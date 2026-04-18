@@ -1,0 +1,16 @@
+{
+  // ### Launch configurations ###
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // ### HouseMaker module launch ###
+      "name": "HouseMaker",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "housemaker",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": true,
+      "console": "integratedTerminal"
+    }
+  ]
+}
