@@ -131,7 +131,7 @@ def _build_multi_level_meshes(
             vertex_data=level.vertex_data,
             wall_height_meters=level.height_meters,
             base_z_meters=_get_level_base_z(level_lookup, level.index),
-            blueprint_size_pixels=blueprint_size_pixels,
+            blueprint_size_pixels=level.image_size_pixels or blueprint_size_pixels,
         )
         if not wall_meshes:
             continue

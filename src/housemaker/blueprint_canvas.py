@@ -96,20 +96,50 @@ class BlueprintCanvas(QWidget):
         vertex_data: VertexData | None = None,
     ) -> None:
         image = _load_qimage_from_path(file_path)
-
-        self.blueprint_image = image
-        self.blueprint_path = file_path
-        self.vertex_data = vertex_data or VertexData()
-        self.active_vertex_id = None
-        self.selected_vertex_id = None
-        self.preview_point = None
-        self.preview_guides = []
-        self.undo_stack.clear()
-        self._reset_pointer_state()
-        self._reset_view()
-        self.update()
+        self._set_level_contents(
+            vertex_data=vertex_data or VertexData(),
+            blueprint_image=image,
+            blueprint_path=file_path,
+        )
 
     def set_level_vertex_data(self, vertex_data: VertexData) -> None:
+        self.set_level_data(vertex_data, self.blueprint_path)
+
+    def set_level_data(
+        self,
+        vertex_data: VertexData,
+        image_path: str | None,
+    ) -> None:
+        blueprint_image: QImage | None = None
+        if image_path and Path(image_path).exists():
+            try:
+                blueprint_image = _load_qimage_from_path(image_path)
+            except ValueError:
+                blueprint_image = None
+
+        self._set_level_contents(
+            vertex_data=vertex_data,
+            blueprint_image=blueprint_image,
+            blueprint_path=image_path,
+        )
+
+    def get_image_size_pixels(self) -> tuple[float, float] | None:
+        if self.blueprint_image is None:
+            return None
+
+        return (
+            float(self.blueprint_image.width()),
+            float(self.blueprint_image.height()),
+        )
+
+    def _set_level_contents(
+        self,
+        vertex_data: VertexData,
+        blueprint_image: QImage | None,
+        blueprint_path: str | None,
+    ) -> None:
+        self.blueprint_image = blueprint_image
+        self.blueprint_path = blueprint_path
         self.vertex_data = vertex_data
         self.active_vertex_id = None
         self.selected_vertex_id = None
@@ -117,6 +147,7 @@ class BlueprintCanvas(QWidget):
         self.preview_guides = []
         self.undo_stack.clear()
         self._reset_pointer_state()
+        self._reset_view()
         self.update()
 
     def undo_last_step(self) -> None:
@@ -249,13 +280,13 @@ class BlueprintCanvas(QWidget):
         event.accept()
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
-        if event.button() != Qt.MouseButton.LeftButton or self.pressed_vertex_id is None:
-            super().mouseReleaseEvent(event)
-            return
-
         if event.button() == Qt.MouseButton.MiddleButton:
             self._stop_panning()
             event.accept()
+            return
+
+        if event.button() != Qt.MouseButton.LeftButton or self.pressed_vertex_id is None:
+            super().mouseReleaseEvent(event)
             return
 
         if self.drag_vertex_id is not None:
@@ -796,10 +827,16 @@ class BlueprintCanvas(QWidget):
     def _paint_empty_state(self, painter: QPainter) -> None:
         painter.setPen(QPen(TEXT_COLOR))
         painter.setFont(QFont("Segoe UI", 15))
+        empty_message = "Use Load image to select a blueprint for this level."
+        if self.blueprint_path is not None:
+            empty_message = (
+                f"Image not found:\n{self.blueprint_path}\n\n"
+                "Use Load image to select a replacement for this level."
+            )
         painter.drawText(
             self.rect(),
             int(Qt.AlignmentFlag.AlignCenter),
-            "Select a blueprint image to start tracing.",
+            empty_message,
         )
 
     def _paint_edges(self, painter: QPainter) -> None:

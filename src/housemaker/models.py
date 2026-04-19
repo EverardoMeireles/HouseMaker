@@ -160,6 +160,8 @@ class LevelData:
     name: str
     height_meters: float = DEFAULT_LEVEL_HEIGHT_METERS
     vertex_data: VertexData = field(default_factory=VertexData)
+    image_path: str | None = None
+    image_size_pixels: tuple[float, float] | None = None
 
     @property
     def display_name(self) -> str:

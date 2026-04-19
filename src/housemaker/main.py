@@ -70,7 +70,6 @@ class BlueprintWorkspace(QWidget):
         self.levels: list[LevelData] = create_default_levels()
         self.current_level_index = GROUND_LEVEL_INDEX
         self._is_syncing_level_controls = False
-        self.project_blueprint_path: str | None = None
         self._build_ui()
 
     @property
@@ -112,13 +111,18 @@ class BlueprintWorkspace(QWidget):
         self.height_level_spinbox.valueChanged.connect(self._handle_height_level_changed)
         side_layout.addWidget(self.height_level_spinbox)
 
+        self.load_image_button = QPushButton("Load image")
+        self.load_image_button.setMinimumHeight(44)
+        self.load_image_button.clicked.connect(self._handle_load_image_clicked)
+        side_layout.addWidget(self.load_image_button)
+
+        self.blueprint_name_label = QLabel("Image: none for this level")
+        self.blueprint_name_label.setWordWrap(True)
+        side_layout.addWidget(self.blueprint_name_label)
+
         levels_label = QLabel("Levels")
         levels_label.setStyleSheet("font-size: 18px; font-weight: 600;")
         side_layout.addWidget(levels_label)
-
-        self.blueprint_name_label = QLabel("No blueprint selected")
-        self.blueprint_name_label.setWordWrap(True)
-        side_layout.addWidget(self.blueprint_name_label)
 
         self.levels_list = QListWidget()
         self.levels_list.currentRowChanged.connect(self._handle_level_selection_changed)
@@ -151,20 +155,14 @@ class BlueprintWorkspace(QWidget):
 
         self._refresh_levels_list()
         self._sync_level_controls()
+        self._sync_canvas_to_current_level()
 
     def load_blueprint(self, file_path: str) -> None:
-        self._apply_project_state(
-            blueprint_path=file_path,
-            levels=create_default_levels(),
-            current_level_index=GROUND_LEVEL_INDEX,
-        )
+        self._set_current_level_image(file_path)
 
     def _handle_convert_clicked(self) -> None:
         try:
-            generated_model = convert_to_glb(
-                self.levels,
-                blueprint_size_pixels=self._get_blueprint_size_pixels(),
-            )
+            generated_model = convert_to_glb(self.levels)
         except ValueError as error:
             QMessageBox.warning(self, "Convert failed", str(error))
             return
@@ -184,14 +182,6 @@ class BlueprintWorkspace(QWidget):
         ]
 
     def _handle_save_clicked(self) -> None:
-        if not self.project_blueprint_path:
-            QMessageBox.warning(
-                self,
-                "Save failed",
-                "Load a blueprint or project before saving.",
-            )
-            return
-
         default_path = Path.cwd() / "housemaker_project.json"
         file_path, _ = QFileDialog.getSaveFileName(
             self,
@@ -205,7 +195,6 @@ class BlueprintWorkspace(QWidget):
         try:
             save_project(
                 path=file_path,
-                blueprint_path=self.project_blueprint_path,
                 current_level_index=self.current_level_index,
                 levels=self.levels,
             )
@@ -231,6 +220,21 @@ class BlueprintWorkspace(QWidget):
         except ValueError as error:
             QMessageBox.critical(self, "Project load failed", str(error))
 
+    def _handle_load_image_clicked(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "load image",
+            str(Path.home()),
+            "Image Files (*.png *.jpg *.jpeg *.bmp *.webp)",
+        )
+        if not file_path:
+            return
+
+        try:
+            self._set_current_level_image(file_path)
+        except ValueError as error:
+            QMessageBox.critical(self, "Image load failed", str(error))
+
     def _refresh_levels_list(self) -> None:
         self._is_syncing_level_controls = True
         self.levels_list.clear()
@@ -247,6 +251,7 @@ class BlueprintWorkspace(QWidget):
         self.height_level_spinbox.setValue(self.current_level.height_meters)
         if self.levels_list.currentRow() != self.current_level_index:
             self.levels_list.setCurrentRow(self.current_level_index)
+        self._update_blueprint_name_label()
         self._is_syncing_level_controls = False
 
     def _handle_level_selection_changed(self, level_index: int) -> None:
@@ -255,7 +260,7 @@ class BlueprintWorkspace(QWidget):
 
         self.current_level_index = level_index
         self._sync_level_controls()
-        self.canvas.set_level_vertex_data(self.current_level.vertex_data)
+        self._sync_canvas_to_current_level()
 
     def _handle_height_level_changed(self, value: float) -> None:
         if self._is_syncing_level_controls:
@@ -263,42 +268,51 @@ class BlueprintWorkspace(QWidget):
 
         self.current_level.height_meters = value
 
-    def _get_blueprint_size_pixels(self) -> tuple[float, float] | None:
-        if self.canvas.blueprint_image is None:
-            return None
-
-        return (
-            float(self.canvas.blueprint_image.width()),
-            float(self.canvas.blueprint_image.height()),
-        )
-
     def _apply_loaded_project(self, project_data: ProjectData) -> None:
-        blueprint_path = Path(project_data.blueprint_path)
-        if not blueprint_path.exists():
-            raise ValueError(
-                f"Blueprint image not found for this project:\n{project_data.blueprint_path}"
-            )
-
         self._apply_project_state(
-            blueprint_path=str(blueprint_path),
             levels=project_data.levels,
             current_level_index=project_data.current_level_index,
         )
 
     def _apply_project_state(
         self,
-        blueprint_path: str,
         levels: list[LevelData],
         current_level_index: int,
     ) -> None:
         self.levels = levels
-        self.current_level_index = current_level_index
-        self.project_blueprint_path = blueprint_path
+        self.current_level_index = min(max(current_level_index, 0), len(self.levels) - 1)
 
-        self.canvas.load_blueprint(blueprint_path, self.current_level.vertex_data)
-        self.blueprint_name_label.setText(f"Loaded: {Path(blueprint_path).name}")
         self._refresh_levels_list()
         self._sync_level_controls()
+        self._sync_canvas_to_current_level()
+
+    def _set_current_level_image(self, file_path: str) -> None:
+        normalized_path = str(Path(file_path).resolve())
+        self.canvas.load_blueprint(normalized_path, self.current_level.vertex_data)
+        self.current_level.image_path = normalized_path
+        self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
+        self._update_blueprint_name_label()
+
+    def _sync_canvas_to_current_level(self) -> None:
+        self.canvas.set_level_data(
+            vertex_data=self.current_level.vertex_data,
+            image_path=self.current_level.image_path,
+        )
+        if self.canvas.blueprint_image is not None:
+            self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
+        self._update_blueprint_name_label()
+
+    def _update_blueprint_name_label(self) -> None:
+        image_path = self.current_level.image_path
+        if image_path is None:
+            self.blueprint_name_label.setText("Image: none for this level")
+            return
+
+        if self.canvas.blueprint_image is None:
+            self.blueprint_name_label.setText(f"Image missing: {image_path}")
+            return
+
+        self.blueprint_name_label.setText(f"Image: {Path(image_path).name}")
 
 
 class MainWindow(QMainWindow):
@@ -324,20 +338,6 @@ class MainWindow(QMainWindow):
 
     def _open_blueprint_mode(self) -> None:
         self.stack.setCurrentWidget(self.blueprint_workspace)
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "select blueprint",
-            str(Path.home()),
-            "Image Files (*.png *.jpg *.jpeg *.bmp *.webp)",
-        )
-        if not file_path:
-            return
-
-        try:
-            self.blueprint_workspace.load_blueprint(file_path)
-        except ValueError as error:
-            QMessageBox.critical(self, "Blueprint load failed", str(error))
-            return
 
 
 # ### Entrypoint ###
