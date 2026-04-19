@@ -19,7 +19,6 @@ from housemaker.models import (
 
 # ### Constants ###
 DEFAULT_WALL_HEIGHT_METERS = DEFAULT_LEVEL_HEIGHT_METERS
-DEFAULT_WALL_THICKNESS_METERS = 0.18
 PIXEL_TO_METER = 0.02
 
 # ### Data models ###
@@ -189,15 +188,26 @@ def _build_wall_mesh(
     if length < 1e-6:
         return None
 
-    wall_mesh = trimesh.creation.box(
-        extents=(length, DEFAULT_WALL_THICKNESS_METERS, wall_height_meters)
+    wall_mesh = trimesh.Trimesh(
+        vertices=[
+            [0.0, 0.0, -wall_height_meters / 2.0],
+            [length, 0.0, -wall_height_meters / 2.0],
+            [length, 0.0, wall_height_meters / 2.0],
+            [0.0, 0.0, wall_height_meters / 2.0],
+        ],
+        faces=[
+            [0, 1, 2],
+            [0, 2, 3],
+            [2, 1, 0],
+            [3, 2, 0],
+        ],
+        process=False,
     )
     angle_radians = float(np.arctan2(direction[1], direction[0]))
     transform = trimesh.transformations.rotation_matrix(angle_radians, [0.0, 0.0, 1.0])
-    midpoint = (start_xy + end_xy) / 2.0
     transform[:3, 3] = [
-        float(midpoint[0]),
-        float(midpoint[1]),
+        float(start_xy[0]),
+        float(start_xy[1]),
         base_z_meters + wall_height_meters / 2.0,
     ]
 
