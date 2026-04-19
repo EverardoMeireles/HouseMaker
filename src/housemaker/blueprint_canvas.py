@@ -27,6 +27,9 @@ IMAGE_MARGIN = 16.0
 VERTEX_RADIUS_SCREEN = 6.0
 AXIS_SNAP_TOLERANCE_SCREEN = 10.0
 DRAG_THRESHOLD_SCREEN = 4.0
+MIN_ZOOM_SCALE = 1.0
+MAX_ZOOM_SCALE = 16.0
+ZOOM_STEP_FACTOR = 1.15
 
 # ### Snapshot models ###
 @dataclass
@@ -73,6 +76,11 @@ class BlueprintCanvas(QWidget):
         self.pressed_vertex_id: int | None = None
         self.drag_vertex_id: int | None = None
         self.drag_press_position: QPointF | None = None
+        self.zoom_scale = MIN_ZOOM_SCALE
+        self.view_offset = QPointF(0.0, 0.0)
+        self.is_panning = False
+        self.pan_press_position: QPointF | None = None
+        self.pan_start_offset = QPointF(0.0, 0.0)
 
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -98,6 +106,7 @@ class BlueprintCanvas(QWidget):
         self.preview_guides = []
         self.undo_stack.clear()
         self._reset_pointer_state()
+        self._reset_view()
         self.update()
 
     def set_level_vertex_data(self, vertex_data: VertexData) -> None:
@@ -131,6 +140,22 @@ class BlueprintCanvas(QWidget):
 
         super().keyPressEvent(event)
 
+    def wheelEvent(self, event) -> None:  # type: ignore[override]
+        if self.blueprint_image is None:
+            super().wheelEvent(event)
+            return
+
+        wheel_delta = event.angleDelta().y()
+        if wheel_delta == 0:
+            wheel_delta = event.pixelDelta().y()
+        if wheel_delta == 0:
+            event.accept()
+            return
+
+        zoom_factor = ZOOM_STEP_FACTOR ** (wheel_delta / 120.0)
+        self._zoom_around_widget_point(event.position(), zoom_factor)
+        event.accept()
+
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         self.setFocus(Qt.FocusReason.MouseFocusReason)
 
@@ -140,6 +165,11 @@ class BlueprintCanvas(QWidget):
 
         if event.button() == Qt.MouseButton.RightButton:
             self._apply_active_chain()
+            event.accept()
+            return
+
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._start_panning(event.position())
             event.accept()
             return
 
@@ -173,18 +203,28 @@ class BlueprintCanvas(QWidget):
             super().mouseMoveEvent(event)
             return
 
+        if self.is_panning and event.buttons() & Qt.MouseButton.MiddleButton:
+            self._update_pan(event.position())
+            event.accept()
+            return
+
         if self.pressed_vertex_id is not None and event.buttons() & Qt.MouseButton.LeftButton:
             if self._should_start_drag(event.position()):
                 self._start_drag()
 
             if self.drag_vertex_id is not None:
                 image_point = self._widget_to_image_clamped(event.position())
+                snap_preview = self._build_drag_preview(
+                    image_point,
+                    dragged_vertex_id=self.drag_vertex_id,
+                )
                 self.vertex_data.move_vertex(
                     self.drag_vertex_id,
-                    image_point.x(),
-                    image_point.y(),
+                    snap_preview.point[0],
+                    snap_preview.point[1],
                 )
-                self.preview_guides = []
+                self.preview_point = snap_preview.point
+                self.preview_guides = snap_preview.guides
                 self.update()
                 event.accept()
                 return
@@ -213,7 +253,14 @@ class BlueprintCanvas(QWidget):
             super().mouseReleaseEvent(event)
             return
 
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._stop_panning()
+            event.accept()
+            return
+
         if self.drag_vertex_id is not None:
+            self.preview_point = None
+            self.preview_guides = []
             self._reset_pointer_state()
             self.update()
             event.accept()
@@ -363,6 +410,18 @@ class BlueprintCanvas(QWidget):
 
         return SnapPreview(point=angle_snapped_point, guides=[])
 
+    def _build_drag_preview(
+        self,
+        image_point: QPointF,
+        dragged_vertex_id: int,
+    ) -> SnapPreview:
+        raw_point = self._clamp_image_point(image_point.x(), image_point.y())
+        axis_candidates = self._find_axis_snap_candidates(
+            raw_point,
+            excluded_vertex_ids={dragged_vertex_id},
+        )
+        return self._build_axis_only_preview(raw_point, axis_candidates)
+
     def _clamp_image_point(self, x: float, y: float) -> tuple[float, float]:
         if self.blueprint_image is None:
             return x, y
@@ -408,6 +467,70 @@ class BlueprintCanvas(QWidget):
         self.pressed_vertex_id = None
         self.drag_vertex_id = None
         self.drag_press_position = None
+        self._stop_panning()
+
+    def _reset_view(self) -> None:
+        self.zoom_scale = MIN_ZOOM_SCALE
+        self.view_offset = QPointF(0.0, 0.0)
+        self._stop_panning()
+
+    def _zoom_around_widget_point(
+        self,
+        widget_point: QPointF,
+        zoom_factor: float,
+    ) -> None:
+        if self.blueprint_image is None:
+            return
+
+        old_rect = self._image_display_rect()
+        base_rect = self._base_image_display_rect()
+        if old_rect.width() <= 0.0 or old_rect.height() <= 0.0:
+            return
+
+        old_zoom_scale = self.zoom_scale
+        new_zoom_scale = min(
+            max(old_zoom_scale * zoom_factor, MIN_ZOOM_SCALE),
+            MAX_ZOOM_SCALE,
+        )
+        if math.isclose(new_zoom_scale, old_zoom_scale):
+            return
+
+        if math.isclose(new_zoom_scale, MIN_ZOOM_SCALE):
+            self._reset_view()
+            self.update()
+            return
+
+        normalized_x = (widget_point.x() - old_rect.left()) / old_rect.width()
+        normalized_y = (widget_point.y() - old_rect.top()) / old_rect.height()
+        new_width = base_rect.width() * new_zoom_scale
+        new_height = base_rect.height() * new_zoom_scale
+        new_center = QPointF(
+            widget_point.x() - (normalized_x - 0.5) * new_width,
+            widget_point.y() - (normalized_y - 0.5) * new_height,
+        )
+
+        self.zoom_scale = new_zoom_scale
+        self.view_offset = new_center - base_rect.center()
+        self.update()
+
+    def _start_panning(self, widget_point: QPointF) -> None:
+        if self.zoom_scale <= MIN_ZOOM_SCALE:
+            return
+
+        self.is_panning = True
+        self.pan_press_position = QPointF(widget_point)
+        self.pan_start_offset = QPointF(self.view_offset)
+
+    def _update_pan(self, widget_point: QPointF) -> None:
+        if not self.is_panning or self.pan_press_position is None:
+            return
+
+        self.view_offset = self.pan_start_offset + (widget_point - self.pan_press_position)
+        self.update()
+
+    def _stop_panning(self) -> None:
+        self.is_panning = False
+        self.pan_press_position = None
 
     def _find_axis_snap_candidates(
         self,
@@ -595,6 +718,21 @@ class BlueprintCanvas(QWidget):
         return screen_distance / scale
 
     def _image_display_rect(self) -> QRectF:
+        base_rect = self._base_image_display_rect()
+        if self.blueprint_image is None:
+            return base_rect
+
+        center = base_rect.center() + self.view_offset
+        display_width = base_rect.width() * self.zoom_scale
+        display_height = base_rect.height() * self.zoom_scale
+        return QRectF(
+            center.x() - display_width / 2.0,
+            center.y() - display_height / 2.0,
+            display_width,
+            display_height,
+        )
+
+    def _base_image_display_rect(self) -> QRectF:
         if self.blueprint_image is None:
             return QRectF()
 
@@ -705,6 +843,9 @@ class BlueprintCanvas(QWidget):
             )
 
     def _paint_preview_edge(self, painter: QPainter) -> None:
+        if self.drag_vertex_id is not None:
+            return
+
         if self.active_vertex_id is None or self.preview_point is None:
             return
 
@@ -756,8 +897,8 @@ class BlueprintCanvas(QWidget):
         painter.setFont(QFont("Segoe UI", 9))
         overlay_lines = [
             f"Blueprint: {Path(self.blueprint_path).name}",
-            "Left click: add/connect, select, or drag vertices | Right click: apply chain",
-            "Delete: remove selected vertex | Ctrl+Z: undo | Hold Ctrl while moving: free placement",
+            "Left click: add/connect/select/drag | Middle drag: pan | Right click: apply chain",
+            "Mouse wheel: zoom | Delete: remove selected vertex | Ctrl+Z: undo | Hold Ctrl: free placement",
         ]
 
         line_y = overlay_rect.top() + 24.0
