@@ -20,6 +20,15 @@ from housemaker.models import (
 # ### Constants ###
 DEFAULT_WALL_HEIGHT_METERS = DEFAULT_LEVEL_HEIGHT_METERS
 PIXEL_TO_METER = 0.02
+Z_UP_TO_GLTF_Y_UP_TRANSFORM = np.array(
+    [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, -1.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=float,
+)
 
 # ### Data models ###
 @dataclass
@@ -39,29 +48,28 @@ class NamedMesh:
 def convert_to_glb(
     level_source: VertexData | Sequence[LevelData],
     wall_height_meters: float = DEFAULT_WALL_HEIGHT_METERS,
+    blueprint_size_pixels: tuple[float, float] | None = None,
 ) -> GeneratedModel:
     if isinstance(level_source, VertexData):
         wall_meshes = _build_level_meshes(
             vertex_data=level_source,
             wall_height_meters=wall_height_meters,
             base_z_meters=0.0,
+            blueprint_size_pixels=blueprint_size_pixels,
         )
         named_meshes = _build_named_meshes_for_single_level(wall_meshes)
     else:
-        named_meshes = _build_multi_level_meshes(level_source)
+        named_meshes = _build_multi_level_meshes(
+            level_source,
+            blueprint_size_pixels=blueprint_size_pixels,
+        )
         wall_meshes = [named_mesh.mesh for named_mesh in named_meshes]
 
     if not wall_meshes:
         raise ValueError("The current blueprint data does not contain usable edges.")
 
     combined_mesh = trimesh.util.concatenate(wall_meshes)
-    scene = trimesh.Scene()
-    for named_mesh in named_meshes:
-        scene.add_geometry(
-            named_mesh.mesh,
-            geom_name=named_mesh.name,
-            node_name=named_mesh.name,
-        )
+    scene = _build_export_scene(named_meshes)
     glb_bytes = scene.export(file_type="glb")
     return GeneratedModel(mesh=combined_mesh, scene=scene, glb_bytes=glb_bytes)
 
@@ -73,6 +81,23 @@ def export_glb_file(model: GeneratedModel, path: str | Path) -> Path:
 
 
 # ### Internal helpers ###
+def _build_export_scene(named_meshes: list[NamedMesh]) -> trimesh.Scene:
+    scene = trimesh.Scene()
+    for named_mesh in named_meshes:
+        scene.add_geometry(
+            _to_gltf_y_up_mesh(named_mesh.mesh),
+            geom_name=named_mesh.name,
+            node_name=named_mesh.name,
+        )
+    return scene
+
+
+def _to_gltf_y_up_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    export_mesh = mesh.copy()
+    export_mesh.apply_transform(Z_UP_TO_GLTF_Y_UP_TRANSFORM)
+    return export_mesh
+
+
 def _build_named_meshes_for_single_level(
     wall_meshes: list[trimesh.Trimesh],
 ) -> list[NamedMesh]:
@@ -87,7 +112,10 @@ def _build_named_meshes_for_single_level(
     ]
 
 
-def _build_multi_level_meshes(levels: Sequence[LevelData]) -> list[NamedMesh]:
+def _build_multi_level_meshes(
+    levels: Sequence[LevelData],
+    blueprint_size_pixels: tuple[float, float] | None,
+) -> list[NamedMesh]:
     if not levels:
         raise ValueError("No levels are available for GLB conversion.")
 
@@ -103,6 +131,7 @@ def _build_multi_level_meshes(levels: Sequence[LevelData]) -> list[NamedMesh]:
             vertex_data=level.vertex_data,
             wall_height_meters=level.height_meters,
             base_z_meters=_get_level_base_z(level_lookup, level.index),
+            blueprint_size_pixels=blueprint_size_pixels,
         )
         if not wall_meshes:
             continue
@@ -121,6 +150,7 @@ def _build_level_meshes(
     vertex_data: VertexData,
     wall_height_meters: float,
     base_z_meters: float,
+    blueprint_size_pixels: tuple[float, float] | None,
 ) -> list[trimesh.Trimesh]:
     if wall_height_meters <= 0.0:
         raise ValueError("Height level must be greater than zero.")
@@ -135,6 +165,7 @@ def _build_level_meshes(
                 vertex_lookup=vertex_lookup,
                 wall_height_meters=wall_height_meters,
                 base_z_meters=base_z_meters,
+                blueprint_size_pixels=blueprint_size_pixels,
             )
         )
         is not None
@@ -168,20 +199,15 @@ def _build_wall_mesh(
     vertex_lookup: dict[int, Vertex],
     wall_height_meters: float,
     base_z_meters: float,
+    blueprint_size_pixels: tuple[float, float] | None,
 ) -> trimesh.Trimesh | None:
     start_vertex = vertex_lookup.get(edge.start_vertex_id)
     end_vertex = vertex_lookup.get(edge.end_vertex_id)
     if start_vertex is None or end_vertex is None:
         return None
 
-    start_xy = np.array(
-        [start_vertex.x * PIXEL_TO_METER, -start_vertex.y * PIXEL_TO_METER],
-        dtype=float,
-    )
-    end_xy = np.array(
-        [end_vertex.x * PIXEL_TO_METER, -end_vertex.y * PIXEL_TO_METER],
-        dtype=float,
-    )
+    start_xy = _vertex_to_world_xy(start_vertex, blueprint_size_pixels)
+    end_xy = _vertex_to_world_xy(end_vertex, blueprint_size_pixels)
 
     direction = end_xy - start_xy
     length = float(np.linalg.norm(direction))
@@ -213,3 +239,24 @@ def _build_wall_mesh(
 
     wall_mesh.apply_transform(transform)
     return wall_mesh
+
+
+def _vertex_to_world_xy(
+    vertex: Vertex,
+    blueprint_size_pixels: tuple[float, float] | None,
+) -> np.ndarray:
+    if blueprint_size_pixels is None:
+        centered_x = vertex.x
+        centered_y = vertex.y
+    else:
+        blueprint_width, blueprint_height = blueprint_size_pixels
+        centered_x = vertex.x - blueprint_width / 2.0
+        centered_y = vertex.y - blueprint_height / 2.0
+
+    return np.array(
+        [
+            centered_x * PIXEL_TO_METER,
+            -centered_y * PIXEL_TO_METER,
+        ],
+        dtype=float,
+    )

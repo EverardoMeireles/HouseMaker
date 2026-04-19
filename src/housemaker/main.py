@@ -161,7 +161,10 @@ class BlueprintWorkspace(QWidget):
 
     def _handle_convert_clicked(self) -> None:
         try:
-            generated_model = convert_to_glb(self.levels)
+            generated_model = convert_to_glb(
+                self.levels,
+                blueprint_size_pixels=self._get_blueprint_size_pixels(),
+            )
         except ValueError as error:
             QMessageBox.warning(self, "Convert failed", str(error))
             return
@@ -259,6 +262,15 @@ class BlueprintWorkspace(QWidget):
             return
 
         self.current_level.height_meters = value
+
+    def _get_blueprint_size_pixels(self) -> tuple[float, float] | None:
+        if self.canvas.blueprint_image is None:
+            return None
+
+        return (
+            float(self.canvas.blueprint_image.width()),
+            float(self.canvas.blueprint_image.height()),
+        )
 
     def _apply_loaded_project(self, project_data: ProjectData) -> None:
         blueprint_path = Path(project_data.blueprint_path)
