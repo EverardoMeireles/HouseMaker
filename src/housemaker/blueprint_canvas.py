@@ -82,12 +82,26 @@ class BlueprintCanvas(QWidget):
         self.undo_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self.undo_shortcut.activated.connect(self.undo_last_step)
 
-    def load_blueprint(self, file_path: str) -> None:
+    def load_blueprint(
+        self,
+        file_path: str,
+        vertex_data: VertexData | None = None,
+    ) -> None:
         image = _load_qimage_from_path(file_path)
 
         self.blueprint_image = image
         self.blueprint_path = file_path
-        self.vertex_data.reset()
+        self.vertex_data = vertex_data or VertexData()
+        self.active_vertex_id = None
+        self.selected_vertex_id = None
+        self.preview_point = None
+        self.preview_guides = []
+        self.undo_stack.clear()
+        self._reset_pointer_state()
+        self.update()
+
+    def set_level_vertex_data(self, vertex_data: VertexData) -> None:
+        self.vertex_data = vertex_data
         self.active_vertex_id = None
         self.selected_vertex_id = None
         self.preview_point = None

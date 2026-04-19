@@ -6,6 +6,10 @@ import math
 from dataclasses import dataclass, field
 
 # ### Constants ###
+DEFAULT_LEVEL_HEIGHT_METERS = 3.0
+GROUND_LEVEL_INDEX = 2
+MIN_LEVEL_INDEX = 0
+MAX_LEVEL_INDEX = 7
 SNAP_ANGLE_DEGREES = 10.0
 VERTEX_HIT_RADIUS_SCREEN = 12.0
 
@@ -102,6 +106,7 @@ class VertexData:
 
     def to_dict(self) -> dict[str, list[dict[str, float | int]]]:
         return {
+            "next_vertex_id": self._next_vertex_id,
             "vertices": [
                 {"id": vertex.id, "x": vertex.x, "y": vertex.y}
                 for vertex in self.vertices
@@ -115,9 +120,50 @@ class VertexData:
             ],
         }
 
+    @classmethod
+    def from_dict(cls, payload: dict) -> "VertexData":
+        vertex_data = cls()
+        vertex_data.vertices = [
+            Vertex(
+                id=int(vertex["id"]),
+                x=float(vertex["x"]),
+                y=float(vertex["y"]),
+            )
+            for vertex in payload.get("vertices", [])
+        ]
+        vertex_data.edges = [
+            Edge(
+                start_vertex_id=int(edge["start_vertex_id"]),
+                end_vertex_id=int(edge["end_vertex_id"]),
+            )
+            for edge in payload.get("edges", [])
+        ]
+
+        default_next_vertex_id = max(
+            [vertex.id for vertex in vertex_data.vertices],
+            default=0,
+        ) + 1
+        vertex_data._next_vertex_id = int(
+            payload.get("next_vertex_id", default_next_vertex_id)
+        )
+        return vertex_data
+
     @staticmethod
     def _edge_key(start_vertex_id: int, end_vertex_id: int) -> tuple[int, int]:
         return tuple(sorted((start_vertex_id, end_vertex_id)))
+
+
+# ### Level models ###
+@dataclass
+class LevelData:
+    index: int
+    name: str
+    height_meters: float = DEFAULT_LEVEL_HEIGHT_METERS
+    vertex_data: VertexData = field(default_factory=VertexData)
+
+    @property
+    def display_name(self) -> str:
+        return f"L{self.index} {self.name}"
 
 
 # ### Geometry helpers ###
@@ -140,3 +186,23 @@ def snap_point(
     snapped_x = base_vertex.x + distance * math.cos(snapped_angle_radians)
     snapped_y = base_vertex.y + distance * math.sin(snapped_angle_radians)
     return snapped_x, snapped_y
+
+
+# ### Level helpers ###
+def create_default_levels() -> list[LevelData]:
+    return [
+        LevelData(index=level_index, name=_get_level_name(level_index))
+        for level_index in range(MIN_LEVEL_INDEX, MAX_LEVEL_INDEX + 1)
+    ]
+
+
+def _get_level_name(level_index: int) -> str:
+    if level_index == 0:
+        return "Underground 2"
+    if level_index == 1:
+        return "Underground 1"
+    if level_index == GROUND_LEVEL_INDEX:
+        return "Ground"
+
+    story_number = level_index - GROUND_LEVEL_INDEX
+    return f"Story {story_number}"

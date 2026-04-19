@@ -1,16 +1,24 @@
 # ### Imports ###
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import trimesh
 
-from housemaker.models import Edge, Vertex, VertexData
+from housemaker.models import (
+    DEFAULT_LEVEL_HEIGHT_METERS,
+    GROUND_LEVEL_INDEX,
+    Edge,
+    LevelData,
+    Vertex,
+    VertexData,
+)
 
 # ### Constants ###
-DEFAULT_WALL_HEIGHT_METERS = 3.0
+DEFAULT_WALL_HEIGHT_METERS = DEFAULT_LEVEL_HEIGHT_METERS
 DEFAULT_WALL_THICKNESS_METERS = 0.18
 PIXEL_TO_METER = 0.02
 
@@ -22,36 +30,39 @@ class GeneratedModel:
     glb_bytes: bytes
 
 
+@dataclass
+class NamedMesh:
+    name: str
+    mesh: trimesh.Trimesh
+
+
 # ### Public helpers ###
 def convert_to_glb(
-    vertex_data: VertexData,
+    level_source: VertexData | Sequence[LevelData],
     wall_height_meters: float = DEFAULT_WALL_HEIGHT_METERS,
 ) -> GeneratedModel:
-    if not vertex_data.edges:
-        raise ValueError("Create at least one edge before converting to GLB.")
-    if wall_height_meters <= 0.0:
-        raise ValueError("Height level must be greater than zero.")
-
-    vertex_lookup = {vertex.id: vertex for vertex in vertex_data.vertices}
-    wall_meshes = [
-        wall_mesh
-        for edge in vertex_data.edges
-        if (
-            wall_mesh := _build_wall_mesh(
-                edge,
-                vertex_lookup,
-                wall_height_meters=wall_height_meters,
-            )
+    if isinstance(level_source, VertexData):
+        wall_meshes = _build_level_meshes(
+            vertex_data=level_source,
+            wall_height_meters=wall_height_meters,
+            base_z_meters=0.0,
         )
-        is not None
-    ]
+        named_meshes = _build_named_meshes_for_single_level(wall_meshes)
+    else:
+        named_meshes = _build_multi_level_meshes(level_source)
+        wall_meshes = [named_mesh.mesh for named_mesh in named_meshes]
 
     if not wall_meshes:
         raise ValueError("The current blueprint data does not contain usable edges.")
 
     combined_mesh = trimesh.util.concatenate(wall_meshes)
     scene = trimesh.Scene()
-    scene.add_geometry(combined_mesh, geom_name="walls")
+    for named_mesh in named_meshes:
+        scene.add_geometry(
+            named_mesh.mesh,
+            geom_name=named_mesh.name,
+            node_name=named_mesh.name,
+        )
     glb_bytes = scene.export(file_type="glb")
     return GeneratedModel(mesh=combined_mesh, scene=scene, glb_bytes=glb_bytes)
 
@@ -63,10 +74,101 @@ def export_glb_file(model: GeneratedModel, path: str | Path) -> Path:
 
 
 # ### Internal helpers ###
+def _build_named_meshes_for_single_level(
+    wall_meshes: list[trimesh.Trimesh],
+) -> list[NamedMesh]:
+    if not wall_meshes:
+        return []
+
+    return [
+        NamedMesh(
+            name="level_2_ground",
+            mesh=trimesh.util.concatenate(wall_meshes),
+        )
+    ]
+
+
+def _build_multi_level_meshes(levels: Sequence[LevelData]) -> list[NamedMesh]:
+    if not levels:
+        raise ValueError("No levels are available for GLB conversion.")
+
+    sorted_levels = sorted(levels, key=lambda level: level.index)
+    level_lookup = {level.index: level for level in sorted_levels}
+    named_meshes: list[NamedMesh] = []
+
+    for level in sorted_levels:
+        if level.height_meters <= 0.0:
+            raise ValueError(f"Level {level.index} height must be greater than zero.")
+
+        wall_meshes = _build_level_meshes(
+            vertex_data=level.vertex_data,
+            wall_height_meters=level.height_meters,
+            base_z_meters=_get_level_base_z(level_lookup, level.index),
+        )
+        if not wall_meshes:
+            continue
+
+        named_meshes.append(
+            NamedMesh(
+                name=_get_level_object_name(level),
+                mesh=trimesh.util.concatenate(wall_meshes),
+            )
+        )
+
+    return named_meshes
+
+
+def _build_level_meshes(
+    vertex_data: VertexData,
+    wall_height_meters: float,
+    base_z_meters: float,
+) -> list[trimesh.Trimesh]:
+    if wall_height_meters <= 0.0:
+        raise ValueError("Height level must be greater than zero.")
+
+    vertex_lookup = {vertex.id: vertex for vertex in vertex_data.vertices}
+    return [
+        wall_mesh
+        for edge in vertex_data.edges
+        if (
+            wall_mesh := _build_wall_mesh(
+                edge=edge,
+                vertex_lookup=vertex_lookup,
+                wall_height_meters=wall_height_meters,
+                base_z_meters=base_z_meters,
+            )
+        )
+        is not None
+    ]
+
+
+def _get_level_base_z(
+    level_lookup: dict[int, LevelData],
+    level_index: int,
+) -> float:
+    if level_index >= GROUND_LEVEL_INDEX:
+        return sum(
+            level_lookup[index].height_meters
+            for index in range(GROUND_LEVEL_INDEX, level_index)
+            if index in level_lookup
+        )
+
+    return -sum(
+        level_lookup[index].height_meters
+        for index in range(level_index, GROUND_LEVEL_INDEX)
+        if index in level_lookup
+    )
+
+
+def _get_level_object_name(level: LevelData) -> str:
+    return level.display_name.lower().replace(" ", "_")
+
+
 def _build_wall_mesh(
     edge: Edge,
     vertex_lookup: dict[int, Vertex],
     wall_height_meters: float,
+    base_z_meters: float,
 ) -> trimesh.Trimesh | None:
     start_vertex = vertex_lookup.get(edge.start_vertex_id)
     end_vertex = vertex_lookup.get(edge.end_vertex_id)
@@ -96,7 +198,7 @@ def _build_wall_mesh(
     transform[:3, 3] = [
         float(midpoint[0]),
         float(midpoint[1]),
-        wall_height_meters / 2.0,
+        base_z_meters + wall_height_meters / 2.0,
     ]
 
     wall_mesh.apply_transform(transform)
