@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 
 # ### Constants ###
 DEFAULT_LEVEL_HEIGHT_METERS = 3.0
+DEFAULT_IMAGE_SCALE = 1.0
+DEFAULT_IMAGE_OFFSET = 0.0
 GROUND_LEVEL_INDEX = 2
 MIN_LEVEL_INDEX = 0
 MAX_LEVEL_INDEX = 7
@@ -162,6 +164,9 @@ class LevelData:
     vertex_data: VertexData = field(default_factory=VertexData)
     image_path: str | None = None
     image_size_pixels: tuple[float, float] | None = None
+    image_scale: float = DEFAULT_IMAGE_SCALE
+    image_offset_x: float = DEFAULT_IMAGE_OFFSET
+    image_offset_y: float = DEFAULT_IMAGE_OFFSET
 
     @property
     def display_name(self) -> str:

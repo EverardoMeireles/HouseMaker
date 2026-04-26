@@ -10,7 +10,14 @@ from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QImage, QKeySequence, QPainter, QPen, QShortcut
 from PySide6.QtWidgets import QWidget
 
-from housemaker.models import VERTEX_HIT_RADIUS_SCREEN, Vertex, VertexData, snap_point
+from housemaker.models import (
+    DEFAULT_IMAGE_OFFSET,
+    DEFAULT_IMAGE_SCALE,
+    VERTEX_HIT_RADIUS_SCREEN,
+    Vertex,
+    VertexData,
+    snap_point,
+)
 
 # ### Constants ###
 CANVAS_BACKGROUND_COLOR = QColor("#1c1f24")
@@ -68,6 +75,9 @@ class BlueprintCanvas(QWidget):
         self.vertex_data = VertexData()
         self.blueprint_image: QImage | None = None
         self.blueprint_path: str | None = None
+        self.image_scale = DEFAULT_IMAGE_SCALE
+        self.image_offset_x = DEFAULT_IMAGE_OFFSET
+        self.image_offset_y = DEFAULT_IMAGE_OFFSET
         self.active_vertex_id: int | None = None
         self.selected_vertex_id: int | None = None
         self.preview_point: tuple[float, float] | None = None
@@ -94,21 +104,36 @@ class BlueprintCanvas(QWidget):
         self,
         file_path: str,
         vertex_data: VertexData | None = None,
+        image_scale: float = DEFAULT_IMAGE_SCALE,
+        image_offset_x: float = DEFAULT_IMAGE_OFFSET,
+        image_offset_y: float = DEFAULT_IMAGE_OFFSET,
     ) -> None:
         image = _load_qimage_from_path(file_path)
         self._set_level_contents(
             vertex_data=vertex_data or VertexData(),
             blueprint_image=image,
             blueprint_path=file_path,
+            image_scale=image_scale,
+            image_offset_x=image_offset_x,
+            image_offset_y=image_offset_y,
         )
 
     def set_level_vertex_data(self, vertex_data: VertexData) -> None:
-        self.set_level_data(vertex_data, self.blueprint_path)
+        self.set_level_data(
+            vertex_data=vertex_data,
+            image_path=self.blueprint_path,
+            image_scale=self.image_scale,
+            image_offset_x=self.image_offset_x,
+            image_offset_y=self.image_offset_y,
+        )
 
     def set_level_data(
         self,
         vertex_data: VertexData,
         image_path: str | None,
+        image_scale: float = DEFAULT_IMAGE_SCALE,
+        image_offset_x: float = DEFAULT_IMAGE_OFFSET,
+        image_offset_y: float = DEFAULT_IMAGE_OFFSET,
     ) -> None:
         blueprint_image: QImage | None = None
         if image_path and Path(image_path).exists():
@@ -121,6 +146,9 @@ class BlueprintCanvas(QWidget):
             vertex_data=vertex_data,
             blueprint_image=blueprint_image,
             blueprint_path=image_path,
+            image_scale=image_scale,
+            image_offset_x=image_offset_x,
+            image_offset_y=image_offset_y,
         )
 
     def get_image_size_pixels(self) -> tuple[float, float] | None:
@@ -132,14 +160,31 @@ class BlueprintCanvas(QWidget):
             float(self.blueprint_image.height()),
         )
 
+    def set_image_transform(
+        self,
+        image_scale: float,
+        image_offset_x: float,
+        image_offset_y: float,
+    ) -> None:
+        self.image_scale = max(0.01, float(image_scale))
+        self.image_offset_x = float(image_offset_x)
+        self.image_offset_y = float(image_offset_y)
+        self.update()
+
     def _set_level_contents(
         self,
         vertex_data: VertexData,
         blueprint_image: QImage | None,
         blueprint_path: str | None,
+        image_scale: float,
+        image_offset_x: float,
+        image_offset_y: float,
     ) -> None:
         self.blueprint_image = blueprint_image
         self.blueprint_path = blueprint_path
+        self.image_scale = max(0.01, float(image_scale))
+        self.image_offset_x = float(image_offset_x)
+        self.image_offset_y = float(image_offset_y)
         self.vertex_data = vertex_data
         self.active_vertex_id = None
         self.selected_vertex_id = None
@@ -781,10 +826,14 @@ class BlueprintCanvas(QWidget):
             available_rect.height() / image_height,
         )
 
-        display_width = image_width * scale
-        display_height = image_height * scale
-        display_x = available_rect.center().x() - display_width / 2.0
-        display_y = available_rect.center().y() - display_height / 2.0
+        display_width = image_width * scale * self.image_scale
+        display_height = image_height * scale * self.image_scale
+        display_center = available_rect.center() + QPointF(
+            self.image_offset_x,
+            self.image_offset_y,
+        )
+        display_x = display_center.x() - display_width / 2.0
+        display_y = display_center.y() - display_height / 2.0
         return QRectF(display_x, display_y, display_width, display_height)
 
     def _widget_to_image(self, widget_point: QPointF) -> QPointF | None:

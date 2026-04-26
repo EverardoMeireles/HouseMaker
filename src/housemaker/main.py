@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QDoubleSpinBox,
     QFileDialog,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -24,7 +25,13 @@ from PySide6.QtWidgets import (
 
 from housemaker.blueprint_canvas import BlueprintCanvas
 from housemaker.glb import DEFAULT_WALL_HEIGHT_METERS, convert_to_glb
-from housemaker.models import GROUND_LEVEL_INDEX, LevelData, create_default_levels
+from housemaker.models import (
+    DEFAULT_IMAGE_OFFSET,
+    DEFAULT_IMAGE_SCALE,
+    GROUND_LEVEL_INDEX,
+    LevelData,
+    create_default_levels,
+)
 from housemaker.project_io import ProjectData, load_project, save_project
 from housemaker.viewer import GlbViewerWindow
 
@@ -116,6 +123,47 @@ class BlueprintWorkspace(QWidget):
         self.load_image_button.clicked.connect(self._handle_load_image_clicked)
         side_layout.addWidget(self.load_image_button)
 
+        image_transform_layout = QFormLayout()
+        image_transform_layout.setContentsMargins(0, 0, 0, 0)
+        image_transform_layout.setSpacing(8)
+
+        self.image_scale_spinbox = self._build_image_transform_spinbox(
+            value=DEFAULT_IMAGE_SCALE,
+            minimum=0.01,
+            maximum=20.0,
+            decimals=3,
+            single_step=0.05,
+        )
+        self.image_scale_spinbox.valueChanged.connect(self._handle_image_scale_changed)
+        image_transform_layout.addRow("Scale", self.image_scale_spinbox)
+
+        self.image_x_offset_spinbox = self._build_image_transform_spinbox(
+            value=DEFAULT_IMAGE_OFFSET,
+            minimum=-100000.0,
+            maximum=100000.0,
+            decimals=1,
+            single_step=1.0,
+            suffix=" px",
+        )
+        self.image_x_offset_spinbox.valueChanged.connect(
+            self._handle_image_x_offset_changed
+        )
+        image_transform_layout.addRow("X offset", self.image_x_offset_spinbox)
+
+        self.image_y_offset_spinbox = self._build_image_transform_spinbox(
+            value=DEFAULT_IMAGE_OFFSET,
+            minimum=-100000.0,
+            maximum=100000.0,
+            decimals=1,
+            single_step=1.0,
+            suffix=" px",
+        )
+        self.image_y_offset_spinbox.valueChanged.connect(
+            self._handle_image_y_offset_changed
+        )
+        image_transform_layout.addRow("Y offset", self.image_y_offset_spinbox)
+        side_layout.addLayout(image_transform_layout)
+
         self.blueprint_name_label = QLabel("Image: none for this level")
         self.blueprint_name_label.setWordWrap(True)
         side_layout.addWidget(self.blueprint_name_label)
@@ -156,6 +204,24 @@ class BlueprintWorkspace(QWidget):
         self._refresh_levels_list()
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
+
+    @staticmethod
+    def _build_image_transform_spinbox(
+        value: float,
+        minimum: float,
+        maximum: float,
+        decimals: int,
+        single_step: float,
+        suffix: str = "",
+    ) -> QDoubleSpinBox:
+        spinbox = QDoubleSpinBox()
+        spinbox.setRange(minimum, maximum)
+        spinbox.setDecimals(decimals)
+        spinbox.setSingleStep(single_step)
+        spinbox.setValue(value)
+        spinbox.setSuffix(suffix)
+        spinbox.setMinimumHeight(34)
+        return spinbox
 
     def load_blueprint(self, file_path: str) -> None:
         self._set_current_level_image(file_path)
@@ -249,6 +315,9 @@ class BlueprintWorkspace(QWidget):
     def _sync_level_controls(self) -> None:
         self._is_syncing_level_controls = True
         self.height_level_spinbox.setValue(self.current_level.height_meters)
+        self.image_scale_spinbox.setValue(self.current_level.image_scale)
+        self.image_x_offset_spinbox.setValue(self.current_level.image_offset_x)
+        self.image_y_offset_spinbox.setValue(self.current_level.image_offset_y)
         if self.levels_list.currentRow() != self.current_level_index:
             self.levels_list.setCurrentRow(self.current_level_index)
         self._update_blueprint_name_label()
@@ -267,6 +336,27 @@ class BlueprintWorkspace(QWidget):
             return
 
         self.current_level.height_meters = value
+
+    def _handle_image_scale_changed(self, value: float) -> None:
+        if self._is_syncing_level_controls:
+            return
+
+        self.current_level.image_scale = value
+        self._sync_canvas_image_transform()
+
+    def _handle_image_x_offset_changed(self, value: float) -> None:
+        if self._is_syncing_level_controls:
+            return
+
+        self.current_level.image_offset_x = value
+        self._sync_canvas_image_transform()
+
+    def _handle_image_y_offset_changed(self, value: float) -> None:
+        if self._is_syncing_level_controls:
+            return
+
+        self.current_level.image_offset_y = value
+        self._sync_canvas_image_transform()
 
     def _apply_loaded_project(self, project_data: ProjectData) -> None:
         self._apply_project_state(
@@ -288,7 +378,13 @@ class BlueprintWorkspace(QWidget):
 
     def _set_current_level_image(self, file_path: str) -> None:
         normalized_path = str(Path(file_path).resolve())
-        self.canvas.load_blueprint(normalized_path, self.current_level.vertex_data)
+        self.canvas.load_blueprint(
+            file_path=normalized_path,
+            vertex_data=self.current_level.vertex_data,
+            image_scale=self.current_level.image_scale,
+            image_offset_x=self.current_level.image_offset_x,
+            image_offset_y=self.current_level.image_offset_y,
+        )
         self.current_level.image_path = normalized_path
         self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
         self._update_blueprint_name_label()
@@ -297,10 +393,20 @@ class BlueprintWorkspace(QWidget):
         self.canvas.set_level_data(
             vertex_data=self.current_level.vertex_data,
             image_path=self.current_level.image_path,
+            image_scale=self.current_level.image_scale,
+            image_offset_x=self.current_level.image_offset_x,
+            image_offset_y=self.current_level.image_offset_y,
         )
         if self.canvas.blueprint_image is not None:
             self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
         self._update_blueprint_name_label()
+
+    def _sync_canvas_image_transform(self) -> None:
+        self.canvas.set_image_transform(
+            image_scale=self.current_level.image_scale,
+            image_offset_x=self.current_level.image_offset_x,
+            image_offset_y=self.current_level.image_offset_y,
+        )
 
     def _update_blueprint_name_label(self) -> None:
         image_path = self.current_level.image_path
