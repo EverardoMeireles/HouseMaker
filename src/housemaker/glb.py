@@ -124,6 +124,9 @@ def _build_multi_level_meshes(
     named_meshes: list[NamedMesh] = []
 
     for level in sorted_levels:
+        if not level.include_in_export:
+            continue
+
         if level.height_meters <= 0.0:
             raise ValueError(f"Level {level.index} height must be greater than zero.")
 

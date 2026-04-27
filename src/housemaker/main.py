@@ -7,6 +7,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QRadioButton,
     QSplitter,
     QStackedWidget,
     QVBoxLayout,
@@ -162,6 +164,23 @@ class BlueprintWorkspace(QWidget):
             self._handle_image_y_offset_changed
         )
         image_transform_layout.addRow("Y offset", self.image_y_offset_spinbox)
+
+        include_widget = QWidget()
+        include_layout = QHBoxLayout(include_widget)
+        include_layout.setContentsMargins(0, 0, 0, 0)
+        include_layout.setSpacing(12)
+
+        self.include_button_group = QButtonGroup(self)
+        self.include_yes_radio = QRadioButton("Yes")
+        self.include_no_radio = QRadioButton("No")
+        self.include_button_group.addButton(self.include_yes_radio)
+        self.include_button_group.addButton(self.include_no_radio)
+        self.include_yes_radio.toggled.connect(self._handle_include_toggled)
+        self.include_no_radio.toggled.connect(self._handle_include_toggled)
+        include_layout.addWidget(self.include_yes_radio)
+        include_layout.addWidget(self.include_no_radio)
+        include_layout.addStretch(1)
+        image_transform_layout.addRow("Include", include_widget)
         side_layout.addLayout(image_transform_layout)
 
         self.blueprint_name_label = QLabel("Image: none for this level")
@@ -318,6 +337,8 @@ class BlueprintWorkspace(QWidget):
         self.image_scale_spinbox.setValue(self.current_level.image_scale)
         self.image_x_offset_spinbox.setValue(self.current_level.image_offset_x)
         self.image_y_offset_spinbox.setValue(self.current_level.image_offset_y)
+        self.include_yes_radio.setChecked(self.current_level.include_in_export)
+        self.include_no_radio.setChecked(not self.current_level.include_in_export)
         if self.levels_list.currentRow() != self.current_level_index:
             self.levels_list.setCurrentRow(self.current_level_index)
         self._update_blueprint_name_label()
@@ -357,6 +378,12 @@ class BlueprintWorkspace(QWidget):
 
         self.current_level.image_offset_y = value
         self._sync_canvas_image_transform()
+
+    def _handle_include_toggled(self, checked: bool) -> None:
+        if self._is_syncing_level_controls or not checked:
+            return
+
+        self.current_level.include_in_export = self.include_yes_radio.isChecked()
 
     def _apply_loaded_project(self, project_data: ProjectData) -> None:
         self._apply_project_state(

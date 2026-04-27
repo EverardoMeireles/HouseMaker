@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 DEFAULT_LEVEL_HEIGHT_METERS = 3.0
 DEFAULT_IMAGE_SCALE = 1.0
 DEFAULT_IMAGE_OFFSET = 0.0
+DEFAULT_INCLUDE_IN_EXPORT = True
 GROUND_LEVEL_INDEX = 2
 MIN_LEVEL_INDEX = 0
 MAX_LEVEL_INDEX = 7
@@ -167,6 +168,7 @@ class LevelData:
     image_scale: float = DEFAULT_IMAGE_SCALE
     image_offset_x: float = DEFAULT_IMAGE_OFFSET
     image_offset_y: float = DEFAULT_IMAGE_OFFSET
+    include_in_export: bool = DEFAULT_INCLUDE_IN_EXPORT
 
     @property
     def display_name(self) -> str:
