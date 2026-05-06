@@ -10,6 +10,10 @@ DEFAULT_LEVEL_HEIGHT_METERS = 3.0
 DEFAULT_IMAGE_SCALE = 1.0
 DEFAULT_IMAGE_OFFSET = 0.0
 DEFAULT_INCLUDE_IN_EXPORT = True
+DEFAULT_UV_MAP_WIDTH = 1024
+DEFAULT_UV_MAP_HEIGHT = 1024
+DEFAULT_WALL_UV_SCALE = 1.0
+DEFAULT_WALL_UV_ROTATION_DEGREES = 0
 GROUND_LEVEL_INDEX = 2
 MIN_LEVEL_INDEX = 0
 MAX_LEVEL_INDEX = 7
@@ -30,12 +34,16 @@ class Edge:
     end_vertex_id: int
 
 
-@dataclass(frozen=True)
+@dataclass
 class RoomData:
     name: str
     vertex_ids: tuple[int, ...]
     center_vertex_id: int
     color_rgb: tuple[int, int, int]
+    uv_map_width: int = DEFAULT_UV_MAP_WIDTH
+    uv_map_height: int = DEFAULT_UV_MAP_HEIGHT
+    wall_uv_scales: dict[str, float] = field(default_factory=dict)
+    wall_uv_rotations: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass

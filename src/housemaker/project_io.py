@@ -9,6 +9,8 @@ from housemaker.models import (
     DEFAULT_INCLUDE_IN_EXPORT,
     DEFAULT_IMAGE_OFFSET,
     DEFAULT_IMAGE_SCALE,
+    DEFAULT_UV_MAP_HEIGHT,
+    DEFAULT_UV_MAP_WIDTH,
     GROUND_LEVEL_INDEX,
     LevelData,
     RoomData,
@@ -155,6 +157,16 @@ def _serialize_room(room: RoomData) -> dict[str, object]:
         "vertex_ids": [int(vertex_id) for vertex_id in room.vertex_ids],
         "center_vertex_id": int(room.center_vertex_id),
         "color_rgb": [int(color_value) for color_value in room.color_rgb],
+        "uv_map_width": int(room.uv_map_width),
+        "uv_map_height": int(room.uv_map_height),
+        "wall_uv_scales": {
+            str(wall_key): float(wall_scale)
+            for wall_key, wall_scale in room.wall_uv_scales.items()
+        },
+        "wall_uv_rotations": {
+            str(wall_key): int(wall_rotation)
+            for wall_key, wall_rotation in room.wall_uv_rotations.items()
+        },
     }
 
 
@@ -184,7 +196,48 @@ def _deserialize_rooms(raw_rooms: object) -> list[RoomData]:
                     int(raw_color[1]),
                     int(raw_color[2]),
                 ),
+                uv_map_width=int(
+                    raw_room.get("uv_map_width", DEFAULT_UV_MAP_WIDTH)
+                ),
+                uv_map_height=int(
+                    raw_room.get("uv_map_height", DEFAULT_UV_MAP_HEIGHT)
+                ),
+                wall_uv_scales=_deserialize_wall_uv_scales(
+                    raw_room.get("wall_uv_scales", {})
+                ),
+                wall_uv_rotations=_deserialize_wall_uv_rotations(
+                    raw_room.get("wall_uv_rotations", {})
+                ),
             )
         )
 
     return rooms
+
+
+def _deserialize_wall_uv_scales(raw_wall_uv_scales: object) -> dict[str, float]:
+    if not isinstance(raw_wall_uv_scales, dict):
+        return {}
+
+    return {
+        str(wall_key): float(wall_scale)
+        for wall_key, wall_scale in raw_wall_uv_scales.items()
+    }
+
+
+def _deserialize_wall_uv_rotations(raw_wall_uv_rotations: object) -> dict[str, int]:
+    if not isinstance(raw_wall_uv_rotations, dict):
+        return {}
+
+    return {
+        str(wall_key): _normalize_wall_uv_rotation(wall_rotation)
+        for wall_key, wall_rotation in raw_wall_uv_rotations.items()
+    }
+
+
+def _normalize_wall_uv_rotation(raw_wall_rotation: object) -> int:
+    try:
+        rotation_degrees = int(raw_wall_rotation)
+    except (TypeError, ValueError):
+        return 0
+
+    return (round(rotation_degrees / 90) * 90) % 360

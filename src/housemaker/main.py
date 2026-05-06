@@ -22,7 +22,9 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QSplitter,
+    QSpinBox,
     QStackedWidget,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -32,11 +34,17 @@ from housemaker.glb import DEFAULT_WALL_HEIGHT_METERS, convert_to_glb
 from housemaker.models import (
     DEFAULT_IMAGE_OFFSET,
     DEFAULT_IMAGE_SCALE,
+    DEFAULT_UV_MAP_HEIGHT,
+    DEFAULT_UV_MAP_WIDTH,
+    DEFAULT_WALL_UV_ROTATION_DEGREES,
+    DEFAULT_WALL_UV_SCALE,
     GROUND_LEVEL_INDEX,
     LevelData,
+    RoomData,
     create_default_levels,
 )
 from housemaker.project_io import ProjectData, load_project, save_project
+from housemaker.uv_canvas import UvCanvas, calculate_unoccupied_uv_pixels
 from housemaker.viewer import GlbViewerWindow
 
 # ### Widgets ###
@@ -74,6 +82,40 @@ class HomePage(QWidget):
         layout.addStretch(2)
 
 
+class PowerOfTwoSpinBox(QSpinBox):
+    def setValue(self, value: int) -> None:  # type: ignore[override]
+        super().setValue(_nearest_power_of_two_value(value))
+
+    def stepBy(self, steps: int) -> None:  # type: ignore[override]
+        self.setValue(_step_power_of_two_value(self.value(), steps))
+
+    def valueFromText(self, text: str) -> int:  # type: ignore[override]
+        try:
+            return _nearest_power_of_two_value(int(text or self.minimum()))
+        except ValueError:
+            return self.value()
+
+    def textFromValue(self, value: int) -> str:  # type: ignore[override]
+        return str(_nearest_power_of_two_value(value))
+
+
+class RightAngleSpinBox(QSpinBox):
+    def setValue(self, value: int) -> None:  # type: ignore[override]
+        super().setValue(_nearest_right_angle_value(value))
+
+    def stepBy(self, steps: int) -> None:  # type: ignore[override]
+        self.setValue(_step_right_angle_value(self.value(), steps))
+
+    def valueFromText(self, text: str) -> int:  # type: ignore[override]
+        try:
+            return _nearest_right_angle_value(int(text or self.minimum()))
+        except ValueError:
+            return self.value()
+
+    def textFromValue(self, value: int) -> str:  # type: ignore[override]
+        return str(_nearest_right_angle_value(value))
+
+
 class BlueprintWorkspace(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -81,6 +123,7 @@ class BlueprintWorkspace(QWidget):
         self.levels: list[LevelData] = create_default_levels()
         self.current_level_index = GROUND_LEVEL_INDEX
         self._is_syncing_level_controls = False
+        self._is_syncing_uv_controls = False
         self._build_ui()
 
     @property
@@ -107,6 +150,16 @@ class BlueprintWorkspace(QWidget):
         side_layout = QVBoxLayout(side_panel)
         side_layout.setContentsMargins(16, 16, 16, 16)
         side_layout.setSpacing(12)
+
+        self.side_tabs = QTabWidget()
+        side_layout.addWidget(self.side_tabs, 1)
+
+        generals_tab = QWidget()
+        generals_layout = QVBoxLayout(generals_tab)
+        generals_layout.setContentsMargins(10, 12, 10, 10)
+        generals_layout.setSpacing(12)
+        self.side_tabs.addTab(generals_tab, "Generals")
+        side_layout = generals_layout
 
         height_label = QLabel("Height level")
         height_label.setStyleSheet("font-size: 18px; font-weight: 600;")
@@ -262,16 +315,83 @@ class BlueprintWorkspace(QWidget):
         buttons_layout.addWidget(self.convert_button, 1)
         side_layout.addLayout(buttons_layout)
 
+        self.side_tabs.addTab(self._build_uvs_tab(), "UVs")
+
         splitter.addWidget(side_panel)
         splitter.setStretchFactor(0, 9)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([1160, 440])
 
-        self.canvas.rooms_changed.connect(self._refresh_rooms_list)
+        self.canvas.rooms_changed.connect(self._refresh_room_lists)
         self._refresh_levels_list()
-        self._refresh_rooms_list()
+        self._refresh_room_lists()
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
+
+    def _build_uvs_tab(self) -> QWidget:
+        uvs_tab = QWidget()
+        uvs_layout = QVBoxLayout(uvs_tab)
+        uvs_layout.setContentsMargins(10, 12, 10, 10)
+        uvs_layout.setSpacing(12)
+
+        uv_map_label = QLabel("UV Map")
+        uv_map_label.setStyleSheet("font-size: 18px; font-weight: 600;")
+        uvs_layout.addWidget(uv_map_label)
+
+        self.uv_canvas = UvCanvas()
+        self.uv_canvas.selected_wall_changed.connect(self._handle_uv_wall_selected)
+        uvs_layout.addWidget(self.uv_canvas, 2)
+
+        uv_controls_layout = QFormLayout()
+        uv_controls_layout.setContentsMargins(0, 0, 0, 0)
+        uv_controls_layout.setSpacing(8)
+
+        self.unoccupied_uv_pixels_label = QLabel("Unoccupied pixels: 0")
+        self.unoccupied_uv_pixels_label.setMinimumHeight(24)
+        uv_controls_layout.addRow("", self.unoccupied_uv_pixels_label)
+
+        self.uv_map_width_spinbox = PowerOfTwoSpinBox()
+        self.uv_map_width_spinbox.setRange(64, 8192)
+        self.uv_map_width_spinbox.valueChanged.connect(
+            self._handle_uv_map_width_changed
+        )
+        uv_controls_layout.addRow("Map X", self.uv_map_width_spinbox)
+
+        self.uv_map_height_spinbox = PowerOfTwoSpinBox()
+        self.uv_map_height_spinbox.setRange(64, 8192)
+        self.uv_map_height_spinbox.valueChanged.connect(
+            self._handle_uv_map_height_changed
+        )
+        uv_controls_layout.addRow("Map Y", self.uv_map_height_spinbox)
+
+        self.uv_wall_scale_spinbox = QDoubleSpinBox()
+        self.uv_wall_scale_spinbox.setRange(0.01, 100.0)
+        self.uv_wall_scale_spinbox.setDecimals(3)
+        self.uv_wall_scale_spinbox.setSingleStep(0.05)
+        self.uv_wall_scale_spinbox.valueChanged.connect(
+            self._handle_uv_wall_scale_changed
+        )
+        uv_controls_layout.addRow("Wall scale", self.uv_wall_scale_spinbox)
+
+        self.uv_wall_rotation_spinbox = RightAngleSpinBox()
+        self.uv_wall_rotation_spinbox.setRange(0, 270)
+        self.uv_wall_rotation_spinbox.setSuffix(" deg")
+        self.uv_wall_rotation_spinbox.valueChanged.connect(
+            self._handle_uv_wall_rotation_changed
+        )
+        uv_controls_layout.addRow("Wall rotation", self.uv_wall_rotation_spinbox)
+        uvs_layout.addLayout(uv_controls_layout)
+
+        uv_rooms_label = QLabel("Rooms")
+        uv_rooms_label.setStyleSheet("font-size: 18px; font-weight: 600;")
+        uvs_layout.addWidget(uv_rooms_label)
+
+        self.uv_rooms_list = QListWidget()
+        self.uv_rooms_list.currentRowChanged.connect(
+            self._handle_uv_room_selection_changed
+        )
+        uvs_layout.addWidget(self.uv_rooms_list, 1)
+        return uvs_tab
 
     @staticmethod
     def _build_image_transform_spinbox(
@@ -393,6 +513,32 @@ class BlueprintWorkspace(QWidget):
         ):
             self.rooms_list.setCurrentRow(selected_room_index)
 
+    def _refresh_room_lists(self) -> None:
+        self._refresh_rooms_list()
+        self._refresh_uv_rooms_list()
+        self._sync_uv_controls()
+
+    def _refresh_uv_rooms_list(self) -> None:
+        selected_room_index = self._get_selected_uv_room_index()
+        self.uv_rooms_list.clear()
+        for room_index, room in enumerate(self.current_level.rooms):
+            room_item = self._build_room_item(room_index, room.name)
+            self.uv_rooms_list.addItem(room_item)
+
+        if self.uv_rooms_list.count() == 0:
+            self._sync_uv_controls()
+            return
+
+        if selected_room_index is None:
+            self.uv_rooms_list.setCurrentRow(0)
+            return
+
+        if selected_room_index < self.uv_rooms_list.count():
+            self.uv_rooms_list.setCurrentRow(selected_room_index)
+            return
+
+        self.uv_rooms_list.setCurrentRow(self.uv_rooms_list.count() - 1)
+
     def _build_room_item(self, room_index: int, room_name: str) -> QListWidgetItem:
         room_item = QListWidgetItem(room_name)
         room_item.setData(Qt.ItemDataRole.UserRole, room_index)
@@ -409,6 +555,24 @@ class BlueprintWorkspace(QWidget):
 
         return int(room_index)
 
+    def _get_selected_uv_room_index(self) -> int | None:
+        selected_item = self.uv_rooms_list.currentItem()
+        if selected_item is None:
+            return None
+
+        room_index = selected_item.data(Qt.ItemDataRole.UserRole)
+        if room_index is None:
+            return None
+
+        return int(room_index)
+
+    def _get_selected_uv_room(self) -> RoomData | None:
+        room_index = self._get_selected_uv_room_index()
+        if room_index is None or room_index >= len(self.current_level.rooms):
+            return None
+
+        return self.current_level.rooms[room_index]
+
     def _sync_level_controls(self) -> None:
         self._is_syncing_level_controls = True
         self.height_level_spinbox.setValue(self.current_level.height_meters)
@@ -422,6 +586,73 @@ class BlueprintWorkspace(QWidget):
         self._update_blueprint_name_label()
         self._is_syncing_level_controls = False
 
+    def _sync_uv_controls(self) -> None:
+        self._is_syncing_uv_controls = True
+        selected_room = self._get_selected_uv_room()
+        has_room = selected_room is not None
+        self.uv_map_width_spinbox.setEnabled(has_room)
+        self.uv_map_height_spinbox.setEnabled(has_room)
+        self.unoccupied_uv_pixels_label.setEnabled(has_room)
+
+        if selected_room is None:
+            self.uv_canvas.set_room_context(None, None, self.current_level.height_meters)
+            self.uv_map_width_spinbox.setValue(DEFAULT_UV_MAP_WIDTH)
+            self.uv_map_height_spinbox.setValue(DEFAULT_UV_MAP_HEIGHT)
+            self.uv_wall_scale_spinbox.setValue(DEFAULT_WALL_UV_SCALE)
+            self.uv_wall_scale_spinbox.setEnabled(False)
+            self.uv_wall_rotation_spinbox.setValue(DEFAULT_WALL_UV_ROTATION_DEGREES)
+            self.uv_wall_rotation_spinbox.setEnabled(False)
+            self.unoccupied_uv_pixels_label.setText("Unoccupied pixels: 0")
+            self._is_syncing_uv_controls = False
+            return
+
+        self.uv_canvas.set_room_context(
+            selected_room,
+            self.current_level.vertex_data,
+            self.current_level.height_meters,
+        )
+        self.uv_map_width_spinbox.setValue(selected_room.uv_map_width)
+        self.uv_map_height_spinbox.setValue(selected_room.uv_map_height)
+
+        selected_wall_key = self.uv_canvas.get_selected_wall_key()
+        has_selected_wall = selected_wall_key is not None
+        self.uv_wall_scale_spinbox.setEnabled(has_selected_wall)
+        self.uv_wall_rotation_spinbox.setEnabled(has_selected_wall)
+        if selected_wall_key is None:
+            self.uv_wall_scale_spinbox.setValue(DEFAULT_WALL_UV_SCALE)
+            self.uv_wall_rotation_spinbox.setValue(DEFAULT_WALL_UV_ROTATION_DEGREES)
+        else:
+            self.uv_wall_scale_spinbox.setValue(
+                selected_room.wall_uv_scales.get(
+                    selected_wall_key,
+                    DEFAULT_WALL_UV_SCALE,
+                )
+            )
+            self.uv_wall_rotation_spinbox.setValue(
+                selected_room.wall_uv_rotations.get(
+                    selected_wall_key,
+                    DEFAULT_WALL_UV_ROTATION_DEGREES,
+                )
+            )
+
+        self._update_unoccupied_uv_pixels_label()
+        self._is_syncing_uv_controls = False
+
+    def _update_unoccupied_uv_pixels_label(self) -> None:
+        selected_room = self._get_selected_uv_room()
+        if selected_room is None:
+            self.unoccupied_uv_pixels_label.setText("Unoccupied pixels: 0")
+            return
+
+        unoccupied_pixels = calculate_unoccupied_uv_pixels(
+            room=selected_room,
+            vertex_data=self.current_level.vertex_data,
+            wall_height_meters=self.current_level.height_meters,
+        )
+        self.unoccupied_uv_pixels_label.setText(
+            f"Unoccupied pixels: {unoccupied_pixels:,}"
+        )
+
     def _handle_level_selection_changed(self, level_index: int) -> None:
         if self._is_syncing_level_controls or level_index < 0 or level_index >= len(self.levels):
             return
@@ -429,13 +660,14 @@ class BlueprintWorkspace(QWidget):
         self.current_level_index = level_index
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
-        self._refresh_rooms_list()
+        self._refresh_room_lists()
 
     def _handle_height_level_changed(self, value: float) -> None:
         if self._is_syncing_level_controls:
             return
 
         self.current_level.height_meters = value
+        self._sync_uv_controls()
 
     def _handle_image_scale_changed(self, value: float) -> None:
         if self._is_syncing_level_controls:
@@ -467,6 +699,64 @@ class BlueprintWorkspace(QWidget):
     def _handle_snap_middle_equal_angle_toggled(self, checked: bool) -> None:
         self.canvas.set_snap_middle_equal_angle_only(checked)
 
+    def _handle_uv_room_selection_changed(self, room_index: int) -> None:
+        self._sync_uv_controls()
+
+    def _handle_uv_map_width_changed(self, value: int) -> None:
+        if self._is_syncing_uv_controls:
+            return
+
+        selected_room = self._get_selected_uv_room()
+        if selected_room is None:
+            return
+
+        selected_room.uv_map_width = int(value)
+        self.uv_canvas.update()
+        self._update_unoccupied_uv_pixels_label()
+
+    def _handle_uv_map_height_changed(self, value: int) -> None:
+        if self._is_syncing_uv_controls:
+            return
+
+        selected_room = self._get_selected_uv_room()
+        if selected_room is None:
+            return
+
+        selected_room.uv_map_height = int(value)
+        self.uv_canvas.update()
+        self._update_unoccupied_uv_pixels_label()
+
+    def _handle_uv_wall_selected(self, wall_key: str) -> None:
+        self._sync_uv_controls()
+
+    def _handle_uv_wall_scale_changed(self, value: float) -> None:
+        if self._is_syncing_uv_controls:
+            return
+
+        selected_room = self._get_selected_uv_room()
+        selected_wall_key = self.uv_canvas.get_selected_wall_key()
+        if selected_room is None or selected_wall_key is None:
+            return
+
+        selected_room.wall_uv_scales[selected_wall_key] = float(value)
+        self.uv_canvas.update()
+        self._update_unoccupied_uv_pixels_label()
+
+    def _handle_uv_wall_rotation_changed(self, value: int) -> None:
+        if self._is_syncing_uv_controls:
+            return
+
+        selected_room = self._get_selected_uv_room()
+        selected_wall_key = self.uv_canvas.get_selected_wall_key()
+        if selected_room is None or selected_wall_key is None:
+            return
+
+        selected_room.wall_uv_rotations[selected_wall_key] = _nearest_right_angle_value(
+            value
+        )
+        self.uv_canvas.update()
+        self._update_unoccupied_uv_pixels_label()
+
     def _handle_designate_room_clicked(self) -> None:
         room_name = self.room_name_field.text().strip()
         if not room_name:
@@ -482,7 +772,11 @@ class BlueprintWorkspace(QWidget):
             )
             return
 
-        self.canvas.start_room_designation(room_name, selected_vertex_ids)
+        self.canvas.start_room_designation(
+            room_name,
+            selected_vertex_ids,
+            self.current_level.height_meters,
+        )
         QMessageBox.information(
             self,
             "Set room center",
@@ -513,7 +807,7 @@ class BlueprintWorkspace(QWidget):
         self._refresh_levels_list()
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
-        self._refresh_rooms_list()
+        self._refresh_room_lists()
 
     def _set_current_level_image(self, file_path: str) -> None:
         normalized_path = str(Path(file_path).resolve())
@@ -585,6 +879,47 @@ class MainWindow(QMainWindow):
 
     def _open_blueprint_mode(self) -> None:
         self.stack.setCurrentWidget(self.blueprint_workspace)
+
+
+# ### Numeric helpers ###
+def _nearest_power_of_two_value(value: int) -> int:
+    clamped_value = min(max(int(value), 64), 8192)
+    lower_power = 64
+    while lower_power * 2 <= clamped_value:
+        lower_power *= 2
+
+    upper_power = min(lower_power * 2, 8192)
+    if clamped_value - lower_power <= upper_power - clamped_value:
+        return lower_power
+
+    return upper_power
+
+
+def _step_power_of_two_value(value: int, steps: int) -> int:
+    power_value = _nearest_power_of_two_value(value)
+    for _ in range(abs(steps)):
+        if steps > 0:
+            power_value = min(power_value * 2, 8192)
+        else:
+            power_value = max(power_value // 2, 64)
+
+    return power_value
+
+
+def _nearest_right_angle_value(value: int) -> int:
+    clamped_value = min(max(int(value), 0), 270)
+    return (round(clamped_value / 90) * 90) % 360
+
+
+def _step_right_angle_value(value: int, steps: int) -> int:
+    right_angle_value = _nearest_right_angle_value(value)
+    for _ in range(abs(steps)):
+        if steps > 0:
+            right_angle_value = min(right_angle_value + 90, 270)
+        else:
+            right_angle_value = max(right_angle_value - 90, 0)
+
+    return right_angle_value
 
 
 # ### Entrypoint ###

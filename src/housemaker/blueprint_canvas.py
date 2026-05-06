@@ -1,6 +1,7 @@
 # ### Imports ###
 from __future__ import annotations
 
+import copy
 import math
 import random
 from dataclasses import dataclass
@@ -30,6 +31,7 @@ from housemaker.models import (
     VertexData,
     snap_point,
 )
+from housemaker.uv_canvas import initialize_room_uv_map_size
 
 # ### Constants ###
 CANVAS_BACKGROUND_COLOR = QColor("#1c1f24")
@@ -129,6 +131,7 @@ class BlueprintCanvas(QWidget):
         self.snap_middle_equal_angle_only = True
         self.pending_room_name: str | None = None
         self.pending_room_vertex_ids: tuple[int, ...] = ()
+        self.pending_room_wall_height_meters = 3.0
 
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -232,9 +235,11 @@ class BlueprintCanvas(QWidget):
         self,
         room_name: str,
         vertex_ids: list[int],
+        wall_height_meters: float,
     ) -> None:
         self.pending_room_name = room_name.strip()
         self.pending_room_vertex_ids = tuple(sorted(set(vertex_ids)))
+        self.pending_room_wall_height_meters = wall_height_meters
         self.preview_point = None
         self.preview_guides = []
         self.update()
@@ -284,7 +289,7 @@ class BlueprintCanvas(QWidget):
         snapshot = self.undo_stack.pop()
         self.vertex_data.copy_from(snapshot.vertex_data)
         self.rooms.clear()
-        self.rooms.extend(snapshot.rooms)
+        self.rooms.extend(copy.deepcopy(snapshot.rooms))
         self.active_vertex_id = snapshot.active_vertex_id
         self.selected_vertex_id = snapshot.selected_vertex_id
         self.selected_vertex_ids = set(snapshot.selected_vertex_ids)
@@ -530,7 +535,7 @@ class BlueprintCanvas(QWidget):
     def _push_undo_state(self) -> None:
         snapshot = CanvasSnapshot(
             vertex_data=self.vertex_data.clone(),
-            rooms=list(self.rooms),
+            rooms=copy.deepcopy(self.rooms),
             active_vertex_id=self.active_vertex_id,
             selected_vertex_id=self.selected_vertex_id,
             selected_vertex_ids=set(self.selected_vertex_ids),
@@ -589,14 +594,18 @@ class BlueprintCanvas(QWidget):
             return
 
         self._push_undo_state()
-        self.rooms.append(
-            RoomData(
-                name=self.pending_room_name,
-                vertex_ids=room_vertex_ids,
-                center_vertex_id=center_vertex_id,
-                color_rgb=_build_random_room_color(),
-            )
+        room = RoomData(
+            name=self.pending_room_name,
+            vertex_ids=room_vertex_ids,
+            center_vertex_id=center_vertex_id,
+            color_rgb=_build_random_room_color(),
         )
+        initialize_room_uv_map_size(
+            room=room,
+            vertex_data=self.vertex_data,
+            wall_height_meters=self.pending_room_wall_height_meters,
+        )
+        self.rooms.append(room)
         self.selected_vertex_id = center_vertex_id
         self.selected_vertex_ids.clear()
         self._reset_room_designation()
@@ -605,6 +614,7 @@ class BlueprintCanvas(QWidget):
     def _reset_room_designation(self) -> None:
         self.pending_room_name = None
         self.pending_room_vertex_ids = ()
+        self.pending_room_wall_height_meters = 3.0
 
     def _remove_vertex_from_rooms(self, deleted_vertex_id: int) -> None:
         original_rooms = list(self.rooms)
@@ -627,6 +637,10 @@ class BlueprintCanvas(QWidget):
                     vertex_ids=remaining_vertex_ids,
                     center_vertex_id=room.center_vertex_id,
                     color_rgb=room.color_rgb,
+                    uv_map_width=room.uv_map_width,
+                    uv_map_height=room.uv_map_height,
+                    wall_uv_scales=copy.deepcopy(room.wall_uv_scales),
+                    wall_uv_rotations=copy.deepcopy(room.wall_uv_rotations),
                 )
             )
 
