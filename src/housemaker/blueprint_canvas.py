@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from itertools import combinations
 from pathlib import Path
 
 import cv2
@@ -33,6 +34,8 @@ TEXT_COLOR = QColor("#f5f7fa")
 IMAGE_MARGIN = 16.0
 VERTEX_RADIUS_SCREEN = 6.0
 AXIS_SNAP_TOLERANCE_SCREEN = 10.0
+CENTER_SNAP_TOLERANCE_SCREEN = 10.0
+CENTER_SNAP_EQUAL_ANGLE_TOLERANCE_DEGREES = 1.0
 DRAG_THRESHOLD_SCREEN = 4.0
 MIN_ZOOM_SCALE = 1.0
 MAX_ZOOM_SCALE = 16.0
@@ -60,11 +63,24 @@ class SnapPreview:
 
 
 @dataclass(frozen=True)
+class CenterSnapCandidate:
+    source_vertex_ids: tuple[int, int, int, int]
+    point: tuple[float, float]
+    distance: float
+
+
+@dataclass(frozen=True)
 class AxisSnapCandidate:
     source_vertex_id: int
     axis: str
     value: float
     distance: float
+
+
+@dataclass(frozen=True)
+class VertexPairCenter:
+    source_vertex_ids: tuple[int, int]
+    point: tuple[float, float]
 
 
 # ### Widgets ###
@@ -91,6 +107,7 @@ class BlueprintCanvas(QWidget):
         self.is_panning = False
         self.pan_press_position: QPointF | None = None
         self.pan_start_offset = QPointF(0.0, 0.0)
+        self.snap_middle_equal_angle_only = True
 
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -169,6 +186,12 @@ class BlueprintCanvas(QWidget):
         self.image_scale = max(0.01, float(image_scale))
         self.image_offset_x = float(image_offset_x)
         self.image_offset_y = float(image_offset_y)
+        self.update()
+
+    def set_snap_middle_equal_angle_only(self, enabled: bool) -> None:
+        self.snap_middle_equal_angle_only = bool(enabled)
+        self.preview_point = None
+        self.preview_guides = []
         self.update()
 
     def _set_level_contents(
@@ -456,29 +479,33 @@ class BlueprintCanvas(QWidget):
         modifiers: Qt.KeyboardModifier,
     ) -> SnapPreview:
         raw_x, raw_y = self._clamp_image_point(image_point.x(), image_point.y())
+        raw_point = (raw_x, raw_y)
         modifier_bits = getattr(modifiers, "value", modifiers)
         control_modifier = Qt.KeyboardModifier.ControlModifier.value
+        center_candidate = self._find_center_snap_candidate(raw_point)
+        if center_candidate is not None:
+            return self._build_center_snap_preview(center_candidate)
 
         if self.active_vertex_id is None:
-            return SnapPreview(point=(raw_x, raw_y), guides=[])
+            return SnapPreview(point=raw_point, guides=[])
 
         base_vertex = self.vertex_data.get_vertex(self.active_vertex_id)
         if base_vertex is None:
-            return SnapPreview(point=(raw_x, raw_y), guides=[])
+            return SnapPreview(point=raw_point, guides=[])
 
         axis_candidates = self._find_axis_snap_candidates(
-            (raw_x, raw_y),
+            raw_point,
             excluded_vertex_ids={base_vertex.id},
         )
 
         if modifier_bits & control_modifier:
-            return self._build_axis_only_preview((raw_x, raw_y), axis_candidates)
+            return self._build_axis_only_preview(raw_point, axis_candidates)
 
         snapped_x, snapped_y = snap_point(base_vertex, raw_x, raw_y)
         angle_snapped_point = self._clamp_image_point(snapped_x, snapped_y)
         axis_and_angle_preview = self._build_axis_and_angle_preview(
             base_vertex,
-            (raw_x, raw_y),
+            raw_point,
             axis_candidates,
         )
         if axis_and_angle_preview is not None:
@@ -492,6 +519,13 @@ class BlueprintCanvas(QWidget):
         dragged_vertex_id: int,
     ) -> SnapPreview:
         raw_point = self._clamp_image_point(image_point.x(), image_point.y())
+        center_candidate = self._find_center_snap_candidate(
+            raw_point,
+            excluded_vertex_ids={dragged_vertex_id},
+        )
+        if center_candidate is not None:
+            return self._build_center_snap_preview(center_candidate)
+
         axis_candidates = self._find_axis_snap_candidates(
             raw_point,
             excluded_vertex_ids={dragged_vertex_id},
@@ -658,6 +692,113 @@ class BlueprintCanvas(QWidget):
 
         return candidates
 
+    def _find_center_snap_candidate(
+        self,
+        point: tuple[float, float],
+        excluded_vertex_ids: set[int] | None = None,
+    ) -> CenterSnapCandidate | None:
+        excluded_ids = excluded_vertex_ids or set()
+        snap_vertices = [
+            vertex
+            for vertex in self.vertex_data.vertices
+            if vertex.id not in excluded_ids
+        ]
+        if len(snap_vertices) < 4:
+            return None
+
+        tolerance = self._screen_distance_to_image(CENTER_SNAP_TOLERANCE_SCREEN)
+        near_pair_centers: list[VertexPairCenter] = []
+        for first_vertex, second_vertex in combinations(snap_vertices, 2):
+            pair_center = (
+                (first_vertex.x + second_vertex.x) / 2.0,
+                (first_vertex.y + second_vertex.y) / 2.0,
+            )
+            if self._point_distance(pair_center, point) > tolerance:
+                continue
+
+            near_pair_centers.append(
+                VertexPairCenter(
+                    source_vertex_ids=(first_vertex.id, second_vertex.id),
+                    point=pair_center,
+                )
+            )
+
+        best_candidate: CenterSnapCandidate | None = None
+        best_candidate_key: tuple[float, float] | None = None
+        for first_pair, second_pair in combinations(near_pair_centers, 2):
+            if _vertex_pairs_overlap(first_pair, second_pair):
+                continue
+
+            midpoint_spread = self._point_distance(first_pair.point, second_pair.point)
+            if midpoint_spread > tolerance:
+                continue
+
+            center_point = (
+                (first_pair.point[0] + second_pair.point[0]) / 2.0,
+                (first_pair.point[1] + second_pair.point[1]) / 2.0,
+            )
+            center_distance = self._point_distance(center_point, point)
+            if center_distance > tolerance:
+                continue
+
+            candidate_key = (center_distance, midpoint_spread)
+            if best_candidate_key is not None and candidate_key >= best_candidate_key:
+                continue
+
+            combined_source_ids = sorted(
+                first_pair.source_vertex_ids + second_pair.source_vertex_ids
+            )
+            source_vertex_ids = (
+                combined_source_ids[0],
+                combined_source_ids[1],
+                combined_source_ids[2],
+                combined_source_ids[3],
+            )
+            if self.snap_middle_equal_angle_only and not self._has_equal_corner_angles(
+                source_vertex_ids
+            ):
+                continue
+
+            best_candidate = CenterSnapCandidate(
+                source_vertex_ids=source_vertex_ids,
+                point=center_point,
+                distance=center_distance,
+            )
+            best_candidate_key = candidate_key
+
+        return best_candidate
+
+    def _has_equal_corner_angles(
+        self,
+        source_vertex_ids: tuple[int, int, int, int],
+    ) -> bool:
+        vertices = [
+            vertex
+            for vertex_id in source_vertex_ids
+            if (vertex := self.vertex_data.get_vertex(vertex_id)) is not None
+        ]
+        if len(vertices) != 4:
+            return False
+
+        center_x = sum(vertex.x for vertex in vertices) / 4.0
+        center_y = sum(vertex.y for vertex in vertices) / 4.0
+        ordered_vertices = sorted(
+            vertices,
+            key=lambda vertex: math.atan2(vertex.y - center_y, vertex.x - center_x),
+        )
+        corner_angles = [
+            _calculate_corner_angle(
+                previous_vertex=ordered_vertices[index - 1],
+                current_vertex=ordered_vertices[index],
+                next_vertex=ordered_vertices[(index + 1) % len(ordered_vertices)],
+            )
+            for index in range(len(ordered_vertices))
+        ]
+        return all(
+            abs(corner_angle - 90.0) <= CENTER_SNAP_EQUAL_ANGLE_TOLERANCE_DEGREES
+            for corner_angle in corner_angles
+        )
+
     def _build_axis_and_angle_preview(
         self,
         base_vertex: Vertex,
@@ -719,6 +860,22 @@ class BlueprintCanvas(QWidget):
 
         snapped_point = self._clamp_image_point(snapped_x, snapped_y)
         return SnapPreview(point=snapped_point, guides=guides)
+
+    def _build_center_snap_preview(
+        self,
+        center_candidate: CenterSnapCandidate,
+    ) -> SnapPreview:
+        snapped_point = self._clamp_image_point(
+            center_candidate.point[0],
+            center_candidate.point[1],
+        )
+        return SnapPreview(
+            point=snapped_point,
+            guides=[
+                SnapGuide(source_vertex_id=vertex_id, axis="center")
+                for vertex_id in center_candidate.source_vertex_ids
+            ],
+        )
 
     def _solve_axis_locked_angle_point(
         self,
@@ -910,10 +1067,21 @@ class BlueprintCanvas(QWidget):
         guide_pen = QPen(GUIDE_COLOR, 1.5, Qt.PenStyle.DashLine)
         guide_pen.setDashPattern([3.0, 5.0])
         painter.setPen(guide_pen)
+        preview_widget_point = self._image_to_widget(
+            self.preview_point[0],
+            self.preview_point[1],
+        )
 
         for guide in self.preview_guides:
             source_vertex = self.vertex_data.get_vertex(guide.source_vertex_id)
             if source_vertex is None:
+                continue
+
+            if guide.axis == "center":
+                painter.drawLine(
+                    self._image_to_widget(source_vertex.x, source_vertex.y),
+                    preview_widget_point,
+                )
                 continue
 
             if guide.axis == "x":
@@ -1009,3 +1177,43 @@ def _load_qimage_from_path(file_path: str) -> QImage:
         bytes_per_line,
         QImage.Format.Format_RGB888,
     ).copy()
+
+
+# ### Geometry helpers ###
+def _vertex_pairs_overlap(
+    first_pair: VertexPairCenter,
+    second_pair: VertexPairCenter,
+) -> bool:
+    first_source_ids = first_pair.source_vertex_ids
+    second_source_ids = second_pair.source_vertex_ids
+    return (
+        first_source_ids[0] in second_source_ids
+        or first_source_ids[1] in second_source_ids
+    )
+
+
+def _calculate_corner_angle(
+    previous_vertex: Vertex,
+    current_vertex: Vertex,
+    next_vertex: Vertex,
+) -> float:
+    previous_vector = (
+        previous_vertex.x - current_vertex.x,
+        previous_vertex.y - current_vertex.y,
+    )
+    next_vector = (
+        next_vertex.x - current_vertex.x,
+        next_vertex.y - current_vertex.y,
+    )
+    previous_length = math.hypot(previous_vector[0], previous_vector[1])
+    next_length = math.hypot(next_vector[0], next_vector[1])
+    if previous_length <= 1e-6 or next_length <= 1e-6:
+        return 0.0
+
+    dot_product = (
+        previous_vector[0] * next_vector[0]
+        + previous_vector[1] * next_vector[1]
+    )
+    cosine = dot_product / (previous_length * next_length)
+    clamped_cosine = min(max(cosine, -1.0), 1.0)
+    return math.degrees(math.acos(clamped_cosine))

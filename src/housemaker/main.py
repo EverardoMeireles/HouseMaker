@@ -183,6 +183,20 @@ class BlueprintWorkspace(QWidget):
         image_transform_layout.addRow("Include", include_widget)
         side_layout.addLayout(image_transform_layout)
 
+        snap_label = QLabel("Snap")
+        snap_label.setStyleSheet("font-size: 18px; font-weight: 600;")
+        side_layout.addWidget(snap_label)
+
+        self.snap_middle_equal_angle_radio = QRadioButton(
+            "Snap to middle equal angle only"
+        )
+        self.snap_middle_equal_angle_radio.setAutoExclusive(False)
+        self.snap_middle_equal_angle_radio.setChecked(True)
+        self.snap_middle_equal_angle_radio.toggled.connect(
+            self._handle_snap_middle_equal_angle_toggled
+        )
+        side_layout.addWidget(self.snap_middle_equal_angle_radio)
+
         self.blueprint_name_label = QLabel("Image: none for this level")
         self.blueprint_name_label.setWordWrap(True)
         side_layout.addWidget(self.blueprint_name_label)
@@ -218,7 +232,7 @@ class BlueprintWorkspace(QWidget):
         splitter.addWidget(side_panel)
         splitter.setStretchFactor(0, 9)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([1380, 220])
+        splitter.setSizes([1160, 440])
 
         self._refresh_levels_list()
         self._sync_level_controls()
@@ -384,6 +398,9 @@ class BlueprintWorkspace(QWidget):
             return
 
         self.current_level.include_in_export = self.include_yes_radio.isChecked()
+
+    def _handle_snap_middle_equal_angle_toggled(self, checked: bool) -> None:
+        self.canvas.set_snap_middle_equal_angle_only(checked)
 
     def _apply_loaded_project(self, project_data: ProjectData) -> None:
         self._apply_project_state(
