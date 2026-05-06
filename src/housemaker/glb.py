@@ -13,6 +13,7 @@ from housemaker.models import (
     GROUND_LEVEL_INDEX,
     Edge,
     LevelData,
+    RoomData,
     Vertex,
     VertexData,
 )
@@ -135,6 +136,7 @@ def _build_multi_level_meshes(
             wall_height_meters=level.height_meters,
             base_z_meters=_get_level_base_z(level_lookup, level.index),
             blueprint_size_pixels=level.image_size_pixels or blueprint_size_pixels,
+            ignored_vertex_ids=_get_room_center_vertex_ids(level.rooms),
         )
         if not wall_meshes:
             continue
@@ -154,14 +156,20 @@ def _build_level_meshes(
     wall_height_meters: float,
     base_z_meters: float,
     blueprint_size_pixels: tuple[float, float] | None,
+    ignored_vertex_ids: set[int] | None = None,
 ) -> list[trimesh.Trimesh]:
     if wall_height_meters <= 0.0:
         raise ValueError("Height level must be greater than zero.")
 
+    ignored_ids = ignored_vertex_ids or set()
     vertex_lookup = {vertex.id: vertex for vertex in vertex_data.vertices}
     return [
         wall_mesh
         for edge in vertex_data.edges
+        if (
+            edge.start_vertex_id not in ignored_ids
+            and edge.end_vertex_id not in ignored_ids
+        )
         if (
             wall_mesh := _build_wall_mesh(
                 edge=edge,
@@ -173,6 +181,10 @@ def _build_level_meshes(
         )
         is not None
     ]
+
+
+def _get_room_center_vertex_ids(rooms: list[RoomData]) -> set[int]:
+    return {room.center_vertex_id for room in rooms}
 
 
 def _get_level_base_z(

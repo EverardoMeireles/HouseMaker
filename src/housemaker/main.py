@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -13,6 +14,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -209,6 +211,37 @@ class BlueprintWorkspace(QWidget):
         self.levels_list.currentRowChanged.connect(self._handle_level_selection_changed)
         side_layout.addWidget(self.levels_list, 1)
 
+        rooms_label = QLabel("Rooms")
+        rooms_label.setStyleSheet("font-size: 18px; font-weight: 600;")
+        side_layout.addWidget(rooms_label)
+
+        self.rooms_list = QListWidget()
+        side_layout.addWidget(self.rooms_list, 1)
+
+        self.delete_room_shortcut = QShortcut(
+            QKeySequence.StandardKey.Delete,
+            self.rooms_list,
+        )
+        self.delete_room_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self.delete_room_shortcut.activated.connect(self._delete_selected_room)
+
+        room_layout = QFormLayout()
+        room_layout.setContentsMargins(0, 0, 0, 0)
+        room_layout.setSpacing(8)
+
+        self.room_name_field = QLineEdit()
+        self.room_name_field.setPlaceholderText("Room name")
+        self.room_name_field.setMinimumHeight(34)
+        room_layout.addRow("Room name", self.room_name_field)
+        side_layout.addLayout(room_layout)
+
+        self.designate_room_button = QPushButton("Designate room")
+        self.designate_room_button.setMinimumHeight(44)
+        self.designate_room_button.clicked.connect(self._handle_designate_room_clicked)
+        side_layout.addWidget(self.designate_room_button)
+
         buttons_layout = QHBoxLayout()
         buttons_layout.setSpacing(10)
 
@@ -234,7 +267,9 @@ class BlueprintWorkspace(QWidget):
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([1160, 440])
 
+        self.canvas.rooms_changed.connect(self._refresh_rooms_list)
         self._refresh_levels_list()
+        self._refresh_rooms_list()
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
 
@@ -345,6 +380,35 @@ class BlueprintWorkspace(QWidget):
     def _build_level_item(self, level: LevelData) -> QListWidgetItem:
         return QListWidgetItem(level.display_name)
 
+    def _refresh_rooms_list(self) -> None:
+        selected_room_index = self._get_selected_room_index()
+        self.rooms_list.clear()
+        for room_index, room in enumerate(self.current_level.rooms):
+            room_item = self._build_room_item(room_index, room.name)
+            self.rooms_list.addItem(room_item)
+
+        if (
+            selected_room_index is not None
+            and selected_room_index < self.rooms_list.count()
+        ):
+            self.rooms_list.setCurrentRow(selected_room_index)
+
+    def _build_room_item(self, room_index: int, room_name: str) -> QListWidgetItem:
+        room_item = QListWidgetItem(room_name)
+        room_item.setData(Qt.ItemDataRole.UserRole, room_index)
+        return room_item
+
+    def _get_selected_room_index(self) -> int | None:
+        selected_item = self.rooms_list.currentItem()
+        if selected_item is None:
+            return None
+
+        room_index = selected_item.data(Qt.ItemDataRole.UserRole)
+        if room_index is None:
+            return None
+
+        return int(room_index)
+
     def _sync_level_controls(self) -> None:
         self._is_syncing_level_controls = True
         self.height_level_spinbox.setValue(self.current_level.height_meters)
@@ -365,6 +429,7 @@ class BlueprintWorkspace(QWidget):
         self.current_level_index = level_index
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
+        self._refresh_rooms_list()
 
     def _handle_height_level_changed(self, value: float) -> None:
         if self._is_syncing_level_controls:
@@ -402,6 +467,35 @@ class BlueprintWorkspace(QWidget):
     def _handle_snap_middle_equal_angle_toggled(self, checked: bool) -> None:
         self.canvas.set_snap_middle_equal_angle_only(checked)
 
+    def _handle_designate_room_clicked(self) -> None:
+        room_name = self.room_name_field.text().strip()
+        if not room_name:
+            QMessageBox.warning(self, "Room name required", "Enter a room name first.")
+            return
+
+        selected_vertex_ids = self.canvas.get_selected_vertex_ids()
+        if len(selected_vertex_ids) < 3:
+            QMessageBox.warning(
+                self,
+                "Select room vertices",
+                "Shift-click at least three vertices before designating a room.",
+            )
+            return
+
+        self.canvas.start_room_designation(room_name, selected_vertex_ids)
+        QMessageBox.information(
+            self,
+            "Set room center",
+            "Click the vertex that marks the center of the room.",
+        )
+
+    def _delete_selected_room(self) -> None:
+        room_index = self._get_selected_room_index()
+        if room_index is None:
+            return
+
+        self.canvas.delete_room_at_index(room_index)
+
     def _apply_loaded_project(self, project_data: ProjectData) -> None:
         self._apply_project_state(
             levels=project_data.levels,
@@ -419,12 +513,14 @@ class BlueprintWorkspace(QWidget):
         self._refresh_levels_list()
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
+        self._refresh_rooms_list()
 
     def _set_current_level_image(self, file_path: str) -> None:
         normalized_path = str(Path(file_path).resolve())
         self.canvas.load_blueprint(
             file_path=normalized_path,
             vertex_data=self.current_level.vertex_data,
+            rooms=self.current_level.rooms,
             image_scale=self.current_level.image_scale,
             image_offset_x=self.current_level.image_offset_x,
             image_offset_y=self.current_level.image_offset_y,
@@ -436,6 +532,7 @@ class BlueprintWorkspace(QWidget):
     def _sync_canvas_to_current_level(self) -> None:
         self.canvas.set_level_data(
             vertex_data=self.current_level.vertex_data,
+            rooms=self.current_level.rooms,
             image_path=self.current_level.image_path,
             image_scale=self.current_level.image_scale,
             image_offset_x=self.current_level.image_offset_x,

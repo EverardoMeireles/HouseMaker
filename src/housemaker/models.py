@@ -30,6 +30,14 @@ class Edge:
     end_vertex_id: int
 
 
+@dataclass(frozen=True)
+class RoomData:
+    name: str
+    vertex_ids: tuple[int, ...]
+    center_vertex_id: int
+    color_rgb: tuple[int, int, int]
+
+
 @dataclass
 class VertexData:
     vertices: list[Vertex] = field(default_factory=list)
@@ -163,6 +171,7 @@ class LevelData:
     name: str
     height_meters: float = DEFAULT_LEVEL_HEIGHT_METERS
     vertex_data: VertexData = field(default_factory=VertexData)
+    rooms: list[RoomData] = field(default_factory=list)
     image_path: str | None = None
     image_size_pixels: tuple[float, float] | None = None
     image_scale: float = DEFAULT_IMAGE_SCALE

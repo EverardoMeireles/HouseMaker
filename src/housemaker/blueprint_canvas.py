@@ -2,18 +2,29 @@
 from __future__ import annotations
 
 import math
+import random
 from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
 
 import cv2
-from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QFont, QImage, QKeySequence, QPainter, QPen, QShortcut
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QImage,
+    QKeySequence,
+    QPainter,
+    QPen,
+    QPolygonF,
+    QShortcut,
+)
 from PySide6.QtWidgets import QWidget
 
 from housemaker.models import (
     DEFAULT_IMAGE_OFFSET,
     DEFAULT_IMAGE_SCALE,
+    RoomData,
     VERTEX_HIT_RADIUS_SCREEN,
     Vertex,
     VertexData,
@@ -31,11 +42,13 @@ ACTIVE_VERTEX_FILL_COLOR = QColor("#ff7f50")
 SELECTED_VERTEX_FILL_COLOR = QColor("#90cdf4")
 VERTEX_OUTLINE_COLOR = QColor("#20242a")
 TEXT_COLOR = QColor("#f5f7fa")
+ROOM_LABEL_BACKGROUND_COLOR = QColor(10, 12, 16, 170)
 IMAGE_MARGIN = 16.0
 VERTEX_RADIUS_SCREEN = 6.0
 AXIS_SNAP_TOLERANCE_SCREEN = 10.0
 CENTER_SNAP_TOLERANCE_SCREEN = 10.0
 CENTER_SNAP_EQUAL_ANGLE_TOLERANCE_DEGREES = 1.0
+ROOM_FILL_ALPHA = 72
 DRAG_THRESHOLD_SCREEN = 4.0
 MIN_ZOOM_SCALE = 1.0
 MAX_ZOOM_SCALE = 16.0
@@ -45,8 +58,10 @@ ZOOM_STEP_FACTOR = 1.15
 @dataclass
 class CanvasSnapshot:
     vertex_data: VertexData
+    rooms: list[RoomData]
     active_vertex_id: int | None
     selected_vertex_id: int | None
+    selected_vertex_ids: set[int]
     preview_point: tuple[float, float] | None
 
 
@@ -85,10 +100,13 @@ class VertexPairCenter:
 
 # ### Widgets ###
 class BlueprintCanvas(QWidget):
+    rooms_changed = Signal()
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
 
         self.vertex_data = VertexData()
+        self.rooms: list[RoomData] = []
         self.blueprint_image: QImage | None = None
         self.blueprint_path: str | None = None
         self.image_scale = DEFAULT_IMAGE_SCALE
@@ -96,6 +114,7 @@ class BlueprintCanvas(QWidget):
         self.image_offset_y = DEFAULT_IMAGE_OFFSET
         self.active_vertex_id: int | None = None
         self.selected_vertex_id: int | None = None
+        self.selected_vertex_ids: set[int] = set()
         self.preview_point: tuple[float, float] | None = None
         self.preview_guides: list[SnapGuide] = []
         self.undo_stack: list[CanvasSnapshot] = []
@@ -108,6 +127,8 @@ class BlueprintCanvas(QWidget):
         self.pan_press_position: QPointF | None = None
         self.pan_start_offset = QPointF(0.0, 0.0)
         self.snap_middle_equal_angle_only = True
+        self.pending_room_name: str | None = None
+        self.pending_room_vertex_ids: tuple[int, ...] = ()
 
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -121,6 +142,7 @@ class BlueprintCanvas(QWidget):
         self,
         file_path: str,
         vertex_data: VertexData | None = None,
+        rooms: list[RoomData] | None = None,
         image_scale: float = DEFAULT_IMAGE_SCALE,
         image_offset_x: float = DEFAULT_IMAGE_OFFSET,
         image_offset_y: float = DEFAULT_IMAGE_OFFSET,
@@ -128,6 +150,7 @@ class BlueprintCanvas(QWidget):
         image = _load_qimage_from_path(file_path)
         self._set_level_contents(
             vertex_data=vertex_data or VertexData(),
+            rooms=rooms,
             blueprint_image=image,
             blueprint_path=file_path,
             image_scale=image_scale,
@@ -138,6 +161,7 @@ class BlueprintCanvas(QWidget):
     def set_level_vertex_data(self, vertex_data: VertexData) -> None:
         self.set_level_data(
             vertex_data=vertex_data,
+            rooms=self.rooms,
             image_path=self.blueprint_path,
             image_scale=self.image_scale,
             image_offset_x=self.image_offset_x,
@@ -147,6 +171,7 @@ class BlueprintCanvas(QWidget):
     def set_level_data(
         self,
         vertex_data: VertexData,
+        rooms: list[RoomData] | None,
         image_path: str | None,
         image_scale: float = DEFAULT_IMAGE_SCALE,
         image_offset_x: float = DEFAULT_IMAGE_OFFSET,
@@ -161,6 +186,7 @@ class BlueprintCanvas(QWidget):
 
         self._set_level_contents(
             vertex_data=vertex_data,
+            rooms=rooms,
             blueprint_image=blueprint_image,
             blueprint_path=image_path,
             image_scale=image_scale,
@@ -194,9 +220,39 @@ class BlueprintCanvas(QWidget):
         self.preview_guides = []
         self.update()
 
+    def get_selected_vertex_ids(self) -> list[int]:
+        existing_vertex_ids = {vertex.id for vertex in self.vertex_data.vertices}
+        return sorted(
+            vertex_id
+            for vertex_id in self.selected_vertex_ids
+            if vertex_id in existing_vertex_ids
+        )
+
+    def start_room_designation(
+        self,
+        room_name: str,
+        vertex_ids: list[int],
+    ) -> None:
+        self.pending_room_name = room_name.strip()
+        self.pending_room_vertex_ids = tuple(sorted(set(vertex_ids)))
+        self.preview_point = None
+        self.preview_guides = []
+        self.update()
+
+    def delete_room_at_index(self, room_index: int) -> bool:
+        if room_index < 0 or room_index >= len(self.rooms):
+            return False
+
+        self._push_undo_state()
+        del self.rooms[room_index]
+        self.rooms_changed.emit()
+        self.update()
+        return True
+
     def _set_level_contents(
         self,
         vertex_data: VertexData,
+        rooms: list[RoomData] | None,
         blueprint_image: QImage | None,
         blueprint_path: str | None,
         image_scale: float,
@@ -209,11 +265,14 @@ class BlueprintCanvas(QWidget):
         self.image_offset_x = float(image_offset_x)
         self.image_offset_y = float(image_offset_y)
         self.vertex_data = vertex_data
+        self.rooms = rooms if rooms is not None else []
         self.active_vertex_id = None
         self.selected_vertex_id = None
+        self.selected_vertex_ids.clear()
         self.preview_point = None
         self.preview_guides = []
         self.undo_stack.clear()
+        self._reset_room_designation()
         self._reset_pointer_state()
         self._reset_view()
         self.update()
@@ -224,12 +283,17 @@ class BlueprintCanvas(QWidget):
 
         snapshot = self.undo_stack.pop()
         self.vertex_data.copy_from(snapshot.vertex_data)
+        self.rooms.clear()
+        self.rooms.extend(snapshot.rooms)
         self.active_vertex_id = snapshot.active_vertex_id
         self.selected_vertex_id = snapshot.selected_vertex_id
+        self.selected_vertex_ids = set(snapshot.selected_vertex_ids)
         self.preview_point = snapshot.preview_point
         self.preview_guides = []
+        self._reset_room_designation()
         self._reset_pointer_state()
         self.update()
+        self.rooms_changed.emit()
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
         if event.key() == Qt.Key.Key_Delete:
@@ -277,12 +341,30 @@ class BlueprintCanvas(QWidget):
             return
 
         hit_vertex = self._find_vertex_at(event.position())
+        if self.pending_room_name is not None:
+            if hit_vertex is not None:
+                self._finish_room_designation(hit_vertex.id)
+                self.update()
+            event.accept()
+            return
+
         if hit_vertex is not None:
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self._toggle_vertex_selection(hit_vertex.id)
+                self.update()
+                event.accept()
+                return
+
             self.selected_vertex_id = hit_vertex.id
+            self.selected_vertex_ids = {hit_vertex.id}
             self.pressed_vertex_id = hit_vertex.id
             self.drag_press_position = QPointF(event.position())
             self.drag_vertex_id = None
             self.update()
+            event.accept()
+            return
+
+        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
             event.accept()
             return
 
@@ -395,6 +477,7 @@ class BlueprintCanvas(QWidget):
         painter.fillRect(display_rect, CANVAS_PANEL_COLOR)
         painter.drawImage(display_rect, self.blueprint_image)
 
+        self._paint_rooms(painter)
         self._paint_edges(painter)
         self._paint_preview_guides(painter)
         self._paint_preview_edge(painter)
@@ -414,6 +497,7 @@ class BlueprintCanvas(QWidget):
 
     def _handle_existing_vertex_click(self, vertex: Vertex) -> None:
         self.selected_vertex_id = vertex.id
+        self.selected_vertex_ids = {vertex.id}
 
         if self.active_vertex_id is None:
             self.active_vertex_id = vertex.id
@@ -439,23 +523,37 @@ class BlueprintCanvas(QWidget):
 
         self.active_vertex_id = new_vertex.id
         self.selected_vertex_id = new_vertex.id
+        self.selected_vertex_ids = {new_vertex.id}
         self.preview_point = point
         self.preview_guides = []
 
     def _push_undo_state(self) -> None:
         snapshot = CanvasSnapshot(
             vertex_data=self.vertex_data.clone(),
+            rooms=list(self.rooms),
             active_vertex_id=self.active_vertex_id,
             selected_vertex_id=self.selected_vertex_id,
+            selected_vertex_ids=set(self.selected_vertex_ids),
             preview_point=self.preview_point,
         )
         self.undo_stack.append(snapshot)
+
+    def _toggle_vertex_selection(self, vertex_id: int) -> None:
+        if vertex_id in self.selected_vertex_ids:
+            self.selected_vertex_ids.remove(vertex_id)
+            if self.selected_vertex_id == vertex_id:
+                self.selected_vertex_id = next(iter(self.selected_vertex_ids), None)
+            return
+
+        self.selected_vertex_ids.add(vertex_id)
+        self.selected_vertex_id = vertex_id
 
     def _delete_selected_vertex(self) -> None:
         if self.selected_vertex_id is None:
             return
 
         if self.vertex_data.get_vertex(self.selected_vertex_id) is None:
+            self.selected_vertex_ids.discard(self.selected_vertex_id)
             self.selected_vertex_id = None
             self.update()
             return
@@ -463,15 +561,79 @@ class BlueprintCanvas(QWidget):
         self._push_undo_state()
         deleted_vertex_id = self.selected_vertex_id
         self.vertex_data.delete_vertex(deleted_vertex_id)
+        self._remove_vertex_from_rooms(deleted_vertex_id)
 
         if self.active_vertex_id == deleted_vertex_id:
             self.active_vertex_id = None
             self.preview_point = None
 
         self.selected_vertex_id = None
+        self.selected_vertex_ids.discard(deleted_vertex_id)
         self.preview_guides = []
         self._reset_pointer_state()
         self.update()
+
+    def _finish_room_designation(self, center_vertex_id: int) -> None:
+        if self.pending_room_name is None or len(self.pending_room_vertex_ids) < 3:
+            self._reset_room_designation()
+            return
+
+        existing_vertex_ids = {vertex.id for vertex in self.vertex_data.vertices}
+        room_vertex_ids = tuple(
+            vertex_id
+            for vertex_id in self.pending_room_vertex_ids
+            if vertex_id in existing_vertex_ids and vertex_id != center_vertex_id
+        )
+        if len(room_vertex_ids) < 3:
+            self._reset_room_designation()
+            return
+
+        self._push_undo_state()
+        self.rooms.append(
+            RoomData(
+                name=self.pending_room_name,
+                vertex_ids=room_vertex_ids,
+                center_vertex_id=center_vertex_id,
+                color_rgb=_build_random_room_color(),
+            )
+        )
+        self.selected_vertex_id = center_vertex_id
+        self.selected_vertex_ids.clear()
+        self._reset_room_designation()
+        self.rooms_changed.emit()
+
+    def _reset_room_designation(self) -> None:
+        self.pending_room_name = None
+        self.pending_room_vertex_ids = ()
+
+    def _remove_vertex_from_rooms(self, deleted_vertex_id: int) -> None:
+        original_rooms = list(self.rooms)
+        updated_rooms: list[RoomData] = []
+        for room in self.rooms:
+            if room.center_vertex_id == deleted_vertex_id:
+                continue
+
+            remaining_vertex_ids = tuple(
+                vertex_id
+                for vertex_id in room.vertex_ids
+                if vertex_id != deleted_vertex_id
+            )
+            if len(remaining_vertex_ids) < 3:
+                continue
+
+            updated_rooms.append(
+                RoomData(
+                    name=room.name,
+                    vertex_ids=remaining_vertex_ids,
+                    center_vertex_id=room.center_vertex_id,
+                    color_rgb=room.color_rgb,
+                )
+            )
+
+        self.rooms.clear()
+        self.rooms.extend(updated_rooms)
+        if self.rooms != original_rooms:
+            self.rooms_changed.emit()
 
     def _build_connection_preview(
         self,
@@ -1045,6 +1207,72 @@ class BlueprintCanvas(QWidget):
             empty_message,
         )
 
+    def _paint_rooms(self, painter: QPainter) -> None:
+        label_font = QFont("Segoe UI", 10)
+        label_font.setBold(True)
+
+        for room in self.rooms:
+            room_vertices = self._get_room_vertices(room)
+            if len(room_vertices) < 3:
+                continue
+
+            ordered_vertices = _order_vertices_around_center(room_vertices)
+            polygon = QPolygonF(
+                [
+                    self._image_to_widget(vertex.x, vertex.y)
+                    for vertex in ordered_vertices
+                ]
+            )
+            fill_color = QColor(
+                room.color_rgb[0],
+                room.color_rgb[1],
+                room.color_rgb[2],
+                ROOM_FILL_ALPHA,
+            )
+
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(fill_color)
+            painter.drawPolygon(polygon)
+
+            label_point = self._get_room_label_point(room, ordered_vertices)
+            label_rect = QRectF(
+                label_point.x() - 90.0,
+                label_point.y() - 14.0,
+                180.0,
+                28.0,
+            )
+            painter.setBrush(ROOM_LABEL_BACKGROUND_COLOR)
+            painter.drawRoundedRect(label_rect, 6.0, 6.0)
+            painter.setPen(QPen(TEXT_COLOR))
+            painter.setFont(label_font)
+            painter.drawText(
+                label_rect,
+                int(Qt.AlignmentFlag.AlignCenter),
+                room.name,
+            )
+
+    def _get_room_vertices(self, room: RoomData) -> list[Vertex]:
+        vertices: list[Vertex] = []
+        for vertex_id in room.vertex_ids:
+            vertex = self.vertex_data.get_vertex(vertex_id)
+            if vertex is not None:
+                vertices.append(vertex)
+
+        return vertices
+
+    def _get_room_label_point(
+        self,
+        room: RoomData,
+        ordered_vertices: list[Vertex],
+    ) -> QPointF:
+        center_vertex = self.vertex_data.get_vertex(room.center_vertex_id)
+        if center_vertex is not None:
+            return self._image_to_widget(center_vertex.x, center_vertex.y)
+
+        center_x = sum(vertex.x for vertex in ordered_vertices) / len(ordered_vertices)
+        center_y = sum(vertex.y for vertex in ordered_vertices) / len(ordered_vertices)
+        return self._image_to_widget(center_x, center_y)
+
     def _paint_edges(self, painter: QPainter) -> None:
         edge_pen = QPen(EDGE_COLOR, 2.0)
         painter.setPen(edge_pen)
@@ -1121,7 +1349,10 @@ class BlueprintCanvas(QWidget):
         for vertex in self.vertex_data.vertices:
             center = self._image_to_widget(vertex.x, vertex.y)
             is_active = vertex.id == self.active_vertex_id
-            is_selected = vertex.id == self.selected_vertex_id
+            is_selected = (
+                vertex.id == self.selected_vertex_id
+                or vertex.id in self.selected_vertex_ids
+            )
 
             painter.setPen(QPen(VERTEX_OUTLINE_COLOR, 1.5))
             if is_active:
@@ -1142,19 +1373,21 @@ class BlueprintCanvas(QWidget):
         if self.blueprint_path is None:
             return
 
-        overlay_rect = QRectF(24.0, 24.0, 460.0, 86.0)
+        overlay_lines = [
+            f"Blueprint: {Path(self.blueprint_path).name}",
+            "Left click: add/connect/select/drag | Shift click: multi-select vertices",
+            "Mouse wheel: zoom | Delete: remove selected vertex | Ctrl+Z: undo | Hold Ctrl: free placement",
+        ]
+        if self.pending_room_name is not None:
+            overlay_lines.append("Click a vertex to set the current room center.")
+
+        overlay_rect = QRectF(24.0, 24.0, 520.0, 20.0 + len(overlay_lines) * 22.0)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(10, 12, 16, 180))
         painter.drawRoundedRect(overlay_rect, 10.0, 10.0)
 
         painter.setPen(QPen(TEXT_COLOR))
         painter.setFont(QFont("Segoe UI", 9))
-        overlay_lines = [
-            f"Blueprint: {Path(self.blueprint_path).name}",
-            "Left click: add/connect/select/drag | Middle drag: pan | Right click: apply chain",
-            "Mouse wheel: zoom | Delete: remove selected vertex | Ctrl+Z: undo | Hold Ctrl: free placement",
-        ]
-
         line_y = overlay_rect.top() + 24.0
         for line in overlay_lines:
             painter.drawText(QPointF(overlay_rect.left() + 14.0, line_y), line)
@@ -1217,3 +1450,20 @@ def _calculate_corner_angle(
     cosine = dot_product / (previous_length * next_length)
     clamped_cosine = min(max(cosine, -1.0), 1.0)
     return math.degrees(math.acos(clamped_cosine))
+
+
+def _order_vertices_around_center(vertices: list[Vertex]) -> list[Vertex]:
+    center_x = sum(vertex.x for vertex in vertices) / len(vertices)
+    center_y = sum(vertex.y for vertex in vertices) / len(vertices)
+    return sorted(
+        vertices,
+        key=lambda vertex: math.atan2(vertex.y - center_y, vertex.x - center_x),
+    )
+
+
+def _build_random_room_color() -> tuple[int, int, int]:
+    return (
+        random.randint(70, 230),
+        random.randint(70, 230),
+        random.randint(70, 230),
+    )

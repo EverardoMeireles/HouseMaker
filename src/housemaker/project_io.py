@@ -11,6 +11,7 @@ from housemaker.models import (
     DEFAULT_IMAGE_SCALE,
     GROUND_LEVEL_INDEX,
     LevelData,
+    RoomData,
     VertexData,
     create_default_levels,
 )
@@ -50,6 +51,7 @@ def save_project(
                 "image_offset_y": float(level.image_offset_y),
                 "include_in_export": bool(level.include_in_export),
                 "vertex_data": level.vertex_data.to_dict(),
+                "rooms": [_serialize_room(room) for room in level.rooms],
             }
             for level in levels
         ],
@@ -109,6 +111,7 @@ def load_project(path: str | Path) -> ProjectData:
             raw_level.get("include_in_export", DEFAULT_INCLUDE_IN_EXPORT)
         )
         level.vertex_data = VertexData.from_dict(raw_level.get("vertex_data", {}))
+        level.rooms = _deserialize_rooms(raw_level.get("rooms", []))
 
     current_level_index = int(payload.get("current_level_index", GROUND_LEVEL_INDEX))
     if current_level_index not in level_lookup:
@@ -144,3 +147,44 @@ def _deserialize_image_size(raw_image_size: object) -> tuple[float, float] | Non
         return None
 
     return (float(raw_image_size[0]), float(raw_image_size[1]))
+
+
+def _serialize_room(room: RoomData) -> dict[str, object]:
+    return {
+        "name": room.name,
+        "vertex_ids": [int(vertex_id) for vertex_id in room.vertex_ids],
+        "center_vertex_id": int(room.center_vertex_id),
+        "color_rgb": [int(color_value) for color_value in room.color_rgb],
+    }
+
+
+def _deserialize_rooms(raw_rooms: object) -> list[RoomData]:
+    if not isinstance(raw_rooms, list):
+        return []
+
+    rooms: list[RoomData] = []
+    for raw_room in raw_rooms:
+        if not isinstance(raw_room, dict):
+            continue
+
+        raw_color = raw_room.get("color_rgb", [140, 180, 220])
+        if not isinstance(raw_color, list | tuple) or len(raw_color) != 3:
+            raw_color = [140, 180, 220]
+
+        rooms.append(
+            RoomData(
+                name=str(raw_room.get("name", "Room")),
+                vertex_ids=tuple(
+                    int(vertex_id)
+                    for vertex_id in raw_room.get("vertex_ids", [])
+                ),
+                center_vertex_id=int(raw_room.get("center_vertex_id", 0)),
+                color_rgb=(
+                    int(raw_color[0]),
+                    int(raw_color[1]),
+                    int(raw_color[2]),
+                ),
+            )
+        )
+
+    return rooms
