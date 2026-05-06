@@ -1,31 +1,22 @@
 # ### Imports ###
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 import pyqtgraph.opengl as gl
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QCloseEvent, QVector3D
-from PySide6.QtWidgets import QFileDialog, QMessageBox, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtGui import QVector3D
+from PySide6.QtWidgets import QVBoxLayout, QWidget
 
-from housemaker.glb import GeneratedModel, export_glb_file
+from housemaker.glb import GeneratedModel
 
 # ### Constants ###
 EDGE_COLOR = (0.12, 0.12, 0.16, 1.0)
 FACE_COLOR = np.array([0.78, 0.80, 0.84, 1.0], dtype=float)
 
-# ### Windows ###
-class GlbViewerWindow(QWidget):
-    closed = Signal(object)
-
-    def __init__(
-        self,
-        model: GeneratedModel,
-        parent: QWidget | None = None,
-    ) -> None:
+# ### Widgets ###
+class GlbViewerWidget(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.model = model
+        self.model: GeneratedModel | None = None
         self.grid_item: gl.GLGridItem | None = None
         self.mesh_item: gl.GLMeshItem | None = None
 
@@ -33,31 +24,35 @@ class GlbViewerWindow(QWidget):
         self._populate_scene()
 
     def _build_ui(self) -> None:
-        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        self.setWindowTitle("HouseMaker 3D Viewer")
-        self.resize(1100, 720)
-
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(12)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
         self.view = gl.GLViewWidget()
         self.view.setBackgroundColor((24, 24, 28))
         layout.addWidget(self.view, 1)
 
-        self.export_button = QPushButton("export glb")
-        self.export_button.setMinimumHeight(48)
-        self.export_button.clicked.connect(self._export_glb)
-        layout.addWidget(self.export_button)
+    def set_model(self, model: GeneratedModel) -> None:
+        self.model = model
+        self._populate_scene()
+
+    def clear_model(self) -> None:
+        self.model = None
+        self._populate_scene()
 
     def _populate_scene(self) -> None:
-        self.grid_item = gl.GLGridItem()
-        self.grid_item.setSize(x=20.0, y=20.0)
-        self.grid_item.setSpacing(x=1.0, y=1.0)
-        self.view.addItem(self.grid_item)
+        self._clear_scene()
+        self._add_grid()
+        if self.model is None:
+            self._set_default_camera()
+            return
 
         vertices = np.asarray(self.model.mesh.vertices, dtype=np.float32)
         faces = np.asarray(self.model.mesh.faces, dtype=np.int32)
+        if vertices.size == 0 or faces.size == 0:
+            self._set_default_camera()
+            return
+
         face_colors = np.tile(FACE_COLOR, (faces.shape[0], 1))
 
         self.mesh_item = gl.GLMeshItem(
@@ -81,25 +76,17 @@ class GlbViewerWindow(QWidget):
             float(center[2]),
         )
         self.view.setCameraPosition(distance=extent * 3.0, elevation=28.0, azimuth=-40.0)
+        self.view.update()
 
-    def closeEvent(self, event: QCloseEvent) -> None:
-        self._clear_scene()
-        self.closed.emit(self)
-        super().closeEvent(event)
+    def _add_grid(self) -> None:
+        self.grid_item = gl.GLGridItem()
+        self.grid_item.setSize(x=20.0, y=20.0)
+        self.grid_item.setSpacing(x=1.0, y=1.0)
+        self.view.addItem(self.grid_item)
 
-    def _export_glb(self) -> None:
-        default_path = Path.cwd() / "housemaker_export.glb"
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "export glb",
-            str(default_path),
-            "GLB Files (*.glb)",
-        )
-        if not file_path:
-            return
-
-        export_glb_file(self.model, file_path)
-        QMessageBox.information(self, "GLB exported", f"Saved GLB to:\n{file_path}")
+    def _set_default_camera(self) -> None:
+        self.view.opts["center"] = QVector3D(0.0, 0.0, 0.0)
+        self.view.setCameraPosition(distance=18.0, elevation=28.0, azimuth=-40.0)
 
     def _clear_scene(self) -> None:
         if not hasattr(self, "view"):

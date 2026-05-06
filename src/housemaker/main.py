@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -30,7 +30,12 @@ from PySide6.QtWidgets import (
 )
 
 from housemaker.blueprint_canvas import BlueprintCanvas
-from housemaker.glb import DEFAULT_WALL_HEIGHT_METERS, convert_to_glb
+from housemaker.glb import (
+    DEFAULT_WALL_HEIGHT_METERS,
+    GeneratedModel,
+    convert_to_glb,
+    export_glb_file,
+)
 from housemaker.models import (
     DEFAULT_IMAGE_OFFSET,
     DEFAULT_IMAGE_SCALE,
@@ -45,7 +50,7 @@ from housemaker.models import (
 )
 from housemaker.project_io import ProjectData, load_project, save_project
 from housemaker.uv_canvas import UvCanvas, calculate_unoccupied_uv_pixels
-from housemaker.viewer import GlbViewerWindow
+from housemaker.viewer import GlbViewerWidget
 
 # ### Widgets ###
 class HomePage(QWidget):
@@ -119,11 +124,11 @@ class RightAngleSpinBox(QSpinBox):
 class BlueprintWorkspace(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.viewer_windows: list[GlbViewerWindow] = []
         self.levels: list[LevelData] = create_default_levels()
         self.current_level_index = GROUND_LEVEL_INDEX
         self._is_syncing_level_controls = False
         self._is_syncing_uv_controls = False
+        self._is_viewer_refresh_scheduled = False
         self._build_ui()
 
     @property
@@ -143,8 +148,15 @@ class BlueprintWorkspace(QWidget):
         splitter.setChildrenCollapsible(False)
         root_layout.addWidget(splitter, 1)
 
+        self.workspace_tabs = QTabWidget()
         self.canvas = BlueprintCanvas()
-        splitter.addWidget(self.canvas)
+        self.viewer = GlbViewerWidget()
+        self.workspace_tabs.addTab(self.canvas, "Canvas")
+        self.workspace_tabs.addTab(self.viewer, "Viewer")
+        self.workspace_tabs.currentChanged.connect(
+            self._handle_workspace_tab_changed
+        )
+        splitter.addWidget(self.workspace_tabs)
 
         side_panel = QWidget()
         side_layout = QVBoxLayout(side_panel)
@@ -308,11 +320,11 @@ class BlueprintWorkspace(QWidget):
         self.load_button.clicked.connect(self._handle_load_clicked)
         buttons_layout.addWidget(self.load_button)
 
-        self.convert_button = QPushButton("Convert")
-        self.convert_button.setMinimumHeight(56)
-        self.convert_button.setStyleSheet("font-size: 18px; font-weight: 600;")
-        self.convert_button.clicked.connect(self._handle_convert_clicked)
-        buttons_layout.addWidget(self.convert_button, 1)
+        self.export_button = QPushButton("Export")
+        self.export_button.setMinimumHeight(56)
+        self.export_button.setStyleSheet("font-size: 18px; font-weight: 600;")
+        self.export_button.clicked.connect(self._handle_export_clicked)
+        buttons_layout.addWidget(self.export_button, 1)
         side_layout.addLayout(buttons_layout)
 
         self.side_tabs.addTab(self._build_uvs_tab(), "UVs")
@@ -323,6 +335,7 @@ class BlueprintWorkspace(QWidget):
         splitter.setSizes([1160, 440])
 
         self.canvas.rooms_changed.connect(self._refresh_room_lists)
+        self.canvas.rooms_changed.connect(self._schedule_viewer_preview_refresh)
         self._refresh_levels_list()
         self._refresh_room_lists()
         self._sync_level_controls()
@@ -414,26 +427,79 @@ class BlueprintWorkspace(QWidget):
     def load_blueprint(self, file_path: str) -> None:
         self._set_current_level_image(file_path)
 
-    def _handle_convert_clicked(self) -> None:
-        try:
-            generated_model = convert_to_glb(self.levels)
-        except ValueError as error:
-            QMessageBox.warning(self, "Convert failed", str(error))
+    def _handle_export_clicked(self) -> None:
+        generated_model = self._build_generated_model("Export failed")
+        if generated_model is None:
             return
 
-        viewer_window = GlbViewerWindow(generated_model)
-        viewer_window.closed.connect(self._handle_viewer_closed)
-        viewer_window.show()
-        viewer_window.raise_()
-        viewer_window.activateWindow()
-        self.viewer_windows.append(viewer_window)
+        default_path = Path.cwd() / "housemaker_export.glb"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export GLB",
+            str(default_path),
+            "GLB Files (*.glb)",
+        )
+        if not file_path:
+            return
 
-    def _handle_viewer_closed(self, closed_viewer: GlbViewerWindow) -> None:
-        self.viewer_windows = [
-            viewer_window
-            for viewer_window in self.viewer_windows
-            if viewer_window is not closed_viewer
-        ]
+        export_path = Path(file_path)
+        if export_path.suffix.lower() != ".glb":
+            export_path = export_path.with_suffix(".glb")
+
+        try:
+            exported_path = export_glb_file(generated_model, export_path)
+        except OSError as error:
+            QMessageBox.critical(self, "Export failed", str(error))
+            return
+
+        self.workspace_tabs.setCurrentWidget(self.viewer)
+        self.viewer.set_model(generated_model)
+        QMessageBox.information(
+            self,
+            "GLB exported",
+            f"Saved GLB to:\n{exported_path}",
+        )
+
+    def _handle_workspace_tab_changed(self, tab_index: int) -> None:
+        if self.workspace_tabs.widget(tab_index) is not self.viewer:
+            return
+
+        self._schedule_viewer_preview_refresh()
+
+    def _build_generated_model(
+        self,
+        failure_title: str | None,
+    ) -> GeneratedModel | None:
+        try:
+            return convert_to_glb(self.levels)
+        except ValueError as error:
+            if failure_title is not None:
+                QMessageBox.warning(self, failure_title, str(error))
+            return None
+
+    def _refresh_viewer_preview(self) -> None:
+        generated_model = self._build_generated_model(None)
+        if generated_model is None:
+            self.viewer.clear_model()
+            return
+
+        self.viewer.set_model(generated_model)
+
+    def _schedule_viewer_preview_refresh(self) -> None:
+        if self.workspace_tabs.currentWidget() is not self.viewer:
+            return
+        if self._is_viewer_refresh_scheduled:
+            return
+
+        self._is_viewer_refresh_scheduled = True
+        QTimer.singleShot(0, self._run_scheduled_viewer_preview_refresh)
+
+    def _run_scheduled_viewer_preview_refresh(self) -> None:
+        self._is_viewer_refresh_scheduled = False
+        if self.workspace_tabs.currentWidget() is not self.viewer:
+            return
+
+        self._refresh_viewer_preview()
 
     def _handle_save_clicked(self) -> None:
         default_path = Path.cwd() / "housemaker_project.json"
@@ -661,6 +727,7 @@ class BlueprintWorkspace(QWidget):
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
         self._refresh_room_lists()
+        self._schedule_viewer_preview_refresh()
 
     def _handle_height_level_changed(self, value: float) -> None:
         if self._is_syncing_level_controls:
@@ -668,6 +735,7 @@ class BlueprintWorkspace(QWidget):
 
         self.current_level.height_meters = value
         self._sync_uv_controls()
+        self._schedule_viewer_preview_refresh()
 
     def _handle_image_scale_changed(self, value: float) -> None:
         if self._is_syncing_level_controls:
@@ -695,6 +763,7 @@ class BlueprintWorkspace(QWidget):
             return
 
         self.current_level.include_in_export = self.include_yes_radio.isChecked()
+        self._schedule_viewer_preview_refresh()
 
     def _handle_snap_middle_equal_angle_toggled(self, checked: bool) -> None:
         self.canvas.set_snap_middle_equal_angle_only(checked)
@@ -808,6 +877,7 @@ class BlueprintWorkspace(QWidget):
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
         self._refresh_room_lists()
+        self._schedule_viewer_preview_refresh()
 
     def _set_current_level_image(self, file_path: str) -> None:
         normalized_path = str(Path(file_path).resolve())
@@ -822,6 +892,7 @@ class BlueprintWorkspace(QWidget):
         self.current_level.image_path = normalized_path
         self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
         self._update_blueprint_name_label()
+        self._schedule_viewer_preview_refresh()
 
     def _sync_canvas_to_current_level(self) -> None:
         self.canvas.set_level_data(
