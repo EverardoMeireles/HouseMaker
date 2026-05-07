@@ -50,7 +50,10 @@ from housemaker.models import (
 )
 from housemaker.project_io import ProjectData, load_project, save_project
 from housemaker.uv_canvas import UvCanvas
-from housemaker.uv_layout import calculate_unoccupied_uv_pixels
+from housemaker.uv_layout import (
+    calculate_unoccupied_uv_pixels,
+    optimize_room_wall_uvs,
+)
 from housemaker.viewer import GlbViewerWidget
 
 # ### Widgets ###
@@ -365,6 +368,22 @@ class BlueprintWorkspace(QWidget):
         self.unoccupied_uv_pixels_label.setMinimumHeight(24)
         uv_controls_layout.addRow("", self.unoccupied_uv_pixels_label)
 
+        self.optimize_uv_button = QPushButton("Optimize")
+        self.optimize_uv_button.setMinimumHeight(34)
+        self.optimize_uv_button.clicked.connect(self._handle_optimize_uv_clicked)
+        uv_controls_layout.addRow("", self.optimize_uv_button)
+
+        self.max_scale_variation_spinbox = QDoubleSpinBox()
+        self.max_scale_variation_spinbox.setRange(0.0, 1.0)
+        self.max_scale_variation_spinbox.setDecimals(3)
+        self.max_scale_variation_spinbox.setSingleStep(0.01)
+        self.max_scale_variation_spinbox.setValue(0.200)
+        self.max_scale_variation_spinbox.setMinimumHeight(34)
+        uv_controls_layout.addRow(
+            "Max scale variation",
+            self.max_scale_variation_spinbox,
+        )
+
         self.uv_map_width_spinbox = PowerOfTwoSpinBox()
         self.uv_map_width_spinbox.setRange(64, 8192)
         self.uv_map_width_spinbox.valueChanged.connect(
@@ -668,6 +687,8 @@ class BlueprintWorkspace(QWidget):
         has_room = selected_room is not None
         self.uv_map_width_spinbox.setEnabled(has_room)
         self.uv_map_height_spinbox.setEnabled(has_room)
+        self.optimize_uv_button.setEnabled(has_room)
+        self.max_scale_variation_spinbox.setEnabled(has_room)
         self.unoccupied_uv_pixels_label.setEnabled(has_room)
 
         if selected_room is None:
@@ -805,6 +826,26 @@ class BlueprintWorkspace(QWidget):
         selected_room.uv_map_height = int(value)
         self.uv_canvas.update()
         self._update_unoccupied_uv_pixels_label()
+        self._schedule_viewer_preview_refresh()
+
+    def _handle_optimize_uv_clicked(self) -> None:
+        selected_room = self._get_selected_uv_room()
+        if selected_room is None:
+            return
+
+        optimized_result = optimize_room_wall_uvs(
+            room=selected_room,
+            vertex_data=self.current_level.vertex_data,
+            wall_height_meters=self.current_level.height_meters,
+            max_scale_variation=self.max_scale_variation_spinbox.value(),
+        )
+        if not optimized_result.wall_uv_rotations:
+            return
+
+        selected_room.wall_uv_rotations.update(optimized_result.wall_uv_rotations)
+        selected_room.wall_uv_scales.update(optimized_result.wall_uv_scales)
+        self.uv_canvas.update()
+        self._sync_uv_controls()
         self._schedule_viewer_preview_refresh()
 
     def _handle_uv_wall_selected(self, wall_key: str) -> None:

@@ -1,7 +1,9 @@
 # ### Imports ###
 from __future__ import annotations
 
+import heapq
 import math
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 from housemaker.models import (
@@ -19,6 +21,9 @@ from housemaker.models import (
 STRAIGHT_WALL_TOLERANCE = 1e-5
 UV_MAP_PADDING = 12.0
 UV_MAP_SIZE_POWERS = (64, 128, 256, 512, 1024, 2048, 4096, 8192)
+UV_OPTIMIZATION_BEAM_WIDTH = 96
+UV_OPTIMIZATION_ROTATION_CANDIDATES = tuple(range(360))
+UV_OPTIMIZATION_SCALE_STEP = 0.01
 
 
 # ### Data models ###
@@ -45,6 +50,39 @@ class UvWallPlacement:
 class UvLayout:
     placements: list[UvWallPlacement]
     hidden_wall_count: int
+
+
+@dataclass(frozen=True)
+class UvOptimizationState:
+    rotations: tuple[int, ...]
+    scales: tuple[float, ...]
+    cursor_x: float
+    cursor_y: float
+    row_height: float
+    occupied_area: float
+    bounding_area: float
+    placed_wall_count: int
+    hidden_wall_count: int
+    scale_change_amount: float
+    rotation_change_amount: int
+
+
+@dataclass(frozen=True)
+class UvOptimizationResult:
+    wall_uv_rotations: dict[str, int]
+    wall_uv_scales: dict[str, float]
+
+
+@dataclass(frozen=True)
+class UvOptimizationCandidate:
+    rotation_degrees: int
+    wall_scale: float
+    wall_width: float
+    wall_height: float
+    bounding_width: float
+    bounding_height: float
+    scale_change_amount: float
+    rotation_change_amount: int
 
 
 # ### Public helpers ###
@@ -74,8 +112,84 @@ def calculate_unoccupied_uv_pixels(
         1.0,
         float(room.uv_map_height),
     )
-    occupied_area = sum(_get_placement_area(placement) for placement in layout.placements)
+    occupied_area = sum(
+        _get_placement_area(placement)
+        for placement in layout.placements
+    )
     return max(0, int(round(map_area - occupied_area)))
+
+
+def optimize_room_wall_uv_rotations(
+    room: RoomData,
+    vertex_data: VertexData,
+    wall_height_meters: float,
+) -> dict[str, int]:
+    result = optimize_room_wall_uvs(
+        room=room,
+        vertex_data=vertex_data,
+        wall_height_meters=wall_height_meters,
+        max_scale_variation=0.0,
+    )
+    return result.wall_uv_rotations
+
+
+def optimize_room_wall_uvs(
+    room: RoomData,
+    vertex_data: VertexData,
+    wall_height_meters: float,
+    max_scale_variation: float,
+) -> UvOptimizationResult:
+    walls = build_room_walls(room, vertex_data)
+    if not walls:
+        return UvOptimizationResult(wall_uv_rotations={}, wall_uv_scales={})
+
+    current_rotations = {
+        wall.key: _normalize_wall_uv_rotation(
+            room.wall_uv_rotations.get(
+                wall.key,
+                DEFAULT_WALL_UV_ROTATION_DEGREES,
+            )
+        )
+        for wall in walls
+    }
+    current_scales = {
+        wall.key: _normalize_wall_uv_scale(
+            room.wall_uv_scales.get(wall.key, DEFAULT_WALL_UV_SCALE)
+        )
+        for wall in walls
+    }
+    current_result = UvOptimizationResult(
+        wall_uv_rotations=current_rotations,
+        wall_uv_scales=current_scales,
+    )
+    rotation_only_result = _find_optimized_uv_settings(
+        walls=walls,
+        map_width=float(room.uv_map_width),
+        map_height=float(room.uv_map_height),
+        wall_height_meters=wall_height_meters,
+        wall_uv_scales=current_scales,
+        wall_uv_rotations=current_rotations,
+        max_scale_variation=0.0,
+    )
+    optimized_result = _find_optimized_uv_settings(
+        walls=walls,
+        map_width=float(room.uv_map_width),
+        map_height=float(room.uv_map_height),
+        wall_height_meters=wall_height_meters,
+        wall_uv_scales=current_scales,
+        wall_uv_rotations=current_rotations,
+        max_scale_variation=max_scale_variation,
+    )
+    return max(
+        (current_result, rotation_only_result, optimized_result),
+        key=lambda result: _score_uv_optimization_result(
+            result=result,
+            walls=walls,
+            map_width=float(room.uv_map_width),
+            map_height=float(room.uv_map_height),
+            wall_height_meters=wall_height_meters,
+        ),
+    )
 
 
 def calculate_minimum_uv_map_size(
@@ -187,12 +301,17 @@ def _build_uv_wall_layout_for_size(
     row_height = 0.0
 
     for wall in walls:
-        wall_scale = float(wall_uv_scales.get(wall.key, DEFAULT_WALL_UV_SCALE))
+        wall_scale = _normalize_wall_uv_scale(
+            wall_uv_scales.get(wall.key, DEFAULT_WALL_UV_SCALE)
+        )
         wall_rotation = _normalize_wall_uv_rotation(
             wall_uv_rotations.get(wall.key, DEFAULT_WALL_UV_ROTATION_DEGREES)
         )
-        wall_width = max(1.0, wall.length * wall_scale)
-        wall_height = max(1.0, wall_height_pixels * wall_scale)
+        wall_width, wall_height = _calculate_scaled_wall_natural_size(
+            wall=wall,
+            wall_height_pixels=wall_height_pixels,
+            wall_scale=wall_scale,
+        )
         bounding_width, bounding_height = _calculate_rotated_bounds(
             width=wall_width,
             height=wall_height,
@@ -227,6 +346,355 @@ def _build_uv_wall_layout_for_size(
         row_height = max(row_height, bounding_height)
 
     return UvLayout(placements=placements, hidden_wall_count=hidden_wall_count)
+
+
+def _find_optimized_uv_settings(
+    walls: list[RoomWall],
+    map_width: float,
+    map_height: float,
+    wall_height_meters: float,
+    wall_uv_scales: dict[str, float],
+    wall_uv_rotations: dict[str, int],
+    max_scale_variation: float,
+) -> UvOptimizationResult:
+    map_width = max(1.0, map_width)
+    map_height = max(1.0, map_height)
+    max_right = map_width - UV_MAP_PADDING
+    max_bottom = map_height - UV_MAP_PADDING
+    wall_height_pixels = max(1.0, wall_height_meters / PIXEL_TO_METER)
+    states = [
+        UvOptimizationState(
+            rotations=(),
+            scales=(),
+            cursor_x=UV_MAP_PADDING,
+            cursor_y=UV_MAP_PADDING,
+            row_height=0.0,
+            occupied_area=0.0,
+            bounding_area=0.0,
+            placed_wall_count=0,
+            hidden_wall_count=0,
+            scale_change_amount=0.0,
+            rotation_change_amount=0,
+        )
+    ]
+
+    for wall in walls:
+        wall_scale = wall_uv_scales.get(wall.key, DEFAULT_WALL_UV_SCALE)
+        wall_rotation = wall_uv_rotations.get(
+            wall.key,
+            DEFAULT_WALL_UV_ROTATION_DEGREES,
+        )
+        states = heapq.nlargest(
+            UV_OPTIMIZATION_BEAM_WIDTH,
+            _iter_extended_uv_optimization_states(
+                states=states,
+                wall=wall,
+                wall_height_pixels=wall_height_pixels,
+                current_scale=wall_scale,
+                current_rotation=wall_rotation,
+                max_scale_variation=max_scale_variation,
+                map_width=map_width,
+                map_height=map_height,
+                max_right=max_right,
+                max_bottom=max_bottom,
+            ),
+            key=_score_uv_optimization_state,
+        )
+
+    best_state = max(states, key=_score_uv_optimization_state)
+    return UvOptimizationResult(
+        wall_uv_rotations={
+            wall.key: best_state.rotations[wall_index]
+            for wall_index, wall in enumerate(walls)
+        },
+        wall_uv_scales={
+            wall.key: best_state.scales[wall_index]
+            for wall_index, wall in enumerate(walls)
+        },
+    )
+
+
+def _iter_extended_uv_optimization_states(
+    states: list[UvOptimizationState],
+    wall: RoomWall,
+    wall_height_pixels: float,
+    current_scale: float,
+    current_rotation: int,
+    max_scale_variation: float,
+    map_width: float,
+    map_height: float,
+    max_right: float,
+    max_bottom: float,
+) -> Iterator[UvOptimizationState]:
+    uv_candidates = _build_uv_optimization_candidates(
+        wall=wall,
+        wall_height_pixels=wall_height_pixels,
+        current_scale=current_scale,
+        current_rotation=current_rotation,
+        max_scale_variation=max_scale_variation,
+    )
+    for state in states:
+        for uv_candidate in uv_candidates:
+            yield _extend_uv_optimization_state(
+                state=state,
+                uv_candidate=uv_candidate,
+                map_width=map_width,
+                map_height=map_height,
+                max_right=max_right,
+                max_bottom=max_bottom,
+            )
+
+
+def _extend_uv_optimization_state(
+    state: UvOptimizationState,
+    uv_candidate: UvOptimizationCandidate,
+    map_width: float,
+    map_height: float,
+    max_right: float,
+    max_bottom: float,
+) -> UvOptimizationState:
+    rotations = state.rotations + (uv_candidate.rotation_degrees,)
+    scales = state.scales + (uv_candidate.wall_scale,)
+    scale_change_amount = (
+        state.scale_change_amount + uv_candidate.scale_change_amount
+    )
+    rotation_change_amount = (
+        state.rotation_change_amount + uv_candidate.rotation_change_amount
+    )
+    if uv_candidate.bounding_width > map_width - UV_MAP_PADDING * 2.0:
+        return _extend_hidden_uv_optimization_state(
+            state=state,
+            rotations=rotations,
+            scales=scales,
+            scale_change_amount=scale_change_amount,
+            rotation_change_amount=rotation_change_amount,
+        )
+    if uv_candidate.bounding_height > map_height - UV_MAP_PADDING * 2.0:
+        return _extend_hidden_uv_optimization_state(
+            state=state,
+            rotations=rotations,
+            scales=scales,
+            scale_change_amount=scale_change_amount,
+            rotation_change_amount=rotation_change_amount,
+        )
+
+    cursor_x = state.cursor_x
+    cursor_y = state.cursor_y
+    row_height = state.row_height
+    if (
+        cursor_x + uv_candidate.bounding_width > max_right
+        and cursor_x > UV_MAP_PADDING
+    ):
+        cursor_x = UV_MAP_PADDING
+        cursor_y += row_height + UV_MAP_PADDING
+        row_height = 0.0
+
+    if cursor_y + uv_candidate.bounding_height > max_bottom:
+        return _extend_hidden_uv_optimization_state(
+            state=state,
+            rotations=rotations,
+            scales=scales,
+            scale_change_amount=scale_change_amount,
+            rotation_change_amount=rotation_change_amount,
+        )
+
+    return UvOptimizationState(
+        rotations=rotations,
+        scales=scales,
+        cursor_x=cursor_x + uv_candidate.bounding_width + UV_MAP_PADDING,
+        cursor_y=cursor_y,
+        row_height=max(row_height, uv_candidate.bounding_height),
+        occupied_area=(
+            state.occupied_area
+            + uv_candidate.wall_width * uv_candidate.wall_height
+        ),
+        bounding_area=(
+            state.bounding_area
+            + uv_candidate.bounding_width * uv_candidate.bounding_height
+        ),
+        placed_wall_count=state.placed_wall_count + 1,
+        hidden_wall_count=state.hidden_wall_count,
+        scale_change_amount=scale_change_amount,
+        rotation_change_amount=rotation_change_amount,
+    )
+
+
+def _extend_hidden_uv_optimization_state(
+    state: UvOptimizationState,
+    rotations: tuple[int, ...],
+    scales: tuple[float, ...],
+    scale_change_amount: float,
+    rotation_change_amount: int,
+) -> UvOptimizationState:
+    return UvOptimizationState(
+        rotations=rotations,
+        scales=scales,
+        cursor_x=state.cursor_x,
+        cursor_y=state.cursor_y,
+        row_height=state.row_height,
+        occupied_area=state.occupied_area,
+        bounding_area=state.bounding_area,
+        placed_wall_count=state.placed_wall_count,
+        hidden_wall_count=state.hidden_wall_count + 1,
+        scale_change_amount=scale_change_amount,
+        rotation_change_amount=rotation_change_amount,
+    )
+
+
+def _build_uv_optimization_candidates(
+    wall: RoomWall,
+    wall_height_pixels: float,
+    current_scale: float,
+    current_rotation: int,
+    max_scale_variation: float,
+) -> tuple[UvOptimizationCandidate, ...]:
+    return tuple(
+        _build_uv_optimization_candidate(
+            wall=wall,
+            wall_height_pixels=wall_height_pixels,
+            current_scale=current_scale,
+            current_rotation=current_rotation,
+            wall_scale=wall_scale,
+            rotation_degrees=rotation_degrees,
+        )
+        for wall_scale in _build_wall_scale_candidates(
+            wall_scale=current_scale,
+            max_scale_variation=max_scale_variation,
+        )
+        for rotation_degrees in _build_wall_rotation_candidates(current_rotation)
+    )
+
+
+def _build_uv_optimization_candidate(
+    wall: RoomWall,
+    wall_height_pixels: float,
+    current_scale: float,
+    current_rotation: int,
+    wall_scale: float,
+    rotation_degrees: int,
+) -> UvOptimizationCandidate:
+    wall_width, wall_height = _calculate_scaled_wall_natural_size(
+        wall=wall,
+        wall_height_pixels=wall_height_pixels,
+        wall_scale=wall_scale,
+    )
+    bounding_width, bounding_height = _calculate_rotated_bounds(
+        width=wall_width,
+        height=wall_height,
+        rotation_degrees=rotation_degrees,
+    )
+    return UvOptimizationCandidate(
+        rotation_degrees=rotation_degrees,
+        wall_scale=wall_scale,
+        wall_width=wall_width,
+        wall_height=wall_height,
+        bounding_width=bounding_width,
+        bounding_height=bounding_height,
+        scale_change_amount=abs(wall_scale - current_scale),
+        rotation_change_amount=_get_rotation_delta(
+            rotation_degrees,
+            current_rotation,
+        ),
+    )
+
+
+def _calculate_scaled_wall_natural_size(
+    wall: RoomWall,
+    wall_height_pixels: float,
+    wall_scale: float,
+) -> tuple[float, float]:
+    return (
+        max(1.0, wall.length * wall_scale),
+        max(1.0, wall_height_pixels * wall_scale),
+    )
+
+
+def _build_wall_scale_candidates(
+    wall_scale: float,
+    max_scale_variation: float,
+) -> tuple[float, ...]:
+    scale_variation = max(0.0, float(max_scale_variation))
+    variation_steps = int(round(scale_variation / UV_OPTIMIZATION_SCALE_STEP))
+    scale_candidates = {
+        max(
+            0.01,
+            round(
+                wall_scale + step * UV_OPTIMIZATION_SCALE_STEP,
+                3,
+            ),
+        )
+        for step in range(-variation_steps, variation_steps + 1)
+    }
+    return tuple(sorted(scale_candidates))
+
+
+def _build_wall_rotation_candidates(current_rotation: int) -> tuple[int, ...]:
+    normalized_rotation = _normalize_wall_uv_rotation(current_rotation)
+    return (normalized_rotation,) + tuple(
+        rotation
+        for rotation in UV_OPTIMIZATION_ROTATION_CANDIDATES
+        if rotation != normalized_rotation
+    )
+
+
+def _score_uv_optimization_state(
+    state: UvOptimizationState,
+) -> tuple[float, int, int, float, float, float, float, int]:
+    return (
+        state.occupied_area,
+        -state.hidden_wall_count,
+        state.placed_wall_count,
+        -state.bounding_area,
+        -(state.cursor_y + state.row_height),
+        -state.cursor_x,
+        -state.scale_change_amount,
+        -state.rotation_change_amount,
+    )
+
+
+def _score_uv_layout(
+    layout: UvLayout,
+) -> tuple[float, int, int, float, float]:
+    occupied_area = sum(
+        _get_placement_area(placement)
+        for placement in layout.placements
+    )
+    bounding_area = sum(
+        placement.uv_rect[2] * placement.uv_rect[3]
+        for placement in layout.placements
+    )
+    layout_bottom = max(
+        (
+            placement.uv_rect[1] + placement.uv_rect[3]
+            for placement in layout.placements
+        ),
+        default=0.0,
+    )
+    return (
+        occupied_area,
+        -layout.hidden_wall_count,
+        len(layout.placements),
+        -bounding_area,
+        -layout_bottom,
+    )
+
+
+def _score_uv_optimization_result(
+    result: UvOptimizationResult,
+    walls: list[RoomWall],
+    map_width: float,
+    map_height: float,
+    wall_height_meters: float,
+) -> tuple[float, int, int, float, float]:
+    layout = _build_uv_wall_layout_for_size(
+        walls=walls,
+        map_width=map_width,
+        map_height=map_height,
+        wall_height_meters=wall_height_meters,
+        wall_uv_scales=result.wall_uv_scales,
+        wall_uv_rotations=result.wall_uv_rotations,
+    )
+    return _score_uv_layout(layout)
 
 
 def get_rotated_uv_corners(
@@ -412,8 +880,24 @@ def _get_projection_direction(
     return "South" if delta_y >= 0.0 else "North"
 
 
+# ### Numeric helpers ###
 def _normalize_wall_uv_rotation(rotation_degrees: int) -> int:
     try:
         return int(round(float(rotation_degrees))) % 360
     except (TypeError, ValueError):
         return 0
+
+
+def _normalize_wall_uv_scale(wall_scale: object) -> float:
+    try:
+        return max(0.01, float(wall_scale))
+    except (TypeError, ValueError):
+        return DEFAULT_WALL_UV_SCALE
+
+
+def _get_rotation_delta(rotation_degrees: int, current_rotation: int) -> int:
+    rotation_delta = abs(
+        _normalize_wall_uv_rotation(rotation_degrees)
+        - _normalize_wall_uv_rotation(current_rotation)
+    )
+    return min(rotation_delta, 360 - rotation_delta)
