@@ -13,6 +13,7 @@ from housemaker.glb import GeneratedModel, PreviewTexturedWall
 EDGE_COLOR = (0.12, 0.12, 0.16, 1.0)
 FACE_COLOR = np.array([0.78, 0.80, 0.84, 1.0], dtype=float)
 TEXTURE_PREVIEW_OFFSET_METERS = 0.01
+CAMERA_STATE_KEYS = ("center", "distance", "elevation", "azimuth", "fov")
 
 # ### Widgets ###
 class GlbViewerWidget(QWidget):
@@ -35,9 +36,12 @@ class GlbViewerWidget(QWidget):
         self.view.setBackgroundColor((24, 24, 28))
         layout.addWidget(self.view, 1)
 
-    def set_model(self, model: GeneratedModel) -> None:
+    def set_model(self, model: GeneratedModel, preserve_camera: bool = False) -> None:
+        camera_state = self._capture_camera_state() if preserve_camera else None
         self.model = model
         self._populate_scene()
+        if camera_state is not None:
+            self._restore_camera_state(camera_state)
 
     def clear_model(self) -> None:
         self.model = None
@@ -131,6 +135,24 @@ class GlbViewerWidget(QWidget):
         self.grid_item = None
         self.mesh_item = None
         self.textured_wall_items = []
+
+    def _capture_camera_state(self) -> dict[str, object]:
+        camera_state: dict[str, object] = {}
+        for key in CAMERA_STATE_KEYS:
+            if key not in self.view.opts:
+                continue
+
+            value = self.view.opts[key]
+            if isinstance(value, QVector3D):
+                camera_state[key] = QVector3D(value)
+            else:
+                camera_state[key] = value
+
+        return camera_state
+
+    def _restore_camera_state(self, camera_state: dict[str, object]) -> None:
+        self.view.opts.update(camera_state)
+        self.view.update()
 
 
 # ### Transform helpers ###

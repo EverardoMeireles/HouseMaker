@@ -130,6 +130,7 @@ class BlueprintWorkspace(QWidget):
         self._is_syncing_level_controls = False
         self._is_syncing_uv_controls = False
         self._is_viewer_refresh_scheduled = False
+        self._scheduled_viewer_refresh_preserve_camera = True
         self._build_ui()
 
     @property
@@ -465,7 +466,7 @@ class BlueprintWorkspace(QWidget):
         if self.workspace_tabs.widget(tab_index) is not self.viewer:
             return
 
-        self._schedule_viewer_preview_refresh()
+        self._schedule_viewer_preview_refresh(preserve_camera=False)
 
     def _build_generated_model(
         self,
@@ -478,21 +479,25 @@ class BlueprintWorkspace(QWidget):
                 QMessageBox.warning(self, failure_title, str(error))
             return None
 
-    def _refresh_viewer_preview(self) -> None:
+    def _refresh_viewer_preview(self, preserve_camera: bool = False) -> None:
         generated_model = self._build_generated_model(None)
         if generated_model is None:
             self.viewer.clear_model()
             return
 
-        self.viewer.set_model(generated_model)
+        self.viewer.set_model(generated_model, preserve_camera=preserve_camera)
 
-    def _schedule_viewer_preview_refresh(self) -> None:
+    def _schedule_viewer_preview_refresh(self, preserve_camera: bool = True) -> None:
         if self.workspace_tabs.currentWidget() is not self.viewer:
             return
         if self._is_viewer_refresh_scheduled:
+            self._scheduled_viewer_refresh_preserve_camera = (
+                self._scheduled_viewer_refresh_preserve_camera and preserve_camera
+            )
             return
 
         self._is_viewer_refresh_scheduled = True
+        self._scheduled_viewer_refresh_preserve_camera = preserve_camera
         QTimer.singleShot(0, self._run_scheduled_viewer_preview_refresh)
 
     def _run_scheduled_viewer_preview_refresh(self) -> None:
@@ -500,7 +505,9 @@ class BlueprintWorkspace(QWidget):
         if self.workspace_tabs.currentWidget() is not self.viewer:
             return
 
-        self._refresh_viewer_preview()
+        preserve_camera = self._scheduled_viewer_refresh_preserve_camera
+        self._scheduled_viewer_refresh_preserve_camera = True
+        self._refresh_viewer_preview(preserve_camera=preserve_camera)
 
     def _handle_save_clicked(self) -> None:
         default_path = Path.cwd() / "housemaker_project.json"
