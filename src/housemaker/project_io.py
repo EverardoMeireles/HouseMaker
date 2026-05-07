@@ -236,8 +236,8 @@ def _deserialize_wall_uv_rotations(raw_wall_uv_rotations: object) -> dict[str, i
 
 def _normalize_wall_uv_rotation(raw_wall_rotation: object) -> int:
     try:
-        rotation_degrees = int(raw_wall_rotation)
+        rotation_degrees = int(round(float(raw_wall_rotation)))
     except (TypeError, ValueError):
         return 0
 
-    return (round(rotation_degrees / 90) * 90) % 360
+    return rotation_degrees % 360

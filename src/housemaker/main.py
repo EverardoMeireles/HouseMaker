@@ -105,21 +105,21 @@ class PowerOfTwoSpinBox(QSpinBox):
         return str(_nearest_power_of_two_value(value))
 
 
-class RightAngleSpinBox(QSpinBox):
+class DegreeSpinBox(QSpinBox):
     def setValue(self, value: int) -> None:  # type: ignore[override]
-        super().setValue(_nearest_right_angle_value(value))
+        super().setValue(_normalize_degree_value(value))
 
     def stepBy(self, steps: int) -> None:  # type: ignore[override]
-        self.setValue(_step_right_angle_value(self.value(), steps))
+        self.setValue(self.value() + steps)
 
     def valueFromText(self, text: str) -> int:  # type: ignore[override]
         try:
-            return _nearest_right_angle_value(int(text or self.minimum()))
+            return _normalize_degree_value(int(text or self.minimum()))
         except ValueError:
             return self.value()
 
     def textFromValue(self, value: int) -> str:  # type: ignore[override]
-        return str(_nearest_right_angle_value(value))
+        return str(_normalize_degree_value(value))
 
 
 class BlueprintWorkspace(QWidget):
@@ -388,8 +388,10 @@ class BlueprintWorkspace(QWidget):
         )
         uv_controls_layout.addRow("Wall scale", self.uv_wall_scale_spinbox)
 
-        self.uv_wall_rotation_spinbox = RightAngleSpinBox()
-        self.uv_wall_rotation_spinbox.setRange(0, 270)
+        self.uv_wall_rotation_spinbox = DegreeSpinBox()
+        self.uv_wall_rotation_spinbox.setRange(0, 359)
+        self.uv_wall_rotation_spinbox.setSingleStep(1)
+        self.uv_wall_rotation_spinbox.setWrapping(True)
         self.uv_wall_rotation_spinbox.setSuffix(" deg")
         self.uv_wall_rotation_spinbox.valueChanged.connect(
             self._handle_uv_wall_rotation_changed
@@ -831,7 +833,7 @@ class BlueprintWorkspace(QWidget):
         if selected_room is None or selected_wall_key is None:
             return
 
-        selected_room.wall_uv_rotations[selected_wall_key] = _nearest_right_angle_value(
+        selected_room.wall_uv_rotations[selected_wall_key] = _normalize_degree_value(
             value
         )
         self.uv_canvas.update()
@@ -989,20 +991,8 @@ def _step_power_of_two_value(value: int, steps: int) -> int:
     return power_value
 
 
-def _nearest_right_angle_value(value: int) -> int:
-    clamped_value = min(max(int(value), 0), 270)
-    return (round(clamped_value / 90) * 90) % 360
-
-
-def _step_right_angle_value(value: int, steps: int) -> int:
-    right_angle_value = _nearest_right_angle_value(value)
-    for _ in range(abs(steps)):
-        if steps > 0:
-            right_angle_value = min(right_angle_value + 90, 270)
-        else:
-            right_angle_value = max(right_angle_value - 90, 0)
-
-    return right_angle_value
+def _normalize_degree_value(value: int) -> int:
+    return int(value) % 360
 
 
 # ### Entrypoint ###

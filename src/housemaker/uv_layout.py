@@ -37,6 +37,7 @@ class RoomWall:
 class UvWallPlacement:
     wall: RoomWall
     uv_rect: tuple[float, float, float, float]
+    natural_size: tuple[float, float]
     rotation_degrees: int
 
 
@@ -73,10 +74,7 @@ def calculate_unoccupied_uv_pixels(
         1.0,
         float(room.uv_map_height),
     )
-    occupied_area = sum(
-        placement.uv_rect[2] * placement.uv_rect[3]
-        for placement in layout.placements
-    )
+    occupied_area = sum(_get_placement_area(placement) for placement in layout.placements)
     return max(0, int(round(map_area - occupied_area)))
 
 
@@ -195,36 +193,104 @@ def _build_uv_wall_layout_for_size(
         )
         wall_width = max(1.0, wall.length * wall_scale)
         wall_height = max(1.0, wall_height_pixels * wall_scale)
-        if wall_rotation in (90, 270):
-            wall_width, wall_height = wall_height, wall_width
+        bounding_width, bounding_height = _calculate_rotated_bounds(
+            width=wall_width,
+            height=wall_height,
+            rotation_degrees=wall_rotation,
+        )
 
-        if wall_width > map_width - UV_MAP_PADDING * 2.0:
+        if bounding_width > map_width - UV_MAP_PADDING * 2.0:
             hidden_wall_count += 1
             continue
-        if wall_height > map_height - UV_MAP_PADDING * 2.0:
+        if bounding_height > map_height - UV_MAP_PADDING * 2.0:
             hidden_wall_count += 1
             continue
 
-        if cursor_x + wall_width > max_right and cursor_x > UV_MAP_PADDING:
+        if cursor_x + bounding_width > max_right and cursor_x > UV_MAP_PADDING:
             cursor_x = UV_MAP_PADDING
             cursor_y += row_height + UV_MAP_PADDING
             row_height = 0.0
 
-        if cursor_y + wall_height > max_bottom:
+        if cursor_y + bounding_height > max_bottom:
             hidden_wall_count += 1
             continue
 
         placements.append(
             UvWallPlacement(
                 wall=wall,
-                uv_rect=(cursor_x, cursor_y, wall_width, wall_height),
+                uv_rect=(cursor_x, cursor_y, bounding_width, bounding_height),
+                natural_size=(wall_width, wall_height),
                 rotation_degrees=wall_rotation,
             )
         )
-        cursor_x += wall_width + UV_MAP_PADDING
-        row_height = max(row_height, wall_height)
+        cursor_x += bounding_width + UV_MAP_PADDING
+        row_height = max(row_height, bounding_height)
 
     return UvLayout(placements=placements, hidden_wall_count=hidden_wall_count)
+
+
+def get_rotated_uv_corners(
+    placement: UvWallPlacement,
+) -> tuple[
+    tuple[float, float],
+    tuple[float, float],
+    tuple[float, float],
+    tuple[float, float],
+]:
+    uv_x, uv_y, uv_width, uv_height = placement.uv_rect
+    wall_width, wall_height = placement.natural_size
+    center_x = uv_x + uv_width / 2.0
+    center_y = uv_y + uv_height / 2.0
+    return tuple(
+        _rotate_uv_point(
+            center_x=center_x,
+            center_y=center_y,
+            offset_x=offset_x,
+            offset_y=offset_y,
+            rotation_degrees=placement.rotation_degrees,
+        )
+        for offset_x, offset_y in (
+            (-wall_width / 2.0, -wall_height / 2.0),
+            (wall_width / 2.0, -wall_height / 2.0),
+            (wall_width / 2.0, wall_height / 2.0),
+            (-wall_width / 2.0, wall_height / 2.0),
+        )
+    )
+
+
+def _get_placement_area(placement: UvWallPlacement) -> float:
+    natural_width, natural_height = placement.natural_size
+    return natural_width * natural_height
+
+
+def _calculate_rotated_bounds(
+    width: float,
+    height: float,
+    rotation_degrees: int,
+) -> tuple[float, float]:
+    rotation_radians = math.radians(rotation_degrees % 360)
+    cosine = abs(math.cos(rotation_radians))
+    sine = abs(math.sin(rotation_radians))
+    return (
+        width * cosine + height * sine,
+        width * sine + height * cosine,
+    )
+
+
+def _rotate_uv_point(
+    center_x: float,
+    center_y: float,
+    offset_x: float,
+    offset_y: float,
+    rotation_degrees: int,
+) -> tuple[float, float]:
+    rotation_radians = math.radians(rotation_degrees % 360)
+    cosine = math.cos(rotation_radians)
+    sine = math.sin(rotation_radians)
+    return (
+        center_x + offset_x * cosine - offset_y * sine,
+        center_y + offset_x * sine + offset_y * cosine,
+    )
 
 
 # ### Geometry helpers ###
@@ -347,4 +413,7 @@ def _get_projection_direction(
 
 
 def _normalize_wall_uv_rotation(rotation_degrees: int) -> int:
-    return (round(int(rotation_degrees) / 90) * 90) % 360
+    try:
+        return int(round(float(rotation_degrees))) % 360
+    except (TypeError, ValueError):
+        return 0

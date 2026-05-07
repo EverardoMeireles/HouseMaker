@@ -1,8 +1,8 @@
 # ### Imports ###
 from __future__ import annotations
 
-import os
 import math
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,6 +29,7 @@ from housemaker.uv_layout import (
     UvWallPlacement,
     build_room_walls,
     build_uv_wall_layout,
+    get_rotated_uv_corners,
 )
 
 # ### Constants ###
@@ -428,12 +429,17 @@ def _paint_room_texture_wall(
     placement: UvWallPlacement,
 ) -> None:
     uv_x, uv_y, uv_width, uv_height = placement.uv_rect
-    texture_rect = QRectF(uv_x, uv_y, uv_width, uv_height).adjusted(
-        0.5,
-        0.5,
-        -0.5,
-        -0.5,
-    )
+    wall_width, wall_height = placement.natural_size
+    texture_rect = QRectF(
+        -wall_width / 2.0,
+        -wall_height / 2.0,
+        wall_width,
+        wall_height,
+    ).adjusted(0.5, 0.5, -0.5, -0.5)
+
+    painter.save()
+    painter.translate(uv_x + uv_width / 2.0, uv_y + uv_height / 2.0)
+    painter.rotate(placement.rotation_degrees)
     painter.setPen(QPen(ROOM_TEXTURE_WALL_BORDER_COLOR, ROOM_TEXTURE_WALL_BORDER_WIDTH))
     painter.setBrush(ROOM_TEXTURE_WALL_FILL_COLOR)
     painter.drawRect(texture_rect)
@@ -445,6 +451,7 @@ def _paint_room_texture_wall(
         int(Qt.AlignmentFlag.AlignCenter),
         f"{placement.wall.projection_direction}\n{placement.rotation_degrees} deg",
     )
+    painter.restore()
 
 
 def _paint_room_texture_hidden_indicator(
@@ -507,35 +514,38 @@ def _qimage_to_gl_rgba_array(image: QImage) -> np.ndarray:
     return np.flip(np.swapaxes(image_array, 0, 1), axis=1).copy()
 
 
-def _crop_placement_texture(
-    texture_image: QImage,
-    placement: UvWallPlacement,
-) -> np.ndarray:
-    uv_x, uv_y, uv_width, uv_height = placement.uv_rect
-    crop_x = max(0, int(math.floor(uv_x)))
-    crop_y = max(0, int(math.floor(uv_y)))
-    crop_right = min(texture_image.width(), int(math.ceil(uv_x + uv_width)))
-    crop_bottom = min(texture_image.height(), int(math.ceil(uv_y + uv_height)))
-    crop_width = max(1, crop_right - crop_x)
-    crop_height = max(1, crop_bottom - crop_y)
-    cropped_image = texture_image.copy(crop_x, crop_y, crop_width, crop_height)
-    texture_rgba = _qimage_to_gl_rgba_array(cropped_image)
-    return _rotate_preview_texture(texture_rgba, placement.rotation_degrees)
+def _build_wall_preview_texture(placement: UvWallPlacement) -> np.ndarray:
+    _ensure_qt_application()
+    wall_width, wall_height = placement.natural_size
+    texture_width = max(1, int(math.ceil(wall_width)))
+    texture_height = max(1, int(math.ceil(wall_height)))
+    image = QImage(
+        texture_width,
+        texture_height,
+        QImage.Format.Format_RGBA8888,
+    )
+    image.fill(ROOM_TEXTURE_WALL_FILL_COLOR)
 
-
-def _rotate_preview_texture(
-    texture_rgba: np.ndarray,
-    rotation_degrees: int,
-) -> np.ndarray:
-    normalized_rotation = int(rotation_degrees) % 360
-    if normalized_rotation == 90:
-        return np.rot90(texture_rgba, k=-1, axes=(0, 1)).copy()
-    if normalized_rotation == 180:
-        return np.rot90(texture_rgba, k=2, axes=(0, 1)).copy()
-    if normalized_rotation == 270:
-        return np.rot90(texture_rgba, k=1, axes=(0, 1)).copy()
-
-    return texture_rgba
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    texture_rect = QRectF(
+        0.5,
+        0.5,
+        max(1.0, texture_width - 1.0),
+        max(1.0, texture_height - 1.0),
+    )
+    painter.setPen(QPen(ROOM_TEXTURE_WALL_BORDER_COLOR, ROOM_TEXTURE_WALL_BORDER_WIDTH))
+    painter.setBrush(ROOM_TEXTURE_WALL_FILL_COLOR)
+    painter.drawRect(texture_rect)
+    painter.setPen(QPen(ROOM_TEXTURE_TEXT_COLOR))
+    painter.setFont(QFont("Segoe UI", _get_room_texture_label_font_size(texture_rect)))
+    painter.drawText(
+        texture_rect,
+        int(Qt.AlignmentFlag.AlignCenter),
+        f"{placement.wall.projection_direction}\n{placement.rotation_degrees} deg",
+    )
+    painter.end()
+    return _qimage_to_gl_rgba_array(image)
 
 
 # ### Wall geometry helpers ###
@@ -574,26 +584,26 @@ def _build_wall_uv_coordinates(
     room: RoomData,
     placement: UvWallPlacement,
 ) -> list[tuple[float, float]]:
-    uv_x, uv_y, uv_width, uv_height = placement.uv_rect
     texture_width = max(1.0, float(room.uv_map_width))
     texture_height = max(1.0, float(room.uv_map_height))
-    left = uv_x / texture_width
-    right = (uv_x + uv_width) / texture_width
-    top = 1.0 - (uv_y / texture_height)
-    bottom = 1.0 - ((uv_y + uv_height) / texture_height)
-    top_left = (left, top)
-    top_right = (right, top)
-    bottom_right = (right, bottom)
-    bottom_left = (left, bottom)
+    top_left, top_right, bottom_right, bottom_left = get_rotated_uv_corners(placement)
+    return [
+        _normalize_uv_point(bottom_left, texture_width, texture_height),
+        _normalize_uv_point(bottom_right, texture_width, texture_height),
+        _normalize_uv_point(top_right, texture_width, texture_height),
+        _normalize_uv_point(top_left, texture_width, texture_height),
+    ]
 
-    if placement.rotation_degrees == 90:
-        return [bottom_right, top_right, top_left, bottom_left]
-    if placement.rotation_degrees == 180:
-        return [top_right, top_left, bottom_left, bottom_right]
-    if placement.rotation_degrees == 270:
-        return [top_left, bottom_left, bottom_right, top_right]
 
-    return [bottom_left, bottom_right, top_right, top_left]
+def _normalize_uv_point(
+    uv_point: tuple[float, float],
+    texture_width: float,
+    texture_height: float,
+) -> tuple[float, float]:
+    return (
+        uv_point[0] / texture_width,
+        1.0 - (uv_point[1] / texture_height),
+    )
 
 
 def _build_hidden_wall_uv_coordinates() -> list[tuple[float, float]]:
@@ -639,7 +649,6 @@ def _build_level_preview_textured_walls(
         if not layout.placements:
             continue
 
-        texture_image = _build_room_texture_image(room, layout)
         for placement in layout.placements:
             start_xy = _point_to_world_xy(
                 placement.wall.start_point,
@@ -662,7 +671,7 @@ def _build_level_preview_textured_walls(
                         base_z_meters,
                     ),
                     height_meters=float(level.height_meters),
-                    texture_rgba=_crop_placement_texture(texture_image, placement),
+                    texture_rgba=_build_wall_preview_texture(placement),
                 )
             )
 

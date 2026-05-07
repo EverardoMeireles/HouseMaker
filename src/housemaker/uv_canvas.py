@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QWidget
 
 from housemaker.models import RoomData, VertexData
@@ -10,6 +10,7 @@ from housemaker.uv_layout import (
     UvWallPlacement,
     build_uv_wall_layout,
     get_room_wall_keys,
+    get_rotated_uv_corners,
 )
 
 # ### Constants ###
@@ -102,8 +103,11 @@ class UvCanvas(QWidget):
             wall_height_meters=self.wall_height_meters,
         )
         for placement in reversed(layout.placements):
-            widget_rect = self._uv_rect_to_widget_rect(placement.uv_rect, map_rect)
-            if widget_rect.contains(event.position()):
+            widget_polygon = self._uv_placement_to_widget_polygon(placement, map_rect)
+            if widget_polygon.containsPoint(
+                event.position(),
+                Qt.FillRule.OddEvenFill,
+            ):
                 self.selected_wall_key = placement.wall.key
                 self.selected_wall_changed.emit(placement.wall.key)
                 self.update()
@@ -121,14 +125,27 @@ class UvCanvas(QWidget):
         painter.setFont(QFont("Segoe UI", 8))
         for placement in placements:
             widget_rect = self._uv_rect_to_widget_rect(placement.uv_rect, map_rect)
+            wall_width, wall_height = placement.natural_size
+            scale_x = map_rect.width() / max(1.0, float(self.room.uv_map_width))
+            scale_y = map_rect.height() / max(1.0, float(self.room.uv_map_height))
+            wall_widget_rect = QRectF(
+                -wall_width * scale_x / 2.0,
+                -wall_height * scale_y / 2.0,
+                wall_width * scale_x,
+                wall_height * scale_y,
+            )
+
+            painter.save()
+            painter.translate(widget_rect.center())
+            painter.rotate(placement.rotation_degrees)
             painter.setPen(QPen(UV_WALL_BORDER_COLOR, 2.0))
             painter.setBrush(UV_WALL_FILL_COLOR)
-            painter.drawRect(widget_rect)
+            painter.drawRect(wall_widget_rect)
 
             if placement.wall.key == self.selected_wall_key:
                 painter.setPen(QPen(UV_SELECTED_WALL_COLOR, 3.0))
                 painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.drawRect(widget_rect.adjusted(2.0, 2.0, -2.0, -2.0))
+                painter.drawRect(wall_widget_rect.adjusted(2.0, 2.0, -2.0, -2.0))
 
             painter.setPen(QPen(UV_DARK_TEXT_COLOR))
             label_text = (
@@ -136,10 +153,11 @@ class UvCanvas(QWidget):
                 f"{placement.rotation_degrees} deg"
             )
             painter.drawText(
-                widget_rect,
+                wall_widget_rect,
                 int(Qt.AlignmentFlag.AlignCenter),
                 label_text,
             )
+            painter.restore()
 
     def _paint_hidden_wall_indicator(
         self,
@@ -216,4 +234,31 @@ class UvCanvas(QWidget):
             map_rect.top() + uv_y * scale_y,
             uv_width * scale_x,
             uv_height * scale_y,
+        )
+
+    def _uv_placement_to_widget_polygon(
+        self,
+        placement: UvWallPlacement,
+        map_rect: QRectF,
+    ) -> QPolygonF:
+        return QPolygonF(
+            [
+                self._uv_point_to_widget_point(uv_point, map_rect)
+                for uv_point in get_rotated_uv_corners(placement)
+            ]
+        )
+
+    def _uv_point_to_widget_point(
+        self,
+        uv_point: tuple[float, float],
+        map_rect: QRectF,
+    ) -> QPointF:
+        if self.room is None:
+            return QPointF()
+
+        scale_x = map_rect.width() / max(1.0, float(self.room.uv_map_width))
+        scale_y = map_rect.height() / max(1.0, float(self.room.uv_map_height))
+        return QPointF(
+            map_rect.left() + uv_point[0] * scale_x,
+            map_rect.top() + uv_point[1] * scale_y,
         )
