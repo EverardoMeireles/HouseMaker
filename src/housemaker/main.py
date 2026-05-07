@@ -49,7 +49,8 @@ from housemaker.models import (
     create_default_levels,
 )
 from housemaker.project_io import ProjectData, load_project, save_project
-from housemaker.uv_canvas import UvCanvas, calculate_unoccupied_uv_pixels
+from housemaker.uv_canvas import UvCanvas
+from housemaker.uv_layout import calculate_unoccupied_uv_pixels
 from housemaker.viewer import GlbViewerWidget
 
 # ### Widgets ###
@@ -782,6 +783,7 @@ class BlueprintWorkspace(QWidget):
         selected_room.uv_map_width = int(value)
         self.uv_canvas.update()
         self._update_unoccupied_uv_pixels_label()
+        self._schedule_viewer_preview_refresh()
 
     def _handle_uv_map_height_changed(self, value: int) -> None:
         if self._is_syncing_uv_controls:
@@ -794,6 +796,7 @@ class BlueprintWorkspace(QWidget):
         selected_room.uv_map_height = int(value)
         self.uv_canvas.update()
         self._update_unoccupied_uv_pixels_label()
+        self._schedule_viewer_preview_refresh()
 
     def _handle_uv_wall_selected(self, wall_key: str) -> None:
         self._sync_uv_controls()
@@ -810,6 +813,7 @@ class BlueprintWorkspace(QWidget):
         selected_room.wall_uv_scales[selected_wall_key] = float(value)
         self.uv_canvas.update()
         self._update_unoccupied_uv_pixels_label()
+        self._schedule_viewer_preview_refresh()
 
     def _handle_uv_wall_rotation_changed(self, value: int) -> None:
         if self._is_syncing_uv_controls:
@@ -825,6 +829,7 @@ class BlueprintWorkspace(QWidget):
         )
         self.uv_canvas.update()
         self._update_unoccupied_uv_pixels_label()
+        self._schedule_viewer_preview_refresh()
 
     def _handle_designate_room_clicked(self) -> None:
         room_name = self.room_name_field.text().strip()

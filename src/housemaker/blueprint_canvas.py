@@ -31,7 +31,7 @@ from housemaker.models import (
     VertexData,
     snap_point,
 )
-from housemaker.uv_canvas import initialize_room_uv_map_size
+from housemaker.uv_layout import initialize_room_uv_map_size
 
 # ### Constants ###
 CANVAS_BACKGROUND_COLOR = QColor("#1c1f24")
