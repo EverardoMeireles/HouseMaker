@@ -461,6 +461,7 @@ class BlueprintCanvas(QWidget):
             return
 
         if self.drag_vertex_id is not None:
+            self._join_dragged_vertex_to_edge(self.drag_vertex_id)
             self.preview_point = None
             self.preview_guides = []
             self._reset_pointer_state()
@@ -547,6 +548,25 @@ class BlueprintCanvas(QWidget):
         self.selected_vertex_ids = {new_vertex.id}
         self.preview_point = point
         self.preview_guides = []
+
+    def _join_dragged_vertex_to_edge(self, vertex_id: int) -> None:
+        vertex = self.vertex_data.get_vertex(vertex_id)
+        if vertex is None:
+            return
+
+        hit_edge = self._find_edge_at(
+            self._image_to_widget(vertex.x, vertex.y),
+            excluded_vertex_ids={vertex_id},
+        )
+        if hit_edge is None:
+            return
+
+        self.vertex_data.move_vertex(vertex_id, hit_edge.point[0], hit_edge.point[1])
+        self.vertex_data.split_edge(
+            hit_edge.edge.start_vertex_id,
+            hit_edge.edge.end_vertex_id,
+            vertex_id,
+        )
 
     def _handle_new_vertex_on_edge_click(
         self,
@@ -771,11 +791,21 @@ class BlueprintCanvas(QWidget):
 
         return closest_vertex
 
-    def _find_edge_at(self, widget_point: QPointF) -> EdgeHit | None:
+    def _find_edge_at(
+        self,
+        widget_point: QPointF,
+        excluded_vertex_ids: set[int] | None = None,
+    ) -> EdgeHit | None:
+        excluded_ids = excluded_vertex_ids or set()
         closest_hit: EdgeHit | None = None
         closest_distance = EDGE_HIT_TOLERANCE_SCREEN
 
         for edge in self.vertex_data.edges:
+            if edge.start_vertex_id in excluded_ids:
+                continue
+            if edge.end_vertex_id in excluded_ids:
+                continue
+
             start_vertex = self.vertex_data.get_vertex(edge.start_vertex_id)
             end_vertex = self.vertex_data.get_vertex(edge.end_vertex_id)
             if start_vertex is None or end_vertex is None:
