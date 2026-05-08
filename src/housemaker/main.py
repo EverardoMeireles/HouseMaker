@@ -386,6 +386,13 @@ class BlueprintWorkspace(QWidget):
         self.optimize_uv_button.clicked.connect(self._handle_optimize_uv_clicked)
         optimize_layout.addWidget(self.optimize_uv_button, 1)
 
+        self.optimize_all_uv_button = QPushButton("Optimize all")
+        self.optimize_all_uv_button.setMinimumHeight(34)
+        self.optimize_all_uv_button.clicked.connect(
+            self._handle_optimize_all_uv_clicked
+        )
+        optimize_layout.addWidget(self.optimize_all_uv_button, 1)
+
         self.use_complex_optimization_radio = QRadioButton(
             "Use complex optimization"
         )
@@ -748,6 +755,7 @@ class BlueprintWorkspace(QWidget):
         self.uv_map_width_spinbox.setEnabled(has_room)
         self.uv_map_height_spinbox.setEnabled(has_room)
         self.optimize_uv_button.setEnabled(has_room)
+        self.optimize_all_uv_button.setEnabled(has_room)
         self.reset_uv_defaults_button.setEnabled(has_room)
         self.use_complex_optimization_radio.setEnabled(has_room)
         self.complex_optimization_passes_spinbox.setEnabled(
@@ -903,17 +911,7 @@ class BlueprintWorkspace(QWidget):
         if selected_room is None:
             return
 
-        optimized_result = optimize_room_wall_uvs(
-            room=selected_room,
-            vertex_data=self.current_level.vertex_data,
-            wall_height_meters=self.current_level.height_meters,
-            use_complex_optimization=(
-                self.use_complex_optimization_radio.isChecked()
-            ),
-            complex_optimization_passes=(
-                self.complex_optimization_passes_spinbox.value()
-            ),
-        )
+        optimized_result = self._optimize_uv_room(selected_room)
         if not optimized_result.wall_uv_rotations:
             QMessageBox.warning(
                 self,
@@ -926,6 +924,37 @@ class BlueprintWorkspace(QWidget):
         self.uv_canvas.update()
         self._sync_uv_controls()
         self._schedule_viewer_preview_refresh()
+
+    def _handle_optimize_all_uv_clicked(self) -> None:
+        skipped_room_names: list[str] = []
+        optimized_count = 0
+        for room in self.current_level.rooms:
+            optimized_result = self._optimize_uv_room(room)
+            if not optimized_result.wall_uv_rotations:
+                skipped_room_names.append(room.name or "Room")
+                continue
+
+            self._apply_uv_optimization_result(room, optimized_result)
+            optimized_count += 1
+
+        if optimized_count == 0:
+            QMessageBox.warning(
+                self,
+                "Optimization skipped",
+                "No layout can show every wall for any room with the current map sizes.",
+            )
+            return
+
+        self.uv_canvas.update()
+        self._sync_uv_controls()
+        self._schedule_viewer_preview_refresh()
+        if skipped_room_names:
+            QMessageBox.warning(
+                self,
+                "Some rooms skipped",
+                "No layout can show every wall for: "
+                + ", ".join(skipped_room_names),
+            )
 
     def _handle_reset_uv_defaults_clicked(self) -> None:
         selected_room = self._get_selected_uv_room()
@@ -940,6 +969,19 @@ class BlueprintWorkspace(QWidget):
         self.uv_canvas.update()
         self._sync_uv_controls()
         self._schedule_viewer_preview_refresh()
+
+    def _optimize_uv_room(self, room: RoomData) -> UvOptimizationResult:
+        return optimize_room_wall_uvs(
+            room=room,
+            vertex_data=self.current_level.vertex_data,
+            wall_height_meters=self.current_level.height_meters,
+            use_complex_optimization=(
+                self.use_complex_optimization_radio.isChecked()
+            ),
+            complex_optimization_passes=(
+                self.complex_optimization_passes_spinbox.value()
+            ),
+        )
 
     @staticmethod
     def _apply_uv_optimization_result(
