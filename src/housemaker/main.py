@@ -405,6 +405,13 @@ class BlueprintWorkspace(QWidget):
             self.complex_optimization_passes_spinbox,
         )
 
+        self.reset_uv_defaults_button = QPushButton("Reset defaults")
+        self.reset_uv_defaults_button.setMinimumHeight(34)
+        self.reset_uv_defaults_button.clicked.connect(
+            self._handle_reset_uv_defaults_clicked
+        )
+        uv_controls_layout.addRow("", self.reset_uv_defaults_button)
+
         self.uv_map_width_spinbox = PowerOfTwoSpinBox()
         self.uv_map_width_spinbox.setRange(64, 8192)
         self.uv_map_width_spinbox.valueChanged.connect(
@@ -741,6 +748,7 @@ class BlueprintWorkspace(QWidget):
         self.uv_map_width_spinbox.setEnabled(has_room)
         self.uv_map_height_spinbox.setEnabled(has_room)
         self.optimize_uv_button.setEnabled(has_room)
+        self.reset_uv_defaults_button.setEnabled(has_room)
         self.use_complex_optimization_radio.setEnabled(has_room)
         self.complex_optimization_passes_spinbox.setEnabled(
             has_room and self.use_complex_optimization_radio.isChecked()
@@ -915,6 +923,20 @@ class BlueprintWorkspace(QWidget):
             return
 
         self._apply_uv_optimization_result(selected_room, optimized_result)
+        self.uv_canvas.update()
+        self._sync_uv_controls()
+        self._schedule_viewer_preview_refresh()
+
+    def _handle_reset_uv_defaults_clicked(self) -> None:
+        selected_room = self._get_selected_uv_room()
+        if selected_room is None:
+            return
+
+        selected_room.uv_map_width = DEFAULT_UV_MAP_WIDTH
+        selected_room.uv_map_height = DEFAULT_UV_MAP_HEIGHT
+        selected_room.wall_uv_scales.clear()
+        selected_room.wall_uv_rotations.clear()
+        selected_room.wall_uv_positions.clear()
         self.uv_canvas.update()
         self._sync_uv_controls()
         self._schedule_viewer_preview_refresh()
