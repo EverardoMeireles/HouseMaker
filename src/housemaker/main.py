@@ -35,6 +35,7 @@ from housemaker.glb import (
     GeneratedModel,
     convert_to_glb,
     export_glb_file,
+    export_room_texture_pngs,
 )
 from housemaker.models import (
     DEFAULT_IMAGE_OFFSET,
@@ -51,6 +52,7 @@ from housemaker.models import (
 from housemaker.project_io import ProjectData, load_project, save_project
 from housemaker.uv_canvas import UvCanvas
 from housemaker.uv_layout import (
+    UvOptimizationResult,
     calculate_unoccupied_uv_pixels,
     optimize_room_wall_uvs,
 )
@@ -325,11 +327,17 @@ class BlueprintWorkspace(QWidget):
         self.load_button.clicked.connect(self._handle_load_clicked)
         buttons_layout.addWidget(self.load_button)
 
-        self.export_button = QPushButton("Export")
+        self.export_button = QPushButton("GLB")
         self.export_button.setMinimumHeight(56)
         self.export_button.setStyleSheet("font-size: 18px; font-weight: 600;")
-        self.export_button.clicked.connect(self._handle_export_clicked)
+        self.export_button.clicked.connect(self._handle_glb_export_clicked)
         buttons_layout.addWidget(self.export_button, 1)
+
+        self.png_export_button = QPushButton("PNG")
+        self.png_export_button.setMinimumHeight(56)
+        self.png_export_button.setStyleSheet("font-size: 18px; font-weight: 600;")
+        self.png_export_button.clicked.connect(self._handle_png_export_clicked)
+        buttons_layout.addWidget(self.png_export_button, 1)
         side_layout.addLayout(buttons_layout)
 
         self.side_tabs.addTab(self._build_uvs_tab(), "UVs")
@@ -358,6 +366,7 @@ class BlueprintWorkspace(QWidget):
 
         self.uv_canvas = UvCanvas()
         self.uv_canvas.selected_wall_changed.connect(self._handle_uv_wall_selected)
+        self.uv_canvas.uv_values_changed.connect(self._handle_uv_values_changed)
         uvs_layout.addWidget(self.uv_canvas, 2)
 
         uv_controls_layout = QFormLayout()
@@ -368,20 +377,32 @@ class BlueprintWorkspace(QWidget):
         self.unoccupied_uv_pixels_label.setMinimumHeight(24)
         uv_controls_layout.addRow("", self.unoccupied_uv_pixels_label)
 
+        optimize_layout = QHBoxLayout()
+        optimize_layout.setContentsMargins(0, 0, 0, 0)
+        optimize_layout.setSpacing(8)
+
         self.optimize_uv_button = QPushButton("Optimize")
         self.optimize_uv_button.setMinimumHeight(34)
         self.optimize_uv_button.clicked.connect(self._handle_optimize_uv_clicked)
-        uv_controls_layout.addRow("", self.optimize_uv_button)
+        optimize_layout.addWidget(self.optimize_uv_button, 1)
 
-        self.max_scale_variation_spinbox = QDoubleSpinBox()
-        self.max_scale_variation_spinbox.setRange(0.0, 1.0)
-        self.max_scale_variation_spinbox.setDecimals(3)
-        self.max_scale_variation_spinbox.setSingleStep(0.01)
-        self.max_scale_variation_spinbox.setValue(0.200)
-        self.max_scale_variation_spinbox.setMinimumHeight(34)
+        self.use_complex_optimization_radio = QRadioButton(
+            "Use complex optimization"
+        )
+        self.use_complex_optimization_radio.setAutoExclusive(False)
+        self.use_complex_optimization_radio.toggled.connect(
+            self._handle_complex_optimization_toggled
+        )
+        optimize_layout.addWidget(self.use_complex_optimization_radio)
+        uv_controls_layout.addRow("", optimize_layout)
+
+        self.complex_optimization_passes_spinbox = QSpinBox()
+        self.complex_optimization_passes_spinbox.setRange(1, 100)
+        self.complex_optimization_passes_spinbox.setValue(3)
+        self.complex_optimization_passes_spinbox.setMinimumHeight(34)
         uv_controls_layout.addRow(
-            "Max scale variation",
-            self.max_scale_variation_spinbox,
+            "Complex optimization passes",
+            self.complex_optimization_passes_spinbox,
         )
 
         self.uv_map_width_spinbox = PowerOfTwoSpinBox()
@@ -450,7 +471,7 @@ class BlueprintWorkspace(QWidget):
     def load_blueprint(self, file_path: str) -> None:
         self._set_current_level_image(file_path)
 
-    def _handle_export_clicked(self) -> None:
+    def _handle_glb_export_clicked(self) -> None:
         generated_model = self._build_generated_model("Export failed")
         if generated_model is None:
             return
@@ -481,6 +502,38 @@ class BlueprintWorkspace(QWidget):
             self,
             "GLB exported",
             f"Saved GLB to:\n{exported_path}",
+        )
+
+    def _handle_png_export_clicked(self) -> None:
+        directory_path = QFileDialog.getExistingDirectory(
+            self,
+            "Export PNG textures",
+            str(Path.cwd()),
+        )
+        if not directory_path:
+            return
+
+        try:
+            exported_paths = export_room_texture_pngs(
+                levels=self.levels,
+                directory=directory_path,
+            )
+        except OSError as error:
+            QMessageBox.critical(self, "PNG export failed", str(error))
+            return
+
+        if not exported_paths:
+            QMessageBox.warning(
+                self,
+                "PNG export skipped",
+                "No room textures are available to export.",
+            )
+            return
+
+        QMessageBox.information(
+            self,
+            "PNG textures exported",
+            f"Saved {len(exported_paths)} PNG texture(s) to:\n{directory_path}",
         )
 
     def _handle_workspace_tab_changed(self, tab_index: int) -> None:
@@ -688,7 +741,10 @@ class BlueprintWorkspace(QWidget):
         self.uv_map_width_spinbox.setEnabled(has_room)
         self.uv_map_height_spinbox.setEnabled(has_room)
         self.optimize_uv_button.setEnabled(has_room)
-        self.max_scale_variation_spinbox.setEnabled(has_room)
+        self.use_complex_optimization_radio.setEnabled(has_room)
+        self.complex_optimization_passes_spinbox.setEnabled(
+            has_room and self.use_complex_optimization_radio.isChecked()
+        )
         self.unoccupied_uv_pixels_label.setEnabled(has_room)
 
         if selected_room is None:
@@ -802,6 +858,12 @@ class BlueprintWorkspace(QWidget):
     def _handle_uv_room_selection_changed(self, room_index: int) -> None:
         self._sync_uv_controls()
 
+    def _handle_complex_optimization_toggled(self, checked: bool) -> None:
+        selected_room = self._get_selected_uv_room()
+        self.complex_optimization_passes_spinbox.setEnabled(
+            selected_room is not None and checked
+        )
+
     def _handle_uv_map_width_changed(self, value: int) -> None:
         if self._is_syncing_uv_controls:
             return
@@ -837,19 +899,41 @@ class BlueprintWorkspace(QWidget):
             room=selected_room,
             vertex_data=self.current_level.vertex_data,
             wall_height_meters=self.current_level.height_meters,
-            max_scale_variation=self.max_scale_variation_spinbox.value(),
+            use_complex_optimization=(
+                self.use_complex_optimization_radio.isChecked()
+            ),
+            complex_optimization_passes=(
+                self.complex_optimization_passes_spinbox.value()
+            ),
         )
         if not optimized_result.wall_uv_rotations:
+            QMessageBox.warning(
+                self,
+                "Optimization skipped",
+                "No layout can show every wall with the current map size.",
+            )
             return
 
-        selected_room.wall_uv_rotations.update(optimized_result.wall_uv_rotations)
-        selected_room.wall_uv_scales.update(optimized_result.wall_uv_scales)
+        self._apply_uv_optimization_result(selected_room, optimized_result)
         self.uv_canvas.update()
         self._sync_uv_controls()
         self._schedule_viewer_preview_refresh()
 
+    @staticmethod
+    def _apply_uv_optimization_result(
+        selected_room: RoomData,
+        optimized_result: UvOptimizationResult,
+    ) -> None:
+        selected_room.wall_uv_rotations.update(optimized_result.wall_uv_rotations)
+        selected_room.wall_uv_scales.update(optimized_result.wall_uv_scales)
+        selected_room.wall_uv_positions.update(optimized_result.wall_uv_positions)
+
     def _handle_uv_wall_selected(self, wall_key: str) -> None:
         self._sync_uv_controls()
+
+    def _handle_uv_values_changed(self) -> None:
+        self._sync_uv_controls()
+        self._schedule_viewer_preview_refresh()
 
     def _handle_uv_wall_scale_changed(self, value: float) -> None:
         if self._is_syncing_uv_controls:

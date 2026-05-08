@@ -167,6 +167,10 @@ def _serialize_room(room: RoomData) -> dict[str, object]:
             str(wall_key): int(wall_rotation)
             for wall_key, wall_rotation in room.wall_uv_rotations.items()
         },
+        "wall_uv_positions": {
+            str(wall_key): [float(wall_position[0]), float(wall_position[1])]
+            for wall_key, wall_position in room.wall_uv_positions.items()
+        },
     }
 
 
@@ -208,6 +212,9 @@ def _deserialize_rooms(raw_rooms: object) -> list[RoomData]:
                 wall_uv_rotations=_deserialize_wall_uv_rotations(
                     raw_room.get("wall_uv_rotations", {})
                 ),
+                wall_uv_positions=_deserialize_wall_uv_positions(
+                    raw_room.get("wall_uv_positions", {})
+                ),
             )
         )
 
@@ -231,6 +238,19 @@ def _deserialize_wall_uv_rotations(raw_wall_uv_rotations: object) -> dict[str, i
     return {
         str(wall_key): _normalize_wall_uv_rotation(wall_rotation)
         for wall_key, wall_rotation in raw_wall_uv_rotations.items()
+    }
+
+
+def _deserialize_wall_uv_positions(
+    raw_wall_uv_positions: object,
+) -> dict[str, tuple[float, float]]:
+    if not isinstance(raw_wall_uv_positions, dict):
+        return {}
+
+    return {
+        str(wall_key): (float(wall_position[0]), float(wall_position[1]))
+        for wall_key, wall_position in raw_wall_uv_positions.items()
+        if isinstance(wall_position, list | tuple) and len(wall_position) == 2
     }
 
 

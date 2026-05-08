@@ -45,6 +45,7 @@ class RoomData:
     uv_map_height: int = DEFAULT_UV_MAP_HEIGHT
     wall_uv_scales: dict[str, float] = field(default_factory=dict)
     wall_uv_rotations: dict[str, int] = field(default_factory=dict)
+    wall_uv_positions: dict[str, tuple[float, float]] = field(default_factory=dict)
 
 
 @dataclass

@@ -1,11 +1,13 @@
 # ### Imports ###
 from __future__ import annotations
 
+import math
+
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QWidget
 
-from housemaker.models import RoomData, VertexData
+from housemaker.models import DEFAULT_WALL_UV_SCALE, RoomData, VertexData
 from housemaker.uv_layout import (
     UvWallPlacement,
     build_uv_wall_layout,
@@ -29,6 +31,7 @@ UV_WIDGET_MARGIN = 14.0
 # ### Widgets ###
 class UvCanvas(QWidget):
     selected_wall_changed = Signal(str)
+    uv_values_changed = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -36,6 +39,13 @@ class UvCanvas(QWidget):
         self.vertex_data: VertexData | None = None
         self.wall_height_meters = 3.0
         self.selected_wall_key: str | None = None
+        self.drag_mode: str | None = None
+        self.drag_wall_key: str | None = None
+        self.drag_start_uv_point = QPointF()
+        self.drag_start_wall_position: tuple[float, float] = (0.0, 0.0)
+        self.rotation_center_uv: tuple[float, float] = (0.0, 0.0)
+        self.rotation_start_angle = 0.0
+        self.rotation_start_degrees = 0
         self.setMinimumHeight(260)
 
     def set_room_context(
@@ -97,6 +107,87 @@ class UvCanvas(QWidget):
             return
 
         map_rect = self._get_map_rect()
+        placement = self._find_placement_at_position(event.position(), map_rect)
+        if placement is None:
+            super().mousePressEvent(event)
+            return
+
+        self._select_wall(placement.wall.key)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._start_move_drag(event.position(), placement, map_rect)
+            event.accept()
+            return
+
+        if event.button() == Qt.MouseButton.RightButton:
+            self._start_rotation_drag(event.position(), placement, map_rect)
+            event.accept()
+            return
+
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        if self.drag_mode == "move":
+            self._continue_move_drag(event.position())
+            event.accept()
+            return
+
+        if self.drag_mode == "rotate":
+            self._continue_rotation_drag(event.position())
+            event.accept()
+            return
+
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if self.drag_mode is None:
+            super().mouseReleaseEvent(event)
+            return
+
+        self.drag_mode = None
+        self.drag_wall_key = None
+        event.accept()
+
+    def wheelEvent(self, event) -> None:  # type: ignore[override]
+        if self.room is None or self.vertex_data is None:
+            super().wheelEvent(event)
+            return
+
+        map_rect = self._get_map_rect()
+        placement = self._find_placement_at_position(event.position(), map_rect)
+        if placement is not None:
+            self._select_wall(placement.wall.key)
+        else:
+            placement = self._get_selected_wall_placement()
+
+        if placement is None:
+            super().wheelEvent(event)
+            return
+
+        wheel_delta = event.angleDelta().y()
+        if wheel_delta == 0:
+            wheel_delta = event.pixelDelta().y()
+        if wheel_delta == 0:
+            super().wheelEvent(event)
+            return
+
+        scale_factor = 1.05 ** (wheel_delta / 120.0)
+        current_scale = self.room.wall_uv_scales.get(
+            placement.wall.key,
+            DEFAULT_WALL_UV_SCALE,
+        )
+        new_scale = max(0.01, round(current_scale * scale_factor, 3))
+        placement_center = self._get_placement_center(placement)
+        self.room.wall_uv_scales[placement.wall.key] = new_scale
+        self._set_wall_position_from_center(placement.wall.key, placement_center)
+        self.uv_values_changed.emit()
+        self.update()
+        event.accept()
+
+    def _find_placement_at_position(
+        self,
+        widget_position: QPointF,
+        map_rect: QRectF,
+    ) -> UvWallPlacement | None:
         layout = build_uv_wall_layout(
             room=self.room,
             vertex_data=self.vertex_data,
@@ -105,16 +196,170 @@ class UvCanvas(QWidget):
         for placement in reversed(layout.placements):
             widget_polygon = self._uv_placement_to_widget_polygon(placement, map_rect)
             if widget_polygon.containsPoint(
-                event.position(),
+                widget_position,
                 Qt.FillRule.OddEvenFill,
             ):
-                self.selected_wall_key = placement.wall.key
-                self.selected_wall_changed.emit(placement.wall.key)
-                self.update()
-                event.accept()
-                return
+                return placement
 
-        super().mousePressEvent(event)
+        return None
+
+    def _select_wall(self, wall_key: str) -> None:
+        self.selected_wall_key = wall_key
+        self.selected_wall_changed.emit(wall_key)
+        self.update()
+
+    def _start_move_drag(
+        self,
+        widget_position: QPointF,
+        placement: UvWallPlacement,
+        map_rect: QRectF,
+    ) -> None:
+        self.drag_mode = "move"
+        self.drag_wall_key = placement.wall.key
+        self.drag_start_uv_point = self._widget_point_to_uv_point(
+            widget_position,
+            map_rect,
+        )
+        self.drag_start_wall_position = (placement.uv_rect[0], placement.uv_rect[1])
+
+    def _continue_move_drag(self, widget_position: QPointF) -> None:
+        if self.room is None or self.drag_wall_key is None:
+            return
+
+        map_rect = self._get_map_rect()
+        current_uv_point = self._widget_point_to_uv_point(widget_position, map_rect)
+        placement = self._get_wall_placement(self.drag_wall_key)
+        if placement is None:
+            return
+
+        moved_position = (
+            self.drag_start_wall_position[0]
+            + current_uv_point.x()
+            - self.drag_start_uv_point.x(),
+            self.drag_start_wall_position[1]
+            + current_uv_point.y()
+            - self.drag_start_uv_point.y(),
+        )
+        self.room.wall_uv_positions[self.drag_wall_key] = self._clamp_wall_position(
+            moved_position,
+            placement,
+        )
+        self.uv_values_changed.emit()
+        self.update()
+
+    def _start_rotation_drag(
+        self,
+        widget_position: QPointF,
+        placement: UvWallPlacement,
+        map_rect: QRectF,
+    ) -> None:
+        self.drag_mode = "rotate"
+        self.drag_wall_key = placement.wall.key
+        self.rotation_center_uv = self._get_placement_center(placement)
+        self.rotation_start_angle = self._get_uv_angle_from_center(
+            widget_position=widget_position,
+            map_rect=map_rect,
+            center_uv=self.rotation_center_uv,
+        )
+        self.rotation_start_degrees = placement.rotation_degrees
+
+    def _continue_rotation_drag(self, widget_position: QPointF) -> None:
+        if self.room is None or self.drag_wall_key is None:
+            return
+
+        current_angle = self._get_uv_angle_from_center(
+            widget_position=widget_position,
+            map_rect=self._get_map_rect(),
+            center_uv=self.rotation_center_uv,
+        )
+        rotation_delta = _get_shortest_angle_delta(
+            current_angle,
+            self.rotation_start_angle,
+        )
+        self.room.wall_uv_rotations[self.drag_wall_key] = int(
+            round(self.rotation_start_degrees + rotation_delta)
+        ) % 360
+        self._set_wall_position_from_center(
+            self.drag_wall_key,
+            self.rotation_center_uv,
+        )
+        self.uv_values_changed.emit()
+        self.update()
+
+    def _get_uv_angle_from_center(
+        self,
+        widget_position: QPointF,
+        map_rect: QRectF,
+        center_uv: tuple[float, float],
+    ) -> float:
+        uv_point = self._widget_point_to_uv_point(widget_position, map_rect)
+        return math.degrees(
+            math.atan2(uv_point.y() - center_uv[1], uv_point.x() - center_uv[0])
+        )
+
+    def _get_selected_wall_placement(self) -> UvWallPlacement | None:
+        if self.selected_wall_key is None:
+            return None
+
+        return self._get_wall_placement(self.selected_wall_key)
+
+    def _get_wall_placement(self, wall_key: str) -> UvWallPlacement | None:
+        if self.room is None or self.vertex_data is None:
+            return None
+
+        layout = build_uv_wall_layout(
+            room=self.room,
+            vertex_data=self.vertex_data,
+            wall_height_meters=self.wall_height_meters,
+        )
+        for placement in layout.placements:
+            if placement.wall.key == wall_key:
+                return placement
+
+        return None
+
+    def _get_placement_center(
+        self,
+        placement: UvWallPlacement,
+    ) -> tuple[float, float]:
+        uv_x, uv_y, uv_width, uv_height = placement.uv_rect
+        return uv_x + uv_width / 2.0, uv_y + uv_height / 2.0
+
+    def _set_wall_position_from_center(
+        self,
+        wall_key: str,
+        center_uv: tuple[float, float],
+    ) -> None:
+        if self.room is None:
+            return
+
+        placement = self._get_wall_placement(wall_key)
+        if placement is None:
+            return
+
+        position = (
+            center_uv[0] - placement.uv_rect[2] / 2.0,
+            center_uv[1] - placement.uv_rect[3] / 2.0,
+        )
+        self.room.wall_uv_positions[wall_key] = self._clamp_wall_position(
+            position,
+            placement,
+        )
+
+    def _clamp_wall_position(
+        self,
+        position: tuple[float, float],
+        placement: UvWallPlacement,
+    ) -> tuple[float, float]:
+        if self.room is None:
+            return position
+
+        max_x = max(0.0, float(self.room.uv_map_width) - placement.uv_rect[2])
+        max_y = max(0.0, float(self.room.uv_map_height) - placement.uv_rect[3])
+        return (
+            min(max(position[0], 0.0), max_x),
+            min(max(position[1], 0.0), max_y),
+        )
 
     def _paint_wall_placements(
         self,
@@ -262,3 +507,23 @@ class UvCanvas(QWidget):
             map_rect.left() + uv_point[0] * scale_x,
             map_rect.top() + uv_point[1] * scale_y,
         )
+
+    def _widget_point_to_uv_point(
+        self,
+        widget_point: QPointF,
+        map_rect: QRectF,
+    ) -> QPointF:
+        if self.room is None:
+            return QPointF()
+
+        scale_x = map_rect.width() / max(1.0, float(self.room.uv_map_width))
+        scale_y = map_rect.height() / max(1.0, float(self.room.uv_map_height))
+        return QPointF(
+            (widget_point.x() - map_rect.left()) / scale_x,
+            (widget_point.y() - map_rect.top()) / scale_y,
+        )
+
+
+# ### Numeric helpers ###
+def _get_shortest_angle_delta(current_angle: float, start_angle: float) -> float:
+    return (current_angle - start_angle + 180.0) % 360.0 - 180.0

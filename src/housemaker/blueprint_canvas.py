@@ -641,6 +641,7 @@ class BlueprintCanvas(QWidget):
                     uv_map_height=room.uv_map_height,
                     wall_uv_scales=copy.deepcopy(room.wall_uv_scales),
                     wall_uv_rotations=copy.deepcopy(room.wall_uv_rotations),
+                    wall_uv_positions=copy.deepcopy(room.wall_uv_positions),
                 )
             )
 

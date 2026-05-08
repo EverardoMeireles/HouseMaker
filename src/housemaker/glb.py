@@ -145,6 +145,38 @@ def export_glb_file(model: GeneratedModel, path: str | Path) -> Path:
     return export_path
 
 
+def export_room_texture_pngs(
+    levels: Sequence[LevelData],
+    directory: str | Path,
+) -> list[Path]:
+    export_directory = Path(directory)
+    export_directory.mkdir(parents=True, exist_ok=True)
+    exported_paths: list[Path] = []
+
+    for level in levels:
+        for room_index, room in enumerate(level.rooms):
+            if not build_room_walls(room, level.vertex_data):
+                continue
+
+            layout = build_uv_wall_layout(
+                room=room,
+                vertex_data=level.vertex_data,
+                wall_height_meters=level.height_meters,
+            )
+            texture_path = export_directory / _get_room_texture_file_name(
+                level=level,
+                room=room,
+                room_index=room_index,
+            )
+            texture_image = _build_room_texture_image(room, layout)
+            if not texture_image.save(str(texture_path), "PNG"):
+                raise OSError(f"Unable to save PNG texture: {texture_path}")
+
+            exported_paths.append(texture_path)
+
+    return exported_paths
+
+
 # ### Internal helpers ###
 def _build_export_scene(named_meshes: list[NamedMesh]) -> trimesh.Scene:
     scene = trimesh.Scene()
@@ -735,6 +767,16 @@ def _get_room_material_name(
     room_index: int,
 ) -> str:
     return f"{level.display_name} {room.name or 'Room'} {room_index + 1}"
+
+
+def _get_room_texture_file_name(
+    level: LevelData,
+    room: RoomData,
+    room_index: int,
+) -> str:
+    level_name = _slugify_name(level.display_name)
+    room_name = _slugify_name(room.name or "Room")
+    return f"{level_name}_{room_name}_{room_index + 1}.png"
 
 
 # ### Plain wall helpers ###
