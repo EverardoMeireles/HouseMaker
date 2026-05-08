@@ -25,6 +25,7 @@ from PySide6.QtWidgets import QWidget
 from housemaker.models import (
     DEFAULT_IMAGE_OFFSET,
     DEFAULT_IMAGE_SCALE,
+    Edge,
     RoomData,
     VERTEX_HIT_RADIUS_SCREEN,
     Vertex,
@@ -47,6 +48,7 @@ TEXT_COLOR = QColor("#f5f7fa")
 ROOM_LABEL_BACKGROUND_COLOR = QColor(10, 12, 16, 170)
 IMAGE_MARGIN = 16.0
 VERTEX_RADIUS_SCREEN = 6.0
+EDGE_HIT_TOLERANCE_SCREEN = 8.0
 AXIS_SNAP_TOLERANCE_SCREEN = 10.0
 CENTER_SNAP_TOLERANCE_SCREEN = 10.0
 CENTER_SNAP_EQUAL_ANGLE_TOLERANCE_DEGREES = 1.0
@@ -98,6 +100,13 @@ class AxisSnapCandidate:
 class VertexPairCenter:
     source_vertex_ids: tuple[int, int]
     point: tuple[float, float]
+
+
+@dataclass(frozen=True)
+class EdgeHit:
+    edge: Edge
+    point: tuple[float, float]
+    distance: float
 
 
 # ### Widgets ###
@@ -378,6 +387,13 @@ class BlueprintCanvas(QWidget):
             event.accept()
             return
 
+        hit_edge = self._find_edge_at(event.position())
+        if hit_edge is not None:
+            self._handle_new_vertex_on_edge_click(hit_edge.point, hit_edge.edge)
+            self.update()
+            event.accept()
+            return
+
         snap_preview = self._build_connection_preview(image_point, event.modifiers())
         self._handle_new_vertex_click(snap_preview.point)
 
@@ -523,6 +539,28 @@ class BlueprintCanvas(QWidget):
         self._push_undo_state()
 
         new_vertex = self.vertex_data.add_vertex(*point)
+        if self.active_vertex_id is not None:
+            self.vertex_data.add_edge(self.active_vertex_id, new_vertex.id)
+
+        self.active_vertex_id = new_vertex.id
+        self.selected_vertex_id = new_vertex.id
+        self.selected_vertex_ids = {new_vertex.id}
+        self.preview_point = point
+        self.preview_guides = []
+
+    def _handle_new_vertex_on_edge_click(
+        self,
+        point: tuple[float, float],
+        edge: Edge,
+    ) -> None:
+        self._push_undo_state()
+
+        new_vertex = self.vertex_data.add_vertex(*point)
+        self.vertex_data.split_edge(
+            edge.start_vertex_id,
+            edge.end_vertex_id,
+            new_vertex.id,
+        )
         if self.active_vertex_id is not None:
             self.vertex_data.add_edge(self.active_vertex_id, new_vertex.id)
 
@@ -732,6 +770,46 @@ class BlueprintCanvas(QWidget):
                 closest_distance = distance
 
         return closest_vertex
+
+    def _find_edge_at(self, widget_point: QPointF) -> EdgeHit | None:
+        closest_hit: EdgeHit | None = None
+        closest_distance = EDGE_HIT_TOLERANCE_SCREEN
+
+        for edge in self.vertex_data.edges:
+            start_vertex = self.vertex_data.get_vertex(edge.start_vertex_id)
+            end_vertex = self.vertex_data.get_vertex(edge.end_vertex_id)
+            if start_vertex is None or end_vertex is None:
+                continue
+
+            projection = _project_point_onto_widget_segment(
+                point=widget_point,
+                segment_start=self._image_to_widget(start_vertex.x, start_vertex.y),
+                segment_end=self._image_to_widget(end_vertex.x, end_vertex.y),
+            )
+            if projection is None:
+                continue
+
+            projected_widget_point, segment_ratio = projection
+            distance = math.hypot(
+                widget_point.x() - projected_widget_point.x(),
+                widget_point.y() - projected_widget_point.y(),
+            )
+            if distance > closest_distance:
+                continue
+
+            closest_hit = EdgeHit(
+                edge=edge,
+                point=(
+                    start_vertex.x
+                    + (end_vertex.x - start_vertex.x) * segment_ratio,
+                    start_vertex.y
+                    + (end_vertex.y - start_vertex.y) * segment_ratio,
+                ),
+                distance=distance,
+            )
+            closest_distance = distance
+
+        return closest_hit
 
     def _should_start_drag(self, widget_point: QPointF) -> bool:
         if self.drag_vertex_id is not None or self.drag_press_position is None:
@@ -1428,6 +1506,36 @@ def _load_qimage_from_path(file_path: str) -> QImage:
 
 
 # ### Geometry helpers ###
+def _project_point_onto_widget_segment(
+    point: QPointF,
+    segment_start: QPointF,
+    segment_end: QPointF,
+) -> tuple[QPointF, float] | None:
+    segment_delta_x = segment_end.x() - segment_start.x()
+    segment_delta_y = segment_end.y() - segment_start.y()
+    segment_length_squared = (
+        segment_delta_x * segment_delta_x
+        + segment_delta_y * segment_delta_y
+    )
+    if segment_length_squared <= 1e-6:
+        return None
+
+    point_delta_x = point.x() - segment_start.x()
+    point_delta_y = point.y() - segment_start.y()
+    segment_ratio = (
+        point_delta_x * segment_delta_x
+        + point_delta_y * segment_delta_y
+    ) / segment_length_squared
+    if segment_ratio < 0.0 or segment_ratio > 1.0:
+        return None
+
+    projected_point = QPointF(
+        segment_start.x() + segment_delta_x * segment_ratio,
+        segment_start.y() + segment_delta_y * segment_ratio,
+    )
+    return projected_point, segment_ratio
+
+
 def _vertex_pairs_overlap(
     first_pair: VertexPairCenter,
     second_pair: VertexPairCenter,

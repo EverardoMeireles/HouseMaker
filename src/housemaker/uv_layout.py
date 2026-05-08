@@ -877,12 +877,20 @@ def build_room_walls(room: RoomData, vertex_data: VertexData | None) -> list[Roo
         return []
 
     center_point = _get_room_center_point(room, vertex_data, room_vertices)
+    edge_based_walls = _build_room_walls_from_edges(
+        room_vertices=room_vertices,
+        vertex_data=vertex_data,
+        center_point=center_point,
+    )
+    if edge_based_walls:
+        return edge_based_walls
+
     ordered_vertices = _order_vertices_around_center(room_vertices, center_point)
     wall_vertices = _remove_straight_through_vertices(ordered_vertices)
     if len(wall_vertices) < 3:
         return []
 
-    return [
+    walls = [
         _build_room_wall(
             start_vertex=wall_vertices[index],
             end_vertex=wall_vertices[(index + 1) % len(wall_vertices)],
@@ -890,6 +898,7 @@ def build_room_walls(room: RoomData, vertex_data: VertexData | None) -> list[Roo
         )
         for index in range(len(wall_vertices))
     ]
+    return _sort_room_walls_around_center(walls, center_point)
 
 
 def get_room_wall_keys(
@@ -1471,6 +1480,137 @@ def _order_vertices_around_center(
     )
 
 
+def _build_room_walls_from_edges(
+    room_vertices: list[Vertex],
+    vertex_data: VertexData,
+    center_point: tuple[float, float],
+) -> list[RoomWall]:
+    room_vertices_by_id = {vertex.id: vertex for vertex in room_vertices}
+    room_vertex_ids = set(room_vertices_by_id)
+    adjacency = {
+        vertex_id: set()
+        for vertex_id in room_vertex_ids
+    }
+    unvisited_edges: set[tuple[int, int]] = set()
+    for edge in vertex_data.edges:
+        if edge.start_vertex_id not in room_vertex_ids:
+            continue
+        if edge.end_vertex_id not in room_vertex_ids:
+            continue
+
+        edge_key = _build_edge_key(edge.start_vertex_id, edge.end_vertex_id)
+        if edge_key in unvisited_edges:
+            continue
+
+        unvisited_edges.add(edge_key)
+        adjacency[edge.start_vertex_id].add(edge.end_vertex_id)
+        adjacency[edge.end_vertex_id].add(edge.start_vertex_id)
+
+    if not unvisited_edges:
+        return []
+
+    walls: list[RoomWall] = []
+    while unvisited_edges:
+        start_vertex_id, end_vertex_id = next(iter(unvisited_edges))
+        unvisited_edges.remove((start_vertex_id, end_vertex_id))
+        wall_chain = [start_vertex_id, end_vertex_id]
+        _extend_room_wall_chain(
+            wall_chain=wall_chain,
+            adjacency=adjacency,
+            unvisited_edges=unvisited_edges,
+            vertices_by_id=room_vertices_by_id,
+            forward=True,
+        )
+        _extend_room_wall_chain(
+            wall_chain=wall_chain,
+            adjacency=adjacency,
+            unvisited_edges=unvisited_edges,
+            vertices_by_id=room_vertices_by_id,
+            forward=False,
+        )
+
+        start_vertex = room_vertices_by_id[wall_chain[0]]
+        end_vertex = room_vertices_by_id[wall_chain[-1]]
+        if _get_vertex_distance(start_vertex, end_vertex) <= STRAIGHT_WALL_TOLERANCE:
+            continue
+
+        walls.append(
+            _build_room_wall(
+                start_vertex=start_vertex,
+                end_vertex=end_vertex,
+                center_point=center_point,
+            )
+        )
+
+    return _sort_room_walls_around_center(walls, center_point)
+
+
+def _extend_room_wall_chain(
+    wall_chain: list[int],
+    adjacency: dict[int, set[int]],
+    unvisited_edges: set[tuple[int, int]],
+    vertices_by_id: dict[int, Vertex],
+    forward: bool,
+) -> None:
+    while len(wall_chain) >= 2:
+        endpoint_index = -1 if forward else 0
+        previous_index = -2 if forward else 1
+        endpoint_id = wall_chain[endpoint_index]
+        previous_id = wall_chain[previous_index]
+        next_id = _find_straight_wall_chain_candidate(
+            previous_id=previous_id,
+            endpoint_id=endpoint_id,
+            adjacency=adjacency,
+            unvisited_edges=unvisited_edges,
+            vertices_by_id=vertices_by_id,
+        )
+        if next_id is None:
+            return
+
+        unvisited_edges.remove(_build_edge_key(endpoint_id, next_id))
+        if forward:
+            wall_chain.append(next_id)
+        else:
+            wall_chain.insert(0, next_id)
+
+
+def _find_straight_wall_chain_candidate(
+    previous_id: int,
+    endpoint_id: int,
+    adjacency: dict[int, set[int]],
+    unvisited_edges: set[tuple[int, int]],
+    vertices_by_id: dict[int, Vertex],
+) -> int | None:
+    candidates = [
+        next_id
+        for next_id in adjacency[endpoint_id]
+        if _build_edge_key(endpoint_id, next_id) in unvisited_edges
+        and _is_straight_through(
+            vertices_by_id[previous_id],
+            vertices_by_id[endpoint_id],
+            vertices_by_id[next_id],
+        )
+    ]
+    if len(candidates) != 1:
+        return None
+
+    return candidates[0]
+
+
+def _sort_room_walls_around_center(
+    walls: list[RoomWall],
+    center_point: tuple[float, float],
+) -> list[RoomWall]:
+    center_x, center_y = center_point
+    return sorted(
+        walls,
+        key=lambda wall: math.atan2(
+            (wall.start_point[1] + wall.end_point[1]) / 2.0 - center_y,
+            (wall.start_point[0] + wall.end_point[0]) / 2.0 - center_x,
+        ),
+    )
+
+
 def _remove_straight_through_vertices(vertices: list[Vertex]) -> list[Vertex]:
     simplified_vertices = list(vertices)
     changed = True
@@ -1528,6 +1668,11 @@ def _build_room_wall(
     end_vertex: Vertex,
     center_point: tuple[float, float],
 ) -> RoomWall:
+    start_vertex, end_vertex = _orient_wall_vertices_toward_room_center(
+        start_vertex=start_vertex,
+        end_vertex=end_vertex,
+        center_point=center_point,
+    )
     wall_midpoint = (
         (start_vertex.x + end_vertex.x) / 2.0,
         (start_vertex.y + end_vertex.y) / 2.0,
@@ -1547,8 +1692,43 @@ def _build_room_wall(
     )
 
 
+def _orient_wall_vertices_toward_room_center(
+    start_vertex: Vertex,
+    end_vertex: Vertex,
+    center_point: tuple[float, float],
+) -> tuple[Vertex, Vertex]:
+    wall_midpoint = (
+        (start_vertex.x + end_vertex.x) / 2.0,
+        (start_vertex.y + end_vertex.y) / 2.0,
+    )
+    wall_delta = (
+        end_vertex.x - start_vertex.x,
+        end_vertex.y - start_vertex.y,
+    )
+    center_delta = (
+        center_point[0] - wall_midpoint[0],
+        center_point[1] - wall_midpoint[1],
+    )
+    room_side_cross = (
+        wall_delta[0] * center_delta[1]
+        - wall_delta[1] * center_delta[0]
+    )
+    if room_side_cross < -STRAIGHT_WALL_TOLERANCE:
+        return end_vertex, start_vertex
+
+    return start_vertex, end_vertex
+
+
 def _build_wall_key(start_vertex_id: int, end_vertex_id: int) -> str:
     return f"{min(start_vertex_id, end_vertex_id)}:{max(start_vertex_id, end_vertex_id)}"
+
+
+def _build_edge_key(start_vertex_id: int, end_vertex_id: int) -> tuple[int, int]:
+    return tuple(sorted((start_vertex_id, end_vertex_id)))
+
+
+def _get_vertex_distance(first_vertex: Vertex, second_vertex: Vertex) -> float:
+    return math.hypot(first_vertex.x - second_vertex.x, first_vertex.y - second_vertex.y)
 
 
 def _get_projection_direction(

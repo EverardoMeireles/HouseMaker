@@ -118,6 +118,38 @@ class VertexData:
         self.edges.append(edge)
         return edge
 
+    def remove_edge(self, start_vertex_id: int, end_vertex_id: int) -> bool:
+        expected_key = self._edge_key(start_vertex_id, end_vertex_id)
+        original_edge_count = len(self.edges)
+        self.edges = [
+            edge
+            for edge in self.edges
+            if self._edge_key(edge.start_vertex_id, edge.end_vertex_id)
+            != expected_key
+        ]
+        return len(self.edges) != original_edge_count
+
+    def split_edge(
+        self,
+        start_vertex_id: int,
+        end_vertex_id: int,
+        middle_vertex_id: int,
+    ) -> bool:
+        if middle_vertex_id in (start_vertex_id, end_vertex_id):
+            return False
+        if self.get_vertex(start_vertex_id) is None:
+            return False
+        if self.get_vertex(end_vertex_id) is None:
+            return False
+        if self.get_vertex(middle_vertex_id) is None:
+            return False
+        if not self.remove_edge(start_vertex_id, end_vertex_id):
+            return False
+
+        self.add_edge(start_vertex_id, middle_vertex_id)
+        self.add_edge(middle_vertex_id, end_vertex_id)
+        return True
+
     def has_edge(self, start_vertex_id: int, end_vertex_id: int) -> bool:
         expected_key = self._edge_key(start_vertex_id, end_vertex_id)
         return any(
