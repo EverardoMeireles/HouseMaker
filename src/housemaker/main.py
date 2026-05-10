@@ -1184,6 +1184,33 @@ def _normalize_degree_value(value: int) -> int:
     return int(value) % 360
 
 
+# ### Entrypoint helpers ###
+def _show_window_on_primary_screen(window: QMainWindow) -> None:
+    screen = QApplication.primaryScreen()
+    if screen is None:
+        window.show()
+        return
+
+    available_geometry = screen.availableGeometry()
+    window_width = min(window.width(), available_geometry.width())
+    window_height = min(window.height(), available_geometry.height())
+    if window_width != window.width() or window_height != window.height():
+        window.resize(window_width, window_height)
+
+    window_x = available_geometry.x() + max(
+        0,
+        (available_geometry.width() - window.width()) // 2,
+    )
+    window_y = available_geometry.y() + max(
+        0,
+        (available_geometry.height() - window.height()) // 2,
+    )
+    window.move(window_x, window_y)
+    window.show()
+    window.raise_()
+    window.activateWindow()
+
+
 # ### Entrypoint ###
 def main() -> int:
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
@@ -1192,7 +1219,7 @@ def main() -> int:
     app.setStyle("Fusion")
 
     window = MainWindow()
-    window.show()
+    _show_window_on_primary_screen(window)
     return app.exec()
 
 
