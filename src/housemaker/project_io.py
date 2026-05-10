@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from housemaker.models import (
@@ -28,6 +28,7 @@ class ProjectData:
     blueprint_path: str | None
     current_level_index: int
     levels: list[LevelData]
+    image_library_paths: list[str] = field(default_factory=list)
 
 
 # ### Public helpers ###
@@ -35,12 +36,16 @@ def save_project(
     path: str | Path,
     current_level_index: int,
     levels: list[LevelData],
+    image_library_paths: list[str] | None = None,
 ) -> Path:
     export_path = Path(path)
     payload = {
         "project_version": PROJECT_FILE_VERSION,
         "blueprint_path": None,
         "current_level_index": int(current_level_index),
+        "image_library_paths": _serialize_image_library_paths(
+            image_library_paths or []
+        ),
         "levels": [
             {
                 "index": level.index,
@@ -115,6 +120,11 @@ def load_project(path: str | Path) -> ProjectData:
         level.vertex_data = VertexData.from_dict(raw_level.get("vertex_data", {}))
         level.rooms = _deserialize_rooms(raw_level.get("rooms", []))
 
+    image_library_paths = _deserialize_image_library_paths(
+        payload.get("image_library_paths", [])
+    )
+    _clear_image_library_paths_from_levels(levels, image_library_paths)
+
     current_level_index = int(payload.get("current_level_index", GROUND_LEVEL_INDEX))
     if current_level_index not in level_lookup:
         current_level_index = GROUND_LEVEL_INDEX
@@ -123,6 +133,7 @@ def load_project(path: str | Path) -> ProjectData:
         blueprint_path=legacy_blueprint_path,
         current_level_index=current_level_index,
         levels=levels,
+        image_library_paths=image_library_paths,
     )
 
 
@@ -149,6 +160,40 @@ def _deserialize_image_size(raw_image_size: object) -> tuple[float, float] | Non
         return None
 
     return (float(raw_image_size[0]), float(raw_image_size[1]))
+
+
+def _serialize_image_library_paths(image_paths: list[str]) -> list[str]:
+    normalized_paths: list[str] = []
+    for image_path in image_paths:
+        normalized_path = _normalize_optional_path(image_path)
+        if normalized_path is None or normalized_path in normalized_paths:
+            continue
+
+        normalized_paths.append(normalized_path)
+
+    return normalized_paths
+
+
+def _deserialize_image_library_paths(raw_image_paths: object) -> list[str]:
+    if not isinstance(raw_image_paths, list | tuple):
+        return []
+
+    return _serialize_image_library_paths(
+        [str(image_path) for image_path in raw_image_paths]
+    )
+
+
+def _clear_image_library_paths_from_levels(
+    levels: list[LevelData],
+    image_library_paths: list[str],
+) -> None:
+    image_library_path_lookup = set(image_library_paths)
+    for level in levels:
+        if level.image_path not in image_library_path_lookup:
+            continue
+
+        level.image_path = None
+        level.image_size_pixels = None
 
 
 def _serialize_room(room: RoomData) -> dict[str, object]:

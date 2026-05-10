@@ -4,8 +4,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QTimer, Qt
-from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtCore import QSize, QTimer, Qt
+from PySide6.QtGui import QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QListView,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -131,8 +132,10 @@ class BlueprintWorkspace(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.levels: list[LevelData] = create_default_levels()
+        self.image_library_paths: list[str] = []
         self.current_level_index = GROUND_LEVEL_INDEX
         self._is_syncing_level_controls = False
+        self._is_syncing_image_library_controls = False
         self._is_syncing_uv_controls = False
         self._is_viewer_refresh_scheduled = False
         self._scheduled_viewer_refresh_preserve_camera = True
@@ -341,6 +344,7 @@ class BlueprintWorkspace(QWidget):
         side_layout.addLayout(buttons_layout)
 
         self.side_tabs.addTab(self._build_uvs_tab(), "UVs")
+        self.side_tabs.addTab(self._build_images_tab(), "Images")
 
         splitter.addWidget(side_panel)
         splitter.setStretchFactor(0, 9)
@@ -463,6 +467,74 @@ class BlueprintWorkspace(QWidget):
         )
         uvs_layout.addWidget(self.uv_rooms_list, 1)
         return uvs_tab
+
+    def _build_images_tab(self) -> QWidget:
+        images_tab = QWidget()
+        images_layout = QVBoxLayout(images_tab)
+        images_layout.setContentsMargins(10, 12, 10, 10)
+        images_layout.setSpacing(12)
+
+        images_label = QLabel("Selected image")
+        images_label.setStyleSheet("font-size: 18px; font-weight: 600;")
+        images_layout.addWidget(images_label)
+
+        self.image_preview_label = QLabel("No image loaded")
+        self.image_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_preview_label.setMinimumHeight(260)
+        self.image_preview_label.setStyleSheet(
+            "border: 1px solid #4b5563; background: #1f242b; color: #f5f7fa;"
+        )
+        images_layout.addWidget(self.image_preview_label, 1)
+
+        self.image_path_label = QLabel("No image selected")
+        self.image_path_label.setWordWrap(True)
+        images_layout.addWidget(self.image_path_label)
+
+        loaded_images_label = QLabel("Loaded images")
+        loaded_images_label.setStyleSheet("font-size: 16px; font-weight: 600;")
+        images_layout.addWidget(loaded_images_label)
+
+        self.image_thumbnail_list = QListWidget()
+        self.image_thumbnail_list.setViewMode(QListView.ViewMode.IconMode)
+        self.image_thumbnail_list.setFlow(QListView.Flow.LeftToRight)
+        self.image_thumbnail_list.setWrapping(False)
+        self.image_thumbnail_list.setMovement(QListView.Movement.Static)
+        self.image_thumbnail_list.setResizeMode(QListView.ResizeMode.Adjust)
+        self.image_thumbnail_list.setIconSize(QSize(72, 72))
+        self.image_thumbnail_list.setGridSize(QSize(104, 104))
+        self.image_thumbnail_list.setMinimumHeight(120)
+        self.image_thumbnail_list.setMaximumHeight(132)
+        self.image_thumbnail_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.image_thumbnail_list.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.image_thumbnail_list.currentRowChanged.connect(
+            self._handle_image_thumbnail_selection_changed
+        )
+        images_layout.addWidget(self.image_thumbnail_list)
+
+        image_buttons_layout = QHBoxLayout()
+        image_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        image_buttons_layout.setSpacing(10)
+
+        self.images_load_button = QPushButton("Load image")
+        self.images_load_button.setMinimumHeight(44)
+        self.images_load_button.clicked.connect(
+            self._handle_load_library_image_clicked
+        )
+        image_buttons_layout.addWidget(self.images_load_button)
+
+        self.images_delete_button = QPushButton("Delete image")
+        self.images_delete_button.setMinimumHeight(44)
+        self.images_delete_button.clicked.connect(
+            self._handle_delete_image_clicked
+        )
+        image_buttons_layout.addWidget(self.images_delete_button)
+
+        images_layout.addLayout(image_buttons_layout)
+        return images_tab
 
     @staticmethod
     def _build_image_transform_spinbox(
@@ -613,6 +685,7 @@ class BlueprintWorkspace(QWidget):
                 path=file_path,
                 current_level_index=self.current_level_index,
                 levels=self.levels,
+                image_library_paths=self.image_library_paths,
             )
         except ValueError as error:
             QMessageBox.critical(self, "Save failed", str(error))
@@ -637,12 +710,7 @@ class BlueprintWorkspace(QWidget):
             QMessageBox.critical(self, "Project load failed", str(error))
 
     def _handle_load_image_clicked(self) -> None:
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "load image",
-            str(Path.home()),
-            "Image Files (*.png *.jpg *.jpeg *.bmp *.webp)",
-        )
+        file_path = self._get_image_file_path()
         if not file_path:
             return
 
@@ -650,6 +718,77 @@ class BlueprintWorkspace(QWidget):
             self._set_current_level_image(file_path)
         except ValueError as error:
             QMessageBox.critical(self, "Image load failed", str(error))
+
+    def _handle_load_library_image_clicked(self) -> None:
+        file_paths = self._get_image_file_paths()
+        if not file_paths:
+            return
+
+        loaded_image_paths: list[str] = []
+        skipped_image_paths: list[str] = []
+        for file_path in file_paths:
+            normalized_path = str(Path(file_path).resolve())
+            if QPixmap(normalized_path).isNull():
+                skipped_image_paths.append(normalized_path)
+                continue
+
+            self._add_image_to_library(normalized_path)
+            loaded_image_paths.append(normalized_path)
+
+        if not loaded_image_paths:
+            QMessageBox.critical(
+                self,
+                "Image load failed",
+                "Unable to load the selected image files.",
+            )
+            return
+
+        self._refresh_image_thumbnail_list(
+            selected_image_path=loaded_image_paths[-1]
+        )
+        if skipped_image_paths:
+            QMessageBox.warning(
+                self,
+                "Some images skipped",
+                f"Unable to load {len(skipped_image_paths)} selected image(s).",
+            )
+
+    def _handle_image_thumbnail_selection_changed(self, row: int) -> None:
+        if self._is_syncing_image_library_controls or row < 0:
+            return
+
+        self._sync_images_tab()
+
+    def _handle_delete_image_clicked(self) -> None:
+        selected_image_path = self._get_selected_image_library_path()
+        if selected_image_path is None:
+            return
+
+        normalized_path = str(Path(selected_image_path).resolve())
+        self.image_library_paths = [
+            library_path
+            for library_path in self.image_library_paths
+            if library_path != normalized_path
+        ]
+        self._refresh_image_thumbnail_list()
+
+    def _get_image_file_path(self) -> str:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "load image",
+            str(Path.home()),
+            "Image Files (*.png *.jpg *.jpeg *.bmp *.webp)",
+        )
+        return file_path
+
+    def _get_image_file_paths(self) -> list[str]:
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "load images",
+            str(Path.home()),
+            "Image Files (*.png *.jpg *.jpeg *.bmp *.webp)",
+        )
+        return file_paths
 
     def _refresh_levels_list(self) -> None:
         self._is_syncing_level_controls = True
@@ -734,6 +873,98 @@ class BlueprintWorkspace(QWidget):
             return None
 
         return self.current_level.rooms[room_index]
+
+    def _refresh_image_thumbnail_list(
+        self,
+        selected_image_path: str | None = None,
+    ) -> None:
+        if not hasattr(self, "image_thumbnail_list"):
+            return
+
+        if selected_image_path is None:
+            selected_image_path = self._get_selected_image_library_path()
+
+        self._is_syncing_image_library_controls = True
+        self.image_thumbnail_list.clear()
+        for image_path in self.image_library_paths:
+            self.image_thumbnail_list.addItem(
+                self._build_image_thumbnail_item(image_path)
+            )
+        self._select_image_thumbnail_path(selected_image_path)
+        self._is_syncing_image_library_controls = False
+        self._sync_images_tab()
+
+    def _build_image_thumbnail_item(self, image_path: str) -> QListWidgetItem:
+        image_name = Path(image_path).name
+        thumbnail_item = QListWidgetItem(image_name)
+        thumbnail_item.setData(Qt.ItemDataRole.UserRole, image_path)
+        thumbnail_item.setToolTip(image_path)
+
+        thumbnail_pixmap = QPixmap(image_path)
+        if thumbnail_pixmap.isNull():
+            thumbnail_item.setText(f"{image_name}\nmissing")
+            return thumbnail_item
+
+        thumbnail_item.setIcon(
+            QIcon(
+                thumbnail_pixmap.scaled(
+                    72,
+                    72,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+        )
+        return thumbnail_item
+
+    def _select_image_thumbnail_path(self, selected_image_path: str | None) -> None:
+        self.image_thumbnail_list.clearSelection()
+        self.image_thumbnail_list.setCurrentRow(-1)
+        if selected_image_path is None:
+            return
+
+        normalized_path = str(Path(selected_image_path).resolve())
+        for row_index in range(self.image_thumbnail_list.count()):
+            thumbnail_item = self.image_thumbnail_list.item(row_index)
+            image_path = thumbnail_item.data(Qt.ItemDataRole.UserRole)
+            if image_path != normalized_path:
+                continue
+
+            self.image_thumbnail_list.setCurrentRow(row_index)
+            return
+
+    def _get_selected_image_library_path(self) -> str | None:
+        if not hasattr(self, "image_thumbnail_list"):
+            return None
+
+        selected_item = self.image_thumbnail_list.currentItem()
+        if selected_item is None:
+            return None
+
+        image_path = selected_item.data(Qt.ItemDataRole.UserRole)
+        if image_path is None:
+            return None
+
+        return str(image_path)
+
+    def _add_image_to_library(self, image_path: str) -> None:
+        normalized_path = str(Path(image_path).resolve())
+        if normalized_path in self.image_library_paths:
+            return
+
+        self.image_library_paths.append(normalized_path)
+
+    @staticmethod
+    def _normalize_image_library_paths(image_paths: list[str]) -> list[str]:
+        normalized_paths: list[str] = []
+        for image_path in image_paths:
+            normalized_path = str(Path(image_path).resolve())
+            if normalized_path in normalized_paths:
+                continue
+
+            normalized_paths.append(normalized_path)
+
+        return normalized_paths
 
     def _sync_level_controls(self) -> None:
         self._is_syncing_level_controls = True
@@ -1066,16 +1297,22 @@ class BlueprintWorkspace(QWidget):
         self._apply_project_state(
             levels=project_data.levels,
             current_level_index=project_data.current_level_index,
+            image_library_paths=project_data.image_library_paths,
         )
 
     def _apply_project_state(
         self,
         levels: list[LevelData],
         current_level_index: int,
+        image_library_paths: list[str] | None = None,
     ) -> None:
         self.levels = levels
+        self.image_library_paths = self._normalize_image_library_paths(
+            image_library_paths or []
+        )
         self.current_level_index = min(max(current_level_index, 0), len(self.levels) - 1)
 
+        self._refresh_image_thumbnail_list()
         self._refresh_levels_list()
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
@@ -1094,6 +1331,7 @@ class BlueprintWorkspace(QWidget):
         )
         self.current_level.image_path = normalized_path
         self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
+        self.workspace_tabs.setCurrentWidget(self.canvas)
         self._update_blueprint_name_label()
         self._schedule_viewer_preview_refresh()
 
@@ -1120,14 +1358,47 @@ class BlueprintWorkspace(QWidget):
     def _update_blueprint_name_label(self) -> None:
         image_path = self.current_level.image_path
         if image_path is None:
-            self.blueprint_name_label.setText("Image: none for this level")
+            label_text = "Image: none for this level"
+        elif self.canvas.blueprint_image is None:
+            label_text = f"Image missing: {image_path}"
+        else:
+            label_text = f"Image: {Path(image_path).name}"
+
+        self.blueprint_name_label.setText(label_text)
+        self._sync_images_tab()
+
+    def _sync_images_tab(self) -> None:
+        if not hasattr(self, "image_preview_label"):
             return
 
-        if self.canvas.blueprint_image is None:
-            self.blueprint_name_label.setText(f"Image missing: {image_path}")
+        selected_image_path = self._get_selected_image_library_path()
+        self.images_delete_button.setEnabled(selected_image_path is not None)
+
+        if selected_image_path is None:
+            self.image_path_label.setText("No image selected")
+            self.image_preview_label.setPixmap(QPixmap())
+            self.image_preview_label.setText("No image loaded")
             return
 
-        self.blueprint_name_label.setText(f"Image: {Path(image_path).name}")
+        preview_pixmap = QPixmap(selected_image_path)
+        if preview_pixmap.isNull():
+            self.image_path_label.setText(f"Image missing: {selected_image_path}")
+            self.image_preview_label.setPixmap(QPixmap())
+            self.image_preview_label.setText("Image missing")
+            return
+
+        self.image_path_label.setText(f"Image: {Path(selected_image_path).name}")
+        target_width = max(320, self.image_preview_label.width() - 16)
+        target_height = max(220, self.image_preview_label.height() - 16)
+        self.image_preview_label.setText("")
+        self.image_preview_label.setPixmap(
+            preview_pixmap.scaled(
+                target_width,
+                target_height,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
 
 
 class MainWindow(QMainWindow):
