@@ -60,6 +60,7 @@ from housemaker.uv_layout import (
     build_uv_wall_layout,
     calculate_unoccupied_uv_pixels,
     optimize_room_wall_uvs,
+    rebuild_room_subdivision_uvs,
 )
 from housemaker.viewer import GlbViewerWidget
 
@@ -415,14 +416,24 @@ class BlueprintWorkspace(QWidget):
         )
         optimize_layout.addWidget(self.optimize_all_uv_button, 1)
 
-        self.use_complex_optimization_radio = QRadioButton(
-            "Use complex optimization"
+        self.uv_optimization_mode_group = QButtonGroup(self)
+        self.uv_optimization_mode_group.setExclusive(False)
+        self.free_placement_radio = QRadioButton("Free placement")
+        self.subdivision_optimization_radio = QRadioButton("Subdivision")
+        self.free_placement_radio.setAutoExclusive(False)
+        self.subdivision_optimization_radio.setAutoExclusive(False)
+        self.uv_optimization_mode_group.addButton(self.free_placement_radio)
+        self.uv_optimization_mode_group.addButton(
+            self.subdivision_optimization_radio
         )
-        self.use_complex_optimization_radio.setAutoExclusive(False)
-        self.use_complex_optimization_radio.toggled.connect(
-            self._handle_complex_optimization_toggled
+        self.free_placement_radio.toggled.connect(
+            self._handle_optimization_mode_toggled
         )
-        optimize_layout.addWidget(self.use_complex_optimization_radio)
+        self.subdivision_optimization_radio.toggled.connect(
+            self._handle_optimization_mode_toggled
+        )
+        optimize_layout.addWidget(self.free_placement_radio)
+        optimize_layout.addWidget(self.subdivision_optimization_radio)
         uv_controls_layout.addRow("", optimize_layout)
 
         self.complex_optimization_passes_spinbox = QSpinBox()
@@ -430,7 +441,7 @@ class BlueprintWorkspace(QWidget):
         self.complex_optimization_passes_spinbox.setValue(3)
         self.complex_optimization_passes_spinbox.setMinimumHeight(34)
         uv_controls_layout.addRow(
-            "Complex optimization passes",
+            "Free placement passes",
             self.complex_optimization_passes_spinbox,
         )
 
@@ -1191,8 +1202,9 @@ class BlueprintWorkspace(QWidget):
         self.texture_creator_canvas.set_context(
             room=selected_room,
             wall_key=selected_placement.wall.key,
-            wall_size=selected_placement.natural_size,
+            wall_size=_get_logical_wall_size(selected_placement),
             image_path=selected_image_path,
+            segment_count=selected_placement.segment_count,
         )
 
     def _get_texture_creator_room(self) -> RoomData | None:
@@ -1257,9 +1269,10 @@ class BlueprintWorkspace(QWidget):
         self.optimize_uv_button.setEnabled(has_room)
         self.optimize_all_uv_button.setEnabled(has_room)
         self.reset_uv_defaults_button.setEnabled(has_room)
-        self.use_complex_optimization_radio.setEnabled(has_room)
+        self.free_placement_radio.setEnabled(has_room)
+        self.subdivision_optimization_radio.setEnabled(has_room)
         self.complex_optimization_passes_spinbox.setEnabled(
-            has_room and self.use_complex_optimization_radio.isChecked()
+            has_room and self.free_placement_radio.isChecked()
         )
         self.unoccupied_uv_pixels_label.setEnabled(has_room)
         self.uv_aspect_ratio_label.setEnabled(has_room)
@@ -1360,6 +1373,8 @@ class BlueprintWorkspace(QWidget):
             return
 
         self.current_level.height_meters = value
+        for room in self.current_level.rooms:
+            self._refresh_room_subdivision_layout(room)
         self._sync_uv_controls()
         self._schedule_viewer_preview_refresh()
 
@@ -1397,10 +1412,17 @@ class BlueprintWorkspace(QWidget):
     def _handle_uv_room_selection_changed(self, room_index: int) -> None:
         self._sync_uv_controls()
 
-    def _handle_complex_optimization_toggled(self, checked: bool) -> None:
+    def _handle_optimization_mode_toggled(self, checked: bool) -> None:
+        sender = self.sender()
+        if checked and sender == self.free_placement_radio:
+            self.subdivision_optimization_radio.setChecked(False)
+        elif checked and sender == self.subdivision_optimization_radio:
+            self.free_placement_radio.setChecked(False)
+
         selected_room = self._get_selected_uv_room()
         self.complex_optimization_passes_spinbox.setEnabled(
-            selected_room is not None and checked
+            selected_room is not None
+            and self.free_placement_radio.isChecked()
         )
 
     def _handle_uv_map_width_changed(self, value: int) -> None:
@@ -1412,6 +1434,7 @@ class BlueprintWorkspace(QWidget):
             return
 
         selected_room.uv_map_width = int(value)
+        self._refresh_room_subdivision_layout(selected_room)
         self.uv_canvas.update()
         self._update_unoccupied_uv_pixels_label()
         self._schedule_viewer_preview_refresh()
@@ -1425,6 +1448,7 @@ class BlueprintWorkspace(QWidget):
             return
 
         selected_room.uv_map_height = int(value)
+        self._refresh_room_subdivision_layout(selected_room)
         self.uv_canvas.update()
         self._update_unoccupied_uv_pixels_label()
         self._schedule_viewer_preview_refresh()
@@ -1489,6 +1513,9 @@ class BlueprintWorkspace(QWidget):
         selected_room.wall_uv_scales.clear()
         selected_room.wall_uv_rotations.clear()
         selected_room.wall_uv_positions.clear()
+        selected_room.wall_subdivisions.clear()
+        selected_room.wall_subdivision_positions.clear()
+        selected_room.wall_subdivision_source_ranges.clear()
         self.uv_canvas.update()
         self._sync_uv_controls()
         self._schedule_viewer_preview_refresh()
@@ -1499,7 +1526,10 @@ class BlueprintWorkspace(QWidget):
             vertex_data=self.current_level.vertex_data,
             wall_height_meters=self.current_level.height_meters,
             use_complex_optimization=(
-                self.use_complex_optimization_radio.isChecked()
+                self.free_placement_radio.isChecked()
+            ),
+            use_subdivision_optimization=(
+                self.subdivision_optimization_radio.isChecked()
             ),
             complex_optimization_passes=(
                 self.complex_optimization_passes_spinbox.value()
@@ -1511,9 +1541,27 @@ class BlueprintWorkspace(QWidget):
         selected_room: RoomData,
         optimized_result: UvOptimizationResult,
     ) -> None:
-        selected_room.wall_uv_rotations.update(optimized_result.wall_uv_rotations)
-        selected_room.wall_uv_scales.update(optimized_result.wall_uv_scales)
-        selected_room.wall_uv_positions.update(optimized_result.wall_uv_positions)
+        selected_room.wall_uv_rotations = dict(optimized_result.wall_uv_rotations)
+        selected_room.wall_uv_scales = dict(optimized_result.wall_uv_scales)
+        selected_room.wall_uv_positions = dict(optimized_result.wall_uv_positions)
+        selected_room.wall_subdivisions = dict(optimized_result.wall_subdivisions)
+        selected_room.wall_subdivision_positions = dict(
+            optimized_result.wall_subdivision_positions
+        )
+        selected_room.wall_subdivision_source_ranges = dict(
+            optimized_result.wall_subdivision_source_ranges
+        )
+
+    def _refresh_room_subdivision_layout(self, room: RoomData) -> None:
+        optimized_result = rebuild_room_subdivision_uvs(
+            room=room,
+            vertex_data=self.current_level.vertex_data,
+            wall_height_meters=self.current_level.height_meters,
+        )
+        if optimized_result is None:
+            return
+
+        self._apply_uv_optimization_result(room, optimized_result)
 
     def _handle_uv_wall_selected(self, wall_key: str) -> None:
         if self.uv_canvas.get_selected_wall_key() != wall_key:
@@ -1541,6 +1589,7 @@ class BlueprintWorkspace(QWidget):
             return
 
         selected_room.wall_uv_scales[selected_wall_key] = float(value)
+        self._refresh_room_subdivision_layout(selected_room)
         self.uv_canvas.update()
         self._update_unoccupied_uv_pixels_label()
         self._schedule_viewer_preview_refresh()
@@ -1557,6 +1606,7 @@ class BlueprintWorkspace(QWidget):
         selected_room.wall_uv_rotations[selected_wall_key] = _normalize_degree_value(
             value
         )
+        self._refresh_room_subdivision_layout(selected_room)
         self.uv_canvas.update()
         self._update_unoccupied_uv_pixels_label()
         self._schedule_viewer_preview_refresh()
@@ -1764,7 +1814,7 @@ def _build_wall_aspect_ratio_text(placement: UvWallPlacement | None) -> str:
     if placement is None:
         return "Aspect ratio: none"
 
-    wall_width, wall_height = placement.natural_size
+    wall_width, wall_height = _get_logical_wall_size(placement)
     aspect_ratio = float(wall_width) / max(1.0, float(wall_height))
     return f"Aspect ratio: {aspect_ratio:.3f}:1"
 
@@ -1773,7 +1823,7 @@ def _build_wall_resolution_text(placement: UvWallPlacement | None) -> str:
     if placement is None:
         return "Resolutions: none"
 
-    wall_width, wall_height = placement.natural_size
+    wall_width, wall_height = _get_logical_wall_size(placement)
     aspect_ratio = float(wall_width) / max(1.0, float(wall_height))
     resolution_lines = ["Suggested resolutions:"]
     for detail_size in TEXTURE_CREATOR_DETAIL_SIZES:
@@ -1797,6 +1847,15 @@ def _calculate_aspect_resolution(
     resolution_width = max(1, int(round((target_area * safe_aspect_ratio) ** 0.5)))
     resolution_height = max(1, int(round((target_area / safe_aspect_ratio) ** 0.5)))
     return resolution_width, resolution_height
+
+
+def _get_logical_wall_size(placement: UvWallPlacement) -> tuple[float, float]:
+    wall_width, wall_height = placement.natural_size
+    source_span = max(
+        0.001,
+        placement.source_end_ratio - placement.source_start_ratio,
+    )
+    return wall_width / source_span, wall_height
 
 
 # ### Entrypoint helpers ###

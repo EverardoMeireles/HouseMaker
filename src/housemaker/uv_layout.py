@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 import random
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from housemaker.models import (
     DEFAULT_UV_MAP_HEIGHT,
@@ -26,6 +26,7 @@ UV_COMPLEX_SCALE_STEP = 0.05
 UV_COMPLEX_FAILURE_LIMIT = 100
 UV_COMPLEX_MAX_LOOPS_PER_PASS = 5000
 UV_COMPLEX_ROTATION_CANDIDATE_COUNT = 36
+UV_SUBDIVISION_EPSILON = 1e-6
 
 
 # ### Data models ###
@@ -46,6 +47,10 @@ class UvWallPlacement:
     uv_rect: tuple[float, float, float, float]
     natural_size: tuple[float, float]
     rotation_degrees: int
+    segment_index: int = 0
+    segment_count: int = 1
+    source_start_ratio: float = 0.0
+    source_end_ratio: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -67,6 +72,15 @@ class UvOptimizationResult:
     wall_uv_rotations: dict[str, int]
     wall_uv_scales: dict[str, float]
     wall_uv_positions: dict[str, tuple[float, float]]
+    wall_subdivisions: dict[str, int] = field(default_factory=dict)
+    wall_subdivision_positions: dict[
+        str,
+        tuple[tuple[float, float], ...],
+    ] = field(default_factory=dict)
+    wall_subdivision_source_ranges: dict[
+        str,
+        tuple[tuple[float, float], ...],
+    ] = field(default_factory=dict)
 
 
 # ### Public helpers ###
@@ -84,6 +98,9 @@ def build_uv_wall_layout(
         wall_uv_scales=room.wall_uv_scales,
         wall_uv_rotations=room.wall_uv_rotations,
         wall_uv_positions=room.wall_uv_positions,
+        wall_subdivisions=room.wall_subdivisions,
+        wall_subdivision_positions=room.wall_subdivision_positions,
+        wall_subdivision_source_ranges=room.wall_subdivision_source_ranges,
     )
 
 
@@ -109,6 +126,7 @@ def optimize_room_wall_uvs(
     vertex_data: VertexData,
     wall_height_meters: float,
     use_complex_optimization: bool = False,
+    use_subdivision_optimization: bool = False,
     complex_optimization_passes: int = 1,
 ) -> UvOptimizationResult:
     walls = build_room_walls(room, vertex_data)
@@ -134,6 +152,23 @@ def optimize_room_wall_uvs(
         )
         for wall in walls
     }
+
+    if use_subdivision_optimization:
+        optimized_result = _find_subdivision_uv_optimization_result(
+            walls=walls,
+            map_width=float(room.uv_map_width),
+            map_height=float(room.uv_map_height),
+            wall_height_meters=wall_height_meters,
+            base_wall_uv_scales=current_scales,
+        )
+        if optimized_result is not None:
+            return optimized_result
+
+        return UvOptimizationResult(
+            wall_uv_rotations={},
+            wall_uv_scales={},
+            wall_uv_positions={},
+        )
 
     if use_complex_optimization:
         current_result = _build_current_uv_optimization_result(
@@ -186,7 +221,250 @@ def optimize_room_wall_uvs(
     return phase_two_result
 
 
+def rebuild_room_subdivision_uvs(
+    room: RoomData,
+    vertex_data: VertexData,
+    wall_height_meters: float,
+) -> UvOptimizationResult | None:
+    if not room.wall_subdivisions:
+        return None
+
+    walls = build_room_walls(room, vertex_data)
+    if not walls:
+        return None
+
+    return _build_subdivision_row_uv_result(
+        walls=walls,
+        map_width=float(room.uv_map_width),
+        map_height=float(room.uv_map_height),
+        wall_height_meters=wall_height_meters,
+        base_wall_uv_scales={
+            wall.key: _normalize_wall_uv_scale(
+                room.wall_uv_scales.get(wall.key, DEFAULT_WALL_UV_SCALE)
+            )
+            for wall in walls
+        },
+        wall_uv_rotations={
+            wall.key: _normalize_wall_uv_rotation(
+                room.wall_uv_rotations.get(
+                    wall.key,
+                    DEFAULT_WALL_UV_ROTATION_DEGREES,
+                )
+            )
+            for wall in walls
+        },
+        scale_multiplier=1.0,
+    )
+
+
 # ### Optimization helpers ###
+def _find_subdivision_uv_optimization_result(
+    walls: list[RoomWall],
+    map_width: float,
+    map_height: float,
+    wall_height_meters: float,
+    base_wall_uv_scales: dict[str, float],
+) -> UvOptimizationResult | None:
+    wall_uv_rotations = {
+        wall.key: DEFAULT_WALL_UV_ROTATION_DEGREES
+        for wall in walls
+    }
+    low_multiplier = 0.01
+    high_multiplier = 1.0
+    best_result = _build_subdivision_row_uv_result(
+        walls=walls,
+        map_width=map_width,
+        map_height=map_height,
+        wall_height_meters=wall_height_meters,
+        base_wall_uv_scales=base_wall_uv_scales,
+        wall_uv_rotations=wall_uv_rotations,
+        scale_multiplier=low_multiplier,
+    )
+    if best_result is None:
+        return None
+
+    candidate_result = _build_subdivision_row_uv_result(
+        walls=walls,
+        map_width=map_width,
+        map_height=map_height,
+        wall_height_meters=wall_height_meters,
+        base_wall_uv_scales=base_wall_uv_scales,
+        wall_uv_rotations=wall_uv_rotations,
+        scale_multiplier=high_multiplier,
+    )
+    if candidate_result is not None:
+        best_result = candidate_result
+        low_multiplier = high_multiplier
+        high_multiplier *= 2.0
+        while high_multiplier <= 100.0:
+            candidate_result = _build_subdivision_row_uv_result(
+                walls=walls,
+                map_width=map_width,
+                map_height=map_height,
+                wall_height_meters=wall_height_meters,
+                base_wall_uv_scales=base_wall_uv_scales,
+                wall_uv_rotations=wall_uv_rotations,
+                scale_multiplier=high_multiplier,
+            )
+            if candidate_result is None:
+                break
+
+            best_result = candidate_result
+            low_multiplier = high_multiplier
+            high_multiplier *= 2.0
+
+    high_multiplier = min(high_multiplier, 100.0)
+    for _ in range(UV_UNIFORM_SCALE_SEARCH_PASSES):
+        next_multiplier = (low_multiplier + high_multiplier) / 2.0
+        candidate_result = _build_subdivision_row_uv_result(
+            walls=walls,
+            map_width=map_width,
+            map_height=map_height,
+            wall_height_meters=wall_height_meters,
+            base_wall_uv_scales=base_wall_uv_scales,
+            wall_uv_rotations=wall_uv_rotations,
+            scale_multiplier=next_multiplier,
+        )
+        if candidate_result is None:
+            high_multiplier = next_multiplier
+            continue
+
+        best_result = candidate_result
+        low_multiplier = next_multiplier
+
+    return best_result
+
+
+def _build_subdivision_row_uv_result(
+    walls: list[RoomWall],
+    map_width: float,
+    map_height: float,
+    wall_height_meters: float,
+    base_wall_uv_scales: dict[str, float],
+    wall_uv_rotations: dict[str, int],
+    scale_multiplier: float,
+) -> UvOptimizationResult | None:
+    map_width = max(1.0, map_width)
+    map_height = max(1.0, map_height)
+    wall_height_pixels = max(1.0, wall_height_meters / PIXEL_TO_METER)
+    row_x = 0.0
+    row_y = 0.0
+    row_height = 0.0
+    optimized_scales: dict[str, float] = {}
+    optimized_rotations: dict[str, int] = {}
+    wall_subdivisions: dict[str, int] = {}
+    wall_subdivision_positions: dict[str, tuple[tuple[float, float], ...]] = {}
+    wall_subdivision_source_ranges: dict[str, tuple[tuple[float, float], ...]] = {}
+
+    for wall in walls:
+        wall_scale = _normalize_wall_uv_scale(
+            base_wall_uv_scales.get(wall.key, DEFAULT_WALL_UV_SCALE)
+            * max(0.01, scale_multiplier)
+        )
+        rotation_degrees = _normalize_wall_uv_rotation(
+            wall_uv_rotations.get(wall.key, DEFAULT_WALL_UV_ROTATION_DEGREES)
+        )
+        wall_width, wall_height = _calculate_scaled_wall_natural_size(
+            wall=wall,
+            wall_height_pixels=wall_height_pixels,
+            wall_scale=wall_scale,
+        )
+        remaining_wall_width = wall_width
+        consumed_wall_width = 0.0
+        segment_positions: list[tuple[float, float]] = []
+        segment_source_ranges: list[tuple[float, float]] = []
+
+        while remaining_wall_width > UV_SUBDIVISION_EPSILON:
+            available_row_width = map_width - row_x
+            if row_x > 0.0 and available_row_width < 1.0:
+                row_x = 0.0
+                row_y += row_height
+                row_height = 0.0
+                available_row_width = map_width
+
+            segment_width = _calculate_row_overflow_segment_width(
+                remaining_wall_width=remaining_wall_width,
+                available_row_width=available_row_width,
+                wall_height=wall_height,
+                rotation_degrees=rotation_degrees,
+            )
+            if segment_width is None:
+                if row_x <= 0.0:
+                    return None
+
+                row_x = 0.0
+                row_y += row_height
+                row_height = 0.0
+                continue
+
+            bounding_width, bounding_height = _calculate_rotated_bounds(
+                width=segment_width,
+                height=wall_height,
+                rotation_degrees=rotation_degrees,
+            )
+            if bounding_width > map_width or bounding_height > map_height:
+                return None
+
+            if row_y + bounding_height > map_height:
+                return None
+
+            source_start_ratio = consumed_wall_width / wall_width
+            consumed_wall_width = min(wall_width, consumed_wall_width + segment_width)
+            source_end_ratio = consumed_wall_width / wall_width
+            segment_positions.append((row_x, row_y))
+            segment_source_ranges.append((source_start_ratio, source_end_ratio))
+            row_x += bounding_width
+            row_height = max(row_height, bounding_height)
+            remaining_wall_width = wall_width - consumed_wall_width
+
+            if remaining_wall_width > UV_SUBDIVISION_EPSILON:
+                row_x = 0.0
+                row_y += row_height
+                row_height = 0.0
+
+        optimized_scales[wall.key] = wall_scale
+        optimized_rotations[wall.key] = rotation_degrees
+        wall_subdivisions[wall.key] = len(segment_positions)
+        wall_subdivision_positions[wall.key] = tuple(segment_positions)
+        wall_subdivision_source_ranges[wall.key] = tuple(segment_source_ranges)
+
+    return UvOptimizationResult(
+        wall_uv_rotations=optimized_rotations,
+        wall_uv_scales=optimized_scales,
+        wall_uv_positions={},
+        wall_subdivisions=wall_subdivisions,
+        wall_subdivision_positions=wall_subdivision_positions,
+        wall_subdivision_source_ranges=wall_subdivision_source_ranges,
+    )
+
+
+def _calculate_row_overflow_segment_width(
+    remaining_wall_width: float,
+    available_row_width: float,
+    wall_height: float,
+    rotation_degrees: int,
+) -> float | None:
+    full_bounding_width, _ = _calculate_rotated_bounds(
+        width=remaining_wall_width,
+        height=wall_height,
+        rotation_degrees=rotation_degrees,
+    )
+    if full_bounding_width <= available_row_width + UV_SUBDIVISION_EPSILON:
+        return remaining_wall_width
+
+    rotation_radians = math.radians(rotation_degrees % 360)
+    cosine = abs(math.cos(rotation_radians))
+    sine = abs(math.sin(rotation_radians))
+    if cosine <= UV_SUBDIVISION_EPSILON:
+        return None
+
+    segment_width = (available_row_width - wall_height * sine) / cosine
+    if segment_width < 1.0:
+        return None
+
+    return min(remaining_wall_width, segment_width)
+
+
 def _build_current_uv_optimization_result(
     room: RoomData,
     walls: list[RoomWall],
@@ -917,6 +1195,13 @@ def _build_uv_wall_layout_for_size(
     wall_uv_scales: dict[str, float],
     wall_uv_rotations: dict[str, int],
     wall_uv_positions: dict[str, tuple[float, float]] | None = None,
+    wall_subdivisions: dict[str, int] | None = None,
+    wall_subdivision_positions: (
+        dict[str, tuple[tuple[float, float], ...]] | None
+    ) = None,
+    wall_subdivision_source_ranges: (
+        dict[str, tuple[tuple[float, float], ...]] | None
+    ) = None,
 ) -> UvLayout:
     map_width = max(1.0, map_width)
     map_height = max(1.0, map_height)
@@ -935,8 +1220,11 @@ def _build_uv_wall_layout_for_size(
         wall_rotation = _normalize_wall_uv_rotation(
             wall_uv_rotations.get(wall.key, DEFAULT_WALL_UV_ROTATION_DEGREES)
         )
+        wall_has_subdivision_layout = (
+            wall_subdivisions is not None and wall.key in wall_subdivisions
+        )
         wall_position = None
-        if wall_uv_positions is not None:
+        if wall_uv_positions is not None and not wall_has_subdivision_layout:
             wall_position = wall_uv_positions.get(wall.key)
 
         wall_width, wall_height = _calculate_scaled_wall_natural_size(
@@ -944,6 +1232,37 @@ def _build_uv_wall_layout_for_size(
             wall_height_pixels=wall_height_pixels,
             wall_scale=wall_scale,
         )
+        if wall_has_subdivision_layout:
+            segment_count = _normalize_wall_subdivision_count(
+                wall_subdivisions.get(wall.key, 1) if wall_subdivisions else 1
+            )
+            segment_positions = None
+            if wall_subdivision_positions is not None:
+                segment_positions = wall_subdivision_positions.get(wall.key)
+            segment_source_ranges = None
+            if wall_subdivision_source_ranges is not None:
+                segment_source_ranges = wall_subdivision_source_ranges.get(wall.key)
+
+            placement_option = _build_wall_segment_placement_option(
+                wall=wall,
+                wall_width=wall_width,
+                wall_height=wall_height,
+                rotation_degrees=wall_rotation,
+                map_width=map_width,
+                map_height=map_height,
+                free_rectangles=free_rectangles,
+                segment_count=segment_count,
+                segment_positions=segment_positions,
+                segment_source_ranges=segment_source_ranges,
+            )
+            if placement_option is None:
+                hidden_wall_count += 1
+                continue
+
+            wall_placements, free_rectangles = placement_option
+            placements.extend(wall_placements)
+            continue
+
         bounding_width, bounding_height = _calculate_rotated_bounds(
             width=wall_width,
             height=wall_height,
@@ -985,6 +1304,93 @@ def _build_uv_wall_layout_for_size(
         )
 
     return UvLayout(placements=placements, hidden_wall_count=hidden_wall_count)
+
+
+def _build_wall_segment_placement_option(
+    wall: RoomWall,
+    wall_width: float,
+    wall_height: float,
+    rotation_degrees: int,
+    map_width: float,
+    map_height: float,
+    free_rectangles: tuple[UvFreeRectangle, ...],
+    segment_count: int,
+    segment_positions: tuple[tuple[float, float], ...] | None,
+    segment_source_ranges: tuple[tuple[float, float], ...] | None,
+) -> tuple[list[UvWallPlacement], tuple[UvFreeRectangle, ...]] | None:
+    segment_count = _normalize_wall_subdivision_count(segment_count)
+    if segment_positions is not None and len(segment_positions) != segment_count:
+        segment_positions = None
+    if (
+        segment_source_ranges is not None
+        and len(segment_source_ranges) != segment_count
+    ):
+        segment_source_ranges = None
+    if segment_source_ranges is None:
+        segment_source_ranges = tuple(
+            (segment_index / segment_count, (segment_index + 1) / segment_count)
+            for segment_index in range(segment_count)
+        )
+
+    next_free_rectangles = free_rectangles
+    placements: list[UvWallPlacement] = []
+    for segment_index in range(segment_count):
+        source_start_ratio, source_end_ratio = _normalize_uv_source_range(
+            segment_source_ranges[segment_index]
+        )
+        segment_width = max(
+            1.0,
+            wall_width * (source_end_ratio - source_start_ratio),
+        )
+        bounding_width, bounding_height = _calculate_rotated_bounds(
+            width=segment_width,
+            height=wall_height,
+            rotation_degrees=rotation_degrees,
+        )
+        segment_position = (
+            segment_positions[segment_index]
+            if segment_positions is not None
+            else None
+        )
+        if segment_position is None:
+            placement_option = _find_best_uv_free_placement(
+                free_rectangles=next_free_rectangles,
+                width=bounding_width,
+                height=bounding_height,
+            )
+        else:
+            placement_option = _build_manual_uv_placement_option(
+                free_rectangles=next_free_rectangles,
+                map_width=map_width,
+                map_height=map_height,
+                wall_position=segment_position,
+                width=bounding_width,
+                height=bounding_height,
+            )
+
+        if placement_option is None:
+            return None
+
+        placement_rect, next_free_rectangles = placement_option
+        placements.append(
+            UvWallPlacement(
+                wall=wall,
+                uv_rect=(
+                    placement_rect.x,
+                    placement_rect.y,
+                    placement_rect.width,
+                    placement_rect.height,
+                ),
+                natural_size=(segment_width, wall_height),
+                rotation_degrees=rotation_degrees,
+                segment_index=segment_index,
+                segment_count=segment_count,
+                source_start_ratio=source_start_ratio,
+                source_end_ratio=source_end_ratio,
+            )
+        )
+
+    return placements, next_free_rectangles
 
 
 def _build_packed_uv_result_from_settings(
@@ -1332,6 +1738,26 @@ def _calculate_scaled_wall_natural_size(
     )
 
 
+def _normalize_wall_subdivision_count(segment_count: int | float | object) -> int:
+    try:
+        normalized_count = int(segment_count)
+    except (TypeError, ValueError):
+        return 1
+
+    return max(1, normalized_count)
+
+
+def _normalize_uv_source_range(
+    source_range: tuple[float, float] | list[float],
+) -> tuple[float, float]:
+    source_start = min(max(0.0, float(source_range[0])), 1.0)
+    source_end = min(max(source_start, float(source_range[1])), 1.0)
+    if source_end <= source_start:
+        source_end = min(1.0, source_start + UV_SUBDIVISION_EPSILON)
+
+    return source_start, source_end
+
+
 def _score_uv_layout(
     layout: UvLayout,
 ) -> tuple[float, int, int, float, float]:
@@ -1385,6 +1811,9 @@ def _score_uv_optimization_result(
         wall_uv_scales=result.wall_uv_scales,
         wall_uv_rotations=result.wall_uv_rotations,
         wall_uv_positions=result.wall_uv_positions,
+        wall_subdivisions=result.wall_subdivisions,
+        wall_subdivision_positions=result.wall_subdivision_positions,
+        wall_subdivision_source_ranges=result.wall_subdivision_source_ranges,
     )
     return _score_uv_layout(layout)
 

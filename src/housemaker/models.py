@@ -46,6 +46,15 @@ class RoomData:
     wall_uv_scales: dict[str, float] = field(default_factory=dict)
     wall_uv_rotations: dict[str, int] = field(default_factory=dict)
     wall_uv_positions: dict[str, tuple[float, float]] = field(default_factory=dict)
+    wall_subdivisions: dict[str, int] = field(default_factory=dict)
+    wall_subdivision_positions: dict[
+        str,
+        tuple[tuple[float, float], ...],
+    ] = field(default_factory=dict)
+    wall_subdivision_source_ranges: dict[
+        str,
+        tuple[tuple[float, float], ...],
+    ] = field(default_factory=dict)
     wall_textures: dict[str, "WallTextureData"] = field(default_factory=dict)
 
 

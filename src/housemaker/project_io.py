@@ -217,6 +217,16 @@ def _serialize_room(room: RoomData) -> dict[str, object]:
             str(wall_key): [float(wall_position[0]), float(wall_position[1])]
             for wall_key, wall_position in room.wall_uv_positions.items()
         },
+        "wall_subdivisions": {
+            str(wall_key): int(segment_count)
+            for wall_key, segment_count in room.wall_subdivisions.items()
+        },
+        "wall_subdivision_positions": _serialize_wall_subdivision_positions(
+            room.wall_subdivision_positions
+        ),
+        "wall_subdivision_source_ranges": _serialize_wall_subdivision_source_ranges(
+            room.wall_subdivision_source_ranges
+        ),
         "wall_textures": _serialize_wall_textures(room.wall_textures),
     }
 
@@ -262,6 +272,17 @@ def _deserialize_rooms(raw_rooms: object) -> list[RoomData]:
                 wall_uv_positions=_deserialize_wall_uv_positions(
                     raw_room.get("wall_uv_positions", {})
                 ),
+                wall_subdivisions=_deserialize_wall_subdivisions(
+                    raw_room.get("wall_subdivisions", {})
+                ),
+                wall_subdivision_positions=_deserialize_wall_subdivision_positions(
+                    raw_room.get("wall_subdivision_positions", {})
+                ),
+                wall_subdivision_source_ranges=(
+                    _deserialize_wall_subdivision_source_ranges(
+                        raw_room.get("wall_subdivision_source_ranges", {})
+                    )
+                ),
                 wall_textures=_deserialize_wall_textures(
                     raw_room.get("wall_textures", {})
                 ),
@@ -302,6 +323,101 @@ def _deserialize_wall_uv_positions(
         for wall_key, wall_position in raw_wall_uv_positions.items()
         if isinstance(wall_position, list | tuple) and len(wall_position) == 2
     }
+
+
+def _deserialize_wall_subdivisions(raw_wall_subdivisions: object) -> dict[str, int]:
+    if not isinstance(raw_wall_subdivisions, dict):
+        return {}
+
+    wall_subdivisions: dict[str, int] = {}
+    for wall_key, raw_segment_count in raw_wall_subdivisions.items():
+        try:
+            segment_count = int(raw_segment_count)
+        except (TypeError, ValueError):
+            continue
+
+        wall_subdivisions[str(wall_key)] = max(1, segment_count)
+
+    return wall_subdivisions
+
+
+def _serialize_wall_subdivision_positions(
+    wall_subdivision_positions: dict[str, tuple[tuple[float, float], ...]],
+) -> dict[str, list[list[float]]]:
+    return {
+        str(wall_key): [
+            [float(position[0]), float(position[1])]
+            for position in segment_positions
+        ]
+        for wall_key, segment_positions in wall_subdivision_positions.items()
+    }
+
+
+def _deserialize_wall_subdivision_positions(
+    raw_wall_subdivision_positions: object,
+) -> dict[str, tuple[tuple[float, float], ...]]:
+    if not isinstance(raw_wall_subdivision_positions, dict):
+        return {}
+
+    wall_subdivision_positions: dict[str, tuple[tuple[float, float], ...]] = {}
+    for wall_key, raw_positions in raw_wall_subdivision_positions.items():
+        if not isinstance(raw_positions, list | tuple):
+            continue
+
+        segment_positions: list[tuple[float, float]] = []
+        for raw_position in raw_positions:
+            if not isinstance(raw_position, list | tuple) or len(raw_position) != 2:
+                continue
+
+            segment_positions.append(
+                (float(raw_position[0]), float(raw_position[1]))
+            )
+
+        if segment_positions:
+            wall_subdivision_positions[str(wall_key)] = tuple(segment_positions)
+
+    return wall_subdivision_positions
+
+
+def _serialize_wall_subdivision_source_ranges(
+    wall_subdivision_source_ranges: dict[str, tuple[tuple[float, float], ...]],
+) -> dict[str, list[list[float]]]:
+    return {
+        str(wall_key): [
+            [float(source_range[0]), float(source_range[1])]
+            for source_range in source_ranges
+        ]
+        for wall_key, source_ranges in wall_subdivision_source_ranges.items()
+    }
+
+
+def _deserialize_wall_subdivision_source_ranges(
+    raw_wall_subdivision_source_ranges: object,
+) -> dict[str, tuple[tuple[float, float], ...]]:
+    if not isinstance(raw_wall_subdivision_source_ranges, dict):
+        return {}
+
+    wall_subdivision_source_ranges: dict[str, tuple[tuple[float, float], ...]] = {}
+    for wall_key, raw_ranges in raw_wall_subdivision_source_ranges.items():
+        if not isinstance(raw_ranges, list | tuple):
+            continue
+
+        source_ranges: list[tuple[float, float]] = []
+        for raw_range in raw_ranges:
+            if not isinstance(raw_range, list | tuple) or len(raw_range) != 2:
+                continue
+
+            source_start = min(max(0.0, float(raw_range[0])), 1.0)
+            source_end = min(max(source_start, float(raw_range[1])), 1.0)
+            if source_end <= source_start:
+                continue
+
+            source_ranges.append((source_start, source_end))
+
+        if source_ranges:
+            wall_subdivision_source_ranges[str(wall_key)] = tuple(source_ranges)
+
+    return wall_subdivision_source_ranges
 
 
 def _normalize_wall_uv_rotation(raw_wall_rotation: object) -> int:

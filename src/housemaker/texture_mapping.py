@@ -11,6 +11,8 @@ def paint_wall_texture_crop(
     painter: QPainter,
     texture_data: WallTextureData,
     target_rect: QRectF,
+    source_start_ratio: float = 0.0,
+    source_end_ratio: float = 1.0,
 ) -> bool:
     source_image = QImage(texture_data.image_path)
     if source_image.isNull():
@@ -20,6 +22,11 @@ def paint_wall_texture_crop(
     if source_rect.width() <= 0.0 or source_rect.height() <= 0.0:
         return False
 
+    source_rect = _slice_source_rect(
+        source_rect=source_rect,
+        source_start_ratio=source_start_ratio,
+        source_end_ratio=source_end_ratio,
+    )
     painter.drawImage(target_rect, source_image, source_rect)
     return True
 
@@ -42,3 +49,18 @@ def _clamp_source_rect(
         max(0.0, image_height - source_height),
     )
     return QRectF(source_x, source_y, source_width, source_height)
+
+
+def _slice_source_rect(
+    source_rect: QRectF,
+    source_start_ratio: float,
+    source_end_ratio: float,
+) -> QRectF:
+    start_ratio = min(max(0.0, float(source_start_ratio)), 1.0)
+    end_ratio = min(max(start_ratio, float(source_end_ratio)), 1.0)
+    return QRectF(
+        source_rect.left() + source_rect.width() * start_ratio,
+        source_rect.top(),
+        max(1.0, source_rect.width() * (end_ratio - start_ratio)),
+        source_rect.height(),
+    )

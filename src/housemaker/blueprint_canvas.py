@@ -700,6 +700,14 @@ class BlueprintCanvas(QWidget):
                     wall_uv_scales=copy.deepcopy(room.wall_uv_scales),
                     wall_uv_rotations=copy.deepcopy(room.wall_uv_rotations),
                     wall_uv_positions=copy.deepcopy(room.wall_uv_positions),
+                    wall_subdivisions=copy.deepcopy(room.wall_subdivisions),
+                    wall_subdivision_positions=copy.deepcopy(
+                        room.wall_subdivision_positions
+                    ),
+                    wall_subdivision_source_ranges=copy.deepcopy(
+                        room.wall_subdivision_source_ranges
+                    ),
+                    wall_textures=copy.deepcopy(room.wall_textures),
                 )
             )
 

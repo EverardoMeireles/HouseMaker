@@ -26,6 +26,7 @@ from housemaker.models import (
 )
 from housemaker.texture_mapping import paint_wall_texture_crop
 from housemaker.uv_layout import (
+    RoomWall,
     UvLayout,
     UvWallPlacement,
     build_room_walls,
@@ -46,11 +47,9 @@ Z_UP_TO_GLTF_Y_UP_TRANSFORM = np.array(
 )
 ROOM_TEXTURE_BACKGROUND_COLOR = QColor("#f7f8fb")
 ROOM_TEXTURE_WALL_FILL_COLOR = QColor("#dce0e8")
-ROOM_TEXTURE_WALL_BORDER_COLOR = QColor("#d92d20")
 ROOM_TEXTURE_TEXT_COLOR = QColor("#20242a")
 ROOM_TEXTURE_INDICATOR_BACKGROUND_COLOR = QColor(10, 12, 16, 180)
 ROOM_TEXTURE_INDICATOR_TEXT_COLOR = QColor("#f5f7fa")
-ROOM_TEXTURE_WALL_BORDER_WIDTH = 2.0
 ROOM_TEXTURE_MIN_FONT_SIZE = 8
 ROOM_TEXTURE_MAX_FONT_SIZE = 32
 FALLBACK_QT_PLATFORM = "offscreen"
@@ -356,33 +355,49 @@ def _build_room_mesh(
         vertex_data=level.vertex_data,
         wall_height_meters=level.height_meters,
     )
-    placements_by_key = {
-        placement.wall.key: placement
-        for placement in layout.placements
-    }
+    placements_by_key = _group_wall_placements_by_key(layout.placements)
     material = _build_room_material(level, room, room_index, layout)
     vertices: list[list[float]] = []
     faces: list[list[int]] = []
     uv_coordinates: list[tuple[float, float]] = []
 
     for wall in room_walls:
-        placement = placements_by_key.get(wall.key)
-        wall_vertices = _build_wall_vertices_from_points(
-            start_point=wall.start_point,
-            end_point=wall.end_point,
-            wall_height_meters=level.height_meters,
-            base_z_meters=base_z_meters,
-            blueprint_size_pixels=blueprint_size_pixels,
-        )
-        if wall_vertices is None:
+        wall_placements = placements_by_key.get(wall.key, [])
+        if not wall_placements:
+            wall_vertices = _build_wall_vertices_from_points(
+                start_point=wall.start_point,
+                end_point=wall.end_point,
+                wall_height_meters=level.height_meters,
+                base_z_meters=base_z_meters,
+                blueprint_size_pixels=blueprint_size_pixels,
+            )
+            if wall_vertices is None:
+                continue
+
+            vertex_offset = len(vertices)
+            vertices.extend(wall_vertices)
+            faces.extend(_build_wall_faces(vertex_offset))
+            uv_coordinates.extend(_build_hidden_wall_uv_coordinates())
             continue
 
-        vertex_offset = len(vertices)
-        vertices.extend(wall_vertices)
-        faces.extend(_build_wall_faces(vertex_offset))
-        if placement is None:
-            uv_coordinates.extend(_build_hidden_wall_uv_coordinates())
-        else:
+        for placement in wall_placements:
+            segment_start_point, segment_end_point = _get_wall_segment_points(
+                wall=wall,
+                placement=placement,
+            )
+            wall_vertices = _build_wall_vertices_from_points(
+                start_point=segment_start_point,
+                end_point=segment_end_point,
+                wall_height_meters=level.height_meters,
+                base_z_meters=base_z_meters,
+                blueprint_size_pixels=blueprint_size_pixels,
+            )
+            if wall_vertices is None:
+                continue
+
+            vertex_offset = len(vertices)
+            vertices.extend(wall_vertices)
+            faces.extend(_build_wall_faces(vertex_offset))
             uv_coordinates.extend(_build_wall_uv_coordinates(room, placement))
 
     if not vertices or not faces:
@@ -397,6 +412,16 @@ def _build_room_mesh(
         ),
         process=False,
     )
+
+
+def _group_wall_placements_by_key(
+    placements: Sequence[UvWallPlacement],
+) -> dict[str, list[UvWallPlacement]]:
+    placements_by_key: dict[str, list[UvWallPlacement]] = {}
+    for placement in placements:
+        placements_by_key.setdefault(placement.wall.key, []).append(placement)
+
+    return placements_by_key
 
 
 # ### Material helpers ###
@@ -480,15 +505,19 @@ def _paint_room_texture_wall(
     texture_data = room.wall_textures.get(placement.wall.key)
     did_paint_texture = (
         texture_data is not None
-        and paint_wall_texture_crop(painter, texture_data, texture_rect)
+        and paint_wall_texture_crop(
+            painter,
+            texture_data,
+            texture_rect,
+            placement.source_start_ratio,
+            placement.source_end_ratio,
+        )
     )
 
-    painter.setPen(QPen(ROOM_TEXTURE_WALL_BORDER_COLOR, ROOM_TEXTURE_WALL_BORDER_WIDTH))
-    painter.setBrush(
-        Qt.BrushStyle.NoBrush if did_paint_texture else ROOM_TEXTURE_WALL_FILL_COLOR
-    )
-    painter.drawRect(texture_rect)
     if not did_paint_texture:
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(ROOM_TEXTURE_WALL_FILL_COLOR)
+        painter.drawRect(texture_rect)
         painter.setPen(QPen(ROOM_TEXTURE_TEXT_COLOR))
         painter.setFont(
             QFont("Segoe UI", _get_room_texture_label_font_size(texture_rect))
@@ -587,14 +616,18 @@ def _build_wall_preview_texture(
     texture_data = room.wall_textures.get(placement.wall.key)
     did_paint_texture = (
         texture_data is not None
-        and paint_wall_texture_crop(painter, texture_data, texture_rect)
+        and paint_wall_texture_crop(
+            painter,
+            texture_data,
+            texture_rect,
+            placement.source_start_ratio,
+            placement.source_end_ratio,
+        )
     )
-    painter.setPen(QPen(ROOM_TEXTURE_WALL_BORDER_COLOR, ROOM_TEXTURE_WALL_BORDER_WIDTH))
-    painter.setBrush(
-        Qt.BrushStyle.NoBrush if did_paint_texture else ROOM_TEXTURE_WALL_FILL_COLOR
-    )
-    painter.drawRect(texture_rect)
     if not did_paint_texture:
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(ROOM_TEXTURE_WALL_FILL_COLOR)
+        painter.drawRect(texture_rect)
         painter.setPen(QPen(ROOM_TEXTURE_TEXT_COLOR))
         painter.setFont(
             QFont("Segoe UI", _get_room_texture_label_font_size(texture_rect))
@@ -629,6 +662,36 @@ def _build_wall_vertices_from_points(
         [float(end_xy[0]), float(end_xy[1]), top_z],
         [float(start_xy[0]), float(start_xy[1]), top_z],
     ]
+
+
+def _get_wall_segment_points(
+    wall: RoomWall,
+    placement: UvWallPlacement,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    return (
+        _interpolate_2d_point(
+            wall.start_point,
+            wall.end_point,
+            placement.source_start_ratio,
+        ),
+        _interpolate_2d_point(
+            wall.start_point,
+            wall.end_point,
+            placement.source_end_ratio,
+        ),
+    )
+
+
+def _interpolate_2d_point(
+    start_point: tuple[float, float],
+    end_point: tuple[float, float],
+    ratio: float,
+) -> tuple[float, float]:
+    safe_ratio = min(max(0.0, float(ratio)), 1.0)
+    return (
+        start_point[0] + (end_point[0] - start_point[0]) * safe_ratio,
+        start_point[1] + (end_point[1] - start_point[1]) * safe_ratio,
+    )
 
 
 def _build_wall_faces(vertex_offset: int) -> list[list[int]]:
@@ -710,12 +773,16 @@ def _build_level_preview_textured_walls(
             continue
 
         for placement in layout.placements:
+            segment_start_point, segment_end_point = _get_wall_segment_points(
+                wall=placement.wall,
+                placement=placement,
+            )
             start_xy = _point_to_world_xy(
-                placement.wall.start_point,
+                segment_start_point,
                 blueprint_size_pixels,
             )
             end_xy = _point_to_world_xy(
-                placement.wall.end_point,
+                segment_end_point,
                 blueprint_size_pixels,
             )
             preview_walls.append(

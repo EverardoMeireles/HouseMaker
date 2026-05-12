@@ -12,7 +12,8 @@ from housemaker.models import RoomData, WallTextureData
 # ### Constants ###
 TEXTURE_CANVAS_BACKGROUND_COLOR = QColor("#1c1f24")
 TEXTURE_IMAGE_BACKGROUND_COLOR = QColor("#101318")
-TEXTURE_OUTLINE_COLOR = QColor("#f6c85f")
+TEXTURE_OUTLINE_COLOR = QColor("#d92d20")
+TEXTURE_FACE_OUTLINE_COLOR = QColor("#f6c85f")
 TEXTURE_OUTLINE_HANDLE_COLOR = QColor(246, 200, 95, 45)
 TEXTURE_TEXT_COLOR = QColor("#f5f7fa")
 TEXTURE_WIDGET_MARGIN = 14.0
@@ -28,6 +29,7 @@ class TextureCreatorCanvas(QWidget):
         self.room: RoomData | None = None
         self.wall_key: str | None = None
         self.wall_aspect_ratio = 1.0
+        self.wall_segment_count = 1
         self.image_path: str | None = None
         self.source_image = QImage()
         self.drag_start_source_point = QPointF()
@@ -40,10 +42,12 @@ class TextureCreatorCanvas(QWidget):
         wall_key: str | None,
         wall_size: tuple[float, float] | None,
         image_path: str | None,
+        segment_count: int = 1,
     ) -> None:
         self.room = room
         self.wall_key = wall_key
         self.wall_aspect_ratio = _get_wall_aspect_ratio(wall_size)
+        self.wall_segment_count = max(1, int(segment_count))
         self.image_path = str(Path(image_path).resolve()) if image_path else None
         self.source_image = QImage(self.image_path or "")
         changed = self._ensure_texture_data()
@@ -241,6 +245,7 @@ class TextureCreatorCanvas(QWidget):
         painter.setPen(QPen(TEXTURE_OUTLINE_COLOR, 2.5))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRect(texture_rect)
+        self._paint_face_outlines(painter, texture_rect)
 
     def _paint_blank_wall_outline(self, painter: QPainter) -> None:
         outline_rect = self._get_blank_wall_outline_rect()
@@ -250,6 +255,35 @@ class TextureCreatorCanvas(QWidget):
         painter.setPen(QPen(TEXTURE_OUTLINE_COLOR, 2.5))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRect(outline_rect)
+        self._paint_face_outlines(painter, outline_rect)
+
+    def _paint_face_outlines(self, painter: QPainter, outline_rect: QRectF) -> None:
+        painter.setPen(QPen(TEXTURE_FACE_OUTLINE_COLOR, 1.5))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(outline_rect.adjusted(2.0, 2.0, -2.0, -2.0))
+        if self.wall_segment_count <= 1:
+            return
+
+        for segment_index in range(1, self.wall_segment_count):
+            segment_ratio = self._get_segment_division_ratio(segment_index)
+            segment_x = (
+                outline_rect.left()
+                + outline_rect.width() * segment_ratio
+            )
+            painter.drawLine(
+                QPointF(segment_x, outline_rect.top()),
+                QPointF(segment_x, outline_rect.bottom()),
+            )
+
+    def _get_segment_division_ratio(self, segment_index: int) -> float:
+        if self.room is None or self.wall_key is None:
+            return segment_index / max(1, self.wall_segment_count)
+
+        source_ranges = self.room.wall_subdivision_source_ranges.get(self.wall_key)
+        if source_ranges is None or len(source_ranges) != self.wall_segment_count:
+            return segment_index / max(1, self.wall_segment_count)
+
+        return min(max(0.0, float(source_ranges[segment_index - 1][1])), 1.0)
 
     def _paint_centered_message(self, painter: QPainter, message: str) -> None:
         painter.setPen(QPen(TEXTURE_TEXT_COLOR))

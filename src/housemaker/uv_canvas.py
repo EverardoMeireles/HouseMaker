@@ -14,6 +14,7 @@ from housemaker.uv_layout import (
     build_uv_wall_layout,
     get_room_wall_keys,
     get_rotated_uv_corners,
+    rebuild_room_subdivision_uvs,
 )
 
 # ### Constants ###
@@ -22,6 +23,7 @@ UV_MAP_BACKGROUND_COLOR = QColor("#f7f8fb")
 UV_MAP_OUTLINE_COLOR = QColor("#6b7280")
 UV_WALL_FILL_COLOR = QColor(220, 224, 232, 210)
 UV_WALL_BORDER_COLOR = QColor("#d92d20")
+UV_FACE_BORDER_COLOR = QColor("#f6c85f")
 UV_SELECTED_WALL_COLOR = QColor("#f6c85f")
 UV_TEXT_COLOR = QColor("#f5f7fa")
 UV_DARK_TEXT_COLOR = QColor("#20242a")
@@ -42,6 +44,7 @@ class UvCanvas(QWidget):
         self.selected_wall_key: str | None = None
         self.drag_mode: str | None = None
         self.drag_wall_key: str | None = None
+        self.drag_segment_index = 0
         self.drag_start_uv_point = QPointF()
         self.drag_start_wall_position: tuple[float, float] = (0.0, 0.0)
         self.rotation_center_uv: tuple[float, float] = (0.0, 0.0)
@@ -146,6 +149,7 @@ class UvCanvas(QWidget):
 
         self.drag_mode = None
         self.drag_wall_key = None
+        self.drag_segment_index = 0
         event.accept()
 
     def wheelEvent(self, event) -> None:  # type: ignore[override]
@@ -179,6 +183,7 @@ class UvCanvas(QWidget):
         new_scale = max(0.01, round(current_scale * scale_factor, 3))
         placement_center = self._get_placement_center(placement)
         self.room.wall_uv_scales[placement.wall.key] = new_scale
+        self._refresh_subdivision_layout_if_needed(placement.wall.key)
         self._set_wall_position_from_center(placement.wall.key, placement_center)
         self.uv_values_changed.emit()
         self.update()
@@ -217,6 +222,7 @@ class UvCanvas(QWidget):
     ) -> None:
         self.drag_mode = "move"
         self.drag_wall_key = placement.wall.key
+        self.drag_segment_index = placement.segment_index
         self.drag_start_uv_point = self._widget_point_to_uv_point(
             widget_position,
             map_rect,
@@ -229,7 +235,10 @@ class UvCanvas(QWidget):
 
         map_rect = self._get_map_rect()
         current_uv_point = self._widget_point_to_uv_point(widget_position, map_rect)
-        placement = self._get_wall_placement(self.drag_wall_key)
+        placement = self._get_wall_placement(
+            self.drag_wall_key,
+            self.drag_segment_index,
+        )
         if placement is None:
             return
 
@@ -241,10 +250,18 @@ class UvCanvas(QWidget):
             + current_uv_point.y()
             - self.drag_start_uv_point.y(),
         )
-        self.room.wall_uv_positions[self.drag_wall_key] = self._clamp_wall_position(
-            moved_position,
-            placement,
-        )
+        clamped_position = self._clamp_wall_position(moved_position, placement)
+        if self.drag_wall_key in self.room.wall_subdivisions:
+            segment_positions = list(
+                self.room.wall_subdivision_positions.get(self.drag_wall_key, ())
+            )
+            if len(segment_positions) == placement.segment_count:
+                segment_positions[placement.segment_index] = clamped_position
+                self.room.wall_subdivision_positions[self.drag_wall_key] = tuple(
+                    segment_positions
+                )
+        else:
+            self.room.wall_uv_positions[self.drag_wall_key] = clamped_position
         self.uv_values_changed.emit()
         self.update()
 
@@ -256,6 +273,7 @@ class UvCanvas(QWidget):
     ) -> None:
         self.drag_mode = "rotate"
         self.drag_wall_key = placement.wall.key
+        self.drag_segment_index = placement.segment_index
         self.rotation_center_uv = self._get_placement_center(placement)
         self.rotation_start_angle = self._get_uv_angle_from_center(
             widget_position=widget_position,
@@ -280,6 +298,7 @@ class UvCanvas(QWidget):
         self.room.wall_uv_rotations[self.drag_wall_key] = int(
             round(self.rotation_start_degrees + rotation_delta)
         ) % 360
+        self._refresh_subdivision_layout_if_needed(self.drag_wall_key)
         self._set_wall_position_from_center(
             self.drag_wall_key,
             self.rotation_center_uv,
@@ -304,7 +323,11 @@ class UvCanvas(QWidget):
 
         return self._get_wall_placement(self.selected_wall_key)
 
-    def _get_wall_placement(self, wall_key: str) -> UvWallPlacement | None:
+    def _get_wall_placement(
+        self,
+        wall_key: str,
+        segment_index: int | None = None,
+    ) -> UvWallPlacement | None:
         if self.room is None or self.vertex_data is None:
             return None
 
@@ -314,7 +337,9 @@ class UvCanvas(QWidget):
             wall_height_meters=self.wall_height_meters,
         )
         for placement in layout.placements:
-            if placement.wall.key == wall_key:
+            if placement.wall.key != wall_key:
+                continue
+            if segment_index is None or placement.segment_index == segment_index:
                 return placement
 
         return None
@@ -345,6 +370,31 @@ class UvCanvas(QWidget):
         self.room.wall_uv_positions[wall_key] = self._clamp_wall_position(
             position,
             placement,
+        )
+
+    def _refresh_subdivision_layout_if_needed(self, wall_key: str) -> None:
+        if self.room is None or self.vertex_data is None:
+            return
+        if wall_key not in self.room.wall_subdivisions:
+            return
+
+        optimized_result = rebuild_room_subdivision_uvs(
+            room=self.room,
+            vertex_data=self.vertex_data,
+            wall_height_meters=self.wall_height_meters,
+        )
+        if optimized_result is None:
+            return
+
+        self.room.wall_uv_rotations = dict(optimized_result.wall_uv_rotations)
+        self.room.wall_uv_scales = dict(optimized_result.wall_uv_scales)
+        self.room.wall_uv_positions = dict(optimized_result.wall_uv_positions)
+        self.room.wall_subdivisions = dict(optimized_result.wall_subdivisions)
+        self.room.wall_subdivision_positions = dict(
+            optimized_result.wall_subdivision_positions
+        )
+        self.room.wall_subdivision_source_ranges = dict(
+            optimized_result.wall_subdivision_source_ranges
         )
 
     def _clamp_wall_position(
@@ -387,18 +437,27 @@ class UvCanvas(QWidget):
             texture_data = self.room.wall_textures.get(placement.wall.key)
             did_paint_texture = (
                 texture_data is not None
-                and paint_wall_texture_crop(painter, texture_data, wall_widget_rect)
+                and paint_wall_texture_crop(
+                    painter,
+                    texture_data,
+                    wall_widget_rect,
+                    placement.source_start_ratio,
+                    placement.source_end_ratio,
+                )
             )
             painter.setPen(QPen(UV_WALL_BORDER_COLOR, 2.0))
             painter.setBrush(
                 Qt.BrushStyle.NoBrush if did_paint_texture else UV_WALL_FILL_COLOR
             )
             painter.drawRect(wall_widget_rect)
+            painter.setPen(QPen(UV_FACE_BORDER_COLOR, 1.3))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(wall_widget_rect.adjusted(2.0, 2.0, -2.0, -2.0))
 
             if placement.wall.key == self.selected_wall_key:
                 painter.setPen(QPen(UV_SELECTED_WALL_COLOR, 3.0))
                 painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.drawRect(wall_widget_rect.adjusted(2.0, 2.0, -2.0, -2.0))
+                painter.drawRect(wall_widget_rect.adjusted(4.0, 4.0, -4.0, -4.0))
 
             if not did_paint_texture:
                 painter.setPen(QPen(UV_DARK_TEXT_COLOR))
