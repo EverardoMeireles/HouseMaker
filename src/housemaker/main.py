@@ -9,6 +9,7 @@ from PySide6.QtGui import QIcon, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -51,13 +52,19 @@ from housemaker.models import (
     create_default_levels,
 )
 from housemaker.project_io import ProjectData, load_project, save_project
+from housemaker.texture_creator_canvas import TextureCreatorCanvas
 from housemaker.uv_canvas import UvCanvas
 from housemaker.uv_layout import (
     UvOptimizationResult,
+    UvWallPlacement,
+    build_uv_wall_layout,
     calculate_unoccupied_uv_pixels,
     optimize_room_wall_uvs,
 )
 from housemaker.viewer import GlbViewerWidget
+
+# ### Constants ###
+TEXTURE_CREATOR_DETAIL_SIZES = (512, 1024, 2048)
 
 # ### Widgets ###
 class HomePage(QWidget):
@@ -136,9 +143,13 @@ class BlueprintWorkspace(QWidget):
         self.current_level_index = GROUND_LEVEL_INDEX
         self._is_syncing_level_controls = False
         self._is_syncing_image_library_controls = False
+        self._is_syncing_texture_controls = False
         self._is_syncing_uv_controls = False
         self._is_viewer_refresh_scheduled = False
         self._scheduled_viewer_refresh_preserve_camera = True
+        self.texture_creator_level_index: int | None = None
+        self.texture_creator_room_index: int | None = None
+        self.texture_creator_wall_key: str | None = None
         self._build_ui()
 
     @property
@@ -166,6 +177,7 @@ class BlueprintWorkspace(QWidget):
         self.workspace_tabs.currentChanged.connect(
             self._handle_workspace_tab_changed
         )
+        self.viewer.wall_selected.connect(self._handle_viewer_wall_selected)
         splitter.addWidget(self.workspace_tabs)
 
         side_panel = QWidget()
@@ -345,6 +357,7 @@ class BlueprintWorkspace(QWidget):
 
         self.side_tabs.addTab(self._build_uvs_tab(), "UVs")
         self.side_tabs.addTab(self._build_images_tab(), "Images")
+        self.side_tabs.addTab(self._build_texture_creator_tab(), "Texture creator")
 
         splitter.addWidget(side_panel)
         splitter.setStretchFactor(0, 9)
@@ -357,6 +370,7 @@ class BlueprintWorkspace(QWidget):
         self._refresh_room_lists()
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
+        self._sync_texture_creator_tab()
 
     def _build_uvs_tab(self) -> QWidget:
         uvs_tab = QWidget()
@@ -380,6 +394,10 @@ class BlueprintWorkspace(QWidget):
         self.unoccupied_uv_pixels_label = QLabel("Unoccupied pixels: 0")
         self.unoccupied_uv_pixels_label.setMinimumHeight(24)
         uv_controls_layout.addRow("", self.unoccupied_uv_pixels_label)
+
+        self.uv_aspect_ratio_label = QLabel("Aspect ratio: none")
+        self.uv_aspect_ratio_label.setMinimumHeight(24)
+        uv_controls_layout.addRow("", self.uv_aspect_ratio_label)
 
         optimize_layout = QHBoxLayout()
         optimize_layout.setContentsMargins(0, 0, 0, 0)
@@ -535,6 +553,47 @@ class BlueprintWorkspace(QWidget):
 
         images_layout.addLayout(image_buttons_layout)
         return images_tab
+
+    def _build_texture_creator_tab(self) -> QWidget:
+        self.texture_creator_tab = QWidget()
+        texture_layout = QVBoxLayout(self.texture_creator_tab)
+        texture_layout.setContentsMargins(10, 12, 10, 10)
+        texture_layout.setSpacing(12)
+
+        texture_label = QLabel("Wall texture")
+        texture_label.setStyleSheet("font-size: 18px; font-weight: 600;")
+        texture_layout.addWidget(texture_label)
+
+        self.texture_creator_wall_label = QLabel("Select a wall in Viewer")
+        self.texture_creator_wall_label.setWordWrap(True)
+        texture_layout.addWidget(self.texture_creator_wall_label)
+
+        self.texture_creator_aspect_ratio_label = QLabel("Aspect ratio: none")
+        self.texture_creator_aspect_ratio_label.setWordWrap(True)
+        texture_layout.addWidget(self.texture_creator_aspect_ratio_label)
+
+        self.texture_creator_resolution_label = QLabel("Resolutions: none")
+        self.texture_creator_resolution_label.setWordWrap(True)
+        texture_layout.addWidget(self.texture_creator_resolution_label)
+
+        texture_form_layout = QFormLayout()
+        texture_form_layout.setContentsMargins(0, 0, 0, 0)
+        texture_form_layout.setSpacing(8)
+
+        self.texture_image_combo = QComboBox()
+        self.texture_image_combo.setMinimumHeight(34)
+        self.texture_image_combo.currentIndexChanged.connect(
+            self._handle_texture_image_selection_changed
+        )
+        texture_form_layout.addRow("Image", self.texture_image_combo)
+        texture_layout.addLayout(texture_form_layout)
+
+        self.texture_creator_canvas = TextureCreatorCanvas()
+        self.texture_creator_canvas.texture_changed.connect(
+            self._handle_texture_creator_texture_changed
+        )
+        texture_layout.addWidget(self.texture_creator_canvas, 1)
+        return self.texture_creator_tab
 
     @staticmethod
     def _build_image_transform_spinbox(
@@ -770,7 +829,10 @@ class BlueprintWorkspace(QWidget):
             for library_path in self.image_library_paths
             if library_path != normalized_path
         ]
+        did_clear_textures = self._clear_wall_textures_using_image(normalized_path)
         self._refresh_image_thumbnail_list()
+        if did_clear_textures:
+            self._handle_texture_creator_texture_changed()
 
     def _get_image_file_path(self) -> str:
         file_path, _ = QFileDialog.getOpenFileName(
@@ -818,6 +880,7 @@ class BlueprintWorkspace(QWidget):
         self._refresh_rooms_list()
         self._refresh_uv_rooms_list()
         self._sync_uv_controls()
+        self._sync_texture_creator_tab()
 
     def _refresh_uv_rooms_list(self) -> None:
         selected_room_index = self._get_selected_uv_room_index()
@@ -874,6 +937,23 @@ class BlueprintWorkspace(QWidget):
 
         return self.current_level.rooms[room_index]
 
+    def _get_selected_uv_wall_placement(self) -> UvWallPlacement | None:
+        selected_room = self._get_selected_uv_room()
+        selected_wall_key = self.uv_canvas.get_selected_wall_key()
+        if selected_room is None or selected_wall_key is None:
+            return None
+
+        layout = build_uv_wall_layout(
+            room=selected_room,
+            vertex_data=self.current_level.vertex_data,
+            wall_height_meters=self.current_level.height_meters,
+        )
+        for placement in layout.placements:
+            if placement.wall.key == selected_wall_key:
+                return placement
+
+        return None
+
     def _refresh_image_thumbnail_list(
         self,
         selected_image_path: str | None = None,
@@ -893,6 +973,7 @@ class BlueprintWorkspace(QWidget):
         self._select_image_thumbnail_path(selected_image_path)
         self._is_syncing_image_library_controls = False
         self._sync_images_tab()
+        self._refresh_texture_image_combo()
 
     def _build_image_thumbnail_item(self, image_path: str) -> QListWidgetItem:
         image_name = Path(image_path).name
@@ -954,6 +1035,24 @@ class BlueprintWorkspace(QWidget):
 
         self.image_library_paths.append(normalized_path)
 
+    def _clear_wall_textures_using_image(self, image_path: str) -> bool:
+        normalized_path = str(Path(image_path).resolve())
+        did_clear_textures = False
+        for level in self.levels:
+            for room in level.rooms:
+                original_texture_count = len(room.wall_textures)
+                room.wall_textures = {
+                    wall_key: texture_data
+                    for wall_key, texture_data in room.wall_textures.items()
+                    if texture_data.image_path != normalized_path
+                }
+                did_clear_textures = (
+                    did_clear_textures
+                    or len(room.wall_textures) != original_texture_count
+                )
+
+        return did_clear_textures
+
     @staticmethod
     def _normalize_image_library_paths(image_paths: list[str]) -> list[str]:
         normalized_paths: list[str] = []
@@ -965,6 +1064,176 @@ class BlueprintWorkspace(QWidget):
             normalized_paths.append(normalized_path)
 
         return normalized_paths
+
+    def _refresh_texture_image_combo(
+        self,
+        selected_image_path: str | None = None,
+    ) -> None:
+        if not hasattr(self, "texture_image_combo"):
+            return
+
+        if selected_image_path is None:
+            selected_image_path = self._get_selected_texture_image_path()
+        if selected_image_path is None:
+            selected_image_path = self._get_texture_creator_saved_image_path()
+
+        has_wall = self._get_texture_creator_wall_placement() is not None
+        self.texture_image_combo.setEnabled(has_wall and bool(self.image_library_paths))
+        self._is_syncing_texture_controls = True
+        self.texture_image_combo.clear()
+        self.texture_image_combo.addItem("Select image", None)
+        for image_path in self.image_library_paths:
+            self.texture_image_combo.addItem(Path(image_path).name, image_path)
+
+        if selected_image_path is not None:
+            normalized_path = str(Path(selected_image_path).resolve())
+            for item_index in range(self.texture_image_combo.count()):
+                if self.texture_image_combo.itemData(item_index) != normalized_path:
+                    continue
+
+                self.texture_image_combo.setCurrentIndex(item_index)
+                break
+
+        self._is_syncing_texture_controls = False
+        self._sync_texture_creator_canvas()
+
+    def _get_selected_texture_image_path(self) -> str | None:
+        if not hasattr(self, "texture_image_combo"):
+            return None
+
+        image_path = self.texture_image_combo.currentData()
+        if image_path is None:
+            return None
+
+        return str(image_path)
+
+    def _get_texture_creator_saved_image_path(self) -> str | None:
+        selected_room = self._get_texture_creator_room()
+        if selected_room is None or self.texture_creator_wall_key is None:
+            return None
+
+        texture_data = selected_room.wall_textures.get(self.texture_creator_wall_key)
+        if texture_data is None:
+            return None
+
+        return texture_data.image_path
+
+    def _handle_viewer_wall_selected(
+        self,
+        level_index: int,
+        room_index: int,
+        wall_key: str,
+    ) -> None:
+        level_position = self._get_level_position_for_level_index(level_index)
+        if level_position is None:
+            return
+        if room_index < 0 or room_index >= len(self.levels[level_position].rooms):
+            return
+
+        self.texture_creator_level_index = level_position
+        self.texture_creator_room_index = room_index
+        self.texture_creator_wall_key = wall_key
+        if self.current_level_index != level_position:
+            self.current_level_index = level_position
+            self._sync_level_controls()
+            self._sync_canvas_to_current_level()
+            self._refresh_room_lists()
+
+        if self.uv_rooms_list.currentRow() != room_index:
+            self.uv_rooms_list.setCurrentRow(room_index)
+        self.uv_canvas.set_selected_wall_key(wall_key)
+        self._sync_uv_controls()
+        self._sync_texture_creator_tab()
+        self.side_tabs.setCurrentWidget(self.texture_creator_tab)
+
+    def _handle_texture_image_selection_changed(self, item_index: int) -> None:
+        if self._is_syncing_texture_controls:
+            return
+
+        self._sync_texture_creator_canvas()
+
+    def _handle_texture_creator_texture_changed(self) -> None:
+        self.uv_canvas.update()
+        self._schedule_viewer_preview_refresh()
+
+    def _sync_texture_creator_tab(self) -> None:
+        if not hasattr(self, "texture_creator_canvas"):
+            return
+
+        selected_room = self._get_texture_creator_room()
+        selected_placement = self._get_texture_creator_wall_placement()
+        has_wall = selected_room is not None and selected_placement is not None
+        self.texture_image_combo.setEnabled(has_wall and bool(self.image_library_paths))
+        if not has_wall:
+            self.texture_creator_wall_label.setText("Select a wall in Viewer")
+            self._update_texture_creator_aspect_ratio_label(None)
+            self._refresh_texture_image_combo(selected_image_path=None)
+            return
+
+        self.texture_creator_wall_label.setText(
+            f"{selected_room.name or 'Room'} - "
+            f"{selected_placement.wall.projection_direction} wall"
+        )
+        self._update_texture_creator_aspect_ratio_label(selected_placement)
+        self._refresh_texture_image_combo()
+
+    def _sync_texture_creator_canvas(self) -> None:
+        if not hasattr(self, "texture_creator_canvas"):
+            return
+
+        selected_room = self._get_texture_creator_room()
+        selected_placement = self._get_texture_creator_wall_placement()
+        selected_image_path = self._get_selected_texture_image_path()
+        if selected_room is None or selected_placement is None:
+            self.texture_creator_canvas.set_context(None, None, None, None)
+            return
+
+        self.texture_creator_canvas.set_context(
+            room=selected_room,
+            wall_key=selected_placement.wall.key,
+            wall_size=selected_placement.natural_size,
+            image_path=selected_image_path,
+        )
+
+    def _get_texture_creator_room(self) -> RoomData | None:
+        if self.texture_creator_level_index is None:
+            return None
+        if self.texture_creator_room_index is None:
+            return None
+        if self.texture_creator_level_index >= len(self.levels):
+            return None
+
+        level = self.levels[self.texture_creator_level_index]
+        if self.texture_creator_room_index >= len(level.rooms):
+            return None
+
+        return level.rooms[self.texture_creator_room_index]
+
+    def _get_texture_creator_wall_placement(self) -> UvWallPlacement | None:
+        selected_room = self._get_texture_creator_room()
+        if selected_room is None or self.texture_creator_wall_key is None:
+            return None
+        if self.texture_creator_level_index is None:
+            return None
+
+        selected_level = self.levels[self.texture_creator_level_index]
+        layout = build_uv_wall_layout(
+            room=selected_room,
+            vertex_data=selected_level.vertex_data,
+            wall_height_meters=selected_level.height_meters,
+        )
+        for placement in layout.placements:
+            if placement.wall.key == self.texture_creator_wall_key:
+                return placement
+
+        return None
+
+    def _get_level_position_for_level_index(self, level_index: int) -> int | None:
+        for level_position, level in enumerate(self.levels):
+            if level.index == level_index:
+                return level_position
+
+        return None
 
     def _sync_level_controls(self) -> None:
         self._is_syncing_level_controls = True
@@ -993,6 +1262,7 @@ class BlueprintWorkspace(QWidget):
             has_room and self.use_complex_optimization_radio.isChecked()
         )
         self.unoccupied_uv_pixels_label.setEnabled(has_room)
+        self.uv_aspect_ratio_label.setEnabled(has_room)
 
         if selected_room is None:
             self.uv_canvas.set_room_context(None, None, self.current_level.height_meters)
@@ -1003,6 +1273,7 @@ class BlueprintWorkspace(QWidget):
             self.uv_wall_rotation_spinbox.setValue(DEFAULT_WALL_UV_ROTATION_DEGREES)
             self.uv_wall_rotation_spinbox.setEnabled(False)
             self.unoccupied_uv_pixels_label.setText("Unoccupied pixels: 0")
+            self._update_uv_aspect_ratio_label(None)
             self._is_syncing_uv_controls = False
             return
 
@@ -1015,6 +1286,7 @@ class BlueprintWorkspace(QWidget):
         self.uv_map_height_spinbox.setValue(selected_room.uv_map_height)
 
         selected_wall_key = self.uv_canvas.get_selected_wall_key()
+        selected_placement = self._get_selected_uv_wall_placement()
         has_selected_wall = selected_wall_key is not None
         self.uv_wall_scale_spinbox.setEnabled(has_selected_wall)
         self.uv_wall_rotation_spinbox.setEnabled(has_selected_wall)
@@ -1036,6 +1308,7 @@ class BlueprintWorkspace(QWidget):
             )
 
         self._update_unoccupied_uv_pixels_label()
+        self._update_uv_aspect_ratio_label(selected_placement)
         self._is_syncing_uv_controls = False
 
     def _update_unoccupied_uv_pixels_label(self) -> None:
@@ -1051,6 +1324,25 @@ class BlueprintWorkspace(QWidget):
         )
         self.unoccupied_uv_pixels_label.setText(
             f"Unoccupied pixels: {unoccupied_pixels:,}"
+        )
+
+    def _update_uv_aspect_ratio_label(
+        self,
+        placement: UvWallPlacement | None,
+    ) -> None:
+        self.uv_aspect_ratio_label.setText(
+            _build_wall_aspect_ratio_text(placement)
+        )
+
+    def _update_texture_creator_aspect_ratio_label(
+        self,
+        placement: UvWallPlacement | None,
+    ) -> None:
+        self.texture_creator_aspect_ratio_label.setText(
+            _build_wall_aspect_ratio_text(placement)
+        )
+        self.texture_creator_resolution_label.setText(
+            _build_wall_resolution_text(placement)
         )
 
     def _handle_level_selection_changed(self, level_index: int) -> None:
@@ -1224,6 +1516,15 @@ class BlueprintWorkspace(QWidget):
         selected_room.wall_uv_positions.update(optimized_result.wall_uv_positions)
 
     def _handle_uv_wall_selected(self, wall_key: str) -> None:
+        if self.uv_canvas.get_selected_wall_key() != wall_key:
+            self.uv_canvas.set_selected_wall_key(wall_key)
+
+        selected_room_index = self._get_selected_uv_room_index()
+        if selected_room_index is not None:
+            self.texture_creator_level_index = self.current_level_index
+            self.texture_creator_room_index = selected_room_index
+            self.texture_creator_wall_key = wall_key
+            self._sync_texture_creator_tab()
         self._sync_uv_controls()
 
     def _handle_uv_values_changed(self) -> None:
@@ -1311,6 +1612,9 @@ class BlueprintWorkspace(QWidget):
             image_library_paths or []
         )
         self.current_level_index = min(max(current_level_index, 0), len(self.levels) - 1)
+        self.texture_creator_level_index = None
+        self.texture_creator_room_index = None
+        self.texture_creator_wall_key = None
 
         self._refresh_image_thumbnail_list()
         self._refresh_levels_list()
@@ -1453,6 +1757,46 @@ def _step_power_of_two_value(value: int, steps: int) -> int:
 
 def _normalize_degree_value(value: int) -> int:
     return int(value) % 360
+
+
+# ### Text helpers ###
+def _build_wall_aspect_ratio_text(placement: UvWallPlacement | None) -> str:
+    if placement is None:
+        return "Aspect ratio: none"
+
+    wall_width, wall_height = placement.natural_size
+    aspect_ratio = float(wall_width) / max(1.0, float(wall_height))
+    return f"Aspect ratio: {aspect_ratio:.3f}:1"
+
+
+def _build_wall_resolution_text(placement: UvWallPlacement | None) -> str:
+    if placement is None:
+        return "Resolutions: none"
+
+    wall_width, wall_height = placement.natural_size
+    aspect_ratio = float(wall_width) / max(1.0, float(wall_height))
+    resolution_lines = ["Suggested resolutions:"]
+    for detail_size in TEXTURE_CREATOR_DETAIL_SIZES:
+        resolution_width, resolution_height = _calculate_aspect_resolution(
+            aspect_ratio=aspect_ratio,
+            target_square_size=detail_size,
+        )
+        resolution_lines.append(
+            f"{detail_size} detail: {resolution_width} x {resolution_height}"
+        )
+
+    return "\n".join(resolution_lines)
+
+
+def _calculate_aspect_resolution(
+    aspect_ratio: float,
+    target_square_size: int,
+) -> tuple[int, int]:
+    target_area = float(target_square_size * target_square_size)
+    safe_aspect_ratio = max(0.01, float(aspect_ratio))
+    resolution_width = max(1, int(round((target_area * safe_aspect_ratio) ** 0.5)))
+    resolution_height = max(1, int(round((target_area / safe_aspect_ratio) ** 0.5)))
+    return resolution_width, resolution_height
 
 
 # ### Entrypoint helpers ###

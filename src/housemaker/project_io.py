@@ -15,6 +15,7 @@ from housemaker.models import (
     LevelData,
     RoomData,
     VertexData,
+    WallTextureData,
     create_default_levels,
 )
 
@@ -216,6 +217,7 @@ def _serialize_room(room: RoomData) -> dict[str, object]:
             str(wall_key): [float(wall_position[0]), float(wall_position[1])]
             for wall_key, wall_position in room.wall_uv_positions.items()
         },
+        "wall_textures": _serialize_wall_textures(room.wall_textures),
     }
 
 
@@ -259,6 +261,9 @@ def _deserialize_rooms(raw_rooms: object) -> list[RoomData]:
                 ),
                 wall_uv_positions=_deserialize_wall_uv_positions(
                     raw_room.get("wall_uv_positions", {})
+                ),
+                wall_textures=_deserialize_wall_textures(
+                    raw_room.get("wall_textures", {})
                 ),
             )
         )
@@ -306,3 +311,42 @@ def _normalize_wall_uv_rotation(raw_wall_rotation: object) -> int:
         return 0
 
     return rotation_degrees % 360
+
+
+def _serialize_wall_textures(
+    wall_textures: dict[str, WallTextureData],
+) -> dict[str, dict[str, object]]:
+    return {
+        str(wall_key): {
+            "image_path": _normalize_optional_path(texture_data.image_path),
+            "source_x": float(texture_data.source_x),
+            "source_y": float(texture_data.source_y),
+            "source_width": float(texture_data.source_width),
+            "source_height": float(texture_data.source_height),
+        }
+        for wall_key, texture_data in wall_textures.items()
+    }
+
+
+def _deserialize_wall_textures(raw_wall_textures: object) -> dict[str, WallTextureData]:
+    if not isinstance(raw_wall_textures, dict):
+        return {}
+
+    wall_textures: dict[str, WallTextureData] = {}
+    for wall_key, raw_texture in raw_wall_textures.items():
+        if not isinstance(raw_texture, dict):
+            continue
+
+        image_path = _normalize_optional_path(raw_texture.get("image_path"))
+        if image_path is None:
+            continue
+
+        wall_textures[str(wall_key)] = WallTextureData(
+            image_path=image_path,
+            source_x=float(raw_texture.get("source_x", 0.0)),
+            source_y=float(raw_texture.get("source_y", 0.0)),
+            source_width=max(1.0, float(raw_texture.get("source_width", 1.0))),
+            source_height=max(1.0, float(raw_texture.get("source_height", 1.0))),
+        )
+
+    return wall_textures

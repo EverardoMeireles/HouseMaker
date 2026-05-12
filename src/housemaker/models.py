@@ -46,6 +46,16 @@ class RoomData:
     wall_uv_scales: dict[str, float] = field(default_factory=dict)
     wall_uv_rotations: dict[str, int] = field(default_factory=dict)
     wall_uv_positions: dict[str, tuple[float, float]] = field(default_factory=dict)
+    wall_textures: dict[str, "WallTextureData"] = field(default_factory=dict)
+
+
+@dataclass
+class WallTextureData:
+    image_path: str
+    source_x: float
+    source_y: float
+    source_width: float
+    source_height: float
 
 
 @dataclass

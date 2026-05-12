@@ -24,6 +24,7 @@ from housemaker.models import (
     Vertex,
     VertexData,
 )
+from housemaker.texture_mapping import paint_wall_texture_crop
 from housemaker.uv_layout import (
     UvLayout,
     UvWallPlacement,
@@ -74,6 +75,9 @@ class NamedMesh:
 
 @dataclass(frozen=True)
 class PreviewTexturedWall:
+    level_index: int
+    room_index: int
+    wall_key: str
     start_point: tuple[float, float, float]
     end_point: tuple[float, float, float]
     height_meters: float
@@ -431,7 +435,7 @@ def _build_room_texture_image(room: RoomData, layout: UvLayout) -> QImage:
     painter = QPainter(image)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     for placement in layout.placements:
-        _paint_room_texture_wall(painter, placement)
+        _paint_room_texture_wall(painter, room, placement)
 
     if layout.hidden_wall_count > 0:
         _paint_room_texture_hidden_indicator(
@@ -458,6 +462,7 @@ def _ensure_qt_application() -> None:
 # ### Texture helpers ###
 def _paint_room_texture_wall(
     painter: QPainter,
+    room: RoomData,
     placement: UvWallPlacement,
 ) -> None:
     uv_x, uv_y, uv_width, uv_height = placement.uv_rect
@@ -472,17 +477,27 @@ def _paint_room_texture_wall(
     painter.save()
     painter.translate(uv_x + uv_width / 2.0, uv_y + uv_height / 2.0)
     painter.rotate(placement.rotation_degrees)
-    painter.setPen(QPen(ROOM_TEXTURE_WALL_BORDER_COLOR, ROOM_TEXTURE_WALL_BORDER_WIDTH))
-    painter.setBrush(ROOM_TEXTURE_WALL_FILL_COLOR)
-    painter.drawRect(texture_rect)
-
-    painter.setPen(QPen(ROOM_TEXTURE_TEXT_COLOR))
-    painter.setFont(QFont("Segoe UI", _get_room_texture_label_font_size(texture_rect)))
-    painter.drawText(
-        texture_rect,
-        int(Qt.AlignmentFlag.AlignCenter),
-        f"{placement.wall.projection_direction}\n{placement.rotation_degrees} deg",
+    texture_data = room.wall_textures.get(placement.wall.key)
+    did_paint_texture = (
+        texture_data is not None
+        and paint_wall_texture_crop(painter, texture_data, texture_rect)
     )
+
+    painter.setPen(QPen(ROOM_TEXTURE_WALL_BORDER_COLOR, ROOM_TEXTURE_WALL_BORDER_WIDTH))
+    painter.setBrush(
+        Qt.BrushStyle.NoBrush if did_paint_texture else ROOM_TEXTURE_WALL_FILL_COLOR
+    )
+    painter.drawRect(texture_rect)
+    if not did_paint_texture:
+        painter.setPen(QPen(ROOM_TEXTURE_TEXT_COLOR))
+        painter.setFont(
+            QFont("Segoe UI", _get_room_texture_label_font_size(texture_rect))
+        )
+        painter.drawText(
+            texture_rect,
+            int(Qt.AlignmentFlag.AlignCenter),
+            f"{placement.wall.projection_direction}\n{placement.rotation_degrees} deg",
+        )
     painter.restore()
 
 
@@ -546,7 +561,10 @@ def _qimage_to_gl_rgba_array(image: QImage) -> np.ndarray:
     return np.flip(np.swapaxes(image_array, 0, 1), axis=1).copy()
 
 
-def _build_wall_preview_texture(placement: UvWallPlacement) -> np.ndarray:
+def _build_wall_preview_texture(
+    room: RoomData,
+    placement: UvWallPlacement,
+) -> np.ndarray:
     _ensure_qt_application()
     wall_width, wall_height = placement.natural_size
     texture_width = max(1, int(math.ceil(wall_width)))
@@ -566,16 +584,26 @@ def _build_wall_preview_texture(placement: UvWallPlacement) -> np.ndarray:
         max(1.0, texture_width - 1.0),
         max(1.0, texture_height - 1.0),
     )
-    painter.setPen(QPen(ROOM_TEXTURE_WALL_BORDER_COLOR, ROOM_TEXTURE_WALL_BORDER_WIDTH))
-    painter.setBrush(ROOM_TEXTURE_WALL_FILL_COLOR)
-    painter.drawRect(texture_rect)
-    painter.setPen(QPen(ROOM_TEXTURE_TEXT_COLOR))
-    painter.setFont(QFont("Segoe UI", _get_room_texture_label_font_size(texture_rect)))
-    painter.drawText(
-        texture_rect,
-        int(Qt.AlignmentFlag.AlignCenter),
-        f"{placement.wall.projection_direction}\n{placement.rotation_degrees} deg",
+    texture_data = room.wall_textures.get(placement.wall.key)
+    did_paint_texture = (
+        texture_data is not None
+        and paint_wall_texture_crop(painter, texture_data, texture_rect)
     )
+    painter.setPen(QPen(ROOM_TEXTURE_WALL_BORDER_COLOR, ROOM_TEXTURE_WALL_BORDER_WIDTH))
+    painter.setBrush(
+        Qt.BrushStyle.NoBrush if did_paint_texture else ROOM_TEXTURE_WALL_FILL_COLOR
+    )
+    painter.drawRect(texture_rect)
+    if not did_paint_texture:
+        painter.setPen(QPen(ROOM_TEXTURE_TEXT_COLOR))
+        painter.setFont(
+            QFont("Segoe UI", _get_room_texture_label_font_size(texture_rect))
+        )
+        painter.drawText(
+            texture_rect,
+            int(Qt.AlignmentFlag.AlignCenter),
+            f"{placement.wall.projection_direction}\n{placement.rotation_degrees} deg",
+        )
     painter.end()
     return _qimage_to_gl_rgba_array(image)
 
@@ -672,7 +700,7 @@ def _build_level_preview_textured_walls(
     blueprint_size_pixels: tuple[float, float] | None,
 ) -> list[PreviewTexturedWall]:
     preview_walls: list[PreviewTexturedWall] = []
-    for room in level.rooms:
+    for room_index, room in enumerate(level.rooms):
         layout = build_uv_wall_layout(
             room=room,
             vertex_data=level.vertex_data,
@@ -692,6 +720,9 @@ def _build_level_preview_textured_walls(
             )
             preview_walls.append(
                 PreviewTexturedWall(
+                    level_index=level.index,
+                    room_index=room_index,
+                    wall_key=placement.wall.key,
                     start_point=(
                         float(start_xy[0]),
                         float(start_xy[1]),
@@ -703,7 +734,7 @@ def _build_level_preview_textured_walls(
                         base_z_meters,
                     ),
                     height_meters=float(level.height_meters),
-                    texture_rgba=_build_wall_preview_texture(placement),
+                    texture_rgba=_build_wall_preview_texture(room, placement),
                 )
             )
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import numpy as np
 from pyqtgraph import Transform3D
 import pyqtgraph.opengl as gl
+from PySide6.QtCore import QPointF, Qt, Signal
 from PySide6.QtGui import QVector3D
 from PySide6.QtWidgets import QVBoxLayout, QWidget
 
@@ -14,15 +15,56 @@ EDGE_COLOR = (0.12, 0.12, 0.16, 1.0)
 FACE_COLOR = np.array([0.78, 0.80, 0.84, 1.0], dtype=float)
 TEXTURE_PREVIEW_OFFSET_METERS = 0.01
 CAMERA_STATE_KEYS = ("center", "distance", "elevation", "azimuth", "fov")
+CLICK_SELECTION_TOLERANCE = 4.0
 
 # ### Widgets ###
+class SelectableGLViewWidget(gl.GLViewWidget):
+    items_clicked = Signal(object)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.click_press_position = QPointF()
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        self.click_press_position = event.position()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and _get_point_distance(self.click_press_position, event.position())
+            <= CLICK_SELECTION_TOLERANCE
+        ):
+            clicked_items = self._get_clicked_items(event.position())
+            if clicked_items:
+                self.items_clicked.emit(clicked_items)
+
+        super().mouseReleaseEvent(event)
+
+    def _get_clicked_items(self, position: QPointF) -> list[object]:
+        region_size = int(CLICK_SELECTION_TOLERANCE * 2.0)
+        region = (
+            int(position.x() - CLICK_SELECTION_TOLERANCE),
+            int(position.y() - CLICK_SELECTION_TOLERANCE),
+            region_size,
+            region_size,
+        )
+        try:
+            return list(self.itemsAt(region))
+        except Exception:
+            return []
+
+
 class GlbViewerWidget(QWidget):
+    wall_selected = Signal(int, int, str)
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.model: GeneratedModel | None = None
         self.grid_item: gl.GLGridItem | None = None
         self.mesh_item: gl.GLMeshItem | None = None
         self.textured_wall_items: list[gl.GLImageItem] = []
+        self.wall_by_item_id: dict[int, PreviewTexturedWall] = {}
 
         self._build_ui()
         self._populate_scene()
@@ -32,8 +74,9 @@ class GlbViewerWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        self.view = gl.GLViewWidget()
+        self.view = SelectableGLViewWidget()
         self.view.setBackgroundColor((24, 24, 28))
+        self.view.items_clicked.connect(self._handle_view_items_clicked)
         layout.addWidget(self.view, 1)
 
     def set_model(self, model: GeneratedModel, preserve_camera: bool = False) -> None:
@@ -122,6 +165,20 @@ class GlbViewerWidget(QWidget):
         )
         self.view.addItem(image_item)
         self.textured_wall_items.append(image_item)
+        self.wall_by_item_id[id(image_item)] = textured_wall
+
+    def _handle_view_items_clicked(self, clicked_items: list[object]) -> None:
+        for clicked_item in clicked_items:
+            textured_wall = self.wall_by_item_id.get(id(clicked_item))
+            if textured_wall is None:
+                continue
+
+            self.wall_selected.emit(
+                textured_wall.level_index,
+                textured_wall.room_index,
+                textured_wall.wall_key,
+            )
+            return
 
     def _set_default_camera(self) -> None:
         self.view.opts["center"] = QVector3D(0.0, 0.0, 0.0)
@@ -135,6 +192,7 @@ class GlbViewerWidget(QWidget):
         self.grid_item = None
         self.mesh_item = None
         self.textured_wall_items = []
+        self.wall_by_item_id = {}
 
     def _capture_camera_state(self) -> dict[str, object]:
         camera_state: dict[str, object] = {}
@@ -194,3 +252,8 @@ def _build_textured_wall_transform(
             [0.0, 0.0, 0.0, 1.0],
         ]
     )
+
+
+def _get_point_distance(first_point: QPointF, second_point: QPointF) -> float:
+    delta = first_point - second_point
+    return float((delta.x() ** 2 + delta.y() ** 2) ** 0.5)

@@ -8,6 +8,7 @@ from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QWidget
 
 from housemaker.models import DEFAULT_WALL_UV_SCALE, RoomData, VertexData
+from housemaker.texture_mapping import paint_wall_texture_crop
 from housemaker.uv_layout import (
     UvWallPlacement,
     build_uv_wall_layout,
@@ -383,8 +384,15 @@ class UvCanvas(QWidget):
             painter.save()
             painter.translate(widget_rect.center())
             painter.rotate(placement.rotation_degrees)
+            texture_data = self.room.wall_textures.get(placement.wall.key)
+            did_paint_texture = (
+                texture_data is not None
+                and paint_wall_texture_crop(painter, texture_data, wall_widget_rect)
+            )
             painter.setPen(QPen(UV_WALL_BORDER_COLOR, 2.0))
-            painter.setBrush(UV_WALL_FILL_COLOR)
+            painter.setBrush(
+                Qt.BrushStyle.NoBrush if did_paint_texture else UV_WALL_FILL_COLOR
+            )
             painter.drawRect(wall_widget_rect)
 
             if placement.wall.key == self.selected_wall_key:
@@ -392,16 +400,17 @@ class UvCanvas(QWidget):
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawRect(wall_widget_rect.adjusted(2.0, 2.0, -2.0, -2.0))
 
-            painter.setPen(QPen(UV_DARK_TEXT_COLOR))
-            label_text = (
-                f"{placement.wall.projection_direction}\n"
-                f"{placement.rotation_degrees} deg"
-            )
-            painter.drawText(
-                wall_widget_rect,
-                int(Qt.AlignmentFlag.AlignCenter),
-                label_text,
-            )
+            if not did_paint_texture:
+                painter.setPen(QPen(UV_DARK_TEXT_COLOR))
+                label_text = (
+                    f"{placement.wall.projection_direction}\n"
+                    f"{placement.rotation_degrees} deg"
+                )
+                painter.drawText(
+                    wall_widget_rect,
+                    int(Qt.AlignmentFlag.AlignCenter),
+                    label_text,
+                )
             painter.restore()
 
     def _paint_hidden_wall_indicator(
