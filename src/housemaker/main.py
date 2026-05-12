@@ -417,14 +417,17 @@ class BlueprintWorkspace(QWidget):
         optimize_layout.addWidget(self.optimize_all_uv_button, 1)
 
         self.uv_optimization_mode_group = QButtonGroup(self)
-        self.uv_optimization_mode_group.setExclusive(False)
+        self.uv_optimization_mode_group.setExclusive(True)
+        self.basic_optimization_radio = QRadioButton("Basic")
         self.free_placement_radio = QRadioButton("Free placement")
         self.subdivision_optimization_radio = QRadioButton("Subdivision")
-        self.free_placement_radio.setAutoExclusive(False)
-        self.subdivision_optimization_radio.setAutoExclusive(False)
+        self.uv_optimization_mode_group.addButton(self.basic_optimization_radio)
         self.uv_optimization_mode_group.addButton(self.free_placement_radio)
         self.uv_optimization_mode_group.addButton(
             self.subdivision_optimization_radio
+        )
+        self.basic_optimization_radio.toggled.connect(
+            self._handle_optimization_mode_toggled
         )
         self.free_placement_radio.toggled.connect(
             self._handle_optimization_mode_toggled
@@ -432,6 +435,8 @@ class BlueprintWorkspace(QWidget):
         self.subdivision_optimization_radio.toggled.connect(
             self._handle_optimization_mode_toggled
         )
+        self.subdivision_optimization_radio.setChecked(True)
+        optimize_layout.addWidget(self.basic_optimization_radio)
         optimize_layout.addWidget(self.free_placement_radio)
         optimize_layout.addWidget(self.subdivision_optimization_radio)
         uv_controls_layout.addRow("", optimize_layout)
@@ -1269,6 +1274,7 @@ class BlueprintWorkspace(QWidget):
         self.optimize_uv_button.setEnabled(has_room)
         self.optimize_all_uv_button.setEnabled(has_room)
         self.reset_uv_defaults_button.setEnabled(has_room)
+        self.basic_optimization_radio.setEnabled(has_room)
         self.free_placement_radio.setEnabled(has_room)
         self.subdivision_optimization_radio.setEnabled(has_room)
         self.complex_optimization_passes_spinbox.setEnabled(
@@ -1413,11 +1419,8 @@ class BlueprintWorkspace(QWidget):
         self._sync_uv_controls()
 
     def _handle_optimization_mode_toggled(self, checked: bool) -> None:
-        sender = self.sender()
-        if checked and sender == self.free_placement_radio:
-            self.subdivision_optimization_radio.setChecked(False)
-        elif checked and sender == self.subdivision_optimization_radio:
-            self.free_placement_radio.setChecked(False)
+        if not hasattr(self, "uv_rooms_list"):
+            return
 
         selected_room = self._get_selected_uv_room()
         self.complex_optimization_passes_spinbox.setEnabled(
