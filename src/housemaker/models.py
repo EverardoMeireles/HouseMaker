@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 
 # ### Constants ###
 DEFAULT_LEVEL_HEIGHT_METERS = 3.0
+DEFAULT_ROOM_HEIGHT_METERS = 3.0
 DEFAULT_IMAGE_SCALE = 1.0
 DEFAULT_IMAGE_OFFSET = 0.0
 DEFAULT_INCLUDE_IN_EXPORT = True
@@ -41,6 +42,7 @@ class RoomData:
     vertex_ids: tuple[int, ...]
     center_vertex_id: int
     color_rgb: tuple[int, int, int]
+    height_meters: float = DEFAULT_ROOM_HEIGHT_METERS
     uv_map_width: int = DEFAULT_UV_MAP_WIDTH
     uv_map_height: int = DEFAULT_UV_MAP_HEIGHT
     wall_uv_scales: dict[str, float] = field(default_factory=dict)

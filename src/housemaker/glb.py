@@ -164,7 +164,7 @@ def export_room_texture_pngs(
             layout = build_uv_wall_layout(
                 room=room,
                 vertex_data=level.vertex_data,
-                wall_height_meters=level.height_meters,
+                wall_height_meters=room.height_meters,
             )
             texture_path = export_directory / _get_room_texture_file_name(
                 level=level,
@@ -284,6 +284,12 @@ def _build_room_named_meshes(
 ) -> list[NamedMesh]:
     named_meshes: list[NamedMesh] = []
     for room_index, room in enumerate(level.rooms):
+        if room.height_meters <= 0.0:
+            raise ValueError(
+                f"Room {room.name or room_index + 1} height must be greater "
+                "than zero."
+            )
+
         room_mesh = _build_room_mesh(
             level=level,
             room=room,
@@ -353,7 +359,7 @@ def _build_room_mesh(
     layout = build_uv_wall_layout(
         room=room,
         vertex_data=level.vertex_data,
-        wall_height_meters=level.height_meters,
+        wall_height_meters=room.height_meters,
     )
     placements_by_key = _group_wall_placements_by_key(layout.placements)
     material = _build_room_material(level, room, room_index, layout)
@@ -367,7 +373,7 @@ def _build_room_mesh(
             wall_vertices = _build_wall_vertices_from_points(
                 start_point=wall.start_point,
                 end_point=wall.end_point,
-                wall_height_meters=level.height_meters,
+                wall_height_meters=room.height_meters,
                 base_z_meters=base_z_meters,
                 blueprint_size_pixels=blueprint_size_pixels,
             )
@@ -388,7 +394,7 @@ def _build_room_mesh(
             wall_vertices = _build_wall_vertices_from_points(
                 start_point=segment_start_point,
                 end_point=segment_end_point,
-                wall_height_meters=level.height_meters,
+                wall_height_meters=room.height_meters,
                 base_z_meters=base_z_meters,
                 blueprint_size_pixels=blueprint_size_pixels,
             )
@@ -767,7 +773,7 @@ def _build_level_preview_textured_walls(
         layout = build_uv_wall_layout(
             room=room,
             vertex_data=level.vertex_data,
-            wall_height_meters=level.height_meters,
+            wall_height_meters=room.height_meters,
         )
         if not layout.placements:
             continue
@@ -800,7 +806,7 @@ def _build_level_preview_textured_walls(
                         float(end_xy[1]),
                         base_z_meters,
                     ),
-                    height_meters=float(level.height_meters),
+                    height_meters=float(room.height_meters),
                     texture_rgba=_build_wall_preview_texture(room, placement),
                 )
             )

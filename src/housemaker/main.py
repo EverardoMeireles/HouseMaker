@@ -42,6 +42,7 @@ from housemaker.glb import (
 from housemaker.models import (
     DEFAULT_IMAGE_OFFSET,
     DEFAULT_IMAGE_SCALE,
+    DEFAULT_ROOM_HEIGHT_METERS,
     DEFAULT_UV_MAP_HEIGHT,
     DEFAULT_UV_MAP_WIDTH,
     DEFAULT_WALL_UV_ROTATION_DEGREES,
@@ -143,6 +144,7 @@ class BlueprintWorkspace(QWidget):
         self.image_library_paths: list[str] = []
         self.current_level_index = GROUND_LEVEL_INDEX
         self._is_syncing_level_controls = False
+        self._is_syncing_room_controls = False
         self._is_syncing_image_library_controls = False
         self._is_syncing_texture_controls = False
         self._is_syncing_uv_controls = False
@@ -304,6 +306,7 @@ class BlueprintWorkspace(QWidget):
         side_layout.addWidget(rooms_label)
 
         self.rooms_list = QListWidget()
+        self.rooms_list.currentRowChanged.connect(self._handle_room_selection_changed)
         side_layout.addWidget(self.rooms_list, 1)
 
         self.delete_room_shortcut = QShortcut(
@@ -323,6 +326,18 @@ class BlueprintWorkspace(QWidget):
         self.room_name_field.setPlaceholderText("Room name")
         self.room_name_field.setMinimumHeight(34)
         room_layout.addRow("Room name", self.room_name_field)
+
+        self.room_height_spinbox = QDoubleSpinBox()
+        self.room_height_spinbox.setRange(0.1, 100.0)
+        self.room_height_spinbox.setDecimals(2)
+        self.room_height_spinbox.setSingleStep(0.1)
+        self.room_height_spinbox.setValue(DEFAULT_ROOM_HEIGHT_METERS)
+        self.room_height_spinbox.setSuffix(" m")
+        self.room_height_spinbox.setMinimumHeight(34)
+        self.room_height_spinbox.valueChanged.connect(
+            self._handle_room_height_changed
+        )
+        room_layout.addRow("Room height", self.room_height_spinbox)
         side_layout.addLayout(room_layout)
 
         self.designate_room_button = QPushButton("Designate room")
@@ -881,9 +896,10 @@ class BlueprintWorkspace(QWidget):
 
     def _refresh_rooms_list(self) -> None:
         selected_room_index = self._get_selected_room_index()
+        self._is_syncing_room_controls = True
         self.rooms_list.clear()
         for room_index, room in enumerate(self.current_level.rooms):
-            room_item = self._build_room_item(room_index, room.name)
+            room_item = self._build_room_item(room_index, room)
             self.rooms_list.addItem(room_item)
 
         if (
@@ -891,6 +907,8 @@ class BlueprintWorkspace(QWidget):
             and selected_room_index < self.rooms_list.count()
         ):
             self.rooms_list.setCurrentRow(selected_room_index)
+        self._is_syncing_room_controls = False
+        self._sync_room_controls()
 
     def _refresh_room_lists(self) -> None:
         self._refresh_rooms_list()
@@ -902,7 +920,7 @@ class BlueprintWorkspace(QWidget):
         selected_room_index = self._get_selected_uv_room_index()
         self.uv_rooms_list.clear()
         for room_index, room in enumerate(self.current_level.rooms):
-            room_item = self._build_room_item(room_index, room.name)
+            room_item = self._build_room_item(room_index, room)
             self.uv_rooms_list.addItem(room_item)
 
         if self.uv_rooms_list.count() == 0:
@@ -919,8 +937,9 @@ class BlueprintWorkspace(QWidget):
 
         self.uv_rooms_list.setCurrentRow(self.uv_rooms_list.count() - 1)
 
-    def _build_room_item(self, room_index: int, room_name: str) -> QListWidgetItem:
-        room_item = QListWidgetItem(room_name)
+    def _build_room_item(self, room_index: int, room: RoomData) -> QListWidgetItem:
+        room_name = room.name or "Room"
+        room_item = QListWidgetItem(f"{room_name} ({room.height_meters:.2f} m)")
         room_item.setData(Qt.ItemDataRole.UserRole, room_index)
         return room_item
 
@@ -934,6 +953,13 @@ class BlueprintWorkspace(QWidget):
             return None
 
         return int(room_index)
+
+    def _get_selected_room(self) -> RoomData | None:
+        room_index = self._get_selected_room_index()
+        if room_index is None or room_index >= len(self.current_level.rooms):
+            return None
+
+        return self.current_level.rooms[room_index]
 
     def _get_selected_uv_room_index(self) -> int | None:
         selected_item = self.uv_rooms_list.currentItem()
@@ -962,7 +988,7 @@ class BlueprintWorkspace(QWidget):
         layout = build_uv_wall_layout(
             room=selected_room,
             vertex_data=self.current_level.vertex_data,
-            wall_height_meters=self.current_level.height_meters,
+            wall_height_meters=selected_room.height_meters,
         )
         for placement in layout.placements:
             if placement.wall.key == selected_wall_key:
@@ -1157,6 +1183,8 @@ class BlueprintWorkspace(QWidget):
 
         if self.uv_rooms_list.currentRow() != room_index:
             self.uv_rooms_list.setCurrentRow(room_index)
+        if self.rooms_list.currentRow() != room_index:
+            self.rooms_list.setCurrentRow(room_index)
         self.uv_canvas.set_selected_wall_key(wall_key)
         self._sync_uv_controls()
         self._sync_texture_creator_tab()
@@ -1237,7 +1265,7 @@ class BlueprintWorkspace(QWidget):
         layout = build_uv_wall_layout(
             room=selected_room,
             vertex_data=selected_level.vertex_data,
-            wall_height_meters=selected_level.height_meters,
+            wall_height_meters=selected_room.height_meters,
         )
         for placement in layout.placements:
             if placement.wall.key == self.texture_creator_wall_key:
@@ -1265,6 +1293,15 @@ class BlueprintWorkspace(QWidget):
         self._update_blueprint_name_label()
         self._is_syncing_level_controls = False
 
+    def _sync_room_controls(self) -> None:
+        selected_room = self._get_selected_room()
+        self._is_syncing_room_controls = True
+        if selected_room is None:
+            self.room_height_spinbox.setValue(DEFAULT_ROOM_HEIGHT_METERS)
+        else:
+            self.room_height_spinbox.setValue(selected_room.height_meters)
+        self._is_syncing_room_controls = False
+
     def _sync_uv_controls(self) -> None:
         self._is_syncing_uv_controls = True
         selected_room = self._get_selected_uv_room()
@@ -1284,7 +1321,7 @@ class BlueprintWorkspace(QWidget):
         self.uv_aspect_ratio_label.setEnabled(has_room)
 
         if selected_room is None:
-            self.uv_canvas.set_room_context(None, None, self.current_level.height_meters)
+            self.uv_canvas.set_room_context(None, None, DEFAULT_ROOM_HEIGHT_METERS)
             self.uv_map_width_spinbox.setValue(DEFAULT_UV_MAP_WIDTH)
             self.uv_map_height_spinbox.setValue(DEFAULT_UV_MAP_HEIGHT)
             self.uv_wall_scale_spinbox.setValue(DEFAULT_WALL_UV_SCALE)
@@ -1299,7 +1336,7 @@ class BlueprintWorkspace(QWidget):
         self.uv_canvas.set_room_context(
             selected_room,
             self.current_level.vertex_data,
-            self.current_level.height_meters,
+            selected_room.height_meters,
         )
         self.uv_map_width_spinbox.setValue(selected_room.uv_map_width)
         self.uv_map_height_spinbox.setValue(selected_room.uv_map_height)
@@ -1339,7 +1376,7 @@ class BlueprintWorkspace(QWidget):
         unoccupied_pixels = calculate_unoccupied_uv_pixels(
             room=selected_room,
             vertex_data=self.current_level.vertex_data,
-            wall_height_meters=self.current_level.height_meters,
+            wall_height_meters=selected_room.height_meters,
         )
         self.unoccupied_uv_pixels_label.setText(
             f"Unoccupied pixels: {unoccupied_pixels:,}"
@@ -1365,7 +1402,11 @@ class BlueprintWorkspace(QWidget):
         )
 
     def _handle_level_selection_changed(self, level_index: int) -> None:
-        if self._is_syncing_level_controls or level_index < 0 or level_index >= len(self.levels):
+        if (
+            self._is_syncing_level_controls
+            or level_index < 0
+            or level_index >= len(self.levels)
+        ):
             return
 
         self.current_level_index = level_index
@@ -1374,14 +1415,31 @@ class BlueprintWorkspace(QWidget):
         self._refresh_room_lists()
         self._schedule_viewer_preview_refresh()
 
+    def _handle_room_selection_changed(self, _room_index: int) -> None:
+        if self._is_syncing_room_controls:
+            return
+
+        self._sync_room_controls()
+
     def _handle_height_level_changed(self, value: float) -> None:
         if self._is_syncing_level_controls:
             return
 
         self.current_level.height_meters = value
-        for room in self.current_level.rooms:
-            self._refresh_room_subdivision_layout(room)
-        self._sync_uv_controls()
+        self._schedule_viewer_preview_refresh()
+
+    def _handle_room_height_changed(self, value: float) -> None:
+        if self._is_syncing_room_controls:
+            return
+
+        selected_room = self._get_selected_room()
+        if selected_room is None:
+            return
+
+        selected_room.height_meters = float(value)
+        self._refresh_room_subdivision_layout(selected_room)
+        self._refresh_room_lists()
+        self.uv_canvas.update()
         self._schedule_viewer_preview_refresh()
 
     def _handle_image_scale_changed(self, value: float) -> None:
@@ -1527,7 +1585,7 @@ class BlueprintWorkspace(QWidget):
         return optimize_room_wall_uvs(
             room=room,
             vertex_data=self.current_level.vertex_data,
-            wall_height_meters=self.current_level.height_meters,
+            wall_height_meters=room.height_meters,
             use_complex_optimization=(
                 self.free_placement_radio.isChecked()
             ),
@@ -1559,7 +1617,7 @@ class BlueprintWorkspace(QWidget):
         optimized_result = rebuild_room_subdivision_uvs(
             room=room,
             vertex_data=self.current_level.vertex_data,
-            wall_height_meters=self.current_level.height_meters,
+            wall_height_meters=room.height_meters,
         )
         if optimized_result is None:
             return
@@ -1632,7 +1690,7 @@ class BlueprintWorkspace(QWidget):
         self.canvas.start_room_designation(
             room_name,
             selected_vertex_ids,
-            self.current_level.height_meters,
+            self.room_height_spinbox.value(),
         )
         QMessageBox.information(
             self,

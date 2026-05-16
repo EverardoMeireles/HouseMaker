@@ -9,6 +9,7 @@ from housemaker.models import (
     DEFAULT_INCLUDE_IN_EXPORT,
     DEFAULT_IMAGE_OFFSET,
     DEFAULT_IMAGE_SCALE,
+    DEFAULT_ROOM_HEIGHT_METERS,
     DEFAULT_UV_MAP_HEIGHT,
     DEFAULT_UV_MAP_WIDTH,
     GROUND_LEVEL_INDEX,
@@ -119,7 +120,10 @@ def load_project(path: str | Path) -> ProjectData:
             raw_level.get("include_in_export", DEFAULT_INCLUDE_IN_EXPORT)
         )
         level.vertex_data = VertexData.from_dict(raw_level.get("vertex_data", {}))
-        level.rooms = _deserialize_rooms(raw_level.get("rooms", []))
+        level.rooms = _deserialize_rooms(
+            raw_level.get("rooms", []),
+            default_height_meters=level.height_meters,
+        )
 
     image_library_paths = _deserialize_image_library_paths(
         payload.get("image_library_paths", [])
@@ -203,6 +207,7 @@ def _serialize_room(room: RoomData) -> dict[str, object]:
         "vertex_ids": [int(vertex_id) for vertex_id in room.vertex_ids],
         "center_vertex_id": int(room.center_vertex_id),
         "color_rgb": [int(color_value) for color_value in room.color_rgb],
+        "height_meters": float(room.height_meters),
         "uv_map_width": int(room.uv_map_width),
         "uv_map_height": int(room.uv_map_height),
         "wall_uv_scales": {
@@ -231,7 +236,10 @@ def _serialize_room(room: RoomData) -> dict[str, object]:
     }
 
 
-def _deserialize_rooms(raw_rooms: object) -> list[RoomData]:
+def _deserialize_rooms(
+    raw_rooms: object,
+    default_height_meters: float = DEFAULT_ROOM_HEIGHT_METERS,
+) -> list[RoomData]:
     if not isinstance(raw_rooms, list):
         return []
 
@@ -256,6 +264,10 @@ def _deserialize_rooms(raw_rooms: object) -> list[RoomData]:
                     int(raw_color[0]),
                     int(raw_color[1]),
                     int(raw_color[2]),
+                ),
+                height_meters=_deserialize_room_height_meters(
+                    raw_room.get("height_meters", default_height_meters),
+                    default_height_meters,
                 ),
                 uv_map_width=int(
                     raw_room.get("uv_map_width", DEFAULT_UV_MAP_WIDTH)
@@ -290,6 +302,21 @@ def _deserialize_rooms(raw_rooms: object) -> list[RoomData]:
         )
 
     return rooms
+
+
+def _deserialize_room_height_meters(
+    raw_height_meters: object,
+    default_height_meters: float,
+) -> float:
+    try:
+        height_meters = float(raw_height_meters)
+    except (TypeError, ValueError):
+        return max(0.1, float(default_height_meters))
+
+    if height_meters <= 0.0:
+        return max(0.1, float(default_height_meters))
+
+    return height_meters
 
 
 def _deserialize_wall_uv_scales(raw_wall_uv_scales: object) -> dict[str, float]:

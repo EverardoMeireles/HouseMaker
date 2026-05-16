@@ -7,7 +7,12 @@ from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QWidget
 
-from housemaker.models import DEFAULT_WALL_UV_SCALE, RoomData, VertexData
+from housemaker.models import (
+    DEFAULT_ROOM_HEIGHT_METERS,
+    DEFAULT_WALL_UV_SCALE,
+    RoomData,
+    VertexData,
+)
 from housemaker.texture_mapping import paint_wall_texture_crop
 from housemaker.uv_layout import (
     UvWallPlacement,
@@ -40,7 +45,7 @@ class UvCanvas(QWidget):
         super().__init__(parent)
         self.room: RoomData | None = None
         self.vertex_data: VertexData | None = None
-        self.wall_height_meters = 3.0
+        self.wall_height_meters = DEFAULT_ROOM_HEIGHT_METERS
         self.selected_wall_key: str | None = None
         self.drag_mode: str | None = None
         self.drag_wall_key: str | None = None
