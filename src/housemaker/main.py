@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QListView,
+    QDialog,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -64,6 +65,12 @@ from housemaker.uv_layout import (
     rebuild_room_subdivision_uvs,
 )
 from housemaker.viewer import GlbViewerWidget
+from housemaker.manual_stitching import (
+    VIDEO_FILE_FILTER,
+    ManualVideoStitchDialog,
+    build_unique_stitched_output_path,
+    save_stitched_image,
+)
 
 # ### Constants ###
 TEXTURE_CREATOR_DETAIL_SIZES = (512, 1024, 2048)
@@ -575,6 +582,21 @@ class BlueprintWorkspace(QWidget):
         )
         image_buttons_layout.addWidget(self.images_load_button)
 
+        self.images_convert_video_button = QPushButton("Convert video to image")
+        self.images_convert_video_button.setMinimumHeight(44)
+        self.images_convert_video_button.clicked.connect(
+            self._handle_convert_video_to_image_clicked
+        )
+        image_buttons_layout.addWidget(self.images_convert_video_button)
+
+        self.images_save_png_button = QPushButton("Save png")
+        self.images_save_png_button.setMinimumHeight(44)
+        self.images_save_png_button.setEnabled(False)
+        self.images_save_png_button.clicked.connect(
+            self._handle_save_selected_image_clicked
+        )
+        image_buttons_layout.addWidget(self.images_save_png_button)
+
         self.images_delete_button = QPushButton("Delete image")
         self.images_delete_button.setMinimumHeight(44)
         self.images_delete_button.clicked.connect(
@@ -843,11 +865,82 @@ class BlueprintWorkspace(QWidget):
                 f"Unable to load {len(skipped_image_paths)} selected image(s).",
             )
 
+    def _handle_convert_video_to_image_clicked(self) -> None:
+        file_path = self._get_video_file_path()
+        if not file_path:
+            return
+
+        try:
+            manual_dialog = ManualVideoStitchDialog(file_path, self)
+        except ValueError as error:
+            QMessageBox.critical(self, "Video conversion failed", str(error))
+            return
+
+        if manual_dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        stitched_image = manual_dialog.get_stitched_image()
+        if stitched_image is None:
+            return
+
+        try:
+            output_path = save_stitched_image(
+                stitched_image,
+                build_unique_stitched_output_path(file_path),
+            )
+        except OSError as error:
+            QMessageBox.critical(self, "Video conversion failed", str(error))
+            return
+
+        normalized_path = str(output_path.resolve())
+        self._add_image_to_library(normalized_path)
+        self._refresh_image_thumbnail_list(selected_image_path=normalized_path)
+        QMessageBox.information(
+            self,
+            "Video converted",
+            "Saved stitched image to:\n"
+            f"{normalized_path}\n\n"
+            f"Stitched frames: {manual_dialog.stitched_frame_count}",
+        )
+
     def _handle_image_thumbnail_selection_changed(self, row: int) -> None:
-        if self._is_syncing_image_library_controls or row < 0:
+        if self._is_syncing_image_library_controls:
             return
 
         self._sync_images_tab()
+
+    def _handle_save_selected_image_clicked(self) -> None:
+        selected_image_path = self._get_selected_image_library_path()
+        if selected_image_path is None:
+            return
+
+        selected_pixmap = QPixmap(selected_image_path)
+        if selected_pixmap.isNull():
+            QMessageBox.critical(
+                self,
+                "Image save failed",
+                f"Unable to load selected image:\n{selected_image_path}",
+            )
+            return
+
+        output_path = self._get_png_save_file_path(Path(selected_image_path).stem)
+        if not output_path:
+            return
+
+        normalized_output_path = _ensure_png_file_suffix(output_path)
+        if not selected_pixmap.save(normalized_output_path, "PNG"):
+            QMessageBox.critical(
+                self,
+                "Image save failed",
+                f"Unable to save PNG file:\n{normalized_output_path}",
+            )
+            return
+
+        QMessageBox.information(
+            self,
+            "Image saved",
+            f"Saved PNG image to:\n{normalized_output_path}",
+        )
 
     def _handle_delete_image_clicked(self) -> None:
         selected_image_path = self._get_selected_image_library_path()
@@ -882,6 +975,24 @@ class BlueprintWorkspace(QWidget):
             "Image Files (*.png *.jpg *.jpeg *.bmp *.webp)",
         )
         return file_paths
+
+    def _get_video_file_path(self) -> str:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "convert video to image",
+            str(Path.home()),
+            VIDEO_FILE_FILTER,
+        )
+        return file_path
+
+    def _get_png_save_file_path(self, default_image_name: str) -> str:
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "save png",
+            str(Path.home() / f"{default_image_name}.png"),
+            "PNG Files (*.png)",
+        )
+        return file_path
 
     def _refresh_levels_list(self) -> None:
         self._is_syncing_level_controls = True
@@ -1788,6 +1899,7 @@ class BlueprintWorkspace(QWidget):
 
         selected_image_path = self._get_selected_image_library_path()
         self.images_delete_button.setEnabled(selected_image_path is not None)
+        self.images_save_png_button.setEnabled(selected_image_path is not None)
 
         if selected_image_path is None:
             self.image_path_label.setText("No image selected")
@@ -1800,6 +1912,7 @@ class BlueprintWorkspace(QWidget):
             self.image_path_label.setText(f"Image missing: {selected_image_path}")
             self.image_preview_label.setPixmap(QPixmap())
             self.image_preview_label.setText("Image missing")
+            self.images_save_png_button.setEnabled(False)
             return
 
         self.image_path_label.setText(f"Image: {Path(selected_image_path).name}")
@@ -1917,6 +2030,15 @@ def _get_logical_wall_size(placement: UvWallPlacement) -> tuple[float, float]:
         placement.source_end_ratio - placement.source_start_ratio,
     )
     return wall_width / source_span, wall_height
+
+
+# ### Path helpers ###
+def _ensure_png_file_suffix(file_path: str) -> str:
+    output_path = Path(file_path)
+    if output_path.suffix.lower() == ".png":
+        return str(output_path)
+
+    return f"{output_path}.png"
 
 
 # ### Entrypoint helpers ###
