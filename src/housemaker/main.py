@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSplitter,
     QSpinBox,
     QStackedWidget,
@@ -41,6 +42,7 @@ from housemaker.glb import (
     export_room_texture_pngs,
 )
 from housemaker.models import (
+    DEFAULT_FLOOR_THICKNESS_METERS,
     DEFAULT_IMAGE_OFFSET,
     DEFAULT_IMAGE_SCALE,
     DEFAULT_ROOM_HEIGHT_METERS,
@@ -50,6 +52,8 @@ from housemaker.models import (
     DEFAULT_WALL_UV_SCALE,
     GROUND_LEVEL_INDEX,
     LevelData,
+    MAX_FLOOR_THICKNESS_METERS,
+    MIN_FLOOR_THICKNESS_METERS,
     RoomData,
     create_default_levels,
 )
@@ -198,10 +202,17 @@ class BlueprintWorkspace(QWidget):
         self.side_tabs = QTabWidget()
         side_layout.addWidget(self.side_tabs, 1)
 
-        generals_tab = QWidget()
-        generals_layout = QVBoxLayout(generals_tab)
+        generals_tab = QScrollArea()
+        generals_tab.setWidgetResizable(True)
+        generals_tab.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+
+        generals_content = QWidget()
+        generals_layout = QVBoxLayout(generals_content)
         generals_layout.setContentsMargins(10, 12, 10, 10)
         generals_layout.setSpacing(12)
+        generals_tab.setWidget(generals_content)
         self.side_tabs.addTab(generals_tab, "Generals")
         side_layout = generals_layout
 
@@ -218,6 +229,46 @@ class BlueprintWorkspace(QWidget):
         self.height_level_spinbox.setMinimumHeight(40)
         self.height_level_spinbox.valueChanged.connect(self._handle_height_level_changed)
         side_layout.addWidget(self.height_level_spinbox)
+
+        floor_thickness_label = QLabel("Floor thickness")
+        floor_thickness_label.setStyleSheet("font-size: 18px; font-weight: 600;")
+        side_layout.addWidget(floor_thickness_label)
+
+        self.floor_thickness_spinbox = QDoubleSpinBox()
+        self.floor_thickness_spinbox.setRange(
+            MIN_FLOOR_THICKNESS_METERS,
+            MAX_FLOOR_THICKNESS_METERS,
+        )
+        self.floor_thickness_spinbox.setDecimals(2)
+        self.floor_thickness_spinbox.setSingleStep(0.05)
+        self.floor_thickness_spinbox.setValue(DEFAULT_FLOOR_THICKNESS_METERS)
+        self.floor_thickness_spinbox.setSuffix(" m")
+        self.floor_thickness_spinbox.setMinimumHeight(40)
+        self.floor_thickness_spinbox.valueChanged.connect(
+            self._handle_floor_thickness_changed
+        )
+        side_layout.addWidget(self.floor_thickness_spinbox)
+
+        self.floor_contour_status_label = QLabel("Floor contour: Not set")
+        side_layout.addWidget(self.floor_contour_status_label)
+
+        floor_contour_buttons_layout = QHBoxLayout()
+        floor_contour_buttons_layout.setSpacing(10)
+
+        self.set_floor_contour_button = QPushButton("Set floor contour")
+        self.set_floor_contour_button.setMinimumHeight(40)
+        self.set_floor_contour_button.clicked.connect(
+            self._handle_set_floor_contour_clicked
+        )
+        floor_contour_buttons_layout.addWidget(self.set_floor_contour_button)
+
+        self.clear_floor_contour_button = QPushButton("Clear floor contour")
+        self.clear_floor_contour_button.setMinimumHeight(40)
+        self.clear_floor_contour_button.clicked.connect(
+            self._handle_clear_floor_contour_clicked
+        )
+        floor_contour_buttons_layout.addWidget(self.clear_floor_contour_button)
+        side_layout.addLayout(floor_contour_buttons_layout)
 
         self.load_image_button = QPushButton("Load image")
         self.load_image_button.setMinimumHeight(44)
@@ -389,6 +440,9 @@ class BlueprintWorkspace(QWidget):
 
         self.canvas.rooms_changed.connect(self._refresh_room_lists)
         self.canvas.rooms_changed.connect(self._schedule_viewer_preview_refresh)
+        self.canvas.floor_contour_changed.connect(
+            self._handle_floor_contour_changed
+        )
         self._refresh_levels_list()
         self._refresh_room_lists()
         self._sync_level_controls()
@@ -1394,6 +1448,10 @@ class BlueprintWorkspace(QWidget):
     def _sync_level_controls(self) -> None:
         self._is_syncing_level_controls = True
         self.height_level_spinbox.setValue(self.current_level.height_meters)
+        self.floor_thickness_spinbox.setValue(
+            self.current_level.floor_thickness_meters
+        )
+        self._update_floor_contour_status_label()
         self.image_scale_spinbox.setValue(self.current_level.image_scale)
         self.image_x_offset_spinbox.setValue(self.current_level.image_offset_x)
         self.image_y_offset_spinbox.setValue(self.current_level.image_offset_y)
@@ -1537,6 +1595,30 @@ class BlueprintWorkspace(QWidget):
             return
 
         self.current_level.height_meters = value
+        self._schedule_viewer_preview_refresh()
+
+    def _handle_floor_thickness_changed(self, value: float) -> None:
+        if self._is_syncing_level_controls:
+            return
+
+        self.current_level.floor_thickness_meters = float(value)
+        self._schedule_viewer_preview_refresh()
+
+    def _handle_set_floor_contour_clicked(self) -> None:
+        self.canvas.start_floor_contour_designation()
+        self.workspace_tabs.setCurrentWidget(self.canvas)
+
+    def _handle_clear_floor_contour_clicked(self) -> None:
+        self.canvas.clear_floor_contour()
+
+    def _handle_floor_contour_changed(self, vertex_ids: object) -> None:
+        if not isinstance(vertex_ids, list | tuple):
+            return
+
+        self.current_level.floor_contour_vertex_ids = tuple(
+            int(vertex_id) for vertex_id in vertex_ids
+        )
+        self._update_floor_contour_status_label()
         self._schedule_viewer_preview_refresh()
 
     def _handle_room_height_changed(self, value: float) -> None:
@@ -1851,6 +1933,9 @@ class BlueprintWorkspace(QWidget):
             file_path=normalized_path,
             vertex_data=self.current_level.vertex_data,
             rooms=self.current_level.rooms,
+            floor_contour_vertex_ids=(
+                self.current_level.floor_contour_vertex_ids
+            ),
             image_scale=self.current_level.image_scale,
             image_offset_x=self.current_level.image_offset_x,
             image_offset_y=self.current_level.image_offset_y,
@@ -1865,6 +1950,9 @@ class BlueprintWorkspace(QWidget):
         self.canvas.set_level_data(
             vertex_data=self.current_level.vertex_data,
             rooms=self.current_level.rooms,
+            floor_contour_vertex_ids=(
+                self.current_level.floor_contour_vertex_ids
+            ),
             image_path=self.current_level.image_path,
             image_scale=self.current_level.image_scale,
             image_offset_x=self.current_level.image_offset_x,
@@ -1892,6 +1980,16 @@ class BlueprintWorkspace(QWidget):
 
         self.blueprint_name_label.setText(label_text)
         self._sync_images_tab()
+
+    def _update_floor_contour_status_label(self) -> None:
+        vertex_count = len(self.current_level.floor_contour_vertex_ids)
+        if vertex_count == 0:
+            self.floor_contour_status_label.setText("Floor contour: Not set")
+            return
+
+        self.floor_contour_status_label.setText(
+            f"Floor contour: {vertex_count} vertices"
+        )
 
     def _sync_images_tab(self) -> None:
         if not hasattr(self, "image_preview_label"):

@@ -14,6 +14,7 @@ from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage, QPainter, QPen
 from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
+from housemaker.floor_geometry import build_level_floor_mesh
 from housemaker.models import (
     DEFAULT_LEVEL_HEIGHT_METERS,
     GROUND_LEVEL_INDEX,
@@ -227,8 +228,15 @@ def _build_multi_level_meshes(
         if not level.include_in_export:
             continue
 
-        if level.height_meters <= 0.0:
+        if not math.isfinite(level.height_meters) or level.height_meters <= 0.0:
             raise ValueError(f"Level {level.index} height must be greater than zero.")
+        if (
+            not math.isfinite(level.floor_thickness_meters)
+            or level.floor_thickness_meters <= 0.0
+        ):
+            raise ValueError(
+                f"Level {level.index} floor thickness must be greater than zero."
+            )
 
         level_named_meshes = _build_named_meshes_for_level(
             level=level,
@@ -251,11 +259,21 @@ def _build_named_meshes_for_level(
     base_z_meters = _get_level_base_z(level_lookup, level.index)
     level_blueprint_size = level.image_size_pixels or blueprint_size_pixels
     room_vertex_sets = _get_room_vertex_sets(level.rooms)
-    named_meshes = _build_room_named_meshes(
+    named_meshes: list[NamedMesh] = []
+    floor_mesh = build_level_floor_mesh(
         level=level,
-        base_z_meters=base_z_meters,
+        floor_surface_z_meters=base_z_meters,
         blueprint_size_pixels=level_blueprint_size,
+        point_to_world_xy=_point_to_world_xy,
     )
+    if floor_mesh is not None:
+        named_meshes.append(
+            NamedMesh(
+                name=_get_level_floor_object_name(level),
+                mesh=floor_mesh,
+            )
+        )
+
     regular_wall_meshes = _build_level_meshes(
         vertex_data=level.vertex_data,
         wall_height_meters=level.height_meters,
@@ -266,13 +284,20 @@ def _build_named_meshes_for_level(
     )
 
     if regular_wall_meshes:
-        named_meshes.insert(
-            0,
+        named_meshes.append(
             NamedMesh(
                 name=_get_level_object_name(level),
                 mesh=_combine_mesh_geometry(regular_wall_meshes),
-            ),
+            )
         )
+
+    named_meshes.extend(
+        _build_room_named_meshes(
+            level=level,
+            base_z_meters=base_z_meters,
+            blueprint_size_pixels=level_blueprint_size,
+        )
+    )
 
     return named_meshes
 
@@ -855,6 +880,10 @@ def _get_level_base_z(
 
 def _get_level_object_name(level: LevelData) -> str:
     return level.display_name.lower().replace(" ", "_")
+
+
+def _get_level_floor_object_name(level: LevelData) -> str:
+    return f"{_get_level_object_name(level)}_floor"
 
 
 def _get_room_object_name(

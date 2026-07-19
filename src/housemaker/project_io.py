@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from housemaker.models import (
+    DEFAULT_FLOOR_THICKNESS_METERS,
     DEFAULT_INCLUDE_IN_EXPORT,
     DEFAULT_IMAGE_OFFSET,
     DEFAULT_IMAGE_SCALE,
@@ -13,6 +15,8 @@ from housemaker.models import (
     DEFAULT_UV_MAP_HEIGHT,
     DEFAULT_UV_MAP_WIDTH,
     GROUND_LEVEL_INDEX,
+    MAX_FLOOR_THICKNESS_METERS,
+    MIN_FLOOR_THICKNESS_METERS,
     LevelData,
     RoomData,
     VertexData,
@@ -53,6 +57,10 @@ def save_project(
                 "index": level.index,
                 "name": level.name,
                 "height_meters": level.height_meters,
+                "floor_thickness_meters": level.floor_thickness_meters,
+                "floor_contour_vertex_ids": list(
+                    level.floor_contour_vertex_ids
+                ),
                 "image_path": _normalize_optional_path(level.image_path),
                 "image_size_pixels": _serialize_image_size(level.image_size_pixels),
                 "image_scale": float(level.image_scale),
@@ -103,6 +111,12 @@ def load_project(path: str | Path) -> ProjectData:
 
         level.name = str(raw_level.get("name", level.name))
         level.height_meters = float(raw_level.get("height_meters", level.height_meters))
+        level.floor_thickness_meters = _deserialize_floor_thickness_meters(
+            raw_level.get(
+                "floor_thickness_meters",
+                DEFAULT_FLOOR_THICKNESS_METERS,
+            )
+        )
         level.image_path = _normalize_optional_path(
             raw_level.get("image_path", legacy_blueprint_path)
         )
@@ -120,6 +134,10 @@ def load_project(path: str | Path) -> ProjectData:
             raw_level.get("include_in_export", DEFAULT_INCLUDE_IN_EXPORT)
         )
         level.vertex_data = VertexData.from_dict(raw_level.get("vertex_data", {}))
+        level.floor_contour_vertex_ids = _deserialize_floor_contour_vertex_ids(
+            raw_level.get("floor_contour_vertex_ids"),
+            level.vertex_data,
+        )
         level.rooms = _deserialize_rooms(
             raw_level.get("rooms", []),
             default_height_meters=level.height_meters,
@@ -165,6 +183,28 @@ def _deserialize_image_size(raw_image_size: object) -> tuple[float, float] | Non
         return None
 
     return (float(raw_image_size[0]), float(raw_image_size[1]))
+
+
+def _deserialize_floor_contour_vertex_ids(
+    raw_vertex_ids: object,
+    vertex_data: VertexData,
+) -> tuple[int, ...]:
+    if not isinstance(raw_vertex_ids, list | tuple):
+        return ()
+    if len(raw_vertex_ids) < 3:
+        return ()
+    if any(type(vertex_id) is not int for vertex_id in raw_vertex_ids):
+        return ()
+
+    vertex_ids = tuple(raw_vertex_ids)
+    if len(set(vertex_ids)) != len(vertex_ids):
+        return ()
+
+    existing_vertex_ids = {vertex.id for vertex in vertex_data.vertices}
+    if any(vertex_id not in existing_vertex_ids for vertex_id in vertex_ids):
+        return ()
+
+    return vertex_ids
 
 
 def _serialize_image_library_paths(image_paths: list[str]) -> list[str]:
@@ -317,6 +357,21 @@ def _deserialize_room_height_meters(
         return max(0.1, float(default_height_meters))
 
     return height_meters
+
+
+def _deserialize_floor_thickness_meters(raw_thickness_meters: object) -> float:
+    try:
+        thickness_meters = float(raw_thickness_meters)
+    except (TypeError, ValueError):
+        return DEFAULT_FLOOR_THICKNESS_METERS
+
+    if not math.isfinite(thickness_meters):
+        return DEFAULT_FLOOR_THICKNESS_METERS
+
+    return min(
+        max(thickness_meters, MIN_FLOOR_THICKNESS_METERS),
+        MAX_FLOOR_THICKNESS_METERS,
+    )
 
 
 def _deserialize_wall_uv_scales(raw_wall_uv_scales: object) -> dict[str, float]:

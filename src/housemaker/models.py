@@ -7,6 +7,9 @@ from dataclasses import dataclass, field
 
 # ### Constants ###
 DEFAULT_LEVEL_HEIGHT_METERS = 3.0
+DEFAULT_FLOOR_THICKNESS_METERS = 0.3
+MIN_FLOOR_THICKNESS_METERS = 0.01
+MAX_FLOOR_THICKNESS_METERS = 10.0
 DEFAULT_ROOM_HEIGHT_METERS = 3.0
 DEFAULT_IMAGE_SCALE = 1.0
 DEFAULT_IMAGE_OFFSET = 0.0
@@ -241,6 +244,8 @@ class LevelData:
     image_offset_x: float = DEFAULT_IMAGE_OFFSET
     image_offset_y: float = DEFAULT_IMAGE_OFFSET
     include_in_export: bool = DEFAULT_INCLUDE_IN_EXPORT
+    floor_thickness_meters: float = DEFAULT_FLOOR_THICKNESS_METERS
+    floor_contour_vertex_ids: tuple[int, ...] = ()
 
     @property
     def display_name(self) -> str:

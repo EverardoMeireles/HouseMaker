@@ -47,6 +47,9 @@ SELECTED_VERTEX_FILL_COLOR = QColor("#90cdf4")
 VERTEX_OUTLINE_COLOR = QColor("#20242a")
 TEXT_COLOR = QColor("#f5f7fa")
 ROOM_LABEL_BACKGROUND_COLOR = QColor(10, 12, 16, 170)
+FLOOR_CONTOUR_FILL_COLOR = QColor(65, 180, 130, 52)
+FLOOR_CONTOUR_EDGE_COLOR = QColor("#41d69a")
+PENDING_FLOOR_CONTOUR_COLOR = QColor("#ffd166")
 IMAGE_MARGIN = 16.0
 VERTEX_RADIUS_SCREEN = 6.0
 EDGE_HIT_TOLERANCE_SCREEN = 8.0
@@ -64,6 +67,7 @@ ZOOM_STEP_FACTOR = 1.15
 class CanvasSnapshot:
     vertex_data: VertexData
     rooms: list[RoomData]
+    floor_contour_vertex_ids: tuple[int, ...]
     active_vertex_id: int | None
     selected_vertex_id: int | None
     selected_vertex_ids: set[int]
@@ -113,12 +117,14 @@ class EdgeHit:
 # ### Widgets ###
 class BlueprintCanvas(QWidget):
     rooms_changed = Signal()
+    floor_contour_changed = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
 
         self.vertex_data = VertexData()
         self.rooms: list[RoomData] = []
+        self.floor_contour_vertex_ids: tuple[int, ...] = ()
         self.blueprint_image: QImage | None = None
         self.blueprint_path: str | None = None
         self.image_scale = DEFAULT_IMAGE_SCALE
@@ -142,6 +148,8 @@ class BlueprintCanvas(QWidget):
         self.pending_room_name: str | None = None
         self.pending_room_vertex_ids: tuple[int, ...] = ()
         self.pending_room_height_meters = DEFAULT_ROOM_HEIGHT_METERS
+        self.pending_floor_contour_vertex_ids: list[int] | None = None
+        self.pending_floor_contour_preview_point: tuple[float, float] | None = None
 
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -159,6 +167,7 @@ class BlueprintCanvas(QWidget):
         image_scale: float = DEFAULT_IMAGE_SCALE,
         image_offset_x: float = DEFAULT_IMAGE_OFFSET,
         image_offset_y: float = DEFAULT_IMAGE_OFFSET,
+        floor_contour_vertex_ids: tuple[int, ...] = (),
     ) -> None:
         image = _load_qimage_from_path(file_path)
         self._set_level_contents(
@@ -169,9 +178,14 @@ class BlueprintCanvas(QWidget):
             image_scale=image_scale,
             image_offset_x=image_offset_x,
             image_offset_y=image_offset_y,
+            floor_contour_vertex_ids=floor_contour_vertex_ids,
         )
 
-    def set_level_vertex_data(self, vertex_data: VertexData) -> None:
+    def set_level_vertex_data(
+        self,
+        vertex_data: VertexData,
+        floor_contour_vertex_ids: tuple[int, ...] | None = None,
+    ) -> None:
         self.set_level_data(
             vertex_data=vertex_data,
             rooms=self.rooms,
@@ -179,6 +193,11 @@ class BlueprintCanvas(QWidget):
             image_scale=self.image_scale,
             image_offset_x=self.image_offset_x,
             image_offset_y=self.image_offset_y,
+            floor_contour_vertex_ids=(
+                self.floor_contour_vertex_ids
+                if floor_contour_vertex_ids is None
+                else floor_contour_vertex_ids
+            ),
         )
 
     def set_level_data(
@@ -189,6 +208,7 @@ class BlueprintCanvas(QWidget):
         image_scale: float = DEFAULT_IMAGE_SCALE,
         image_offset_x: float = DEFAULT_IMAGE_OFFSET,
         image_offset_y: float = DEFAULT_IMAGE_OFFSET,
+        floor_contour_vertex_ids: tuple[int, ...] = (),
     ) -> None:
         blueprint_image: QImage | None = None
         if image_path and Path(image_path).exists():
@@ -205,6 +225,7 @@ class BlueprintCanvas(QWidget):
             image_scale=image_scale,
             image_offset_x=image_offset_x,
             image_offset_y=image_offset_y,
+            floor_contour_vertex_ids=floor_contour_vertex_ids,
         )
 
     def get_image_size_pixels(self) -> tuple[float, float] | None:
@@ -247,11 +268,35 @@ class BlueprintCanvas(QWidget):
         vertex_ids: list[int],
         room_height_meters: float,
     ) -> None:
+        self._reset_floor_contour_designation()
         self.pending_room_name = room_name.strip()
         self.pending_room_vertex_ids = tuple(sorted(set(vertex_ids)))
         self.pending_room_height_meters = room_height_meters
         self.preview_point = None
         self.preview_guides = []
+        self.update()
+
+    def start_floor_contour_designation(self) -> None:
+        self._reset_room_designation()
+        self.active_vertex_id = None
+        self.preview_point = None
+        self.preview_guides = []
+        self.selected_vertex_id = None
+        self.selected_vertex_ids.clear()
+        self.pending_floor_contour_vertex_ids = []
+        self.pending_floor_contour_preview_point = None
+        self._reset_pointer_state()
+        self.update()
+
+    def clear_floor_contour(self) -> None:
+        self._reset_floor_contour_designation()
+        if not self.floor_contour_vertex_ids:
+            self.update()
+            return
+
+        self._push_undo_state()
+        self.floor_contour_vertex_ids = ()
+        self.floor_contour_changed.emit(())
         self.update()
 
     def delete_room_at_index(self, room_index: int) -> bool:
@@ -273,6 +318,7 @@ class BlueprintCanvas(QWidget):
         image_scale: float,
         image_offset_x: float,
         image_offset_y: float,
+        floor_contour_vertex_ids: tuple[int, ...],
     ) -> None:
         self.blueprint_image = blueprint_image
         self.blueprint_path = blueprint_path
@@ -281,6 +327,9 @@ class BlueprintCanvas(QWidget):
         self.image_offset_y = float(image_offset_y)
         self.vertex_data = vertex_data
         self.rooms = rooms if rooms is not None else []
+        self.floor_contour_vertex_ids = self._normalize_floor_contour_vertex_ids(
+            floor_contour_vertex_ids
+        )
         self.active_vertex_id = None
         self.selected_vertex_id = None
         self.selected_vertex_ids.clear()
@@ -288,6 +337,7 @@ class BlueprintCanvas(QWidget):
         self.preview_guides = []
         self.undo_stack.clear()
         self._reset_room_designation()
+        self._reset_floor_contour_designation()
         self._reset_pointer_state()
         self._reset_view()
         self.update()
@@ -297,20 +347,34 @@ class BlueprintCanvas(QWidget):
             return
 
         snapshot = self.undo_stack.pop()
+        previous_floor_contour_vertex_ids = self.floor_contour_vertex_ids
         self.vertex_data.copy_from(snapshot.vertex_data)
         self.rooms.clear()
         self.rooms.extend(copy.deepcopy(snapshot.rooms))
+        self.floor_contour_vertex_ids = snapshot.floor_contour_vertex_ids
         self.active_vertex_id = snapshot.active_vertex_id
         self.selected_vertex_id = snapshot.selected_vertex_id
         self.selected_vertex_ids = set(snapshot.selected_vertex_ids)
         self.preview_point = snapshot.preview_point
         self.preview_guides = []
         self._reset_room_designation()
+        self._reset_floor_contour_designation()
         self._reset_pointer_state()
         self.update()
         self.rooms_changed.emit()
+        if self.floor_contour_vertex_ids != previous_floor_contour_vertex_ids:
+            self.floor_contour_changed.emit(self.floor_contour_vertex_ids)
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if (
+            event.key() == Qt.Key.Key_Escape
+            and self.pending_floor_contour_vertex_ids is not None
+        ):
+            self._reset_floor_contour_designation()
+            self.update()
+            event.accept()
+            return
+
         if event.key() == Qt.Key.Key_Delete:
             self._delete_selected_vertex()
             event.accept()
@@ -342,6 +406,12 @@ class BlueprintCanvas(QWidget):
             return
 
         if event.button() == Qt.MouseButton.RightButton:
+            if self.pending_floor_contour_vertex_ids is not None:
+                self._reset_floor_contour_designation()
+                self.update()
+                event.accept()
+                return
+
             self._apply_active_chain()
             event.accept()
             return
@@ -356,6 +426,12 @@ class BlueprintCanvas(QWidget):
             return
 
         hit_vertex = self._find_vertex_at(event.position())
+        if self.pending_floor_contour_vertex_ids is not None:
+            if hit_vertex is not None:
+                self._handle_floor_contour_vertex_click(hit_vertex.id)
+            event.accept()
+            return
+
         if self.pending_room_name is not None:
             if hit_vertex is not None:
                 self._finish_room_designation(hit_vertex.id)
@@ -408,6 +484,17 @@ class BlueprintCanvas(QWidget):
 
         if self.is_panning and event.buttons() & Qt.MouseButton.MiddleButton:
             self._update_pan(event.position())
+            event.accept()
+            return
+
+        if self.pending_floor_contour_vertex_ids is not None:
+            image_point = self._widget_to_image(event.position())
+            self.pending_floor_contour_preview_point = (
+                None
+                if image_point is None
+                else (image_point.x(), image_point.y())
+            )
+            self.update()
             event.accept()
             return
 
@@ -481,6 +568,9 @@ class BlueprintCanvas(QWidget):
         event.accept()
 
     def leaveEvent(self, event) -> None:  # type: ignore[override]
+        if self.pending_floor_contour_vertex_ids is not None:
+            self.pending_floor_contour_preview_point = None
+            self.update()
         if self.drag_vertex_id is None and self.active_vertex_id is not None:
             self.preview_point = None
             self.preview_guides = []
@@ -500,8 +590,10 @@ class BlueprintCanvas(QWidget):
         painter.fillRect(display_rect, CANVAS_PANEL_COLOR)
         painter.drawImage(display_rect, self.blueprint_image)
 
+        self._paint_floor_contour(painter)
         self._paint_rooms(painter)
         self._paint_edges(painter)
+        self._paint_pending_floor_contour(painter)
         self._paint_preview_guides(painter)
         self._paint_preview_edge(painter)
         self._paint_vertices(painter)
@@ -595,6 +687,7 @@ class BlueprintCanvas(QWidget):
         snapshot = CanvasSnapshot(
             vertex_data=self.vertex_data.clone(),
             rooms=copy.deepcopy(self.rooms),
+            floor_contour_vertex_ids=self.floor_contour_vertex_ids,
             active_vertex_id=self.active_vertex_id,
             selected_vertex_id=self.selected_vertex_id,
             selected_vertex_ids=set(self.selected_vertex_ids),
@@ -626,6 +719,10 @@ class BlueprintCanvas(QWidget):
         deleted_vertex_id = self.selected_vertex_id
         self.vertex_data.delete_vertex(deleted_vertex_id)
         self._remove_vertex_from_rooms(deleted_vertex_id)
+        if deleted_vertex_id in self.floor_contour_vertex_ids:
+            self.floor_contour_vertex_ids = ()
+            self._reset_floor_contour_designation()
+            self.floor_contour_changed.emit(())
 
         if self.active_vertex_id == deleted_vertex_id:
             self.active_vertex_id = None
@@ -636,6 +733,62 @@ class BlueprintCanvas(QWidget):
         self.preview_guides = []
         self._reset_pointer_state()
         self.update()
+
+    def _handle_floor_contour_vertex_click(self, vertex_id: int) -> None:
+        pending_vertex_ids = self.pending_floor_contour_vertex_ids
+        if pending_vertex_ids is None:
+            return
+
+        if pending_vertex_ids and vertex_id == pending_vertex_ids[0]:
+            if len(pending_vertex_ids) >= 3:
+                self._push_undo_state()
+                self.floor_contour_vertex_ids = tuple(pending_vertex_ids)
+                self._reset_floor_contour_designation()
+                self.floor_contour_changed.emit(self.floor_contour_vertex_ids)
+                self.update()
+            return
+
+        if vertex_id in pending_vertex_ids:
+            return
+
+        pending_vertex_ids.append(vertex_id)
+        vertex = self.vertex_data.get_vertex(vertex_id)
+        self.pending_floor_contour_preview_point = (
+            None if vertex is None else (vertex.x, vertex.y)
+        )
+        self.update()
+
+    def _reset_floor_contour_designation(self) -> None:
+        self.pending_floor_contour_vertex_ids = None
+        self.pending_floor_contour_preview_point = None
+
+    def _normalize_floor_contour_vertex_ids(
+        self,
+        vertex_ids: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        normalized_vertex_ids = tuple(vertex_ids)
+        if (
+            len(normalized_vertex_ids) >= 2
+            and normalized_vertex_ids[-1] == normalized_vertex_ids[0]
+        ):
+            normalized_vertex_ids = normalized_vertex_ids[:-1]
+
+        if (
+            len(normalized_vertex_ids) < 3
+            or len(set(normalized_vertex_ids)) != len(normalized_vertex_ids)
+        ):
+            return ()
+
+        existing_vertex_ids = {
+            vertex.id for vertex in self.vertex_data.vertices
+        }
+        if any(
+            vertex_id not in existing_vertex_ids
+            for vertex_id in normalized_vertex_ids
+        ):
+            return ()
+
+        return normalized_vertex_ids
 
     def _finish_room_designation(self, center_vertex_id: int) -> None:
         if self.pending_room_name is None or len(self.pending_room_vertex_ids) < 3:
@@ -1341,6 +1494,77 @@ class BlueprintCanvas(QWidget):
             empty_message,
         )
 
+    def _paint_floor_contour(self, painter: QPainter) -> None:
+        contour_vertices = self._get_vertices_for_ids(
+            self.floor_contour_vertex_ids
+        )
+        if len(contour_vertices) < 3:
+            return
+
+        contour_polygon = QPolygonF(
+            [
+                self._image_to_widget(vertex.x, vertex.y)
+                for vertex in contour_vertices
+            ]
+        )
+        contour_pen = QPen(
+            FLOOR_CONTOUR_EDGE_COLOR,
+            2.0,
+            Qt.PenStyle.DashLine,
+        )
+        contour_pen.setDashPattern([6.0, 4.0])
+        painter.setPen(contour_pen)
+        painter.setBrush(FLOOR_CONTOUR_FILL_COLOR)
+        painter.drawPolygon(contour_polygon)
+
+    def _paint_pending_floor_contour(self, painter: QPainter) -> None:
+        pending_vertex_ids = self.pending_floor_contour_vertex_ids
+        if pending_vertex_ids is None or not pending_vertex_ids:
+            return
+
+        pending_vertices = self._get_vertices_for_ids(
+            tuple(pending_vertex_ids)
+        )
+        if not pending_vertices:
+            return
+
+        pending_points = [
+            self._image_to_widget(vertex.x, vertex.y)
+            for vertex in pending_vertices
+        ]
+        pending_pen = QPen(
+            PENDING_FLOOR_CONTOUR_COLOR,
+            2.5,
+            Qt.PenStyle.DashDotLine,
+        )
+        painter.setPen(pending_pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        if len(pending_points) >= 2:
+            painter.drawPolyline(QPolygonF(pending_points))
+
+        if self.pending_floor_contour_preview_point is not None:
+            preview_point = self._image_to_widget(
+                self.pending_floor_contour_preview_point[0],
+                self.pending_floor_contour_preview_point[1],
+            )
+            painter.drawLine(pending_points[-1], preview_point)
+
+        for pending_point in pending_points:
+            painter.drawEllipse(pending_point, 4.0, 4.0)
+        painter.drawEllipse(pending_points[0], 7.0, 7.0)
+
+    def _get_vertices_for_ids(
+        self,
+        vertex_ids: tuple[int, ...],
+    ) -> list[Vertex]:
+        vertices: list[Vertex] = []
+        for vertex_id in vertex_ids:
+            vertex = self.vertex_data.get_vertex(vertex_id)
+            if vertex is not None:
+                vertices.append(vertex)
+
+        return vertices
+
     def _paint_rooms(self, painter: QPainter) -> None:
         label_font = QFont("Segoe UI", 10)
         label_font.setBold(True)
@@ -1514,8 +1738,14 @@ class BlueprintCanvas(QWidget):
         ]
         if self.pending_room_name is not None:
             overlay_lines.append("Click a vertex to set the current room center.")
+        if self.pending_floor_contour_vertex_ids is not None:
+            overlay_lines.append(
+                "Floor contour: click every perimeter corner in order, "
+                "including inward corners; click the first again to finish."
+            )
+            overlay_lines.append("Right click or Escape: cancel floor contour.")
 
-        overlay_rect = QRectF(24.0, 24.0, 520.0, 20.0 + len(overlay_lines) * 22.0)
+        overlay_rect = QRectF(24.0, 24.0, 680.0, 20.0 + len(overlay_lines) * 22.0)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(10, 12, 16, 180))
         painter.drawRoundedRect(overlay_rect, 10.0, 10.0)
