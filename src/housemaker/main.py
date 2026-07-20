@@ -45,6 +45,7 @@ from housemaker.models import (
     DEFAULT_FLOOR_THICKNESS_METERS,
     DEFAULT_IMAGE_OFFSET,
     DEFAULT_IMAGE_SCALE,
+    DEFAULT_LEVEL_SCALE,
     DEFAULT_ROOM_HEIGHT_METERS,
     DEFAULT_UV_MAP_HEIGHT,
     DEFAULT_UV_MAP_WIDTH,
@@ -53,7 +54,9 @@ from housemaker.models import (
     GROUND_LEVEL_INDEX,
     LevelData,
     MAX_FLOOR_THICKNESS_METERS,
+    MAX_LEVEL_SCALE,
     MIN_FLOOR_THICKNESS_METERS,
+    MIN_LEVEL_SCALE,
     RoomData,
     create_default_levels,
 )
@@ -230,6 +233,22 @@ class BlueprintWorkspace(QWidget):
         self.height_level_spinbox.valueChanged.connect(self._handle_height_level_changed)
         side_layout.addWidget(self.height_level_spinbox)
 
+        level_scale_label = QLabel("Level scale")
+        level_scale_label.setStyleSheet("font-size: 18px; font-weight: 600;")
+        side_layout.addWidget(level_scale_label)
+
+        self.level_scale_spinbox = QDoubleSpinBox()
+        self.level_scale_spinbox.setRange(MIN_LEVEL_SCALE, MAX_LEVEL_SCALE)
+        self.level_scale_spinbox.setDecimals(3)
+        self.level_scale_spinbox.setSingleStep(0.05)
+        self.level_scale_spinbox.setValue(DEFAULT_LEVEL_SCALE)
+        self.level_scale_spinbox.setSuffix(" x")
+        self.level_scale_spinbox.setMinimumHeight(40)
+        self.level_scale_spinbox.valueChanged.connect(
+            self._handle_level_scale_changed
+        )
+        side_layout.addWidget(self.level_scale_spinbox)
+
         floor_thickness_label = QLabel("Floor thickness")
         floor_thickness_label.setStyleSheet("font-size: 18px; font-weight: 600;")
         side_layout.addWidget(floor_thickness_label)
@@ -287,7 +306,7 @@ class BlueprintWorkspace(QWidget):
             single_step=0.05,
         )
         self.image_scale_spinbox.valueChanged.connect(self._handle_image_scale_changed)
-        image_transform_layout.addRow("Scale", self.image_scale_spinbox)
+        image_transform_layout.addRow("Blueprint scale", self.image_scale_spinbox)
 
         self.image_x_offset_spinbox = self._build_image_transform_spinbox(
             value=DEFAULT_IMAGE_OFFSET,
@@ -1448,6 +1467,7 @@ class BlueprintWorkspace(QWidget):
     def _sync_level_controls(self) -> None:
         self._is_syncing_level_controls = True
         self.height_level_spinbox.setValue(self.current_level.height_meters)
+        self.level_scale_spinbox.setValue(self.current_level.scale)
         self.floor_thickness_spinbox.setValue(
             self.current_level.floor_thickness_meters
         )
@@ -1595,6 +1615,13 @@ class BlueprintWorkspace(QWidget):
             return
 
         self.current_level.height_meters = value
+        self._schedule_viewer_preview_refresh()
+
+    def _handle_level_scale_changed(self, value: float) -> None:
+        if self._is_syncing_level_controls:
+            return
+
+        self.current_level.scale = float(value)
         self._schedule_viewer_preview_refresh()
 
     def _handle_floor_thickness_changed(self, value: float) -> None:

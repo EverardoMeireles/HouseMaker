@@ -23,6 +23,7 @@ from housemaker.blueprint_canvas import BlueprintCanvas
 from housemaker.glb import convert_to_glb
 from housemaker.models import (
     DEFAULT_FLOOR_THICKNESS_METERS,
+    DEFAULT_LEVEL_SCALE,
     LevelData,
     RoomData,
     VertexData,
@@ -160,6 +161,16 @@ def _assert_slab_sides_follow_only_outer_bounds(
             )
         )
         test_case.assertTrue(touches_outer_boundary)
+
+
+def _get_scene_world_mesh(
+    scene: trimesh.Scene,
+    object_name: str,
+) -> trimesh.Trimesh:
+    transform, geometry_name = scene.graph.get(object_name)
+    mesh = scene.geometry[geometry_name].copy()
+    mesh.apply_transform(transform)
+    return mesh
 
 
 # ### Tests ###
@@ -603,6 +614,96 @@ class FloorContourTests(unittest.TestCase):
                 np.asarray(expected_bounds),
             )
 
+    def test_level_scale_applies_to_every_level_object_and_glb_nodes(
+        self,
+    ) -> None:
+        level = _build_square_level()
+        room_vertex_ids = _add_closed_wall_loop(
+            level.vertex_data,
+            [(25.0, 25.0), (75.0, 25.0), (75.0, 75.0), (25.0, 75.0)],
+        )
+        room_center = level.vertex_data.add_vertex(50.0, 50.0)
+        level.rooms.append(
+            RoomData(
+                name="Room",
+                vertex_ids=room_vertex_ids,
+                center_vertex_id=room_center.id,
+                color_rgb=(140, 180, 220),
+            )
+        )
+        level.scale = 2.0
+
+        model = convert_to_glb([level])
+        np.testing.assert_allclose(
+            model.mesh.bounds,
+            np.asarray([[-1.0, -3.0, -0.3], [3.0, 1.0, 3.0]]),
+        )
+        preview_points = np.asarray(
+            [
+                point
+                for preview_wall in model.preview_textured_walls
+                for point in (preview_wall.start_point, preview_wall.end_point)
+            ]
+        )
+        np.testing.assert_allclose(
+            preview_points[:, :2].min(axis=0),
+            np.asarray([0.0, -2.0]),
+        )
+        np.testing.assert_allclose(
+            preview_points[:, :2].max(axis=0),
+            np.asarray([2.0, 0.0]),
+        )
+        self.assertTrue(
+            all(
+                preview_wall.height_meters == 3.0
+                for preview_wall in model.preview_textured_walls
+            )
+        )
+
+        expected_world_bounds = {
+            "l2_ground_floor": np.asarray(
+                [[-1.0, -0.3, -1.0], [3.0, 0.0, 3.0]]
+            ),
+            "l2_ground": np.asarray(
+                [[-1.0, 0.0, -1.0], [3.0, 3.0, 3.0]]
+            ),
+            "l2_ground_room_1": np.asarray(
+                [[0.0, 0.0, 0.0], [2.0, 3.0, 2.0]]
+            ),
+        }
+        for object_name, expected_bounds in expected_world_bounds.items():
+            transform, _ = model.scene.graph.get(object_name)
+            np.testing.assert_allclose(
+                np.diag(transform)[:3],
+                np.asarray([2.0, 1.0, 2.0]),
+            )
+            np.testing.assert_allclose(
+                _get_scene_world_mesh(model.scene, object_name).bounds,
+                expected_bounds,
+            )
+
+        loaded_scene = trimesh.load(BytesIO(model.glb_bytes), file_type="glb")
+        self.assertIsInstance(loaded_scene, trimesh.Scene)
+        for object_name, expected_bounds in expected_world_bounds.items():
+            transform, _ = loaded_scene.graph.get(object_name)
+            np.testing.assert_allclose(
+                np.diag(transform)[:3],
+                np.asarray([2.0, 1.0, 2.0]),
+            )
+            np.testing.assert_allclose(
+                _get_scene_world_mesh(loaded_scene, object_name).bounds,
+                expected_bounds,
+                atol=1e-6,
+            )
+
+    def test_invalid_level_scale_is_rejected(self) -> None:
+        level = _build_square_level()
+        for invalid_scale in (0.0, -0.1, float("nan"), float("inf"), True):
+            with self.subTest(invalid_scale=invalid_scale):
+                level.scale = invalid_scale
+                with self.assertRaisesRegex(ValueError, "scale"):
+                    convert_to_glb([level])
+
     def test_invalid_floor_thickness_is_rejected(self) -> None:
         level = _build_square_level()
         for invalid_thickness in (0.0, -0.1, float("nan")):
@@ -646,6 +747,7 @@ class FloorContourTests(unittest.TestCase):
 
     def test_floor_settings_persist_and_legacy_projects_use_defaults(self) -> None:
         levels = create_default_levels()
+        levels[2].scale = 1.75
         levels[2].floor_thickness_meters = 0.37
         levels[2].floor_contour_vertex_ids = _add_closed_wall_loop(
             levels[2].vertex_data,
@@ -656,6 +758,7 @@ class FloorContourTests(unittest.TestCase):
             project_path = Path(temporary_directory) / "floor-project.json"
             save_project(project_path, 2, levels)
             loaded_level = load_project(project_path).levels[2]
+            self.assertAlmostEqual(loaded_level.scale, 1.75)
             self.assertAlmostEqual(loaded_level.floor_thickness_meters, 0.37)
             self.assertEqual(
                 loaded_level.floor_contour_vertex_ids,
@@ -663,10 +766,12 @@ class FloorContourTests(unittest.TestCase):
             )
 
             payload = json.loads(project_path.read_text(encoding="utf-8"))
+            payload["levels"][2].pop("scale")
             payload["levels"][2].pop("floor_thickness_meters")
             payload["levels"][2].pop("floor_contour_vertex_ids")
             project_path.write_text(json.dumps(payload), encoding="utf-8")
             legacy_level = load_project(project_path).levels[2]
+            self.assertAlmostEqual(legacy_level.scale, DEFAULT_LEVEL_SCALE)
             self.assertAlmostEqual(
                 legacy_level.floor_thickness_meters,
                 DEFAULT_FLOOR_THICKNESS_METERS,
@@ -690,6 +795,21 @@ class FloorContourTests(unittest.TestCase):
         self.assertEqual(
             workspace.levels[1].floor_thickness_meters,
             DEFAULT_FLOOR_THICKNESS_METERS,
+        )
+
+    def test_level_scale_control_updates_only_the_selected_level(self) -> None:
+        from housemaker.main import BlueprintWorkspace
+
+        workspace = BlueprintWorkspace()
+        _qt_widgets.append(workspace)
+        self.assertAlmostEqual(workspace.level_scale_spinbox.value(), 1.0)
+        workspace.level_scale_spinbox.setValue(1.75)
+        _qt_application.processEvents()
+
+        self.assertAlmostEqual(workspace.current_level.scale, 1.75)
+        self.assertAlmostEqual(
+            workspace.levels[1].scale,
+            DEFAULT_LEVEL_SCALE,
         )
 
     def test_generals_tab_scrolls_without_crowding_image_controls(self) -> None:

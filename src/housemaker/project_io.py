@@ -11,12 +11,15 @@ from housemaker.models import (
     DEFAULT_INCLUDE_IN_EXPORT,
     DEFAULT_IMAGE_OFFSET,
     DEFAULT_IMAGE_SCALE,
+    DEFAULT_LEVEL_SCALE,
     DEFAULT_ROOM_HEIGHT_METERS,
     DEFAULT_UV_MAP_HEIGHT,
     DEFAULT_UV_MAP_WIDTH,
     GROUND_LEVEL_INDEX,
     MAX_FLOOR_THICKNESS_METERS,
+    MAX_LEVEL_SCALE,
     MIN_FLOOR_THICKNESS_METERS,
+    MIN_LEVEL_SCALE,
     LevelData,
     RoomData,
     VertexData,
@@ -57,6 +60,7 @@ def save_project(
                 "index": level.index,
                 "name": level.name,
                 "height_meters": level.height_meters,
+                "scale": float(level.scale),
                 "floor_thickness_meters": level.floor_thickness_meters,
                 "floor_contour_vertex_ids": list(
                     level.floor_contour_vertex_ids
@@ -111,6 +115,9 @@ def load_project(path: str | Path) -> ProjectData:
 
         level.name = str(raw_level.get("name", level.name))
         level.height_meters = float(raw_level.get("height_meters", level.height_meters))
+        level.scale = _deserialize_level_scale(
+            raw_level.get("scale", DEFAULT_LEVEL_SCALE)
+        )
         level.floor_thickness_meters = _deserialize_floor_thickness_meters(
             raw_level.get(
                 "floor_thickness_meters",
@@ -372,6 +379,18 @@ def _deserialize_floor_thickness_meters(raw_thickness_meters: object) -> float:
         max(thickness_meters, MIN_FLOOR_THICKNESS_METERS),
         MAX_FLOOR_THICKNESS_METERS,
     )
+
+
+def _deserialize_level_scale(raw_scale: object) -> float:
+    try:
+        scale = float(raw_scale)
+    except (TypeError, ValueError):
+        return DEFAULT_LEVEL_SCALE
+
+    if not math.isfinite(scale):
+        return DEFAULT_LEVEL_SCALE
+
+    return min(max(scale, MIN_LEVEL_SCALE), MAX_LEVEL_SCALE)
 
 
 def _deserialize_wall_uv_scales(raw_wall_uv_scales: object) -> dict[str, float]:

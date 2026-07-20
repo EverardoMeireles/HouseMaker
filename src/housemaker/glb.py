@@ -46,6 +46,7 @@ Z_UP_TO_GLTF_Y_UP_TRANSFORM = np.array(
     ],
     dtype=float,
 )
+GLTF_Y_UP_TO_Z_UP_TRANSFORM = np.linalg.inv(Z_UP_TO_GLTF_Y_UP_TRANSFORM)
 ROOM_TEXTURE_BACKGROUND_COLOR = QColor("#f7f8fb")
 ROOM_TEXTURE_WALL_FILL_COLOR = QColor("#dce0e8")
 ROOM_TEXTURE_TEXT_COLOR = QColor("#20242a")
@@ -71,6 +72,9 @@ class GeneratedModel:
 class NamedMesh:
     name: str
     mesh: trimesh.Trimesh
+    source_transform: np.ndarray = field(
+        default_factory=lambda: np.eye(4, dtype=float)
+    )
 
 
 @dataclass(frozen=True)
@@ -127,12 +131,16 @@ def convert_to_glb(
             level_source,
             blueprint_size_pixels=blueprint_size_pixels,
         )
-        wall_meshes = [named_mesh.mesh for named_mesh in named_meshes]
 
-    if not wall_meshes:
+    if not named_meshes:
         raise ValueError("The current blueprint data does not contain usable edges.")
 
-    combined_mesh = _combine_mesh_geometry(wall_meshes)
+    combined_mesh = _combine_mesh_geometry(
+        [
+            _build_transformed_named_mesh_copy(named_mesh)
+            for named_mesh in named_meshes
+        ]
+    )
     scene = _build_export_scene(named_meshes)
     glb_bytes = scene.export(file_type="glb")
     return GeneratedModel(
@@ -189,6 +197,9 @@ def _build_export_scene(named_meshes: list[NamedMesh]) -> trimesh.Scene:
             _to_gltf_y_up_mesh(named_mesh.mesh),
             geom_name=named_mesh.name,
             node_name=named_mesh.name,
+            transform=_source_to_gltf_y_up_transform(
+                named_mesh.source_transform
+            ),
         )
     return scene
 
@@ -197,6 +208,35 @@ def _to_gltf_y_up_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
     export_mesh = mesh.copy()
     export_mesh.apply_transform(Z_UP_TO_GLTF_Y_UP_TRANSFORM)
     return export_mesh
+
+
+def _build_transformed_named_mesh_copy(named_mesh: NamedMesh) -> trimesh.Trimesh:
+    transformed_mesh = named_mesh.mesh.copy()
+    transformed_mesh.apply_transform(
+        _get_valid_source_transform(named_mesh.source_transform)
+    )
+    return transformed_mesh
+
+
+def _source_to_gltf_y_up_transform(source_transform: np.ndarray) -> np.ndarray:
+    valid_source_transform = _get_valid_source_transform(source_transform)
+    return (
+        Z_UP_TO_GLTF_Y_UP_TRANSFORM
+        @ valid_source_transform
+        @ GLTF_Y_UP_TO_Z_UP_TRANSFORM
+    )
+
+
+def _get_valid_source_transform(source_transform: np.ndarray) -> np.ndarray:
+    try:
+        transform = np.asarray(source_transform, dtype=float)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Mesh source transform must be a 4 by 4 matrix.") from error
+
+    if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
+        raise ValueError("Mesh source transform must be a finite 4 by 4 matrix.")
+
+    return transform
 
 
 def _build_named_meshes_for_single_level(
@@ -237,6 +277,7 @@ def _build_multi_level_meshes(
             raise ValueError(
                 f"Level {level.index} floor thickness must be greater than zero."
             )
+        _get_valid_level_scale(level)
 
         level_named_meshes = _build_named_meshes_for_level(
             level=level,
@@ -258,6 +299,10 @@ def _build_named_meshes_for_level(
 ) -> list[NamedMesh]:
     base_z_meters = _get_level_base_z(level_lookup, level.index)
     level_blueprint_size = level.image_size_pixels or blueprint_size_pixels
+    level_source_transform = _build_level_scale_source_transform(
+        level,
+        level_blueprint_size,
+    )
     room_vertex_sets = _get_room_vertex_sets(level.rooms)
     named_meshes: list[NamedMesh] = []
     floor_mesh = build_level_floor_mesh(
@@ -298,6 +343,9 @@ def _build_named_meshes_for_level(
             blueprint_size_pixels=level_blueprint_size,
         )
     )
+
+    for named_mesh in named_meshes:
+        named_mesh.source_transform = level_source_transform.copy()
 
     return named_meshes
 
@@ -777,11 +825,16 @@ def _build_preview_textured_walls(
         if not level.include_in_export:
             continue
 
+        level_blueprint_size = level.image_size_pixels or blueprint_size_pixels
         preview_walls.extend(
             _build_level_preview_textured_walls(
                 level=level,
                 base_z_meters=_get_level_base_z(level_lookup, level.index),
-                blueprint_size_pixels=level.image_size_pixels or blueprint_size_pixels,
+                blueprint_size_pixels=level_blueprint_size,
+                source_transform=_build_level_scale_source_transform(
+                    level,
+                    level_blueprint_size,
+                ),
             )
         )
 
@@ -792,6 +845,7 @@ def _build_level_preview_textured_walls(
     level: LevelData,
     base_z_meters: float,
     blueprint_size_pixels: tuple[float, float] | None,
+    source_transform: np.ndarray,
 ) -> list[PreviewTexturedWall]:
     preview_walls: list[PreviewTexturedWall] = []
     for room_index, room in enumerate(level.rooms):
@@ -821,15 +875,21 @@ def _build_level_preview_textured_walls(
                     level_index=level.index,
                     room_index=room_index,
                     wall_key=placement.wall.key,
-                    start_point=(
-                        float(start_xy[0]),
-                        float(start_xy[1]),
-                        base_z_meters,
+                    start_point=_transform_source_point(
+                        (
+                            float(start_xy[0]),
+                            float(start_xy[1]),
+                            base_z_meters,
+                        ),
+                        source_transform,
                     ),
-                    end_point=(
-                        float(end_xy[0]),
-                        float(end_xy[1]),
-                        base_z_meters,
+                    end_point=_transform_source_point(
+                        (
+                            float(end_xy[0]),
+                            float(end_xy[1]),
+                            base_z_meters,
+                        ),
+                        source_transform,
                     ),
                     height_meters=float(room.height_meters),
                     texture_rgba=_build_wall_preview_texture(room, placement),
@@ -857,6 +917,71 @@ def _is_edge_inside_any_room(
 
 def _get_room_center_vertex_ids(rooms: list[RoomData]) -> set[int]:
     return {room.center_vertex_id for room in rooms}
+
+
+# ### Level transform helpers ###
+def _get_valid_level_scale(level: LevelData) -> float:
+    raw_scale = level.scale
+    if isinstance(raw_scale, bool):
+        raise ValueError(
+            f"Level {level.index} scale must be a finite number greater than zero."
+        )
+
+    try:
+        scale = float(raw_scale)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            f"Level {level.index} scale must be a finite number greater than zero."
+        ) from error
+
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError(
+            f"Level {level.index} scale must be a finite number greater than zero."
+        )
+
+    return scale
+
+
+def _build_level_scale_source_transform(
+    level: LevelData,
+    blueprint_size_pixels: tuple[float, float] | None,
+) -> np.ndarray:
+    scale = _get_valid_level_scale(level)
+    transform = np.eye(4, dtype=float)
+    if scale == 1.0 or not level.vertex_data.vertices:
+        return transform
+
+    level_points = np.asarray(
+        [
+            _vertex_to_world_xy(vertex, blueprint_size_pixels)
+            for vertex in level.vertex_data.vertices
+        ],
+        dtype=float,
+    )
+    if not np.all(np.isfinite(level_points)):
+        raise ValueError(f"Level {level.index} vertices must have finite positions.")
+
+    minimum_point = np.min(level_points, axis=0)
+    maximum_point = np.max(level_points, axis=0)
+    pivot_point = (minimum_point + maximum_point) / 2.0
+    transform[0, 0] = scale
+    transform[1, 1] = scale
+    transform[0, 3] = float(pivot_point[0] * (1.0 - scale))
+    transform[1, 3] = float(pivot_point[1] * (1.0 - scale))
+    return transform
+
+
+def _transform_source_point(
+    point: tuple[float, float, float],
+    source_transform: np.ndarray,
+) -> tuple[float, float, float]:
+    source_point = np.array([*point, 1.0], dtype=float)
+    transformed_point = _get_valid_source_transform(source_transform) @ source_point
+    return (
+        float(transformed_point[0]),
+        float(transformed_point[1]),
+        float(transformed_point[2]),
+    )
 
 
 # ### Level helpers ###
