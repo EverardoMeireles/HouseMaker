@@ -14,10 +14,10 @@ import trimesh
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # ### Imports ###
-from PySide6.QtCore import QPoint, Qt
-from PySide6.QtGui import QImage
+from PySide6.QtCore import QPoint, QPointF, Qt
+from PySide6.QtGui import QImage, QWheelEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QScrollArea
+from PySide6.QtWidgets import QApplication, QScrollArea, QWidget
 
 from housemaker.blueprint_canvas import BlueprintCanvas
 from housemaker.glb import convert_to_glb
@@ -172,6 +172,22 @@ def _get_scene_world_mesh(
     mesh = scene.geometry[geometry_name].copy()
     mesh.apply_transform(transform)
     return mesh
+
+
+def _send_wheel_event(widget: QWidget, angle_delta_y: int) -> None:
+    local_position = QPointF(widget.rect().center())
+    global_position = QPointF(widget.mapToGlobal(widget.rect().center()))
+    event = QWheelEvent(
+        local_position,
+        global_position,
+        QPoint(),
+        QPoint(0, angle_delta_y),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+    QApplication.sendEvent(widget, event)
 
 
 # ### Tests ###
@@ -1036,6 +1052,56 @@ class FloorContourTests(unittest.TestCase):
 
         for previous_bounds, next_bounds in zip(row_bounds, row_bounds[1:]):
             self.assertGreaterEqual(next_bounds[0] - previous_bounds[1], 8)
+
+        workspace.close()
+
+    def test_wheel_over_generals_spinboxes_scrolls_without_changing_values(
+        self,
+    ) -> None:
+        from housemaker.main import BlueprintWorkspace
+
+        workspace = BlueprintWorkspace()
+        _qt_widgets.append(workspace)
+        workspace.resize(1600, 900)
+        workspace.show()
+        _qt_application.processEvents()
+
+        generals_tab = workspace.side_tabs.widget(0)
+        self.assertIsInstance(generals_tab, QScrollArea)
+        scroll_bar = generals_tab.verticalScrollBar()
+        self.assertGreater(scroll_bar.maximum(), 0)
+
+        controls = (
+            ("height", workspace.height_level_spinbox),
+            ("floor thickness", workspace.floor_thickness_spinbox),
+            ("level scale", workspace.level_scale_spinbox),
+            ("level X offset", workspace.level_x_offset_spinbox),
+            ("level Y offset", workspace.level_y_offset_spinbox),
+            ("blueprint scale", workspace.image_scale_spinbox),
+            ("blueprint X offset", workspace.image_x_offset_spinbox),
+            ("blueprint Y offset", workspace.image_y_offset_spinbox),
+        )
+        for control_name, control in controls:
+            with self.subTest(control=control_name):
+                scroll_bar.setValue(0)
+                _qt_application.processEvents()
+                original_value = control.value()
+
+                _send_wheel_event(control, angle_delta_y=-120)
+                _qt_application.processEvents()
+
+                self.assertAlmostEqual(control.value(), original_value)
+                self.assertGreater(scroll_bar.value(), 0)
+
+        scroll_bar.setValue(0)
+        level_scale_value = workspace.level_scale_spinbox.value()
+        _send_wheel_event(workspace.level_scale_spinbox.lineEdit(), -120)
+        _qt_application.processEvents()
+        self.assertAlmostEqual(
+            workspace.level_scale_spinbox.value(),
+            level_scale_value,
+        )
+        self.assertGreater(scroll_bar.value(), 0)
 
         workspace.close()
 

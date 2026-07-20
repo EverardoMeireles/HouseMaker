@@ -4,10 +4,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QSize, QTimer, Qt
-from PySide6.QtGui import QIcon, QKeySequence, QPixmap, QShortcut
+from PySide6.QtCore import QEvent, QObject, QPointF, QSize, QTimer, Qt
+from PySide6.QtGui import QIcon, QKeySequence, QPixmap, QShortcut, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractSpinBox,
     QButtonGroup,
     QComboBox,
     QDoubleSpinBox,
@@ -152,6 +153,45 @@ class DegreeSpinBox(QSpinBox):
 
     def textFromValue(self, value: int) -> str:  # type: ignore[override]
         return str(_normalize_degree_value(value))
+
+
+# ### Event filters ###
+class RightPanelSpinBoxWheelFilter(QObject):
+    """Scrolls a containing panel when its value inputs receive wheel events."""
+
+    def __init__(self, scroll_area: QScrollArea) -> None:
+        super().__init__(scroll_area)
+        self._scroll_area = scroll_area
+
+    def eventFilter(
+        self,
+        watched: QObject,
+        event: QEvent,
+    ) -> bool:  # type: ignore[override]
+        if event.type() != QEvent.Type.Wheel or not isinstance(event, QWheelEvent):
+            return super().eventFilter(watched, event)
+
+        self._forward_wheel_event_to_scroll_area(event)
+        event.accept()
+        return True
+
+    def _forward_wheel_event_to_scroll_area(self, event: QWheelEvent) -> None:
+        viewport = self._scroll_area.viewport()
+        viewport_position = viewport.mapFromGlobal(
+            event.globalPosition().toPoint()
+        )
+        forwarded_event = QWheelEvent(
+            QPointF(viewport_position),
+            event.globalPosition(),
+            event.pixelDelta(),
+            event.angleDelta(),
+            event.buttons(),
+            event.modifiers(),
+            event.phase(),
+            event.inverted(),
+            event.source(),
+        )
+        QApplication.sendEvent(viewport, forwarded_event)
 
 
 class BlueprintWorkspace(QWidget):
@@ -494,6 +534,15 @@ class BlueprintWorkspace(QWidget):
         self.png_export_button.clicked.connect(self._handle_png_export_clicked)
         buttons_layout.addWidget(self.png_export_button, 1)
         side_layout.addLayout(buttons_layout)
+
+        self._generals_spinbox_wheel_filter = RightPanelSpinBoxWheelFilter(
+            generals_tab
+        )
+        for spinbox in generals_content.findChildren(QAbstractSpinBox):
+            spinbox.installEventFilter(self._generals_spinbox_wheel_filter)
+            spinbox.lineEdit().installEventFilter(
+                self._generals_spinbox_wheel_filter
+            )
 
         self.side_tabs.addTab(self._build_uvs_tab(), "UVs")
         self.side_tabs.addTab(self._build_images_tab(), "Images")
