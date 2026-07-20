@@ -277,8 +277,6 @@ def _build_multi_level_meshes(
             raise ValueError(
                 f"Level {level.index} floor thickness must be greater than zero."
             )
-        _get_valid_level_scale(level)
-
         level_named_meshes = _build_named_meshes_for_level(
             level=level,
             level_lookup=level_lookup,
@@ -299,7 +297,7 @@ def _build_named_meshes_for_level(
 ) -> list[NamedMesh]:
     base_z_meters = _get_level_base_z(level_lookup, level.index)
     level_blueprint_size = level.image_size_pixels or blueprint_size_pixels
-    level_source_transform = _build_level_scale_source_transform(
+    level_source_transform = _build_level_source_transform(
         level,
         level_blueprint_size,
     )
@@ -831,7 +829,7 @@ def _build_preview_textured_walls(
                 level=level,
                 base_z_meters=_get_level_base_z(level_lookup, level.index),
                 blueprint_size_pixels=level_blueprint_size,
-                source_transform=_build_level_scale_source_transform(
+                source_transform=_build_level_source_transform(
                     level,
                     level_blueprint_size,
                 ),
@@ -942,32 +940,59 @@ def _get_valid_level_scale(level: LevelData) -> float:
     return scale
 
 
-def _build_level_scale_source_transform(
+def _get_valid_level_offset(level: LevelData, axis: str) -> float:
+    raw_offset = getattr(level, f"offset_{axis}_meters")
+    if isinstance(raw_offset, bool):
+        raise ValueError(
+            f"Level {level.index} {axis} offset must be a finite number."
+        )
+
+    try:
+        offset = float(raw_offset)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            f"Level {level.index} {axis} offset must be a finite number."
+        ) from error
+
+    if not math.isfinite(offset):
+        raise ValueError(
+            f"Level {level.index} {axis} offset must be a finite number."
+        )
+
+    return offset
+
+
+def _build_level_source_transform(
     level: LevelData,
     blueprint_size_pixels: tuple[float, float] | None,
 ) -> np.ndarray:
     scale = _get_valid_level_scale(level)
+    offset_x_meters = _get_valid_level_offset(level, "x")
+    offset_y_meters = _get_valid_level_offset(level, "y")
     transform = np.eye(4, dtype=float)
-    if scale == 1.0 or not level.vertex_data.vertices:
-        return transform
+    if scale != 1.0 and level.vertex_data.vertices:
+        level_points = np.asarray(
+            [
+                _vertex_to_world_xy(vertex, blueprint_size_pixels)
+                for vertex in level.vertex_data.vertices
+            ],
+            dtype=float,
+        )
+        if not np.all(np.isfinite(level_points)):
+            raise ValueError(
+                f"Level {level.index} vertices must have finite positions."
+            )
 
-    level_points = np.asarray(
-        [
-            _vertex_to_world_xy(vertex, blueprint_size_pixels)
-            for vertex in level.vertex_data.vertices
-        ],
-        dtype=float,
-    )
-    if not np.all(np.isfinite(level_points)):
-        raise ValueError(f"Level {level.index} vertices must have finite positions.")
+        minimum_point = np.min(level_points, axis=0)
+        maximum_point = np.max(level_points, axis=0)
+        pivot_point = (minimum_point + maximum_point) / 2.0
+        transform[0, 0] = scale
+        transform[1, 1] = scale
+        transform[0, 3] = float(pivot_point[0] * (1.0 - scale))
+        transform[1, 3] = float(pivot_point[1] * (1.0 - scale))
 
-    minimum_point = np.min(level_points, axis=0)
-    maximum_point = np.max(level_points, axis=0)
-    pivot_point = (minimum_point + maximum_point) / 2.0
-    transform[0, 0] = scale
-    transform[1, 1] = scale
-    transform[0, 3] = float(pivot_point[0] * (1.0 - scale))
-    transform[1, 3] = float(pivot_point[1] * (1.0 - scale))
+    transform[0, 3] += offset_x_meters
+    transform[1, 3] += offset_y_meters
     return transform
 
 

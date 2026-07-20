@@ -10,6 +10,9 @@ DEFAULT_LEVEL_HEIGHT_METERS = 3.0
 DEFAULT_LEVEL_SCALE = 1.0
 MIN_LEVEL_SCALE = 0.01
 MAX_LEVEL_SCALE = 20.0
+DEFAULT_LEVEL_OFFSET_METERS = 0.0
+MIN_LEVEL_OFFSET_METERS = -10000.0
+MAX_LEVEL_OFFSET_METERS = 10000.0
 DEFAULT_FLOOR_THICKNESS_METERS = 0.3
 MIN_FLOOR_THICKNESS_METERS = 0.01
 MAX_FLOOR_THICKNESS_METERS = 10.0
@@ -240,6 +243,8 @@ class LevelData:
     name: str
     height_meters: float = DEFAULT_LEVEL_HEIGHT_METERS
     scale: float = DEFAULT_LEVEL_SCALE
+    offset_x_meters: float = DEFAULT_LEVEL_OFFSET_METERS
+    offset_y_meters: float = DEFAULT_LEVEL_OFFSET_METERS
     vertex_data: VertexData = field(default_factory=VertexData)
     rooms: list[RoomData] = field(default_factory=list)
     image_path: str | None = None

@@ -11,14 +11,17 @@ from housemaker.models import (
     DEFAULT_INCLUDE_IN_EXPORT,
     DEFAULT_IMAGE_OFFSET,
     DEFAULT_IMAGE_SCALE,
+    DEFAULT_LEVEL_OFFSET_METERS,
     DEFAULT_LEVEL_SCALE,
     DEFAULT_ROOM_HEIGHT_METERS,
     DEFAULT_UV_MAP_HEIGHT,
     DEFAULT_UV_MAP_WIDTH,
     GROUND_LEVEL_INDEX,
     MAX_FLOOR_THICKNESS_METERS,
+    MAX_LEVEL_OFFSET_METERS,
     MAX_LEVEL_SCALE,
     MIN_FLOOR_THICKNESS_METERS,
+    MIN_LEVEL_OFFSET_METERS,
     MIN_LEVEL_SCALE,
     LevelData,
     RoomData,
@@ -61,6 +64,8 @@ def save_project(
                 "name": level.name,
                 "height_meters": level.height_meters,
                 "scale": float(level.scale),
+                "offset_x_meters": float(level.offset_x_meters),
+                "offset_y_meters": float(level.offset_y_meters),
                 "floor_thickness_meters": level.floor_thickness_meters,
                 "floor_contour_vertex_ids": list(
                     level.floor_contour_vertex_ids
@@ -117,6 +122,12 @@ def load_project(path: str | Path) -> ProjectData:
         level.height_meters = float(raw_level.get("height_meters", level.height_meters))
         level.scale = _deserialize_level_scale(
             raw_level.get("scale", DEFAULT_LEVEL_SCALE)
+        )
+        level.offset_x_meters = _deserialize_level_offset_meters(
+            raw_level.get("offset_x_meters", DEFAULT_LEVEL_OFFSET_METERS)
+        )
+        level.offset_y_meters = _deserialize_level_offset_meters(
+            raw_level.get("offset_y_meters", DEFAULT_LEVEL_OFFSET_METERS)
         )
         level.floor_thickness_meters = _deserialize_floor_thickness_meters(
             raw_level.get(
@@ -391,6 +402,24 @@ def _deserialize_level_scale(raw_scale: object) -> float:
         return DEFAULT_LEVEL_SCALE
 
     return min(max(scale, MIN_LEVEL_SCALE), MAX_LEVEL_SCALE)
+
+
+def _deserialize_level_offset_meters(raw_offset_meters: object) -> float:
+    if isinstance(raw_offset_meters, bool):
+        return DEFAULT_LEVEL_OFFSET_METERS
+
+    try:
+        offset_meters = float(raw_offset_meters)
+    except (TypeError, ValueError):
+        return DEFAULT_LEVEL_OFFSET_METERS
+
+    if not math.isfinite(offset_meters):
+        return DEFAULT_LEVEL_OFFSET_METERS
+
+    return min(
+        max(offset_meters, MIN_LEVEL_OFFSET_METERS),
+        MAX_LEVEL_OFFSET_METERS,
+    )
 
 
 def _deserialize_wall_uv_scales(raw_wall_uv_scales: object) -> dict[str, float]:

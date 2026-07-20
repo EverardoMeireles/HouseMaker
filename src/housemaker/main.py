@@ -45,6 +45,7 @@ from housemaker.models import (
     DEFAULT_FLOOR_THICKNESS_METERS,
     DEFAULT_IMAGE_OFFSET,
     DEFAULT_IMAGE_SCALE,
+    DEFAULT_LEVEL_OFFSET_METERS,
     DEFAULT_LEVEL_SCALE,
     DEFAULT_ROOM_HEIGHT_METERS,
     DEFAULT_UV_MAP_HEIGHT,
@@ -54,8 +55,10 @@ from housemaker.models import (
     GROUND_LEVEL_INDEX,
     LevelData,
     MAX_FLOOR_THICKNESS_METERS,
+    MAX_LEVEL_OFFSET_METERS,
     MAX_LEVEL_SCALE,
     MIN_FLOOR_THICKNESS_METERS,
+    MIN_LEVEL_OFFSET_METERS,
     MIN_LEVEL_SCALE,
     RoomData,
     create_default_levels,
@@ -233,22 +236,6 @@ class BlueprintWorkspace(QWidget):
         self.height_level_spinbox.valueChanged.connect(self._handle_height_level_changed)
         side_layout.addWidget(self.height_level_spinbox)
 
-        level_scale_label = QLabel("Level scale")
-        level_scale_label.setStyleSheet("font-size: 18px; font-weight: 600;")
-        side_layout.addWidget(level_scale_label)
-
-        self.level_scale_spinbox = QDoubleSpinBox()
-        self.level_scale_spinbox.setRange(MIN_LEVEL_SCALE, MAX_LEVEL_SCALE)
-        self.level_scale_spinbox.setDecimals(3)
-        self.level_scale_spinbox.setSingleStep(0.05)
-        self.level_scale_spinbox.setValue(DEFAULT_LEVEL_SCALE)
-        self.level_scale_spinbox.setSuffix(" x")
-        self.level_scale_spinbox.setMinimumHeight(40)
-        self.level_scale_spinbox.valueChanged.connect(
-            self._handle_level_scale_changed
-        )
-        side_layout.addWidget(self.level_scale_spinbox)
-
         floor_thickness_label = QLabel("Floor thickness")
         floor_thickness_label.setStyleSheet("font-size: 18px; font-weight: 600;")
         side_layout.addWidget(floor_thickness_label)
@@ -267,6 +254,60 @@ class BlueprintWorkspace(QWidget):
             self._handle_floor_thickness_changed
         )
         side_layout.addWidget(self.floor_thickness_spinbox)
+
+        level_scale_label = QLabel("Level scale")
+        level_scale_label.setStyleSheet("font-size: 18px; font-weight: 600;")
+        side_layout.addWidget(level_scale_label)
+
+        self.level_scale_spinbox = QDoubleSpinBox()
+        self.level_scale_spinbox.setRange(MIN_LEVEL_SCALE, MAX_LEVEL_SCALE)
+        self.level_scale_spinbox.setDecimals(3)
+        self.level_scale_spinbox.setSingleStep(0.05)
+        self.level_scale_spinbox.setValue(DEFAULT_LEVEL_SCALE)
+        self.level_scale_spinbox.setSuffix(" x")
+        self.level_scale_spinbox.setMinimumHeight(40)
+        self.level_scale_spinbox.valueChanged.connect(
+            self._handle_level_scale_changed
+        )
+        side_layout.addWidget(self.level_scale_spinbox)
+
+        level_x_offset_label = QLabel("X offset")
+        level_x_offset_label.setStyleSheet("font-size: 18px; font-weight: 600;")
+        side_layout.addWidget(level_x_offset_label)
+
+        self.level_x_offset_spinbox = QDoubleSpinBox()
+        self.level_x_offset_spinbox.setRange(
+            MIN_LEVEL_OFFSET_METERS,
+            MAX_LEVEL_OFFSET_METERS,
+        )
+        self.level_x_offset_spinbox.setDecimals(2)
+        self.level_x_offset_spinbox.setSingleStep(0.1)
+        self.level_x_offset_spinbox.setValue(DEFAULT_LEVEL_OFFSET_METERS)
+        self.level_x_offset_spinbox.setSuffix(" m")
+        self.level_x_offset_spinbox.setMinimumHeight(40)
+        self.level_x_offset_spinbox.valueChanged.connect(
+            self._handle_level_x_offset_changed
+        )
+        side_layout.addWidget(self.level_x_offset_spinbox)
+
+        level_y_offset_label = QLabel("Y offset")
+        level_y_offset_label.setStyleSheet("font-size: 18px; font-weight: 600;")
+        side_layout.addWidget(level_y_offset_label)
+
+        self.level_y_offset_spinbox = QDoubleSpinBox()
+        self.level_y_offset_spinbox.setRange(
+            MIN_LEVEL_OFFSET_METERS,
+            MAX_LEVEL_OFFSET_METERS,
+        )
+        self.level_y_offset_spinbox.setDecimals(2)
+        self.level_y_offset_spinbox.setSingleStep(0.1)
+        self.level_y_offset_spinbox.setValue(DEFAULT_LEVEL_OFFSET_METERS)
+        self.level_y_offset_spinbox.setSuffix(" m")
+        self.level_y_offset_spinbox.setMinimumHeight(40)
+        self.level_y_offset_spinbox.valueChanged.connect(
+            self._handle_level_y_offset_changed
+        )
+        side_layout.addWidget(self.level_y_offset_spinbox)
 
         self.floor_contour_status_label = QLabel("Floor contour: Not set")
         side_layout.addWidget(self.floor_contour_status_label)
@@ -319,7 +360,10 @@ class BlueprintWorkspace(QWidget):
         self.image_x_offset_spinbox.valueChanged.connect(
             self._handle_image_x_offset_changed
         )
-        image_transform_layout.addRow("X offset", self.image_x_offset_spinbox)
+        image_transform_layout.addRow(
+            "Blueprint X offset",
+            self.image_x_offset_spinbox,
+        )
 
         self.image_y_offset_spinbox = self._build_image_transform_spinbox(
             value=DEFAULT_IMAGE_OFFSET,
@@ -332,7 +376,10 @@ class BlueprintWorkspace(QWidget):
         self.image_y_offset_spinbox.valueChanged.connect(
             self._handle_image_y_offset_changed
         )
-        image_transform_layout.addRow("Y offset", self.image_y_offset_spinbox)
+        image_transform_layout.addRow(
+            "Blueprint Y offset",
+            self.image_y_offset_spinbox,
+        )
 
         include_widget = QWidget()
         include_layout = QHBoxLayout(include_widget)
@@ -1468,6 +1515,12 @@ class BlueprintWorkspace(QWidget):
         self._is_syncing_level_controls = True
         self.height_level_spinbox.setValue(self.current_level.height_meters)
         self.level_scale_spinbox.setValue(self.current_level.scale)
+        self.level_x_offset_spinbox.setValue(
+            self.current_level.offset_x_meters
+        )
+        self.level_y_offset_spinbox.setValue(
+            self.current_level.offset_y_meters
+        )
         self.floor_thickness_spinbox.setValue(
             self.current_level.floor_thickness_meters
         )
@@ -1622,6 +1675,20 @@ class BlueprintWorkspace(QWidget):
             return
 
         self.current_level.scale = float(value)
+        self._schedule_viewer_preview_refresh()
+
+    def _handle_level_x_offset_changed(self, value: float) -> None:
+        if self._is_syncing_level_controls:
+            return
+
+        self.current_level.offset_x_meters = float(value)
+        self._schedule_viewer_preview_refresh()
+
+    def _handle_level_y_offset_changed(self, value: float) -> None:
+        if self._is_syncing_level_controls:
+            return
+
+        self.current_level.offset_y_meters = float(value)
         self._schedule_viewer_preview_refresh()
 
     def _handle_floor_thickness_changed(self, value: float) -> None:
