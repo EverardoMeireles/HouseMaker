@@ -8,6 +8,7 @@ from PySide6.QtCore import QEvent, QObject, QPointF, QSize, QTimer, Qt
 from PySide6.QtGui import QIcon, QKeySequence, QPixmap, QShortcut, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractItemView,
     QAbstractSpinBox,
     QButtonGroup,
     QComboBox,
@@ -43,6 +44,8 @@ from housemaker.glb import (
     export_room_texture_pngs,
 )
 from housemaker.models import (
+    DEFAULT_DOORWAY_HEIGHT_METERS,
+    DEFAULT_DOORWAY_WIDTH_METERS,
     DEFAULT_FLOOR_THICKNESS_METERS,
     DEFAULT_IMAGE_OFFSET,
     DEFAULT_IMAGE_SCALE,
@@ -54,14 +57,20 @@ from housemaker.models import (
     DEFAULT_WALL_UV_ROTATION_DEGREES,
     DEFAULT_WALL_UV_SCALE,
     GROUND_LEVEL_INDEX,
+    DoorwayPreset,
     LevelData,
+    MAX_DOORWAY_HEIGHT_METERS,
+    MAX_DOORWAY_WIDTH_METERS,
     MAX_FLOOR_THICKNESS_METERS,
     MAX_LEVEL_OFFSET_METERS,
     MAX_LEVEL_SCALE,
+    MIN_DOORWAY_HEIGHT_METERS,
+    MIN_DOORWAY_WIDTH_METERS,
     MIN_FLOOR_THICKNESS_METERS,
     MIN_LEVEL_OFFSET_METERS,
     MIN_LEVEL_SCALE,
     RoomData,
+    create_default_doorway_presets,
     create_default_levels,
 )
 from housemaker.project_io import ProjectData, load_project, save_project
@@ -199,6 +208,9 @@ class BlueprintWorkspace(QWidget):
         super().__init__(parent)
         self.levels: list[LevelData] = create_default_levels()
         self.image_library_paths: list[str] = []
+        self.doorway_presets: list[DoorwayPreset] = (
+            create_default_doorway_presets()
+        )
         self.current_level_index = GROUND_LEVEL_INDEX
         self._is_syncing_level_controls = False
         self._is_syncing_room_controls = False
@@ -370,6 +382,74 @@ class BlueprintWorkspace(QWidget):
         floor_contour_buttons_layout.addWidget(self.clear_floor_contour_button)
         side_layout.addLayout(floor_contour_buttons_layout)
 
+        doorway_label = QLabel("Doorways")
+        doorway_label.setStyleSheet("font-size: 18px; font-weight: 600;")
+        side_layout.addWidget(doorway_label)
+
+        doorway_dimensions_layout = QFormLayout()
+        doorway_dimensions_layout.setContentsMargins(0, 0, 0, 0)
+        doorway_dimensions_layout.setSpacing(8)
+
+        self.doorway_width_spinbox = QDoubleSpinBox()
+        self.doorway_width_spinbox.setRange(
+            MIN_DOORWAY_WIDTH_METERS,
+            MAX_DOORWAY_WIDTH_METERS,
+        )
+        self.doorway_width_spinbox.setDecimals(2)
+        self.doorway_width_spinbox.setSingleStep(0.05)
+        self.doorway_width_spinbox.setValue(DEFAULT_DOORWAY_WIDTH_METERS)
+        self.doorway_width_spinbox.setSuffix(" m")
+        self.doorway_width_spinbox.setMinimumHeight(34)
+        doorway_dimensions_layout.addRow("Width", self.doorway_width_spinbox)
+
+        self.doorway_height_spinbox = QDoubleSpinBox()
+        self.doorway_height_spinbox.setRange(
+            MIN_DOORWAY_HEIGHT_METERS,
+            MAX_DOORWAY_HEIGHT_METERS,
+        )
+        self.doorway_height_spinbox.setDecimals(2)
+        self.doorway_height_spinbox.setSingleStep(0.05)
+        self.doorway_height_spinbox.setValue(DEFAULT_DOORWAY_HEIGHT_METERS)
+        self.doorway_height_spinbox.setSuffix(" m")
+        self.doorway_height_spinbox.setMinimumHeight(34)
+        doorway_dimensions_layout.addRow("Height", self.doorway_height_spinbox)
+        side_layout.addLayout(doorway_dimensions_layout)
+
+        self.add_doorway_preset_button = QPushButton("Add preset")
+        self.add_doorway_preset_button.setMinimumHeight(40)
+        self.add_doorway_preset_button.clicked.connect(
+            self._handle_add_doorway_preset_clicked
+        )
+        side_layout.addWidget(self.add_doorway_preset_button)
+
+        self.doorway_preset_list = QListWidget()
+        self.doorway_preset_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.doorway_preset_list.setMinimumHeight(112)
+        self.doorway_preset_list.currentRowChanged.connect(
+            self._handle_doorway_preset_selection_changed
+        )
+        side_layout.addWidget(self.doorway_preset_list)
+
+        doorway_buttons_layout = QHBoxLayout()
+        doorway_buttons_layout.setSpacing(10)
+
+        self.remove_doorway_preset_button = QPushButton("Remove selected preset")
+        self.remove_doorway_preset_button.setMinimumHeight(40)
+        self.remove_doorway_preset_button.clicked.connect(
+            self._handle_remove_doorway_preset_clicked
+        )
+        doorway_buttons_layout.addWidget(self.remove_doorway_preset_button)
+
+        self.place_doorway_button = QPushButton("Place selected doorway")
+        self.place_doorway_button.setMinimumHeight(40)
+        self.place_doorway_button.clicked.connect(
+            self._handle_place_selected_doorway_clicked
+        )
+        doorway_buttons_layout.addWidget(self.place_doorway_button)
+        side_layout.addLayout(doorway_buttons_layout)
+
         self.load_image_button = QPushButton("Load image")
         self.load_image_button.setMinimumHeight(44)
         self.load_image_button.clicked.connect(self._handle_load_image_clicked)
@@ -535,6 +615,8 @@ class BlueprintWorkspace(QWidget):
         buttons_layout.addWidget(self.png_export_button, 1)
         side_layout.addLayout(buttons_layout)
 
+        self._refresh_doorway_preset_list(selected_index=0)
+
         self._generals_spinbox_wheel_filter = RightPanelSpinBoxWheelFilter(
             generals_tab
         )
@@ -558,6 +640,7 @@ class BlueprintWorkspace(QWidget):
         self.canvas.floor_contour_changed.connect(
             self._handle_floor_contour_changed
         )
+        self.canvas.doorways_changed.connect(self._handle_doorways_changed)
         self._refresh_levels_list()
         self._refresh_room_lists()
         self._sync_level_controls()
@@ -967,6 +1050,7 @@ class BlueprintWorkspace(QWidget):
                 current_level_index=self.current_level_index,
                 levels=self.levels,
                 image_library_paths=self.image_library_paths,
+                doorway_presets=self.doorway_presets,
             )
         except ValueError as error:
             QMessageBox.critical(self, "Save failed", str(error))
@@ -1173,6 +1257,37 @@ class BlueprintWorkspace(QWidget):
 
     def _build_level_item(self, level: LevelData) -> QListWidgetItem:
         return QListWidgetItem(level.display_name)
+
+    def _refresh_doorway_preset_list(
+        self,
+        selected_index: int | None = None,
+    ) -> None:
+        if selected_index is None:
+            selected_index = self.doorway_preset_list.currentRow()
+
+        self.doorway_preset_list.blockSignals(True)
+        self.doorway_preset_list.clear()
+        for preset in self.doorway_presets:
+            self.doorway_preset_list.addItem(
+                _format_doorway_preset_label(preset)
+            )
+
+        if 0 <= selected_index < self.doorway_preset_list.count():
+            self.doorway_preset_list.setCurrentRow(selected_index)
+        self.doorway_preset_list.blockSignals(False)
+        self._update_doorway_preset_button_state()
+
+    def _get_selected_doorway_preset(self) -> DoorwayPreset | None:
+        selected_index = self.doorway_preset_list.currentRow()
+        if selected_index < 0 or selected_index >= len(self.doorway_presets):
+            return None
+
+        return self.doorway_presets[selected_index]
+
+    def _update_doorway_preset_button_state(self) -> None:
+        has_selected_preset = self._get_selected_doorway_preset() is not None
+        self.remove_doorway_preset_button.setEnabled(has_selected_preset)
+        self.place_doorway_button.setEnabled(has_selected_preset)
 
     def _refresh_rooms_list(self) -> None:
         selected_room_index = self._get_selected_room_index()
@@ -1747,6 +1862,42 @@ class BlueprintWorkspace(QWidget):
         self.current_level.floor_thickness_meters = float(value)
         self._schedule_viewer_preview_refresh()
 
+    def _handle_add_doorway_preset_clicked(self) -> None:
+        doorway_preset = DoorwayPreset(
+            width_meters=float(self.doorway_width_spinbox.value()),
+            height_meters=float(self.doorway_height_spinbox.value()),
+        )
+        self.doorway_presets.append(doorway_preset)
+        self._refresh_doorway_preset_list(
+            selected_index=len(self.doorway_presets) - 1
+        )
+
+    def _handle_doorway_preset_selection_changed(self, _row: int) -> None:
+        self._update_doorway_preset_button_state()
+
+    def _handle_remove_doorway_preset_clicked(self) -> None:
+        selected_index = self.doorway_preset_list.currentRow()
+        if selected_index < 0 or selected_index >= len(self.doorway_presets):
+            return
+
+        del self.doorway_presets[selected_index]
+        next_selected_index = min(selected_index, len(self.doorway_presets) - 1)
+        self._refresh_doorway_preset_list(
+            selected_index=next_selected_index
+        )
+
+    def _handle_place_selected_doorway_clicked(self) -> None:
+        doorway_preset = self._get_selected_doorway_preset()
+        if doorway_preset is None:
+            return
+
+        self.canvas.start_doorway_placement(doorway_preset)
+        self.workspace_tabs.setCurrentWidget(self.canvas)
+
+    def _handle_doorways_changed(self) -> None:
+        self.current_level.doorways = self.canvas.doorways
+        self._schedule_viewer_preview_refresh()
+
     def _handle_set_floor_contour_clicked(self) -> None:
         self.canvas.start_floor_contour_designation()
         self.workspace_tabs.setCurrentWidget(self.canvas)
@@ -2046,6 +2197,7 @@ class BlueprintWorkspace(QWidget):
             levels=project_data.levels,
             current_level_index=project_data.current_level_index,
             image_library_paths=project_data.image_library_paths,
+            doorway_presets=project_data.doorway_presets,
         )
 
     def _apply_project_state(
@@ -2053,17 +2205,23 @@ class BlueprintWorkspace(QWidget):
         levels: list[LevelData],
         current_level_index: int,
         image_library_paths: list[str] | None = None,
+        doorway_presets: list[DoorwayPreset] | None = None,
     ) -> None:
         self.levels = levels
         self.image_library_paths = self._normalize_image_library_paths(
             image_library_paths or []
         )
+        if doorway_presets is not None:
+            self.doorway_presets = list(doorway_presets)
         self.current_level_index = min(max(current_level_index, 0), len(self.levels) - 1)
         self.texture_creator_level_index = None
         self.texture_creator_room_index = None
         self.texture_creator_wall_key = None
 
         self._refresh_image_thumbnail_list()
+        self._refresh_doorway_preset_list(
+            selected_index=0 if self.doorway_presets else -1
+        )
         self._refresh_levels_list()
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
@@ -2076,6 +2234,7 @@ class BlueprintWorkspace(QWidget):
             file_path=normalized_path,
             vertex_data=self.current_level.vertex_data,
             rooms=self.current_level.rooms,
+            doorways=self.current_level.doorways,
             floor_contour_vertex_ids=(
                 self.current_level.floor_contour_vertex_ids
             ),
@@ -2093,6 +2252,7 @@ class BlueprintWorkspace(QWidget):
         self.canvas.set_level_data(
             vertex_data=self.current_level.vertex_data,
             rooms=self.current_level.rooms,
+            doorways=self.current_level.doorways,
             floor_contour_vertex_ids=(
                 self.current_level.floor_contour_vertex_ids
             ),
@@ -2225,6 +2385,13 @@ def _normalize_degree_value(value: int) -> int:
 
 
 # ### Text helpers ###
+def _format_doorway_preset_label(doorway_preset: DoorwayPreset) -> str:
+    return (
+        f"{doorway_preset.width_meters:.2f} m × "
+        f"{doorway_preset.height_meters:.2f} m"
+    )
+
+
 def _build_wall_aspect_ratio_text(placement: UvWallPlacement | None) -> str:
     if placement is None:
         return "Aspect ratio: none"

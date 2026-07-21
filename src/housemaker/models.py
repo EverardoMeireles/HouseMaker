@@ -16,6 +16,15 @@ MAX_LEVEL_OFFSET_METERS = 10000.0
 DEFAULT_FLOOR_THICKNESS_METERS = 0.3
 MIN_FLOOR_THICKNESS_METERS = 0.01
 MAX_FLOOR_THICKNESS_METERS = 10.0
+DEFAULT_DOORWAY_WIDTH_METERS = 0.90
+DEFAULT_DOORWAY_HEIGHT_METERS = 2.10
+DEFAULT_DOORWAY_DEPTH_METERS = 0.20
+MIN_DOORWAY_WIDTH_METERS = 0.10
+MAX_DOORWAY_WIDTH_METERS = 20.0
+MIN_DOORWAY_HEIGHT_METERS = 0.10
+MAX_DOORWAY_HEIGHT_METERS = 20.0
+MIN_DOORWAY_DEPTH_METERS = 0.01
+MAX_DOORWAY_DEPTH_METERS = 10.0
 DEFAULT_ROOM_HEIGHT_METERS = 3.0
 DEFAULT_IMAGE_SCALE = 1.0
 DEFAULT_IMAGE_OFFSET = 0.0
@@ -76,6 +85,22 @@ class WallTextureData:
     source_y: float
     source_width: float
     source_height: float
+
+
+@dataclass(frozen=True)
+class DoorwayPreset:
+    width_meters: float
+    height_meters: float
+
+
+@dataclass
+class DoorwayData:
+    center_x: float
+    center_y: float
+    width_meters: float
+    height_meters: float
+    depth_meters: float = DEFAULT_DOORWAY_DEPTH_METERS
+    rotation_degrees: float = 0.0
 
 
 @dataclass
@@ -247,6 +272,7 @@ class LevelData:
     offset_y_meters: float = DEFAULT_LEVEL_OFFSET_METERS
     vertex_data: VertexData = field(default_factory=VertexData)
     rooms: list[RoomData] = field(default_factory=list)
+    doorways: list[DoorwayData] = field(default_factory=list)
     image_path: str | None = None
     image_size_pixels: tuple[float, float] | None = None
     image_scale: float = DEFAULT_IMAGE_SCALE
@@ -284,6 +310,15 @@ def snap_point(
 
 
 # ### Level helpers ###
+def create_default_doorway_presets() -> list[DoorwayPreset]:
+    return [
+        DoorwayPreset(
+            width_meters=DEFAULT_DOORWAY_WIDTH_METERS,
+            height_meters=DEFAULT_DOORWAY_HEIGHT_METERS,
+        )
+    ]
+
+
 def create_default_levels() -> list[LevelData]:
     return [
         LevelData(index=level_index, name=_get_level_name(level_index))

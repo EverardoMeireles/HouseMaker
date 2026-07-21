@@ -7,6 +7,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from housemaker.models import (
+    DEFAULT_DOORWAY_DEPTH_METERS,
+    DEFAULT_DOORWAY_HEIGHT_METERS,
+    DEFAULT_DOORWAY_WIDTH_METERS,
     DEFAULT_FLOOR_THICKNESS_METERS,
     DEFAULT_INCLUDE_IN_EXPORT,
     DEFAULT_IMAGE_OFFSET,
@@ -18,15 +21,24 @@ from housemaker.models import (
     DEFAULT_UV_MAP_WIDTH,
     GROUND_LEVEL_INDEX,
     MAX_FLOOR_THICKNESS_METERS,
+    MAX_DOORWAY_DEPTH_METERS,
+    MAX_DOORWAY_HEIGHT_METERS,
+    MAX_DOORWAY_WIDTH_METERS,
     MAX_LEVEL_OFFSET_METERS,
     MAX_LEVEL_SCALE,
     MIN_FLOOR_THICKNESS_METERS,
+    MIN_DOORWAY_DEPTH_METERS,
+    MIN_DOORWAY_HEIGHT_METERS,
+    MIN_DOORWAY_WIDTH_METERS,
     MIN_LEVEL_OFFSET_METERS,
     MIN_LEVEL_SCALE,
+    DoorwayData,
+    DoorwayPreset,
     LevelData,
     RoomData,
     VertexData,
     WallTextureData,
+    create_default_doorway_presets,
     create_default_levels,
 )
 
@@ -41,6 +53,9 @@ class ProjectData:
     current_level_index: int
     levels: list[LevelData]
     image_library_paths: list[str] = field(default_factory=list)
+    doorway_presets: list[DoorwayPreset] = field(
+        default_factory=create_default_doorway_presets
+    )
 
 
 # ### Public helpers ###
@@ -49,6 +64,7 @@ def save_project(
     current_level_index: int,
     levels: list[LevelData],
     image_library_paths: list[str] | None = None,
+    doorway_presets: list[DoorwayPreset] | None = None,
 ) -> Path:
     export_path = Path(path)
     payload = {
@@ -57,6 +73,11 @@ def save_project(
         "current_level_index": int(current_level_index),
         "image_library_paths": _serialize_image_library_paths(
             image_library_paths or []
+        ),
+        "doorway_presets": _serialize_doorway_presets(
+            doorway_presets
+            if doorway_presets is not None
+            else create_default_doorway_presets()
         ),
         "levels": [
             {
@@ -78,6 +99,10 @@ def save_project(
                 "include_in_export": bool(level.include_in_export),
                 "vertex_data": level.vertex_data.to_dict(),
                 "rooms": [_serialize_room(room) for room in level.rooms],
+                "doorways": [
+                    _serialize_doorway(doorway)
+                    for doorway in level.doorways
+                ],
             }
             for level in levels
         ],
@@ -160,9 +185,13 @@ def load_project(path: str | Path) -> ProjectData:
             raw_level.get("rooms", []),
             default_height_meters=level.height_meters,
         )
+        level.doorways = _deserialize_doorways(raw_level.get("doorways", []))
 
     image_library_paths = _deserialize_image_library_paths(
         payload.get("image_library_paths", [])
+    )
+    doorway_presets = _deserialize_doorway_presets(
+        payload.get("doorway_presets")
     )
     _clear_image_library_paths_from_levels(levels, image_library_paths)
 
@@ -175,6 +204,7 @@ def load_project(path: str | Path) -> ProjectData:
         current_level_index=current_level_index,
         levels=levels,
         image_library_paths=image_library_paths,
+        doorway_presets=doorway_presets,
     )
 
 
@@ -259,6 +289,182 @@ def _clear_image_library_paths_from_levels(
         level.image_size_pixels = None
 
 
+# ### Doorway serialization helpers ###
+def _serialize_doorway_presets(
+    doorway_presets: list[DoorwayPreset],
+) -> list[dict[str, float]]:
+    return [
+        {
+            "width_meters": float(preset.width_meters),
+            "height_meters": float(preset.height_meters),
+        }
+        for preset in doorway_presets
+    ]
+
+
+def _deserialize_doorway_presets(raw_presets: object) -> list[DoorwayPreset]:
+    if not isinstance(raw_presets, list | tuple):
+        return create_default_doorway_presets()
+
+    doorway_presets: list[DoorwayPreset] = []
+    for raw_preset in raw_presets:
+        if not isinstance(raw_preset, dict):
+            continue
+
+        doorway_presets.append(
+            DoorwayPreset(
+                width_meters=_deserialize_doorway_width_meters(
+                    raw_preset.get(
+                        "width_meters",
+                        DEFAULT_DOORWAY_WIDTH_METERS,
+                    )
+                ),
+                height_meters=_deserialize_doorway_height_meters(
+                    raw_preset.get(
+                        "height_meters",
+                        DEFAULT_DOORWAY_HEIGHT_METERS,
+                    )
+                ),
+            )
+        )
+
+    return doorway_presets
+
+
+def _serialize_doorway(doorway: DoorwayData) -> dict[str, float]:
+    return {
+        "center_x": float(doorway.center_x),
+        "center_y": float(doorway.center_y),
+        "width_meters": float(doorway.width_meters),
+        "height_meters": float(doorway.height_meters),
+        "depth_meters": float(doorway.depth_meters),
+        "rotation_degrees": float(doorway.rotation_degrees),
+    }
+
+
+def _deserialize_doorways(raw_doorways: object) -> list[DoorwayData]:
+    if not isinstance(raw_doorways, list | tuple):
+        return []
+
+    doorways: list[DoorwayData] = []
+    for raw_doorway in raw_doorways:
+        if not isinstance(raw_doorway, dict):
+            continue
+
+        center_x = _deserialize_doorway_coordinate(raw_doorway.get("center_x"))
+        center_y = _deserialize_doorway_coordinate(raw_doorway.get("center_y"))
+        if center_x is None or center_y is None:
+            continue
+
+        doorways.append(
+            DoorwayData(
+                center_x=center_x,
+                center_y=center_y,
+                width_meters=_deserialize_doorway_width_meters(
+                    raw_doorway.get(
+                        "width_meters",
+                        DEFAULT_DOORWAY_WIDTH_METERS,
+                    )
+                ),
+                height_meters=_deserialize_doorway_height_meters(
+                    raw_doorway.get(
+                        "height_meters",
+                        DEFAULT_DOORWAY_HEIGHT_METERS,
+                    )
+                ),
+                depth_meters=_deserialize_doorway_depth_meters(
+                    raw_doorway.get(
+                        "depth_meters",
+                        DEFAULT_DOORWAY_DEPTH_METERS,
+                    )
+                ),
+                rotation_degrees=_deserialize_doorway_rotation_degrees(
+                    raw_doorway.get("rotation_degrees", 0.0)
+                ),
+            )
+        )
+
+    return doorways
+
+
+def _deserialize_doorway_coordinate(raw_coordinate: object) -> float | None:
+    if isinstance(raw_coordinate, bool):
+        return None
+
+    try:
+        coordinate = float(raw_coordinate)
+    except (TypeError, ValueError):
+        return None
+
+    if not math.isfinite(coordinate):
+        return None
+
+    return coordinate
+
+
+def _deserialize_doorway_width_meters(raw_width_meters: object) -> float:
+    return _deserialize_doorway_measurement_meters(
+        raw_width_meters,
+        default_value=DEFAULT_DOORWAY_WIDTH_METERS,
+        minimum=MIN_DOORWAY_WIDTH_METERS,
+        maximum=MAX_DOORWAY_WIDTH_METERS,
+    )
+
+
+def _deserialize_doorway_height_meters(raw_height_meters: object) -> float:
+    return _deserialize_doorway_measurement_meters(
+        raw_height_meters,
+        default_value=DEFAULT_DOORWAY_HEIGHT_METERS,
+        minimum=MIN_DOORWAY_HEIGHT_METERS,
+        maximum=MAX_DOORWAY_HEIGHT_METERS,
+    )
+
+
+def _deserialize_doorway_depth_meters(raw_depth_meters: object) -> float:
+    return _deserialize_doorway_measurement_meters(
+        raw_depth_meters,
+        default_value=DEFAULT_DOORWAY_DEPTH_METERS,
+        minimum=MIN_DOORWAY_DEPTH_METERS,
+        maximum=MAX_DOORWAY_DEPTH_METERS,
+    )
+
+
+def _deserialize_doorway_measurement_meters(
+    raw_measurement_meters: object,
+    default_value: float,
+    minimum: float,
+    maximum: float,
+) -> float:
+    if isinstance(raw_measurement_meters, bool):
+        return default_value
+
+    try:
+        measurement_meters = float(raw_measurement_meters)
+    except (TypeError, ValueError):
+        return default_value
+
+    if not math.isfinite(measurement_meters):
+        return default_value
+
+    return min(max(measurement_meters, minimum), maximum)
+
+
+def _deserialize_doorway_rotation_degrees(raw_rotation_degrees: object) -> float:
+    if isinstance(raw_rotation_degrees, bool):
+        return 0.0
+
+    try:
+        rotation_degrees = float(raw_rotation_degrees)
+    except (TypeError, ValueError):
+        return 0.0
+
+    if not math.isfinite(rotation_degrees):
+        return 0.0
+
+    return rotation_degrees % 360.0
+
+
+# ### Room serialization helpers ###
 def _serialize_room(room: RoomData) -> dict[str, object]:
     return {
         "name": room.name,
