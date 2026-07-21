@@ -138,6 +138,27 @@ def _build_intersected_wall_level() -> LevelData:
     )
 
 
+def _build_parallel_wall_doorway_level() -> LevelData:
+    vertex_data = VertexData()
+    _add_wall(vertex_data, (10.0, 45.0), (90.0, 45.0))
+    _add_wall(vertex_data, (10.0, 55.0), (90.0, 55.0))
+    return LevelData(
+        index=2,
+        name="Ground",
+        vertex_data=vertex_data,
+        doorways=[
+            DoorwayData(
+                center_x=50.0,
+                center_y=50.0,
+                width_meters=0.9,
+                height_meters=2.1,
+                depth_meters=0.2,
+                rotation_degrees=90.0,
+            )
+        ],
+    )
+
+
 def _get_depth_border_image_position(
     doorway: DoorwayData,
     depth_border_sign: float = 1.0,
@@ -546,13 +567,14 @@ class DoorwayTests(unittest.TestCase):
         model = convert_to_glb([level])
         model_without_doorway = convert_to_glb([no_doorway_level])
 
-        self.assertEqual(
-            set(model.scene.geometry),
-            set(model_without_doorway.scene.geometry),
+        self.assertTrue(
+            set(model_without_doorway.scene.geometry).issubset(
+                model.scene.geometry
+            )
         )
         self.assertFalse(
             any(
-                "doorway" in geometry_name.lower()
+                geometry_name.endswith("_doorway_reveals")
                 for geometry_name in model.scene.geometry
             )
         )
@@ -626,6 +648,83 @@ class DoorwayTests(unittest.TestCase):
                 exported_mesh,
                 (1.0, 1.0, 0.3),
                 fixed_axis=0,
+            )
+        )
+
+    def test_glb_seals_parallel_wall_doorway_with_jambs_and_soffit(self) -> None:
+        model = convert_to_glb([_build_parallel_wall_doorway_level()])
+
+        # The openings in the front and back wall planes remain empty.
+        for wall_plane_y in (-0.9, -1.1):
+            with self.subTest(wall_plane_y=wall_plane_y):
+                self.assertFalse(
+                    _mesh_covers_point_on_plane(
+                        model.mesh,
+                        (1.0, wall_plane_y, 1.0),
+                        fixed_axis=1,
+                    )
+                )
+
+        # The two jambs bridge both wall contacts through doorway depth.
+        for jamb_x in (0.55, 1.45):
+            with self.subTest(jamb_x=jamb_x):
+                self.assertTrue(
+                    _mesh_covers_point_on_plane(
+                        model.mesh,
+                        (jamb_x, -1.0, 1.0),
+                        fixed_axis=0,
+                    )
+                )
+
+        # The top reveal seals the passage without filling its vertical opening.
+        self.assertTrue(
+            _mesh_covers_point_on_plane(
+                model.mesh,
+                (1.0, -1.0, 2.1),
+                fixed_axis=2,
+            )
+        )
+        self.assertFalse(
+            _mesh_covers_point_on_plane(
+                model.mesh,
+                (1.0, -1.0, 1.0),
+                fixed_axis=1,
+            )
+        )
+
+        exported_mesh = _load_glb_world_mesh(model.glb_bytes)
+        for wall_plane_z in (0.9, 1.1):
+            with self.subTest(exported_wall_plane_z=wall_plane_z):
+                self.assertFalse(
+                    _mesh_covers_point_on_plane(
+                        exported_mesh,
+                        (1.0, 1.0, wall_plane_z),
+                        fixed_axis=2,
+                    )
+                )
+
+        for jamb_x in (0.55, 1.45):
+            with self.subTest(exported_jamb_x=jamb_x):
+                self.assertTrue(
+                    _mesh_covers_point_on_plane(
+                        exported_mesh,
+                        (jamb_x, 1.0, 1.0),
+                        fixed_axis=0,
+                    )
+                )
+
+        self.assertTrue(
+            _mesh_covers_point_on_plane(
+                exported_mesh,
+                (1.0, 2.1, 1.0),
+                fixed_axis=1,
+            )
+        )
+        self.assertFalse(
+            _mesh_covers_point_on_plane(
+                exported_mesh,
+                (1.0, 1.0, 1.0),
+                fixed_axis=2,
             )
         )
 
