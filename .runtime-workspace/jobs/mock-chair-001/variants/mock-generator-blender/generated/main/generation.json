@@ -1,0 +1,8 @@
+{
+  "componentId": "main",
+  "deterministicDigest": "7bf722b5c0aa6933c00bfbf9c239fbd19b6b007d4782c328429b769bfe47a2a7",
+  "generator": "mock",
+  "mesh": "main.obj",
+  "seed": 1001,
+  "triangleCount": 12
+}

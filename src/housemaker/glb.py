@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Sequence
+from io import BytesIO
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -57,6 +58,7 @@ ROOM_TEXTURE_MAX_FONT_SIZE = 32
 FALLBACK_QT_PLATFORM = "offscreen"
 WALL_OPENING_EPSILON = 1e-6
 WALL_REVEAL_PARALLEL_COSINE = math.cos(math.radians(10.0))
+MAX_IMPORTED_GENERATED_MODEL_FACES = 1_000_000
 
 # ### Module state ###
 _fallback_qt_application: QGuiApplication | None = None
@@ -68,6 +70,10 @@ class GeneratedModel:
     scene: trimesh.Scene
     glb_bytes: bytes
     preview_textured_walls: list["PreviewTexturedWall"] = field(default_factory=list)
+    preview_textured_surfaces: list["PreviewTexturedSurface"] = field(
+        default_factory=list
+    )
+    preview_untextured_mesh: trimesh.Trimesh | None = None
 
 
 @dataclass
@@ -88,6 +94,18 @@ class PreviewTexturedWall:
     end_point: tuple[float, float, float]
     height_meters: float
     texture_rgba: np.ndarray
+
+
+@dataclass(frozen=True)
+class PreviewTexturedSurface:
+    """One semantic surface carrying its exported texture and planar UVs."""
+
+    surface_id: str
+    surface_type: str
+    mesh: trimesh.Trimesh
+    level_index: int | None = None
+    room_index: int | None = None
+    wall_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -172,6 +190,10 @@ def convert_to_glb(
     level_source: VertexData | Sequence[LevelData],
     wall_height_meters: float = DEFAULT_WALL_HEIGHT_METERS,
     blueprint_size_pixels: tuple[float, float] | None = None,
+    surface_materials: (
+        Mapping[str, bytes | bytearray | memoryview | str | Path] | None
+    ) = None,
+    surface_texture_world_size_meters: float = 2.0,
 ) -> GeneratedModel:
     if isinstance(level_source, VertexData):
         preview_textured_walls: list[PreviewTexturedWall] = []
@@ -203,18 +225,192 @@ def convert_to_glb(
     )
     scene = _build_export_scene(named_meshes)
     glb_bytes = scene.export(file_type="glb")
-    return GeneratedModel(
+    model = GeneratedModel(
         mesh=combined_mesh,
         scene=scene,
         glb_bytes=glb_bytes,
         preview_textured_walls=preview_textured_walls,
     )
+    if not surface_materials:
+        return model
+    return _apply_surface_material_overlays(
+        model=model,
+        level_source=level_source,
+        surface_materials=surface_materials,
+        surface_texture_world_size_meters=(
+            surface_texture_world_size_meters
+        ),
+    )
+
+
+def _apply_surface_material_overlays(
+    model: GeneratedModel,
+    level_source: VertexData | Sequence[LevelData],
+    surface_materials: Mapping[
+        str,
+        bytes | bytearray | memoryview | str | Path,
+    ],
+    surface_texture_world_size_meters: float,
+) -> GeneratedModel:
+    """Overlay only assigned semantic faces on the unchanged legacy model."""
+
+    if not isinstance(surface_materials, Mapping):
+        raise TypeError("Surface materials must be provided as a mapping.")
+    if isinstance(level_source, VertexData):
+        raise ValueError(
+            "Surface materials require level data with stable surface IDs."
+        )
+
+    from housemaker.surface_geometry import build_fixed_surfaces
+    from housemaker.surface_materials import (
+        build_world_planar_textured_mesh,
+        normalize_texture_world_size,
+        resolve_surface_materials,
+    )
+
+    levels = list(level_source)
+    fixed_surfaces = build_fixed_surfaces(levels)
+    known_surface_ids = {surface.surface_id for surface in fixed_surfaces}
+    live_sources = {
+        str(surface_id): source
+        for surface_id, source in surface_materials.items()
+        if str(surface_id) in known_surface_ids
+    }
+    if not live_sources:
+        return model
+    texture_world_size = normalize_texture_world_size(
+        surface_texture_world_size_meters
+    )
+    resolved_materials = resolve_surface_materials(live_sources)
+    (
+        overlay_named_meshes,
+        preview_textured_surfaces,
+    ) = _build_surface_named_meshes(
+        fixed_surfaces=fixed_surfaces,
+        resolved_materials=resolved_materials,
+        texture_world_size_meters=texture_world_size,
+        build_textured_mesh=build_world_planar_textured_mesh,
+    )
+    if not overlay_named_meshes:
+        return model
+    combined_mesh = _combine_mesh_geometry(
+        [model.mesh, *[named_mesh.mesh for named_mesh in overlay_named_meshes]]
+    )
+    scene = model.scene.copy()
+    for named_mesh in overlay_named_meshes:
+        scene.add_geometry(
+            _to_gltf_y_up_mesh(named_mesh.mesh),
+            geom_name=named_mesh.name,
+            node_name=named_mesh.name,
+        )
+    return GeneratedModel(
+        mesh=combined_mesh,
+        scene=scene,
+        glb_bytes=scene.export(file_type="glb"),
+        preview_textured_walls=model.preview_textured_walls,
+        preview_textured_surfaces=preview_textured_surfaces,
+        preview_untextured_mesh=model.mesh,
+    )
+
+
+# ### Surface material helpers ###
+def _build_surface_named_meshes(
+    fixed_surfaces: Sequence[object],
+    resolved_materials: Mapping[str, object],
+    texture_world_size_meters: float,
+    build_textured_mesh: Callable[..., trimesh.Trimesh],
+) -> tuple[list[NamedMesh], list[PreviewTexturedSurface]]:
+    named_meshes: list[NamedMesh] = []
+    preview_surfaces: list[PreviewTexturedSurface] = []
+    for surface in fixed_surfaces:
+        surface_id = str(getattr(surface, "surface_id"))
+        surface_type = str(getattr(surface, "surface_type"))
+        mesh = getattr(surface, "mesh").copy()
+        material = resolved_materials.get(surface_id)
+        if material is None:
+            continue
+        mesh = build_textured_mesh(
+            mesh,
+            surface_type,
+            material,
+            texture_world_size_meters=texture_world_size_meters,
+            material_name=f"Surface {surface_id}",
+            overlay_offset_meters=0.002,
+        )
+        preview_surfaces.append(
+            PreviewTexturedSurface(
+                surface_id=surface_id,
+                surface_type=surface_type,
+                mesh=mesh.copy(),
+                level_index=getattr(surface, "level_index", None),
+                room_index=getattr(surface, "room_index", None),
+                wall_key=getattr(surface, "wall_key", None),
+            )
+        )
+        named_mesh = NamedMesh(
+            name=_get_surface_object_name(surface_id),
+            mesh=mesh,
+        )
+        named_meshes.append(named_mesh)
+    return named_meshes, preview_surfaces
+
+
+def _get_surface_object_name(surface_id: str) -> str:
+    normalized = "".join(
+        character if character.isalnum() else "_"
+        for character in surface_id.lower()
+    ).strip("_")
+    return f"surface_{normalized or 'unnamed'}"
 
 
 def export_glb_file(model: GeneratedModel, path: str | Path) -> Path:
     export_path = Path(path)
     export_path.write_bytes(model.glb_bytes)
     return export_path
+
+
+def import_generated_glb(glb_bytes: bytes) -> GeneratedModel:
+    """Load a provider GLB and build a Z-up preview without altering its export."""
+
+    payload = bytes(glb_bytes)
+    if not payload:
+        raise ValueError("The generated GLB is empty.")
+    try:
+        loaded = trimesh.load(
+            BytesIO(payload),
+            file_type="glb",
+            force="scene",
+            process=False,
+        )
+    except Exception as error:
+        raise ValueError("The generated GLB could not be loaded.") from error
+    if isinstance(loaded, trimesh.Trimesh):
+        scene = trimesh.Scene(loaded)
+    elif isinstance(loaded, trimesh.Scene):
+        scene = loaded
+    else:
+        raise ValueError("The generated GLB contains no mesh scene.")
+
+    try:
+        preview_mesh = scene.to_geometry()
+    except Exception as error:
+        raise ValueError("The generated GLB geometry could not be combined.") from error
+    if not isinstance(preview_mesh, trimesh.Trimesh):
+        raise ValueError("The generated GLB contains no triangle mesh.")
+    if len(preview_mesh.vertices) == 0 or len(preview_mesh.faces) == 0:
+        raise ValueError("The generated GLB contains empty geometry.")
+    if len(preview_mesh.faces) > MAX_IMPORTED_GENERATED_MODEL_FACES:
+        raise ValueError("The generated GLB contains too many faces.")
+    if not np.all(np.isfinite(preview_mesh.vertices)):
+        raise ValueError("The generated GLB contains invalid vertex coordinates.")
+
+    preview_mesh = preview_mesh.copy()
+    preview_mesh.apply_transform(GLTF_Y_UP_TO_Z_UP_TRANSFORM)
+    return GeneratedModel(
+        mesh=preview_mesh,
+        scene=scene,
+        glb_bytes=payload,
+    )
 
 
 def export_room_texture_pngs(

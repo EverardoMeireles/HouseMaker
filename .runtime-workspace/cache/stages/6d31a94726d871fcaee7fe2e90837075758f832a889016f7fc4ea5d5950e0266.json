@@ -1,0 +1,25 @@
+{
+  "cacheKey": "6d31a94726d871fcaee7fe2e90837075758f832a889016f7fc4ea5d5950e0266",
+  "stageType": "input_embeddings",
+  "applicationVersion": "0.1.0",
+  "createdAt": "2026-08-03T23:36:10.406106Z",
+  "result": {
+    "stage": "input_embeddings",
+    "inputCount": 1,
+    "mode": "mock",
+    "adapter": "mock",
+    "outputFiles": [
+      "C:\\Users\\Everardo\\Documents\\HouseMaker\\.runtime-workspace\\cache\\stage_outputs\\6d31a94726d871fcaee7fe2e90837075758f832a889016f7fc4ea5d5950e0266\\input-embeddings.json"
+    ],
+    "metadata": {
+      "inputHashes": [
+        "a63fc1f784aa9a3612172ce04fa643cdb71f867f321b1e331f0f407b7f1de08c"
+      ],
+      "deterministic": true
+    }
+  },
+  "metadata": {
+    "adapterName": "mock_vision",
+    "modelName": "deterministic-mock-planner"
+  }
+}

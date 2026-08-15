@@ -1,0 +1,23 @@
+{
+  "stage": "route_components",
+  "status": "completed",
+  "startedAt": "2026-08-03T23:36:12.650729Z",
+  "finishedAt": "2026-08-03T23:36:12.702506Z",
+  "durationSeconds": 0.031,
+  "cacheKey": null,
+  "cacheHit": false,
+  "result": {
+    "components": [
+      {
+        "id": "main",
+        "description": "Generate a deterministic low-poly office chair for a mock pipeline demonstration.",
+        "route": "mesh"
+      },
+      {
+        "id": "support",
+        "description": "Deterministic procedural support component",
+        "route": "procedural"
+      }
+    ]
+  }
+}

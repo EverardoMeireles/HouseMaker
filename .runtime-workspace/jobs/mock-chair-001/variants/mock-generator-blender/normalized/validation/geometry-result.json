@@ -1,0 +1,9 @@
+{
+  "backend": "mock",
+  "files": [
+    "model.stl"
+  ],
+  "formats": [
+    "stl"
+  ]
+}

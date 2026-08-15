@@ -1,0 +1,19 @@
+{
+  "summary": "Deterministic component plan for the supplied object",
+  "components": [
+    {
+      "id": "main",
+      "description": "Generate a deterministic low-poly office chair for a mock pipeline demonstration.",
+      "route": "mesh"
+    },
+    {
+      "id": "support",
+      "description": "Deterministic procedural support component",
+      "route": "procedural"
+    }
+  ],
+  "assembly_notes": [
+    "Normalize scale",
+    "Place the main component at the origin"
+  ]
+}

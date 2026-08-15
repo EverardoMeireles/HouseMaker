@@ -1,0 +1,33 @@
+{
+  "stage": "plan",
+  "status": "completed",
+  "startedAt": "2026-08-03T23:36:10.586071Z",
+  "finishedAt": "2026-08-03T23:36:10.658418Z",
+  "durationSeconds": 0.031,
+  "cacheKey": null,
+  "cacheHit": false,
+  "result": {
+    "plan": {
+      "summary": "Deterministic component plan for the supplied object",
+      "components": [
+        {
+          "id": "main",
+          "description": "Generate a deterministic low-poly office chair for a mock pipeline demonstration.",
+          "route": "mesh"
+        },
+        {
+          "id": "support",
+          "description": "Deterministic procedural support component",
+          "route": "procedural"
+        }
+      ],
+      "assembly_notes": [
+        "Normalize scale",
+        "Place the main component at the origin"
+      ]
+    },
+    "llmUsed": "mock",
+    "executionAdapter": "mock",
+    "model": "deterministic-mock-planner"
+  }
+}

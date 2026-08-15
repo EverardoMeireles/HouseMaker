@@ -1,0 +1,24 @@
+{
+  "stage": "image_normalization",
+  "status": "completed",
+  "startedAt": "2026-08-03T23:36:09.959943Z",
+  "finishedAt": "2026-08-03T23:36:10.017295Z",
+  "durationSeconds": 0.031,
+  "cacheKey": "77716c73249a19aba44c10686bb38bc597ac214e11787f85524c77ab283eb14c",
+  "cacheHit": false,
+  "result": {
+    "stage": "image_normalization",
+    "inputCount": 1,
+    "mode": "mock",
+    "adapter": "mock",
+    "outputFiles": [
+      "C:\\Users\\Everardo\\Documents\\HouseMaker\\.runtime-workspace\\jobs\\mock-chair-001\\shared\\image_normalization\\image_normalization-0.png"
+    ],
+    "metadata": {
+      "inputHashes": [
+        "a63fc1f784aa9a3612172ce04fa643cdb71f867f321b1e331f0f407b7f1de08c"
+      ],
+      "deterministic": true
+    }
+  }
+}

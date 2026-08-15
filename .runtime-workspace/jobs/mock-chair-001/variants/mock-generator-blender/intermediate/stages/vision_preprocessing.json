@@ -1,0 +1,25 @@
+{
+  "stage": "vision_preprocessing",
+  "status": "completed",
+  "startedAt": "2026-08-03T23:36:10.768301Z",
+  "finishedAt": "2026-08-03T23:36:10.832137Z",
+  "durationSeconds": 0.047,
+  "cacheKey": null,
+  "cacheHit": false,
+  "result": {
+    "enabledStages": [
+      "segmentation",
+      "depth_estimation"
+    ],
+    "inputCount": 1,
+    "adapter": "mock_shared_cache",
+    "adapters": {
+      "segmentation": "mock_shared_cache",
+      "depth_estimation": "mock_shared_cache"
+    },
+    "outputFiles": [
+      "C:\\Users\\Everardo\\Documents\\HouseMaker\\.runtime-workspace\\jobs\\mock-chair-001\\shared\\initial_segmentation\\initial_segmentation-0.pgm",
+      "C:\\Users\\Everardo\\Documents\\HouseMaker\\.runtime-workspace\\jobs\\mock-chair-001\\shared\\depth_estimation\\depth_estimation-0.pgm"
+    ]
+  }
+}

@@ -1,0 +1,95 @@
+{
+  "batchId": "mock-chair-001",
+  "inputs": {
+    "images": [
+      "C:\\Users\\Everardo\\Documents\\HouseMaker\\.runtime-workspace\\jobs\\mock-chair-001\\input\\chair.png"
+    ],
+    "prompt": "Generate a deterministic low-poly office chair for a mock pipeline demonstration."
+  },
+  "sharedSettings": {
+    "targetTriangles": 20000,
+    "generateTextures": true,
+    "componentDecomposition": true,
+    "targetDimensionsMetres": {
+      "x": 0.62,
+      "y": 0.58,
+      "z": 1.08
+    },
+    "outputFormats": [
+      "glb",
+      "blend",
+      "step"
+    ]
+  },
+  "execution": {
+    "mode": "sequential",
+    "continueAfterVariantFailure": true,
+    "reuseCompatibleStages": true
+  },
+  "variants": [
+    {
+      "id": "mock-generator-blender",
+      "planner": {
+        "adapter": "mock",
+        "model": "deterministic-mock-planner",
+        "temperature": 0.0,
+        "maxTokens": 1000
+      },
+      "vision": {
+        "segmentation": true,
+        "depthEstimation": true,
+        "inpainting": false,
+        "segmentationBackend": null,
+        "depthBackend": null,
+        "inpaintingBackend": null
+      },
+      "generation": {
+        "primary": "mock",
+        "fallback": null,
+        "seed": 1001
+      },
+      "geometry": {
+        "backend": "blender",
+        "proceduralBackend": null,
+        "meshBackend": null
+      },
+      "validation": {
+        "meshValidation": true,
+        "visualValidation": true
+      },
+      "simulateFailureStage": null
+    },
+    {
+      "id": "mock-generator-hybrid",
+      "planner": {
+        "adapter": "mock",
+        "model": "deterministic-mock-planner",
+        "temperature": 0.0,
+        "maxTokens": 1000
+      },
+      "vision": {
+        "segmentation": true,
+        "depthEstimation": true,
+        "inpainting": false,
+        "segmentationBackend": null,
+        "depthBackend": null,
+        "inpaintingBackend": null
+      },
+      "generation": {
+        "primary": "mock",
+        "fallback": null,
+        "seed": 1001
+      },
+      "geometry": {
+        "backend": "hybrid",
+        "proceduralBackend": "freecad",
+        "meshBackend": "blender"
+      },
+      "validation": {
+        "meshValidation": true,
+        "visualValidation": true
+      },
+      "simulateFailureStage": null
+    }
+  ]
+}

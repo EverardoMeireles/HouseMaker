@@ -1,0 +1,654 @@
+# ### Environment setup ###
+from __future__ import annotations
+
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+
+# ### Imports ###
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import cv2
+import numpy as np
+import trimesh
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtTest import QSignalSpy, QTest
+from PySide6.QtWidgets import QApplication
+
+from housemaker.generation_state import (
+    MASK_MODE_ERASE,
+    MASK_MODE_PAINT,
+    GeneratedObjectRecord,
+    GenerationData,
+    MaskPoint,
+    MaskStroke,
+)
+from housemaker.generation_views import VideoInpaintView, rasterize_mask_strokes
+from housemaker.generation_workspace import (
+    GENERATION_BACKEND_MESHY,
+    GenerationRequest,
+    GenerationWorker,
+    GenerationWorkspace,
+    MeshyImagePlanner,
+    _format_model_statistics,
+)
+from housemaker.glb import GeneratedModel
+from housemaker.meshy_generation import MeshyGenerationResult
+from housemaker.settings_widget import GenerationServiceSettings
+from housemaker.video_source import VideoMetadata
+
+
+# ### Module state ###
+_qt_application = QApplication.instance() or QApplication([])
+
+
+# ### Fixture helpers ###
+def _test_model() -> GeneratedModel:
+    mesh = trimesh.creation.box(extents=(1.0, 0.5, 0.75))
+    scene = trimesh.Scene(mesh)
+    return GeneratedModel(
+        mesh=mesh,
+        scene=scene,
+        glb_bytes=scene.export(file_type="glb"),
+    )
+
+
+def _test_meshy_result(name: str = "Test chair") -> MeshyGenerationResult:
+    return MeshyGenerationResult(
+        task_id="task-test-chair",
+        glb_bytes=_test_model().glb_bytes,
+        name=name,
+    )
+
+
+def _test_stroke(
+    mode: str = MASK_MODE_PAINT,
+    x: float = 0.5,
+    y: float = 0.5,
+) -> MaskStroke:
+    return MaskStroke(
+        mode=mode,
+        radius_normalized=0.1,
+        points=(MaskPoint(x, y),),
+    )
+
+
+def _write_test_video(path: Path, frame_count: int = 3) -> None:
+    writer = cv2.VideoWriter(
+        str(path),
+        cv2.VideoWriter_fourcc(*"MJPG"),
+        10.0,
+        (80, 60),
+    )
+    if not writer.isOpened():
+        raise unittest.SkipTest("MJPG writer is unavailable")
+    try:
+        for frame_index in range(frame_count):
+            writer.write(
+                np.full(
+                    (60, 80, 3),
+                    (frame_index * 40, 40, 160),
+                    dtype=np.uint8,
+                )
+            )
+    finally:
+        writer.release()
+
+
+class _FakeMeshyPlanner:
+    def __init__(self, result: MeshyGenerationResult | None = None) -> None:
+        self.result = result or _test_meshy_result()
+        self.requests: list[GenerationRequest] = []
+
+    def plan(self, request: GenerationRequest) -> MeshyGenerationResult:
+        self.requests.append(request)
+        return self.result
+
+
+class _FakeMeshyExecutor:
+    def __init__(self, model: GeneratedModel | None = None) -> None:
+        self.model = model or _test_model()
+        self.results: list[MeshyGenerationResult] = []
+
+    def execute(self, result: MeshyGenerationResult) -> GeneratedModel:
+        self.results.append(result)
+        return self.model
+
+
+class _BlockingMeshyPlanner:
+    """Meshy fixture that simulates an in-flight provider request."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def plan(self, _request: GenerationRequest) -> MeshyGenerationResult:
+        self.started.set()
+        if not self.release.wait(timeout=5.0):
+            raise RuntimeError("Blocking Meshy planner test timed out.")
+        return _test_meshy_result("Late chair")
+
+
+# ### State tests ###
+class GenerationStateTests(unittest.TestCase):
+    def test_generation_data_round_trip_preserves_meshy_records(self) -> None:
+        metadata = VideoMetadata(
+            path="house.avi",
+            frame_count=10,
+            fps=24.0,
+            width=640,
+            height=480,
+        )
+        original = GenerationData(
+            video_metadata=metadata,
+            current_frame_index=4,
+            frame_strokes={4: [_test_stroke()]},
+            generated_objects=[
+                GeneratedObjectRecord(
+                    object_id="chair-1",
+                    frame_index=4,
+                    object_name="Chair",
+                    pipeline={},
+                    provider=GENERATION_BACKEND_MESHY,
+                    provider_task_id="task-chair-1",
+                    asset_path="chair-1.glb",
+                )
+            ],
+        )
+
+        loaded = GenerationData.from_dict(original.to_dict())
+
+        self.assertEqual(loaded, original)
+        self.assertIsNot(loaded.frame_strokes, original.frame_strokes)
+        self.assertNotIn("api", str(original.to_dict()).lower())
+
+    def test_legacy_procedural_records_are_ignored_on_load(self) -> None:
+        loaded = GenerationData.from_dict(
+            {
+                "generated_objects": [
+                    {
+                        "object_id": "legacy-chair",
+                        "frame_index": 0,
+                        "object_name": "Legacy chair",
+                        "pipeline": {"schema_version": 1},
+                        "provider": "procedural",
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(loaded.generated_objects, [])
+
+    def test_invalid_normalized_mask_data_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            MaskPoint(1.1, 0.5)
+        with self.assertRaises(ValueError):
+            MaskStroke("unknown", 0.1, (MaskPoint(0.5, 0.5),))
+        with self.assertRaises(ValueError):
+            MaskStroke(
+                MASK_MODE_PAINT,
+                0.1,
+                (MaskPoint(0.4, 0.5), MaskPoint(0.6, 0.5)),
+                is_fill=True,
+            )
+
+    def test_enclosed_fill_action_round_trips_with_frame_strokes(self) -> None:
+        fill = MaskStroke(
+            MASK_MODE_PAINT,
+            0.000001,
+            (MaskPoint(0.5, 0.5),),
+            is_fill=True,
+        )
+        original = GenerationData(frame_strokes={2: [fill]})
+
+        restored = GenerationData.from_dict(original.to_dict())
+
+        self.assertEqual(restored.frame_strokes, {2: [fill]})
+
+
+# ### Mask-view tests ###
+class GenerationMaskViewTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.view = VideoInpaintView()
+        self.view.resize(400, 300)
+        self.view.show()
+        _qt_application.processEvents()
+
+    def tearDown(self) -> None:
+        self.view.close()
+        _qt_application.processEvents()
+
+    def test_paint_erase_undo_clear_and_object_crop(self) -> None:
+        frame = np.full((100, 200, 3), 120, dtype=np.uint8)
+        self.view.set_frame(frame)
+        changed_spy = QSignalSpy(self.view.strokes_changed)
+
+        QTest.mousePress(
+            self.view,
+            Qt.MouseButton.LeftButton,
+            pos=QPoint(190, 150),
+        )
+        QTest.mouseMove(self.view, QPoint(215, 150), delay=1)
+        QTest.mouseRelease(
+            self.view,
+            Qt.MouseButton.LeftButton,
+            pos=QPoint(215, 150),
+        )
+        _qt_application.processEvents()
+
+        self.assertEqual(len(self.view.get_strokes()), 1)
+        self.assertTrue(self.view.has_selection())
+        object_crop = self.view.build_selected_object_crop()
+        self.assertEqual(object_crop.shape[2], 4)
+        transparent_pixels = object_crop[:, :, 3] == 0
+        self.assertTrue(np.any(transparent_pixels))
+        self.assertTrue(np.all(object_crop[transparent_pixels, :3] == 0))
+        self.assertEqual(changed_spy.count(), 1)
+
+        self.view.undo_last_stroke()
+        self.assertFalse(self.view.has_selection())
+
+        self.view.set_strokes([_test_stroke()])
+        self.view.clear_mask()
+        self.assertFalse(self.view.has_selection())
+
+    def test_normalized_strokes_rasterize_consistently_at_new_resolution(self) -> None:
+        paint = MaskStroke(
+            mode=MASK_MODE_PAINT,
+            radius_normalized=0.12,
+            points=(MaskPoint(0.2, 0.5), MaskPoint(0.8, 0.5)),
+        )
+        erase = _test_stroke(MASK_MODE_ERASE)
+
+        small_mask = rasterize_mask_strokes((100, 50), [paint, erase])
+        large_mask = rasterize_mask_strokes((200, 100), [paint, erase])
+
+        self.assertEqual(small_mask.shape, (50, 100))
+        self.assertEqual(large_mask.shape, (100, 200))
+        self.assertGreater(np.count_nonzero(small_mask), 0)
+        self.assertGreater(np.count_nonzero(large_mask), 0)
+        self.assertEqual(small_mask[25, 50], 0)
+        self.assertEqual(large_mask[50, 100], 0)
+
+    def test_right_click_fills_closed_outline_and_undoes_as_one_action(
+        self,
+    ) -> None:
+        frame = np.full((100, 200, 3), 120, dtype=np.uint8)
+        outline = MaskStroke(
+            MASK_MODE_PAINT,
+            0.03,
+            (
+                MaskPoint(0.25, 0.25),
+                MaskPoint(0.75, 0.25),
+                MaskPoint(0.75, 0.75),
+                MaskPoint(0.25, 0.75),
+                MaskPoint(0.25, 0.25),
+            ),
+        )
+        self.view.set_frame(frame, [outline])
+        changed_spy = QSignalSpy(self.view.strokes_changed)
+
+        QTest.mouseClick(
+            self.view,
+            Qt.MouseButton.RightButton,
+            pos=QPoint(200, 150),
+        )
+        _qt_application.processEvents()
+
+        strokes = self.view.get_strokes()
+        self.assertEqual(len(strokes), 2)
+        self.assertTrue(strokes[-1].is_fill)
+        self.assertEqual(changed_spy.count(), 1)
+        mask = self.view.get_mask()
+        self.assertEqual(mask[50, 100], 255)
+        self.assertEqual(mask[5, 5], 0)
+
+        self.view.undo_last_stroke()
+
+        self.assertEqual(self.view.get_mask()[50, 100], 0)
+
+    def test_right_click_does_not_fill_an_open_or_unbounded_region(self) -> None:
+        frame = np.full((100, 200, 3), 120, dtype=np.uint8)
+        open_outline = MaskStroke(
+            MASK_MODE_PAINT,
+            0.03,
+            (
+                MaskPoint(0.25, 0.25),
+                MaskPoint(0.75, 0.25),
+                MaskPoint(0.75, 0.75),
+            ),
+        )
+        self.view.set_frame(frame, [open_outline])
+        changed_spy = QSignalSpy(self.view.strokes_changed)
+
+        QTest.mouseClick(
+            self.view,
+            Qt.MouseButton.RightButton,
+            pos=QPoint(200, 150),
+        )
+        _qt_application.processEvents()
+
+        self.assertEqual(len(self.view.get_strokes()), 1)
+        self.assertEqual(changed_spy.count(), 0)
+        self.assertEqual(self.view.get_mask()[50, 100], 0)
+
+
+# ### Meshy-adapter tests ###
+class MeshyGenerationAdapterTests(unittest.TestCase):
+    def test_meshy_planner_sends_the_selected_png_and_meshy_settings(self) -> None:
+        selected = np.zeros((7, 11, 4), dtype=np.uint8)
+        selected[1:6, 2:9] = (20, 80, 190, 255)
+        request = GenerationRequest(
+            frame_index=3,
+            selected_object_bgra=selected,
+            settings=GenerationServiceSettings(
+                meshy_api_key="meshy-test-key",
+                meshy_target_polycount=7_200,
+            ),
+        )
+        captured: dict[str, object] = {}
+
+        def fake_meshy_request(**kwargs: object) -> MeshyGenerationResult:
+            captured.update(kwargs)
+            return _test_meshy_result()
+
+        with patch(
+            "housemaker.generation_workspace.request_image_to_3d_model",
+            side_effect=fake_meshy_request,
+        ):
+            result = MeshyImagePlanner().plan(request)
+
+        self.assertEqual(result.task_id, "task-test-chair")
+        self.assertEqual(captured["api_key"], "meshy-test-key")
+        self.assertEqual(captured["target_polycount"], 7_200)
+        encoded_png = captured["image_png"]
+        self.assertIsInstance(encoded_png, bytes)
+        decoded = cv2.imdecode(
+            np.frombuffer(encoded_png, dtype=np.uint8),
+            cv2.IMREAD_UNCHANGED,
+        )
+        self.assertEqual(decoded.shape, selected.shape)
+        np.testing.assert_array_equal(decoded, selected)
+
+    def test_worker_invokes_meshy_planner_and_executor(self) -> None:
+        planner = _FakeMeshyPlanner()
+        executor = _FakeMeshyExecutor()
+        request = GenerationRequest(
+            frame_index=2,
+            selected_object_bgra=np.zeros((10, 10, 4), dtype=np.uint8),
+            settings=GenerationServiceSettings(meshy_api_key="secret"),
+        )
+        worker = GenerationWorker(planner, executor, request)
+        succeeded_spy = QSignalSpy(worker.succeeded)
+        failed_spy = QSignalSpy(worker.failed)
+
+        worker.run()
+
+        self.assertEqual(succeeded_spy.count(), 1)
+        self.assertEqual(failed_spy.count(), 0)
+        self.assertEqual(planner.requests[0].frame_index, 2)
+        self.assertEqual(len(executor.results), 1)
+
+    def test_worker_redacts_the_meshy_api_key_from_errors(self) -> None:
+        key = "meshy-never-show-this"
+
+        def failing_planner(_request: GenerationRequest) -> MeshyGenerationResult:
+            raise RuntimeError(f"provider echoed {key}")
+
+        request = GenerationRequest(
+            frame_index=0,
+            selected_object_bgra=np.zeros((4, 4, 4), dtype=np.uint8),
+            settings=GenerationServiceSettings(meshy_api_key=key),
+        )
+        worker = GenerationWorker(failing_planner, _FakeMeshyExecutor(), request)
+        failed_spy = QSignalSpy(worker.failed)
+
+        worker.run()
+
+        self.assertEqual(failed_spy.count(), 1)
+        self.assertNotIn(key, failed_spy.at(0)[0])
+        self.assertIn("[redacted]", failed_spy.at(0)[0])
+
+
+# ### Workspace tests ###
+class GenerationWorkspaceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.meshy_planner = _FakeMeshyPlanner()
+        self.meshy_executor = _FakeMeshyExecutor()
+        self.workspace = GenerationWorkspace(
+            meshy_planner=self.meshy_planner,
+            meshy_executor=self.meshy_executor,
+        )
+        self.workspace.resize(900, 600)
+        self.workspace.show()
+        _qt_application.processEvents()
+
+    def tearDown(self) -> None:
+        self.workspace.shutdown()
+        self.workspace.close()
+        _qt_application.processEvents()
+
+    def test_layout_controls_and_video_seek_keep_masks_per_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            video_path = Path(temporary_directory) / "source.avi"
+            _write_test_video(video_path)
+            self.workspace.load_video(str(video_path))
+
+            self.assertEqual(self.workspace.seekbar.maximum(), 2)
+            self.assertEqual(self.workspace.frame_label.text(), "Frame 1 / 3")
+            self.assertTrue(self.workspace.load_video_button.isEnabled())
+            self.assertFalse(self.workspace.generate_button.isEnabled())
+
+            self.workspace.video_view.set_strokes([_test_stroke()])
+            self.workspace._handle_video_strokes_changed(
+                self.workspace.video_view.get_strokes()
+            )
+            self.workspace.show_frame(1)
+            self.assertEqual(self.workspace.video_view.get_strokes(), [])
+            self.workspace.show_frame(0)
+            self.assertEqual(self.workspace.video_view.get_strokes(), [_test_stroke()])
+
+            saved = self.workspace.get_data()
+            self.assertEqual(saved.current_frame_index, 0)
+            self.assertEqual(saved.strokes_for_frame(0), [_test_stroke()])
+
+            self.workspace.set_data(saved)
+            self.assertEqual(
+                self.workspace.video_view.get_strokes(),
+                [_test_stroke()],
+            )
+            self.workspace.shutdown()
+
+    def test_meshy_is_the_only_generation_path_and_requires_its_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            video_path = Path(temporary_directory) / "source.avi"
+            _write_test_video(video_path, frame_count=1)
+            self.workspace.load_video(str(video_path))
+            self.workspace.video_view.set_strokes([_test_stroke()])
+            self.workspace._handle_video_strokes_changed(
+                self.workspace.video_view.get_strokes()
+            )
+
+            self.assertFalse(hasattr(self.workspace, "generation_backend_combo"))
+            self.assertTrue(self.workspace.meshy_target_polycount_control.isVisible())
+            self.assertFalse(self.workspace.generate_button.isEnabled())
+
+            self.workspace.set_runtime_settings(
+                GenerationServiceSettings(meshy_api_key="meshy-key")
+            )
+            self.assertTrue(self.workspace.generate_button.isEnabled())
+            self.workspace.shutdown()
+
+    def test_meshy_target_triangles_are_always_visible_and_preserve_user_value(self) -> None:
+        control = self.workspace.meshy_target_polycount_control
+        spinbox = self.workspace.meshy_target_polycount_spinbox
+
+        self.assertTrue(control.isVisible())
+        self.workspace.set_runtime_settings(
+            GenerationServiceSettings(
+                meshy_api_key="meshy-key",
+                meshy_target_polycount=7_200,
+            )
+        )
+        self.assertEqual(spinbox.minimum(), 100)
+        self.assertEqual(spinbox.maximum(), 15_000)
+        self.assertEqual(spinbox.value(), 7_200)
+
+        spinbox.setValue(5_600)
+        self.assertEqual(
+            self.workspace.get_runtime_settings().meshy_target_polycount,
+            5_600,
+        )
+        self.workspace.set_runtime_settings(
+            GenerationServiceSettings(meshy_api_key="replacement-key")
+        )
+        self.assertEqual(spinbox.value(), 5_600)
+
+    def test_meshy_success_displays_saves_persists_and_rebuilds_glb(self) -> None:
+        self.workspace.shutdown()
+        self.workspace.close()
+        _qt_application.processEvents()
+
+        model = _test_model()
+        meshy_result = MeshyGenerationResult(
+            task_id="task-complex-chair",
+            glb_bytes=model.glb_bytes,
+        )
+        meshy_planner = _FakeMeshyPlanner(meshy_result)
+        meshy_executor = _FakeMeshyExecutor(model)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            asset_directory = temporary_path / "generation_assets"
+            video_path = temporary_path / "source.avi"
+            _write_test_video(video_path, frame_count=1)
+            self.workspace = GenerationWorkspace(
+                meshy_planner=meshy_planner,
+                meshy_executor=meshy_executor,
+                asset_directory=asset_directory,
+            )
+            restored_workspace: GenerationWorkspace | None = None
+            try:
+                self.workspace.set_runtime_settings(
+                    GenerationServiceSettings(meshy_api_key="meshy-test-key")
+                )
+                self.workspace.load_video(str(video_path))
+                self.workspace.video_view.set_strokes([_test_stroke()])
+                self.workspace._handle_video_strokes_changed(
+                    self.workspace.video_view.get_strokes()
+                )
+                completed_spy = QSignalSpy(self.workspace.generation_completed)
+
+                self.workspace.generate()
+
+                deadline = time.monotonic() + 3.0
+                while completed_spy.count() == 0 and time.monotonic() < deadline:
+                    _qt_application.processEvents()
+                    QTest.qWait(5)
+                self.assertEqual(completed_spy.count(), 1)
+                while self.workspace.is_generating and time.monotonic() < deadline:
+                    _qt_application.processEvents()
+                    QTest.qWait(5)
+                self.assertFalse(self.workspace.is_generating)
+                self.assertEqual(len(meshy_planner.requests), 1)
+                routed_request = meshy_planner.requests[0]
+                self.assertGreater(
+                    np.count_nonzero(routed_request.selected_object_bgra[:, :, 3]),
+                    0,
+                )
+                self.assertEqual(meshy_executor.results, [meshy_result])
+                self.assertIs(self.workspace.result_view.model, model)
+
+                saved_data = self.workspace.get_data()
+                self.assertEqual(len(saved_data.generated_objects), 1)
+                record = saved_data.generated_objects[0]
+                self.assertEqual(record.provider, GENERATION_BACKEND_MESHY)
+                self.assertEqual(record.provider_task_id, "task-complex-chair")
+                self.assertEqual(record.pipeline, {})
+                self.assertIsNotNone(record.asset_path)
+                self.assertEqual(
+                    (asset_directory / str(record.asset_path)).read_bytes(),
+                    model.glb_bytes,
+                )
+
+                restored_workspace = GenerationWorkspace(asset_directory=asset_directory)
+                restored_workspace.set_data(saved_data)
+                rebuilt = restored_workspace.result_view.model
+                self.assertIsNotNone(rebuilt)
+                self.assertEqual(rebuilt.glb_bytes, model.glb_bytes)
+            finally:
+                if restored_workspace is not None:
+                    restored_workspace.shutdown()
+                    restored_workspace.close()
+                self.workspace.shutdown()
+                self.workspace.close()
+                _qt_application.processEvents()
+
+    def test_display_options_control_texture_and_wireframe_visibility(self) -> None:
+        self.assertTrue(self.workspace.textures_checkbox.isChecked())
+        self.assertFalse(self.workspace.wireframe_checkbox.isChecked())
+        self.assertTrue(self.workspace.result_view.get_textures_enabled())
+        self.assertFalse(self.workspace.result_view.get_wireframe_enabled())
+
+        self.workspace.textures_checkbox.setChecked(False)
+        self.workspace.wireframe_checkbox.setChecked(True)
+
+        self.assertFalse(self.workspace.result_view.get_textures_enabled())
+        self.assertTrue(self.workspace.result_view.get_wireframe_enabled())
+
+    def test_generated_model_statistics_are_displayed_and_reset(self) -> None:
+        model = _test_model()
+        self.workspace._handle_generation_succeeded(_test_meshy_result(), model)
+
+        statistics = self.workspace.model_statistics_label.text()
+        self.assertIn("8 vertices", statistics)
+        self.assertIn("12 triangles", statistics)
+        self.assertIn("material color", statistics)
+        self.assertEqual(_format_model_statistics(None), "No generated object")
+
+        self.workspace.set_data(GenerationData())
+        self.assertEqual(
+            self.workspace.model_statistics_label.text(),
+            "No generated object",
+        )
+
+    def test_ambient_slider_updates_generated_object_view_lighting(self) -> None:
+        self.workspace.ambient_light_slider.setValue(72)
+        self.assertAlmostEqual(
+            self.workspace.result_view.get_ambient_light_intensity(),
+            0.72,
+        )
+
+    def test_shutdown_discards_an_in_flight_meshy_result(self) -> None:
+        planner = _BlockingMeshyPlanner()
+        self.workspace.set_meshy_planner(planner)
+        request = GenerationRequest(
+            frame_index=0,
+            selected_object_bgra=np.zeros((4, 4, 4), dtype=np.uint8),
+            settings=GenerationServiceSettings(meshy_api_key="key"),
+        )
+        completed_spy = QSignalSpy(self.workspace.generation_completed)
+
+        self.workspace._start_generation(request)
+        self.assertTrue(planner.started.wait(timeout=1.0))
+        active_thread = self.workspace._generation_thread
+        self.assertIsNotNone(active_thread)
+
+        self.workspace.shutdown()
+        planner.release.set()
+        self.assertTrue(active_thread.wait(2000))
+        _qt_application.processEvents()
+
+        self.assertEqual(completed_spy.count(), 0)
+        self.assertEqual(self.workspace.get_data().generated_objects, [])
+
+
+# ### Test entry point ###
+if __name__ == "__main__":
+    unittest.main()

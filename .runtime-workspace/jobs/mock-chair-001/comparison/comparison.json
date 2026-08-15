@@ -1,0 +1,122 @@
+{
+  "batchId": "mock-chair-001",
+  "completedCount": 2,
+  "generatedAt": 1785800173.9796238,
+  "variantCount": 2,
+  "variants": [
+    {
+      "backendUsed": "blender",
+      "dimensionsMetres": {
+        "x": 1.0,
+        "y": 1.0,
+        "z": 1.0
+      },
+      "durationSeconds": 1.531,
+      "failedStages": [],
+      "generatedFiles": [
+        "variants/mock-generator-blender/generated/main/main.obj",
+        "variants/mock-generator-blender/generated/main/main.mtl",
+        "variants/mock-generator-blender/generated/main/main_albedo.png",
+        "variants/mock-generator-blender/generated/main/generation.json",
+        "variants/mock-generator-blender/final/model.glb",
+        "variants/mock-generator-blender/final/model.blend",
+        "variants/mock-generator-blender/final/model.step",
+        "variants/mock-generator-blender/final/geometry-result.json",
+        "variants/mock-generator-blender/renders/preview.png",
+        "variants/mock-generator-blender/validation/validation.json"
+      ],
+      "generatorUsed": "mock",
+      "llmModel": "deterministic-mock-planner",
+      "llmUsed": "mock",
+      "seed": 1001,
+      "status": "completed",
+      "triangleCount": 12,
+      "validation": {
+        "enabled": true,
+        "metrics": {
+          "dimensionsMetres": {
+            "x": 1.0,
+            "y": 1.0,
+            "z": 1.0
+          },
+          "materialCount": 0,
+          "nonManifoldEdgeCount": 0,
+          "objectCount": 1,
+          "triangleCount": 12
+        },
+        "valid": true,
+        "warnings": [
+          "Triangle count differs from the target by more than 20 percent",
+          "Dimension x differs from the target by more than 5 percent",
+          "Dimension y differs from the target by more than 5 percent",
+          "Dimension z differs from the target by more than 5 percent"
+        ]
+      },
+      "variantId": "mock-generator-blender",
+      "visualScore": 75.01,
+      "warnings": [
+        "Triangle count differs from the target by more than 20 percent",
+        "Dimension x differs from the target by more than 5 percent",
+        "Dimension y differs from the target by more than 5 percent",
+        "Dimension z differs from the target by more than 5 percent"
+      ]
+    },
+    {
+      "backendUsed": "hybrid",
+      "dimensionsMetres": {
+        "x": 1.0,
+        "y": 1.0,
+        "z": 1.0
+      },
+      "durationSeconds": 1.578,
+      "failedStages": [],
+      "generatedFiles": [
+        "variants/mock-generator-hybrid/generated/main/main.obj",
+        "variants/mock-generator-hybrid/generated/main/main.mtl",
+        "variants/mock-generator-hybrid/generated/main/main_albedo.png",
+        "variants/mock-generator-hybrid/generated/main/generation.json",
+        "variants/mock-generator-hybrid/final/model.glb",
+        "variants/mock-generator-hybrid/final/model.blend",
+        "variants/mock-generator-hybrid/final/model.step",
+        "variants/mock-generator-hybrid/final/geometry-result.json",
+        "variants/mock-generator-hybrid/renders/preview.png",
+        "variants/mock-generator-hybrid/validation/validation.json"
+      ],
+      "generatorUsed": "mock",
+      "llmModel": "deterministic-mock-planner",
+      "llmUsed": "mock",
+      "seed": 1001,
+      "status": "completed",
+      "triangleCount": 12,
+      "validation": {
+        "enabled": true,
+        "metrics": {
+          "dimensionsMetres": {
+            "x": 1.0,
+            "y": 1.0,
+            "z": 1.0
+          },
+          "materialCount": 0,
+          "nonManifoldEdgeCount": 0,
+          "objectCount": 1,
+          "triangleCount": 12
+        },
+        "valid": true,
+        "warnings": [
+          "Triangle count differs from the target by more than 20 percent",
+          "Dimension x differs from the target by more than 5 percent",
+          "Dimension y differs from the target by more than 5 percent",
+          "Dimension z differs from the target by more than 5 percent"
+        ]
+      },
+      "variantId": "mock-generator-hybrid",
+      "visualScore": 75.01,
+      "warnings": [
+        "Triangle count differs from the target by more than 20 percent",
+        "Dimension x differs from the target by more than 5 percent",
+        "Dimension y differs from the target by more than 5 percent",
+        "Dimension z differs from the target by more than 5 percent"
+      ]
+    }
+  ]
+}

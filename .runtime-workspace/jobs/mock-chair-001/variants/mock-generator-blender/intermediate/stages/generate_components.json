@@ -1,0 +1,40 @@
+{
+  "stage": "generate_components",
+  "status": "completed",
+  "startedAt": "2026-08-03T23:36:11.101976Z",
+  "finishedAt": "2026-08-03T23:36:11.182407Z",
+  "durationSeconds": 0.047,
+  "cacheKey": null,
+  "cacheHit": false,
+  "result": {
+    "generatorUsed": "mock",
+    "executionAdapter": "mock",
+    "seed": 1001,
+    "meshPath": "C:\\Users\\Everardo\\Documents\\HouseMaker\\.runtime-workspace\\jobs\\mock-chair-001\\variants\\mock-generator-blender\\generated\\main\\main.obj",
+    "meshPaths": [
+      "C:\\Users\\Everardo\\Documents\\HouseMaker\\.runtime-workspace\\jobs\\mock-chair-001\\variants\\mock-generator-blender\\generated\\main\\main.obj"
+    ],
+    "components": [
+      {
+        "id": "main",
+        "meshPath": "C:\\Users\\Everardo\\Documents\\HouseMaker\\.runtime-workspace\\jobs\\mock-chair-001\\variants\\mock-generator-blender\\generated\\main\\main.obj"
+      }
+    ],
+    "artifacts": [
+      "C:\\Users\\Everardo\\Documents\\HouseMaker\\.runtime-workspace\\jobs\\mock-chair-001\\variants\\mock-generator-blender\\generated\\main\\main.obj",
+      "C:\\Users\\Everardo\\Documents\\HouseMaker\\.runtime-workspace\\jobs\\mock-chair-001\\variants\\mock-generator-blender\\generated\\main\\main.mtl",
+      "C:\\Users\\Everardo\\Documents\\HouseMaker\\.runtime-workspace\\jobs\\mock-chair-001\\variants\\mock-generator-blender\\generated\\main\\main_albedo.png",
+      "C:\\Users\\Everardo\\Documents\\HouseMaker\\.runtime-workspace\\jobs\\mock-chair-001\\variants\\mock-generator-blender\\generated\\main\\generation.json"
+    ],
+    "metadata": [
+      {
+        "generator": "mock",
+        "seed": 1001,
+        "componentId": "main",
+        "deterministicDigest": "7bf722b5c0aa6933c00bfbf9c239fbd19b6b007d4782c328429b769bfe47a2a7",
+        "mesh": "main.obj",
+        "triangleCount": 12
+      }
+    ]
+  }
+}

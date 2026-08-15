@@ -1,0 +1,14 @@
+{
+  "stage": "render_previews",
+  "status": "completed",
+  "startedAt": "2026-08-03T23:36:11.687285Z",
+  "finishedAt": "2026-08-03T23:36:11.750350Z",
+  "durationSeconds": 0.031,
+  "cacheKey": null,
+  "cacheHit": false,
+  "result": {
+    "artifacts": [
+      "C:\\Users\\Everardo\\Documents\\HouseMaker\\.runtime-workspace\\jobs\\mock-chair-001\\variants\\mock-generator-blender\\renders\\preview.png"
+    ]
+  }
+}

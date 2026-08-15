@@ -1,0 +1,14 @@
+{
+  "stage": "visual_evaluation",
+  "status": "completed",
+  "startedAt": "2026-08-03T23:36:13.602288Z",
+  "finishedAt": "2026-08-03T23:36:13.650725Z",
+  "durationSeconds": 0.016,
+  "cacheKey": null,
+  "cacheHit": false,
+  "result": {
+    "enabled": true,
+    "score": 75.01,
+    "warnings": []
+  }
+}

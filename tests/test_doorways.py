@@ -553,7 +553,10 @@ class DoorwayTests(unittest.TestCase):
         )
         _qt_application.processEvents()
 
-        self.assertIs(workspace.workspace_tabs.currentWidget(), workspace.canvas)
+        self.assertIs(
+            workspace.workspace_tabs.currentWidget(),
+            workspace.canvas_viewer_workspace,
+        )
         self.assertEqual(
             workspace.canvas.pending_doorway_preset,
             workspace.doorway_presets[-1],

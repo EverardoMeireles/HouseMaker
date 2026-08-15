@@ -1,0 +1,13 @@
+{
+  "backend": "mock",
+  "files": [
+    "model.glb",
+    "model.blend",
+    "model.step"
+  ],
+  "formats": [
+    "glb",
+    "blend",
+    "step"
+  ]
+}

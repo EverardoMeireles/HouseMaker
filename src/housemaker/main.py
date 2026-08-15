@@ -27,15 +27,29 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QSlider,
     QSplitter,
     QSpinBox,
-    QStackedWidget,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.blueprint_canvas import BlueprintCanvas
+from housemaker.external_viewer_host import ExternalFullscreenViewerHost
+from housemaker.camera_models import (
+    DEFAULT_FIRST_PERSON_LIGHT_INTENSITY,
+    InitialFirstPersonCamera,
+    MAX_FIRST_PERSON_LIGHT_INTENSITY,
+    MIN_FIRST_PERSON_LIGHT_INTENSITY,
+)
+from housemaker.generation_state import GenerationData
+from housemaker.generation_workspace import GenerationWorkspace
+from housemaker.surface_texture_state import SurfaceTextureData
+from housemaker.surface_texture_workspace import (
+    SurfaceTextureGenerationWorkspace,
+)
 from housemaker.glb import (
     DEFAULT_WALL_HEIGHT_METERS,
     GeneratedModel,
@@ -73,7 +87,12 @@ from housemaker.models import (
     create_default_doorway_presets,
     create_default_levels,
 )
+from housemaker.level_coordinates import build_level_base_z_lookup
 from housemaker.project_io import ProjectData, load_project, save_project
+from housemaker.settings_widget import (
+    SettingsWidget,
+    resolve_fullscreen_3d_viewer_screen,
+)
 from housemaker.texture_creator_canvas import TextureCreatorCanvas
 from housemaker.uv_canvas import UvCanvas
 from housemaker.uv_layout import (
@@ -84,7 +103,10 @@ from housemaker.uv_layout import (
     optimize_room_wall_uvs,
     rebuild_room_subdivision_uvs,
 )
-from housemaker.viewer import GlbViewerWidget
+from housemaker.viewer import (
+    NAVIGATION_MODE_FIRST_PERSON,
+    GlbViewerWidget,
+)
 from housemaker.manual_stitching import (
     VIDEO_FILE_FILTER,
     ManualVideoStitchDialog,
@@ -94,42 +116,20 @@ from housemaker.manual_stitching import (
 
 # ### Constants ###
 TEXTURE_CREATOR_DETAIL_SIZES = (512, 1024, 2048)
+DEFAULT_FIRST_PERSON_CAMERA_HEIGHT_METERS = 1.65
+FIRST_PERSON_LIGHT_PERCENT_SCALE = 100
+LAST_PROJECT_PATH_SETTING_KEY = "last_project_path"
+PROJECT_LOAD_FAILURES = (
+    AttributeError,
+    KeyError,
+    OSError,
+    OverflowError,
+    RuntimeError,
+    TypeError,
+    ValueError,
+)
 
 # ### Widgets ###
-class HomePage(QWidget):
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._build_ui()
-
-    def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(40, 40, 40, 40)
-        layout.setSpacing(24)
-
-        title_label = QLabel("HouseMaker")
-        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title_label.setStyleSheet("font-size: 28px; font-weight: 600;")
-        layout.addWidget(title_label)
-        layout.addStretch(1)
-
-        buttons_layout = QHBoxLayout()
-        buttons_layout.setSpacing(32)
-
-        self.blueprint_button = QPushButton("Blueprint")
-        self.blueprint_button.setMinimumSize(280, 220)
-        self.blueprint_button.setStyleSheet("font-size: 24px; font-weight: 600;")
-        buttons_layout.addWidget(self.blueprint_button)
-
-        self.projection_button = QPushButton("Projection")
-        self.projection_button.setMinimumSize(280, 220)
-        self.projection_button.setEnabled(False)
-        self.projection_button.setStyleSheet("font-size: 24px; font-weight: 600;")
-        buttons_layout.addWidget(self.projection_button)
-
-        layout.addLayout(buttons_layout)
-        layout.addStretch(2)
-
-
 class PowerOfTwoSpinBox(QSpinBox):
     def setValue(self, value: int) -> None:  # type: ignore[override]
         super().setValue(_nearest_power_of_two_value(value))
@@ -204,21 +204,34 @@ class RightPanelSpinBoxWheelFilter(QObject):
 
 
 class BlueprintWorkspace(QWidget):
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        application_settings: ApplicationSettingsStore | None = None,
+    ) -> None:
         super().__init__(parent)
+        self._application_settings = (
+            application_settings
+            if application_settings is not None
+            else ApplicationSettingsStore()
+        )
+        self.current_project_path: str | None = None
         self.levels: list[LevelData] = create_default_levels()
         self.image_library_paths: list[str] = []
         self.doorway_presets: list[DoorwayPreset] = (
             create_default_doorway_presets()
         )
+        self.initial_first_person_camera: InitialFirstPersonCamera | None = None
         self.current_level_index = GROUND_LEVEL_INDEX
         self._is_syncing_level_controls = False
+        self._is_syncing_first_person_camera_controls = False
         self._is_syncing_room_controls = False
         self._is_syncing_image_library_controls = False
         self._is_syncing_texture_controls = False
         self._is_syncing_uv_controls = False
         self._is_viewer_refresh_scheduled = False
         self._scheduled_viewer_refresh_preserve_camera = True
+        self._is_shutdown = False
         self.texture_creator_level_index: int | None = None
         self.texture_creator_room_index: int | None = None
         self.texture_creator_wall_key: str | None = None
@@ -232,6 +245,20 @@ class BlueprintWorkspace(QWidget):
     def current_level(self) -> LevelData:
         return self.levels[self.current_level_index]
 
+    def shutdown(self) -> None:
+        """Release detached viewers and background work exactly once."""
+
+        if self._is_shutdown:
+            return
+        self._is_shutdown = True
+        self._external_viewer_host.dispose()
+        self.surface_texture_generation.shutdown()
+        self.generation.shutdown()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self.shutdown()
+        super().closeEvent(event)
+
     def _build_ui(self) -> None:
         root_layout = QHBoxLayout(self)
         root_layout.setContentsMargins(12, 12, 12, 12)
@@ -244,16 +271,68 @@ class BlueprintWorkspace(QWidget):
         self.workspace_tabs = QTabWidget()
         self.canvas = BlueprintCanvas()
         self.viewer = GlbViewerWidget()
-        self.workspace_tabs.addTab(self.canvas, "Canvas")
-        self.workspace_tabs.addTab(self.viewer, "Viewer")
+        self.canvas_3d_navigation_shortcut = QShortcut(self.viewer)
+        self.canvas_3d_navigation_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self.canvas_3d_navigation_shortcut.activated.connect(
+            self._toggle_canvas_3d_navigation_mode
+        )
+        self.canvas_viewer_workspace = self._build_canvas_viewer_workspace()
+        self._external_viewer_host = ExternalFullscreenViewerHost(self)
+        self._external_viewer_host.close_requested.connect(
+            self._handle_external_viewer_window_closed
+        )
+        self.generation = GenerationWorkspace(
+            asset_directory=(
+                self._application_settings.path.parent / "generated"
+            )
+        )
+        self.surface_texture_generation = SurfaceTextureGenerationWorkspace(
+            asset_directory=(
+                self._application_settings.path.parent / "surface_textures"
+            ),
+            application_settings=self._application_settings,
+        )
+        self.settings_widget = SettingsWidget(
+            application_settings=self._application_settings
+        )
+        generation_settings = self.settings_widget.get_settings()
+        self._set_canvas_3d_navigation_shortcut(
+            generation_settings.canvas_3d_navigation_toggle_hotkey
+        )
+        self.generation.set_runtime_settings(generation_settings)
+        self.surface_texture_generation.set_runtime_settings(
+            generation_settings
+        )
+        self.surface_texture_generation.generation_completed.connect(
+            self._handle_surface_texture_generation_completed
+        )
+        self.surface_texture_generation.set_levels(
+            self.levels,
+            self.initial_first_person_camera,
+        )
+        self.workspace_tabs.addTab(self.canvas_viewer_workspace, "Canvas")
+        self.workspace_tabs.addTab(
+            self.surface_texture_generation,
+            "Surface texture generation",
+        )
+        self.workspace_tabs.addTab(self.generation, "Object generation")
+        self.workspace_tabs.addTab(self.settings_widget, "Settings")
         self.workspace_tabs.currentChanged.connect(
             self._handle_workspace_tab_changed
         )
         self.viewer.wall_selected.connect(self._handle_viewer_wall_selected)
+        self.viewer.navigation_mode_changed.connect(
+            self._handle_canvas_3d_navigation_mode_changed
+        )
+        self.settings_widget.settings_changed.connect(
+            self._handle_generation_settings_changed
+        )
         splitter.addWidget(self.workspace_tabs)
 
-        side_panel = QWidget()
-        side_layout = QVBoxLayout(side_panel)
+        self.side_panel = QWidget()
+        side_layout = QVBoxLayout(self.side_panel)
         side_layout.setContentsMargins(16, 16, 16, 16)
         side_layout.setSpacing(12)
 
@@ -381,6 +460,94 @@ class BlueprintWorkspace(QWidget):
         )
         floor_contour_buttons_layout.addWidget(self.clear_floor_contour_button)
         side_layout.addLayout(floor_contour_buttons_layout)
+
+        first_person_camera_label = QLabel("Initial first person camera")
+        first_person_camera_label.setStyleSheet(
+            "font-size: 18px; font-weight: 600;"
+        )
+        side_layout.addWidget(first_person_camera_label)
+
+        self.first_person_camera_status_label = QLabel("Camera: Not set")
+        self.first_person_camera_status_label.setWordWrap(True)
+        side_layout.addWidget(self.first_person_camera_status_label)
+
+        self.first_person_camera_z_spinbox = QDoubleSpinBox()
+        self.first_person_camera_z_spinbox.setRange(-10000.0, 10000.0)
+        self.first_person_camera_z_spinbox.setDecimals(3)
+        self.first_person_camera_z_spinbox.setSingleStep(0.05)
+        self.first_person_camera_z_spinbox.setSuffix(" m")
+        self.first_person_camera_z_spinbox.setKeyboardTracking(False)
+        self.first_person_camera_z_spinbox.setEnabled(False)
+        self.first_person_camera_z_spinbox.valueChanged.connect(
+            self._handle_first_person_camera_z_changed
+        )
+        camera_z_layout = QFormLayout()
+        camera_z_layout.setContentsMargins(0, 0, 0, 0)
+        camera_z_layout.addRow("Camera Z", self.first_person_camera_z_spinbox)
+        side_layout.addLayout(camera_z_layout)
+
+        self.first_person_camera_light_slider = QSlider(Qt.Orientation.Horizontal)
+        self.first_person_camera_light_slider.setRange(
+            _light_intensity_to_percent(MIN_FIRST_PERSON_LIGHT_INTENSITY),
+            _light_intensity_to_percent(MAX_FIRST_PERSON_LIGHT_INTENSITY),
+        )
+        self.first_person_camera_light_slider.setSingleStep(1)
+        self.first_person_camera_light_slider.setPageStep(10)
+        self.first_person_camera_light_slider.setToolTip(
+            "Camera-mounted headlight intensity"
+        )
+        self.first_person_camera_light_slider.setValue(
+            _light_intensity_to_percent(DEFAULT_FIRST_PERSON_LIGHT_INTENSITY)
+        )
+        self.first_person_camera_light_slider.setEnabled(False)
+        self.first_person_camera_light_slider.sliderPressed.connect(
+            self.canvas.begin_first_person_camera_light_intensity_adjustment
+        )
+        self.first_person_camera_light_slider.sliderReleased.connect(
+            self.canvas.end_first_person_camera_light_intensity_adjustment
+        )
+        self.first_person_camera_light_slider.valueChanged.connect(
+            self._handle_first_person_camera_light_intensity_changed
+        )
+        self.first_person_camera_light_value_label = QLabel(
+            _format_light_intensity_percent(
+                _light_intensity_to_percent(DEFAULT_FIRST_PERSON_LIGHT_INTENSITY)
+            )
+        )
+        camera_light_control = QWidget()
+        camera_light_layout = QHBoxLayout(camera_light_control)
+        camera_light_layout.setContentsMargins(0, 0, 0, 0)
+        camera_light_layout.setSpacing(8)
+        camera_light_layout.addWidget(self.first_person_camera_light_slider, 1)
+        camera_light_layout.addWidget(self.first_person_camera_light_value_label)
+        camera_light_form = QFormLayout()
+        camera_light_form.setContentsMargins(0, 0, 0, 0)
+        camera_light_form.addRow("Light intensity", camera_light_control)
+        side_layout.addLayout(camera_light_form)
+
+        first_person_camera_buttons_layout = QHBoxLayout()
+        first_person_camera_buttons_layout.setSpacing(10)
+        self.set_first_person_camera_button = QPushButton(
+            "Set first person camera"
+        )
+        self.set_first_person_camera_button.setMinimumHeight(40)
+        self.set_first_person_camera_button.clicked.connect(
+            self._handle_set_first_person_camera_clicked
+        )
+        first_person_camera_buttons_layout.addWidget(
+            self.set_first_person_camera_button
+        )
+
+        self.clear_first_person_camera_button = QPushButton("Clear camera")
+        self.clear_first_person_camera_button.setMinimumHeight(40)
+        self.clear_first_person_camera_button.setEnabled(False)
+        self.clear_first_person_camera_button.clicked.connect(
+            self.canvas.clear_first_person_camera
+        )
+        first_person_camera_buttons_layout.addWidget(
+            self.clear_first_person_camera_button
+        )
+        side_layout.addLayout(first_person_camera_buttons_layout)
 
         doorway_label = QLabel("Doorways")
         doorway_label.setStyleSheet("font-size: 18px; font-weight: 600;")
@@ -630,7 +797,7 @@ class BlueprintWorkspace(QWidget):
         self.side_tabs.addTab(self._build_images_tab(), "Images")
         self.side_tabs.addTab(self._build_texture_creator_tab(), "Texture creator")
 
-        splitter.addWidget(side_panel)
+        splitter.addWidget(self.side_panel)
         splitter.setStretchFactor(0, 9)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([1160, 440])
@@ -641,11 +808,104 @@ class BlueprintWorkspace(QWidget):
             self._handle_floor_contour_changed
         )
         self.canvas.doorways_changed.connect(self._handle_doorways_changed)
+        self.canvas.first_person_camera_changed.connect(
+            self._handle_canvas_first_person_camera_changed
+        )
         self._refresh_levels_list()
         self._refresh_room_lists()
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
         self._sync_texture_creator_tab()
+        self._schedule_viewer_preview_refresh(preserve_camera=False)
+        self._apply_fullscreen_3d_viewer_screen(
+            generation_settings.fullscreen_3d_viewer_screen_id
+        )
+
+    def _build_canvas_viewer_workspace(self) -> QWidget:
+        """Place the editable blueprint and its 3D preview in local tabs."""
+
+        workspace = QWidget()
+        workspace.setObjectName("canvas-viewer-workspace")
+        workspace_layout = QVBoxLayout(workspace)
+        workspace_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.canvas_viewer_tabs = QTabWidget()
+        self.canvas_viewer_tabs.setObjectName("canvas-viewer-tabs")
+        self.canvas_2d_view_tab_index = self.canvas_viewer_tabs.addTab(
+            self.canvas,
+            "2D view",
+        )
+        self.canvas_3d_view_tab_index = self.canvas_viewer_tabs.addTab(
+            self.viewer,
+            "3D view",
+        )
+        self.canvas_viewer_tabs.currentChanged.connect(
+            self._handle_canvas_viewer_subtab_changed
+        )
+        workspace_layout.addWidget(self.canvas_viewer_tabs)
+        return workspace
+
+    def set_canvas_3d_viewer_external_display_active(
+        self,
+        is_active: bool,
+    ) -> None:
+        """Keep the Canvas workspace focused on 2D while 3D is external."""
+
+        if is_active:
+            self.canvas_viewer_tabs.setCurrentIndex(
+                self.canvas_2d_view_tab_index
+            )
+            self.canvas_viewer_tabs.setTabEnabled(
+                self.canvas_3d_view_tab_index,
+                False,
+            )
+            self.canvas_viewer_tabs.tabBar().setVisible(False)
+            return
+
+        self.canvas_viewer_tabs.setTabEnabled(
+            self.canvas_3d_view_tab_index,
+            True,
+        )
+        self.canvas_viewer_tabs.tabBar().setVisible(True)
+
+    def _handle_canvas_viewer_subtab_changed(self, tab_index: int) -> None:
+        """Give the standard viewer keyboard focus when its tab opens."""
+
+        if tab_index == self.canvas_3d_view_tab_index:
+            self.viewer.focus_navigation()
+
+    def _set_canvas_3d_navigation_shortcut(self, hotkey: str) -> None:
+        """Apply the persisted Canvas-only navigation shortcut."""
+
+        self.canvas_3d_navigation_shortcut.setKey(
+            QKeySequence(hotkey, QKeySequence.SequenceFormat.PortableText)
+        )
+
+    def _toggle_canvas_3d_navigation_mode(self) -> None:
+        """Toggle the active Canvas viewer between orbit and first person."""
+
+        if self.workspace_tabs.currentWidget() is not self.canvas_viewer_workspace:
+            return
+        if (
+            self._external_viewer_host.is_active
+            and self._external_viewer_host.viewer is not self.viewer
+        ):
+            return
+
+        if self.viewer.get_navigation_mode() != NAVIGATION_MODE_FIRST_PERSON:
+            self._sync_canvas_viewer_first_person_camera()
+        self.viewer.toggle_navigation_mode()
+
+    def _handle_canvas_3d_navigation_mode_changed(self, mode: str) -> None:
+        """Reflect the standard viewer's navigation mode in its local tab."""
+
+        tab_label = "3D view"
+        if mode == NAVIGATION_MODE_FIRST_PERSON:
+            tab_label = "3D view (first person)"
+        self.canvas_viewer_tabs.setTabText(
+            self.canvas_3d_view_tab_index,
+            tab_label,
+        )
 
     def _build_uvs_tab(self) -> QWidget:
         uvs_tab = QWidget()
@@ -946,7 +1206,7 @@ class BlueprintWorkspace(QWidget):
             QMessageBox.critical(self, "Export failed", str(error))
             return
 
-        self.workspace_tabs.setCurrentWidget(self.viewer)
+        self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
         self.viewer.set_model(generated_model)
         QMessageBox.information(
             self,
@@ -987,21 +1247,99 @@ class BlueprintWorkspace(QWidget):
         )
 
     def _handle_workspace_tab_changed(self, tab_index: int) -> None:
-        if self.workspace_tabs.widget(tab_index) is not self.viewer:
+        selected_widget = self.workspace_tabs.widget(tab_index)
+        is_full_width_workspace = selected_widget in (
+            self.surface_texture_generation,
+            self.generation,
+            self.settings_widget,
+        )
+        self.side_panel.setVisible(not is_full_width_workspace)
+        if selected_widget is self.surface_texture_generation:
+            self.surface_texture_generation.set_levels(
+                self.levels,
+                self.initial_first_person_camera,
+            )
+
+        self._apply_fullscreen_3d_viewer_screen(
+            self.settings_widget.get_settings().fullscreen_3d_viewer_screen_id
+        )
+        if is_full_width_workspace:
+            return
+
+        if selected_widget is not self.canvas_viewer_workspace:
             return
 
         self._schedule_viewer_preview_refresh(preserve_camera=False)
+
+    def _handle_external_viewer_window_closed(self) -> None:
+        """Keep Settings in sync when the detached viewer window is closed."""
+
+        combo = self.settings_widget.fullscreen_3d_viewer_screen_combo
+        if combo.currentIndex() != 0:
+            combo.setCurrentIndex(0)
+            return
+        self._handle_generation_settings_changed()
+
+    def _apply_fullscreen_3d_viewer_screen(
+        self,
+        screen_id: str | None,
+    ) -> None:
+        """Show the active workspace's 3D view on its chosen display."""
+
+        screen = resolve_fullscreen_3d_viewer_screen(screen_id)
+        viewer = self._active_workspace_3d_viewer()
+        if screen is None or viewer is None:
+            self._external_viewer_host.restore()
+            self.set_canvas_3d_viewer_external_display_active(False)
+            return
+        self._external_viewer_host.show_on_screen(viewer, screen)
+        self.set_canvas_3d_viewer_external_display_active(
+            self._external_viewer_host.viewer is self.viewer
+        )
+
+    def _active_workspace_3d_viewer(self) -> QWidget | None:
+        """Return the 3D widget belonging to the selected top-level tab."""
+
+        selected_widget = self.workspace_tabs.currentWidget()
+        if selected_widget is self.canvas_viewer_workspace:
+            return self.viewer
+        if selected_widget is self.surface_texture_generation:
+            return self.surface_texture_generation.surface_view
+        if selected_widget is self.generation:
+            return self.generation.result_view
+        return None
+
+    def _viewer_preview_is_active(self) -> bool:
+        return (
+            self.workspace_tabs.currentWidget()
+            is self.canvas_viewer_workspace
+            or (
+                self._external_viewer_host.is_active
+                and self._external_viewer_host.viewer is self.viewer
+            )
+        )
 
     def _build_generated_model(
         self,
         failure_title: str | None,
     ) -> GeneratedModel | None:
         try:
-            return convert_to_glb(self.levels)
+            return convert_to_glb(
+                self.levels,
+                surface_materials=(
+                    self.surface_texture_generation.get_surface_material_sources()
+                ),
+            )
         except ValueError as error:
             if failure_title is not None:
                 QMessageBox.warning(self, failure_title, str(error))
             return None
+
+    def _handle_surface_texture_generation_completed(
+        self,
+        _assignment: object,
+    ) -> None:
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     def _refresh_viewer_preview(self, preserve_camera: bool = False) -> None:
         generated_model = self._build_generated_model(None)
@@ -1012,7 +1350,7 @@ class BlueprintWorkspace(QWidget):
         self.viewer.set_model(generated_model, preserve_camera=preserve_camera)
 
     def _schedule_viewer_preview_refresh(self, preserve_camera: bool = True) -> None:
-        if self.workspace_tabs.currentWidget() is not self.viewer:
+        if not self._viewer_preview_is_active():
             return
         if self._is_viewer_refresh_scheduled:
             self._scheduled_viewer_refresh_preserve_camera = (
@@ -1026,7 +1364,7 @@ class BlueprintWorkspace(QWidget):
 
     def _run_scheduled_viewer_preview_refresh(self) -> None:
         self._is_viewer_refresh_scheduled = False
-        if self.workspace_tabs.currentWidget() is not self.viewer:
+        if not self._viewer_preview_is_active():
             return
 
         preserve_camera = self._scheduled_viewer_refresh_preserve_camera
@@ -1034,7 +1372,11 @@ class BlueprintWorkspace(QWidget):
         self._refresh_viewer_preview(preserve_camera=preserve_camera)
 
     def _handle_save_clicked(self) -> None:
-        default_path = Path.cwd() / "housemaker_project.json"
+        default_path = (
+            Path(self.current_project_path)
+            if self.current_project_path is not None
+            else Path.cwd() / "housemaker_project.json"
+        )
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "save project",
@@ -1051,14 +1393,32 @@ class BlueprintWorkspace(QWidget):
                 levels=self.levels,
                 image_library_paths=self.image_library_paths,
                 doorway_presets=self.doorway_presets,
+                generation=self.generation.get_data(),
+                surface_texture_generation=(
+                    self.surface_texture_generation.get_data()
+                ),
+                initial_first_person_camera=self.initial_first_person_camera,
             )
         except ValueError as error:
             QMessageBox.critical(self, "Save failed", str(error))
             return
 
+        self._remember_project_path(file_path)
         QMessageBox.information(self, "Project saved", f"Saved project to:\n{file_path}")
 
     def _handle_load_clicked(self) -> None:
+        if (
+            self.generation.is_generating
+            or self.surface_texture_generation.is_generating
+        ):
+            QMessageBox.critical(
+                self,
+                "Project load failed",
+                "Wait for the current generation request to finish before "
+                "loading another project.",
+            )
+            return
+
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "load project",
@@ -1069,10 +1429,45 @@ class BlueprintWorkspace(QWidget):
             return
 
         try:
-            project_data = load_project(file_path)
-            self._apply_loaded_project(project_data)
-        except ValueError as error:
+            self._load_project_path(file_path)
+        except PROJECT_LOAD_FAILURES as error:
             QMessageBox.critical(self, "Project load failed", str(error))
+
+    def restore_last_project(self) -> bool:
+        """Load the most recently opened or saved project without blocking startup."""
+
+        if self._application_settings is None:
+            return False
+
+        stored_path = self._application_settings.get(
+            LAST_PROJECT_PATH_SETTING_KEY,
+            "",
+        )
+        if not isinstance(stored_path, str) or not stored_path.strip():
+            self._application_settings.remove(LAST_PROJECT_PATH_SETTING_KEY)
+            return False
+
+        try:
+            self._load_project_path(stored_path)
+        except PROJECT_LOAD_FAILURES:
+            self.current_project_path = None
+            self._application_settings.remove(LAST_PROJECT_PATH_SETTING_KEY)
+            return False
+        return True
+
+    def _load_project_path(self, file_path: str | Path) -> None:
+        project_data = load_project(file_path)
+        self._apply_loaded_project(project_data)
+        self._remember_project_path(file_path)
+
+    def _remember_project_path(self, file_path: str | Path) -> None:
+        normalized_path = str(Path(file_path).expanduser().resolve())
+        self.current_project_path = normalized_path
+        if self._application_settings is not None:
+            self._application_settings.set(
+                LAST_PROJECT_PATH_SETTING_KEY,
+                normalized_path,
+            )
 
     def _handle_load_image_clicked(self) -> None:
         file_path = self._get_image_file_path()
@@ -1839,6 +2234,7 @@ class BlueprintWorkspace(QWidget):
             return
 
         self.current_level.scale = float(value)
+        self.canvas.update()
         self._schedule_viewer_preview_refresh()
 
     def _handle_level_x_offset_changed(self, value: float) -> None:
@@ -1846,6 +2242,7 @@ class BlueprintWorkspace(QWidget):
             return
 
         self.current_level.offset_x_meters = float(value)
+        self.canvas.update()
         self._schedule_viewer_preview_refresh()
 
     def _handle_level_y_offset_changed(self, value: float) -> None:
@@ -1853,6 +2250,7 @@ class BlueprintWorkspace(QWidget):
             return
 
         self.current_level.offset_y_meters = float(value)
+        self.canvas.update()
         self._schedule_viewer_preview_refresh()
 
     def _handle_floor_thickness_changed(self, value: float) -> None:
@@ -1892,15 +2290,135 @@ class BlueprintWorkspace(QWidget):
             return
 
         self.canvas.start_doorway_placement(doorway_preset)
-        self.workspace_tabs.setCurrentWidget(self.canvas)
+        self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
 
     def _handle_doorways_changed(self) -> None:
         self.current_level.doorways = self.canvas.doorways
         self._schedule_viewer_preview_refresh()
 
+    def _handle_set_first_person_camera_clicked(self) -> None:
+        if self.canvas.blueprint_image is None:
+            QMessageBox.information(
+                self,
+                "Blueprint required",
+                "Load a blueprint image for this level before placing the camera.",
+            )
+            return
+
+        camera = self.initial_first_person_camera
+        if camera is not None and camera.level_index == self.current_level.index:
+            z_meters = camera.pose.z
+        else:
+            level_base_z = build_level_base_z_lookup(self.levels).get(
+                self.current_level.index,
+                0.0,
+            )
+            z_meters = (
+                level_base_z + DEFAULT_FIRST_PERSON_CAMERA_HEIGHT_METERS
+            )
+
+        self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
+        self.canvas.start_first_person_camera_placement(z_meters)
+        self.first_person_camera_status_label.setText(
+            "Camera placement active: click the blueprint to place it."
+        )
+
+    def _handle_canvas_first_person_camera_changed(self, raw_camera: object) -> None:
+        if raw_camera is not None and not isinstance(
+            raw_camera,
+            InitialFirstPersonCamera,
+        ):
+            return
+        self.initial_first_person_camera = raw_camera
+        self._sync_canvas_viewer_first_person_camera()
+        self._sync_first_person_camera_controls()
+        self.surface_texture_generation.set_levels(
+            self.levels,
+            self.initial_first_person_camera,
+        )
+
+    def _sync_canvas_viewer_first_person_camera(self) -> None:
+        """Use the Canvas camera as the standard viewer's FP entry pose."""
+
+        camera = self.initial_first_person_camera
+        if camera is not None:
+            self.viewer.set_first_person_camera_pose(camera.pose)
+
+    def _handle_generation_settings_changed(self) -> None:
+        settings = self.settings_widget.get_settings()
+        self._set_canvas_3d_navigation_shortcut(
+            settings.canvas_3d_navigation_toggle_hotkey
+        )
+        self.generation.set_runtime_settings(settings)
+        self.surface_texture_generation.set_runtime_settings(settings)
+        self._apply_fullscreen_3d_viewer_screen(
+            settings.fullscreen_3d_viewer_screen_id
+        )
+
+    def _handle_first_person_camera_z_changed(self, value: float) -> None:
+        if self._is_syncing_first_person_camera_controls:
+            return
+        self.canvas.update_first_person_camera_z(float(value))
+
+    def _handle_first_person_camera_light_intensity_changed(
+        self,
+        value: int,
+    ) -> None:
+        self.first_person_camera_light_value_label.setText(
+            _format_light_intensity_percent(value)
+        )
+        if self._is_syncing_first_person_camera_controls:
+            return
+        self.canvas.update_first_person_camera_light_intensity(
+            _percent_to_light_intensity(value)
+        )
+
+    def _sync_first_person_camera_controls(self) -> None:
+        camera = self.initial_first_person_camera
+        self._is_syncing_first_person_camera_controls = True
+        self.first_person_camera_z_spinbox.setEnabled(camera is not None)
+        self.first_person_camera_light_slider.setEnabled(camera is not None)
+        self.clear_first_person_camera_button.setEnabled(camera is not None)
+        if camera is None:
+            self.first_person_camera_status_label.setText("Camera: Not set")
+            light_percent = _light_intensity_to_percent(
+                DEFAULT_FIRST_PERSON_LIGHT_INTENSITY
+            )
+            self.first_person_camera_light_slider.setValue(light_percent)
+            self.first_person_camera_light_value_label.setText(
+                _format_light_intensity_percent(light_percent)
+            )
+        else:
+            self.first_person_camera_z_spinbox.setValue(camera.pose.z)
+            light_percent = _light_intensity_to_percent(camera.light_intensity)
+            self.first_person_camera_light_slider.setValue(light_percent)
+            self.first_person_camera_light_value_label.setText(
+                _format_light_intensity_percent(light_percent)
+            )
+            owner_level = next(
+                (
+                    level
+                    for level in self.levels
+                    if level.index == camera.level_index
+                ),
+                None,
+            )
+            owner_name = (
+                f"L{camera.level_index}"
+                if owner_level is None
+                else owner_level.display_name
+            )
+            self.first_person_camera_status_label.setText(
+                f"Camera: {owner_name} | "
+                f"X {camera.pose.x:.2f} m | Y {camera.pose.y:.2f} m | "
+                f"Z {camera.pose.z:.2f} m | Yaw {camera.pose.yaw_degrees:.1f} deg | "
+                f"Light {light_percent}%"
+            )
+        self._is_syncing_first_person_camera_controls = False
+
     def _handle_set_floor_contour_clicked(self) -> None:
         self.canvas.start_floor_contour_designation()
-        self.workspace_tabs.setCurrentWidget(self.canvas)
+        self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
 
     def _handle_clear_floor_contour_clicked(self) -> None:
         self.canvas.clear_floor_contour()
@@ -2198,6 +2716,13 @@ class BlueprintWorkspace(QWidget):
             current_level_index=project_data.current_level_index,
             image_library_paths=project_data.image_library_paths,
             doorway_presets=project_data.doorway_presets,
+            generation=project_data.generation,
+            surface_texture_generation=(
+                project_data.surface_texture_generation
+            ),
+            initial_first_person_camera=(
+                project_data.initial_first_person_camera
+            ),
         )
 
     def _apply_project_state(
@@ -2206,8 +2731,22 @@ class BlueprintWorkspace(QWidget):
         current_level_index: int,
         image_library_paths: list[str] | None = None,
         doorway_presets: list[DoorwayPreset] | None = None,
+        generation: GenerationData | None = None,
+        surface_texture_generation: SurfaceTextureData | None = None,
+        initial_first_person_camera: InitialFirstPersonCamera | None = None,
     ) -> None:
+        if (
+            self.generation.is_generating
+            or self.surface_texture_generation.is_generating
+        ):
+            raise RuntimeError(
+                "Wait for the current generation request to finish before "
+                "loading another project."
+            )
+
         self.levels = levels
+        self.initial_first_person_camera = initial_first_person_camera
+        self._sync_canvas_viewer_first_person_camera()
         self.image_library_paths = self._normalize_image_library_paths(
             image_library_paths or []
         )
@@ -2226,6 +2765,14 @@ class BlueprintWorkspace(QWidget):
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
         self._refresh_room_lists()
+        self.generation.set_data(generation)
+        self.surface_texture_generation.set_levels(
+            self.levels,
+            self.initial_first_person_camera,
+        )
+        self.surface_texture_generation.set_data(
+            surface_texture_generation
+        )
         self._schedule_viewer_preview_refresh()
 
     def _set_current_level_image(self, file_path: str) -> None:
@@ -2244,7 +2791,11 @@ class BlueprintWorkspace(QWidget):
         )
         self.current_level.image_path = normalized_path
         self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
-        self.workspace_tabs.setCurrentWidget(self.canvas)
+        self.canvas.set_initial_first_person_camera_context(
+            self.initial_first_person_camera,
+            self.current_level,
+        )
+        self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
         self._update_blueprint_name_label()
         self._schedule_viewer_preview_refresh()
 
@@ -2263,7 +2814,12 @@ class BlueprintWorkspace(QWidget):
         )
         if self.canvas.blueprint_image is not None:
             self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
+        self.canvas.set_initial_first_person_camera_context(
+            self.initial_first_person_camera,
+            self.current_level,
+        )
         self._update_blueprint_name_label()
+        self._sync_first_person_camera_controls()
 
     def _sync_canvas_image_transform(self) -> None:
         self.canvas.set_image_transform(
@@ -2331,28 +2887,31 @@ class BlueprintWorkspace(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        application_settings: ApplicationSettingsStore | None = None,
+    ) -> None:
         super().__init__()
+        self.application_settings = (
+            application_settings
+            if application_settings is not None
+            else ApplicationSettingsStore()
+        )
         self._build_ui()
 
     def _build_ui(self) -> None:
         self.setWindowTitle("HouseMaker")
         self.resize(1600, 900)
 
-        self.stack = QStackedWidget()
-        self.setCentralWidget(self.stack)
+        self.blueprint_workspace = BlueprintWorkspace(
+            application_settings=self.application_settings
+        )
+        self.setCentralWidget(self.blueprint_workspace)
+        self.blueprint_workspace.restore_last_project()
 
-        self.home_page = HomePage()
-        self.blueprint_workspace = BlueprintWorkspace()
-
-        self.stack.addWidget(self.home_page)
-        self.stack.addWidget(self.blueprint_workspace)
-        self.stack.setCurrentWidget(self.home_page)
-
-        self.home_page.blueprint_button.clicked.connect(self._open_blueprint_mode)
-
-    def _open_blueprint_mode(self) -> None:
-        self.stack.setCurrentWidget(self.blueprint_workspace)
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self.blueprint_workspace.shutdown()
+        super().closeEvent(event)
 
 
 # ### Numeric helpers ###
@@ -2382,6 +2941,18 @@ def _step_power_of_two_value(value: int, steps: int) -> int:
 
 def _normalize_degree_value(value: int) -> int:
     return int(value) % 360
+
+
+def _light_intensity_to_percent(intensity: float) -> int:
+    return int(round(float(intensity) * FIRST_PERSON_LIGHT_PERCENT_SCALE))
+
+
+def _percent_to_light_intensity(percent: int) -> float:
+    return float(percent) / FIRST_PERSON_LIGHT_PERCENT_SCALE
+
+
+def _format_light_intensity_percent(percent: int) -> str:
+    return f"{int(percent)}%"
 
 
 # ### Text helpers ###

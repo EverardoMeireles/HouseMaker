@@ -1,0 +1,163 @@
+{
+  "id": "mock-generator-hybrid",
+  "status": "completed",
+  "durationSeconds": 1.578,
+  "artifacts": [
+    {
+      "name": "main.obj",
+      "type": "model",
+      "format": "obj",
+      "path": "variants/mock-generator-hybrid/generated/main/main.obj",
+      "sizeBytes": 410,
+      "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-hybrid/generated/main/main.obj",
+      "createdAt": "2026-08-03T23:36:13.821357Z"
+    },
+    {
+      "name": "main.mtl",
+      "type": "file",
+      "format": "mtl",
+      "path": "variants/mock-generator-hybrid/generated/main/main.mtl",
+      "sizeBytes": 59,
+      "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-hybrid/generated/main/main.mtl",
+      "createdAt": "2026-08-03T23:36:13.821357Z"
+    },
+    {
+      "name": "main_albedo.png",
+      "type": "preview",
+      "format": "png",
+      "path": "variants/mock-generator-hybrid/generated/main/main_albedo.png",
+      "sizeBytes": 79,
+      "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-hybrid/generated/main/main_albedo.png",
+      "createdAt": "2026-08-03T23:36:13.821357Z"
+    },
+    {
+      "name": "generation.json",
+      "type": "metadata",
+      "format": "json",
+      "path": "variants/mock-generator-hybrid/generated/main/generation.json",
+      "sizeBytes": 205,
+      "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-hybrid/generated/main/generation.json",
+      "createdAt": "2026-08-03T23:36:13.821357Z"
+    },
+    {
+      "name": "model.glb",
+      "type": "model",
+      "format": "glb",
+      "path": "variants/mock-generator-hybrid/final/model.glb",
+      "sizeBytes": 740,
+      "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-hybrid/final/model.glb",
+      "createdAt": "2026-08-03T23:36:13.821357Z"
+    },
+    {
+      "name": "model.blend",
+      "type": "model",
+      "format": "blend",
+      "path": "variants/mock-generator-hybrid/final/model.blend",
+      "sizeBytes": 30,
+      "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-hybrid/final/model.blend",
+      "createdAt": "2026-08-03T23:36:13.821357Z"
+    },
+    {
+      "name": "model.step",
+      "type": "model",
+      "format": "step",
+      "path": "variants/mock-generator-hybrid/final/model.step",
+      "sizeBytes": 285,
+      "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-hybrid/final/model.step",
+      "createdAt": "2026-08-03T23:36:13.821357Z"
+    },
+    {
+      "name": "geometry-result.json",
+      "type": "metadata",
+      "format": "json",
+      "path": "variants/mock-generator-hybrid/final/geometry-result.json",
+      "sizeBytes": 150,
+      "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-hybrid/final/geometry-result.json",
+      "createdAt": "2026-08-03T23:36:13.821357Z"
+    },
+    {
+      "name": "preview.png",
+      "type": "preview",
+      "format": "png",
+      "path": "variants/mock-generator-hybrid/renders/preview.png",
+      "sizeBytes": 584,
+      "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-hybrid/renders/preview.png",
+      "createdAt": "2026-08-03T23:36:13.821357Z"
+    },
+    {
+      "name": "validation.json",
+      "type": "metadata",
+      "format": "json",
+      "path": "variants/mock-generator-hybrid/validation/validation.json",
+      "sizeBytes": 528,
+      "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-hybrid/validation/validation.json",
+      "createdAt": "2026-08-03T23:36:13.821357Z"
+    }
+  ],
+  "validation": {
+    "enabled": true,
+    "valid": true,
+    "metrics": {
+      "triangleCount": 12,
+      "objectCount": 1,
+      "materialCount": 0,
+      "nonManifoldEdgeCount": 0,
+      "dimensionsMetres": {
+        "x": 1.0,
+        "y": 1.0,
+        "z": 1.0
+      }
+    },
+    "warnings": [
+      "Triangle count differs from the target by more than 20 percent",
+      "Dimension x differs from the target by more than 5 percent",
+      "Dimension y differs from the target by more than 5 percent",
+      "Dimension z differs from the target by more than 5 percent"
+    ]
+  },
+  "warnings": [
+    "Triangle count differs from the target by more than 20 percent",
+    "Dimension x differs from the target by more than 5 percent",
+    "Dimension y differs from the target by more than 5 percent",
+    "Dimension z differs from the target by more than 5 percent"
+  ],
+  "failedStages": [],
+  "generatorUsed": "mock",
+  "llmUsed": "mock",
+  "llmModel": "deterministic-mock-planner",
+  "backendUsed": "hybrid",
+  "seed": 1001,
+  "visualScore": 75.01,
+  "configuration": {
+    "id": "mock-generator-hybrid",
+    "planner": {
+      "adapter": "mock",
+      "model": "deterministic-mock-planner",
+      "temperature": 0.0,
+      "maxTokens": 1000
+    },
+    "vision": {
+      "segmentation": true,
+      "depthEstimation": true,
+      "inpainting": false,
+      "segmentationBackend": null,
+      "depthBackend": null,
+      "inpaintingBackend": null
+    },
+    "generation": {
+      "primary": "mock",
+      "fallback": null,
+      "seed": 1001
+    },
+    "geometry": {
+      "backend": "hybrid",
+      "proceduralBackend": "freecad",
+      "meshBackend": "blender"
+    },
+    "validation": {
+      "meshValidation": true,
+      "visualValidation": true
+    },
+    "simulateFailureStage": null
+  }
+}

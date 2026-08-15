@@ -3,9 +3,14 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from housemaker.camera_models import CameraPose, InitialFirstPersonCamera
+from housemaker.generation_state import GenerationData
+from housemaker.surface_texture_state import SurfaceTextureData
 from housemaker.models import (
     DEFAULT_DOORWAY_DEPTH_METERS,
     DEFAULT_DOORWAY_HEIGHT_METERS,
@@ -56,6 +61,11 @@ class ProjectData:
     doorway_presets: list[DoorwayPreset] = field(
         default_factory=create_default_doorway_presets
     )
+    generation: GenerationData = field(default_factory=GenerationData)
+    surface_texture_generation: SurfaceTextureData = field(
+        default_factory=SurfaceTextureData
+    )
+    initial_first_person_camera: InitialFirstPersonCamera | None = None
 
 
 # ### Public helpers ###
@@ -65,6 +75,9 @@ def save_project(
     levels: list[LevelData],
     image_library_paths: list[str] | None = None,
     doorway_presets: list[DoorwayPreset] | None = None,
+    generation: GenerationData | None = None,
+    surface_texture_generation: SurfaceTextureData | None = None,
+    initial_first_person_camera: InitialFirstPersonCamera | None = None,
 ) -> Path:
     export_path = Path(path)
     payload = {
@@ -78,6 +91,21 @@ def save_project(
             doorway_presets
             if doorway_presets is not None
             else create_default_doorway_presets()
+        ),
+        "generation": (
+            generation.to_dict()
+            if generation is not None
+            else GenerationData().to_dict()
+        ),
+        "surface_texture_generation": (
+            surface_texture_generation.to_dict()
+            if surface_texture_generation is not None
+            else SurfaceTextureData().to_dict()
+        ),
+        "initial_first_person_camera": (
+            None
+            if initial_first_person_camera is None
+            else initial_first_person_camera.to_dict()
         ),
         "levels": [
             {
@@ -108,13 +136,7 @@ def save_project(
         ],
     }
 
-    try:
-        export_path.write_text(
-            json.dumps(payload, indent=2),
-            encoding="utf-8",
-        )
-    except OSError as error:
-        raise ValueError(f"Unable to save project file: {export_path}") from error
+    _write_project_json_atomically(export_path, payload)
 
     return export_path
 
@@ -193,6 +215,22 @@ def load_project(path: str | Path) -> ProjectData:
     doorway_presets = _deserialize_doorway_presets(
         payload.get("doorway_presets")
     )
+    generation = _deserialize_generation(
+        payload.get("generation"),
+        payload.get("dynamic_generation"),
+    )
+    surface_texture_generation = _deserialize_surface_texture_generation(
+        payload.get("surface_texture_generation")
+    )
+    if "initial_first_person_camera" in payload:
+        initial_first_person_camera = _deserialize_initial_first_person_camera(
+            payload.get("initial_first_person_camera"),
+            valid_level_indices=set(level_lookup),
+        )
+    else:
+        initial_first_person_camera = _build_legacy_initial_camera(
+            payload.get("dynamic_generation")
+        )
     _clear_image_library_paths_from_levels(levels, image_library_paths)
 
     current_level_index = int(payload.get("current_level_index", GROUND_LEVEL_INDEX))
@@ -205,10 +243,127 @@ def load_project(path: str | Path) -> ProjectData:
         levels=levels,
         image_library_paths=image_library_paths,
         doorway_presets=doorway_presets,
+        generation=generation,
+        surface_texture_generation=surface_texture_generation,
+        initial_first_person_camera=initial_first_person_camera,
     )
 
 
+# ### Project file helpers ###
+def _write_project_json_atomically(
+    export_path: Path,
+    payload: dict[str, object],
+) -> None:
+    """Replace a project only after its complete JSON is durable on disk."""
+
+    temporary_path: Path | None = None
+    try:
+        serialized_payload = json.dumps(payload, indent=2)
+        file_descriptor, raw_temporary_path = tempfile.mkstemp(
+            prefix=f".{export_path.name}.",
+            suffix=".tmp",
+            dir=str(export_path.parent),
+        )
+        temporary_path = Path(raw_temporary_path)
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
+            handle.write(serialized_payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, export_path)
+    except (OSError, TypeError, ValueError) as error:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise ValueError(f"Unable to save project file: {export_path}") from error
+
+
 # ### Serialization helpers ###
+def _deserialize_generation(
+    raw_generation: object,
+    raw_legacy_dynamic_generation: object,
+) -> GenerationData:
+    if isinstance(raw_generation, dict):
+        try:
+            return GenerationData.from_dict(raw_generation)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return GenerationData()
+
+    if not isinstance(raw_legacy_dynamic_generation, dict):
+        return GenerationData()
+    raw_video_metadata = raw_legacy_dynamic_generation.get("video_metadata")
+    if not isinstance(raw_video_metadata, dict):
+        return GenerationData()
+    try:
+        return GenerationData.from_dict(
+            {"video_metadata": raw_video_metadata}
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return GenerationData()
+
+
+def _deserialize_surface_texture_generation(
+    raw_surface_texture_generation: object,
+) -> SurfaceTextureData:
+    """Load optional surface-texture state without breaking older projects."""
+
+    if not isinstance(raw_surface_texture_generation, dict):
+        return SurfaceTextureData()
+    try:
+        return SurfaceTextureData.from_dict(raw_surface_texture_generation)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return SurfaceTextureData()
+
+
+def _deserialize_initial_first_person_camera(
+    raw_camera: object,
+    valid_level_indices: set[int],
+) -> InitialFirstPersonCamera | None:
+    if not isinstance(raw_camera, dict):
+        return None
+
+    try:
+        camera = InitialFirstPersonCamera.from_dict(raw_camera)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+    if camera.level_index not in valid_level_indices:
+        return None
+    return camera
+
+
+def _build_legacy_initial_camera(
+    raw_dynamic_generation: object,
+) -> InitialFirstPersonCamera | None:
+    if not isinstance(raw_dynamic_generation, dict):
+        return None
+    raw_alignments = raw_dynamic_generation.get("alignments")
+    if not isinstance(raw_alignments, list):
+        return None
+    for raw_alignment in raw_alignments:
+        if not isinstance(raw_alignment, dict):
+            continue
+        try:
+            is_frame_zero = int(raw_alignment.get("frame_index", -1)) == 0
+        except (TypeError, ValueError, OverflowError):
+            continue
+        is_manual = (
+            raw_alignment.get("source") == "manual"
+            or raw_alignment.get("manual") is True
+        )
+        raw_pose = raw_alignment.get("pose")
+        if not is_frame_zero or not is_manual or not isinstance(raw_pose, dict):
+            continue
+        try:
+            return InitialFirstPersonCamera(
+                level_index=GROUND_LEVEL_INDEX,
+                pose=CameraPose.from_dict(raw_pose),
+            )
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+    return None
+
+
 def _normalize_optional_path(path_value: object) -> str | None:
     path_text = str(path_value or "").strip()
     if not path_text:

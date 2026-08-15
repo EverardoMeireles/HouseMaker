@@ -1,0 +1,297 @@
+{
+  "batchId": "mock-chair-001",
+  "status": "completed",
+  "progress": 100,
+  "currentVariant": null,
+  "currentStage": null,
+  "variants": [
+    {
+      "id": "mock-generator-blender",
+      "status": "completed",
+      "progress": 100,
+      "currentStage": null,
+      "durationSeconds": 1.643029,
+      "startedAt": "2026-08-03T23:36:10.506517Z",
+      "finishedAt": "2026-08-03T23:36:12.149546Z",
+      "error": null,
+      "warnings": [
+        "Triangle count differs from the target by more than 20 percent",
+        "Dimension x differs from the target by more than 5 percent",
+        "Dimension y differs from the target by more than 5 percent",
+        "Dimension z differs from the target by more than 5 percent"
+      ],
+      "artifacts": [
+        {
+          "name": "main.obj",
+          "type": "model",
+          "format": "obj",
+          "path": "variants/mock-generator-blender/generated/main/main.obj",
+          "sizeBytes": 410,
+          "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-blender/generated/main/main.obj",
+          "createdAt": "2026-08-03T23:36:12.068411Z"
+        },
+        {
+          "name": "main.mtl",
+          "type": "file",
+          "format": "mtl",
+          "path": "variants/mock-generator-blender/generated/main/main.mtl",
+          "sizeBytes": 59,
+          "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-blender/generated/main/main.mtl",
+          "createdAt": "2026-08-03T23:36:12.070417Z"
+        },
+        {
+          "name": "main_albedo.png",
+          "type": "preview",
+          "format": "png",
+          "path": "variants/mock-generator-blender/generated/main/main_albedo.png",
+          "sizeBytes": 79,
+          "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-blender/generated/main/main_albedo.png",
+          "createdAt": "2026-08-03T23:36:12.070417Z"
+        },
+        {
+          "name": "generation.json",
+          "type": "metadata",
+          "format": "json",
+          "path": "variants/mock-generator-blender/generated/main/generation.json",
+          "sizeBytes": 205,
+          "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-blender/generated/main/generation.json",
+          "createdAt": "2026-08-03T23:36:12.072422Z"
+        },
+        {
+          "name": "model.glb",
+          "type": "model",
+          "format": "glb",
+          "path": "variants/mock-generator-blender/final/model.glb",
+          "sizeBytes": 740,
+          "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-blender/final/model.glb",
+          "createdAt": "2026-08-03T23:36:12.072422Z"
+        },
+        {
+          "name": "model.blend",
+          "type": "model",
+          "format": "blend",
+          "path": "variants/mock-generator-blender/final/model.blend",
+          "sizeBytes": 30,
+          "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-blender/final/model.blend",
+          "createdAt": "2026-08-03T23:36:12.072422Z"
+        },
+        {
+          "name": "model.step",
+          "type": "model",
+          "format": "step",
+          "path": "variants/mock-generator-blender/final/model.step",
+          "sizeBytes": 285,
+          "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-blender/final/model.step",
+          "createdAt": "2026-08-03T23:36:12.074427Z"
+        },
+        {
+          "name": "geometry-result.json",
+          "type": "metadata",
+          "format": "json",
+          "path": "variants/mock-generator-blender/final/geometry-result.json",
+          "sizeBytes": 150,
+          "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-blender/final/geometry-result.json",
+          "createdAt": "2026-08-03T23:36:12.074427Z"
+        },
+        {
+          "name": "preview.png",
+          "type": "preview",
+          "format": "png",
+          "path": "variants/mock-generator-blender/renders/preview.png",
+          "sizeBytes": 585,
+          "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-blender/renders/preview.png",
+          "createdAt": "2026-08-03T23:36:12.076432Z"
+        },
+        {
+          "name": "validation.json",
+          "type": "metadata",
+          "format": "json",
+          "path": "variants/mock-generator-blender/validation/validation.json",
+          "sizeBytes": 528,
+          "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-blender/validation/validation.json",
+          "createdAt": "2026-08-03T23:36:12.076432Z"
+        }
+      ],
+      "failedStages": [],
+      "completedStages": [
+        "plan",
+        "vision_preprocessing",
+        "route_components",
+        "generate_components",
+        "geometry_processing",
+        "validate_geometry",
+        "render_previews",
+        "visual_evaluation",
+        "save_result"
+      ]
+    },
+    {
+      "id": "mock-generator-hybrid",
+      "status": "completed",
+      "progress": 100,
+      "currentStage": null,
+      "durationSeconds": 1.690373,
+      "startedAt": "2026-08-03T23:36:12.208864Z",
+      "finishedAt": "2026-08-03T23:36:13.899237Z",
+      "error": null,
+      "warnings": [
+        "Triangle count differs from the target by more than 20 percent",
+        "Dimension x differs from the target by more than 5 percent",
+        "Dimension y differs from the target by more than 5 percent",
+        "Dimension z differs from the target by more than 5 percent"
+      ],
+      "artifacts": [
+        {
+          "name": "main.obj",
+          "type": "model",
+          "format": "obj",
+          "path": "variants/mock-generator-hybrid/generated/main/main.obj",
+          "sizeBytes": 410,
+          "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-hybrid/generated/main/main.obj",
+          "createdAt": "2026-08-03T23:36:13.821357Z"
+        },
+        {
+          "name": "main.mtl",
+          "type": "file",
+          "format": "mtl",
+          "path": "variants/mock-generator-hybrid/generated/main/main.mtl",
+          "sizeBytes": 59,
+          "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-hybrid/generated/main/main.mtl",
+          "createdAt": "2026-08-03T23:36:13.821357Z"
+        },
+        {
+          "name": "main_albedo.png",
+          "type": "preview",
+          "format": "png",
+          "path": "variants/mock-generator-hybrid/generated/main/main_albedo.png",
+          "sizeBytes": 79,
+          "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-hybrid/generated/main/main_albedo.png",
+          "createdAt": "2026-08-03T23:36:13.821357Z"
+        },
+        {
+          "name": "generation.json",
+          "type": "metadata",
+          "format": "json",
+          "path": "variants/mock-generator-hybrid/generated/main/generation.json",
+          "sizeBytes": 205,
+          "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-hybrid/generated/main/generation.json",
+          "createdAt": "2026-08-03T23:36:13.821357Z"
+        },
+        {
+          "name": "model.glb",
+          "type": "model",
+          "format": "glb",
+          "path": "variants/mock-generator-hybrid/final/model.glb",
+          "sizeBytes": 740,
+          "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-hybrid/final/model.glb",
+          "createdAt": "2026-08-03T23:36:13.821357Z"
+        },
+        {
+          "name": "model.blend",
+          "type": "model",
+          "format": "blend",
+          "path": "variants/mock-generator-hybrid/final/model.blend",
+          "sizeBytes": 30,
+          "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-hybrid/final/model.blend",
+          "createdAt": "2026-08-03T23:36:13.821357Z"
+        },
+        {
+          "name": "model.step",
+          "type": "model",
+          "format": "step",
+          "path": "variants/mock-generator-hybrid/final/model.step",
+          "sizeBytes": 285,
+          "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-hybrid/final/model.step",
+          "createdAt": "2026-08-03T23:36:13.821357Z"
+        },
+        {
+          "name": "geometry-result.json",
+          "type": "metadata",
+          "format": "json",
+          "path": "variants/mock-generator-hybrid/final/geometry-result.json",
+          "sizeBytes": 150,
+          "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-hybrid/final/geometry-result.json",
+          "createdAt": "2026-08-03T23:36:13.821357Z"
+        },
+        {
+          "name": "preview.png",
+          "type": "preview",
+          "format": "png",
+          "path": "variants/mock-generator-hybrid/renders/preview.png",
+          "sizeBytes": 584,
+          "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-hybrid/renders/preview.png",
+          "createdAt": "2026-08-03T23:36:13.821357Z"
+        },
+        {
+          "name": "validation.json",
+          "type": "metadata",
+          "format": "json",
+          "path": "variants/mock-generator-hybrid/validation/validation.json",
+          "sizeBytes": 528,
+          "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-hybrid/validation/validation.json",
+          "createdAt": "2026-08-03T23:36:13.821357Z"
+        }
+      ],
+      "failedStages": [],
+      "completedStages": [
+        "plan",
+        "vision_preprocessing",
+        "route_components",
+        "generate_components",
+        "geometry_processing",
+        "validate_geometry",
+        "render_previews",
+        "visual_evaluation",
+        "save_result"
+      ]
+    }
+  ],
+  "elapsedSeconds": 4.286288,
+  "createdAt": "2026-08-03T23:36:09.661976Z",
+  "updatedAt": "2026-08-03T23:36:14.059794Z",
+  "startedAt": "2026-08-03T23:36:09.754715Z",
+  "finishedAt": "2026-08-03T23:36:14.041003Z",
+  "error": null,
+  "errors": [],
+  "warnings": [
+    "mock-generator-blender: Triangle count differs from the target by more than 20 percent",
+    "mock-generator-blender: Dimension x differs from the target by more than 5 percent",
+    "mock-generator-blender: Dimension y differs from the target by more than 5 percent",
+    "mock-generator-blender: Dimension z differs from the target by more than 5 percent",
+    "mock-generator-hybrid: Triangle count differs from the target by more than 20 percent",
+    "mock-generator-hybrid: Dimension x differs from the target by more than 5 percent",
+    "mock-generator-hybrid: Dimension y differs from the target by more than 5 percent",
+    "mock-generator-hybrid: Dimension z differs from the target by more than 5 percent"
+  ],
+  "artifacts": [
+    {
+      "name": "comparison.json",
+      "type": "comparison",
+      "format": "json",
+      "path": "comparison/comparison.json",
+      "sizeBytes": 4373,
+      "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/comparison/comparison.json",
+      "createdAt": "2026-08-03T23:36:14.019528Z"
+    },
+    {
+      "name": "ranking.json",
+      "type": "comparison",
+      "format": "json",
+      "path": "comparison/ranking.json",
+      "sizeBytes": 366,
+      "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/comparison/ranking.json",
+      "createdAt": "2026-08-03T23:36:14.019528Z"
+    },
+    {
+      "name": "contact-sheet.png",
+      "type": "comparison",
+      "format": "png",
+      "path": "comparison/contact-sheet.png",
+      "sizeBytes": 2517,
+      "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/comparison/contact-sheet.png",
+      "createdAt": "2026-08-03T23:36:14.019528Z"
+    }
+  ],
+  "cancelRequested": false,
+  "eventNumber": 53
+}

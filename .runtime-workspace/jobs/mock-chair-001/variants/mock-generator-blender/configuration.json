@@ -1,0 +1,32 @@
+{
+  "id": "mock-generator-blender",
+  "planner": {
+    "adapter": "mock",
+    "model": "deterministic-mock-planner",
+    "temperature": 0.0,
+    "maxTokens": 1000
+  },
+  "vision": {
+    "segmentation": true,
+    "depthEstimation": true,
+    "inpainting": false,
+    "segmentationBackend": null,
+    "depthBackend": null,
+    "inpaintingBackend": null
+  },
+  "generation": {
+    "primary": "mock",
+    "fallback": null,
+    "seed": 1001
+  },
+  "geometry": {
+    "backend": "blender",
+    "proceduralBackend": null,
+    "meshBackend": null
+  },
+  "validation": {
+    "meshValidation": true,
+    "visualValidation": true
+  },
+  "simulateFailureStage": null
+}

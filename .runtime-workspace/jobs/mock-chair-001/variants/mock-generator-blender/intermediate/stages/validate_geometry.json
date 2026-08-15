@@ -1,0 +1,30 @@
+{
+  "stage": "validate_geometry",
+  "status": "completed",
+  "startedAt": "2026-08-03T23:36:11.530088Z",
+  "finishedAt": "2026-08-03T23:36:11.578661Z",
+  "durationSeconds": 0.031,
+  "cacheKey": null,
+  "cacheHit": false,
+  "result": {
+    "enabled": true,
+    "valid": true,
+    "metrics": {
+      "triangleCount": 12,
+      "objectCount": 1,
+      "materialCount": 0,
+      "nonManifoldEdgeCount": 0,
+      "dimensionsMetres": {
+        "x": 1.0,
+        "y": 1.0,
+        "z": 1.0
+      }
+    },
+    "warnings": [
+      "Triangle count differs from the target by more than 20 percent",
+      "Dimension x differs from the target by more than 5 percent",
+      "Dimension y differs from the target by more than 5 percent",
+      "Dimension z differs from the target by more than 5 percent"
+    ]
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "stage": "geometry_processing",
+  "status": "completed",
+  "startedAt": "2026-08-03T23:36:11.292641Z",
+  "finishedAt": "2026-08-03T23:36:11.424114Z",
+  "durationSeconds": 0.11,
+  "cacheKey": null,
+  "cacheHit": false,
+  "result": {
+    "backendUsed": "blender",
+    "executionAdapter": "mock",
+    "assemblyMesh": "C:\\Users\\Everardo\\Documents\\HouseMaker\\.runtime-workspace\\jobs\\mock-chair-001\\variants\\mock-generator-blender\\normalized\\topology\\clean_topology.obj",
+    "validationMesh": "C:\\Users\\Everardo\\Documents\\HouseMaker\\.runtime-workspace\\jobs\\mock-chair-001\\variants\\mock-generator-blender\\normalized\\validation\\model.stl",
+    "previewMesh": "C:\\Users\\Everardo\\Documents\\HouseMaker\\.runtime-workspace\\jobs\\mock-chair-001\\variants\\mock-generator-blender\\normalized\\topology\\clean_topology.obj",
+    "previewBackend": "mock",
+    "artifacts": [
+      "C:\\Users\\Everardo\\Documents\\HouseMaker\\.runtime-workspace\\jobs\\mock-chair-001\\variants\\mock-generator-blender\\final\\model.glb",
+      "C:\\Users\\Everardo\\Documents\\HouseMaker\\.runtime-workspace\\jobs\\mock-chair-001\\variants\\mock-generator-blender\\final\\model.blend",
+      "C:\\Users\\Everardo\\Documents\\HouseMaker\\.runtime-workspace\\jobs\\mock-chair-001\\variants\\mock-generator-blender\\final\\model.step",
+      "C:\\Users\\Everardo\\Documents\\HouseMaker\\.runtime-workspace\\jobs\\mock-chair-001\\variants\\mock-generator-blender\\final\\geometry-result.json"
+    ]
+  }
+}

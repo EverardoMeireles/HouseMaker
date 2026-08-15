@@ -1,0 +1,120 @@
+{
+  "id": "mock-generator-blender",
+  "status": "completed",
+  "progress": 100,
+  "currentStage": null,
+  "durationSeconds": 1.643029,
+  "startedAt": "2026-08-03T23:36:10.506517Z",
+  "finishedAt": "2026-08-03T23:36:12.149546Z",
+  "error": null,
+  "warnings": [
+    "Triangle count differs from the target by more than 20 percent",
+    "Dimension x differs from the target by more than 5 percent",
+    "Dimension y differs from the target by more than 5 percent",
+    "Dimension z differs from the target by more than 5 percent"
+  ],
+  "artifacts": [
+    {
+      "name": "main.obj",
+      "type": "model",
+      "format": "obj",
+      "path": "variants/mock-generator-blender/generated/main/main.obj",
+      "sizeBytes": 410,
+      "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-blender/generated/main/main.obj",
+      "createdAt": "2026-08-03T23:36:12.068411Z"
+    },
+    {
+      "name": "main.mtl",
+      "type": "file",
+      "format": "mtl",
+      "path": "variants/mock-generator-blender/generated/main/main.mtl",
+      "sizeBytes": 59,
+      "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-blender/generated/main/main.mtl",
+      "createdAt": "2026-08-03T23:36:12.070417Z"
+    },
+    {
+      "name": "main_albedo.png",
+      "type": "preview",
+      "format": "png",
+      "path": "variants/mock-generator-blender/generated/main/main_albedo.png",
+      "sizeBytes": 79,
+      "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-blender/generated/main/main_albedo.png",
+      "createdAt": "2026-08-03T23:36:12.070417Z"
+    },
+    {
+      "name": "generation.json",
+      "type": "metadata",
+      "format": "json",
+      "path": "variants/mock-generator-blender/generated/main/generation.json",
+      "sizeBytes": 205,
+      "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-blender/generated/main/generation.json",
+      "createdAt": "2026-08-03T23:36:12.072422Z"
+    },
+    {
+      "name": "model.glb",
+      "type": "model",
+      "format": "glb",
+      "path": "variants/mock-generator-blender/final/model.glb",
+      "sizeBytes": 740,
+      "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-blender/final/model.glb",
+      "createdAt": "2026-08-03T23:36:12.072422Z"
+    },
+    {
+      "name": "model.blend",
+      "type": "model",
+      "format": "blend",
+      "path": "variants/mock-generator-blender/final/model.blend",
+      "sizeBytes": 30,
+      "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-blender/final/model.blend",
+      "createdAt": "2026-08-03T23:36:12.072422Z"
+    },
+    {
+      "name": "model.step",
+      "type": "model",
+      "format": "step",
+      "path": "variants/mock-generator-blender/final/model.step",
+      "sizeBytes": 285,
+      "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-blender/final/model.step",
+      "createdAt": "2026-08-03T23:36:12.074427Z"
+    },
+    {
+      "name": "geometry-result.json",
+      "type": "metadata",
+      "format": "json",
+      "path": "variants/mock-generator-blender/final/geometry-result.json",
+      "sizeBytes": 150,
+      "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-blender/final/geometry-result.json",
+      "createdAt": "2026-08-03T23:36:12.074427Z"
+    },
+    {
+      "name": "preview.png",
+      "type": "preview",
+      "format": "png",
+      "path": "variants/mock-generator-blender/renders/preview.png",
+      "sizeBytes": 585,
+      "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-blender/renders/preview.png",
+      "createdAt": "2026-08-03T23:36:12.076432Z"
+    },
+    {
+      "name": "validation.json",
+      "type": "metadata",
+      "format": "json",
+      "path": "variants/mock-generator-blender/validation/validation.json",
+      "sizeBytes": 528,
+      "downloadUrl": "/api/v1/files/mock-chair-001/artifacts/variants/mock-generator-blender/validation/validation.json",
+      "createdAt": "2026-08-03T23:36:12.076432Z"
+    }
+  ],
+  "failedStages": [],
+  "completedStages": [
+    "plan",
+    "vision_preprocessing",
+    "route_components",
+    "generate_components",
+    "geometry_processing",
+    "validate_geometry",
+    "render_previews",
+    "visual_evaluation",
+    "save_result"
+  ]
+}

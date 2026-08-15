@@ -1,0 +1,18 @@
+{
+  "batchId": "mock-chair-001",
+  "method": "deterministic-validation-duration-v1",
+  "ranking": [
+    {
+      "rank": 1,
+      "score": 8592.999998,
+      "status": "completed",
+      "variantId": "mock-generator-blender"
+    },
+    {
+      "rank": 2,
+      "score": 8592.999998,
+      "status": "completed",
+      "variantId": "mock-generator-hybrid"
+    }
+  ]
+}
