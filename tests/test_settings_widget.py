@@ -170,7 +170,7 @@ class SettingsWidgetTests(unittest.TestCase):
                         meshy_target_polycount=value,  # type: ignore[arg-type]
                     )
 
-    def test_canvas_3d_navigation_hotkey_defaults_to_f(self) -> None:
+    def test_canvas_3d_navigation_hotkey_uses_safe_default(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             application_settings = _build_test_settings(temporary_directory)
             widget = SettingsWidget(
@@ -245,6 +245,8 @@ class SettingsWidgetTests(unittest.TestCase):
             "Q",
             "S",
             "D",
+            "R",
+            "F",
             "Z, Q",
         )
         for hotkey in invalid_hotkeys:
@@ -254,7 +256,14 @@ class SettingsWidgetTests(unittest.TestCase):
                         canvas_3d_navigation_toggle_hotkey=hotkey,  # type: ignore[arg-type]
                     )
 
-        for hotkey in ("Ctrl+Z", "Alt+Q", "Shift+S", "Meta+D"):
+        for hotkey in (
+            "Ctrl+Z",
+            "Alt+Q",
+            "Shift+S",
+            "Meta+D",
+            "Ctrl+R",
+            "Alt+F",
+        ):
             with self.subTest(hotkey=hotkey):
                 self.assertEqual(
                     GenerationServiceSettings(
@@ -309,6 +318,30 @@ class SettingsWidgetTests(unittest.TestCase):
             )
             self.assertEqual(
                 widget.get_settings().canvas_3d_navigation_toggle_hotkey,
+                DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY,
+            )
+
+    def test_legacy_f_toggle_hotkey_falls_back_to_safe_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            application_settings.set(
+                CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY_SETTING_KEY,
+                "F",
+            )
+
+            widget = SettingsWidget(
+                application_settings=application_settings,
+                environment={},
+            )
+
+            self.assertEqual(
+                widget.get_settings().canvas_3d_navigation_toggle_hotkey,
+                DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY,
+            )
+            self.assertEqual(
+                read_canvas_3d_navigation_toggle_hotkey(
+                    application_settings
+                ),
                 DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY,
             )
 

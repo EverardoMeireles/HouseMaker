@@ -122,7 +122,7 @@ class RepeatingTexturedMeshItem(TexturedMeshItem):
 
 # ### First-person view ###
 class SurfaceFirstPersonViewWidget(gl.GLViewWidget):
-    """Captured-mouse ZQSD first-person view with semantic item picking."""
+    """Captured-mouse ZQSD plus R/F first-person view with item picking."""
 
     items_clicked = Signal(object, object)
     surface_pick_requested = Signal(object, object)
@@ -215,7 +215,7 @@ class SurfaceFirstPersonViewWidget(gl.GLViewWidget):
         self.first_person_active_changed.emit(False)
 
     def step_movement(self, elapsed_seconds: float) -> None:
-        """Advance held ZQSD keys; public for deterministic UI tests."""
+        """Advance held ZQSD and R/F keys; public for deterministic tests."""
 
         elapsed = max(0.0, float(elapsed_seconds))
         if elapsed <= 0.0 or not self._pressed_movement_keys:
@@ -228,11 +228,22 @@ class SurfaceFirstPersonViewWidget(gl.GLViewWidget):
             (Qt.Key.Key_D in self._pressed_movement_keys)
             - (Qt.Key.Key_Q in self._pressed_movement_keys)
         )
-        if forward_amount == 0.0 and right_amount == 0.0:
+        vertical_amount = float(
+            (Qt.Key.Key_F in self._pressed_movement_keys)
+            - (Qt.Key.Key_R in self._pressed_movement_keys)
+        )
+        if (
+            forward_amount == 0.0
+            and right_amount == 0.0
+            and vertical_amount == 0.0
+        ):
             return
-        magnitude = math.hypot(forward_amount, right_amount)
+        magnitude = math.sqrt(
+            forward_amount**2 + right_amount**2 + vertical_amount**2
+        )
         forward_amount /= magnitude
         right_amount /= magnitude
+        vertical_amount /= magnitude
         yaw_radians = math.radians(self._camera_pose.yaw_degrees)
         forward_x = math.cos(yaw_radians)
         forward_y = math.sin(yaw_radians)
@@ -249,7 +260,7 @@ class SurfaceFirstPersonViewWidget(gl.GLViewWidget):
                 y=self._camera_pose.y
                 + (forward_y * forward_amount + right_y * right_amount)
                 * distance,
-                z=self._camera_pose.z,
+                z=self._camera_pose.z + vertical_amount * distance,
                 yaw_degrees=self._camera_pose.yaw_degrees,
                 pitch_degrees=self._camera_pose.pitch_degrees,
                 roll_degrees=self._camera_pose.roll_degrees,
@@ -1644,7 +1655,16 @@ def _build_default_camera_pose(surfaces: Sequence[FixedSurface]) -> CameraPose:
 
 
 def _movement_keys() -> frozenset[int]:
-    return frozenset((Qt.Key.Key_Z, Qt.Key.Key_Q, Qt.Key.Key_S, Qt.Key.Key_D))
+    return frozenset(
+        (
+            Qt.Key.Key_Z,
+            Qt.Key.Key_Q,
+            Qt.Key.Key_S,
+            Qt.Key.Key_D,
+            Qt.Key.Key_R,
+            Qt.Key.Key_F,
+        )
+    )
 
 
 # ### Assignment and collection helpers ###

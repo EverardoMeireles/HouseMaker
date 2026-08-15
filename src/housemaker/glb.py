@@ -6,6 +6,7 @@ import os
 from io import BytesIO
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from itertools import permutations
 from pathlib import Path
 
 import numpy as np
@@ -16,13 +17,22 @@ from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
 from housemaker.floor_geometry import build_level_floor_mesh
+from housemaker.level_coordinates import (
+    build_level_base_z_lookup,
+    level_image_to_world_xy,
+)
 from housemaker.models import (
     DEFAULT_LEVEL_HEIGHT_METERS,
     GROUND_LEVEL_INDEX,
+    STAIR_STYLE_FLOATING,
+    STAIR_STYLE_FLOATING_WITH_RISER,
+    STAIR_STYLE_SUPPORTED,
     Edge,
     LevelData,
     PIXEL_TO_METER,
     RoomData,
+    StairData,
+    StairSectionData,
     Vertex,
     VertexData,
 )
@@ -59,6 +69,12 @@ FALLBACK_QT_PLATFORM = "offscreen"
 WALL_OPENING_EPSILON = 1e-6
 WALL_REVEAL_PARALLEL_COSINE = math.cos(math.radians(10.0))
 MAX_IMPORTED_GENERATED_MODEL_FACES = 1_000_000
+DEFAULT_STAIR_RISER_HEIGHT_METERS = 0.175
+DEFAULT_FLOATING_STAIR_TREAD_THICKNESS_METERS = 0.08
+STAIR_GEOMETRY_EPSILON = 1e-6
+STAIR_CURVE_SAMPLE_SPACING_METERS = 0.08
+MAX_EXACT_STAIR_GUIDE_ORDER_COUNT = 12
+MAX_TOPOLOGY_STAIR_GUIDE_ORDER_COUNT = 8
 
 # ### Module state ###
 _fallback_qt_application: QGuiApplication | None = None
@@ -194,8 +210,11 @@ def convert_to_glb(
         Mapping[str, bytes | bytearray | memoryview | str | Path] | None
     ) = None,
     surface_texture_world_size_meters: float = 2.0,
+    stairs: Sequence[StairData] = (),
 ) -> GeneratedModel:
     if isinstance(level_source, VertexData):
+        if stairs:
+            raise ValueError("Stairs require level data with endpoint levels.")
         preview_textured_walls: list[PreviewTexturedWall] = []
         wall_meshes = _build_level_meshes(
             vertex_data=level_source,
@@ -208,6 +227,7 @@ def convert_to_glb(
         named_meshes = _build_multi_level_meshes(
             level_source,
             blueprint_size_pixels=blueprint_size_pixels,
+            stairs=stairs,
         )
         preview_textured_walls = _build_preview_textured_walls(
             level_source,
@@ -241,6 +261,1168 @@ def convert_to_glb(
             surface_texture_world_size_meters
         ),
     )
+
+
+# ### Stair geometry helpers ###
+def build_stair_meshes(
+    levels: Sequence[LevelData],
+    stairs: Sequence[StairData],
+) -> list[NamedMesh]:
+    """Build one world-space mesh per stairway.
+
+    Stair sections intentionally remain in each owning level's local image
+    coordinate system. Resolving them here through ``level_image_to_world_xy``
+    means level scale and offsets automatically carry every route section.
+    """
+
+    if not stairs:
+        return []
+
+    level_lookup = {level.index: level for level in levels}
+    base_z_by_level_index = build_level_base_z_lookup(levels)
+    named_meshes: list[NamedMesh] = []
+    for stair_index, stair in enumerate(stairs, start=1):
+        mesh = _build_stair_mesh(
+            stair=stair,
+            level_lookup=level_lookup,
+            base_z_by_level_index=base_z_by_level_index,
+        )
+        named_meshes.append(
+            NamedMesh(
+                name=_get_stair_object_name(stair_index, stair),
+                mesh=mesh,
+            )
+        )
+
+    return named_meshes
+
+
+def _build_stair_mesh(
+    stair: StairData,
+    level_lookup: Mapping[int, LevelData],
+    base_z_by_level_index: Mapping[int, float],
+) -> trimesh.Trimesh:
+    route_sections = _resolve_stair_route_sections(stair, level_lookup)
+    start_z_meters = _get_stair_endpoint_base_z(
+        base_z_by_level_index,
+        stair.start_level_index,
+        "start",
+    )
+    end_z_meters = _get_stair_endpoint_base_z(
+        base_z_by_level_index,
+        stair.end_level_index,
+        "end",
+    )
+    height_difference_meters = end_z_meters - start_z_meters
+    if abs(height_difference_meters) <= STAIR_GEOMETRY_EPSILON:
+        raise ValueError("Stair endpoints must be at different elevations.")
+
+    if start_z_meters < end_z_meters:
+        lower_elevation_meters = start_z_meters
+        upper_elevation_meters = end_z_meters
+    else:
+        route_sections.reverse()
+        lower_elevation_meters = end_z_meters
+        upper_elevation_meters = start_z_meters
+
+    # Curve guides are ordered cross-sections, not separate stair flights.
+    # Sample one continuous spline through every section before deriving the
+    # treads.  Using the full route here is important: treating the control
+    # pairs as isolated linear prisms makes later guides look like detached
+    # stair systems whenever the route changes direction more than once.
+    route_sections = _build_smoothed_stair_route_sections(route_sections)
+    cumulative_distances = _build_stair_route_distances(route_sections)
+    total_run_meters = cumulative_distances[-1]
+    total_rise_meters = upper_elevation_meters - lower_elevation_meters
+    step_count = max(
+        1,
+        math.ceil(
+            total_rise_meters / DEFAULT_STAIR_RISER_HEIGHT_METERS
+        ),
+    )
+    riser_height_meters = total_rise_meters / step_count
+    tread_thickness_meters = min(
+        DEFAULT_FLOATING_STAIR_TREAD_THICKNESS_METERS,
+        riser_height_meters,
+    )
+
+    meshes: list[trimesh.Trimesh] = []
+    for step_index in range(step_count):
+        step_start_distance = total_run_meters * step_index / step_count
+        step_end_distance = total_run_meters * (step_index + 1) / step_count
+        step_top_z_meters = lower_elevation_meters + (
+            riser_height_meters * (step_index + 1)
+        )
+        if stair.style in {
+            STAIR_STYLE_FLOATING,
+            STAIR_STYLE_FLOATING_WITH_RISER,
+        }:
+            step_bottom_z_meters = step_top_z_meters - tread_thickness_meters
+        elif stair.style == STAIR_STYLE_SUPPORTED:
+            step_bottom_z_meters = min(
+                lower_elevation_meters,
+                step_top_z_meters - tread_thickness_meters,
+            )
+        else:
+            raise ValueError(f"Unsupported stair style: {stair.style!r}.")
+
+        step_distances = _split_stair_step_at_route_sections(
+            step_start_distance,
+            step_end_distance,
+            cumulative_distances,
+        )
+        step_segment_count = len(step_distances) - 1
+        for segment_index, (segment_start, segment_end) in enumerate(
+            zip(
+                step_distances,
+                step_distances[1:],
+            )
+        ):
+            step_start_a_xy, step_start_b_xy = _sample_stair_route(
+                route_sections,
+                cumulative_distances,
+                segment_start,
+            )
+            step_end_a_xy, step_end_b_xy = _sample_stair_route(
+                route_sections,
+                cumulative_distances,
+                segment_end,
+            )
+            meshes.append(
+                _build_stair_step_prism(
+                    start_a_xy=step_start_a_xy,
+                    start_b_xy=step_start_b_xy,
+                    end_a_xy=step_end_a_xy,
+                    end_b_xy=step_end_b_xy,
+                    bottom_z_meters=step_bottom_z_meters,
+                    top_z_meters=step_top_z_meters,
+                    include_start_cap=segment_index == 0,
+                    include_end_cap=(
+                        segment_index == step_segment_count - 1
+                    ),
+                )
+            )
+
+        if (
+            stair.style == STAIR_STYLE_FLOATING_WITH_RISER
+            and step_index > 0
+        ):
+            previous_step_top_z_meters = lower_elevation_meters + (
+                riser_height_meters * step_index
+            )
+            if (
+                step_bottom_z_meters
+                > previous_step_top_z_meters + STAIR_GEOMETRY_EPSILON
+            ):
+                meshes.append(
+                    _build_stair_riser_prism(
+                        route_sections=route_sections,
+                        cumulative_distances=cumulative_distances,
+                        step_start_distance=step_start_distance,
+                        first_step_segment_end_distance=step_distances[1],
+                        bottom_z_meters=previous_step_top_z_meters,
+                        top_z_meters=step_bottom_z_meters,
+                        maximum_depth_meters=tread_thickness_meters,
+                    )
+                )
+
+    return _combine_mesh_geometry(meshes)
+
+
+def _resolve_stair_route_sections(
+    stair: StairData,
+    level_lookup: Mapping[int, LevelData],
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    resolved_sections: list[tuple[np.ndarray, np.ndarray]] = []
+    final_section_index = len(stair.sections) - 1
+    for section_index, section in enumerate(stair.sections):
+        section_name = _get_stair_section_name(
+            section_index,
+            final_section_index,
+        )
+        level = _get_stair_endpoint_level(
+            level_lookup,
+            section.level_index,
+            section_name,
+        )
+        section_a_xy, section_b_xy = _resolve_stair_section_points(
+            section,
+            level,
+        )
+        _validate_world_stair_segment(
+            section_a_xy,
+            section_b_xy,
+            section_name,
+        )
+        resolved_sections.append((section_a_xy, section_b_xy))
+
+    ordered_sections = _order_stair_route_sections(resolved_sections)
+    return _normalize_stair_rail_correspondence(ordered_sections)
+
+
+def _order_stair_route_sections(
+    route_sections: Sequence[tuple[np.ndarray, np.ndarray]],
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Order guides spatially while keeping both stair endpoints fixed."""
+
+    if len(route_sections) < 2:
+        raise ValueError("A stair route requires two endpoint sections.")
+    guide_sections = list(route_sections[1:-1])
+    if len(guide_sections) <= 1:
+        return list(route_sections)
+
+    guide_order: tuple[int, ...] | None = None
+    if len(guide_sections) <= MAX_TOPOLOGY_STAIR_GUIDE_ORDER_COUNT:
+        guide_order = _find_shortest_topology_safe_stair_guide_order(
+            route_sections[0],
+            guide_sections,
+            route_sections[-1],
+        )
+    if (
+        guide_order is None
+        and len(guide_sections) <= MAX_EXACT_STAIR_GUIDE_ORDER_COUNT
+    ):
+        guide_order = _find_shortest_stair_guide_order(
+            route_sections[0],
+            guide_sections,
+            route_sections[-1],
+        )
+    elif guide_order is None:
+        guide_order = _find_greedy_stair_guide_order(
+            route_sections[0],
+            guide_sections,
+        )
+    return [
+        route_sections[0],
+        *(guide_sections[index] for index in guide_order),
+        route_sections[-1],
+    ]
+
+
+def _find_shortest_topology_safe_stair_guide_order(
+    start_section: tuple[np.ndarray, np.ndarray],
+    guide_sections: Sequence[tuple[np.ndarray, np.ndarray]],
+    end_section: tuple[np.ndarray, np.ndarray],
+) -> tuple[int, ...] | None:
+    """Find the shortest guide permutation whose piecewise rails do not cross."""
+
+    best_path: tuple[float, tuple[int, ...]] | None = None
+    for guide_order in permutations(range(len(guide_sections))):
+        route_sections = [
+            start_section,
+            *(guide_sections[index] for index in guide_order),
+            end_section,
+        ]
+        normalized_sections = _normalize_stair_rail_correspondence(
+            route_sections
+        )
+        if not _is_stair_route_topology_safe(normalized_sections):
+            continue
+        path_distance = _get_stair_route_center_distance(route_sections)
+        if _is_better_stair_guide_path(
+            path_distance,
+            guide_order,
+            best_path,
+        ):
+            best_path = (path_distance, guide_order)
+    return None if best_path is None else best_path[1]
+
+
+def _get_stair_route_center_distance(
+    route_sections: Sequence[tuple[np.ndarray, np.ndarray]],
+) -> float:
+    centers = [
+        _get_stair_section_center(section) for section in route_sections
+    ]
+    return sum(
+        float(np.linalg.norm(end_center - start_center))
+        for start_center, end_center in zip(centers, centers[1:])
+    )
+
+
+def _find_shortest_stair_guide_order(
+    start_section: tuple[np.ndarray, np.ndarray],
+    guide_sections: Sequence[tuple[np.ndarray, np.ndarray]],
+    end_section: tuple[np.ndarray, np.ndarray],
+) -> tuple[int, ...]:
+    """Solve the fixed-endpoint guide path exactly with dynamic programming."""
+
+    start_center = _get_stair_section_center(start_section)
+    guide_centers = [
+        _get_stair_section_center(section) for section in guide_sections
+    ]
+    end_center = _get_stair_section_center(end_section)
+    guide_count = len(guide_sections)
+    states: dict[tuple[int, int], tuple[float, tuple[int, ...]]] = {}
+    for guide_index, guide_center in enumerate(guide_centers):
+        states[(1 << guide_index, guide_index)] = (
+            float(np.linalg.norm(guide_center - start_center)),
+            (guide_index,),
+        )
+
+    all_guides_mask = (1 << guide_count) - 1
+    for visited_mask in range(1, all_guides_mask + 1):
+        for final_guide_index in range(guide_count):
+            state = states.get((visited_mask, final_guide_index))
+            if state is None:
+                continue
+            current_distance, current_order = state
+            for next_guide_index in range(guide_count):
+                next_guide_bit = 1 << next_guide_index
+                if visited_mask & next_guide_bit:
+                    continue
+                next_mask = visited_mask | next_guide_bit
+                candidate_distance = current_distance + float(
+                    np.linalg.norm(
+                        guide_centers[next_guide_index]
+                        - guide_centers[final_guide_index]
+                    )
+                )
+                candidate_order = (*current_order, next_guide_index)
+                state_key = (next_mask, next_guide_index)
+                existing_state = states.get(state_key)
+                if _is_better_stair_guide_path(
+                    candidate_distance,
+                    candidate_order,
+                    existing_state,
+                ):
+                    states[state_key] = (
+                        candidate_distance,
+                        candidate_order,
+                    )
+
+    best_path: tuple[float, tuple[int, ...]] | None = None
+    for final_guide_index in range(guide_count):
+        path_distance, path_order = states[
+            (all_guides_mask, final_guide_index)
+        ]
+        total_distance = path_distance + float(
+            np.linalg.norm(end_center - guide_centers[final_guide_index])
+        )
+        if _is_better_stair_guide_path(
+            total_distance,
+            path_order,
+            best_path,
+        ):
+            best_path = (total_distance, path_order)
+
+    if best_path is None:
+        raise ValueError("Unable to order the stair curve guides.")
+    return best_path[1]
+
+
+def _is_better_stair_guide_path(
+    candidate_distance: float,
+    candidate_order: tuple[int, ...],
+    current_path: tuple[float, tuple[int, ...]] | None,
+) -> bool:
+    if current_path is None:
+        return True
+    current_distance, current_order = current_path
+    if candidate_distance < current_distance - STAIR_GEOMETRY_EPSILON:
+        return True
+    return (
+        abs(candidate_distance - current_distance)
+        <= STAIR_GEOMETRY_EPSILON
+        and candidate_order < current_order
+    )
+
+
+def _find_greedy_stair_guide_order(
+    start_section: tuple[np.ndarray, np.ndarray],
+    guide_sections: Sequence[tuple[np.ndarray, np.ndarray]],
+) -> tuple[int, ...]:
+    """Order unusually large guide sets with a deterministic nearest walk."""
+
+    guide_centers = [
+        _get_stair_section_center(section) for section in guide_sections
+    ]
+    current_center = _get_stair_section_center(start_section)
+    remaining_indices = set(range(len(guide_sections)))
+    guide_order: list[int] = []
+    while remaining_indices:
+        next_guide_index = min(
+            remaining_indices,
+            key=lambda guide_index: (
+                float(
+                    np.linalg.norm(
+                        guide_centers[guide_index] - current_center
+                    )
+                ),
+                guide_index,
+            ),
+        )
+        guide_order.append(next_guide_index)
+        remaining_indices.remove(next_guide_index)
+        current_center = guide_centers[next_guide_index]
+    return tuple(guide_order)
+
+
+def _get_stair_section_center(
+    section: tuple[np.ndarray, np.ndarray],
+) -> np.ndarray:
+    return (section[0] + section[1]) / 2.0
+
+
+def _resolve_stair_section_points(
+    section: StairSectionData,
+    level: LevelData,
+) -> tuple[np.ndarray, np.ndarray]:
+    return (
+        _resolve_stair_control_point(
+            level,
+            section.a_x,
+            section.a_y,
+            section.a_vertex_id,
+        ),
+        _resolve_stair_control_point(
+            level,
+            section.b_x,
+            section.b_y,
+            section.b_vertex_id,
+        ),
+    )
+
+
+def _build_stair_route_distances(
+    route_sections: Sequence[tuple[np.ndarray, np.ndarray]],
+) -> list[float]:
+    cumulative_distances = [0.0]
+    for previous_section, current_section in zip(
+        route_sections,
+        route_sections[1:],
+    ):
+        previous_center = (previous_section[0] + previous_section[1]) / 2.0
+        current_center = (current_section[0] + current_section[1]) / 2.0
+        segment_length = float(np.linalg.norm(current_center - previous_center))
+        if segment_length <= STAIR_GEOMETRY_EPSILON:
+            raise ValueError(
+                "Consecutive stair section centers must be separated "
+                "horizontally."
+            )
+        cumulative_distances.append(
+            cumulative_distances[-1] + segment_length
+        )
+    return cumulative_distances
+
+
+def _build_smoothed_stair_route_sections(
+    control_sections: Sequence[tuple[np.ndarray, np.ndarray]],
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Sample a continuous route through every ordered stair cross-section.
+
+    A straight stair deliberately stays as one segment.  For a curved stair,
+    each rail is interpolated with a distance-parameterized cubic Hermite
+    spline.  The original guide cross-sections are included verbatim at the
+    interval boundaries, so every placed guide remains an exact part of the
+    final route while the pieces between guides follow one continuous curve.
+    """
+
+    if len(control_sections) < 2:
+        raise ValueError("A stair route requires two endpoint sections.")
+    if len(control_sections) == 2:
+        return [
+            (section_a_xy.copy(), section_b_xy.copy())
+            for section_a_xy, section_b_xy in control_sections
+        ]
+
+    control_distances = _build_stair_route_distances(control_sections)
+    sampled_sections: list[tuple[np.ndarray, np.ndarray]] = []
+    for segment_index, (segment_start, segment_end) in enumerate(
+        zip(control_sections, control_sections[1:])
+    ):
+        segment_length = (
+            control_distances[segment_index + 1]
+            - control_distances[segment_index]
+        )
+        sample_count = max(
+            1,
+            math.ceil(segment_length / STAIR_CURVE_SAMPLE_SPACING_METERS),
+        )
+        for sample_index in range(sample_count):
+            ratio = sample_index / sample_count
+            if sample_index == 0:
+                # Preserve every user-supplied guide exactly.  This also
+                # avoids accumulating tiny floating-point offsets at joins.
+                sampled_sections.append(
+                    (segment_start[0].copy(), segment_start[1].copy())
+                )
+                continue
+            sampled_sections.append(
+                _sample_smoothed_stair_route_section(
+                    control_sections,
+                    control_distances,
+                    segment_index,
+                    ratio,
+                )
+            )
+
+    final_a_xy, final_b_xy = control_sections[-1]
+    sampled_sections.append((final_a_xy.copy(), final_b_xy.copy()))
+    if not _is_stair_route_topology_safe(sampled_sections):
+        # Cubic centerline tangents can overshoot around two very close,
+        # sharply turning guides.  The guides already approximate the curve,
+        # so first fall back to their faithful piecewise-linear route.
+        linear_sections = [
+            (section_a_xy.copy(), section_b_xy.copy())
+            for section_a_xy, section_b_xy in control_sections
+        ]
+        if _is_stair_route_topology_safe(linear_sections):
+            return linear_sections
+        raise ValueError(
+            "Stair curve guides produce crossing rails. Move the guides "
+            "farther apart, reduce the stair width, or remove the sharpest "
+            "turn."
+        )
+    return sampled_sections
+
+
+def _is_stair_route_topology_safe(
+    route_sections: Sequence[tuple[np.ndarray, np.ndarray]],
+) -> bool:
+    """Return whether a sampled route keeps two ordered, uncrossed rails."""
+
+    rail_a = [section_a_xy for section_a_xy, _ in route_sections]
+    rail_b = [section_b_xy for _, section_b_xy in route_sections]
+    if _does_stair_rail_self_intersect(rail_a):
+        return False
+    if _does_stair_rail_self_intersect(rail_b):
+        return False
+    if _do_stair_rails_intersect(rail_a, rail_b):
+        return False
+    return _do_stair_sections_keep_handedness(route_sections)
+
+
+def _does_stair_rail_self_intersect(
+    rail_points: Sequence[np.ndarray],
+) -> bool:
+    for first_index in range(len(rail_points) - 1):
+        for second_index in range(first_index + 2, len(rail_points) - 1):
+            if _do_stair_line_segments_intersect(
+                rail_points[first_index],
+                rail_points[first_index + 1],
+                rail_points[second_index],
+                rail_points[second_index + 1],
+            ):
+                return True
+    return False
+
+
+def _do_stair_rails_intersect(
+    rail_a: Sequence[np.ndarray],
+    rail_b: Sequence[np.ndarray],
+) -> bool:
+    for rail_a_start, rail_a_end in zip(rail_a, rail_a[1:]):
+        for rail_b_start, rail_b_end in zip(rail_b, rail_b[1:]):
+            if _do_stair_line_segments_intersect(
+                rail_a_start,
+                rail_a_end,
+                rail_b_start,
+                rail_b_end,
+            ):
+                return True
+    return False
+
+
+def _do_stair_sections_keep_handedness(
+    route_sections: Sequence[tuple[np.ndarray, np.ndarray]],
+) -> bool:
+    centers = [
+        (section_a_xy + section_b_xy) / 2.0
+        for section_a_xy, section_b_xy in route_sections
+    ]
+    segment_directions: list[np.ndarray] = []
+    for start_center_xy, end_center_xy in zip(centers, centers[1:]):
+        route_delta = end_center_xy - start_center_xy
+        route_delta_length = float(np.linalg.norm(route_delta))
+        if route_delta_length <= STAIR_GEOMETRY_EPSILON:
+            return False
+        segment_directions.append(route_delta / route_delta_length)
+    route_directions = _build_stair_section_route_directions(
+        segment_directions
+    )
+
+    reference_handedness = 0.0
+    for (section_a_xy, section_b_xy), route_direction in zip(
+        route_sections,
+        route_directions,
+    ):
+        handedness = _get_stair_2d_cross_product(
+            route_direction,
+            section_b_xy - section_a_xy,
+        )
+        if abs(handedness) <= STAIR_GEOMETRY_EPSILON:
+            return False
+        if reference_handedness == 0.0:
+            reference_handedness = handedness
+        elif handedness * reference_handedness < 0.0:
+            return False
+    return True
+
+
+def _do_stair_line_segments_intersect(
+    first_start_xy: np.ndarray,
+    first_end_xy: np.ndarray,
+    second_start_xy: np.ndarray,
+    second_end_xy: np.ndarray,
+) -> bool:
+    if not _do_stair_segment_bounds_overlap(
+        first_start_xy,
+        first_end_xy,
+        second_start_xy,
+        second_end_xy,
+    ):
+        return False
+
+    first_start_side = _get_stair_2d_cross_product(
+        first_end_xy - first_start_xy,
+        second_start_xy - first_start_xy,
+    )
+    first_end_side = _get_stair_2d_cross_product(
+        first_end_xy - first_start_xy,
+        second_end_xy - first_start_xy,
+    )
+    second_start_side = _get_stair_2d_cross_product(
+        second_end_xy - second_start_xy,
+        first_start_xy - second_start_xy,
+    )
+    second_end_side = _get_stair_2d_cross_product(
+        second_end_xy - second_start_xy,
+        first_end_xy - second_start_xy,
+    )
+    if (
+        first_start_side * first_end_side
+        < -(STAIR_GEOMETRY_EPSILON**2)
+        and second_start_side * second_end_side
+        < -(STAIR_GEOMETRY_EPSILON**2)
+    ):
+        return True
+    return (
+        abs(first_start_side) <= STAIR_GEOMETRY_EPSILON
+        and _is_point_on_stair_segment(
+            second_start_xy,
+            first_start_xy,
+            first_end_xy,
+        )
+    ) or (
+        abs(first_end_side) <= STAIR_GEOMETRY_EPSILON
+        and _is_point_on_stair_segment(
+            second_end_xy,
+            first_start_xy,
+            first_end_xy,
+        )
+    ) or (
+        abs(second_start_side) <= STAIR_GEOMETRY_EPSILON
+        and _is_point_on_stair_segment(
+            first_start_xy,
+            second_start_xy,
+            second_end_xy,
+        )
+    ) or (
+        abs(second_end_side) <= STAIR_GEOMETRY_EPSILON
+        and _is_point_on_stair_segment(
+            first_end_xy,
+            second_start_xy,
+            second_end_xy,
+        )
+    )
+
+
+def _do_stair_segment_bounds_overlap(
+    first_start_xy: np.ndarray,
+    first_end_xy: np.ndarray,
+    second_start_xy: np.ndarray,
+    second_end_xy: np.ndarray,
+) -> bool:
+    return not (
+        max(first_start_xy[0], first_end_xy[0])
+        < min(second_start_xy[0], second_end_xy[0])
+        - STAIR_GEOMETRY_EPSILON
+        or max(second_start_xy[0], second_end_xy[0])
+        < min(first_start_xy[0], first_end_xy[0])
+        - STAIR_GEOMETRY_EPSILON
+        or max(first_start_xy[1], first_end_xy[1])
+        < min(second_start_xy[1], second_end_xy[1])
+        - STAIR_GEOMETRY_EPSILON
+        or max(second_start_xy[1], second_end_xy[1])
+        < min(first_start_xy[1], first_end_xy[1])
+        - STAIR_GEOMETRY_EPSILON
+    )
+
+
+def _is_point_on_stair_segment(
+    point_xy: np.ndarray,
+    segment_start_xy: np.ndarray,
+    segment_end_xy: np.ndarray,
+) -> bool:
+    return bool(
+        np.all(
+            point_xy
+            >= np.minimum(segment_start_xy, segment_end_xy)
+            - STAIR_GEOMETRY_EPSILON
+        )
+        and np.all(
+            point_xy
+            <= np.maximum(segment_start_xy, segment_end_xy)
+            + STAIR_GEOMETRY_EPSILON
+        )
+    )
+
+
+def _sample_smoothed_stair_route_section(
+    control_sections: Sequence[tuple[np.ndarray, np.ndarray]],
+    control_distances: Sequence[float],
+    segment_index: int,
+    ratio: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return one spline-interpolated cross-section inside a route interval."""
+
+    interval_length = (
+        control_distances[segment_index + 1]
+        - control_distances[segment_index]
+    )
+    start_a_xy, start_b_xy = control_sections[segment_index]
+    end_a_xy, end_b_xy = control_sections[segment_index + 1]
+    start_center_xy = (start_a_xy + start_b_xy) / 2.0
+    end_center_xy = (end_a_xy + end_b_xy) / 2.0
+    center_xy = _interpolate_stair_cubic_hermite(
+        start_center_xy,
+        end_center_xy,
+        _get_stair_route_center_tangent(
+            control_sections,
+            control_distances,
+            segment_index,
+        ),
+        _get_stair_route_center_tangent(
+            control_sections,
+            control_distances,
+            segment_index + 1,
+        ),
+        interval_length,
+        ratio,
+    )
+    width_xy = _interpolate_stair_route_width(
+        start_b_xy - start_a_xy,
+        end_b_xy - end_a_xy,
+        ratio,
+    )
+    return center_xy - (width_xy / 2.0), center_xy + (width_xy / 2.0)
+
+
+def _get_stair_route_center_tangent(
+    control_sections: Sequence[tuple[np.ndarray, np.ndarray]],
+    control_distances: Sequence[float],
+    section_index: int,
+) -> np.ndarray:
+    """Return a distance-aware tangent for the stair route centerline."""
+
+    control_centers = [
+        (section_a_xy + section_b_xy) / 2.0
+        for section_a_xy, section_b_xy in control_sections
+    ]
+    final_section_index = len(control_sections) - 1
+    if section_index == 0:
+        return (
+            control_centers[1] - control_centers[0]
+        ) / (control_distances[1] - control_distances[0])
+    if section_index == final_section_index:
+        return (
+            control_centers[-1] - control_centers[-2]
+        ) / (control_distances[-1] - control_distances[-2])
+    return (
+        control_centers[section_index + 1]
+        - control_centers[section_index - 1]
+    ) / (
+        control_distances[section_index + 1]
+        - control_distances[section_index - 1]
+    )
+
+
+def _interpolate_stair_route_width(
+    start_width_xy: np.ndarray,
+    end_width_xy: np.ndarray,
+    ratio: float,
+) -> np.ndarray:
+    """Interpolate a stair width without allowing its two rails to cross."""
+
+    start_width = float(np.linalg.norm(start_width_xy))
+    end_width = float(np.linalg.norm(end_width_xy))
+    if (
+        start_width <= STAIR_GEOMETRY_EPSILON
+        or end_width <= STAIR_GEOMETRY_EPSILON
+    ):
+        raise ValueError("Stair route sections must have a positive width.")
+
+    start_angle = math.atan2(start_width_xy[1], start_width_xy[0])
+    end_angle = math.atan2(end_width_xy[1], end_width_xy[0])
+    angle_delta = math.atan2(
+        math.sin(end_angle - start_angle),
+        math.cos(end_angle - start_angle),
+    )
+    interpolated_angle = start_angle + (angle_delta * float(ratio))
+    interpolated_width = start_width + (
+        (end_width - start_width) * float(ratio)
+    )
+    return float(interpolated_width) * np.asarray(
+        (math.cos(interpolated_angle), math.sin(interpolated_angle)),
+        dtype=float,
+    )
+
+
+def _interpolate_stair_cubic_hermite(
+    start_xy: np.ndarray,
+    end_xy: np.ndarray,
+    start_tangent: np.ndarray,
+    end_tangent: np.ndarray,
+    interval_length: float,
+    ratio: float,
+) -> np.ndarray:
+    """Interpolate a route rail while preserving its two endpoint sections."""
+
+    ratio_squared = ratio * ratio
+    ratio_cubed = ratio_squared * ratio
+    return (
+        ((2.0 * ratio_cubed) - (3.0 * ratio_squared) + 1.0) * start_xy
+        + ((ratio_cubed) - (2.0 * ratio_squared) + ratio)
+        * interval_length
+        * start_tangent
+        + ((-2.0 * ratio_cubed) + (3.0 * ratio_squared)) * end_xy
+        + ((ratio_cubed) - ratio_squared) * interval_length * end_tangent
+    )
+
+
+def _split_stair_step_at_route_sections(
+    step_start_distance: float,
+    step_end_distance: float,
+    cumulative_distances: Sequence[float],
+) -> list[float]:
+    internal_sections = [
+        distance
+        for distance in cumulative_distances[1:-1]
+        if (
+            distance > step_start_distance + STAIR_GEOMETRY_EPSILON
+            and distance < step_end_distance - STAIR_GEOMETRY_EPSILON
+        )
+    ]
+    return [step_start_distance, *internal_sections, step_end_distance]
+
+
+def _sample_stair_route(
+    route_sections: Sequence[tuple[np.ndarray, np.ndarray]],
+    cumulative_distances: Sequence[float],
+    distance: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    segment_index = int(
+        np.searchsorted(cumulative_distances, distance, side="right") - 1
+    )
+    segment_index = min(max(segment_index, 0), len(route_sections) - 2)
+    segment_start_distance = cumulative_distances[segment_index]
+    segment_end_distance = cumulative_distances[segment_index + 1]
+    segment_ratio = (
+        (distance - segment_start_distance)
+        / (segment_end_distance - segment_start_distance)
+    )
+    start_a_xy, start_b_xy = route_sections[segment_index]
+    end_a_xy, end_b_xy = route_sections[segment_index + 1]
+    return (
+        _interpolate_stair_point(start_a_xy, end_a_xy, segment_ratio),
+        _interpolate_stair_point(start_b_xy, end_b_xy, segment_ratio),
+    )
+
+
+def _get_stair_section_name(
+    section_index: int,
+    final_section_index: int,
+) -> str:
+    if section_index == 0:
+        return "start"
+    if section_index == final_section_index:
+        return "end"
+    return f"intermediate section {section_index}"
+
+
+def _build_stair_step_prism(
+    start_a_xy: np.ndarray,
+    start_b_xy: np.ndarray,
+    end_a_xy: np.ndarray,
+    end_b_xy: np.ndarray,
+    bottom_z_meters: float,
+    top_z_meters: float,
+    *,
+    include_start_cap: bool = True,
+    include_end_cap: bool = True,
+) -> trimesh.Trimesh:
+    step_height_meters = top_z_meters - bottom_z_meters
+    if step_height_meters <= STAIR_GEOMETRY_EPSILON:
+        raise ValueError("Stair step height must be greater than zero.")
+
+    footprint = np.asarray(
+        [start_a_xy, end_a_xy, end_b_xy, start_b_xy],
+        dtype=float,
+    )
+    signed_area = _get_polygon_signed_area(footprint)
+    if abs(signed_area) <= STAIR_GEOMETRY_EPSILON:
+        raise ValueError("Stair control points produce a zero-area step.")
+    if signed_area < 0.0:
+        footprint = footprint[::-1]
+
+    vertices = np.vstack(
+        (
+            np.column_stack(
+                (footprint, np.full(4, bottom_z_meters, dtype=float))
+            ),
+            np.column_stack(
+                (footprint, np.full(4, top_z_meters, dtype=float))
+            ),
+        )
+    )
+    faces: list[list[int]] = [
+        [0, 2, 1],
+        [0, 3, 2],
+        [4, 5, 6],
+        [4, 6, 7],
+        [0, 1, 5],
+        [0, 5, 4],
+        [2, 3, 7],
+        [2, 7, 6],
+    ]
+    # A guide can split one horizontal tread into several route pieces.  The
+    # pieces share their guide cross-section, so retaining both closed-prism
+    # caps would render a false vertical wall and make that guide look like an
+    # isolated stair section.  Keep caps only at the true outer tread edges.
+    if include_end_cap:
+        faces.extend(
+            (
+                [1, 2, 6],
+                [1, 6, 5],
+            )
+        )
+    if include_start_cap:
+        faces.extend(
+            (
+                [3, 0, 4],
+                [3, 4, 7],
+            )
+        )
+    return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+
+def _build_stair_riser_prism(
+    route_sections: Sequence[tuple[np.ndarray, np.ndarray]],
+    cumulative_distances: Sequence[float],
+    step_start_distance: float,
+    first_step_segment_end_distance: float,
+    bottom_z_meters: float,
+    top_z_meters: float,
+    maximum_depth_meters: float,
+) -> trimesh.Trimesh:
+    """Build the thin vertical panel closing one floating tread's gap.
+
+    A curved step can be divided around one or more route sections. The riser
+    is intentionally built once at the shared edge with the preceding tread,
+    so bends do not create duplicate risers. Its shallow footprint only closes
+    the space from that tread's top to this tread's underside.
+    """
+
+    first_segment_length = (
+        first_step_segment_end_distance - step_start_distance
+    )
+    riser_depth_meters = min(
+        maximum_depth_meters,
+        first_segment_length / 2.0,
+    )
+    if riser_depth_meters <= STAIR_GEOMETRY_EPSILON:
+        raise ValueError("Stair riser depth must be greater than zero.")
+
+    riser_end_distance = step_start_distance + riser_depth_meters
+    riser_start_a_xy, riser_start_b_xy = _sample_stair_route(
+        route_sections,
+        cumulative_distances,
+        step_start_distance,
+    )
+    riser_end_a_xy, riser_end_b_xy = _sample_stair_route(
+        route_sections,
+        cumulative_distances,
+        riser_end_distance,
+    )
+    return _build_stair_step_prism(
+        start_a_xy=riser_start_a_xy,
+        start_b_xy=riser_start_b_xy,
+        end_a_xy=riser_end_a_xy,
+        end_b_xy=riser_end_b_xy,
+        bottom_z_meters=bottom_z_meters,
+        top_z_meters=top_z_meters,
+    )
+
+
+def _resolve_stair_control_point(
+    level: LevelData,
+    fallback_x: float,
+    fallback_y: float,
+    vertex_id: int | None,
+) -> np.ndarray:
+    source_x = fallback_x
+    source_y = fallback_y
+    if vertex_id is not None:
+        bound_vertex = level.vertex_data.get_vertex(vertex_id)
+        if bound_vertex is not None:
+            source_x = bound_vertex.x
+            source_y = bound_vertex.y
+
+    point = np.asarray(
+        level_image_to_world_xy(level, source_x, source_y),
+        dtype=float,
+    )
+    if not np.all(np.isfinite(point)):
+        raise ValueError("Stair control points must have finite world coordinates.")
+    return point
+
+
+def _normalize_stair_rail_correspondence(
+    route_sections: Sequence[tuple[np.ndarray, np.ndarray]],
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Give every cross-section one route-wide left/right orientation.
+
+    Point-pair click order is intentionally irrelevant.  Each ``B - A``
+    vector is oriented to the same side of the ordered centerline.  A local
+    shortest-distance choice is insufficient because it exchanges the two
+    rails after sharp turns, which makes later curve guides appear jumbled.
+    """
+
+    if len(route_sections) < 2:
+        raise ValueError("A stair route requires two endpoint sections.")
+
+    centers = [
+        (section_a_xy + section_b_xy) / 2.0
+        for section_a_xy, section_b_xy in route_sections
+    ]
+    segment_directions: list[np.ndarray] = []
+    for start_center_xy, end_center_xy in zip(centers, centers[1:]):
+        center_delta = end_center_xy - start_center_xy
+        center_distance = float(np.linalg.norm(center_delta))
+        if center_distance <= STAIR_GEOMETRY_EPSILON:
+            raise ValueError(
+                "Consecutive stair section centers must be separated "
+                "horizontally."
+            )
+        segment_directions.append(center_delta / center_distance)
+
+    route_directions = _build_stair_section_route_directions(
+        segment_directions
+    )
+    normalized_sections: list[tuple[np.ndarray, np.ndarray]] = []
+    for (section_a_xy, section_b_xy), route_direction in zip(
+        route_sections,
+        route_directions,
+    ):
+        width_direction = section_b_xy - section_a_xy
+        handedness = _get_stair_2d_cross_product(
+            route_direction,
+            width_direction,
+        )
+        if handedness < 0.0:
+            normalized_sections.append((section_b_xy, section_a_xy))
+        else:
+            normalized_sections.append((section_a_xy, section_b_xy))
+
+    return normalized_sections
+
+
+def _build_stair_section_route_directions(
+    segment_directions: Sequence[np.ndarray],
+) -> list[np.ndarray]:
+    """Build stable forward directions at all ordered stair sections."""
+
+    route_directions = [segment_directions[0]]
+    for incoming_direction, outgoing_direction in zip(
+        segment_directions,
+        segment_directions[1:],
+    ):
+        route_direction = incoming_direction + outgoing_direction
+        route_direction_length = float(np.linalg.norm(route_direction))
+        if route_direction_length <= STAIR_GEOMETRY_EPSILON:
+            route_directions.append(outgoing_direction)
+        else:
+            route_directions.append(
+                route_direction / route_direction_length
+            )
+    route_directions.append(segment_directions[-1])
+    return route_directions
+
+
+def _get_stair_2d_cross_product(
+    first_xy: np.ndarray,
+    second_xy: np.ndarray,
+) -> float:
+    return float(
+        (first_xy[0] * second_xy[1])
+        - (first_xy[1] * second_xy[0])
+    )
+
+
+def _validate_world_stair_segment(
+    first_xy: np.ndarray,
+    second_xy: np.ndarray,
+    segment_name: str,
+) -> None:
+    if float(np.linalg.norm(second_xy - first_xy)) <= STAIR_GEOMETRY_EPSILON:
+        raise ValueError(
+            f"Stair {segment_name} points must be separated in world space."
+        )
+
+
+def _interpolate_stair_point(
+    start_xy: np.ndarray,
+    end_xy: np.ndarray,
+    ratio: float,
+) -> np.ndarray:
+    return start_xy + ((end_xy - start_xy) * float(ratio))
+
+
+def _get_polygon_signed_area(points: np.ndarray) -> float:
+    shifted_points = np.roll(points, -1, axis=0)
+    return float(
+        0.5
+        * np.sum(
+            (points[:, 0] * shifted_points[:, 1])
+            - (points[:, 1] * shifted_points[:, 0])
+        )
+    )
+
+
+def _get_stair_endpoint_level(
+    level_lookup: Mapping[int, LevelData],
+    level_index: int,
+    endpoint_name: str,
+) -> LevelData:
+    level = level_lookup.get(level_index)
+    if level is None:
+        raise ValueError(
+            f"Stair {endpoint_name} level {level_index} does not exist."
+        )
+    return level
+
+
+def _get_stair_endpoint_base_z(
+    base_z_by_level_index: Mapping[int, float],
+    level_index: int,
+    endpoint_name: str,
+) -> float:
+    base_z_meters = base_z_by_level_index.get(level_index)
+    if base_z_meters is None:
+        raise ValueError(
+            f"Stair {endpoint_name} level {level_index} has no elevation."
+        )
+    if not math.isfinite(base_z_meters):
+        raise ValueError(
+            f"Stair {endpoint_name} level {level_index} has an invalid "
+            "elevation."
+        )
+    return float(base_z_meters)
+
+
+def _get_stair_object_name(stair_index: int, stair: StairData) -> str:
+    return f"stair_{stair_index}_{stair.style}"
 
 
 def _apply_surface_material_overlays(
@@ -512,6 +1694,7 @@ def _build_named_meshes_for_single_level(
 def _build_multi_level_meshes(
     levels: Sequence[LevelData],
     blueprint_size_pixels: tuple[float, float] | None,
+    stairs: Sequence[StairData] = (),
 ) -> list[NamedMesh]:
     if not levels:
         raise ValueError("No levels are available for GLB conversion.")
@@ -543,7 +1726,41 @@ def _build_multi_level_meshes(
 
         named_meshes.extend(level_named_meshes)
 
+    named_meshes.extend(
+        build_stair_meshes(
+            sorted_levels,
+            _filter_stairs_for_export(stairs, level_lookup),
+        )
+    )
     return named_meshes
+
+
+def _filter_stairs_for_export(
+    stairs: Sequence[StairData],
+    level_lookup: Mapping[int, LevelData],
+) -> list[StairData]:
+    """Keep stairs only when every referenced route level is exported.
+
+    An unknown route level is deliberately retained so ``build_stair_meshes``
+    can report the invalid project data instead of silently omitting it.
+    """
+
+    exportable_stairs: list[StairData] = []
+    for stair in stairs:
+        route_levels = [
+            level_lookup.get(section.level_index)
+            for section in stair.sections
+        ]
+        if any(level is None for level in route_levels):
+            exportable_stairs.append(stair)
+            continue
+        if all(
+            level.include_in_export
+            for level in route_levels
+            if level is not None
+        ):
+            exportable_stairs.append(stair)
+    return exportable_stairs
 
 
 def _build_named_meshes_for_level(

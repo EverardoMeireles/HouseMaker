@@ -532,6 +532,7 @@ class SurfaceMaterialWorkspaceTests(unittest.TestCase):
 
                 convert_mock.assert_called_once_with(
                     workspace.levels,
+                    stairs=[],
                     surface_materials={
                         floor_surface_id: texture_path.resolve(),
                     },

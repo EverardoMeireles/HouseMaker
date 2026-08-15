@@ -295,6 +295,36 @@ class SurfaceTextureViewerCameraTests(unittest.TestCase):
                 self.assertAlmostEqual(moved_pose.y, expected_xy[1])
                 self.assertAlmostEqual(moved_pose.z, 1.7)
 
+    def test_r_moves_camera_down_and_f_moves_camera_up(self) -> None:
+        view = self.viewer.view
+        view.enter_first_person_mode()
+        cases = (
+            (Qt.Key.Key_R, 0.7),
+            (Qt.Key.Key_F, 2.7),
+        )
+        for key, expected_z in cases:
+            with self.subTest(key=key):
+                self.viewer.set_camera_pose(CameraPose(x=1.0, y=2.0, z=1.7))
+                view.keyPressEvent(
+                    QKeyEvent(
+                        QEvent.Type.KeyPress,
+                        key,
+                        Qt.KeyboardModifier.NoModifier,
+                    )
+                )
+                view.step_movement(0.4)
+                view.keyReleaseEvent(
+                    QKeyEvent(
+                        QEvent.Type.KeyRelease,
+                        key,
+                        Qt.KeyboardModifier.NoModifier,
+                    )
+                )
+                moved_pose = view.get_camera_pose()
+                self.assertAlmostEqual(moved_pose.x, 1.0)
+                self.assertAlmostEqual(moved_pose.y, 2.0)
+                self.assertAlmostEqual(moved_pose.z, expected_z)
+
     def test_camera_ray_uses_horizontal_fov_on_non_square_viewport(self) -> None:
         _origin, right_edge_ray = _build_camera_ray(
             CameraPose(fov_degrees=70.0),

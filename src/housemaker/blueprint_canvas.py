@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import math
 import random
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from itertools import combinations
 from pathlib import Path
@@ -43,6 +44,10 @@ from housemaker.models import (
     MAX_DOORWAY_DEPTH_METERS,
     MIN_DOORWAY_DEPTH_METERS,
     PIXEL_TO_METER,
+    DEFAULT_STAIR_STYLE,
+    STAIR_STYLE_FLOATING,
+    STAIR_STYLE_FLOATING_WITH_RISER,
+    STAIR_STYLE_SUPPORTED,
     RoomData,
     LevelData,
     VERTEX_HIT_RADIUS_SCREEN,
@@ -76,6 +81,22 @@ FIRST_PERSON_CAMERA_FILL_COLOR = QColor("#f8fafc")
 FIRST_PERSON_CAMERA_SELECTED_COLOR = QColor("#f6c85f")
 FIRST_PERSON_CAMERA_DIRECTION_COLOR = QColor("#ef8354")
 FIRST_PERSON_CAMERA_TEXT_COLOR = QColor("#ffffff")
+STAIR_SUPPORTED_COLOR = QColor("#65d6ff")
+STAIR_FLOATING_COLOR = QColor("#c99cff")
+STAIR_FLOATING_WITH_RISER_COLOR = QColor("#ff9f6e")
+STAIR_SELECTED_COLOR = QColor("#f6c85f")
+PENDING_STAIR_COLOR = QColor("#ffd166")
+STAIR_ENDPOINT_RADIUS_SCREEN = 10.0
+STAIR_ENDPOINT_HIT_RADIUS_SCREEN = 16.0
+STAIR_DIRECTION_LENGTH_SCREEN = 26.0
+STAIR_ROUTE_CENTERLINE_WIDTH_SCREEN = 1.5
+STAIR_STYLES = frozenset(
+    (
+        STAIR_STYLE_SUPPORTED,
+        STAIR_STYLE_FLOATING,
+        STAIR_STYLE_FLOATING_WITH_RISER,
+    )
+)
 IMAGE_MARGIN = 16.0
 VERTEX_RADIUS_SCREEN = 6.0
 EDGE_HIT_TOLERANCE_SCREEN = 8.0
@@ -161,12 +182,129 @@ class WallProjection:
     distance: float
 
 
+@dataclass(frozen=True)
+class PendingStairPlacement:
+    """The completed start segment retained while another level is chosen."""
+
+    style: str
+    start_level_index: int
+    start_a_x: float
+    start_a_y: float
+    start_b_x: float
+    start_b_y: float
+    start_a_vertex_id: int | None = None
+    start_b_vertex_id: int | None = None
+
+    @property
+    def start_x(self) -> float:
+        """Return the legacy midpoint coordinate for compatibility."""
+
+        return (self.start_a_x + self.start_b_x) * 0.5
+
+    @property
+    def start_y(self) -> float:
+        """Return the legacy midpoint coordinate for compatibility."""
+
+        return (self.start_a_y + self.start_b_y) * 0.5
+
+
+@dataclass(frozen=True)
+class StairSectionPlacement:
+    """One ordered two-point stair cross-section owned by a Canvas level."""
+
+    level_index: int
+    a_x: float
+    a_y: float
+    b_x: float
+    b_y: float
+    a_vertex_id: int | None = None
+    b_vertex_id: int | None = None
+
+
+@dataclass(frozen=True)
+class StairPlacement:
+    """Canvas-neutral stair data emitted after its route is confirmed."""
+
+    style: str
+    start_level_index: int
+    start_a_x: float
+    start_a_y: float
+    start_b_x: float
+    start_b_y: float
+    end_level_index: int
+    end_a_x: float
+    end_a_y: float
+    end_b_x: float
+    end_b_y: float
+    intermediate_sections: tuple[StairSectionPlacement, ...] = ()
+    start_a_vertex_id: int | None = None
+    start_b_vertex_id: int | None = None
+    end_a_vertex_id: int | None = None
+    end_b_vertex_id: int | None = None
+
+    @property
+    def start_x(self) -> float:
+        """Return the legacy start-segment midpoint coordinate."""
+
+        return (self.start_a_x + self.start_b_x) * 0.5
+
+    @property
+    def start_y(self) -> float:
+        """Return the legacy start-segment midpoint coordinate."""
+
+        return (self.start_a_y + self.start_b_y) * 0.5
+
+    @property
+    def end_x(self) -> float:
+        """Return the legacy end-segment midpoint coordinate."""
+
+        return (self.end_a_x + self.end_b_x) * 0.5
+
+    @property
+    def end_y(self) -> float:
+        """Return the legacy end-segment midpoint coordinate."""
+
+        return (self.end_a_y + self.end_b_y) * 0.5
+
+
+@dataclass(frozen=True)
+class StairPointTarget:
+    """A free or snapped point used to define one end of a stair segment."""
+
+    point: tuple[float, float]
+    guides: list[SnapGuide]
+    vertex_id: int | None = None
+
+
+@dataclass(frozen=True)
+class PendingStairPoint:
+    """The first point of the segment currently being drawn."""
+
+    level_index: int
+    x: float
+    y: float
+    vertex_id: int | None = None
+
+
+@dataclass(frozen=True)
+class StairHit:
+    stair_index: int
+    endpoint_name: str
+
+
 # ### Widgets ###
 class BlueprintCanvas(QWidget):
     rooms_changed = Signal()
     doorways_changed = Signal()
     floor_contour_changed = Signal(object)
     first_person_camera_changed = Signal(object)
+    stair_start_placed = Signal(object)
+    stair_placement_ready = Signal(object)
+    stair_placement_completed = Signal(object)
+    stair_placement_cancelled = Signal()
+    stair_placement_invalid_endpoint = Signal(str)
+    stair_selected = Signal(int)
+    stair_delete_requested = Signal(int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -211,6 +349,14 @@ class BlueprintCanvas(QWidget):
         self.doorway_drag_press_image_point: tuple[float, float] | None = None
         self.doorway_drag_initial_doorway: DoorwayData | None = None
         self.doorway_drag_changed = False
+        self.stairs: list[object] = []
+        self.selected_stair_index: int | None = None
+        self.pending_stair_style: str | None = None
+        self.pending_stair_placement: PendingStairPlacement | None = None
+        self.pending_stair_draft: StairPlacement | None = None
+        self.pending_stair_point: PendingStairPoint | None = None
+        self.pending_stair_preview_point: tuple[float, float] | None = None
+        self.pending_stair_preview_guides: list[SnapGuide] = []
         self.level_context: LevelData | None = None
         self.initial_first_person_camera: InitialFirstPersonCamera | None = None
         self.initial_first_person_camera_selected = False
@@ -324,6 +470,168 @@ class BlueprintCanvas(QWidget):
         self.image_offset_y = float(image_offset_y)
         self.update()
 
+    # ### Stair context and placement ###
+    def set_stair_context(
+        self,
+        stairs: Iterable[object],
+        level: LevelData | None = None,
+    ) -> None:
+        """Display project-owned stairs without taking ownership of their model."""
+
+        self.stairs = list(stairs)
+        if level is not None:
+            self.level_context = level
+        if (
+            self.selected_stair_index is not None
+            and self.selected_stair_index >= len(self.stairs)
+        ):
+            self.selected_stair_index = None
+        if self._is_stair_placement_active():
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        self.update()
+
+    def start_stair_placement(
+        self,
+        style: str = DEFAULT_STAIR_STYLE,
+    ) -> None:
+        """Start endpoint placement followed by optional curve refinement."""
+
+        if self._is_stair_placement_active():
+            # The Add/Confirm button and level changes can both revisit this
+            # entry point while the user is adding curve controls.  Preserve
+            # the one owned draft instead of silently starting a second stair
+            # placement and losing its ordered route.
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            self.update()
+            return
+        self._reset_first_person_camera_placement()
+        self._reset_room_designation()
+        self._reset_floor_contour_designation()
+        self._reset_doorway_placement()
+        self.selected_doorway_index = None
+        self._reset_doorway_pointer_state()
+        self.active_vertex_id = None
+        self.selected_vertex_id = None
+        self.selected_vertex_ids.clear()
+        self.selected_stair_index = None
+        self.preview_point = None
+        self.preview_guides = []
+        self._reset_pointer_state()
+        self._reset_first_person_camera_pointer_state()
+        self.pending_stair_style = _normalize_stair_style(style)
+        self.pending_stair_placement = None
+        self.pending_stair_draft = None
+        self.pending_stair_point = None
+        self.pending_stair_preview_point = None
+        self.pending_stair_preview_guides = []
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.update()
+
+    def get_pending_stair_placement(self) -> PendingStairPlacement | None:
+        return self.pending_stair_placement
+
+    def get_stair_placement_draft(self) -> StairPlacement | None:
+        """Return the complete, unconfirmed stair route being refined."""
+
+        return self.pending_stair_draft
+
+    def get_pending_stair_point(self) -> PendingStairPoint | None:
+        """Return point A of the stair segment that is currently being drawn."""
+
+        return self.pending_stair_point
+
+    def is_stair_placement_active(self) -> bool:
+        return self._is_stair_placement_active()
+
+    def is_stair_ready_for_confirmation(self) -> bool:
+        """Return whether the draft has complete endpoints and control pairs."""
+
+        return (
+            self.pending_stair_draft is not None
+            and self.pending_stair_point is None
+        )
+
+    def confirm_stair_placement(self) -> bool:
+        """Commit the refined draft and finish Canvas placement mode."""
+
+        draft = self.pending_stair_draft
+        if draft is None:
+            return False
+        if self.pending_stair_point is not None:
+            self.stair_placement_invalid_endpoint.emit(
+                "Place the second point of the current stair section before "
+                "confirming."
+            )
+            return False
+
+        self._reset_stair_placement()
+        self.unsetCursor()
+        self.stair_placement_completed.emit(draft)
+        self.update()
+        return True
+
+    def remove_last_stair_intermediate_section(self) -> bool:
+        """Remove an unfinished point or the newest refinement cross-section."""
+
+        draft = self.pending_stair_draft
+        if draft is None:
+            return False
+        if self.pending_stair_point is not None:
+            self.pending_stair_point = None
+            self.pending_stair_preview_point = None
+            self.pending_stair_preview_guides = []
+            self.stair_placement_ready.emit(draft)
+            self.update()
+            return True
+        if not draft.intermediate_sections:
+            return False
+
+        updated_draft = replace(
+            draft,
+            intermediate_sections=draft.intermediate_sections[:-1],
+        )
+        self.pending_stair_draft = updated_draft
+        self.stair_placement_ready.emit(updated_draft)
+        self.update()
+        return True
+
+    def set_pending_stair_placement(
+        self,
+        placement: PendingStairPlacement | object | None,
+    ) -> bool:
+        """Restore a pending first endpoint after an owner-level view changes."""
+
+        pending_placement = _coerce_pending_stair_placement(placement)
+        if placement is not None and pending_placement is None:
+            return False
+
+        self.pending_stair_placement = pending_placement
+        self.pending_stair_draft = None
+        self.pending_stair_style = (
+            None if pending_placement is None else pending_placement.style
+        )
+        self.pending_stair_point = None
+        self.pending_stair_preview_point = None
+        self.pending_stair_preview_guides = []
+        if self._is_stair_placement_active():
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.unsetCursor()
+        self.update()
+        return True
+
+    def cancel_stair_placement(self) -> bool:
+        """Cancel either phase of placement and leave existing project stairs intact."""
+
+        if not self._is_stair_placement_active():
+            return False
+
+        self._reset_stair_placement()
+        self.unsetCursor()
+        self.stair_placement_cancelled.emit()
+        self.update()
+        return True
+
     def set_initial_first_person_camera_context(
         self,
         camera: InitialFirstPersonCamera | None,
@@ -345,6 +653,7 @@ class BlueprintCanvas(QWidget):
         self,
         z_meters: float,
     ) -> None:
+        self._cancel_stair_placement_for_other_mode()
         self._reset_room_designation()
         self._reset_floor_contour_designation()
         self._reset_doorway_placement()
@@ -441,6 +750,7 @@ class BlueprintCanvas(QWidget):
         vertex_ids: list[int],
         room_height_meters: float,
     ) -> None:
+        self._cancel_stair_placement_for_other_mode()
         self._reset_first_person_camera_placement()
         self._reset_floor_contour_designation()
         self._reset_doorway_placement()
@@ -455,6 +765,7 @@ class BlueprintCanvas(QWidget):
         self.update()
 
     def start_floor_contour_designation(self) -> None:
+        self._cancel_stair_placement_for_other_mode()
         self._reset_first_person_camera_placement()
         self._reset_room_designation()
         self._reset_doorway_placement()
@@ -473,6 +784,7 @@ class BlueprintCanvas(QWidget):
 
     def start_doorway_placement(self, preset: DoorwayPreset) -> None:
         """Begin placing one doorway using the selected hole dimensions."""
+        self._cancel_stair_placement_for_other_mode()
         self._reset_first_person_camera_placement()
         self._reset_room_designation()
         self._reset_floor_contour_designation()
@@ -543,14 +855,20 @@ class BlueprintCanvas(QWidget):
         self._reset_floor_contour_designation()
         self._reset_doorway_placement()
         self.pending_first_person_camera_z = None
+        self.pending_stair_preview_point = None
+        self.pending_stair_preview_guides = []
         self.initial_first_person_camera_selected = False
         self.level_context = None
         self.selected_doorway_index = None
+        self.selected_stair_index = None
         self._reset_pointer_state()
         self._reset_doorway_pointer_state()
         self._reset_first_person_camera_pointer_state()
         self._reset_view()
-        self.unsetCursor()
+        if self._is_stair_placement_active():
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.unsetCursor()
         self.update()
 
     def undo_last_step(self) -> None:
@@ -594,12 +912,34 @@ class BlueprintCanvas(QWidget):
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
         if (
+            event.key() == Qt.Key.Key_Backspace
+            and self.remove_last_stair_intermediate_section()
+        ):
+            event.accept()
+            return
+
+        if (
+            event.key() == Qt.Key.Key_Escape
+            and self._is_stair_placement_active()
+        ):
+            self.cancel_stair_placement()
+            event.accept()
+            return
+
+        if (
             event.key() == Qt.Key.Key_Escape
             and self.pending_first_person_camera_z is not None
         ):
             self.pending_first_person_camera_z = None
             self.unsetCursor()
             self.update()
+            event.accept()
+            return
+
+        if (
+            event.key() == Qt.Key.Key_Delete
+            and self._request_selected_stair_deletion()
+        ):
             event.accept()
             return
 
@@ -669,6 +1009,11 @@ class BlueprintCanvas(QWidget):
             return
 
         if event.button() == Qt.MouseButton.RightButton:
+            if self._is_stair_placement_active():
+                self.cancel_stair_placement()
+                event.accept()
+                return
+
             if self.pending_first_person_camera_z is not None:
                 self.pending_first_person_camera_z = None
                 self.unsetCursor()
@@ -700,6 +1045,17 @@ class BlueprintCanvas(QWidget):
 
         if event.button() != Qt.MouseButton.LeftButton:
             super().mousePressEvent(event)
+            return
+
+        if self._is_stair_placement_active():
+            image_point = self._widget_to_image(event.position())
+            if image_point is not None:
+                self._place_stair_endpoint(
+                    image_point,
+                    event.modifiers(),
+                    event.position(),
+                )
+            event.accept()
             return
 
         if self.pending_first_person_camera_z is not None:
@@ -742,6 +1098,19 @@ class BlueprintCanvas(QWidget):
             return
 
         self.initial_first_person_camera_selected = False
+        if event.modifiers() & Qt.KeyboardModifier.AltModifier:
+            stair_hit = self._find_stair_hit(event.position())
+            if stair_hit is not None:
+                self.selected_stair_index = stair_hit.stair_index
+                self.selected_doorway_index = None
+                self.selected_vertex_id = None
+                self.selected_vertex_ids.clear()
+                self.stair_selected.emit(stair_hit.stair_index)
+                self.update()
+                event.accept()
+                return
+
+        self.selected_stair_index = None
         doorway_hit = self._find_doorway_hit(event.position())
         if doorway_hit is not None:
             self.selected_doorway_index = doorway_hit.doorway_index
@@ -828,6 +1197,27 @@ class BlueprintCanvas(QWidget):
 
         if self.is_panning and event.buttons() & Qt.MouseButton.MiddleButton:
             self._update_pan(event.position())
+            event.accept()
+            return
+
+        if self._is_stair_placement_active():
+            image_point = self._widget_to_image(event.position())
+            if image_point is None:
+                self.pending_stair_preview_point = None
+                self.pending_stair_preview_guides = []
+            else:
+                preview = self._build_stair_endpoint_preview(
+                    image_point,
+                    event.modifiers(),
+                    event.position(),
+                )
+                self.pending_stair_preview_point = (
+                    None if preview is None else preview.point
+                )
+                self.pending_stair_preview_guides = (
+                    [] if preview is None else preview.guides
+                )
+            self.update()
             event.accept()
             return
 
@@ -982,6 +1372,10 @@ class BlueprintCanvas(QWidget):
         event.accept()
 
     def leaveEvent(self, event) -> None:  # type: ignore[override]
+        if self._is_stair_placement_active():
+            self.pending_stair_preview_point = None
+            self.pending_stair_preview_guides = []
+            self.update()
         if self.pending_doorway_preset is not None:
             self.pending_doorway = None
             self.update()
@@ -995,6 +1389,7 @@ class BlueprintCanvas(QWidget):
         if (
             self.pending_doorway_preset is None
             and self.pending_first_person_camera_z is None
+            and not self._is_stair_placement_active()
         ):
             self.unsetCursor()
         super().leaveEvent(event)
@@ -1022,6 +1417,8 @@ class BlueprintCanvas(QWidget):
         self._paint_preview_guides(painter)
         self._paint_preview_edge(painter)
         self._paint_vertices(painter)
+        self._paint_stairs(painter)
+        self._paint_pending_stair_placement(painter)
         self._paint_overlay_text(painter)
 
     def _apply_active_chain(self) -> None:
@@ -1107,6 +1504,301 @@ class BlueprintCanvas(QWidget):
         self.selected_vertex_ids = {new_vertex.id}
         self.preview_point = point
         self.preview_guides = []
+
+    # ### Stair helpers ###
+    def _is_stair_placement_active(self) -> bool:
+        return self.pending_stair_style is not None
+
+    def _cancel_stair_placement_for_other_mode(self) -> None:
+        if not self._is_stair_placement_active():
+            return
+
+        self._reset_stair_placement()
+        self.stair_placement_cancelled.emit()
+
+    def _reset_stair_placement(self) -> None:
+        self.pending_stair_style = None
+        self.pending_stair_placement = None
+        self.pending_stair_draft = None
+        self.pending_stair_point = None
+        self.pending_stair_preview_point = None
+        self.pending_stair_preview_guides = []
+
+    def _build_stair_endpoint_preview(
+        self,
+        image_point: QPointF,
+        modifiers: Qt.KeyboardModifier,
+        widget_point: QPointF | None = None,
+    ) -> SnapPreview | None:
+        """Preview a free or snapped stair point without changing wall data."""
+
+        level = self.level_context
+        pending_point = self.pending_stair_point
+        pending_placement = self.pending_stair_placement
+        pending_draft = self.pending_stair_draft
+        if level is None:
+            return None
+        if (
+            pending_point is not None
+            and pending_point.level_index != level.index
+        ):
+            return None
+        if (
+            pending_placement is not None
+            and pending_draft is None
+            and pending_point is None
+            and pending_placement.start_level_index == level.index
+        ):
+            return None
+
+        target_widget_point = widget_point
+        if target_widget_point is None:
+            target_widget_point = self._image_to_widget(
+                image_point.x(),
+                image_point.y(),
+            )
+        target = self._build_stair_point_target(
+            image_point,
+            modifiers,
+            target_widget_point,
+        )
+        return SnapPreview(point=target.point, guides=target.guides)
+
+    def _place_stair_endpoint(
+        self,
+        image_point: QPointF,
+        modifiers: Qt.KeyboardModifier,
+        widget_point: QPointF | None = None,
+    ) -> None:
+        level = self.level_context
+        style = self.pending_stair_style
+        if level is None or style is None:
+            return
+
+        pending_placement = self.pending_stair_placement
+        pending_draft = self.pending_stair_draft
+        pending_point = self.pending_stair_point
+        if pending_point is not None and pending_point.level_index != level.index:
+            self.stair_placement_invalid_endpoint.emit(
+                f"Return to level {pending_point.level_index} and place the "
+                "second point of this stair segment."
+            )
+            return
+        if (
+            pending_placement is not None
+            and pending_draft is None
+            and pending_point is None
+            and level.index == pending_placement.start_level_index
+        ):
+            self.stair_placement_invalid_endpoint.emit(
+                "Choose a different level for the stair end segment."
+            )
+            return
+
+        target_widget_point = widget_point
+        if target_widget_point is None:
+            target_widget_point = self._image_to_widget(
+                image_point.x(),
+                image_point.y(),
+            )
+        target = self._build_stair_point_target(
+            image_point,
+            modifiers,
+            target_widget_point,
+        )
+        point_x, point_y = target.point
+        if pending_point is not None and _points_are_coincident(
+            (pending_point.x, pending_point.y),
+            target.point,
+        ):
+            self.stair_placement_invalid_endpoint.emit(
+                "The two points of a stair segment must be different."
+            )
+            return
+
+        if target.vertex_id is None:
+            self.selected_vertex_id = None
+            self.selected_vertex_ids.clear()
+        else:
+            self.selected_vertex_id = target.vertex_id
+            self.selected_vertex_ids = {target.vertex_id}
+
+        if pending_point is None:
+            self.pending_stair_point = PendingStairPoint(
+                level_index=level.index,
+                x=point_x,
+                y=point_y,
+                vertex_id=target.vertex_id,
+            )
+            self.pending_stair_preview_point = None
+            self.pending_stair_preview_guides = []
+            self.update()
+            return
+
+        if pending_placement is None:
+            pending_placement = PendingStairPlacement(
+                style=style,
+                start_level_index=level.index,
+                start_a_x=pending_point.x,
+                start_a_y=pending_point.y,
+                start_b_x=point_x,
+                start_b_y=point_y,
+                start_a_vertex_id=pending_point.vertex_id,
+                start_b_vertex_id=target.vertex_id,
+            )
+            self.pending_stair_placement = pending_placement
+            self.pending_stair_point = None
+            self.pending_stair_preview_point = None
+            self.pending_stair_preview_guides = []
+            self.stair_start_placed.emit(pending_placement)
+            self.update()
+            return
+
+        if pending_draft is None:
+            pending_draft = StairPlacement(
+                style=style,
+                start_level_index=pending_placement.start_level_index,
+                start_a_x=pending_placement.start_a_x,
+                start_a_y=pending_placement.start_a_y,
+                start_b_x=pending_placement.start_b_x,
+                start_b_y=pending_placement.start_b_y,
+                end_level_index=level.index,
+                end_a_x=pending_point.x,
+                end_a_y=pending_point.y,
+                end_b_x=point_x,
+                end_b_y=point_y,
+                start_a_vertex_id=pending_placement.start_a_vertex_id,
+                start_b_vertex_id=pending_placement.start_b_vertex_id,
+                end_a_vertex_id=pending_point.vertex_id,
+                end_b_vertex_id=target.vertex_id,
+            )
+        else:
+            intermediate_section = StairSectionPlacement(
+                level_index=level.index,
+                a_x=pending_point.x,
+                a_y=pending_point.y,
+                b_x=point_x,
+                b_y=point_y,
+                a_vertex_id=pending_point.vertex_id,
+                b_vertex_id=target.vertex_id,
+            )
+            pending_draft = replace(
+                pending_draft,
+                intermediate_sections=(
+                    *pending_draft.intermediate_sections,
+                    intermediate_section,
+                ),
+            )
+
+        self.pending_stair_draft = pending_draft
+        self.pending_stair_point = None
+        self.pending_stair_preview_point = None
+        self.pending_stair_preview_guides = []
+        self.stair_placement_ready.emit(pending_draft)
+        self.update()
+
+    def _build_stair_point_target(
+        self,
+        image_point: QPointF,
+        modifiers: Qt.KeyboardModifier,
+        widget_point: QPointF,
+    ) -> StairPointTarget:
+        """Resolve vertex, wall-edge, or free placement snapping for a point."""
+
+        hit_vertex = self._find_vertex_at(widget_point)
+        if hit_vertex is not None:
+            return StairPointTarget(
+                point=(hit_vertex.x, hit_vertex.y),
+                guides=[],
+                vertex_id=hit_vertex.id,
+            )
+
+        hit_edge = self._find_edge_at(widget_point)
+        if hit_edge is not None:
+            return StairPointTarget(point=hit_edge.point, guides=[])
+
+        base_point = self.pending_stair_point
+        base_vertex = None
+        level = self.level_context
+        if (
+            base_point is not None
+            and level is not None
+            and base_point.level_index == level.index
+        ):
+            base_vertex = Vertex(
+                id=-1,
+                x=base_point.x,
+                y=base_point.y,
+            )
+        preview = self._build_connection_preview_from_base(
+            image_point=image_point,
+            modifiers=modifiers,
+            base_vertex=base_vertex,
+        )
+        return StairPointTarget(
+            point=preview.point,
+            guides=preview.guides,
+        )
+
+    def _find_stair_hit(self, widget_point: QPointF) -> StairHit | None:
+        level = self.level_context
+        if level is None:
+            return None
+
+        for stair_index in range(len(self.stairs) - 1, -1, -1):
+            placement = _coerce_stair_placement(self.stairs[stair_index])
+            if placement is None:
+                continue
+
+            for section_name, section in _get_stair_sections(placement):
+                if section.level_index != level.index:
+                    continue
+                for point_name, point_x, point_y, vertex_id in (
+                    ("a", section.a_x, section.a_y, section.a_vertex_id),
+                    ("b", section.b_x, section.b_y, section.b_vertex_id),
+                ):
+                    resolved_x, resolved_y = self._resolve_stair_canvas_point(
+                        point_x,
+                        point_y,
+                        vertex_id,
+                    )
+                    endpoint_point = self._image_to_widget(
+                        resolved_x,
+                        resolved_y,
+                    )
+                    if _qpoint_distance(widget_point, endpoint_point) <= (
+                        STAIR_ENDPOINT_HIT_RADIUS_SCREEN
+                    ):
+                        return StairHit(
+                            stair_index=stair_index,
+                            endpoint_name=f"{section_name}_{point_name}",
+                        )
+
+        return None
+
+    def _resolve_stair_canvas_point(
+        self,
+        saved_x: float,
+        saved_y: float,
+        vertex_id: int | None,
+    ) -> tuple[float, float]:
+        """Use a live bound vertex, falling back to the stair's saved point."""
+
+        if vertex_id is not None:
+            bound_vertex = self.vertex_data.get_vertex(vertex_id)
+            if bound_vertex is not None:
+                return bound_vertex.x, bound_vertex.y
+        return saved_x, saved_y
+
+    def _request_selected_stair_deletion(self) -> bool:
+        stair_index = self.selected_stair_index
+        if stair_index is None or not (0 <= stair_index < len(self.stairs)):
+            return False
+
+        self.selected_stair_index = None
+        self.stair_delete_requested.emit(stair_index)
+        self.update()
+        return True
 
     # ### Doorway helpers ###
     def _update_pending_doorway(self, image_point: QPointF) -> None:
@@ -1740,6 +2432,23 @@ class BlueprintCanvas(QWidget):
         image_point: QPointF,
         modifiers: Qt.KeyboardModifier,
     ) -> SnapPreview:
+        base_vertex = (
+            None
+            if self.active_vertex_id is None
+            else self.vertex_data.get_vertex(self.active_vertex_id)
+        )
+        return self._build_connection_preview_from_base(
+            image_point=image_point,
+            modifiers=modifiers,
+            base_vertex=base_vertex,
+        )
+
+    def _build_connection_preview_from_base(
+        self,
+        image_point: QPointF,
+        modifiers: Qt.KeyboardModifier,
+        base_vertex: Vertex | None,
+    ) -> SnapPreview:
         raw_x, raw_y = self._clamp_image_point(image_point.x(), image_point.y())
         raw_point = (raw_x, raw_y)
         modifier_bits = getattr(modifiers, "value", modifiers)
@@ -1748,10 +2457,6 @@ class BlueprintCanvas(QWidget):
         if center_candidate is not None:
             return self._build_center_snap_preview(center_candidate)
 
-        if self.active_vertex_id is None:
-            return SnapPreview(point=raw_point, guides=[])
-
-        base_vertex = self.vertex_data.get_vertex(self.active_vertex_id)
         if base_vertex is None:
             return SnapPreview(point=raw_point, guides=[])
 
@@ -2692,6 +3397,527 @@ class BlueprintCanvas(QWidget):
                 "Doorway",
             )
 
+    # ### Stair painting ###
+    def _paint_stairs(self, painter: QPainter) -> None:
+        level = self.level_context
+        if level is None:
+            return
+
+        for stair_index, raw_stair in enumerate(self.stairs):
+            placement = _coerce_stair_placement(raw_stair)
+            if placement is None:
+                continue
+
+            self._paint_stair_route_continuity(
+                painter=painter,
+                placement=placement,
+                style=placement.style,
+                pending=False,
+            )
+            for section_name, section in _get_stair_sections(placement):
+                if section.level_index != level.index:
+                    continue
+                point_a_x, point_a_y = self._resolve_stair_canvas_point(
+                    section.a_x,
+                    section.a_y,
+                    section.a_vertex_id,
+                )
+                point_b_x, point_b_y = self._resolve_stair_canvas_point(
+                    section.b_x,
+                    section.b_y,
+                    section.b_vertex_id,
+                )
+                if section_name == "start":
+                    label = (
+                        f"Stairs to L{placement.end_level_index} "
+                        f"({_format_stair_style_label(placement.style)})"
+                    )
+                    destination_level_index = placement.end_level_index
+                elif section_name == "end":
+                    label = (
+                        f"Stairs to L{placement.start_level_index} "
+                        f"({_format_stair_style_label(placement.style)})"
+                    )
+                    destination_level_index = placement.start_level_index
+                else:
+                    section_number = int(section_name.rsplit("_", 1)[-1]) + 1
+                    label = (
+                        f"Stair curve {section_number} "
+                        f"({_format_stair_style_label(placement.style)})"
+                    )
+                    destination_level_index = None
+                self._paint_stair_segment(
+                    painter=painter,
+                    point_a=self._image_to_widget(point_a_x, point_a_y),
+                    point_b=self._image_to_widget(point_b_x, point_b_y),
+                    style=placement.style,
+                    label=label,
+                    selected=stair_index == self.selected_stair_index,
+                    destination_level_index=destination_level_index,
+                )
+
+    def _paint_pending_stair_placement(self, painter: QPainter) -> None:
+        if not self._is_stair_placement_active():
+            return
+
+        level = self.level_context
+        style = self.pending_stair_style
+        if level is None or style is None:
+            return
+
+        pending_placement = self.pending_stair_placement
+        pending_draft = self.pending_stair_draft
+        if pending_draft is not None:
+            self._paint_stair_route_continuity(
+                painter=painter,
+                placement=pending_draft,
+                style=style,
+                pending=True,
+            )
+            for section_name, section in _get_stair_sections(pending_draft):
+                if section.level_index != level.index:
+                    continue
+                point_a_x, point_a_y = self._resolve_stair_canvas_point(
+                    section.a_x,
+                    section.a_y,
+                    section.a_vertex_id,
+                )
+                point_b_x, point_b_y = self._resolve_stair_canvas_point(
+                    section.b_x,
+                    section.b_y,
+                    section.b_vertex_id,
+                )
+                label = (
+                    "Stair start - add curve sections or confirm"
+                    if section_name == "start"
+                    else "Stair end - add curve sections or confirm"
+                    if section_name == "end"
+                    else "Stair curve control"
+                )
+                self._paint_stair_segment(
+                    painter=painter,
+                    point_a=self._image_to_widget(point_a_x, point_a_y),
+                    point_b=self._image_to_widget(point_b_x, point_b_y),
+                    style=style,
+                    label=label,
+                    selected=True,
+                    pending=True,
+                )
+        elif (
+            pending_placement is not None
+            and pending_placement.start_level_index == level.index
+        ):
+            self._paint_stair_segment(
+                painter=painter,
+                point_a=self._image_to_widget(
+                    pending_placement.start_a_x,
+                    pending_placement.start_a_y,
+                ),
+                point_b=self._image_to_widget(
+                    pending_placement.start_b_x,
+                    pending_placement.start_b_y,
+                ),
+                style=style,
+                label="Stair start segment - choose another level",
+                selected=True,
+                pending=True,
+            )
+
+        pending_point = self.pending_stair_point
+        pending_point_widget = None
+        if pending_point is not None and pending_point.level_index == level.index:
+            pending_point_widget = self._image_to_widget(
+                pending_point.x,
+                pending_point.y,
+            )
+            self._paint_stair_endpoint(
+                painter=painter,
+                point=pending_point_widget,
+                other_point=None,
+                style=style,
+                label=(
+                    "Start A"
+                    if pending_placement is None
+                    else "Curve A"
+                    if pending_draft is not None
+                    else "End A"
+                ),
+                selected=True,
+                pending=True,
+            )
+
+        preview_point = self.pending_stair_preview_point
+        if preview_point is None:
+            return
+
+        preview_widget_point = self._image_to_widget(
+            preview_point[0],
+            preview_point[1]
+        )
+        if pending_point_widget is not None:
+            preview_pen = QPen(PENDING_STAIR_COLOR, 2.0, Qt.PenStyle.DashLine)
+            preview_pen.setDashPattern([5.0, 4.0])
+            painter.setPen(preview_pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawLine(pending_point_widget, preview_widget_point)
+
+        self._paint_stair_endpoint(
+            painter=painter,
+            point=preview_widget_point,
+            other_point=None,
+            style=style,
+            label=(
+                "Curve B preview"
+                if pending_draft is not None and pending_point is not None
+                else "Curve A preview"
+                if pending_draft is not None
+                else "End B preview"
+                if pending_placement is not None and pending_point is not None
+                else "End A preview"
+                if pending_placement is not None
+                else "Start B preview"
+                if pending_point is not None
+                else "Start A preview"
+            ),
+            selected=False,
+            pending=True,
+        )
+        self._paint_stair_preview_guides(painter)
+
+    # ### Stair route continuity painting ###
+    def _paint_stair_route_continuity(
+        self,
+        painter: QPainter,
+        placement: StairPlacement,
+        style: str,
+        pending: bool,
+    ) -> None:
+        """Show that ordered guide cross-sections belong to one stair route.
+
+        Two sections can share a level and therefore have a useful plan-view
+        connector.  A cross-level route cannot be drawn in either level's
+        local blueprint space, so it receives an explicit directional cue
+        instead.  The actual route order always remains start, guides, end.
+        """
+
+        level = self.level_context
+        if level is None:
+            return
+
+        named_sections = _get_stair_sections(placement)
+        for (
+            previous_name,
+            previous_section,
+        ), (
+            next_name,
+            next_section,
+        ) in zip(named_sections, named_sections[1:]):
+            # A straight stair already paints its start/end transition arrow
+            # with the segment itself.  The continuity marker is useful only
+            # once an intermediate route control exists.
+            if previous_name == "start" and next_name == "end":
+                continue
+
+            previous_is_visible = previous_section.level_index == level.index
+            next_is_visible = next_section.level_index == level.index
+            if previous_is_visible and next_is_visible:
+                self._paint_stair_route_centerline(
+                    painter=painter,
+                    start_point=self._get_stair_section_midpoint_widget(
+                        previous_section
+                    ),
+                    end_point=self._get_stair_section_midpoint_widget(
+                        next_section
+                    ),
+                    style=style,
+                    pending=pending,
+                )
+                continue
+
+            if previous_is_visible:
+                self._paint_stair_route_level_transition(
+                    painter=painter,
+                    point=self._get_stair_section_midpoint_widget(
+                        previous_section
+                    ),
+                    source_level_index=previous_section.level_index,
+                    destination_level_index=next_section.level_index,
+                    label=(
+                        "Curve route to"
+                        if next_name != "end"
+                        else "Stair route to"
+                    ),
+                    style=style,
+                    pending=pending,
+                )
+            elif next_is_visible:
+                self._paint_stair_route_level_transition(
+                    painter=painter,
+                    point=self._get_stair_section_midpoint_widget(next_section),
+                    source_level_index=next_section.level_index,
+                    destination_level_index=previous_section.level_index,
+                    label=(
+                        "Curve route from"
+                        if previous_name != "start"
+                        else "Stair route from"
+                    ),
+                    style=style,
+                    pending=pending,
+                )
+
+    def _get_stair_section_midpoint_widget(
+        self,
+        section: StairSectionPlacement,
+    ) -> QPointF:
+        """Resolve one route section's current Canvas midpoint."""
+
+        point_a_x, point_a_y = self._resolve_stair_canvas_point(
+            section.a_x,
+            section.a_y,
+            section.a_vertex_id,
+        )
+        point_b_x, point_b_y = self._resolve_stair_canvas_point(
+            section.b_x,
+            section.b_y,
+            section.b_vertex_id,
+        )
+        return (
+            self._image_to_widget(point_a_x, point_a_y)
+            + self._image_to_widget(point_b_x, point_b_y)
+        ) * 0.5
+
+    def _paint_stair_route_centerline(
+        self,
+        painter: QPainter,
+        start_point: QPointF,
+        end_point: QPointF,
+        style: str,
+        pending: bool,
+    ) -> None:
+        """Paint the local-plan portion between two consecutive sections."""
+
+        color = PENDING_STAIR_COLOR if pending else _get_stair_style_color(style)
+        painter.save()
+        route_pen = QPen(
+            color,
+            STAIR_ROUTE_CENTERLINE_WIDTH_SCREEN,
+            Qt.PenStyle.DashLine,
+        )
+        route_pen.setCosmetic(True)
+        route_pen.setDashPattern([4.0, 4.0])
+        painter.setPen(route_pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawLine(start_point, end_point)
+        painter.restore()
+
+    def _paint_stair_route_level_transition(
+        self,
+        painter: QPainter,
+        point: QPointF,
+        source_level_index: int,
+        destination_level_index: int,
+        label: str,
+        style: str,
+        pending: bool,
+    ) -> None:
+        """Mark a route segment which continues on another Canvas level."""
+
+        color = PENDING_STAIR_COLOR if pending else _get_stair_style_color(style)
+        direction_point = _get_level_transition_indicator_point(
+            point,
+            source_level_index,
+            destination_level_index,
+        )
+        self._paint_stair_direction_arrow(
+            painter,
+            point,
+            direction_point,
+            color,
+        )
+        painter.save()
+        painter.setPen(QPen(TEXT_COLOR))
+        painter.setFont(QFont("Segoe UI", 8))
+        painter.drawText(
+            direction_point + QPointF(6.0, -6.0),
+            f"{label} L{destination_level_index}",
+        )
+        painter.restore()
+
+    def _paint_stair_segment(
+        self,
+        painter: QPainter,
+        point_a: QPointF,
+        point_b: QPointF,
+        style: str,
+        label: str,
+        selected: bool,
+        destination_level_index: int | None = None,
+        pending: bool = False,
+    ) -> None:
+        """Paint the two-point footprint that anchors stairs on one level."""
+
+        base_color = _get_stair_style_color(style)
+        color = PENDING_STAIR_COLOR if pending else base_color
+        if selected and not pending:
+            color = STAIR_SELECTED_COLOR
+
+        painter.save()
+        segment_pen = QPen(
+            color,
+            4.0 if selected else 3.0,
+            Qt.PenStyle.DashLine if pending else Qt.PenStyle.SolidLine,
+        )
+        segment_pen.setCosmetic(True)
+        painter.setPen(segment_pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawLine(point_a, point_b)
+        painter.restore()
+
+        self._paint_stair_endpoint(
+            painter=painter,
+            point=point_a,
+            other_point=None,
+            style=style,
+            label="A",
+            selected=selected,
+            pending=pending,
+        )
+        self._paint_stair_endpoint(
+            painter=painter,
+            point=point_b,
+            other_point=None,
+            style=style,
+            label="B",
+            selected=selected,
+            pending=pending,
+        )
+
+        midpoint = (point_a + point_b) * 0.5
+        if destination_level_index is not None and self.level_context is not None:
+            direction_point = _get_level_transition_indicator_point(
+                midpoint,
+                self.level_context.index,
+                destination_level_index,
+            )
+            self._paint_stair_direction_arrow(
+                painter,
+                midpoint,
+                direction_point,
+                color,
+            )
+
+        painter.save()
+        painter.setPen(QPen(TEXT_COLOR))
+        painter.setFont(QFont("Segoe UI", 8))
+        painter.drawText(midpoint + QPointF(13.0, -13.0), label)
+        painter.restore()
+
+    def _paint_stair_direction_arrow(
+        self,
+        painter: QPainter,
+        point: QPointF,
+        other_point: QPointF,
+        color: QColor,
+    ) -> None:
+        """Paint the up/down level cue from the midpoint of a stair segment."""
+
+        direction = other_point - point
+        direction_length = math.hypot(direction.x(), direction.y())
+        if direction_length <= 1e-6:
+            return
+
+        direction = direction * (STAIR_DIRECTION_LENGTH_SCREEN / direction_length)
+        arrow_tip = point + direction
+        arrow_side = QPointF(-direction.y(), direction.x()) * 0.25
+        painter.save()
+        painter.setPen(QPen(color, 2.0))
+        painter.setBrush(color)
+        painter.drawLine(point, arrow_tip)
+        painter.drawPolygon(
+            QPolygonF(
+                [
+                    arrow_tip,
+                    arrow_tip - direction * 0.42 + arrow_side * 5.0,
+                    arrow_tip - direction * 0.42 - arrow_side * 5.0,
+                ]
+            )
+        )
+        painter.restore()
+
+    def _paint_stair_endpoint(
+        self,
+        painter: QPainter,
+        point: QPointF,
+        other_point: QPointF | None,
+        style: str,
+        label: str,
+        selected: bool,
+        pending: bool = False,
+    ) -> None:
+        base_color = _get_stair_style_color(style)
+        color = PENDING_STAIR_COLOR if pending else base_color
+        if selected and not pending:
+            color = STAIR_SELECTED_COLOR
+
+        painter.save()
+        endpoint_pen = QPen(
+            color,
+            3.0 if selected else 2.0,
+            Qt.PenStyle.DashLine if pending else Qt.PenStyle.SolidLine,
+        )
+        endpoint_pen.setCosmetic(True)
+        painter.setPen(endpoint_pen)
+        painter.setBrush(QColor(color.red(), color.green(), color.blue(), 88))
+        if _is_floating_stair_style(style):
+            diamond = QPolygonF(
+                [
+                    point + QPointF(0.0, -STAIR_ENDPOINT_RADIUS_SCREEN),
+                    point + QPointF(STAIR_ENDPOINT_RADIUS_SCREEN, 0.0),
+                    point + QPointF(0.0, STAIR_ENDPOINT_RADIUS_SCREEN),
+                    point + QPointF(-STAIR_ENDPOINT_RADIUS_SCREEN, 0.0),
+                ]
+            )
+            painter.drawPolygon(diamond)
+            if style == STAIR_STYLE_FLOATING_WITH_RISER:
+                painter.drawLine(
+                    point + QPointF(-6.0, 2.5),
+                    point + QPointF(6.0, 2.5),
+                )
+        else:
+            painter.drawEllipse(
+                point,
+                STAIR_ENDPOINT_RADIUS_SCREEN,
+                STAIR_ENDPOINT_RADIUS_SCREEN,
+            )
+            painter.drawLine(
+                point + QPointF(-7.0, 11.0),
+                point + QPointF(7.0, 11.0),
+            )
+
+        if other_point is not None:
+            direction = other_point - point
+            direction_length = math.hypot(direction.x(), direction.y())
+            if direction_length > 1e-6:
+                direction = direction * (STAIR_DIRECTION_LENGTH_SCREEN / direction_length)
+                arrow_tip = point + direction
+                painter.drawLine(point, arrow_tip)
+                arrow_side = QPointF(-direction.y(), direction.x()) * 0.25
+                painter.setBrush(color)
+                painter.drawPolygon(
+                    QPolygonF(
+                        [
+                            arrow_tip,
+                            arrow_tip - direction * 0.42 + arrow_side * 5.0,
+                            arrow_tip - direction * 0.42 - arrow_side * 5.0,
+                        ]
+                    )
+                )
+
+        painter.setPen(QPen(TEXT_COLOR))
+        painter.setFont(QFont("Segoe UI", 8))
+        painter.drawText(point + QPointF(13.0, -13.0), label)
+        painter.restore()
+
     def _paint_initial_first_person_camera(self, painter: QPainter) -> None:
         camera_points = self._get_initial_first_person_camera_widget_points()
         camera = self.initial_first_person_camera
@@ -2802,18 +4028,37 @@ class BlueprintCanvas(QWidget):
         ]
 
     def _paint_preview_guides(self, painter: QPainter) -> None:
-        if self.preview_point is None or not self.preview_guides:
+        self._paint_guides(
+            painter,
+            self.preview_point,
+            self.preview_guides,
+        )
+
+    def _paint_stair_preview_guides(self, painter: QPainter) -> None:
+        self._paint_guides(
+            painter,
+            self.pending_stair_preview_point,
+            self.pending_stair_preview_guides,
+        )
+
+    def _paint_guides(
+        self,
+        painter: QPainter,
+        preview_point: tuple[float, float] | None,
+        guides: list[SnapGuide],
+    ) -> None:
+        if preview_point is None or not guides:
             return
 
         guide_pen = QPen(GUIDE_COLOR, 1.5, Qt.PenStyle.DashLine)
         guide_pen.setDashPattern([3.0, 5.0])
         painter.setPen(guide_pen)
         preview_widget_point = self._image_to_widget(
-            self.preview_point[0],
-            self.preview_point[1],
+            preview_point[0],
+            preview_point[1],
         )
 
-        for guide in self.preview_guides:
+        for guide in guides:
             source_vertex = self.vertex_data.get_vertex(guide.source_vertex_id)
             if source_vertex is None:
                 continue
@@ -2828,13 +4073,13 @@ class BlueprintCanvas(QWidget):
             if guide.axis == "x":
                 painter.drawLine(
                     self._image_to_widget(source_vertex.x, source_vertex.y),
-                    self._image_to_widget(source_vertex.x, self.preview_point[1]),
+                    self._image_to_widget(source_vertex.x, preview_point[1]),
                 )
                 continue
 
             painter.drawLine(
                 self._image_to_widget(source_vertex.x, source_vertex.y),
-                self._image_to_widget(self.preview_point[0], source_vertex.y),
+                self._image_to_widget(preview_point[0], source_vertex.y),
             )
 
     def _paint_preview_edge(self, painter: QPainter) -> None:
@@ -2893,6 +4138,39 @@ class BlueprintCanvas(QWidget):
         ]
         if self.pending_room_name is not None:
             overlay_lines.append("Click a vertex to set the current room center.")
+        if self._is_stair_placement_active():
+            pending_point = self.pending_stair_point
+            pending_stair = self.pending_stair_placement
+            pending_draft = self.pending_stair_draft
+            if pending_draft is not None and pending_point is None:
+                overlay_lines.append(
+                    "Stairs: add optional two-point curve sections, or click "
+                    "Confirm stairs | Backspace: remove last curve section."
+                )
+            elif pending_draft is not None:
+                overlay_lines.append(
+                    f"Stairs: place curve point B on level "
+                    f"{pending_point.level_index} | Backspace: discard point A."
+                )
+            elif pending_stair is None and pending_point is None:
+                overlay_lines.append(
+                    "Stairs: click start point A anywhere; existing vertices "
+                    "and wall edges snap | Right click or Escape: cancel."
+                )
+            elif pending_stair is None:
+                overlay_lines.append(
+                    f"Stairs: place start point B on level "
+                    f"{pending_point.level_index}."
+                )
+            elif pending_point is None:
+                overlay_lines.append(
+                    "Stairs: select a different level, then place end point A."
+                )
+            else:
+                overlay_lines.append(
+                    f"Stairs: place end point B on level "
+                    f"{pending_point.level_index}."
+                )
         if self.pending_first_person_camera_z is not None:
             overlay_lines.append(
                 "First POV: click to place | Right click or Escape: cancel."
@@ -2908,6 +4186,10 @@ class BlueprintCanvas(QWidget):
         elif self.doorways:
             overlay_lines.append(
                 "Doorway: click its center to select; drag a facing border to resize depth."
+            )
+        if self.stairs:
+            overlay_lines.append(
+                "Stairs: Alt+click any A/B point to select; Delete removes the selected stair."
             )
         if self.pending_floor_contour_vertex_ids is not None:
             overlay_lines.append(
@@ -2930,9 +4212,337 @@ class BlueprintCanvas(QWidget):
 
 
 # ### Numeric helpers ###
+def _normalize_stair_style(style: object) -> str:
+    normalized_style = str(style).strip().lower()
+    if normalized_style in STAIR_STYLES:
+        return normalized_style
+    return DEFAULT_STAIR_STYLE
+
+
+def _format_stair_style_label(style: str) -> str:
+    """Return the Canvas-facing name for a known stair construction style."""
+
+    if style == STAIR_STYLE_FLOATING_WITH_RISER:
+        return "Floating with riser"
+    if style == STAIR_STYLE_FLOATING:
+        return "Floating"
+    return "Supported"
+
+
+def _is_floating_stair_style(style: str) -> bool:
+    """Return whether a style uses the floating-stair Canvas marker."""
+
+    return style in (
+        STAIR_STYLE_FLOATING,
+        STAIR_STYLE_FLOATING_WITH_RISER,
+    )
+
+
+def _get_stair_style_color(style: str) -> QColor:
+    if style == STAIR_STYLE_FLOATING_WITH_RISER:
+        return STAIR_FLOATING_WITH_RISER_COLOR
+    if style == STAIR_STYLE_FLOATING:
+        return STAIR_FLOATING_COLOR
+    return STAIR_SUPPORTED_COLOR
+
+
+def _get_stair_sections(
+    placement: StairPlacement,
+) -> tuple[tuple[str, StairSectionPlacement], ...]:
+    """Return the full ordered route as consistently shaped sections."""
+
+    start_section = StairSectionPlacement(
+        level_index=placement.start_level_index,
+        a_x=placement.start_a_x,
+        a_y=placement.start_a_y,
+        b_x=placement.start_b_x,
+        b_y=placement.start_b_y,
+        a_vertex_id=placement.start_a_vertex_id,
+        b_vertex_id=placement.start_b_vertex_id,
+    )
+    end_section = StairSectionPlacement(
+        level_index=placement.end_level_index,
+        a_x=placement.end_a_x,
+        a_y=placement.end_a_y,
+        b_x=placement.end_b_x,
+        b_y=placement.end_b_y,
+        a_vertex_id=placement.end_a_vertex_id,
+        b_vertex_id=placement.end_b_vertex_id,
+    )
+    named_intermediate_sections = tuple(
+        (f"intermediate_{section_index}", section)
+        for section_index, section in enumerate(
+            placement.intermediate_sections
+        )
+    )
+    return (
+        ("start", start_section),
+        *named_intermediate_sections,
+        ("end", end_section),
+    )
+
+
+def _get_level_transition_indicator_point(
+    endpoint_point: QPointF,
+    source_level_index: int,
+    destination_level_index: int,
+) -> QPointF:
+    direction_y = (
+        -STAIR_DIRECTION_LENGTH_SCREEN
+        if destination_level_index > source_level_index
+        else STAIR_DIRECTION_LENGTH_SCREEN
+    )
+    return endpoint_point + QPointF(0.0, direction_y)
+
+
+def _coerce_pending_stair_placement(
+    raw_placement: object | None,
+) -> PendingStairPlacement | None:
+    if raw_placement is None:
+        return None
+    if isinstance(raw_placement, PendingStairPlacement):
+        return raw_placement
+
+    start_level_index = _coerce_stair_level_index(
+        _get_stair_value(raw_placement, "start_level_index")
+    )
+    start_a_x = _coerce_stair_coordinate(
+        _get_stair_value(raw_placement, "start_a_x")
+    )
+    start_a_y = _coerce_stair_coordinate(
+        _get_stair_value(raw_placement, "start_a_y")
+    )
+    start_b_x = _coerce_stair_coordinate(
+        _get_stair_value(raw_placement, "start_b_x")
+    )
+    start_b_y = _coerce_stair_coordinate(
+        _get_stair_value(raw_placement, "start_b_y")
+    )
+    if None in (start_a_x, start_a_y, start_b_x, start_b_y):
+        legacy_start_x = _coerce_stair_coordinate(
+            _get_stair_value(raw_placement, "start_x")
+        )
+        legacy_start_y = _coerce_stair_coordinate(
+            _get_stair_value(raw_placement, "start_y")
+        )
+        start_a_x = start_b_x = legacy_start_x
+        start_a_y = start_b_y = legacy_start_y
+    if (
+        start_level_index is None
+        or start_a_x is None
+        or start_a_y is None
+        or start_b_x is None
+        or start_b_y is None
+    ):
+        return None
+
+    return PendingStairPlacement(
+        style=_normalize_stair_style(_get_stair_value(raw_placement, "style")),
+        start_level_index=start_level_index,
+        start_a_x=start_a_x,
+        start_a_y=start_a_y,
+        start_b_x=start_b_x,
+        start_b_y=start_b_y,
+        start_a_vertex_id=_coerce_optional_stair_vertex_id(
+            _get_stair_value(raw_placement, "start_a_vertex_id")
+        ),
+        start_b_vertex_id=_coerce_optional_stair_vertex_id(
+            _get_stair_value(raw_placement, "start_b_vertex_id")
+        ),
+    )
+
+
+def _coerce_stair_placement(raw_stair: object) -> StairPlacement | None:
+    if isinstance(raw_stair, StairPlacement):
+        return raw_stair
+
+    start_level_index = _coerce_stair_level_index(
+        _get_stair_value(raw_stair, "start_level_index")
+    )
+    end_level_index = _coerce_stair_level_index(
+        _get_stair_value(raw_stair, "end_level_index")
+    )
+    start_a_x = _coerce_stair_coordinate(
+        _get_stair_value(raw_stair, "start_a_x")
+    )
+    start_a_y = _coerce_stair_coordinate(
+        _get_stair_value(raw_stair, "start_a_y")
+    )
+    start_b_x = _coerce_stair_coordinate(
+        _get_stair_value(raw_stair, "start_b_x")
+    )
+    start_b_y = _coerce_stair_coordinate(
+        _get_stair_value(raw_stair, "start_b_y")
+    )
+    end_a_x = _coerce_stair_coordinate(_get_stair_value(raw_stair, "end_a_x"))
+    end_a_y = _coerce_stair_coordinate(_get_stair_value(raw_stair, "end_a_y"))
+    end_b_x = _coerce_stair_coordinate(_get_stair_value(raw_stair, "end_b_x"))
+    end_b_y = _coerce_stair_coordinate(_get_stair_value(raw_stair, "end_b_y"))
+    if None in (start_a_x, start_a_y, start_b_x, start_b_y):
+        legacy_start_x = _coerce_stair_coordinate(
+            _get_stair_value(raw_stair, "start_x")
+        )
+        legacy_start_y = _coerce_stair_coordinate(
+            _get_stair_value(raw_stair, "start_y")
+        )
+        start_a_x = start_b_x = legacy_start_x
+        start_a_y = start_b_y = legacy_start_y
+    if None in (end_a_x, end_a_y, end_b_x, end_b_y):
+        legacy_end_x = _coerce_stair_coordinate(
+            _get_stair_value(raw_stair, "end_x")
+        )
+        legacy_end_y = _coerce_stair_coordinate(
+            _get_stair_value(raw_stair, "end_y")
+        )
+        end_a_x = end_b_x = legacy_end_x
+        end_a_y = end_b_y = legacy_end_y
+    if (
+        start_level_index is None
+        or end_level_index is None
+        or start_a_x is None
+        or start_a_y is None
+        or start_b_x is None
+        or start_b_y is None
+        or end_a_x is None
+        or end_a_y is None
+        or end_b_x is None
+        or end_b_y is None
+    ):
+        return None
+
+    return StairPlacement(
+        style=_normalize_stair_style(_get_stair_value(raw_stair, "style")),
+        start_level_index=start_level_index,
+        start_a_x=start_a_x,
+        start_a_y=start_a_y,
+        start_b_x=start_b_x,
+        start_b_y=start_b_y,
+        end_level_index=end_level_index,
+        end_a_x=end_a_x,
+        end_a_y=end_a_y,
+        end_b_x=end_b_x,
+        end_b_y=end_b_y,
+        intermediate_sections=_coerce_stair_intermediate_sections(
+            _get_stair_value(raw_stair, "intermediate_sections")
+        ),
+        start_a_vertex_id=_coerce_optional_stair_vertex_id(
+            _get_stair_value(raw_stair, "start_a_vertex_id")
+        ),
+        start_b_vertex_id=_coerce_optional_stair_vertex_id(
+            _get_stair_value(raw_stair, "start_b_vertex_id")
+        ),
+        end_a_vertex_id=_coerce_optional_stair_vertex_id(
+            _get_stair_value(raw_stair, "end_a_vertex_id")
+        ),
+        end_b_vertex_id=_coerce_optional_stair_vertex_id(
+            _get_stair_value(raw_stair, "end_b_vertex_id")
+        ),
+    )
+
+
+def _coerce_stair_intermediate_sections(
+    raw_sections: object | None,
+) -> tuple[StairSectionPlacement, ...]:
+    """Convert model or mapping sections into Canvas-neutral data."""
+
+    if raw_sections is None:
+        return ()
+    if not isinstance(raw_sections, Iterable) or isinstance(
+        raw_sections,
+        (str, bytes, Mapping),
+    ):
+        return ()
+
+    sections: list[StairSectionPlacement] = []
+    for raw_section in raw_sections:
+        section = _coerce_stair_section(raw_section)
+        if section is not None:
+            sections.append(section)
+    return tuple(sections)
+
+
+def _coerce_stair_section(
+    raw_section: object,
+) -> StairSectionPlacement | None:
+    level_index = _coerce_stair_level_index(
+        _get_stair_value(raw_section, "level_index")
+    )
+    a_x = _coerce_stair_coordinate(_get_stair_value(raw_section, "a_x"))
+    a_y = _coerce_stair_coordinate(_get_stair_value(raw_section, "a_y"))
+    b_x = _coerce_stair_coordinate(_get_stair_value(raw_section, "b_x"))
+    b_y = _coerce_stair_coordinate(_get_stair_value(raw_section, "b_y"))
+    if (
+        level_index is None
+        or a_x is None
+        or a_y is None
+        or b_x is None
+        or b_y is None
+    ):
+        return None
+    return StairSectionPlacement(
+        level_index=level_index,
+        a_x=a_x,
+        a_y=a_y,
+        b_x=b_x,
+        b_y=b_y,
+        a_vertex_id=_coerce_optional_stair_vertex_id(
+            _get_stair_value(raw_section, "a_vertex_id")
+        ),
+        b_vertex_id=_coerce_optional_stair_vertex_id(
+            _get_stair_value(raw_section, "b_vertex_id")
+        ),
+    )
+
+
+def _get_stair_value(raw_stair: object, field_name: str) -> object | None:
+    if isinstance(raw_stair, Mapping):
+        return raw_stair.get(field_name)
+    return getattr(raw_stair, field_name, None)
+
+
+def _coerce_stair_level_index(value: object | None) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        numeric_value = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return numeric_value
+
+
+def _coerce_optional_stair_vertex_id(value: object | None) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        vertex_id = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return vertex_id if vertex_id >= 0 else None
+
+
+def _coerce_stair_coordinate(value: object | None) -> float | None:
+    try:
+        numeric_value = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(numeric_value):
+        return None
+    return numeric_value
+
+
 def _qpoint_distance(first_point: QPointF, second_point: QPointF) -> float:
     delta = first_point - second_point
     return math.hypot(delta.x(), delta.y())
+
+
+def _points_are_coincident(
+    first_point: tuple[float, float],
+    second_point: tuple[float, float],
+) -> bool:
+    return math.hypot(
+        first_point[0] - second_point[0],
+        first_point[1] - second_point[1],
+    ) <= 1e-6
 
 
 # ### File helpers ###

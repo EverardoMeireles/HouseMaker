@@ -374,6 +374,69 @@ class FirstPersonNavigationTests(unittest.TestCase):
                 self.assertAlmostEqual(moved_pose.y, expected_xy[1])
                 self.assertAlmostEqual(moved_pose.z, 1.7)
 
+    def test_r_moves_down_and_f_moves_up_without_gravity(self) -> None:
+        self.view.enter_first_person_mode()
+        cases = (
+            (Qt.Key.Key_R, 0.7),
+            (Qt.Key.Key_F, 2.7),
+        )
+        for key, expected_z in cases:
+            with self.subTest(key=key):
+                self.view.set_first_person_camera_pose(
+                    CameraPose(x=1.0, y=2.0, z=1.7)
+                )
+                self.view.keyPressEvent(
+                    QKeyEvent(
+                        QEvent.Type.KeyPress,
+                        key,
+                        Qt.KeyboardModifier.NoModifier,
+                    )
+                )
+                self.view.step_first_person_movement(0.4)
+                self.view.keyReleaseEvent(
+                    QKeyEvent(
+                        QEvent.Type.KeyRelease,
+                        key,
+                        Qt.KeyboardModifier.NoModifier,
+                    )
+                )
+
+                moved_pose = self.view.get_first_person_camera_pose()
+                self.assertAlmostEqual(moved_pose.x, 1.0)
+                self.assertAlmostEqual(moved_pose.y, 2.0)
+                self.assertAlmostEqual(moved_pose.z, expected_z)
+
+    def test_repeated_vertical_key_press_keeps_moving_until_release(self) -> None:
+        self.view.set_first_person_camera_pose(CameraPose(z=1.7))
+        self.view.enter_first_person_mode()
+        press_event = QKeyEvent(
+            QEvent.Type.KeyPress,
+            Qt.Key.Key_F,
+            Qt.KeyboardModifier.NoModifier,
+        )
+
+        self.view.keyPressEvent(press_event)
+        self.view.keyPressEvent(press_event)
+        self.view.step_first_person_movement(0.2)
+        self.view.step_first_person_movement(0.2)
+
+        self.assertAlmostEqual(
+            self.view.get_first_person_camera_pose().z,
+            2.7,
+        )
+        self.view.keyReleaseEvent(
+            QKeyEvent(
+                QEvent.Type.KeyRelease,
+                Qt.Key.Key_F,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+        self.view.step_first_person_movement(0.4)
+        self.assertAlmostEqual(
+            self.view.get_first_person_camera_pose().z,
+            2.7,
+        )
+
     def test_mouse_look_and_right_click_exit_do_not_use_orbit_controls(self) -> None:
         self.view.set_first_person_camera_pose(CameraPose(z=1.7))
         self.view.enter_first_person_mode()

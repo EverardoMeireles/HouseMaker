@@ -226,7 +226,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self._set_first_person_camera_pose(pose, is_custom=False, emit_signal=False)
 
     def step_first_person_movement(self, elapsed_seconds: float) -> None:
-        """Advance held Z/Q/S/D movement; public for deterministic callers/tests."""
+        """Advance held Z/Q/S/D/R/F movement for deterministic callers/tests."""
 
         elapsed = max(0.0, float(elapsed_seconds))
         if (
@@ -243,11 +243,22 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             (Qt.Key.Key_D in self._pressed_movement_keys)
             - (Qt.Key.Key_Q in self._pressed_movement_keys)
         )
-        if forward_amount == 0.0 and right_amount == 0.0:
+        vertical_amount = float(
+            (Qt.Key.Key_F in self._pressed_movement_keys)
+            - (Qt.Key.Key_R in self._pressed_movement_keys)
+        )
+        if (
+            forward_amount == 0.0
+            and right_amount == 0.0
+            and vertical_amount == 0.0
+        ):
             return
-        magnitude = math.hypot(forward_amount, right_amount)
+        magnitude = math.sqrt(
+            forward_amount**2 + right_amount**2 + vertical_amount**2
+        )
         forward_amount /= magnitude
         right_amount /= magnitude
+        vertical_amount /= magnitude
         yaw_radians = math.radians(self._first_person_camera_pose.yaw_degrees)
         forward_x = math.cos(yaw_radians)
         forward_y = math.sin(yaw_radians)
@@ -265,7 +276,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
                 y=pose.y
                 + (forward_y * forward_amount + right_y * right_amount)
                 * distance,
-                z=pose.z,
+                z=pose.z + vertical_amount * distance,
                 yaw_degrees=pose.yaw_degrees,
                 pitch_degrees=pose.pitch_degrees,
                 roll_degrees=pose.roll_degrees,
@@ -525,8 +536,9 @@ class SelectableGLViewWidget(gl.GLViewWidget):
     def _update_navigation_tooltip(self) -> None:
         if self.is_first_person_active:
             self.setToolTip(
-                "First-person controls: Z/Q/S/D to move, move the mouse to look, "
-                "right-click to return to Blender orbit controls."
+                "First-person controls: Z/Q/S/D to move, R/F to move down/up, "
+                "move the mouse to look, right-click to return to Blender "
+                "orbit controls."
             )
             return
         self.setToolTip(
@@ -1188,7 +1200,16 @@ def _normalize_navigation_mode(value: object) -> str:
 
 
 def _first_person_movement_keys() -> frozenset[int]:
-    return frozenset((Qt.Key.Key_Z, Qt.Key.Key_Q, Qt.Key.Key_S, Qt.Key.Key_D))
+    return frozenset(
+        (
+            Qt.Key.Key_Z,
+            Qt.Key.Key_Q,
+            Qt.Key.Key_S,
+            Qt.Key.Key_D,
+            Qt.Key.Key_R,
+            Qt.Key.Key_F,
+        )
+    )
 
 
 def _point_is_near(delta: QPointF, tolerance: float) -> bool:

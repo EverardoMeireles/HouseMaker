@@ -41,6 +41,7 @@ from housemaker.models import (
     DoorwayPreset,
     LevelData,
     RoomData,
+    StairData,
     VertexData,
     WallTextureData,
     create_default_doorway_presets,
@@ -66,6 +67,7 @@ class ProjectData:
         default_factory=SurfaceTextureData
     )
     initial_first_person_camera: InitialFirstPersonCamera | None = None
+    stairs: list[StairData] = field(default_factory=list)
 
 
 # ### Public helpers ###
@@ -78,6 +80,7 @@ def save_project(
     generation: GenerationData | None = None,
     surface_texture_generation: SurfaceTextureData | None = None,
     initial_first_person_camera: InitialFirstPersonCamera | None = None,
+    stairs: list[StairData] | None = None,
 ) -> Path:
     export_path = Path(path)
     payload = {
@@ -107,6 +110,7 @@ def save_project(
             if initial_first_person_camera is None
             else initial_first_person_camera.to_dict()
         ),
+        "stairs": _serialize_stairs(stairs or []),
         "levels": [
             {
                 "index": level.index,
@@ -231,6 +235,10 @@ def load_project(path: str | Path) -> ProjectData:
         initial_first_person_camera = _build_legacy_initial_camera(
             payload.get("dynamic_generation")
         )
+    stairs = _deserialize_stairs(
+        payload.get("stairs"),
+        valid_level_indices=set(level_lookup),
+    )
     _clear_image_library_paths_from_levels(levels, image_library_paths)
 
     current_level_index = int(payload.get("current_level_index", GROUND_LEVEL_INDEX))
@@ -246,6 +254,7 @@ def load_project(path: str | Path) -> ProjectData:
         generation=generation,
         surface_texture_generation=surface_texture_generation,
         initial_first_person_camera=initial_first_person_camera,
+        stairs=stairs,
     )
 
 
@@ -442,6 +451,43 @@ def _clear_image_library_paths_from_levels(
 
         level.image_path = None
         level.image_size_pixels = None
+
+
+# ### Stair serialization helpers ###
+def _serialize_stairs(
+    stairs: list[StairData],
+) -> list[dict[str, object]]:
+    return [stair.to_dict() for stair in stairs]
+
+
+def _deserialize_stairs(
+    raw_stairs: object,
+    valid_level_indices: set[int],
+) -> list[StairData]:
+    """Load complete stairs whose complete route references current levels."""
+
+    if not isinstance(raw_stairs, list | tuple):
+        return []
+
+    stairs: list[StairData] = []
+    for raw_stair in raw_stairs:
+        try:
+            stair = StairData.from_dict(raw_stair)
+        except (TypeError, ValueError):
+            continue
+
+        if (
+            stair.start_level_index not in valid_level_indices
+            or stair.end_level_index not in valid_level_indices
+            or any(
+                section.level_index not in valid_level_indices
+                for section in stair.intermediate_sections
+            )
+        ):
+            continue
+        stairs.append(stair)
+
+    return stairs
 
 
 # ### Doorway serialization helpers ###

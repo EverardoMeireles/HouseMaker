@@ -33,6 +33,18 @@ DEFAULT_UV_MAP_WIDTH = 1024
 DEFAULT_UV_MAP_HEIGHT = 1024
 DEFAULT_WALL_UV_SCALE = 1.0
 DEFAULT_WALL_UV_ROTATION_DEGREES = 0
+STAIR_STYLE_SUPPORTED = "supported"
+STAIR_STYLE_FLOATING = "floating"
+STAIR_STYLE_FLOATING_WITH_RISER = "floating_with_riser"
+STAIR_STYLES = frozenset(
+    {
+        STAIR_STYLE_SUPPORTED,
+        STAIR_STYLE_FLOATING,
+        STAIR_STYLE_FLOATING_WITH_RISER,
+    }
+)
+DEFAULT_STAIR_STYLE = STAIR_STYLE_SUPPORTED
+LEGACY_STAIR_WIDTH_PIXELS = 50.0
 PIXEL_TO_METER = 0.02
 GROUND_LEVEL_INDEX = 2
 MIN_LEVEL_INDEX = 0
@@ -101,6 +113,421 @@ class DoorwayData:
     height_meters: float
     depth_meters: float = DEFAULT_DOORWAY_DEPTH_METERS
     rotation_degrees: float = 0.0
+
+
+@dataclass(frozen=True, init=False)
+class StairSectionData:
+    """One locally stored two-point cross-section along a stair route."""
+
+    level_index: int
+    a_x: float
+    a_y: float
+    b_x: float
+    b_y: float
+    a_vertex_id: int | None = None
+    b_vertex_id: int | None = None
+
+    def __init__(
+        self,
+        level_index: object,
+        a_x: object,
+        a_y: object,
+        b_x: object,
+        b_y: object,
+        a_vertex_id: object = None,
+        b_vertex_id: object = None,
+    ) -> None:
+        _validate_stair_level_index(level_index, "section")
+        normalized_coordinates = {
+            name: _normalize_stair_coordinate(value, f"section {name}")
+            for name, value in (
+                ("a x", a_x),
+                ("a y", a_y),
+                ("b x", b_x),
+                ("b y", b_y),
+            )
+        }
+        _validate_stair_segment_width(
+            normalized_coordinates["a x"],
+            normalized_coordinates["a y"],
+            normalized_coordinates["b x"],
+            normalized_coordinates["b y"],
+            "section",
+        )
+
+        object.__setattr__(self, "level_index", level_index)
+        object.__setattr__(self, "a_x", normalized_coordinates["a x"])
+        object.__setattr__(self, "a_y", normalized_coordinates["a y"])
+        object.__setattr__(self, "b_x", normalized_coordinates["b x"])
+        object.__setattr__(self, "b_y", normalized_coordinates["b y"])
+        object.__setattr__(
+            self,
+            "a_vertex_id",
+            _normalize_optional_stair_vertex_id(a_vertex_id, "section a"),
+        )
+        object.__setattr__(
+            self,
+            "b_vertex_id",
+            _normalize_optional_stair_vertex_id(b_vertex_id, "section b"),
+        )
+
+    @property
+    def points(self) -> tuple[tuple[float, float], tuple[float, float]]:
+        return ((self.a_x, self.a_y), (self.b_x, self.b_y))
+
+    @property
+    def center_x(self) -> float:
+        return (self.a_x + self.b_x) / 2.0
+
+    @property
+    def center_y(self) -> float:
+        return (self.a_y + self.b_y) / 2.0
+
+    def to_dict(self) -> dict[str, int | float | None]:
+        return {
+            "level_index": int(self.level_index),
+            "a_x": float(self.a_x),
+            "a_y": float(self.a_y),
+            "b_x": float(self.b_x),
+            "b_y": float(self.b_y),
+            "a_vertex_id": self.a_vertex_id,
+            "b_vertex_id": self.b_vertex_id,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "StairSectionData":
+        if not isinstance(payload, dict):
+            raise ValueError("Stair section JSON must contain an object.")
+        return cls(
+            level_index=payload.get("level_index"),
+            a_x=payload.get("a_x"),
+            a_y=payload.get("a_y"),
+            b_x=payload.get("b_x"),
+            b_y=payload.get("b_y"),
+            a_vertex_id=payload.get("a_vertex_id"),
+            b_vertex_id=payload.get("b_vertex_id"),
+        )
+
+
+@dataclass(frozen=True, init=False)
+class StairData:
+    """A stairway joining ordered local plan segments on different levels.
+
+    The ``a`` and ``b`` points define the full stair width at each elevation.
+    Coordinates remain valid when no wall vertex is involved.  A nullable
+    vertex id may additionally bind a point to a level vertex so moving that
+    vertex can move the stair point without rewriting the stored fallback
+    coordinates.
+
+    Intermediate sections bend the stair route in their stored order. The
+    custom initializer accepts the old single-point ``start_x`` / ``end_x``
+    representation and projects without intermediate sections, keeping both
+    earlier stair formats usable.
+    """
+
+    start_level_index: int
+    start_a_x: float
+    start_a_y: float
+    start_b_x: float
+    start_b_y: float
+    end_level_index: int
+    end_a_x: float
+    end_a_y: float
+    end_b_x: float
+    end_b_y: float
+    style: str = DEFAULT_STAIR_STYLE
+    start_a_vertex_id: int | None = None
+    start_b_vertex_id: int | None = None
+    end_a_vertex_id: int | None = None
+    end_b_vertex_id: int | None = None
+    intermediate_sections: tuple[StairSectionData, ...] = ()
+
+    def __init__(
+        self,
+        start_level_index: object,
+        start_x: object = None,
+        start_y: object = None,
+        end_level_index: object = None,
+        end_x: object = None,
+        end_y: object = None,
+        style: object = DEFAULT_STAIR_STYLE,
+        *,
+        start_a_x: object = None,
+        start_a_y: object = None,
+        start_b_x: object = None,
+        start_b_y: object = None,
+        end_a_x: object = None,
+        end_a_y: object = None,
+        end_b_x: object = None,
+        end_b_y: object = None,
+        start_a_vertex_id: object = None,
+        start_b_vertex_id: object = None,
+        end_a_vertex_id: object = None,
+        end_b_vertex_id: object = None,
+        intermediate_sections: object = (),
+    ) -> None:
+        _validate_stair_level_index(start_level_index, "start")
+        _validate_stair_level_index(end_level_index, "end")
+        if start_level_index == end_level_index:
+            raise ValueError("Stair endpoints must belong to different levels.")
+
+        canonical_coordinates = (
+            start_a_x,
+            start_a_y,
+            start_b_x,
+            start_b_y,
+            end_a_x,
+            end_a_y,
+            end_b_x,
+            end_b_y,
+        )
+        if any(value is not None for value in canonical_coordinates):
+            if not all(value is not None for value in canonical_coordinates):
+                raise ValueError(
+                    "A stair requires two complete points on each level."
+                )
+            if any(
+                value is not None
+                for value in (start_x, start_y, end_x, end_y)
+            ):
+                raise ValueError(
+                    "Do not mix legacy stair center points with four-point "
+                    "coordinates."
+                )
+        else:
+            legacy_coordinates = (start_x, start_y, end_x, end_y)
+            if not all(value is not None for value in legacy_coordinates):
+                raise ValueError(
+                    "A stair requires two complete points on each level."
+                )
+            (
+                start_a_x,
+                start_a_y,
+                start_b_x,
+                start_b_y,
+                end_a_x,
+                end_a_y,
+                end_b_x,
+                end_b_y,
+            ) = _migrate_legacy_stair_centerline(
+                start_x,
+                start_y,
+                end_x,
+                end_y,
+            )
+
+        normalized_coordinates = {
+            name: _normalize_stair_coordinate(value, name.replace("_", " "))
+            for name, value in (
+                ("start_a_x", start_a_x),
+                ("start_a_y", start_a_y),
+                ("start_b_x", start_b_x),
+                ("start_b_y", start_b_y),
+                ("end_a_x", end_a_x),
+                ("end_a_y", end_a_y),
+                ("end_b_x", end_b_x),
+                ("end_b_y", end_b_y),
+            )
+        }
+        _validate_stair_segment_width(
+            normalized_coordinates["start_a_x"],
+            normalized_coordinates["start_a_y"],
+            normalized_coordinates["start_b_x"],
+            normalized_coordinates["start_b_y"],
+            "start",
+        )
+        _validate_stair_segment_width(
+            normalized_coordinates["end_a_x"],
+            normalized_coordinates["end_a_y"],
+            normalized_coordinates["end_b_x"],
+            normalized_coordinates["end_b_y"],
+            "end",
+        )
+
+        object.__setattr__(self, "start_level_index", start_level_index)
+        object.__setattr__(self, "end_level_index", end_level_index)
+        for name, value in normalized_coordinates.items():
+            object.__setattr__(self, name, value)
+        object.__setattr__(self, "style", normalize_stair_style(style))
+        object.__setattr__(
+            self,
+            "start_a_vertex_id",
+            _normalize_optional_stair_vertex_id(
+                start_a_vertex_id,
+                "start a",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "start_b_vertex_id",
+            _normalize_optional_stair_vertex_id(
+                start_b_vertex_id,
+                "start b",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "end_a_vertex_id",
+            _normalize_optional_stair_vertex_id(end_a_vertex_id, "end a"),
+        )
+        object.__setattr__(
+            self,
+            "end_b_vertex_id",
+            _normalize_optional_stair_vertex_id(end_b_vertex_id, "end b"),
+        )
+        object.__setattr__(
+            self,
+            "intermediate_sections",
+            _normalize_stair_intermediate_sections(intermediate_sections),
+        )
+
+    @property
+    def start_points(self) -> tuple[tuple[float, float], tuple[float, float]]:
+        return (
+            (self.start_a_x, self.start_a_y),
+            (self.start_b_x, self.start_b_y),
+        )
+
+    @property
+    def end_points(self) -> tuple[tuple[float, float], tuple[float, float]]:
+        return (
+            (self.end_a_x, self.end_a_y),
+            (self.end_b_x, self.end_b_y),
+        )
+
+    @property
+    def start_section(self) -> StairSectionData:
+        return StairSectionData(
+            level_index=self.start_level_index,
+            a_x=self.start_a_x,
+            a_y=self.start_a_y,
+            b_x=self.start_b_x,
+            b_y=self.start_b_y,
+            a_vertex_id=self.start_a_vertex_id,
+            b_vertex_id=self.start_b_vertex_id,
+        )
+
+    @property
+    def end_section(self) -> StairSectionData:
+        return StairSectionData(
+            level_index=self.end_level_index,
+            a_x=self.end_a_x,
+            a_y=self.end_a_y,
+            b_x=self.end_b_x,
+            b_y=self.end_b_y,
+            a_vertex_id=self.end_a_vertex_id,
+            b_vertex_id=self.end_b_vertex_id,
+        )
+
+    @property
+    def sections(self) -> tuple[StairSectionData, ...]:
+        """Return the complete stair route from start through end."""
+
+        return (
+            self.start_section,
+            *self.intermediate_sections,
+            self.end_section,
+        )
+
+    @property
+    def start_x(self) -> float:
+        """Return the legacy start center for transitional callers."""
+
+        return (self.start_a_x + self.start_b_x) / 2.0
+
+    @property
+    def start_y(self) -> float:
+        """Return the legacy start center for transitional callers."""
+
+        return (self.start_a_y + self.start_b_y) / 2.0
+
+    @property
+    def end_x(self) -> float:
+        """Return the legacy end center for transitional callers."""
+
+        return (self.end_a_x + self.end_b_x) / 2.0
+
+    @property
+    def end_y(self) -> float:
+        """Return the legacy end center for transitional callers."""
+
+        return (self.end_a_y + self.end_b_y) / 2.0
+
+    @property
+    def is_floating(self) -> bool:
+        """Return whether this stair uses unsupported floating treads."""
+
+        return self.style in {
+            STAIR_STYLE_FLOATING,
+            STAIR_STYLE_FLOATING_WITH_RISER,
+        }
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "start_level_index": int(self.start_level_index),
+            "start_a_x": float(self.start_a_x),
+            "start_a_y": float(self.start_a_y),
+            "start_b_x": float(self.start_b_x),
+            "start_b_y": float(self.start_b_y),
+            "end_level_index": int(self.end_level_index),
+            "end_a_x": float(self.end_a_x),
+            "end_a_y": float(self.end_a_y),
+            "end_b_x": float(self.end_b_x),
+            "end_b_y": float(self.end_b_y),
+            "style": self.style,
+            "start_a_vertex_id": self.start_a_vertex_id,
+            "start_b_vertex_id": self.start_b_vertex_id,
+            "end_a_vertex_id": self.end_a_vertex_id,
+            "end_b_vertex_id": self.end_b_vertex_id,
+            "intermediate_sections": [
+                section.to_dict() for section in self.intermediate_sections
+            ],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "StairData":
+        if not isinstance(payload, dict):
+            raise ValueError("Stair JSON must contain an object.")
+
+        common_values = {
+            "start_level_index": payload.get("start_level_index"),
+            "end_level_index": payload.get("end_level_index"),
+            "style": payload.get("style", DEFAULT_STAIR_STYLE),
+            "start_a_vertex_id": payload.get("start_a_vertex_id"),
+            "start_b_vertex_id": payload.get("start_b_vertex_id"),
+            "end_a_vertex_id": payload.get("end_a_vertex_id"),
+            "end_b_vertex_id": payload.get("end_b_vertex_id"),
+            "intermediate_sections": payload.get("intermediate_sections", ()),
+        }
+        canonical_names = (
+            "start_a_x",
+            "start_a_y",
+            "start_b_x",
+            "start_b_y",
+            "end_a_x",
+            "end_a_y",
+            "end_b_x",
+            "end_b_y",
+        )
+        if any(name in payload for name in canonical_names):
+            legacy_names = ("start_x", "start_y", "end_x", "end_y")
+            if any(name in payload for name in legacy_names):
+                raise ValueError(
+                    "Do not mix legacy stair center points with four-point "
+                    "coordinates."
+                )
+            return cls(
+                **common_values,
+                **{name: payload.get(name) for name in canonical_names},
+            )
+
+        return cls(
+            **common_values,
+            start_x=payload.get("start_x"),
+            start_y=payload.get("start_y"),
+            end_x=payload.get("end_x"),
+            end_y=payload.get("end_y"),
+        )
 
 
 @dataclass
@@ -307,6 +734,124 @@ def snap_point(
     snapped_x = base_vertex.x + distance * math.cos(snapped_angle_radians)
     snapped_y = base_vertex.y + distance * math.sin(snapped_angle_radians)
     return snapped_x, snapped_y
+
+
+# ### Stair validation helpers ###
+def normalize_stair_style(value: object) -> str:
+    """Return a supported stair style or raise a clear validation error."""
+
+    if not isinstance(value, str):
+        raise ValueError("Stair style must be a string.")
+
+    style = value.strip().lower()
+    if style not in STAIR_STYLES:
+        supported_styles = ", ".join(sorted(STAIR_STYLES))
+        raise ValueError(
+            f"Stair style must be one of: {supported_styles}."
+        )
+    return style
+
+
+def _validate_stair_level_index(level_index: object, endpoint_name: str) -> None:
+    if isinstance(level_index, bool) or not isinstance(level_index, int):
+        raise ValueError(
+            f"Stair {endpoint_name} level index must be an integer."
+        )
+    if not MIN_LEVEL_INDEX <= level_index <= MAX_LEVEL_INDEX:
+        raise ValueError(
+            f"Stair {endpoint_name} level index must be between "
+            f"{MIN_LEVEL_INDEX} and {MAX_LEVEL_INDEX}."
+        )
+
+
+def _normalize_stair_coordinate(value: object, coordinate_name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"Stair {coordinate_name} coordinate must be a number.")
+    try:
+        coordinate = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            f"Stair {coordinate_name} coordinate must be a number."
+        ) from error
+    if not math.isfinite(coordinate):
+        raise ValueError(
+            f"Stair {coordinate_name} coordinate must be finite."
+        )
+    return coordinate
+
+
+def _normalize_optional_stair_vertex_id(
+    value: object,
+    point_name: str,
+) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(
+            f"Stair {point_name} vertex id must be a positive integer or null."
+        )
+    return value
+
+
+def _validate_stair_segment_width(
+    first_x: float,
+    first_y: float,
+    second_x: float,
+    second_y: float,
+    segment_name: str,
+) -> None:
+    if math.hypot(second_x - first_x, second_y - first_y) <= 1e-9:
+        raise ValueError(
+            f"Stair {segment_name} points must be separated."
+        )
+
+
+def _normalize_stair_intermediate_sections(
+    value: object,
+) -> tuple[StairSectionData, ...]:
+    if not isinstance(value, list | tuple):
+        raise ValueError("Stair intermediate sections must contain a list.")
+
+    normalized_sections: list[StairSectionData] = []
+    for section in value:
+        if isinstance(section, StairSectionData):
+            normalized_sections.append(section)
+            continue
+        normalized_sections.append(StairSectionData.from_dict(section))
+    return tuple(normalized_sections)
+
+
+def _migrate_legacy_stair_centerline(
+    start_x: object,
+    start_y: object,
+    end_x: object,
+    end_y: object,
+) -> tuple[float, float, float, float, float, float, float, float]:
+    normalized_start_x = _normalize_stair_coordinate(start_x, "start x")
+    normalized_start_y = _normalize_stair_coordinate(start_y, "start y")
+    normalized_end_x = _normalize_stair_coordinate(end_x, "end x")
+    normalized_end_y = _normalize_stair_coordinate(end_y, "end y")
+    run_x = normalized_end_x - normalized_start_x
+    run_y = normalized_end_y - normalized_start_y
+    run_length = math.hypot(run_x, run_y)
+    if run_length <= 1e-9:
+        lateral_x = LEGACY_STAIR_WIDTH_PIXELS / 2.0
+        lateral_y = 0.0
+    else:
+        half_width = LEGACY_STAIR_WIDTH_PIXELS / 2.0
+        lateral_x = (-run_y / run_length) * half_width
+        lateral_y = (run_x / run_length) * half_width
+
+    return (
+        normalized_start_x + lateral_x,
+        normalized_start_y + lateral_y,
+        normalized_start_x - lateral_x,
+        normalized_start_y - lateral_y,
+        normalized_end_x + lateral_x,
+        normalized_end_y + lateral_y,
+        normalized_end_x - lateral_x,
+        normalized_end_y - lateral_y,
+    )
 
 
 # ### Level helpers ###

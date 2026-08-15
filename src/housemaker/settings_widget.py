@@ -32,7 +32,7 @@ FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY = (
 CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY_SETTING_KEY = (
     "navigation/canvas_3d_navigation_toggle_hotkey"
 )
-DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY = "F"
+DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY = "N"
 MESHY_SMART_TOPOLOGY_MIN_TARGET_POLYCOUNT = 100
 MESHY_SMART_TOPOLOGY_MAX_TARGET_POLYCOUNT = 15_000
 DEFAULT_MESHY_TARGET_POLYCOUNT = 4_000
@@ -65,7 +65,9 @@ _MODIFIER_ONLY_SHORTCUT_KEYS = frozenset(
 _FIRST_PERSON_MOVEMENT_SHORTCUT_KEYS = frozenset(
     {
         Qt.Key.Key_D,
+        Qt.Key.Key_F,
         Qt.Key.Key_Q,
+        Qt.Key.Key_R,
         Qt.Key.Key_S,
         Qt.Key.Key_Z,
     }
@@ -278,7 +280,8 @@ class SettingsWidget(QWidget):
         self.canvas_3d_navigation_toggle_hotkey_edit.setClearButtonEnabled(True)
         self.canvas_3d_navigation_toggle_hotkey_edit.setToolTip(
             "Press one key combination to switch the Canvas 3D view between "
-            "top-down orbit and first-person navigation."
+            "top-down orbit and first-person navigation. Bare Z, Q, S, D, R, "
+            "and F are reserved for first-person movement."
         )
         self.canvas_3d_navigation_toggle_hotkey_edit.keySequenceChanged.connect(
             self._handle_canvas_3d_navigation_toggle_hotkey_changed

@@ -186,7 +186,7 @@ class GenerationMainIntegrationTests(unittest.TestCase):
         _qt_application.processEvents()
 
         self.workspace.viewer.view.setFocus()
-        QTest.keyClick(self.workspace.viewer.view, Qt.Key.Key_F)
+        QTest.keyClick(self.workspace.viewer.view, Qt.Key.Key_N)
         _qt_application.processEvents()
 
         self.assertEqual(
@@ -204,7 +204,7 @@ class GenerationMainIntegrationTests(unittest.TestCase):
             "3D view (first person)",
         )
 
-        QTest.keyClick(self.workspace.viewer.view, Qt.Key.Key_F)
+        QTest.keyClick(self.workspace.viewer.view, Qt.Key.Key_N)
         _qt_application.processEvents()
 
         self.assertEqual(

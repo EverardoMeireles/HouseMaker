@@ -53,6 +53,7 @@ from housemaker.surface_texture_workspace import (
 from housemaker.glb import (
     DEFAULT_WALL_HEIGHT_METERS,
     GeneratedModel,
+    build_stair_meshes,
     convert_to_glb,
     export_glb_file,
     export_room_texture_pngs,
@@ -66,6 +67,7 @@ from housemaker.models import (
     DEFAULT_LEVEL_OFFSET_METERS,
     DEFAULT_LEVEL_SCALE,
     DEFAULT_ROOM_HEIGHT_METERS,
+    DEFAULT_STAIR_STYLE,
     DEFAULT_UV_MAP_HEIGHT,
     DEFAULT_UV_MAP_WIDTH,
     DEFAULT_WALL_UV_ROTATION_DEGREES,
@@ -84,6 +86,11 @@ from housemaker.models import (
     MIN_LEVEL_OFFSET_METERS,
     MIN_LEVEL_SCALE,
     RoomData,
+    STAIR_STYLE_FLOATING,
+    STAIR_STYLE_FLOATING_WITH_RISER,
+    STAIR_STYLE_SUPPORTED,
+    StairData,
+    StairSectionData,
     create_default_doorway_presets,
     create_default_levels,
 )
@@ -221,6 +228,7 @@ class BlueprintWorkspace(QWidget):
         self.doorway_presets: list[DoorwayPreset] = (
             create_default_doorway_presets()
         )
+        self.stairs: list[StairData] = []
         self.initial_first_person_camera: InitialFirstPersonCamera | None = None
         self.current_level_index = GROUND_LEVEL_INDEX
         self._is_syncing_level_controls = False
@@ -460,6 +468,50 @@ class BlueprintWorkspace(QWidget):
         )
         floor_contour_buttons_layout.addWidget(self.clear_floor_contour_button)
         side_layout.addLayout(floor_contour_buttons_layout)
+
+        stairs_label = QLabel("Stairs")
+        stairs_label.setStyleSheet("font-size: 18px; font-weight: 600;")
+        side_layout.addWidget(stairs_label)
+
+        self.stair_style_combo = QComboBox()
+        self.stair_style_combo.addItem("Supported", STAIR_STYLE_SUPPORTED)
+        self.stair_style_combo.addItem("Floating", STAIR_STYLE_FLOATING)
+        self.stair_style_combo.addItem(
+            "Floating with riser",
+            STAIR_STYLE_FLOATING_WITH_RISER,
+        )
+        self.stair_style_combo.setCurrentIndex(0)
+        self.stair_style_combo.setMinimumHeight(34)
+        stair_style_layout = QFormLayout()
+        stair_style_layout.setContentsMargins(0, 0, 0, 0)
+        stair_style_layout.addRow("Stair type", self.stair_style_combo)
+        side_layout.addLayout(stair_style_layout)
+
+        self.stair_status_label = QLabel("Stairs: none")
+        self.stair_status_label.setWordWrap(True)
+        side_layout.addWidget(self.stair_status_label)
+
+        self.add_stairs_button = QPushButton("Add stairs")
+        self.add_stairs_button.setMinimumHeight(40)
+        self.add_stairs_button.clicked.connect(self._handle_add_stairs_clicked)
+        side_layout.addWidget(self.add_stairs_button)
+
+        self.stairs_list = QListWidget()
+        self.stairs_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.stairs_list.setMinimumHeight(86)
+        self.stairs_list.currentRowChanged.connect(
+            self._update_stair_button_state
+        )
+        side_layout.addWidget(self.stairs_list)
+
+        self.delete_selected_stair_button = QPushButton("Delete selected stair")
+        self.delete_selected_stair_button.setMinimumHeight(36)
+        self.delete_selected_stair_button.clicked.connect(
+            self._handle_delete_selected_stair_clicked
+        )
+        side_layout.addWidget(self.delete_selected_stair_button)
 
         first_person_camera_label = QLabel("Initial first person camera")
         first_person_camera_label.setStyleSheet(
@@ -811,7 +863,27 @@ class BlueprintWorkspace(QWidget):
         self.canvas.first_person_camera_changed.connect(
             self._handle_canvas_first_person_camera_changed
         )
+        self.canvas.stair_start_placed.connect(
+            self._handle_stair_start_placed
+        )
+        self.canvas.stair_placement_ready.connect(
+            self._handle_stair_placement_ready
+        )
+        self.canvas.stair_placement_completed.connect(
+            self._handle_stair_placement_completed
+        )
+        self.canvas.stair_placement_cancelled.connect(
+            self._handle_stair_placement_cancelled
+        )
+        self.canvas.stair_placement_invalid_endpoint.connect(
+            self._handle_stair_placement_invalid_endpoint
+        )
+        self.canvas.stair_selected.connect(self._handle_stair_selected)
+        self.canvas.stair_delete_requested.connect(
+            self._handle_stair_delete_requested
+        )
         self._refresh_levels_list()
+        self._refresh_stairs_list()
         self._refresh_room_lists()
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
@@ -1326,6 +1398,7 @@ class BlueprintWorkspace(QWidget):
         try:
             return convert_to_glb(
                 self.levels,
+                stairs=self.stairs,
                 surface_materials=(
                     self.surface_texture_generation.get_surface_material_sources()
                 ),
@@ -1398,6 +1471,7 @@ class BlueprintWorkspace(QWidget):
                     self.surface_texture_generation.get_data()
                 ),
                 initial_first_person_camera=self.initial_first_person_camera,
+                stairs=self.stairs,
             )
         except ValueError as error:
             QMessageBox.critical(self, "Save failed", str(error))
@@ -1671,6 +1745,37 @@ class BlueprintWorkspace(QWidget):
             self.doorway_preset_list.setCurrentRow(selected_index)
         self.doorway_preset_list.blockSignals(False)
         self._update_doorway_preset_button_state()
+
+    def _refresh_stairs_list(self) -> None:
+        """Refresh the cross-level stair records without changing placement."""
+
+        selected_index = self.stairs_list.currentRow()
+        self.stairs_list.blockSignals(True)
+        self.stairs_list.clear()
+        for stair in self.stairs:
+            self.stairs_list.addItem(_format_stair_label(stair))
+        if 0 <= selected_index < self.stairs_list.count():
+            self.stairs_list.setCurrentRow(selected_index)
+        self.stairs_list.blockSignals(False)
+        self._update_stair_button_state()
+
+    def _update_stair_button_state(self, _row: int = -1) -> None:
+        placement_active = self.canvas.is_stair_placement_active()
+        has_complete_endpoints = (
+            self.canvas.get_stair_placement_draft() is not None
+        )
+        self.add_stairs_button.setText(
+            "Confirm stairs" if has_complete_endpoints else "Add stairs"
+        )
+        self.add_stairs_button.setEnabled(
+            not placement_active or has_complete_endpoints
+        )
+        self.stair_style_combo.setEnabled(not placement_active)
+        selected_index = self.stairs_list.currentRow()
+        self.delete_selected_stair_button.setEnabled(
+            not placement_active
+            and 0 <= selected_index < len(self.stairs)
+        )
 
     def _get_selected_doorway_preset(self) -> DoorwayPreset | None:
         selected_index = self.doorway_preset_list.currentRow()
@@ -2213,6 +2318,7 @@ class BlueprintWorkspace(QWidget):
         self.current_level_index = level_index
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
+        self._update_pending_stair_level_status()
         self._refresh_room_lists()
         self._schedule_viewer_preview_refresh()
 
@@ -2294,6 +2400,210 @@ class BlueprintWorkspace(QWidget):
 
     def _handle_doorways_changed(self) -> None:
         self.current_level.doorways = self.canvas.doorways
+        self._schedule_viewer_preview_refresh()
+
+    def _handle_add_stairs_clicked(self) -> None:
+        draft = self.canvas.get_stair_placement_draft()
+        if draft is not None:
+            if self.canvas.is_stair_ready_for_confirmation():
+                try:
+                    stair = _build_stair_data_from_placement(draft)
+                    build_stair_meshes(self.levels, [stair])
+                except (TypeError, ValueError) as error:
+                    self.stair_status_label.setText(
+                        f"Stair not added: {error}"
+                    )
+                    return
+            self.canvas.confirm_stair_placement()
+            return
+        if self.canvas.is_stair_placement_active():
+            return
+
+        if self.canvas.blueprint_image is None:
+            QMessageBox.information(
+                self,
+                "Blueprint required",
+                "Load a blueprint image for this level before placing stairs.",
+            )
+            return
+
+        style = self.stair_style_combo.currentData()
+        self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
+        self.canvas_viewer_tabs.setCurrentWidget(self.canvas)
+        self.canvas.start_stair_placement(
+            DEFAULT_STAIR_STYLE if style is None else str(style)
+        )
+        self._update_stair_button_state()
+        self.stair_status_label.setText(
+            "Click two points to define the stair opening on this level."
+        )
+        QMessageBox.information(
+            self,
+            "Add stairs",
+            "1. Click two points for the stair opening on this level.\n"
+            "2. Select a different level.\n"
+            "3. Click two points for the stair opening on that level.\n"
+            "4. Optionally add two-point curve guides, in order from the "
+            "stair start toward its end.\n"
+            "5. Click Confirm stairs. Backspace removes the latest guide.\n\n"
+            "Points may be placed freely or snapped to existing Canvas "
+            "geometry. Each opening remains attached to its own level when "
+            "that level is scaled or moved. Right-click or Escape cancels "
+            "the entire draft.",
+        )
+
+    def _handle_stair_start_placed(self, placement: object) -> None:
+        start_level_index = _get_stair_placement_value(
+            placement,
+            "start_level_index",
+        )
+        self.stair_status_label.setText(
+            "Stair opening set on "
+            f"{_format_level_name(self.levels, start_level_index)}. "
+            "Select a different level, then click two points for its opening."
+        )
+        self._update_stair_button_state()
+
+    def _handle_stair_placement_ready(self, placement: object) -> None:
+        intermediate_count = len(
+            _get_stair_intermediate_section_payloads(placement)
+        )
+        guide_text = (
+            "No curve guides added yet."
+            if intermediate_count == 0
+            else (
+                f"{intermediate_count} curve guide"
+                f"{'s' if intermediate_count != 1 else ''} added."
+            )
+        )
+        self.stair_status_label.setText(
+            f"Stair endpoints are ready. {guide_text} Add another two-point "
+            "guide or click Confirm stairs. Backspace removes the latest guide."
+        )
+        self._update_stair_button_state()
+
+    def _handle_stair_placement_completed(self, placement: object) -> None:
+        try:
+            stair = _build_stair_data_from_placement(placement)
+        except (TypeError, ValueError) as error:
+            self.stair_status_label.setText(f"Stair not added: {error}")
+            self._update_stair_button_state()
+            return
+
+        try:
+            build_stair_meshes(self.levels, [stair])
+        except ValueError as error:
+            self.stair_status_label.setText(f"Stair not added: {error}")
+            self._update_stair_button_state()
+            return
+
+        self.stairs.append(stair)
+        self.canvas.set_stair_context(self.stairs, self.current_level)
+        self._refresh_stairs_list()
+        self.stairs_list.setCurrentRow(len(self.stairs) - 1)
+        self.stair_status_label.setText(
+            "Added "
+            f"{_format_stair_style_label(stair.style).lower()} stairs from "
+            f"{_format_level_name(self.levels, stair.start_level_index)} to "
+            f"{_format_level_name(self.levels, stair.end_level_index)}."
+        )
+        self._update_stair_button_state()
+        # A stair can extend beyond the previously framed house bounds. Refit
+        # the Canvas 3D view so a successful placement is visible immediately.
+        self._schedule_viewer_preview_refresh(preserve_camera=False)
+
+    def _handle_stair_placement_cancelled(self) -> None:
+        self.stair_status_label.setText("Stair placement cancelled.")
+        self._update_stair_button_state()
+
+    def _handle_stair_placement_invalid_endpoint(self, message: str) -> None:
+        self.stair_status_label.setText(str(message))
+
+    def _update_pending_stair_level_status(self) -> None:
+        pending = self.canvas.get_pending_stair_placement()
+        draft = self.canvas.get_stair_placement_draft()
+        pending_point = self.canvas.get_pending_stair_point()
+        if pending is None and draft is None and pending_point is None:
+            return
+
+        if draft is not None:
+            if pending_point is not None:
+                owner_level_index = _get_stair_placement_value(
+                    pending_point,
+                    "level_index",
+                )
+                if self.current_level.index != owner_level_index:
+                    self.stair_status_label.setText(
+                        "Return to "
+                        f"{_format_level_name(self.levels, owner_level_index)} "
+                        "and place the second point of this curve guide."
+                    )
+                else:
+                    self.stair_status_label.setText(
+                        "Click the second point of this curve guide."
+                    )
+            else:
+                self._handle_stair_placement_ready(draft)
+            return
+
+        if pending_point is not None:
+            owner_level_index = _get_stair_placement_value(
+                pending_point,
+                "level_index",
+            )
+            if self.current_level.index != owner_level_index:
+                self.stair_status_label.setText(
+                    "Return to "
+                    f"{_format_level_name(self.levels, owner_level_index)} "
+                    "and place the second point of this opening."
+                )
+            else:
+                opening_name = "first" if pending is None else "second"
+                self.stair_status_label.setText(
+                    f"Click the second point of the {opening_name} opening."
+                )
+            return
+
+        start_level_index = _get_stair_placement_value(
+            pending,
+            "start_level_index",
+        )
+        if self.current_level.index == start_level_index:
+            self.stair_status_label.setText(
+                "The first opening is complete. Select a different level."
+            )
+            return
+
+        if self.canvas.blueprint_image is None:
+            self.stair_status_label.setText(
+                "Load a blueprint image on this level before placing the "
+                "stair end."
+            )
+            return
+
+        self.stair_status_label.setText(
+            "Click two points for the stair opening on "
+            f"{self.current_level.display_name}."
+        )
+
+    def _handle_stair_selected(self, stair_index: int) -> None:
+        if 0 <= stair_index < self.stairs_list.count():
+            self.stairs_list.setCurrentRow(stair_index)
+
+    def _handle_stair_delete_requested(self, stair_index: int) -> None:
+        self._delete_stair_at_index(stair_index)
+
+    def _handle_delete_selected_stair_clicked(self) -> None:
+        self._delete_stair_at_index(self.stairs_list.currentRow())
+
+    def _delete_stair_at_index(self, stair_index: int) -> None:
+        if not 0 <= stair_index < len(self.stairs):
+            return
+
+        del self.stairs[stair_index]
+        self.canvas.set_stair_context(self.stairs, self.current_level)
+        self._refresh_stairs_list()
+        self.stair_status_label.setText("Stair deleted.")
         self._schedule_viewer_preview_refresh()
 
     def _handle_set_first_person_camera_clicked(self) -> None:
@@ -2723,6 +3033,7 @@ class BlueprintWorkspace(QWidget):
             initial_first_person_camera=(
                 project_data.initial_first_person_camera
             ),
+            stairs=project_data.stairs,
         )
 
     def _apply_project_state(
@@ -2734,6 +3045,7 @@ class BlueprintWorkspace(QWidget):
         generation: GenerationData | None = None,
         surface_texture_generation: SurfaceTextureData | None = None,
         initial_first_person_camera: InitialFirstPersonCamera | None = None,
+        stairs: list[StairData] | None = None,
     ) -> None:
         if (
             self.generation.is_generating
@@ -2744,7 +3056,9 @@ class BlueprintWorkspace(QWidget):
                 "loading another project."
             )
 
+        self.canvas.cancel_stair_placement()
         self.levels = levels
+        self.stairs = list(stairs or [])
         self.initial_first_person_camera = initial_first_person_camera
         self._sync_canvas_viewer_first_person_camera()
         self.image_library_paths = self._normalize_image_library_paths(
@@ -2762,6 +3076,12 @@ class BlueprintWorkspace(QWidget):
             selected_index=0 if self.doorway_presets else -1
         )
         self._refresh_levels_list()
+        self._refresh_stairs_list()
+        self.stair_status_label.setText(
+            "Stairs: none"
+            if not self.stairs
+            else f"Stairs: {len(self.stairs)} loaded."
+        )
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
         self._refresh_room_lists()
@@ -2795,6 +3115,7 @@ class BlueprintWorkspace(QWidget):
             self.initial_first_person_camera,
             self.current_level,
         )
+        self.canvas.set_stair_context(self.stairs, self.current_level)
         self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
         self._update_blueprint_name_label()
         self._schedule_viewer_preview_refresh()
@@ -2818,6 +3139,7 @@ class BlueprintWorkspace(QWidget):
             self.initial_first_person_camera,
             self.current_level,
         )
+        self.canvas.set_stair_context(self.stairs, self.current_level)
         self._update_blueprint_name_label()
         self._sync_first_person_camera_controls()
 
@@ -2956,6 +3278,137 @@ def _format_light_intensity_percent(percent: int) -> str:
 
 
 # ### Text helpers ###
+def _format_stair_label(stair: StairData) -> str:
+    style_label = _format_stair_style_label(stair.style)
+    guide_count = len(stair.intermediate_sections)
+    route_label = (
+        "straight"
+        if guide_count == 0
+        else f"curved, {guide_count} guide{'s' if guide_count != 1 else ''}"
+    )
+    return (
+        f"{style_label}: L{stair.start_level_index} "
+        f"to L{stair.end_level_index} ({route_label})"
+    )
+
+
+def _format_stair_style_label(style: str) -> str:
+    """Return the human-readable name for one persisted stair style."""
+
+    if style == STAIR_STYLE_FLOATING_WITH_RISER:
+        return "Floating with riser"
+    if style == STAIR_STYLE_FLOATING:
+        return "Floating"
+    return "Supported"
+
+
+def _format_level_name(
+    levels: list[LevelData],
+    level_index: object,
+) -> str:
+    for level in levels:
+        if level.index == level_index:
+            return level.display_name
+    return f"L{level_index}"
+
+
+def _get_stair_placement_value(placement: object, name: str) -> object:
+    """Read one Canvas stair-payload field without coupling its model type."""
+
+    value = getattr(placement, name, None)
+    if value is None:
+        raise ValueError(f"Stair placement is missing {name}.")
+    return value
+
+
+def _get_optional_stair_vertex_id(
+    placement: object,
+    name: str,
+) -> int | None:
+    """Read an optional Canvas vertex binding from a stair payload."""
+
+    value = getattr(placement, name, None)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"Stair placement has an invalid {name}.")
+    return int(value)
+
+
+def _get_stair_intermediate_section_payloads(
+    placement: object,
+) -> tuple[object, ...]:
+    """Return the Canvas route controls while accepting straight stairs."""
+
+    value = getattr(placement, "intermediate_sections", ())
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes)):
+        raise ValueError("Stair intermediate sections must be a sequence.")
+    try:
+        return tuple(value)
+    except TypeError as error:
+        raise ValueError(
+            "Stair intermediate sections must be a sequence."
+        ) from error
+
+
+def _build_stair_section_data(section: object) -> StairSectionData:
+    """Convert one Canvas curve-guide payload into persisted stair data."""
+
+    return StairSectionData(
+        level_index=int(_get_stair_placement_value(section, "level_index")),
+        a_x=float(_get_stair_placement_value(section, "a_x")),
+        a_y=float(_get_stair_placement_value(section, "a_y")),
+        b_x=float(_get_stair_placement_value(section, "b_x")),
+        b_y=float(_get_stair_placement_value(section, "b_y")),
+        a_vertex_id=_get_optional_stair_vertex_id(section, "a_vertex_id"),
+        b_vertex_id=_get_optional_stair_vertex_id(section, "b_vertex_id"),
+    )
+
+
+def _build_stair_data_from_placement(placement: object) -> StairData:
+    """Convert a complete Canvas draft into the persistent stair model."""
+
+    return StairData(
+        start_level_index=int(
+            _get_stair_placement_value(placement, "start_level_index")
+        ),
+        end_level_index=int(
+            _get_stair_placement_value(placement, "end_level_index")
+        ),
+        start_a_x=float(_get_stair_placement_value(placement, "start_a_x")),
+        start_a_y=float(_get_stair_placement_value(placement, "start_a_y")),
+        start_b_x=float(_get_stair_placement_value(placement, "start_b_x")),
+        start_b_y=float(_get_stair_placement_value(placement, "start_b_y")),
+        end_a_x=float(_get_stair_placement_value(placement, "end_a_x")),
+        end_a_y=float(_get_stair_placement_value(placement, "end_a_y")),
+        end_b_x=float(_get_stair_placement_value(placement, "end_b_x")),
+        end_b_y=float(_get_stair_placement_value(placement, "end_b_y")),
+        style=str(_get_stair_placement_value(placement, "style")),
+        start_a_vertex_id=_get_optional_stair_vertex_id(
+            placement,
+            "start_a_vertex_id",
+        ),
+        start_b_vertex_id=_get_optional_stair_vertex_id(
+            placement,
+            "start_b_vertex_id",
+        ),
+        end_a_vertex_id=_get_optional_stair_vertex_id(
+            placement,
+            "end_a_vertex_id",
+        ),
+        end_b_vertex_id=_get_optional_stair_vertex_id(
+            placement,
+            "end_b_vertex_id",
+        ),
+        intermediate_sections=tuple(
+            _build_stair_section_data(section)
+            for section in _get_stair_intermediate_section_payloads(placement)
+        ),
+    )
+
+
 def _format_doorway_preset_label(doorway_preset: DoorwayPreset) -> str:
     return (
         f"{doorway_preset.width_meters:.2f} m × "
