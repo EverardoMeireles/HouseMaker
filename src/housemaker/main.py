@@ -1362,11 +1362,23 @@ class BlueprintWorkspace(QWidget):
         viewer = self._active_workspace_3d_viewer()
         if screen is None or viewer is None:
             self._external_viewer_host.restore()
-            self.set_canvas_3d_viewer_external_display_active(False)
+            self._sync_external_3d_workspace_presentations()
             return
         self._external_viewer_host.show_on_screen(viewer, screen)
+        self._sync_external_3d_workspace_presentations()
+
+    def _sync_external_3d_workspace_presentations(self) -> None:
+        """Show each workspace's local replacement for its detached 3D view."""
+
+        hosted_viewer = self._external_viewer_host.viewer
         self.set_canvas_3d_viewer_external_display_active(
-            self._external_viewer_host.viewer is self.viewer
+            hosted_viewer is self.viewer
+        )
+        self.surface_texture_generation.set_external_3d_viewer_active(
+            hosted_viewer is self.surface_texture_generation.surface_view
+        )
+        self.generation.set_external_3d_viewer_active(
+            hosted_viewer is self.generation.object_3d_panel
         )
 
     def _active_workspace_3d_viewer(self) -> QWidget | None:
@@ -1378,7 +1390,7 @@ class BlueprintWorkspace(QWidget):
         if selected_widget is self.surface_texture_generation:
             return self.surface_texture_generation.surface_view
         if selected_widget is self.generation:
-            return self.generation.result_view
+            return self.generation.object_3d_panel
         return None
 
     def _viewer_preview_is_active(self) -> bool:

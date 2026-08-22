@@ -19,7 +19,7 @@ from PIL import Image
 from PySide6.QtWidgets import QApplication
 
 from housemaker.app_settings import ApplicationSettingsStore
-from housemaker.glb import convert_to_glb
+from housemaker.glb import GLTF_Y_UP_TO_Z_UP_TRANSFORM, convert_to_glb
 from housemaker.main import BlueprintWorkspace
 from housemaker.models import (
     DoorwayData,
@@ -187,6 +187,57 @@ def _build_adjacent_room_level_with_doorway() -> tuple[LevelData, str]:
     return level, shared_wall_key
 
 
+def _build_concave_u_room_level() -> tuple[LevelData, RoomData]:
+    vertex_data = VertexData()
+    boundary_ids = tuple(
+        vertex_data.add_vertex(*point).id
+        for point in (
+            (0.0, 0.0),
+            (300.0, 0.0),
+            (300.0, 300.0),
+            (200.0, 300.0),
+            (200.0, 100.0),
+            (100.0, 100.0),
+            (100.0, 300.0),
+            (0.0, 300.0),
+        )
+    )
+    for start_id, end_id in zip(
+        boundary_ids,
+        (*boundary_ids[1:], boundary_ids[0]),
+    ):
+        vertex_data.add_edge(start_id, end_id)
+    center_vertex = vertex_data.add_vertex(50.0, 150.0)
+    room = RoomData(
+        name="U room",
+        vertex_ids=boundary_ids,
+        center_vertex_id=center_vertex.id,
+        color_rgb=(140, 180, 220),
+    )
+    return (
+        LevelData(
+            index=2,
+            name="Ground",
+            vertex_data=vertex_data,
+            rooms=[room],
+            floor_contour_vertex_ids=room.vertex_ids,
+        ),
+        room,
+    )
+
+
+def _build_reversed_plain_wall_level() -> LevelData:
+    vertex_data = VertexData()
+    left_vertex = vertex_data.add_vertex(0.0, 0.0)
+    right_vertex = vertex_data.add_vertex(100.0, 0.0)
+    vertex_data.add_edge(right_vertex.id, left_vertex.id)
+    return LevelData(
+        index=2,
+        name="Ground",
+        vertex_data=vertex_data,
+    )
+
+
 def _solid_png(color: tuple[int, int, int, int]) -> bytes:
     output = BytesIO()
     Image.new("RGBA", (8, 8), color).save(output, format="PNG")
@@ -338,6 +389,55 @@ class SurfaceMaterialGlbTests(unittest.TestCase):
         self.assertEqual(len(model.mesh.faces), len(legacy_model.mesh.faces))
         self.assertEqual(set(model.scene.geometry), set(legacy_model.scene.geometry))
 
+    def test_legacy_plain_wall_id_textures_both_non_coplanar_sides(self) -> None:
+        level = _build_reversed_plain_wall_level()
+        surface_id = "level:2/wall:1:2"
+
+        model = convert_to_glb(
+            [level],
+            surface_materials={surface_id: _solid_png((180, 70, 40, 255))},
+        )
+
+        preview_sides = [
+            surface.mesh
+            for surface in model.preview_textured_surfaces
+            if surface.surface_id == surface_id
+        ]
+        self.assertEqual(len(preview_sides), 2)
+        np.testing.assert_allclose(
+            sorted(float(mesh.vertices[:, 1].mean()) for mesh in preview_sides),
+            (-0.002, 0.002),
+        )
+        np.testing.assert_allclose(
+            sorted(float(mesh.face_normals[:, 1].mean()) for mesh in preview_sides),
+            (-1.0, 1.0),
+        )
+
+        exported_scene = trimesh.load(
+            BytesIO(model.glb_bytes),
+            file_type="glb",
+            force="scene",
+            process=False,
+        )
+        self.assertIsInstance(exported_scene, trimesh.Scene)
+        exported_sides = [
+            mesh.copy()
+            for mesh in exported_scene.geometry.values()
+            if getattr(getattr(mesh.visual, "material", None), "name", "")
+            == f"Surface {surface_id}"
+        ]
+        self.assertEqual(len(exported_sides), 2)
+        for mesh in exported_sides:
+            mesh.apply_transform(GLTF_Y_UP_TO_Z_UP_TRANSFORM)
+        np.testing.assert_allclose(
+            sorted(float(mesh.vertices[:, 1].mean()) for mesh in exported_sides),
+            (-0.002, 0.002),
+        )
+        np.testing.assert_allclose(
+            sorted(float(mesh.face_normals[:, 1].mean()) for mesh in exported_sides),
+            (-1.0, 1.0),
+        )
+
     def test_two_textured_sides_of_shared_wall_use_separate_overlay_planes(
         self,
     ) -> None:
@@ -393,6 +493,46 @@ class SurfaceMaterialGlbTests(unittest.TestCase):
         )
         self.assertTrue(
             np.any(np.isclose(model.preview_untextured_mesh.vertices[:, 0], 2.0))
+        )
+
+    def test_concave_room_exports_generated_texture_on_its_interior_face(
+        self,
+    ) -> None:
+        level, room = _build_concave_u_room_level()
+        surface_id = f"level:2/room:{room.center_vertex_id}/wall:4:5"
+
+        model = convert_to_glb(
+            [level],
+            surface_materials={surface_id: _solid_png((180, 70, 40, 255))},
+        )
+
+        overlay = next(
+            surface.mesh
+            for surface in model.preview_textured_surfaces
+            if surface.surface_id == surface_id
+        )
+        self.assertTrue(np.all(overlay.face_normals[:, 0] > 0.9))
+        self.assertTrue(np.all(overlay.vertices[:, 0] > 4.0))
+
+        exported_scene = trimesh.load(
+            BytesIO(model.glb_bytes),
+            file_type="glb",
+            force="scene",
+            process=False,
+        )
+        self.assertIsInstance(exported_scene, trimesh.Scene)
+        room_mesh = next(
+            mesh
+            for mesh in exported_scene.geometry.values()
+            if getattr(getattr(mesh.visual, "material", None), "name", "")
+            == "L2 Ground U room 1"
+        )
+        inner_wall_faces = np.flatnonzero(
+            np.all(np.isclose(room_mesh.triangles[:, :, 0], 4.0), axis=1)
+        )
+        self.assertEqual(len(inner_wall_faces), 2)
+        self.assertTrue(
+            np.all(room_mesh.face_normals[inner_wall_faces, 0] > 0.9)
         )
 
 
@@ -555,6 +695,27 @@ class SurfaceMaterialWorkspaceTests(unittest.TestCase):
 
 # ### Ordinary viewer tests ###
 class SurfaceMaterialOrdinaryViewerTests(unittest.TestCase):
+    def test_legacy_plain_wall_texture_draws_both_sides_in_canvas(self) -> None:
+        level = _build_reversed_plain_wall_level()
+        surface_id = "level:2/wall:1:2"
+        model = convert_to_glb(
+            [level],
+            surface_materials={surface_id: _solid_png((205, 75, 30, 255))},
+        )
+
+        viewer = GlbViewerWidget()
+        try:
+            viewer.set_model(model)
+
+            self.assertEqual(len(viewer.textured_surface_items), 2)
+            self.assertTrue(
+                all(item.visible() for item in viewer.textured_surface_items)
+            )
+        finally:
+            viewer.close()
+            viewer.deleteLater()
+            _qt_application.processEvents()
+
     def test_neighbor_legacy_wall_stays_on_its_side_of_generated_shared_wall(
         self,
     ) -> None:

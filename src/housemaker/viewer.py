@@ -710,6 +710,32 @@ class TexturedMeshItem(GLGraphicsItem):
         self._resources_uploaded = True
 
 
+class _WireframeOverlayMeshItem(gl.GLMeshItem):
+    """Keep coplanar mesh edges visible over faces and texture previews."""
+
+    def parseMeshData(self):
+        """Prepare edge buffers even when the first frame hides wireframe."""
+
+        draw_edges = self.opts["drawEdges"]
+        self.opts["drawEdges"] = True
+        try:
+            return super().parseMeshData()
+        finally:
+            self.opts["drawEdges"] = draw_edges
+
+    def paint(self) -> None:
+        if not self.opts["drawEdges"]:
+            super().paint()
+            return
+
+        previous_depth_function = int(GL.glGetIntegerv(GL.GL_DEPTH_FUNC))
+        GL.glDepthFunc(GL.GL_LEQUAL)
+        try:
+            super().paint()
+        finally:
+            GL.glDepthFunc(previous_depth_function)
+
+
 class GlbViewerWidget(QWidget):
     """Generated-model viewer with Blender orbit and first-person navigation."""
 
@@ -927,7 +953,7 @@ class GlbViewerWidget(QWidget):
             )
             self.view.addItem(self.textured_mesh_item)
 
-        self.mesh_item = gl.GLMeshItem(
+        self.mesh_item = _WireframeOverlayMeshItem(
             vertexes=vertices,
             faces=faces,
             faceColors=face_colors,

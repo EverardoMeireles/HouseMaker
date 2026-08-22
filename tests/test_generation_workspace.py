@@ -17,6 +17,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 import trimesh
+from PIL import Image
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import QApplication
@@ -42,6 +43,8 @@ from housemaker.glb import GeneratedModel
 from housemaker.meshy_generation import MeshyGenerationResult
 from housemaker.settings_widget import GenerationServiceSettings
 from housemaker.video_source import VideoMetadata
+from trimesh.visual.material import PBRMaterial
+from trimesh.visual.texture import TextureVisuals
 
 
 # ### Module state ###
@@ -51,6 +54,21 @@ _qt_application = QApplication.instance() or QApplication([])
 # ### Fixture helpers ###
 def _test_model() -> GeneratedModel:
     mesh = trimesh.creation.box(extents=(1.0, 0.5, 0.75))
+    scene = trimesh.Scene(mesh)
+    return GeneratedModel(
+        mesh=mesh,
+        scene=scene,
+        glb_bytes=scene.export(file_type="glb"),
+    )
+
+
+def _test_textured_model(color: tuple[int, int, int, int]) -> GeneratedModel:
+    mesh = trimesh.creation.box(extents=(1.0, 0.5, 0.75))
+    texture = Image.new("RGBA", (8, 6), color)
+    mesh.visual = TextureVisuals(
+        uv=np.zeros((len(mesh.vertices), 2), dtype=float),
+        material=PBRMaterial(baseColorTexture=texture),
+    )
     scene = trimesh.Scene(mesh)
     return GeneratedModel(
         mesh=mesh,
@@ -617,6 +635,86 @@ class GenerationWorkspaceTests(unittest.TestCase):
             self.workspace.model_statistics_label.text(),
             "No generated object",
         )
+
+    def test_object_list_selects_saved_models_and_their_texture_atlases(
+        self,
+    ) -> None:
+        self.workspace.shutdown()
+        self.workspace.close()
+        _qt_application.processEvents()
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            asset_directory = Path(temporary_directory) / "generation_assets"
+            asset_directory.mkdir()
+            first_model = _test_textured_model((220, 20, 30, 255))
+            second_model = _test_textured_model((25, 200, 45, 255))
+            (asset_directory / "first.glb").write_bytes(first_model.glb_bytes)
+            (asset_directory / "second.glb").write_bytes(second_model.glb_bytes)
+            data = GenerationData(
+                generated_objects=[
+                    GeneratedObjectRecord(
+                        object_id="first-object",
+                        frame_index=2,
+                        object_name="First chair",
+                        pipeline={},
+                        provider=GENERATION_BACKEND_MESHY,
+                        provider_task_id="first-task",
+                        asset_path="first.glb",
+                    ),
+                    GeneratedObjectRecord(
+                        object_id="second-object",
+                        frame_index=5,
+                        object_name="Second chair",
+                        pipeline={},
+                        provider=GENERATION_BACKEND_MESHY,
+                        provider_task_id="second-task",
+                        asset_path="second.glb",
+                    ),
+                ]
+            )
+            self.workspace = GenerationWorkspace(
+                asset_directory=asset_directory
+            )
+            self.workspace.set_data(data)
+
+            self.assertEqual(self.workspace.generated_objects_list.count(), 2)
+            self.assertEqual(
+                self.workspace.generated_objects_list.currentRow(),
+                1,
+            )
+            self.assertIsNotNone(self.workspace.result_view.model)
+            self.assertEqual(len(self.workspace.texture_view.entries), 2)
+            self.assertEqual(
+                {entry.owner_id for entry in self.workspace.texture_view.entries},
+                {"first-object", "second-object"},
+            )
+            self.assertEqual(
+                self.workspace.texture_view.selected_entry.owner_id,
+                "second-object",
+            )
+            second_color = self.workspace.texture_view.selected_entry.get_image()
+            self.assertEqual(second_color.pixelColor(0, 0).green(), 200)
+
+            self.workspace.generated_objects_list.setCurrentRow(0)
+            _qt_application.processEvents()
+
+            self.assertEqual(
+                self.workspace.texture_view.selected_entry.owner_id,
+                "first-object",
+            )
+            first_color = self.workspace.texture_view.selected_entry.get_image()
+            self.assertEqual(first_color.pixelColor(0, 0).red(), 220)
+
+            self.workspace.set_external_3d_viewer_active(True)
+            self.assertIs(
+                self.workspace.right_view_stack.currentWidget(),
+                self.workspace.texture_view_page,
+            )
+            self.workspace.set_external_3d_viewer_active(False)
+            self.assertIs(
+                self.workspace.right_view_stack.currentWidget(),
+                self.workspace.object_3d_page,
+            )
 
     def test_ambient_slider_updates_generated_object_view_lighting(self) -> None:
         self.workspace.ambient_light_slider.setValue(72)

@@ -7,6 +7,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 # ### Imports ###
+import io
 import shutil
 import tempfile
 import threading
@@ -17,6 +18,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from PIL import Image
 from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import QApplication
 
@@ -122,6 +124,12 @@ def _texture_png() -> bytes:
     if not did_encode:
         raise AssertionError("Unable to build PNG fixture")
     return bytes(encoded)
+
+
+def _colored_texture_png(color: tuple[int, int, int, int]) -> bytes:
+    output = io.BytesIO()
+    Image.new("RGBA", (10, 7), color).save(output, format="PNG")
+    return output.getvalue()
 
 
 def _set_current_mask(
@@ -310,8 +318,106 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         splitter = self.workspace.views_splitter
 
         self.assertIs(splitter.widget(0), self.workspace.video_view.parentWidget())
-        self.assertIs(splitter.widget(1), self.workspace.surface_view.parentWidget())
+        self.assertIs(splitter.widget(1), self.workspace.right_view_stack)
+        self.assertIs(
+            self.workspace.surface_view.parentWidget(),
+            self.workspace.surface_3d_page,
+        )
         self.assertLessEqual(abs(splitter.sizes()[0] - splitter.sizes()[1]), 2)
+
+    def test_texture_view_tracks_latest_selected_surface_assignment(self) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(exist_ok=True)
+        first_png = _colored_texture_png((210, 20, 35, 255))
+        second_png = _colored_texture_png((25, 190, 50, 255))
+        (asset_directory / "first.png").write_bytes(first_png)
+        (asset_directory / "second.png").write_bytes(second_png)
+        surface_id = "level:2/room:5/floor"
+        self.workspace.set_data(
+            SurfaceTextureData(
+                selected_surface_type="floor",
+                selected_surface_ids=(surface_id,),
+                assignments=[
+                    SurfaceTextureAssignment(
+                        assignment_id="first-atlas",
+                        surface_type="floor",
+                        surface_ids=(surface_id,),
+                        provider="meshy",
+                        asset_path="first.png",
+                    ),
+                    SurfaceTextureAssignment(
+                        assignment_id="second-atlas",
+                        surface_type="floor",
+                        surface_ids=(surface_id,),
+                        provider="meshy",
+                        asset_path="second.png",
+                    ),
+                ],
+            )
+        )
+
+        self.assertEqual(len(self.workspace.texture_view.entries), 2)
+        self.assertEqual(
+            self.workspace.texture_view.selected_atlas_id,
+            "second-atlas",
+        )
+        selected_image = self.workspace.texture_view.selected_entry.get_image()
+        self.assertEqual(selected_image.pixelColor(0, 0).green(), 190)
+
+        self.workspace.set_external_3d_viewer_active(True)
+        self.assertIs(
+            self.workspace.right_view_stack.currentWidget(),
+            self.workspace.texture_view_page,
+        )
+        self.workspace.set_external_3d_viewer_active(False)
+        self.assertIs(
+            self.workspace.right_view_stack.currentWidget(),
+            self.workspace.surface_3d_page,
+        )
+
+    def test_texture_view_falls_back_to_latest_valid_surface_atlas(self) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(exist_ok=True)
+        (asset_directory / "valid.png").write_bytes(
+            _colored_texture_png((85, 120, 210, 255))
+        )
+        surface_id = "level:2/room:5/floor"
+        self.workspace.set_data(
+            SurfaceTextureData(
+                selected_surface_type="floor",
+                selected_surface_ids=(surface_id,),
+                assignments=[
+                    SurfaceTextureAssignment(
+                        assignment_id="valid-atlas",
+                        surface_type="floor",
+                        surface_ids=(surface_id,),
+                        provider="meshy",
+                        asset_path="valid.png",
+                    ),
+                    SurfaceTextureAssignment(
+                        assignment_id="missing-atlas",
+                        surface_type="floor",
+                        surface_ids=(surface_id,),
+                        provider="meshy",
+                        asset_path="missing.png",
+                    ),
+                ],
+            )
+        )
+
+        self.assertEqual(
+            [entry.atlas_id for entry in self.workspace.texture_view.entries],
+            ["valid-atlas"],
+        )
+        self.assertEqual(
+            self.workspace.texture_view.selected_atlas_id,
+            "valid-atlas",
+        )
+        cached_entry = self.workspace.texture_view.entries[0]
+
+        self.workspace._handle_surface_selection_changed((surface_id,))
+
+        self.assertIs(self.workspace.texture_view.entries[0], cached_entry)
 
     def test_multiframe_masks_build_request_with_selected_surface_area(self) -> None:
         video_path = self._temporary_path / "walkthrough.avi"

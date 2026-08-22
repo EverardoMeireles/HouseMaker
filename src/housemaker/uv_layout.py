@@ -6,6 +6,9 @@ import random
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 
+import shapely
+from shapely import LineString, Point, Polygon
+
 from housemaker.models import (
     DEFAULT_UV_MAP_HEIGHT,
     DEFAULT_UV_MAP_WIDTH,
@@ -1155,10 +1158,16 @@ def build_room_walls(room: RoomData, vertex_data: VertexData | None) -> list[Roo
         return []
 
     center_point = _get_room_center_point(room, vertex_data, room_vertices)
+    room_polygon = _build_room_boundary_polygon(
+        room_vertices=room_vertices,
+        vertex_data=vertex_data,
+        center_point=center_point,
+    )
     edge_based_walls = _build_room_walls_from_edges(
         room_vertices=room_vertices,
         vertex_data=vertex_data,
         center_point=center_point,
+        room_polygon=room_polygon,
     )
     if edge_based_walls:
         return edge_based_walls
@@ -1173,6 +1182,7 @@ def build_room_walls(room: RoomData, vertex_data: VertexData | None) -> list[Roo
             start_vertex=wall_vertices[index],
             end_vertex=wall_vertices[(index + 1) % len(wall_vertices)],
             center_point=center_point,
+            room_polygon=room_polygon,
         )
         for index in range(len(wall_vertices))
     ]
@@ -1913,6 +1923,7 @@ def _build_room_walls_from_edges(
     room_vertices: list[Vertex],
     vertex_data: VertexData,
     center_point: tuple[float, float],
+    room_polygon: Polygon | None,
 ) -> list[RoomWall]:
     room_vertices_by_id = {vertex.id: vertex for vertex in room_vertices}
     room_vertex_ids = set(room_vertices_by_id)
@@ -1968,6 +1979,7 @@ def _build_room_walls_from_edges(
                 start_vertex=start_vertex,
                 end_vertex=end_vertex,
                 center_point=center_point,
+                room_polygon=room_polygon,
             )
         )
 
@@ -2096,11 +2108,13 @@ def _build_room_wall(
     start_vertex: Vertex,
     end_vertex: Vertex,
     center_point: tuple[float, float],
+    room_polygon: Polygon | None,
 ) -> RoomWall:
-    start_vertex, end_vertex = _orient_wall_vertices_toward_room_center(
+    start_vertex, end_vertex = _orient_wall_vertices_toward_room_interior(
         start_vertex=start_vertex,
         end_vertex=end_vertex,
         center_point=center_point,
+        room_polygon=room_polygon,
     )
     wall_midpoint = (
         (start_vertex.x + end_vertex.x) / 2.0,
@@ -2121,11 +2135,24 @@ def _build_room_wall(
     )
 
 
-def _orient_wall_vertices_toward_room_center(
+def _orient_wall_vertices_toward_room_interior(
     start_vertex: Vertex,
     end_vertex: Vertex,
     center_point: tuple[float, float],
+    room_polygon: Polygon | None,
 ) -> tuple[Vertex, Vertex]:
+    polygon_orientation = _get_wall_polygon_orientation(
+        start_vertex=start_vertex,
+        end_vertex=end_vertex,
+        room_polygon=room_polygon,
+    )
+    if polygon_orientation is not None:
+        return (
+            (start_vertex, end_vertex)
+            if polygon_orientation
+            else (end_vertex, start_vertex)
+        )
+
     wall_midpoint = (
         (start_vertex.x + end_vertex.x) / 2.0,
         (start_vertex.y + end_vertex.y) / 2.0,
@@ -2146,6 +2173,97 @@ def _orient_wall_vertices_toward_room_center(
         return end_vertex, start_vertex
 
     return start_vertex, end_vertex
+
+
+def _get_wall_polygon_orientation(
+    start_vertex: Vertex,
+    end_vertex: Vertex,
+    room_polygon: Polygon | None,
+) -> bool | None:
+    """Return whether the directed wall has the room locally on its left."""
+
+    if room_polygon is None or room_polygon.is_empty:
+        return None
+    wall_delta_x = end_vertex.x - start_vertex.x
+    wall_delta_y = end_vertex.y - start_vertex.y
+    wall_length = math.hypot(wall_delta_x, wall_delta_y)
+    if wall_length <= STRAIGHT_WALL_TOLERANCE:
+        return None
+
+    midpoint_x = (start_vertex.x + end_vertex.x) / 2.0
+    midpoint_y = (start_vertex.y + end_vertex.y) / 2.0
+    left_normal_x = -wall_delta_y / wall_length
+    left_normal_y = wall_delta_x / wall_length
+    for probe_ratio in (1e-7, 1e-6, 1e-5, 1e-4, 1e-3):
+        probe_distance = max(
+            STRAIGHT_WALL_TOLERANCE * 2.0,
+            wall_length * probe_ratio,
+        )
+        left_probe = Point(
+            midpoint_x + left_normal_x * probe_distance,
+            midpoint_y + left_normal_y * probe_distance,
+        )
+        right_probe = Point(
+            midpoint_x - left_normal_x * probe_distance,
+            midpoint_y - left_normal_y * probe_distance,
+        )
+        left_is_inside = room_polygon.contains(left_probe)
+        right_is_inside = room_polygon.contains(right_probe)
+        if left_is_inside != right_is_inside:
+            return left_is_inside
+    return None
+
+
+def _build_room_boundary_polygon(
+    room_vertices: list[Vertex],
+    vertex_data: VertexData,
+    center_point: tuple[float, float],
+) -> Polygon | None:
+    """Build the room polygon from its real boundary edges when available."""
+
+    vertices_by_id = {vertex.id: vertex for vertex in room_vertices}
+    lines = []
+    for edge in vertex_data.edges:
+        start_vertex = vertices_by_id.get(edge.start_vertex_id)
+        end_vertex = vertices_by_id.get(edge.end_vertex_id)
+        if start_vertex is None or end_vertex is None:
+            continue
+        lines.append(
+            LineString(
+                (
+                    (start_vertex.x, start_vertex.y),
+                    (end_vertex.x, end_vertex.y),
+                )
+            )
+        )
+
+    polygon_candidates = [
+        candidate
+        for candidate in shapely.get_parts(shapely.polygonize(lines))
+        if isinstance(candidate, Polygon)
+        and candidate.area > STRAIGHT_WALL_TOLERANCE
+    ]
+    if polygon_candidates:
+        room_center = Point(center_point)
+        containing_candidates = [
+            polygon for polygon in polygon_candidates if polygon.covers(room_center)
+        ]
+        if containing_candidates:
+            return max(containing_candidates, key=lambda polygon: polygon.area)
+        return max(polygon_candidates, key=lambda polygon: polygon.area)
+
+    ordered_vertices = _order_vertices_around_center(room_vertices, center_point)
+    fallback_polygon = Polygon(
+        [(vertex.x, vertex.y) for vertex in ordered_vertices]
+    )
+    if not fallback_polygon.is_valid:
+        repaired_polygon = fallback_polygon.buffer(0)
+        if not isinstance(repaired_polygon, Polygon):
+            return None
+        fallback_polygon = repaired_polygon
+    if fallback_polygon.area <= STRAIGHT_WALL_TOLERANCE:
+        return None
+    return fallback_polygon
 
 
 def _build_wall_key(start_vertex_id: int, end_vertex_id: int) -> str:

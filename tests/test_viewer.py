@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import os
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
+from OpenGL import GL
+import pyqtgraph.opengl as gl
 import trimesh
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -203,6 +205,51 @@ class GlbViewerRenderingTests(unittest.TestCase):
 
         self.assertTrue(viewer.get_wireframe_enabled())
         self.assertTrue(viewer.mesh_item.opts["drawEdges"])
+
+    def test_hidden_initial_wireframe_prepares_edges_for_later_toggle(
+        self,
+    ) -> None:
+        viewer = self._build_viewer(wireframe_enabled=False)
+        viewer.set_model(_build_generated_model(textured=True))
+
+        assert viewer.mesh_item is not None
+        self.assertFalse(viewer.mesh_item.opts["drawEdges"])
+
+        viewer.mesh_item.parseMeshData()
+
+        self.assertFalse(viewer.mesh_item.opts["drawEdges"])
+        self.assertIsNotNone(viewer.mesh_item.edges)
+        self.assertIsNotNone(viewer.mesh_item.edgeVerts)
+
+        viewer.set_wireframe_enabled(True)
+
+        self.assertTrue(viewer.mesh_item.opts["drawEdges"])
+        self.assertGreater(viewer.mesh_item.edges.size, 0)
+
+    def test_wireframe_edges_accept_coplanar_depth_then_restore_gl_state(
+        self,
+    ) -> None:
+        viewer = self._build_viewer(wireframe_enabled=False)
+        viewer.set_model(_build_generated_model(textured=True))
+        viewer.set_wireframe_enabled(True)
+
+        assert viewer.mesh_item is not None
+        with (
+            patch.object(
+                GL,
+                "glGetIntegerv",
+                return_value=GL.GL_LESS,
+            ),
+            patch.object(GL, "glDepthFunc") as depth_function,
+            patch.object(gl.GLMeshItem, "paint") as base_paint,
+        ):
+            viewer.mesh_item.paint()
+
+        base_paint.assert_called_once_with()
+        self.assertEqual(
+            [call.args[0] for call in depth_function.call_args_list],
+            [GL.GL_LEQUAL, GL.GL_LESS],
+        )
 
     def test_viewer_forwards_first_person_navigation_apis(self) -> None:
         viewer = self._build_viewer()

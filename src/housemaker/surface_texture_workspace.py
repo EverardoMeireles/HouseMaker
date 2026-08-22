@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -52,6 +53,7 @@ from housemaker.surface_texture_state import (
     SurfaceTextureData,
 )
 from housemaker.surface_texture_viewer import SurfaceTextureViewer
+from housemaker.texture_atlas_view import TextureAtlasEntry, TextureAtlasView
 from housemaker.video_source import VIDEO_FILE_FILTER, VideoFrameSource, probe_video
 
 
@@ -204,6 +206,10 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._is_syncing_seekbar = False
         self._generation_thread: QThread | None = None
         self._generation_worker: SurfaceTextureWorker | None = None
+        self._texture_atlas_entry_cache: dict[
+            str,
+            tuple[str, TextureAtlasEntry],
+        ] = {}
 
         self._build_ui()
         self._sync_video_controls()
@@ -240,6 +246,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             )
         self._close_video_source()
         self._displayed_frame_index = None
+        self._texture_atlas_entry_cache.clear()
         self._data = SurfaceTextureData() if data is None else data.clone()
         metadata = self._data.video_metadata
         if metadata is not None and Path(metadata.path).exists():
@@ -259,6 +266,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             )
         self._restore_viewer_state()
         self._restore_assignment_textures()
+        self._refresh_texture_atlases()
         self._sync_video_controls()
         if self._video_source is not None:
             self.show_frame(self._data.current_frame_index)
@@ -277,6 +285,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self.surface_view.set_levels(self._levels, initial_camera)
         self._restore_viewer_state()
         self._restore_assignment_textures()
+        self._refresh_texture_atlases()
         self._sync_selection_status()
         self._sync_controls()
 
@@ -289,6 +298,13 @@ class SurfaceTextureGenerationWorkspace(QWidget):
 
     def get_runtime_settings(self) -> GenerationServiceSettings:
         return self._settings
+
+    def set_external_3d_viewer_active(self, is_active: bool) -> None:
+        """Show the local atlas inspector while fixed surfaces are external."""
+
+        self.right_view_stack.setCurrentWidget(
+            self.texture_view_page if is_active else self.surface_3d_page
+        )
 
     def set_provider(
         self,
@@ -406,9 +422,22 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self.surface_view.texture_mask_strokes_changed.connect(
             self._handle_texture_mask_strokes_changed
         )
-        self.views_splitter.addWidget(
-            _build_labeled_view("Fixed surfaces", self.surface_view)
+        self.surface_3d_page = _build_labeled_view(
+            "Fixed surfaces",
+            self.surface_view,
         )
+        self.texture_view = TextureAtlasView()
+        self.texture_view.setObjectName("surface_texture_atlas_view")
+        self.texture_view_page = _build_labeled_view(
+            "Texture view",
+            self.texture_view,
+        )
+        self.right_view_stack = QStackedWidget()
+        self.right_view_stack.setObjectName("surface_texture_right_view_stack")
+        self.right_view_stack.addWidget(self.surface_3d_page)
+        self.right_view_stack.addWidget(self.texture_view_page)
+        self.right_view_stack.setCurrentWidget(self.surface_3d_page)
+        self.views_splitter.addWidget(self.right_view_stack)
         self.views_splitter.setStretchFactor(0, 1)
         self.views_splitter.setStretchFactor(1, 1)
         self.views_splitter.setSizes([1_000, 1_000])
@@ -649,6 +678,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         ):
             self.inpaint_3d_button.setChecked(False)
         self._sync_selection_status()
+        self._refresh_texture_atlases()
         self._emit_data_changed()
         self._sync_controls()
 
@@ -729,6 +759,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             self._data.assignments.append(assignment)
             assignments.append(assignment)
             self.surface_view.set_surface_texture(surface_ids, texture_png)
+        self._refresh_texture_atlases()
         self.surface_view.clear_texture_mask(request.surface_ids)
         self.status_label.setText(
             f"Applied generated texture to {len(request.surface_ids)} "
@@ -859,6 +890,79 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 )
             except (OSError, ValueError):
                 continue
+
+    def _refresh_texture_atlases(self) -> None:
+        entries: list[TextureAtlasEntry] = []
+        valid_assignment_ids: set[str] = set()
+        next_cache: dict[str, tuple[str, TextureAtlasEntry]] = {}
+        for assignment_index, assignment in enumerate(
+            self._data.assignments,
+            start=1,
+        ):
+            try:
+                texture_path = self._resolve_asset_path(assignment.asset_path)
+                if not texture_path.is_file():
+                    continue
+                resolved_path = str(texture_path)
+                cached_entry = self._texture_atlas_entry_cache.get(
+                    assignment.assignment_id
+                )
+                if cached_entry is not None and cached_entry[0] == resolved_path:
+                    entry = cached_entry[1]
+                else:
+                    entry = TextureAtlasEntry(
+                        atlas_id=assignment.assignment_id,
+                        display_name=(
+                            f"#{assignment_index} "
+                            f"{assignment.surface_type.title()} · "
+                            f"{len(assignment.surface_ids)} surface(s)"
+                        ),
+                        image=texture_path,
+                        owner_id=(
+                            assignment.surface_ids[-1]
+                            if assignment.surface_ids
+                            else None
+                        ),
+                    )
+            except (OSError, TypeError, ValueError):
+                continue
+            entries.append(entry)
+            valid_assignment_ids.add(assignment.assignment_id)
+            next_cache[assignment.assignment_id] = (resolved_path, entry)
+        self._texture_atlas_entry_cache = next_cache
+
+        selected_surface_ids = self.surface_view.get_selected_surface_ids()
+        selected_atlas_id = self._latest_selected_surface_assignment_id(
+            valid_assignment_ids
+        )
+        if tuple(entries) != self.texture_view.entries:
+            self.texture_view.set_atlases(
+                entries,
+                selected_atlas_id=selected_atlas_id,
+            )
+        elif selected_atlas_id is not None:
+            self.texture_view.select_atlas(selected_atlas_id)
+        if selected_surface_ids and selected_atlas_id is None:
+            self.texture_view.select_atlas(None)
+
+    def _latest_selected_surface_assignment_id(
+        self,
+        valid_assignment_ids: set[str] | None = None,
+    ) -> str | None:
+        selected_ids = self.surface_view.get_selected_surface_ids()
+        if not selected_ids:
+            return None
+        selected_surface_id = selected_ids[-1]
+        for assignment in reversed(self._data.assignments):
+            if (
+                selected_surface_id in assignment.surface_ids
+                and (
+                    valid_assignment_ids is None
+                    or assignment.assignment_id in valid_assignment_ids
+                )
+            ):
+                return assignment.assignment_id
+        return None
 
     def _persist_texture(self, assignment_id: str, texture_png: bytes) -> str:
         self._asset_directory.mkdir(parents=True, exist_ok=True)

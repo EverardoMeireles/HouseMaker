@@ -126,6 +126,10 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
             self._assert_externally_hosted_viewer_is(
                 self.workspace.surface_texture_generation.surface_view
             )
+            self.assertIs(
+                self.workspace.surface_texture_generation.right_view_stack.currentWidget(),
+                self.workspace.surface_texture_generation.texture_view_page,
+            )
             self.assertFalse(
                 self.workspace.canvas_viewer_tabs.tabBar().isHidden()
             )
@@ -139,13 +143,29 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
                 self.workspace.generation
             )
             self._assert_externally_hosted_viewer_is(
-                self.workspace.generation.result_view
+                self.workspace.generation.object_3d_panel
+            )
+            self.assertIs(
+                self.workspace.generation.right_view_stack.currentWidget(),
+                self.workspace.generation.texture_view_page,
+            )
+            self.assertIs(
+                self.workspace.generation.generated_objects_list.parentWidget(),
+                self.workspace.generation.object_3d_panel,
             )
 
             self.workspace.workspace_tabs.setCurrentWidget(
                 self.workspace.settings_widget
             )
             self.assertFalse(self.workspace._external_viewer_host.is_active)
+            self.assertIs(
+                self.workspace.surface_texture_generation.right_view_stack.currentWidget(),
+                self.workspace.surface_texture_generation.surface_3d_page,
+            )
+            self.assertIs(
+                self.workspace.generation.right_view_stack.currentWidget(),
+                self.workspace.generation.object_3d_page,
+            )
 
             self.workspace.workspace_tabs.setCurrentWidget(
                 self.workspace.canvas_viewer_workspace

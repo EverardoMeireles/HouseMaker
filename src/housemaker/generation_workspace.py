@@ -1,17 +1,20 @@
 # ### Imports ###
 from __future__ import annotations
 
+import hashlib
 import os
-import threading
 import tempfile
+import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 from typing import Protocol
 
 import cv2
 import numpy as np
+from PIL import Image
 from PySide6.QtCore import QObject, QStandardPaths, QThread, Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -19,11 +22,14 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QRadioButton,
     QSlider,
     QSpinBox,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -52,6 +58,7 @@ from housemaker.settings_widget import (
     MESHY_SMART_TOPOLOGY_MIN_TARGET_POLYCOUNT,
     GenerationServiceSettings,
 )
+from housemaker.texture_atlas_view import TextureAtlasEntry, TextureAtlasView
 from housemaker.viewer import GlbViewerWidget
 
 
@@ -65,6 +72,8 @@ CONTROL_STRETCH = 0
 INTERRUPT_POLL_SECONDS = 0.01
 SHUTDOWN_WAIT_MILLISECONDS = 250
 GENERATION_BACKEND_MESHY = "meshy"
+OBJECT_ID_ITEM_ROLE = Qt.ItemDataRole.UserRole
+OBJECT_LIST_MAXIMUM_HEIGHT = 124
 
 
 # ### Generation interfaces ###
@@ -134,6 +143,42 @@ class MeshyModelExecutor:
         if not isinstance(result, MeshyGenerationResult):
             raise TypeError("Meshy returned an invalid generation result.")
         return import_generated_glb(result.glb_bytes)
+
+
+# ### Object viewer panel ###
+class ObjectGenerationViewerPanel(QWidget):
+    """Keep the generated-object selector with its detachable 3D viewer."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        self.viewer = GlbViewerWidget(wireframe_enabled=False)
+        layout.addWidget(self.viewer, 1)
+
+        self.object_list = QListWidget()
+        self.object_list.setObjectName("generated_objects_list")
+        self.object_list.setMaximumHeight(OBJECT_LIST_MAXIMUM_HEIGHT)
+        self.object_list.setAlternatingRowColors(True)
+        self.object_list.setToolTip(
+            "Select which generated Meshy object is shown in the 3D view."
+        )
+        layout.addWidget(self.object_list)
+
+        self.statistics_label = QLabel("No generated object")
+        self.statistics_label.setObjectName("model_statistics_label")
+        self.statistics_label.setWordWrap(True)
+        self.statistics_label.setStyleSheet(
+            "color: #aeb7c5; padding: 2px 4px;"
+        )
+        layout.addWidget(self.statistics_label)
+
+    def focus_navigation(self) -> None:
+        """Forward external-window focus to the actual OpenGL viewer."""
+
+        self.viewer.focus_navigation()
 
 
 # ### Background worker ###
@@ -223,6 +268,12 @@ class GenerationWorkspace(QWidget):
         self._generation_thread: QThread | None = None
         self._generation_worker: GenerationWorker | None = None
         self._generated_model: GeneratedModel | None = None
+        self._generated_model_cache: dict[str, GeneratedModel] = {}
+        self._texture_atlas_entries_by_object_id: dict[
+            str,
+            tuple[TextureAtlasEntry, ...],
+        ] = {}
+        self._selected_object_id: str | None = None
 
         self._build_ui()
         self._sync_video_controls()
@@ -257,7 +308,9 @@ class GenerationWorkspace(QWidget):
             pass
         else:
             self.show_frame(self._data.current_frame_index)
-        self._rebuild_last_generated_object()
+        self._generated_model_cache.clear()
+        self._texture_atlas_entries_by_object_id.clear()
+        self._rebuild_generated_objects()
         self._sync_controls()
 
     def set_runtime_settings(self, settings: GenerationServiceSettings) -> None:
@@ -275,6 +328,13 @@ class GenerationWorkspace(QWidget):
 
     def get_runtime_settings(self) -> GenerationServiceSettings:
         return self._settings
+
+    def set_external_3d_viewer_active(self, is_active: bool) -> None:
+        """Show the local atlas inspector while the 3D panel is external."""
+
+        self.right_view_stack.setCurrentWidget(
+            self.texture_view_page if is_active else self.object_3d_page
+        )
 
     @property
     def is_generating(self) -> bool:
@@ -430,22 +490,30 @@ class GenerationWorkspace(QWidget):
             VIEW_STRETCH,
         )
 
-        result_panel = QWidget()
-        result_layout = QVBoxLayout(result_panel)
-        result_layout.setContentsMargins(0, 0, 0, 0)
-        result_layout.setSpacing(4)
-
-        self.result_view = GlbViewerWidget(wireframe_enabled=False)
-        result_layout.addWidget(self.result_view, 1)
-        self.model_statistics_label = QLabel("No generated object")
-        self.model_statistics_label.setObjectName("model_statistics_label")
-        self.model_statistics_label.setWordWrap(True)
-        self.model_statistics_label.setStyleSheet("color: #aeb7c5; padding: 2px 4px;")
-        result_layout.addWidget(self.model_statistics_label)
-        views_layout.addWidget(
-            _build_labeled_view("Generated 3D object", result_panel),
-            VIEW_STRETCH,
+        self.object_3d_panel = ObjectGenerationViewerPanel()
+        self.result_view = self.object_3d_panel.viewer
+        self.generated_objects_list = self.object_3d_panel.object_list
+        self.model_statistics_label = self.object_3d_panel.statistics_label
+        self.generated_objects_list.currentItemChanged.connect(
+            self._handle_generated_object_selection_changed
         )
+
+        self.object_3d_page = _build_labeled_view(
+            "Generated 3D objects",
+            self.object_3d_panel,
+        )
+        self.texture_view = TextureAtlasView()
+        self.texture_view.setObjectName("object_texture_atlas_view")
+        self.texture_view_page = _build_labeled_view(
+            "Texture view",
+            self.texture_view,
+        )
+        self.right_view_stack = QStackedWidget()
+        self.right_view_stack.setObjectName("object_generation_right_view_stack")
+        self.right_view_stack.addWidget(self.object_3d_page)
+        self.right_view_stack.addWidget(self.texture_view_page)
+        self.right_view_stack.setCurrentWidget(self.object_3d_page)
+        views_layout.addWidget(self.right_view_stack, VIEW_STRETCH)
         root_layout.addWidget(views_widget, 1)
 
         controls_widget = QWidget()
@@ -670,9 +738,13 @@ class GenerationWorkspace(QWidget):
             asset_path=asset_path,
         )
         self._data.generated_objects.append(record)
+        self._generated_model_cache[object_id] = generated_model
+        self._texture_atlas_entries_by_object_id[object_id] = tuple(
+            _build_model_texture_atlas_entries(record, generated_model)
+        )
+        self._selected_object_id = object_id
         self._generated_model = generated_model
-        self.result_view.set_model(generated_model)
-        self._sync_model_statistics(generated_model)
+        self._refresh_generated_objects_list(object_id)
         self.status_label.setText(f"Generated: {object_name}")
         self._emit_data_changed()
         self.generation_completed.emit(record, generated_model)
@@ -791,24 +863,197 @@ class GenerationWorkspace(QWidget):
             return 0
         return min(max(int(frame_index), 0), metadata.frame_count - 1)
 
-    def _rebuild_last_generated_object(self) -> None:
+    @Slot(QListWidgetItem, QListWidgetItem)
+    def _handle_generated_object_selection_changed(
+        self,
+        current_item: QListWidgetItem | None,
+        _previous_item: QListWidgetItem | None,
+    ) -> None:
+        if current_item is None:
+            self._selected_object_id = None
+            self._clear_generated_object_display()
+            return
+        object_id = str(current_item.data(OBJECT_ID_ITEM_ROLE) or "")
+        record = self._find_generated_object_record(object_id)
+        if record is None:
+            self._selected_object_id = None
+            self._clear_generated_object_display()
+            return
+        self._selected_object_id = object_id
+        self._display_generated_object(record)
+
+    def _rebuild_generated_objects(self) -> None:
+        preferred_id = self._selected_object_id
+        if self._find_generated_object_record(preferred_id) is None:
+            preferred_id = (
+                None
+                if not self._data.generated_objects
+                else self._data.generated_objects[-1].object_id
+            )
+        self._refresh_generated_objects_list(preferred_id)
+
+    def _refresh_generated_objects_list(
+        self,
+        selected_object_id: str | None,
+    ) -> None:
+        object_list = self.generated_objects_list
+        was_blocked = object_list.blockSignals(True)
+        try:
+            object_list.clear()
+            selected_row = -1
+            for object_index, record in enumerate(
+                self._data.generated_objects,
+                start=1,
+            ):
+                item = QListWidgetItem(
+                    f"#{object_index} {record.object_name} · "
+                    f"frame {record.frame_index + 1}"
+                )
+                item.setData(OBJECT_ID_ITEM_ROLE, record.object_id)
+                if record.provider_task_id:
+                    item.setToolTip(
+                        f"Meshy task: {record.provider_task_id}"
+                    )
+                object_list.addItem(item)
+                if record.object_id == selected_object_id:
+                    selected_row = object_list.count() - 1
+            if selected_row >= 0:
+                object_list.setCurrentRow(selected_row)
+        finally:
+            object_list.blockSignals(was_blocked)
+
+        if selected_row < 0:
+            self._selected_object_id = None
+            self._clear_generated_object_display()
+            return
+        self._selected_object_id = selected_object_id
+        record = self._find_generated_object_record(selected_object_id)
+        if record is None:
+            self._clear_generated_object_display()
+            return
+        self._display_generated_object(record)
+
+    def _find_generated_object_record(
+        self,
+        object_id: str | None,
+    ) -> GeneratedObjectRecord | None:
+        if not object_id:
+            return None
+        return next(
+            (
+                record
+                for record in self._data.generated_objects
+                if record.object_id == object_id
+            ),
+            None,
+        )
+
+    def _display_generated_object(
+        self,
+        record: GeneratedObjectRecord,
+    ) -> None:
         self._generated_model = None
         self.result_view.clear_model()
         self._sync_model_statistics(None)
-        if not self._data.generated_objects:
-            return
-        record = self._data.generated_objects[-1]
         try:
-            asset_path = self._resolve_meshy_asset_path(record.asset_path)
-            generated_model = import_generated_glb(asset_path.read_bytes())
+            generated_model = self._load_generated_object_model(record)
         except Exception as error:
             self.status_label.setText(
                 f"Saved generated object could not be rebuilt: {error}"
             )
+            self._refresh_object_texture_atlases(record.object_id)
             return
         self._generated_model = generated_model
         self.result_view.set_model(generated_model)
         self._sync_model_statistics(generated_model)
+        self._refresh_object_texture_atlases(
+            record.object_id,
+            generated_model,
+        )
+
+    def _clear_generated_object_display(self) -> None:
+        self._generated_model = None
+        self.result_view.clear_model()
+        self._sync_model_statistics(None)
+        self.texture_view.clear()
+
+    def _refresh_object_texture_atlases(
+        self,
+        selected_object_id: str,
+        selected_model: GeneratedModel | None = None,
+    ) -> None:
+        selected_record = self._find_generated_object_record(selected_object_id)
+        if (
+            selected_record is not None
+            and selected_model is not None
+            and selected_object_id
+            not in self._texture_atlas_entries_by_object_id
+        ):
+            self._texture_atlas_entries_by_object_id[selected_object_id] = tuple(
+                _build_model_texture_atlas_entries(
+                    selected_record,
+                    selected_model,
+                )
+            )
+
+        entries: list[TextureAtlasEntry] = []
+        live_object_ids = {
+            record.object_id for record in self._data.generated_objects
+        }
+        for cached_object_id in tuple(
+            self._texture_atlas_entries_by_object_id
+        ):
+            if cached_object_id not in live_object_ids:
+                self._texture_atlas_entries_by_object_id.pop(
+                    cached_object_id,
+                    None,
+                )
+        for record in self._data.generated_objects:
+            object_entries = self._texture_atlas_entries_by_object_id.get(
+                record.object_id
+            )
+            if object_entries is None:
+                try:
+                    model = self._load_generated_object_model(record)
+                    object_entries = tuple(
+                        _build_model_texture_atlas_entries(record, model)
+                    )
+                except Exception:
+                    object_entries = ()
+                self._texture_atlas_entries_by_object_id[
+                    record.object_id
+                ] = object_entries
+            entries.extend(object_entries)
+
+        selected_atlas_id = next(
+            (
+                entry.atlas_id
+                for entry in entries
+                if entry.owner_id == selected_object_id
+            ),
+            None,
+        )
+        if tuple(entries) != self.texture_view.entries:
+            self.texture_view.set_atlases(
+                entries,
+                selected_atlas_id=selected_atlas_id,
+            )
+        elif selected_atlas_id is not None:
+            self.texture_view.select_atlas(selected_atlas_id)
+        else:
+            self.texture_view.select_atlas(None)
+
+    def _load_generated_object_model(
+        self,
+        record: GeneratedObjectRecord,
+    ) -> GeneratedModel:
+        generated_model = self._generated_model_cache.get(record.object_id)
+        if generated_model is not None:
+            return generated_model
+        asset_path = self._resolve_meshy_asset_path(record.asset_path)
+        generated_model = import_generated_glb(asset_path.read_bytes())
+        self._generated_model_cache[record.object_id] = generated_model
+        return generated_model
 
     def _sync_model_statistics(self, model: GeneratedModel | None) -> None:
         self.model_statistics_label.setText(_format_model_statistics(model))
@@ -955,6 +1200,112 @@ def _default_generation_asset_directory() -> Path:
     )
     base_directory = Path(root) if root else Path.home() / ".housemaker"
     return base_directory / "generated"
+
+
+# ### Texture-atlas helpers ###
+def _build_model_texture_atlas_entries(
+    record: GeneratedObjectRecord,
+    model: GeneratedModel,
+) -> list[TextureAtlasEntry]:
+    """Extract distinct embedded base-color images from every scene material."""
+
+    geometries = list(getattr(model.scene, "geometry", {}).items())
+    if not geometries:
+        geometries = [("mesh", model.mesh)]
+
+    entries: list[TextureAtlasEntry] = []
+    seen_texture_digests: set[str] = set()
+    for geometry_name, geometry in sorted(
+        geometries,
+        key=lambda item: str(item[0]),
+    ):
+        visual = getattr(geometry, "visual", None)
+        material = getattr(visual, "material", None)
+        for material_index, texture_source in enumerate(
+            _iter_material_texture_sources(material),
+            start=1,
+        ):
+            texture_rgba = _decode_texture_rgba(texture_source)
+            if texture_rgba is None:
+                continue
+            digest_input = (
+                np.asarray(texture_rgba.shape, dtype=np.int64).tobytes()
+                + texture_rgba.tobytes()
+            )
+            digest = hashlib.sha256(digest_input).hexdigest()
+            if digest in seen_texture_digests:
+                continue
+            seen_texture_digests.add(digest)
+            geometry_label = str(geometry_name).strip() or "material"
+            try:
+                entry = TextureAtlasEntry(
+                    atlas_id=f"{record.object_id}:{digest[:20]}",
+                    display_name=(
+                        f"{record.object_name} · {geometry_label} "
+                        f"· atlas {material_index}"
+                    ),
+                    image=texture_rgba,
+                    owner_id=record.object_id,
+                )
+            except (TypeError, ValueError):
+                continue
+            entries.append(entry)
+    return entries
+
+
+def _iter_material_texture_sources(material: object) -> list[object]:
+    """Return base-color sources from ordinary and multi-material visuals."""
+
+    if material is None:
+        return []
+    nested_materials = getattr(material, "materials", None)
+    if isinstance(nested_materials, list | tuple):
+        sources: list[object] = []
+        for nested_material in nested_materials:
+            sources.extend(_iter_material_texture_sources(nested_material))
+        return sources
+
+    for attribute_name in ("baseColorTexture", "image"):
+        texture = getattr(material, attribute_name, None)
+        if texture is not None:
+            return [texture]
+    return []
+
+
+def _decode_texture_rgba(texture: object) -> np.ndarray | None:
+    """Decode one trusted in-memory GLB material image into owned RGBA pixels."""
+
+    try:
+        if hasattr(texture, "convert"):
+            rgba = np.asarray(texture.convert("RGBA"), dtype=np.uint8)
+        elif isinstance(texture, bytes | bytearray | memoryview):
+            with Image.open(BytesIO(bytes(texture))) as image:
+                rgba = np.asarray(image.convert("RGBA"), dtype=np.uint8)
+        else:
+            raw_texture = np.asarray(texture)
+            if raw_texture.ndim == 1:
+                with Image.open(BytesIO(raw_texture.tobytes())) as image:
+                    rgba = np.asarray(image.convert("RGBA"), dtype=np.uint8)
+            else:
+                if np.issubdtype(raw_texture.dtype, np.floating):
+                    finite_texture = np.nan_to_num(raw_texture, nan=0.0)
+                    if finite_texture.size and float(np.max(finite_texture)) <= 1.0:
+                        finite_texture = finite_texture * 255.0
+                    raw_texture = finite_texture
+                rgba = np.asarray(np.clip(raw_texture, 0, 255), dtype=np.uint8)
+    except Exception:
+        return None
+
+    if rgba.ndim == 2:
+        rgba = np.repeat(rgba[:, :, np.newaxis], 3, axis=2)
+    if rgba.ndim != 3 or rgba.shape[2] not in {3, 4}:
+        return None
+    if rgba.shape[2] == 3:
+        alpha = np.full((*rgba.shape[:2], 1), 255, dtype=np.uint8)
+        rgba = np.concatenate((rgba, alpha), axis=2)
+    if rgba.shape[0] <= 0 or rgba.shape[1] <= 0:
+        return None
+    return np.ascontiguousarray(rgba)
 
 
 # ### Model-statistics helpers ###

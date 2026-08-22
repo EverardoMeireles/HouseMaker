@@ -62,6 +62,42 @@ def _build_square_level(*, doorway: bool = False, with_room: bool = True) -> Lev
     )
 
 
+def _build_concave_u_level() -> LevelData:
+    vertex_data = VertexData()
+    boundary_ids = tuple(
+        vertex_data.add_vertex(*point).id
+        for point in (
+            (0.0, 0.0),
+            (300.0, 0.0),
+            (300.0, 300.0),
+            (200.0, 300.0),
+            (200.0, 100.0),
+            (100.0, 100.0),
+            (100.0, 300.0),
+            (0.0, 300.0),
+        )
+    )
+    for start_id, end_id in zip(
+        boundary_ids,
+        (*boundary_ids[1:], boundary_ids[0]),
+    ):
+        vertex_data.add_edge(start_id, end_id)
+    center = vertex_data.add_vertex(50.0, 150.0)
+    room = RoomData(
+        name="U room",
+        vertex_ids=boundary_ids,
+        center_vertex_id=center.id,
+        color_rgb=(140, 180, 220),
+    )
+    return LevelData(
+        index=2,
+        name="Ground",
+        vertex_data=vertex_data,
+        rooms=[room],
+        floor_contour_vertex_ids=boundary_ids,
+    )
+
+
 def _surface_by_id(level: LevelData) -> dict[str, object]:
     return {
         surface.surface_id: surface
@@ -200,6 +236,19 @@ class FixedSurfaceGeometryTests(unittest.TestCase):
         np.testing.assert_allclose(
             floor.mesh.bounds,
             np.asarray(((0.25, -3.75, 0.0), (4.25, 0.25, 0.0))),
+        )
+
+    def test_concave_room_wall_normals_point_locally_into_the_room(self) -> None:
+        surfaces = _surface_by_id(_build_concave_u_level())
+
+        right_inner_wall = surfaces["level:2/room:9/wall:4:5"]
+        left_inner_wall = surfaces["level:2/room:9/wall:6:7"]
+
+        self.assertTrue(
+            np.all(right_inner_wall.mesh.face_normals[:, 0] > 0.9)  # type: ignore[attr-defined]
+        )
+        self.assertTrue(
+            np.all(left_inner_wall.mesh.face_normals[:, 0] < -0.9)  # type: ignore[attr-defined]
         )
 
 

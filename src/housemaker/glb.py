@@ -1507,34 +1507,55 @@ def _build_surface_named_meshes(
     for surface in fixed_surfaces:
         surface_id = str(getattr(surface, "surface_id"))
         surface_type = str(getattr(surface, "surface_type"))
-        mesh = getattr(surface, "mesh").copy()
         material = resolved_materials.get(surface_id)
         if material is None:
             continue
-        mesh = build_textured_mesh(
-            mesh,
-            surface_type,
-            material,
-            texture_world_size_meters=texture_world_size_meters,
-            material_name=f"Surface {surface_id}",
-            overlay_offset_meters=0.002,
-        )
-        preview_surfaces.append(
-            PreviewTexturedSurface(
-                surface_id=surface_id,
-                surface_type=surface_type,
-                mesh=mesh.copy(),
-                level_index=getattr(surface, "level_index", None),
-                room_index=getattr(surface, "room_index", None),
-                wall_key=getattr(surface, "wall_key", None),
+
+        source_meshes = [getattr(surface, "mesh").copy()]
+        if surface_type == "wall" and getattr(surface, "room_index", None) is None:
+            source_meshes.append(_build_opposite_winding_mesh(source_meshes[0]))
+
+        object_name = _get_surface_object_name(surface_id)
+        for side_index, source_mesh in enumerate(source_meshes):
+            mesh = build_textured_mesh(
+                source_mesh,
+                surface_type,
+                material,
+                texture_world_size_meters=texture_world_size_meters,
+                material_name=f"Surface {surface_id}",
+                overlay_offset_meters=0.002,
             )
-        )
-        named_mesh = NamedMesh(
-            name=_get_surface_object_name(surface_id),
-            mesh=mesh,
-        )
-        named_meshes.append(named_mesh)
+            preview_surfaces.append(
+                PreviewTexturedSurface(
+                    surface_id=surface_id,
+                    surface_type=surface_type,
+                    mesh=mesh.copy(),
+                    level_index=getattr(surface, "level_index", None),
+                    room_index=getattr(surface, "room_index", None),
+                    wall_key=getattr(surface, "wall_key", None),
+                )
+            )
+            named_meshes.append(
+                NamedMesh(
+                    name=(
+                        object_name
+                        if side_index == 0
+                        else f"{object_name}_opposite_side"
+                    ),
+                    mesh=mesh,
+                )
+            )
     return named_meshes, preview_surfaces
+
+
+def _build_opposite_winding_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    """Copy a surface with every triangle facing the opposite direction."""
+
+    opposite_mesh = mesh.copy()
+    opposite_mesh.faces = np.asarray(opposite_mesh.faces, dtype=np.int64)[
+        :, ::-1
+    ].copy()
+    return opposite_mesh
 
 
 def _get_surface_object_name(surface_id: str) -> str:
@@ -1951,7 +1972,9 @@ def _build_room_mesh(
 
                 vertex_offset = len(vertices)
                 vertices.extend(wall_vertices)
-                faces.extend(_build_wall_faces(vertex_offset))
+                faces.extend(
+                    _build_wall_faces(vertex_offset, double_sided=False)
+                )
                 uv_coordinates.extend(_build_hidden_wall_uv_coordinates())
             continue
 
@@ -1978,7 +2001,9 @@ def _build_room_mesh(
 
                 vertex_offset = len(vertices)
                 vertices.extend(wall_vertices)
-                faces.extend(_build_wall_faces(vertex_offset))
+                faces.extend(
+                    _build_wall_faces(vertex_offset, double_sided=False)
+                )
                 uv_coordinates.extend(
                     _build_wall_piece_uv_coordinates(
                         room=room,
@@ -3021,13 +3046,23 @@ def _get_2d_point_distance(
     )
 
 
-def _build_wall_faces(vertex_offset: int) -> list[list[int]]:
-    return [
+def _build_wall_faces(
+    vertex_offset: int,
+    *,
+    double_sided: bool = True,
+) -> list[list[int]]:
+    faces = [
         [vertex_offset + 0, vertex_offset + 1, vertex_offset + 2],
         [vertex_offset + 0, vertex_offset + 2, vertex_offset + 3],
-        [vertex_offset + 2, vertex_offset + 1, vertex_offset + 0],
-        [vertex_offset + 3, vertex_offset + 2, vertex_offset + 0],
     ]
+    if double_sided:
+        faces.extend(
+            (
+                [vertex_offset + 2, vertex_offset + 1, vertex_offset + 0],
+                [vertex_offset + 3, vertex_offset + 2, vertex_offset + 0],
+            )
+        )
+    return faces
 
 
 def _build_wall_uv_coordinates(
