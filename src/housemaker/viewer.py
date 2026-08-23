@@ -18,7 +18,12 @@ from PySide6.QtWidgets import QLabel, QStackedLayout, QWidget
 from PIL import Image
 
 from housemaker.camera_models import CameraPose
+from housemaker.camera_indicators import (
+    create_unused_face_camera_indicator_items,
+    normalize_unused_face_camera_ids,
+)
 from housemaker.glb import GeneratedModel, PreviewTexturedWall
+from housemaker.unused_face_removal import ALL_CAMERA_IDS
 
 # ### Constants ###
 EDGE_COLOR = (0.12, 0.12, 0.16, 1.0)
@@ -760,10 +765,20 @@ class GlbViewerWidget(QWidget):
         self.textured_surface_items: list[TexturedMeshItem] = []
         self.textured_wall_items: list[gl.GLImageItem] = []
         self.wall_by_item_id: dict[int, PreviewTexturedWall] = {}
+        self.unused_face_camera_indicator_items: dict[
+            str,
+            tuple[GLGraphicsItem, ...],
+        ] = {}
+        self.unused_face_camera_indicator_labels: dict[
+            str,
+            gl.GLTextItem,
+        ] = {}
         self._ambient_light_intensity = DEFAULT_AMBIENT_LIGHT_INTENSITY
         self._textures_enabled = bool(textures_enabled)
         self._wireframe_enabled = bool(wireframe_enabled)
         self._wireframe_only = bool(wireframe_only)
+        self._unused_face_camera_indicators_visible = False
+        self._enabled_unused_face_camera_ids = ALL_CAMERA_IDS
         self._ambient_shader = _build_ambient_shader(
             self._ambient_light_intensity
         )
@@ -920,6 +935,34 @@ class GlbViewerWidget(QWidget):
     def get_wireframe_only(self) -> bool:
         return self._wireframe_only
 
+    def set_unused_face_camera_indicators_visible(self, visible: bool) -> None:
+        """Show or hide the purely illustrative face-check cameras."""
+
+        self._unused_face_camera_indicators_visible = bool(visible)
+        if self._unused_face_camera_indicators_visible:
+            self._ensure_unused_face_camera_indicators()
+            self._sync_unused_face_camera_indicator_visibility()
+        else:
+            self._remove_unused_face_camera_indicators()
+
+    def get_unused_face_camera_indicators_visible(self) -> bool:
+        """Return the requested global visibility for illustrative cameras."""
+
+        return self._unused_face_camera_indicators_visible
+
+    def set_enabled_unused_face_camera_ids(self, camera_ids: object) -> None:
+        """Show indicators for the checked post-processing camera IDs."""
+
+        self._enabled_unused_face_camera_ids = (
+            normalize_unused_face_camera_ids(camera_ids)
+        )
+        self._sync_unused_face_camera_indicator_visibility()
+
+    def get_enabled_unused_face_camera_ids(self) -> tuple[str, ...]:
+        """Return illustrated camera IDs in canonical axis order."""
+
+        return self._enabled_unused_face_camera_ids
+
     def _populate_scene(self) -> None:
         self._clear_scene()
         self._add_grid()
@@ -971,6 +1014,10 @@ class GlbViewerWidget(QWidget):
         bounding_box = self.model.mesh.bounding_box
         center = np.asarray(bounding_box.centroid, dtype=float)
         extent = float(max(bounding_box.extents.max(), 1.0))
+        if self._unused_face_camera_indicators_visible:
+            self._add_unused_face_camera_indicators(
+                np.asarray(bounding_box.bounds, dtype=float)
+            )
 
         self.view.opts["center"] = QVector3D(
             float(center[0]),
@@ -988,6 +1035,67 @@ class GlbViewerWidget(QWidget):
         self.grid_item.setSize(x=20.0, y=20.0)
         self.grid_item.setSpacing(x=1.0, y=1.0)
         self.view.addItem(self.grid_item)
+
+    def _add_unused_face_camera_indicators(self, bounds: np.ndarray) -> None:
+        """Place six non-interactive camera outlines around model bounds."""
+
+        self.unused_face_camera_indicator_items = (
+            create_unused_face_camera_indicator_items(bounds)
+        )
+        self.unused_face_camera_indicator_labels = {
+            camera_id: indicator_items[1]
+            for camera_id, indicator_items in (
+                self.unused_face_camera_indicator_items.items()
+            )
+            if len(indicator_items) > 1
+            and isinstance(indicator_items[1], gl.GLTextItem)
+        }
+        for indicator_items in self.unused_face_camera_indicator_items.values():
+            for indicator_item in indicator_items:
+                self.view.addItem(indicator_item)
+        self._sync_unused_face_camera_indicator_visibility()
+
+    def _ensure_unused_face_camera_indicators(self) -> None:
+        """Lazily add indicators when enabled after a model was displayed."""
+
+        if (
+            not self._unused_face_camera_indicators_visible
+            or self.unused_face_camera_indicator_items
+            or self.model is None
+        ):
+            return
+        mesh = self.model.mesh
+        if len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+            return
+        self._add_unused_face_camera_indicators(
+            np.asarray(mesh.bounding_box.bounds, dtype=float)
+        )
+
+    def _remove_unused_face_camera_indicators(self) -> None:
+        """Remove illustrative items completely from an ordinary viewer."""
+
+        for indicator_items in self.unused_face_camera_indicator_items.values():
+            for indicator_item in indicator_items:
+                indicator_item.setVisible(False)
+                if indicator_item in self.view.items:
+                    self.view.removeItem(indicator_item)
+        self.unused_face_camera_indicator_items = {}
+        self.unused_face_camera_indicator_labels = {}
+        self.view.update()
+
+    def _sync_unused_face_camera_indicator_visibility(self) -> None:
+        enabled_camera_ids = set(self._enabled_unused_face_camera_ids)
+        for camera_id, indicator_items in (
+            self.unused_face_camera_indicator_items.items()
+        ):
+            is_visible = (
+                self._unused_face_camera_indicators_visible
+                and camera_id in enabled_camera_ids
+            )
+            for indicator_item in indicator_items:
+                indicator_item.setVisible(is_visible)
+        if hasattr(self, "view"):
+            self.view.update()
 
     def _add_textured_wall_items(self) -> None:
         if self.model is None:
@@ -1142,6 +1250,8 @@ class GlbViewerWidget(QWidget):
         self.textured_surface_items = []
         self.textured_wall_items = []
         self.wall_by_item_id = {}
+        self.unused_face_camera_indicator_items = {}
+        self.unused_face_camera_indicator_labels = {}
 
     def _capture_camera_state(self) -> dict[str, object]:
         camera_state: dict[str, object] = {}

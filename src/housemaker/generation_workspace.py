@@ -6,8 +6,8 @@ import os
 import tempfile
 import threading
 import uuid
-from collections.abc import Callable
-from dataclasses import replace
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
 from typing import Protocol
@@ -17,9 +17,11 @@ import numpy as np
 from PIL import Image
 from PySide6.QtCore import QObject, QStandardPaths, QThread, Qt, Signal, Slot
 from PySide6.QtWidgets import (
+    QBoxLayout,
     QButtonGroup,
     QCheckBox,
     QFileDialog,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -35,11 +37,6 @@ from PySide6.QtWidgets import (
 )
 from shiboken6 import isValid as is_valid_qt_object
 
-from housemaker.video_source import (
-    VIDEO_FILE_FILTER,
-    VideoFrameSource,
-    probe_video,
-)
 from housemaker.generation_state import (
     MASK_MODE_ERASE,
     MASK_MODE_PAINT,
@@ -51,6 +48,7 @@ from housemaker.glb import GeneratedModel, import_generated_glb
 from housemaker.meshy_generation import (
     MeshyGenerationResult,
     request_image_to_3d_model,
+    request_retextured_model,
 )
 from housemaker.settings_widget import (
     DEFAULT_MESHY_TARGET_POLYCOUNT,
@@ -59,6 +57,18 @@ from housemaker.settings_widget import (
     GenerationServiceSettings,
 )
 from housemaker.texture_atlas_view import TextureAtlasEntry, TextureAtlasView
+from housemaker.unused_face_removal import (
+    ALL_CAMERA_IDS,
+    CAMERA_OPTIONS,
+    UnusedFaceRemovalOptions,
+    UnusedFaceRemovalProgress,
+    remove_unused_faces_from_glb,
+)
+from housemaker.video_source import (
+    VIDEO_FILE_FILTER,
+    VideoFrameSource,
+    probe_video,
+)
 from housemaker.viewer import GlbViewerWidget
 
 
@@ -74,6 +84,18 @@ SHUTDOWN_WAIT_MILLISECONDS = 250
 GENERATION_BACKEND_MESHY = "meshy"
 OBJECT_ID_ITEM_ROLE = Qt.ItemDataRole.UserRole
 OBJECT_LIST_MAXIMUM_HEIGHT = 124
+OBJECT_DETAILS_EXTERNAL_MINIMUM_WIDTH = 320
+OBJECT_DETAILS_EXTERNAL_MAXIMUM_WIDTH = 440
+QT_WIDGET_MAXIMUM_SIZE = 16_777_215
+MESHY_REVISION_GEOMETRY = "geometry"
+MESHY_REVISION_POSTPROCESSED = "postprocessed"
+MESHY_REVISION_NAMES = frozenset(
+    {MESHY_REVISION_GEOMETRY, MESHY_REVISION_POSTPROCESSED}
+)
+MESHY_REVISION_ASSET_PIPELINE_KEYS = (
+    "source_asset_path",
+    "postprocessed_asset_path",
+)
 
 
 # ### Generation interfaces ###
@@ -96,12 +118,34 @@ class GenerationRequest:
         frame_index: int,
         selected_object_bgra: np.ndarray,
         settings: GenerationServiceSettings,
+        enabled_camera_ids: Sequence[str] = ALL_CAMERA_IDS,
     ) -> None:
         self.frame_index = int(frame_index)
         self.selected_object_bgra = np.ascontiguousarray(
             selected_object_bgra
         ).copy()
         self.settings = settings
+        requested_camera_ids = tuple(str(value) for value in enabled_camera_ids)
+        self.enabled_camera_ids = tuple(
+            camera_id
+            for camera_id in ALL_CAMERA_IDS
+            if camera_id in requested_camera_ids
+        )
+
+
+@dataclass(frozen=True)
+class StagedMeshyGenerationResult(MeshyGenerationResult):
+    """Final textured result plus auditable geometry-processing revisions."""
+
+    geometry_task_id: str = ""
+    source_glb_bytes: bytes = b""
+    postprocessed_glb_bytes: bytes = b""
+    original_face_count: int = 0
+    retained_face_count: int = 0
+    removed_face_count: int = 0
+    protected_face_count: int = 0
+    enabled_camera_ids: tuple[str, ...] = ()
+    unused_face_removal_applied: bool = False
 
 
 # ### Default adapters ###
@@ -117,7 +161,10 @@ class MeshyImagePlanner:
         if not request.settings.meshy_api_key:
             raise ValueError("Set a Meshy AI API key in Settings before generating.")
 
-        def report_progress(status: str, progress: int) -> None:
+        _raise_if_generation_cancelled(cancel_event)
+        image_png = _encode_png(request.selected_object_bgra)
+
+        def report_generation_progress(status: str, progress: int) -> None:
             if progress_callback is None:
                 return
             if status == "PENDING":
@@ -127,12 +174,110 @@ class MeshyImagePlanner:
             elif status == "SUCCEEDED":
                 progress_callback("Meshy generation complete. Downloading GLB...")
 
-        return request_image_to_3d_model(
+        use_unused_face_removal = request.settings.unused_face_removal
+        if not use_unused_face_removal:
+            _raise_if_generation_cancelled(cancel_event)
+            return request_image_to_3d_model(
+                api_key=request.settings.meshy_api_key,
+                image_png=image_png,
+                target_polycount=request.settings.meshy_target_polycount,
+                progress_callback=report_generation_progress,
+                cancel_event=cancel_event,
+            )
+
+        if not request.enabled_camera_ids:
+            raise ValueError(
+                "Select at least one post-processing camera before generating."
+            )
+        if progress_callback is not None:
+            progress_callback("Submitting geometry-only Meshy task...")
+        _raise_if_generation_cancelled(cancel_event)
+        geometry_result = request_image_to_3d_model(
             api_key=request.settings.meshy_api_key,
-            image_png=_encode_png(request.selected_object_bgra),
+            image_png=image_png,
             target_polycount=request.settings.meshy_target_polycount,
-            progress_callback=report_progress,
+            progress_callback=report_generation_progress,
             cancel_event=cancel_event,
+            should_texture=False,
+        )
+
+        processed_glb_bytes = geometry_result.glb_bytes
+        original_face_count = 0
+        retained_face_count = 0
+        removed_face_count = 0
+        protected_face_count = 0
+        if use_unused_face_removal:
+            def report_face_removal(
+                update: UnusedFaceRemovalProgress,
+            ) -> None:
+                if progress_callback is None:
+                    return
+                if update.stage == "capturing":
+                    camera_suffix = (
+                        ""
+                        if update.camera_id is None
+                        else f" ({update.camera_id})"
+                    )
+                    progress_callback(
+                        "Capturing unused-face views" + camera_suffix + "..."
+                    )
+                elif update.stage == "checking":
+                    progress_callback(
+                        "Checking faces: "
+                        f"{update.completed_face_count}/"
+                        f"{update.total_face_count}"
+                    )
+                elif update.stage == "exporting":
+                    progress_callback("Saving visible geometry...")
+
+            removed = remove_unused_faces_from_glb(
+                processed_glb_bytes,
+                options=UnusedFaceRemovalOptions(
+                    enabled_camera_ids=request.enabled_camera_ids,
+                ),
+                cancel_requested=(
+                    None if cancel_event is None else cancel_event.is_set
+                ),
+                progress_callback=report_face_removal,
+            )
+            processed_glb_bytes = removed.glb_bytes
+            original_face_count = removed.original_face_count
+            retained_face_count = removed.retained_face_count
+            removed_face_count = removed.removed_face_count
+            protected_face_count = removed.protected_face_count
+
+        def report_texture_progress(status: str, progress: int) -> None:
+            if progress_callback is None:
+                return
+            if status == "PENDING":
+                progress_callback("Meshy texture task queued...")
+            elif status == "IN_PROGRESS":
+                progress_callback(f"Meshy is texturing: {progress}%")
+            elif status == "SUCCEEDED":
+                progress_callback("Meshy texturing complete. Downloading GLB...")
+
+        _raise_if_generation_cancelled(cancel_event)
+        textured_result = request_retextured_model(
+            api_key=request.settings.meshy_api_key,
+            model_glb=processed_glb_bytes,
+            reference_images_png=(image_png,),
+            enable_original_uv=False,
+            progress_callback=report_texture_progress,
+            cancel_event=cancel_event,
+        )
+        return StagedMeshyGenerationResult(
+            task_id=textured_result.task_id,
+            glb_bytes=textured_result.glb_bytes,
+            name=textured_result.name,
+            geometry_task_id=geometry_result.task_id,
+            source_glb_bytes=geometry_result.glb_bytes,
+            postprocessed_glb_bytes=processed_glb_bytes,
+            original_face_count=original_face_count,
+            retained_face_count=retained_face_count,
+            removed_face_count=removed_face_count,
+            protected_face_count=protected_face_count,
+            enabled_camera_ids=request.enabled_camera_ids,
+            unused_face_removal_applied=use_unused_face_removal,
         )
 
 
@@ -149,14 +294,52 @@ class MeshyModelExecutor:
 class ObjectGenerationViewerPanel(QWidget):
     """Keep the generated-object selector with its detachable 3D viewer."""
 
+    camera_selection_changed = Signal()
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        self._is_external_presentation_active = False
+        self._layout = QBoxLayout(QBoxLayout.Direction.TopToBottom, self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(8)
 
         self.viewer = GlbViewerWidget(wireframe_enabled=False)
-        layout.addWidget(self.viewer, 1)
+        self._layout.addWidget(self.viewer, 1)
+
+        self.details_panel = QWidget()
+        self.details_panel.setObjectName("object_generation_details_panel")
+        details_layout = QVBoxLayout(self.details_panel)
+        details_layout.setContentsMargins(0, 0, 0, 0)
+        details_layout.setSpacing(4)
+
+        self.unused_face_camera_controls = QWidget()
+        self.unused_face_camera_controls.setObjectName(
+            "unused_face_camera_controls"
+        )
+        camera_layout = QGridLayout(self.unused_face_camera_controls)
+        camera_layout.setContentsMargins(4, 2, 4, 2)
+        camera_layout.setSpacing(8)
+        self.postprocess_camera_label = QLabel("Post-processing cameras")
+        camera_layout.addWidget(self.postprocess_camera_label, 0, 0, 1, 3)
+        self.unused_face_camera_checkboxes: dict[str, QCheckBox] = {}
+        for index, (camera_id, label) in enumerate(CAMERA_OPTIONS):
+            checkbox = QCheckBox(label)
+            checkbox.setObjectName(
+                f"unused_face_camera_{camera_id}_checkbox"
+            )
+            checkbox.setChecked(True)
+            checkbox.setToolTip(
+                "Use this camera's depth capture when determining which "
+                "generated faces are visible and must be kept. The camera "
+                "marker is illustrative only."
+            )
+            checkbox.toggled.connect(
+                lambda _checked: self.camera_selection_changed.emit()
+            )
+            self.unused_face_camera_checkboxes[camera_id] = checkbox
+            camera_layout.addWidget(checkbox, 1 + index // 3, index % 3)
+        camera_layout.setColumnStretch(3, 1)
+        details_layout.addWidget(self.unused_face_camera_controls)
 
         self.object_list = QListWidget()
         self.object_list.setObjectName("generated_objects_list")
@@ -165,7 +348,17 @@ class ObjectGenerationViewerPanel(QWidget):
         self.object_list.setToolTip(
             "Select which generated Meshy object is shown in the 3D view."
         )
-        layout.addWidget(self.object_list)
+        details_layout.addWidget(self.object_list, 1)
+
+        self.delete_object_button = QPushButton("Delete object")
+        self.delete_object_button.setObjectName(
+            "delete_generated_object_button"
+        )
+        self.delete_object_button.setToolTip(
+            "Permanently delete the selected generated object, its embedded "
+            "textures, and its unreferenced local GLB revisions."
+        )
+        details_layout.addWidget(self.delete_object_button)
 
         self.statistics_label = QLabel("No generated object")
         self.statistics_label.setObjectName("model_statistics_label")
@@ -173,12 +366,56 @@ class ObjectGenerationViewerPanel(QWidget):
         self.statistics_label.setStyleSheet(
             "color: #aeb7c5; padding: 2px 4px;"
         )
-        layout.addWidget(self.statistics_label)
+        details_layout.addWidget(self.statistics_label)
+        self._layout.addWidget(self.details_panel)
 
     def focus_navigation(self) -> None:
         """Forward external-window focus to the actual OpenGL viewer."""
 
         self.viewer.focus_navigation()
+
+    @property
+    def is_external_presentation_active(self) -> bool:
+        """Whether controls are arranged beside the detached 3D viewport."""
+
+        return self._is_external_presentation_active
+
+    def set_external_presentation_active(self, is_active: bool) -> None:
+        """Keep all object controls visible beside an external 3D viewport."""
+
+        is_active = bool(is_active)
+        self._is_external_presentation_active = is_active
+        self._layout.setDirection(
+            QBoxLayout.Direction.LeftToRight
+            if is_active
+            else QBoxLayout.Direction.TopToBottom
+        )
+        self.details_panel.setMinimumWidth(
+            OBJECT_DETAILS_EXTERNAL_MINIMUM_WIDTH if is_active else 0
+        )
+        self.details_panel.setMaximumWidth(
+            OBJECT_DETAILS_EXTERNAL_MAXIMUM_WIDTH
+            if is_active
+            else QT_WIDGET_MAXIMUM_SIZE
+        )
+        self.object_list.setMaximumHeight(
+            QT_WIDGET_MAXIMUM_SIZE
+            if is_active
+            else OBJECT_LIST_MAXIMUM_HEIGHT
+        )
+        self._layout.invalidate()
+
+    def get_enabled_postprocess_camera_ids(self) -> tuple[str, ...]:
+        """Return checked cameras in the canonical processing order."""
+
+        return tuple(
+            camera_id
+            for camera_id in ALL_CAMERA_IDS
+            if self.unused_face_camera_checkboxes[camera_id].isChecked()
+        )
+
+    def set_postprocess_camera_controls_enabled(self, enabled: bool) -> None:
+        self.unused_face_camera_controls.setEnabled(bool(enabled))
 
 
 # ### Background worker ###
@@ -332,6 +569,7 @@ class GenerationWorkspace(QWidget):
     def set_external_3d_viewer_active(self, is_active: bool) -> None:
         """Show the local atlas inspector while the 3D panel is external."""
 
+        self.object_3d_panel.set_external_presentation_active(is_active)
         self.right_view_stack.setCurrentWidget(
             self.texture_view_page if is_active else self.object_3d_page
         )
@@ -339,6 +577,68 @@ class GenerationWorkspace(QWidget):
     @property
     def is_generating(self) -> bool:
         return self._generation_thread is not None
+
+    def delete_selected_generated_object(self) -> bool:
+        """Delete the selected object without showing an interactive prompt."""
+
+        if self._selected_object_id is None:
+            return False
+        return self.delete_generated_object(self._selected_object_id)
+
+    def delete_generated_object(self, object_id: str) -> bool:
+        """Remove one generated object and its unreferenced local assets.
+
+        This programmatic seam deliberately does not show a confirmation
+        dialog. UI callers confirm first. Missing records, active generation,
+        unsafe asset paths, and filesystem cleanup failures never partially
+        remove another object.
+        """
+
+        if self._generation_thread is not None:
+            self.status_label.setText(
+                "Wait for generation to finish before deleting an object."
+            )
+            return False
+        if not isinstance(object_id, str) or not object_id:
+            return False
+        record_index = next(
+            (
+                index
+                for index, record in enumerate(self._data.generated_objects)
+                if record.object_id == object_id
+            ),
+            None,
+        )
+        if record_index is None:
+            return False
+
+        deleted_record = self._data.generated_objects.pop(record_index)
+        self._generated_model_cache.pop(object_id, None)
+        self._texture_atlas_entries_by_object_id.pop(object_id, None)
+        asset_cleanup_failed = self._delete_unreferenced_object_assets(
+            deleted_record
+        )
+
+        preferred_object_id = self._selected_object_id
+        if preferred_object_id == object_id:
+            preferred_object_id = (
+                None
+                if not self._data.generated_objects
+                else self._data.generated_objects[
+                    min(record_index, len(self._data.generated_objects) - 1)
+                ].object_id
+            )
+        self._refresh_generated_objects_list(preferred_object_id)
+        if asset_cleanup_failed:
+            self.status_label.setText(
+                f"Deleted: {deleted_record.object_name}. Some local GLB "
+                "files could not be removed."
+            )
+        else:
+            self.status_label.setText(f"Deleted: {deleted_record.object_name}")
+        self._emit_data_changed()
+        self._sync_controls()
+        return True
 
     def set_meshy_planner(
         self,
@@ -493,9 +793,18 @@ class GenerationWorkspace(QWidget):
         self.object_3d_panel = ObjectGenerationViewerPanel()
         self.result_view = self.object_3d_panel.viewer
         self.generated_objects_list = self.object_3d_panel.object_list
+        self.delete_generated_object_button = (
+            self.object_3d_panel.delete_object_button
+        )
         self.model_statistics_label = self.object_3d_panel.statistics_label
         self.generated_objects_list.currentItemChanged.connect(
             self._handle_generated_object_selection_changed
+        )
+        self.object_3d_panel.camera_selection_changed.connect(
+            self._sync_controls
+        )
+        self.delete_generated_object_button.clicked.connect(
+            self._handle_delete_generated_object_clicked
         )
 
         self.object_3d_page = _build_labeled_view(
@@ -673,6 +982,26 @@ class GenerationWorkspace(QWidget):
         except (RuntimeError, ValueError) as error:
             QMessageBox.critical(self, "Video load failed", str(error))
 
+    @Slot()
+    def _handle_delete_generated_object_clicked(self) -> None:
+        record = self._find_generated_object_record(self._selected_object_id)
+        if record is None or self._generation_thread is not None:
+            return
+        response = QMessageBox.question(
+            self,
+            "Delete generated object",
+            f'Permanently delete "{record.object_name}", its embedded '
+            "textures, and its unreferenced local GLB revisions?",
+            (
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No
+            ),
+            QMessageBox.StandardButton.No,
+        )
+        if response != QMessageBox.StandardButton.Yes:
+            return
+        self.delete_generated_object(record.object_id)
+
     def _handle_seekbar_changed(self, frame_index: int) -> None:
         if self._is_syncing_seekbar or self._generation_thread is not None:
             return
@@ -718,11 +1047,42 @@ class GenerationWorkspace(QWidget):
             return
         object_id = uuid.uuid4().hex
         object_name = result.name
+        pipeline: dict[str, object] = {}
         try:
             asset_path = self._persist_meshy_asset(
                 object_id,
                 result.glb_bytes,
             )
+            if isinstance(result, StagedMeshyGenerationResult):
+                source_asset_path = self._persist_meshy_revision_asset(
+                    object_id,
+                    MESHY_REVISION_GEOMETRY,
+                    result.source_glb_bytes,
+                )
+                postprocessed_asset_path = self._persist_meshy_revision_asset(
+                    object_id,
+                    MESHY_REVISION_POSTPROCESSED,
+                    result.postprocessed_glb_bytes,
+                )
+                pipeline = {
+                    "mode": _staged_generation_mode(result),
+                    "geometry_task_id": result.geometry_task_id,
+                    "source_asset_path": source_asset_path,
+                    "postprocessed_asset_path": postprocessed_asset_path,
+                    "enabled_camera_ids": list(result.enabled_camera_ids),
+                    "unused_face_removal_applied": (
+                        _staged_result_used_face_removal(result)
+                    ),
+                }
+                if _staged_result_used_face_removal(result):
+                    pipeline.update(
+                        {
+                            "original_face_count": result.original_face_count,
+                            "retained_face_count": result.retained_face_count,
+                            "removed_face_count": result.removed_face_count,
+                            "protected_face_count": result.protected_face_count,
+                        }
+                    )
         except OSError as error:
             self._handle_generation_failed(
                 f"The Meshy GLB could not be saved locally: {error}"
@@ -732,7 +1092,7 @@ class GenerationWorkspace(QWidget):
             object_id=object_id,
             frame_index=self._data.current_frame_index,
             object_name=object_name,
-            pipeline={},
+            pipeline=pipeline,
             provider=GENERATION_BACKEND_MESHY,
             provider_task_id=result.task_id,
             asset_path=asset_path,
@@ -745,7 +1105,12 @@ class GenerationWorkspace(QWidget):
         self._selected_object_id = object_id
         self._generated_model = generated_model
         self._refresh_generated_objects_list(object_id)
-        self.status_label.setText(f"Generated: {object_name}")
+        if isinstance(result, StagedMeshyGenerationResult):
+            self.status_label.setText(
+                _format_staged_generation_status(object_name, result)
+            )
+        else:
+            self.status_label.setText(f"Generated: {object_name}")
         self._emit_data_changed()
         self.generation_completed.emit(record, generated_model)
 
@@ -778,6 +1143,9 @@ class GenerationWorkspace(QWidget):
             frame_index=self._data.current_frame_index,
             selected_object_bgra=selected_crop,
             settings=self._settings,
+            enabled_camera_ids=(
+                self.object_3d_panel.get_enabled_postprocess_camera_ids()
+            ),
         )
 
     def _store_current_frame_strokes(self) -> None:
@@ -834,6 +1202,22 @@ class GenerationWorkspace(QWidget):
             has_video and has_mask and not is_generating
         )
         required_key_is_available = bool(self._settings.meshy_api_key)
+        enabled_camera_ids = (
+            self.object_3d_panel.get_enabled_postprocess_camera_ids()
+        )
+        postprocessing_is_enabled = self._settings.unused_face_removal
+        camera_selection_is_valid = (
+            not postprocessing_is_enabled or bool(enabled_camera_ids)
+        )
+        self.object_3d_panel.set_postprocess_camera_controls_enabled(
+            postprocessing_is_enabled and not is_generating
+        )
+        self.result_view.set_enabled_unused_face_camera_ids(
+            enabled_camera_ids
+        )
+        self.result_view.set_unused_face_camera_indicators_visible(
+            postprocessing_is_enabled
+        )
         self.meshy_target_polycount_control.setVisible(True)
         self.meshy_target_polycount_spinbox.setEnabled(
             not is_generating
@@ -841,10 +1225,18 @@ class GenerationWorkspace(QWidget):
         self.ambient_light_slider.setEnabled(not is_generating)
         self.textures_checkbox.setEnabled(not is_generating)
         self.wireframe_checkbox.setEnabled(not is_generating)
+        self.delete_generated_object_button.setEnabled(
+            not is_generating
+            and self._find_generated_object_record(
+                self._selected_object_id
+            )
+            is not None
+        )
         self.generate_button.setEnabled(
             has_video
             and has_mask
             and required_key_is_available
+            and camera_selection_is_valid
             and not is_generating
         )
         self.video_view.set_interaction_enabled(has_video and not is_generating)
@@ -872,15 +1264,18 @@ class GenerationWorkspace(QWidget):
         if current_item is None:
             self._selected_object_id = None
             self._clear_generated_object_display()
+            self._sync_controls()
             return
         object_id = str(current_item.data(OBJECT_ID_ITEM_ROLE) or "")
         record = self._find_generated_object_record(object_id)
         if record is None:
             self._selected_object_id = None
             self._clear_generated_object_display()
+            self._sync_controls()
             return
         self._selected_object_id = object_id
         self._display_generated_object(record)
+        self._sync_controls()
 
     def _rebuild_generated_objects(self) -> None:
         preferred_id = self._selected_object_id
@@ -1059,8 +1454,30 @@ class GenerationWorkspace(QWidget):
         self.model_statistics_label.setText(_format_model_statistics(model))
 
     def _persist_meshy_asset(self, object_id: str, glb_bytes: bytes) -> str:
+        return self._persist_meshy_named_asset(
+            f"{object_id}.glb",
+            glb_bytes,
+        )
+
+    def _persist_meshy_revision_asset(
+        self,
+        object_id: str,
+        revision: str,
+        glb_bytes: bytes,
+    ) -> str:
+        if revision not in MESHY_REVISION_NAMES:
+            raise ValueError("Unknown Meshy revision name.")
+        return self._persist_meshy_named_asset(
+            f"{object_id}.{revision}.glb",
+            glb_bytes,
+        )
+
+    def _persist_meshy_named_asset(
+        self,
+        file_name: str,
+        glb_bytes: bytes,
+    ) -> str:
         self._asset_directory.mkdir(parents=True, exist_ok=True)
-        file_name = f"{object_id}.glb"
         destination = self._asset_directory / file_name
         file_descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{file_name}.",
@@ -1090,6 +1507,57 @@ class GenerationWorkspace(QWidget):
             raise ValueError("The saved Meshy asset path is unsafe.") from error
         return candidate
 
+    def _delete_unreferenced_object_assets(
+        self,
+        deleted_record: GeneratedObjectRecord,
+    ) -> bool:
+        """Unlink safe GLB paths not referenced by any remaining record.
+
+        Returns ``True`` when at least one requested cleanup could not be
+        performed. The generated-object record remains deleted either way.
+        """
+
+        raw_asset_paths = _get_generated_object_asset_paths(deleted_record)
+        if not raw_asset_paths:
+            return False
+        try:
+            asset_root = self._asset_directory.resolve()
+        except OSError:
+            return True
+
+        remaining_asset_identities: set[str] = set()
+        for remaining_record in self._data.generated_objects:
+            for raw_path in _get_generated_object_asset_paths(
+                remaining_record
+            ):
+                safe_asset = _resolve_deletable_asset(
+                    asset_root,
+                    raw_path,
+                )
+                if safe_asset is not None:
+                    _candidate, identity = safe_asset
+                    remaining_asset_identities.add(identity)
+
+        cleanup_failed = False
+        deletion_candidates: dict[str, tuple[Path, str]] = {}
+        for raw_path in raw_asset_paths:
+            safe_asset = _resolve_deletable_asset(asset_root, raw_path)
+            if safe_asset is None:
+                cleanup_failed = True
+                continue
+            candidate, identity = safe_asset
+            candidate_key = os.path.normcase(str(candidate.absolute()))
+            deletion_candidates[candidate_key] = (candidate, identity)
+
+        for candidate, identity in deletion_candidates.values():
+            if identity in remaining_asset_identities:
+                continue
+            try:
+                candidate.unlink(missing_ok=True)
+            except OSError:
+                cleanup_failed = True
+        return cleanup_failed
+
     def _emit_data_changed(self) -> None:
         self.data_changed.emit(self._data.clone())
 
@@ -1099,9 +1567,82 @@ class GenerationWorkspace(QWidget):
         self._video_source = None
 
 
+# ### Staged-generation helpers ###
+def _staged_result_used_face_removal(
+    result: StagedMeshyGenerationResult,
+) -> bool:
+    return bool(
+        result.unused_face_removal_applied
+        or result.original_face_count
+        or result.retained_face_count
+        or result.removed_face_count
+        or result.protected_face_count
+    )
+
+
+def _staged_generation_mode(result: StagedMeshyGenerationResult) -> str:
+    if _staged_result_used_face_removal(result):
+        return "unused_face_removal"
+    return "geometry_then_retexture"
+
+
+def _format_staged_generation_status(
+    object_name: str,
+    result: StagedMeshyGenerationResult,
+) -> str:
+    messages = [f"Generated: {object_name}."]
+    if _staged_result_used_face_removal(result):
+        messages.append(
+            f"Removed {result.removed_face_count} of "
+            f"{result.original_face_count} faces."
+        )
+    return " ".join(messages)
+
+
+# ### Generated-object asset helpers ###
+def _get_generated_object_asset_paths(
+    record: GeneratedObjectRecord,
+) -> tuple[str, ...]:
+    """Return only final and known post-processing GLB path fields."""
+
+    raw_paths: list[str] = []
+    if isinstance(record.asset_path, str) and record.asset_path.strip():
+        raw_paths.append(record.asset_path)
+    for pipeline_key in MESHY_REVISION_ASSET_PIPELINE_KEYS:
+        raw_path = record.pipeline.get(pipeline_key)
+        if isinstance(raw_path, str) and raw_path.strip():
+            raw_paths.append(raw_path)
+    return tuple(dict.fromkeys(raw_paths))
+
+
+def _resolve_deletable_asset(
+    asset_root: Path,
+    raw_path: str,
+) -> tuple[Path, str] | None:
+    """Return a contained GLB unlink path and canonical reference identity."""
+
+    try:
+        candidate = asset_root / raw_path
+        resolved_candidate = candidate.resolve()
+        resolved_candidate.relative_to(asset_root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if candidate.suffix.lower() != ".glb":
+        return None
+    identity = os.path.normcase(str(resolved_candidate))
+    return candidate, identity
+
+
 # ### Adapter helpers ###
 class _GenerationCancelled(Exception):
     """Internal control flow for an abandoned background operation."""
+
+
+def _raise_if_generation_cancelled(
+    cancel_event: threading.Event | None,
+) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise _GenerationCancelled
 
 
 def _run_interruptible_stage(operation: Callable[[], object]) -> object:

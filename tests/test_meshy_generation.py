@@ -22,15 +22,23 @@ from housemaker.meshy_generation import (
     DEFAULT_SMART_TOPOLOGY_TARGET_POLYCOUNT,
     MAX_SMART_TOPOLOGY_TARGET_POLYCOUNT,
     MESHY_IMAGE_TO_3D_ENDPOINT,
+    MESHY_RETEXTURE_ENDPOINT,
     MIN_SMART_TOPOLOGY_TARGET_POLYCOUNT,
+    MULTIVIEW_RETEXTURE_AI_MODEL,
+    SINGLE_IMAGE_RETEXTURE_AI_MODEL,
     MeshyRequestError,
     MeshyTaskError,
     build_image_to_3d_request_body,
+    build_retexture_request_body,
     create_image_to_3d_task,
+    create_retexture_task,
     download_glb,
     get_image_to_3d_task,
+    get_retexture_task,
     request_image_to_3d_model,
+    request_retextured_model,
     wait_for_image_to_3d_task,
+    wait_for_retexture_task,
 )
 from housemaker.viewer import _build_texture_mesh_data
 
@@ -76,6 +84,12 @@ class SequentialOpener:
 # ### Fixture helpers ###
 def _json_bytes(payload: object) -> bytes:
     return json.dumps(payload).encode("utf-8")
+
+
+def _decode_data_uri(data_uri: str, prefix: str) -> bytes:
+    if not data_uri.startswith(prefix):
+        raise AssertionError(f"Expected data URI prefix {prefix!r}")
+    return base64.b64decode(data_uri.removeprefix(prefix))
 
 
 def _valid_glb_bytes() -> bytes:
@@ -163,6 +177,91 @@ class MeshyRequestConstructionTests(unittest.TestCase):
         ):
             self.assertNotIn(incompatible_option, body)
 
+    def test_geometry_only_request_skips_all_texture_options(self) -> None:
+        body = build_image_to_3d_request_body(
+            b"png bytes",
+            should_texture=False,
+        )
+
+        self.assertFalse(body["should_texture"])
+        self.assertFalse(body["moderation"])
+        self.assertEqual(body["target_formats"], ["glb"])
+        self.assertNotIn("texture_resolution", body)
+        self.assertNotIn("enable_pbr", body)
+
+    def test_single_image_retexture_uses_edited_glb_without_task_id(self) -> None:
+        model_glb = b"edited glb"
+        reference_png = b"reference png"
+
+        body = build_retexture_request_body(
+            model_glb=model_glb,
+            reference_images_png=[reference_png],
+        )
+
+        self.assertEqual(
+            _decode_data_uri(
+                body["model_url"],
+                "data:application/octet-stream;base64,",
+            ),
+            model_glb,
+        )
+        self.assertEqual(
+            _decode_data_uri(
+                body["image_style_url"],
+                "data:image/png;base64,",
+            ),
+            reference_png,
+        )
+        self.assertEqual(body["ai_model"], SINGLE_IMAGE_RETEXTURE_AI_MODEL)
+        self.assertEqual(body["texture_resolution"], "2k")
+        self.assertEqual(body["target_formats"], ["glb"])
+        self.assertFalse(body["enable_original_uv"])
+        self.assertFalse(body["enable_pbr"])
+        for forbidden_option in (
+            "input_task_id",
+            "multiview_image_urls",
+            "moderation",
+        ):
+            self.assertNotIn(forbidden_option, body)
+
+    def test_multiview_retexture_preserves_order_and_requires_meshy_7(self) -> None:
+        references = [b"front", b"right", b"back", b"left"]
+
+        body = build_retexture_request_body(
+            model_glb=b"edited glb",
+            reference_images_png=references,
+            enable_original_uv=True,
+        )
+
+        self.assertEqual(body["ai_model"], MULTIVIEW_RETEXTURE_AI_MODEL)
+        self.assertEqual(
+            [
+                _decode_data_uri(uri, "data:image/png;base64,")
+                for uri in body["multiview_image_urls"]
+            ],
+            references,
+        )
+        self.assertTrue(body["enable_original_uv"])
+        self.assertNotIn("image_style_url", body)
+
+    def test_retexture_request_rejects_invalid_binary_inputs_and_image_counts(
+        self,
+    ) -> None:
+        invalid_requests = (
+            (b"", [b"image"]),
+            (b"glb", []),
+            (b"glb", [b"image"] * 5),
+            (b"glb", [b""]),
+        )
+
+        for model_glb, references in invalid_requests:
+            with self.subTest(
+                model_bytes=len(model_glb),
+                reference_count=len(references),
+            ):
+                with self.assertRaises(ValueError):
+                    build_retexture_request_body(model_glb, references)
+
     def test_request_body_accepts_only_the_smart_topology_t2_polycount_range(
         self,
     ) -> None:
@@ -237,6 +336,51 @@ class MeshyRequestConstructionTests(unittest.TestCase):
             request.get_header("Authorization"),
             "Bearer msy-test-secret",
         )
+
+    def test_create_retexture_posts_edited_model_and_get_uses_retexture_endpoint(
+        self,
+    ) -> None:
+        opener = SequentialOpener(
+            [
+                _json_bytes({"result": "retexture-123"}),
+                _json_bytes(
+                    {
+                        "id": "retexture-123",
+                        "status": "IN_PROGRESS",
+                        "progress": 35,
+                    }
+                ),
+            ]
+        )
+
+        task_id = create_retexture_task(
+            api_key="msy-test-secret",
+            model_glb=b"locally edited glb",
+            reference_images_png=[b"front", b"side"],
+            timeout_seconds=7.5,
+            opener=opener,
+        )
+        task = get_retexture_task(
+            api_key="msy-test-secret",
+            task_id=task_id,
+            timeout_seconds=6.5,
+            opener=opener,
+        )
+
+        self.assertEqual(task_id, "retexture-123")
+        self.assertEqual(task["progress"], 35)
+        create_request, get_request = opener.requests
+        self.assertEqual(create_request.full_url, MESHY_RETEXTURE_ENDPOINT)
+        self.assertEqual(create_request.method, "POST")
+        sent_body = json.loads(create_request.data.decode("utf-8"))
+        self.assertIn("model_url", sent_body)
+        self.assertNotIn("input_task_id", sent_body)
+        self.assertEqual(
+            get_request.full_url,
+            f"{MESHY_RETEXTURE_ENDPOINT}/retexture-123",
+        )
+        self.assertEqual(get_request.method, "GET")
+        self.assertEqual(opener.timeouts, [7.5, 6.5])
 
 
 # ### Task polling tests ###
@@ -359,6 +503,71 @@ class MeshyTaskPollingTests(unittest.TestCase):
                         sleep=lambda _seconds: None,
                     )
 
+    def test_retexture_wait_reports_progress_and_redacts_failures(self) -> None:
+        progress_updates: list[tuple[str, int]] = []
+        success_opener = SequentialOpener(
+            [
+                _json_bytes(
+                    {
+                        "id": "retexture-123",
+                        "status": "IN_PROGRESS",
+                        "progress": 48,
+                    }
+                ),
+                _json_bytes(
+                    {
+                        "id": "retexture-123",
+                        "status": "SUCCEEDED",
+                        "progress": 100,
+                        "model_urls": {
+                            "glb": "https://assets.meshy.ai/textured.glb"
+                        },
+                    }
+                ),
+            ]
+        )
+
+        task = wait_for_retexture_task(
+            api_key="msy-test-secret",
+            task_id="retexture-123",
+            poll_interval_seconds=0.0,
+            max_polls=2,
+            opener=success_opener,
+            sleep=lambda _seconds: None,
+            progress_callback=lambda status, progress: progress_updates.append(
+                (status, progress)
+            ),
+        )
+
+        self.assertEqual(task["status"], "SUCCEEDED")
+        self.assertEqual(
+            progress_updates,
+            [("IN_PROGRESS", 48), ("SUCCEEDED", 100)],
+        )
+
+        api_key = "msy-secret-retexture"
+        failure_opener = SequentialOpener(
+            [
+                _json_bytes(
+                    {
+                        "id": "retexture-failed",
+                        "status": "FAILED",
+                        "task_error": {"message": f"Rejected {api_key}"},
+                    }
+                )
+            ]
+        )
+        with self.assertRaises(MeshyTaskError) as raised:
+            wait_for_retexture_task(
+                api_key=api_key,
+                task_id="retexture-failed",
+                max_polls=1,
+                opener=failure_opener,
+                sleep=lambda _seconds: None,
+            )
+        self.assertIn("[redacted]", str(raised.exception))
+        self.assertNotIn(api_key, str(raised.exception))
+
 
 # ### Artifact download tests ###
 class MeshyArtifactDownloadTests(unittest.TestCase):
@@ -431,6 +640,85 @@ class MeshyImageTo3DClientTests(unittest.TestCase):
         self.assertEqual(len(opener.requests), 3)
         submitted_body = json.loads(opener.requests[0].data.decode("utf-8"))
         self.assertEqual(submitted_body["target_polycount"], 5_432)
+
+    def test_geometry_only_client_submits_without_texture_and_downloads_glb(
+        self,
+    ) -> None:
+        geometry_glb = _valid_glb_bytes()
+        opener = SequentialOpener(
+            [
+                _json_bytes({"result": "geometry-123"}),
+                _json_bytes(
+                    {
+                        "id": "geometry-123",
+                        "status": "SUCCEEDED",
+                        "progress": 100,
+                        "model_urls": {
+                            "glb": "https://assets.meshy.ai/geometry.glb"
+                        },
+                    }
+                ),
+                geometry_glb,
+            ]
+        )
+
+        result = request_image_to_3d_model(
+            api_key="msy-test-secret",
+            image_png=b"png bytes",
+            poll_interval_seconds=0.0,
+            max_polls=1,
+            opener=opener,
+            sleep=lambda _seconds: None,
+            should_texture=False,
+        )
+
+        self.assertEqual(result.task_id, "geometry-123")
+        self.assertEqual(result.glb_bytes, geometry_glb)
+        submitted_body = json.loads(opener.requests[0].data.decode("utf-8"))
+        self.assertFalse(submitted_body["should_texture"])
+        self.assertNotIn("texture_resolution", submitted_body)
+
+    def test_retexture_client_creates_polls_and_downloads_final_glb(self) -> None:
+        final_glb = _valid_glb_bytes()
+        progress_updates: list[tuple[str, int]] = []
+        opener = SequentialOpener(
+            [
+                _json_bytes({"result": "retexture-123"}),
+                _json_bytes(
+                    {
+                        "id": "retexture-123",
+                        "status": "SUCCEEDED",
+                        "progress": 100,
+                        "model_urls": {
+                            "glb": "https://assets.meshy.ai/final.glb"
+                        },
+                    }
+                ),
+                final_glb,
+            ]
+        )
+
+        result = request_retextured_model(
+            api_key="msy-test-secret",
+            model_glb=b"locally edited glb",
+            reference_images_png=[b"front", b"side"],
+            poll_interval_seconds=0.0,
+            max_polls=1,
+            opener=opener,
+            sleep=lambda _seconds: None,
+            progress_callback=lambda status, progress: progress_updates.append(
+                (status, progress)
+            ),
+        )
+
+        self.assertEqual(result.task_id, "retexture-123")
+        self.assertEqual(result.glb_bytes, final_glb)
+        self.assertEqual(result.name, "Meshy textured object")
+        self.assertEqual(progress_updates, [("SUCCEEDED", 100)])
+        submitted_body = json.loads(opener.requests[0].data.decode("utf-8"))
+        self.assertIn("model_url", submitted_body)
+        self.assertNotIn("input_task_id", submitted_body)
+        self.assertEqual(submitted_body["ai_model"], "meshy-7")
 
     def test_http_and_network_errors_are_safe_and_retryable_when_expected(
         self,

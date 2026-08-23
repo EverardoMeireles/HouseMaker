@@ -20,7 +20,7 @@ import trimesh
 from PIL import Image
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QSignalSpy, QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from housemaker.generation_state import (
     MASK_MODE_ERASE,
@@ -37,11 +37,17 @@ from housemaker.generation_workspace import (
     GenerationWorker,
     GenerationWorkspace,
     MeshyImagePlanner,
+    StagedMeshyGenerationResult,
     _format_model_statistics,
 )
 from housemaker.glb import GeneratedModel
 from housemaker.meshy_generation import MeshyGenerationResult
 from housemaker.settings_widget import GenerationServiceSettings
+from housemaker.unused_face_removal import (
+    ALL_CAMERA_IDS,
+    UnusedFaceRemovalCancelled,
+    UnusedFaceRemovalResult,
+)
 from housemaker.video_source import VideoMetadata
 from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
@@ -82,6 +88,25 @@ def _test_meshy_result(name: str = "Test chair") -> MeshyGenerationResult:
         task_id="task-test-chair",
         glb_bytes=_test_model().glb_bytes,
         name=name,
+    )
+
+
+def _test_staged_meshy_result(
+    final_model: GeneratedModel | None = None,
+) -> StagedMeshyGenerationResult:
+    final_model = final_model or _test_model()
+    return StagedMeshyGenerationResult(
+        task_id="texture-task-123",
+        glb_bytes=final_model.glb_bytes,
+        name="Post-processed chair",
+        geometry_task_id="geometry-task-123",
+        source_glb_bytes=b"source geometry glb",
+        postprocessed_glb_bytes=b"post-processed geometry glb",
+        original_face_count=120,
+        retained_face_count=80,
+        removed_face_count=40,
+        protected_face_count=80,
+        enabled_camera_ids=("pos_x", "top"),
     )
 
 
@@ -185,6 +210,44 @@ class GenerationStateTests(unittest.TestCase):
         self.assertEqual(loaded, original)
         self.assertIsNot(loaded.frame_strokes, original.frame_strokes)
         self.assertNotIn("api", str(original.to_dict()).lower())
+
+    def test_legacy_simplification_pipeline_round_trip_is_lossless(self) -> None:
+        legacy_pipeline = {
+            "schema_version": 3,
+            "mode": "unused_face_removal_and_rectangular_face_cleanup",
+            "source_asset_path": "chair.source.glb",
+            "postprocessed_asset_path": "chair.postprocessed.glb",
+            "camera_validated_simplification_applied": True,
+            "simplification_input_face_count": 120,
+            "simplified_face_count": 74,
+            "simplification_removed_face_count": 46,
+            "simplification_pixel_tolerance_percent": 0.25,
+            "simplification_detected_rectangle_count": 5,
+            "simplification_accepted_rectangle_count": 4,
+            "simplification_rejected_rectangle_count": 1,
+        }
+        original_record = GeneratedObjectRecord(
+            object_id="legacy-simplified-chair",
+            frame_index=3,
+            object_name="Legacy simplified chair",
+            pipeline=legacy_pipeline,
+            provider=GENERATION_BACKEND_MESHY,
+            provider_task_id="legacy-texture-task",
+            asset_path="chair.glb",
+        )
+        original = GenerationData(generated_objects=[original_record])
+
+        restored = GenerationData.from_dict(original.to_dict())
+
+        self.assertEqual(restored.generated_objects, [original_record])
+        self.assertEqual(
+            restored.generated_objects[0].pipeline,
+            legacy_pipeline,
+        )
+        self.assertIsNot(
+            restored.generated_objects[0].pipeline,
+            original_record.pipeline,
+        )
 
     def test_legacy_procedural_records_are_ignored_on_load(self) -> None:
         loaded = GenerationData.from_dict(
@@ -376,15 +439,26 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
             captured.update(kwargs)
             return _test_meshy_result()
 
-        with patch(
-            "housemaker.generation_workspace.request_image_to_3d_model",
-            side_effect=fake_meshy_request,
+        with (
+            patch(
+                "housemaker.generation_workspace.request_image_to_3d_model",
+                side_effect=fake_meshy_request,
+            ),
+            patch(
+                "housemaker.generation_workspace.remove_unused_faces_from_glb"
+            ) as removal_mock,
+            patch(
+                "housemaker.generation_workspace.request_retextured_model"
+            ) as retexture_mock,
         ):
             result = MeshyImagePlanner().plan(request)
 
         self.assertEqual(result.task_id, "task-test-chair")
         self.assertEqual(captured["api_key"], "meshy-test-key")
         self.assertEqual(captured["target_polycount"], 7_200)
+        self.assertNotIn("should_texture", captured)
+        removal_mock.assert_not_called()
+        retexture_mock.assert_not_called()
         encoded_png = captured["image_png"]
         self.assertIsInstance(encoded_png, bytes)
         decoded = cv2.imdecode(
@@ -393,6 +467,147 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
         )
         self.assertEqual(decoded.shape, selected.shape)
         np.testing.assert_array_equal(decoded, selected)
+
+    def test_staged_planner_generates_geometry_removes_faces_then_textures(
+        self,
+    ) -> None:
+        selected = np.zeros((9, 13, 4), dtype=np.uint8)
+        selected[2:8, 3:11] = (30, 90, 170, 255)
+        selected_camera_ids = ("pos_x", "neg_y", "top")
+        request = GenerationRequest(
+            frame_index=4,
+            selected_object_bgra=selected,
+            settings=GenerationServiceSettings(
+                meshy_api_key="meshy-staged-key",
+                meshy_target_polycount=5_400,
+                unused_face_removal=True,
+            ),
+            enabled_camera_ids=selected_camera_ids,
+        )
+        geometry_model = _test_model()
+        processed_model = _test_model()
+        final_model = _test_model()
+        geometry_result = MeshyGenerationResult(
+            task_id="geometry-task",
+            glb_bytes=geometry_model.glb_bytes,
+            name="Geometry",
+        )
+        textured_result = MeshyGenerationResult(
+            task_id="texture-task",
+            glb_bytes=final_model.glb_bytes,
+            name="Textured chair",
+        )
+        removal_result = UnusedFaceRemovalResult(
+            model=processed_model,
+            enabled_camera_ids=selected_camera_ids,
+            original_face_count=12,
+            retained_face_count=9,
+            removed_face_count=3,
+            protected_face_count=9,
+        )
+        image_calls: list[dict[str, object]] = []
+        removal_calls: list[tuple[bytes, dict[str, object]]] = []
+        texture_calls: list[dict[str, object]] = []
+        progress_messages: list[str] = []
+
+        def fake_image_request(**kwargs: object) -> MeshyGenerationResult:
+            image_calls.append(kwargs)
+            return geometry_result
+
+        def fake_removal(
+            glb_bytes: bytes,
+            **kwargs: object,
+        ) -> UnusedFaceRemovalResult:
+            removal_calls.append((glb_bytes, kwargs))
+            return removal_result
+
+        def fake_retexture_request(**kwargs: object) -> MeshyGenerationResult:
+            texture_calls.append(kwargs)
+            return textured_result
+
+        with (
+            patch(
+                "housemaker.generation_workspace.request_image_to_3d_model",
+                side_effect=fake_image_request,
+            ),
+            patch(
+                "housemaker.generation_workspace.remove_unused_faces_from_glb",
+                side_effect=fake_removal,
+            ),
+            patch(
+                "housemaker.generation_workspace.request_retextured_model",
+                side_effect=fake_retexture_request,
+            ),
+        ):
+            result = MeshyImagePlanner().plan(
+                request,
+                progress_callback=progress_messages.append,
+                cancel_event=threading.Event(),
+            )
+
+        self.assertEqual(len(image_calls), 1)
+        self.assertFalse(image_calls[0]["should_texture"])
+        self.assertEqual(image_calls[0]["target_polycount"], 5_400)
+        self.assertEqual(removal_calls[0][0], geometry_model.glb_bytes)
+        removal_options = removal_calls[0][1]["options"]
+        self.assertEqual(
+            removal_options.enabled_camera_ids,  # type: ignore[union-attr]
+            selected_camera_ids,
+        )
+        self.assertEqual(
+            texture_calls[0]["model_glb"],
+            processed_model.glb_bytes,
+        )
+        self.assertFalse(texture_calls[0]["enable_original_uv"])
+        reference_images = texture_calls[0]["reference_images_png"]
+        self.assertEqual(len(reference_images), 1)  # type: ignore[arg-type]
+        decoded_reference = cv2.imdecode(
+            np.frombuffer(reference_images[0], dtype=np.uint8),  # type: ignore[index]
+            cv2.IMREAD_UNCHANGED,
+        )
+        np.testing.assert_array_equal(decoded_reference, selected)
+        self.assertIsInstance(result, StagedMeshyGenerationResult)
+        self.assertEqual(result.task_id, "texture-task")
+        self.assertEqual(result.geometry_task_id, "geometry-task")
+        self.assertEqual(result.source_glb_bytes, geometry_model.glb_bytes)
+        self.assertEqual(
+            result.postprocessed_glb_bytes,
+            processed_model.glb_bytes,
+        )
+        self.assertEqual(result.removed_face_count, 3)
+        self.assertEqual(result.enabled_camera_ids, selected_camera_ids)
+        self.assertIn("Submitting geometry-only Meshy task...", progress_messages)
+
+    def test_staged_planner_stops_before_retexture_on_removal_cancellation(
+        self,
+    ) -> None:
+        request = GenerationRequest(
+            frame_index=0,
+            selected_object_bgra=np.zeros((4, 4, 4), dtype=np.uint8),
+            settings=GenerationServiceSettings(
+                meshy_api_key="meshy-key",
+                unused_face_removal=True,
+            ),
+            enabled_camera_ids=("pos_x",),
+        )
+
+        with (
+            patch(
+                "housemaker.generation_workspace.request_image_to_3d_model",
+                return_value=_test_meshy_result(),
+            ),
+            patch(
+                "housemaker.generation_workspace.remove_unused_faces_from_glb",
+                side_effect=UnusedFaceRemovalCancelled("cancelled"),
+            ),
+            patch(
+                "housemaker.generation_workspace.request_retextured_model"
+            ) as retexture_mock,
+        ):
+            with self.assertRaises(UnusedFaceRemovalCancelled):
+                MeshyImagePlanner().plan(request)
+
+        retexture_mock.assert_not_called()
 
     def test_worker_invokes_meshy_planner_and_executor(self) -> None:
         planner = _FakeMeshyPlanner()
@@ -527,6 +742,197 @@ class GenerationWorkspaceTests(unittest.TestCase):
             GenerationServiceSettings(meshy_api_key="replacement-key")
         )
         self.assertEqual(spinbox.value(), 5_600)
+
+    def test_unused_face_cameras_default_to_all_and_are_snapshotted_per_request(
+        self,
+    ) -> None:
+        checkboxes = self.workspace.object_3d_panel.unused_face_camera_checkboxes
+        viewer = self.workspace.object_3d_panel.viewer
+
+        self.assertEqual(tuple(checkboxes), ALL_CAMERA_IDS)
+        self.assertTrue(all(checkbox.isChecked() for checkbox in checkboxes.values()))
+        self.assertEqual(
+            self.workspace.object_3d_panel.get_enabled_postprocess_camera_ids(),
+            ALL_CAMERA_IDS,
+        )
+        self.assertFalse(
+            self.workspace.object_3d_panel.unused_face_camera_controls.isEnabled()
+        )
+        self.assertFalse(viewer.get_unused_face_camera_indicators_visible())
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            video_path = Path(temporary_directory) / "source.avi"
+            _write_test_video(video_path, frame_count=1)
+            self.workspace.set_runtime_settings(
+                GenerationServiceSettings(
+                    meshy_api_key="meshy-key",
+                    unused_face_removal=True,
+                )
+            )
+            self.workspace.load_video(str(video_path))
+            self.workspace.video_view.set_strokes([_test_stroke()])
+            self.workspace._handle_video_strokes_changed(
+                self.workspace.video_view.get_strokes()
+            )
+            viewer.set_model(_test_model())
+
+            self.assertTrue(viewer.get_unused_face_camera_indicators_visible())
+            self.assertEqual(
+                viewer.get_enabled_unused_face_camera_ids(),
+                ALL_CAMERA_IDS,
+            )
+            self.assertTrue(
+                all(
+                    item.visible()
+                    for camera_items in (
+                        viewer.unused_face_camera_indicator_items.values()
+                    )
+                    for item in camera_items
+                )
+            )
+
+            checkboxes["neg_x"].setChecked(False)
+            checkboxes["bottom"].setChecked(False)
+
+            expected_camera_ids = tuple(
+                camera_id
+                for camera_id in ALL_CAMERA_IDS
+                if camera_id not in {"neg_x", "bottom"}
+            )
+            self.assertTrue(
+                self.workspace.object_3d_panel.unused_face_camera_controls.isEnabled()
+            )
+            request = self.workspace._build_generation_request()
+            self.assertIsNotNone(request)
+            self.assertEqual(
+                request.enabled_camera_ids,  # type: ignore[union-attr]
+                expected_camera_ids,
+            )
+            self.assertEqual(
+                viewer.get_enabled_unused_face_camera_ids(),
+                expected_camera_ids,
+            )
+            self.assertTrue(
+                all(
+                    item.visible()
+                    == (camera_id in expected_camera_ids)
+                    for camera_id, camera_items in (
+                        viewer.unused_face_camera_indicator_items.items()
+                    )
+                    for item in camera_items
+                )
+            )
+
+            checkboxes["pos_x"].setChecked(False)
+            self.assertEqual(
+                request.enabled_camera_ids,  # type: ignore[union-attr]
+                expected_camera_ids,
+            )
+            self.assertNotEqual(
+                viewer.get_enabled_unused_face_camera_ids(),
+                request.enabled_camera_ids,  # type: ignore[union-attr]
+            )
+            for checkbox in checkboxes.values():
+                checkbox.setChecked(False)
+            generate_is_enabled = self.workspace.generate_button.isEnabled()
+            self.workspace.shutdown()
+            self.assertFalse(generate_is_enabled)
+
+    def test_staged_success_persists_all_revisions_and_task_provenance(
+        self,
+    ) -> None:
+        self.workspace.shutdown()
+        self.workspace.close()
+        _qt_application.processEvents()
+
+        final_model = _test_model()
+        staged_result = _test_staged_meshy_result(final_model)
+        meshy_planner = _FakeMeshyPlanner(staged_result)
+        meshy_executor = _FakeMeshyExecutor(final_model)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            asset_directory = temporary_path / "generation_assets"
+            video_path = temporary_path / "source.avi"
+            _write_test_video(video_path, frame_count=1)
+            self.workspace = GenerationWorkspace(
+                meshy_planner=meshy_planner,
+                meshy_executor=meshy_executor,
+                asset_directory=asset_directory,
+            )
+            self.workspace.show()
+            self.workspace.set_runtime_settings(
+                GenerationServiceSettings(
+                    meshy_api_key="meshy-key",
+                    unused_face_removal=True,
+                )
+            )
+            self.workspace.load_video(str(video_path))
+            self.workspace.video_view.set_strokes([_test_stroke()])
+            self.workspace._handle_video_strokes_changed(
+                self.workspace.video_view.get_strokes()
+            )
+            completed_spy = QSignalSpy(self.workspace.generation_completed)
+
+            self.workspace.generate()
+
+            deadline = time.monotonic() + 3.0
+            while completed_spy.count() == 0 and time.monotonic() < deadline:
+                _qt_application.processEvents()
+                QTest.qWait(5)
+            self.assertEqual(completed_spy.count(), 1)
+            while self.workspace.is_generating and time.monotonic() < deadline:
+                _qt_application.processEvents()
+                QTest.qWait(5)
+            self.assertFalse(self.workspace.is_generating)
+            self.assertEqual(len(meshy_planner.requests), 1)
+            self.assertTrue(
+                meshy_planner.requests[0].settings.unused_face_removal
+            )
+            self.assertEqual(
+                meshy_planner.requests[0].enabled_camera_ids,
+                ALL_CAMERA_IDS,
+            )
+            self.assertEqual(meshy_executor.results, [staged_result])
+            self.assertIs(self.workspace.result_view.model, final_model)
+
+            saved_data = self.workspace.get_data()
+            self.assertEqual(len(saved_data.generated_objects), 1)
+            record = saved_data.generated_objects[0]
+            self.assertEqual(record.provider_task_id, "texture-task-123")
+            self.assertEqual(record.pipeline["mode"], "unused_face_removal")
+            self.assertEqual(
+                record.pipeline["geometry_task_id"],
+                "geometry-task-123",
+            )
+            self.assertEqual(
+                record.pipeline["enabled_camera_ids"],
+                ["pos_x", "top"],
+            )
+            self.assertEqual(record.pipeline["removed_face_count"], 40)
+            self.assertEqual(record.pipeline["retained_face_count"], 80)
+            self.assertEqual(
+                (asset_directory / str(record.asset_path)).read_bytes(),
+                final_model.glb_bytes,
+            )
+            self.assertEqual(
+                (
+                    asset_directory
+                    / str(record.pipeline["source_asset_path"])
+                ).read_bytes(),
+                staged_result.source_glb_bytes,
+            )
+            self.assertEqual(
+                (
+                    asset_directory
+                    / str(record.pipeline["postprocessed_asset_path"])
+                ).read_bytes(),
+                staged_result.postprocessed_glb_bytes,
+            )
+            restored_data = GenerationData.from_dict(saved_data.to_dict())
+            self.assertEqual(restored_data.generated_objects[0], record)
+            self.assertIn("Removed 40 of 120 faces", self.workspace.status_label.text())
+            self.workspace.shutdown()
 
     def test_meshy_success_displays_saves_persists_and_rebuilds_glb(self) -> None:
         self.workspace.shutdown()
@@ -745,6 +1151,311 @@ class GenerationWorkspaceTests(unittest.TestCase):
 
         self.assertEqual(completed_spy.count(), 0)
         self.assertEqual(self.workspace.get_data().generated_objects, [])
+
+
+# ### Generated-object deletion tests ###
+class GeneratedObjectDeletionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.asset_directory = (
+            Path(self.temporary_directory.name) / "generation_assets"
+        )
+        self.asset_directory.mkdir()
+        self.workspace = GenerationWorkspace(
+            asset_directory=self.asset_directory
+        )
+        self.workspace.resize(900, 600)
+        self.workspace.show()
+        _qt_application.processEvents()
+
+    def tearDown(self) -> None:
+        self.workspace.shutdown()
+        self.workspace.close()
+        _qt_application.processEvents()
+        self.temporary_directory.cleanup()
+
+    def _set_generated_objects(
+        self,
+        object_specs: list[tuple[str, str, tuple[int, int, int, int]]],
+    ) -> list[GeneratedObjectRecord]:
+        records: list[GeneratedObjectRecord] = []
+        for frame_index, (object_id, name, color) in enumerate(object_specs):
+            model = _test_textured_model(color)
+            asset_path = f"{object_id}.glb"
+            (self.asset_directory / asset_path).write_bytes(model.glb_bytes)
+            records.append(
+                GeneratedObjectRecord(
+                    object_id=object_id,
+                    frame_index=frame_index,
+                    object_name=name,
+                    pipeline={},
+                    provider=GENERATION_BACKEND_MESHY,
+                    provider_task_id=f"task-{object_id}",
+                    asset_path=asset_path,
+                )
+            )
+        self.workspace.set_data(GenerationData(generated_objects=records))
+        _qt_application.processEvents()
+        return records
+
+    def test_delete_button_is_visible_and_requires_a_selected_object(
+        self,
+    ) -> None:
+        button = self.workspace.delete_generated_object_button
+
+        self.assertIs(
+            button,
+            self.workspace.object_3d_panel.delete_object_button,
+        )
+        self.assertEqual(button.text(), "Delete object")
+        self.assertTrue(button.isVisible())
+        self.assertFalse(button.isEnabled())
+
+        self._set_generated_objects(
+            [("chair", "Chair", (180, 30, 20, 255))]
+        )
+        self.assertTrue(button.isEnabled())
+
+        self.workspace.generated_objects_list.setCurrentRow(-1)
+        _qt_application.processEvents()
+        self.assertFalse(button.isEnabled())
+        self.assertFalse(self.workspace.delete_selected_generated_object())
+
+    def test_delete_button_confirms_and_cancel_preserves_the_object(self) -> None:
+        self._set_generated_objects(
+            [("chair", "Chair", (180, 30, 20, 255))]
+        )
+        button = self.workspace.delete_generated_object_button
+
+        with patch(
+            "housemaker.generation_workspace.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.No,
+        ) as question_mock:
+            QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+            _qt_application.processEvents()
+
+        question_mock.assert_called_once()
+        self.assertEqual(
+            [
+                record.object_id
+                for record in self.workspace.get_data().generated_objects
+            ],
+            ["chair"],
+        )
+        self.assertTrue(button.isEnabled())
+
+        with patch(
+            "housemaker.generation_workspace.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ) as question_mock:
+            QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+            _qt_application.processEvents()
+
+        question_mock.assert_called_once()
+        self.assertEqual(self.workspace.get_data().generated_objects, [])
+        self.assertEqual(self.workspace.generated_objects_list.count(), 0)
+        self.assertFalse(button.isEnabled())
+        self.assertIsNone(self.workspace.result_view.model)
+
+    def test_delete_selects_successor_then_previous_for_the_last_row(
+        self,
+    ) -> None:
+        self._set_generated_objects(
+            [
+                ("first", "First", (180, 30, 20, 255)),
+                ("second", "Second", (20, 180, 30, 255)),
+                ("third", "Third", (20, 30, 180, 255)),
+            ]
+        )
+        self.workspace.generated_objects_list.setCurrentRow(1)
+        _qt_application.processEvents()
+
+        self.assertTrue(self.workspace.delete_selected_generated_object())
+        self.assertEqual(self.workspace._selected_object_id, "third")
+        self.assertEqual(self.workspace.generated_objects_list.currentRow(), 1)
+        self.assertEqual(
+            [
+                record.object_id
+                for record in self.workspace.get_data().generated_objects
+            ],
+            ["first", "third"],
+        )
+
+        self.assertTrue(self.workspace.delete_generated_object("third"))
+        self.assertEqual(self.workspace._selected_object_id, "first")
+        self.assertEqual(self.workspace.generated_objects_list.currentRow(), 0)
+        self.assertEqual(
+            [
+                record.object_id
+                for record in self.workspace.get_data().generated_objects
+            ],
+            ["first"],
+        )
+
+    def test_delete_removes_record_model_cache_and_owned_texture_atlases(
+        self,
+    ) -> None:
+        self._set_generated_objects(
+            [
+                ("first", "First", (180, 30, 20, 255)),
+                ("second", "Second", (20, 180, 30, 255)),
+            ]
+        )
+        self.workspace.generated_objects_list.setCurrentRow(0)
+        _qt_application.processEvents()
+        changed_spy = QSignalSpy(self.workspace.data_changed)
+
+        self.assertIn("first", self.workspace._generated_model_cache)
+        self.assertIn(
+            "first", self.workspace._texture_atlas_entries_by_object_id
+        )
+        self.assertTrue(self.workspace.delete_generated_object("first"))
+
+        self.assertEqual(changed_spy.count(), 1)
+        self.assertNotIn("first", self.workspace._generated_model_cache)
+        self.assertNotIn(
+            "first", self.workspace._texture_atlas_entries_by_object_id
+        )
+        self.assertEqual(
+            {entry.owner_id for entry in self.workspace.texture_view.entries},
+            {"second"},
+        )
+        self.assertEqual(self.workspace._selected_object_id, "second")
+        self.assertIsNotNone(self.workspace.result_view.model)
+
+        self.assertFalse(self.workspace.delete_generated_object("unknown"))
+        self.assertEqual(changed_spy.count(), 1)
+        self.assertEqual(
+            [
+                record.object_id
+                for record in self.workspace.get_data().generated_objects
+            ],
+            ["second"],
+        )
+
+    def test_delete_unlinks_final_and_revision_glbs_except_shared_assets(
+        self,
+    ) -> None:
+        model = _test_textured_model((180, 30, 20, 255))
+        final_path = self.asset_directory / "deleted.glb"
+        source_path = self.asset_directory / "deleted.geometry.glb"
+        shared_path = self.asset_directory / "shared.glb"
+        for asset_path in (final_path, source_path, shared_path):
+            asset_path.write_bytes(model.glb_bytes)
+        deleted_record = GeneratedObjectRecord(
+            object_id="deleted",
+            frame_index=0,
+            object_name="Deleted",
+            pipeline={
+                "source_asset_path": source_path.name,
+                "postprocessed_asset_path": shared_path.name,
+            },
+            provider=GENERATION_BACKEND_MESHY,
+            provider_task_id="task-deleted",
+            asset_path=final_path.name,
+        )
+        keeper_record = GeneratedObjectRecord(
+            object_id="keeper",
+            frame_index=1,
+            object_name="Keeper",
+            pipeline={},
+            provider=GENERATION_BACKEND_MESHY,
+            provider_task_id="task-keeper",
+            asset_path=shared_path.name,
+        )
+        self.workspace.set_data(
+            GenerationData(generated_objects=[deleted_record, keeper_record])
+        )
+
+        self.assertTrue(self.workspace.delete_generated_object("deleted"))
+
+        self.assertFalse(final_path.exists())
+        self.assertFalse(source_path.exists())
+        self.assertTrue(shared_path.exists())
+
+    def test_delete_refuses_outside_and_non_glb_paths_and_allows_missing(
+        self,
+    ) -> None:
+        outside_path = self.asset_directory.parent / "outside.glb"
+        notes_path = self.asset_directory / "notes.txt"
+        outside_path.write_bytes(b"outside")
+        notes_path.write_bytes(b"notes")
+        record = GeneratedObjectRecord(
+            object_id="unsafe",
+            frame_index=0,
+            object_name="Unsafe paths",
+            pipeline={
+                "source_asset_path": "../outside.glb",
+                "postprocessed_asset_path": notes_path.name,
+            },
+            provider=GENERATION_BACKEND_MESHY,
+            provider_task_id="task-unsafe",
+            asset_path="already-missing.glb",
+        )
+        self.workspace.set_data(GenerationData(generated_objects=[record]))
+
+        self.assertTrue(self.workspace.delete_generated_object("unsafe"))
+
+        self.assertTrue(outside_path.exists())
+        self.assertTrue(notes_path.exists())
+        self.assertEqual(self.workspace.get_data().generated_objects, [])
+
+    def test_asset_unlink_failure_does_not_restore_the_deleted_record(
+        self,
+    ) -> None:
+        model = _test_textured_model((180, 30, 20, 255))
+        locked_path = self.asset_directory / "locked.glb"
+        locked_path.write_bytes(model.glb_bytes)
+        record = GeneratedObjectRecord(
+            object_id="locked",
+            frame_index=0,
+            object_name="Locked",
+            pipeline={},
+            provider=GENERATION_BACKEND_MESHY,
+            provider_task_id="task-locked",
+            asset_path=locked_path.name,
+        )
+        self.workspace.set_data(GenerationData(generated_objects=[record]))
+
+        with patch.object(Path, "unlink", side_effect=OSError("in use")):
+            self.assertTrue(self.workspace.delete_generated_object("locked"))
+
+        self.assertTrue(locked_path.exists())
+        self.assertEqual(self.workspace.get_data().generated_objects, [])
+        self.assertIn("could not be removed", self.workspace.status_label.text())
+
+    def test_delete_is_disabled_and_refused_while_generating(self) -> None:
+        self._set_generated_objects(
+            [("chair", "Chair", (180, 30, 20, 255))]
+        )
+        planner = _BlockingMeshyPlanner()
+        self.workspace.set_meshy_planner(planner)
+        request = GenerationRequest(
+            frame_index=0,
+            selected_object_bgra=np.zeros((4, 4, 4), dtype=np.uint8),
+            settings=GenerationServiceSettings(meshy_api_key="key"),
+        )
+
+        self.workspace._start_generation(request)
+        self.assertTrue(planner.started.wait(timeout=1.0))
+        self.assertFalse(
+            self.workspace.delete_generated_object_button.isEnabled()
+        )
+        self.assertFalse(self.workspace.delete_generated_object("chair"))
+        self.assertEqual(
+            [
+                record.object_id
+                for record in self.workspace.get_data().generated_objects
+            ],
+            ["chair"],
+        )
+
+        active_thread = self.workspace._generation_thread
+        self.assertIsNotNone(active_thread)
+        self.workspace.shutdown()
+        planner.release.set()
+        self.assertTrue(active_thread.wait(2000))
+        _qt_application.processEvents()
 
 
 # ### Test entry point ###

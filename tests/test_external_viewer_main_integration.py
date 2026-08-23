@@ -20,11 +20,23 @@ from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.glb import GeneratedModel
 from housemaker.main import BlueprintWorkspace
 from housemaker.settings_widget import FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY
+from housemaker.unused_face_removal import ALL_CAMERA_IDS
 
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
 _qt_application.setQuitOnLastWindowClosed(False)
+
+
+# ### Test constants ###
+_EXPECTED_UNUSED_FACE_CAMERA_LABELS = {
+    "pos_x": "+X",
+    "neg_x": "-X",
+    "pos_y": "+Y",
+    "neg_y": "-Y",
+    "top": "Top",
+    "bottom": "Bottom",
+}
 
 
 # ### Main-workspace external viewer integration tests ###
@@ -151,7 +163,7 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
             )
             self.assertIs(
                 self.workspace.generation.generated_objects_list.parentWidget(),
-                self.workspace.generation.object_3d_panel,
+                self.workspace.generation.object_3d_panel.details_panel,
             )
 
             self.workspace.workspace_tabs.setCurrentWidget(
@@ -171,6 +183,65 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
                 self.workspace.canvas_viewer_workspace
             )
             self._assert_externally_hosted_viewer_is(self.workspace.viewer)
+
+    def test_complete_object_panel_is_visible_beside_external_viewer(
+        self,
+    ) -> None:
+        screen_id = "screen:external-object-panel-test"
+        combo = self.workspace.settings_widget.fullscreen_3d_viewer_screen_combo
+        combo.addItem("External object-panel display", screen_id)
+        generation = self.workspace.generation
+        panel = generation.object_3d_panel
+        model = _generated_box_model()
+        panel.viewer.set_model(model)
+        generation._sync_model_statistics(model)
+        generation.generated_objects_list.addItem("Generated test object")
+
+        with patch(
+            "housemaker.main.resolve_fullscreen_3d_viewer_screen",
+            return_value=_primary_screen(),
+        ):
+            combo.setCurrentIndex(combo.findData(screen_id))
+            self.workspace.workspace_tabs.setCurrentWidget(generation)
+            _qt_application.processEvents()
+
+        external_window = self.workspace._external_viewer_host.window
+        self._assert_externally_hosted_viewer_is(panel)
+        self.assertTrue(panel.is_external_presentation_active)
+        self.assertIs(
+            generation.right_view_stack.currentWidget(),
+            generation.texture_view_page,
+        )
+        self.assertGreaterEqual(
+            panel.details_panel.geometry().left(),
+            panel.viewer.geometry().right(),
+        )
+        self.assertIn("12 triangles", panel.statistics_label.text())
+        self.assertEqual(panel.object_list.count(), 1)
+
+        expected_external_widgets = (
+            panel.viewer,
+            panel.details_panel,
+            panel.unused_face_camera_controls,
+            panel.object_list,
+            panel.delete_object_button,
+            panel.statistics_label,
+        )
+        for widget in expected_external_widgets:
+            with self.subTest(widget=widget.objectName() or type(widget).__name__):
+                self.assertTrue(panel.isAncestorOf(widget))
+                self.assertTrue(widget.isVisibleTo(external_window))
+                self.assertGreater(widget.width(), 0)
+                self.assertGreater(widget.height(), 0)
+
+        self.workspace._apply_fullscreen_3d_viewer_screen(None)
+        _qt_application.processEvents()
+
+        self.assertFalse(panel.is_external_presentation_active)
+        self.assertIs(
+            generation.right_view_stack.currentWidget(),
+            generation.object_3d_page,
+        )
 
     def test_external_window_close_resets_display_dropdown_and_restores_viewer(
         self,
@@ -195,6 +266,112 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
         self.assertIs(
             self._canvas_3d_tab_widget(),
             self.workspace.viewer,
+        )
+
+    def test_unused_face_camera_controls_follow_object_panel_to_external_window(
+        self,
+    ) -> None:
+        screen_id = "screen:external-test"
+        combo = self.workspace.settings_widget.fullscreen_3d_viewer_screen_combo
+        combo.addItem("External test display", screen_id)
+        self.workspace.settings_widget.unused_face_removal_checkbox.setChecked(
+            True
+        )
+
+        with patch(
+            "housemaker.main.resolve_fullscreen_3d_viewer_screen",
+            return_value=_primary_screen(),
+        ):
+            combo.setCurrentIndex(combo.findData(screen_id))
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.generation
+            )
+            _qt_application.processEvents()
+
+        panel = self.workspace.generation.object_3d_panel
+        controls = panel.unused_face_camera_controls
+        checkboxes = panel.unused_face_camera_checkboxes
+        panel.viewer.set_model(_generated_box_model())
+        _qt_application.processEvents()
+        self._assert_externally_hosted_viewer_is(panel)
+        self.assertIs(controls.parentWidget(), panel.details_panel)
+        self.assertTrue(controls.isEnabled())
+        self.assertTrue(controls.isVisibleTo(panel))
+        self.assertEqual(tuple(checkboxes), ALL_CAMERA_IDS)
+        self.assertTrue(
+            all(checkbox.isChecked() for checkbox in checkboxes.values())
+        )
+        self.assertTrue(
+            panel.viewer.get_unused_face_camera_indicators_visible()
+        )
+        self.assertEqual(
+            tuple(panel.viewer.unused_face_camera_indicator_items),
+            ALL_CAMERA_IDS,
+        )
+        labels = panel.viewer.unused_face_camera_indicator_labels
+        self.assertEqual(
+            {
+                camera_id: label.text
+                for camera_id, label in labels.items()
+            },
+            _EXPECTED_UNUSED_FACE_CAMERA_LABELS,
+        )
+        self.assertTrue(
+            all(
+                item.visible() and item in panel.viewer.view.items
+                for camera_items in (
+                    panel.viewer.unused_face_camera_indicator_items.values()
+                )
+                for item in camera_items
+            )
+        )
+        self.assertTrue(
+            all(
+                label.visible() and label in panel.viewer.view.items
+                for label in labels.values()
+            )
+        )
+
+        checkboxes["bottom"].setChecked(False)
+        _qt_application.processEvents()
+
+        self.assertEqual(
+            panel.get_enabled_postprocess_camera_ids(),
+            tuple(
+                camera_id
+                for camera_id in ALL_CAMERA_IDS
+                if camera_id != "bottom"
+            ),
+        )
+        self.assertFalse(
+            any(
+                item.visible()
+                for item in (
+                    panel.viewer.unused_face_camera_indicator_items["bottom"]
+                )
+            )
+        )
+        self.assertFalse(labels["bottom"].visible())
+        self.assertTrue(
+            all(
+                item.visible()
+                for camera_id, camera_items in (
+                    panel.viewer.unused_face_camera_indicator_items.items()
+                )
+                if camera_id != "bottom"
+                for item in camera_items
+            )
+        )
+        self.assertTrue(
+            all(
+                label.visible()
+                for camera_id, label in labels.items()
+                if camera_id != "bottom"
+            )
+        )
+        self.assertIs(
+            self.workspace.generation.right_view_stack.currentWidget(),
+            self.workspace.generation.texture_view_page,
         )
 
     def test_canvas_preview_is_not_refreshed_from_another_3d_tab(self) -> None:

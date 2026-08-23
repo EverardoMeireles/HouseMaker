@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from PySide6.QtCore import QSignalBlocker, Qt, Signal
 from PySide6.QtGui import QGuiApplication, QKeySequence, QScreen
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFormLayout,
     QKeySequenceEdit,
@@ -32,7 +33,9 @@ FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY = (
 CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY_SETTING_KEY = (
     "navigation/canvas_3d_navigation_toggle_hotkey"
 )
+UNUSED_FACE_REMOVAL_SETTING_KEY = "generation/unused_face_removal"
 DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY = "N"
+DEFAULT_UNUSED_FACE_REMOVAL = False
 MESHY_SMART_TOPOLOGY_MIN_TARGET_POLYCOUNT = 100
 MESHY_SMART_TOPOLOGY_MAX_TARGET_POLYCOUNT = 15_000
 DEFAULT_MESHY_TARGET_POLYCOUNT = 4_000
@@ -93,8 +96,11 @@ class GenerationServiceSettings:
     canvas_3d_navigation_toggle_hotkey: str = (
         DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY
     )
+    unused_face_removal: bool = DEFAULT_UNUSED_FACE_REMOVAL
 
     def __post_init__(self) -> None:
+        if not isinstance(self.unused_face_removal, bool):
+            raise ValueError("Unused face removal must be enabled or disabled.")
         if (
             isinstance(self.meshy_target_polycount, bool)
             or not isinstance(self.meshy_target_polycount, int)
@@ -214,6 +220,7 @@ class SettingsWidget(QWidget):
             canvas_3d_navigation_toggle_hotkey=(
                 self._selected_canvas_3d_navigation_toggle_hotkey()
             ),
+            unused_face_removal=self.unused_face_removal_checkbox.isChecked(),
         )
 
     def clear_session_keys(self) -> None:
@@ -291,6 +298,23 @@ class SettingsWidget(QWidget):
             self.canvas_3d_navigation_toggle_hotkey_edit,
         )
 
+        self.unused_face_removal_checkbox = QCheckBox()
+        self.unused_face_removal_checkbox.setObjectName(
+            "unused_face_removal_checkbox"
+        )
+        self.unused_face_removal_checkbox.setToolTip(
+            "Generate geometry first, remove faces invisible from the enabled "
+            "Object-generation cameras, then submit the edited GLB to Meshy "
+            "Retexture. This uses two Meshy tasks."
+        )
+        self.unused_face_removal_checkbox.toggled.connect(
+            self._handle_unused_face_removal_changed
+        )
+        form_layout.addRow(
+            "Unused face removal",
+            self.unused_face_removal_checkbox,
+        )
+
         root_layout.addLayout(form_layout)
 
         security_note = QLabel(
@@ -357,6 +381,9 @@ class SettingsWidget(QWidget):
                 ),
                 QKeySequence.SequenceFormat.PortableText,
             )
+        )
+        self.unused_face_removal_checkbox.setChecked(
+            read_unused_face_removal(self._application_settings)
         )
         self._is_loading_settings = False
 
@@ -462,6 +489,15 @@ class SettingsWidget(QWidget):
         )
         self.settings_changed.emit()
 
+    def _handle_unused_face_removal_changed(self, enabled: bool) -> None:
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            UNUSED_FACE_REMOVAL_SETTING_KEY,
+            bool(enabled),
+        )
+        self.settings_changed.emit()
+
     def _sync_key_status_labels(self) -> None:
         self.meshy_key_status_label.setText(
             self._build_key_status_text(
@@ -538,6 +574,19 @@ def read_fullscreen_3d_viewer_screen_id(
     return _normalize_fullscreen_3d_viewer_screen_id(
         application_settings.get(FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY)
     )
+
+
+# ### Object post-processing setting helpers ###
+def read_unused_face_removal(
+    application_settings: ApplicationSettingsStore,
+) -> bool:
+    """Read the persisted staged-generation option with a safe default."""
+
+    value = application_settings.get(
+        UNUSED_FACE_REMOVAL_SETTING_KEY,
+        DEFAULT_UNUSED_FACE_REMOVAL,
+    )
+    return value if isinstance(value, bool) else DEFAULT_UNUSED_FACE_REMOVAL
 
 
 # ### Canvas navigation hotkey helpers ###

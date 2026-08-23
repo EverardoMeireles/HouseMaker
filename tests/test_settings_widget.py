@@ -23,6 +23,7 @@ from housemaker.settings_widget import (
     MESHY_API_KEY_SETTING_KEY,
     OPENAI_API_KEY_ENVIRONMENT_VARIABLE,
     OPENAI_API_KEY_SETTING_KEY,
+    UNUSED_FACE_REMOVAL_SETTING_KEY,
     Fullscreen3DViewerScreenOption,
     SURFACE_TEXTURE_PROVIDER_GPT_5_6_TERRA,
     SURFACE_TEXTURE_PROVIDER_SETTING_KEY,
@@ -30,6 +31,7 @@ from housemaker.settings_widget import (
     SettingsWidget,
     fullscreen_3d_viewer_screen_id,
     read_canvas_3d_navigation_toggle_hotkey,
+    read_unused_face_removal,
 )
 
 
@@ -61,6 +63,50 @@ class SettingsWidgetTests(unittest.TestCase):
                 )
             )
             self.assertFalse(hasattr(widget, "surface_texture_provider_combo"))
+            self.assertTrue(hasattr(widget, "unused_face_removal_checkbox"))
+            self.assertFalse(
+                hasattr(widget, "camera_validated_simplification_checkbox")
+            )
+            self.assertFalse(
+                hasattr(widget, "simplification_pixel_tolerance_spinbox")
+            )
+
+    def test_unused_face_removal_persists_and_emits_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            widget = SettingsWidget(
+                application_settings=application_settings,
+                environment={},
+            )
+            emitted_changes: list[bool] = []
+            widget.settings_changed.connect(
+                lambda: emitted_changes.append(True)
+            )
+
+            self.assertFalse(widget.get_settings().unused_face_removal)
+            widget.unused_face_removal_checkbox.setChecked(True)
+
+            self.assertTrue(
+                application_settings.get(UNUSED_FACE_REMOVAL_SETTING_KEY)
+            )
+            self.assertTrue(widget.get_settings().unused_face_removal)
+            self.assertEqual(emitted_changes, [True])
+
+            restored = SettingsWidget(
+                application_settings=_build_test_settings(temporary_directory),
+                environment={},
+            )
+            self.assertTrue(restored.get_settings().unused_face_removal)
+
+    def test_unused_face_removal_rejects_malformed_settings(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Unused face removal"):
+            GenerationServiceSettings(unused_face_removal=1)  # type: ignore[arg-type]
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            application_settings.set(UNUSED_FACE_REMOVAL_SETTING_KEY, "yes")
+
+            self.assertFalse(read_unused_face_removal(application_settings))
 
     def test_meshy_api_key_persists_in_application_json(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

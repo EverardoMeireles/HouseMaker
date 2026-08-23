@@ -6,7 +6,7 @@ import json
 import math
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 
 # ### Constants ###
 MESHY_IMAGE_TO_3D_ENDPOINT = "https://api.meshy.ai/openapi/v1/image-to-3d"
+MESHY_RETEXTURE_ENDPOINT = "https://api.meshy.ai/openapi/v1/retexture"
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
 DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 DEFAULT_MAX_POLLS = 360
@@ -28,6 +29,9 @@ TERMINAL_TASK_STATUSES = frozenset({"SUCCEEDED", "FAILED", "CANCELED"})
 ACTIVE_TASK_STATUSES = frozenset({"PENDING", "IN_PROGRESS"})
 KNOWN_TASK_STATUSES = TERMINAL_TASK_STATUSES | ACTIVE_TASK_STATUSES
 RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+MAX_RETEXTURE_REFERENCE_IMAGES = 4
+SINGLE_IMAGE_RETEXTURE_AI_MODEL = "meshy-6"
+MULTIVIEW_RETEXTURE_AI_MODEL = "meshy-7"
 
 
 # ### Data models ###
@@ -74,35 +78,111 @@ class ResponseStream(Protocol):
 UrlOpenFunction = Callable[..., ResponseStream]
 SleepFunction = Callable[[float], None]
 ProgressCallback = Callable[[str, int], None]
+TaskGetter = Callable[..., dict[str, Any]]
 
 
 # ### Request builders ###
 def build_image_to_3d_request_body(
     image_png: bytes,
     target_polycount: int = DEFAULT_SMART_TOPOLOGY_TARGET_POLYCOUNT,
+    should_texture: bool = True,
 ) -> dict[str, Any]:
     """Build a Smart Topology Meshy Image-to-3D request."""
 
-    normalized_image = bytes(image_png)
-    if not normalized_image:
-        raise ValueError("The selected object image is empty.")
+    normalized_image = _normalize_binary_payload(
+        image_png,
+        empty_message="The selected object image is empty.",
+    )
+    if not isinstance(should_texture, bool):
+        raise ValueError("Meshy should_texture must be a boolean.")
     normalized_polycount = _normalize_smart_topology_target_polycount(
         target_polycount
     )
-    encoded_image = base64.b64encode(normalized_image).decode("ascii")
-    return {
-        "image_url": f"data:image/png;base64,{encoded_image}",
+    body: dict[str, Any] = {
+        "image_url": _build_data_uri("image/png", normalized_image),
         "model_type": "smart-topology",
         "ai_model": "meshy-t2",
-        "should_texture": True,
-        "enable_pbr": False,
-        "texture_resolution": "2k",
+        "should_texture": should_texture,
         "target_polycount": normalized_polycount,
         "moderation": False,
         "target_formats": ["glb"],
         "auto_size": True,
         "origin_at": "bottom",
     }
+    if should_texture:
+        body.update(
+            {
+                "enable_pbr": False,
+                "texture_resolution": "2k",
+            }
+        )
+    return body
+
+
+def build_retexture_request_body(
+    model_glb: bytes,
+    reference_images_png: Sequence[bytes],
+    enable_original_uv: bool = False,
+) -> dict[str, Any]:
+    """Build a Retexture request for a locally post-processed GLB."""
+
+    normalized_model = _normalize_binary_payload(
+        model_glb,
+        empty_message="The post-processed GLB is empty.",
+    )
+    if not isinstance(enable_original_uv, bool):
+        raise ValueError("Meshy enable_original_uv must be a boolean.")
+    image_data_uris = _normalize_retexture_reference_images(reference_images_png)
+    body: dict[str, Any] = {
+        "model_url": _build_data_uri("application/octet-stream", normalized_model),
+        "enable_original_uv": enable_original_uv,
+        "enable_pbr": False,
+        "texture_resolution": "2k",
+        "target_formats": ["glb"],
+    }
+    if len(image_data_uris) == 1:
+        body.update(
+            {
+                "image_style_url": image_data_uris[0],
+                "ai_model": SINGLE_IMAGE_RETEXTURE_AI_MODEL,
+            }
+        )
+    else:
+        body.update(
+            {
+                "multiview_image_urls": image_data_uris,
+                "ai_model": MULTIVIEW_RETEXTURE_AI_MODEL,
+            }
+        )
+    return body
+
+
+def _normalize_retexture_reference_images(
+    reference_images_png: Sequence[bytes],
+) -> list[str]:
+    if isinstance(reference_images_png, (str, bytes, bytearray, memoryview)):
+        raise ValueError("Meshy reference images must be provided as a sequence.")
+    try:
+        images = list(reference_images_png)
+    except TypeError as error:
+        raise ValueError(
+            "Meshy reference images must be provided as a sequence."
+        ) from error
+    if not 1 <= len(images) <= MAX_RETEXTURE_REFERENCE_IMAGES:
+        raise ValueError(
+            "Meshy Retexture requires between 1 and "
+            f"{MAX_RETEXTURE_REFERENCE_IMAGES} reference images."
+        )
+    return [
+        _build_data_uri(
+            "image/png",
+            _normalize_binary_payload(
+                image,
+                empty_message=f"Meshy reference image {index} is empty.",
+            ),
+        )
+        for index, image in enumerate(images, start=1)
+    ]
 
 
 def _normalize_smart_topology_target_polycount(target_polycount: int) -> int:
@@ -130,11 +210,13 @@ def create_image_to_3d_task(
     timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
     opener: UrlOpenFunction | None = None,
     target_polycount: int = DEFAULT_SMART_TOPOLOGY_TARGET_POLYCOUNT,
+    should_texture: bool = True,
 ) -> str:
     normalized_key = _require_api_key(api_key)
     payload = build_image_to_3d_request_body(
         image_png,
         target_polycount=target_polycount,
+        should_texture=should_texture,
     )
     response = _request_json(
         Request(
@@ -187,42 +269,96 @@ def wait_for_image_to_3d_task(
     progress_callback: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
+    return _wait_for_model_task(
+        api_key=api_key,
+        task_id=task_id,
+        get_task=get_image_to_3d_task,
+        poll_interval_seconds=poll_interval_seconds,
+        max_polls=max_polls,
+        opener=opener,
+        sleep=sleep,
+        progress_callback=progress_callback,
+        cancel_event=cancel_event,
+    )
+
+
+# ### Retexture task API ###
+def create_retexture_task(
+    api_key: str,
+    model_glb: bytes,
+    reference_images_png: Sequence[bytes],
+    timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    opener: UrlOpenFunction | None = None,
+    enable_original_uv: bool = False,
+) -> str:
+    normalized_key = _require_api_key(api_key)
+    payload = build_retexture_request_body(
+        model_glb=model_glb,
+        reference_images_png=reference_images_png,
+        enable_original_uv=enable_original_uv,
+    )
+    response = _request_json(
+        Request(
+            MESHY_RETEXTURE_ENDPOINT,
+            data=_encode_json(payload),
+            headers={
+                "Authorization": f"Bearer {normalized_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        ),
+        timeout_seconds=timeout_seconds,
+        opener=opener,
+        secrets=(normalized_key,),
+    )
+    task_id = response.get("result")
+    if not isinstance(task_id, str) or not task_id.strip():
+        raise MeshyRequestError("Meshy returned an invalid task identifier.")
+    return task_id.strip()
+
+
+def get_retexture_task(
+    api_key: str,
+    task_id: str,
+    timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    opener: UrlOpenFunction | None = None,
+) -> dict[str, Any]:
+    normalized_key = _require_api_key(api_key)
     normalized_task_id = _require_task_id(task_id)
-    normalized_max_polls = int(max_polls)
-    if normalized_max_polls <= 0:
-        raise ValueError("Meshy max polls must be positive.")
-    poll_interval = float(poll_interval_seconds)
-    if not math.isfinite(poll_interval) or poll_interval < 0.0:
-        raise ValueError("Meshy poll interval must be a finite non-negative value.")
+    return _request_json(
+        Request(
+            f"{MESHY_RETEXTURE_ENDPOINT}/{quote(normalized_task_id, safe='')}",
+            headers={"Authorization": f"Bearer {normalized_key}"},
+            method="GET",
+        ),
+        timeout_seconds=timeout_seconds,
+        opener=opener,
+        secrets=(normalized_key,),
+    )
 
-    for poll_index in range(normalized_max_polls):
-        _raise_if_cancelled(cancel_event, normalized_task_id)
-        task = get_image_to_3d_task(
-            api_key=api_key,
-            task_id=normalized_task_id,
-            opener=opener,
-        )
-        status = _get_task_status(task, normalized_task_id)
-        progress = _get_task_progress(task)
-        if progress_callback is not None:
-            progress_callback(status, progress)
 
-        if status == "SUCCEEDED":
-            _get_glb_url(task, normalized_task_id)
-            return task
-        if status in {"FAILED", "CANCELED"}:
-            detail = _redact(
-                _get_task_error_message(task),
-                (str(api_key).strip(),),
-            )
-            raise MeshyTaskError(
-                f"Meshy task {normalized_task_id} {status.lower()}: {detail}"
-            )
-        if poll_index + 1 < normalized_max_polls:
-            _interruptible_sleep(poll_interval, sleep, cancel_event, normalized_task_id)
+def wait_for_retexture_task(
+    api_key: str,
+    task_id: str,
+    poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
+    max_polls: int = DEFAULT_MAX_POLLS,
+    opener: UrlOpenFunction | None = None,
+    sleep: SleepFunction = time.sleep,
+    progress_callback: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
+    """Poll a Retexture task until its final GLB is ready."""
 
-    raise MeshyTaskError(
-        f"Meshy task {normalized_task_id} timed out before completion."
+    return _wait_for_model_task(
+        api_key=api_key,
+        task_id=task_id,
+        get_task=get_retexture_task,
+        poll_interval_seconds=poll_interval_seconds,
+        max_polls=max_polls,
+        opener=opener,
+        sleep=sleep,
+        progress_callback=progress_callback,
+        cancel_event=cancel_event,
     )
 
 
@@ -275,12 +411,14 @@ def request_image_to_3d_model(
     progress_callback: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
     target_polycount: int = DEFAULT_SMART_TOPOLOGY_TARGET_POLYCOUNT,
+    should_texture: bool = True,
 ) -> MeshyGenerationResult:
     task_id = create_image_to_3d_task(
         api_key=api_key,
         image_png=image_png,
         opener=opener,
         target_polycount=target_polycount,
+        should_texture=should_texture,
     )
     task = wait_for_image_to_3d_task(
         api_key=api_key,
@@ -295,6 +433,44 @@ def request_image_to_3d_model(
     _raise_if_cancelled(cancel_event, task_id)
     glb_bytes = download_glb(_get_glb_url(task, task_id), opener=opener)
     return MeshyGenerationResult(task_id=task_id, glb_bytes=glb_bytes)
+
+
+def request_retextured_model(
+    api_key: str,
+    model_glb: bytes,
+    reference_images_png: Sequence[bytes],
+    poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
+    max_polls: int = DEFAULT_MAX_POLLS,
+    opener: UrlOpenFunction | None = None,
+    sleep: SleepFunction = time.sleep,
+    progress_callback: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
+    enable_original_uv: bool = False,
+) -> MeshyGenerationResult:
+    task_id = create_retexture_task(
+        api_key=api_key,
+        model_glb=model_glb,
+        reference_images_png=reference_images_png,
+        opener=opener,
+        enable_original_uv=enable_original_uv,
+    )
+    task = wait_for_retexture_task(
+        api_key=api_key,
+        task_id=task_id,
+        poll_interval_seconds=poll_interval_seconds,
+        max_polls=max_polls,
+        opener=opener,
+        sleep=sleep,
+        progress_callback=progress_callback,
+        cancel_event=cancel_event,
+    )
+    _raise_if_cancelled(cancel_event, task_id)
+    glb_bytes = download_glb(_get_glb_url(task, task_id), opener=opener)
+    return MeshyGenerationResult(
+        task_id=task_id,
+        glb_bytes=glb_bytes,
+        name="Meshy textured object",
+    )
 
 
 # ### HTTP helpers ###
@@ -360,6 +536,61 @@ def _encode_json(payload: Mapping[str, Any]) -> bytes:
 
 
 # ### Task helpers ###
+def _wait_for_model_task(
+    api_key: str,
+    task_id: str,
+    get_task: TaskGetter,
+    poll_interval_seconds: float,
+    max_polls: int,
+    opener: UrlOpenFunction | None,
+    sleep: SleepFunction,
+    progress_callback: ProgressCallback | None,
+    cancel_event: threading.Event | None,
+) -> dict[str, Any]:
+    normalized_task_id = _require_task_id(task_id)
+    normalized_max_polls = int(max_polls)
+    if normalized_max_polls <= 0:
+        raise ValueError("Meshy max polls must be positive.")
+    poll_interval = float(poll_interval_seconds)
+    if not math.isfinite(poll_interval) or poll_interval < 0.0:
+        raise ValueError("Meshy poll interval must be a finite non-negative value.")
+
+    for poll_index in range(normalized_max_polls):
+        _raise_if_cancelled(cancel_event, normalized_task_id)
+        task = get_task(
+            api_key=api_key,
+            task_id=normalized_task_id,
+            opener=opener,
+        )
+        status = _get_task_status(task, normalized_task_id)
+        progress = _get_task_progress(task)
+        if progress_callback is not None:
+            progress_callback(status, progress)
+
+        if status == "SUCCEEDED":
+            _get_glb_url(task, normalized_task_id)
+            return task
+        if status in {"FAILED", "CANCELED"}:
+            detail = _redact(
+                _get_task_error_message(task),
+                (str(api_key).strip(),),
+            )
+            raise MeshyTaskError(
+                f"Meshy task {normalized_task_id} {status.lower()}: {detail}"
+            )
+        if poll_index + 1 < normalized_max_polls:
+            _interruptible_sleep(
+                poll_interval,
+                sleep,
+                cancel_event,
+                normalized_task_id,
+            )
+
+    raise MeshyTaskError(
+        f"Meshy task {normalized_task_id} timed out before completion."
+    )
+
+
 def _require_api_key(api_key: str) -> str:
     normalized_key = str(api_key).strip()
     if not normalized_key:
@@ -438,3 +669,18 @@ def _redact(message: str, secrets: tuple[str, ...]) -> str:
         if secret:
             redacted = redacted.replace(secret, "[redacted]")
     return redacted
+
+
+# ### Binary payload helpers ###
+def _normalize_binary_payload(payload: bytes, empty_message: str) -> bytes:
+    if not isinstance(payload, (bytes, bytearray, memoryview)):
+        raise ValueError("Meshy binary inputs must contain bytes.")
+    normalized_payload = bytes(payload)
+    if not normalized_payload:
+        raise ValueError(empty_message)
+    return normalized_payload
+
+
+def _build_data_uri(mime_type: str, payload: bytes) -> str:
+    encoded_payload = base64.b64encode(payload).decode("ascii")
+    return f"data:{mime_type};base64,{encoded_payload}"
