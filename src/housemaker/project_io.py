@@ -11,6 +11,7 @@ from pathlib import Path
 from housemaker.camera_models import CameraPose, InitialFirstPersonCamera
 from housemaker.generation_state import GenerationData
 from housemaker.surface_texture_state import SurfaceTextureData
+from housemaker.texture_atlas_state import TextureAtlasData
 from housemaker.models import (
     DEFAULT_DOORWAY_DEPTH_METERS,
     DEFAULT_DOORWAY_HEIGHT_METERS,
@@ -68,6 +69,7 @@ class ProjectData:
     )
     initial_first_person_camera: InitialFirstPersonCamera | None = None
     stairs: list[StairData] = field(default_factory=list)
+    texture_atlases: TextureAtlasData = field(default_factory=TextureAtlasData)
 
 
 # ### Public helpers ###
@@ -81,6 +83,7 @@ def save_project(
     surface_texture_generation: SurfaceTextureData | None = None,
     initial_first_person_camera: InitialFirstPersonCamera | None = None,
     stairs: list[StairData] | None = None,
+    texture_atlases: TextureAtlasData | None = None,
 ) -> Path:
     export_path = Path(path)
     payload = {
@@ -104,6 +107,11 @@ def save_project(
             surface_texture_generation.to_dict()
             if surface_texture_generation is not None
             else SurfaceTextureData().to_dict()
+        ),
+        "texture_atlases": (
+            texture_atlases.to_dict()
+            if texture_atlases is not None
+            else TextureAtlasData().to_dict()
         ),
         "initial_first_person_camera": (
             None
@@ -226,6 +234,9 @@ def load_project(path: str | Path) -> ProjectData:
     surface_texture_generation = _deserialize_surface_texture_generation(
         payload.get("surface_texture_generation")
     )
+    texture_atlases = _deserialize_texture_atlases(
+        payload.get("texture_atlases")
+    )
     if "initial_first_person_camera" in payload:
         initial_first_person_camera = _deserialize_initial_first_person_camera(
             payload.get("initial_first_person_camera"),
@@ -253,6 +264,7 @@ def load_project(path: str | Path) -> ProjectData:
         doorway_presets=doorway_presets,
         generation=generation,
         surface_texture_generation=surface_texture_generation,
+        texture_atlases=texture_atlases,
         initial_first_person_camera=initial_first_person_camera,
         stairs=stairs,
     )
@@ -323,6 +335,19 @@ def _deserialize_surface_texture_generation(
         return SurfaceTextureData.from_dict(raw_surface_texture_generation)
     except (KeyError, TypeError, ValueError, OverflowError):
         return SurfaceTextureData()
+
+
+def _deserialize_texture_atlases(
+    raw_texture_atlases: object,
+) -> TextureAtlasData:
+    """Load optional atlas state while keeping old or damaged projects usable."""
+
+    if not isinstance(raw_texture_atlases, dict):
+        return TextureAtlasData()
+    try:
+        return TextureAtlasData.from_dict(raw_texture_atlases)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return TextureAtlasData()
 
 
 def _deserialize_initial_first_person_camera(

@@ -34,6 +34,9 @@ SURFACE_TYPES = frozenset(
     (SURFACE_TYPE_WALL, SURFACE_TYPE_FLOOR, SURFACE_TYPE_CEILING)
 )
 SURFACE_GEOMETRY_EPSILON = 1e-8
+DEFAULT_SURFACE_OVERLAY_OFFSET_METERS = 0.003
+MAX_SURFACE_OVERLAY_OFFSET_METERS = 0.05
+SURFACE_OVERLAY_COPLANAR_DECIMALS = 6
 DOORWAY_REVEAL_PARALLEL_COSINE = math.cos(math.radians(10.0))
 
 
@@ -50,6 +53,7 @@ class FixedSurface:
     mesh: trimesh.Trimesh
     area_square_meters: float
     wall_key: str | None = None
+    overlay_parent_surface_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.surface_id:
@@ -63,6 +67,8 @@ class FixedSurface:
             or float(self.area_square_meters) <= 0.0
         ):
             raise ValueError("A fixed surface area must be finite and positive.")
+        if self.overlay_parent_surface_id == self.surface_id:
+            raise ValueError("A surface overlay cannot be its own parent.")
 
 
 @dataclass(frozen=True)
@@ -124,6 +130,74 @@ def get_combined_surface_area(
             if surface.surface_id in requested_ids
         )
     )
+
+
+def build_surface_overlay_plane(
+    parent_surface: FixedSurface,
+    overlay_surface_id: str,
+    normal_offset_meters: float,
+) -> FixedSurface:
+    """Copy the parent's dominant plane at a small signed normal offset."""
+
+    if not isinstance(parent_surface, FixedSurface):
+        raise TypeError("A surface overlay requires a fixed parent surface.")
+    if parent_surface.overlay_parent_surface_id is not None:
+        raise ValueError("A surface overlay cannot be created on another overlay.")
+    normalized_id = str(overlay_surface_id).strip()
+    if not normalized_id:
+        raise ValueError("A surface overlay requires a stable ID.")
+    offset = _normalize_surface_overlay_offset(normal_offset_meters)
+    face_indices, plane_normal = _get_dominant_coplanar_face_patch(
+        parent_surface.mesh
+    )
+    source_vertices = np.asarray(parent_surface.mesh.vertices, dtype=float)
+    source_faces = np.asarray(parent_surface.mesh.faces, dtype=np.int64)
+    face_vertices = source_vertices[source_faces[face_indices]].copy()
+    face_vertices += plane_normal[np.newaxis, np.newaxis, :] * offset
+    vertices = face_vertices.reshape(-1, 3)
+    faces = np.arange(len(vertices), dtype=np.int64).reshape(-1, 3)
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    area = float(mesh.area)
+    if area <= SURFACE_GEOMETRY_EPSILON:
+        raise ValueError("A surface overlay requires a usable planar patch.")
+    return FixedSurface(
+        surface_id=normalized_id,
+        surface_type=parent_surface.surface_type,
+        level_index=parent_surface.level_index,
+        room_index=parent_surface.room_index,
+        wall_key=parent_surface.wall_key,
+        mesh=mesh,
+        area_square_meters=area,
+        overlay_parent_surface_id=parent_surface.surface_id,
+    )
+
+
+def get_surface_overlay_offset_toward_point(
+    parent_surface: FixedSurface,
+    world_point: Sequence[float],
+    distance_meters: float = DEFAULT_SURFACE_OVERLAY_OFFSET_METERS,
+) -> float:
+    """Choose the signed offset that puts an overlay toward a viewer point."""
+
+    if not isinstance(parent_surface, FixedSurface):
+        raise TypeError("A surface overlay requires a fixed parent surface.")
+    distance = abs(_normalize_surface_overlay_offset(distance_meters))
+    face_indices, plane_normal = _get_dominant_coplanar_face_patch(
+        parent_surface.mesh
+    )
+    try:
+        point = np.asarray(tuple(world_point), dtype=float)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "An overlay viewpoint must contain three coordinates."
+        ) from error
+    if point.shape != (3,) or not np.isfinite(point).all():
+        raise ValueError("An overlay viewpoint must contain finite XYZ coordinates.")
+    faces = np.asarray(parent_surface.mesh.faces, dtype=np.int64)[face_indices]
+    vertices = np.asarray(parent_surface.mesh.vertices, dtype=float)
+    centroid = np.mean(vertices[faces].reshape(-1, 3), axis=0)
+    direction = point - centroid
+    return distance if float(np.dot(direction, plane_normal)) >= 0.0 else -distance
 
 
 def build_wall_surface_id(
@@ -782,6 +856,75 @@ def _build_mesh(
         faces=np.asarray(faces, dtype=np.int64),
         process=False,
     )
+
+
+def _get_dominant_coplanar_face_patch(
+    mesh: trimesh.Trimesh,
+) -> tuple[np.ndarray, np.ndarray]:
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    vertices = np.asarray(mesh.vertices, dtype=float)
+    normals = np.asarray(mesh.face_normals, dtype=float)
+    areas = np.asarray(mesh.area_faces, dtype=float)
+    if (
+        faces.ndim != 2
+        or faces.shape[1:] != (3,)
+        or not len(faces)
+        or vertices.ndim != 2
+        or vertices.shape[1:] != (3,)
+        or normals.shape != (len(faces), 3)
+        or areas.shape != (len(faces),)
+    ):
+        raise ValueError("A surface overlay requires triangular parent geometry.")
+
+    grouped_indices: dict[tuple[float, ...], list[int]] = {}
+    group_normals: dict[tuple[float, ...], np.ndarray] = {}
+    for face_index, normal in enumerate(normals):
+        normal_length = float(np.linalg.norm(normal))
+        if normal_length <= SURFACE_GEOMETRY_EPSILON:
+            continue
+        unit_normal = normal / normal_length
+        plane_offset = float(np.dot(unit_normal, vertices[faces[face_index, 0]]))
+        key = tuple(
+            float(value)
+            for value in np.round(
+                np.append(unit_normal, plane_offset),
+                SURFACE_OVERLAY_COPLANAR_DECIMALS,
+            )
+        )
+        grouped_indices.setdefault(key, []).append(face_index)
+        group_normals.setdefault(key, unit_normal)
+    if not grouped_indices:
+        raise ValueError("A surface overlay requires a usable planar parent patch.")
+    dominant_key = max(
+        grouped_indices,
+        key=lambda key: (
+            float(np.sum(areas[grouped_indices[key]])),
+            len(grouped_indices[key]),
+            key,
+        ),
+    )
+    return (
+        np.asarray(grouped_indices[dominant_key], dtype=np.int64),
+        group_normals[dominant_key].copy(),
+    )
+
+
+def _normalize_surface_overlay_offset(value: object) -> float:
+    if isinstance(value, bool):
+        raise ValueError("A surface overlay offset must be a number.")
+    try:
+        offset = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("A surface overlay offset must be a number.") from error
+    if (
+        not math.isfinite(offset)
+        or abs(offset) <= SURFACE_GEOMETRY_EPSILON
+        or abs(offset) > MAX_SURFACE_OVERLAY_OFFSET_METERS
+    ):
+        raise ValueError(
+            "A surface overlay offset must be finite and no more than 5 cm."
+        )
+    return offset
 
 
 # ### Numeric and ordering helpers ###

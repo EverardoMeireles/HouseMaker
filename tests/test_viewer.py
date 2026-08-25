@@ -179,6 +179,28 @@ class GlbViewerRenderingTests(unittest.TestCase):
         self.assertFalse(viewer.textured_mesh_item.visible())
         self.assertTrue(viewer.mesh_item.opts["drawFaces"])
 
+    def test_texture_edit_mask_is_previewed_without_mutating_base_texture(
+        self,
+    ) -> None:
+        viewer = self._build_viewer()
+        viewer.set_model(_build_generated_model(textured=True))
+        assert viewer.textured_mesh_item is not None
+        textured_item = viewer.textured_mesh_item
+        base_texture = textured_item._texture_rgba.copy()
+        edit_mask = np.zeros((2, 2), dtype=np.uint8)
+        edit_mask[0, 0] = 255
+
+        viewer.set_texture_edit_mask(edit_mask)
+
+        self.assertTrue(textured_item._edit_mask_enabled)
+        np.testing.assert_array_equal(textured_item._edit_mask, edit_mask)
+        np.testing.assert_array_equal(textured_item._texture_rgba, base_texture)
+
+        viewer.set_texture_edit_mask(None)
+
+        self.assertFalse(textured_item._edit_mask_enabled)
+        np.testing.assert_array_equal(textured_item._texture_rgba, base_texture)
+
     def test_wireframe_only_forces_edges_and_hides_all_surfaces(self) -> None:
         viewer = self._build_viewer()
         viewer.set_model(_build_generated_model(textured=True))

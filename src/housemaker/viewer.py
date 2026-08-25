@@ -98,11 +98,20 @@ TEXTURED_AMBIENT_FRAGMENT_SHADER = """
     precision mediump float;
     #endif
     uniform sampler2D u_texture;
+    uniform sampler2D u_edit_mask;
+    uniform float u_edit_mask_enabled;
     uniform float u_ambient_light;
     varying vec3 v_normal;
     varying vec2 v_texcoord;
     void main() {
         vec4 base_color = texture2D(u_texture, v_texcoord);
+        float edit_amount = texture2D(u_edit_mask, v_texcoord).r
+            * u_edit_mask_enabled * 0.58;
+        base_color.rgb = mix(
+            base_color.rgb,
+            vec3(1.0, 0.49411765, 0.12549020),
+            edit_amount
+        );
         float diffuse = max(dot(v_normal, normalize(vec3(1.0, -1.0, -1.0))), 0.0);
         float illumination = min(1.0, u_ambient_light + diffuse * 0.65);
         gl_FragColor = vec4(base_color.rgb * illumination, base_color.a);
@@ -128,11 +137,16 @@ class SelectableGLViewWidget(gl.GLViewWidget):
     navigation_mode_changed = Signal(str)
     first_person_active_changed = Signal(bool)
     first_person_camera_pose_changed = Signal(object)
+    texture_inpaint_pointer_pressed = Signal(object)
+    texture_inpaint_pointer_moved = Signal(object)
+    texture_inpaint_pointer_released = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.click_press_position = QPointF()
         self._is_middle_navigation_active = False
+        self._texture_inpaint_enabled = False
+        self._texture_inpaint_pointer_active = False
         self._navigation_mode = NAVIGATION_MODE_ORBIT
         self._first_person_camera_pose = CameraPose(
             z=DEFAULT_FIRST_PERSON_HEIGHT_METERS
@@ -175,6 +189,53 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         if self.is_first_person_active and self.isVisible():
             self.grabMouse()
             self._center_pointer()
+
+    @property
+    def texture_inpaint_enabled(self) -> bool:
+        return self._texture_inpaint_enabled
+
+    def set_texture_inpaint_enabled(self, enabled: bool) -> None:
+        """Reserve left drags for painting the current model's UV texture."""
+
+        enabled = bool(enabled)
+        if enabled == self._texture_inpaint_enabled:
+            return
+        if enabled and self.is_first_person_active:
+            self.exit_first_person_mode()
+        self._texture_inpaint_enabled = enabled
+        self._texture_inpaint_pointer_active = False
+        if enabled:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.unsetCursor()
+
+    def build_camera_ray(
+        self,
+        position: QPointF,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """Return one world-space ray through a viewport position."""
+
+        width = max(float(self.width()), 1.0)
+        height = max(float(self.height()), 1.0)
+        normalized_x = 2.0 * float(position.x()) / width - 1.0
+        normalized_y = 1.0 - 2.0 * float(position.y()) / height
+        viewport = (0, 0, int(width), int(height))
+        inverse, invertible = (
+            self.projectionMatrix(viewport, viewport) * self.viewMatrix()
+        ).inverted()
+        if not invertible:
+            return None
+        near = inverse.map(QVector3D(normalized_x, normalized_y, -1.0))
+        far = inverse.map(QVector3D(normalized_x, normalized_y, 1.0))
+        origin = np.asarray((near.x(), near.y(), near.z()), dtype=float)
+        direction = np.asarray(
+            (far.x() - near.x(), far.y() - near.y(), far.z() - near.z()),
+            dtype=float,
+        )
+        length = float(np.linalg.norm(direction))
+        if not np.isfinite(length) or length <= 1e-12:
+            return None
+        return origin, direction / length
 
     def get_navigation_mode(self) -> str:
         """Return the active navigation mode."""
@@ -317,6 +378,15 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             event.accept()
             return
 
+        if (
+            self._texture_inpaint_enabled
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            self._texture_inpaint_pointer_active = True
+            self.texture_inpaint_pointer_pressed.emit(event.position())
+            event.accept()
+            return
+
         self.click_press_position = event.position()
         if event.button() == Qt.MouseButton.MiddleButton:
             self.mousePos = event.position()
@@ -330,6 +400,16 @@ class SelectableGLViewWidget(gl.GLViewWidget):
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
         if self.is_first_person_active:
+            event.accept()
+            return
+
+        if (
+            self._texture_inpaint_enabled
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            if self._texture_inpaint_pointer_active:
+                self.texture_inpaint_pointer_released.emit(event.position())
+            self._texture_inpaint_pointer_active = False
             event.accept()
             return
 
@@ -366,6 +446,15 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         delta = position - previous_position
         self.mousePos = position
         buttons = event.buttons()
+
+        if (
+            self._texture_inpaint_enabled
+            and self._texture_inpaint_pointer_active
+            and buttons & Qt.MouseButton.LeftButton
+        ):
+            self.texture_inpaint_pointer_moved.emit(event.position())
+            event.accept()
+            return
 
         if buttons & Qt.MouseButton.MiddleButton:
             self._is_middle_navigation_active = True
@@ -602,6 +691,8 @@ class TexturedMeshItem(GLGraphicsItem):
             texture_mesh_data.texture_rgba,
             dtype=np.uint8,
         )
+        self._edit_mask = np.zeros((1, 1), dtype=np.uint8)
+        self._edit_mask_enabled = False
         self._ambient_light_intensity = _normalize_ambient_light_intensity(
             ambient_light_intensity
         )
@@ -610,13 +701,39 @@ class TexturedMeshItem(GLGraphicsItem):
         self._normal_buffer: int | None = None
         self._texture_coordinate_buffer: int | None = None
         self._texture_id: int | None = None
+        self._edit_mask_texture_id: int | None = None
         self._shader_program: int | None = None
         self._resources_uploaded = False
+        self._edit_mask_dirty = False
 
     def set_ambient_light_intensity(self, intensity: float) -> None:
         self._ambient_light_intensity = _normalize_ambient_light_intensity(
             intensity
         )
+        self.update()
+
+    def set_edit_mask(self, mask: np.ndarray | None) -> None:
+        """Overlay the editable texels in orange without changing the model."""
+
+        if mask is None:
+            if not self._edit_mask_enabled:
+                return
+            self._edit_mask_enabled = False
+            self.update()
+            return
+        raw_mask = np.asarray(mask)
+        if raw_mask.ndim != 2 or raw_mask.size == 0:
+            raise ValueError("A texture edit mask must be a non-empty image.")
+        normalized_mask = np.ascontiguousarray(
+            raw_mask > 0,
+            dtype=np.uint8,
+        ) * 255
+        self._edit_mask_enabled = True
+        if np.array_equal(normalized_mask, self._edit_mask):
+            self.update()
+            return
+        self._edit_mask = normalized_mask
+        self._edit_mask_dirty = True
         self.update()
 
     def initializeGL(self) -> None:
@@ -656,6 +773,12 @@ class TexturedMeshItem(GLGraphicsItem):
             self._ambient_light_intensity,
         )
         _set_integer_uniform(self._shader_program, "u_texture", 0)
+        _set_integer_uniform(self._shader_program, "u_edit_mask", 1)
+        _set_float_uniform(
+            self._shader_program,
+            "u_edit_mask_enabled",
+            float(self._edit_mask_enabled),
+        )
 
         enabled_locations: list[int] = []
         try:
@@ -682,16 +805,30 @@ class TexturedMeshItem(GLGraphicsItem):
             )
             GL.glActiveTexture(GL.GL_TEXTURE0)
             GL.glBindTexture(GL.GL_TEXTURE_2D, self._texture_id)
+            GL.glActiveTexture(GL.GL_TEXTURE1)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, self._edit_mask_texture_id)
             GL.glDrawArrays(GL.GL_TRIANGLES, 0, len(self._vertices))
         finally:
             for location in enabled_locations:
                 GL.glDisableVertexAttribArray(location)
             GL.glBindBuffer(GL.GL_ARRAY_BUFFER, 0)
+            GL.glActiveTexture(GL.GL_TEXTURE1)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+            GL.glActiveTexture(GL.GL_TEXTURE0)
             GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
             GL.glUseProgram(0)
 
     def _ensure_gl_resources(self) -> None:
         if self._resources_uploaded:
+            if (
+                self._edit_mask_dirty
+                and self._edit_mask_texture_id is not None
+            ):
+                _replace_uploaded_mask_texture(
+                    self._edit_mask_texture_id,
+                    self._edit_mask,
+                )
+                self._edit_mask_dirty = False
             return
         self._shader_program = opengl_shaders.compileProgram(
             opengl_shaders.compileShader(
@@ -712,7 +849,9 @@ class TexturedMeshItem(GLGraphicsItem):
             self._texture_rgba,
             repeat=self._texture_repeat,
         )
+        self._edit_mask_texture_id = _upload_mask_texture(self._edit_mask)
         self._resources_uploaded = True
+        self._edit_mask_dirty = False
 
 
 class _WireframeOverlayMeshItem(gl.GLMeshItem):
@@ -779,6 +918,7 @@ class GlbViewerWidget(QWidget):
         self._wireframe_only = bool(wireframe_only)
         self._unused_face_camera_indicators_visible = False
         self._enabled_unused_face_camera_ids = ALL_CAMERA_IDS
+        self._texture_edit_mask: np.ndarray | None = None
         self._ambient_shader = _build_ambient_shader(
             self._ambient_light_intensity
         )
@@ -876,14 +1016,33 @@ class GlbViewerWidget(QWidget):
 
     def set_model(self, model: GeneratedModel, preserve_camera: bool = False) -> None:
         camera_state = self._capture_camera_state() if preserve_camera else None
+        self._texture_edit_mask = None
         self.model = model
         self._populate_scene()
         if camera_state is not None:
             self._restore_camera_state(camera_state)
 
     def clear_model(self) -> None:
+        self._texture_edit_mask = None
         self.model = None
         self._populate_scene()
+
+    def set_texture_edit_mask(self, mask: np.ndarray | None) -> None:
+        """Preview editable UV texels on the generated object's material."""
+
+        if mask is None:
+            self._texture_edit_mask = None
+        else:
+            raw_mask = np.asarray(mask)
+            if raw_mask.ndim != 2 or raw_mask.size == 0:
+                raise ValueError("A texture edit mask must be a non-empty image.")
+            self._texture_edit_mask = np.ascontiguousarray(
+                raw_mask > 0,
+                dtype=np.uint8,
+            )
+        if self.textured_mesh_item is not None:
+            self.textured_mesh_item.set_edit_mask(self._texture_edit_mask)
+        self.view.update()
 
     def set_ambient_light_intensity(self, intensity: float) -> None:
         """Set the view-wide ambient baseline from 0 (black) to 1 (full)."""
@@ -994,6 +1153,7 @@ class GlbViewerWidget(QWidget):
                 texture_mesh_data,
                 self._ambient_light_intensity,
             )
+            self.textured_mesh_item.set_edit_mask(self._texture_edit_mask)
             self.view.addItem(self.textured_mesh_item)
 
         self.mesh_item = _WireframeOverlayMeshItem(
@@ -1569,6 +1729,52 @@ def _upload_texture(texture_rgba: np.ndarray, *, repeat: bool = False) -> int:
     )
     GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
     return texture_id
+
+
+def _upload_mask_texture(mask: np.ndarray) -> int:
+    """Upload a one-channel UV edit mask for shader-side highlighting."""
+
+    texture_id = int(GL.glGenTextures(1))
+    GL.glActiveTexture(GL.GL_TEXTURE1)
+    GL.glBindTexture(GL.GL_TEXTURE_2D, texture_id)
+    GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_NEAREST)
+    GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_NEAREST)
+    GL.glTexParameteri(
+        GL.GL_TEXTURE_2D,
+        GL.GL_TEXTURE_WRAP_S,
+        GL.GL_CLAMP_TO_EDGE,
+    )
+    GL.glTexParameteri(
+        GL.GL_TEXTURE_2D,
+        GL.GL_TEXTURE_WRAP_T,
+        GL.GL_CLAMP_TO_EDGE,
+    )
+    _replace_uploaded_mask_texture(texture_id, mask)
+    return texture_id
+
+
+def _replace_uploaded_mask_texture(
+    texture_id: int,
+    mask: np.ndarray,
+) -> None:
+    """Replace one mask texture while its OpenGL context is current."""
+
+    GL.glActiveTexture(GL.GL_TEXTURE1)
+    GL.glBindTexture(GL.GL_TEXTURE_2D, int(texture_id))
+    GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
+    GL.glTexImage2D(
+        GL.GL_TEXTURE_2D,
+        0,
+        GL.GL_LUMINANCE,
+        mask.shape[1],
+        mask.shape[0],
+        0,
+        GL.GL_LUMINANCE,
+        GL.GL_UNSIGNED_BYTE,
+        np.ascontiguousarray(np.flipud(mask)),
+    )
+    GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+    GL.glActiveTexture(GL.GL_TEXTURE0)
 
 
 def _bind_float_attribute(

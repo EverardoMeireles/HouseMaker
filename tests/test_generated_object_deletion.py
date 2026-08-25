@@ -128,6 +128,9 @@ class GeneratedObjectAssetDeletionTests(unittest.TestCase):
             )
         )
         data_changed_spy = QSignalSpy(self.workspace.data_changed)
+        deleted_spy = QSignalSpy(
+            self.workspace.generated_object_deleted
+        )
 
         deleted = self.workspace.delete_generated_object("staged")
 
@@ -140,6 +143,8 @@ class GeneratedObjectAssetDeletionTests(unittest.TestCase):
         emitted_data = data_changed_spy.at(0)[0]
         self.assertIsInstance(emitted_data, GenerationData)
         self.assertEqual(emitted_data.generated_objects, [])
+        self.assertEqual(deleted_spy.count(), 1)
+        self.assertEqual(deleted_spy.at(0)[0], "staged")
 
     def test_delete_preserves_assets_referenced_by_a_live_object(self) -> None:
         shared_final_path = _write_asset(

@@ -18,6 +18,11 @@ from PySide6.QtWidgets import QApplication
 
 from housemaker.camera_models import CameraPose
 from housemaker.generation_state import MASK_MODE_PAINT, MaskPoint, MaskStroke
+from housemaker.glb import GeneratedModel, PreviewTexturedSurface
+from housemaker.surface_materials import (
+    ResolvedSurfaceMaterial,
+    build_world_planar_textured_mesh,
+)
 from housemaker.surface_geometry import (
     SURFACE_TYPE_CEILING,
     SURFACE_TYPE_FLOOR,
@@ -28,10 +33,12 @@ from housemaker.surface_texture_viewer import (
     SELECTED_SURFACE_EDGE_COLOR,
     SELECTED_SURFACE_OUTLINE_RADIUS_METERS,
     SurfaceTextureViewer,
+    RepeatingTexturedMeshItem,
     _build_camera_ray,
     _build_surface_texture_mesh_data,
     rasterize_texture_mask_strokes,
 )
+from housemaker.viewer import GlbViewerWidget
 
 
 # ### Module state ###
@@ -82,6 +89,39 @@ def _build_quad_surface(
         wall_key=surface_id if surface_type == SURFACE_TYPE_WALL else None,
         mesh=mesh,
         area_square_meters=area,
+    )
+
+
+def _build_canvas_model_with_surface(
+    surface: FixedSurface,
+    texture_rgba: np.ndarray,
+) -> GeneratedModel:
+    material = ResolvedSurfaceMaterial(
+        png_bytes=b"test-png-placeholder",
+        texture_rgba=texture_rgba,
+    )
+    textured_mesh = build_world_planar_textured_mesh(
+        surface.mesh,
+        surface.surface_type,
+        material,
+        overlay_offset_meters=0.002,
+    )
+    base_mesh = surface.mesh.copy()
+    return GeneratedModel(
+        mesh=base_mesh.copy(),
+        scene=trimesh.Scene(base_mesh.copy()),
+        glb_bytes=b"test-glb-placeholder",
+        preview_textured_surfaces=[
+            PreviewTexturedSurface(
+                surface_id=surface.surface_id,
+                surface_type=surface.surface_type,
+                mesh=textured_mesh,
+                level_index=surface.level_index,
+                room_index=surface.room_index,
+                wall_key=surface.wall_key,
+            )
+        ],
+        preview_untextured_mesh=base_mesh,
     )
 
 
@@ -357,6 +397,185 @@ class SurfaceTextureViewerCameraTests(unittest.TestCase):
         self.viewer.exit_first_person_mode()
 
         self.assertFalse(self.viewer.view.is_first_person_active)
+
+
+class SurfaceTextureViewerCanvasParityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.surface = _build_quad_surface("wall-one", SURFACE_TYPE_WALL)
+        self.texture_rgba = np.full(
+            (16, 16, 4),
+            (65, 115, 175, 255),
+            dtype=np.uint8,
+        )
+        self.model = _build_canvas_model_with_surface(
+            self.surface,
+            self.texture_rgba,
+        )
+        self.surface_viewer = SurfaceTextureViewer()
+        self.canvas_viewer = GlbViewerWidget()
+
+    def tearDown(self) -> None:
+        self.surface_viewer.close()
+        self.surface_viewer.deleteLater()
+        self.canvas_viewer.close()
+        self.canvas_viewer.deleteLater()
+        _qt_application.processEvents()
+
+    def test_canvas_model_supplies_identical_base_and_texture_geometry(self) -> None:
+        self.surface_viewer.set_surfaces((self.surface,))
+        self.surface_viewer.set_surface_texture(
+            (self.surface.surface_id,),
+            self.texture_rgba,
+        )
+        self.surface_viewer.set_scene_model(self.model)
+        self.canvas_viewer.set_model(self.model)
+
+        surface_scene = self.surface_viewer._canvas_scene_render_items
+        self.assertIsNotNone(surface_scene.grid_item)
+        self.assertIsNotNone(surface_scene.mesh_item)
+        self.assertIsNotNone(self.canvas_viewer.mesh_item)
+        assert surface_scene.mesh_item is not None
+        assert self.canvas_viewer.mesh_item is not None
+        self.assertEqual(
+            surface_scene.mesh_item.opts["drawFaces"],
+            self.canvas_viewer.mesh_item.opts["drawFaces"],
+        )
+        self.assertEqual(
+            surface_scene.mesh_item.opts["drawEdges"],
+            self.canvas_viewer.mesh_item.opts["drawEdges"],
+        )
+
+        surface_items = self.surface_viewer._render_items_by_surface_id[
+            self.surface.surface_id
+        ]
+        self.assertFalse(surface_items.face_item.opts["drawFaces"])
+        self.assertIsNotNone(surface_items.texture_item)
+        self.assertEqual(len(self.canvas_viewer.textured_surface_items), 1)
+        assert surface_items.texture_item is not None
+        canvas_texture_item = self.canvas_viewer.textured_surface_items[0]
+        np.testing.assert_allclose(
+            surface_items.texture_item._vertices,
+            canvas_texture_item._vertices,
+        )
+        np.testing.assert_allclose(
+            surface_items.texture_item._texture_coordinates,
+            canvas_texture_item._texture_coordinates,
+        )
+        self.assertEqual(
+            self.surface_viewer._ambient_light_intensity,
+            self.canvas_viewer.get_ambient_light_intensity(),
+        )
+
+    def test_shared_repeating_renderer_keeps_complete_mask_resources(self) -> None:
+        self.surface_viewer.set_surfaces((self.surface,))
+        self.surface_viewer.set_surface_texture(
+            (self.surface.surface_id,),
+            self.texture_rgba,
+        )
+        texture_item = self.surface_viewer._render_items_by_surface_id[
+            self.surface.surface_id
+        ].texture_item
+
+        self.assertIsNotNone(texture_item)
+        assert texture_item is not None
+        self.assertTrue(texture_item._texture_repeat)
+        self.assertNotIn(
+            "_ensure_gl_resources",
+            RepeatingTexturedMeshItem.__dict__,
+        )
+        self.assertTrue(hasattr(texture_item, "_edit_mask_texture_id"))
+
+    def test_both_canvas_sides_of_one_wall_remain_visible(self) -> None:
+        first_preview = self.model.preview_textured_surfaces[0]
+        opposite_mesh = first_preview.mesh.copy()
+        opposite_mesh.faces = np.asarray(opposite_mesh.faces, dtype=np.int64)[
+            :, ::-1
+        ].copy()
+        self.model.preview_textured_surfaces.append(
+            PreviewTexturedSurface(
+                surface_id=first_preview.surface_id,
+                surface_type=first_preview.surface_type,
+                mesh=opposite_mesh,
+                level_index=first_preview.level_index,
+                room_index=first_preview.room_index,
+                wall_key=first_preview.wall_key,
+            )
+        )
+        self.surface_viewer.set_surfaces((self.surface,))
+        self.surface_viewer.set_surface_texture(
+            (self.surface.surface_id,),
+            self.texture_rgba,
+        )
+
+        self.surface_viewer.set_scene_model(self.model)
+        self.canvas_viewer.set_model(self.model)
+
+        surface_items = self.surface_viewer._render_items_by_surface_id[
+            self.surface.surface_id
+        ]
+        self.assertIsNotNone(surface_items.texture_item)
+        self.assertEqual(len(surface_items.additional_texture_items), 1)
+        self.assertEqual(len(self.canvas_viewer.textured_surface_items), 2)
+
+    def test_scene_base_remains_visible_when_a_surface_texture_is_applied(self) -> None:
+        transparent_texture = self.texture_rgba.copy()
+        transparent_texture[:, :, 3] = 0
+        model = _build_canvas_model_with_surface(
+            self.surface,
+            transparent_texture,
+        )
+        self.surface_viewer.set_surfaces((self.surface,))
+        self.surface_viewer.set_surface_texture(
+            (self.surface.surface_id,),
+            transparent_texture,
+        )
+
+        self.surface_viewer.set_scene_model(model)
+
+        background_item = (
+            self.surface_viewer._canvas_scene_render_items.mesh_item
+        )
+        semantic_item = self.surface_viewer._render_items_by_surface_id[
+            self.surface.surface_id
+        ]
+        self.assertIsNotNone(background_item)
+        assert background_item is not None
+        self.assertTrue(background_item.opts["drawFaces"])
+        self.assertFalse(semantic_item.face_item.opts["drawFaces"])
+        self.assertIsNotNone(semantic_item.texture_item)
+
+    def test_scene_model_preserves_semantic_selection_and_inpaint_masks(self) -> None:
+        surface_id = self.surface.surface_id
+        self.surface_viewer.set_surfaces((self.surface,))
+        self.surface_viewer.set_surface_texture(
+            (surface_id,),
+            self.texture_rgba,
+        )
+        self.surface_viewer.set_scene_model(self.model)
+
+        picked_id = self.surface_viewer.pick_surface_from_ray(
+            (1.0, -2.0, 1.5),
+            (0.0, 1.0, 0.0),
+        )
+        self.surface_viewer.select_surface(surface_id)
+        self.surface_viewer.add_texture_mask_stroke(
+            surface_id,
+            MaskStroke(
+                mode=MASK_MODE_PAINT,
+                radius_normalized=0.1,
+                points=(MaskPoint(x=0.5, y=0.5),),
+            ),
+        )
+
+        render_items = self.surface_viewer._render_items_by_surface_id[
+            surface_id
+        ]
+        self.assertEqual(picked_id, surface_id)
+        self.assertIsNotNone(render_items.outline_item)
+        assert render_items.outline_item is not None
+        self.assertTrue(render_items.outline_item.visible())
+        self.assertTrue(self.surface_viewer.has_selected_texture_mask())
+        self.assertIsNotNone(render_items.texture_item)
 
 
 class SurfaceTextureMappingTests(unittest.TestCase):

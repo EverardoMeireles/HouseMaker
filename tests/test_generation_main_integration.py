@@ -115,6 +115,7 @@ class GenerationMainIntegrationTests(unittest.TestCase):
             tab_names,
             [
                 "Canvas",
+                "Atlas",
                 "Surface texture generation",
                 "Object generation",
                 "Settings",
@@ -123,6 +124,7 @@ class GenerationMainIntegrationTests(unittest.TestCase):
 
         expected_side_panel_visibility = {
             "Canvas": True,
+            "Atlas": False,
             "Surface texture generation": False,
             "Object generation": False,
             "Settings": False,

@@ -36,8 +36,11 @@ from housemaker.settings_widget import (
 )
 from housemaker.surface_texture_providers import SurfaceTextureResult
 from housemaker.surface_texture_state import (
+    SURFACE_TEXTURE_RESOLUTIONS,
     SurfaceTextureAssignment,
     SurfaceTextureData,
+    SurfaceTextureInpaintUndoSnapshot,
+    SurfaceTextureVariant,
 )
 from housemaker.surface_texture_workspace import (
     DefaultSurfaceTextureProvider,
@@ -138,6 +141,56 @@ def _set_current_mask(
 ) -> None:
     workspace.video_view.set_strokes([stroke])
     workspace._handle_video_strokes_changed([stroke])
+
+
+def _surface_assignment(
+    assignment_id: str,
+    surface_ids: tuple[str, ...],
+    asset_path: str,
+) -> SurfaceTextureAssignment:
+    return SurfaceTextureAssignment(
+        assignment_id=assignment_id,
+        surface_type="wall",
+        surface_ids=surface_ids,
+        provider="meshy",
+        asset_path=asset_path,
+    )
+
+
+def _surface_assignment_with_variants(
+    asset_directory: Path,
+    assignment_id: str,
+    surface_ids: tuple[str, ...],
+    *,
+    surface_type: str = "wall",
+    selected_resolution: int = 1024,
+    color: tuple[int, int, int, int] = (180, 80, 30, 255),
+) -> SurfaceTextureAssignment:
+    asset_directory.mkdir(parents=True, exist_ok=True)
+    variants: list[SurfaceTextureVariant] = []
+    for resolution in SURFACE_TEXTURE_RESOLUTIONS:
+        asset_path = f"{assignment_id}.texture-{resolution}.png"
+        Image.new("RGBA", (resolution, resolution), color).save(
+            asset_directory / asset_path,
+            format="PNG",
+        )
+        variants.append(SurfaceTextureVariant(resolution, asset_path))
+    active_path = next(
+        variant.asset_path
+        for variant in variants
+        if variant.resolution == selected_resolution
+    )
+    return SurfaceTextureAssignment(
+        assignment_id=assignment_id,
+        surface_type=surface_type,
+        surface_ids=surface_ids,
+        provider="meshy",
+        asset_path=active_path,
+        texture_width=selected_resolution,
+        texture_height=selected_resolution,
+        texture_variants=tuple(variants),
+        selected_texture_resolution=selected_resolution,
+    )
 
 
 # ### Provider fixtures ###
@@ -325,44 +378,58 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         )
         self.assertLessEqual(abs(splitter.sizes()[0] - splitter.sizes()[1]), 2)
 
-    def test_texture_view_tracks_latest_selected_surface_assignment(self) -> None:
+    def test_texture_view_shows_only_three_resolutions_for_selected_family(
+        self,
+    ) -> None:
         asset_directory = self._temporary_path / "surface_assets"
-        asset_directory.mkdir(exist_ok=True)
-        first_png = _colored_texture_png((210, 20, 35, 255))
-        second_png = _colored_texture_png((25, 190, 50, 255))
-        (asset_directory / "first.png").write_bytes(first_png)
-        (asset_directory / "second.png").write_bytes(second_png)
         surface_id = "level:2/room:5/floor"
+        assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "oak-floor",
+            (surface_id,),
+            surface_type="floor",
+            color=(25, 190, 50, 255),
+        )
         self.workspace.set_data(
             SurfaceTextureData(
                 selected_surface_type="floor",
                 selected_surface_ids=(surface_id,),
-                assignments=[
-                    SurfaceTextureAssignment(
-                        assignment_id="first-atlas",
-                        surface_type="floor",
-                        surface_ids=(surface_id,),
-                        provider="meshy",
-                        asset_path="first.png",
-                    ),
-                    SurfaceTextureAssignment(
-                        assignment_id="second-atlas",
-                        surface_type="floor",
-                        surface_ids=(surface_id,),
-                        provider="meshy",
-                        asset_path="second.png",
-                    ),
-                ],
+                assignments=[assignment],
             )
         )
 
-        self.assertEqual(len(self.workspace.texture_view.entries), 2)
+        self.assertEqual(
+            [entry.atlas_id for entry in self.workspace.texture_view.entries],
+            [
+                f"oak-floor:resolution:{resolution}"
+                for resolution in SURFACE_TEXTURE_RESOLUTIONS
+            ],
+        )
+        self.assertEqual(
+            [entry.display_name for entry in self.workspace.texture_view.entries],
+            ["512 x 512", "1024 x 1024", "2048 x 2048"],
+        )
         self.assertEqual(
             self.workspace.texture_view.selected_atlas_id,
-            "second-atlas",
+            "oak-floor:resolution:1024",
         )
         selected_image = self.workspace.texture_view.selected_entry.get_image()
         self.assertEqual(selected_image.pixelColor(0, 0).green(), 190)
+        cached_entries = self.workspace.texture_view.entries
+
+        self.workspace._handle_surface_selection_changed((surface_id,))
+
+        self.assertEqual(len(self.workspace.texture_view.entries), 3)
+        self.assertTrue(
+            all(
+                current is cached
+                for current, cached in zip(
+                    self.workspace.texture_view.entries,
+                    cached_entries,
+                    strict=True,
+                )
+            )
+        )
 
         self.workspace.set_external_3d_viewer_active(True)
         self.assertIs(
@@ -375,49 +442,208 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
             self.workspace.surface_3d_page,
         )
 
-    def test_texture_view_falls_back_to_latest_valid_surface_atlas(self) -> None:
+    def test_single_clicked_variant_changes_the_assignment_globally(self) -> None:
         asset_directory = self._temporary_path / "surface_assets"
-        asset_directory.mkdir(exist_ok=True)
-        (asset_directory / "valid.png").write_bytes(
-            _colored_texture_png((85, 120, 210, 255))
+        surface_ids = (
+            "level:2/room:5/wall:1:2",
+            "level:2/room:5/wall:2:3",
         )
+        assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "global-brick",
+            surface_ids,
+        )
+        self.workspace.set_data(
+            SurfaceTextureData(
+                selected_surface_type="wall",
+                selected_surface_ids=(surface_ids[0],),
+                assignments=[assignment],
+            )
+        )
+
+        self.assertTrue(
+            self.workspace.texture_view.select_atlas(
+                "global-brick:resolution:2048"
+            )
+        )
+        _qt_application.processEvents()
+
+        selected_assignment = self.workspace.get_data().assignments[0]
+        self.assertEqual(selected_assignment.selected_texture_resolution, 2048)
+        self.assertEqual(
+            selected_assignment.asset_path,
+            "global-brick.texture-2048.png",
+        )
+        for surface_id in surface_ids:
+            texture = self.workspace.surface_view.get_surface_texture_rgba(
+                surface_id
+            )
+            self.assertIsNotNone(texture)
+            self.assertEqual(texture.shape[:2], (2048, 2048))
+
+    def test_rejected_single_click_restores_the_active_resolution(self) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
         surface_id = "level:2/room:5/floor"
+        assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "blocked-floor",
+            (surface_id,),
+            surface_type="floor",
+        )
         self.workspace.set_data(
             SurfaceTextureData(
                 selected_surface_type="floor",
                 selected_surface_ids=(surface_id,),
-                assignments=[
-                    SurfaceTextureAssignment(
-                        assignment_id="valid-atlas",
-                        surface_type="floor",
-                        surface_ids=(surface_id,),
-                        provider="meshy",
-                        asset_path="valid.png",
-                    ),
-                    SurfaceTextureAssignment(
-                        assignment_id="missing-atlas",
-                        surface_type="floor",
-                        surface_ids=(surface_id,),
-                        provider="meshy",
-                        asset_path="missing.png",
-                    ),
-                ],
+                assignments=[assignment],
+            )
+        )
+        requests: list[tuple[str, int]] = []
+        self.workspace.set_texture_resolution_change_handler(
+            lambda assignment_id, resolution: (
+                requests.append((assignment_id, resolution)) or False
             )
         )
 
+        self.assertTrue(
+            self.workspace.texture_view.select_atlas(
+                "blocked-floor:resolution:2048"
+            )
+        )
+        _qt_application.processEvents()
+
+        self.assertEqual(requests, [("blocked-floor", 2048)])
+        selected_assignment = self.workspace.get_data().assignments[0]
+        self.assertEqual(selected_assignment.selected_texture_resolution, 1024)
         self.assertEqual(
-            [entry.atlas_id for entry in self.workspace.texture_view.entries],
-            ["valid-atlas"],
+            self.workspace.texture_view.selected_atlas_id,
+            "blocked-floor:resolution:1024",
+        )
+        self.assertIn(
+            "previous resolution was kept",
+            self.workspace.status_label.text(),
+        )
+
+    def test_texture_view_clears_stale_family_for_untextured_selection(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        textured_surface_id = "level:2/room:5/floor"
+        untextured_surface_id = "level:2/room:5/ceiling"
+        assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "valid-family",
+            (textured_surface_id,),
+            surface_type="floor",
+            color=(85, 120, 210, 255),
+        )
+        self.workspace.set_data(
+            SurfaceTextureData(
+                selected_surface_type="floor",
+                selected_surface_ids=(textured_surface_id,),
+                assignments=[assignment],
+            )
+        )
+        self.assertEqual(len(self.workspace.texture_view.entries), 3)
+
+        self.workspace.surface_view.set_selected_surface_ids(
+            (untextured_surface_id,)
+        )
+
+        self.assertEqual(self.workspace.texture_view.entries, ())
+        self.assertIsNone(self.workspace.texture_view.selected_atlas_id)
+
+    def test_double_clicked_variant_applies_family_to_selected_surfaces(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        source_surface_id = "level:2/room:5/wall:1:2"
+        target_surface_id = "level:2/room:5/wall:2:3"
+        target_assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "old-plaster",
+            (target_surface_id,),
+            color=(180, 40, 30, 255),
+        )
+        source_assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "new-brick",
+            (source_surface_id,),
+            color=(20, 170, 90, 255),
+        )
+        source_stroke = _test_stroke(0.25)
+        target_stroke = _test_stroke(0.75)
+        self.workspace.set_data(
+            SurfaceTextureData(
+                selected_surface_type="wall",
+                selected_surface_ids=(source_surface_id, target_surface_id),
+                texture_mask_strokes={
+                    source_surface_id: [source_stroke],
+                    target_surface_id: [target_stroke],
+                },
+                assignments=[target_assignment, source_assignment],
+                localized_inpaint_undo_stack=[
+                    SurfaceTextureInpaintUndoSnapshot(
+                        previous_assignments=(target_assignment,),
+                        replacement_assignment_ids=(
+                            source_assignment.assignment_id,
+                        ),
+                        affected_surface_ids=(target_surface_id,),
+                        previous_texture_mask_strokes={
+                            target_surface_id: (target_stroke,),
+                        },
+                    )
+                ],
+            )
+        )
+        removed = QSignalSpy(self.workspace.assignments_removed)
+        target_entry = next(
+            entry
+            for entry in self.workspace.texture_view.entries
+            if entry.atlas_id == "new-brick:resolution:2048"
+        )
+
+        self.workspace.texture_view.atlas_activated.emit(target_entry)
+        _qt_application.processEvents()
+
+        data = self.workspace.get_data()
+        self.assertEqual(len(data.assignments), 1)
+        selected_assignment = data.assignments[0]
+        self.assertEqual(selected_assignment.assignment_id, "new-brick")
+        self.assertEqual(
+            selected_assignment.surface_ids,
+            (source_surface_id, target_surface_id),
+        )
+        self.assertEqual(selected_assignment.selected_texture_resolution, 2048)
+        self.assertEqual(
+            selected_assignment.asset_path,
+            "new-brick.texture-2048.png",
+        )
+        self.assertEqual(
+            data.texture_mask_strokes,
+            {source_surface_id: [source_stroke]},
+        )
+        self.assertEqual(data.localized_inpaint_undo_stack, [])
+        self.assertEqual(tuple(removed.at(0)[0]), ("old-plaster",))
+        self.assertEqual(
+            self.workspace.surface_view.get_surface_texture_rgba(
+                target_surface_id
+            ).shape[:2],
+            (2048, 2048),
         )
         self.assertEqual(
             self.workspace.texture_view.selected_atlas_id,
-            "valid-atlas",
+            "new-brick:resolution:2048",
         )
-        cached_entry = self.workspace.texture_view.entries[0]
-
-        self.workspace._handle_surface_selection_changed((surface_id,))
-
-        self.assertIs(self.workspace.texture_view.entries[0], cached_entry)
+        self.assertEqual(len(self.workspace.texture_view.entries), 3)
+        self.assertTrue(
+            all(
+                not (
+                    asset_directory
+                    / f"old-plaster.texture-{resolution}.png"
+                ).exists()
+                for resolution in SURFACE_TEXTURE_RESOLUTIONS
+            )
+        )
 
     def test_multiframe_masks_build_request_with_selected_surface_area(self) -> None:
         video_path = self._temporary_path / "walkthrough.avi"
@@ -494,6 +720,131 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         )
         self.assertAlmostEqual(request.combined_area_m2, 6.0)
 
+    def test_localized_inpaint_uses_2048_base_and_preserves_active_resolution(
+        self,
+    ) -> None:
+        surface_id = "level:2/room:5/wall:1:2"
+        self.workspace.set_runtime_settings(
+            GenerationServiceSettings(
+                openai_api_key="openai-test-key",
+                surface_texture_provider=SURFACE_TEXTURE_PROVIDER_GPT_5_6_LUNA,
+            )
+        )
+        for selected_resolution in (512, 2048):
+            with self.subTest(selected_resolution=selected_resolution):
+                assignment = _surface_assignment_with_variants(
+                    self._temporary_path / "surface_assets",
+                    f"prior-{selected_resolution}",
+                    (surface_id,),
+                    selected_resolution=selected_resolution,
+                    color=(40, 90, 180, 255),
+                )
+                texture_stroke = _test_stroke(0.4)
+                self.workspace.set_data(
+                    SurfaceTextureData(
+                        selected_surface_type="wall",
+                        selected_surface_ids=(surface_id,),
+                        texture_mask_strokes={surface_id: [texture_stroke]},
+                        assignments=[assignment],
+                    )
+                )
+                video_path = (
+                    self._temporary_path
+                    / f"inpaint-{selected_resolution}.avi"
+                )
+                _write_test_video(video_path, frame_count=1)
+                self.workspace.load_video(str(video_path))
+                _set_current_mask(self.workspace, _test_stroke(0.2))
+
+                request = self.workspace._build_request()
+
+                self.assertIsNotNone(request)
+                assert request is not None
+                self.assertIsNotNone(request.existing_texture_png)
+                self.assertIsNotNone(request.edit_mask_png)
+                assert request.existing_texture_png is not None
+                assert request.edit_mask_png is not None
+                self.assertEqual(
+                    _decode_png_rgba(
+                        request.existing_texture_png,
+                        "Canonical inpaint base",
+                    ).shape[:2],
+                    (2048, 2048),
+                )
+                self.assertEqual(
+                    _decode_png_rgba(
+                        request.edit_mask_png,
+                        "Canonical inpaint mask",
+                    ).shape[:2],
+                    (2048, 2048),
+                )
+
+                self.workspace._handle_generation_succeeded(
+                    request,
+                    SurfaceTextureResult(
+                        provider="meshy",
+                        texture_png=_colored_texture_png(
+                            (20, 170, 90, 255)
+                        ),
+                        task_id=f"inpaint-{selected_resolution}",
+                    ),
+                )
+
+                generated_data = self.workspace.get_data()
+                self.assertEqual(len(generated_data.assignments), 1)
+                replacement = generated_data.assignments[0]
+                self.assertEqual(
+                    replacement.selected_texture_resolution,
+                    selected_resolution,
+                )
+                self.assertEqual(
+                    self.workspace.surface_view.get_surface_texture_rgba(
+                        surface_id
+                    ).shape[:2],
+                    (selected_resolution, selected_resolution),
+                )
+                self.assertEqual(
+                    len(generated_data.localized_inpaint_undo_stack),
+                    1,
+                )
+                replacement_paths = tuple(
+                    self._temporary_path
+                    / "surface_assets"
+                    / variant.asset_path
+                    for variant in replacement.texture_variants
+                )
+
+                self.assertTrue(
+                    self.workspace.undo_localized_texture_inpaint()
+                )
+
+                restored = self.workspace.get_data()
+                self.assertEqual(restored.assignments, [assignment])
+                self.assertEqual(restored.localized_inpaint_undo_stack, [])
+                self.assertEqual(
+                    restored.assignments[0].selected_texture_resolution,
+                    selected_resolution,
+                )
+                self.assertEqual(
+                    self.workspace.surface_view.get_surface_texture_rgba(
+                        surface_id
+                    ).shape[:2],
+                    (selected_resolution, selected_resolution),
+                )
+                self.assertTrue(
+                    all(
+                        (
+                            self._temporary_path
+                            / "surface_assets"
+                            / variant.asset_path
+                        ).is_file()
+                        for variant in assignment.texture_variants
+                    )
+                )
+                self.assertTrue(
+                    all(not path.exists() for path in replacement_paths)
+                )
+
     def test_async_result_is_persisted_applied_and_restored(self) -> None:
         video_path = self._temporary_path / "walkthrough.avi"
         _write_test_video(video_path, frame_count=1)
@@ -528,10 +879,47 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         self.assertEqual(assignment.provider_task_id, "texture-task-1")
         self.assertAlmostEqual(assignment.combined_area_m2, 4.0)
         self.assertEqual(assignment.reference_frame_indices, (0,))
-        self.assertEqual((assignment.texture_width, assignment.texture_height), (12, 8))
         self.assertEqual(
-            (self._temporary_path / "surface_assets" / assignment.asset_path).read_bytes(),
-            _texture_png(),
+            (assignment.texture_width, assignment.texture_height),
+            (1024, 1024),
+        )
+        self.assertEqual(assignment.selected_texture_resolution, 1024)
+        self.assertEqual(
+            [variant.resolution for variant in assignment.texture_variants],
+            list(SURFACE_TEXTURE_RESOLUTIONS),
+        )
+        self.assertEqual(
+            assignment.asset_path,
+            next(
+                variant.asset_path
+                for variant in assignment.texture_variants
+                if variant.resolution == 1024
+            ),
+        )
+        for variant in assignment.texture_variants:
+            with self.subTest(resolution=variant.resolution):
+                variant_path = (
+                    self._temporary_path
+                    / "surface_assets"
+                    / variant.asset_path
+                )
+                self.assertTrue(variant_path.is_file())
+                with Image.open(variant_path) as image:
+                    self.assertEqual(
+                        image.size,
+                        (variant.resolution, variant.resolution),
+                    )
+        self.assertEqual(
+            sorted(
+                path.name
+                for path in (
+                    self._temporary_path / "surface_assets"
+                ).glob("*.png")
+            ),
+            sorted(
+                variant.asset_path
+                for variant in assignment.texture_variants
+            ),
         )
         self.assertIn(surface_id, self.workspace.surface_view._surface_textures)
 
@@ -545,6 +933,474 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         finally:
             restored.shutdown()
             restored.close()
+
+    def test_generation_replaces_fully_covered_assignment_and_deletes_asset(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(exist_ok=True)
+        old_asset_path = asset_directory / "old-walls.png"
+        old_asset_path.write_bytes(_colored_texture_png((180, 40, 30, 255)))
+        first_wall = "level:2/room:5/wall:1:2"
+        second_wall = "level:2/room:5/wall:2:3"
+        self.workspace.set_data(
+            SurfaceTextureData(
+                assignments=[
+                    _surface_assignment(
+                        "old-walls",
+                        (first_wall, second_wall),
+                        old_asset_path.name,
+                    )
+                ]
+            )
+        )
+        removed = QSignalSpy(self.workspace.assignments_removed)
+        completed = QSignalSpy(self.workspace.generation_completed)
+        request = SurfaceTextureRequest(
+            provider="meshy",
+            api_key="test-key",
+            reference_pngs=(_texture_png(),),
+            reference_frame_indices=(0,),
+            surface_type="wall",
+            surface_ids=(first_wall, second_wall),
+            combined_area_m2=12.0,
+            prompt="Replace both walls",
+        )
+
+        self.workspace._handle_generation_succeeded(
+            request,
+            SurfaceTextureResult(
+                provider="meshy",
+                texture_png=_colored_texture_png((20, 170, 90, 255)),
+                task_id="replacement-task",
+            ),
+        )
+
+        assignments = self.workspace.get_data().assignments
+        self.assertEqual(len(assignments), 1)
+        self.assertNotEqual(assignments[0].assignment_id, "old-walls")
+        self.assertEqual(assignments[0].surface_ids, (first_wall, second_wall))
+        self.assertFalse(old_asset_path.exists())
+        self.assertEqual(removed.count(), 1)
+        self.assertEqual(tuple(removed.at(0)[0]), ("old-walls",))
+        self.assertEqual(completed.count(), 1)
+
+    def test_generation_trims_partially_covered_assignment_and_keeps_asset(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(exist_ok=True)
+        old_asset_path = asset_directory / "shared-walls.png"
+        old_asset_path.write_bytes(_colored_texture_png((180, 40, 30, 255)))
+        first_wall = "level:2/room:5/wall:1:2"
+        second_wall = "level:2/room:5/wall:2:3"
+        self.workspace.set_data(
+            SurfaceTextureData(
+                assignments=[
+                    _surface_assignment(
+                        "shared-walls",
+                        (first_wall, second_wall),
+                        old_asset_path.name,
+                    )
+                ]
+            )
+        )
+        removed = QSignalSpy(self.workspace.assignments_removed)
+        request = SurfaceTextureRequest(
+            provider="meshy",
+            api_key="test-key",
+            reference_pngs=(_texture_png(),),
+            reference_frame_indices=(0,),
+            surface_type="wall",
+            surface_ids=(first_wall,),
+            combined_area_m2=6.0,
+            prompt="Replace one wall",
+        )
+
+        self.workspace._handle_generation_succeeded(
+            request,
+            SurfaceTextureResult(
+                provider="meshy",
+                texture_png=_colored_texture_png((20, 170, 90, 255)),
+            ),
+        )
+
+        assignments = self.workspace.get_data().assignments
+        self.assertEqual(len(assignments), 2)
+        retained, replacement = assignments
+        self.assertEqual(retained.assignment_id, "shared-walls")
+        self.assertEqual(retained.surface_ids, (second_wall,))
+        self.assertAlmostEqual(retained.combined_area_m2, 6.0)
+        self.assertIn("1 wall surface(s)", retained.area_description)
+        self.assertEqual(replacement.surface_ids, (first_wall,))
+        self.assertTrue(old_asset_path.exists())
+        self.assertEqual(removed.count(), 0)
+
+    def test_localized_inpaint_undo_restores_assignment_asset_mask_and_signals(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(exist_ok=True)
+        old_png = _colored_texture_png((180, 40, 30, 255))
+        old_asset_path = asset_directory / "old-wall.png"
+        old_asset_path.write_bytes(old_png)
+        wall_id = "level:2/room:5/wall:1:2"
+        old_assignment = _surface_assignment(
+            "old-wall",
+            (wall_id,),
+            old_asset_path.name,
+        )
+        original_stroke = _test_stroke(0.3)
+        self.workspace.set_data(
+            SurfaceTextureData(
+                texture_mask_strokes={wall_id: [original_stroke]},
+                assignments=[old_assignment],
+            )
+        )
+        mask = np.zeros((7, 10), dtype=np.uint8)
+        mask[:, :4] = 255
+        request = SurfaceTextureRequest(
+            provider="meshy",
+            api_key="test-key",
+            reference_pngs=(_texture_png(),),
+            reference_frame_indices=(0,),
+            surface_type="wall",
+            surface_ids=(wall_id,),
+            combined_area_m2=6.0,
+            prompt="Localized edit",
+            existing_texture_png=old_png,
+            edit_mask_png=_encode_png(mask),
+            surface_edit_mask_pngs=((wall_id, _encode_png(mask)),),
+        )
+        removed = QSignalSpy(self.workspace.assignments_removed)
+        undone = QSignalSpy(self.workspace.localized_inpaint_undone)
+
+        self.workspace._handle_generation_succeeded(
+            request,
+            SurfaceTextureResult(
+                provider="meshy",
+                texture_png=_colored_texture_png((20, 170, 90, 255)),
+                task_id="localized-task",
+            ),
+        )
+
+        generated_data = self.workspace.get_data()
+        self.assertEqual(len(generated_data.assignments), 1)
+        replacement = generated_data.assignments[0]
+        replacement_path = asset_directory / replacement.asset_path
+        self.assertTrue(replacement_path.is_file())
+        self.assertTrue(old_asset_path.is_file())
+        self.assertEqual(len(generated_data.localized_inpaint_undo_stack), 1)
+        self.assertEqual(removed.count(), 0)
+        self.assertTrue(self.workspace.undo_inpaint_button.isEnabled())
+        self.assertEqual(
+            SurfaceTextureData.from_dict(generated_data.to_dict()),
+            generated_data,
+        )
+
+        self.assertTrue(self.workspace.undo_localized_texture_inpaint())
+
+        restored = self.workspace.get_data()
+        self.assertEqual(restored.assignments, [old_assignment])
+        self.assertEqual(restored.localized_inpaint_undo_stack, [])
+        self.assertEqual(
+            restored.texture_mask_strokes,
+            {wall_id: [original_stroke]},
+        )
+        self.assertTrue(old_asset_path.is_file())
+        self.assertFalse(replacement_path.exists())
+        self.assertEqual(removed.count(), 1)
+        self.assertEqual(tuple(removed.at(0)[0]), (replacement.assignment_id,))
+        self.assertEqual(undone.count(), 1)
+        self.assertFalse(self.workspace.undo_inpaint_button.isEnabled())
+        np.testing.assert_array_equal(
+            self.workspace.surface_view.get_surface_texture_rgba(wall_id),
+            _decode_png_rgba(old_png, "Old texture"),
+        )
+
+    def test_localized_inpaint_undo_blocks_atomically_when_old_asset_is_missing(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(exist_ok=True)
+        old_png = _colored_texture_png((180, 40, 30, 255))
+        old_asset_path = asset_directory / "old-wall.png"
+        old_asset_path.write_bytes(old_png)
+        wall_id = "level:2/room:5/wall:1:2"
+        old_assignment = _surface_assignment(
+            "old-wall",
+            (wall_id,),
+            old_asset_path.name,
+        )
+        mask = np.full((7, 10), 255, dtype=np.uint8)
+        self.workspace.set_data(SurfaceTextureData(assignments=[old_assignment]))
+        request = SurfaceTextureRequest(
+            provider="meshy",
+            api_key="test-key",
+            reference_pngs=(_texture_png(),),
+            reference_frame_indices=(0,),
+            surface_type="wall",
+            surface_ids=(wall_id,),
+            combined_area_m2=6.0,
+            prompt="Localized edit",
+            existing_texture_png=old_png,
+            edit_mask_png=_encode_png(mask),
+            surface_edit_mask_pngs=((wall_id, _encode_png(mask)),),
+        )
+        self.workspace._handle_generation_succeeded(
+            request,
+            SurfaceTextureResult(
+                provider="meshy",
+                texture_png=_colored_texture_png((20, 170, 90, 255)),
+            ),
+        )
+        generated_data = self.workspace.get_data()
+        old_asset_path.unlink()
+        removed = QSignalSpy(self.workspace.assignments_removed)
+
+        self.assertFalse(self.workspace.undo_localized_texture_inpaint())
+
+        self.assertEqual(self.workspace.get_data(), generated_data)
+        self.assertEqual(removed.count(), 0)
+        self.assertIn("missing", self.workspace.status_label.text())
+
+    def test_full_generation_invalidates_localized_inpaint_history(self) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(exist_ok=True)
+        old_png = _colored_texture_png((180, 40, 30, 255))
+        old_asset_path = asset_directory / "old-wall.png"
+        old_asset_path.write_bytes(old_png)
+        wall_id = "level:2/room:5/wall:1:2"
+        old_assignment = _surface_assignment(
+            "old-wall",
+            (wall_id,),
+            old_asset_path.name,
+        )
+        self.workspace.set_data(SurfaceTextureData(assignments=[old_assignment]))
+        mask = np.full((7, 10), 255, dtype=np.uint8)
+        localized_request = SurfaceTextureRequest(
+            provider="meshy",
+            api_key="test-key",
+            reference_pngs=(_texture_png(),),
+            reference_frame_indices=(0,),
+            surface_type="wall",
+            surface_ids=(wall_id,),
+            combined_area_m2=6.0,
+            prompt="Localized edit",
+            existing_texture_png=old_png,
+            edit_mask_png=_encode_png(mask),
+            surface_edit_mask_pngs=((wall_id, _encode_png(mask)),),
+        )
+        self.workspace._handle_generation_succeeded(
+            localized_request,
+            SurfaceTextureResult(
+                provider="meshy",
+                texture_png=_colored_texture_png((20, 170, 90, 255)),
+            ),
+        )
+        localized_assignment = self.workspace.get_data().assignments[0]
+        removed = QSignalSpy(self.workspace.assignments_removed)
+        full_request = SurfaceTextureRequest(
+            provider="meshy",
+            api_key="test-key",
+            reference_pngs=(_texture_png(),),
+            reference_frame_indices=(0,),
+            surface_type="wall",
+            surface_ids=(wall_id,),
+            combined_area_m2=6.0,
+            prompt="Full replacement",
+        )
+
+        self.workspace._handle_generation_succeeded(
+            full_request,
+            SurfaceTextureResult(
+                provider="meshy",
+                texture_png=_colored_texture_png((30, 80, 210, 255)),
+            ),
+        )
+
+        self.assertEqual(
+            self.workspace.get_data().localized_inpaint_undo_stack,
+            [],
+        )
+        self.assertFalse(self.workspace.undo_localized_texture_inpaint())
+        removed_ids = {
+            str(value)
+            for signal_arguments in (
+                removed.at(index) for index in range(removed.count())
+            )
+            for value in signal_arguments[0]
+        }
+        self.assertEqual(
+            removed_ids,
+            {old_assignment.assignment_id, localized_assignment.assignment_id},
+        )
+        self.assertFalse(old_asset_path.exists())
+
+    def test_removed_assignment_asset_is_kept_while_another_record_uses_it(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(exist_ok=True)
+        shared_asset_path = asset_directory / "shared.png"
+        shared_asset_path.write_bytes(_colored_texture_png((180, 40, 30, 255)))
+        first_wall = "level:2/room:5/wall:1:2"
+        second_wall = "level:2/room:5/wall:2:3"
+        self.workspace.set_data(
+            SurfaceTextureData(
+                assignments=[
+                    _surface_assignment(
+                        "first-record",
+                        (first_wall,),
+                        shared_asset_path.name,
+                    ),
+                    _surface_assignment(
+                        "second-record",
+                        (second_wall,),
+                        shared_asset_path.name,
+                    ),
+                ]
+            )
+        )
+        removed = QSignalSpy(self.workspace.assignments_removed)
+        request = SurfaceTextureRequest(
+            provider="meshy",
+            api_key="test-key",
+            reference_pngs=(_texture_png(),),
+            reference_frame_indices=(0,),
+            surface_type="wall",
+            surface_ids=(first_wall,),
+            combined_area_m2=6.0,
+            prompt="Replace one record",
+        )
+
+        self.workspace._handle_generation_succeeded(
+            request,
+            SurfaceTextureResult(
+                provider="meshy",
+                texture_png=_colored_texture_png((20, 170, 90, 255)),
+            ),
+        )
+
+        assignments = self.workspace.get_data().assignments
+        self.assertEqual(
+            [assignment.assignment_id for assignment in assignments[:-1]],
+            ["second-record"],
+        )
+        self.assertTrue(shared_asset_path.exists())
+        self.assertEqual(tuple(removed.at(0)[0]), ("first-record",))
+
+    @unittest.skipUnless(os.name == "nt", "Windows path casing regression")
+    def test_orphan_cleanup_keeps_case_aliased_active_asset(self) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(exist_ok=True)
+        shared_asset_path = asset_directory / "Shared.PNG"
+        shared_asset_path.write_bytes(_colored_texture_png((180, 40, 30, 255)))
+        first_wall = "level:2/room:5/wall:1:2"
+        second_wall = "level:2/room:5/wall:2:3"
+        retained = _surface_assignment(
+            "retained",
+            (second_wall,),
+            "shared.png",
+        )
+        removed = _surface_assignment(
+            "removed",
+            (first_wall,),
+            "Shared.PNG",
+        )
+        self.workspace.set_data(SurfaceTextureData(assignments=[retained]))
+
+        failure_count = self.workspace._delete_orphaned_assignment_assets(
+            [removed]
+        )
+
+        self.assertEqual(failure_count, 0)
+        self.assertTrue(shared_asset_path.exists())
+
+    def test_multi_output_apply_failure_restores_assignments_and_assets(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(exist_ok=True)
+        old_texture = _colored_texture_png((180, 40, 30, 255))
+        old_asset_path = asset_directory / "old.png"
+        old_asset_path.write_bytes(old_texture)
+        first_wall = "level:2/room:5/wall:1:2"
+        second_wall = "level:2/room:5/wall:2:3"
+        original_assignment = _surface_assignment(
+            "old",
+            (first_wall, second_wall),
+            old_asset_path.name,
+        )
+        self.workspace.set_data(
+            SurfaceTextureData(assignments=[original_assignment])
+        )
+        first_texture = _colored_texture_png((20, 170, 90, 255))
+        second_texture = _colored_texture_png((30, 80, 210, 255))
+        request = SurfaceTextureRequest(
+            provider="meshy",
+            api_key="test-key",
+            reference_pngs=(_texture_png(),),
+            reference_frame_indices=(0,),
+            surface_type="wall",
+            surface_ids=(first_wall, second_wall),
+            combined_area_m2=12.0,
+            prompt="Replace both walls",
+        )
+        original_apply = self.workspace.surface_view.set_surface_texture
+        apply_count = 0
+
+        def apply_with_second_failure(
+            surface_ids: tuple[str, ...],
+            texture: object,
+        ) -> None:
+            nonlocal apply_count
+            apply_count += 1
+            if apply_count == 2:
+                raise ValueError("simulated second output failure")
+            original_apply(surface_ids, texture)  # type: ignore[arg-type]
+
+        with (
+            patch(
+                "housemaker.surface_texture_workspace."
+                "_build_surface_texture_outputs",
+                return_value=[
+                    ((first_wall,), first_texture),
+                    ((second_wall,), second_texture),
+                ],
+            ),
+            patch.object(
+                self.workspace.surface_view,
+                "set_surface_texture",
+                side_effect=apply_with_second_failure,
+            ),
+        ):
+            self.workspace._handle_generation_succeeded(
+                request,
+                SurfaceTextureResult(
+                    provider="meshy",
+                    texture_png=first_texture,
+                ),
+            )
+
+        self.assertEqual(
+            self.workspace.get_data().assignments,
+            [original_assignment],
+        )
+        self.assertEqual(
+            sorted(path.name for path in asset_directory.iterdir()),
+            [old_asset_path.name],
+        )
+        expected = _decode_png_rgba(old_texture, "Old texture")
+        np.testing.assert_array_equal(
+            self.workspace.surface_view.get_surface_texture_rgba(first_wall),
+            expected,
+        )
+        np.testing.assert_array_equal(
+            self.workspace.surface_view.get_surface_texture_rgba(second_wall),
+            expected,
+        )
+        self.assertIn("could not be applied", self.workspace.status_label.text())
 
     def test_legacy_room_index_assignment_is_not_retargeted_on_restore(self) -> None:
         asset_path = self._temporary_path / "surface_assets" / "legacy.png"

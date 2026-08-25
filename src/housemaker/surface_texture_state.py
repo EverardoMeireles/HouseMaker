@@ -16,7 +16,7 @@ from housemaker.video_source import VideoMetadata
 
 
 # ### Constants ###
-SURFACE_TEXTURE_SCHEMA_VERSION = 2
+SURFACE_TEXTURE_SCHEMA_VERSION = 4
 SURFACE_TYPE_WALL = "wall"
 SURFACE_TYPE_FLOOR = "floor"
 SURFACE_TYPE_CEILING = "ceiling"
@@ -40,16 +40,99 @@ MAX_ASSET_PATH_LENGTH = 2_048
 MAX_AREA_DESCRIPTION_LENGTH = 4_096
 MAX_COMBINED_AREA_M2 = 1_000_000_000.0
 MAX_TEXTURE_DIMENSION_PIXELS = 16_384
+SURFACE_TEXTURE_RESOLUTIONS = (512, 1024, 2048)
+DEFAULT_SURFACE_TEXTURE_RESOLUTION = 1024
+MAX_LOCALIZED_INPAINT_UNDO_HISTORY = 10
+MAX_SURFACE_OVERLAY_PLANES = 10_000
+MAX_SURFACE_OVERLAY_OFFSET_METERS = 0.05
+SURFACE_OVERLAY_ID_SUFFIX = "/overlay:1"
 
 _SURFACE_ID_PATTERN = re.compile(
     r"^level:(?P<level_index>0|[1-9]\d*)/"
     r"(?:room:(?P<room_identity>0|[1-9]\d*)/)?"
     r"(?:(?P<wall>wall):(?P<wall_key>[1-9]\d*:[1-9]\d*)|"
-    r"(?P<plane>floor|ceiling))$"
+    r"(?P<plane>floor|ceiling))"
+    r"(?P<overlay>/overlay:(?P<overlay_key>[1-9]\d*))?$"
 )
 
 
+# ### Surface-overlay models ###
+@dataclass(frozen=True)
+class SurfaceTextureOverlayPlane:
+    """One persisted close-offset plane derived from a fixed surface."""
+
+    parent_surface_id: str
+    normal_offset_meters: float
+
+    def __post_init__(self) -> None:
+        parent_surface_id = _normalize_surface_id(self.parent_surface_id)
+        if _is_overlay_surface_id(parent_surface_id):
+            raise ValueError("A surface overlay cannot be placed on another overlay.")
+        normal_offset_meters = _normalize_surface_overlay_offset(
+            self.normal_offset_meters
+        )
+        object.__setattr__(self, "parent_surface_id", parent_surface_id)
+        object.__setattr__(self, "normal_offset_meters", normal_offset_meters)
+
+    @property
+    def surface_id(self) -> str:
+        return f"{self.parent_surface_id}{SURFACE_OVERLAY_ID_SUFFIX}"
+
+    @property
+    def surface_type(self) -> str:
+        return _surface_type_for_id(self.parent_surface_id)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "surface_id": self.surface_id,
+            "parent_surface_id": self.parent_surface_id,
+            "normal_offset_meters": float(self.normal_offset_meters),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "SurfaceTextureOverlayPlane":
+        if not isinstance(payload, dict):
+            raise ValueError("A surface overlay plane must contain an object.")
+        plane = cls(
+            parent_surface_id=str(payload.get("parent_surface_id", "")),
+            normal_offset_meters=payload.get("normal_offset_meters", 0.0),
+        )
+        raw_surface_id = payload.get("surface_id")
+        if raw_surface_id is not None and str(raw_surface_id) != plane.surface_id:
+            raise ValueError("A surface overlay plane has an inconsistent ID.")
+        return plane
+
+
 # ### Generated-texture models ###
+@dataclass(frozen=True)
+class SurfaceTextureVariant:
+    """One exact square PNG belonging to a generated surface texture."""
+
+    resolution: int
+    asset_path: str
+
+    def __post_init__(self) -> None:
+        resolution = _normalize_surface_texture_resolution(self.resolution)
+        asset_path = _normalize_safe_relative_asset_path(self.asset_path)
+        object.__setattr__(self, "resolution", resolution)
+        object.__setattr__(self, "asset_path", asset_path)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "resolution": self.resolution,
+            "asset_path": self.asset_path,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "SurfaceTextureVariant":
+        if not isinstance(payload, dict):
+            raise ValueError("A surface texture variant must contain an object.")
+        return cls(
+            resolution=payload.get("resolution", payload.get("size")),
+            asset_path=str(payload.get("asset_path", payload.get("path", ""))),
+        )
+
+
 @dataclass(frozen=True)
 class SurfaceTextureAssignment:
     """One generated texture assigned to a homogeneous group of surfaces."""
@@ -65,6 +148,8 @@ class SurfaceTextureAssignment:
     reference_frame_indices: tuple[int, ...] = ()
     texture_width: int | None = None
     texture_height: int | None = None
+    texture_variants: tuple[SurfaceTextureVariant, ...] = ()
+    selected_texture_resolution: int | None = None
 
     def __post_init__(self) -> None:
         assignment_id = _normalize_required_text(
@@ -103,6 +188,36 @@ class SurfaceTextureAssignment:
             self.texture_width,
             self.texture_height,
         )
+        texture_variants = _normalize_surface_texture_variants(
+            self.texture_variants
+        )
+        selected_texture_resolution = _normalize_selected_texture_resolution(
+            self.selected_texture_resolution,
+            texture_variants,
+            asset_path,
+        )
+        if selected_texture_resolution is not None:
+            selected_variant = next(
+                variant
+                for variant in texture_variants
+                if variant.resolution == selected_texture_resolution
+            )
+            if selected_variant.asset_path != asset_path:
+                raise ValueError(
+                    "The active surface texture asset does not match its "
+                    "selected resolution."
+                )
+            if texture_width is None and texture_height is None:
+                texture_width = selected_texture_resolution
+                texture_height = selected_texture_resolution
+            elif (texture_width, texture_height) != (
+                selected_texture_resolution,
+                selected_texture_resolution,
+            ):
+                raise ValueError(
+                    "The active surface texture dimensions do not match its "
+                    "selected resolution."
+                )
 
         object.__setattr__(self, "assignment_id", assignment_id)
         object.__setattr__(self, "surface_type", surface_type)
@@ -119,6 +234,33 @@ class SurfaceTextureAssignment:
         )
         object.__setattr__(self, "texture_width", texture_width)
         object.__setattr__(self, "texture_height", texture_height)
+        object.__setattr__(self, "texture_variants", texture_variants)
+        object.__setattr__(
+            self,
+            "selected_texture_resolution",
+            selected_texture_resolution,
+        )
+
+    def texture_variant_for_resolution(
+        self,
+        resolution: int,
+    ) -> SurfaceTextureVariant | None:
+        """Return one exact persisted variant without changing selection."""
+
+        try:
+            normalized_resolution = _normalize_surface_texture_resolution(
+                resolution
+            )
+        except ValueError:
+            return None
+        return next(
+            (
+                variant
+                for variant in self.texture_variants
+                if variant.resolution == normalized_resolution
+            ),
+            None,
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -133,6 +275,10 @@ class SurfaceTextureAssignment:
             "reference_frame_indices": list(self.reference_frame_indices),
             "texture_width": self.texture_width,
             "texture_height": self.texture_height,
+            "texture_variants": [
+                variant.to_dict() for variant in self.texture_variants
+            ],
+            "selected_texture_resolution": self.selected_texture_resolution,
         }
 
     @classmethod
@@ -157,6 +303,16 @@ class SurfaceTextureAssignment:
         )
         if not isinstance(raw_reference_frames, list | tuple):
             raise ValueError("Surface texture reference frames must contain a list.")
+        raw_texture_variants = payload.get(
+            "texture_variants",
+            payload.get("variants", ()),
+        )
+        if not isinstance(raw_texture_variants, list | tuple):
+            raise ValueError("Surface texture variants must contain a list.")
+        texture_variants = tuple(
+            SurfaceTextureVariant.from_dict(raw_variant)
+            for raw_variant in raw_texture_variants
+        )
 
         return cls(
             assignment_id=str(payload.get("assignment_id", payload.get("id", ""))),
@@ -175,6 +331,116 @@ class SurfaceTextureAssignment:
             reference_frame_indices=tuple(raw_reference_frames),
             texture_width=payload.get("texture_width", payload.get("width")),
             texture_height=payload.get("texture_height", payload.get("height")),
+            texture_variants=texture_variants,
+            selected_texture_resolution=payload.get(
+                "selected_texture_resolution",
+                payload.get("texture_resolution"),
+            ),
+        )
+
+
+# ### Localized-inpaint undo models ###
+@dataclass(frozen=True)
+class SurfaceTextureInpaintUndoSnapshot:
+    """One complete pre-inpaint assignment state plus its painted masks."""
+
+    previous_assignments: tuple[SurfaceTextureAssignment, ...]
+    replacement_assignment_ids: tuple[str, ...]
+    affected_surface_ids: tuple[str, ...]
+    previous_texture_mask_strokes: dict[str, tuple[MaskStroke, ...]] = field(
+        default_factory=dict
+    )
+
+    def __post_init__(self) -> None:
+        previous_assignments = tuple(self.previous_assignments)
+        if len(previous_assignments) > MAX_SURFACE_TEXTURE_ASSIGNMENTS:
+            raise ValueError("An inpaint undo snapshot has too many assignments.")
+        if not all(
+            isinstance(assignment, SurfaceTextureAssignment)
+            for assignment in previous_assignments
+        ):
+            raise ValueError("An inpaint undo snapshot has invalid assignments.")
+        previous_ids = [
+            assignment.assignment_id for assignment in previous_assignments
+        ]
+        if len(previous_ids) != len(set(previous_ids)):
+            raise ValueError("An inpaint undo snapshot has duplicate assignments.")
+
+        replacement_ids = _normalize_assignment_ids(
+            self.replacement_assignment_ids,
+            allow_empty=False,
+        )
+        affected_ids = _normalize_undo_surface_ids(self.affected_surface_ids)
+        previous_strokes: dict[str, tuple[MaskStroke, ...]] = {}
+        if not isinstance(self.previous_texture_mask_strokes, dict):
+            raise ValueError("An inpaint undo snapshot has invalid mask strokes.")
+        for raw_surface_id, raw_strokes in (
+            self.previous_texture_mask_strokes.items()
+        ):
+            surface_id = _normalize_surface_id(raw_surface_id)
+            if surface_id not in affected_ids:
+                raise ValueError(
+                    "An inpaint undo mask targets an unaffected surface."
+                )
+            strokes = tuple(_normalize_frame_strokes(raw_strokes))
+            if strokes:
+                previous_strokes[surface_id] = strokes
+
+        object.__setattr__(self, "previous_assignments", previous_assignments)
+        object.__setattr__(self, "replacement_assignment_ids", replacement_ids)
+        object.__setattr__(self, "affected_surface_ids", affected_ids)
+        object.__setattr__(
+            self,
+            "previous_texture_mask_strokes",
+            previous_strokes,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "previous_assignments": [
+                assignment.to_dict() for assignment in self.previous_assignments
+            ],
+            "replacement_assignment_ids": list(self.replacement_assignment_ids),
+            "affected_surface_ids": list(self.affected_surface_ids),
+            "previous_texture_mask_strokes": {
+                surface_id: [stroke.to_dict() for stroke in strokes]
+                for surface_id, strokes in sorted(
+                    self.previous_texture_mask_strokes.items()
+                )
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "SurfaceTextureInpaintUndoSnapshot":
+        if not isinstance(payload, dict):
+            raise ValueError("An inpaint undo snapshot must contain an object.")
+        raw_previous = payload.get("previous_assignments", ())
+        if not isinstance(raw_previous, list | tuple):
+            raise ValueError("Inpaint undo assignments must contain a list.")
+        previous_assignments = tuple(
+            SurfaceTextureAssignment.from_dict(raw_assignment)
+            for raw_assignment in raw_previous
+        )
+        raw_replacement_ids = payload.get("replacement_assignment_ids", ())
+        raw_affected_ids = payload.get("affected_surface_ids", ())
+        if not isinstance(raw_replacement_ids, list | tuple) or not isinstance(
+            raw_affected_ids,
+            list | tuple,
+        ):
+            raise ValueError("Inpaint undo surface and assignment IDs need lists.")
+        previous_strokes = _load_texture_mask_strokes(
+            payload.get("previous_texture_mask_strokes", {})
+        )
+        return cls(
+            previous_assignments=previous_assignments,
+            replacement_assignment_ids=tuple(
+                str(value) for value in raw_replacement_ids
+            ),
+            affected_surface_ids=tuple(str(value) for value in raw_affected_ids),
+            previous_texture_mask_strokes={
+                surface_id: tuple(strokes)
+                for surface_id, strokes in previous_strokes.items()
+            },
         )
 
 
@@ -191,6 +457,10 @@ class SurfaceTextureData:
     selected_surface_type: str | None = None
     selected_surface_ids: tuple[str, ...] = ()
     assignments: list[SurfaceTextureAssignment] = field(default_factory=list)
+    overlay_planes: list[SurfaceTextureOverlayPlane] = field(default_factory=list)
+    localized_inpaint_undo_stack: list[
+        SurfaceTextureInpaintUndoSnapshot
+    ] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.video_metadata is not None and not isinstance(
@@ -224,6 +494,19 @@ class SurfaceTextureData:
             self.selected_surface_type,
             self.selected_surface_ids,
         )
+        overlay_planes = list(self.overlay_planes)
+        if len(overlay_planes) > MAX_SURFACE_OVERLAY_PLANES:
+            raise ValueError("Surface texture data contains too many overlay planes.")
+        if not all(
+            isinstance(plane, SurfaceTextureOverlayPlane)
+            for plane in overlay_planes
+        ):
+            raise ValueError(
+                "Surface texture overlay planes have invalid values."
+            )
+        parent_surface_ids = [plane.parent_surface_id for plane in overlay_planes]
+        if len(set(parent_surface_ids)) != len(parent_surface_ids):
+            raise ValueError("Only one overlay plane may exist per fixed surface.")
         assignments = list(self.assignments)
         if len(assignments) > MAX_SURFACE_TEXTURE_ASSIGNMENTS:
             raise ValueError("Surface texture data contains too many assignments.")
@@ -237,13 +520,23 @@ class SurfaceTextureData:
         assignment_ids = [assignment.assignment_id for assignment in assignments]
         if len(set(assignment_ids)) != len(assignment_ids):
             raise ValueError("Surface texture assignment IDs must be unique.")
+        undo_stack = list(self.localized_inpaint_undo_stack)
+        if len(undo_stack) > MAX_LOCALIZED_INPAINT_UNDO_HISTORY:
+            raise ValueError("Surface texture data has too much inpaint undo history.")
+        if not all(
+            isinstance(snapshot, SurfaceTextureInpaintUndoSnapshot)
+            for snapshot in undo_stack
+        ):
+            raise ValueError("Surface texture inpaint undo history is invalid.")
 
         self.current_frame_index = current_frame_index
         self.frame_strokes = normalized_frame_strokes
         self.texture_mask_strokes = normalized_texture_mask_strokes
         self.selected_surface_type = selected_surface_type
         self.selected_surface_ids = selected_surface_ids
+        self.overlay_planes = overlay_planes
         self.assignments = assignments
+        self.localized_inpaint_undo_stack = undo_stack
 
     @property
     def generated_assignments(self) -> list[SurfaceTextureAssignment]:
@@ -339,7 +632,12 @@ class SurfaceTextureData:
             ),
             "selected_surface_type": self.selected_surface_type,
             "selected_surface_ids": list(self.selected_surface_ids),
+            "overlay_planes": [plane.to_dict() for plane in self.overlay_planes],
             "assignments": [assignment.to_dict() for assignment in self.assignments],
+            "localized_inpaint_undo_stack": [
+                snapshot.to_dict()
+                for snapshot in self.localized_inpaint_undo_stack
+            ],
         }
 
     @classmethod
@@ -370,8 +668,12 @@ class SurfaceTextureData:
             payload.get("camera_pose", payload.get("first_person_camera_pose"))
         )
         selected_surface_type, selected_surface_ids = _load_selection(payload)
+        overlay_planes = _load_overlay_planes(payload.get("overlay_planes", ()))
         assignments = _load_assignments(
             payload.get("assignments", payload.get("generated_assignments", ()))
+        )
+        undo_stack = _load_localized_inpaint_undo_stack(
+            payload.get("localized_inpaint_undo_stack", ())
         )
         return cls(
             video_metadata=video_metadata,
@@ -381,7 +683,9 @@ class SurfaceTextureData:
             camera_pose=camera_pose,
             selected_surface_type=selected_surface_type,
             selected_surface_ids=selected_surface_ids,
+            overlay_planes=overlay_planes,
             assignments=assignments,
+            localized_inpaint_undo_stack=undo_stack,
         )
 
 
@@ -493,6 +797,26 @@ def _load_selection(payload: dict[object, object]) -> tuple[str | None, tuple[st
         return None, ()
 
 
+def _load_overlay_planes(
+    raw_overlay_planes: object,
+) -> list[SurfaceTextureOverlayPlane]:
+    if not isinstance(raw_overlay_planes, list | tuple):
+        return []
+
+    planes: list[SurfaceTextureOverlayPlane] = []
+    seen_parent_ids: set[str] = set()
+    for raw_plane in raw_overlay_planes[:MAX_SURFACE_OVERLAY_PLANES]:
+        try:
+            plane = SurfaceTextureOverlayPlane.from_dict(raw_plane)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if plane.parent_surface_id in seen_parent_ids:
+            continue
+        seen_parent_ids.add(plane.parent_surface_id)
+        planes.append(plane)
+    return planes
+
+
 def _load_assignments(raw_assignments: object) -> list[SurfaceTextureAssignment]:
     if not isinstance(raw_assignments, list | tuple):
         return []
@@ -509,6 +833,20 @@ def _load_assignments(raw_assignments: object) -> list[SurfaceTextureAssignment]
         seen_assignment_ids.add(assignment.assignment_id)
         assignments.append(assignment)
     return assignments
+
+
+def _load_localized_inpaint_undo_stack(
+    raw_snapshots: object,
+) -> list[SurfaceTextureInpaintUndoSnapshot]:
+    if not isinstance(raw_snapshots, list | tuple):
+        return []
+    loaded: list[SurfaceTextureInpaintUndoSnapshot] = []
+    for raw_snapshot in raw_snapshots[-MAX_LOCALIZED_INPAINT_UNDO_HISTORY:]:
+        try:
+            loaded.append(SurfaceTextureInpaintUndoSnapshot.from_dict(raw_snapshot))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+    return loaded
 
 
 # ### Validation helpers ###
@@ -621,6 +959,42 @@ def _normalize_surface_ids(
     return tuple(normalized_ids)
 
 
+def _normalize_undo_surface_ids(raw_surface_ids: object) -> tuple[str, ...]:
+    try:
+        values = tuple(raw_surface_ids)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError("Inpaint undo surface IDs must contain a sequence.") from error
+    if not values or len(values) > MAX_SELECTED_SURFACES:
+        raise ValueError("An inpaint undo snapshot has invalid surface IDs.")
+    return tuple(dict.fromkeys(_normalize_surface_id(value) for value in values))
+
+
+def _normalize_assignment_ids(
+    raw_assignment_ids: object,
+    *,
+    allow_empty: bool,
+) -> tuple[str, ...]:
+    try:
+        values = tuple(raw_assignment_ids)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError("Assignment IDs must contain a sequence.") from error
+    normalized = tuple(
+        dict.fromkeys(
+            _normalize_required_text(
+                value,
+                "Surface texture assignment ID",
+                MAX_ASSIGNMENT_ID_LENGTH,
+            )
+            for value in values
+        )
+    )
+    if not normalized and not allow_empty:
+        raise ValueError("At least one replacement assignment ID is required.")
+    if len(normalized) > MAX_SURFACE_TEXTURE_ASSIGNMENTS:
+        raise ValueError("An inpaint undo snapshot has too many replacement IDs.")
+    return normalized
+
+
 def _normalize_surface_id(surface_id: object) -> str:
     normalized_id = str(surface_id).strip()
     if not normalized_id or len(normalized_id) > MAX_SURFACE_ID_LENGTH:
@@ -630,11 +1004,34 @@ def _normalize_surface_id(surface_id: object) -> str:
     return normalized_id
 
 
+def _is_overlay_surface_id(surface_id: str) -> bool:
+    match = _SURFACE_ID_PATTERN.fullmatch(surface_id)
+    return match is not None and match.group("overlay") is not None
+
+
 def _surface_type_for_id(surface_id: str) -> str:
     match = _SURFACE_ID_PATTERN.fullmatch(surface_id)
     if match is None:
         raise ValueError(f"Invalid fixed-surface ID: {surface_id!r}.")
     return SURFACE_TYPE_WALL if match.group("wall") else str(match.group("plane"))
+
+
+def _normalize_surface_overlay_offset(value: object) -> float:
+    if isinstance(value, bool):
+        raise ValueError("A surface overlay offset must be a number.")
+    try:
+        offset = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("A surface overlay offset must be a number.") from error
+    if (
+        not math.isfinite(offset)
+        or abs(offset) <= 1e-8
+        or abs(offset) > MAX_SURFACE_OVERLAY_OFFSET_METERS
+    ):
+        raise ValueError(
+            "A surface overlay offset must be finite and no more than 5 cm."
+        )
+    return offset
 
 
 def _infer_surface_type(surface_ids: object) -> str:
@@ -715,6 +1112,72 @@ def _normalize_texture_dimension(value: object) -> int:
     if not 1 <= value <= MAX_TEXTURE_DIMENSION_PIXELS:
         raise ValueError("Surface texture dimension is outside the supported range.")
     return value
+
+
+def _normalize_surface_texture_resolution(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("A surface texture resolution must be an integer.")
+    resolution = int(value)
+    if resolution not in SURFACE_TEXTURE_RESOLUTIONS:
+        supported = ", ".join(str(item) for item in SURFACE_TEXTURE_RESOLUTIONS)
+        raise ValueError(
+            f"A surface texture resolution must be one of: {supported}."
+        )
+    return resolution
+
+
+def _normalize_surface_texture_variants(
+    raw_variants: object,
+) -> tuple[SurfaceTextureVariant, ...]:
+    try:
+        variants = tuple(raw_variants)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise ValueError("Surface texture variants must contain a sequence.") from error
+    if not variants:
+        return ()
+    if not all(isinstance(variant, SurfaceTextureVariant) for variant in variants):
+        raise ValueError(
+            "Surface texture variants must be SurfaceTextureVariant values."
+        )
+    resolutions = tuple(variant.resolution for variant in variants)
+    if len(resolutions) != len(set(resolutions)):
+        raise ValueError("Surface texture variant resolutions must be unique.")
+    if set(resolutions) != set(SURFACE_TEXTURE_RESOLUTIONS):
+        raise ValueError(
+            "A generated surface texture needs 512, 1024 and 2048 variants."
+        )
+    asset_paths = tuple(variant.asset_path for variant in variants)
+    if len(asset_paths) != len(set(asset_paths)):
+        raise ValueError("Surface texture variant asset paths must be unique.")
+    return tuple(sorted(variants, key=lambda variant: variant.resolution))
+
+
+def _normalize_selected_texture_resolution(
+    raw_resolution: object,
+    variants: tuple[SurfaceTextureVariant, ...],
+    active_asset_path: str,
+) -> int | None:
+    if not variants:
+        if raw_resolution is not None:
+            raise ValueError(
+                "A selected surface texture resolution requires exact variants."
+            )
+        return None
+    if raw_resolution is None:
+        matching_variants = tuple(
+            variant
+            for variant in variants
+            if variant.asset_path == active_asset_path
+        )
+        if len(matching_variants) != 1:
+            raise ValueError(
+                "The active surface texture asset has no exact variant."
+            )
+        return matching_variants[0].resolution
+    resolution = _normalize_surface_texture_resolution(raw_resolution)
+    if not any(variant.resolution == resolution for variant in variants):
+        raise ValueError("The selected surface texture variant is unavailable.")
+    return resolution
 
 
 def _normalize_required_text(value: object, label: str, maximum_length: int) -> str:

@@ -16,12 +16,14 @@ from unittest.mock import patch
 
 import cv2
 import numpy as np
+import trimesh
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.camera_models import CameraPose
 from housemaker.generation_state import MaskPoint, MaskStroke
+from housemaker.glb import GeneratedModel
 from housemaker.main import BlueprintWorkspace
 from housemaker.models import GROUND_LEVEL_INDEX, create_default_levels
 from housemaker.project_io import ProjectData, load_project, save_project
@@ -217,6 +219,7 @@ class SurfaceTextureMainIntegrationTests(unittest.TestCase):
             tab_names,
             [
                 "Canvas",
+                "Atlas",
                 "Surface texture generation",
                 "Object generation",
                 "Settings",
@@ -314,6 +317,33 @@ class SurfaceTextureMainIntegrationTests(unittest.TestCase):
             if active_thread is not None:
                 self.assertTrue(active_thread.wait(2_000))
             _qt_application.processEvents()
+
+    def test_surface_tab_uses_the_exact_canvas_preview_model(self) -> None:
+        surface_workspace = self.workspace.surface_texture_generation
+        preview_mesh = trimesh.creation.box(extents=(2.0, 3.0, 2.5))
+        expected_model = GeneratedModel(
+            mesh=preview_mesh,
+            scene=trimesh.Scene(preview_mesh.copy()),
+            glb_bytes=b"shared-preview-model",
+        )
+        with patch.object(
+            self.workspace,
+            "_build_generated_model",
+            return_value=expected_model,
+        ):
+            self.workspace.workspace_tabs.setCurrentWidget(surface_workspace)
+            _qt_application.processEvents()
+            _qt_application.processEvents()
+
+        canvas_model = self.workspace.viewer.model
+        self.assertIs(canvas_model, expected_model)
+        self.assertIs(
+            surface_workspace.surface_view.get_scene_model(),
+            canvas_model,
+        )
+        self.assertIsNotNone(
+            surface_workspace.surface_view._canvas_scene_render_items.mesh_item
+        )
 
 
 # ### Test entry point ###

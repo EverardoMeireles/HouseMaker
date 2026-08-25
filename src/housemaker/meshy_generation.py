@@ -447,6 +447,10 @@ def request_retextured_model(
     cancel_event: threading.Event | None = None,
     enable_original_uv: bool = False,
 ) -> MeshyGenerationResult:
+    if cancel_event is not None and cancel_event.is_set():
+        raise MeshyTaskError(
+            "Meshy Retexture was canceled locally before task submission."
+        )
     task_id = create_retexture_task(
         api_key=api_key,
         model_glb=model_glb,

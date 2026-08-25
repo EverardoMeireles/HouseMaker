@@ -10,8 +10,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import trimesh
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication
@@ -20,6 +22,7 @@ from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.glb import GeneratedModel
 from housemaker.main import BlueprintWorkspace
 from housemaker.settings_widget import FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY
+from housemaker.texture_atlas_view import TextureAtlasEntry
 from housemaker.unused_face_removal import ALL_CAMERA_IDS
 
 
@@ -133,6 +136,16 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
             )
 
             self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.texture_atlas_workspace
+            )
+            self._assert_externally_hosted_viewer_is(
+                self.workspace.atlas_object_preview_viewer
+            )
+            self.assertFalse(
+                self.workspace.atlas_object_preview_viewer.isHidden()
+            )
+
+            self.workspace.workspace_tabs.setCurrentWidget(
                 self.workspace.surface_texture_generation
             )
             self._assert_externally_hosted_viewer_is(
@@ -183,6 +196,122 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
                 self.workspace.canvas_viewer_workspace
             )
             self._assert_externally_hosted_viewer_is(self.workspace.viewer)
+
+    def test_atlas_click_loads_exact_variant_in_detached_viewer(self) -> None:
+        screen_id = "screen:external-atlas-preview-test"
+        combo = self.workspace.settings_widget.fullscreen_3d_viewer_screen_combo
+        combo.addItem("External Atlas preview display", screen_id)
+        asset_path = Path(self._temporary_directory.name) / "chair-2048.glb"
+        asset_path.write_bytes(b"test glb")
+        variant = SimpleNamespace(
+            object_id="chair",
+            resolution=2048,
+            glb_asset_path=asset_path,
+        )
+        model = _generated_box_model()
+
+        with (
+            patch(
+                "housemaker.main.resolve_fullscreen_3d_viewer_screen",
+                return_value=_primary_screen(),
+            ),
+            patch.object(
+                self.workspace.generation,
+                "get_texture_variant",
+                return_value=variant,
+            ) as variant_resolver,
+            patch(
+                "housemaker.main.import_generated_glb",
+                return_value=model,
+            ) as importer,
+        ):
+            combo.setCurrentIndex(combo.findData(screen_id))
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.texture_atlas_workspace
+            )
+            self.workspace.texture_atlas_workspace.object_preview_requested.emit(
+                "chair",
+                2048,
+            )
+            _qt_application.processEvents()
+
+        variant_resolver.assert_called_once_with("chair", 2048)
+        importer.assert_called_once_with(b"test glb")
+        self._assert_externally_hosted_viewer_is(
+            self.workspace.atlas_object_preview_viewer
+        )
+        self.assertEqual(
+            self.workspace.atlas_object_preview_viewer
+            .get_ambient_light_intensity(),
+            1.0,
+        )
+        self.assertIs(self.workspace.atlas_object_preview_viewer.model, model)
+        self.assertTrue(self.workspace.atlas_object_preview_viewer.isVisible())
+
+    def test_returning_to_atlas_refreshes_the_selected_external_preview(
+        self,
+    ) -> None:
+        screen_id = "screen:external-atlas-refresh-test"
+        combo = self.workspace.settings_widget.fullscreen_3d_viewer_screen_combo
+        combo.addItem("External Atlas refresh display", screen_id)
+
+        with (
+            patch(
+                "housemaker.main.resolve_fullscreen_3d_viewer_screen",
+                return_value=_primary_screen(),
+            ),
+            patch.object(
+                self.workspace.texture_atlas_workspace,
+                "request_selected_object_preview",
+            ) as request_preview,
+        ):
+            combo.setCurrentIndex(combo.findData(screen_id))
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.texture_atlas_workspace
+            )
+            request_preview.assert_called_once_with()
+
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.generation
+            )
+            request_preview.reset_mock()
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.texture_atlas_workspace
+            )
+
+        request_preview.assert_called_once_with()
+        self._assert_externally_hosted_viewer_is(
+            self.workspace.atlas_object_preview_viewer
+        )
+
+    def test_missing_atlas_variant_clears_stale_detached_preview(self) -> None:
+        viewer = self.workspace.atlas_object_preview_viewer
+        viewer.set_model(_generated_box_model())
+        self.workspace._atlas_preview_variant_key = (
+            "old-object",
+            1024,
+            "old.glb",
+            1,
+            1,
+        )
+
+        with patch.object(
+            self.workspace.generation,
+            "get_texture_variant",
+            return_value=None,
+        ):
+            self.workspace.texture_atlas_workspace.object_preview_requested.emit(
+                "missing-object",
+                2048,
+            )
+            _qt_application.processEvents()
+
+        self.assertIsNone(viewer.model)
+        self.assertIsNone(self.workspace._atlas_preview_variant_key)
+        self.assertIn(
+            "exact 3D texture variant is missing",
+            self.workspace.texture_atlas_workspace.status_label.text(),
+        )
 
     def test_complete_object_panel_is_visible_beside_external_viewer(
         self,
@@ -241,6 +370,70 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
         self.assertIs(
             generation.right_view_stack.currentWidget(),
             generation.object_3d_page,
+        )
+
+    def test_object_wireframe_syncs_external_3d_and_local_uv_preview(
+        self,
+    ) -> None:
+        screen_id = "screen:external-object-uv-test"
+        combo = self.workspace.settings_widget.fullscreen_3d_viewer_screen_combo
+        combo.addItem("External object UV display", screen_id)
+        generation = self.workspace.generation
+        uv_triangles = (
+            ((0.1, 0.1), (0.9, 0.1), (0.9, 0.9)),
+            ((0.1, 0.1), (0.9, 0.9), (0.1, 0.9)),
+        )
+        generation.texture_view.set_atlases(
+            (
+                TextureAtlasEntry(
+                    "object:resolution:1024",
+                    "1024 x 1024",
+                    np.full((64, 64, 4), (30, 50, 70, 255), dtype=np.uint8),
+                    owner_id="object",
+                ),
+            )
+        )
+        generation.texture_view.set_uv_overlay_triangles(uv_triangles)
+        generation.wireframe_checkbox.setChecked(True)
+
+        with patch(
+            "housemaker.main.resolve_fullscreen_3d_viewer_screen",
+            return_value=_primary_screen(),
+        ):
+            combo.setCurrentIndex(combo.findData(screen_id))
+            self.workspace.workspace_tabs.setCurrentWidget(generation)
+            _qt_application.processEvents()
+
+        self._assert_externally_hosted_viewer_is(generation.object_3d_panel)
+        self.assertIs(
+            generation.right_view_stack.currentWidget(),
+            generation.texture_view_page,
+        )
+        self.assertTrue(generation.texture_view.isVisibleTo(self.workspace))
+        self.assertTrue(generation.result_view.get_wireframe_enabled())
+        self.assertTrue(generation.texture_view.uv_overlay_enabled)
+        self.assertEqual(
+            generation.texture_view.uv_overlay_triangles,
+            uv_triangles,
+        )
+        self.assertFalse(generation.texture_view.preview_label.pixmap().isNull())
+
+        generation.wireframe_checkbox.setChecked(False)
+
+        self.assertFalse(generation.result_view.get_wireframe_enabled())
+        self.assertFalse(generation.texture_view.uv_overlay_enabled)
+        generation.wireframe_checkbox.setChecked(True)
+        self.workspace._apply_fullscreen_3d_viewer_screen(None)
+        _qt_application.processEvents()
+
+        self.assertTrue(generation.result_view.get_wireframe_enabled())
+        self.assertTrue(generation.texture_view.uv_overlay_enabled)
+        self.assertIs(
+            generation.right_view_stack.currentWidget(),
+            generation.object_3d_page,
+        )
+        self.assertFalse(
+            self.workspace.surface_texture_generation.texture_view.uv_overlay_enabled
         )
 
     def test_external_window_close_resets_display_dropdown_and_restores_viewer(

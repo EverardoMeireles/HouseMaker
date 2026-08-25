@@ -9,8 +9,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from OpenGL import GL
-from OpenGL.GL import shaders as opengl_shaders
 import pyqtgraph.opengl as gl
 import trimesh
 from PySide6.QtCore import QPointF, QTimer, Qt, Signal
@@ -19,6 +17,7 @@ from PySide6.QtWidgets import QLabel, QStackedLayout, QWidget
 from PIL import Image
 
 from housemaker.camera_models import CameraPose, InitialFirstPersonCamera
+from housemaker.glb import GeneratedModel, PreviewTexturedSurface
 from housemaker.generation_state import (
     MASK_MODE_ERASE,
     MASK_MODE_PAINT,
@@ -35,12 +34,17 @@ from housemaker.surface_geometry import (
     get_combined_surface_area,
 )
 from housemaker.viewer import (
-    TEXTURED_AMBIENT_FRAGMENT_SHADER,
-    TEXTURED_AMBIENT_VERTEX_SHADER,
+    DEFAULT_AMBIENT_LIGHT_INTENSITY as CANVAS_AMBIENT_LIGHT_INTENSITY,
+    EDGE_COLOR,
+    FACE_COLOR,
     TextureMeshData,
     TexturedMeshItem,
+    _WireframeOverlayMeshItem,
+    _build_ambient_shader,
+    _build_texture_mesh_data,
+    _build_textured_wall_transform,
+    _get_mesh_face_colors,
     _limit_texture_preview_size,
-    _upload_array_buffer,
 )
 
 
@@ -49,8 +53,9 @@ DEFAULT_FIRST_PERSON_HEIGHT_METERS = 1.65
 DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND = 2.5
 DEFAULT_MOUSE_LOOK_SENSITIVITY_DEGREES = 0.16
 DEFAULT_TEXTURE_WORLD_SIZE_METERS = 2.0
-DEFAULT_AMBIENT_LIGHT_INTENSITY = 0.55
+DEFAULT_AMBIENT_LIGHT_INTENSITY = CANVAS_AMBIENT_LIGHT_INTENSITY
 DEFAULT_TEXTURE_INPAINT_BRUSH_RADIUS_PIXELS = 24
+CANVAS_SURFACE_TEXTURE_OFFSET_METERS = 0.002
 FIRST_PERSON_UPDATE_INTERVAL_MILLISECONDS = 16
 FIRST_PERSON_LOOK_DISTANCE_METERS = 1.0
 MAX_FIRST_PERSON_PITCH_DEGREES = 89.0
@@ -76,6 +81,17 @@ class SurfaceRenderItems:
     face_item: gl.GLMeshItem
     outline_item: gl.GLMeshItem | None = None
     texture_item: RepeatingTexturedMeshItem | None = None
+    additional_texture_items: tuple[RepeatingTexturedMeshItem, ...] = ()
+
+
+@dataclass
+class CanvasSceneRenderItems:
+    """Canvas-compatible background items hosted by the semantic viewer."""
+
+    grid_item: gl.GLGridItem | None = None
+    mesh_item: gl.GLMeshItem | None = None
+    textured_mesh_item: TexturedMeshItem | None = None
+    legacy_wall_items: tuple[gl.GLImageItem, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -94,30 +110,37 @@ class _MeshRayHit:
     is_back_facing: bool
 
 
+def _group_preview_surfaces_by_id(
+    preview_surfaces: Iterable[PreviewTexturedSurface],
+) -> dict[str, tuple[PreviewTexturedSurface, ...]]:
+    grouped: dict[str, list[PreviewTexturedSurface]] = {}
+    for preview_surface in preview_surfaces:
+        grouped.setdefault(preview_surface.surface_id, []).append(
+            preview_surface
+        )
+    return {
+        surface_id: tuple(surface_values)
+        for surface_id, surface_values in grouped.items()
+    }
+
+
 # ### Textured render item ###
 class RepeatingTexturedMeshItem(TexturedMeshItem):
     """Texture renderer whose world-scale UVs repeat beyond the first tile."""
 
-    def _ensure_gl_resources(self) -> None:
-        if self._resources_uploaded:
-            return
-        self._shader_program = opengl_shaders.compileProgram(
-            opengl_shaders.compileShader(
-                TEXTURED_AMBIENT_VERTEX_SHADER,
-                GL.GL_VERTEX_SHADER,
-            ),
-            opengl_shaders.compileShader(
-                TEXTURED_AMBIENT_FRAGMENT_SHADER,
-                GL.GL_FRAGMENT_SHADER,
-            ),
+    def __init__(
+        self,
+        texture_mesh_data: TextureMeshData,
+        ambient_light_intensity: float,
+    ) -> None:
+        # Keep the complete shared texture renderer, including its edit-mask
+        # sampler.  The old custom resource upload omitted that sampler, so the
+        # textured draw failed after the fallback surface face was hidden.
+        super().__init__(
+            texture_mesh_data,
+            ambient_light_intensity,
+            texture_repeat=True,
         )
-        self._position_buffer = _upload_array_buffer(self._vertices)
-        self._normal_buffer = _upload_array_buffer(self._normals)
-        self._texture_coordinate_buffer = _upload_array_buffer(
-            self._texture_coordinates
-        )
-        self._texture_id = _upload_repeating_texture(self._texture_rgba)
-        self._resources_uploaded = True
 
 
 # ### First-person view ###
@@ -412,8 +435,17 @@ class SurfaceTextureViewer(QWidget):
         self._selected_surface_ids: list[str] = []
         self._surface_textures: dict[str, np.ndarray] = {}
         self._texture_mask_strokes: dict[str, list[MaskStroke]] = {}
+        self._scene_model: GeneratedModel | None = None
+        self._canvas_scene_render_items = CanvasSceneRenderItems()
+        self._preview_surfaces_by_id: dict[
+            str,
+            tuple[PreviewTexturedSurface, ...],
+        ] = {}
         self._texture_world_size_meters = DEFAULT_TEXTURE_WORLD_SIZE_METERS
         self._ambient_light_intensity = DEFAULT_AMBIENT_LIGHT_INTENSITY
+        self._ambient_shader = _build_ambient_shader(
+            self._ambient_light_intensity
+        )
         self._inpaint_brush_mode = MASK_MODE_PAINT
         self._inpaint_brush_radius_pixels = (
             DEFAULT_TEXTURE_INPAINT_BRUSH_RADIUS_PIXELS
@@ -468,12 +500,25 @@ class SurfaceTextureViewer(QWidget):
         self,
         levels: Sequence[LevelData],
         initial_camera: InitialFirstPersonCamera | CameraPose | None = None,
+        additional_surfaces: Sequence[FixedSurface] = (),
     ) -> None:
-        self.set_surfaces(build_fixed_surfaces(levels))
+        surfaces = [*build_fixed_surfaces(levels), *list(additional_surfaces)]
+        self.set_surfaces(surfaces)
         pose = _get_initial_pose(initial_camera)
         if pose is None:
             pose = _build_default_camera_pose(self._surfaces)
         self.set_camera_pose(pose)
+
+    def set_scene_model(self, model: GeneratedModel | None) -> None:
+        """Render the exact Canvas model behind semantic interaction geometry."""
+
+        if model is not None and not isinstance(model, GeneratedModel):
+            raise TypeError("The Surface preview model must be a GeneratedModel.")
+        self._scene_model = model
+        self._populate_scene()
+
+    def get_scene_model(self) -> GeneratedModel | None:
+        return self._scene_model
 
     def set_surfaces(self, surfaces: Sequence[FixedSurface]) -> None:
         normalized = list(surfaces)
@@ -507,6 +552,9 @@ class SurfaceTextureViewer(QWidget):
 
     def get_surfaces(self) -> list[FixedSurface]:
         return list(self._surfaces)
+
+    def get_surface(self, surface_id: str) -> FixedSurface | None:
+        return self._surface_by_id.get(str(surface_id))
 
     def get_selected_surface_ids(self) -> tuple[str, ...]:
         return tuple(self._selected_surface_ids)
@@ -977,6 +1025,14 @@ class SurfaceTextureViewer(QWidget):
         self.view.clear()
         self._render_items_by_surface_id = {}
         self._surface_id_by_item_id = {}
+        self._canvas_scene_render_items = CanvasSceneRenderItems()
+        self._preview_surfaces_by_id = _group_preview_surfaces_by_id(
+            ()
+            if self._scene_model is None
+            else self._scene_model.preview_textured_surfaces
+        )
+        if self._scene_model is not None:
+            self._populate_canvas_scene_background(self._scene_model)
         for surface in self._surfaces:
             vertices = np.asarray(surface.mesh.vertices, dtype=np.float32)
             faces = np.asarray(surface.mesh.faces, dtype=np.int32)
@@ -988,7 +1044,7 @@ class SurfaceTextureViewer(QWidget):
                 faces=faces,
                 faceColors=np.tile(face_color, (len(faces), 1)),
                 smooth=False,
-                drawFaces=True,
+                drawFaces=self._scene_model is None,
                 drawEdges=False,
                 edgeColor=SURFACE_EDGE_COLOR,
                 glOptions="opaque",
@@ -1010,6 +1066,102 @@ class SurfaceTextureViewer(QWidget):
         self._sync_selection_rendering()
         self.view.update()
 
+    def _populate_canvas_scene_background(self, model: GeneratedModel) -> None:
+        """Add the same base geometry, wireframe, grid, and legacy walls as Canvas."""
+
+        grid_item = gl.GLGridItem()
+        grid_item.setSize(x=20.0, y=20.0)
+        grid_item.setSpacing(x=1.0, y=1.0)
+        self.view.addItem(grid_item)
+
+        display_mesh = (
+            model.preview_untextured_mesh
+            if model.preview_textured_surfaces
+            and model.preview_untextured_mesh is not None
+            else model.mesh
+        )
+        vertices = np.asarray(display_mesh.vertices, dtype=np.float32)
+        faces = np.asarray(display_mesh.faces, dtype=np.int32)
+        if vertices.size == 0 or faces.size == 0:
+            self._canvas_scene_render_items = CanvasSceneRenderItems(
+                grid_item=grid_item
+            )
+            return
+
+        texture_mesh_data = _build_texture_mesh_data(display_mesh)
+        textured_mesh_item: TexturedMeshItem | None = None
+        if texture_mesh_data is not None:
+            textured_mesh_item = TexturedMeshItem(
+                texture_mesh_data,
+                self._ambient_light_intensity,
+            )
+            self.view.addItem(textured_mesh_item)
+        face_colors = (
+            np.tile(FACE_COLOR, (len(faces), 1))
+            if texture_mesh_data is not None
+            else _get_mesh_face_colors(display_mesh, faces)
+        )
+        mesh_item = _WireframeOverlayMeshItem(
+            vertexes=vertices,
+            faces=faces,
+            faceColors=face_colors,
+            smooth=False,
+            drawFaces=texture_mesh_data is None,
+            drawEdges=True,
+            edgeColor=EDGE_COLOR,
+            shader=self._ambient_shader,
+        )
+        self.view.addItem(mesh_item)
+        legacy_wall_items = self._add_canvas_legacy_wall_items(model)
+        self._canvas_scene_render_items = CanvasSceneRenderItems(
+            grid_item=grid_item,
+            mesh_item=mesh_item,
+            textured_mesh_item=textured_mesh_item,
+            legacy_wall_items=legacy_wall_items,
+        )
+
+    def _add_canvas_legacy_wall_items(
+        self,
+        model: GeneratedModel,
+    ) -> tuple[gl.GLImageItem, ...]:
+        assigned_wall_keys = {
+            (
+                surface.level_index,
+                surface.room_index,
+                surface.wall_key,
+            )
+            for surface in model.preview_textured_surfaces
+            if surface.surface_type == SURFACE_TYPE_WALL
+            and surface.level_index is not None
+            and surface.room_index is not None
+            and surface.wall_key is not None
+        }
+        items: list[gl.GLImageItem] = []
+        for textured_wall in model.preview_textured_walls:
+            if (
+                textured_wall.level_index,
+                textured_wall.room_index,
+                textured_wall.wall_key,
+            ) in assigned_wall_keys:
+                continue
+            texture_rgba = np.asarray(textured_wall.texture_rgba, dtype=np.ubyte)
+            if texture_rgba.ndim != 3 or texture_rgba.shape[2] != 4:
+                continue
+            image_item = gl.GLImageItem(
+                texture_rgba,
+                smooth=True,
+                glOptions="opaque",
+            )
+            image_item.setTransform(
+                _build_textured_wall_transform(
+                    textured_wall=textured_wall,
+                    offset_sign=-1.0,
+                )
+            )
+            self.view.addItem(image_item)
+            items.append(image_item)
+        return tuple(items)
+
     def _rebuild_surface_texture_item(self, surface_id: str) -> None:
         self._remove_surface_texture_item(surface_id)
         surface = self._surface_by_id.get(surface_id)
@@ -1021,31 +1173,86 @@ class SurfaceTextureViewer(QWidget):
             texture_rgba,
             self._texture_mask_strokes.get(surface_id, []),
         )
-        texture_data = _build_surface_texture_mesh_data(
+        texture_data_values = self._build_surface_texture_data_values(
             surface,
             preview_texture_rgba,
+        )
+        texture_items = tuple(
+            RepeatingTexturedMeshItem(
+                texture_data,
+                self._ambient_light_intensity,
+            )
+            for texture_data in texture_data_values
+        )
+        if not texture_items:
+            return
+        for texture_item in texture_items:
+            self.view.addItem(texture_item)
+            self._surface_id_by_item_id[id(texture_item)] = surface_id
+        render_items.texture_item = texture_items[0]
+        render_items.additional_texture_items = texture_items[1:]
+        self._sync_surface_rendering(surface_id)
+
+    def _build_surface_texture_data_values(
+        self,
+        surface: FixedSurface,
+        texture_rgba: np.ndarray,
+    ) -> tuple[TextureMeshData, ...]:
+        previews = self._preview_surfaces_by_id.get(surface.surface_id, ())
+        preview_data = tuple(
+            texture_data
+            for preview in previews
+            if (texture_data := _build_texture_mesh_data(preview.mesh))
+            is not None
+        )
+        if preview_data:
+            return tuple(
+                TextureMeshData(
+                    vertices=texture_data.vertices,
+                    normals=texture_data.normals,
+                    texture_coordinates=texture_data.texture_coordinates,
+                    texture_rgba=_limit_texture_preview_size(texture_rgba),
+                )
+                for texture_data in preview_data
+            )
+
+        texture_data = _build_surface_texture_mesh_data(
+            surface,
+            texture_rgba,
             self._texture_world_size_meters,
         )
-        texture_item = RepeatingTexturedMeshItem(
-            texture_data,
-            self._ambient_light_intensity,
-        )
-        self.view.addItem(texture_item)
-        render_items.texture_item = texture_item
-        self._surface_id_by_item_id[id(texture_item)] = surface_id
-        self._sync_surface_rendering(surface_id)
+        if (
+            self._scene_model is not None
+            and surface.overlay_parent_surface_id is None
+        ):
+            texture_data = TextureMeshData(
+                vertices=np.ascontiguousarray(
+                    texture_data.vertices
+                    + texture_data.normals
+                    * CANVAS_SURFACE_TEXTURE_OFFSET_METERS
+                ),
+                normals=texture_data.normals,
+                texture_coordinates=texture_data.texture_coordinates,
+                texture_rgba=texture_data.texture_rgba,
+            )
+        return (texture_data,)
 
     def _remove_surface_texture_item(self, surface_id: str) -> None:
         render_items = self._render_items_by_surface_id.get(surface_id)
         if render_items is None or render_items.texture_item is None:
             return
-        texture_item = render_items.texture_item
-        self._surface_id_by_item_id.pop(id(texture_item), None)
-        try:
-            self.view.removeItem(texture_item)
-        except ValueError:
-            pass
+        texture_items = (
+            render_items.texture_item,
+            *render_items.additional_texture_items,
+        )
+        for texture_item in texture_items:
+            self._surface_id_by_item_id.pop(id(texture_item), None)
+            try:
+                self.view.removeItem(texture_item)
+            except ValueError:
+                pass
         render_items.texture_item = None
+        render_items.additional_texture_items = ()
 
     def _handle_items_clicked(
         self,
@@ -1142,13 +1349,17 @@ class SurfaceTextureViewer(QWidget):
             return
         is_selected = surface_id in self._selected_surface_ids
         has_texture = render_items.texture_item is not None
-        render_items.face_item.opts["drawFaces"] = not has_texture
+        render_items.face_item.opts["drawFaces"] = (
+            self._scene_model is None and not has_texture
+        )
         render_items.face_item.opts["drawEdges"] = False
         render_items.face_item.meshDataChanged()
         if render_items.outline_item is not None:
             render_items.outline_item.setVisible(is_selected)
         if render_items.texture_item is not None:
             render_items.texture_item.setVisible(True)
+        for texture_item in render_items.additional_texture_items:
+            texture_item.setVisible(True)
 
 
 # ### Selection outline geometry ###
@@ -1392,30 +1603,6 @@ def _load_texture_rgba(
     else:
         raise TypeError("Unsupported surface texture source.")
     return np.ascontiguousarray(np.asarray(image, dtype=np.uint8))
-
-
-def _upload_repeating_texture(texture_rgba: np.ndarray) -> int:
-    texture_id = int(GL.glGenTextures(1))
-    GL.glActiveTexture(GL.GL_TEXTURE0)
-    GL.glBindTexture(GL.GL_TEXTURE_2D, texture_id)
-    GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
-    GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
-    GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_REPEAT)
-    GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_REPEAT)
-    GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
-    GL.glTexImage2D(
-        GL.GL_TEXTURE_2D,
-        0,
-        GL.GL_RGBA,
-        texture_rgba.shape[1],
-        texture_rgba.shape[0],
-        0,
-        GL.GL_RGBA,
-        GL.GL_UNSIGNED_BYTE,
-        np.ascontiguousarray(np.flipud(texture_rgba)),
-    )
-    GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
-    return texture_id
 
 
 # ### CPU ray-picking helpers ###

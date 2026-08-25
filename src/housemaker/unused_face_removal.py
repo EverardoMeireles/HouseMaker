@@ -66,18 +66,27 @@ class UnusedFaceRemovalOptions:
     def __post_init__(self) -> None:
         normalized_camera_ids = _normalize_camera_ids(self.enabled_camera_ids)
         object.__setattr__(self, "enabled_camera_ids", normalized_camera_ids)
-        if not MIN_CAPTURE_IMAGE_SIZE <= int(self.image_size) <= MAX_CAPTURE_IMAGE_SIZE:
-            raise ValueError(
-                "Unused-face capture size must be between "
-                f"{MIN_CAPTURE_IMAGE_SIZE} and {MAX_CAPTURE_IMAGE_SIZE} pixels."
-            )
-        if not 1 <= int(self.max_face_count) <= MAX_FACE_ID_COLOR_COUNT:
-            raise ValueError(
-                "Unused-face maximum face count must be between 1 and "
-                f"{MAX_FACE_ID_COLOR_COUNT}."
-            )
-        if int(self.progress_interval_faces) < 1:
-            raise ValueError("Progress interval must contain at least one face.")
+        _validate_processing_bounds(
+            image_size=self.image_size,
+            max_face_count=self.max_face_count,
+            progress_interval_faces=self.progress_interval_faces,
+        )
+
+
+@dataclass(frozen=True)
+class UncheckedCameraFacePurgeOptions:
+    """Bounds for removing faces exposed to unchecked fixed cameras."""
+
+    image_size: int = DEFAULT_CAPTURE_IMAGE_SIZE
+    max_face_count: int = DEFAULT_MAX_FACE_COUNT
+    progress_interval_faces: int = DEFAULT_PROGRESS_INTERVAL_FACES
+
+    def __post_init__(self) -> None:
+        _validate_processing_bounds(
+            image_size=self.image_size,
+            max_face_count=self.max_face_count,
+            progress_interval_faces=self.progress_interval_faces,
+        )
 
 
 @dataclass(frozen=True)
@@ -106,8 +115,34 @@ class UnusedFaceRemovalResult:
         return self.model.glb_bytes
 
 
+@dataclass(frozen=True)
+class UncheckedCameraFacePurgeResult:
+    """Model produced by deleting the union visible from unchecked cameras."""
+
+    model: GeneratedModel
+    unchecked_camera_ids: tuple[str, ...]
+    original_face_count: int
+    retained_face_count: int
+    removed_face_count: int
+
+    @property
+    def glb_bytes(self) -> bytes:
+        return self.model.glb_bytes
+
+
 class UnusedFaceRemovalCancelled(RuntimeError):
     """Raised when a caller cancels a removal operation."""
+
+
+# ### Public camera data models ###
+@dataclass(frozen=True)
+class FixedCameraView:
+    """Canonical orthographic axes shared by model post-processing steps."""
+
+    camera_id: str
+    depth_axis: tuple[float, float, float]
+    horizontal_axis: tuple[float, float, float]
+    vertical_axis: tuple[float, float, float]
 
 
 # ### Internal data models ###
@@ -183,6 +218,72 @@ _CAMERA_DEFINITIONS = {
         vertical_axis=(0.0, -1.0, 0.0),
     ),
 }
+
+
+# ### Public camera helpers ###
+def get_fixed_camera_view(camera_id: str) -> FixedCameraView:
+    """Return a copy of one canonical unused-face camera definition."""
+
+    normalized_id = str(camera_id)
+    definition = _CAMERA_DEFINITIONS.get(normalized_id)
+    if definition is None:
+        raise ValueError(f"Unknown unused-face camera ID: {normalized_id!r}.")
+    return FixedCameraView(
+        camera_id=definition.camera_id,
+        depth_axis=definition.depth_axis,
+        horizontal_axis=definition.horizontal_axis,
+        vertical_axis=definition.vertical_axis,
+    )
+
+
+def capture_visible_face_indices(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    camera_id: str,
+    *,
+    image_size: int = DEFAULT_CAPTURE_IMAGE_SIZE,
+    cancel_requested: CancelCallback | None = None,
+    progress_interval_faces: int = DEFAULT_PROGRESS_INTERVAL_FACES,
+) -> frozenset[int]:
+    """Depth-rasterize one fixed view and return faces owning any top pixel."""
+
+    normalized_vertices = np.asarray(vertices, dtype=float)
+    normalized_faces = np.asarray(faces, dtype=np.int64)
+    if normalized_vertices.ndim != 2 or normalized_vertices.shape[1:] != (3,):
+        raise ValueError("Camera capture vertices must have shape (n, 3).")
+    if normalized_faces.ndim != 2 or normalized_faces.shape[1:] != (3,):
+        raise ValueError("Camera capture faces must have shape (n, 3).")
+    if len(normalized_vertices) == 0 or len(normalized_faces) == 0:
+        return frozenset()
+    if not np.all(np.isfinite(normalized_vertices)):
+        raise ValueError("Camera capture vertices must contain finite coordinates.")
+    if (
+        np.any(normalized_faces < 0)
+        or np.any(normalized_faces >= len(normalized_vertices))
+    ):
+        raise ValueError("Camera capture faces contain an invalid vertex index.")
+    normalized_image_size = int(image_size)
+    if not MIN_CAPTURE_IMAGE_SIZE <= normalized_image_size <= MAX_CAPTURE_IMAGE_SIZE:
+        raise ValueError(
+            "Camera capture size must be between "
+            f"{MIN_CAPTURE_IMAGE_SIZE} and {MAX_CAPTURE_IMAGE_SIZE} pixels."
+        )
+    normalized_progress_interval = int(progress_interval_faces)
+    if normalized_progress_interval < 1:
+        raise ValueError("Progress interval must contain at least one face.")
+    definition = _CAMERA_DEFINITIONS.get(str(camera_id))
+    if definition is None:
+        raise ValueError(f"Unknown unused-face camera ID: {str(camera_id)!r}.")
+    _raise_if_cancelled(cancel_requested)
+    capture = _capture_camera(
+        vertices=normalized_vertices,
+        faces=normalized_faces,
+        definition=definition,
+        image_size=normalized_image_size,
+        cancel_requested=cancel_requested,
+        progress_interval_faces=normalized_progress_interval,
+    )
+    return frozenset(capture.face_samples)
 
 
 # ### Public processing API ###
@@ -320,6 +421,142 @@ def remove_unused_faces_from_glb(
         retained_face_count=retained_face_count,
         removed_face_count=total_face_count - retained_face_count,
         protected_face_count=retained_face_count,
+    )
+
+
+def purge_faces_visible_from_unchecked_cameras_from_glb(
+    glb_bytes: bytes,
+    *,
+    unchecked_camera_ids: Iterable[str],
+    options: UncheckedCameraFacePurgeOptions | None = None,
+    cancel_requested: CancelCallback | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> UncheckedCameraFacePurgeResult:
+    """Delete every face owning a depth pixel in any unchecked camera view.
+
+    Visibility comes from the same six fixed orthographic depth captures used
+    by unused-face removal and camera UV projection. An unchecked face is
+    removed once even when it is visible from several unchecked cameras.
+    Passing no unchecked cameras is an explicit no-op that preserves the
+    original GLB bytes.
+    """
+
+    normalized_options = options or UncheckedCameraFacePurgeOptions()
+    normalized_camera_ids = _normalize_optional_camera_ids(
+        unchecked_camera_ids
+    )
+    _raise_if_cancelled(cancel_requested)
+    payload = bytes(glb_bytes)
+    if not payload:
+        raise ValueError("The generated GLB is empty.")
+    scene = _load_glb_scene(payload)
+    instances, vertices, faces = _collect_scene_geometry(scene)
+    total_face_count = len(faces)
+    if total_face_count == 0:
+        raise ValueError("The generated GLB contains no triangle faces.")
+    if total_face_count > normalized_options.max_face_count:
+        raise ValueError(
+            f"The generated GLB has {total_face_count} faces; the configured "
+            f"camera-face purge limit is {normalized_options.max_face_count}."
+        )
+
+    if not normalized_camera_ids:
+        _report_progress(
+            progress_callback,
+            stage="complete",
+            completed_face_count=total_face_count,
+            total_face_count=total_face_count,
+        )
+        return UncheckedCameraFacePurgeResult(
+            model=import_generated_glb(payload),
+            unchecked_camera_ids=(),
+            original_face_count=total_face_count,
+            retained_face_count=total_face_count,
+            removed_face_count=0,
+        )
+
+    _report_progress(
+        progress_callback,
+        stage="capturing",
+        completed_face_count=0,
+        total_face_count=total_face_count,
+    )
+    captures: list[_CameraCapture] = []
+    for camera_id in normalized_camera_ids:
+        _raise_if_cancelled(cancel_requested)
+        captures.append(
+            _capture_camera(
+                vertices=vertices,
+                faces=faces,
+                definition=_CAMERA_DEFINITIONS[camera_id],
+                image_size=normalized_options.image_size,
+                cancel_requested=cancel_requested,
+                progress_interval_faces=(
+                    normalized_options.progress_interval_faces
+                ),
+            )
+        )
+        _report_progress(
+            progress_callback,
+            stage="capturing",
+            completed_face_count=total_face_count,
+            total_face_count=total_face_count,
+            camera_id=camera_id,
+        )
+
+    remove_faces = np.zeros(total_face_count, dtype=bool)
+    _report_progress(
+        progress_callback,
+        stage="checking",
+        completed_face_count=0,
+        total_face_count=total_face_count,
+    )
+    for face_index in range(total_face_count):
+        if face_index % normalized_options.progress_interval_faces == 0:
+            _raise_if_cancelled(cancel_requested)
+            _report_progress(
+                progress_callback,
+                stage="checking",
+                completed_face_count=face_index,
+                total_face_count=total_face_count,
+            )
+        remove_faces[face_index] = any(
+            _sample_changes_frame(capture.face_samples.get(face_index))
+            for capture in captures
+        )
+
+    removed_face_count = int(np.count_nonzero(remove_faces))
+    retained_face_count = total_face_count - removed_face_count
+    if retained_face_count == 0:
+        raise ValueError(
+            "Camera-face purge would remove every face; check at least one "
+            "fixed camera."
+        )
+    _raise_if_cancelled(cancel_requested)
+    _report_progress(
+        progress_callback,
+        stage="exporting",
+        completed_face_count=total_face_count,
+        total_face_count=total_face_count,
+    )
+
+    if removed_face_count == 0:
+        processed_model = import_generated_glb(payload)
+    else:
+        processed_glb = _export_filtered_scene(instances, ~remove_faces)
+        processed_model = import_generated_glb(processed_glb)
+    _report_progress(
+        progress_callback,
+        stage="complete",
+        completed_face_count=total_face_count,
+        total_face_count=total_face_count,
+    )
+    return UncheckedCameraFacePurgeResult(
+        model=processed_model,
+        unchecked_camera_ids=normalized_camera_ids,
+        original_face_count=total_face_count,
+        retained_face_count=retained_face_count,
+        removed_face_count=removed_face_count,
     )
 
 
@@ -649,17 +886,43 @@ def _make_unique_name(
 
 # ### Validation and callback helpers ###
 def _normalize_camera_ids(camera_ids: Iterable[str]) -> tuple[str, ...]:
+    normalized_camera_ids = _normalize_optional_camera_ids(camera_ids)
+    if not normalized_camera_ids:
+        raise ValueError("Select at least one unused-face camera.")
+    return normalized_camera_ids
+
+
+def _normalize_optional_camera_ids(
+    camera_ids: Iterable[str],
+) -> tuple[str, ...]:
     requested_camera_ids = tuple(str(camera_id) for camera_id in camera_ids)
     unknown_camera_ids = set(requested_camera_ids).difference(ALL_CAMERA_IDS)
     if unknown_camera_ids:
         unknown_labels = ", ".join(sorted(unknown_camera_ids))
         raise ValueError(f"Unknown unused-face camera IDs: {unknown_labels}.")
-    normalized_camera_ids = tuple(
+    return tuple(
         camera_id for camera_id in ALL_CAMERA_IDS if camera_id in requested_camera_ids
     )
-    if not normalized_camera_ids:
-        raise ValueError("Select at least one unused-face camera.")
-    return normalized_camera_ids
+
+
+def _validate_processing_bounds(
+    *,
+    image_size: int,
+    max_face_count: int,
+    progress_interval_faces: int,
+) -> None:
+    if not MIN_CAPTURE_IMAGE_SIZE <= int(image_size) <= MAX_CAPTURE_IMAGE_SIZE:
+        raise ValueError(
+            "Unused-face capture size must be between "
+            f"{MIN_CAPTURE_IMAGE_SIZE} and {MAX_CAPTURE_IMAGE_SIZE} pixels."
+        )
+    if not 1 <= int(max_face_count) <= MAX_FACE_ID_COLOR_COUNT:
+        raise ValueError(
+            "Unused-face maximum face count must be between 1 and "
+            f"{MAX_FACE_ID_COLOR_COUNT}."
+        )
+    if int(progress_interval_faces) < 1:
+        raise ValueError("Progress interval must contain at least one face.")
 
 
 def _raise_if_cancelled(cancel_requested: CancelCallback | None) -> None:

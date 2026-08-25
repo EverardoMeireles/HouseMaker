@@ -6,11 +6,16 @@ import unittest
 from housemaker.camera_models import CameraPose
 from housemaker.generation_state import MASK_MODE_PAINT, MaskPoint, MaskStroke
 from housemaker.surface_texture_state import (
+    DEFAULT_SURFACE_TEXTURE_RESOLUTION,
+    SURFACE_TEXTURE_RESOLUTIONS,
+    SURFACE_TEXTURE_SCHEMA_VERSION,
     SURFACE_TYPE_CEILING,
     SURFACE_TYPE_FLOOR,
     SURFACE_TYPE_WALL,
     SurfaceTextureAssignment,
     SurfaceTextureData,
+    SurfaceTextureInpaintUndoSnapshot,
+    SurfaceTextureVariant,
 )
 from housemaker.video_source import VideoMetadata
 
@@ -55,6 +60,45 @@ def _assignment() -> SurfaceTextureAssignment:
 
 # ### State round-trip tests ###
 class SurfaceTextureStateRoundTripTests(unittest.TestCase):
+    def test_localized_inpaint_undo_history_round_trips_and_is_independent(
+        self,
+    ) -> None:
+        wall_id = "level:2/room:0/wall:1:2"
+        snapshot = SurfaceTextureInpaintUndoSnapshot(
+            previous_assignments=(_assignment(),),
+            replacement_assignment_ids=("replacement-1",),
+            affected_surface_ids=(wall_id,),
+            previous_texture_mask_strokes={wall_id: (_stroke(0.2),)},
+        )
+        state = SurfaceTextureData(
+            assignments=[_assignment()],
+            localized_inpaint_undo_stack=[snapshot],
+        )
+
+        restored = SurfaceTextureData.from_dict(state.to_dict())
+        cloned = restored.clone()
+        cloned.localized_inpaint_undo_stack.clear()
+
+        self.assertEqual(restored, state)
+        self.assertEqual(restored.localized_inpaint_undo_stack, [snapshot])
+        self.assertEqual(state.localized_inpaint_undo_stack, [snapshot])
+
+    def test_legacy_positional_assignments_keep_their_original_slot(self) -> None:
+        state = SurfaceTextureData(
+            None,
+            0,
+            {},
+            {},
+            None,
+            None,
+            (),
+            [_assignment()],
+        )
+
+        self.assertEqual(state.assignments, [_assignment()])
+        self.assertEqual(state.overlay_planes, [])
+        self.assertEqual(state.localized_inpaint_undo_stack, [])
+
     def test_3d_texture_mask_strokes_round_trip_per_stable_surface(self) -> None:
         surface_id = "level:2/room:5/wall:1:2"
         state = SurfaceTextureData(
@@ -189,6 +233,113 @@ class SurfaceTextureSelectionTests(unittest.TestCase):
 
 # ### Assignment validation tests ###
 class SurfaceTextureAssignmentTests(unittest.TestCase):
+    def test_exact_resolution_variants_round_trip_and_infer_active_selection(
+        self,
+    ) -> None:
+        variants = tuple(
+            SurfaceTextureVariant(
+                resolution=resolution,
+                asset_path=f"textures/oak-{resolution}.png",
+            )
+            for resolution in SURFACE_TEXTURE_RESOLUTIONS
+        )
+        assignment = SurfaceTextureAssignment(
+            assignment_id="oak",
+            surface_type=SURFACE_TYPE_FLOOR,
+            surface_ids=("level:2/room:0/floor",),
+            provider="provider",
+            asset_path="textures/oak-1024.png",
+            texture_variants=tuple(reversed(variants)),
+        )
+
+        restored = SurfaceTextureAssignment.from_dict(assignment.to_dict())
+
+        self.assertEqual(SURFACE_TEXTURE_SCHEMA_VERSION, 4)
+        self.assertEqual(
+            restored.selected_texture_resolution,
+            DEFAULT_SURFACE_TEXTURE_RESOLUTION,
+        )
+        self.assertEqual(
+            (restored.texture_width, restored.texture_height),
+            (1024, 1024),
+        )
+        self.assertEqual(restored.texture_variants, variants)
+        self.assertEqual(
+            restored.texture_variant_for_resolution(2048),
+            variants[-1],
+        )
+        self.assertIsNone(restored.texture_variant_for_resolution(4096))
+
+    def test_legacy_assignment_without_variants_remains_unchanged(self) -> None:
+        legacy = _assignment()
+
+        restored = SurfaceTextureAssignment.from_dict(legacy.to_dict())
+
+        self.assertEqual(restored, legacy)
+        self.assertEqual(restored.texture_variants, ())
+        self.assertIsNone(restored.selected_texture_resolution)
+
+    def test_assignment_appends_variant_fields_after_legacy_positional_fields(
+        self,
+    ) -> None:
+        assignment = SurfaceTextureAssignment(
+            "legacy-positional",
+            SURFACE_TYPE_FLOOR,
+            ("level:2/room:0/floor",),
+            "provider",
+            "textures/floor.png",
+            "task",
+            4.0,
+            "Floor",
+            (1,),
+            512,
+            256,
+        )
+
+        self.assertEqual(assignment.asset_path, "textures/floor.png")
+        self.assertEqual((assignment.texture_width, assignment.texture_height), (512, 256))
+        self.assertEqual(assignment.texture_variants, ())
+        self.assertIsNone(assignment.selected_texture_resolution)
+
+    def test_assignment_rejects_incomplete_or_inconsistent_variants(self) -> None:
+        variants = tuple(
+            SurfaceTextureVariant(
+                resolution=resolution,
+                asset_path=f"textures/oak-{resolution}.png",
+            )
+            for resolution in SURFACE_TEXTURE_RESOLUTIONS
+        )
+        base_arguments = {
+            "assignment_id": "oak",
+            "surface_type": SURFACE_TYPE_FLOOR,
+            "surface_ids": ("level:2/room:0/floor",),
+            "provider": "provider",
+            "asset_path": "textures/oak-1024.png",
+            "texture_variants": variants,
+            "selected_texture_resolution": 1024,
+        }
+        invalid_overrides = (
+            {"texture_variants": variants[:-1]},
+            {"texture_variants": (*variants, variants[0])},
+            {"asset_path": "textures/oak-512.png"},
+            {"texture_width": 512, "texture_height": 512},
+            {"selected_texture_resolution": 4096},
+        )
+        for overrides in invalid_overrides:
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(ValueError):
+                    SurfaceTextureAssignment(**(base_arguments | overrides))
+
+    def test_surface_texture_variant_rejects_invalid_resolution_and_path(self) -> None:
+        for resolution, asset_path in (
+            (256, "textures/oak.png"),
+            (True, "textures/oak.png"),
+            (512, "../oak.png"),
+        ):
+            with self.subTest(resolution=resolution, asset_path=asset_path):
+                with self.assertRaises(ValueError):
+                    SurfaceTextureVariant(resolution, asset_path)
+
     def test_assignment_normalizes_safe_relative_paths_and_legacy_aliases(self) -> None:
         assignment = SurfaceTextureAssignment.from_dict(
             {

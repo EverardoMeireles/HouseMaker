@@ -36,6 +36,7 @@ from housemaker.models import (
     Vertex,
     VertexData,
 )
+from housemaker.object_texture_variants import ObjectTextureVariants
 from housemaker.texture_mapping import paint_wall_texture_crop
 from housemaker.uv_layout import (
     RoomWall,
@@ -90,6 +91,7 @@ class GeneratedModel:
         default_factory=list
     )
     preview_untextured_mesh: trimesh.Trimesh | None = None
+    object_texture_variants: ObjectTextureVariants | None = None
 
 
 @dataclass
@@ -211,6 +213,7 @@ def convert_to_glb(
     ) = None,
     surface_texture_world_size_meters: float = 2.0,
     stairs: Sequence[StairData] = (),
+    surface_overlay_planes: Sequence[object] = (),
 ) -> GeneratedModel:
     if isinstance(level_source, VertexData):
         if stairs:
@@ -260,6 +263,7 @@ def convert_to_glb(
         surface_texture_world_size_meters=(
             surface_texture_world_size_meters
         ),
+        surface_overlay_planes=surface_overlay_planes,
     )
 
 
@@ -1433,6 +1437,7 @@ def _apply_surface_material_overlays(
         bytes | bytearray | memoryview | str | Path,
     ],
     surface_texture_world_size_meters: float,
+    surface_overlay_planes: Sequence[object],
 ) -> GeneratedModel:
     """Overlay only assigned semantic faces on the unchanged legacy model."""
 
@@ -1443,7 +1448,7 @@ def _apply_surface_material_overlays(
             "Surface materials require level data with stable surface IDs."
         )
 
-    from housemaker.surface_geometry import build_fixed_surfaces
+    from housemaker.surface_geometry import FixedSurface, build_fixed_surfaces
     from housemaker.surface_materials import (
         build_world_planar_textured_mesh,
         normalize_texture_world_size,
@@ -1452,6 +1457,26 @@ def _apply_surface_material_overlays(
 
     levels = list(level_source)
     fixed_surfaces = build_fixed_surfaces(levels)
+    overlay_planes = list(surface_overlay_planes)
+    if not all(isinstance(surface, FixedSurface) for surface in overlay_planes):
+        raise TypeError("Surface overlay planes must contain FixedSurface values.")
+    base_surface_ids = {surface.surface_id for surface in fixed_surfaces}
+    overlay_surface_ids = [surface.surface_id for surface in overlay_planes]
+    if len(overlay_surface_ids) != len(set(overlay_surface_ids)):
+        raise ValueError("Surface overlay plane IDs must be unique.")
+    if base_surface_ids.intersection(overlay_surface_ids):
+        raise ValueError("A surface overlay plane ID conflicts with a fixed surface.")
+    if any(
+        surface.overlay_parent_surface_id not in base_surface_ids
+        for surface in overlay_planes
+    ):
+        raise ValueError("A surface overlay plane has no live fixed parent.")
+    overlay_parent_ids = [
+        surface.overlay_parent_surface_id for surface in overlay_planes
+    ]
+    if len(overlay_parent_ids) != len(set(overlay_parent_ids)):
+        raise ValueError("Only one surface overlay plane may exist per parent.")
+    fixed_surfaces.extend(overlay_planes)
     known_surface_ids = {surface.surface_id for surface in fixed_surfaces}
     live_sources = {
         str(surface_id): source
@@ -1512,7 +1537,14 @@ def _build_surface_named_meshes(
             continue
 
         source_meshes = [getattr(surface, "mesh").copy()]
-        if surface_type == "wall" and getattr(surface, "room_index", None) is None:
+        is_overlay_plane = (
+            getattr(surface, "overlay_parent_surface_id", None) is not None
+        )
+        if (
+            surface_type == "wall"
+            and getattr(surface, "room_index", None) is None
+            and not is_overlay_plane
+        ):
             source_meshes.append(_build_opposite_winding_mesh(source_meshes[0]))
 
         object_name = _get_surface_object_name(surface_id)
@@ -1523,7 +1555,7 @@ def _build_surface_named_meshes(
                 material,
                 texture_world_size_meters=texture_world_size_meters,
                 material_name=f"Surface {surface_id}",
-                overlay_offset_meters=0.002,
+                overlay_offset_meters=0.0 if is_overlay_plane else 0.002,
             )
             preview_surfaces.append(
                 PreviewTexturedSurface(

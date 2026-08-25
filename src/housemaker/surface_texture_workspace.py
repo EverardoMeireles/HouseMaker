@@ -33,10 +33,11 @@ from PySide6.QtWidgets import (
 )
 from shiboken6 import isValid as is_valid_qt_object
 
-from housemaker.camera_models import InitialFirstPersonCamera
 from housemaker.app_settings import ApplicationSettingsStore
+from housemaker.camera_models import InitialFirstPersonCamera
 from housemaker.generation_state import MASK_MODE_ERASE, MASK_MODE_PAINT, MaskStroke
 from housemaker.generation_views import VideoInpaintView, rasterize_mask_strokes
+from housemaker.glb import GeneratedModel
 from housemaker.models import LevelData
 from housemaker.settings_widget import (
     SURFACE_TEXTURE_PROVIDER_OPTIONS,
@@ -44,15 +45,35 @@ from housemaker.settings_widget import (
     GenerationServiceSettings,
     read_surface_texture_provider,
 )
+from housemaker.surface_geometry import (
+    DEFAULT_SURFACE_OVERLAY_OFFSET_METERS,
+    FixedSurface,
+    build_fixed_surfaces,
+    build_surface_overlay_plane,
+    get_surface_overlay_offset_toward_point,
+)
 from housemaker.surface_texture_providers import (
     SurfaceTextureResult,
     request_surface_texture,
 )
 from housemaker.surface_texture_state import (
+    MAX_LOCALIZED_INPAINT_UNDO_HISTORY,
     SurfaceTextureAssignment,
     SurfaceTextureData,
+    SurfaceTextureInpaintUndoSnapshot,
+    SurfaceTextureOverlayPlane,
+    SurfaceTextureVariant,
 )
-from housemaker.surface_texture_viewer import SurfaceTextureViewer
+from housemaker.surface_texture_variants import (
+    DEFAULT_SURFACE_TEXTURE_RESOLUTION,
+    SURFACE_TEXTURE_RESOLUTIONS,
+    SurfaceTextureVariants,
+    build_surface_texture_variants,
+)
+from housemaker.surface_texture_viewer import (
+    SurfaceTextureViewer,
+    rasterize_texture_mask_strokes,
+)
 from housemaker.texture_atlas_view import TextureAtlasEntry, TextureAtlasView
 from housemaker.video_source import VIDEO_FILE_FILTER, VideoFrameSource, probe_video
 
@@ -82,6 +103,22 @@ class SurfaceTextureRequest:
     existing_texture_png: bytes | None = None
     edit_mask_png: bytes | None = None
     surface_edit_mask_pngs: tuple[tuple[str, bytes], ...] = ()
+
+
+@dataclass(frozen=True)
+class _SavedSurfaceTextureOutput:
+    """One completely persisted resolution family awaiting state commit."""
+
+    surface_ids: tuple[str, ...]
+    assignment_id: str
+    variants: tuple[SurfaceTextureVariant, ...]
+    texture_png_by_resolution: tuple[tuple[int, bytes], ...]
+
+    def png_for_resolution(self, resolution: int) -> bytes:
+        for candidate_resolution, texture_png in self.texture_png_by_resolution:
+            if candidate_resolution == int(resolution):
+                return texture_png
+        raise ValueError("The saved surface texture resolution is unavailable.")
 
 
 class SurfaceTextureProvider(Protocol):
@@ -170,6 +207,9 @@ class SurfaceTextureGenerationWorkspace(QWidget):
 
     data_changed = Signal(object)
     generation_completed = Signal(object)
+    assignments_removed = Signal(object)
+    localized_inpaint_undone = Signal(object)
+    surface_content_changed = Signal()
 
     def __init__(
         self,
@@ -210,6 +250,11 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             str,
             tuple[str, TextureAtlasEntry],
         ] = {}
+        self._texture_variant_entry_targets: dict[str, tuple[str, int]] = {}
+        self._texture_resolution_change_handler: (
+            Callable[[str, int], bool] | None
+        ) = None
+        self._is_refreshing_texture_atlases = False
 
         self._build_ui()
         self._sync_video_controls()
@@ -239,6 +284,262 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 material_sources[surface_id] = texture_path
         return material_sources
 
+    def get_surface_overlay_planes(self) -> tuple[FixedSurface, ...]:
+        """Build live overlay geometry from bounded persisted definitions."""
+
+        base_surfaces = build_fixed_surfaces(self._levels)
+        base_by_id = {
+            surface.surface_id: surface for surface in base_surfaces
+        }
+        overlay_surfaces: list[FixedSurface] = []
+        for plane in self._data.overlay_planes:
+            parent_surface = base_by_id.get(plane.parent_surface_id)
+            if parent_surface is None:
+                continue
+            try:
+                overlay_surfaces.append(
+                    build_surface_overlay_plane(
+                        parent_surface,
+                        plane.surface_id,
+                        plane.normal_offset_meters,
+                    )
+                )
+            except (TypeError, ValueError):
+                continue
+        return tuple(overlay_surfaces)
+
+    def get_assignment_asset_path(
+        self,
+        assignment_id: str,
+        resolution: int | None = None,
+    ) -> Path | None:
+        """Resolve one live assignment variant without exposing the asset root."""
+
+        normalized_id = str(assignment_id).strip()
+        assignment = next(
+            (
+                candidate
+                for candidate in self._data.assignments
+                if candidate.assignment_id == normalized_id
+            ),
+            None,
+        )
+        if assignment is None:
+            return None
+        asset_path = assignment.asset_path
+        if resolution is not None:
+            variant = assignment.texture_variant_for_resolution(resolution)
+            if variant is None:
+                return None
+            asset_path = variant.asset_path
+        try:
+            texture_path = self._resolve_asset_path(asset_path)
+        except ValueError:
+            return None
+        return texture_path if texture_path.is_file() else None
+
+    def can_select_assignment_texture_resolution(
+        self,
+        assignment_id: str,
+        resolution: int,
+    ) -> bool:
+        """Return whether an exact generated surface variant can be selected."""
+
+        if self.is_generating:
+            return False
+        texture_path = self.get_assignment_asset_path(
+            assignment_id,
+            resolution,
+        )
+        if texture_path is None:
+            return False
+        try:
+            texture = _decode_png_rgba(
+                texture_path.read_bytes(),
+                "Surface texture variant",
+            )
+        except (OSError, ValueError):
+            return False
+        return texture.shape[:2] == (int(resolution), int(resolution))
+
+    def set_texture_resolution_change_handler(
+        self,
+        handler: Callable[[str, int], bool] | None,
+    ) -> None:
+        """Route UI resolution changes through an application-wide transaction."""
+
+        if handler is not None and not callable(handler):
+            raise TypeError("The texture resolution change handler must be callable.")
+        self._texture_resolution_change_handler = handler
+
+    def select_assignment_texture_resolution(
+        self,
+        assignment_id: str,
+        resolution: int,
+        target_surface_ids: Sequence[str] = (),
+    ) -> bool:
+        """Select a family variant and optionally apply it to selected surfaces."""
+
+        if self.is_generating:
+            return False
+        normalized_id = str(assignment_id).strip()
+        source_assignment = next(
+            (
+                assignment
+                for assignment in self._data.assignments
+                if assignment.assignment_id == normalized_id
+            ),
+            None,
+        )
+        if source_assignment is None:
+            return False
+        try:
+            target_resolution = int(resolution)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        variant = source_assignment.texture_variant_for_resolution(
+            target_resolution
+        )
+        if variant is None:
+            return False
+        texture_path = self.get_assignment_asset_path(
+            source_assignment.assignment_id,
+            target_resolution,
+        )
+        if texture_path is None:
+            return False
+        try:
+            texture_png = texture_path.read_bytes()
+            texture_rgba = _decode_png_rgba(
+                texture_png,
+                "Surface texture variant",
+            )
+        except (OSError, ValueError):
+            return False
+        if texture_rgba.shape[:2] != (
+            target_resolution,
+            target_resolution,
+        ):
+            return False
+
+        normalized_targets = tuple(
+            dict.fromkeys(str(surface_id) for surface_id in target_surface_ids)
+        )
+        if normalized_targets:
+            target_surfaces = tuple(
+                self.surface_view.get_surface(surface_id)
+                for surface_id in normalized_targets
+            )
+            if any(surface is None for surface in target_surfaces):
+                return False
+            if any(
+                surface.surface_type != source_assignment.surface_type
+                for surface in target_surfaces
+                if surface is not None
+            ):
+                return False
+        else:
+            normalized_targets = source_assignment.surface_ids
+        if (
+            target_resolution == source_assignment.selected_texture_resolution
+            and set(normalized_targets).issubset(source_assignment.surface_ids)
+        ):
+            return True
+
+        previous_assignments = list(self._data.assignments)
+        previous_strokes = {
+            surface_id: list(strokes)
+            for surface_id, strokes in self._data.texture_mask_strokes.items()
+        }
+        source_surface_ids = tuple(
+            dict.fromkeys(
+                (*source_assignment.surface_ids, *normalized_targets)
+            )
+        )
+        retained_assignments: list[SurfaceTextureAssignment] = []
+        removed_assignments: list[SurfaceTextureAssignment] = []
+        target_set = set(normalized_targets)
+        for assignment in self._data.assignments:
+            if assignment.assignment_id == source_assignment.assignment_id:
+                continue
+            remaining_ids = tuple(
+                surface_id
+                for surface_id in assignment.surface_ids
+                if surface_id not in target_set
+            )
+            if remaining_ids == assignment.surface_ids:
+                retained_assignments.append(assignment)
+            elif not remaining_ids:
+                removed_assignments.append(assignment)
+            else:
+                retained_assignments.append(
+                    self._assignment_with_surfaces(
+                        assignment,
+                        remaining_ids,
+                    )
+                )
+        selected_assignment = self._assignment_with_surfaces(
+            replace(
+                source_assignment,
+                asset_path=variant.asset_path,
+                selected_texture_resolution=target_resolution,
+                texture_width=target_resolution,
+                texture_height=target_resolution,
+            ),
+            source_surface_ids,
+        )
+        next_assignments = [*retained_assignments, selected_assignment]
+        changed_family_ids = target_set.difference(
+            source_assignment.surface_ids
+        )
+        next_strokes = {
+            surface_id: strokes
+            for surface_id, strokes in previous_strokes.items()
+            if surface_id not in changed_family_ids
+        }
+
+        try:
+            self.surface_view.set_surface_texture(
+                selected_assignment.surface_ids,
+                texture_png,
+            )
+            self._data.assignments = next_assignments
+            self._data.texture_mask_strokes = next_strokes
+            self.surface_view.set_texture_mask_strokes(next_strokes)
+        except (OSError, TypeError, ValueError):
+            self._data.assignments = previous_assignments
+            self._data.texture_mask_strokes = previous_strokes
+            self._restore_assignment_textures()
+            self.surface_view.set_texture_mask_strokes(previous_strokes)
+            return False
+
+        discarded_assignments = self._clear_localized_inpaint_undo_history()
+        self._texture_atlas_entry_cache.clear()
+        self._refresh_texture_atlases()
+        cleanup_failure_count = self._delete_orphaned_assignment_assets(
+            [*removed_assignments, *discarded_assignments]
+        )
+        removed_assignment_ids = self._unretained_assignment_ids(
+            [*removed_assignments, *discarded_assignments]
+        )
+        if removed_assignment_ids:
+            self.assignments_removed.emit(removed_assignment_ids)
+        self.status_label.setText(
+            f"Applied the {target_resolution} x {target_resolution} texture "
+            f"to {len(selected_assignment.surface_ids)} "
+            f"{selected_assignment.surface_type} surface(s)."
+        )
+        if cleanup_failure_count:
+            self.status_label.setText(
+                self.status_label.text()
+                + f" {cleanup_failure_count} unused texture file(s) could not "
+                "be deleted."
+            )
+        self._emit_data_changed()
+        self.surface_content_changed.emit()
+        self._sync_controls()
+        return True
+
     def set_data(self, data: SurfaceTextureData | None) -> None:
         if self.is_generating:
             raise RuntimeError(
@@ -247,6 +548,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._close_video_source()
         self._displayed_frame_index = None
         self._texture_atlas_entry_cache.clear()
+        self._texture_variant_entry_targets.clear()
         self._data = SurfaceTextureData() if data is None else data.clone()
         metadata = self._data.video_metadata
         if metadata is not None and Path(metadata.path).exists():
@@ -259,11 +561,13 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             self.status_label.setText(f"Video missing: {metadata.path}")
 
         self.video_view.clear_frame("Load a source video to paint references")
-        if self._data.camera_pose is None:
-            self.surface_view.set_levels(
-                self._levels,
-                self._initial_camera,
-            )
+        saved_camera_pose = self._data.camera_pose
+        self.surface_view.set_levels(
+            self._levels,
+            self._initial_camera,
+            self.get_surface_overlay_planes(),
+        )
+        self._data.camera_pose = saved_camera_pose
         self._restore_viewer_state()
         self._restore_assignment_textures()
         self._refresh_texture_atlases()
@@ -282,12 +586,21 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             self._store_viewer_state()
         self._levels = list(levels)
         self._initial_camera = initial_camera
-        self.surface_view.set_levels(self._levels, initial_camera)
+        self.surface_view.set_levels(
+            self._levels,
+            initial_camera,
+            self.get_surface_overlay_planes(),
+        )
         self._restore_viewer_state()
         self._restore_assignment_textures()
         self._refresh_texture_atlases()
         self._sync_selection_status()
         self._sync_controls()
+
+    def set_preview_model(self, model: GeneratedModel | None) -> None:
+        """Use the Canvas model while retaining semantic selection and inpainting."""
+
+        self.surface_view.set_scene_model(model)
 
     def set_runtime_settings(self, settings: GenerationServiceSettings) -> None:
         if not isinstance(settings, GenerationServiceSettings):
@@ -361,6 +674,81 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             return
         self._start_generation(request)
 
+    def undo_localized_texture_inpaint(self) -> bool:
+        """Restore the complete state before the latest successful 3D inpaint."""
+
+        if self.is_generating:
+            return False
+        history = self._data.localized_inpaint_undo_stack
+        if not history:
+            self.status_label.setText("There is no localized texture inpaint to undo.")
+            self._sync_controls()
+            return False
+        snapshot = history[-1]
+        try:
+            required_assignment_ids = self._validate_undo_snapshot_assets(snapshot)
+        except (OSError, ValueError) as error:
+            self.status_label.setText(
+                f"The localized texture inpaint cannot be undone: {error}"
+            )
+            return False
+
+        current_assignments = list(self._data.assignments)
+        current_strokes = {
+            surface_id: list(strokes)
+            for surface_id, strokes in self._data.texture_mask_strokes.items()
+        }
+        restored_strokes = {
+            surface_id: list(strokes)
+            for surface_id, strokes in current_strokes.items()
+        }
+        for surface_id in snapshot.affected_surface_ids:
+            restored_strokes.pop(surface_id, None)
+            previous = snapshot.previous_texture_mask_strokes.get(surface_id)
+            if previous:
+                restored_strokes[surface_id] = list(previous)
+
+        try:
+            self._data.assignments = list(snapshot.previous_assignments)
+            self._data.texture_mask_strokes = restored_strokes
+            self._restore_assignment_textures(
+                required_assignment_ids=required_assignment_ids
+            )
+            self.surface_view.set_texture_mask_strokes(restored_strokes)
+        except (OSError, TypeError, ValueError) as error:
+            self._data.assignments = current_assignments
+            self._data.texture_mask_strokes = current_strokes
+            self._restore_assignment_textures()
+            self.surface_view.set_texture_mask_strokes(current_strokes)
+            self.status_label.setText(
+                f"The localized texture inpaint could not be undone: {error}"
+            )
+            return False
+
+        history.pop()
+        self._texture_atlas_entry_cache.clear()
+        self._refresh_texture_atlases()
+        cleanup_failure_count = self._delete_orphaned_assignment_assets(
+            current_assignments
+        )
+        removed_assignment_ids = self._unretained_assignment_ids(
+            current_assignments
+        )
+        self.status_label.setText("Restored the texture before localized inpainting.")
+        if cleanup_failure_count:
+            self.status_label.setText(
+                self.status_label.text()
+                + f" {cleanup_failure_count} replaced texture file(s) could not "
+                "be deleted."
+            )
+        self._emit_data_changed()
+        if removed_assignment_ids:
+            self.assignments_removed.emit(removed_assignment_ids)
+        self.localized_inpaint_undone.emit(snapshot)
+        self.surface_content_changed.emit()
+        self._sync_controls()
+        return True
+
     def shutdown(self) -> None:
         worker = self._generation_worker
         thread = self._generation_thread
@@ -426,8 +814,17 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             "Fixed surfaces",
             self.surface_view,
         )
-        self.texture_view = TextureAtlasView()
+        self.texture_view = TextureAtlasView(
+            empty_preview_text="No texture resolutions available",
+            unselected_preview_text="Select a texture resolution",
+        )
         self.texture_view.setObjectName("surface_texture_atlas_view")
+        self.texture_view.atlas_selected.connect(
+            self._handle_texture_variant_selected
+        )
+        self.texture_view.atlas_activated.connect(
+            self._handle_texture_variant_activated
+        )
         self.texture_view_page = _build_labeled_view(
             "Texture view",
             self.texture_view,
@@ -459,6 +856,24 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self.selection_label = QLabel("No surface selected")
         self.selection_label.setObjectName("surface_selection_label")
         first_row.addWidget(self.selection_label, 1)
+        self.add_plane_button = QPushButton("Add plane")
+        self.add_plane_button.setObjectName("add_surface_texture_plane_button")
+        self.add_plane_button.setToolTip(
+            "Add one close-offset texture plane in front of the selected surface."
+        )
+        self.add_plane_button.clicked.connect(self._handle_add_plane_clicked)
+        first_row.addWidget(self.add_plane_button)
+        self.remove_plane_button = QPushButton("Remove plane")
+        self.remove_plane_button.setObjectName(
+            "remove_surface_texture_plane_button"
+        )
+        self.remove_plane_button.setToolTip(
+            "Remove the selected texture plane and any assignment used only by it."
+        )
+        self.remove_plane_button.clicked.connect(
+            self._handle_remove_plane_clicked
+        )
+        first_row.addWidget(self.remove_plane_button)
         first_row.addWidget(QLabel("Surface texture provider"))
         self.surface_texture_provider_combo = QComboBox()
         self.surface_texture_provider_combo.setObjectName(
@@ -529,6 +944,19 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self.generate_button.setMinimumHeight(38)
         self.generate_button.clicked.connect(self.generate)
         second_row.addWidget(self.generate_button)
+        self.undo_inpaint_button = QPushButton("Undo inpaint")
+        self.undo_inpaint_button.setObjectName(
+            "undo_surface_texture_inpaint_button"
+        )
+        self.undo_inpaint_button.setMinimumHeight(38)
+        self.undo_inpaint_button.setToolTip(
+            "Restore the texture and painted region before the latest successful "
+            "localized 3D inpaint."
+        )
+        self.undo_inpaint_button.clicked.connect(
+            self.undo_localized_texture_inpaint
+        )
+        second_row.addWidget(self.undo_inpaint_button)
         root_layout.addLayout(second_row)
 
         self.status_label = QLabel(
@@ -600,21 +1028,23 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         masked_surface_ids = self.surface_view.get_masked_selected_surface_ids()
         if masked_surface_ids:
             try:
-                edit_data = self.surface_view.get_selected_texture_edit_data()
-            except ValueError as error:
+                base_rgba, edit_masks = (
+                    self._build_canonical_selected_texture_edit_data(
+                        masked_surface_ids
+                    )
+                )
+            except (OSError, ValueError) as error:
                 self.status_label.setText(str(error))
                 return None
-            if edit_data is None:
+            if not edit_masks:
                 self.status_label.setText("Paint an edit region on the 3D texture.")
                 return None
-            base_rgba, editable_mask = edit_data
+            editable_mask = np.maximum.reduce(tuple(edit_masks.values()))
             existing_texture_png = _encode_rgba_png(base_rgba)
             edit_mask_png = _encode_png(editable_mask)
             surface_edit_mask_pngs = tuple(
                 (surface_id, _encode_png(mask))
-                for surface_id, mask in (
-                    self.surface_view.get_selected_texture_edit_masks().items()
-                )
+                for surface_id, mask in edit_masks.items()
             )
             selected_ids = masked_surface_ids
             area_m2 = self.surface_view.get_combined_masked_selected_area()
@@ -665,6 +1095,72 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             MAX_PROVIDER_REFERENCE_IMAGES,
         )
         return tuple(_encode_png(image) for image in packed_images), tuple(used_indices)
+
+    def _build_canonical_selected_texture_edit_data(
+        self,
+        masked_surface_ids: Sequence[str],
+    ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        """Load one family's canonical texture and rasterize normalized masks."""
+
+        base_textures: list[np.ndarray] = []
+        strokes_by_surface_id = self.surface_view.get_texture_mask_strokes()
+        edit_masks: dict[str, np.ndarray] = {}
+        assignments = tuple(
+            next(
+                (
+                    candidate
+                    for candidate in reversed(self._data.assignments)
+                    if surface_id in candidate.surface_ids
+                ),
+                None,
+            )
+            for surface_id in masked_surface_ids
+        )
+        if any(assignment is None for assignment in assignments):
+            edit_data = self.surface_view.get_selected_texture_edit_data()
+            if edit_data is None:
+                raise ValueError("Paint an edit region on the 3D texture.")
+            return (
+                edit_data[0],
+                self.surface_view.get_selected_texture_edit_masks(),
+            )
+        for assignment in assignments:
+            assert assignment is not None
+            target_resolution = (
+                2048 if assignment.texture_variants else None
+            )
+            texture_path = self.get_assignment_asset_path(
+                assignment.assignment_id,
+                target_resolution,
+            )
+            if texture_path is None:
+                raise ValueError(
+                    "The canonical 2048 surface texture is unavailable."
+                )
+            texture = _decode_png_rgba(
+                texture_path.read_bytes(),
+                "Base surface texture",
+            )
+            base_textures.append(texture)
+        base_texture = base_textures[0]
+        if any(
+            texture.shape != base_texture.shape
+            or not np.array_equal(texture, base_texture)
+            for texture in base_textures[1:]
+        ):
+            raise ValueError(
+                "Selected surfaces must share the same texture for partial "
+                "inpainting."
+            )
+        for surface_id in masked_surface_ids:
+            strokes = strokes_by_surface_id.get(surface_id, ())
+            if not strokes:
+                continue
+            edit_masks[surface_id] = rasterize_texture_mask_strokes(
+                (base_texture.shape[1], base_texture.shape[0]),
+                strokes,
+            )
+        return base_texture.copy(), edit_masks
 
     @Slot(object)
     def _handle_surface_selection_changed(self, raw_ids: object) -> None:
@@ -718,56 +1214,391 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         request: SurfaceTextureRequest,
         result: SurfaceTextureResult,
     ) -> None:
+        is_localized_inpaint = _is_localized_surface_texture_inpaint(request)
+        previous_assignments = tuple(self._data.assignments)
+        previous_texture_mask_strokes = {
+            surface_id: tuple(self._data.texture_mask_strokes.get(surface_id, ()))
+            for surface_id in request.surface_ids
+            if self._data.texture_mask_strokes.get(surface_id)
+        }
         try:
             outputs = _build_surface_texture_outputs(request, result.texture_png)
         except ValueError as error:
             self._handle_generation_failed(str(error))
             return
-        saved_outputs: list[tuple[tuple[str, ...], str, bytes]] = []
+        saved_outputs: list[_SavedSurfaceTextureOutput] = []
         try:
             for surface_ids, texture_png in outputs:
                 assignment_id = uuid.uuid4().hex
-                asset_path = self._persist_texture(assignment_id, texture_png)
-                saved_outputs.append((surface_ids, asset_path, texture_png))
-        except OSError as error:
-            for _surface_ids, saved_path, _texture_png in saved_outputs:
-                self._resolve_asset_path(saved_path).unlink(missing_ok=True)
+                texture_variants = build_surface_texture_variants(texture_png)
+                saved_outputs.append(
+                    self._persist_texture_variants(
+                        surface_ids,
+                        assignment_id,
+                        texture_variants,
+                    )
+                )
+        except (OSError, ValueError) as error:
+            self._discard_saved_outputs(saved_outputs)
             self._handle_generation_failed(
                 f"The generated texture could not be saved: {error}"
             )
             return
         assignments: list[SurfaceTextureAssignment] = []
-        for surface_ids, asset_path, texture_png in saved_outputs:
-            decoded_texture = _decode_png_rgba(texture_png, "Generated texture")
-            area_m2 = self.surface_view.get_combined_surface_area(surface_ids)
-            assignment = SurfaceTextureAssignment(
-                assignment_id=Path(asset_path).stem,
-                surface_type=request.surface_type,
-                surface_ids=surface_ids,
-                provider=result.provider,
-                provider_task_id=result.task_id,
-                asset_path=asset_path,
-                combined_area_m2=area_m2,
-                area_description=(
-                    f"{len(surface_ids)} {request.surface_type} "
-                    f"surface(s), {area_m2:.2f} m²"
-                ),
-                reference_frame_indices=request.reference_frame_indices,
-                texture_width=int(decoded_texture.shape[1]),
-                texture_height=int(decoded_texture.shape[0]),
+        try:
+            for saved_output in saved_outputs:
+                selected_resolution = (
+                    self._replacement_texture_resolution(
+                        saved_output.surface_ids,
+                        previous_assignments,
+                    )
+                    if is_localized_inpaint
+                    else DEFAULT_SURFACE_TEXTURE_RESOLUTION
+                )
+                active_variant = next(
+                    variant
+                    for variant in saved_output.variants
+                    if variant.resolution == selected_resolution
+                )
+                area_m2 = self.surface_view.get_combined_surface_area(
+                    saved_output.surface_ids
+                )
+                assignments.append(
+                    SurfaceTextureAssignment(
+                        assignment_id=saved_output.assignment_id,
+                        surface_type=request.surface_type,
+                        surface_ids=saved_output.surface_ids,
+                        provider=result.provider,
+                        provider_task_id=result.task_id,
+                        asset_path=active_variant.asset_path,
+                        combined_area_m2=area_m2,
+                        area_description=(
+                            f"{len(saved_output.surface_ids)} "
+                            f"{request.surface_type} "
+                            f"surface(s), {area_m2:.2f} m²"
+                        ),
+                        reference_frame_indices=request.reference_frame_indices,
+                        texture_width=selected_resolution,
+                        texture_height=selected_resolution,
+                        texture_variants=saved_output.variants,
+                        selected_texture_resolution=selected_resolution,
+                    )
+                )
+        except (OSError, ValueError) as error:
+            self._discard_saved_outputs(saved_outputs)
+            self._handle_generation_failed(
+                f"The generated texture could not be applied: {error}"
             )
-            self._data.assignments.append(assignment)
-            assignments.append(assignment)
-            self.surface_view.set_surface_texture(surface_ids, texture_png)
+            return
+
+        try:
+            retained_assignments, removed_assignments = (
+                self._replace_assignments_for_surfaces(assignments)
+            )
+            for saved_output, assignment in zip(
+                saved_outputs,
+                assignments,
+                strict=True,
+            ):
+                self.surface_view.set_surface_texture(
+                    saved_output.surface_ids,
+                    saved_output.png_for_resolution(
+                        assignment.selected_texture_resolution
+                        or DEFAULT_SURFACE_TEXTURE_RESOLUTION
+                    ),
+                )
+        except (OSError, TypeError, ValueError) as error:
+            self._restore_assignment_textures()
+            self._discard_saved_outputs(saved_outputs)
+            self._handle_generation_failed(
+                f"The generated texture could not be applied: {error}"
+            )
+            return
+
+        self._data.assignments = [*retained_assignments, *assignments]
+        discarded_snapshots: list[SurfaceTextureInpaintUndoSnapshot] = []
+        if is_localized_inpaint:
+            self._data.localized_inpaint_undo_stack.append(
+                SurfaceTextureInpaintUndoSnapshot(
+                    previous_assignments=previous_assignments,
+                    replacement_assignment_ids=tuple(
+                        assignment.assignment_id for assignment in assignments
+                    ),
+                    affected_surface_ids=request.surface_ids,
+                    previous_texture_mask_strokes=(
+                        previous_texture_mask_strokes
+                    ),
+                )
+            )
+            excess_count = max(
+                0,
+                len(self._data.localized_inpaint_undo_stack)
+                - MAX_LOCALIZED_INPAINT_UNDO_HISTORY,
+            )
+            if excess_count:
+                discarded_snapshots = (
+                    self._data.localized_inpaint_undo_stack[:excess_count]
+                )
+                del self._data.localized_inpaint_undo_stack[:excess_count]
+        else:
+            discarded_snapshots = list(
+                self._data.localized_inpaint_undo_stack
+            )
+            self._data.localized_inpaint_undo_stack.clear()
+        self._texture_atlas_entry_cache.clear()
         self._refresh_texture_atlases()
         self.surface_view.clear_texture_mask(request.surface_ids)
-        self.status_label.setText(
+        discarded_assignments = [
+            assignment
+            for snapshot in discarded_snapshots
+            for assignment in snapshot.previous_assignments
+        ]
+        cleanup_failure_count = self._delete_orphaned_assignment_assets(
+            [*removed_assignments, *discarded_assignments]
+        )
+        status = (
             f"Applied generated texture to {len(request.surface_ids)} "
             f"{request.surface_type} surface(s)."
         )
+        if cleanup_failure_count:
+            status += (
+                f" {cleanup_failure_count} replaced texture file(s) could not "
+                "be deleted."
+            )
+        self.status_label.setText(status)
         self._emit_data_changed()
+        removable_assignments = [
+            *([] if is_localized_inpaint else removed_assignments),
+            *discarded_assignments,
+        ]
+        removed_assignment_ids = self._unretained_assignment_ids(
+            removable_assignments
+        )
+        if removed_assignment_ids:
+            self.assignments_removed.emit(removed_assignment_ids)
         for assignment in assignments:
             self.generation_completed.emit(assignment)
+        self.surface_content_changed.emit()
+        self._sync_controls()
+
+    def _replace_assignments_for_surfaces(
+        self,
+        replacements: Sequence[SurfaceTextureAssignment],
+    ) -> tuple[
+        list[SurfaceTextureAssignment],
+        list[SurfaceTextureAssignment],
+    ]:
+        replaced_surface_ids = {
+            surface_id
+            for assignment in replacements
+            for surface_id in assignment.surface_ids
+        }
+        retained: list[SurfaceTextureAssignment] = []
+        removed: list[SurfaceTextureAssignment] = []
+        for assignment in self._data.assignments:
+            remaining_surface_ids = tuple(
+                surface_id
+                for surface_id in assignment.surface_ids
+                if surface_id not in replaced_surface_ids
+            )
+            if remaining_surface_ids == assignment.surface_ids:
+                retained.append(assignment)
+                continue
+            if not remaining_surface_ids:
+                removed.append(assignment)
+                continue
+            retained.append(
+                self._assignment_with_surfaces(
+                    assignment,
+                    remaining_surface_ids,
+                )
+            )
+        return retained, removed
+
+    def _assignment_with_surfaces(
+        self,
+        assignment: SurfaceTextureAssignment,
+        surface_ids: Sequence[str],
+    ) -> SurfaceTextureAssignment:
+        """Return assignment metadata recomputed for one surface group."""
+
+        normalized_ids = tuple(dict.fromkeys(str(value) for value in surface_ids))
+        area_m2 = self.surface_view.get_combined_surface_area(normalized_ids)
+        return replace(
+            assignment,
+            surface_ids=normalized_ids,
+            combined_area_m2=area_m2,
+            area_description=(
+                f"{len(normalized_ids)} {assignment.surface_type} "
+                f"surface(s), {area_m2:.2f} m²"
+            ),
+        )
+
+    @staticmethod
+    def _replacement_texture_resolution(
+        surface_ids: Sequence[str],
+        previous_assignments: Sequence[SurfaceTextureAssignment],
+    ) -> int:
+        """Preserve one unambiguous active resolution through inpainting."""
+
+        resolutions: set[int] = set()
+        for surface_id in surface_ids:
+            assignment = next(
+                (
+                    candidate
+                    for candidate in reversed(previous_assignments)
+                    if surface_id in candidate.surface_ids
+                ),
+                None,
+            )
+            if (
+                assignment is None
+                or assignment.selected_texture_resolution is None
+            ):
+                return DEFAULT_SURFACE_TEXTURE_RESOLUTION
+            resolutions.add(assignment.selected_texture_resolution)
+        if len(resolutions) != 1:
+            return DEFAULT_SURFACE_TEXTURE_RESOLUTION
+        resolution = next(iter(resolutions))
+        return (
+            resolution
+            if resolution in SURFACE_TEXTURE_RESOLUTIONS
+            else DEFAULT_SURFACE_TEXTURE_RESOLUTION
+        )
+
+    def _discard_saved_outputs(
+        self,
+        saved_outputs: Sequence[_SavedSurfaceTextureOutput],
+    ) -> None:
+        for saved_output in saved_outputs:
+            for variant in saved_output.variants:
+                try:
+                    self._resolve_asset_path(variant.asset_path).unlink(
+                        missing_ok=True
+                    )
+                except (OSError, ValueError):
+                    continue
+
+    def _delete_orphaned_assignment_assets(
+        self,
+        removed_assignments: Sequence[SurfaceTextureAssignment],
+    ) -> int:
+        active_asset_paths: set[Path] = set()
+        retained_assignments = [
+            *self._data.assignments,
+            *(
+                assignment
+                for snapshot in self._data.localized_inpaint_undo_stack
+                for assignment in snapshot.previous_assignments
+            ),
+        ]
+        for assignment in retained_assignments:
+            for raw_path in self._assignment_asset_relative_paths(assignment):
+                try:
+                    active_asset_paths.add(self._resolve_asset_path(raw_path))
+                except (OSError, ValueError):
+                    continue
+
+        orphaned_asset_paths: set[Path] = set()
+        for assignment in removed_assignments:
+            for raw_path in self._assignment_asset_relative_paths(assignment):
+                try:
+                    resolved_path = self._resolve_asset_path(raw_path)
+                except (OSError, ValueError):
+                    continue
+                if resolved_path not in active_asset_paths:
+                    orphaned_asset_paths.add(resolved_path)
+        failure_count = 0
+        for asset_path in orphaned_asset_paths:
+            try:
+                asset_path.unlink(missing_ok=True)
+            except OSError:
+                failure_count += 1
+        return failure_count
+
+    @staticmethod
+    def _assignment_asset_relative_paths(
+        assignment: SurfaceTextureAssignment,
+    ) -> tuple[str, ...]:
+        """Return every file retained by one assignment without duplicates."""
+
+        return tuple(
+            dict.fromkeys(
+                (
+                    assignment.asset_path,
+                    *(
+                        variant.asset_path
+                        for variant in assignment.texture_variants
+                    ),
+                )
+            )
+        )
+
+    def _unretained_assignment_ids(
+        self,
+        assignments: Sequence[SurfaceTextureAssignment],
+    ) -> tuple[str, ...]:
+        retained_ids = {
+            assignment.assignment_id for assignment in self._data.assignments
+        }
+        retained_ids.update(
+            assignment.assignment_id
+            for snapshot in self._data.localized_inpaint_undo_stack
+            for assignment in snapshot.previous_assignments
+        )
+        return tuple(
+            dict.fromkeys(
+                assignment.assignment_id
+                for assignment in assignments
+                if assignment.assignment_id not in retained_ids
+            )
+        )
+
+    def _clear_localized_inpaint_undo_history(
+        self,
+    ) -> list[SurfaceTextureAssignment]:
+        discarded = [
+            assignment
+            for snapshot in self._data.localized_inpaint_undo_stack
+            for assignment in snapshot.previous_assignments
+        ]
+        self._data.localized_inpaint_undo_stack.clear()
+        return discarded
+
+    def _validate_undo_snapshot_assets(
+        self,
+        snapshot: SurfaceTextureInpaintUndoSnapshot,
+    ) -> set[str]:
+        validated_paths: set[Path] = set()
+        required_assignment_ids: set[str] = set()
+        for surface_id in snapshot.affected_surface_ids:
+            assignment = next(
+                (
+                    candidate
+                    for candidate in reversed(snapshot.previous_assignments)
+                    if surface_id in candidate.surface_ids
+                ),
+                None,
+            )
+            if assignment is None:
+                raise ValueError(
+                    f"the prior texture for {surface_id!r} is unavailable."
+                )
+            required_assignment_ids.add(assignment.assignment_id)
+            for raw_path in self._assignment_asset_relative_paths(assignment):
+                texture_path = self._resolve_asset_path(raw_path)
+                if texture_path in validated_paths:
+                    continue
+                if not texture_path.is_file():
+                    raise ValueError(
+                        f"the prior texture asset {raw_path!r} is missing."
+                    )
+                _decode_png_rgba(
+                    texture_path.read_bytes(),
+                    "Prior surface texture",
+                )
+                validated_paths.add(texture_path)
+        return required_assignment_ids
 
     @Slot(str)
     def _handle_generation_failed(self, message: str) -> None:
@@ -792,6 +1623,144 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             self.load_video(file_path)
         except (RuntimeError, ValueError) as error:
             QMessageBox.critical(self, "Video load failed", str(error))
+
+    def _handle_add_plane_clicked(self) -> None:
+        if self.is_generating:
+            return
+        selected_ids = self.surface_view.get_selected_surface_ids()
+        if len(selected_ids) != 1:
+            self.status_label.setText(
+                "Select exactly one fixed surface before adding a plane."
+            )
+            return
+        parent_surface = self.surface_view.get_surface(selected_ids[0])
+        if parent_surface is None:
+            self.status_label.setText("The selected fixed surface is unavailable.")
+            return
+        if parent_surface.overlay_parent_surface_id is not None:
+            self.status_label.setText(
+                "A texture plane cannot be placed on another texture plane."
+            )
+            return
+        if any(
+            plane.parent_surface_id == parent_surface.surface_id
+            for plane in self._data.overlay_planes
+        ):
+            self.status_label.setText(
+                "The selected surface already has a texture plane."
+            )
+            return
+
+        camera_pose = self.surface_view.get_camera_pose()
+        try:
+            normal_offset = get_surface_overlay_offset_toward_point(
+                parent_surface,
+                (camera_pose.x, camera_pose.y, camera_pose.z),
+                DEFAULT_SURFACE_OVERLAY_OFFSET_METERS,
+            )
+            plane = SurfaceTextureOverlayPlane(
+                parent_surface_id=parent_surface.surface_id,
+                normal_offset_meters=normal_offset,
+            )
+            build_surface_overlay_plane(
+                parent_surface,
+                plane.surface_id,
+                plane.normal_offset_meters,
+            )
+        except (TypeError, ValueError) as error:
+            self.status_label.setText(f"The texture plane could not be added: {error}")
+            return
+
+        self._data.overlay_planes.append(plane)
+        self._reload_surface_geometry()
+        self.surface_view.set_selected_surface_ids((plane.surface_id,))
+        self.surface_content_changed.emit()
+        self.status_label.setText(
+            "Added and selected a texture plane 3 mm in front of the surface."
+        )
+
+    def _handle_remove_plane_clicked(self) -> None:
+        if self.is_generating:
+            return
+        selected_ids = self.surface_view.get_selected_surface_ids()
+        if len(selected_ids) != 1:
+            self.status_label.setText("Select exactly one texture plane to remove.")
+            return
+        selected_id = selected_ids[0]
+        plane = next(
+            (
+                candidate
+                for candidate in self._data.overlay_planes
+                if candidate.surface_id == selected_id
+            ),
+            None,
+        )
+        if plane is None:
+            self.status_label.setText("The selected surface is not a texture plane.")
+            return
+
+        retained_assignments: list[SurfaceTextureAssignment] = []
+        removed_assignments: list[SurfaceTextureAssignment] = []
+        for assignment in self._data.assignments:
+            remaining_surface_ids = tuple(
+                surface_id
+                for surface_id in assignment.surface_ids
+                if surface_id != selected_id
+            )
+            if remaining_surface_ids == assignment.surface_ids:
+                retained_assignments.append(assignment)
+                continue
+            if not remaining_surface_ids:
+                removed_assignments.append(assignment)
+                continue
+            remaining_area = self.surface_view.get_combined_surface_area(
+                remaining_surface_ids
+            )
+            retained_assignments.append(
+                replace(
+                    assignment,
+                    surface_ids=remaining_surface_ids,
+                    combined_area_m2=remaining_area,
+                    area_description=(
+                        f"{len(remaining_surface_ids)} "
+                        f"{assignment.surface_type} surface(s), "
+                        f"{remaining_area:.2f} m²"
+                    ),
+                )
+            )
+
+        self._data.overlay_planes = [
+            candidate
+            for candidate in self._data.overlay_planes
+            if candidate.surface_id != selected_id
+        ]
+        self._data.assignments = retained_assignments
+        self._data.texture_mask_strokes.pop(selected_id, None)
+        discarded_undo_assignments = (
+            self._clear_localized_inpaint_undo_history()
+        )
+        self._texture_atlas_entry_cache.clear()
+        cleanup_failure_count = self._delete_orphaned_assignment_assets(
+            [*removed_assignments, *discarded_undo_assignments]
+        )
+        self._reload_surface_geometry()
+        self.surface_view.set_selected_surface_ids((plane.parent_surface_id,))
+        self._restore_assignment_textures()
+        self._refresh_texture_atlases()
+        removed_assignment_ids = self._unretained_assignment_ids(
+            [*removed_assignments, *discarded_undo_assignments]
+        )
+        if removed_assignment_ids:
+            self.assignments_removed.emit(removed_assignment_ids)
+        self.surface_content_changed.emit()
+        status = "Removed the selected texture plane."
+        if cleanup_failure_count:
+            status += (
+                f" {cleanup_failure_count} unused texture file(s) could not "
+                "be deleted."
+            )
+        self.status_label.setText(status)
+        self._sync_controls()
 
     def _handle_seekbar_changed(self, frame_index: int) -> None:
         if self._is_syncing_seekbar or self.is_generating:
@@ -879,7 +1848,18 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             self._data.texture_mask_strokes
         )
 
-    def _restore_assignment_textures(self) -> None:
+    def _reload_surface_geometry(self) -> None:
+        base_surfaces = build_fixed_surfaces(self._levels)
+        self.surface_view.set_surfaces(
+            [*base_surfaces, *self.get_surface_overlay_planes()]
+        )
+
+    def _restore_assignment_textures(
+        self,
+        *,
+        required_assignment_ids: set[str] | None = None,
+    ) -> None:
+        required_ids = required_assignment_ids or set()
         self.surface_view.clear_surface_textures()
         for assignment in self._data.assignments:
             try:
@@ -888,62 +1868,183 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                     assignment.surface_ids,
                     texture_path,
                 )
-            except (OSError, ValueError):
+            except (OSError, TypeError, ValueError):
+                if assignment.assignment_id in required_ids:
+                    raise
                 continue
 
     def _refresh_texture_atlases(self) -> None:
+        assignment_id = self._latest_selected_surface_assignment_id()
+        assignment = next(
+            (
+                candidate
+                for candidate in self._data.assignments
+                if candidate.assignment_id == assignment_id
+            ),
+            None,
+        )
         entries: list[TextureAtlasEntry] = []
-        valid_assignment_ids: set[str] = set()
         next_cache: dict[str, tuple[str, TextureAtlasEntry]] = {}
-        for assignment_index, assignment in enumerate(
-            self._data.assignments,
-            start=1,
-        ):
+        next_targets: dict[str, tuple[str, int]] = {}
+        for variant in (() if assignment is None else assignment.texture_variants):
+            entry_id = (
+                f"{assignment.assignment_id}:resolution:{variant.resolution}"
+            )
             try:
-                texture_path = self._resolve_asset_path(assignment.asset_path)
+                texture_path = self._resolve_asset_path(variant.asset_path)
                 if not texture_path.is_file():
                     continue
                 resolved_path = str(texture_path)
-                cached_entry = self._texture_atlas_entry_cache.get(
-                    assignment.assignment_id
-                )
+                cached_entry = self._texture_atlas_entry_cache.get(entry_id)
                 if cached_entry is not None and cached_entry[0] == resolved_path:
                     entry = cached_entry[1]
                 else:
                     entry = TextureAtlasEntry(
-                        atlas_id=assignment.assignment_id,
-                        display_name=(
-                            f"#{assignment_index} "
-                            f"{assignment.surface_type.title()} · "
-                            f"{len(assignment.surface_ids)} surface(s)"
-                        ),
+                        atlas_id=entry_id,
+                        display_name=f"{variant.resolution} x {variant.resolution}",
                         image=texture_path,
-                        owner_id=(
-                            assignment.surface_ids[-1]
-                            if assignment.surface_ids
-                            else None
-                        ),
+                        owner_id=assignment.assignment_id,
                     )
             except (OSError, TypeError, ValueError):
                 continue
             entries.append(entry)
-            valid_assignment_ids.add(assignment.assignment_id)
-            next_cache[assignment.assignment_id] = (resolved_path, entry)
-        self._texture_atlas_entry_cache = next_cache
-
-        selected_surface_ids = self.surface_view.get_selected_surface_ids()
-        selected_atlas_id = self._latest_selected_surface_assignment_id(
-            valid_assignment_ids
-        )
-        if tuple(entries) != self.texture_view.entries:
-            self.texture_view.set_atlases(
-                entries,
-                selected_atlas_id=selected_atlas_id,
+            next_cache[entry_id] = (resolved_path, entry)
+            next_targets[entry_id] = (
+                assignment.assignment_id,
+                variant.resolution,
             )
-        elif selected_atlas_id is not None:
-            self.texture_view.select_atlas(selected_atlas_id)
-        if selected_surface_ids and selected_atlas_id is None:
-            self.texture_view.select_atlas(None)
+        self._texture_atlas_entry_cache = next_cache
+        self._texture_variant_entry_targets = next_targets
+
+        selected_atlas_id: str | None = None
+        if assignment is not None and entries:
+            preferred_resolution = (
+                assignment.selected_texture_resolution
+                or DEFAULT_SURFACE_TEXTURE_RESOLUTION
+            )
+            selected_atlas_id = min(
+                entries,
+                key=lambda entry: (
+                    abs(
+                        next_targets[entry.atlas_id][1]
+                        - preferred_resolution
+                    ),
+                    next_targets[entry.atlas_id][1],
+                ),
+            ).atlas_id
+        self._is_refreshing_texture_atlases = True
+        try:
+            if tuple(entries) != self.texture_view.entries:
+                self.texture_view.set_atlases(
+                    entries,
+                    selected_atlas_id=selected_atlas_id,
+                )
+            elif selected_atlas_id is not None:
+                self.texture_view.select_atlas(selected_atlas_id)
+            elif not entries:
+                self.texture_view.select_atlas(None)
+        finally:
+            self._is_refreshing_texture_atlases = False
+
+    @Slot(object)
+    def _handle_texture_variant_selected(self, raw_entry: object) -> None:
+        """Make a single-clicked variant the assignment's global resolution."""
+
+        if self._is_refreshing_texture_atlases:
+            return
+        if not isinstance(raw_entry, TextureAtlasEntry):
+            return
+        target = self._texture_variant_entry_targets.get(raw_entry.atlas_id)
+        if target is None:
+            return
+        assignment_id, resolution = target
+        assignment = self._assignment_by_id(assignment_id)
+        if (
+            assignment is not None
+            and assignment.selected_texture_resolution == resolution
+        ):
+            return
+        if self._request_global_texture_resolution_change(
+            assignment_id,
+            resolution,
+        ):
+            return
+        self.status_label.setText(
+            "The selected surface texture resolution could not be applied "
+            "globally; the previous resolution was kept."
+        )
+        self._refresh_texture_atlases()
+
+    @Slot(object)
+    def _handle_texture_variant_activated(self, raw_entry: object) -> None:
+        """Apply a double-clicked texture family variant to the selection."""
+
+        if not isinstance(raw_entry, TextureAtlasEntry):
+            return
+        target = self._texture_variant_entry_targets.get(raw_entry.atlas_id)
+        selected_surface_ids = self.surface_view.get_selected_surface_ids()
+        if target is None or not selected_surface_ids:
+            return
+        assignment_id, resolution = target
+        assignment = self._assignment_by_id(assignment_id)
+        if (
+            assignment is None
+            or (
+                assignment.selected_texture_resolution != resolution
+                and not self._request_global_texture_resolution_change(
+                    assignment_id,
+                    resolution,
+                )
+            )
+        ):
+            self.status_label.setText(
+                "The selected surface texture resolution could not be applied "
+                "globally; the previous resolution was kept."
+            )
+            self._refresh_texture_atlases()
+            return
+        if not self.select_assignment_texture_resolution(
+            assignment_id,
+            resolution,
+            selected_surface_ids,
+        ):
+            self.status_label.setText(
+                "The selected surface texture resolution could not be applied."
+            )
+
+    def _request_global_texture_resolution_change(
+        self,
+        assignment_id: str,
+        resolution: int,
+    ) -> bool:
+        """Commit through the host transaction, or locally when standalone."""
+
+        handler = self._texture_resolution_change_handler
+        if handler is None:
+            return self.select_assignment_texture_resolution(
+                assignment_id,
+                resolution,
+            )
+        try:
+            return bool(handler(assignment_id, resolution))
+        except Exception:
+            return False
+
+    def _assignment_by_id(
+        self,
+        assignment_id: str,
+    ) -> SurfaceTextureAssignment | None:
+        """Return one live assignment without cloning the workspace state."""
+
+        normalized_id = str(assignment_id).strip()
+        return next(
+            (
+                assignment
+                for assignment in self._data.assignments
+                if assignment.assignment_id == normalized_id
+            ),
+            None,
+        )
 
     def _latest_selected_surface_assignment_id(
         self,
@@ -952,10 +2053,10 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         selected_ids = self.surface_view.get_selected_surface_ids()
         if not selected_ids:
             return None
-        selected_surface_id = selected_ids[-1]
+        selected_surface_ids = set(selected_ids)
         for assignment in reversed(self._data.assignments):
             if (
-                selected_surface_id in assignment.surface_ids
+                selected_surface_ids.intersection(assignment.surface_ids)
                 and (
                     valid_assignment_ids is None
                     or assignment.assignment_id in valid_assignment_ids
@@ -964,10 +2065,56 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 return assignment.assignment_id
         return None
 
-    def _persist_texture(self, assignment_id: str, texture_png: bytes) -> str:
+    def _persist_texture_variants(
+        self,
+        surface_ids: tuple[str, ...],
+        assignment_id: str,
+        texture_variants: SurfaceTextureVariants,
+    ) -> _SavedSurfaceTextureOutput:
+        """Persist a complete family or remove every partial file on failure."""
+
+        persisted: list[SurfaceTextureVariant] = []
+        png_items = tuple(
+            (resolution, texture_variants.texture_png_by_resolution[resolution])
+            for resolution in SURFACE_TEXTURE_RESOLUTIONS
+        )
+        try:
+            for resolution, texture_png in png_items:
+                file_name = f"{assignment_id}.texture-{resolution}.png"
+                asset_path = self._persist_texture_file(file_name, texture_png)
+                persisted.append(
+                    SurfaceTextureVariant(
+                        resolution=resolution,
+                        asset_path=asset_path,
+                    )
+                )
+        except Exception:
+            for variant in persisted:
+                try:
+                    self._resolve_asset_path(variant.asset_path).unlink(
+                        missing_ok=True
+                    )
+                except (OSError, ValueError):
+                    continue
+            raise
+        return _SavedSurfaceTextureOutput(
+            surface_ids=surface_ids,
+            assignment_id=assignment_id,
+            variants=tuple(persisted),
+            texture_png_by_resolution=png_items,
+        )
+
+    def _persist_texture_file(
+        self,
+        file_name: str,
+        texture_png: bytes,
+    ) -> str:
         self._asset_directory.mkdir(parents=True, exist_ok=True)
-        file_name = f"{assignment_id}.png"
         destination = self._asset_directory / file_name
+        if destination.exists():
+            raise FileExistsError(
+                f"A surface texture asset already exists for {file_name}."
+            )
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{file_name}.",
             suffix=".tmp",
@@ -1050,6 +2197,19 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         has_video = self._video_source is not None
         has_mask = bool(self._data.frame_strokes) or self.video_view.has_selection()
         has_surface = bool(self.surface_view.get_selected_surface_ids())
+        selected_ids = self.surface_view.get_selected_surface_ids()
+        selected_surface = (
+            self.surface_view.get_surface(selected_ids[0])
+            if len(selected_ids) == 1
+            else None
+        )
+        selected_parent_has_plane = (
+            selected_surface is not None
+            and any(
+                plane.parent_surface_id == selected_surface.surface_id
+                for plane in self._data.overlay_planes
+            )
+        )
         has_key = bool(self._settings.surface_texture_api_key)
         self.load_video_button.setEnabled(not busy)
         self.seekbar.setEnabled(has_video and not busy)
@@ -1070,8 +2230,22 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         )
         self.material_notes_edit.setEnabled(not busy)
         self.surface_texture_provider_combo.setEnabled(not busy)
+        self.add_plane_button.setEnabled(
+            selected_surface is not None
+            and selected_surface.overlay_parent_surface_id is None
+            and not selected_parent_has_plane
+            and not busy
+        )
+        self.remove_plane_button.setEnabled(
+            selected_surface is not None
+            and selected_surface.overlay_parent_surface_id is not None
+            and not busy
+        )
         self.generate_button.setEnabled(
             has_video and has_mask and has_surface and has_key and not busy
+        )
+        self.undo_inpaint_button.setEnabled(
+            bool(self._data.localized_inpaint_undo_stack) and not busy
         )
         self.video_view.set_interaction_enabled(has_video and not busy)
 
@@ -1247,6 +2421,16 @@ def _decode_png_mask(png_bytes: bytes, expected_shape: tuple[int, int]) -> np.nd
     if decoded is None or decoded.shape != expected_shape:
         raise ValueError("A 3D edit mask has invalid dimensions.")
     return np.where(decoded > 0, 255, 0).astype(np.uint8)
+
+
+def _is_localized_surface_texture_inpaint(
+    request: SurfaceTextureRequest,
+) -> bool:
+    return bool(
+        request.existing_texture_png is not None
+        and request.edit_mask_png is not None
+        and request.surface_edit_mask_pngs
+    )
 
 
 def _build_surface_texture_outputs(
