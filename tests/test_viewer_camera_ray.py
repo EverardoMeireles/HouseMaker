@@ -186,8 +186,8 @@ class ViewerCameraRayTests(unittest.TestCase):
         self.assertAlmostEqual(hit.point.v, 1.0 / 3.0, places=4)
 
 
-# ### Inpaint pointer tests ###
-class ViewerInpaintPointerTests(unittest.TestCase):
+# ### Retired inpaint pointer tests ###
+class ViewerRetiredInpaintPointerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.view = SelectableGLViewWidget()
 
@@ -197,37 +197,12 @@ class ViewerInpaintPointerTests(unittest.TestCase):
         self.view.deleteLater()
         _qt_application.processEvents()
 
-    def test_inpaint_mode_exits_first_person_and_owns_left_drag_signals(
-        self,
-    ) -> None:
-        self.view.set_navigation_mode(NAVIGATION_MODE_FIRST_PERSON)
-        self.assertEqual(
-            self.view.get_navigation_mode(),
-            NAVIGATION_MODE_FIRST_PERSON,
+    def test_object_texture_inpaint_pointer_api_is_removed(self) -> None:
+        self.assertFalse(hasattr(self.view, "texture_inpaint_enabled"))
+        self.assertFalse(hasattr(self.view, "set_texture_inpaint_enabled"))
+        self.assertFalse(
+            hasattr(self.view, "texture_inpaint_pointer_pressed")
         )
-        pressed = QSignalSpy(self.view.texture_inpaint_pointer_pressed)
-        moved = QSignalSpy(self.view.texture_inpaint_pointer_moved)
-        released = QSignalSpy(self.view.texture_inpaint_pointer_released)
-
-        self.view.set_texture_inpaint_enabled(True)
-        press_event = _PointerEvent(QPointF(10.0, 20.0))
-        move_event = _PointerEvent(QPointF(14.0, 25.0))
-        release_event = _PointerEvent(QPointF(16.0, 28.0))
-        self.view.mousePressEvent(press_event)
-        self.view.mouseMoveEvent(move_event)
-        self.view.mouseReleaseEvent(release_event)
-
-        self.assertEqual(self.view.get_navigation_mode(), NAVIGATION_MODE_ORBIT)
-        self.assertTrue(self.view.texture_inpaint_enabled)
-        self.assertTrue(press_event.was_accepted)
-        self.assertTrue(move_event.was_accepted)
-        self.assertTrue(release_event.was_accepted)
-        self.assertEqual(pressed.count(), 1)
-        self.assertEqual(moved.count(), 1)
-        self.assertEqual(released.count(), 1)
-        self.assertEqual(pressed.at(0)[0], QPointF(10.0, 20.0))
-        self.assertEqual(moved.at(0)[0], QPointF(14.0, 25.0))
-        self.assertEqual(released.at(0)[0], QPointF(16.0, 28.0))
 
 
 # ### Test runner ###

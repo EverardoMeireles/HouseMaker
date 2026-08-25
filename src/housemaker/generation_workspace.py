@@ -16,7 +16,6 @@ import cv2
 import numpy as np
 from PySide6.QtCore import (
     QObject,
-    QPointF,
     QStandardPaths,
     QThread,
     Qt,
@@ -33,7 +32,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
-    QLineEdit,
     QMessageBox,
     QPushButton,
     QRadioButton,
@@ -75,22 +73,6 @@ from housemaker.object_texture_variants import (
     TEXTURE_RESOLUTIONS,
     ObjectTextureVariants,
     build_object_texture_variants,
-    build_object_texture_variants_from_texture,
-)
-from housemaker.object_texture_inpaint import (
-    MAX_TEXTURE_UV_POINTS_PER_STROKE,
-    OBJECT_TEXTURE_INPAINT_RESOLUTION,
-    TEXTURE_UV_MODE_ERASE,
-    TEXTURE_UV_MODE_PAINT,
-    DefaultObjectTextureInpaintProvider,
-    ObjectTextureInpaintCancelled,
-    ObjectTextureInpaintProvider,
-    ObjectTextureInpaintRequest,
-    ObjectTextureInpaintResult,
-    TextureUvPoint,
-    TextureUvStroke,
-    build_texture_uv_stamp_stroke_from_screen_brush,
-    rasterize_texture_uv_strokes,
 )
 from housemaker.settings_widget import (
     DEFAULT_MESHY_TARGET_POLYCOUNT,
@@ -150,27 +132,13 @@ TEXTURE_VARIANTS_PIPELINE_KEY = "texture_variants"
 SELECTED_TEXTURE_RESOLUTION_PIPELINE_KEY = "selected_texture_resolution"
 TEXTURE_VARIANT_GLB_PATH_KEY = "glb_asset_path"
 TEXTURE_VARIANT_PNG_PATH_KEY = "texture_asset_path"
+# Legacy-only key retained so later geometry operations can discard obsolete
+# masks from projects saved before Object Generation inpainting was removed.
 TEXTURE_INPAINT_STROKES_PIPELINE_KEY = "texture_inpaint_strokes"
-TEXTURE_INPAINT_HISTORY_PIPELINE_KEY = "texture_inpaint_history"
-MAX_TEXTURE_INPAINT_HISTORY_COUNT = 25
-MAX_TEXTURE_INPAINT_STROKE_COUNT = 10_000
-TEXTURE_INPAINT_SCREEN_BRUSH_SAMPLE_COUNT = 25
 OBJECT_OPERATION_UNDO_STACK_PIPELINE_KEY = "object_operation_undo_stack"
 MAX_OBJECT_OPERATION_UNDO_COUNT = 10
 OBJECT_OPERATION_GENERATE_TEXTURE = "generate_texture"
 OBJECT_OPERATION_PURGE_FACES = "purge_faces"
-DEFAULT_TEXTURE_INPAINT_PROMPT = (
-    "Edit only the masked portion of this object's base-color texture. The "
-    "isolated-object reference identifies the target, while the full-scene "
-    "reference shows its surroundings and nearby materials. Match the "
-    "existing boundary texels in color, material, pattern scale, and pattern "
-    "direction so the edit blends into the old texture. Preserve the UV "
-    "layout and every unmasked pixel. Use the scene only as material context; "
-    "do not add text, geometry, lighting, reflections, or cast shadows to the "
-    "base-color texture."
-)
-
-
 # ### Generation interfaces ###
 class MeshyPlanner(Protocol):
     def plan(self, request: "GenerationRequest") -> MeshyGenerationResult:
@@ -188,16 +156,6 @@ class TextureRegenerator(Protocol):
         request: "TextureRegenerationRequest",
     ) -> MeshyGenerationResult:
         """Return a newly textured version of one existing generated model."""
-
-
-class TextureInpainter(Protocol):
-    def inpaint(
-        self,
-        request: ObjectTextureInpaintRequest,
-        progress_callback: Callable[[str, int], None] | None = None,
-        cancel_event: threading.Event | None = None,
-    ) -> ObjectTextureInpaintResult:
-        """Return one exact-mask edit of an object's canonical texture."""
 
 
 class GenerationRequest:
@@ -288,40 +246,6 @@ class TextureRegenerationOutcome:
     request: TextureRegenerationRequest
     result: MeshyGenerationResult
     final_uv_fingerprint: CameraUvFingerprint | None = None
-
-
-@dataclass(frozen=True)
-class ObjectTextureInpaintJob:
-    """Immutable provider request plus the GLB whose UVs it edits."""
-
-    request: ObjectTextureInpaintRequest
-    model_glb: bytes
-    reference_frame_index: int
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.request, ObjectTextureInpaintRequest):
-            raise TypeError("A valid object texture inpaint request is required.")
-        model_glb = bytes(self.model_glb)
-        if not model_glb:
-            raise ValueError("Object texture inpainting requires a model GLB.")
-        reference_frame_index = int(self.reference_frame_index)
-        if reference_frame_index < 0:
-            raise ValueError("The object texture reference frame is invalid.")
-        object.__setattr__(self, "model_glb", model_glb)
-        object.__setattr__(
-            self,
-            "reference_frame_index",
-            reference_frame_index,
-        )
-
-
-@dataclass(frozen=True)
-class ObjectTextureInpaintOutcome:
-    """Completed exact-mask edit and its locally rebuilt texture variants."""
-
-    job: ObjectTextureInpaintJob
-    result: ObjectTextureInpaintResult
-    variants: ObjectTextureVariants
 
 
 @dataclass(frozen=True)
@@ -1122,77 +1046,6 @@ class TextureRegenerationWorker(QObject):
         return final_fingerprint
 
 
-class ObjectTextureInpaintWorker(QObject):
-    """Run one provider edit and local variant build off the UI thread."""
-
-    succeeded = Signal(object)
-    failed = Signal(str)
-    finished = Signal()
-    progress = Signal(str)
-
-    def __init__(
-        self,
-        provider: TextureInpainter | ObjectTextureInpaintProvider,
-        job: ObjectTextureInpaintJob,
-    ) -> None:
-        super().__init__()
-        self._provider = provider
-        self._job = job
-        self._cancel_event = threading.Event()
-
-    def cancel(self) -> None:
-        self._cancel_event.set()
-
-    @Slot()
-    def run(self) -> None:
-        def report_progress(status: str, progress: int) -> None:
-            normalized_status = str(status).strip().replace("_", " ").title()
-            if normalized_status:
-                self.progress.emit(
-                    f"Texture inpainting: {normalized_status} ({int(progress)}%)"
-                )
-
-        try:
-            result = self._provider.inpaint(
-                self._job.request,
-                progress_callback=report_progress,
-                cancel_event=self._cancel_event,
-            )
-            if not isinstance(result, ObjectTextureInpaintResult):
-                raise TypeError(
-                    "The texture inpaint provider returned an invalid result."
-                )
-            if result.object_id != self._job.request.object_id:
-                raise ValueError(
-                    "The texture inpaint result targeted a different object."
-                )
-            _raise_if_object_texture_inpaint_cancelled(self._cancel_event)
-            self.progress.emit(
-                "Creating 512, 1024 and 2048 texture variants..."
-            )
-            variants = build_object_texture_variants_from_texture(
-                self._job.model_glb,
-                result.texture_png,
-            )
-            _raise_if_object_texture_inpaint_cancelled(self._cancel_event)
-            outcome = ObjectTextureInpaintOutcome(
-                job=self._job,
-                result=result,
-                variants=variants,
-            )
-        except ObjectTextureInpaintCancelled:
-            return
-        except Exception as error:
-            if self._cancel_event.is_set():
-                return
-            self.failed.emit(str(error) or type(error).__name__)
-            return
-        else:
-            self.succeeded.emit(outcome)
-        finally:
-            self.finished.emit()
-
-
 class UncheckedCameraFacePurgeWorker(QObject):
     """Remove selected-model faces exposed to currently unchecked cameras."""
 
@@ -1256,7 +1109,6 @@ class GenerationWorkspace(QWidget):
     generated_object_deleted = Signal(str)
     generation_completed = Signal(object, object)
     texture_regeneration_completed = Signal(object, object)
-    texture_inpaint_completed = Signal(object, object)
     face_purge_completed = Signal(object, object)
     generated_object_changed = Signal(object, object)
 
@@ -1274,18 +1126,11 @@ class GenerationWorkspace(QWidget):
         meshy_texture_regenerator: TextureRegenerator
         | Callable[[TextureRegenerationRequest], MeshyGenerationResult]
         | None = None,
-        object_texture_inpaint_provider: TextureInpainter
-        | ObjectTextureInpaintProvider
-        | None = None,
     ) -> None:
         super().__init__(parent)
         self._meshy_planner = meshy_planner or MeshyImagePlanner()
         self._meshy_texture_regenerator = (
             meshy_texture_regenerator or MeshyTextureRegenerator()
-        )
-        self._object_texture_inpaint_provider = (
-            object_texture_inpaint_provider
-            or DefaultObjectTextureInpaintProvider()
         )
         self._meshy_executor = meshy_executor or MeshyModelExecutor()
         self._asset_directory = (
@@ -1306,7 +1151,6 @@ class GenerationWorkspace(QWidget):
         self._generation_worker: (
             GenerationWorker
             | TextureRegenerationWorker
-            | ObjectTextureInpaintWorker
             | UncheckedCameraFacePurgeWorker
             | None
         ) = None
@@ -1316,25 +1160,17 @@ class GenerationWorkspace(QWidget):
         self._is_rebuilding_generation_data = False
         self._is_emitting_texture_repair = False
         self._selected_object_id: str | None = None
-        self._active_texture_inpaint_points: list[TextureUvPoint] | None = None
-        self._active_texture_inpaint_mode = TEXTURE_UV_MODE_PAINT
-        self._active_texture_inpaint_radius = (
-            DEFAULT_BRUSH_RADIUS_PIXELS / OBJECT_TEXTURE_INPAINT_RESOLUTION
-        )
-
         self._build_ui()
         self._sync_video_controls()
         self._sync_controls()
 
     def get_data(self) -> GenerationData:
-        self._finish_active_texture_inpaint_stroke()
         self._store_current_frame_strokes()
         return self._data.clone()
 
     def set_data(self, data: GenerationData | None) -> None:
         if self._generation_thread is not None:
             raise RuntimeError("Cannot replace Generation data while generating.")
-        self._cancel_active_texture_inpaint_stroke()
         self._close_video_source()
         self._displayed_frame_index = None
         self._data = GenerationData() if data is None else data.clone()
@@ -1380,17 +1216,6 @@ class GenerationWorkspace(QWidget):
 
     def get_runtime_settings(self) -> GenerationServiceSettings:
         return self._settings
-
-    def get_texture_inpaint_strokes(
-        self,
-        object_id: str,
-    ) -> tuple[TextureUvStroke, ...]:
-        """Return one object's persisted, replayable UV-mask history."""
-
-        record = self._find_generated_object_record(object_id)
-        if record is None:
-            return ()
-        return _get_texture_inpaint_strokes(record)
 
     def get_active_texture_variant(
         self,
@@ -1622,18 +1447,6 @@ class GenerationWorkspace(QWidget):
         self._sync_controls()
         return True
 
-    def inpaint_selected_object_texture(self) -> bool:
-        """Edit only the selected object's painted canonical texture pixels."""
-
-        if self._generation_thread is not None:
-            return False
-        self._finish_active_texture_inpaint_stroke()
-        job = self._build_object_texture_inpaint_job()
-        if job is None:
-            return False
-        self._start_object_texture_inpaint(job)
-        return True
-
     def delete_generated_object(self, object_id: str) -> bool:
         """Remove one generated object and its unreferenced GLB/PNG assets.
 
@@ -1710,16 +1523,6 @@ class GenerationWorkspace(QWidget):
 
         self._meshy_texture_regenerator = regenerator
 
-    def set_object_texture_inpaint_provider(
-        self,
-        provider: TextureInpainter | ObjectTextureInpaintProvider,
-    ) -> None:
-        """Replace the object texture edit adapter for tests/integrations."""
-
-        if not callable(getattr(provider, "inpaint", None)):
-            raise TypeError("A texture inpaint provider must define inpaint().")
-        self._object_texture_inpaint_provider = provider
-
     def load_video(self, video_path: str) -> None:
         if self._generation_thread is not None:
             raise RuntimeError("Cannot replace the video while generating.")
@@ -1783,7 +1586,6 @@ class GenerationWorkspace(QWidget):
     def _start_generation(self, request: GenerationRequest) -> None:
         """Start one owned request; split out for deterministic UI tests."""
 
-        self._deactivate_texture_inpaint_input()
         self._generation_thread = QThread(self)
         self._generation_worker = GenerationWorker(
             self._meshy_planner,
@@ -1819,7 +1621,6 @@ class GenerationWorkspace(QWidget):
     ) -> None:
         """Start a texture-only task for one immutable selected-object snapshot."""
 
-        self._deactivate_texture_inpaint_input()
         self._generation_thread = QThread(self)
         self._generation_worker = TextureRegenerationWorker(
             self._meshy_texture_regenerator,
@@ -1849,48 +1650,12 @@ class GenerationWorkspace(QWidget):
         self._generation_thread.start()
         self._sync_controls()
 
-    def _start_object_texture_inpaint(
-        self,
-        job: ObjectTextureInpaintJob,
-    ) -> None:
-        """Start one exact-mask texture edit from immutable inputs."""
-
-        self._deactivate_texture_inpaint_input()
-        self._generation_thread = QThread(self)
-        self._generation_worker = ObjectTextureInpaintWorker(
-            self._object_texture_inpaint_provider,
-            job,
-        )
-        self._generation_worker.moveToThread(self._generation_thread)
-        self._generation_thread.started.connect(self._generation_worker.run)
-        self._generation_worker.succeeded.connect(
-            self._handle_object_texture_inpaint_succeeded
-        )
-        self._generation_worker.failed.connect(
-            self._handle_object_texture_inpaint_failed
-        )
-        self._generation_worker.progress.connect(self.status_label.setText)
-        self._generation_worker.finished.connect(
-            self._generation_worker.deleteLater
-        )
-        self._generation_worker.finished.connect(self._generation_thread.quit)
-        self._generation_thread.finished.connect(
-            self._handle_generation_thread_finished
-        )
-        self._generation_thread.finished.connect(
-            self._generation_thread.deleteLater
-        )
-        self.status_label.setText("Preparing object texture inpainting...")
-        self._generation_thread.start()
-        self._sync_controls()
-
     def _start_unchecked_camera_face_purge(
         self,
         request: UncheckedCameraFacePurgeRequest,
     ) -> None:
         """Start one local face-purge request off the UI thread."""
 
-        self._deactivate_texture_inpaint_input()
         self._generation_thread = QThread(self)
         self._generation_worker = UncheckedCameraFacePurgeWorker(request)
         self._generation_worker.moveToThread(self._generation_thread)
@@ -1927,18 +1692,7 @@ class GenerationWorkspace(QWidget):
                 return
             if worker is not None and is_valid_qt_object(worker):
                 worker.cancel()
-                if isinstance(worker, ObjectTextureInpaintWorker):
-                    worker_slots = (
-                        (
-                            worker.succeeded,
-                            self._handle_object_texture_inpaint_succeeded,
-                        ),
-                        (
-                            worker.failed,
-                            self._handle_object_texture_inpaint_failed,
-                        ),
-                    )
-                elif isinstance(worker, TextureRegenerationWorker):
+                if isinstance(worker, TextureRegenerationWorker):
                     worker_slots = (
                         (
                             worker.succeeded,
@@ -2011,15 +1765,6 @@ class GenerationWorkspace(QWidget):
         self.result_view = self.object_3d_panel.viewer
         self.result_view.set_ambient_light_intensity(
             OBJECT_GENERATION_DEFAULT_AMBIENT_LIGHT_INTENSITY
-        )
-        self.result_view.view.texture_inpaint_pointer_pressed.connect(
-            self._handle_texture_inpaint_pointer_pressed
-        )
-        self.result_view.view.texture_inpaint_pointer_moved.connect(
-            self._handle_texture_inpaint_pointer_moved
-        )
-        self.result_view.view.texture_inpaint_pointer_released.connect(
-            self._handle_texture_inpaint_pointer_released
         )
         self.generated_objects_list = self.object_3d_panel.object_list
         self.delete_generated_object_button = (
@@ -2219,6 +1964,19 @@ class GenerationWorkspace(QWidget):
         buttons_layout.addWidget(self.generate_texture_button)
         self.regenerate_texture_button = self.generate_texture_button
 
+        self.purge_faces_button = QPushButton("Purge faces")
+        self.purge_faces_button.setObjectName("purge_faces_button")
+        self.purge_faces_button.setMinimumHeight(38)
+        self.purge_faces_button.setToolTip(
+            "Delete faces of the selected generated object that are visible "
+            "from any unchecked post-processing camera."
+        )
+        self.purge_faces_button.clicked.connect(
+            self.purge_selected_object_faces
+        )
+        buttons_layout.addWidget(self.purge_faces_button)
+        buttons_layout.addStretch(1)
+
         self.undo_object_change_button = QPushButton("Undo")
         self.undo_object_change_button.setObjectName(
             "undo_object_change_button"
@@ -2232,88 +1990,7 @@ class GenerationWorkspace(QWidget):
             self.undo_selected_object_change
         )
         buttons_layout.addWidget(self.undo_object_change_button)
-
-        self.purge_faces_button = QPushButton("Purge faces")
-        self.purge_faces_button.setObjectName("purge_faces_button")
-        self.purge_faces_button.setMinimumHeight(38)
-        self.purge_faces_button.setToolTip(
-            "Delete faces of the selected generated object that are visible "
-            "from any unchecked post-processing camera."
-        )
-        self.purge_faces_button.clicked.connect(
-            self.purge_selected_object_faces
-        )
-        buttons_layout.addWidget(self.purge_faces_button)
-        buttons_layout.addStretch(1)
         controls_layout.addLayout(buttons_layout)
-
-        texture_inpaint_layout = QHBoxLayout()
-        texture_inpaint_layout.setSpacing(8)
-
-        self.paint_texture_mask_button = QCheckBox("Paint texture mask")
-        self.paint_texture_mask_button.setObjectName(
-            "paint_texture_mask_button"
-        )
-        self.paint_texture_mask_button.setToolTip(
-            "Paint every visible model face covered by the circular screen "
-            "brush into the selected object's UV texture. The existing "
-            "Paint, Erase, and Brush controls are reused. Overlapping UV "
-            "islands share texture pixels and are edited together."
-        )
-        self.paint_texture_mask_button.toggled.connect(
-            self._handle_paint_texture_mask_toggled
-        )
-        texture_inpaint_layout.addWidget(self.paint_texture_mask_button)
-
-        texture_inpaint_layout.addWidget(QLabel("Inpaint instructions"))
-        self.texture_inpaint_instructions_edit = QLineEdit()
-        self.texture_inpaint_instructions_edit.setObjectName(
-            "texture_inpaint_instructions_edit"
-        )
-        self.texture_inpaint_instructions_edit.setPlaceholderText(
-            "Optional material or repair instructions"
-        )
-        self.texture_inpaint_instructions_edit.setMaxLength(3_000)
-        self.texture_inpaint_instructions_edit.returnPressed.connect(
-            self.inpaint_selected_object_texture
-        )
-        texture_inpaint_layout.addWidget(
-            self.texture_inpaint_instructions_edit,
-            1,
-        )
-
-        self.undo_texture_stroke_button = QPushButton("Undo texture stroke")
-        self.undo_texture_stroke_button.setObjectName(
-            "undo_texture_stroke_button"
-        )
-        self.undo_texture_stroke_button.clicked.connect(
-            self._undo_last_texture_inpaint_stroke
-        )
-        texture_inpaint_layout.addWidget(self.undo_texture_stroke_button)
-
-        self.clear_texture_mask_button = QPushButton("Clear texture mask")
-        self.clear_texture_mask_button.setObjectName(
-            "clear_texture_mask_button"
-        )
-        self.clear_texture_mask_button.clicked.connect(
-            self._clear_selected_texture_inpaint_strokes
-        )
-        texture_inpaint_layout.addWidget(self.clear_texture_mask_button)
-
-        self.inpaint_texture_button = QPushButton("Inpaint texture")
-        self.inpaint_texture_button.setObjectName("inpaint_texture_button")
-        self.inpaint_texture_button.setMinimumHeight(38)
-        self.inpaint_texture_button.setToolTip(
-            "Edit the orange UV-mask pixels of the canonical 2048 texture "
-            "with the surface-texture provider selected in Settings. The "
-            "isolated object, full video frame, neighboring texture pixels, "
-            "and an inward feather guide the blend."
-        )
-        self.inpaint_texture_button.clicked.connect(
-            self.inpaint_selected_object_texture
-        )
-        texture_inpaint_layout.addWidget(self.inpaint_texture_button)
-        controls_layout.addLayout(texture_inpaint_layout)
 
         self.status_label = QLabel(
             "Load a video, seek to a useful frame, and paint over an object. "
@@ -2366,213 +2043,6 @@ class GenerationWorkspace(QWidget):
         self.video_view.set_brush_mode(
             MASK_MODE_PAINT if paint_checked else MASK_MODE_ERASE
         )
-
-    @Slot(bool)
-    def _handle_paint_texture_mask_toggled(self, enabled: bool) -> None:
-        if enabled and not self._can_paint_selected_texture_mask():
-            was_blocked = self.paint_texture_mask_button.blockSignals(True)
-            self.paint_texture_mask_button.setChecked(False)
-            self.paint_texture_mask_button.blockSignals(was_blocked)
-            self.status_label.setText(
-                "Select a generated object with a complete 2048 texture "
-                "before painting its texture mask."
-            )
-            enabled = False
-        if not enabled:
-            self._finish_active_texture_inpaint_stroke()
-        self.result_view.view.set_texture_inpaint_enabled(enabled)
-        self._sync_texture_inpaint_preview()
-        self._sync_controls()
-
-    @Slot(object)
-    def _handle_texture_inpaint_pointer_pressed(self, position: object) -> None:
-        if (
-            self._generation_thread is not None
-            or not self.paint_texture_mask_button.isChecked()
-        ):
-            return
-        self._active_texture_inpaint_mode = (
-            TEXTURE_UV_MODE_PAINT
-            if self.paint_mask_button.isChecked()
-            else TEXTURE_UV_MODE_ERASE
-        )
-        self._active_texture_inpaint_radius = (
-            self.brush_size_spinbox.value()
-            / OBJECT_TEXTURE_INPAINT_RESOLUTION
-        )
-        stamp = self._build_texture_inpaint_stamp(position)
-        if stamp is None:
-            self._active_texture_inpaint_points = None
-            return
-        self._active_texture_inpaint_points = list(stamp.points)
-        self._sync_texture_inpaint_preview(update_texture_view=False)
-
-    @Slot(object)
-    def _handle_texture_inpaint_pointer_moved(self, position: object) -> None:
-        if self._generation_thread is not None:
-            return
-        points = self._active_texture_inpaint_points
-        if points is None:
-            return
-        stamp = self._build_texture_inpaint_stamp(position)
-        if stamp is None:
-            return
-        existing_points = set(points)
-        new_points = [
-            point for point in stamp.points if point not in existing_points
-        ]
-        if not new_points:
-            return
-        available_point_count = (
-            MAX_TEXTURE_UV_POINTS_PER_STROKE - len(points)
-        )
-        if available_point_count <= 0:
-            self._finish_active_texture_inpaint_stroke()
-            self._active_texture_inpaint_points = list(stamp.points)
-        else:
-            points.extend(new_points[:available_point_count])
-        self._sync_texture_inpaint_preview(update_texture_view=False)
-
-    @Slot(object)
-    def _handle_texture_inpaint_pointer_released(
-        self,
-        _position: object,
-    ) -> None:
-        if self._generation_thread is not None:
-            self._cancel_active_texture_inpaint_stroke()
-            return
-        self._finish_active_texture_inpaint_stroke()
-
-    def _build_texture_inpaint_stamp(
-        self,
-        position: object,
-    ) -> TextureUvStroke | None:
-        """Sample every visible face covered by the circular screen brush."""
-
-        if self._generated_model is None:
-            return None
-        try:
-            cursor_position = (float(position.x()), float(position.y()))
-        except (AttributeError, TypeError, ValueError, OverflowError):
-            return None
-
-        def build_ray(
-            sample_position: tuple[float, float],
-        ) -> tuple[np.ndarray, np.ndarray] | None:
-            return self.result_view.view.build_camera_ray(
-                QPointF(sample_position[0], sample_position[1])
-            )
-
-        try:
-            return build_texture_uv_stamp_stroke_from_screen_brush(
-                self._generated_model.mesh,
-                cursor_position,
-                float(self.brush_size_spinbox.value()),
-                build_ray,
-                mode=self._active_texture_inpaint_mode,
-                stamp_radius_normalized=(
-                    self._active_texture_inpaint_radius
-                ),
-                maximum_sample_count=(
-                    TEXTURE_INPAINT_SCREEN_BRUSH_SAMPLE_COUNT
-                ),
-            )
-        except (RuntimeError, TypeError, ValueError, OverflowError):
-            return None
-
-    def _finish_active_texture_inpaint_stroke(self) -> None:
-        points = self._active_texture_inpaint_points
-        self._active_texture_inpaint_points = None
-        if not points:
-            self._sync_texture_inpaint_preview()
-            return
-        record = self._find_generated_object_record(self._selected_object_id)
-        if record is None:
-            self._sync_texture_inpaint_preview()
-            return
-        stroke = TextureUvStroke(
-            mode=self._active_texture_inpaint_mode,
-            radius_normalized=self._active_texture_inpaint_radius,
-            points=tuple(points),
-            connect_points=False,
-        )
-        strokes = (*_get_texture_inpaint_strokes(record), stroke)
-        self._replace_texture_inpaint_strokes(record, strokes)
-
-    def _cancel_active_texture_inpaint_stroke(self) -> None:
-        self._active_texture_inpaint_points = None
-        self.result_view.view.set_texture_inpaint_enabled(False)
-        if hasattr(self, "paint_texture_mask_button"):
-            was_blocked = self.paint_texture_mask_button.blockSignals(True)
-            self.paint_texture_mask_button.setChecked(False)
-            self.paint_texture_mask_button.blockSignals(was_blocked)
-
-    def _deactivate_texture_inpaint_input(self) -> None:
-        """Commit an active drag and return left-drag control to navigation."""
-
-        self._finish_active_texture_inpaint_stroke()
-        if self.paint_texture_mask_button.isChecked():
-            self.paint_texture_mask_button.setChecked(False)
-        else:
-            self.result_view.view.set_texture_inpaint_enabled(False)
-
-    def _undo_last_texture_inpaint_stroke(self) -> None:
-        self._finish_active_texture_inpaint_stroke()
-        record = self._find_generated_object_record(self._selected_object_id)
-        if record is None:
-            return
-        strokes = _get_texture_inpaint_strokes(record)
-        if not strokes:
-            return
-        self._replace_texture_inpaint_strokes(record, strokes[:-1])
-
-    def _clear_selected_texture_inpaint_strokes(self) -> None:
-        self._cancel_active_texture_inpaint_stroke()
-        if self._clear_object_texture_inpaint_strokes(
-            self._selected_object_id,
-        ):
-            self.status_label.setText("Cleared the selected texture mask.")
-
-    def _clear_object_texture_inpaint_strokes(
-        self,
-        object_id: str | None,
-        *,
-        emit_change: bool = True,
-    ) -> bool:
-        record = self._find_generated_object_record(object_id)
-        if record is None or not _get_texture_inpaint_strokes(record):
-            self._sync_texture_inpaint_preview()
-            return False
-        self._replace_texture_inpaint_strokes(
-            record,
-            (),
-            emit_change=emit_change,
-        )
-        return True
-
-    def _replace_texture_inpaint_strokes(
-        self,
-        record: GeneratedObjectRecord,
-        strokes: Sequence[TextureUvStroke],
-        *,
-        emit_change: bool = True,
-    ) -> GeneratedObjectRecord:
-        pipeline = dict(record.pipeline)
-        normalized_strokes = tuple(strokes)
-        if normalized_strokes:
-            pipeline[TEXTURE_INPAINT_STROKES_PIPELINE_KEY] = [
-                stroke.to_dict() for stroke in normalized_strokes
-            ]
-        else:
-            pipeline.pop(TEXTURE_INPAINT_STROKES_PIPELINE_KEY, None)
-        replacement = replace(record, pipeline=pipeline)
-        record_index = self._data.generated_objects.index(record)
-        self._data.generated_objects[record_index] = replacement
-        self._sync_texture_inpaint_preview()
-        self._sync_controls()
-        if emit_change:
-            self._emit_data_changed()
-        return replacement
 
     def _handle_meshy_target_polycount_changed(self, value: int) -> None:
         self._mesh_target_polycount_is_locally_selected = True
@@ -2894,81 +2364,6 @@ class GenerationWorkspace(QWidget):
         self.generated_object_changed.emit(replacement, preview_model)
 
     @Slot(object)
-    def _handle_object_texture_inpaint_succeeded(
-        self,
-        raw_outcome: object,
-    ) -> None:
-        if not isinstance(raw_outcome, ObjectTextureInpaintOutcome):
-            self._handle_object_texture_inpaint_failed(
-                "The texture inpaint worker returned an invalid result."
-            )
-            return
-        outcome = raw_outcome
-        record = self._find_generated_object_record(
-            outcome.job.request.object_id
-        )
-        if record is None:
-            self._handle_object_texture_inpaint_failed(
-                "The target generated object no longer exists."
-            )
-            return
-
-        persisted_asset_paths: list[str] = []
-        try:
-            variant_metadata = self._persist_object_texture_variants(
-                record.object_id,
-                outcome.variants,
-                asset_stem=f"inpainted-{uuid.uuid4().hex}",
-            )
-            persisted_asset_paths.extend(
-                path
-                for variant in variant_metadata.values()
-                for path in variant.values()
-            )
-            selected_resolution = _get_selected_texture_resolution(record)
-            if selected_resolution not in TEXTURE_RESOLUTIONS:
-                selected_resolution = DEFAULT_TEXTURE_RESOLUTION
-            selected_variant = variant_metadata[str(selected_resolution)]
-            preview_model = import_generated_glb(
-                outcome.variants.glb_by_resolution[selected_resolution]
-            )
-            replacement = replace(
-                record,
-                pipeline=_build_inpainted_texture_pipeline(
-                    record,
-                    outcome,
-                    variant_metadata,
-                ),
-                asset_path=selected_variant[TEXTURE_VARIANT_GLB_PATH_KEY],
-            )
-        except Exception as error:
-            self._remove_newly_persisted_assets(persisted_asset_paths)
-            self._handle_object_texture_inpaint_failed(
-                "The inpainted texture variants could not be saved locally: "
-                f"{error}"
-            )
-            return
-
-        record_index = self._data.generated_objects.index(record)
-        self._data.generated_objects[record_index] = replacement
-        self._generated_model_cache.pop(record.object_id, None)
-        selected_object_id = self._selected_object_id
-        if selected_object_id == record.object_id:
-            self._generated_model_cache[record.object_id] = preview_model
-        self._refresh_generated_objects_list(selected_object_id)
-        cleanup_failed = self._delete_unreferenced_object_assets(record)
-        status_suffix = (
-            " Some superseded texture files could not be removed."
-            if cleanup_failed
-            else ""
-        )
-        self.status_label.setText(
-            f"Inpainted texture: {record.object_name}." + status_suffix
-        )
-        self._emit_data_changed()
-        self.texture_inpaint_completed.emit(replacement, preview_model)
-
-    @Slot(object)
     def _handle_unchecked_camera_face_purge_succeeded(
         self,
         raw_outcome: object,
@@ -3085,18 +2480,6 @@ class GenerationWorkspace(QWidget):
         )
 
     @Slot(str)
-    def _handle_object_texture_inpaint_failed(
-        self,
-        error_message: str,
-    ) -> None:
-        self.status_label.setText(f"Texture inpainting failed: {error_message}")
-        QMessageBox.warning(
-            self,
-            "Texture inpainting failed",
-            error_message,
-        )
-
-    @Slot(str)
     def _handle_unchecked_camera_face_purge_failed(
         self,
         error_message: str,
@@ -3137,78 +2520,6 @@ class GenerationWorkspace(QWidget):
             ),
             geometry_only=geometry_only,
         )
-
-    def _build_object_texture_inpaint_job(
-        self,
-    ) -> ObjectTextureInpaintJob | None:
-        record = self._find_generated_object_record(self._selected_object_id)
-        if not self._can_inpaint_object_texture(record):
-            self.status_label.setText(
-                "Select a generated object, paint its orange texture mask, "
-                "and paint a current video reference before inpainting."
-            )
-            return None
-        assert record is not None
-        selected_crop = self.video_view.build_selected_object_crop()
-        if selected_crop.size == 0:
-            self.status_label.setText("The selected texture reference is empty.")
-            return None
-        full_frame = self.video_view.get_frame_bgr()
-        if full_frame is None or full_frame.size == 0:
-            self.status_label.setText("The full scene reference is unavailable.")
-            return None
-        strokes = _get_texture_inpaint_strokes(record)
-        edit_mask = rasterize_texture_uv_strokes(
-            (
-                OBJECT_TEXTURE_INPAINT_RESOLUTION,
-                OBJECT_TEXTURE_INPAINT_RESOLUTION,
-            ),
-            strokes,
-        )
-        if not np.any(edit_mask):
-            self.status_label.setText("The selected texture mask is empty.")
-            return None
-        try:
-            variant = self.get_texture_variant(
-                record.object_id,
-                TEXTURE_RESOLUTION_2048,
-            )
-            if variant is None:
-                raise ValueError(
-                    "The selected object has no complete 2048 texture variant."
-                )
-            model_glb = variant.glb_asset_path.read_bytes()
-            import_generated_glb(model_glb)
-            user_instructions = (
-                self.texture_inpaint_instructions_edit.text().strip()
-            )
-            prompt = DEFAULT_TEXTURE_INPAINT_PROMPT
-            if user_instructions:
-                prompt += " User instructions: " + user_instructions
-            request = ObjectTextureInpaintRequest(
-                object_id=record.object_id,
-                provider=self._settings.surface_texture_provider,
-                api_key=self._settings.surface_texture_api_key,
-                reference_pngs=(
-                    _encode_png(selected_crop),
-                    _encode_png(full_frame),
-                ),
-                prompt=prompt,
-                existing_texture_png=variant.texture_asset_path.read_bytes(),
-                edit_mask_png=_encode_png(edit_mask),
-            )
-            job = ObjectTextureInpaintJob(
-                request=request,
-                model_glb=model_glb,
-                reference_frame_index=self._data.current_frame_index,
-            )
-        except Exception as error:
-            self.status_label.setText(
-                f"Texture inpainting could not start: {error}"
-            )
-            return None
-        self._store_current_frame_strokes()
-        return job
 
     def _build_unchecked_camera_face_purge_request(
         self,
@@ -3368,116 +2679,13 @@ class GenerationWorkspace(QWidget):
         self.seekbar.setValue(int(frame_index))
         self._is_syncing_seekbar = False
 
-    def _sync_texture_inpaint_preview(
-        self,
-        *,
-        update_texture_view: bool = True,
-    ) -> None:
-        if not hasattr(self, "texture_view"):
-            return
-        record = self._find_generated_object_record(self._selected_object_id)
-        strokes = () if record is None else _get_texture_inpaint_strokes(record)
-        active_points = self._active_texture_inpaint_points
-        if active_points:
-            strokes = (
-                *strokes,
-                TextureUvStroke(
-                    mode=self._active_texture_inpaint_mode,
-                    radius_normalized=self._active_texture_inpaint_radius,
-                    points=tuple(active_points),
-                    connect_points=False,
-                ),
-            )
-        mask = (
-            None
-            if not strokes
-            else rasterize_texture_uv_strokes(
-                (
-                    OBJECT_TEXTURE_INPAINT_RESOLUTION,
-                    OBJECT_TEXTURE_INPAINT_RESOLUTION,
-                ),
-                strokes,
-            )
-        )
-        if mask is not None and not np.any(mask):
-            mask = None
-        self.result_view.set_texture_edit_mask(mask)
-        if update_texture_view:
-            self.texture_view.set_edit_mask(mask)
-            self.texture_view.set_edit_mask_enabled(mask is not None)
-
-    def _can_paint_selected_texture_mask(self) -> bool:
-        record = self._find_generated_object_record(self._selected_object_id)
-        if record is None or self._generated_model is None:
-            return False
-        return (
-            self.get_texture_variant(
-                record.object_id,
-                TEXTURE_RESOLUTION_2048,
-            )
-            is not None
-        )
-
-    def _can_inpaint_object_texture(
-        self,
-        record: GeneratedObjectRecord | None,
-    ) -> bool:
-        if (
-            record is None
-            or self._generation_thread is not None
-            or not self._settings.surface_texture_api_key
-            or self._video_source is None
-            or self.video_view.get_frame_bgr() is None
-            or not self.video_view.has_selection()
-            or record.provider != GENERATION_BACKEND_MESHY
-        ):
-            return False
-        strokes = _get_texture_inpaint_strokes(record)
-        if not strokes:
-            return False
-        edit_mask = rasterize_texture_uv_strokes(
-            (
-                OBJECT_TEXTURE_INPAINT_RESOLUTION,
-                OBJECT_TEXTURE_INPAINT_RESOLUTION,
-            ),
-            strokes,
-        )
-        if not np.any(edit_mask):
-            return False
-        return (
-            self.get_texture_variant(
-                record.object_id,
-                TEXTURE_RESOLUTION_2048,
-            )
-            is not None
-        )
-
     def _sync_controls(self) -> None:
         has_video = self._video_source is not None
         is_generating = self._generation_thread is not None
         has_mask = self.video_view.has_selection()
-        can_paint_texture = (
-            not is_generating and self._can_paint_selected_texture_mask()
-        )
-        texture_painting_is_active = (
-            can_paint_texture and self.paint_texture_mask_button.isChecked()
-        )
-        self.result_view.view.set_texture_inpaint_enabled(
-            texture_painting_is_active
-        )
-        selected_record = self._find_generated_object_record(
-            self._selected_object_id
-        )
-        texture_strokes = (
-            ()
-            if selected_record is None
-            else _get_texture_inpaint_strokes(selected_record)
-        )
         self.load_video_button.setEnabled(not is_generating)
         self.seekbar.setEnabled(has_video and not is_generating)
-        mask_tool_is_available = (
-            (has_video or can_paint_texture) and not is_generating
-        )
+        mask_tool_is_available = has_video and not is_generating
         self.paint_mask_button.setEnabled(mask_tool_is_available)
         self.erase_mask_button.setEnabled(mask_tool_is_available)
         self.brush_size_spinbox.setEnabled(mask_tool_is_available)
@@ -3488,19 +2696,6 @@ class GenerationWorkspace(QWidget):
         )
         self.clear_mask_button.setEnabled(
             has_video and has_mask and not is_generating
-        )
-        self.paint_texture_mask_button.setEnabled(can_paint_texture)
-        self.texture_inpaint_instructions_edit.setEnabled(
-            selected_record is not None and not is_generating
-        )
-        self.undo_texture_stroke_button.setEnabled(
-            bool(texture_strokes) and not is_generating
-        )
-        self.clear_texture_mask_button.setEnabled(
-            bool(texture_strokes) and not is_generating
-        )
-        self.inpaint_texture_button.setEnabled(
-            self._can_inpaint_object_texture(selected_record)
         )
         required_key_is_available = bool(self._settings.meshy_api_key)
         enabled_camera_ids = (
@@ -3571,9 +2766,7 @@ class GenerationWorkspace(QWidget):
             and not is_generating
         )
         self.video_view.set_interaction_enabled(
-            has_video
-            and not is_generating
-            and not texture_painting_is_active
+            has_video and not is_generating
         )
 
     def _can_regenerate_object_texture(
@@ -3612,9 +2805,6 @@ class GenerationWorkspace(QWidget):
         current_item: QListWidgetItem | None,
         _previous_item: QListWidgetItem | None,
     ) -> None:
-        self._finish_active_texture_inpaint_stroke()
-        if self.paint_texture_mask_button.isChecked():
-            self.paint_texture_mask_button.setChecked(False)
         if current_item is None:
             self._selected_object_id = None
             self._clear_generated_object_display()
@@ -3723,7 +2913,6 @@ class GenerationWorkspace(QWidget):
         self._refresh_object_texture_atlases(
             record.object_id,
         )
-        self._sync_texture_inpaint_preview()
 
     def _repair_missing_active_texture_variant(
         self,
@@ -3774,7 +2963,6 @@ class GenerationWorkspace(QWidget):
         return record
 
     def _clear_generated_object_display(self) -> None:
-        self._cancel_active_texture_inpaint_stroke()
         self._generated_model = None
         self.result_view.clear_model()
         self._sync_model_statistics(None)
@@ -3808,7 +2996,6 @@ class GenerationWorkspace(QWidget):
                 self.texture_view.select_atlas(selected_entry_id)
         finally:
             self._is_syncing_texture_resolution_view = False
-        self._sync_texture_inpaint_preview()
 
     @Slot(object)
     def _handle_texture_resolution_selected(self, raw_entry: object) -> None:
@@ -4467,97 +3654,6 @@ def _build_regenerated_texture_pipeline(
     return pipeline
 
 
-# ### Object texture-inpaint helpers ###
-def _get_texture_inpaint_strokes(
-    record: GeneratedObjectRecord,
-) -> tuple[TextureUvStroke, ...]:
-    """Parse safe pending UV strokes from an extensible record pipeline."""
-
-    raw_strokes = record.pipeline.get(TEXTURE_INPAINT_STROKES_PIPELINE_KEY)
-    if not isinstance(raw_strokes, list):
-        return ()
-    strokes: list[TextureUvStroke] = []
-    for raw_stroke in raw_strokes[:MAX_TEXTURE_INPAINT_STROKE_COUNT]:
-        try:
-            strokes.append(TextureUvStroke.from_dict(raw_stroke))
-        except (KeyError, TypeError, ValueError):
-            continue
-    return tuple(strokes)
-
-
-def _build_inpainted_texture_pipeline(
-    record: GeneratedObjectRecord,
-    outcome: ObjectTextureInpaintOutcome,
-    variant_metadata: dict[str, dict[str, str]],
-) -> dict[str, object]:
-    """Record texture-edit provenance while clearing the consumed UV mask."""
-
-    request = outcome.job.request
-    result = outcome.result
-    pipeline: dict[str, object] = dict(record.pipeline)
-    pipeline.pop(TEXTURE_INPAINT_STROKES_PIPELINE_KEY, None)
-    selected_resolution = _get_selected_texture_resolution(record)
-    if selected_resolution not in TEXTURE_RESOLUTIONS:
-        selected_resolution = DEFAULT_TEXTURE_RESOLUTION
-    raw_count = pipeline.get("texture_inpaint_count", 0)
-    try:
-        inpaint_count = max(int(raw_count), 0) + 1
-    except (TypeError, ValueError):
-        inpaint_count = 1
-    reference_sha256s = [
-        hashlib.sha256(reference_png).hexdigest()
-        for reference_png in request.reference_pngs
-    ]
-    reference_sha256 = reference_sha256s[0]
-    texture_sha256 = hashlib.sha256(
-        request.existing_texture_png
-    ).hexdigest()
-    mask_sha256 = hashlib.sha256(request.edit_mask_png).hexdigest()
-    history_entry: dict[str, object] = {
-        "provider": result.provider,
-        "task_id": result.task_id,
-        "reference_frame_index": outcome.job.reference_frame_index,
-        "reference_image_sha256": reference_sha256,
-        "reference_image_sha256s": reference_sha256s,
-        "reference_image_count": len(reference_sha256s),
-        "source_texture_sha256": texture_sha256,
-        "edit_mask_sha256": mask_sha256,
-        "prompt": request.prompt,
-    }
-    raw_history = pipeline.get(TEXTURE_INPAINT_HISTORY_PIPELINE_KEY)
-    history = (
-        [dict(entry) for entry in raw_history if isinstance(entry, dict)]
-        if isinstance(raw_history, list)
-        else []
-    )
-    history.append(history_entry)
-    pipeline.update(
-        {
-            TEXTURE_VARIANTS_PIPELINE_KEY: variant_metadata,
-            SELECTED_TEXTURE_RESOLUTION_PIPELINE_KEY: selected_resolution,
-            "texture_inpaint_count": inpaint_count,
-            "latest_texture_inpaint_provider": result.provider,
-            "latest_texture_inpaint_task_id": result.task_id,
-            "last_texture_inpaint_reference_frame_index": (
-                outcome.job.reference_frame_index
-            ),
-            "last_texture_inpaint_reference_image_sha256": reference_sha256,
-            "last_texture_inpaint_reference_image_sha256s": (
-                reference_sha256s
-            ),
-            "last_texture_inpaint_reference_image_count": (
-                len(reference_sha256s)
-            ),
-            "last_texture_inpaint_source_texture_sha256": texture_sha256,
-            "last_texture_inpaint_edit_mask_sha256": mask_sha256,
-            TEXTURE_INPAINT_HISTORY_PIPELINE_KEY: history[
-                -MAX_TEXTURE_INPAINT_HISTORY_COUNT:
-            ],
-        }
-    )
-    return pipeline
-
-
 # ### UV preview helpers ###
 def _collect_model_uv_triangles(
     model: GeneratedModel,
@@ -4672,15 +3768,6 @@ def _raise_if_generation_cancelled(
 ) -> None:
     if cancel_event is not None and cancel_event.is_set():
         raise _GenerationCancelled
-
-
-def _raise_if_object_texture_inpaint_cancelled(
-    cancel_event: threading.Event | None,
-) -> None:
-    if cancel_event is not None and cancel_event.is_set():
-        raise ObjectTextureInpaintCancelled(
-            "Object texture inpainting was canceled locally."
-        )
 
 
 def _run_interruptible_stage(operation: Callable[[], object]) -> object:

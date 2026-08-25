@@ -13,14 +13,19 @@ from typing import Protocol
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
+from PySide6.QtCore import QEvent, QObject, QSize, QThread, Qt, Signal, Slot
+from PySide6.QtGui import QIcon, QKeyEvent, QPixmap
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QButtonGroup,
     QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListView,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QRadioButton,
@@ -87,6 +92,8 @@ MAX_REFERENCE_FRAMES = 100
 REFERENCE_PADDING_RATIO = 0.08
 INTERRUPT_POLL_SECONDS = 0.05
 SHUTDOWN_WAIT_MILLISECONDS = 250
+OTHER_TEXTURE_THUMBNAIL_SIZE = QSize(96, 96)
+OTHER_TEXTURE_GRID_SIZE = QSize(152, 128)
 
 
 # ### Request models ###
@@ -251,6 +258,10 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             tuple[str, TextureAtlasEntry],
         ] = {}
         self._texture_variant_entry_targets: dict[str, tuple[str, int]] = {}
+        self._other_texture_entry_targets: dict[
+            str,
+            tuple[str, int | None],
+        ] = {}
         self._texture_resolution_change_handler: (
             Callable[[str, int], bool] | None
         ) = None
@@ -421,6 +432,170 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             target_resolution,
         ):
             return False
+        selected_assignment = replace(
+            source_assignment,
+            asset_path=variant.asset_path,
+            selected_texture_resolution=target_resolution,
+            texture_width=target_resolution,
+            texture_height=target_resolution,
+        )
+        return self._apply_assignment_texture_to_surfaces(
+            source_assignment,
+            selected_assignment,
+            texture_png,
+            target_surface_ids,
+            texture_size=(target_resolution, target_resolution),
+        )
+
+    def apply_assignment_texture(
+        self,
+        assignment_id: str,
+        target_surface_ids: Sequence[str] = (),
+    ) -> bool:
+        """Apply one family's active asset without changing its resolution."""
+
+        if self.is_generating:
+            return False
+        source_assignment = self._assignment_by_id(assignment_id)
+        if source_assignment is None:
+            return False
+        selected_resolution = source_assignment.selected_texture_resolution
+        if selected_resolution is not None:
+            return self.select_assignment_texture_resolution(
+                source_assignment.assignment_id,
+                selected_resolution,
+                target_surface_ids,
+            )
+        if source_assignment.texture_variants:
+            return False
+        texture_path = self.get_assignment_asset_path(
+            source_assignment.assignment_id
+        )
+        if texture_path is None:
+            return False
+        try:
+            texture_png = texture_path.read_bytes()
+            texture_rgba = _decode_png_rgba(
+                texture_png,
+                "Surface texture",
+            )
+        except (OSError, ValueError):
+            return False
+        height, width = texture_rgba.shape[:2]
+        return self._apply_assignment_texture_to_surfaces(
+            source_assignment,
+            source_assignment,
+            texture_png,
+            target_surface_ids,
+            texture_size=(width, height),
+        )
+
+    def delete_assignment_texture(self, assignment_id: str) -> bool:
+        """Delete one complete texture family from every assigned surface."""
+
+        if self.is_generating:
+            return False
+        assignment = self._assignment_by_id(assignment_id)
+        if assignment is None:
+            return False
+
+        previous_assignments = list(self._data.assignments)
+        previous_strokes = {
+            surface_id: list(strokes)
+            for surface_id, strokes in self._data.texture_mask_strokes.items()
+        }
+        previous_undo_stack = list(
+            self._data.localized_inpaint_undo_stack
+        )
+        affected_surface_ids = set(assignment.surface_ids)
+        next_assignments = [
+            candidate
+            for candidate in previous_assignments
+            if candidate.assignment_id != assignment.assignment_id
+        ]
+        retained_surface_ids = {
+            surface_id
+            for candidate in next_assignments
+            for surface_id in candidate.surface_ids
+        }
+        untextured_surface_ids = affected_surface_ids.difference(
+            retained_surface_ids
+        )
+        next_strokes = {
+            surface_id: strokes
+            for surface_id, strokes in previous_strokes.items()
+            if surface_id not in untextured_surface_ids
+        }
+
+        self._data.assignments = next_assignments
+        self._data.texture_mask_strokes = next_strokes
+        discarded_undo_assignments = (
+            self._clear_localized_inpaint_undo_history()
+        )
+        try:
+            self._restore_assignment_textures()
+            self.surface_view.set_texture_mask_strokes(next_strokes)
+        except (OSError, TypeError, ValueError):
+            self._data.assignments = previous_assignments
+            self._data.texture_mask_strokes = previous_strokes
+            self._data.localized_inpaint_undo_stack = previous_undo_stack
+            try:
+                self._restore_assignment_textures()
+                self.surface_view.set_texture_mask_strokes(previous_strokes)
+            except (OSError, TypeError, ValueError):
+                pass
+            self.status_label.setText(
+                "The selected surface texture could not be deleted."
+            )
+            self._sync_controls()
+            return False
+
+        if (
+            self.inpaint_3d_button.isChecked()
+            and not self.surface_view.can_inpaint_selection()
+        ):
+            self.inpaint_3d_button.setChecked(False)
+
+        removed_assignments = [
+            assignment,
+            *discarded_undo_assignments,
+        ]
+        self._texture_atlas_entry_cache.clear()
+        self._refresh_texture_atlases()
+        cleanup_failure_count = self._delete_orphaned_assignment_assets(
+            removed_assignments
+        )
+        removed_assignment_ids = self._unretained_assignment_ids(
+            removed_assignments
+        )
+        if removed_assignment_ids:
+            self.assignments_removed.emit(removed_assignment_ids)
+        self._emit_data_changed()
+        self.surface_content_changed.emit()
+
+        status = (
+            f"Deleted the selected {assignment.surface_type} texture from "
+            f"{len(assignment.surface_ids)} surface(s)."
+        )
+        if cleanup_failure_count:
+            status += (
+                f" {cleanup_failure_count} unused texture file(s) could not "
+                "be deleted."
+            )
+        self.status_label.setText(status)
+        self._sync_controls()
+        return True
+
+    def _apply_assignment_texture_to_surfaces(
+        self,
+        source_assignment: SurfaceTextureAssignment,
+        applied_assignment: SurfaceTextureAssignment,
+        texture_png: bytes,
+        target_surface_ids: Sequence[str],
+        *,
+        texture_size: tuple[int, int],
+    ) -> bool:
+        """Commit one validated active family asset to homogeneous surfaces."""
 
         normalized_targets = tuple(
             dict.fromkeys(str(surface_id) for surface_id in target_surface_ids)
@@ -441,7 +616,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         else:
             normalized_targets = source_assignment.surface_ids
         if (
-            target_resolution == source_assignment.selected_texture_resolution
+            applied_assignment == source_assignment
             and set(normalized_targets).issubset(source_assignment.surface_ids)
         ):
             return True
@@ -479,13 +654,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                     )
                 )
         selected_assignment = self._assignment_with_surfaces(
-            replace(
-                source_assignment,
-                asset_path=variant.asset_path,
-                selected_texture_resolution=target_resolution,
-                texture_width=target_resolution,
-                texture_height=target_resolution,
-            ),
+            applied_assignment,
             source_surface_ids,
         )
         next_assignments = [*retained_assignments, selected_assignment]
@@ -524,8 +693,9 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         )
         if removed_assignment_ids:
             self.assignments_removed.emit(removed_assignment_ids)
+        texture_width, texture_height = texture_size
         self.status_label.setText(
-            f"Applied the {target_resolution} x {target_resolution} texture "
+            f"Applied the {texture_width} x {texture_height} texture "
             f"to {len(selected_assignment.surface_ids)} "
             f"{selected_assignment.surface_type} surface(s)."
         )
@@ -549,6 +719,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._displayed_frame_index = None
         self._texture_atlas_entry_cache.clear()
         self._texture_variant_entry_targets.clear()
+        self._other_texture_entry_targets.clear()
         self._data = SurfaceTextureData() if data is None else data.clone()
         metadata = self._data.video_metadata
         if metadata is not None and Path(metadata.path).exists():
@@ -825,9 +996,58 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self.texture_view.atlas_activated.connect(
             self._handle_texture_variant_activated
         )
+        self.texture_view.atlas_list.installEventFilter(self)
+        self.texture_view.atlas_list.itemPressed.connect(
+            self._handle_current_texture_item_pressed
+        )
+        self.other_texture_list = QListWidget()
+        self.other_texture_list.setObjectName(
+            "other_surface_texture_list"
+        )
+        self.other_texture_list.setViewMode(QListView.ViewMode.IconMode)
+        self.other_texture_list.setResizeMode(QListView.ResizeMode.Adjust)
+        self.other_texture_list.setMovement(QListView.Movement.Static)
+        self.other_texture_list.setWrapping(True)
+        self.other_texture_list.setWordWrap(True)
+        self.other_texture_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.other_texture_list.setIconSize(OTHER_TEXTURE_THUMBNAIL_SIZE)
+        self.other_texture_list.setGridSize(OTHER_TEXTURE_GRID_SIZE)
+        self.other_texture_list.setToolTip(
+            "Double-click a compatible texture to apply it to the selected "
+            "surfaces."
+        )
+        self.other_texture_list.itemDoubleClicked.connect(
+            self._handle_other_texture_activated
+        )
+        self.other_texture_list.currentItemChanged.connect(
+            self._handle_other_texture_selection_changed
+        )
+        self.other_texture_list.installEventFilter(self)
+        self.texture_views_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.texture_views_splitter.setObjectName(
+            "surface_texture_selection_splitter"
+        )
+        self.texture_views_splitter.setChildrenCollapsible(False)
+        self.texture_views_splitter.addWidget(
+            _build_labeled_view(
+                "Current texture resolutions",
+                self.texture_view,
+            )
+        )
+        self.texture_views_splitter.addWidget(
+            _build_labeled_view(
+                "Other surface textures",
+                self.other_texture_list,
+            )
+        )
+        self.texture_views_splitter.setStretchFactor(0, 1)
+        self.texture_views_splitter.setStretchFactor(1, 1)
+        self.texture_views_splitter.setSizes([1_000, 1_000])
         self.texture_view_page = _build_labeled_view(
             "Texture view",
-            self.texture_view,
+            self.texture_views_splitter,
         )
         self.right_view_stack = QStackedWidget()
         self.right_view_stack.setObjectName("surface_texture_right_view_stack")
@@ -874,6 +1094,19 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             self._handle_remove_plane_clicked
         )
         first_row.addWidget(self.remove_plane_button)
+        self.delete_texture_button = QPushButton("Delete texture")
+        self.delete_texture_button.setObjectName(
+            "delete_surface_texture_button"
+        )
+        self.delete_texture_button.setToolTip(
+            "Delete the selected texture family and all of its resolution "
+            "files. Select an item in Other surface textures to delete that "
+            "family instead of the current surface texture."
+        )
+        self.delete_texture_button.clicked.connect(
+            self._handle_delete_texture_clicked
+        )
+        first_row.addWidget(self.delete_texture_button)
         first_row.addWidget(QLabel("Surface texture provider"))
         self.surface_texture_provider_combo = QComboBox()
         self.surface_texture_provider_combo.setObjectName(
@@ -965,6 +1198,22 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         )
         self.status_label.setWordWrap(True)
         root_layout.addWidget(self.status_label)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        """Route Delete from either texture selector to the same safe action."""
+
+        texture_view = getattr(self, "texture_view", None)
+        current_list = getattr(texture_view, "atlas_list", None)
+        other_list = getattr(self, "other_texture_list", None)
+        if (
+            (watched is current_list or watched is other_list)
+            and isinstance(event, QKeyEvent)
+            and event.type() == QEvent.Type.KeyPress
+            and event.key() == Qt.Key.Key_Delete
+        ):
+            self._handle_delete_texture_clicked()
+            return True
+        return super().eventFilter(watched, event)
 
     def _start_generation(self, request: SurfaceTextureRequest) -> None:
         if self.inpaint_3d_button.isChecked():
@@ -1166,6 +1415,13 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     def _handle_surface_selection_changed(self, raw_ids: object) -> None:
         if not isinstance(raw_ids, tuple | list):
             return
+        if hasattr(self, "other_texture_list"):
+            signals_were_blocked = self.other_texture_list.blockSignals(True)
+            try:
+                self.other_texture_list.setCurrentRow(-1)
+                self.other_texture_list.clearSelection()
+            finally:
+                self.other_texture_list.blockSignals(signals_were_blocked)
         self._data.selected_surface_ids = tuple(str(value) for value in raw_ids)
         self._data.selected_surface_type = self.surface_view.get_selected_surface_type()
         if (
@@ -1884,8 +2140,11 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             None,
         )
         entries: list[TextureAtlasEntry] = []
+        other_entries: list[TextureAtlasEntry] = []
         next_cache: dict[str, tuple[str, TextureAtlasEntry]] = {}
         next_targets: dict[str, tuple[str, int]] = {}
+        next_other_targets: dict[str, tuple[str, int | None]] = {}
+        next_other_tooltips: dict[str, str] = {}
         for variant in (() if assignment is None else assignment.texture_variants):
             entry_id = (
                 f"{assignment.assignment_id}:resolution:{variant.resolution}"
@@ -1913,8 +2172,95 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 assignment.assignment_id,
                 variant.resolution,
             )
+
+        selected_surface_type = self.surface_view.get_selected_surface_type()
+        for candidate in self._data.assignments:
+            resolution = candidate.selected_texture_resolution
+            if (
+                selected_surface_type is None
+                or candidate.assignment_id == assignment_id
+                or candidate.surface_type != selected_surface_type
+            ):
+                continue
+            if candidate.texture_variants:
+                active_variant = (
+                    None
+                    if resolution is None
+                    else candidate.texture_variant_for_resolution(resolution)
+                )
+                if active_variant is None:
+                    continue
+                display_name = (
+                    f"{candidate.surface_type.title()} texture - "
+                    f"{resolution} x {resolution}"
+                )
+            else:
+                if resolution is not None:
+                    continue
+                display_name = (
+                    f"{candidate.surface_type.title()} texture - fixed image"
+                )
+            entry_id = f"{candidate.assignment_id}:other-texture"
+            try:
+                texture_path = self._resolve_asset_path(candidate.asset_path)
+                if not texture_path.is_file():
+                    continue
+                resolved_path = str(texture_path)
+                cached_entry = self._texture_atlas_entry_cache.get(entry_id)
+                if (
+                    cached_entry is not None
+                    and cached_entry[0] == resolved_path
+                    and cached_entry[1].display_name == display_name
+                ):
+                    entry = cached_entry[1]
+                else:
+                    entry = TextureAtlasEntry(
+                        atlas_id=entry_id,
+                        display_name=display_name,
+                        image=texture_path,
+                        owner_id=candidate.assignment_id,
+                    )
+                image = entry.get_image()
+                image_width = image.size().width()
+                image_height = image.size().height()
+                if (
+                    resolution is not None
+                    and (
+                        image_width != resolution
+                        or image_height != resolution
+                    )
+                ):
+                    continue
+            except (OSError, TypeError, ValueError):
+                continue
+            other_entries.append(entry)
+            next_cache[entry_id] = (resolved_path, entry)
+            next_other_targets[entry_id] = (
+                candidate.assignment_id,
+                resolution,
+            )
+            surface_count = len(candidate.surface_ids)
+            surface_suffix = "surface" if surface_count == 1 else "surfaces"
+            resolution_description = (
+                f"Resolution: {resolution} x {resolution}"
+                if resolution is not None
+                else (
+                    f"Fixed image: {image_width} x {image_height} "
+                    "(no resolution variants)"
+                )
+            )
+            next_other_tooltips[entry_id] = (
+                f"{display_name}\n"
+                f"{resolution_description}\n"
+                f"Provider: {_get_provider_display_name(candidate.provider)}\n"
+                f"Currently assigned to: {surface_count} {surface_suffix}\n"
+                f"Texture ID: {candidate.assignment_id}\n"
+                f"Double-click to apply it to the selected "
+                f"{candidate.surface_type} surfaces."
+            )
         self._texture_atlas_entry_cache = next_cache
         self._texture_variant_entry_targets = next_targets
+        self._other_texture_entry_targets = next_other_targets
 
         selected_atlas_id: str | None = None
         if assignment is not None and entries:
@@ -1943,8 +2289,55 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 self.texture_view.select_atlas(selected_atlas_id)
             elif not entries:
                 self.texture_view.select_atlas(None)
+            self._rebuild_other_texture_list(
+                other_entries,
+                next_other_tooltips,
+            )
         finally:
             self._is_refreshing_texture_atlases = False
+
+    def _rebuild_other_texture_list(
+        self,
+        entries: Sequence[TextureAtlasEntry],
+        tooltips_by_entry_id: dict[str, str],
+    ) -> None:
+        """Replace the compact reusable-texture thumbnail library."""
+
+        current_item = self.other_texture_list.currentItem()
+        current_entry_id = (
+            None
+            if current_item is None
+            else str(current_item.data(Qt.ItemDataRole.UserRole) or "")
+        )
+        signals_were_blocked = self.other_texture_list.blockSignals(True)
+        try:
+            self.other_texture_list.clear()
+            replacement_item: QListWidgetItem | None = None
+            for entry in entries:
+                item = QListWidgetItem(
+                    QIcon(
+                        QPixmap.fromImage(entry.get_image()).scaled(
+                            OTHER_TEXTURE_THUMBNAIL_SIZE,
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation,
+                        )
+                    ),
+                    entry.display_name,
+                )
+                item.setData(Qt.ItemDataRole.UserRole, entry.atlas_id)
+                item.setToolTip(
+                    tooltips_by_entry_id.get(
+                        entry.atlas_id,
+                        entry.display_name,
+                    )
+                )
+                self.other_texture_list.addItem(item)
+                if entry.atlas_id == current_entry_id:
+                    replacement_item = item
+            if replacement_item is not None:
+                self.other_texture_list.setCurrentItem(replacement_item)
+        finally:
+            self.other_texture_list.blockSignals(signals_were_blocked)
 
     @Slot(object)
     def _handle_texture_variant_selected(self, raw_entry: object) -> None:
@@ -1974,6 +2367,28 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             "globally; the previous resolution was kept."
         )
         self._refresh_texture_atlases()
+
+    @Slot(object)
+    def _handle_current_texture_item_pressed(self, _raw_item: object) -> None:
+        """Make the current-family pane the unambiguous deletion target."""
+
+        signals_were_blocked = self.other_texture_list.blockSignals(True)
+        try:
+            self.other_texture_list.setCurrentRow(-1)
+            self.other_texture_list.clearSelection()
+        finally:
+            self.other_texture_list.blockSignals(signals_were_blocked)
+        self._sync_controls()
+
+    @Slot(object, object)
+    def _handle_other_texture_selection_changed(
+        self,
+        _current: object,
+        _previous: object,
+    ) -> None:
+        """Keep deletion availability synchronized with library selection."""
+
+        self._sync_controls()
 
     @Slot(object)
     def _handle_texture_variant_activated(self, raw_entry: object) -> None:
@@ -2011,6 +2426,93 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             self.status_label.setText(
                 "The selected surface texture resolution could not be applied."
             )
+
+    @Slot(object)
+    def _handle_other_texture_activated(self, raw_item: object) -> None:
+        """Apply another compatible texture family to selected surfaces."""
+
+        if self.is_generating or not isinstance(raw_item, QListWidgetItem):
+            return
+        entry_id = str(raw_item.data(Qt.ItemDataRole.UserRole) or "")
+        target = self._other_texture_entry_targets.get(entry_id)
+        selected_surface_ids = self.surface_view.get_selected_surface_ids()
+        selected_surface_type = self.surface_view.get_selected_surface_type()
+        if (
+            target is None
+            or not selected_surface_ids
+            or selected_surface_type is None
+        ):
+            return
+        assignment_id, _ = target
+        assignment = self._assignment_by_id(assignment_id)
+        if assignment is None or assignment.surface_type != selected_surface_type:
+            return
+        if self.apply_assignment_texture(
+            assignment_id,
+            selected_surface_ids,
+        ):
+            return
+        self.status_label.setText(
+            "The selected surface texture could not be applied."
+        )
+        self._refresh_texture_atlases()
+
+    def _selected_texture_assignment_id_for_deletion(self) -> str | None:
+        """Resolve an explicit library choice, then the current surface family."""
+
+        other_item = self.other_texture_list.currentItem()
+        if other_item is not None and other_item.isSelected():
+            entry_id = str(
+                other_item.data(Qt.ItemDataRole.UserRole) or ""
+            )
+            target = self._other_texture_entry_targets.get(entry_id)
+            if (
+                target is not None
+                and self._assignment_by_id(target[0]) is not None
+            ):
+                return target[0]
+        assignment_id = self._latest_selected_surface_assignment_id()
+        return (
+            assignment_id
+            if assignment_id is not None
+            and self._assignment_by_id(assignment_id) is not None
+            else None
+        )
+
+    def _handle_delete_texture_clicked(self) -> None:
+        """Confirm and delete the texture family selected in either pane."""
+
+        if self.is_generating:
+            return
+        assignment_id = self._selected_texture_assignment_id_for_deletion()
+        assignment = (
+            None
+            if assignment_id is None
+            else self._assignment_by_id(assignment_id)
+        )
+        if assignment is None:
+            self.status_label.setText("Select a surface texture to delete.")
+            self._sync_controls()
+            return
+        answer = QMessageBox.question(
+            self,
+            "Delete surface texture",
+            (
+                f"Delete this {assignment.surface_type} texture from all "
+                f"{len(assignment.surface_ids)} assigned surface(s)?\n\n"
+                f"Texture ID: {assignment.assignment_id}\n\n"
+                "Every generated resolution in this texture family will be "
+                "deleted."
+            ),
+            (
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.Cancel
+            ),
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.delete_assignment_texture(assignment.assignment_id)
 
     def _request_global_texture_resolution_change(
         self,
@@ -2230,6 +2732,12 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         )
         self.material_notes_edit.setEnabled(not busy)
         self.surface_texture_provider_combo.setEnabled(not busy)
+        self.texture_view.setEnabled(not busy)
+        self.other_texture_list.setEnabled(not busy)
+        self.delete_texture_button.setEnabled(
+            self._selected_texture_assignment_id_for_deletion() is not None
+            and not busy
+        )
         self.add_plane_button.setEnabled(
             selected_surface is not None
             and selected_surface.overlay_parent_surface_id is None

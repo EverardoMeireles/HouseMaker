@@ -166,15 +166,17 @@ class InpaintStrokeDeletionTests(unittest.TestCase):
         _qt_application.processEvents()
         self.temporary_directory.cleanup()
 
-    def test_deleting_object_removes_its_persisted_inpaint_mask_state(self) -> None:
+    def test_deleting_object_with_legacy_inpaint_state_is_safe(self) -> None:
         self.assertEqual(
-            self.workspace.get_texture_inpaint_strokes("chair"),
-            (_stroke(),),
+            self.workspace.get_data().generated_objects[0].pipeline[
+                TEXTURE_INPAINT_STROKES_PIPELINE_KEY
+            ],
+            [_stroke().to_dict()],
         )
+        self.assertIsNone(self.workspace.result_view._texture_edit_mask)
 
         self.assertTrue(self.workspace.delete_generated_object("chair"))
 
-        self.assertEqual(self.workspace.get_texture_inpaint_strokes("chair"), ())
         self.assertEqual(self.workspace.get_data().generated_objects, [])
 
 

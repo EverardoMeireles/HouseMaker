@@ -15,8 +15,17 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 # ### Imports ###
-from PySide6.QtCore import QPoint, QPointF, Qt
-from PySide6.QtGui import QDropEvent, QWheelEvent
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt
+from PySide6.QtGui import (
+    QDragEnterEvent,
+    QDragLeaveEvent,
+    QDragMoveEvent,
+    QDropEvent,
+    QImage,
+    QMouseEvent,
+    QPainter,
+    QWheelEvent,
+)
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -136,6 +145,47 @@ def _wheel_event(position: QPointF, delta: int) -> QWheelEvent:
         Qt.ScrollPhase.ScrollUpdate,
         False,
     )
+
+
+def _atlas_preview_point(
+    preview,
+    atlas_resolution: int,
+    atlas_x: float,
+    atlas_y: float,
+) -> QPointF:
+    """Map Atlas coordinates to the preview widget for drag tests."""
+
+    preview_side = min(preview.width() - 32.0, preview.height() - 32.0)
+    preview_origin = QPointF(
+        (preview.width() - preview_side) / 2.0,
+        (preview.height() - preview_side) / 2.0,
+    )
+    return QPointF(
+        preview_origin.x() + atlas_x * preview_side / atlas_resolution,
+        preview_origin.y() + atlas_y * preview_side / atlas_resolution,
+    )
+
+
+def _paint_drag_feedback(preview) -> QImage:
+    """Paint only the transient slot feedback onto a transparent image."""
+
+    preview_side = min(preview.width() - 32.0, preview.height() - 32.0)
+    atlas_rect = QRectF(
+        (preview.width() - preview_side) / 2.0,
+        (preview.height() - preview_side) / 2.0,
+        preview_side,
+        preview_side,
+    )
+    image = QImage(
+        preview.width(),
+        preview.height(),
+        QImage.Format.Format_ARGB32,
+    )
+    image.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(image)
+    preview._paint_drag_slot_preview(painter, atlas_rect)
+    painter.end()
+    return image
 
 
 # ### Workspace tests ###
@@ -418,6 +468,79 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         )
         self.assertEqual(self.workspace.selected_object_id, source_id)
 
+    def test_mouse_wheel_resizes_selection_instead_of_hovered_texture(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Selected", 4096, atlas_id="atlas-a")
+        variants: dict[tuple[str, int], AtlasObjectTextureSource] = {}
+        for object_id in ("selected", "hovered"):
+            for resolution in (512, 1024, 2048):
+                variants[(object_id, resolution)] = _source(
+                    object_id,
+                    directory=self._temporary_directory.name,
+                    resolution=resolution,
+                )
+            source = variants[(object_id, 512)]
+            data.assign_object(
+                atlas.atlas_id,
+                object_id,
+                source.texture_path,
+                source.texture_resolution,
+            )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources(
+            [variants[("selected", 512)], variants[("hovered", 512)]],
+            variant_resolver=_variant_resolver(variants),
+            selectability_resolver=lambda _object_id, _resolution: True,
+        )
+        self.workspace.object_list.setCurrentRow(0)
+        _qt_application.processEvents()
+
+        hovered_row_center = QPointF(
+            self.workspace.object_list.visualItemRect(
+                self.workspace.object_list.item(1)
+            ).center()
+        )
+        list_wheel = _wheel_event(hovered_row_center, 120)
+        self.workspace.object_list.wheelEvent(list_wheel)
+
+        updated = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert updated is not None
+        selected = updated.placement_for_object("selected")
+        hovered = updated.placement_for_object("hovered")
+        assert selected is not None and hovered is not None
+        self.assertEqual(selected.texture_resolution, 1024)
+        self.assertEqual(hovered.texture_resolution, 512)
+        self.assertEqual(self.workspace.selected_object_id, "selected")
+
+        preview_wheel = _wheel_event(
+            QPointF(self.workspace.preview.rect().center()),
+            120,
+        )
+        self.workspace.preview.wheelEvent(preview_wheel)
+
+        updated = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert updated is not None
+        selected = updated.placement_for_object("selected")
+        hovered = updated.placement_for_object("hovered")
+        assert selected is not None and hovered is not None
+        self.assertTrue(preview_wheel.isAccepted())
+        self.assertEqual(selected.texture_resolution, 2048)
+        self.assertEqual(hovered.texture_resolution, 512)
+
+        before = self.workspace.get_data()
+        self.workspace.object_list.setCurrentRow(-1)
+        unselected_wheel = _wheel_event(
+            QPointF(self.workspace.preview.rect().center()),
+            -120,
+        )
+        unselected_wheel.setAccepted(False)
+        self.workspace.preview.wheelEvent(unselected_wheel)
+
+        self.assertFalse(unselected_wheel.isAccepted())
+        self.assertEqual(self.workspace.get_data(), before)
+
     def test_dragged_source_is_placed_at_the_exact_preview_grid_slot(self) -> None:
         data = TextureAtlasData()
         atlas = data.create_atlas("Manual", 2048, atlas_id="atlas-a")
@@ -468,6 +591,467 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.assertEqual((placement.x, placement.y), slot)
         self.assertEqual(placement.texture_resolution, 512)
         self.assertIsNotNone(updated.image_path)
+
+    def test_large_drag_preview_and_drop_advance_one_512_pixel_cell(self) -> None:
+        for resolution in (1024, 2048):
+            with self.subTest(resolution=resolution):
+                data = TextureAtlasData()
+                atlas = data.create_atlas(
+                    "Manual",
+                    4096,
+                    atlas_id="atlas-a",
+                )
+                source = _source(
+                    f"chair-{resolution}",
+                    directory=self._temporary_directory.name,
+                    resolution=resolution,
+                )
+                self.workspace.set_data(data)
+                self.workspace.set_object_texture_sources([source])
+                preview = self.workspace.preview
+                _qt_application.processEvents()
+                mime_data = _build_texture_source_mime_data(source.object_id)
+                first_point = _atlas_preview_point(
+                    preview,
+                    atlas.resolution,
+                    700,
+                    700,
+                )
+                second_point = _atlas_preview_point(
+                    preview,
+                    atlas.resolution,
+                    700,
+                    1200,
+                )
+
+                first_event = QDragEnterEvent(
+                    first_point.toPoint(),
+                    Qt.DropAction.CopyAction,
+                    mime_data,
+                    Qt.MouseButton.LeftButton,
+                    Qt.KeyboardModifier.NoModifier,
+                )
+                preview.dragEnterEvent(first_event)
+                first_slot = preview.drag_slot_preview
+                assert first_slot is not None
+                self.assertEqual((first_slot.x, first_slot.y), (512, 512))
+                self.assertEqual(first_slot.size, resolution)
+
+                second_event = QDragMoveEvent(
+                    second_point.toPoint(),
+                    Qt.DropAction.CopyAction,
+                    mime_data,
+                    Qt.MouseButton.LeftButton,
+                    Qt.KeyboardModifier.NoModifier,
+                )
+                preview.dragMoveEvent(second_event)
+                second_slot = preview.drag_slot_preview
+                assert second_slot is not None
+                self.assertEqual((second_slot.x, second_slot.y), (512, 1024))
+                self.assertEqual(second_slot.size, resolution)
+                self.assertTrue(second_slot.is_valid)
+
+                drop_event = QDropEvent(
+                    second_point,
+                    Qt.DropAction.CopyAction,
+                    mime_data,
+                    Qt.MouseButton.LeftButton,
+                    Qt.KeyboardModifier.NoModifier,
+                )
+                preview.dropEvent(drop_event)
+
+                placement = self.workspace.get_data().atlas_by_id(
+                    atlas.atlas_id
+                ).placement_for_object(source.object_id)
+                assert placement is not None
+                self.assertTrue(drop_event.isAccepted())
+                self.assertEqual((placement.x, placement.y), (512, 1024))
+                self.assertEqual(placement.size, resolution)
+
+    def test_large_drag_preview_uses_its_full_footprint_for_validity(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Manual", 4096, atlas_id="atlas-a")
+        dragged = _source(
+            "large",
+            directory=self._temporary_directory.name,
+            resolution=1024,
+        )
+        occupied = _source(
+            "occupied",
+            directory=self._temporary_directory.name,
+        )
+        data.place_object_at(
+            atlas.atlas_id,
+            dragged.object_id,
+            dragged.texture_path,
+            dragged.texture_resolution,
+            512,
+            512,
+        )
+        data.place_object_at(
+            atlas.atlas_id,
+            occupied.object_id,
+            occupied.texture_path,
+            occupied.texture_resolution,
+            1536,
+            1024,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([dragged, occupied])
+        preview = self.workspace.preview
+        _qt_application.processEvents()
+        mime_data = _build_texture_source_mime_data(dragged.object_id)
+
+        cases = (
+            (700, 1200, (512, 1024), True),
+            (1200, 1200, (1024, 1024), False),
+            (3700, 1200, (3584, 1024), False),
+        )
+        for atlas_x, atlas_y, expected_slot, is_valid in cases:
+            with self.subTest(expected_slot=expected_slot):
+                point = _atlas_preview_point(
+                    preview,
+                    atlas.resolution,
+                    atlas_x,
+                    atlas_y,
+                )
+                move_event = QDragMoveEvent(
+                    point.toPoint(),
+                    Qt.DropAction.CopyAction,
+                    mime_data,
+                    Qt.MouseButton.LeftButton,
+                    Qt.KeyboardModifier.NoModifier,
+                )
+
+                preview.dragMoveEvent(move_event)
+
+                slot = preview.drag_slot_preview
+                assert slot is not None
+                self.assertEqual((slot.x, slot.y), expected_slot)
+                self.assertEqual(slot.size, 1024)
+                self.assertEqual(slot.is_valid, is_valid)
+
+    def test_drag_preview_tracks_list_source_without_mutating_until_drop(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Manual", 2048, atlas_id="atlas-a")
+        source = _source("chair", directory=self._temporary_directory.name)
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([source])
+        preview = self.workspace.preview
+        _qt_application.processEvents()
+        mime_data = _build_texture_source_mime_data(source.object_id)
+        before = self.workspace.get_data()
+        first_point = _atlas_preview_point(preview, atlas.resolution, 700, 700)
+        second_point = _atlas_preview_point(
+            preview,
+            atlas.resolution,
+            1300,
+            700,
+        )
+
+        enter_event = QDragEnterEvent(
+            first_point.toPoint(),
+            Qt.DropAction.CopyAction,
+            mime_data,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        preview.dragEnterEvent(enter_event)
+
+        slot_preview = preview.drag_slot_preview
+        assert slot_preview is not None
+        self.assertTrue(enter_event.isAccepted())
+        self.assertEqual(
+            (slot_preview.object_id, slot_preview.x, slot_preview.y),
+            (source.object_id, 512, 512),
+        )
+        self.assertTrue(slot_preview.is_valid)
+        self.assertEqual(self.workspace.get_data(), before)
+
+        move_event = QDragMoveEvent(
+            second_point.toPoint(),
+            Qt.DropAction.CopyAction,
+            mime_data,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        preview.dragMoveEvent(move_event)
+
+        moved_preview = preview.drag_slot_preview
+        assert moved_preview is not None
+        self.assertTrue(move_event.isAccepted())
+        self.assertEqual((moved_preview.x, moved_preview.y), (1024, 512))
+        self.assertTrue(moved_preview.is_valid)
+        self.assertEqual(self.workspace.get_data(), before)
+
+        drop_event = QDropEvent(
+            second_point,
+            Qt.DropAction.CopyAction,
+            mime_data,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        preview.dropEvent(drop_event)
+
+        placement = self.workspace.get_data().atlas_by_id(
+            atlas.atlas_id
+        ).placement_for_object(source.object_id)
+        assert placement is not None
+        self.assertEqual((placement.x, placement.y), (1024, 512))
+        self.assertIsNone(preview.drag_slot_preview)
+
+    def test_drag_preview_marks_collisions_and_outside_points_as_blocked(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Manual", 2048, atlas_id="atlas-a")
+        occupied = _source(
+            "occupied",
+            directory=self._temporary_directory.name,
+            color=(20, 20, 20, 255),
+        )
+        dragged = _source(
+            "dragged",
+            directory=self._temporary_directory.name,
+            color=(30, 120, 210, 255),
+        )
+        data.place_object_at(
+            atlas.atlas_id,
+            occupied.object_id,
+            occupied.texture_path,
+            occupied.texture_resolution,
+            0,
+            0,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([occupied, dragged])
+        preview = self.workspace.preview
+        _qt_application.processEvents()
+        mime_data = _build_texture_source_mime_data(dragged.object_id)
+        collision_point = _atlas_preview_point(
+            preview,
+            atlas.resolution,
+            200,
+            200,
+        )
+        valid_point = _atlas_preview_point(
+            preview,
+            atlas.resolution,
+            700,
+            200,
+        )
+        before = self.workspace.get_data()
+
+        collision_event = QDragEnterEvent(
+            collision_point.toPoint(),
+            Qt.DropAction.CopyAction,
+            mime_data,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        preview.dragEnterEvent(collision_event)
+        blocked_preview = preview.drag_slot_preview
+        assert blocked_preview is not None
+        self.assertTrue(collision_event.isAccepted())
+        self.assertFalse(blocked_preview.is_valid)
+
+        blocked_image = _paint_drag_feedback(preview)
+        blocked_pixel = blocked_image.pixelColor(collision_point.toPoint())
+        self.assertGreater(blocked_pixel.alpha(), 0)
+        self.assertLess(blocked_pixel.alpha(), 255)
+
+        valid_event = QDragMoveEvent(
+            valid_point.toPoint(),
+            Qt.DropAction.CopyAction,
+            mime_data,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        preview.dragMoveEvent(valid_event)
+        valid_preview = preview.drag_slot_preview
+        assert valid_preview is not None
+        self.assertTrue(valid_event.isAccepted())
+        self.assertTrue(valid_preview.is_valid)
+        valid_image = _paint_drag_feedback(preview)
+        valid_pixel = valid_image.pixelColor(valid_point.toPoint())
+        self.assertGreater(valid_pixel.alpha(), 0)
+        self.assertLess(valid_pixel.alpha(), 255)
+        self.assertNotEqual(valid_pixel.rgba(), blocked_pixel.rgba())
+
+        outside_point = QPointF(2.0, preview.height() / 2.0)
+        outside_event = QDragMoveEvent(
+            outside_point.toPoint(),
+            Qt.DropAction.CopyAction,
+            mime_data,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        preview.dragMoveEvent(outside_event)
+        outside_preview = preview.drag_slot_preview
+        assert outside_preview is not None
+        self.assertTrue(outside_event.isAccepted())
+        self.assertFalse(outside_preview.is_valid)
+        self.assertEqual(self.workspace.get_data(), before)
+
+        blocked_drop = QDropEvent(
+            outside_point,
+            Qt.DropAction.CopyAction,
+            mime_data,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        preview.dropEvent(blocked_drop)
+        self.assertFalse(blocked_drop.isAccepted())
+        self.assertIsNone(preview.drag_slot_preview)
+        self.assertEqual(self.workspace.get_data(), before)
+
+    def test_drag_preview_clears_on_leave_and_content_refresh(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Manual", 2048, atlas_id="atlas-a")
+        source = _source("chair", directory=self._temporary_directory.name)
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([source])
+        preview = self.workspace.preview
+        _qt_application.processEvents()
+        mime_data = _build_texture_source_mime_data(source.object_id)
+        point = _atlas_preview_point(preview, atlas.resolution, 700, 700)
+
+        enter_event = QDragEnterEvent(
+            point.toPoint(),
+            Qt.DropAction.CopyAction,
+            mime_data,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        preview.dragEnterEvent(enter_event)
+        self.assertIsNotNone(preview.drag_slot_preview)
+
+        preview.dragLeaveEvent(QDragLeaveEvent())
+        self.assertIsNone(preview.drag_slot_preview)
+
+        preview.dragEnterEvent(enter_event)
+        self.assertIsNotNone(preview.drag_slot_preview)
+        self.workspace._refresh_preview()
+        self.assertIsNone(preview.drag_slot_preview)
+
+    def test_existing_preview_texture_can_be_dragged_to_an_exact_slot(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Manual", 2048, atlas_id="atlas-a")
+        source = _source("chair", directory=self._temporary_directory.name)
+        data.place_object_at(
+            atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+            0,
+            0,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([source])
+        preview = self.workspace.preview
+        _qt_application.processEvents()
+        preview_side = min(preview.width() - 32.0, preview.height() - 32.0)
+        preview_origin = QPointF(
+            (preview.width() - preview_side) / 2.0,
+            (preview.height() - preview_side) / 2.0,
+        )
+        start_point = QPointF(
+            preview_origin.x() + 256.0 * preview_side / atlas.resolution,
+            preview_origin.y() + 256.0 * preview_side / atlas.resolution,
+        )
+        drop_point = QPointF(
+            preview_origin.x() + 1300.0 * preview_side / atlas.resolution,
+            preview_origin.y() + 700.0 * preview_side / atlas.resolution,
+        )
+        press_event = QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            start_point,
+            start_point,
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        preview.mousePressEvent(press_event)
+        move_event = QMouseEvent(
+            QEvent.Type.MouseMove,
+            drop_point,
+            drop_point,
+            Qt.MouseButton.NoButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        with patch("housemaker.texture_atlas_workspace.QDrag") as drag_class:
+            preview.mouseMoveEvent(move_event)
+
+        drag = drag_class.return_value
+        drag.exec.assert_called_once_with(Qt.DropAction.CopyAction)
+        mime_data = drag.setMimeData.call_args.args[0]
+        drag_enter_event = QDragEnterEvent(
+            drop_point.toPoint(),
+            Qt.DropAction.CopyAction,
+            mime_data,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        preview.dragEnterEvent(drag_enter_event)
+        self.assertTrue(drag_enter_event.isAccepted())
+        slot_preview = preview.drag_slot_preview
+        assert slot_preview is not None
+        self.assertEqual((slot_preview.x, slot_preview.y), (1024, 512))
+        self.assertTrue(slot_preview.is_valid)
+        drop_event = QDropEvent(
+            drop_point,
+            Qt.DropAction.CopyAction,
+            mime_data,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        preview.dropEvent(drop_event)
+
+        updated = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert updated is not None
+        placement = updated.placement_for_object(source.object_id)
+        assert placement is not None
+        self.assertTrue(drop_event.isAccepted())
+        self.assertEqual((placement.x, placement.y), (1024, 512))
+
+    def test_list_row_starts_drag_before_and_after_atlas_assignment(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Manual", 2048, atlas_id="atlas-a")
+        source = _source("chair", directory=self._temporary_directory.name)
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([source])
+
+        for should_be_assigned in (False, True):
+            if should_be_assigned:
+                self.workspace.assign_object_button.click()
+            with patch(
+                "housemaker.texture_atlas_workspace.QDrag"
+            ) as drag_class:
+                self.workspace.object_list.startDrag(Qt.DropAction.CopyAction)
+
+            drag = drag_class.return_value
+            drag.exec.assert_called_once_with(Qt.DropAction.CopyAction)
+            mime_data = drag.setMimeData.call_args.args[0]
+            self.assertTrue(
+                mime_data.hasFormat(
+                    "application/x-housemaker-texture-atlas-source"
+                )
+            )
+            self.assertEqual(
+                bytes(
+                    mime_data.data(
+                        "application/x-housemaker-texture-atlas-source"
+                    )
+                ).decode("utf-8"),
+                source.object_id,
+            )
+
+        updated = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert updated is not None
+        self.assertIsNotNone(updated.placement_for_object(source.object_id))
 
     def test_drag_collision_and_png_failure_preserve_state_and_png(self) -> None:
         data = TextureAtlasData()
@@ -773,7 +1357,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
                 )
 
                 self.assertFalse(changed)
-                self.assertEqual(observed_candidates, [(1024, 0, 0)])
+                self.assertEqual(observed_candidates, [(1024, 512, 0)])
                 self.assertEqual(self.workspace.get_data(), before)
                 restored_atlas = self.workspace.selected_atlas
                 assert restored_atlas is not None

@@ -137,16 +137,11 @@ class SelectableGLViewWidget(gl.GLViewWidget):
     navigation_mode_changed = Signal(str)
     first_person_active_changed = Signal(bool)
     first_person_camera_pose_changed = Signal(object)
-    texture_inpaint_pointer_pressed = Signal(object)
-    texture_inpaint_pointer_moved = Signal(object)
-    texture_inpaint_pointer_released = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.click_press_position = QPointF()
         self._is_middle_navigation_active = False
-        self._texture_inpaint_enabled = False
-        self._texture_inpaint_pointer_active = False
         self._navigation_mode = NAVIGATION_MODE_ORBIT
         self._first_person_camera_pose = CameraPose(
             z=DEFAULT_FIRST_PERSON_HEIGHT_METERS
@@ -189,25 +184,6 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         if self.is_first_person_active and self.isVisible():
             self.grabMouse()
             self._center_pointer()
-
-    @property
-    def texture_inpaint_enabled(self) -> bool:
-        return self._texture_inpaint_enabled
-
-    def set_texture_inpaint_enabled(self, enabled: bool) -> None:
-        """Reserve left drags for painting the current model's UV texture."""
-
-        enabled = bool(enabled)
-        if enabled == self._texture_inpaint_enabled:
-            return
-        if enabled and self.is_first_person_active:
-            self.exit_first_person_mode()
-        self._texture_inpaint_enabled = enabled
-        self._texture_inpaint_pointer_active = False
-        if enabled:
-            self.setCursor(Qt.CursorShape.CrossCursor)
-        else:
-            self.unsetCursor()
 
     def build_camera_ray(
         self,
@@ -378,15 +354,6 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             event.accept()
             return
 
-        if (
-            self._texture_inpaint_enabled
-            and event.button() == Qt.MouseButton.LeftButton
-        ):
-            self._texture_inpaint_pointer_active = True
-            self.texture_inpaint_pointer_pressed.emit(event.position())
-            event.accept()
-            return
-
         self.click_press_position = event.position()
         if event.button() == Qt.MouseButton.MiddleButton:
             self.mousePos = event.position()
@@ -400,16 +367,6 @@ class SelectableGLViewWidget(gl.GLViewWidget):
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
         if self.is_first_person_active:
-            event.accept()
-            return
-
-        if (
-            self._texture_inpaint_enabled
-            and event.button() == Qt.MouseButton.LeftButton
-        ):
-            if self._texture_inpaint_pointer_active:
-                self.texture_inpaint_pointer_released.emit(event.position())
-            self._texture_inpaint_pointer_active = False
             event.accept()
             return
 
@@ -446,15 +403,6 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         delta = position - previous_position
         self.mousePos = position
         buttons = event.buttons()
-
-        if (
-            self._texture_inpaint_enabled
-            and self._texture_inpaint_pointer_active
-            and buttons & Qt.MouseButton.LeftButton
-        ):
-            self.texture_inpaint_pointer_moved.emit(event.position())
-            event.accept()
-            return
 
         if buttons & Qt.MouseButton.MiddleButton:
             self._is_middle_navigation_active = True

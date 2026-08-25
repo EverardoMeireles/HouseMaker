@@ -845,21 +845,10 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
 
         refresh_regenerated.assert_called_once_with("chair")
 
-    def test_inpainted_object_is_routed_to_atlas_path_refresh(self) -> None:
-        inpainted_record = SimpleNamespace(object_id="chair")
-
-        with patch.object(
-            self.workspace.texture_atlas_workspace,
-            "refresh_regenerated_object_texture",
-            return_value=1,
-        ) as refresh_regenerated:
-            self.workspace.generation.texture_inpaint_completed.emit(
-                inpainted_record,
-                _generated_box_model(),
-            )
-            _qt_application.processEvents()
-
-        refresh_regenerated.assert_called_once_with("chair")
+    def test_object_generation_exposes_no_texture_inpaint_signal(self) -> None:
+        self.assertFalse(
+            hasattr(self.workspace.generation, "texture_inpaint_completed")
+        )
 
     def test_invalid_object_change_does_not_refresh_atlas(self) -> None:
         with patch.object(

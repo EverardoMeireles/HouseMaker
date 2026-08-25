@@ -24,6 +24,7 @@ from PySide6.QtGui import (
     QColor,
     QDrag,
     QDragEnterEvent,
+    QDragLeaveEvent,
     QDragMoveEvent,
     QDropEvent,
     QImage,
@@ -35,6 +36,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QComboBox,
     QFormLayout,
     QHBoxLayout,
@@ -49,6 +51,7 @@ from PySide6.QtWidgets import (
 )
 
 from housemaker.texture_atlas_state import (
+    ATLAS_BASE_CELL_SIZE,
     ATLAS_RESOLUTIONS,
     TextureAtlasData,
     TextureAtlasPlacement,
@@ -69,6 +72,11 @@ PREVIEW_MISSING_COLOR = QColor(105, 59, 52)
 PREVIEW_BORDER_COLOR = QColor(220, 224, 230)
 PREVIEW_SELECTED_BORDER_COLOR = QColor(255, 139, 31)
 PREVIEW_LABEL_COLOR = QColor(245, 247, 250)
+PREVIEW_DRAG_VALID_FILL_COLOR = QColor(38, 190, 95, 72)
+PREVIEW_DRAG_VALID_BORDER_COLOR = QColor(77, 255, 142, 235)
+PREVIEW_DRAG_BLOCKED_FILL_COLOR = QColor(225, 56, 64, 88)
+PREVIEW_DRAG_BLOCKED_BORDER_COLOR = QColor(255, 104, 111, 240)
+PREVIEW_DRAG_IMAGE_OPACITY = 0.46
 MAX_SOURCE_THUMBNAIL_SIZE = 256
 MAX_VARIANT_SOURCE_CACHE_ENTRIES = 256
 TEXTURE_RESOLUTION_ORDER = (512, 1024, 2048)
@@ -163,6 +171,17 @@ class AtlasObjectTextureSource:
                 f"received {rgba.shape[1]} x {rgba.shape[0]}."
             )
         return np.ascontiguousarray(rgba)
+
+
+@dataclass(frozen=True)
+class AtlasDragSlotPreview:
+    """One non-mutating, snapped placement shown during an Atlas drag."""
+
+    object_id: str
+    x: int
+    y: int
+    size: int
+    is_valid: bool
 
 
 TextureVariantResolver = Callable[
@@ -315,9 +334,9 @@ class TextureAtlasObjectList(QListWidget):
             self.object_clicked.emit(str(object_id), button)
 
     def wheelEvent(self, event: QWheelEvent) -> None:  # type: ignore[override]
-        """Resize the texture under the cursor instead of scrolling the list."""
+        """Resize the selected texture instead of the hovered list row."""
 
-        item = self.itemAt(event.position().toPoint())
+        item = self.currentItem()
         wheel_delta = int(event.angleDelta().y())
         if item is None or wheel_delta == 0:
             super().wheelEvent(event)
@@ -353,7 +372,12 @@ class TextureAtlasPreview(QWidget):
         super().__init__(parent)
         self._atlas: TextureAtlasRecord | None = None
         self._sources: dict[str, AtlasObjectTextureSource] = {}
+        self._source_preview_images: dict[str, QImage] = {}
         self._selected_object_id: str | None = None
+        self._drag_start_position: QPointF | None = None
+        self._drag_object_id: str | None = None
+        self._drag_slot_preview: AtlasDragSlotPreview | None = None
+        self._wheel_resize_object_ids: frozenset[str] = frozenset()
         self.setMinimumSize(360, 360)
         self.setAcceptDrops(True)
 
@@ -364,7 +388,18 @@ class TextureAtlasPreview(QWidget):
     ) -> None:
         self._atlas = atlas
         self._sources = dict(sources)
+        self._source_preview_images = {
+            object_id: source.get_preview_image()
+            for object_id, source in self._sources.items()
+        }
+        self._drag_slot_preview = None
         self.update()
+
+    @property
+    def drag_slot_preview(self) -> AtlasDragSlotPreview | None:
+        """Return the currently painted drag feedback without atlas mutation."""
+
+        return self._drag_slot_preview
 
     def set_selected_object_id(self, object_id: str | None) -> None:
         """Highlight one placement without changing atlas data."""
@@ -374,6 +409,13 @@ class TextureAtlasPreview(QWidget):
             return
         self._selected_object_id = normalized_id
         self.update()
+
+    def set_wheel_resize_object_ids(self, object_ids: set[str]) -> None:
+        """Limit wheel capture to packed sources that can resize."""
+
+        self._wheel_resize_object_ids = frozenset(
+            str(object_id) for object_id in object_ids
+        )
 
     def object_id_at(self, position: QPointF) -> str | None:
         """Return the placement at one widget-space position, if any."""
@@ -406,7 +448,7 @@ class TextureAtlasPreview(QWidget):
         object_id: str,
         position: QPointF,
     ) -> tuple[int, int] | None:
-        """Return the exact texture-size grid slot beneath a widget point."""
+        """Return the exact 512-pixel grid slot beneath a widget point."""
 
         atlas = self._atlas
         source = self._sources.get(str(object_id))
@@ -424,10 +466,9 @@ class TextureAtlasPreview(QWidget):
         scale = float(atlas.resolution) / atlas_rect.width()
         atlas_x = int((position.x() - atlas_rect.left()) * scale)
         atlas_y = int((position.y() - atlas_rect.top()) * scale)
-        slot_size = source.texture_resolution
         return (
-            (atlas_x // slot_size) * slot_size,
-            (atlas_y // slot_size) * slot_size,
+            (atlas_x // ATLAS_BASE_CELL_SIZE) * ATLAS_BASE_CELL_SIZE,
+            (atlas_y // ATLAS_BASE_CELL_SIZE) * ATLAS_BASE_CELL_SIZE,
         )
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
@@ -440,13 +481,56 @@ class TextureAtlasPreview(QWidget):
         object_id = self.object_id_at(event.position())
         if object_id is not None:
             self.object_clicked.emit(object_id, event.button())
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start_position = QPointF(event.position())
+            self._drag_object_id = object_id
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        """Drag an existing placement to another exact Atlas slot."""
+
+        if not bool(event.buttons() & Qt.MouseButton.LeftButton):
+            super().mouseMoveEvent(event)
+            return
+        start_position = self._drag_start_position
+        object_id = self._drag_object_id
+        if start_position is None or object_id is None:
+            super().mouseMoveEvent(event)
+            return
+        distance = (
+            event.position().toPoint() - start_position.toPoint()
+        ).manhattanLength()
+        if distance < QApplication.startDragDistance():
+            super().mouseMoveEvent(event)
+            return
+
+        self._drag_start_position = None
+        self._drag_object_id = None
+        try:
+            mime_data = _build_texture_source_mime_data(object_id)
+        except ValueError:
+            return
+        drag = QDrag(self)
+        drag.setMimeData(mime_data)
+        drag.exec(Qt.DropAction.CopyAction)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        """Clear a pending placement drag when the left button is released."""
+
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start_position = None
+            self._drag_object_id = None
+        super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event: QWheelEvent) -> None:  # type: ignore[override]
-        """Resize the placement under the cursor using the wheel direction."""
+        """Resize the selected placement regardless of pointer position."""
 
-        object_id = self.object_id_at(event.position())
+        object_id = self._selected_object_id
         wheel_delta = int(event.angleDelta().y())
-        if object_id is None or wheel_delta == 0:
+        if (
+            object_id is None
+            or object_id not in self._wheel_resize_object_ids
+            or wheel_delta == 0
+        ):
             super().wheelEvent(event)
             return
         self.object_wheeled.emit(
@@ -457,39 +541,50 @@ class TextureAtlasPreview(QWidget):
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # type: ignore[override]
         object_id = _read_texture_source_mime_data(event.mimeData())
-        if (
-            object_id is not None
-            and self.atlas_slot_at(object_id, QPointF(event.position()))
-            is not None
+        if object_id is not None and self._update_drag_slot_preview(
+            object_id,
+            QPointF(event.position()),
         ):
             event.setDropAction(Qt.DropAction.CopyAction)
             event.accept()
             return
+        self._clear_drag_slot_preview()
         event.ignore()
 
     def dragMoveEvent(self, event: QDragMoveEvent) -> None:  # type: ignore[override]
         object_id = _read_texture_source_mime_data(event.mimeData())
-        if (
-            object_id is not None
-            and self.atlas_slot_at(object_id, QPointF(event.position()))
-            is not None
+        if object_id is not None and self._update_drag_slot_preview(
+            object_id,
+            QPointF(event.position()),
         ):
             event.setDropAction(Qt.DropAction.CopyAction)
             event.accept()
             return
+        self._clear_drag_slot_preview()
         event.ignore()
+
+    def dragLeaveEvent(self, event: QDragLeaveEvent) -> None:  # type: ignore[override]
+        """Remove transient slot feedback when a drag leaves the preview."""
+
+        self._clear_drag_slot_preview()
+        event.accept()
 
     def dropEvent(self, event: QDropEvent) -> None:  # type: ignore[override]
         object_id = _read_texture_source_mime_data(event.mimeData())
-        slot = (
-            None
-            if object_id is None
-            else self.atlas_slot_at(object_id, event.position())
+        has_preview = (
+            object_id is not None
+            and self._update_drag_slot_preview(object_id, event.position())
         )
-        if object_id is None or slot is None:
+        slot_preview = self._drag_slot_preview if has_preview else None
+        self._clear_drag_slot_preview()
+        if slot_preview is None or not slot_preview.is_valid:
             event.ignore()
             return
-        self.object_dropped.emit(object_id, slot[0], slot[1])
+        self.object_dropped.emit(
+            slot_preview.object_id,
+            slot_preview.x,
+            slot_preview.y,
+        )
         event.setDropAction(Qt.DropAction.CopyAction)
         event.accept()
 
@@ -522,7 +617,10 @@ class TextureAtlasPreview(QWidget):
                 painter.fillRect(placement_rect, PREVIEW_MISSING_COLOR)
                 label = f"Missing\n{placement.object_id}"
             else:
-                painter.drawImage(placement_rect, source.get_preview_image())
+                painter.drawImage(
+                    placement_rect,
+                    self._source_preview_images[placement.object_id],
+                )
                 label = (
                     f"{source.object_name}\n"
                     f"{placement.texture_resolution} x "
@@ -547,8 +645,138 @@ class TextureAtlasPreview(QWidget):
                 label,
             )
 
+        self._paint_drag_slot_preview(painter, atlas_rect)
+
         painter.setPen(QPen(PREVIEW_BORDER_COLOR, 2.0))
         painter.drawRect(atlas_rect)
+
+    def _drag_slot_preview_at(
+        self,
+        object_id: str,
+        position: QPointF,
+    ) -> AtlasDragSlotPreview | None:
+        """Build snapped feedback, including collision and bounds validity."""
+
+        atlas = self._atlas
+        source = self._sources.get(str(object_id))
+        if atlas is None or source is None:
+            return None
+        atlas_rect = _aspect_fit_square(self.width(), self.height())
+        if atlas_rect.width() <= 0.0:
+            return None
+
+        pointer_is_inside = (
+            position.x() >= atlas_rect.left()
+            and position.y() >= atlas_rect.top()
+            and position.x() < atlas_rect.right()
+            and position.y() < atlas_rect.bottom()
+        )
+        scale = float(atlas.resolution) / atlas_rect.width()
+        raw_x = int((position.x() - atlas_rect.left()) * scale)
+        raw_y = int((position.y() - atlas_rect.top()) * scale)
+        atlas_x = min(max(raw_x, 0), max(0, atlas.resolution - 1))
+        atlas_y = min(max(raw_y, 0), max(0, atlas.resolution - 1))
+        slot_size = source.texture_resolution
+        slot_x = (
+            atlas_x // ATLAS_BASE_CELL_SIZE
+        ) * ATLAS_BASE_CELL_SIZE
+        slot_y = (
+            atlas_y // ATLAS_BASE_CELL_SIZE
+        ) * ATLAS_BASE_CELL_SIZE
+        fits_bounds = (
+            slot_x + slot_size <= atlas.resolution
+            and slot_y + slot_size <= atlas.resolution
+        )
+        overlaps_other = any(
+            placement.object_id != object_id
+            and slot_x < placement.x + placement.size
+            and slot_x + slot_size > placement.x
+            and slot_y < placement.y + placement.size
+            and slot_y + slot_size > placement.y
+            for placement in atlas.placements
+        )
+        return AtlasDragSlotPreview(
+            object_id=str(object_id),
+            x=slot_x,
+            y=slot_y,
+            size=slot_size,
+            is_valid=(
+                pointer_is_inside and fits_bounds and not overlaps_other
+            ),
+        )
+
+    def _update_drag_slot_preview(
+        self,
+        object_id: str,
+        position: QPointF,
+    ) -> bool:
+        """Update live drag feedback and schedule only necessary repaints."""
+
+        slot_preview = self._drag_slot_preview_at(object_id, position)
+        if slot_preview != self._drag_slot_preview:
+            self._drag_slot_preview = slot_preview
+            self.update()
+        return slot_preview is not None
+
+    def _clear_drag_slot_preview(self) -> None:
+        """Clear transient drag state without touching persisted placements."""
+
+        if self._drag_slot_preview is None:
+            return
+        self._drag_slot_preview = None
+        self.update()
+
+    def _paint_drag_slot_preview(
+        self,
+        painter: QPainter,
+        atlas_rect: QRectF,
+    ) -> None:
+        """Paint a translucent source footprint and valid/blocked feedback."""
+
+        slot_preview = self._drag_slot_preview
+        atlas = self._atlas
+        if slot_preview is None or atlas is None:
+            return
+        preview_image = self._source_preview_images.get(slot_preview.object_id)
+        if preview_image is None:
+            return
+        preview_rect = _atlas_slot_preview_rect(
+            slot_preview.x,
+            slot_preview.y,
+            slot_preview.size,
+            atlas.resolution,
+            atlas_rect,
+        )
+        fill_color = (
+            PREVIEW_DRAG_VALID_FILL_COLOR
+            if slot_preview.is_valid
+            else PREVIEW_DRAG_BLOCKED_FILL_COLOR
+        )
+        border_color = (
+            PREVIEW_DRAG_VALID_BORDER_COLOR
+            if slot_preview.is_valid
+            else PREVIEW_DRAG_BLOCKED_BORDER_COLOR
+        )
+
+        painter.save()
+        painter.setClipRect(atlas_rect)
+        painter.setOpacity(PREVIEW_DRAG_IMAGE_OPACITY)
+        painter.drawImage(preview_rect, preview_image)
+        painter.restore()
+        clipped_rect = preview_rect.intersected(atlas_rect)
+        painter.fillRect(clipped_rect, fill_color)
+        border_pen = QPen(border_color, 3.0)
+        if not slot_preview.is_valid:
+            border_pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(border_pen)
+        painter.drawRect(clipped_rect)
+        if not slot_preview.is_valid:
+            painter.drawLine(
+                QLineF(clipped_rect.topLeft(), clipped_rect.bottomRight())
+            )
+            painter.drawLine(
+                QLineF(clipped_rect.topRight(), clipped_rect.bottomLeft())
+            )
 
     @staticmethod
     def _paint_quadtree_grid(
@@ -557,7 +785,10 @@ class TextureAtlasPreview(QWidget):
         atlas_resolution: int,
     ) -> None:
         painter.setPen(QPen(PREVIEW_GRID_COLOR, 1.0))
-        smallest_cell_count = max(1, int(atlas_resolution) // 512)
+        smallest_cell_count = max(
+            1,
+            int(atlas_resolution) // ATLAS_BASE_CELL_SIZE,
+        )
         cell_size = atlas_rect.width() / smallest_cell_count
         for index in range(1, smallest_cell_count):
             position = index * cell_size
@@ -1449,13 +1680,16 @@ class TextureAtlasWorkspace(QWidget):
         object_id: str,
         direction: int,
     ) -> None:
-        """Select and resize the texture directly beneath a wheel event."""
+        """Resize the currently selected texture for every wheel event."""
 
         if int(direction) == 0:
             return
+        selected_object_id = self._selected_object_id()
+        if selected_object_id is None:
+            return
+        object_id = selected_object_id
         self._is_handling_object_click = True
         try:
-            self._select_object_row(object_id)
             atlas = self.selected_atlas
             placement = (
                 None if atlas is None else atlas.placement_for_object(object_id)
@@ -1657,13 +1891,13 @@ class TextureAtlasWorkspace(QWidget):
                 self.object_list.setCurrentRow(0)
         finally:
             self._is_syncing = was_syncing
-        self.object_list.set_wheel_resize_object_ids(
-            {
-                placement.object_id
-                for placement in (() if atlas is None else atlas.placements)
-                if not self._source_has_fixed_resolution(placement.object_id)
-            }
-        )
+        wheel_resize_object_ids = {
+            placement.object_id
+            for placement in (() if atlas is None else atlas.placements)
+            if not self._source_has_fixed_resolution(placement.object_id)
+        }
+        self.object_list.set_wheel_resize_object_ids(wheel_resize_object_ids)
+        self.preview.set_wheel_resize_object_ids(wheel_resize_object_ids)
         self._sync_controls()
 
     def _refresh_preview(self) -> None:
@@ -2118,6 +2352,24 @@ def _placement_preview_rect(
         atlas_rect.top() + placement.y * scale,
         placement.size * scale,
         placement.size * scale,
+    )
+
+
+def _atlas_slot_preview_rect(
+    x: int,
+    y: int,
+    size: int,
+    atlas_resolution: int,
+    atlas_rect: QRectF,
+) -> QRectF:
+    """Map one snapped Atlas slot into widget preview coordinates."""
+
+    scale = atlas_rect.width() / float(atlas_resolution)
+    return QRectF(
+        atlas_rect.left() + int(x) * scale,
+        atlas_rect.top() + int(y) * scale,
+        int(size) * scale,
+        int(size) * scale,
     )
 
 

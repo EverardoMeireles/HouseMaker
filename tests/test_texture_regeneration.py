@@ -894,11 +894,6 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
         original_paths = _record_variant_paths(original)
         original_bytes = _asset_bytes(self.asset_directory, original_paths)
         expected_reference = self._load_reference(frame_index=1)
-        self.workspace.paint_texture_mask_button.setChecked(True)
-        self.assertTrue(
-            self.workspace.result_view.view.texture_inpaint_enabled
-        )
-
         first_variants = _texture_variants(1)
         second_variants = _texture_variants(2)
         first_result = MeshyGenerationResult(
@@ -931,10 +926,6 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
         generated = QSignalSpy(self.workspace.generation_completed)
 
         self.assertTrue(self.workspace.regenerate_selected_object_texture())
-        self.assertFalse(self.workspace.paint_texture_mask_button.isChecked())
-        self.assertFalse(
-            self.workspace.result_view.view.texture_inpaint_enabled
-        )
         self._wait_until_idle()
 
         self.assertEqual(len(regenerator.requests), 1)

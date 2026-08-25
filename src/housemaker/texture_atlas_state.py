@@ -18,6 +18,7 @@ import numpy as np
 # ### Constants ###
 ATLAS_RESOLUTIONS = frozenset({2048, 4096})
 OBJECT_TEXTURE_RESOLUTIONS = frozenset({512, 1024, 2048})
+ATLAS_BASE_CELL_SIZE = 512
 MAX_ATLAS_COUNT = 1_000
 MAX_ATLAS_NAME_LENGTH = 200
 MAX_ATLAS_OBJECT_COUNT = 4_096
@@ -575,16 +576,20 @@ def _find_available_placement(
     """Find one aligned slot while treating every other placement as fixed."""
 
     positions = [] if preferred_position is None else [preferred_position]
-    positions.extend(
-        position
-        for position in _iter_quad_slot_positions(
-            0,
-            0,
-            int(atlas_resolution),
-            int(texture_resolution),
-        )
-        if position != preferred_position
-    )
+    for position in _iter_quad_slot_positions(
+        0,
+        0,
+        int(atlas_resolution),
+        int(texture_resolution),
+    ):
+        if position not in positions:
+            positions.append(position)
+    for position in _iter_base_grid_positions(
+        int(atlas_resolution),
+        int(texture_resolution),
+    ):
+        if position not in positions:
+            positions.append(position)
     for x, y in positions:
         try:
             candidate = TextureAtlasPlacement(
@@ -631,6 +636,18 @@ def _iter_quad_slot_positions(
             half_size,
             requested_size,
         )
+
+
+def _iter_base_grid_positions(
+    atlas_resolution: int,
+    requested_size: int,
+) -> Iterator[tuple[int, int]]:
+    """Yield every in-bounds origin on the shared 512-pixel Atlas grid."""
+
+    maximum_origin = int(atlas_resolution) - int(requested_size)
+    for y in range(0, maximum_origin + 1, ATLAS_BASE_CELL_SIZE):
+        for x in range(0, maximum_origin + 1, ATLAS_BASE_CELL_SIZE):
+            yield (x, y)
 
 
 # ### Validation helpers ###
@@ -706,9 +723,12 @@ def _validate_placements_fit(
     placements: list[TextureAtlasPlacement],
 ) -> None:
     for placement in placements:
-        if placement.x % placement.size or placement.y % placement.size:
+        if (
+            placement.x % ATLAS_BASE_CELL_SIZE
+            or placement.y % ATLAS_BASE_CELL_SIZE
+        ):
             raise ValueError(
-                "Texture atlas placement must align to its texture-size grid."
+                "Texture atlas placement must align to the 512-pixel grid."
             )
         if (
             placement.x + placement.size > atlas_resolution

@@ -19,8 +19,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PIL import Image
+from PySide6.QtCore import Qt
 from PySide6.QtTest import QSignalSpy, QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QListWidgetItem, QMessageBox
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.camera_models import CameraPose, InitialFirstPersonCamera
@@ -191,6 +192,31 @@ def _surface_assignment_with_variants(
         texture_variants=tuple(variants),
         selected_texture_resolution=selected_resolution,
     )
+
+
+def _other_texture_entry_ids(
+    workspace: SurfaceTextureGenerationWorkspace,
+) -> list[str]:
+    return [
+        str(
+            workspace.other_texture_list.item(row).data(
+                Qt.ItemDataRole.UserRole
+            )
+        )
+        for row in range(workspace.other_texture_list.count())
+    ]
+
+
+def _other_texture_item(
+    workspace: SurfaceTextureGenerationWorkspace,
+    assignment_id: str,
+) -> QListWidgetItem:
+    expected_id = f"{assignment_id}:other-texture"
+    for row in range(workspace.other_texture_list.count()):
+        item = workspace.other_texture_list.item(row)
+        if item.data(Qt.ItemDataRole.UserRole) == expected_id:
+            return item
+    raise AssertionError(f"Missing other texture item: {assignment_id}")
 
 
 # ### Provider fixtures ###
@@ -551,6 +577,716 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
 
         self.assertEqual(self.workspace.texture_view.entries, ())
         self.assertIsNone(self.workspace.texture_view.selected_atlas_id)
+
+    def test_other_texture_library_filters_and_tracks_surface_selection(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        first_wall = "level:2/room:5/wall:1:2"
+        second_wall = "level:2/room:5/wall:2:3"
+        untextured_wall = "level:2/room:5/wall:3:4"
+        legacy_wall = "level:2/room:5/wall:1:4"
+        floor = "level:2/room:5/floor"
+        current_wall_assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "current-wall",
+            (first_wall,),
+            selected_resolution=1024,
+        )
+        other_wall_assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "other-wall",
+            (second_wall,),
+            selected_resolution=2048,
+        )
+        legacy_asset_path = "legacy-wall.png"
+        Image.new("RGBA", (13, 9), (70, 90, 210, 255)).save(
+            asset_directory / legacy_asset_path,
+            format="PNG",
+        )
+        legacy_wall_assignment = _surface_assignment(
+            "legacy-wall",
+            (legacy_wall,),
+            legacy_asset_path,
+        )
+        floor_assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "floor-texture",
+            (floor,),
+            surface_type="floor",
+        )
+        self.workspace.set_data(
+            SurfaceTextureData(
+                selected_surface_type="wall",
+                selected_surface_ids=(first_wall,),
+                assignments=[
+                    current_wall_assignment,
+                    other_wall_assignment,
+                    legacy_wall_assignment,
+                    floor_assignment,
+                ],
+            )
+        )
+
+        self.assertEqual(self.workspace.texture_views_splitter.count(), 2)
+        self.assertEqual(
+            _other_texture_entry_ids(self.workspace),
+            [
+                "other-wall:other-texture",
+                "legacy-wall:other-texture",
+            ],
+        )
+        other_item = _other_texture_item(self.workspace, "other-wall")
+        self.assertEqual(other_item.text(), "Wall texture - 2048 x 2048")
+        self.assertIn("Provider: Meshy", other_item.toolTip())
+        self.assertIn("Double-click to apply", other_item.toolTip())
+        legacy_item = _other_texture_item(self.workspace, "legacy-wall")
+        self.assertEqual(legacy_item.text(), "Wall texture - fixed image")
+        self.assertIn(
+            "Fixed image: 13 x 9 (no resolution variants)",
+            legacy_item.toolTip(),
+        )
+
+        self.workspace.surface_view.set_selected_surface_ids((second_wall,))
+
+        self.assertEqual(
+            self.workspace.texture_view.selected_atlas_id,
+            "other-wall:resolution:2048",
+        )
+        self.assertEqual(
+            _other_texture_entry_ids(self.workspace),
+            [
+                "current-wall:other-texture",
+                "legacy-wall:other-texture",
+            ],
+        )
+
+        self.workspace.surface_view.set_selected_surface_ids(
+            (untextured_wall,)
+        )
+
+        self.assertEqual(self.workspace.texture_view.entries, ())
+        self.assertEqual(
+            _other_texture_entry_ids(self.workspace),
+            [
+                "current-wall:other-texture",
+                "other-wall:other-texture",
+                "legacy-wall:other-texture",
+            ],
+        )
+
+        self.workspace.surface_view.set_selected_surface_ids((legacy_wall,))
+
+        self.assertEqual(self.workspace.texture_view.entries, ())
+        self.assertEqual(
+            _other_texture_entry_ids(self.workspace),
+            [
+                "current-wall:other-texture",
+                "other-wall:other-texture",
+            ],
+        )
+
+    def test_delete_current_texture_family_clears_state_assets_and_viewer(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        target_surface = "level:2/room:5/wall:1:2"
+        retained_surface = "level:2/room:5/wall:2:3"
+        target = _surface_assignment_with_variants(
+            asset_directory,
+            "delete-plaster",
+            (target_surface,),
+        )
+        retained = _surface_assignment_with_variants(
+            asset_directory,
+            "keep-brick",
+            (retained_surface,),
+        )
+        target_stroke = _test_stroke(0.25)
+        retained_stroke = _test_stroke(0.75)
+        self.workspace.set_data(
+            SurfaceTextureData(
+                selected_surface_type="wall",
+                selected_surface_ids=(target_surface,),
+                assignments=[target, retained],
+                texture_mask_strokes={
+                    target_surface: [target_stroke],
+                    retained_surface: [retained_stroke],
+                },
+                localized_inpaint_undo_stack=[
+                    SurfaceTextureInpaintUndoSnapshot(
+                        previous_assignments=(target,),
+                        replacement_assignment_ids=("localized-edit",),
+                        affected_surface_ids=(target_surface,),
+                    )
+                ],
+            )
+        )
+        event_order: list[str] = []
+        removed = QSignalSpy(self.workspace.assignments_removed)
+        changed = QSignalSpy(self.workspace.data_changed)
+        content_changed = QSignalSpy(self.workspace.surface_content_changed)
+        self.workspace.assignments_removed.connect(
+            lambda _ids: event_order.append("removed")
+        )
+        self.workspace.data_changed.connect(
+            lambda _data: event_order.append("data")
+        )
+        self.workspace.surface_content_changed.connect(
+            lambda: event_order.append("content")
+        )
+
+        self.assertTrue(
+            self.workspace.delete_assignment_texture("delete-plaster")
+        )
+
+        data = self.workspace.get_data()
+        self.assertEqual(
+            [assignment.assignment_id for assignment in data.assignments],
+            ["keep-brick"],
+        )
+        self.assertEqual(
+            data.texture_mask_strokes,
+            {retained_surface: [retained_stroke]},
+        )
+        self.assertEqual(data.localized_inpaint_undo_stack, [])
+        self.assertEqual(tuple(removed.at(0)[0]), ("delete-plaster",))
+        self.assertEqual(changed.count(), 1)
+        self.assertEqual(content_changed.count(), 1)
+        self.assertEqual(event_order, ["removed", "data", "content"])
+        self.assertIsNone(
+            self.workspace.surface_view.get_surface_texture_rgba(
+                target_surface
+            )
+        )
+        self.assertIsNotNone(
+            self.workspace.surface_view.get_surface_texture_rgba(
+                retained_surface
+            )
+        )
+        self.assertEqual(self.workspace.texture_view.entries, ())
+        self.assertTrue(
+            all(
+                not (
+                    asset_directory
+                    / f"delete-plaster.texture-{resolution}.png"
+                ).exists()
+                for resolution in SURFACE_TEXTURE_RESOLUTIONS
+            )
+        )
+        self.assertTrue(
+            all(
+                (
+                    asset_directory
+                    / f"keep-brick.texture-{resolution}.png"
+                ).is_file()
+                for resolution in SURFACE_TEXTURE_RESOLUTIONS
+            )
+        )
+
+    def test_delete_key_targets_explicit_other_texture_after_confirmation(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        current_surface = "level:2/room:5/wall:1:2"
+        other_surface = "level:2/room:5/wall:2:3"
+        current = _surface_assignment_with_variants(
+            asset_directory,
+            "current-wall",
+            (current_surface,),
+        )
+        other = _surface_assignment_with_variants(
+            asset_directory,
+            "other-wall",
+            (other_surface,),
+        )
+        self.workspace.set_data(
+            SurfaceTextureData(
+                selected_surface_type="wall",
+                selected_surface_ids=(current_surface,),
+                assignments=[current, other],
+            )
+        )
+        item = _other_texture_item(self.workspace, "other-wall")
+        self.workspace.other_texture_list.setCurrentItem(item)
+        item.setSelected(True)
+
+        with patch.object(
+            QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Cancel,
+        ) as question:
+            QTest.keyClick(
+                self.workspace.other_texture_list,
+                Qt.Key.Key_Delete,
+            )
+        self.assertEqual(len(self.workspace.get_data().assignments), 2)
+        self.assertIn("other-wall", question.call_args.args[2])
+
+        with patch.object(
+            QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            QTest.keyClick(
+                self.workspace.other_texture_list,
+                Qt.Key.Key_Delete,
+            )
+
+        self.assertEqual(
+            [
+                assignment.assignment_id
+                for assignment in self.workspace.get_data().assignments
+            ],
+            ["current-wall"],
+        )
+        self.assertEqual(
+            self.workspace.texture_view.selected_atlas_id,
+            "current-wall:resolution:1024",
+        )
+
+    def test_surface_change_clears_stale_other_texture_deletion_target(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        surfaces = (
+            "level:2/room:5/wall:1:2",
+            "level:2/room:5/wall:2:3",
+            "level:2/room:5/wall:3:4",
+        )
+        assignments = [
+            _surface_assignment_with_variants(
+                asset_directory,
+                assignment_id,
+                (surface_id,),
+            )
+            for assignment_id, surface_id in zip(
+                ("first-wall", "stale-other", "latest-wall"),
+                surfaces,
+                strict=True,
+            )
+        ]
+        self.workspace.set_data(
+            SurfaceTextureData(
+                selected_surface_type="wall",
+                selected_surface_ids=(surfaces[0],),
+                assignments=assignments,
+            )
+        )
+        stale_item = _other_texture_item(self.workspace, "stale-other")
+        self.workspace.other_texture_list.setCurrentItem(stale_item)
+        stale_item.setSelected(True)
+        self.assertEqual(
+            self.workspace._selected_texture_assignment_id_for_deletion(),
+            "stale-other",
+        )
+
+        self.workspace.surface_view.set_selected_surface_ids((surfaces[2],))
+
+        self.assertFalse(self.workspace.other_texture_list.selectedItems())
+        self.assertEqual(
+            self.workspace._selected_texture_assignment_id_for_deletion(),
+            "latest-wall",
+        )
+
+    def test_delete_legacy_texture_keeps_shared_asset_and_overlap_mask(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(parents=True, exist_ok=True)
+        first_surface = "level:2/room:5/wall:1:2"
+        shared_surface = "level:2/room:5/wall:2:3"
+        shared_path = "shared-legacy.png"
+        Image.new("RGBA", (13, 9), (70, 90, 210, 255)).save(
+            asset_directory / shared_path,
+            format="PNG",
+        )
+        deleted = _surface_assignment(
+            "legacy-delete",
+            (first_surface, shared_surface),
+            shared_path,
+        )
+        retained = _surface_assignment(
+            "legacy-retained",
+            (shared_surface,),
+            shared_path,
+        )
+        first_stroke = _test_stroke(0.25)
+        shared_stroke = _test_stroke(0.75)
+        self.workspace.set_data(
+            SurfaceTextureData(
+                selected_surface_type="wall",
+                selected_surface_ids=(first_surface,),
+                assignments=[deleted, retained],
+                texture_mask_strokes={
+                    first_surface: [first_stroke],
+                    shared_surface: [shared_stroke],
+                },
+            )
+        )
+        self.assertEqual(self.workspace.texture_view.entries, ())
+        self.assertTrue(self.workspace.delete_texture_button.isEnabled())
+
+        self.assertTrue(
+            self.workspace.delete_assignment_texture("legacy-delete")
+        )
+
+        self.assertTrue((asset_directory / shared_path).is_file())
+        self.assertEqual(
+            self.workspace.get_data().texture_mask_strokes,
+            {shared_surface: [shared_stroke]},
+        )
+        self.assertIsNone(
+            self.workspace.surface_view.get_surface_texture_rgba(first_surface)
+        )
+        self.assertIsNotNone(
+            self.workspace.surface_view.get_surface_texture_rgba(shared_surface)
+        )
+
+        self.assertTrue(
+            self.workspace.delete_assignment_texture("legacy-retained")
+        )
+        self.assertFalse((asset_directory / shared_path).exists())
+
+    def test_delete_texture_rolls_back_viewer_failure_and_gates_invalid_calls(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        surface_id = "level:2/room:5/wall:1:2"
+        assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "rollback-wall",
+            (surface_id,),
+        )
+        self.workspace.set_data(
+            SurfaceTextureData(
+                selected_surface_type="wall",
+                selected_surface_ids=(surface_id,),
+                assignments=[assignment],
+            )
+        )
+        changed = QSignalSpy(self.workspace.data_changed)
+        removed = QSignalSpy(self.workspace.assignments_removed)
+
+        with patch.object(
+            self.workspace.surface_view,
+            "clear_surface_textures",
+            side_effect=[ValueError("viewer failed"), None],
+        ):
+            self.assertFalse(
+                self.workspace.delete_assignment_texture("rollback-wall")
+            )
+
+        self.assertEqual(self.workspace.get_data().assignments, [assignment])
+        self.assertEqual(changed.count(), 0)
+        self.assertEqual(removed.count(), 0)
+        self.assertIsNotNone(
+            self.workspace.surface_view.get_surface_texture_rgba(surface_id)
+        )
+        self.assertTrue(
+            all(
+                (
+                    asset_directory
+                    / f"rollback-wall.texture-{resolution}.png"
+                ).is_file()
+                for resolution in SURFACE_TEXTURE_RESOLUTIONS
+            )
+        )
+        self.assertFalse(
+            self.workspace.delete_assignment_texture("missing-family")
+        )
+        with patch.object(
+            SurfaceTextureGenerationWorkspace,
+            "is_generating",
+            property(lambda _workspace: True),
+        ):
+            self.assertFalse(
+                self.workspace.delete_assignment_texture("rollback-wall")
+            )
+
+        self.workspace.surface_view.set_selected_surface_ids(())
+        self.assertFalse(self.workspace.delete_texture_button.isEnabled())
+
+    def test_delete_texture_asset_cleanup_failure_is_nonfatal(self) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(parents=True, exist_ok=True)
+        surface_id = "level:2/room:5/wall:1:2"
+        asset_path = "locked-legacy.png"
+        Image.new("RGBA", (13, 9), (70, 90, 210, 255)).save(
+            asset_directory / asset_path,
+            format="PNG",
+        )
+        assignment = _surface_assignment(
+            "locked-legacy",
+            (surface_id,),
+            asset_path,
+        )
+        self.workspace.set_data(
+            SurfaceTextureData(
+                selected_surface_type="wall",
+                selected_surface_ids=(surface_id,),
+                assignments=[assignment],
+            )
+        )
+
+        with patch.object(Path, "unlink", side_effect=PermissionError("locked")):
+            self.assertTrue(
+                self.workspace.delete_assignment_texture("locked-legacy")
+            )
+
+        self.assertEqual(self.workspace.get_data().assignments, [])
+        self.assertTrue((asset_directory / asset_path).is_file())
+        self.assertIn(
+            "1 unused texture file(s) could not be deleted",
+            self.workspace.status_label.text(),
+        )
+
+    def test_double_clicked_other_texture_uses_assignment_transaction(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        target_surface = "level:2/room:5/wall:1:2"
+        source_surface = "level:2/room:5/wall:2:3"
+        replaced_assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "replaced-plaster",
+            (target_surface,),
+            color=(180, 40, 30, 255),
+        )
+        reusable_assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "reusable-brick",
+            (source_surface,),
+            color=(20, 170, 90, 255),
+        )
+        target_stroke = _test_stroke(0.25)
+        source_stroke = _test_stroke(0.75)
+        self.workspace.set_data(
+            SurfaceTextureData(
+                selected_surface_type="wall",
+                selected_surface_ids=(target_surface,),
+                texture_mask_strokes={
+                    target_surface: [target_stroke],
+                    source_surface: [source_stroke],
+                },
+                assignments=[replaced_assignment, reusable_assignment],
+                localized_inpaint_undo_stack=[
+                    SurfaceTextureInpaintUndoSnapshot(
+                        previous_assignments=(replaced_assignment,),
+                        replacement_assignment_ids=("localized-edit",),
+                        affected_surface_ids=(target_surface,),
+                        previous_texture_mask_strokes={
+                            target_surface: (target_stroke,),
+                        },
+                    )
+                ],
+            )
+        )
+        removed = QSignalSpy(self.workspace.assignments_removed)
+        changed = QSignalSpy(self.workspace.data_changed)
+        content_changed = QSignalSpy(self.workspace.surface_content_changed)
+        item = _other_texture_item(self.workspace, "reusable-brick")
+
+        self.workspace.other_texture_list.itemDoubleClicked.emit(item)
+        _qt_application.processEvents()
+
+        data = self.workspace.get_data()
+        self.assertEqual(len(data.assignments), 1)
+        selected_assignment = data.assignments[0]
+        self.assertEqual(selected_assignment.assignment_id, "reusable-brick")
+        self.assertEqual(
+            selected_assignment.surface_ids,
+            (source_surface, target_surface),
+        )
+        self.assertEqual(
+            data.texture_mask_strokes,
+            {source_surface: [source_stroke]},
+        )
+        self.assertEqual(data.localized_inpaint_undo_stack, [])
+        self.assertEqual(tuple(removed.at(0)[0]), ("replaced-plaster",))
+        self.assertEqual(changed.count(), 1)
+        self.assertEqual(content_changed.count(), 1)
+        target_texture = self.workspace.surface_view.get_surface_texture_rgba(
+            target_surface
+        )
+        self.assertIsNotNone(target_texture)
+        self.assertEqual(target_texture.shape[:2], (1024, 1024))
+        self.assertEqual(
+            self.workspace.texture_view.selected_atlas_id,
+            "reusable-brick:resolution:1024",
+        )
+        self.assertEqual(self.workspace.other_texture_list.count(), 0)
+        self.assertTrue(
+            all(
+                not (
+                    asset_directory
+                    / f"replaced-plaster.texture-{resolution}.png"
+                ).exists()
+                for resolution in SURFACE_TEXTURE_RESOLUTIONS
+            )
+        )
+
+    def test_double_clicked_legacy_texture_preserves_fixed_asset_metadata(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(parents=True, exist_ok=True)
+        target_surface = "level:2/room:5/wall:1:2"
+        source_surface = "level:2/room:5/wall:2:3"
+        replaced_assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "replaced-wall",
+            (target_surface,),
+        )
+        legacy_asset_path = "legacy-stone.png"
+        Image.new("RGBA", (11, 6), (25, 140, 190, 255)).save(
+            asset_directory / legacy_asset_path,
+            format="PNG",
+        )
+        legacy_assignment = _surface_assignment(
+            "legacy-stone",
+            (source_surface,),
+            legacy_asset_path,
+        )
+        target_stroke = _test_stroke(0.25)
+        self.workspace.set_data(
+            SurfaceTextureData(
+                selected_surface_type="wall",
+                selected_surface_ids=(target_surface,),
+                texture_mask_strokes={target_surface: [target_stroke]},
+                assignments=[replaced_assignment, legacy_assignment],
+                localized_inpaint_undo_stack=[
+                    SurfaceTextureInpaintUndoSnapshot(
+                        previous_assignments=(replaced_assignment,),
+                        replacement_assignment_ids=("localized-edit",),
+                        affected_surface_ids=(target_surface,),
+                        previous_texture_mask_strokes={
+                            target_surface: (target_stroke,),
+                        },
+                    )
+                ],
+            )
+        )
+        removed = QSignalSpy(self.workspace.assignments_removed)
+        changed = QSignalSpy(self.workspace.data_changed)
+        content_changed = QSignalSpy(self.workspace.surface_content_changed)
+        item = _other_texture_item(self.workspace, "legacy-stone")
+
+        self.workspace.other_texture_list.itemDoubleClicked.emit(item)
+        _qt_application.processEvents()
+
+        data = self.workspace.get_data()
+        self.assertEqual(len(data.assignments), 1)
+        applied = data.assignments[0]
+        self.assertEqual(applied.assignment_id, "legacy-stone")
+        self.assertEqual(
+            applied.surface_ids,
+            (source_surface, target_surface),
+        )
+        self.assertEqual(applied.asset_path, legacy_asset_path)
+        self.assertEqual(applied.texture_variants, ())
+        self.assertIsNone(applied.selected_texture_resolution)
+        self.assertIsNone(applied.texture_width)
+        self.assertIsNone(applied.texture_height)
+        self.assertEqual(data.texture_mask_strokes, {})
+        self.assertEqual(data.localized_inpaint_undo_stack, [])
+        self.assertEqual(tuple(removed.at(0)[0]), ("replaced-wall",))
+        self.assertEqual(changed.count(), 1)
+        self.assertEqual(content_changed.count(), 1)
+        texture = self.workspace.surface_view.get_surface_texture_rgba(
+            target_surface
+        )
+        self.assertIsNotNone(texture)
+        self.assertEqual(texture.shape[:2], (6, 11))
+        self.assertEqual(self.workspace.texture_view.entries, ())
+        self.assertEqual(self.workspace.other_texture_list.count(), 0)
+        self.assertTrue((asset_directory / legacy_asset_path).is_file())
+        self.assertTrue(
+            all(
+                not (
+                    asset_directory
+                    / f"replaced-wall.texture-{resolution}.png"
+                ).exists()
+                for resolution in SURFACE_TEXTURE_RESOLUTIONS
+            )
+        )
+
+    def test_other_texture_busy_and_missing_asset_are_no_ops(self) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        target_surface = "level:2/room:5/wall:1:2"
+        source_surface = "level:2/room:5/wall:2:3"
+        target_assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "target-wall",
+            (target_surface,),
+        )
+        source_assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "source-wall",
+            (source_surface,),
+        )
+        self.workspace.set_data(
+            SurfaceTextureData(
+                selected_surface_type="wall",
+                selected_surface_ids=(target_surface,),
+                assignments=[target_assignment, source_assignment],
+            )
+        )
+        item = _other_texture_item(self.workspace, "source-wall")
+        before = self.workspace.get_data().to_dict()
+        changed = QSignalSpy(self.workspace.data_changed)
+
+        with patch.object(
+            SurfaceTextureGenerationWorkspace,
+            "is_generating",
+            property(lambda _workspace: True),
+        ):
+            self.workspace._handle_other_texture_activated(item)
+
+        self.assertEqual(self.workspace.get_data().to_dict(), before)
+        self.assertEqual(changed.count(), 0)
+
+        (asset_directory / source_assignment.asset_path).unlink()
+        self.workspace._handle_other_texture_activated(item)
+
+        self.assertEqual(self.workspace.get_data().to_dict(), before)
+        self.assertEqual(changed.count(), 0)
+        self.assertIn("could not be applied", self.workspace.status_label.text())
+
+    def test_other_texture_decode_error_is_a_no_op(self) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        target_surface = "level:2/room:5/wall:1:2"
+        source_surface = "level:2/room:5/wall:2:3"
+        target_assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "target-wall",
+            (target_surface,),
+        )
+        source_assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "source-wall",
+            (source_surface,),
+        )
+        self.workspace.set_data(
+            SurfaceTextureData(
+                selected_surface_type="wall",
+                selected_surface_ids=(target_surface,),
+                assignments=[target_assignment, source_assignment],
+            )
+        )
+        item = _other_texture_item(self.workspace, "source-wall")
+        before = self.workspace.get_data().to_dict()
+        changed = QSignalSpy(self.workspace.data_changed)
+
+        with patch(
+            "housemaker.surface_texture_workspace._decode_png_rgba",
+            side_effect=ValueError("invalid texture"),
+        ):
+            self.workspace._handle_other_texture_activated(item)
+
+        self.assertEqual(self.workspace.get_data().to_dict(), before)
+        self.assertEqual(changed.count(), 0)
+        self.assertIn("could not be applied", self.workspace.status_label.text())
 
     def test_double_clicked_variant_applies_family_to_selected_surfaces(
         self,

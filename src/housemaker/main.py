@@ -377,9 +377,6 @@ class BlueprintWorkspace(QWidget):
         self.generation.data_changed.connect(
             self._handle_generation_data_changed_for_atlases
         )
-        self.generation.texture_inpaint_completed.connect(
-            self._handle_generated_object_changed_for_atlases
-        )
         self.generation.generated_object_changed.connect(
             self._handle_generated_object_changed_for_atlases
         )

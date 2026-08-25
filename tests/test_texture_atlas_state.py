@@ -129,6 +129,67 @@ class TextureAtlasStateTests(unittest.TestCase):
         )
         self.assertEqual(TextureAtlasData.from_dict(data.to_dict()), data)
 
+    def test_large_manual_placements_use_the_shared_512_pixel_grid(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Manual", 4096, atlas_id="atlas-a")
+
+        medium = data.place_object_at(
+            atlas.atlas_id,
+            "medium",
+            "textures/medium.png",
+            1024,
+            512,
+            512,
+        )
+        large = data.place_object_at(
+            atlas.atlas_id,
+            "large",
+            "textures/large.png",
+            2048,
+            1536,
+            512,
+        )
+
+        self.assertEqual((medium.x, medium.y, medium.size), (512, 512, 1024))
+        self.assertEqual((large.x, large.y, large.size), (1536, 512, 2048))
+        self.assertEqual(TextureAtlasData.from_dict(data.to_dict()), data)
+
+    def test_assignment_uses_an_offset_base_grid_gap_as_fallback(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Offset gap", 2048, atlas_id="atlas-a")
+        border_positions = (
+            (0, 0),
+            (512, 0),
+            (1024, 0),
+            (1536, 0),
+            (0, 512),
+            (1536, 512),
+            (0, 1024),
+            (1536, 1024),
+            (0, 1536),
+            (512, 1536),
+            (1024, 1536),
+            (1536, 1536),
+        )
+        for index, (x, y) in enumerate(border_positions):
+            data.place_object_at(
+                atlas.atlas_id,
+                f"border-{index}",
+                f"textures/border-{index}.png",
+                512,
+                x,
+                y,
+            )
+
+        placement = data.assign_object(
+            atlas.atlas_id,
+            "center",
+            "textures/center.png",
+            1024,
+        )
+
+        self.assertEqual((placement.x, placement.y), (512, 512))
+
     def test_manual_placement_rejects_grid_bounds_and_collisions_atomically(
         self,
     ) -> None:
@@ -144,7 +205,7 @@ class TextureAtlasStateTests(unittest.TestCase):
         )
         before = data.clone()
 
-        with self.assertRaisesRegex(ValueError, "texture-size grid"):
+        with self.assertRaisesRegex(ValueError, "512-pixel grid"):
             data.place_object_at(
                 atlas.atlas_id,
                 "misaligned",

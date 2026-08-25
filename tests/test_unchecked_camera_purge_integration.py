@@ -516,11 +516,11 @@ class UncheckedCameraFacePurgeWorkspaceTests(unittest.TestCase):
         )
         self.assertLess(
             self.workspace.generate_texture_button.geometry().left(),
-            self.workspace.undo_object_change_button.geometry().left(),
+            self.workspace.purge_faces_button.geometry().left(),
         )
         self.assertLess(
-            self.workspace.undo_object_change_button.geometry().left(),
             self.workspace.purge_faces_button.geometry().left(),
+            self.workspace.undo_object_change_button.geometry().left(),
         )
         self.assertLess(
             self.workspace.generate_button.geometry().left() + 30,
@@ -595,10 +595,6 @@ class UncheckedCameraFacePurgeWorkspaceTests(unittest.TestCase):
         )
         self.workspace._data.generated_objects[0] = marked_record
         self.workspace._refresh_generated_objects_list(marked_record.object_id)
-        self.workspace.paint_texture_mask_button.setChecked(True)
-        self.assertTrue(
-            self.workspace.result_view.view.texture_inpaint_enabled
-        )
         self._uncheck("neg_x", "bottom")
         old_paths = _record_variant_paths(marked_record)
 
@@ -633,12 +629,6 @@ class UncheckedCameraFacePurgeWorkspaceTests(unittest.TestCase):
             ),
         ):
             self.assertTrue(self.workspace.purge_selected_object_faces())
-            self.assertFalse(
-                self.workspace.paint_texture_mask_button.isChecked()
-            )
-            self.assertFalse(
-                self.workspace.result_view.view.texture_inpaint_enabled
-            )
             self._wait_until_idle()
 
         self.assertEqual(
