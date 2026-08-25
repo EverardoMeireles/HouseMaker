@@ -10,7 +10,9 @@ from itertools import permutations
 from pathlib import Path
 
 import numpy as np
+import shapely
 import trimesh
+from shapely import Polygon
 from PySide6.QtCore import QByteArray, QBuffer, QIODevice, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage, QPainter, QPen
 from trimesh.visual.material import PBRMaterial
@@ -66,6 +68,8 @@ ROOM_TEXTURE_INDICATOR_BACKGROUND_COLOR = QColor(10, 12, 16, 180)
 ROOM_TEXTURE_INDICATOR_TEXT_COLOR = QColor("#f5f7fa")
 ROOM_TEXTURE_MIN_FONT_SIZE = 8
 ROOM_TEXTURE_MAX_FONT_SIZE = 32
+SURFACE_FACE_MATCH_DECIMALS = 7
+SURFACE_FACE_COVERAGE_EPSILON = 1e-9
 FALLBACK_QT_PLATFORM = "offscreen"
 WALL_OPENING_EPSILON = 1e-6
 WALL_REVEAL_PARALLEL_COSINE = math.cos(math.radians(10.0))
@@ -124,6 +128,7 @@ class PreviewTexturedSurface:
     level_index: int | None = None
     room_index: int | None = None
     wall_key: str | None = None
+    double_sided: bool = False
 
 
 @dataclass(frozen=True)
@@ -256,8 +261,9 @@ def convert_to_glb(
     )
     if not surface_materials:
         return model
-    return _apply_surface_material_overlays(
+    return _apply_surface_materials(
         model=model,
+        named_meshes=named_meshes,
         level_source=level_source,
         surface_materials=surface_materials,
         surface_texture_world_size_meters=(
@@ -1429,8 +1435,9 @@ def _get_stair_object_name(stair_index: int, stair: StairData) -> str:
     return f"stair_{stair_index}_{stair.style}"
 
 
-def _apply_surface_material_overlays(
+def _apply_surface_materials(
     model: GeneratedModel,
+    named_meshes: Sequence[NamedMesh],
     level_source: VertexData | Sequence[LevelData],
     surface_materials: Mapping[
         str,
@@ -1439,7 +1446,7 @@ def _apply_surface_material_overlays(
     surface_texture_world_size_meters: float,
     surface_overlay_planes: Sequence[object],
 ) -> GeneratedModel:
-    """Overlay only assigned semantic faces on the unchanged legacy model."""
+    """Replace assigned base faces and add only explicit overlay-plane geometry."""
 
     if not isinstance(surface_materials, Mapping):
         raise TypeError("Surface materials must be provided as a mapping.")
@@ -1476,6 +1483,7 @@ def _apply_surface_material_overlays(
     ]
     if len(overlay_parent_ids) != len(set(overlay_parent_ids)):
         raise ValueError("Only one surface overlay plane may exist per parent.")
+    base_surfaces = list(fixed_surfaces)
     fixed_surfaces.extend(overlay_planes)
     known_surface_ids = {surface.surface_id for surface in fixed_surfaces}
     live_sources = {
@@ -1490,7 +1498,7 @@ def _apply_surface_material_overlays(
     )
     resolved_materials = resolve_surface_materials(live_sources)
     (
-        overlay_named_meshes,
+        textured_named_meshes,
         preview_textured_surfaces,
     ) = _build_surface_named_meshes(
         fixed_surfaces=fixed_surfaces,
@@ -1498,25 +1506,75 @@ def _apply_surface_material_overlays(
         texture_world_size_meters=texture_world_size,
         build_textured_mesh=build_world_planar_textured_mesh,
     )
-    if not overlay_named_meshes:
+    if not textured_named_meshes:
         return model
-    combined_mesh = _combine_mesh_geometry(
-        [model.mesh, *[named_mesh.mesh for named_mesh in overlay_named_meshes]]
+    replacement_surface_ids = set(resolved_materials).intersection(
+        surface.surface_id for surface in base_surfaces
     )
-    scene = model.scene.copy()
-    for named_mesh in overlay_named_meshes:
-        scene.add_geometry(
-            _to_gltf_y_up_mesh(named_mesh.mesh),
-            geom_name=named_mesh.name,
-            node_name=named_mesh.name,
+    replacement_surfaces = [
+        surface
+        for surface in base_surfaces
+        if surface.surface_id in replacement_surface_ids
+    ]
+    level_by_index = {level.index: level for level in levels}
+    partitioned_floor_levels = {
+        surface.level_index
+        for surface in replacement_surfaces
+        if surface.surface_type == "floor"
+        and level_by_index.get(surface.level_index) is not None
+        and level_by_index[surface.level_index].floor_contour_vertex_ids
+    }
+    untextured_partition_surfaces = [
+        surface
+        for surface in base_surfaces
+        if surface.surface_type == "floor"
+        and surface.level_index in partitioned_floor_levels
+        and surface.surface_id not in replacement_surface_ids
+    ]
+    removal_surfaces = [
+        *replacement_surfaces,
+        *untextured_partition_surfaces,
+    ]
+    replacement_face_keys = _build_oriented_surface_face_keys(
+        removal_surfaces
+    )
+    replacement_plane_coverage = _build_surface_plane_coverage(
+        removal_surfaces
+    )
+    retained_named_meshes = _remove_named_mesh_surface_faces(
+        named_meshes,
+        replacement_face_keys,
+        replacement_plane_coverage,
+    )
+    retained_named_meshes.extend(
+        NamedMesh(
+            name=f"{_get_surface_object_name(surface.surface_id)}_untextured",
+            mesh=surface.mesh.copy(),
         )
+        for surface in untextured_partition_surfaces
+    )
+    preview_base_mesh = _combine_mesh_geometry(
+        [
+            _build_transformed_named_mesh_copy(named_mesh)
+            for named_mesh in retained_named_meshes
+        ]
+    )
+    combined_mesh = _combine_mesh_geometry(
+        [
+            preview_base_mesh,
+            *[named_mesh.mesh for named_mesh in textured_named_meshes],
+        ]
+    )
+    scene = _build_export_scene(
+        [*retained_named_meshes, *textured_named_meshes]
+    )
     return GeneratedModel(
         mesh=combined_mesh,
         scene=scene,
         glb_bytes=scene.export(file_type="glb"),
         preview_textured_walls=model.preview_textured_walls,
         preview_textured_surfaces=preview_textured_surfaces,
-        preview_untextured_mesh=model.mesh,
+        preview_untextured_mesh=preview_base_mesh,
     )
 
 
@@ -1536,58 +1594,197 @@ def _build_surface_named_meshes(
         if material is None:
             continue
 
-        source_meshes = [getattr(surface, "mesh").copy()]
         is_overlay_plane = (
             getattr(surface, "overlay_parent_surface_id", None) is not None
         )
-        if (
+        double_sided = (
             surface_type == "wall"
             and getattr(surface, "room_index", None) is None
             and not is_overlay_plane
-        ):
-            source_meshes.append(_build_opposite_winding_mesh(source_meshes[0]))
+        )
 
         object_name = _get_surface_object_name(surface_id)
-        for side_index, source_mesh in enumerate(source_meshes):
-            mesh = build_textured_mesh(
-                source_mesh,
-                surface_type,
-                material,
-                texture_world_size_meters=texture_world_size_meters,
-                material_name=f"Surface {surface_id}",
-                overlay_offset_meters=0.0 if is_overlay_plane else 0.002,
+        mesh = build_textured_mesh(
+            getattr(surface, "mesh").copy(),
+            surface_type,
+            material,
+            texture_world_size_meters=texture_world_size_meters,
+            material_name=f"Surface {surface_id}",
+            overlay_offset_meters=0.0,
+            double_sided=double_sided,
+        )
+        preview_surfaces.append(
+            PreviewTexturedSurface(
+                surface_id=surface_id,
+                surface_type=surface_type,
+                mesh=mesh.copy(),
+                level_index=getattr(surface, "level_index", None),
+                room_index=getattr(surface, "room_index", None),
+                wall_key=getattr(surface, "wall_key", None),
+                double_sided=double_sided,
             )
-            preview_surfaces.append(
-                PreviewTexturedSurface(
-                    surface_id=surface_id,
-                    surface_type=surface_type,
-                    mesh=mesh.copy(),
-                    level_index=getattr(surface, "level_index", None),
-                    room_index=getattr(surface, "room_index", None),
-                    wall_key=getattr(surface, "wall_key", None),
-                )
+        )
+        named_meshes.append(
+            NamedMesh(
+                name=object_name,
+                mesh=mesh,
             )
-            named_meshes.append(
-                NamedMesh(
-                    name=(
-                        object_name
-                        if side_index == 0
-                        else f"{object_name}_opposite_side"
-                    ),
-                    mesh=mesh,
-                )
-            )
+        )
     return named_meshes, preview_surfaces
 
 
-def _build_opposite_winding_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
-    """Copy a surface with every triangle facing the opposite direction."""
+def _build_oriented_surface_face_keys(
+    surfaces: Iterable[object],
+) -> set[tuple[tuple[float, float, float], ...]]:
+    """Return winding-sensitive keys for semantic faces that replace base faces."""
 
-    opposite_mesh = mesh.copy()
-    opposite_mesh.faces = np.asarray(opposite_mesh.faces, dtype=np.int64)[
-        :, ::-1
-    ].copy()
-    return opposite_mesh
+    return {
+        _build_oriented_triangle_key(triangle)
+        for surface in surfaces
+        for triangle, _normal in _iter_surface_replacement_triangles(surface)
+    }
+
+
+def _remove_named_mesh_surface_faces(
+    named_meshes: Sequence[NamedMesh],
+    replacement_face_keys: set[tuple[tuple[float, float, float], ...]],
+    replacement_plane_coverage: Mapping[tuple[float, ...], object],
+) -> list[NamedMesh]:
+    """Remove exact oriented semantic faces while preserving source materials."""
+
+    if not replacement_face_keys and not replacement_plane_coverage:
+        return list(named_meshes)
+    retained: list[NamedMesh] = []
+    for named_mesh in named_meshes:
+        world_mesh = _build_transformed_named_mesh_copy(named_mesh)
+        keep_faces = np.asarray(
+            [
+                not _triangle_is_replaced(
+                    triangle,
+                    normal,
+                    replacement_face_keys,
+                    replacement_plane_coverage,
+                )
+                for triangle, normal in zip(
+                    world_mesh.triangles,
+                    world_mesh.face_normals,
+                )
+            ],
+            dtype=bool,
+        )
+        if not np.any(keep_faces):
+            continue
+        if np.all(keep_faces):
+            retained.append(named_mesh)
+            continue
+        filtered_mesh = named_mesh.mesh.copy()
+        filtered_mesh.update_faces(keep_faces)
+        filtered_mesh.remove_unreferenced_vertices()
+        retained.append(
+            NamedMesh(
+                name=named_mesh.name,
+                mesh=filtered_mesh,
+                source_transform=named_mesh.source_transform.copy(),
+            )
+        )
+    return retained
+
+
+def _build_surface_plane_coverage(
+    surfaces: Iterable[object],
+) -> dict[tuple[float, ...], object]:
+    polygons_by_plane: dict[tuple[float, ...], list[Polygon]] = {}
+    for surface in surfaces:
+        for triangle, normal in _iter_surface_replacement_triangles(surface):
+            plane_key = _build_oriented_plane_key(triangle, normal)
+            polygon = _project_triangle_to_plane(triangle, normal)
+            if polygon.area > 0.0:
+                polygons_by_plane.setdefault(plane_key, []).append(polygon)
+    return {
+        plane_key: shapely.union_all(polygons).buffer(
+            SURFACE_FACE_COVERAGE_EPSILON
+        )
+        for plane_key, polygons in polygons_by_plane.items()
+    }
+
+
+def _iter_surface_replacement_triangles(
+    surface: object,
+) -> Iterable[tuple[np.ndarray, np.ndarray]]:
+    mesh = getattr(surface, "mesh")
+    for triangle, normal in zip(mesh.triangles, mesh.face_normals):
+        yield triangle, normal
+        if (
+            getattr(surface, "surface_type", None) == "wall"
+            and getattr(surface, "room_index", None) is None
+            and getattr(surface, "overlay_parent_surface_id", None) is None
+        ):
+            yield triangle[::-1], -np.asarray(normal, dtype=float)
+
+
+def _triangle_is_replaced(
+    triangle: np.ndarray,
+    normal: np.ndarray,
+    replacement_face_keys: set[tuple[tuple[float, float, float], ...]],
+    replacement_plane_coverage: Mapping[tuple[float, ...], object],
+) -> bool:
+    if _build_oriented_triangle_key(triangle) in replacement_face_keys:
+        return True
+    plane_key = _build_oriented_plane_key(triangle, normal)
+    coverage = replacement_plane_coverage.get(plane_key)
+    if coverage is None:
+        return False
+    projected = _project_triangle_to_plane(triangle, normal)
+    return bool(coverage.covers(projected))
+
+
+def _build_oriented_plane_key(
+    triangle: np.ndarray,
+    normal: np.ndarray,
+) -> tuple[float, ...]:
+    normalized = np.array(normal, dtype=float, copy=True)
+    length = float(np.linalg.norm(normalized))
+    if length <= 1e-12:
+        return ()
+    normalized /= length
+    plane_offset = float(
+        np.dot(normalized, np.asarray(triangle, dtype=float)[0])
+    )
+    return tuple(
+        float(value)
+        for value in np.round(
+            np.append(normalized, plane_offset),
+            SURFACE_FACE_MATCH_DECIMALS,
+        )
+    )
+
+
+def _project_triangle_to_plane(
+    triangle: np.ndarray,
+    normal: np.ndarray,
+) -> Polygon:
+    drop_axis = int(np.argmax(np.abs(np.asarray(normal, dtype=float))))
+    projected = np.delete(np.asarray(triangle, dtype=float), drop_axis, axis=1)
+    return Polygon(projected)
+
+
+def _build_oriented_triangle_key(
+    triangle: np.ndarray,
+) -> tuple[tuple[float, float, float], ...]:
+    points = tuple(
+        tuple(float(value) for value in point)
+        for point in np.round(
+            np.asarray(triangle, dtype=float),
+            SURFACE_FACE_MATCH_DECIMALS,
+        )
+    )
+    if len(points) != 3 or any(len(point) != 3 for point in points):
+        raise ValueError("Surface replacement faces must be triangles.")
+    return min(
+        points,
+        (points[1], points[2], points[0]),
+        (points[2], points[0], points[1]),
+    )
 
 
 def _get_surface_object_name(surface_id: str) -> str:
@@ -2082,7 +2279,7 @@ def _build_room_material(
         baseColorTexture=_build_room_texture(room, layout),
         metallicFactor=0.0,
         roughnessFactor=0.65,
-        doubleSided=True,
+        doubleSided=False,
     )
 
 

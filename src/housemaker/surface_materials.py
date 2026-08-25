@@ -149,6 +149,7 @@ def build_world_planar_textured_mesh(
     texture_world_size_meters: float = DEFAULT_SURFACE_TEXTURE_WORLD_SIZE_METERS,
     material_name: str | None = None,
     overlay_offset_meters: float = 0.0,
+    double_sided: bool = False,
 ) -> trimesh.Trimesh:
     """Expand faces and attach stable world-scale planar UV coordinates."""
 
@@ -195,7 +196,7 @@ def build_world_planar_textured_mesh(
                 baseColorTexture=texture_image,
                 metallicFactor=0.0,
                 roughnessFactor=0.72,
-                doubleSided=True,
+                doubleSided=bool(double_sided),
             ),
         ),
         process=False,

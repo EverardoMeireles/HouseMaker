@@ -11,6 +11,7 @@ from housemaker.surface_geometry import (
     SURFACE_TYPE_FLOOR,
     SURFACE_TYPE_WALL,
     build_fixed_surfaces,
+    build_surface_overlay_plane,
     get_combined_surface_area,
 )
 
@@ -62,7 +63,11 @@ def _build_square_level(*, doorway: bool = False, with_room: bool = True) -> Lev
     )
 
 
-def _build_concave_u_level() -> LevelData:
+def _build_concave_u_level(
+    *,
+    with_room: bool = True,
+    reversed_edge_indices: frozenset[int] = frozenset(),
+) -> LevelData:
     vertex_data = VertexData()
     boundary_ids = tuple(
         vertex_data.add_vertex(*point).id
@@ -77,23 +82,28 @@ def _build_concave_u_level() -> LevelData:
             (0.0, 300.0),
         )
     )
-    for start_id, end_id in zip(
-        boundary_ids,
-        (*boundary_ids[1:], boundary_ids[0]),
+    for edge_index, (start_id, end_id) in enumerate(
+        zip(boundary_ids, (*boundary_ids[1:], boundary_ids[0]))
     ):
+        if edge_index in reversed_edge_indices:
+            start_id, end_id = end_id, start_id
         vertex_data.add_edge(start_id, end_id)
-    center = vertex_data.add_vertex(50.0, 150.0)
-    room = RoomData(
-        name="U room",
-        vertex_ids=boundary_ids,
-        center_vertex_id=center.id,
-        color_rgb=(140, 180, 220),
-    )
+    rooms: list[RoomData] = []
+    if with_room:
+        center = vertex_data.add_vertex(50.0, 150.0)
+        rooms.append(
+            RoomData(
+                name="U room",
+                vertex_ids=boundary_ids,
+                center_vertex_id=center.id,
+                color_rgb=(140, 180, 220),
+            )
+        )
     return LevelData(
         index=2,
         name="Ground",
         vertex_data=vertex_data,
-        rooms=[room],
+        rooms=rooms,
         floor_contour_vertex_ids=boundary_ids,
     )
 
@@ -160,6 +170,11 @@ class FixedSurfaceGeometryTests(unittest.TestCase):
             np.asarray((-0.1, 0.1)),
             atol=1e-6,
         )
+        lintel_normals = doorway_wall.mesh.face_normals[  # type: ignore[attr-defined]
+            np.abs(doorway_wall.mesh.face_normals[:, 2]) > 0.9  # type: ignore[attr-defined]
+        ]
+        self.assertEqual(len(lintel_normals), 2)
+        self.assertTrue(np.all(lintel_normals[:, 2] < -0.9))
         self.assertAlmostEqual(
             surfaces["level:2/room:5/wall:3:4"].area_square_meters,  # type: ignore[attr-defined]
             6.0,
@@ -191,6 +206,14 @@ class FixedSurfaceGeometryTests(unittest.TestCase):
             sum(item.surface_type == SURFACE_TYPE_WALL for item in surfaces),
             4,
         )
+        floor = next(
+            item for item in surfaces if item.surface_type == SURFACE_TYPE_FLOOR
+        )
+        ceiling = next(
+            item for item in surfaces if item.surface_type == SURFACE_TYPE_CEILING
+        )
+        self.assertTrue(np.all(floor.mesh.face_normals[:, 2] > 0.0))
+        self.assertTrue(np.all(ceiling.mesh.face_normals[:, 2] < 0.0))
 
     def test_level_contour_residual_outside_rooms_is_selectable_without_overlap(
         self,
@@ -250,6 +273,53 @@ class FixedSurfaceGeometryTests(unittest.TestCase):
         self.assertTrue(
             np.all(left_inner_wall.mesh.face_normals[:, 0] < -0.9)  # type: ignore[attr-defined]
         )
+
+    def test_plain_concave_wall_normals_ignore_mixed_edge_directions(self) -> None:
+        surfaces = _surface_by_id(
+            _build_concave_u_level(
+                with_room=False,
+                reversed_edge_indices=frozenset((0, 3, 6)),
+            )
+        )
+        expected_normals = {
+            "level:2/wall:1:2": (0.0, -1.0, 0.0),
+            "level:2/wall:2:3": (-1.0, 0.0, 0.0),
+            "level:2/wall:3:4": (0.0, 1.0, 0.0),
+            "level:2/wall:4:5": (1.0, 0.0, 0.0),
+            "level:2/wall:5:6": (0.0, 1.0, 0.0),
+            "level:2/wall:6:7": (-1.0, 0.0, 0.0),
+            "level:2/wall:7:8": (0.0, 1.0, 0.0),
+            "level:2/wall:1:8": (1.0, 0.0, 0.0),
+        }
+
+        for surface_id, expected_normal in expected_normals.items():
+            np.testing.assert_allclose(
+                surfaces[surface_id].mesh.face_normals,  # type: ignore[attr-defined]
+                np.tile(expected_normal, (2, 1)),
+                atol=1e-7,
+            )
+
+    def test_overlay_front_follows_its_signed_normal_offset(self) -> None:
+        parent = _surface_by_id(_build_square_level())[
+            "level:2/room:5/wall:1:2"
+        ]
+        positive = build_surface_overlay_plane(parent, "overlay:positive", 0.01)
+        negative = build_surface_overlay_plane(parent, "overlay:negative", -0.01)
+        parent_normal = np.mean(parent.mesh.face_normals, axis=0)  # type: ignore[attr-defined]
+        parent_normal /= np.linalg.norm(parent_normal)
+        parent_center = np.mean(parent.mesh.triangles_center, axis=0)  # type: ignore[attr-defined]
+
+        for overlay, expected_direction in ((positive, 1.0), (negative, -1.0)):
+            overlay_center = np.mean(overlay.mesh.triangles_center, axis=0)
+            center_offset = float(
+                np.dot(overlay_center - parent_center, parent_normal)
+            )
+            normal_alignment = overlay.mesh.face_normals @ parent_normal
+
+            self.assertAlmostEqual(center_offset, expected_direction * 0.01)
+            self.assertTrue(
+                np.all(normal_alignment * expected_direction > 0.99)
+            )
 
 
 if __name__ == "__main__":

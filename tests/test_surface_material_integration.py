@@ -15,8 +15,10 @@ from unittest.mock import patch
 
 import numpy as np
 import trimesh
+from OpenGL import GL
 from PIL import Image
 from PySide6.QtWidgets import QApplication
+from shapely import Polygon
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.glb import GLTF_Y_UP_TO_Z_UP_TRANSFORM, convert_to_glb
@@ -305,6 +307,78 @@ class StableRoomSurfaceIdentityTests(unittest.TestCase):
 
 # ### GLB material tests ###
 class SurfaceMaterialGlbTests(unittest.TestCase):
+    def test_floor_material_replaces_base_faces_without_growing_geometry(
+        self,
+    ) -> None:
+        level, room = _build_one_room_level()
+        surface_id = f"level:2/room:{room.center_vertex_id}/floor"
+        fixed_surface = _surface_by_id(level, surface_id)
+        legacy_model = convert_to_glb([level])
+
+        model = convert_to_glb(
+            [level],
+            surface_materials={surface_id: _solid_png((80, 120, 190, 255))},
+        )
+
+        self.assertEqual(len(model.mesh.faces), len(legacy_model.mesh.faces))
+        self.assertIsNotNone(model.preview_untextured_mesh)
+        assert model.preview_untextured_mesh is not None
+        self.assertEqual(
+            len(model.preview_untextured_mesh.faces),
+            len(legacy_model.mesh.faces) - len(fixed_surface.mesh.faces),
+        )
+        textured_surface = model.preview_textured_surfaces[0]
+        self.assertFalse(textured_surface.double_sided)
+        np.testing.assert_allclose(
+            textured_surface.mesh.triangles,
+            fixed_surface.mesh.triangles,
+        )
+
+    def test_selected_room_floor_partitions_a_shared_level_cap_without_overlap(
+        self,
+    ) -> None:
+        level, _shared_wall_key = _build_adjacent_room_level_with_doorway()
+        first_room = level.rooms[0]
+        vertex_id_by_point = {
+            (vertex.x, vertex.y): vertex.id
+            for vertex in level.vertex_data.vertices
+        }
+        level.floor_contour_vertex_ids = (
+            vertex_id_by_point[(0.0, 0.0)],
+            vertex_id_by_point[(200.0, 0.0)],
+            vertex_id_by_point[(200.0, 100.0)],
+            vertex_id_by_point[(0.0, 100.0)],
+        )
+        surface_id = f"level:2/room:{first_room.center_vertex_id}/floor"
+        legacy_model = convert_to_glb([level])
+
+        model = convert_to_glb(
+            [level],
+            surface_materials={surface_id: _solid_png((90, 130, 210, 255))},
+        )
+
+        textured_mesh = model.preview_textured_surfaces[0].mesh
+        base_mesh = model.preview_untextured_mesh
+        self.assertIsNotNone(base_mesh)
+        assert base_mesh is not None
+        coplanar_base_triangles = [
+            triangle
+            for triangle, normal in zip(
+                base_mesh.triangles,
+                base_mesh.face_normals,
+            )
+            if normal[2] > 0.999
+            and np.all(np.isclose(triangle[:, 2], 0.0))
+        ]
+        for textured_triangle in textured_mesh.triangles:
+            textured_polygon = Polygon(textured_triangle[:, :2])
+            for base_triangle in coplanar_base_triangles:
+                overlap = textured_polygon.intersection(
+                    Polygon(base_triangle[:, :2])
+                )
+                self.assertLessEqual(overlap.area, 1e-10)
+        self.assertAlmostEqual(model.mesh.area, legacy_model.mesh.area)
+
     def test_generated_floor_texture_preserves_legacy_room_wall_texture(
         self,
     ) -> None:
@@ -371,6 +445,14 @@ class SurfaceMaterialGlbTests(unittest.TestCase):
                 for name in material_names
             )
         )
+        for mesh in exported_scene.geometry.values():
+            material = getattr(mesh.visual, "material", None)
+            material_name = getattr(material, "name", "")
+            if material_name == f"Surface {floor_surface_id}" or (
+                material_name is not None
+                and material_name.startswith("L2 Ground Living room")
+            ):
+                self.assertFalse(material.doubleSided)
 
     def test_unknown_surface_material_is_ignored_without_changing_legacy_model(
         self,
@@ -389,7 +471,7 @@ class SurfaceMaterialGlbTests(unittest.TestCase):
         self.assertEqual(len(model.mesh.faces), len(legacy_model.mesh.faces))
         self.assertEqual(set(model.scene.geometry), set(legacy_model.scene.geometry))
 
-    def test_legacy_plain_wall_id_textures_both_non_coplanar_sides(self) -> None:
+    def test_plain_wall_texture_replaces_only_its_authoritative_front(self) -> None:
         level = _build_reversed_plain_wall_level()
         surface_id = "level:2/wall:1:2"
 
@@ -403,15 +485,18 @@ class SurfaceMaterialGlbTests(unittest.TestCase):
             for surface in model.preview_textured_surfaces
             if surface.surface_id == surface_id
         ]
-        self.assertEqual(len(preview_sides), 2)
+        self.assertEqual(len(preview_sides), 1)
         np.testing.assert_allclose(
-            sorted(float(mesh.vertices[:, 1].mean()) for mesh in preview_sides),
-            (-0.002, 0.002),
+            [float(mesh.vertices[:, 1].mean()) for mesh in preview_sides],
+            (0.0,),
         )
         np.testing.assert_allclose(
-            sorted(float(mesh.face_normals[:, 1].mean()) for mesh in preview_sides),
-            (-1.0, 1.0),
+            [float(mesh.face_normals[:, 1].mean()) for mesh in preview_sides],
+            (1.0,),
         )
+        self.assertEqual(len(model.mesh.faces), 2)
+        self.assertEqual(len(model.preview_untextured_mesh.faces), 0)
+        self.assertTrue(model.preview_textured_surfaces[0].double_sided)
 
         exported_scene = trimesh.load(
             BytesIO(model.glb_bytes),
@@ -426,19 +511,20 @@ class SurfaceMaterialGlbTests(unittest.TestCase):
             if getattr(getattr(mesh.visual, "material", None), "name", "")
             == f"Surface {surface_id}"
         ]
-        self.assertEqual(len(exported_sides), 2)
+        self.assertEqual(len(exported_sides), 1)
+        self.assertTrue(exported_sides[0].visual.material.doubleSided)
         for mesh in exported_sides:
             mesh.apply_transform(GLTF_Y_UP_TO_Z_UP_TRANSFORM)
         np.testing.assert_allclose(
-            sorted(float(mesh.vertices[:, 1].mean()) for mesh in exported_sides),
-            (-0.002, 0.002),
+            [float(mesh.vertices[:, 1].mean()) for mesh in exported_sides],
+            (0.0,),
         )
         np.testing.assert_allclose(
-            sorted(float(mesh.face_normals[:, 1].mean()) for mesh in exported_sides),
-            (-1.0, 1.0),
+            [float(mesh.face_normals[:, 1].mean()) for mesh in exported_sides],
+            (1.0,),
         )
 
-    def test_two_textured_sides_of_shared_wall_use_separate_overlay_planes(
+    def test_two_textured_sides_replace_the_shared_wall_at_its_real_plane(
         self,
     ) -> None:
         level, shared_wall_key = _build_adjacent_room_level_with_doorway()
@@ -478,22 +564,21 @@ class SurfaceMaterialGlbTests(unittest.TestCase):
             self.assertEqual(len(plane_x_values), 1)
             primary_wall_planes.append(float(plane_x_values[0]))
 
-        self.assertAlmostEqual(
-            abs(primary_wall_planes[0] - primary_wall_planes[1]),
-            0.004,
-            places=6,
-        )
-        self.assertLess(primary_wall_planes[0], 2.0)
-        self.assertGreater(primary_wall_planes[1], 2.0)
+        np.testing.assert_allclose(primary_wall_planes, (2.0, 2.0))
         self.assertIsNotNone(model.preview_untextured_mesh)
         assert model.preview_untextured_mesh is not None
         self.assertEqual(
             len(model.preview_untextured_mesh.faces),
-            len(legacy_model.mesh.faces),
+            len(legacy_model.mesh.faces) - 12,
         )
-        self.assertTrue(
-            np.any(np.isclose(model.preview_untextured_mesh.vertices[:, 0], 2.0))
-        )
+        oriented_faces = [
+            tuple(
+                tuple(float(value) for value in point)
+                for point in np.round(triangle, 7)
+            )
+            for triangle in model.mesh.triangles
+        ]
+        self.assertEqual(len(oriented_faces), len(set(oriented_faces)))
 
     def test_concave_room_exports_generated_texture_on_its_interior_face(
         self,
@@ -512,7 +597,7 @@ class SurfaceMaterialGlbTests(unittest.TestCase):
             if surface.surface_id == surface_id
         )
         self.assertTrue(np.all(overlay.face_normals[:, 0] > 0.9))
-        self.assertTrue(np.all(overlay.vertices[:, 0] > 4.0))
+        self.assertTrue(np.all(np.isclose(overlay.vertices[:, 0], 4.0)))
 
         exported_scene = trimesh.load(
             BytesIO(model.glb_bytes),
@@ -530,10 +615,7 @@ class SurfaceMaterialGlbTests(unittest.TestCase):
         inner_wall_faces = np.flatnonzero(
             np.all(np.isclose(room_mesh.triangles[:, :, 0], 4.0), axis=1)
         )
-        self.assertEqual(len(inner_wall_faces), 2)
-        self.assertTrue(
-            np.all(room_mesh.face_normals[inner_wall_faces, 0] > 0.9)
-        )
+        self.assertEqual(len(inner_wall_faces), 0)
 
 
 # ### Workspace material routing tests ###
@@ -695,7 +777,7 @@ class SurfaceMaterialWorkspaceTests(unittest.TestCase):
 
 # ### Ordinary viewer tests ###
 class SurfaceMaterialOrdinaryViewerTests(unittest.TestCase):
-    def test_legacy_plain_wall_texture_draws_both_sides_in_canvas(self) -> None:
+    def test_plain_wall_texture_uses_one_double_sided_canvas_primitive(self) -> None:
         level = _build_reversed_plain_wall_level()
         surface_id = "level:2/wall:1:2"
         model = convert_to_glb(
@@ -707,10 +789,11 @@ class SurfaceMaterialOrdinaryViewerTests(unittest.TestCase):
         try:
             viewer.set_model(model)
 
-            self.assertEqual(len(viewer.textured_surface_items), 2)
+            self.assertEqual(len(viewer.textured_surface_items), 1)
             self.assertTrue(
                 all(item.visible() for item in viewer.textured_surface_items)
             )
+            self.assertTrue(viewer.textured_surface_items[0]._double_sided)
         finally:
             viewer.close()
             viewer.deleteLater()
@@ -746,6 +829,10 @@ class SurfaceMaterialOrdinaryViewerTests(unittest.TestCase):
         try:
             viewer.set_model(model)
 
+            assert viewer.mesh_item is not None
+            self.assertTrue(
+                viewer.mesh_item._GLGraphicsItem__glOpts[GL.GL_CULL_FACE]
+            )
             shared_legacy_items = [
                 item
                 for item in viewer.textured_wall_items
@@ -765,14 +852,14 @@ class SurfaceMaterialOrdinaryViewerTests(unittest.TestCase):
             }
             self.assertEqual(legacy_plane_x_values, {2.01})
 
-            generated_overlay = model.preview_textured_surfaces[0].mesh
+            generated_surface = model.preview_textured_surfaces[0].mesh
             primary_faces = np.flatnonzero(
-                np.abs(generated_overlay.face_normals[:, 0]) > 0.9
+                np.abs(generated_surface.face_normals[:, 0]) > 0.9
             )
             generated_plane_x_values = np.unique(
                 np.round(
-                    generated_overlay.vertices[
-                        generated_overlay.faces[primary_faces].reshape(-1)
+                    generated_surface.vertices[
+                        generated_surface.faces[primary_faces].reshape(-1)
                     ][:, 0],
                     6,
                 )
@@ -780,7 +867,7 @@ class SurfaceMaterialOrdinaryViewerTests(unittest.TestCase):
             wall_plane_x_values = generated_plane_x_values[
                 np.abs(generated_plane_x_values - 2.0) < 0.01
             ]
-            np.testing.assert_allclose(wall_plane_x_values, (1.998,))
+            np.testing.assert_allclose(wall_plane_x_values, (2.0,))
             self.assertGreater(
                 min(legacy_plane_x_values),
                 float(wall_plane_x_values[0]),

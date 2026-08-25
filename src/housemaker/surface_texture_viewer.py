@@ -55,7 +55,6 @@ DEFAULT_MOUSE_LOOK_SENSITIVITY_DEGREES = 0.16
 DEFAULT_TEXTURE_WORLD_SIZE_METERS = 2.0
 DEFAULT_AMBIENT_LIGHT_INTENSITY = CANVAS_AMBIENT_LIGHT_INTENSITY
 DEFAULT_TEXTURE_INPAINT_BRUSH_RADIUS_PIXELS = 24
-CANVAS_SURFACE_TEXTURE_OFFSET_METERS = 0.002
 FIRST_PERSON_UPDATE_INTERVAL_MILLISECONDS = 16
 FIRST_PERSON_LOOK_DISTANCE_METERS = 1.0
 MAX_FIRST_PERSON_PITCH_DEGREES = 89.0
@@ -132,6 +131,8 @@ class RepeatingTexturedMeshItem(TexturedMeshItem):
         self,
         texture_mesh_data: TextureMeshData,
         ambient_light_intensity: float,
+        *,
+        double_sided: bool = False,
     ) -> None:
         # Keep the complete shared texture renderer, including its edit-mask
         # sampler.  The old custom resource upload omitted that sampler, so the
@@ -140,6 +141,7 @@ class RepeatingTexturedMeshItem(TexturedMeshItem):
             texture_mesh_data,
             ambient_light_intensity,
             texture_repeat=True,
+            double_sided=double_sided,
         )
 
 
@@ -1110,6 +1112,7 @@ class SurfaceTextureViewer(QWidget):
             drawEdges=True,
             edgeColor=EDGE_COLOR,
             shader=self._ambient_shader,
+            cull_back_faces=bool(model.preview_textured_surfaces),
         )
         self.view.addItem(mesh_item)
         legacy_wall_items = self._add_canvas_legacy_wall_items(model)
@@ -1181,8 +1184,9 @@ class SurfaceTextureViewer(QWidget):
             RepeatingTexturedMeshItem(
                 texture_data,
                 self._ambient_light_intensity,
+                double_sided=double_sided,
             )
-            for texture_data in texture_data_values
+            for texture_data, double_sided in texture_data_values
         )
         if not texture_items:
             return
@@ -1197,45 +1201,45 @@ class SurfaceTextureViewer(QWidget):
         self,
         surface: FixedSurface,
         texture_rgba: np.ndarray,
-    ) -> tuple[TextureMeshData, ...]:
+    ) -> tuple[tuple[TextureMeshData, bool], ...]:
         previews = self._preview_surfaces_by_id.get(surface.surface_id, ())
         preview_data = tuple(
-            texture_data
+            (texture_data, preview.double_sided)
             for preview in previews
             if (texture_data := _build_texture_mesh_data(preview.mesh))
             is not None
         )
         if preview_data:
             return tuple(
-                TextureMeshData(
-                    vertices=texture_data.vertices,
-                    normals=texture_data.normals,
-                    texture_coordinates=texture_data.texture_coordinates,
-                    texture_rgba=_limit_texture_preview_size(texture_rgba),
+                (
+                    TextureMeshData(
+                        vertices=texture_data.vertices,
+                        normals=texture_data.normals,
+                        texture_coordinates=texture_data.texture_coordinates,
+                        texture_rgba=_limit_texture_preview_size(texture_rgba),
+                    ),
+                    double_sided,
                 )
-                for texture_data in preview_data
+                for texture_data, double_sided in preview_data
             )
+
+        if self._scene_model is not None:
+            # The shared Canvas model is authoritative.  A missing preview
+            # means its transactional refresh has not arrived yet; drawing a
+            # second coplanar mesh here would reintroduce z-fighting.
+            return ()
 
         texture_data = _build_surface_texture_mesh_data(
             surface,
             texture_rgba,
             self._texture_world_size_meters,
         )
-        if (
-            self._scene_model is not None
+        double_sided = (
+            surface.surface_type == SURFACE_TYPE_WALL
+            and surface.room_index is None
             and surface.overlay_parent_surface_id is None
-        ):
-            texture_data = TextureMeshData(
-                vertices=np.ascontiguousarray(
-                    texture_data.vertices
-                    + texture_data.normals
-                    * CANVAS_SURFACE_TEXTURE_OFFSET_METERS
-                ),
-                normals=texture_data.normals,
-                texture_coordinates=texture_data.texture_coordinates,
-                texture_rgba=texture_data.texture_rgba,
-            )
-        return (texture_data,)
+        )
+        return ((texture_data, double_sided),)
 
     def _remove_surface_texture_item(self, surface_id: str) -> None:
         render_items = self._render_items_by_surface_id.get(surface_id)

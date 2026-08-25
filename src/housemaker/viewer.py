@@ -672,6 +672,7 @@ class TexturedMeshItem(GLGraphicsItem):
         ambient_light_intensity: float,
         *,
         texture_repeat: bool = False,
+        double_sided: bool = True,
     ) -> None:
         super().__init__()
         self.setGLOptions("opaque")
@@ -697,6 +698,7 @@ class TexturedMeshItem(GLGraphicsItem):
             ambient_light_intensity
         )
         self._texture_repeat = bool(texture_repeat)
+        self._double_sided = bool(double_sided)
         self._position_buffer: int | None = None
         self._normal_buffer: int | None = None
         self._texture_coordinate_buffer: int | None = None
@@ -741,8 +743,14 @@ class TexturedMeshItem(GLGraphicsItem):
 
     def paint(self) -> None:  # type: ignore[override]
         self.setupGLState()
+        culling_was_enabled = bool(GL.glIsEnabled(GL.GL_CULL_FACE))
+        if not self._double_sided:
+            GL.glEnable(GL.GL_CULL_FACE)
+            GL.glCullFace(GL.GL_BACK)
         self._ensure_gl_resources()
         if self._shader_program is None or self._texture_id is None:
+            if not self._double_sided and not culling_was_enabled:
+                GL.glDisable(GL.GL_CULL_FACE)
             return
 
         model_view_projection = np.asarray(
@@ -817,6 +825,8 @@ class TexturedMeshItem(GLGraphicsItem):
             GL.glActiveTexture(GL.GL_TEXTURE0)
             GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
             GL.glUseProgram(0)
+            if not self._double_sided and not culling_was_enabled:
+                GL.glDisable(GL.GL_CULL_FACE)
 
     def _ensure_gl_resources(self) -> None:
         if self._resources_uploaded:
@@ -856,6 +866,25 @@ class TexturedMeshItem(GLGraphicsItem):
 
 class _WireframeOverlayMeshItem(gl.GLMeshItem):
     """Keep coplanar mesh edges visible over faces and texture previews."""
+
+    def __init__(
+        self,
+        *args,
+        cull_back_faces: bool = False,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        if cull_back_faces:
+            # GLMeshItem calls setupGLState inside paint(), so culling must be
+            # part of its configured state rather than enabled beforehand.
+            self.setGLOptions(
+                {
+                    GL.GL_DEPTH_TEST: True,
+                    GL.GL_BLEND: False,
+                    GL.GL_CULL_FACE: True,
+                    "glCullFace": (GL.GL_BACK,),
+                }
+            )
 
     def parseMeshData(self):
         """Prepare edge buffers even when the first frame hides wireframe."""
@@ -1137,36 +1166,34 @@ class GlbViewerWidget(QWidget):
         )
         vertices = np.asarray(display_mesh.vertices, dtype=np.float32)
         faces = np.asarray(display_mesh.faces, dtype=np.int32)
-        if vertices.size == 0 or faces.size == 0:
-            self._set_default_camera()
-            return
-
-        texture_mesh_data = _build_texture_mesh_data(display_mesh)
-        face_colors = (
-            np.tile(FACE_COLOR, (faces.shape[0], 1))
-            if texture_mesh_data is not None
-            else _get_mesh_face_colors(display_mesh, faces)
-        )
-
-        if texture_mesh_data is not None:
-            self.textured_mesh_item = TexturedMeshItem(
-                texture_mesh_data,
-                self._ambient_light_intensity,
+        if vertices.size and faces.size:
+            texture_mesh_data = _build_texture_mesh_data(display_mesh)
+            face_colors = (
+                np.tile(FACE_COLOR, (faces.shape[0], 1))
+                if texture_mesh_data is not None
+                else _get_mesh_face_colors(display_mesh, faces)
             )
-            self.textured_mesh_item.set_edit_mask(self._texture_edit_mask)
-            self.view.addItem(self.textured_mesh_item)
 
-        self.mesh_item = _WireframeOverlayMeshItem(
-            vertexes=vertices,
-            faces=faces,
-            faceColors=face_colors,
-            smooth=False,
-            drawFaces=texture_mesh_data is None,
-            drawEdges=True,
-            edgeColor=EDGE_COLOR,
-            shader=self._ambient_shader,
-        )
-        self.view.addItem(self.mesh_item)
+            if texture_mesh_data is not None:
+                self.textured_mesh_item = TexturedMeshItem(
+                    texture_mesh_data,
+                    self._ambient_light_intensity,
+                )
+                self.textured_mesh_item.set_edit_mask(self._texture_edit_mask)
+                self.view.addItem(self.textured_mesh_item)
+
+            self.mesh_item = _WireframeOverlayMeshItem(
+                vertexes=vertices,
+                faces=faces,
+                faceColors=face_colors,
+                smooth=False,
+                drawFaces=texture_mesh_data is None,
+                drawEdges=True,
+                edgeColor=EDGE_COLOR,
+                shader=self._ambient_shader,
+                cull_back_faces=bool(self.model.preview_textured_surfaces),
+            )
+            self.view.addItem(self.mesh_item)
         self._add_textured_surface_items()
         self._add_textured_wall_items()
         self._apply_render_display_options()
@@ -1297,6 +1324,7 @@ class GlbViewerWidget(QWidget):
                 texture_data,
                 self._ambient_light_intensity,
                 texture_repeat=True,
+                double_sided=textured_surface.double_sided,
             )
             self.view.addItem(texture_item)
             self.textured_surface_items.append(texture_item)

@@ -38,6 +38,7 @@ DEFAULT_SURFACE_OVERLAY_OFFSET_METERS = 0.003
 MAX_SURFACE_OVERLAY_OFFSET_METERS = 0.05
 SURFACE_OVERLAY_COPLANAR_DECIMALS = 6
 DOORWAY_REVEAL_PARALLEL_COSINE = math.cos(math.radians(10.0))
+SURFACE_INTERIOR_PROBE_RATIOS = (1e-7, 1e-6, 1e-5, 1e-4, 1e-3)
 
 
 # ### Surface models ###
@@ -154,6 +155,8 @@ def build_surface_overlay_plane(
     source_faces = np.asarray(parent_surface.mesh.faces, dtype=np.int64)
     face_vertices = source_vertices[source_faces[face_indices]].copy()
     face_vertices += plane_normal[np.newaxis, np.newaxis, :] * offset
+    if offset < 0.0:
+        face_vertices = face_vertices[:, ::-1, :]
     vertices = face_vertices.reshape(-1, 3)
     faces = np.arange(len(vertices), dtype=np.int64).reshape(-1, 3)
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
@@ -241,6 +244,7 @@ def _build_room_surfaces(
     surfaces: list[FixedSurface] = []
     room_identity = room.center_vertex_id
     doorway_openings = _build_wall_openings(level.doorways)
+    room_polygon = _build_room_world_polygon(level, room)
     for wall in build_room_walls(room, level.vertex_data):
         wall_surface = _build_wall_surface(
             level=level,
@@ -253,11 +257,11 @@ def _build_room_surfaces(
             room_index=room_index,
             room_identity=room_identity,
             reveal_owner_by_opening_index=reveal_owner_by_opening_index,
+            interior_polygon=room_polygon,
         )
         if wall_surface is not None:
             surfaces.append(wall_surface)
 
-    room_polygon = _build_room_world_polygon(level, room)
     if room_polygon is None:
         return surfaces
     floor_surface = _build_horizontal_surface(
@@ -301,6 +305,7 @@ def _build_plain_level_wall_surfaces(
     room_vertex_sets = [set(room.vertex_ids) for room in level.rooms]
     ignored_vertex_ids = {room.center_vertex_id for room in level.rooms}
     doorway_openings = _build_wall_openings(level.doorways)
+    interior_polygon = _build_level_contour_world_polygon(level)
     vertex_lookup = {vertex.id: vertex for vertex in level.vertex_data.vertices}
     surfaces: list[FixedSurface] = []
     for edge in sorted(level.vertex_data.edges, key=_get_edge_sort_key):
@@ -333,6 +338,7 @@ def _build_plain_level_wall_surfaces(
             room_index=None,
             room_identity=None,
             reveal_owner_by_opening_index=reveal_owner_by_opening_index,
+            interior_polygon=interior_polygon,
         )
         if surface is not None:
             surfaces.append(surface)
@@ -430,6 +436,7 @@ def _build_wall_surface(
     room_index: int | None,
     room_identity: int | None,
     reveal_owner_by_opening_index: Mapping[int, str],
+    interior_polygon: Polygon | None,
 ) -> FixedSurface | None:
     if (
         not math.isfinite(float(wall_height_meters))
@@ -457,14 +464,21 @@ def _build_wall_surface(
         )
         start_world = level_image_to_world_xy(level, *piece_start)
         end_world = level_image_to_world_xy(level, *piece_end)
+        corners = (
+            (*start_world, base_z_meters + wall_piece.bottom_height_meters),
+            (*end_world, base_z_meters + wall_piece.bottom_height_meters),
+            (*end_world, base_z_meters + wall_piece.top_height_meters),
+            (*start_world, base_z_meters + wall_piece.top_height_meters),
+        )
         _append_quad(
             vertices,
             faces,
-            (
-                (*start_world, base_z_meters + wall_piece.bottom_height_meters),
-                (*end_world, base_z_meters + wall_piece.bottom_height_meters),
-                (*end_world, base_z_meters + wall_piece.top_height_meters),
-                (*start_world, base_z_meters + wall_piece.top_height_meters),
+            corners,
+            reverse_winding=(
+                _quad_front_points_outside_polygon(
+                    corners,
+                    interior_polygon,
+                )
             ),
         )
 
@@ -584,6 +598,7 @@ def _append_connected_doorway_reveals(
             (*high_positive, top_z),
             (*low_positive, top_z),
         ),
+        reverse_winding=True,
     )
 
 
@@ -821,6 +836,8 @@ def _append_quad(
     vertices: list[list[float]],
     faces: list[list[int]],
     corners: Sequence[tuple[float, float, float]],
+    *,
+    reverse_winding: bool = False,
 ) -> None:
     if len(corners) != 4:
         return
@@ -837,12 +854,56 @@ def _append_quad(
         return
     vertex_offset = len(vertices)
     vertices.extend(corner_array.tolist())
-    faces.extend(
-        (
-            [vertex_offset, vertex_offset + 1, vertex_offset + 2],
-            [vertex_offset, vertex_offset + 2, vertex_offset + 3],
-        )
+    forward_faces = (
+        [vertex_offset, vertex_offset + 1, vertex_offset + 2],
+        [vertex_offset, vertex_offset + 2, vertex_offset + 3],
     )
+    faces.extend(
+        [list(reversed(face)) for face in forward_faces]
+        if reverse_winding
+        else forward_faces
+    )
+
+
+def _quad_front_points_outside_polygon(
+    corners: Sequence[tuple[float, float, float]],
+    interior_polygon: Polygon | None,
+) -> bool:
+    """Return whether one planar quad must flip to face its local interior."""
+
+    if interior_polygon is None or interior_polygon.is_empty or len(corners) != 4:
+        return False
+    corner_array = np.asarray(corners, dtype=float)
+    face_normal = np.cross(
+        corner_array[1] - corner_array[0],
+        corner_array[2] - corner_array[0],
+    )
+    normal_xy = face_normal[:2]
+    normal_length = float(np.linalg.norm(normal_xy))
+    wall_length = float(
+        np.linalg.norm(corner_array[1, :2] - corner_array[0, :2])
+    )
+    if (
+        normal_length <= SURFACE_GEOMETRY_EPSILON
+        or wall_length <= SURFACE_GEOMETRY_EPSILON
+    ):
+        return False
+    normal_xy /= normal_length
+    midpoint_xy = np.mean(corner_array[:, :2], axis=0)
+    for probe_ratio in SURFACE_INTERIOR_PROBE_RATIOS:
+        probe_distance = max(
+            SURFACE_GEOMETRY_EPSILON * 10.0,
+            wall_length * probe_ratio,
+        )
+        front_is_inside = interior_polygon.contains(
+            Point(*(midpoint_xy + normal_xy * probe_distance))
+        )
+        back_is_inside = interior_polygon.contains(
+            Point(*(midpoint_xy - normal_xy * probe_distance))
+        )
+        if front_is_inside != back_is_inside:
+            return not front_is_inside
+    return False
 
 
 def _build_mesh(

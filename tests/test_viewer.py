@@ -280,6 +280,8 @@ class GlbViewerRenderingTests(unittest.TestCase):
             viewer.mesh_item.paint()
 
         base_paint.assert_called_once_with()
+        gl_options = viewer.mesh_item._GLGraphicsItem__glOpts
+        self.assertFalse(gl_options[GL.GL_CULL_FACE])
         self.assertEqual(
             [call.args[0] for call in depth_function.call_args_list],
             [GL.GL_LEQUAL, GL.GL_LESS],
