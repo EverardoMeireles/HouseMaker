@@ -14,7 +14,14 @@ from pyqtgraph.opengl import shaders as gl_shaders
 from pyqtgraph.opengl.GLGraphicsItem import GLGraphicsItem
 from PySide6.QtCore import QPointF, QTimer, Qt, Signal
 from PySide6.QtGui import QCursor, QKeyEvent, QMouseEvent, QVector3D
-from PySide6.QtWidgets import QLabel, QStackedLayout, QWidget
+from PySide6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QStackedLayout,
+    QVBoxLayout,
+    QWidget,
+)
 from PIL import Image
 
 from housemaker.camera_models import CameraPose
@@ -23,6 +30,13 @@ from housemaker.camera_indicators import (
     normalize_unused_face_camera_ids,
 )
 from housemaker.glb import GeneratedModel, PreviewTexturedWall
+from housemaker.surface_geometry import (
+    FixedSurface,
+    SURFACE_TYPE_WALL,
+    WallWindowPlacement,
+    build_wall_window_placement,
+    get_wall_window_world_corners,
+)
 from housemaker.unused_face_removal import ALL_CAMERA_IDS
 
 # ### Constants ###
@@ -49,6 +63,11 @@ DEFAULT_MOUSE_LOOK_SENSITIVITY_DEGREES = 0.16
 FIRST_PERSON_UPDATE_INTERVAL_MILLISECONDS = 16
 FIRST_PERSON_LOOK_DISTANCE_METERS = 1.0
 MAX_FIRST_PERSON_PITCH_DEGREES = 89.0
+WINDOW_EDITOR_PANEL_WIDTH = 190
+WINDOW_PREVIEW_OFFSET_METERS = 0.006
+WINDOW_SELECTION_COLOR = (0.20, 0.72, 1.0, 1.0)
+WINDOW_VALID_PREVIEW_COLOR = (0.20, 0.86, 0.38, 0.34)
+WINDOW_INVALID_PREVIEW_COLOR = (1.0, 0.24, 0.20, 0.34)
 
 
 # ### Shader source ###
@@ -134,6 +153,11 @@ class SelectableGLViewWidget(gl.GLViewWidget):
     """3D viewport with selectable items and two explicit navigation modes."""
 
     items_clicked = Signal(object)
+    viewport_clicked = Signal(object)
+    rectangle_pointer_pressed = Signal(object)
+    rectangle_pointer_moved = Signal(object)
+    rectangle_pointer_released = Signal(object)
+    rectangle_drawing_cancel_requested = Signal()
     navigation_mode_changed = Signal(str)
     first_person_active_changed = Signal(bool)
     first_person_camera_pose_changed = Signal(object)
@@ -142,7 +166,9 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         super().__init__(parent)
         self.click_press_position = QPointF()
         self._is_middle_navigation_active = False
+        self._rectangle_drawing_enabled = False
         self._navigation_mode = NAVIGATION_MODE_ORBIT
+        self._first_person_pointer_captured = False
         self._first_person_camera_pose = CameraPose(
             z=DEFAULT_FIRST_PERSON_HEIGHT_METERS
         )
@@ -160,6 +186,24 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self._update_navigation_tooltip()
 
     @property
+    def is_rectangle_drawing_enabled(self) -> bool:
+        """Whether primary-pointer input is reserved for rectangle drawing."""
+
+        return self._rectangle_drawing_enabled
+
+    def set_rectangle_drawing_enabled(self, enabled: bool) -> None:
+        """Reserve or release primary-pointer input for a transient tool."""
+
+        normalized_enabled = bool(enabled)
+        if normalized_enabled == self._rectangle_drawing_enabled:
+            return
+        if normalized_enabled:
+            self.release_first_person_pointer_capture()
+        self._rectangle_drawing_enabled = normalized_enabled
+        if normalized_enabled:
+            self.focus_navigation()
+
+    @property
     def navigation_mode(self) -> str:
         """Return ``orbit`` or ``first_person`` for settings/UI synchronization."""
 
@@ -172,6 +216,15 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         return self._navigation_mode == NAVIGATION_MODE_FIRST_PERSON
 
     @property
+    def is_first_person_pointer_captured(self) -> bool:
+        """Whether mouse movement is currently captured for first-person look."""
+
+        return bool(
+            self.is_first_person_active
+            and self._first_person_pointer_captured
+        )
+
+    @property
     def has_custom_first_person_camera_pose(self) -> bool:
         """Whether the first-person pose was supplied by the application/user."""
 
@@ -181,9 +234,22 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         """Focus this viewport after it is moved into another window."""
 
         self.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
-        if self.is_first_person_active and self.isVisible():
+        if self.is_first_person_pointer_captured and self.isVisible():
             self.grabMouse()
             self._center_pointer()
+
+    def release_first_person_pointer_capture(self) -> None:
+        """Release mouse-look without changing the first-person camera mode."""
+
+        was_pointer_captured = self._first_person_pointer_captured
+        self._pressed_movement_keys.clear()
+        if not was_pointer_captured:
+            return
+        self._first_person_pointer_captured = False
+        if self.isVisible():
+            self.releaseMouse()
+        self.unsetCursor()
+        self._update_navigation_tooltip()
 
     def build_camera_ray(
         self,
@@ -346,11 +412,21 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             self._sync_view_to_first_person_camera_pose()
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if self._rectangle_drawing_enabled:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.click_press_position = event.position()
+                self.rectangle_pointer_pressed.emit(event.position())
+            elif event.button() == Qt.MouseButton.RightButton:
+                self.rectangle_drawing_cancel_requested.emit()
+            event.accept()
+            return
+
         if self.is_first_person_active:
             if event.button() == Qt.MouseButton.RightButton:
-                self.exit_first_person_mode()
-            else:
-                self.focus_navigation()
+                self.release_first_person_pointer_capture()
+            elif not self.is_first_person_pointer_captured:
+                self.click_press_position = event.position()
+                self.setFocus(Qt.FocusReason.MouseFocusReason)
             event.accept()
             return
 
@@ -366,7 +442,28 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if self._rectangle_drawing_enabled:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.rectangle_pointer_released.emit(event.position())
+            elif event.button() == Qt.MouseButton.RightButton:
+                self.rectangle_drawing_cancel_requested.emit()
+            event.accept()
+            return
+
         if self.is_first_person_active:
+            if (
+                not self.is_first_person_pointer_captured
+                and event.button() == Qt.MouseButton.LeftButton
+                and _get_point_distance(
+                    self.click_press_position,
+                    event.position(),
+                )
+                <= CLICK_SELECTION_TOLERANCE
+            ):
+                clicked_items = self._get_clicked_items(event.position())
+                if clicked_items:
+                    self.items_clicked.emit(clicked_items)
+                self.viewport_clicked.emit(event.position())
             event.accept()
             return
 
@@ -388,14 +485,25 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             clicked_items = self._get_clicked_items(event.position())
             if clicked_items:
                 self.items_clicked.emit(clicked_items)
+            self.viewport_clicked.emit(event.position())
 
         super().mouseReleaseEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
         """Use Blender-style middle-button navigation without rotating on left drag."""
 
-        if self.is_first_person_active:
+        if self._rectangle_drawing_enabled:
+            if event.buttons() & Qt.MouseButton.LeftButton:
+                self.rectangle_pointer_moved.emit(event.position())
+            event.accept()
+            return
+
+        if self.is_first_person_pointer_captured:
             self._handle_first_person_mouse_look(event)
+            return
+
+        if self.is_first_person_active:
+            event.accept()
             return
 
         position = event.position()
@@ -439,6 +547,13 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         super().wheelEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
+        if (
+            self._rectangle_drawing_enabled
+            and event.key() == Qt.Key.Key_Escape
+        ):
+            self.rectangle_drawing_cancel_requested.emit()
+            event.accept()
+            return
         if self.is_first_person_active and event.key() in _first_person_movement_keys():
             self._pressed_movement_keys.add(event.key())
             event.accept()
@@ -453,7 +568,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         super().keyReleaseEvent(event)
 
     def focusOutEvent(self, event) -> None:  # type: ignore[override]
-        self.exit_first_person_mode()
+        self.release_first_person_pointer_capture()
         super().focusOutEvent(event)
 
     def _enter_first_person_mode(self) -> None:
@@ -461,26 +576,32 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self._navigation_mode = NAVIGATION_MODE_FIRST_PERSON
         self._is_middle_navigation_active = False
         self.setFocus(Qt.FocusReason.OtherFocusReason)
-        self.setCursor(Qt.CursorShape.BlankCursor)
         self._sync_view_to_first_person_camera_pose()
-        if self.isVisible():
-            self.grabMouse()
-            self._center_pointer()
+        self._capture_first_person_pointer()
         self._movement_timer.start()
         self._update_navigation_tooltip()
         self.navigation_mode_changed.emit(self._navigation_mode)
         self.first_person_active_changed.emit(True)
 
+    def _capture_first_person_pointer(self) -> None:
+        """Capture the pointer for mouse-look while first-person mode is active."""
+
+        if not self.is_first_person_active:
+            return
+        self._first_person_pointer_captured = True
+        self.setCursor(Qt.CursorShape.BlankCursor)
+        if self.isVisible():
+            self.grabMouse()
+            self._center_pointer()
+
     def _exit_first_person_mode(self) -> None:
         was_first_person_active = self.is_first_person_active
         if not was_first_person_active:
             return
+        self.release_first_person_pointer_capture()
         self._navigation_mode = NAVIGATION_MODE_ORBIT
         self._pressed_movement_keys.clear()
         self._movement_timer.stop()
-        if self.isVisible():
-            self.releaseMouse()
-        self.unsetCursor()
         self.opts.update(self._orbit_camera_state)
         self.update()
         self._update_navigation_tooltip()
@@ -576,11 +697,17 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         QCursor.setPos(self.mapToGlobal(self.rect().center()))
 
     def _update_navigation_tooltip(self) -> None:
-        if self.is_first_person_active:
+        if self.is_first_person_pointer_captured:
             self.setToolTip(
                 "First-person controls: Z/Q/S/D to move, R/F to move down/up, "
-                "move the mouse to look, right-click to return to Blender "
-                "orbit controls."
+                "move the mouse to look, right-click to release the pointer "
+                "for selection."
+            )
+            return
+        if self.is_first_person_active:
+            self.setToolTip(
+                "First-person view: click to select, Z/Q/S/D to move, and use "
+                "the Canvas 3D navigation hotkey to return to orbit controls."
             )
             return
         self.setToolTip(
@@ -861,6 +988,8 @@ class GlbViewerWidget(QWidget):
     """Generated-model viewer with Blender orbit and first-person navigation."""
 
     wall_selected = Signal(int, int, str)
+    window_placement_requested = Signal(object)
+    window_undo_requested = Signal()
     navigation_mode_changed = Signal(str)
     first_person_active_changed = Signal(bool)
     first_person_camera_pose_changed = Signal(object)
@@ -872,6 +1001,7 @@ class GlbViewerWidget(QWidget):
         textures_enabled: bool = DEFAULT_TEXTURES_ENABLED,
         wireframe_enabled: bool = DEFAULT_WIREFRAME_ENABLED,
         wireframe_only: bool = DEFAULT_WIREFRAME_ONLY,
+        window_editing_enabled: bool = False,
     ) -> None:
         super().__init__(parent)
         self.model: GeneratedModel | None = None
@@ -893,6 +1023,19 @@ class GlbViewerWidget(QWidget):
         self._textures_enabled = bool(textures_enabled)
         self._wireframe_enabled = bool(wireframe_enabled)
         self._wireframe_only = bool(wireframe_only)
+        self._window_editing_enabled = bool(window_editing_enabled)
+        self._window_wall_targets: dict[str, FixedSurface] = {}
+        self._selected_window_wall_surface_id: str | None = None
+        self._window_drag_first_world: tuple[float, float, float] | None = None
+        self._window_preview_placement: WallWindowPlacement | None = None
+        self._window_preview_is_valid = False
+        self._window_undo_available = False
+        self._window_selection_item: gl.GLLinePlotItem | None = None
+        self._window_preview_item: gl.GLMeshItem | None = None
+        self.window_tools_panel: QWidget | None = None
+        self.window_tools_status_label: QLabel | None = None
+        self.add_window_button: QPushButton | None = None
+        self.undo_window_button: QPushButton | None = None
         self._unused_face_camera_indicators_visible = False
         self._enabled_unused_face_camera_ids = ALL_CAMERA_IDS
         self._texture_edit_mask: np.ndarray | None = None
@@ -901,10 +1044,30 @@ class GlbViewerWidget(QWidget):
         )
 
         self._build_ui()
+        if self._window_editing_enabled:
+            self._connect_window_editor_input()
         self._populate_scene()
 
     def _build_ui(self) -> None:
-        layout = QStackedLayout(self)
+        if not self._window_editing_enabled:
+            layout = QStackedLayout(self)
+            self._populate_viewport_stack(layout)
+            return
+
+        root_layout = QHBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        viewport_container = QWidget()
+        viewport_container.setObjectName("canvas-window-editor-viewport")
+        viewport_layout = QStackedLayout(viewport_container)
+        self._populate_viewport_stack(viewport_layout)
+        root_layout.addWidget(viewport_container, 1)
+        root_layout.addWidget(self._build_window_tools_panel())
+
+    def _populate_viewport_stack(self, layout: QStackedLayout) -> None:
+        """Create the shared viewport and crosshair inside *layout*."""
+
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setStackingMode(QStackedLayout.StackingMode.StackAll)
 
@@ -939,6 +1102,454 @@ class GlbViewerWidget(QWidget):
         )
         layout.addWidget(self.first_person_crosshair_label)
 
+    def _build_window_tools_panel(self) -> QWidget:
+        """Build the Canvas-only controls that travel with the 3D viewer."""
+
+        panel = QWidget()
+        panel.setObjectName("canvas-window-tools-panel")
+        panel.setFixedWidth(WINDOW_EDITOR_PANEL_WIDTH)
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(12, 12, 12, 12)
+        panel_layout.setSpacing(10)
+
+        title_label = QLabel("Window tools")
+        title_label.setObjectName("canvas-window-tools-title")
+        panel_layout.addWidget(title_label)
+
+        self.add_window_button = QPushButton("Add window")
+        self.add_window_button.setObjectName("canvas-add-window-button")
+        self.add_window_button.setCheckable(True)
+        self.add_window_button.setEnabled(False)
+        self.add_window_button.toggled.connect(
+            self._handle_add_window_button_toggled
+        )
+        panel_layout.addWidget(self.add_window_button)
+
+        self.undo_window_button = QPushButton("Undo window")
+        self.undo_window_button.setObjectName("canvas-undo-window-button")
+        self.undo_window_button.setEnabled(False)
+        self.undo_window_button.clicked.connect(
+            self._handle_undo_window_button_clicked
+        )
+        panel_layout.addWidget(self.undo_window_button)
+
+        self.window_tools_status_label = QLabel("Select one wall.")
+        self.window_tools_status_label.setObjectName(
+            "canvas-window-tools-status"
+        )
+        self.window_tools_status_label.setWordWrap(True)
+        panel_layout.addWidget(self.window_tools_status_label)
+        panel_layout.addStretch(1)
+        self.window_tools_panel = panel
+        return panel
+
+    # ### Canvas window editor API ###
+    @property
+    def window_editing_enabled(self) -> bool:
+        """Whether this viewer owns the Canvas wall-window tools."""
+
+        return self._window_editing_enabled
+
+    def set_wall_targets(self, surfaces: tuple[FixedSurface, ...]) -> None:
+        """Replace the immutable semantic walls available for selection."""
+
+        if not self._window_editing_enabled:
+            return
+        if not isinstance(surfaces, tuple):
+            raise TypeError("Canvas wall targets must be supplied as a tuple.")
+
+        targets: dict[str, FixedSurface] = {}
+        for surface in surfaces:
+            if not isinstance(surface, FixedSurface):
+                raise TypeError("Canvas wall targets must be FixedSurface values.")
+            if surface.surface_type != SURFACE_TYPE_WALL:
+                continue
+            if surface.surface_id in targets:
+                raise ValueError(
+                    f"Duplicate Canvas wall target: {surface.surface_id!r}."
+                )
+            targets[surface.surface_id] = surface
+
+        selected_id = self._selected_window_wall_surface_id
+        self._window_wall_targets = targets
+        self._selected_window_wall_surface_id = (
+            selected_id if selected_id in targets else None
+        )
+        self.cancel_window_placement(status_message=None)
+        self._refresh_window_selection_outline()
+        self._sync_window_tools_controls()
+
+    def get_selected_wall_surface_id(self) -> str | None:
+        """Return the one selected semantic wall, if any."""
+
+        return self._selected_window_wall_surface_id
+
+    def select_wall_target(self, surface_id: str | None) -> bool:
+        """Select one semantic wall, or clear selection with ``None``."""
+
+        if not self._window_editing_enabled:
+            return False
+        normalized_id = None if surface_id is None else str(surface_id).strip()
+        if normalized_id is not None and normalized_id not in self._window_wall_targets:
+            return False
+        if normalized_id == self._selected_window_wall_surface_id:
+            return False
+
+        self.cancel_window_placement(status_message=None)
+        self._selected_window_wall_surface_id = normalized_id
+        self._refresh_window_selection_outline()
+        self._sync_window_tools_controls()
+        return True
+
+    def is_window_placement_active(self) -> bool:
+        """Whether pointer input is currently reserved for a new window."""
+
+        return bool(
+            self._window_editing_enabled
+            and self.view.is_rectangle_drawing_enabled
+        )
+
+    def set_window_tools_status(self, message: str) -> None:
+        """Show a commit result without exposing the panel's label internals."""
+
+        if not isinstance(message, str):
+            raise TypeError("A window-tools status message must be text.")
+        self._set_window_tools_status(message)
+
+    def set_window_undo_available(self, available: bool) -> None:
+        """Enable undo only while Main owns a committed window history item."""
+
+        self._window_undo_available = bool(available)
+        self._sync_window_undo_button()
+
+    def begin_window_placement(self) -> bool:
+        """Arm rectangle drawing when exactly one wall is selected."""
+
+        if (
+            not self._window_editing_enabled
+            or self._selected_window_wall_surface_id
+            not in self._window_wall_targets
+        ):
+            self._set_window_tools_status("Select one wall.")
+            self._set_add_window_button_checked(False)
+            return False
+
+        self._window_drag_first_world = None
+        self._window_preview_placement = None
+        self._window_preview_is_valid = False
+        self._remove_window_preview_item()
+        self.view.set_rectangle_drawing_enabled(True)
+        self._set_add_window_button_checked(True)
+        self._sync_window_undo_button()
+        self._set_window_tools_status(
+            "Drag on the selected wall. Escape or right-click cancels."
+        )
+        return True
+
+    def cancel_window_placement(
+        self,
+        *,
+        status_message: str | None = "Window placement cancelled.",
+    ) -> None:
+        """Safely clear every transient rectangle-drawing resource."""
+
+        if not self._window_editing_enabled:
+            return
+        self.view.set_rectangle_drawing_enabled(False)
+        self._window_drag_first_world = None
+        self._window_preview_placement = None
+        self._window_preview_is_valid = False
+        self._remove_window_preview_item()
+        self._set_add_window_button_checked(False)
+        self._sync_window_undo_button()
+        if status_message is not None:
+            self._set_window_tools_status(status_message)
+
+    # ### Canvas window editor input ###
+    def _connect_window_editor_input(self) -> None:
+        self.view.viewport_clicked.connect(
+            self._handle_window_wall_pick_requested
+        )
+        self.view.rectangle_pointer_pressed.connect(
+            self._handle_window_pointer_pressed
+        )
+        self.view.rectangle_pointer_moved.connect(
+            self._handle_window_pointer_moved
+        )
+        self.view.rectangle_pointer_released.connect(
+            self._handle_window_pointer_released
+        )
+        self.view.rectangle_drawing_cancel_requested.connect(
+            self.cancel_window_placement
+        )
+        self.navigation_mode_changed.connect(
+            self._handle_window_navigation_mode_changed
+        )
+
+    def _handle_add_window_button_toggled(self, checked: bool) -> None:
+        if checked:
+            self.begin_window_placement()
+            return
+        if self.is_window_placement_active():
+            self.cancel_window_placement()
+
+    def _handle_undo_window_button_clicked(self) -> None:
+        self.cancel_window_placement(status_message=None)
+        self.window_undo_requested.emit()
+
+    def _handle_window_navigation_mode_changed(self, _mode: str) -> None:
+        if self.is_window_placement_active():
+            self.cancel_window_placement()
+
+    def _handle_window_wall_pick_requested(self, position: QPointF) -> None:
+        if not self._window_editing_enabled or self.is_window_placement_active():
+            return
+        camera_ray = self.view.build_camera_ray(position)
+        if camera_ray is None:
+            self.select_wall_target(None)
+            return
+        ray_origin, ray_direction = camera_ray
+        hit = _get_nearest_fixed_surface_ray_hit(
+            tuple(self._window_wall_targets.values()),
+            ray_origin,
+            ray_direction,
+        )
+        self.select_wall_target(None if hit is None else hit[0].surface_id)
+
+    def _handle_window_pointer_pressed(self, position: QPointF) -> None:
+        surface = self._get_selected_window_wall()
+        camera_ray = self.view.build_camera_ray(position)
+        if surface is None or camera_ray is None:
+            self._set_window_tools_status("Start the drag on the selected wall.")
+            return
+        ray_origin, ray_direction = camera_ray
+        hit = _get_nearest_fixed_surface_ray_hit(
+            (surface,),
+            ray_origin,
+            ray_direction,
+        )
+        if hit is None:
+            self._set_window_tools_status("Start the drag on the selected wall.")
+            return
+        self._window_drag_first_world = _world_point_tuple(hit[1])
+        self._window_preview_placement = None
+        self._window_preview_is_valid = False
+
+    def _handle_window_pointer_moved(self, position: QPointF) -> None:
+        self._update_window_drag_preview(position)
+
+    def _handle_window_pointer_released(self, position: QPointF) -> None:
+        if self._window_drag_first_world is None:
+            self.cancel_window_placement(
+                status_message="Start the drag on the selected wall."
+            )
+            return
+
+        self._update_window_drag_preview(position)
+        placement = self._window_preview_placement
+        is_valid = self._window_preview_is_valid and placement is not None
+        if not is_valid:
+            message = (
+                self.window_tools_status_label.text()
+                if self.window_tools_status_label is not None
+                else "Window placement is invalid."
+            )
+            self.cancel_window_placement(status_message=message)
+            return
+
+        self.cancel_window_placement(status_message="Window placement ready.")
+        self.window_placement_requested.emit(placement)
+
+    def _update_window_drag_preview(self, position: QPointF) -> None:
+        surface = self._get_selected_window_wall()
+        first_world = self._window_drag_first_world
+        camera_ray = self.view.build_camera_ray(position)
+        if surface is None or first_world is None:
+            self._invalidate_window_preview(
+                "Start the drag on the selected wall."
+            )
+            return
+        if camera_ray is None:
+            self._invalidate_window_preview(
+                "Keep the pointer over the wall plane."
+            )
+            return
+        ray_origin, ray_direction = camera_ray
+        second_world = _intersect_ray_with_fixed_surface_plane(
+            surface,
+            ray_origin,
+            ray_direction,
+        )
+        if second_world is None:
+            self._invalidate_window_preview(
+                "Keep the pointer over the wall plane."
+            )
+            return
+
+        raw_corners = _build_wall_rectangle_corners(
+            surface,
+            first_world,
+            second_world,
+        )
+        placement: object | None = None
+        error_message: str | None = None
+        try:
+            placement = _build_validated_wall_window_placement(
+                surface,
+                first_world,
+                second_world,
+            )
+            corners = _get_validated_wall_window_world_corners(
+                surface,
+                placement,
+            )
+        except (TypeError, ValueError) as error:
+            corners = raw_corners
+            error_message = str(error)
+
+        self._window_preview_placement = placement
+        self._window_preview_is_valid = placement is not None
+        if corners is not None:
+            self._set_window_preview_item(
+                surface,
+                corners,
+                ray_origin,
+                is_valid=self._window_preview_is_valid,
+            )
+        if self._window_preview_is_valid:
+            self._set_window_tools_status("Release to add this window.")
+        else:
+            self._set_window_tools_status(
+                error_message or "Window placement is invalid."
+            )
+
+    def _invalidate_window_preview(self, message: str) -> None:
+        """Drop stale valid data whenever the pointer cannot be resolved."""
+
+        self._window_preview_placement = None
+        self._window_preview_is_valid = False
+        self._remove_window_preview_item()
+        self._set_window_tools_status(message)
+
+    # ### Canvas window editor rendering ###
+    def _get_selected_window_wall(self) -> FixedSurface | None:
+        surface = self._window_wall_targets.get(
+            self._selected_window_wall_surface_id or ""
+        )
+        return surface if isinstance(surface, FixedSurface) else None
+
+    def _refresh_window_selection_outline(self) -> None:
+        self._remove_window_selection_item()
+        surface = self._get_selected_window_wall()
+        if surface is None or self.model is None:
+            return
+        positions = _build_fixed_surface_boundary_line_positions(surface)
+        if positions is None:
+            return
+        positions = _offset_points_toward_camera(
+            positions,
+            _get_fixed_surface_plane_normal(surface),
+            self.view.cameraPosition(),
+            WINDOW_PREVIEW_OFFSET_METERS,
+        )
+        self._window_selection_item = gl.GLLinePlotItem(
+            pos=np.asarray(positions, dtype=float),
+            color=WINDOW_SELECTION_COLOR,
+            width=2.0,
+            antialias=True,
+            mode="lines",
+        )
+        self._window_selection_item.setGLOptions("translucent")
+        self.view.addItem(self._window_selection_item)
+        self.view.update()
+
+    def _remove_window_selection_item(self) -> None:
+        item = self._window_selection_item
+        self._window_selection_item = None
+        if item is not None and item in self.view.items:
+            self.view.removeItem(item)
+
+    def _set_window_preview_item(
+        self,
+        surface: FixedSurface,
+        corners: object,
+        camera_position: object,
+        *,
+        is_valid: bool,
+    ) -> None:
+        raw_corners = np.asarray(corners, dtype=float)
+        if raw_corners.shape != (4, 3) or not np.isfinite(raw_corners).all():
+            self._remove_window_preview_item()
+            return
+        normal = _get_fixed_surface_plane_normal(surface)
+        offset_corners = _offset_points_toward_camera(
+            raw_corners,
+            normal,
+            camera_position,
+            WINDOW_PREVIEW_OFFSET_METERS * 1.5,
+        )
+        color = (
+            WINDOW_VALID_PREVIEW_COLOR
+            if is_valid
+            else WINDOW_INVALID_PREVIEW_COLOR
+        )
+        faces = np.asarray(((0, 1, 2), (0, 2, 3)), dtype=np.int32)
+        face_colors = np.tile(np.asarray(color, dtype=float), (2, 1))
+        self._remove_window_preview_item()
+        self._window_preview_item = gl.GLMeshItem(
+            vertexes=np.asarray(offset_corners, dtype=np.float32),
+            faces=faces,
+            faceColors=face_colors,
+            smooth=False,
+            drawFaces=True,
+            drawEdges=True,
+            edgeColor=(color[0], color[1], color[2], 0.95),
+            glOptions="translucent",
+        )
+        self.view.addItem(self._window_preview_item)
+        self.view.update()
+
+    def _remove_window_preview_item(self) -> None:
+        item = self._window_preview_item
+        self._window_preview_item = None
+        if item is not None and item in self.view.items:
+            self.view.removeItem(item)
+        if hasattr(self, "view"):
+            self.view.update()
+
+    # ### Canvas window editor controls ###
+    def _sync_window_tools_controls(self) -> None:
+        selected = self._get_selected_window_wall() is not None
+        if self.add_window_button is not None:
+            self.add_window_button.setEnabled(selected)
+        self._sync_window_undo_button()
+        if self.is_window_placement_active():
+            return
+        self._set_window_tools_status(
+            "Wall selected. Click Add window."
+            if selected
+            else "Select one wall."
+        )
+
+    def _set_add_window_button_checked(self, checked: bool) -> None:
+        if self.add_window_button is None:
+            return
+        was_blocked = self.add_window_button.blockSignals(True)
+        self.add_window_button.setChecked(bool(checked))
+        self.add_window_button.blockSignals(was_blocked)
+
+    def _sync_window_undo_button(self) -> None:
+        if self.undo_window_button is None:
+            return
+        self.undo_window_button.setEnabled(
+            self._window_undo_available
+            and not self.is_window_placement_active()
+        )
+
+    def _set_window_tools_status(self, message: str) -> None:
+        if self.window_tools_status_label is not None:
+            self.window_tools_status_label.setText(str(message))
+
     def focus_navigation(self) -> None:
         """Give the OpenGL viewport input focus after external reparenting."""
 
@@ -955,6 +1566,17 @@ class GlbViewerWidget(QWidget):
         """Whether the generated-model viewport is in first-person mode."""
 
         return self.view.is_first_person_active
+
+    @property
+    def is_first_person_pointer_captured(self) -> bool:
+        """Whether first-person mouse-look currently owns the pointer."""
+
+        return self.view.is_first_person_pointer_captured
+
+    def release_first_person_pointer_capture(self) -> None:
+        """Release mouse-look while preserving the first-person camera view."""
+
+        self.view.release_first_person_pointer_capture()
 
     def get_navigation_mode(self) -> str:
         """Return the active ``orbit`` or ``first_person`` navigation mode."""
@@ -992,17 +1614,26 @@ class GlbViewerWidget(QWidget):
         self.view.set_first_person_camera_pose(pose)
 
     def set_model(self, model: GeneratedModel, preserve_camera: bool = False) -> None:
+        if self._window_editing_enabled:
+            self.cancel_window_placement(status_message=None)
         camera_state = self._capture_camera_state() if preserve_camera else None
         self._texture_edit_mask = None
         self.model = model
         self._populate_scene()
         if camera_state is not None:
             self._restore_camera_state(camera_state)
+            self._refresh_window_selection_outline()
+        if self._window_editing_enabled:
+            self._sync_window_tools_controls()
 
     def clear_model(self) -> None:
+        if self._window_editing_enabled:
+            self.cancel_window_placement(status_message=None)
         self._texture_edit_mask = None
         self.model = None
         self._populate_scene()
+        if self._window_editing_enabled:
+            self._sync_window_tools_controls()
 
     def set_texture_edit_mask(self, mask: np.ndarray | None) -> None:
         """Preview editable UV texels on the generated object's material."""
@@ -1104,6 +1735,7 @@ class GlbViewerWidget(QWidget):
         self._add_grid()
         if self.model is None:
             self._set_default_camera()
+            self._refresh_window_selection_outline()
             return
 
         display_mesh = (
@@ -1163,6 +1795,7 @@ class GlbViewerWidget(QWidget):
         self.view.remember_orbit_camera_state()
         self._set_default_first_person_camera_pose_from_bounding_box(bounding_box)
         self.view.apply_navigation_camera()
+        self._refresh_window_selection_outline()
         self.view.update()
 
     def _add_grid(self) -> None:
@@ -1388,6 +2021,8 @@ class GlbViewerWidget(QWidget):
         self.wall_by_item_id = {}
         self.unused_face_camera_indicator_items = {}
         self.unused_face_camera_indicator_labels = {}
+        self._window_selection_item = None
+        self._window_preview_item = None
 
     def _capture_camera_state(self) -> dict[str, object]:
         camera_state: dict[str, object] = {}
@@ -1408,6 +2043,277 @@ class GlbViewerWidget(QWidget):
         self.view.remember_orbit_camera_state()
         self.view.apply_navigation_camera()
         self.view.update()
+
+
+# ### Window editor helpers ###
+def _world_point_tuple(point: object) -> tuple[float, float, float]:
+    """Return one finite world point as a plain immutable tuple."""
+
+    raw_point = np.asarray(point, dtype=float)
+    if raw_point.shape != (3,) or not np.isfinite(raw_point).all():
+        raise ValueError("A window pointer hit must contain finite XYZ coordinates.")
+    return tuple(float(value) for value in raw_point)
+
+
+def _get_nearest_fixed_surface_ray_hit(
+    surfaces: tuple[FixedSurface, ...],
+    ray_origin: object,
+    ray_direction: object,
+) -> tuple[FixedSurface, np.ndarray, float] | None:
+    """Return the closest double-sided triangle hit without optional ray indexes."""
+
+    origin = np.asarray(ray_origin, dtype=float)
+    direction = np.asarray(ray_direction, dtype=float)
+    if (
+        origin.shape != (3,)
+        or direction.shape != (3,)
+        or not np.isfinite(origin).all()
+        or not np.isfinite(direction).all()
+    ):
+        return None
+    direction_length = float(np.linalg.norm(direction))
+    if direction_length <= 1e-12:
+        return None
+    direction = direction / direction_length
+
+    nearest: tuple[FixedSurface, np.ndarray, float] | None = None
+    for surface in surfaces:
+        hit = _get_nearest_triangle_ray_hit(
+            surface.mesh,
+            origin,
+            direction,
+        )
+        if hit is None:
+            continue
+        hit_point, hit_distance = hit
+        if nearest is None or hit_distance < nearest[2] - 1e-9:
+            nearest = (surface, hit_point, hit_distance)
+    return nearest
+
+
+def _get_nearest_triangle_ray_hit(
+    mesh: object,
+    ray_origin: np.ndarray,
+    ray_direction: np.ndarray,
+) -> tuple[np.ndarray, float] | None:
+    """Intersect one ray with all mesh triangles using Moller-Trumbore."""
+
+    vertices = np.asarray(getattr(mesh, "vertices", ()), dtype=float)
+    faces = np.asarray(getattr(mesh, "faces", ()), dtype=np.int64)
+    if (
+        vertices.ndim != 2
+        or vertices.shape[1:] != (3,)
+        or faces.ndim != 2
+        or faces.shape[1:] != (3,)
+        or len(vertices) == 0
+        or len(faces) == 0
+    ):
+        return None
+    triangles = vertices[faces]
+    first_edges = triangles[:, 1] - triangles[:, 0]
+    second_edges = triangles[:, 2] - triangles[:, 0]
+    repeated_direction = np.broadcast_to(ray_direction, second_edges.shape)
+    cross_direction = np.cross(repeated_direction, second_edges)
+    determinants = np.einsum("ij,ij->i", first_edges, cross_direction)
+    usable = np.abs(determinants) > 1e-10
+    if not np.any(usable):
+        return None
+
+    inverse_determinants = np.zeros_like(determinants)
+    inverse_determinants[usable] = 1.0 / determinants[usable]
+    origin_offsets = ray_origin[np.newaxis, :] - triangles[:, 0]
+    first_coordinates = (
+        np.einsum("ij,ij->i", origin_offsets, cross_direction)
+        * inverse_determinants
+    )
+    offset_crosses = np.cross(origin_offsets, first_edges)
+    second_coordinates = (
+        np.einsum("j,ij->i", ray_direction, offset_crosses)
+        * inverse_determinants
+    )
+    distances = (
+        np.einsum("ij,ij->i", second_edges, offset_crosses)
+        * inverse_determinants
+    )
+    usable &= first_coordinates >= -1e-9
+    usable &= second_coordinates >= -1e-9
+    usable &= first_coordinates + second_coordinates <= 1.0 + 1e-9
+    usable &= distances >= 0.0
+    hit_indices = np.flatnonzero(usable)
+    if hit_indices.size == 0:
+        return None
+    hit_index = int(hit_indices[np.argmin(distances[hit_indices])])
+    distance = float(distances[hit_index])
+    return ray_origin + ray_direction * distance, distance
+
+
+def _get_fixed_surface_wall_frame(
+    surface: FixedSurface,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return wall origin, horizontal tangent, and plane normal."""
+
+    if surface.wall_start_world is None or surface.wall_end_world is None:
+        raise ValueError("The selected wall has no stable placement frame.")
+    wall_start = np.asarray(surface.wall_start_world, dtype=float)
+    wall_end = np.asarray(surface.wall_end_world, dtype=float)
+    if (
+        wall_start.shape != (3,)
+        or wall_end.shape != (3,)
+        or not np.isfinite(wall_start).all()
+        or not np.isfinite(wall_end).all()
+    ):
+        raise ValueError("The selected wall has an invalid placement frame.")
+    wall_axis = wall_end - wall_start
+    wall_axis[2] = 0.0
+    wall_width = float(np.linalg.norm(wall_axis))
+    if wall_width <= 1e-10:
+        raise ValueError("The selected wall is too narrow for a window.")
+    tangent = wall_axis / wall_width
+    plane_normal = np.cross(tangent, np.asarray((0.0, 0.0, 1.0)))
+    normal_length = float(np.linalg.norm(plane_normal))
+    if normal_length <= 1e-10:
+        raise ValueError("The selected wall has an invalid placement plane.")
+    return wall_start, tangent, plane_normal / normal_length
+
+
+def _get_fixed_surface_plane_normal(surface: FixedSurface) -> np.ndarray:
+    """Return a deterministic unit normal for a semantic wall."""
+
+    try:
+        return _get_fixed_surface_wall_frame(surface)[2]
+    except ValueError:
+        vertices = np.asarray(surface.mesh.vertices, dtype=float)
+        faces = np.asarray(surface.mesh.faces, dtype=np.int64)
+        if len(faces) == 0:
+            return np.asarray((0.0, 1.0, 0.0), dtype=float)
+        triangle = vertices[faces[0]]
+        normal = np.cross(triangle[1] - triangle[0], triangle[2] - triangle[0])
+        length = float(np.linalg.norm(normal))
+        if length <= 1e-10:
+            return np.asarray((0.0, 1.0, 0.0), dtype=float)
+        return normal / length
+
+
+def _intersect_ray_with_fixed_surface_plane(
+    surface: FixedSurface,
+    ray_origin: object,
+    ray_direction: object,
+) -> tuple[float, float, float] | None:
+    """Intersect a camera ray with the infinite plane of one selected wall."""
+
+    try:
+        plane_point, _tangent, plane_normal = _get_fixed_surface_wall_frame(
+            surface
+        )
+    except ValueError:
+        return None
+    origin = np.asarray(ray_origin, dtype=float)
+    direction = np.asarray(ray_direction, dtype=float)
+    if origin.shape != (3,) or direction.shape != (3,):
+        return None
+    denominator = float(np.dot(plane_normal, direction))
+    if abs(denominator) <= 1e-10:
+        return None
+    distance = float(np.dot(plane_point - origin, plane_normal) / denominator)
+    if not math.isfinite(distance) or distance < 0.0:
+        return None
+    return _world_point_tuple(origin + direction * distance)
+
+
+def _build_wall_rectangle_corners(
+    surface: FixedSurface,
+    first_world: object,
+    second_world: object,
+) -> tuple[tuple[float, float, float], ...] | None:
+    """Build raw drag corners for valid and invalid live feedback."""
+
+    try:
+        _origin, tangent, _normal = _get_fixed_surface_wall_frame(surface)
+        first = np.asarray(_world_point_tuple(first_world), dtype=float)
+        second = np.asarray(_world_point_tuple(second_world), dtype=float)
+    except ValueError:
+        return None
+    horizontal_delta = tangent * float(np.dot(second - first, tangent))
+    vertical_delta = np.asarray((0.0, 0.0, second[2] - first[2]), dtype=float)
+    corners = (
+        first,
+        first + horizontal_delta,
+        first + horizontal_delta + vertical_delta,
+        first + vertical_delta,
+    )
+    return tuple(_world_point_tuple(corner) for corner in corners)
+
+
+def _build_validated_wall_window_placement(
+    surface: FixedSurface,
+    first_world: object,
+    second_world: object,
+) -> WallWindowPlacement:
+    """Keep the geometry validation call isolated for UI tests."""
+
+    return build_wall_window_placement(surface, first_world, second_world)
+
+
+def _get_validated_wall_window_world_corners(
+    surface: FixedSurface,
+    placement: object,
+) -> tuple[tuple[float, float, float], ...]:
+    """Resolve validated immutable placement bounds into preview corners."""
+
+    if not isinstance(placement, WallWindowPlacement):
+        raise TypeError("A Canvas window preview requires a wall placement.")
+    return get_wall_window_world_corners(surface, placement)
+
+
+def _build_fixed_surface_boundary_line_positions(
+    surface: FixedSurface,
+) -> np.ndarray | None:
+    """Return paired boundary vertices for a visible semantic selection."""
+
+    mesh = surface.mesh.copy()
+    try:
+        mesh.merge_vertices()
+    except (AttributeError, TypeError, ValueError):
+        pass
+    vertices = np.asarray(mesh.vertices, dtype=float)
+    unique_edges = np.asarray(mesh.edges_unique, dtype=np.int64)
+    inverse_edges = np.asarray(mesh.edges_unique_inverse, dtype=np.int64)
+    if len(vertices) == 0 or len(unique_edges) == 0:
+        return None
+    edge_counts = np.bincount(inverse_edges, minlength=len(unique_edges))
+    boundary_edges = unique_edges[edge_counts == 1]
+    if len(boundary_edges) == 0:
+        boundary_edges = unique_edges
+    return np.asarray(vertices[boundary_edges].reshape(-1, 3), dtype=float)
+
+
+def _offset_points_toward_camera(
+    points: object,
+    plane_normal: object,
+    camera_position: object,
+    distance: float,
+) -> np.ndarray:
+    """Offset coplanar feedback toward the current camera to avoid flicker."""
+
+    raw_points = np.asarray(points, dtype=float)
+    normal = np.asarray(plane_normal, dtype=float)
+    if isinstance(camera_position, QVector3D):
+        camera = np.asarray(
+            (camera_position.x(), camera_position.y(), camera_position.z()),
+            dtype=float,
+        )
+    else:
+        camera = np.asarray(camera_position, dtype=float)
+    if (
+        raw_points.ndim != 2
+        or raw_points.shape[1:] != (3,)
+        or normal.shape != (3,)
+        or camera.shape != (3,)
+    ):
+        return raw_points
+    center = np.mean(raw_points, axis=0)
+    sign = 1.0 if float(np.dot(camera - center, normal)) >= 0.0 else -1.0
+    return raw_points + normal[np.newaxis, :] * sign * abs(float(distance))
 
 
 # ### Transform helpers ###

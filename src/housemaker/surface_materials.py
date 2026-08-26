@@ -148,7 +148,6 @@ def build_world_planar_textured_mesh(
     *,
     texture_world_size_meters: float = DEFAULT_SURFACE_TEXTURE_WORLD_SIZE_METERS,
     material_name: str | None = None,
-    overlay_offset_meters: float = 0.0,
     double_sided: bool = False,
 ) -> trimesh.Trimesh:
     """Expand faces and attach stable world-scale planar UV coordinates."""
@@ -170,12 +169,6 @@ def build_world_planar_textured_mesh(
     face_normals = np.asarray(mesh.face_normals, dtype=float)
     if face_normals.shape != faces.shape:
         raise ValueError("Surface material mesh normals are invalid.")
-    overlay_offset = _normalize_overlay_offset(overlay_offset_meters)
-    if overlay_offset != 0.0:
-        face_vertices = (
-            face_vertices
-            + face_normals[:, np.newaxis, :] * overlay_offset
-        )
     uv_coordinates = build_world_planar_face_uvs(
         face_vertices,
         face_normals,
@@ -264,15 +257,3 @@ def _get_assignment_member(assignment: object, name: str) -> object:
     if isinstance(assignment, Mapping):
         return assignment.get(name)
     return getattr(assignment, name, None)
-
-
-def _normalize_overlay_offset(value: object) -> float:
-    if isinstance(value, bool):
-        raise ValueError("Surface overlay offset must be a number.")
-    try:
-        offset = float(value)
-    except (TypeError, ValueError, OverflowError) as error:
-        raise ValueError("Surface overlay offset must be a number.") from error
-    if not math.isfinite(offset) or offset < 0.0:
-        raise ValueError("Surface overlay offset must be finite and non-negative.")
-    return offset

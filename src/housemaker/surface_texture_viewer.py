@@ -502,10 +502,8 @@ class SurfaceTextureViewer(QWidget):
         self,
         levels: Sequence[LevelData],
         initial_camera: InitialFirstPersonCamera | CameraPose | None = None,
-        additional_surfaces: Sequence[FixedSurface] = (),
     ) -> None:
-        surfaces = [*build_fixed_surfaces(levels), *list(additional_surfaces)]
-        self.set_surfaces(surfaces)
+        self.set_surfaces(build_fixed_surfaces(levels))
         pose = _get_initial_pose(initial_camera)
         if pose is None:
             pose = _build_default_camera_pose(self._surfaces)
@@ -1237,7 +1235,6 @@ class SurfaceTextureViewer(QWidget):
         double_sided = (
             surface.surface_type == SURFACE_TYPE_WALL
             and surface.room_index is None
-            and surface.overlay_parent_surface_id is None
         )
         return ((texture_data, double_sided),)
 

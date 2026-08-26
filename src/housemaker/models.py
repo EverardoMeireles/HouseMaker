@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import math
+import re
 from dataclasses import dataclass, field
 
 # ### Constants ###
@@ -25,6 +26,9 @@ MIN_DOORWAY_HEIGHT_METERS = 0.10
 MAX_DOORWAY_HEIGHT_METERS = 20.0
 MIN_DOORWAY_DEPTH_METERS = 0.01
 MAX_DOORWAY_DEPTH_METERS = 10.0
+MAX_WINDOW_ID_LENGTH = 128
+MAX_WINDOW_SURFACE_ID_LENGTH = 512
+MIN_WINDOW_RATIO_SPAN = 1e-6
 DEFAULT_ROOM_HEIGHT_METERS = 3.0
 DEFAULT_IMAGE_SCALE = 1.0
 DEFAULT_IMAGE_OFFSET = 0.0
@@ -51,6 +55,11 @@ MIN_LEVEL_INDEX = 0
 MAX_LEVEL_INDEX = 7
 SNAP_ANGLE_DEGREES = 10.0
 VERTEX_HIT_RADIUS_SCREEN = 12.0
+_WINDOW_WALL_SURFACE_ID_PATTERN = re.compile(
+    r"^level:(?:0|[1-9]\d*)/"
+    r"(?:room:(?:0|[1-9]\d*)/)?"
+    r"wall:[1-9]\d*:[1-9]\d*$"
+)
 
 # ### Data models ###
 @dataclass(frozen=True)
@@ -113,6 +122,77 @@ class DoorwayData:
     height_meters: float
     depth_meters: float = DEFAULT_DOORWAY_DEPTH_METERS
     rotation_degrees: float = 0.0
+
+
+@dataclass(frozen=True)
+class WindowData:
+    """One stable rectangular opening attached to a semantic wall."""
+
+    window_id: str
+    wall_surface_id: str
+    start_ratio: float
+    end_ratio: float
+    bottom_ratio: float
+    top_ratio: float
+
+    def __post_init__(self) -> None:
+        window_id = _normalize_window_text(
+            self.window_id,
+            "Window ID",
+            MAX_WINDOW_ID_LENGTH,
+        )
+        wall_surface_id = _normalize_window_text(
+            self.wall_surface_id,
+            "Window wall surface ID",
+            MAX_WINDOW_SURFACE_ID_LENGTH,
+        )
+        if not _WINDOW_WALL_SURFACE_ID_PATTERN.fullmatch(wall_surface_id):
+            raise ValueError("A window must reference a stable wall surface ID.")
+
+        start_ratio = _normalize_window_ratio(
+            self.start_ratio,
+            "start",
+        )
+        end_ratio = _normalize_window_ratio(self.end_ratio, "end")
+        bottom_ratio = _normalize_window_ratio(
+            self.bottom_ratio,
+            "bottom",
+        )
+        top_ratio = _normalize_window_ratio(self.top_ratio, "top")
+        if end_ratio - start_ratio <= MIN_WINDOW_RATIO_SPAN:
+            raise ValueError("A window must have a positive wall-local width.")
+        if top_ratio - bottom_ratio <= MIN_WINDOW_RATIO_SPAN:
+            raise ValueError("A window must have a positive wall-local height.")
+
+        object.__setattr__(self, "window_id", window_id)
+        object.__setattr__(self, "wall_surface_id", wall_surface_id)
+        object.__setattr__(self, "start_ratio", start_ratio)
+        object.__setattr__(self, "end_ratio", end_ratio)
+        object.__setattr__(self, "bottom_ratio", bottom_ratio)
+        object.__setattr__(self, "top_ratio", top_ratio)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "window_id": self.window_id,
+            "wall_surface_id": self.wall_surface_id,
+            "start_ratio": self.start_ratio,
+            "end_ratio": self.end_ratio,
+            "bottom_ratio": self.bottom_ratio,
+            "top_ratio": self.top_ratio,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "WindowData":
+        if not isinstance(payload, dict):
+            raise ValueError("Window JSON must contain an object.")
+        return cls(
+            window_id=payload.get("window_id", ""),
+            wall_surface_id=payload.get("wall_surface_id", ""),
+            start_ratio=payload.get("start_ratio"),
+            end_ratio=payload.get("end_ratio"),
+            bottom_ratio=payload.get("bottom_ratio"),
+            top_ratio=payload.get("top_ratio"),
+        )
 
 
 @dataclass(frozen=True, init=False)
@@ -708,10 +788,45 @@ class LevelData:
     include_in_export: bool = DEFAULT_INCLUDE_IN_EXPORT
     floor_thickness_meters: float = DEFAULT_FLOOR_THICKNESS_METERS
     floor_contour_vertex_ids: tuple[int, ...] = ()
+    windows: list[WindowData] = field(default_factory=list)
 
     @property
     def display_name(self) -> str:
         return f"L{self.index} {self.name}"
+
+
+# ### Window validation helpers ###
+def _normalize_window_text(
+    value: object,
+    field_name: str,
+    maximum_length: int,
+) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string.")
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{field_name} cannot be empty.")
+    if len(normalized) > maximum_length:
+        raise ValueError(f"{field_name} is too long.")
+    if any(ord(character) < 32 for character in normalized):
+        raise ValueError(f"{field_name} cannot contain control characters.")
+    return normalized
+
+
+def _normalize_window_ratio(value: object, field_name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"Window {field_name} ratio must be a number.")
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            f"Window {field_name} ratio must be a number."
+        ) from error
+    if not math.isfinite(ratio) or not 0.0 <= ratio <= 1.0:
+        raise ValueError(
+            f"Window {field_name} ratio must be between zero and one."
+        )
+    return ratio
 
 
 # ### Geometry helpers ###

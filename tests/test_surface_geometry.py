@@ -11,7 +11,6 @@ from housemaker.surface_geometry import (
     SURFACE_TYPE_FLOOR,
     SURFACE_TYPE_WALL,
     build_fixed_surfaces,
-    build_surface_overlay_plane,
     get_combined_surface_area,
 )
 
@@ -298,29 +297,6 @@ class FixedSurfaceGeometryTests(unittest.TestCase):
                 np.tile(expected_normal, (2, 1)),
                 atol=1e-7,
             )
-
-    def test_overlay_front_follows_its_signed_normal_offset(self) -> None:
-        parent = _surface_by_id(_build_square_level())[
-            "level:2/room:5/wall:1:2"
-        ]
-        positive = build_surface_overlay_plane(parent, "overlay:positive", 0.01)
-        negative = build_surface_overlay_plane(parent, "overlay:negative", -0.01)
-        parent_normal = np.mean(parent.mesh.face_normals, axis=0)  # type: ignore[attr-defined]
-        parent_normal /= np.linalg.norm(parent_normal)
-        parent_center = np.mean(parent.mesh.triangles_center, axis=0)  # type: ignore[attr-defined]
-
-        for overlay, expected_direction in ((positive, 1.0), (negative, -1.0)):
-            overlay_center = np.mean(overlay.mesh.triangles_center, axis=0)
-            center_offset = float(
-                np.dot(overlay_center - parent_center, parent_normal)
-            )
-            normal_alignment = overlay.mesh.face_normals @ parent_normal
-
-            self.assertAlmostEqual(center_offset, expected_direction * 0.01)
-            self.assertTrue(
-                np.all(normal_alignment * expected_direction > 0.99)
-            )
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -55,6 +55,11 @@ from housemaker.surface_texture_state import (
 from housemaker.surface_texture_workspace import (
     SurfaceTextureGenerationWorkspace,
 )
+from housemaker.surface_geometry import (
+    WallWindowPlacement,
+    add_wall_window,
+    build_fixed_surfaces,
+)
 from housemaker.glb import (
     DEFAULT_WALL_HEIGHT_METERS,
     GeneratedModel,
@@ -97,6 +102,7 @@ from housemaker.models import (
     STAIR_STYLE_SUPPORTED,
     StairData,
     StairSectionData,
+    WindowData,
     create_default_doorway_presets,
     create_default_levels,
 )
@@ -260,6 +266,7 @@ class BlueprintWorkspace(QWidget):
         self._atlas_preview_variant_key: tuple[
             str, int, str, int, int
         ] | None = None
+        self._canvas_window_undo_ids: list[str] = []
         self._is_shutdown = False
         self.texture_creator_level_index: int | None = None
         self.texture_creator_room_index: int | None = None
@@ -299,7 +306,7 @@ class BlueprintWorkspace(QWidget):
 
         self.workspace_tabs = QTabWidget()
         self.canvas = BlueprintCanvas()
-        self.viewer = GlbViewerWidget()
+        self.viewer = GlbViewerWidget(window_editing_enabled=True)
         self.canvas_3d_navigation_shortcut = QShortcut(self.viewer)
         self.canvas_3d_navigation_shortcut.setContext(
             Qt.ShortcutContext.WidgetWithChildrenShortcut
@@ -399,6 +406,12 @@ class BlueprintWorkspace(QWidget):
             self._handle_workspace_tab_changed
         )
         self.viewer.wall_selected.connect(self._handle_viewer_wall_selected)
+        self.viewer.window_placement_requested.connect(
+            self._handle_canvas_window_placement_requested
+        )
+        self.viewer.window_undo_requested.connect(
+            self._handle_canvas_window_undo_requested
+        )
         self.viewer.navigation_mode_changed.connect(
             self._handle_canvas_3d_navigation_mode_changed
         )
@@ -1046,6 +1059,165 @@ class BlueprintWorkspace(QWidget):
             self.canvas_3d_view_tab_index,
             tab_label,
         )
+
+    def _handle_canvas_window_placement_requested(
+        self,
+        raw_placement: object,
+    ) -> None:
+        """Commit one validated Canvas rectangle as a real wall opening."""
+
+        if not isinstance(raw_placement, WallWindowPlacement):
+            self.viewer.set_window_tools_status(
+                "The requested window placement is invalid."
+            )
+            return
+
+        try:
+            window = add_wall_window(self.levels, raw_placement)
+        except (TypeError, ValueError) as error:
+            self.viewer.set_window_tools_status(f"Window not added: {error}")
+            return
+
+        try:
+            generated_model = self._build_generated_model(None)
+        except Exception as error:
+            self._rollback_canvas_window(window.window_id)
+            self.viewer.set_window_tools_status(f"Window not added: {error}")
+            return
+        if generated_model is None:
+            self._rollback_canvas_window(window.window_id)
+            self.viewer.set_window_tools_status(
+                "Window not added because the updated model could not be built."
+            )
+            return
+
+        try:
+            self._apply_canvas_window_preview(generated_model)
+        except Exception as error:
+            self._rollback_canvas_window(window.window_id)
+            self._restore_canvas_window_preview_after_rollback()
+            self.viewer.set_window_tools_status(f"Window not added: {error}")
+            return
+
+        self._canvas_window_undo_ids.append(window.window_id)
+        self._sync_canvas_window_undo_availability()
+        self.viewer.set_window_tools_status("Window added.")
+
+    def _handle_canvas_window_undo_requested(self) -> None:
+        """Undo the latest successfully committed Canvas window transaction."""
+
+        self._sync_canvas_window_undo_availability()
+        if not self._canvas_window_undo_ids:
+            self.viewer.set_window_tools_status("No added window to undo.")
+            return
+
+        window_id = self._canvas_window_undo_ids[-1]
+        removed = self._remove_canvas_window(window_id)
+        if removed is None:
+            self._sync_canvas_window_undo_availability()
+            self.viewer.set_window_tools_status("No added window to undo.")
+            return
+        level, window_index, window = removed
+
+        try:
+            generated_model = self._build_generated_model(None)
+        except Exception as error:
+            level.windows.insert(window_index, window)
+            self._sync_canvas_window_undo_availability()
+            self.viewer.set_window_tools_status(
+                f"Window could not be undone: {error}"
+            )
+            return
+        if generated_model is None:
+            level.windows.insert(window_index, window)
+            self._sync_canvas_window_undo_availability()
+            self.viewer.set_window_tools_status(
+                "Window could not be undone because the model could not be built."
+            )
+            return
+
+        try:
+            self._apply_canvas_window_preview(generated_model)
+        except Exception as error:
+            level.windows.insert(window_index, window)
+            self._restore_canvas_window_preview_after_rollback()
+            self._sync_canvas_window_undo_availability()
+            self.viewer.set_window_tools_status(
+                f"Window could not be undone: {error}"
+            )
+            return
+
+        self._canvas_window_undo_ids.pop()
+        self._sync_canvas_window_undo_availability()
+        self.viewer.set_window_tools_status("Window undone.")
+
+    def _apply_canvas_window_preview(
+        self,
+        generated_model: GeneratedModel,
+    ) -> None:
+        """Refresh every 3D consumer from one committed window state."""
+
+        wall_targets = tuple(build_fixed_surfaces(self.levels))
+        self.viewer.set_wall_targets(wall_targets)
+        self.viewer.set_model(generated_model, preserve_camera=True)
+        self.surface_texture_generation.set_levels(
+            self.levels,
+            self.initial_first_person_camera,
+        )
+        self.surface_texture_generation.set_preview_model(generated_model)
+
+    def _restore_canvas_window_preview_after_rollback(self) -> None:
+        """Best-effort repair after a display refresh failed mid-transaction."""
+
+        try:
+            generated_model = self._build_generated_model(None)
+            if generated_model is not None:
+                self._apply_canvas_window_preview(generated_model)
+        except Exception:
+            return
+
+    def _sync_canvas_window_undo_availability(self) -> None:
+        """Discard stale history IDs and synchronize the Canvas undo button."""
+
+        while self._canvas_window_undo_ids:
+            window_id = self._canvas_window_undo_ids[-1]
+            if self._find_canvas_window(window_id) is not None:
+                break
+            self._canvas_window_undo_ids.pop()
+        self.viewer.set_window_undo_available(
+            bool(self._canvas_window_undo_ids)
+        )
+
+    def _find_canvas_window(
+        self,
+        window_id: str,
+    ) -> tuple[LevelData, int, WindowData] | None:
+        """Locate one exact committed window without relying on active level."""
+
+        normalized_id = str(window_id)
+        for level in self.levels:
+            for index, window in enumerate(level.windows):
+                if window.window_id == normalized_id:
+                    return level, index, window
+        return None
+
+    def _remove_canvas_window(
+        self,
+        window_id: str,
+    ) -> tuple[LevelData, int, WindowData] | None:
+        """Remove and return one window so a failed undo can restore its index."""
+
+        found = self._find_canvas_window(window_id)
+        if found is None:
+            return None
+        level, index, window = found
+        del level.windows[index]
+        return level, index, window
+
+    def _rollback_canvas_window(self, window_id: str) -> None:
+        """Remove only the just-created window after a pre-display failure."""
+
+        self._remove_canvas_window(window_id)
 
     def _build_uvs_tab(self) -> QWidget:
         uvs_tab = QWidget()
@@ -2004,21 +2176,12 @@ class BlueprintWorkspace(QWidget):
         failure_title: str | None,
     ) -> GeneratedModel | None:
         try:
-            overlay_planes = (
-                self.surface_texture_generation.get_surface_overlay_planes()
-            )
-            overlay_arguments = (
-                {"surface_overlay_planes": overlay_planes}
-                if overlay_planes
-                else {}
-            )
             return convert_to_glb(
                 self.levels,
                 stairs=self.stairs,
                 surface_materials=(
                     self.surface_texture_generation.get_surface_material_sources()
                 ),
-                **overlay_arguments,
             )
         except ValueError as error:
             if failure_title is not None:
@@ -2037,12 +2200,16 @@ class BlueprintWorkspace(QWidget):
     def _refresh_viewer_preview(self, preserve_camera: bool = False) -> None:
         generated_model = self._build_generated_model(None)
         if generated_model is None:
+            self.viewer.set_wall_targets(())
             self.viewer.clear_model()
             self.surface_texture_generation.set_preview_model(None)
+            self._sync_canvas_window_undo_availability()
             return
 
+        self.viewer.set_wall_targets(tuple(build_fixed_surfaces(self.levels)))
         self.viewer.set_model(generated_model, preserve_camera=preserve_camera)
         self.surface_texture_generation.set_preview_model(generated_model)
+        self._sync_canvas_window_undo_availability()
 
     def _schedule_viewer_preview_refresh(self, preserve_camera: bool = True) -> None:
         if not self._viewer_preview_is_active():
@@ -3682,6 +3849,8 @@ class BlueprintWorkspace(QWidget):
             )
 
         self.canvas.cancel_stair_placement()
+        self._canvas_window_undo_ids.clear()
+        self.viewer.set_window_undo_available(False)
         self.levels = levels
         self.stairs = list(stairs or [])
         self.initial_first_person_camera = initial_first_person_camera

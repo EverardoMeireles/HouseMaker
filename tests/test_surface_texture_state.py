@@ -96,7 +96,6 @@ class SurfaceTextureStateRoundTripTests(unittest.TestCase):
         )
 
         self.assertEqual(state.assignments, [_assignment()])
-        self.assertEqual(state.overlay_planes, [])
         self.assertEqual(state.localized_inpaint_undo_stack, [])
 
     def test_3d_texture_mask_strokes_round_trip_per_stable_surface(self) -> None:
@@ -221,6 +220,7 @@ class SurfaceTextureSelectionTests(unittest.TestCase):
             (SURFACE_TYPE_CEILING, ("level:2/room:0/floor",)),
             (SURFACE_TYPE_WALL, ("room:0/wall:1:2",)),
             (SURFACE_TYPE_WALL, ("level:-1/room:0/wall:1:2",)),
+            (SURFACE_TYPE_WALL, ("level:2/room:0/wall:1:2/overlay:1",)),
         )
         for surface_type, surface_ids in invalid_selections:
             with self.subTest(surface_type=surface_type, surface_ids=surface_ids):
@@ -254,7 +254,7 @@ class SurfaceTextureAssignmentTests(unittest.TestCase):
 
         restored = SurfaceTextureAssignment.from_dict(assignment.to_dict())
 
-        self.assertEqual(SURFACE_TEXTURE_SCHEMA_VERSION, 4)
+        self.assertEqual(SURFACE_TEXTURE_SCHEMA_VERSION, 5)
         self.assertEqual(
             restored.selected_texture_resolution,
             DEFAULT_SURFACE_TEXTURE_RESOLUTION,
@@ -386,6 +386,56 @@ class SurfaceTextureAssignmentTests(unittest.TestCase):
 
 # ### Defensive loading tests ###
 class SurfaceTextureDefensiveLoadingTests(unittest.TestCase):
+    def test_schema_four_overlay_data_is_loaded_as_inert_state(self) -> None:
+        wall_id = "level:2/room:0/wall:1:2"
+        overlay_id = f"{wall_id}/overlay:1"
+        mixed_assignment = _assignment().to_dict() | {
+            "assignment_id": "mixed",
+            "surface_ids": [wall_id, overlay_id],
+        }
+        overlay_assignment = _assignment().to_dict() | {
+            "assignment_id": "overlay-only",
+            "surface_ids": [overlay_id],
+        }
+        loaded = SurfaceTextureData.from_dict(
+            {
+                "schema_version": 4,
+                "selected_surface_type": SURFACE_TYPE_WALL,
+                "selected_surface_ids": [overlay_id, wall_id],
+                "texture_mask_strokes": {
+                    overlay_id: [_stroke(0.2).to_dict()],
+                    wall_id: [_stroke(0.8).to_dict()],
+                },
+                "overlay_planes": [
+                    {
+                        "surface_id": overlay_id,
+                        "parent_surface_id": wall_id,
+                        "normal_offset_meters": 0.003,
+                    }
+                ],
+                "assignments": [mixed_assignment, overlay_assignment],
+                "localized_inpaint_undo_stack": [
+                    {
+                        "previous_assignments": [overlay_assignment],
+                        "replacement_assignment_ids": ["overlay-after"],
+                        "affected_surface_ids": [overlay_id],
+                        "previous_texture_mask_strokes": {
+                            overlay_id: [_stroke().to_dict()]
+                        },
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(loaded.selected_surface_ids, (wall_id,))
+        self.assertEqual(loaded.texture_mask_strokes, {wall_id: [_stroke(0.8)]})
+        self.assertEqual(len(loaded.assignments), 1)
+        self.assertEqual(loaded.assignments[0].assignment_id, "mixed")
+        self.assertEqual(loaded.assignments[0].surface_ids, (wall_id,))
+        self.assertEqual(loaded.localized_inpaint_undo_stack, [])
+        self.assertFalse(hasattr(loaded, "overlay_planes"))
+        self.assertNotIn("overlay_planes", loaded.to_dict())
+
     def test_legacy_keys_load_and_out_of_range_frame_data_is_bounded(self) -> None:
         payload = {
             "video": _video(3).to_dict(),

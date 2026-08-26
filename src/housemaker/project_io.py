@@ -45,6 +45,7 @@ from housemaker.models import (
     StairData,
     VertexData,
     WallTextureData,
+    WindowData,
     create_default_doorway_presets,
     create_default_levels,
 )
@@ -143,6 +144,7 @@ def save_project(
                     _serialize_doorway(doorway)
                     for doorway in level.doorways
                 ],
+                "windows": [window.to_dict() for window in level.windows],
             }
             for level in levels
         ],
@@ -220,6 +222,10 @@ def load_project(path: str | Path) -> ProjectData:
             default_height_meters=level.height_meters,
         )
         level.doorways = _deserialize_doorways(raw_level.get("doorways", []))
+        level.windows = _deserialize_windows(
+            raw_level.get("windows", []),
+            level_index=level.index,
+        )
 
     image_library_paths = _deserialize_image_library_paths(
         payload.get("image_library_paths", [])
@@ -688,6 +694,30 @@ def _deserialize_doorway_rotation_degrees(raw_rotation_degrees: object) -> float
         return 0.0
 
     return rotation_degrees % 360.0
+
+
+# ### Window serialization helpers ###
+def _deserialize_windows(
+    raw_windows: object,
+    level_index: int,
+) -> list[WindowData]:
+    if not isinstance(raw_windows, list | tuple):
+        return []
+
+    windows: list[WindowData] = []
+    window_ids: set[str] = set()
+    for raw_window in raw_windows:
+        try:
+            window = WindowData.from_dict(raw_window)
+        except (TypeError, ValueError):
+            continue
+        if not window.wall_surface_id.startswith(f"level:{level_index}/"):
+            continue
+        if window.window_id in window_ids:
+            continue
+        window_ids.add(window.window_id)
+        windows.append(window)
+    return windows
 
 
 # ### Room serialization helpers ###

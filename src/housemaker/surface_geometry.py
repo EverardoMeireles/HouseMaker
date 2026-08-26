@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
@@ -13,7 +14,11 @@ from shapely import LineString, Point, Polygon
 from housemaker.glb import (
     WALL_OPENING_EPSILON,
     WallOpening,
+    WindowReveal,
+    _build_level_window_reveals,
+    _build_wall_opening_reveal_quads,
     _build_visible_wall_pieces,
+    _build_level_wall_openings,
     _build_wall_openings,
     _clip_wall_segment_to_opening,
     _interpolate_2d_point,
@@ -22,7 +27,7 @@ from housemaker.level_coordinates import (
     build_level_base_z_lookup,
     level_image_to_world_xy,
 )
-from housemaker.models import Edge, LevelData, RoomData
+from housemaker.models import Edge, LevelData, RoomData, WindowData
 from housemaker.uv_layout import build_room_walls
 
 
@@ -34,9 +39,9 @@ SURFACE_TYPES = frozenset(
     (SURFACE_TYPE_WALL, SURFACE_TYPE_FLOOR, SURFACE_TYPE_CEILING)
 )
 SURFACE_GEOMETRY_EPSILON = 1e-8
-DEFAULT_SURFACE_OVERLAY_OFFSET_METERS = 0.003
-MAX_SURFACE_OVERLAY_OFFSET_METERS = 0.05
-SURFACE_OVERLAY_COPLANAR_DECIMALS = 6
+MIN_WINDOW_SIZE_METERS = 0.05
+WINDOW_PLANE_DISTANCE_TOLERANCE_METERS = 0.01
+WINDOW_PATCH_COVERAGE_TOLERANCE_METERS = 1e-7
 DOORWAY_REVEAL_PARALLEL_COSINE = math.cos(math.radians(10.0))
 SURFACE_INTERIOR_PROBE_RATIOS = (1e-7, 1e-6, 1e-5, 1e-4, 1e-3)
 
@@ -54,7 +59,9 @@ class FixedSurface:
     mesh: trimesh.Trimesh
     area_square_meters: float
     wall_key: str | None = None
-    overlay_parent_surface_id: str | None = None
+    wall_start_world: tuple[float, float, float] | None = None
+    wall_end_world: tuple[float, float, float] | None = None
+    wall_height_meters: float | None = None
 
     def __post_init__(self) -> None:
         if not self.surface_id:
@@ -68,8 +75,35 @@ class FixedSurface:
             or float(self.area_square_meters) <= 0.0
         ):
             raise ValueError("A fixed surface area must be finite and positive.")
-        if self.overlay_parent_surface_id == self.surface_id:
-            raise ValueError("A surface overlay cannot be its own parent.")
+
+
+@dataclass(frozen=True)
+class WallWindowPlacement:
+    """A validated rectangle in one stable wall's normalized local frame."""
+
+    wall_surface_id: str
+    start_ratio: float
+    end_ratio: float
+    bottom_ratio: float
+    top_ratio: float
+
+    def __post_init__(self) -> None:
+        validated = WindowData(
+            window_id="placement",
+            wall_surface_id=self.wall_surface_id,
+            start_ratio=self.start_ratio,
+            end_ratio=self.end_ratio,
+            bottom_ratio=self.bottom_ratio,
+            top_ratio=self.top_ratio,
+        )
+        for field_name in (
+            "wall_surface_id",
+            "start_ratio",
+            "end_ratio",
+            "bottom_ratio",
+            "top_ratio",
+        ):
+            object.__setattr__(self, field_name, getattr(validated, field_name))
 
 
 @dataclass(frozen=True)
@@ -90,11 +124,15 @@ def build_fixed_surfaces(levels: Sequence[LevelData]) -> list[FixedSurface]:
             continue
         base_z_meters = level_base_z.get(level.index, 0.0)
         reveal_owner_by_opening_index = _build_doorway_reveal_owner_lookup(level)
+        window_reveals_by_surface_id = _group_window_reveals_by_surface_id(
+            _build_level_window_reveals(level)
+        )
         surfaces.extend(
             _build_plain_level_wall_surfaces(
                 level,
                 base_z_meters,
                 reveal_owner_by_opening_index,
+                window_reveals_by_surface_id,
             )
         )
         for room_index, room in enumerate(level.rooms):
@@ -106,6 +144,9 @@ def build_fixed_surfaces(levels: Sequence[LevelData]) -> list[FixedSurface]:
                     base_z_meters=base_z_meters,
                     reveal_owner_by_opening_index=(
                         reveal_owner_by_opening_index
+                    ),
+                    window_reveals_by_surface_id=(
+                        window_reveals_by_surface_id
                     ),
                 )
             )
@@ -133,74 +174,164 @@ def get_combined_surface_area(
     )
 
 
-def build_surface_overlay_plane(
+def build_wall_window_placement(
     parent_surface: FixedSurface,
-    overlay_surface_id: str,
-    normal_offset_meters: float,
-) -> FixedSurface:
-    """Copy the parent's dominant plane at a small signed normal offset."""
+    first_world_point: Sequence[float],
+    second_world_point: Sequence[float],
+) -> WallWindowPlacement:
+    """Validate a dragged wall rectangle and return stable local bounds."""
 
-    if not isinstance(parent_surface, FixedSurface):
-        raise TypeError("A surface overlay requires a fixed parent surface.")
-    if parent_surface.overlay_parent_surface_id is not None:
-        raise ValueError("A surface overlay cannot be created on another overlay.")
-    normalized_id = str(overlay_surface_id).strip()
-    if not normalized_id:
-        raise ValueError("A surface overlay requires a stable ID.")
-    offset = _normalize_surface_overlay_offset(normal_offset_meters)
-    face_indices, plane_normal = _get_dominant_coplanar_face_patch(
-        parent_surface.mesh
+    wall_start, wall_end, wall_height = _get_window_wall_frame(parent_surface)
+    first = _normalize_window_world_point(first_world_point)
+    second = _normalize_window_world_point(second_world_point)
+    wall_axis = wall_end - wall_start
+    wall_width = float(np.linalg.norm(wall_axis))
+    tangent = wall_axis / wall_width
+    plane_normal = np.cross(tangent, np.asarray((0.0, 0.0, 1.0)))
+    for point in (first, second):
+        plane_distance = abs(float(np.dot(point - wall_start, plane_normal)))
+        if plane_distance > WINDOW_PLANE_DISTANCE_TOLERANCE_METERS:
+            raise ValueError("A window rectangle must stay on its selected wall.")
+
+    horizontal_ratios = sorted(
+        float(np.dot(point - wall_start, tangent)) / wall_width
+        for point in (first, second)
     )
-    source_vertices = np.asarray(parent_surface.mesh.vertices, dtype=float)
-    source_faces = np.asarray(parent_surface.mesh.faces, dtype=np.int64)
-    face_vertices = source_vertices[source_faces[face_indices]].copy()
-    face_vertices += plane_normal[np.newaxis, np.newaxis, :] * offset
-    if offset < 0.0:
-        face_vertices = face_vertices[:, ::-1, :]
-    vertices = face_vertices.reshape(-1, 3)
-    faces = np.arange(len(vertices), dtype=np.int64).reshape(-1, 3)
-    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-    area = float(mesh.area)
-    if area <= SURFACE_GEOMETRY_EPSILON:
-        raise ValueError("A surface overlay requires a usable planar patch.")
-    return FixedSurface(
-        surface_id=normalized_id,
-        surface_type=parent_surface.surface_type,
-        level_index=parent_surface.level_index,
-        room_index=parent_surface.room_index,
-        wall_key=parent_surface.wall_key,
-        mesh=mesh,
-        area_square_meters=area,
-        overlay_parent_surface_id=parent_surface.surface_id,
+    vertical_ratios = sorted(
+        (float(point[2]) - float(wall_start[2])) / wall_height
+        for point in (first, second)
     )
+    start_ratio, end_ratio = _clamp_window_ratio_pair(
+        horizontal_ratios,
+        "horizontal",
+    )
+    bottom_ratio, top_ratio = _clamp_window_ratio_pair(
+        vertical_ratios,
+        "vertical",
+    )
+    if (end_ratio - start_ratio) * wall_width < MIN_WINDOW_SIZE_METERS:
+        raise ValueError("A window must be at least 5 cm wide.")
+    if (top_ratio - bottom_ratio) * wall_height < MIN_WINDOW_SIZE_METERS:
+        raise ValueError("A window must be at least 5 cm tall.")
+
+    placement = WallWindowPlacement(
+        wall_surface_id=parent_surface.surface_id,
+        start_ratio=start_ratio,
+        end_ratio=end_ratio,
+        bottom_ratio=bottom_ratio,
+        top_ratio=top_ratio,
+    )
+    _validate_window_patch_coverage(parent_surface, placement)
+    return placement
 
 
-def get_surface_overlay_offset_toward_point(
+def get_wall_window_world_corners(
     parent_surface: FixedSurface,
-    world_point: Sequence[float],
-    distance_meters: float = DEFAULT_SURFACE_OVERLAY_OFFSET_METERS,
-) -> float:
-    """Choose the signed offset that puts an overlay toward a viewer point."""
+    placement: WallWindowPlacement | WindowData,
+) -> tuple[tuple[float, float, float], ...]:
+    """Resolve one normalized window rectangle into four world corners."""
 
-    if not isinstance(parent_surface, FixedSurface):
-        raise TypeError("A surface overlay requires a fixed parent surface.")
-    distance = abs(_normalize_surface_overlay_offset(distance_meters))
-    face_indices, plane_normal = _get_dominant_coplanar_face_patch(
-        parent_surface.mesh
+    wall_start, wall_end, wall_height = _get_window_wall_frame(parent_surface)
+    if placement.wall_surface_id != parent_surface.surface_id:
+        raise ValueError("A window placement belongs to a different wall.")
+    bottom_start = _interpolate_window_world_point(
+        wall_start,
+        wall_end,
+        placement.start_ratio,
+        placement.bottom_ratio,
+        wall_height,
     )
+    bottom_end = _interpolate_window_world_point(
+        wall_start,
+        wall_end,
+        placement.end_ratio,
+        placement.bottom_ratio,
+        wall_height,
+    )
+    top_end = _interpolate_window_world_point(
+        wall_start,
+        wall_end,
+        placement.end_ratio,
+        placement.top_ratio,
+        wall_height,
+    )
+    top_start = _interpolate_window_world_point(
+        wall_start,
+        wall_end,
+        placement.start_ratio,
+        placement.top_ratio,
+        wall_height,
+    )
+    return (bottom_start, bottom_end, top_end, top_start)
+
+
+def add_wall_window(
+    levels: Sequence[LevelData],
+    placement: WallWindowPlacement,
+    *,
+    window_id: str | None = None,
+) -> WindowData:
+    """Atomically validate and append a stable window to its owning level."""
+
+    if not isinstance(placement, WallWindowPlacement):
+        raise TypeError("A wall window commit requires a validated placement.")
+    surfaces = {
+        surface.surface_id: surface for surface in build_fixed_surfaces(levels)
+    }
+    parent_surface = surfaces.get(placement.wall_surface_id)
+    if parent_surface is None:
+        raise ValueError("The selected wall no longer exists.")
+    owning_level = next(
+        (
+            level
+            for level in levels
+            if level.index == parent_surface.level_index
+        ),
+        None,
+    )
+    if owning_level is None:
+        raise ValueError("The selected wall has no owning level.")
+
+    corners = get_wall_window_world_corners(parent_surface, placement)
+    current_placement = build_wall_window_placement(
+        parent_surface,
+        corners[0],
+        corners[2],
+    )
+    normalized_id = (
+        f"window-{uuid.uuid4().hex}"
+        if window_id is None
+        else str(window_id).strip()
+    )
+    if any(
+        existing.window_id == normalized_id
+        for level in levels
+        for existing in level.windows
+    ):
+        raise ValueError("A window with this stable ID already exists.")
+    window = WindowData(
+        window_id=normalized_id,
+        wall_surface_id=current_placement.wall_surface_id,
+        start_ratio=current_placement.start_ratio,
+        end_ratio=current_placement.end_ratio,
+        bottom_ratio=current_placement.bottom_ratio,
+        top_ratio=current_placement.top_ratio,
+    )
+    owning_level.windows.append(window)
     try:
-        point = np.asarray(tuple(world_point), dtype=float)
-    except (TypeError, ValueError) as error:
-        raise ValueError(
-            "An overlay viewpoint must contain three coordinates."
-        ) from error
-    if point.shape != (3,) or not np.isfinite(point).all():
-        raise ValueError("An overlay viewpoint must contain finite XYZ coordinates.")
-    faces = np.asarray(parent_surface.mesh.faces, dtype=np.int64)[face_indices]
-    vertices = np.asarray(parent_surface.mesh.vertices, dtype=float)
-    centroid = np.mean(vertices[faces].reshape(-1, 3), axis=0)
-    direction = point - centroid
-    return distance if float(np.dot(direction, plane_normal)) >= 0.0 else -distance
+        updated_surfaces = {
+            surface.surface_id: surface
+            for surface in build_fixed_surfaces(levels)
+        }
+        if window.wall_surface_id not in updated_surfaces:
+            raise ValueError("The window would remove its complete owning wall.")
+    except Exception:
+        if owning_level.windows and owning_level.windows[-1] is window:
+            owning_level.windows.pop()
+        else:
+            owning_level.windows.remove(window)
+        raise
+    return window
 
 
 def build_wall_surface_id(
@@ -240,10 +371,12 @@ def _build_room_surfaces(
     room_index: int,
     base_z_meters: float,
     reveal_owner_by_opening_index: Mapping[int, str],
+    window_reveals_by_surface_id: Mapping[str, Sequence[WindowReveal]],
 ) -> list[FixedSurface]:
     surfaces: list[FixedSurface] = []
     room_identity = room.center_vertex_id
     doorway_openings = _build_wall_openings(level.doorways)
+    wall_openings = _build_level_wall_openings(level)
     room_polygon = _build_room_world_polygon(level, room)
     for wall in build_room_walls(room, level.vertex_data):
         wall_surface = _build_wall_surface(
@@ -254,10 +387,12 @@ def _build_room_surfaces(
             wall_height_meters=room.height_meters,
             base_z_meters=base_z_meters,
             doorway_openings=doorway_openings,
+            wall_openings=wall_openings,
             room_index=room_index,
             room_identity=room_identity,
             reveal_owner_by_opening_index=reveal_owner_by_opening_index,
             interior_polygon=room_polygon,
+            window_reveals_by_surface_id=window_reveals_by_surface_id,
         )
         if wall_surface is not None:
             surfaces.append(wall_surface)
@@ -301,10 +436,12 @@ def _build_plain_level_wall_surfaces(
     level: LevelData,
     base_z_meters: float,
     reveal_owner_by_opening_index: Mapping[int, str],
+    window_reveals_by_surface_id: Mapping[str, Sequence[WindowReveal]],
 ) -> list[FixedSurface]:
     room_vertex_sets = [set(room.vertex_ids) for room in level.rooms]
     ignored_vertex_ids = {room.center_vertex_id for room in level.rooms}
     doorway_openings = _build_wall_openings(level.doorways)
+    wall_openings = _build_level_wall_openings(level)
     interior_polygon = _build_level_contour_world_polygon(level)
     vertex_lookup = {vertex.id: vertex for vertex in level.vertex_data.vertices}
     surfaces: list[FixedSurface] = []
@@ -335,14 +472,28 @@ def _build_plain_level_wall_surfaces(
             wall_height_meters=level.height_meters,
             base_z_meters=base_z_meters,
             doorway_openings=doorway_openings,
+            wall_openings=wall_openings,
             room_index=None,
             room_identity=None,
             reveal_owner_by_opening_index=reveal_owner_by_opening_index,
             interior_polygon=interior_polygon,
+            window_reveals_by_surface_id=window_reveals_by_surface_id,
         )
         if surface is not None:
             surfaces.append(surface)
     return surfaces
+
+
+def _group_window_reveals_by_surface_id(
+    reveals: Sequence[WindowReveal],
+) -> dict[str, tuple[WindowReveal, ...]]:
+    grouped: dict[str, list[WindowReveal]] = {}
+    for reveal in reveals:
+        grouped.setdefault(reveal.owner_surface_id, []).append(reveal)
+    return {
+        surface_id: tuple(surface_reveals)
+        for surface_id, surface_reveals in grouped.items()
+    }
 
 
 def _build_doorway_reveal_owner_lookup(level: LevelData) -> dict[int, str]:
@@ -424,6 +575,136 @@ def _build_level_surface_wall_definitions(
     return definitions
 
 
+# ### Window placement helpers ###
+def _get_window_wall_frame(
+    surface: FixedSurface,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    if not isinstance(surface, FixedSurface):
+        raise TypeError("A window requires a fixed wall surface.")
+    if surface.surface_type != SURFACE_TYPE_WALL:
+        raise ValueError("Windows can only be added to wall surfaces.")
+    if (
+        surface.wall_start_world is None
+        or surface.wall_end_world is None
+        or surface.wall_height_meters is None
+    ):
+        raise ValueError("The selected wall has no placement frame.")
+    wall_start = np.asarray(surface.wall_start_world, dtype=float)
+    wall_end = np.asarray(surface.wall_end_world, dtype=float)
+    wall_height = float(surface.wall_height_meters)
+    if (
+        wall_start.shape != (3,)
+        or wall_end.shape != (3,)
+        or not np.isfinite(wall_start).all()
+        or not np.isfinite(wall_end).all()
+        or not math.isfinite(wall_height)
+        or wall_height <= SURFACE_GEOMETRY_EPSILON
+    ):
+        raise ValueError("The selected wall has an invalid placement frame.")
+    wall_axis = wall_end - wall_start
+    if (
+        abs(float(wall_axis[2])) > SURFACE_GEOMETRY_EPSILON
+        or float(np.linalg.norm(wall_axis)) <= SURFACE_GEOMETRY_EPSILON
+    ):
+        raise ValueError("The selected wall has an invalid placement frame.")
+    return wall_start, wall_end, wall_height
+
+
+def _normalize_window_world_point(value: Sequence[float]) -> np.ndarray:
+    try:
+        point = np.asarray(tuple(value), dtype=float)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("A window point must contain finite XYZ values.") from error
+    if point.shape != (3,) or not np.isfinite(point).all():
+        raise ValueError("A window point must contain finite XYZ values.")
+    return point
+
+
+def _clamp_window_ratio_pair(
+    ratios: Sequence[float],
+    axis_name: str,
+) -> tuple[float, float]:
+    if len(ratios) != 2:
+        raise ValueError("A window rectangle requires two points.")
+    low_ratio, high_ratio = (float(ratios[0]), float(ratios[1]))
+    tolerance = SURFACE_GEOMETRY_EPSILON * 10.0
+    if low_ratio < -tolerance or high_ratio > 1.0 + tolerance:
+        raise ValueError(
+            f"A window must remain inside the wall's {axis_name} bounds."
+        )
+    return max(0.0, low_ratio), min(1.0, high_ratio)
+
+
+def _interpolate_window_world_point(
+    wall_start: np.ndarray,
+    wall_end: np.ndarray,
+    horizontal_ratio: float,
+    vertical_ratio: float,
+    wall_height: float,
+) -> tuple[float, float, float]:
+    point = wall_start + (wall_end - wall_start) * float(horizontal_ratio)
+    point[2] = wall_start[2] + wall_height * float(vertical_ratio)
+    return tuple(float(value) for value in point)
+
+
+def _validate_window_patch_coverage(
+    surface: FixedSurface,
+    placement: WallWindowPlacement,
+) -> None:
+    wall_start, wall_end, wall_height = _get_window_wall_frame(surface)
+    wall_axis = wall_end - wall_start
+    wall_width = float(np.linalg.norm(wall_axis))
+    tangent = wall_axis / wall_width
+    plane_normal = np.cross(tangent, np.asarray((0.0, 0.0, 1.0)))
+    mesh_vertices = np.asarray(surface.mesh.vertices, dtype=float)
+    mesh_faces = np.asarray(surface.mesh.faces, dtype=np.int64)
+    polygons: list[Polygon] = []
+    for face in mesh_faces:
+        triangle = mesh_vertices[face]
+        distances = np.dot(triangle - wall_start, plane_normal)
+        if np.max(np.abs(distances)) > WINDOW_PATCH_COVERAGE_TOLERANCE_METERS:
+            continue
+        local_points = [
+            (
+                float(np.dot(vertex - wall_start, tangent)),
+                float(vertex[2] - wall_start[2]),
+            )
+            for vertex in triangle
+        ]
+        polygon = Polygon(local_points)
+        if polygon.is_valid and polygon.area > SURFACE_GEOMETRY_EPSILON:
+            polygons.append(polygon)
+    if not polygons:
+        raise ValueError("The selected wall has no visible window patch.")
+    visible_patch = shapely.union_all(polygons)
+    candidate = Polygon(
+        (
+            (
+                placement.start_ratio * wall_width,
+                placement.bottom_ratio * wall_height,
+            ),
+            (
+                placement.end_ratio * wall_width,
+                placement.bottom_ratio * wall_height,
+            ),
+            (
+                placement.end_ratio * wall_width,
+                placement.top_ratio * wall_height,
+            ),
+            (
+                placement.start_ratio * wall_width,
+                placement.top_ratio * wall_height,
+            ),
+        )
+    )
+    if not visible_patch.buffer(
+        WINDOW_PATCH_COVERAGE_TOLERANCE_METERS
+    ).covers(candidate):
+        raise ValueError(
+            "A window must fit the visible wall without crossing another opening."
+        )
+
+
 # ### Wall geometry helpers ###
 def _build_wall_surface(
     level: LevelData,
@@ -433,10 +714,12 @@ def _build_wall_surface(
     wall_height_meters: float,
     base_z_meters: float,
     doorway_openings: Sequence[WallOpening],
+    wall_openings: Sequence[WallOpening],
     room_index: int | None,
     room_identity: int | None,
     reveal_owner_by_opening_index: Mapping[int, str],
     interior_polygon: Polygon | None,
+    window_reveals_by_surface_id: Mapping[str, Sequence[WindowReveal]],
 ) -> FixedSurface | None:
     if (
         not math.isfinite(float(wall_height_meters))
@@ -446,11 +729,13 @@ def _build_wall_surface(
 
     vertices: list[list[float]] = []
     faces: list[list[int]] = []
+    duplicate_face_indices: list[int] = []
     for wall_piece in _build_visible_wall_pieces(
         start_point=start_point,
         end_point=end_point,
         wall_height_meters=wall_height_meters,
-        doorway_openings=doorway_openings,
+        doorway_openings=wall_openings,
+        wall_key=wall_key,
     ):
         piece_start = _interpolate_2d_point(
             start_point,
@@ -497,10 +782,25 @@ def _build_wall_surface(
             doorway_opening=doorway_opening,
         )
 
+    for window_reveal in window_reveals_by_surface_id.get(surface_id, ()):
+        _append_connected_window_reveals(
+            vertices=vertices,
+            faces=faces,
+            duplicate_face_indices=duplicate_face_indices,
+            level=level,
+            base_z_meters=base_z_meters,
+            window_reveal=window_reveal,
+        )
+
     mesh = _build_mesh(vertices, faces)
     if mesh is None:
         return None
-    area = float(mesh.area)
+    duplicate_area = float(
+        np.sum(mesh.area_faces[duplicate_face_indices])
+        if duplicate_face_indices
+        else 0.0
+    )
+    area = float(mesh.area) - duplicate_area
     if area <= SURFACE_GEOMETRY_EPSILON:
         return None
     return FixedSurface(
@@ -509,9 +809,46 @@ def _build_wall_surface(
         level_index=level.index,
         room_index=room_index,
         wall_key=wall_key,
+        wall_start_world=(*level_image_to_world_xy(level, *start_point), base_z_meters),
+        wall_end_world=(*level_image_to_world_xy(level, *end_point), base_z_meters),
+        wall_height_meters=wall_height_meters,
         mesh=mesh,
         area_square_meters=area,
     )
+
+
+def _append_connected_window_reveals(
+    vertices: list[list[float]],
+    faces: list[list[int]],
+    duplicate_face_indices: list[int],
+    level: LevelData,
+    base_z_meters: float,
+    window_reveal: WindowReveal,
+) -> None:
+    for image_quad in _build_wall_opening_reveal_quads(
+        window_reveal.reveal_pair,
+        include_sill=True,
+    ):
+        world_quad = tuple(
+            (
+                *level_image_to_world_xy(
+                    level,
+                    local_point[0],
+                    local_point[1],
+                ),
+                base_z_meters + local_point[2],
+            )
+            for local_point in image_quad
+        )
+        _append_quad(vertices, faces, world_quad)
+        duplicate_start = len(faces)
+        _append_quad(
+            vertices,
+            faces,
+            world_quad,
+            reverse_winding=True,
+        )
+        duplicate_face_indices.extend(range(duplicate_start, len(faces)))
 
 
 def _append_connected_doorway_reveals(
@@ -917,75 +1254,6 @@ def _build_mesh(
         faces=np.asarray(faces, dtype=np.int64),
         process=False,
     )
-
-
-def _get_dominant_coplanar_face_patch(
-    mesh: trimesh.Trimesh,
-) -> tuple[np.ndarray, np.ndarray]:
-    faces = np.asarray(mesh.faces, dtype=np.int64)
-    vertices = np.asarray(mesh.vertices, dtype=float)
-    normals = np.asarray(mesh.face_normals, dtype=float)
-    areas = np.asarray(mesh.area_faces, dtype=float)
-    if (
-        faces.ndim != 2
-        or faces.shape[1:] != (3,)
-        or not len(faces)
-        or vertices.ndim != 2
-        or vertices.shape[1:] != (3,)
-        or normals.shape != (len(faces), 3)
-        or areas.shape != (len(faces),)
-    ):
-        raise ValueError("A surface overlay requires triangular parent geometry.")
-
-    grouped_indices: dict[tuple[float, ...], list[int]] = {}
-    group_normals: dict[tuple[float, ...], np.ndarray] = {}
-    for face_index, normal in enumerate(normals):
-        normal_length = float(np.linalg.norm(normal))
-        if normal_length <= SURFACE_GEOMETRY_EPSILON:
-            continue
-        unit_normal = normal / normal_length
-        plane_offset = float(np.dot(unit_normal, vertices[faces[face_index, 0]]))
-        key = tuple(
-            float(value)
-            for value in np.round(
-                np.append(unit_normal, plane_offset),
-                SURFACE_OVERLAY_COPLANAR_DECIMALS,
-            )
-        )
-        grouped_indices.setdefault(key, []).append(face_index)
-        group_normals.setdefault(key, unit_normal)
-    if not grouped_indices:
-        raise ValueError("A surface overlay requires a usable planar parent patch.")
-    dominant_key = max(
-        grouped_indices,
-        key=lambda key: (
-            float(np.sum(areas[grouped_indices[key]])),
-            len(grouped_indices[key]),
-            key,
-        ),
-    )
-    return (
-        np.asarray(grouped_indices[dominant_key], dtype=np.int64),
-        group_normals[dominant_key].copy(),
-    )
-
-
-def _normalize_surface_overlay_offset(value: object) -> float:
-    if isinstance(value, bool):
-        raise ValueError("A surface overlay offset must be a number.")
-    try:
-        offset = float(value)
-    except (TypeError, ValueError, OverflowError) as error:
-        raise ValueError("A surface overlay offset must be a number.") from error
-    if (
-        not math.isfinite(offset)
-        or abs(offset) <= SURFACE_GEOMETRY_EPSILON
-        or abs(offset) > MAX_SURFACE_OVERLAY_OFFSET_METERS
-    ):
-        raise ValueError(
-            "A surface overlay offset must be finite and no more than 5 cm."
-        )
-    return offset
 
 
 # ### Numeric and ordering helpers ###

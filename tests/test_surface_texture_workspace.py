@@ -21,7 +21,12 @@ import numpy as np
 from PIL import Image
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QSignalSpy, QTest
-from PySide6.QtWidgets import QApplication, QListWidgetItem, QMessageBox
+from PySide6.QtWidgets import (
+    QApplication,
+    QListWidgetItem,
+    QMessageBox,
+    QPushButton,
+)
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.camera_models import CameraPose, InitialFirstPersonCamera
@@ -323,6 +328,22 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         self.workspace.close()
         _qt_application.processEvents()
         shutil.rmtree(self._temporary_path, ignore_errors=True)
+
+    def test_plane_controls_are_absent(self) -> None:
+        self.assertFalse(hasattr(self.workspace, "add_plane_button"))
+        self.assertFalse(hasattr(self.workspace, "remove_plane_button"))
+        self.assertIsNone(
+            self.workspace.findChild(
+                QPushButton,
+                "add_surface_texture_plane_button",
+            )
+        )
+        self.assertIsNone(
+            self.workspace.findChild(
+                QPushButton,
+                "remove_surface_texture_plane_button",
+            )
+        )
 
     def test_provider_selector_has_exact_options_and_persists_selection(self) -> None:
         combo = self.workspace.surface_texture_provider_combo

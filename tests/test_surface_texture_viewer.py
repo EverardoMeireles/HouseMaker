@@ -104,7 +104,6 @@ def _build_canvas_model_with_surface(
         surface.mesh,
         surface.surface_type,
         material,
-        overlay_offset_meters=0.0,
     )
     base_mesh = surface.mesh.copy()
     return GeneratedModel(

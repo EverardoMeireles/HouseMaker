@@ -22,14 +22,12 @@ from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.generation_state import MASK_MODE_PAINT, MaskPoint, MaskStroke
 from housemaker.main import BlueprintWorkspace
 from housemaker.models import GROUND_LEVEL_INDEX, LevelData, RoomData, VertexData
-from housemaker.project_io import load_project, save_project
 from housemaker.surface_texture_providers import SurfaceTextureResult
 from housemaker.surface_texture_state import (
     SURFACE_TYPE_WALL,
     SurfaceTextureAssignment,
     SurfaceTextureData,
     SurfaceTextureInpaintUndoSnapshot,
-    SurfaceTextureOverlayPlane,
 )
 from housemaker.surface_texture_workspace import (
     SurfaceTextureGenerationWorkspace,
@@ -290,158 +288,6 @@ class SurfaceTextureInpaintUndoTransactionTests(unittest.TestCase):
                     _decode_png_rgba(replacement_png, "Replacement texture"),
                 )
                 self.assertIn(expected_status, self.workspace.status_label.text())
-
-    def test_localized_inpaint_on_overlay_undoes_without_losing_plane(self) -> None:
-        parent_id = self.wall_id
-        self.workspace.surface_view.set_selected_surface_ids((parent_id,))
-        self.workspace.add_plane_button.click()
-        overlay = self.workspace.get_data().overlay_planes[0]
-        previous_png = _texture_png((180, 40, 30, 255))
-        previous_path = self.asset_directory / "overlay-before.png"
-        previous_path.write_bytes(previous_png)
-        previous_assignment = _assignment(
-            "overlay-before",
-            overlay.surface_id,
-            previous_path.name,
-        )
-        self.workspace.set_data(
-            SurfaceTextureData(
-                selected_surface_type=SURFACE_TYPE_WALL,
-                selected_surface_ids=(overlay.surface_id,),
-                texture_mask_strokes={overlay.surface_id: [_stroke()]},
-                assignments=[previous_assignment],
-                overlay_planes=[overlay],
-            )
-        )
-        generated_png = _texture_png((20, 170, 90, 255))
-
-        self.workspace._handle_generation_succeeded(
-            _localized_request(overlay.surface_id, previous_png),
-            SurfaceTextureResult(
-                provider="meshy",
-                texture_png=generated_png,
-                task_id="overlay-inpaint",
-            ),
-        )
-        generated = self.workspace.get_data()
-        replacement_path = (
-            self.asset_directory / generated.assignments[0].asset_path
-        )
-
-        self.assertEqual(generated.overlay_planes, [overlay])
-        self.assertEqual(len(generated.localized_inpaint_undo_stack), 1)
-        self.assertIsNotNone(
-            self.workspace.surface_view.get_surface(overlay.surface_id)
-        )
-        self.assertTrue(self.workspace.undo_localized_texture_inpaint())
-
-        restored = self.workspace.get_data()
-        self.assertEqual(restored.overlay_planes, [overlay])
-        self.assertEqual(restored.assignments, [previous_assignment])
-        self.assertEqual(restored.localized_inpaint_undo_stack, [])
-        self.assertEqual(
-            self.workspace.surface_view.get_selected_surface_ids(),
-            (overlay.surface_id,),
-        )
-        self.assertIsNotNone(
-            self.workspace.surface_view.get_surface(overlay.surface_id)
-        )
-        self.assertFalse(replacement_path.exists())
-        np.testing.assert_array_equal(
-            self.workspace.surface_view.get_surface_texture_rgba(
-                overlay.surface_id
-            ),
-            _decode_png_rgba(previous_png, "Previous overlay texture"),
-        )
-
-
-# ### Project persistence tests ###
-class SurfaceTextureInpaintUndoProjectTests(unittest.TestCase):
-    def test_project_round_trip_keeps_overlay_and_complete_undo_snapshot(self) -> None:
-        level = _test_level()
-        parent_id = (
-            f"level:{GROUND_LEVEL_INDEX}/room:5/wall:1:2"
-        )
-        overlay = SurfaceTextureOverlayPlane(
-            parent_surface_id=parent_id,
-            normal_offset_meters=0.003,
-        )
-        previous = _assignment(
-            "overlay-before",
-            overlay.surface_id,
-            "overlay-before.png",
-        )
-        replacement = _assignment(
-            "overlay-after",
-            overlay.surface_id,
-            "overlay-after.png",
-        )
-        snapshot = SurfaceTextureInpaintUndoSnapshot(
-            previous_assignments=(previous,),
-            replacement_assignment_ids=(replacement.assignment_id,),
-            affected_surface_ids=(overlay.surface_id,),
-            previous_texture_mask_strokes={overlay.surface_id: (_stroke(),)},
-        )
-        state = SurfaceTextureData(
-            selected_surface_type=SURFACE_TYPE_WALL,
-            selected_surface_ids=(overlay.surface_id,),
-            assignments=[replacement],
-            overlay_planes=[overlay],
-            localized_inpaint_undo_stack=[snapshot],
-        )
-
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            project_directory = Path(temporary_directory)
-            project_path = project_directory / "overlay-undo.json"
-            asset_directory = project_directory / "surface_textures"
-            asset_directory.mkdir()
-            (asset_directory / previous.asset_path).write_bytes(
-                _texture_png((180, 40, 30, 255))
-            )
-            (asset_directory / replacement.asset_path).write_bytes(
-                _texture_png((20, 170, 90, 255))
-            )
-            save_project(
-                project_path,
-                current_level_index=GROUND_LEVEL_INDEX,
-                levels=[level],
-                surface_texture_generation=state,
-            )
-            loaded = load_project(project_path)
-            self.assertEqual(loaded.surface_texture_generation, state)
-            self.assertEqual(
-                loaded.surface_texture_generation.overlay_planes,
-                [overlay],
-            )
-            self.assertEqual(
-                loaded.surface_texture_generation.localized_inpaint_undo_stack,
-                [snapshot],
-            )
-
-            workspace = SurfaceTextureGenerationWorkspace(
-                asset_directory=asset_directory
-            )
-            try:
-                workspace.set_levels(loaded.levels)
-                workspace.set_data(loaded.surface_texture_generation)
-                self.assertTrue(workspace.undo_inpaint_button.isEnabled())
-                self.assertTrue(workspace.undo_localized_texture_inpaint())
-                restored = workspace.get_data()
-                self.assertEqual(restored.assignments, [previous])
-                self.assertEqual(restored.overlay_planes, [overlay])
-                self.assertEqual(restored.localized_inpaint_undo_stack, [])
-                self.assertTrue(
-                    (asset_directory / previous.asset_path).is_file()
-                )
-                self.assertFalse(
-                    (asset_directory / replacement.asset_path).exists()
-                )
-            finally:
-                workspace.shutdown()
-                workspace.close()
-                workspace.deleteLater()
-                _qt_application.processEvents()
-
 
 # ### Atlas integration tests ###
 class SurfaceTextureInpaintUndoAtlasTests(unittest.TestCase):

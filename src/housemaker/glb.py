@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import shapely
 import trimesh
-from shapely import Polygon
+from shapely import Point, Polygon
 from PySide6.QtCore import QByteArray, QBuffer, QIODevice, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage, QPainter, QPen
 from trimesh.visual.material import PBRMaterial
@@ -72,6 +72,8 @@ SURFACE_FACE_MATCH_DECIMALS = 7
 SURFACE_FACE_COVERAGE_EPSILON = 1e-9
 FALLBACK_QT_PLATFORM = "offscreen"
 WALL_OPENING_EPSILON = 1e-6
+WINDOW_COPLANAR_DEPTH_PIXELS = 1e-4
+WINDOW_CUT_DEPTH_METERS = 0.5
 WALL_REVEAL_PARALLEL_COSINE = math.cos(math.radians(10.0))
 MAX_IMPORTED_GENERATED_MODEL_FACES = 1_000_000
 DEFAULT_STAIR_RISER_HEIGHT_METERS = 0.175
@@ -133,7 +135,7 @@ class PreviewTexturedSurface:
 
 @dataclass(frozen=True)
 class WallOpening:
-    """A validated doorway footprint in image-space coordinates."""
+    """A validated rectangular wall cut in image and wall-local coordinates."""
 
     center_x: float
     center_y: float
@@ -144,6 +146,15 @@ class WallOpening:
     half_width_pixels: float
     half_depth_pixels: float
     height_meters: float
+    bottom_height_meters: float = 0.0
+    target_wall_key: str | None = None
+    target_surface_id: str | None = None
+    parallel_walls_only: bool = False
+    penetrates_parallel_walls: bool = False
+
+    @property
+    def top_height_meters(self) -> float:
+        return self.bottom_height_meters + self.height_meters
 
 
 @dataclass(frozen=True)
@@ -158,12 +169,15 @@ class WallPiece:
 
 @dataclass(frozen=True)
 class WallSource:
-    """One wall line that can contribute a doorway tunnel contact."""
+    """One rendered wall line that can bound an opening tunnel."""
 
     key: str
     start_point: tuple[float, float]
     end_point: tuple[float, float]
     height_meters: float
+    wall_key: str | None = None
+    surface_id: str | None = None
+    exterior_direction: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -176,17 +190,29 @@ class WallOpeningContact:
     low_width_position: float
     high_width_position: float
     depth_position: float
-    opening_height_meters: float
+    opening_bottom_height_meters: float
+    opening_top_height_meters: float
+    wall_key: str | None = None
+    surface_id: str | None = None
 
 
 @dataclass(frozen=True)
 class DoorwayRevealPair:
-    """Two opposing, parallel doorway contacts that form a valid tunnel."""
+    """Two parallel wall contacts that form a valid opening tunnel."""
 
     first_contact: WallOpeningContact
     second_contact: WallOpeningContact
     low_width_position: float
     high_width_position: float
+
+
+@dataclass(frozen=True)
+class WindowReveal:
+    """A window opening paired with the nearest outward wall contact."""
+
+    opening: WallOpening
+    reveal_pair: DoorwayRevealPair
+    owner_surface_id: str
 
 
 @dataclass(frozen=True)
@@ -218,7 +244,6 @@ def convert_to_glb(
     ) = None,
     surface_texture_world_size_meters: float = 2.0,
     stairs: Sequence[StairData] = (),
-    surface_overlay_planes: Sequence[object] = (),
 ) -> GeneratedModel:
     if isinstance(level_source, VertexData):
         if stairs:
@@ -269,7 +294,6 @@ def convert_to_glb(
         surface_texture_world_size_meters=(
             surface_texture_world_size_meters
         ),
-        surface_overlay_planes=surface_overlay_planes,
     )
 
 
@@ -1444,9 +1468,8 @@ def _apply_surface_materials(
         bytes | bytearray | memoryview | str | Path,
     ],
     surface_texture_world_size_meters: float,
-    surface_overlay_planes: Sequence[object],
 ) -> GeneratedModel:
-    """Replace assigned base faces and add only explicit overlay-plane geometry."""
+    """Replace assigned semantic faces with their textured geometry."""
 
     if not isinstance(surface_materials, Mapping):
         raise TypeError("Surface materials must be provided as a mapping.")
@@ -1455,7 +1478,7 @@ def _apply_surface_materials(
             "Surface materials require level data with stable surface IDs."
         )
 
-    from housemaker.surface_geometry import FixedSurface, build_fixed_surfaces
+    from housemaker.surface_geometry import build_fixed_surfaces
     from housemaker.surface_materials import (
         build_world_planar_textured_mesh,
         normalize_texture_world_size,
@@ -1464,27 +1487,7 @@ def _apply_surface_materials(
 
     levels = list(level_source)
     fixed_surfaces = build_fixed_surfaces(levels)
-    overlay_planes = list(surface_overlay_planes)
-    if not all(isinstance(surface, FixedSurface) for surface in overlay_planes):
-        raise TypeError("Surface overlay planes must contain FixedSurface values.")
-    base_surface_ids = {surface.surface_id for surface in fixed_surfaces}
-    overlay_surface_ids = [surface.surface_id for surface in overlay_planes]
-    if len(overlay_surface_ids) != len(set(overlay_surface_ids)):
-        raise ValueError("Surface overlay plane IDs must be unique.")
-    if base_surface_ids.intersection(overlay_surface_ids):
-        raise ValueError("A surface overlay plane ID conflicts with a fixed surface.")
-    if any(
-        surface.overlay_parent_surface_id not in base_surface_ids
-        for surface in overlay_planes
-    ):
-        raise ValueError("A surface overlay plane has no live fixed parent.")
-    overlay_parent_ids = [
-        surface.overlay_parent_surface_id for surface in overlay_planes
-    ]
-    if len(overlay_parent_ids) != len(set(overlay_parent_ids)):
-        raise ValueError("Only one surface overlay plane may exist per parent.")
     base_surfaces = list(fixed_surfaces)
-    fixed_surfaces.extend(overlay_planes)
     known_surface_ids = {surface.surface_id for surface in fixed_surfaces}
     live_sources = {
         str(surface_id): source
@@ -1594,13 +1597,9 @@ def _build_surface_named_meshes(
         if material is None:
             continue
 
-        is_overlay_plane = (
-            getattr(surface, "overlay_parent_surface_id", None) is not None
-        )
         double_sided = (
             surface_type == "wall"
             and getattr(surface, "room_index", None) is None
-            and not is_overlay_plane
         )
 
         object_name = _get_surface_object_name(surface_id)
@@ -1610,7 +1609,6 @@ def _build_surface_named_meshes(
             material,
             texture_world_size_meters=texture_world_size_meters,
             material_name=f"Surface {surface_id}",
-            overlay_offset_meters=0.0,
             double_sided=double_sided,
         )
         preview_surfaces.append(
@@ -1717,7 +1715,6 @@ def _iter_surface_replacement_triangles(
         if (
             getattr(surface, "surface_type", None) == "wall"
             and getattr(surface, "room_index", None) is None
-            and getattr(surface, "overlay_parent_surface_id", None) is None
         ):
             yield triangle[::-1], -np.asarray(normal, dtype=float)
 
@@ -2046,6 +2043,7 @@ def _build_named_meshes_for_level(
         base_z_meters=base_z_meters,
         blueprint_size_pixels=level_blueprint_size,
         doorways=level.doorways,
+        window_openings=_build_window_openings(level),
         ignored_vertex_ids=_get_room_center_vertex_ids(level.rooms),
         ignored_room_vertex_sets=room_vertex_sets,
     )
@@ -2077,6 +2075,19 @@ def _build_named_meshes_for_level(
             NamedMesh(
                 name=_get_level_doorway_reveal_object_name(level),
                 mesh=doorway_reveal_mesh,
+            )
+        )
+
+    window_reveal_mesh = _build_level_window_reveal_mesh(
+        level=level,
+        base_z_meters=base_z_meters,
+        blueprint_size_pixels=level_blueprint_size,
+    )
+    if window_reveal_mesh is not None:
+        named_meshes.append(
+            NamedMesh(
+                name=_get_level_window_reveal_object_name(level),
+                mesh=window_reveal_mesh,
             )
         )
 
@@ -2125,6 +2136,7 @@ def _build_level_meshes(
     base_z_meters: float,
     blueprint_size_pixels: tuple[float, float] | None,
     doorways: Sequence[object] = (),
+    window_openings: Sequence[WallOpening] = (),
     ignored_vertex_ids: set[int] | None = None,
     ignored_room_vertex_sets: list[set[int]] | None = None,
 ) -> list[trimesh.Trimesh]:
@@ -2134,7 +2146,10 @@ def _build_level_meshes(
     ignored_ids = ignored_vertex_ids or set()
     room_vertex_sets = ignored_room_vertex_sets or []
     vertex_lookup = {vertex.id: vertex for vertex in vertex_data.vertices}
-    doorway_openings = _build_wall_openings(doorways)
+    doorway_openings = [
+        *_build_wall_openings(doorways),
+        *window_openings,
+    ]
     return [
         wall_mesh
         for edge in vertex_data.edges
@@ -2174,7 +2189,7 @@ def _build_room_mesh(
         wall_height_meters=room.height_meters,
     )
     placements_by_key = _group_wall_placements_by_key(layout.placements)
-    doorway_openings = _build_wall_openings(level.doorways)
+    doorway_openings = _build_level_wall_openings(level)
     material = _build_room_material(level, room, room_index, layout)
     vertices: list[list[float]] = []
     faces: list[list[int]] = []
@@ -2188,6 +2203,7 @@ def _build_room_mesh(
                 end_point=wall.end_point,
                 wall_height_meters=room.height_meters,
                 doorway_openings=doorway_openings,
+                wall_key=wall.key,
             ):
                 wall_vertices = _build_wall_piece_vertices_from_points(
                     start_point=wall.start_point,
@@ -2217,6 +2233,7 @@ def _build_room_mesh(
                 end_point=segment_end_point,
                 wall_height_meters=room.height_meters,
                 doorway_openings=doorway_openings,
+                wall_key=wall.key,
             ):
                 wall_vertices = _build_wall_piece_vertices_from_points(
                     start_point=segment_start_point,
@@ -2589,13 +2606,254 @@ def _build_wall_openings(doorways: Sequence[object]) -> list[WallOpening]:
     return wall_openings
 
 
+def _build_level_wall_openings(level: LevelData) -> list[WallOpening]:
+    """Build doorway and stable wall-attached window cuts for one level."""
+
+    return [
+        *_build_wall_openings(level.doorways),
+        *_build_window_openings(level),
+    ]
+
+
+def _build_window_openings(level: LevelData) -> list[WallOpening]:
+    openings: list[WallOpening] = []
+    targets = _build_window_wall_target_lookup(level)
+    for window in getattr(level, "windows", ()):
+        wall_surface_id = str(getattr(window, "wall_surface_id", "")).strip()
+        target = targets.get(wall_surface_id)
+        if target is None:
+            continue
+        try:
+            start_ratio = float(getattr(window, "start_ratio"))
+            end_ratio = float(getattr(window, "end_ratio"))
+            bottom_ratio = float(getattr(window, "bottom_ratio"))
+            top_ratio = float(getattr(window, "top_ratio"))
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            continue
+        ratios = (start_ratio, end_ratio, bottom_ratio, top_ratio)
+        if not all(math.isfinite(value) for value in ratios):
+            continue
+        if not (
+            0.0 <= start_ratio < end_ratio <= 1.0
+            and 0.0 <= bottom_ratio < top_ratio <= 1.0
+        ):
+            continue
+
+        segment_delta_x = target.end_point[0] - target.start_point[0]
+        segment_delta_y = target.end_point[1] - target.start_point[1]
+        segment_length = math.hypot(segment_delta_x, segment_delta_y)
+        if segment_length <= WALL_OPENING_EPSILON:
+            continue
+        width_direction_x = segment_delta_x / segment_length
+        width_direction_y = segment_delta_y / segment_length
+        center_ratio = (start_ratio + end_ratio) / 2.0
+        center = _interpolate_2d_point(
+            target.start_point,
+            target.end_point,
+            center_ratio,
+        )
+        (
+            opening_center,
+            depth_direction,
+            half_depth_pixels,
+        ) = _build_window_depth_footprint(level, target, center)
+        opening_height = (top_ratio - bottom_ratio) * target.height_meters
+        if opening_height <= WALL_OPENING_EPSILON:
+            continue
+        openings.append(
+            WallOpening(
+                center_x=opening_center[0],
+                center_y=opening_center[1],
+                width_direction_x=width_direction_x,
+                width_direction_y=width_direction_y,
+                depth_direction_x=depth_direction[0],
+                depth_direction_y=depth_direction[1],
+                half_width_pixels=(
+                    segment_length * (end_ratio - start_ratio) / 2.0
+                ),
+                half_depth_pixels=half_depth_pixels,
+                height_meters=opening_height,
+                bottom_height_meters=bottom_ratio * target.height_meters,
+                target_wall_key=target.key,
+                target_surface_id=wall_surface_id,
+                parallel_walls_only=True,
+                penetrates_parallel_walls=True,
+            )
+        )
+    return openings
+
+
+def _build_window_wall_target_lookup(
+    level: LevelData,
+) -> dict[str, WallSource]:
+    targets: dict[str, WallSource] = {}
+    for room in level.rooms:
+        for wall in build_room_walls(room, level.vertex_data):
+            exterior_direction = _get_wall_right_normal(
+                wall.start_point,
+                wall.end_point,
+            )
+            surface_id = (
+                f"level:{level.index}/room:{room.center_vertex_id}/"
+                f"wall:{wall.key}"
+            )
+            targets[surface_id] = WallSource(
+                key=wall.key,
+                start_point=wall.start_point,
+                end_point=wall.end_point,
+                height_meters=room.height_meters,
+                wall_key=wall.key,
+                surface_id=surface_id,
+                exterior_direction=exterior_direction,
+            )
+
+    room_vertex_sets = _get_room_vertex_sets(level.rooms)
+    ignored_vertex_ids = _get_room_center_vertex_ids(level.rooms)
+    vertex_lookup = {vertex.id: vertex for vertex in level.vertex_data.vertices}
+    level_contour = _build_level_image_contour_polygon(level)
+    for edge in level.vertex_data.edges:
+        if (
+            edge.start_vertex_id in ignored_vertex_ids
+            or edge.end_vertex_id in ignored_vertex_ids
+            or _is_edge_inside_any_room(edge, room_vertex_sets)
+        ):
+            continue
+        start_vertex = vertex_lookup.get(edge.start_vertex_id)
+        end_vertex = vertex_lookup.get(edge.end_vertex_id)
+        if start_vertex is None or end_vertex is None:
+            continue
+        wall_key = (
+            f"{min(edge.start_vertex_id, edge.end_vertex_id)}:"
+            f"{max(edge.start_vertex_id, edge.end_vertex_id)}"
+        )
+        surface_id = f"level:{level.index}/wall:{wall_key}"
+        targets[surface_id] = WallSource(
+            key=wall_key,
+            start_point=(start_vertex.x, start_vertex.y),
+            end_point=(end_vertex.x, end_vertex.y),
+            height_meters=level.height_meters,
+            wall_key=wall_key,
+            surface_id=surface_id,
+            exterior_direction=_get_wall_exterior_from_contour(
+                (start_vertex.x, start_vertex.y),
+                (end_vertex.x, end_vertex.y),
+                level_contour,
+            ),
+        )
+    return targets
+
+
+def _build_window_depth_footprint(
+    level: LevelData,
+    target: WallSource,
+    center: tuple[float, float],
+) -> tuple[tuple[float, float], tuple[float, float], float]:
+    """Extend a window 50 cm behind its selected semantic wall face."""
+
+    depth_pixels = WINDOW_CUT_DEPTH_METERS / (
+        PIXEL_TO_METER * _get_valid_level_scale(level)
+    )
+    exterior_direction = (
+        target.exterior_direction
+        if target.exterior_direction is not None
+        else _get_wall_right_normal(
+            target.start_point,
+            target.end_point,
+        )
+    )
+    if exterior_direction is None:
+        return center, (1.0, 0.0), WINDOW_COPLANAR_DEPTH_PIXELS
+
+    interior_margin = WINDOW_COPLANAR_DEPTH_PIXELS
+    center_offset = (depth_pixels - interior_margin) / 2.0
+    half_depth = (depth_pixels + interior_margin) / 2.0
+    return (
+        (
+            center[0] + exterior_direction[0] * center_offset,
+            center[1] + exterior_direction[1] * center_offset,
+        ),
+        exterior_direction,
+        half_depth,
+    )
+
+
+def _get_wall_right_normal(
+    start_point: tuple[float, float],
+    end_point: tuple[float, float],
+) -> tuple[float, float] | None:
+    delta_x = end_point[0] - start_point[0]
+    delta_y = end_point[1] - start_point[1]
+    length = math.hypot(delta_x, delta_y)
+    if length <= WALL_OPENING_EPSILON:
+        return None
+    return delta_y / length, -delta_x / length
+
+
+def _build_level_image_contour_polygon(level: LevelData) -> Polygon | None:
+    points: list[tuple[float, float]] = []
+    for vertex_id in level.floor_contour_vertex_ids:
+        vertex = level.vertex_data.get_vertex(vertex_id)
+        if vertex is not None:
+            points.append((vertex.x, vertex.y))
+    if len(points) < 3:
+        return None
+    polygon = Polygon(points)
+    if not polygon.is_valid:
+        repaired = polygon.buffer(0)
+        if not isinstance(repaired, Polygon):
+            return None
+        polygon = repaired
+    if polygon.area <= WALL_OPENING_EPSILON:
+        return None
+    return polygon
+
+
+def _get_wall_exterior_from_contour(
+    start_point: tuple[float, float],
+    end_point: tuple[float, float],
+    contour: Polygon | None,
+) -> tuple[float, float] | None:
+    if contour is None or contour.is_empty:
+        return None
+    right_normal = _get_wall_right_normal(start_point, end_point)
+    if right_normal is None:
+        return None
+    left_normal = (-right_normal[0], -right_normal[1])
+    midpoint = (
+        (start_point[0] + end_point[0]) / 2.0,
+        (start_point[1] + end_point[1]) / 2.0,
+    )
+    wall_length = _get_2d_point_distance(start_point, end_point)
+    for probe_ratio in (1e-7, 1e-6, 1e-5, 1e-4, 1e-3):
+        probe_distance = max(
+            WALL_OPENING_EPSILON * 10.0,
+            wall_length * probe_ratio,
+        )
+        right_is_inside = contour.contains(
+            Point(
+                midpoint[0] + right_normal[0] * probe_distance,
+                midpoint[1] + right_normal[1] * probe_distance,
+            )
+        )
+        left_is_inside = contour.contains(
+            Point(
+                midpoint[0] + left_normal[0] * probe_distance,
+                midpoint[1] + left_normal[1] * probe_distance,
+            )
+        )
+        if right_is_inside != left_is_inside:
+            return left_normal if right_is_inside else right_normal
+    return None
+
+
 def _build_visible_wall_pieces(
     start_point: tuple[float, float],
     end_point: tuple[float, float],
     wall_height_meters: float,
     doorway_openings: Sequence[WallOpening],
+    wall_key: str | None = None,
 ) -> list[WallPiece]:
-    """Split a wall into the portions left after subtracting doorway holes."""
+    """Split a wall into rectangular pieces outside every applicable cut."""
     if (
         not math.isfinite(wall_height_meters)
         or wall_height_meters <= WALL_OPENING_EPSILON
@@ -2603,8 +2861,23 @@ def _build_visible_wall_pieces(
     ):
         return []
 
-    doorway_intervals: list[tuple[float, float, float]] = []
+    opening_intervals: list[tuple[float, float, float, float]] = []
     for doorway_opening in doorway_openings:
+        if (
+            doorway_opening.target_wall_key is not None
+            and doorway_opening.target_wall_key != wall_key
+            and not doorway_opening.penetrates_parallel_walls
+        ):
+            continue
+        if (
+            doorway_opening.parallel_walls_only
+            and not _wall_segment_is_parallel_to_opening(
+                start_point,
+                end_point,
+                doorway_opening,
+            )
+        ):
+            continue
         doorway_interval = _clip_wall_segment_to_opening(
             start_point=start_point,
             end_point=end_point,
@@ -2614,15 +2887,21 @@ def _build_visible_wall_pieces(
             continue
 
         interval_start, interval_end = doorway_interval
-        doorway_intervals.append(
-            (
-                interval_start,
-                interval_end,
-                min(doorway_opening.height_meters, wall_height_meters),
-            )
+        opening_bottom = min(
+            max(0.0, doorway_opening.bottom_height_meters),
+            wall_height_meters,
+        )
+        opening_top = min(
+            max(opening_bottom, doorway_opening.top_height_meters),
+            wall_height_meters,
+        )
+        if opening_top - opening_bottom <= WALL_OPENING_EPSILON:
+            continue
+        opening_intervals.append(
+            (interval_start, interval_end, opening_bottom, opening_top)
         )
 
-    if not doorway_intervals:
+    if not opening_intervals:
         return [
             WallPiece(
                 start_ratio=0.0,
@@ -2632,36 +2911,83 @@ def _build_visible_wall_pieces(
             )
         ]
 
-    breakpoints = _get_opening_interval_breakpoints(doorway_intervals)
+    breakpoints = _get_opening_interval_breakpoints(opening_intervals)
     wall_pieces: list[WallPiece] = []
     for interval_start, interval_end in zip(breakpoints, breakpoints[1:]):
         if interval_end - interval_start <= WALL_OPENING_EPSILON:
             continue
 
         interval_midpoint = (interval_start + interval_end) / 2.0
-        opening_height_meters = max(
-            (
-                doorway_height_meters
-                for doorway_start, doorway_end, doorway_height_meters
-                in doorway_intervals
-                if doorway_start - WALL_OPENING_EPSILON
+        covered_vertical_intervals = _merge_wall_opening_vertical_intervals(
+            [
+                (opening_bottom, opening_top)
+                for opening_start, opening_end, opening_bottom, opening_top
+                in opening_intervals
+                if opening_start - WALL_OPENING_EPSILON
                 <= interval_midpoint
-                <= doorway_end + WALL_OPENING_EPSILON
-            ),
-            default=0.0,
+                <= opening_end + WALL_OPENING_EPSILON
+            ]
         )
-        if opening_height_meters >= wall_height_meters - WALL_OPENING_EPSILON:
-            continue
-
-        wall_piece = WallPiece(
-            start_ratio=interval_start,
-            end_ratio=interval_end,
-            bottom_height_meters=opening_height_meters,
-            top_height_meters=wall_height_meters,
-        )
-        _append_or_merge_wall_piece(wall_pieces, wall_piece)
+        visible_bottom = 0.0
+        for opening_bottom, opening_top in covered_vertical_intervals:
+            if opening_bottom - visible_bottom > WALL_OPENING_EPSILON:
+                _append_or_merge_wall_piece(
+                    wall_pieces,
+                    WallPiece(
+                        start_ratio=interval_start,
+                        end_ratio=interval_end,
+                        bottom_height_meters=visible_bottom,
+                        top_height_meters=opening_bottom,
+                    ),
+                )
+            visible_bottom = max(visible_bottom, opening_top)
+        if wall_height_meters - visible_bottom > WALL_OPENING_EPSILON:
+            _append_or_merge_wall_piece(
+                wall_pieces,
+                WallPiece(
+                    start_ratio=interval_start,
+                    end_ratio=interval_end,
+                    bottom_height_meters=visible_bottom,
+                    top_height_meters=wall_height_meters,
+                ),
+            )
 
     return wall_pieces
+
+
+def _wall_segment_is_parallel_to_opening(
+    start_point: tuple[float, float],
+    end_point: tuple[float, float],
+    opening: WallOpening,
+) -> bool:
+    delta_x = end_point[0] - start_point[0]
+    delta_y = end_point[1] - start_point[1]
+    length = math.hypot(delta_x, delta_y)
+    if length <= WALL_OPENING_EPSILON:
+        return False
+    alignment = abs(
+        delta_x / length * opening.width_direction_x
+        + delta_y / length * opening.width_direction_y
+    )
+    return alignment >= WALL_REVEAL_PARALLEL_COSINE
+
+
+def _merge_wall_opening_vertical_intervals(
+    intervals: Sequence[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    merged: list[tuple[float, float]] = []
+    for interval_start, interval_end in sorted(intervals):
+        if (
+            merged
+            and interval_start <= merged[-1][1] + WALL_OPENING_EPSILON
+        ):
+            merged[-1] = (
+                merged[-1][0],
+                max(merged[-1][1], interval_end),
+            )
+            continue
+        merged.append((interval_start, interval_end))
+    return merged
 
 
 def _clip_wall_segment_to_opening(
@@ -2714,7 +3040,7 @@ def _clip_wall_segment_to_opening(
     return interval_start, interval_end
 
 
-# ### Doorway reveal helpers ###
+# ### Wall opening reveal helpers ###
 def _build_level_doorway_reveal_mesh(
     level: LevelData,
     base_z_meters: float,
@@ -2762,6 +3088,35 @@ def _build_level_doorway_reveal_mesh(
     )
 
 
+def _build_level_window_reveal_mesh(
+    level: LevelData,
+    base_z_meters: float,
+    blueprint_size_pixels: tuple[float, float] | None,
+) -> trimesh.Trimesh | None:
+    """Build untextured jamb, sill, and head faces for window tunnels."""
+
+    reveals = _build_level_window_reveals(level)
+    if not reveals:
+        return None
+    vertices: list[list[float]] = []
+    faces: list[list[int]] = []
+    for reveal in reveals:
+        _append_window_reveal_geometry(
+            vertices=vertices,
+            faces=faces,
+            reveal_pair=reveal.reveal_pair,
+            base_z_meters=base_z_meters,
+            blueprint_size_pixels=blueprint_size_pixels,
+        )
+    if not vertices or not faces:
+        return None
+    return trimesh.Trimesh(
+        vertices=np.asarray(vertices, dtype=float),
+        faces=np.asarray(faces, dtype=np.int64),
+        process=False,
+    )
+
+
 def _build_level_wall_sources(
     level: LevelData,
     room_vertex_sets: Sequence[set[int]],
@@ -2784,17 +3139,21 @@ def _build_level_wall_sources(
         end_vertex = vertex_lookup.get(edge.end_vertex_id)
         if start_vertex is None or end_vertex is None:
             continue
+        wall_key = (
+            f"{min(edge.start_vertex_id, edge.end_vertex_id)}:"
+            f"{max(edge.start_vertex_id, edge.end_vertex_id)}"
+        )
+        surface_id = f"level:{level.index}/wall:{wall_key}"
 
         _add_level_wall_source(
             wall_sources_by_key,
             WallSource(
-                key=(
-                    f"edge:{min(edge.start_vertex_id, edge.end_vertex_id)}:"
-                    f"{max(edge.start_vertex_id, edge.end_vertex_id)}"
-                ),
+                key=f"edge:{wall_key}",
                 start_point=(start_vertex.x, start_vertex.y),
                 end_point=(end_vertex.x, end_vertex.y),
                 height_meters=level.height_meters,
+                wall_key=wall_key,
+                surface_id=surface_id,
             ),
         )
 
@@ -2806,13 +3165,19 @@ def _build_level_wall_sources(
             continue
 
         for wall in build_room_walls(room, level.vertex_data):
+            surface_id = (
+                f"level:{level.index}/room:{room.center_vertex_id}/"
+                f"wall:{wall.key}"
+            )
             _add_level_wall_source(
                 wall_sources_by_key,
                 WallSource(
-                    key=f"room:{wall.key}",
+                    key=f"room:{room.center_vertex_id}:{wall.key}",
                     start_point=wall.start_point,
                     end_point=wall.end_point,
                     height_meters=room.height_meters,
+                    wall_key=wall.key,
+                    surface_id=surface_id,
                 ),
             )
 
@@ -2899,6 +3264,16 @@ def _build_doorway_reveal_contacts(
             high_width_point,
             0.5,
         )
+        opening_bottom = min(
+            max(0.0, doorway_opening.bottom_height_meters),
+            wall_source.height_meters,
+        )
+        opening_top = min(
+            max(opening_bottom, doorway_opening.top_height_meters),
+            wall_source.height_meters,
+        )
+        if opening_top - opening_bottom <= WALL_OPENING_EPSILON:
+            continue
         contacts.append(
             WallOpeningContact(
                 source_key=wall_source.key,
@@ -2910,10 +3285,10 @@ def _build_doorway_reveal_contacts(
                     contact_midpoint,
                     doorway_opening,
                 ),
-                opening_height_meters=min(
-                    doorway_opening.height_meters,
-                    wall_source.height_meters,
-                ),
+                opening_bottom_height_meters=opening_bottom,
+                opening_top_height_meters=opening_top,
+                wall_key=wall_source.wall_key,
+                surface_id=wall_source.surface_id,
             )
         )
 
@@ -3016,6 +3391,217 @@ def _get_doorway_reveal_pair(
     return best_pair
 
 
+def _build_level_window_reveals(level: LevelData) -> list[WindowReveal]:
+    """Pair each selected wall with its nearest cut outward wall."""
+
+    openings = _build_window_openings(level)
+    if not openings:
+        return []
+    wall_sources = _build_level_wall_sources(
+        level,
+        _get_room_vertex_sets(level.rooms),
+    )
+    reveals: list[WindowReveal] = []
+    for opening in openings:
+        if (
+            opening.target_wall_key is None
+            or opening.target_surface_id is None
+        ):
+            continue
+        contacts = _build_doorway_reveal_contacts(
+            wall_sources,
+            opening,
+        )
+        reveal_pair = _get_window_reveal_pair(contacts, opening)
+        if reveal_pair is None:
+            continue
+        reveals.append(
+            WindowReveal(
+                opening=opening,
+                reveal_pair=reveal_pair,
+                owner_surface_id=opening.target_surface_id,
+            )
+        )
+    return reveals
+
+
+def _get_window_reveal_pair(
+    contacts: Sequence[WallOpeningContact],
+    opening: WallOpening,
+) -> DoorwayRevealPair | None:
+    """Choose the selected wall and nearest distinct outward contact."""
+
+    target_contacts = [
+        contact
+        for contact in contacts
+        if contact.surface_id == opening.target_surface_id
+    ]
+    if not target_contacts:
+        return None
+    target_contact = min(
+        target_contacts,
+        key=lambda contact: (
+            contact.depth_position,
+            contact.source_key,
+        ),
+    )
+    outward_contacts = _merge_contiguous_opening_contacts(
+        [
+            contact
+            for contact in contacts
+            if contact.source_key != target_contact.source_key
+            and contact.depth_position
+            > target_contact.depth_position + WALL_OPENING_EPSILON
+        ],
+        opening,
+    )
+
+    best_pair: DoorwayRevealPair | None = None
+    best_score: tuple[float, float, str] | None = None
+    for outward_contact in outward_contacts:
+        low_width_position = max(
+            target_contact.low_width_position,
+            outward_contact.low_width_position,
+        )
+        high_width_position = min(
+            target_contact.high_width_position,
+            outward_contact.high_width_position,
+        )
+        width_overlap = high_width_position - low_width_position
+        opening_bottom = max(
+            target_contact.opening_bottom_height_meters,
+            outward_contact.opening_bottom_height_meters,
+        )
+        opening_top = min(
+            target_contact.opening_top_height_meters,
+            outward_contact.opening_top_height_meters,
+        )
+        if (
+            width_overlap <= WALL_OPENING_EPSILON
+            or opening_top - opening_bottom <= WALL_OPENING_EPSILON
+        ):
+            continue
+        depth_separation = (
+            outward_contact.depth_position - target_contact.depth_position
+        )
+        score = (
+            depth_separation,
+            -width_overlap,
+            outward_contact.source_key,
+        )
+        if best_score is not None and score >= best_score:
+            continue
+        best_score = score
+        best_pair = DoorwayRevealPair(
+            first_contact=target_contact,
+            second_contact=outward_contact,
+            low_width_position=low_width_position,
+            high_width_position=high_width_position,
+        )
+    return best_pair
+
+
+def _merge_contiguous_opening_contacts(
+    contacts: Sequence[WallOpeningContact],
+    opening: WallOpening,
+) -> list[WallOpeningContact]:
+    """Join collinear outer-wall segments before choosing a reveal pair."""
+
+    merged: list[WallOpeningContact] = []
+    ordered_contacts = sorted(
+        contacts,
+        key=lambda contact: (
+            contact.depth_position,
+            contact.low_width_position,
+            contact.high_width_position,
+            contact.source_key,
+        ),
+    )
+    for contact in ordered_contacts:
+        if not merged:
+            merged.append(contact)
+            continue
+        previous = merged[-1]
+        vertical_bottom = max(
+            previous.opening_bottom_height_meters,
+            contact.opening_bottom_height_meters,
+        )
+        vertical_top = min(
+            previous.opening_top_height_meters,
+            contact.opening_top_height_meters,
+        )
+        same_depth = abs(
+            previous.depth_position - contact.depth_position
+        ) <= WINDOW_COPLANAR_DEPTH_PIXELS
+        contiguous_width = (
+            contact.low_width_position
+            <= previous.high_width_position + WALL_OPENING_EPSILON
+        )
+        if (
+            not same_depth
+            or not contiguous_width
+            or vertical_top - vertical_bottom <= WALL_OPENING_EPSILON
+        ):
+            merged.append(contact)
+            continue
+
+        low_width = min(
+            previous.low_width_position,
+            contact.low_width_position,
+        )
+        high_width = max(
+            previous.high_width_position,
+            contact.high_width_position,
+        )
+        depth_position = (
+            previous.depth_position + contact.depth_position
+        ) / 2.0
+        merged[-1] = WallOpeningContact(
+            source_key=f"{previous.source_key}+{contact.source_key}",
+            low_width_point=_wall_opening_local_to_image(
+                opening,
+                low_width,
+                depth_position,
+            ),
+            high_width_point=_wall_opening_local_to_image(
+                opening,
+                high_width,
+                depth_position,
+            ),
+            low_width_position=low_width,
+            high_width_position=high_width,
+            depth_position=depth_position,
+            opening_bottom_height_meters=vertical_bottom,
+            opening_top_height_meters=vertical_top,
+            wall_key=(
+                previous.wall_key
+                if previous.wall_key == contact.wall_key
+                else None
+            ),
+            surface_id=(
+                previous.surface_id
+                if previous.surface_id == contact.surface_id
+                else None
+            ),
+        )
+    return merged
+
+
+def _wall_opening_local_to_image(
+    opening: WallOpening,
+    width_position: float,
+    depth_position: float,
+) -> tuple[float, float]:
+    return (
+        opening.center_x
+        + opening.width_direction_x * width_position
+        + opening.depth_direction_x * depth_position,
+        opening.center_y
+        + opening.width_direction_y * width_position
+        + opening.depth_direction_y * depth_position,
+    )
+
+
 def _append_doorway_reveal_geometry(
     vertices: list[list[float]],
     faces: list[list[int]],
@@ -3023,79 +3609,137 @@ def _append_doorway_reveal_geometry(
     base_z_meters: float,
     blueprint_size_pixels: tuple[float, float] | None,
 ) -> None:
-    opening_height_meters = min(
-        reveal_pair.first_contact.opening_height_meters,
-        reveal_pair.second_contact.opening_height_meters,
+    _append_wall_opening_reveal_geometry(
+        vertices=vertices,
+        faces=faces,
+        reveal_pair=reveal_pair,
+        base_z_meters=base_z_meters,
+        blueprint_size_pixels=blueprint_size_pixels,
+        include_sill=False,
     )
-    if opening_height_meters <= WALL_OPENING_EPSILON:
-        return
 
-    first_low_point = _interpolate_wall_opening_contact(
+
+def _append_window_reveal_geometry(
+    vertices: list[list[float]],
+    faces: list[list[int]],
+    reveal_pair: DoorwayRevealPair,
+    base_z_meters: float,
+    blueprint_size_pixels: tuple[float, float] | None,
+) -> None:
+    _append_wall_opening_reveal_geometry(
+        vertices=vertices,
+        faces=faces,
+        reveal_pair=reveal_pair,
+        base_z_meters=base_z_meters,
+        blueprint_size_pixels=blueprint_size_pixels,
+        include_sill=True,
+    )
+
+
+def _append_wall_opening_reveal_geometry(
+    vertices: list[list[float]],
+    faces: list[list[int]],
+    reveal_pair: DoorwayRevealPair,
+    base_z_meters: float,
+    blueprint_size_pixels: tuple[float, float] | None,
+    *,
+    include_sill: bool,
+) -> None:
+    for image_quad in _build_wall_opening_reveal_quads(
+        reveal_pair,
+        include_sill=include_sill,
+    ):
+        world_quad = tuple(
+            (
+                float(world_xy[0]),
+                float(world_xy[1]),
+                base_z_meters + local_point[2],
+            )
+            for local_point in image_quad
+            for world_xy in (
+                _point_to_world_xy(
+                    (local_point[0], local_point[1]),
+                    blueprint_size_pixels,
+                ),
+            )
+        )
+        _append_double_sided_quad(
+            vertices=vertices,
+            faces=faces,
+            corners=world_quad,
+        )
+
+
+def _build_wall_opening_reveal_quads(
+    reveal_pair: DoorwayRevealPair,
+    *,
+    include_sill: bool,
+) -> tuple[tuple[tuple[float, float, float], ...], ...]:
+    bottom_height = max(
+        reveal_pair.first_contact.opening_bottom_height_meters,
+        reveal_pair.second_contact.opening_bottom_height_meters,
+    )
+    top_height = min(
+        reveal_pair.first_contact.opening_top_height_meters,
+        reveal_pair.second_contact.opening_top_height_meters,
+    )
+    if top_height - bottom_height <= WALL_OPENING_EPSILON:
+        return ()
+
+    first_low = _interpolate_wall_opening_contact(
         reveal_pair.first_contact,
         reveal_pair.low_width_position,
     )
-    first_high_point = _interpolate_wall_opening_contact(
+    first_high = _interpolate_wall_opening_contact(
         reveal_pair.first_contact,
         reveal_pair.high_width_position,
     )
-    second_low_point = _interpolate_wall_opening_contact(
+    second_low = _interpolate_wall_opening_contact(
         reveal_pair.second_contact,
         reveal_pair.low_width_position,
     )
-    second_high_point = _interpolate_wall_opening_contact(
+    second_high = _interpolate_wall_opening_contact(
         reveal_pair.second_contact,
         reveal_pair.high_width_position,
     )
-    reveal_points = (
-        first_low_point,
-        first_high_point,
-        second_low_point,
-        second_high_point,
-    )
+    points = (first_low, first_high, second_low, second_high)
     if not all(
         math.isfinite(coordinate)
-        for point in reveal_points
+        for point in points
         for coordinate in point
     ):
-        return
+        return ()
 
-    first_low_xy = _point_to_world_xy(first_low_point, blueprint_size_pixels)
-    first_high_xy = _point_to_world_xy(first_high_point, blueprint_size_pixels)
-    second_low_xy = _point_to_world_xy(second_low_point, blueprint_size_pixels)
-    second_high_xy = _point_to_world_xy(second_high_point, blueprint_size_pixels)
-    bottom_z = base_z_meters
-    top_z = base_z_meters + opening_height_meters
-
-    _append_double_sided_quad(
-        vertices=vertices,
-        faces=faces,
-        corners=(
-            (float(first_low_xy[0]), float(first_low_xy[1]), bottom_z),
-            (float(second_low_xy[0]), float(second_low_xy[1]), bottom_z),
-            (float(second_low_xy[0]), float(second_low_xy[1]), top_z),
-            (float(first_low_xy[0]), float(first_low_xy[1]), top_z),
+    quads = [
+        (
+            (*first_low, bottom_height),
+            (*second_low, bottom_height),
+            (*second_low, top_height),
+            (*first_low, top_height),
         ),
-    )
-    _append_double_sided_quad(
-        vertices=vertices,
-        faces=faces,
-        corners=(
-            (float(second_high_xy[0]), float(second_high_xy[1]), bottom_z),
-            (float(first_high_xy[0]), float(first_high_xy[1]), bottom_z),
-            (float(first_high_xy[0]), float(first_high_xy[1]), top_z),
-            (float(second_high_xy[0]), float(second_high_xy[1]), top_z),
+        (
+            (*second_high, bottom_height),
+            (*first_high, bottom_height),
+            (*first_high, top_height),
+            (*second_high, top_height),
         ),
-    )
-    _append_double_sided_quad(
-        vertices=vertices,
-        faces=faces,
-        corners=(
-            (float(first_low_xy[0]), float(first_low_xy[1]), top_z),
-            (float(first_high_xy[0]), float(first_high_xy[1]), top_z),
-            (float(second_high_xy[0]), float(second_high_xy[1]), top_z),
-            (float(second_low_xy[0]), float(second_low_xy[1]), top_z),
+        (
+            (*first_low, top_height),
+            (*second_low, top_height),
+            (*second_high, top_height),
+            (*first_high, top_height),
         ),
-    )
+    ]
+    if include_sill:
+        quads.append(
+            (
+                (*first_low, bottom_height),
+                (*first_high, bottom_height),
+                (*second_high, bottom_height),
+                (*second_low, bottom_height),
+            )
+        )
+    return tuple(quads)
 
 
 def _interpolate_wall_opening_contact(
@@ -3134,10 +3778,11 @@ def _append_double_sided_quad(
 
 
 def _get_opening_interval_breakpoints(
-    doorway_intervals: Sequence[tuple[float, float, float]],
+    doorway_intervals: Sequence[Sequence[float]],
 ) -> list[float]:
     raw_breakpoints = [0.0, 1.0]
-    for interval_start, interval_end, _ in doorway_intervals:
+    for interval in doorway_intervals:
+        interval_start, interval_end = interval[:2]
         raw_breakpoints.extend(
             (
                 min(max(interval_start, 0.0), 1.0),
@@ -3427,7 +4072,7 @@ def _build_level_preview_textured_walls(
     source_transform: np.ndarray,
 ) -> list[PreviewTexturedWall]:
     preview_walls: list[PreviewTexturedWall] = []
-    doorway_openings = _build_wall_openings(level.doorways)
+    doorway_openings = _build_level_wall_openings(level)
     for room_index, room in enumerate(level.rooms):
         layout = build_uv_wall_layout(
             room=room,
@@ -3448,6 +4093,7 @@ def _build_level_preview_textured_walls(
                 end_point=segment_end_point,
                 wall_height_meters=room.height_meters,
                 doorway_openings=doorway_openings,
+                wall_key=placement.wall.key,
             ):
                 preview_start_point = _interpolate_2d_point(
                     segment_start_point,
@@ -3648,6 +4294,10 @@ def _get_level_doorway_reveal_object_name(level: LevelData) -> str:
     return f"{_get_level_object_name(level)}_doorway_reveals"
 
 
+def _get_level_window_reveal_object_name(level: LevelData) -> str:
+    return f"{_get_level_object_name(level)}_window_reveals"
+
+
 def _get_room_object_name(
     level: LevelData,
     room: RoomData,
@@ -3690,11 +4340,16 @@ def _build_wall_mesh(
 
     start_point = (start_vertex.x, start_vertex.y)
     end_point = (end_vertex.x, end_vertex.y)
+    wall_key = (
+        f"{min(edge.start_vertex_id, edge.end_vertex_id)}:"
+        f"{max(edge.start_vertex_id, edge.end_vertex_id)}"
+    )
     wall_pieces = _build_visible_wall_pieces(
         start_point=start_point,
         end_point=end_point,
         wall_height_meters=wall_height_meters,
         doorway_openings=doorway_openings,
+        wall_key=wall_key,
     )
     if not wall_pieces:
         return None

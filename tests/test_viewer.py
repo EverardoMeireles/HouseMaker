@@ -15,7 +15,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # ### Imports ###
 from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
-from PySide6.QtGui import QKeyEvent
+from PySide6.QtGui import QFocusEvent, QKeyEvent
 from PySide6.QtWidgets import QApplication
 from PIL import Image
 from trimesh.visual.material import PBRMaterial
@@ -298,7 +298,11 @@ class GlbViewerRenderingTests(unittest.TestCase):
 
         self.assertEqual(viewer.get_navigation_mode(), NAVIGATION_MODE_FIRST_PERSON)
         self.assertEqual(viewer.get_first_person_camera_pose(), pose)
+        self.assertTrue(viewer.is_first_person_pointer_captured)
         self.assertFalse(viewer.first_person_crosshair_label.isHidden())
+        viewer.release_first_person_pointer_capture()
+        self.assertFalse(viewer.is_first_person_pointer_captured)
+        self.assertEqual(viewer.get_navigation_mode(), NAVIGATION_MODE_FIRST_PERSON)
         self.assertEqual(viewer.toggle_navigation_mode(), NAVIGATION_MODE_ORBIT)
         self.assertEqual(viewer.get_navigation_mode(), NAVIGATION_MODE_ORBIT)
         self.assertTrue(viewer.first_person_crosshair_label.isHidden())
@@ -710,7 +714,9 @@ class FirstPersonNavigationTests(unittest.TestCase):
             2.7,
         )
 
-    def test_mouse_look_and_right_click_exit_do_not_use_orbit_controls(self) -> None:
+    def test_right_click_releases_pointer_but_preserves_first_person_view(
+        self,
+    ) -> None:
         self.view.set_first_person_camera_pose(CameraPose(z=1.7))
         self.view.enter_first_person_mode()
         orbit = Mock()
@@ -729,13 +735,82 @@ class FirstPersonNavigationTests(unittest.TestCase):
         self.assertAlmostEqual(pose.yaw_degrees, -1.6)
         self.assertAlmostEqual(pose.pitch_degrees, -0.8)
 
-        original_orbit_distance = float(self.view._orbit_camera_state["distance"])
-        exit_event = FakeMousePressEvent(button=Qt.MouseButton.RightButton)
-        self.view.mousePressEvent(exit_event)
+        first_person_distance = float(self.view.opts["distance"])
+        release_event = FakeMousePressEvent(button=Qt.MouseButton.RightButton)
+        self.view.mousePressEvent(release_event)
 
-        self.assertTrue(exit_event.was_accepted)
-        self.assertEqual(self.view.get_navigation_mode(), NAVIGATION_MODE_ORBIT)
+        self.assertTrue(release_event.was_accepted)
+        self.assertEqual(
+            self.view.get_navigation_mode(),
+            NAVIGATION_MODE_FIRST_PERSON,
+        )
+        self.assertFalse(self.view.is_first_person_pointer_captured)
         self.assertAlmostEqual(
             float(self.view.opts["distance"]),
-            original_orbit_distance,
+            first_person_distance,
+        )
+
+    def test_released_first_person_pointer_can_select_viewport_content(
+        self,
+    ) -> None:
+        self.view.enter_first_person_mode()
+        self.view.release_first_person_pointer_capture()
+        clicked_positions: list[QPointF] = []
+        clicked_items: list[object] = []
+        self.view.viewport_clicked.connect(clicked_positions.append)
+        self.view.items_clicked.connect(clicked_items.append)
+        self.view._get_clicked_items = Mock(return_value=["wall"])
+        position = QPointF(42.0, 24.0)
+
+        self.view.mousePressEvent(
+            FakeMousePressEvent(
+                button=Qt.MouseButton.LeftButton,
+                position=position,
+            )
+        )
+        self.view.mouseReleaseEvent(
+            FakeMousePressEvent(
+                button=Qt.MouseButton.LeftButton,
+                position=position,
+            )
+        )
+
+        self.assertEqual(clicked_positions, [position])
+        self.assertEqual(clicked_items, [["wall"]])
+        self.assertEqual(
+            self.view.get_navigation_mode(),
+            NAVIGATION_MODE_FIRST_PERSON,
+        )
+
+    def test_focus_loss_releases_capture_without_leaving_first_person(
+        self,
+    ) -> None:
+        self.view.enter_first_person_mode()
+        self.view.keyPressEvent(
+            QKeyEvent(
+                QEvent.Type.KeyPress,
+                Qt.Key.Key_Z,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+
+        self.view.focusOutEvent(QFocusEvent(QEvent.Type.FocusOut))
+
+        self.assertEqual(
+            self.view.get_navigation_mode(),
+            NAVIGATION_MODE_FIRST_PERSON,
+        )
+        self.assertFalse(self.view.is_first_person_pointer_captured)
+        self.assertEqual(self.view._pressed_movement_keys, set())
+
+    def test_rectangle_tool_preserves_first_person_camera_mode(self) -> None:
+        self.view.enter_first_person_mode()
+
+        self.view.set_rectangle_drawing_enabled(True)
+
+        self.assertTrue(self.view.is_rectangle_drawing_enabled)
+        self.assertFalse(self.view.is_first_person_pointer_captured)
+        self.assertEqual(
+            self.view.get_navigation_mode(),
+            NAVIGATION_MODE_FIRST_PERSON,
         )

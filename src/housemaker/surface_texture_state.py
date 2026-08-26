@@ -16,7 +16,7 @@ from housemaker.video_source import VideoMetadata
 
 
 # ### Constants ###
-SURFACE_TEXTURE_SCHEMA_VERSION = 4
+SURFACE_TEXTURE_SCHEMA_VERSION = 5
 SURFACE_TYPE_WALL = "wall"
 SURFACE_TYPE_FLOOR = "floor"
 SURFACE_TYPE_CEILING = "ceiling"
@@ -43,64 +43,13 @@ MAX_TEXTURE_DIMENSION_PIXELS = 16_384
 SURFACE_TEXTURE_RESOLUTIONS = (512, 1024, 2048)
 DEFAULT_SURFACE_TEXTURE_RESOLUTION = 1024
 MAX_LOCALIZED_INPAINT_UNDO_HISTORY = 10
-MAX_SURFACE_OVERLAY_PLANES = 10_000
-MAX_SURFACE_OVERLAY_OFFSET_METERS = 0.05
-SURFACE_OVERLAY_ID_SUFFIX = "/overlay:1"
-
 _SURFACE_ID_PATTERN = re.compile(
     r"^level:(?P<level_index>0|[1-9]\d*)/"
     r"(?:room:(?P<room_identity>0|[1-9]\d*)/)?"
     r"(?:(?P<wall>wall):(?P<wall_key>[1-9]\d*:[1-9]\d*)|"
-    r"(?P<plane>floor|ceiling))"
-    r"(?P<overlay>/overlay:(?P<overlay_key>[1-9]\d*))?$"
+    r"(?P<plane>floor|ceiling))$"
 )
-
-
-# ### Surface-overlay models ###
-@dataclass(frozen=True)
-class SurfaceTextureOverlayPlane:
-    """One persisted close-offset plane derived from a fixed surface."""
-
-    parent_surface_id: str
-    normal_offset_meters: float
-
-    def __post_init__(self) -> None:
-        parent_surface_id = _normalize_surface_id(self.parent_surface_id)
-        if _is_overlay_surface_id(parent_surface_id):
-            raise ValueError("A surface overlay cannot be placed on another overlay.")
-        normal_offset_meters = _normalize_surface_overlay_offset(
-            self.normal_offset_meters
-        )
-        object.__setattr__(self, "parent_surface_id", parent_surface_id)
-        object.__setattr__(self, "normal_offset_meters", normal_offset_meters)
-
-    @property
-    def surface_id(self) -> str:
-        return f"{self.parent_surface_id}{SURFACE_OVERLAY_ID_SUFFIX}"
-
-    @property
-    def surface_type(self) -> str:
-        return _surface_type_for_id(self.parent_surface_id)
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "surface_id": self.surface_id,
-            "parent_surface_id": self.parent_surface_id,
-            "normal_offset_meters": float(self.normal_offset_meters),
-        }
-
-    @classmethod
-    def from_dict(cls, payload: object) -> "SurfaceTextureOverlayPlane":
-        if not isinstance(payload, dict):
-            raise ValueError("A surface overlay plane must contain an object.")
-        plane = cls(
-            parent_surface_id=str(payload.get("parent_surface_id", "")),
-            normal_offset_meters=payload.get("normal_offset_meters", 0.0),
-        )
-        raw_surface_id = payload.get("surface_id")
-        if raw_surface_id is not None and str(raw_surface_id) != plane.surface_id:
-            raise ValueError("A surface overlay plane has an inconsistent ID.")
-        return plane
+_LEGACY_SURFACE_OVERLAY_ID_PATTERN = re.compile(r"/overlay:[1-9]\d*$")
 
 
 # ### Generated-texture models ###
@@ -457,7 +406,6 @@ class SurfaceTextureData:
     selected_surface_type: str | None = None
     selected_surface_ids: tuple[str, ...] = ()
     assignments: list[SurfaceTextureAssignment] = field(default_factory=list)
-    overlay_planes: list[SurfaceTextureOverlayPlane] = field(default_factory=list)
     localized_inpaint_undo_stack: list[
         SurfaceTextureInpaintUndoSnapshot
     ] = field(default_factory=list)
@@ -494,19 +442,6 @@ class SurfaceTextureData:
             self.selected_surface_type,
             self.selected_surface_ids,
         )
-        overlay_planes = list(self.overlay_planes)
-        if len(overlay_planes) > MAX_SURFACE_OVERLAY_PLANES:
-            raise ValueError("Surface texture data contains too many overlay planes.")
-        if not all(
-            isinstance(plane, SurfaceTextureOverlayPlane)
-            for plane in overlay_planes
-        ):
-            raise ValueError(
-                "Surface texture overlay planes have invalid values."
-            )
-        parent_surface_ids = [plane.parent_surface_id for plane in overlay_planes]
-        if len(set(parent_surface_ids)) != len(parent_surface_ids):
-            raise ValueError("Only one overlay plane may exist per fixed surface.")
         assignments = list(self.assignments)
         if len(assignments) > MAX_SURFACE_TEXTURE_ASSIGNMENTS:
             raise ValueError("Surface texture data contains too many assignments.")
@@ -534,7 +469,6 @@ class SurfaceTextureData:
         self.texture_mask_strokes = normalized_texture_mask_strokes
         self.selected_surface_type = selected_surface_type
         self.selected_surface_ids = selected_surface_ids
-        self.overlay_planes = overlay_planes
         self.assignments = assignments
         self.localized_inpaint_undo_stack = undo_stack
 
@@ -632,7 +566,6 @@ class SurfaceTextureData:
             ),
             "selected_surface_type": self.selected_surface_type,
             "selected_surface_ids": list(self.selected_surface_ids),
-            "overlay_planes": [plane.to_dict() for plane in self.overlay_planes],
             "assignments": [assignment.to_dict() for assignment in self.assignments],
             "localized_inpaint_undo_stack": [
                 snapshot.to_dict()
@@ -668,7 +601,6 @@ class SurfaceTextureData:
             payload.get("camera_pose", payload.get("first_person_camera_pose"))
         )
         selected_surface_type, selected_surface_ids = _load_selection(payload)
-        overlay_planes = _load_overlay_planes(payload.get("overlay_planes", ()))
         assignments = _load_assignments(
             payload.get("assignments", payload.get("generated_assignments", ()))
         )
@@ -683,7 +615,6 @@ class SurfaceTextureData:
             camera_pose=camera_pose,
             selected_surface_type=selected_surface_type,
             selected_surface_ids=selected_surface_ids,
-            overlay_planes=overlay_planes,
             assignments=assignments,
             localized_inpaint_undo_stack=undo_stack,
         )
@@ -783,38 +714,27 @@ def _load_camera_pose(raw_camera_pose: object) -> CameraPose | None:
         return None
 
 
-def _load_selection(payload: dict[object, object]) -> tuple[str | None, tuple[str, ...]]:
+def _load_selection(
+    payload: dict[object, object],
+) -> tuple[str | None, tuple[str, ...]]:
     raw_surface_ids = payload.get("selected_surface_ids", ())
     if not isinstance(raw_surface_ids, list | tuple):
+        return None, ()
+    surface_ids = tuple(
+        str(surface_id)
+        for surface_id in raw_surface_ids
+        if not _is_legacy_surface_overlay_id(surface_id)
+    )
+    if not surface_ids:
         return None, ()
     raw_surface_type = payload.get("selected_surface_type")
     try:
         return _normalize_selection(
             None if raw_surface_type is None else str(raw_surface_type),
-            tuple(str(surface_id) for surface_id in raw_surface_ids),
+            surface_ids,
         )
     except ValueError:
         return None, ()
-
-
-def _load_overlay_planes(
-    raw_overlay_planes: object,
-) -> list[SurfaceTextureOverlayPlane]:
-    if not isinstance(raw_overlay_planes, list | tuple):
-        return []
-
-    planes: list[SurfaceTextureOverlayPlane] = []
-    seen_parent_ids: set[str] = set()
-    for raw_plane in raw_overlay_planes[:MAX_SURFACE_OVERLAY_PLANES]:
-        try:
-            plane = SurfaceTextureOverlayPlane.from_dict(raw_plane)
-        except (KeyError, TypeError, ValueError, OverflowError):
-            continue
-        if plane.parent_surface_id in seen_parent_ids:
-            continue
-        seen_parent_ids.add(plane.parent_surface_id)
-        planes.append(plane)
-    return planes
 
 
 def _load_assignments(raw_assignments: object) -> list[SurfaceTextureAssignment]:
@@ -824,8 +744,13 @@ def _load_assignments(raw_assignments: object) -> list[SurfaceTextureAssignment]
     assignments: list[SurfaceTextureAssignment] = []
     seen_assignment_ids: set[str] = set()
     for raw_assignment in raw_assignments[:MAX_SURFACE_TEXTURE_ASSIGNMENTS]:
+        migrated_assignment = _without_legacy_overlay_assignment_surfaces(
+            raw_assignment
+        )
+        if migrated_assignment is None:
+            continue
         try:
-            assignment = SurfaceTextureAssignment.from_dict(raw_assignment)
+            assignment = SurfaceTextureAssignment.from_dict(migrated_assignment)
         except (KeyError, TypeError, ValueError, OverflowError):
             continue
         if assignment.assignment_id in seen_assignment_ids:
@@ -833,6 +758,31 @@ def _load_assignments(raw_assignments: object) -> list[SurfaceTextureAssignment]
         seen_assignment_ids.add(assignment.assignment_id)
         assignments.append(assignment)
     return assignments
+
+
+def _without_legacy_overlay_assignment_surfaces(
+    raw_assignment: object,
+) -> dict[object, object] | object | None:
+    """Strip removed overlay targets while retaining an assignment's base targets."""
+
+    if not isinstance(raw_assignment, dict):
+        return raw_assignment
+    surface_key = "surface_ids" if "surface_ids" in raw_assignment else "surfaces"
+    raw_surface_ids = raw_assignment.get(surface_key, ())
+    if not isinstance(raw_surface_ids, list | tuple):
+        return raw_assignment
+    retained_ids = [
+        surface_id
+        for surface_id in raw_surface_ids
+        if not _is_legacy_surface_overlay_id(surface_id)
+    ]
+    if not retained_ids:
+        return None
+    if len(retained_ids) == len(raw_surface_ids):
+        return raw_assignment
+    migrated_assignment = dict(raw_assignment)
+    migrated_assignment[surface_key] = retained_ids
+    return migrated_assignment
 
 
 def _load_localized_inpaint_undo_stack(
@@ -1004,9 +954,9 @@ def _normalize_surface_id(surface_id: object) -> str:
     return normalized_id
 
 
-def _is_overlay_surface_id(surface_id: str) -> bool:
-    match = _SURFACE_ID_PATTERN.fullmatch(surface_id)
-    return match is not None and match.group("overlay") is not None
+def _is_legacy_surface_overlay_id(surface_id: object) -> bool:
+    normalized_id = str(surface_id).strip()
+    return _LEGACY_SURFACE_OVERLAY_ID_PATTERN.search(normalized_id) is not None
 
 
 def _surface_type_for_id(surface_id: str) -> str:
@@ -1014,24 +964,6 @@ def _surface_type_for_id(surface_id: str) -> str:
     if match is None:
         raise ValueError(f"Invalid fixed-surface ID: {surface_id!r}.")
     return SURFACE_TYPE_WALL if match.group("wall") else str(match.group("plane"))
-
-
-def _normalize_surface_overlay_offset(value: object) -> float:
-    if isinstance(value, bool):
-        raise ValueError("A surface overlay offset must be a number.")
-    try:
-        offset = float(value)
-    except (TypeError, ValueError, OverflowError) as error:
-        raise ValueError("A surface overlay offset must be a number.") from error
-    if (
-        not math.isfinite(offset)
-        or abs(offset) <= 1e-8
-        or abs(offset) > MAX_SURFACE_OVERLAY_OFFSET_METERS
-    ):
-        raise ValueError(
-            "A surface overlay offset must be finite and no more than 5 cm."
-        )
-    return offset
 
 
 def _infer_surface_type(surface_ids: object) -> str:

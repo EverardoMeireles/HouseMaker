@@ -50,13 +50,6 @@ from housemaker.settings_widget import (
     GenerationServiceSettings,
     read_surface_texture_provider,
 )
-from housemaker.surface_geometry import (
-    DEFAULT_SURFACE_OVERLAY_OFFSET_METERS,
-    FixedSurface,
-    build_fixed_surfaces,
-    build_surface_overlay_plane,
-    get_surface_overlay_offset_toward_point,
-)
 from housemaker.surface_texture_providers import (
     SurfaceTextureResult,
     request_surface_texture,
@@ -66,7 +59,6 @@ from housemaker.surface_texture_state import (
     SurfaceTextureAssignment,
     SurfaceTextureData,
     SurfaceTextureInpaintUndoSnapshot,
-    SurfaceTextureOverlayPlane,
     SurfaceTextureVariant,
 )
 from housemaker.surface_texture_variants import (
@@ -294,30 +286,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             for surface_id in assignment.surface_ids:
                 material_sources[surface_id] = texture_path
         return material_sources
-
-    def get_surface_overlay_planes(self) -> tuple[FixedSurface, ...]:
-        """Build live overlay geometry from bounded persisted definitions."""
-
-        base_surfaces = build_fixed_surfaces(self._levels)
-        base_by_id = {
-            surface.surface_id: surface for surface in base_surfaces
-        }
-        overlay_surfaces: list[FixedSurface] = []
-        for plane in self._data.overlay_planes:
-            parent_surface = base_by_id.get(plane.parent_surface_id)
-            if parent_surface is None:
-                continue
-            try:
-                overlay_surfaces.append(
-                    build_surface_overlay_plane(
-                        parent_surface,
-                        plane.surface_id,
-                        plane.normal_offset_meters,
-                    )
-                )
-            except (TypeError, ValueError):
-                continue
-        return tuple(overlay_surfaces)
 
     def get_assignment_asset_path(
         self,
@@ -736,7 +704,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self.surface_view.set_levels(
             self._levels,
             self._initial_camera,
-            self.get_surface_overlay_planes(),
         )
         self._data.camera_pose = saved_camera_pose
         self._restore_viewer_state()
@@ -760,7 +727,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self.surface_view.set_levels(
             self._levels,
             initial_camera,
-            self.get_surface_overlay_planes(),
         )
         self._restore_viewer_state()
         self._restore_assignment_textures()
@@ -1076,24 +1042,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self.selection_label = QLabel("No surface selected")
         self.selection_label.setObjectName("surface_selection_label")
         first_row.addWidget(self.selection_label, 1)
-        self.add_plane_button = QPushButton("Add plane")
-        self.add_plane_button.setObjectName("add_surface_texture_plane_button")
-        self.add_plane_button.setToolTip(
-            "Add one close-offset texture plane in front of the selected surface."
-        )
-        self.add_plane_button.clicked.connect(self._handle_add_plane_clicked)
-        first_row.addWidget(self.add_plane_button)
-        self.remove_plane_button = QPushButton("Remove plane")
-        self.remove_plane_button.setObjectName(
-            "remove_surface_texture_plane_button"
-        )
-        self.remove_plane_button.setToolTip(
-            "Remove the selected texture plane and any assignment used only by it."
-        )
-        self.remove_plane_button.clicked.connect(
-            self._handle_remove_plane_clicked
-        )
-        first_row.addWidget(self.remove_plane_button)
         self.delete_texture_button = QPushButton("Delete texture")
         self.delete_texture_button.setObjectName(
             "delete_surface_texture_button"
@@ -1880,144 +1828,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         except (RuntimeError, ValueError) as error:
             QMessageBox.critical(self, "Video load failed", str(error))
 
-    def _handle_add_plane_clicked(self) -> None:
-        if self.is_generating:
-            return
-        selected_ids = self.surface_view.get_selected_surface_ids()
-        if len(selected_ids) != 1:
-            self.status_label.setText(
-                "Select exactly one fixed surface before adding a plane."
-            )
-            return
-        parent_surface = self.surface_view.get_surface(selected_ids[0])
-        if parent_surface is None:
-            self.status_label.setText("The selected fixed surface is unavailable.")
-            return
-        if parent_surface.overlay_parent_surface_id is not None:
-            self.status_label.setText(
-                "A texture plane cannot be placed on another texture plane."
-            )
-            return
-        if any(
-            plane.parent_surface_id == parent_surface.surface_id
-            for plane in self._data.overlay_planes
-        ):
-            self.status_label.setText(
-                "The selected surface already has a texture plane."
-            )
-            return
-
-        camera_pose = self.surface_view.get_camera_pose()
-        try:
-            normal_offset = get_surface_overlay_offset_toward_point(
-                parent_surface,
-                (camera_pose.x, camera_pose.y, camera_pose.z),
-                DEFAULT_SURFACE_OVERLAY_OFFSET_METERS,
-            )
-            plane = SurfaceTextureOverlayPlane(
-                parent_surface_id=parent_surface.surface_id,
-                normal_offset_meters=normal_offset,
-            )
-            build_surface_overlay_plane(
-                parent_surface,
-                plane.surface_id,
-                plane.normal_offset_meters,
-            )
-        except (TypeError, ValueError) as error:
-            self.status_label.setText(f"The texture plane could not be added: {error}")
-            return
-
-        self._data.overlay_planes.append(plane)
-        self._reload_surface_geometry()
-        self.surface_view.set_selected_surface_ids((plane.surface_id,))
-        self.surface_content_changed.emit()
-        self.status_label.setText(
-            "Added and selected a texture plane 3 mm in front of the surface."
-        )
-
-    def _handle_remove_plane_clicked(self) -> None:
-        if self.is_generating:
-            return
-        selected_ids = self.surface_view.get_selected_surface_ids()
-        if len(selected_ids) != 1:
-            self.status_label.setText("Select exactly one texture plane to remove.")
-            return
-        selected_id = selected_ids[0]
-        plane = next(
-            (
-                candidate
-                for candidate in self._data.overlay_planes
-                if candidate.surface_id == selected_id
-            ),
-            None,
-        )
-        if plane is None:
-            self.status_label.setText("The selected surface is not a texture plane.")
-            return
-
-        retained_assignments: list[SurfaceTextureAssignment] = []
-        removed_assignments: list[SurfaceTextureAssignment] = []
-        for assignment in self._data.assignments:
-            remaining_surface_ids = tuple(
-                surface_id
-                for surface_id in assignment.surface_ids
-                if surface_id != selected_id
-            )
-            if remaining_surface_ids == assignment.surface_ids:
-                retained_assignments.append(assignment)
-                continue
-            if not remaining_surface_ids:
-                removed_assignments.append(assignment)
-                continue
-            remaining_area = self.surface_view.get_combined_surface_area(
-                remaining_surface_ids
-            )
-            retained_assignments.append(
-                replace(
-                    assignment,
-                    surface_ids=remaining_surface_ids,
-                    combined_area_m2=remaining_area,
-                    area_description=(
-                        f"{len(remaining_surface_ids)} "
-                        f"{assignment.surface_type} surface(s), "
-                        f"{remaining_area:.2f} m²"
-                    ),
-                )
-            )
-
-        self._data.overlay_planes = [
-            candidate
-            for candidate in self._data.overlay_planes
-            if candidate.surface_id != selected_id
-        ]
-        self._data.assignments = retained_assignments
-        self._data.texture_mask_strokes.pop(selected_id, None)
-        discarded_undo_assignments = (
-            self._clear_localized_inpaint_undo_history()
-        )
-        self._texture_atlas_entry_cache.clear()
-        cleanup_failure_count = self._delete_orphaned_assignment_assets(
-            [*removed_assignments, *discarded_undo_assignments]
-        )
-        self._reload_surface_geometry()
-        self.surface_view.set_selected_surface_ids((plane.parent_surface_id,))
-        self._restore_assignment_textures()
-        self._refresh_texture_atlases()
-        removed_assignment_ids = self._unretained_assignment_ids(
-            [*removed_assignments, *discarded_undo_assignments]
-        )
-        if removed_assignment_ids:
-            self.assignments_removed.emit(removed_assignment_ids)
-        self.surface_content_changed.emit()
-        status = "Removed the selected texture plane."
-        if cleanup_failure_count:
-            status += (
-                f" {cleanup_failure_count} unused texture file(s) could not "
-                "be deleted."
-            )
-        self.status_label.setText(status)
-        self._sync_controls()
-
     def _handle_seekbar_changed(self, frame_index: int) -> None:
         if self._is_syncing_seekbar or self.is_generating:
             return
@@ -2102,12 +1912,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         )
         self.surface_view.set_texture_mask_strokes(
             self._data.texture_mask_strokes
-        )
-
-    def _reload_surface_geometry(self) -> None:
-        base_surfaces = build_fixed_surfaces(self._levels)
-        self.surface_view.set_surfaces(
-            [*base_surfaces, *self.get_surface_overlay_planes()]
         )
 
     def _restore_assignment_textures(
@@ -2699,19 +2503,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         has_video = self._video_source is not None
         has_mask = bool(self._data.frame_strokes) or self.video_view.has_selection()
         has_surface = bool(self.surface_view.get_selected_surface_ids())
-        selected_ids = self.surface_view.get_selected_surface_ids()
-        selected_surface = (
-            self.surface_view.get_surface(selected_ids[0])
-            if len(selected_ids) == 1
-            else None
-        )
-        selected_parent_has_plane = (
-            selected_surface is not None
-            and any(
-                plane.parent_surface_id == selected_surface.surface_id
-                for plane in self._data.overlay_planes
-            )
-        )
         has_key = bool(self._settings.surface_texture_api_key)
         self.load_video_button.setEnabled(not busy)
         self.seekbar.setEnabled(has_video and not busy)
@@ -2736,17 +2527,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self.other_texture_list.setEnabled(not busy)
         self.delete_texture_button.setEnabled(
             self._selected_texture_assignment_id_for_deletion() is not None
-            and not busy
-        )
-        self.add_plane_button.setEnabled(
-            selected_surface is not None
-            and selected_surface.overlay_parent_surface_id is None
-            and not selected_parent_has_plane
-            and not busy
-        )
-        self.remove_plane_button.setEnabled(
-            selected_surface is not None
-            and selected_surface.overlay_parent_surface_id is not None
             and not busy
         )
         self.generate_button.setEnabled(
