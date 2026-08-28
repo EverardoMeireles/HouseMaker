@@ -23,10 +23,10 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
-from housemaker.camera_uv_integrity import (
-    CAMERA_UV_FINGERPRINT_VERSION,
-    CameraUvFingerprint,
-    build_camera_uv_fingerprint,
+from housemaker.uv_integrity import (
+    UV_FINGERPRINT_VERSION,
+    UvFingerprint,
+    build_uv_fingerprint,
 )
 from housemaker.generation_state import (
     MASK_MODE_PAINT,
@@ -97,7 +97,7 @@ def _write_test_video(path: Path) -> None:
         writer.release()
 
 
-def _camera_uv_glb(*, mutate_uv: bool = False) -> bytes:
+def _uv_glb(*, mutate_uv: bool = False) -> bytes:
     vertices = np.asarray(
         (
             (0.0, 0.0, 0.0),
@@ -264,8 +264,8 @@ class TextureRegenerationRequestTests(unittest.TestCase):
         self.assertEqual(request.model_glb, b"owned model")
         self.assertIs(request.settings, settings)
 
-        fingerprint = CameraUvFingerprint(
-            CAMERA_UV_FINGERPRINT_VERSION,
+        fingerprint = UvFingerprint(
+            UV_FINGERPRINT_VERSION,
             "a" * 64,
             2,
         )
@@ -285,6 +285,16 @@ class TextureRegenerationRequestTests(unittest.TestCase):
                 reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
                 model_glb=b"model",
                 settings=settings,
+                submitted_uv_fingerprint=fingerprint,
+            )
+        with self.assertRaisesRegex(ValueError, "only supported for symmetric"):
+            TextureRegenerationRequest(
+                object_id="chair",
+                reference_frame_index=0,
+                reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
+                model_glb=b"model",
+                settings=settings,
+                enable_original_uv=True,
                 submitted_uv_fingerprint=fingerprint,
             )
 
@@ -310,8 +320,8 @@ class MeshyTextureRegeneratorTests(unittest.TestCase):
     def test_provider_sends_owned_model_reference_and_uv_flag(self) -> None:
         reference = np.zeros((5, 7, 4), dtype=np.uint8)
         reference[:, :] = (11, 22, 33, 177)
-        model_glb = _camera_uv_glb()
-        fingerprint = build_camera_uv_fingerprint(model_glb)
+        model_glb = _uv_glb()
+        fingerprint = build_uv_fingerprint(model_glb)
         request = TextureRegenerationRequest(
             object_id="chair",
             reference_frame_index=3,
@@ -320,6 +330,7 @@ class MeshyTextureRegeneratorTests(unittest.TestCase):
             settings=GenerationServiceSettings(meshy_api_key="msy-secret"),
             enable_original_uv=True,
             submitted_uv_fingerprint=fingerprint,
+            preserve_symmetric_uvs=True,
         )
         expected = MeshyGenerationResult("texture-task", model_glb, "Chair")
         progress_messages: list[str] = []
@@ -406,8 +417,8 @@ class MeshyTextureRegeneratorTests(unittest.TestCase):
 
         retexture.assert_not_called()
 
-    def test_worker_rejects_returned_camera_uv_changes_before_executor(self) -> None:
-        submitted_glb = _camera_uv_glb()
+    def test_worker_rejects_changed_symmetric_uvs_before_executor(self) -> None:
+        submitted_glb = _uv_glb()
         request = TextureRegenerationRequest(
             object_id="chair",
             reference_frame_index=0,
@@ -415,11 +426,12 @@ class MeshyTextureRegeneratorTests(unittest.TestCase):
             model_glb=submitted_glb,
             settings=GenerationServiceSettings(meshy_api_key="msy-secret"),
             enable_original_uv=True,
-            submitted_uv_fingerprint=build_camera_uv_fingerprint(submitted_glb),
+            submitted_uv_fingerprint=build_uv_fingerprint(submitted_glb),
+            preserve_symmetric_uvs=True,
         )
         result = MeshyGenerationResult(
             "changed-task",
-            _camera_uv_glb(mutate_uv=True),
+            _uv_glb(mutate_uv=True),
             "Changed",
         )
         regenerator = _SequenceTextureRegenerator([result])
@@ -776,97 +788,41 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
         )
         self.assertEqual(data_changed.count(), 1)
 
-    def test_request_uses_current_setting_to_preserve_camera_uv_provenance(
+    def test_legacy_camera_uv_metadata_is_preserved_but_not_activated(
         self,
     ) -> None:
-        record, variants = self._seed_object(
+        record, _variants = self._seed_object(
             0,
             name="Chair",
             task_id="geometry-task",
         )
-        self.workspace.texture_view.select_atlas(
-            f"{record.object_id}:resolution:2048"
-        )
-        expected_reference = self._load_reference(frame_index=1)
-
-        ordinary_request = self.workspace._build_texture_regeneration_request()
-
-        self.assertIsNotNone(ordinary_request)
-        assert ordinary_request is not None
-        self.assertEqual(
-            ordinary_request.model_glb,
-            variants.glb_by_resolution[1024],
-        )
-        self.assertEqual(ordinary_request.reference_frame_index, 1)
-        np.testing.assert_array_equal(
-            ordinary_request.reference_image_bgra,
-            expected_reference,
-        )
-        self.assertFalse(ordinary_request.enable_original_uv)
-        self.assertIsNone(ordinary_request.submitted_uv_fingerprint)
-
-        postprocessed_glb = _camera_uv_glb()
+        self._load_reference(frame_index=1)
+        postprocessed_glb = _uv_glb()
         postprocessed_name = f"{record.object_id}.postprocessed.glb"
         self.asset_directory.joinpath(postprocessed_name).write_bytes(
             postprocessed_glb
         )
-        fingerprint = build_camera_uv_fingerprint(postprocessed_glb)
-        current = self.workspace.get_data().generated_objects[0]
-        projected = self._replace_record(
-            current,
-            postprocessed_asset_path=postprocessed_name,
-            camera_uv_projection_applied=True,
-            retexture_enable_original_uv=True,
-            camera_uv_fingerprint_version=(
-                CAMERA_UV_FINGERPRINT_VERSION
-            ),
-            camera_uv_submitted_fingerprint=fingerprint.sha256,
-            camera_uv_integrity_face_count=fingerprint.face_count,
-            retained_provenance="keep-me",
-        )
+        legacy_pipeline = {
+            "postprocessed_asset_path": postprocessed_name,
+            "camera_uv_projection_applied": True,
+            "camera_uv_submitted_fingerprint": "a" * 64,
+            "camera_uv_integrity_face_count": 2,
+            "retained_provenance": "keep-me",
+        }
+        replacement = self._replace_record(record, **legacy_pipeline)
 
-        projected_request = self.workspace._build_texture_regeneration_request()
+        request = self.workspace._build_texture_regeneration_request()
 
-        self.assertIsNotNone(projected_request)
-        assert projected_request is not None
-        self.assertEqual(projected_request.object_id, projected.object_id)
-        self.assertEqual(projected_request.model_glb, postprocessed_glb)
-        self.assertFalse(projected_request.enable_original_uv)
-        self.assertIsNone(projected_request.submitted_uv_fingerprint)
-
-        self.workspace.set_runtime_settings(
-            GenerationServiceSettings(
-                meshy_api_key="msy-test-key",
-                project_uvs_from_camera_views=True,
-            )
-        )
-        projected_request = self.workspace._build_texture_regeneration_request()
-
-        self.assertIsNotNone(projected_request)
-        assert projected_request is not None
-        self.assertTrue(projected_request.enable_original_uv)
-        self.assertEqual(
-            projected_request.submitted_uv_fingerprint,
-            fingerprint,
-        )
-
-        corrupt = self._replace_record(
-            projected,
-            camera_uv_submitted_fingerprint="0" * 64,
-        )
-        regenerator = _SequenceTextureRegenerator(
-            [MeshyGenerationResult("should-not-run", postprocessed_glb, "Chair")]
-        )
-        self.workspace.set_texture_regenerator(regenerator)
-
-        self.assertFalse(self.workspace.regenerate_selected_object_texture())
-        self.assertEqual(regenerator.requests, [])
-        self.assertFalse(self.workspace.is_generating)
-        self.assertIn("no longer matches", self.workspace.status_label.text())
-        self.assertEqual(
-            self.workspace.get_data().generated_objects[0],
-            corrupt,
-        )
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertEqual(request.model_glb, postprocessed_glb)
+        self.assertFalse(request.enable_original_uv)
+        self.assertFalse(request.preserve_symmetric_uvs)
+        self.assertIsNone(request.submitted_uv_fingerprint)
+        restored = GenerationData.from_dict(self.workspace.get_data().to_dict())
+        for key, value in legacy_pipeline.items():
+            self.assertEqual(replacement.pipeline[key], value)
+            self.assertEqual(restored.generated_objects[0].pipeline[key], value)
 
     def test_success_replaces_variants_repeats_and_refreshes_external_view(
         self,

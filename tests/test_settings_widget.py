@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # ### Imports ###
 from PySide6.QtGui import QKeySequence
-from PySide6.QtWidgets import QApplication, QLineEdit
+from PySide6.QtWidgets import QApplication, QLabel, QLineEdit
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.settings_widget import (
@@ -23,7 +23,6 @@ from housemaker.settings_widget import (
     MESHY_API_KEY_SETTING_KEY,
     OPENAI_API_KEY_ENVIRONMENT_VARIABLE,
     OPENAI_API_KEY_SETTING_KEY,
-    PROJECT_UVS_FROM_CAMERA_VIEWS_SETTING_KEY,
     UNUSED_FACE_REMOVAL_SETTING_KEY,
     Fullscreen3DViewerScreenOption,
     SURFACE_TEXTURE_PROVIDER_GPT_5_6_TERRA,
@@ -32,7 +31,6 @@ from housemaker.settings_widget import (
     SettingsWidget,
     fullscreen_3d_viewer_screen_id,
     read_canvas_3d_navigation_toggle_hotkey,
-    read_project_uvs_from_camera_views,
     read_unused_face_removal,
 )
 
@@ -66,7 +64,7 @@ class SettingsWidgetTests(unittest.TestCase):
             )
             self.assertFalse(hasattr(widget, "surface_texture_provider_combo"))
             self.assertTrue(hasattr(widget, "unused_face_removal_checkbox"))
-            self.assertTrue(
+            self.assertFalse(
                 hasattr(widget, "project_uvs_from_camera_views_checkbox")
             )
             self.assertFalse(
@@ -103,67 +101,30 @@ class SettingsWidgetTests(unittest.TestCase):
             )
             self.assertTrue(restored.get_settings().unused_face_removal)
 
-    def test_project_uvs_from_camera_views_persists_and_emits_changes(
-        self,
-    ) -> None:
+    def test_legacy_camera_uv_setting_is_ignored_without_ui(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             application_settings = _build_test_settings(temporary_directory)
+            legacy_setting_key = "generation/project_uvs_from_camera_views"
+            application_settings.set(legacy_setting_key, True)
             widget = SettingsWidget(
                 application_settings=application_settings,
                 environment={},
             )
-            emitted_changes: list[bool] = []
-            widget.settings_changed.connect(
-                lambda: emitted_changes.append(True)
-            )
 
-            checkbox = widget.project_uvs_from_camera_views_checkbox
             self.assertFalse(
-                widget.get_settings().project_uvs_from_camera_views
+                hasattr(widget, "project_uvs_from_camera_views_checkbox")
             )
-            self.assertIn(
-                "all six fixed camera views",
-                checkbox.toolTip(),
-            )
-            self.assertIn("independently", checkbox.toolTip())
-            checkbox.setChecked(True)
-
-            self.assertTrue(
-                application_settings.get(
-                    PROJECT_UVS_FROM_CAMERA_VIEWS_SETTING_KEY
+            self.assertFalse(
+                hasattr(
+                    widget.get_settings(),
+                    "project_uvs_from_camera_views",
                 )
             )
-            self.assertTrue(
-                widget.get_settings().project_uvs_from_camera_views
+            self.assertNotIn(
+                "Project UVs from camera views",
+                [label.text() for label in widget.findChildren(QLabel)],
             )
-            self.assertEqual(emitted_changes, [True])
-
-            restored = SettingsWidget(
-                application_settings=_build_test_settings(temporary_directory),
-                environment={},
-            )
-            self.assertTrue(
-                restored.get_settings().project_uvs_from_camera_views
-            )
-
-    def test_project_uvs_from_camera_views_rejects_malformed_settings(
-        self,
-    ) -> None:
-        with self.assertRaisesRegex(ValueError, "Project UVs from camera views"):
-            GenerationServiceSettings(
-                project_uvs_from_camera_views=1  # type: ignore[arg-type]
-            )
-
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            application_settings = _build_test_settings(temporary_directory)
-            application_settings.set(
-                PROJECT_UVS_FROM_CAMERA_VIEWS_SETTING_KEY,
-                "yes",
-            )
-
-            self.assertFalse(
-                read_project_uvs_from_camera_views(application_settings)
-            )
+            self.assertTrue(application_settings.get(legacy_setting_key))
 
     def test_unused_face_removal_rejects_malformed_settings(self) -> None:
         with self.assertRaisesRegex(ValueError, "Unused face removal"):

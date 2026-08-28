@@ -45,16 +45,11 @@ from PySide6.QtWidgets import (
 )
 from shiboken6 import isValid as is_valid_qt_object
 
-from housemaker.camera_uv_integrity import (
-    CAMERA_UV_FINGERPRINT_VERSION,
-    CAMERA_UV_PROJECTION_VERSION,
-    CameraUvFingerprint,
-    CameraUvIntegrityError,
-    build_camera_uv_fingerprint,
-    validate_camera_uv_retexture_integrity,
-)
-from housemaker.camera_uv_projection import (
-    project_uvs_from_camera_views_from_glb,
+from housemaker.uv_integrity import (
+    UV_FINGERPRINT_VERSION,
+    UvFingerprint,
+    UvIntegrityError,
+    build_uv_fingerprint,
 )
 from housemaker.generation_state import (
     MASK_MODE_ERASE,
@@ -400,7 +395,7 @@ class TextureRegenerationRequest:
     model_glb: bytes
     settings: GenerationServiceSettings
     enable_original_uv: bool = False
-    submitted_uv_fingerprint: CameraUvFingerprint | None = None
+    submitted_uv_fingerprint: UvFingerprint | None = None
     preserve_symmetric_uvs: bool = False
 
     def __post_init__(self) -> None:
@@ -430,6 +425,11 @@ class TextureRegenerationRequest:
         if self.preserve_symmetric_uvs and not self.enable_original_uv:
             raise ValueError(
                 "Symmetric texture regeneration must preserve original UVs."
+            )
+        if self.enable_original_uv and not self.preserve_symmetric_uvs:
+            raise ValueError(
+                "Original-UV texture regeneration is only supported for "
+                "symmetric objects."
             )
         object.__setattr__(self, "object_id", normalized_object_id)
         object.__setattr__(
@@ -461,7 +461,7 @@ class TextureRegenerationOutcome:
 
     request: TextureRegenerationRequest
     result: MeshyGenerationResult
-    final_uv_fingerprint: CameraUvFingerprint | None = None
+    final_uv_fingerprint: UvFingerprint | None = None
 
 
 @dataclass(frozen=True)
@@ -522,17 +522,6 @@ class StagedMeshyGenerationResult(MeshyGenerationResult):
     purge_retained_face_count: int = 0
     purge_removed_face_count: int = 0
     unused_face_removal_applied: bool = False
-    camera_uv_projection_applied: bool = False
-    camera_uv_face_counts: tuple[tuple[str, int], ...] = ()
-    camera_uv_leftover_face_count: int = 0
-    camera_uv_invisible_face_count: int = 0
-    camera_uv_quality_fallback_face_count: int = 0
-    camera_uv_conflict_fallback_face_count: int = 0
-    camera_uv_projection_version: str = ""
-    camera_uv_fingerprint_version: str = ""
-    camera_uv_submitted_fingerprint: str = ""
-    camera_uv_final_fingerprint: str = ""
-    camera_uv_integrity_face_count: int = 0
     geometry_only: bool = False
 
 
@@ -587,9 +576,6 @@ class MeshyImagePlanner:
                 progress_callback("Meshy generation complete. Downloading GLB...")
 
         use_unused_face_removal = request.settings.unused_face_removal
-        use_camera_uv_projection = (
-            request.settings.project_uvs_from_camera_views
-        )
         unchecked_camera_ids = tuple(
             camera_id
             for camera_id in ALL_CAMERA_IDS
@@ -600,7 +586,6 @@ class MeshyImagePlanner:
             not request.geometry_only
             and not use_camera_face_purge
             and not use_unused_face_removal
-            and not use_camera_uv_projection
         ):
             _raise_if_generation_cancelled(cancel_event)
             return request_image_to_3d_model(
@@ -709,64 +694,7 @@ class MeshyImagePlanner:
             removed_face_count = removed.removed_face_count
             protected_face_count = removed.protected_face_count
 
-        camera_uv_face_counts: tuple[tuple[str, int], ...] = ()
-        camera_uv_leftover_face_count = 0
-        camera_uv_invisible_face_count = 0
-        camera_uv_quality_fallback_face_count = 0
-        camera_uv_conflict_fallback_face_count = 0
-        camera_uv_submitted_fingerprint: CameraUvFingerprint | None = None
-        if use_camera_uv_projection:
-            if progress_callback is not None:
-                progress_callback(
-                    "Projecting UVs from six fixed camera views..."
-                )
-            try:
-                projected = project_uvs_from_camera_views_from_glb(
-                    processed_glb_bytes,
-                    cancel_requested=(
-                        None if cancel_event is None else cancel_event.is_set
-                    ),
-                )
-            except Exception:
-                # Translate the projection core's cancellation exception into
-                # the worker's silent cancellation control flow.
-                _raise_if_generation_cancelled(cancel_event)
-                raise
-            processed_glb_bytes = projected.glb_bytes
-            _raise_if_generation_cancelled(cancel_event)
-            try:
-                camera_uv_submitted_fingerprint = (
-                    build_camera_uv_fingerprint(processed_glb_bytes)
-                )
-            except CameraUvIntegrityError as error:
-                raise CameraUvIntegrityError(
-                    "Camera projection produced a GLB whose UV layout could "
-                    "not be verified, so Meshy Retexture was not submitted. "
-                    "Retry generation or disable 'Project UVs from camera "
-                    f"views' for this object. Detail: {error}"
-                ) from error
-            camera_uv_face_counts = tuple(
-                (
-                    camera_id,
-                    int(projected.camera_face_counts.get(camera_id, 0)),
-                )
-                for camera_id in ALL_CAMERA_IDS
-            )
-            camera_uv_leftover_face_count = int(
-                projected.leftover_face_count
-            )
-            camera_uv_invisible_face_count = int(
-                projected.invisible_face_count
-            )
-            camera_uv_quality_fallback_face_count = int(
-                projected.quality_fallback_face_count
-            )
-            camera_uv_conflict_fallback_face_count = int(
-                projected.conflict_fallback_face_count
-            )
-
         if request.geometry_only:
-            final_geometry_fingerprint = camera_uv_submitted_fingerprint
             return StagedMeshyGenerationResult(
                 task_id=geometry_result.task_id,
                 glb_bytes=processed_glb_bytes,
@@ -785,43 +713,6 @@ class MeshyImagePlanner:
                 purge_retained_face_count=purge_retained_face_count,
                 purge_removed_face_count=purge_removed_face_count,
                 unused_face_removal_applied=use_unused_face_removal,
-                camera_uv_projection_applied=use_camera_uv_projection,
-                camera_uv_face_counts=camera_uv_face_counts,
-                camera_uv_leftover_face_count=camera_uv_leftover_face_count,
-                camera_uv_invisible_face_count=(
-                    camera_uv_invisible_face_count
-                ),
-                camera_uv_quality_fallback_face_count=(
-                    camera_uv_quality_fallback_face_count
-                ),
-                camera_uv_conflict_fallback_face_count=(
-                    camera_uv_conflict_fallback_face_count
-                ),
-                camera_uv_projection_version=(
-                    CAMERA_UV_PROJECTION_VERSION
-                    if use_camera_uv_projection
-                    else ""
-                ),
-                camera_uv_fingerprint_version=(
-                    CAMERA_UV_FINGERPRINT_VERSION
-                    if use_camera_uv_projection
-                    else ""
-                ),
-                camera_uv_submitted_fingerprint=(
-                    ""
-                    if final_geometry_fingerprint is None
-                    else final_geometry_fingerprint.sha256
-                ),
-                camera_uv_final_fingerprint=(
-                    ""
-                    if final_geometry_fingerprint is None
-                    else final_geometry_fingerprint.sha256
-                ),
-                camera_uv_integrity_face_count=(
-                    0
-                    if final_geometry_fingerprint is None
-                    else final_geometry_fingerprint.face_count
-                ),
                 geometry_only=True,
             )
 
@@ -842,34 +733,10 @@ class MeshyImagePlanner:
             api_key=request.settings.meshy_api_key,
             model_glb=processed_glb_bytes,
             reference_images_png=(image_png,),
-            enable_original_uv=use_camera_uv_projection,
+            enable_original_uv=False,
             progress_callback=report_texture_progress,
             cancel_event=cancel_event,
         )
-        camera_uv_final_fingerprint: CameraUvFingerprint | None = None
-        if use_camera_uv_projection:
-            _raise_if_generation_cancelled(cancel_event)
-            submitted_fingerprint = camera_uv_submitted_fingerprint
-            if submitted_fingerprint is None:
-                raise CameraUvIntegrityError(
-                    "The submitted camera UV fingerprint is unavailable. No "
-                    "texture variants were saved; retry generation."
-                )
-            try:
-                camera_uv_final_fingerprint = build_camera_uv_fingerprint(
-                    textured_result.glb_bytes
-                )
-            except CameraUvIntegrityError as error:
-                raise CameraUvIntegrityError(
-                    "Meshy Retexture returned a GLB whose camera UV layout "
-                    "could not be verified. No texture variants were saved; "
-                    "retry or disable 'Project UVs from camera views' for "
-                    f"this object. Detail: {error}"
-                ) from error
-            validate_camera_uv_retexture_integrity(
-                submitted_fingerprint,
-                camera_uv_final_fingerprint,
-            )
         return StagedMeshyGenerationResult(
             task_id=textured_result.task_id,
             glb_bytes=textured_result.glb_bytes,
@@ -888,43 +755,6 @@ class MeshyImagePlanner:
             purge_retained_face_count=purge_retained_face_count,
             purge_removed_face_count=purge_removed_face_count,
             unused_face_removal_applied=use_unused_face_removal,
-            camera_uv_projection_applied=use_camera_uv_projection,
-            camera_uv_face_counts=camera_uv_face_counts,
-            camera_uv_leftover_face_count=camera_uv_leftover_face_count,
-            camera_uv_invisible_face_count=(
-                camera_uv_invisible_face_count
-            ),
-            camera_uv_quality_fallback_face_count=(
-                camera_uv_quality_fallback_face_count
-            ),
-            camera_uv_conflict_fallback_face_count=(
-                camera_uv_conflict_fallback_face_count
-            ),
-            camera_uv_projection_version=(
-                CAMERA_UV_PROJECTION_VERSION
-                if use_camera_uv_projection
-                else ""
-            ),
-            camera_uv_fingerprint_version=(
-                CAMERA_UV_FINGERPRINT_VERSION
-                if use_camera_uv_projection
-                else ""
-            ),
-            camera_uv_submitted_fingerprint=(
-                ""
-                if camera_uv_submitted_fingerprint is None
-                else camera_uv_submitted_fingerprint.sha256
-            ),
-            camera_uv_final_fingerprint=(
-                ""
-                if camera_uv_final_fingerprint is None
-                else camera_uv_final_fingerprint.sha256
-            ),
-            camera_uv_integrity_face_count=(
-                0
-                if camera_uv_submitted_fingerprint is None
-                else camera_uv_submitted_fingerprint.face_count
-            ),
         )
 
 
@@ -1253,34 +1083,22 @@ class TextureRegenerationWorker(QObject):
     def _validate_final_uvs(
         self,
         result: MeshyGenerationResult,
-    ) -> CameraUvFingerprint | None:
+    ) -> UvFingerprint | None:
         submitted = self._request.submitted_uv_fingerprint
         if submitted is None:
             return None
         try:
-            final_fingerprint = build_camera_uv_fingerprint(result.glb_bytes)
-        except CameraUvIntegrityError as error:
-            if self._request.preserve_symmetric_uvs:
-                raise CameraUvIntegrityError(
-                    "Meshy Retexture returned a GLB whose preserved packed UV "
-                    "layout could not be verified. The existing texture was "
-                    f"kept. Detail: {error}"
-                ) from error
-            raise CameraUvIntegrityError(
-                "Meshy Retexture returned a GLB whose camera UV layout could "
-                "not be verified. The existing texture was kept. Detail: "
-                f"{error}"
+            final_fingerprint = build_uv_fingerprint(result.glb_bytes)
+        except UvIntegrityError as error:
+            raise UvIntegrityError(
+                "Meshy Retexture returned a GLB whose preserved packed UV "
+                "layout could not be verified. The existing texture was "
+                f"kept. Detail: {error}"
             ) from error
-        if self._request.preserve_symmetric_uvs:
-            _validate_symmetric_uv_retexture_integrity(
-                submitted,
-                final_fingerprint,
-            )
-        else:
-            validate_camera_uv_retexture_integrity(
-                submitted,
-                final_fingerprint,
-            )
+        _validate_symmetric_uv_retexture_integrity(
+            submitted,
+            final_fingerprint,
+        )
         return final_fingerprint
 
 
@@ -2806,9 +2624,6 @@ class GenerationWorkspace(QWidget):
                     "unused_face_removal_applied": (
                         _staged_result_used_face_removal(result)
                     ),
-                    "camera_uv_projection_applied": (
-                        result.camera_uv_projection_applied
-                    ),
                     "geometry_only": result.geometry_only,
                 }
                 if symmetry is None:
@@ -2847,55 +2662,6 @@ class GenerationWorkspace(QWidget):
                             "protected_face_count": result.protected_face_count,
                         }
                     )
-                if result.camera_uv_projection_applied:
-                    projected_face_count = sum(
-                        count
-                        for _camera_id, count in result.camera_uv_face_counts
-                    )
-                    pipeline.update(
-                        {
-                            "camera_uv_projection_camera_ids": list(
-                                ALL_CAMERA_IDS
-                            ),
-                            "camera_uv_face_counts": {
-                                camera_id: count
-                                for camera_id, count in (
-                                    result.camera_uv_face_counts
-                                )
-                            },
-                            "camera_uv_projected_face_count": (
-                                projected_face_count
-                            ),
-                            "camera_uv_leftover_face_count": (
-                                result.camera_uv_leftover_face_count
-                            ),
-                            "camera_uv_invisible_face_count": (
-                                result.camera_uv_invisible_face_count
-                            ),
-                            "camera_uv_quality_fallback_face_count": (
-                                result.camera_uv_quality_fallback_face_count
-                            ),
-                            "camera_uv_conflict_fallback_face_count": (
-                                result.camera_uv_conflict_fallback_face_count
-                            ),
-                            "retexture_enable_original_uv": True,
-                            "camera_uv_projection_version": (
-                                result.camera_uv_projection_version
-                            ),
-                            "camera_uv_fingerprint_version": (
-                                result.camera_uv_fingerprint_version
-                            ),
-                            "camera_uv_submitted_fingerprint": (
-                                result.camera_uv_submitted_fingerprint
-                            ),
-                            "camera_uv_final_fingerprint": (
-                                result.camera_uv_final_fingerprint
-                            ),
-                            "camera_uv_integrity_face_count": (
-                                result.camera_uv_integrity_face_count
-                            ),
-                        }
-                    )
             if symmetry is not None:
                 assert isinstance(
                     texture_variants,
@@ -2905,9 +2671,6 @@ class GenerationWorkspace(QWidget):
                     pipeline,
                     symmetry,
                     variant_metadata,
-                    texture_variants.glb_by_resolution[
-                        TEXTURE_RESOLUTION_1024
-                    ],
                 )
         except Exception as error:
             self._remove_newly_persisted_assets(persisted_asset_paths)
@@ -3433,24 +3196,13 @@ class GenerationWorkspace(QWidget):
             source_path = self._resolve_texture_regeneration_source_path(record)
             model_glb = source_path.read_bytes()
             import_generated_glb(model_glb)
-            preserve_camera_uvs = (
-                self._settings.project_uvs_from_camera_views
-                and _record_uses_camera_projected_uvs(record)
-            )
             preserve_symmetric_uvs = (
                 _get_object_symmetric_division_metadata(record) is not None
             )
-            preserve_original_uvs = (
-                preserve_camera_uvs or preserve_symmetric_uvs
-            )
+            preserve_original_uvs = preserve_symmetric_uvs
             submitted_fingerprint = None
             if preserve_original_uvs:
-                submitted_fingerprint = build_camera_uv_fingerprint(model_glb)
-            if preserve_camera_uvs:
-                _validate_stored_camera_uv_fingerprint(
-                    record,
-                    submitted_fingerprint,
-                )
+                submitted_fingerprint = build_uv_fingerprint(model_glb)
             request = TextureRegenerationRequest(
                 object_id=record.object_id,
                 reference_frame_index=self._data.current_frame_index,
@@ -3483,10 +3235,6 @@ class GenerationWorkspace(QWidget):
                 raw_postprocessed_path
             )
         else:
-            if _record_uses_camera_projected_uvs(record):
-                raise ValueError(
-                    "The processed camera-UV model revision is unavailable."
-                )
             canonical_variant = _get_texture_variant_metadata(
                 record,
                 DEFAULT_TEXTURE_RESOLUTION,
@@ -4230,8 +3978,6 @@ def _staged_generation_mode(result: StagedMeshyGenerationResult) -> str:
         stages.append("unchecked_camera_face_purge")
     if _staged_result_used_face_removal(result):
         stages.append("unused_face_removal")
-    if result.camera_uv_projection_applied:
-        stages.append("camera_uv_projection")
     stage_mode = "_and_".join(stages)
     if result.geometry_only:
         return (
@@ -4260,47 +4006,7 @@ def _format_staged_generation_status(
             f"Removed {result.removed_face_count} of "
             f"{result.original_face_count} faces."
         )
-    if result.camera_uv_projection_applied:
-        projected_face_count = sum(
-            count for _camera_id, count in result.camera_uv_face_counts
-        )
-        categorized_fallback_count = (
-            result.camera_uv_invisible_face_count
-            + result.camera_uv_quality_fallback_face_count
-            + result.camera_uv_conflict_fallback_face_count
-        )
-        if categorized_fallback_count == result.camera_uv_leftover_face_count:
-            messages.append(
-                f"Projected {projected_face_count} faces from six fixed "
-                "camera views; fallback UV islands contain "
-                + _format_fallback_face_count(
-                    result.camera_uv_invisible_face_count,
-                    "invisible",
-                )
-                + ", "
-                + _format_fallback_face_count(
-                    result.camera_uv_quality_fallback_face_count,
-                    "quality-rejected depth-visible",
-                )
-                + ", and "
-                + _format_fallback_face_count(
-                    result.camera_uv_conflict_fallback_face_count,
-                    "projection-conflict",
-                )
-                + "."
-            )
-        else:
-            messages.append(
-                f"Projected {projected_face_count} faces from six fixed "
-                f"camera views; {result.camera_uv_leftover_face_count} faces "
-                "use fallback UV islands."
-            )
     return " ".join(messages)
-
-
-def _format_fallback_face_count(count: int, description: str) -> str:
-    face_label = "face" if count == 1 else "faces"
-    return f"{count} {description} {face_label}"
 
 
 # ### Symmetric-division helpers ###
@@ -4317,12 +4023,12 @@ def _validate_symmetric_texture_regeneration_uvs(
         or not request.preserve_symmetric_uvs
         or submitted_fingerprint is None
     ):
-        raise CameraUvIntegrityError(
+        raise UvIntegrityError(
             "Symmetric texture generation must preserve the existing packed "
             "UV layout. The existing texture was kept."
         )
     if final_fingerprint is None:
-        raise CameraUvIntegrityError(
+        raise UvIntegrityError(
             "The symmetric texture result has no verified UV fingerprint. "
             "The existing texture was kept."
         )
@@ -4333,23 +4039,23 @@ def _validate_symmetric_texture_regeneration_uvs(
 
 
 def _validate_symmetric_uv_retexture_integrity(
-    submitted: CameraUvFingerprint,
-    returned: CameraUvFingerprint,
+    submitted: UvFingerprint,
+    returned: UvFingerprint,
 ) -> None:
-    """Reject provider changes without camera-specific remediation text."""
+    """Reject provider changes with symmetric-object remediation text."""
 
     if submitted.version != returned.version:
-        raise CameraUvIntegrityError(
+        raise UvIntegrityError(
             "The preserved UV integrity versions do not match. The existing "
             "texture was kept; retry texture generation."
         )
     if submitted.face_count != returned.face_count:
-        raise CameraUvIntegrityError(
+        raise UvIntegrityError(
             "Meshy Retexture changed the symmetric object's face count. The "
             "existing texture was kept; retry texture generation."
         )
     if submitted.sha256 != returned.sha256:
-        raise CameraUvIntegrityError(
+        raise UvIntegrityError(
             "Meshy Retexture changed the symmetric object's packed UV layout. "
             "The existing texture was kept; retry texture generation."
         )
@@ -4537,7 +4243,6 @@ def _build_automatic_symmetric_generation_pipeline(
     raw_pipeline: Mapping[str, object],
     metadata: ObjectSymmetricDivisionMetadata,
     variant_metadata: dict[str, dict[str, str]],
-    canonical_glb: bytes,
 ) -> dict[str, object]:
     """Make pair variants the final persisted new-generation revision."""
 
@@ -4556,21 +4261,6 @@ def _build_automatic_symmetric_generation_pipeline(
             SYMMETRIC_DIVISION_PIPELINE_KEY: metadata.to_pipeline_dict(),
         }
     )
-    if (
-        pipeline.get("camera_uv_projection_applied")
-        or "camera_uv_projection" in str(pipeline.get("mode", ""))
-    ):
-        fingerprint = build_camera_uv_fingerprint(canonical_glb)
-        pipeline.update(
-            {
-                "camera_uv_fingerprint_version": (
-                    CAMERA_UV_FINGERPRINT_VERSION
-                ),
-                "camera_uv_submitted_fingerprint": fingerprint.sha256,
-                "camera_uv_final_fingerprint": fingerprint.sha256,
-                "camera_uv_integrity_face_count": fingerprint.face_count,
-            }
-        )
     return pipeline
 
 
@@ -4744,76 +4434,10 @@ def _build_unchecked_camera_face_purge_pipeline(
                 SELECTED_TEXTURE_RESOLUTION_PIPELINE_KEY: selected_resolution,
             }
         )
-    if _record_uses_camera_projected_uvs(record):
-        fingerprint = build_camera_uv_fingerprint(result.glb_bytes)
-        pipeline.update(
-            {
-                "camera_uv_fingerprint_version": (
-                    CAMERA_UV_FINGERPRINT_VERSION
-                ),
-                "camera_uv_submitted_fingerprint": fingerprint.sha256,
-                "camera_uv_final_fingerprint": fingerprint.sha256,
-                "camera_uv_integrity_face_count": fingerprint.face_count,
-            }
-        )
     return pipeline
 
 
 # ### Texture-regeneration helpers ###
-def _record_uses_camera_projected_uvs(
-    record: GeneratedObjectRecord,
-) -> bool:
-    if record.pipeline.get("camera_uv_projection_applied"):
-        return True
-    raw_mode = record.pipeline.get("mode")
-    return isinstance(raw_mode, str) and "camera_uv_projection" in raw_mode
-
-
-def _validate_stored_camera_uv_fingerprint(
-    record: GeneratedObjectRecord,
-    actual: CameraUvFingerprint,
-) -> None:
-    stored_version = record.pipeline.get("camera_uv_fingerprint_version")
-    if stored_version != CAMERA_UV_FINGERPRINT_VERSION:
-        raise CameraUvIntegrityError(
-            "The saved camera-UV fingerprint version is unavailable or "
-            "unsupported. The existing texture was kept."
-        )
-    stored_sha256 = record.pipeline.get("camera_uv_submitted_fingerprint")
-    if not isinstance(stored_sha256, str) or len(stored_sha256) != 64:
-        raise CameraUvIntegrityError(
-            "The saved camera-UV fingerprint is unavailable. The existing "
-            "texture was kept."
-        )
-    try:
-        int(stored_sha256, 16)
-    except ValueError as error:
-        raise CameraUvIntegrityError(
-            "The saved camera-UV fingerprint is malformed. The existing "
-            "texture was kept."
-        ) from error
-    if stored_sha256 != actual.sha256:
-        raise CameraUvIntegrityError(
-            "The saved processed model no longer matches its camera-UV "
-            "fingerprint. The existing texture was kept."
-        )
-    raw_face_count = record.pipeline.get("camera_uv_integrity_face_count")
-    if (
-        isinstance(raw_face_count, bool)
-        or not isinstance(raw_face_count, int)
-        or raw_face_count <= 0
-    ):
-        raise CameraUvIntegrityError(
-            "The saved camera-UV face count is unavailable. The existing "
-            "texture was kept."
-        )
-    if raw_face_count != actual.face_count:
-        raise CameraUvIntegrityError(
-            "The saved processed model face count no longer matches its "
-            "camera-UV provenance. The existing texture was kept."
-        )
-
-
 def _build_regenerated_texture_pipeline(
     record: GeneratedObjectRecord,
     outcome: TextureRegenerationOutcome,
@@ -4879,14 +4503,14 @@ def _build_regenerated_texture_pipeline(
     if request.submitted_uv_fingerprint is not None:
         final_fingerprint = outcome.final_uv_fingerprint
         if final_fingerprint is None:
-            raise CameraUvIntegrityError(
+            raise UvIntegrityError(
                 "The regenerated texture UV fingerprint is unavailable."
             )
         pipeline.update(
             {
                 "retexture_enable_original_uv": True,
                 "texture_regeneration_uv_fingerprint_version": (
-                    CAMERA_UV_FINGERPRINT_VERSION
+                    UV_FINGERPRINT_VERSION
                 ),
                 "texture_regeneration_submitted_uv_fingerprint": (
                     request.submitted_uv_fingerprint.sha256
@@ -4899,23 +4523,6 @@ def _build_regenerated_texture_pipeline(
                 ),
             }
         )
-        if _record_uses_camera_projected_uvs(record):
-            pipeline.update(
-                {
-                    "camera_uv_fingerprint_version": (
-                        CAMERA_UV_FINGERPRINT_VERSION
-                    ),
-                    "camera_uv_submitted_fingerprint": (
-                        request.submitted_uv_fingerprint.sha256
-                    ),
-                    "camera_uv_final_fingerprint": (
-                        final_fingerprint.sha256
-                    ),
-                    "camera_uv_integrity_face_count": (
-                        request.submitted_uv_fingerprint.face_count
-                    ),
-                }
-            )
     else:
         pipeline["retexture_enable_original_uv"] = False
     return pipeline

@@ -23,11 +23,6 @@ from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from housemaker.camera_uv_integrity import (
-    CAMERA_UV_FINGERPRINT_VERSION,
-    CAMERA_UV_PROJECTION_VERSION,
-    CameraUvIntegrityError,
-)
 from housemaker.generation_state import (
     MASK_MODE_ERASE,
     MASK_MODE_PAINT,
@@ -45,8 +40,6 @@ from housemaker.generation_workspace import (
     MeshyImagePlanner,
     MeshyModelExecutor,
     StagedMeshyGenerationResult,
-    _GenerationCancelled,
-    _format_staged_generation_status,
     _format_model_statistics,
     _collect_model_uv_triangles,
     _staged_generation_mode,
@@ -121,14 +114,10 @@ def _test_staged_meshy_result(
     )
 
 
-def _test_camera_uv_glb(
-    *,
-    redundant_vertices: bool = False,
-    mutate_uv: bool = False,
-) -> bytes:
-    """Build two equivalent ordered UV triangles with optional reindexing."""
+def _test_uv_glb() -> bytes:
+    """Build a textured quad for UV-preview coverage."""
 
-    shared_vertices = np.asarray(
+    vertices = np.asarray(
         (
             (0.0, 0.0, 0.0),
             (1.0, 0.0, 0.0),
@@ -137,7 +126,7 @@ def _test_camera_uv_glb(
         ),
         dtype=float,
     )
-    shared_uv = np.asarray(
+    uv = np.asarray(
         (
             (0.1, 0.1),
             (0.9, 0.1),
@@ -146,16 +135,7 @@ def _test_camera_uv_glb(
         ),
         dtype=float,
     )
-    if redundant_vertices:
-        vertices = shared_vertices[[2, 0, 1, 3, 2, 0]]
-        uv = shared_uv[[2, 0, 1, 3, 2, 0]]
-        faces = np.asarray(((0, 1, 2), (3, 4, 5)), dtype=np.int64)
-    else:
-        vertices = shared_vertices
-        uv = shared_uv.copy()
-        faces = np.asarray(((0, 1, 2), (0, 2, 3)), dtype=np.int64)
-    if mutate_uv:
-        uv[-1] = (0.25, 0.25)
+    faces = np.asarray(((0, 1, 2), (0, 2, 3)), dtype=np.int64)
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     mesh.visual = TextureVisuals(uv=uv, material=PBRMaterial())
     return bytes(trimesh.Scene(mesh).export(file_type="glb"))
@@ -684,368 +664,6 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
 
         retexture_mock.assert_not_called()
 
-    def test_camera_uv_projection_alone_forces_staged_generation(self) -> None:
-        request = GenerationRequest(
-            frame_index=0,
-            selected_object_bgra=np.zeros((6, 8, 4), dtype=np.uint8),
-            settings=GenerationServiceSettings(
-                meshy_api_key="meshy-camera-uv-key",
-                project_uvs_from_camera_views=True,
-            ),
-            enabled_camera_ids=(),
-        )
-        projected_glb = _test_camera_uv_glb()
-        returned_glb = _test_camera_uv_glb(redundant_vertices=True)
-        geometry_result = MeshyGenerationResult(
-            task_id="geometry-task",
-            glb_bytes=b"geometry-only glb",
-            name="Geometry",
-        )
-        textured_result = MeshyGenerationResult(
-            task_id="texture-task",
-            glb_bytes=returned_glb,
-            name="Textured object",
-        )
-        projected = SimpleNamespace(
-            glb_bytes=projected_glb,
-            camera_face_counts={
-                camera_id: index + 1
-                for index, camera_id in enumerate(ALL_CAMERA_IDS)
-            },
-            leftover_face_count=3,
-            invisible_face_count=1,
-            quality_fallback_face_count=1,
-            conflict_fallback_face_count=1,
-        )
-        progress_messages: list[str] = []
-
-        with (
-            patch(
-                "housemaker.generation_workspace.request_image_to_3d_model",
-                return_value=geometry_result,
-            ) as image_request,
-            patch(
-                "housemaker.generation_workspace."
-                "purge_faces_visible_from_unchecked_cameras_from_glb",
-                return_value=SimpleNamespace(
-                    glb_bytes=b"geometry-only glb",
-                    original_face_count=12,
-                    retained_face_count=12,
-                    removed_face_count=0,
-                ),
-            ) as purge,
-            patch(
-                "housemaker.generation_workspace.remove_unused_faces_from_glb"
-            ) as removal,
-            patch(
-                "housemaker.generation_workspace."
-                "project_uvs_from_camera_views_from_glb",
-                return_value=projected,
-            ) as projection,
-            patch(
-                "housemaker.generation_workspace.request_retextured_model",
-                return_value=textured_result,
-            ) as retexture,
-        ):
-            result = MeshyImagePlanner().plan(
-                request,
-                progress_callback=progress_messages.append,
-                cancel_event=threading.Event(),
-            )
-
-        self.assertFalse(image_request.call_args.kwargs["should_texture"])
-        self.assertEqual(
-            purge.call_args.kwargs["unchecked_camera_ids"],
-            ALL_CAMERA_IDS,
-        )
-        removal.assert_not_called()
-        self.assertEqual(projection.call_args.args, (b"geometry-only glb",))
-        self.assertTrue(
-            callable(projection.call_args.kwargs["cancel_requested"])
-        )
-        self.assertEqual(
-            retexture.call_args.kwargs["model_glb"],
-            projected_glb,
-        )
-        self.assertTrue(retexture.call_args.kwargs["enable_original_uv"])
-        self.assertIsInstance(result, StagedMeshyGenerationResult)
-        self.assertTrue(result.camera_uv_projection_applied)
-        self.assertEqual(result.postprocessed_glb_bytes, projected_glb)
-        self.assertEqual(
-            result.camera_uv_projection_version,
-            "camera-view-uv-v3-strict",
-        )
-        self.assertEqual(
-            result.camera_uv_fingerprint_version,
-            CAMERA_UV_FINGERPRINT_VERSION,
-        )
-        self.assertEqual(
-            result.camera_uv_submitted_fingerprint,
-            result.camera_uv_final_fingerprint,
-        )
-        self.assertEqual(result.camera_uv_integrity_face_count, 2)
-        self.assertEqual(
-            tuple(camera_id for camera_id, _count in result.camera_uv_face_counts),
-            ALL_CAMERA_IDS,
-        )
-        self.assertEqual(result.camera_uv_leftover_face_count, 3)
-        self.assertEqual(result.camera_uv_invisible_face_count, 1)
-        self.assertEqual(result.camera_uv_quality_fallback_face_count, 1)
-        self.assertEqual(result.camera_uv_conflict_fallback_face_count, 1)
-        self.assertIn(
-            "Projecting UVs from six fixed camera views...",
-            progress_messages,
-        )
-
-    def test_combined_postprocessing_orders_removal_before_uv_projection(
-        self,
-    ) -> None:
-        request = GenerationRequest(
-            frame_index=0,
-            selected_object_bgra=np.zeros((4, 4, 4), dtype=np.uint8),
-            settings=GenerationServiceSettings(
-                meshy_api_key="meshy-key",
-                unused_face_removal=True,
-                project_uvs_from_camera_views=True,
-            ),
-            enabled_camera_ids=("pos_x",),
-        )
-        call_order: list[str] = []
-        projected_glb = _test_camera_uv_glb()
-        returned_glb = _test_camera_uv_glb(redundant_vertices=True)
-
-        def generate_geometry(**_kwargs: object) -> MeshyGenerationResult:
-            call_order.append("geometry")
-            return MeshyGenerationResult("geometry-task", b"geometry")
-
-        def purge_faces(glb_bytes: bytes, **_kwargs: object) -> object:
-            self.assertEqual(glb_bytes, b"geometry")
-            call_order.append("purge")
-            return SimpleNamespace(
-                glb_bytes=b"purged geometry",
-                original_face_count=14,
-                retained_face_count=12,
-                removed_face_count=2,
-            )
-
-        def remove_faces(
-            glb_bytes: bytes,
-            **_kwargs: object,
-        ) -> UnusedFaceRemovalResult:
-            self.assertEqual(glb_bytes, b"purged geometry")
-            call_order.append("removal")
-            result = SimpleNamespace(
-                glb_bytes=b"visible geometry",
-                original_face_count=12,
-                retained_face_count=10,
-                removed_face_count=2,
-                protected_face_count=10,
-            )
-            return result  # type: ignore[return-value]
-
-        def project_uvs(glb_bytes: bytes, **_kwargs: object) -> object:
-            self.assertEqual(glb_bytes, b"visible geometry")
-            call_order.append("projection")
-            return SimpleNamespace(
-                glb_bytes=projected_glb,
-                camera_face_counts={camera_id: 1 for camera_id in ALL_CAMERA_IDS},
-                leftover_face_count=0,
-                invisible_face_count=0,
-                quality_fallback_face_count=0,
-                conflict_fallback_face_count=0,
-            )
-
-        def retexture_model(**kwargs: object) -> MeshyGenerationResult:
-            self.assertEqual(kwargs["model_glb"], projected_glb)
-            self.assertTrue(kwargs["enable_original_uv"])
-            call_order.append("retexture")
-            return MeshyGenerationResult("texture-task", returned_glb)
-
-        with (
-            patch(
-                "housemaker.generation_workspace.request_image_to_3d_model",
-                side_effect=generate_geometry,
-            ),
-            patch(
-                "housemaker.generation_workspace."
-                "purge_faces_visible_from_unchecked_cameras_from_glb",
-                side_effect=purge_faces,
-            ),
-            patch(
-                "housemaker.generation_workspace.remove_unused_faces_from_glb",
-                side_effect=remove_faces,
-            ),
-            patch(
-                "housemaker.generation_workspace."
-                "project_uvs_from_camera_views_from_glb",
-                side_effect=project_uvs,
-            ),
-            patch(
-                "housemaker.generation_workspace.request_retextured_model",
-                side_effect=retexture_model,
-            ),
-        ):
-            result = MeshyImagePlanner().plan(request)
-
-        self.assertEqual(
-            call_order,
-            ["geometry", "purge", "removal", "projection", "retexture"],
-        )
-        self.assertIsInstance(result, StagedMeshyGenerationResult)
-        self.assertEqual(
-            _staged_generation_mode(result),  # type: ignore[arg-type]
-            "unchecked_camera_face_purge_and_unused_face_removal_and_"
-            "camera_uv_projection",
-        )
-
-    def test_camera_uv_mutation_rejects_result_before_variant_executor(
-        self,
-    ) -> None:
-        projected_glb = _test_camera_uv_glb()
-        mutated_glb = _test_camera_uv_glb(
-            redundant_vertices=True,
-            mutate_uv=True,
-        )
-        request = GenerationRequest(
-            frame_index=0,
-            selected_object_bgra=np.zeros((4, 4, 4), dtype=np.uint8),
-            settings=GenerationServiceSettings(
-                meshy_api_key="meshy-key",
-                project_uvs_from_camera_views=True,
-            ),
-        )
-        executor = _FakeMeshyExecutor()
-        worker = GenerationWorker(MeshyImagePlanner(), executor, request)
-        failed_spy = QSignalSpy(worker.failed)
-
-        with (
-            patch(
-                "housemaker.generation_workspace.request_image_to_3d_model",
-                return_value=MeshyGenerationResult(
-                    "geometry-task",
-                    b"geometry",
-                ),
-            ),
-            patch(
-                "housemaker.generation_workspace."
-                "project_uvs_from_camera_views_from_glb",
-                return_value=SimpleNamespace(
-                    glb_bytes=projected_glb,
-                    camera_face_counts={
-                        camera_id: 0 for camera_id in ALL_CAMERA_IDS
-                    },
-                    leftover_face_count=2,
-                    invisible_face_count=2,
-                    quality_fallback_face_count=0,
-                    conflict_fallback_face_count=0,
-                ),
-            ),
-            patch(
-                "housemaker.generation_workspace.request_retextured_model",
-                return_value=MeshyGenerationResult(
-                    "texture-task",
-                    mutated_glb,
-                ),
-            ),
-        ):
-            worker.run()
-
-        self.assertEqual(failed_spy.count(), 1)
-        self.assertIn(
-            "changed the camera-projected UV layout",
-            failed_spy.at(0)[0],
-        )
-        self.assertEqual(executor.results, [])
-
-    def test_camera_uv_cancellation_before_retexture_skips_paid_task(self) -> None:
-        cancel_event = threading.Event()
-        request = GenerationRequest(
-            frame_index=0,
-            selected_object_bgra=np.zeros((4, 4, 4), dtype=np.uint8),
-            settings=GenerationServiceSettings(
-                meshy_api_key="meshy-key",
-                project_uvs_from_camera_views=True,
-            ),
-        )
-
-        def finish_projection_then_cancel(
-            _glb_bytes: bytes,
-            **_kwargs: object,
-        ) -> object:
-            cancel_event.set()
-            return SimpleNamespace(
-                glb_bytes=b"uv-authored geometry",
-                camera_face_counts={camera_id: 1 for camera_id in ALL_CAMERA_IDS},
-                leftover_face_count=0,
-                invisible_face_count=0,
-                quality_fallback_face_count=0,
-                conflict_fallback_face_count=0,
-            )
-
-        with (
-            patch(
-                "housemaker.generation_workspace.request_image_to_3d_model",
-                return_value=MeshyGenerationResult(
-                    "geometry-task",
-                    b"geometry",
-                ),
-            ),
-            patch(
-                "housemaker.generation_workspace."
-                "project_uvs_from_camera_views_from_glb",
-                side_effect=finish_projection_then_cancel,
-            ),
-            patch(
-                "housemaker.generation_workspace.request_retextured_model"
-            ) as retexture,
-        ):
-            with self.assertRaises(_GenerationCancelled):
-                MeshyImagePlanner().plan(request, cancel_event=cancel_event)
-
-        retexture.assert_not_called()
-
-    def test_camera_uv_core_cancellation_uses_silent_worker_control_flow(
-        self,
-    ) -> None:
-        cancel_event = threading.Event()
-        request = GenerationRequest(
-            frame_index=0,
-            selected_object_bgra=np.zeros((4, 4, 4), dtype=np.uint8),
-            settings=GenerationServiceSettings(
-                meshy_api_key="meshy-key",
-                project_uvs_from_camera_views=True,
-            ),
-        )
-
-        def cancel_projection(
-            _glb_bytes: bytes,
-            **_kwargs: object,
-        ) -> object:
-            cancel_event.set()
-            raise RuntimeError("projection core cancelled")
-
-        with (
-            patch(
-                "housemaker.generation_workspace.request_image_to_3d_model",
-                return_value=MeshyGenerationResult(
-                    "geometry-task",
-                    b"geometry",
-                ),
-            ),
-            patch(
-                "housemaker.generation_workspace."
-                "project_uvs_from_camera_views_from_glb",
-                side_effect=cancel_projection,
-            ),
-            patch(
-                "housemaker.generation_workspace.request_retextured_model"
-            ) as retexture,
-        ):
-            with self.assertRaises(_GenerationCancelled):
-                MeshyImagePlanner().plan(request, cancel_event=cancel_event)
-
-        retexture.assert_not_called()
-
     def test_worker_invokes_meshy_planner_and_executor(self) -> None:
         planner = _FakeMeshyPlanner()
         executor = _FakeMeshyExecutor()
@@ -1327,43 +945,6 @@ class GenerationWorkspaceTests(unittest.TestCase):
             self.workspace.shutdown()
             self.assertFalse(generate_is_enabled)
 
-    def test_camera_uv_only_allows_generation_with_removal_cameras_off(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            video_path = Path(temporary_directory) / "source.avi"
-            _write_test_video(video_path, frame_count=1)
-            self.workspace.set_runtime_settings(
-                GenerationServiceSettings(
-                    meshy_api_key="meshy-key",
-                    project_uvs_from_camera_views=True,
-                )
-            )
-            self.workspace.load_video(str(video_path))
-            self.workspace.video_view.set_strokes([_test_stroke()])
-            self.workspace._handle_video_strokes_changed(
-                self.workspace.video_view.get_strokes()
-            )
-            camera_controls = (
-                self.workspace.object_3d_panel.unused_face_camera_controls
-            )
-            checkboxes = (
-                self.workspace.object_3d_panel.unused_face_camera_checkboxes
-            )
-            for checkbox in checkboxes.values():
-                checkbox.setChecked(False)
-
-            request = self.workspace._build_generation_request()
-
-            self.assertTrue(camera_controls.isEnabled())
-            self.assertTrue(
-                self.workspace.result_view.get_unused_face_camera_indicators_visible()
-            )
-            self.assertTrue(self.workspace.generate_button.isEnabled())
-            self.assertIsNotNone(request)
-            self.assertEqual(request.enabled_camera_ids, ())  # type: ignore[union-attr]
-            self.workspace.shutdown()
-
     def test_staged_success_persists_all_revisions_and_task_provenance(
         self,
     ) -> None:
@@ -1459,126 +1040,6 @@ class GenerationWorkspaceTests(unittest.TestCase):
             self.assertEqual(restored_data.generated_objects[0], record)
             self.assertIn("Removed 40 of 120 faces", self.workspace.status_label.text())
             self.workspace.shutdown()
-
-    def test_camera_uv_success_persists_projection_provenance(self) -> None:
-        self.workspace.shutdown()
-        self.workspace.close()
-        _qt_application.processEvents()
-        final_model = _test_model()
-        source_glb = b"source geometry glb"
-        uv_authored_glb = b"uv-authored geometry glb"
-        camera_face_counts = tuple(
-            (camera_id, index + 1)
-            for index, camera_id in enumerate(ALL_CAMERA_IDS)
-        )
-        result = StagedMeshyGenerationResult(
-            task_id="texture-task-uv",
-            glb_bytes=final_model.glb_bytes,
-            name="Camera UV chair",
-            geometry_task_id="geometry-task-uv",
-            source_glb_bytes=source_glb,
-            postprocessed_glb_bytes=uv_authored_glb,
-            camera_uv_projection_applied=True,
-            camera_uv_face_counts=camera_face_counts,
-            camera_uv_leftover_face_count=4,
-            camera_uv_invisible_face_count=2,
-            camera_uv_quality_fallback_face_count=1,
-            camera_uv_conflict_fallback_face_count=1,
-            camera_uv_projection_version=CAMERA_UV_PROJECTION_VERSION,
-            camera_uv_fingerprint_version=CAMERA_UV_FINGERPRINT_VERSION,
-            camera_uv_submitted_fingerprint="a" * 64,
-            camera_uv_final_fingerprint="a" * 64,
-            camera_uv_integrity_face_count=24,
-        )
-
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            asset_directory = Path(temporary_directory) / "generation_assets"
-            self.workspace = GenerationWorkspace(
-                asset_directory=asset_directory,
-            )
-            self.workspace._handle_generation_succeeded(result, final_model)
-
-            record = self.workspace.get_data().generated_objects[0]
-            pipeline = record.pipeline
-            self.assertEqual(pipeline["mode"], "camera_uv_projection")
-            self.assertTrue(pipeline["camera_uv_projection_applied"])
-            self.assertEqual(
-                pipeline["camera_uv_projection_camera_ids"],
-                list(ALL_CAMERA_IDS),
-            )
-            self.assertEqual(
-                pipeline["camera_uv_projected_face_count"],
-                sum(range(1, len(ALL_CAMERA_IDS) + 1)),
-            )
-            self.assertEqual(
-                pipeline["camera_uv_face_counts"],
-                dict(camera_face_counts),
-            )
-            self.assertEqual(pipeline["camera_uv_leftover_face_count"], 4)
-            self.assertEqual(pipeline["camera_uv_invisible_face_count"], 2)
-            self.assertEqual(
-                pipeline["camera_uv_quality_fallback_face_count"],
-                1,
-            )
-            self.assertEqual(
-                pipeline["camera_uv_conflict_fallback_face_count"],
-                1,
-            )
-            self.assertTrue(pipeline["retexture_enable_original_uv"])
-            self.assertEqual(
-                pipeline["camera_uv_projection_version"],
-                "camera-view-uv-v3-strict",
-            )
-            self.assertEqual(
-                pipeline["camera_uv_fingerprint_version"],
-                CAMERA_UV_FINGERPRINT_VERSION,
-            )
-            self.assertEqual(
-                pipeline["camera_uv_submitted_fingerprint"],
-                "a" * 64,
-            )
-            self.assertEqual(
-                pipeline["camera_uv_final_fingerprint"],
-                "a" * 64,
-            )
-            self.assertEqual(pipeline["camera_uv_integrity_face_count"], 24)
-            self.assertEqual(
-                (
-                    asset_directory
-                    / str(pipeline["source_asset_path"])
-                ).read_bytes(),
-                source_glb,
-            )
-            self.assertEqual(
-                (
-                    asset_directory
-                    / str(pipeline["postprocessed_asset_path"])
-                ).read_bytes(),
-                uv_authored_glb,
-            )
-            self.assertIn(
-                "Projected 21 faces from six fixed camera views; fallback UV "
-                "islands contain 2 invisible faces, 1 quality-rejected "
-                "depth-visible face, and 1 projection-conflict face.",
-                self.workspace.status_label.text(),
-            )
-
-    def test_legacy_camera_uv_status_uses_total_fallback_count(self) -> None:
-        legacy_result = StagedMeshyGenerationResult(
-            task_id="legacy-texture-task",
-            glb_bytes=b"legacy textured glb",
-            camera_uv_projection_applied=True,
-            camera_uv_face_counts=(("pos_x", 7),),
-            camera_uv_leftover_face_count=3,
-        )
-
-        status = _format_staged_generation_status(
-            "Legacy object",
-            legacy_result,
-        )
-
-        self.assertIn("3 faces use fallback UV islands", status)
-        self.assertNotIn("0 invisible faces", status)
 
     def test_meshy_success_displays_saves_persists_and_rebuilds_glb(self) -> None:
         self.workspace.shutdown()
@@ -1680,7 +1141,7 @@ class GenerationWorkspaceTests(unittest.TestCase):
     def test_model_uv_triangles_are_collected_per_face_for_texture_preview(
         self,
     ) -> None:
-        model = import_generated_glb(_test_camera_uv_glb())
+        model = import_generated_glb(_test_uv_glb())
 
         triangles = _collect_model_uv_triangles(model)
 

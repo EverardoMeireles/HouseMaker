@@ -22,10 +22,6 @@ import trimesh
 from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from housemaker.camera_uv_integrity import (
-    CAMERA_UV_FINGERPRINT_VERSION,
-    CameraUvFingerprint,
-)
 from housemaker.generation_state import GeneratedObjectRecord
 from housemaker.generation_workspace import (
     GenerationRequest,
@@ -60,7 +56,6 @@ def _generation_request(
     *,
     enabled_camera_ids: tuple[str, ...],
     unused_face_removal: bool = False,
-    project_camera_uvs: bool = False,
 ) -> GenerationRequest:
     return GenerationRequest(
         frame_index=2,
@@ -72,7 +67,6 @@ def _generation_request(
         settings=GenerationServiceSettings(
             meshy_api_key="meshy-test-key",
             unused_face_removal=unused_face_removal,
-            project_uvs_from_camera_views=project_camera_uvs,
         ),
         enabled_camera_ids=enabled_camera_ids,
     )
@@ -230,18 +224,12 @@ class UncheckedCameraGenerationPipelineTests(unittest.TestCase):
         self.assertEqual(result.source_glb_bytes, b"source geometry")
         self.assertEqual(result.postprocessed_glb_bytes, b"purged geometry")
 
-    def test_purge_is_first_before_removal_projection_and_retexture(self) -> None:
+    def test_purge_is_first_before_removal_and_retexture(self) -> None:
         request = _generation_request(
             enabled_camera_ids=("pos_x", "neg_x", "pos_y", "top"),
             unused_face_removal=True,
-            project_camera_uvs=True,
         )
         call_order: list[str] = []
-        fingerprint = CameraUvFingerprint(
-            version=CAMERA_UV_FINGERPRINT_VERSION,
-            sha256="a" * 64,
-            face_count=72,
-        )
 
         def request_geometry(**_kwargs: object) -> MeshyGenerationResult:
             call_order.append("geometry")
@@ -263,20 +251,8 @@ class UncheckedCameraGenerationPipelineTests(unittest.TestCase):
                 protected_face_count=80,
             )
 
-        def project_uvs(glb_bytes: bytes, **_kwargs: object) -> object:
-            self.assertEqual(glb_bytes, b"visible geometry")
-            call_order.append("camera-uv")
-            return SimpleNamespace(
-                glb_bytes=b"projected geometry",
-                camera_face_counts={camera_id: 12 for camera_id in ALL_CAMERA_IDS},
-                leftover_face_count=0,
-                invisible_face_count=0,
-                quality_fallback_face_count=0,
-                conflict_fallback_face_count=0,
-            )
-
         def retexture(**kwargs: object) -> MeshyGenerationResult:
-            self.assertEqual(kwargs["model_glb"], b"projected geometry")
+            self.assertEqual(kwargs["model_glb"], b"visible geometry")
             call_order.append("retexture")
             return MeshyGenerationResult("texture-task", b"textured geometry")
 
@@ -295,19 +271,6 @@ class UncheckedCameraGenerationPipelineTests(unittest.TestCase):
                 side_effect=remove_unused,
             ) as unused_removal,
             patch(
-                "housemaker.generation_workspace."
-                "project_uvs_from_camera_views_from_glb",
-                side_effect=project_uvs,
-            ) as projection,
-            patch(
-                "housemaker.generation_workspace.build_camera_uv_fingerprint",
-                return_value=fingerprint,
-            ),
-            patch(
-                "housemaker.generation_workspace."
-                "validate_camera_uv_retexture_integrity"
-            ),
-            patch(
                 "housemaker.generation_workspace.request_retextured_model",
                 side_effect=retexture,
             ),
@@ -316,7 +279,7 @@ class UncheckedCameraGenerationPipelineTests(unittest.TestCase):
 
         self.assertEqual(
             call_order,
-            ["geometry", "purge", "unused-removal", "camera-uv", "retexture"],
+            ["geometry", "purge", "unused-removal", "retexture"],
         )
         self.assertEqual(
             purge.call_args.kwargs["unchecked_camera_ids"],
@@ -326,11 +289,9 @@ class UncheckedCameraGenerationPipelineTests(unittest.TestCase):
             unused_removal.call_args.args,
             (b"purged geometry",),
         )
-        self.assertEqual(projection.call_args.args, (b"visible geometry",))
         self.assertTrue(result.camera_face_purge_applied)
         self.assertTrue(result.unused_face_removal_applied)
-        self.assertTrue(result.camera_uv_projection_applied)
-        self.assertEqual(result.postprocessed_glb_bytes, b"projected geometry")
+        self.assertEqual(result.postprocessed_glb_bytes, b"visible geometry")
 
     def test_all_checked_without_other_processing_keeps_direct_generation(self) -> None:
         request = _generation_request(enabled_camera_ids=ALL_CAMERA_IDS)

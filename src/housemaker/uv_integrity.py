@@ -11,15 +11,14 @@ import trimesh
 
 
 # ### Integrity constants ###
-CAMERA_UV_PROJECTION_VERSION = "camera-view-uv-v3-strict"
-CAMERA_UV_FINGERPRINT_VERSION = "per-face-uv-triangle-sha256-v1"
+UV_FINGERPRINT_VERSION = "per-face-uv-triangle-sha256-v1"
 UV_FINGERPRINT_QUANTIZATION_SCALE = 1_000_000
 MAX_ABSOLUTE_UV_COORDINATE = 1_000_000.0
 
 
 # ### Public data models ###
 @dataclass(frozen=True)
-class CameraUvFingerprint:
+class UvFingerprint:
     """One deterministic per-face UV-layout identity."""
 
     version: str
@@ -28,12 +27,12 @@ class CameraUvFingerprint:
 
 
 # ### Public exceptions ###
-class CameraUvIntegrityError(ValueError):
-    """Raised when Meshy Retexture does not preserve submitted camera UVs."""
+class UvIntegrityError(ValueError):
+    """Raised when a model's required UV layout cannot be verified."""
 
 
 # ### Public integrity API ###
-def build_camera_uv_fingerprint(glb_bytes: bytes) -> CameraUvFingerprint:
+def build_uv_fingerprint(glb_bytes: bytes) -> UvFingerprint:
     """Fingerprint ordered face UV triangles without using vertex indices.
 
     Each triangle's three quantized UV corners are sorted before hashing, and
@@ -51,36 +50,30 @@ def build_camera_uv_fingerprint(glb_bytes: bytes) -> CameraUvFingerprint:
             continue
         faces = np.asarray(geometry.faces, dtype=np.int64)
         if faces.ndim != 2 or faces.shape[1:] != (3,):
-            raise CameraUvIntegrityError(
-                "Camera UV integrity requires triangle mesh faces."
+            raise UvIntegrityError(
+                "UV integrity requires triangle mesh faces."
             )
         if len(faces) == 0:
             continue
         uv = getattr(geometry.visual, "uv", None)
         if uv is None:
-            raise CameraUvIntegrityError(
-                "A staged GLB is missing the projected UV coordinates needed "
-                "for integrity validation."
+            raise UvIntegrityError(
+                "The GLB is missing UV coordinates needed for integrity "
+                "validation."
             )
         normalized_uv = np.asarray(uv, dtype=float)
         if normalized_uv.ndim != 2 or normalized_uv.shape[1:] != (2,):
-            raise CameraUvIntegrityError(
-                "A staged GLB contains malformed projected UV coordinates."
-            )
+            raise UvIntegrityError("The GLB contains malformed UV coordinates.")
         if len(faces) and (
             np.any(faces < 0) or np.any(faces >= len(normalized_uv))
         ):
-            raise CameraUvIntegrityError(
-                "A staged GLB contains invalid UV vertex indices."
-            )
+            raise UvIntegrityError("The GLB contains invalid UV vertex indices.")
         if not np.all(np.isfinite(normalized_uv)):
-            raise CameraUvIntegrityError(
-                "A staged GLB contains non-finite projected UV coordinates."
-            )
+            raise UvIntegrityError("The GLB contains non-finite UV coordinates.")
         if np.any(np.abs(normalized_uv) > MAX_ABSOLUTE_UV_COORDINATE):
-            raise CameraUvIntegrityError(
-                "A staged GLB contains projected UV coordinates outside the "
-                "supported integrity range."
+            raise UvIntegrityError(
+                "The GLB contains UV coordinates outside the supported "
+                "integrity range."
             )
 
         geometry_hasher = hashlib.sha256()
@@ -104,57 +97,29 @@ def build_camera_uv_fingerprint(glb_bytes: bytes) -> CameraUvFingerprint:
             )
 
     if face_count == 0:
-        raise CameraUvIntegrityError(
-            "Camera UV integrity requires at least one triangle face."
+        raise UvIntegrityError(
+            "UV integrity requires at least one triangle face."
         )
     hasher = hashlib.sha256()
-    hasher.update(CAMERA_UV_FINGERPRINT_VERSION.encode("ascii"))
+    hasher.update(UV_FINGERPRINT_VERSION.encode("ascii"))
     hasher.update(b"\0")
     for geometry_face_count, geometry_digest in sorted(
         geometry_fingerprints
     ):
         hasher.update(struct.pack("<Q", geometry_face_count))
         hasher.update(geometry_digest)
-    return CameraUvFingerprint(
-        version=CAMERA_UV_FINGERPRINT_VERSION,
+    return UvFingerprint(
+        version=UV_FINGERPRINT_VERSION,
         sha256=hasher.hexdigest(),
         face_count=face_count,
     )
-
-
-def validate_camera_uv_retexture_integrity(
-    submitted: CameraUvFingerprint,
-    returned: CameraUvFingerprint,
-) -> None:
-    """Reject a Meshy result that changed submitted per-face camera UVs."""
-
-    if submitted.version != returned.version:
-        raise CameraUvIntegrityError(
-            "Camera UV integrity versions do not match. No texture variants "
-            "were saved; retry generation with the current HouseMaker build."
-        )
-    if submitted.face_count != returned.face_count:
-        raise CameraUvIntegrityError(
-            "Meshy Retexture changed the projected model's face count from "
-            f"{submitted.face_count} to {returned.face_count}. No texture "
-            "variants were saved; retry or disable 'Project UVs from camera "
-            "views' for this object."
-        )
-    if submitted.sha256 != returned.sha256:
-        raise CameraUvIntegrityError(
-            "Meshy Retexture changed the camera-projected UV layout. No "
-            "texture variants were saved; retry or disable 'Project UVs from "
-            "camera views' for this object."
-        )
 
 
 # ### GLB helpers ###
 def _load_glb_scene(glb_bytes: bytes) -> trimesh.Scene:
     payload = bytes(glb_bytes)
     if not payload:
-        raise CameraUvIntegrityError(
-            "Camera UV integrity cannot inspect an empty GLB."
-        )
+        raise UvIntegrityError("UV integrity cannot inspect an empty GLB.")
     try:
         loaded = trimesh.load(
             BytesIO(payload),
@@ -163,16 +128,14 @@ def _load_glb_scene(glb_bytes: bytes) -> trimesh.Scene:
             process=False,
         )
     except Exception as error:
-        raise CameraUvIntegrityError(
-            "Camera UV integrity could not load the staged GLB."
+        raise UvIntegrityError(
+            "UV integrity could not load the GLB."
         ) from error
     if isinstance(loaded, trimesh.Trimesh):
         return trimesh.Scene(loaded)
     if isinstance(loaded, trimesh.Scene):
         return loaded
-    raise CameraUvIntegrityError(
-        "Camera UV integrity found no mesh scene in the staged GLB."
-    )
+    raise UvIntegrityError("UV integrity found no mesh scene in the GLB.")
 
 
 # ### Fingerprint helpers ###

@@ -13,7 +13,7 @@ from PIL import Image
 from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
-from housemaker.camera_uv_integrity import build_camera_uv_fingerprint
+from housemaker.uv_integrity import build_uv_fingerprint
 from housemaker.object_symmetry import build_symmetric_half_texture_variants
 from housemaker.object_texture_variants import TEXTURE_RESOLUTIONS
 
@@ -556,8 +556,8 @@ class SymmetricPreservedUvSmartFallbackAuditTests(unittest.TestCase):
                 rtol=0.0,
             )
         self.assertNotEqual(
-            build_camera_uv_fingerprint(compatible.glb_by_resolution[2048]),
-            build_camera_uv_fingerprint(source),
+            build_uv_fingerprint(compatible.glb_by_resolution[2048]),
+            build_uv_fingerprint(source),
         )
         _assert_only_left_half_is_used(self, compatible)
 
@@ -575,13 +575,13 @@ class SymmetricPreservedUvSmartFallbackAuditTests(unittest.TestCase):
             uvs_already_left_packed=True,
         )
 
-        source_fingerprint = build_camera_uv_fingerprint(source)
+        source_fingerprint = build_uv_fingerprint(source)
         self.assertEqual(
-            build_camera_uv_fingerprint(first.glb_by_resolution[2048]),
+            build_uv_fingerprint(first.glb_by_resolution[2048]),
             source_fingerprint,
         )
         self.assertEqual(
-            build_camera_uv_fingerprint(second.glb_by_resolution[2048]),
+            build_uv_fingerprint(second.glb_by_resolution[2048]),
             source_fingerprint,
         )
         source_uvs = _uvs_by_position(_load_mesh(source))
@@ -618,12 +618,12 @@ class SymmetricPreservedUvSmartFallbackAuditTests(unittest.TestCase):
             fresh.texture_png_by_resolution,
         )
         self.assertNotEqual(
-            build_camera_uv_fingerprint(canonical),
-            build_camera_uv_fingerprint(source),
+            build_uv_fingerprint(canonical),
+            build_uv_fingerprint(source),
         )
         self.assertEqual(
-            build_camera_uv_fingerprint(reentered.glb_by_resolution[2048]),
-            build_camera_uv_fingerprint(canonical),
+            build_uv_fingerprint(reentered.glb_by_resolution[2048]),
+            build_uv_fingerprint(canonical),
         )
         source_by_position = _uvs_by_position(_load_mesh(source))
         output_by_position = _uvs_by_position(_load_mesh(canonical))

@@ -435,10 +435,9 @@ def purge_faces_visible_from_unchecked_cameras_from_glb(
     """Delete every face owning a depth pixel in any unchecked camera view.
 
     Visibility comes from the same six fixed orthographic depth captures used
-    by unused-face removal and camera UV projection. An unchecked face is
-    removed once even when it is visible from several unchecked cameras.
-    Passing no unchecked cameras is an explicit no-op that preserves the
-    original GLB bytes.
+    by unused-face removal. An unchecked face is removed once even when it is
+    visible from several unchecked cameras. Passing no unchecked cameras is an
+    explicit no-op that preserves the original GLB bytes.
     """
 
     normalized_options = options or UncheckedCameraFacePurgeOptions()

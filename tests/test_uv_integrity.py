@@ -8,49 +8,44 @@ import trimesh
 from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
-from housemaker.camera_uv_integrity import (
-    CameraUvIntegrityError,
-    build_camera_uv_fingerprint,
-    validate_camera_uv_retexture_integrity,
+from housemaker.uv_integrity import (
+    UvIntegrityError,
+    build_uv_fingerprint,
 )
 
 
 # ### Integrity tests ###
-class CameraUvIntegrityTests(unittest.TestCase):
+class UvIntegrityTests(unittest.TestCase):
     def test_redundant_vertex_welding_preserves_face_uvs(self) -> None:
-        submitted = build_camera_uv_fingerprint(
+        submitted = build_uv_fingerprint(
             _square_glb(redundant_vertices=True)
         )
-        returned = build_camera_uv_fingerprint(
+        returned = build_uv_fingerprint(
             _square_glb(redundant_vertices=False)
         )
 
-        validate_camera_uv_retexture_integrity(submitted, returned)
-
-        self.assertEqual(submitted.sha256, returned.sha256)
+        self.assertEqual(submitted, returned)
         self.assertEqual(submitted.face_count, 2)
 
     def test_reordered_primitives_and_reindexed_vertices_match(self) -> None:
-        submitted = build_camera_uv_fingerprint(
+        submitted = build_uv_fingerprint(
             _two_primitive_glb(("first", "second"))
         )
-        returned = build_camera_uv_fingerprint(
+        returned = build_uv_fingerprint(
             _two_primitive_glb(
                 ("second", "first"),
                 reindex_vertices=True,
             )
         )
 
-        validate_camera_uv_retexture_integrity(submitted, returned)
-
-        self.assertEqual(submitted.sha256, returned.sha256)
+        self.assertEqual(submitted, returned)
         self.assertEqual(submitted.face_count, 2)
 
-    def test_one_mutated_face_uv_is_rejected(self) -> None:
-        submitted = build_camera_uv_fingerprint(
+    def test_one_mutated_face_uv_changes_the_fingerprint(self) -> None:
+        submitted = build_uv_fingerprint(
             _two_primitive_glb(("first", "second"))
         )
-        returned = build_camera_uv_fingerprint(
+        returned = build_uv_fingerprint(
             _two_primitive_glb(
                 ("second", "first"),
                 reindex_vertices=True,
@@ -58,11 +53,12 @@ class CameraUvIntegrityTests(unittest.TestCase):
             )
         )
 
-        with self.assertRaisesRegex(
-            CameraUvIntegrityError,
-            "changed the camera-projected UV layout",
-        ):
-            validate_camera_uv_retexture_integrity(submitted, returned)
+        self.assertNotEqual(submitted.sha256, returned.sha256)
+        self.assertEqual(submitted.face_count, returned.face_count)
+
+    def test_empty_payload_is_rejected(self) -> None:
+        with self.assertRaisesRegex(UvIntegrityError, "empty GLB"):
+            build_uv_fingerprint(b"")
 
 
 # ### GLB fixtures ###

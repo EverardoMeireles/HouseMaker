@@ -18,9 +18,9 @@ import trimesh
 from PySide6.QtTest import QSignalSpy
 from PySide6.QtWidgets import QApplication
 
-from housemaker.camera_uv_integrity import (
-    CAMERA_UV_FINGERPRINT_VERSION,
-    CameraUvFingerprint,
+from housemaker.uv_integrity import (
+    UV_FINGERPRINT_VERSION,
+    UvFingerprint,
 )
 from housemaker.generation_state import GeneratedObjectRecord
 from housemaker.generation_workspace import (
@@ -202,9 +202,9 @@ def _model_with_variants(variants: ObjectTextureVariants):
     return model
 
 
-def _fingerprint() -> CameraUvFingerprint:
-    return CameraUvFingerprint(
-        version=CAMERA_UV_FINGERPRINT_VERSION,
+def _fingerprint() -> UvFingerprint:
+    return UvFingerprint(
+        version=UV_FINGERPRINT_VERSION,
         sha256="a" * 64,
         face_count=12,
     )

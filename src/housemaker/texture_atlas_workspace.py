@@ -1177,7 +1177,7 @@ class TextureAtlasWorkspace(QWidget):
         self._refresh_preview()
 
     def materialize_missing_atlases(self) -> int:
-        """Rebuild only the selected, non-empty derived atlas PNG."""
+        """Materialize the selected non-empty atlas PNG when it is missing."""
 
         if not self._materialize_selected_atlas_if_missing():
             if self._lazy_materialization_error is not None:
@@ -1874,14 +1874,6 @@ class TextureAtlasWorkspace(QWidget):
         self.remove_atlas_button.setObjectName("delete_texture_atlas_button")
         self.remove_atlas_button.clicked.connect(self._remove_selected_atlas)
         selectors_layout.addWidget(self.remove_atlas_button)
-        self.rebuild_atlas_button = QPushButton("Rebuild atlas PNG")
-        self.rebuild_atlas_button.setObjectName(
-            "rebuild_texture_atlas_png_button"
-        )
-        self.rebuild_atlas_button.clicked.connect(
-            self._rebuild_selected_atlas_png
-        )
-        selectors_layout.addWidget(self.rebuild_atlas_button)
 
         selectors_layout.addWidget(QLabel("Texture sources"))
         self.object_list = TextureAtlasObjectList()
@@ -1973,25 +1965,6 @@ class TextureAtlasWorkspace(QWidget):
                 f"Deleted atlas: {name}. Its PNG could not be removed: "
                 f"{cleanup_error}"
             )
-
-    def _rebuild_selected_atlas_png(self) -> None:
-        atlas = self.selected_atlas
-        if atlas is None or not atlas.placements:
-            return
-        try:
-            self._materialize_atlas(atlas)
-        except (OSError, TypeError, ValueError) as error:
-            self.status_label.setText(
-                "The atlas PNG could not be rebuilt; any existing PNG remains "
-                f"unchanged: {error}"
-            )
-            return
-        self._lazy_materialization_error = None
-        self._refresh_atlas_list(atlas.atlas_id)
-        self._refresh_preview()
-        self._sync_controls()
-        self._emit_data_changed()
-        self.status_label.setText(f"Rebuilt the PNG for {atlas.name}.")
 
     def _assign_selected_object(self) -> None:
         atlas = self.selected_atlas
@@ -2416,8 +2389,7 @@ class TextureAtlasWorkspace(QWidget):
         ):
             self.status_label.setText(
                 "The atlas layout preview is ready, but its PNG could not be "
-                f"built: {self._lazy_materialization_error[1]}. Use Rebuild "
-                "atlas PNG to retry."
+                f"built: {self._lazy_materialization_error[1]}."
             )
         else:
             self.status_label.setText(
@@ -2431,9 +2403,6 @@ class TextureAtlasWorkspace(QWidget):
         object_id = self._selected_object_id()
         source = self._selected_object_source()
         self.remove_atlas_button.setEnabled(atlas is not None)
-        self.rebuild_atlas_button.setEnabled(
-            atlas is not None and bool(atlas.placements)
-        )
         self.assign_object_button.setEnabled(atlas is not None and source is not None)
         self.unassign_object_button.setEnabled(
             atlas is not None

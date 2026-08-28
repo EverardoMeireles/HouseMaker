@@ -255,7 +255,7 @@ class PersistentObjectUndoTests(unittest.TestCase):
             frame_index=3,
             object_name="Chair",
             pipeline={
-                "mode": "camera_uv_projection_geometry_only",
+                "mode": "processed_geometry_only",
                 "geometry_only": True,
                 "postprocessed_asset_path": "geometry.glb",
             },
@@ -302,7 +302,7 @@ class PersistentObjectUndoTests(unittest.TestCase):
         )
 
         self.assertFalse(textured.pipeline["geometry_only"])
-        self.assertEqual(textured.pipeline["mode"], "camera_uv_projection")
+        self.assertEqual(textured.pipeline["mode"], "processed")
         undo_stack = _get_object_operation_undo_stack(textured)
         restored = _restore_object_operation_snapshot(
             textured,

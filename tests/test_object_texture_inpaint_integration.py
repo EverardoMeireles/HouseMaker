@@ -13,7 +13,7 @@ from PIL import Image
 from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
-from housemaker.camera_uv_integrity import build_camera_uv_fingerprint
+from housemaker.uv_integrity import build_uv_fingerprint
 from housemaker.object_texture_inpaint import (
     OBJECT_TEXTURE_INPAINT_RESOLUTION,
     TEXTURE_UV_MODE_ERASE,
@@ -348,7 +348,7 @@ class ObjectTextureInpaintVariantTests(unittest.TestCase):
             force="scene",
             process=False,
         )
-        source_fingerprint = build_camera_uv_fingerprint(source_glb)
+        source_fingerprint = build_uv_fingerprint(source_glb)
 
         variants = build_object_texture_variants_from_texture(
             source_glb,
@@ -362,7 +362,7 @@ class ObjectTextureInpaintVariantTests(unittest.TestCase):
         for resolution in TEXTURE_RESOLUTIONS:
             variant_glb = variants.glb_by_resolution[resolution]
             self.assertEqual(
-                build_camera_uv_fingerprint(variant_glb),
+                build_uv_fingerprint(variant_glb),
                 source_fingerprint,
             )
             variant_scene = trimesh.load(

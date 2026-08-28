@@ -2387,7 +2387,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.assertEqual(loaded.placements, [])
         self.assertEqual(self.workspace.status_label.text(), "write failed")
 
-    def test_lazy_png_failure_is_reported_and_can_be_retried(self) -> None:
+    def test_lazy_png_failure_and_subsequent_materialization(self) -> None:
         data = TextureAtlasData()
         atlas = data.create_atlas("Retryable", 2048, atlas_id="atlas-a")
         source = _source("chair", directory=self._temporary_directory.name)
@@ -2411,14 +2411,12 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.assertIsNone(failed.image_path)
         self.assertIn("PNG could not be built", self.workspace.status_label.text())
         self.assertIn("disk full", self.workspace.status_label.text())
-        self.assertTrue(self.workspace.rebuild_atlas_button.isEnabled())
 
-        self.workspace.rebuild_atlas_button.click()
+        self.assertEqual(self.workspace.materialize_missing_atlases(), 1)
 
-        rebuilt = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
-        assert rebuilt is not None
-        self.assertIsNotNone(rebuilt.image_path)
-        self.assertIn("Rebuilt the PNG", self.workspace.status_label.text())
+        materialized = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert materialized is not None
+        self.assertIsNotNone(materialized.image_path)
 
     def test_delete_atlas_removes_its_owned_png(self) -> None:
         self.workspace.atlas_name_edit.setText("Disposable")

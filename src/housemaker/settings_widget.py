@@ -34,12 +34,8 @@ CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY_SETTING_KEY = (
     "navigation/canvas_3d_navigation_toggle_hotkey"
 )
 UNUSED_FACE_REMOVAL_SETTING_KEY = "generation/unused_face_removal"
-PROJECT_UVS_FROM_CAMERA_VIEWS_SETTING_KEY = (
-    "generation/project_uvs_from_camera_views"
-)
 DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY = "N"
 DEFAULT_UNUSED_FACE_REMOVAL = False
-DEFAULT_PROJECT_UVS_FROM_CAMERA_VIEWS = False
 MESHY_SMART_TOPOLOGY_MIN_TARGET_POLYCOUNT = 100
 MESHY_SMART_TOPOLOGY_MAX_TARGET_POLYCOUNT = 15_000
 DEFAULT_MESHY_TARGET_POLYCOUNT = 4_000
@@ -101,17 +97,10 @@ class GenerationServiceSettings:
         DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY
     )
     unused_face_removal: bool = DEFAULT_UNUSED_FACE_REMOVAL
-    project_uvs_from_camera_views: bool = (
-        DEFAULT_PROJECT_UVS_FROM_CAMERA_VIEWS
-    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.unused_face_removal, bool):
             raise ValueError("Unused face removal must be enabled or disabled.")
-        if not isinstance(self.project_uvs_from_camera_views, bool):
-            raise ValueError(
-                "Project UVs from camera views must be enabled or disabled."
-            )
         if (
             isinstance(self.meshy_target_polycount, bool)
             or not isinstance(self.meshy_target_polycount, int)
@@ -232,9 +221,6 @@ class SettingsWidget(QWidget):
                 self._selected_canvas_3d_navigation_toggle_hotkey()
             ),
             unused_face_removal=self.unused_face_removal_checkbox.isChecked(),
-            project_uvs_from_camera_views=(
-                self.project_uvs_from_camera_views_checkbox.isChecked()
-            ),
         )
 
     def clear_session_keys(self) -> None:
@@ -329,27 +315,6 @@ class SettingsWidget(QWidget):
             self.unused_face_removal_checkbox,
         )
 
-        self.project_uvs_from_camera_views_checkbox = QCheckBox()
-        self.project_uvs_from_camera_views_checkbox.setObjectName(
-            "project_uvs_from_camera_views_checkbox"
-        )
-        self.project_uvs_from_camera_views_checkbox.setToolTip(
-            "Generate geometry first, project the model's UVs using all six "
-            "fixed camera views, pack the projected UV islands compactly, "
-            "and place faces missed by every view in the bottom-left corner "
-            "of the UV map before asking Meshy Retexture to preserve those "
-            "UVs. This option uses all six cameras independently of the "
-            "unused-face camera checkboxes and requires staged geometry and "
-            "texturing tasks."
-        )
-        self.project_uvs_from_camera_views_checkbox.toggled.connect(
-            self._handle_project_uvs_from_camera_views_changed
-        )
-        form_layout.addRow(
-            "Project UVs from camera views",
-            self.project_uvs_from_camera_views_checkbox,
-        )
-
         root_layout.addLayout(form_layout)
 
         security_note = QLabel(
@@ -419,9 +384,6 @@ class SettingsWidget(QWidget):
         )
         self.unused_face_removal_checkbox.setChecked(
             read_unused_face_removal(self._application_settings)
-        )
-        self.project_uvs_from_camera_views_checkbox.setChecked(
-            read_project_uvs_from_camera_views(self._application_settings)
         )
         self._is_loading_settings = False
 
@@ -536,18 +498,6 @@ class SettingsWidget(QWidget):
         )
         self.settings_changed.emit()
 
-    def _handle_project_uvs_from_camera_views_changed(
-        self,
-        enabled: bool,
-    ) -> None:
-        if self._is_loading_settings:
-            return
-        self._application_settings.set(
-            PROJECT_UVS_FROM_CAMERA_VIEWS_SETTING_KEY,
-            bool(enabled),
-        )
-        self.settings_changed.emit()
-
     def _sync_key_status_labels(self) -> None:
         self.meshy_key_status_label.setText(
             self._build_key_status_text(
@@ -637,20 +587,6 @@ def read_unused_face_removal(
         DEFAULT_UNUSED_FACE_REMOVAL,
     )
     return value if isinstance(value, bool) else DEFAULT_UNUSED_FACE_REMOVAL
-
-
-def read_project_uvs_from_camera_views(
-    application_settings: ApplicationSettingsStore,
-) -> bool:
-    """Read the camera-projected UV option with a safe default."""
-
-    value = application_settings.get(
-        PROJECT_UVS_FROM_CAMERA_VIEWS_SETTING_KEY,
-        DEFAULT_PROJECT_UVS_FROM_CAMERA_VIEWS,
-    )
-    if not isinstance(value, bool):
-        return DEFAULT_PROJECT_UVS_FROM_CAMERA_VIEWS
-    return value
 
 
 # ### Canvas navigation hotkey helpers ###
