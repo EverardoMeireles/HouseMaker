@@ -6,7 +6,7 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 from PIL import Image
@@ -29,7 +29,19 @@ from PySide6.QtGui import (
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
-from housemaker.texture_atlas_state import TextureAtlasData
+from housemaker.texture_atlas_state import (
+    ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+    ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+    ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+    ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+    ATLAS_SLOT_HALF_LEFT,
+    ATLAS_SLOT_HALF_RIGHT,
+    ATLAS_SLOT_QUADRANT_BOTTOM_LEFT,
+    ATLAS_SLOT_QUADRANT_ORDER,
+    ATLAS_SLOT_QUADRANT_TOP_LEFT,
+    ATLAS_SLOT_QUADRANT_TOP_RIGHT,
+    TextureAtlasData,
+)
 from housemaker.texture_atlas_workspace import (
     AtlasObjectTextureSource,
     TextureAtlasWorkspace,
@@ -52,11 +64,35 @@ def _source(
     directory: str | Path,
     resolution: int = 512,
     color: tuple[int, int, int, int] = (30, 120, 210, 255),
+    symmetric_orientation: str | None = None,
+    symmetric_plane_coordinate: float | None = None,
+    packing_mode: str | None = None,
 ) -> AtlasObjectTextureSource:
     pixels = np.empty((8, 8, 4), dtype=np.uint8)
     pixels[:, :] = np.asarray(color, dtype=np.uint8)
     texture_path = Path(directory) / f"{object_id}-{resolution}.png"
-    exact_pixels = np.empty((resolution, resolution, 4), dtype=np.uint8)
+    resolved_packing_mode = (
+        packing_mode
+        if packing_mode is not None
+        else (
+            ATLAS_PACKING_MODE_SYMMETRIC_HALF
+            if symmetric_orientation is not None
+            else "full"
+        )
+    )
+    physical_resolution = (
+        resolution * 2
+        if resolved_packing_mode
+        in {
+            ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+            ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+        }
+        else resolution
+    )
+    exact_pixels = np.empty(
+        (physical_resolution, physical_resolution, 4),
+        dtype=np.uint8,
+    )
     exact_pixels[:, :] = np.asarray(color, dtype=np.uint8)
     Image.fromarray(exact_pixels, mode="RGBA").save(texture_path)
     return AtlasObjectTextureSource(
@@ -66,6 +102,9 @@ def _source(
         texture_resolution=resolution,
         physical_texture_path=texture_path,
         preview_rgba=pixels,
+        packing_mode=resolved_packing_mode,
+        symmetric_preview_orientation=symmetric_orientation,
+        symmetric_preview_plane_coordinate=symmetric_plane_coordinate,
     )
 
 
@@ -2432,6 +2471,935 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             sum(source.preview_rgba.nbytes for source in sources),
             24 * 256 * 256 * 4,
         )
+
+    def test_symmetric_sources_pair_across_orientations_and_hit_each_half(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Halves", 2048, atlas_id="atlas-a")
+        vertical = _source(
+            "vertical",
+            directory=self._temporary_directory.name,
+            symmetric_orientation="vertical",
+            symmetric_plane_coordinate=0.0,
+        )
+        horizontal = _source(
+            "horizontal",
+            directory=self._temporary_directory.name,
+            symmetric_orientation="horizontal",
+            symmetric_plane_coordinate=1.5,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([vertical, horizontal])
+        for row in range(2):
+            self.workspace.object_list.setCurrentRow(row)
+            self.workspace.assign_object_button.click()
+
+        packed = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert packed is not None
+        placements = {
+            placement.object_id: placement for placement in packed.placements
+        }
+        self.assertEqual(
+            (placements["vertical"].x, placements["vertical"].y),
+            (placements["horizontal"].x, placements["horizontal"].y),
+        )
+        self.assertEqual(
+            placements["vertical"].slot_half,
+            ATLAS_SLOT_HALF_LEFT,
+        )
+        self.assertEqual(
+            placements["horizontal"].slot_half,
+            ATLAS_SLOT_HALF_RIGHT,
+        )
+        left_point = _atlas_preview_point(
+            self.workspace.preview,
+            atlas.resolution,
+            placements["vertical"].x + 128,
+            placements["vertical"].y + 128,
+        )
+        right_point = _atlas_preview_point(
+            self.workspace.preview,
+            atlas.resolution,
+            placements["vertical"].x + 384,
+            placements["vertical"].y + 128,
+        )
+        self.assertEqual(
+            self.workspace.preview.object_id_at(left_point),
+            "vertical",
+        )
+        self.assertEqual(
+            self.workspace.preview.object_id_at(right_point),
+            "horizontal",
+        )
+
+    def test_half_drag_snaps_to_compatible_unpaired_right_side(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Drag halves", 2048, atlas_id="atlas-a")
+        first = _source(
+            "first",
+            directory=self._temporary_directory.name,
+            symmetric_orientation="vertical",
+            symmetric_plane_coordinate=0.0,
+        )
+        second = _source(
+            "second",
+            directory=self._temporary_directory.name,
+            symmetric_orientation="horizontal",
+            symmetric_plane_coordinate=2.0,
+        )
+        data.assign_object(
+            atlas.atlas_id,
+            first.object_id,
+            first.texture_path,
+            first.texture_resolution,
+            first.packing_mode,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([first, second])
+        hover_point = _atlas_preview_point(
+            self.workspace.preview,
+            atlas.resolution,
+            400,
+            200,
+        )
+
+        preview = self.workspace.preview._drag_slot_preview_at(
+            second.object_id,
+            hover_point,
+        )
+
+        self.assertIsNotNone(preview)
+        assert preview is not None
+        self.assertTrue(preview.is_valid)
+        self.assertEqual((preview.x, preview.y), (0, 0))
+        self.assertEqual(preview.slot_half, ATLAS_SLOT_HALF_RIGHT)
+
+    def test_half_resolution_change_splits_pairs_in_every_atlas(self) -> None:
+        data = TextureAtlasData()
+        first_512 = _source(
+            "first",
+            directory=self._temporary_directory.name,
+            symmetric_orientation="vertical",
+            symmetric_plane_coordinate=0.0,
+        )
+        first_1024 = _source(
+            "first",
+            directory=self._temporary_directory.name,
+            resolution=1024,
+            symmetric_orientation="vertical",
+            symmetric_plane_coordinate=0.0,
+        )
+        partner = _source(
+            "partner",
+            directory=self._temporary_directory.name,
+            symmetric_orientation="horizontal",
+            symmetric_plane_coordinate=1.0,
+        )
+        for atlas_id in ("atlas-a", "atlas-b"):
+            atlas = data.create_atlas(atlas_id, 2048, atlas_id=atlas_id)
+            for source in (first_512, partner):
+                data.assign_object(
+                    atlas.atlas_id,
+                    source.object_id,
+                    source.texture_path,
+                    source.texture_resolution,
+                    source.packing_mode,
+                )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources(
+            [first_512, partner],
+            variant_resolver=_variant_resolver(
+                {
+                    (first_512.object_id, 512): first_512,
+                    (first_1024.object_id, 1024): first_1024,
+                    (partner.object_id, 512): partner,
+                }
+            ),
+        )
+
+        self.assertTrue(
+            self.workspace.set_object_texture_resolution(
+                first_512.object_id,
+                1024,
+                commit_callback=lambda: True,
+            )
+        )
+
+        for atlas in self.workspace.get_data().atlases:
+            resized = atlas.placement_for_object("first")
+            survivor = atlas.placement_for_object("partner")
+            assert resized is not None and survivor is not None
+            self.assertEqual(resized.texture_resolution, 1024)
+            self.assertEqual(resized.slot_half, ATLAS_SLOT_HALF_LEFT)
+            self.assertEqual(survivor.slot_half, ATLAS_SLOT_HALF_LEFT)
+            self.assertNotEqual(
+                (resized.x, resized.y),
+                (survivor.x, survivor.y),
+            )
+
+    def test_full_transition_without_spare_slot_restores_pair_and_png(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Full", 2048, atlas_id="atlas-a")
+        target = _source(
+            "target",
+            directory=self._temporary_directory.name,
+            resolution=1024,
+            symmetric_orientation="vertical",
+            symmetric_plane_coordinate=0.0,
+        )
+        partner = _source(
+            "partner",
+            directory=self._temporary_directory.name,
+            resolution=1024,
+            symmetric_orientation="horizontal",
+            symmetric_plane_coordinate=1.0,
+        )
+        fillers = [
+            _source(
+                f"filler-{index}",
+                directory=self._temporary_directory.name,
+                resolution=1024,
+            )
+            for index in range(3)
+        ]
+        for source in (target, partner):
+            data.assign_object(
+                atlas.atlas_id,
+                source.object_id,
+                source.texture_path,
+                source.texture_resolution,
+                source.packing_mode,
+            )
+        for source, (x, y) in zip(
+            fillers,
+            ((1024, 0), (0, 1024), (1024, 1024)),
+            strict=True,
+        ):
+            data.place_object_at(
+                atlas.atlas_id,
+                source.object_id,
+                source.texture_path,
+                source.texture_resolution,
+                x,
+                y,
+            )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([target, partner, *fillers])
+        self.assertEqual(self.workspace.materialize_missing_atlases(), 1)
+        before = self.workspace.get_data()
+        before_atlas = before.atlas_by_id(atlas.atlas_id)
+        assert before_atlas is not None and before_atlas.image_path is not None
+        png_path = Path(self._temporary_directory.name) / before_atlas.image_path
+        png_before = png_path.read_bytes()
+        full_target = _source(
+            "target",
+            directory=self._temporary_directory.name,
+            resolution=1024,
+        )
+        commit = Mock(return_value=True)
+
+        changed = self.workspace.transition_object_packing(
+            target.object_id,
+            [full_target],
+            commit_callback=commit,
+        )
+
+        self.assertFalse(changed)
+        commit.assert_not_called()
+        self.assertEqual(self.workspace.get_data(), before)
+        self.assertEqual(png_path.read_bytes(), png_before)
+
+    def test_quarter_sources_share_row_major_regions_and_hit_independently(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Quarters", 2048, atlas_id="atlas-a")
+        sources = [
+            _source(
+                object_id,
+                directory=self._temporary_directory.name,
+                symmetric_orientation=(
+                    "vertical" if index % 2 == 0 else "horizontal"
+                ),
+                symmetric_plane_coordinate=float(index),
+                packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+            )
+            for index, object_id in enumerate(("one", "two", "three", "four"))
+        ]
+        for source in sources:
+            data.assign_object(
+                atlas.atlas_id,
+                source.object_id,
+                source.texture_path,
+                source.texture_resolution,
+                source.packing_mode,
+            )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources(sources)
+
+        packed = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert packed is not None
+        placements = {
+            placement.object_id: placement for placement in packed.placements
+        }
+        self.assertEqual(
+            [placements[source.object_id].slot_quadrant for source in sources],
+            list(ATLAS_SLOT_QUADRANT_ORDER),
+        )
+        hit_offsets = ((256, 256), (768, 256), (256, 768), (768, 768))
+        for source, (offset_x, offset_y) in zip(
+            sources,
+            hit_offsets,
+            strict=True,
+        ):
+            point = _atlas_preview_point(
+                self.workspace.preview,
+                atlas.resolution,
+                offset_x,
+                offset_y,
+            )
+            self.assertEqual(
+                self.workspace.preview.object_id_at(point),
+                source.object_id,
+            )
+
+    def test_quarter_drag_fills_first_free_region_and_same_group_is_noop(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Drag quarters", 2048, atlas_id="atlas-a")
+        first = _source(
+            "first",
+            directory=self._temporary_directory.name,
+            symmetric_orientation="vertical",
+            symmetric_plane_coordinate=0.0,
+            packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+        )
+        second = _source(
+            "second",
+            directory=self._temporary_directory.name,
+            symmetric_orientation="horizontal",
+            symmetric_plane_coordinate=2.0,
+            packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+        )
+        data.assign_object(
+            atlas.atlas_id,
+            first.object_id,
+            first.texture_path,
+            first.texture_resolution,
+            first.packing_mode,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([first, second])
+        hover_point = _atlas_preview_point(
+            self.workspace.preview,
+            atlas.resolution,
+            800,
+            200,
+        )
+
+        preview = self.workspace.preview._drag_slot_preview_at(
+            second.object_id,
+            hover_point,
+        )
+
+        assert preview is not None
+        self.assertTrue(preview.is_valid)
+        self.assertEqual((preview.x, preview.y, preview.size), (0, 0, 1024))
+        self.assertEqual(
+            preview.slot_quadrant,
+            ATLAS_SLOT_QUADRANT_TOP_RIGHT,
+        )
+        data.assign_object(
+            atlas.atlas_id,
+            second.object_id,
+            second.texture_path,
+            second.texture_resolution,
+            second.packing_mode,
+        )
+        self.workspace.set_data(data)
+        noop_point = _atlas_preview_point(
+            self.workspace.preview,
+            atlas.resolution,
+            200,
+            800,
+        )
+
+        noop = self.workspace.preview._drag_slot_preview_at(
+            second.object_id,
+            noop_point,
+        )
+
+        assert noop is not None
+        self.assertEqual(noop.slot_quadrant, ATLAS_SLOT_QUADRANT_TOP_RIGHT)
+
+    def test_quarter_resolution_change_breaks_out_and_compacts_survivors(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Resize quarters", 4096, atlas_id="atlas-a")
+        target_512 = _source(
+            "target",
+            directory=self._temporary_directory.name,
+            symmetric_orientation="vertical",
+            symmetric_plane_coordinate=0.0,
+            packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+        )
+        target_1024 = _source(
+            "target",
+            directory=self._temporary_directory.name,
+            resolution=1024,
+            symmetric_orientation="vertical",
+            symmetric_plane_coordinate=0.0,
+            packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+        )
+        partners = [
+            _source(
+                f"partner-{index}",
+                directory=self._temporary_directory.name,
+                symmetric_orientation="horizontal",
+                symmetric_plane_coordinate=float(index + 1),
+                packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+            )
+            for index in range(3)
+        ]
+        for source in (target_512, *partners):
+            data.assign_object(
+                atlas.atlas_id,
+                source.object_id,
+                source.texture_path,
+                source.texture_resolution,
+                source.packing_mode,
+            )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources(
+            [target_512, *partners],
+            variant_resolver=_variant_resolver(
+                {
+                    ("target", 512): target_512,
+                    ("target", 1024): target_1024,
+                    **{
+                        (source.object_id, 512): source
+                        for source in partners
+                    },
+                }
+            ),
+        )
+
+        self.assertTrue(
+            self.workspace.set_object_texture_resolution(
+                "target",
+                1024,
+                commit_callback=lambda: True,
+            )
+        )
+
+        updated = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert updated is not None
+        target = updated.placement_for_object("target")
+        assert target is not None
+        self.assertEqual(target.size, 2048)
+        self.assertEqual(target.slot_quadrant, ATLAS_SLOT_QUADRANT_TOP_LEFT)
+        survivor_placements = [
+            updated.placement_for_object(source.object_id)
+            for source in partners
+        ]
+        self.assertTrue(all(item is not None for item in survivor_placements))
+        self.assertEqual(
+            [item.slot_quadrant for item in survivor_placements if item is not None],
+            [
+                ATLAS_SLOT_QUADRANT_TOP_LEFT,
+                ATLAS_SLOT_QUADRANT_TOP_RIGHT,
+                ATLAS_SLOT_QUADRANT_BOTTOM_LEFT,
+            ],
+        )
+        self.assertNotEqual(
+            (target.x, target.y),
+            (survivor_placements[0].x, survivor_placements[0].y),
+        )
+
+    def test_quarter_resolution_callback_rejection_restores_layout_and_png(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Quarter rollback", 2048, atlas_id="atlas-a")
+        variants = {
+            resolution: _source(
+                "target",
+                directory=self._temporary_directory.name,
+                resolution=resolution,
+                symmetric_orientation="vertical",
+                symmetric_plane_coordinate=0.0,
+                packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+            )
+            for resolution in (512, 1024)
+        }
+        source = variants[1024]
+        data.assign_object(
+            atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+            source.packing_mode,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources(
+            [source],
+            variant_resolver=lambda object_id, resolution: (
+                variants.get(resolution) if object_id == "target" else None
+            ),
+        )
+        self.assertEqual(self.workspace.materialize_missing_atlases(), 1)
+        before = self.workspace.get_data()
+        before_atlas = before.atlas_by_id(atlas.atlas_id)
+        assert before_atlas is not None and before_atlas.image_path is not None
+        png_path = Path(self._temporary_directory.name) / before_atlas.image_path
+        png_before = png_path.read_bytes()
+
+        changed = self.workspace.set_object_texture_resolution(
+            "target",
+            512,
+            commit_callback=lambda: False,
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(self.workspace.get_data(), before)
+        self.assertEqual(png_path.read_bytes(), png_before)
+
+    def test_quarter_transition_maps_2048_slot_to_1024_content_variant(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Quarter transition", 2048, atlas_id="atlas-a")
+        full_source = _source(
+            "target",
+            directory=self._temporary_directory.name,
+            resolution=2048,
+        )
+        quarter_source = _source(
+            "target",
+            directory=self._temporary_directory.name,
+            resolution=1024,
+            symmetric_orientation="vertical",
+            symmetric_plane_coordinate=0.0,
+            packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+        )
+        data.assign_object(
+            atlas.atlas_id,
+            full_source.object_id,
+            full_source.texture_path,
+            full_source.texture_resolution,
+            full_source.packing_mode,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([full_source])
+        commit = Mock(return_value=True)
+
+        changed = self.workspace.transition_object_packing(
+            "target",
+            [quarter_source],
+            commit_callback=commit,
+        )
+
+        self.assertTrue(changed)
+        commit.assert_called_once_with()
+        updated = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert updated is not None
+        placement = updated.placement_for_object("target")
+        assert placement is not None
+        self.assertEqual(placement.texture_resolution, 1024)
+        self.assertEqual(placement.size, 2048)
+        self.assertEqual(
+            placement.packing_mode,
+            ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+        )
+        self.assertEqual(
+            placement.slot_quadrant,
+            ATLAS_SLOT_QUADRANT_TOP_LEFT,
+        )
+
+    def test_square_pair_transition_maps_a_full_2048_slot_to_1024(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Square transition", 2048, atlas_id="atlas-a")
+        full_source = _source(
+            "target",
+            directory=self._temporary_directory.name,
+            resolution=2048,
+        )
+        square_source = _source(
+            "target",
+            directory=self._temporary_directory.name,
+            resolution=1024,
+            symmetric_orientation="vertical",
+            symmetric_plane_coordinate=0.0,
+            packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+        )
+        data.assign_object(
+            atlas.atlas_id,
+            full_source.object_id,
+            full_source.texture_path,
+            full_source.texture_resolution,
+            full_source.packing_mode,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([full_source])
+        commit = Mock(return_value=True)
+
+        changed = self.workspace.transition_object_packing(
+            "target",
+            [square_source],
+            commit_callback=commit,
+        )
+
+        self.assertTrue(changed)
+        commit.assert_called_once_with()
+        updated = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert updated is not None
+        placement = updated.placement_for_object("target")
+        assert placement is not None
+        self.assertEqual((placement.texture_resolution, placement.size), (1024, 1024))
+        self.assertEqual(
+            placement.packing_mode,
+            ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+        )
+        self.assertEqual(placement.slot_half, ATLAS_SLOT_HALF_LEFT)
+
+    def test_pair_drag_fills_right_half_and_both_members_hit_full_height(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Pair drag", 2048, atlas_id="atlas-a")
+        first = _source(
+            "first",
+            directory=self._temporary_directory.name,
+            symmetric_orientation="vertical",
+            symmetric_plane_coordinate=0.0,
+            packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+        )
+        second = _source(
+            "second",
+            directory=self._temporary_directory.name,
+            symmetric_orientation="horizontal",
+            symmetric_plane_coordinate=1.0,
+            packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+        )
+        data.assign_object(
+            atlas.atlas_id,
+            first.object_id,
+            first.texture_path,
+            first.texture_resolution,
+            first.packing_mode,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([first, second])
+        right_half_point = _atlas_preview_point(
+            self.workspace.preview,
+            atlas.resolution,
+            768,
+            800,
+        )
+
+        preview = self.workspace.preview._drag_slot_preview_at(
+            second.object_id,
+            right_half_point,
+        )
+
+        assert preview is not None
+        self.assertTrue(preview.is_valid)
+        self.assertEqual((preview.x, preview.y, preview.size), (0, 0, 1024))
+        self.assertEqual(preview.slot_half, ATLAS_SLOT_HALF_RIGHT)
+        data.assign_object(
+            atlas.atlas_id,
+            second.object_id,
+            second.texture_path,
+            second.texture_resolution,
+            second.packing_mode,
+        )
+        self.workspace.set_data(data)
+        for source, atlas_x in ((first, 256), (second, 768)):
+            point = _atlas_preview_point(
+                self.workspace.preview,
+                atlas.resolution,
+                atlas_x,
+                900,
+            )
+            self.assertEqual(
+                self.workspace.preview.object_id_at(point),
+                source.object_id,
+            )
+        noop = self.workspace.preview._drag_slot_preview_at(
+            second.object_id,
+            right_half_point,
+        )
+        assert noop is not None
+        self.assertEqual(noop.slot_half, ATLAS_SLOT_HALF_RIGHT)
+
+    def test_square_pair_uses_an_ordinary_source_and_drag_slot(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Square pair drag", 2048, atlas_id="atlas-a")
+        first = _source(
+            "first-square",
+            directory=self._temporary_directory.name,
+            symmetric_orientation="vertical",
+            symmetric_plane_coordinate=0.0,
+            packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+        )
+        second = _source(
+            "second-square",
+            directory=self._temporary_directory.name,
+            symmetric_orientation="horizontal",
+            symmetric_plane_coordinate=1.0,
+            packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+        )
+        self.assertEqual(first.load_texture_rgba().shape, (512, 512, 4))
+        data.assign_object(
+            atlas.atlas_id,
+            first.object_id,
+            first.texture_path,
+            first.texture_resolution,
+            first.packing_mode,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([first, second])
+        right_half_point = _atlas_preview_point(
+            self.workspace.preview,
+            atlas.resolution,
+            384,
+            500,
+        )
+
+        preview = self.workspace.preview._drag_slot_preview_at(
+            second.object_id,
+            right_half_point,
+        )
+
+        assert preview is not None
+        self.assertTrue(preview.is_valid)
+        self.assertEqual((preview.x, preview.y, preview.size), (0, 0, 512))
+        self.assertEqual(preview.slot_half, ATLAS_SLOT_HALF_RIGHT)
+        data.assign_object(
+            atlas.atlas_id,
+            second.object_id,
+            second.texture_path,
+            second.texture_resolution,
+            second.packing_mode,
+        )
+        self.workspace.set_data(data)
+        for source, atlas_x in ((first, 128), (second, 384)):
+            point = _atlas_preview_point(
+                self.workspace.preview,
+                atlas.resolution,
+                atlas_x,
+                500,
+            )
+            self.assertEqual(
+                self.workspace.preview.object_id_at(point),
+                source.object_id,
+            )
+
+    def test_square_pair_drag_does_not_snap_into_a_legacy_half_slot(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Distinct drag modes", 2048, atlas_id="atlas-a")
+        legacy = _source(
+            "legacy",
+            directory=self._temporary_directory.name,
+            symmetric_orientation="vertical",
+            symmetric_plane_coordinate=0.0,
+        )
+        square = _source(
+            "square",
+            directory=self._temporary_directory.name,
+            symmetric_orientation="vertical",
+            symmetric_plane_coordinate=0.0,
+            packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+        )
+        data.assign_object(
+            atlas.atlas_id,
+            legacy.object_id,
+            legacy.texture_path,
+            legacy.texture_resolution,
+            legacy.packing_mode,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([legacy, square])
+        hover_point = _atlas_preview_point(
+            self.workspace.preview,
+            atlas.resolution,
+            384,
+            256,
+        )
+
+        preview = self.workspace.preview._drag_slot_preview_at(
+            square.object_id,
+            hover_point,
+        )
+
+        assert preview is not None
+        self.assertFalse(preview.is_valid)
+        self.assertEqual(preview.slot_half, ATLAS_SLOT_HALF_LEFT)
+
+    def test_square_pair_resolution_change_splits_and_rebuilds_black_halves(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Square resize", 2048, atlas_id="atlas-a")
+        target_512 = _source(
+            "square-target",
+            directory=self._temporary_directory.name,
+            symmetric_orientation="vertical",
+            symmetric_plane_coordinate=0.0,
+            packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+        )
+        target_1024 = _source(
+            "square-target",
+            directory=self._temporary_directory.name,
+            resolution=1024,
+            symmetric_orientation="vertical",
+            symmetric_plane_coordinate=0.0,
+            packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+        )
+        partner = _source(
+            "square-partner",
+            directory=self._temporary_directory.name,
+            symmetric_orientation="horizontal",
+            symmetric_plane_coordinate=1.0,
+            packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+        )
+        for source in (target_512, partner):
+            data.assign_object(
+                atlas.atlas_id,
+                source.object_id,
+                source.texture_path,
+                source.texture_resolution,
+                source.packing_mode,
+            )
+        variants = {
+            (target_512.object_id, 512): target_512,
+            (target_1024.object_id, 1024): target_1024,
+            (partner.object_id, 512): partner,
+        }
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources(
+            [target_512, partner],
+            variant_resolver=_variant_resolver(variants),
+        )
+
+        changed = self.workspace.set_object_texture_resolution(
+            target_512.object_id,
+            1024,
+            commit_callback=lambda: True,
+        )
+
+        self.assertTrue(changed)
+        updated = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert updated is not None
+        resized = updated.placement_for_object(target_512.object_id)
+        survivor = updated.placement_for_object(partner.object_id)
+        assert resized is not None and survivor is not None
+        self.assertEqual((resized.texture_resolution, resized.size), (1024, 1024))
+        self.assertEqual((survivor.texture_resolution, survivor.size), (512, 512))
+        self.assertEqual(resized.slot_half, ATLAS_SLOT_HALF_LEFT)
+        self.assertEqual(survivor.slot_half, ATLAS_SLOT_HALF_LEFT)
+        self.assertNotEqual((resized.x, resized.y), (survivor.x, survivor.y))
+        output_path = (
+            Path(self._temporary_directory.name) / str(updated.image_path)
+        )
+        with Image.open(output_path) as image:
+            pixels = np.asarray(image.convert("RGBA"), dtype=np.uint8)
+        self.assertTrue(
+            np.all(
+                pixels[
+                    resized.y : resized.y + resized.size,
+                    resized.x + resized.size // 2 : resized.x + resized.size,
+                ]
+                == (0, 0, 0, 255)
+            )
+        )
+        self.assertTrue(
+            np.all(
+                pixels[
+                    survivor.y : survivor.y + survivor.size,
+                    survivor.x + survivor.size // 2 : survivor.x + survivor.size,
+                ]
+                == (0, 0, 0, 255)
+            )
+        )
+
+    def test_pair_multi_atlas_resize_rejection_restores_layouts_and_pngs(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlases = [
+            data.create_atlas(name, 4096, atlas_id=atlas_id)
+            for name, atlas_id in (
+                ("First pair", "atlas-a"),
+                ("Second pair", "atlas-b"),
+            )
+        ]
+        target_variants = {
+            resolution: _source(
+                "target",
+                directory=self._temporary_directory.name,
+                resolution=resolution,
+                symmetric_orientation="vertical",
+                symmetric_plane_coordinate=0.0,
+                packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+            )
+            for resolution in (512, 1024)
+        }
+        partners = [
+            _source(
+                f"partner-{index}",
+                directory=self._temporary_directory.name,
+                symmetric_orientation="horizontal",
+                symmetric_plane_coordinate=float(index),
+                packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+            )
+            for index in range(2)
+        ]
+        for atlas, partner in zip(atlases, partners, strict=True):
+            for source in (target_variants[512], partner):
+                data.assign_object(
+                    atlas.atlas_id,
+                    source.object_id,
+                    source.texture_path,
+                    source.texture_resolution,
+                    source.packing_mode,
+                )
+        all_sources = [target_variants[512], *partners]
+        variants = {
+            (source.object_id, source.texture_resolution): source
+            for source in [*target_variants.values(), *partners]
+        }
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources(
+            all_sources,
+            variant_resolver=_variant_resolver(variants),
+        )
+        for atlas in self.workspace._data.atlases:
+            self.workspace._materialize_atlas(atlas)
+        before = self.workspace.get_data()
+        pngs_before = {
+            atlas.atlas_id: (
+                Path(self._temporary_directory.name) / str(atlas.image_path)
+            ).read_bytes()
+            for atlas in before.atlases
+        }
+        commit = Mock(return_value=False)
+
+        changed = self.workspace.set_object_texture_resolution(
+            "target",
+            1024,
+            commit_callback=commit,
+        )
+
+        self.assertFalse(changed)
+        commit.assert_called_once_with()
+        self.assertEqual(self.workspace.get_data(), before)
+        for atlas in before.atlases:
+            png_path = Path(self._temporary_directory.name) / str(atlas.image_path)
+            self.assertEqual(png_path.read_bytes(), pngs_before[atlas.atlas_id])
 
     def test_materialization_rejects_mutated_traversal_id_without_writing(
         self,

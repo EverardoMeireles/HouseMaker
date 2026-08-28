@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from PIL import Image
@@ -45,7 +46,7 @@ from housemaker.camera_models import (
     MAX_FIRST_PERSON_LIGHT_INTENSITY,
     MIN_FIRST_PERSON_LIGHT_INTENSITY,
 )
-from housemaker.generation_state import GenerationData
+from housemaker.generation_state import GeneratedObjectRecord, GenerationData
 from housemaker.generation_workspace import GenerationWorkspace
 from housemaker.surface_texture_state import (
     SURFACE_TYPE_WALL,
@@ -113,7 +114,16 @@ from housemaker.settings_widget import (
     resolve_fullscreen_3d_viewer_screen,
 )
 from housemaker.texture_creator_canvas import TextureCreatorCanvas
-from housemaker.texture_atlas_state import TextureAtlasData
+from housemaker.texture_atlas_state import (
+    ATLAS_PACKING_MODE_FULL,
+    ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+    ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+    ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+    ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+    ATLAS_SLOT_HALF_LEFT,
+    OBJECT_TEXTURE_RESOLUTIONS,
+    TextureAtlasData,
+)
 from housemaker.texture_atlas_workspace import (
     AtlasObjectTextureSource,
     TextureAtlasWorkspace,
@@ -263,9 +273,7 @@ class BlueprintWorkspace(QWidget):
         self._scheduled_viewer_refresh_preserve_camera = True
         self._atlas_generation_signature: tuple[tuple[object, ...], ...] | None = None
         self._atlas_wall_texture_source_ids: set[str] = set()
-        self._atlas_preview_variant_key: tuple[
-            str, int, str, int, int
-        ] | None = None
+        self._atlas_preview_variant_key: tuple[object, ...] | None = None
         self._canvas_window_undo_ids: list[str] = []
         self._is_shutdown = False
         self.texture_creator_level_index: int | None = None
@@ -323,6 +331,12 @@ class BlueprintWorkspace(QWidget):
             asset_directory=(
                 self._application_settings.path.parent / "generated"
             )
+        )
+        self.generation.set_texture_resolution_change_handler(
+            self._handle_generation_texture_resolution_change_requested
+        )
+        self.generation.set_object_packing_change_handler(
+            self._handle_generation_object_packing_change_requested
         )
         self.texture_atlas_workspace = TextureAtlasWorkspace(
             asset_directory=(
@@ -1695,12 +1709,31 @@ class BlueprintWorkspace(QWidget):
         try:
             asset_path = Path(variant.glb_asset_path)
             asset_stat = asset_path.stat()
+            symmetry = self.generation.get_object_symmetric_division(object_id)
             variant_key = (
                 str(variant.object_id),
                 int(variant.resolution),
                 str(asset_path.resolve()),
                 int(asset_stat.st_mtime_ns),
                 int(asset_stat.st_size),
+                None if symmetry is None else symmetry.orientation,
+                None if symmetry is None else symmetry.plane_coordinate,
+                None if symmetry is None else getattr(symmetry, "version", None),
+                (
+                    None
+                    if symmetry is None
+                    else getattr(symmetry, "packing_mode", None)
+                ),
+                (
+                    None
+                    if symmetry is None
+                    else getattr(symmetry, "texture_content_half", None)
+                ),
+                (
+                    None
+                    if symmetry is None
+                    else getattr(symmetry, "texture_content_quadrant", None)
+                ),
             )
             if (
                 self._atlas_preview_variant_key == variant_key
@@ -1723,6 +1756,10 @@ class BlueprintWorkspace(QWidget):
         self.atlas_object_preview_viewer.set_model(
             generated_model,
             preserve_camera=preserve_camera,
+        )
+        self.atlas_object_preview_viewer.set_symmetric_division_preview(
+            None if symmetry is None else symmetry.orientation,
+            None if symmetry is None else symmetry.plane_coordinate,
         )
         self._atlas_preview_variant_key = variant_key
 
@@ -1823,6 +1860,85 @@ class BlueprintWorkspace(QWidget):
             ),
         )
 
+    def _handle_generation_texture_resolution_change_requested(
+        self,
+        object_id: str,
+        texture_resolution: int,
+    ) -> bool:
+        """Commit an Object-tab resolution together with every Atlas slot."""
+
+        normalized_id = str(object_id).strip()
+        try:
+            target_resolution = int(texture_resolution)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not normalized_id or target_resolution not in OBJECT_TEXTURE_RESOLUTIONS:
+            return False
+        current_variant = self.generation.get_active_texture_variant(normalized_id)
+        if current_variant is None:
+            return False
+        if current_variant.resolution == target_resolution:
+            return True
+        if self.generation.get_texture_variant(
+            normalized_id,
+            target_resolution,
+        ) is None:
+            return False
+
+        self._sync_atlas_object_texture_sources()
+        return self.texture_atlas_workspace.set_object_texture_resolution(
+            normalized_id,
+            target_resolution,
+            commit_callback=lambda: (
+                self.generation.select_object_texture_resolution(
+                    normalized_id,
+                    target_resolution,
+                )
+            ),
+        )
+
+    def _handle_generation_object_packing_change_requested(
+        self,
+        old_record: GeneratedObjectRecord,
+        replacement_record: GeneratedObjectRecord,
+        _preview_model: GeneratedModel,
+        commit_callback: Callable[[], bool],
+    ) -> bool:
+        """Commit one prepared full or symmetric object and all Atlas PNGs."""
+
+        if (
+            not isinstance(old_record, GeneratedObjectRecord)
+            or not isinstance(replacement_record, GeneratedObjectRecord)
+            or old_record.object_id != replacement_record.object_id
+            or not callable(commit_callback)
+        ):
+            return False
+        symmetry = self.generation.resolve_symmetric_division_for_record(
+            replacement_record
+        )
+        candidate_sources: list[AtlasObjectTextureSource] = []
+        for resolution in sorted(OBJECT_TEXTURE_RESOLUTIONS):
+            variant = self.generation.resolve_texture_image_variant_for_record(
+                replacement_record,
+                resolution,
+            )
+            if variant is None:
+                continue
+            source = self._build_atlas_object_texture_source(
+                variant,
+                symmetry,
+            )
+            if source is None:
+                return False
+            candidate_sources.append(source)
+        if not candidate_sources:
+            return bool(commit_callback())
+        return self.texture_atlas_workspace.transition_object_packing(
+            replacement_record.object_id,
+            candidate_sources,
+            commit_callback=commit_callback,
+        )
+
     def _append_atlas_preview_status(self, message: str) -> None:
         """Report preview errors without hiding an Atlas resize result."""
 
@@ -1847,7 +1963,7 @@ class BlueprintWorkspace(QWidget):
     def _sync_atlas_object_texture_sources(self) -> None:
         """Expose generated object and wall texture sources to Atlas."""
 
-        active_variants: list[object] = []
+        active_variants: list[tuple[object, object | None]] = []
         signature_items: list[tuple[object, ...]] = []
         generation_data = self.generation.get_data()
         generated_object_ids = {
@@ -1857,16 +1973,79 @@ class BlueprintWorkspace(QWidget):
             variant = self.generation.get_active_texture_variant(
                 record.object_id
             )
+            symmetry = self.generation.get_object_symmetric_division(
+                record.object_id
+            )
             if variant is None:
-                signature_items.append(("object", record.object_id, 0, ""))
+                signature_items.append(
+                    (
+                        "object",
+                        record.object_id,
+                        0,
+                        "",
+                        None if symmetry is None else symmetry.orientation,
+                        None if symmetry is None else symmetry.plane_coordinate,
+                        (
+                            None
+                            if symmetry is None
+                            else getattr(symmetry, "version", None)
+                        ),
+                        (
+                            None
+                            if symmetry is None
+                            else getattr(symmetry, "packing_mode", None)
+                        ),
+                        (
+                            None
+                            if symmetry is None
+                            else getattr(
+                                symmetry,
+                                "texture_content_half",
+                                None,
+                            )
+                        ),
+                        (
+                            None
+                            if symmetry is None
+                            else getattr(
+                                symmetry,
+                                "texture_content_quadrant",
+                                None,
+                            )
+                        ),
+                    )
+                )
                 continue
-            active_variants.append(variant)
+            active_variants.append((variant, symmetry))
             signature_items.append(
                 (
                     "object",
                     record.object_id,
                     int(getattr(variant, "resolution")),
                     str(getattr(variant, "texture_asset_relative_path")),
+                    None if symmetry is None else symmetry.orientation,
+                    None if symmetry is None else symmetry.kept_side,
+                    None if symmetry is None else symmetry.plane_coordinate,
+                    (
+                        None
+                        if symmetry is None
+                        else getattr(symmetry, "texture_content_half", None)
+                    ),
+                    None if symmetry is None else getattr(symmetry, "version", None),
+                    (
+                        None
+                        if symmetry is None
+                        else getattr(symmetry, "packing_mode", None)
+                    ),
+                    (
+                        None
+                        if symmetry is None
+                        else getattr(
+                            symmetry,
+                            "texture_content_quadrant",
+                            None,
+                        )
+                    ),
                 )
             )
 
@@ -1926,8 +2105,11 @@ class BlueprintWorkspace(QWidget):
             return
 
         active_sources: list[AtlasObjectTextureSource] = []
-        for variant in active_variants:
-            source = self._build_atlas_object_texture_source(variant)
+        for variant, symmetry in active_variants:
+            source = self._build_atlas_object_texture_source(
+                variant,
+                symmetry,
+            )
             if source is not None:
                 active_sources.append(source)
         wall_sources: dict[str, AtlasObjectTextureSource] = {}
@@ -1960,7 +2142,8 @@ class BlueprintWorkspace(QWidget):
                 self.generation.get_texture_image_variant(
                     object_id,
                     resolution,
-                )
+                ),
+                self.generation.get_object_symmetric_division(object_id),
             )
 
         def is_variant_selectable(
@@ -2008,12 +2191,55 @@ class BlueprintWorkspace(QWidget):
     @staticmethod
     def _build_atlas_object_texture_source(
         variant: object,
+        symmetry: object | None = None,
     ) -> AtlasObjectTextureSource | None:
         """Adapt one public Generation variant while tolerating missing assets."""
 
         if variant is None:
             return None
         try:
+            packing_mode = ATLAS_PACKING_MODE_FULL
+            if symmetry is not None:
+                symmetry_version = getattr(symmetry, "version", None)
+                is_legacy_pair = (
+                    isinstance(symmetry_version, int)
+                    and not isinstance(symmetry_version, bool)
+                    and symmetry_version == 3
+                    and getattr(symmetry, "packing_mode", None)
+                    == ATLAS_PACKING_MODE_SYMMETRIC_PAIR
+                    and getattr(symmetry, "texture_content_half", None)
+                    == ATLAS_SLOT_HALF_LEFT
+                )
+                is_square_pair = (
+                    isinstance(symmetry_version, int)
+                    and not isinstance(symmetry_version, bool)
+                    and symmetry_version == 4
+                    and getattr(symmetry, "packing_mode", None)
+                    == ATLAS_PACKING_MODE_SYMMETRIC_PAIR
+                    and getattr(symmetry, "texture_content_half", None)
+                    == ATLAS_SLOT_HALF_LEFT
+                )
+                is_quarter = (
+                    symmetry_version == 2
+                    and getattr(symmetry, "packing_mode", None)
+                    == ATLAS_PACKING_MODE_SYMMETRIC_QUARTER
+                    and getattr(
+                        symmetry,
+                        "texture_content_quadrant",
+                        None,
+                    )
+                    == "top_left"
+                )
+                if is_square_pair:
+                    packing_mode = ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR
+                elif is_legacy_pair:
+                    packing_mode = ATLAS_PACKING_MODE_SYMMETRIC_PAIR
+                elif is_quarter:
+                    packing_mode = ATLAS_PACKING_MODE_SYMMETRIC_QUARTER
+                elif symmetry_version == 1:
+                    packing_mode = ATLAS_PACKING_MODE_SYMMETRIC_HALF
+                else:
+                    raise ValueError("Unknown symmetric texture packing metadata.")
             return load_atlas_object_texture_source(
                 object_id=str(getattr(variant, "object_id")),
                 object_name=str(getattr(variant, "object_name")),
@@ -2024,6 +2250,17 @@ class BlueprintWorkspace(QWidget):
                 physical_texture_path=getattr(
                     variant,
                     "texture_asset_path",
+                ),
+                packing_mode=packing_mode,
+                symmetric_preview_orientation=(
+                    None
+                    if symmetry is None
+                    else str(getattr(symmetry, "orientation"))
+                ),
+                symmetric_preview_plane_coordinate=(
+                    None
+                    if symmetry is None
+                    else float(getattr(symmetry, "plane_coordinate"))
                 ),
             )
         except (AttributeError, OSError, TypeError, ValueError):

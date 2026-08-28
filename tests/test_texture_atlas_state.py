@@ -15,6 +15,16 @@ from housemaker.models import create_default_doorway_presets, create_default_lev
 from housemaker.project_io import ProjectData, load_project, save_project
 from housemaker.surface_texture_state import SurfaceTextureData
 from housemaker.texture_atlas_state import (
+    ATLAS_PACKING_MODE_FULL,
+    ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+    ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+    ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+    ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+    ATLAS_STATE_SCHEMA_VERSION,
+    ATLAS_SLOT_HALF_LEFT,
+    ATLAS_SLOT_HALF_RIGHT,
+    ATLAS_SLOT_QUADRANT_ORDER,
+    ATLAS_SLOT_QUADRANT_TOP_LEFT,
     TextureAtlasData,
     write_texture_atlas_metadata,
     write_texture_atlas_png,
@@ -23,6 +33,713 @@ from housemaker.texture_atlas_state import (
 
 # ### Texture atlas state tests ###
 class TextureAtlasStateTests(unittest.TestCase):
+    def test_schema_v1_placements_migrate_to_full_slots(self) -> None:
+        payload = {
+            "schema_version": 1,
+            "selected_atlas_id": "atlas-a",
+            "atlases": [
+                {
+                    "atlas_id": "atlas-a",
+                    "name": "Legacy",
+                    "resolution": 2048,
+                    "image_path": None,
+                    "placements": [
+                        {
+                            "object_id": "chair",
+                            "texture_path": "textures/chair.png",
+                            "texture_resolution": 512,
+                            "x": 0,
+                            "y": 0,
+                            "width": 512,
+                            "height": 512,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        restored = TextureAtlasData.from_dict(payload)
+        placement = restored.atlases[0].placements[0]
+
+        self.assertEqual(placement.packing_mode, ATLAS_PACKING_MODE_FULL)
+        self.assertIsNone(placement.slot_half)
+        self.assertEqual(
+            restored.to_dict()["schema_version"],
+            ATLAS_STATE_SCHEMA_VERSION,
+        )
+
+    def test_schema_v2_symmetric_half_round_trips_through_schema_v5(self) -> None:
+        payload = {
+            "schema_version": 2,
+            "selected_atlas_id": "atlas-a",
+            "atlases": [
+                {
+                    "atlas_id": "atlas-a",
+                    "name": "Legacy half",
+                    "resolution": 2048,
+                    "image_path": None,
+                    "placements": [
+                        {
+                            "object_id": "half",
+                            "texture_path": "textures/half.png",
+                            "texture_resolution": 512,
+                            "x": 0,
+                            "y": 0,
+                            "width": 512,
+                            "height": 512,
+                            "packing_mode": (
+                                ATLAS_PACKING_MODE_SYMMETRIC_HALF
+                            ),
+                            "slot_half": ATLAS_SLOT_HALF_LEFT,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        restored = TextureAtlasData.from_dict(payload)
+
+        self.assertEqual(
+            restored.to_dict()["schema_version"],
+            ATLAS_STATE_SCHEMA_VERSION,
+        )
+        placement = restored.atlases[0].placements[0]
+        self.assertEqual(
+            placement.packing_mode,
+            ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+        )
+        self.assertEqual(placement.slot_half, ATLAS_SLOT_HALF_LEFT)
+        self.assertIsNone(placement.slot_quadrant)
+
+    def test_schema_v3_symmetric_quarter_round_trips_through_schema_v5(
+        self,
+    ) -> None:
+        payload = {
+            "schema_version": 3,
+            "selected_atlas_id": "atlas-a",
+            "atlases": [
+                {
+                    "atlas_id": "atlas-a",
+                    "name": "Legacy quarter",
+                    "resolution": 2048,
+                    "image_path": None,
+                    "placements": [
+                        {
+                            "object_id": "quarter",
+                            "texture_path": "textures/quarter.png",
+                            "texture_resolution": 512,
+                            "x": 0,
+                            "y": 0,
+                            "width": 1024,
+                            "height": 1024,
+                            "packing_mode": (
+                                ATLAS_PACKING_MODE_SYMMETRIC_QUARTER
+                            ),
+                            "slot_half": None,
+                            "slot_quadrant": ATLAS_SLOT_QUADRANT_TOP_LEFT,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        restored = TextureAtlasData.from_dict(payload)
+
+        self.assertEqual(
+            restored.to_dict()["schema_version"],
+            ATLAS_STATE_SCHEMA_VERSION,
+        )
+        placement = restored.atlases[0].placements[0]
+        self.assertEqual(
+            placement.packing_mode,
+            ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+        )
+        self.assertEqual(
+            placement.slot_quadrant,
+            ATLAS_SLOT_QUADRANT_TOP_LEFT,
+        )
+        self.assertEqual(placement.size, 1024)
+
+    def test_schema_v4_legacy_pair_keeps_its_double_sized_slot(self) -> None:
+        payload = {
+            "schema_version": 4,
+            "selected_atlas_id": "atlas-a",
+            "atlases": [
+                {
+                    "atlas_id": "atlas-a",
+                    "name": "Legacy pair",
+                    "resolution": 2048,
+                    "image_path": "atlases/legacy.png",
+                    "placements": [
+                        {
+                            "object_id": "legacy-pair",
+                            "texture_path": "textures/legacy-pair.png",
+                            "texture_resolution": 512,
+                            "x": 0,
+                            "y": 0,
+                            "width": 1024,
+                            "height": 1024,
+                            "packing_mode": ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+                            "slot_half": ATLAS_SLOT_HALF_LEFT,
+                            "slot_quadrant": None,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        restored = TextureAtlasData.from_dict(payload)
+        placement = restored.atlases[0].placements[0]
+
+        self.assertEqual(restored.to_dict()["schema_version"], 5)
+        self.assertEqual(
+            placement.packing_mode,
+            ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+        )
+        self.assertEqual(placement.size, 1024)
+        self.assertEqual(placement.texture_path, "textures/legacy-pair.png")
+
+    def test_schema_v4_cannot_silently_claim_the_v5_square_pair_mode(
+        self,
+    ) -> None:
+        payload = {
+            "schema_version": 4,
+            "selected_atlas_id": "atlas-a",
+            "atlases": [
+                {
+                    "atlas_id": "atlas-a",
+                    "name": "Mislabeled square pair",
+                    "resolution": 2048,
+                    "image_path": None,
+                    "placements": [
+                        {
+                            "object_id": "new-pair",
+                            "texture_path": "textures/new-pair.png",
+                            "texture_resolution": 512,
+                            "x": 0,
+                            "y": 0,
+                            "width": 512,
+                            "height": 512,
+                            "packing_mode": (
+                                ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR
+                            ),
+                            "slot_half": ATLAS_SLOT_HALF_LEFT,
+                            "slot_quadrant": None,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with self.assertRaisesRegex(ValueError, "schema version 5"):
+            TextureAtlasData.from_dict(payload)
+
+    def test_loaded_orphan_right_half_is_rejected(self) -> None:
+        payload = {
+            "schema_version": 2,
+            "selected_atlas_id": "atlas-a",
+            "atlases": [
+                {
+                    "atlas_id": "atlas-a",
+                    "name": "Invalid",
+                    "resolution": 2048,
+                    "image_path": None,
+                    "placements": [
+                        {
+                            "object_id": "right-only",
+                            "texture_path": "textures/right.png",
+                            "texture_resolution": 512,
+                            "x": 0,
+                            "y": 0,
+                            "width": 512,
+                            "height": 512,
+                            "packing_mode": ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+                            "slot_half": ATLAS_SLOT_HALF_RIGHT,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with self.assertRaisesRegex(ValueError, "matching left half"):
+            TextureAtlasData.from_dict(payload)
+
+    def test_same_resolution_symmetric_halves_share_only_one_exact_slot(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Halves", 2048, atlas_id="atlas-a")
+
+        first = data.assign_object(
+            atlas.atlas_id,
+            "first",
+            "textures/first.png",
+            512,
+            ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+        )
+        second = data.assign_object(
+            atlas.atlas_id,
+            "second",
+            "textures/second.png",
+            512,
+            ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+        )
+
+        self.assertEqual((first.x, first.y), (second.x, second.y))
+        self.assertEqual(first.slot_half, ATLAS_SLOT_HALF_LEFT)
+        self.assertEqual(second.slot_half, ATLAS_SLOT_HALF_RIGHT)
+        with self.assertRaisesRegex(ValueError, "at most two|overlap"):
+            data.place_object_at(
+                atlas.atlas_id,
+                "full",
+                "textures/full.png",
+                512,
+                first.x,
+                first.y,
+            )
+
+    def test_moving_right_member_to_empty_slot_normalizes_both_survivors_left(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Move", 2048, atlas_id="atlas-a")
+        data.assign_object(
+            atlas.atlas_id,
+            "first",
+            "textures/first.png",
+            512,
+            ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+        )
+        data.assign_object(
+            atlas.atlas_id,
+            "second",
+            "textures/second.png",
+            512,
+            ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+        )
+
+        moved = data.place_object_at(
+            atlas.atlas_id,
+            "second",
+            "textures/second.png",
+            512,
+            512,
+            0,
+            ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+            ATLAS_SLOT_HALF_RIGHT,
+        )
+
+        self.assertEqual(moved.slot_half, ATLAS_SLOT_HALF_LEFT)
+        self.assertEqual(
+            {placement.slot_half for placement in atlas.placements},
+            {ATLAS_SLOT_HALF_LEFT},
+        )
+
+    def test_removing_left_pair_member_normalizes_right_survivor(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Remove", 2048, atlas_id="atlas-a")
+        for object_id in ("first", "second"):
+            data.assign_object(
+                atlas.atlas_id,
+                object_id,
+                f"textures/{object_id}.png",
+                512,
+                ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+            )
+
+        self.assertTrue(data.unassign_object(atlas.atlas_id, "first"))
+
+        survivor = atlas.placement_for_object("second")
+        self.assertIsNotNone(survivor)
+        assert survivor is not None
+        self.assertEqual(survivor.slot_half, ATLAS_SLOT_HALF_LEFT)
+
+    def test_half_compositor_uses_only_left_source_pixels_and_opaque_black_gap(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Composite", 2048, atlas_id="atlas-a")
+        first = data.assign_object(
+            atlas.atlas_id,
+            "first",
+            "textures/first.png",
+            512,
+            ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+        )
+
+        def load_source(placement):
+            source = np.empty((512, 512, 4), dtype=np.uint8)
+            source[:, :256] = (
+                (10, 20, 30, 255)
+                if placement.object_id == "first"
+                else (40, 50, 60, 255)
+            )
+            source[:, 256:] = (200, 210, 220, 3)
+            return source
+
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "unpaired.png"
+            write_texture_atlas_png(atlas, output_path, source_loader=load_source)
+            unpaired = cv2.imread(str(output_path), cv2.IMREAD_UNCHANGED)
+            data.assign_object(
+                atlas.atlas_id,
+                "second",
+                "textures/second.png",
+                512,
+                ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+            )
+            write_texture_atlas_png(atlas, output_path, source_loader=load_source)
+            paired = cv2.imread(str(output_path), cv2.IMREAD_UNCHANGED)
+
+        self.assertEqual(tuple(unpaired[first.y + 10, first.x + 10]), (10, 20, 30, 255))
+        self.assertEqual(tuple(unpaired[first.y + 10, first.x + 300]), (0, 0, 0, 255))
+        self.assertEqual(tuple(paired[first.y + 10, first.x + 10]), (10, 20, 30, 255))
+        self.assertEqual(tuple(paired[first.y + 10, first.x + 300]), (40, 50, 60, 255))
+
+    def test_four_symmetric_quarters_share_one_row_major_logical_slot(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Quarters", 4096, atlas_id="atlas-a")
+
+        placements = [
+            data.assign_object(
+                atlas.atlas_id,
+                object_id,
+                f"textures/{object_id}.png",
+                512,
+                ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+            )
+            for object_id in ("one", "two", "three", "four")
+        ]
+
+        self.assertEqual(
+            {(placement.x, placement.y, placement.size) for placement in placements},
+            {(0, 0, 1024)},
+        )
+        self.assertEqual(
+            [placement.slot_quadrant for placement in placements],
+            list(ATLAS_SLOT_QUADRANT_ORDER),
+        )
+        fifth = data.assign_object(
+            atlas.atlas_id,
+            "five",
+            "textures/five.png",
+            512,
+            ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+        )
+        self.assertEqual(fifth.slot_quadrant, ATLAS_SLOT_QUADRANT_TOP_LEFT)
+        self.assertNotEqual((fifth.x, fifth.y), (0, 0))
+
+    def test_quarter_removal_compacts_survivors_without_moving_the_group(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Compact", 2048, atlas_id="atlas-a")
+        for object_id in ("one", "two", "three", "four"):
+            data.assign_object(
+                atlas.atlas_id,
+                object_id,
+                f"textures/{object_id}.png",
+                512,
+                ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+            )
+
+        self.assertTrue(data.unassign_object(atlas.atlas_id, "two"))
+
+        survivors = [
+            placement
+            for placement in atlas.placements
+            if placement.object_id in {"one", "three", "four"}
+        ]
+        self.assertEqual(
+            [placement.slot_quadrant for placement in survivors],
+            list(ATLAS_SLOT_QUADRANT_ORDER[:3]),
+        )
+        self.assertEqual(
+            {(placement.x, placement.y, placement.size) for placement in survivors},
+            {(0, 0, 1024)},
+        )
+
+    def test_quarter_compositor_uses_only_each_source_top_left_content(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Quarter pixels", 2048, atlas_id="atlas-a")
+        first = data.assign_object(
+            atlas.atlas_id,
+            "red",
+            "textures/red.png",
+            512,
+            ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+        )
+        data.assign_object(
+            atlas.atlas_id,
+            "green",
+            "textures/green.png",
+            512,
+            ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+        )
+
+        def load_source(placement):
+            source = np.full(
+                (1024, 1024, 4),
+                (250, 0, 250, 7),
+                dtype=np.uint8,
+            )
+            source[:512, :512] = (
+                (10, 20, 30, 255)
+                if placement.object_id == "red"
+                else (40, 50, 60, 255)
+            )
+            return source
+
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "quarters.png"
+            write_texture_atlas_png(
+                atlas,
+                output_path,
+                source_loader=load_source,
+            )
+            image = cv2.imread(str(output_path), cv2.IMREAD_UNCHANGED)
+
+        self.assertEqual(
+            tuple(image[first.y + 10, first.x + 10]),
+            (10, 20, 30, 255),
+        )
+        self.assertEqual(
+            tuple(image[first.y + 10, first.x + 600]),
+            (40, 50, 60, 255),
+        )
+        self.assertEqual(
+            tuple(image[first.y + 600, first.x + 10]),
+            (0, 0, 0, 255),
+        )
+
+    def test_four_symmetric_pairs_fill_two_high_density_slots(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Pairs", 2048, atlas_id="atlas-a")
+
+        placements = [
+            data.assign_object(
+                atlas.atlas_id,
+                object_id,
+                f"textures/{object_id}.png",
+                512,
+                ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+            )
+            for object_id in ("one", "two", "three", "four")
+        ]
+
+        self.assertEqual(
+            [(placement.x, placement.y, placement.size) for placement in placements],
+            [(0, 0, 1024), (0, 0, 1024), (1024, 0, 1024), (1024, 0, 1024)],
+        )
+        self.assertEqual(
+            [placement.slot_half for placement in placements],
+            [
+                ATLAS_SLOT_HALF_LEFT,
+                ATLAS_SLOT_HALF_RIGHT,
+                ATLAS_SLOT_HALF_LEFT,
+                ATLAS_SLOT_HALF_RIGHT,
+            ],
+        )
+
+    def test_pair_removal_compacts_right_survivor_to_left(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Pair compact", 2048, atlas_id="atlas-a")
+        for object_id in ("first", "second"):
+            data.assign_object(
+                atlas.atlas_id,
+                object_id,
+                f"textures/{object_id}.png",
+                512,
+                ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+            )
+
+        self.assertTrue(data.unassign_object(atlas.atlas_id, "first"))
+
+        survivor = atlas.placement_for_object("second")
+        assert survivor is not None
+        self.assertEqual(survivor.slot_half, ATLAS_SLOT_HALF_LEFT)
+        self.assertEqual((survivor.x, survivor.y, survivor.size), (0, 0, 1024))
+
+    def test_pair_compositor_uses_full_height_left_source_content(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Pair pixels", 2048, atlas_id="atlas-a")
+        first = data.assign_object(
+            atlas.atlas_id,
+            "first",
+            "textures/first.png",
+            512,
+            ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+        )
+        data.assign_object(
+            atlas.atlas_id,
+            "second",
+            "textures/second.png",
+            512,
+            ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+        )
+
+        def load_source(placement):
+            source = np.full(
+                (1024, 1024, 4),
+                (250, 0, 250, 7),
+                dtype=np.uint8,
+            )
+            source[:, :512] = (
+                (10, 20, 30, 255)
+                if placement.object_id == "first"
+                else (40, 50, 60, 255)
+            )
+            return source
+
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "pairs.png"
+            write_texture_atlas_png(
+                atlas,
+                output_path,
+                source_loader=load_source,
+            )
+            image = cv2.imread(str(output_path), cv2.IMREAD_UNCHANGED)
+
+        self.assertEqual(
+            tuple(image[first.y + 900, first.x + 10]),
+            (10, 20, 30, 255),
+        )
+        self.assertEqual(
+            tuple(image[first.y + 900, first.x + 600]),
+            (40, 50, 60, 255),
+        )
+
+    def test_four_square_pair_members_fill_two_ordinary_slots(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Square pairs", 2048, atlas_id="atlas-a")
+
+        placements = [
+            data.assign_object(
+                atlas.atlas_id,
+                object_id,
+                f"textures/{object_id}.png",
+                512,
+                ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+            )
+            for object_id in ("one", "two", "three", "four")
+        ]
+
+        self.assertEqual(
+            [(placement.x, placement.y, placement.size) for placement in placements],
+            [(0, 0, 512), (0, 0, 512), (512, 0, 512), (512, 0, 512)],
+        )
+        self.assertEqual(
+            [placement.slot_half for placement in placements],
+            [
+                ATLAS_SLOT_HALF_LEFT,
+                ATLAS_SLOT_HALF_RIGHT,
+                ATLAS_SLOT_HALF_LEFT,
+                ATLAS_SLOT_HALF_RIGHT,
+            ],
+        )
+
+    def test_square_pair_never_cross_pairs_with_legacy_modes(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Distinct pairs", 2048, atlas_id="atlas-a")
+        legacy_half = data.assign_object(
+            atlas.atlas_id,
+            "legacy-half",
+            "textures/legacy-half.png",
+            512,
+            ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+        )
+        legacy_pair = data.assign_object(
+            atlas.atlas_id,
+            "legacy-pair",
+            "textures/legacy-pair.png",
+            512,
+            ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+        )
+        square_pair = data.assign_object(
+            atlas.atlas_id,
+            "square-pair",
+            "textures/square-pair.png",
+            512,
+            ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+        )
+
+        self.assertNotEqual(
+            (square_pair.x, square_pair.y, square_pair.size),
+            (legacy_half.x, legacy_half.y, legacy_half.size),
+        )
+        self.assertNotEqual(
+            (square_pair.x, square_pair.y, square_pair.size),
+            (legacy_pair.x, legacy_pair.y, legacy_pair.size),
+        )
+        self.assertEqual(square_pair.slot_half, ATLAS_SLOT_HALF_LEFT)
+
+    def test_square_pair_compositor_uses_only_each_full_height_left_half(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Square pair pixels", 2048, atlas_id="atlas-a")
+        first = data.assign_object(
+            atlas.atlas_id,
+            "first",
+            "textures/first.png",
+            512,
+            ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+        )
+        data.assign_object(
+            atlas.atlas_id,
+            "second",
+            "textures/second.png",
+            512,
+            ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+        )
+
+        def load_source(placement):
+            source = np.full(
+                (512, 512, 4),
+                (250, 0, 250, 7),
+                dtype=np.uint8,
+            )
+            source[:, :256] = (
+                (10, 20, 30, 255)
+                if placement.object_id == "first"
+                else (40, 50, 60, 255)
+            )
+            return source
+
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "square-pairs.png"
+            write_texture_atlas_png(
+                atlas,
+                output_path,
+                source_loader=load_source,
+            )
+            image = cv2.imread(str(output_path), cv2.IMREAD_UNCHANGED)
+
+        self.assertEqual(tuple(image[first.y + 500, first.x + 10]), (10, 20, 30, 255))
+        self.assertEqual(tuple(image[first.y + 500, first.x + 300]), (40, 50, 60, 255))
+        self.assertEqual(tuple(image[first.y + 10, first.x + 511]), (40, 50, 60, 255))
+
+    def test_square_pair_removal_compacts_the_survivor_left(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Square pair compact", 2048, atlas_id="atlas-a")
+        for object_id in ("first", "second"):
+            data.assign_object(
+                atlas.atlas_id,
+                object_id,
+                f"textures/{object_id}.png",
+                512,
+                ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+            )
+
+        self.assertTrue(data.unassign_object(atlas.atlas_id, "first"))
+
+        survivor = atlas.placement_for_object("second")
+        assert survivor is not None
+        self.assertEqual(survivor.slot_half, ATLAS_SLOT_HALF_LEFT)
+        self.assertEqual((survivor.x, survivor.y, survivor.size), (0, 0, 512))
+
     def test_four_512_textures_share_one_1024_quadrant(self) -> None:
         data = TextureAtlasData()
         atlas = data.create_atlas("Furniture", 4096, atlas_id="atlas-a")

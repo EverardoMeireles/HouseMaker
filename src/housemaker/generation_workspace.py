@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import math
 import os
 import tempfile
 import threading
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
     QBoxLayout,
     QButtonGroup,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QGridLayout,
     QHBoxLayout,
@@ -69,10 +71,33 @@ from housemaker.meshy_generation import (
 )
 from housemaker.object_texture_variants import (
     DEFAULT_TEXTURE_RESOLUTION,
+    TEXTURE_RESOLUTION_1024,
     TEXTURE_RESOLUTION_2048,
     TEXTURE_RESOLUTIONS,
     ObjectTextureVariants,
     build_object_texture_variants,
+)
+from housemaker.object_symmetry import (
+    AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
+    LEGACY_SYMMETRIC_PAIR_METADATA_VERSION,
+    SYMMETRIC_DIVISION_METADATA_VERSION,
+    SYMMETRIC_DIVISION_ORIENTATIONS,
+    SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL,
+    SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+    SYMMETRIC_DIVISION_SIDE_ORDER_BY_ORIENTATION,
+    SYMMETRIC_DIVISION_SIDES_BY_ORIENTATION,
+    SYMMETRIC_QUARTER_METADATA_VERSION,
+    SYMMETRIC_SQUARE_PAIR_CONTENT_RESOLUTIONS,
+    SymmetricDivisionMetadata,
+    SymmetricDivisionResult,
+    SymmetricPairTextureVariants,
+    SymmetricQuarterTextureVariants,
+    SymmetricSquarePairTextureVariants,
+    build_automatic_symmetric_object_variants,
+    build_symmetric_half_texture_variants,
+    build_symmetric_pair_texture_variants,
+    build_symmetric_quarter_texture_variants,
+    build_symmetric_square_pair_texture_variants,
 )
 from housemaker.settings_widget import (
     DEFAULT_MESHY_TARGET_POLYCOUNT,
@@ -139,6 +164,119 @@ OBJECT_OPERATION_UNDO_STACK_PIPELINE_KEY = "object_operation_undo_stack"
 MAX_OBJECT_OPERATION_UNDO_COUNT = 10
 OBJECT_OPERATION_GENERATE_TEXTURE = "generate_texture"
 OBJECT_OPERATION_PURGE_FACES = "purge_faces"
+SYMMETRIC_DIVISION_PIPELINE_KEY = "symmetric_division"
+SYMMETRIC_DIVISION_TEXTURE_CONTENT_HALF = "left"
+SYMMETRIC_TEXTURE_RESOLUTIONS = SYMMETRIC_SQUARE_PAIR_CONTENT_RESOLUTIONS
+
+
+# ### Symmetric-division metadata ###
+@dataclass(frozen=True)
+class ObjectSymmetricDivisionMetadata:
+    """Validated immutable provenance for one divided generated object."""
+
+    version: int
+    orientation: str
+    kept_side: str
+    plane_coordinate: float
+    texture_content_half: str | None = None
+    packing_mode: str | None = None
+    texture_content_quadrant: str | None = None
+    selection_mode: str | None = None
+    triangle_count_by_side: tuple[tuple[str, int], ...] = ()
+    tie_broken_randomly: bool = False
+
+    def __post_init__(self) -> None:
+        if isinstance(self.version, bool) or self.version not in {
+            SYMMETRIC_DIVISION_METADATA_VERSION,
+            SYMMETRIC_QUARTER_METADATA_VERSION,
+            LEGACY_SYMMETRIC_PAIR_METADATA_VERSION,
+            AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
+        }:
+            raise ValueError("Unsupported symmetric-division metadata version.")
+        if self.orientation not in SYMMETRIC_DIVISION_ORIENTATIONS:
+            raise ValueError("Unknown symmetric-division orientation.")
+        if self.kept_side not in SYMMETRIC_DIVISION_SIDES_BY_ORIENTATION[
+            self.orientation
+        ]:
+            raise ValueError("The kept side does not match the orientation.")
+        if not math.isfinite(self.plane_coordinate):
+            raise ValueError("The symmetric-division plane must be finite.")
+        if self.version == SYMMETRIC_DIVISION_METADATA_VERSION:
+            if (
+                self.texture_content_half
+                != SYMMETRIC_DIVISION_TEXTURE_CONTENT_HALF
+            ):
+                raise ValueError("Unknown symmetric-division texture half.")
+            if (
+                self.packing_mode is not None
+                or self.texture_content_quadrant is not None
+                or self.selection_mode is not None
+                or self.triangle_count_by_side
+                or self.tie_broken_randomly
+            ):
+                raise ValueError(
+                    "Legacy symmetric-division metadata has automatic fields."
+                )
+            return
+        SymmetricDivisionMetadata(
+            version=self.version,
+            orientation=self.orientation,
+            kept_side=self.kept_side,
+            plane_coordinate=self.plane_coordinate,
+            packing_mode=self.packing_mode,
+            texture_content_quadrant=self.texture_content_quadrant,
+            texture_content_half=self.texture_content_half,
+            selection_mode=self.selection_mode,
+            triangle_count_by_side=self.triangle_count_by_side,
+            tie_broken_randomly=self.tie_broken_randomly,
+        )
+
+    def to_pipeline_dict(self) -> dict[str, object]:
+        """Return JSON-safe provenance stored with the generated object."""
+
+        pipeline: dict[str, object] = {
+            "version": self.version,
+            "orientation": self.orientation,
+            "kept_side": self.kept_side,
+            "plane_coordinate": self.plane_coordinate,
+        }
+        if self.version == SYMMETRIC_DIVISION_METADATA_VERSION:
+            pipeline["texture_content_half"] = self.texture_content_half
+        else:
+            pipeline["packing_mode"] = self.packing_mode
+            if self.version == SYMMETRIC_QUARTER_METADATA_VERSION:
+                pipeline["texture_content_quadrant"] = (
+                    self.texture_content_quadrant
+                )
+            else:
+                pipeline["texture_content_half"] = (
+                    self.texture_content_half
+                )
+            pipeline.update(
+                {
+                    "selection_mode": self.selection_mode,
+                    "triangle_count_by_side": dict(
+                        self.triangle_count_by_side
+                    ),
+                    "tie_broken_randomly": self.tie_broken_randomly,
+                }
+            )
+        return pipeline
+
+
+# ### Object-packing transaction types ###
+ObjectPackingCommit = Callable[[], bool]
+ObjectPackingChangeHandler = Callable[
+    [
+        GeneratedObjectRecord,
+        GeneratedObjectRecord,
+        GeneratedModel,
+        ObjectPackingCommit,
+    ],
+    bool,
+]
+
+
 # ### Generation interfaces ###
 class MeshyPlanner(Protocol):
     def plan(self, request: "GenerationRequest") -> MeshyGenerationResult:
@@ -169,6 +307,10 @@ class GenerationRequest:
         settings: GenerationServiceSettings,
         enabled_camera_ids: Sequence[str] = ALL_CAMERA_IDS,
         geometry_only: bool = False,
+        symmetric_division_enabled: bool = False,
+        symmetric_division_orientation: str = (
+            SYMMETRIC_DIVISION_ORIENTATION_VERTICAL
+        ),
     ) -> None:
         self.frame_index = int(frame_index)
         self.selected_object_bgra = np.ascontiguousarray(
@@ -176,6 +318,17 @@ class GenerationRequest:
         ).copy()
         self.settings = settings
         self.geometry_only = bool(geometry_only)
+        self.symmetric_division_enabled = bool(symmetric_division_enabled)
+        normalized_orientation = str(
+            symmetric_division_orientation
+        ).strip().lower()
+        if normalized_orientation not in SYMMETRIC_DIVISION_ORIENTATIONS:
+            raise ValueError("Unknown generation-time symmetric orientation.")
+        if self.geometry_only and self.symmetric_division_enabled:
+            raise ValueError(
+                "Geometry-only generation cannot apply symmetric division."
+            )
+        self.symmetric_division_orientation = normalized_orientation
         requested_camera_ids = tuple(str(value) for value in enabled_camera_ids)
         self.enabled_camera_ids = tuple(
             camera_id
@@ -195,6 +348,7 @@ class TextureRegenerationRequest:
     settings: GenerationServiceSettings
     enable_original_uv: bool = False
     submitted_uv_fingerprint: CameraUvFingerprint | None = None
+    preserve_symmetric_uvs: bool = False
 
     def __post_init__(self) -> None:
         normalized_object_id = str(self.object_id).strip()
@@ -220,6 +374,10 @@ class TextureRegenerationRequest:
             raise ValueError(
                 "A UV fingerprint is only valid when original UVs are preserved."
             )
+        if self.preserve_symmetric_uvs and not self.enable_original_uv:
+            raise ValueError(
+                "Symmetric texture regeneration must preserve original UVs."
+            )
         object.__setattr__(self, "object_id", normalized_object_id)
         object.__setattr__(
             self,
@@ -236,6 +394,11 @@ class TextureRegenerationRequest:
             self,
             "enable_original_uv",
             bool(self.enable_original_uv),
+        )
+        object.__setattr__(
+            self,
+            "preserve_symmetric_uvs",
+            bool(self.preserve_symmetric_uvs),
         )
 
 
@@ -1034,15 +1197,27 @@ class TextureRegenerationWorker(QObject):
         try:
             final_fingerprint = build_camera_uv_fingerprint(result.glb_bytes)
         except CameraUvIntegrityError as error:
+            if self._request.preserve_symmetric_uvs:
+                raise CameraUvIntegrityError(
+                    "Meshy Retexture returned a GLB whose preserved packed UV "
+                    "layout could not be verified. The existing texture was "
+                    f"kept. Detail: {error}"
+                ) from error
             raise CameraUvIntegrityError(
                 "Meshy Retexture returned a GLB whose camera UV layout could "
                 "not be verified. The existing texture was kept. Detail: "
                 f"{error}"
             ) from error
-        validate_camera_uv_retexture_integrity(
-            submitted,
-            final_fingerprint,
-        )
+        if self._request.preserve_symmetric_uvs:
+            _validate_symmetric_uv_retexture_integrity(
+                submitted,
+                final_fingerprint,
+            )
+        else:
+            validate_camera_uv_retexture_integrity(
+                submitted,
+                final_fingerprint,
+            )
         return final_fingerprint
 
 
@@ -1157,6 +1332,13 @@ class GenerationWorkspace(QWidget):
         self._generated_model: GeneratedModel | None = None
         self._generated_model_cache: dict[str, GeneratedModel] = {}
         self._is_syncing_texture_resolution_view = False
+        self._texture_resolution_change_handler: (
+            Callable[[str, int], bool] | None
+        ) = None
+        self._object_packing_change_handler: (
+            ObjectPackingChangeHandler | None
+        ) = None
+        self._active_generation_request: GenerationRequest | None = None
         self._is_rebuilding_generation_data = False
         self._is_emitting_texture_repair = False
         self._selected_object_id: str | None = None
@@ -1217,6 +1399,45 @@ class GenerationWorkspace(QWidget):
     def get_runtime_settings(self) -> GenerationServiceSettings:
         return self._settings
 
+    def set_texture_resolution_change_handler(
+        self,
+        handler: Callable[[str, int], bool] | None,
+    ) -> None:
+        """Route UI resolution clicks through an application transaction."""
+
+        if handler is not None and not callable(handler):
+            raise TypeError("The texture resolution change handler must be callable.")
+        self._texture_resolution_change_handler = handler
+
+    def set_object_packing_change_handler(
+        self,
+        handler: ObjectPackingChangeHandler | None,
+    ) -> None:
+        """Route object packing transitions through a host transaction."""
+
+        if handler is not None and not callable(handler):
+            raise TypeError("The object packing change handler must be callable.")
+        self._object_packing_change_handler = handler
+
+    def get_object_symmetric_division(
+        self,
+        object_id: str,
+    ) -> ObjectSymmetricDivisionMetadata | None:
+        """Resolve validated immutable division metadata for Atlas pairing."""
+
+        record = self._find_generated_object_record(object_id)
+        return _get_object_symmetric_division_metadata(record)
+
+    def resolve_symmetric_division_for_record(
+        self,
+        record: GeneratedObjectRecord,
+    ) -> ObjectSymmetricDivisionMetadata | None:
+        """Resolve candidate metadata before a record is globally committed."""
+
+        if not isinstance(record, GeneratedObjectRecord):
+            return None
+        return _get_object_symmetric_division_metadata(record)
+
     def get_active_texture_variant(
         self,
         object_id: str,
@@ -1271,12 +1492,28 @@ class GenerationWorkspace(QWidget):
     ) -> ObjectTextureImageVariant | None:
         """Resolve one exact PNG even when its material GLB is unavailable."""
 
+        record = self._find_generated_object_record(object_id)
+        if record is None:
+            return None
+        return self.resolve_texture_image_variant_for_record(
+            record,
+            resolution,
+        )
+
+    def resolve_texture_image_variant_for_record(
+        self,
+        record: GeneratedObjectRecord,
+        resolution: int,
+    ) -> ObjectTextureImageVariant | None:
+        """Resolve a committed or prepared record's exact PNG safely."""
+
+        if not isinstance(record, GeneratedObjectRecord):
+            return None
         try:
             normalized_resolution = int(resolution)
         except (TypeError, ValueError):
             return None
-        record = self._find_generated_object_record(object_id)
-        if record is None or normalized_resolution not in TEXTURE_RESOLUTIONS:
+        if normalized_resolution not in TEXTURE_RESOLUTIONS:
             return None
         variant = _get_texture_variant_metadata(record, normalized_resolution)
         if variant is None:
@@ -1311,7 +1548,16 @@ class GenerationWorkspace(QWidget):
         record = self._find_generated_object_record(object_id)
         if record is None:
             return False
-        variant = self.get_texture_variant(record.object_id, resolution)
+        try:
+            requested_resolution = int(resolution)
+        except (TypeError, ValueError):
+            return False
+        if requested_resolution not in _selectable_texture_resolutions(record):
+            return False
+        variant = self.get_texture_variant(
+            record.object_id,
+            requested_resolution,
+        )
         if variant is None:
             return False
         normalized_resolution = variant.resolution
@@ -1395,7 +1641,7 @@ class GenerationWorkspace(QWidget):
         return True
 
     def undo_selected_object_change(self) -> bool:
-        """Undo the selected object's latest texture generation or face purge."""
+        """Undo the selected object's latest local or texture operation."""
 
         if self._generation_thread is not None:
             return False
@@ -1421,13 +1667,17 @@ class GenerationWorkspace(QWidget):
             self.status_label.setText(f"Undo could not restore the object: {error}")
             return False
 
-        record_index = self._data.generated_objects.index(record)
-        self._data.generated_objects[record_index] = replacement
-        self._generated_model_cache.pop(record.object_id, None)
-        selected_object_id = self._selected_object_id
-        if selected_object_id == record.object_id:
-            self._generated_model_cache[record.object_id] = preview_model
-        self._refresh_generated_objects_list(selected_object_id)
+        if not self._request_object_packing_change(
+            record,
+            replacement,
+            preview_model,
+        ):
+            self.status_label.setText(
+                "Undo could not restore the object because the Atlas packing "
+                "change was rejected."
+            )
+            self._sync_controls()
+            return False
         cleanup_failed = self._delete_unreferenced_object_assets(record)
         operation = str(snapshot.get("operation", "object change"))
         operation_label = {
@@ -1578,6 +1828,12 @@ class GenerationWorkspace(QWidget):
 
         if self._generation_thread is not None:
             return
+        if self.symmetric_division_checkbox.isChecked():
+            self.status_label.setText(
+                "Symmetric division requires the full Generate workflow. "
+                "Clear the option to generate geometry only."
+            )
+            return
         request = self._build_generation_request(geometry_only=True)
         if request is None:
             return
@@ -1586,6 +1842,7 @@ class GenerationWorkspace(QWidget):
     def _start_generation(self, request: GenerationRequest) -> None:
         """Start one owned request; split out for deterministic UI tests."""
 
+        self._active_generation_request = request
         self._generation_thread = QThread(self)
         self._generation_worker = GenerationWorker(
             self._meshy_planner,
@@ -1621,6 +1878,7 @@ class GenerationWorkspace(QWidget):
     ) -> None:
         """Start a texture-only task for one immutable selected-object snapshot."""
 
+        self._active_generation_request = None
         self._generation_thread = QThread(self)
         self._generation_worker = TextureRegenerationWorker(
             self._meshy_texture_regenerator,
@@ -1656,6 +1914,7 @@ class GenerationWorkspace(QWidget):
     ) -> None:
         """Start one local face-purge request off the UI thread."""
 
+        self._active_generation_request = None
         self._generation_thread = QThread(self)
         self._generation_worker = UncheckedCameraFacePurgeWorker(request)
         self._generation_worker.moveToThread(self._generation_thread)
@@ -1688,6 +1947,7 @@ class GenerationWorkspace(QWidget):
             if not is_valid_qt_object(thread):
                 self._generation_thread = None
                 self._generation_worker = None
+                self._active_generation_request = None
                 self._close_video_source()
                 return
             if worker is not None and is_valid_qt_object(worker):
@@ -1736,6 +1996,7 @@ class GenerationWorkspace(QWidget):
             if self._generation_thread is thread:
                 self._generation_thread = None
                 self._generation_worker = None
+                self._active_generation_request = None
         self._close_video_source()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
@@ -1930,6 +2191,36 @@ class GenerationWorkspace(QWidget):
         self.clear_mask_button.clicked.connect(self.video_view.clear_mask)
         buttons_layout.addWidget(self.clear_mask_button)
 
+        self.symmetric_division_checkbox = QCheckBox("Symmetric division")
+        self.symmetric_division_checkbox.setObjectName(
+            "symmetric_division_checkbox"
+        )
+        self.symmetric_division_checkbox.setToolTip(
+            "Automatically keep the generated model half with fewer "
+            "triangles and pack its texture into one atlas half. This only "
+            "applies to a "
+            "brand-new Generate request."
+        )
+        self.symmetric_division_checkbox.toggled.connect(self._sync_controls)
+        buttons_layout.addWidget(self.symmetric_division_checkbox)
+
+        self.symmetric_division_orientation_combo = QComboBox()
+        self.symmetric_division_orientation_combo.setObjectName(
+            "symmetric_division_orientation_combo"
+        )
+        self.symmetric_division_orientation_combo.addItem(
+            "Vertical",
+            SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+        )
+        self.symmetric_division_orientation_combo.addItem(
+            "Horizontal",
+            SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL,
+        )
+        self.symmetric_division_orientation_combo.setToolTip(
+            "Choose the axis of the automatic midpoint division."
+        )
+        buttons_layout.addWidget(self.symmetric_division_orientation_combo)
+
         self.generate_button = QPushButton("Generate")
         self.generate_button.setMinimumHeight(38)
         self.generate_button.setToolTip(
@@ -2079,6 +2370,8 @@ class GenerationWorkspace(QWidget):
         result: object,
         generated_model: GeneratedModel,
     ) -> None:
+        generation_request = self._active_generation_request
+        self._active_generation_request = None
         if not isinstance(result, MeshyGenerationResult):
             self._handle_generation_failed("Meshy returned an invalid result.")
             return
@@ -2086,6 +2379,7 @@ class GenerationWorkspace(QWidget):
         object_name = result.name
         pipeline: dict[str, object] = {}
         persisted_asset_paths: list[str] = []
+        symmetry: ObjectSymmetricDivisionMetadata | None = None
         try:
             geometry_only = (
                 isinstance(result, StagedMeshyGenerationResult)
@@ -2096,6 +2390,30 @@ class GenerationWorkspace(QWidget):
                 if geometry_only
                 else generated_model.object_texture_variants
             )
+            symmetric_division_was_requested = bool(
+                generation_request is not None
+                and generation_request.symmetric_division_enabled
+            )
+            if symmetric_division_was_requested:
+                if geometry_only or not isinstance(
+                    texture_variants,
+                    ObjectTextureVariants,
+                ):
+                    raise ValueError(
+                        "Symmetric division requires a newly generated "
+                        "textured model."
+                    )
+                division_result = build_automatic_symmetric_object_variants(
+                    texture_variants.glb_by_resolution[
+                        TEXTURE_RESOLUTION_2048
+                    ],
+                    generation_request.symmetric_division_orientation,
+                )
+                symmetry = _validate_automatic_symmetric_division_result(
+                    division_result,
+                    generation_request.symmetric_division_orientation,
+                )
+                texture_variants = division_result.variants
             if texture_variants is None:
                 asset_path = self._persist_meshy_asset(
                     object_id,
@@ -2137,34 +2455,38 @@ class GenerationWorkspace(QWidget):
                     result.source_glb_bytes,
                 )
                 persisted_asset_paths.append(source_asset_path)
-                postprocessed_asset_path = self._persist_meshy_revision_asset(
-                    object_id,
-                    MESHY_REVISION_POSTPROCESSED,
-                    result.postprocessed_glb_bytes,
-                )
-                persisted_asset_paths.append(postprocessed_asset_path)
-                pipeline.update(
-                    {
-                        "mode": _staged_generation_mode(result),
-                        "geometry_task_id": result.geometry_task_id,
-                        "source_asset_path": source_asset_path,
-                        "postprocessed_asset_path": postprocessed_asset_path,
-                        "enabled_camera_ids": list(result.enabled_camera_ids),
-                        "unchecked_camera_ids": list(
-                            result.unchecked_camera_ids
-                        ),
-                        "camera_face_purge_applied": (
-                            result.camera_face_purge_applied
-                        ),
-                        "unused_face_removal_applied": (
-                            _staged_result_used_face_removal(result)
-                        ),
-                        "camera_uv_projection_applied": (
-                            result.camera_uv_projection_applied
-                        ),
-                        "geometry_only": result.geometry_only,
-                    }
-                )
+                staged_pipeline: dict[str, object] = {
+                    "mode": _staged_generation_mode(result),
+                    "geometry_task_id": result.geometry_task_id,
+                    "source_asset_path": source_asset_path,
+                    "enabled_camera_ids": list(result.enabled_camera_ids),
+                    "unchecked_camera_ids": list(
+                        result.unchecked_camera_ids
+                    ),
+                    "camera_face_purge_applied": (
+                        result.camera_face_purge_applied
+                    ),
+                    "unused_face_removal_applied": (
+                        _staged_result_used_face_removal(result)
+                    ),
+                    "camera_uv_projection_applied": (
+                        result.camera_uv_projection_applied
+                    ),
+                    "geometry_only": result.geometry_only,
+                }
+                if symmetry is None:
+                    postprocessed_asset_path = (
+                        self._persist_meshy_revision_asset(
+                            object_id,
+                            MESHY_REVISION_POSTPROCESSED,
+                            result.postprocessed_glb_bytes,
+                        )
+                    )
+                    persisted_asset_paths.append(postprocessed_asset_path)
+                    staged_pipeline["postprocessed_asset_path"] = (
+                        postprocessed_asset_path
+                    )
+                pipeline.update(staged_pipeline)
                 if _staged_result_used_face_purge(result):
                     pipeline.update(
                         {
@@ -2237,6 +2559,19 @@ class GenerationWorkspace(QWidget):
                             ),
                         }
                     )
+            if symmetry is not None:
+                assert isinstance(
+                    texture_variants,
+                    SymmetricSquarePairTextureVariants,
+                )
+                pipeline = _build_automatic_symmetric_generation_pipeline(
+                    pipeline,
+                    symmetry,
+                    variant_metadata,
+                    texture_variants.glb_by_resolution[
+                        TEXTURE_RESOLUTION_1024
+                    ],
+                )
         except Exception as error:
             self._remove_newly_persisted_assets(persisted_asset_paths)
             self._handle_generation_failed(
@@ -2245,7 +2580,11 @@ class GenerationWorkspace(QWidget):
             return
         record = GeneratedObjectRecord(
             object_id=object_id,
-            frame_index=self._data.current_frame_index,
+            frame_index=(
+                self._data.current_frame_index
+                if generation_request is None
+                else generation_request.frame_index
+            ),
             object_name=object_name,
             pipeline=pipeline,
             provider=GENERATION_BACKEND_MESHY,
@@ -2272,6 +2611,11 @@ class GenerationWorkspace(QWidget):
                 )
         else:
             self.status_label.setText(f"Generated: {object_name}")
+        if symmetry is not None:
+            self.status_label.setText(
+                f"{self.status_label.text()} Automatic symmetric division "
+                f"kept the {symmetry.kept_side} half."
+            )
         self._emit_data_changed()
         self.generation_completed.emit(record, generated_model)
 
@@ -2303,6 +2647,36 @@ class GenerationWorkspace(QWidget):
                 raise ValueError(
                     "The regenerated model has no selectable texture variants."
                 )
+            symmetry = _get_object_symmetric_division_metadata(record)
+            if symmetry is not None:
+                _validate_symmetric_texture_regeneration_uvs(outcome)
+                canonical_provider_glb = texture_variants.glb_by_resolution[
+                    TEXTURE_RESOLUTION_2048
+                ]
+                if _is_square_pair_symmetric_metadata(symmetry):
+                    texture_variants = (
+                        build_symmetric_square_pair_texture_variants(
+                            canonical_provider_glb,
+                            uvs_already_left_packed=True,
+                        )
+                    )
+                elif _is_legacy_pair_symmetric_metadata(symmetry):
+                    texture_variants = build_symmetric_pair_texture_variants(
+                        canonical_provider_glb,
+                        uvs_already_left_packed=True,
+                    )
+                elif _is_quarter_symmetric_metadata(symmetry):
+                    texture_variants = (
+                        build_symmetric_quarter_texture_variants(
+                            canonical_provider_glb,
+                            uvs_already_top_left_quarter=True,
+                        )
+                    )
+                else:
+                    texture_variants = build_symmetric_half_texture_variants(
+                        canonical_provider_glb,
+                        uvs_already_left_packed=True,
+                    )
             variant_metadata = self._persist_object_texture_variants(
                 record.object_id,
                 texture_variants,
@@ -2314,7 +2688,9 @@ class GenerationWorkspace(QWidget):
                 for path in variant.values()
             )
             selected_resolution = _get_selected_texture_resolution(record)
-            if selected_resolution not in TEXTURE_RESOLUTIONS:
+            if selected_resolution not in _selectable_texture_resolutions(
+                record
+            ):
                 selected_resolution = DEFAULT_TEXTURE_RESOLUTION
             selected_variant = variant_metadata[str(selected_resolution)]
             preview_model = import_generated_glb(
@@ -2343,13 +2719,17 @@ class GenerationWorkspace(QWidget):
             )
             return
 
-        record_index = self._data.generated_objects.index(record)
-        self._data.generated_objects[record_index] = replacement
-        self._generated_model_cache.pop(record.object_id, None)
-        selected_object_id = self._selected_object_id
-        if selected_object_id == record.object_id:
-            self._generated_model_cache[record.object_id] = preview_model
-        self._refresh_generated_objects_list(selected_object_id)
+        if not self._request_object_packing_change(
+            record,
+            replacement,
+            preview_model,
+        ):
+            self._remove_newly_persisted_assets(persisted_asset_paths)
+            self.status_label.setText(
+                "The generated texture was kept out because the Atlas "
+                "packing change could not be committed."
+            )
+            return
         cleanup_failed = self._delete_unreferenced_object_assets(record)
         status_suffix = (
             " Some superseded texture files could not be removed."
@@ -2383,9 +2763,28 @@ class GenerationWorkspace(QWidget):
 
         persisted_asset_paths: list[str] = []
         try:
-            texture_variants = build_object_texture_variants(
-                outcome.result.glb_bytes
-            )
+            symmetry = _get_object_symmetric_division_metadata(record)
+            if _is_square_pair_symmetric_metadata(symmetry):
+                texture_variants = (
+                    build_symmetric_square_pair_texture_variants(
+                        outcome.result.glb_bytes,
+                        uvs_already_left_packed=True,
+                    )
+                )
+            elif _is_legacy_pair_symmetric_metadata(symmetry):
+                texture_variants = build_symmetric_pair_texture_variants(
+                    outcome.result.glb_bytes,
+                    uvs_already_left_packed=True,
+                )
+            elif _is_quarter_symmetric_metadata(symmetry):
+                texture_variants = build_symmetric_quarter_texture_variants(
+                    outcome.result.glb_bytes,
+                    uvs_already_top_left_quarter=True,
+                )
+            else:
+                texture_variants = build_object_texture_variants(
+                    outcome.result.glb_bytes
+                )
             if texture_variants is None:
                 if isinstance(
                     record.pipeline.get(TEXTURE_VARIANTS_PIPELINE_KEY),
@@ -2398,6 +2797,7 @@ class GenerationWorkspace(QWidget):
                     f"purged-{uuid.uuid4().hex}.glb",
                     outcome.result.glb_bytes,
                 )
+                postprocessed_asset_path = asset_path
                 persisted_asset_paths.append(asset_path)
                 variant_metadata = None
                 preview_model = import_generated_glb(outcome.result.glb_bytes)
@@ -2413,10 +2813,15 @@ class GenerationWorkspace(QWidget):
                     for path in variant.values()
                 )
                 selected_resolution = _get_selected_texture_resolution(record)
-                if selected_resolution not in TEXTURE_RESOLUTIONS:
+                if selected_resolution not in _selectable_texture_resolutions(
+                    record
+                ):
                     selected_resolution = DEFAULT_TEXTURE_RESOLUTION
                 selected_variant = variant_metadata[str(selected_resolution)]
                 asset_path = selected_variant[TEXTURE_VARIANT_GLB_PATH_KEY]
+                postprocessed_asset_path = variant_metadata[
+                    str(_canonical_texture_resolution(record))
+                ][TEXTURE_VARIANT_GLB_PATH_KEY]
                 preview_model = import_generated_glb(
                     texture_variants.glb_by_resolution[selected_resolution]
                 )
@@ -2424,7 +2829,7 @@ class GenerationWorkspace(QWidget):
                 record,
                 outcome,
                 variant_metadata,
-                postprocessed_asset_path=asset_path,
+                postprocessed_asset_path=postprocessed_asset_path,
             )
             replacement = replace(
                 record,
@@ -2442,13 +2847,17 @@ class GenerationWorkspace(QWidget):
             )
             return
 
-        record_index = self._data.generated_objects.index(record)
-        self._data.generated_objects[record_index] = replacement
-        self._generated_model_cache.pop(record.object_id, None)
-        selected_object_id = self._selected_object_id
-        if selected_object_id == record.object_id:
-            self._generated_model_cache[record.object_id] = preview_model
-        self._refresh_generated_objects_list(selected_object_id)
+        if not self._request_object_packing_change(
+            record,
+            replacement,
+            preview_model,
+        ):
+            self._remove_newly_persisted_assets(persisted_asset_paths)
+            self.status_label.setText(
+                "The purged object was kept out because the Atlas packing "
+                "change could not be committed."
+            )
+            return
         cleanup_failed = self._delete_unreferenced_object_assets(record)
         status_suffix = (
             " Some superseded files could not be removed."
@@ -2465,6 +2874,7 @@ class GenerationWorkspace(QWidget):
 
     @Slot(str)
     def _handle_generation_failed(self, error_message: str) -> None:
+        self._active_generation_request = None
         self.status_label.setText(f"Generation failed: {error_message}")
         QMessageBox.warning(self, "Generation failed", error_message)
 
@@ -2493,6 +2903,7 @@ class GenerationWorkspace(QWidget):
             return
         self._generation_worker = None
         self._generation_thread = None
+        self._active_generation_request = None
         self._sync_controls()
 
     def _build_generation_request(
@@ -2511,6 +2922,14 @@ class GenerationWorkspace(QWidget):
             self.status_label.setText("The selected object mask is empty.")
             return None
         self._store_current_frame_strokes()
+        symmetric_division_enabled = (
+            not geometry_only
+            and self.symmetric_division_checkbox.isChecked()
+        )
+        symmetric_division_orientation = str(
+            self.symmetric_division_orientation_combo.currentData()
+            or SYMMETRIC_DIVISION_ORIENTATION_VERTICAL
+        )
         return GenerationRequest(
             frame_index=self._data.current_frame_index,
             selected_object_bgra=selected_crop,
@@ -2519,6 +2938,10 @@ class GenerationWorkspace(QWidget):
                 self.object_3d_panel.get_enabled_postprocess_camera_ids()
             ),
             geometry_only=geometry_only,
+            symmetric_division_enabled=symmetric_division_enabled,
+            symmetric_division_orientation=(
+                symmetric_division_orientation
+            ),
         )
 
     def _build_unchecked_camera_face_purge_request(
@@ -2546,7 +2969,7 @@ class GenerationWorkspace(QWidget):
         try:
             variant = self.get_texture_variant(
                 record.object_id,
-                TEXTURE_RESOLUTION_2048,
+                _canonical_texture_resolution(record),
             )
             source_path = (
                 self._resolve_texture_regeneration_source_path(record)
@@ -2587,9 +3010,16 @@ class GenerationWorkspace(QWidget):
                 self._settings.project_uvs_from_camera_views
                 and _record_uses_camera_projected_uvs(record)
             )
+            preserve_symmetric_uvs = (
+                _get_object_symmetric_division_metadata(record) is not None
+            )
+            preserve_original_uvs = (
+                preserve_camera_uvs or preserve_symmetric_uvs
+            )
             submitted_fingerprint = None
-            if preserve_camera_uvs:
+            if preserve_original_uvs:
                 submitted_fingerprint = build_camera_uv_fingerprint(model_glb)
+            if preserve_camera_uvs:
                 _validate_stored_camera_uv_fingerprint(
                     record,
                     submitted_fingerprint,
@@ -2600,8 +3030,9 @@ class GenerationWorkspace(QWidget):
                 reference_image_bgra=selected_crop,
                 model_glb=model_glb,
                 settings=self._settings,
-                enable_original_uv=preserve_camera_uvs,
+                enable_original_uv=preserve_original_uvs,
                 submitted_uv_fingerprint=submitted_fingerprint,
+                preserve_symmetric_uvs=preserve_symmetric_uvs,
             )
         except Exception as error:
             self.status_label.setText(
@@ -2681,21 +3112,24 @@ class GenerationWorkspace(QWidget):
 
     def _sync_controls(self) -> None:
         has_video = self._video_source is not None
-        is_generating = self._generation_thread is not None
+        controls_are_busy = self._generation_thread is not None
         has_mask = self.video_view.has_selection()
-        self.load_video_button.setEnabled(not is_generating)
-        self.seekbar.setEnabled(has_video and not is_generating)
-        mask_tool_is_available = has_video and not is_generating
+        selected_record = self._find_generated_object_record(
+            self._selected_object_id
+        )
+        self.load_video_button.setEnabled(not controls_are_busy)
+        self.seekbar.setEnabled(has_video and not controls_are_busy)
+        mask_tool_is_available = has_video and not controls_are_busy
         self.paint_mask_button.setEnabled(mask_tool_is_available)
         self.erase_mask_button.setEnabled(mask_tool_is_available)
         self.brush_size_spinbox.setEnabled(mask_tool_is_available)
         self.undo_mask_button.setEnabled(
             has_video
             and bool(self.video_view.get_strokes())
-            and not is_generating
+            and not controls_are_busy
         )
         self.clear_mask_button.setEnabled(
-            has_video and has_mask and not is_generating
+            has_video and has_mask and not controls_are_busy
         )
         required_key_is_available = bool(self._settings.meshy_api_key)
         enabled_camera_ids = (
@@ -2706,7 +3140,7 @@ class GenerationWorkspace(QWidget):
             not postprocessing_is_enabled or bool(enabled_camera_ids)
         )
         self.object_3d_panel.set_postprocess_camera_controls_enabled(
-            not is_generating
+            not controls_are_busy
         )
         self.result_view.set_enabled_unused_face_camera_ids(
             enabled_camera_ids
@@ -2716,57 +3150,55 @@ class GenerationWorkspace(QWidget):
         )
         self.meshy_target_polycount_control.setVisible(True)
         self.meshy_target_polycount_spinbox.setEnabled(
-            not is_generating
+            not controls_are_busy
         )
-        self.ambient_light_slider.setEnabled(not is_generating)
-        self.textures_checkbox.setEnabled(not is_generating)
-        self.wireframe_checkbox.setEnabled(not is_generating)
+        self.ambient_light_slider.setEnabled(not controls_are_busy)
+        self.textures_checkbox.setEnabled(not controls_are_busy)
+        self.wireframe_checkbox.setEnabled(not controls_are_busy)
+        self.generated_objects_list.setEnabled(not controls_are_busy)
+        self.texture_view.setEnabled(not controls_are_busy)
         self.delete_generated_object_button.setEnabled(
-            not is_generating
-            and self._find_generated_object_record(
-                self._selected_object_id
-            )
-            is not None
+            not controls_are_busy
+            and selected_record is not None
         )
         self.regenerate_texture_button.setEnabled(
-            self._can_regenerate_object_texture(
-                self._find_generated_object_record(self._selected_object_id)
-            )
+            self._can_regenerate_object_texture(selected_record)
         )
         self.undo_object_change_button.setEnabled(
-            not is_generating
+            not controls_are_busy
             and bool(
                 _get_object_operation_undo_stack(
-                    self._find_generated_object_record(
-                        self._selected_object_id
-                    )
+                    selected_record
                 )
             )
         )
         self.purge_faces_button.setEnabled(
-            not is_generating
+            not controls_are_busy
             and len(enabled_camera_ids) < len(ALL_CAMERA_IDS)
-            and self._find_generated_object_record(
-                self._selected_object_id
-            )
-            is not None
+            and selected_record is not None
+        )
+        self.symmetric_division_checkbox.setEnabled(not controls_are_busy)
+        self.symmetric_division_orientation_combo.setEnabled(
+            not controls_are_busy
+            and self.symmetric_division_checkbox.isChecked()
         )
         self.generate_button.setEnabled(
             has_video
             and has_mask
             and required_key_is_available
             and camera_selection_is_valid
-            and not is_generating
+            and not controls_are_busy
         )
         self.generate_geometry_button.setEnabled(
             has_video
             and has_mask
             and required_key_is_available
             and camera_selection_is_valid
-            and not is_generating
+            and not self.symmetric_division_checkbox.isChecked()
+            and not controls_are_busy
         )
         self.video_view.set_interaction_enabled(
-            has_video and not is_generating
+            has_video and not controls_are_busy
         )
 
     def _can_regenerate_object_texture(
@@ -2906,6 +3338,11 @@ class GenerationWorkspace(QWidget):
             return
         self._generated_model = generated_model
         self.result_view.set_model(generated_model)
+        symmetry = _get_object_symmetric_division_metadata(record)
+        self.result_view.set_symmetric_division_preview(
+            None if symmetry is None else symmetry.orientation,
+            None if symmetry is None else symmetry.plane_coordinate,
+        )
         self._sync_model_statistics(generated_model)
         self.texture_view.set_uv_overlay_triangles(
             _collect_model_uv_triangles(generated_model)
@@ -2923,11 +3360,16 @@ class GenerationWorkspace(QWidget):
         raw_variants = record.pipeline.get(TEXTURE_VARIANTS_PIPELINE_KEY)
         if not isinstance(raw_variants, dict):
             return record
-        if self.get_active_texture_variant(record.object_id) is not None:
+        selectable_resolutions = _selectable_texture_resolutions(record)
+        selected_resolution = _get_selected_texture_resolution(record)
+        if (
+            selected_resolution in selectable_resolutions
+            and self.get_active_texture_variant(record.object_id) is not None
+        ):
             return record
-        missing_resolution = _get_selected_texture_resolution(record)
+        missing_resolution = selected_resolution
         fallback_resolutions = sorted(
-            TEXTURE_RESOLUTIONS,
+            selectable_resolutions,
             key=lambda resolution: (
                 resolution != DEFAULT_TEXTURE_RESOLUTION,
                 abs(resolution - missing_resolution),
@@ -3010,7 +3452,114 @@ class GenerationWorkspace(QWidget):
             record.object_id,
             raw_entry.atlas_id,
         )
-        self.select_object_texture_resolution(record.object_id, resolution)
+        if _get_selected_texture_resolution(record) == resolution:
+            return
+        if self._request_global_texture_resolution_change(
+            record.object_id,
+            resolution,
+        ):
+            return
+        self.status_label.setText(
+            "The selected object texture resolution could not be applied "
+            "globally; the previous resolution was kept."
+        )
+        self._refresh_object_texture_atlases(record.object_id)
+
+    def _request_global_texture_resolution_change(
+        self,
+        object_id: str,
+        resolution: int,
+    ) -> bool:
+        """Commit through the host transaction, or locally when standalone."""
+
+        handler = self._texture_resolution_change_handler
+        if handler is None:
+            return self.select_object_texture_resolution(
+                object_id,
+                resolution,
+            )
+        try:
+            return bool(handler(object_id, resolution))
+        except Exception:
+            return False
+
+    def _request_object_packing_change(
+        self,
+        record: GeneratedObjectRecord,
+        replacement: GeneratedObjectRecord,
+        preview_model: GeneratedModel,
+    ) -> bool:
+        """Commit one prepared packing transition with host rollback."""
+
+        try:
+            record_index = self._data.generated_objects.index(record)
+        except ValueError:
+            return False
+        selected_object_id = self._selected_object_id
+        cached_model_was_present = record.object_id in self._generated_model_cache
+        cached_model = self._generated_model_cache.get(record.object_id)
+        is_committed = False
+
+        def restore_record() -> bool:
+            nonlocal is_committed
+            if not is_committed:
+                return True
+            self._data.generated_objects[record_index] = record
+            self._generated_model_cache.pop(record.object_id, None)
+            if cached_model_was_present and cached_model is not None:
+                self._generated_model_cache[record.object_id] = cached_model
+            is_committed = False
+            try:
+                self._refresh_generated_objects_list(selected_object_id)
+            except Exception:
+                return False
+            return True
+
+        def commit_record() -> bool:
+            nonlocal is_committed
+            if is_committed:
+                return True
+            current_record = self._find_generated_object_record(
+                record.object_id
+            )
+            if current_record is not record:
+                return False
+            self._data.generated_objects[record_index] = replacement
+            self._generated_model_cache.pop(record.object_id, None)
+            if selected_object_id == record.object_id:
+                self._generated_model_cache[record.object_id] = preview_model
+            is_committed = True
+            try:
+                self._refresh_generated_objects_list(selected_object_id)
+            except Exception:
+                restore_record()
+                return False
+            return True
+
+        handler = self._object_packing_change_handler
+        packing_change_requires_host = (
+            _get_object_symmetric_division_metadata(record) is not None
+            or _get_object_symmetric_division_metadata(replacement) is not None
+        )
+        if handler is None or not packing_change_requires_host:
+            return commit_record()
+        try:
+            accepted = bool(
+                handler(
+                    record,
+                    replacement,
+                    preview_model,
+                    commit_record,
+                )
+            )
+            if accepted and not is_committed:
+                accepted = commit_record()
+        except Exception:
+            accepted = False
+        if accepted and is_committed:
+            return True
+        restore_record()
+        return False
 
     def _load_generated_object_model(
         self,
@@ -3049,7 +3598,12 @@ class GenerationWorkspace(QWidget):
     def _persist_object_texture_variants(
         self,
         object_id: str,
-        variants: ObjectTextureVariants,
+        variants: (
+            ObjectTextureVariants
+            | SymmetricQuarterTextureVariants
+            | SymmetricPairTextureVariants
+            | SymmetricSquarePairTextureVariants
+        ),
         *,
         asset_stem: str | None = None,
     ) -> dict[str, dict[str, str]]:
@@ -3066,8 +3620,18 @@ class GenerationWorkspace(QWidget):
             raise ValueError("Texture variant asset stem is unsafe.")
         metadata: dict[str, dict[str, str]] = {}
         created_paths: list[str] = []
+        resolutions = (
+            variants.selectable_resolutions
+            if isinstance(
+                variants,
+                SymmetricQuarterTextureVariants
+                | SymmetricPairTextureVariants
+                | SymmetricSquarePairTextureVariants,
+            )
+            else TEXTURE_RESOLUTIONS
+        )
         try:
-            for resolution in TEXTURE_RESOLUTIONS:
+            for resolution in resolutions:
                 glb_path = self._persist_meshy_named_asset(
                     f"{normalized_asset_stem}.texture-{resolution}.glb",
                     variants.glb_by_resolution[resolution],
@@ -3311,6 +3875,302 @@ def _format_fallback_face_count(count: int, description: str) -> str:
     return f"{count} {description} {face_label}"
 
 
+# ### Symmetric-division helpers ###
+def _validate_symmetric_texture_regeneration_uvs(
+    outcome: TextureRegenerationOutcome,
+) -> None:
+    """Require provider proof that rigid left-half UVs were preserved."""
+
+    request = outcome.request
+    submitted_fingerprint = request.submitted_uv_fingerprint
+    final_fingerprint = outcome.final_uv_fingerprint
+    if (
+        not request.enable_original_uv
+        or not request.preserve_symmetric_uvs
+        or submitted_fingerprint is None
+    ):
+        raise CameraUvIntegrityError(
+            "Symmetric texture generation must preserve the existing packed "
+            "UV layout. The existing texture was kept."
+        )
+    if final_fingerprint is None:
+        raise CameraUvIntegrityError(
+            "The symmetric texture result has no verified UV fingerprint. "
+            "The existing texture was kept."
+        )
+    _validate_symmetric_uv_retexture_integrity(
+        submitted_fingerprint,
+        final_fingerprint,
+    )
+
+
+def _validate_symmetric_uv_retexture_integrity(
+    submitted: CameraUvFingerprint,
+    returned: CameraUvFingerprint,
+) -> None:
+    """Reject provider changes without camera-specific remediation text."""
+
+    if submitted.version != returned.version:
+        raise CameraUvIntegrityError(
+            "The preserved UV integrity versions do not match. The existing "
+            "texture was kept; retry texture generation."
+        )
+    if submitted.face_count != returned.face_count:
+        raise CameraUvIntegrityError(
+            "Meshy Retexture changed the symmetric object's face count. The "
+            "existing texture was kept; retry texture generation."
+        )
+    if submitted.sha256 != returned.sha256:
+        raise CameraUvIntegrityError(
+            "Meshy Retexture changed the symmetric object's packed UV layout. "
+            "The existing texture was kept; retry texture generation."
+        )
+
+
+def _parse_object_symmetric_division_metadata(
+    raw_metadata: object,
+) -> ObjectSymmetricDivisionMetadata | None:
+    """Reject partial or malformed persisted symmetry provenance."""
+
+    if not isinstance(raw_metadata, Mapping):
+        return None
+    raw_version = raw_metadata.get("version")
+    raw_plane_coordinate = raw_metadata.get("plane_coordinate")
+    if (
+        isinstance(raw_version, bool)
+        or not isinstance(raw_version, int)
+        or isinstance(raw_plane_coordinate, bool)
+        or not isinstance(raw_plane_coordinate, (int, float))
+    ):
+        return None
+    orientation = str(raw_metadata.get("orientation", ""))
+    automatic_fields: dict[str, object] = {}
+    if raw_version in {
+        SYMMETRIC_QUARTER_METADATA_VERSION,
+        LEGACY_SYMMETRIC_PAIR_METADATA_VERSION,
+        AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
+    }:
+        raw_counts = raw_metadata.get("triangle_count_by_side")
+        side_order = SYMMETRIC_DIVISION_SIDE_ORDER_BY_ORIENTATION.get(
+            orientation
+        )
+        if (
+            not isinstance(raw_counts, Mapping)
+            or side_order is None
+            or set(raw_counts) != set(side_order)
+        ):
+            return None
+        counts: list[tuple[str, int]] = []
+        for side in side_order:
+            raw_count = raw_counts.get(side)
+            if (
+                isinstance(raw_count, bool)
+                or not isinstance(raw_count, int)
+                or raw_count < 0
+            ):
+                return None
+            counts.append((side, raw_count))
+        raw_tie = raw_metadata.get("tie_broken_randomly")
+        if not isinstance(raw_tie, bool):
+            return None
+        automatic_fields = {
+            "packing_mode": str(raw_metadata.get("packing_mode", "")),
+            "selection_mode": str(
+                raw_metadata.get("selection_mode", "")
+            ),
+            "triangle_count_by_side": tuple(counts),
+            "tie_broken_randomly": raw_tie,
+        }
+        if raw_version == SYMMETRIC_QUARTER_METADATA_VERSION:
+            automatic_fields["texture_content_quadrant"] = str(
+                raw_metadata.get("texture_content_quadrant", "")
+            )
+    try:
+        return ObjectSymmetricDivisionMetadata(
+            version=raw_version,
+            orientation=orientation,
+            kept_side=str(raw_metadata.get("kept_side", "")),
+            plane_coordinate=float(raw_plane_coordinate),
+            texture_content_half=(
+                str(raw_metadata.get("texture_content_half", ""))
+                if raw_version
+                in {
+                    SYMMETRIC_DIVISION_METADATA_VERSION,
+                    LEGACY_SYMMETRIC_PAIR_METADATA_VERSION,
+                    AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
+                }
+                else None
+            ),
+            **automatic_fields,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _get_object_symmetric_division_metadata(
+    record: GeneratedObjectRecord | None,
+) -> ObjectSymmetricDivisionMetadata | None:
+    if record is None:
+        return None
+    return _parse_object_symmetric_division_metadata(
+        record.pipeline.get(SYMMETRIC_DIVISION_PIPELINE_KEY)
+    )
+
+
+def _is_quarter_symmetric_metadata(
+    metadata: ObjectSymmetricDivisionMetadata | None,
+) -> bool:
+    """Return whether metadata uses the compatible v2 quarter layout."""
+
+    return (
+        metadata is not None
+        and metadata.version
+        == SYMMETRIC_QUARTER_METADATA_VERSION
+    )
+
+
+def _is_legacy_pair_symmetric_metadata(
+    metadata: ObjectSymmetricDivisionMetadata | None,
+) -> bool:
+    """Return whether metadata uses the legacy double-sized pair layout."""
+
+    return (
+        metadata is not None
+        and metadata.version
+        == LEGACY_SYMMETRIC_PAIR_METADATA_VERSION
+    )
+
+
+def _is_square_pair_symmetric_metadata(
+    metadata: ObjectSymmetricDivisionMetadata | None,
+) -> bool:
+    """Return whether metadata uses the current square pair layout."""
+
+    return (
+        metadata is not None
+        and metadata.version
+        == AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION
+    )
+
+
+def _is_pair_symmetric_metadata(
+    metadata: ObjectSymmetricDivisionMetadata | None,
+) -> bool:
+    """Return whether metadata uses either two-object pair layout."""
+
+    return _is_legacy_pair_symmetric_metadata(
+        metadata
+    ) or _is_square_pair_symmetric_metadata(metadata)
+
+
+def _uses_compact_symmetric_resolutions(
+    metadata: ObjectSymmetricDivisionMetadata | None,
+) -> bool:
+    """Return whether a saved layout exposes logical 512/1024 choices."""
+
+    return _is_quarter_symmetric_metadata(
+        metadata
+    ) or _is_pair_symmetric_metadata(metadata)
+
+
+def _selectable_texture_resolutions(
+    record: GeneratedObjectRecord,
+) -> tuple[int, ...]:
+    """Expose only logical content resolutions for automatic symmetry."""
+
+    symmetry = _get_object_symmetric_division_metadata(record)
+    if _uses_compact_symmetric_resolutions(symmetry):
+        return tuple(SYMMETRIC_TEXTURE_RESOLUTIONS)
+    return tuple(TEXTURE_RESOLUTIONS)
+
+
+def _canonical_texture_resolution(record: GeneratedObjectRecord) -> int:
+    """Return the local operation source key for one persisted record."""
+
+    symmetry = _get_object_symmetric_division_metadata(record)
+    if _uses_compact_symmetric_resolutions(symmetry):
+        return TEXTURE_RESOLUTION_1024
+    return TEXTURE_RESOLUTION_2048
+
+
+def _validate_automatic_symmetric_division_result(
+    raw_result: object,
+    requested_orientation: str,
+) -> ObjectSymmetricDivisionMetadata:
+    """Validate one automatic core result before persisting any asset."""
+
+    if not isinstance(raw_result, SymmetricDivisionResult):
+        raise ValueError("The symmetric-division transformer returned no result.")
+    if not isinstance(
+        raw_result.variants,
+        SymmetricSquarePairTextureVariants,
+    ):
+        raise ValueError("The symmetric-division texture variants are invalid.")
+    core_metadata = raw_result.metadata
+    if (
+        not isinstance(core_metadata, SymmetricDivisionMetadata)
+        or core_metadata.version
+        != AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION
+    ):
+        raise ValueError("The symmetric-division provenance is invalid.")
+    metadata = _parse_object_symmetric_division_metadata(
+        core_metadata.to_pipeline_dict()
+    )
+    if metadata is None:
+        raise ValueError("The symmetric-division provenance is malformed.")
+    if (
+        metadata.orientation != requested_orientation
+        or raw_result.orientation != metadata.orientation
+        or raw_result.kept_side != metadata.kept_side
+        or raw_result.plane_coordinate != metadata.plane_coordinate
+    ):
+        raise ValueError(
+            "The symmetric-division result does not match the request."
+        )
+    return metadata
+
+
+def _build_automatic_symmetric_generation_pipeline(
+    raw_pipeline: Mapping[str, object],
+    metadata: ObjectSymmetricDivisionMetadata,
+    variant_metadata: dict[str, dict[str, str]],
+    canonical_glb: bytes,
+) -> dict[str, object]:
+    """Make pair variants the final persisted new-generation revision."""
+
+    canonical_variant = variant_metadata[str(TEXTURE_RESOLUTION_1024)]
+    pipeline = dict(raw_pipeline)
+    pipeline.pop(TEXTURE_INPAINT_STROKES_PIPELINE_KEY, None)
+    pipeline.update(
+        {
+            TEXTURE_VARIANTS_PIPELINE_KEY: variant_metadata,
+            SELECTED_TEXTURE_RESOLUTION_PIPELINE_KEY: (
+                DEFAULT_TEXTURE_RESOLUTION
+            ),
+            "postprocessed_asset_path": canonical_variant[
+                TEXTURE_VARIANT_GLB_PATH_KEY
+            ],
+            SYMMETRIC_DIVISION_PIPELINE_KEY: metadata.to_pipeline_dict(),
+        }
+    )
+    if (
+        pipeline.get("camera_uv_projection_applied")
+        or "camera_uv_projection" in str(pipeline.get("mode", ""))
+    ):
+        fingerprint = build_camera_uv_fingerprint(canonical_glb)
+        pipeline.update(
+            {
+                "camera_uv_fingerprint_version": (
+                    CAMERA_UV_FINGERPRINT_VERSION
+                ),
+                "camera_uv_submitted_fingerprint": fingerprint.sha256,
+                "camera_uv_final_fingerprint": fingerprint.sha256,
+                "camera_uv_integrity_face_count": fingerprint.face_count,
+            }
+        )
+    return pipeline
+
+
 # ### Object-operation undo helpers ###
 def _get_object_operation_undo_stack(
     record: GeneratedObjectRecord | None,
@@ -3427,7 +4287,7 @@ def _build_unchecked_camera_face_purge_pipeline(
     pipeline: dict[str, object] = dict(record.pipeline)
     pipeline.pop(TEXTURE_INPAINT_STROKES_PIPELINE_KEY, None)
     selected_resolution = _get_selected_texture_resolution(record)
-    if selected_resolution not in TEXTURE_RESOLUTIONS:
+    if selected_resolution not in _selectable_texture_resolutions(record):
         selected_resolution = DEFAULT_TEXTURE_RESOLUTION
     raw_count = pipeline.get("manual_face_purge_count", 0)
     try:
@@ -3451,7 +4311,7 @@ def _build_unchecked_camera_face_purge_pipeline(
         if variant_metadata is None:
             raise ValueError("A purged post-processed model path is required.")
         postprocessed_asset_path = variant_metadata[
-            str(TEXTURE_RESOLUTION_2048)
+            str(_canonical_texture_resolution(record))
         ][TEXTURE_VARIANT_GLB_PATH_KEY]
     pipeline.update(
         {
@@ -3561,7 +4421,7 @@ def _build_regenerated_texture_pipeline(
     pipeline: dict[str, object] = dict(record.pipeline)
     pipeline.pop(TEXTURE_INPAINT_STROKES_PIPELINE_KEY, None)
     selected_resolution = _get_selected_texture_resolution(record)
-    if selected_resolution not in TEXTURE_RESOLUTIONS:
+    if selected_resolution not in _selectable_texture_resolutions(record):
         selected_resolution = DEFAULT_TEXTURE_RESOLUTION
     raw_count = pipeline.get("texture_regeneration_count", 0)
     try:
@@ -3581,6 +4441,7 @@ def _build_regenerated_texture_pipeline(
         "reference_frame_index": request.reference_frame_index,
         "reference_image_sha256": hashlib.sha256(reference_png).hexdigest(),
         "enable_original_uv": request.enable_original_uv,
+        "preserve_symmetric_uvs": request.preserve_symmetric_uvs,
     }
     raw_history = pipeline.get("texture_regeneration_history")
     history = (
@@ -3605,6 +4466,9 @@ def _build_regenerated_texture_pipeline(
             ),
             "last_texture_regeneration_enable_original_uv": (
                 request.enable_original_uv
+            ),
+            "last_texture_regeneration_preserve_symmetric_uvs": (
+                request.preserve_symmetric_uvs
             ),
             "texture_regeneration_history": history[-25:],
         }
@@ -3937,7 +4801,7 @@ def _build_texture_resolution_entries(
 ) -> list[TextureAtlasEntry]:
     entries: list[TextureAtlasEntry] = []
     asset_root = asset_directory.resolve()
-    for resolution in TEXTURE_RESOLUTIONS:
+    for resolution in _selectable_texture_resolutions(record):
         variant = _get_texture_variant_metadata(record, resolution)
         if variant is None:
             continue

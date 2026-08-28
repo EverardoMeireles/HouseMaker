@@ -68,6 +68,10 @@ WINDOW_PREVIEW_OFFSET_METERS = 0.006
 WINDOW_SELECTION_COLOR = (0.20, 0.72, 1.0, 1.0)
 WINDOW_VALID_PREVIEW_COLOR = (0.20, 0.86, 0.38, 0.34)
 WINDOW_INVALID_PREVIEW_COLOR = (1.0, 0.24, 0.20, 0.34)
+SYMMETRIC_PREVIEW_MIN_OPACITY = 0.12
+SYMMETRIC_PREVIEW_MAX_OPACITY = 0.72
+SYMMETRIC_PREVIEW_FADE_PERIOD_MILLISECONDS = 2_000
+SYMMETRIC_PREVIEW_UPDATE_INTERVAL_MILLISECONDS = 50
 
 
 # ### Shader source ###
@@ -120,6 +124,7 @@ TEXTURED_AMBIENT_FRAGMENT_SHADER = """
     uniform sampler2D u_edit_mask;
     uniform float u_edit_mask_enabled;
     uniform float u_ambient_light;
+    uniform float u_opacity;
     varying vec3 v_normal;
     varying vec2 v_texcoord;
     void main() {
@@ -133,7 +138,10 @@ TEXTURED_AMBIENT_FRAGMENT_SHADER = """
         );
         float diffuse = max(dot(v_normal, normalize(vec3(1.0, -1.0, -1.0))), 0.0);
         float illumination = min(1.0, u_ambient_light + diffuse * 0.65);
-        gl_FragColor = vec4(base_color.rgb * illumination, base_color.a);
+        gl_FragColor = vec4(
+            base_color.rgb * illumination,
+            base_color.a * u_opacity
+        );
     }
 """
 
@@ -748,9 +756,11 @@ class TexturedMeshItem(GLGraphicsItem):
         *,
         texture_repeat: bool = False,
         double_sided: bool = True,
+        opacity: float = 1.0,
+        translucent: bool = False,
     ) -> None:
         super().__init__()
-        self.setGLOptions("opaque")
+        self.setGLOptions("translucent" if translucent else "opaque")
         self._vertices = np.ascontiguousarray(
             texture_mesh_data.vertices,
             dtype=np.float32,
@@ -774,6 +784,7 @@ class TexturedMeshItem(GLGraphicsItem):
         )
         self._texture_repeat = bool(texture_repeat)
         self._double_sided = bool(double_sided)
+        self._opacity = _normalize_preview_opacity(opacity)
         self._position_buffer: int | None = None
         self._normal_buffer: int | None = None
         self._texture_coordinate_buffer: int | None = None
@@ -787,6 +798,15 @@ class TexturedMeshItem(GLGraphicsItem):
         self._ambient_light_intensity = _normalize_ambient_light_intensity(
             intensity
         )
+        self.update()
+
+    def set_opacity(self, opacity: float) -> None:
+        """Update a preview item's opacity without rebuilding its buffers."""
+
+        normalized = _normalize_preview_opacity(opacity)
+        if normalized == self._opacity:
+            return
+        self._opacity = normalized
         self.update()
 
     def set_edit_mask(self, mask: np.ndarray | None) -> None:
@@ -854,6 +874,11 @@ class TexturedMeshItem(GLGraphicsItem):
             self._shader_program,
             "u_ambient_light",
             self._ambient_light_intensity,
+        )
+        _set_float_uniform(
+            self._shader_program,
+            "u_opacity",
+            self._opacity,
         )
         _set_integer_uniform(self._shader_program, "u_texture", 0)
         _set_integer_uniform(self._shader_program, "u_edit_mask", 1)
@@ -1008,6 +1033,8 @@ class GlbViewerWidget(QWidget):
         self.grid_item: gl.GLGridItem | None = None
         self.mesh_item: gl.GLMeshItem | None = None
         self.textured_mesh_item: TexturedMeshItem | None = None
+        self.symmetric_preview_textured_mesh_item: TexturedMeshItem | None = None
+        self.symmetric_preview_mesh_item: gl.GLMeshItem | None = None
         self.textured_surface_items: list[TexturedMeshItem] = []
         self.textured_wall_items: list[gl.GLImageItem] = []
         self.wall_by_item_id: dict[int, PreviewTexturedWall] = {}
@@ -1039,6 +1066,20 @@ class GlbViewerWidget(QWidget):
         self._unused_face_camera_indicators_visible = False
         self._enabled_unused_face_camera_ids = ALL_CAMERA_IDS
         self._texture_edit_mask: np.ndarray | None = None
+        self._symmetric_preview_orientation: str | None = None
+        self._symmetric_preview_plane_coordinate: float | None = None
+        self._symmetric_preview_phase = 0.0
+        self._symmetric_preview_vertices: np.ndarray | None = None
+        self._symmetric_preview_faces: np.ndarray | None = None
+        self._symmetric_preview_face_colors: np.ndarray | None = None
+        self._last_set_model_preserved_camera = False
+        self._symmetric_preview_timer = QTimer(self)
+        self._symmetric_preview_timer.setInterval(
+            SYMMETRIC_PREVIEW_UPDATE_INTERVAL_MILLISECONDS
+        )
+        self._symmetric_preview_timer.timeout.connect(
+            self._advance_symmetric_preview_fade
+        )
         self._ambient_shader = _build_ambient_shader(
             self._ambient_light_intensity
         )
@@ -1101,6 +1142,18 @@ class GlbViewerWidget(QWidget):
             self.first_person_crosshair_label.setVisible
         )
         layout.addWidget(self.first_person_crosshair_label)
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        if (
+            self.symmetric_preview_textured_mesh_item is not None
+            or self.symmetric_preview_mesh_item is not None
+        ):
+            self._symmetric_preview_timer.start()
+
+    def hideEvent(self, event) -> None:  # type: ignore[override]
+        self._symmetric_preview_timer.stop()
+        super().hideEvent(event)
 
     def _build_window_tools_panel(self) -> QWidget:
         """Build the Canvas-only controls that travel with the 3D viewer."""
@@ -1616,6 +1669,8 @@ class GlbViewerWidget(QWidget):
     def set_model(self, model: GeneratedModel, preserve_camera: bool = False) -> None:
         if self._window_editing_enabled:
             self.cancel_window_placement(status_message=None)
+        self._clear_symmetric_preview()
+        self._last_set_model_preserved_camera = bool(preserve_camera)
         camera_state = self._capture_camera_state() if preserve_camera else None
         self._texture_edit_mask = None
         self.model = model
@@ -1630,10 +1685,213 @@ class GlbViewerWidget(QWidget):
         if self._window_editing_enabled:
             self.cancel_window_placement(status_message=None)
         self._texture_edit_mask = None
+        self._clear_symmetric_preview()
+        self._last_set_model_preserved_camera = False
         self.model = None
         self._populate_scene()
         if self._window_editing_enabled:
             self._sync_window_tools_controls()
+
+    # ### Symmetric divided-object preview API ###
+    def set_symmetric_division_preview(
+        self,
+        orientation: str | None,
+        plane_coordinate: float | None = None,
+    ) -> None:
+        """Configure a viewer-only mirror without changing export geometry."""
+
+        if orientation is None:
+            if plane_coordinate is not None:
+                raise ValueError("A cleared symmetric preview cannot keep a plane.")
+            self._clear_symmetric_preview()
+            return
+        normalized_orientation = str(orientation).strip().lower()
+        if normalized_orientation not in {"vertical", "horizontal"}:
+            raise ValueError(
+                "Symmetric preview orientation must be vertical or horizontal."
+            )
+        if plane_coordinate is None or not math.isfinite(float(plane_coordinate)):
+            raise ValueError("Symmetric preview plane must be finite.")
+        normalized_plane = float(plane_coordinate)
+        if (
+            self._symmetric_preview_orientation == normalized_orientation
+            and self._symmetric_preview_plane_coordinate == normalized_plane
+            and (
+                self.symmetric_preview_textured_mesh_item is not None
+                or self.symmetric_preview_mesh_item is not None
+            )
+        ):
+            return
+        self._remove_symmetric_preview_items()
+        self._symmetric_preview_orientation = normalized_orientation
+        self._symmetric_preview_plane_coordinate = normalized_plane
+        self._build_symmetric_preview_items()
+        self.view.update()
+
+    def _build_symmetric_preview_items(self) -> None:
+        """Build transient reflected draw items from the retained preview mesh."""
+
+        if (
+            self.model is None
+            or self._symmetric_preview_orientation is None
+            or self._symmetric_preview_plane_coordinate is None
+        ):
+            return
+        display_mesh = (
+            self.model.preview_untextured_mesh
+            if self.model.preview_textured_surfaces
+            and self.model.preview_untextured_mesh is not None
+            else self.model.mesh
+        )
+        vertices = np.asarray(display_mesh.vertices, dtype=np.float32)
+        faces = np.asarray(display_mesh.faces, dtype=np.int32)
+        if (
+            vertices.ndim != 2
+            or vertices.shape[1] != 3
+            or faces.ndim != 2
+            or faces.shape[1] != 3
+            or not len(vertices)
+            or not len(faces)
+        ):
+            return
+        mirrored_vertices = _mirror_preview_vertices(
+            vertices,
+            self._symmetric_preview_orientation,
+            self._symmetric_preview_plane_coordinate,
+        )
+        mirrored_faces = np.ascontiguousarray(faces[:, (0, 2, 1)])
+        opacity = SYMMETRIC_PREVIEW_MIN_OPACITY
+        texture_mesh_data = _build_texture_mesh_data(display_mesh)
+        if texture_mesh_data is not None:
+            mirrored_texture_data = _mirror_texture_mesh_data(
+                texture_mesh_data,
+                self._symmetric_preview_orientation,
+                self._symmetric_preview_plane_coordinate,
+            )
+            self.symmetric_preview_textured_mesh_item = TexturedMeshItem(
+                mirrored_texture_data,
+                self._ambient_light_intensity,
+                opacity=opacity,
+                translucent=True,
+            )
+            self.view.addItem(self.symmetric_preview_textured_mesh_item)
+        face_colors = (
+            np.tile(FACE_COLOR, (faces.shape[0], 1))
+            if texture_mesh_data is not None
+            else _get_mesh_face_colors(display_mesh, faces)
+        )
+        face_colors = np.ascontiguousarray(face_colors, dtype=float)
+        faded_colors = face_colors.copy()
+        faded_colors[:, 3] *= opacity
+        self._symmetric_preview_vertices = mirrored_vertices
+        self._symmetric_preview_faces = mirrored_faces
+        self._symmetric_preview_face_colors = face_colors
+        self.symmetric_preview_mesh_item = _WireframeOverlayMeshItem(
+            vertexes=mirrored_vertices,
+            faces=mirrored_faces,
+            faceColors=faded_colors,
+            smooth=False,
+            drawFaces=True,
+            drawEdges=True,
+            edgeColor=(*EDGE_COLOR[:3], opacity),
+            shader=self._ambient_shader,
+        )
+        self.symmetric_preview_mesh_item.setGLOptions("translucent")
+        self.view.addItem(self.symmetric_preview_mesh_item)
+        self._symmetric_preview_phase = -math.pi / 2.0
+        self._apply_render_display_options()
+        if not self._last_set_model_preserved_camera:
+            self._frame_symmetric_preview(vertices, mirrored_vertices)
+        if self.isVisible():
+            self._symmetric_preview_timer.start()
+
+    def _advance_symmetric_preview_fade(self) -> None:
+        """Advance the translucent mirror through one smooth pulse sample."""
+
+        if (
+            self.symmetric_preview_textured_mesh_item is None
+            and self.symmetric_preview_mesh_item is None
+        ):
+            self._symmetric_preview_timer.stop()
+            return
+        self._symmetric_preview_phase = (
+            self._symmetric_preview_phase
+            + 2.0
+            * math.pi
+            * SYMMETRIC_PREVIEW_UPDATE_INTERVAL_MILLISECONDS
+            / SYMMETRIC_PREVIEW_FADE_PERIOD_MILLISECONDS
+        ) % (2.0 * math.pi)
+        blend = (math.sin(self._symmetric_preview_phase) + 1.0) / 2.0
+        opacity = SYMMETRIC_PREVIEW_MIN_OPACITY + blend * (
+            SYMMETRIC_PREVIEW_MAX_OPACITY - SYMMETRIC_PREVIEW_MIN_OPACITY
+        )
+        if self.symmetric_preview_textured_mesh_item is not None:
+            self.symmetric_preview_textured_mesh_item.set_opacity(opacity)
+        if (
+            self.symmetric_preview_mesh_item is not None
+            and self._symmetric_preview_vertices is not None
+            and self._symmetric_preview_faces is not None
+            and self._symmetric_preview_face_colors is not None
+        ):
+            faded_colors = self._symmetric_preview_face_colors.copy()
+            faded_colors[:, 3] *= opacity
+            self.symmetric_preview_mesh_item.setMeshData(
+                vertexes=self._symmetric_preview_vertices,
+                faces=self._symmetric_preview_faces,
+                faceColors=faded_colors,
+            )
+            self.symmetric_preview_mesh_item.opts["edgeColor"] = (
+                *EDGE_COLOR[:3],
+                opacity,
+            )
+            self.symmetric_preview_mesh_item.update()
+        self.view.update()
+
+    def _frame_symmetric_preview(
+        self,
+        retained_vertices: np.ndarray,
+        mirrored_vertices: np.ndarray,
+    ) -> None:
+        combined = np.vstack((retained_vertices, mirrored_vertices))
+        if combined.size == 0 or not np.all(np.isfinite(combined)):
+            return
+        minimum = np.min(combined, axis=0)
+        maximum = np.max(combined, axis=0)
+        center = (minimum + maximum) / 2.0
+        extent = float(max(np.max(maximum - minimum), 1.0))
+        self.view.opts["center"] = QVector3D(
+            float(center[0]),
+            float(center[1]),
+            float(center[2]),
+        )
+        self.view.setCameraPosition(
+            distance=extent * 3.0,
+            elevation=28.0,
+            azimuth=-40.0,
+        )
+        self.view.remember_orbit_camera_state()
+        self.view.apply_navigation_camera()
+
+    def _remove_symmetric_preview_items(self) -> None:
+        self._symmetric_preview_timer.stop()
+        for item in (
+            self.symmetric_preview_textured_mesh_item,
+            self.symmetric_preview_mesh_item,
+        ):
+            if item is not None and item in self.view.items:
+                self.view.removeItem(item)
+        self.symmetric_preview_textured_mesh_item = None
+        self.symmetric_preview_mesh_item = None
+        self._symmetric_preview_vertices = None
+        self._symmetric_preview_faces = None
+        self._symmetric_preview_face_colors = None
+
+    def _clear_symmetric_preview(self) -> None:
+        self._remove_symmetric_preview_items()
+        self._symmetric_preview_orientation = None
+        self._symmetric_preview_plane_coordinate = None
+        if hasattr(self, "view"):
+            self.view.update()
 
     def set_texture_edit_mask(self, mask: np.ndarray | None) -> None:
         """Preview editable UV texels on the generated object's material."""
@@ -1664,6 +1922,10 @@ class GlbViewerWidget(QWidget):
         )
         if self.textured_mesh_item is not None:
             self.textured_mesh_item.set_ambient_light_intensity(
+                self._ambient_light_intensity
+            )
+        if self.symmetric_preview_textured_mesh_item is not None:
+            self.symmetric_preview_textured_mesh_item.set_ambient_light_intensity(
                 self._ambient_light_intensity
             )
         for textured_surface_item in self.textured_surface_items:
@@ -1940,6 +2202,8 @@ class GlbViewerWidget(QWidget):
         textures_visible = self._textures_enabled and not self._wireframe_only
         if self.textured_mesh_item is not None:
             self.textured_mesh_item.setVisible(textures_visible)
+        if self.symmetric_preview_textured_mesh_item is not None:
+            self.symmetric_preview_textured_mesh_item.setVisible(textures_visible)
         for textured_surface_item in self.textured_surface_items:
             textured_surface_item.setVisible(textures_visible)
         for textured_wall_item in self.textured_wall_items:
@@ -1955,6 +2219,18 @@ class GlbViewerWidget(QWidget):
                 self._wireframe_enabled or self._wireframe_only
             )
             self.mesh_item.update()
+        if self.symmetric_preview_mesh_item is not None:
+            has_textured_preview = (
+                self.symmetric_preview_textured_mesh_item is not None
+            )
+            self.symmetric_preview_mesh_item.opts["drawFaces"] = (
+                not self._wireframe_only
+                and (not has_textured_preview or not self._textures_enabled)
+            )
+            self.symmetric_preview_mesh_item.opts["drawEdges"] = (
+                self._wireframe_enabled or self._wireframe_only
+            )
+            self.symmetric_preview_mesh_item.update()
 
         if hasattr(self, "view"):
             self.view.update()
@@ -2012,10 +2288,16 @@ class GlbViewerWidget(QWidget):
         if not hasattr(self, "view"):
             return
 
+        self._symmetric_preview_timer.stop()
         self.view.clear()
         self.grid_item = None
         self.mesh_item = None
         self.textured_mesh_item = None
+        self.symmetric_preview_textured_mesh_item = None
+        self.symmetric_preview_mesh_item = None
+        self._symmetric_preview_vertices = None
+        self._symmetric_preview_faces = None
+        self._symmetric_preview_face_colors = None
         self.textured_surface_items = []
         self.textured_wall_items = []
         self.wall_by_item_id = {}
@@ -2435,6 +2717,57 @@ def _get_mesh_face_colors(
 
 
 # ### Texture helpers ###
+def _mirror_preview_vertices(
+    vertices: np.ndarray,
+    orientation: str,
+    plane_coordinate: float,
+) -> np.ndarray:
+    """Reflect copied Z-up vertices around the persisted global cut plane."""
+
+    mirrored = np.ascontiguousarray(vertices, dtype=np.float32).copy()
+    axis = 0 if orientation == "vertical" else 2
+    mirrored[:, axis] = float(plane_coordinate) * 2.0 - mirrored[:, axis]
+    return mirrored
+
+
+def _mirror_texture_mesh_data(
+    texture_mesh_data: TextureMeshData,
+    orientation: str,
+    plane_coordinate: float,
+) -> TextureMeshData:
+    """Reflect face-expanded textured geometry and reverse its winding."""
+
+    vertices = _mirror_preview_vertices(
+        texture_mesh_data.vertices,
+        orientation,
+        plane_coordinate,
+    ).reshape((-1, 3, 3))
+    normals = np.ascontiguousarray(
+        texture_mesh_data.normals,
+        dtype=np.float32,
+    ).copy()
+    axis = 0 if orientation == "vertical" else 2
+    normals[:, axis] *= -1.0
+    normals = normals.reshape((-1, 3, 3))
+    texture_coordinates = np.ascontiguousarray(
+        texture_mesh_data.texture_coordinates,
+        dtype=np.float32,
+    ).reshape((-1, 3, 2))
+    reverse_winding = (0, 2, 1)
+    return TextureMeshData(
+        vertices=np.ascontiguousarray(
+            vertices[:, reverse_winding, :].reshape((-1, 3))
+        ),
+        normals=np.ascontiguousarray(
+            normals[:, reverse_winding, :].reshape((-1, 3))
+        ),
+        texture_coordinates=np.ascontiguousarray(
+            texture_coordinates[:, reverse_winding, :].reshape((-1, 2))
+        ),
+        texture_rgba=texture_mesh_data.texture_rgba,
+    )
+
+
 def _build_texture_mesh_data(mesh) -> TextureMeshData | None:
     """Build face-expanded UV geometry for an embedded base-color texture."""
 
@@ -2565,6 +2898,13 @@ def _normalize_ambient_light_intensity(intensity: float) -> float:
         max(normalized_intensity, MIN_AMBIENT_LIGHT_INTENSITY),
         MAX_AMBIENT_LIGHT_INTENSITY,
     )
+
+
+def _normalize_preview_opacity(opacity: float) -> float:
+    normalized_opacity = float(opacity)
+    if not math.isfinite(normalized_opacity):
+        raise ValueError("Preview opacity must be finite.")
+    return min(max(normalized_opacity, 0.0), 1.0)
 
 
 # ### OpenGL helpers ###

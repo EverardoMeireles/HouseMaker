@@ -7,7 +7,7 @@ import re
 import tempfile
 import uuid
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Callable
 
@@ -24,8 +24,55 @@ MAX_ATLAS_NAME_LENGTH = 200
 MAX_ATLAS_OBJECT_COUNT = 4_096
 MAX_ATLAS_ID_LENGTH = 128
 MAX_TEXTURE_PATH_LENGTH = 32_768
-ATLAS_STATE_SCHEMA_VERSION = 1
+ATLAS_STATE_SCHEMA_VERSION = 5
+LEGACY_ATLAS_STATE_SCHEMA_VERSION = 1
+SYMMETRIC_HALF_ATLAS_STATE_SCHEMA_VERSION = 2
+SYMMETRIC_QUARTER_ATLAS_STATE_SCHEMA_VERSION = 3
+SYMMETRIC_PAIR_ATLAS_STATE_SCHEMA_VERSION = 4
 ATLAS_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+ATLAS_PACKING_MODE_FULL = "full"
+ATLAS_PACKING_MODE_SYMMETRIC_HALF = "symmetric_half"
+ATLAS_PACKING_MODE_SYMMETRIC_QUARTER = "symmetric_quarter"
+ATLAS_PACKING_MODE_SYMMETRIC_PAIR = "symmetric_pair"
+ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR = "symmetric_square_pair"
+ATLAS_PACKING_MODES = frozenset(
+    {
+        ATLAS_PACKING_MODE_FULL,
+        ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+        ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+        ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+        ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+    }
+)
+ATLAS_SLOT_HALF_LEFT = "left"
+ATLAS_SLOT_HALF_RIGHT = "right"
+ATLAS_SLOT_HALVES = frozenset({ATLAS_SLOT_HALF_LEFT, ATLAS_SLOT_HALF_RIGHT})
+ATLAS_SLOT_QUADRANT_TOP_LEFT = "top_left"
+ATLAS_SLOT_QUADRANT_TOP_RIGHT = "top_right"
+ATLAS_SLOT_QUADRANT_BOTTOM_LEFT = "bottom_left"
+ATLAS_SLOT_QUADRANT_BOTTOM_RIGHT = "bottom_right"
+ATLAS_SLOT_QUADRANT_ORDER = (
+    ATLAS_SLOT_QUADRANT_TOP_LEFT,
+    ATLAS_SLOT_QUADRANT_TOP_RIGHT,
+    ATLAS_SLOT_QUADRANT_BOTTOM_LEFT,
+    ATLAS_SLOT_QUADRANT_BOTTOM_RIGHT,
+)
+ATLAS_SLOT_QUADRANTS = frozenset(ATLAS_SLOT_QUADRANT_ORDER)
+SYMMETRIC_QUARTER_TEXTURE_RESOLUTIONS = frozenset({512, 1024})
+SYMMETRIC_PAIR_TEXTURE_RESOLUTIONS = frozenset({512, 1024})
+SYMMETRIC_SQUARE_PAIR_TEXTURE_RESOLUTIONS = frozenset({512, 1024})
+ATLAS_PAIR_PACKING_MODES = frozenset(
+    {
+        ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+        ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+    }
+)
+ATLAS_HALF_SLOT_PACKING_MODES = frozenset(
+    {
+        ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+        *ATLAS_PAIR_PACKING_MODES,
+    }
+)
 
 
 # ### Public data models ###
@@ -42,6 +89,9 @@ class TextureAtlasPlacement:
     x: int
     y: int
     size: int
+    packing_mode: str = ATLAS_PACKING_MODE_FULL
+    slot_half: str | None = None
+    slot_quadrant: str | None = None
 
     def __post_init__(self) -> None:
         _validate_nonempty_text(self.object_id, "Texture source ID")
@@ -51,10 +101,66 @@ class TextureAtlasPlacement:
             _normalize_project_relative_path(self.texture_path),
         )
         _validate_texture_resolution(self.texture_resolution)
-        if int(self.size) != int(self.texture_resolution):
-            raise ValueError("Atlas placement size must match texture resolution.")
         if int(self.x) < 0 or int(self.y) < 0:
             raise ValueError("Atlas placement coordinates cannot be negative.")
+        packing_mode = str(self.packing_mode).strip().lower()
+        if packing_mode not in ATLAS_PACKING_MODES:
+            raise ValueError("Unknown texture atlas packing mode.")
+        slot_half = (
+            None if self.slot_half is None else str(self.slot_half).strip().lower()
+        )
+        slot_quadrant = (
+            None
+            if self.slot_quadrant is None
+            else str(self.slot_quadrant).strip().lower()
+        )
+        if packing_mode == ATLAS_PACKING_MODE_FULL:
+            if slot_half is not None or slot_quadrant is not None:
+                raise ValueError("Full texture placements cannot select a slot region.")
+            expected_size = int(self.texture_resolution)
+        elif packing_mode == ATLAS_PACKING_MODE_SYMMETRIC_HALF:
+            if slot_half not in ATLAS_SLOT_HALVES or slot_quadrant is not None:
+                raise ValueError(
+                    "Symmetric half textures require one left or right slot."
+                )
+            expected_size = int(self.texture_resolution)
+        elif packing_mode == ATLAS_PACKING_MODE_SYMMETRIC_QUARTER:
+            if (
+                int(self.texture_resolution)
+                not in SYMMETRIC_QUARTER_TEXTURE_RESOLUTIONS
+            ):
+                raise ValueError(
+                    "Symmetric quarter textures must use 512 or 1024 content."
+                )
+            if slot_half is not None or slot_quadrant not in ATLAS_SLOT_QUADRANTS:
+                raise ValueError(
+                    "Symmetric quarter textures require one Atlas quadrant."
+                )
+            expected_size = int(self.texture_resolution) * 2
+        else:
+            supported_resolutions = (
+                SYMMETRIC_PAIR_TEXTURE_RESOLUTIONS
+                if packing_mode == ATLAS_PACKING_MODE_SYMMETRIC_PAIR
+                else SYMMETRIC_SQUARE_PAIR_TEXTURE_RESOLUTIONS
+            )
+            if int(self.texture_resolution) not in supported_resolutions:
+                raise ValueError(
+                    "Symmetric pair textures must use 512 or 1024 content."
+                )
+            if slot_half not in ATLAS_SLOT_HALVES or slot_quadrant is not None:
+                raise ValueError(
+                    "Symmetric pair textures require one left or right slot."
+                )
+            expected_size = int(self.texture_resolution) * (
+                2 if packing_mode == ATLAS_PACKING_MODE_SYMMETRIC_PAIR else 1
+            )
+        if int(self.size) != expected_size:
+            raise ValueError(
+                "Atlas placement size does not match its texture packing mode."
+            )
+        object.__setattr__(self, "packing_mode", packing_mode)
+        object.__setattr__(self, "slot_half", slot_half)
+        object.__setattr__(self, "slot_quadrant", slot_quadrant)
 
     @property
     def width(self) -> int:
@@ -73,6 +179,9 @@ class TextureAtlasPlacement:
             "y": int(self.y),
             "width": int(self.size),
             "height": int(self.size),
+            "packing_mode": self.packing_mode,
+            "slot_half": self.slot_half,
+            "slot_quadrant": self.slot_quadrant,
         }
 
     @classmethod
@@ -90,6 +199,19 @@ class TextureAtlasPlacement:
             x=int(payload["x"]),
             y=int(payload["y"]),
             size=width,
+            packing_mode=str(
+                payload.get("packing_mode", ATLAS_PACKING_MODE_FULL)
+            ),
+            slot_half=(
+                None
+                if payload.get("slot_half") is None
+                else str(payload["slot_half"])
+            ),
+            slot_quadrant=(
+                None
+                if payload.get("slot_quadrant") is None
+                else str(payload["slot_quadrant"])
+            ),
         )
 
 
@@ -262,14 +384,19 @@ class TextureAtlasData:
         object_id: str,
         texture_path: str | Path,
         texture_resolution: int,
+        packing_mode: str = ATLAS_PACKING_MODE_FULL,
+        *,
+        allow_pairing: bool = True,
     ) -> TextureAtlasPlacement:
         """Add or update one source without moving unrelated placements."""
 
         atlas = self._require_atlas(atlas_id)
         normalized_id = str(object_id)
         normalized_path = _normalize_project_relative_path(texture_path)
+        normalized_packing_mode = _normalize_packing_mode(packing_mode)
         _validate_nonempty_text(normalized_id, "Object ID")
         _validate_texture_resolution(texture_resolution)
+        normalized_resolution = int(texture_resolution)
         existing = atlas.placement_for_object(normalized_id)
         if existing is None and len(atlas.placements) >= MAX_ATLAS_OBJECT_COUNT:
             raise ValueError("Texture atlas contains too many texture sources.")
@@ -278,23 +405,139 @@ class TextureAtlasData:
             for placement in atlas.placements
             if placement.object_id != normalized_id
         ]
-        placement = _find_available_placement(
-            atlas.resolution,
-            normalized_id,
-            normalized_path,
-            int(texture_resolution),
-            unaffected,
-            preferred_position=(
-                None if existing is None else (existing.x, existing.y)
-            ),
+        preserves_existing_slot = (
+            existing is not None
+            and existing.texture_resolution == normalized_resolution
+            and existing.packing_mode == normalized_packing_mode
         )
+        if preserves_existing_slot:
+            placement = TextureAtlasPlacement(
+                object_id=normalized_id,
+                texture_path=normalized_path,
+                texture_resolution=normalized_resolution,
+                x=existing.x,
+                y=existing.y,
+                size=existing.size,
+                packing_mode=normalized_packing_mode,
+                slot_half=existing.slot_half,
+                slot_quadrant=existing.slot_quadrant,
+            )
+            _validate_placements_fit(
+                atlas.resolution,
+                [*unaffected, placement],
+            )
+        else:
+            unaffected = _normalize_partial_slot_placements(unaffected)
+            pair_target = (
+                _find_compatible_unpaired_half(
+                    unaffected,
+                    normalized_resolution,
+                )
+                if normalized_packing_mode
+                == ATLAS_PACKING_MODE_SYMMETRIC_HALF
+                and bool(allow_pairing)
+                else None
+            )
+            if pair_target is not None:
+                placement = TextureAtlasPlacement(
+                    object_id=normalized_id,
+                    texture_path=normalized_path,
+                    texture_resolution=normalized_resolution,
+                    x=pair_target.x,
+                    y=pair_target.y,
+                    size=normalized_resolution,
+                    packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+                    slot_half=ATLAS_SLOT_HALF_RIGHT,
+                )
+                _validate_placements_fit(
+                    atlas.resolution,
+                    [*unaffected, placement],
+                )
+            elif (
+                normalized_packing_mode in ATLAS_PAIR_PACKING_MODES
+                and bool(allow_pairing)
+                and (
+                    pair_target := _find_compatible_unpaired_pair(
+                        unaffected,
+                        normalized_resolution,
+                        normalized_packing_mode,
+                    )
+                )
+                is not None
+            ):
+                placement = TextureAtlasPlacement(
+                    object_id=normalized_id,
+                    texture_path=normalized_path,
+                    texture_resolution=normalized_resolution,
+                    x=pair_target.x,
+                    y=pair_target.y,
+                    size=pair_target.size,
+                    packing_mode=normalized_packing_mode,
+                    slot_half=ATLAS_SLOT_HALF_RIGHT,
+                )
+                _validate_placements_fit(
+                    atlas.resolution,
+                    [*unaffected, placement],
+                )
+            elif (
+                normalized_packing_mode
+                == ATLAS_PACKING_MODE_SYMMETRIC_QUARTER
+                and bool(allow_pairing)
+                and (
+                    quarter_target := _find_compatible_quarter_group(
+                        unaffected,
+                        normalized_resolution,
+                    )
+                )
+                is not None
+            ):
+                placement = TextureAtlasPlacement(
+                    object_id=normalized_id,
+                    texture_path=normalized_path,
+                    texture_resolution=normalized_resolution,
+                    x=quarter_target[0].x,
+                    y=quarter_target[0].y,
+                    size=quarter_target[0].size,
+                    packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+                    slot_quadrant=_first_available_quadrant(quarter_target),
+                )
+                _validate_placements_fit(
+                    atlas.resolution,
+                    [*unaffected, placement],
+                )
+            else:
+                placement = _find_available_placement(
+                    atlas.resolution,
+                    normalized_id,
+                    normalized_path,
+                    normalized_resolution,
+                    unaffected,
+                    preferred_position=(
+                        None if existing is None else (existing.x, existing.y)
+                    ),
+                    packing_mode=normalized_packing_mode,
+                    slot_half=(
+                        ATLAS_SLOT_HALF_LEFT
+                        if normalized_packing_mode
+                        in ATLAS_HALF_SLOT_PACKING_MODES
+                        else None
+                    ),
+                    slot_quadrant=(
+                        ATLAS_SLOT_QUADRANT_TOP_LEFT
+                        if normalized_packing_mode
+                        == ATLAS_PACKING_MODE_SYMMETRIC_QUARTER
+                        else None
+                    ),
+                )
         if existing is None:
             atlas.placements.append(placement)
-        else:
+        elif preserves_existing_slot:
             atlas.placements = [
                 placement if candidate.object_id == normalized_id else candidate
                 for candidate in atlas.placements
             ]
+        else:
+            atlas.placements = [*unaffected, placement]
         atlas.image_path = None
         return placement
 
@@ -306,6 +549,9 @@ class TextureAtlasData:
         texture_resolution: int,
         x: int,
         y: int,
+        packing_mode: str = ATLAS_PACKING_MODE_FULL,
+        slot_half: str | None = None,
+        slot_quadrant: str | None = None,
     ) -> TextureAtlasPlacement:
         """Add or move one source at an exact aligned atlas slot."""
 
@@ -313,6 +559,7 @@ class TextureAtlasData:
         normalized_id = str(object_id)
         normalized_path = _normalize_project_relative_path(texture_path)
         normalized_resolution = int(texture_resolution)
+        normalized_packing_mode = _normalize_packing_mode(packing_mode)
         normalized_x = _normalize_atlas_coordinate(x, "Atlas placement x")
         normalized_y = _normalize_atlas_coordinate(y, "Atlas placement y")
         _validate_nonempty_text(normalized_id, "Object ID")
@@ -323,19 +570,117 @@ class TextureAtlasData:
         ):
             raise ValueError("Texture atlas contains too many texture sources.")
 
+        existing = atlas.placement_for_object(normalized_id)
+        normalized_slot_half = _normalize_slot_half(
+            normalized_packing_mode,
+            slot_half,
+            allow_unspecified_half=True,
+        )
+        normalized_slot_quadrant = _normalize_slot_quadrant(
+            normalized_packing_mode,
+            slot_quadrant,
+            allow_unspecified_quadrant=True,
+        )
+        if (
+            existing is not None
+            and existing.texture_resolution == normalized_resolution
+            and existing.x == normalized_x
+            and existing.y == normalized_y
+            and existing.packing_mode == normalized_packing_mode
+            and (
+                normalized_slot_half is None
+                or existing.slot_half == normalized_slot_half
+            )
+            and (
+                normalized_slot_quadrant is None
+                or existing.slot_quadrant == normalized_slot_quadrant
+            )
+        ):
+            placement = TextureAtlasPlacement(
+                object_id=normalized_id,
+                texture_path=normalized_path,
+                texture_resolution=normalized_resolution,
+                x=normalized_x,
+                y=normalized_y,
+                size=existing.size,
+                packing_mode=normalized_packing_mode,
+                slot_half=existing.slot_half,
+                slot_quadrant=existing.slot_quadrant,
+            )
+            placements = [
+                placement if candidate.object_id == normalized_id else candidate
+                for candidate in atlas.placements
+            ]
+            _validate_placements_fit(atlas.resolution, placements)
+            atlas.placements = placements
+            atlas.image_path = None
+            return placement
+        placements = _normalize_partial_slot_placements(
+            [
+                candidate
+                for candidate in atlas.placements
+                if candidate.object_id != normalized_id
+            ]
+        )
+        if normalized_packing_mode in ATLAS_HALF_SLOT_PACKING_MODES:
+            compatible_target = next(
+                (
+                    candidate
+                    for candidate in placements
+                    if candidate.packing_mode == normalized_packing_mode
+                    and candidate.slot_half == ATLAS_SLOT_HALF_LEFT
+                    and candidate.texture_resolution == normalized_resolution
+                    and candidate.x == normalized_x
+                    and candidate.y == normalized_y
+                ),
+                None,
+            )
+            if normalized_slot_half is None:
+                normalized_slot_half = (
+                    ATLAS_SLOT_HALF_RIGHT
+                    if compatible_target is not None
+                    else ATLAS_SLOT_HALF_LEFT
+                )
+            elif (
+                normalized_slot_half == ATLAS_SLOT_HALF_RIGHT
+                and compatible_target is None
+            ):
+                normalized_slot_half = ATLAS_SLOT_HALF_LEFT
+
+        if normalized_packing_mode == ATLAS_PACKING_MODE_SYMMETRIC_QUARTER:
+            compatible_group = _quarter_group_at(
+                placements,
+                normalized_resolution,
+                normalized_x,
+                normalized_y,
+            )
+            if compatible_group is None:
+                normalized_slot_quadrant = ATLAS_SLOT_QUADRANT_TOP_LEFT
+            elif normalized_slot_quadrant is None:
+                normalized_slot_quadrant = _first_available_quadrant(
+                    compatible_group
+                )
+            elif normalized_slot_quadrant in {
+                member.slot_quadrant for member in compatible_group
+            }:
+                normalized_slot_quadrant = _first_available_quadrant(
+                    compatible_group
+                )
+
         placement = TextureAtlasPlacement(
             object_id=normalized_id,
             texture_path=normalized_path,
             texture_resolution=normalized_resolution,
             x=normalized_x,
             y=normalized_y,
-            size=normalized_resolution,
+            size=_logical_slot_size(
+                normalized_packing_mode,
+                normalized_resolution,
+            ),
+            packing_mode=normalized_packing_mode,
+            slot_half=normalized_slot_half,
+            slot_quadrant=normalized_slot_quadrant,
         )
-        placements = [
-            candidate
-            for candidate in atlas.placements
-            if candidate.object_id != normalized_id
-        ]
         placements.append(placement)
         _validate_placements_fit(atlas.resolution, placements)
         atlas.placements = placements
@@ -352,22 +697,15 @@ class TextureAtlasData:
         ]
         if len(placements) == len(atlas.placements):
             return False
-        atlas.placements = placements
+        atlas.placements = _normalize_partial_slot_placements(placements)
         atlas.image_path = None
         return True
 
     def repack_atlas(self, atlas_id: str) -> list[TextureAtlasPlacement]:
         atlas = self._require_atlas(atlas_id)
-        atlas.placements = _pack_assignments(
+        atlas.placements = _pack_placements(
             atlas.resolution,
-            [
-                (
-                    placement.object_id,
-                    placement.texture_path,
-                    placement.texture_resolution,
-                )
-                for placement in atlas.placements
-            ],
+            atlas.placements,
         )
         atlas.image_path = None
         return list(atlas.placements)
@@ -386,18 +724,35 @@ class TextureAtlasData:
         schema_version = int(
             payload.get("schema_version", ATLAS_STATE_SCHEMA_VERSION)
         )
-        if schema_version != ATLAS_STATE_SCHEMA_VERSION:
+        if schema_version not in {
+            LEGACY_ATLAS_STATE_SCHEMA_VERSION,
+            SYMMETRIC_HALF_ATLAS_STATE_SCHEMA_VERSION,
+            SYMMETRIC_QUARTER_ATLAS_STATE_SCHEMA_VERSION,
+            SYMMETRIC_PAIR_ATLAS_STATE_SCHEMA_VERSION,
+            ATLAS_STATE_SCHEMA_VERSION,
+        }:
             raise ValueError(
                 f"Unsupported texture atlas schema version: {schema_version}."
             )
         raw_atlases = payload.get("atlases", [])
         if not isinstance(raw_atlases, list):
             raise ValueError("Texture atlases must contain a list.")
+        atlases = [
+            TextureAtlasRecord.from_dict(raw_atlas)
+            for raw_atlas in raw_atlases
+        ]
+        if schema_version < ATLAS_STATE_SCHEMA_VERSION and any(
+            placement.packing_mode
+            == ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR
+            for atlas in atlases
+            for placement in atlas.placements
+        ):
+            raise ValueError(
+                "Symmetric square-pair placements require texture atlas "
+                "schema version 5."
+            )
         return cls(
-            atlases=[
-                TextureAtlasRecord.from_dict(raw_atlas)
-                for raw_atlas in raw_atlases
-            ],
+            atlases=atlases,
             selected_atlas_id=(
                 None
                 if payload.get("selected_atlas_id") is None
@@ -447,11 +802,44 @@ def write_texture_atlas_png(
     else:
         loader = source_loader
     canvas = np.zeros((atlas.resolution, atlas.resolution, 4), dtype=np.uint8)
-    for placement in atlas.placements:
-        source = _normalize_texture_pixels(loader(placement), placement)
-        y_end = placement.y + placement.size
-        x_end = placement.x + placement.size
-        canvas[placement.y:y_end, placement.x:x_end] = source
+    for placements in _group_placements_by_slot(atlas.placements):
+        first = placements[0]
+        y_end = first.y + first.size
+        x_end = first.x + first.size
+        if first.packing_mode == ATLAS_PACKING_MODE_FULL:
+            source = _normalize_texture_pixels(loader(first), first)
+            canvas[first.y:y_end, first.x:x_end] = source
+            continue
+
+        canvas[first.y:y_end, first.x:x_end] = (0, 0, 0, 255)
+        if first.packing_mode == ATLAS_PACKING_MODE_SYMMETRIC_QUARTER:
+            for placement in placements:
+                source = _normalize_texture_pixels(loader(placement), placement)
+                content_size = placement.texture_resolution
+                offset_x, offset_y = _quadrant_pixel_offset(
+                    placement.slot_quadrant,
+                    content_size,
+                )
+                destination_x = placement.x + offset_x
+                destination_y = placement.y + offset_y
+                canvas[
+                    destination_y : destination_y + content_size,
+                    destination_x : destination_x + content_size,
+                ] = source[:content_size, :content_size]
+            continue
+
+        content_width = first.size // 2
+        for placement in placements:
+            source = _normalize_texture_pixels(loader(placement), placement)
+            destination_x = placement.x + (
+                content_width
+                if placement.slot_half == ATLAS_SLOT_HALF_RIGHT
+                else 0
+            )
+            canvas[
+                placement.y:y_end,
+                destination_x : destination_x + content_width,
+            ] = source[:, :content_width]
 
     success, encoded = cv2.imencode(".png", canvas)
     if not success:
@@ -541,6 +929,156 @@ def _pack_assignments(
     return placements
 
 
+def _pack_placements(
+    atlas_resolution: int,
+    placements: list[TextureAtlasPlacement],
+) -> list[TextureAtlasPlacement]:
+    """Pack full textures and established symmetric groups as logical units."""
+
+    _validate_atlas_resolution(atlas_resolution)
+    _validate_placements_fit(atlas_resolution, placements)
+    placements = _normalize_partial_slot_placements(placements)
+    logical_units: list[list[TextureAtlasPlacement]] = []
+    unpaired_halves_by_resolution: dict[int, list[TextureAtlasPlacement]] = {}
+    unpaired_pairs_by_mode_and_resolution: dict[
+        tuple[str, int],
+        list[TextureAtlasPlacement],
+    ] = {}
+    ungrouped_quarters_by_resolution: dict[
+        int,
+        list[TextureAtlasPlacement],
+    ] = {}
+    for slot_group in _group_placements_by_slot(placements):
+        packing_mode = slot_group[0].packing_mode
+        if packing_mode == ATLAS_PACKING_MODE_FULL:
+            logical_units.append(slot_group)
+            continue
+        if packing_mode == ATLAS_PACKING_MODE_SYMMETRIC_HALF:
+            if len(slot_group) == 2:
+                logical_units.append(slot_group)
+            else:
+                placement = slot_group[0]
+                unpaired_halves_by_resolution.setdefault(
+                    placement.texture_resolution,
+                    [],
+                ).append(placement)
+            continue
+        if packing_mode in ATLAS_PAIR_PACKING_MODES:
+            if len(slot_group) == 2:
+                logical_units.append(slot_group)
+            else:
+                placement = slot_group[0]
+                unpaired_pairs_by_mode_and_resolution.setdefault(
+                    (packing_mode, placement.texture_resolution),
+                    [],
+                ).append(placement)
+            continue
+        if len(slot_group) > 1:
+            logical_units.append(slot_group)
+            continue
+        placement = slot_group[0]
+        ungrouped_quarters_by_resolution.setdefault(
+            placement.texture_resolution,
+            [],
+        ).append(placement)
+
+    for resolution in sorted(unpaired_halves_by_resolution, reverse=True):
+        unpaired = sorted(
+            unpaired_halves_by_resolution[resolution],
+            key=lambda placement: placement.object_id,
+        )
+        for index in range(0, len(unpaired), 2):
+            members = unpaired[index : index + 2]
+            logical_units.append(
+                [
+                    replace(
+                        member,
+                        slot_half=(
+                            ATLAS_SLOT_HALF_LEFT
+                            if member_index == 0
+                            else ATLAS_SLOT_HALF_RIGHT
+                        ),
+                    )
+                    for member_index, member in enumerate(members)
+                ]
+            )
+
+    for mode_and_resolution in sorted(
+        unpaired_pairs_by_mode_and_resolution,
+        key=lambda item: (item[0], -item[1]),
+    ):
+        unpaired = sorted(
+            unpaired_pairs_by_mode_and_resolution[mode_and_resolution],
+            key=lambda placement: placement.object_id,
+        )
+        for index in range(0, len(unpaired), 2):
+            members = unpaired[index : index + 2]
+            logical_units.append(
+                [
+                    replace(
+                        member,
+                        slot_half=(
+                            ATLAS_SLOT_HALF_LEFT
+                            if member_index == 0
+                            else ATLAS_SLOT_HALF_RIGHT
+                        ),
+                    )
+                    for member_index, member in enumerate(members)
+                ]
+            )
+
+    for resolution in sorted(ungrouped_quarters_by_resolution, reverse=True):
+        ungrouped = sorted(
+            ungrouped_quarters_by_resolution[resolution],
+            key=lambda placement: placement.object_id,
+        )
+        for index in range(0, len(ungrouped), 4):
+            members = ungrouped[index : index + 4]
+            logical_units.append(
+                [
+                    replace(
+                        member,
+                        slot_quadrant=ATLAS_SLOT_QUADRANT_ORDER[
+                            member_index
+                        ],
+                    )
+                    for member_index, member in enumerate(members)
+                ]
+            )
+
+    root = _QuadNode(0, 0, int(atlas_resolution))
+    packed: list[TextureAtlasPlacement] = []
+    for logical_unit in sorted(
+        logical_units,
+        key=lambda unit: (
+            -unit[0].size,
+            tuple(sorted(member.object_id for member in unit)),
+        ),
+    ):
+        requested_size = logical_unit[0].size
+        node = _allocate_quad(root, requested_size)
+        if node is None:
+            object_labels = ", ".join(
+                repr(member.object_id) for member in logical_unit
+            )
+            raise ValueError(
+                f"Texture atlas {atlas_resolution}x{atlas_resolution} has no "
+                f"space for texture source(s) {object_labels} at "
+                f"{requested_size}x{requested_size}."
+            )
+        packed.extend(
+            replace(
+                member,
+                x=node.x,
+                y=node.y,
+                size=requested_size,
+            )
+            for member in logical_unit
+        )
+    _validate_placements_fit(atlas_resolution, packed)
+    return packed
+
+
 def _allocate_quad(node: _QuadNode, requested_size: int) -> _QuadNode | None:
     if node.occupied or node.size < requested_size:
         return None
@@ -572,21 +1110,25 @@ def _find_available_placement(
     unaffected: list[TextureAtlasPlacement],
     *,
     preferred_position: tuple[int, int] | None,
+    packing_mode: str = ATLAS_PACKING_MODE_FULL,
+    slot_half: str | None = None,
+    slot_quadrant: str | None = None,
 ) -> TextureAtlasPlacement:
     """Find one aligned slot while treating every other placement as fixed."""
 
+    logical_size = _logical_slot_size(packing_mode, texture_resolution)
     positions = [] if preferred_position is None else [preferred_position]
     for position in _iter_quad_slot_positions(
         0,
         0,
         int(atlas_resolution),
-        int(texture_resolution),
+        logical_size,
     ):
         if position not in positions:
             positions.append(position)
     for position in _iter_base_grid_positions(
         int(atlas_resolution),
-        int(texture_resolution),
+        logical_size,
     ):
         if position not in positions:
             positions.append(position)
@@ -598,7 +1140,10 @@ def _find_available_placement(
                 texture_resolution=texture_resolution,
                 x=x,
                 y=y,
-                size=texture_resolution,
+                size=logical_size,
+                packing_mode=packing_mode,
+                slot_half=slot_half,
+                slot_quadrant=slot_quadrant,
             )
             _validate_placements_fit(
                 atlas_resolution,
@@ -610,7 +1155,7 @@ def _find_available_placement(
     raise ValueError(
         f"Texture atlas {atlas_resolution}x{atlas_resolution} has no space "
         f"for texture source {object_id!r} at "
-        f"{texture_resolution}x{texture_resolution}."
+        f"{logical_size}x{logical_size}."
     )
 
 
@@ -651,6 +1196,283 @@ def _iter_base_grid_positions(
 
 
 # ### Validation helpers ###
+def _normalize_packing_mode(value: object) -> str:
+    packing_mode = str(value).strip().lower()
+    if packing_mode not in ATLAS_PACKING_MODES:
+        raise ValueError("Unknown texture atlas packing mode.")
+    return packing_mode
+
+
+def _normalize_slot_half(
+    packing_mode: str,
+    value: object,
+    *,
+    allow_unspecified_half: bool,
+) -> str | None:
+    if packing_mode not in ATLAS_HALF_SLOT_PACKING_MODES:
+        if value is not None:
+            raise ValueError(
+                "Only symmetric half or pair textures can select a slot half."
+            )
+        return None
+    if value is None and allow_unspecified_half:
+        return None
+    slot_half = str(value).strip().lower()
+    if slot_half not in ATLAS_SLOT_HALVES:
+        raise ValueError(
+            "Symmetric half or pair textures require a left or right slot."
+        )
+    return slot_half
+
+
+def _normalize_slot_quadrant(
+    packing_mode: str,
+    value: object,
+    *,
+    allow_unspecified_quadrant: bool,
+) -> str | None:
+    if packing_mode != ATLAS_PACKING_MODE_SYMMETRIC_QUARTER:
+        if value is not None:
+            raise ValueError(
+                "Only symmetric quarter textures can select a quadrant."
+            )
+        return None
+    if value is None and allow_unspecified_quadrant:
+        return None
+    slot_quadrant = str(value).strip().lower()
+    if slot_quadrant not in ATLAS_SLOT_QUADRANTS:
+        raise ValueError(
+            "Symmetric quarter textures require one Atlas quadrant."
+        )
+    return slot_quadrant
+
+
+def _logical_slot_size(packing_mode: str, texture_resolution: int) -> int:
+    if packing_mode in {
+        ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+        ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+    }:
+        supported_resolutions = (
+            SYMMETRIC_QUARTER_TEXTURE_RESOLUTIONS
+            if packing_mode == ATLAS_PACKING_MODE_SYMMETRIC_QUARTER
+            else SYMMETRIC_PAIR_TEXTURE_RESOLUTIONS
+        )
+        if int(texture_resolution) not in supported_resolutions:
+            raise ValueError(
+                "High-density symmetric textures must use 512 or 1024 content."
+            )
+        return int(texture_resolution) * 2
+    if packing_mode == ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR:
+        if int(texture_resolution) not in SYMMETRIC_SQUARE_PAIR_TEXTURE_RESOLUTIONS:
+            raise ValueError(
+                "Symmetric square-pair textures must use 512 or 1024 content."
+            )
+    return int(texture_resolution)
+
+
+def _group_placements_by_slot(
+    placements: list[TextureAtlasPlacement],
+) -> list[list[TextureAtlasPlacement]]:
+    groups: dict[tuple[int, int, int], list[TextureAtlasPlacement]] = {}
+    for placement in placements:
+        groups.setdefault(
+            (placement.x, placement.y, placement.size),
+            [],
+        ).append(placement)
+    return list(groups.values())
+
+
+def _normalize_orphaned_half_placements(
+    placements: list[TextureAtlasPlacement],
+) -> list[TextureAtlasPlacement]:
+    """Move a surviving right member to the left side of its logical slot."""
+
+    normalized: list[TextureAtlasPlacement] = []
+    for slot_group in _group_placements_by_slot(placements):
+        if (
+            len(slot_group) == 1
+            and slot_group[0].packing_mode in ATLAS_HALF_SLOT_PACKING_MODES
+            and slot_group[0].slot_half == ATLAS_SLOT_HALF_RIGHT
+        ):
+            normalized.append(
+                replace(slot_group[0], slot_half=ATLAS_SLOT_HALF_LEFT)
+            )
+        else:
+            normalized.extend(slot_group)
+    return normalized
+
+
+def _normalize_partial_slot_placements(
+    placements: list[TextureAtlasPlacement],
+) -> list[TextureAtlasPlacement]:
+    """Compact symmetric slot members into their canonical region order."""
+
+    normalized: list[TextureAtlasPlacement] = []
+    for slot_group in _group_placements_by_slot(placements):
+        packing_mode = slot_group[0].packing_mode
+        if packing_mode in ATLAS_HALF_SLOT_PACKING_MODES:
+            ordered = sorted(
+                slot_group,
+                key=lambda placement: (
+                    0
+                    if placement.slot_half == ATLAS_SLOT_HALF_LEFT
+                    else 1,
+                    placement.object_id,
+                ),
+            )
+            normalized.extend(
+                replace(
+                    placement,
+                    slot_half=(
+                        ATLAS_SLOT_HALF_LEFT
+                        if index == 0
+                        else ATLAS_SLOT_HALF_RIGHT
+                    ),
+                )
+                for index, placement in enumerate(ordered)
+            )
+            continue
+        if packing_mode == ATLAS_PACKING_MODE_SYMMETRIC_QUARTER:
+            quadrant_index = {
+                quadrant: index
+                for index, quadrant in enumerate(ATLAS_SLOT_QUADRANT_ORDER)
+            }
+            ordered = sorted(
+                slot_group,
+                key=lambda placement: (
+                    quadrant_index.get(placement.slot_quadrant, 4),
+                    placement.object_id,
+                ),
+            )
+            normalized.extend(
+                replace(
+                    placement,
+                    slot_quadrant=ATLAS_SLOT_QUADRANT_ORDER[index],
+                )
+                for index, placement in enumerate(ordered)
+            )
+            continue
+        normalized.extend(slot_group)
+    return normalized
+
+
+def _find_compatible_unpaired_half(
+    placements: list[TextureAtlasPlacement],
+    texture_resolution: int,
+) -> TextureAtlasPlacement | None:
+    for slot_group in _group_placements_by_slot(placements):
+        if len(slot_group) != 1:
+            continue
+        placement = slot_group[0]
+        if (
+            placement.packing_mode == ATLAS_PACKING_MODE_SYMMETRIC_HALF
+            and placement.slot_half == ATLAS_SLOT_HALF_LEFT
+            and placement.texture_resolution == int(texture_resolution)
+        ):
+            return placement
+    return None
+
+
+def _find_compatible_unpaired_pair(
+    placements: list[TextureAtlasPlacement],
+    texture_resolution: int,
+    packing_mode: str,
+) -> TextureAtlasPlacement | None:
+    for slot_group in _group_placements_by_slot(placements):
+        if len(slot_group) != 1:
+            continue
+        placement = slot_group[0]
+        if (
+            placement.packing_mode == packing_mode
+            and placement.slot_half == ATLAS_SLOT_HALF_LEFT
+            and placement.texture_resolution == int(texture_resolution)
+        ):
+            return placement
+    return None
+
+
+def _find_compatible_quarter_group(
+    placements: list[TextureAtlasPlacement],
+    texture_resolution: int,
+) -> list[TextureAtlasPlacement] | None:
+    candidates = [
+        slot_group
+        for slot_group in _group_placements_by_slot(placements)
+        if len(slot_group) < len(ATLAS_SLOT_QUADRANT_ORDER)
+        and slot_group[0].packing_mode
+        == ATLAS_PACKING_MODE_SYMMETRIC_QUARTER
+        and slot_group[0].texture_resolution == int(texture_resolution)
+    ]
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda group: (
+            group[0].y,
+            group[0].x,
+            tuple(member.object_id for member in group),
+        ),
+    )
+
+
+def _quarter_group_at(
+    placements: list[TextureAtlasPlacement],
+    texture_resolution: int,
+    x: int,
+    y: int,
+) -> list[TextureAtlasPlacement] | None:
+    expected_size = int(texture_resolution) * 2
+    for slot_group in _group_placements_by_slot(placements):
+        first = slot_group[0]
+        if (
+            len(slot_group) < len(ATLAS_SLOT_QUADRANT_ORDER)
+            and first.packing_mode == ATLAS_PACKING_MODE_SYMMETRIC_QUARTER
+            and first.texture_resolution == int(texture_resolution)
+            and first.size == expected_size
+            and first.x == int(x)
+            and first.y == int(y)
+        ):
+            return slot_group
+    return None
+
+
+def _first_available_quadrant(
+    placements: list[TextureAtlasPlacement],
+) -> str:
+    occupied = {placement.slot_quadrant for placement in placements}
+    for quadrant in ATLAS_SLOT_QUADRANT_ORDER:
+        if quadrant not in occupied:
+            return quadrant
+    raise ValueError("The symmetric quarter Atlas slot is already full.")
+
+
+def _quadrant_pixel_offset(
+    slot_quadrant: str | None,
+    content_size: int,
+) -> tuple[int, int]:
+    if slot_quadrant not in ATLAS_SLOT_QUADRANTS:
+        raise ValueError("The symmetric quarter Atlas quadrant is invalid.")
+    offset_x = (
+        int(content_size)
+        if slot_quadrant
+        in {
+            ATLAS_SLOT_QUADRANT_TOP_RIGHT,
+            ATLAS_SLOT_QUADRANT_BOTTOM_RIGHT,
+        }
+        else 0
+    )
+    offset_y = (
+        int(content_size)
+        if slot_quadrant
+        in {
+            ATLAS_SLOT_QUADRANT_BOTTOM_LEFT,
+            ATLAS_SLOT_QUADRANT_BOTTOM_RIGHT,
+        }
+        else 0
+    )
+    return offset_x, offset_y
+
+
 def _validate_atlas_resolution(resolution: object) -> None:
     if isinstance(resolution, bool) or int(resolution) not in ATLAS_RESOLUTIONS:
         raise ValueError("Texture atlas resolution must be 2048 or 4096.")
@@ -735,15 +1557,65 @@ def _validate_placements_fit(
             or placement.y + placement.size > atlas_resolution
         ):
             raise ValueError("Texture atlas placement exceeds atlas bounds.")
-    for index, first in enumerate(placements):
-        for second in placements[index + 1 :]:
+    slot_groups = _group_placements_by_slot(placements)
+    for slot_group in slot_groups:
+        first = slot_group[0]
+        if any(
+            placement.packing_mode != first.packing_mode
+            or placement.texture_resolution != first.texture_resolution
+            or placement.size != first.size
+            for placement in slot_group[1:]
+        ):
+            raise ValueError("Atlas placements overlap with incompatible slots.")
+        if first.packing_mode == ATLAS_PACKING_MODE_FULL:
+            if len(slot_group) != 1:
+                raise ValueError("Full texture atlas placements cannot overlap.")
+            continue
+        if first.packing_mode in ATLAS_HALF_SLOT_PACKING_MODES:
+            if (
+                len(slot_group) == 1
+                and first.slot_half == ATLAS_SLOT_HALF_RIGHT
+            ):
+                raise ValueError(
+                    "A right-half atlas placement requires a matching left half."
+                )
+            if len(slot_group) > 2:
+                raise ValueError(
+                    "A texture atlas slot can contain at most two halves."
+                )
+            expected_halves = set(
+                (ATLAS_SLOT_HALF_LEFT, ATLAS_SLOT_HALF_RIGHT)[: len(slot_group)]
+            )
+            if {placement.slot_half for placement in slot_group} != expected_halves:
+                raise ValueError(
+                    "Symmetric Atlas pairs must occupy left before right."
+                )
+            continue
+        if len(slot_group) > len(ATLAS_SLOT_QUADRANT_ORDER):
+            raise ValueError(
+                "A symmetric quarter Atlas slot can contain at most four sources."
+            )
+        expected_quadrants = set(
+            ATLAS_SLOT_QUADRANT_ORDER[: len(slot_group)]
+        )
+        if {
+            placement.slot_quadrant for placement in slot_group
+        } != expected_quadrants:
+            raise ValueError(
+                "Symmetric quarter Atlas members must occupy quadrants row-major."
+            )
+
+    for index, first_group in enumerate(slot_groups):
+        first = first_group[0]
+        for second_group in slot_groups[index + 1 :]:
+            second = second_group[0]
             if not (
                 first.x + first.size <= second.x
                 or second.x + second.size <= first.x
                 or first.y + first.size <= second.y
                 or second.y + second.size <= first.y
             ):
-                raise ValueError("Texture atlas placements overlap.")
+                raise ValueError("Texture atlas logical slots overlap.")
 
 
 # ### Image helpers ###

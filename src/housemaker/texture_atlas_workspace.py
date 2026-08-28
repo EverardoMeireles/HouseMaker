@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
 import tempfile
 from dataclasses import dataclass
@@ -52,7 +53,21 @@ from PySide6.QtWidgets import (
 
 from housemaker.texture_atlas_state import (
     ATLAS_BASE_CELL_SIZE,
+    ATLAS_HALF_SLOT_PACKING_MODES,
+    ATLAS_PACKING_MODE_FULL,
+    ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+    ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+    ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+    ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+    ATLAS_PACKING_MODES,
     ATLAS_RESOLUTIONS,
+    ATLAS_SLOT_HALF_LEFT,
+    ATLAS_SLOT_HALF_RIGHT,
+    ATLAS_SLOT_QUADRANT_BOTTOM_LEFT,
+    ATLAS_SLOT_QUADRANT_BOTTOM_RIGHT,
+    ATLAS_SLOT_QUADRANT_ORDER,
+    ATLAS_SLOT_QUADRANT_TOP_LEFT,
+    ATLAS_SLOT_QUADRANT_TOP_RIGHT,
     TextureAtlasData,
     TextureAtlasPlacement,
     TextureAtlasRecord,
@@ -85,6 +100,18 @@ ATLAS_TEXTURE_SOURCE_MIME_TYPE = (
     "application/x-housemaker-texture-atlas-source"
 )
 MAX_DRAG_SOURCE_ID_BYTES = 4_096
+DOUBLE_SIZED_SYMMETRIC_PACKING_MODES = frozenset(
+    {
+        ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+        ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+    }
+)
+LIMITED_SYMMETRIC_RESOLUTION_PACKING_MODES = frozenset(
+    {
+        *DOUBLE_SIZED_SYMMETRIC_PACKING_MODES,
+        ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+    }
+)
 
 
 # ### Public texture-source model ###
@@ -101,6 +128,9 @@ class AtlasObjectTextureSource:
     fit_to_square: bool = False
     supports_resolution_changes: bool = True
     supports_3d_preview: bool = True
+    packing_mode: str = ATLAS_PACKING_MODE_FULL
+    symmetric_preview_orientation: str | None = None
+    symmetric_preview_plane_coordinate: float | None = None
 
     def __post_init__(self) -> None:
         object_id = str(self.object_id).strip()
@@ -137,6 +167,51 @@ class AtlasObjectTextureSource:
             "supports_3d_preview",
             bool(self.supports_3d_preview),
         )
+        packing_mode = str(self.packing_mode).strip().lower()
+        if packing_mode not in ATLAS_PACKING_MODES:
+            raise ValueError("Unknown Atlas source packing mode.")
+        if (
+            packing_mode in LIMITED_SYMMETRIC_RESOLUTION_PACKING_MODES
+            and int(self.texture_resolution) not in {512, 1024}
+        ):
+            raise ValueError(
+                "High-density symmetric Atlas sources must use 512 or 1024 "
+                "content."
+            )
+        if packing_mode != ATLAS_PACKING_MODE_FULL and bool(self.fit_to_square):
+            raise ValueError(
+                "Symmetric Atlas sources require an exact square texture."
+            )
+        orientation = (
+            None
+            if self.symmetric_preview_orientation is None
+            else str(self.symmetric_preview_orientation).strip().lower()
+        )
+        plane_coordinate = self.symmetric_preview_plane_coordinate
+        if packing_mode == ATLAS_PACKING_MODE_FULL:
+            if orientation is not None or plane_coordinate is not None:
+                raise ValueError(
+                    "Full Atlas sources cannot define a symmetric preview."
+                )
+        else:
+            if orientation not in {"vertical", "horizontal"}:
+                raise ValueError(
+                    "Symmetric Atlas sources require a preview orientation."
+                )
+            if plane_coordinate is None or not math.isfinite(
+                float(plane_coordinate)
+            ):
+                raise ValueError(
+                    "Symmetric Atlas sources require a finite preview plane."
+                )
+            plane_coordinate = float(plane_coordinate)
+        object.__setattr__(self, "packing_mode", packing_mode)
+        object.__setattr__(self, "symmetric_preview_orientation", orientation)
+        object.__setattr__(
+            self,
+            "symmetric_preview_plane_coordinate",
+            plane_coordinate,
+        )
 
     def get_preview_image(self) -> QImage:
         """Return an owned Qt image for atlas preview painting."""
@@ -163,11 +238,15 @@ class AtlasObjectTextureSource:
             else:
                 loaded_image = image.convert("RGBA")
             rgba = np.asarray(loaded_image, dtype=np.uint8)
-        expected_shape = (self.texture_resolution, self.texture_resolution)
+        physical_resolution = _physical_texture_resolution(
+            self.packing_mode,
+            self.texture_resolution,
+        )
+        expected_shape = (physical_resolution, physical_resolution)
         if rgba.shape[:2] != expected_shape:
             raise ValueError(
                 f"Texture {self.texture_path!r} must be "
-                f"{self.texture_resolution} x {self.texture_resolution}; "
+                f"{physical_resolution} x {physical_resolution}; "
                 f"received {rgba.shape[1]} x {rgba.shape[0]}."
             )
         return np.ascontiguousarray(rgba)
@@ -181,6 +260,8 @@ class AtlasDragSlotPreview:
     x: int
     y: int
     size: int
+    slot_half: str | None
+    slot_quadrant: str | None
     is_valid: bool
 
 
@@ -202,18 +283,25 @@ def load_atlas_object_texture_source(
     fit_to_square: bool = False,
     supports_resolution_changes: bool = True,
     supports_3d_preview: bool = True,
+    packing_mode: str = ATLAS_PACKING_MODE_FULL,
+    symmetric_preview_orientation: str | None = None,
+    symmetric_preview_plane_coordinate: float | None = None,
 ) -> AtlasObjectTextureSource:
     """Load one texture-source descriptor for the Atlas workspace."""
 
     normalized_physical_path = Path(physical_texture_path)
     with Image.open(normalized_physical_path) as image:
-        if (
-            not fit_to_square
-            and image.size != (int(texture_resolution), int(texture_resolution))
+        physical_resolution = _physical_texture_resolution(
+            packing_mode,
+            int(texture_resolution),
+        )
+        if not fit_to_square and image.size != (
+            physical_resolution,
+            physical_resolution,
         ):
             raise ValueError(
                 f"Texture {str(texture_path)!r} must be "
-                f"{int(texture_resolution)} x {int(texture_resolution)}; "
+                f"{physical_resolution} x {physical_resolution}; "
                 f"received {image.width} x {image.height}."
             )
         thumbnail = (
@@ -236,6 +324,9 @@ def load_atlas_object_texture_source(
         fit_to_square=fit_to_square,
         supports_resolution_changes=supports_resolution_changes,
         supports_3d_preview=supports_3d_preview,
+        packing_mode=packing_mode,
+        symmetric_preview_orientation=symmetric_preview_orientation,
+        symmetric_preview_plane_coordinate=symmetric_preview_plane_coordinate,
     )
 
 
@@ -436,9 +527,29 @@ class TextureAtlasPreview(QWidget):
         atlas_x = (position.x() - atlas_rect.left()) * scale
         atlas_y = (position.y() - atlas_rect.top()) * scale
         for placement in atlas.placements:
+            content_x = placement.x
+            content_y = placement.y
+            content_width = placement.size
+            content_height = placement.size
+            if placement.packing_mode in ATLAS_HALF_SLOT_PACKING_MODES:
+                content_width = placement.size / 2.0
+                if placement.slot_half == ATLAS_SLOT_HALF_RIGHT:
+                    content_x += content_width
+            elif (
+                placement.packing_mode
+                == ATLAS_PACKING_MODE_SYMMETRIC_QUARTER
+            ):
+                content_width = placement.texture_resolution
+                content_height = placement.texture_resolution
+                offset_x, offset_y = _quarter_region_offset(
+                    placement.slot_quadrant,
+                    placement.texture_resolution,
+                )
+                content_x += offset_x
+                content_y += offset_y
             if (
-                placement.x <= atlas_x < placement.x + placement.size
-                and placement.y <= atlas_y < placement.y + placement.size
+                content_x <= atlas_x < content_x + content_width
+                and content_y <= atlas_y < content_y + content_height
             ):
                 return placement.object_id
         return None
@@ -576,8 +687,8 @@ class TextureAtlasPreview(QWidget):
             and self._update_drag_slot_preview(object_id, event.position())
         )
         slot_preview = self._drag_slot_preview if has_preview else None
-        self._clear_drag_slot_preview()
         if slot_preview is None or not slot_preview.is_valid:
+            self._clear_drag_slot_preview()
             event.ignore()
             return
         self.object_dropped.emit(
@@ -585,6 +696,7 @@ class TextureAtlasPreview(QWidget):
             slot_preview.x,
             slot_preview.y,
         )
+        self._clear_drag_slot_preview()
         event.setDropAction(Qt.DropAction.CopyAction)
         event.accept()
 
@@ -606,8 +718,24 @@ class TextureAtlasPreview(QWidget):
         atlas_rect = _aspect_fit_square(self.width(), self.height())
         painter.fillRect(atlas_rect, PREVIEW_EMPTY_COLOR)
         self._paint_quadtree_grid(painter, atlas_rect, atlas.resolution)
+        painted_symmetric_slots: set[tuple[int, int, int]] = set()
         for placement in atlas.placements:
-            placement_rect = _placement_preview_rect(
+            logical_rect = _placement_preview_rect(
+                placement,
+                atlas.resolution,
+                atlas_rect,
+            )
+            if placement.packing_mode in {
+                ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+                ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+                ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+                ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+            }:
+                slot_key = (placement.x, placement.y, placement.size)
+                if slot_key not in painted_symmetric_slots:
+                    painter.fillRect(logical_rect, QColor(0, 0, 0, 255))
+                    painted_symmetric_slots.add(slot_key)
+            placement_rect = _placement_content_preview_rect(
                 placement,
                 atlas.resolution,
                 atlas_rect,
@@ -617,10 +745,34 @@ class TextureAtlasPreview(QWidget):
                 painter.fillRect(placement_rect, PREVIEW_MISSING_COLOR)
                 label = f"Missing\n{placement.object_id}"
             else:
-                painter.drawImage(
-                    placement_rect,
-                    self._source_preview_images[placement.object_id],
-                )
+                preview_image = self._source_preview_images[placement.object_id]
+                if placement.packing_mode in ATLAS_HALF_SLOT_PACKING_MODES:
+                    painter.drawImage(
+                        placement_rect,
+                        preview_image,
+                        QRectF(
+                            0.0,
+                            0.0,
+                            preview_image.width() / 2.0,
+                            float(preview_image.height()),
+                        ),
+                    )
+                elif (
+                    placement.packing_mode
+                    == ATLAS_PACKING_MODE_SYMMETRIC_QUARTER
+                ):
+                    painter.drawImage(
+                        placement_rect,
+                        preview_image,
+                        QRectF(
+                            0.0,
+                            0.0,
+                            preview_image.width() / 2.0,
+                            preview_image.height() / 2.0,
+                        ),
+                    )
+                else:
+                    painter.drawImage(placement_rect, preview_image)
                 label = (
                     f"{source.object_name}\n"
                     f"{placement.texture_resolution} x "
@@ -676,19 +828,128 @@ class TextureAtlasPreview(QWidget):
         raw_y = int((position.y() - atlas_rect.top()) * scale)
         atlas_x = min(max(raw_x, 0), max(0, atlas.resolution - 1))
         atlas_y = min(max(raw_y, 0), max(0, atlas.resolution - 1))
-        slot_size = source.texture_resolution
+        slot_size = _physical_texture_resolution(
+            source.packing_mode,
+            source.texture_resolution,
+        )
+        existing = atlas.placement_for_object(str(object_id))
+        if (
+            source.packing_mode
+            in {
+                ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+                ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+                ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+                ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+            }
+            and existing is not None
+            and existing.packing_mode == source.packing_mode
+            and existing.texture_resolution == source.texture_resolution
+            and existing.x <= atlas_x < existing.x + existing.size
+            and existing.y <= atlas_y < existing.y + existing.size
+        ):
+            return AtlasDragSlotPreview(
+                object_id=str(object_id),
+                x=existing.x,
+                y=existing.y,
+                size=existing.size,
+                slot_half=existing.slot_half,
+                slot_quadrant=existing.slot_quadrant,
+                is_valid=pointer_is_inside,
+            )
+        compatible_group: list[TextureAtlasPlacement] | None = None
+        if source.packing_mode in {
+            ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+            ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+            ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+            ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+        }:
+            visited_slots: set[tuple[int, int, int]] = set()
+            for placement in atlas.placements:
+                slot_key = (placement.x, placement.y, placement.size)
+                if slot_key in visited_slots:
+                    continue
+                visited_slots.add(slot_key)
+                if (
+                    placement.object_id == object_id
+                    or placement.packing_mode != source.packing_mode
+                    or placement.texture_resolution
+                    != source.texture_resolution
+                    or not (
+                        placement.x <= atlas_x < placement.x + placement.size
+                        and placement.y
+                        <= atlas_y
+                        < placement.y + placement.size
+                    )
+                ):
+                    continue
+                slot_members = [
+                    candidate
+                    for candidate in atlas.placements
+                    if candidate.object_id != object_id
+                    and candidate.x == placement.x
+                    and candidate.y == placement.y
+                    and candidate.size == placement.size
+                ]
+                capacity = (
+                    2
+                    if source.packing_mode
+                    in ATLAS_HALF_SLOT_PACKING_MODES
+                    else 4
+                )
+                if 0 < len(slot_members) < capacity:
+                    compatible_group = slot_members
+                    break
         slot_x = (
-            atlas_x // ATLAS_BASE_CELL_SIZE
-        ) * ATLAS_BASE_CELL_SIZE
+            compatible_group[0].x
+            if compatible_group is not None
+            else (atlas_x // ATLAS_BASE_CELL_SIZE) * ATLAS_BASE_CELL_SIZE
+        )
         slot_y = (
-            atlas_y // ATLAS_BASE_CELL_SIZE
-        ) * ATLAS_BASE_CELL_SIZE
+            compatible_group[0].y
+            if compatible_group is not None
+            else (atlas_y // ATLAS_BASE_CELL_SIZE) * ATLAS_BASE_CELL_SIZE
+        )
+        slot_half = (
+            ATLAS_SLOT_HALF_RIGHT
+            if compatible_group is not None
+            and source.packing_mode
+            in ATLAS_HALF_SLOT_PACKING_MODES
+            else (
+                ATLAS_SLOT_HALF_LEFT
+                if source.packing_mode
+                in ATLAS_HALF_SLOT_PACKING_MODES
+                else None
+            )
+        )
+        occupied_quadrants = (
+            {
+                placement.slot_quadrant
+                for placement in compatible_group
+            }
+            if compatible_group is not None
+            else set()
+        )
+        slot_quadrant = (
+            next(
+                quadrant
+                for quadrant in ATLAS_SLOT_QUADRANT_ORDER
+                if quadrant not in occupied_quadrants
+            )
+            if source.packing_mode == ATLAS_PACKING_MODE_SYMMETRIC_QUARTER
+            else None
+        )
         fits_bounds = (
             slot_x + slot_size <= atlas.resolution
             and slot_y + slot_size <= atlas.resolution
         )
         overlaps_other = any(
             placement.object_id != object_id
+            and not (
+                compatible_group is not None
+                and placement.x == compatible_group[0].x
+                and placement.y == compatible_group[0].y
+                and placement.size == compatible_group[0].size
+            )
             and slot_x < placement.x + placement.size
             and slot_x + slot_size > placement.x
             and slot_y < placement.y + placement.size
@@ -700,6 +961,8 @@ class TextureAtlasPreview(QWidget):
             x=slot_x,
             y=slot_y,
             size=slot_size,
+            slot_half=slot_half,
+            slot_quadrant=slot_quadrant,
             is_valid=(
                 pointer_is_inside and fits_bounds and not overlaps_other
             ),
@@ -740,12 +1003,17 @@ class TextureAtlasPreview(QWidget):
         preview_image = self._source_preview_images.get(slot_preview.object_id)
         if preview_image is None:
             return
-        preview_rect = _atlas_slot_preview_rect(
+        logical_rect = _atlas_slot_preview_rect(
             slot_preview.x,
             slot_preview.y,
             slot_preview.size,
             atlas.resolution,
             atlas_rect,
+        )
+        preview_rect = _slot_content_preview_rect(
+            logical_rect,
+            slot_preview.slot_half,
+            slot_preview.slot_quadrant,
         )
         fill_color = (
             PREVIEW_DRAG_VALID_FILL_COLOR
@@ -761,7 +1029,30 @@ class TextureAtlasPreview(QWidget):
         painter.save()
         painter.setClipRect(atlas_rect)
         painter.setOpacity(PREVIEW_DRAG_IMAGE_OPACITY)
-        painter.drawImage(preview_rect, preview_image)
+        if slot_preview.slot_half is not None:
+            painter.drawImage(
+                preview_rect,
+                preview_image,
+                QRectF(
+                    0.0,
+                    0.0,
+                    preview_image.width() / 2.0,
+                    float(preview_image.height()),
+                ),
+            )
+        elif slot_preview.slot_quadrant is not None:
+            painter.drawImage(
+                preview_rect,
+                preview_image,
+                QRectF(
+                    0.0,
+                    0.0,
+                    preview_image.width() / 2.0,
+                    preview_image.height() / 2.0,
+                ),
+            )
+        else:
+            painter.drawImage(preview_rect, preview_image)
         painter.restore()
         clipped_rect = preview_rect.intersected(atlas_rect)
         painter.fillRect(clipped_rect, fill_color)
@@ -837,7 +1128,7 @@ class TextureAtlasWorkspace(QWidget):
             TextureVariantSelectabilityResolver | None
         ) = None
         self._variant_source_cache: dict[
-            tuple[str, int, str],
+            tuple[str, int, str, str],
             AtlasObjectTextureSource,
         ] = {}
         self._lazy_materialization_error: tuple[str, str] | None = None
@@ -1033,6 +1324,21 @@ class TextureAtlasWorkspace(QWidget):
                 return 0
             replacement_sources[placement.texture_resolution] = source
 
+        if all(
+            (
+                (placement := atlas.placement_for_object(object_id))
+                is not None
+                and (
+                    source := replacement_sources[placement.texture_resolution]
+                ).texture_path
+                == placement.texture_path
+                and source.texture_resolution == placement.texture_resolution
+                and source.packing_mode == placement.packing_mode
+            )
+            for atlas in affected_atlases
+        ):
+            return 0
+
         previous_image_paths = {
             atlas.atlas_id: atlas.image_path for atlas in affected_atlases
         }
@@ -1046,6 +1352,7 @@ class TextureAtlasWorkspace(QWidget):
                 object_id,
                 source.texture_path,
                 source.texture_resolution,
+                source.packing_mode,
             )
         self._data = next_data
 
@@ -1137,6 +1444,169 @@ class TextureAtlasWorkspace(QWidget):
             )
         except (OSError, TypeError, ValueError):
             return False
+        return True
+
+    def transition_object_packing(
+        self,
+        object_id: str,
+        candidate_sources: list[AtlasObjectTextureSource]
+        | tuple[AtlasObjectTextureSource, ...],
+        *,
+        commit_callback: TextureResolutionCommitCallback,
+    ) -> bool:
+        """Atomically reconcile a generated object's texture packing."""
+
+        normalized_id = str(object_id).strip()
+        sources = list(candidate_sources)
+        if not normalized_id or not sources or not callable(commit_callback):
+            return False
+        if any(source.object_id != normalized_id for source in sources):
+            return False
+        sources_by_resolution = {
+            source.texture_resolution: source for source in sources
+        }
+        if len(sources_by_resolution) != len(sources):
+            return False
+        affected_atlas_ids = tuple(
+            atlas.atlas_id
+            for atlas in self._data.atlases
+            if atlas.placement_for_object(normalized_id) is not None
+        )
+        if not affected_atlas_ids:
+            return self._accept_texture_resolution_commit(commit_callback)
+
+        previous_data = self._data.clone()
+        previous_lazy_error = self._lazy_materialization_error
+        next_data = self._data.clone()
+        try:
+            for atlas_id in affected_atlas_ids:
+                atlas = next_data.atlas_by_id(atlas_id)
+                assert atlas is not None
+                placement = atlas.placement_for_object(normalized_id)
+                assert placement is not None
+                source = sources_by_resolution.get(placement.texture_resolution)
+                if source is None:
+                    source = next(
+                        (
+                            candidate
+                            for candidate in sources
+                            if candidate.packing_mode
+                            in {
+                                ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+                                ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+                                ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+                            }
+                            and candidate.texture_resolution * 2
+                            == placement.size
+                        ),
+                        None,
+                    )
+                if source is None:
+                    raise ValueError(
+                        "The candidate object is missing an exact texture "
+                        f"variant at {placement.texture_resolution} x "
+                        f"{placement.texture_resolution}."
+                    )
+                next_data.assign_object(
+                    atlas_id,
+                    normalized_id,
+                    source.texture_path,
+                    source.texture_resolution,
+                    source.packing_mode,
+                )
+            for atlas_id in affected_atlas_ids:
+                atlas = next_data.atlas_by_id(atlas_id)
+                assert atlas is not None
+                for placement in atlas.placements:
+                    source = (
+                        sources_by_resolution.get(placement.texture_resolution)
+                        if placement.object_id == normalized_id
+                        else self._resolve_placement_source(placement)
+                    )
+                    if (
+                        source is None
+                        or source.texture_path != placement.texture_path
+                        or source.packing_mode != placement.packing_mode
+                    ):
+                        raise ValueError(
+                            "An exact texture needed to rebuild an affected "
+                            "atlas is unavailable."
+                        )
+        except (OSError, TypeError, ValueError) as error:
+            self.status_label.setText(
+                "Object packing change blocked; all Atlas placements and "
+                f"PNGs remain unchanged: {error}"
+            )
+            return False
+
+        png_snapshots: dict[Path, bytes | None] = {}
+        source_overrides = {
+            (normalized_id, resolution): source
+            for resolution, source in sources_by_resolution.items()
+        }
+        try:
+            png_snapshots = self._snapshot_atlas_pngs(affected_atlas_ids)
+            for atlas_id in affected_atlas_ids:
+                atlas = next_data.atlas_by_id(atlas_id)
+                assert atlas is not None
+                self._materialize_atlas(
+                    atlas,
+                    source_overrides=source_overrides,
+                )
+        except (OSError, TypeError, ValueError) as error:
+            _restore_atlas_png_snapshots(png_snapshots)
+            self._lazy_materialization_error = previous_lazy_error
+            self.status_label.setText(
+                "Object packing change blocked; all Atlas placements and "
+                f"PNGs remain unchanged: {error}"
+            )
+            return False
+
+        self._data = next_data
+        if not self._accept_texture_resolution_commit(commit_callback):
+            self._data = previous_data
+            restore_failures = _restore_atlas_png_snapshots(png_snapshots)
+            self._lazy_materialization_error = previous_lazy_error
+            self._refresh_all()
+            self.status_label.setText(
+                "Object packing change blocked; Generation rejected the "
+                "candidate, so every Atlas placement and PNG was restored."
+            )
+            if restore_failures:
+                self.status_label.setText(
+                    self.status_label.text()
+                    + f" {restore_failures} prior Atlas PNG file(s) could not "
+                    "be restored."
+                )
+            return False
+
+        try:
+            self._refresh_all()
+            self._emit_data_changed()
+        except Exception as error:
+            self._data = previous_data
+            restore_failures = _restore_atlas_png_snapshots(png_snapshots)
+            self._lazy_materialization_error = previous_lazy_error
+            try:
+                self._refresh_all()
+            except Exception:
+                pass
+            self.status_label.setText(
+                "Object packing change blocked; Atlas could not publish the "
+                f"candidate, so every placement and PNG was restored: {error}"
+            )
+            if restore_failures:
+                self.status_label.setText(
+                    self.status_label.text()
+                    + f" {restore_failures} prior Atlas PNG file(s) could not "
+                    "be restored."
+                )
+            return False
+        self.status_label.setText(
+            f"Updated {len(affected_atlas_ids)} Atlas layout"
+            f"{'s' if len(affected_atlas_ids) != 1 else ''} for the "
+            "object's texture packing."
+        )
         return True
 
     def set_object_texture_resolution(
@@ -1300,6 +1770,8 @@ class TextureAtlasWorkspace(QWidget):
                 normalized_id,
                 target_source.texture_path,
                 target_source.texture_resolution,
+                target_source.packing_mode,
+                allow_pairing=False,
             )
             affected_atlas_ids.append(atlas.atlas_id)
 
@@ -1542,6 +2014,7 @@ class TextureAtlasWorkspace(QWidget):
                 source.object_id,
                 source.texture_path,
                 source.texture_resolution,
+                source.packing_mode,
             )
             self._materialize_atlas(atlas)
         except (OSError, TypeError, ValueError) as error:
@@ -1653,6 +2126,13 @@ class TextureAtlasWorkspace(QWidget):
                 source.texture_resolution,
                 x,
                 y,
+                source.packing_mode,
+                self.preview.drag_slot_preview.slot_half
+                if self.preview.drag_slot_preview is not None
+                else None,
+                self.preview.drag_slot_preview.slot_quadrant
+                if self.preview.drag_slot_preview is not None
+                else None,
             )
             self._materialize_atlas(atlas)
         except (OSError, TypeError, ValueError) as error:
@@ -1731,9 +2211,19 @@ class TextureAtlasWorkspace(QWidget):
         if placement is None:
             return False
         current_resolution = placement.texture_resolution
-        current_index = TEXTURE_RESOLUTION_ORDER.index(current_resolution)
-        target_resolution = TEXTURE_RESOLUTION_ORDER[
-            (current_index + direction) % len(TEXTURE_RESOLUTION_ORDER)
+        resolution_order = (
+            (512, 1024)
+            if placement.packing_mode
+            in {
+                ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+                ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+                ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+            }
+            else TEXTURE_RESOLUTION_ORDER
+        )
+        current_index = resolution_order.index(current_resolution)
+        target_resolution = resolution_order[
+            (current_index + direction) % len(resolution_order)
         ]
         object_name = self._object_display_name(object_id)
         if self.set_object_texture_resolution(object_id, target_resolution):
@@ -2029,7 +2519,16 @@ class TextureAtlasWorkspace(QWidget):
             return False
         return True
 
-    def _materialize_atlas(self, atlas: TextureAtlasRecord) -> None:
+    def _materialize_atlas(
+        self,
+        atlas: TextureAtlasRecord,
+        *,
+        source_overrides: dict[
+            tuple[str, int],
+            AtlasObjectTextureSource,
+        ]
+        | None = None,
+    ) -> None:
         """Write a complete atlas before exposing its updated state."""
 
         self._asset_directory.mkdir(parents=True, exist_ok=True)
@@ -2041,13 +2540,28 @@ class TextureAtlasWorkspace(QWidget):
             )
 
         def load_source(placement: TextureAtlasPlacement) -> np.ndarray:
-            source = self._resolve_placement_source(placement)
+            source = (
+                None
+                if source_overrides is None
+                else source_overrides.get(
+                    (placement.object_id, placement.texture_resolution)
+                )
+            )
+            if source is None:
+                source = self._resolve_placement_source(placement)
             if source is None:
                 raise ValueError(
                     "The atlas cannot be updated because the exact "
                     f"{placement.texture_resolution} x "
                     f"{placement.texture_resolution} texture for source "
                     f"{placement.object_id!r} is unavailable."
+                )
+            if (
+                source.texture_path != placement.texture_path
+                or source.packing_mode != placement.packing_mode
+            ):
+                raise ValueError(
+                    "The exact texture source does not match its Atlas placement."
                 )
             rgba = source.load_texture_rgba()
             return np.ascontiguousarray(rgba[:, :, (2, 1, 0, 3)])
@@ -2123,6 +2637,7 @@ class TextureAtlasWorkspace(QWidget):
             active_source is not None
             and active_source.texture_resolution == placement.texture_resolution
             and active_source.texture_path == placement.texture_path
+            and active_source.packing_mode == placement.packing_mode
         ):
             return active_source
 
@@ -2130,6 +2645,7 @@ class TextureAtlasWorkspace(QWidget):
             placement.object_id,
             placement.texture_resolution,
             placement.texture_path,
+            placement.packing_mode,
         )
         cached_source = self._variant_source_cache.get(cache_key)
         if cached_source is not None:
@@ -2149,6 +2665,7 @@ class TextureAtlasWorkspace(QWidget):
                     and source.texture_resolution
                     == placement.texture_resolution
                     and source.texture_path == placement.texture_path
+                    and source.packing_mode == placement.packing_mode
                 ):
                     if (
                         len(self._variant_source_cache)
@@ -2201,6 +2718,7 @@ class TextureAtlasWorkspace(QWidget):
             source.object_id,
             source.texture_resolution,
             source.texture_path,
+            source.packing_mode,
         )
         if len(self._variant_source_cache) >= MAX_VARIANT_SOURCE_CACHE_ENTRIES:
             oldest_key = next(iter(self._variant_source_cache))
@@ -2289,6 +2807,13 @@ def _read_texture_source_mime_data(mime_data: QMimeData) -> str | None:
 
 
 # ### Preview helpers ###
+def _physical_texture_resolution(packing_mode: str, resolution: int) -> int:
+    """Return the source PNG and logical Atlas slot side length."""
+
+    multiplier = 2 if packing_mode in DOUBLE_SIZED_SYMMETRIC_PACKING_MODES else 1
+    return int(resolution) * multiplier
+
+
 def _fit_image_to_square(image: Image.Image, resolution: int) -> Image.Image:
     """Aspect-fit all source pixels into a transparent square allocation."""
 
@@ -2353,6 +2878,113 @@ def _placement_preview_rect(
         placement.size * scale,
         placement.size * scale,
     )
+
+
+def _placement_content_preview_rect(
+    placement: TextureAtlasPlacement,
+    atlas_resolution: int,
+    atlas_rect: QRectF,
+) -> QRectF:
+    """Return one independently selectable packed-content rectangle."""
+
+    logical_rect = _placement_preview_rect(
+        placement,
+        atlas_resolution,
+        atlas_rect,
+    )
+    if placement.packing_mode == ATLAS_PACKING_MODE_FULL:
+        return logical_rect
+    if placement.packing_mode == ATLAS_PACKING_MODE_SYMMETRIC_QUARTER:
+        return _slot_content_preview_rect(
+            logical_rect,
+            None,
+            placement.slot_quadrant,
+        )
+    half_width = logical_rect.width() / 2.0
+    return QRectF(
+        (
+            logical_rect.left() + half_width
+            if placement.slot_half == ATLAS_SLOT_HALF_RIGHT
+            else logical_rect.left()
+        ),
+        logical_rect.top(),
+        half_width,
+        logical_rect.height(),
+    )
+
+
+def _slot_content_preview_rect(
+    logical_rect: QRectF,
+    slot_half: str | None,
+    slot_quadrant: str | None,
+) -> QRectF:
+    if slot_quadrant in ATLAS_SLOT_QUADRANT_ORDER:
+        half_width = logical_rect.width() / 2.0
+        half_height = logical_rect.height() / 2.0
+        offset_x = (
+            half_width
+            if slot_quadrant
+            in {
+                ATLAS_SLOT_QUADRANT_TOP_RIGHT,
+                ATLAS_SLOT_QUADRANT_BOTTOM_RIGHT,
+            }
+            else 0.0
+        )
+        offset_y = (
+            half_height
+            if slot_quadrant
+            in {
+                ATLAS_SLOT_QUADRANT_BOTTOM_LEFT,
+                ATLAS_SLOT_QUADRANT_BOTTOM_RIGHT,
+            }
+            else 0.0
+        )
+        return QRectF(
+            logical_rect.left() + offset_x,
+            logical_rect.top() + offset_y,
+            half_width,
+            half_height,
+        )
+    if slot_half not in {ATLAS_SLOT_HALF_LEFT, ATLAS_SLOT_HALF_RIGHT}:
+        return logical_rect
+    half_width = logical_rect.width() / 2.0
+    return QRectF(
+        (
+            logical_rect.left() + half_width
+            if slot_half == ATLAS_SLOT_HALF_RIGHT
+            else logical_rect.left()
+        ),
+        logical_rect.top(),
+        half_width,
+        logical_rect.height(),
+    )
+
+
+def _quarter_region_offset(
+    slot_quadrant: str | None,
+    content_resolution: int,
+) -> tuple[int, int]:
+    if slot_quadrant not in ATLAS_SLOT_QUADRANT_ORDER:
+        return (0, 0)
+    offset_x = (
+        int(content_resolution)
+        if slot_quadrant
+        in {
+            ATLAS_SLOT_QUADRANT_TOP_RIGHT,
+            ATLAS_SLOT_QUADRANT_BOTTOM_RIGHT,
+        }
+        else 0
+    )
+    offset_y = (
+        int(content_resolution)
+        if slot_quadrant
+        in {
+            ATLAS_SLOT_QUADRANT_BOTTOM_LEFT,
+            ATLAS_SLOT_QUADRANT_BOTTOM_RIGHT,
+        }
+        else 0
+    )
+    return offset_x, offset_y
 
 
 def _atlas_slot_preview_rect(

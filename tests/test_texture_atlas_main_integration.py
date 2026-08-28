@@ -7,7 +7,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -21,6 +21,7 @@ from PySide6.QtWidgets import QApplication
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.glb import GeneratedModel
+from housemaker.generation_state import GeneratedObjectRecord
 from housemaker.main import BlueprintWorkspace
 from housemaker.models import GROUND_LEVEL_INDEX, create_default_levels
 from housemaker.project_io import ProjectData
@@ -31,7 +32,13 @@ from housemaker.surface_texture_state import (
     SurfaceTextureData,
     SurfaceTextureVariant,
 )
-from housemaker.texture_atlas_state import TextureAtlasData
+from housemaker.texture_atlas_state import (
+    ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+    ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+    ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+    ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+    TextureAtlasData,
+)
 from housemaker.texture_atlas_workspace import (
     build_atlas_wall_texture_source_id,
 )
@@ -605,6 +612,338 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         with Image.open(atlas_png) as image:
             self.assertEqual(image.getpixel((256, 256)), (170, 70, 25, 255))
 
+    def test_generation_packing_callback_routes_candidate_sources_to_atlas(
+        self,
+    ) -> None:
+        old_record = GeneratedObjectRecord(
+            object_id="chair",
+            frame_index=0,
+            object_name="Chair",
+            pipeline={},
+            provider_task_id="task-old",
+            asset_path="chair-old.glb",
+        )
+        replacement = replace(
+            old_record,
+            pipeline={"symmetric_division": {"version": 1}},
+            asset_path="chair-half.glb",
+        )
+        symmetry = SimpleNamespace(
+            orientation="vertical",
+            plane_coordinate=0.0,
+        )
+        variants = {
+            resolution: SimpleNamespace(resolution=resolution)
+            for resolution in (512, 1024, 2048)
+        }
+        sources = {
+            resolution: SimpleNamespace(
+                object_id="chair",
+                texture_resolution=resolution,
+            )
+            for resolution in variants
+        }
+        commit = Mock(return_value=True)
+
+        with patch.object(
+            self.workspace.generation,
+            "resolve_symmetric_division_for_record",
+            return_value=symmetry,
+        ), patch.object(
+            self.workspace.generation,
+            "resolve_texture_image_variant_for_record",
+            side_effect=lambda _record, resolution: variants[resolution],
+        ), patch.object(
+            self.workspace,
+            "_build_atlas_object_texture_source",
+            side_effect=lambda variant, _symmetry: sources[variant.resolution],
+        ), patch.object(
+            self.workspace.texture_atlas_workspace,
+            "transition_object_packing",
+            return_value=True,
+        ) as transition:
+            accepted = (
+                self.workspace
+                ._handle_generation_object_packing_change_requested(
+                    old_record,
+                    replacement,
+                    GeneratedModel(
+                        mesh=trimesh.creation.box(),
+                        scene=trimesh.Scene(),
+                        glb_bytes=b"candidate",
+                    ),
+                    commit,
+                )
+            )
+
+        self.assertTrue(accepted)
+        transition.assert_called_once_with(
+            "chair",
+            [sources[512], sources[1024], sources[2048]],
+            commit_callback=commit,
+        )
+
+    def test_generation_quarter_packing_callback_skips_missing_2048_variant(
+        self,
+    ) -> None:
+        old_record = GeneratedObjectRecord(
+            object_id="chair",
+            frame_index=0,
+            object_name="Chair",
+            pipeline={},
+            provider_task_id="task-old",
+            asset_path="chair-old.glb",
+        )
+        replacement = replace(
+            old_record,
+            pipeline={"symmetric_division": {"version": 2}},
+            asset_path="chair-quarter.glb",
+        )
+        symmetry = SimpleNamespace(
+            version=2,
+            orientation="vertical",
+            kept_side="left",
+            plane_coordinate=0.0,
+            packing_mode="symmetric_quarter",
+            texture_content_quadrant="top_left",
+        )
+        variants = {
+            resolution: SimpleNamespace(resolution=resolution)
+            for resolution in (512, 1024)
+        }
+        sources = {
+            resolution: SimpleNamespace(
+                object_id="chair",
+                texture_resolution=resolution,
+            )
+            for resolution in variants
+        }
+        commit = Mock(return_value=True)
+
+        with patch.object(
+            self.workspace.generation,
+            "resolve_symmetric_division_for_record",
+            return_value=symmetry,
+        ), patch.object(
+            self.workspace.generation,
+            "resolve_texture_image_variant_for_record",
+            side_effect=lambda _record, resolution: variants.get(resolution),
+        ), patch.object(
+            self.workspace,
+            "_build_atlas_object_texture_source",
+            side_effect=lambda variant, _symmetry: sources[variant.resolution],
+        ), patch.object(
+            self.workspace.texture_atlas_workspace,
+            "transition_object_packing",
+            return_value=True,
+        ) as transition:
+            accepted = (
+                self.workspace
+                ._handle_generation_object_packing_change_requested(
+                    old_record,
+                    replacement,
+                    _generated_box_model(),
+                    commit,
+                )
+            )
+
+        self.assertTrue(accepted)
+        transition.assert_called_once_with(
+            "chair",
+            [sources[512], sources[1024]],
+            commit_callback=commit,
+        )
+
+    def test_generation_pair_packing_callback_skips_missing_2048_variant(
+        self,
+    ) -> None:
+        old_record = GeneratedObjectRecord(
+            object_id="chair",
+            frame_index=0,
+            object_name="Chair",
+            pipeline={},
+            provider_task_id="task-old",
+            asset_path="chair-old.glb",
+        )
+        replacement = replace(
+            old_record,
+            pipeline={"symmetric_division": {"version": 3}},
+            asset_path="chair-pair.glb",
+        )
+        symmetry = SimpleNamespace(
+            version=3,
+            orientation="vertical",
+            kept_side="left",
+            plane_coordinate=0.0,
+            packing_mode="symmetric_pair",
+            texture_content_half="left",
+        )
+        variants = {
+            resolution: SimpleNamespace(resolution=resolution)
+            for resolution in (512, 1024)
+        }
+        sources = {
+            resolution: SimpleNamespace(
+                object_id="chair",
+                texture_resolution=resolution,
+            )
+            for resolution in variants
+        }
+        commit = Mock(return_value=True)
+
+        with patch.object(
+            self.workspace.generation,
+            "resolve_symmetric_division_for_record",
+            return_value=symmetry,
+        ), patch.object(
+            self.workspace.generation,
+            "resolve_texture_image_variant_for_record",
+            side_effect=lambda _record, resolution: variants.get(resolution),
+        ), patch.object(
+            self.workspace,
+            "_build_atlas_object_texture_source",
+            side_effect=lambda variant, _symmetry: sources[variant.resolution],
+        ), patch.object(
+            self.workspace.texture_atlas_workspace,
+            "transition_object_packing",
+            return_value=True,
+        ) as transition:
+            accepted = (
+                self.workspace
+                ._handle_generation_object_packing_change_requested(
+                    old_record,
+                    replacement,
+                    _generated_box_model(),
+                    commit,
+                )
+            )
+
+        self.assertTrue(accepted)
+        transition.assert_called_once_with(
+            "chair",
+            [sources[512], sources[1024]],
+            commit_callback=commit,
+        )
+
+    def test_main_adapts_current_square_and_all_legacy_symmetry_metadata(
+        self,
+    ) -> None:
+        asset_root = Path(self._temporary_directory.name)
+        square_pair_png = asset_root / "chair-square-pair-512.png"
+        pair_png = asset_root / "chair-pair-512.png"
+        quarter_png = asset_root / "chair-quarter-512.png"
+        half_png = asset_root / "chair-half-512.png"
+        _write_texture_png(square_pair_png, 512, (90, 60, 30, 255))
+        _write_texture_png(pair_png, 1024, (30, 60, 90, 255))
+        _write_texture_png(quarter_png, 1024, (20, 40, 60, 255))
+        _write_texture_png(half_png, 512, (60, 40, 20, 255))
+        square_pair_variant = SimpleNamespace(
+            object_id="square-pair",
+            object_name="Square pair",
+            resolution=512,
+            texture_asset_relative_path=square_pair_png.name,
+            texture_asset_path=square_pair_png,
+        )
+        pair_variant = SimpleNamespace(
+            object_id="pair",
+            object_name="Pair",
+            resolution=512,
+            texture_asset_relative_path=pair_png.name,
+            texture_asset_path=pair_png,
+        )
+        quarter_variant = SimpleNamespace(
+            object_id="quarter",
+            object_name="Quarter",
+            resolution=512,
+            texture_asset_relative_path=quarter_png.name,
+            texture_asset_path=quarter_png,
+        )
+        half_variant = SimpleNamespace(
+            object_id="half",
+            object_name="Half",
+            resolution=512,
+            texture_asset_relative_path=half_png.name,
+            texture_asset_path=half_png,
+        )
+        square_pair_metadata = SimpleNamespace(
+            version=4,
+            orientation="vertical",
+            plane_coordinate=0.0,
+            packing_mode="symmetric_pair",
+            texture_content_half="left",
+        )
+        quarter_metadata = SimpleNamespace(
+            version=2,
+            orientation="vertical",
+            plane_coordinate=0.0,
+            packing_mode="symmetric_quarter",
+            texture_content_quadrant="top_left",
+        )
+        pair_metadata = SimpleNamespace(
+            version=3,
+            orientation="vertical",
+            plane_coordinate=0.0,
+            packing_mode="symmetric_pair",
+            texture_content_half="left",
+        )
+        legacy_metadata = SimpleNamespace(
+            version=1,
+            orientation="horizontal",
+            plane_coordinate=1.0,
+        )
+
+        square_pair_source = self.workspace._build_atlas_object_texture_source(
+            square_pair_variant,
+            square_pair_metadata,
+        )
+        pair_source = self.workspace._build_atlas_object_texture_source(
+            pair_variant,
+            pair_metadata,
+        )
+        quarter_source = self.workspace._build_atlas_object_texture_source(
+            quarter_variant,
+            quarter_metadata,
+        )
+        half_source = self.workspace._build_atlas_object_texture_source(
+            half_variant,
+            legacy_metadata,
+        )
+
+        assert (
+            square_pair_source is not None
+            and pair_source is not None
+            and quarter_source is not None
+            and half_source is not None
+        )
+        self.assertEqual(
+            square_pair_source.packing_mode,
+            ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+        )
+        self.assertEqual(
+            square_pair_source.load_texture_rgba().shape,
+            (512, 512, 4),
+        )
+        self.assertEqual(
+            pair_source.packing_mode,
+            ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+        )
+        self.assertEqual(
+            pair_source.load_texture_rgba().shape,
+            (1024, 1024, 4),
+        )
+        self.assertEqual(
+            quarter_source.packing_mode,
+            ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+        )
+        self.assertEqual(
+            quarter_source.load_texture_rgba().shape,
+            (1024, 1024, 4),
+        )
+        self.assertEqual(
+            half_source.packing_mode,
+            ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+        )
+
     def test_stroke_only_generation_change_does_not_reload_thumbnails(
         self,
     ) -> None:
@@ -642,7 +981,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
                 object()
             )
 
-        source_builder.assert_called_once_with(variant)
+        source_builder.assert_called_once_with(variant, None)
 
     def test_unchanged_wall_source_is_cached_but_file_change_reloads_it(
         self,
@@ -780,7 +1119,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         ) as complete_variant_resolver, patch.object(
             self.workspace,
             "_build_atlas_object_texture_source",
-            side_effect=lambda variant: variant,
+            side_effect=lambda variant, _symmetry=None: variant,
         ), patch.object(
             self.workspace.texture_atlas_workspace,
             "set_object_texture_sources",
