@@ -12,12 +12,14 @@ import threading
 import time
 import unittest
 from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
 import cv2
 import numpy as np
 import trimesh
+from PIL import Image
 from PySide6.QtCore import QThread
 from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
@@ -41,14 +43,31 @@ from housemaker.generation_workspace import (
     TextureRegenerationRequest,
     TextureRegenerationWorker,
     GenerationWorkspace,
+    MeshyModelExecutor,
     MeshyTextureRegenerator,
     _TextureRegenerationPreflight,
     _GenerationCancelled,
     _materialize_texture_regeneration_preflight,
     _persist_generated_named_asset,
 )
-from housemaker.glb import GeneratedModel, import_generated_glb
+from housemaker.glb import (
+    GLTF_Y_UP_TO_Z_UP_TRANSFORM,
+    GeneratedModel,
+    import_generated_glb,
+)
 from housemaker.meshy_generation import MeshyGenerationResult
+from housemaker.object_symmetry import (
+    AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
+    SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL,
+    SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+    SYMMETRIC_DIVISION_SIDE_LEFT,
+    SYMMETRIC_DIVISION_SIDE_RIGHT,
+    SYMMETRIC_SELECTION_MODE_FEWEST_TRIANGLES_RANDOM_TIE,
+    SYMMETRIC_TEXTURE_CONTENT_HALF_LEFT,
+    SYMMETRIC_TEXTURE_PACKING_MODE_PAIR,
+    SymmetricDivisionMetadata,
+    build_symmetric_retexture_proxy_glb,
+)
 from housemaker.object_texture_variants import (
     TEXTURE_RESOLUTIONS,
     ObjectTextureVariants,
@@ -101,7 +120,15 @@ def _write_test_video(path: Path) -> None:
         writer.release()
 
 
-def _uv_glb(*, mutate_uv: bool = False) -> bytes:
+def _uv_glb(
+    *,
+    mutate_uv: bool = False,
+    subdivide_faces: bool = False,
+    left_packed: bool = False,
+    texture_resolution: int | None = None,
+    texture_color: tuple[int, int, int, int] = (25, 80, 160, 255),
+    texture_right_color: tuple[int, int, int, int] | None = None,
+) -> bytes:
     vertices = np.asarray(
         (
             (0.0, 0.0, 0.0),
@@ -118,8 +145,35 @@ def _uv_glb(*, mutate_uv: bool = False) -> bytes:
     )
     if mutate_uv:
         uv[-1] = (0.3, 0.25)
+    if left_packed:
+        uv[:, 0] *= 0.5
+    if subdivide_faces:
+        vertices = np.vstack((vertices, np.mean(vertices, axis=0)))
+        uv = np.vstack((uv, np.mean(uv, axis=0)))
+        faces = np.asarray(
+            ((0, 1, 4), (1, 2, 4), (2, 3, 4), (3, 0, 4)),
+            dtype=np.int64,
+        )
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-    mesh.visual = TextureVisuals(uv=uv, material=PBRMaterial())
+    texture_image = None
+    if texture_resolution is not None:
+        texture_image = Image.new(
+            "RGBA",
+            (texture_resolution, texture_resolution),
+            texture_color,
+        )
+        if texture_right_color is not None:
+            texture_image.paste(
+                texture_right_color,
+                (
+                    texture_resolution // 2,
+                    0,
+                    texture_resolution,
+                    texture_resolution,
+                ),
+            )
+    material = PBRMaterial(baseColorTexture=texture_image)
+    mesh.visual = TextureVisuals(uv=uv, material=material)
     return bytes(trimesh.Scene(mesh).export(file_type="glb"))
 
 
@@ -320,6 +374,149 @@ class TextureRegenerationRequestTests(unittest.TestCase):
                     )
 
 
+# ### Symmetric provider-proxy tests ###
+class SymmetricRetextureProxyTests(unittest.TestCase):
+    def test_proxy_mirrors_geometry_and_uses_both_texture_halves(self) -> None:
+        retained_color = (145, 35, 210, 255)
+        retained_glb = _uv_glb(
+            left_packed=True,
+            texture_resolution=1024,
+            texture_color=retained_color,
+            texture_right_color=(0, 0, 0, 255),
+        )
+
+        for orientation, axis in (
+            (SYMMETRIC_DIVISION_ORIENTATION_VERTICAL, 0),
+            (SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL, 2),
+        ):
+            with self.subTest(orientation=orientation):
+                proxy_glb = build_symmetric_retexture_proxy_glb(
+                    retained_glb,
+                    orientation,
+                    0.0,
+                )
+                proxy_scene = trimesh.load(
+                    BytesIO(proxy_glb),
+                    file_type="glb",
+                    force="scene",
+                    process=False,
+                )
+
+                self.assertEqual(len(proxy_scene.geometry), 2)
+                self.assertEqual(
+                    sum(
+                        len(mesh.faces)
+                        for mesh in proxy_scene.geometry.values()
+                    ),
+                    4,
+                )
+                z_up_vertices: list[np.ndarray] = []
+                uv_ranges: list[tuple[float, float]] = []
+                for node_name in proxy_scene.graph.nodes_geometry:
+                    transform, geometry_name = proxy_scene.graph.get(node_name)
+                    mesh = proxy_scene.geometry[geometry_name]
+                    gltf_vertices = trimesh.transform_points(
+                        mesh.vertices,
+                        transform,
+                    )
+                    z_up_vertices.append(
+                        trimesh.transform_points(
+                            gltf_vertices,
+                            GLTF_Y_UP_TO_Z_UP_TRANSFORM,
+                        )
+                    )
+                    uv = np.asarray(mesh.visual.uv, dtype=float)
+                    uv_ranges.append(
+                        (
+                            float(np.min(uv[:, 0])),
+                            float(np.max(uv[:, 0])),
+                        )
+                    )
+                    texture = np.asarray(
+                        mesh.visual.material.baseColorTexture.convert("RGBA"),
+                        dtype=np.uint8,
+                    )
+                    half_width = texture.shape[1] // 2
+                    self.assertTrue(
+                        np.all(texture[:, :half_width] == retained_color)
+                    )
+                    self.assertTrue(
+                        np.all(texture[:, half_width:] == retained_color)
+                    )
+                combined_vertices = np.vstack(z_up_vertices)
+                self.assertAlmostEqual(
+                    float(np.min(combined_vertices[:, axis])),
+                    -1.0,
+                )
+                self.assertAlmostEqual(
+                    float(np.max(combined_vertices[:, axis])),
+                    1.0,
+                )
+                self.assertTrue(
+                    any(
+                        maximum <= 0.5
+                        for _minimum, maximum in uv_ranges
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        minimum >= 0.5
+                        for minimum, _maximum in uv_ranges
+                    )
+                )
+
+    def test_proxy_also_mirrors_untextured_geometry(self) -> None:
+        retained_scene = trimesh.load(
+            BytesIO(
+                _uv_glb(
+                    left_packed=True,
+                    texture_resolution=1024,
+                )
+            ),
+            file_type="glb",
+            force="scene",
+            process=False,
+        )
+        untextured_mesh = trimesh.creation.box(extents=(0.5, 0.5, 0.5))
+        untextured_transform = np.eye(4, dtype=float)
+        untextured_transform[:3, 3] = (2.0, 0.25, 0.0)
+        retained_scene.add_geometry(
+            untextured_mesh,
+            geom_name="untextured-part",
+            node_name="untextured-node",
+            transform=untextured_transform,
+        )
+        retained_glb = bytes(retained_scene.export(file_type="glb"))
+
+        proxy_glb = build_symmetric_retexture_proxy_glb(
+            retained_glb,
+            SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+            0.0,
+        )
+        proxy_scene = trimesh.load(
+            BytesIO(proxy_glb),
+            file_type="glb",
+            force="scene",
+            process=False,
+        )
+
+        textured_mesh_count = sum(
+            getattr(
+                getattr(mesh.visual, "material", None),
+                "baseColorTexture",
+                None,
+            )
+            is not None
+            for mesh in proxy_scene.geometry.values()
+        )
+        self.assertEqual(len(proxy_scene.geometry), 4)
+        self.assertEqual(textured_mesh_count, 2)
+        self.assertEqual(
+            sum(len(mesh.faces) for mesh in proxy_scene.geometry.values()),
+            28,
+        )
+
+
 class MeshyTextureRegeneratorTests(unittest.TestCase):
     def test_provider_sends_owned_model_reference_and_uv_flag(self) -> None:
         reference = np.zeros((5, 7, 4), dtype=np.uint8)
@@ -421,8 +618,100 @@ class MeshyTextureRegeneratorTests(unittest.TestCase):
 
         retexture.assert_not_called()
 
-    def test_worker_rejects_changed_symmetric_uvs_before_executor(self) -> None:
-        submitted_glb = _uv_glb()
+    def test_worker_preserves_symmetric_geometry_when_meshy_remeshes(self) -> None:
+        submitted_glb = _uv_glb(
+            left_packed=True,
+            texture_resolution=1024,
+        )
+        submitted_fingerprint = build_uv_fingerprint(submitted_glb)
+        request = TextureRegenerationRequest(
+            object_id="chair",
+            reference_frame_index=0,
+            reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
+            model_glb=submitted_glb,
+            settings=GenerationServiceSettings(meshy_api_key="msy-secret"),
+            enable_original_uv=True,
+            submitted_uv_fingerprint=submitted_fingerprint,
+            preserve_symmetric_uvs=True,
+        )
+        generated_color = (180, 35, 90, 255)
+        provider_glb = build_symmetric_retexture_proxy_glb(
+            _uv_glb(
+                subdivide_faces=True,
+                left_packed=True,
+                texture_resolution=2048,
+                texture_color=generated_color,
+            ),
+            SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+            0.0,
+        )
+        self.assertNotEqual(
+            build_uv_fingerprint(provider_glb).face_count,
+            submitted_fingerprint.face_count,
+        )
+        result = MeshyGenerationResult(
+            "changed-task",
+            provider_glb,
+            "Changed",
+        )
+        regenerator = _SequenceTextureRegenerator([result])
+        executor = MeshyModelExecutor()
+        symmetry = SymmetricDivisionMetadata(
+            orientation=SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+            kept_side=SYMMETRIC_DIVISION_SIDE_RIGHT,
+            plane_coordinate=0.0,
+        )
+        worker = TextureRegenerationWorker(
+            regenerator,
+            executor,
+            request,
+            symmetry=symmetry,
+        )
+        succeeded = QSignalSpy(worker.succeeded)
+        failed = QSignalSpy(worker.failed)
+        finished = QSignalSpy(worker.finished)
+
+        worker.run()
+
+        self.assertEqual(succeeded.count(), 1)
+        self.assertEqual(failed.count(), 0)
+        self.assertEqual(finished.count(), 1)
+        self.assertEqual(len(regenerator.requests), 1)
+        provider_request = regenerator.requests[0]
+        self.assertEqual(
+            build_uv_fingerprint(provider_request.model_glb).face_count,
+            submitted_fingerprint.face_count * 2,
+        )
+        np.testing.assert_array_equal(
+            provider_request.reference_image_bgra,
+            request.reference_image_bgra,
+        )
+        outcome = succeeded.at(0)[0]
+        preserved_result = outcome.result
+        self.assertEqual(
+            build_uv_fingerprint(preserved_result.glb_bytes),
+            submitted_fingerprint,
+        )
+        preserved_model = import_generated_glb(preserved_result.glb_bytes)
+        self.assertEqual(len(preserved_model.mesh.faces), 2)
+        preserved_texture = (
+            preserved_model.mesh.visual.material.baseColorTexture
+        )
+        self.assertEqual(preserved_texture.size, (2048, 2048))
+        self.assertEqual(preserved_texture.getpixel((0, 0)), generated_color)
+        self.assertEqual(outcome.final_uv_fingerprint, submitted_fingerprint)
+        generated_model = succeeded.at(0)[1]
+        generated_variants = generated_model.object_texture_variants
+        self.assertIsNotNone(generated_variants)
+        assert generated_variants is not None
+        for variant_glb in generated_variants.glb_by_resolution.values():
+            self.assertEqual(
+                build_uv_fingerprint(variant_glb),
+                submitted_fingerprint,
+            )
+
+    def test_worker_rejects_symmetric_result_without_a_texture(self) -> None:
+        submitted_glb = _uv_glb(texture_resolution=1024)
         request = TextureRegenerationRequest(
             object_id="chair",
             reference_frame_index=0,
@@ -434,25 +723,23 @@ class MeshyTextureRegeneratorTests(unittest.TestCase):
             preserve_symmetric_uvs=True,
         )
         result = MeshyGenerationResult(
-            "changed-task",
+            "untextured-task",
             _uv_glb(mutate_uv=True),
-            "Changed",
+            "Untextured",
         )
         regenerator = _SequenceTextureRegenerator([result])
         executor = _SequenceExecutor(
-            [_model_with_variants(_texture_variants(9))]
+            [_model_with_variants(_texture_variants(10))]
         )
         worker = TextureRegenerationWorker(regenerator, executor, request)
         succeeded = QSignalSpy(worker.succeeded)
         failed = QSignalSpy(worker.failed)
-        finished = QSignalSpy(worker.finished)
 
         worker.run()
 
         self.assertEqual(succeeded.count(), 0)
         self.assertEqual(failed.count(), 1)
-        self.assertIn("UV", failed.at(0)[0])
-        self.assertEqual(finished.count(), 1)
+        self.assertIn("no embedded base-color texture", failed.at(0)[0])
         self.assertEqual(executor.results, [])
 
 
@@ -842,11 +1129,14 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
             name="Chair",
             task_id="geometry-task",
         )
-        self._load_reference()
+        full_reference = self._load_reference()
         source_asset_path = record.pipeline["texture_variants"]["1024"][
             "glb_asset_path"
         ]
-        source_glb = _uv_glb()
+        source_glb = _uv_glb(
+            left_packed=True,
+            texture_resolution=1024,
+        )
         self.asset_directory.joinpath(source_asset_path).write_bytes(
             source_glb
         )
@@ -903,7 +1193,17 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
             self._wait_until_idle()
 
         self.assertEqual(len(regenerator.requests), 1)
-        self.assertEqual(regenerator.requests[0].model_glb, source_glb)
+        self.assertNotEqual(regenerator.requests[0].model_glb, source_glb)
+        self.assertEqual(
+            build_uv_fingerprint(
+                regenerator.requests[0].model_glb
+            ).face_count,
+            build_uv_fingerprint(source_glb).face_count * 2,
+        )
+        np.testing.assert_array_equal(
+            regenerator.requests[0].reference_image_bgra,
+            full_reference,
+        )
         self.assertIsNotNone(
             regenerator.requests[0].submitted_uv_fingerprint
         )
@@ -923,6 +1223,125 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
             self.workspace.get_data().generated_objects[0],
             record,
         )
+
+    def test_symmetric_remesh_saves_only_the_new_texture_on_old_geometry(
+        self,
+    ) -> None:
+        record, _variants = self._seed_object(
+            0,
+            name="Chair",
+            task_id="geometry-task",
+        )
+        full_reference = self._load_reference()
+        source_glb = _uv_glb(
+            left_packed=True,
+            texture_resolution=1024,
+        )
+        source_fingerprint = build_uv_fingerprint(source_glb)
+        source_asset_path = record.pipeline["texture_variants"]["1024"][
+            "glb_asset_path"
+        ]
+        self.asset_directory.joinpath(source_asset_path).write_bytes(
+            source_glb
+        )
+        symmetry = SymmetricDivisionMetadata(
+            version=AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
+            orientation=SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+            kept_side=SYMMETRIC_DIVISION_SIDE_LEFT,
+            plane_coordinate=0.0,
+            packing_mode=SYMMETRIC_TEXTURE_PACKING_MODE_PAIR,
+            texture_content_half=SYMMETRIC_TEXTURE_CONTENT_HALF_LEFT,
+            selection_mode=(
+                SYMMETRIC_SELECTION_MODE_FEWEST_TRIANGLES_RANDOM_TIE
+            ),
+            triangle_count_by_side=(("left", 2), ("right", 5)),
+            tie_broken_randomly=False,
+        )
+        record = self._replace_record(
+            record,
+            postprocessed_asset_path=source_asset_path,
+            symmetric_division=symmetry.to_pipeline_dict(),
+            selected_texture_resolution=1024,
+        )
+        generated_color = (210, 65, 25, 255)
+        provider_glb = build_symmetric_retexture_proxy_glb(
+            _uv_glb(
+                subdivide_faces=True,
+                left_packed=True,
+                texture_resolution=2048,
+                texture_color=generated_color,
+            ),
+            SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+            0.0,
+        )
+        self.assertEqual(build_uv_fingerprint(provider_glb).face_count, 8)
+        regenerator = _SequenceTextureRegenerator(
+            [
+                MeshyGenerationResult(
+                    "remeshed-texture-task",
+                    provider_glb,
+                    "Chair",
+                )
+            ]
+        )
+        self.workspace.set_texture_regenerator(regenerator)
+        self.workspace.set_meshy_executor(MeshyModelExecutor())
+
+        self.assertTrue(self.workspace.generate_selected_object_texture())
+        self._wait_until_idle()
+
+        replacement = self.workspace.get_data().generated_objects[0]
+        self.assertEqual(len(regenerator.requests), 1)
+        np.testing.assert_array_equal(
+            regenerator.requests[0].reference_image_bgra,
+            full_reference,
+        )
+        self.assertEqual(
+            build_uv_fingerprint(
+                regenerator.requests[0].model_glb
+            ).face_count,
+            source_fingerprint.face_count * 2,
+        )
+        self.assertEqual(
+            replacement.provider_task_id,
+            "remeshed-texture-task",
+        )
+        self.assertEqual(
+            replacement.pipeline["symmetric_division"],
+            record.pipeline["symmetric_division"],
+        )
+        self.assertEqual(
+            set(replacement.pipeline["texture_variants"]),
+            {"512", "1024"},
+        )
+        self.assertEqual(
+            replacement.pipeline["texture_regeneration_uv_face_count"],
+            source_fingerprint.face_count,
+        )
+        for variant in replacement.pipeline["texture_variants"].values():
+            variant_glb = self.asset_directory.joinpath(
+                variant["glb_asset_path"]
+            ).read_bytes()
+            self.assertEqual(
+                build_uv_fingerprint(variant_glb),
+                source_fingerprint,
+            )
+            texture = np.asarray(
+                Image.open(
+                    self.asset_directory / variant["texture_asset_path"]
+                ).convert("RGBA"),
+                dtype=np.uint8,
+            )
+            half_width = texture.shape[1] // 2
+            self.assertTrue(
+                np.all(texture[:, half_width:] == (0, 0, 0, 255))
+            )
+            self.assertGreater(
+                np.count_nonzero(
+                    np.all(texture[:, :half_width] == generated_color, axis=2)
+                ),
+                0,
+            )
 
     def test_success_replaces_variants_repeats_and_refreshes_external_view(
         self,

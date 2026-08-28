@@ -13,7 +13,10 @@ import trimesh
 from trimesh.visual.color import ColorVisuals
 from trimesh.visual.texture import TextureVisuals
 
-from housemaker.glb import GLTF_Y_UP_TO_Z_UP_TRANSFORM
+from housemaker.glb import (
+    GLTF_Y_UP_TO_Z_UP_TRANSFORM,
+    Z_UP_TO_GLTF_Y_UP_TRANSFORM,
+)
 from housemaker.object_texture_variants import (
     TEXTURE_RESOLUTION_512,
     TEXTURE_RESOLUTION_1024,
@@ -546,7 +549,104 @@ class _UvPackPlacement:
     scale: float
 
 
-# ### Public automatic transform ###
+# ### Public symmetric transforms ###
+def build_symmetric_retexture_proxy_glb(
+    retained_glb: bytes,
+    orientation: SymmetricDivisionOrientation,
+    plane_coordinate: float,
+) -> bytes:
+    """Mirror a retained half solely for Meshy's full-object context.
+
+    The authoritative half keeps its left-atlas UVs. Its temporary mirror uses
+    the corresponding right-atlas coordinates, so the full reference image
+    and the submitted geometry describe the same complete object. This proxy
+    is never persisted or exported as the user's model.
+    """
+
+    _validate_orientation(orientation)
+    normalized_plane = float(plane_coordinate)
+    if not math.isfinite(normalized_plane):
+        raise ValueError("The symmetric Retexture plane must be finite.")
+    payload = bytes(retained_glb)
+    if not payload:
+        raise ValueError("The symmetric Retexture source GLB is empty.")
+
+    source_scene = _load_glb_scene(payload)
+    _reject_auxiliary_material_textures(source_scene)
+    source_textures = _collect_material_textures(source_scene)
+    if not source_textures:
+        raise ValueError(
+            "The symmetric Retexture source has no base-color atlas."
+        )
+    source_texture = _validate_shared_square_pair_texture(
+        source_textures
+    ).copy()
+    _validate_scene_uvs_in_left_half(source_scene)
+    instances = _collect_mesh_instances(source_scene)
+
+    proxy_scene = copy.deepcopy(source_scene)
+    occupied_geometry_names = {str(name) for name in proxy_scene.geometry}
+    occupied_node_names = {str(name) for name in proxy_scene.graph.nodes}
+    axis = _get_z_up_axis(orientation)
+    reflection = np.eye(4, dtype=float)
+    reflection[axis, axis] = -1.0
+    reflection[axis, 3] = 2.0 * normalized_plane
+    for instance in instances:
+        mirrored_mesh = copy.deepcopy(instance.mesh)
+        mirrored_uvs: np.ndarray | None = None
+        if _material_textures(mirrored_mesh):
+            mirrored_uvs = _get_vertex_uvs(mirrored_mesh)
+            if mirrored_uvs is None:
+                raise ValueError(
+                    "A textured symmetric Retexture mesh is missing UV "
+                    "coordinates."
+                )
+            mirrored_uvs[:, 0] += 0.5
+            if np.any(
+                mirrored_uvs[:, 0] > 1.0 + _REPEAT_UV_TOLERANCE
+            ):
+                raise ValueError(
+                    "The symmetric Retexture mirror UVs exceed the atlas."
+                )
+        mirror_transform = (
+            Z_UP_TO_GLTF_Y_UP_TRANSFORM
+            @ reflection
+            @ GLTF_Y_UP_TO_Z_UP_TRANSFORM
+            @ instance.transform
+        )
+        mirrored_mesh.apply_transform(mirror_transform)
+        if mirrored_uvs is not None:
+            mirrored_mesh.visual.uv = np.clip(mirrored_uvs, 0.0, 1.0)
+        geometry_name = _reserve_unique_proxy_name(
+            f"{instance.geometry_name}-symmetric-mirror",
+            occupied_geometry_names,
+        )
+        node_name = _reserve_unique_proxy_name(
+            f"{instance.node_name}-symmetric-mirror",
+            occupied_node_names,
+        )
+        proxy_scene.add_geometry(
+            mirrored_mesh,
+            geom_name=geometry_name,
+            node_name=node_name,
+        )
+
+    half_width = source_texture.shape[1] // 2
+    proxy_texture = source_texture.copy()
+    proxy_texture[:, half_width:] = source_texture[:, :half_width]
+    proxy_textures = _collect_material_textures(proxy_scene)
+    _replace_material_textures(
+        proxy_scene,
+        [proxy_texture] * len(proxy_textures),
+    )
+    try:
+        return bytes(proxy_scene.export(file_type="glb"))
+    except Exception as error:
+        raise ValueError(
+            "The full symmetric Retexture proxy could not be exported."
+        ) from error
+
+
 def build_automatic_symmetric_object_variants(
     canonical_2048_glb: bytes,
     orientation: SymmetricDivisionOrientation,
@@ -801,6 +901,19 @@ def build_symmetric_half_texture_variants(
 
 
 # ### Scene collection helpers ###
+def _reserve_unique_proxy_name(
+    preferred_name: str,
+    occupied_names: set[str],
+) -> str:
+    candidate = str(preferred_name)
+    suffix = 2
+    while candidate in occupied_names:
+        candidate = f"{preferred_name}-{suffix}"
+        suffix += 1
+    occupied_names.add(candidate)
+    return candidate
+
+
 def _collect_mesh_instances(scene: trimesh.Scene) -> list[_MeshInstance]:
     node_names = sorted(scene.graph.nodes_geometry, key=str)
     referenced_geometry_names: set[str] = set()

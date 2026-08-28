@@ -24,6 +24,7 @@ from housemaker.object_texture_variants import (
     TEXTURE_RESOLUTIONS,
     build_object_texture_variants,
     build_object_texture_variants_from_texture,
+    replace_object_base_color_texture_from_glb,
 )
 
 
@@ -36,6 +37,7 @@ def _textured_glb(
     *,
     distinct_second_texture: bool = False,
     texture_size: tuple[int, int] = (2048, 2048),
+    texture_color: tuple[int, int, int, int] = (24, 80, 160, 96),
 ) -> bytes:
     first = trimesh.creation.box(extents=(1.0, 2.0, 3.0))
     first.visual = TextureVisuals(
@@ -44,7 +46,7 @@ def _textured_glb(
             baseColorTexture=Image.new(
                 "RGBA",
                 texture_size,
-                (24, 80, 160, 96),
+                texture_color,
             )
         ),
     )
@@ -58,7 +60,7 @@ def _textured_glb(
                 (
                     (210, 40, 12, 224)
                     if distinct_second_texture
-                    else (24, 80, 160, 96)
+                    else texture_color
                 ),
             )
         ),
@@ -351,6 +353,73 @@ class ObjectTextureVariantAlgorithmTests(unittest.TestCase):
             build_object_texture_variants_from_texture(
                 source_glb,
                 b"not a png",
+            )
+
+    def test_provider_texture_replaces_only_the_authoritative_model_atlas(
+        self,
+    ) -> None:
+        model_glb = _textured_glb(texture_size=(1024, 1024))
+        model_scene = trimesh.load(
+            BytesIO(model_glb),
+            file_type="glb",
+            force="scene",
+            process=False,
+        )
+        texture_source_glb, generated_texture = _nonuniform_2048_rgba_glb()
+        texture_source_glb = _rewrite_uv_layout(
+            texture_source_glb,
+            scale=0.2,
+            offset=0.6,
+        )
+
+        replaced_glb = replace_object_base_color_texture_from_glb(
+            model_glb,
+            texture_source_glb,
+        )
+
+        replaced_scene = trimesh.load(
+            BytesIO(replaced_glb),
+            file_type="glb",
+            force="scene",
+            process=False,
+        )
+        self.assertEqual(set(replaced_scene.geometry), set(model_scene.geometry))
+        for geometry_name in model_scene.geometry:
+            np.testing.assert_allclose(
+                replaced_scene.geometry[geometry_name].vertices,
+                model_scene.geometry[geometry_name].vertices,
+            )
+            np.testing.assert_allclose(
+                replaced_scene.geometry[geometry_name].faces,
+                model_scene.geometry[geometry_name].faces,
+            )
+            np.testing.assert_allclose(
+                replaced_scene.geometry[geometry_name].visual.uv,
+                model_scene.geometry[geometry_name].visual.uv,
+            )
+        np.testing.assert_allclose(
+            replaced_scene.graph.get("sphere-node")[0],
+            model_scene.graph.get("sphere-node")[0],
+        )
+        for texture in _texture_images(replaced_glb):
+            self.assertEqual(texture.size, (2048, 2048))
+            np.testing.assert_array_equal(
+                np.asarray(texture.convert("RGBA"), dtype=np.uint8),
+                generated_texture,
+            )
+
+    def test_provider_texture_requires_one_shared_2048_atlas(self) -> None:
+        model_glb = _textured_glb(texture_size=(1024, 1024))
+
+        with self.assertRaisesRegex(ValueError, "not 2048 x 2048"):
+            replace_object_base_color_texture_from_glb(
+                model_glb,
+                _textured_glb(texture_size=(1024, 1024)),
+            )
+        with self.assertRaisesRegex(ValueError, "more than one distinct"):
+            replace_object_base_color_texture_from_glb(
+                model_glb,
+                _textured_glb(distinct_second_texture=True),
             )
 
 

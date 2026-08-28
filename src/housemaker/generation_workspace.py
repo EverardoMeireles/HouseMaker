@@ -75,6 +75,7 @@ from housemaker.object_texture_variants import (
     TEXTURE_RESOLUTIONS,
     ObjectTextureVariants,
     build_object_texture_variants,
+    replace_object_base_color_texture_from_glb,
 )
 from housemaker.object_symmetry import (
     AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
@@ -96,6 +97,7 @@ from housemaker.object_symmetry import (
     build_symmetric_half_texture_variants,
     build_symmetric_pair_texture_variants,
     build_symmetric_quarter_texture_variants,
+    build_symmetric_retexture_proxy_glb,
     build_symmetric_square_pair_texture_variants,
 )
 from housemaker.settings_widget import (
@@ -1399,11 +1401,29 @@ class TextureRegenerationWorker(QObject):
                 self.progress.emit("Preparing model processor...")
                 _run_interruptible_stage(prepare_executor)
                 _raise_if_generation_cancelled(self._cancel_event)
+            provider_request = request
+            if request.preserve_symmetric_uvs and self._symmetry is not None:
+                self.progress.emit(
+                    "Building full symmetric texture reference model (6%)"
+                )
+                provider_model_glb = build_symmetric_retexture_proxy_glb(
+                    request.model_glb,
+                    self._symmetry.orientation,
+                    self._symmetry.plane_coordinate,
+                )
+                provider_request = replace(
+                    request,
+                    model_glb=provider_model_glb,
+                    submitted_uv_fingerprint=build_uv_fingerprint(
+                        provider_model_glb
+                    ),
+                )
+                _raise_if_generation_cancelled(self._cancel_event)
             progress_mapper = _ObjectTextureProgressMapper()
             result = _run_interruptible_stage(
                 lambda: _invoke_texture_regenerator(
                     self._regenerator,
-                    request,
+                    provider_request,
                     lambda message: self.progress.emit(
                         progress_mapper.map_provider_message(message)
                     ),
@@ -1413,6 +1433,22 @@ class TextureRegenerationWorker(QObject):
             if not isinstance(result, MeshyGenerationResult):
                 raise TypeError("Meshy returned an invalid texture result.")
             _raise_if_generation_cancelled(self._cancel_event)
+            if request.preserve_symmetric_uvs:
+                # The provider proxy keeps the authoritative half in the left
+                # UV region. Copy only its atlas because Meshy may still
+                # retriangulate the temporary full model.
+                self.progress.emit(
+                    "Applying texture to preserved symmetric geometry (82%)"
+                )
+                result = MeshyGenerationResult(
+                    task_id=result.task_id,
+                    glb_bytes=replace_object_base_color_texture_from_glb(
+                        request.model_glb,
+                        result.glb_bytes,
+                    ),
+                    name=result.name,
+                )
+                _raise_if_generation_cancelled(self._cancel_event)
             final_uv_fingerprint = self._validate_final_uvs(
                 result,
                 request,
@@ -5536,7 +5572,7 @@ def _format_staged_generation_status(
 def _validate_symmetric_texture_regeneration_uvs(
     outcome: TextureRegenerationOutcome,
 ) -> None:
-    """Require provider proof that rigid left-half UVs were preserved."""
+    """Require proof that the rebuilt result retained its packed UVs."""
 
     request = outcome.request
     submitted_fingerprint = request.submitted_uv_fingerprint
@@ -5565,7 +5601,7 @@ def _validate_symmetric_uv_retexture_integrity(
     submitted: UvFingerprint,
     returned: UvFingerprint,
 ) -> None:
-    """Reject provider changes with symmetric-object remediation text."""
+    """Reject local reconstruction changes before replacing the object."""
 
     if submitted.version != returned.version:
         raise UvIntegrityError(
@@ -5574,13 +5610,14 @@ def _validate_symmetric_uv_retexture_integrity(
         )
     if submitted.face_count != returned.face_count:
         raise UvIntegrityError(
-            "Meshy Retexture changed the symmetric object's face count. The "
-            "existing texture was kept; retry texture generation."
+            "HouseMaker could not preserve the symmetric object's face count "
+            "while applying its new texture. The existing texture was kept."
         )
     if submitted.sha256 != returned.sha256:
         raise UvIntegrityError(
-            "Meshy Retexture changed the symmetric object's packed UV layout. "
-            "The existing texture was kept; retry texture generation."
+            "HouseMaker could not preserve the symmetric object's packed UV "
+            "layout while applying its new texture. The existing texture was "
+            "kept."
         )
 
 

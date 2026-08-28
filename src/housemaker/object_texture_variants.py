@@ -100,6 +100,54 @@ def build_object_texture_variants_from_texture(
     )
 
 
+def replace_object_base_color_texture_from_glb(
+    model_glb: bytes,
+    texture_source_glb: bytes,
+) -> bytes:
+    """Apply a provider atlas without accepting its replacement geometry.
+
+    Texture-only operations keep the submitted model's scene, geometry and
+    UVs authoritative. Only the shared 2048 base-color atlas is copied from
+    the provider result.
+    """
+
+    model_payload = bytes(model_glb)
+    texture_payload = bytes(texture_source_glb)
+    if not model_payload:
+        raise ValueError("The preserved object GLB is empty.")
+    if not texture_payload:
+        raise ValueError("The generated texture GLB is empty.")
+
+    model_scene = _load_glb_scene(model_payload)
+    model_textures = _collect_material_textures(model_scene)
+    if not model_textures:
+        raise ValueError(
+            "The preserved object GLB has no embedded base-color texture."
+        )
+    _validate_shared_texture(model_textures)
+
+    texture_scene = _load_glb_scene(texture_payload)
+    generated_textures = _collect_material_textures(texture_scene)
+    if not generated_textures:
+        raise ValueError(
+            "Meshy returned no embedded base-color texture."
+        )
+    generated_texture = _validate_shared_2048_texture(
+        generated_textures
+    ).copy()
+    _replace_material_textures(
+        model_scene,
+        [generated_texture] * len(model_textures),
+    )
+    try:
+        return bytes(model_scene.export(file_type="glb"))
+    except Exception as error:
+        raise ValueError(
+            "The generated texture could not be applied to the preserved "
+            "object geometry."
+        ) from error
+
+
 def _build_variants_from_scene(
     scene: trimesh.Scene,
     texture_2048: np.ndarray,
@@ -149,13 +197,7 @@ def _build_variants_from_scene(
 def _validate_shared_2048_texture(
     source_textures: list[np.ndarray],
 ) -> np.ndarray:
-    if len({_texture_digest(texture) for texture in source_textures}) > 1:
-        raise ValueError(
-            "The generated object contains more than one distinct base-color "
-            "texture atlas. Resolution variants currently require one shared "
-            "atlas so UV-to-texture ownership remains unambiguous."
-        )
-    source_texture = source_textures[0]
+    source_texture = _validate_shared_texture(source_textures)
     expected_source_shape = (
         TEXTURE_RESOLUTION_2048,
         TEXTURE_RESOLUTION_2048,
@@ -166,6 +208,20 @@ def _validate_shared_2048_texture(
             "HouseMaker will not upscale or stretch it."
         )
     return source_texture
+
+
+def _validate_shared_texture(
+    source_textures: list[np.ndarray],
+) -> np.ndarray:
+    if not source_textures:
+        raise ValueError("The generated GLB has no base-color texture atlas.")
+    if len({_texture_digest(texture) for texture in source_textures}) > 1:
+        raise ValueError(
+            "The generated object contains more than one distinct base-color "
+            "texture atlas. Resolution variants currently require one shared "
+            "atlas so UV-to-texture ownership remains unambiguous."
+        )
+    return source_textures[0]
 
 
 # ### GLB material helpers ###
