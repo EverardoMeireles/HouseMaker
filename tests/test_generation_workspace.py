@@ -43,6 +43,7 @@ from housemaker.generation_workspace import (
     MeshyModelExecutor,
     StagedMeshyGenerationResult,
     TEXTURE_VARIANTS_PIPELINE_KEY,
+    _ObjectGenerationProgressMapper,
     _build_texture_resolution_entries,
     _format_model_statistics,
     _collect_model_uv_triangles,
@@ -458,6 +459,37 @@ class GenerationMaskViewTests(unittest.TestCase):
 
 # ### Meshy-adapter tests ###
 class MeshyGenerationAdapterTests(unittest.TestCase):
+    def test_staged_progress_reserves_separate_geometry_and_texture_phases(
+        self,
+    ) -> None:
+        request = GenerationRequest(
+            frame_index=0,
+            selected_object_bgra=np.zeros((4, 4, 4), dtype=np.uint8),
+            settings=GenerationServiceSettings(
+                meshy_api_key="key",
+                unused_face_removal=True,
+            ),
+        )
+        mapper = _ObjectGenerationProgressMapper(request)
+
+        geometry_complete = mapper.map_provider_message(
+            "Meshy is generating: 100%"
+        )
+        texture_submitted = mapper.map_provider_message(
+            "Submitting Meshy texture task..."
+        )
+        texture_started = mapper.map_provider_message(
+            "Meshy is texturing: 0%"
+        )
+        texture_complete = mapper.map_provider_message(
+            "Meshy is texturing: 100%"
+        )
+
+        self.assertIn("48%", geometry_complete)
+        self.assertIn("56%", texture_submitted)
+        self.assertIn("56%", texture_started)
+        self.assertIn("80%", texture_complete)
+
     def test_meshy_planner_sends_the_selected_png_and_meshy_settings(self) -> None:
         selected = np.zeros((7, 11, 4), dtype=np.uint8)
         selected[1:6, 2:9] = (20, 80, 190, 255)
@@ -1942,7 +1974,7 @@ class GeneratedObjectDeletionTests(unittest.TestCase):
         self.assertEqual(self.workspace.get_data().generated_objects, [])
         self.assertIn("could not be removed", self.workspace.status_label.text())
 
-    def test_delete_is_disabled_and_refused_while_generating(self) -> None:
+    def test_unrelated_delete_remains_available_while_generating(self) -> None:
         self._set_generated_objects(
             [("chair", "Chair", (180, 30, 20, 255))]
         )
@@ -1956,16 +1988,16 @@ class GeneratedObjectDeletionTests(unittest.TestCase):
 
         self.workspace._start_generation(request)
         self.assertTrue(planner.started.wait(timeout=1.0))
-        self.assertFalse(
+        self.assertTrue(
             self.workspace.delete_generated_object_button.isEnabled()
         )
-        self.assertFalse(self.workspace.delete_generated_object("chair"))
+        self.assertTrue(self.workspace.delete_generated_object("chair"))
         self.assertEqual(
             [
                 record.object_id
                 for record in self.workspace.get_data().generated_objects
             ],
-            ["chair"],
+            [],
         )
 
         active_thread = self.workspace._generation_thread

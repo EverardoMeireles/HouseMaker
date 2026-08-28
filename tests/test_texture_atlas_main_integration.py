@@ -7,7 +7,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -147,6 +147,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.workspace.shutdown()
         self.workspace.close()
+        self.workspace.deleteLater()
         _qt_application.processEvents()
         self._temporary_directory.cleanup()
 
@@ -1698,6 +1699,71 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         self.assertIs(resolved_pinned, pinned_png)
         self.assertFalse(is_selectable)
         image_resolver.assert_called_once_with("chair", 2048)
+        complete_variant_resolver.assert_called_once_with("chair", 2048)
+
+    def test_unrelated_object_variant_stays_selectable_during_generation(
+        self,
+    ) -> None:
+        active = SimpleNamespace(
+            object_id="chair",
+            object_name="Chair",
+            resolution=1024,
+            texture_asset_relative_path="chair-1024.png",
+        )
+        glb_path = Path(self._temporary_directory.name) / "chair-2048.glb"
+        glb_path.write_bytes(b"test glb")
+        complete_variant = SimpleNamespace(glb_asset_path=glb_path)
+        self.workspace._atlas_generation_signature = None
+
+        with (
+            patch.object(
+                self.workspace.generation,
+                "get_generated_object_ids",
+                return_value=("chair",),
+            ),
+            patch.object(
+                self.workspace.generation,
+                "get_active_texture_variant",
+                return_value=active,
+            ),
+            patch.object(
+                self.workspace.generation,
+                "has_active_object_job",
+                side_effect=lambda object_id: object_id == "busy-table",
+            ) as has_active_object_job,
+            patch.object(
+                self.workspace.generation,
+                "get_texture_variant",
+                return_value=complete_variant,
+            ) as complete_variant_resolver,
+            patch.object(
+                self.workspace,
+                "_build_atlas_object_texture_source",
+                side_effect=lambda variant, _symmetry=None: variant,
+            ),
+            patch(
+                "housemaker.main.import_generated_glb",
+                return_value=_generated_box_model(),
+            ),
+            patch.object(
+                self.workspace.texture_atlas_workspace,
+                "set_object_texture_sources",
+            ) as set_sources,
+        ):
+            self.workspace._sync_atlas_object_texture_sources()
+            selectability_resolver = set_sources.call_args.kwargs[
+                "selectability_resolver"
+            ]
+
+            self.assertTrue(selectability_resolver("chair", 2048))
+            self.assertFalse(
+                selectability_resolver("busy-table", 2048)
+            )
+
+        self.assertEqual(
+            has_active_object_job.call_args_list,
+            [call("chair"), call("busy-table")],
+        )
         complete_variant_resolver.assert_called_once_with("chair", 2048)
 
     def test_explicit_generated_object_deletion_is_routed_to_atlas(self) -> None:

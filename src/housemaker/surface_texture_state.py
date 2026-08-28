@@ -37,6 +37,7 @@ MAX_ASSIGNMENT_ID_LENGTH = 256
 MAX_PROVIDER_NAME_LENGTH = 128
 MAX_PROVIDER_TASK_ID_LENGTH = 512
 MAX_ASSET_PATH_LENGTH = 2_048
+MAX_ASSIGNMENT_DISPLAY_NAME_LENGTH = 256
 MAX_AREA_DESCRIPTION_LENGTH = 4_096
 MAX_COMBINED_AREA_M2 = 1_000_000_000.0
 MAX_TEXTURE_DIMENSION_PIXELS = 16_384
@@ -99,6 +100,7 @@ class SurfaceTextureAssignment:
     texture_height: int | None = None
     texture_variants: tuple[SurfaceTextureVariant, ...] = ()
     selected_texture_resolution: int | None = None
+    display_name: str = ""
 
     def __post_init__(self) -> None:
         assignment_id = _normalize_required_text(
@@ -124,6 +126,11 @@ class SurfaceTextureAssignment:
             "Surface texture provider task ID",
             MAX_PROVIDER_TASK_ID_LENGTH,
         )
+        display_name = _normalize_optional_text(
+            self.display_name,
+            "Surface texture display name",
+            MAX_ASSIGNMENT_DISPLAY_NAME_LENGTH,
+        ) or ""
         combined_area_m2 = _normalize_combined_area(self.combined_area_m2)
         area_description = _normalize_optional_text(
             self.area_description,
@@ -174,6 +181,7 @@ class SurfaceTextureAssignment:
         object.__setattr__(self, "provider", provider)
         object.__setattr__(self, "asset_path", asset_path)
         object.__setattr__(self, "provider_task_id", provider_task_id)
+        object.__setattr__(self, "display_name", display_name)
         object.__setattr__(self, "combined_area_m2", combined_area_m2)
         object.__setattr__(self, "area_description", area_description)
         object.__setattr__(
@@ -228,6 +236,7 @@ class SurfaceTextureAssignment:
                 variant.to_dict() for variant in self.texture_variants
             ],
             "selected_texture_resolution": self.selected_texture_resolution,
+            "display_name": self.display_name,
         }
 
     @classmethod
@@ -284,6 +293,10 @@ class SurfaceTextureAssignment:
             selected_texture_resolution=payload.get(
                 "selected_texture_resolution",
                 payload.get("texture_resolution"),
+            ),
+            display_name=payload.get(
+                "display_name",
+                payload.get("name", ""),
             ),
         )
 

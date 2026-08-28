@@ -18,6 +18,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 import trimesh
+from PySide6.QtCore import QThread
 from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import QApplication
 
@@ -26,6 +27,11 @@ from housemaker.generation_state import (
     GeneratedObjectRecord,
     GenerationData,
 )
+from housemaker.generation_jobs import (
+    JOB_STATUS_CANCELLED,
+    JOB_STATUS_COMPLETED,
+    GenerationJobManager,
+)
 from housemaker.generation_workspace import (
     OBJECT_OPERATION_GENERATE_MODEL,
     GenerationRequest,
@@ -33,6 +39,7 @@ from housemaker.generation_workspace import (
     GenerationWorkspace,
     TextureRegenerationRequest,
     UncheckedCameraFacePurgeRequest,
+    _persist_generated_named_asset,
 )
 from housemaker.glb import GeneratedModel, import_generated_glb
 from housemaker.meshy_generation import MeshyGenerationResult
@@ -168,13 +175,70 @@ class _ImmediateExecutor:
         return self.model
 
 
+class _PerFrameBlockingPlanner:
+    """Let concurrent model requests be released independently in tests."""
+
+    def __init__(self) -> None:
+        self.started = {index: threading.Event() for index in (0, 1)}
+        self.release = {index: threading.Event() for index in (0, 1)}
+
+    def plan(self, request: GenerationRequest) -> MeshyGenerationResult:
+        frame_index = request.frame_index
+        self.started[frame_index].set()
+        if not self.release[frame_index].wait(timeout=5.0):
+            raise RuntimeError("Concurrent model fixture timed out.")
+        return MeshyGenerationResult(
+            f"model-task-{frame_index}",
+            _box_glb(1.0 + frame_index),
+            f"Provider object {frame_index}",
+        )
+
+
+class _PerObjectBlockingTextureRegenerator:
+    """Let different object texture requests overlap deterministically."""
+
+    def __init__(
+        self,
+        results: dict[str, MeshyGenerationResult],
+    ) -> None:
+        self.results = results
+        self.started = {
+            object_id: threading.Event() for object_id in results
+        }
+        self.release = {
+            object_id: threading.Event() for object_id in results
+        }
+
+    def regenerate(
+        self,
+        request: TextureRegenerationRequest,
+    ) -> MeshyGenerationResult:
+        object_id = request.object_id
+        self.started[object_id].set()
+        if not self.release[object_id].wait(timeout=5.0):
+            raise RuntimeError("Concurrent texture fixture timed out.")
+        return self.results[object_id]
+
+
+class _ResultModelExecutor:
+    """Resolve an independent prepared model for each provider task."""
+
+    def __init__(self, models: dict[str, GeneratedModel]) -> None:
+        self.models = models
+
+    def execute(self, result: MeshyGenerationResult) -> GeneratedModel:
+        return self.models[result.task_id]
+
+
 # ### Cancellation tests ###
 class GenerationCancellationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.asset_directory = Path(self.temporary_directory.name) / "assets"
+        self.job_manager = GenerationJobManager()
         self.workspace = GenerationWorkspace(
-            asset_directory=self.asset_directory
+            asset_directory=self.asset_directory,
+            job_manager=self.job_manager,
         )
         self.workspace.show()
         _qt_application.processEvents()
@@ -251,6 +315,19 @@ class GenerationCancellationTests(unittest.TestCase):
             QTest.qWait(5)
         _qt_application.processEvents()
         self.assertFalse(self.workspace.is_generating)
+
+    def _wait_for_record_count(self, expected_count: int) -> None:
+        deadline = time.monotonic() + 5.0
+        while (
+            len(self.workspace.get_data().generated_objects) < expected_count
+            and time.monotonic() < deadline
+        ):
+            _qt_application.processEvents()
+            QTest.qWait(5)
+        self.assertEqual(
+            len(self.workspace.get_data().generated_objects),
+            expected_count,
+        )
 
     def test_cancel_active_generation_is_idempotent_and_discards_late_result(
         self,
@@ -710,6 +787,263 @@ class GenerationCancellationTests(unittest.TestCase):
         records = self.workspace.get_data().generated_objects
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0].provider_task_id, "current")
+
+    def test_two_model_jobs_overlap_and_commit_in_reverse_order(self) -> None:
+        planner = _PerFrameBlockingPlanner()
+        self.workspace.set_meshy_planner(planner)
+        self.workspace.set_meshy_executor(
+            _ResultModelExecutor(
+                {
+                    "model-task-0": _plain_model(1.0),
+                    "model-task-1": _plain_model(2.0),
+                }
+            )
+        )
+        first_request = self._generation_request()
+        second_request = GenerationRequest(
+            frame_index=1,
+            selected_object_bgra=np.zeros((4, 4, 4), dtype=np.uint8),
+            settings=GenerationServiceSettings(meshy_api_key="key"),
+        )
+
+        self.workspace._start_generation(
+            first_request,
+            requested_name="  Custom chair  ",
+        )
+        self.workspace._start_generation(second_request, requested_name="")
+        self._wait_for_event(planner.started[0])
+        self._wait_for_event(planner.started[1])
+
+        self.assertEqual(len(self.workspace._object_job_runtimes), 2)
+        planner.release[1].set()
+        self._wait_for_record_count(1)
+        self.assertEqual(
+            self.workspace.get_data().generated_objects[0].object_name,
+            "Provider object 1",
+        )
+        self.assertTrue(self.workspace.is_generating)
+
+        planner.release[0].set()
+        self._wait_until_idle()
+
+        records = self.workspace.get_data().generated_objects
+        self.assertEqual(
+            [record.provider_task_id for record in records],
+            ["model-task-1", "model-task-0"],
+        )
+        self.assertEqual(
+            [record.object_name for record in records],
+            ["Provider object 1", "Custom chair"],
+        )
+        self.assertTrue(
+            all(
+                job.status == JOB_STATUS_COMPLETED
+                for job in self.job_manager.jobs()
+            )
+        )
+        self.assertEqual(
+            {job.name for job in self.job_manager.jobs()},
+            {"Custom chair", "Provider object 1"},
+        )
+
+    def test_cancelling_one_model_job_leaves_its_sibling_running(self) -> None:
+        planner = _PerFrameBlockingPlanner()
+        self.workspace.set_meshy_planner(planner)
+        self.workspace.set_meshy_executor(
+            _ResultModelExecutor(
+                {
+                    "model-task-0": _plain_model(1.0),
+                    "model-task-1": _plain_model(2.0),
+                }
+            )
+        )
+        first_request = self._generation_request()
+        second_request = GenerationRequest(
+            frame_index=1,
+            selected_object_bgra=np.zeros((4, 4, 4), dtype=np.uint8),
+            settings=GenerationServiceSettings(meshy_api_key="key"),
+        )
+
+        self.workspace._start_generation(first_request)
+        self.workspace._start_generation(second_request)
+        self._wait_for_event(planner.started[0])
+        self._wait_for_event(planner.started[1])
+        runtimes = tuple(self.workspace._object_job_runtimes.values())
+        cancelled_runtime = runtimes[0]
+        assert cancelled_runtime.managed_job_id is not None
+
+        self.assertTrue(
+            self.job_manager.cancel_job(cancelled_runtime.managed_job_id)
+        )
+        planner.release[0].set()
+        planner.release[1].set()
+        self._wait_until_idle()
+
+        records = self.workspace.get_data().generated_objects
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].provider_task_id, "model-task-1")
+        statuses = {job.status for job in self.job_manager.jobs()}
+        self.assertEqual(
+            statuses,
+            {JOB_STATUS_CANCELLED, JOB_STATUS_COMPLETED},
+        )
+
+    def test_texture_jobs_overlap_by_object_and_reject_same_target(self) -> None:
+        chair, _variants = self._seed_textured_object()
+        table = replace(
+            chair,
+            object_id="table",
+            object_name="Table",
+            provider_task_id="table-original-task",
+        )
+        self.workspace.set_data(
+            GenerationData(generated_objects=[chair, table])
+        )
+        chair_request = self._texture_request(chair)
+        table_request = self._texture_request(table)
+        chair_variants = _texture_variants(3)
+        table_variants = _texture_variants(4)
+        results = {
+            "chair": MeshyGenerationResult(
+                "chair-new-texture",
+                chair_variants.glb_by_resolution[1024],
+                "Chair",
+            ),
+            "table": MeshyGenerationResult(
+                "table-new-texture",
+                table_variants.glb_by_resolution[1024],
+                "Table",
+            ),
+        }
+        regenerator = _PerObjectBlockingTextureRegenerator(results)
+        self.workspace.set_texture_regenerator(regenerator)
+        self.workspace.set_meshy_executor(
+            _ResultModelExecutor(
+                {
+                    "chair-new-texture": _model_with_variants(
+                        chair_variants
+                    ),
+                    "table-new-texture": _model_with_variants(
+                        table_variants
+                    ),
+                }
+            )
+        )
+
+        self.workspace._start_texture_regeneration(
+            chair_request,
+            requested_name="Chair polish",
+        )
+        self.workspace._start_texture_regeneration(table_request)
+        self._wait_for_event(regenerator.started["chair"])
+        self._wait_for_event(regenerator.started["table"])
+        self.assertEqual(len(self.workspace._object_job_runtimes), 2)
+
+        self.workspace._start_texture_regeneration(chair_request)
+        self.assertEqual(len(self.workspace._object_job_runtimes), 2)
+        regenerator.release["table"].set()
+        deadline = time.monotonic() + 5.0
+        while (
+            self.workspace.get_data().generated_objects[1].provider_task_id
+            != "table-new-texture"
+            and time.monotonic() < deadline
+        ):
+            _qt_application.processEvents()
+            QTest.qWait(5)
+        regenerator.release["chair"].set()
+        self._wait_until_idle()
+
+        records = {
+            record.object_id: record
+            for record in self.workspace.get_data().generated_objects
+        }
+        self.assertEqual(
+            records["chair"].provider_task_id,
+            "chair-new-texture",
+        )
+        self.assertEqual(
+            records["table"].provider_task_id,
+            "table-new-texture",
+        )
+        self.assertEqual(len(self.job_manager.jobs()), 2)
+        self.assertTrue(
+            all(
+                job.status == JOB_STATUS_COMPLETED
+                for job in self.job_manager.jobs()
+            )
+        )
+        self.assertTrue(
+            self.workspace.status_label.text().startswith("Chair polish: ")
+        )
+
+    def test_worker_preparation_is_off_gui_and_rejected_assets_are_removed(
+        self,
+    ) -> None:
+        gui_thread = _qt_application.thread()
+        persistence_threads: list[QThread] = []
+
+        def persist_with_thread_capture(
+            asset_directory: Path,
+            file_name: str,
+            payload: bytes,
+        ) -> str:
+            persistence_threads.append(QThread.currentThread())
+            return _persist_generated_named_asset(
+                asset_directory,
+                file_name,
+                payload,
+            )
+
+        result = MeshyGenerationResult("prepared", _box_glb(), "Prepared")
+        self.workspace.set_meshy_planner(_ImmediatePlanner(result))
+        self.workspace.set_meshy_executor(_ImmediateExecutor(_plain_model()))
+        with (
+            patch(
+                "housemaker.generation_workspace."
+                "_persist_generated_named_asset",
+                side_effect=persist_with_thread_capture,
+            ),
+            patch.object(
+                self.workspace,
+                "_commit_saved_object_generation",
+            ),
+        ):
+            self.workspace._start_generation(self._generation_request())
+            self._wait_until_idle()
+
+        self.assertTrue(persistence_threads)
+        self.assertTrue(
+            all(thread != gui_thread for thread in persistence_threads)
+        )
+        self.assertEqual(tuple(self.asset_directory.glob("*")), ())
+
+        symmetry_threads: list[QThread] = []
+        variants = _texture_variants(7)
+        self.workspace.set_meshy_executor(
+            _ImmediateExecutor(_model_with_variants(variants))
+        )
+
+        def reject_symmetric_preparation(*_args: object) -> object:
+            symmetry_threads.append(QThread.currentThread())
+            raise RuntimeError("injected symmetric preparation rejection")
+
+        symmetric_request = GenerationRequest(
+            frame_index=0,
+            selected_object_bgra=np.zeros((4, 4, 4), dtype=np.uint8),
+            settings=GenerationServiceSettings(meshy_api_key="key"),
+            symmetric_division_enabled=True,
+        )
+        with patch(
+            "housemaker.generation_workspace."
+            "build_automatic_symmetric_object_variants",
+            side_effect=reject_symmetric_preparation,
+        ):
+            self.workspace._start_generation(symmetric_request)
+            self._wait_until_idle()
+
+        self.assertEqual(len(symmetry_threads), 1)
+        self.assertNotEqual(symmetry_threads[0], gui_thread)
+        self.assertEqual(tuple(self.asset_directory.glob("*")), ())
 
 
 # ### Test entry point ###

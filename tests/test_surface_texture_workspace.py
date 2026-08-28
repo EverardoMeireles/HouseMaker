@@ -2817,7 +2817,9 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
             self.workspace.surface_view._surface_textures,
         )
 
-    def test_shutdown_discards_inflight_result_and_busy_state_blocks_replacement(self) -> None:
+    def test_shutdown_discards_inflight_result_and_only_data_replacement_is_blocked(
+        self,
+    ) -> None:
         blocker = _BlockingProvider()
         self.workspace.set_provider(blocker)
         request = SurfaceTextureRequest(
@@ -2838,8 +2840,13 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         self.assertIsNotNone(active_thread)
         with self.assertRaises(RuntimeError):
             self.workspace.set_data(SurfaceTextureData())
-        with self.assertRaises(RuntimeError):
-            self.workspace.load_video(str(self._temporary_path / "unused.avi"))
+        replacement_video = self._temporary_path / "replacement.avi"
+        _write_test_video(replacement_video, frame_count=1)
+        self.workspace.load_video(str(replacement_video))
+        self.assertEqual(
+            self.workspace.get_data().video_metadata.path,
+            str(replacement_video),
+        )
 
         self.workspace.shutdown()
         blocker.release.set()

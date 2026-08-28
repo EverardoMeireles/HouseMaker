@@ -30,6 +30,7 @@ SURFACE_TEXTURE_PROVIDER_SETTING_KEY = "generation/surface_texture_provider"
 FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY = (
     "display/fullscreen_3d_viewer_screen_id"
 )
+JOBS_WINDOW_SCREEN_SETTING_KEY = "display/jobs_window_screen_id"
 CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY_SETTING_KEY = (
     "navigation/canvas_3d_navigation_toggle_hotkey"
 )
@@ -97,6 +98,7 @@ class GenerationServiceSettings:
         DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY
     )
     unused_face_removal: bool = DEFAULT_UNUSED_FACE_REMOVAL
+    jobs_window_screen_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.unused_face_removal, bool):
@@ -132,6 +134,18 @@ class GenerationServiceSettings:
             "fullscreen_3d_viewer_screen_id",
             _normalize_fullscreen_3d_viewer_screen_id(
                 self.fullscreen_3d_viewer_screen_id
+            ),
+        )
+        if (
+            self.jobs_window_screen_id is not None
+            and not isinstance(self.jobs_window_screen_id, str)
+        ):
+            raise ValueError("Jobs window screen ID must be a string or None.")
+        object.__setattr__(
+            self,
+            "jobs_window_screen_id",
+            _normalize_fullscreen_3d_viewer_screen_id(
+                self.jobs_window_screen_id
             ),
         )
         normalized_hotkey = _normalize_canvas_3d_navigation_toggle_hotkey(
@@ -182,6 +196,8 @@ class SettingsWidget(QWidget):
             else ApplicationSettingsStore()
         )
         self._is_loading_settings = False
+        self._is_disposed = False
+        self._screen_signals_connected = False
         self._screen_application = _get_gui_application()
         environment_values = os.environ if environment is None else environment
         self._environment_meshy_api_key = str(
@@ -217,6 +233,7 @@ class SettingsWidget(QWidget):
             fullscreen_3d_viewer_screen_id=(
                 self._selected_fullscreen_3d_viewer_screen_id()
             ),
+            jobs_window_screen_id=self._selected_jobs_window_screen_id(),
             canvas_3d_navigation_toggle_hotkey=(
                 self._selected_canvas_3d_navigation_toggle_hotkey()
             ),
@@ -228,11 +245,38 @@ class SettingsWidget(QWidget):
 
         return self._selected_fullscreen_3d_viewer_screen_id()
 
+    def get_jobs_window_screen_id(self) -> str | None:
+        """Return the selected Jobs-window display without rereading disk."""
+
+        return self._selected_jobs_window_screen_id()
+
     def clear_session_keys(self) -> None:
         """Clear the temporary plaintext key values from settings.json."""
 
         self.meshy_api_key_edit.clear()
         self.openai_api_key_edit.clear()
+
+    def dispose(self) -> None:
+        """Disconnect application-wide display signals exactly once."""
+
+        if self._is_disposed:
+            return
+        self._is_disposed = True
+        if (
+            self._screen_application is None
+            or not self._screen_signals_connected
+        ):
+            return
+        for signal in (
+            self._screen_application.screenAdded,
+            self._screen_application.screenRemoved,
+            self._screen_application.primaryScreenChanged,
+        ):
+            try:
+                signal.disconnect(self._handle_connected_screens_changed)
+            except (RuntimeError, TypeError):
+                pass
+        self._screen_signals_connected = False
 
     def _build_ui(self) -> None:
         root_layout = QVBoxLayout(self)
@@ -282,6 +326,21 @@ class SettingsWidget(QWidget):
         form_layout.addRow(
             "Fullscreen 3D viewer display",
             self.fullscreen_3d_viewer_screen_combo,
+        )
+
+        self.jobs_window_screen_combo = QComboBox()
+        self.jobs_window_screen_combo.setObjectName(
+            "jobs_window_screen_combo"
+        )
+        self.jobs_window_screen_combo.setToolTip(
+            "Choose the display where the detached Jobs window opens."
+        )
+        self.jobs_window_screen_combo.currentIndexChanged.connect(
+            self._handle_jobs_window_screen_changed
+        )
+        form_layout.addRow(
+            "Jobs window display",
+            self.jobs_window_screen_combo,
         )
 
         self.canvas_3d_navigation_toggle_hotkey_edit = QKeySequenceEdit()
@@ -379,6 +438,7 @@ class SettingsWidget(QWidget):
             )
         )
         self._refresh_fullscreen_3d_viewer_screen_options()
+        self._refresh_jobs_window_screen_options()
         self.canvas_3d_navigation_toggle_hotkey_edit.setKeySequence(
             QKeySequence(
                 read_canvas_3d_navigation_toggle_hotkey(
@@ -407,7 +467,10 @@ class SettingsWidget(QWidget):
         self.settings_changed.emit()
 
     def _connect_screen_change_signals(self) -> None:
-        if self._screen_application is None:
+        if (
+            self._screen_application is None
+            or self._screen_signals_connected
+        ):
             return
         self._screen_application.screenAdded.connect(
             self._handle_connected_screens_changed
@@ -415,15 +478,22 @@ class SettingsWidget(QWidget):
         self._screen_application.screenRemoved.connect(
             self._handle_connected_screens_changed
         )
+        self._screen_application.primaryScreenChanged.connect(
+            self._handle_connected_screens_changed
+        )
+        self._screen_signals_connected = True
 
-    def _handle_connected_screens_changed(self, _screen: QScreen) -> None:
-        previous_screen_id = self._selected_fullscreen_3d_viewer_screen_id()
+    def _handle_connected_screens_changed(
+        self,
+        _screen: QScreen | None,
+    ) -> None:
+        if self._is_disposed:
+            return
         self._refresh_fullscreen_3d_viewer_screen_options()
-        if (
-            not self._is_loading_settings
-            and previous_screen_id
-            != self._selected_fullscreen_3d_viewer_screen_id()
-        ):
+        self._refresh_jobs_window_screen_options()
+        if not self._is_loading_settings:
+            # Reapply even unchanged "Primary display" selections because the
+            # primary screen itself may have changed or been disconnected.
             self.settings_changed.emit()
 
     def _refresh_fullscreen_3d_viewer_screen_options(self) -> None:
@@ -451,6 +521,31 @@ class SettingsWidget(QWidget):
             self.fullscreen_3d_viewer_screen_combo.currentData()
         )
 
+    def _refresh_jobs_window_screen_options(self) -> None:
+        selected_screen_id = read_jobs_window_screen_id(
+            self._application_settings
+        )
+        blocker = QSignalBlocker(self.jobs_window_screen_combo)
+        self.jobs_window_screen_combo.clear()
+        self.jobs_window_screen_combo.addItem("Primary display", None)
+        for option in connected_fullscreen_3d_viewer_display_options():
+            self.jobs_window_screen_combo.addItem(
+                option.label,
+                option.screen_id,
+            )
+        selected_index = self.jobs_window_screen_combo.findData(
+            selected_screen_id
+        )
+        self.jobs_window_screen_combo.setCurrentIndex(
+            selected_index if selected_index >= 0 else 0
+        )
+        del blocker
+
+    def _selected_jobs_window_screen_id(self) -> str | None:
+        return _normalize_fullscreen_3d_viewer_screen_id(
+            self.jobs_window_screen_combo.currentData()
+        )
+
     def _handle_fullscreen_3d_viewer_screen_changed(
         self,
         _index: int,
@@ -460,6 +555,15 @@ class SettingsWidget(QWidget):
         self._application_settings.set(
             FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY,
             self._selected_fullscreen_3d_viewer_screen_id(),
+        )
+        self.settings_changed.emit()
+
+    def _handle_jobs_window_screen_changed(self, _index: int) -> None:
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            JOBS_WINDOW_SCREEN_SETTING_KEY,
+            self._selected_jobs_window_screen_id(),
         )
         self.settings_changed.emit()
 
@@ -548,8 +652,10 @@ def resolve_fullscreen_3d_viewer_screen(
     normalized_screen_id = _normalize_fullscreen_3d_viewer_screen_id(screen_id)
     if normalized_screen_id is None:
         return None
-    for screen in _connected_screens():
-        if fullscreen_3d_viewer_screen_id(screen) == normalized_screen_id:
+    screens = _connected_screens()
+    options = _fullscreen_3d_viewer_display_options(screens)
+    for screen, option in zip(screens, options, strict=True):
+        if option.screen_id == normalized_screen_id:
             return screen
     return None
 
@@ -578,6 +684,16 @@ def read_fullscreen_3d_viewer_screen_id(
 
     return _normalize_fullscreen_3d_viewer_screen_id(
         application_settings.get(FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY)
+    )
+
+
+def read_jobs_window_screen_id(
+    application_settings: ApplicationSettingsStore,
+) -> str | None:
+    """Read the persisted detached Jobs-window display identity."""
+
+    return _normalize_fullscreen_3d_viewer_screen_id(
+        application_settings.get(JOBS_WINDOW_SCREEN_SETTING_KEY)
     )
 
 

@@ -5,6 +5,7 @@ import copy
 import hashlib
 import math
 import os
+import re
 import tempfile
 import threading
 import uuid
@@ -32,6 +33,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
@@ -58,6 +60,7 @@ from housemaker.generation_state import (
     GeneratedObjectPlacement,
     GenerationData,
 )
+from housemaker.generation_jobs import GenerationJobManager
 from housemaker.generation_views import VideoInpaintView
 from housemaker.glb import GeneratedModel, import_generated_glb
 from housemaker.meshy_generation import (
@@ -161,6 +164,9 @@ MAX_OBJECT_OPERATION_UNDO_COUNT = 10
 OBJECT_OPERATION_GENERATE_MODEL = "generate_model"
 OBJECT_OPERATION_GENERATE_TEXTURE = "generate_texture"
 OBJECT_OPERATION_PURGE_FACES = "purge_faces"
+GENERATION_JOB_KIND_MODEL = "Object generation"
+GENERATION_JOB_KIND_TEXTURE = "Object texture generation"
+GENERATION_JOB_KIND_FACE_PURGE = "Object face purge"
 SYMMETRIC_DIVISION_PIPELINE_KEY = "symmetric_division"
 SYMMETRIC_DIVISION_TEXTURE_CONTENT_HALF = "left"
 SYMMETRIC_TEXTURE_RESOLUTIONS = SYMMETRIC_SQUARE_PAIR_CONTENT_RESOLUTIONS
@@ -180,6 +186,13 @@ LEFT_HALF_SYMMETRIC_METADATA_VERSIONS = (
     SUPPORTED_SYMMETRIC_METADATA_VERSIONS
     - {SYMMETRIC_QUARTER_METADATA_VERSION}
 )
+_PROGRESS_PERCENT_PATTERN = re.compile(r"(?<!\d)(100|[1-9]?\d)\s*%")
+_OBJECT_PROVIDER_PROGRESS_START = 5
+_OBJECT_PROVIDER_PROGRESS_END = 80
+_STAGED_GEOMETRY_PROGRESS_END = 48
+_STAGED_TEXTURE_PROGRESS_START = 56
+_TEXTURE_PROVIDER_PROGRESS_START = 5
+_TEXTURE_PROVIDER_PROGRESS_END = 80
 
 
 # ### Active operation state ###
@@ -211,6 +224,61 @@ class _ExistingObjectPlacementRequest:
 
     request_id: str
     object_id: str
+
+
+class _ObjectJobSignalRelay(QObject):
+    """Tag worker events on a GUI-affine QObject before workspace dispatch."""
+
+    pair_succeeded = Signal(str, object, object)
+    single_succeeded = Signal(str, object)
+    failed = Signal(str, str)
+    progress = Signal(str, str)
+    thread_finished = Signal(str)
+
+    def __init__(self, operation_id: str, parent: QObject) -> None:
+        super().__init__(parent)
+        self._operation_id = str(operation_id)
+
+    @Slot(object, object)
+    def forward_pair_succeeded(self, first: object, second: object) -> None:
+        self.pair_succeeded.emit(self._operation_id, first, second)
+
+    @Slot(object)
+    def forward_single_succeeded(self, outcome: object) -> None:
+        self.single_succeeded.emit(self._operation_id, outcome)
+
+    @Slot(str)
+    def forward_failed(self, message: str) -> None:
+        self.failed.emit(self._operation_id, str(message))
+
+    @Slot(str)
+    def forward_progress(self, message: str) -> None:
+        self.progress.emit(self._operation_id, str(message))
+
+    @Slot()
+    def forward_thread_finished(self) -> None:
+        self.thread_finished.emit(self._operation_id)
+
+
+@dataclass
+class _ObjectJobRuntime:
+    """Own one worker transaction independently of every other job."""
+
+    operation: _ActiveObjectOperation
+    thread: QThread
+    worker: (
+        GenerationWorker
+        | TextureRegenerationWorker
+        | UncheckedCameraFacePurgeWorker
+    )
+    relay: _ObjectJobSignalRelay
+    generation_request: GenerationRequest | None = None
+    requested_name: str = ""
+    managed_job_id: str | None = None
+
+    @property
+    def operation_id(self) -> str:
+        return self.operation.operation_id
 
 
 # ### Symmetric-division metadata ###
@@ -456,12 +524,128 @@ class TextureRegenerationRequest:
 
 
 @dataclass(frozen=True)
+class _TextureRegenerationPreflight:
+    """Lightweight GUI snapshot materialized into a request by the worker."""
+
+    object_id: str
+    reference_frame_index: int
+    reference_image_bgra: np.ndarray
+    source_asset_path: str
+    source_asset_revision: tuple[object, ...]
+    settings: GenerationServiceSettings
+    enable_original_uv: bool = False
+    preserve_symmetric_uvs: bool = False
+
+    def __post_init__(self) -> None:
+        normalized_object_id = str(self.object_id).strip()
+        if not normalized_object_id:
+            raise ValueError("Texture regeneration requires an object ID.")
+        reference_image = np.asarray(self.reference_image_bgra)
+        if (
+            reference_image.ndim != 3
+            or reference_image.shape[2] != 4
+            or reference_image.size == 0
+        ):
+            raise ValueError(
+                "Texture regeneration requires a non-empty BGRA reference image."
+            )
+        source_asset_path = str(self.source_asset_path).strip()
+        source_path = Path(source_asset_path)
+        if (
+            not source_asset_path
+            or source_path.is_absolute()
+            or ".." in source_path.parts
+            or source_path.suffix.lower() != ".glb"
+        ):
+            raise ValueError("The texture source asset path is unsafe.")
+        if len(self.source_asset_revision) != 4:
+            raise ValueError("The texture source asset revision is invalid.")
+        if self.preserve_symmetric_uvs and not self.enable_original_uv:
+            raise ValueError(
+                "Symmetric texture regeneration must preserve original UVs."
+            )
+        if self.enable_original_uv and not self.preserve_symmetric_uvs:
+            raise ValueError(
+                "Original-UV texture regeneration is only supported for "
+                "symmetric objects."
+            )
+        object.__setattr__(self, "object_id", normalized_object_id)
+        object.__setattr__(
+            self,
+            "reference_frame_index",
+            int(self.reference_frame_index),
+        )
+        object.__setattr__(
+            self,
+            "reference_image_bgra",
+            np.ascontiguousarray(reference_image).copy(),
+        )
+        object.__setattr__(self, "source_asset_path", source_asset_path)
+        object.__setattr__(
+            self,
+            "source_asset_revision",
+            tuple(self.source_asset_revision),
+        )
+        object.__setattr__(
+            self,
+            "enable_original_uv",
+            bool(self.enable_original_uv),
+        )
+        object.__setattr__(
+            self,
+            "preserve_symmetric_uvs",
+            bool(self.preserve_symmetric_uvs),
+        )
+
+
+@dataclass(frozen=True)
+class _MaterializedTextureRegeneration:
+    """Worker-owned paid request plus its stable source revision."""
+
+    request: TextureRegenerationRequest
+    source_asset_path: str | None = None
+    source_asset_revision: tuple[object, ...] | None = None
+
+
+@dataclass(frozen=True)
 class TextureRegenerationOutcome:
     """Provider result plus the immutable request and verified final UVs."""
 
     request: TextureRegenerationRequest
     result: MeshyGenerationResult
     final_uv_fingerprint: UvFingerprint | None = None
+
+
+@dataclass(frozen=True)
+class _SavedObjectGeneration:
+    """Fully prepared model assets awaiting a short GUI-thread commit."""
+
+    result: MeshyGenerationResult
+    object_id: str
+    pipeline: dict[str, object]
+    asset_path: str
+    preview_model: GeneratedModel
+    preview_asset_revision: tuple[object, ...]
+    symmetry: ObjectSymmetricDivisionMetadata | None
+    persisted_asset_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _SavedObjectTextureRegeneration:
+    """Fully prepared texture assets awaiting target and Atlas validation."""
+
+    outcome: TextureRegenerationOutcome
+    variant_metadata: dict[str, dict[str, str]]
+    selected_resolution: int
+    base_asset_path: str
+    base_provider_task_id: str
+    base_pipeline: dict[str, object]
+    source_asset_path: str | None
+    source_asset_revision: tuple[object, ...] | None
+    next_pipeline: dict[str, object]
+    preview_model: GeneratedModel
+    preview_asset_revision: tuple[object, ...]
+    persisted_asset_paths: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -946,6 +1130,91 @@ class ObjectGenerationViewerPanel(QWidget):
         self.unused_face_camera_controls.setEnabled(bool(enabled))
 
 
+# ### Background progress mapping ###
+class _BoundedProgressMapper:
+    """Map provider-local percentages into one monotonic job phase."""
+
+    def __init__(self) -> None:
+        self._last_percent = 0
+
+    def _map_message(
+        self,
+        message: str,
+        *,
+        phase_start: int,
+        phase_end: int,
+        phase_floor_without_percent: bool = False,
+    ) -> str:
+        text = str(message)
+        match = _PROGRESS_PERCENT_PATTERN.search(text)
+        if match is None:
+            if phase_floor_without_percent:
+                self._last_percent = max(self._last_percent, phase_start)
+                return f"{text} ({self._last_percent}%)"
+            return text
+        provider_percent = max(0, min(100, int(match.group(1))))
+        mapped_percent = round(
+            phase_start
+            + ((phase_end - phase_start) * provider_percent / 100)
+        )
+        self._last_percent = max(self._last_percent, mapped_percent)
+        return (
+            text[: match.start()]
+            + f"{self._last_percent}%"
+            + text[match.end() :]
+        )
+
+
+class _ObjectGenerationProgressMapper(_BoundedProgressMapper):
+    """Keep staged geometry and texturing inside distinct progress ranges."""
+
+    def __init__(self, request: GenerationRequest) -> None:
+        super().__init__()
+        unchecked_camera_ids = set(ALL_CAMERA_IDS) - set(
+            request.enabled_camera_ids
+        )
+        self._uses_staged_pipeline = bool(
+            request.geometry_only
+            or request.settings.unused_face_removal
+            or unchecked_camera_ids
+        )
+        self._geometry_only = request.geometry_only
+        self._texture_phase = False
+
+    def map_provider_message(self, message: str) -> str:
+        text = str(message)
+        if self._uses_staged_pipeline and "textur" in text.lower():
+            self._texture_phase = True
+        if self._texture_phase:
+            return self._map_message(
+                text,
+                phase_start=_STAGED_TEXTURE_PROGRESS_START,
+                phase_end=_OBJECT_PROVIDER_PROGRESS_END,
+                phase_floor_without_percent=True,
+            )
+        geometry_end = (
+            _STAGED_GEOMETRY_PROGRESS_END
+            if self._uses_staged_pipeline and not self._geometry_only
+            else _OBJECT_PROVIDER_PROGRESS_END
+        )
+        return self._map_message(
+            text,
+            phase_start=_OBJECT_PROVIDER_PROGRESS_START,
+            phase_end=geometry_end,
+        )
+
+
+class _ObjectTextureProgressMapper(_BoundedProgressMapper):
+    """Reserve the final fifth of progress for local texture preparation."""
+
+    def map_provider_message(self, message: str) -> str:
+        return self._map_message(
+            str(message),
+            phase_start=_TEXTURE_PROVIDER_PROGRESS_START,
+            phase_end=_TEXTURE_PROVIDER_PROGRESS_END,
+        )
+
+
 # ### Background worker ###
 class GenerationWorker(QObject):
     succeeded = Signal(object, object)
@@ -958,15 +1227,38 @@ class GenerationWorker(QObject):
         planner: MeshyPlanner | Callable[[GenerationRequest], MeshyGenerationResult],
         executor: MeshyExecutor | Callable[[MeshyGenerationResult], GeneratedModel],
         request: GenerationRequest,
+        *,
+        asset_directory: Path | None = None,
+        object_id: str | None = None,
     ) -> None:
         super().__init__()
         self._planner = planner
         self._executor = executor
         self._request = request
+        self._asset_directory = (
+            None if asset_directory is None else Path(asset_directory)
+        )
+        self._object_id = None if object_id is None else str(object_id)
         self._cancel_event = threading.Event()
+        self._output_lock = threading.Lock()
+        self._unclaimed_asset_paths: tuple[str, ...] = ()
 
     def cancel(self) -> None:
         self._cancel_event.set()
+
+    def claim_saved_output(self) -> None:
+        with self._output_lock:
+            self._unclaimed_asset_paths = ()
+
+    def discard_unclaimed_output(self) -> None:
+        with self._output_lock:
+            asset_paths = self._unclaimed_asset_paths
+            self._unclaimed_asset_paths = ()
+        if self._asset_directory is not None:
+            _discard_generated_asset_paths(
+                self._asset_directory,
+                asset_paths,
+            )
 
     @Slot()
     def run(self) -> None:
@@ -977,19 +1269,25 @@ class GenerationWorker(QObject):
                 self.progress.emit("Preparing model processor...")
                 _run_interruptible_stage(prepare_executor)
                 _raise_if_generation_cancelled(self._cancel_event)
+            progress_mapper = _ObjectGenerationProgressMapper(self._request)
             result = _run_interruptible_stage(
                 lambda: _invoke_planner(
                     self._planner,
                     self._request,
-                    self.progress.emit,
+                    lambda message: self.progress.emit(
+                        progress_mapper.map_provider_message(message)
+                    ),
                     self._cancel_event,
                 )
             )
             _raise_if_generation_cancelled(self._cancel_event)
             self.progress.emit(
-                "Validating generated geometry..."
+                "Preparing generated geometry locally (84%)"
                 if self._request.geometry_only
-                else "Creating 512, 1024 and 2048 texture variants..."
+                else (
+                    "Preparing local 512, 1024 and 2048 texture variants "
+                    "(84%)"
+                )
             )
             generated_model = _run_interruptible_stage(
                 lambda: _invoke_executor(self._executor, result)
@@ -997,15 +1295,36 @@ class GenerationWorker(QObject):
             if not isinstance(generated_model, GeneratedModel):
                 raise TypeError("The Meshy executor returned an invalid model.")
             _raise_if_generation_cancelled(self._cancel_event)
+            success_payload: object = result
+            if self._asset_directory is not None and self._object_id is not None:
+                self.progress.emit("Saving local object assets (94%)")
+                saved_output = _prepare_and_persist_object_generation(
+                    self._asset_directory,
+                    self._object_id,
+                    self._request,
+                    result,
+                    generated_model,
+                    self._cancel_event,
+                )
+                with self._output_lock:
+                    self._unclaimed_asset_paths = (
+                        saved_output.persisted_asset_paths
+                    )
+                generated_model = saved_output.preview_model
+                success_payload = saved_output
+            _raise_if_generation_cancelled(self._cancel_event)
+            self.progress.emit("Waiting to apply generated object (98%)")
         except _GenerationCancelled:
+            self.discard_unclaimed_output()
             return
         except Exception as error:
+            self.discard_unclaimed_output()
             if self._cancel_event.is_set():
                 return
             self.failed.emit(_safe_error_message(error, self._request.settings))
             return
         else:
-            self.succeeded.emit(result, generated_model)
+            self.succeeded.emit(success_payload, generated_model)
         finally:
             self.finished.emit()
 
@@ -1024,40 +1343,82 @@ class TextureRegenerationWorker(QObject):
         | Callable[[TextureRegenerationRequest], MeshyGenerationResult],
         executor: MeshyExecutor
         | Callable[[MeshyGenerationResult], GeneratedModel],
-        request: TextureRegenerationRequest,
+        request: TextureRegenerationRequest | _TextureRegenerationPreflight,
+        *,
+        asset_directory: Path | None = None,
+        symmetry: ObjectSymmetricDivisionMetadata | None = None,
+        selected_resolution: int = DEFAULT_TEXTURE_RESOLUTION,
+        record_snapshot: GeneratedObjectRecord | None = None,
     ) -> None:
         super().__init__()
         self._regenerator = regenerator
         self._executor = executor
         self._request = request
+        self._asset_directory = (
+            None if asset_directory is None else Path(asset_directory)
+        )
+        self._symmetry = symmetry
+        self._selected_resolution = int(selected_resolution)
+        self._record_snapshot = record_snapshot
         self._cancel_event = threading.Event()
+        self._output_lock = threading.Lock()
+        self._unclaimed_asset_paths: tuple[str, ...] = ()
 
     def cancel(self) -> None:
         self._cancel_event.set()
 
+    def claim_saved_output(self) -> None:
+        with self._output_lock:
+            self._unclaimed_asset_paths = ()
+
+    def discard_unclaimed_output(self) -> None:
+        with self._output_lock:
+            asset_paths = self._unclaimed_asset_paths
+            self._unclaimed_asset_paths = ()
+        if self._asset_directory is not None:
+            _discard_generated_asset_paths(
+                self._asset_directory,
+                asset_paths,
+            )
+
     @Slot()
     def run(self) -> None:
         try:
+            _raise_if_generation_cancelled(self._cancel_event)
+            self.progress.emit("Validating texture source model (2%)")
+            materialized = _materialize_texture_regeneration_preflight(
+                self._request,
+                self._asset_directory,
+                self._cancel_event,
+            )
+            request = materialized.request
+            self._request = request
             _raise_if_generation_cancelled(self._cancel_event)
             prepare_executor = getattr(self._executor, "prepare", None)
             if callable(prepare_executor):
                 self.progress.emit("Preparing model processor...")
                 _run_interruptible_stage(prepare_executor)
                 _raise_if_generation_cancelled(self._cancel_event)
+            progress_mapper = _ObjectTextureProgressMapper()
             result = _run_interruptible_stage(
                 lambda: _invoke_texture_regenerator(
                     self._regenerator,
-                    self._request,
-                    self.progress.emit,
+                    request,
+                    lambda message: self.progress.emit(
+                        progress_mapper.map_provider_message(message)
+                    ),
                     self._cancel_event,
                 )
             )
             if not isinstance(result, MeshyGenerationResult):
                 raise TypeError("Meshy returned an invalid texture result.")
             _raise_if_generation_cancelled(self._cancel_event)
-            final_uv_fingerprint = self._validate_final_uvs(result)
+            final_uv_fingerprint = self._validate_final_uvs(
+                result,
+                request,
+            )
             self.progress.emit(
-                "Creating 512, 1024 and 2048 texture variants..."
+                "Preparing local 512, 1024 and 2048 texture variants (84%)"
             )
             generated_model = _run_interruptible_stage(
                 lambda: _invoke_executor(self._executor, result)
@@ -1065,28 +1426,58 @@ class TextureRegenerationWorker(QObject):
             if not isinstance(generated_model, GeneratedModel):
                 raise TypeError("The Meshy executor returned an invalid model.")
             _raise_if_generation_cancelled(self._cancel_event)
+            self.progress.emit("Local texture preparation complete. Saving...")
             outcome = TextureRegenerationOutcome(
-                request=self._request,
+                request=request,
                 result=result,
                 final_uv_fingerprint=final_uv_fingerprint,
             )
+            success_payload: object = outcome
+            if self._asset_directory is not None:
+                if self._record_snapshot is None:
+                    raise ValueError(
+                        "Texture persistence requires an object snapshot."
+                    )
+                self.progress.emit("Saving local texture assets (94%)")
+                saved_output = _prepare_and_persist_texture_regeneration(
+                    self._asset_directory,
+                    outcome,
+                    generated_model,
+                    self._symmetry,
+                    self._selected_resolution,
+                    self._record_snapshot,
+                    materialized.source_asset_path,
+                    materialized.source_asset_revision,
+                    self._cancel_event,
+                )
+                with self._output_lock:
+                    self._unclaimed_asset_paths = (
+                        saved_output.persisted_asset_paths
+                    )
+                generated_model = saved_output.preview_model
+                success_payload = saved_output
+            _raise_if_generation_cancelled(self._cancel_event)
+            self.progress.emit("Waiting to apply generated texture (98%)")
         except _GenerationCancelled:
+            self.discard_unclaimed_output()
             return
         except Exception as error:
+            self.discard_unclaimed_output()
             if self._cancel_event.is_set():
                 return
             self.failed.emit(_safe_error_message(error, self._request.settings))
             return
         else:
-            self.succeeded.emit(outcome, generated_model)
+            self.succeeded.emit(success_payload, generated_model)
         finally:
             self.finished.emit()
 
     def _validate_final_uvs(
         self,
         result: MeshyGenerationResult,
+        request: TextureRegenerationRequest,
     ) -> UvFingerprint | None:
-        submitted = self._request.submitted_uv_fingerprint
+        submitted = request.submitted_uv_fingerprint
         if submitted is None:
             return None
         try:
@@ -1189,6 +1580,7 @@ class GenerationWorkspace(QWidget):
         meshy_texture_regenerator: TextureRegenerator
         | Callable[[TextureRegenerationRequest], MeshyGenerationResult]
         | None = None,
+        job_manager: GenerationJobManager | None = None,
     ) -> None:
         super().__init__(parent)
         self._meshy_planner = meshy_planner or MeshyImagePlanner()
@@ -1210,6 +1602,8 @@ class GenerationWorkspace(QWidget):
         self._video_source: VideoFrameSource | None = None
         self._displayed_frame_index: int | None = None
         self._is_syncing_seekbar = False
+        self._job_manager = job_manager
+        self._object_job_runtimes: dict[str, _ObjectJobRuntime] = {}
         self._generation_thread: QThread | None = None
         self._generation_worker: (
             GenerationWorker
@@ -1294,7 +1688,7 @@ class GenerationWorkspace(QWidget):
         return None if record is None else record.placement
 
     def set_data(self, data: GenerationData | None) -> None:
-        if self._generation_thread is not None:
+        if self.is_generating:
             raise RuntimeError("Cannot replace Generation data while generating.")
         self._finish_existing_object_placement_request()
         self._close_video_source()
@@ -1575,7 +1969,7 @@ class GenerationWorkspace(QWidget):
     ) -> bool:
         """Assign one exact persisted texture variant to an object globally."""
 
-        if self._generation_thread is not None:
+        if self._object_has_active_mutation_job(object_id):
             return False
         record = self._find_generated_object_record(object_id)
         if record is None:
@@ -1644,20 +2038,33 @@ class GenerationWorkspace(QWidget):
 
     @property
     def is_generating(self) -> bool:
-        return self._generation_thread is not None
+        return bool(self._object_job_runtimes) or (
+            self._generation_thread is not None
+            and not self._object_job_runtimes
+        )
+
+    def has_active_object_job(self, object_id: str) -> bool:
+        """Return whether one object's persisted state is currently reserved."""
+
+        return self._object_has_active_mutation_job(object_id)
 
     def request_object_placement(self) -> bool:
         """Request placement for an in-flight or selected completed object."""
 
-        operation = self._active_object_operation
-        if self._can_place_active_operation(operation):
-            assert operation is not None
+        placeable_jobs = tuple(
+            runtime
+            for runtime in self._object_job_runtimes.values()
+            if self._can_place_active_operation(runtime.operation)
+        )
+        if len(placeable_jobs) == 1:
+            operation = placeable_jobs[0].operation
             self.placement_requested.emit(operation.operation_id)
             return True
-        if self._generation_thread is not None:
-            return False
         record = self._find_generated_object_record(self._selected_object_id)
-        if record is None:
+        if (
+            record is None
+            or self._object_has_active_mutation_job(record.object_id)
+        ):
             return False
 
         self._finish_existing_object_placement_request()
@@ -1684,12 +2091,9 @@ class GenerationWorkspace(QWidget):
         if not isinstance(placement, GeneratedObjectPlacement):
             return False
         exact_request_id = str(operation_id)
-        operation = self._active_object_operation
-        if (
-            self._can_place_active_operation(operation)
-            and operation is not None
-            and operation.operation_id == exact_request_id
-        ):
+        runtime = self._object_job_runtimes.get(exact_request_id)
+        operation = None if runtime is None else runtime.operation
+        if operation is not None and self._can_place_active_operation(operation):
             operation.pending_placement = placement
             self.status_label.setText(
                 "Object placement selected. Generation is still in progress."
@@ -1698,8 +2102,7 @@ class GenerationWorkspace(QWidget):
 
         request = self._existing_object_placement_request
         if (
-            self._generation_thread is not None
-            or request is None
+            request is None
             or request.request_id != exact_request_id
         ):
             return False
@@ -1785,17 +2188,31 @@ class GenerationWorkspace(QWidget):
     def cancel_current_operation(self) -> bool:
         """Request an idempotent rollback of the active object operation."""
 
-        operation = self._active_object_operation
-        thread = self._generation_thread
-        if operation is None or thread is None:
+        runtime = self._legacy_active_job_runtime()
+        if runtime is None:
             return False
+        return self.cancel_operation(runtime.operation_id)
+
+    def cancel_operation(self, operation_id: str) -> bool:
+        """Cancel one exact generation job without affecting its siblings."""
+
+        runtime = self._object_job_runtimes.get(str(operation_id))
+        if runtime is None:
+            return False
+        manager = self._job_manager
+        if manager is not None and runtime.managed_job_id is not None:
+            managed_job = manager.get_job(runtime.managed_job_id)
+            if managed_job is not None and managed_job.is_finished:
+                return False
+        operation = runtime.operation
         if operation.cancel_requested:
             return True
         operation.cancel_requested = True
         operation.pending_placement = None
-        worker = self._generation_worker
+        worker = runtime.worker
         if worker is not None and is_valid_qt_object(worker):
             worker.cancel()
+        thread = runtime.thread
         if is_valid_qt_object(thread):
             thread.requestInterruption()
         self.status_label.setText("Cancelling the current operation...")
@@ -1812,10 +2229,13 @@ class GenerationWorkspace(QWidget):
     def purge_selected_object_faces(self) -> bool:
         """Delete faces visible from every currently unchecked camera."""
 
-        if self._generation_thread is not None:
-            return False
         request = self._build_unchecked_camera_face_purge_request()
         if request is None:
+            return False
+        if self._object_has_active_mutation_job(request.object_id):
+            self.status_label.setText(
+                "Wait for the selected object's active job to finish."
+            )
             return False
         self._start_unchecked_camera_face_purge(request)
         return True
@@ -1828,12 +2248,16 @@ class GenerationWorkspace(QWidget):
     def generate_selected_object_texture(self) -> bool:
         """Generate the selected object's texture from the current mask."""
 
-        if self._generation_thread is not None:
-            return False
         request = self._build_texture_regeneration_request()
         if request is None:
             return False
-        self._start_texture_regeneration(request)
+        requested_name = self.job_name_edit.text().strip()
+        if not self._start_texture_regeneration(
+            request,
+            requested_name=requested_name,
+        ):
+            return False
+        self.job_name_edit.clear()
         return True
 
     def undo_selected_object_change(self) -> bool:
@@ -1848,10 +2272,14 @@ class GenerationWorkspace(QWidget):
         object_id: str,
         *,
         expected_operation: str | None = None,
+        allow_operation_id: str | None = None,
     ) -> bool:
         """Undo one exact object's latest operation and its Atlas transition."""
 
-        if self._generation_thread is not None:
+        if self._object_has_active_mutation_job(
+            object_id,
+            excluding_operation_id=allow_operation_id,
+        ):
             return False
         record = self._find_generated_object_record(object_id)
         if record is None:
@@ -1910,7 +2338,12 @@ class GenerationWorkspace(QWidget):
         self._sync_controls()
         return True
 
-    def delete_generated_object(self, object_id: str) -> bool:
+    def delete_generated_object(
+        self,
+        object_id: str,
+        *,
+        allow_operation_id: str | None = None,
+    ) -> bool:
         """Remove one generated object and its unreferenced GLB/PNG assets.
 
         This programmatic seam deliberately does not show a confirmation
@@ -1919,9 +2352,12 @@ class GenerationWorkspace(QWidget):
         remove another object.
         """
 
-        if self._generation_thread is not None:
+        if self._object_has_active_mutation_job(
+            object_id,
+            excluding_operation_id=allow_operation_id,
+        ):
             self.status_label.setText(
-                "Wait for generation to finish before deleting an object."
+                "Wait for this object's active job to finish before deleting it."
             )
             return False
         if not isinstance(object_id, str) or not object_id:
@@ -1995,8 +2431,6 @@ class GenerationWorkspace(QWidget):
         self._meshy_texture_regenerator = regenerator
 
     def load_video(self, video_path: str) -> None:
-        if self._generation_thread is not None:
-            raise RuntimeError("Cannot replace the video while generating.")
         metadata = probe_video(video_path)
         next_source = VideoFrameSource(metadata.path)
         self._close_video_source()
@@ -2037,18 +2471,17 @@ class GenerationWorkspace(QWidget):
         self._sync_controls()
 
     def generate(self) -> None:
-        if self._generation_thread is not None:
-            return
         request = self._build_generation_request()
         if request is None:
             return
-        self._start_generation(request)
+        self._start_generation(
+            request,
+            requested_name=self._take_requested_job_name(),
+        )
 
     def generate_geometry(self) -> None:
         """Generate and locally process geometry without submitting Retexture."""
 
-        if self._generation_thread is not None:
-            return
         if self.symmetric_division_checkbox.isChecked():
             self.status_label.setText(
                 "Symmetric division requires the full Generate workflow. "
@@ -2058,89 +2491,151 @@ class GenerationWorkspace(QWidget):
         request = self._build_generation_request(geometry_only=True)
         if request is None:
             return
-        self._start_generation(request)
+        self._start_generation(
+            request,
+            requested_name=self._take_requested_job_name(),
+        )
 
-    def _start_generation(self, request: GenerationRequest) -> None:
-        """Start one owned request; split out for deterministic UI tests."""
+    def _start_generation(
+        self,
+        request: GenerationRequest,
+        *,
+        requested_name: str | None = None,
+    ) -> None:
+        """Start one independently owned model-generation request."""
 
-        self._finish_existing_object_placement_request()
-        self._active_generation_request = request
-        self._active_object_operation = _ActiveObjectOperation(
+        object_id = uuid.uuid4().hex
+        operation = _ActiveObjectOperation(
             kind=OBJECT_OPERATION_GENERATE_MODEL,
         )
-        self._generation_thread = QThread(self)
-        self._generation_worker = GenerationWorker(
+        thread = QThread(self)
+        worker = GenerationWorker(
             self._meshy_planner,
             self._meshy_executor,
             request,
+            asset_directory=self._asset_directory,
+            object_id=object_id,
         )
-        self._generation_worker.moveToThread(self._generation_thread)
-        self._generation_thread.started.connect(self._generation_worker.run)
-        self._generation_worker.succeeded.connect(
-            self._handle_generation_succeeded
+        relay = _ObjectJobSignalRelay(operation.operation_id, self)
+        managed_job_id = self._create_managed_job(
+            operation,
+            kind=GENERATION_JOB_KIND_MODEL,
+            requested_name=requested_name,
+            default_name=f"Object from frame {request.frame_index + 1}",
+            stage=f"Submitting frame {request.frame_index + 1} to Meshy...",
         )
-        self._generation_worker.failed.connect(self._handle_generation_failed)
-        self._generation_worker.progress.connect(
-            self._handle_generation_progress
+        runtime = _ObjectJobRuntime(
+            operation=operation,
+            thread=thread,
+            worker=worker,
+            relay=relay,
+            generation_request=request,
+            requested_name=str(requested_name or "").strip(),
+            managed_job_id=managed_job_id,
         )
-        self._generation_worker.finished.connect(
-            self._generation_worker.deleteLater
+        self._register_object_job_runtime(runtime)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(relay.forward_pair_succeeded)
+        worker.failed.connect(relay.forward_failed)
+        worker.progress.connect(relay.forward_progress)
+        relay.pair_succeeded.connect(
+            self._handle_job_generation_succeeded
         )
-        self._generation_worker.finished.connect(self._generation_thread.quit)
-        self._generation_thread.finished.connect(
-            self._handle_generation_thread_finished
+        relay.failed.connect(self._handle_job_generation_failed)
+        relay.progress.connect(self._handle_job_generation_progress)
+        relay.thread_finished.connect(
+            self._handle_object_job_thread_finished
         )
-        self._generation_thread.finished.connect(
-            self._generation_thread.deleteLater
-        )
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(relay.forward_thread_finished)
+        thread.finished.connect(thread.deleteLater)
         self.status_label.setText(
             f"Submitting frame {request.frame_index + 1} to Meshy..."
         )
-        self._generation_thread.start()
+        thread.start()
         self._sync_controls()
 
     def _start_texture_regeneration(
         self,
-        request: TextureRegenerationRequest,
-    ) -> None:
+        request: TextureRegenerationRequest | _TextureRegenerationPreflight,
+        *,
+        requested_name: str | None = None,
+    ) -> bool:
         """Start a texture-only task for one immutable selected-object snapshot."""
 
-        self._finish_existing_object_placement_request()
-        self._active_generation_request = None
-        self._active_object_operation = _ActiveObjectOperation(
+        if self._object_has_active_mutation_job(request.object_id):
+            self.status_label.setText(
+                "Wait for the selected object's active job to finish."
+            )
+            return False
+        record = self._find_generated_object_record(request.object_id)
+        if record is None:
+            self.status_label.setText(
+                "The selected object no longer exists."
+            )
+            return False
+        operation = _ActiveObjectOperation(
             kind=OBJECT_OPERATION_GENERATE_TEXTURE,
             target_object_id=request.object_id,
         )
-        self._generation_thread = QThread(self)
-        self._generation_worker = TextureRegenerationWorker(
+        thread = QThread(self)
+        worker = TextureRegenerationWorker(
             self._meshy_texture_regenerator,
             self._meshy_executor,
             request,
+            asset_directory=self._asset_directory,
+            symmetry=_get_object_symmetric_division_metadata(record),
+            selected_resolution=_get_selected_texture_resolution(record),
+            record_snapshot=replace(
+                record,
+                pipeline=copy.deepcopy(record.pipeline),
+            ),
         )
-        self._generation_worker.moveToThread(self._generation_thread)
-        self._generation_thread.started.connect(self._generation_worker.run)
-        self._generation_worker.succeeded.connect(
-            self._handle_texture_regeneration_succeeded
+        relay = _ObjectJobSignalRelay(operation.operation_id, self)
+        default_name = (
+            f"Texture: {record.object_name}"
         )
-        self._generation_worker.failed.connect(
-            self._handle_texture_regeneration_failed
+        managed_job_id = self._create_managed_job(
+            operation,
+            kind=GENERATION_JOB_KIND_TEXTURE,
+            requested_name=requested_name,
+            default_name=default_name,
+            stage="Preparing texture generation...",
         )
-        self._generation_worker.progress.connect(
-            self._handle_generation_progress
+        runtime = _ObjectJobRuntime(
+            operation=operation,
+            thread=thread,
+            worker=worker,
+            relay=relay,
+            requested_name=str(requested_name or "").strip(),
+            managed_job_id=managed_job_id,
         )
-        self._generation_worker.finished.connect(
-            self._generation_worker.deleteLater
+        self._register_object_job_runtime(runtime)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(relay.forward_pair_succeeded)
+        worker.failed.connect(relay.forward_failed)
+        worker.progress.connect(relay.forward_progress)
+        relay.pair_succeeded.connect(
+            self._handle_job_texture_regeneration_succeeded
         )
-        self._generation_worker.finished.connect(self._generation_thread.quit)
-        self._generation_thread.finished.connect(
-            self._handle_generation_thread_finished
+        relay.failed.connect(
+            self._handle_job_texture_regeneration_failed
         )
-        self._generation_thread.finished.connect(
-            self._generation_thread.deleteLater
+        relay.progress.connect(self._handle_job_generation_progress)
+        relay.thread_finished.connect(
+            self._handle_object_job_thread_finished
         )
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(relay.forward_thread_finished)
+        thread.finished.connect(thread.deleteLater)
         self.status_label.setText("Preparing texture generation...")
-        self._generation_thread.start()
+        thread.start()
         self._sync_controls()
+        return True
 
     def _start_unchecked_camera_face_purge(
         self,
@@ -2148,101 +2643,225 @@ class GenerationWorkspace(QWidget):
     ) -> None:
         """Start one local face-purge request off the UI thread."""
 
-        self._finish_existing_object_placement_request()
-        self._active_generation_request = None
-        self._active_object_operation = _ActiveObjectOperation(
+        if self._object_has_active_mutation_job(request.object_id):
+            self.status_label.setText(
+                "Wait for the selected object's active job to finish."
+            )
+            return
+        operation = _ActiveObjectOperation(
             kind=OBJECT_OPERATION_PURGE_FACES,
             target_object_id=request.object_id,
         )
-        self._generation_thread = QThread(self)
-        self._generation_worker = UncheckedCameraFacePurgeWorker(request)
-        self._generation_worker.moveToThread(self._generation_thread)
-        self._generation_thread.started.connect(self._generation_worker.run)
-        self._generation_worker.succeeded.connect(
-            self._handle_unchecked_camera_face_purge_succeeded
+        thread = QThread(self)
+        worker = UncheckedCameraFacePurgeWorker(request)
+        relay = _ObjectJobSignalRelay(operation.operation_id, self)
+        record = self._find_generated_object_record(request.object_id)
+        managed_job_id = self._create_managed_job(
+            operation,
+            kind=GENERATION_JOB_KIND_FACE_PURGE,
+            requested_name=None,
+            default_name=(
+                "Object face purge"
+                if record is None
+                else f"Purge faces: {record.object_name}"
+            ),
+            stage="Preparing unchecked-camera face purge...",
         )
-        self._generation_worker.failed.connect(
-            self._handle_unchecked_camera_face_purge_failed
+        runtime = _ObjectJobRuntime(
+            operation=operation,
+            thread=thread,
+            worker=worker,
+            relay=relay,
+            managed_job_id=managed_job_id,
         )
-        self._generation_worker.progress.connect(
-            self._handle_generation_progress
+        self._register_object_job_runtime(runtime)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(relay.forward_single_succeeded)
+        worker.failed.connect(relay.forward_failed)
+        worker.progress.connect(relay.forward_progress)
+        relay.single_succeeded.connect(
+            self._handle_job_face_purge_succeeded
         )
-        self._generation_worker.finished.connect(
-            self._generation_worker.deleteLater
+        relay.failed.connect(self._handle_job_face_purge_failed)
+        relay.progress.connect(self._handle_job_generation_progress)
+        relay.thread_finished.connect(
+            self._handle_object_job_thread_finished
         )
-        self._generation_worker.finished.connect(self._generation_thread.quit)
-        self._generation_thread.finished.connect(
-            self._handle_generation_thread_finished
-        )
-        self._generation_thread.finished.connect(
-            self._generation_thread.deleteLater
-        )
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(relay.forward_thread_finished)
+        thread.finished.connect(thread.deleteLater)
         self.status_label.setText("Preparing unchecked-camera face purge...")
-        self._generation_thread.start()
+        thread.start()
         self._sync_controls()
+
+    # ### Multi-job runtime helpers ###
+    def _take_requested_job_name(self) -> str:
+        """Snapshot and clear the optional name for the next accepted job."""
+
+        requested_name = self.job_name_edit.text().strip()
+        self.job_name_edit.clear()
+        return requested_name
+
+    def _create_managed_job(
+        self,
+        operation: _ActiveObjectOperation,
+        *,
+        kind: str,
+        requested_name: str | None,
+        default_name: str,
+        stage: str,
+    ) -> str | None:
+        manager = self._job_manager
+        if manager is None:
+            return None
+        job = manager.create_job(
+            kind=kind,
+            requested_name=str(requested_name or ""),
+            default_name=default_name,
+            stage=stage,
+        )
+        return job.job_id
+
+    def _register_object_job_runtime(
+        self,
+        runtime: _ObjectJobRuntime,
+    ) -> None:
+        operation_id = runtime.operation_id
+        self._object_job_runtimes[operation_id] = runtime
+        self._set_legacy_active_job_runtime(runtime)
+        manager = self._job_manager
+        if manager is not None and runtime.managed_job_id is not None:
+            manager.set_cancel_callback(
+                runtime.managed_job_id,
+                lambda operation_id=operation_id: self.cancel_operation(
+                    operation_id
+                ),
+            )
+
+    def _set_legacy_active_job_runtime(
+        self,
+        runtime: _ObjectJobRuntime | None,
+    ) -> None:
+        """Keep historical single-job attributes as aliases for integrations."""
+
+        if runtime is None:
+            self._generation_thread = None
+            self._generation_worker = None
+            self._active_generation_request = None
+            self._active_object_operation = None
+            return
+        self._generation_thread = runtime.thread
+        self._generation_worker = runtime.worker
+        self._active_generation_request = runtime.generation_request
+        self._active_object_operation = runtime.operation
+
+    def _legacy_active_job_runtime(self) -> _ObjectJobRuntime | None:
+        operation = self._active_object_operation
+        if operation is not None:
+            runtime = self._object_job_runtimes.get(operation.operation_id)
+            if runtime is not None:
+                return runtime
+        if not self._object_job_runtimes:
+            return None
+        return next(reversed(self._object_job_runtimes.values()))
+
+    def _object_has_active_mutation_job(
+        self,
+        object_id: str,
+        *,
+        excluding_operation_id: str | None = None,
+    ) -> bool:
+        normalized_id = str(object_id).strip()
+        return any(
+            operation_id != excluding_operation_id
+            and runtime.operation.target_object_id == normalized_id
+            for operation_id, runtime in self._object_job_runtimes.items()
+        )
+
+    def _format_object_job_status(
+        self,
+        runtime: _ObjectJobRuntime | None,
+        message: str,
+    ) -> str:
+        """Prefix Object-tab texture feedback with its optional job name."""
+
+        if (
+            runtime is not None
+            and runtime.operation.kind == OBJECT_OPERATION_GENERATE_TEXTURE
+            and runtime.requested_name
+        ):
+            return f"{runtime.requested_name}: {message}"
+        return str(message)
+
+    def _update_managed_job_progress(
+        self,
+        runtime: _ObjectJobRuntime,
+        message: str,
+    ) -> None:
+        manager = self._job_manager
+        if manager is None or runtime.managed_job_id is None:
+            return
+        manager.update_job(runtime.managed_job_id, stage=str(message))
+
+    def _complete_managed_job(
+        self,
+        runtime: _ObjectJobRuntime,
+        stage: str,
+    ) -> None:
+        manager = self._job_manager
+        if manager is None or runtime.managed_job_id is None:
+            return
+        manager.complete_job(runtime.managed_job_id, stage=stage)
+
+    def _fail_managed_job(
+        self,
+        runtime: _ObjectJobRuntime,
+        stage: str,
+    ) -> None:
+        manager = self._job_manager
+        if manager is None or runtime.managed_job_id is None:
+            return
+        manager.fail_job(runtime.managed_job_id, stage=stage)
+
+    def _mark_managed_job_cancelled(
+        self,
+        runtime: _ObjectJobRuntime,
+        stage: str,
+    ) -> None:
+        manager = self._job_manager
+        if manager is None or runtime.managed_job_id is None:
+            return
+        manager.mark_cancelled(runtime.managed_job_id, stage=stage)
 
     def shutdown(self) -> None:
         self._existing_object_placement_request = None
-        worker = self._generation_worker
-        thread = self._generation_thread
-        if thread is not None:
-            if not is_valid_qt_object(thread):
-                self._generation_thread = None
-                self._generation_worker = None
-                self._active_generation_request = None
-                self._active_object_operation = None
-                self._close_video_source()
-                return
-            if worker is not None and is_valid_qt_object(worker):
+        runtimes = tuple(self._object_job_runtimes.values())
+        for runtime in runtimes:
+            runtime.operation.cancel_requested = True
+            worker = runtime.worker
+            thread = runtime.thread
+            if isinstance(worker, GenerationWorker | TextureRegenerationWorker):
+                worker.discard_unclaimed_output()
+            if is_valid_qt_object(worker):
                 worker.cancel()
-                if isinstance(worker, TextureRegenerationWorker):
-                    worker_slots = (
-                        (
-                            worker.succeeded,
-                            self._handle_texture_regeneration_succeeded,
-                        ),
-                        (
-                            worker.failed,
-                            self._handle_texture_regeneration_failed,
-                        ),
-                    )
-                elif isinstance(worker, UncheckedCameraFacePurgeWorker):
-                    worker_slots = (
-                        (
-                            worker.succeeded,
-                            self._handle_unchecked_camera_face_purge_succeeded,
-                        ),
-                        (
-                            worker.failed,
-                            self._handle_unchecked_camera_face_purge_failed,
-                        ),
-                    )
-                else:
-                    worker_slots = (
-                        (worker.succeeded, self._handle_generation_succeeded),
-                        (worker.failed, self._handle_generation_failed),
-                    )
-                for signal, slot in worker_slots:
-                    try:
-                        signal.disconnect(slot)
-                    except (RuntimeError, TypeError):
-                        pass
-            try:
-                thread.finished.disconnect(
-                    self._handle_generation_thread_finished
-                )
-            except (RuntimeError, TypeError):
-                pass
-            thread.requestInterruption()
-            thread.quit()
-            thread.wait(SHUTDOWN_WAIT_MILLISECONDS)
-            if self._generation_thread is thread:
-                self._generation_thread = None
-                self._generation_worker = None
-                self._active_generation_request = None
-                self._active_object_operation = None
-        else:
-            self._active_object_operation = None
+            if is_valid_qt_object(thread):
+                thread.requestInterruption()
+                thread.quit()
+        for runtime in runtimes:
+            thread = runtime.thread
+            while is_valid_qt_object(thread) and thread.isRunning():
+                thread.wait(SHUTDOWN_WAIT_MILLISECONDS)
+            worker = runtime.worker
+            if isinstance(worker, GenerationWorker | TextureRegenerationWorker):
+                worker.discard_unclaimed_output()
+            self._mark_managed_job_cancelled(
+                runtime,
+                "Cancelled during shutdown",
+            )
+        self._object_job_runtimes.clear()
+        self._set_legacy_active_job_runtime(None)
         self._close_video_source()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
@@ -2466,6 +3085,16 @@ class GenerationWorkspace(QWidget):
         )
         buttons_layout.addWidget(self.symmetric_division_orientation_combo)
 
+        self.job_name_edit = QLineEdit()
+        self.job_name_edit.setObjectName("object_generation_job_name_edit")
+        self.job_name_edit.setPlaceholderText("Job name (optional)")
+        self.job_name_edit.setClearButtonEnabled(True)
+        self.job_name_edit.setMaximumWidth(190)
+        self.job_name_edit.setToolTip(
+            "Optionally name the next object or object-texture generation job."
+        )
+        buttons_layout.addWidget(self.job_name_edit)
+
         self.generate_button = QPushButton("Generate")
         self.generate_button.setMinimumHeight(38)
         self.generate_button.setToolTip(
@@ -2579,7 +3208,10 @@ class GenerationWorkspace(QWidget):
     @Slot()
     def _handle_delete_generated_object_clicked(self) -> None:
         record = self._find_generated_object_record(self._selected_object_id)
-        if record is None or self._generation_thread is not None:
+        if (
+            record is None
+            or self._object_has_active_mutation_job(record.object_id)
+        ):
             return
         response = QMessageBox.question(
             self,
@@ -2597,7 +3229,7 @@ class GenerationWorkspace(QWidget):
         self.delete_generated_object(record.object_id)
 
     def _handle_seekbar_changed(self, frame_index: int) -> None:
-        if self._is_syncing_seekbar or self._generation_thread is not None:
+        if self._is_syncing_seekbar:
             return
         self.show_frame(frame_index)
 
@@ -2649,17 +3281,25 @@ class GenerationWorkspace(QWidget):
         self,
         operation: _ActiveObjectOperation | None,
     ) -> bool:
+        runtime = (
+            None
+            if operation is None
+            else self._object_job_runtimes.get(operation.operation_id)
+        )
         return bool(
             operation is not None
             and operation.kind == OBJECT_OPERATION_GENERATE_MODEL
             and not operation.cancel_requested
             and operation.committed_object_id is None
-            and self._generation_thread is not None
-            and isinstance(self._generation_worker, GenerationWorker)
+            and runtime is not None
+            and is_valid_qt_object(runtime.thread)
+            and isinstance(runtime.worker, GenerationWorker)
         )
 
     @Slot(str)
     def _handle_generation_progress(self, message: str) -> None:
+        """Compatibility handler for an explicitly connected legacy worker."""
+
         operation = self._active_object_operation
         sender = self.sender()
         if sender is not None and sender is not self._generation_worker:
@@ -2668,7 +3308,40 @@ class GenerationWorkspace(QWidget):
             return
         self.status_label.setText(str(message))
 
-    def _should_ignore_operation_result(self, expected_kind: str) -> bool:
+    @Slot(str, str)
+    def _handle_job_generation_progress(
+        self,
+        operation_id: str,
+        message: str,
+    ) -> None:
+        runtime = self._object_job_runtimes.get(str(operation_id))
+        if runtime is None or runtime.operation.cancel_requested:
+            return
+        manager = self._job_manager
+        if manager is not None and runtime.managed_job_id is not None:
+            managed_job = manager.get_job(runtime.managed_job_id)
+            if managed_job is not None and managed_job.is_finished:
+                return
+        if runtime.operation.committed_object_id is not None:
+            return
+        self._update_managed_job_progress(runtime, str(message))
+        if runtime is self._legacy_active_job_runtime():
+            self.status_label.setText(
+                self._format_object_job_status(runtime, str(message))
+            )
+
+    def _should_ignore_operation_result(
+        self,
+        expected_kind: str,
+        operation_id: str | None = None,
+    ) -> bool:
+        if operation_id is not None:
+            runtime = self._object_job_runtimes.get(str(operation_id))
+            return bool(
+                runtime is None
+                or runtime.operation.kind != expected_kind
+                or runtime.operation.cancel_requested
+            )
         sender = self.sender()
         if sender is not None and sender is not self._generation_worker:
             return True
@@ -2682,8 +3355,12 @@ class GenerationWorkspace(QWidget):
         self,
         expected_kind: str,
         object_id: str,
+        operation_id: str | None = None,
     ) -> None:
         operation = self._active_object_operation
+        if operation_id is not None:
+            runtime = self._object_job_runtimes.get(str(operation_id))
+            operation = None if runtime is None else runtime.operation
         if (
             operation is None
             or operation.kind != expected_kind
@@ -2698,23 +3375,120 @@ class GenerationWorkspace(QWidget):
         operation.committed_object_id = object_id
         self._sync_controls()
 
+    @Slot(str, object, object)
+    def _handle_job_generation_succeeded(
+        self,
+        operation_id: str,
+        result: object,
+        generated_model: object,
+    ) -> None:
+        if not isinstance(generated_model, GeneratedModel):
+            self._handle_job_generation_failed(
+                operation_id,
+                "The generated preview model is invalid.",
+            )
+            return
+        runtime = self._object_job_runtimes.get(str(operation_id))
+        if runtime is None:
+            return
+        self._set_legacy_active_job_runtime(runtime)
+        self._handle_generation_succeeded(
+            result,
+            generated_model,
+            operation_id=operation_id,
+        )
+        if runtime.operation.committed_object_id is not None:
+            worker = runtime.worker
+            if isinstance(worker, GenerationWorker):
+                worker.claim_saved_output()
+
+    @Slot(str, object, object)
+    def _handle_job_texture_regeneration_succeeded(
+        self,
+        operation_id: str,
+        outcome: object,
+        generated_model: object,
+    ) -> None:
+        if not isinstance(generated_model, GeneratedModel):
+            self._handle_job_texture_regeneration_failed(
+                operation_id,
+                "The generated preview model is invalid.",
+            )
+            return
+        runtime = self._object_job_runtimes.get(str(operation_id))
+        if runtime is None:
+            return
+        self._set_legacy_active_job_runtime(runtime)
+        self._handle_texture_regeneration_succeeded(
+            outcome,
+            generated_model,
+            operation_id=operation_id,
+        )
+        if runtime.operation.committed_object_id is not None:
+            worker = runtime.worker
+            if isinstance(worker, TextureRegenerationWorker):
+                worker.claim_saved_output()
+
+    @Slot(str, object)
+    def _handle_job_face_purge_succeeded(
+        self,
+        operation_id: str,
+        outcome: object,
+    ) -> None:
+        runtime = self._object_job_runtimes.get(str(operation_id))
+        if runtime is None:
+            return
+        self._set_legacy_active_job_runtime(runtime)
+        self._handle_unchecked_camera_face_purge_succeeded(
+            outcome,
+            operation_id=operation_id,
+        )
+
     @Slot(object, object)
     def _handle_generation_succeeded(
         self,
         result: object,
         generated_model: GeneratedModel,
+        *,
+        operation_id: str | None = None,
     ) -> None:
         if self._should_ignore_operation_result(
-            OBJECT_OPERATION_GENERATE_MODEL
+            OBJECT_OPERATION_GENERATE_MODEL,
+            operation_id,
         ):
             return
-        generation_request = self._active_generation_request
-        self._active_generation_request = None
+        runtime = (
+            None
+            if operation_id is None
+            else self._object_job_runtimes.get(str(operation_id))
+        )
+        generation_request = (
+            self._active_generation_request
+            if runtime is None
+            else runtime.generation_request
+        )
+        if operation_id is None:
+            self._active_generation_request = None
+        if isinstance(result, _SavedObjectGeneration):
+            self._commit_saved_object_generation(
+                result,
+                generation_request,
+                runtime,
+                operation_id,
+            )
+            return
         if not isinstance(result, MeshyGenerationResult):
-            self._handle_generation_failed("Meshy returned an invalid result.")
+            self._handle_generation_failed(
+                "Meshy returned an invalid result.",
+                operation_id=operation_id,
+            )
             return
         object_id = uuid.uuid4().hex
-        object_name = result.name
+        object_name = (
+            runtime.requested_name
+            if runtime is not None and runtime.requested_name
+            else result.name
+        )
         pipeline: dict[str, object] = {}
         persisted_asset_paths: list[str] = []
         symmetry: ObjectSymmetricDivisionMetadata | None = None
@@ -2858,10 +3632,15 @@ class GenerationWorkspace(QWidget):
         except Exception as error:
             self._remove_newly_persisted_assets(persisted_asset_paths)
             self._handle_generation_failed(
-                f"The Meshy texture variants could not be prepared locally: {error}"
+                f"The Meshy texture variants could not be prepared locally: {error}",
+                operation_id=operation_id,
             )
             return
-        active_operation = self._active_object_operation
+        active_operation = (
+            self._active_object_operation
+            if runtime is None
+            else runtime.operation
+        )
         placement = (
             active_operation.pending_placement
             if active_operation is not None
@@ -2890,6 +3669,7 @@ class GenerationWorkspace(QWidget):
         self._record_operation_commit(
             OBJECT_OPERATION_GENERATE_MODEL,
             object_id,
+            operation_id,
         )
         if isinstance(result, StagedMeshyGenerationResult):
             if result.geometry_only:
@@ -2913,20 +3693,140 @@ class GenerationWorkspace(QWidget):
             )
         self._emit_data_changed()
         self.generation_completed.emit(record, generated_model)
+        if runtime is not None and not runtime.operation.cancel_requested:
+            self._complete_managed_job(
+                runtime,
+                f"Generated: {object_name}",
+            )
+
+    def _commit_saved_object_generation(
+        self,
+        saved: _SavedObjectGeneration,
+        generation_request: GenerationRequest | None,
+        runtime: _ObjectJobRuntime | None,
+        operation_id: str | None,
+    ) -> None:
+        """Commit one worker-prepared model without doing local file work."""
+
+        result = saved.result
+        if not isinstance(result, MeshyGenerationResult):
+            self._handle_generation_failed(
+                "Meshy returned an invalid result.",
+                operation_id=operation_id,
+            )
+            return
+        object_name = (
+            runtime.requested_name
+            if runtime is not None and runtime.requested_name
+            else result.name
+        )
+        active_operation = (
+            self._active_object_operation
+            if runtime is None
+            else runtime.operation
+        )
+        placement = (
+            active_operation.pending_placement
+            if active_operation is not None
+            and active_operation.kind == OBJECT_OPERATION_GENERATE_MODEL
+            else None
+        )
+        record = GeneratedObjectRecord(
+            object_id=saved.object_id,
+            frame_index=(
+                self._data.current_frame_index
+                if generation_request is None
+                else generation_request.frame_index
+            ),
+            object_name=object_name,
+            pipeline=copy.deepcopy(saved.pipeline),
+            provider=GENERATION_BACKEND_MESHY,
+            provider_task_id=result.task_id,
+            asset_path=saved.asset_path,
+            placement=placement,
+        )
+        if (
+            _build_generation_asset_revision(
+                self._asset_directory,
+                saved.asset_path,
+            )
+            != saved.preview_asset_revision
+        ):
+            self._handle_generation_failed(
+                "The prepared object asset changed before it could be applied.",
+                operation_id=operation_id,
+            )
+            return
+        self._data.generated_objects.append(record)
+        self._cache_generated_model(
+            record,
+            saved.preview_model,
+            asset_revision=saved.preview_asset_revision,
+        )
+        self._selected_object_id = saved.object_id
+        self._generated_model = saved.preview_model
+        self._refresh_generated_objects_list(saved.object_id)
+        self._record_operation_commit(
+            OBJECT_OPERATION_GENERATE_MODEL,
+            saved.object_id,
+            operation_id,
+        )
+        if isinstance(result, StagedMeshyGenerationResult):
+            status = _format_staged_generation_status(
+                object_name,
+                result,
+                generated_label=(
+                    "Generated geometry"
+                    if result.geometry_only
+                    else "Generated"
+                ),
+            )
+        else:
+            status = f"Generated: {object_name}"
+        if saved.symmetry is not None:
+            status += (
+                " Automatic symmetric division kept the "
+                f"{saved.symmetry.kept_side} half."
+            )
+        self.status_label.setText(status)
+        self._emit_data_changed()
+        self.generation_completed.emit(record, saved.preview_model)
+        if runtime is not None and not runtime.operation.cancel_requested:
+            manager = self._job_manager
+            if (
+                not runtime.requested_name
+                and manager is not None
+                and runtime.managed_job_id is not None
+            ):
+                manager.rename_job(runtime.managed_job_id, result.name)
+            self._complete_managed_job(
+                runtime,
+                f"Generated: {object_name}",
+            )
 
     @Slot(object, object)
     def _handle_texture_regeneration_succeeded(
         self,
         raw_outcome: object,
         generated_model: GeneratedModel,
+        *,
+        operation_id: str | None = None,
     ) -> None:
         if self._should_ignore_operation_result(
-            OBJECT_OPERATION_GENERATE_TEXTURE
+            OBJECT_OPERATION_GENERATE_TEXTURE,
+            operation_id,
         ):
+            return
+        if isinstance(raw_outcome, _SavedObjectTextureRegeneration):
+            self._commit_saved_texture_regeneration(
+                raw_outcome,
+                operation_id,
+            )
             return
         if not isinstance(raw_outcome, TextureRegenerationOutcome):
             self._handle_texture_regeneration_failed(
-                "Meshy returned an invalid texture-regeneration result."
+                "Meshy returned an invalid texture-regeneration result.",
+                operation_id=operation_id,
             )
             return
         outcome = raw_outcome
@@ -2935,7 +3835,8 @@ class GenerationWorkspace(QWidget):
         record = self._find_generated_object_record(request.object_id)
         if record is None:
             self._handle_texture_regeneration_failed(
-                "The target generated object no longer exists."
+                "The target generated object no longer exists.",
+                operation_id=operation_id,
             )
             return
 
@@ -2994,7 +3895,8 @@ class GenerationWorkspace(QWidget):
             self._remove_newly_persisted_assets(persisted_asset_paths)
             self._handle_texture_regeneration_failed(
                 "The new texture variants could not be saved locally: "
-                f"{error}"
+                f"{error}",
+                operation_id=operation_id,
             )
             return
 
@@ -3004,14 +3906,25 @@ class GenerationWorkspace(QWidget):
             preview_model,
         ):
             self._remove_newly_persisted_assets(persisted_asset_paths)
-            self.status_label.setText(
-                "The generated texture was kept out because the Atlas "
-                "packing change could not be committed."
+            runtime = (
+                None
+                if operation_id is None
+                else self._object_job_runtimes.get(str(operation_id))
             )
+            self.status_label.setText(
+                self._format_object_job_status(
+                    runtime,
+                    "The generated texture was kept out because the Atlas "
+                    "packing change could not be committed.",
+                )
+            )
+            if runtime is not None:
+                self._fail_managed_job(runtime, self.status_label.text())
             return
         self._record_operation_commit(
             OBJECT_OPERATION_GENERATE_TEXTURE,
             record.object_id,
+            operation_id,
         )
         cleanup_failed = self._delete_unreferenced_object_assets(record)
         status_suffix = (
@@ -3019,32 +3932,180 @@ class GenerationWorkspace(QWidget):
             if cleanup_failed
             else ""
         )
+        runtime = (
+            None
+            if operation_id is None
+            else self._object_job_runtimes.get(str(operation_id))
+        )
         self.status_label.setText(
-            f"Generated texture: {record.object_name}." + status_suffix
+            self._format_object_job_status(
+                runtime,
+                f"Generated texture: {record.object_name}." + status_suffix,
+            )
         )
         self._emit_data_changed()
         self.texture_regeneration_completed.emit(replacement, preview_model)
         self.generated_object_changed.emit(replacement, preview_model)
+        if runtime is not None and not runtime.operation.cancel_requested:
+            self._complete_managed_job(
+                runtime,
+                self.status_label.text(),
+            )
+
+    def _commit_saved_texture_regeneration(
+        self,
+        saved: _SavedObjectTextureRegeneration,
+        operation_id: str | None,
+    ) -> None:
+        """Validate and commit one worker-prepared texture transaction."""
+
+        outcome = saved.outcome
+        if not isinstance(outcome, TextureRegenerationOutcome):
+            self._handle_texture_regeneration_failed(
+                "Meshy returned an invalid texture-regeneration result.",
+                operation_id=operation_id,
+            )
+            return
+        record = self._find_generated_object_record(
+            outcome.request.object_id
+        )
+        if record is None:
+            self._handle_texture_regeneration_failed(
+                "The target generated object no longer exists.",
+                operation_id=operation_id,
+            )
+            return
+        if (
+            (saved.source_asset_path is None)
+            != (saved.source_asset_revision is None)
+        ):
+            self._handle_texture_regeneration_failed(
+                "The prepared texture source revision is invalid.",
+                operation_id=operation_id,
+            )
+            return
+        if saved.source_asset_path is not None:
+            current_source_asset_path = (
+                _texture_regeneration_source_asset_path(record)
+            )
+            if (
+                current_source_asset_path != saved.source_asset_path
+                or _build_generation_asset_revision(
+                    self._asset_directory,
+                    current_source_asset_path,
+                )
+                != saved.source_asset_revision
+            ):
+                self._handle_texture_regeneration_failed(
+                    "The target object's source model changed before its "
+                    "generated texture could be applied.",
+                    operation_id=operation_id,
+                )
+                return
+        if (
+            record.asset_path != saved.base_asset_path
+            or record.provider_task_id != saved.base_provider_task_id
+            or record.pipeline != saved.base_pipeline
+        ):
+            self._handle_texture_regeneration_failed(
+                "The target object changed before its generated texture "
+                "could be applied.",
+                operation_id=operation_id,
+            )
+            return
+        try:
+            selected_variant = saved.variant_metadata[
+                str(saved.selected_resolution)
+            ]
+            replacement = replace(
+                record,
+                pipeline=_push_object_operation_undo_snapshot(
+                    record,
+                    copy.deepcopy(saved.next_pipeline),
+                    operation=OBJECT_OPERATION_GENERATE_TEXTURE,
+                ),
+                provider_task_id=outcome.result.task_id,
+                asset_path=selected_variant[TEXTURE_VARIANT_GLB_PATH_KEY],
+            )
+        except Exception as error:
+            self._handle_texture_regeneration_failed(
+                f"The prepared texture transaction is invalid: {error}",
+                operation_id=operation_id,
+            )
+            return
+
+        runtime = (
+            None
+            if operation_id is None
+            else self._object_job_runtimes.get(str(operation_id))
+        )
+        if not self._request_object_packing_change(
+            record,
+            replacement,
+            saved.preview_model,
+            preview_asset_revision=saved.preview_asset_revision,
+        ):
+            status = self._format_object_job_status(
+                runtime,
+                "The generated texture was kept out because the Atlas "
+                "packing change could not be committed.",
+            )
+            self.status_label.setText(status)
+            if runtime is not None:
+                self._fail_managed_job(runtime, status)
+            return
+        self._record_operation_commit(
+            OBJECT_OPERATION_GENERATE_TEXTURE,
+            record.object_id,
+            operation_id,
+        )
+        cleanup_failed = self._delete_unreferenced_object_assets(record)
+        status_suffix = (
+            " Some superseded texture files could not be removed."
+            if cleanup_failed
+            else ""
+        )
+        status = self._format_object_job_status(
+            runtime,
+            f"Generated texture: {record.object_name}." + status_suffix,
+        )
+        self.status_label.setText(status)
+        self._emit_data_changed()
+        self.texture_regeneration_completed.emit(
+            replacement,
+            saved.preview_model,
+        )
+        self.generated_object_changed.emit(
+            replacement,
+            saved.preview_model,
+        )
+        if runtime is not None and not runtime.operation.cancel_requested:
+            self._complete_managed_job(runtime, status)
 
     @Slot(object)
     def _handle_unchecked_camera_face_purge_succeeded(
         self,
         raw_outcome: object,
+        *,
+        operation_id: str | None = None,
     ) -> None:
         if self._should_ignore_operation_result(
-            OBJECT_OPERATION_PURGE_FACES
+            OBJECT_OPERATION_PURGE_FACES,
+            operation_id,
         ):
             return
         if not isinstance(raw_outcome, UncheckedCameraFacePurgeOutcome):
             self._handle_unchecked_camera_face_purge_failed(
-                "The face-purge worker returned an invalid result."
+                "The face-purge worker returned an invalid result.",
+                operation_id=operation_id,
             )
             return
         outcome = raw_outcome
         record = self._find_generated_object_record(outcome.request.object_id)
         if record is None:
             self._handle_unchecked_camera_face_purge_failed(
-                "The target generated object no longer exists."
+                "The target generated object no longer exists.",
+                operation_id=operation_id,
             )
             return
 
@@ -3122,7 +4183,8 @@ class GenerationWorkspace(QWidget):
         except Exception as error:
             self._remove_newly_persisted_assets(persisted_asset_paths)
             self._handle_unchecked_camera_face_purge_failed(
-                f"The purged object could not be saved locally: {error}"
+                f"The purged object could not be saved locally: {error}",
+                operation_id=operation_id,
             )
             return
 
@@ -3136,10 +4198,18 @@ class GenerationWorkspace(QWidget):
                 "The purged object was kept out because the Atlas packing "
                 "change could not be committed."
             )
+            runtime = (
+                None
+                if operation_id is None
+                else self._object_job_runtimes.get(str(operation_id))
+            )
+            if runtime is not None:
+                self._fail_managed_job(runtime, self.status_label.text())
             return
         self._record_operation_commit(
             OBJECT_OPERATION_PURGE_FACES,
             record.object_id,
+            operation_id,
         )
         cleanup_failed = self._delete_unreferenced_object_assets(record)
         status_suffix = (
@@ -3154,50 +4224,154 @@ class GenerationWorkspace(QWidget):
         self._emit_data_changed()
         self.face_purge_completed.emit(replacement, preview_model)
         self.generated_object_changed.emit(replacement, preview_model)
+        runtime = (
+            None
+            if operation_id is None
+            else self._object_job_runtimes.get(str(operation_id))
+        )
+        if runtime is not None and not runtime.operation.cancel_requested:
+            self._complete_managed_job(
+                runtime,
+                f"Purged faces: {record.object_name}",
+            )
 
     @Slot(str)
-    def _handle_generation_failed(self, error_message: str) -> None:
+    def _handle_generation_failed(
+        self,
+        error_message: str,
+        *,
+        operation_id: str | None = None,
+    ) -> None:
         if self._should_ignore_operation_result(
-            OBJECT_OPERATION_GENERATE_MODEL
+            OBJECT_OPERATION_GENERATE_MODEL,
+            operation_id,
         ):
             return
-        self._active_generation_request = None
-        operation = self._active_object_operation
+        runtime = (
+            None
+            if operation_id is None
+            else self._object_job_runtimes.get(str(operation_id))
+        )
+        if operation_id is None:
+            self._active_generation_request = None
+        operation = (
+            self._active_object_operation
+            if runtime is None
+            else runtime.operation
+        )
         if operation is not None:
             operation.pending_placement = None
         self.status_label.setText(f"Generation failed: {error_message}")
-        QMessageBox.warning(self, "Generation failed", error_message)
+        if runtime is not None:
+            self._fail_managed_job(runtime, f"Failed: {error_message}")
+        if self._job_manager is None:
+            QMessageBox.warning(self, "Generation failed", error_message)
+
+    @Slot(str, str)
+    def _handle_job_generation_failed(
+        self,
+        operation_id: str,
+        error_message: str,
+    ) -> None:
+        runtime = self._object_job_runtimes.get(str(operation_id))
+        if runtime is None:
+            return
+        self._set_legacy_active_job_runtime(runtime)
+        self._handle_generation_failed(
+            str(error_message),
+            operation_id=operation_id,
+        )
 
     @Slot(str)
-    def _handle_texture_regeneration_failed(self, error_message: str) -> None:
+    def _handle_texture_regeneration_failed(
+        self,
+        error_message: str,
+        *,
+        operation_id: str | None = None,
+    ) -> None:
         if self._should_ignore_operation_result(
-            OBJECT_OPERATION_GENERATE_TEXTURE
+            OBJECT_OPERATION_GENERATE_TEXTURE,
+            operation_id,
         ):
             return
-        self.status_label.setText(
-            f"Texture generation failed: {error_message}"
+        runtime = (
+            None
+            if operation_id is None
+            else self._object_job_runtimes.get(str(operation_id))
         )
-        QMessageBox.warning(
-            self,
-            "Texture generation failed",
-            error_message,
+        self.status_label.setText(
+            self._format_object_job_status(
+                runtime,
+                f"Texture generation failed: {error_message}",
+            )
+        )
+        if runtime is not None:
+            self._fail_managed_job(runtime, self.status_label.text())
+        if self._job_manager is None:
+            QMessageBox.warning(
+                self,
+                "Texture generation failed",
+                error_message,
+            )
+
+    @Slot(str, str)
+    def _handle_job_texture_regeneration_failed(
+        self,
+        operation_id: str,
+        error_message: str,
+    ) -> None:
+        runtime = self._object_job_runtimes.get(str(operation_id))
+        if runtime is None:
+            return
+        self._set_legacy_active_job_runtime(runtime)
+        self._handle_texture_regeneration_failed(
+            str(error_message),
+            operation_id=operation_id,
         )
 
     @Slot(str)
     def _handle_unchecked_camera_face_purge_failed(
         self,
         error_message: str,
+        *,
+        operation_id: str | None = None,
     ) -> None:
         if self._should_ignore_operation_result(
-            OBJECT_OPERATION_PURGE_FACES
+            OBJECT_OPERATION_PURGE_FACES,
+            operation_id,
         ):
             return
         self.status_label.setText(f"Face purge failed: {error_message}")
-        QMessageBox.warning(self, "Face purge failed", error_message)
+        runtime = (
+            None
+            if operation_id is None
+            else self._object_job_runtimes.get(str(operation_id))
+        )
+        if runtime is not None:
+            self._fail_managed_job(runtime, f"Failed: {error_message}")
+        if self._job_manager is None:
+            QMessageBox.warning(self, "Face purge failed", error_message)
+
+    @Slot(str, str)
+    def _handle_job_face_purge_failed(
+        self,
+        operation_id: str,
+        error_message: str,
+    ) -> None:
+        runtime = self._object_job_runtimes.get(str(operation_id))
+        if runtime is None:
+            return
+        self._set_legacy_active_job_runtime(runtime)
+        self._handle_unchecked_camera_face_purge_failed(
+            str(error_message),
+            operation_id=operation_id,
+        )
 
     def _rollback_cancelled_operation(
         self,
         operation: _ActiveObjectOperation,
+        *,
+        operation_id: str | None = None,
     ) -> bool:
         object_id = operation.committed_object_id
         if object_id is None:
@@ -3205,7 +4379,10 @@ class GenerationWorkspace(QWidget):
         if operation.kind == OBJECT_OPERATION_GENERATE_MODEL:
             if self._find_generated_object_record(object_id) is None:
                 return True
-            return self.delete_generated_object(object_id)
+            return self.delete_generated_object(
+                object_id,
+                allow_operation_id=operation_id,
+            )
         if operation.kind not in {
             OBJECT_OPERATION_GENERATE_TEXTURE,
             OBJECT_OPERATION_PURGE_FACES,
@@ -3216,6 +4393,7 @@ class GenerationWorkspace(QWidget):
         return self._undo_object_change(
             object_id,
             expected_operation=operation.kind,
+            allow_operation_id=operation_id,
         )
 
     def _set_cancelled_operation_status(
@@ -3257,17 +4435,34 @@ class GenerationWorkspace(QWidget):
 
     @Slot()
     def _handle_generation_thread_finished(self) -> None:
-        if self.sender() is not self._generation_thread:
+        """Compatibility finish handler for a legacy single worker."""
+
+        runtime = self._legacy_active_job_runtime()
+        if runtime is None or self.sender() is not runtime.thread:
             return
-        operation = self._active_object_operation
-        self._generation_worker = None
-        self._generation_thread = None
-        self._active_generation_request = None
+        self._handle_object_job_thread_finished(runtime.operation_id)
+
+    @Slot(str)
+    def _handle_object_job_thread_finished(self, operation_id: str) -> None:
+        runtime = self._object_job_runtimes.get(str(operation_id))
+        if runtime is None:
+            return
+        worker = runtime.worker
+        if isinstance(worker, GenerationWorker | TextureRegenerationWorker):
+            worker.discard_unclaimed_output()
+        operation = runtime.operation
         if operation is not None and operation.cancel_requested:
-            rollback_succeeded = self._rollback_cancelled_operation(operation)
+            rollback_succeeded = self._rollback_cancelled_operation(
+                operation,
+                operation_id=runtime.operation_id,
+            )
             self._set_cancelled_operation_status(
                 operation,
                 rollback_succeeded,
+            )
+            self._mark_managed_job_cancelled(
+                runtime,
+                self.status_label.text(),
             )
             self.operation_cancelled.emit(
                 operation.kind,
@@ -3276,7 +4471,23 @@ class GenerationWorkspace(QWidget):
         if operation is not None:
             operation.pending_placement = None
             self.operation_finished.emit(operation.operation_id)
-        self._active_object_operation = None
+        manager = self._job_manager
+        if (
+            not operation.cancel_requested
+            and manager is not None
+            and runtime.managed_job_id is not None
+        ):
+            managed_job = manager.get_job(runtime.managed_job_id)
+            if managed_job is not None and not managed_job.is_finished:
+                self._fail_managed_job(
+                    runtime,
+                    "The job ended before its result could be committed.",
+                )
+        self._object_job_runtimes.pop(runtime.operation_id, None)
+        runtime.relay.deleteLater()
+        self._set_legacy_active_job_runtime(
+            self._legacy_active_job_runtime()
+        )
         self._sync_controls()
 
     def _build_generation_request(
@@ -3362,7 +4573,7 @@ class GenerationWorkspace(QWidget):
 
     def _build_texture_regeneration_request(
         self,
-    ) -> TextureRegenerationRequest | None:
+    ) -> _TextureRegenerationPreflight | None:
         record = self._find_generated_object_record(self._selected_object_id)
         if not self._can_regenerate_object_texture(record):
             self.status_label.setText(
@@ -3376,24 +4587,28 @@ class GenerationWorkspace(QWidget):
             self.status_label.setText("The selected texture reference is empty.")
             return None
         try:
-            source_path = self._resolve_texture_regeneration_source_path(record)
-            model_glb = source_path.read_bytes()
-            import_generated_glb(model_glb)
+            source_asset_path = _texture_regeneration_source_asset_path(
+                record
+            )
+            source_asset_revision = _build_generation_asset_revision(
+                self._asset_directory,
+                source_asset_path,
+            )
+            if source_asset_revision[1] is None:
+                raise ValueError(
+                    "The model revision used for Retexture is missing or unsafe."
+                )
             preserve_symmetric_uvs = (
                 _get_object_symmetric_division_metadata(record) is not None
             )
-            preserve_original_uvs = preserve_symmetric_uvs
-            submitted_fingerprint = None
-            if preserve_original_uvs:
-                submitted_fingerprint = build_uv_fingerprint(model_glb)
-            request = TextureRegenerationRequest(
+            request = _TextureRegenerationPreflight(
                 object_id=record.object_id,
                 reference_frame_index=self._data.current_frame_index,
                 reference_image_bgra=selected_crop,
-                model_glb=model_glb,
+                source_asset_path=source_asset_path,
+                source_asset_revision=source_asset_revision,
                 settings=self._settings,
-                enable_original_uv=preserve_original_uvs,
-                submitted_uv_fingerprint=submitted_fingerprint,
+                enable_original_uv=preserve_symmetric_uvs,
                 preserve_symmetric_uvs=preserve_symmetric_uvs,
             )
         except Exception as error:
@@ -3410,24 +4625,9 @@ class GenerationWorkspace(QWidget):
     ) -> Path:
         """Resolve processed geometry, or a canonical existing textured GLB."""
 
-        raw_postprocessed_path = record.pipeline.get(
-            "postprocessed_asset_path"
+        source_path = self._resolve_meshy_asset_path(
+            _texture_regeneration_source_asset_path(record)
         )
-        if isinstance(raw_postprocessed_path, str) and raw_postprocessed_path:
-            source_path = self._resolve_meshy_asset_path(
-                raw_postprocessed_path
-            )
-        else:
-            canonical_variant = _get_texture_variant_metadata(
-                record,
-                DEFAULT_TEXTURE_RESOLUTION,
-            )
-            raw_source_path = (
-                record.asset_path
-                if canonical_variant is None
-                else canonical_variant[TEXTURE_VARIANT_GLB_PATH_KEY]
-            )
-            source_path = self._resolve_meshy_asset_path(raw_source_path)
         if not source_path.is_file():
             raise ValueError("The model revision used for Retexture is missing.")
         return source_path
@@ -3470,24 +4670,33 @@ class GenerationWorkspace(QWidget):
 
     def _sync_controls(self) -> None:
         has_video = self._video_source is not None
-        controls_are_busy = self._generation_thread is not None
+        has_untracked_legacy_job = (
+            self._generation_thread is not None
+            and not self._object_job_runtimes
+        )
         has_mask = self.video_view.has_selection()
         selected_record = self._find_generated_object_record(
             self._selected_object_id
         )
-        self.load_video_button.setEnabled(not controls_are_busy)
-        self.seekbar.setEnabled(has_video and not controls_are_busy)
-        mask_tool_is_available = has_video and not controls_are_busy
+        selected_object_is_busy = bool(
+            selected_record is not None
+            and self._object_has_active_mutation_job(
+                selected_record.object_id
+            )
+        )
+        self.load_video_button.setEnabled(not has_untracked_legacy_job)
+        self.seekbar.setEnabled(has_video and not has_untracked_legacy_job)
+        mask_tool_is_available = has_video and not has_untracked_legacy_job
         self.paint_mask_button.setEnabled(mask_tool_is_available)
         self.erase_mask_button.setEnabled(mask_tool_is_available)
         self.brush_size_spinbox.setEnabled(mask_tool_is_available)
         self.undo_mask_button.setEnabled(
             has_video
             and bool(self.video_view.get_strokes())
-            and not controls_are_busy
+            and not has_untracked_legacy_job
         )
         self.clear_mask_button.setEnabled(
-            has_video and has_mask and not controls_are_busy
+            has_video and has_mask and not has_untracked_legacy_job
         )
         required_key_is_available = bool(self._settings.meshy_api_key)
         enabled_camera_ids = (
@@ -3498,7 +4707,7 @@ class GenerationWorkspace(QWidget):
             not postprocessing_is_enabled or bool(enabled_camera_ids)
         )
         self.object_3d_panel.set_postprocess_camera_controls_enabled(
-            not controls_are_busy
+            not has_untracked_legacy_job
         )
         self.result_view.set_enabled_unused_face_camera_ids(
             enabled_camera_ids
@@ -3508,22 +4717,22 @@ class GenerationWorkspace(QWidget):
         )
         self.meshy_target_polycount_control.setVisible(True)
         self.meshy_target_polycount_spinbox.setEnabled(
-            not controls_are_busy
+            not has_untracked_legacy_job
         )
-        self.ambient_light_slider.setEnabled(not controls_are_busy)
-        self.textures_checkbox.setEnabled(not controls_are_busy)
-        self.wireframe_checkbox.setEnabled(not controls_are_busy)
-        self.generated_objects_list.setEnabled(not controls_are_busy)
-        self.texture_view.setEnabled(not controls_are_busy)
+        self.ambient_light_slider.setEnabled(not has_untracked_legacy_job)
+        self.textures_checkbox.setEnabled(not has_untracked_legacy_job)
+        self.wireframe_checkbox.setEnabled(not has_untracked_legacy_job)
+        self.generated_objects_list.setEnabled(not has_untracked_legacy_job)
+        self.texture_view.setEnabled(not has_untracked_legacy_job)
         self.delete_generated_object_button.setEnabled(
-            not controls_are_busy
-            and selected_record is not None
+            selected_record is not None
+            and not selected_object_is_busy
         )
         self.regenerate_texture_button.setEnabled(
             self._can_regenerate_object_texture(selected_record)
         )
         self.undo_object_change_button.setEnabled(
-            not controls_are_busy
+            not selected_object_is_busy
             and bool(
                 _get_object_operation_undo_stack(
                     selected_record
@@ -3531,32 +4740,40 @@ class GenerationWorkspace(QWidget):
             )
         )
         self.place_object_button.setEnabled(
-            self._can_place_active_operation(
-                self._active_object_operation
+            any(
+                self._can_place_active_operation(runtime.operation)
+                for runtime in self._object_job_runtimes.values()
             )
-            or (not controls_are_busy and selected_record is not None)
+            or (
+                selected_record is not None
+                and not selected_object_is_busy
+            )
         )
         self.cancel_operation_button.setEnabled(
-            controls_are_busy
-            and self._active_object_operation is not None
+            self._active_object_operation is not None
+            and self._legacy_active_job_runtime() is not None
             and not self._active_object_operation.cancel_requested
         )
         self.purge_faces_button.setEnabled(
-            not controls_are_busy
-            and len(enabled_camera_ids) < len(ALL_CAMERA_IDS)
+            len(enabled_camera_ids) < len(ALL_CAMERA_IDS)
             and selected_record is not None
+            and not selected_object_is_busy
+            and not has_untracked_legacy_job
         )
-        self.symmetric_division_checkbox.setEnabled(not controls_are_busy)
+        self.symmetric_division_checkbox.setEnabled(
+            not has_untracked_legacy_job
+        )
         self.symmetric_division_orientation_combo.setEnabled(
-            not controls_are_busy
+            not has_untracked_legacy_job
             and self.symmetric_division_checkbox.isChecked()
         )
+        self.job_name_edit.setEnabled(not has_untracked_legacy_job)
         self.generate_button.setEnabled(
             has_video
             and has_mask
             and required_key_is_available
             and camera_selection_is_valid
-            and not controls_are_busy
+            and not has_untracked_legacy_job
         )
         self.generate_geometry_button.setEnabled(
             has_video
@@ -3564,10 +4781,10 @@ class GenerationWorkspace(QWidget):
             and required_key_is_available
             and camera_selection_is_valid
             and not self.symmetric_division_checkbox.isChecked()
-            and not controls_are_busy
+            and not has_untracked_legacy_job
         )
         self.video_view.set_interaction_enabled(
-            has_video and not controls_are_busy
+            has_video and not has_untracked_legacy_job
         )
 
     def _can_regenerate_object_texture(
@@ -3576,7 +4793,11 @@ class GenerationWorkspace(QWidget):
     ) -> bool:
         if (
             record is None
-            or self._generation_thread is not None
+            or self._object_has_active_mutation_job(record.object_id)
+            or (
+                self._generation_thread is not None
+                and not self._object_job_runtimes
+            )
             or not self._settings.meshy_api_key
             or self._video_source is None
             or self.video_view.get_frame_bgr() is None
@@ -3943,6 +5164,8 @@ class GenerationWorkspace(QWidget):
         record: GeneratedObjectRecord,
         replacement: GeneratedObjectRecord,
         preview_model: GeneratedModel,
+        *,
+        preview_asset_revision: tuple[object, ...] | None = None,
     ) -> bool:
         """Commit one prepared packing transition with host rollback."""
 
@@ -3987,11 +5210,24 @@ class GenerationWorkspace(QWidget):
             )
             if current_record is not record:
                 return False
+            if (
+                preview_asset_revision is not None
+                and _build_generation_asset_revision(
+                    self._asset_directory,
+                    replacement.asset_path,
+                )
+                != preview_asset_revision
+            ):
+                return False
             self._data.generated_objects[record_index] = replacement
             self._generated_model_cache.pop(record.object_id, None)
             self._generated_model_cache_revisions.pop(record.object_id, None)
             if selected_object_id == record.object_id:
-                self._cache_generated_model(replacement, preview_model)
+                self._cache_generated_model(
+                    replacement,
+                    preview_model,
+                    asset_revision=preview_asset_revision,
+                )
             is_committed = True
             try:
                 self._refresh_generated_objects_list(selected_object_id)
@@ -4127,79 +5363,29 @@ class GenerationWorkspace(QWidget):
     ) -> dict[str, dict[str, str]]:
         """Atomically persist each selectable GLB and its atlas-ready PNG."""
 
-        normalized_asset_stem = (
-            str(object_id) if asset_stem is None else str(asset_stem)
+        return _persist_object_texture_variants_to_directory(
+            self._asset_directory,
+            object_id,
+            variants,
+            asset_stem=asset_stem,
+            persist_asset=self._persist_meshy_named_asset,
         )
-        if (
-            not normalized_asset_stem
-            or Path(normalized_asset_stem).name != normalized_asset_stem
-            or normalized_asset_stem in {".", ".."}
-        ):
-            raise ValueError("Texture variant asset stem is unsafe.")
-        metadata: dict[str, dict[str, str]] = {}
-        created_paths: list[str] = []
-        resolutions = (
-            TEXTURE_RESOLUTIONS
-            if isinstance(variants, ObjectTextureVariants)
-            else variants.selectable_resolutions
-        )
-        try:
-            for resolution in resolutions:
-                glb_path = self._persist_meshy_named_asset(
-                    f"{normalized_asset_stem}.texture-{resolution}.glb",
-                    variants.glb_by_resolution[resolution],
-                )
-                created_paths.append(glb_path)
-                png_path = self._persist_meshy_named_asset(
-                    f"{normalized_asset_stem}.texture-{resolution}.png",
-                    variants.texture_png_by_resolution[resolution],
-                )
-                created_paths.append(png_path)
-                metadata[str(resolution)] = {
-                    TEXTURE_VARIANT_GLB_PATH_KEY: glb_path,
-                    TEXTURE_VARIANT_PNG_PATH_KEY: png_path,
-                }
-            return metadata
-        except Exception:
-            self._remove_newly_persisted_assets(created_paths)
-            raise
 
     def _remove_newly_persisted_assets(self, raw_paths: Sequence[str]) -> None:
         """Best-effort rollback for files written by one failed generation."""
 
-        for raw_path in raw_paths:
-            try:
-                path = self._resolve_generated_asset_path(
-                    raw_path,
-                    allowed_suffixes=frozenset({".glb", ".png"}),
-                )
-                path.unlink(missing_ok=True)
-            except (OSError, ValueError):
-                continue
+        _discard_generated_asset_paths(self._asset_directory, raw_paths)
 
     def _persist_meshy_named_asset(
         self,
         file_name: str,
         glb_bytes: bytes,
     ) -> str:
-        self._asset_directory.mkdir(parents=True, exist_ok=True)
-        destination = self._asset_directory / file_name
-        file_descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{file_name}.",
-            suffix=".tmp",
-            dir=str(self._asset_directory),
+        return _persist_generated_named_asset(
+            self._asset_directory,
+            file_name,
+            glb_bytes,
         )
-        temporary_path = Path(temporary_name)
-        try:
-            with os.fdopen(file_descriptor, "wb") as handle:
-                handle.write(bytes(glb_bytes))
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary_path, destination)
-        except Exception:
-            temporary_path.unlink(missing_ok=True)
-            raise
-        return file_name
 
     def _resolve_meshy_asset_path(self, raw_path: str | None) -> Path:
         return self._resolve_generated_asset_path(
@@ -4775,6 +5961,23 @@ def _build_unchecked_camera_face_purge_pipeline(
 
 
 # ### Texture-regeneration helpers ###
+def _texture_regeneration_source_asset_path(
+    record: GeneratedObjectRecord,
+) -> str:
+    """Return the persisted geometry revision submitted to Retexture."""
+
+    raw_postprocessed_path = record.pipeline.get("postprocessed_asset_path")
+    if isinstance(raw_postprocessed_path, str) and raw_postprocessed_path:
+        return raw_postprocessed_path
+    canonical_variant = _get_texture_variant_metadata(
+        record,
+        DEFAULT_TEXTURE_RESOLUTION,
+    )
+    if canonical_variant is None:
+        return record.asset_path
+    return canonical_variant[TEXTURE_VARIANT_GLB_PATH_KEY]
+
+
 def _build_regenerated_texture_pipeline(
     record: GeneratedObjectRecord,
     outcome: TextureRegenerationOutcome,
@@ -4967,6 +6170,468 @@ def _resolve_deletable_asset(
         return None
     identity = os.path.normcase(str(resolved_candidate))
     return candidate, identity
+
+
+# ### Background asset preparation ###
+def _persist_generated_named_asset(
+    asset_directory: Path,
+    file_name: str,
+    payload: bytes,
+) -> str:
+    """Atomically fsync and replace one generated GLB or PNG asset."""
+
+    normalized_file_name = str(file_name)
+    if (
+        not normalized_file_name
+        or Path(normalized_file_name).name != normalized_file_name
+        or normalized_file_name in {".", ".."}
+        or Path(normalized_file_name).suffix.lower() not in {".glb", ".png"}
+    ):
+        raise ValueError("Generated asset file name is unsafe.")
+    asset_root = Path(asset_directory)
+    asset_root.mkdir(parents=True, exist_ok=True)
+    destination = asset_root / normalized_file_name
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{normalized_file_name}.",
+        suffix=".tmp",
+        dir=str(asset_root),
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(file_descriptor, "wb") as handle:
+            handle.write(bytes(payload))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, destination)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+    return normalized_file_name
+
+
+def _persist_object_texture_variants_to_directory(
+    asset_directory: Path,
+    object_id: str,
+    variants: PersistableObjectTextureVariants,
+    *,
+    asset_stem: str | None = None,
+    cancel_event: threading.Event | None = None,
+    persist_asset: Callable[[str, bytes], str] | None = None,
+) -> dict[str, dict[str, str]]:
+    """Persist all selectable variants with rollback on failure/cancel."""
+
+    normalized_asset_stem = (
+        str(object_id) if asset_stem is None else str(asset_stem)
+    )
+    if (
+        not normalized_asset_stem
+        or Path(normalized_asset_stem).name != normalized_asset_stem
+        or normalized_asset_stem in {".", ".."}
+    ):
+        raise ValueError("Texture variant asset stem is unsafe.")
+    resolutions = (
+        TEXTURE_RESOLUTIONS
+        if isinstance(variants, ObjectTextureVariants)
+        else variants.selectable_resolutions
+    )
+    metadata: dict[str, dict[str, str]] = {}
+    created_paths: list[str] = []
+    persist = persist_asset
+    if persist is None:
+        persist = lambda file_name, payload: _persist_generated_named_asset(
+            asset_directory,
+            file_name,
+            payload,
+        )
+    try:
+        for resolution in resolutions:
+            _raise_if_generation_cancelled(cancel_event)
+            glb_path = persist(
+                f"{normalized_asset_stem}.texture-{resolution}.glb",
+                variants.glb_by_resolution[resolution],
+            )
+            created_paths.append(glb_path)
+            _raise_if_generation_cancelled(cancel_event)
+            png_path = persist(
+                f"{normalized_asset_stem}.texture-{resolution}.png",
+                variants.texture_png_by_resolution[resolution],
+            )
+            created_paths.append(png_path)
+            metadata[str(resolution)] = {
+                TEXTURE_VARIANT_GLB_PATH_KEY: glb_path,
+                TEXTURE_VARIANT_PNG_PATH_KEY: png_path,
+            }
+        return metadata
+    except Exception:
+        _discard_generated_asset_paths(asset_directory, created_paths)
+        raise
+
+
+def _discard_generated_asset_paths(
+    asset_directory: Path,
+    raw_paths: Sequence[str],
+) -> None:
+    """Best-effort deletion for one worker's uncommitted contained assets."""
+
+    try:
+        asset_root = Path(asset_directory).resolve()
+    except OSError:
+        return
+    for raw_path in tuple(raw_paths):
+        safe_asset = _resolve_deletable_asset(asset_root, str(raw_path))
+        if safe_asset is None:
+            continue
+        candidate, _identity = safe_asset
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError:
+            continue
+
+
+def _materialize_texture_regeneration_preflight(
+    raw_request: TextureRegenerationRequest | _TextureRegenerationPreflight,
+    asset_directory: Path | None,
+    cancel_event: threading.Event | None = None,
+) -> _MaterializedTextureRegeneration:
+    """Read and validate deferred Retexture inputs on the worker thread."""
+
+    if isinstance(raw_request, TextureRegenerationRequest):
+        return _MaterializedTextureRegeneration(request=raw_request)
+    if not isinstance(raw_request, _TextureRegenerationPreflight):
+        raise TypeError("Texture generation received an invalid preflight.")
+    if asset_directory is None:
+        raise ValueError("Texture preflight requires an asset directory.")
+    _raise_if_generation_cancelled(cancel_event)
+    asset_root = Path(asset_directory).resolve()
+    source_path = (asset_root / raw_request.source_asset_path).resolve()
+    try:
+        source_path.relative_to(asset_root)
+    except ValueError as error:
+        raise ValueError("The texture source asset path is unsafe.") from error
+    if source_path.suffix.lower() != ".glb":
+        raise ValueError("The texture source asset must be a GLB.")
+    revision_before = _build_generation_asset_revision(
+        asset_root,
+        raw_request.source_asset_path,
+    )
+    if revision_before != raw_request.source_asset_revision:
+        raise ValueError(
+            "The target object's source model changed before texture "
+            "generation could start."
+        )
+    try:
+        model_glb = source_path.read_bytes()
+    except OSError as error:
+        raise ValueError(
+            "The model revision used for Retexture could not be read."
+        ) from error
+    _raise_if_generation_cancelled(cancel_event)
+    revision_after_read = _build_generation_asset_revision(
+        asset_root,
+        raw_request.source_asset_path,
+    )
+    if revision_after_read != revision_before:
+        raise ValueError(
+            "The target object's source model changed while texture "
+            "generation was starting."
+        )
+    import_generated_glb(model_glb)
+    submitted_fingerprint = (
+        build_uv_fingerprint(model_glb)
+        if raw_request.enable_original_uv
+        else None
+    )
+    _raise_if_generation_cancelled(cancel_event)
+    revision_after_validation = _build_generation_asset_revision(
+        asset_root,
+        raw_request.source_asset_path,
+    )
+    if revision_after_validation != revision_before:
+        raise ValueError(
+            "The target object's source model changed during texture "
+            "preflight."
+        )
+    request = TextureRegenerationRequest(
+        object_id=raw_request.object_id,
+        reference_frame_index=raw_request.reference_frame_index,
+        reference_image_bgra=raw_request.reference_image_bgra,
+        model_glb=model_glb,
+        settings=raw_request.settings,
+        enable_original_uv=raw_request.enable_original_uv,
+        submitted_uv_fingerprint=submitted_fingerprint,
+        preserve_symmetric_uvs=raw_request.preserve_symmetric_uvs,
+    )
+    return _MaterializedTextureRegeneration(
+        request=request,
+        source_asset_path=raw_request.source_asset_path,
+        source_asset_revision=revision_before,
+    )
+
+
+def _prepare_and_persist_object_generation(
+    asset_directory: Path,
+    object_id: str,
+    request: GenerationRequest,
+    result: MeshyGenerationResult,
+    generated_model: GeneratedModel,
+    cancel_event: threading.Event | None = None,
+) -> _SavedObjectGeneration:
+    """Prepare every model revision without touching GUI-owned state."""
+
+    pipeline: dict[str, object] = {}
+    persisted_asset_paths: list[str] = []
+    symmetry: ObjectSymmetricDivisionMetadata | None = None
+    variant_metadata: dict[str, dict[str, str]] | None = None
+    try:
+        _raise_if_generation_cancelled(cancel_event)
+        geometry_only = (
+            isinstance(result, StagedMeshyGenerationResult)
+            and result.geometry_only
+        )
+        texture_variants = (
+            None
+            if geometry_only
+            else generated_model.object_texture_variants
+        )
+        if request.symmetric_division_enabled:
+            if geometry_only or not isinstance(
+                texture_variants,
+                ObjectTextureVariants,
+            ):
+                raise ValueError(
+                    "Symmetric division requires a newly generated textured "
+                    "model."
+                )
+            division_result = build_automatic_symmetric_object_variants(
+                texture_variants.glb_by_resolution[TEXTURE_RESOLUTION_2048],
+                request.symmetric_division_orientation,
+            )
+            symmetry = _validate_automatic_symmetric_division_result(
+                division_result,
+                request.symmetric_division_orientation,
+            )
+            texture_variants = division_result.variants
+            _raise_if_generation_cancelled(cancel_event)
+
+        if texture_variants is None:
+            asset_path = _persist_generated_named_asset(
+                asset_directory,
+                f"{object_id}.glb",
+                result.glb_bytes,
+            )
+            persisted_asset_paths.append(asset_path)
+            preview_model = (
+                import_generated_glb(result.glb_bytes)
+                if geometry_only
+                else generated_model
+            )
+        else:
+            variant_metadata = (
+                _persist_object_texture_variants_to_directory(
+                    asset_directory,
+                    object_id,
+                    texture_variants,
+                    cancel_event=cancel_event,
+                )
+            )
+            persisted_asset_paths.extend(
+                path
+                for variant in variant_metadata.values()
+                for path in variant.values()
+            )
+            pipeline.update(
+                {
+                    TEXTURE_VARIANTS_PIPELINE_KEY: variant_metadata,
+                    SELECTED_TEXTURE_RESOLUTION_PIPELINE_KEY: (
+                        DEFAULT_TEXTURE_RESOLUTION
+                    ),
+                }
+            )
+            asset_path = variant_metadata[str(DEFAULT_TEXTURE_RESOLUTION)][
+                TEXTURE_VARIANT_GLB_PATH_KEY
+            ]
+            preview_model = import_generated_glb(
+                texture_variants.glb_by_resolution[
+                    DEFAULT_TEXTURE_RESOLUTION
+                ]
+            )
+        _raise_if_generation_cancelled(cancel_event)
+
+        if isinstance(result, StagedMeshyGenerationResult):
+            source_asset_path = _persist_generated_named_asset(
+                asset_directory,
+                f"{object_id}.{MESHY_REVISION_GEOMETRY}.glb",
+                result.source_glb_bytes,
+            )
+            persisted_asset_paths.append(source_asset_path)
+            staged_pipeline: dict[str, object] = {
+                "mode": _staged_generation_mode(result),
+                "geometry_task_id": result.geometry_task_id,
+                "source_asset_path": source_asset_path,
+                "enabled_camera_ids": list(result.enabled_camera_ids),
+                "unchecked_camera_ids": list(result.unchecked_camera_ids),
+                "camera_face_purge_applied": result.camera_face_purge_applied,
+                "unused_face_removal_applied": (
+                    _staged_result_used_face_removal(result)
+                ),
+                "geometry_only": result.geometry_only,
+            }
+            if symmetry is None:
+                postprocessed_asset_path = _persist_generated_named_asset(
+                    asset_directory,
+                    f"{object_id}.{MESHY_REVISION_POSTPROCESSED}.glb",
+                    result.postprocessed_glb_bytes,
+                )
+                persisted_asset_paths.append(postprocessed_asset_path)
+                staged_pipeline["postprocessed_asset_path"] = (
+                    postprocessed_asset_path
+                )
+            pipeline.update(staged_pipeline)
+            if _staged_result_used_face_purge(result):
+                pipeline.update(
+                    {
+                        "purge_original_face_count": (
+                            result.purge_original_face_count
+                        ),
+                        "purge_retained_face_count": (
+                            result.purge_retained_face_count
+                        ),
+                        "purge_removed_face_count": (
+                            result.purge_removed_face_count
+                        ),
+                    }
+                )
+            if _staged_result_used_face_removal(result):
+                pipeline.update(
+                    {
+                        "original_face_count": result.original_face_count,
+                        "retained_face_count": result.retained_face_count,
+                        "removed_face_count": result.removed_face_count,
+                        "protected_face_count": result.protected_face_count,
+                    }
+                )
+
+        if symmetry is not None:
+            if variant_metadata is None:
+                raise ValueError("Symmetric texture variants were not saved.")
+            pipeline = _build_automatic_symmetric_generation_pipeline(
+                pipeline,
+                symmetry,
+                variant_metadata,
+            )
+        _raise_if_generation_cancelled(cancel_event)
+        preview_asset_revision = _build_generation_asset_revision(
+            asset_directory,
+            asset_path,
+        )
+        if preview_asset_revision[1] is None:
+            raise OSError("The saved object preview asset is unavailable.")
+        return _SavedObjectGeneration(
+            result=result,
+            object_id=str(object_id),
+            pipeline=pipeline,
+            asset_path=asset_path,
+            preview_model=preview_model,
+            preview_asset_revision=preview_asset_revision,
+            symmetry=symmetry,
+            persisted_asset_paths=tuple(persisted_asset_paths),
+        )
+    except Exception:
+        _discard_generated_asset_paths(
+            asset_directory,
+            persisted_asset_paths,
+        )
+        raise
+
+
+def _prepare_and_persist_texture_regeneration(
+    asset_directory: Path,
+    outcome: TextureRegenerationOutcome,
+    generated_model: GeneratedModel,
+    symmetry: ObjectSymmetricDivisionMetadata | None,
+    selected_resolution: int,
+    record_snapshot: GeneratedObjectRecord,
+    source_asset_path: str | None = None,
+    source_asset_revision: tuple[object, ...] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> _SavedObjectTextureRegeneration:
+    """Build, save, and import one retexture result on its worker thread."""
+
+    persisted_asset_paths: list[str] = []
+    try:
+        texture_variants = generated_model.object_texture_variants
+        if texture_variants is None:
+            raise ValueError(
+                "The regenerated model has no selectable texture variants."
+            )
+        if symmetry is not None:
+            _validate_symmetric_texture_regeneration_uvs(outcome)
+            canonical_provider_glb = texture_variants.glb_by_resolution[
+                TEXTURE_RESOLUTION_2048
+            ]
+            texture_variants = _rebuild_symmetric_texture_variants(
+                canonical_provider_glb,
+                symmetry,
+            )
+        _raise_if_generation_cancelled(cancel_event)
+        variant_metadata = _persist_object_texture_variants_to_directory(
+            asset_directory,
+            outcome.request.object_id,
+            texture_variants,
+            asset_stem=f"regenerated-{uuid.uuid4().hex}",
+            cancel_event=cancel_event,
+        )
+        persisted_asset_paths.extend(
+            path
+            for variant in variant_metadata.values()
+            for path in variant.values()
+        )
+        selectable_resolutions = (
+            TEXTURE_RESOLUTIONS
+            if isinstance(texture_variants, ObjectTextureVariants)
+            else texture_variants.selectable_resolutions
+        )
+        normalized_resolution = int(selected_resolution)
+        if normalized_resolution not in selectable_resolutions:
+            normalized_resolution = DEFAULT_TEXTURE_RESOLUTION
+        preview_model = import_generated_glb(
+            texture_variants.glb_by_resolution[normalized_resolution]
+        )
+        next_pipeline = _build_regenerated_texture_pipeline(
+            record_snapshot,
+            outcome,
+            variant_metadata,
+        )
+        preview_asset_path = variant_metadata[str(normalized_resolution)][
+            TEXTURE_VARIANT_GLB_PATH_KEY
+        ]
+        preview_asset_revision = _build_generation_asset_revision(
+            asset_directory,
+            preview_asset_path,
+        )
+        if preview_asset_revision[1] is None:
+            raise OSError("The saved texture preview asset is unavailable.")
+        _raise_if_generation_cancelled(cancel_event)
+        return _SavedObjectTextureRegeneration(
+            outcome=outcome,
+            variant_metadata=variant_metadata,
+            selected_resolution=normalized_resolution,
+            base_asset_path=record_snapshot.asset_path,
+            base_provider_task_id=record_snapshot.provider_task_id,
+            base_pipeline=copy.deepcopy(record_snapshot.pipeline),
+            source_asset_path=source_asset_path,
+            source_asset_revision=source_asset_revision,
+            next_pipeline=next_pipeline,
+            preview_model=preview_model,
+            preview_asset_revision=preview_asset_revision,
+            persisted_asset_paths=tuple(persisted_asset_paths),
+        )
+    except Exception:
+        _discard_generated_asset_paths(
+            asset_directory,
+            persisted_asset_paths,
+        )
+        raise
 
 
 # ### Adapter helpers ###

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import tempfile
 import threading
 import uuid
@@ -41,6 +42,7 @@ from shiboken6 import isValid as is_valid_qt_object
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.camera_models import InitialFirstPersonCamera
 from housemaker.generation_state import MASK_MODE_ERASE, MASK_MODE_PAINT, MaskStroke
+from housemaker.generation_jobs import GenerationJobManager
 from housemaker.generation_views import VideoInpaintView, rasterize_mask_strokes
 from housemaker.glb import GeneratedModel
 from housemaker.models import LevelData
@@ -87,6 +89,7 @@ INTERRUPT_POLL_SECONDS = 0.05
 SHUTDOWN_WAIT_MILLISECONDS = 250
 OTHER_TEXTURE_THUMBNAIL_SIZE = QSize(96, 96)
 OTHER_TEXTURE_GRID_SIZE = QSize(152, 128)
+_PROGRESS_PERCENT_PATTERN = re.compile(r"(?<!\d)(100|[1-9]?\d)\s*%")
 
 
 # ### Level synchronization helpers ###
@@ -206,6 +209,40 @@ class SurfaceTextureRequest:
     existing_texture_png: bytes | None = None
     edit_mask_png: bytes | None = None
     surface_edit_mask_pngs: tuple[tuple[str, bytes], ...] = ()
+    display_name: str = ""
+
+
+@dataclass(frozen=True)
+class _PreparedSurfaceTextureOutput:
+    """One CPU-prepared texture family ready for main-thread persistence."""
+
+    surface_ids: tuple[str, ...]
+    texture_variants: SurfaceTextureVariants
+
+
+@dataclass(frozen=True)
+class _SurfaceTextureLocalizedEditSource:
+    """Immutable file revision and strokes for one localized edit target."""
+
+    surface_id: str
+    assignment_id: str
+    asset_path: str | None
+    asset_revision: tuple[object, ...] | None
+    strokes: tuple[MaskStroke, ...]
+    texture_rgba_bytes: bytes | None = None
+    texture_shape: tuple[int, int, int] | None = None
+
+
+@dataclass(frozen=True)
+class _SurfaceTextureReferenceInput:
+    """Immutable video and localized-edit inputs prepared by one worker."""
+
+    video_path: str
+    frame_strokes: tuple[tuple[int, tuple[MaskStroke, ...]], ...]
+    localized_edit_sources: tuple[
+        _SurfaceTextureLocalizedEditSource,
+        ...,
+    ] = ()
 
 
 @dataclass(frozen=True)
@@ -262,46 +299,141 @@ class DefaultSurfaceTextureProvider:
 
 # ### Background worker ###
 class SurfaceTextureWorker(QObject):
-    succeeded = Signal(object, object)
-    failed = Signal(str)
-    finished = Signal()
-    progress = Signal(str)
+    succeeded = Signal(str, object, object, object)
+    failed = Signal(str, str)
+    cancelled = Signal(str)
+    finished = Signal(str)
+    progress = Signal(str, str)
 
     def __init__(
         self,
+        job_id: str,
         provider: SurfaceTextureProvider | Callable[[SurfaceTextureRequest], object],
         request: SurfaceTextureRequest,
+        asset_directory: Path,
+        reference_input: _SurfaceTextureReferenceInput | None = None,
     ) -> None:
         super().__init__()
+        self._job_id = str(job_id)
         self._provider = provider
         self._request = request
+        self._asset_directory = Path(asset_directory)
+        self._reference_input = reference_input
         self._cancel_event = threading.Event()
+        self._output_lock = threading.Lock()
+        self._unclaimed_saved_outputs: tuple[
+            _SavedSurfaceTextureOutput,
+            ...,
+        ] = ()
 
     def cancel(self) -> None:
         self._cancel_event.set()
 
+    @property
+    def is_cancelled(self) -> bool:
+        return self._cancel_event.is_set()
+
+    def claim_saved_outputs(self) -> None:
+        with self._output_lock:
+            self._unclaimed_saved_outputs = ()
+
+    def discard_unclaimed_outputs(self) -> None:
+        with self._output_lock:
+            saved_outputs = self._unclaimed_saved_outputs
+            self._unclaimed_saved_outputs = ()
+        _discard_surface_texture_outputs(self._asset_directory, saved_outputs)
+
     @Slot()
     def run(self) -> None:
         try:
+            request = self._request
+            if self._reference_input is not None:
+                if self._reference_input.localized_edit_sources:
+                    self.progress.emit(
+                        self._job_id,
+                        "Preparing localized texture edit (3%)",
+                    )
+                    request = _prepare_localized_surface_texture_request(
+                        request,
+                        self._reference_input.localized_edit_sources,
+                        self._asset_directory,
+                        self._cancel_event,
+                    )
+                self.progress.emit(
+                    self._job_id,
+                    "Preparing reference frames (5%)",
+                )
+                reference_pngs, frame_indices = (
+                    _build_reference_pngs_from_input(
+                        self._reference_input,
+                        self._cancel_event,
+                    )
+                )
+                if not reference_pngs:
+                    raise ValueError("The painted reference masks are empty.")
+                request = replace(
+                    request,
+                    reference_pngs=reference_pngs,
+                    reference_frame_indices=frame_indices,
+                )
+                self._request = request
+            _raise_surface_worker_cancelled(self._cancel_event)
             result = _run_interruptible_stage(
                 lambda: _invoke_provider(
                     self._provider,
-                    self._request,
-                    self.progress.emit,
+                    request,
+                    lambda message: self.progress.emit(
+                        self._job_id,
+                        _format_surface_provider_progress(message),
+                    ),
                     self._cancel_event,
                 )
             )
             if not isinstance(result, SurfaceTextureResult):
                 raise TypeError("The texture provider returned an invalid result.")
-            if not self._cancel_event.is_set():
-                self.succeeded.emit(self._request, result)
+            _raise_surface_worker_cancelled(self._cancel_event)
+            self.progress.emit(
+                self._job_id,
+                "Preparing texture variants (90%)",
+            )
+            prepared_outputs = _prepare_surface_texture_outputs(
+                request,
+                result,
+                self._cancel_event,
+            )
+            _raise_surface_worker_cancelled(self._cancel_event)
+            self.progress.emit(
+                self._job_id,
+                "Saving texture variants (95%)",
+            )
+            saved_outputs = _persist_prepared_surface_texture_outputs(
+                self._asset_directory,
+                prepared_outputs,
+                self._cancel_event,
+            )
+            with self._output_lock:
+                self._unclaimed_saved_outputs = saved_outputs
+            _raise_surface_worker_cancelled(self._cancel_event)
+            self.succeeded.emit(
+                self._job_id,
+                request,
+                result,
+                saved_outputs,
+            )
         except _SurfaceTextureCancelled:
-            pass
+            self.discard_unclaimed_outputs()
+            self.cancelled.emit(self._job_id)
         except Exception as error:
-            if not self._cancel_event.is_set():
-                self.failed.emit(_redact_error(error, self._request.api_key))
+            self.discard_unclaimed_outputs()
+            if self._cancel_event.is_set():
+                self.cancelled.emit(self._job_id)
+            else:
+                self.failed.emit(
+                    self._job_id,
+                    _redact_error(error, self._request.api_key),
+                )
         finally:
-            self.finished.emit()
+            self.finished.emit(self._job_id)
 
 
 # ### Surface texture workspace ###
@@ -321,6 +453,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         | None = None,
         asset_directory: str | Path | None = None,
         application_settings: ApplicationSettingsStore | None = None,
+        job_manager: GenerationJobManager | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -335,6 +468,11 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             if application_settings is not None
             else ApplicationSettingsStore()
         )
+        self._job_manager = (
+            job_manager
+            if job_manager is not None
+            else GenerationJobManager(self)
+        )
         self._settings = GenerationServiceSettings(
             surface_texture_provider=read_surface_texture_provider(
                 self._application_settings
@@ -348,8 +486,20 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._video_source: VideoFrameSource | None = None
         self._displayed_frame_index: int | None = None
         self._is_syncing_seekbar = False
-        self._generation_thread: QThread | None = None
-        self._generation_worker: SurfaceTextureWorker | None = None
+        self._generation_threads: dict[str, QThread] = {}
+        self._generation_workers: dict[str, SurfaceTextureWorker] = {}
+        self._generation_requests: dict[str, SurfaceTextureRequest] = {}
+        self._generation_surface_targets: dict[str, frozenset[str]] = {}
+        self._generation_submitted_texture_strokes: dict[
+            str,
+            dict[str, tuple[MaskStroke, ...]],
+        ] = {}
+        self._generation_localized_edit_sources: dict[
+            str,
+            tuple[_SurfaceTextureLocalizedEditSource, ...],
+        ] = {}
+        self._cancelled_generation_job_ids: set[str] = set()
+        self._is_shutting_down = False
         self._texture_atlas_entry_cache: dict[
             str,
             tuple[tuple[object, ...], TextureAtlasEntry],
@@ -379,7 +529,19 @@ class SurfaceTextureGenerationWorkspace(QWidget):
 
     @property
     def is_generating(self) -> bool:
-        return self._generation_thread is not None
+        return bool(self._generation_threads)
+
+    @property
+    def _generation_thread(self) -> QThread | None:
+        """Compatibility view of the first active Surface worker thread."""
+
+        return next(iter(self._generation_threads.values()), None)
+
+    @property
+    def _generation_worker(self) -> SurfaceTextureWorker | None:
+        """Compatibility view of the first active Surface worker."""
+
+        return next(iter(self._generation_workers.values()), None)
 
     def get_data(self) -> SurfaceTextureData:
         self._store_displayed_frame_strokes()
@@ -460,6 +622,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             (
                 assignment.assignment_id,
                 assignment.surface_type,
+                assignment.display_name,
                 assignment.selected_texture_resolution,
                 assignment.asset_path,
                 _get_cached_surface_asset_revision(
@@ -537,7 +700,8 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     ) -> bool:
         """Return whether an exact generated surface variant can be selected."""
 
-        if self.is_generating:
+        assignment = self._assignment_by_id(assignment_id)
+        if assignment is None or self._assignment_is_reserved(assignment):
             return False
         texture_path = self.get_assignment_asset_path(
             assignment_id,
@@ -572,8 +736,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     ) -> bool:
         """Select a family variant and optionally apply it to selected surfaces."""
 
-        if self.is_generating:
-            return False
         normalized_id = str(assignment_id).strip()
         source_assignment = next(
             (
@@ -584,6 +746,8 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             None,
         )
         if source_assignment is None:
+            return False
+        if self._assignment_is_reserved(source_assignment):
             return False
         try:
             target_resolution = int(resolution)
@@ -635,10 +799,10 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     ) -> bool:
         """Apply one family's active asset without changing its resolution."""
 
-        if self.is_generating:
-            return False
         source_assignment = self._assignment_by_id(assignment_id)
         if source_assignment is None:
+            return False
+        if self._assignment_is_reserved(source_assignment):
             return False
         selected_resolution = source_assignment.selected_texture_resolution
         if selected_resolution is not None:
@@ -674,10 +838,12 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     def delete_assignment_texture(self, assignment_id: str) -> bool:
         """Delete one complete texture family from every assigned surface."""
 
-        if self.is_generating:
+        if self.is_generating and not self._generation_threads:
             return False
         assignment = self._assignment_by_id(assignment_id)
         if assignment is None:
+            return False
+        if self._assignment_is_reserved(assignment):
             return False
 
         previous_assignments = list(self._data.assignments)
@@ -781,6 +947,10 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         normalized_targets = tuple(
             dict.fromkeys(str(surface_id) for surface_id in target_surface_ids)
         )
+        if self._assignment_is_reserved(
+            source_assignment
+        ) or self._surface_targets_are_reserved(normalized_targets):
+            return False
         if normalized_targets:
             target_surfaces = tuple(
                 self.surface_view.get_surface(surface_id)
@@ -1036,8 +1206,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._provider = provider
 
     def load_video(self, video_path: str) -> None:
-        if self.is_generating:
-            raise RuntimeError("Cannot replace the video while generating.")
         metadata = probe_video(video_path)
         next_source = VideoFrameSource(metadata.path)
         self._close_video_source()
@@ -1076,24 +1244,32 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._sync_controls()
 
     def generate(self) -> None:
-        if self.is_generating:
-            return
-        request = self._build_request()
+        request = self._build_request(
+            display_name=self.job_name_edit.text(),
+            defer_reference_preparation=True,
+        )
         if request is None:
             return
-        self._start_generation(request)
+        reference_input = self._build_reference_input(request)
+        if reference_input is None:
+            return
+        if self._start_generation(request, reference_input=reference_input):
+            self.job_name_edit.clear()
 
     def undo_localized_texture_inpaint(self) -> bool:
         """Restore the complete state before the latest successful 3D inpaint."""
 
-        if self.is_generating:
-            return False
         history = self._data.localized_inpaint_undo_stack
         if not history:
             self.status_label.setText("There is no localized texture inpaint to undo.")
             self._sync_controls()
             return False
         snapshot = history[-1]
+        if self._surface_targets_are_reserved(snapshot.affected_surface_ids):
+            self.status_label.setText(
+                "Wait for the job editing these surfaces before undoing."
+            )
+            return False
         try:
             required_assignment_ids = self._validate_undo_snapshot_assets(snapshot)
         except (OSError, ValueError) as error:
@@ -1159,34 +1335,48 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         return True
 
     def shutdown(self) -> None:
-        worker = self._generation_worker
-        thread = self._generation_thread
-        if thread is not None:
-            if not is_valid_qt_object(thread):
-                self._generation_thread = None
-                self._generation_worker = None
-                self._close_video_source()
-                return
+        if self._is_shutting_down:
+            self._close_video_source()
+            return
+        self._is_shutting_down = True
+        active_jobs = tuple(self._generation_threads.items())
+        for job_id, thread in active_jobs:
+            worker = self._generation_workers.get(job_id)
+            self._cancelled_generation_job_ids.add(job_id)
             if worker is not None and is_valid_qt_object(worker):
                 worker.cancel()
+                worker.discard_unclaimed_outputs()
                 for signal, slot in (
-                    (worker.succeeded, self._handle_generation_succeeded),
-                    (worker.failed, self._handle_generation_failed),
+                    (worker.succeeded, self._handle_generation_job_succeeded),
+                    (worker.failed, self._handle_generation_job_failed),
+                    (worker.progress, self._handle_generation_job_progress),
+                    (worker.cancelled, self._handle_generation_job_cancelled),
                 ):
                     try:
                         signal.disconnect(slot)
                     except (RuntimeError, TypeError):
                         pass
-            try:
-                thread.finished.disconnect(self._handle_thread_finished)
-            except (RuntimeError, TypeError):
-                pass
-            thread.requestInterruption()
-            thread.quit()
-            thread.wait(SHUTDOWN_WAIT_MILLISECONDS)
-            if self._generation_thread is thread:
-                self._generation_thread = None
-                self._generation_worker = None
+            self._job_manager.mark_cancelled(job_id)
+            if is_valid_qt_object(thread):
+                thread.requestInterruption()
+                thread.quit()
+        for job_id, thread in active_jobs:
+            while is_valid_qt_object(thread) and thread.isRunning():
+                # Provider calls are isolated in interruptible daemon threads.
+                # Work left directly on this QThread is finite image/file work,
+                # so retain its QObject and wait until it is safe to destroy.
+                thread.wait(SHUTDOWN_WAIT_MILLISECONDS)
+            worker = self._generation_workers.get(job_id)
+            if worker is not None and is_valid_qt_object(worker):
+                # The worker may have persisted its files after the first
+                # discard but before its thread observed cancellation.
+                worker.discard_unclaimed_outputs()
+        self._generation_threads.clear()
+        self._generation_workers.clear()
+        self._generation_requests.clear()
+        self._generation_surface_targets.clear()
+        self._generation_submitted_texture_strokes.clear()
+        self._generation_localized_edit_sources.clear()
         self._close_video_source()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
@@ -1393,6 +1583,12 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             "Optional material notes, e.g. pale oak or matte plaster"
         )
         second_row.addWidget(self.material_notes_edit, 1)
+        second_row.addWidget(QLabel("Job name"))
+        self.job_name_edit = QLineEdit()
+        self.job_name_edit.setObjectName("surface_texture_job_name_edit")
+        self.job_name_edit.setPlaceholderText("Optional")
+        self.job_name_edit.setMaxLength(256)
+        second_row.addWidget(self.job_name_edit)
         self.generate_button = QPushButton("Generate texture")
         self.generate_button.setMinimumHeight(38)
         self.generate_button.clicked.connect(self.generate)
@@ -1435,34 +1631,87 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             return True
         return super().eventFilter(watched, event)
 
-    def _start_generation(self, request: SurfaceTextureRequest) -> None:
+    def _start_generation(
+        self,
+        request: SurfaceTextureRequest,
+        *,
+        reference_input: _SurfaceTextureReferenceInput | None = None,
+    ) -> bool:
+        """Start one independently tracked job unless its surfaces are busy."""
+
+        if self._is_shutting_down:
+            return False
+        if self._surface_targets_are_reserved(request.surface_ids):
+            self.status_label.setText(
+                "A surface texture job is already using part of this selection."
+            )
+            self._sync_controls()
+            return False
         if self.inpaint_3d_button.isChecked():
             self.inpaint_3d_button.setChecked(False)
-        self._generation_thread = QThread(self)
-        self._generation_worker = SurfaceTextureWorker(self._provider, request)
-        self._generation_worker.moveToThread(self._generation_thread)
-        self._generation_thread.started.connect(self._generation_worker.run)
-        self._generation_worker.succeeded.connect(
-            self._handle_generation_succeeded
+        job = self._job_manager.create_job(
+            kind="Surface texture",
+            requested_name=request.display_name,
+            default_name=_default_surface_texture_name(request.surface_type),
+            stage="Sending texture request",
         )
-        self._generation_worker.failed.connect(self._handle_generation_failed)
-        self._generation_worker.progress.connect(self.status_label.setText)
-        self._generation_worker.finished.connect(
-            self._generation_worker.deleteLater
+        job_id = job.job_id
+        thread = QThread(self)
+        worker = SurfaceTextureWorker(
+            job_id,
+            self._provider,
+            request,
+            self._asset_directory,
+            reference_input,
         )
-        self._generation_worker.finished.connect(self._generation_thread.quit)
-        self._generation_thread.finished.connect(self._handle_thread_finished)
-        self._generation_thread.finished.connect(
-            self._generation_thread.deleteLater
+        self._generation_threads[job_id] = thread
+        self._generation_workers[job_id] = worker
+        self._generation_requests[job_id] = request
+        self._generation_surface_targets[job_id] = frozenset(
+            request.surface_ids
         )
+        self._generation_submitted_texture_strokes[job_id] = {
+            surface_id: tuple(
+                self._data.texture_mask_strokes.get(surface_id, ())
+            )
+            for surface_id in request.surface_ids
+        }
+        self._generation_localized_edit_sources[job_id] = (
+            ()
+            if reference_input is None
+            else reference_input.localized_edit_sources
+        )
+        self._job_manager.set_cancel_callback(
+            job_id,
+            lambda active_job_id=job_id: self._cancel_generation_job(
+                active_job_id
+            ),
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._handle_generation_job_succeeded)
+        worker.failed.connect(self._handle_generation_job_failed)
+        worker.cancelled.connect(self._handle_generation_job_cancelled)
+        worker.progress.connect(self._handle_generation_job_progress)
+        worker.finished.connect(self._handle_generation_worker_finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(thread.deleteLater)
         self.status_label.setText(
-            f"Sending {len(request.reference_frame_indices)} painted frame(s) "
+            f"{job.name}: sending {len(request.reference_frame_indices)} "
+            "painted frame(s) "
             f"to {_get_provider_display_name(request.provider)}..."
         )
-        self._generation_thread.start()
+        thread.start()
         self._sync_controls()
+        return True
 
-    def _build_request(self) -> SurfaceTextureRequest | None:
+    def _build_request(
+        self,
+        display_name: str = "",
+        *,
+        defer_reference_preparation: bool = False,
+    ) -> SurfaceTextureRequest | None:
         self._store_displayed_frame_strokes()
         selected_ids = tuple(self.surface_view.get_selected_surface_ids())
         surface_type = self.surface_view.get_selected_surface_type()
@@ -1482,39 +1731,49 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 "API key in Settings."
             )
             return None
-        try:
-            reference_pngs, used_frame_indices = self._build_reference_pngs(
-                frame_indices
-            )
-        except (OSError, ValueError) as error:
-            self.status_label.setText(str(error))
-            return None
-        if not reference_pngs:
-            self.status_label.setText("The painted reference masks are empty.")
-            return None
-        existing_texture_png: bytes | None = None
-        edit_mask_png: bytes | None = None
-        masked_surface_ids = self.surface_view.get_masked_selected_surface_ids()
-        if masked_surface_ids:
+        if defer_reference_preparation:
+            reference_pngs = ()
+            used_frame_indices = frame_indices
+        else:
             try:
-                base_rgba, edit_masks = (
-                    self._build_canonical_selected_texture_edit_data(
-                        masked_surface_ids
-                    )
+                reference_pngs, used_frame_indices = self._build_reference_pngs(
+                    frame_indices
                 )
             except (OSError, ValueError) as error:
                 self.status_label.setText(str(error))
                 return None
-            if not edit_masks:
-                self.status_label.setText("Paint an edit region on the 3D texture.")
+            if not reference_pngs:
+                self.status_label.setText(
+                    "The painted reference masks are empty."
+                )
                 return None
-            editable_mask = np.maximum.reduce(tuple(edit_masks.values()))
-            existing_texture_png = _encode_rgba_png(base_rgba)
-            edit_mask_png = _encode_png(editable_mask)
-            surface_edit_mask_pngs = tuple(
-                (surface_id, _encode_png(mask))
-                for surface_id, mask in edit_masks.items()
-            )
+        existing_texture_png: bytes | None = None
+        edit_mask_png: bytes | None = None
+        masked_surface_ids = self.surface_view.get_masked_selected_surface_ids()
+        if masked_surface_ids:
+            surface_edit_mask_pngs: tuple[tuple[str, bytes], ...] = ()
+            if not defer_reference_preparation:
+                try:
+                    base_rgba, edit_masks = (
+                        self._build_canonical_selected_texture_edit_data(
+                            masked_surface_ids
+                        )
+                    )
+                except (OSError, ValueError) as error:
+                    self.status_label.setText(str(error))
+                    return None
+                if not edit_masks:
+                    self.status_label.setText(
+                        "Paint an edit region on the 3D texture."
+                    )
+                    return None
+                editable_mask = np.maximum.reduce(tuple(edit_masks.values()))
+                existing_texture_png = _encode_rgba_png(base_rgba)
+                edit_mask_png = _encode_png(editable_mask)
+                surface_edit_mask_pngs = tuple(
+                    (surface_id, _encode_png(mask))
+                    for surface_id, mask in edit_masks.items()
+                )
             selected_ids = masked_surface_ids
             area_m2 = self.surface_view.get_combined_masked_selected_area()
         else:
@@ -1537,7 +1796,162 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             existing_texture_png=existing_texture_png,
             edit_mask_png=edit_mask_png,
             surface_edit_mask_pngs=surface_edit_mask_pngs,
+            display_name=str(display_name).strip()[:256],
         )
+
+    def _build_reference_input(
+        self,
+        request: SurfaceTextureRequest,
+    ) -> _SurfaceTextureReferenceInput | None:
+        """Snapshot cheap inputs while deferring image preparation."""
+
+        video_source = self._video_source
+        if video_source is None:
+            self.status_label.setText("Load the source video before generating.")
+            return None
+        localized_edit_sources: tuple[
+            _SurfaceTextureLocalizedEditSource,
+            ...,
+        ] = ()
+        if (
+            request.existing_texture_png is None
+            and any(
+                self._data.texture_mask_strokes.get(surface_id)
+                for surface_id in request.surface_ids
+            )
+        ):
+            localized_edit_sources = self._build_localized_edit_sources(
+                request.surface_ids
+            )
+            if not localized_edit_sources:
+                return None
+        return _SurfaceTextureReferenceInput(
+            video_path=video_source.metadata.path,
+            frame_strokes=tuple(
+                (
+                    frame_index,
+                    tuple(self._data.strokes_for_frame(frame_index)),
+                )
+                for frame_index in request.reference_frame_indices
+            ),
+            localized_edit_sources=localized_edit_sources,
+        )
+
+    def _build_localized_edit_sources(
+        self,
+        surface_ids: Sequence[str],
+    ) -> tuple[_SurfaceTextureLocalizedEditSource, ...]:
+        """Snapshot file revisions or legacy viewer pixels plus mask strokes."""
+
+        normalized_surface_ids = tuple(str(value) for value in surface_ids)
+        strokes_by_surface_id = self.surface_view.get_texture_mask_strokes()
+        strokes_by_target: dict[str, tuple[MaskStroke, ...]] = {}
+        assignments: list[SurfaceTextureAssignment | None] = []
+        for surface_id in normalized_surface_ids:
+            strokes = tuple(strokes_by_surface_id.get(surface_id, ()))
+            if not strokes:
+                self.status_label.setText(
+                    "Paint an edit region on the 3D texture."
+                )
+                return ()
+            strokes_by_target[surface_id] = strokes
+            assignments.append(
+                next(
+                    (
+                        candidate
+                        for candidate in reversed(self._data.assignments)
+                        if surface_id in candidate.surface_ids
+                    ),
+                    None,
+                )
+            )
+
+        if any(assignment is None for assignment in assignments):
+            return self._build_legacy_localized_edit_sources(
+                normalized_surface_ids,
+                assignments,
+                strokes_by_target,
+            )
+
+        sources: list[_SurfaceTextureLocalizedEditSource] = []
+        for surface_id, assignment in zip(
+            normalized_surface_ids,
+            assignments,
+            strict=True,
+        ):
+            assert assignment is not None
+            if assignment.texture_variants:
+                canonical_variant = assignment.texture_variant_for_resolution(
+                    2048
+                )
+                if canonical_variant is None:
+                    self.status_label.setText(
+                        "The canonical 2048 surface texture is unavailable."
+                    )
+                    return ()
+                asset_path = canonical_variant.asset_path
+            else:
+                asset_path = assignment.asset_path
+            asset_revision = _build_surface_asset_revision(
+                self._asset_directory,
+                asset_path,
+            )
+            if any(value is None for value in asset_revision[1:]):
+                self.status_label.setText(
+                    "The canonical 2048 surface texture is unavailable."
+                )
+                return ()
+            sources.append(
+                _SurfaceTextureLocalizedEditSource(
+                    surface_id=surface_id,
+                    assignment_id=assignment.assignment_id,
+                    asset_path=asset_path,
+                    asset_revision=asset_revision,
+                    strokes=strokes_by_target[surface_id],
+                )
+            )
+        return tuple(sources)
+
+    def _build_legacy_localized_edit_sources(
+        self,
+        surface_ids: Sequence[str],
+        assignments: Sequence[SurfaceTextureAssignment | None],
+        strokes_by_target: dict[str, tuple[MaskStroke, ...]],
+    ) -> tuple[_SurfaceTextureLocalizedEditSource, ...]:
+        """Snapshot immutable raw RGBA for viewer-only legacy textures."""
+
+        sources: list[_SurfaceTextureLocalizedEditSource] = []
+        for surface_id, assignment in zip(
+            surface_ids,
+            assignments,
+            strict=True,
+        ):
+            texture = self.surface_view.get_surface_texture_rgba(surface_id)
+            if texture is None:
+                self.status_label.setText(
+                    "Every selected 3D surface needs an applied texture."
+                )
+                return ()
+            texture_rgba = np.ascontiguousarray(texture, dtype=np.uint8)
+            if texture_rgba.ndim != 3 or texture_rgba.shape[2] != 4:
+                self.status_label.setText(
+                    "A base surface texture must contain RGBA pixels."
+                )
+                return ()
+            sources.append(
+                _SurfaceTextureLocalizedEditSource(
+                    surface_id=surface_id,
+                    assignment_id=(
+                        "" if assignment is None else assignment.assignment_id
+                    ),
+                    asset_path=None,
+                    asset_revision=None,
+                    strokes=strokes_by_target[surface_id],
+                    texture_rgba_bytes=texture_rgba.tobytes(),
+                    texture_shape=tuple(texture_rgba.shape),
+                )
+            )
+        return tuple(sources)
 
     def _build_reference_pngs(
         self,
@@ -1689,7 +2103,12 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self,
         request: SurfaceTextureRequest,
         result: SurfaceTextureResult,
-    ) -> None:
+        prepared_outputs: Sequence[_PreparedSurfaceTextureOutput] | None = None,
+        saved_outputs: Sequence[_SavedSurfaceTextureOutput] | None = None,
+        submitted_texture_strokes: (
+            dict[str, tuple[MaskStroke, ...]] | None
+        ) = None,
+    ) -> bool:
         is_localized_inpaint = _is_localized_surface_texture_inpaint(request)
         previous_assignments = tuple(self._data.assignments)
         previous_texture_mask_strokes = {
@@ -1697,32 +2116,46 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             for surface_id in request.surface_ids
             if self._data.texture_mask_strokes.get(surface_id)
         }
-        try:
-            outputs = _build_surface_texture_outputs(request, result.texture_png)
-        except ValueError as error:
-            self._handle_generation_failed(str(error))
-            return
-        saved_outputs: list[_SavedSurfaceTextureOutput] = []
-        try:
-            for surface_ids, texture_png in outputs:
-                assignment_id = uuid.uuid4().hex
-                texture_variants = build_surface_texture_variants(texture_png)
-                saved_outputs.append(
-                    self._persist_texture_variants(
-                        surface_ids,
-                        assignment_id,
-                        texture_variants,
-                    )
+        if prepared_outputs is None and saved_outputs is None:
+            try:
+                raw_outputs = _build_surface_texture_outputs(
+                    request,
+                    result.texture_png,
                 )
-        except (OSError, ValueError) as error:
-            self._discard_saved_outputs(saved_outputs)
-            self._handle_generation_failed(
-                f"The generated texture could not be saved: {error}"
-            )
-            return
+                prepared_outputs = tuple(
+                    _PreparedSurfaceTextureOutput(
+                        surface_ids=surface_ids,
+                        texture_variants=build_surface_texture_variants(
+                            texture_png
+                        ),
+                    )
+                    for surface_ids, texture_png in raw_outputs
+                )
+            except ValueError as error:
+                self._handle_generation_failed(str(error))
+                return False
+        saved_output_items = list(saved_outputs or ())
+        if saved_outputs is None:
+            assert prepared_outputs is not None
+            try:
+                for prepared_output in prepared_outputs:
+                    assignment_id = uuid.uuid4().hex
+                    saved_output_items.append(
+                        self._persist_texture_variants(
+                            prepared_output.surface_ids,
+                            assignment_id,
+                            prepared_output.texture_variants,
+                        )
+                    )
+            except (OSError, ValueError) as error:
+                self._discard_saved_outputs(saved_output_items)
+                self._handle_generation_failed(
+                    f"The generated texture could not be saved: {error}"
+                )
+                return False
         assignments: list[SurfaceTextureAssignment] = []
         try:
-            for saved_output in saved_outputs:
+            for saved_output in saved_output_items:
                 selected_resolution = (
                     self._replacement_texture_resolution(
                         saved_output.surface_ids,
@@ -1758,21 +2191,22 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                         texture_height=selected_resolution,
                         texture_variants=saved_output.variants,
                         selected_texture_resolution=selected_resolution,
+                        display_name=request.display_name,
                     )
                 )
         except (OSError, ValueError) as error:
-            self._discard_saved_outputs(saved_outputs)
+            self._discard_saved_outputs(saved_output_items)
             self._handle_generation_failed(
                 f"The generated texture could not be applied: {error}"
             )
-            return
+            return False
 
         try:
             retained_assignments, removed_assignments = (
                 self._replace_assignments_for_surfaces(assignments)
             )
             for saved_output, assignment in zip(
-                saved_outputs,
+                saved_output_items,
                 assignments,
                 strict=True,
             ):
@@ -1785,11 +2219,11 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 )
         except (OSError, TypeError, ValueError) as error:
             self._restore_assignment_textures()
-            self._discard_saved_outputs(saved_outputs)
+            self._discard_saved_outputs(saved_output_items)
             self._handle_generation_failed(
                 f"The generated texture could not be applied: {error}"
             )
-            return
+            return False
 
         self._data.assignments = [*retained_assignments, *assignments]
         # These pixels came from the generated in-memory payload.  Leave the
@@ -1827,7 +2261,10 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             self._data.localized_inpaint_undo_stack.clear()
         self._texture_atlas_entry_cache.clear()
         self._refresh_texture_atlases()
-        self.surface_view.clear_texture_mask(request.surface_ids)
+        self._clear_submitted_texture_masks(
+            request.surface_ids,
+            submitted_texture_strokes,
+        )
         discarded_assignments = [
             assignment
             for snapshot in discarded_snapshots
@@ -1837,8 +2274,13 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             [*removed_assignments, *discarded_assignments]
         )
         status = (
-            f"Applied generated texture to {len(request.surface_ids)} "
+            f"Applied {request.display_name!r} to {len(request.surface_ids)} "
             f"{request.surface_type} surface(s)."
+            if request.display_name
+            else (
+                f"Applied generated texture to {len(request.surface_ids)} "
+                f"{request.surface_type} surface(s)."
+            )
         )
         if cleanup_failure_count:
             status += (
@@ -1860,6 +2302,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             self.generation_completed.emit(assignment)
         self.surface_content_changed.emit()
         self._sync_controls()
+        return True
 
     def _replace_assignments_for_surfaces(
         self,
@@ -2084,11 +2527,166 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     def _handle_generation_failed(self, message: str) -> None:
         self.status_label.setText(message)
 
-    @Slot()
-    def _handle_thread_finished(self) -> None:
-        self._generation_thread = None
-        self._generation_worker = None
+    @Slot(str, object, object, object)
+    def _handle_generation_job_succeeded(
+        self,
+        job_id: str,
+        raw_request: object,
+        raw_result: object,
+        raw_prepared_outputs: object,
+    ) -> None:
+        """Commit a worker result on the GUI thread for its exact job."""
+
+        worker = self._generation_workers.get(job_id)
+        if (
+            self._is_shutting_down
+            or worker is None
+            or job_id in self._cancelled_generation_job_ids
+            or not isinstance(raw_request, SurfaceTextureRequest)
+            or not isinstance(raw_result, SurfaceTextureResult)
+            or not isinstance(raw_prepared_outputs, tuple | list)
+            or not all(
+                isinstance(output, _SavedSurfaceTextureOutput)
+                for output in raw_prepared_outputs
+            )
+        ):
+            if worker is not None:
+                worker.discard_unclaimed_outputs()
+            return
+        localized_edit_sources = self._generation_localized_edit_sources.get(
+            job_id,
+            (),
+        )
+        if (
+            localized_edit_sources
+            and not self._localized_edit_sources_are_current(
+                localized_edit_sources
+            )
+        ):
+            message = (
+                "The canonical surface texture changed while the localized "
+                "edit was running. Start the edit again."
+            )
+            self._handle_generation_failed(message)
+            self._job_manager.fail_job(job_id, message)
+            worker.discard_unclaimed_outputs()
+            return
+        missing_targets = tuple(
+            surface_id
+            for surface_id in raw_request.surface_ids
+            if self.surface_view.get_surface(surface_id) is None
+        )
+        if missing_targets:
+            message = (
+                "The target surfaces changed before the generated texture "
+                "could be applied."
+            )
+            self._handle_generation_failed(message)
+            self._job_manager.fail_job(job_id, message)
+            worker.discard_unclaimed_outputs()
+            return
+        self._job_manager.update_job(
+            job_id,
+            stage="Applying texture (99%)",
+            progress=99,
+        )
+        worker.claim_saved_outputs()
+        committed = self._handle_generation_succeeded(
+            raw_request,
+            raw_result,
+            saved_outputs=tuple(raw_prepared_outputs),
+            submitted_texture_strokes=(
+                self._generation_submitted_texture_strokes.get(job_id)
+            ),
+        )
+        if committed:
+            self._job_manager.complete_job(job_id)
+        else:
+            self._job_manager.fail_job(job_id, self.status_label.text())
+
+    @Slot(str, str)
+    def _handle_generation_job_failed(
+        self,
+        job_id: str,
+        message: str,
+    ) -> None:
+        if self._is_shutting_down or job_id not in self._generation_workers:
+            return
+        job = self._job_manager.get_job(job_id)
+        prefix = "" if job is None else f"{job.name}: "
+        self._handle_generation_failed(prefix + message)
+        self._job_manager.fail_job(job_id, message)
+
+    @Slot(str, str)
+    def _handle_generation_job_progress(
+        self,
+        job_id: str,
+        stage: str,
+    ) -> None:
+        managed_job = self._job_manager.get_job(job_id)
+        if (
+            self._is_shutting_down
+            or job_id not in self._generation_workers
+            or job_id in self._cancelled_generation_job_ids
+            or managed_job is None
+            or managed_job.is_finished
+        ):
+            return
+        job = self._job_manager.update_job(job_id, stage=stage)
+        if job is not None and not job.is_finished:
+            self.status_label.setText(f"{job.name}: {job.stage}")
+
+    @Slot(str)
+    def _handle_generation_job_cancelled(self, job_id: str) -> None:
+        if job_id not in self._generation_workers:
+            return
+        self._cancelled_generation_job_ids.add(job_id)
+        self._job_manager.mark_cancelled(job_id)
+        job = self._job_manager.get_job(job_id)
+        self.status_label.setText(
+            "Surface texture generation cancelled."
+            if job is None
+            else f"Cancelled: {job.name}."
+        )
+
+    @Slot(str)
+    def _handle_generation_worker_finished(self, job_id: str) -> None:
+        """Release only the runtime belonging to the finished worker."""
+
+        worker = self._generation_workers.get(job_id)
+        if worker is not None:
+            worker.discard_unclaimed_outputs()
+        managed_job = self._job_manager.get_job(job_id)
+        if (
+            job_id in self._cancelled_generation_job_ids
+            and managed_job is not None
+            and not managed_job.is_finished
+        ):
+            self._job_manager.mark_cancelled(job_id)
+        elif managed_job is not None and not managed_job.is_finished:
+            self._job_manager.fail_job(
+                job_id,
+                "The job ended before its result could be committed.",
+            )
+        self._generation_threads.pop(job_id, None)
+        self._generation_workers.pop(job_id, None)
+        self._generation_requests.pop(job_id, None)
+        self._generation_surface_targets.pop(job_id, None)
+        self._generation_submitted_texture_strokes.pop(job_id, None)
+        self._generation_localized_edit_sources.pop(job_id, None)
+        self._cancelled_generation_job_ids.discard(job_id)
         self._sync_controls()
+
+    def _cancel_generation_job(self, job_id: str) -> bool:
+        worker = self._generation_workers.get(str(job_id))
+        thread = self._generation_threads.get(str(job_id))
+        if worker is None or thread is None or worker.is_cancelled:
+            return False
+        self._cancelled_generation_job_ids.add(str(job_id))
+        worker.cancel()
+        if is_valid_qt_object(thread):
+            thread.requestInterruption()
+        return True
 
     def _handle_load_video_clicked(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
@@ -2105,7 +2703,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             QMessageBox.critical(self, "Video load failed", str(error))
 
     def _handle_seekbar_changed(self, frame_index: int) -> None:
-        if self._is_syncing_seekbar or self.is_generating:
+        if self._is_syncing_seekbar:
             return
         self.show_frame(frame_index)
 
@@ -2262,6 +2860,12 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             entry_id = (
                 f"{assignment.assignment_id}:resolution:{variant.resolution}"
             )
+            display_name = (
+                f"{assignment.display_name} - "
+                f"{variant.resolution} x {variant.resolution}"
+                if assignment.display_name
+                else f"{variant.resolution} x {variant.resolution}"
+            )
             try:
                 texture_path = self._resolve_asset_path(variant.asset_path)
             except (OSError, TypeError, ValueError):
@@ -2274,12 +2878,16 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             )
             try:
                 cached_entry = self._texture_atlas_entry_cache.get(entry_id)
-                if cached_entry is not None and cached_entry[0] == asset_revision:
+                if (
+                    cached_entry is not None
+                    and cached_entry[0] == asset_revision
+                    and cached_entry[1].display_name == display_name
+                ):
                     entry = cached_entry[1]
                 else:
                     entry = TextureAtlasEntry(
                         atlas_id=entry_id,
-                        display_name=f"{variant.resolution} x {variant.resolution}",
+                        display_name=display_name,
                         image=texture_path,
                         owner_id=assignment.assignment_id,
                     )
@@ -2311,14 +2919,14 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 if active_variant is None:
                     continue
                 display_name = (
-                    f"{candidate.surface_type.title()} texture - "
+                    f"{_surface_texture_display_name(candidate)} - "
                     f"{resolution} x {resolution}"
                 )
             else:
                 if resolution is not None:
                     continue
                 display_name = (
-                    f"{candidate.surface_type.title()} texture - fixed image"
+                    f"{_surface_texture_display_name(candidate)} - fixed image"
                 )
             entry_id = f"{candidate.assignment_id}:other-texture"
             try:
@@ -2577,7 +3185,9 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     def _handle_other_texture_activated(self, raw_item: object) -> None:
         """Apply another compatible texture family to selected surfaces."""
 
-        if self.is_generating or not isinstance(raw_item, QListWidgetItem):
+        if (
+            self.is_generating and not self._generation_threads
+        ) or not isinstance(raw_item, QListWidgetItem):
             return
         entry_id = str(raw_item.data(Qt.ItemDataRole.UserRole) or "")
         target = self._other_texture_entry_targets.get(entry_id)
@@ -2592,6 +3202,13 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         assignment_id, _ = target
         assignment = self._assignment_by_id(assignment_id)
         if assignment is None or assignment.surface_type != selected_surface_type:
+            return
+        if self._surface_targets_are_reserved(
+            selected_surface_ids
+        ) or self._assignment_is_reserved(assignment):
+            self.status_label.setText(
+                "A running job is using one of these surface textures."
+            )
             return
         if self.apply_assignment_texture(
             assignment_id,
@@ -2628,8 +3245,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     def _handle_delete_texture_clicked(self) -> None:
         """Confirm and delete the texture family selected in either pane."""
 
-        if self.is_generating:
-            return
         assignment_id = self._selected_texture_assignment_id_for_deletion()
         assignment = (
             None
@@ -2639,6 +3254,11 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         if assignment is None:
             self.status_label.setText("Select a surface texture to delete.")
             self._sync_controls()
+            return
+        if self._assignment_is_reserved(assignment):
+            self.status_label.setText(
+                "Wait for the job using this texture before deleting it."
+            )
             return
         answer = QMessageBox.question(
             self,
@@ -2721,35 +3341,11 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     ) -> _SavedSurfaceTextureOutput:
         """Persist a complete family or remove every partial file on failure."""
 
-        persisted: list[SurfaceTextureVariant] = []
-        png_items = tuple(
-            (resolution, texture_variants.texture_png_by_resolution[resolution])
-            for resolution in SURFACE_TEXTURE_RESOLUTIONS
-        )
-        try:
-            for resolution, texture_png in png_items:
-                file_name = f"{assignment_id}.texture-{resolution}.png"
-                asset_path = self._persist_texture_file(file_name, texture_png)
-                persisted.append(
-                    SurfaceTextureVariant(
-                        resolution=resolution,
-                        asset_path=asset_path,
-                    )
-                )
-        except Exception:
-            for variant in persisted:
-                try:
-                    self._resolve_asset_path(variant.asset_path).unlink(
-                        missing_ok=True
-                    )
-                except (OSError, ValueError):
-                    continue
-            raise
-        return _SavedSurfaceTextureOutput(
-            surface_ids=surface_ids,
-            assignment_id=assignment_id,
-            variants=tuple(persisted),
-            texture_png_by_resolution=png_items,
+        return _persist_surface_texture_variants(
+            self._asset_directory,
+            surface_ids,
+            assignment_id,
+            texture_variants,
         )
 
     def _persist_texture_file(
@@ -2757,28 +3353,11 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         file_name: str,
         texture_png: bytes,
     ) -> str:
-        self._asset_directory.mkdir(parents=True, exist_ok=True)
-        destination = self._asset_directory / file_name
-        if destination.exists():
-            raise FileExistsError(
-                f"A surface texture asset already exists for {file_name}."
-            )
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{file_name}.",
-            suffix=".tmp",
-            dir=str(self._asset_directory),
+        return _persist_surface_texture_file(
+            self._asset_directory,
+            file_name,
+            texture_png,
         )
-        temporary_path = Path(temporary_name)
-        try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(bytes(texture_png))
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary_path, destination)
-        except Exception:
-            temporary_path.unlink(missing_ok=True)
-            raise
-        return file_name
 
     def _resolve_asset_path(self, raw_path: str) -> Path:
         candidate = (self._asset_directory / raw_path).resolve()
@@ -2840,44 +3419,161 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             f"{len(surface_ids)} {surface_type} surface(s), {area:.2f} m²"
         )
 
+    def _surface_targets_are_reserved(
+        self,
+        surface_ids: Sequence[str],
+    ) -> bool:
+        requested_ids = {str(surface_id) for surface_id in surface_ids}
+        return bool(
+            requested_ids
+            and any(
+                requested_ids.intersection(active_ids)
+                for active_ids in self._generation_surface_targets.values()
+            )
+        )
+
+    def _assignment_is_reserved(
+        self,
+        assignment: SurfaceTextureAssignment,
+    ) -> bool:
+        return self._surface_targets_are_reserved(assignment.surface_ids)
+
+    def _localized_edit_sources_are_current(
+        self,
+        sources: Sequence[_SurfaceTextureLocalizedEditSource],
+    ) -> bool:
+        """Confirm a long-running edit still targets its submitted texture."""
+
+        for source in sources:
+            assignment = next(
+                (
+                    candidate
+                    for candidate in reversed(self._data.assignments)
+                    if source.surface_id in candidate.surface_ids
+                ),
+                None,
+            )
+            if source.assignment_id:
+                if (
+                    assignment is None
+                    or assignment.assignment_id != source.assignment_id
+                ):
+                    return False
+            elif assignment is not None:
+                return False
+            if source.asset_path is None:
+                continue
+            if assignment is None or source.asset_revision is None:
+                return False
+            if assignment.texture_variants:
+                canonical_variant = assignment.texture_variant_for_resolution(
+                    2048
+                )
+                if canonical_variant is None:
+                    return False
+                asset_path = canonical_variant.asset_path
+            else:
+                asset_path = assignment.asset_path
+            if asset_path != source.asset_path:
+                return False
+            if (
+                _build_surface_asset_revision(
+                    self._asset_directory,
+                    asset_path,
+                )
+                != source.asset_revision
+            ):
+                return False
+        return True
+
+    def _clear_submitted_texture_masks(
+        self,
+        surface_ids: Sequence[str],
+        submitted_strokes: dict[str, tuple[MaskStroke, ...]] | None,
+    ) -> None:
+        """Clear consumed masks while preserving strokes painted after submit."""
+
+        if submitted_strokes is None:
+            self.surface_view.clear_texture_mask(surface_ids)
+            return
+        next_strokes = {
+            surface_id: list(strokes)
+            for surface_id, strokes in self._data.texture_mask_strokes.items()
+        }
+        changed = False
+        for raw_surface_id in surface_ids:
+            surface_id = str(raw_surface_id)
+            submitted = submitted_strokes.get(surface_id, ())
+            current = tuple(next_strokes.get(surface_id, ()))
+            if current != submitted or not current:
+                continue
+            next_strokes.pop(surface_id, None)
+            changed = True
+        if not changed:
+            return
+        self._data.texture_mask_strokes = next_strokes
+        self.surface_view.set_texture_mask_strokes(next_strokes)
+
     def _sync_controls(self) -> None:
-        busy = self.is_generating
         has_video = self._video_source is not None
         has_mask = bool(self._data.frame_strokes) or self.video_view.has_selection()
-        has_surface = bool(self.surface_view.get_selected_surface_ids())
+        selected_surface_ids = self.surface_view.get_selected_surface_ids()
+        has_surface = bool(selected_surface_ids)
+        selection_is_reserved = self._surface_targets_are_reserved(
+            selected_surface_ids
+        )
         has_key = bool(self._settings.surface_texture_api_key)
-        self.load_video_button.setEnabled(not busy)
-        self.seekbar.setEnabled(has_video and not busy)
-        self.paint_mask_button.setEnabled(has_video and not busy)
-        self.erase_mask_button.setEnabled(has_video and not busy)
-        self.brush_size_spinbox.setEnabled(has_video and not busy)
-        self.undo_mask_button.setEnabled(has_video and not busy)
+        self.load_video_button.setEnabled(True)
+        self.seekbar.setEnabled(has_video)
+        self.paint_mask_button.setEnabled(has_video)
+        self.erase_mask_button.setEnabled(has_video)
+        self.brush_size_spinbox.setEnabled(has_video)
+        self.undo_mask_button.setEnabled(has_video)
         self.clear_mask_button.setEnabled(
-            has_video and self.video_view.has_selection() and not busy
+            has_video and self.video_view.has_selection()
         )
         can_inpaint_3d = self.surface_view.can_inpaint_selection()
-        self.inpaint_3d_button.setEnabled(can_inpaint_3d and not busy)
+        self.inpaint_3d_button.setEnabled(can_inpaint_3d)
         self.undo_3d_mask_button.setEnabled(
-            self.surface_view.has_selected_texture_mask() and not busy
+            self.surface_view.has_selected_texture_mask()
         )
         self.clear_3d_mask_button.setEnabled(
-            self.surface_view.has_selected_texture_mask() and not busy
+            self.surface_view.has_selected_texture_mask()
         )
-        self.material_notes_edit.setEnabled(not busy)
-        self.surface_texture_provider_combo.setEnabled(not busy)
-        self.texture_view.setEnabled(not busy)
-        self.other_texture_list.setEnabled(not busy)
+        self.material_notes_edit.setEnabled(True)
+        self.job_name_edit.setEnabled(True)
+        self.surface_texture_provider_combo.setEnabled(True)
+        self.texture_view.setEnabled(True)
+        self.other_texture_list.setEnabled(True)
+        deletion_id = self._selected_texture_assignment_id_for_deletion()
+        deletion_assignment = (
+            None
+            if deletion_id is None
+            else self._assignment_by_id(deletion_id)
+        )
         self.delete_texture_button.setEnabled(
-            self._selected_texture_assignment_id_for_deletion() is not None
-            and not busy
+            deletion_assignment is not None
+            and not self._assignment_is_reserved(deletion_assignment)
         )
         self.generate_button.setEnabled(
-            has_video and has_mask and has_surface and has_key and not busy
+            has_video
+            and has_mask
+            and has_surface
+            and has_key
+            and not selection_is_reserved
+        )
+        last_undo_snapshot = (
+            self._data.localized_inpaint_undo_stack[-1]
+            if self._data.localized_inpaint_undo_stack
+            else None
         )
         self.undo_inpaint_button.setEnabled(
-            bool(self._data.localized_inpaint_undo_stack) and not busy
+            last_undo_snapshot is not None
+            and not self._surface_targets_are_reserved(
+                last_undo_snapshot.affected_surface_ids
+            )
         )
-        self.video_view.set_interaction_enabled(has_video and not busy)
+        self.video_view.set_interaction_enabled(has_video)
 
     def _emit_data_changed(self) -> None:
         self.data_changed.emit(self._data.clone())
@@ -2891,6 +3587,316 @@ class SurfaceTextureGenerationWorkspace(QWidget):
 # ### Worker helpers ###
 class _SurfaceTextureCancelled(Exception):
     pass
+
+
+def _raise_surface_worker_cancelled(
+    cancel_event: threading.Event,
+) -> None:
+    if cancel_event.is_set():
+        raise _SurfaceTextureCancelled
+
+
+def _build_reference_pngs_from_input(
+    reference_input: _SurfaceTextureReferenceInput,
+    cancel_event: threading.Event,
+) -> tuple[tuple[bytes, ...], tuple[int, ...]]:
+    """Decode, crop, pack, and encode one immutable video snapshot."""
+
+    strokes_by_frame = dict(reference_input.frame_strokes)
+    limited_indices = _sample_frame_indices(
+        tuple(strokes_by_frame),
+        MAX_REFERENCE_FRAMES,
+    )
+    video_source = VideoFrameSource(reference_input.video_path)
+    crops: list[np.ndarray] = []
+    used_indices: list[int] = []
+    try:
+        for frame_index in limited_indices:
+            _raise_surface_worker_cancelled(cancel_event)
+            frame = video_source.get_frame(frame_index)
+            crop = _build_masked_crop(
+                frame,
+                list(strokes_by_frame.get(frame_index, ())),
+            )
+            if crop.size == 0:
+                continue
+            crops.append(crop)
+            used_indices.append(frame_index)
+    finally:
+        video_source.close()
+    _raise_surface_worker_cancelled(cancel_event)
+    packed_images = _pack_reference_crops(
+        crops,
+        MAX_PROVIDER_REFERENCE_IMAGES,
+    )
+    encoded_images: list[bytes] = []
+    for image in packed_images:
+        _raise_surface_worker_cancelled(cancel_event)
+        encoded_images.append(_encode_png(image))
+    return tuple(encoded_images), tuple(used_indices)
+
+
+def _prepare_localized_surface_texture_request(
+    request: SurfaceTextureRequest,
+    sources: Sequence[_SurfaceTextureLocalizedEditSource],
+    asset_directory: Path,
+    cancel_event: threading.Event,
+) -> SurfaceTextureRequest:
+    """Read revision-validated bases and rasterize edit masks off the GUI."""
+
+    if tuple(source.surface_id for source in sources) != request.surface_ids:
+        raise ValueError("The localized texture targets changed before preparation.")
+    base_textures: list[np.ndarray] = []
+    for source in sources:
+        _raise_surface_worker_cancelled(cancel_event)
+        if (
+            source.texture_rgba_bytes is not None
+            and source.texture_shape is not None
+        ):
+            try:
+                texture = np.frombuffer(
+                    source.texture_rgba_bytes,
+                    dtype=np.uint8,
+                ).reshape(source.texture_shape)
+            except ValueError as error:
+                raise ValueError(
+                    "A legacy base surface texture has invalid dimensions."
+                ) from error
+            base_textures.append(texture)
+            continue
+        if source.asset_path is None or source.asset_revision is None:
+            raise ValueError("A localized texture source is incomplete.")
+        current_revision = _build_surface_asset_revision(
+            asset_directory,
+            source.asset_path,
+        )
+        if current_revision != source.asset_revision:
+            raise ValueError(
+                "The canonical surface texture changed after this job was "
+                "submitted. Start the localized edit again."
+            )
+        try:
+            asset_root = asset_directory.resolve()
+            texture_path = (asset_directory / source.asset_path).resolve()
+            texture_path.relative_to(asset_root)
+            texture_png = texture_path.read_bytes()
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ValueError(
+                "The canonical 2048 surface texture is unavailable."
+            ) from error
+        if (
+            _build_surface_asset_revision(asset_directory, source.asset_path)
+            != source.asset_revision
+        ):
+            raise ValueError(
+                "The canonical surface texture changed while it was being "
+                "prepared. Start the localized edit again."
+            )
+        base_textures.append(
+            _decode_png_rgba(texture_png, "Base surface texture")
+        )
+    if not base_textures:
+        raise ValueError("Paint an edit region on the 3D texture.")
+    base_texture = base_textures[0]
+    if any(
+        texture.shape != base_texture.shape
+        or not np.array_equal(texture, base_texture)
+        for texture in base_textures[1:]
+    ):
+        raise ValueError(
+            "Selected surfaces must share the same texture for partial "
+            "inpainting."
+        )
+
+    edit_masks: list[tuple[str, np.ndarray]] = []
+    texture_size = (base_texture.shape[1], base_texture.shape[0])
+    for source in sources:
+        _raise_surface_worker_cancelled(cancel_event)
+        edit_masks.append(
+            (
+                source.surface_id,
+                rasterize_texture_mask_strokes(texture_size, source.strokes),
+            )
+        )
+    editable_mask = np.maximum.reduce(
+        tuple(mask for _surface_id, mask in edit_masks)
+    )
+    _raise_surface_worker_cancelled(cancel_event)
+    return replace(
+        request,
+        existing_texture_png=_encode_rgba_png(base_texture),
+        edit_mask_png=_encode_png(editable_mask),
+        surface_edit_mask_pngs=tuple(
+            (surface_id, _encode_png(mask))
+            for surface_id, mask in edit_masks
+        ),
+    )
+
+
+def _prepare_surface_texture_outputs(
+    request: SurfaceTextureRequest,
+    result: SurfaceTextureResult,
+    cancel_event: threading.Event,
+) -> tuple[_PreparedSurfaceTextureOutput, ...]:
+    """Build every expensive PNG variant without touching Qt objects."""
+
+    raw_outputs = _build_surface_texture_outputs(
+        request,
+        result.texture_png,
+    )
+    prepared_outputs: list[_PreparedSurfaceTextureOutput] = []
+    for surface_ids, texture_png in raw_outputs:
+        _raise_surface_worker_cancelled(cancel_event)
+        prepared_outputs.append(
+            _PreparedSurfaceTextureOutput(
+                surface_ids=surface_ids,
+                texture_variants=build_surface_texture_variants(texture_png),
+            )
+        )
+    if not prepared_outputs:
+        raise ValueError("The provider returned no usable surface texture output.")
+    return tuple(prepared_outputs)
+
+
+def _persist_prepared_surface_texture_outputs(
+    asset_directory: Path,
+    prepared_outputs: Sequence[_PreparedSurfaceTextureOutput],
+    cancel_event: threading.Event,
+) -> tuple[_SavedSurfaceTextureOutput, ...]:
+    """Persist complete variant families on the worker thread."""
+
+    saved_outputs: list[_SavedSurfaceTextureOutput] = []
+    try:
+        for prepared_output in prepared_outputs:
+            _raise_surface_worker_cancelled(cancel_event)
+            saved_outputs.append(
+                _persist_surface_texture_variants(
+                    asset_directory,
+                    prepared_output.surface_ids,
+                    uuid.uuid4().hex,
+                    prepared_output.texture_variants,
+                    cancel_event,
+                )
+            )
+    except Exception:
+        _discard_surface_texture_outputs(asset_directory, saved_outputs)
+        raise
+    return tuple(saved_outputs)
+
+
+def _persist_surface_texture_variants(
+    asset_directory: Path,
+    surface_ids: tuple[str, ...],
+    assignment_id: str,
+    texture_variants: SurfaceTextureVariants,
+    cancel_event: threading.Event | None = None,
+) -> _SavedSurfaceTextureOutput:
+    """Persist one complete family or remove every partial file on failure."""
+
+    persisted: list[SurfaceTextureVariant] = []
+    png_items = tuple(
+        (resolution, texture_variants.texture_png_by_resolution[resolution])
+        for resolution in SURFACE_TEXTURE_RESOLUTIONS
+    )
+    try:
+        for resolution, texture_png in png_items:
+            if cancel_event is not None:
+                _raise_surface_worker_cancelled(cancel_event)
+            file_name = f"{assignment_id}.texture-{resolution}.png"
+            asset_path = _persist_surface_texture_file(
+                asset_directory,
+                file_name,
+                texture_png,
+            )
+            persisted.append(
+                SurfaceTextureVariant(
+                    resolution=resolution,
+                    asset_path=asset_path,
+                )
+            )
+    except Exception:
+        _discard_surface_texture_outputs(
+            asset_directory,
+            (
+                _SavedSurfaceTextureOutput(
+                    surface_ids=surface_ids,
+                    assignment_id=assignment_id,
+                    variants=tuple(persisted),
+                    texture_png_by_resolution=png_items,
+                ),
+            ),
+        )
+        raise
+    return _SavedSurfaceTextureOutput(
+        surface_ids=surface_ids,
+        assignment_id=assignment_id,
+        variants=tuple(persisted),
+        texture_png_by_resolution=png_items,
+    )
+
+
+def _persist_surface_texture_file(
+    asset_directory: Path,
+    file_name: str,
+    texture_png: bytes,
+) -> str:
+    asset_directory.mkdir(parents=True, exist_ok=True)
+    destination = asset_directory / file_name
+    if destination.exists():
+        raise FileExistsError(
+            f"A surface texture asset already exists for {file_name}."
+        )
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{file_name}.",
+        suffix=".tmp",
+        dir=str(asset_directory),
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(bytes(texture_png))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, destination)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+    return file_name
+
+
+def _discard_surface_texture_outputs(
+    asset_directory: Path,
+    saved_outputs: Sequence[_SavedSurfaceTextureOutput],
+) -> None:
+    try:
+        asset_root = asset_directory.resolve()
+    except OSError:
+        return
+    for saved_output in saved_outputs:
+        for variant in saved_output.variants:
+            try:
+                asset_path = (asset_directory / variant.asset_path).resolve()
+                asset_path.relative_to(asset_root)
+                asset_path.unlink(missing_ok=True)
+            except (OSError, ValueError):
+                continue
+
+
+def _format_surface_provider_progress(message: str) -> str:
+    """Map provider progress into the provider portion of the whole job."""
+
+    normalized = str(message).strip() or "Generating texture"
+    matches = tuple(_PROGRESS_PERCENT_PATTERN.finditer(normalized))
+    if not matches:
+        return normalized
+    match = matches[-1]
+    provider_percent = int(match.group(1))
+    job_percent = 10 + round(provider_percent * 0.75)
+    return (
+        normalized[: match.start(1)]
+        + str(job_percent)
+        + normalized[match.end(1) :]
+    )
 
 
 def _run_interruptible_stage(operation: Callable[[], object]) -> object:
@@ -3098,6 +4104,19 @@ def _build_surface_texture_outputs(
 
 
 # ### Text helpers ###
+def _default_surface_texture_name(surface_type: str) -> str:
+    return f"{str(surface_type).strip().title() or 'Surface'} texture"
+
+
+def _surface_texture_display_name(
+    assignment: SurfaceTextureAssignment,
+) -> str:
+    return (
+        assignment.display_name
+        or _default_surface_texture_name(assignment.surface_type)
+    )
+
+
 def _build_material_prompt(
     surface_type: str,
     area_m2: float,

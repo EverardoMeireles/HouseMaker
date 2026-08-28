@@ -52,6 +52,7 @@ from housemaker.generation_state import (
     GeneratedObjectRecord,
     GenerationData,
 )
+from housemaker.generation_jobs import GenerationJobManager, JobsWindow
 from housemaker.generation_workspace import GenerationWorkspace
 from housemaker.object_placement_dialog import ObjectPlacementDialog
 from housemaker.surface_texture_state import (
@@ -340,10 +341,18 @@ class BlueprintWorkspace(QWidget):
         if self._is_shutdown:
             return
         self._is_shutdown = True
+        try:
+            self.settings_widget.settings_changed.disconnect(
+                self._handle_generation_settings_changed
+            )
+        except (RuntimeError, TypeError):
+            pass
+        self.settings_widget.dispose()
         self._close_object_placement_dialog()
         self._external_viewer_host.dispose()
         self.surface_texture_generation.shutdown()
         self.generation.shutdown()
+        self.jobs_window.dispose()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.shutdown()
@@ -373,10 +382,13 @@ class BlueprintWorkspace(QWidget):
         self._external_viewer_host.close_requested.connect(
             self._handle_external_viewer_window_closed
         )
+        self.job_manager = GenerationJobManager(self)
+        self.jobs_window = JobsWindow(self.job_manager, self)
         self.generation = GenerationWorkspace(
             asset_directory=(
                 self._application_settings.path.parent / "generated"
-            )
+            ),
+            job_manager=self.job_manager,
         )
         self.generation.set_texture_resolution_change_handler(
             self._handle_generation_texture_resolution_change_requested
@@ -414,6 +426,7 @@ class BlueprintWorkspace(QWidget):
                 self._application_settings.path.parent / "surface_textures"
             ),
             application_settings=self._application_settings,
+            job_manager=self.job_manager,
         )
         self.surface_texture_generation.set_texture_resolution_change_handler(
             self._handle_surface_texture_resolution_change_requested
@@ -1062,6 +1075,9 @@ class BlueprintWorkspace(QWidget):
         self._schedule_viewer_preview_refresh(preserve_camera=False)
         self._apply_fullscreen_3d_viewer_screen(
             generation_settings.fullscreen_3d_viewer_screen_id
+        )
+        self._apply_jobs_window_screen(
+            generation_settings.jobs_window_screen_id
         )
 
     def _build_canvas_viewer_workspace(self) -> QWidget:
@@ -2807,7 +2823,7 @@ class BlueprintWorkspace(QWidget):
                         resolution,
                     )
                 )
-            if self.generation.is_generating:
+            if self.generation.has_active_object_job(object_id):
                 return False
             variant = self.generation.get_texture_variant(
                 object_id,
@@ -2982,8 +2998,11 @@ class BlueprintWorkspace(QWidget):
                     assignment.assignment_id
                 ),
                 object_name=(
-                    f"Wall texture Â· {surface_count} surface"
-                    f"{'s' if surface_count != 1 else ''}"
+                    assignment.display_name
+                    or (
+                        f"Wall texture Â· {surface_count} surface"
+                        f"{'s' if surface_count != 1 else ''}"
+                    )
                 ),
                 texture_path=f"surface_textures/{asset_path}",
                 texture_resolution=texture_resolution,
@@ -3027,6 +3046,12 @@ class BlueprintWorkspace(QWidget):
             or viewer is self.surface_texture_generation.surface_view
         ):
             self._ensure_viewer_preview_current(preserve_camera=True)
+
+    def _apply_jobs_window_screen(self, screen_id: str | None) -> None:
+        """Move the persistent Jobs window to its selected display."""
+
+        screen = resolve_fullscreen_3d_viewer_screen(screen_id)
+        self.jobs_window.set_target_screen(screen)
 
     def _sync_external_3d_workspace_presentations(self) -> None:
         """Show each workspace's local replacement for its detached 3D view."""
@@ -4772,6 +4797,7 @@ class BlueprintWorkspace(QWidget):
         self._apply_fullscreen_3d_viewer_screen(
             settings.fullscreen_3d_viewer_screen_id
         )
+        self._apply_jobs_window_screen(settings.jobs_window_screen_id)
 
     def _handle_first_person_camera_z_changed(self, value: float) -> None:
         if self._is_syncing_first_person_camera_controls:

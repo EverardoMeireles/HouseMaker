@@ -18,6 +18,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 import trimesh
+from PySide6.QtCore import QThread
 from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 from trimesh.visual.material import PBRMaterial
@@ -41,7 +42,10 @@ from housemaker.generation_workspace import (
     TextureRegenerationWorker,
     GenerationWorkspace,
     MeshyTextureRegenerator,
+    _TextureRegenerationPreflight,
     _GenerationCancelled,
+    _materialize_texture_regeneration_preflight,
+    _persist_generated_named_asset,
 )
 from housemaker.glb import GeneratedModel, import_generated_glb
 from housemaker.meshy_generation import MeshyGenerationResult
@@ -815,14 +819,110 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
 
         self.assertIsNotNone(request)
         assert request is not None
-        self.assertEqual(request.model_glb, postprocessed_glb)
-        self.assertFalse(request.enable_original_uv)
-        self.assertFalse(request.preserve_symmetric_uvs)
-        self.assertIsNone(request.submitted_uv_fingerprint)
+        self.assertIsInstance(request, _TextureRegenerationPreflight)
+        self.assertEqual(request.source_asset_path, postprocessed_name)
+        materialized = _materialize_texture_regeneration_preflight(
+            request,
+            self.asset_directory,
+        ).request
+        self.assertEqual(materialized.model_glb, postprocessed_glb)
+        self.assertFalse(materialized.enable_original_uv)
+        self.assertFalse(materialized.preserve_symmetric_uvs)
+        self.assertIsNone(materialized.submitted_uv_fingerprint)
         restored = GenerationData.from_dict(self.workspace.get_data().to_dict())
         for key, value in legacy_pipeline.items():
             self.assertEqual(replacement.pipeline[key], value)
             self.assertEqual(restored.generated_objects[0].pipeline[key], value)
+
+    def test_source_read_import_and_symmetric_fingerprint_run_off_gui(
+        self,
+    ) -> None:
+        record, _variants = self._seed_object(
+            0,
+            name="Chair",
+            task_id="geometry-task",
+        )
+        self._load_reference()
+        source_asset_path = record.pipeline["texture_variants"]["1024"][
+            "glb_asset_path"
+        ]
+        source_glb = _uv_glb()
+        self.asset_directory.joinpath(source_asset_path).write_bytes(
+            source_glb
+        )
+        record = self._replace_record(
+            record,
+            symmetric_division={
+                "version": 1,
+                "orientation": "vertical",
+                "kept_side": "left",
+                "plane_coordinate": 0.0,
+                "texture_content_half": "left",
+            },
+        )
+        regenerator = _SequenceTextureRegenerator(
+            [RuntimeError("stop after preflight")]
+        )
+        self.workspace.set_texture_regenerator(regenerator)
+        self.workspace.set_meshy_executor(_SequenceExecutor([]))
+        gui_thread = _qt_application.thread()
+        read_threads: list[QThread] = []
+        import_threads: list[QThread] = []
+        fingerprint_threads: list[QThread] = []
+        original_read_bytes = Path.read_bytes
+        original_import = import_generated_glb
+        original_fingerprint = build_uv_fingerprint
+
+        def read_bytes_with_thread(path: Path) -> bytes:
+            read_threads.append(QThread.currentThread())
+            return original_read_bytes(path)
+
+        def import_with_thread(payload: bytes) -> GeneratedModel:
+            import_threads.append(QThread.currentThread())
+            return original_import(payload)
+
+        def fingerprint_with_thread(payload: bytes) -> UvFingerprint:
+            fingerprint_threads.append(QThread.currentThread())
+            return original_fingerprint(payload)
+
+        with (
+            patch.object(Path, "read_bytes", read_bytes_with_thread),
+            patch(
+                "housemaker.generation_workspace.import_generated_glb",
+                side_effect=import_with_thread,
+            ),
+            patch(
+                "housemaker.generation_workspace.build_uv_fingerprint",
+                side_effect=fingerprint_with_thread,
+            ),
+            patch.object(QMessageBox, "warning"),
+        ):
+            self.assertTrue(
+                self.workspace.generate_selected_object_texture()
+            )
+            self._wait_until_idle()
+
+        self.assertEqual(len(regenerator.requests), 1)
+        self.assertEqual(regenerator.requests[0].model_glb, source_glb)
+        self.assertIsNotNone(
+            regenerator.requests[0].submitted_uv_fingerprint
+        )
+        self.assertTrue(read_threads)
+        self.assertTrue(import_threads)
+        self.assertTrue(fingerprint_threads)
+        self.assertTrue(
+            all(thread != gui_thread for thread in read_threads)
+        )
+        self.assertTrue(
+            all(thread != gui_thread for thread in import_threads)
+        )
+        self.assertTrue(
+            all(thread != gui_thread for thread in fingerprint_threads)
+        )
+        self.assertEqual(
+            self.workspace.get_data().generated_objects[0],
+            record,
+        )
 
     def test_success_replaces_variants_repeats_and_refreshes_external_view(
         self,
@@ -1106,6 +1206,57 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
         self.assertEqual(completed.count(), 1)
         self.assertEqual(completed.at(0)[0].object_id, first.object_id)
 
+    def test_source_revision_change_rejects_prepared_texture_commit(
+        self,
+    ) -> None:
+        original, _original_variants = self._seed_object(
+            0,
+            name="Chair",
+            task_id="original-task",
+        )
+        self._load_reference()
+        original = self.workspace.get_data().generated_objects[0]
+        original_paths = _record_variant_paths(original)
+        new_variants = _texture_variants(8)
+        regenerator = _BlockingTextureRegenerator(
+            MeshyGenerationResult(
+                "new-texture-task",
+                new_variants.glb_by_resolution[1024],
+                "Chair",
+            )
+        )
+        self.workspace.set_texture_regenerator(regenerator)
+        self.workspace.set_meshy_executor(
+            _SequenceExecutor([_model_with_variants(new_variants)])
+        )
+
+        with patch.object(QMessageBox, "warning"):
+            self.assertTrue(
+                self.workspace.generate_selected_object_texture()
+            )
+            self._wait_for_event(regenerator.started)
+            source_asset_path = original.pipeline["texture_variants"][
+                "1024"
+            ]["glb_asset_path"]
+            self.asset_directory.joinpath(source_asset_path).write_bytes(
+                _box_glb(99.0)
+            )
+            regenerator.release.set()
+            self._wait_until_idle()
+
+        self.assertEqual(
+            self.workspace.get_data().generated_objects[0],
+            original,
+        )
+        self.assertEqual(
+            {path.name for path in self.asset_directory.iterdir()},
+            original_paths,
+        )
+        self.assertIn(
+            "source model changed",
+            self.workspace.status_label.text(),
+        )
+
     def test_provider_failure_keeps_record_files_cache_and_display(self) -> None:
         record, _variants = self._seed_object(
             0,
@@ -1173,16 +1324,24 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
                 )
                 self.workspace.set_texture_regenerator(regenerator)
                 self.workspace.set_meshy_executor(executor)
-                original_persist = self.workspace._persist_meshy_named_asset
+                original_persist = _persist_generated_named_asset
                 write_count = 0
                 import_count = 0
 
-                def persist_or_fail(file_name: str, payload: bytes) -> str:
+                def persist_or_fail(
+                    asset_directory: Path,
+                    file_name: str,
+                    payload: bytes,
+                ) -> str:
                     nonlocal write_count
                     write_count += 1
                     if failure_mode == "write" and write_count == 4:
                         raise OSError("injected fourth write failure")
-                    return original_persist(file_name, payload)
+                    return original_persist(
+                        asset_directory,
+                        file_name,
+                        payload,
+                    )
 
                 def import_or_fail(payload: bytes) -> GeneratedModel:
                     nonlocal import_count
@@ -1196,9 +1355,9 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
                     side_effect=import_or_fail,
                 )
                 with (
-                    patch.object(
-                        self.workspace,
-                        "_persist_meshy_named_asset",
+                    patch(
+                        "housemaker.generation_workspace."
+                        "_persist_generated_named_asset",
                         side_effect=persist_or_fail,
                     ),
                     import_patch,
