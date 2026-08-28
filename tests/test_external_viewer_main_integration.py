@@ -115,6 +115,12 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
         )
         model = _generated_box_model()
         self.workspace.viewer.set_model(model)
+        self.workspace._remember_current_canvas_preview_model(
+            model,
+            validated_dependency_signature=(
+                self.workspace._build_viewer_preview_dependency_signature()
+            ),
+        )
 
         self._detach_viewer("screen:external-test")
         _qt_application.processEvents()
@@ -296,6 +302,39 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(assignment.assignment_id, "detached-wall")
 
+    def test_cached_surface_plane_preview_skips_state_clone_and_png_decode(
+        self,
+    ) -> None:
+        _assignment, _source_id, _atlas_id = self._seed_packed_wall_texture()
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        self.assertTrue(atlas_workspace.request_selected_object_preview())
+        cached_model = self.workspace.atlas_object_preview_viewer.model
+        self.assertIsNotNone(cached_model)
+
+        with (
+            patch.object(
+                self.workspace.surface_texture_generation,
+                "get_data",
+                side_effect=AssertionError("Surface data must not be cloned"),
+            ),
+            patch.object(
+                self.workspace,
+                "_build_atlas_wall_texture_source",
+                wraps=self.workspace._build_atlas_wall_texture_source,
+            ) as build_source,
+            patch(
+                "housemaker.main.build_texture_preview_plane_model"
+            ) as build_plane,
+        ):
+            self.assertTrue(atlas_workspace.request_selected_object_preview())
+
+        build_source.assert_not_called()
+        build_plane.assert_not_called()
+        self.assertIs(
+            self.workspace.atlas_object_preview_viewer.model,
+            cached_model,
+        )
+
     def test_delete_key_in_detached_atlas_viewer_unassigns_texture(self) -> None:
         assignment, source_id, atlas_id = self._seed_packed_wall_texture()
         atlas_workspace = self.workspace.texture_atlas_workspace
@@ -387,6 +426,30 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
             self.workspace.texture_atlas_workspace.status_label.text(),
         )
 
+    def test_repeated_missing_atlas_preview_clears_the_scene_once(self) -> None:
+        viewer = self.workspace.atlas_object_preview_viewer
+        viewer.set_model(_generated_box_model())
+        self.workspace._atlas_preview_variant_key = ("old-object", 1024)
+
+        with (
+            patch.object(
+                self.workspace.generation,
+                "get_texture_variant",
+                return_value=None,
+            ),
+            patch.object(
+                viewer,
+                "clear_model",
+                wraps=viewer.clear_model,
+            ) as clear_model,
+        ):
+            for _request_index in range(2):
+                self.workspace.texture_atlas_workspace \
+                    .object_preview_requested.emit("missing-object", 2048)
+                _qt_application.processEvents()
+
+        clear_model.assert_called_once_with()
+
     def test_complete_object_panel_is_visible_beside_external_viewer(
         self,
     ) -> None:
@@ -400,9 +463,12 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
         generation._sync_model_statistics(model)
         generation.generated_objects_list.addItem("Generated test object")
 
-        with patch(
-            "housemaker.main.resolve_fullscreen_3d_viewer_screen",
-            return_value=_primary_screen(),
+        with (
+            patch(
+                "housemaker.main.resolve_fullscreen_3d_viewer_screen",
+                return_value=_primary_screen(),
+            ),
+            patch.object(generation, "refresh_file_backed_previews"),
         ):
             combo.setCurrentIndex(combo.findData(screen_id))
             self.workspace.workspace_tabs.setCurrentWidget(generation)
@@ -470,9 +536,12 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
         generation.texture_view.set_uv_overlay_triangles(uv_triangles)
         generation.wireframe_checkbox.setChecked(True)
 
-        with patch(
-            "housemaker.main.resolve_fullscreen_3d_viewer_screen",
-            return_value=_primary_screen(),
+        with (
+            patch(
+                "housemaker.main.resolve_fullscreen_3d_viewer_screen",
+                return_value=_primary_screen(),
+            ),
+            patch.object(generation, "refresh_file_backed_previews"),
         ):
             combo.setCurrentIndex(combo.findData(screen_id))
             self.workspace.workspace_tabs.setCurrentWidget(generation)

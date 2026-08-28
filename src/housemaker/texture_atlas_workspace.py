@@ -138,6 +138,7 @@ class AtlasObjectTextureSource:
             raise ValueError("Atlas source texture must be 512, 1024, or 2048.")
         physical_texture_path = Path(self.physical_texture_path)
         rgba = _normalize_preview_rgba(self.preview_rgba)
+        rgba.setflags(write=False)
         if max(rgba.shape[:2]) > MAX_SOURCE_THUMBNAIL_SIZE:
             raise ValueError(
                 "Atlas source previews cannot exceed 256 pixels per side."
@@ -457,6 +458,7 @@ class TextureAtlasPreview(QWidget):
         self._atlas: TextureAtlasRecord | None = None
         self._sources: dict[str, AtlasObjectTextureSource] = {}
         self._source_preview_images: dict[str, QImage] = {}
+        self._content_signature: tuple[object, ...] | None = None
         self._selected_object_id: str | None = None
         self._drag_start_position: QPointF | None = None
         self._drag_object_id: str | None = None
@@ -471,12 +473,30 @@ class TextureAtlasPreview(QWidget):
         atlas: TextureAtlasRecord | None,
         sources: dict[str, AtlasObjectTextureSource],
     ) -> None:
+        content_signature = _build_atlas_preview_content_signature(
+            atlas,
+            sources,
+        )
+        if content_signature == self._content_signature:
+            self._clear_drag_slot_preview()
+            return
+
+        previous_sources = self._sources
+        previous_images = self._source_preview_images
+        source_preview_images: dict[str, QImage] = {}
+        for object_id, source in sources.items():
+            if (
+                previous_sources.get(object_id) is source
+                and object_id in previous_images
+            ):
+                source_preview_images[object_id] = previous_images[object_id]
+            else:
+                source_preview_images[object_id] = source.get_preview_image()
+
         self._atlas = atlas
         self._sources = dict(sources)
-        self._source_preview_images = {
-            object_id: source.get_preview_image()
-            for object_id, source in self._sources.items()
-        }
+        self._source_preview_images = source_preview_images
+        self._content_signature = content_signature
         self._drag_slot_preview = None
         self.update()
 
@@ -1128,6 +1148,8 @@ class TextureAtlasWorkspace(QWidget):
         self._lazy_materialization_error: tuple[str, str] | None = None
         self._is_syncing = False
         self._is_handling_object_click = False
+        self._is_coalescing_preview_requests = False
+        self._coalesced_preview_request_key: tuple[str, int] | None = None
         self._build_ui()
         self._refresh_all()
 
@@ -1189,6 +1211,69 @@ class TextureAtlasWorkspace(QWidget):
         self._refresh_all()
         self._emit_data_changed()
         return 1
+
+    def refresh_texture_source_content(
+        self,
+        source_ids: tuple[str, ...] | list[str],
+    ) -> bool:
+        """Atomically rewrite atlases whose source pixels changed in place."""
+
+        normalized_ids = tuple(
+            dict.fromkeys(
+                source_id
+                for source_id in (str(value).strip() for value in source_ids)
+                if source_id
+            )
+        )
+        if not normalized_ids:
+            return True
+        source_id_lookup = set(normalized_ids)
+        affected_atlases = tuple(
+            atlas
+            for atlas in self._data.atlases
+            if any(
+                placement.object_id in source_id_lookup
+                for placement in atlas.placements
+            )
+        )
+        if not affected_atlases:
+            return True
+
+        previous_data = self._data.clone()
+        previous_lazy_error = self._lazy_materialization_error
+        affected_atlas_ids = tuple(
+            atlas.atlas_id for atlas in affected_atlases
+        )
+        png_snapshots: dict[Path, bytes | None] = {}
+        try:
+            png_snapshots = self._snapshot_atlas_pngs(affected_atlas_ids)
+            for atlas in affected_atlases:
+                self._materialize_atlas(atlas)
+        except (OSError, TypeError, ValueError) as error:
+            self._data = previous_data
+            self._lazy_materialization_error = previous_lazy_error
+            restore_failures = _restore_atlas_png_snapshots(png_snapshots)
+            self._refresh_all()
+            self.status_label.setText(
+                "Texture content refresh blocked; existing atlas PNGs were "
+                f"kept: {error}"
+            )
+            if restore_failures:
+                self.status_label.setText(
+                    self.status_label.text()
+                    + f" {restore_failures} atlas PNG file(s) could not be "
+                    "restored."
+                )
+            return False
+
+        self._refresh_all()
+        self._emit_data_changed()
+        atlas_count = len(affected_atlases)
+        self.status_label.setText(
+            f"Refreshed source pixels in {atlas_count} texture atlas"
+            f"{'es' if atlas_count != 1 else ''}."
+        )
+        return True
 
     def remove_deleted_object(self, object_id: str) -> int:
         """Purge one explicitly deleted object from every atlas.
@@ -1820,17 +1905,28 @@ class TextureAtlasWorkspace(QWidget):
         """Request a 3D preview for the selected Atlas texture source."""
 
         object_id = self._selected_object_id()
-        source = self._sources_by_object_id.get(str(object_id))
+        source = (
+            None
+            if object_id is None
+            else self._sources_by_object_id.get(str(object_id))
+        )
+        resolution = self.get_selected_object_texture_resolution()
         if (
-            source is not None and not source.supports_3d_preview
-        ) or (
-            source is None and is_atlas_wall_texture_source_id(object_id)
+            object_id is None
+            or source is None
+            or not source.supports_3d_preview
+            or resolution is None
         ):
             self.object_preview_clear_requested.emit()
             return False
-        resolution = self.get_selected_object_texture_resolution()
-        if object_id is None or resolution is None:
-            return False
+        request_key = (object_id, resolution)
+        if (
+            self._is_coalescing_preview_requests
+            and request_key == self._coalesced_preview_request_key
+        ):
+            return True
+        if self._is_coalescing_preview_requests:
+            self._coalesced_preview_request_key = request_key
         self.object_preview_requested.emit(object_id, resolution)
         return True
 
@@ -2158,6 +2254,8 @@ class TextureAtlasWorkspace(QWidget):
             return
         object_id = selected_object_id
         self._is_handling_object_click = True
+        self._is_coalescing_preview_requests = True
+        self._coalesced_preview_request_key = None
         try:
             atlas = self.selected_atlas
             placement = (
@@ -2177,9 +2275,17 @@ class TextureAtlasWorkspace(QWidget):
                     object_id,
                     1 if int(direction) > 0 else -1,
                 )
+        except Exception:
+            self._is_coalescing_preview_requests = False
+            self._coalesced_preview_request_key = None
+            raise
         finally:
             self._is_handling_object_click = False
-        self.request_selected_object_preview()
+        try:
+            self.request_selected_object_preview()
+        finally:
+            self._is_coalescing_preview_requests = False
+            self._coalesced_preview_request_key = None
 
     def _cycle_object_texture_resolution(
         self,
@@ -2726,6 +2832,30 @@ class TextureAtlasWorkspace(QWidget):
         if candidate.suffix.lower() != ".png":
             return None
         return candidate
+
+
+# ### Atlas preview cache helpers ###
+def _build_atlas_preview_content_signature(
+    atlas: TextureAtlasRecord | None,
+    sources: dict[str, AtlasObjectTextureSource],
+) -> tuple[object, ...]:
+    """Snapshot layout state and immutable source identities for repainting."""
+
+    atlas_signature: tuple[object, ...] | None = None
+    if atlas is not None:
+        atlas_signature = (
+            atlas.atlas_id,
+            atlas.name,
+            int(atlas.resolution),
+            tuple(atlas.placements),
+        )
+    source_signature = tuple(
+        sorted(
+            (str(object_id), id(source))
+            for object_id, source in sources.items()
+        )
+    )
+    return atlas_signature, source_signature
 
 
 # ### Atlas PNG transaction helpers ###

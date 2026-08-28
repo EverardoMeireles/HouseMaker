@@ -315,6 +315,7 @@ class BlueprintCanvas(QWidget):
         self.floor_contour_vertex_ids: tuple[int, ...] = ()
         self.blueprint_image: QImage | None = None
         self.blueprint_path: str | None = None
+        self._blueprint_image_revision: tuple[object, ...] | None = None
         self.image_scale = DEFAULT_IMAGE_SCALE
         self.image_offset_x = DEFAULT_IMAGE_OFFSET
         self.image_offset_y = DEFAULT_IMAGE_OFFSET
@@ -386,7 +387,9 @@ class BlueprintCanvas(QWidget):
         floor_contour_vertex_ids: tuple[int, ...] = (),
         doorways: list[DoorwayData] | None = None,
     ) -> None:
+        revision_before = _build_blueprint_image_revision(file_path)
         image = _load_qimage_from_path(file_path)
+        revision_after = _build_blueprint_image_revision(file_path)
         self._set_level_contents(
             vertex_data=vertex_data or VertexData(),
             rooms=rooms,
@@ -397,6 +400,11 @@ class BlueprintCanvas(QWidget):
             image_offset_y=image_offset_y,
             floor_contour_vertex_ids=floor_contour_vertex_ids,
             doorways=doorways,
+            blueprint_revision=(
+                revision_after
+                if revision_before == revision_after
+                else None
+            ),
         )
 
     def set_level_vertex_data(
@@ -432,11 +440,25 @@ class BlueprintCanvas(QWidget):
         doorways: list[DoorwayData] | None = None,
     ) -> None:
         blueprint_image: QImage | None = None
-        if image_path and Path(image_path).exists():
+        blueprint_revision = (
+            None
+            if image_path is None
+            else _build_blueprint_image_revision(image_path)
+        )
+        if (
+            image_path
+            and blueprint_revision is not None
+            and _blueprint_revision_has_file(blueprint_revision)
+        ):
             try:
                 blueprint_image = _load_qimage_from_path(image_path)
             except ValueError:
                 blueprint_image = None
+                blueprint_revision = None
+            else:
+                revision_after = _build_blueprint_image_revision(image_path)
+                if blueprint_revision != revision_after:
+                    blueprint_revision = None
 
         self._set_level_contents(
             vertex_data=vertex_data,
@@ -448,6 +470,7 @@ class BlueprintCanvas(QWidget):
             image_offset_y=image_offset_y,
             floor_contour_vertex_ids=floor_contour_vertex_ids,
             doorways=doorways,
+            blueprint_revision=blueprint_revision,
         )
 
     def get_image_size_pixels(self) -> tuple[float, float] | None:
@@ -458,6 +481,36 @@ class BlueprintCanvas(QWidget):
             float(self.blueprint_image.width()),
             float(self.blueprint_image.height()),
         )
+
+    def get_blueprint_image_revision(self) -> tuple[object, ...] | None:
+        """Return the file revision validated for the displayed pixels."""
+
+        return self._blueprint_image_revision
+
+    def refresh_blueprint_image_if_stale(self) -> bool:
+        """Reload changed pixels without resetting Canvas editing state."""
+
+        if self.blueprint_path is None:
+            return False
+        next_revision = _build_blueprint_image_revision(self.blueprint_path)
+        if next_revision == self._blueprint_image_revision:
+            return False
+        if not _blueprint_revision_has_file(next_revision):
+            self.blueprint_image = None
+            self._blueprint_image_revision = next_revision
+            self.update()
+            return True
+        try:
+            blueprint_image = _load_qimage_from_path(self.blueprint_path)
+        except (OSError, ValueError):
+            return False
+        revision_after = _build_blueprint_image_revision(self.blueprint_path)
+        if next_revision != revision_after:
+            return False
+        self.blueprint_image = blueprint_image
+        self._blueprint_image_revision = revision_after
+        self.update()
+        return True
 
     def set_image_transform(
         self,
@@ -833,9 +886,11 @@ class BlueprintCanvas(QWidget):
         image_offset_y: float,
         floor_contour_vertex_ids: tuple[int, ...],
         doorways: list[DoorwayData] | None,
+        blueprint_revision: tuple[object, ...] | None,
     ) -> None:
         self.blueprint_image = blueprint_image
         self.blueprint_path = blueprint_path
+        self._blueprint_image_revision = blueprint_revision
         self.image_scale = max(0.01, float(image_scale))
         self.image_offset_x = float(image_offset_x)
         self.image_offset_y = float(image_offset_y)
@@ -4546,6 +4601,30 @@ def _points_are_coincident(
 
 
 # ### File helpers ###
+def _build_blueprint_image_revision(
+    file_path: str,
+) -> tuple[object, ...]:
+    """Identify one blueprint image revision without decoding pixels."""
+
+    normalized_path = str(Path(file_path).resolve())
+    try:
+        image_stat = Path(normalized_path).stat()
+    except OSError:
+        return normalized_path, None, None, None
+    return (
+        normalized_path,
+        int(image_stat.st_size),
+        int(image_stat.st_mtime_ns),
+        int(image_stat.st_ctime_ns),
+    )
+
+
+def _blueprint_revision_has_file(revision: tuple[object, ...]) -> bool:
+    """Distinguish a cacheable missing path from an existing image revision."""
+
+    return len(revision) == 4 and all(value is not None for value in revision[1:])
+
+
 def _load_qimage_from_path(file_path: str) -> QImage:
     image_bgr = cv2.imread(file_path, cv2.IMREAD_COLOR)
     if image_bgr is None:

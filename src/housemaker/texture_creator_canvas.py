@@ -32,6 +32,9 @@ class TextureCreatorCanvas(QWidget):
         self.wall_segment_count = 1
         self.image_path: str | None = None
         self.source_image = QImage()
+        self._context_cache_key: tuple[object, ...] | None = None
+        self._decoded_image_cache_key: tuple[object, ...] | None = None
+        self._decoded_source_image = QImage()
         self.drag_start_source_point = QPointF()
         self.drag_start_texture_data: WallTextureData | None = None
         self.setMinimumHeight(320)
@@ -44,16 +47,70 @@ class TextureCreatorCanvas(QWidget):
         image_path: str | None,
         segment_count: int = 1,
     ) -> None:
+        normalized_image_path = (
+            str(Path(image_path).resolve()) if image_path else None
+        )
+        image_cache_key = _build_image_cache_key(normalized_image_path)
         self.room = room
         self.wall_key = wall_key
         self.wall_aspect_ratio = _get_wall_aspect_ratio(wall_size)
         self.wall_segment_count = max(1, int(segment_count))
-        self.image_path = str(Path(image_path).resolve()) if image_path else None
-        self.source_image = QImage(self.image_path or "")
+        self.image_path = normalized_image_path
+        self.source_image = self._get_cached_source_image(image_cache_key)
+        loaded_image_cache_key = (
+            image_cache_key if not self.source_image.isNull() else None
+        )
+
+        context_cache_key = self._build_context_cache_key(
+            loaded_image_cache_key
+        )
+        if context_cache_key == self._context_cache_key:
+            self.update()
+            return
+
         changed = self._ensure_texture_data()
+        self._context_cache_key = self._build_context_cache_key(
+            loaded_image_cache_key
+        )
         self.update()
         if changed:
             self.texture_changed.emit()
+
+    # ### Context and image caches ###
+    def _get_cached_source_image(
+        self,
+        image_cache_key: tuple[object, ...] | None,
+    ) -> QImage:
+        """Reuse the decoded source while its path metadata stays unchanged."""
+
+        if image_cache_key is None or self.image_path is None:
+            return QImage()
+        if image_cache_key != self._decoded_image_cache_key:
+            if not Path(self.image_path).is_file():
+                self._decoded_source_image = QImage()
+                self._decoded_image_cache_key = image_cache_key
+                return self._decoded_source_image
+            decoded_image = _load_source_image(self.image_path)
+            if decoded_image.isNull():
+                return decoded_image
+            self._decoded_source_image = decoded_image
+            self._decoded_image_cache_key = image_cache_key
+        return self._decoded_source_image
+
+    def _build_context_cache_key(
+        self,
+        image_cache_key: tuple[object, ...] | None,
+    ) -> tuple[object, ...]:
+        """Capture context values that can initialize texture placement."""
+
+        return (
+            id(self.room),
+            self.wall_key,
+            self.wall_aspect_ratio.hex(),
+            self.wall_segment_count,
+            image_cache_key,
+            _build_wall_texture_cache_key(self._get_texture_data()),
+        )
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
         painter = QPainter(self)
@@ -364,6 +421,48 @@ class TextureCreatorCanvas(QWidget):
             (widget_point.x() - image_rect.left()) * scale_x,
             (widget_point.y() - image_rect.top()) * scale_y,
         )
+
+
+# ### Image cache helpers ###
+def _build_image_cache_key(
+    image_path: str | None,
+) -> tuple[object, ...] | None:
+    """Identify an image revision without decoding its pixels."""
+
+    if image_path is None:
+        return None
+    try:
+        image_stat = Path(image_path).stat()
+    except OSError:
+        return (image_path, None, None, None)
+    return (
+        image_path,
+        int(image_stat.st_mtime_ns),
+        int(image_stat.st_ctime_ns),
+        int(image_stat.st_size),
+    )
+
+
+def _load_source_image(image_path: str) -> QImage:
+    """Decode one source image on a cache miss."""
+
+    return QImage(image_path)
+
+
+def _build_wall_texture_cache_key(
+    texture_data: WallTextureData | None,
+) -> tuple[object, ...] | None:
+    """Identify external changes to the active wall's crop data."""
+
+    if texture_data is None:
+        return None
+    return (
+        texture_data.image_path,
+        float(texture_data.source_x).hex(),
+        float(texture_data.source_y).hex(),
+        float(texture_data.source_width).hex(),
+        float(texture_data.source_height).hex(),
+    )
 
 
 # ### Geometry helpers ###

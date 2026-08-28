@@ -74,7 +74,9 @@ from housemaker.glb import (
     build_stair_meshes,
     build_texture_preview_plane_model,
     compose_placed_generated_models,
+    compose_placed_generated_models_preview,
     convert_to_glb,
+    convert_to_preview_model,
     export_glb_file,
     export_room_texture_pngs,
     import_generated_glb,
@@ -284,9 +286,37 @@ class BlueprintWorkspace(QWidget):
         self._is_syncing_uv_controls = False
         self._is_viewer_refresh_scheduled = False
         self._scheduled_viewer_refresh_preserve_camera = True
+        self._viewer_preview_revision = 0
+        self._viewer_preview_model_revision = -1
+        self._canvas_viewer_preview_revision = -1
+        self._surface_viewer_preview_revision = -1
+        self._viewer_preview_model: GeneratedModel | None = None
+        self._viewer_preview_dependency_signature: tuple[object, ...] | None = (
+            None
+        )
+        self._viewer_preview_dependency_signature_revision = -1
+        self._canvas_3d_viewer_is_external = False
         self._atlas_generation_signature: tuple[tuple[object, ...], ...] | None = None
+        self._atlas_source_content_paths: (
+            dict[str, tuple[tuple[object, ...], ...]] | None
+        ) = None
+        self._atlas_source_content_revisions: (
+            dict[str, tuple[tuple[object, ...], ...]] | None
+        ) = None
+        self._atlas_pending_source_content_refresh_ids: set[str] = set()
         self._atlas_wall_texture_source_ids: set[str] = set()
         self._atlas_preview_variant_key: tuple[object, ...] | None = None
+        self._image_preview_source_key: tuple[object, ...] | None = None
+        self._image_preview_source_pixmap: QPixmap | None = None
+        self._image_preview_scaled_key: tuple[object, ...] | None = None
+        self._image_thumbnail_source_keys: dict[
+            str,
+            tuple[object, ...],
+        ] = {}
+        self._level_blueprint_image_revisions: dict[
+            int,
+            tuple[object, ...],
+        ] = {}
         self._canvas_window_undo_ids: list[str] = []
         self._object_placement_dialog: ObjectPlacementDialog | None = None
         self._object_placement_operation_id: str | None = None
@@ -983,9 +1013,12 @@ class BlueprintWorkspace(QWidget):
                 self._generals_spinbox_wheel_filter
             )
 
-        self.side_tabs.addTab(self._build_uvs_tab(), "UVs")
-        self.side_tabs.addTab(self._build_images_tab(), "Images")
+        self.uvs_tab = self._build_uvs_tab()
+        self.side_tabs.addTab(self.uvs_tab, "UVs")
+        self.images_tab = self._build_images_tab()
+        self.side_tabs.addTab(self.images_tab, "Images")
         self.side_tabs.addTab(self._build_texture_creator_tab(), "Texture creator")
+        self.side_tabs.currentChanged.connect(self._handle_side_tab_changed)
 
         splitter.addWidget(self.side_panel)
         splitter.setStretchFactor(0, 9)
@@ -1061,6 +1094,10 @@ class BlueprintWorkspace(QWidget):
     ) -> None:
         """Keep the Canvas workspace focused on 2D while 3D is external."""
 
+        is_active = bool(is_active)
+        if is_active == self._canvas_3d_viewer_is_external:
+            return
+        self._canvas_3d_viewer_is_external = is_active
         if is_active:
             self.canvas_viewer_tabs.setCurrentIndex(
                 self.canvas_2d_view_tab_index
@@ -1083,6 +1120,7 @@ class BlueprintWorkspace(QWidget):
 
         if tab_index == self.canvas_3d_view_tab_index:
             self.viewer.focus_navigation()
+            self._ensure_viewer_preview_current(preserve_camera=False)
 
     def _set_canvas_3d_navigation_shortcut(self, hotkey: str) -> None:
         """Apply the persisted Canvas-only navigation shortcut."""
@@ -1136,20 +1174,26 @@ class BlueprintWorkspace(QWidget):
             return
 
         try:
-            generated_model = self._build_generated_model(None)
+            validated_build = self._build_model_with_stable_dependencies(
+                lambda: self._build_viewer_preview_model(None)
+            )
         except Exception as error:
             self._rollback_canvas_window(window.window_id)
             self.viewer.set_window_tools_status(f"Window not added: {error}")
             return
-        if generated_model is None:
+        if validated_build is None:
             self._rollback_canvas_window(window.window_id)
             self.viewer.set_window_tools_status(
                 "Window not added because the updated model could not be built."
             )
             return
+        generated_model, dependency_signature = validated_build
 
         try:
-            self._apply_canvas_window_preview(generated_model)
+            self._apply_canvas_window_preview(
+                generated_model,
+                dependency_signature=dependency_signature,
+            )
         except Exception as error:
             self._rollback_canvas_window(window.window_id)
             self._restore_canvas_window_preview_after_rollback()
@@ -1177,7 +1221,9 @@ class BlueprintWorkspace(QWidget):
         level, window_index, window = removed
 
         try:
-            generated_model = self._build_generated_model(None)
+            validated_build = self._build_model_with_stable_dependencies(
+                lambda: self._build_viewer_preview_model(None)
+            )
         except Exception as error:
             level.windows.insert(window_index, window)
             self._sync_canvas_window_undo_availability()
@@ -1185,16 +1231,20 @@ class BlueprintWorkspace(QWidget):
                 f"Window could not be undone: {error}"
             )
             return
-        if generated_model is None:
+        if validated_build is None:
             level.windows.insert(window_index, window)
             self._sync_canvas_window_undo_availability()
             self.viewer.set_window_tools_status(
                 "Window could not be undone because the model could not be built."
             )
             return
+        generated_model, dependency_signature = validated_build
 
         try:
-            self._apply_canvas_window_preview(generated_model)
+            self._apply_canvas_window_preview(
+                generated_model,
+                dependency_signature=dependency_signature,
+            )
         except Exception as error:
             level.windows.insert(window_index, window)
             self._restore_canvas_window_preview_after_rollback()
@@ -1211,25 +1261,36 @@ class BlueprintWorkspace(QWidget):
     def _apply_canvas_window_preview(
         self,
         generated_model: GeneratedModel,
-    ) -> None:
-        """Refresh every 3D consumer from one committed window state."""
+        *,
+        dependency_signature: tuple[object, ...],
+    ) -> bool:
+        """Commit one validated window model to the active Canvas consumer."""
 
         wall_targets = tuple(build_fixed_surfaces(self.levels))
         self.viewer.set_wall_targets(wall_targets)
         self.viewer.set_model(generated_model, preserve_camera=True)
-        self.surface_texture_generation.set_levels(
-            self.levels,
-            self.initial_first_person_camera,
-        )
-        self.surface_texture_generation.set_preview_model(generated_model)
+        self._mark_viewer_preview_dirty(preserve_camera=True)
+        if self._remember_current_canvas_preview_model(
+            generated_model,
+            validated_dependency_signature=dependency_signature,
+        ):
+            return True
+        self._queue_viewer_preview_refresh()
+        return False
 
     def _restore_canvas_window_preview_after_rollback(self) -> None:
         """Best-effort repair after a display refresh failed mid-transaction."""
 
         try:
-            generated_model = self._build_generated_model(None)
-            if generated_model is not None:
-                self._apply_canvas_window_preview(generated_model)
+            validated_build = self._build_model_with_stable_dependencies(
+                lambda: self._build_viewer_preview_model(None)
+            )
+            if validated_build is not None:
+                generated_model, dependency_signature = validated_build
+                self._apply_canvas_window_preview(
+                    generated_model,
+                    dependency_signature=dependency_signature,
+                )
         except Exception:
             return
 
@@ -1551,10 +1612,6 @@ class BlueprintWorkspace(QWidget):
         self._set_current_level_image(file_path)
 
     def _handle_glb_export_clicked(self) -> None:
-        generated_model = self._build_generated_model("Export failed")
-        if generated_model is None:
-            return
-
         default_path = Path.cwd() / "housemaker_export.glb"
         file_path, _ = QFileDialog.getSaveFileName(
             self,
@@ -1570,13 +1627,31 @@ class BlueprintWorkspace(QWidget):
             export_path = export_path.with_suffix(".glb")
 
         try:
+            validated_build = self._build_model_with_stable_dependencies(
+                lambda: self._build_generated_model("Export failed")
+            )
+        except RuntimeError as error:
+            QMessageBox.warning(self, "Export blocked", str(error))
+            return
+        if validated_build is None:
+            return
+        generated_model, dependency_signature = validated_build
+
+        try:
             exported_path = export_glb_file(generated_model, export_path)
         except OSError as error:
             QMessageBox.critical(self, "Export failed", str(error))
             return
 
         self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
+        self.viewer.set_wall_targets(tuple(build_fixed_surfaces(self.levels)))
         self.viewer.set_model(generated_model)
+        if not self._remember_current_canvas_preview_model(
+            generated_model,
+            validated_dependency_signature=dependency_signature,
+        ):
+            self._mark_viewer_preview_dirty(preserve_camera=False)
+            self._queue_viewer_preview_refresh()
         QMessageBox.information(
             self,
             "GLB exported",
@@ -1615,6 +1690,106 @@ class BlueprintWorkspace(QWidget):
             f"Saved {len(exported_paths)} PNG texture(s) to:\n{directory_path}",
         )
 
+    # ### Workspace tab activation ###
+    def _handle_side_tab_changed(self, tab_index: int) -> None:
+        """Refresh only file-backed content owned by the visible side tab."""
+
+        self._sync_visible_side_tab(self.side_tabs.widget(tab_index))
+
+    def _sync_visible_side_tab(self, selected_widget: QWidget | None) -> None:
+        """Recheck cheap revisions without rebuilding unrelated side tabs."""
+
+        if selected_widget is self.images_tab:
+            self._refresh_stale_image_thumbnails()
+            self._sync_images_tab()
+        elif selected_widget is self.texture_creator_tab:
+            self._sync_texture_creator_canvas()
+
+    def _refresh_blueprint_file_dependencies(
+        self,
+        *,
+        include_exported_levels: bool,
+    ) -> None:
+        """Refresh changed blueprint pixels and geometry dimensions by revision."""
+
+        geometry_dimensions_changed = False
+        current_level = (
+            self.levels[self.current_level_index]
+            if 0 <= self.current_level_index < len(self.levels)
+            else None
+        )
+        if current_level is not None:
+            current_image_changed = (
+                self.canvas.refresh_blueprint_image_if_stale()
+            )
+            current_revision = self.canvas.get_blueprint_image_revision()
+            if current_image_changed:
+                refreshed_image_size = self.canvas.get_image_size_pixels()
+                if (
+                    refreshed_image_size is not None
+                    and refreshed_image_size
+                    != current_level.image_size_pixels
+                ):
+                    current_level.image_size_pixels = refreshed_image_size
+                    geometry_dimensions_changed = True
+                self._update_blueprint_name_label()
+            if current_revision is not None:
+                self._level_blueprint_image_revisions[
+                    current_level.index
+                ] = current_revision
+
+        if include_exported_levels:
+            exported_level_indices = {
+                level.index for level in self.levels if level.include_in_export
+            }
+            self._level_blueprint_image_revisions = {
+                level_index: revision
+                for level_index, revision
+                in self._level_blueprint_image_revisions.items()
+                if level_index in exported_level_indices
+            }
+            for level in self.levels:
+                if (
+                    not level.include_in_export
+                    or (
+                        current_level is not None
+                        and level.index == current_level.index
+                    )
+                    or level.image_path is None
+                ):
+                    continue
+                revision_before = _build_local_file_revision(level.image_path)
+                if (
+                    self._level_blueprint_image_revisions.get(level.index)
+                    == revision_before
+                ):
+                    continue
+                if not _local_file_revision_has_file(revision_before):
+                    self._level_blueprint_image_revisions[
+                        level.index
+                    ] = revision_before
+                    continue
+                try:
+                    with Image.open(level.image_path) as blueprint_image:
+                        image_size = (
+                            float(blueprint_image.width),
+                            float(blueprint_image.height),
+                        )
+                except (OSError, TypeError, ValueError):
+                    continue
+                revision_after = _build_local_file_revision(level.image_path)
+                if revision_before != revision_after:
+                    continue
+                self._level_blueprint_image_revisions[
+                    level.index
+                ] = revision_after
+                if image_size != level.image_size_pixels:
+                    level.image_size_pixels = image_size
+                    geometry_dimensions_changed = True
+
+        if geometry_dimensions_changed:
+            self._mark_viewer_preview_dirty(preserve_camera=False)
+
     def _handle_workspace_tab_changed(self, tab_index: int) -> None:
         selected_widget = self.workspace_tabs.widget(tab_index)
         is_full_width_workspace = selected_widget in (
@@ -1625,14 +1800,15 @@ class BlueprintWorkspace(QWidget):
         )
         self.side_panel.setVisible(not is_full_width_workspace)
         if selected_widget is self.surface_texture_generation:
-            self.surface_texture_generation.set_levels(
-                self.levels,
-                self.initial_first_person_camera,
-            )
-            self._schedule_viewer_preview_refresh(preserve_camera=True)
+            self.surface_texture_generation.refresh_file_backed_previews()
+            self._ensure_viewer_preview_current(preserve_camera=True)
+        elif selected_widget is self.texture_atlas_workspace:
+            self._sync_atlas_object_texture_sources()
+        elif selected_widget is self.generation:
+            self.generation.refresh_file_backed_previews()
 
         self._apply_fullscreen_3d_viewer_screen(
-            self.settings_widget.get_settings().fullscreen_3d_viewer_screen_id
+            self.settings_widget.get_fullscreen_3d_viewer_screen_id()
         )
         if is_full_width_workspace:
             return
@@ -1640,7 +1816,12 @@ class BlueprintWorkspace(QWidget):
         if selected_widget is not self.canvas_viewer_workspace:
             return
 
-        self._schedule_viewer_preview_refresh(preserve_camera=False)
+        if not self._viewer_preview_is_active():
+            self._refresh_blueprint_file_dependencies(
+                include_exported_levels=False
+            )
+        self._sync_visible_side_tab(self.side_tabs.currentWidget())
+        self._ensure_viewer_preview_current(preserve_camera=False)
 
     def _handle_generation_data_changed_for_atlases(
         self,
@@ -1649,6 +1830,7 @@ class BlueprintWorkspace(QWidget):
         """Refresh Atlas object choices after generation, deletion, or selection."""
 
         self._sync_atlas_object_texture_sources()
+        self._request_hosted_atlas_object_preview()
 
     # ### Generated-object placement ###
     def _handle_object_placement_requested(
@@ -1829,6 +2011,23 @@ class BlueprintWorkspace(QWidget):
         # The gizmo already updated its independent preview root. Emitting the
         # ordinary placement signals here would serialize and rebuild both 3D
         # previews, even though only this retained transform changed.
+        canvas_was_current = (
+            self._canvas_viewer_preview_revision
+            == self._viewer_preview_revision
+        )
+        dependency_signature_before: tuple[object, ...] | None = None
+        if canvas_was_current:
+            current_dependency_signature = (
+                self._build_viewer_preview_dependency_signature()
+            )
+            canvas_was_current = bool(
+                self._viewer_preview_dependency_signature_revision
+                == self._viewer_preview_revision
+                and current_dependency_signature
+                == self._viewer_preview_dependency_signature
+            )
+            if canvas_was_current:
+                dependency_signature_before = current_dependency_signature
         was_updated = self.generation.update_generated_object_placement(
             normalized_object_id,
             placement,
@@ -1836,6 +2035,31 @@ class BlueprintWorkspace(QWidget):
         )
         if not was_updated:
             self._schedule_viewer_preview_refresh(preserve_camera=True)
+            return
+
+        revision = self._mark_viewer_preview_dirty(preserve_camera=True)
+        dependency_signature_after = (
+            self._build_viewer_preview_dependency_signature()
+            if canvas_was_current
+            else None
+        )
+        if (
+            dependency_signature_before is not None
+            and dependency_signature_after is not None
+            and self._dependency_change_is_only_target_placement(
+                dependency_signature_before,
+                dependency_signature_after,
+                normalized_object_id,
+                placement,
+            )
+        ):
+            self._canvas_viewer_preview_revision = revision
+            self._viewer_preview_dependency_signature = (
+                dependency_signature_after
+            )
+            self._viewer_preview_dependency_signature_revision = revision
+            return
+        self._queue_viewer_preview_refresh()
 
     def _handle_generated_object_deleted_for_canvas(
         self,
@@ -1966,14 +2190,11 @@ class BlueprintWorkspace(QWidget):
 
         try:
             asset_path = Path(variant.glb_asset_path)
-            asset_stat = asset_path.stat()
             symmetry = self.generation.get_object_symmetric_division(object_id)
             variant_key = (
                 str(variant.object_id),
                 int(variant.resolution),
-                str(asset_path.resolve()),
-                int(asset_stat.st_mtime_ns),
-                int(asset_stat.st_size),
+                _build_local_file_revision(asset_path),
                 None if symmetry is None else symmetry.orientation,
                 None if symmetry is None else symmetry.plane_coordinate,
                 None if symmetry is None else getattr(symmetry, "version", None),
@@ -2029,24 +2250,35 @@ class BlueprintWorkspace(QWidget):
         """Display one exact Atlas wall texture on an upright square plane."""
 
         assignment_id = get_atlas_wall_texture_assignment_id(source_id)
-        surface_data = self.surface_texture_generation.get_data()
-        assignment = next(
-            (
-                candidate
-                for candidate in surface_data.assignments
-                if candidate.assignment_id == assignment_id
-            ),
-            None,
-        )
-        source = (
+        try:
+            normalized_resolution = int(texture_resolution)
+        except (TypeError, ValueError, OverflowError):
+            normalized_resolution = -1
+        assignment = (
             None
-            if assignment is None
-            else self._build_atlas_wall_texture_source(
-                assignment,
-                texture_resolution if assignment.texture_variants else None,
+            if assignment_id is None
+            else self.surface_texture_generation.get_assignment(
+                assignment_id
             )
         )
-        if source is None:
+        requested_resolution = (
+            normalized_resolution
+            if assignment is not None and assignment.texture_variants
+            else None
+        )
+        asset_path = (
+            None
+            if assignment is None
+            else self.surface_texture_generation.get_assignment_asset_path(
+                assignment.assignment_id,
+                requested_resolution,
+            )
+        )
+        if (
+            assignment is None
+            or asset_path is None
+            or normalized_resolution <= 0
+        ):
             self._clear_atlas_object_preview()
             self._append_atlas_preview_status(
                 "The selected surface texture preview is unavailable."
@@ -2054,14 +2286,10 @@ class BlueprintWorkspace(QWidget):
             return
 
         try:
-            asset_path = source.physical_texture_path
-            asset_stat = asset_path.stat()
             preview_key = (
-                source.object_id,
-                source.texture_resolution,
-                str(asset_path.resolve()),
-                int(asset_stat.st_mtime_ns),
-                int(asset_stat.st_size),
+                source_id,
+                normalized_resolution,
+                _build_local_file_revision(asset_path),
                 "surface_texture_plane",
             )
             if (
@@ -2069,6 +2297,12 @@ class BlueprintWorkspace(QWidget):
                 and self.atlas_object_preview_viewer.model is not None
             ):
                 return
+            source = self._build_atlas_wall_texture_source(
+                assignment,
+                requested_resolution,
+            )
+            if source is None:
+                raise ValueError("The surface texture source is unavailable.")
             model = build_texture_preview_plane_model(
                 source.load_texture_rgba()
             )
@@ -2082,7 +2316,7 @@ class BlueprintWorkspace(QWidget):
 
         preserve_camera = (
             self._atlas_preview_variant_key is not None
-            and self._atlas_preview_variant_key[0] == source.object_id
+            and self._atlas_preview_variant_key[0] == source_id
         )
         self.atlas_object_preview_viewer.set_model(
             model,
@@ -2128,14 +2362,8 @@ class BlueprintWorkspace(QWidget):
     ) -> bool:
         """Commit a Surface-tab choice together with every Atlas placement."""
 
-        surface_data = self.surface_texture_generation.get_data()
-        assignment = next(
-            (
-                candidate
-                for candidate in surface_data.assignments
-                if candidate.assignment_id == str(assignment_id).strip()
-            ),
-            None,
+        assignment = self.surface_texture_generation.get_assignment(
+            assignment_id
         )
         if assignment is None:
             return False
@@ -2290,6 +2518,11 @@ class BlueprintWorkspace(QWidget):
     def _clear_atlas_object_preview(self) -> None:
         """Drop stale Atlas preview content and its cached selection key."""
 
+        if (
+            self._atlas_preview_variant_key is None
+            and self.atlas_object_preview_viewer.model is None
+        ):
+            return
         self._atlas_preview_variant_key = None
         self.atlas_object_preview_viewer.clear_model()
 
@@ -2298,24 +2531,46 @@ class BlueprintWorkspace(QWidget):
 
         active_variants: list[tuple[object, object | None]] = []
         signature_items: list[tuple[object, ...]] = []
-        generation_data = self.generation.get_data()
-        generated_object_ids = {
-            record.object_id for record in generation_data.generated_objects
-        }
-        for record in generation_data.generated_objects:
+        source_content_paths: dict[
+            str,
+            tuple[tuple[object, ...], ...],
+        ] = {}
+        source_content_revisions: dict[
+            str,
+            tuple[tuple[object, ...], ...],
+        ] = {}
+        generated_object_ids = self.generation.get_generated_object_ids()
+        generated_object_id_lookup = set(generated_object_ids)
+        for object_id in generated_object_ids:
             variant = self.generation.get_active_texture_variant(
-                record.object_id
+                object_id
             )
             symmetry = self.generation.get_object_symmetric_division(
-                record.object_id
+                object_id
+            )
+            texture_variant_signature = (
+                self.generation.get_texture_variant_dependency_signature(
+                    object_id
+                )
+            )
+            texture_source_signature = tuple(
+                (item[0], item[3], item[4])
+                for item in texture_variant_signature
+            )
+            source_content_paths[object_id] = tuple(
+                (item[0], item[3]) for item in texture_variant_signature
+            )
+            source_content_revisions[object_id] = tuple(
+                (item[0], item[4]) for item in texture_variant_signature
             )
             if variant is None:
                 signature_items.append(
                     (
                         "object",
-                        record.object_id,
+                        object_id,
                         0,
                         "",
+                        texture_source_signature,
                         None if symmetry is None else symmetry.orientation,
                         None if symmetry is None else symmetry.plane_coordinate,
                         (
@@ -2353,9 +2608,10 @@ class BlueprintWorkspace(QWidget):
             signature_items.append(
                 (
                     "object",
-                    record.object_id,
+                    object_id,
                     int(getattr(variant, "resolution")),
                     str(getattr(variant, "texture_asset_relative_path")),
+                    texture_source_signature,
                     None if symmetry is None else symmetry.orientation,
                     None if symmetry is None else symmetry.kept_side,
                     None if symmetry is None else symmetry.plane_coordinate,
@@ -2382,43 +2638,38 @@ class BlueprintWorkspace(QWidget):
                 )
             )
 
-        surface_data = self.surface_texture_generation.get_data()
-        wall_assignments = [
-            assignment
-            for assignment in surface_data.assignments
-            if assignment.surface_type == SURFACE_TYPE_WALL
-        ]
+        wall_assignments = list(
+            self.surface_texture_generation.get_wall_assignments()
+        )
         for assignment in wall_assignments:
             variant_signature: list[tuple[object, ...]] = []
-            candidate_resolutions = (
-                tuple(
-                    variant.resolution
-                    for variant in assignment.texture_variants
-                )
+            candidate_variants = (
+                tuple(assignment.texture_variants)
                 if assignment.texture_variants
                 else (None,)
             )
-            for resolution in candidate_resolutions:
+            for texture_variant in candidate_variants:
+                resolution = (
+                    None
+                    if texture_variant is None
+                    else texture_variant.resolution
+                )
+                logical_path = (
+                    assignment.asset_path
+                    if texture_variant is None
+                    else texture_variant.asset_path
+                )
                 physical_path = (
                     self.surface_texture_generation.get_assignment_asset_path(
                         assignment.assignment_id,
                         resolution,
                     )
                 )
-                try:
-                    asset_stat = (
-                        None if physical_path is None else physical_path.stat()
-                    )
-                except OSError:
-                    asset_stat = None
                 variant_signature.append(
                     (
                         resolution,
-                        ""
-                        if physical_path is None
-                        else str(physical_path.resolve()),
-                        0 if asset_stat is None else int(asset_stat.st_mtime_ns),
-                        0 if asset_stat is None else int(asset_stat.st_size),
+                        str(logical_path),
+                        _build_local_file_revision(physical_path),
                     )
                 )
             signature_items.append(
@@ -2433,18 +2684,51 @@ class BlueprintWorkspace(QWidget):
                     tuple(variant_signature),
                 )
             )
+            wall_source_id = build_atlas_wall_texture_source_id(
+                assignment.assignment_id
+            )
+            if wall_source_id not in generated_object_id_lookup:
+                source_content_paths[wall_source_id] = tuple(
+                    (resolution, logical_path)
+                    for resolution, logical_path, _revision in variant_signature
+                )
+                source_content_revisions[wall_source_id] = tuple(
+                    (resolution, revision)
+                    for resolution, _logical_path, revision in variant_signature
+                )
         signature = tuple(signature_items)
         if signature == self._atlas_generation_signature:
+            self._request_hosted_atlas_object_preview()
             return
+        changed_source_ids = tuple(
+            source_id
+            for source_id, content_revision in source_content_revisions.items()
+            if (
+                self._atlas_source_content_paths is not None
+                and self._atlas_source_content_revisions is not None
+                and source_id in self._atlas_source_content_revisions
+                and self._atlas_source_content_paths.get(source_id)
+                == source_content_paths.get(source_id)
+                and self._atlas_source_content_revisions.get(source_id)
+                != content_revision
+            )
+        )
 
         active_sources: list[AtlasObjectTextureSource] = []
+        available_source_ids: set[str] = set()
+        failed_source_ids: set[str] = set()
+        source_build_failed = False
         for variant, symmetry in active_variants:
             source = self._build_atlas_object_texture_source(
                 variant,
                 symmetry,
             )
-            if source is not None:
-                active_sources.append(source)
+            if source is None:
+                source_build_failed = True
+                failed_source_ids.add(str(getattr(variant, "object_id")))
+                continue
+            active_sources.append(source)
+            available_source_ids.add(str(getattr(variant, "object_id")))
         wall_sources: dict[str, AtlasObjectTextureSource] = {}
         wall_assignments_by_source_id: dict[str, SurfaceTextureAssignment] = {}
         colliding_wall_texture_count = 0
@@ -2452,14 +2736,45 @@ class BlueprintWorkspace(QWidget):
             wall_source_id = build_atlas_wall_texture_source_id(
                 assignment.assignment_id
             )
-            if wall_source_id in generated_object_ids:
+            if wall_source_id in generated_object_id_lookup:
                 colliding_wall_texture_count += 1
                 continue
+            active_resolution = (
+                assignment.selected_texture_resolution
+                if assignment.texture_variants
+                else None
+            )
+            if (
+                self.surface_texture_generation.get_assignment_asset_path(
+                    assignment.assignment_id,
+                    active_resolution,
+                )
+                is None
+            ):
+                continue
             source = self._build_atlas_wall_texture_source(assignment)
-            if source is not None:
-                active_sources.append(source)
-                wall_sources[source.object_id] = source
-                wall_assignments_by_source_id[source.object_id] = assignment
+            if source is None:
+                source_build_failed = True
+                failed_source_ids.add(wall_source_id)
+                continue
+            active_sources.append(source)
+            available_source_ids.add(wall_source_id)
+            wall_sources[source.object_id] = source
+            wall_assignments_by_source_id[source.object_id] = assignment
+
+        self._atlas_pending_source_content_refresh_ids.update(
+            failed_source_ids
+        )
+        refreshable_source_ids = tuple(
+            source_id
+            for source_id in dict.fromkeys(
+                (
+                    *changed_source_ids,
+                    *self._atlas_pending_source_content_refresh_ids,
+                )
+            )
+            if source_id in available_source_ids
+        )
 
         def resolve_variant(
             object_id: str,
@@ -2511,8 +2826,23 @@ class BlueprintWorkspace(QWidget):
             variant_resolver=resolve_variant,
             selectability_resolver=is_variant_selectable,
         )
+        if not self.texture_atlas_workspace.refresh_texture_source_content(
+            refreshable_source_ids
+        ):
+            self._atlas_pending_source_content_refresh_ids.update(
+                refreshable_source_ids
+            )
+            self._atlas_generation_signature = None
+            return
+        self._atlas_pending_source_content_refresh_ids.difference_update(
+            refreshable_source_ids
+        )
         self._atlas_wall_texture_source_ids.update(wall_sources)
-        self._atlas_generation_signature = signature
+        self._atlas_generation_signature = (
+            None if source_build_failed else signature
+        )
+        self._atlas_source_content_paths = source_content_paths
+        self._atlas_source_content_revisions = source_content_revisions
         self._request_hosted_atlas_object_preview()
         if colliding_wall_texture_count:
             self._append_atlas_preview_status(
@@ -2618,11 +2948,9 @@ class BlueprintWorkspace(QWidget):
             )
             if requested_resolution is None:
                 return None
-        physical_path = (
-            self.surface_texture_generation.get_assignment_asset_path(
-                assignment.assignment_id,
-                requested_resolution,
-            )
+        physical_path = self.surface_texture_generation.get_assignment_asset_path(
+            assignment.assignment_id,
+            requested_resolution if supports_resolution_changes else None,
         )
         if physical_path is None:
             return None
@@ -2638,10 +2966,14 @@ class BlueprintWorkspace(QWidget):
                 asset_path = variant.asset_path
             else:
                 with Image.open(physical_path) as image:
-                    texture_resolution = choose_atlas_texture_resolution(
-                        image.width,
-                        image.height,
+                    natural_resolution = choose_atlas_texture_resolution(
+                        image.width, image.height
                     )
+                texture_resolution = (
+                    natural_resolution
+                    if resolution is None
+                    else int(resolution)
+                )
                 fit_to_square = True
                 asset_path = assignment.asset_path
             surface_count = len(assignment.surface_ids)
@@ -2677,15 +3009,24 @@ class BlueprintWorkspace(QWidget):
     ) -> None:
         """Show the active workspace's 3D view on its chosen display."""
 
+        if screen_id is None and not self._external_viewer_host.is_active:
+            return
         screen = resolve_fullscreen_3d_viewer_screen(screen_id)
         viewer = self._active_workspace_3d_viewer()
         if screen is None or viewer is None:
+            if not self._external_viewer_host.is_active:
+                return
             self._external_viewer_host.restore()
             self._sync_external_3d_workspace_presentations()
             return
         self._external_viewer_host.show_on_screen(viewer, screen)
         self._sync_external_3d_workspace_presentations()
         self._request_hosted_atlas_object_preview()
+        if (
+            viewer is self.viewer
+            or viewer is self.surface_texture_generation.surface_view
+        ):
+            self._ensure_viewer_preview_current(preserve_camera=True)
 
     def _sync_external_3d_workspace_presentations(self) -> None:
         """Show each workspace's local replacement for its detached 3D view."""
@@ -2727,18 +3068,197 @@ class BlueprintWorkspace(QWidget):
         ):
             self.texture_atlas_workspace.request_selected_object_preview()
 
-    def _viewer_preview_is_active(self) -> bool:
-        return (
-            self.workspace_tabs.currentWidget()
-            in (
-                self.canvas_viewer_workspace,
-                self.surface_texture_generation,
+    # ### Shared 3D preview cache ###
+    def _canvas_viewer_preview_is_active(self) -> bool:
+        return bool(
+            (
+                self.workspace_tabs.currentWidget()
+                is self.canvas_viewer_workspace
+                and self.canvas_viewer_tabs.currentIndex()
+                == self.canvas_3d_view_tab_index
             )
             or (
                 self._external_viewer_host.is_active
                 and self._external_viewer_host.viewer is self.viewer
             )
         )
+
+    def _surface_viewer_preview_is_active(self) -> bool:
+        return bool(
+            self.workspace_tabs.currentWidget()
+            is self.surface_texture_generation
+            or (
+                self._external_viewer_host.is_active
+                and self._external_viewer_host.viewer
+                is self.surface_texture_generation.surface_view
+            )
+        )
+
+    def _viewer_preview_is_active(self) -> bool:
+        return bool(
+            self._canvas_viewer_preview_is_active()
+            or self._surface_viewer_preview_is_active()
+        )
+
+    def _active_viewer_preview_needs_refresh(self) -> bool:
+        revision = self._viewer_preview_revision
+        return bool(
+            (
+                self._canvas_viewer_preview_is_active()
+                and self._canvas_viewer_preview_revision != revision
+            )
+            or (
+                self._surface_viewer_preview_is_active()
+                and self._surface_viewer_preview_revision != revision
+            )
+        )
+
+    def _remember_current_canvas_preview_model(
+        self,
+        generated_model: GeneratedModel,
+        *,
+        validated_dependency_signature: tuple[object, ...],
+    ) -> bool:
+        """Cache an installed Canvas model only for validated dependencies."""
+
+        if not isinstance(generated_model, GeneratedModel):
+            raise TypeError("Canvas previews require a GeneratedModel.")
+        current_dependency_signature = (
+            self._build_viewer_preview_dependency_signature()
+        )
+        if current_dependency_signature != validated_dependency_signature:
+            return False
+        revision = self._viewer_preview_revision
+        self._viewer_preview_model = generated_model
+        self._viewer_preview_model_revision = revision
+        self._viewer_preview_dependency_signature = current_dependency_signature
+        self._viewer_preview_dependency_signature_revision = revision
+        self._canvas_viewer_preview_revision = revision
+        self._scheduled_viewer_refresh_preserve_camera = True
+        return True
+
+    def _build_viewer_preview_dependency_signature(
+        self,
+    ) -> tuple[object, ...]:
+        """Snapshot file-backed inputs that can change without a Qt signal."""
+
+        room_texture_signature = tuple(
+            (
+                level.index,
+                room_index,
+                wall_key,
+                texture_data.image_path,
+                float(texture_data.source_x).hex(),
+                float(texture_data.source_y).hex(),
+                float(texture_data.source_width).hex(),
+                float(texture_data.source_height).hex(),
+                _build_local_file_revision(texture_data.image_path),
+            )
+            for level in self.levels
+            for room_index, room in enumerate(level.rooms)
+            for wall_key, texture_data in sorted(room.wall_textures.items())
+        )
+        return (
+            room_texture_signature,
+            self.generation.get_placed_preview_dependency_signature(),
+            self.surface_texture_generation.get_preview_dependency_signature(),
+        )
+
+    @staticmethod
+    def _dependency_change_is_only_target_placement(
+        signature_before: tuple[object, ...],
+        signature_after: tuple[object, ...],
+        object_id: str,
+        placement: GeneratedObjectPlacement,
+    ) -> bool:
+        """Accept a gizmo fast path only when no unrelated input changed."""
+
+        if signature_before == signature_after:
+            return True
+        if len(signature_before) != 3 or len(signature_after) != 3:
+            return False
+        if (
+            signature_before[0] != signature_after[0]
+            or signature_before[2] != signature_after[2]
+        ):
+            return False
+        placed_before = signature_before[1]
+        placed_after = signature_after[1]
+        if not isinstance(placed_before, tuple) or not isinstance(
+            placed_after,
+            tuple,
+        ):
+            return False
+        if len(placed_before) != len(placed_after):
+            return False
+
+        target_count = 0
+        for item_before, item_after in zip(
+            placed_before,
+            placed_after,
+            strict=True,
+        ):
+            if (
+                not isinstance(item_before, tuple)
+                or not isinstance(item_after, tuple)
+                or len(item_before) < 2
+                or len(item_before) != len(item_after)
+                or item_before[0] != item_after[0]
+            ):
+                return False
+            if item_before[0] != object_id:
+                if item_before != item_after:
+                    return False
+                continue
+            target_count += 1
+            if item_after[1] != placement:
+                return False
+            if (
+                item_before[:1] + item_before[2:]
+                != item_after[:1] + item_after[2:]
+            ):
+                return False
+        return target_count == 1
+
+    def _build_model_with_stable_dependencies(
+        self,
+        builder: Callable[[], GeneratedModel | None],
+    ) -> tuple[GeneratedModel, tuple[object, ...]] | None:
+        """Build once and reject a model assembled across file revisions."""
+
+        dependency_signature_before = (
+            self._build_viewer_preview_dependency_signature()
+        )
+        generated_model = builder()
+        if generated_model is None:
+            return None
+        dependency_signature_after = (
+            self._build_viewer_preview_dependency_signature()
+        )
+        if dependency_signature_before != dependency_signature_after:
+            raise RuntimeError(
+                "Preview inputs changed while the model was being built. "
+                "Try the operation again."
+            )
+        return generated_model, dependency_signature_after
+
+    def _invalidate_viewer_preview_for_dependency_changes(
+        self,
+        preserve_camera: bool,
+    ) -> None:
+        """Advance the preview revision after an out-of-band asset change."""
+
+        if (
+            self._viewer_preview_dependency_signature_revision
+            != self._viewer_preview_revision
+        ):
+            return
+        dependency_signature = (
+            self._build_viewer_preview_dependency_signature()
+        )
+        if dependency_signature == self._viewer_preview_dependency_signature:
+            return
+        self._mark_viewer_preview_dirty(preserve_camera=preserve_camera)
 
     def _build_generated_model(
         self,
@@ -2756,6 +3276,32 @@ class BlueprintWorkspace(QWidget):
             if not placed_models:
                 return base_model
             return compose_placed_generated_models(
+                base_model,
+                placed_models,
+            )
+        except (TypeError, ValueError) as error:
+            if failure_title is not None:
+                QMessageBox.warning(self, failure_title, str(error))
+            return None
+
+    def _build_viewer_preview_model(
+        self,
+        failure_title: str | None,
+    ) -> GeneratedModel | None:
+        """Build render data without paying the GLB serialization cost."""
+
+        try:
+            base_model = convert_to_preview_model(
+                self.levels,
+                stairs=self.stairs,
+                surface_materials=(
+                    self.surface_texture_generation.get_surface_material_sources()
+                ),
+            )
+            placed_models = self._build_placed_generated_models()
+            if not placed_models:
+                return base_model
+            return compose_placed_generated_models_preview(
                 base_model,
                 placed_models,
             )
@@ -2790,7 +3336,15 @@ class BlueprintWorkspace(QWidget):
                 record.object_id
             )
             if generated_model is None:
-                continue
+                if not self.generation.is_generated_object_asset_available(
+                    record.object_id
+                ):
+                    continue
+                raise ValueError(
+                    f"Placed object '{getattr(record, 'object_name', record.object_id)}' "
+                    "is temporarily "
+                    "unavailable."
+                )
             symmetry = self.generation.resolve_symmetric_division_for_record(
                 record
             )
@@ -2829,39 +3383,130 @@ class BlueprintWorkspace(QWidget):
         self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     def _refresh_viewer_preview(self, preserve_camera: bool = False) -> None:
-        generated_model = self._build_generated_model(None)
-        if generated_model is None:
-            self.viewer.set_wall_targets(())
-            self.viewer.clear_model()
-            self.surface_texture_generation.set_preview_model(None)
-            self._sync_canvas_window_undo_availability()
+        revision = self._viewer_preview_revision
+        canvas_is_stale = bool(
+            self._canvas_viewer_preview_is_active()
+            and self._canvas_viewer_preview_revision != revision
+        )
+        surface_is_stale = bool(
+            self._surface_viewer_preview_is_active()
+            and self._surface_viewer_preview_revision != revision
+        )
+        if not canvas_is_stale and not surface_is_stale:
             return
 
-        self.viewer.set_wall_targets(tuple(build_fixed_surfaces(self.levels)))
-        self.viewer.set_model(generated_model, preserve_camera=preserve_camera)
-        self.surface_texture_generation.set_preview_model(generated_model)
-        self._sync_canvas_window_undo_availability()
+        if self._viewer_preview_model_revision != revision:
+            dependency_signature_before = (
+                self._build_viewer_preview_dependency_signature()
+            )
+            next_model = self._build_viewer_preview_model(None)
+            if next_model is None:
+                return
+            dependency_signature_after = (
+                self._build_viewer_preview_dependency_signature()
+            )
+            if dependency_signature_before != dependency_signature_after:
+                return
+            self._viewer_preview_model = next_model
+            self._viewer_preview_model_revision = revision
+            self._viewer_preview_dependency_signature = (
+                dependency_signature_after
+            )
+            self._viewer_preview_dependency_signature_revision = revision
+        generated_model = self._viewer_preview_model
 
-    def _schedule_viewer_preview_refresh(self, preserve_camera: bool = True) -> None:
-        if not self._viewer_preview_is_active():
+        if canvas_is_stale:
+            if generated_model is None:
+                self.viewer.set_wall_targets(())
+                self.viewer.clear_model()
+            else:
+                self.viewer.set_wall_targets(
+                    tuple(build_fixed_surfaces(self.levels))
+                )
+                self.viewer.set_model(
+                    generated_model,
+                    preserve_camera=preserve_camera,
+                )
+            self._canvas_viewer_preview_revision = revision
+            self._scheduled_viewer_refresh_preserve_camera = True
+            self._sync_canvas_window_undo_availability()
+
+        if surface_is_stale:
+            self.surface_texture_generation.set_preview_context(
+                self.levels,
+                self.initial_first_person_camera,
+                generated_model,
+            )
+            self._surface_viewer_preview_revision = revision
+
+    def _mark_viewer_preview_dirty(
+        self,
+        preserve_camera: bool = True,
+    ) -> int:
+        """Invalidate shared preview data and retain future camera intent."""
+
+        self._viewer_preview_revision += 1
+        self._scheduled_viewer_refresh_preserve_camera = bool(
+            self._scheduled_viewer_refresh_preserve_camera
+            and preserve_camera
+        )
+        return self._viewer_preview_revision
+
+    def _mark_surface_viewer_context_dirty(self) -> None:
+        """Invalidate Surface-only semantic or camera context."""
+
+        if (
+            self._surface_viewer_preview_revision
+            == self._viewer_preview_revision
+        ):
+            self._surface_viewer_preview_revision -= 1
+        self._queue_viewer_preview_refresh()
+
+    def _queue_viewer_preview_refresh(self) -> None:
+        if not self._active_viewer_preview_needs_refresh():
             return
         if self._is_viewer_refresh_scheduled:
-            self._scheduled_viewer_refresh_preserve_camera = (
-                self._scheduled_viewer_refresh_preserve_camera and preserve_camera
-            )
             return
-
         self._is_viewer_refresh_scheduled = True
-        self._scheduled_viewer_refresh_preserve_camera = preserve_camera
         QTimer.singleShot(0, self._run_scheduled_viewer_preview_refresh)
+
+    def _schedule_viewer_preview_refresh(self, preserve_camera: bool = True) -> None:
+        self._mark_viewer_preview_dirty(preserve_camera=preserve_camera)
+        if not self._viewer_preview_is_active():
+            return
+        self._queue_viewer_preview_refresh()
+
+    def _ensure_viewer_preview_current(
+        self,
+        preserve_camera: bool = True,
+    ) -> None:
+        """Display the current revision without treating a tab click as a change."""
+
+        if not self._viewer_preview_is_active():
+            return
+        self._refresh_blueprint_file_dependencies(
+            include_exported_levels=True
+        )
+        self._invalidate_viewer_preview_for_dependency_changes(
+            preserve_camera=preserve_camera
+        )
+        if (
+            self._canvas_viewer_preview_is_active()
+            and self._canvas_viewer_preview_revision
+            != self._viewer_preview_revision
+        ):
+            self._scheduled_viewer_refresh_preserve_camera = bool(
+                self._scheduled_viewer_refresh_preserve_camera
+                and preserve_camera
+            )
+        self._queue_viewer_preview_refresh()
 
     def _run_scheduled_viewer_preview_refresh(self) -> None:
         self._is_viewer_refresh_scheduled = False
-        if not self._viewer_preview_is_active():
+        if not self._active_viewer_preview_needs_refresh():
             return
 
         preserve_camera = self._scheduled_viewer_refresh_preserve_camera
-        self._scheduled_viewer_refresh_preserve_camera = True
         self._refresh_viewer_preview(preserve_camera=preserve_camera)
 
     def _handle_save_clicked(self) -> None:
@@ -3324,6 +3969,7 @@ class BlueprintWorkspace(QWidget):
 
         self._is_syncing_image_library_controls = True
         self.image_thumbnail_list.clear()
+        self._image_thumbnail_source_keys.clear()
         for image_path in self.image_library_paths:
             self.image_thumbnail_list.addItem(
                 self._build_image_thumbnail_item(image_path)
@@ -3339,11 +3985,55 @@ class BlueprintWorkspace(QWidget):
         thumbnail_item.setData(Qt.ItemDataRole.UserRole, image_path)
         thumbnail_item.setToolTip(image_path)
 
-        thumbnail_pixmap = QPixmap(image_path)
-        if thumbnail_pixmap.isNull():
-            thumbnail_item.setText(f"{image_name}\nmissing")
-            return thumbnail_item
+        self._sync_image_thumbnail_item(thumbnail_item, image_path)
+        return thumbnail_item
 
+    def _refresh_stale_image_thumbnails(self) -> None:
+        """Reload only library icons whose file revisions changed."""
+
+        if not hasattr(self, "image_thumbnail_list"):
+            return
+        active_paths: set[str] = set()
+        for row_index in range(self.image_thumbnail_list.count()):
+            thumbnail_item = self.image_thumbnail_list.item(row_index)
+            image_path = str(
+                thumbnail_item.data(Qt.ItemDataRole.UserRole) or ""
+            )
+            if not image_path:
+                continue
+            active_paths.add(image_path)
+            self._sync_image_thumbnail_item(thumbnail_item, image_path)
+        self._image_thumbnail_source_keys = {
+            image_path: revision
+            for image_path, revision in self._image_thumbnail_source_keys.items()
+            if image_path in active_paths
+        }
+
+    def _sync_image_thumbnail_item(
+        self,
+        thumbnail_item: QListWidgetItem,
+        image_path: str,
+    ) -> None:
+        """Install one thumbnail only after its current revision decodes."""
+
+        source_key = _build_local_file_revision(image_path)
+        if self._image_thumbnail_source_keys.get(image_path) == source_key:
+            return
+
+        if not Path(image_path).is_file():
+            thumbnail_item.setIcon(QIcon())
+            thumbnail_item.setText(f"{Path(image_path).name}\nmissing")
+            self._image_thumbnail_source_keys[image_path] = source_key
+            return
+
+        thumbnail_pixmap = _load_image_pixmap(image_path)
+        if thumbnail_pixmap.isNull():
+            thumbnail_item.setIcon(QIcon())
+            thumbnail_item.setText(f"{Path(image_path).name}\nmissing")
+            self._image_thumbnail_source_keys.pop(image_path, None)
+            return
+
+        thumbnail_item.setText(Path(image_path).name)
         thumbnail_item.setIcon(
             QIcon(
                 thumbnail_pixmap.scaled(
@@ -3354,7 +4044,7 @@ class BlueprintWorkspace(QWidget):
                 )
             )
         )
-        return thumbnail_item
+        self._image_thumbnail_source_keys[image_path] = source_key
 
     def _select_image_thumbnail_path(self, selected_image_path: str | None) -> None:
         self.image_thumbnail_list.clearSelection()
@@ -3741,7 +4431,7 @@ class BlueprintWorkspace(QWidget):
         self._sync_canvas_to_current_level()
         self._update_pending_stair_level_status()
         self._refresh_room_lists()
-        self._schedule_viewer_preview_refresh()
+        self._ensure_viewer_preview_current()
 
     def _handle_room_selection_changed(self, _room_index: int) -> None:
         if self._is_syncing_room_controls:
@@ -4063,10 +4753,7 @@ class BlueprintWorkspace(QWidget):
         self.initial_first_person_camera = raw_camera
         self._sync_canvas_viewer_first_person_camera()
         self._sync_first_person_camera_controls()
-        self.surface_texture_generation.set_levels(
-            self.levels,
-            self.initial_first_person_camera,
-        )
+        self._mark_surface_viewer_context_dirty()
 
     def _sync_canvas_viewer_first_person_camera(self) -> None:
         """Use the Canvas camera as the standard viewer's FP entry pose."""
@@ -4483,6 +5170,7 @@ class BlueprintWorkspace(QWidget):
         self._canvas_window_undo_ids.clear()
         self.viewer.set_window_undo_available(False)
         self.levels = levels
+        self._level_blueprint_image_revisions.clear()
         self.stairs = list(stairs or [])
         self.initial_first_person_camera = initial_first_person_camera
         self._sync_canvas_viewer_first_person_camera()
@@ -4511,6 +5199,9 @@ class BlueprintWorkspace(QWidget):
         self._sync_canvas_to_current_level()
         self._refresh_room_lists()
         self._atlas_generation_signature = None
+        self._atlas_source_content_paths = None
+        self._atlas_source_content_revisions = None
+        self._atlas_pending_source_content_refresh_ids.clear()
         self._atlas_wall_texture_source_ids.clear()
         self._clear_atlas_object_preview()
         self.generation.set_data(generation)
@@ -4523,6 +5214,9 @@ class BlueprintWorkspace(QWidget):
             surface_texture_generation
         )
         self._atlas_generation_signature = None
+        self._atlas_source_content_paths = None
+        self._atlas_source_content_revisions = None
+        self._atlas_pending_source_content_refresh_ids.clear()
         self._atlas_wall_texture_source_ids.clear()
         self._sync_atlas_object_texture_sources()
         self.texture_atlas_workspace.materialize_missing_atlases()
@@ -4614,13 +5308,32 @@ class BlueprintWorkspace(QWidget):
         self.images_save_png_button.setEnabled(selected_image_path is not None)
 
         if selected_image_path is None:
+            self._image_preview_source_key = None
+            self._image_preview_source_pixmap = None
+            self._image_preview_scaled_key = None
             self.image_path_label.setText("No image selected")
             self.image_preview_label.setPixmap(QPixmap())
             self.image_preview_label.setText("No image loaded")
             return
 
-        preview_pixmap = QPixmap(selected_image_path)
-        if preview_pixmap.isNull():
+        source_key = _build_local_file_revision(selected_image_path)
+        if source_key != self._image_preview_source_key:
+            if not Path(selected_image_path).is_file():
+                self._image_preview_source_key = source_key
+                self._image_preview_source_pixmap = None
+                self._image_preview_scaled_key = None
+            else:
+                next_pixmap = _load_image_pixmap(selected_image_path)
+                if next_pixmap.isNull():
+                    self._image_preview_source_key = None
+                    self._image_preview_source_pixmap = None
+                    self._image_preview_scaled_key = None
+                else:
+                    self._image_preview_source_key = source_key
+                    self._image_preview_source_pixmap = next_pixmap
+                    self._image_preview_scaled_key = None
+        preview_pixmap = self._image_preview_source_pixmap
+        if preview_pixmap is None or preview_pixmap.isNull():
             self.image_path_label.setText(f"Image missing: {selected_image_path}")
             self.image_preview_label.setPixmap(QPixmap())
             self.image_preview_label.setText("Image missing")
@@ -4630,6 +5343,9 @@ class BlueprintWorkspace(QWidget):
         self.image_path_label.setText(f"Image: {Path(selected_image_path).name}")
         target_width = max(320, self.image_preview_label.width() - 16)
         target_height = max(220, self.image_preview_label.height() - 16)
+        scaled_key = (*source_key, target_width, target_height)
+        if scaled_key == self._image_preview_scaled_key:
+            return
         self.image_preview_label.setText("")
         self.image_preview_label.setPixmap(
             preview_pixmap.scaled(
@@ -4639,6 +5355,7 @@ class BlueprintWorkspace(QWidget):
                 Qt.TransformationMode.SmoothTransformation,
             )
         )
+        self._image_preview_scaled_key = scaled_key
 
 
 class MainWindow(QMainWindow):
@@ -4898,6 +5615,42 @@ def _get_logical_wall_size(placement: UvWallPlacement) -> tuple[float, float]:
 
 
 # ### Path helpers ###
+def _build_local_file_revision(raw_path: object) -> tuple[object, ...]:
+    """Return a cheap replacement-aware revision for one local file."""
+
+    normalized_path = str(raw_path or "").strip()
+    if not normalized_path:
+        return ("", None, None, None)
+    try:
+        resolved_path = Path(normalized_path).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return (normalized_path, None, None, None)
+    try:
+        path_stat = resolved_path.stat()
+    except OSError:
+        return (str(resolved_path), None, None, None)
+    if not resolved_path.is_file():
+        return (str(resolved_path), None, None, None)
+    return (
+        str(resolved_path),
+        path_stat.st_size,
+        path_stat.st_mtime_ns,
+        path_stat.st_ctime_ns,
+    )
+
+
+def _local_file_revision_has_file(revision: tuple[object, ...]) -> bool:
+    """Return whether a local-file revision represents an existing file."""
+
+    return len(revision) == 4 and all(value is not None for value in revision[1:])
+
+
+def _load_image_pixmap(image_path: str) -> QPixmap:
+    """Decode one library image after its revision cache misses."""
+
+    return QPixmap(image_path)
+
+
 def _ensure_png_file_suffix(file_path: str) -> str:
     output_path = Path(file_path)
     if output_path.suffix.lower() == ".png":

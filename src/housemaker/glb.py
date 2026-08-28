@@ -444,6 +444,59 @@ def convert_to_glb(
     surface_texture_world_size_meters: float = 2.0,
     stairs: Sequence[StairData] = (),
 ) -> GeneratedModel:
+    """Build an export-ready house model and serialize its GLB payload."""
+
+    return _build_blueprint_model(
+        level_source=level_source,
+        wall_height_meters=wall_height_meters,
+        blueprint_size_pixels=blueprint_size_pixels,
+        surface_materials=surface_materials,
+        surface_texture_world_size_meters=(
+            surface_texture_world_size_meters
+        ),
+        stairs=stairs,
+        serialize_glb=True,
+    )
+
+
+def convert_to_preview_model(
+    level_source: VertexData | Sequence[LevelData],
+    wall_height_meters: float = DEFAULT_WALL_HEIGHT_METERS,
+    blueprint_size_pixels: tuple[float, float] | None = None,
+    surface_materials: (
+        Mapping[str, bytes | bytearray | memoryview | str | Path] | None
+    ) = None,
+    surface_texture_world_size_meters: float = 2.0,
+    stairs: Sequence[StairData] = (),
+) -> GeneratedModel:
+    """Build the complete interactive house model without GLB serialization."""
+
+    return _build_blueprint_model(
+        level_source=level_source,
+        wall_height_meters=wall_height_meters,
+        blueprint_size_pixels=blueprint_size_pixels,
+        surface_materials=surface_materials,
+        surface_texture_world_size_meters=(
+            surface_texture_world_size_meters
+        ),
+        stairs=stairs,
+        serialize_glb=False,
+    )
+
+
+# ### Blueprint model construction ###
+def _build_blueprint_model(
+    *,
+    level_source: VertexData | Sequence[LevelData],
+    wall_height_meters: float,
+    blueprint_size_pixels: tuple[float, float] | None,
+    surface_materials: (
+        Mapping[str, bytes | bytearray | memoryview | str | Path] | None
+    ),
+    surface_texture_world_size_meters: float,
+    stairs: Sequence[StairData],
+    serialize_glb: bool,
+) -> GeneratedModel:
     if isinstance(level_source, VertexData):
         if stairs:
             raise ValueError("Stairs require level data with endpoint levels.")
@@ -476,7 +529,7 @@ def convert_to_glb(
         ]
     )
     scene = _build_export_scene(named_meshes)
-    glb_bytes = scene.export(file_type="glb")
+    glb_bytes = scene.export(file_type="glb") if serialize_glb else b""
     model = GeneratedModel(
         mesh=combined_mesh,
         scene=scene,
@@ -493,6 +546,7 @@ def convert_to_glb(
         surface_texture_world_size_meters=(
             surface_texture_world_size_meters
         ),
+        serialize_glb=serialize_glb,
     )
 
 
@@ -507,6 +561,34 @@ def compose_placed_generated_models(
     Z-up bottom center. Source scene hierarchy, node transforms, materials,
     and embedded textures are copied into the returned export scene.
     """
+
+    return _compose_placed_generated_models(
+        base_model,
+        placements,
+        serialize_glb=True,
+    )
+
+
+def compose_placed_generated_models_preview(
+    base_model: GeneratedModel,
+    placements: Sequence[PlacedGeneratedModel],
+) -> GeneratedModel:
+    """Compose the complete interactive scene without GLB serialization."""
+
+    return _compose_placed_generated_models(
+        base_model,
+        placements,
+        serialize_glb=False,
+    )
+
+
+def _compose_placed_generated_models(
+    base_model: GeneratedModel,
+    placements: Sequence[PlacedGeneratedModel],
+    *,
+    serialize_glb: bool,
+) -> GeneratedModel:
+    """Compose placed objects while preserving export and preview parity."""
 
     if not isinstance(base_model, GeneratedModel):
         raise TypeError("Placed models require a GeneratedModel house base.")
@@ -629,15 +711,18 @@ def compose_placed_generated_models(
             [base_preview_mesh, *placed_untextured_meshes]
         )
 
-    exported_glb = output_scene.export(file_type="glb")
-    if not isinstance(exported_glb, (bytes, bytearray, memoryview)):
-        raise ValueError(
-            "The placed generated-object scene could not be exported."
-        )
+    glb_bytes = b""
+    if serialize_glb:
+        exported_glb = output_scene.export(file_type="glb")
+        if not isinstance(exported_glb, (bytes, bytearray, memoryview)):
+            raise ValueError(
+                "The placed generated-object scene could not be exported."
+            )
+        glb_bytes = bytes(exported_glb)
     return GeneratedModel(
         mesh=combined_mesh,
         scene=output_scene,
-        glb_bytes=bytes(exported_glb),
+        glb_bytes=glb_bytes,
         preview_textured_walls=list(base_model.preview_textured_walls),
         preview_textured_surfaces=preview_textured_surfaces,
         preview_untextured_mesh=preview_untextured_mesh,
@@ -2165,6 +2250,7 @@ def _apply_surface_materials(
         bytes | bytearray | memoryview | str | Path,
     ],
     surface_texture_world_size_meters: float,
+    serialize_glb: bool,
 ) -> GeneratedModel:
     """Replace assigned semantic faces with their textured geometry."""
 
@@ -2271,7 +2357,9 @@ def _apply_surface_materials(
     return GeneratedModel(
         mesh=combined_mesh,
         scene=scene,
-        glb_bytes=scene.export(file_type="glb"),
+        glb_bytes=(
+            scene.export(file_type="glb") if serialize_glb else b""
+        ),
         preview_textured_walls=model.preview_textured_walls,
         preview_textured_surfaces=preview_textured_surfaces,
         preview_untextured_mesh=preview_base_mesh,

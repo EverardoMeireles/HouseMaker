@@ -160,6 +160,10 @@ class StairMainIntegrationTests(unittest.TestCase):
         self.assertEqual(self.workspace.stairs_list.count(), 1)
         self.assertIn("Added floating stairs", self.workspace.stair_status_label.text())
 
+        self.workspace.canvas_viewer_tabs.setCurrentIndex(
+            self.workspace.canvas_3d_view_tab_index
+        )
+        _qt_application.processEvents()
         viewer_model = self.workspace.viewer.model
         self.assertIsNotNone(viewer_model)
         self.assertIn(

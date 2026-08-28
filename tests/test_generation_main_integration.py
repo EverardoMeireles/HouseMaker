@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+from PIL import Image
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeySequence
 from PySide6.QtTest import QTest
@@ -138,6 +139,182 @@ class GenerationMainIntegrationTests(unittest.TestCase):
                     self.workspace.side_panel.isVisible(),
                     should_be_visible,
                 )
+
+    def test_images_tab_reuses_unchanged_decoded_preview(self) -> None:
+        image_path = Path(self._temporary_directory.name) / "library-image.png"
+        Image.new("RGBA", (96, 64), (25, 80, 140, 255)).save(image_path)
+        normalized_path = str(image_path.resolve())
+        self.workspace.image_library_paths = [normalized_path]
+        self.workspace._refresh_image_thumbnail_list(
+            selected_image_path=normalized_path
+        )
+        first_pixmap = self.workspace._image_preview_source_pixmap
+        first_source_key = self.workspace._image_preview_source_key
+        first_thumbnail_key = (
+            self.workspace.image_thumbnail_list.item(0).icon().cacheKey()
+        )
+        self.assertIsNotNone(first_pixmap)
+
+        images_tab_index = self.workspace.side_tabs.indexOf(
+            self.workspace.images_tab
+        )
+        self.workspace.side_tabs.setCurrentIndex(images_tab_index)
+        self.workspace.side_tabs.setCurrentIndex(0)
+        self.workspace.side_tabs.setCurrentIndex(images_tab_index)
+        _qt_application.processEvents()
+
+        self.assertIs(
+            self.workspace._image_preview_source_pixmap,
+            first_pixmap,
+        )
+        self.assertEqual(
+            self.workspace._image_preview_source_key,
+            first_source_key,
+        )
+
+        previous_stat = image_path.stat()
+        Image.new("RGBA", (96, 64), (180, 45, 20, 255)).save(image_path)
+        os.utime(
+            image_path,
+            ns=(
+                previous_stat.st_atime_ns,
+                previous_stat.st_mtime_ns + 1_000_000,
+            ),
+        )
+        self.workspace.workspace_tabs.setCurrentWidget(
+            self.workspace.settings_widget
+        )
+        self.workspace.workspace_tabs.setCurrentWidget(
+            self.workspace.canvas_viewer_workspace
+        )
+        _qt_application.processEvents()
+
+        self.assertIsNot(
+            self.workspace._image_preview_source_pixmap,
+            first_pixmap,
+        )
+        self.assertNotEqual(
+            self.workspace._image_preview_source_key,
+            first_source_key,
+        )
+        self.assertNotEqual(
+            self.workspace.image_thumbnail_list.item(0).icon().cacheKey(),
+            first_thumbnail_key,
+        )
+
+    def test_canvas_return_refreshes_the_selected_texture_creator(self) -> None:
+        self.workspace.side_tabs.setCurrentWidget(
+            self.workspace.texture_creator_tab
+        )
+
+        with patch.object(
+            self.workspace,
+            "_sync_texture_creator_canvas",
+        ) as sync_canvas:
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.settings_widget
+            )
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.canvas_viewer_workspace
+            )
+            _qt_application.processEvents()
+
+        sync_canvas.assert_called_once_with()
+
+    def test_failed_image_decode_retries_the_same_revision(self) -> None:
+        image_path = Path(self._temporary_directory.name) / "retry-image.png"
+        image_path.write_bytes(b"temporarily unreadable")
+        normalized_path = str(image_path.resolve())
+        self.workspace.image_library_paths = [normalized_path]
+        self.workspace._refresh_image_thumbnail_list(
+            selected_image_path=normalized_path
+        )
+
+        with patch(
+            "housemaker.main._build_local_file_revision",
+            return_value=(normalized_path, 99, 100, 101),
+        ):
+            self.workspace._sync_images_tab()
+            self.workspace._refresh_stale_image_thumbnails()
+            self.assertIsNone(self.workspace._image_preview_source_pixmap)
+            self.assertNotIn(
+                normalized_path,
+                self.workspace._image_thumbnail_source_keys,
+            )
+
+            Image.new("RGBA", (40, 24), (210, 35, 15, 255)).save(image_path)
+            self.workspace._sync_images_tab()
+            self.workspace._refresh_stale_image_thumbnails()
+
+        self.assertIsNotNone(self.workspace._image_preview_source_pixmap)
+        self.assertEqual(
+            self.workspace._image_preview_source_key,
+            (normalized_path, 99, 100, 101),
+        )
+        self.assertIn(
+            normalized_path,
+            self.workspace._image_thumbnail_source_keys,
+        )
+
+    def test_known_missing_library_image_is_cached_across_activations(
+        self,
+    ) -> None:
+        missing_path = str(
+            (Path(self._temporary_directory.name) / "missing.png").resolve()
+        )
+        self.workspace.image_library_paths = [missing_path]
+        self.workspace._refresh_image_thumbnail_list(
+            selected_image_path=missing_path
+        )
+        expected_revision = self.workspace._image_preview_source_key
+        self.assertEqual(
+            self.workspace._image_thumbnail_source_keys[missing_path],
+            expected_revision,
+        )
+
+        with patch("housemaker.main._load_image_pixmap") as load_pixmap:
+            for _activation in range(2):
+                self.workspace.workspace_tabs.setCurrentWidget(
+                    self.workspace.settings_widget
+                )
+                self.workspace.workspace_tabs.setCurrentWidget(
+                    self.workspace.canvas_viewer_workspace
+                )
+                _qt_application.processEvents()
+
+        load_pixmap.assert_not_called()
+        self.assertEqual(
+            self.workspace._image_preview_source_key,
+            expected_revision,
+        )
+
+    def test_valid_image_recovers_after_an_invalid_selection(self) -> None:
+        valid_path = Path(self._temporary_directory.name) / "valid.png"
+        invalid_path = Path(self._temporary_directory.name) / "invalid.png"
+        Image.new("RGBA", (40, 24), (20, 90, 160, 255)).save(valid_path)
+        invalid_path.write_bytes(b"invalid image payload")
+        normalized_valid = str(valid_path.resolve())
+        normalized_invalid = str(invalid_path.resolve())
+        self.workspace.image_library_paths = [
+            normalized_valid,
+            normalized_invalid,
+        ]
+        self.workspace._refresh_image_thumbnail_list(
+            selected_image_path=normalized_valid
+        )
+
+        self.workspace.image_thumbnail_list.setCurrentRow(1)
+        self.assertIsNone(self.workspace._image_preview_source_pixmap)
+        self.assertIsNone(self.workspace._image_preview_source_key)
+        self.workspace.image_thumbnail_list.setCurrentRow(0)
+
+        self.assertIsNotNone(self.workspace._image_preview_source_pixmap)
+        assert self.workspace._image_preview_source_pixmap is not None
+        self.assertFalse(self.workspace._image_preview_source_pixmap.isNull())
+        self.assertEqual(
+            self.workspace._image_preview_source_key[0],
+            normalized_valid,
+        )
 
     def test_canvas_tab_uses_dedicated_2d_and_3d_subtabs(self) -> None:
         canvas_tab_index = self.workspace.workspace_tabs.indexOf(
@@ -280,6 +457,10 @@ class GenerationMainIntegrationTests(unittest.TestCase):
         self.workspace.workspace_tabs.setCurrentWidget(
             self.workspace.canvas_viewer_workspace
         )
+        self.workspace.canvas_viewer_tabs.setCurrentIndex(
+            self.workspace.canvas_3d_view_tab_index
+        )
+        _qt_application.processEvents()
 
         with patch.object(
             self.workspace,

@@ -1027,8 +1027,8 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         with (
             patch.object(
                 self.workspace.generation,
-                "get_data",
-                return_value=generation_data,
+                "get_generated_object_ids",
+                return_value=(record.object_id,),
             ),
             patch.object(
                 self.workspace.generation,
@@ -1038,8 +1038,12 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             patch.object(
                 self.workspace,
                 "_build_atlas_object_texture_source",
-                return_value=None,
+                return_value=object(),
             ) as source_builder,
+            patch.object(
+                self.workspace.texture_atlas_workspace,
+                "set_object_texture_sources",
+            ),
         ):
             self.workspace._handle_generation_data_changed_for_atlases(
                 object()
@@ -1049,6 +1053,125 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             )
 
         source_builder.assert_called_once_with(variant, None)
+
+    def test_atlas_activation_reloads_sources_only_after_file_revision_change(
+        self,
+    ) -> None:
+        variant = SimpleNamespace(
+            object_id="chair",
+            object_name="Chair",
+            resolution=1024,
+            texture_asset_relative_path="chair-1024.png",
+            texture_asset_path=Path(self._temporary_directory.name)
+            / "chair-1024.png",
+        )
+        self.workspace._atlas_generation_signature = None
+        texture_revision = [("png-revision-one",)]
+
+        def dependency_signature(_object_id: str):
+            return (
+                (
+                    1024,
+                    "chair-1024.glb",
+                    ("glb-revision",),
+                    "chair-1024.png",
+                    texture_revision[0],
+                ),
+            )
+
+        with (
+            patch.object(
+                self.workspace.generation,
+                "get_generated_object_ids",
+                return_value=("chair",),
+            ),
+            patch.object(
+                self.workspace.generation,
+                "get_active_texture_variant",
+                return_value=variant,
+            ),
+            patch.object(
+                self.workspace.generation,
+                "get_texture_variant_dependency_signature",
+                side_effect=dependency_signature,
+            ),
+            patch.object(
+                self.workspace,
+                "_build_atlas_object_texture_source",
+                return_value=object(),
+            ) as source_builder,
+            patch.object(
+                self.workspace.texture_atlas_workspace,
+                "set_object_texture_sources",
+            ),
+        ):
+            self.workspace._sync_atlas_object_texture_sources()
+            self.workspace._sync_atlas_object_texture_sources()
+            source_builder.assert_called_once_with(variant, None)
+
+            texture_revision[0] = ("png-revision-two",)
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.settings_widget
+            )
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.texture_atlas_workspace
+            )
+
+        self.assertEqual(source_builder.call_count, 2)
+
+    def test_atlas_source_cache_ignores_glb_only_revision_changes(self) -> None:
+        variant = SimpleNamespace(
+            object_id="chair",
+            object_name="Chair",
+            resolution=1024,
+            texture_asset_relative_path="chair-1024.png",
+        )
+        glb_revision = [("glb-revision-one",)]
+
+        def dependency_signature(_object_id: str):
+            return (
+                (
+                    1024,
+                    "chair-1024.glb",
+                    glb_revision[0],
+                    "chair-1024.png",
+                    ("png-revision",),
+                ),
+            )
+
+        self.workspace._atlas_generation_signature = None
+        with (
+            patch.object(
+                self.workspace.generation,
+                "get_generated_object_ids",
+                return_value=("chair",),
+            ),
+            patch.object(
+                self.workspace.generation,
+                "get_active_texture_variant",
+                return_value=variant,
+            ),
+            patch.object(
+                self.workspace.generation,
+                "get_texture_variant_dependency_signature",
+                side_effect=dependency_signature,
+            ),
+            patch.object(
+                self.workspace,
+                "_build_atlas_object_texture_source",
+                return_value=object(),
+            ) as source_builder,
+            patch.object(
+                self.workspace.texture_atlas_workspace,
+                "set_object_texture_sources",
+            ) as set_sources,
+        ):
+            self.workspace._sync_atlas_object_texture_sources()
+            glb_revision[0] = ("glb-revision-two",)
+            self.workspace._sync_atlas_object_texture_sources()
+
+        source_builder.assert_called_once_with(variant, None)
+        set_sources.assert_called_once()
 
     def test_unchanged_wall_source_is_cached_but_file_change_reloads_it(
         self,
@@ -1093,6 +1216,378 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
 
         self.assertEqual(source_builder.call_count, 2)
 
+    def test_atlas_activation_rematerializes_same_path_wall_pixels(
+        self,
+    ) -> None:
+        surface_asset_directory = self.settings.path.parent / "surface_textures"
+        assignment = _wall_texture_assignment(surface_asset_directory)
+        self.workspace.surface_texture_generation.set_data(
+            SurfaceTextureData(assignments=[assignment])
+        )
+        self.workspace._atlas_generation_signature = None
+        self.workspace._atlas_source_content_paths = None
+        self.workspace._atlas_source_content_revisions = None
+        self.workspace._sync_atlas_object_texture_sources()
+
+        source_id = build_atlas_wall_texture_source_id(
+            assignment.assignment_id
+        )
+        source = self.workspace.texture_atlas_workspace \
+            ._sources_by_object_id[source_id]
+        atlas_data = TextureAtlasData()
+        atlas = atlas_data.create_atlas(
+            "Same-path wall",
+            2048,
+            atlas_id="same-path-wall",
+        )
+        atlas_data.assign_object(
+            atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+            source.packing_mode,
+        )
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        atlas_workspace.set_data(atlas_data)
+        self.assertEqual(atlas_workspace.materialize_missing_atlases(), 1)
+        atlas_path = (
+            self.settings.path.parent
+            / "texture_atlases"
+            / f"{atlas.atlas_id}.png"
+        )
+        with Image.open(atlas_path) as atlas_image:
+            self.assertEqual(
+                atlas_image.convert("RGBA").getpixel((256, 256)),
+                (170, 70, 25, 255),
+            )
+
+        texture_path = surface_asset_directory / assignment.asset_path
+        Image.new("RGBA", (12, 8), (20, 90, 160, 255)).save(texture_path)
+        current_stat = texture_path.stat()
+        os.utime(
+            texture_path,
+            ns=(
+                current_stat.st_atime_ns,
+                current_stat.st_mtime_ns + 1_000_000,
+            ),
+        )
+        self.workspace.workspace_tabs.setCurrentWidget(
+            self.workspace.settings_widget
+        )
+        self.workspace.workspace_tabs.setCurrentWidget(atlas_workspace)
+
+        with Image.open(atlas_path) as atlas_image:
+            self.assertEqual(
+                atlas_image.convert("RGBA").getpixel((256, 256)),
+                (20, 90, 160, 255),
+            )
+
+    def test_fixed_wall_replacement_keeps_its_pinned_atlas_resolution(
+        self,
+    ) -> None:
+        surface_asset_directory = self.settings.path.parent / "surface_textures"
+        assignment = _wall_texture_assignment(
+            surface_asset_directory,
+            assignment_id="cross-bucket-wall",
+            size=(400, 300),
+            color=(170, 70, 25, 255),
+        )
+        self.workspace.surface_texture_generation.set_data(
+            SurfaceTextureData(assignments=[assignment])
+        )
+        self.workspace._atlas_generation_signature = None
+        self.workspace._sync_atlas_object_texture_sources()
+        source_id = build_atlas_wall_texture_source_id(
+            assignment.assignment_id
+        )
+        source = self.workspace.texture_atlas_workspace \
+            ._sources_by_object_id[source_id]
+        self.assertEqual(source.texture_resolution, 512)
+
+        atlas_data = TextureAtlasData()
+        atlas = atlas_data.create_atlas(
+            "Pinned fixed wall",
+            2048,
+            atlas_id="pinned-fixed-wall",
+        )
+        atlas_data.assign_object(
+            atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+            source.packing_mode,
+        )
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        atlas_workspace.set_data(atlas_data)
+        self.assertEqual(atlas_workspace.materialize_missing_atlases(), 1)
+        atlas_path = (
+            self.settings.path.parent
+            / "texture_atlases"
+            / f"{atlas.atlas_id}.png"
+        )
+
+        texture_path = surface_asset_directory / assignment.asset_path
+        Image.new("RGBA", (900, 700), (20, 90, 160, 255)).save(texture_path)
+        current_stat = texture_path.stat()
+        os.utime(
+            texture_path,
+            ns=(
+                current_stat.st_atime_ns,
+                current_stat.st_mtime_ns + 1_000_000,
+            ),
+        )
+        self.workspace._sync_atlas_object_texture_sources()
+
+        updated = atlas_workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert updated is not None
+        placement = updated.placement_for_object(source_id)
+        assert placement is not None
+        self.assertEqual(placement.texture_resolution, 512)
+        with Image.open(atlas_path) as atlas_image:
+            self.assertEqual(
+                atlas_image.convert("RGBA").getpixel((256, 256)),
+                (20, 90, 160, 255),
+            )
+
+    def test_generated_png_reappearance_rematerializes_same_atlas_slot(
+        self,
+    ) -> None:
+        asset_directory = self.settings.path.parent / "generated"
+        asset_directory.mkdir(parents=True, exist_ok=True)
+        glb_name = "reappearing-object.glb"
+        png_name = "reappearing-object.png"
+        (asset_directory / glb_name).write_bytes(b"available glb")
+        texture_path = asset_directory / png_name
+        Image.new("RGBA", (512, 512), (170, 70, 25, 255)).save(texture_path)
+        record = GeneratedObjectRecord(
+            object_id="reappearing-object",
+            frame_index=0,
+            object_name="Reappearing object",
+            pipeline={
+                "texture_variants": {
+                    "512": {
+                        "glb_asset_path": glb_name,
+                        "texture_asset_path": png_name,
+                    },
+                },
+                "selected_texture_resolution": 512,
+            },
+            provider_task_id="reappearing-object-task",
+            asset_path=glb_name,
+        )
+        self.workspace.generation._data.generated_objects = [record]
+        self.workspace._atlas_generation_signature = None
+        self.workspace._atlas_source_content_paths = None
+        self.workspace._atlas_source_content_revisions = None
+        self.workspace._sync_atlas_object_texture_sources()
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        source = atlas_workspace._sources_by_object_id[record.object_id]
+        atlas_data = TextureAtlasData()
+        atlas = atlas_data.create_atlas(
+            "Reappearing generated texture",
+            2048,
+            atlas_id="reappearing-generated",
+        )
+        atlas_data.assign_object(
+            atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+            source.packing_mode,
+        )
+        atlas_workspace.set_data(atlas_data)
+        self.assertEqual(atlas_workspace.materialize_missing_atlases(), 1)
+        atlas_path = (
+            self.settings.path.parent
+            / "texture_atlases"
+            / f"{atlas.atlas_id}.png"
+        )
+
+        texture_path.unlink()
+        self.workspace._sync_atlas_object_texture_sources()
+        self.assertIsNotNone(self.workspace._atlas_generation_signature)
+        Image.new("RGBA", (512, 512), (20, 90, 160, 255)).save(texture_path)
+        self.workspace._sync_atlas_object_texture_sources()
+
+        with Image.open(atlas_path) as atlas_image:
+            self.assertEqual(
+                atlas_image.convert("RGBA").getpixel((256, 256)),
+                (20, 90, 160, 255),
+            )
+
+    def test_missing_wall_does_not_block_other_atlas_sources(self) -> None:
+        asset_directory = self.settings.path.parent / "surface_textures"
+        valid_assignment = _wall_texture_assignment(
+            asset_directory,
+            assignment_id="available-wall",
+        )
+        missing_assignment = _wall_texture_assignment(
+            asset_directory,
+            assignment_id="missing-wall",
+        )
+        (asset_directory / missing_assignment.asset_path).unlink()
+        self.workspace.surface_texture_generation.set_data(
+            SurfaceTextureData(
+                assignments=[valid_assignment, missing_assignment]
+            )
+        )
+        self.workspace._atlas_generation_signature = None
+
+        self.workspace._sync_atlas_object_texture_sources()
+
+        sources = self.workspace.texture_atlas_workspace._sources_by_object_id
+        self.assertIn(
+            build_atlas_wall_texture_source_id(valid_assignment.assignment_id),
+            sources,
+        )
+        self.assertNotIn(
+            build_atlas_wall_texture_source_id(missing_assignment.assignment_id),
+            sources,
+        )
+        self.assertIsNotNone(self.workspace._atlas_generation_signature)
+
+    def test_failed_atlas_source_build_retries_same_revision(self) -> None:
+        variant = SimpleNamespace(
+            object_id="retry-source",
+            object_name="Retry source",
+            resolution=512,
+            texture_asset_relative_path="retry-source.png",
+            texture_asset_path=Path(self._temporary_directory.name)
+            / "retry-source.png",
+        )
+        dependency_signature = (
+            (512, "retry-source.glb", ("glb",), "retry-source.png", ("png",)),
+        )
+        replacement_source = SimpleNamespace(object_id="retry-source")
+        self.workspace._atlas_generation_signature = None
+
+        with (
+            patch.object(
+                self.workspace.generation,
+                "get_generated_object_ids",
+                return_value=(variant.object_id,),
+            ),
+            patch.object(
+                self.workspace.generation,
+                "get_active_texture_variant",
+                return_value=variant,
+            ),
+            patch.object(
+                self.workspace.generation,
+                "get_texture_variant_dependency_signature",
+                return_value=dependency_signature,
+            ),
+            patch.object(
+                self.workspace,
+                "_build_atlas_object_texture_source",
+                side_effect=(None, replacement_source),
+            ) as build_source,
+            patch.object(
+                self.workspace.texture_atlas_workspace,
+                "set_object_texture_sources",
+            ) as set_sources,
+            patch.object(
+                self.workspace.texture_atlas_workspace,
+                "refresh_texture_source_content",
+                return_value=True,
+            ),
+        ):
+            self.workspace._sync_atlas_object_texture_sources()
+            self.workspace._sync_atlas_object_texture_sources()
+
+        self.assertEqual(build_source.call_count, 2)
+        self.assertEqual(set_sources.call_count, 2)
+        self.assertEqual(set_sources.call_args_list[0].args[0], [])
+        self.assertEqual(
+            set_sources.call_args_list[1].args[0],
+            [replacement_source],
+        )
+        self.assertIsNotNone(self.workspace._atlas_generation_signature)
+
+    def test_failed_atlas_source_does_not_block_a_healthy_source(self) -> None:
+        variants = {
+            object_id: SimpleNamespace(
+                object_id=object_id,
+                object_name=object_id,
+                resolution=512,
+                texture_asset_relative_path=f"{object_id}.png",
+                texture_asset_path=(
+                    Path(self._temporary_directory.name) / f"{object_id}.png"
+                ),
+            )
+            for object_id in ("retry-source", "healthy-source")
+        }
+        sources = {
+            object_id: SimpleNamespace(object_id=object_id)
+            for object_id in variants
+        }
+        build_attempts = {object_id: 0 for object_id in variants}
+
+        def build_source(variant, _symmetry=None):
+            object_id = variant.object_id
+            build_attempts[object_id] += 1
+            if object_id == "retry-source" and build_attempts[object_id] == 1:
+                return None
+            return sources[object_id]
+
+        def dependency_signature(object_id: str):
+            return (
+                (
+                    512,
+                    f"{object_id}.glb",
+                    ("glb",),
+                    f"{object_id}.png",
+                    ("png",),
+                ),
+            )
+
+        self.workspace._atlas_generation_signature = None
+        with (
+            patch.object(
+                self.workspace.generation,
+                "get_generated_object_ids",
+                return_value=tuple(variants),
+            ),
+            patch.object(
+                self.workspace.generation,
+                "get_active_texture_variant",
+                side_effect=lambda object_id: variants[object_id],
+            ),
+            patch.object(
+                self.workspace.generation,
+                "get_texture_variant_dependency_signature",
+                side_effect=dependency_signature,
+            ),
+            patch.object(
+                self.workspace,
+                "_build_atlas_object_texture_source",
+                side_effect=build_source,
+            ),
+            patch.object(
+                self.workspace.texture_atlas_workspace,
+                "set_object_texture_sources",
+            ) as set_sources,
+            patch.object(
+                self.workspace.texture_atlas_workspace,
+                "refresh_texture_source_content",
+                return_value=True,
+            ),
+        ):
+            self.workspace._sync_atlas_object_texture_sources()
+            self.workspace._sync_atlas_object_texture_sources()
+
+        self.assertEqual(
+            [source.object_id for source in set_sources.call_args_list[0].args[0]],
+            ["healthy-source"],
+        )
+        self.assertEqual(
+            [source.object_id for source in set_sources.call_args_list[1].args[0]],
+            ["retry-source", "healthy-source"],
+        )
+        self.assertEqual(build_attempts["retry-source"], 2)
+        self.assertEqual(build_attempts["healthy-source"], 2)
+        self.assertIsNotNone(self.workspace._atlas_generation_signature)
+
     def test_generated_object_wins_reserved_wall_source_id_collision(
         self,
     ) -> None:
@@ -1119,8 +1614,8 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         with (
             patch.object(
                 self.workspace.generation,
-                "get_data",
-                return_value=generation_data,
+                "get_generated_object_ids",
+                return_value=(record.object_id,),
             ),
             patch.object(
                 self.workspace.generation,
@@ -1169,8 +1664,8 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
 
         with patch.object(
             self.workspace.generation,
-            "get_data",
-            return_value=generation_data,
+            "get_generated_object_ids",
+            return_value=(record.object_id,),
         ), patch.object(
             self.workspace.generation,
             "get_active_texture_variant",
@@ -1192,6 +1687,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             "set_object_texture_sources",
         ) as set_sources:
             self.workspace._sync_atlas_object_texture_sources()
+            image_resolver.reset_mock()
             resolver = set_sources.call_args.kwargs["variant_resolver"]
             selectability_resolver = set_sources.call_args.kwargs[
                 "selectability_resolver"
@@ -1350,8 +1846,8 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         with (
             patch.object(
                 self.workspace.generation,
-                "get_data",
-                return_value=generation_data,
+                "get_generated_object_ids",
+                return_value=("chair",),
             ),
             patch.object(
                 self.workspace.generation,

@@ -507,15 +507,21 @@ class SurfaceTextureViewer(QWidget):
         pose = _get_initial_pose(initial_camera)
         if pose is None:
             pose = _build_default_camera_pose(self._surfaces)
-        self.set_camera_pose(pose)
+        self.set_camera_pose(pose, emit_signal=False)
 
-    def set_scene_model(self, model: GeneratedModel | None) -> None:
+    def set_scene_model(
+        self,
+        model: GeneratedModel | None,
+        *,
+        repopulate: bool = True,
+    ) -> None:
         """Render the exact Canvas model behind semantic interaction geometry."""
 
         if model is not None and not isinstance(model, GeneratedModel):
             raise TypeError("The Surface preview model must be a GeneratedModel.")
         self._scene_model = model
-        self._populate_scene()
+        if repopulate:
+            self._populate_scene()
 
     def get_scene_model(self) -> GeneratedModel | None:
         return self._scene_model
@@ -574,7 +580,12 @@ class SurfaceTextureViewer(QWidget):
     def get_combined_surface_area(self, surface_ids: Iterable[str]) -> float:
         return get_combined_surface_area(self._surfaces, surface_ids)
 
-    def set_selected_surface_ids(self, surface_ids: Iterable[str]) -> None:
+    def set_selected_surface_ids(
+        self,
+        surface_ids: Iterable[str],
+        *,
+        emit_signal: bool = True,
+    ) -> None:
         normalized_ids = _deduplicate_strings(surface_ids)
         surfaces = [
             self._surface_by_id[surface_id]
@@ -587,7 +598,8 @@ class SurfaceTextureViewer(QWidget):
             surface.surface_id for surface in surfaces
         ]
         self._sync_selection_rendering()
-        self.selection_changed.emit(self.get_selected_surface_ids())
+        if emit_signal:
+            self.selection_changed.emit(self.get_selected_surface_ids())
 
     def select_surface(self, surface_id: str, *, shift_pressed: bool = False) -> bool:
         surface = self._surface_by_id.get(str(surface_id))
@@ -852,8 +864,13 @@ class SurfaceTextureViewer(QWidget):
     def get_texture_world_size_meters(self) -> float:
         return self._texture_world_size_meters
 
-    def set_camera_pose(self, pose: CameraPose) -> None:
-        self.view.set_camera_pose(pose)
+    def set_camera_pose(
+        self,
+        pose: CameraPose,
+        *,
+        emit_signal: bool = True,
+    ) -> None:
+        self.view.set_camera_pose(pose, emit_signal=emit_signal)
 
     def get_camera_pose(self) -> CameraPose:
         return self.view.get_camera_pose()

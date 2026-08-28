@@ -223,6 +223,11 @@ class SettingsWidget(QWidget):
             unused_face_removal=self.unused_face_removal_checkbox.isChecked(),
         )
 
+    def get_fullscreen_3d_viewer_screen_id(self) -> str | None:
+        """Return the selected display without rereading the settings file."""
+
+        return self._selected_fullscreen_3d_viewer_screen_id()
+
     def clear_session_keys(self) -> None:
         """Clear the temporary plaintext key values from settings.json."""
 

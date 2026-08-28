@@ -7,6 +7,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 # ### Imports ###
+import copy
 import io
 import shutil
 import tempfile
@@ -18,6 +19,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import trimesh
 from PIL import Image
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QSignalSpy, QTest
@@ -31,6 +33,7 @@ from PySide6.QtWidgets import (
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.camera_models import CameraPose, InitialFirstPersonCamera
 from housemaker.generation_state import MASK_MODE_PAINT, MaskPoint, MaskStroke
+from housemaker.glb import GeneratedModel
 from housemaker.models import LevelData, RoomData, VertexData
 from housemaker.settings_widget import (
     SURFACE_TEXTURE_PROVIDER_GPT_4O_MINI,
@@ -53,11 +56,13 @@ from housemaker.surface_texture_workspace import (
     SurfaceTextureGenerationWorkspace,
     SurfaceTextureRequest,
     _build_masked_crop,
+    _build_surface_asset_revision,
     _build_surface_texture_outputs,
     _decode_png_rgba,
     _encode_png,
     _encode_rgba_png,
 )
+from housemaker.texture_atlas_view import TextureAtlasEntry
 
 
 # ### Module state ###
@@ -92,6 +97,15 @@ def _test_level() -> LevelData:
         ],
         image_size_pixels=(100.0, 100.0),
         floor_contour_vertex_ids=(1, 2, 3, 4),
+    )
+
+
+def _test_preview_model() -> GeneratedModel:
+    mesh = trimesh.creation.box(extents=(1.0, 1.0, 1.0))
+    return GeneratedModel(
+        mesh=mesh,
+        scene=trimesh.Scene(mesh.copy()),
+        glb_bytes=b"",
     )
 
 
@@ -345,6 +359,176 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
             )
         )
 
+    def test_equivalent_levels_skip_all_surface_rebuilding(self) -> None:
+        equivalent_level = copy.deepcopy(self.workspace._levels[0])
+        equivalent_camera = InitialFirstPersonCamera.from_dict(
+            self.initial_camera.to_dict()
+        )
+
+        with (
+            patch.object(self.workspace, "_store_viewer_state") as store_state,
+            patch.object(self.workspace.surface_view, "set_levels") as set_levels,
+            patch.object(
+                self.workspace,
+                "_restore_viewer_state",
+            ) as restore_state,
+            patch.object(
+                self.workspace,
+                "_restore_assignment_textures",
+            ) as restore_textures,
+            patch.object(
+                self.workspace,
+                "_refresh_texture_atlases",
+            ) as refresh_atlases,
+            patch.object(
+                self.workspace,
+                "_sync_selection_status",
+            ) as sync_selection,
+            patch.object(self.workspace, "_sync_controls") as sync_controls,
+        ):
+            self.workspace.set_levels(
+                [equivalent_level],
+                equivalent_camera,
+            )
+
+        store_state.assert_not_called()
+        set_levels.assert_not_called()
+        restore_state.assert_not_called()
+        restore_textures.assert_not_called()
+        refresh_atlases.assert_not_called()
+        sync_selection.assert_not_called()
+        sync_controls.assert_not_called()
+        self.assertIs(self.workspace._levels[0], equivalent_level)
+
+    def test_changed_levels_preserve_viewer_state_without_data_signal(self) -> None:
+        custom_pose = CameraPose(
+            x=9.0,
+            y=8.0,
+            z=7.0,
+            yaw_degrees=61.0,
+            pitch_degrees=-12.0,
+        )
+        selected_wall = "level:2/room:5/wall:1:2"
+        self.workspace.surface_view.set_camera_pose(custom_pose)
+        self.workspace.surface_view.set_selected_surface_ids((selected_wall,))
+        changed = QSignalSpy(self.workspace.data_changed)
+        changed_level = copy.deepcopy(self.workspace._levels[0])
+        changed_level.height_meters += 0.25
+
+        self.workspace.set_levels([changed_level], self.initial_camera)
+
+        self.assertEqual(
+            self.workspace.surface_view.get_camera_pose(),
+            custom_pose,
+        )
+        self.assertEqual(
+            self.workspace.surface_view.get_selected_surface_ids(),
+            (selected_wall,),
+        )
+        restored_data = self.workspace.get_data()
+        self.assertEqual(restored_data.camera_pose, custom_pose)
+        self.assertEqual(restored_data.selected_surface_ids, (selected_wall,))
+        self.assertEqual(changed.count(), 0)
+
+    def test_in_place_level_change_rebuilds_surface_content(self) -> None:
+        mutable_level = self.workspace._levels[0]
+        mutable_level.height_meters += 0.5
+
+        with (
+            patch.object(self.workspace, "_store_viewer_state") as store_state,
+            patch.object(self.workspace.surface_view, "set_levels") as set_levels,
+            patch.object(
+                self.workspace,
+                "_restore_viewer_state",
+            ) as restore_state,
+            patch.object(
+                self.workspace,
+                "_restore_assignment_textures",
+            ) as restore_textures,
+            patch.object(
+                self.workspace,
+                "_refresh_texture_atlases",
+            ) as refresh_atlases,
+            patch.object(
+                self.workspace,
+                "_sync_selection_status",
+            ) as sync_selection,
+            patch.object(self.workspace, "_sync_controls") as sync_controls,
+        ):
+            self.workspace.set_levels([mutable_level], self.initial_camera)
+
+        store_state.assert_called_once_with()
+        set_levels.assert_called_once_with(
+            [mutable_level],
+            self.initial_camera,
+        )
+        restore_state.assert_called_once_with()
+        restore_textures.assert_called_once_with()
+        refresh_atlases.assert_called_once_with()
+        sync_selection.assert_called_once_with()
+        sync_controls.assert_called_once_with()
+
+    def test_initial_camera_change_rebuilds_surface_content(self) -> None:
+        changed_camera = InitialFirstPersonCamera(
+            level_index=self.initial_camera.level_index,
+            pose=CameraPose(
+                x=self.initial_camera.pose.x + 1.0,
+                y=self.initial_camera.pose.y,
+                z=self.initial_camera.pose.z,
+                yaw_degrees=self.initial_camera.pose.yaw_degrees,
+                pitch_degrees=self.initial_camera.pose.pitch_degrees,
+                roll_degrees=self.initial_camera.pose.roll_degrees,
+                fov_degrees=self.initial_camera.pose.fov_degrees,
+            ),
+            light_intensity=self.initial_camera.light_intensity,
+        )
+
+        with (
+            patch.object(self.workspace.surface_view, "set_levels") as set_levels,
+            patch.object(self.workspace, "_restore_viewer_state"),
+            patch.object(
+                self.workspace,
+                "_restore_assignment_textures",
+            ) as restore_textures,
+            patch.object(
+                self.workspace,
+                "_refresh_texture_atlases",
+            ) as refresh_atlases,
+        ):
+            self.workspace.set_levels(
+                list(self.workspace._levels),
+                changed_camera,
+            )
+
+        set_levels.assert_called_once_with(
+            self.workspace._levels,
+            changed_camera,
+        )
+        restore_textures.assert_called_once_with()
+        refresh_atlases.assert_called_once_with()
+
+    def test_changed_preview_context_populates_the_gl_scene_once(self) -> None:
+        mutable_level = self.workspace._levels[0]
+        mutable_level.height_meters += 0.5
+        preview_model = _test_preview_model()
+
+        with patch.object(
+            self.workspace.surface_view,
+            "_populate_scene",
+            wraps=self.workspace.surface_view._populate_scene,
+        ) as populate_scene:
+            self.workspace.set_preview_context(
+                [mutable_level],
+                self.initial_camera,
+                preview_model,
+            )
+
+        populate_scene.assert_called_once_with()
+        self.assertIs(
+            self.workspace.surface_view.get_scene_model(),
+            preview_model,
+        )
+
     def test_provider_selector_has_exact_options_and_persists_selection(self) -> None:
         combo = self.workspace.surface_texture_provider_combo
         options = [
@@ -487,6 +671,458 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         self.assertIs(
             self.workspace.right_view_stack.currentWidget(),
             self.workspace.surface_3d_page,
+        )
+
+    def test_same_path_texture_replacement_rebuilds_thumbnail_and_signature(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        surface_id = "level:2/room:5/floor"
+        assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "changing-floor",
+            (surface_id,),
+            surface_type="floor",
+            color=(25, 190, 50, 255),
+        )
+        self.workspace.set_data(
+            SurfaceTextureData(
+                selected_surface_type="floor",
+                selected_surface_ids=(surface_id,),
+                assignments=[assignment],
+            )
+        )
+        original_entry = self.workspace.texture_view.selected_entry
+        original_signature = self.workspace.get_preview_dependency_signature()
+        texture_path = asset_directory / assignment.asset_path
+        Image.new("RGBA", (1024, 1024), (210, 30, 40, 255)).save(
+            texture_path
+        )
+        current_stat = texture_path.stat()
+        os.utime(
+            texture_path,
+            ns=(current_stat.st_atime_ns, current_stat.st_mtime_ns + 1_000_000),
+        )
+
+        self.workspace._refresh_texture_atlases()
+
+        replacement_entry = self.workspace.texture_view.selected_entry
+        self.assertIsNot(replacement_entry, original_entry)
+        self.assertEqual(
+            replacement_entry.get_image().pixelColor(0, 0).red(),
+            210,
+        )
+        self.assertNotEqual(
+            self.workspace.get_preview_dependency_signature(),
+            original_signature,
+        )
+
+    def test_file_backed_preview_refresh_is_revision_guarded(self) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        surface_id = "level:2/room:5/floor"
+        assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "guarded-floor",
+            (surface_id,),
+            surface_type="floor",
+            color=(25, 190, 50, 255),
+        )
+        self.workspace.set_data(
+            SurfaceTextureData(
+                selected_surface_type="floor",
+                selected_surface_ids=(surface_id,),
+                assignments=[assignment],
+            )
+        )
+
+        with (
+            patch.object(
+                self.workspace,
+                "_restore_assignment_textures",
+                wraps=self.workspace._restore_assignment_textures,
+            ) as restore_textures,
+            patch.object(
+                self.workspace,
+                "_refresh_texture_atlases",
+                wraps=self.workspace._refresh_texture_atlases,
+            ) as refresh_atlases,
+        ):
+            self.workspace.refresh_file_backed_previews()
+            restore_textures.assert_not_called()
+            refresh_atlases.assert_not_called()
+
+            texture_path = asset_directory / assignment.asset_path
+            Image.new("RGBA", (1024, 1024), (210, 30, 40, 255)).save(
+                texture_path
+            )
+            current_stat = texture_path.stat()
+            os.utime(
+                texture_path,
+                ns=(
+                    current_stat.st_atime_ns,
+                    current_stat.st_mtime_ns + 1_000_000,
+                ),
+            )
+            self.workspace.refresh_file_backed_previews()
+
+        restore_textures.assert_called_once_with()
+        refresh_atlases.assert_called_once_with()
+
+    def test_file_backed_refresh_stats_each_texture_path_once(self) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        surface_id = "level:2/room:5/floor"
+        assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "single-stat-floor",
+            (surface_id,),
+            surface_type="floor",
+        )
+        self.workspace.set_data(
+            SurfaceTextureData(
+                selected_surface_type="floor",
+                selected_surface_ids=(surface_id,),
+                assignments=[assignment],
+            )
+        )
+
+        with patch(
+            "housemaker.surface_texture_workspace."
+            "_build_surface_asset_revision",
+            wraps=_build_surface_asset_revision,
+        ) as build_revision:
+            self.workspace.refresh_file_backed_previews()
+
+        self.assertEqual(build_revision.call_count, 3)
+
+    def test_known_missing_texture_revision_is_cached_until_reappearance(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        surface_id = "level:2/room:5/wall:1:2"
+        valid_assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "available-wall",
+            (surface_id,),
+            surface_type="wall",
+            color=(25, 190, 50, 255),
+        )
+        missing_assignment = SurfaceTextureAssignment(
+            assignment_id="missing-wall",
+            surface_type="wall",
+            surface_ids=("level:2/room:5/wall:2:3",),
+            provider="test",
+            asset_path="missing-wall.png",
+            texture_width=32,
+            texture_height=32,
+        )
+        self.workspace.set_data(
+            SurfaceTextureData(
+                selected_surface_type="wall",
+                selected_surface_ids=(surface_id,),
+                assignments=[valid_assignment, missing_assignment],
+            )
+        )
+
+        with (
+            patch.object(
+                self.workspace,
+                "_restore_assignment_textures",
+                wraps=self.workspace._restore_assignment_textures,
+            ) as restore_textures,
+            patch.object(
+                self.workspace,
+                "_refresh_texture_atlases",
+                wraps=self.workspace._refresh_texture_atlases,
+            ) as refresh_atlases,
+        ):
+            self.workspace.refresh_file_backed_previews()
+            self.workspace.refresh_file_backed_previews()
+            restore_textures.assert_not_called()
+            refresh_atlases.assert_not_called()
+
+            Image.new("RGBA", (32, 32), (210, 30, 40, 255)).save(
+                asset_directory / missing_assignment.asset_path
+            )
+            self.workspace.refresh_file_backed_previews()
+
+        restore_textures.assert_called_once_with()
+        refresh_atlases.assert_called_once_with()
+
+    def test_failed_surface_install_retries_the_same_revision(self) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "retry-floor",
+            ("level:2/room:5/floor",),
+            surface_type="floor",
+            color=(25, 190, 50, 255),
+        )
+        self.workspace.set_data(SurfaceTextureData(assignments=[assignment]))
+        self.workspace._restored_assignment_texture_signature = None
+
+        with patch.object(
+            self.workspace.surface_view,
+            "set_surface_texture",
+            side_effect=(ValueError("temporary decode failure"), None),
+        ) as install_texture:
+            self.workspace.refresh_file_backed_previews()
+            self.assertIsNone(
+                self.workspace._restored_assignment_texture_signature
+            )
+            self.workspace.refresh_file_backed_previews()
+
+        self.assertEqual(install_texture.call_count, 2)
+        self.assertIsNotNone(
+            self.workspace._restored_assignment_texture_signature
+        )
+
+    def test_failed_surface_thumbnail_decode_retries_same_revision(self) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "retry-thumbnail",
+            ("level:2/room:5/floor",),
+            surface_type="floor",
+            color=(25, 190, 50, 255),
+        )
+        self.workspace.set_data(
+            SurfaceTextureData(
+                selected_surface_type="floor",
+                selected_surface_ids=("level:2/room:5/floor",),
+                assignments=[assignment],
+            )
+        )
+        self.workspace._texture_atlas_entry_cache.clear()
+        self.workspace._texture_catalog_dependency_signature = None
+        failed_once = False
+
+        def build_entry(*args, **kwargs):
+            nonlocal failed_once
+            if not failed_once and str(kwargs.get("atlas_id", "")).endswith(
+                ":resolution:512"
+            ):
+                failed_once = True
+                raise ValueError("temporary thumbnail decode failure")
+            return TextureAtlasEntry(*args, **kwargs)
+
+        with patch(
+            "housemaker.surface_texture_workspace.TextureAtlasEntry",
+            side_effect=build_entry,
+        ) as entry_builder:
+            self.workspace.refresh_file_backed_previews()
+            self.assertIsNone(
+                self.workspace._texture_catalog_dependency_signature
+            )
+            self.workspace.refresh_file_backed_previews()
+
+        self.assertEqual(entry_builder.call_count, 4)
+        self.assertEqual(len(self.workspace.texture_view.entries), 3)
+        self.assertIsNotNone(
+            self.workspace._texture_catalog_dependency_signature
+        )
+
+    def test_surface_material_revision_change_during_load_retries(self) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "material-race",
+            ("level:2/room:5/floor",),
+            surface_type="floor",
+            color=(25, 190, 50, 255),
+        )
+        self.workspace.set_data(SurfaceTextureData(assignments=[assignment]))
+        self.workspace._restored_assignment_texture_signature = None
+        revision_before = (("material", "before"),)
+        revision_after = (("material", "after"),)
+
+        with patch.object(
+            self.workspace,
+            "get_preview_dependency_signature",
+            side_effect=(
+                revision_before,
+                revision_before,
+                revision_after,
+                revision_after,
+                revision_after,
+                revision_after,
+            ),
+        ):
+            self.workspace.refresh_file_backed_previews()
+            self.assertIsNone(
+                self.workspace._restored_assignment_texture_signature
+            )
+            self.workspace.refresh_file_backed_previews()
+
+        self.assertEqual(
+            self.workspace._restored_assignment_texture_signature,
+            revision_after,
+        )
+
+    def test_surface_catalog_revision_change_during_decode_retries(self) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "catalog-race",
+            ("level:2/room:5/floor",),
+            surface_type="floor",
+            color=(25, 190, 50, 255),
+        )
+        self.workspace.set_data(
+            SurfaceTextureData(
+                selected_surface_type="floor",
+                selected_surface_ids=("level:2/room:5/floor",),
+                assignments=[assignment],
+            )
+        )
+        self.workspace._texture_atlas_entry_cache.clear()
+        self.workspace._texture_catalog_dependency_signature = None
+        revision_before = (("catalog", "before"),)
+        revision_after = (("catalog", "after"),)
+
+        with patch.object(
+            self.workspace,
+            "_build_texture_catalog_dependency_signature",
+            side_effect=(
+                revision_before,
+                revision_before,
+                revision_after,
+                revision_after,
+                revision_after,
+                revision_after,
+            ),
+        ):
+            self.workspace.refresh_file_backed_previews()
+            self.assertIsNone(
+                self.workspace._texture_catalog_dependency_signature
+            )
+            self.workspace.refresh_file_backed_previews()
+
+        self.assertEqual(
+            self.workspace._texture_catalog_dependency_signature,
+            revision_after,
+        )
+
+    def test_assignment_apply_reloads_a_concurrently_replaced_png(self) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(exist_ok=True)
+        texture_path = asset_directory / "apply-race.png"
+        original_png = _colored_texture_png((180, 40, 30, 255))
+        replacement_png = _colored_texture_png((20, 170, 90, 255))
+        texture_path.write_bytes(original_png)
+        first_wall = "level:2/room:5/wall:1:2"
+        second_wall = "level:2/room:5/wall:2:3"
+        assignment = _surface_assignment(
+            "apply-race",
+            (first_wall,),
+            texture_path.name,
+        )
+        self.workspace.set_data(SurfaceTextureData(assignments=[assignment]))
+        install_texture = self.workspace.surface_view.set_surface_texture
+
+        def install_then_replace(
+            surface_ids: tuple[str, ...],
+            texture: object,
+        ) -> None:
+            install_texture(surface_ids, texture)  # type: ignore[arg-type]
+            texture_path.write_bytes(replacement_png)
+
+        with patch.object(
+            self.workspace.surface_view,
+            "set_surface_texture",
+            side_effect=install_then_replace,
+        ):
+            self.assertTrue(
+                self.workspace.apply_assignment_texture(
+                    assignment.assignment_id,
+                    (second_wall,),
+                )
+            )
+
+        self.assertIsNone(
+            self.workspace._restored_assignment_texture_signature
+        )
+        installed_before_refresh = (
+            self.workspace.surface_view.get_surface_texture_rgba(second_wall)
+        )
+        assert installed_before_refresh is not None
+        self.assertEqual(tuple(installed_before_refresh[0, 0]), (180, 40, 30, 255))
+
+        self.workspace.refresh_file_backed_previews()
+
+        installed_after_refresh = (
+            self.workspace.surface_view.get_surface_texture_rgba(second_wall)
+        )
+        assert installed_after_refresh is not None
+        self.assertEqual(tuple(installed_after_refresh[0, 0]), (20, 170, 90, 255))
+        self.assertIsNotNone(
+            self.workspace._restored_assignment_texture_signature
+        )
+
+    def test_generation_commit_reloads_a_concurrently_replaced_png(self) -> None:
+        wall_id = "level:2/room:5/wall:1:2"
+        generated_png = _colored_texture_png((180, 40, 30, 255))
+        replacement_output = io.BytesIO()
+        Image.new("RGBA", (1024, 1024), (20, 170, 90, 255)).save(
+            replacement_output,
+            format="PNG",
+        )
+        replacement_png = replacement_output.getvalue()
+        request = SurfaceTextureRequest(
+            provider="meshy",
+            api_key="test-key",
+            reference_pngs=(_texture_png(),),
+            reference_frame_indices=(0,),
+            surface_type="wall",
+            surface_ids=(wall_id,),
+            combined_area_m2=6.0,
+            prompt="Generate one wall",
+        )
+        install_texture = self.workspace.surface_view.set_surface_texture
+
+        def install_then_replace(
+            surface_ids: tuple[str, ...],
+            texture: object,
+        ) -> None:
+            install_texture(surface_ids, texture)  # type: ignore[arg-type]
+            active_paths = tuple(
+                (self._temporary_path / "surface_assets").glob(
+                    "*.texture-1024.png"
+                )
+            )
+            self.assertEqual(len(active_paths), 1)
+            active_paths[0].write_bytes(replacement_png)
+
+        with patch.object(
+            self.workspace.surface_view,
+            "set_surface_texture",
+            side_effect=install_then_replace,
+        ):
+            self.workspace._handle_generation_succeeded(
+                request,
+                SurfaceTextureResult(
+                    provider="meshy",
+                    texture_png=generated_png,
+                ),
+            )
+
+        self.assertIsNone(
+            self.workspace._restored_assignment_texture_signature
+        )
+        installed_before_refresh = (
+            self.workspace.surface_view.get_surface_texture_rgba(wall_id)
+        )
+        assert installed_before_refresh is not None
+        self.assertEqual(tuple(installed_before_refresh[0, 0]), (180, 40, 30, 255))
+
+        self.workspace.refresh_file_backed_previews()
+
+        installed_after_refresh = (
+            self.workspace.surface_view.get_surface_texture_rgba(wall_id)
+        )
+        assert installed_after_refresh is not None
+        self.assertEqual(tuple(installed_after_refresh[0, 0]), (20, 170, 90, 255))
+        self.assertIsNotNone(
+            self.workspace._restored_assignment_texture_signature
         )
 
     def test_single_clicked_variant_changes_the_assignment_globally(self) -> None:

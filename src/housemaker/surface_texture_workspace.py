@@ -7,7 +7,7 @@ import tempfile
 import threading
 import uuid
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
@@ -56,6 +56,7 @@ from housemaker.surface_texture_providers import (
 )
 from housemaker.surface_texture_state import (
     MAX_LOCALIZED_INPAINT_UNDO_HISTORY,
+    SURFACE_TYPE_WALL,
     SurfaceTextureAssignment,
     SurfaceTextureData,
     SurfaceTextureInpaintUndoSnapshot,
@@ -86,6 +87,109 @@ INTERRUPT_POLL_SECONDS = 0.05
 SHUTDOWN_WAIT_MILLISECONDS = 250
 OTHER_TEXTURE_THUMBNAIL_SIZE = QSize(96, 96)
 OTHER_TEXTURE_GRID_SIZE = QSize(152, 128)
+
+
+# ### Level synchronization helpers ###
+def _build_level_sync_signature(
+    levels: Sequence[LevelData],
+    initial_camera: InitialFirstPersonCamera | None,
+) -> tuple[object, ...]:
+    """Snapshot mutable level content used by the Surface scene."""
+
+    return (
+        _freeze_level_sync_value(tuple(levels)),
+        _freeze_level_sync_value(initial_camera),
+    )
+
+
+def _freeze_level_sync_value(value: object) -> object:
+    """Convert nested model values into a stable, immutable signature."""
+
+    if is_dataclass(value) and not isinstance(value, type):
+        return (
+            type(value).__qualname__,
+            tuple(
+                (
+                    model_field.name,
+                    _freeze_level_sync_value(
+                        getattr(value, model_field.name)
+                    ),
+                )
+                for model_field in fields(value)
+            ),
+        )
+    if isinstance(value, dict):
+        frozen_items = (
+            (
+                _freeze_level_sync_value(key),
+                _freeze_level_sync_value(item_value),
+            )
+            for key, item_value in value.items()
+        )
+        return (
+            "dict",
+            tuple(sorted(frozen_items, key=repr)),
+        )
+    if isinstance(value, list | tuple):
+        return tuple(_freeze_level_sync_value(item) for item in value)
+    if isinstance(value, set | frozenset):
+        return (
+            "set",
+            tuple(
+                sorted(
+                    (_freeze_level_sync_value(item) for item in value),
+                    key=repr,
+                )
+            ),
+        )
+    if isinstance(value, float):
+        return ("float", value.hex())
+    if isinstance(value, Path):
+        return ("path", str(value))
+    if value is None or isinstance(value, str | bytes | int | bool):
+        return value
+    return (type(value).__qualname__, repr(value))
+
+
+# ### Asset revision helpers ###
+def _build_surface_asset_revision(
+    asset_directory: Path,
+    raw_asset_path: object,
+) -> tuple[object, ...]:
+    """Return a stable local path and cheap revision for one texture file."""
+
+    normalized_path = str(raw_asset_path or "")
+    try:
+        asset_root = asset_directory.resolve()
+        asset_path = (asset_directory / normalized_path).resolve()
+        asset_path.relative_to(asset_root)
+        asset_stat = asset_path.stat()
+    except (OSError, RuntimeError, ValueError):
+        return normalized_path, None, None, None
+    return (
+        str(asset_path),
+        int(asset_stat.st_size),
+        int(asset_stat.st_mtime_ns),
+        int(asset_stat.st_ctime_ns),
+    )
+
+
+def _get_cached_surface_asset_revision(
+    revision_cache: dict[str, tuple[object, ...]],
+    asset_directory: Path,
+    raw_asset_path: object,
+) -> tuple[object, ...]:
+    """Stat each logical texture path once within one comparison pass."""
+
+    cache_key = str(raw_asset_path or "")
+    revision = revision_cache.get(cache_key)
+    if revision is None:
+        revision = _build_surface_asset_revision(
+            asset_directory,
+            raw_asset_path,
+        )
+        revision_cache[cache_key] = revision
+    return revision
 
 
 # ### Request models ###
@@ -240,6 +344,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._data = SurfaceTextureData()
         self._levels: list[LevelData] = []
         self._initial_camera: InitialFirstPersonCamera | None = None
+        self._level_sync_signature: tuple[object, ...] | None = None
         self._video_source: VideoFrameSource | None = None
         self._displayed_frame_index: int | None = None
         self._is_syncing_seekbar = False
@@ -247,13 +352,22 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._generation_worker: SurfaceTextureWorker | None = None
         self._texture_atlas_entry_cache: dict[
             str,
-            tuple[str, TextureAtlasEntry],
+            tuple[tuple[object, ...], TextureAtlasEntry],
         ] = {}
         self._texture_variant_entry_targets: dict[str, tuple[str, int]] = {}
         self._other_texture_entry_targets: dict[
             str,
             tuple[str, int | None],
         ] = {}
+        self._restored_assignment_texture_signature: (
+            tuple[tuple[object, ...], ...] | None
+        ) = None
+        self._texture_catalog_dependency_signature: (
+            tuple[tuple[object, ...], ...] | None
+        ) = None
+        self._other_texture_list_signature: (
+            tuple[tuple[object, ...], ...] | None
+        ) = None
         self._texture_resolution_change_handler: (
             Callable[[str, int], bool] | None
         ) = None
@@ -287,6 +401,88 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 material_sources[surface_id] = texture_path
         return material_sources
 
+    def get_preview_dependency_signature(
+        self,
+    ) -> tuple[tuple[object, ...], ...]:
+        """Snapshot assigned texture files without cloning or decoding images."""
+
+        return self._build_preview_dependency_signature({})
+
+    def _build_preview_dependency_signature(
+        self,
+        revision_cache: dict[str, tuple[object, ...]],
+    ) -> tuple[tuple[object, ...], ...]:
+        """Snapshot active PNGs using one caller-owned stat cache."""
+
+        return tuple(
+            (
+                assignment.assignment_id,
+                assignment.selected_texture_resolution,
+                assignment.asset_path,
+                _get_cached_surface_asset_revision(
+                    revision_cache,
+                    self._asset_directory,
+                    assignment.asset_path,
+                ),
+            )
+            for assignment in self._data.assignments
+        )
+
+    def refresh_file_backed_previews(self) -> None:
+        """Reload only Surface assets whose on-disk revisions changed."""
+
+        revision_cache: dict[str, tuple[object, ...]] = {}
+        material_signature = self.get_preview_dependency_signature()
+        for assignment, signature_item in zip(
+            self._data.assignments,
+            material_signature,
+            strict=False,
+        ):
+            if len(signature_item) >= 4:
+                revision_cache[str(assignment.asset_path)] = signature_item[3]
+        if material_signature != self._restored_assignment_texture_signature:
+            self._restore_assignment_textures()
+
+        catalog_signature = self._build_texture_catalog_dependency_signature(
+            revision_cache
+        )
+        if catalog_signature != self._texture_catalog_dependency_signature:
+            self._refresh_texture_atlases()
+
+    def _build_texture_catalog_dependency_signature(
+        self,
+        revision_cache: dict[str, tuple[object, ...]] | None = None,
+    ) -> tuple[tuple[object, ...], ...]:
+        """Snapshot active and alternate PNGs shown by Surface controls."""
+
+        cached_revisions = {} if revision_cache is None else revision_cache
+        return tuple(
+            (
+                assignment.assignment_id,
+                assignment.surface_type,
+                assignment.selected_texture_resolution,
+                assignment.asset_path,
+                _get_cached_surface_asset_revision(
+                    cached_revisions,
+                    self._asset_directory,
+                    assignment.asset_path,
+                ),
+                tuple(
+                    (
+                        variant.resolution,
+                        variant.asset_path,
+                        _get_cached_surface_asset_revision(
+                            cached_revisions,
+                            self._asset_directory,
+                            variant.asset_path,
+                        ),
+                    )
+                    for variant in assignment.texture_variants
+                ),
+            )
+            for assignment in self._data.assignments
+        )
+
     def get_assignment_asset_path(
         self,
         assignment_id: str,
@@ -316,6 +512,23 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         except ValueError:
             return None
         return texture_path if texture_path.is_file() else None
+
+    def get_assignment(
+        self,
+        assignment_id: str,
+    ) -> SurfaceTextureAssignment | None:
+        """Return one immutable assignment without cloning all Surface data."""
+
+        return self._assignment_by_id(assignment_id)
+
+    def get_wall_assignments(self) -> tuple[SurfaceTextureAssignment, ...]:
+        """Return immutable wall assignments without cloning Surface data."""
+
+        return tuple(
+            assignment
+            for assignment in self._data.assignments
+            if assignment.surface_type == SURFACE_TYPE_WALL
+        )
 
     def can_select_assignment_texture_resolution(
         self,
@@ -643,6 +856,10 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             self._data.assignments = next_assignments
             self._data.texture_mask_strokes = next_strokes
             self.surface_view.set_texture_mask_strokes(next_strokes)
+            # The caller supplied bytes read before this commit.  Do not bind
+            # them to a file revision sampled afterward: the backing PNG may
+            # have been replaced between the read and this installation.
+            self._restored_assignment_texture_signature = None
         except (OSError, TypeError, ValueError):
             self._data.assignments = previous_assignments
             self._data.texture_mask_strokes = previous_strokes
@@ -720,10 +937,61 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         levels: Sequence[LevelData],
         initial_camera: InitialFirstPersonCamera | None = None,
     ) -> None:
+        self._set_level_context(
+            levels,
+            initial_camera,
+            preview_model=None,
+            replace_preview_model=False,
+        )
+
+    def set_preview_context(
+        self,
+        levels: Sequence[LevelData],
+        initial_camera: InitialFirstPersonCamera | None,
+        model: GeneratedModel | None,
+    ) -> None:
+        """Synchronize semantic levels and the shared model with one GL rebuild."""
+
+        self._set_level_context(
+            levels,
+            initial_camera,
+            preview_model=model,
+            replace_preview_model=True,
+        )
+
+    def _set_level_context(
+        self,
+        levels: Sequence[LevelData],
+        initial_camera: InitialFirstPersonCamera | None,
+        *,
+        preview_model: GeneratedModel | None,
+        replace_preview_model: bool,
+    ) -> None:
+        normalized_levels = list(levels)
+        next_signature = _build_level_sync_signature(
+            normalized_levels,
+            initial_camera,
+        )
+        if next_signature == self._level_sync_signature:
+            # Retain the latest model objects without rebuilding equivalent
+            # semantic geometry, textures, atlas controls, or OpenGL items.
+            self._levels = normalized_levels
+            self._initial_camera = initial_camera
+            self.refresh_file_backed_previews()
+            if replace_preview_model:
+                self.set_preview_model(preview_model)
+            return
+
         if self._levels:
             self._store_viewer_state()
-        self._levels = list(levels)
+        self._levels = normalized_levels
         self._initial_camera = initial_camera
+        if replace_preview_model:
+            self.surface_view.set_scene_model(
+                preview_model,
+                repopulate=False,
+            )
+            self.surface_view.clear_surface_textures()
         self.surface_view.set_levels(
             self._levels,
             initial_camera,
@@ -733,6 +1001,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._refresh_texture_atlases()
         self._sync_selection_status()
         self._sync_controls()
+        self._level_sync_signature = next_signature
 
     def set_preview_model(self, model: GeneratedModel | None) -> None:
         """Use the Canvas model while retaining semantic selection and inpainting."""
@@ -752,9 +1021,12 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     def set_external_3d_viewer_active(self, is_active: bool) -> None:
         """Show the local atlas inspector while fixed surfaces are external."""
 
-        self.right_view_stack.setCurrentWidget(
-            self.texture_view_page if is_active else self.surface_3d_page
+        target_page = (
+            self.texture_view_page if bool(is_active) else self.surface_3d_page
         )
+        if self.right_view_stack.currentWidget() is target_page:
+            return
+        self.right_view_stack.setCurrentWidget(target_page)
 
     def set_provider(
         self,
@@ -1520,6 +1792,10 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             return
 
         self._data.assignments = [*retained_assignments, *assignments]
+        # These pixels came from the generated in-memory payload.  Leave the
+        # file-backed cache unvalidated so activation confirms the exact bytes
+        # that were persisted, including a concurrent same-path replacement.
+        self._restored_assignment_texture_signature = None
         discarded_snapshots: list[SurfaceTextureInpaintUndoSnapshot] = []
         if is_localized_inpaint:
             self._data.localized_inpaint_undo_stack.append(
@@ -1906,9 +2182,19 @@ class SurfaceTextureGenerationWorkspace(QWidget):
 
     def _restore_viewer_state(self) -> None:
         if self._data.camera_pose is not None:
-            self.surface_view.set_camera_pose(self._data.camera_pose)
+            self.surface_view.set_camera_pose(
+                self._data.camera_pose,
+                emit_signal=False,
+            )
         self.surface_view.set_selected_surface_ids(
-            self._data.selected_surface_ids
+            self._data.selected_surface_ids,
+            emit_signal=False,
+        )
+        self._data.selected_surface_ids = tuple(
+            self.surface_view.get_selected_surface_ids()
+        )
+        self._data.selected_surface_type = (
+            self.surface_view.get_selected_surface_type()
         )
         self.surface_view.set_texture_mask_strokes(
             self._data.texture_mask_strokes
@@ -1920,10 +2206,21 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         required_assignment_ids: set[str] | None = None,
     ) -> None:
         required_ids = required_assignment_ids or set()
+        signature_before = self.get_preview_dependency_signature()
+        restore_succeeded = True
         self.surface_view.clear_surface_textures()
         for assignment in self._data.assignments:
             try:
                 texture_path = self._resolve_asset_path(assignment.asset_path)
+            except (OSError, TypeError, ValueError):
+                if assignment.assignment_id in required_ids:
+                    raise
+                continue
+            if not texture_path.is_file():
+                if assignment.assignment_id in required_ids:
+                    raise OSError("The required surface texture is missing.")
+                continue
+            try:
                 self.surface_view.set_surface_texture(
                     assignment.surface_ids,
                     texture_path,
@@ -1931,9 +2228,17 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             except (OSError, TypeError, ValueError):
                 if assignment.assignment_id in required_ids:
                     raise
+                restore_succeeded = False
                 continue
+        signature_after = self.get_preview_dependency_signature()
+        self._restored_assignment_texture_signature = (
+            signature_after
+            if restore_succeeded and signature_before == signature_after
+            else None
+        )
 
     def _refresh_texture_atlases(self) -> None:
+        signature_before = self._build_texture_catalog_dependency_signature()
         assignment_id = self._latest_selected_surface_assignment_id()
         assignment = next(
             (
@@ -1945,21 +2250,31 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         )
         entries: list[TextureAtlasEntry] = []
         other_entries: list[TextureAtlasEntry] = []
-        next_cache: dict[str, tuple[str, TextureAtlasEntry]] = {}
+        next_cache: dict[
+            str,
+            tuple[tuple[object, ...], TextureAtlasEntry],
+        ] = {}
         next_targets: dict[str, tuple[str, int]] = {}
         next_other_targets: dict[str, tuple[str, int | None]] = {}
         next_other_tooltips: dict[str, str] = {}
+        catalog_succeeded = True
         for variant in (() if assignment is None else assignment.texture_variants):
             entry_id = (
                 f"{assignment.assignment_id}:resolution:{variant.resolution}"
             )
             try:
                 texture_path = self._resolve_asset_path(variant.asset_path)
-                if not texture_path.is_file():
-                    continue
-                resolved_path = str(texture_path)
+            except (OSError, TypeError, ValueError):
+                continue
+            if not texture_path.is_file():
+                continue
+            asset_revision = _build_surface_asset_revision(
+                self._asset_directory,
+                variant.asset_path,
+            )
+            try:
                 cached_entry = self._texture_atlas_entry_cache.get(entry_id)
-                if cached_entry is not None and cached_entry[0] == resolved_path:
+                if cached_entry is not None and cached_entry[0] == asset_revision:
                     entry = cached_entry[1]
                 else:
                     entry = TextureAtlasEntry(
@@ -1969,9 +2284,10 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                         owner_id=assignment.assignment_id,
                     )
             except (OSError, TypeError, ValueError):
+                catalog_succeeded = False
                 continue
             entries.append(entry)
-            next_cache[entry_id] = (resolved_path, entry)
+            next_cache[entry_id] = (asset_revision, entry)
             next_targets[entry_id] = (
                 assignment.assignment_id,
                 variant.resolution,
@@ -2007,13 +2323,19 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             entry_id = f"{candidate.assignment_id}:other-texture"
             try:
                 texture_path = self._resolve_asset_path(candidate.asset_path)
-                if not texture_path.is_file():
-                    continue
-                resolved_path = str(texture_path)
+            except (OSError, TypeError, ValueError):
+                continue
+            if not texture_path.is_file():
+                continue
+            asset_revision = _build_surface_asset_revision(
+                self._asset_directory,
+                candidate.asset_path,
+            )
+            try:
                 cached_entry = self._texture_atlas_entry_cache.get(entry_id)
                 if (
                     cached_entry is not None
-                    and cached_entry[0] == resolved_path
+                    and cached_entry[0] == asset_revision
                     and cached_entry[1].display_name == display_name
                 ):
                     entry = cached_entry[1]
@@ -2036,9 +2358,10 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 ):
                     continue
             except (OSError, TypeError, ValueError):
+                catalog_succeeded = False
                 continue
             other_entries.append(entry)
-            next_cache[entry_id] = (resolved_path, entry)
+            next_cache[entry_id] = (asset_revision, entry)
             next_other_targets[entry_id] = (
                 candidate.assignment_id,
                 resolution,
@@ -2099,6 +2422,12 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             )
         finally:
             self._is_refreshing_texture_atlases = False
+        signature_after = self._build_texture_catalog_dependency_signature()
+        self._texture_catalog_dependency_signature = (
+            signature_after
+            if catalog_succeeded and signature_before == signature_after
+            else None
+        )
 
     def _rebuild_other_texture_list(
         self,
@@ -2106,6 +2435,18 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         tooltips_by_entry_id: dict[str, str],
     ) -> None:
         """Replace the compact reusable-texture thumbnail library."""
+
+        content_signature = tuple(
+            (
+                id(entry),
+                entry.atlas_id,
+                entry.display_name,
+                tooltips_by_entry_id.get(entry.atlas_id, entry.display_name),
+            )
+            for entry in entries
+        )
+        if content_signature == self._other_texture_list_signature:
+            return
 
         current_item = self.other_texture_list.currentItem()
         current_entry_id = (
@@ -2142,6 +2483,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 self.other_texture_list.setCurrentItem(replacement_item)
         finally:
             self.other_texture_list.blockSignals(signals_were_blocked)
+        self._other_texture_list_signature = content_signature
 
     @Slot(object)
     def _handle_texture_variant_selected(self, raw_entry: object) -> None:

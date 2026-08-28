@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from housemaker.generation_state import (
     MASK_MODE_ERASE,
     MASK_MODE_PAINT,
+    GeneratedObjectPlacement,
     GeneratedObjectRecord,
     GenerationData,
     MaskPoint,
@@ -40,6 +42,8 @@ from housemaker.generation_workspace import (
     MeshyImagePlanner,
     MeshyModelExecutor,
     StagedMeshyGenerationResult,
+    TEXTURE_VARIANTS_PIPELINE_KEY,
+    _build_texture_resolution_entries,
     _format_model_statistics,
     _collect_model_uv_triangles,
     _staged_generation_mode,
@@ -47,6 +51,7 @@ from housemaker.generation_workspace import (
 from housemaker.glb import GeneratedModel, import_generated_glb
 from housemaker.meshy_generation import MeshyGenerationResult
 from housemaker.settings_widget import GenerationServiceSettings
+from housemaker.texture_atlas_view import TextureAtlasEntry
 from housemaker.unused_face_removal import (
     ALL_CAMERA_IDS,
     UnusedFaceRemovalCancelled,
@@ -1269,6 +1274,379 @@ class GenerationWorkspaceTests(unittest.TestCase):
             self.assertIs(
                 self.workspace.right_view_stack.currentWidget(),
                 self.workspace.object_3d_page,
+            )
+
+    def test_unchanged_object_preview_refresh_preserves_resources(
+        self,
+    ) -> None:
+        model = _test_model()
+        self.workspace._handle_generation_succeeded(
+            _test_meshy_result(),
+            model,
+        )
+        record = self.workspace._data.generated_objects[-1]
+        original_item = self.workspace.generated_objects_list.item(0)
+
+        with (
+            patch.object(self.workspace.result_view, "clear_model") as clear,
+            patch.object(self.workspace.result_view, "set_model") as set_model,
+            patch(
+                "housemaker.generation_workspace._collect_model_uv_triangles"
+            ) as collect_uvs,
+            patch(
+                "housemaker.generation_workspace."
+                "_build_texture_resolution_entries"
+            ) as build_texture_entries,
+        ):
+            self.workspace.refresh_file_backed_previews()
+
+        self.assertIs(
+            self.workspace.generated_objects_list.item(0),
+            original_item,
+        )
+        clear.assert_not_called()
+        set_model.assert_not_called()
+        collect_uvs.assert_not_called()
+        build_texture_entries.assert_not_called()
+
+    def test_in_place_preview_record_change_invalidates_display_snapshot(
+        self,
+    ) -> None:
+        model = _test_model()
+        self.workspace._handle_generation_succeeded(
+            _test_meshy_result(),
+            model,
+        )
+        record = self.workspace._data.generated_objects[-1]
+        record.pipeline["preview_revision"] = 2
+
+        with (
+            patch.object(self.workspace.result_view, "clear_model") as clear,
+            patch.object(self.workspace.result_view, "set_model") as set_model,
+            patch.object(
+                self.workspace,
+                "_refresh_object_texture_atlases",
+            ) as refresh_textures,
+        ):
+            self.workspace._refresh_generated_objects_list(record.object_id)
+
+        clear.assert_called_once_with()
+        set_model.assert_called_once_with(model)
+        refresh_textures.assert_called_once_with(record.object_id)
+
+    def test_same_path_glb_replacement_reloads_preview_and_signature(
+        self,
+    ) -> None:
+        model = _test_model()
+        self.workspace._handle_generation_succeeded(
+            _test_meshy_result(),
+            model,
+        )
+        record = self.workspace._data.generated_objects[-1]
+        placed_record = replace(
+            record,
+            placement=GeneratedObjectPlacement(
+                level_index=0,
+                image_x=20.0,
+                image_y=30.0,
+            ),
+        )
+        self.workspace._data.generated_objects[-1] = placed_record
+        original_signature = (
+            self.workspace.get_placed_preview_dependency_signature()
+        )
+        asset_path = self.workspace._resolve_meshy_asset_path(
+            placed_record.asset_path
+        )
+        replacement_scene = trimesh.Scene(
+            trimesh.creation.icosphere(subdivisions=1)
+        )
+        asset_path.write_bytes(replacement_scene.export(file_type="glb"))
+        current_stat = asset_path.stat()
+        os.utime(
+            asset_path,
+            ns=(current_stat.st_atime_ns, current_stat.st_mtime_ns + 1_000_000),
+        )
+
+        with patch(
+            "housemaker.generation_workspace.import_generated_glb",
+            wraps=import_generated_glb,
+        ) as import_model:
+            self.workspace.refresh_file_backed_previews()
+
+        import_model.assert_called_once()
+        self.assertIsNot(self.workspace.result_view.model, model)
+        self.assertNotEqual(
+            self.workspace.get_placed_preview_dependency_signature(),
+            original_signature,
+        )
+
+    def test_model_cache_retries_when_glb_changes_during_read(self) -> None:
+        first_model = _test_model()
+        second_model = _test_model()
+        self.workspace._handle_generation_succeeded(
+            _test_meshy_result(),
+            first_model,
+        )
+        record = self.workspace._data.generated_objects[-1]
+        self.workspace._generated_model_cache.clear()
+        self.workspace._generated_model_cache_revisions.clear()
+        revision_before = ("asset.glb", 10, 100, 200)
+        revision_after = ("asset.glb", 10, 101, 201)
+
+        with (
+            patch(
+                "housemaker.generation_workspace."
+                "_build_generation_asset_revision",
+                side_effect=(
+                    revision_before,
+                    revision_after,
+                    revision_after,
+                    revision_after,
+                ),
+            ),
+            patch(
+                "housemaker.generation_workspace.import_generated_glb",
+                side_effect=(first_model, second_model),
+            ) as import_model,
+        ):
+            loaded_model = self.workspace._load_generated_object_model(record)
+
+        self.assertIs(loaded_model, second_model)
+        self.assertEqual(import_model.call_count, 2)
+        self.assertIs(
+            self.workspace._generated_model_cache[record.object_id],
+            second_model,
+        )
+        self.assertEqual(
+            self.workspace._generated_model_cache_revisions[record.object_id],
+            revision_after,
+        )
+
+    def test_texture_resolution_entries_are_cached_by_content_revision(
+        self,
+    ) -> None:
+        model = _test_model()
+        self.workspace._handle_generation_succeeded(
+            _test_meshy_result(),
+            model,
+        )
+        record = self.workspace._data.generated_objects[-1]
+        self.workspace._texture_resolution_entry_cache.clear()
+
+        with patch(
+            "housemaker.generation_workspace._build_texture_resolution_entries",
+            wraps=_build_texture_resolution_entries,
+        ) as build_entries:
+            self.workspace._refresh_object_texture_atlases(record.object_id)
+            self.workspace._refresh_object_texture_atlases(record.object_id)
+            record.pipeline[TEXTURE_VARIANTS_PIPELINE_KEY] = {}
+            self.workspace._refresh_object_texture_atlases(record.object_id)
+
+        self.assertEqual(build_entries.call_count, 2)
+
+    def test_known_missing_texture_variant_is_cached_until_reappearance(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            asset_directory = Path(temporary_directory)
+            self.workspace._asset_directory = asset_directory
+            model = _test_model()
+            valid_glb = "cache-512.glb"
+            valid_png = "cache-512.png"
+            missing_glb = "cache-1024.glb"
+            missing_png = "cache-1024.png"
+            (asset_directory / valid_glb).write_bytes(model.glb_bytes)
+            Image.new("RGBA", (32, 32), (30, 70, 110, 255)).save(
+                asset_directory / valid_png
+            )
+            record = GeneratedObjectRecord(
+                object_id="partial-cache",
+                frame_index=0,
+                object_name="Partial cache",
+                pipeline={
+                    TEXTURE_VARIANTS_PIPELINE_KEY: {
+                        "512": {
+                            "glb_asset_path": valid_glb,
+                            "texture_asset_path": valid_png,
+                        },
+                        "1024": {
+                            "glb_asset_path": missing_glb,
+                            "texture_asset_path": missing_png,
+                        },
+                    },
+                    "selected_texture_resolution": 512,
+                },
+                provider_task_id="partial-cache-task",
+                asset_path=valid_glb,
+            )
+            self.workspace._data.generated_objects = [record]
+
+            with patch(
+                "housemaker.generation_workspace."
+                "_build_texture_resolution_entries",
+                wraps=_build_texture_resolution_entries,
+            ) as build_entries:
+                self.workspace._refresh_object_texture_atlases(record.object_id)
+                self.workspace._refresh_object_texture_atlases(record.object_id)
+                self.assertEqual(build_entries.call_count, 1)
+                self.assertEqual(len(self.workspace.texture_view.entries), 1)
+
+                (asset_directory / missing_glb).write_bytes(model.glb_bytes)
+                Image.new("RGBA", (32, 32), (110, 70, 30, 255)).save(
+                    asset_directory / missing_png
+                )
+                self.workspace._refresh_object_texture_atlases(record.object_id)
+
+            self.assertEqual(build_entries.call_count, 2)
+            self.assertEqual(len(self.workspace.texture_view.entries), 2)
+
+    def test_activation_does_not_repair_a_temporarily_missing_selection(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            asset_directory = Path(temporary_directory)
+            self.workspace._asset_directory = asset_directory
+            model = _test_model()
+            variants: dict[str, dict[str, str]] = {}
+            for resolution, color in (
+                (512, (30, 70, 110, 255)),
+                (1024, (110, 70, 30, 255)),
+            ):
+                glb_name = f"selection-{resolution}.glb"
+                png_name = f"selection-{resolution}.png"
+                (asset_directory / glb_name).write_bytes(model.glb_bytes)
+                Image.new("RGBA", (32, 32), color).save(
+                    asset_directory / png_name
+                )
+                variants[str(resolution)] = {
+                    "glb_asset_path": glb_name,
+                    "texture_asset_path": png_name,
+                }
+            record = GeneratedObjectRecord(
+                object_id="selection-cache",
+                frame_index=0,
+                object_name="Selection cache",
+                pipeline={
+                    TEXTURE_VARIANTS_PIPELINE_KEY: variants,
+                    "selected_texture_resolution": 1024,
+                },
+                provider_task_id="selection-cache-task",
+                asset_path="selection-1024.glb",
+            )
+            self.workspace.set_data(
+                GenerationData(generated_objects=[record])
+            )
+            selected_glb = asset_directory / "selection-1024.glb"
+            selected_png = asset_directory / "selection-1024.png"
+            glb_payload = selected_glb.read_bytes()
+            png_payload = selected_png.read_bytes()
+            selected_glb.unlink()
+            selected_png.unlink()
+
+            self.workspace.refresh_file_backed_previews()
+            missing_record = self.workspace._data.generated_objects[0]
+            self.assertEqual(
+                missing_record.pipeline["selected_texture_resolution"],
+                1024,
+            )
+            self.assertEqual(missing_record.asset_path, "selection-1024.glb")
+
+            selected_glb.write_bytes(glb_payload)
+            selected_png.write_bytes(png_payload)
+            self.workspace.refresh_file_backed_previews()
+
+            restored_record = self.workspace._data.generated_objects[0]
+            self.assertEqual(
+                restored_record.pipeline["selected_texture_resolution"],
+                1024,
+            )
+            self.assertEqual(restored_record.asset_path, "selection-1024.glb")
+            self.assertIsNotNone(self.workspace.result_view.model)
+
+    def test_failed_object_thumbnail_decode_retries_same_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            asset_directory = Path(temporary_directory)
+            self.workspace._asset_directory = asset_directory
+            model = _test_model()
+            glb_path = "retry-thumbnail.glb"
+            png_path = "retry-thumbnail.png"
+            (asset_directory / glb_path).write_bytes(model.glb_bytes)
+            Image.new("RGBA", (32, 32), (30, 70, 110, 255)).save(
+                asset_directory / png_path
+            )
+            record = GeneratedObjectRecord(
+                object_id="retry-thumbnail",
+                frame_index=0,
+                object_name="Retry thumbnail",
+                pipeline={
+                    TEXTURE_VARIANTS_PIPELINE_KEY: {
+                        "512": {
+                            "glb_asset_path": glb_path,
+                            "texture_asset_path": png_path,
+                        },
+                    },
+                    "selected_texture_resolution": 512,
+                },
+                provider_task_id="retry-thumbnail-task",
+                asset_path=glb_path,
+            )
+            self.workspace._data.generated_objects = [record]
+            failed_once = False
+
+            def build_entry(*args, **kwargs):
+                nonlocal failed_once
+                if not failed_once:
+                    failed_once = True
+                    raise ValueError("temporary thumbnail decode failure")
+                return TextureAtlasEntry(*args, **kwargs)
+
+            with patch(
+                "housemaker.generation_workspace.TextureAtlasEntry",
+                side_effect=build_entry,
+            ) as entry_builder:
+                self.workspace._refresh_object_texture_atlases(record.object_id)
+                self.assertNotIn(
+                    record.object_id,
+                    self.workspace._texture_resolution_entry_cache,
+                )
+                self.workspace._refresh_object_texture_atlases(record.object_id)
+
+            self.assertEqual(entry_builder.call_count, 2)
+            self.assertEqual(len(self.workspace.texture_view.entries), 1)
+            self.assertIn(
+                record.object_id,
+                self.workspace._texture_resolution_entry_cache,
+            )
+
+    def test_unvalidated_model_is_not_bound_to_a_newer_file_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            asset_directory = Path(temporary_directory)
+            self.workspace._asset_directory = asset_directory
+            cached_model = _test_model()
+            replacement_model = _test_textured_model((20, 80, 140, 255))
+            record = GeneratedObjectRecord(
+                object_id="cache-race",
+                frame_index=0,
+                object_name="Cache race",
+                pipeline={},
+                provider_task_id="cache-race-task",
+                asset_path="cache-race.glb",
+            )
+            asset_path = asset_directory / record.asset_path
+            asset_path.write_bytes(replacement_model.glb_bytes)
+
+            self.workspace._cache_generated_model(record, cached_model)
+
+            self.assertNotIn(
+                record.object_id,
+                self.workspace._generated_model_cache,
+            )
+            asset_path.write_bytes(cached_model.glb_bytes)
+            self.workspace._cache_generated_model(record, cached_model)
+            self.assertIs(
+                self.workspace._generated_model_cache[record.object_id],
+                cached_model,
             )
 
     def test_ambient_slider_updates_generated_object_view_lighting(self) -> None:

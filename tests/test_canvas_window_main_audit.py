@@ -173,11 +173,6 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
         self.assertAlmostEqual(rebuilt_wall.area_square_meters, 4.5)
         model = self.workspace.viewer.model
         self.assertIsNotNone(model)
-        self.assertIs(
-            self.workspace.surface_texture_generation.surface_view
-            .get_scene_model(),
-            model,
-        )
         self.assertEqual(
             set(self.workspace.viewer._window_wall_targets),
             {
@@ -193,18 +188,37 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
         )
         assert self.workspace.viewer.undo_window_button is not None
         self.assertTrue(self.workspace.viewer.undo_window_button.isEnabled())
-        surface_wall = self.workspace.surface_texture_generation.surface_view.get_surface(
-            wall.surface_id
+        self.workspace.workspace_tabs.setCurrentWidget(
+            self.workspace.surface_texture_generation
+        )
+        _qt_application.processEvents()
+        self.assertIs(
+            self.workspace.surface_texture_generation.surface_view
+            .get_scene_model(),
+            model,
+        )
+        surface_wall = (
+            self.workspace.surface_texture_generation.surface_view.get_surface(
+                wall.surface_id
+            )
         )
         self.assertIsNotNone(surface_wall)
         assert surface_wall is not None
         self.assertAlmostEqual(surface_wall.area_square_meters, 4.5)
 
+        self.workspace.workspace_tabs.setCurrentWidget(
+            self.workspace.canvas_viewer_workspace
+        )
+        _qt_application.processEvents()
         self.workspace.viewer.undo_window_button.click()
 
         self.assertEqual(level.windows, [])
         restored_wall = _get_target_wall(level)
         self.assertAlmostEqual(restored_wall.area_square_meters, 6.0)
+        self.workspace.workspace_tabs.setCurrentWidget(
+            self.workspace.surface_texture_generation
+        )
+        _qt_application.processEvents()
         restored_surface_wall = (
             self.workspace.surface_texture_generation.surface_view.get_surface(
                 wall.surface_id
@@ -360,13 +374,13 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
                 build_patch = (
                     patch.object(
                         self.workspace,
-                        "_build_generated_model",
+                        "_build_viewer_preview_model",
                         return_value=None,
                     )
                     if failure_kind == "none"
                     else patch.object(
                         self.workspace,
-                        "_build_generated_model",
+                        "_build_viewer_preview_model",
                         side_effect=RuntimeError("undo refresh failure"),
                     )
                 )
@@ -438,13 +452,13 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
                 build_patch = (
                     patch.object(
                         self.workspace,
-                        "_build_generated_model",
+                        "_build_viewer_preview_model",
                         return_value=None,
                     )
                     if failure_kind == "none"
                     else patch.object(
                         self.workspace,
-                        "_build_generated_model",
+                        "_build_viewer_preview_model",
                         side_effect=RuntimeError("audit refresh failure"),
                     )
                 )
@@ -517,6 +531,12 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
         wall = _get_target_wall(level)
         viewer = self.workspace.viewer
         viewer.set_model(model)
+        self.workspace._remember_current_canvas_preview_model(
+            model,
+            validated_dependency_signature=(
+                self.workspace._build_viewer_preview_dependency_signature()
+            ),
+        )
         viewer.set_wall_targets(tuple(build_fixed_surfaces([level])))
         self.assertTrue(viewer.select_wall_target(wall.surface_id))
         panel = viewer.window_tools_panel

@@ -328,13 +328,21 @@ class SurfaceTextureMainIntegrationTests(unittest.TestCase):
         )
         with patch.object(
             self.workspace,
-            "_build_generated_model",
+            "_build_viewer_preview_model",
             return_value=expected_model,
-        ):
+        ) as build_preview:
+            self.workspace.canvas_viewer_tabs.setCurrentIndex(
+                self.workspace.canvas_3d_view_tab_index
+            )
+            self.workspace._schedule_viewer_preview_refresh(
+                preserve_camera=False
+            )
+            _qt_application.processEvents()
             self.workspace.workspace_tabs.setCurrentWidget(surface_workspace)
             _qt_application.processEvents()
             _qt_application.processEvents()
 
+        build_preview.assert_called_once_with(None)
         canvas_model = self.workspace.viewer.model
         self.assertIs(canvas_model, expected_model)
         self.assertIs(

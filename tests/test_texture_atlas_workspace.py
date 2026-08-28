@@ -17,6 +17,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # ### Imports ###
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt
 from PySide6.QtGui import (
+    QColor,
     QDragEnterEvent,
     QDragLeaveEvent,
     QDragMoveEvent,
@@ -254,6 +255,15 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             get_atlas_wall_texture_assignment_id("surface-wall-texture:")
         )
 
+    def test_source_preview_pixels_are_immutable_after_normalization(self) -> None:
+        source = _source(
+            "immutable-preview",
+            directory=self._temporary_directory.name,
+        )
+
+        with self.assertRaises(ValueError):
+            source.preview_rgba[0, 0, 0] = 0
+
     def test_creates_named_atlas_with_selected_resolution(self) -> None:
         self.workspace.atlas_name_edit.setText("Furniture")
         self.workspace.atlas_resolution_combo.setCurrentIndex(
@@ -387,6 +397,72 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.assertIn(
             "Selected the texture",
             self.workspace.status_label.text(),
+        )
+
+    def test_invalid_preview_requests_always_clear_external_content(self) -> None:
+        clear_requests: list[bool] = []
+        self.workspace.object_preview_clear_requested.connect(
+            lambda: clear_requests.append(True)
+        )
+
+        self.assertFalse(self.workspace.request_selected_object_preview())
+        self.assertFalse(self.workspace.request_selected_object_preview())
+
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Missing", 2048, atlas_id="atlas-missing")
+        source = _source(
+            "missing-chair",
+            directory=self._temporary_directory.name,
+        )
+        data.assign_object(
+            atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+        )
+        self.workspace.set_data(data)
+        self.assertFalse(self.workspace.request_selected_object_preview())
+
+        self.assertEqual(clear_requests, [True, True, True])
+
+    def test_wheel_transaction_coalesces_same_preview_request(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Objects", 2048, atlas_id="atlas-a")
+        source = _source(
+            "chair",
+            directory=self._temporary_directory.name,
+        )
+        data.assign_object(
+            atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([source])
+        preview_requests: list[tuple[str, int]] = []
+        self.workspace.object_preview_requested.connect(
+            lambda object_id, resolution: preview_requests.append(
+                (object_id, resolution)
+            )
+        )
+
+        def request_during_resolution_change(
+            _object_id: str,
+            _direction: int,
+        ) -> bool:
+            return self.workspace.request_selected_object_preview()
+
+        with patch.object(
+            self.workspace,
+            "_cycle_object_texture_resolution",
+            side_effect=request_during_resolution_change,
+        ):
+            self.workspace._handle_object_wheel(source.object_id, 1)
+
+        self.assertEqual(
+            preview_requests,
+            [(source.object_id, source.texture_resolution)],
         )
 
     def test_delete_key_on_source_list_removes_only_selected_atlas_placement(
@@ -1061,6 +1137,55 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.assertIsNotNone(preview.drag_slot_preview)
         self.workspace._refresh_preview()
         self.assertIsNone(preview.drag_slot_preview)
+
+    def test_preview_reuses_unchanged_source_images_across_layout_refreshes(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Cached", 2048, atlas_id="atlas-a")
+        source = _source(
+            "chair",
+            directory=self._temporary_directory.name,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([source])
+        preview = self.workspace.preview
+        original_image = preview._source_preview_images[source.object_id]
+
+        self.workspace._refresh_preview()
+
+        self.assertIs(
+            preview._source_preview_images[source.object_id],
+            original_image,
+        )
+
+        self.workspace._data.assign_object(
+            atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+        )
+        self.workspace._refresh_preview()
+
+        self.assertEqual(len(preview._atlas.placements), 1)
+        self.assertIs(
+            preview._source_preview_images[source.object_id],
+            original_image,
+        )
+
+        replacement = _source(
+            "chair",
+            directory=self._temporary_directory.name,
+            color=(210, 40, 30, 255),
+        )
+        self.workspace.set_object_texture_sources([replacement])
+        replacement_image = preview._source_preview_images[source.object_id]
+
+        self.assertIsNot(replacement_image, original_image)
+        self.assertEqual(
+            replacement_image.pixelColor(0, 0),
+            QColor(210, 40, 30, 255),
+        )
 
     def test_existing_preview_texture_can_be_dragged_to_an_exact_slot(self) -> None:
         data = TextureAtlasData()
@@ -2356,6 +2481,10 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
                 (object_id, resolution)
             )
         )
+        clear_requests: list[bool] = []
+        self.workspace.object_preview_clear_requested.connect(
+            lambda: clear_requests.append(True)
+        )
 
         self.workspace.atlas_list.setCurrentRow(1)
 
@@ -2364,7 +2493,8 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             self.workspace.object_list.item(0).text(),
             "[Missing] missing-table",
         )
-        self.assertEqual(preview_requests, [("missing-table", 512)])
+        self.assertEqual(preview_requests, [])
+        self.assertEqual(clear_requests, [True])
 
     def test_mutations_emit_detached_state(self) -> None:
         changes: list[TextureAtlasData] = []

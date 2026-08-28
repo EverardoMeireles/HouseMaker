@@ -15,9 +15,9 @@ from housemaker.models import (
 )
 from housemaker.texture_mapping import paint_wall_texture_crop
 from housemaker.uv_layout import (
+    UvLayout,
     UvWallPlacement,
     build_uv_wall_layout,
-    get_room_wall_keys,
     get_rotated_uv_corners,
     rebuild_room_subdivision_uvs,
 )
@@ -55,6 +55,8 @@ class UvCanvas(QWidget):
         self.rotation_center_uv: tuple[float, float] = (0.0, 0.0)
         self.rotation_start_angle = 0.0
         self.rotation_start_degrees = 0
+        self._layout_cache_key: tuple[object, ...] | None = None
+        self._layout_cache: UvLayout | None = None
         self.setMinimumHeight(260)
 
     def set_room_context(
@@ -68,8 +70,13 @@ class UvCanvas(QWidget):
         self.wall_height_meters = wall_height_meters
         if room is None:
             self.selected_wall_key = None
-        elif self.selected_wall_key not in get_room_wall_keys(room, vertex_data):
-            self.selected_wall_key = None
+        elif self.selected_wall_key is not None:
+            wall_keys = {
+                placement.wall.key
+                for placement in self._get_wall_layout().placements
+            }
+            if self.selected_wall_key not in wall_keys:
+                self.selected_wall_key = None
         self.update()
 
     def set_selected_wall_key(self, wall_key: str | None) -> None:
@@ -93,11 +100,7 @@ class UvCanvas(QWidget):
         painter.setBrush(UV_MAP_BACKGROUND_COLOR)
         painter.drawRect(map_rect)
 
-        layout = build_uv_wall_layout(
-            room=self.room,
-            vertex_data=self.vertex_data,
-            wall_height_meters=self.wall_height_meters,
-        )
+        layout = self._get_wall_layout()
         if not layout.placements:
             self._paint_centered_message(painter, "No walls to show")
             return
@@ -199,11 +202,7 @@ class UvCanvas(QWidget):
         widget_position: QPointF,
         map_rect: QRectF,
     ) -> UvWallPlacement | None:
-        layout = build_uv_wall_layout(
-            room=self.room,
-            vertex_data=self.vertex_data,
-            wall_height_meters=self.wall_height_meters,
-        )
+        layout = self._get_wall_layout()
         for placement in reversed(layout.placements):
             widget_polygon = self._uv_placement_to_widget_polygon(placement, map_rect)
             if widget_polygon.containsPoint(
@@ -336,11 +335,7 @@ class UvCanvas(QWidget):
         if self.room is None or self.vertex_data is None:
             return None
 
-        layout = build_uv_wall_layout(
-            room=self.room,
-            vertex_data=self.vertex_data,
-            wall_height_meters=self.wall_height_meters,
-        )
+        layout = self._get_wall_layout()
         for placement in layout.placements:
             if placement.wall.key != wall_key:
                 continue
@@ -349,6 +344,34 @@ class UvCanvas(QWidget):
 
         return None
 
+    # ### Layout cache ###
+    def _get_wall_layout(self) -> UvLayout:
+        """Reuse layout geometry until one of its mutable inputs changes."""
+
+        if self.room is None or self.vertex_data is None:
+            return UvLayout(placements=[], hidden_wall_count=0)
+
+        cache_key = _build_uv_layout_cache_key(
+            self.room,
+            self.vertex_data,
+            self.wall_height_meters,
+        )
+        if (
+            cache_key == self._layout_cache_key
+            and self._layout_cache is not None
+        ):
+            return self._layout_cache
+
+        layout = build_uv_wall_layout(
+            room=self.room,
+            vertex_data=self.vertex_data,
+            wall_height_meters=self.wall_height_meters,
+        )
+        self._layout_cache_key = cache_key
+        self._layout_cache = layout
+        return layout
+
+    # ### Placement geometry ###
     def _get_placement_center(
         self,
         placement: UvWallPlacement,
@@ -595,6 +618,62 @@ class UvCanvas(QWidget):
             (widget_point.x() - map_rect.left()) / scale_x,
             (widget_point.y() - map_rect.top()) / scale_y,
         )
+
+
+# ### Layout cache helpers ###
+def _build_uv_layout_cache_key(
+    room: RoomData,
+    vertex_data: VertexData,
+    wall_height_meters: float,
+) -> tuple[object, ...]:
+    """Snapshot every geometry and UV value consumed by the layout builder."""
+
+    return (
+        tuple(
+            (
+                vertex.id,
+                _freeze_uv_layout_value(vertex.x),
+                _freeze_uv_layout_value(vertex.y),
+            )
+            for vertex in vertex_data.vertices
+        ),
+        tuple(
+            (edge.start_vertex_id, edge.end_vertex_id)
+            for edge in vertex_data.edges
+        ),
+        tuple(room.vertex_ids),
+        int(room.center_vertex_id),
+        _freeze_uv_layout_value(wall_height_meters),
+        int(room.uv_map_width),
+        int(room.uv_map_height),
+        _freeze_uv_layout_value(room.wall_uv_scales),
+        _freeze_uv_layout_value(room.wall_uv_rotations),
+        _freeze_uv_layout_value(room.wall_uv_positions),
+        _freeze_uv_layout_value(room.wall_subdivisions),
+        _freeze_uv_layout_value(room.wall_subdivision_positions),
+        _freeze_uv_layout_value(room.wall_subdivision_source_ranges),
+    )
+
+
+def _freeze_uv_layout_value(value: object) -> object:
+    """Make nested mutable UV values deterministic and safely comparable."""
+
+    if isinstance(value, dict):
+        frozen_items = (
+            (
+                _freeze_uv_layout_value(key),
+                _freeze_uv_layout_value(item_value),
+            )
+            for key, item_value in value.items()
+        )
+        return tuple(sorted(frozen_items, key=repr))
+    if isinstance(value, list | tuple):
+        return tuple(_freeze_uv_layout_value(item) for item in value)
+    if isinstance(value, float):
+        return ("float", value.hex())
+    if value is None or isinstance(value, str | int | bool):
+        return value
+    return (type(value).__qualname__, repr(value))
 
 
 # ### Numeric helpers ###

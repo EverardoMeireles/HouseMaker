@@ -910,6 +910,8 @@ class ObjectGenerationViewerPanel(QWidget):
         """Keep all object controls visible beside an external 3D viewport."""
 
         is_active = bool(is_active)
+        if is_active == self._is_external_presentation_active:
+            return
         self._is_external_presentation_active = is_active
         self._layout.setDirection(
             QBoxLayout.Direction.LeftToRight
@@ -1217,6 +1219,15 @@ class GenerationWorkspace(QWidget):
         ) = None
         self._generated_model: GeneratedModel | None = None
         self._generated_model_cache: dict[str, GeneratedModel] = {}
+        self._generated_model_cache_revisions: dict[
+            str,
+            tuple[object, ...],
+        ] = {}
+        self._displayed_object_snapshot: tuple[object, ...] | None = None
+        self._texture_resolution_entry_cache: dict[
+            str,
+            tuple[object, tuple[TextureAtlasEntry, ...]],
+        ] = {}
         self._is_syncing_texture_resolution_view = False
         self._texture_resolution_change_handler: (
             Callable[[str, int], bool] | None
@@ -1239,6 +1250,39 @@ class GenerationWorkspace(QWidget):
     def get_data(self) -> GenerationData:
         self._store_current_frame_strokes()
         return self._data.clone()
+
+    def get_generated_object_ids(self) -> tuple[str, ...]:
+        """Return lightweight immutable IDs without cloning Generation data."""
+
+        return tuple(record.object_id for record in self._data.generated_objects)
+
+    def refresh_file_backed_previews(self) -> None:
+        """Reload the selected Object preview only after an asset revision."""
+
+        record = self._find_generated_object_record(self._selected_object_id)
+        if record is None:
+            self._clear_generated_object_display()
+            return
+        display_snapshot = _build_generated_object_display_snapshot(
+            record,
+            self._asset_directory,
+        )
+        texture_signature = _build_texture_resolution_entry_signature(
+            record,
+            self._asset_directory,
+        )
+        cached_entries = self._texture_resolution_entry_cache.get(
+            record.object_id
+        )
+        if (
+            display_snapshot == self._displayed_object_snapshot
+            and self._generated_model is not None
+            and self.result_view.model is self._generated_model
+            and cached_entries is not None
+            and cached_entries[0] == texture_signature
+        ):
+            return
+        self._display_generated_object(record, repair_missing_variant=False)
 
     def get_generated_object_placement(
         self,
@@ -1276,6 +1320,9 @@ class GenerationWorkspace(QWidget):
         else:
             self.show_frame(self._data.current_frame_index)
         self._generated_model_cache.clear()
+        self._generated_model_cache_revisions.clear()
+        self._displayed_object_snapshot = None
+        self._texture_resolution_entry_cache.clear()
         self._is_rebuilding_generation_data = True
         try:
             self._rebuild_generated_objects()
@@ -1298,6 +1345,77 @@ class GenerationWorkspace(QWidget):
 
     def get_runtime_settings(self) -> GenerationServiceSettings:
         return self._settings
+
+    def get_placed_preview_dependency_signature(
+        self,
+    ) -> tuple[tuple[object, ...], ...]:
+        """Snapshot placed model files and metadata without cloning or decoding."""
+
+        signature: list[tuple[object, ...]] = []
+        for record in self._data.generated_objects:
+            if record.placement is None:
+                continue
+            signature.append(
+                (
+                    record.object_id,
+                    record.placement,
+                    _build_generation_asset_revision(
+                        self._asset_directory,
+                        record.asset_path,
+                    ),
+                    _get_selected_texture_resolution(record),
+                    _get_object_symmetric_division_metadata(record),
+                )
+            )
+        return tuple(signature)
+
+    def is_generated_object_asset_available(self, object_id: str) -> bool:
+        """Report whether one selected GLB currently exists inside the asset root."""
+
+        record = self._find_generated_object_record(str(object_id).strip())
+        if record is None:
+            return False
+        try:
+            return self._resolve_meshy_asset_path(record.asset_path).is_file()
+        except (OSError, RuntimeError, ValueError):
+            return False
+
+    def get_texture_variant_dependency_signature(
+        self,
+        object_id: str,
+    ) -> tuple[tuple[object, ...], ...]:
+        """Expose configured GLB/PNG paths and revisions even while files are missing."""
+
+        record = self._find_generated_object_record(str(object_id).strip())
+        if record is None:
+            return ()
+        return tuple(
+            (
+                resolution,
+                None if variant is None else variant[TEXTURE_VARIANT_GLB_PATH_KEY],
+                (
+                    None
+                    if variant is None
+                    else _build_generation_asset_revision(
+                        self._asset_directory,
+                        variant[TEXTURE_VARIANT_GLB_PATH_KEY],
+                    )
+                ),
+                None if variant is None else variant[TEXTURE_VARIANT_PNG_PATH_KEY],
+                (
+                    None
+                    if variant is None
+                    else _build_generation_asset_revision(
+                        self._asset_directory,
+                        variant[TEXTURE_VARIANT_PNG_PATH_KEY],
+                    )
+                ),
+            )
+            for resolution in sorted(TEXTURE_RESOLUTIONS)
+            for variant in (
+                _get_texture_variant_metadata(record, resolution),
+            )
+        )
 
     def set_texture_resolution_change_handler(
         self,
@@ -1498,8 +1616,9 @@ class GenerationWorkspace(QWidget):
         record_index = self._data.generated_objects.index(record)
         self._data.generated_objects[record_index] = replacement
         self._generated_model_cache.pop(record.object_id, None)
+        self._generated_model_cache_revisions.pop(record.object_id, None)
         if self._selected_object_id == record.object_id:
-            self._generated_model_cache[record.object_id] = preview_model
+            self._cache_generated_model(replacement, preview_model)
             self._display_generated_object(replacement)
             self.status_label.setText(
                 f"Selected {normalized_resolution} x {normalized_resolution} "
@@ -1511,10 +1630,17 @@ class GenerationWorkspace(QWidget):
     def set_external_3d_viewer_active(self, is_active: bool) -> None:
         """Show the local atlas inspector while the 3D panel is external."""
 
-        self.object_3d_panel.set_external_presentation_active(is_active)
-        self.right_view_stack.setCurrentWidget(
+        is_active = bool(is_active)
+        target_page = (
             self.texture_view_page if is_active else self.object_3d_page
         )
+        if (
+            self.object_3d_panel.is_external_presentation_active == is_active
+            and self.right_view_stack.currentWidget() is target_page
+        ):
+            return
+        self.object_3d_panel.set_external_presentation_active(is_active)
+        self.right_view_stack.setCurrentWidget(target_page)
 
     @property
     def is_generating(self) -> bool:
@@ -1819,6 +1945,8 @@ class GenerationWorkspace(QWidget):
             self._finish_existing_object_placement_request()
         deleted_record = self._data.generated_objects.pop(record_index)
         self._generated_model_cache.pop(object_id, None)
+        self._generated_model_cache_revisions.pop(object_id, None)
+        self._texture_resolution_entry_cache.pop(object_id, None)
         asset_cleanup_failed = self._delete_unreferenced_object_assets(
             deleted_record
         )
@@ -2755,7 +2883,7 @@ class GenerationWorkspace(QWidget):
             placement=placement,
         )
         self._data.generated_objects.append(record)
-        self._generated_model_cache[object_id] = generated_model
+        self._cache_generated_model(record, generated_model)
         self._selected_object_id = object_id
         self._generated_model = generated_model
         self._refresh_generated_objects_list(object_id)
@@ -3502,37 +3630,67 @@ class GenerationWorkspace(QWidget):
                 if not self._data.generated_objects
                 else self._data.generated_objects[-1].object_id
             )
-        self._refresh_generated_objects_list(preferred_id)
+        self._refresh_generated_objects_list(
+            preferred_id,
+            repair_missing_variant=True,
+        )
 
     def _refresh_generated_objects_list(
         self,
         selected_object_id: str | None,
+        *,
+        repair_missing_variant: bool = False,
     ) -> None:
         object_list = self.generated_objects_list
-        was_blocked = object_list.blockSignals(True)
-        try:
-            object_list.clear()
-            selected_row = -1
-            for object_index, record in enumerate(
-                self._data.generated_objects,
-                start=1,
-            ):
-                item = QListWidgetItem(
-                    f"#{object_index} {record.object_name} · "
-                    f"frame {record.frame_index + 1}"
-                )
-                item.setData(OBJECT_ID_ITEM_ROLE, record.object_id)
-                if record.provider_task_id:
-                    item.setToolTip(
-                        f"Meshy task: {record.provider_task_id}"
+        expected_rows = _build_generated_object_list_rows(
+            self._data.generated_objects
+        )
+        current_rows = tuple(
+            (
+                str(
+                    object_list.item(row_index).data(
+                        OBJECT_ID_ITEM_ROLE
                     )
-                object_list.addItem(item)
-                if record.object_id == selected_object_id:
-                    selected_row = object_list.count() - 1
-            if selected_row >= 0:
+                    or ""
+                ),
+                object_list.item(row_index).text(),
+                object_list.item(row_index).toolTip(),
+            )
+            for row_index in range(object_list.count())
+        )
+        if current_rows != expected_rows:
+            was_blocked = object_list.blockSignals(True)
+            try:
+                object_list.clear()
+                for object_id, label, tooltip in expected_rows:
+                    item = QListWidgetItem(label)
+                    item.setData(OBJECT_ID_ITEM_ROLE, object_id)
+                    if tooltip:
+                        item.setToolTip(tooltip)
+                    object_list.addItem(item)
+            finally:
+                object_list.blockSignals(was_blocked)
+
+        selected_row = next(
+            (
+                row_index
+                for row_index in range(object_list.count())
+                if str(
+                    object_list.item(row_index).data(
+                        OBJECT_ID_ITEM_ROLE
+                    )
+                    or ""
+                )
+                == selected_object_id
+            ),
+            -1,
+        )
+        if object_list.currentRow() != selected_row:
+            was_blocked = object_list.blockSignals(True)
+            try:
                 object_list.setCurrentRow(selected_row)
-        finally:
-            object_list.blockSignals(was_blocked)
+            finally:
+                object_list.blockSignals(was_blocked)
 
         if selected_row < 0:
             self._selected_object_id = None
@@ -3543,7 +3701,10 @@ class GenerationWorkspace(QWidget):
         if record is None:
             self._clear_generated_object_display()
             return
-        self._display_generated_object(record)
+        self._display_generated_object(
+            record,
+            repair_missing_variant=repair_missing_variant,
+        )
 
     def _find_generated_object_record(
         self,
@@ -3563,8 +3724,23 @@ class GenerationWorkspace(QWidget):
     def _display_generated_object(
         self,
         record: GeneratedObjectRecord,
+        *,
+        repair_missing_variant: bool = True,
     ) -> None:
-        record = self._repair_missing_active_texture_variant(record)
+        if repair_missing_variant:
+            record = self._repair_missing_active_texture_variant(record)
+        next_snapshot = _build_generated_object_display_snapshot(
+            record,
+            self._asset_directory,
+        )
+        if (
+            next_snapshot == self._displayed_object_snapshot
+            and self._generated_model is not None
+            and self.result_view.model is self._generated_model
+        ):
+            self._refresh_object_texture_atlases(record.object_id)
+            return
+        self._displayed_object_snapshot = None
         self._generated_model = None
         self.result_view.clear_model()
         self._sync_model_statistics(None)
@@ -3591,6 +3767,7 @@ class GenerationWorkspace(QWidget):
         self._refresh_object_texture_atlases(
             record.object_id,
         )
+        self._displayed_object_snapshot = next_snapshot
 
     def _repair_missing_active_texture_variant(
         self,
@@ -3633,6 +3810,7 @@ class GenerationWorkspace(QWidget):
             record_index = self._data.generated_objects.index(record)
             self._data.generated_objects[record_index] = replacement
             self._generated_model_cache.pop(record.object_id, None)
+            self._generated_model_cache_revisions.pop(record.object_id, None)
             if (
                 not self._is_rebuilding_generation_data
                 and not self._is_emitting_texture_repair
@@ -3646,6 +3824,14 @@ class GenerationWorkspace(QWidget):
         return record
 
     def _clear_generated_object_display(self) -> None:
+        if (
+            self._displayed_object_snapshot is None
+            and self._generated_model is None
+            and self.result_view.model is None
+            and not self.texture_view.entries
+        ):
+            return
+        self._displayed_object_snapshot = None
         self._generated_model = None
         self.result_view.clear_model()
         self._sync_model_statistics(None)
@@ -3659,10 +3845,38 @@ class GenerationWorkspace(QWidget):
         if record is None:
             self.texture_view.clear()
             return
-        entries = _build_texture_resolution_entries(
+        entry_signature = _build_texture_resolution_entry_signature(
             record,
             self._asset_directory,
         )
+        cached_entries = self._texture_resolution_entry_cache.get(
+            record.object_id
+        )
+        expected_entry_count = _count_available_texture_resolution_entries(
+            record,
+            self._asset_directory,
+        )
+        if (
+            cached_entries is not None
+            and cached_entries[0] == entry_signature
+            and len(cached_entries[1]) == expected_entry_count
+        ):
+            entries = list(cached_entries[1])
+        else:
+            entries = _build_texture_resolution_entries(
+                record,
+                self._asset_directory,
+            )
+            if len(entries) == expected_entry_count:
+                self._texture_resolution_entry_cache[record.object_id] = (
+                    entry_signature,
+                    tuple(entries),
+                )
+            else:
+                self._texture_resolution_entry_cache.pop(
+                    record.object_id,
+                    None,
+                )
         selected_resolution = _get_selected_texture_resolution(record)
         selected_entry_id = f"{record.object_id}:resolution:{selected_resolution}"
         if not any(entry.atlas_id == selected_entry_id for entry in entries):
@@ -3739,6 +3953,9 @@ class GenerationWorkspace(QWidget):
         selected_object_id = self._selected_object_id
         cached_model_was_present = record.object_id in self._generated_model_cache
         cached_model = self._generated_model_cache.get(record.object_id)
+        cached_model_revision = self._generated_model_cache_revisions.get(
+            record.object_id
+        )
         is_committed = False
 
         def restore_record() -> bool:
@@ -3747,8 +3964,13 @@ class GenerationWorkspace(QWidget):
                 return True
             self._data.generated_objects[record_index] = record
             self._generated_model_cache.pop(record.object_id, None)
+            self._generated_model_cache_revisions.pop(record.object_id, None)
             if cached_model_was_present and cached_model is not None:
                 self._generated_model_cache[record.object_id] = cached_model
+                if cached_model_revision is not None:
+                    self._generated_model_cache_revisions[record.object_id] = (
+                        cached_model_revision
+                    )
             is_committed = False
             try:
                 self._refresh_generated_objects_list(selected_object_id)
@@ -3767,8 +3989,9 @@ class GenerationWorkspace(QWidget):
                 return False
             self._data.generated_objects[record_index] = replacement
             self._generated_model_cache.pop(record.object_id, None)
+            self._generated_model_cache_revisions.pop(record.object_id, None)
             if selected_object_id == record.object_id:
-                self._generated_model_cache[record.object_id] = preview_model
+                self._cache_generated_model(replacement, preview_model)
             is_committed = True
             try:
                 self._refresh_generated_objects_list(selected_object_id)
@@ -3806,13 +4029,72 @@ class GenerationWorkspace(QWidget):
         self,
         record: GeneratedObjectRecord,
     ) -> GeneratedModel:
-        generated_model = self._generated_model_cache.get(record.object_id)
-        if generated_model is not None:
+        for _attempt_index in range(2):
+            asset_revision_before = _build_generation_asset_revision(
+                self._asset_directory,
+                record.asset_path,
+            )
+            generated_model = self._generated_model_cache.get(record.object_id)
+            if (
+                generated_model is not None
+                and self._generated_model_cache_revisions.get(record.object_id)
+                == asset_revision_before
+            ):
+                return generated_model
+            asset_path = self._resolve_meshy_asset_path(record.asset_path)
+            generated_model = import_generated_glb(asset_path.read_bytes())
+            asset_revision_after = _build_generation_asset_revision(
+                self._asset_directory,
+                record.asset_path,
+            )
+            if asset_revision_before != asset_revision_after:
+                continue
+            self._cache_generated_model(
+                record,
+                generated_model,
+                asset_revision=asset_revision_after,
+            )
             return generated_model
-        asset_path = self._resolve_meshy_asset_path(record.asset_path)
-        generated_model = import_generated_glb(asset_path.read_bytes())
-        self._generated_model_cache[record.object_id] = generated_model
-        return generated_model
+        raise OSError("The generated GLB changed repeatedly while loading.")
+
+    def _cache_generated_model(
+        self,
+        record: GeneratedObjectRecord,
+        model: GeneratedModel,
+        *,
+        asset_revision: tuple[object, ...] | None = None,
+    ) -> None:
+        """Cache one model only for the exact active on-disk GLB revision."""
+
+        if asset_revision is None:
+            for _attempt_index in range(2):
+                revision_before = _build_generation_asset_revision(
+                    self._asset_directory,
+                    record.asset_path,
+                )
+                try:
+                    asset_path = self._resolve_meshy_asset_path(
+                        record.asset_path
+                    )
+                    persisted_payload = asset_path.read_bytes()
+                except (OSError, RuntimeError, ValueError):
+                    break
+                revision_after = _build_generation_asset_revision(
+                    self._asset_directory,
+                    record.asset_path,
+                )
+                if revision_before != revision_after:
+                    continue
+                if persisted_payload != bytes(model.glb_bytes):
+                    break
+                asset_revision = revision_after
+                break
+        if asset_revision is None:
+            self._generated_model_cache.pop(record.object_id, None)
+            self._generated_model_cache_revisions.pop(record.object_id, None)
+            return
+        self._generated_model_cache[record.object_id] = model
+        self._generated_model_cache_revisions[record.object_id] = asset_revision
 
     def _sync_model_statistics(self, model: GeneratedModel | None) -> None:
         self.model_statistics_label.setText(_format_model_statistics(model))
@@ -4821,7 +5103,106 @@ def _default_generation_asset_directory() -> Path:
     return base_directory / "generated"
 
 
+# ### Generated-object presentation helpers ###
+def _build_generated_object_display_snapshot(
+    record: GeneratedObjectRecord,
+    asset_directory: Path,
+) -> tuple[object, ...]:
+    """Snapshot only record content that changes the Object preview."""
+
+    return (
+        record.object_id,
+        record.asset_path,
+        _build_generation_asset_revision(
+            asset_directory,
+            record.asset_path,
+        ),
+        copy.deepcopy(record.pipeline),
+    )
+
+
+def _build_generation_asset_revision(
+    asset_directory: Path,
+    raw_asset_path: object,
+) -> tuple[object, ...]:
+    """Return a stable local path and cheap revision for one generated GLB."""
+
+    normalized_path = str(raw_asset_path or "")
+    try:
+        asset_root = asset_directory.resolve()
+        asset_path = (asset_directory / normalized_path).resolve()
+        asset_path.relative_to(asset_root)
+        asset_stat = asset_path.stat()
+    except (OSError, RuntimeError, ValueError):
+        return normalized_path, None, None, None
+    return (
+        str(asset_path),
+        int(asset_stat.st_size),
+        int(asset_stat.st_mtime_ns),
+        int(asset_stat.st_ctime_ns),
+    )
+
+
+def _build_generated_object_list_rows(
+    records: Sequence[GeneratedObjectRecord],
+) -> tuple[tuple[str, str, str], ...]:
+    """Return the exact lightweight rows expected by the object selector."""
+
+    return tuple(
+        (
+            record.object_id,
+            f"#{object_index} {record.object_name} · "
+            f"frame {record.frame_index + 1}",
+            (
+                ""
+                if not record.provider_task_id
+                else f"Meshy task: {record.provider_task_id}"
+            ),
+        )
+        for object_index, record in enumerate(records, start=1)
+    )
+
+
 # ### Texture-atlas helpers ###
+def _build_texture_resolution_entry_signature(
+    record: GeneratedObjectRecord,
+    asset_directory: Path,
+) -> tuple[object, ...]:
+    """Snapshot variant metadata and cheap file revisions without decoding PNGs."""
+
+    raw_variants = record.pipeline.get(TEXTURE_VARIANTS_PIPELINE_KEY)
+    asset_root = asset_directory.resolve()
+    file_revisions: list[tuple[object, ...]] = []
+    for resolution in _selectable_texture_resolutions(record):
+        variant = _get_texture_variant_metadata(record, resolution)
+        if variant is None:
+            file_revisions.append((resolution, None))
+            continue
+        for path_key in (
+            TEXTURE_VARIANT_GLB_PATH_KEY,
+            TEXTURE_VARIANT_PNG_PATH_KEY,
+        ):
+            raw_path = variant[path_key]
+            try:
+                asset_path = (asset_directory / raw_path).resolve()
+                asset_path.relative_to(asset_root)
+                file_stat = asset_path.stat()
+                revision = (
+                    file_stat.st_size,
+                    file_stat.st_mtime_ns,
+                    file_stat.st_ctime_ns,
+                )
+            except (OSError, RuntimeError, ValueError):
+                revision = None
+            file_revisions.append(
+                (resolution, path_key, raw_path, revision)
+            )
+    return (
+        copy.deepcopy(raw_variants),
+        tuple(file_revisions),
+    )
+
+
 def _get_selected_texture_resolution(record: GeneratedObjectRecord) -> int:
     raw_resolution = record.pipeline.get(
         SELECTED_TEXTURE_RESOLUTION_PIPELINE_KEY,
@@ -4902,6 +5283,39 @@ def _build_texture_resolution_entries(
         except (OSError, TypeError, ValueError):
             continue
     return entries
+
+
+def _count_available_texture_resolution_entries(
+    record: GeneratedObjectRecord,
+    asset_directory: Path,
+) -> int:
+    """Count existing safe variant pairs without decoding their PNG pixels."""
+
+    entry_count = 0
+    asset_root = asset_directory.resolve()
+    for resolution in _selectable_texture_resolutions(record):
+        variant = _get_texture_variant_metadata(record, resolution)
+        if variant is None:
+            continue
+        try:
+            image_path = (
+                asset_directory / variant[TEXTURE_VARIANT_PNG_PATH_KEY]
+            ).resolve()
+            glb_path = (
+                asset_directory / variant[TEXTURE_VARIANT_GLB_PATH_KEY]
+            ).resolve()
+            image_path.relative_to(asset_root)
+            glb_path.relative_to(asset_root)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if (
+            image_path.suffix.lower() == ".png"
+            and glb_path.suffix.lower() == ".glb"
+            and image_path.is_file()
+            and glb_path.is_file()
+        ):
+            entry_count += 1
+    return entry_count
 
 
 def _parse_texture_resolution_entry_id(

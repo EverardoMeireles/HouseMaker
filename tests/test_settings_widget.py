@@ -74,6 +74,34 @@ class SettingsWidgetTests(unittest.TestCase):
                 hasattr(widget, "simplification_pixel_tolerance_spinbox")
             )
 
+    def test_fullscreen_display_id_can_be_read_without_settings_file_io(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            widget = SettingsWidget(
+                application_settings=application_settings,
+                environment={},
+            )
+            widget.fullscreen_3d_viewer_screen_combo.addItem(
+                "Cached display",
+                "screen:cached",
+            )
+            widget.fullscreen_3d_viewer_screen_combo.setCurrentIndex(
+                widget.fullscreen_3d_viewer_screen_combo.findData(
+                    "screen:cached"
+                )
+            )
+
+            with patch.object(
+                application_settings,
+                "get",
+                side_effect=AssertionError("unexpected settings-file read"),
+            ):
+                screen_id = widget.get_fullscreen_3d_viewer_screen_id()
+
+            self.assertEqual(screen_id, "screen:cached")
+
     def test_unused_face_removal_persists_and_emits_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             application_settings = _build_test_settings(temporary_directory)
