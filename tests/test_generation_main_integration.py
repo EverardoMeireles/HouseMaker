@@ -140,6 +140,52 @@ class GenerationMainIntegrationTests(unittest.TestCase):
                     should_be_visible,
                 )
 
+    def test_canvas_side_panel_stays_inside_the_window_after_tab_round_trip(
+        self,
+    ) -> None:
+        requested_width = 1400
+        self.workspace.resize(requested_width, self.workspace.height())
+        _qt_application.processEvents()
+
+        for full_width_workspace in (
+            self.workspace.texture_atlas_workspace,
+            self.workspace.surface_texture_generation,
+            self.workspace.generation,
+            self.workspace.settings_widget,
+        ):
+            with self.subTest(
+                tab=self.workspace.workspace_tabs.tabText(
+                    self.workspace.workspace_tabs.indexOf(full_width_workspace)
+                )
+            ):
+                self.workspace.workspace_tabs.setCurrentWidget(
+                    full_width_workspace
+                )
+                _qt_application.processEvents()
+                self.workspace.resize(
+                    requested_width,
+                    self.workspace.height(),
+                )
+                _qt_application.processEvents()
+                self.workspace.workspace_tabs.setCurrentWidget(
+                    self.workspace.canvas_viewer_workspace
+                )
+                _qt_application.processEvents()
+
+                splitter_rect = self.workspace.workspace_splitter.rect()
+                side_panel_geometry = self.workspace.side_panel.geometry()
+                self.assertEqual(self.workspace.width(), requested_width)
+                self.assertTrue(self.workspace.side_panel.isVisible())
+                self.assertGreater(side_panel_geometry.width(), 0)
+                self.assertGreaterEqual(
+                    side_panel_geometry.left(),
+                    splitter_rect.left(),
+                )
+                self.assertLessEqual(
+                    side_panel_geometry.right(),
+                    splitter_rect.right(),
+                )
+
     def test_images_tab_reuses_unchanged_decoded_preview(self) -> None:
         image_path = Path(self._temporary_directory.name) / "library-image.png"
         Image.new("RGBA", (96, 64), (25, 80, 140, 255)).save(image_path)

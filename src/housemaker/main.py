@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QSplitter,
     QSpinBox,
@@ -363,11 +364,16 @@ class BlueprintWorkspace(QWidget):
         root_layout.setContentsMargins(12, 12, 12, 12)
         root_layout.setSpacing(12)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setChildrenCollapsible(False)
-        root_layout.addWidget(splitter, 1)
+        self.workspace_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.workspace_splitter.setChildrenCollapsible(False)
+        root_layout.addWidget(self.workspace_splitter, 1)
 
         self.workspace_tabs = QTabWidget()
+        # Hidden pages contain wide tool rows whose size hints must not push
+        # the visible Canvas panel beyond the actual window bounds.
+        workspace_tabs_policy = self.workspace_tabs.sizePolicy()
+        workspace_tabs_policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+        self.workspace_tabs.setSizePolicy(workspace_tabs_policy)
         self.canvas = BlueprintCanvas()
         self.viewer = GlbViewerWidget(window_editing_enabled=True)
         self.canvas_3d_navigation_shortcut = QShortcut(self.viewer)
@@ -518,9 +524,14 @@ class BlueprintWorkspace(QWidget):
         self.settings_widget.settings_changed.connect(
             self._handle_generation_settings_changed
         )
-        splitter.addWidget(self.workspace_tabs)
+        self.workspace_splitter.addWidget(self.workspace_tabs)
 
         self.side_panel = QWidget()
+        # The side-tab hint includes its widest hidden page. Let the splitter
+        # use the available width instead of treating that hint as a minimum.
+        side_panel_policy = self.side_panel.sizePolicy()
+        side_panel_policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+        self.side_panel.setSizePolicy(side_panel_policy)
         side_layout = QVBoxLayout(self.side_panel)
         side_layout.setContentsMargins(16, 16, 16, 16)
         side_layout.setSpacing(12)
@@ -1033,10 +1044,10 @@ class BlueprintWorkspace(QWidget):
         self.side_tabs.addTab(self._build_texture_creator_tab(), "Texture creator")
         self.side_tabs.currentChanged.connect(self._handle_side_tab_changed)
 
-        splitter.addWidget(self.side_panel)
-        splitter.setStretchFactor(0, 9)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([1160, 440])
+        self.workspace_splitter.addWidget(self.side_panel)
+        self.workspace_splitter.setStretchFactor(0, 9)
+        self.workspace_splitter.setStretchFactor(1, 1)
+        self.workspace_splitter.setSizes([1160, 440])
 
         self.canvas.rooms_changed.connect(self._refresh_room_lists)
         self.canvas.rooms_changed.connect(self._schedule_viewer_preview_refresh)
