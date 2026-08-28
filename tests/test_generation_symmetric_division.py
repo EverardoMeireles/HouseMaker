@@ -802,6 +802,25 @@ class GenerationSymmetricDivisionTests(unittest.TestCase):
             {"512", "1024"},
         )
 
+        purged_pair_variants = _legacy_pair_variants(21)
+        with patch(
+            "housemaker.generation_workspace."
+            "build_symmetric_pair_texture_variants",
+            return_value=purged_pair_variants,
+        ) as pair_purge:
+            self.workspace._handle_unchecked_camera_face_purge_succeeded(
+                self._purge_outcome(replacement)
+            )
+        pair_purge.assert_called_once()
+        self.assertTrue(
+            pair_purge.call_args.kwargs["uvs_already_left_packed"]
+        )
+        purged = self.workspace.get_data().generated_objects[0]
+        self.assertEqual(
+            purged.pipeline[SYMMETRIC_DIVISION_PIPELINE_KEY],
+            symmetry.to_pipeline_dict(),
+        )
+
     def test_legacy_v1_record_keeps_half_metadata_and_three_resolutions(
         self,
     ) -> None:
@@ -885,6 +904,33 @@ class GenerationSymmetricDivisionTests(unittest.TestCase):
         )
         self.assertEqual(
             replacement.pipeline[SYMMETRIC_DIVISION_PIPELINE_KEY],
+            record.pipeline[SYMMETRIC_DIVISION_PIPELINE_KEY],
+        )
+
+        purged_legacy_variants = _ordinary_variants(14)
+        with (
+            patch(
+                "housemaker.generation_workspace."
+                "build_object_texture_variants",
+                return_value=purged_legacy_variants,
+            ) as ordinary_purge,
+            patch(
+                "housemaker.generation_workspace."
+                "build_symmetric_half_texture_variants",
+            ) as half_purge,
+        ):
+            self.workspace._handle_unchecked_camera_face_purge_succeeded(
+                self._purge_outcome(replacement)
+            )
+        ordinary_purge.assert_called_once()
+        half_purge.assert_not_called()
+        purged = self.workspace.get_data().generated_objects[0]
+        self.assertEqual(
+            set(purged.pipeline[TEXTURE_VARIANTS_PIPELINE_KEY]),
+            {str(resolution) for resolution in TEXTURE_RESOLUTIONS},
+        )
+        self.assertEqual(
+            purged.pipeline[SYMMETRIC_DIVISION_PIPELINE_KEY],
             record.pipeline[SYMMETRIC_DIVISION_PIPELINE_KEY],
         )
 

@@ -118,7 +118,7 @@ class RetiredObjectTextureInpaintWorkspaceTests(unittest.TestCase):
             hasattr(self.workspace.result_view.view, "texture_inpaint_enabled")
         )
 
-    def test_action_order_spacer_and_far_right_undo(self) -> None:
+    def test_action_order_spacer_and_far_right_operation_controls(self) -> None:
         layout = _action_layout(self.workspace)
         widgets = [
             layout.itemAt(index).widget()
@@ -129,7 +129,9 @@ class RetiredObjectTextureInpaintWorkspaceTests(unittest.TestCase):
             self.workspace.generate_geometry_button,
             self.workspace.generate_texture_button,
             self.workspace.purge_faces_button,
+            self.workspace.place_object_button,
             self.workspace.undo_object_change_button,
+            self.workspace.cancel_operation_button,
         )
         action_indices = tuple(widgets.index(widget) for widget in action_widgets)
         self.assertEqual(action_indices, tuple(sorted(action_indices)))
@@ -140,14 +142,15 @@ class RetiredObjectTextureInpaintWorkspaceTests(unittest.TestCase):
         assert spacer is not None
         self.assertGreaterEqual(spacer.sizeHint().width(), 30)
 
-        undo_index = action_indices[-1]
-        stretch = layout.itemAt(undo_index - 1).spacerItem()
+        place_index = action_indices[-3]
+        stretch = layout.itemAt(place_index - 1).spacerItem()
         self.assertIsNotNone(stretch)
         assert stretch is not None
         self.assertTrue(
             stretch.expandingDirections() & Qt.Orientation.Horizontal
         )
-        self.assertEqual(undo_index, layout.count() - 1)
+        self.assertEqual(action_indices[-1], layout.count() - 1)
+        self.assertEqual(action_indices[-1] - action_indices[-2], 1)
         self.assertGreater(
             self.workspace.undo_object_change_button.geometry().left(),
             self.workspace.purge_faces_button.geometry().right(),

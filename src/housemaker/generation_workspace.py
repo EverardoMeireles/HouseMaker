@@ -9,7 +9,7 @@ import tempfile
 import threading
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Protocol
 
@@ -60,6 +60,7 @@ from housemaker.generation_state import (
     MASK_MODE_ERASE,
     MASK_MODE_PAINT,
     GeneratedObjectRecord,
+    GeneratedObjectPlacement,
     GenerationData,
 )
 from housemaker.generation_views import VideoInpaintView
@@ -162,11 +163,59 @@ TEXTURE_VARIANT_PNG_PATH_KEY = "texture_asset_path"
 TEXTURE_INPAINT_STROKES_PIPELINE_KEY = "texture_inpaint_strokes"
 OBJECT_OPERATION_UNDO_STACK_PIPELINE_KEY = "object_operation_undo_stack"
 MAX_OBJECT_OPERATION_UNDO_COUNT = 10
+OBJECT_OPERATION_GENERATE_MODEL = "generate_model"
 OBJECT_OPERATION_GENERATE_TEXTURE = "generate_texture"
 OBJECT_OPERATION_PURGE_FACES = "purge_faces"
 SYMMETRIC_DIVISION_PIPELINE_KEY = "symmetric_division"
 SYMMETRIC_DIVISION_TEXTURE_CONTENT_HALF = "left"
 SYMMETRIC_TEXTURE_RESOLUTIONS = SYMMETRIC_SQUARE_PAIR_CONTENT_RESOLUTIONS
+SUPPORTED_SYMMETRIC_METADATA_VERSIONS = frozenset(
+    {
+        SYMMETRIC_DIVISION_METADATA_VERSION,
+        SYMMETRIC_QUARTER_METADATA_VERSION,
+        LEGACY_SYMMETRIC_PAIR_METADATA_VERSION,
+        AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
+    }
+)
+COMPACT_SYMMETRIC_METADATA_VERSIONS = (
+    SUPPORTED_SYMMETRIC_METADATA_VERSIONS
+    - {SYMMETRIC_DIVISION_METADATA_VERSION}
+)
+LEFT_HALF_SYMMETRIC_METADATA_VERSIONS = (
+    SUPPORTED_SYMMETRIC_METADATA_VERSIONS
+    - {SYMMETRIC_QUARTER_METADATA_VERSION}
+)
+
+
+# ### Active operation state ###
+@dataclass
+class _ActiveObjectOperation:
+    """Track one cancellable transaction until its worker fully exits."""
+
+    kind: str
+    target_object_id: str | None = None
+    cancel_requested: bool = False
+    committed_object_id: str | None = None
+    pending_placement: GeneratedObjectPlacement | None = None
+    _operation_id: str = field(
+        default_factory=lambda: uuid.uuid4().hex,
+        init=False,
+        repr=False,
+    )
+
+    @property
+    def operation_id(self) -> str:
+        """Return the immutable identity used by modeless placement UI."""
+
+        return self._operation_id
+
+
+@dataclass(frozen=True)
+class _ExistingObjectPlacementRequest:
+    """Bind one modeless placement picker to one completed object."""
+
+    request_id: str
+    object_id: str
 
 
 # ### Symmetric-division metadata ###
@@ -186,12 +235,10 @@ class ObjectSymmetricDivisionMetadata:
     tie_broken_randomly: bool = False
 
     def __post_init__(self) -> None:
-        if isinstance(self.version, bool) or self.version not in {
-            SYMMETRIC_DIVISION_METADATA_VERSION,
-            SYMMETRIC_QUARTER_METADATA_VERSION,
-            LEGACY_SYMMETRIC_PAIR_METADATA_VERSION,
-            AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
-        }:
+        if (
+            isinstance(self.version, bool)
+            or self.version not in SUPPORTED_SYMMETRIC_METADATA_VERSIONS
+        ):
             raise ValueError("Unsupported symmetric-division metadata version.")
         if self.orientation not in SYMMETRIC_DIVISION_ORIENTATIONS:
             raise ValueError("Unknown symmetric-division orientation.")
@@ -265,6 +312,12 @@ class ObjectSymmetricDivisionMetadata:
 
 
 # ### Object-packing transaction types ###
+PersistableObjectTextureVariants = (
+    ObjectTextureVariants
+    | SymmetricQuarterTextureVariants
+    | SymmetricPairTextureVariants
+    | SymmetricSquarePairTextureVariants
+)
 ObjectPackingCommit = Callable[[], bool]
 ObjectPackingChangeHandler = Callable[
     [
@@ -1086,10 +1139,12 @@ class GenerationWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
+            _raise_if_generation_cancelled(self._cancel_event)
             prepare_executor = getattr(self._executor, "prepare", None)
             if callable(prepare_executor):
                 self.progress.emit("Preparing model processor...")
                 _run_interruptible_stage(prepare_executor)
+                _raise_if_generation_cancelled(self._cancel_event)
             result = _run_interruptible_stage(
                 lambda: _invoke_planner(
                     self._planner,
@@ -1098,6 +1153,7 @@ class GenerationWorker(QObject):
                     self._cancel_event,
                 )
             )
+            _raise_if_generation_cancelled(self._cancel_event)
             self.progress.emit(
                 "Validating generated geometry..."
                 if self._request.geometry_only
@@ -1108,9 +1164,12 @@ class GenerationWorker(QObject):
             )
             if not isinstance(generated_model, GeneratedModel):
                 raise TypeError("The Meshy executor returned an invalid model.")
+            _raise_if_generation_cancelled(self._cancel_event)
         except _GenerationCancelled:
             return
         except Exception as error:
+            if self._cancel_event.is_set():
+                return
             self.failed.emit(_safe_error_message(error, self._request.settings))
             return
         else:
@@ -1147,10 +1206,12 @@ class TextureRegenerationWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
+            _raise_if_generation_cancelled(self._cancel_event)
             prepare_executor = getattr(self._executor, "prepare", None)
             if callable(prepare_executor):
                 self.progress.emit("Preparing model processor...")
                 _run_interruptible_stage(prepare_executor)
+                _raise_if_generation_cancelled(self._cancel_event)
             result = _run_interruptible_stage(
                 lambda: _invoke_texture_regenerator(
                     self._regenerator,
@@ -1180,6 +1241,8 @@ class TextureRegenerationWorker(QObject):
         except _GenerationCancelled:
             return
         except Exception as error:
+            if self._cancel_event.is_set():
+                return
             self.failed.emit(_safe_error_message(error, self._request.settings))
             return
         else:
@@ -1286,6 +1349,11 @@ class GenerationWorkspace(QWidget):
     texture_regeneration_completed = Signal(object, object)
     face_purge_completed = Signal(object, object)
     generated_object_changed = Signal(object, object)
+    generated_object_placement_changed = Signal(object)
+    operation_cancelled = Signal(str, object)
+    placement_requested = Signal(str)
+    placement_request_finished = Signal(str)
+    operation_finished = Signal(str)
 
     def __init__(
         self,
@@ -1339,6 +1407,10 @@ class GenerationWorkspace(QWidget):
             ObjectPackingChangeHandler | None
         ) = None
         self._active_generation_request: GenerationRequest | None = None
+        self._active_object_operation: _ActiveObjectOperation | None = None
+        self._existing_object_placement_request: (
+            _ExistingObjectPlacementRequest | None
+        ) = None
         self._is_rebuilding_generation_data = False
         self._is_emitting_texture_repair = False
         self._selected_object_id: str | None = None
@@ -1353,6 +1425,7 @@ class GenerationWorkspace(QWidget):
     def set_data(self, data: GenerationData | None) -> None:
         if self._generation_thread is not None:
             raise RuntimeError("Cannot replace Generation data while generating.")
+        self._finish_existing_object_placement_request()
         self._close_video_source()
         self._displayed_frame_index = None
         self._data = GenerationData() if data is None else data.clone()
@@ -1437,6 +1510,20 @@ class GenerationWorkspace(QWidget):
         if not isinstance(record, GeneratedObjectRecord):
             return None
         return _get_object_symmetric_division_metadata(record)
+
+    def get_generated_object_model(
+        self,
+        object_id: str,
+    ) -> GeneratedModel | None:
+        """Load one generated model without exposing private asset paths."""
+
+        record = self._find_generated_object_record(object_id)
+        if record is None:
+            return None
+        try:
+            return self._load_generated_object_model(record)
+        except Exception:
+            return None
 
     def get_active_texture_variant(
         self,
@@ -1606,6 +1693,116 @@ class GenerationWorkspace(QWidget):
     def is_generating(self) -> bool:
         return self._generation_thread is not None
 
+    def request_object_placement(self) -> bool:
+        """Request placement for an in-flight or selected completed object."""
+
+        operation = self._active_object_operation
+        if self._can_place_active_operation(operation):
+            assert operation is not None
+            self.placement_requested.emit(operation.operation_id)
+            return True
+        if self._generation_thread is not None:
+            return False
+        record = self._find_generated_object_record(self._selected_object_id)
+        if record is None:
+            return False
+
+        self._finish_existing_object_placement_request()
+        request = _ExistingObjectPlacementRequest(
+            request_id=uuid.uuid4().hex,
+            object_id=record.object_id,
+        )
+        self._existing_object_placement_request = request
+        self.placement_requested.emit(request.request_id)
+        return True
+
+    def request_active_object_placement(self) -> bool:
+        """Compatibility alias for the generalized placement request."""
+
+        return self.request_object_placement()
+
+    def set_active_object_placement(
+        self,
+        operation_id: str,
+        placement: GeneratedObjectPlacement,
+    ) -> bool:
+        """Accept placement only for the exact current request token."""
+
+        if not isinstance(placement, GeneratedObjectPlacement):
+            return False
+        exact_request_id = str(operation_id)
+        operation = self._active_object_operation
+        if (
+            self._can_place_active_operation(operation)
+            and operation is not None
+            and operation.operation_id == exact_request_id
+        ):
+            operation.pending_placement = placement
+            self.status_label.setText(
+                "Object placement selected. Generation is still in progress."
+            )
+            return True
+
+        request = self._existing_object_placement_request
+        if (
+            self._generation_thread is not None
+            or request is None
+            or request.request_id != exact_request_id
+        ):
+            return False
+        record_index = next(
+            (
+                index
+                for index, record in enumerate(self._data.generated_objects)
+                if record.object_id == request.object_id
+            ),
+            None,
+        )
+        if record_index is None:
+            self._existing_object_placement_request = None
+            self._sync_controls()
+            return False
+
+        record = self._data.generated_objects[record_index]
+        replacement = replace(record, placement=placement)
+        self._existing_object_placement_request = None
+        self._data.generated_objects[record_index] = replacement
+        self.status_label.setText(f"Placed: {record.object_name}")
+        self._emit_data_changed()
+        self.generated_object_placement_changed.emit(replacement)
+        self._sync_controls()
+        return True
+
+    def cancel_object_placement_request(self, request_id: str) -> bool:
+        """Forget one exact completed-object placement request."""
+
+        request = self._existing_object_placement_request
+        if request is None or request.request_id != str(request_id):
+            return False
+        self._existing_object_placement_request = None
+        self._sync_controls()
+        return True
+
+    def cancel_current_operation(self) -> bool:
+        """Request an idempotent rollback of the active object operation."""
+
+        operation = self._active_object_operation
+        thread = self._generation_thread
+        if operation is None or thread is None:
+            return False
+        if operation.cancel_requested:
+            return True
+        operation.cancel_requested = True
+        operation.pending_placement = None
+        worker = self._generation_worker
+        if worker is not None and is_valid_qt_object(worker):
+            worker.cancel()
+        if is_valid_qt_object(thread):
+            thread.requestInterruption()
+        self.status_label.setText("Cancelling the current operation...")
+        self._sync_controls()
+        return True
+
     def delete_selected_generated_object(self) -> bool:
         """Delete the selected object without showing an interactive prompt."""
 
@@ -1643,15 +1840,32 @@ class GenerationWorkspace(QWidget):
     def undo_selected_object_change(self) -> bool:
         """Undo the selected object's latest local or texture operation."""
 
+        if self._selected_object_id is None:
+            return False
+        return self._undo_object_change(self._selected_object_id)
+
+    def _undo_object_change(
+        self,
+        object_id: str,
+        *,
+        expected_operation: str | None = None,
+    ) -> bool:
+        """Undo one exact object's latest operation and its Atlas transition."""
+
         if self._generation_thread is not None:
             return False
-        record = self._find_generated_object_record(self._selected_object_id)
+        record = self._find_generated_object_record(object_id)
         if record is None:
             return False
         undo_stack = _get_object_operation_undo_stack(record)
         if not undo_stack:
             return False
         snapshot = undo_stack[-1]
+        if (
+            expected_operation is not None
+            and snapshot.get("operation") != expected_operation
+        ):
+            return False
         try:
             replacement = _restore_object_operation_snapshot(
                 record,
@@ -1724,6 +1938,12 @@ class GenerationWorkspace(QWidget):
         if record_index is None:
             return False
 
+        pending_placement = self._existing_object_placement_request
+        if (
+            pending_placement is not None
+            and pending_placement.object_id == object_id
+        ):
+            self._finish_existing_object_placement_request()
         deleted_record = self._data.generated_objects.pop(record_index)
         self._generated_model_cache.pop(object_id, None)
         asset_cleanup_failed = self._delete_unreferenced_object_assets(
@@ -1842,7 +2062,11 @@ class GenerationWorkspace(QWidget):
     def _start_generation(self, request: GenerationRequest) -> None:
         """Start one owned request; split out for deterministic UI tests."""
 
+        self._finish_existing_object_placement_request()
         self._active_generation_request = request
+        self._active_object_operation = _ActiveObjectOperation(
+            kind=OBJECT_OPERATION_GENERATE_MODEL,
+        )
         self._generation_thread = QThread(self)
         self._generation_worker = GenerationWorker(
             self._meshy_planner,
@@ -1855,7 +2079,9 @@ class GenerationWorkspace(QWidget):
             self._handle_generation_succeeded
         )
         self._generation_worker.failed.connect(self._handle_generation_failed)
-        self._generation_worker.progress.connect(self.status_label.setText)
+        self._generation_worker.progress.connect(
+            self._handle_generation_progress
+        )
         self._generation_worker.finished.connect(
             self._generation_worker.deleteLater
         )
@@ -1878,7 +2104,12 @@ class GenerationWorkspace(QWidget):
     ) -> None:
         """Start a texture-only task for one immutable selected-object snapshot."""
 
+        self._finish_existing_object_placement_request()
         self._active_generation_request = None
+        self._active_object_operation = _ActiveObjectOperation(
+            kind=OBJECT_OPERATION_GENERATE_TEXTURE,
+            target_object_id=request.object_id,
+        )
         self._generation_thread = QThread(self)
         self._generation_worker = TextureRegenerationWorker(
             self._meshy_texture_regenerator,
@@ -1893,7 +2124,9 @@ class GenerationWorkspace(QWidget):
         self._generation_worker.failed.connect(
             self._handle_texture_regeneration_failed
         )
-        self._generation_worker.progress.connect(self.status_label.setText)
+        self._generation_worker.progress.connect(
+            self._handle_generation_progress
+        )
         self._generation_worker.finished.connect(
             self._generation_worker.deleteLater
         )
@@ -1914,7 +2147,12 @@ class GenerationWorkspace(QWidget):
     ) -> None:
         """Start one local face-purge request off the UI thread."""
 
+        self._finish_existing_object_placement_request()
         self._active_generation_request = None
+        self._active_object_operation = _ActiveObjectOperation(
+            kind=OBJECT_OPERATION_PURGE_FACES,
+            target_object_id=request.object_id,
+        )
         self._generation_thread = QThread(self)
         self._generation_worker = UncheckedCameraFacePurgeWorker(request)
         self._generation_worker.moveToThread(self._generation_thread)
@@ -1925,7 +2163,9 @@ class GenerationWorkspace(QWidget):
         self._generation_worker.failed.connect(
             self._handle_unchecked_camera_face_purge_failed
         )
-        self._generation_worker.progress.connect(self.status_label.setText)
+        self._generation_worker.progress.connect(
+            self._handle_generation_progress
+        )
         self._generation_worker.finished.connect(
             self._generation_worker.deleteLater
         )
@@ -1941,6 +2181,7 @@ class GenerationWorkspace(QWidget):
         self._sync_controls()
 
     def shutdown(self) -> None:
+        self._existing_object_placement_request = None
         worker = self._generation_worker
         thread = self._generation_thread
         if thread is not None:
@@ -1948,6 +2189,7 @@ class GenerationWorkspace(QWidget):
                 self._generation_thread = None
                 self._generation_worker = None
                 self._active_generation_request = None
+                self._active_object_operation = None
                 self._close_video_source()
                 return
             if worker is not None and is_valid_qt_object(worker):
@@ -1997,6 +2239,9 @@ class GenerationWorkspace(QWidget):
                 self._generation_thread = None
                 self._generation_worker = None
                 self._active_generation_request = None
+                self._active_object_operation = None
+        else:
+            self._active_object_operation = None
         self._close_video_source()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
@@ -2198,8 +2443,7 @@ class GenerationWorkspace(QWidget):
         self.symmetric_division_checkbox.setToolTip(
             "Automatically keep the generated model half with fewer "
             "triangles and pack its texture into one atlas half. This only "
-            "applies to a "
-            "brand-new Generate request."
+            "applies to a brand-new Generate request."
         )
         self.symmetric_division_checkbox.toggled.connect(self._sync_controls)
         buttons_layout.addWidget(self.symmetric_division_checkbox)
@@ -2268,6 +2512,18 @@ class GenerationWorkspace(QWidget):
         buttons_layout.addWidget(self.purge_faces_button)
         buttons_layout.addStretch(1)
 
+        self.place_object_button = QPushButton("Place")
+        self.place_object_button.setObjectName("place_generated_object_button")
+        self.place_object_button.setMinimumHeight(38)
+        self.place_object_button.setToolTip(
+            "Choose where the selected object appears on the Canvas, or set "
+            "the destination while a new model is still generating."
+        )
+        self.place_object_button.clicked.connect(
+            self.request_object_placement
+        )
+        buttons_layout.addWidget(self.place_object_button)
+
         self.undo_object_change_button = QPushButton("Undo")
         self.undo_object_change_button.setObjectName(
             "undo_object_change_button"
@@ -2281,6 +2537,20 @@ class GenerationWorkspace(QWidget):
             self.undo_selected_object_change
         )
         buttons_layout.addWidget(self.undo_object_change_button)
+
+        self.cancel_operation_button = QPushButton("Cancel")
+        self.cancel_operation_button.setObjectName(
+            "cancel_object_operation_button"
+        )
+        self.cancel_operation_button.setMinimumHeight(38)
+        self.cancel_operation_button.setToolTip(
+            "Cancel the current generation or face operation and restore "
+            "the object state from before it started."
+        )
+        self.cancel_operation_button.clicked.connect(
+            self.cancel_current_operation
+        )
+        buttons_layout.addWidget(self.cancel_operation_button)
         controls_layout.addLayout(buttons_layout)
 
         self.status_label = QLabel(
@@ -2364,12 +2634,79 @@ class GenerationWorkspace(QWidget):
         self._emit_data_changed()
         self._sync_controls()
 
+    # ### Active operation helpers ###
+    def _finish_existing_object_placement_request(self) -> None:
+        """Invalidate and close the picker for one completed object."""
+
+        request = self._existing_object_placement_request
+        if request is None:
+            return
+        self._existing_object_placement_request = None
+        self.placement_request_finished.emit(request.request_id)
+
+    def _can_place_active_operation(
+        self,
+        operation: _ActiveObjectOperation | None,
+    ) -> bool:
+        return bool(
+            operation is not None
+            and operation.kind == OBJECT_OPERATION_GENERATE_MODEL
+            and not operation.cancel_requested
+            and operation.committed_object_id is None
+            and self._generation_thread is not None
+            and isinstance(self._generation_worker, GenerationWorker)
+        )
+
+    @Slot(str)
+    def _handle_generation_progress(self, message: str) -> None:
+        operation = self._active_object_operation
+        sender = self.sender()
+        if sender is not None and sender is not self._generation_worker:
+            return
+        if operation is not None and operation.cancel_requested:
+            return
+        self.status_label.setText(str(message))
+
+    def _should_ignore_operation_result(self, expected_kind: str) -> bool:
+        sender = self.sender()
+        if sender is not None and sender is not self._generation_worker:
+            return True
+        operation = self._active_object_operation
+        return operation is not None and (
+            operation.kind != expected_kind
+            or operation.cancel_requested
+        )
+
+    def _record_operation_commit(
+        self,
+        expected_kind: str,
+        object_id: str,
+    ) -> None:
+        operation = self._active_object_operation
+        if (
+            operation is None
+            or operation.kind != expected_kind
+            or operation.cancel_requested
+        ):
+            return
+        if (
+            operation.target_object_id is not None
+            and operation.target_object_id != object_id
+        ):
+            return
+        operation.committed_object_id = object_id
+        self._sync_controls()
+
     @Slot(object, object)
     def _handle_generation_succeeded(
         self,
         result: object,
         generated_model: GeneratedModel,
     ) -> None:
+        if self._should_ignore_operation_result(
+            OBJECT_OPERATION_GENERATE_MODEL
+        ):
+            return
         generation_request = self._active_generation_request
         self._active_generation_request = None
         if not isinstance(result, MeshyGenerationResult):
@@ -2578,6 +2915,13 @@ class GenerationWorkspace(QWidget):
                 f"The Meshy texture variants could not be prepared locally: {error}"
             )
             return
+        active_operation = self._active_object_operation
+        placement = (
+            active_operation.pending_placement
+            if active_operation is not None
+            and active_operation.kind == OBJECT_OPERATION_GENERATE_MODEL
+            else None
+        )
         record = GeneratedObjectRecord(
             object_id=object_id,
             frame_index=(
@@ -2590,12 +2934,17 @@ class GenerationWorkspace(QWidget):
             provider=GENERATION_BACKEND_MESHY,
             provider_task_id=result.task_id,
             asset_path=asset_path,
+            placement=placement,
         )
         self._data.generated_objects.append(record)
         self._generated_model_cache[object_id] = generated_model
         self._selected_object_id = object_id
         self._generated_model = generated_model
         self._refresh_generated_objects_list(object_id)
+        self._record_operation_commit(
+            OBJECT_OPERATION_GENERATE_MODEL,
+            object_id,
+        )
         if isinstance(result, StagedMeshyGenerationResult):
             if result.geometry_only:
                 self.status_label.setText(
@@ -2625,6 +2974,10 @@ class GenerationWorkspace(QWidget):
         raw_outcome: object,
         generated_model: GeneratedModel,
     ) -> None:
+        if self._should_ignore_operation_result(
+            OBJECT_OPERATION_GENERATE_TEXTURE
+        ):
+            return
         if not isinstance(raw_outcome, TextureRegenerationOutcome):
             self._handle_texture_regeneration_failed(
                 "Meshy returned an invalid texture-regeneration result."
@@ -2653,30 +3006,10 @@ class GenerationWorkspace(QWidget):
                 canonical_provider_glb = texture_variants.glb_by_resolution[
                     TEXTURE_RESOLUTION_2048
                 ]
-                if _is_square_pair_symmetric_metadata(symmetry):
-                    texture_variants = (
-                        build_symmetric_square_pair_texture_variants(
-                            canonical_provider_glb,
-                            uvs_already_left_packed=True,
-                        )
-                    )
-                elif _is_legacy_pair_symmetric_metadata(symmetry):
-                    texture_variants = build_symmetric_pair_texture_variants(
-                        canonical_provider_glb,
-                        uvs_already_left_packed=True,
-                    )
-                elif _is_quarter_symmetric_metadata(symmetry):
-                    texture_variants = (
-                        build_symmetric_quarter_texture_variants(
-                            canonical_provider_glb,
-                            uvs_already_top_left_quarter=True,
-                        )
-                    )
-                else:
-                    texture_variants = build_symmetric_half_texture_variants(
-                        canonical_provider_glb,
-                        uvs_already_left_packed=True,
-                    )
+                texture_variants = _rebuild_symmetric_texture_variants(
+                    canonical_provider_glb,
+                    symmetry,
+                )
             variant_metadata = self._persist_object_texture_variants(
                 record.object_id,
                 texture_variants,
@@ -2730,6 +3063,10 @@ class GenerationWorkspace(QWidget):
                 "packing change could not be committed."
             )
             return
+        self._record_operation_commit(
+            OBJECT_OPERATION_GENERATE_TEXTURE,
+            record.object_id,
+        )
         cleanup_failed = self._delete_unreferenced_object_assets(record)
         status_suffix = (
             " Some superseded texture files could not be removed."
@@ -2748,6 +3085,10 @@ class GenerationWorkspace(QWidget):
         self,
         raw_outcome: object,
     ) -> None:
+        if self._should_ignore_operation_result(
+            OBJECT_OPERATION_PURGE_FACES
+        ):
+            return
         if not isinstance(raw_outcome, UncheckedCameraFacePurgeOutcome):
             self._handle_unchecked_camera_face_purge_failed(
                 "The face-purge worker returned an invalid result."
@@ -2764,26 +3105,18 @@ class GenerationWorkspace(QWidget):
         persisted_asset_paths: list[str] = []
         try:
             symmetry = _get_object_symmetric_division_metadata(record)
-            if _is_square_pair_symmetric_metadata(symmetry):
-                texture_variants = (
-                    build_symmetric_square_pair_texture_variants(
-                        outcome.result.glb_bytes,
-                        uvs_already_left_packed=True,
-                    )
-                )
-            elif _is_legacy_pair_symmetric_metadata(symmetry):
-                texture_variants = build_symmetric_pair_texture_variants(
-                    outcome.result.glb_bytes,
-                    uvs_already_left_packed=True,
-                )
-            elif _is_quarter_symmetric_metadata(symmetry):
-                texture_variants = build_symmetric_quarter_texture_variants(
-                    outcome.result.glb_bytes,
-                    uvs_already_top_left_quarter=True,
-                )
-            else:
+            if (
+                symmetry is None
+                or symmetry.version == SYMMETRIC_DIVISION_METADATA_VERSION
+            ):
+                # V1 projects historically retain three physical resolutions.
                 texture_variants = build_object_texture_variants(
                     outcome.result.glb_bytes
+                )
+            else:
+                texture_variants = _rebuild_symmetric_texture_variants(
+                    outcome.result.glb_bytes,
+                    symmetry,
                 )
             if texture_variants is None:
                 if isinstance(
@@ -2858,6 +3191,10 @@ class GenerationWorkspace(QWidget):
                 "change could not be committed."
             )
             return
+        self._record_operation_commit(
+            OBJECT_OPERATION_PURGE_FACES,
+            record.object_id,
+        )
         cleanup_failed = self._delete_unreferenced_object_assets(record)
         status_suffix = (
             " Some superseded files could not be removed."
@@ -2874,12 +3211,23 @@ class GenerationWorkspace(QWidget):
 
     @Slot(str)
     def _handle_generation_failed(self, error_message: str) -> None:
+        if self._should_ignore_operation_result(
+            OBJECT_OPERATION_GENERATE_MODEL
+        ):
+            return
         self._active_generation_request = None
+        operation = self._active_object_operation
+        if operation is not None:
+            operation.pending_placement = None
         self.status_label.setText(f"Generation failed: {error_message}")
         QMessageBox.warning(self, "Generation failed", error_message)
 
     @Slot(str)
     def _handle_texture_regeneration_failed(self, error_message: str) -> None:
+        if self._should_ignore_operation_result(
+            OBJECT_OPERATION_GENERATE_TEXTURE
+        ):
+            return
         self.status_label.setText(
             f"Texture generation failed: {error_message}"
         )
@@ -2894,16 +3242,95 @@ class GenerationWorkspace(QWidget):
         self,
         error_message: str,
     ) -> None:
+        if self._should_ignore_operation_result(
+            OBJECT_OPERATION_PURGE_FACES
+        ):
+            return
         self.status_label.setText(f"Face purge failed: {error_message}")
         QMessageBox.warning(self, "Face purge failed", error_message)
+
+    def _rollback_cancelled_operation(
+        self,
+        operation: _ActiveObjectOperation,
+    ) -> bool:
+        object_id = operation.committed_object_id
+        if object_id is None:
+            return True
+        if operation.kind == OBJECT_OPERATION_GENERATE_MODEL:
+            if self._find_generated_object_record(object_id) is None:
+                return True
+            return self.delete_generated_object(object_id)
+        if operation.kind not in {
+            OBJECT_OPERATION_GENERATE_TEXTURE,
+            OBJECT_OPERATION_PURGE_FACES,
+        }:
+            return False
+        if operation.target_object_id != object_id:
+            return False
+        return self._undo_object_change(
+            object_id,
+            expected_operation=operation.kind,
+        )
+
+    def _set_cancelled_operation_status(
+        self,
+        operation: _ActiveObjectOperation,
+        rollback_succeeded: bool,
+    ) -> None:
+        had_commit = operation.committed_object_id is not None
+        if not rollback_succeeded:
+            self.status_label.setText(
+                "The operation was cancelled, but its completed local "
+                "changes could not be rolled back."
+            )
+            return
+        if operation.kind == OBJECT_OPERATION_GENERATE_MODEL:
+            suffix = (
+                " The generated model was deleted."
+                if had_commit
+                else ""
+            )
+            self.status_label.setText("Model generation cancelled." + suffix)
+            return
+        if operation.kind == OBJECT_OPERATION_GENERATE_TEXTURE:
+            outcome = (
+                "The generated texture was deleted and the previous texture "
+                "was restored."
+                if had_commit
+                else "The existing texture was kept."
+            )
+            self.status_label.setText("Texture generation cancelled. " + outcome)
+            return
+        outcome = (
+            "The generated face revision was deleted and the previous model "
+            "was restored."
+            if had_commit
+            else "The existing model was kept."
+        )
+        self.status_label.setText("Face purge cancelled. " + outcome)
 
     @Slot()
     def _handle_generation_thread_finished(self) -> None:
         if self.sender() is not self._generation_thread:
             return
+        operation = self._active_object_operation
         self._generation_worker = None
         self._generation_thread = None
         self._active_generation_request = None
+        if operation is not None and operation.cancel_requested:
+            rollback_succeeded = self._rollback_cancelled_operation(operation)
+            self._set_cancelled_operation_status(
+                operation,
+                rollback_succeeded,
+            )
+            self.operation_cancelled.emit(
+                operation.kind,
+                operation.target_object_id,
+            )
+        if operation is not None:
+            operation.pending_placement = None
+            self.operation_finished.emit(operation.operation_id)
+        self._active_object_operation = None
         self._sync_controls()
 
     def _build_generation_request(
@@ -3171,6 +3598,17 @@ class GenerationWorkspace(QWidget):
                     selected_record
                 )
             )
+        )
+        self.place_object_button.setEnabled(
+            self._can_place_active_operation(
+                self._active_object_operation
+            )
+            or (not controls_are_busy and selected_record is not None)
+        )
+        self.cancel_operation_button.setEnabled(
+            controls_are_busy
+            and self._active_object_operation is not None
+            and not self._active_object_operation.cancel_requested
         )
         self.purge_faces_button.setEnabled(
             not controls_are_busy
@@ -3598,12 +4036,7 @@ class GenerationWorkspace(QWidget):
     def _persist_object_texture_variants(
         self,
         object_id: str,
-        variants: (
-            ObjectTextureVariants
-            | SymmetricQuarterTextureVariants
-            | SymmetricPairTextureVariants
-            | SymmetricSquarePairTextureVariants
-        ),
+        variants: PersistableObjectTextureVariants,
         *,
         asset_stem: str | None = None,
     ) -> dict[str, dict[str, str]]:
@@ -3621,14 +4054,9 @@ class GenerationWorkspace(QWidget):
         metadata: dict[str, dict[str, str]] = {}
         created_paths: list[str] = []
         resolutions = (
-            variants.selectable_resolutions
-            if isinstance(
-                variants,
-                SymmetricQuarterTextureVariants
-                | SymmetricPairTextureVariants
-                | SymmetricSquarePairTextureVariants,
-            )
-            else TEXTURE_RESOLUTIONS
+            TEXTURE_RESOLUTIONS
+            if isinstance(variants, ObjectTextureVariants)
+            else variants.selectable_resolutions
         )
         try:
             for resolution in resolutions:
@@ -3945,11 +4373,7 @@ def _parse_object_symmetric_division_metadata(
         return None
     orientation = str(raw_metadata.get("orientation", ""))
     automatic_fields: dict[str, object] = {}
-    if raw_version in {
-        SYMMETRIC_QUARTER_METADATA_VERSION,
-        LEGACY_SYMMETRIC_PAIR_METADATA_VERSION,
-        AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
-    }:
+    if raw_version in COMPACT_SYMMETRIC_METADATA_VERSIONS:
         raw_counts = raw_metadata.get("triangle_count_by_side")
         side_order = SYMMETRIC_DIVISION_SIDE_ORDER_BY_ORIENTATION.get(
             orientation
@@ -3993,12 +4417,7 @@ def _parse_object_symmetric_division_metadata(
             plane_coordinate=float(raw_plane_coordinate),
             texture_content_half=(
                 str(raw_metadata.get("texture_content_half", ""))
-                if raw_version
-                in {
-                    SYMMETRIC_DIVISION_METADATA_VERSION,
-                    LEGACY_SYMMETRIC_PAIR_METADATA_VERSION,
-                    AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
-                }
+                if raw_version in LEFT_HALF_SYMMETRIC_METADATA_VERSIONS
                 else None
             ),
             **automatic_fields,
@@ -4017,50 +4436,33 @@ def _get_object_symmetric_division_metadata(
     )
 
 
-def _is_quarter_symmetric_metadata(
-    metadata: ObjectSymmetricDivisionMetadata | None,
-) -> bool:
-    """Return whether metadata uses the compatible v2 quarter layout."""
+def _rebuild_symmetric_texture_variants(
+    canonical_glb: bytes,
+    metadata: ObjectSymmetricDivisionMetadata,
+) -> PersistableObjectTextureVariants:
+    """Rebuild variants using the exact layout stored by one record."""
 
-    return (
-        metadata is not None
-        and metadata.version
-        == SYMMETRIC_QUARTER_METADATA_VERSION
-    )
-
-
-def _is_legacy_pair_symmetric_metadata(
-    metadata: ObjectSymmetricDivisionMetadata | None,
-) -> bool:
-    """Return whether metadata uses the legacy double-sized pair layout."""
-
-    return (
-        metadata is not None
-        and metadata.version
-        == LEGACY_SYMMETRIC_PAIR_METADATA_VERSION
-    )
-
-
-def _is_square_pair_symmetric_metadata(
-    metadata: ObjectSymmetricDivisionMetadata | None,
-) -> bool:
-    """Return whether metadata uses the current square pair layout."""
-
-    return (
-        metadata is not None
-        and metadata.version
-        == AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION
-    )
-
-
-def _is_pair_symmetric_metadata(
-    metadata: ObjectSymmetricDivisionMetadata | None,
-) -> bool:
-    """Return whether metadata uses either two-object pair layout."""
-
-    return _is_legacy_pair_symmetric_metadata(
-        metadata
-    ) or _is_square_pair_symmetric_metadata(metadata)
+    if metadata.version == AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION:
+        return build_symmetric_square_pair_texture_variants(
+            canonical_glb,
+            uvs_already_left_packed=True,
+        )
+    if metadata.version == LEGACY_SYMMETRIC_PAIR_METADATA_VERSION:
+        return build_symmetric_pair_texture_variants(
+            canonical_glb,
+            uvs_already_left_packed=True,
+        )
+    if metadata.version == SYMMETRIC_QUARTER_METADATA_VERSION:
+        return build_symmetric_quarter_texture_variants(
+            canonical_glb,
+            uvs_already_top_left_quarter=True,
+        )
+    if metadata.version == SYMMETRIC_DIVISION_METADATA_VERSION:
+        return build_symmetric_half_texture_variants(
+            canonical_glb,
+            uvs_already_left_packed=True,
+        )
+    raise ValueError("Unsupported symmetric texture layout version.")
 
 
 def _uses_compact_symmetric_resolutions(
@@ -4068,9 +4470,10 @@ def _uses_compact_symmetric_resolutions(
 ) -> bool:
     """Return whether a saved layout exposes logical 512/1024 choices."""
 
-    return _is_quarter_symmetric_metadata(
-        metadata
-    ) or _is_pair_symmetric_metadata(metadata)
+    return (
+        metadata is not None
+        and metadata.version in COMPACT_SYMMETRIC_METADATA_VERSIONS
+    )
 
 
 def _selectable_texture_resolutions(

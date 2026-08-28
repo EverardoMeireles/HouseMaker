@@ -15,7 +15,7 @@ from PySide6.QtWidgets import QApplication
 from trimesh.visual.material import SimpleMaterial
 from trimesh.visual.texture import TextureVisuals
 
-from housemaker.glb import GeneratedModel
+from housemaker.glb import GeneratedModel, PreviewSymmetricObject
 from housemaker.viewer import GlbViewerWidget
 
 
@@ -97,6 +97,58 @@ class SymmetricViewerPreviewTests(unittest.TestCase):
         np.testing.assert_array_equal(model.mesh.faces, faces_before)
         np.testing.assert_array_equal(model.scene.bounds, scene_bounds_before)
         self.assertEqual(model.glb_bytes, glb_before)
+
+    def test_placed_preview_metadata_builds_an_automatic_fading_mirror(
+        self,
+    ) -> None:
+        model = _textured_half_model()
+        model.preview_symmetric_objects = [
+            PreviewSymmetricObject(
+                object_id="placed-chair",
+                meshes=(model.mesh, model.mesh.copy()),
+                orientation="vertical",
+                plane_coordinate=0.0,
+            )
+        ]
+        vertices_before = np.asarray(model.mesh.vertices).copy()
+        glb_before = bytes(model.glb_bytes)
+
+        self.viewer.set_model(model)
+
+        self.assertIsNone(self.viewer.symmetric_preview_textured_mesh_item)
+        self.assertIsNone(self.viewer.symmetric_preview_mesh_item)
+        self.assertEqual(
+            len(self.viewer._embedded_symmetric_preview_groups),
+            2,
+        )
+        ghost = self.viewer._embedded_symmetric_preview_groups[0]
+        second_ghost = self.viewer._embedded_symmetric_preview_groups[1]
+        self.assertIsNotNone(ghost.textured_item)
+        self.assertIsNotNone(second_ghost.textured_item)
+        np.testing.assert_allclose(
+            ghost.vertices[:, 0],
+            -vertices_before[:, 0],
+        )
+        self.assertTrue(self.viewer._symmetric_preview_timer.isActive())
+
+        assert ghost.textured_item is not None
+        opacity_before = ghost.textured_item._opacity
+        self.viewer._advance_symmetric_preview_fade()
+        self.assertNotEqual(ghost.textured_item._opacity, opacity_before)
+        assert second_ghost.textured_item is not None
+        self.assertEqual(
+            second_ghost.textured_item._opacity,
+            ghost.textured_item._opacity,
+        )
+        self.viewer.set_textures_enabled(False)
+        self.assertFalse(ghost.textured_item.visible())
+        self.assertTrue(ghost.mesh_item.opts["drawFaces"])
+
+        np.testing.assert_array_equal(model.mesh.vertices, vertices_before)
+        self.assertEqual(model.glb_bytes, glb_before)
+        self.viewer.clear_model()
+        self.assertEqual(self.viewer._embedded_symmetric_preview_groups, [])
+        self.assertFalse(self.viewer._symmetric_preview_timer.isActive())
 
     def test_texture_wireframe_visibility_and_timer_lifecycle(self) -> None:
         self.viewer.set_model(_textured_half_model())

@@ -288,17 +288,6 @@ class SymmetricSquarePairTextureVariants:
 
 
 @dataclass(frozen=True)
-class SymmetricDivisionOptions:
-    """Choose the Z-up world axis and half retained in the exported GLB."""
-
-    orientation: SymmetricDivisionOrientation
-    kept_side: SymmetricDivisionKeptSide
-
-    def __post_init__(self) -> None:
-        _validate_orientation_and_side(self.orientation, self.kept_side)
-
-
-@dataclass(frozen=True)
 class SymmetricDivisionMetadata:
     """Serializable provenance needed to mirror the retained half locally."""
 
@@ -306,7 +295,6 @@ class SymmetricDivisionMetadata:
     kept_side: SymmetricDivisionKeptSide
     plane_coordinate: float
     version: int = SYMMETRIC_DIVISION_METADATA_VERSION
-    cut_plane_capped: bool = False
     packing_mode: str | None = None
     texture_content_quadrant: str | None = None
     texture_content_half: str | None = None
@@ -326,8 +314,6 @@ class SymmetricDivisionMetadata:
             raise ValueError("Unsupported symmetric-division metadata version.")
         if not math.isfinite(self.plane_coordinate):
             raise ValueError("The symmetric-division plane must be finite.")
-        if self.cut_plane_capped:
-            raise ValueError("Symmetric division does not cap the cut plane yet.")
         if self.version == SYMMETRIC_DIVISION_METADATA_VERSION:
             self._validate_legacy_fields()
         else:
@@ -430,12 +416,7 @@ class SymmetricDivisionMetadata:
 class SymmetricDivisionResult:
     """Half-only GLB variants plus preview reconstruction provenance."""
 
-    variants: (
-        ObjectTextureVariants
-        | SymmetricQuarterTextureVariants
-        | SymmetricPairTextureVariants
-        | SymmetricSquarePairTextureVariants
-    )
+    variants: SymmetricSquarePairTextureVariants
     orientation: SymmetricDivisionOrientation
     kept_side: SymmetricDivisionKeptSide
     plane_coordinate: float
@@ -444,14 +425,11 @@ class SymmetricDivisionResult:
     def __post_init__(self) -> None:
         if not isinstance(
             self.variants,
-            (
-                ObjectTextureVariants,
-                SymmetricQuarterTextureVariants,
-                SymmetricPairTextureVariants,
-                SymmetricSquarePairTextureVariants,
-            ),
+            SymmetricSquarePairTextureVariants,
         ):
-            raise TypeError("Symmetric division requires object texture variants.")
+            raise TypeError(
+                "Automatic symmetric division requires square-pair variants."
+            )
         _validate_orientation_and_side(self.orientation, self.kept_side)
         if not math.isfinite(self.plane_coordinate):
             raise ValueError("The symmetric-division plane must be finite.")
@@ -461,14 +439,10 @@ class SymmetricDivisionResult:
             or self.metadata.plane_coordinate != self.plane_coordinate
         ):
             raise ValueError("Symmetric-division metadata does not match its result.")
-        expected_version = SYMMETRIC_DIVISION_METADATA_VERSION
-        if isinstance(self.variants, SymmetricQuarterTextureVariants):
-            expected_version = SYMMETRIC_QUARTER_METADATA_VERSION
-        elif isinstance(self.variants, SymmetricPairTextureVariants):
-            expected_version = LEGACY_SYMMETRIC_PAIR_METADATA_VERSION
-        elif isinstance(self.variants, SymmetricSquarePairTextureVariants):
-            expected_version = AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION
-        if self.metadata.version != expected_version:
+        if (
+            self.metadata.version
+            != AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION
+        ):
             raise ValueError(
                 "Symmetric variants do not match their metadata packing mode."
             )
@@ -787,74 +761,6 @@ def build_symmetric_quarter_texture_variants(
         len(source_textures),
         source_is_already_quarter=uvs_already_top_left_quarter,
     )
-
-
-# ### Public legacy transform ###
-def build_symmetric_object_variants(
-    canonical_2048_glb: bytes,
-    options: SymmetricDivisionOptions,
-) -> SymmetricDivisionResult:
-    """Clip an object to one half and repack its atlas into the left half.
-
-    The returned GLBs contain only retained geometry. The cut boundary remains
-    open in this first version; callers reconstruct the missing half only for
-    local previews by using the returned symmetry plane.
-    """
-
-    if not isinstance(options, SymmetricDivisionOptions):
-        raise TypeError("Symmetric division requires SymmetricDivisionOptions.")
-    payload = bytes(canonical_2048_glb)
-    if not payload:
-        raise ValueError("The canonical 2048 GLB is empty.")
-
-    scene = _load_glb_scene(payload)
-    _reject_auxiliary_material_textures(scene)
-    source_textures = _collect_material_textures(scene)
-    if not source_textures:
-        raise ValueError(
-            "Symmetric division requires one embedded base-color texture atlas."
-        )
-    canonical_texture = _validate_shared_2048_texture(source_textures).copy()
-    instances = _collect_mesh_instances(scene)
-    axis = _get_z_up_axis(options.orientation)
-    plane_coordinate = _get_world_midpoint(instances, axis)
-    clipped_scene = _build_clipped_scene(
-        instances,
-        axis=axis,
-        plane_coordinate=plane_coordinate,
-        kept_side=options.kept_side,
-        metadata=scene.metadata,
-    )
-    _normalize_scene_repeat_uvs(clipped_scene)
-    output_textures = _collect_material_textures(clipped_scene)
-    if not output_textures:
-        raise ValueError(
-            "Symmetric division removed every textured mesh from the kept half."
-        )
-    _validate_shared_2048_texture(output_textures)
-
-    packed_texture = _repack_retained_texture(
-        clipped_scene,
-        canonical_texture,
-    )
-    variants = _build_half_texture_variants(
-        clipped_scene,
-        packed_texture,
-        len(output_textures),
-    )
-    metadata = SymmetricDivisionMetadata(
-        orientation=options.orientation,
-        kept_side=options.kept_side,
-        plane_coordinate=plane_coordinate,
-    )
-    return SymmetricDivisionResult(
-        variants=variants,
-        orientation=options.orientation,
-        kept_side=options.kept_side,
-        plane_coordinate=plane_coordinate,
-        metadata=metadata,
-    )
-
 
 def build_symmetric_half_texture_variants(
     canonical_2048_glb: bytes,

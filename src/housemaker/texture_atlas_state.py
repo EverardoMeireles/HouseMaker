@@ -31,9 +31,11 @@ SYMMETRIC_QUARTER_ATLAS_STATE_SCHEMA_VERSION = 3
 SYMMETRIC_PAIR_ATLAS_STATE_SCHEMA_VERSION = 4
 ATLAS_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 ATLAS_PACKING_MODE_FULL = "full"
+# Schemas v2-v4 persist these legacy modes and must retain their old geometry.
 ATLAS_PACKING_MODE_SYMMETRIC_HALF = "symmetric_half"
 ATLAS_PACKING_MODE_SYMMETRIC_QUARTER = "symmetric_quarter"
 ATLAS_PACKING_MODE_SYMMETRIC_PAIR = "symmetric_pair"
+# Schema v5 stores current half models in ordinary square slots.
 ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR = "symmetric_square_pair"
 ATLAS_PACKING_MODES = frozenset(
     {
@@ -58,19 +60,25 @@ ATLAS_SLOT_QUADRANT_ORDER = (
     ATLAS_SLOT_QUADRANT_BOTTOM_RIGHT,
 )
 ATLAS_SLOT_QUADRANTS = frozenset(ATLAS_SLOT_QUADRANT_ORDER)
-SYMMETRIC_QUARTER_TEXTURE_RESOLUTIONS = frozenset({512, 1024})
-SYMMETRIC_PAIR_TEXTURE_RESOLUTIONS = frozenset({512, 1024})
-SYMMETRIC_SQUARE_PAIR_TEXTURE_RESOLUTIONS = frozenset({512, 1024})
-ATLAS_PAIR_PACKING_MODES = frozenset(
+SYMMETRIC_PACKED_TEXTURE_RESOLUTIONS = frozenset({512, 1024})
+ATLAS_LIMITED_RESOLUTION_PACKING_MODES = frozenset(
     {
+        ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
         ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
         ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+    }
+)
+ATLAS_DOUBLE_SIZED_PACKING_MODES = frozenset(
+    {
+        ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+        ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
     }
 )
 ATLAS_HALF_SLOT_PACKING_MODES = frozenset(
     {
         ATLAS_PACKING_MODE_SYMMETRIC_HALF,
-        *ATLAS_PAIR_PACKING_MODES,
+        ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+        ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
     }
 )
 
@@ -127,7 +135,7 @@ class TextureAtlasPlacement:
         elif packing_mode == ATLAS_PACKING_MODE_SYMMETRIC_QUARTER:
             if (
                 int(self.texture_resolution)
-                not in SYMMETRIC_QUARTER_TEXTURE_RESOLUTIONS
+                not in SYMMETRIC_PACKED_TEXTURE_RESOLUTIONS
             ):
                 raise ValueError(
                     "Symmetric quarter textures must use 512 or 1024 content."
@@ -138,12 +146,10 @@ class TextureAtlasPlacement:
                 )
             expected_size = int(self.texture_resolution) * 2
         else:
-            supported_resolutions = (
-                SYMMETRIC_PAIR_TEXTURE_RESOLUTIONS
-                if packing_mode == ATLAS_PACKING_MODE_SYMMETRIC_PAIR
-                else SYMMETRIC_SQUARE_PAIR_TEXTURE_RESOLUTIONS
-            )
-            if int(self.texture_resolution) not in supported_resolutions:
+            if (
+                int(self.texture_resolution)
+                not in SYMMETRIC_PACKED_TEXTURE_RESOLUTIONS
+            ):
                 raise ValueError(
                     "Symmetric pair textures must use 512 or 1024 content."
                 )
@@ -428,50 +434,24 @@ class TextureAtlasData:
             )
         else:
             unaffected = _normalize_partial_slot_placements(unaffected)
-            pair_target = (
-                _find_compatible_unpaired_half(
+            half_slot_target = (
+                _find_compatible_unpaired_half_slot(
                     unaffected,
                     normalized_resolution,
+                    normalized_packing_mode,
                 )
-                if normalized_packing_mode
-                == ATLAS_PACKING_MODE_SYMMETRIC_HALF
+                if normalized_packing_mode in ATLAS_HALF_SLOT_PACKING_MODES
                 and bool(allow_pairing)
                 else None
             )
-            if pair_target is not None:
+            if half_slot_target is not None:
                 placement = TextureAtlasPlacement(
                     object_id=normalized_id,
                     texture_path=normalized_path,
                     texture_resolution=normalized_resolution,
-                    x=pair_target.x,
-                    y=pair_target.y,
-                    size=normalized_resolution,
-                    packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_HALF,
-                    slot_half=ATLAS_SLOT_HALF_RIGHT,
-                )
-                _validate_placements_fit(
-                    atlas.resolution,
-                    [*unaffected, placement],
-                )
-            elif (
-                normalized_packing_mode in ATLAS_PAIR_PACKING_MODES
-                and bool(allow_pairing)
-                and (
-                    pair_target := _find_compatible_unpaired_pair(
-                        unaffected,
-                        normalized_resolution,
-                        normalized_packing_mode,
-                    )
-                )
-                is not None
-            ):
-                placement = TextureAtlasPlacement(
-                    object_id=normalized_id,
-                    texture_path=normalized_path,
-                    texture_resolution=normalized_resolution,
-                    x=pair_target.x,
-                    y=pair_target.y,
-                    size=pair_target.size,
+                    x=half_slot_target.x,
+                    y=half_slot_target.y,
+                    size=half_slot_target.size,
                     packing_mode=normalized_packing_mode,
                     slot_half=ATLAS_SLOT_HALF_RIGHT,
                 )
@@ -795,10 +775,8 @@ def write_texture_atlas_png(
                 "Texture atlas PNG output requires an asset root or source loader."
             )
         normalized_asset_root = Path(asset_root).resolve()
-        loader = lambda placement: _load_texture_from_path(
-            normalized_asset_root,
-            placement,
-        )
+        def loader(placement: TextureAtlasPlacement) -> np.ndarray:
+            return _load_texture_from_path(normalized_asset_root, placement)
     else:
         loader = source_loader
     canvas = np.zeros((atlas.resolution, atlas.resolution, 4), dtype=np.uint8)
@@ -879,56 +857,6 @@ class _QuadNode:
     children: tuple["_QuadNode", "_QuadNode", "_QuadNode", "_QuadNode"] | None = None
 
 
-def _pack_assignments(
-    atlas_resolution: int,
-    assignments: list[tuple[str, str, int]],
-) -> list[TextureAtlasPlacement]:
-    _validate_atlas_resolution(atlas_resolution)
-    if len(assignments) > MAX_ATLAS_OBJECT_COUNT:
-        raise ValueError("Texture atlas contains too many texture sources.")
-    normalized: list[tuple[str, str, int]] = []
-    seen_ids: set[str] = set()
-    for object_id, texture_path, texture_resolution in assignments:
-        normalized_id = str(object_id)
-        normalized_path = _normalize_project_relative_path(texture_path)
-        normalized_resolution = int(texture_resolution)
-        _validate_nonempty_text(normalized_id, "Object ID")
-        _validate_texture_resolution(normalized_resolution)
-        if normalized_id in seen_ids:
-            raise ValueError(
-                "A texture source can only occur once in one texture atlas."
-            )
-        seen_ids.add(normalized_id)
-        normalized.append(
-            (normalized_id, normalized_path, normalized_resolution)
-        )
-
-    root = _QuadNode(0, 0, int(atlas_resolution))
-    placements: list[TextureAtlasPlacement] = []
-    for object_id, texture_path, texture_resolution in sorted(
-        normalized,
-        key=lambda assignment: (-assignment[2], assignment[0]),
-    ):
-        node = _allocate_quad(root, texture_resolution)
-        if node is None:
-            raise ValueError(
-                f"Texture atlas {atlas_resolution}x{atlas_resolution} has no "
-                f"space for texture source {object_id!r} at "
-                f"{texture_resolution}x{texture_resolution}."
-            )
-        placements.append(
-            TextureAtlasPlacement(
-                object_id=object_id,
-                texture_path=texture_path,
-                texture_resolution=texture_resolution,
-                x=node.x,
-                y=node.y,
-                size=node.size,
-            )
-        )
-    return placements
-
-
 def _pack_placements(
     atlas_resolution: int,
     placements: list[TextureAtlasPlacement],
@@ -939,8 +867,7 @@ def _pack_placements(
     _validate_placements_fit(atlas_resolution, placements)
     placements = _normalize_partial_slot_placements(placements)
     logical_units: list[list[TextureAtlasPlacement]] = []
-    unpaired_halves_by_resolution: dict[int, list[TextureAtlasPlacement]] = {}
-    unpaired_pairs_by_mode_and_resolution: dict[
+    unpaired_half_slots_by_mode_and_resolution: dict[
         tuple[str, int],
         list[TextureAtlasPlacement],
     ] = {}
@@ -953,22 +880,12 @@ def _pack_placements(
         if packing_mode == ATLAS_PACKING_MODE_FULL:
             logical_units.append(slot_group)
             continue
-        if packing_mode == ATLAS_PACKING_MODE_SYMMETRIC_HALF:
+        if packing_mode in ATLAS_HALF_SLOT_PACKING_MODES:
             if len(slot_group) == 2:
                 logical_units.append(slot_group)
             else:
                 placement = slot_group[0]
-                unpaired_halves_by_resolution.setdefault(
-                    placement.texture_resolution,
-                    [],
-                ).append(placement)
-            continue
-        if packing_mode in ATLAS_PAIR_PACKING_MODES:
-            if len(slot_group) == 2:
-                logical_units.append(slot_group)
-            else:
-                placement = slot_group[0]
-                unpaired_pairs_by_mode_and_resolution.setdefault(
+                unpaired_half_slots_by_mode_and_resolution.setdefault(
                     (packing_mode, placement.texture_resolution),
                     [],
                 ).append(placement)
@@ -982,33 +899,12 @@ def _pack_placements(
             [],
         ).append(placement)
 
-    for resolution in sorted(unpaired_halves_by_resolution, reverse=True):
-        unpaired = sorted(
-            unpaired_halves_by_resolution[resolution],
-            key=lambda placement: placement.object_id,
-        )
-        for index in range(0, len(unpaired), 2):
-            members = unpaired[index : index + 2]
-            logical_units.append(
-                [
-                    replace(
-                        member,
-                        slot_half=(
-                            ATLAS_SLOT_HALF_LEFT
-                            if member_index == 0
-                            else ATLAS_SLOT_HALF_RIGHT
-                        ),
-                    )
-                    for member_index, member in enumerate(members)
-                ]
-            )
-
     for mode_and_resolution in sorted(
-        unpaired_pairs_by_mode_and_resolution,
+        unpaired_half_slots_by_mode_and_resolution,
         key=lambda item: (item[0], -item[1]),
     ):
         unpaired = sorted(
-            unpaired_pairs_by_mode_and_resolution[mode_and_resolution],
+            unpaired_half_slots_by_mode_and_resolution[mode_and_resolution],
             key=lambda placement: placement.object_id,
         )
         for index in range(0, len(unpaired), 2):
@@ -1248,26 +1144,15 @@ def _normalize_slot_quadrant(
 
 
 def _logical_slot_size(packing_mode: str, texture_resolution: int) -> int:
-    if packing_mode in {
-        ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
-        ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
-    }:
-        supported_resolutions = (
-            SYMMETRIC_QUARTER_TEXTURE_RESOLUTIONS
-            if packing_mode == ATLAS_PACKING_MODE_SYMMETRIC_QUARTER
-            else SYMMETRIC_PAIR_TEXTURE_RESOLUTIONS
+    if (
+        packing_mode in ATLAS_LIMITED_RESOLUTION_PACKING_MODES
+        and int(texture_resolution) not in SYMMETRIC_PACKED_TEXTURE_RESOLUTIONS
+    ):
+        raise ValueError(
+            "High-density symmetric textures must use 512 or 1024 content."
         )
-        if int(texture_resolution) not in supported_resolutions:
-            raise ValueError(
-                "High-density symmetric textures must use 512 or 1024 content."
-            )
-        return int(texture_resolution) * 2
-    if packing_mode == ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR:
-        if int(texture_resolution) not in SYMMETRIC_SQUARE_PAIR_TEXTURE_RESOLUTIONS:
-            raise ValueError(
-                "Symmetric square-pair textures must use 512 or 1024 content."
-            )
-    return int(texture_resolution)
+    multiplier = 2 if packing_mode in ATLAS_DOUBLE_SIZED_PACKING_MODES else 1
+    return int(texture_resolution) * multiplier
 
 
 def _group_placements_by_slot(
@@ -1280,26 +1165,6 @@ def _group_placements_by_slot(
             [],
         ).append(placement)
     return list(groups.values())
-
-
-def _normalize_orphaned_half_placements(
-    placements: list[TextureAtlasPlacement],
-) -> list[TextureAtlasPlacement]:
-    """Move a surviving right member to the left side of its logical slot."""
-
-    normalized: list[TextureAtlasPlacement] = []
-    for slot_group in _group_placements_by_slot(placements):
-        if (
-            len(slot_group) == 1
-            and slot_group[0].packing_mode in ATLAS_HALF_SLOT_PACKING_MODES
-            and slot_group[0].slot_half == ATLAS_SLOT_HALF_RIGHT
-        ):
-            normalized.append(
-                replace(slot_group[0], slot_half=ATLAS_SLOT_HALF_LEFT)
-            )
-        else:
-            normalized.extend(slot_group)
-    return normalized
 
 
 def _normalize_partial_slot_placements(
@@ -1356,24 +1221,7 @@ def _normalize_partial_slot_placements(
     return normalized
 
 
-def _find_compatible_unpaired_half(
-    placements: list[TextureAtlasPlacement],
-    texture_resolution: int,
-) -> TextureAtlasPlacement | None:
-    for slot_group in _group_placements_by_slot(placements):
-        if len(slot_group) != 1:
-            continue
-        placement = slot_group[0]
-        if (
-            placement.packing_mode == ATLAS_PACKING_MODE_SYMMETRIC_HALF
-            and placement.slot_half == ATLAS_SLOT_HALF_LEFT
-            and placement.texture_resolution == int(texture_resolution)
-        ):
-            return placement
-    return None
-
-
-def _find_compatible_unpaired_pair(
+def _find_compatible_unpaired_half_slot(
     placements: list[TextureAtlasPlacement],
     texture_resolution: int,
     packing_mode: str,

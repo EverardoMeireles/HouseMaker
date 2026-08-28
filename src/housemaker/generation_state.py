@@ -103,6 +103,55 @@ class MaskStroke:
 
 # ### Generated-object models ###
 @dataclass(frozen=True)
+class GeneratedObjectPlacement:
+    """One generated object's floor-relative location on a Canvas level."""
+
+    level_index: int
+    image_x: float
+    image_y: float
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.level_index, bool)
+            or not isinstance(self.level_index, int)
+            or self.level_index < 0
+        ):
+            raise ValueError(
+                "Generated-object placement level index must be a "
+                "non-negative integer."
+            )
+        if not _is_strict_finite_number(self.image_x):
+            raise ValueError(
+                "Generated-object placement X coordinate must be finite."
+            )
+        if not _is_strict_finite_number(self.image_y):
+            raise ValueError(
+                "Generated-object placement Y coordinate must be finite."
+            )
+        object.__setattr__(self, "image_x", float(self.image_x))
+        object.__setattr__(self, "image_y", float(self.image_y))
+
+    def to_dict(self) -> dict[str, int | float]:
+        return {
+            "level_index": self.level_index,
+            "image_x": self.image_x,
+            "image_y": self.image_y,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "GeneratedObjectPlacement":
+        if not isinstance(payload, dict):
+            raise ValueError(
+                "Generated-object placement data must contain an object."
+            )
+        return cls(
+            level_index=payload.get("level_index"),
+            image_x=payload.get("image_x"),
+            image_y=payload.get("image_y"),
+        )
+
+
+@dataclass(frozen=True)
 class GeneratedObjectRecord:
     """Serializable provenance for a generated object.
 
@@ -117,6 +166,7 @@ class GeneratedObjectRecord:
     provider: str = MESHY_GENERATION_PROVIDER
     provider_task_id: str | None = None
     asset_path: str | None = None
+    placement: GeneratedObjectPlacement | None = None
 
     def __post_init__(self) -> None:
         if not str(self.object_id).strip():
@@ -134,6 +184,14 @@ class GeneratedObjectRecord:
                 raise ValueError("Meshy generated objects require a task ID.")
             if not str(self.asset_path or "").strip():
                 raise ValueError("Meshy generated objects require an asset path.")
+        if self.placement is not None and not isinstance(
+            self.placement,
+            GeneratedObjectPlacement,
+        ):
+            raise ValueError(
+                "Generated-object placement must be a "
+                "GeneratedObjectPlacement value."
+            )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -144,6 +202,9 @@ class GeneratedObjectRecord:
             "provider": self.provider,
             "provider_task_id": self.provider_task_id,
             "asset_path": self.asset_path,
+            "placement": (
+                None if self.placement is None else self.placement.to_dict()
+            ),
         }
 
     @classmethod
@@ -168,6 +229,13 @@ class GeneratedObjectRecord:
                 None
                 if payload.get("asset_path") is None
                 else str(payload.get("asset_path"))
+            ),
+            placement=(
+                None
+                if payload.get("placement") is None
+                else GeneratedObjectPlacement.from_dict(
+                    payload.get("placement")
+                )
             ),
         )
 
@@ -303,3 +371,13 @@ def _is_finite_number(value: object) -> bool:
         return math.isfinite(float(value))
     except (TypeError, ValueError, OverflowError):
         return False
+
+
+def _is_strict_finite_number(value: object) -> bool:
+    """Reject coercible text and booleans while accepting JSON numbers."""
+
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, int | float)
+        and math.isfinite(float(value))
+    )

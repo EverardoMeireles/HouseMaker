@@ -11,9 +11,7 @@ from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
 from housemaker.object_symmetry import (
-    SymmetricDivisionOptions,
     build_symmetric_half_texture_variants,
-    build_symmetric_object_variants,
 )
 
 
@@ -163,16 +161,6 @@ def _rigid_fit_glb() -> bytes:
                     texture=texture,
                 ),
             ),
-            (
-                "removed-rigid",
-                _quad_mesh(
-                    x_minimum=1.0,
-                    x_maximum=2.0,
-                    z_offset=0.0,
-                    uvs=_quad_uvs((100, 100, 400, 400)),
-                    texture=texture,
-                ),
-            ),
         )
     )
 
@@ -203,16 +191,6 @@ def _uniform_fallback_glb() -> bytes:
                     x_maximum=-1.0,
                     z_offset=2.0,
                     uvs=_quad_uvs(second_rectangle),
-                    texture=texture,
-                ),
-            ),
-            (
-                "removed-poison",
-                _quad_mesh(
-                    x_minimum=1.0,
-                    x_maximum=2.0,
-                    z_offset=0.0,
-                    uvs=_quad_uvs(poison_rectangle),
                     texture=texture,
                 ),
             ),
@@ -385,13 +363,10 @@ class SymmetricUvUniformFallbackTests(unittest.TestCase):
         source_geometry = _geometry_for_node(source_scene, "retained-rigid")
         source_texture = _texture_for_geometry(source_geometry)
 
-        result = build_symmetric_object_variants(
-            source,
-            SymmetricDivisionOptions("vertical", "left"),
-        )
-        output_scene = _load_scene(result.variants.glb_by_resolution[2048])
+        variants = build_symmetric_half_texture_variants(source)
+        output_scene = _load_scene(variants.glb_by_resolution[2048])
         output_geometry = _geometry_for_node(output_scene, "retained-rigid")
-        output_texture = result.variants.preview_rgba_by_resolution[2048]
+        output_texture = variants.preview_rgba_by_resolution[2048]
 
         _assert_similarity_transform(
             self,
@@ -419,16 +394,10 @@ class SymmetricUvUniformFallbackTests(unittest.TestCase):
         source = _uniform_fallback_glb()
         source_scene = _load_scene(source)
 
-        first = build_symmetric_object_variants(
-            source,
-            SymmetricDivisionOptions("vertical", "left"),
-        )
-        second = build_symmetric_object_variants(
-            source,
-            SymmetricDivisionOptions("vertical", "left"),
-        )
-        output_scene = _load_scene(first.variants.glb_by_resolution[2048])
-        output_texture = first.variants.preview_rgba_by_resolution[2048]
+        first = build_symmetric_half_texture_variants(source)
+        second = build_symmetric_half_texture_variants(source)
+        output_scene = _load_scene(first.glb_by_resolution[2048])
+        output_texture = first.preview_rgba_by_resolution[2048]
         scales: list[float] = []
         for node_name in ("retained-first", "retained-second"):
             source_geometry = _geometry_for_node(source_scene, node_name)
@@ -448,7 +417,6 @@ class SymmetricUvUniformFallbackTests(unittest.TestCase):
                 tolerance=2.0,
             )
         self.assertAlmostEqual(scales[0], scales[1], delta=2e-7)
-        self.assertNotIn("removed-poison", output_scene.graph.nodes_geometry)
         self.assertEqual(
             np.count_nonzero(
                 np.all(output_texture == _POISON_MAGENTA, axis=2)
@@ -460,29 +428,26 @@ class SymmetricUvUniformFallbackTests(unittest.TestCase):
         for resolution in (512, 1024, 2048):
             with self.subTest(resolution=resolution):
                 np.testing.assert_array_equal(
-                    first.variants.preview_rgba_by_resolution[resolution],
-                    second.variants.preview_rgba_by_resolution[resolution],
+                    first.preview_rgba_by_resolution[resolution],
+                    second.preview_rgba_by_resolution[resolution],
                 )
                 self.assertEqual(
-                    first.variants.texture_png_by_resolution[resolution],
-                    second.variants.texture_png_by_resolution[resolution],
+                    first.texture_png_by_resolution[resolution],
+                    second.texture_png_by_resolution[resolution],
                 )
                 self.assertEqual(
-                    first.variants.glb_by_resolution[resolution],
-                    second.variants.glb_by_resolution[resolution],
+                    first.glb_by_resolution[resolution],
+                    second.glb_by_resolution[resolution],
                 )
 
     def test_preserved_left_retexture_does_not_scale_fallback_twice(self) -> None:
         source = _uniform_fallback_glb()
-        divided = build_symmetric_object_variants(
-            source,
-            SymmetricDivisionOptions("vertical", "left"),
-        )
-        divided_scene = _load_scene(divided.variants.glb_by_resolution[2048])
-        divided_texture = divided.variants.preview_rgba_by_resolution[2048]
+        divided = build_symmetric_half_texture_variants(source)
+        divided_scene = _load_scene(divided.glb_by_resolution[2048])
+        divided_texture = divided.preview_rgba_by_resolution[2048]
 
         preserved = build_symmetric_half_texture_variants(
-            divided.variants.glb_by_resolution[2048],
+            divided.glb_by_resolution[2048],
             uvs_already_left_packed=True,
         )
         preserved_scene = _load_scene(preserved.glb_by_resolution[2048])

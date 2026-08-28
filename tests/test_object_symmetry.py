@@ -21,9 +21,7 @@ from housemaker.glb import GLTF_Y_UP_TO_Z_UP_TRANSFORM
 from housemaker.object_symmetry import (
     AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
     LEGACY_SYMMETRIC_PAIR_METADATA_VERSION,
-    SYMMETRIC_PAIR_ATLAS_RESOLUTION_BY_CONTENT_RESOLUTION,
     SYMMETRIC_QUARTER_METADATA_VERSION,
-    SYMMETRIC_QUARTER_ATLAS_RESOLUTION_BY_CONTENT_RESOLUTION,
     SYMMETRIC_SQUARE_PAIR_ATLAS_RESOLUTION_BY_CONTENT_RESOLUTION,
     SYMMETRIC_SELECTION_MODE_FEWEST_TRIANGLES_RANDOM_TIE,
     SYMMETRIC_TEXTURE_CONTENT_QUADRANT_TOP_LEFT,
@@ -31,14 +29,11 @@ from housemaker.object_symmetry import (
     SYMMETRIC_TEXTURE_PACKING_MODE_PAIR,
     SYMMETRIC_TEXTURE_PACKING_MODE_TOP_LEFT_QUARTER,
     SymmetricDivisionMetadata,
-    SymmetricDivisionOptions,
-    SymmetricDivisionResult,
     SymmetricPairTextureVariants,
     SymmetricQuarterTextureVariants,
     SymmetricSquarePairTextureVariants,
     build_automatic_symmetric_object_variants,
     build_symmetric_half_texture_variants,
-    build_symmetric_object_variants,
     build_symmetric_pair_texture_variants,
     build_symmetric_quarter_texture_variants,
     build_symmetric_square_pair_texture_variants,
@@ -364,13 +359,18 @@ def _grid_glb(grid_size: int = 40) -> bytes:
     return _scene_glb([("grid-node", mesh, np.eye(4))])
 
 
+def _fixed_choice_rng(side: str) -> mock.Mock:
+    """Return a tie chooser that selects one expected retained side."""
+
+    return mock.Mock(choice=mock.Mock(return_value=side))
+
+
 # ### Metadata tests ###
 class SymmetricDivisionMetadataTests(unittest.TestCase):
-    def test_options_and_metadata_are_validated_and_frozen(self) -> None:
-        options = SymmetricDivisionOptions("vertical", "left")
+    def test_version_one_metadata_remains_validated_and_frozen(self) -> None:
         metadata = SymmetricDivisionMetadata(
-            orientation=options.orientation,
-            kept_side=options.kept_side,
+            orientation="vertical",
+            kept_side="left",
             plane_coordinate=1.25,
         )
 
@@ -383,13 +383,16 @@ class SymmetricDivisionMetadataTests(unittest.TestCase):
                 "plane_coordinate": 1.25,
             },
         )
-        self.assertFalse(metadata.cut_plane_capped)
         with self.assertRaises(FrozenInstanceError):
-            options.kept_side = "right"  # type: ignore[misc]
+            metadata.kept_side = "right"  # type: ignore[misc]
         with self.assertRaisesRegex(ValueError, "match"):
-            SymmetricDivisionOptions("vertical", "top")
+            SymmetricDivisionMetadata("vertical", "top", 0.0)
         with self.assertRaisesRegex(ValueError, "Unknown"):
-            SymmetricDivisionOptions("diagonal", "left")  # type: ignore[arg-type]
+            SymmetricDivisionMetadata(  # type: ignore[arg-type]
+                "diagonal",
+                "left",
+                0.0,
+            )
 
     def test_version_two_quarter_metadata_remains_load_compatible(self) -> None:
         variants = build_symmetric_quarter_texture_variants(_box_glb())
@@ -409,15 +412,7 @@ class SymmetricDivisionMetadataTests(unittest.TestCase):
             tie_broken_randomly=True,
         )
 
-        result = SymmetricDivisionResult(
-            variants=variants,
-            orientation="vertical",
-            kept_side="left",
-            plane_coordinate=0.0,
-            metadata=metadata,
-        )
-
-        self.assertIs(result.metadata, metadata)
+        self.assertIsInstance(variants, SymmetricQuarterTextureVariants)
         self.assertEqual(
             metadata.to_pipeline_dict()["packing_mode"],
             "symmetric_quarter",
@@ -439,15 +434,8 @@ class SymmetricDivisionMetadataTests(unittest.TestCase):
             tie_broken_randomly=True,
         )
 
-        result = SymmetricDivisionResult(
-            variants=variants,
-            orientation="vertical",
-            kept_side="left",
-            plane_coordinate=0.0,
-            metadata=metadata,
-        )
-
-        self.assertIs(result.metadata, metadata)
+        self.assertIsInstance(variants, SymmetricPairTextureVariants)
+        self.assertEqual(metadata.to_pipeline_dict()["version"], 3)
         self.assertEqual(
             variants.preview_rgba_by_resolution[1024].shape,
             (2048, 2048, 4),
@@ -906,9 +894,10 @@ class SymmetricDivisionGeometryTests(unittest.TestCase):
 
         for side, expected_x_bounds in expected_bounds.items():
             with self.subTest(side=side):
-                result = build_symmetric_object_variants(
+                result = build_automatic_symmetric_object_variants(
                     source,
-                    SymmetricDivisionOptions("vertical", side),
+                    "vertical",
+                    rng=_fixed_choice_rng(side),
                 )
                 retained = _z_up_world_mesh(
                     result.variants.glb_by_resolution[512]
@@ -932,9 +921,10 @@ class SymmetricDivisionGeometryTests(unittest.TestCase):
 
         for side, expected_z_bounds in expected_bounds.items():
             with self.subTest(side=side):
-                result = build_symmetric_object_variants(
+                result = build_automatic_symmetric_object_variants(
                     source,
-                    SymmetricDivisionOptions("horizontal", side),
+                    "horizontal",
+                    rng=_fixed_choice_rng(side),
                 )
                 retained = _z_up_world_mesh(
                     result.variants.glb_by_resolution[512]
@@ -956,9 +946,10 @@ class SymmetricDivisionGeometryTests(unittest.TestCase):
             (0.0, 0.0, 1.0),
         )
         transform[:3, 3] = (7.5, 11.0, -4.0)
-        result = build_symmetric_object_variants(
+        result = build_automatic_symmetric_object_variants(
             _box_glb(transform=transform),
-            SymmetricDivisionOptions("vertical", "right"),
+            "vertical",
+            rng=_fixed_choice_rng("right"),
         )
         scene = _load_scene(result.variants.glb_by_resolution[1024])
         retained = _z_up_world_mesh(result.variants.glb_by_resolution[1024])
@@ -991,20 +982,21 @@ class SymmetricDivisionGeometryTests(unittest.TestCase):
         mesh = _textured_mesh(mesh, _solid_texture((90, 60, 30, 255)), uvs=uvs)
         source = _scene_glb([("triangle-node", mesh, np.eye(4))])
 
-        result = build_symmetric_object_variants(
+        result = build_automatic_symmetric_object_variants(
             source,
-            SymmetricDivisionOptions("vertical", "left"),
+            "vertical",
         )
         output_scene = _load_scene(
-            result.variants.glb_by_resolution[2048]
+            result.variants.glb_by_resolution[1024]
         )
         output_geometry = next(iter(output_scene.geometry.values()))
-        retained = _z_up_world_mesh(result.variants.glb_by_resolution[2048])
+        retained = _z_up_world_mesh(result.variants.glb_by_resolution[1024])
         retained_uvs = np.asarray(retained.visual.uv, dtype=float)
         boundary_uvs = retained_uvs[np.isclose(retained.vertices[:, 0], 0.0)]
 
-        self.assertEqual(len(retained.faces), 2)
-        self.assertTrue(np.all(retained.vertices[:, 0] <= 1e-8))
+        self.assertEqual(result.kept_side, "right")
+        self.assertEqual(len(retained.faces), 1)
+        self.assertTrue(np.all(retained.vertices[:, 0] >= -1e-8))
         self.assertEqual(len(boundary_uvs), 2)
         self.assertAlmostEqual(
             float(np.linalg.norm(boundary_uvs[1] - boundary_uvs[0])),
@@ -1022,12 +1014,13 @@ class SymmetricDivisionGeometryTests(unittest.TestCase):
         source = _grid_glb(90)
         source_mesh = _z_up_world_mesh(source)
         started_at = time.perf_counter()
-        result = build_symmetric_object_variants(
+        result = build_automatic_symmetric_object_variants(
             source,
-            SymmetricDivisionOptions("vertical", "left"),
+            "vertical",
+            rng=_fixed_choice_rng("left"),
         )
         elapsed_seconds = time.perf_counter() - started_at
-        output_payload = result.variants.glb_by_resolution[2048]
+        output_payload = result.variants.glb_by_resolution[1024]
         retained = _z_up_world_mesh(output_payload)
 
         self.assertLess(len(retained.faces), len(source_mesh.faces) * 0.55)
@@ -1066,11 +1059,8 @@ class SymmetricDivisionGeometryTests(unittest.TestCase):
             uvs=uvs,
         )
         source = _scene_glb([("seam-node", mesh, np.eye(4))])
-        result = build_symmetric_object_variants(
-            source,
-            SymmetricDivisionOptions("vertical", "left"),
-        )
-        retained = _z_up_world_mesh(result.variants.glb_by_resolution[2048])
+        variants = build_symmetric_half_texture_variants(source)
+        retained = _z_up_world_mesh(variants.glb_by_resolution[2048])
         coincident_indices = np.flatnonzero(
             np.all(
                 np.isclose(retained.vertices, (-1.0, 0.0, 0.0)),
@@ -1086,9 +1076,10 @@ class SymmetricDivisionGeometryTests(unittest.TestCase):
 # ### Texture tests ###
 class SymmetricDivisionTextureTests(unittest.TestCase):
     def test_uvs_and_texture_fit_exactly_in_left_half(self) -> None:
-        result = build_symmetric_object_variants(
+        result = build_automatic_symmetric_object_variants(
             _box_glb(),
-            SymmetricDivisionOptions("vertical", "left"),
+            "vertical",
+            rng=_fixed_choice_rng("left"),
         )
 
         for resolution, payload in result.variants.glb_by_resolution.items():
@@ -1114,11 +1105,8 @@ class SymmetricDivisionTextureTests(unittest.TestCase):
         source_texture = _nonuniform_texture()
         mesh = _textured_mesh(trimesh.creation.box(), source_texture)
         source = _scene_glb([("box-node", mesh, np.eye(4))])
-        result = build_symmetric_object_variants(
-            source,
-            SymmetricDivisionOptions("vertical", "left"),
-        )
-        canonical = result.variants.preview_rgba_by_resolution[2048]
+        variants = build_symmetric_half_texture_variants(source)
+        canonical = variants.preview_rgba_by_resolution[2048]
         expected_black = np.zeros((2048, 1024, 4), dtype=np.uint8)
         expected_black[:, :, 3] = 255
         np.testing.assert_array_equal(canonical[:, 1024:], expected_black)
@@ -1138,15 +1126,15 @@ class SymmetricDivisionTextureTests(unittest.TestCase):
                     interpolation=cv2.INTER_AREA,
                 )
                 np.testing.assert_array_equal(
-                    result.variants.preview_rgba_by_resolution[resolution],
+                    variants.preview_rgba_by_resolution[resolution],
                     expected,
                 )
         chained_512 = cv2.resize(
-            result.variants.preview_rgba_by_resolution[1024],
+            variants.preview_rgba_by_resolution[1024],
             (512, 512),
             interpolation=cv2.INTER_AREA,
         )
-        direct_512 = result.variants.preview_rgba_by_resolution[512]
+        direct_512 = variants.preview_rgba_by_resolution[512]
         self.assertGreater(np.count_nonzero(direct_512 != chained_512), 0)
 
     def test_fresh_retexture_uvs_and_pixels_are_left_packed_without_clip(
@@ -1651,12 +1639,13 @@ class SymmetricDivisionTextureTests(unittest.TestCase):
             ]
         )
 
-        result = build_symmetric_object_variants(
+        result = build_automatic_symmetric_object_variants(
             source,
-            SymmetricDivisionOptions("vertical", "left"),
+            "vertical",
+            rng=_fixed_choice_rng("left"),
         )
-        output = result.variants.preview_rgba_by_resolution[2048]
-        output_scene = _load_scene(result.variants.glb_by_resolution[2048])
+        output = result.variants.preview_rgba_by_resolution[1024]
+        output_scene = _load_scene(result.variants.glb_by_resolution[1024])
 
         self.assertEqual(len(output_scene.geometry), 1)
         self.assertGreater(
@@ -2229,11 +2218,12 @@ class SymmetricDivisionRepeatedUvTests(unittest.TestCase):
             ]
         )
 
-        result = build_symmetric_object_variants(
+        result = build_automatic_symmetric_object_variants(
             source,
-            SymmetricDivisionOptions("vertical", "left"),
+            "vertical",
+            rng=_fixed_choice_rng("left"),
         )
-        output_scene = _load_scene(result.variants.glb_by_resolution[2048])
+        output_scene = _load_scene(result.variants.glb_by_resolution[1024])
         output_transform, _geometry_name = output_scene.graph.get(
             "repeated-node"
         )
@@ -2848,10 +2838,7 @@ class SymmetricDivisionFallbackAndRejectionTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "more than one distinct"):
-            build_symmetric_object_variants(
-                source,
-                SymmetricDivisionOptions("vertical", "left"),
-            )
+            build_automatic_symmetric_object_variants(source, "vertical")
 
     def test_shared_geometry_nodes_are_rejected_before_output(self) -> None:
         mesh = _textured_mesh(
@@ -2870,20 +2857,14 @@ class SymmetricDivisionFallbackAndRejectionTests(unittest.TestCase):
         source = bytes(scene.export(file_type="glb"))
 
         with self.assertRaisesRegex(ValueError, "shared"):
-            build_symmetric_object_variants(
-                source,
-                SymmetricDivisionOptions("vertical", "left"),
-            )
+            build_automatic_symmetric_object_variants(source, "vertical")
 
     def test_missing_texture_is_rejected(self) -> None:
         source = bytes(
             trimesh.Scene(trimesh.creation.box()).export(file_type="glb")
         )
         with self.assertRaisesRegex(ValueError, "base-color texture"):
-            build_symmetric_object_variants(
-                source,
-                SymmetricDivisionOptions("vertical", "left"),
-            )
+            build_automatic_symmetric_object_variants(source, "vertical")
 
 
 # ### Test entry point ###

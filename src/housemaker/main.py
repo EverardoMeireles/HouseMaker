@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 
 from PIL import Image
@@ -46,8 +47,13 @@ from housemaker.camera_models import (
     MAX_FIRST_PERSON_LIGHT_INTENSITY,
     MIN_FIRST_PERSON_LIGHT_INTENSITY,
 )
-from housemaker.generation_state import GeneratedObjectRecord, GenerationData
+from housemaker.generation_state import (
+    GeneratedObjectPlacement,
+    GeneratedObjectRecord,
+    GenerationData,
+)
 from housemaker.generation_workspace import GenerationWorkspace
+from housemaker.object_placement_dialog import ObjectPlacementDialog
 from housemaker.surface_texture_state import (
     SURFACE_TYPE_WALL,
     SurfaceTextureAssignment,
@@ -64,7 +70,9 @@ from housemaker.surface_geometry import (
 from housemaker.glb import (
     DEFAULT_WALL_HEIGHT_METERS,
     GeneratedModel,
+    PlacedGeneratedModel,
     build_stair_meshes,
+    compose_placed_generated_models,
     convert_to_glb,
     export_glb_file,
     export_room_texture_pngs,
@@ -107,7 +115,10 @@ from housemaker.models import (
     create_default_doorway_presets,
     create_default_levels,
 )
-from housemaker.level_coordinates import build_level_base_z_lookup
+from housemaker.level_coordinates import (
+    build_level_base_z_lookup,
+    level_image_to_world_xy,
+)
 from housemaker.project_io import ProjectData, load_project, save_project
 from housemaker.settings_widget import (
     SettingsWidget,
@@ -275,6 +286,8 @@ class BlueprintWorkspace(QWidget):
         self._atlas_wall_texture_source_ids: set[str] = set()
         self._atlas_preview_variant_key: tuple[object, ...] | None = None
         self._canvas_window_undo_ids: list[str] = []
+        self._object_placement_dialog: ObjectPlacementDialog | None = None
+        self._object_placement_operation_id: str | None = None
         self._is_shutdown = False
         self.texture_creator_level_index: int | None = None
         self.texture_creator_room_index: int | None = None
@@ -295,6 +308,7 @@ class BlueprintWorkspace(QWidget):
         if self._is_shutdown:
             return
         self._is_shutdown = True
+        self._close_object_placement_dialog()
         self._external_viewer_host.dispose()
         self.surface_texture_generation.shutdown()
         self.generation.shutdown()
@@ -403,6 +417,27 @@ class BlueprintWorkspace(QWidget):
         )
         self.generation.generated_object_deleted.connect(
             self._handle_generated_object_deleted_for_atlases
+        )
+        self.generation.generation_completed.connect(
+            self._handle_generated_object_completed_for_canvas
+        )
+        self.generation.generated_object_changed.connect(
+            self._handle_generated_object_changed_for_canvas
+        )
+        self.generation.generated_object_placement_changed.connect(
+            self._handle_generated_object_placement_changed_for_canvas
+        )
+        self.generation.generated_object_deleted.connect(
+            self._handle_generated_object_deleted_for_canvas
+        )
+        self.generation.placement_requested.connect(
+            self._handle_object_placement_requested
+        )
+        self.generation.operation_finished.connect(
+            self._handle_object_placement_operation_finished
+        )
+        self.generation.placement_request_finished.connect(
+            self._handle_object_placement_operation_finished
         )
         self.surface_texture_generation.set_levels(
             self.levels,
@@ -1607,6 +1642,160 @@ class BlueprintWorkspace(QWidget):
 
         self._sync_atlas_object_texture_sources()
 
+    # ### Generated-object placement ###
+    def _handle_object_placement_requested(
+        self,
+        operation_id: str,
+    ) -> None:
+        """Open exactly one modeless Canvas picker for an operation token."""
+
+        exact_operation_id = str(operation_id)
+        if self._is_shutdown or not exact_operation_id.strip():
+            return
+
+        self._close_object_placement_dialog()
+        dialog = ObjectPlacementDialog(self.levels, self)
+        self._object_placement_dialog = dialog
+        self._object_placement_operation_id = exact_operation_id
+        dialog.placement_selected.connect(
+            partial(
+                self._handle_object_placement_selected,
+                dialog,
+                exact_operation_id,
+            )
+        )
+        dialog.finished.connect(
+            partial(
+                self._handle_object_placement_dialog_finished,
+                dialog,
+            )
+        )
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _handle_object_placement_selected(
+        self,
+        dialog: ObjectPlacementDialog,
+        operation_id: str,
+        raw_placement: object,
+    ) -> None:
+        """Commit a click only when both its dialog and operation are current."""
+
+        if (
+            dialog is not self._object_placement_dialog
+            or operation_id != self._object_placement_operation_id
+            or not isinstance(raw_placement, GeneratedObjectPlacement)
+        ):
+            return
+        if not self.generation.set_active_object_placement(
+            operation_id,
+            raw_placement,
+        ):
+            self._close_object_placement_dialog()
+
+    def _handle_object_placement_dialog_finished(
+        self,
+        dialog: ObjectPlacementDialog,
+        _result: int,
+    ) -> None:
+        """Release the current picker without touching a replacement dialog."""
+
+        if dialog is not self._object_placement_dialog:
+            return
+        operation_id = self._object_placement_operation_id
+        self._object_placement_dialog = None
+        self._object_placement_operation_id = None
+        if operation_id is not None:
+            self.generation.cancel_object_placement_request(operation_id)
+        dialog.deleteLater()
+
+    def _handle_object_placement_operation_finished(
+        self,
+        operation_id: str,
+    ) -> None:
+        """Close only the picker owned by the completed operation token."""
+
+        if str(operation_id) != self._object_placement_operation_id:
+            return
+        self._close_object_placement_dialog()
+
+    def _close_object_placement_dialog(self) -> None:
+        """Close and forget the one modeless object-placement picker."""
+
+        dialog = self._object_placement_dialog
+        operation_id = self._object_placement_operation_id
+        self._object_placement_dialog = None
+        self._object_placement_operation_id = None
+        if operation_id is not None:
+            self.generation.cancel_object_placement_request(operation_id)
+        if dialog is None:
+            return
+        dialog.close()
+        dialog.deleteLater()
+
+    def _handle_generated_object_completed_for_canvas(
+        self,
+        raw_record: object,
+        _generated_model: object,
+    ) -> None:
+        """Reveal a newly placed object and refit the Canvas 3D view."""
+
+        if (
+            isinstance(raw_record, GeneratedObjectRecord)
+            and raw_record.placement is not None
+        ):
+            self._schedule_viewer_preview_refresh(preserve_camera=False)
+
+    def _handle_generated_object_changed_for_canvas(
+        self,
+        raw_record: object,
+        _generated_model: object,
+    ) -> None:
+        """Refresh the Canvas model after one placed object revision changes."""
+
+        if (
+            isinstance(raw_record, GeneratedObjectRecord)
+            and raw_record.placement is not None
+        ):
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+
+    def _handle_generated_object_placement_changed_for_canvas(
+        self,
+        raw_record: object,
+    ) -> None:
+        """Move a completed object in the Canvas preview immediately."""
+
+        if (
+            isinstance(raw_record, GeneratedObjectRecord)
+            and raw_record.placement is not None
+        ):
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+
+    def _handle_generated_object_deleted_for_canvas(
+        self,
+        _object_id: str,
+    ) -> None:
+        """Remove any deleted placed object from the Canvas preview."""
+
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
+
+    def _refresh_placed_object_texture_if_needed(
+        self,
+        object_id: str,
+    ) -> None:
+        """Show a newly selected texture on a placed Canvas object."""
+
+        normalized_object_id = str(object_id).strip()
+        if not normalized_object_id:
+            return
+        if any(
+            record.object_id == normalized_object_id
+            and record.placement is not None
+            for record in self.generation.get_data().generated_objects
+        ):
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+
     def _handle_surface_texture_data_changed_for_atlases(
         self,
         _surface_texture_data: object,
@@ -1787,6 +1976,7 @@ class BlueprintWorkspace(QWidget):
             object_id,
             texture_resolution,
         ):
+            self._refresh_placed_object_texture_if_needed(object_id)
             return
         self._append_atlas_preview_status(
             "The atlas was resized, but its exact 3D texture variant could "
@@ -1886,16 +2076,21 @@ class BlueprintWorkspace(QWidget):
             return False
 
         self._sync_atlas_object_texture_sources()
-        return self.texture_atlas_workspace.set_object_texture_resolution(
-            normalized_id,
-            target_resolution,
-            commit_callback=lambda: (
-                self.generation.select_object_texture_resolution(
-                    normalized_id,
-                    target_resolution,
-                )
-            ),
+        resolution_changed = (
+            self.texture_atlas_workspace.set_object_texture_resolution(
+                normalized_id,
+                target_resolution,
+                commit_callback=lambda: (
+                    self.generation.select_object_texture_resolution(
+                        normalized_id,
+                        target_resolution,
+                    )
+                ),
+            )
         )
+        if resolution_changed:
+            self._refresh_placed_object_texture_if_needed(normalized_id)
+        return resolution_changed
 
     def _handle_generation_object_packing_change_requested(
         self,
@@ -2413,17 +2608,74 @@ class BlueprintWorkspace(QWidget):
         failure_title: str | None,
     ) -> GeneratedModel | None:
         try:
-            return convert_to_glb(
+            base_model = convert_to_glb(
                 self.levels,
                 stairs=self.stairs,
                 surface_materials=(
                     self.surface_texture_generation.get_surface_material_sources()
                 ),
             )
-        except ValueError as error:
+            placed_models = self._build_placed_generated_models()
+            if not placed_models:
+                return base_model
+            return compose_placed_generated_models(
+                base_model,
+                placed_models,
+            )
+        except (TypeError, ValueError) as error:
             if failure_title is not None:
                 QMessageBox.warning(self, failure_title, str(error))
             return None
+
+    def _build_placed_generated_models(
+        self,
+    ) -> tuple[PlacedGeneratedModel, ...]:
+        """Resolve persisted Canvas clicks into current world positions."""
+
+        visible_level_by_index = {
+            level.index: level
+            for level in self.levels
+            if level.include_in_export
+        }
+        if not visible_level_by_index:
+            return ()
+        base_z_by_level_index = build_level_base_z_lookup(self.levels)
+        placed_models: list[PlacedGeneratedModel] = []
+        for record in self.generation.get_data().generated_objects:
+            placement = record.placement
+            if placement is None:
+                continue
+            level = visible_level_by_index.get(placement.level_index)
+            base_z = base_z_by_level_index.get(placement.level_index)
+            if level is None or base_z is None:
+                continue
+            generated_model = self.generation.get_generated_object_model(
+                record.object_id
+            )
+            if generated_model is None:
+                continue
+            symmetry = self.generation.resolve_symmetric_division_for_record(
+                record
+            )
+            world_x, world_y = level_image_to_world_xy(
+                level,
+                placement.image_x,
+                placement.image_y,
+            )
+            placed_models.append(
+                PlacedGeneratedModel(
+                    object_id=record.object_id,
+                    model=generated_model,
+                    world_position=(world_x, world_y, base_z),
+                    symmetric_preview_orientation=(
+                        None if symmetry is None else symmetry.orientation
+                    ),
+                    symmetric_preview_plane_coordinate=(
+                        None if symmetry is None else symmetry.plane_coordinate
+                    ),
+                )
+            )
+        return tuple(placed_models)
 
     def _handle_surface_texture_generation_completed(
         self,

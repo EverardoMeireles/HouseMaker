@@ -1,6 +1,7 @@
 # ### Imports ###
 from __future__ import annotations
 
+import copy
 import math
 import os
 from io import BytesIO
@@ -82,6 +83,10 @@ STAIR_GEOMETRY_EPSILON = 1e-6
 STAIR_CURVE_SAMPLE_SPACING_METERS = 0.08
 MAX_EXACT_STAIR_GUIDE_ORDER_COUNT = 12
 MAX_TOPOLOGY_STAIR_GUIDE_ORDER_COUNT = 8
+SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION = {
+    "vertical": 0,
+    "horizontal": 2,
+}
 
 # ### Module state ###
 _fallback_qt_application: QGuiApplication | None = None
@@ -98,6 +103,70 @@ class GeneratedModel:
     )
     preview_untextured_mesh: trimesh.Trimesh | None = None
     object_texture_variants: ObjectTextureVariants | None = None
+    preview_symmetric_objects: list["PreviewSymmetricObject"] = field(
+        default_factory=list
+    )
+
+
+@dataclass(frozen=True)
+class PlacedGeneratedModel:
+    """One generated model anchored at a world-space floor position."""
+
+    object_id: str
+    model: GeneratedModel
+    world_position: tuple[float, float, float]
+    symmetric_preview_orientation: str | None = None
+    symmetric_preview_plane_coordinate: float | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.object_id, str):
+            raise TypeError("Placed generated-object IDs must be strings.")
+        normalized_object_id = self.object_id.strip()
+        if not normalized_object_id:
+            raise ValueError("Placed generated-object IDs cannot be empty.")
+        if not isinstance(self.model, GeneratedModel):
+            raise TypeError("Placed generated objects require a GeneratedModel.")
+        normalized_position = _normalize_placed_world_position(
+            self.world_position
+        )
+        orientation, plane_coordinate = _normalize_symmetric_preview(
+            self.symmetric_preview_orientation,
+            self.symmetric_preview_plane_coordinate,
+        )
+        object.__setattr__(self, "object_id", normalized_object_id)
+        object.__setattr__(self, "world_position", normalized_position)
+        object.__setattr__(self, "symmetric_preview_orientation", orientation)
+        object.__setattr__(
+            self,
+            "symmetric_preview_plane_coordinate",
+            plane_coordinate,
+        )
+
+
+@dataclass(frozen=True)
+class PreviewSymmetricObject:
+    """Placed retained meshes and their viewer-only reflection plane."""
+
+    object_id: str
+    meshes: tuple[trimesh.Trimesh, ...]
+    orientation: str
+    plane_coordinate: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.object_id, str) or not self.object_id.strip():
+            raise ValueError("Symmetric preview object IDs cannot be empty.")
+        if not isinstance(self.meshes, tuple) or not self.meshes:
+            raise ValueError("Symmetric previews require retained object meshes.")
+        if not all(isinstance(mesh, trimesh.Trimesh) for mesh in self.meshes):
+            raise TypeError("Symmetric preview meshes must be triangle meshes.")
+        orientation, plane_coordinate = _normalize_symmetric_preview(
+            self.orientation,
+            self.plane_coordinate,
+        )
+        assert orientation is not None and plane_coordinate is not None
+        object.__setattr__(self, "object_id", self.object_id.strip())
+        object.__setattr__(self, "orientation", orientation)
+        object.__setattr__(self, "plane_coordinate", plane_coordinate)
 
 
 @dataclass
@@ -295,6 +364,396 @@ def convert_to_glb(
             surface_texture_world_size_meters
         ),
     )
+
+
+# ### Placed generated-model composition ###
+def compose_placed_generated_models(
+    base_model: GeneratedModel,
+    placements: Sequence[PlacedGeneratedModel],
+) -> GeneratedModel:
+    """Add generated-object scenes to a house without changing their assets.
+
+    Each target is the world-space destination of the generated model's
+    Z-up bottom center. Source scene hierarchy, node transforms, materials,
+    and embedded textures are copied into the returned export scene.
+    """
+
+    if not isinstance(base_model, GeneratedModel):
+        raise TypeError("Placed models require a GeneratedModel house base.")
+    if isinstance(placements, (str, bytes, bytearray)) or not isinstance(
+        placements,
+        Sequence,
+    ):
+        raise TypeError("Placed models must contain a sequence of placements.")
+    normalized_placements = tuple(placements)
+    if not all(
+        isinstance(placement, PlacedGeneratedModel)
+        for placement in normalized_placements
+    ):
+        raise TypeError(
+            "Placed models must contain PlacedGeneratedModel values."
+        )
+    if not normalized_placements:
+        return base_model
+    if not isinstance(base_model.scene, trimesh.Scene):
+        raise TypeError("The house base must contain a trimesh scene.")
+
+    output_scene = copy.deepcopy(base_model.scene)
+    occupied_geometry_names = set(output_scene.geometry)
+    occupied_node_names = set(output_scene.graph.nodes)
+    placed_meshes: list[trimesh.Trimesh] = []
+    placed_untextured_meshes: list[trimesh.Trimesh] = []
+    preview_textured_surfaces = list(base_model.preview_textured_surfaces)
+    preview_symmetric_objects = list(base_model.preview_symmetric_objects)
+
+    for placement_index, placement in enumerate(
+        normalized_placements,
+        start=1,
+    ):
+        translation = _build_placed_model_translation(placement)
+        placement_transform = np.eye(4, dtype=float)
+        placement_transform[:3, 3] = translation
+        _append_placed_model_scene(
+            output_scene=output_scene,
+            placement=placement,
+            placement_index=placement_index,
+            placement_transform=placement_transform,
+            occupied_geometry_names=occupied_geometry_names,
+            occupied_node_names=occupied_node_names,
+        )
+
+        placed_mesh = placement.model.mesh.copy()
+        placed_mesh.apply_transform(placement_transform)
+        placed_meshes.append(placed_mesh)
+        textured_surfaces, untextured_meshes, world_meshes = (
+            _build_placed_model_preview_parts(
+                placement,
+                placement_index,
+                placement_transform,
+            )
+        )
+        preview_textured_surfaces.extend(textured_surfaces)
+        placed_untextured_meshes.extend(untextured_meshes)
+        if placement.symmetric_preview_orientation is not None:
+            axis = SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION[
+                placement.symmetric_preview_orientation
+            ]
+            assert placement.symmetric_preview_plane_coordinate is not None
+            preview_symmetric_objects.append(
+                PreviewSymmetricObject(
+                    object_id=placement.object_id,
+                    meshes=world_meshes,
+                    orientation=placement.symmetric_preview_orientation,
+                    plane_coordinate=(
+                        placement.symmetric_preview_plane_coordinate
+                        + float(translation[axis])
+                    ),
+                )
+            )
+
+    combined_mesh = _combine_mesh_geometry(
+        [base_model.mesh, *placed_meshes]
+    )
+    preview_untextured_mesh = None
+    if preview_textured_surfaces:
+        base_preview_mesh = base_model.mesh
+        if (
+            base_model.preview_textured_surfaces
+            and base_model.preview_untextured_mesh is not None
+        ):
+            base_preview_mesh = base_model.preview_untextured_mesh
+        preview_untextured_mesh = _combine_mesh_geometry(
+            [base_preview_mesh, *placed_untextured_meshes]
+        )
+
+    exported_glb = output_scene.export(file_type="glb")
+    if not isinstance(exported_glb, (bytes, bytearray, memoryview)):
+        raise ValueError(
+            "The placed generated-object scene could not be exported."
+        )
+    return GeneratedModel(
+        mesh=combined_mesh,
+        scene=output_scene,
+        glb_bytes=bytes(exported_glb),
+        preview_textured_walls=list(base_model.preview_textured_walls),
+        preview_textured_surfaces=preview_textured_surfaces,
+        preview_untextured_mesh=preview_untextured_mesh,
+        preview_symmetric_objects=preview_symmetric_objects,
+    )
+
+
+def _normalize_placed_world_position(
+    raw_position: object,
+) -> tuple[float, float, float]:
+    if isinstance(raw_position, (str, bytes, bytearray)) or not isinstance(
+        raw_position,
+        Sequence,
+    ):
+        raise TypeError("Placed generated-object positions must be XYZ sequences.")
+    if len(raw_position) != 3:
+        raise ValueError(
+            "Placed generated-object positions must contain three coordinates."
+        )
+
+    coordinates: list[float] = []
+    for raw_coordinate in raw_position:
+        if isinstance(raw_coordinate, bool):
+            raise TypeError(
+                "Placed generated-object coordinates must be numbers."
+            )
+        try:
+            coordinate = float(raw_coordinate)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise TypeError(
+                "Placed generated-object coordinates must be numbers."
+            ) from error
+        if not math.isfinite(coordinate):
+            raise ValueError(
+                "Placed generated-object coordinates must be finite."
+            )
+        coordinates.append(coordinate)
+    return coordinates[0], coordinates[1], coordinates[2]
+
+
+def _normalize_symmetric_preview(
+    raw_orientation: object,
+    raw_plane_coordinate: object,
+) -> tuple[str | None, float | None]:
+    if raw_orientation is None:
+        if raw_plane_coordinate is not None:
+            raise ValueError(
+                "A symmetric preview plane requires an orientation."
+            )
+        return None, None
+    if raw_plane_coordinate is None:
+        raise ValueError(
+            "A symmetric preview orientation requires a plane coordinate."
+        )
+    if not isinstance(raw_orientation, str):
+        raise TypeError("Symmetric preview orientations must be strings.")
+    orientation = raw_orientation.strip().lower()
+    if orientation not in SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION:
+        raise ValueError(
+            "Symmetric preview orientation must be vertical or horizontal."
+        )
+    if isinstance(raw_plane_coordinate, bool):
+        raise TypeError("Symmetric preview planes must be numbers.")
+    try:
+        plane_coordinate = float(raw_plane_coordinate)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise TypeError("Symmetric preview planes must be numbers.") from error
+    if not math.isfinite(plane_coordinate):
+        raise ValueError("Symmetric preview planes must be finite.")
+    return orientation, plane_coordinate
+
+
+def _build_placed_model_translation(
+    placement: PlacedGeneratedModel,
+) -> np.ndarray:
+    mesh = placement.model.mesh
+    if not isinstance(mesh, trimesh.Trimesh):
+        raise TypeError("Placed generated objects must contain a triangle mesh.")
+    vertices = np.asarray(mesh.vertices, dtype=float)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    if (
+        vertices.ndim != 2
+        or vertices.shape[1:] != (3,)
+        or not len(vertices)
+        or faces.ndim != 2
+        or faces.shape[1:] != (3,)
+        or not len(faces)
+    ):
+        raise ValueError("Placed generated objects must contain non-empty meshes.")
+    if not np.all(np.isfinite(vertices)):
+        raise ValueError("Placed generated-object vertices must be finite.")
+    minimum = np.min(vertices, axis=0)
+    maximum = np.max(vertices, axis=0)
+    bottom_center = np.array(
+        [
+            (minimum[0] + maximum[0]) / 2.0,
+            (minimum[1] + maximum[1]) / 2.0,
+            minimum[2],
+        ],
+        dtype=float,
+    )
+    return np.asarray(placement.world_position, dtype=float) - bottom_center
+
+
+def _append_placed_model_scene(
+    *,
+    output_scene: trimesh.Scene,
+    placement: PlacedGeneratedModel,
+    placement_index: int,
+    placement_transform: np.ndarray,
+    occupied_geometry_names: set[object],
+    occupied_node_names: set[object],
+) -> None:
+    source_scene = placement.model.scene
+    if not isinstance(source_scene, trimesh.Scene):
+        raise TypeError("Placed generated objects must contain trimesh scenes.")
+    if not source_scene.geometry or not source_scene.graph.nodes_geometry:
+        raise ValueError("Placed generated objects must contain scene geometry.")
+
+    prefix = (
+        f"placed_{placement_index}_{_slugify_name(placement.object_id)}"
+    )
+    root_name = _reserve_unique_scene_name(
+        f"{prefix}_root",
+        occupied_node_names,
+    )
+    geometry_names = {
+        source_name: _reserve_unique_scene_name(
+            f"{prefix}_geometry_{_slugify_scene_name(source_name)}",
+            occupied_geometry_names,
+        )
+        for source_name in source_scene.geometry
+    }
+    for source_name, geometry in source_scene.geometry.items():
+        output_scene.geometry[geometry_names[source_name]] = copy.deepcopy(
+            geometry
+        )
+
+    source_base_frame = source_scene.graph.base_frame
+    node_names: dict[object, object] = {source_base_frame: root_name}
+    for source_node_name in source_scene.graph.nodes:
+        if source_node_name == source_base_frame:
+            continue
+        node_names[source_node_name] = _reserve_unique_scene_name(
+            f"{prefix}_node_{_slugify_scene_name(source_node_name)}",
+            occupied_node_names,
+        )
+
+    source_base_data = source_scene.graph.transforms.node_data.get(
+        source_base_frame,
+        {},
+    )
+    root_metadata = copy.deepcopy(source_base_data.get("metadata") or {})
+    root_metadata["housemaker_object_id"] = placement.object_id
+    root_kwargs: dict[str, object] = {
+        "matrix": _source_to_gltf_y_up_transform(placement_transform),
+        "metadata": root_metadata,
+    }
+    source_base_geometry = source_base_data.get("geometry")
+    if source_base_geometry in geometry_names:
+        root_kwargs["geometry"] = geometry_names[source_base_geometry]
+    output_scene.graph.update(
+        frame_to=root_name,
+        frame_from=output_scene.graph.base_frame,
+        **root_kwargs,
+    )
+
+    for source_from, source_to, raw_attributes in (
+        source_scene.graph.to_edgelist()
+    ):
+        attributes = dict(raw_attributes)
+        edge_kwargs: dict[str, object] = {
+            "matrix": _get_valid_source_transform(attributes.get("matrix")),
+        }
+        source_geometry_name = attributes.get("geometry")
+        if source_geometry_name is not None:
+            if source_geometry_name not in geometry_names:
+                raise ValueError(
+                    "A placed generated-object node references missing geometry."
+                )
+            edge_kwargs["geometry"] = geometry_names[source_geometry_name]
+        if attributes.get("metadata") is not None:
+            edge_kwargs["metadata"] = copy.deepcopy(
+                attributes["metadata"]
+            )
+        output_scene.graph.update(
+            frame_to=node_names[source_to],
+            frame_from=node_names[source_from],
+            **edge_kwargs,
+        )
+
+
+def _build_placed_model_preview_parts(
+    placement: PlacedGeneratedModel,
+    placement_index: int,
+    placement_transform: np.ndarray,
+) -> tuple[
+    list[PreviewTexturedSurface],
+    list[trimesh.Trimesh],
+    tuple[trimesh.Trimesh, ...],
+]:
+    source_scene = placement.model.scene
+    textured_surfaces: list[PreviewTexturedSurface] = []
+    untextured_meshes: list[trimesh.Trimesh] = []
+    world_meshes: list[trimesh.Trimesh] = []
+    for node_index, source_node_name in enumerate(
+        sorted(source_scene.graph.nodes_geometry, key=str),
+        start=1,
+    ):
+        node_transform, source_geometry_name = source_scene.graph.get(
+            source_node_name
+        )
+        source_geometry = source_scene.geometry.get(source_geometry_name)
+        if not isinstance(source_geometry, trimesh.Trimesh):
+            raise ValueError(
+                "Placed generated-object scenes must contain triangle meshes."
+            )
+        world_mesh = copy.deepcopy(source_geometry)
+        world_mesh.apply_transform(
+            placement_transform
+            @ GLTF_Y_UP_TO_Z_UP_TRANSFORM
+            @ _get_valid_source_transform(node_transform)
+        )
+        world_meshes.append(world_mesh)
+        if _mesh_supports_embedded_texture_preview(world_mesh):
+            textured_surfaces.append(
+                PreviewTexturedSurface(
+                    surface_id=(
+                        f"placed:{placement.object_id}:"
+                        f"{placement_index}:{node_index}"
+                    ),
+                    surface_type="generated_object",
+                    mesh=world_mesh,
+                )
+            )
+        else:
+            untextured_meshes.append(world_mesh)
+    return textured_surfaces, untextured_meshes, tuple(world_meshes)
+
+
+def _mesh_supports_embedded_texture_preview(mesh: trimesh.Trimesh) -> bool:
+    visual = getattr(mesh, "visual", None)
+    if getattr(visual, "kind", None) != "texture":
+        return False
+    material = getattr(visual, "material", None)
+    texture = getattr(material, "baseColorTexture", None)
+    if texture is None:
+        texture = getattr(material, "image", None)
+    if texture is None:
+        return False
+    vertices = np.asarray(mesh.vertices)
+    faces = np.asarray(mesh.faces)
+    texture_coordinates = np.asarray(getattr(visual, "uv", ()))
+    return bool(
+        vertices.ndim == 2
+        and vertices.shape[1:] == (3,)
+        and faces.ndim == 2
+        and faces.shape[1:] == (3,)
+        and len(faces)
+        and texture_coordinates.shape == (len(vertices), 2)
+        and np.all(np.isfinite(texture_coordinates))
+    )
+
+
+def _reserve_unique_scene_name(
+    preferred_name: str,
+    occupied_names: set[object],
+) -> str:
+    candidate = preferred_name
+    suffix = 2
+    while candidate in occupied_names:
+        candidate = f"{preferred_name}_{suffix}"
+        suffix += 1
+    occupied_names.add(candidate)
+    return candidate
+
+
+def _slugify_scene_name(raw_name: object) -> str:
+    return _slugify_name(str(raw_name))
 
 
 # ### Stair geometry helpers ###

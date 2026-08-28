@@ -53,7 +53,9 @@ from PySide6.QtWidgets import (
 
 from housemaker.texture_atlas_state import (
     ATLAS_BASE_CELL_SIZE,
+    ATLAS_DOUBLE_SIZED_PACKING_MODES,
     ATLAS_HALF_SLOT_PACKING_MODES,
+    ATLAS_LIMITED_RESOLUTION_PACKING_MODES,
     ATLAS_PACKING_MODE_FULL,
     ATLAS_PACKING_MODE_SYMMETRIC_HALF,
     ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
@@ -66,8 +68,8 @@ from housemaker.texture_atlas_state import (
     ATLAS_SLOT_QUADRANT_BOTTOM_LEFT,
     ATLAS_SLOT_QUADRANT_BOTTOM_RIGHT,
     ATLAS_SLOT_QUADRANT_ORDER,
-    ATLAS_SLOT_QUADRANT_TOP_LEFT,
     ATLAS_SLOT_QUADRANT_TOP_RIGHT,
+    SYMMETRIC_PACKED_TEXTURE_RESOLUTIONS,
     TextureAtlasData,
     TextureAtlasPlacement,
     TextureAtlasRecord,
@@ -100,18 +102,6 @@ ATLAS_TEXTURE_SOURCE_MIME_TYPE = (
     "application/x-housemaker-texture-atlas-source"
 )
 MAX_DRAG_SOURCE_ID_BYTES = 4_096
-DOUBLE_SIZED_SYMMETRIC_PACKING_MODES = frozenset(
-    {
-        ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
-        ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
-    }
-)
-LIMITED_SYMMETRIC_RESOLUTION_PACKING_MODES = frozenset(
-    {
-        *DOUBLE_SIZED_SYMMETRIC_PACKING_MODES,
-        ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
-    }
-)
 
 
 # ### Public texture-source model ###
@@ -171,8 +161,9 @@ class AtlasObjectTextureSource:
         if packing_mode not in ATLAS_PACKING_MODES:
             raise ValueError("Unknown Atlas source packing mode.")
         if (
-            packing_mode in LIMITED_SYMMETRIC_RESOLUTION_PACKING_MODES
-            and int(self.texture_resolution) not in {512, 1024}
+            packing_mode in ATLAS_LIMITED_RESOLUTION_PACKING_MODES
+            and int(self.texture_resolution)
+            not in SYMMETRIC_PACKED_TEXTURE_RESOLUTIONS
         ):
             raise ValueError(
                 "High-density symmetric Atlas sources must use 512 or 1024 "
@@ -2810,7 +2801,7 @@ def _read_texture_source_mime_data(mime_data: QMimeData) -> str | None:
 def _physical_texture_resolution(packing_mode: str, resolution: int) -> int:
     """Return the source PNG and logical Atlas slot side length."""
 
-    multiplier = 2 if packing_mode in DOUBLE_SIZED_SYMMETRIC_PACKING_MODES else 1
+    multiplier = 2 if packing_mode in ATLAS_DOUBLE_SIZED_PACKING_MODES else 1
     return int(resolution) * multiplier
 
 
