@@ -15,14 +15,26 @@ from unittest.mock import patch
 
 import numpy as np
 import trimesh
+from PIL import Image
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QGuiApplication
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.glb import GeneratedModel
 from housemaker.main import BlueprintWorkspace
 from housemaker.settings_widget import FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY
+from housemaker.surface_texture_state import (
+    SURFACE_TYPE_WALL,
+    SurfaceTextureAssignment,
+    SurfaceTextureData,
+)
+from housemaker.texture_atlas_state import TextureAtlasData
 from housemaker.texture_atlas_view import TextureAtlasEntry
+from housemaker.texture_atlas_workspace import (
+    build_atlas_wall_texture_source_id,
+)
 from housemaker.unused_face_removal import ALL_CAMERA_IDS
 
 
@@ -247,6 +259,68 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
         )
         self.assertIs(self.workspace.atlas_object_preview_viewer.model, model)
         self.assertTrue(self.workspace.atlas_object_preview_viewer.isVisible())
+
+    def test_atlas_surface_texture_uses_plane_in_detached_viewer(self) -> None:
+        assignment, source_id, _atlas_id = self._seed_packed_wall_texture()
+        self.workspace.workspace_tabs.setCurrentWidget(
+            self.workspace.texture_atlas_workspace
+        )
+        self._detach_viewer("screen:external-atlas-surface-preview")
+
+        self.assertTrue(
+            self.workspace.texture_atlas_workspace
+            .request_selected_object_preview()
+        )
+        _qt_application.processEvents()
+
+        viewer = self.workspace.atlas_object_preview_viewer
+        self._assert_externally_hosted_viewer_is(viewer)
+        self.assertTrue(viewer.isVisible())
+        self.assertIsNotNone(viewer.model)
+        assert viewer.model is not None
+        self.assertEqual(len(viewer.model.mesh.faces), 2)
+        bounds = np.asarray(viewer.model.mesh.bounds, dtype=float)
+        np.testing.assert_allclose(bounds[:, 0], (-1.0, 1.0))
+        np.testing.assert_allclose(bounds[:, 1], (0.0, 0.0))
+        np.testing.assert_allclose(bounds[:, 2], (0.0, 2.0))
+        texture = viewer.model.mesh.visual.material.baseColorTexture
+        texture_rgba = np.asarray(texture.convert("RGBA"), dtype=np.uint8)
+        self.assertEqual(texture_rgba.shape, (512, 512, 4))
+        np.testing.assert_array_equal(
+            texture_rgba[256, 256],
+            np.asarray((140, 75, 30, 255), dtype=np.uint8),
+        )
+        self.assertEqual(
+            self.workspace._atlas_preview_variant_key[0],
+            source_id,
+        )
+        self.assertEqual(assignment.assignment_id, "detached-wall")
+
+    def test_delete_key_in_detached_atlas_viewer_unassigns_texture(self) -> None:
+        assignment, source_id, atlas_id = self._seed_packed_wall_texture()
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        self.workspace.workspace_tabs.setCurrentWidget(atlas_workspace)
+        self._detach_viewer("screen:external-atlas-delete")
+        changes: list[TextureAtlasData] = []
+        atlas_workspace.data_changed.connect(changes.append)
+
+        viewer = self.workspace.atlas_object_preview_viewer
+        viewer.view.setFocus()
+        QTest.keyClick(viewer.view, Qt.Key.Key_Delete)
+        _qt_application.processEvents()
+
+        updated = atlas_workspace.get_data().atlas_by_id(atlas_id)
+        assert updated is not None
+        self.assertIsNone(updated.placement_for_object(source_id))
+        self.assertEqual(len(changes), 1)
+        source_path = (
+            self.workspace.surface_texture_generation.get_assignment_asset_path(
+                assignment.assignment_id
+            )
+        )
+        self.assertIsNotNone(source_path)
+        assert source_path is not None
+        self.assertTrue(source_path.is_file())
 
     def test_returning_to_atlas_refreshes_the_selected_external_preview(
         self,
@@ -594,6 +668,31 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
         refresh_mock.assert_not_called()
 
     # ### Test helpers ###
+    def _seed_packed_wall_texture(
+        self,
+    ) -> tuple[SurfaceTextureAssignment, str, str]:
+        assignment = _wall_texture_assignment(
+            Path(self._temporary_directory.name) / "surface_textures"
+        )
+        surface_data = SurfaceTextureData(assignments=[assignment])
+        self.workspace.surface_texture_generation.set_data(surface_data)
+        self.workspace.surface_texture_generation.data_changed.emit(surface_data)
+
+        atlas_data = TextureAtlasData()
+        atlas = atlas_data.create_atlas(
+            "Detached surfaces",
+            2048,
+            atlas_id="detached-surfaces",
+        )
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        atlas_workspace.set_data(atlas_data)
+        source_id = build_atlas_wall_texture_source_id(
+            assignment.assignment_id
+        )
+        self.assertTrue(atlas_workspace._select_object_row(source_id))
+        atlas_workspace.assign_object_button.click()
+        return assignment, source_id, atlas.atlas_id
+
     def _detach_viewer(self, screen_id: str) -> None:
         with patch(
             "housemaker.main.resolve_fullscreen_3d_viewer_screen",
@@ -618,6 +717,27 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
 
 
 # ### Test helpers ###
+def _wall_texture_assignment(
+    asset_directory: str | Path,
+) -> SurfaceTextureAssignment:
+    directory = Path(asset_directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    asset_path = "detached-wall.png"
+    Image.new("RGBA", (12, 8), (140, 75, 30, 255)).save(
+        directory / asset_path,
+        format="PNG",
+    )
+    return SurfaceTextureAssignment(
+        assignment_id="detached-wall",
+        surface_type=SURFACE_TYPE_WALL,
+        surface_ids=("level:2/wall:1:2",),
+        provider="test",
+        asset_path=asset_path,
+        texture_width=12,
+        texture_height=8,
+    )
+
+
 def _generated_box_model() -> GeneratedModel:
     mesh = trimesh.creation.box()
     return GeneratedModel(

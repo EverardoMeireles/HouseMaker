@@ -72,6 +72,7 @@ from housemaker.glb import (
     GeneratedModel,
     PlacedGeneratedModel,
     build_stair_meshes,
+    build_texture_preview_plane_model,
     compose_placed_generated_models,
     convert_to_glb,
     export_glb_file,
@@ -365,6 +366,9 @@ class BlueprintWorkspace(QWidget):
         )
         self.atlas_object_preview_viewer.set_ambient_light_intensity(1.0)
         self.atlas_object_preview_viewer.hide()
+        self.atlas_object_preview_viewer.delete_requested.connect(
+            self.texture_atlas_workspace.remove_selected_texture_from_atlas
+        )
         self.texture_atlas_workspace.object_preview_requested.connect(
             self._handle_atlas_object_preview_requested
         )
@@ -1880,16 +1884,20 @@ class BlueprintWorkspace(QWidget):
         object_id: str,
         texture_resolution: int,
     ) -> None:
-        """Display the exact clicked Atlas texture variant in 3D."""
+        """Display the exact selected Atlas texture variant in 3D."""
 
+        if is_atlas_wall_texture_source_id(object_id):
+            self._show_atlas_surface_texture_preview(
+                object_id,
+                texture_resolution,
+            )
+            return
         variant = self.generation.get_texture_variant(
             object_id,
             texture_resolution,
         )
         if variant is None:
             self._clear_atlas_object_preview()
-            if is_atlas_wall_texture_source_id(object_id):
-                return
             self._append_atlas_preview_status(
                 "The selected object's exact 3D texture variant is missing."
             )
@@ -1951,6 +1959,75 @@ class BlueprintWorkspace(QWidget):
             None if symmetry is None else symmetry.plane_coordinate,
         )
         self._atlas_preview_variant_key = variant_key
+
+    def _show_atlas_surface_texture_preview(
+        self,
+        source_id: str,
+        texture_resolution: int,
+    ) -> None:
+        """Display one exact Atlas wall texture on an upright square plane."""
+
+        assignment_id = get_atlas_wall_texture_assignment_id(source_id)
+        surface_data = self.surface_texture_generation.get_data()
+        assignment = next(
+            (
+                candidate
+                for candidate in surface_data.assignments
+                if candidate.assignment_id == assignment_id
+            ),
+            None,
+        )
+        source = (
+            None
+            if assignment is None
+            else self._build_atlas_wall_texture_source(
+                assignment,
+                texture_resolution if assignment.texture_variants else None,
+            )
+        )
+        if source is None:
+            self._clear_atlas_object_preview()
+            self._append_atlas_preview_status(
+                "The selected surface texture preview is unavailable."
+            )
+            return
+
+        try:
+            asset_path = source.physical_texture_path
+            asset_stat = asset_path.stat()
+            preview_key = (
+                source.object_id,
+                source.texture_resolution,
+                str(asset_path.resolve()),
+                int(asset_stat.st_mtime_ns),
+                int(asset_stat.st_size),
+                "surface_texture_plane",
+            )
+            if (
+                self._atlas_preview_variant_key == preview_key
+                and self.atlas_object_preview_viewer.model is not None
+            ):
+                return
+            model = build_texture_preview_plane_model(
+                source.load_texture_rgba()
+            )
+        except (OSError, TypeError, ValueError) as error:
+            self._clear_atlas_object_preview()
+            self._append_atlas_preview_status(
+                "The selected surface texture preview could not be loaded: "
+                f"{error}"
+            )
+            return
+
+        preserve_camera = (
+            self._atlas_preview_variant_key is not None
+            and self._atlas_preview_variant_key[0] == source.object_id
+        )
+        self.atlas_object_preview_viewer.set_model(
+            model,
+            preserve_camera=preserve_camera,
+        )
+        self._atlas_preview_variant_key = preview_key
 
     def _handle_atlas_object_texture_resolution_changed(
         self,
@@ -2150,7 +2227,7 @@ class BlueprintWorkspace(QWidget):
         )
 
     def _clear_atlas_object_preview(self) -> None:
-        """Drop stale Atlas preview content and its persisted selection key."""
+        """Drop stale Atlas preview content and its cached selection key."""
 
         self._atlas_preview_variant_key = None
         self.atlas_object_preview_viewer.clear_model()
@@ -2520,7 +2597,6 @@ class BlueprintWorkspace(QWidget):
                 physical_texture_path=physical_path,
                 fit_to_square=fit_to_square,
                 supports_resolution_changes=supports_resolution_changes,
-                supports_3d_preview=False,
             )
         except (AttributeError, OSError, TypeError, ValueError):
             return None

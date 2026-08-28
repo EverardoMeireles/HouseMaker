@@ -168,6 +168,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
     rectangle_pointer_moved = Signal(object)
     rectangle_pointer_released = Signal(object)
     rectangle_drawing_cancel_requested = Signal()
+    delete_requested = Signal()
     navigation_mode_changed = Signal(str)
     first_person_active_changed = Signal(bool)
     first_person_camera_pose_changed = Signal(object)
@@ -557,6 +558,10 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         super().wheelEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
+        if event.key() == Qt.Key.Key_Delete:
+            self.delete_requested.emit()
+            event.accept()
+            return
         if (
             self._rectangle_drawing_enabled
             and event.key() == Qt.Key.Key_Escape
@@ -1028,6 +1033,7 @@ class GlbViewerWidget(QWidget):
     wall_selected = Signal(int, int, str)
     window_placement_requested = Signal(object)
     window_undo_requested = Signal()
+    delete_requested = Signal()
     navigation_mode_changed = Signal(str)
     first_person_active_changed = Signal(bool)
     first_person_camera_pose_changed = Signal(object)
@@ -1134,6 +1140,7 @@ class GlbViewerWidget(QWidget):
         self.view = SelectableGLViewWidget()
         self.view.setBackgroundColor((24, 24, 28))
         self.view.items_clicked.connect(self._handle_view_items_clicked)
+        self.view.delete_requested.connect(self.delete_requested.emit)
         self.view.navigation_mode_changed.connect(self.navigation_mode_changed.emit)
         self.view.first_person_active_changed.connect(
             self.first_person_active_changed.emit

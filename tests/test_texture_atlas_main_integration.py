@@ -13,6 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 # ### Imports ###
+import numpy as np
 import trimesh
 from PIL import Image
 from PySide6.QtCore import QPoint, QPointF, Qt
@@ -272,15 +273,81 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         self.workspace.atlas_object_preview_viewer.set_model(
             _generated_box_model()
         )
-        self.assertFalse(
+        self.assertTrue(
             self.workspace.texture_atlas_workspace
             .request_selected_object_preview()
         )
-        self.assertIsNone(self.workspace.atlas_object_preview_viewer.model)
+        preview_model = self.workspace.atlas_object_preview_viewer.model
+        self.assertIsNotNone(preview_model)
+        assert preview_model is not None
+        self.assertEqual(len(preview_model.mesh.faces), 2)
+        bounds = np.asarray(preview_model.mesh.bounds, dtype=float)
+        np.testing.assert_allclose(bounds[:, 0], (-1.0, 1.0))
+        np.testing.assert_allclose(bounds[:, 1], (0.0, 0.0))
+        np.testing.assert_allclose(bounds[:, 2], (0.0, 2.0))
+        np.testing.assert_allclose(
+            np.asarray(preview_model.mesh.visual.uv, dtype=float),
+            ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)),
+        )
+        texture = preview_model.mesh.visual.material.baseColorTexture
+        texture_rgba = np.asarray(texture.convert("RGBA"), dtype=np.uint8)
+        self.assertEqual(texture_rgba.shape, (512, 512, 4))
+        np.testing.assert_array_equal(
+            texture_rgba[256, 256],
+            np.asarray((170, 70, 25, 255), dtype=np.uint8),
+        )
+        np.testing.assert_array_equal(
+            texture_rgba[0, 0],
+            np.asarray((0, 0, 0, 0), dtype=np.uint8),
+        )
         self.assertNotIn(
             "3D texture variant is missing",
             self.workspace.texture_atlas_workspace.status_label.text(),
         )
+
+    def test_wall_preview_uses_exact_pinned_texture_variant(self) -> None:
+        assignment = _wall_texture_assignment_with_variants(
+            self.settings.path.parent / "surface_textures",
+            selected_resolution=512,
+        )
+        surface_data = SurfaceTextureData(assignments=[assignment])
+        self.workspace.surface_texture_generation.set_data(surface_data)
+        self.workspace.surface_texture_generation.data_changed.emit(surface_data)
+        source_id = build_atlas_wall_texture_source_id(
+            assignment.assignment_id
+        )
+        target_variant = assignment.texture_variant_for_resolution(1024)
+        assert target_variant is not None
+        atlas_data = TextureAtlasData()
+        atlas = atlas_data.create_atlas("Pinned wall", 2048, atlas_id="walls")
+        atlas_data.assign_object(
+            atlas.atlas_id,
+            source_id,
+            f"surface_textures/{target_variant.asset_path}",
+            1024,
+        )
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        atlas_workspace.set_data(atlas_data)
+        self.assertTrue(atlas_workspace._select_object_row(source_id))
+
+        with patch.object(
+            self.workspace.generation,
+            "get_texture_variant",
+        ) as generated_variant:
+            self.assertTrue(atlas_workspace.request_selected_object_preview())
+
+        generated_variant.assert_not_called()
+        preview_model = self.workspace.atlas_object_preview_viewer.model
+        self.assertIsNotNone(preview_model)
+        assert preview_model is not None
+        texture = preview_model.mesh.visual.material.baseColorTexture
+        texture_rgba = np.asarray(texture.convert("RGBA"), dtype=np.uint8)
+        self.assertEqual(texture_rgba.shape, (1024, 1024, 4))
+        np.testing.assert_array_equal(
+            texture_rgba[512, 512],
+            np.asarray((70, 170, 25, 255), dtype=np.uint8),
+        )
+        self.assertEqual(self.workspace._atlas_preview_variant_key[1], 1024)
 
     def test_wall_wheel_resize_selects_surface_resolution_globally(
         self,

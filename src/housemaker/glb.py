@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import shapely
 import trimesh
+from PIL import Image
 from shapely import Point, Polygon
 from PySide6.QtCore import QByteArray, QBuffer, QIODevice, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage, QPainter, QPen
@@ -83,6 +84,7 @@ STAIR_GEOMETRY_EPSILON = 1e-6
 STAIR_CURVE_SAMPLE_SPACING_METERS = 0.08
 MAX_EXACT_STAIR_GUIDE_ORDER_COUNT = 12
 MAX_TOPOLOGY_STAIR_GUIDE_ORDER_COUNT = 8
+TEXTURE_PREVIEW_PLANE_SIZE_METERS = 2.0
 SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION = {
     "vertical": 0,
     "horizontal": 2,
@@ -304,6 +306,66 @@ class PngTexture:
 
 
 # ### Public helpers ###
+def build_texture_preview_plane_model(
+    texture_rgba: np.ndarray,
+) -> GeneratedModel:
+    """Build one viewer-only upright square carrying an RGBA texture."""
+
+    rgba = np.asarray(texture_rgba)
+    if (
+        rgba.dtype != np.uint8
+        or rgba.ndim != 3
+        or rgba.shape[2] not in {3, 4}
+        or rgba.shape[0] <= 0
+        or rgba.shape[1] <= 0
+    ):
+        raise ValueError(
+            "A texture preview requires a non-empty RGB or RGBA uint8 image."
+        )
+    if rgba.shape[2] == 3:
+        alpha = np.full(rgba.shape[:2] + (1,), 255, dtype=np.uint8)
+        rgba = np.concatenate((rgba, alpha), axis=2)
+    rgba = np.ascontiguousarray(rgba, dtype=np.uint8)
+
+    plane_size = TEXTURE_PREVIEW_PLANE_SIZE_METERS
+    vertices = np.asarray(
+        (
+            (-plane_size / 2.0, 0.0, 0.0),
+            (plane_size / 2.0, 0.0, 0.0),
+            (plane_size / 2.0, 0.0, plane_size),
+            (-plane_size / 2.0, 0.0, plane_size),
+        ),
+        dtype=float,
+    )
+    faces = np.asarray(((0, 1, 2), (0, 2, 3)), dtype=np.int64)
+    uv_coordinates = np.asarray(
+        ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)),
+        dtype=float,
+    )
+    mesh = trimesh.Trimesh(
+        vertices=vertices,
+        faces=faces,
+        visual=TextureVisuals(
+            uv=uv_coordinates,
+            material=PBRMaterial(
+                name="Atlas surface texture preview",
+                baseColorFactor=[255, 255, 255, 255],
+                baseColorTexture=Image.fromarray(rgba),
+                metallicFactor=0.0,
+                roughnessFactor=0.8,
+                doubleSided=True,
+            ),
+        ),
+        process=False,
+    )
+    scene = trimesh.Scene(mesh)
+    return GeneratedModel(
+        mesh=mesh,
+        scene=scene,
+        glb_bytes=b"",
+    )
+
+
 def convert_to_glb(
     level_source: VertexData | Sequence[LevelData],
     wall_height_meters: float = DEFAULT_WALL_HEIGHT_METERS,

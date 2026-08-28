@@ -136,7 +136,6 @@ def _wall_source(
         physical_texture_path=texture_path,
         fit_to_square=True,
         supports_resolution_changes=False,
-        supports_3d_preview=False,
     )
 
 
@@ -168,7 +167,6 @@ def _resizable_wall_variants(
             physical_texture_path=texture_path,
             fit_to_square=True,
             supports_resolution_changes=True,
-            supports_3d_preview=False,
         )
     return variants
 
@@ -336,7 +334,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             self.assertEqual(atlas_image.getpixel((256, 256)), (180, 80, 30, 255))
             self.assertEqual(atlas_image.getpixel((256, 20)), (0, 0, 0, 0))
 
-    def test_wall_texture_click_only_selects_and_clears_3d_preview(
+    def test_wall_texture_click_selects_and_requests_3d_preview(
         self,
     ) -> None:
         data = TextureAtlasData()
@@ -380,13 +378,102 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         ).placement_for_object(wall_source.object_id)
         assert placement is not None
         self.assertEqual(placement.texture_resolution, 512)
-        self.assertEqual(preview_requests, [])
+        self.assertEqual(
+            preview_requests,
+            [(wall_source.object_id, wall_source.texture_resolution)],
+        )
         self.assertEqual(resolution_changes, [])
-        self.assertEqual(clear_requests, [True])
+        self.assertEqual(clear_requests, [])
         self.assertIn(
             "Selected the texture",
             self.workspace.status_label.text(),
         )
+
+    def test_delete_key_on_source_list_removes_only_selected_atlas_placement(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        selected_atlas = data.create_atlas(
+            "Selected",
+            2048,
+            atlas_id="atlas-a",
+        )
+        other_atlas = data.create_atlas("Other", 2048, atlas_id="atlas-b")
+        source = _source("chair", directory=self._temporary_directory.name)
+        for atlas in (selected_atlas, other_atlas):
+            data.assign_object(
+                atlas.atlas_id,
+                source.object_id,
+                source.texture_path,
+                source.texture_resolution,
+            )
+        data.select_atlas(selected_atlas.atlas_id)
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([source])
+        self.workspace._select_object_row(source.object_id)
+        changes: list[TextureAtlasData] = []
+        self.workspace.data_changed.connect(changes.append)
+
+        self.workspace.object_list.setFocus()
+        QTest.keyClick(self.workspace.object_list, Qt.Key.Key_Delete)
+        _qt_application.processEvents()
+
+        updated = self.workspace.get_data()
+        selected = updated.atlas_by_id(selected_atlas.atlas_id)
+        other = updated.atlas_by_id(other_atlas.atlas_id)
+        assert selected is not None
+        assert other is not None
+        self.assertIsNone(selected.placement_for_object(source.object_id))
+        self.assertIsNotNone(other.placement_for_object(source.object_id))
+        self.assertTrue(source.physical_texture_path.is_file())
+        self.assertEqual(len(changes), 1)
+
+    def test_delete_key_on_atlas_preview_removes_selected_placement(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Preview", 2048, atlas_id="atlas-a")
+        source = _source("chair", directory=self._temporary_directory.name)
+        data.assign_object(
+            atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([source])
+        self.workspace._select_object_row(source.object_id)
+
+        self.workspace.preview.setFocus()
+        QTest.keyClick(self.workspace.preview, Qt.Key.Key_Delete)
+        _qt_application.processEvents()
+
+        updated = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert updated is not None
+        self.assertIsNone(updated.placement_for_object(source.object_id))
+
+    def test_delete_key_in_atlas_name_field_does_not_remove_texture(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Editable", 2048, atlas_id="atlas-a")
+        source = _source("chair", directory=self._temporary_directory.name)
+        data.assign_object(
+            atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([source])
+        self.workspace._select_object_row(source.object_id)
+        self.workspace.atlas_name_edit.setText("Draft atlas")
+        self.workspace.atlas_name_edit.setCursorPosition(0)
+
+        self.workspace.atlas_name_edit.setFocus()
+        QTest.keyClick(self.workspace.atlas_name_edit, Qt.Key.Key_Delete)
+        _qt_application.processEvents()
+
+        updated = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert updated is not None
+        self.assertIsNotNone(updated.placement_for_object(source.object_id))
+        self.assertEqual(self.workspace.atlas_name_edit.text(), "raft atlas")
 
     def test_resizable_wall_texture_wheel_emits_global_assignment(self) -> None:
         data = TextureAtlasData()

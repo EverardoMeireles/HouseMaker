@@ -29,10 +29,12 @@ from PySide6.QtGui import (
     QDragMoveEvent,
     QDropEvent,
     QImage,
+    QKeySequence,
     QMouseEvent,
     QPainter,
     QPaintEvent,
     QPen,
+    QShortcut,
     QWheelEvent,
 )
 from PySide6.QtWidgets import (
@@ -462,6 +464,7 @@ class TextureAtlasPreview(QWidget):
         self._wheel_resize_object_ids: frozenset[str] = frozenset()
         self.setMinimumSize(360, 360)
         self.setAcceptDrops(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def set_content(
         self,
@@ -1403,7 +1406,7 @@ class TextureAtlasWorkspace(QWidget):
 
     @property
     def selected_object_id(self) -> str | None:
-        """Return the generated object currently selected in the Atlas tab."""
+        """Return the texture source currently selected in the Atlas tab."""
 
         return self._selected_object_id()
 
@@ -1814,7 +1817,7 @@ class TextureAtlasWorkspace(QWidget):
         return snapshots
 
     def request_selected_object_preview(self) -> bool:
-        """Emit the selected object's effective Atlas texture resolution."""
+        """Request a 3D preview for the selected Atlas texture source."""
 
         object_id = self._selected_object_id()
         source = self._sources_by_object_id.get(str(object_id))
@@ -1887,6 +1890,16 @@ class TextureAtlasWorkspace(QWidget):
         self.object_list.object_clicked.connect(self._handle_object_mouse_click)
         self.object_list.object_wheeled.connect(self._handle_object_wheel)
         selectors_layout.addWidget(self.object_list, 1)
+        self.delete_object_list_shortcut = QShortcut(
+            QKeySequence.StandardKey.Delete,
+            self.object_list,
+        )
+        self.delete_object_list_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self.delete_object_list_shortcut.activated.connect(
+            self.remove_selected_texture_from_atlas
+        )
 
         assignment_buttons = QHBoxLayout()
         self.assign_object_button = QPushButton("Add selected texture")
@@ -1898,7 +1911,7 @@ class TextureAtlasWorkspace(QWidget):
             "unassign_texture_atlas_object_button"
         )
         self.unassign_object_button.clicked.connect(
-            self._unassign_selected_object
+            self.remove_selected_texture_from_atlas
         )
         assignment_buttons.addWidget(self.unassign_object_button)
         selectors_layout.addLayout(assignment_buttons)
@@ -1910,6 +1923,16 @@ class TextureAtlasWorkspace(QWidget):
         self.preview.object_wheeled.connect(self._handle_object_wheel)
         self.preview.object_dropped.connect(self._handle_object_drop)
         content_splitter.addWidget(self.preview)
+        self.delete_preview_shortcut = QShortcut(
+            QKeySequence.StandardKey.Delete,
+            self.preview,
+        )
+        self.delete_preview_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self.delete_preview_shortcut.activated.connect(
+            self.remove_selected_texture_from_atlas
+        )
         content_splitter.setStretchFactor(0, 1)
         content_splitter.setStretchFactor(1, 3)
         root_layout.addWidget(content_splitter, 1)
@@ -1997,7 +2020,9 @@ class TextureAtlasWorkspace(QWidget):
             f"{placement.texture_resolution} texture."
         )
 
-    def _unassign_selected_object(self) -> None:
+    def remove_selected_texture_from_atlas(self) -> None:
+        """Remove the selected source from only the selected atlas."""
+
         atlas = self.selected_atlas
         object_id = self._selected_object_id()
         if atlas is None or object_id is None:
