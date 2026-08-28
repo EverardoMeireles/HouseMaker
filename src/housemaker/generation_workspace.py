@@ -1240,6 +1240,15 @@ class GenerationWorkspace(QWidget):
         self._store_current_frame_strokes()
         return self._data.clone()
 
+    def get_generated_object_placement(
+        self,
+        object_id: str,
+    ) -> GeneratedObjectPlacement | None:
+        """Return one immutable placement without cloning all Generation data."""
+
+        record = self._find_generated_object_record(str(object_id).strip())
+        return None if record is None else record.placement
+
     def set_data(self, data: GenerationData | None) -> None:
         if self._generation_thread is not None:
             raise RuntimeError("Cannot replace Generation data while generating.")
@@ -1582,6 +1591,14 @@ class GenerationWorkspace(QWidget):
             return False
 
         record = self._data.generated_objects[record_index]
+        if record.placement is not None:
+            placement = replace(
+                placement,
+                height_offset_meters=(
+                    record.placement.height_offset_meters
+                ),
+                rotation_degrees=record.placement.rotation_degrees,
+            )
         replacement = replace(record, placement=placement)
         self._existing_object_placement_request = None
         self._data.generated_objects[record_index] = replacement
@@ -1589,6 +1606,44 @@ class GenerationWorkspace(QWidget):
         self._emit_data_changed()
         self.generated_object_placement_changed.emit(replacement)
         self._sync_controls()
+        return True
+
+    def update_generated_object_placement(
+        self,
+        object_id: str,
+        placement: GeneratedObjectPlacement,
+        *,
+        emit_change_signals: bool = True,
+    ) -> bool:
+        """Commit one completed object's placement by stable ID.
+
+        Canvas gizmos may suppress signals after updating their retained preview
+        directly. Ordinary placement callers keep the default notifications.
+        """
+
+        if not isinstance(placement, GeneratedObjectPlacement):
+            return False
+        normalized_object_id = str(object_id).strip()
+        record_index = next(
+            (
+                index
+                for index, record in enumerate(self._data.generated_objects)
+                if record.object_id == normalized_object_id
+                and record.placement is not None
+            ),
+            None,
+        )
+        if record_index is None:
+            return False
+        record = self._data.generated_objects[record_index]
+        if record.placement == placement:
+            return True
+
+        replacement = replace(record, placement=placement)
+        self._data.generated_objects[record_index] = replacement
+        if emit_change_signals:
+            self._emit_data_changed()
+            self.generated_object_placement_changed.emit(replacement)
         return True
 
     def cancel_object_placement_request(self, request_id: str) -> bool:

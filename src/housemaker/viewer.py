@@ -1,11 +1,12 @@
 # ### Imports ###
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 import math
 
 import numpy as np
+import trimesh
 from OpenGL import GL
 from OpenGL.GL import shaders as opengl_shaders
 from pyqtgraph import Transform3D
@@ -32,6 +33,7 @@ from housemaker.camera_indicators import (
 from housemaker.glb import (
     SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION,
     GeneratedModel,
+    PreviewPlacedObject,
     PreviewTexturedWall,
 )
 from housemaker.surface_geometry import (
@@ -76,6 +78,20 @@ SYMMETRIC_PREVIEW_MIN_OPACITY = 0.12
 SYMMETRIC_PREVIEW_MAX_OPACITY = 0.72
 SYMMETRIC_PREVIEW_FADE_PERIOD_MILLISECONDS = 2_000
 SYMMETRIC_PREVIEW_UPDATE_INTERVAL_MILLISECONDS = 50
+TRANSFORM_GIZMO_AXIS_COLORS = (
+    (0.96, 0.22, 0.20, 1.0),
+    (0.24, 0.86, 0.32, 1.0),
+    (0.20, 0.48, 1.0, 1.0),
+)
+TRANSFORM_GIZMO_RING_POINT_COUNT = 72
+TRANSFORM_GIZMO_SCREEN_SIZE_PIXELS = 92.0
+TRANSFORM_GIZMO_MIN_SIZE_METERS = 0.35
+TRANSFORM_GIZMO_AXIS_HIT_RATIO = 0.09
+TRANSFORM_GIZMO_RING_RADIUS_RATIO = 0.72
+TRANSFORM_GIZMO_RING_HIT_RATIO = 0.085
+TRANSFORM_GIZMO_SELECTION_COLOR = (1.0, 0.72, 0.18, 0.95)
+TRANSFORM_GIZMO_TRANSLATE = "translate"
+TRANSFORM_GIZMO_ROTATE = "rotate"
 # ### Shader source ###
 AMBIENT_LIT_VERTEX_SHADER = """
     uniform mat4 u_mvp;
@@ -158,6 +174,23 @@ class TextureMeshData:
     texture_coordinates: np.ndarray
     texture_rgba: np.ndarray
 
+
+@dataclass(frozen=True)
+class _TransformGizmoHandle:
+    """One global-axis translation arrow or rotation ring."""
+
+    kind: str
+    axis_index: int
+
+    def __post_init__(self) -> None:
+        if self.kind not in {
+            TRANSFORM_GIZMO_TRANSLATE,
+            TRANSFORM_GIZMO_ROTATE,
+        }:
+            raise ValueError("Unknown placed-object gizmo handle kind.")
+        if self.axis_index not in {0, 1, 2}:
+            raise ValueError("Placed-object gizmo axes must be X, Y, or Z.")
+
 # ### Widgets ###
 class SelectableGLViewWidget(gl.GLViewWidget):
     """3D viewport with selectable items and two explicit navigation modes."""
@@ -168,6 +201,10 @@ class SelectableGLViewWidget(gl.GLViewWidget):
     rectangle_pointer_moved = Signal(object)
     rectangle_pointer_released = Signal(object)
     rectangle_drawing_cancel_requested = Signal()
+    primary_pointer_pressed = Signal(object)
+    primary_pointer_moved = Signal(object)
+    primary_pointer_released = Signal(object)
+    primary_pointer_cancel_requested = Signal()
     delete_requested = Signal()
     navigation_mode_changed = Signal(str)
     first_person_active_changed = Signal(bool)
@@ -178,6 +215,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self.click_press_position = QPointF()
         self._is_middle_navigation_active = False
         self._rectangle_drawing_enabled = False
+        self._primary_pointer_drag_reserved = False
         self._navigation_mode = NAVIGATION_MODE_ORBIT
         self._first_person_pointer_captured = False
         self._first_person_camera_pose = CameraPose(
@@ -213,6 +251,22 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self._rectangle_drawing_enabled = normalized_enabled
         if normalized_enabled:
             self.focus_navigation()
+
+    @property
+    def is_primary_pointer_drag_reserved(self) -> bool:
+        """Whether a Canvas gizmo currently owns primary-pointer input."""
+
+        return self._primary_pointer_drag_reserved
+
+    def reserve_primary_pointer_drag(self) -> None:
+        """Prevent navigation and click selection until the drag finishes."""
+
+        self._primary_pointer_drag_reserved = True
+
+    def release_primary_pointer_drag(self) -> None:
+        """Return primary-pointer input to ordinary selection."""
+
+        self._primary_pointer_drag_reserved = False
 
     @property
     def navigation_mode(self) -> str:
@@ -432,6 +486,24 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             event.accept()
             return
 
+        if (
+            event.button() == Qt.MouseButton.RightButton
+            and self._primary_pointer_drag_reserved
+        ):
+            self.primary_pointer_cancel_requested.emit()
+            event.accept()
+            return
+
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and not self.is_first_person_pointer_captured
+        ):
+            self.click_press_position = event.position()
+            self.primary_pointer_pressed.emit(event.position())
+            if self._primary_pointer_drag_reserved:
+                event.accept()
+                return
+
         if self.is_first_person_active:
             if event.button() == Qt.MouseButton.RightButton:
                 self.release_first_person_pointer_capture()
@@ -458,6 +530,15 @@ class SelectableGLViewWidget(gl.GLViewWidget):
                 self.rectangle_pointer_released.emit(event.position())
             elif event.button() == Qt.MouseButton.RightButton:
                 self.rectangle_drawing_cancel_requested.emit()
+            event.accept()
+            return
+
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._primary_pointer_drag_reserved
+        ):
+            self.primary_pointer_released.emit(event.position())
+            self._primary_pointer_drag_reserved = False
             event.accept()
             return
 
@@ -506,6 +587,12 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         if self._rectangle_drawing_enabled:
             if event.buttons() & Qt.MouseButton.LeftButton:
                 self.rectangle_pointer_moved.emit(event.position())
+            event.accept()
+            return
+
+        if self._primary_pointer_drag_reserved:
+            if event.buttons() & Qt.MouseButton.LeftButton:
+                self.primary_pointer_moved.emit(event.position())
             event.accept()
             return
 
@@ -563,6 +650,13 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             event.accept()
             return
         if (
+            self._primary_pointer_drag_reserved
+            and event.key() == Qt.Key.Key_Escape
+        ):
+            self.primary_pointer_cancel_requested.emit()
+            event.accept()
+            return
+        if (
             self._rectangle_drawing_enabled
             and event.key() == Qt.Key.Key_Escape
         ):
@@ -583,6 +677,8 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         super().keyReleaseEvent(event)
 
     def focusOutEvent(self, event) -> None:  # type: ignore[override]
+        if self._primary_pointer_drag_reserved:
+            self.primary_pointer_cancel_requested.emit()
         self.release_first_person_pointer_capture()
         super().focusOutEvent(event)
 
@@ -1027,12 +1123,53 @@ class _SymmetricPreviewRenderGroup:
     face_colors: np.ndarray
 
 
+@dataclass
+class _PlacedObjectMeshRender:
+    """Retained textured and fallback items for one local object mesh."""
+
+    textured_item: TexturedMeshItem | None
+    mesh_item: _WireframeOverlayMeshItem
+
+
+@dataclass
+class _PlacedObjectRenderGroup:
+    """One independently transformable placed-object preview hierarchy."""
+
+    preview: PreviewPlacedObject
+    root_item: GLGraphicsItem
+    retained_parts: list[_PlacedObjectMeshRender]
+    symmetric_groups: list[_SymmetricPreviewRenderGroup]
+    pick_meshes: tuple[object, ...]
+    selection_item: gl.GLLinePlotItem
+    current_transform: np.ndarray
+
+
+@dataclass
+class _PlacedObjectTransformDrag:
+    """Stable geometry and accumulated state for one gizmo drag."""
+
+    object_id: str
+    handle: _TransformGizmoHandle
+    start_world_position: np.ndarray
+    start_rotation_degrees: tuple[float, float, float]
+    start_transform: np.ndarray
+    local_pivot: np.ndarray
+    axis: np.ndarray
+    drag_plane_normal: np.ndarray
+    start_axis_parameter: float | None = None
+    previous_rotation_vector: np.ndarray | None = None
+    accumulated_rotation_degrees: float = 0.0
+    preview_world_position: tuple[float, float, float] | None = None
+    preview_rotation_degrees: tuple[float, float, float] | None = None
+
+
 class GlbViewerWidget(QWidget):
     """Generated-model viewer with Blender orbit and first-person navigation."""
 
     wall_selected = Signal(int, int, str)
     window_placement_requested = Signal(object)
     window_undo_requested = Signal()
+    placed_object_transform_changed = Signal(str, object, object)
     delete_requested = Signal()
     navigation_mode_changed = Signal(str)
     first_person_active_changed = Signal(bool)
@@ -1070,6 +1207,18 @@ class GlbViewerWidget(QWidget):
         self._wireframe_enabled = bool(wireframe_enabled)
         self._wireframe_only = bool(wireframe_only)
         self._window_editing_enabled = bool(window_editing_enabled)
+        self._placed_object_editing_enabled = self._window_editing_enabled
+        self._placed_object_render_groups: dict[
+            str,
+            _PlacedObjectRenderGroup,
+        ] = {}
+        self._selected_placed_object_id: str | None = None
+        self._placed_object_transform_drag: (
+            _PlacedObjectTransformDrag | None
+        ) = None
+        self._transform_gizmo_items: list[GLGraphicsItem] = []
+        self._transform_gizmo_size = TRANSFORM_GIZMO_MIN_SIZE_METERS
+        self.object_transform_status_label: QLabel | None = None
         self._window_wall_targets: dict[str, FixedSurface] = {}
         self._selected_window_wall_surface_id: str | None = None
         self._window_drag_first_world: tuple[float, float, float] | None = None
@@ -1112,6 +1261,8 @@ class GlbViewerWidget(QWidget):
         self._build_ui()
         if self._window_editing_enabled:
             self._connect_window_editor_input()
+        if self._placed_object_editing_enabled:
+            self._connect_placed_object_editor_input()
         self._populate_scene()
 
     def _build_ui(self) -> None:
@@ -1215,6 +1366,19 @@ class GlbViewerWidget(QWidget):
         )
         self.window_tools_status_label.setWordWrap(True)
         panel_layout.addWidget(self.window_tools_status_label)
+
+        object_title_label = QLabel("Object transforms")
+        object_title_label.setObjectName("canvas-object-transform-title")
+        panel_layout.addWidget(object_title_label)
+
+        self.object_transform_status_label = QLabel(
+            "Select a placed object to show its gizmo."
+        )
+        self.object_transform_status_label.setObjectName(
+            "canvas-object-transform-status"
+        )
+        self.object_transform_status_label.setWordWrap(True)
+        panel_layout.addWidget(self.object_transform_status_label)
         panel_layout.addStretch(1)
         self.window_tools_panel = panel
         return panel
@@ -1268,6 +1432,8 @@ class GlbViewerWidget(QWidget):
         normalized_id = None if surface_id is None else str(surface_id).strip()
         if normalized_id is not None and normalized_id not in self._window_wall_targets:
             return False
+        if normalized_id is not None:
+            self._set_selected_placed_object(None)
         if normalized_id == self._selected_window_wall_surface_id:
             return False
 
@@ -1298,6 +1464,34 @@ class GlbViewerWidget(QWidget):
         self._window_undo_available = bool(available)
         self._sync_window_undo_button()
 
+    # ### Placed-object transform API ###
+    def get_selected_placed_object_id(self) -> str | None:
+        """Return the stable ID currently controlled by the Canvas gizmo."""
+
+        return self._selected_placed_object_id
+
+    def select_placed_object(self, object_id: str | None) -> bool:
+        """Select one rendered placed object, or clear the transform gizmo."""
+
+        if not self._placed_object_editing_enabled:
+            return False
+        normalized_id = None if object_id is None else str(object_id).strip()
+        if normalized_id is not None and normalized_id not in (
+            self._placed_object_render_groups
+        ):
+            return False
+        if normalized_id is not None:
+            self.select_wall_target(None)
+        return self._set_selected_placed_object(normalized_id)
+
+    def _set_selected_placed_object(self, object_id: str | None) -> bool:
+        if object_id == self._selected_placed_object_id:
+            return False
+        self._cancel_placed_object_gizmo_drag()
+        self._selected_placed_object_id = object_id
+        self._sync_placed_object_selection_rendering()
+        return True
+
     def begin_window_placement(self) -> bool:
         """Arm rectangle drawing when exactly one wall is selected."""
 
@@ -1310,6 +1504,7 @@ class GlbViewerWidget(QWidget):
             self._set_add_window_button_checked(False)
             return False
 
+        self._set_selected_placed_object(None)
         self._window_drag_first_world = None
         self._window_preview_placement = None
         self._window_preview_is_valid = False
@@ -1362,6 +1557,25 @@ class GlbViewerWidget(QWidget):
             self._handle_window_navigation_mode_changed
         )
 
+    def _connect_placed_object_editor_input(self) -> None:
+        """Connect Canvas-only pointer events used by transform gizmos."""
+
+        self.view.primary_pointer_pressed.connect(
+            self._handle_placed_object_pointer_pressed
+        )
+        self.view.primary_pointer_moved.connect(
+            self._update_placed_object_gizmo_drag
+        )
+        self.view.primary_pointer_released.connect(
+            self._finish_placed_object_gizmo_drag
+        )
+        self.view.primary_pointer_cancel_requested.connect(
+            self._cancel_placed_object_gizmo_drag
+        )
+        self.navigation_mode_changed.connect(
+            self._cancel_placed_object_gizmo_drag
+        )
+
     def _handle_add_window_button_toggled(self, checked: bool) -> None:
         if checked:
             self.begin_window_placement()
@@ -1382,15 +1596,48 @@ class GlbViewerWidget(QWidget):
             return
         camera_ray = self.view.build_camera_ray(position)
         if camera_ray is None:
+            self._set_selected_placed_object(None)
             self.select_wall_target(None)
             return
         ray_origin, ray_direction = camera_ray
-        hit = _get_nearest_fixed_surface_ray_hit(
+        object_hit = _get_nearest_preview_placed_object_ray_hit(
+            tuple(
+                group.preview
+                for group in self._placed_object_render_groups.values()
+            ),
+            ray_origin,
+            ray_direction,
+        )
+        wall_hit = _get_nearest_fixed_surface_ray_hit(
             tuple(self._window_wall_targets.values()),
             ray_origin,
             ray_direction,
         )
-        self.select_wall_target(None if hit is None else hit[0].surface_id)
+        if object_hit is not None and (
+            wall_hit is None or object_hit[2] <= wall_hit[2] + 1e-9
+        ):
+            self.select_placed_object(object_hit[0].object_id)
+            return
+        self._set_selected_placed_object(None)
+        self.select_wall_target(
+            None if wall_hit is None else wall_hit[0].surface_id
+        )
+
+    # ### Placed-object gizmo input ###
+    def _handle_placed_object_pointer_pressed(self, position: QPointF) -> None:
+        if (
+            not self._placed_object_editing_enabled
+            or self.is_window_placement_active()
+            or self.view.is_first_person_pointer_captured
+        ):
+            return
+        camera_ray = self.view.build_camera_ray(position)
+        if camera_ray is None:
+            return
+        handle = self._pick_transform_gizmo_handle(*camera_ray)
+        if handle is None:
+            return
+        self._begin_placed_object_gizmo_drag(handle, position)
 
     def _handle_window_pointer_pressed(self, position: QPointF) -> None:
         surface = self._get_selected_window_wall()
@@ -1690,6 +1937,7 @@ class GlbViewerWidget(QWidget):
         self.view.set_first_person_camera_pose(pose)
 
     def set_model(self, model: GeneratedModel, preserve_camera: bool = False) -> None:
+        self._cancel_placed_object_gizmo_drag()
         if self._window_editing_enabled:
             self.cancel_window_placement(status_message=None)
         self._clear_symmetric_preview()
@@ -1705,6 +1953,8 @@ class GlbViewerWidget(QWidget):
             self._sync_window_tools_controls()
 
     def clear_model(self) -> None:
+        self._cancel_placed_object_gizmo_drag()
+        self._selected_placed_object_id = None
         if self._window_editing_enabled:
             self.cancel_window_placement(status_message=None)
         self._texture_edit_mask = None
@@ -1787,12 +2037,22 @@ class GlbViewerWidget(QWidget):
         if self.model is None:
             return
         for preview_object in self.model.preview_symmetric_objects:
-            for retained_mesh in preview_object.meshes:
-                group = self._create_symmetric_preview_group(
-                    retained_mesh,
-                    preview_object.orientation,
-                    preview_object.plane_coordinate,
-                )
+            source_meshes = (
+                preview_object.mirrored_meshes
+                if preview_object.mirrored_meshes
+                else preview_object.meshes
+            )
+            for source_mesh in source_meshes:
+                if preview_object.mirrored_meshes:
+                    group = self._create_symmetric_preview_mesh_group(
+                        source_mesh
+                    )
+                else:
+                    group = self._create_symmetric_preview_group(
+                        source_mesh,
+                        preview_object.orientation,
+                        preview_object.plane_coordinate,
+                    )
                 if group is not None:
                     self._embedded_symmetric_preview_groups.append(group)
         if self._embedded_symmetric_preview_groups:
@@ -1803,6 +2063,7 @@ class GlbViewerWidget(QWidget):
         retained_mesh,
         orientation: str,
         plane_coordinate: float,
+        parent_item: GLGraphicsItem | None = None,
     ) -> _SymmetricPreviewRenderGroup | None:
         """Reflect one retained mesh using the shared symmetric-preview rules."""
 
@@ -1838,7 +2099,7 @@ class GlbViewerWidget(QWidget):
                 opacity=opacity,
                 translucent=True,
             )
-            self.view.addItem(textured_item)
+            self._attach_preview_item(textured_item, parent_item)
         face_colors = (
             np.tile(FACE_COLOR, (faces.shape[0], 1))
             if texture_mesh_data is not None
@@ -1858,7 +2119,7 @@ class GlbViewerWidget(QWidget):
             shader=self._ambient_shader,
         )
         mesh_item.setGLOptions("translucent")
-        self.view.addItem(mesh_item)
+        self._attach_preview_item(mesh_item, parent_item)
         return _SymmetricPreviewRenderGroup(
             textured_item=textured_item,
             mesh_item=mesh_item,
@@ -1866,6 +2127,73 @@ class GlbViewerWidget(QWidget):
             faces=mirrored_faces,
             face_colors=face_colors,
         )
+
+    def _create_symmetric_preview_mesh_group(
+        self,
+        mirrored_mesh,
+        parent_item: GLGraphicsItem | None = None,
+    ) -> _SymmetricPreviewRenderGroup | None:
+        """Render geometry that was already mirrored in object-local space."""
+
+        vertices = np.asarray(mirrored_mesh.vertices, dtype=np.float32)
+        faces = np.asarray(mirrored_mesh.faces, dtype=np.int32)
+        if (
+            vertices.ndim != 2
+            or vertices.shape[1:] != (3,)
+            or faces.ndim != 2
+            or faces.shape[1:] != (3,)
+            or not len(vertices)
+            or not len(faces)
+        ):
+            return None
+        opacity = SYMMETRIC_PREVIEW_MIN_OPACITY
+        texture_mesh_data = _build_texture_mesh_data(mirrored_mesh)
+        textured_item = None
+        if texture_mesh_data is not None:
+            textured_item = TexturedMeshItem(
+                texture_mesh_data,
+                self._ambient_light_intensity,
+                opacity=opacity,
+                translucent=True,
+            )
+            self._attach_preview_item(textured_item, parent_item)
+        face_colors = (
+            np.tile(FACE_COLOR, (faces.shape[0], 1))
+            if texture_mesh_data is not None
+            else _get_mesh_face_colors(mirrored_mesh, faces)
+        )
+        face_colors = np.ascontiguousarray(face_colors, dtype=float)
+        faded_colors = face_colors.copy()
+        faded_colors[:, 3] *= opacity
+        mesh_item = _WireframeOverlayMeshItem(
+            vertexes=vertices,
+            faces=faces,
+            faceColors=faded_colors,
+            smooth=False,
+            drawFaces=True,
+            drawEdges=True,
+            edgeColor=(*EDGE_COLOR[:3], opacity),
+            shader=self._ambient_shader,
+        )
+        mesh_item.setGLOptions("translucent")
+        self._attach_preview_item(mesh_item, parent_item)
+        return _SymmetricPreviewRenderGroup(
+            textured_item=textured_item,
+            mesh_item=mesh_item,
+            vertices=np.ascontiguousarray(vertices),
+            faces=np.ascontiguousarray(faces),
+            face_colors=face_colors,
+        )
+
+    def _attach_preview_item(
+        self,
+        item: GLGraphicsItem,
+        parent_item: GLGraphicsItem | None,
+    ) -> None:
+        if parent_item is None:
+            self.view.addItem(item)
+            return
+        item.setParentItem(parent_item)
 
     def _start_symmetric_preview_animation(self) -> None:
         """Synchronize all current mirror groups to one fade phase."""
@@ -1878,6 +2206,8 @@ class GlbViewerWidget(QWidget):
         self,
     ) -> tuple[_SymmetricPreviewRenderGroup, ...]:
         groups = list(self._embedded_symmetric_preview_groups)
+        for placed_group in self._placed_object_render_groups.values():
+            groups.extend(placed_group.symmetric_groups)
         if self._explicit_symmetric_preview_group is not None:
             groups.append(self._explicit_symmetric_preview_group)
         return tuple(groups)
@@ -2009,6 +2339,12 @@ class GlbViewerWidget(QWidget):
             textured_surface_item.set_ambient_light_intensity(
                 self._ambient_light_intensity
             )
+        for placed_group in self._placed_object_render_groups.values():
+            for retained_part in placed_group.retained_parts:
+                if retained_part.textured_item is not None:
+                    retained_part.textured_item.set_ambient_light_intensity(
+                        self._ambient_light_intensity
+                    )
         self.view.update()
 
     def get_ambient_light_intensity(self) -> float:
@@ -2111,7 +2447,10 @@ class GlbViewerWidget(QWidget):
             self.view.addItem(self.mesh_item)
         self._add_textured_surface_items()
         self._add_textured_wall_items()
-        self._build_embedded_symmetric_preview_items()
+        if self._placed_object_editing_enabled:
+            self._add_placed_object_items()
+        else:
+            self._build_embedded_symmetric_preview_items()
         self._apply_render_display_options()
 
         bounding_box = self.model.mesh.bounding_box
@@ -2132,6 +2471,7 @@ class GlbViewerWidget(QWidget):
         self._set_default_first_person_camera_pose_from_bounding_box(bounding_box)
         self.view.apply_navigation_camera()
         self._refresh_window_selection_outline()
+        self._sync_placed_object_selection_rendering()
         self.view.update()
 
     def _get_display_mesh(self):
@@ -2139,6 +2479,12 @@ class GlbViewerWidget(QWidget):
 
         if self.model is None:
             return None
+        if (
+            self._placed_object_editing_enabled
+            and self.model.preview_placed_objects
+            and self.model.preview_base_mesh is not None
+        ):
+            return self.model.preview_base_mesh
         if (
             self.model.preview_textured_surfaces
             and self.model.preview_untextured_mesh is not None
@@ -2246,6 +2592,12 @@ class GlbViewerWidget(QWidget):
         if self.model is None:
             return
         for textured_surface in self.model.preview_textured_surfaces:
+            if (
+                self._placed_object_editing_enabled
+                and self.model.preview_placed_objects
+                and textured_surface.surface_type == "generated_object"
+            ):
+                continue
             texture_data = _build_texture_mesh_data(textured_surface.mesh)
             if texture_data is None:
                 continue
@@ -2257,6 +2609,532 @@ class GlbViewerWidget(QWidget):
             )
             self.view.addItem(texture_item)
             self.textured_surface_items.append(texture_item)
+
+    # ### Placed-object rendering ###
+    def _add_placed_object_items(self) -> None:
+        """Render each Canvas object below one independently movable root."""
+
+        if self.model is None:
+            return
+        has_symmetric_preview = False
+        for preview in self.model.preview_placed_objects:
+            if preview.object_id in self._placed_object_render_groups:
+                continue
+            root_item = GLGraphicsItem()
+            root_item.setTransform(
+                _numpy_transform_to_qt(preview.placement_transform)
+            )
+            self.view.addItem(root_item)
+            retained_parts = [
+                part
+                for mesh in preview.meshes
+                if (part := self._create_placed_object_mesh_render(
+                    mesh,
+                    root_item,
+                ))
+                is not None
+            ]
+            mirrored_meshes = _build_local_symmetric_preview_meshes(preview)
+            symmetric_groups = [
+                group
+                for mesh in mirrored_meshes
+                if (group := self._create_symmetric_preview_mesh_group(
+                    mesh,
+                    root_item,
+                ))
+                is not None
+            ]
+            pick_meshes = (*preview.meshes, *mirrored_meshes)
+            bounds = _get_combined_mesh_bounds(pick_meshes)
+            if not retained_parts or bounds is None:
+                self.view.removeItem(root_item)
+                continue
+            selection_item = gl.GLLinePlotItem(
+                pos=_build_bounds_line_positions(bounds),
+                color=TRANSFORM_GIZMO_SELECTION_COLOR,
+                width=2.0,
+                antialias=True,
+                mode="lines",
+            )
+            selection_item.setGLOptions("translucent")
+            selection_item.setVisible(False)
+            selection_item.setParentItem(root_item)
+            self._placed_object_render_groups[preview.object_id] = (
+                _PlacedObjectRenderGroup(
+                    preview=preview,
+                    root_item=root_item,
+                    retained_parts=retained_parts,
+                    symmetric_groups=symmetric_groups,
+                    pick_meshes=pick_meshes,
+                    selection_item=selection_item,
+                    current_transform=np.asarray(
+                        preview.placement_transform,
+                        dtype=float,
+                    ).copy(),
+                )
+            )
+            has_symmetric_preview = (
+                has_symmetric_preview or bool(symmetric_groups)
+            )
+        if has_symmetric_preview:
+            self._start_symmetric_preview_animation()
+
+    def _create_placed_object_mesh_render(
+        self,
+        mesh,
+        root_item: GLGraphicsItem,
+    ) -> _PlacedObjectMeshRender | None:
+        vertices = np.asarray(mesh.vertices, dtype=np.float32)
+        faces = np.asarray(mesh.faces, dtype=np.int32)
+        if (
+            vertices.ndim != 2
+            or vertices.shape[1:] != (3,)
+            or faces.ndim != 2
+            or faces.shape[1:] != (3,)
+            or not len(vertices)
+            or not len(faces)
+        ):
+            return None
+        texture_data = _build_texture_mesh_data(mesh)
+        textured_item = None
+        if texture_data is not None:
+            textured_item = TexturedMeshItem(
+                texture_data,
+                self._ambient_light_intensity,
+                texture_repeat=True,
+            )
+            textured_item.setParentItem(root_item)
+        face_colors = (
+            np.tile(FACE_COLOR, (faces.shape[0], 1))
+            if texture_data is not None
+            else _get_mesh_face_colors(mesh, faces)
+        )
+        mesh_item = _WireframeOverlayMeshItem(
+            vertexes=vertices,
+            faces=faces,
+            faceColors=face_colors,
+            smooth=False,
+            drawFaces=texture_data is None,
+            drawEdges=True,
+            edgeColor=EDGE_COLOR,
+            shader=self._ambient_shader,
+        )
+        mesh_item.setParentItem(root_item)
+        return _PlacedObjectMeshRender(
+            textured_item=textured_item,
+            mesh_item=mesh_item,
+        )
+
+    # ### Placed-object selection and gizmo rendering ###
+    def _sync_placed_object_selection_rendering(self) -> None:
+        selected_id = self._selected_placed_object_id
+        if selected_id not in self._placed_object_render_groups:
+            selected_id = None
+            self._selected_placed_object_id = None
+        for object_id, group in self._placed_object_render_groups.items():
+            group.selection_item.setVisible(object_id == selected_id)
+        self._remove_transform_gizmo_items()
+        if selected_id is None:
+            if self.object_transform_status_label is not None:
+                self.object_transform_status_label.setText(
+                    "Select a placed object to show its gizmo."
+                )
+            if hasattr(self, "view"):
+                self.view.update()
+            return
+        self._build_transform_gizmo_items(
+            self._placed_object_render_groups[selected_id]
+        )
+        if self.object_transform_status_label is not None:
+            self.object_transform_status_label.setText(
+                "Drag an RGB arrow to move, or an RGB ring to rotate."
+            )
+        self.view.update()
+
+    def _build_transform_gizmo_items(
+        self,
+        group: _PlacedObjectRenderGroup,
+    ) -> None:
+        pivot = _get_render_group_world_pivot(group)
+        local_bounds = _get_combined_mesh_bounds(group.pick_meshes)
+        fallback_size = TRANSFORM_GIZMO_MIN_SIZE_METERS
+        if local_bounds is not None:
+            fallback_size = max(
+                fallback_size,
+                float(np.max(local_bounds[1] - local_bounds[0])) * 0.65,
+            )
+        try:
+            pixel_size = float(
+                self.view.pixelSize(
+                    QVector3D(*[float(value) for value in pivot])
+                )
+            )
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            pixel_size = 0.0
+        gizmo_size = (
+            pixel_size * TRANSFORM_GIZMO_SCREEN_SIZE_PIXELS
+            if math.isfinite(pixel_size) and pixel_size > 0.0
+            else fallback_size
+        )
+        self._transform_gizmo_size = max(
+            TRANSFORM_GIZMO_MIN_SIZE_METERS,
+            gizmo_size,
+        )
+        axes = np.eye(3, dtype=float)
+        for axis_index, axis in enumerate(axes):
+            color = TRANSFORM_GIZMO_AXIS_COLORS[axis_index]
+            endpoint = pivot + axis * self._transform_gizmo_size
+            axis_item = gl.GLLinePlotItem(
+                pos=np.asarray((pivot, endpoint), dtype=float),
+                color=color,
+                width=3.0,
+                antialias=True,
+                mode="lines",
+            )
+            axis_item.setGLOptions("translucent")
+            self.view.addItem(axis_item)
+            self._transform_gizmo_items.append(axis_item)
+
+            endpoint_item = gl.GLScatterPlotItem(
+                pos=np.asarray((endpoint,), dtype=float),
+                color=color,
+                size=10.0,
+                pxMode=True,
+            )
+            endpoint_item.setGLOptions("translucent")
+            self.view.addItem(endpoint_item)
+            self._transform_gizmo_items.append(endpoint_item)
+
+            ring_positions = _build_rotation_ring_positions(
+                pivot,
+                axis_index,
+                self._transform_gizmo_size
+                * TRANSFORM_GIZMO_RING_RADIUS_RATIO,
+            )
+            ring_item = gl.GLLinePlotItem(
+                pos=ring_positions,
+                color=color,
+                width=2.0,
+                antialias=True,
+                mode="line_strip",
+            )
+            ring_item.setGLOptions("translucent")
+            self.view.addItem(ring_item)
+            self._transform_gizmo_items.append(ring_item)
+
+    def _remove_transform_gizmo_items(self) -> None:
+        if not hasattr(self, "view"):
+            self._transform_gizmo_items = []
+            return
+        for item in self._transform_gizmo_items:
+            if item in self.view.items:
+                self.view.removeItem(item)
+        self._transform_gizmo_items = []
+
+    def _pick_transform_gizmo_handle(
+        self,
+        ray_origin: object,
+        ray_direction: object,
+    ) -> _TransformGizmoHandle | None:
+        selected_id = self._selected_placed_object_id
+        group = self._placed_object_render_groups.get(selected_id or "")
+        if group is None:
+            return None
+        origin, direction = _normalize_ray(ray_origin, ray_direction)
+        if origin is None or direction is None:
+            return None
+        pivot = _get_render_group_world_pivot(group)
+        candidates: list[tuple[float, _TransformGizmoHandle]] = []
+        for axis_index, axis in enumerate(np.eye(3, dtype=float)):
+            segment_end = pivot + axis * self._transform_gizmo_size
+            segment_distance = _get_ray_segment_distance(
+                origin,
+                direction,
+                pivot,
+                segment_end,
+            )
+            axis_tolerance = (
+                self._transform_gizmo_size
+                * TRANSFORM_GIZMO_AXIS_HIT_RATIO
+            )
+            if segment_distance is not None and segment_distance <= axis_tolerance:
+                candidates.append(
+                    (
+                        segment_distance / max(axis_tolerance, 1e-12),
+                        _TransformGizmoHandle(
+                            TRANSFORM_GIZMO_TRANSLATE,
+                            axis_index,
+                        ),
+                    )
+                )
+
+            ring_hit = _intersect_ray_with_plane(
+                origin,
+                direction,
+                pivot,
+                axis,
+            )
+            if ring_hit is None:
+                continue
+            ring_radius = (
+                self._transform_gizmo_size
+                * TRANSFORM_GIZMO_RING_RADIUS_RATIO
+            )
+            ring_error = abs(float(np.linalg.norm(ring_hit - pivot)) - ring_radius)
+            ring_tolerance = (
+                self._transform_gizmo_size
+                * TRANSFORM_GIZMO_RING_HIT_RATIO
+            )
+            if ring_error <= ring_tolerance:
+                candidates.append(
+                    (
+                        ring_error / max(ring_tolerance, 1e-12),
+                        _TransformGizmoHandle(
+                            TRANSFORM_GIZMO_ROTATE,
+                            axis_index,
+                        ),
+                    )
+                )
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda candidate: (
+                candidate[0],
+                candidate[1].kind != TRANSFORM_GIZMO_TRANSLATE,
+                candidate[1].axis_index,
+            ),
+        )[1]
+
+    # ### Placed-object gizmo dragging ###
+    def _begin_placed_object_gizmo_drag(
+        self,
+        handle: _TransformGizmoHandle,
+        position: QPointF,
+    ) -> bool:
+        selected_id = self._selected_placed_object_id
+        group = self._placed_object_render_groups.get(selected_id or "")
+        camera_ray = self.view.build_camera_ray(position)
+        if group is None or camera_ray is None:
+            return False
+        origin, direction = camera_ray
+        axis = np.eye(3, dtype=float)[handle.axis_index]
+        pivot = _get_render_group_world_pivot(group)
+        start_transform = np.asarray(group.current_transform, dtype=float).copy()
+        try:
+            local_pivot = _transform_point(
+                np.linalg.inv(start_transform),
+                pivot,
+            )
+        except np.linalg.LinAlgError:
+            return False
+        if handle.kind == TRANSFORM_GIZMO_TRANSLATE:
+            drag_plane_normal = _build_axis_drag_plane_normal(axis, direction)
+            hit = _intersect_ray_with_plane(
+                origin,
+                direction,
+                pivot,
+                drag_plane_normal,
+            )
+            if hit is None:
+                return False
+            start_axis_parameter = float(np.dot(hit - pivot, axis))
+            previous_rotation_vector = None
+        else:
+            drag_plane_normal = axis
+            hit = _intersect_ray_with_plane(
+                origin,
+                direction,
+                pivot,
+                drag_plane_normal,
+            )
+            if hit is None:
+                return False
+            previous_rotation_vector = _normalize_vector(hit - pivot)
+            if previous_rotation_vector is None:
+                return False
+            start_axis_parameter = None
+        self._placed_object_transform_drag = _PlacedObjectTransformDrag(
+            object_id=group.preview.object_id,
+            handle=handle,
+            start_world_position=np.asarray(
+                group.preview.world_position,
+                dtype=float,
+            ),
+            start_rotation_degrees=group.preview.rotation_degrees,
+            start_transform=start_transform,
+            local_pivot=local_pivot,
+            axis=axis,
+            drag_plane_normal=drag_plane_normal,
+            start_axis_parameter=start_axis_parameter,
+            previous_rotation_vector=previous_rotation_vector,
+            preview_world_position=group.preview.world_position,
+            preview_rotation_degrees=group.preview.rotation_degrees,
+        )
+        self.view.reserve_primary_pointer_drag()
+        if self.object_transform_status_label is not None:
+            action = (
+                "Moving"
+                if handle.kind == TRANSFORM_GIZMO_TRANSLATE
+                else "Rotating"
+            )
+            self.object_transform_status_label.setText(
+                f"{action} on {'XYZ'[handle.axis_index]}. "
+                "Release to save; Escape cancels."
+            )
+        return True
+
+    def _update_placed_object_gizmo_drag(self, position: QPointF) -> bool:
+        drag = self._placed_object_transform_drag
+        if drag is None:
+            return False
+        group = self._placed_object_render_groups.get(drag.object_id)
+        camera_ray = self.view.build_camera_ray(position)
+        if group is None or camera_ray is None:
+            return False
+        origin, direction = camera_ray
+        pivot = drag.start_world_position
+        hit = _intersect_ray_with_plane(
+            origin,
+            direction,
+            pivot,
+            drag.drag_plane_normal,
+        )
+        if hit is None:
+            return False
+
+        if drag.handle.kind == TRANSFORM_GIZMO_TRANSLATE:
+            assert drag.start_axis_parameter is not None
+            parameter = float(np.dot(hit - pivot, drag.axis))
+            delta = drag.axis * (parameter - drag.start_axis_parameter)
+            world_position = drag.start_world_position + delta
+            rotation_degrees = drag.start_rotation_degrees
+            transform = np.eye(4, dtype=float)
+            transform[:3, 3] = delta
+            transform = transform @ drag.start_transform
+        else:
+            current_vector = _normalize_vector(hit - pivot)
+            previous_vector = drag.previous_rotation_vector
+            if current_vector is None or previous_vector is None:
+                return False
+            drag.accumulated_rotation_degrees += _get_signed_rotation_degrees(
+                drag.axis,
+                previous_vector,
+                current_vector,
+            )
+            drag.previous_rotation_vector = current_vector
+            delta_rotation = trimesh.transformations.rotation_matrix(
+                math.radians(drag.accumulated_rotation_degrees),
+                drag.axis,
+            )[:3, :3]
+            world_rotation = delta_rotation @ drag.start_transform[:3, :3]
+            rotation_degrees = _rotation_matrix_to_degrees(world_rotation)
+            world_position = drag.start_world_position
+            transform = _build_pivoted_world_transform(
+                world_position,
+                world_rotation,
+                drag.local_pivot,
+            )
+
+        group.current_transform = np.asarray(transform, dtype=float)
+        group.root_item.setTransform(_numpy_transform_to_qt(transform))
+        drag.preview_world_position = tuple(
+            float(value) for value in world_position
+        )
+        drag.preview_rotation_degrees = tuple(
+            float(value) for value in rotation_degrees
+        )
+        self._remove_transform_gizmo_items()
+        self._build_transform_gizmo_items(group)
+        self.view.update()
+        return True
+
+    def _finish_placed_object_gizmo_drag(self, position: QPointF) -> bool:
+        drag = self._placed_object_transform_drag
+        if drag is None:
+            return False
+        self._update_placed_object_gizmo_drag(position)
+        world_position = drag.preview_world_position
+        rotation_degrees = drag.preview_rotation_degrees
+        changed = bool(
+            world_position is not None
+            and rotation_degrees is not None
+            and (
+                not np.allclose(
+                    world_position,
+                    drag.start_world_position,
+                    atol=1e-9,
+                    rtol=0.0,
+                )
+                or not np.allclose(
+                    rotation_degrees,
+                    drag.start_rotation_degrees,
+                    atol=1e-9,
+                    rtol=0.0,
+                )
+            )
+        )
+        self._placed_object_transform_drag = None
+        self.view.release_primary_pointer_drag()
+        if changed:
+            assert world_position is not None and rotation_degrees is not None
+            group = self._placed_object_render_groups.get(drag.object_id)
+            if group is None:
+                changed = False
+            else:
+                self._remember_placed_object_preview_transform(
+                    group,
+                    world_position,
+                    rotation_degrees,
+                )
+        if changed:
+            assert world_position is not None and rotation_degrees is not None
+            self.placed_object_transform_changed.emit(
+                drag.object_id,
+                world_position,
+                rotation_degrees,
+            )
+        self._sync_placed_object_selection_rendering()
+        return changed
+
+    def _remember_placed_object_preview_transform(
+        self,
+        group: _PlacedObjectRenderGroup,
+        world_position: tuple[float, float, float],
+        rotation_degrees: tuple[float, float, float],
+    ) -> None:
+        """Make a committed live transform the baseline for the next drag."""
+
+        preview = replace(
+            group.preview,
+            placement_transform=group.current_transform,
+            world_position=world_position,
+            rotation_degrees=rotation_degrees,
+        )
+        group.preview = preview
+        group.current_transform = np.asarray(
+            preview.placement_transform,
+            dtype=float,
+        ).copy()
+        if self.model is None:
+            return
+        self.model.preview_placed_objects = [
+            preview if candidate.object_id == preview.object_id else candidate
+            for candidate in self.model.preview_placed_objects
+        ]
+
+    def _cancel_placed_object_gizmo_drag(self, *_args: object) -> None:
+        drag = self._placed_object_transform_drag
+        self._placed_object_transform_drag = None
+        self.view.release_primary_pointer_drag()
+        if drag is not None:
+            group = self._placed_object_render_groups.get(drag.object_id)
+            if group is not None:
+                group.current_transform = drag.start_transform.copy()
+                group.root_item.setTransform(
+                    _numpy_transform_to_qt(drag.start_transform)
+                )
+        self._sync_placed_object_selection_rendering()
 
     def _add_textured_wall_item(
         self,
@@ -2296,6 +3174,22 @@ class GlbViewerWidget(QWidget):
             textured_surface_item.setVisible(textures_visible)
         for textured_wall_item in self.textured_wall_items:
             textured_wall_item.setVisible(textures_visible)
+
+        for placed_group in self._placed_object_render_groups.values():
+            for retained_part in placed_group.retained_parts:
+                if retained_part.textured_item is not None:
+                    retained_part.textured_item.setVisible(textures_visible)
+                retained_part.mesh_item.opts["drawFaces"] = (
+                    not self._wireframe_only
+                    and (
+                        retained_part.textured_item is None
+                        or not self._textures_enabled
+                    )
+                )
+                retained_part.mesh_item.opts["drawEdges"] = (
+                    self._wireframe_enabled or self._wireframe_only
+                )
+                retained_part.mesh_item.update()
 
         if self.mesh_item is not None:
             has_textured_surface = self.textured_mesh_item is not None
@@ -2383,6 +3277,8 @@ class GlbViewerWidget(QWidget):
         self.textured_mesh_item = None
         self._reset_symmetric_preview_item_state()
         self._embedded_symmetric_preview_groups = []
+        self._placed_object_render_groups = {}
+        self._remove_transform_gizmo_items()
         self.textured_surface_items = []
         self.textured_wall_items = []
         self.wall_by_item_id = {}
@@ -2684,6 +3580,336 @@ def _offset_points_toward_camera(
 
 
 # ### Transform helpers ###
+def _numpy_transform_to_qt(transform: object) -> Transform3D:
+    matrix = np.asarray(transform, dtype=float)
+    if matrix.shape != (4, 4) or not np.all(np.isfinite(matrix)):
+        raise ValueError("Placed-object transforms must be finite 4 by 4 matrices.")
+    return Transform3D(matrix.tolist())
+
+
+def _transform_point(transform: object, point: object) -> np.ndarray:
+    matrix = np.asarray(transform, dtype=float)
+    coordinate = np.asarray(point, dtype=float)
+    if matrix.shape != (4, 4) or coordinate.shape != (3,):
+        raise ValueError("A transformed point requires a 4 by 4 matrix and XYZ.")
+    transformed = matrix @ np.append(coordinate, 1.0)
+    if abs(float(transformed[3])) <= 1e-12:
+        raise ValueError("A transformed point cannot have a zero homogeneous W.")
+    return np.asarray(transformed[:3] / transformed[3], dtype=float)
+
+
+def _get_render_group_world_pivot(
+    group: _PlacedObjectRenderGroup,
+) -> np.ndarray:
+    local_pivot = _transform_point(
+        np.linalg.inv(group.preview.placement_transform),
+        group.preview.world_position,
+    )
+    return _transform_point(group.current_transform, local_pivot)
+
+
+def _build_pivoted_world_transform(
+    world_position: object,
+    world_rotation: object,
+    local_pivot: object,
+) -> np.ndarray:
+    position = np.asarray(world_position, dtype=float)
+    rotation = np.asarray(world_rotation, dtype=float)
+    pivot = np.asarray(local_pivot, dtype=float)
+    if position.shape != (3,) or rotation.shape != (3, 3) or pivot.shape != (3,):
+        raise ValueError("A pivoted object transform requires XYZ and 3D rotation.")
+    transform = np.eye(4, dtype=float)
+    transform[:3, :3] = rotation
+    transform[:3, 3] = position - rotation @ pivot
+    return transform
+
+
+def _rotation_matrix_to_degrees(
+    rotation: object,
+) -> tuple[float, float, float]:
+    matrix = np.eye(4, dtype=float)
+    raw_rotation = np.asarray(rotation, dtype=float)
+    if raw_rotation.shape != (3, 3) or not np.all(np.isfinite(raw_rotation)):
+        raise ValueError("Placed-object rotations must be finite 3 by 3 matrices.")
+    matrix[:3, :3] = raw_rotation
+    angles = trimesh.transformations.euler_from_matrix(matrix, axes="sxyz")
+    return tuple(float(math.degrees(angle)) for angle in angles)
+
+
+def _build_local_symmetric_preview_meshes(
+    preview: PreviewPlacedObject,
+) -> tuple[object, ...]:
+    orientation = preview.symmetric_preview_orientation
+    plane_coordinate = preview.symmetric_preview_plane_coordinate
+    if orientation is None or plane_coordinate is None:
+        return ()
+    axis = SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION[orientation]
+    mirrored_meshes: list[object] = []
+    for retained_mesh in preview.meshes:
+        mirrored_mesh = retained_mesh.copy()
+        vertices = np.asarray(mirrored_mesh.vertices, dtype=float).copy()
+        vertices[:, axis] = float(plane_coordinate) * 2.0 - vertices[:, axis]
+        mirrored_mesh.vertices = vertices
+        mirrored_mesh.faces = np.asarray(
+            mirrored_mesh.faces,
+            dtype=np.int64,
+        )[:, (0, 2, 1)]
+        mirrored_meshes.append(mirrored_mesh)
+    return tuple(mirrored_meshes)
+
+
+def _get_combined_mesh_bounds(
+    meshes: object,
+) -> np.ndarray | None:
+    vertices = [
+        raw_vertices
+        for mesh in meshes
+        if (
+            (raw_vertices := np.asarray(
+                getattr(mesh, "vertices", ()),
+                dtype=float,
+            )).ndim
+            == 2
+            and raw_vertices.shape[1:] == (3,)
+            and len(raw_vertices)
+            and np.all(np.isfinite(raw_vertices))
+        )
+    ]
+    if not vertices:
+        return None
+    combined = np.vstack(vertices)
+    return np.asarray((np.min(combined, axis=0), np.max(combined, axis=0)))
+
+
+def _build_bounds_line_positions(bounds: object) -> np.ndarray:
+    raw_bounds = np.asarray(bounds, dtype=float)
+    if raw_bounds.shape != (2, 3) or not np.all(np.isfinite(raw_bounds)):
+        raise ValueError("Object-selection bounds must contain finite XYZ limits.")
+    minimum, maximum = raw_bounds
+    corners = np.asarray(
+        [
+            (x, y, z)
+            for x in (minimum[0], maximum[0])
+            for y in (minimum[1], maximum[1])
+            for z in (minimum[2], maximum[2])
+        ],
+        dtype=float,
+    )
+    edges = (
+        (0, 1),
+        (0, 2),
+        (0, 4),
+        (1, 3),
+        (1, 5),
+        (2, 3),
+        (2, 6),
+        (3, 7),
+        (4, 5),
+        (4, 6),
+        (5, 7),
+        (6, 7),
+    )
+    return np.asarray(
+        [corners[index] for edge in edges for index in edge],
+        dtype=float,
+    )
+
+
+def _build_rotation_ring_positions(
+    pivot: object,
+    axis_index: int,
+    radius: float,
+) -> np.ndarray:
+    center = np.asarray(pivot, dtype=float)
+    if center.shape != (3,) or axis_index not in {0, 1, 2}:
+        raise ValueError("Rotation rings require an XYZ center and axis.")
+    first_axis = (axis_index + 1) % 3
+    second_axis = (axis_index + 2) % 3
+    angles = np.linspace(
+        0.0,
+        2.0 * math.pi,
+        TRANSFORM_GIZMO_RING_POINT_COUNT + 1,
+    )
+    positions = np.tile(center, (len(angles), 1))
+    positions[:, first_axis] += np.cos(angles) * float(radius)
+    positions[:, second_axis] += np.sin(angles) * float(radius)
+    return positions
+
+
+def _normalize_vector(vector: object) -> np.ndarray | None:
+    raw_vector = np.asarray(vector, dtype=float)
+    if raw_vector.shape != (3,) or not np.all(np.isfinite(raw_vector)):
+        return None
+    length = float(np.linalg.norm(raw_vector))
+    if length <= 1e-12:
+        return None
+    return raw_vector / length
+
+
+def _normalize_ray(
+    ray_origin: object,
+    ray_direction: object,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    origin = np.asarray(ray_origin, dtype=float)
+    direction = _normalize_vector(ray_direction)
+    if origin.shape != (3,) or not np.all(np.isfinite(origin)):
+        return None, None
+    return origin, direction
+
+
+def _intersect_ray_with_plane(
+    ray_origin: object,
+    ray_direction: object,
+    plane_point: object,
+    plane_normal: object,
+) -> np.ndarray | None:
+    """Return the forward ray hit on one infinite plane."""
+
+    origin, direction = _normalize_ray(ray_origin, ray_direction)
+    point = np.asarray(plane_point, dtype=float)
+    normal = _normalize_vector(plane_normal)
+    if (
+        origin is None
+        or direction is None
+        or point.shape != (3,)
+        or not np.all(np.isfinite(point))
+        or normal is None
+    ):
+        return None
+    denominator = float(np.dot(normal, direction))
+    if abs(denominator) <= 1e-10:
+        return None
+    distance = float(np.dot(point - origin, normal) / denominator)
+    if not math.isfinite(distance) or distance < 0.0:
+        return None
+    return origin + direction * distance
+
+
+def _build_axis_drag_plane_normal(
+    axis: object,
+    camera_direction: object,
+) -> np.ndarray:
+    """Build a stable camera-facing plane that still contains an axis."""
+
+    normalized_axis = _normalize_vector(axis)
+    normalized_direction = _normalize_vector(camera_direction)
+    if normalized_axis is None or normalized_direction is None:
+        raise ValueError("Axis dragging requires finite non-zero directions.")
+    projected = normalized_direction - normalized_axis * float(
+        np.dot(normalized_direction, normalized_axis)
+    )
+    normal = _normalize_vector(projected)
+    if normal is not None:
+        return normal
+    fallback_axis = np.eye(3, dtype=float)[
+        int(np.argmin(np.abs(normalized_axis)))
+    ]
+    fallback = fallback_axis - normalized_axis * float(
+        np.dot(fallback_axis, normalized_axis)
+    )
+    normal = _normalize_vector(fallback)
+    if normal is None:
+        raise ValueError("A stable axis drag plane could not be built.")
+    return normal
+
+
+def _get_signed_rotation_degrees(
+    axis: object,
+    first_vector: object,
+    second_vector: object,
+) -> float:
+    normalized_axis = _normalize_vector(axis)
+    first = _normalize_vector(first_vector)
+    second = _normalize_vector(second_vector)
+    if normalized_axis is None or first is None or second is None:
+        raise ValueError("Rotation angles require finite non-zero vectors.")
+    sine = float(np.dot(normalized_axis, np.cross(first, second)))
+    cosine = float(np.clip(np.dot(first, second), -1.0, 1.0))
+    return math.degrees(math.atan2(sine, cosine))
+
+
+def _get_ray_segment_distance(
+    ray_origin: np.ndarray,
+    ray_direction: np.ndarray,
+    segment_start: np.ndarray,
+    segment_end: np.ndarray,
+) -> float | None:
+    segment = segment_end - segment_start
+    segment_length_squared = float(np.dot(segment, segment))
+    if segment_length_squared <= 1e-12:
+        return None
+    offset = ray_origin - segment_start
+    ray_segment_dot = float(np.dot(ray_direction, segment))
+    ray_offset_dot = float(np.dot(ray_direction, offset))
+    segment_offset_dot = float(np.dot(segment, offset))
+    denominator = segment_length_squared - ray_segment_dot**2
+    if abs(denominator) <= 1e-12:
+        segment_parameter = float(
+            np.clip(segment_offset_dot / segment_length_squared, 0.0, 1.0)
+        )
+    else:
+        segment_parameter = float(
+            np.clip(
+                (segment_offset_dot - ray_segment_dot * ray_offset_dot)
+                / denominator,
+                0.0,
+                1.0,
+            )
+        )
+    ray_parameter = max(
+        0.0,
+        ray_segment_dot * segment_parameter - ray_offset_dot,
+    )
+    segment_parameter = float(
+        np.clip(
+            (
+                segment_offset_dot
+                + ray_segment_dot * ray_parameter
+            )
+            / segment_length_squared,
+            0.0,
+            1.0,
+        )
+    )
+    ray_point = ray_origin + ray_direction * ray_parameter
+    segment_point = segment_start + segment * segment_parameter
+    return float(np.linalg.norm(ray_point - segment_point))
+
+
+def _get_nearest_preview_placed_object_ray_hit(
+    targets: tuple[PreviewPlacedObject, ...],
+    ray_origin: object,
+    ray_direction: object,
+) -> tuple[PreviewPlacedObject, np.ndarray, float] | None:
+    """Pick retained or fading-half geometry for the nearest placed object."""
+
+    origin, direction = _normalize_ray(ray_origin, ray_direction)
+    if origin is None or direction is None:
+        return None
+    nearest: tuple[PreviewPlacedObject, np.ndarray, float] | None = None
+    for target in targets:
+        if not isinstance(target, PreviewPlacedObject):
+            continue
+        meshes = (
+            *target.meshes,
+            *_build_local_symmetric_preview_meshes(target),
+        )
+        for local_mesh in meshes:
+            world_mesh = local_mesh.copy()
+            world_mesh.apply_transform(target.placement_transform)
+            hit = _get_nearest_triangle_ray_hit(
+                world_mesh,
+                origin,
+                direction,
+            )
+            if hit is None:
+                continue
+            hit_point, hit_distance = hit
+            if nearest is None or hit_distance < nearest[2] - 1e-9:
+                nearest = (target, hit_point, hit_distance)
+    return nearest
+
+
 def _build_textured_wall_transform(
     textured_wall: PreviewTexturedWall,
     offset_sign: float,

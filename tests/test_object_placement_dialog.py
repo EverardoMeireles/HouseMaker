@@ -90,6 +90,8 @@ class GeneratedObjectPlacementTests(unittest.TestCase):
             level_index=5,
             image_x=123.25,
             image_y=67.5,
+            height_offset_meters=1.25,
+            rotation_degrees=(15.0, -30.0, 225.0),
         )
         record = _record(placement)
         data = GenerationData(generated_objects=[record])
@@ -105,8 +107,24 @@ class GeneratedObjectPlacementTests(unittest.TestCase):
                 "level_index": 5,
                 "image_x": 123.25,
                 "image_y": 67.5,
+                "height_offset_meters": 1.25,
+                "rotation_degrees": [15.0, -30.0, 225.0],
             },
         )
+
+    def test_legacy_placement_defaults_to_floor_height_and_zero_rotation(
+        self,
+    ) -> None:
+        placement = GeneratedObjectPlacement.from_dict(
+            {
+                "level_index": 2,
+                "image_x": 20.0,
+                "image_y": 30.0,
+            }
+        )
+
+        self.assertEqual(placement.height_offset_meters, 0.0)
+        self.assertEqual(placement.rotation_degrees, (0.0, 0.0, 0.0))
 
     def test_legacy_record_without_placement_loads_unplaced(self) -> None:
         payload = _record(None).to_dict()
@@ -130,6 +148,32 @@ class GeneratedObjectPlacementTests(unittest.TestCase):
         for values in invalid_values:
             with self.subTest(values=values), self.assertRaises(ValueError):
                 GeneratedObjectPlacement(**values)
+
+    def test_placement_rejects_invalid_height_and_rotation(self) -> None:
+        invalid_values = (
+            {"height_offset_meters": True},
+            {"height_offset_meters": "1.0"},
+            {"height_offset_meters": math.nan},
+            {"height_offset_meters": math.inf},
+            {"rotation_degrees": "0,0,0"},
+            {"rotation_degrees": (0.0, 0.0)},
+            {"rotation_degrees": (0.0, 0.0, True)},
+            {"rotation_degrees": (0.0, "1.0", 0.0)},
+            {"rotation_degrees": (0.0, math.nan, 0.0)},
+            {"rotation_degrees": (0.0, 0.0, math.inf)},
+        )
+
+        for extra_values in invalid_values:
+            with (
+                self.subTest(extra_values=extra_values),
+                self.assertRaises((TypeError, ValueError)),
+            ):
+                GeneratedObjectPlacement(
+                    level_index=2,
+                    image_x=1.0,
+                    image_y=2.0,
+                    **extra_values,
+                )
 
     def test_record_rejects_an_untyped_placement(self) -> None:
         with self.assertRaises(ValueError):

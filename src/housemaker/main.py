@@ -119,6 +119,7 @@ from housemaker.models import (
 from housemaker.level_coordinates import (
     build_level_base_z_lookup,
     level_image_to_world_xy,
+    level_world_to_image_xy,
 )
 from housemaker.project_io import ProjectData, load_project, save_project
 from housemaker.settings_widget import (
@@ -464,6 +465,9 @@ class BlueprintWorkspace(QWidget):
         )
         self.viewer.window_undo_requested.connect(
             self._handle_canvas_window_undo_requested
+        )
+        self.viewer.placed_object_transform_changed.connect(
+            self._handle_placed_object_transform_changed
         )
         self.viewer.navigation_mode_changed.connect(
             self._handle_canvas_3d_navigation_mode_changed
@@ -1776,6 +1780,63 @@ class BlueprintWorkspace(QWidget):
         ):
             self._schedule_viewer_preview_refresh(preserve_camera=True)
 
+    def _handle_placed_object_transform_changed(
+        self,
+        object_id: str,
+        world_position: object,
+        rotation_degrees: object,
+    ) -> None:
+        """Convert one world-space gizmo commit back to level-relative state."""
+
+        normalized_object_id = str(object_id).strip()
+        existing_placement = self.generation.get_generated_object_placement(
+            normalized_object_id
+        )
+        if existing_placement is None:
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+            return
+        level = next(
+            (
+                candidate
+                for candidate in self.levels
+                if candidate.index == existing_placement.level_index
+            ),
+            None,
+        )
+        base_z = build_level_base_z_lookup(self.levels).get(
+            existing_placement.level_index
+        )
+        if level is None or base_z is None:
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+            return
+        try:
+            world_x, world_y, world_z = tuple(world_position)
+            image_x, image_y = level_world_to_image_xy(
+                level,
+                float(world_x),
+                float(world_y),
+            )
+            placement = GeneratedObjectPlacement(
+                level_index=existing_placement.level_index,
+                image_x=image_x,
+                image_y=image_y,
+                height_offset_meters=float(world_z) - float(base_z),
+                rotation_degrees=rotation_degrees,
+            )
+        except (TypeError, ValueError, OverflowError):
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+            return
+        # The gizmo already updated its independent preview root. Emitting the
+        # ordinary placement signals here would serialize and rebuild both 3D
+        # previews, even though only this retained transform changed.
+        was_updated = self.generation.update_generated_object_placement(
+            normalized_object_id,
+            placement,
+            emit_change_signals=False,
+        )
+        if not was_updated:
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+
     def _handle_generated_object_deleted_for_canvas(
         self,
         _object_id: str,
@@ -2742,13 +2803,18 @@ class BlueprintWorkspace(QWidget):
                 PlacedGeneratedModel(
                     object_id=record.object_id,
                     model=generated_model,
-                    world_position=(world_x, world_y, base_z),
+                    world_position=(
+                        world_x,
+                        world_y,
+                        base_z + placement.height_offset_meters,
+                    ),
                     symmetric_preview_orientation=(
                         None if symmetry is None else symmetry.orientation
                     ),
                     symmetric_preview_plane_coordinate=(
                         None if symmetry is None else symmetry.plane_coordinate
                     ),
+                    rotation_degrees=placement.rotation_degrees,
                 )
             )
         return tuple(placed_models)

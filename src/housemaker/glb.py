@@ -108,6 +108,10 @@ class GeneratedModel:
     preview_symmetric_objects: list["PreviewSymmetricObject"] = field(
         default_factory=list
     )
+    preview_placed_objects: list["PreviewPlacedObject"] = field(
+        default_factory=list
+    )
+    preview_base_mesh: trimesh.Trimesh | None = None
 
 
 @dataclass(frozen=True)
@@ -119,6 +123,7 @@ class PlacedGeneratedModel:
     world_position: tuple[float, float, float]
     symmetric_preview_orientation: str | None = None
     symmetric_preview_plane_coordinate: float | None = None
+    rotation_degrees: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     def __post_init__(self) -> None:
         if not isinstance(self.object_id, str):
@@ -135,8 +140,57 @@ class PlacedGeneratedModel:
             self.symmetric_preview_orientation,
             self.symmetric_preview_plane_coordinate,
         )
+        normalized_rotation = _normalize_placed_rotation(
+            self.rotation_degrees
+        )
         object.__setattr__(self, "object_id", normalized_object_id)
         object.__setattr__(self, "world_position", normalized_position)
+        object.__setattr__(self, "rotation_degrees", normalized_rotation)
+        object.__setattr__(self, "symmetric_preview_orientation", orientation)
+        object.__setattr__(
+            self,
+            "symmetric_preview_plane_coordinate",
+            plane_coordinate,
+        )
+
+
+@dataclass(frozen=True)
+class PreviewPlacedObject:
+    """Local preview meshes and the rigid transform for one Canvas object."""
+
+    object_id: str
+    meshes: tuple[trimesh.Trimesh, ...]
+    placement_transform: np.ndarray
+    world_position: tuple[float, float, float]
+    rotation_degrees: tuple[float, float, float]
+    symmetric_preview_orientation: str | None = None
+    symmetric_preview_plane_coordinate: float | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.object_id, str) or not self.object_id.strip():
+            raise ValueError("Placed preview object IDs cannot be empty.")
+        if not isinstance(self.meshes, tuple) or not self.meshes:
+            raise ValueError("Placed previews require local object meshes.")
+        if not all(isinstance(mesh, trimesh.Trimesh) for mesh in self.meshes):
+            raise TypeError("Placed preview meshes must be triangle meshes.")
+        transform = _get_valid_source_transform(self.placement_transform).copy()
+        transform.setflags(write=False)
+        orientation, plane_coordinate = _normalize_symmetric_preview(
+            self.symmetric_preview_orientation,
+            self.symmetric_preview_plane_coordinate,
+        )
+        object.__setattr__(self, "object_id", self.object_id.strip())
+        object.__setattr__(self, "placement_transform", transform)
+        object.__setattr__(
+            self,
+            "world_position",
+            _normalize_placed_world_position(self.world_position),
+        )
+        object.__setattr__(
+            self,
+            "rotation_degrees",
+            _normalize_placed_rotation(self.rotation_degrees),
+        )
         object.__setattr__(self, "symmetric_preview_orientation", orientation)
         object.__setattr__(
             self,
@@ -147,12 +201,13 @@ class PlacedGeneratedModel:
 
 @dataclass(frozen=True)
 class PreviewSymmetricObject:
-    """Placed retained meshes and their viewer-only reflection plane."""
+    """Placed retained meshes and their viewer-only mirrored counterparts."""
 
     object_id: str
     meshes: tuple[trimesh.Trimesh, ...]
     orientation: str
     plane_coordinate: float
+    mirrored_meshes: tuple[trimesh.Trimesh, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.object_id, str) or not self.object_id.strip():
@@ -161,6 +216,19 @@ class PreviewSymmetricObject:
             raise ValueError("Symmetric previews require retained object meshes.")
         if not all(isinstance(mesh, trimesh.Trimesh) for mesh in self.meshes):
             raise TypeError("Symmetric preview meshes must be triangle meshes.")
+        if not isinstance(self.mirrored_meshes, tuple) or not all(
+            isinstance(mesh, trimesh.Trimesh)
+            for mesh in self.mirrored_meshes
+        ):
+            raise TypeError(
+                "Mirrored symmetric preview meshes must be triangle meshes."
+            )
+        if self.mirrored_meshes and len(self.mirrored_meshes) != len(
+            self.meshes
+        ):
+            raise ValueError(
+                "Symmetric retained and mirrored previews must have equal parts."
+            )
         orientation, plane_coordinate = _normalize_symmetric_preview(
             self.orientation,
             self.plane_coordinate,
@@ -467,14 +535,21 @@ def compose_placed_generated_models(
     placed_untextured_meshes: list[trimesh.Trimesh] = []
     preview_textured_surfaces = list(base_model.preview_textured_surfaces)
     preview_symmetric_objects = list(base_model.preview_symmetric_objects)
+    preview_placed_objects = list(base_model.preview_placed_objects)
+    preview_base_mesh = base_model.preview_base_mesh
+    if preview_base_mesh is None:
+        preview_base_mesh = (
+            base_model.preview_untextured_mesh
+            if base_model.preview_textured_surfaces
+            and base_model.preview_untextured_mesh is not None
+            else base_model.mesh
+        )
 
     for placement_index, placement in enumerate(
         normalized_placements,
         start=1,
     ):
-        translation = _build_placed_model_translation(placement)
-        placement_transform = np.eye(4, dtype=float)
-        placement_transform[:3, 3] = translation
+        placement_transform = _build_placed_model_transform(placement)
         _append_placed_model_scene(
             output_scene=output_scene,
             placement=placement,
@@ -487,7 +562,7 @@ def compose_placed_generated_models(
         placed_mesh = placement.model.mesh.copy()
         placed_mesh.apply_transform(placement_transform)
         placed_meshes.append(placed_mesh)
-        textured_surfaces, untextured_meshes, world_meshes = (
+        textured_surfaces, untextured_meshes, world_meshes, local_meshes = (
             _build_placed_model_preview_parts(
                 placement,
                 placement_index,
@@ -496,19 +571,45 @@ def compose_placed_generated_models(
         )
         preview_textured_surfaces.extend(textured_surfaces)
         placed_untextured_meshes.extend(untextured_meshes)
+        preview_placed_objects.append(
+            PreviewPlacedObject(
+                object_id=placement.object_id,
+                meshes=local_meshes,
+                placement_transform=placement_transform,
+                world_position=placement.world_position,
+                rotation_degrees=placement.rotation_degrees,
+                symmetric_preview_orientation=(
+                    placement.symmetric_preview_orientation
+                ),
+                symmetric_preview_plane_coordinate=(
+                    placement.symmetric_preview_plane_coordinate
+                ),
+            )
+        )
         if placement.symmetric_preview_orientation is not None:
             axis = SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION[
                 placement.symmetric_preview_orientation
             ]
             assert placement.symmetric_preview_plane_coordinate is not None
+            plane_point = np.zeros(4, dtype=float)
+            plane_point[axis] = (
+                placement.symmetric_preview_plane_coordinate
+            )
+            plane_point[3] = 1.0
+            world_plane_point = placement_transform @ plane_point
             preview_symmetric_objects.append(
                 PreviewSymmetricObject(
                     object_id=placement.object_id,
                     meshes=world_meshes,
                     orientation=placement.symmetric_preview_orientation,
-                    plane_coordinate=(
-                        placement.symmetric_preview_plane_coordinate
-                        + float(translation[axis])
+                    plane_coordinate=float(world_plane_point[axis]),
+                    mirrored_meshes=(
+                        _build_symmetric_preview_world_meshes(
+                            local_meshes,
+                            placement.symmetric_preview_orientation,
+                            placement.symmetric_preview_plane_coordinate,
+                            placement_transform,
+                        )
                     ),
                 )
             )
@@ -541,6 +642,8 @@ def compose_placed_generated_models(
         preview_textured_surfaces=preview_textured_surfaces,
         preview_untextured_mesh=preview_untextured_mesh,
         preview_symmetric_objects=preview_symmetric_objects,
+        preview_placed_objects=preview_placed_objects,
+        preview_base_mesh=preview_base_mesh,
     )
 
 
@@ -609,7 +712,33 @@ def _normalize_symmetric_preview(
     return orientation, plane_coordinate
 
 
-def _build_placed_model_translation(
+def _normalize_placed_rotation(
+    raw_rotation: object,
+) -> tuple[float, float, float]:
+    if isinstance(raw_rotation, (str, bytes, bytearray)) or not isinstance(
+        raw_rotation,
+        Sequence,
+    ):
+        raise TypeError("Placed generated-object rotations must be XYZ sequences.")
+    if len(raw_rotation) != 3:
+        raise ValueError(
+            "Placed generated-object rotations must contain three angles."
+        )
+    angles: list[float] = []
+    for raw_angle in raw_rotation:
+        if isinstance(raw_angle, bool) or not isinstance(
+            raw_angle,
+            (int, float, np.integer, np.floating),
+        ):
+            raise TypeError("Placed generated-object angles must be numbers.")
+        angle = float(raw_angle)
+        if not math.isfinite(angle):
+            raise ValueError("Placed generated-object angles must be finite.")
+        angles.append(angle)
+    return angles[0], angles[1], angles[2]
+
+
+def _build_placed_model_transform(
     placement: PlacedGeneratedModel,
 ) -> np.ndarray:
     mesh = placement.model.mesh
@@ -638,7 +767,21 @@ def _build_placed_model_translation(
         ],
         dtype=float,
     )
-    return np.asarray(placement.world_position, dtype=float) - bottom_center
+    rotation_radians = np.radians(
+        np.asarray(placement.rotation_degrees, dtype=float)
+    )
+    rotation = trimesh.transformations.euler_matrix(
+        *rotation_radians,
+        axes="sxyz",
+    )
+    move_pivot_to_origin = np.eye(4, dtype=float)
+    move_pivot_to_origin[:3, 3] = -bottom_center
+    move_to_world = np.eye(4, dtype=float)
+    move_to_world[:3, 3] = np.asarray(
+        placement.world_position,
+        dtype=float,
+    )
+    return move_to_world @ rotation @ move_pivot_to_origin
 
 
 def _append_placed_model_scene(
@@ -737,11 +880,13 @@ def _build_placed_model_preview_parts(
     list[PreviewTexturedSurface],
     list[trimesh.Trimesh],
     tuple[trimesh.Trimesh, ...],
+    tuple[trimesh.Trimesh, ...],
 ]:
     source_scene = placement.model.scene
     textured_surfaces: list[PreviewTexturedSurface] = []
     untextured_meshes: list[trimesh.Trimesh] = []
     world_meshes: list[trimesh.Trimesh] = []
+    local_meshes: list[trimesh.Trimesh] = []
     for node_index, source_node_name in enumerate(
         sorted(source_scene.graph.nodes_geometry, key=str),
         start=1,
@@ -754,12 +899,14 @@ def _build_placed_model_preview_parts(
             raise ValueError(
                 "Placed generated-object scenes must contain triangle meshes."
             )
-        world_mesh = copy.deepcopy(source_geometry)
-        world_mesh.apply_transform(
-            placement_transform
-            @ GLTF_Y_UP_TO_Z_UP_TRANSFORM
+        local_mesh = copy.deepcopy(source_geometry)
+        local_mesh.apply_transform(
+            GLTF_Y_UP_TO_Z_UP_TRANSFORM
             @ _get_valid_source_transform(node_transform)
         )
+        local_meshes.append(local_mesh)
+        world_mesh = local_mesh.copy()
+        world_mesh.apply_transform(placement_transform)
         world_meshes.append(world_mesh)
         if _mesh_supports_embedded_texture_preview(world_mesh):
             textured_surfaces.append(
@@ -774,7 +921,36 @@ def _build_placed_model_preview_parts(
             )
         else:
             untextured_meshes.append(world_mesh)
-    return textured_surfaces, untextured_meshes, tuple(world_meshes)
+    return (
+        textured_surfaces,
+        untextured_meshes,
+        tuple(world_meshes),
+        tuple(local_meshes),
+    )
+
+
+def _build_symmetric_preview_world_meshes(
+    local_meshes: tuple[trimesh.Trimesh, ...],
+    orientation: str,
+    plane_coordinate: float,
+    placement_transform: np.ndarray,
+) -> tuple[trimesh.Trimesh, ...]:
+    """Mirror local retained parts, then move the preview with its object."""
+
+    axis = SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION[orientation]
+    mirrored_meshes: list[trimesh.Trimesh] = []
+    for local_mesh in local_meshes:
+        mirrored_mesh = copy.deepcopy(local_mesh)
+        vertices = np.asarray(mirrored_mesh.vertices, dtype=float).copy()
+        vertices[:, axis] = float(plane_coordinate) * 2.0 - vertices[:, axis]
+        mirrored_mesh.vertices = vertices
+        mirrored_mesh.faces = np.asarray(
+            mirrored_mesh.faces,
+            dtype=np.int64,
+        )[:, (0, 2, 1)]
+        mirrored_mesh.apply_transform(placement_transform)
+        mirrored_meshes.append(mirrored_mesh)
+    return tuple(mirrored_meshes)
 
 
 def _mesh_supports_embedded_texture_preview(mesh: trimesh.Trimesh) -> bool:

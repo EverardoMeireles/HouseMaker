@@ -26,6 +26,7 @@ from housemaker.glb import GeneratedModel, PlacedGeneratedModel
 from housemaker.level_coordinates import (
     build_level_base_z_lookup,
     level_image_to_world_xy,
+    level_world_to_image_xy,
 )
 from housemaker.main import BlueprintWorkspace
 from housemaker.models import LevelData, VertexData
@@ -256,7 +257,13 @@ class GeneratedObjectPlacementMainTests(unittest.TestCase):
         )
         hidden_level = _level(4, include_in_export=False)
         self.workspace.levels = [ground, target_level, hidden_level]
-        visible_placement = GeneratedObjectPlacement(3, 150.0, 25.0)
+        visible_placement = GeneratedObjectPlacement(
+            3,
+            150.0,
+            25.0,
+            height_offset_meters=1.75,
+            rotation_degrees=(12.0, -25.0, 70.0),
+        )
         generation_data = GenerationData(
             generated_objects=[
                 _record(
@@ -324,10 +331,17 @@ class GeneratedObjectPlacementMainTests(unittest.TestCase):
             visible_placement.image_x,
             visible_placement.image_y,
         )
-        expected_z = build_level_base_z_lookup(self.workspace.levels)[3]
+        expected_z = (
+            build_level_base_z_lookup(self.workspace.levels)[3]
+            + visible_placement.height_offset_meters
+        )
         self.assertEqual(
             placed_model.world_position,
             (expected_x, expected_y, expected_z),
+        )
+        self.assertEqual(
+            placed_model.rotation_degrees,
+            visible_placement.rotation_degrees,
         )
         self.assertEqual(
             placed_model.symmetric_preview_orientation,
@@ -337,6 +351,104 @@ class GeneratedObjectPlacementMainTests(unittest.TestCase):
             placed_model.symmetric_preview_plane_coordinate,
             0.25,
         )
+
+    def test_gizmo_transform_converts_world_position_back_to_level_placement(
+        self,
+    ) -> None:
+        ground = _level(2, height_meters=4.25)
+        target_level = _level(
+            3,
+            scale=1.75,
+            offset_x_meters=2.5,
+            offset_y_meters=-3.0,
+        )
+        self.workspace.levels = [ground, target_level]
+        original = GeneratedObjectPlacement(3, 40.0, 60.0)
+        world_position = (8.25, -4.5, 6.0)
+        rotation_degrees = (15.0, 35.0, -80.0)
+        expected_image_x, expected_image_y = level_world_to_image_xy(
+            target_level,
+            world_position[0],
+            world_position[1],
+        )
+        expected_height_offset = (
+            world_position[2]
+            - build_level_base_z_lookup(self.workspace.levels)[3]
+        )
+
+        with (
+            patch.object(
+                self.workspace.generation,
+                "get_generated_object_placement",
+                return_value=original,
+            ),
+            patch.object(
+                self.workspace.generation,
+                "update_generated_object_placement",
+                return_value=True,
+            ) as update_placement,
+            patch.object(
+                self.workspace,
+                "_sync_atlas_object_texture_sources",
+            ) as sync_atlas,
+            patch.object(
+                self.workspace,
+                "_schedule_viewer_preview_refresh",
+            ) as schedule_refresh,
+        ):
+            self.workspace._handle_placed_object_transform_changed(
+                "chair",
+                world_position,
+                rotation_degrees,
+            )
+
+        update_placement.assert_called_once()
+        sync_atlas.assert_not_called()
+        schedule_refresh.assert_not_called()
+        object_id, placement = update_placement.call_args.args
+        self.assertEqual(
+            update_placement.call_args.kwargs,
+            {"emit_change_signals": False},
+        )
+        self.assertEqual(object_id, "chair")
+        self.assertIsInstance(placement, GeneratedObjectPlacement)
+        self.assertEqual(placement.level_index, target_level.index)
+        self.assertAlmostEqual(placement.image_x, expected_image_x)
+        self.assertAlmostEqual(placement.image_y, expected_image_y)
+        self.assertAlmostEqual(
+            placement.height_offset_meters,
+            expected_height_offset,
+        )
+        self.assertEqual(placement.rotation_degrees, rotation_degrees)
+
+    def test_failed_gizmo_transform_restores_the_persisted_preview(self) -> None:
+        level = _level(2)
+        self.workspace.levels = [level]
+        existing_placement = GeneratedObjectPlacement(2, 40.0, 60.0)
+
+        with (
+            patch.object(
+                self.workspace.generation,
+                "get_generated_object_placement",
+                return_value=existing_placement,
+            ),
+            patch.object(
+                self.workspace.generation,
+                "update_generated_object_placement",
+                return_value=False,
+            ),
+            patch.object(
+                self.workspace,
+                "_schedule_viewer_preview_refresh",
+            ) as schedule_refresh,
+        ):
+            self.workspace._handle_placed_object_transform_changed(
+                "chair",
+                (2.0, 3.0, 4.0),
+                (10.0, 20.0, 30.0),
+            )
+
+        schedule_refresh.assert_called_once_with(preserve_camera=True)
 
     def test_composed_scene_contains_the_placed_object(self) -> None:
         level = _level(2)

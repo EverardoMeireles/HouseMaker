@@ -17,6 +17,7 @@ from housemaker.glb import (
     Z_UP_TO_GLTF_Y_UP_TRANSFORM,
     GeneratedModel,
     PlacedGeneratedModel,
+    PreviewPlacedObject,
     PreviewSymmetricObject,
     PreviewTexturedSurface,
     PreviewTexturedWall,
@@ -191,6 +192,48 @@ def _texture_average(mesh: trimesh.Trimesh) -> np.ndarray:
 
 # ### Composition tests ###
 class PlacedGeneratedModelCompositionTests(unittest.TestCase):
+    def test_rotation_keeps_the_source_bottom_center_on_the_world_anchor(
+        self,
+    ) -> None:
+        base_model = _base_box_model()
+        object_mesh = trimesh.creation.box(extents=(2.0, 4.0, 2.0))
+        object_mesh.apply_translation((4.0, -2.0, 1.0))
+        object_model = _single_mesh_model(object_mesh)
+
+        composed = compose_placed_generated_models(
+            base_model,
+            [
+                PlacedGeneratedModel(
+                    object_id="rotated-chair",
+                    model=object_model,
+                    world_position=(10.0, 20.0, 30.0),
+                    rotation_degrees=(0.0, 0.0, 90.0),
+                )
+            ],
+        )
+
+        placed_mesh = _placed_world_mesh(composed.scene)
+        np.testing.assert_allclose(
+            placed_mesh.bounds,
+            ((8.0, 19.0, 30.0), (12.0, 21.0, 32.0)),
+            atol=1e-7,
+        )
+        np.testing.assert_allclose(
+            (
+                placed_mesh.bounding_box.centroid[0],
+                placed_mesh.bounding_box.centroid[1],
+                placed_mesh.bounds[0, 2],
+            ),
+            (10.0, 20.0, 30.0),
+            atol=1e-7,
+        )
+        exported = import_generated_glb(composed.glb_bytes)
+        np.testing.assert_allclose(
+            exported.mesh.bounds,
+            composed.mesh.bounds,
+            atol=1e-7,
+        )
+
     def test_symmetric_placement_adds_only_a_world_space_preview_mirror(
         self,
     ) -> None:
@@ -237,6 +280,66 @@ class PlacedGeneratedModelCompositionTests(unittest.TestCase):
             len(base_model.mesh.faces) + retained_faces,
         )
         self.assertEqual(retained_model.glb_bytes, source_payload)
+
+    def test_rotated_symmetric_preview_keeps_local_mesh_and_full_transform(
+        self,
+    ) -> None:
+        base_model = _base_box_model()
+        retained_mesh = trimesh.creation.box(extents=(1.0, 2.0, 2.0))
+        retained_mesh.apply_translation((-0.5, 0.0, 1.0))
+        retained_model = _single_mesh_model(retained_mesh)
+        retained_face_count = len(retained_model.mesh.faces)
+
+        composed = compose_placed_generated_models(
+            base_model,
+            [
+                PlacedGeneratedModel(
+                    object_id="rotated-half-chair",
+                    model=retained_model,
+                    world_position=(10.0, 20.0, 30.0),
+                    rotation_degrees=(0.0, 0.0, 90.0),
+                    symmetric_preview_orientation="vertical",
+                    symmetric_preview_plane_coordinate=0.0,
+                )
+            ],
+        )
+
+        self.assertEqual(len(composed.preview_placed_objects), 1)
+        preview = composed.preview_placed_objects[0]
+        self.assertIsInstance(preview, PreviewPlacedObject)
+        self.assertEqual(preview.object_id, "rotated-half-chair")
+        self.assertEqual(preview.world_position, (10.0, 20.0, 30.0))
+        self.assertEqual(preview.rotation_degrees, (0.0, 0.0, 90.0))
+        self.assertEqual(preview.symmetric_preview_orientation, "vertical")
+        self.assertEqual(preview.symmetric_preview_plane_coordinate, 0.0)
+        self.assertEqual(len(preview.meshes), 1)
+        np.testing.assert_allclose(
+            preview.meshes[0].bounds,
+            retained_model.mesh.bounds,
+            atol=1e-7,
+        )
+
+        retained_world = preview.meshes[0].copy()
+        retained_world.apply_transform(preview.placement_transform)
+        mirrored_world = preview.meshes[0].copy()
+        mirrored_world.vertices[:, 0] = -mirrored_world.vertices[:, 0]
+        mirrored_world.apply_transform(preview.placement_transform)
+        np.testing.assert_allclose(
+            retained_world.bounds,
+            ((9.0, 19.5, 30.0), (11.0, 20.5, 32.0)),
+            atol=1e-7,
+        )
+        np.testing.assert_allclose(
+            mirrored_world.bounds,
+            ((9.0, 20.5, 30.0), (11.0, 21.5, 32.0)),
+            atol=1e-7,
+        )
+
+        exported = import_generated_glb(composed.glb_bytes)
+        self.assertEqual(
+            len(exported.mesh.faces),
+            len(base_model.mesh.faces) + retained_face_count,
+        )
 
     def test_bottom_center_moves_to_world_target_and_exports_exact_bounds(
         self,
@@ -483,6 +586,25 @@ class PlacedGeneratedModelCompositionTests(unittest.TestCase):
                         object_model,
                         (invalid_coordinate, 0.0, 0.0),
                     )
+
+        for invalid_rotation in (
+            "0,0,0",
+            (0.0, 0.0),
+            (0.0, True, 0.0),
+            (0.0, "1.0", 0.0),
+            (math.nan, 0.0, 0.0),
+            (0.0, math.inf, 0.0),
+        ):
+            with (
+                self.subTest(invalid_rotation=invalid_rotation),
+                self.assertRaises((TypeError, ValueError)),
+            ):
+                PlacedGeneratedModel(
+                    "id",
+                    object_model,
+                    (0.0, 0.0, 0.0),
+                    rotation_degrees=invalid_rotation,
+                )
 
         with self.assertRaises(ValueError):
             PlacedGeneratedModel(

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -104,11 +105,13 @@ class MaskStroke:
 # ### Generated-object models ###
 @dataclass(frozen=True)
 class GeneratedObjectPlacement:
-    """One generated object's floor-relative location on a Canvas level."""
+    """One generated object's level-relative Canvas transform."""
 
     level_index: int
     image_x: float
     image_y: float
+    height_offset_meters: float = 0.0
+    rotation_degrees: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     def __post_init__(self) -> None:
         if (
@@ -128,14 +131,30 @@ class GeneratedObjectPlacement:
             raise ValueError(
                 "Generated-object placement Y coordinate must be finite."
             )
+        if not _is_strict_finite_number(self.height_offset_meters):
+            raise ValueError(
+                "Generated-object placement height offset must be finite."
+            )
         object.__setattr__(self, "image_x", float(self.image_x))
         object.__setattr__(self, "image_y", float(self.image_y))
+        object.__setattr__(
+            self,
+            "height_offset_meters",
+            float(self.height_offset_meters),
+        )
+        object.__setattr__(
+            self,
+            "rotation_degrees",
+            _normalize_placement_rotation(self.rotation_degrees),
+        )
 
-    def to_dict(self) -> dict[str, int | float]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "level_index": self.level_index,
             "image_x": self.image_x,
             "image_y": self.image_y,
+            "height_offset_meters": self.height_offset_meters,
+            "rotation_degrees": list(self.rotation_degrees),
         }
 
     @classmethod
@@ -148,6 +167,11 @@ class GeneratedObjectPlacement:
             level_index=payload.get("level_index"),
             image_x=payload.get("image_x"),
             image_y=payload.get("image_y"),
+            height_offset_meters=payload.get("height_offset_meters", 0.0),
+            rotation_degrees=payload.get(
+                "rotation_degrees",
+                (0.0, 0.0, 0.0),
+            ),
         )
 
 
@@ -348,6 +372,27 @@ class GenerationData:
 
 
 # ### Validation helpers ###
+def _normalize_placement_rotation(
+    raw_rotation: object,
+) -> tuple[float, float, float]:
+    """Return one finite XYZ Euler rotation without accepting text or booleans."""
+
+    if isinstance(raw_rotation, (str, bytes, bytearray)) or not isinstance(
+        raw_rotation,
+        Sequence,
+    ):
+        raise ValueError(
+            "Generated-object placement rotation must contain three angles."
+        )
+    if len(raw_rotation) != 3 or not all(
+        _is_strict_finite_number(value) for value in raw_rotation
+    ):
+        raise ValueError(
+            "Generated-object placement rotation must contain three finite angles."
+        )
+    return tuple(float(value) for value in raw_rotation)
+
+
 def _load_meshy_generated_objects(
     raw_generated_objects: list[object],
 ) -> list[GeneratedObjectRecord]:

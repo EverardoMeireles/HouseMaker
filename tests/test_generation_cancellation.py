@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -495,6 +496,79 @@ class GenerationCancellationTests(unittest.TestCase):
                 GeneratedObjectPlacement(8, 1.0, 2.0),
             )
         )
+
+    def test_direct_placement_update_replaces_only_the_requested_object(
+        self,
+    ) -> None:
+        chair, _variants = self._seed_textured_object()
+        chair_placement = GeneratedObjectPlacement(2, 10.0, 20.0)
+        table_placement = GeneratedObjectPlacement(3, 30.0, 40.0)
+        chair = replace(chair, placement=chair_placement)
+        table = replace(
+            chair,
+            object_id="table",
+            object_name="Table",
+            provider_task_id="table-task",
+            placement=table_placement,
+        )
+        self.workspace.set_data(
+            GenerationData(generated_objects=[chair, table])
+        )
+        data_changed = QSignalSpy(self.workspace.data_changed)
+        placement_changed = QSignalSpy(
+            self.workspace.generated_object_placement_changed
+        )
+        replacement_placement = GeneratedObjectPlacement(
+            2,
+            55.0,
+            65.0,
+            height_offset_meters=1.4,
+            rotation_degrees=(10.0, 25.0, -40.0),
+        )
+
+        self.assertTrue(
+            self.workspace.update_generated_object_placement(
+                "chair",
+                replacement_placement,
+            )
+        )
+
+        records = {
+            record.object_id: record
+            for record in self.workspace.get_data().generated_objects
+        }
+        self.assertEqual(records["chair"].placement, replacement_placement)
+        self.assertEqual(records["table"].placement, table_placement)
+        self.assertEqual(data_changed.count(), 1)
+        self.assertEqual(placement_changed.count(), 1)
+        self.assertEqual(placement_changed.at(0)[0], records["chair"])
+
+        quiet_placement = replace(
+            replacement_placement,
+            image_x=75.0,
+        )
+        self.assertTrue(
+            self.workspace.update_generated_object_placement(
+                "chair",
+                quiet_placement,
+                emit_change_signals=False,
+            )
+        )
+        self.assertEqual(
+            self.workspace.get_generated_object_placement("chair"),
+            quiet_placement,
+        )
+        self.assertEqual(data_changed.count(), 1)
+        self.assertEqual(placement_changed.count(), 1)
+
+        self.assertFalse(
+            self.workspace.update_generated_object_placement(
+                "missing",
+                replacement_placement,
+            )
+        )
+        self.assertEqual(data_changed.count(), 1)
+        self.assertEqual(placement_changed.count(), 1)
 
     def test_closed_completed_object_picker_invalidates_only_its_token(
         self,
