@@ -35,6 +35,7 @@ from housemaker.level_coordinates import (
 )
 from housemaker.models import (
     DEFAULT_DOORWAY_DEPTH_METERS,
+    DOORWAY_SHAPE_ARCH,
     DEFAULT_IMAGE_OFFSET,
     DEFAULT_IMAGE_SCALE,
     DEFAULT_ROOM_HEIGHT_METERS,
@@ -57,6 +58,8 @@ from housemaker.models import (
     VERTEX_HIT_RADIUS_SCREEN,
     Vertex,
     VertexData,
+    normalize_doorway_arch_amount,
+    normalize_doorway_shape,
     snap_point,
 )
 from housemaker.uv_layout import initialize_room_uv_map_size
@@ -306,6 +309,7 @@ class BlueprintCanvas(QWidget):
     doorway_dimension_preview_changed = Signal()
     doorway_dimension_drag_started = Signal()
     doorway_dimension_drag_finished = Signal()
+    selected_doorway_changed = Signal(int)
     floor_contour_changed = Signal(object)
     first_person_camera_changed = Signal(object)
     stair_start_placed = Signal(object)
@@ -572,7 +576,7 @@ class BlueprintCanvas(QWidget):
         self._reset_room_designation()
         self._reset_floor_contour_designation()
         self._reset_doorway_placement()
-        self.selected_doorway_index = None
+        self._set_selected_doorway_index(None)
         self._reset_doorway_pointer_state()
         self.active_vertex_id = None
         self.selected_vertex_id = None
@@ -721,7 +725,7 @@ class BlueprintCanvas(QWidget):
         self._reset_room_designation()
         self._reset_floor_contour_designation()
         self._reset_doorway_placement()
-        self.selected_doorway_index = None
+        self._set_selected_doorway_index(None)
         self._reset_doorway_pointer_state()
         self.active_vertex_id = None
         self.selected_vertex_id = None
@@ -818,7 +822,7 @@ class BlueprintCanvas(QWidget):
         self._reset_first_person_camera_placement()
         self._reset_floor_contour_designation()
         self._reset_doorway_placement()
-        self.selected_doorway_index = None
+        self._set_selected_doorway_index(None)
         self._reset_doorway_pointer_state()
         self.unsetCursor()
         self.pending_room_name = room_name.strip()
@@ -833,7 +837,7 @@ class BlueprintCanvas(QWidget):
         self._reset_first_person_camera_placement()
         self._reset_room_designation()
         self._reset_doorway_placement()
-        self.selected_doorway_index = None
+        self._set_selected_doorway_index(None)
         self._reset_doorway_pointer_state()
         self.unsetCursor()
         self.active_vertex_id = None
@@ -855,7 +859,7 @@ class BlueprintCanvas(QWidget):
         self.active_vertex_id = None
         self.selected_vertex_id = None
         self.selected_vertex_ids.clear()
-        self.selected_doorway_index = None
+        self._set_selected_doorway_index(None)
         self.preview_point = None
         self.preview_guides = []
         self._reset_pointer_state()
@@ -925,7 +929,7 @@ class BlueprintCanvas(QWidget):
         self.pending_stair_preview_guides = []
         self.initial_first_person_camera_selected = False
         self.level_context = None
-        self.selected_doorway_index = None
+        self._set_selected_doorway_index(None)
         self.selected_stair_index = None
         self._reset_pointer_state()
         self._reset_doorway_pointer_state()
@@ -963,7 +967,7 @@ class BlueprintCanvas(QWidget):
         self._reset_room_designation()
         self._reset_floor_contour_designation()
         self._reset_doorway_placement()
-        self.selected_doorway_index = None
+        self._set_selected_doorway_index(None)
         self._reset_pointer_state()
         self._reset_doorway_pointer_state()
         self._reset_first_person_camera_pointer_state()
@@ -1184,7 +1188,7 @@ class BlueprintCanvas(QWidget):
             )
         if first_person_camera_handle is not None:
             self.initial_first_person_camera_selected = True
-            self.selected_doorway_index = None
+            self._set_selected_doorway_index(None)
             self.selected_vertex_id = None
             self.selected_vertex_ids.clear()
             self.pressed_first_person_camera_handle = (
@@ -1203,7 +1207,7 @@ class BlueprintCanvas(QWidget):
             stair_hit = self._find_stair_hit(event.position())
             if stair_hit is not None:
                 self.selected_stair_index = stair_hit.stair_index
-                self.selected_doorway_index = None
+                self._set_selected_doorway_index(None)
                 self.selected_vertex_id = None
                 self.selected_vertex_ids.clear()
                 self.stair_selected.emit(stair_hit.stair_index)
@@ -1214,7 +1218,7 @@ class BlueprintCanvas(QWidget):
         self.selected_stair_index = None
         doorway_hit = self._find_doorway_hit(event.position())
         if doorway_hit is not None:
-            self.selected_doorway_index = doorway_hit.doorway_index
+            self._set_selected_doorway_index(doorway_hit.doorway_index)
             self.selected_vertex_id = None
             self.selected_vertex_ids.clear()
             self._reset_doorway_pointer_state()
@@ -1244,7 +1248,7 @@ class BlueprintCanvas(QWidget):
             event.accept()
             return
 
-        self.selected_doorway_index = None
+        self._set_selected_doorway_index(None)
         hit_vertex = self._find_vertex_at(event.position())
         if self.pending_floor_contour_vertex_ids is not None:
             if hit_vertex is not None:
@@ -1905,6 +1909,79 @@ class BlueprintCanvas(QWidget):
         return True
 
     # ### Doorway helpers ###
+    def set_selected_doorway_shape(self, shape: str) -> bool:
+        """Change the selected opening shape as one undoable preview edit."""
+
+        doorway_index = self.selected_doorway_index
+        if doorway_index is None or not (0 <= doorway_index < len(self.doorways)):
+            return False
+
+        normalized_shape = normalize_doorway_shape(shape)
+        doorway = self.doorways[doorway_index]
+        if doorway.shape == normalized_shape:
+            return False
+
+        self._push_undo_state()
+        self.doorways[doorway_index] = self._copy_doorway_with(
+            doorway,
+            shape=normalized_shape,
+        )
+        self.doorway_dimension_preview_changed.emit()
+        self.update()
+        return True
+
+    def set_selected_doorway_arch_amount(self, arch_amount: float) -> bool:
+        """Change the selected arch amount as one undoable preview edit."""
+
+        doorway_index = self.selected_doorway_index
+        if doorway_index is None or not (0 <= doorway_index < len(self.doorways)):
+            return False
+
+        normalized_arch_amount = normalize_doorway_arch_amount(arch_amount)
+        doorway = self.doorways[doorway_index]
+        if doorway.shape != DOORWAY_SHAPE_ARCH:
+            return False
+        if doorway.arch_amount == normalized_arch_amount:
+            return False
+
+        self._push_undo_state()
+        self.doorways[doorway_index] = self._copy_doorway_with(
+            doorway,
+            arch_amount=normalized_arch_amount,
+        )
+        self.doorway_dimension_preview_changed.emit()
+        self.update()
+        return True
+
+    def _set_selected_doorway_index(self, doorway_index: int | None) -> None:
+        """Own doorway selection changes and notify dependent controls once."""
+
+        normalized_index = doorway_index
+        if normalized_index is not None and not (
+            0 <= normalized_index < len(self.doorways)
+        ):
+            normalized_index = None
+        if normalized_index == self.selected_doorway_index:
+            return
+
+        self.selected_doorway_index = normalized_index
+        self.selected_doorway_changed.emit(
+            -1 if normalized_index is None else normalized_index
+        )
+
+    @staticmethod
+    def _get_doorway_label_text(doorway: DoorwayData) -> str:
+        """Describe one opening without changing its plan-view footprint."""
+
+        opening_name = "Doorway"
+        if doorway.shape == DOORWAY_SHAPE_ARCH:
+            arch_amount_percent = round(doorway.arch_amount * 100.0, 1)
+            opening_name = f"Arch {arch_amount_percent:g}%"
+        return (
+            f"{opening_name}\n"
+            f"{doorway.width_meters:.2f} × {doorway.height_meters:.2f} m"
+        )
+
     def _update_pending_doorway(self, image_point: QPointF) -> None:
         preset = self.pending_doorway_preset
         if preset is None:
@@ -1932,7 +2009,7 @@ class BlueprintCanvas(QWidget):
 
         self._push_undo_state()
         self.doorways.append(copy.deepcopy(doorway))
-        self.selected_doorway_index = len(self.doorways) - 1
+        self._set_selected_doorway_index(len(self.doorways) - 1)
         self._reset_doorway_placement()
         self.unsetCursor()
         self.doorways_changed.emit()
@@ -2378,6 +2455,8 @@ class BlueprintCanvas(QWidget):
         height_meters: float | None = None,
         depth_meters: float | None = None,
         rotation_degrees: float | None = None,
+        shape: str | None = None,
+        arch_amount: float | None = None,
     ) -> DoorwayData:
         return DoorwayData(
             center_x=doorway.center_x if center_x is None else center_x,
@@ -2395,6 +2474,10 @@ class BlueprintCanvas(QWidget):
                 doorway.rotation_degrees
                 if rotation_degrees is None
                 else rotation_degrees
+            ),
+            shape=doorway.shape if shape is None else shape,
+            arch_amount=(
+                doorway.arch_amount if arch_amount is None else arch_amount
             ),
         )
 
@@ -2429,7 +2512,7 @@ class BlueprintCanvas(QWidget):
 
         self._push_undo_state()
         del self.doorways[doorway_index]
-        self.selected_doorway_index = None
+        self._set_selected_doorway_index(None)
         self._reset_doorway_pointer_state()
         self.doorways_changed.emit()
         self.update()
@@ -3569,11 +3652,7 @@ class BlueprintCanvas(QWidget):
             painter.drawText(
                 label_rect,
                 int(Qt.AlignmentFlag.AlignCenter),
-                (
-                    "Doorway\n"
-                    f"{doorway.width_meters:.2f} × "
-                    f"{doorway.height_meters:.2f} m"
-                ),
+                self._get_doorway_label_text(doorway),
             )
 
     # ### Stair painting ###

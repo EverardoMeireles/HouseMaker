@@ -22,7 +22,7 @@ from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
 from housemaker.camera_models import CameraPose
-from housemaker.glb import GeneratedModel
+from housemaker.glb import GeneratedModel, PreviewTexturedWall
 from housemaker.unused_face_removal import ALL_CAMERA_IDS
 from housemaker.viewer import (
     NAVIGATION_MODE_FIRST_PERSON,
@@ -201,6 +201,47 @@ class GlbViewerRenderingTests(unittest.TestCase):
         self.assertFalse(textured_item._edit_mask_enabled)
         np.testing.assert_array_equal(textured_item._texture_rgba, base_texture)
 
+    def test_textured_wall_uses_translucent_gl_options_for_alpha_mask(
+        self,
+    ) -> None:
+        model = _build_generated_model()
+        opaque_texture = np.full((2, 2, 4), 255, dtype=np.uint8)
+        masked_texture = opaque_texture.copy()
+        masked_texture[0, 0, 3] = 0
+        model.preview_textured_walls = [
+            PreviewTexturedWall(
+                level_index=2,
+                room_index=0,
+                wall_key="opaque",
+                start_point=(0.0, 0.0, 0.0),
+                end_point=(1.0, 0.0, 0.0),
+                height_meters=2.0,
+                texture_rgba=opaque_texture,
+            ),
+            PreviewTexturedWall(
+                level_index=2,
+                room_index=0,
+                wall_key="masked",
+                start_point=(0.0, 1.0, 0.0),
+                end_point=(1.0, 1.0, 0.0),
+                height_meters=2.0,
+                texture_rgba=masked_texture,
+            ),
+        ]
+        viewer = self._build_viewer()
+
+        viewer.set_model(model)
+
+        self.assertEqual(len(viewer.textured_wall_items), 2)
+        opaque_options = (
+            viewer.textured_wall_items[0]._GLGraphicsItem__glOpts
+        )
+        masked_options = (
+            viewer.textured_wall_items[1]._GLGraphicsItem__glOpts
+        )
+        self.assertFalse(opaque_options[GL.GL_BLEND])
+        self.assertTrue(masked_options[GL.GL_BLEND])
+
     def test_wireframe_only_forces_edges_and_hides_all_surfaces(self) -> None:
         viewer = self._build_viewer()
         viewer.set_model(_build_generated_model(textured=True))
@@ -319,7 +360,7 @@ class GlbViewerRenderingTests(unittest.TestCase):
             np.all(viewer._doorway_preview_outline_positions == -1.0)
         )
 
-        updated_positions = np.arange(72, dtype=float).reshape(24, 3) / 5.0
+        updated_positions = np.arange(90, dtype=float).reshape(30, 3) / 5.0
         viewer.set_doorway_preview_outline(updated_positions)
 
         self.assertIs(viewer._doorway_preview_outline_item, first_item)
@@ -364,13 +405,23 @@ class GlbViewerRenderingTests(unittest.TestCase):
     ) -> None:
         viewer = self._build_viewer()
 
-        with self.assertRaisesRegex(ValueError, "exactly 24"):
+        with self.assertRaisesRegex(ValueError, "shaped"):
+            viewer.set_doorway_preview_outline(np.zeros((2, 2)))
+        with self.assertRaisesRegex(ValueError, "at least two"):
+            viewer.set_doorway_preview_outline(np.zeros((1, 3)))
+        with self.assertRaisesRegex(ValueError, "even number"):
             viewer.set_doorway_preview_outline(np.zeros((23, 3)))
 
         positions = np.zeros((24, 3))
         positions[5, 1] = np.nan
         with self.assertRaisesRegex(ValueError, "finite"):
             viewer.set_doorway_preview_outline(positions)
+
+        viewer.set_doorway_preview_outline(np.zeros((2, 3)))
+        self.assertEqual(
+            viewer._doorway_preview_outline_positions.shape,
+            (2, 3),
+        )
 
     def test_viewer_forwards_first_person_navigation_apis(self) -> None:
         viewer = self._build_viewer()

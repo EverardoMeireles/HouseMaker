@@ -8,13 +8,22 @@ from functools import partial
 from pathlib import Path
 
 from PIL import Image
-from PySide6.QtCore import QEvent, QObject, QPointF, QSize, QTimer, Qt
+from PySide6.QtCore import (
+    QEvent,
+    QObject,
+    QPointF,
+    QSignalBlocker,
+    QSize,
+    QTimer,
+    Qt,
+)
 from PySide6.QtGui import QIcon, QKeySequence, QPixmap, QShortcut, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
     QAbstractSpinBox,
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -85,6 +94,7 @@ from housemaker.glb import (
     import_generated_glb,
 )
 from housemaker.models import (
+    DEFAULT_DOORWAY_ARCH_AMOUNT,
     DEFAULT_FLOOR_THICKNESS_METERS,
     DEFAULT_IMAGE_OFFSET,
     DEFAULT_IMAGE_SCALE,
@@ -96,13 +106,17 @@ from housemaker.models import (
     DEFAULT_UV_MAP_WIDTH,
     DEFAULT_WALL_UV_ROTATION_DEGREES,
     DEFAULT_WALL_UV_SCALE,
-    GROUND_LEVEL_INDEX,
+    DOORWAY_SHAPE_ARCH,
+    DOORWAY_SHAPE_RECTANGULAR,
     DoorwayData,
     DoorwayPreset,
+    GROUND_LEVEL_INDEX,
     LevelData,
+    MAX_DOORWAY_ARCH_AMOUNT,
     MAX_FLOOR_THICKNESS_METERS,
     MAX_LEVEL_OFFSET_METERS,
     MAX_LEVEL_SCALE,
+    MIN_DOORWAY_ARCH_AMOUNT,
     MIN_FLOOR_THICKNESS_METERS,
     MIN_LEVEL_OFFSET_METERS,
     MIN_LEVEL_SCALE,
@@ -820,6 +834,47 @@ class BlueprintWorkspace(QWidget):
         doorway_label.setStyleSheet("font-size: 18px; font-weight: 600;")
         side_layout.addWidget(doorway_label)
 
+        self.selected_doorway_arch_checkbox = QCheckBox(
+            "Arch selected doorway"
+        )
+        self.selected_doorway_arch_checkbox.setEnabled(False)
+        self.selected_doorway_arch_checkbox.setToolTip(
+            "Select a placed doorway on the Canvas, then enable this to "
+            "replace its flat top with an arch."
+        )
+        self.selected_doorway_arch_checkbox.toggled.connect(
+            self._handle_selected_doorway_arch_toggled
+        )
+        side_layout.addWidget(self.selected_doorway_arch_checkbox)
+
+        self.selected_doorway_arch_amount_spinbox = QDoubleSpinBox()
+        self.selected_doorway_arch_amount_spinbox.setRange(
+            MIN_DOORWAY_ARCH_AMOUNT * 100.0,
+            MAX_DOORWAY_ARCH_AMOUNT * 100.0,
+        )
+        self.selected_doorway_arch_amount_spinbox.setDecimals(1)
+        self.selected_doorway_arch_amount_spinbox.setSingleStep(1.0)
+        self.selected_doorway_arch_amount_spinbox.setKeyboardTracking(False)
+        self.selected_doorway_arch_amount_spinbox.setSuffix(" %")
+        self.selected_doorway_arch_amount_spinbox.setValue(
+            DEFAULT_DOORWAY_ARCH_AMOUNT * 100.0
+        )
+        self.selected_doorway_arch_amount_spinbox.setMinimumHeight(34)
+        self.selected_doorway_arch_amount_spinbox.setEnabled(False)
+        self.selected_doorway_arch_amount_spinbox.setToolTip(
+            "Control how far the selected doorway's top rises into an arch."
+        )
+        self.selected_doorway_arch_amount_spinbox.valueChanged.connect(
+            self._handle_selected_doorway_arch_amount_changed
+        )
+        doorway_arch_form = QFormLayout()
+        doorway_arch_form.setContentsMargins(0, 0, 0, 0)
+        doorway_arch_form.addRow(
+            "Arch amount",
+            self.selected_doorway_arch_amount_spinbox,
+        )
+        side_layout.addLayout(doorway_arch_form)
+
         self.doorway_preset_list = QListWidget()
         self.doorway_preset_list.setSelectionMode(
             QAbstractItemView.SelectionMode.SingleSelection
@@ -1050,6 +1105,9 @@ class BlueprintWorkspace(QWidget):
         )
         self.canvas.doorway_dimension_drag_finished.connect(
             self._handle_doorway_dimension_drag_finished
+        )
+        self.canvas.selected_doorway_changed.connect(
+            self._handle_canvas_doorway_selection_changed
         )
         self.canvas.first_person_camera_changed.connect(
             self._handle_canvas_first_person_camera_changed
@@ -4666,6 +4724,69 @@ class BlueprintWorkspace(QWidget):
 
         self.canvas.start_doorway_placement(doorway_preset)
         self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
+
+    def _handle_canvas_doorway_selection_changed(
+        self,
+        doorway_index: int,
+    ) -> None:
+        """Synchronize the arch control with the selected placed doorway."""
+
+        doorway = (
+            self.canvas.doorways[doorway_index]
+            if 0 <= doorway_index < len(self.canvas.doorways)
+            else None
+        )
+        blocker = QSignalBlocker(self.selected_doorway_arch_checkbox)
+        amount_blocker = QSignalBlocker(
+            self.selected_doorway_arch_amount_spinbox
+        )
+        arch_is_selected = bool(
+            doorway is not None and doorway.shape == DOORWAY_SHAPE_ARCH
+        )
+        self.selected_doorway_arch_checkbox.setEnabled(doorway is not None)
+        self.selected_doorway_arch_checkbox.setChecked(arch_is_selected)
+        self.selected_doorway_arch_amount_spinbox.setEnabled(arch_is_selected)
+        self.selected_doorway_arch_amount_spinbox.setValue(
+            (
+                doorway.arch_amount
+                if doorway is not None
+                else DEFAULT_DOORWAY_ARCH_AMOUNT
+            )
+            * 100.0
+        )
+        del amount_blocker
+        del blocker
+
+    def _handle_selected_doorway_arch_toggled(self, enabled: bool) -> None:
+        """Turn the selected doorway arch profile on or off."""
+
+        shape = (
+            DOORWAY_SHAPE_ARCH
+            if enabled
+            else DOORWAY_SHAPE_RECTANGULAR
+        )
+        self.canvas.set_selected_doorway_shape(shape)
+        self._handle_canvas_doorway_selection_changed(
+            -1
+            if self.canvas.selected_doorway_index is None
+            else self.canvas.selected_doorway_index
+        )
+
+    def _handle_selected_doorway_arch_amount_changed(
+        self,
+        arch_amount_percent: float,
+    ) -> None:
+        """Preview a normalized arch amount for the selected doorway."""
+
+        if self.canvas.set_selected_doorway_arch_amount(
+            arch_amount_percent / 100.0
+        ):
+            return
+        self._handle_canvas_doorway_selection_changed(
+            -1
+            if self.canvas.selected_doorway_index is None
+            else self.canvas.selected_doorway_index
+        )
 
     def _handle_doorways_changed(self) -> None:
         """Commit structural doorway changes without a debounce delay."""

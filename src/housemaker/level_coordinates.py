@@ -4,28 +4,12 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 
+from housemaker.doorway_geometry import build_doorway_cross_section_outline
 from housemaker.models import (
     GROUND_LEVEL_INDEX,
     PIXEL_TO_METER,
     DoorwayData,
     LevelData,
-)
-
-
-# ### Constants ###
-_DOORWAY_PRISM_EDGE_VERTEX_INDICES = (
-    (0, 1),
-    (1, 2),
-    (2, 3),
-    (3, 0),
-    (4, 5),
-    (5, 6),
-    (6, 7),
-    (7, 4),
-    (0, 4),
-    (1, 5),
-    (2, 6),
-    (3, 7),
 )
 
 
@@ -58,7 +42,7 @@ def build_doorway_world_outline_positions(
     level: LevelData,
     doorway: DoorwayData,
 ) -> tuple[tuple[float, float, float], ...]:
-    """Return paired world-space vertices for one doorway wireframe prism."""
+    """Return paired world-space vertices for one extruded opening outline."""
 
     if not isinstance(level, LevelData):
         raise TypeError("A doorway outline requires a LevelData value.")
@@ -106,46 +90,61 @@ def build_doorway_world_outline_positions(
         math.sin(rotation_radians),
     )
     width_direction = (-depth_direction[1], depth_direction[0])
-    half_width_pixels = width_meters / PIXEL_TO_METER / 2.0
     half_depth_pixels = depth_meters / PIXEL_TO_METER / 2.0
-    image_corners = tuple(
-        (
-            center_x
-            + width_direction[0] * width_sign * half_width_pixels
-            + depth_direction[0] * depth_sign * half_depth_pixels,
-            center_y
-            + width_direction[1] * width_sign * half_width_pixels
-            + depth_direction[1] * depth_sign * half_depth_pixels,
-        )
-        for width_sign, depth_sign in (
-            (-1.0, -1.0),
-            (1.0, -1.0),
-            (1.0, 1.0),
-            (-1.0, 1.0),
-        )
-    )
-    world_footprint = tuple(
-        level_image_to_world_xy(level, image_x, image_y)
-        for image_x, image_y in image_corners
-    )
     base_z_meters = _get_valid_doorway_outline_value(
         base_z_by_level_index[level.index],
         "base Z",
     )
-    bottom_corners = tuple(
-        (world_x, world_y, base_z_meters)
-        for world_x, world_y in world_footprint
+    cross_section = build_doorway_cross_section_outline(
+        width_meters,
+        height_meters,
+        doorway.shape,
+        arch_amount=doorway.arch_amount,
     )
-    top_corners = tuple(
-        (world_x, world_y, base_z_meters + height_meters)
-        for world_x, world_y in world_footprint
-    )
-    corners = (*bottom_corners, *top_corners)
-    return tuple(
-        corners[vertex_index]
-        for edge in _DOORWAY_PRISM_EDGE_VERTEX_INDICES
-        for vertex_index in edge
-    )
+    depth_faces: list[tuple[tuple[float, float, float], ...]] = []
+    for depth_sign in (-1.0, 1.0):
+        profile_positions: list[tuple[float, float, float]] = []
+        for width_offset_meters, height_offset_meters in cross_section:
+            width_offset_pixels = width_offset_meters / PIXEL_TO_METER
+            image_x = (
+                center_x
+                + width_direction[0] * width_offset_pixels
+                + depth_direction[0] * depth_sign * half_depth_pixels
+            )
+            image_y = (
+                center_y
+                + width_direction[1] * width_offset_pixels
+                + depth_direction[1] * depth_sign * half_depth_pixels
+            )
+            world_x, world_y = level_image_to_world_xy(
+                level,
+                image_x,
+                image_y,
+            )
+            profile_positions.append(
+                (
+                    world_x,
+                    world_y,
+                    base_z_meters + height_offset_meters,
+                )
+            )
+        depth_faces.append(tuple(profile_positions))
+
+    positions: list[tuple[float, float, float]] = []
+    for profile_positions in depth_faces:
+        for first_position, second_position in zip(
+            profile_positions,
+            profile_positions[1:],
+        ):
+            positions.extend((first_position, second_position))
+
+    first_depth_face, second_depth_face = depth_faces
+    for first_position, second_position in zip(
+        first_depth_face[:-1],
+        second_depth_face[:-1],
+    ):
+        positions.extend((first_position, second_position))
+    return tuple(positions)
 
 
 def get_level_world_pivot(level: LevelData) -> tuple[float, float]:

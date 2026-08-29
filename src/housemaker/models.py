@@ -20,6 +20,18 @@ MAX_FLOOR_THICKNESS_METERS = 10.0
 DEFAULT_DOORWAY_WIDTH_METERS = 0.90
 DEFAULT_DOORWAY_HEIGHT_METERS = 2.10
 DEFAULT_DOORWAY_DEPTH_METERS = 0.20
+DOORWAY_SHAPE_RECTANGULAR = "rectangular"
+DOORWAY_SHAPE_ARCH = "arch"
+DOORWAY_SHAPES = frozenset(
+    {
+        DOORWAY_SHAPE_RECTANGULAR,
+        DOORWAY_SHAPE_ARCH,
+    }
+)
+DEFAULT_DOORWAY_SHAPE = DOORWAY_SHAPE_RECTANGULAR
+DEFAULT_DOORWAY_ARCH_AMOUNT = 1.0
+MIN_DOORWAY_ARCH_AMOUNT = 0.0
+MAX_DOORWAY_ARCH_AMOUNT = 1.0
 MIN_DOORWAY_WIDTH_METERS = 0.10
 MAX_DOORWAY_WIDTH_METERS = 20.0
 MIN_DOORWAY_HEIGHT_METERS = 0.10
@@ -122,6 +134,12 @@ class DoorwayData:
     height_meters: float
     depth_meters: float = DEFAULT_DOORWAY_DEPTH_METERS
     rotation_degrees: float = 0.0
+    shape: str = DEFAULT_DOORWAY_SHAPE
+    arch_amount: float = DEFAULT_DOORWAY_ARCH_AMOUNT
+
+    def __post_init__(self) -> None:
+        self.shape = normalize_doorway_shape(self.shape)
+        self.arch_amount = normalize_doorway_arch_amount(self.arch_amount)
 
 
 @dataclass(frozen=True)
@@ -793,6 +811,41 @@ class LevelData:
     @property
     def display_name(self) -> str:
         return f"L{self.index} {self.name}"
+
+
+# ### Doorway validation helpers ###
+def normalize_doorway_shape(value: object) -> str:
+    """Return one canonical doorway shape or raise a validation error."""
+
+    if not isinstance(value, str):
+        raise ValueError("Doorway shape must be a string.")
+
+    shape = value.strip().lower()
+    if shape not in DOORWAY_SHAPES:
+        supported_shapes = ", ".join(sorted(DOORWAY_SHAPES))
+        raise ValueError(
+            f"Doorway shape must be one of: {supported_shapes}."
+        )
+    return shape
+
+
+def normalize_doorway_arch_amount(value: object) -> float:
+    """Return a finite normalized doorway arch amount."""
+
+    if isinstance(value, bool):
+        raise ValueError("Doorway arch amount must be a number.")
+    try:
+        arch_amount = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Doorway arch amount must be a number.") from error
+    if not math.isfinite(arch_amount):
+        raise ValueError("Doorway arch amount must be finite.")
+    if not MIN_DOORWAY_ARCH_AMOUNT <= arch_amount <= MAX_DOORWAY_ARCH_AMOUNT:
+        raise ValueError(
+            "Doorway arch amount must be between "
+            f"{MIN_DOORWAY_ARCH_AMOUNT:g} and {MAX_DOORWAY_ARCH_AMOUNT:g}."
+        )
+    return arch_amount
 
 
 # ### Window validation helpers ###

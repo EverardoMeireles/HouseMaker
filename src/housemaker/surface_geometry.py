@@ -12,15 +12,15 @@ import trimesh
 from shapely import LineString, Point, Polygon
 
 from housemaker.glb import (
+    DoorwayReveal,
     WALL_OPENING_EPSILON,
     WallOpening,
     WindowReveal,
+    _build_level_doorway_reveals,
     _build_level_window_reveals,
     _build_wall_opening_reveal_quads,
     _build_visible_wall_pieces,
     _build_level_wall_openings,
-    _build_wall_openings,
-    _clip_wall_segment_to_opening,
     _interpolate_2d_point,
 )
 from housemaker.level_coordinates import (
@@ -42,7 +42,6 @@ SURFACE_GEOMETRY_EPSILON = 1e-8
 MIN_WINDOW_SIZE_METERS = 0.05
 WINDOW_PLANE_DISTANCE_TOLERANCE_METERS = 0.01
 WINDOW_PATCH_COVERAGE_TOLERANCE_METERS = 1e-7
-DOORWAY_REVEAL_PARALLEL_COSINE = math.cos(math.radians(10.0))
 SURFACE_INTERIOR_PROBE_RATIOS = (1e-7, 1e-6, 1e-5, 1e-4, 1e-3)
 
 
@@ -106,13 +105,6 @@ class WallWindowPlacement:
             object.__setattr__(self, field_name, getattr(validated, field_name))
 
 
-@dataclass(frozen=True)
-class _SurfaceWallDefinition:
-    surface_id: str
-    start_point: tuple[float, float]
-    end_point: tuple[float, float]
-
-
 # ### Public surface builders ###
 def build_fixed_surfaces(levels: Sequence[LevelData]) -> list[FixedSurface]:
     """Build walls, floors, and ceilings with stable semantic identities."""
@@ -123,7 +115,12 @@ def build_fixed_surfaces(levels: Sequence[LevelData]) -> list[FixedSurface]:
         if not level.include_in_export:
             continue
         base_z_meters = level_base_z.get(level.index, 0.0)
-        reveal_owner_by_opening_index = _build_doorway_reveal_owner_lookup(level)
+        doorway_reveals_by_surface_id = _group_doorway_reveals_by_surface_id(
+            _build_level_doorway_reveals(
+                level,
+                include_single_wall_fallback=True,
+            )
+        )
         window_reveals_by_surface_id = _group_window_reveals_by_surface_id(
             _build_level_window_reveals(level)
         )
@@ -131,7 +128,7 @@ def build_fixed_surfaces(levels: Sequence[LevelData]) -> list[FixedSurface]:
             _build_plain_level_wall_surfaces(
                 level,
                 base_z_meters,
-                reveal_owner_by_opening_index,
+                doorway_reveals_by_surface_id,
                 window_reveals_by_surface_id,
             )
         )
@@ -142,8 +139,8 @@ def build_fixed_surfaces(levels: Sequence[LevelData]) -> list[FixedSurface]:
                     room=room,
                     room_index=room_index,
                     base_z_meters=base_z_meters,
-                    reveal_owner_by_opening_index=(
-                        reveal_owner_by_opening_index
+                    doorway_reveals_by_surface_id=(
+                        doorway_reveals_by_surface_id
                     ),
                     window_reveals_by_surface_id=(
                         window_reveals_by_surface_id
@@ -370,12 +367,14 @@ def _build_room_surfaces(
     room: RoomData,
     room_index: int,
     base_z_meters: float,
-    reveal_owner_by_opening_index: Mapping[int, str],
+    doorway_reveals_by_surface_id: Mapping[
+        str,
+        Sequence[DoorwayReveal],
+    ],
     window_reveals_by_surface_id: Mapping[str, Sequence[WindowReveal]],
 ) -> list[FixedSurface]:
     surfaces: list[FixedSurface] = []
     room_identity = room.center_vertex_id
-    doorway_openings = _build_wall_openings(level.doorways)
     wall_openings = _build_level_wall_openings(level)
     room_polygon = _build_room_world_polygon(level, room)
     for wall in build_room_walls(room, level.vertex_data):
@@ -386,11 +385,10 @@ def _build_room_surfaces(
             wall_key=wall.key,
             wall_height_meters=room.height_meters,
             base_z_meters=base_z_meters,
-            doorway_openings=doorway_openings,
             wall_openings=wall_openings,
             room_index=room_index,
             room_identity=room_identity,
-            reveal_owner_by_opening_index=reveal_owner_by_opening_index,
+            doorway_reveals_by_surface_id=doorway_reveals_by_surface_id,
             interior_polygon=room_polygon,
             window_reveals_by_surface_id=window_reveals_by_surface_id,
         )
@@ -435,12 +433,14 @@ def _build_room_surfaces(
 def _build_plain_level_wall_surfaces(
     level: LevelData,
     base_z_meters: float,
-    reveal_owner_by_opening_index: Mapping[int, str],
+    doorway_reveals_by_surface_id: Mapping[
+        str,
+        Sequence[DoorwayReveal],
+    ],
     window_reveals_by_surface_id: Mapping[str, Sequence[WindowReveal]],
 ) -> list[FixedSurface]:
     room_vertex_sets = [set(room.vertex_ids) for room in level.rooms]
     ignored_vertex_ids = {room.center_vertex_id for room in level.rooms}
-    doorway_openings = _build_wall_openings(level.doorways)
     wall_openings = _build_level_wall_openings(level)
     interior_polygon = _build_level_contour_world_polygon(level)
     vertex_lookup = {vertex.id: vertex for vertex in level.vertex_data.vertices}
@@ -471,11 +471,10 @@ def _build_plain_level_wall_surfaces(
             wall_key=wall_key,
             wall_height_meters=level.height_meters,
             base_z_meters=base_z_meters,
-            doorway_openings=doorway_openings,
             wall_openings=wall_openings,
             room_index=None,
             room_identity=None,
-            reveal_owner_by_opening_index=reveal_owner_by_opening_index,
+            doorway_reveals_by_surface_id=doorway_reveals_by_surface_id,
             interior_polygon=interior_polygon,
             window_reveals_by_surface_id=window_reveals_by_surface_id,
         )
@@ -496,83 +495,16 @@ def _group_window_reveals_by_surface_id(
     }
 
 
-def _build_doorway_reveal_owner_lookup(level: LevelData) -> dict[int, str]:
-    """Assign each reveal tunnel to one stable intersecting wall surface."""
-
-    openings = _build_wall_openings(level.doorways)
-    wall_definitions = _build_level_surface_wall_definitions(level)
-    owner_by_opening_index: dict[int, str] = {}
-    for opening_index, opening in enumerate(openings):
-        candidates = [
-            wall
-            for wall in wall_definitions
-            if _wall_is_parallel_to_doorway_width(
-                wall.start_point,
-                wall.end_point,
-                opening,
-            )
-            and _clip_wall_segment_to_opening(
-                start_point=wall.start_point,
-                end_point=wall.end_point,
-                doorway_opening=opening,
-            )
-            is not None
-        ]
-        if candidates:
-            owner_by_opening_index[opening_index] = min(
-                candidates,
-                key=lambda wall: wall.surface_id,
-            ).surface_id
-    return owner_by_opening_index
-
-
-def _build_level_surface_wall_definitions(
-    level: LevelData,
-) -> list[_SurfaceWallDefinition]:
-    definitions: list[_SurfaceWallDefinition] = []
-    room_vertex_sets = [set(room.vertex_ids) for room in level.rooms]
-    ignored_vertex_ids = {room.center_vertex_id for room in level.rooms}
-    vertex_lookup = {vertex.id: vertex for vertex in level.vertex_data.vertices}
-    for edge in level.vertex_data.edges:
-        if (
-            edge.start_vertex_id in ignored_vertex_ids
-            or edge.end_vertex_id in ignored_vertex_ids
-            or any(
-                edge.start_vertex_id in vertex_ids
-                and edge.end_vertex_id in vertex_ids
-                for vertex_ids in room_vertex_sets
-            )
-        ):
-            continue
-        start_vertex = vertex_lookup.get(edge.start_vertex_id)
-        end_vertex = vertex_lookup.get(edge.end_vertex_id)
-        if start_vertex is None or end_vertex is None:
-            continue
-        wall_key = (
-            f"{min(edge.start_vertex_id, edge.end_vertex_id)}:"
-            f"{max(edge.start_vertex_id, edge.end_vertex_id)}"
-        )
-        definitions.append(
-            _SurfaceWallDefinition(
-                surface_id=build_wall_surface_id(level.index, wall_key),
-                start_point=(start_vertex.x, start_vertex.y),
-                end_point=(end_vertex.x, end_vertex.y),
-            )
-        )
-    for room in level.rooms:
-        definitions.extend(
-            _SurfaceWallDefinition(
-                surface_id=build_wall_surface_id(
-                    level.index,
-                    wall.key,
-                    room.center_vertex_id,
-                ),
-                start_point=wall.start_point,
-                end_point=wall.end_point,
-            )
-            for wall in build_room_walls(room, level.vertex_data)
-        )
-    return definitions
+def _group_doorway_reveals_by_surface_id(
+    reveals: Sequence[DoorwayReveal],
+) -> dict[str, tuple[DoorwayReveal, ...]]:
+    grouped: dict[str, list[DoorwayReveal]] = {}
+    for reveal in reveals:
+        grouped.setdefault(reveal.owner_surface_id, []).append(reveal)
+    return {
+        surface_id: tuple(surface_reveals)
+        for surface_id, surface_reveals in grouped.items()
+    }
 
 
 # ### Window placement helpers ###
@@ -713,11 +645,13 @@ def _build_wall_surface(
     wall_key: str,
     wall_height_meters: float,
     base_z_meters: float,
-    doorway_openings: Sequence[WallOpening],
     wall_openings: Sequence[WallOpening],
     room_index: int | None,
     room_identity: int | None,
-    reveal_owner_by_opening_index: Mapping[int, str],
+    doorway_reveals_by_surface_id: Mapping[
+        str,
+        Sequence[DoorwayReveal],
+    ],
     interior_polygon: Polygon | None,
     window_reveals_by_surface_id: Mapping[str, Sequence[WindowReveal]],
 ) -> FixedSurface | None:
@@ -737,25 +671,21 @@ def _build_wall_surface(
         doorway_openings=wall_openings,
         wall_key=wall_key,
     ):
-        piece_start = _interpolate_2d_point(
-            start_point,
-            end_point,
-            wall_piece.start_ratio,
+        corners = tuple(
+            (
+                *level_image_to_world_xy(
+                    level,
+                    *_interpolate_2d_point(
+                        start_point,
+                        end_point,
+                        wall_ratio,
+                    ),
+                ),
+                base_z_meters + height_meters,
+            )
+            for wall_ratio, height_meters in wall_piece.points
         )
-        piece_end = _interpolate_2d_point(
-            start_point,
-            end_point,
-            wall_piece.end_ratio,
-        )
-        start_world = level_image_to_world_xy(level, *piece_start)
-        end_world = level_image_to_world_xy(level, *piece_end)
-        corners = (
-            (*start_world, base_z_meters + wall_piece.bottom_height_meters),
-            (*end_world, base_z_meters + wall_piece.bottom_height_meters),
-            (*end_world, base_z_meters + wall_piece.top_height_meters),
-            (*start_world, base_z_meters + wall_piece.top_height_meters),
-        )
-        _append_quad(
+        _append_polygon(
             vertices,
             faces,
             corners,
@@ -768,18 +698,13 @@ def _build_wall_surface(
         )
 
     surface_id = build_wall_surface_id(level.index, wall_key, room_identity)
-    for opening_index, doorway_opening in enumerate(doorway_openings):
-        if reveal_owner_by_opening_index.get(opening_index) != surface_id:
-            continue
+    for doorway_reveal in doorway_reveals_by_surface_id.get(surface_id, ()):
         _append_connected_doorway_reveals(
             vertices=vertices,
             faces=faces,
             level=level,
-            wall_start=start_point,
-            wall_end=end_point,
-            wall_height_meters=wall_height_meters,
             base_z_meters=base_z_meters,
-            doorway_opening=doorway_opening,
+            doorway_reveal=doorway_reveal,
         )
 
     for window_reveal in window_reveals_by_surface_id.get(surface_id, ()):
@@ -827,6 +752,7 @@ def _append_connected_window_reveals(
 ) -> None:
     for image_quad in _build_wall_opening_reveal_quads(
         window_reveal.reveal_pair,
+        window_reveal.opening,
         include_sill=True,
     ):
         world_quad = tuple(
@@ -855,124 +781,26 @@ def _append_connected_doorway_reveals(
     vertices: list[list[float]],
     faces: list[list[int]],
     level: LevelData,
-    wall_start: tuple[float, float],
-    wall_end: tuple[float, float],
-    wall_height_meters: float,
     base_z_meters: float,
-    doorway_opening: WallOpening,
+    doorway_reveal: DoorwayReveal,
 ) -> None:
-    interval = _clip_wall_segment_to_opening(
-        start_point=wall_start,
-        end_point=wall_end,
-        doorway_opening=doorway_opening,
-    )
-    if interval is None or not _wall_is_parallel_to_doorway_width(
-        wall_start,
-        wall_end,
-        doorway_opening,
+    for image_quad in _build_wall_opening_reveal_quads(
+        doorway_reveal.reveal_pair,
+        doorway_reveal.opening,
+        include_sill=False,
     ):
-        return
-
-    opening_height = min(doorway_opening.height_meters, wall_height_meters)
-    if opening_height <= SURFACE_GEOMETRY_EPSILON:
-        return
-    low_width = -doorway_opening.half_width_pixels
-    high_width = doorway_opening.half_width_pixels
-    negative_depth = -doorway_opening.half_depth_pixels
-    positive_depth = doorway_opening.half_depth_pixels
-    low_negative = _doorway_local_to_world(
-        level,
-        doorway_opening,
-        low_width,
-        negative_depth,
-    )
-    low_positive = _doorway_local_to_world(
-        level,
-        doorway_opening,
-        low_width,
-        positive_depth,
-    )
-    high_negative = _doorway_local_to_world(
-        level,
-        doorway_opening,
-        high_width,
-        negative_depth,
-    )
-    high_positive = _doorway_local_to_world(
-        level,
-        doorway_opening,
-        high_width,
-        positive_depth,
-    )
-    bottom_z = base_z_meters
-    top_z = base_z_meters + opening_height
-    _append_quad(
-        vertices,
-        faces,
-        (
-            (*low_negative, bottom_z),
-            (*low_positive, bottom_z),
-            (*low_positive, top_z),
-            (*low_negative, top_z),
-        ),
-    )
-    _append_quad(
-        vertices,
-        faces,
-        (
-            (*high_positive, bottom_z),
-            (*high_negative, bottom_z),
-            (*high_negative, top_z),
-            (*high_positive, top_z),
-        ),
-    )
-    _append_quad(
-        vertices,
-        faces,
-        (
-            (*low_negative, top_z),
-            (*high_negative, top_z),
-            (*high_positive, top_z),
-            (*low_positive, top_z),
-        ),
-        reverse_winding=True,
-    )
-
-
-def _wall_is_parallel_to_doorway_width(
-    wall_start: tuple[float, float],
-    wall_end: tuple[float, float],
-    doorway_opening: WallOpening,
-) -> bool:
-    delta_x = wall_end[0] - wall_start[0]
-    delta_y = wall_end[1] - wall_start[1]
-    length = math.hypot(delta_x, delta_y)
-    if length <= WALL_OPENING_EPSILON:
-        return False
-    alignment = abs(
-        delta_x / length * doorway_opening.width_direction_x
-        + delta_y / length * doorway_opening.width_direction_y
-    )
-    return alignment >= DOORWAY_REVEAL_PARALLEL_COSINE
-
-
-def _doorway_local_to_world(
-    level: LevelData,
-    doorway_opening: WallOpening,
-    width_position: float,
-    depth_position: float,
-) -> tuple[float, float]:
-    image_x = (
-        doorway_opening.center_x
-        + doorway_opening.width_direction_x * width_position
-        + doorway_opening.depth_direction_x * depth_position
-    )
-    image_y = (
-        doorway_opening.center_y
-        + doorway_opening.width_direction_y * width_position
-        + doorway_opening.depth_direction_y * depth_position
-    )
-    return level_image_to_world_xy(level, image_x, image_y)
+        world_quad = tuple(
+            (
+                *level_image_to_world_xy(
+                    level,
+                    local_point[0],
+                    local_point[1],
+                ),
+                base_z_meters + local_point[2],
+            )
+            for local_point in image_quad
+        )
+        _append_quad(vertices, faces, world_quad)
 
 
 # ### Horizontal geometry helpers ###
@@ -1169,6 +997,48 @@ def _build_polygon_from_vertices(
 
 
 # ### Mesh helpers ###
+def _append_polygon(
+    vertices: list[list[float]],
+    faces: list[list[int]],
+    corners: Sequence[tuple[float, float, float]],
+    *,
+    reverse_winding: bool = False,
+) -> None:
+    """Append one finite convex polygon using a triangle fan."""
+
+    if len(corners) < 3:
+        return
+    corner_array = np.asarray(corners, dtype=float)
+    if not np.all(np.isfinite(corner_array)):
+        return
+    vertex_offset = len(vertices)
+    forward_faces = tuple(
+        [
+            vertex_offset,
+            vertex_offset + point_index,
+            vertex_offset + point_index + 1,
+        ]
+        for point_index in range(1, len(corners) - 1)
+    )
+    if not any(
+        np.linalg.norm(
+            np.cross(
+                corner_array[face[1] - vertex_offset] - corner_array[0],
+                corner_array[face[2] - vertex_offset] - corner_array[0],
+            )
+        )
+        > SURFACE_GEOMETRY_EPSILON
+        for face in forward_faces
+    ):
+        return
+    vertices.extend(corner_array.tolist())
+    faces.extend(
+        [list(reversed(face)) for face in forward_faces]
+        if reverse_winding
+        else forward_faces
+    )
+
+
 def _append_quad(
     vertices: list[list[float]],
     faces: list[list[int]],
@@ -1208,7 +1078,7 @@ def _quad_front_points_outside_polygon(
 ) -> bool:
     """Return whether one planar quad must flip to face its local interior."""
 
-    if interior_polygon is None or interior_polygon.is_empty or len(corners) != 4:
+    if interior_polygon is None or interior_polygon.is_empty or len(corners) < 3:
         return False
     corner_array = np.asarray(corners, dtype=float)
     face_normal = np.cross(
@@ -1217,8 +1087,15 @@ def _quad_front_points_outside_polygon(
     )
     normal_xy = face_normal[:2]
     normal_length = float(np.linalg.norm(normal_xy))
-    wall_length = float(
-        np.linalg.norm(corner_array[1, :2] - corner_array[0, :2])
+    wall_length = max(
+        float(
+            np.linalg.norm(
+                corner_array[second_index, :2]
+                - corner_array[first_index, :2]
+            )
+        )
+        for first_index in range(len(corner_array))
+        for second_index in range(first_index + 1, len(corner_array))
     )
     if (
         normal_length <= SURFACE_GEOMETRY_EPSILON

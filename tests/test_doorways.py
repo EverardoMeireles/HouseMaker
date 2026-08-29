@@ -26,6 +26,9 @@ from housemaker.blueprint_canvas import BlueprintCanvas
 from housemaker.glb import convert_to_glb
 from housemaker.models import (
     DEFAULT_DOORWAY_DEPTH_METERS,
+    DEFAULT_DOORWAY_SHAPE,
+    DOORWAY_SHAPE_ARCH,
+    DOORWAY_SHAPE_RECTANGULAR,
     PIXEL_TO_METER,
     DoorwayData,
     DoorwayPreset,
@@ -33,6 +36,7 @@ from housemaker.models import (
     VertexData,
     create_default_doorway_presets,
     create_default_levels,
+    normalize_doorway_shape,
 )
 from housemaker.project_io import load_project, save_project
 from housemaker.settings_widget import (
@@ -268,6 +272,31 @@ class DoorwayTests(unittest.TestCase):
         self.widgets.append(widget)
         return widget
 
+    def test_doorway_shape_is_normalized_and_strictly_validated(self) -> None:
+        doorway = DoorwayData(
+            center_x=10.0,
+            center_y=20.0,
+            width_meters=0.9,
+            height_meters=2.1,
+            shape=" ARCH ",
+        )
+
+        self.assertEqual(doorway.shape, DOORWAY_SHAPE_ARCH)
+        self.assertEqual(
+            normalize_doorway_shape("RECTANGULAR"),
+            DOORWAY_SHAPE_RECTANGULAR,
+        )
+        for invalid_shape in (None, True, "", "rounded", 1):
+            with self.subTest(invalid_shape=invalid_shape):
+                with self.assertRaisesRegex(ValueError, "Doorway shape"):
+                    DoorwayData(
+                        center_x=10.0,
+                        center_y=20.0,
+                        width_meters=0.9,
+                        height_meters=2.1,
+                        shape=invalid_shape,  # type: ignore[arg-type]
+                    )
+
     def test_project_round_trip_persists_doorway_presets_and_level_doorways(self) -> None:
         levels = create_default_levels()
         doorway_presets = [
@@ -282,6 +311,7 @@ class DoorwayTests(unittest.TestCase):
                 height_meters=2.0,
                 depth_meters=0.36,
                 rotation_degrees=90.0,
+                shape=DOORWAY_SHAPE_ARCH,
             )
         ]
 
@@ -303,6 +333,10 @@ class DoorwayTests(unittest.TestCase):
                 ],
             )
             self.assertEqual(payload["levels"][2]["doorways"][0]["depth_meters"], 0.36)
+            self.assertEqual(
+                payload["levels"][2]["doorways"][0]["shape"],
+                DOORWAY_SHAPE_ARCH,
+            )
 
             loaded_project = load_project(project_path)
             self.assertEqual(loaded_project.doorway_presets, doorway_presets)
@@ -318,6 +352,187 @@ class DoorwayTests(unittest.TestCase):
                 create_default_doorway_presets(),
             )
             self.assertEqual(legacy_project.levels[2].doorways, [])
+
+    def test_legacy_and_malformed_doorway_shapes_load_as_rectangular(self) -> None:
+        levels = create_default_levels()
+        levels[2].doorways = [
+            DoorwayData(
+                center_x=64.0,
+                center_y=32.0,
+                width_meters=0.8,
+                height_meters=2.0,
+                shape=DOORWAY_SHAPE_ARCH,
+            )
+        ]
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project_path = Path(temporary_directory) / "doorway-shapes.json"
+            save_project(
+                project_path,
+                current_level_index=2,
+                levels=levels,
+            )
+            payload = json.loads(project_path.read_text(encoding="utf-8"))
+            raw_doorway = payload["levels"][2]["doorways"][0]
+
+            raw_doorway.pop("shape")
+            project_path.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertEqual(
+                load_project(project_path).levels[2].doorways[0].shape,
+                DEFAULT_DOORWAY_SHAPE,
+            )
+
+            for malformed_shape in (None, True, "", "rounded", 1):
+                with self.subTest(malformed_shape=malformed_shape):
+                    raw_doorway["shape"] = malformed_shape
+                    project_path.write_text(
+                        json.dumps(payload),
+                        encoding="utf-8",
+                    )
+                    self.assertEqual(
+                        load_project(project_path).levels[2].doorways[0].shape,
+                        DOORWAY_SHAPE_RECTANGULAR,
+                    )
+
+    def test_canvas_reports_doorway_selection_changes_once(self) -> None:
+        doorway = DoorwayData(
+            center_x=50.0,
+            center_y=50.0,
+            width_meters=0.9,
+            height_meters=2.1,
+        )
+        canvas = self._track_widget(_build_canvas(VertexData(), [doorway]))
+        selection_changes: list[int] = []
+        canvas.selected_doorway_changed.connect(selection_changes.append)
+        doorway_position = _image_position(canvas, doorway.center_x, doorway.center_y)
+
+        QTest.mouseClick(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            pos=doorway_position,
+        )
+        QTest.mouseClick(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            pos=doorway_position,
+        )
+        self.assertEqual(selection_changes, [0])
+
+        empty_position = _image_position(canvas, 10.0, 10.0)
+        QTest.mouseClick(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            pos=empty_position,
+        )
+        QTest.mouseClick(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            pos=empty_position,
+        )
+        self.assertEqual(selection_changes, [0, -1])
+
+    def test_canvas_changes_selected_doorway_shape_as_one_preview_edit(
+        self,
+    ) -> None:
+        doorway = DoorwayData(
+            center_x=50.0,
+            center_y=50.0,
+            width_meters=0.9,
+            height_meters=2.1,
+        )
+        canvas = self._track_widget(_build_canvas(VertexData(), [doorway]))
+        preview_changes: list[None] = []
+        committed_changes: list[None] = []
+        selection_changes: list[int] = []
+        canvas.doorway_dimension_preview_changed.connect(
+            lambda: preview_changes.append(None)
+        )
+        canvas.doorways_changed.connect(lambda: committed_changes.append(None))
+        canvas.selected_doorway_changed.connect(selection_changes.append)
+        original_plan_corners = canvas._get_doorway_corners(doorway)
+
+        self.assertFalse(canvas.set_selected_doorway_shape(DOORWAY_SHAPE_ARCH))
+        self.assertEqual(canvas.undo_stack, [])
+
+        QTest.mouseClick(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            pos=_image_position(canvas, doorway.center_x, doorway.center_y),
+        )
+        self.assertTrue(canvas.set_selected_doorway_shape(" ARCH "))
+        self.assertEqual(canvas.doorways[0].shape, DOORWAY_SHAPE_ARCH)
+        self.assertEqual(len(canvas.undo_stack), 1)
+        self.assertEqual(preview_changes, [None])
+        self.assertEqual(committed_changes, [])
+        self.assertEqual(selection_changes, [0])
+        self.assertEqual(
+            canvas._get_doorway_corners(canvas.doorways[0]),
+            original_plan_corners,
+        )
+        self.assertTrue(
+            canvas._get_doorway_label_text(canvas.doorways[0]).startswith(
+                "Arch 100%\n"
+            )
+        )
+
+        self.assertFalse(canvas.set_selected_doorway_shape(DOORWAY_SHAPE_ARCH))
+        self.assertEqual(len(canvas.undo_stack), 1)
+        self.assertEqual(preview_changes, [None])
+
+        canvas.undo_last_step()
+
+        self.assertEqual(canvas.doorways[0].shape, DOORWAY_SHAPE_RECTANGULAR)
+        self.assertEqual(committed_changes, [None])
+        self.assertEqual(selection_changes, [0, -1])
+        self.assertTrue(
+            canvas._get_doorway_label_text(canvas.doorways[0]).startswith(
+                "Doorway\n"
+            )
+        )
+
+    def test_arch_shape_survives_wheel_height_and_width_drag_edits(self) -> None:
+        doorway = DoorwayData(
+            center_x=50.0,
+            center_y=50.0,
+            width_meters=0.9,
+            height_meters=2.1,
+            depth_meters=0.2,
+            rotation_degrees=0.0,
+            shape=DOORWAY_SHAPE_ARCH,
+            arch_amount=0.4,
+        )
+        canvas = self._track_widget(_build_canvas(VertexData(), [doorway]))
+        doorway_position = _image_position(canvas, doorway.center_x, doorway.center_y)
+        QTest.mouseClick(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            pos=doorway_position,
+        )
+
+        _send_wheel_event(canvas, doorway_position, 120)
+        self.assertEqual(canvas.doorways[0].shape, DOORWAY_SHAPE_ARCH)
+        self.assertEqual(canvas.doorways[0].arch_amount, 0.4)
+
+        width_border_position = _image_position(
+            canvas,
+            *_get_width_border_image_position(canvas.doorways[0]),
+        )
+        resized_position = _image_position(canvas, doorway.center_x, 85.0)
+        QTest.mousePress(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            pos=width_border_position,
+        )
+        _send_drag_move(canvas, resized_position)
+        QTest.mouseRelease(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            pos=resized_position,
+        )
+
+        self.assertEqual(canvas.doorways[0].shape, DOORWAY_SHAPE_ARCH)
+        self.assertEqual(canvas.doorways[0].arch_amount, 0.4)
+        self.assertGreater(canvas.doorways[0].width_meters, doorway.width_meters)
 
     def test_canvas_auto_aligns_doorway_to_wall_and_wheel_zooms(self) -> None:
         vertex_data = VertexData()

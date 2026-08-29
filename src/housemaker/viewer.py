@@ -76,7 +76,6 @@ WINDOW_VALID_PREVIEW_COLOR = (0.20, 0.86, 0.38, 0.34)
 WINDOW_INVALID_PREVIEW_COLOR = (1.0, 0.24, 0.20, 0.34)
 DOORWAY_PREVIEW_OUTLINE_COLOR = (1.0, 0.72, 0.18, 0.98)
 DOORWAY_PREVIEW_OUTLINE_WIDTH = 3.0
-DOORWAY_PREVIEW_OUTLINE_POSITION_COUNT = 24
 SYMMETRIC_PREVIEW_MIN_OPACITY = 0.12
 SYMMETRIC_PREVIEW_MAX_OPACITY = 0.72
 SYMMETRIC_PREVIEW_FADE_PERIOD_MILLISECONDS = 2_000
@@ -1272,7 +1271,7 @@ class GlbViewerWidget(QWidget):
 
     # ### Doorway preview outline API ###
     def set_doorway_preview_outline(self, positions: object | None) -> None:
-        """Set or explicitly clear one transient doorway wireframe prism."""
+        """Set or explicitly clear one transient doorway wireframe outline."""
 
         if positions is None:
             self._doorway_preview_outline_positions = None
@@ -3200,11 +3199,12 @@ class GlbViewerWidget(QWidget):
         texture_rgba = np.asarray(textured_wall.texture_rgba, dtype=np.ubyte)
         if texture_rgba.ndim != 3 or texture_rgba.shape[2] != 4:
             return
+        texture_is_opaque = bool(np.all(texture_rgba[:, :, 3] == 255))
 
         image_item = gl.GLImageItem(
             texture_rgba,
             smooth=True,
-            glOptions="opaque",
+            glOptions="opaque" if texture_is_opaque else "translucent",
         )
         image_item.setTransform(
             _build_textured_wall_transform(
@@ -3369,7 +3369,7 @@ class GlbViewerWidget(QWidget):
 def _normalize_doorway_preview_outline_positions(
     positions: object,
 ) -> np.ndarray:
-    """Own one finite set of paired positions for a doorway wireframe box."""
+    """Own finite paired XYZ positions for one doorway wireframe outline."""
 
     try:
         raw_positions = np.asarray(positions, dtype=float)
@@ -3377,11 +3377,16 @@ def _normalize_doorway_preview_outline_positions(
         raise ValueError(
             "A doorway preview outline requires numeric XYZ positions."
         ) from error
-    expected_shape = (DOORWAY_PREVIEW_OUTLINE_POSITION_COUNT, 3)
-    if raw_positions.shape != expected_shape:
+    if raw_positions.ndim != 2 or raw_positions.shape[1] != 3:
         raise ValueError(
-            "A doorway preview outline requires exactly 24 paired XYZ "
-            "positions."
+            "A doorway preview outline requires paired XYZ positions shaped "
+            "(N, 3)."
+        )
+    position_count = raw_positions.shape[0]
+    if position_count < 2 or position_count % 2 != 0:
+        raise ValueError(
+            "A doorway preview outline requires an even number of at least "
+            "two paired XYZ positions."
         )
     if not np.all(np.isfinite(raw_positions)):
         raise ValueError(

@@ -13,8 +13,10 @@ from housemaker.generation_state import GenerationData
 from housemaker.surface_texture_state import SurfaceTextureData
 from housemaker.texture_atlas_state import TextureAtlasData
 from housemaker.models import (
+    DEFAULT_DOORWAY_ARCH_AMOUNT,
     DEFAULT_DOORWAY_DEPTH_METERS,
     DEFAULT_DOORWAY_HEIGHT_METERS,
+    DEFAULT_DOORWAY_SHAPE,
     DEFAULT_DOORWAY_WIDTH_METERS,
     DEFAULT_FLOOR_THICKNESS_METERS,
     DEFAULT_INCLUDE_IN_EXPORT,
@@ -48,6 +50,8 @@ from housemaker.models import (
     WindowData,
     create_default_doorway_presets,
     create_default_levels,
+    normalize_doorway_arch_amount,
+    normalize_doorway_shape,
 )
 
 # ### Constants ###
@@ -563,7 +567,7 @@ def _deserialize_doorway_presets(raw_presets: object) -> list[DoorwayPreset]:
     return doorway_presets
 
 
-def _serialize_doorway(doorway: DoorwayData) -> dict[str, float]:
+def _serialize_doorway(doorway: DoorwayData) -> dict[str, float | str]:
     return {
         "center_x": float(doorway.center_x),
         "center_y": float(doorway.center_y),
@@ -571,6 +575,8 @@ def _serialize_doorway(doorway: DoorwayData) -> dict[str, float]:
         "height_meters": float(doorway.height_meters),
         "depth_meters": float(doorway.depth_meters),
         "rotation_degrees": float(doorway.rotation_degrees),
+        "shape": doorway.shape,
+        "arch_amount": float(doorway.arch_amount),
     }
 
 
@@ -613,10 +619,33 @@ def _deserialize_doorways(raw_doorways: object) -> list[DoorwayData]:
                 rotation_degrees=_deserialize_doorway_rotation_degrees(
                     raw_doorway.get("rotation_degrees", 0.0)
                 ),
+                shape=_deserialize_doorway_shape(
+                    raw_doorway.get("shape", DEFAULT_DOORWAY_SHAPE)
+                ),
+                arch_amount=_deserialize_doorway_arch_amount(
+                    raw_doorway.get(
+                        "arch_amount",
+                        DEFAULT_DOORWAY_ARCH_AMOUNT,
+                    )
+                ),
             )
         )
 
     return doorways
+
+
+def _deserialize_doorway_shape(raw_shape: object) -> str:
+    try:
+        return normalize_doorway_shape(raw_shape)
+    except ValueError:
+        return DEFAULT_DOORWAY_SHAPE
+
+
+def _deserialize_doorway_arch_amount(raw_arch_amount: object) -> float:
+    try:
+        return normalize_doorway_arch_amount(raw_arch_amount)
+    except ValueError:
+        return DEFAULT_DOORWAY_ARCH_AMOUNT
 
 
 def _deserialize_doorway_coordinate(raw_coordinate: object) -> float | None:
