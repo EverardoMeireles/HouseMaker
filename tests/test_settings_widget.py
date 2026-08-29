@@ -18,9 +18,14 @@ from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.settings_widget import (
     CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY_SETTING_KEY,
     DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY,
+    DEFAULT_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
+    DOORWAY_MESH_UPDATE_DELAY_SECONDS_SETTING_KEY,
+    DOORWAY_MESH_UPDATE_DELAY_STEP_SECONDS,
     FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY,
+    MAX_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
     MESHY_API_KEY_ENVIRONMENT_VARIABLE,
     MESHY_API_KEY_SETTING_KEY,
+    MIN_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
     OPENAI_API_KEY_ENVIRONMENT_VARIABLE,
     OPENAI_API_KEY_SETTING_KEY,
     UNUSED_FACE_REMOVAL_SETTING_KEY,
@@ -31,6 +36,7 @@ from housemaker.settings_widget import (
     SettingsWidget,
     fullscreen_3d_viewer_screen_id,
     read_canvas_3d_navigation_toggle_hotkey,
+    read_doorway_mesh_update_delay_seconds,
     read_unused_face_removal,
 )
 
@@ -61,6 +67,9 @@ class SettingsWidgetTests(unittest.TestCase):
                     widget,
                     "canvas_3d_navigation_toggle_hotkey_edit",
                 )
+            )
+            self.assertTrue(
+                hasattr(widget, "doorway_mesh_update_delay_spinbox")
             )
             self.assertFalse(hasattr(widget, "surface_texture_provider_combo"))
             self.assertTrue(hasattr(widget, "unused_face_removal_checkbox"))
@@ -163,6 +172,120 @@ class SettingsWidgetTests(unittest.TestCase):
             application_settings.set(UNUSED_FACE_REMOVAL_SETTING_KEY, "yes")
 
             self.assertFalse(read_unused_face_removal(application_settings))
+
+    def test_doorway_mesh_update_delay_persists_and_emits_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            widget = SettingsWidget(
+                application_settings=application_settings,
+                environment={},
+            )
+            emitted_changes: list[bool] = []
+            widget.settings_changed.connect(
+                lambda: emitted_changes.append(True)
+            )
+
+            self.assertEqual(
+                widget.get_settings().doorway_mesh_update_delay_seconds,
+                DEFAULT_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
+            )
+            self.assertFalse(
+                widget.doorway_mesh_update_delay_spinbox.keyboardTracking()
+            )
+            self.assertEqual(
+                widget.doorway_mesh_update_delay_spinbox.minimum(),
+                MIN_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
+            )
+            self.assertEqual(
+                widget.doorway_mesh_update_delay_spinbox.maximum(),
+                MAX_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
+            )
+            self.assertEqual(
+                widget.doorway_mesh_update_delay_spinbox.singleStep(),
+                DOORWAY_MESH_UPDATE_DELAY_STEP_SECONDS,
+            )
+            self.assertEqual(
+                widget.doorway_mesh_update_delay_spinbox.suffix(),
+                " s",
+            )
+            widget.doorway_mesh_update_delay_spinbox.setValue(2.4)
+
+            self.assertEqual(
+                application_settings.get(
+                    DOORWAY_MESH_UPDATE_DELAY_SECONDS_SETTING_KEY
+                ),
+                2.4,
+            )
+            self.assertEqual(
+                widget.get_settings().doorway_mesh_update_delay_seconds,
+                2.4,
+            )
+            self.assertEqual(emitted_changes, [True])
+
+            restored = SettingsWidget(
+                application_settings=_build_test_settings(temporary_directory),
+                environment={},
+            )
+            self.assertEqual(
+                restored.get_settings().doorway_mesh_update_delay_seconds,
+                2.4,
+            )
+
+    def test_doorway_mesh_update_delay_rejects_malformed_values(self) -> None:
+        invalid_values: tuple[object, ...] = (
+            True,
+            "1.0",
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            MIN_DOORWAY_MESH_UPDATE_DELAY_SECONDS - 0.01,
+            MAX_DOORWAY_MESH_UPDATE_DELAY_SECONDS + 0.01,
+        )
+        for value in invalid_values:
+            with self.subTest(model_value=value):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "Doorway mesh update delay",
+                ):
+                    GenerationServiceSettings(
+                        doorway_mesh_update_delay_seconds=(
+                            value  # type: ignore[arg-type]
+                        )
+                    )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            for value in invalid_values:
+                with self.subTest(persisted_value=value):
+                    application_settings.set(
+                        DOORWAY_MESH_UPDATE_DELAY_SECONDS_SETTING_KEY,
+                        value,
+                    )
+                    self.assertEqual(
+                        read_doorway_mesh_update_delay_seconds(
+                            application_settings
+                        ),
+                        DEFAULT_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
+                    )
+
+    def test_doorway_mesh_update_delay_accepts_range_boundaries(self) -> None:
+        for value in (
+            MIN_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
+            MAX_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    GenerationServiceSettings(
+                        doorway_mesh_update_delay_seconds=value
+                    ).doorway_mesh_update_delay_seconds,
+                    value,
+                )
+        self.assertIsInstance(
+            GenerationServiceSettings(
+                doorway_mesh_update_delay_seconds=1
+            ).doorway_mesh_update_delay_seconds,
+            float,
+        )
 
     def test_meshy_api_key_persists_in_application_json(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -1,8 +1,9 @@
 # ### Imports ###
 from __future__ import annotations
 
+import copy
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from functools import partial
 from pathlib import Path
 
@@ -84,8 +85,6 @@ from housemaker.glb import (
     import_generated_glb,
 )
 from housemaker.models import (
-    DEFAULT_DOORWAY_HEIGHT_METERS,
-    DEFAULT_DOORWAY_WIDTH_METERS,
     DEFAULT_FLOOR_THICKNESS_METERS,
     DEFAULT_IMAGE_OFFSET,
     DEFAULT_IMAGE_SCALE,
@@ -98,15 +97,12 @@ from housemaker.models import (
     DEFAULT_WALL_UV_ROTATION_DEGREES,
     DEFAULT_WALL_UV_SCALE,
     GROUND_LEVEL_INDEX,
+    DoorwayData,
     DoorwayPreset,
     LevelData,
-    MAX_DOORWAY_HEIGHT_METERS,
-    MAX_DOORWAY_WIDTH_METERS,
     MAX_FLOOR_THICKNESS_METERS,
     MAX_LEVEL_OFFSET_METERS,
     MAX_LEVEL_SCALE,
-    MIN_DOORWAY_HEIGHT_METERS,
-    MIN_DOORWAY_WIDTH_METERS,
     MIN_FLOOR_THICKNESS_METERS,
     MIN_LEVEL_OFFSET_METERS,
     MIN_LEVEL_SCALE,
@@ -121,12 +117,14 @@ from housemaker.models import (
     create_default_levels,
 )
 from housemaker.level_coordinates import (
+    build_doorway_world_outline_positions,
     build_level_base_z_lookup,
     level_image_to_world_xy,
     level_world_to_image_xy,
 )
 from housemaker.project_io import ProjectData, load_project, save_project
 from housemaker.settings_widget import (
+    DEFAULT_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
     SettingsWidget,
     resolve_fullscreen_3d_viewer_screen,
 )
@@ -297,6 +295,27 @@ class BlueprintWorkspace(QWidget):
             None
         )
         self._viewer_preview_dependency_signature_revision = -1
+        # Doorway dimensions remain live in project data while this separate
+        # snapshot controls which openings have reached the expensive 3D mesh.
+        self._viewer_doorways_by_level_index: dict[
+            int,
+            tuple[DoorwayData, ...],
+        ] = {}
+        self._reset_viewer_doorway_snapshots()
+        self._doorway_mesh_update_delay_seconds = (
+            DEFAULT_DOORWAY_MESH_UPDATE_DELAY_SECONDS
+        )
+        self._is_doorway_dimension_drag_active = False
+        self._pending_doorway_mesh_level_index: int | None = None
+        self._doorway_outline_commit_revision: int | None = None
+        self._doorway_mesh_update_timer = QTimer(self)
+        self._doorway_mesh_update_timer.setSingleShot(True)
+        self._doorway_mesh_update_timer.setInterval(
+            round(self._doorway_mesh_update_delay_seconds * 1000.0)
+        )
+        self._doorway_mesh_update_timer.timeout.connect(
+            self._commit_pending_doorway_mesh_update
+        )
         self._canvas_3d_viewer_is_external = False
         self._atlas_generation_signature: tuple[tuple[object, ...], ...] | None = None
         self._atlas_source_content_paths: (
@@ -342,6 +361,7 @@ class BlueprintWorkspace(QWidget):
         if self._is_shutdown:
             return
         self._is_shutdown = True
+        self._cancel_pending_doorway_mesh_update(clear_outline=True)
         try:
             self.settings_widget.settings_changed.disconnect(
                 self._handle_generation_settings_changed
@@ -441,6 +461,9 @@ class BlueprintWorkspace(QWidget):
             application_settings=self._application_settings
         )
         generation_settings = self.settings_widget.get_settings()
+        self._set_doorway_mesh_update_delay_seconds(
+            generation_settings.doorway_mesh_update_delay_seconds
+        )
         self._set_canvas_3d_navigation_shortcut(
             generation_settings.canvas_3d_navigation_toggle_hotkey
         )
@@ -797,42 +820,6 @@ class BlueprintWorkspace(QWidget):
         doorway_label.setStyleSheet("font-size: 18px; font-weight: 600;")
         side_layout.addWidget(doorway_label)
 
-        doorway_dimensions_layout = QFormLayout()
-        doorway_dimensions_layout.setContentsMargins(0, 0, 0, 0)
-        doorway_dimensions_layout.setSpacing(8)
-
-        self.doorway_width_spinbox = QDoubleSpinBox()
-        self.doorway_width_spinbox.setRange(
-            MIN_DOORWAY_WIDTH_METERS,
-            MAX_DOORWAY_WIDTH_METERS,
-        )
-        self.doorway_width_spinbox.setDecimals(2)
-        self.doorway_width_spinbox.setSingleStep(0.05)
-        self.doorway_width_spinbox.setValue(DEFAULT_DOORWAY_WIDTH_METERS)
-        self.doorway_width_spinbox.setSuffix(" m")
-        self.doorway_width_spinbox.setMinimumHeight(34)
-        doorway_dimensions_layout.addRow("Width", self.doorway_width_spinbox)
-
-        self.doorway_height_spinbox = QDoubleSpinBox()
-        self.doorway_height_spinbox.setRange(
-            MIN_DOORWAY_HEIGHT_METERS,
-            MAX_DOORWAY_HEIGHT_METERS,
-        )
-        self.doorway_height_spinbox.setDecimals(2)
-        self.doorway_height_spinbox.setSingleStep(0.05)
-        self.doorway_height_spinbox.setValue(DEFAULT_DOORWAY_HEIGHT_METERS)
-        self.doorway_height_spinbox.setSuffix(" m")
-        self.doorway_height_spinbox.setMinimumHeight(34)
-        doorway_dimensions_layout.addRow("Height", self.doorway_height_spinbox)
-        side_layout.addLayout(doorway_dimensions_layout)
-
-        self.add_doorway_preset_button = QPushButton("Add preset")
-        self.add_doorway_preset_button.setMinimumHeight(40)
-        self.add_doorway_preset_button.clicked.connect(
-            self._handle_add_doorway_preset_clicked
-        )
-        side_layout.addWidget(self.add_doorway_preset_button)
-
         self.doorway_preset_list = QListWidget()
         self.doorway_preset_list.setSelectionMode(
             QAbstractItemView.SelectionMode.SingleSelection
@@ -1055,6 +1042,15 @@ class BlueprintWorkspace(QWidget):
             self._handle_floor_contour_changed
         )
         self.canvas.doorways_changed.connect(self._handle_doorways_changed)
+        self.canvas.doorway_dimension_preview_changed.connect(
+            self._handle_doorway_dimension_preview_changed
+        )
+        self.canvas.doorway_dimension_drag_started.connect(
+            self._handle_doorway_dimension_drag_started
+        )
+        self.canvas.doorway_dimension_drag_finished.connect(
+            self._handle_doorway_dimension_drag_finished
+        )
         self.canvas.first_person_camera_changed.connect(
             self._handle_canvas_first_person_camera_changed
         )
@@ -1293,7 +1289,9 @@ class BlueprintWorkspace(QWidget):
     ) -> bool:
         """Commit one validated window model to the active Canvas consumer."""
 
-        wall_targets = tuple(build_fixed_surfaces(self.levels))
+        wall_targets = tuple(
+            build_fixed_surfaces(self._build_viewer_preview_levels())
+        )
         self.viewer.set_wall_targets(wall_targets)
         self.viewer.set_model(generated_model, preserve_camera=True)
         self._mark_viewer_preview_dirty(preserve_camera=True)
@@ -1649,6 +1647,10 @@ class BlueprintWorkspace(QWidget):
         if not file_path:
             return
 
+        # Export is an explicit completion boundary, so include any doorway
+        # dimensions that were still waiting for their debounce interval.
+        self._commit_pending_doorway_mesh_update()
+
         export_path = Path(file_path)
         if export_path.suffix.lower() != ".glb":
             export_path = export_path.with_suffix(".glb")
@@ -1671,7 +1673,9 @@ class BlueprintWorkspace(QWidget):
             return
 
         self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
-        self.viewer.set_wall_targets(tuple(build_fixed_surfaces(self.levels)))
+        self.viewer.set_wall_targets(
+            tuple(build_fixed_surfaces(self._build_viewer_preview_levels()))
+        )
         self.viewer.set_model(generated_model)
         if not self._remember_current_canvas_preview_model(
             generated_model,
@@ -3171,6 +3175,7 @@ class BlueprintWorkspace(QWidget):
         self._viewer_preview_dependency_signature_revision = revision
         self._canvas_viewer_preview_revision = revision
         self._scheduled_viewer_refresh_preserve_camera = True
+        self._clear_committed_doorway_outline_if_displayed()
         return True
 
     def _build_viewer_preview_dependency_signature(
@@ -3296,6 +3301,123 @@ class BlueprintWorkspace(QWidget):
             return
         self._mark_viewer_preview_dirty(preserve_camera=preserve_camera)
 
+    # ### Debounced doorway mesh previews ###
+    @staticmethod
+    def _copy_doorways(
+        doorways: Sequence[DoorwayData],
+    ) -> tuple[DoorwayData, ...]:
+        """Own a doorway snapshot that cannot follow live Canvas mutations."""
+
+        return tuple(copy.deepcopy(tuple(doorways)))
+
+    def _reset_viewer_doorway_snapshots(self) -> None:
+        """Make every rendered doorway snapshot match the loaded project."""
+
+        self._viewer_doorways_by_level_index = {
+            level.index: self._copy_doorways(level.doorways)
+            for level in self.levels
+        }
+
+    def _build_viewer_preview_levels(self) -> list[LevelData]:
+        """Copy levels while substituting only committed doorway dimensions."""
+
+        preview_levels: list[LevelData] = []
+        for level in self.levels:
+            doorway_snapshot = self._viewer_doorways_by_level_index.get(
+                level.index
+            )
+            if doorway_snapshot is None:
+                doorway_snapshot = self._copy_doorways(level.doorways)
+                self._viewer_doorways_by_level_index[level.index] = (
+                    doorway_snapshot
+                )
+            preview_level = copy.copy(level)
+            preview_level.doorways = list(copy.deepcopy(doorway_snapshot))
+            preview_levels.append(preview_level)
+        return preview_levels
+
+    def _set_doorway_mesh_update_delay_seconds(
+        self,
+        delay_seconds: float,
+    ) -> None:
+        """Apply the setting and restart a live debounce only when it changed."""
+
+        normalized_delay = float(delay_seconds)
+        if normalized_delay <= 0.0:
+            raise ValueError("Doorway mesh update delay must be positive.")
+        if normalized_delay == self._doorway_mesh_update_delay_seconds:
+            return
+
+        timer_was_active = self._doorway_mesh_update_timer.isActive()
+        self._doorway_mesh_update_delay_seconds = normalized_delay
+        self._doorway_mesh_update_timer.setInterval(
+            max(1, round(normalized_delay * 1000.0))
+        )
+        if timer_was_active:
+            self._doorway_mesh_update_timer.start()
+
+    def _cancel_pending_doorway_mesh_update(
+        self,
+        clear_outline: bool = True,
+    ) -> None:
+        """Cancel transient doorway work and optionally remove its outline."""
+
+        self._doorway_mesh_update_timer.stop()
+        self._pending_doorway_mesh_level_index = None
+        if not clear_outline:
+            return
+        self._doorway_outline_commit_revision = None
+        self.viewer.set_doorway_preview_outline(None)
+
+    def _clear_committed_doorway_outline_if_displayed(self) -> None:
+        """Clear an outline only after Canvas displays its committed revision."""
+
+        target_revision = self._doorway_outline_commit_revision
+        if (
+            target_revision is None
+            or self._pending_doorway_mesh_level_index is not None
+            or self._canvas_viewer_preview_revision < target_revision
+        ):
+            return
+        self._doorway_outline_commit_revision = None
+        self.viewer.set_doorway_preview_outline(None)
+
+    def _commit_pending_doorway_mesh_update(self) -> None:
+        """Commit the latest stable doorway dimensions to the 3D mesh cache."""
+
+        self._doorway_mesh_update_timer.stop()
+        level_index = self._pending_doorway_mesh_level_index
+        self._pending_doorway_mesh_level_index = None
+        if level_index is None:
+            return
+
+        level = next(
+            (
+                candidate
+                for candidate in self.levels
+                if candidate.index == level_index
+            ),
+            None,
+        )
+        if level is None:
+            self._doorway_outline_commit_revision = None
+            self.viewer.set_doorway_preview_outline(None)
+            return
+
+        next_snapshot = self._copy_doorways(level.doorways)
+        if (
+            self._viewer_doorways_by_level_index.get(level.index)
+            == next_snapshot
+        ):
+            self._clear_committed_doorway_outline_if_displayed()
+            if self._doorway_outline_commit_revision is None:
+                self.viewer.set_doorway_preview_outline(None)
+            return
+
+        self._viewer_doorways_by_level_index[level.index] = next_snapshot
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
+        self._doorway_outline_commit_revision = self._viewer_preview_revision
+
     def _build_generated_model(
         self,
         failure_title: str | None,
@@ -3328,7 +3450,7 @@ class BlueprintWorkspace(QWidget):
 
         try:
             base_model = convert_to_preview_model(
-                self.levels,
+                self._build_viewer_preview_levels(),
                 stairs=self.stairs,
                 surface_materials=(
                     self.surface_texture_generation.get_surface_material_sources()
@@ -3431,6 +3553,7 @@ class BlueprintWorkspace(QWidget):
         if not canvas_is_stale and not surface_is_stale:
             return
 
+        preview_levels = self._build_viewer_preview_levels()
         if self._viewer_preview_model_revision != revision:
             dependency_signature_before = (
                 self._build_viewer_preview_dependency_signature()
@@ -3457,7 +3580,7 @@ class BlueprintWorkspace(QWidget):
                 self.viewer.clear_model()
             else:
                 self.viewer.set_wall_targets(
-                    tuple(build_fixed_surfaces(self.levels))
+                    tuple(build_fixed_surfaces(preview_levels))
                 )
                 self.viewer.set_model(
                     generated_model,
@@ -3466,10 +3589,11 @@ class BlueprintWorkspace(QWidget):
             self._canvas_viewer_preview_revision = revision
             self._scheduled_viewer_refresh_preserve_camera = True
             self._sync_canvas_window_undo_availability()
+            self._clear_committed_doorway_outline_if_displayed()
 
         if surface_is_stale:
             self.surface_texture_generation.set_preview_context(
-                self.levels,
+                preview_levels,
                 self.initial_first_person_camera,
                 generated_model,
             )
@@ -3888,7 +4012,9 @@ class BlueprintWorkspace(QWidget):
 
     def _update_doorway_preset_button_state(self) -> None:
         has_selected_preset = self._get_selected_doorway_preset() is not None
-        self.remove_doorway_preset_button.setEnabled(has_selected_preset)
+        self.remove_doorway_preset_button.setEnabled(
+            has_selected_preset and len(self.doorway_presets) > 1
+        )
         self.place_doorway_button.setEnabled(has_selected_preset)
 
     def _refresh_rooms_list(self) -> None:
@@ -4462,6 +4588,8 @@ class BlueprintWorkspace(QWidget):
         ):
             return
 
+        if level_index != self.current_level_index:
+            self._commit_pending_doorway_mesh_update()
         self.current_level_index = level_index
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
@@ -4513,22 +4641,16 @@ class BlueprintWorkspace(QWidget):
         self.current_level.floor_thickness_meters = float(value)
         self._schedule_viewer_preview_refresh()
 
-    def _handle_add_doorway_preset_clicked(self) -> None:
-        doorway_preset = DoorwayPreset(
-            width_meters=float(self.doorway_width_spinbox.value()),
-            height_meters=float(self.doorway_height_spinbox.value()),
-        )
-        self.doorway_presets.append(doorway_preset)
-        self._refresh_doorway_preset_list(
-            selected_index=len(self.doorway_presets) - 1
-        )
-
     def _handle_doorway_preset_selection_changed(self, _row: int) -> None:
         self._update_doorway_preset_button_state()
 
     def _handle_remove_doorway_preset_clicked(self) -> None:
         selected_index = self.doorway_preset_list.currentRow()
-        if selected_index < 0 or selected_index >= len(self.doorway_presets):
+        if (
+            len(self.doorway_presets) <= 1
+            or selected_index < 0
+            or selected_index >= len(self.doorway_presets)
+        ):
             return
 
         del self.doorway_presets[selected_index]
@@ -4546,8 +4668,95 @@ class BlueprintWorkspace(QWidget):
         self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
 
     def _handle_doorways_changed(self) -> None:
+        """Commit structural doorway changes without a debounce delay."""
+
+        self._is_doorway_dimension_drag_active = False
         self.current_level.doorways = self.canvas.doorways
+        next_snapshot = self._copy_doorways(self.current_level.doorways)
+        snapshot_changed = bool(
+            self._viewer_doorways_by_level_index.get(
+                self.current_level.index
+            )
+            != next_snapshot
+        )
+        self._cancel_pending_doorway_mesh_update(clear_outline=True)
+        if not snapshot_changed:
+            return
+        self._viewer_doorways_by_level_index[self.current_level.index] = (
+            next_snapshot
+        )
         self._schedule_viewer_preview_refresh()
+
+    def _handle_doorway_dimension_drag_started(self) -> None:
+        """Pause doorway stabilization while a resize handle remains held."""
+
+        self._is_doorway_dimension_drag_active = True
+        self._doorway_mesh_update_timer.stop()
+
+    def _handle_doorway_dimension_drag_finished(self) -> None:
+        """Begin a fresh stabilization interval after the handle is released."""
+
+        self._is_doorway_dimension_drag_active = False
+        if self._pending_doorway_mesh_level_index is not None:
+            self._doorway_mesh_update_timer.start()
+            return
+        self._handle_doorway_dimension_preview_changed()
+
+    def _handle_doorway_dimension_preview_changed(self) -> None:
+        """Show live dimensions as an outline and debounce the wall rebuild."""
+
+        self.current_level.doorways = self.canvas.doorways
+        level = self.current_level
+        committed_doorways = self._viewer_doorways_by_level_index.get(
+            level.index
+        )
+        if committed_doorways is None:
+            committed_doorways = self._copy_doorways(level.doorways)
+            self._viewer_doorways_by_level_index[level.index] = (
+                committed_doorways
+            )
+
+        if self._copy_doorways(level.doorways) == committed_doorways:
+            self._doorway_mesh_update_timer.stop()
+            self._pending_doorway_mesh_level_index = None
+            self._clear_committed_doorway_outline_if_displayed()
+            if self._doorway_outline_commit_revision is None:
+                self.viewer.set_doorway_preview_outline(None)
+            return
+
+        selected_index = self.canvas.selected_doorway_index
+        if (
+            selected_index is None
+            or selected_index < 0
+            or selected_index >= len(level.doorways)
+        ):
+            self._cancel_pending_doorway_mesh_update(clear_outline=True)
+            return
+
+        pending_level_index = self._pending_doorway_mesh_level_index
+        if (
+            pending_level_index is not None
+            and pending_level_index != level.index
+        ):
+            self._commit_pending_doorway_mesh_update()
+
+        doorway = level.doorways[selected_index]
+        try:
+            outline_positions = build_doorway_world_outline_positions(
+                self.levels,
+                level,
+                doorway,
+            )
+        except (TypeError, ValueError):
+            self.viewer.set_doorway_preview_outline(None)
+        else:
+            self.viewer.set_doorway_preview_outline(outline_positions)
+
+        self._pending_doorway_mesh_level_index = level.index
+        if self._is_doorway_dimension_drag_active:
+            self._doorway_mesh_update_timer.stop()
+        else:
+            self._doorway_mesh_update_timer.start()
 
     def _handle_add_stairs_clicked(self) -> None:
         draft = self.canvas.get_stair_placement_draft()
@@ -4800,6 +5009,9 @@ class BlueprintWorkspace(QWidget):
 
     def _handle_generation_settings_changed(self) -> None:
         settings = self.settings_widget.get_settings()
+        self._set_doorway_mesh_update_delay_seconds(
+            settings.doorway_mesh_update_delay_seconds
+        )
         self._set_canvas_3d_navigation_shortcut(
             settings.canvas_3d_navigation_toggle_hotkey
         )
@@ -5203,10 +5415,13 @@ class BlueprintWorkspace(QWidget):
                 "loading another project."
             )
 
+        self._is_doorway_dimension_drag_active = False
+        self._cancel_pending_doorway_mesh_update(clear_outline=True)
         self.canvas.cancel_stair_placement()
         self._canvas_window_undo_ids.clear()
         self.viewer.set_window_undo_available(False)
         self.levels = levels
+        self._reset_viewer_doorway_snapshots()
         self._level_blueprint_image_revisions.clear()
         self.stairs = list(stairs or [])
         self.initial_first_person_camera = initial_first_person_camera
@@ -5215,7 +5430,9 @@ class BlueprintWorkspace(QWidget):
             image_library_paths or []
         )
         if doorway_presets is not None:
-            self.doorway_presets = list(doorway_presets)
+            self.doorway_presets = (
+                list(doorway_presets) or create_default_doorway_presets()
+            )
         self.current_level_index = min(max(current_level_index, 0), len(self.levels) - 1)
         self.texture_creator_level_index = None
         self.texture_creator_room_index = None
@@ -5285,6 +5502,10 @@ class BlueprintWorkspace(QWidget):
         self._schedule_viewer_preview_refresh()
 
     def _sync_canvas_to_current_level(self) -> None:
+        self._viewer_doorways_by_level_index.setdefault(
+            self.current_level.index,
+            self._copy_doorways(self.current_level.doorways),
+        )
         self.canvas.set_level_data(
             vertex_data=self.current_level.vertex_data,
             rooms=self.current_level.rooms,

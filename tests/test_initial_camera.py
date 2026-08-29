@@ -6,18 +6,21 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 from housemaker.camera_models import (
     CameraPose,
     DEFAULT_FIRST_PERSON_LIGHT_INTENSITY,
     InitialFirstPersonCamera,
 )
 from housemaker.level_coordinates import (
+    build_doorway_world_outline_positions,
     build_level_base_z_lookup,
     get_level_world_pivot,
     level_image_to_world_xy,
     level_world_to_image_xy,
 )
-from housemaker.models import LevelData, create_default_levels
+from housemaker.models import DoorwayData, LevelData, create_default_levels
 from housemaker.project_io import load_project, save_project
 
 
@@ -75,6 +78,72 @@ class LevelCoordinateTests(unittest.TestCase):
         self.assertEqual(base_z[2], 0.0)
         self.assertEqual(base_z[3], 3.0)
         self.assertEqual(base_z[4], 7.0)
+
+    def test_doorway_outline_matches_scaled_level_xy_and_unscaled_height(
+        self,
+    ) -> None:
+        ground_level = LevelData(index=2, name="Ground", height_meters=3.0)
+        upper_level = LevelData(
+            index=3,
+            name="Upper",
+            scale=2.0,
+            offset_x_meters=3.0,
+            offset_y_meters=-4.0,
+            image_size_pixels=(100.0, 100.0),
+        )
+        doorway = DoorwayData(
+            center_x=50.0,
+            center_y=50.0,
+            width_meters=0.8,
+            height_meters=2.2,
+            depth_meters=0.2,
+            rotation_degrees=0.0,
+        )
+
+        positions = np.asarray(
+            build_doorway_world_outline_positions(
+                (ground_level, upper_level),
+                upper_level,
+                doorway,
+            ),
+            dtype=float,
+        )
+
+        self.assertEqual(positions.shape, (24, 3))
+        unique_positions = np.unique(positions, axis=0)
+        self.assertEqual(unique_positions.shape, (8, 3))
+        np.testing.assert_allclose(
+            np.min(unique_positions, axis=0),
+            (2.8, -4.8, 3.0),
+        )
+        np.testing.assert_allclose(
+            np.max(unique_positions, axis=0),
+            (3.2, -3.2, 5.2),
+        )
+        edge_lengths = np.linalg.norm(
+            positions[0::2] - positions[1::2],
+            axis=1,
+        )
+        np.testing.assert_allclose(
+            np.sort(edge_lengths),
+            np.sort(np.asarray((0.4,) * 4 + (1.6,) * 4 + (2.2,) * 4)),
+        )
+
+    def test_doorway_outline_rejects_missing_levels_and_invalid_dimensions(
+        self,
+    ) -> None:
+        level = LevelData(index=2, name="Ground")
+        doorway = DoorwayData(
+            center_x=20.0,
+            center_y=30.0,
+            width_meters=0.0,
+            height_meters=2.1,
+        )
+
+        with self.assertRaisesRegex(ValueError, "present"):
+            build_doorway_world_outline_positions((), level, doorway)
+        with self.assertRaisesRegex(ValueError, "width"):
+            build_doorway_world_outline_positions((level,), level, doorway)
 
 
 # ### Camera model tests ###

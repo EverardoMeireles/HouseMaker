@@ -1,6 +1,7 @@
 # ### Imports ###
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -10,6 +11,7 @@ from PySide6.QtGui import QGuiApplication, QKeySequence, QScreen
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFormLayout,
     QKeySequenceEdit,
     QLabel,
@@ -35,8 +37,15 @@ CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY_SETTING_KEY = (
     "navigation/canvas_3d_navigation_toggle_hotkey"
 )
 UNUSED_FACE_REMOVAL_SETTING_KEY = "generation/unused_face_removal"
+DOORWAY_MESH_UPDATE_DELAY_SECONDS_SETTING_KEY = (
+    "canvas/doorway_mesh_update_delay_seconds"
+)
 DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY = "N"
 DEFAULT_UNUSED_FACE_REMOVAL = False
+DEFAULT_DOORWAY_MESH_UPDATE_DELAY_SECONDS = 1.0
+MIN_DOORWAY_MESH_UPDATE_DELAY_SECONDS = 0.1
+MAX_DOORWAY_MESH_UPDATE_DELAY_SECONDS = 10.0
+DOORWAY_MESH_UPDATE_DELAY_STEP_SECONDS = 0.1
 MESHY_SMART_TOPOLOGY_MIN_TARGET_POLYCOUNT = 100
 MESHY_SMART_TOPOLOGY_MAX_TARGET_POLYCOUNT = 15_000
 DEFAULT_MESHY_TARGET_POLYCOUNT = 4_000
@@ -99,6 +108,9 @@ class GenerationServiceSettings:
     )
     unused_face_removal: bool = DEFAULT_UNUSED_FACE_REMOVAL
     jobs_window_screen_id: str | None = None
+    doorway_mesh_update_delay_seconds: float = (
+        DEFAULT_DOORWAY_MESH_UPDATE_DELAY_SECONDS
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.unused_face_removal, bool):
@@ -160,6 +172,22 @@ class GenerationServiceSettings:
             self,
             "canvas_3d_navigation_toggle_hotkey",
             normalized_hotkey,
+        )
+        normalized_doorway_delay = (
+            _normalize_doorway_mesh_update_delay_seconds(
+                self.doorway_mesh_update_delay_seconds
+            )
+        )
+        if normalized_doorway_delay is None:
+            raise ValueError(
+                "Doorway mesh update delay must be between "
+                f"{MIN_DOORWAY_MESH_UPDATE_DELAY_SECONDS} and "
+                f"{MAX_DOORWAY_MESH_UPDATE_DELAY_SECONDS} seconds."
+            )
+        object.__setattr__(
+            self,
+            "doorway_mesh_update_delay_seconds",
+            normalized_doorway_delay,
         )
 
     @property
@@ -238,6 +266,9 @@ class SettingsWidget(QWidget):
                 self._selected_canvas_3d_navigation_toggle_hotkey()
             ),
             unused_face_removal=self.unused_face_removal_checkbox.isChecked(),
+            doorway_mesh_update_delay_seconds=(
+                self.doorway_mesh_update_delay_spinbox.value()
+            ),
         )
 
     def get_fullscreen_3d_viewer_screen_id(self) -> str | None:
@@ -362,6 +393,32 @@ class SettingsWidget(QWidget):
             self.canvas_3d_navigation_toggle_hotkey_edit,
         )
 
+        self.doorway_mesh_update_delay_spinbox = QDoubleSpinBox()
+        self.doorway_mesh_update_delay_spinbox.setObjectName(
+            "doorway_mesh_update_delay_spinbox"
+        )
+        self.doorway_mesh_update_delay_spinbox.setRange(
+            MIN_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
+            MAX_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
+        )
+        self.doorway_mesh_update_delay_spinbox.setDecimals(1)
+        self.doorway_mesh_update_delay_spinbox.setSingleStep(
+            DOORWAY_MESH_UPDATE_DELAY_STEP_SECONDS
+        )
+        self.doorway_mesh_update_delay_spinbox.setSuffix(" s")
+        self.doorway_mesh_update_delay_spinbox.setKeyboardTracking(False)
+        self.doorway_mesh_update_delay_spinbox.setToolTip(
+            "Wait this long after the last doorway size change before "
+            "rebuilding the Canvas 3D wall mesh."
+        )
+        self.doorway_mesh_update_delay_spinbox.valueChanged.connect(
+            self._handle_doorway_mesh_update_delay_changed
+        )
+        form_layout.addRow(
+            "Doorway mesh update delay",
+            self.doorway_mesh_update_delay_spinbox,
+        )
+
         self.unused_face_removal_checkbox = QCheckBox()
         self.unused_face_removal_checkbox.setObjectName(
             "unused_face_removal_checkbox"
@@ -445,6 +502,11 @@ class SettingsWidget(QWidget):
                     self._application_settings
                 ),
                 QKeySequence.SequenceFormat.PortableText,
+            )
+        )
+        self.doorway_mesh_update_delay_spinbox.setValue(
+            read_doorway_mesh_update_delay_seconds(
+                self._application_settings
             )
         )
         self.unused_face_removal_checkbox.setChecked(
@@ -607,6 +669,15 @@ class SettingsWidget(QWidget):
         )
         self.settings_changed.emit()
 
+    def _handle_doorway_mesh_update_delay_changed(self, value: float) -> None:
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            DOORWAY_MESH_UPDATE_DELAY_SECONDS_SETTING_KEY,
+            float(value),
+        )
+        self.settings_changed.emit()
+
     def _sync_key_status_labels(self) -> None:
         self.meshy_key_status_label.setText(
             self._build_key_status_text(
@@ -708,6 +779,40 @@ def read_unused_face_removal(
         DEFAULT_UNUSED_FACE_REMOVAL,
     )
     return value if isinstance(value, bool) else DEFAULT_UNUSED_FACE_REMOVAL
+
+
+# ### Doorway preview setting helpers ###
+def read_doorway_mesh_update_delay_seconds(
+    application_settings: ApplicationSettingsStore,
+) -> float:
+    """Read the doorway rebuild debounce delay with a safe default."""
+
+    normalized_delay = _normalize_doorway_mesh_update_delay_seconds(
+        application_settings.get(
+            DOORWAY_MESH_UPDATE_DELAY_SECONDS_SETTING_KEY,
+            DEFAULT_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
+        )
+    )
+    if normalized_delay is None:
+        return DEFAULT_DOORWAY_MESH_UPDATE_DELAY_SECONDS
+    return normalized_delay
+
+
+def _normalize_doorway_mesh_update_delay_seconds(
+    value: object,
+) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    normalized_value = float(value)
+    if not math.isfinite(normalized_value):
+        return None
+    if not (
+        MIN_DOORWAY_MESH_UPDATE_DELAY_SECONDS
+        <= normalized_value
+        <= MAX_DOORWAY_MESH_UPDATE_DELAY_SECONDS
+    ):
+        return None
+    return normalized_value
 
 
 # ### Canvas navigation hotkey helpers ###

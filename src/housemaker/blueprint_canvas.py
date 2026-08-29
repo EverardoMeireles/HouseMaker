@@ -34,15 +34,19 @@ from housemaker.level_coordinates import (
     level_world_to_image_xy,
 )
 from housemaker.models import (
+    DEFAULT_DOORWAY_DEPTH_METERS,
     DEFAULT_IMAGE_OFFSET,
     DEFAULT_IMAGE_SCALE,
-    DEFAULT_DOORWAY_DEPTH_METERS,
     DEFAULT_ROOM_HEIGHT_METERS,
     DoorwayData,
     DoorwayPreset,
     Edge,
     MAX_DOORWAY_DEPTH_METERS,
+    MAX_DOORWAY_HEIGHT_METERS,
+    MAX_DOORWAY_WIDTH_METERS,
     MIN_DOORWAY_DEPTH_METERS,
+    MIN_DOORWAY_HEIGHT_METERS,
+    MIN_DOORWAY_WIDTH_METERS,
     PIXEL_TO_METER,
     DEFAULT_STAIR_STYLE,
     STAIR_STYLE_FLOATING,
@@ -105,6 +109,9 @@ CENTER_SNAP_TOLERANCE_SCREEN = 10.0
 CENTER_SNAP_EQUAL_ANGLE_TOLERANCE_DEGREES = 1.0
 ROOM_FILL_ALPHA = 72
 DRAG_THRESHOLD_SCREEN = 4.0
+DOORWAY_HEIGHT_WHEEL_STEP_METERS = 0.05
+DOORWAY_RESIZE_AXIS_DEPTH = "depth"
+DOORWAY_RESIZE_AXIS_WIDTH = "width"
 FIRST_PERSON_CAMERA_BODY_RADIUS_SCREEN = 11.0
 FIRST_PERSON_CAMERA_BODY_HIT_RADIUS_SCREEN = 16.0
 FIRST_PERSON_CAMERA_DIRECTION_LENGTH_SCREEN = 72.0
@@ -171,8 +178,8 @@ class EdgeHit:
 @dataclass(frozen=True)
 class DoorwayHit:
     doorway_index: int
-    is_depth_border: bool
-    depth_border_sign: float = 0.0
+    resize_axis: str | None = None
+    border_sign: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -296,6 +303,9 @@ class StairHit:
 class BlueprintCanvas(QWidget):
     rooms_changed = Signal()
     doorways_changed = Signal()
+    doorway_dimension_preview_changed = Signal()
+    doorway_dimension_drag_started = Signal()
+    doorway_dimension_drag_finished = Signal()
     floor_contour_changed = Signal(object)
     first_person_camera_changed = Signal(object)
     stair_start_placed = Signal(object)
@@ -345,8 +355,9 @@ class BlueprintCanvas(QWidget):
         self.pressed_doorway_index: int | None = None
         self.drag_doorway_index: int | None = None
         self.doorway_drag_press_position: QPointF | None = None
+        self.doorway_drag_resize_axis: str | None = None
         self.doorway_drag_border_sign = 0.0
-        self.doorway_drag_start_depth_meters: float | None = None
+        self.doorway_drag_start_size_meters: float | None = None
         self.doorway_drag_press_image_point: tuple[float, float] | None = None
         self.doorway_drag_initial_doorway: DoorwayData | None = None
         self.doorway_drag_changed = False
@@ -931,6 +942,8 @@ class BlueprintCanvas(QWidget):
             return
 
         snapshot = self.undo_stack.pop()
+        previous_vertex_data = self.vertex_data.clone()
+        previous_rooms = copy.deepcopy(self.rooms)
         previous_floor_contour_vertex_ids = self.floor_contour_vertex_ids
         previous_doorways = copy.deepcopy(self.doorways)
         previous_first_person_camera = self.initial_first_person_camera
@@ -955,7 +968,11 @@ class BlueprintCanvas(QWidget):
         self._reset_doorway_pointer_state()
         self._reset_first_person_camera_pointer_state()
         self.update()
-        self.rooms_changed.emit()
+        if (
+            self.vertex_data != previous_vertex_data
+            or self.rooms != previous_rooms
+        ):
+            self.rooms_changed.emit()
         if self.doorways != previous_doorways:
             self.doorways_changed.emit()
         if self.floor_contour_vertex_ids != previous_floor_contour_vertex_ids:
@@ -1049,6 +1066,35 @@ class BlueprintCanvas(QWidget):
         if wheel_delta == 0:
             wheel_delta = event.pixelDelta().y()
         if wheel_delta == 0:
+            event.accept()
+            return
+
+        doorway_index = self.selected_doorway_index
+        if doorway_index is not None and 0 <= doorway_index < len(self.doorways):
+            doorway = self.doorways[doorway_index]
+            height_delta_meters = (
+                DOORWAY_HEIGHT_WHEEL_STEP_METERS * wheel_delta / 120.0
+            )
+            height_meters = min(
+                max(
+                    doorway.height_meters + height_delta_meters,
+                    MIN_DOORWAY_HEIGHT_METERS,
+                ),
+                MAX_DOORWAY_HEIGHT_METERS,
+            )
+            if not math.isclose(
+                height_meters,
+                doorway.height_meters,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            ):
+                self._push_undo_state()
+                self.doorways[doorway_index] = self._copy_doorway_with(
+                    doorway,
+                    height_meters=height_meters,
+                )
+                self.doorway_dimension_preview_changed.emit()
+                self.update()
             event.accept()
             return
 
@@ -1172,13 +1218,18 @@ class BlueprintCanvas(QWidget):
             self.selected_vertex_id = None
             self.selected_vertex_ids.clear()
             self._reset_doorway_pointer_state()
-            if doorway_hit.is_depth_border:
+            resize_axis = doorway_hit.resize_axis
+            if resize_axis is not None:
+                doorway = self.doorways[doorway_hit.doorway_index]
                 self.pressed_doorway_index = doorway_hit.doorway_index
                 self.doorway_drag_press_position = QPointF(event.position())
-                self.doorway_drag_border_sign = doorway_hit.depth_border_sign
-                self.doorway_drag_start_depth_meters = self.doorways[
-                    doorway_hit.doorway_index
-                ].depth_meters
+                self.doorway_drag_resize_axis = resize_axis
+                self.doorway_drag_border_sign = doorway_hit.border_sign
+                self.doorway_drag_start_size_meters = (
+                    doorway.depth_meters
+                    if resize_axis == DOORWAY_RESIZE_AXIS_DEPTH
+                    else doorway.width_meters
+                )
                 image_point = self._widget_to_image(event.position())
                 self.doorway_drag_press_image_point = (
                     None
@@ -1188,6 +1239,7 @@ class BlueprintCanvas(QWidget):
                 self.doorway_drag_initial_doorway = copy.deepcopy(
                     self.doorways[doorway_hit.doorway_index]
                 )
+                self.doorway_dimension_drag_started.emit()
             self.update()
             event.accept()
             return
@@ -1395,10 +1447,7 @@ class BlueprintCanvas(QWidget):
             event.button() == Qt.MouseButton.LeftButton
             and self.pressed_doorway_index is not None
         ):
-            should_emit_change = self.doorway_drag_changed
             self._reset_doorway_pointer_state()
-            if should_emit_change:
-                self.doorways_changed.emit()
             self.update()
             event.accept()
             return
@@ -1894,14 +1943,20 @@ class BlueprintCanvas(QWidget):
         self.pending_doorway = None
 
     def _reset_doorway_pointer_state(self) -> None:
+        doorway_dimension_drag_was_active = (
+            self.pressed_doorway_index is not None
+        )
         self.pressed_doorway_index = None
         self.drag_doorway_index = None
         self.doorway_drag_press_position = None
+        self.doorway_drag_resize_axis = None
         self.doorway_drag_border_sign = 0.0
-        self.doorway_drag_start_depth_meters = None
+        self.doorway_drag_start_size_meters = None
         self.doorway_drag_press_image_point = None
         self.doorway_drag_initial_doorway = None
         self.doorway_drag_changed = False
+        if doorway_dimension_drag_was_active:
+            self.doorway_dimension_drag_finished.emit()
 
     def _find_doorway_at(self, widget_point: QPointF) -> int | None:
         doorway_hit = self._find_doorway_hit(widget_point)
@@ -1924,34 +1979,48 @@ class BlueprintCanvas(QWidget):
             if doorway_hit is not None:
                 return DoorwayHit(
                     doorway_index=doorway_index,
-                    is_depth_border=doorway_hit.is_depth_border,
-                    depth_border_sign=doorway_hit.depth_border_sign,
+                    resize_axis=doorway_hit.resize_axis,
+                    border_sign=doorway_hit.border_sign,
                 )
 
         return None
 
     def _update_doorway_hover_cursor(self, widget_point: QPointF) -> None:
         doorway_hit = self._find_doorway_hit(widget_point)
-        if doorway_hit is None or not doorway_hit.is_depth_border:
+        if doorway_hit is None:
             self.unsetCursor()
             return
 
         doorway = self.doorways[doorway_hit.doorway_index]
-        depth_direction_x, depth_direction_y = self._get_doorway_depth_direction(
-            doorway
-        )
+        resize_axis = doorway_hit.resize_axis
+        if resize_axis == DOORWAY_RESIZE_AXIS_DEPTH:
+            resize_direction = self._get_doorway_depth_direction(doorway)
+        elif resize_axis == DOORWAY_RESIZE_AXIS_WIDTH:
+            resize_direction = self._get_doorway_width_direction(doorway)
+        else:
+            self.unsetCursor()
+            return
+        self._set_directional_resize_cursor(*resize_direction)
+
+    def _set_directional_resize_cursor(
+        self,
+        direction_x: float,
+        direction_y: float,
+    ) -> None:
+        """Show the cursor matching one doorway-local resize direction."""
+
         horizontal_axis_threshold = math.tan(math.radians(22.5))
-        if abs(depth_direction_y) <= abs(depth_direction_x) * horizontal_axis_threshold:
+        if abs(direction_y) <= abs(direction_x) * horizontal_axis_threshold:
             self.setCursor(Qt.CursorShape.SizeHorCursor)
             return
 
-        if abs(depth_direction_x) <= abs(depth_direction_y) * horizontal_axis_threshold:
+        if abs(direction_x) <= abs(direction_y) * horizontal_axis_threshold:
             self.setCursor(Qt.CursorShape.SizeVerCursor)
             return
 
         diagonal_cursor = (
             Qt.CursorShape.SizeFDiagCursor
-            if depth_direction_x * depth_direction_y >= 0.0
+            if direction_x * direction_y >= 0.0
             else Qt.CursorShape.SizeBDiagCursor
         )
         self.setCursor(diagonal_cursor)
@@ -1974,54 +2043,76 @@ class BlueprintCanvas(QWidget):
         if doorway_index is None or not (0 <= doorway_index < len(self.doorways)):
             return
 
-        self._push_undo_state()
         self.drag_doorway_index = doorway_index
 
     def _resize_dragged_doorway(self, image_point: QPointF) -> None:
         doorway_index = self.drag_doorway_index
         initial_doorway = self.doorway_drag_initial_doorway
         press_image_point = self.doorway_drag_press_image_point
-        start_depth_meters = self.doorway_drag_start_depth_meters
+        resize_axis = self.doorway_drag_resize_axis
+        start_size_meters = self.doorway_drag_start_size_meters
         if (
             doorway_index is None
             or not (0 <= doorway_index < len(self.doorways))
             or initial_doorway is None
             or press_image_point is None
-            or start_depth_meters is None
+            or resize_axis is None
+            or start_size_meters is None
         ):
             return
 
-        depth_direction_x, depth_direction_y = self._get_doorway_depth_direction(
-            initial_doorway
-        )
-        cursor_delta_x = image_point.x() - press_image_point[0]
-        cursor_delta_y = image_point.y() - press_image_point[1]
-        depth_delta_meters = (
-            2.0
-            * self.doorway_drag_border_sign
-            * (cursor_delta_x * depth_direction_x + cursor_delta_y * depth_direction_y)
-            * PIXEL_TO_METER
-        )
-        depth_meters = min(
-            max(
-                start_depth_meters + depth_delta_meters,
-                MIN_DOORWAY_DEPTH_METERS,
-            ),
-            MAX_DOORWAY_DEPTH_METERS,
-        )
-        resized_doorway = self._copy_doorway_with(
-            initial_doorway,
-            depth_meters=depth_meters,
-        )
-        fitted_doorway = self._snap_doorway_to_walls(
-            resized_doorway,
-            (initial_doorway.center_x, initial_doorway.center_y),
-        )
-        if fitted_doorway == self.doorways[doorway_index]:
+        if resize_axis == DOORWAY_RESIZE_AXIS_DEPTH:
+            resize_direction = self._get_doorway_depth_direction(initial_doorway)
+            minimum_size_meters = MIN_DOORWAY_DEPTH_METERS
+            maximum_size_meters = MAX_DOORWAY_DEPTH_METERS
+        elif resize_axis == DOORWAY_RESIZE_AXIS_WIDTH:
+            resize_direction = self._get_doorway_width_direction(initial_doorway)
+            minimum_size_meters = MIN_DOORWAY_WIDTH_METERS
+            maximum_size_meters = MAX_DOORWAY_WIDTH_METERS
+        else:
             return
 
+        current_doorway = self.doorways[doorway_index]
+        cursor_delta_x = image_point.x() - press_image_point[0]
+        cursor_delta_y = image_point.y() - press_image_point[1]
+        size_delta_meters = (
+            2.0
+            * self.doorway_drag_border_sign
+            * (
+                cursor_delta_x * resize_direction[0]
+                + cursor_delta_y * resize_direction[1]
+            )
+            * PIXEL_TO_METER
+        )
+        size_meters = min(
+            max(
+                start_size_meters + size_delta_meters,
+                minimum_size_meters,
+            ),
+            maximum_size_meters,
+        )
+        if resize_axis == DOORWAY_RESIZE_AXIS_DEPTH:
+            resized_doorway = self._copy_doorway_with(
+                current_doorway,
+                depth_meters=size_meters,
+            )
+        else:
+            resized_doorway = self._copy_doorway_with(
+                current_doorway,
+                width_meters=size_meters,
+            )
+        fitted_doorway = self._snap_doorway_to_walls(
+            resized_doorway,
+            (current_doorway.center_x, current_doorway.center_y),
+        )
+        if fitted_doorway == current_doorway:
+            return
+
+        if not self.doorway_drag_changed:
+            self._push_undo_state()
         self.doorways[doorway_index] = fitted_doorway
         self.doorway_drag_changed = True
+        self.doorway_dimension_preview_changed.emit()
 
     def _snap_doorway_to_walls(
         self,
@@ -2237,14 +2328,28 @@ class BlueprintCanvas(QWidget):
         ):
             return None
 
-        is_depth_border = (
-            abs(abs(depth_position) - half_depth_pixels)
-            <= hit_tolerance_pixels
-        )
+        depth_border_error = abs(abs(depth_position) - half_depth_pixels)
+        width_border_error = abs(abs(width_position) - half_width_pixels)
+        depth_border_is_nearest = depth_border_error <= width_border_error
+        if (
+            depth_border_error <= hit_tolerance_pixels
+            and depth_border_is_nearest
+        ):
+            resize_axis = DOORWAY_RESIZE_AXIS_DEPTH
+            border_sign = 1.0 if depth_position >= 0.0 else -1.0
+        elif (
+            width_border_error <= hit_tolerance_pixels
+            and not depth_border_is_nearest
+        ):
+            resize_axis = DOORWAY_RESIZE_AXIS_WIDTH
+            border_sign = 1.0 if width_position >= 0.0 else -1.0
+        else:
+            resize_axis = None
+            border_sign = 0.0
         return DoorwayHit(
             doorway_index=-1,
-            is_depth_border=is_depth_border,
-            depth_border_sign=1.0 if depth_position >= 0.0 else -1.0,
+            resize_axis=resize_axis,
+            border_sign=border_sign,
         )
 
     def _get_doorway_depth_direction(
@@ -2254,20 +2359,35 @@ class BlueprintCanvas(QWidget):
         rotation_radians = math.radians(doorway.rotation_degrees)
         return math.cos(rotation_radians), math.sin(rotation_radians)
 
+    def _get_doorway_width_direction(
+        self,
+        doorway: DoorwayData,
+    ) -> tuple[float, float]:
+        depth_direction_x, depth_direction_y = self._get_doorway_depth_direction(
+            doorway
+        )
+        return -depth_direction_y, depth_direction_x
+
     def _copy_doorway_with(
         self,
         doorway: DoorwayData,
         *,
         center_x: float | None = None,
         center_y: float | None = None,
+        width_meters: float | None = None,
+        height_meters: float | None = None,
         depth_meters: float | None = None,
         rotation_degrees: float | None = None,
     ) -> DoorwayData:
         return DoorwayData(
             center_x=doorway.center_x if center_x is None else center_x,
             center_y=doorway.center_y if center_y is None else center_y,
-            width_meters=doorway.width_meters,
-            height_meters=doorway.height_meters,
+            width_meters=(
+                doorway.width_meters if width_meters is None else width_meters
+            ),
+            height_meters=(
+                doorway.height_meters if height_meters is None else height_meters
+            ),
             depth_meters=(
                 doorway.depth_meters if depth_meters is None else depth_meters
             ),
@@ -3441,15 +3561,19 @@ class BlueprintCanvas(QWidget):
             painter.setPen(QPen(TEXT_COLOR))
             painter.setFont(QFont("Segoe UI", 8))
             label_rect = QRectF(
-                doorway_center.x() - 36.0,
-                doorway_center.y() - 10.0,
-                72.0,
-                20.0,
+                doorway_center.x() - 56.0,
+                doorway_center.y() - 18.0,
+                112.0,
+                36.0,
             )
             painter.drawText(
                 label_rect,
                 int(Qt.AlignmentFlag.AlignCenter),
-                "Doorway",
+                (
+                    "Doorway\n"
+                    f"{doorway.width_meters:.2f} × "
+                    f"{doorway.height_meters:.2f} m"
+                ),
             )
 
     # ### Stair painting ###
@@ -4240,7 +4364,8 @@ class BlueprintCanvas(QWidget):
             )
         elif self.doorways:
             overlay_lines.append(
-                "Doorway: click its center to select; drag a facing border to resize depth."
+                "Doorway: select it; drag local-X borders for depth or "
+                "local-Y borders for width; mouse wheel adjusts height."
             )
         if self.stairs:
             overlay_lines.append(

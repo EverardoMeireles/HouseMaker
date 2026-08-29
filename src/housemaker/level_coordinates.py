@@ -4,7 +4,29 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 
-from housemaker.models import GROUND_LEVEL_INDEX, PIXEL_TO_METER, LevelData
+from housemaker.models import (
+    GROUND_LEVEL_INDEX,
+    PIXEL_TO_METER,
+    DoorwayData,
+    LevelData,
+)
+
+
+# ### Constants ###
+_DOORWAY_PRISM_EDGE_VERTEX_INDICES = (
+    (0, 1),
+    (1, 2),
+    (2, 3),
+    (3, 0),
+    (4, 5),
+    (5, 6),
+    (6, 7),
+    (7, 4),
+    (0, 4),
+    (1, 5),
+    (2, 6),
+    (3, 7),
+)
 
 
 # ### Public coordinate helpers ###
@@ -29,6 +51,101 @@ def build_level_base_z_lookup(
                 if index in level_lookup
             )
     return base_z_by_index
+
+
+def build_doorway_world_outline_positions(
+    levels: Sequence[LevelData],
+    level: LevelData,
+    doorway: DoorwayData,
+) -> tuple[tuple[float, float, float], ...]:
+    """Return paired world-space vertices for one doorway wireframe prism."""
+
+    if not isinstance(level, LevelData):
+        raise TypeError("A doorway outline requires a LevelData value.")
+    if not isinstance(doorway, DoorwayData):
+        raise TypeError("A doorway outline requires a DoorwayData value.")
+
+    level_sequence = tuple(levels)
+    if not all(isinstance(candidate, LevelData) for candidate in level_sequence):
+        raise TypeError("Doorway outline levels must contain LevelData values.")
+    base_z_by_level_index = build_level_base_z_lookup(level_sequence)
+    if level.index not in base_z_by_level_index:
+        raise ValueError("The doorway level must be present in the level sequence.")
+
+    center_x = _get_valid_doorway_outline_value(
+        doorway.center_x,
+        "center X",
+    )
+    center_y = _get_valid_doorway_outline_value(
+        doorway.center_y,
+        "center Y",
+    )
+    width_meters = _get_valid_doorway_outline_value(
+        doorway.width_meters,
+        "width",
+        must_be_positive=True,
+    )
+    height_meters = _get_valid_doorway_outline_value(
+        doorway.height_meters,
+        "height",
+        must_be_positive=True,
+    )
+    depth_meters = _get_valid_doorway_outline_value(
+        doorway.depth_meters,
+        "depth",
+        must_be_positive=True,
+    )
+    rotation_degrees = _get_valid_doorway_outline_value(
+        doorway.rotation_degrees,
+        "rotation",
+    )
+
+    rotation_radians = math.radians(rotation_degrees)
+    depth_direction = (
+        math.cos(rotation_radians),
+        math.sin(rotation_radians),
+    )
+    width_direction = (-depth_direction[1], depth_direction[0])
+    half_width_pixels = width_meters / PIXEL_TO_METER / 2.0
+    half_depth_pixels = depth_meters / PIXEL_TO_METER / 2.0
+    image_corners = tuple(
+        (
+            center_x
+            + width_direction[0] * width_sign * half_width_pixels
+            + depth_direction[0] * depth_sign * half_depth_pixels,
+            center_y
+            + width_direction[1] * width_sign * half_width_pixels
+            + depth_direction[1] * depth_sign * half_depth_pixels,
+        )
+        for width_sign, depth_sign in (
+            (-1.0, -1.0),
+            (1.0, -1.0),
+            (1.0, 1.0),
+            (-1.0, 1.0),
+        )
+    )
+    world_footprint = tuple(
+        level_image_to_world_xy(level, image_x, image_y)
+        for image_x, image_y in image_corners
+    )
+    base_z_meters = _get_valid_doorway_outline_value(
+        base_z_by_level_index[level.index],
+        "base Z",
+    )
+    bottom_corners = tuple(
+        (world_x, world_y, base_z_meters)
+        for world_x, world_y in world_footprint
+    )
+    top_corners = tuple(
+        (world_x, world_y, base_z_meters + height_meters)
+        for world_x, world_y in world_footprint
+    )
+    corners = (*bottom_corners, *top_corners)
+    return tuple(
+        corners[vertex_index]
+        for edge in _DOORWAY_PRISM_EDGE_VERTEX_INDICES
+        for vertex_index in edge
+    )
 
 
 def get_level_world_pivot(level: LevelData) -> tuple[float, float]:
@@ -161,3 +278,28 @@ def _get_valid_level_offset(level: LevelData, axis: str) -> float:
             f"Level {level.index} {axis} offset must be a finite number."
         )
     return offset
+
+
+def _get_valid_doorway_outline_value(
+    value: object,
+    field_name: str,
+    *,
+    must_be_positive: bool = False,
+) -> float:
+    """Normalize one finite doorway outline coordinate or dimension."""
+
+    if isinstance(value, bool):
+        raise ValueError(f"Doorway outline {field_name} must be a number.")
+    try:
+        normalized_value = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            f"Doorway outline {field_name} must be a number."
+        ) from error
+    if not math.isfinite(normalized_value):
+        raise ValueError(f"Doorway outline {field_name} must be finite.")
+    if must_be_positive and normalized_value <= 0.0:
+        raise ValueError(
+            f"Doorway outline {field_name} must be greater than zero."
+        )
+    return normalized_value

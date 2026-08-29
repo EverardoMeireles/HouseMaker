@@ -15,7 +15,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # ### Imports ###
 from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
-from PySide6.QtGui import QFocusEvent, QKeyEvent
+from PySide6.QtGui import QFocusEvent, QKeyEvent, QVector3D
 from PySide6.QtWidgets import QApplication
 from PIL import Image
 from trimesh.visual.material import PBRMaterial
@@ -286,6 +286,91 @@ class GlbViewerRenderingTests(unittest.TestCase):
             [call.args[0] for call in depth_function.call_args_list],
             [GL.GL_LEQUAL, GL.GL_LESS],
         )
+
+    def test_doorway_outline_updates_in_place_and_survives_model_refresh(
+        self,
+    ) -> None:
+        viewer = self._build_viewer()
+        viewer.set_model(_build_generated_model())
+        viewer.view.opts["center"] = QVector3D(1.0, 2.0, 3.0)
+        viewer.view.setCameraPosition(
+            distance=9.0,
+            elevation=17.0,
+            azimuth=31.0,
+        )
+        camera_center = viewer.view.opts["center"]
+        camera_before = (
+            (camera_center.x(), camera_center.y(), camera_center.z()),
+            float(viewer.view.opts["distance"]),
+            float(viewer.view.opts["elevation"]),
+            float(viewer.view.opts["azimuth"]),
+        )
+        positions = np.arange(72, dtype=float).reshape(24, 3) / 10.0
+
+        viewer.set_doorway_preview_outline(positions)
+
+        first_item = viewer._doorway_preview_outline_item
+        self.assertIsNotNone(first_item)
+        assert first_item is not None
+        self.assertIn(first_item, viewer.view.items)
+        np.testing.assert_allclose(first_item.pos, positions)
+        positions[:] = -1.0
+        self.assertFalse(
+            np.all(viewer._doorway_preview_outline_positions == -1.0)
+        )
+
+        updated_positions = np.arange(72, dtype=float).reshape(24, 3) / 5.0
+        viewer.set_doorway_preview_outline(updated_positions)
+
+        self.assertIs(viewer._doorway_preview_outline_item, first_item)
+        np.testing.assert_allclose(first_item.pos, updated_positions)
+        camera_center = viewer.view.opts["center"]
+        self.assertEqual(
+            (
+                (camera_center.x(), camera_center.y(), camera_center.z()),
+                float(viewer.view.opts["distance"]),
+                float(viewer.view.opts["elevation"]),
+                float(viewer.view.opts["azimuth"]),
+            ),
+            camera_before,
+        )
+
+        viewer.set_model(_build_generated_model(), preserve_camera=True)
+
+        rebuilt_item = viewer._doorway_preview_outline_item
+        self.assertIsNotNone(rebuilt_item)
+        self.assertIsNot(rebuilt_item, first_item)
+        self.assertIn(rebuilt_item, viewer.view.items)
+        np.testing.assert_allclose(rebuilt_item.pos, updated_positions)
+        camera_center = viewer.view.opts["center"]
+        self.assertEqual(
+            (
+                (camera_center.x(), camera_center.y(), camera_center.z()),
+                float(viewer.view.opts["distance"]),
+                float(viewer.view.opts["elevation"]),
+                float(viewer.view.opts["azimuth"]),
+            ),
+            camera_before,
+        )
+
+        viewer.set_doorway_preview_outline(None)
+
+        self.assertIsNone(viewer._doorway_preview_outline_positions)
+        self.assertIsNone(viewer._doorway_preview_outline_item)
+        self.assertNotIn(rebuilt_item, viewer.view.items)
+
+    def test_doorway_outline_rejects_wrong_shape_and_non_finite_positions(
+        self,
+    ) -> None:
+        viewer = self._build_viewer()
+
+        with self.assertRaisesRegex(ValueError, "exactly 24"):
+            viewer.set_doorway_preview_outline(np.zeros((23, 3)))
+
+        positions = np.zeros((24, 3))
+        positions[5, 1] = np.nan
+        with self.assertRaisesRegex(ValueError, "finite"):
+            viewer.set_doorway_preview_outline(positions)
 
     def test_viewer_forwards_first_person_navigation_apis(self) -> None:
         viewer = self._build_viewer()

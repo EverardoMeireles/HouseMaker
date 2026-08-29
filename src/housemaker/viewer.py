@@ -74,6 +74,9 @@ WINDOW_PREVIEW_OFFSET_METERS = 0.006
 WINDOW_SELECTION_COLOR = (0.20, 0.72, 1.0, 1.0)
 WINDOW_VALID_PREVIEW_COLOR = (0.20, 0.86, 0.38, 0.34)
 WINDOW_INVALID_PREVIEW_COLOR = (1.0, 0.24, 0.20, 0.34)
+DOORWAY_PREVIEW_OUTLINE_COLOR = (1.0, 0.72, 0.18, 0.98)
+DOORWAY_PREVIEW_OUTLINE_WIDTH = 3.0
+DOORWAY_PREVIEW_OUTLINE_POSITION_COUNT = 24
 SYMMETRIC_PREVIEW_MIN_OPACITY = 0.12
 SYMMETRIC_PREVIEW_MAX_OPACITY = 0.72
 SYMMETRIC_PREVIEW_FADE_PERIOD_MILLISECONDS = 2_000
@@ -1194,6 +1197,8 @@ class GlbViewerWidget(QWidget):
         self.textured_surface_items: list[TexturedMeshItem] = []
         self.textured_wall_items: list[gl.GLImageItem] = []
         self.wall_by_item_id: dict[int, PreviewTexturedWall] = {}
+        self._doorway_preview_outline_positions: np.ndarray | None = None
+        self._doorway_preview_outline_item: gl.GLLinePlotItem | None = None
         self.unused_face_camera_indicator_items: dict[
             str,
             tuple[GLGraphicsItem, ...],
@@ -1265,6 +1270,21 @@ class GlbViewerWidget(QWidget):
             self._connect_placed_object_editor_input()
         self._populate_scene()
 
+    # ### Doorway preview outline API ###
+    def set_doorway_preview_outline(self, positions: object | None) -> None:
+        """Set or explicitly clear one transient doorway wireframe prism."""
+
+        if positions is None:
+            self._doorway_preview_outline_positions = None
+            self._remove_doorway_preview_outline_item()
+            return
+
+        self._doorway_preview_outline_positions = (
+            _normalize_doorway_preview_outline_positions(positions)
+        )
+        self._refresh_doorway_preview_outline_item()
+
+    # ### Viewer UI ###
     def _build_ui(self) -> None:
         if not self._window_editing_enabled:
             layout = QStackedLayout(self)
@@ -1835,6 +1855,40 @@ class GlbViewerWidget(QWidget):
     def _remove_window_preview_item(self) -> None:
         item = self._window_preview_item
         self._window_preview_item = None
+        if item is not None and item in self.view.items:
+            self.view.removeItem(item)
+        if hasattr(self, "view"):
+            self.view.update()
+
+    # ### Doorway preview outline rendering ###
+    def _refresh_doorway_preview_outline_item(self) -> None:
+        positions = self._doorway_preview_outline_positions
+        if positions is None:
+            self._remove_doorway_preview_outline_item()
+            return
+
+        item = self._doorway_preview_outline_item
+        if item is not None and item in self.view.items:
+            item.setData(pos=positions)
+            self.view.update()
+            return
+
+        self._remove_doorway_preview_outline_item()
+        item = gl.GLLinePlotItem(
+            pos=positions,
+            color=DOORWAY_PREVIEW_OUTLINE_COLOR,
+            width=DOORWAY_PREVIEW_OUTLINE_WIDTH,
+            antialias=True,
+            mode="lines",
+        )
+        item.setGLOptions("translucent")
+        self._doorway_preview_outline_item = item
+        self.view.addItem(item)
+        self.view.update()
+
+    def _remove_doorway_preview_outline_item(self) -> None:
+        item = self._doorway_preview_outline_item
+        self._doorway_preview_outline_item = None
         if item is not None and item in self.view.items:
             self.view.removeItem(item)
         if hasattr(self, "view"):
@@ -2411,6 +2465,7 @@ class GlbViewerWidget(QWidget):
         if self.model is None:
             self._set_default_camera()
             self._refresh_window_selection_outline()
+            self._refresh_doorway_preview_outline_item()
             return
 
         display_mesh = self._get_display_mesh()
@@ -2472,6 +2527,7 @@ class GlbViewerWidget(QWidget):
         self.view.apply_navigation_camera()
         self._refresh_window_selection_outline()
         self._sync_placed_object_selection_rendering()
+        self._refresh_doorway_preview_outline_item()
         self.view.update()
 
     def _get_display_mesh(self):
@@ -3286,6 +3342,7 @@ class GlbViewerWidget(QWidget):
         self.unused_face_camera_indicator_labels = {}
         self._window_selection_item = None
         self._window_preview_item = None
+        self._doorway_preview_outline_item = None
 
     def _capture_camera_state(self) -> dict[str, object]:
         camera_state: dict[str, object] = {}
@@ -3306,6 +3363,31 @@ class GlbViewerWidget(QWidget):
         self.view.remember_orbit_camera_state()
         self.view.apply_navigation_camera()
         self.view.update()
+
+
+# ### Doorway preview helpers ###
+def _normalize_doorway_preview_outline_positions(
+    positions: object,
+) -> np.ndarray:
+    """Own one finite set of paired positions for a doorway wireframe box."""
+
+    try:
+        raw_positions = np.asarray(positions, dtype=float)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            "A doorway preview outline requires numeric XYZ positions."
+        ) from error
+    expected_shape = (DOORWAY_PREVIEW_OUTLINE_POSITION_COUNT, 3)
+    if raw_positions.shape != expected_shape:
+        raise ValueError(
+            "A doorway preview outline requires exactly 24 paired XYZ "
+            "positions."
+        )
+    if not np.all(np.isfinite(raw_positions)):
+        raise ValueError(
+            "Doorway preview outline positions must all be finite."
+        )
+    return np.ascontiguousarray(raw_positions, dtype=np.float32).copy()
 
 
 # ### Window editor helpers ###
