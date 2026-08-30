@@ -38,7 +38,6 @@ from housemaker.generation_workspace import (
     GenerationWorker,
     GenerationWorkspace,
     TextureRegenerationRequest,
-    UncheckedCameraFacePurgeRequest,
     _persist_generated_named_asset,
 )
 from housemaker.glb import GeneratedModel, import_generated_glb
@@ -48,7 +47,6 @@ from housemaker.object_texture_variants import (
     ObjectTextureVariants,
 )
 from housemaker.settings_widget import GenerationServiceSettings
-from housemaker.unused_face_removal import UncheckedCameraFacePurgeResult
 
 
 # ### Test application ###
@@ -708,58 +706,6 @@ class GenerationCancellationTests(unittest.TestCase):
         }
         self.assertIsNone(records[chair.object_id].placement)
         self.assertEqual(records[table.object_id].placement, placement)
-
-    def test_post_commit_face_purge_cancel_restores_exact_old_model(self) -> None:
-        self.asset_directory.mkdir(parents=True, exist_ok=True)
-        old_glb = _box_glb(1.0)
-        self.asset_directory.joinpath("chair.glb").write_bytes(old_glb)
-        original = GeneratedObjectRecord(
-            object_id="chair",
-            frame_index=0,
-            object_name="Chair",
-            pipeline={},
-            provider_task_id="original-task",
-            asset_path="chair.glb",
-        )
-        self.workspace.set_data(GenerationData(generated_objects=[original]))
-        request = UncheckedCameraFacePurgeRequest(
-            object_id=original.object_id,
-            model_glb=old_glb,
-            unchecked_camera_ids=("pos_x",),
-        )
-        purged_model = _plain_model(0.8)
-        purge_result = UncheckedCameraFacePurgeResult(
-            model=purged_model,
-            unchecked_camera_ids=("pos_x",),
-            original_face_count=12,
-            retained_face_count=10,
-            removed_face_count=2,
-        )
-        cancel_results: list[bool] = []
-        self.workspace.face_purge_completed.connect(
-            lambda _record, _model: cancel_results.append(
-                self.workspace.cancel_current_operation()
-            )
-        )
-
-        with patch(
-            "housemaker.generation_workspace."
-            "purge_faces_visible_from_unchecked_cameras_from_glb",
-            return_value=purge_result,
-        ):
-            self.workspace._start_unchecked_camera_face_purge(request)
-            self._wait_until_idle()
-
-        self.assertEqual(cancel_results, [True])
-        self.assertEqual(self.workspace.get_data().generated_objects, [original])
-        self.assertEqual(
-            self.workspace.result_view.model.glb_bytes,
-            old_glb,
-        )
-        self.assertEqual(
-            {path.name for path in self.asset_directory.iterdir()},
-            {"chair.glb"},
-        )
 
     def test_old_worker_signal_cannot_commit_into_new_operation(self) -> None:
         old_result = MeshyGenerationResult("old", _box_glb(), "Old")

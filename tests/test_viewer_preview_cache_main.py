@@ -417,7 +417,6 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
         set_canvas_model.assert_called_once()
         set_surface_model.assert_called_once_with(
             self.workspace.levels,
-            self.workspace.initial_first_person_camera,
             expected_model,
         )
         set_surface_levels.assert_not_called()

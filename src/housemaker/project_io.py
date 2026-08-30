@@ -8,7 +8,6 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from housemaker.camera_models import CameraPose, InitialFirstPersonCamera
 from housemaker.generation_state import GenerationData
 from housemaker.surface_texture_state import SurfaceTextureData
 from housemaker.texture_atlas_state import TextureAtlasData
@@ -20,8 +19,6 @@ from housemaker.models import (
     DEFAULT_DOORWAY_WIDTH_METERS,
     DEFAULT_FLOOR_THICKNESS_METERS,
     DEFAULT_INCLUDE_IN_EXPORT,
-    DEFAULT_IMAGE_OFFSET,
-    DEFAULT_IMAGE_SCALE,
     DEFAULT_LEVEL_OFFSET_METERS,
     DEFAULT_LEVEL_SCALE,
     DEFAULT_ROOM_HEIGHT_METERS,
@@ -72,7 +69,6 @@ class ProjectData:
     surface_texture_generation: SurfaceTextureData = field(
         default_factory=SurfaceTextureData
     )
-    initial_first_person_camera: InitialFirstPersonCamera | None = None
     stairs: list[StairData] = field(default_factory=list)
     texture_atlases: TextureAtlasData = field(default_factory=TextureAtlasData)
 
@@ -86,7 +82,6 @@ def save_project(
     doorway_presets: list[DoorwayPreset] | None = None,
     generation: GenerationData | None = None,
     surface_texture_generation: SurfaceTextureData | None = None,
-    initial_first_person_camera: InitialFirstPersonCamera | None = None,
     stairs: list[StairData] | None = None,
     texture_atlases: TextureAtlasData | None = None,
 ) -> Path:
@@ -118,11 +113,6 @@ def save_project(
             if texture_atlases is not None
             else TextureAtlasData().to_dict()
         ),
-        "initial_first_person_camera": (
-            None
-            if initial_first_person_camera is None
-            else initial_first_person_camera.to_dict()
-        ),
         "stairs": _serialize_stairs(stairs or []),
         "levels": [
             {
@@ -138,9 +128,6 @@ def save_project(
                 ),
                 "image_path": _normalize_optional_path(level.image_path),
                 "image_size_pixels": _serialize_image_size(level.image_size_pixels),
-                "image_scale": float(level.image_scale),
-                "image_offset_x": float(level.image_offset_x),
-                "image_offset_y": float(level.image_offset_y),
                 "include_in_export": bool(level.include_in_export),
                 "vertex_data": level.vertex_data.to_dict(),
                 "rooms": [_serialize_room(room) for room in level.rooms],
@@ -206,13 +193,6 @@ def load_project(path: str | Path) -> ProjectData:
         level.image_size_pixels = _deserialize_image_size(
             raw_level.get("image_size_pixels")
         )
-        level.image_scale = float(raw_level.get("image_scale", DEFAULT_IMAGE_SCALE))
-        level.image_offset_x = float(
-            raw_level.get("image_offset_x", DEFAULT_IMAGE_OFFSET)
-        )
-        level.image_offset_y = float(
-            raw_level.get("image_offset_y", DEFAULT_IMAGE_OFFSET)
-        )
         level.include_in_export = bool(
             raw_level.get("include_in_export", DEFAULT_INCLUDE_IN_EXPORT)
         )
@@ -247,15 +227,6 @@ def load_project(path: str | Path) -> ProjectData:
     texture_atlases = _deserialize_texture_atlases(
         payload.get("texture_atlases")
     )
-    if "initial_first_person_camera" in payload:
-        initial_first_person_camera = _deserialize_initial_first_person_camera(
-            payload.get("initial_first_person_camera"),
-            valid_level_indices=set(level_lookup),
-        )
-    else:
-        initial_first_person_camera = _build_legacy_initial_camera(
-            payload.get("dynamic_generation")
-        )
     stairs = _deserialize_stairs(
         payload.get("stairs"),
         valid_level_indices=set(level_lookup),
@@ -275,7 +246,6 @@ def load_project(path: str | Path) -> ProjectData:
         generation=generation,
         surface_texture_generation=surface_texture_generation,
         texture_atlases=texture_atlases,
-        initial_first_person_camera=initial_first_person_camera,
         stairs=stairs,
     )
 
@@ -358,54 +328,6 @@ def _deserialize_texture_atlases(
         return TextureAtlasData.from_dict(raw_texture_atlases)
     except (KeyError, TypeError, ValueError, OverflowError):
         return TextureAtlasData()
-
-
-def _deserialize_initial_first_person_camera(
-    raw_camera: object,
-    valid_level_indices: set[int],
-) -> InitialFirstPersonCamera | None:
-    if not isinstance(raw_camera, dict):
-        return None
-
-    try:
-        camera = InitialFirstPersonCamera.from_dict(raw_camera)
-    except (KeyError, TypeError, ValueError, OverflowError):
-        return None
-    if camera.level_index not in valid_level_indices:
-        return None
-    return camera
-
-
-def _build_legacy_initial_camera(
-    raw_dynamic_generation: object,
-) -> InitialFirstPersonCamera | None:
-    if not isinstance(raw_dynamic_generation, dict):
-        return None
-    raw_alignments = raw_dynamic_generation.get("alignments")
-    if not isinstance(raw_alignments, list):
-        return None
-    for raw_alignment in raw_alignments:
-        if not isinstance(raw_alignment, dict):
-            continue
-        try:
-            is_frame_zero = int(raw_alignment.get("frame_index", -1)) == 0
-        except (TypeError, ValueError, OverflowError):
-            continue
-        is_manual = (
-            raw_alignment.get("source") == "manual"
-            or raw_alignment.get("manual") is True
-        )
-        raw_pose = raw_alignment.get("pose")
-        if not is_frame_zero or not is_manual or not isinstance(raw_pose, dict):
-            continue
-        try:
-            return InitialFirstPersonCamera(
-                level_index=GROUND_LEVEL_INDEX,
-                pose=CameraPose.from_dict(raw_pose),
-            )
-        except (KeyError, TypeError, ValueError, OverflowError):
-            return None
-    return None
 
 
 def _normalize_optional_path(path_value: object) -> str | None:
@@ -528,11 +450,13 @@ def _deserialize_stairs(
 # ### Doorway serialization helpers ###
 def _serialize_doorway_presets(
     doorway_presets: list[DoorwayPreset],
-) -> list[dict[str, float]]:
+) -> list[dict[str, float | str]]:
     return [
         {
             "width_meters": float(preset.width_meters),
             "height_meters": float(preset.height_meters),
+            "shape": preset.shape,
+            "arch_amount": float(preset.arch_amount),
         }
         for preset in doorway_presets
     ]
@@ -559,6 +483,15 @@ def _deserialize_doorway_presets(raw_presets: object) -> list[DoorwayPreset]:
                     raw_preset.get(
                         "height_meters",
                         DEFAULT_DOORWAY_HEIGHT_METERS,
+                    )
+                ),
+                shape=_deserialize_doorway_shape(
+                    raw_preset.get("shape", DEFAULT_DOORWAY_SHAPE)
+                ),
+                arch_amount=_deserialize_doorway_arch_amount(
+                    raw_preset.get(
+                        "arch_amount",
+                        DEFAULT_DOORWAY_ARCH_AMOUNT,
                     )
                 ),
             )

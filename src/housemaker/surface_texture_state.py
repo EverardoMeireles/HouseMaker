@@ -16,7 +16,7 @@ from housemaker.video_source import VideoMetadata
 
 
 # ### Constants ###
-SURFACE_TEXTURE_SCHEMA_VERSION = 5
+SURFACE_TEXTURE_SCHEMA_VERSION = 6
 SURFACE_TYPE_WALL = "wall"
 SURFACE_TYPE_FLOOR = "floor"
 SURFACE_TYPE_CEILING = "ceiling"
@@ -43,7 +43,6 @@ MAX_COMBINED_AREA_M2 = 1_000_000_000.0
 MAX_TEXTURE_DIMENSION_PIXELS = 16_384
 SURFACE_TEXTURE_RESOLUTIONS = (512, 1024, 2048)
 DEFAULT_SURFACE_TEXTURE_RESOLUTION = 1024
-MAX_LOCALIZED_INPAINT_UNDO_HISTORY = 10
 _SURFACE_ID_PATTERN = re.compile(
     r"^level:(?P<level_index>0|[1-9]\d*)/"
     r"(?:room:(?P<room_identity>0|[1-9]\d*)/)?"
@@ -301,111 +300,6 @@ class SurfaceTextureAssignment:
         )
 
 
-# ### Localized-inpaint undo models ###
-@dataclass(frozen=True)
-class SurfaceTextureInpaintUndoSnapshot:
-    """One complete pre-inpaint assignment state plus its painted masks."""
-
-    previous_assignments: tuple[SurfaceTextureAssignment, ...]
-    replacement_assignment_ids: tuple[str, ...]
-    affected_surface_ids: tuple[str, ...]
-    previous_texture_mask_strokes: dict[str, tuple[MaskStroke, ...]] = field(
-        default_factory=dict
-    )
-
-    def __post_init__(self) -> None:
-        previous_assignments = tuple(self.previous_assignments)
-        if len(previous_assignments) > MAX_SURFACE_TEXTURE_ASSIGNMENTS:
-            raise ValueError("An inpaint undo snapshot has too many assignments.")
-        if not all(
-            isinstance(assignment, SurfaceTextureAssignment)
-            for assignment in previous_assignments
-        ):
-            raise ValueError("An inpaint undo snapshot has invalid assignments.")
-        previous_ids = [
-            assignment.assignment_id for assignment in previous_assignments
-        ]
-        if len(previous_ids) != len(set(previous_ids)):
-            raise ValueError("An inpaint undo snapshot has duplicate assignments.")
-
-        replacement_ids = _normalize_assignment_ids(
-            self.replacement_assignment_ids,
-            allow_empty=False,
-        )
-        affected_ids = _normalize_undo_surface_ids(self.affected_surface_ids)
-        previous_strokes: dict[str, tuple[MaskStroke, ...]] = {}
-        if not isinstance(self.previous_texture_mask_strokes, dict):
-            raise ValueError("An inpaint undo snapshot has invalid mask strokes.")
-        for raw_surface_id, raw_strokes in (
-            self.previous_texture_mask_strokes.items()
-        ):
-            surface_id = _normalize_surface_id(raw_surface_id)
-            if surface_id not in affected_ids:
-                raise ValueError(
-                    "An inpaint undo mask targets an unaffected surface."
-                )
-            strokes = tuple(_normalize_frame_strokes(raw_strokes))
-            if strokes:
-                previous_strokes[surface_id] = strokes
-
-        object.__setattr__(self, "previous_assignments", previous_assignments)
-        object.__setattr__(self, "replacement_assignment_ids", replacement_ids)
-        object.__setattr__(self, "affected_surface_ids", affected_ids)
-        object.__setattr__(
-            self,
-            "previous_texture_mask_strokes",
-            previous_strokes,
-        )
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "previous_assignments": [
-                assignment.to_dict() for assignment in self.previous_assignments
-            ],
-            "replacement_assignment_ids": list(self.replacement_assignment_ids),
-            "affected_surface_ids": list(self.affected_surface_ids),
-            "previous_texture_mask_strokes": {
-                surface_id: [stroke.to_dict() for stroke in strokes]
-                for surface_id, strokes in sorted(
-                    self.previous_texture_mask_strokes.items()
-                )
-            },
-        }
-
-    @classmethod
-    def from_dict(cls, payload: object) -> "SurfaceTextureInpaintUndoSnapshot":
-        if not isinstance(payload, dict):
-            raise ValueError("An inpaint undo snapshot must contain an object.")
-        raw_previous = payload.get("previous_assignments", ())
-        if not isinstance(raw_previous, list | tuple):
-            raise ValueError("Inpaint undo assignments must contain a list.")
-        previous_assignments = tuple(
-            SurfaceTextureAssignment.from_dict(raw_assignment)
-            for raw_assignment in raw_previous
-        )
-        raw_replacement_ids = payload.get("replacement_assignment_ids", ())
-        raw_affected_ids = payload.get("affected_surface_ids", ())
-        if not isinstance(raw_replacement_ids, list | tuple) or not isinstance(
-            raw_affected_ids,
-            list | tuple,
-        ):
-            raise ValueError("Inpaint undo surface and assignment IDs need lists.")
-        previous_strokes = _load_texture_mask_strokes(
-            payload.get("previous_texture_mask_strokes", {})
-        )
-        return cls(
-            previous_assignments=previous_assignments,
-            replacement_assignment_ids=tuple(
-                str(value) for value in raw_replacement_ids
-            ),
-            affected_surface_ids=tuple(str(value) for value in raw_affected_ids),
-            previous_texture_mask_strokes={
-                surface_id: tuple(strokes)
-                for surface_id, strokes in previous_strokes.items()
-            },
-        )
-
-
 # ### Workspace state ###
 @dataclass
 class SurfaceTextureData:
@@ -414,14 +308,10 @@ class SurfaceTextureData:
     video_metadata: VideoMetadata | None = None
     current_frame_index: int = 0
     frame_strokes: dict[int, list[MaskStroke]] = field(default_factory=dict)
-    texture_mask_strokes: dict[str, list[MaskStroke]] = field(default_factory=dict)
     camera_pose: CameraPose | None = None
     selected_surface_type: str | None = None
     selected_surface_ids: tuple[str, ...] = ()
     assignments: list[SurfaceTextureAssignment] = field(default_factory=list)
-    localized_inpaint_undo_stack: list[
-        SurfaceTextureInpaintUndoSnapshot
-    ] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.video_metadata is not None and not isinstance(
@@ -447,10 +337,6 @@ class SurfaceTextureData:
             if strokes:
                 normalized_frame_strokes[frame_index] = strokes
 
-        normalized_texture_mask_strokes = _normalize_texture_mask_strokes(
-            self.texture_mask_strokes
-        )
-
         selected_surface_type, selected_surface_ids = _normalize_selection(
             self.selected_surface_type,
             self.selected_surface_ids,
@@ -468,22 +354,11 @@ class SurfaceTextureData:
         assignment_ids = [assignment.assignment_id for assignment in assignments]
         if len(set(assignment_ids)) != len(assignment_ids):
             raise ValueError("Surface texture assignment IDs must be unique.")
-        undo_stack = list(self.localized_inpaint_undo_stack)
-        if len(undo_stack) > MAX_LOCALIZED_INPAINT_UNDO_HISTORY:
-            raise ValueError("Surface texture data has too much inpaint undo history.")
-        if not all(
-            isinstance(snapshot, SurfaceTextureInpaintUndoSnapshot)
-            for snapshot in undo_stack
-        ):
-            raise ValueError("Surface texture inpaint undo history is invalid.")
-
         self.current_frame_index = current_frame_index
         self.frame_strokes = normalized_frame_strokes
-        self.texture_mask_strokes = normalized_texture_mask_strokes
         self.selected_surface_type = selected_surface_type
         self.selected_surface_ids = selected_surface_ids
         self.assignments = assignments
-        self.localized_inpaint_undo_stack = undo_stack
 
     @property
     def generated_assignments(self) -> list[SurfaceTextureAssignment]:
@@ -515,27 +390,6 @@ class SurfaceTextureData:
             self.frame_strokes[normalized_index] = normalized_strokes
         else:
             self.frame_strokes.pop(normalized_index, None)
-
-    def strokes_for_surface(self, surface_id: str) -> list[MaskStroke]:
-        normalized_id = _normalize_surface_id(surface_id)
-        return list(self.texture_mask_strokes.get(normalized_id, []))
-
-    def set_surface_strokes(
-        self,
-        surface_id: str,
-        strokes: list[MaskStroke],
-    ) -> None:
-        normalized_id = _normalize_surface_id(surface_id)
-        normalized_strokes = _normalize_frame_strokes(strokes)
-        if normalized_strokes:
-            if (
-                normalized_id not in self.texture_mask_strokes
-                and len(self.texture_mask_strokes) >= MAX_SELECTED_SURFACES
-            ):
-                raise ValueError("Surface texture data contains too many 3D masks.")
-            self.texture_mask_strokes[normalized_id] = normalized_strokes
-        else:
-            self.texture_mask_strokes.pop(normalized_id, None)
 
     def set_selection(
         self,
@@ -570,20 +424,12 @@ class SurfaceTextureData:
                 str(frame_index): [stroke.to_dict() for stroke in strokes]
                 for frame_index, strokes in sorted(self.frame_strokes.items())
             },
-            "texture_mask_strokes": {
-                surface_id: [stroke.to_dict() for stroke in strokes]
-                for surface_id, strokes in sorted(self.texture_mask_strokes.items())
-            },
             "camera_pose": (
                 None if self.camera_pose is None else self.camera_pose.to_dict()
             ),
             "selected_surface_type": self.selected_surface_type,
             "selected_surface_ids": list(self.selected_surface_ids),
             "assignments": [assignment.to_dict() for assignment in self.assignments],
-            "localized_inpaint_undo_stack": [
-                snapshot.to_dict()
-                for snapshot in self.localized_inpaint_undo_stack
-            ],
         }
 
     @classmethod
@@ -604,12 +450,6 @@ class SurfaceTextureData:
             payload.get("frame_strokes", {}),
             video_metadata,
         )
-        texture_mask_strokes = _load_texture_mask_strokes(
-            payload.get(
-                "texture_mask_strokes",
-                payload.get("surface_mask_strokes", {}),
-            )
-        )
         camera_pose = _load_camera_pose(
             payload.get("camera_pose", payload.get("first_person_camera_pose"))
         )
@@ -617,19 +457,14 @@ class SurfaceTextureData:
         assignments = _load_assignments(
             payload.get("assignments", payload.get("generated_assignments", ()))
         )
-        undo_stack = _load_localized_inpaint_undo_stack(
-            payload.get("localized_inpaint_undo_stack", ())
-        )
         return cls(
             video_metadata=video_metadata,
             current_frame_index=current_frame_index,
             frame_strokes=frame_strokes,
-            texture_mask_strokes=texture_mask_strokes,
             camera_pose=camera_pose,
             selected_surface_type=selected_surface_type,
             selected_surface_ids=selected_surface_ids,
             assignments=assignments,
-            localized_inpaint_undo_stack=undo_stack,
         )
 
 
@@ -686,35 +521,6 @@ def _load_frame_strokes(
                 continue
         if strokes:
             loaded[frame_index] = strokes
-    return loaded
-
-
-def _load_texture_mask_strokes(
-    raw_texture_mask_strokes: object,
-) -> dict[str, list[MaskStroke]]:
-    if not isinstance(raw_texture_mask_strokes, dict):
-        return {}
-
-    loaded: dict[str, list[MaskStroke]] = {}
-    for raw_surface_id, raw_strokes in list(raw_texture_mask_strokes.items())[
-        :MAX_SELECTED_SURFACES
-    ]:
-        if not isinstance(raw_strokes, list):
-            continue
-        try:
-            surface_id = _normalize_surface_id(raw_surface_id)
-        except ValueError:
-            continue
-        if len(raw_strokes) > MAX_MASK_STROKES_PER_FRAME:
-            continue
-        strokes: list[MaskStroke] = []
-        for raw_stroke in raw_strokes:
-            try:
-                strokes.append(MaskStroke.from_dict(raw_stroke))
-            except (KeyError, TypeError, ValueError, OverflowError):
-                continue
-        if strokes:
-            loaded[surface_id] = strokes
     return loaded
 
 
@@ -798,20 +604,6 @@ def _without_legacy_overlay_assignment_surfaces(
     return migrated_assignment
 
 
-def _load_localized_inpaint_undo_stack(
-    raw_snapshots: object,
-) -> list[SurfaceTextureInpaintUndoSnapshot]:
-    if not isinstance(raw_snapshots, list | tuple):
-        return []
-    loaded: list[SurfaceTextureInpaintUndoSnapshot] = []
-    for raw_snapshot in raw_snapshots[-MAX_LOCALIZED_INPAINT_UNDO_HISTORY:]:
-        try:
-            loaded.append(SurfaceTextureInpaintUndoSnapshot.from_dict(raw_snapshot))
-        except (KeyError, TypeError, ValueError, OverflowError):
-            continue
-    return loaded
-
-
 # ### Validation helpers ###
 def _normalize_frame_index(value: object) -> int:
     if isinstance(value, bool):
@@ -844,22 +636,6 @@ def _normalize_frame_strokes(raw_strokes: object) -> list[MaskStroke]:
     if not all(isinstance(stroke, MaskStroke) for stroke in strokes):
         raise ValueError("Surface texture frame strokes must be MaskStroke values.")
     return strokes
-
-
-def _normalize_texture_mask_strokes(
-    raw_texture_mask_strokes: object,
-) -> dict[str, list[MaskStroke]]:
-    if not isinstance(raw_texture_mask_strokes, dict):
-        raise ValueError("3D texture masks must contain a surface mapping.")
-    if len(raw_texture_mask_strokes) > MAX_SELECTED_SURFACES:
-        raise ValueError("Surface texture data contains too many 3D masks.")
-    normalized: dict[str, list[MaskStroke]] = {}
-    for raw_surface_id, raw_strokes in raw_texture_mask_strokes.items():
-        surface_id = _normalize_surface_id(raw_surface_id)
-        strokes = _normalize_frame_strokes(raw_strokes)
-        if strokes:
-            normalized[surface_id] = strokes
-    return normalized
 
 
 def _normalize_selection(
@@ -920,42 +696,6 @@ def _normalize_surface_ids(
     if not normalized_ids and not allow_empty:
         raise ValueError("At least one surface ID is required.")
     return tuple(normalized_ids)
-
-
-def _normalize_undo_surface_ids(raw_surface_ids: object) -> tuple[str, ...]:
-    try:
-        values = tuple(raw_surface_ids)  # type: ignore[arg-type]
-    except TypeError as error:
-        raise ValueError("Inpaint undo surface IDs must contain a sequence.") from error
-    if not values or len(values) > MAX_SELECTED_SURFACES:
-        raise ValueError("An inpaint undo snapshot has invalid surface IDs.")
-    return tuple(dict.fromkeys(_normalize_surface_id(value) for value in values))
-
-
-def _normalize_assignment_ids(
-    raw_assignment_ids: object,
-    *,
-    allow_empty: bool,
-) -> tuple[str, ...]:
-    try:
-        values = tuple(raw_assignment_ids)  # type: ignore[arg-type]
-    except TypeError as error:
-        raise ValueError("Assignment IDs must contain a sequence.") from error
-    normalized = tuple(
-        dict.fromkeys(
-            _normalize_required_text(
-                value,
-                "Surface texture assignment ID",
-                MAX_ASSIGNMENT_ID_LENGTH,
-            )
-            for value in values
-        )
-    )
-    if not normalized and not allow_empty:
-        raise ValueError("At least one replacement assignment ID is required.")
-    if len(normalized) > MAX_SURFACE_TEXTURE_ASSIGNMENTS:
-        raise ValueError("An inpaint undo snapshot has too many replacement IDs.")
-    return normalized
 
 
 def _normalize_surface_id(surface_id: object) -> str:

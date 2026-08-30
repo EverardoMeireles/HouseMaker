@@ -14,7 +14,6 @@ from housemaker.surface_texture_state import (
     SURFACE_TYPE_WALL,
     SurfaceTextureAssignment,
     SurfaceTextureData,
-    SurfaceTextureInpaintUndoSnapshot,
     SurfaceTextureVariant,
 )
 from housemaker.video_source import VideoMetadata
@@ -60,56 +59,6 @@ def _assignment() -> SurfaceTextureAssignment:
 
 # ### State round-trip tests ###
 class SurfaceTextureStateRoundTripTests(unittest.TestCase):
-    def test_localized_inpaint_undo_history_round_trips_and_is_independent(
-        self,
-    ) -> None:
-        wall_id = "level:2/room:0/wall:1:2"
-        snapshot = SurfaceTextureInpaintUndoSnapshot(
-            previous_assignments=(_assignment(),),
-            replacement_assignment_ids=("replacement-1",),
-            affected_surface_ids=(wall_id,),
-            previous_texture_mask_strokes={wall_id: (_stroke(0.2),)},
-        )
-        state = SurfaceTextureData(
-            assignments=[_assignment()],
-            localized_inpaint_undo_stack=[snapshot],
-        )
-
-        restored = SurfaceTextureData.from_dict(state.to_dict())
-        cloned = restored.clone()
-        cloned.localized_inpaint_undo_stack.clear()
-
-        self.assertEqual(restored, state)
-        self.assertEqual(restored.localized_inpaint_undo_stack, [snapshot])
-        self.assertEqual(state.localized_inpaint_undo_stack, [snapshot])
-
-    def test_legacy_positional_assignments_keep_their_original_slot(self) -> None:
-        state = SurfaceTextureData(
-            None,
-            0,
-            {},
-            {},
-            None,
-            None,
-            (),
-            [_assignment()],
-        )
-
-        self.assertEqual(state.assignments, [_assignment()])
-        self.assertEqual(state.localized_inpaint_undo_stack, [])
-
-    def test_3d_texture_mask_strokes_round_trip_per_stable_surface(self) -> None:
-        surface_id = "level:2/room:5/wall:1:2"
-        state = SurfaceTextureData(
-            texture_mask_strokes={surface_id: [_stroke(0.25)]}
-        )
-
-        restored = SurfaceTextureData.from_dict(state.to_dict())
-
-        self.assertEqual(restored.strokes_for_surface(surface_id), [_stroke(0.25)])
-        restored.set_surface_strokes(surface_id, [])
-        self.assertEqual(restored.texture_mask_strokes, {})
-
     def test_video_enclosed_fill_action_round_trips(self) -> None:
         fill = MaskStroke(
             mode=MASK_MODE_PAINT,
@@ -254,7 +203,7 @@ class SurfaceTextureAssignmentTests(unittest.TestCase):
 
         restored = SurfaceTextureAssignment.from_dict(assignment.to_dict())
 
-        self.assertEqual(SURFACE_TEXTURE_SCHEMA_VERSION, 5)
+        self.assertEqual(SURFACE_TEXTURE_SCHEMA_VERSION, 6)
         self.assertEqual(
             restored.selected_texture_resolution,
             DEFAULT_SURFACE_TEXTURE_RESOLUTION,
@@ -386,7 +335,7 @@ class SurfaceTextureAssignmentTests(unittest.TestCase):
 
 # ### Defensive loading tests ###
 class SurfaceTextureDefensiveLoadingTests(unittest.TestCase):
-    def test_schema_four_overlay_data_is_loaded_as_inert_state(self) -> None:
+    def test_schema_four_overlay_and_inpaint_data_is_ignored(self) -> None:
         wall_id = "level:2/room:0/wall:1:2"
         overlay_id = f"{wall_id}/overlay:1"
         mixed_assignment = _assignment().to_dict() | {
@@ -428,13 +377,15 @@ class SurfaceTextureDefensiveLoadingTests(unittest.TestCase):
         )
 
         self.assertEqual(loaded.selected_surface_ids, (wall_id,))
-        self.assertEqual(loaded.texture_mask_strokes, {wall_id: [_stroke(0.8)]})
         self.assertEqual(len(loaded.assignments), 1)
         self.assertEqual(loaded.assignments[0].assignment_id, "mixed")
         self.assertEqual(loaded.assignments[0].surface_ids, (wall_id,))
-        self.assertEqual(loaded.localized_inpaint_undo_stack, [])
+        self.assertFalse(hasattr(loaded, "texture_mask_strokes"))
+        self.assertFalse(hasattr(loaded, "localized_inpaint_undo_stack"))
         self.assertFalse(hasattr(loaded, "overlay_planes"))
         self.assertNotIn("overlay_planes", loaded.to_dict())
+        self.assertNotIn("texture_mask_strokes", loaded.to_dict())
+        self.assertNotIn("localized_inpaint_undo_stack", loaded.to_dict())
 
     def test_legacy_keys_load_and_out_of_range_frame_data_is_bounded(self) -> None:
         payload = {

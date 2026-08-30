@@ -17,11 +17,12 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from housemaker.app_settings import ApplicationSettingsStore
-from housemaker.main import BlueprintWorkspace, _format_stair_label
+from housemaker.main import BlueprintWorkspace
 from housemaker.models import (
     GROUND_LEVEL_INDEX,
     STAIR_STYLE_FLOATING,
     STAIR_STYLE_FLOATING_WITH_RISER,
+    StairData,
 )
 
 
@@ -157,7 +158,7 @@ class StairMainIntegrationTests(unittest.TestCase):
         self.assertEqual(stair.style, STAIR_STYLE_FLOATING)
         self.assertEqual(stair.start_level_index, GROUND_LEVEL_INDEX)
         self.assertEqual(stair.end_level_index, destination_level_index)
-        self.assertEqual(self.workspace.stairs_list.count(), 1)
+        self.assertFalse(hasattr(self.workspace, "stairs_list"))
         self.assertIn("Added floating stairs", self.workspace.stair_status_label.text())
 
         self.workspace.canvas_viewer_tabs.setCurrentIndex(
@@ -182,19 +183,42 @@ class StairMainIntegrationTests(unittest.TestCase):
             "Floating with riser",
         )
 
-        stair = type(
-            "Stair",
-            (),
-            {
-                "style": STAIR_STYLE_FLOATING_WITH_RISER,
-                "start_level_index": GROUND_LEVEL_INDEX,
-                "end_level_index": GROUND_LEVEL_INDEX + 1,
-                "intermediate_sections": (),
-            },
-        )()
+    def test_selected_canvas_stair_can_be_deleted_without_a_list(self) -> None:
+        stair = StairData(
+            start_level_index=GROUND_LEVEL_INDEX,
+            start_a_x=20.0,
+            start_a_y=30.0,
+            start_b_x=50.0,
+            start_b_y=30.0,
+            end_level_index=GROUND_LEVEL_INDEX + 1,
+            end_a_x=20.0,
+            end_a_y=70.0,
+            end_b_x=50.0,
+            end_b_y=70.0,
+        )
+        self.workspace.stairs = [stair]
+        _make_current_canvas_clickable(self.workspace)
+
+        QTest.mouseClick(
+            self.workspace.canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.AltModifier,
+            pos=_image_position(self.workspace, 20.0, 30.0),
+        )
+        self.assertEqual(self.workspace.canvas.selected_stair_index, 0)
+        self.assertFalse(hasattr(self.workspace, "stairs_list"))
+        self.assertFalse(
+            hasattr(self.workspace, "delete_selected_stair_button")
+        )
+
+        QTest.keyClick(self.workspace.canvas, Qt.Key.Key_Delete)
+        _qt_application.processEvents()
+
+        self.assertEqual(self.workspace.stairs, [])
+        self.assertEqual(self.workspace.canvas.stairs, [])
         self.assertEqual(
-            _format_stair_label(stair),  # type: ignore[arg-type]
-            "Floating with riser: L2 to L3 (straight)",
+            self.workspace.stair_status_label.text(),
+            "Stair deleted.",
         )
 
     def test_curve_guides_remain_draft_until_confirmed(self) -> None:
@@ -269,10 +293,6 @@ class StairMainIntegrationTests(unittest.TestCase):
                 }
                 for section in draft.intermediate_sections  # type: ignore[union-attr]
             ],
-        )
-        self.assertIn(
-            "curved, 2 guides",
-            self.workspace.stairs_list.item(0).text(),
         )
         self.assertEqual(self.workspace.add_stairs_button.text(), "Add stairs")
 

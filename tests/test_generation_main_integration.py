@@ -22,7 +22,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QPushButton
 
 from housemaker.app_settings import ApplicationSettingsStore
-from housemaker.camera_models import CameraPose, InitialFirstPersonCamera
+from housemaker.camera_models import CameraPose
 from housemaker.generation_state import GenerationData, MaskPoint, MaskStroke
 from housemaker.generation_workspace import GenerationRequest
 from housemaker.main import BlueprintWorkspace
@@ -390,21 +390,18 @@ class GenerationMainIntegrationTests(unittest.TestCase):
             self.workspace.viewer,
         )
 
-    def test_canvas_navigation_hotkey_toggles_first_person_from_canvas_camera(
+    def test_canvas_navigation_hotkey_toggles_first_person_from_current_pose(
         self,
     ) -> None:
-        camera = InitialFirstPersonCamera(
-            level_index=GROUND_LEVEL_INDEX,
-            pose=CameraPose(
-                x=2.5,
-                y=-1.25,
-                z=1.7,
-                yaw_degrees=42.0,
-                pitch_degrees=-6.0,
-                fov_degrees=72.0,
-            ),
+        camera_pose = CameraPose(
+            x=2.5,
+            y=-1.25,
+            z=1.7,
+            yaw_degrees=42.0,
+            pitch_degrees=-6.0,
+            fov_degrees=72.0,
         )
-        self.workspace._handle_canvas_first_person_camera_changed(camera)
+        self.workspace.viewer.set_first_person_camera_pose(camera_pose)
         self.workspace.canvas_viewer_tabs.setCurrentIndex(
             self.workspace.canvas_3d_view_tab_index
         )
@@ -420,7 +417,7 @@ class GenerationMainIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(
             self.workspace.viewer.get_first_person_camera_pose(),
-            camera.pose,
+            camera_pose,
         )
         self.assertEqual(
             self.workspace.canvas_viewer_tabs.tabText(
@@ -580,7 +577,6 @@ class GenerationMainIntegrationTests(unittest.TestCase):
         original_level_index = self.workspace.current_level_index
         original_library_paths = list(self.workspace.image_library_paths)
         original_doorway_presets = list(self.workspace.doorway_presets)
-        original_camera = self.workspace.initial_first_person_camera
 
         incoming_generation = GenerationData()
         incoming_project = _project_data(incoming_generation)
@@ -622,10 +618,6 @@ class GenerationMainIntegrationTests(unittest.TestCase):
             self.assertEqual(
                 self.workspace.doorway_presets,
                 original_doorway_presets,
-            )
-            self.assertEqual(
-                self.workspace.initial_first_person_camera,
-                original_camera,
             )
             self.assertEqual(
                 self.workspace.generation.get_data(),

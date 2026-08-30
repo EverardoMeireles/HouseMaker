@@ -30,7 +30,6 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QListView,
@@ -41,7 +40,6 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QScrollArea,
     QSizePolicy,
-    QSlider,
     QSplitter,
     QSpinBox,
     QTabWidget,
@@ -52,12 +50,6 @@ from PySide6.QtWidgets import (
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.blueprint_canvas import BlueprintCanvas
 from housemaker.external_viewer_host import ExternalFullscreenViewerHost
-from housemaker.camera_models import (
-    DEFAULT_FIRST_PERSON_LIGHT_INTENSITY,
-    InitialFirstPersonCamera,
-    MAX_FIRST_PERSON_LIGHT_INTENSITY,
-    MIN_FIRST_PERSON_LIGHT_INTENSITY,
-)
 from housemaker.generation_state import (
     GeneratedObjectPlacement,
     GeneratedObjectRecord,
@@ -96,8 +88,6 @@ from housemaker.glb import (
 from housemaker.models import (
     DEFAULT_DOORWAY_ARCH_AMOUNT,
     DEFAULT_FLOOR_THICKNESS_METERS,
-    DEFAULT_IMAGE_OFFSET,
-    DEFAULT_IMAGE_SCALE,
     DEFAULT_LEVEL_OFFSET_METERS,
     DEFAULT_LEVEL_SCALE,
     DEFAULT_ROOM_HEIGHT_METERS,
@@ -184,8 +174,6 @@ from housemaker.manual_stitching import (
 
 # ### Constants ###
 TEXTURE_CREATOR_DETAIL_SIZES = (512, 1024, 2048)
-DEFAULT_FIRST_PERSON_CAMERA_HEIGHT_METERS = 1.65
-FIRST_PERSON_LIGHT_PERCENT_SCALE = 100
 LAST_PROJECT_PATH_SETTING_KEY = "last_project_path"
 PROJECT_LOAD_FAILURES = (
     AttributeError,
@@ -290,11 +278,8 @@ class BlueprintWorkspace(QWidget):
             create_default_doorway_presets()
         )
         self.stairs: list[StairData] = []
-        self.initial_first_person_camera: InitialFirstPersonCamera | None = None
         self.current_level_index = GROUND_LEVEL_INDEX
         self._is_syncing_level_controls = False
-        self._is_syncing_first_person_camera_controls = False
-        self._is_syncing_room_controls = False
         self._is_syncing_image_library_controls = False
         self._is_syncing_texture_controls = False
         self._is_syncing_uv_controls = False
@@ -494,9 +479,6 @@ class BlueprintWorkspace(QWidget):
         self.surface_texture_generation.assignments_removed.connect(
             self._handle_surface_texture_assignments_removed_for_atlases
         )
-        self.surface_texture_generation.localized_inpaint_undone.connect(
-            self._handle_surface_texture_inpaint_undone_for_atlases
-        )
         self.surface_texture_generation.surface_content_changed.connect(
             self._handle_surface_texture_content_changed
         )
@@ -530,10 +512,7 @@ class BlueprintWorkspace(QWidget):
         self.generation.placement_request_finished.connect(
             self._handle_object_placement_operation_finished
         )
-        self.surface_texture_generation.set_levels(
-            self.levels,
-            self.initial_first_person_camera,
-        )
+        self.surface_texture_generation.set_levels(self.levels)
         self.workspace_tabs.addTab(self.canvas_viewer_workspace, "Canvas")
         self.workspace_tabs.addTab(self.texture_atlas_workspace, "Atlas")
         self.workspace_tabs.addTab(
@@ -725,111 +704,6 @@ class BlueprintWorkspace(QWidget):
         self.add_stairs_button.clicked.connect(self._handle_add_stairs_clicked)
         side_layout.addWidget(self.add_stairs_button)
 
-        self.stairs_list = QListWidget()
-        self.stairs_list.setSelectionMode(
-            QAbstractItemView.SelectionMode.SingleSelection
-        )
-        self.stairs_list.setMinimumHeight(86)
-        self.stairs_list.currentRowChanged.connect(
-            self._update_stair_button_state
-        )
-        side_layout.addWidget(self.stairs_list)
-
-        self.delete_selected_stair_button = QPushButton("Delete selected stair")
-        self.delete_selected_stair_button.setMinimumHeight(36)
-        self.delete_selected_stair_button.clicked.connect(
-            self._handle_delete_selected_stair_clicked
-        )
-        side_layout.addWidget(self.delete_selected_stair_button)
-
-        first_person_camera_label = QLabel("Initial first person camera")
-        first_person_camera_label.setStyleSheet(
-            "font-size: 18px; font-weight: 600;"
-        )
-        side_layout.addWidget(first_person_camera_label)
-
-        self.first_person_camera_status_label = QLabel("Camera: Not set")
-        self.first_person_camera_status_label.setWordWrap(True)
-        side_layout.addWidget(self.first_person_camera_status_label)
-
-        self.first_person_camera_z_spinbox = QDoubleSpinBox()
-        self.first_person_camera_z_spinbox.setRange(-10000.0, 10000.0)
-        self.first_person_camera_z_spinbox.setDecimals(3)
-        self.first_person_camera_z_spinbox.setSingleStep(0.05)
-        self.first_person_camera_z_spinbox.setSuffix(" m")
-        self.first_person_camera_z_spinbox.setKeyboardTracking(False)
-        self.first_person_camera_z_spinbox.setEnabled(False)
-        self.first_person_camera_z_spinbox.valueChanged.connect(
-            self._handle_first_person_camera_z_changed
-        )
-        camera_z_layout = QFormLayout()
-        camera_z_layout.setContentsMargins(0, 0, 0, 0)
-        camera_z_layout.addRow("Camera Z", self.first_person_camera_z_spinbox)
-        side_layout.addLayout(camera_z_layout)
-
-        self.first_person_camera_light_slider = QSlider(Qt.Orientation.Horizontal)
-        self.first_person_camera_light_slider.setRange(
-            _light_intensity_to_percent(MIN_FIRST_PERSON_LIGHT_INTENSITY),
-            _light_intensity_to_percent(MAX_FIRST_PERSON_LIGHT_INTENSITY),
-        )
-        self.first_person_camera_light_slider.setSingleStep(1)
-        self.first_person_camera_light_slider.setPageStep(10)
-        self.first_person_camera_light_slider.setToolTip(
-            "Camera-mounted headlight intensity"
-        )
-        self.first_person_camera_light_slider.setValue(
-            _light_intensity_to_percent(DEFAULT_FIRST_PERSON_LIGHT_INTENSITY)
-        )
-        self.first_person_camera_light_slider.setEnabled(False)
-        self.first_person_camera_light_slider.sliderPressed.connect(
-            self.canvas.begin_first_person_camera_light_intensity_adjustment
-        )
-        self.first_person_camera_light_slider.sliderReleased.connect(
-            self.canvas.end_first_person_camera_light_intensity_adjustment
-        )
-        self.first_person_camera_light_slider.valueChanged.connect(
-            self._handle_first_person_camera_light_intensity_changed
-        )
-        self.first_person_camera_light_value_label = QLabel(
-            _format_light_intensity_percent(
-                _light_intensity_to_percent(DEFAULT_FIRST_PERSON_LIGHT_INTENSITY)
-            )
-        )
-        camera_light_control = QWidget()
-        camera_light_layout = QHBoxLayout(camera_light_control)
-        camera_light_layout.setContentsMargins(0, 0, 0, 0)
-        camera_light_layout.setSpacing(8)
-        camera_light_layout.addWidget(self.first_person_camera_light_slider, 1)
-        camera_light_layout.addWidget(self.first_person_camera_light_value_label)
-        camera_light_form = QFormLayout()
-        camera_light_form.setContentsMargins(0, 0, 0, 0)
-        camera_light_form.addRow("Light intensity", camera_light_control)
-        side_layout.addLayout(camera_light_form)
-
-        first_person_camera_buttons_layout = QHBoxLayout()
-        first_person_camera_buttons_layout.setSpacing(10)
-        self.set_first_person_camera_button = QPushButton(
-            "Set first person camera"
-        )
-        self.set_first_person_camera_button.setMinimumHeight(40)
-        self.set_first_person_camera_button.clicked.connect(
-            self._handle_set_first_person_camera_clicked
-        )
-        first_person_camera_buttons_layout.addWidget(
-            self.set_first_person_camera_button
-        )
-
-        self.clear_first_person_camera_button = QPushButton("Clear camera")
-        self.clear_first_person_camera_button.setMinimumHeight(40)
-        self.clear_first_person_camera_button.setEnabled(False)
-        self.clear_first_person_camera_button.clicked.connect(
-            self.canvas.clear_first_person_camera
-        )
-        first_person_camera_buttons_layout.addWidget(
-            self.clear_first_person_camera_button
-        )
-        side_layout.addLayout(first_person_camera_buttons_layout)
-
         doorway_label = QLabel("Doorways")
         doorway_label.setStyleSheet("font-size: 18px; font-weight: 600;")
         side_layout.addWidget(doorway_label)
@@ -885,6 +759,16 @@ class BlueprintWorkspace(QWidget):
         )
         side_layout.addWidget(self.doorway_preset_list)
 
+        self.save_doorway_template_button = QPushButton(
+            "Save doorway template"
+        )
+        self.save_doorway_template_button.setMinimumHeight(40)
+        self.save_doorway_template_button.setEnabled(False)
+        self.save_doorway_template_button.clicked.connect(
+            self._handle_save_doorway_template_clicked
+        )
+        side_layout.addWidget(self.save_doorway_template_button)
+
         doorway_buttons_layout = QHBoxLayout()
         doorway_buttons_layout.setSpacing(10)
 
@@ -907,70 +791,6 @@ class BlueprintWorkspace(QWidget):
         self.load_image_button.setMinimumHeight(44)
         self.load_image_button.clicked.connect(self._handle_load_image_clicked)
         side_layout.addWidget(self.load_image_button)
-
-        image_transform_layout = QFormLayout()
-        image_transform_layout.setContentsMargins(0, 0, 0, 0)
-        image_transform_layout.setSpacing(8)
-
-        self.image_scale_spinbox = self._build_image_transform_spinbox(
-            value=DEFAULT_IMAGE_SCALE,
-            minimum=0.01,
-            maximum=20.0,
-            decimals=3,
-            single_step=0.05,
-        )
-        self.image_scale_spinbox.valueChanged.connect(self._handle_image_scale_changed)
-        image_transform_layout.addRow("Blueprint scale", self.image_scale_spinbox)
-
-        self.image_x_offset_spinbox = self._build_image_transform_spinbox(
-            value=DEFAULT_IMAGE_OFFSET,
-            minimum=-100000.0,
-            maximum=100000.0,
-            decimals=1,
-            single_step=1.0,
-            suffix=" px",
-        )
-        self.image_x_offset_spinbox.valueChanged.connect(
-            self._handle_image_x_offset_changed
-        )
-        image_transform_layout.addRow(
-            "Blueprint X offset",
-            self.image_x_offset_spinbox,
-        )
-
-        self.image_y_offset_spinbox = self._build_image_transform_spinbox(
-            value=DEFAULT_IMAGE_OFFSET,
-            minimum=-100000.0,
-            maximum=100000.0,
-            decimals=1,
-            single_step=1.0,
-            suffix=" px",
-        )
-        self.image_y_offset_spinbox.valueChanged.connect(
-            self._handle_image_y_offset_changed
-        )
-        image_transform_layout.addRow(
-            "Blueprint Y offset",
-            self.image_y_offset_spinbox,
-        )
-
-        include_widget = QWidget()
-        include_layout = QHBoxLayout(include_widget)
-        include_layout.setContentsMargins(0, 0, 0, 0)
-        include_layout.setSpacing(12)
-
-        self.include_button_group = QButtonGroup(self)
-        self.include_yes_radio = QRadioButton("Yes")
-        self.include_no_radio = QRadioButton("No")
-        self.include_button_group.addButton(self.include_yes_radio)
-        self.include_button_group.addButton(self.include_no_radio)
-        self.include_yes_radio.toggled.connect(self._handle_include_toggled)
-        self.include_no_radio.toggled.connect(self._handle_include_toggled)
-        include_layout.addWidget(self.include_yes_radio)
-        include_layout.addWidget(self.include_no_radio)
-        include_layout.addStretch(1)
-        image_transform_layout.addRow("Include", include_widget)
-        side_layout.addLayout(image_transform_layout)
 
         snap_label = QLabel("Snap")
         snap_label.setStyleSheet("font-size: 18px; font-weight: 600;")
@@ -998,49 +818,26 @@ class BlueprintWorkspace(QWidget):
         self.levels_list.currentRowChanged.connect(self._handle_level_selection_changed)
         side_layout.addWidget(self.levels_list, 1)
 
-        rooms_label = QLabel("Rooms")
-        rooms_label.setStyleSheet("font-size: 18px; font-weight: 600;")
-        side_layout.addWidget(rooms_label)
+        level_options_layout = QFormLayout()
+        level_options_layout.setContentsMargins(0, 0, 0, 0)
+        level_options_layout.setSpacing(8)
+        include_widget = QWidget()
+        include_layout = QHBoxLayout(include_widget)
+        include_layout.setContentsMargins(0, 0, 0, 0)
+        include_layout.setSpacing(12)
 
-        self.rooms_list = QListWidget()
-        self.rooms_list.currentRowChanged.connect(self._handle_room_selection_changed)
-        side_layout.addWidget(self.rooms_list, 1)
-
-        self.delete_room_shortcut = QShortcut(
-            QKeySequence.StandardKey.Delete,
-            self.rooms_list,
-        )
-        self.delete_room_shortcut.setContext(
-            Qt.ShortcutContext.WidgetWithChildrenShortcut
-        )
-        self.delete_room_shortcut.activated.connect(self._delete_selected_room)
-
-        room_layout = QFormLayout()
-        room_layout.setContentsMargins(0, 0, 0, 0)
-        room_layout.setSpacing(8)
-
-        self.room_name_field = QLineEdit()
-        self.room_name_field.setPlaceholderText("Room name")
-        self.room_name_field.setMinimumHeight(34)
-        room_layout.addRow("Room name", self.room_name_field)
-
-        self.room_height_spinbox = QDoubleSpinBox()
-        self.room_height_spinbox.setRange(0.1, 100.0)
-        self.room_height_spinbox.setDecimals(2)
-        self.room_height_spinbox.setSingleStep(0.1)
-        self.room_height_spinbox.setValue(DEFAULT_ROOM_HEIGHT_METERS)
-        self.room_height_spinbox.setSuffix(" m")
-        self.room_height_spinbox.setMinimumHeight(34)
-        self.room_height_spinbox.valueChanged.connect(
-            self._handle_room_height_changed
-        )
-        room_layout.addRow("Room height", self.room_height_spinbox)
-        side_layout.addLayout(room_layout)
-
-        self.designate_room_button = QPushButton("Designate room")
-        self.designate_room_button.setMinimumHeight(44)
-        self.designate_room_button.clicked.connect(self._handle_designate_room_clicked)
-        side_layout.addWidget(self.designate_room_button)
+        self.include_button_group = QButtonGroup(self)
+        self.include_yes_radio = QRadioButton("Yes")
+        self.include_no_radio = QRadioButton("No")
+        self.include_button_group.addButton(self.include_yes_radio)
+        self.include_button_group.addButton(self.include_no_radio)
+        self.include_yes_radio.toggled.connect(self._handle_include_toggled)
+        self.include_no_radio.toggled.connect(self._handle_include_toggled)
+        include_layout.addWidget(self.include_yes_radio)
+        include_layout.addWidget(self.include_no_radio)
+        include_layout.addStretch(1)
+        level_options_layout.addRow("Include", include_widget)
+        side_layout.addLayout(level_options_layout)
 
         buttons_layout = QHBoxLayout()
         buttons_layout.setSpacing(10)
@@ -1091,7 +888,9 @@ class BlueprintWorkspace(QWidget):
         self.workspace_splitter.setStretchFactor(1, 1)
         self.workspace_splitter.setSizes([1160, 440])
 
-        self.canvas.rooms_changed.connect(self._refresh_room_lists)
+        self.canvas.rooms_changed.connect(
+            self._refresh_room_dependent_controls
+        )
         self.canvas.rooms_changed.connect(self._schedule_viewer_preview_refresh)
         self.canvas.floor_contour_changed.connect(
             self._handle_floor_contour_changed
@@ -1109,9 +908,6 @@ class BlueprintWorkspace(QWidget):
         self.canvas.selected_doorway_changed.connect(
             self._handle_canvas_doorway_selection_changed
         )
-        self.canvas.first_person_camera_changed.connect(
-            self._handle_canvas_first_person_camera_changed
-        )
         self.canvas.stair_start_placed.connect(
             self._handle_stair_start_placed
         )
@@ -1127,13 +923,12 @@ class BlueprintWorkspace(QWidget):
         self.canvas.stair_placement_invalid_endpoint.connect(
             self._handle_stair_placement_invalid_endpoint
         )
-        self.canvas.stair_selected.connect(self._handle_stair_selected)
         self.canvas.stair_delete_requested.connect(
             self._handle_stair_delete_requested
         )
         self._refresh_levels_list()
-        self._refresh_stairs_list()
-        self._refresh_room_lists()
+        self._update_stair_button_state()
+        self._refresh_room_dependent_controls()
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
         self._sync_texture_creator_tab()
@@ -1221,8 +1016,6 @@ class BlueprintWorkspace(QWidget):
         ):
             return
 
-        if self.viewer.get_navigation_mode() != NAVIGATION_MODE_FIRST_PERSON:
-            self._sync_canvas_viewer_first_person_camera()
         self.viewer.toggle_navigation_mode()
 
     def _handle_canvas_3d_navigation_mode_changed(self, mode: str) -> None:
@@ -1672,24 +1465,6 @@ class BlueprintWorkspace(QWidget):
         )
         texture_layout.addWidget(self.texture_creator_canvas, 1)
         return self.texture_creator_tab
-
-    @staticmethod
-    def _build_image_transform_spinbox(
-        value: float,
-        minimum: float,
-        maximum: float,
-        decimals: int,
-        single_step: float,
-        suffix: str = "",
-    ) -> QDoubleSpinBox:
-        spinbox = QDoubleSpinBox()
-        spinbox.setRange(minimum, maximum)
-        spinbox.setDecimals(decimals)
-        spinbox.setSingleStep(single_step)
-        spinbox.setValue(value)
-        spinbox.setSuffix(suffix)
-        spinbox.setMinimumHeight(34)
-        return spinbox
 
     def load_blueprint(self, file_path: str) -> None:
         self._set_current_level_image(file_path)
@@ -2216,15 +1991,6 @@ class BlueprintWorkspace(QWidget):
             )
         self._atlas_generation_signature = None
         self._sync_atlas_object_texture_sources()
-
-    def _handle_surface_texture_inpaint_undone_for_atlases(
-        self,
-        _snapshot: object,
-    ) -> None:
-        """Rematerialize a detached Atlas after its prior source is restored."""
-
-        self._sync_atlas_object_texture_sources()
-        self.texture_atlas_workspace.materialize_missing_atlases()
 
     def _handle_generated_object_changed_for_atlases(
         self,
@@ -3652,7 +3418,6 @@ class BlueprintWorkspace(QWidget):
         if surface_is_stale:
             self.surface_texture_generation.set_preview_context(
                 preview_levels,
-                self.initial_first_person_camera,
                 generated_model,
             )
             self._surface_viewer_preview_revision = revision
@@ -3669,16 +3434,6 @@ class BlueprintWorkspace(QWidget):
             and preserve_camera
         )
         return self._viewer_preview_revision
-
-    def _mark_surface_viewer_context_dirty(self) -> None:
-        """Invalidate Surface-only semantic or camera context."""
-
-        if (
-            self._surface_viewer_preview_revision
-            == self._viewer_preview_revision
-        ):
-            self._surface_viewer_preview_revision -= 1
-        self._queue_viewer_preview_refresh()
 
     def _queue_viewer_preview_refresh(self) -> None:
         if not self._active_viewer_preview_needs_refresh():
@@ -3754,7 +3509,6 @@ class BlueprintWorkspace(QWidget):
                     self.surface_texture_generation.get_data()
                 ),
                 texture_atlases=self.texture_atlas_workspace.get_data(),
-                initial_first_person_camera=self.initial_first_person_camera,
                 stairs=self.stairs,
             )
         except ValueError as error:
@@ -4030,20 +3784,7 @@ class BlueprintWorkspace(QWidget):
         self.doorway_preset_list.blockSignals(False)
         self._update_doorway_preset_button_state()
 
-    def _refresh_stairs_list(self) -> None:
-        """Refresh the cross-level stair records without changing placement."""
-
-        selected_index = self.stairs_list.currentRow()
-        self.stairs_list.blockSignals(True)
-        self.stairs_list.clear()
-        for stair in self.stairs:
-            self.stairs_list.addItem(_format_stair_label(stair))
-        if 0 <= selected_index < self.stairs_list.count():
-            self.stairs_list.setCurrentRow(selected_index)
-        self.stairs_list.blockSignals(False)
-        self._update_stair_button_state()
-
-    def _update_stair_button_state(self, _row: int = -1) -> None:
+    def _update_stair_button_state(self) -> None:
         placement_active = self.canvas.is_stair_placement_active()
         has_complete_endpoints = (
             self.canvas.get_stair_placement_draft() is not None
@@ -4055,11 +3796,6 @@ class BlueprintWorkspace(QWidget):
             not placement_active or has_complete_endpoints
         )
         self.stair_style_combo.setEnabled(not placement_active)
-        selected_index = self.stairs_list.currentRow()
-        self.delete_selected_stair_button.setEnabled(
-            not placement_active
-            and 0 <= selected_index < len(self.stairs)
-        )
 
     def _get_selected_doorway_preset(self) -> DoorwayPreset | None:
         selected_index = self.doorway_preset_list.currentRow()
@@ -4068,31 +3804,30 @@ class BlueprintWorkspace(QWidget):
 
         return self.doorway_presets[selected_index]
 
+    def _get_selected_placed_doorway(self) -> DoorwayData | None:
+        selected_index = self.canvas.selected_doorway_index
+        if (
+            selected_index is None
+            or selected_index < 0
+            or selected_index >= len(self.canvas.doorways)
+        ):
+            return None
+
+        return self.canvas.doorways[selected_index]
+
     def _update_doorway_preset_button_state(self) -> None:
         has_selected_preset = self._get_selected_doorway_preset() is not None
         self.remove_doorway_preset_button.setEnabled(
             has_selected_preset and len(self.doorway_presets) > 1
         )
         self.place_doorway_button.setEnabled(has_selected_preset)
+        self.save_doorway_template_button.setEnabled(
+            self._get_selected_placed_doorway() is not None
+        )
 
-    def _refresh_rooms_list(self) -> None:
-        selected_room_index = self._get_selected_room_index()
-        self._is_syncing_room_controls = True
-        self.rooms_list.clear()
-        for room_index, room in enumerate(self.current_level.rooms):
-            room_item = self._build_room_item(room_index, room)
-            self.rooms_list.addItem(room_item)
+    def _refresh_room_dependent_controls(self) -> None:
+        """Refresh features that still consume persisted room geometry."""
 
-        if (
-            selected_room_index is not None
-            and selected_room_index < self.rooms_list.count()
-        ):
-            self.rooms_list.setCurrentRow(selected_room_index)
-        self._is_syncing_room_controls = False
-        self._sync_room_controls()
-
-    def _refresh_room_lists(self) -> None:
-        self._refresh_rooms_list()
         self._refresh_uv_rooms_list()
         self._sync_uv_controls()
         self._sync_texture_creator_tab()
@@ -4123,24 +3858,6 @@ class BlueprintWorkspace(QWidget):
         room_item = QListWidgetItem(f"{room_name} ({room.height_meters:.2f} m)")
         room_item.setData(Qt.ItemDataRole.UserRole, room_index)
         return room_item
-
-    def _get_selected_room_index(self) -> int | None:
-        selected_item = self.rooms_list.currentItem()
-        if selected_item is None:
-            return None
-
-        room_index = selected_item.data(Qt.ItemDataRole.UserRole)
-        if room_index is None:
-            return None
-
-        return int(room_index)
-
-    def _get_selected_room(self) -> RoomData | None:
-        room_index = self._get_selected_room_index()
-        if room_index is None or room_index >= len(self.current_level.rooms):
-            return None
-
-        return self.current_level.rooms[room_index]
 
     def _get_selected_uv_room_index(self) -> int | None:
         selected_item = self.uv_rooms_list.currentItem()
@@ -4405,12 +4122,10 @@ class BlueprintWorkspace(QWidget):
             self.current_level_index = level_position
             self._sync_level_controls()
             self._sync_canvas_to_current_level()
-            self._refresh_room_lists()
+            self._refresh_room_dependent_controls()
 
         if self.uv_rooms_list.currentRow() != room_index:
             self.uv_rooms_list.setCurrentRow(room_index)
-        if self.rooms_list.currentRow() != room_index:
-            self.rooms_list.setCurrentRow(room_index)
         self.uv_canvas.set_selected_wall_key(wall_key)
         self._sync_uv_controls()
         self._sync_texture_creator_tab()
@@ -4520,24 +4235,12 @@ class BlueprintWorkspace(QWidget):
             self.current_level.floor_thickness_meters
         )
         self._update_floor_contour_status_label()
-        self.image_scale_spinbox.setValue(self.current_level.image_scale)
-        self.image_x_offset_spinbox.setValue(self.current_level.image_offset_x)
-        self.image_y_offset_spinbox.setValue(self.current_level.image_offset_y)
         self.include_yes_radio.setChecked(self.current_level.include_in_export)
         self.include_no_radio.setChecked(not self.current_level.include_in_export)
         if self.levels_list.currentRow() != self.current_level_index:
             self.levels_list.setCurrentRow(self.current_level_index)
         self._update_blueprint_name_label()
         self._is_syncing_level_controls = False
-
-    def _sync_room_controls(self) -> None:
-        selected_room = self._get_selected_room()
-        self._is_syncing_room_controls = True
-        if selected_room is None:
-            self.room_height_spinbox.setValue(DEFAULT_ROOM_HEIGHT_METERS)
-        else:
-            self.room_height_spinbox.setValue(selected_room.height_meters)
-        self._is_syncing_room_controls = False
 
     def _sync_uv_controls(self) -> None:
         self._is_syncing_uv_controls = True
@@ -4652,14 +4355,8 @@ class BlueprintWorkspace(QWidget):
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
         self._update_pending_stair_level_status()
-        self._refresh_room_lists()
+        self._refresh_room_dependent_controls()
         self._ensure_viewer_preview_current()
-
-    def _handle_room_selection_changed(self, _room_index: int) -> None:
-        if self._is_syncing_room_controls:
-            return
-
-        self._sync_room_controls()
 
     def _handle_height_level_changed(self, value: float) -> None:
         if self._is_syncing_level_controls:
@@ -4701,6 +4398,24 @@ class BlueprintWorkspace(QWidget):
 
     def _handle_doorway_preset_selection_changed(self, _row: int) -> None:
         self._update_doorway_preset_button_state()
+
+    def _handle_save_doorway_template_clicked(self) -> None:
+        doorway = self._get_selected_placed_doorway()
+        if doorway is None:
+            self._update_doorway_preset_button_state()
+            return
+
+        self.doorway_presets.append(
+            DoorwayPreset(
+                width_meters=doorway.width_meters,
+                height_meters=doorway.height_meters,
+                shape=doorway.shape,
+                arch_amount=doorway.arch_amount,
+            )
+        )
+        self._refresh_doorway_preset_list(
+            selected_index=len(self.doorway_presets) - 1
+        )
 
     def _handle_remove_doorway_preset_clicked(self) -> None:
         selected_index = self.doorway_preset_list.currentRow()
@@ -4754,6 +4469,7 @@ class BlueprintWorkspace(QWidget):
             )
             * 100.0
         )
+        self._update_doorway_preset_button_state()
         del amount_blocker
         del blocker
 
@@ -4976,8 +4692,6 @@ class BlueprintWorkspace(QWidget):
 
         self.stairs.append(stair)
         self.canvas.set_stair_context(self.stairs, self.current_level)
-        self._refresh_stairs_list()
-        self.stairs_list.setCurrentRow(len(self.stairs) - 1)
         self.stair_status_label.setText(
             "Added "
             f"{_format_stair_style_label(stair.style).lower()} stairs from "
@@ -5063,15 +4777,8 @@ class BlueprintWorkspace(QWidget):
             f"{self.current_level.display_name}."
         )
 
-    def _handle_stair_selected(self, stair_index: int) -> None:
-        if 0 <= stair_index < self.stairs_list.count():
-            self.stairs_list.setCurrentRow(stair_index)
-
     def _handle_stair_delete_requested(self, stair_index: int) -> None:
         self._delete_stair_at_index(stair_index)
-
-    def _handle_delete_selected_stair_clicked(self) -> None:
-        self._delete_stair_at_index(self.stairs_list.currentRow())
 
     def _delete_stair_at_index(self, stair_index: int) -> None:
         if not 0 <= stair_index < len(self.stairs):
@@ -5079,54 +4786,9 @@ class BlueprintWorkspace(QWidget):
 
         del self.stairs[stair_index]
         self.canvas.set_stair_context(self.stairs, self.current_level)
-        self._refresh_stairs_list()
+        self._update_stair_button_state()
         self.stair_status_label.setText("Stair deleted.")
         self._schedule_viewer_preview_refresh()
-
-    def _handle_set_first_person_camera_clicked(self) -> None:
-        if self.canvas.blueprint_image is None:
-            QMessageBox.information(
-                self,
-                "Blueprint required",
-                "Load a blueprint image for this level before placing the camera.",
-            )
-            return
-
-        camera = self.initial_first_person_camera
-        if camera is not None and camera.level_index == self.current_level.index:
-            z_meters = camera.pose.z
-        else:
-            level_base_z = build_level_base_z_lookup(self.levels).get(
-                self.current_level.index,
-                0.0,
-            )
-            z_meters = (
-                level_base_z + DEFAULT_FIRST_PERSON_CAMERA_HEIGHT_METERS
-            )
-
-        self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
-        self.canvas.start_first_person_camera_placement(z_meters)
-        self.first_person_camera_status_label.setText(
-            "Camera placement active: click the blueprint to place it."
-        )
-
-    def _handle_canvas_first_person_camera_changed(self, raw_camera: object) -> None:
-        if raw_camera is not None and not isinstance(
-            raw_camera,
-            InitialFirstPersonCamera,
-        ):
-            return
-        self.initial_first_person_camera = raw_camera
-        self._sync_canvas_viewer_first_person_camera()
-        self._sync_first_person_camera_controls()
-        self._mark_surface_viewer_context_dirty()
-
-    def _sync_canvas_viewer_first_person_camera(self) -> None:
-        """Use the Canvas camera as the standard viewer's FP entry pose."""
-
-        camera = self.initial_first_person_camera
-        if camera is not None:
-            self.viewer.set_first_person_camera_pose(camera.pose)
 
     def _handle_generation_settings_changed(self) -> None:
         settings = self.settings_widget.get_settings()
@@ -5142,67 +4804,6 @@ class BlueprintWorkspace(QWidget):
             settings.fullscreen_3d_viewer_screen_id
         )
         self._apply_jobs_window_screen(settings.jobs_window_screen_id)
-
-    def _handle_first_person_camera_z_changed(self, value: float) -> None:
-        if self._is_syncing_first_person_camera_controls:
-            return
-        self.canvas.update_first_person_camera_z(float(value))
-
-    def _handle_first_person_camera_light_intensity_changed(
-        self,
-        value: int,
-    ) -> None:
-        self.first_person_camera_light_value_label.setText(
-            _format_light_intensity_percent(value)
-        )
-        if self._is_syncing_first_person_camera_controls:
-            return
-        self.canvas.update_first_person_camera_light_intensity(
-            _percent_to_light_intensity(value)
-        )
-
-    def _sync_first_person_camera_controls(self) -> None:
-        camera = self.initial_first_person_camera
-        self._is_syncing_first_person_camera_controls = True
-        self.first_person_camera_z_spinbox.setEnabled(camera is not None)
-        self.first_person_camera_light_slider.setEnabled(camera is not None)
-        self.clear_first_person_camera_button.setEnabled(camera is not None)
-        if camera is None:
-            self.first_person_camera_status_label.setText("Camera: Not set")
-            light_percent = _light_intensity_to_percent(
-                DEFAULT_FIRST_PERSON_LIGHT_INTENSITY
-            )
-            self.first_person_camera_light_slider.setValue(light_percent)
-            self.first_person_camera_light_value_label.setText(
-                _format_light_intensity_percent(light_percent)
-            )
-        else:
-            self.first_person_camera_z_spinbox.setValue(camera.pose.z)
-            light_percent = _light_intensity_to_percent(camera.light_intensity)
-            self.first_person_camera_light_slider.setValue(light_percent)
-            self.first_person_camera_light_value_label.setText(
-                _format_light_intensity_percent(light_percent)
-            )
-            owner_level = next(
-                (
-                    level
-                    for level in self.levels
-                    if level.index == camera.level_index
-                ),
-                None,
-            )
-            owner_name = (
-                f"L{camera.level_index}"
-                if owner_level is None
-                else owner_level.display_name
-            )
-            self.first_person_camera_status_label.setText(
-                f"Camera: {owner_name} | "
-                f"X {camera.pose.x:.2f} m | Y {camera.pose.y:.2f} m | "
-                f"Z {camera.pose.z:.2f} m | Yaw {camera.pose.yaw_degrees:.1f} deg | "
-                f"Light {light_percent}%"
-            )
-        self._is_syncing_first_person_camera_controls = False
 
     def _handle_set_floor_contour_clicked(self) -> None:
         self.canvas.start_floor_contour_designation()
@@ -5220,41 +4821,6 @@ class BlueprintWorkspace(QWidget):
         )
         self._update_floor_contour_status_label()
         self._schedule_viewer_preview_refresh()
-
-    def _handle_room_height_changed(self, value: float) -> None:
-        if self._is_syncing_room_controls:
-            return
-
-        selected_room = self._get_selected_room()
-        if selected_room is None:
-            return
-
-        selected_room.height_meters = float(value)
-        self._refresh_room_subdivision_layout(selected_room)
-        self._refresh_room_lists()
-        self.uv_canvas.update()
-        self._schedule_viewer_preview_refresh()
-
-    def _handle_image_scale_changed(self, value: float) -> None:
-        if self._is_syncing_level_controls:
-            return
-
-        self.current_level.image_scale = value
-        self._sync_canvas_image_transform()
-
-    def _handle_image_x_offset_changed(self, value: float) -> None:
-        if self._is_syncing_level_controls:
-            return
-
-        self.current_level.image_offset_x = value
-        self._sync_canvas_image_transform()
-
-    def _handle_image_y_offset_changed(self, value: float) -> None:
-        if self._is_syncing_level_controls:
-            return
-
-        self.current_level.image_offset_y = value
-        self._sync_canvas_image_transform()
 
     def _handle_include_toggled(self, checked: bool) -> None:
         if self._is_syncing_level_controls or not checked:
@@ -5465,39 +5031,6 @@ class BlueprintWorkspace(QWidget):
         self._update_unoccupied_uv_pixels_label()
         self._schedule_viewer_preview_refresh()
 
-    def _handle_designate_room_clicked(self) -> None:
-        room_name = self.room_name_field.text().strip()
-        if not room_name:
-            QMessageBox.warning(self, "Room name required", "Enter a room name first.")
-            return
-
-        selected_vertex_ids = self.canvas.get_selected_vertex_ids()
-        if len(selected_vertex_ids) < 3:
-            QMessageBox.warning(
-                self,
-                "Select room vertices",
-                "Shift-click at least three vertices before designating a room.",
-            )
-            return
-
-        self.canvas.start_room_designation(
-            room_name,
-            selected_vertex_ids,
-            self.room_height_spinbox.value(),
-        )
-        QMessageBox.information(
-            self,
-            "Set room center",
-            "Click the vertex that marks the center of the room.",
-        )
-
-    def _delete_selected_room(self) -> None:
-        room_index = self._get_selected_room_index()
-        if room_index is None:
-            return
-
-        self.canvas.delete_room_at_index(room_index)
-
     def _apply_loaded_project(self, project_data: ProjectData) -> None:
         self._apply_project_state(
             levels=project_data.levels,
@@ -5509,9 +5042,6 @@ class BlueprintWorkspace(QWidget):
                 project_data.surface_texture_generation
             ),
             texture_atlases=project_data.texture_atlases,
-            initial_first_person_camera=(
-                project_data.initial_first_person_camera
-            ),
             stairs=project_data.stairs,
         )
 
@@ -5524,7 +5054,6 @@ class BlueprintWorkspace(QWidget):
         generation: GenerationData | None = None,
         surface_texture_generation: SurfaceTextureData | None = None,
         texture_atlases: TextureAtlasData | None = None,
-        initial_first_person_camera: InitialFirstPersonCamera | None = None,
         stairs: list[StairData] | None = None,
     ) -> None:
         if (
@@ -5545,8 +5074,6 @@ class BlueprintWorkspace(QWidget):
         self._reset_viewer_doorway_snapshots()
         self._level_blueprint_image_revisions.clear()
         self.stairs = list(stairs or [])
-        self.initial_first_person_camera = initial_first_person_camera
-        self._sync_canvas_viewer_first_person_camera()
         self.image_library_paths = self._normalize_image_library_paths(
             image_library_paths or []
         )
@@ -5564,7 +5091,7 @@ class BlueprintWorkspace(QWidget):
             selected_index=0 if self.doorway_presets else -1
         )
         self._refresh_levels_list()
-        self._refresh_stairs_list()
+        self._update_stair_button_state()
         self.stair_status_label.setText(
             "Stairs: none"
             if not self.stairs
@@ -5572,7 +5099,7 @@ class BlueprintWorkspace(QWidget):
         )
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
-        self._refresh_room_lists()
+        self._refresh_room_dependent_controls()
         self._atlas_generation_signature = None
         self._atlas_source_content_paths = None
         self._atlas_source_content_revisions = None
@@ -5581,10 +5108,7 @@ class BlueprintWorkspace(QWidget):
         self._clear_atlas_object_preview()
         self.generation.set_data(generation)
         self.texture_atlas_workspace.set_data(texture_atlases)
-        self.surface_texture_generation.set_levels(
-            self.levels,
-            self.initial_first_person_camera,
-        )
+        self.surface_texture_generation.set_levels(self.levels)
         self.surface_texture_generation.set_data(
             surface_texture_generation
         )
@@ -5607,16 +5131,9 @@ class BlueprintWorkspace(QWidget):
             floor_contour_vertex_ids=(
                 self.current_level.floor_contour_vertex_ids
             ),
-            image_scale=self.current_level.image_scale,
-            image_offset_x=self.current_level.image_offset_x,
-            image_offset_y=self.current_level.image_offset_y,
         )
         self.current_level.image_path = normalized_path
         self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
-        self.canvas.set_initial_first_person_camera_context(
-            self.initial_first_person_camera,
-            self.current_level,
-        )
         self.canvas.set_stair_context(self.stairs, self.current_level)
         self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
         self._update_blueprint_name_label()
@@ -5635,26 +5152,11 @@ class BlueprintWorkspace(QWidget):
                 self.current_level.floor_contour_vertex_ids
             ),
             image_path=self.current_level.image_path,
-            image_scale=self.current_level.image_scale,
-            image_offset_x=self.current_level.image_offset_x,
-            image_offset_y=self.current_level.image_offset_y,
         )
         if self.canvas.blueprint_image is not None:
             self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
-        self.canvas.set_initial_first_person_camera_context(
-            self.initial_first_person_camera,
-            self.current_level,
-        )
         self.canvas.set_stair_context(self.stairs, self.current_level)
         self._update_blueprint_name_label()
-        self._sync_first_person_camera_controls()
-
-    def _sync_canvas_image_transform(self) -> None:
-        self.canvas.set_image_transform(
-            image_scale=self.current_level.image_scale,
-            image_offset_x=self.current_level.image_offset_x,
-            image_offset_y=self.current_level.image_offset_y,
-        )
 
     def _update_blueprint_name_label(self) -> None:
         image_path = self.current_level.image_path
@@ -5794,33 +5296,7 @@ def _normalize_degree_value(value: int) -> int:
     return int(value) % 360
 
 
-def _light_intensity_to_percent(intensity: float) -> int:
-    return int(round(float(intensity) * FIRST_PERSON_LIGHT_PERCENT_SCALE))
-
-
-def _percent_to_light_intensity(percent: int) -> float:
-    return float(percent) / FIRST_PERSON_LIGHT_PERCENT_SCALE
-
-
-def _format_light_intensity_percent(percent: int) -> str:
-    return f"{int(percent)}%"
-
-
 # ### Text helpers ###
-def _format_stair_label(stair: StairData) -> str:
-    style_label = _format_stair_style_label(stair.style)
-    guide_count = len(stair.intermediate_sections)
-    route_label = (
-        "straight"
-        if guide_count == 0
-        else f"curved, {guide_count} guide{'s' if guide_count != 1 else ''}"
-    )
-    return (
-        f"{style_label}: L{stair.start_level_index} "
-        f"to L{stair.end_level_index} ({route_label})"
-    )
-
-
 def _format_stair_style_label(style: str) -> str:
     """Return the human-readable name for one persisted stair style."""
 
@@ -5939,10 +5415,15 @@ def _build_stair_data_from_placement(placement: object) -> StairData:
 
 
 def _format_doorway_preset_label(doorway_preset: DoorwayPreset) -> str:
-    return (
+    dimension_text = (
         f"{doorway_preset.width_meters:.2f} m × "
         f"{doorway_preset.height_meters:.2f} m"
     )
+    if doorway_preset.shape != DOORWAY_SHAPE_ARCH:
+        return dimension_text
+
+    arch_amount_percent = round(doorway_preset.arch_amount * 100.0, 1)
+    return f"{dimension_text} — Arch {arch_amount_percent:g}%"
 
 
 def _build_wall_aspect_ratio_text(placement: UvWallPlacement | None) -> str:

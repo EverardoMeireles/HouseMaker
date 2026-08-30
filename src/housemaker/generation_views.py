@@ -125,15 +125,6 @@ class VideoInpaintView(QWidget):
             self._cancel_active_stroke()
         self.update()
 
-    def undo_last_stroke(self) -> None:
-        self._cancel_active_stroke()
-        if not self._strokes:
-            return
-        self._strokes.pop()
-        self._rebuild_mask()
-        self.strokes_changed.emit(self.get_strokes())
-        self.update()
-
     def clear_mask(self) -> None:
         self._cancel_active_stroke()
         if not self._strokes and not self.has_selection():

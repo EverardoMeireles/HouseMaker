@@ -17,7 +17,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtGui import QImage, QWheelEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QScrollArea, QWidget
+from PySide6.QtWidgets import QApplication, QLabel, QScrollArea, QWidget
 
 from housemaker.blueprint_canvas import BlueprintCanvas
 from housemaker.glb import convert_to_glb
@@ -1026,7 +1026,7 @@ class FloorContourTests(unittest.TestCase):
 
         workspace.close()
 
-    def test_generals_tab_scrolls_without_crowding_image_controls(self) -> None:
+    def test_include_controls_are_inside_the_levels_section(self) -> None:
         from housemaker.main import BlueprintWorkspace
 
         workspace = BlueprintWorkspace()
@@ -1035,23 +1035,27 @@ class FloorContourTests(unittest.TestCase):
         workspace.show()
         _qt_application.processEvents()
 
-        generals_tab = workspace.side_tabs.widget(0)
-        self.assertIsInstance(generals_tab, QScrollArea)
-        self.assertGreater(generals_tab.verticalScrollBar().maximum(), 0)
-
-        row_widgets = [
-            workspace.image_scale_spinbox,
-            workspace.image_x_offset_spinbox,
-            workspace.image_y_offset_spinbox,
+        levels_label = next(
+            label
+            for label in workspace.findChildren(QLabel)
+            if label.text() == "Levels"
+        )
+        controls = (
+            levels_label,
+            workspace.levels_list,
             workspace.include_yes_radio,
+            workspace.save_button,
+        )
+        top_positions = [
+            control.mapTo(workspace, QPoint()).y()
+            for control in controls
         ]
-        row_bounds = []
-        for widget in row_widgets:
-            top = widget.mapTo(workspace, QPoint()).y()
-            row_bounds.append((top, top + widget.height()))
 
-        for previous_bounds, next_bounds in zip(row_bounds, row_bounds[1:]):
-            self.assertGreaterEqual(next_bounds[0] - previous_bounds[1], 8)
+        self.assertEqual(top_positions, sorted(top_positions))
+        self.assertIs(
+            workspace.include_yes_radio.parentWidget(),
+            workspace.include_no_radio.parentWidget(),
+        )
 
         workspace.close()
 
@@ -1077,9 +1081,6 @@ class FloorContourTests(unittest.TestCase):
             ("level scale", workspace.level_scale_spinbox),
             ("level X offset", workspace.level_x_offset_spinbox),
             ("level Y offset", workspace.level_y_offset_spinbox),
-            ("blueprint scale", workspace.image_scale_spinbox),
-            ("blueprint X offset", workspace.image_x_offset_spinbox),
-            ("blueprint Y offset", workspace.image_y_offset_spinbox),
         )
         for control_name, control in controls:
             with self.subTest(control=control_name):

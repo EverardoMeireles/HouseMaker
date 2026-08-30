@@ -35,23 +35,11 @@ from housemaker.texture_atlas_view import TextureAtlasEntry
 from housemaker.texture_atlas_workspace import (
     build_atlas_wall_texture_source_id,
 )
-from housemaker.unused_face_removal import ALL_CAMERA_IDS
 
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
 _qt_application.setQuitOnLastWindowClosed(False)
-
-
-# ### Test constants ###
-_EXPECTED_UNUSED_FACE_CAMERA_LABELS = {
-    "pos_x": "+X",
-    "neg_x": "-X",
-    "pos_y": "+Y",
-    "neg_y": "-Y",
-    "top": "Top",
-    "bottom": "Bottom",
-}
 
 
 # ### Main-workspace external viewer integration tests ###
@@ -491,7 +479,6 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
         expected_external_widgets = (
             panel.viewer,
             panel.details_panel,
-            panel.unused_face_camera_controls,
             panel.object_list,
             panel.delete_object_button,
             panel.statistics_label,
@@ -602,112 +589,6 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
         self.assertIs(
             self._canvas_3d_tab_widget(),
             self.workspace.viewer,
-        )
-
-    def test_unused_face_camera_controls_follow_object_panel_to_external_window(
-        self,
-    ) -> None:
-        screen_id = "screen:external-test"
-        combo = self.workspace.settings_widget.fullscreen_3d_viewer_screen_combo
-        combo.addItem("External test display", screen_id)
-        self.workspace.settings_widget.unused_face_removal_checkbox.setChecked(
-            True
-        )
-
-        with patch(
-            "housemaker.main.resolve_fullscreen_3d_viewer_screen",
-            return_value=_primary_screen(),
-        ):
-            combo.setCurrentIndex(combo.findData(screen_id))
-            self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.generation
-            )
-            _qt_application.processEvents()
-
-        panel = self.workspace.generation.object_3d_panel
-        controls = panel.unused_face_camera_controls
-        checkboxes = panel.unused_face_camera_checkboxes
-        panel.viewer.set_model(_generated_box_model())
-        _qt_application.processEvents()
-        self._assert_externally_hosted_viewer_is(panel)
-        self.assertIs(controls.parentWidget(), panel.details_panel)
-        self.assertTrue(controls.isEnabled())
-        self.assertTrue(controls.isVisibleTo(panel))
-        self.assertEqual(tuple(checkboxes), ALL_CAMERA_IDS)
-        self.assertTrue(
-            all(checkbox.isChecked() for checkbox in checkboxes.values())
-        )
-        self.assertTrue(
-            panel.viewer.get_unused_face_camera_indicators_visible()
-        )
-        self.assertEqual(
-            tuple(panel.viewer.unused_face_camera_indicator_items),
-            ALL_CAMERA_IDS,
-        )
-        labels = panel.viewer.unused_face_camera_indicator_labels
-        self.assertEqual(
-            {
-                camera_id: label.text
-                for camera_id, label in labels.items()
-            },
-            _EXPECTED_UNUSED_FACE_CAMERA_LABELS,
-        )
-        self.assertTrue(
-            all(
-                item.visible() and item in panel.viewer.view.items
-                for camera_items in (
-                    panel.viewer.unused_face_camera_indicator_items.values()
-                )
-                for item in camera_items
-            )
-        )
-        self.assertTrue(
-            all(
-                label.visible() and label in panel.viewer.view.items
-                for label in labels.values()
-            )
-        )
-
-        checkboxes["bottom"].setChecked(False)
-        _qt_application.processEvents()
-
-        self.assertEqual(
-            panel.get_enabled_postprocess_camera_ids(),
-            tuple(
-                camera_id
-                for camera_id in ALL_CAMERA_IDS
-                if camera_id != "bottom"
-            ),
-        )
-        self.assertFalse(
-            any(
-                item.visible()
-                for item in (
-                    panel.viewer.unused_face_camera_indicator_items["bottom"]
-                )
-            )
-        )
-        self.assertFalse(labels["bottom"].visible())
-        self.assertTrue(
-            all(
-                item.visible()
-                for camera_id, camera_items in (
-                    panel.viewer.unused_face_camera_indicator_items.items()
-                )
-                if camera_id != "bottom"
-                for item in camera_items
-            )
-        )
-        self.assertTrue(
-            all(
-                label.visible()
-                for camera_id, label in labels.items()
-                if camera_id != "bottom"
-            )
-        )
-        self.assertIs(
-            self.workspace.generation.right_view_stack.currentWidget(),
-            self.workspace.generation.texture_view_page,
         )
 
     def test_canvas_preview_is_not_refreshed_from_another_3d_tab(self) -> None:

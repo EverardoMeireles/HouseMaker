@@ -30,7 +30,6 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -112,13 +111,8 @@ from housemaker.texture_atlas_view import (
     UvTriangle,
 )
 from housemaker.unused_face_removal import (
-    ALL_CAMERA_IDS,
-    CAMERA_OPTIONS,
-    UncheckedCameraFacePurgeOptions,
-    UncheckedCameraFacePurgeResult,
     UnusedFaceRemovalOptions,
     UnusedFaceRemovalProgress,
-    purge_faces_visible_from_unchecked_cameras_from_glb,
     remove_unused_faces_from_glb,
 )
 from housemaker.video_source import (
@@ -133,8 +127,7 @@ from housemaker.viewer import GlbViewerWidget
 MIN_BRUSH_RADIUS_PIXELS = 2
 MAX_BRUSH_RADIUS_PIXELS = 160
 DEFAULT_BRUSH_RADIUS_PIXELS = 24
-AMBIENT_LIGHT_PERCENT_SCALE = 100
-OBJECT_GENERATION_DEFAULT_AMBIENT_LIGHT_INTENSITY = 1.0
+OBJECT_GENERATION_AMBIENT_LIGHT_INTENSITY = 1.0
 VIEW_STRETCH = 1
 CONTROL_STRETCH = 0
 INTERRUPT_POLL_SECONDS = 0.01
@@ -165,10 +158,8 @@ OBJECT_OPERATION_UNDO_STACK_PIPELINE_KEY = "object_operation_undo_stack"
 MAX_OBJECT_OPERATION_UNDO_COUNT = 10
 OBJECT_OPERATION_GENERATE_MODEL = "generate_model"
 OBJECT_OPERATION_GENERATE_TEXTURE = "generate_texture"
-OBJECT_OPERATION_PURGE_FACES = "purge_faces"
 GENERATION_JOB_KIND_MODEL = "Object generation"
 GENERATION_JOB_KIND_TEXTURE = "Object texture generation"
-GENERATION_JOB_KIND_FACE_PURGE = "Object face purge"
 SYMMETRIC_DIVISION_PIPELINE_KEY = "symmetric_division"
 SYMMETRIC_DIVISION_TEXTURE_CONTENT_HALF = "left"
 SYMMETRIC_TEXTURE_RESOLUTIONS = SYMMETRIC_SQUARE_PAIR_CONTENT_RESOLUTIONS
@@ -232,7 +223,6 @@ class _ObjectJobSignalRelay(QObject):
     """Tag worker events on a GUI-affine QObject before workspace dispatch."""
 
     pair_succeeded = Signal(str, object, object)
-    single_succeeded = Signal(str, object)
     failed = Signal(str, str)
     progress = Signal(str, str)
     thread_finished = Signal(str)
@@ -244,10 +234,6 @@ class _ObjectJobSignalRelay(QObject):
     @Slot(object, object)
     def forward_pair_succeeded(self, first: object, second: object) -> None:
         self.pair_succeeded.emit(self._operation_id, first, second)
-
-    @Slot(object)
-    def forward_single_succeeded(self, outcome: object) -> None:
-        self.single_succeeded.emit(self._operation_id, outcome)
 
     @Slot(str)
     def forward_failed(self, message: str) -> None:
@@ -268,11 +254,7 @@ class _ObjectJobRuntime:
 
     operation: _ActiveObjectOperation
     thread: QThread
-    worker: (
-        GenerationWorker
-        | TextureRegenerationWorker
-        | UncheckedCameraFacePurgeWorker
-    )
+    worker: GenerationWorker | TextureRegenerationWorker
     relay: _ObjectJobSignalRelay
     generation_request: GenerationRequest | None = None
     requested_name: str = ""
@@ -423,7 +405,6 @@ class GenerationRequest:
         frame_index: int,
         selected_object_bgra: np.ndarray,
         settings: GenerationServiceSettings,
-        enabled_camera_ids: Sequence[str] = ALL_CAMERA_IDS,
         geometry_only: bool = False,
         symmetric_division_enabled: bool = False,
         symmetric_division_orientation: str = (
@@ -447,12 +428,6 @@ class GenerationRequest:
                 "Geometry-only generation cannot apply symmetric division."
             )
         self.symmetric_division_orientation = normalized_orientation
-        requested_camera_ids = tuple(str(value) for value in enabled_camera_ids)
-        self.enabled_camera_ids = tuple(
-            camera_id
-            for camera_id in ALL_CAMERA_IDS
-            if camera_id in requested_camera_ids
-        )
 
 
 @dataclass(frozen=True)
@@ -651,46 +626,6 @@ class _SavedObjectTextureRegeneration:
 
 
 @dataclass(frozen=True)
-class UncheckedCameraFacePurgeRequest:
-    """Owned selected-object input for one local face purge."""
-
-    object_id: str
-    model_glb: bytes
-    unchecked_camera_ids: tuple[str, ...]
-
-    def __post_init__(self) -> None:
-        object_id = str(self.object_id).strip()
-        if not object_id:
-            raise ValueError("Face purge requires an object ID.")
-        model_glb = bytes(self.model_glb)
-        if not model_glb:
-            raise ValueError("Face purge requires a model GLB.")
-        requested_ids = tuple(str(value) for value in self.unchecked_camera_ids)
-        unchecked_camera_ids = tuple(
-            camera_id
-            for camera_id in ALL_CAMERA_IDS
-            if camera_id in requested_ids
-        )
-        if not unchecked_camera_ids:
-            raise ValueError("Uncheck at least one camera before purging faces.")
-        object.__setattr__(self, "object_id", object_id)
-        object.__setattr__(self, "model_glb", model_glb)
-        object.__setattr__(
-            self,
-            "unchecked_camera_ids",
-            unchecked_camera_ids,
-        )
-
-
-@dataclass(frozen=True)
-class UncheckedCameraFacePurgeOutcome:
-    """Immutable request paired with its filtered geometry result."""
-
-    request: UncheckedCameraFacePurgeRequest
-    result: UncheckedCameraFacePurgeResult
-
-
-@dataclass(frozen=True)
 class StagedMeshyGenerationResult(MeshyGenerationResult):
     """Final textured result plus auditable geometry-processing revisions."""
 
@@ -701,12 +636,6 @@ class StagedMeshyGenerationResult(MeshyGenerationResult):
     retained_face_count: int = 0
     removed_face_count: int = 0
     protected_face_count: int = 0
-    enabled_camera_ids: tuple[str, ...] = ()
-    unchecked_camera_ids: tuple[str, ...] = ()
-    camera_face_purge_applied: bool = False
-    purge_original_face_count: int = 0
-    purge_retained_face_count: int = 0
-    purge_removed_face_count: int = 0
     unused_face_removal_applied: bool = False
     geometry_only: bool = False
 
@@ -762,17 +691,7 @@ class MeshyImagePlanner:
                 progress_callback("Meshy generation complete. Downloading GLB...")
 
         use_unused_face_removal = request.settings.unused_face_removal
-        unchecked_camera_ids = tuple(
-            camera_id
-            for camera_id in ALL_CAMERA_IDS
-            if camera_id not in request.enabled_camera_ids
-        )
-        use_camera_face_purge = bool(unchecked_camera_ids)
-        if (
-            not request.geometry_only
-            and not use_camera_face_purge
-            and not use_unused_face_removal
-        ):
+        if not request.geometry_only and not use_unused_face_removal:
             _raise_if_generation_cancelled(cancel_event)
             return request_image_to_3d_model(
                 api_key=request.settings.meshy_api_key,
@@ -782,10 +701,6 @@ class MeshyImagePlanner:
                 cancel_event=cancel_event,
             )
 
-        if use_unused_face_removal and not request.enabled_camera_ids:
-            raise ValueError(
-                "Select at least one post-processing camera before generating."
-            )
         if progress_callback is not None:
             progress_callback("Submitting geometry-only Meshy task...")
         _raise_if_generation_cancelled(cancel_event)
@@ -799,43 +714,6 @@ class MeshyImagePlanner:
         )
 
         processed_glb_bytes = geometry_result.glb_bytes
-        purge_original_face_count = 0
-        purge_retained_face_count = 0
-        purge_removed_face_count = 0
-        if use_camera_face_purge:
-            def report_face_purge(
-                update: UnusedFaceRemovalProgress,
-            ) -> None:
-                if progress_callback is None:
-                    return
-                if update.stage == "capturing":
-                    camera_suffix = (
-                        ""
-                        if update.camera_id is None
-                        else f" ({update.camera_id})"
-                    )
-                    progress_callback(
-                        "Capturing unchecked-camera views"
-                        + camera_suffix
-                        + "..."
-                    )
-                elif update.stage == "exporting":
-                    progress_callback("Saving camera-purged geometry...")
-
-            purged = purge_faces_visible_from_unchecked_cameras_from_glb(
-                processed_glb_bytes,
-                unchecked_camera_ids=unchecked_camera_ids,
-                options=UncheckedCameraFacePurgeOptions(),
-                cancel_requested=(
-                    None if cancel_event is None else cancel_event.is_set
-                ),
-                progress_callback=report_face_purge,
-            )
-            processed_glb_bytes = purged.glb_bytes
-            purge_original_face_count = purged.original_face_count
-            purge_retained_face_count = purged.retained_face_count
-            purge_removed_face_count = purged.removed_face_count
-
         original_face_count = 0
         retained_face_count = 0
         removed_face_count = 0
@@ -866,9 +744,7 @@ class MeshyImagePlanner:
 
             removed = remove_unused_faces_from_glb(
                 processed_glb_bytes,
-                options=UnusedFaceRemovalOptions(
-                    enabled_camera_ids=request.enabled_camera_ids,
-                ),
+                options=UnusedFaceRemovalOptions(),
                 cancel_requested=(
                     None if cancel_event is None else cancel_event.is_set
                 ),
@@ -892,12 +768,6 @@ class MeshyImagePlanner:
                 retained_face_count=retained_face_count,
                 removed_face_count=removed_face_count,
                 protected_face_count=protected_face_count,
-                enabled_camera_ids=request.enabled_camera_ids,
-                unchecked_camera_ids=unchecked_camera_ids,
-                camera_face_purge_applied=use_camera_face_purge,
-                purge_original_face_count=purge_original_face_count,
-                purge_retained_face_count=purge_retained_face_count,
-                purge_removed_face_count=purge_removed_face_count,
                 unused_face_removal_applied=use_unused_face_removal,
                 geometry_only=True,
             )
@@ -934,12 +804,6 @@ class MeshyImagePlanner:
             retained_face_count=retained_face_count,
             removed_face_count=removed_face_count,
             protected_face_count=protected_face_count,
-            enabled_camera_ids=request.enabled_camera_ids,
-            unchecked_camera_ids=unchecked_camera_ids,
-            camera_face_purge_applied=use_camera_face_purge,
-            purge_original_face_count=purge_original_face_count,
-            purge_retained_face_count=purge_retained_face_count,
-            purge_removed_face_count=purge_removed_face_count,
             unused_face_removal_applied=use_unused_face_removal,
         )
 
@@ -1005,8 +869,6 @@ class MeshyModelExecutor:
 class ObjectGenerationViewerPanel(QWidget):
     """Keep the generated-object selector with its detachable 3D viewer."""
 
-    camera_selection_changed = Signal()
-
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._is_external_presentation_active = False
@@ -1022,36 +884,6 @@ class ObjectGenerationViewerPanel(QWidget):
         details_layout = QVBoxLayout(self.details_panel)
         details_layout.setContentsMargins(0, 0, 0, 0)
         details_layout.setSpacing(4)
-
-        self.unused_face_camera_controls = QWidget()
-        self.unused_face_camera_controls.setObjectName(
-            "unused_face_camera_controls"
-        )
-        camera_layout = QGridLayout(self.unused_face_camera_controls)
-        camera_layout.setContentsMargins(4, 2, 4, 2)
-        camera_layout.setSpacing(8)
-        self.postprocess_camera_label = QLabel("Post-processing cameras")
-        camera_layout.addWidget(self.postprocess_camera_label, 0, 0, 1, 3)
-        self.unused_face_camera_checkboxes: dict[str, QCheckBox] = {}
-        for index, (camera_id, label) in enumerate(CAMERA_OPTIONS):
-            checkbox = QCheckBox(label)
-            checkbox.setObjectName(
-                f"unused_face_camera_{camera_id}_checkbox"
-            )
-            checkbox.setChecked(True)
-            checkbox.setToolTip(
-                "Checked cameras protect visible faces during unused-face "
-                "removal. Faces visible from unchecked cameras are deleted "
-                "before the next generation or by Purge faces. The camera "
-                "marker is illustrative only."
-            )
-            checkbox.toggled.connect(
-                lambda _checked: self.camera_selection_changed.emit()
-            )
-            self.unused_face_camera_checkboxes[camera_id] = checkbox
-            camera_layout.addWidget(checkbox, 1 + index // 3, index % 3)
-        camera_layout.setColumnStretch(3, 1)
-        details_layout.addWidget(self.unused_face_camera_controls)
 
         self.object_list = QListWidget()
         self.object_list.setObjectName("generated_objects_list")
@@ -1119,19 +951,6 @@ class ObjectGenerationViewerPanel(QWidget):
         )
         self._layout.invalidate()
 
-    def get_enabled_postprocess_camera_ids(self) -> tuple[str, ...]:
-        """Return checked cameras in the canonical processing order."""
-
-        return tuple(
-            camera_id
-            for camera_id in ALL_CAMERA_IDS
-            if self.unused_face_camera_checkboxes[camera_id].isChecked()
-        )
-
-    def set_postprocess_camera_controls_enabled(self, enabled: bool) -> None:
-        self.unused_face_camera_controls.setEnabled(bool(enabled))
-
-
 # ### Background progress mapping ###
 class _BoundedProgressMapper:
     """Map provider-local percentages into one monotonic job phase."""
@@ -1172,13 +991,9 @@ class _ObjectGenerationProgressMapper(_BoundedProgressMapper):
 
     def __init__(self, request: GenerationRequest) -> None:
         super().__init__()
-        unchecked_camera_ids = set(ALL_CAMERA_IDS) - set(
-            request.enabled_camera_ids
-        )
         self._uses_staged_pipeline = bool(
             request.geometry_only
             or request.settings.unused_face_removal
-            or unchecked_camera_ids
         )
         self._geometry_only = request.geometry_only
         self._texture_phase = False
@@ -1531,61 +1346,6 @@ class TextureRegenerationWorker(QObject):
         return final_fingerprint
 
 
-class UncheckedCameraFacePurgeWorker(QObject):
-    """Remove selected-model faces exposed to currently unchecked cameras."""
-
-    succeeded = Signal(object)
-    failed = Signal(str)
-    finished = Signal()
-    progress = Signal(str)
-
-    def __init__(self, request: UncheckedCameraFacePurgeRequest) -> None:
-        super().__init__()
-        self._request = request
-        self._cancel_event = threading.Event()
-
-    def cancel(self) -> None:
-        self._cancel_event.set()
-
-    @Slot()
-    def run(self) -> None:
-        def report_progress(update: UnusedFaceRemovalProgress) -> None:
-            if update.stage == "capturing":
-                camera_suffix = (
-                    "" if update.camera_id is None else f" ({update.camera_id})"
-                )
-                self.progress.emit(
-                    "Capturing unchecked-camera views" + camera_suffix + "..."
-                )
-            elif update.stage == "exporting":
-                self.progress.emit("Saving camera-purged geometry...")
-
-        try:
-            result = purge_faces_visible_from_unchecked_cameras_from_glb(
-                self._request.model_glb,
-                unchecked_camera_ids=self._request.unchecked_camera_ids,
-                options=UncheckedCameraFacePurgeOptions(),
-                cancel_requested=self._cancel_event.is_set,
-                progress_callback=report_progress,
-            )
-            _raise_if_generation_cancelled(self._cancel_event)
-            outcome = UncheckedCameraFacePurgeOutcome(
-                request=self._request,
-                result=result,
-            )
-        except _GenerationCancelled:
-            return
-        except Exception as error:
-            if self._cancel_event.is_set():
-                return
-            self.failed.emit(str(error) or type(error).__name__)
-            return
-        else:
-            self.succeeded.emit(outcome)
-        finally:
-            self.finished.emit()
-
-
 # ### Generation workspace ###
 class GenerationWorkspace(QWidget):
     """Manual video selection and Meshy Image-to-3D workspace."""
@@ -1594,7 +1354,6 @@ class GenerationWorkspace(QWidget):
     generated_object_deleted = Signal(str)
     generation_completed = Signal(object, object)
     texture_regeneration_completed = Signal(object, object)
-    face_purge_completed = Signal(object, object)
     generated_object_changed = Signal(object, object)
     generated_object_placement_changed = Signal(object)
     operation_cancelled = Signal(str, object)
@@ -1642,10 +1401,7 @@ class GenerationWorkspace(QWidget):
         self._object_job_runtimes: dict[str, _ObjectJobRuntime] = {}
         self._generation_thread: QThread | None = None
         self._generation_worker: (
-            GenerationWorker
-            | TextureRegenerationWorker
-            | UncheckedCameraFacePurgeWorker
-            | None
+            GenerationWorker | TextureRegenerationWorker | None
         ) = None
         self._generated_model: GeneratedModel | None = None
         self._generated_model_cache: dict[str, GeneratedModel] = {}
@@ -2262,20 +2018,6 @@ class GenerationWorkspace(QWidget):
             return False
         return self.delete_generated_object(self._selected_object_id)
 
-    def purge_selected_object_faces(self) -> bool:
-        """Delete faces visible from every currently unchecked camera."""
-
-        request = self._build_unchecked_camera_face_purge_request()
-        if request is None:
-            return False
-        if self._object_has_active_mutation_job(request.object_id):
-            self.status_label.setText(
-                "Wait for the selected object's active job to finish."
-            )
-            return False
-        self._start_unchecked_camera_face_purge(request)
-        return True
-
     def regenerate_selected_object_texture(self) -> bool:
         """Compatibility alias for :meth:`generate_selected_object_texture`."""
 
@@ -2359,7 +2101,6 @@ class GenerationWorkspace(QWidget):
         operation = str(snapshot.get("operation", "object change"))
         operation_label = {
             OBJECT_OPERATION_GENERATE_TEXTURE: "texture generation",
-            OBJECT_OPERATION_PURGE_FACES: "face purge",
         }.get(operation, "object change")
         status_suffix = (
             " Some superseded files could not be removed."
@@ -2673,65 +2414,6 @@ class GenerationWorkspace(QWidget):
         self._sync_controls()
         return True
 
-    def _start_unchecked_camera_face_purge(
-        self,
-        request: UncheckedCameraFacePurgeRequest,
-    ) -> None:
-        """Start one local face-purge request off the UI thread."""
-
-        if self._object_has_active_mutation_job(request.object_id):
-            self.status_label.setText(
-                "Wait for the selected object's active job to finish."
-            )
-            return
-        operation = _ActiveObjectOperation(
-            kind=OBJECT_OPERATION_PURGE_FACES,
-            target_object_id=request.object_id,
-        )
-        thread = QThread(self)
-        worker = UncheckedCameraFacePurgeWorker(request)
-        relay = _ObjectJobSignalRelay(operation.operation_id, self)
-        record = self._find_generated_object_record(request.object_id)
-        managed_job_id = self._create_managed_job(
-            operation,
-            kind=GENERATION_JOB_KIND_FACE_PURGE,
-            requested_name=None,
-            default_name=(
-                "Object face purge"
-                if record is None
-                else f"Purge faces: {record.object_name}"
-            ),
-            stage="Preparing unchecked-camera face purge...",
-        )
-        runtime = _ObjectJobRuntime(
-            operation=operation,
-            thread=thread,
-            worker=worker,
-            relay=relay,
-            managed_job_id=managed_job_id,
-        )
-        self._register_object_job_runtime(runtime)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.succeeded.connect(relay.forward_single_succeeded)
-        worker.failed.connect(relay.forward_failed)
-        worker.progress.connect(relay.forward_progress)
-        relay.single_succeeded.connect(
-            self._handle_job_face_purge_succeeded
-        )
-        relay.failed.connect(self._handle_job_face_purge_failed)
-        relay.progress.connect(self._handle_job_generation_progress)
-        relay.thread_finished.connect(
-            self._handle_object_job_thread_finished
-        )
-        worker.finished.connect(worker.deleteLater)
-        worker.finished.connect(thread.quit)
-        thread.finished.connect(relay.forward_thread_finished)
-        thread.finished.connect(thread.deleteLater)
-        self.status_label.setText("Preparing unchecked-camera face purge...")
-        thread.start()
-        self._sync_controls()
-
     # ### Multi-job runtime helpers ###
     def _take_requested_job_name(self) -> str:
         """Snapshot and clear the optional name for the next accepted job."""
@@ -2926,7 +2608,7 @@ class GenerationWorkspace(QWidget):
         self.object_3d_panel = ObjectGenerationViewerPanel()
         self.result_view = self.object_3d_panel.viewer
         self.result_view.set_ambient_light_intensity(
-            OBJECT_GENERATION_DEFAULT_AMBIENT_LIGHT_INTENSITY
+            OBJECT_GENERATION_AMBIENT_LIGHT_INTENSITY
         )
         self.generated_objects_list = self.object_3d_panel.object_list
         self.delete_generated_object_button = (
@@ -2935,9 +2617,6 @@ class GenerationWorkspace(QWidget):
         self.model_statistics_label = self.object_3d_panel.statistics_label
         self.generated_objects_list.currentItemChanged.connect(
             self._handle_generated_object_selection_changed
-        )
-        self.object_3d_panel.camera_selection_changed.connect(
-            self._sync_controls
         )
         self.delete_generated_object_button.clicked.connect(
             self._handle_delete_generated_object_clicked
@@ -3019,25 +2698,6 @@ class GenerationWorkspace(QWidget):
         meshy_target_layout.addWidget(self.meshy_target_polycount_spinbox)
         buttons_layout.addWidget(self.meshy_target_polycount_control)
 
-        buttons_layout.addWidget(QLabel("Ambient"))
-        self.ambient_light_slider = QSlider(Qt.Orientation.Horizontal)
-        self.ambient_light_slider.setObjectName("ambient_light_slider")
-        self.ambient_light_slider.setRange(0, AMBIENT_LIGHT_PERCENT_SCALE)
-        self.ambient_light_slider.setValue(
-            round(
-                self.result_view.get_ambient_light_intensity()
-                * AMBIENT_LIGHT_PERCENT_SCALE
-            )
-        )
-        self.ambient_light_slider.setFixedWidth(100)
-        self.ambient_light_slider.setToolTip(
-            "Ambient light keeps the generated object visible on unlit sides."
-        )
-        self.ambient_light_slider.valueChanged.connect(
-            self._handle_ambient_light_changed
-        )
-        buttons_layout.addWidget(self.ambient_light_slider)
-
         self.textures_checkbox = QCheckBox("Textures")
         self.textures_checkbox.setObjectName("textures_checkbox")
         self.textures_checkbox.setChecked(True)
@@ -3068,8 +2728,16 @@ class GenerationWorkspace(QWidget):
         self._mask_mode_button_group.addButton(self.paint_mask_button)
         self._mask_mode_button_group.addButton(self.erase_mask_button)
         self.paint_mask_button.toggled.connect(self._handle_mask_mode_changed)
-        buttons_layout.addWidget(self.paint_mask_button)
-        buttons_layout.addWidget(self.erase_mask_button)
+        self.mask_mode_control = QWidget()
+        self.mask_mode_control.setObjectName(
+            "object_generation_mask_mode_control"
+        )
+        mask_mode_layout = QVBoxLayout(self.mask_mode_control)
+        mask_mode_layout.setContentsMargins(0, 0, 0, 0)
+        mask_mode_layout.setSpacing(0)
+        mask_mode_layout.addWidget(self.paint_mask_button)
+        mask_mode_layout.addWidget(self.erase_mask_button)
+        buttons_layout.addWidget(self.mask_mode_control)
 
         buttons_layout.addWidget(QLabel("Brush"))
         self.brush_size_spinbox = QSpinBox()
@@ -3083,10 +2751,6 @@ class GenerationWorkspace(QWidget):
             self.video_view.set_brush_radius_pixels
         )
         buttons_layout.addWidget(self.brush_size_spinbox)
-
-        self.undo_mask_button = QPushButton("Undo stroke")
-        self.undo_mask_button.clicked.connect(self.video_view.undo_last_stroke)
-        buttons_layout.addWidget(self.undo_mask_button)
 
         self.clear_mask_button = QPushButton("Clear mask")
         self.clear_mask_button.clicked.connect(self.video_view.clear_mask)
@@ -3140,8 +2804,6 @@ class GenerationWorkspace(QWidget):
         self.generate_button.clicked.connect(self.generate)
         buttons_layout.addWidget(self.generate_button)
 
-        buttons_layout.addSpacing(30)
-
         self.generate_geometry_button = QPushButton("Generate geometry")
         self.generate_geometry_button.setObjectName("generate_geometry_button")
         self.generate_geometry_button.setMinimumHeight(38)
@@ -3165,17 +2827,7 @@ class GenerationWorkspace(QWidget):
         buttons_layout.addWidget(self.generate_texture_button)
         self.regenerate_texture_button = self.generate_texture_button
 
-        self.purge_faces_button = QPushButton("Purge faces")
-        self.purge_faces_button.setObjectName("purge_faces_button")
-        self.purge_faces_button.setMinimumHeight(38)
-        self.purge_faces_button.setToolTip(
-            "Delete faces of the selected generated object that are visible "
-            "from any unchecked post-processing camera."
-        )
-        self.purge_faces_button.clicked.connect(
-            self.purge_selected_object_faces
-        )
-        buttons_layout.addWidget(self.purge_faces_button)
+        buttons_layout.addSpacing(30)
         buttons_layout.addStretch(1)
 
         self.place_object_button = QPushButton("Place")
@@ -3197,7 +2849,7 @@ class GenerationWorkspace(QWidget):
         self.undo_object_change_button.setMinimumHeight(38)
         self.undo_object_change_button.setToolTip(
             "Restore the selected object to its state before the latest "
-            "Generate texture or Purge faces operation."
+            "Generate texture operation."
         )
         self.undo_object_change_button.clicked.connect(
             self.undo_selected_object_change
@@ -3210,7 +2862,7 @@ class GenerationWorkspace(QWidget):
         )
         self.cancel_operation_button.setMinimumHeight(38)
         self.cancel_operation_button.setToolTip(
-            "Cancel the current generation or face operation and restore "
+            "Cancel the current generation operation and restore "
             "the object state from before it started."
         )
         self.cancel_operation_button.clicked.connect(
@@ -3279,11 +2931,6 @@ class GenerationWorkspace(QWidget):
         self._settings = replace(
             self._settings,
             meshy_target_polycount=int(value),
-        )
-
-    def _handle_ambient_light_changed(self, value: int) -> None:
-        self.result_view.set_ambient_light_intensity(
-            int(value) / AMBIENT_LIGHT_PERCENT_SCALE
         )
 
     @Slot(bool)
@@ -3465,21 +3112,6 @@ class GenerationWorkspace(QWidget):
             if isinstance(worker, TextureRegenerationWorker):
                 worker.claim_saved_output()
 
-    @Slot(str, object)
-    def _handle_job_face_purge_succeeded(
-        self,
-        operation_id: str,
-        outcome: object,
-    ) -> None:
-        runtime = self._object_job_runtimes.get(str(operation_id))
-        if runtime is None:
-            return
-        self._set_legacy_active_job_runtime(runtime)
-        self._handle_unchecked_camera_face_purge_succeeded(
-            outcome,
-            operation_id=operation_id,
-        )
-
     @Slot(object, object)
     def _handle_generation_succeeded(
         self,
@@ -3607,13 +3239,6 @@ class GenerationWorkspace(QWidget):
                     "mode": _staged_generation_mode(result),
                     "geometry_task_id": result.geometry_task_id,
                     "source_asset_path": source_asset_path,
-                    "enabled_camera_ids": list(result.enabled_camera_ids),
-                    "unchecked_camera_ids": list(
-                        result.unchecked_camera_ids
-                    ),
-                    "camera_face_purge_applied": (
-                        result.camera_face_purge_applied
-                    ),
                     "unused_face_removal_applied": (
                         _staged_result_used_face_removal(result)
                     ),
@@ -3632,20 +3257,6 @@ class GenerationWorkspace(QWidget):
                         postprocessed_asset_path
                     )
                 pipeline.update(staged_pipeline)
-                if _staged_result_used_face_purge(result):
-                    pipeline.update(
-                        {
-                            "purge_original_face_count": (
-                                result.purge_original_face_count
-                            ),
-                            "purge_retained_face_count": (
-                                result.purge_retained_face_count
-                            ),
-                            "purge_removed_face_count": (
-                                result.purge_removed_face_count
-                            ),
-                        }
-                    )
                 if _staged_result_used_face_removal(result):
                     pipeline.update(
                         {
@@ -4118,159 +3729,6 @@ class GenerationWorkspace(QWidget):
         if runtime is not None and not runtime.operation.cancel_requested:
             self._complete_managed_job(runtime, status)
 
-    @Slot(object)
-    def _handle_unchecked_camera_face_purge_succeeded(
-        self,
-        raw_outcome: object,
-        *,
-        operation_id: str | None = None,
-    ) -> None:
-        if self._should_ignore_operation_result(
-            OBJECT_OPERATION_PURGE_FACES,
-            operation_id,
-        ):
-            return
-        if not isinstance(raw_outcome, UncheckedCameraFacePurgeOutcome):
-            self._handle_unchecked_camera_face_purge_failed(
-                "The face-purge worker returned an invalid result.",
-                operation_id=operation_id,
-            )
-            return
-        outcome = raw_outcome
-        record = self._find_generated_object_record(outcome.request.object_id)
-        if record is None:
-            self._handle_unchecked_camera_face_purge_failed(
-                "The target generated object no longer exists.",
-                operation_id=operation_id,
-            )
-            return
-
-        persisted_asset_paths: list[str] = []
-        try:
-            symmetry = _get_object_symmetric_division_metadata(record)
-            if (
-                symmetry is None
-                or symmetry.version == SYMMETRIC_DIVISION_METADATA_VERSION
-            ):
-                # V1 projects historically retain three physical resolutions.
-                texture_variants = build_object_texture_variants(
-                    outcome.result.glb_bytes
-                )
-            else:
-                texture_variants = _rebuild_symmetric_texture_variants(
-                    outcome.result.glb_bytes,
-                    symmetry,
-                )
-            if texture_variants is None:
-                if isinstance(
-                    record.pipeline.get(TEXTURE_VARIANTS_PIPELINE_KEY),
-                    dict,
-                ):
-                    raise ValueError(
-                        "The purged model unexpectedly lost its texture."
-                    )
-                asset_path = self._persist_meshy_named_asset(
-                    f"purged-{uuid.uuid4().hex}.glb",
-                    outcome.result.glb_bytes,
-                )
-                postprocessed_asset_path = asset_path
-                persisted_asset_paths.append(asset_path)
-                variant_metadata = None
-                preview_model = import_generated_glb(outcome.result.glb_bytes)
-            else:
-                variant_metadata = self._persist_object_texture_variants(
-                    record.object_id,
-                    texture_variants,
-                    asset_stem=f"purged-{uuid.uuid4().hex}",
-                )
-                persisted_asset_paths.extend(
-                    path
-                    for variant in variant_metadata.values()
-                    for path in variant.values()
-                )
-                selected_resolution = _get_selected_texture_resolution(record)
-                if selected_resolution not in _selectable_texture_resolutions(
-                    record
-                ):
-                    selected_resolution = DEFAULT_TEXTURE_RESOLUTION
-                selected_variant = variant_metadata[str(selected_resolution)]
-                asset_path = selected_variant[TEXTURE_VARIANT_GLB_PATH_KEY]
-                postprocessed_asset_path = variant_metadata[
-                    str(_canonical_texture_resolution(record))
-                ][TEXTURE_VARIANT_GLB_PATH_KEY]
-                preview_model = import_generated_glb(
-                    texture_variants.glb_by_resolution[selected_resolution]
-                )
-            next_pipeline = _build_unchecked_camera_face_purge_pipeline(
-                record,
-                outcome,
-                variant_metadata,
-                postprocessed_asset_path=postprocessed_asset_path,
-            )
-            replacement = replace(
-                record,
-                pipeline=_push_object_operation_undo_snapshot(
-                    record,
-                    next_pipeline,
-                    operation=OBJECT_OPERATION_PURGE_FACES,
-                ),
-                asset_path=asset_path,
-            )
-        except Exception as error:
-            self._remove_newly_persisted_assets(persisted_asset_paths)
-            self._handle_unchecked_camera_face_purge_failed(
-                f"The purged object could not be saved locally: {error}",
-                operation_id=operation_id,
-            )
-            return
-
-        if not self._request_object_packing_change(
-            record,
-            replacement,
-            preview_model,
-        ):
-            self._remove_newly_persisted_assets(persisted_asset_paths)
-            self.status_label.setText(
-                "The purged object was kept out because the Atlas packing "
-                "change could not be committed."
-            )
-            runtime = (
-                None
-                if operation_id is None
-                else self._object_job_runtimes.get(str(operation_id))
-            )
-            if runtime is not None:
-                self._fail_managed_job(runtime, self.status_label.text())
-            return
-        self._record_operation_commit(
-            OBJECT_OPERATION_PURGE_FACES,
-            record.object_id,
-            operation_id,
-        )
-        cleanup_failed = self._delete_unreferenced_object_assets(record)
-        status_suffix = (
-            " Some superseded files could not be removed."
-            if cleanup_failed
-            else ""
-        )
-        self.status_label.setText(
-            f"Purged {outcome.result.removed_face_count} faces from "
-            f"{record.object_name}." + status_suffix
-        )
-        self._emit_data_changed()
-        self.face_purge_completed.emit(replacement, preview_model)
-        self.generated_object_changed.emit(replacement, preview_model)
-        runtime = (
-            None
-            if operation_id is None
-            else self._object_job_runtimes.get(str(operation_id))
-        )
-        if runtime is not None and not runtime.operation.cancel_requested:
-            self._complete_managed_job(
-                runtime,
-                f"Purged faces: {record.object_name}",
-            )
-
     @Slot(str)
     def _handle_generation_failed(
         self,
@@ -4365,44 +3823,6 @@ class GenerationWorkspace(QWidget):
             operation_id=operation_id,
         )
 
-    @Slot(str)
-    def _handle_unchecked_camera_face_purge_failed(
-        self,
-        error_message: str,
-        *,
-        operation_id: str | None = None,
-    ) -> None:
-        if self._should_ignore_operation_result(
-            OBJECT_OPERATION_PURGE_FACES,
-            operation_id,
-        ):
-            return
-        self.status_label.setText(f"Face purge failed: {error_message}")
-        runtime = (
-            None
-            if operation_id is None
-            else self._object_job_runtimes.get(str(operation_id))
-        )
-        if runtime is not None:
-            self._fail_managed_job(runtime, f"Failed: {error_message}")
-        if self._job_manager is None:
-            QMessageBox.warning(self, "Face purge failed", error_message)
-
-    @Slot(str, str)
-    def _handle_job_face_purge_failed(
-        self,
-        operation_id: str,
-        error_message: str,
-    ) -> None:
-        runtime = self._object_job_runtimes.get(str(operation_id))
-        if runtime is None:
-            return
-        self._set_legacy_active_job_runtime(runtime)
-        self._handle_unchecked_camera_face_purge_failed(
-            str(error_message),
-            operation_id=operation_id,
-        )
-
     def _rollback_cancelled_operation(
         self,
         operation: _ActiveObjectOperation,
@@ -4419,10 +3839,7 @@ class GenerationWorkspace(QWidget):
                 object_id,
                 allow_operation_id=operation_id,
             )
-        if operation.kind not in {
-            OBJECT_OPERATION_GENERATE_TEXTURE,
-            OBJECT_OPERATION_PURGE_FACES,
-        }:
+        if operation.kind != OBJECT_OPERATION_GENERATE_TEXTURE:
             return False
         if operation.target_object_id != object_id:
             return False
@@ -4461,13 +3878,7 @@ class GenerationWorkspace(QWidget):
             )
             self.status_label.setText("Texture generation cancelled. " + outcome)
             return
-        outcome = (
-            "The generated face revision was deleted and the previous model "
-            "was restored."
-            if had_commit
-            else "The existing model was kept."
-        )
-        self.status_label.setText("Face purge cancelled. " + outcome)
+        self.status_label.setText("Operation cancelled.")
 
     @Slot()
     def _handle_generation_thread_finished(self) -> None:
@@ -4554,58 +3965,12 @@ class GenerationWorkspace(QWidget):
             frame_index=self._data.current_frame_index,
             selected_object_bgra=selected_crop,
             settings=self._settings,
-            enabled_camera_ids=(
-                self.object_3d_panel.get_enabled_postprocess_camera_ids()
-            ),
             geometry_only=geometry_only,
             symmetric_division_enabled=symmetric_division_enabled,
             symmetric_division_orientation=(
                 symmetric_division_orientation
             ),
         )
-
-    def _build_unchecked_camera_face_purge_request(
-        self,
-    ) -> UncheckedCameraFacePurgeRequest | None:
-        record = self._find_generated_object_record(self._selected_object_id)
-        if record is None:
-            self.status_label.setText(
-                "Select a generated object before purging faces."
-            )
-            return None
-        enabled_camera_ids = set(
-            self.object_3d_panel.get_enabled_postprocess_camera_ids()
-        )
-        unchecked_camera_ids = tuple(
-            camera_id
-            for camera_id in ALL_CAMERA_IDS
-            if camera_id not in enabled_camera_ids
-        )
-        if not unchecked_camera_ids:
-            self.status_label.setText(
-                "Uncheck at least one camera before purging faces."
-            )
-            return None
-        try:
-            variant = self.get_texture_variant(
-                record.object_id,
-                _canonical_texture_resolution(record),
-            )
-            source_path = (
-                self._resolve_texture_regeneration_source_path(record)
-                if variant is None
-                else variant.glb_asset_path
-            )
-            model_glb = source_path.read_bytes()
-            import_generated_glb(model_glb)
-            return UncheckedCameraFacePurgeRequest(
-                object_id=record.object_id,
-                model_glb=model_glb,
-                unchecked_camera_ids=unchecked_camera_ids,
-            )
-        except Exception as error:
-            self.status_label.setText(f"Face purge could not start: {error}")
-            return None
 
     def _build_texture_regeneration_request(
         self,
@@ -4726,36 +4091,14 @@ class GenerationWorkspace(QWidget):
         self.paint_mask_button.setEnabled(mask_tool_is_available)
         self.erase_mask_button.setEnabled(mask_tool_is_available)
         self.brush_size_spinbox.setEnabled(mask_tool_is_available)
-        self.undo_mask_button.setEnabled(
-            has_video
-            and bool(self.video_view.get_strokes())
-            and not has_untracked_legacy_job
-        )
         self.clear_mask_button.setEnabled(
             has_video and has_mask and not has_untracked_legacy_job
         )
         required_key_is_available = bool(self._settings.meshy_api_key)
-        enabled_camera_ids = (
-            self.object_3d_panel.get_enabled_postprocess_camera_ids()
-        )
-        postprocessing_is_enabled = self._settings.unused_face_removal
-        camera_selection_is_valid = (
-            not postprocessing_is_enabled or bool(enabled_camera_ids)
-        )
-        self.object_3d_panel.set_postprocess_camera_controls_enabled(
-            not has_untracked_legacy_job
-        )
-        self.result_view.set_enabled_unused_face_camera_ids(
-            enabled_camera_ids
-        )
-        self.result_view.set_unused_face_camera_indicators_visible(
-            True
-        )
         self.meshy_target_polycount_control.setVisible(True)
         self.meshy_target_polycount_spinbox.setEnabled(
             not has_untracked_legacy_job
         )
-        self.ambient_light_slider.setEnabled(not has_untracked_legacy_job)
         self.textures_checkbox.setEnabled(not has_untracked_legacy_job)
         self.wireframe_checkbox.setEnabled(not has_untracked_legacy_job)
         self.generated_objects_list.setEnabled(not has_untracked_legacy_job)
@@ -4790,12 +4133,6 @@ class GenerationWorkspace(QWidget):
             and self._legacy_active_job_runtime() is not None
             and not self._active_object_operation.cancel_requested
         )
-        self.purge_faces_button.setEnabled(
-            len(enabled_camera_ids) < len(ALL_CAMERA_IDS)
-            and selected_record is not None
-            and not selected_object_is_busy
-            and not has_untracked_legacy_job
-        )
         self.symmetric_division_checkbox.setEnabled(
             not has_untracked_legacy_job
         )
@@ -4808,14 +4145,12 @@ class GenerationWorkspace(QWidget):
             has_video
             and has_mask
             and required_key_is_available
-            and camera_selection_is_valid
             and not has_untracked_legacy_job
         )
         self.generate_geometry_button.setEnabled(
             has_video
             and has_mask
             and required_key_is_available
-            and camera_selection_is_valid
             and not self.symmetric_division_checkbox.isChecked()
             and not has_untracked_legacy_job
         )
@@ -5508,17 +4843,6 @@ class GenerationWorkspace(QWidget):
 
 
 # ### Staged-generation helpers ###
-def _staged_result_used_face_purge(
-    result: StagedMeshyGenerationResult,
-) -> bool:
-    return bool(
-        result.camera_face_purge_applied
-        or result.purge_original_face_count
-        or result.purge_retained_face_count
-        or result.purge_removed_face_count
-    )
-
-
 def _staged_result_used_face_removal(
     result: StagedMeshyGenerationResult,
 ) -> bool:
@@ -5533,8 +4857,6 @@ def _staged_result_used_face_removal(
 
 def _staged_generation_mode(result: StagedMeshyGenerationResult) -> str:
     stages: list[str] = []
-    if _staged_result_used_face_purge(result):
-        stages.append("unchecked_camera_face_purge")
     if _staged_result_used_face_removal(result):
         stages.append("unused_face_removal")
     stage_mode = "_and_".join(stages)
@@ -5554,12 +4876,6 @@ def _format_staged_generation_status(
     generated_label: str = "Generated",
 ) -> str:
     messages = [f"{generated_label}: {object_name}."]
-    if _staged_result_used_face_purge(result):
-        messages.append(
-            f"Purged {result.purge_removed_face_count} of "
-            f"{result.purge_original_face_count} faces visible from "
-            "unchecked cameras."
-        )
     if _staged_result_used_face_removal(result):
         messages.append(
             f"Removed {result.removed_face_count} of "
@@ -5843,10 +5159,7 @@ def _get_object_operation_undo_stack(
         asset_path = raw_snapshot.get("asset_path")
         provider_task_id = raw_snapshot.get("provider_task_id")
         pipeline = raw_snapshot.get("pipeline")
-        if operation not in {
-            OBJECT_OPERATION_GENERATE_TEXTURE,
-            OBJECT_OPERATION_PURGE_FACES,
-        }:
+        if operation != OBJECT_OPERATION_GENERATE_TEXTURE:
             continue
         if not isinstance(asset_path, str) or not asset_path.strip():
             continue
@@ -5875,10 +5188,7 @@ def _push_object_operation_undo_snapshot(
 ) -> dict[str, object]:
     """Attach one bounded pre-operation snapshot to a replacement pipeline."""
 
-    if operation not in {
-        OBJECT_OPERATION_GENERATE_TEXTURE,
-        OBJECT_OPERATION_PURGE_FACES,
-    }:
+    if operation != OBJECT_OPERATION_GENERATE_TEXTURE:
         raise ValueError("Unknown undoable object operation.")
     snapshot_pipeline = copy.deepcopy(record.pipeline)
     snapshot_pipeline.pop(OBJECT_OPERATION_UNDO_STACK_PIPELINE_KEY, None)
@@ -5925,76 +5235,6 @@ def _restore_object_operation_snapshot(
         provider_task_id=provider_task_id,
         asset_path=asset_path,
     )
-
-
-# ### Face-purge helpers ###
-def _build_unchecked_camera_face_purge_pipeline(
-    record: GeneratedObjectRecord,
-    outcome: UncheckedCameraFacePurgeOutcome,
-    variant_metadata: dict[str, dict[str, str]] | None,
-    *,
-    postprocessed_asset_path: str | None = None,
-) -> dict[str, object]:
-    request = outcome.request
-    result = outcome.result
-    pipeline: dict[str, object] = dict(record.pipeline)
-    pipeline.pop(TEXTURE_INPAINT_STROKES_PIPELINE_KEY, None)
-    selected_resolution = _get_selected_texture_resolution(record)
-    if selected_resolution not in _selectable_texture_resolutions(record):
-        selected_resolution = DEFAULT_TEXTURE_RESOLUTION
-    raw_count = pipeline.get("manual_face_purge_count", 0)
-    try:
-        purge_count = max(int(raw_count), 0) + 1
-    except (TypeError, ValueError):
-        purge_count = 1
-    history_entry: dict[str, object] = {
-        "unchecked_camera_ids": list(request.unchecked_camera_ids),
-        "original_face_count": result.original_face_count,
-        "retained_face_count": result.retained_face_count,
-        "removed_face_count": result.removed_face_count,
-    }
-    raw_history = pipeline.get("manual_face_purge_history")
-    history = (
-        [dict(entry) for entry in raw_history if isinstance(entry, dict)]
-        if isinstance(raw_history, list)
-        else []
-    )
-    history.append(history_entry)
-    if postprocessed_asset_path is None:
-        if variant_metadata is None:
-            raise ValueError("A purged post-processed model path is required.")
-        postprocessed_asset_path = variant_metadata[
-            str(_canonical_texture_resolution(record))
-        ][TEXTURE_VARIANT_GLB_PATH_KEY]
-    pipeline.update(
-        {
-            "postprocessed_asset_path": postprocessed_asset_path,
-            "camera_face_purge_applied": True,
-            "unchecked_camera_ids": list(request.unchecked_camera_ids),
-            "manual_face_purge_count": purge_count,
-            "latest_face_purge_original_face_count": (
-                result.original_face_count
-            ),
-            "latest_face_purge_retained_face_count": (
-                result.retained_face_count
-            ),
-            "latest_face_purge_removed_face_count": (
-                result.removed_face_count
-            ),
-            "manual_face_purge_history": history[-25:],
-        }
-    )
-    if variant_metadata is None:
-        pipeline.pop(TEXTURE_VARIANTS_PIPELINE_KEY, None)
-        pipeline.pop(SELECTED_TEXTURE_RESOLUTION_PIPELINE_KEY, None)
-    else:
-        pipeline.update(
-            {
-                TEXTURE_VARIANTS_PIPELINE_KEY: variant_metadata,
-                SELECTED_TEXTURE_RESOLUTION_PIPELINE_KEY: selected_resolution,
-            }
-        )
-    return pipeline
 
 
 # ### Texture-regeneration helpers ###
@@ -6505,9 +5745,6 @@ def _prepare_and_persist_object_generation(
                 "mode": _staged_generation_mode(result),
                 "geometry_task_id": result.geometry_task_id,
                 "source_asset_path": source_asset_path,
-                "enabled_camera_ids": list(result.enabled_camera_ids),
-                "unchecked_camera_ids": list(result.unchecked_camera_ids),
-                "camera_face_purge_applied": result.camera_face_purge_applied,
                 "unused_face_removal_applied": (
                     _staged_result_used_face_removal(result)
                 ),
@@ -6524,20 +5761,6 @@ def _prepare_and_persist_object_generation(
                     postprocessed_asset_path
                 )
             pipeline.update(staged_pipeline)
-            if _staged_result_used_face_purge(result):
-                pipeline.update(
-                    {
-                        "purge_original_face_count": (
-                            result.purge_original_face_count
-                        ),
-                        "purge_retained_face_count": (
-                            result.purge_retained_face_count
-                        ),
-                        "purge_removed_face_count": (
-                            result.purge_removed_face_count
-                        ),
-                    }
-                )
             if _staged_result_used_face_removal(result):
                 pipeline.update(
                     {

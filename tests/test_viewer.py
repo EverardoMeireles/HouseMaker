@@ -23,7 +23,6 @@ from trimesh.visual.texture import TextureVisuals
 
 from housemaker.camera_models import CameraPose
 from housemaker.glb import GeneratedModel, PreviewTexturedWall
-from housemaker.unused_face_removal import ALL_CAMERA_IDS
 from housemaker.viewer import (
     NAVIGATION_MODE_FIRST_PERSON,
     NAVIGATION_MODE_ORBIT,
@@ -132,17 +131,6 @@ def _build_generated_model(*, textured: bool = False) -> GeneratedModel:
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
 _qt_application.setQuitOnLastWindowClosed(False)
-
-
-# ### Test constants ###
-_EXPECTED_UNUSED_FACE_CAMERA_LABELS = {
-    "pos_x": "+X",
-    "neg_x": "-X",
-    "pos_y": "+Y",
-    "neg_y": "-Y",
-    "top": "Top",
-    "bottom": "Bottom",
-}
 
 
 # ### Tests ###
@@ -455,195 +443,17 @@ class GlbViewerRenderingTests(unittest.TestCase):
         self.assertEqual(viewer.get_first_person_camera_pose(), pose)
         self.assertAlmostEqual(float(viewer.view.opts["distance"]), 1.0)
 
-    def test_unused_face_camera_indicators_follow_selected_camera_ids(
-        self,
-    ) -> None:
+    def test_generated_model_has_no_camera_indicator_scene_items(self) -> None:
         viewer = self._build_viewer()
-        viewer.set_unused_face_camera_indicators_visible(True)
-        viewer.set_model(_build_generated_model())
-
-        indicators = viewer.unused_face_camera_indicator_items
-        labels = viewer.unused_face_camera_indicator_labels
-        self.assertEqual(tuple(indicators), ALL_CAMERA_IDS)
-        self.assertEqual(tuple(labels), ALL_CAMERA_IDS)
-        self.assertEqual(
-            viewer.get_enabled_unused_face_camera_ids(),
-            ALL_CAMERA_IDS,
-        )
-        self.assertTrue(viewer.get_unused_face_camera_indicators_visible())
-        self.assertTrue(all(indicators.values()))
-        self.assertTrue(
-            all(
-                item.visible() and item in viewer.view.items
-                for camera_items in indicators.values()
-                for item in camera_items
-            )
-        )
-        self.assertEqual(
-            {
-                camera_id: label.text
-                for camera_id, label in labels.items()
-            },
-            _EXPECTED_UNUSED_FACE_CAMERA_LABELS,
-        )
-        for camera_id, label in labels.items():
-            label_position = np.asarray(label.pos, dtype=float)
-            self.assertEqual(label_position.shape, (3,))
-            self.assertTrue(np.all(np.isfinite(label_position)))
-            self.assertIn(label, indicators[camera_id])
-            camera_line_positions = np.concatenate(
-                [
-                    np.asarray(item.pos, dtype=float)
-                    for item in indicators[camera_id]
-                    if item is not label
-                ],
-                axis=0,
-            )
-            nearest_line_distance = float(
-                np.min(
-                    np.linalg.norm(
-                        camera_line_positions - label_position,
-                        axis=1,
-                    )
-                )
-            )
-            self.assertLess(nearest_line_distance, 0.5)
-
-        enabled_camera_ids = ("neg_x", "pos_y", "bottom")
-        viewer.set_enabled_unused_face_camera_ids(enabled_camera_ids)
-
-        self.assertEqual(
-            viewer.get_enabled_unused_face_camera_ids(),
-            enabled_camera_ids,
-        )
-        for camera_id, camera_items in indicators.items():
-            expected_visibility = camera_id in enabled_camera_ids
-            self.assertTrue(
-                all(
-                    item.visible() == expected_visibility
-                    for item in camera_items
-                )
-            )
-            self.assertEqual(
-                labels[camera_id].visible(),
-                expected_visibility,
-            )
-
-        viewer.set_unused_face_camera_indicators_visible(False)
-
-        self.assertFalse(viewer.get_unused_face_camera_indicators_visible())
-        self.assertEqual(
-            viewer.get_enabled_unused_face_camera_ids(),
-            enabled_camera_ids,
-        )
-        self.assertEqual(viewer.unused_face_camera_indicator_items, {})
-        self.assertEqual(viewer.unused_face_camera_indicator_labels, {})
-        removed_items = tuple(
-            item
-            for camera_items in indicators.values()
-            for item in camera_items
-        )
-        self.assertTrue(
-            all(
-                not item.visible() and item not in viewer.view.items
-                for item in removed_items
-            )
-        )
-
-        viewer.set_unused_face_camera_indicators_visible(True)
-
-        rebuilt_indicators = viewer.unused_face_camera_indicator_items
-        rebuilt_labels = viewer.unused_face_camera_indicator_labels
-        self.assertEqual(tuple(rebuilt_indicators), ALL_CAMERA_IDS)
-        self.assertEqual(
-            {
-                camera_id: label.text
-                for camera_id, label in rebuilt_labels.items()
-            },
-            _EXPECTED_UNUSED_FACE_CAMERA_LABELS,
-        )
-        for camera_id, camera_items in rebuilt_indicators.items():
-            expected_visibility = camera_id in enabled_camera_ids
-            self.assertTrue(
-                all(
-                    item.visible() == expected_visibility
-                    and item in viewer.view.items
-                    for item in camera_items
-                )
-            )
-
-    def test_unused_face_camera_indicator_state_survives_model_refresh(
-        self,
-    ) -> None:
-        viewer = self._build_viewer()
-        enabled_camera_ids = ("pos_x", "top")
-        viewer.set_enabled_unused_face_camera_ids(enabled_camera_ids)
-        viewer.set_unused_face_camera_indicators_visible(True)
-
-        self.assertEqual(viewer.unused_face_camera_indicator_items, {})
-        self.assertEqual(viewer.unused_face_camera_indicator_labels, {})
-        viewer.set_model(_build_generated_model())
-        original_indicators = viewer.unused_face_camera_indicator_items
-        original_labels = viewer.unused_face_camera_indicator_labels
-        self.assertEqual(tuple(original_indicators), ALL_CAMERA_IDS)
-        self.assertEqual(tuple(original_labels), ALL_CAMERA_IDS)
-        original_items = tuple(
-            item
-            for camera_items in original_indicators.values()
-            for item in camera_items
-        )
-
-        viewer.clear_model()
-
-        self.assertEqual(viewer.unused_face_camera_indicator_items, {})
-        self.assertEqual(viewer.unused_face_camera_indicator_labels, {})
-        self.assertTrue(
-            all(item not in viewer.view.items for item in original_items)
-        )
-        self.assertEqual(
-            viewer.get_enabled_unused_face_camera_ids(),
-            enabled_camera_ids,
-        )
-        self.assertTrue(viewer.get_unused_face_camera_indicators_visible())
 
         viewer.set_model(_build_generated_model())
 
-        rebuilt_indicators = viewer.unused_face_camera_indicator_items
-        rebuilt_labels = viewer.unused_face_camera_indicator_labels
-        self.assertEqual(tuple(rebuilt_indicators), ALL_CAMERA_IDS)
-        self.assertEqual(tuple(rebuilt_labels), ALL_CAMERA_IDS)
-        self.assertEqual(
-            {
-                camera_id: label.text
-                for camera_id, label in rebuilt_labels.items()
-            },
-            _EXPECTED_UNUSED_FACE_CAMERA_LABELS,
-        )
-        self.assertTrue(
-            all(
-                rebuilt_labels[camera_id] is not original_labels[camera_id]
-                for camera_id in ALL_CAMERA_IDS
+        self.assertFalse(
+            any(
+                isinstance(item, (gl.GLLinePlotItem, gl.GLTextItem))
+                for item in viewer.view.items
             )
         )
-        self.assertTrue(
-            all(
-                item not in original_items
-                for camera_items in rebuilt_indicators.values()
-                for item in camera_items
-            )
-        )
-        for camera_id, camera_items in rebuilt_indicators.items():
-            expected_visibility = camera_id in enabled_camera_ids
-            self.assertTrue(
-                all(
-                    item.visible() == expected_visibility
-                    for item in camera_items
-                )
-            )
-            self.assertEqual(
-                rebuilt_labels[camera_id].visible(),
-                expected_visibility,
-            )
 
 
 class BlenderNavigationTests(unittest.TestCase):

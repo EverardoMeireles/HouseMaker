@@ -890,7 +890,7 @@ class TextureRegenerationUiTests(unittest.TestCase):
         self._load_video()
         self._paint_current_frame_mask()
 
-        self.assertEqual(self.workspace.ambient_light_slider.value(), 100)
+        self.assertFalse(hasattr(self.workspace, "ambient_light_slider"))
         self.assertEqual(
             self.workspace.result_view.get_ambient_light_intensity(),
             1.0,
@@ -912,7 +912,6 @@ class TextureRegenerationUiTests(unittest.TestCase):
             )
         )
         self.assertTrue(self.workspace.regenerate_texture_button.isEnabled())
-        self.assertEqual(self.workspace.ambient_light_slider.value(), 100)
         self.assertEqual(
             self.workspace.result_view.get_ambient_light_intensity(),
             1.0,
@@ -925,7 +924,6 @@ class TextureRegenerationUiTests(unittest.TestCase):
         self.workspace.set_external_3d_viewer_active(False)
         _qt_application.processEvents()
 
-        self.assertEqual(self.workspace.ambient_light_slider.value(), 100)
         self.assertEqual(
             self.workspace.result_view.get_ambient_light_intensity(),
             1.0,

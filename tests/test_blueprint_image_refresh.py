@@ -7,6 +7,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 # ### Imports ###
+import inspect
 import tempfile
 import unittest
 from pathlib import Path
@@ -64,6 +65,23 @@ class BlueprintImageRefreshTests(unittest.TestCase):
         self.assertEqual(self.canvas.zoom_scale, 1.75)
         self.assertEqual(self.canvas.view_offset, QPointF(17.0, 23.0))
         self.assertEqual(self.canvas.get_image_size_pixels(), (48.0, 20.0))
+        self.canvas.resize(640, 480)
+        base_rect = self.canvas._base_image_display_rect()
+        self.assertAlmostEqual(base_rect.left(), 16.0)
+        self.assertAlmostEqual(base_rect.width(), 608.0)
+        self.assertAlmostEqual(base_rect.height(), 608.0 / 2.4)
+        self.assertEqual(base_rect.center(), QPointF(320.0, 240.0))
+        self.assertFalse(hasattr(self.canvas, "image_scale"))
+        self.assertFalse(hasattr(self.canvas, "image_offset_x"))
+        self.assertFalse(hasattr(self.canvas, "image_offset_y"))
+        self.assertFalse(hasattr(self.canvas, "set_image_transform"))
+        display_rect = self.canvas._image_display_rect()
+        self.assertAlmostEqual(display_rect.width(), base_rect.width() * 1.75)
+        self.assertAlmostEqual(display_rect.height(), base_rect.height() * 1.75)
+        self.assertEqual(
+            display_rect.center(),
+            base_rect.center() + QPointF(17.0, 23.0),
+        )
 
     def test_failed_decode_retries_at_the_same_revision(self) -> None:
         self.canvas.blueprint_path = str(self.image_path)
@@ -181,6 +199,28 @@ class BlueprintImageRefreshTests(unittest.TestCase):
         Image.new("RGB", (20, 12), (120, 60, 30)).save(missing_path)
         self.assertTrue(self.canvas.refresh_blueprint_image_if_stale())
         self.assertEqual(self.canvas.get_image_size_pixels(), (20.0, 12.0))
+
+
+# ### Canvas API tests ###
+class BlueprintCanvasApiTests(unittest.TestCase):
+    def test_loading_api_has_no_retired_transform_parameters(self) -> None:
+        retired_parameters = {
+            "image_scale",
+            "image_offset_x",
+            "image_offset_y",
+        }
+
+        self.assertTrue(
+            retired_parameters.isdisjoint(
+                inspect.signature(BlueprintCanvas.load_blueprint).parameters
+            )
+        )
+        self.assertTrue(
+            retired_parameters.isdisjoint(
+                inspect.signature(BlueprintCanvas.set_level_data).parameters
+            )
+        )
+        self.assertFalse(hasattr(BlueprintCanvas, "set_image_transform"))
 
 
 # ### Test entry point ###

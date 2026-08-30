@@ -23,13 +23,9 @@ from housemaker.generation_workspace import (
     TEXTURE_INPAINT_STROKES_PIPELINE_KEY,
     TextureRegenerationOutcome,
     TextureRegenerationRequest,
-    UncheckedCameraFacePurgeOutcome,
-    UncheckedCameraFacePurgeRequest,
     GenerationWorkspace,
     _build_regenerated_texture_pipeline,
-    _build_unchecked_camera_face_purge_pipeline,
 )
-from housemaker.glb import import_generated_glb
 from housemaker.meshy_generation import MeshyGenerationResult
 from housemaker.object_texture_inpaint import (
     TEXTURE_UV_MODE_PAINT,
@@ -37,7 +33,6 @@ from housemaker.object_texture_inpaint import (
     TextureUvStroke,
 )
 from housemaker.settings_widget import GenerationServiceSettings
-from housemaker.unused_face_removal import UncheckedCameraFacePurgeResult
 
 
 # ### Test application ###
@@ -91,31 +86,6 @@ def _record(
 
 # ### Geometry and texture invalidation tests ###
 class InpaintStrokePipelineInvalidationTests(unittest.TestCase):
-    def test_manual_face_purge_discards_saved_uv_mask_strokes(self) -> None:
-        record = _record()
-        model = import_generated_glb(_box_glb())
-        request = UncheckedCameraFacePurgeRequest(
-            object_id=record.object_id,
-            model_glb=model.glb_bytes,
-            unchecked_camera_ids=("bottom",),
-        )
-        result = UncheckedCameraFacePurgeResult(
-            model=model,
-            unchecked_camera_ids=("bottom",),
-            original_face_count=12,
-            retained_face_count=10,
-            removed_face_count=2,
-        )
-
-        pipeline = _build_unchecked_camera_face_purge_pipeline(
-            record,
-            UncheckedCameraFacePurgeOutcome(request=request, result=result),
-            _variant_metadata(),
-        )
-
-        self.assertNotIn(TEXTURE_INPAINT_STROKES_PIPELINE_KEY, pipeline)
-        self.assertEqual(pipeline["retained_provenance"], "keep")
-
     def test_full_retexture_discards_strokes_when_uvs_may_change(self) -> None:
         record = _record()
         request = TextureRegenerationRequest(

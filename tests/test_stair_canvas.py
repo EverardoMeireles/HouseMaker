@@ -54,9 +54,6 @@ def _set_canvas_level(
         vertex_data=level.vertex_data,
         rooms=level.rooms,
         image_path=None,
-        image_scale=level.image_scale,
-        image_offset_x=level.image_offset_x,
-        image_offset_y=level.image_offset_y,
         floor_contour_vertex_ids=level.floor_contour_vertex_ids,
         doorways=level.doorways,
     )
@@ -613,9 +610,7 @@ class StairCanvasTests(unittest.TestCase):
         canvas = self._build_canvas(level)
         stairs = [_four_point_stair_dict()]
         canvas.set_stair_context(stairs, level)
-        selected: list[int] = []
         deleted: list[int] = []
-        canvas.stair_selected.connect(selected.append)
         canvas.stair_delete_requested.connect(deleted.append)
 
         QTest.mouseClick(
@@ -624,9 +619,9 @@ class StairCanvasTests(unittest.TestCase):
             Qt.KeyboardModifier.AltModifier,
             pos=_image_position(canvas, 50.0, 30.0),
         )
+        self.assertEqual(canvas.selected_stair_index, 0)
         QTest.keyClick(canvas, Qt.Key.Key_Delete)
 
-        self.assertEqual(selected, [0])
         self.assertEqual(deleted, [0])
         self.assertIsNone(canvas.selected_stair_index)
         self.assertEqual(canvas.stairs, stairs)
@@ -640,8 +635,6 @@ class StairCanvasTests(unittest.TestCase):
         stair = _four_point_stair_dict()
         stair["start_a_vertex_id"] = vertex.id
         canvas.set_stair_context([stair], level)
-        selected: list[int] = []
-        canvas.stair_selected.connect(selected.append)
 
         QTest.mouseClick(
             canvas,
@@ -650,7 +643,7 @@ class StairCanvasTests(unittest.TestCase):
         )
 
         self.assertEqual(canvas.selected_vertex_id, vertex.id)
-        self.assertEqual(selected, [])
+        self.assertIsNone(canvas.selected_stair_index)
 
     def test_intermediate_section_is_painted_and_can_select_its_stair(
         self,
@@ -668,8 +661,6 @@ class StairCanvasTests(unittest.TestCase):
             }
         ]
         canvas.set_stair_context([stair], level)
-        selected: list[int] = []
-        canvas.stair_selected.connect(selected.append)
 
         QTest.mouseClick(
             canvas,
@@ -678,7 +669,7 @@ class StairCanvasTests(unittest.TestCase):
             pos=_image_position(canvas, 25.0, 48.0),
         )
 
-        self.assertEqual(selected, [0])
+        self.assertEqual(canvas.selected_stair_index, 0)
         with (
             patch.object(canvas, "_paint_stair_segment") as paint_segment,
             patch.object(canvas, "_paint_stair_route_continuity"),

@@ -13,7 +13,6 @@ import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import cv2
@@ -116,7 +115,6 @@ def _test_staged_meshy_result(
         retained_face_count=80,
         removed_face_count=40,
         protected_face_count=80,
-        enabled_camera_ids=("pos_x", "top"),
     )
 
 
@@ -342,7 +340,7 @@ class GenerationMaskViewTests(unittest.TestCase):
         self.view.close()
         _qt_application.processEvents()
 
-    def test_paint_erase_undo_clear_and_object_crop(self) -> None:
+    def test_paint_erase_clear_and_object_crop(self) -> None:
         frame = np.full((100, 200, 3), 120, dtype=np.uint8)
         self.view.set_frame(frame)
         changed_spy = QSignalSpy(self.view.strokes_changed)
@@ -369,9 +367,6 @@ class GenerationMaskViewTests(unittest.TestCase):
         self.assertTrue(np.all(object_crop[transparent_pixels, :3] == 0))
         self.assertEqual(changed_spy.count(), 1)
 
-        self.view.undo_last_stroke()
-        self.assertFalse(self.view.has_selection())
-
         self.view.set_strokes([_test_stroke()])
         self.view.clear_mask()
         self.assertFalse(self.view.has_selection())
@@ -394,7 +389,7 @@ class GenerationMaskViewTests(unittest.TestCase):
         self.assertEqual(small_mask[25, 50], 0)
         self.assertEqual(large_mask[50, 100], 0)
 
-    def test_right_click_fills_closed_outline_and_undoes_as_one_action(
+    def test_right_click_fills_closed_outline_as_one_action(
         self,
     ) -> None:
         frame = np.full((100, 200, 3), 120, dtype=np.uint8)
@@ -426,10 +421,6 @@ class GenerationMaskViewTests(unittest.TestCase):
         mask = self.view.get_mask()
         self.assertEqual(mask[50, 100], 255)
         self.assertEqual(mask[5, 5], 0)
-
-        self.view.undo_last_stroke()
-
-        self.assertEqual(self.view.get_mask()[50, 100], 0)
 
     def test_right_click_does_not_fill_an_open_or_unbounded_region(self) -> None:
         frame = np.full((100, 200, 3), 120, dtype=np.uint8)
@@ -541,7 +532,6 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
     ) -> None:
         selected = np.zeros((9, 13, 4), dtype=np.uint8)
         selected[2:8, 3:11] = (30, 90, 170, 255)
-        selected_camera_ids = ("pos_x", "neg_y", "top")
         request = GenerationRequest(
             frame_index=4,
             selected_object_bgra=selected,
@@ -550,7 +540,6 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
                 meshy_target_polycount=5_400,
                 unused_face_removal=True,
             ),
-            enabled_camera_ids=selected_camera_ids,
         )
         geometry_model = _test_model()
         processed_model = _test_model()
@@ -567,14 +556,13 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
         )
         removal_result = UnusedFaceRemovalResult(
             model=processed_model,
-            enabled_camera_ids=selected_camera_ids,
+            enabled_camera_ids=ALL_CAMERA_IDS,
             original_face_count=12,
             retained_face_count=9,
             removed_face_count=3,
             protected_face_count=9,
         )
         image_calls: list[dict[str, object]] = []
-        purge_calls: list[tuple[bytes, dict[str, object]]] = []
         removal_calls: list[tuple[bytes, dict[str, object]]] = []
         texture_calls: list[dict[str, object]] = []
         progress_messages: list[str] = []
@@ -590,15 +578,6 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
             removal_calls.append((glb_bytes, kwargs))
             return removal_result
 
-        def fake_purge(glb_bytes: bytes, **kwargs: object) -> object:
-            purge_calls.append((glb_bytes, kwargs))
-            return SimpleNamespace(
-                glb_bytes=geometry_model.glb_bytes,
-                original_face_count=12,
-                retained_face_count=12,
-                removed_face_count=0,
-            )
-
         def fake_retexture_request(**kwargs: object) -> MeshyGenerationResult:
             texture_calls.append(kwargs)
             return textured_result
@@ -607,11 +586,6 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
             patch(
                 "housemaker.generation_workspace.request_image_to_3d_model",
                 side_effect=fake_image_request,
-            ),
-            patch(
-                "housemaker.generation_workspace."
-                "purge_faces_visible_from_unchecked_cameras_from_glb",
-                side_effect=fake_purge,
             ),
             patch(
                 "housemaker.generation_workspace.remove_unused_faces_from_glb",
@@ -631,20 +605,11 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
         self.assertEqual(len(image_calls), 1)
         self.assertFalse(image_calls[0]["should_texture"])
         self.assertEqual(image_calls[0]["target_polycount"], 5_400)
-        self.assertEqual(purge_calls[0][0], geometry_model.glb_bytes)
-        self.assertEqual(
-            purge_calls[0][1]["unchecked_camera_ids"],
-            tuple(
-                camera_id
-                for camera_id in ALL_CAMERA_IDS
-                if camera_id not in selected_camera_ids
-            ),
-        )
         self.assertEqual(removal_calls[0][0], geometry_model.glb_bytes)
         removal_options = removal_calls[0][1]["options"]
         self.assertEqual(
             removal_options.enabled_camera_ids,  # type: ignore[union-attr]
-            selected_camera_ids,
+            ALL_CAMERA_IDS,
         )
         self.assertEqual(
             texture_calls[0]["model_glb"],
@@ -667,7 +632,6 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
             processed_model.glb_bytes,
         )
         self.assertEqual(result.removed_face_count, 3)
-        self.assertEqual(result.enabled_camera_ids, selected_camera_ids)
         self.assertIn("Submitting geometry-only Meshy task...", progress_messages)
 
     def test_staged_planner_stops_before_retexture_on_removal_cancellation(
@@ -680,7 +644,6 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
                 meshy_api_key="meshy-key",
                 unused_face_removal=True,
             ),
-            enabled_camera_ids=("pos_x",),
         )
 
         with (
@@ -887,100 +850,16 @@ class GenerationWorkspaceTests(unittest.TestCase):
         )
         self.assertEqual(spinbox.value(), 5_600)
 
-    def test_unused_face_cameras_default_to_all_and_are_snapshotted_per_request(
-        self,
-    ) -> None:
-        checkboxes = self.workspace.object_3d_panel.unused_face_camera_checkboxes
-        viewer = self.workspace.object_3d_panel.viewer
+    def test_face_purge_and_camera_selection_controls_are_absent(self) -> None:
+        panel = self.workspace.object_3d_panel
 
-        self.assertEqual(tuple(checkboxes), ALL_CAMERA_IDS)
-        self.assertTrue(all(checkbox.isChecked() for checkbox in checkboxes.values()))
-        self.assertEqual(
-            self.workspace.object_3d_panel.get_enabled_postprocess_camera_ids(),
-            ALL_CAMERA_IDS,
+        self.assertFalse(hasattr(panel, "unused_face_camera_controls"))
+        self.assertFalse(hasattr(panel, "unused_face_camera_checkboxes"))
+        self.assertFalse(hasattr(panel, "get_enabled_postprocess_camera_ids"))
+        self.assertFalse(hasattr(self.workspace, "purge_faces_button"))
+        self.assertFalse(
+            hasattr(self.workspace, "purge_selected_object_faces")
         )
-        self.assertTrue(
-            self.workspace.object_3d_panel.unused_face_camera_controls.isEnabled()
-        )
-        self.assertTrue(viewer.get_unused_face_camera_indicators_visible())
-
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            video_path = Path(temporary_directory) / "source.avi"
-            _write_test_video(video_path, frame_count=1)
-            self.workspace.set_runtime_settings(
-                GenerationServiceSettings(
-                    meshy_api_key="meshy-key",
-                    unused_face_removal=True,
-                )
-            )
-            self.workspace.load_video(str(video_path))
-            self.workspace.video_view.set_strokes([_test_stroke()])
-            self.workspace._handle_video_strokes_changed(
-                self.workspace.video_view.get_strokes()
-            )
-            viewer.set_model(_test_model())
-
-            self.assertTrue(viewer.get_unused_face_camera_indicators_visible())
-            self.assertEqual(
-                viewer.get_enabled_unused_face_camera_ids(),
-                ALL_CAMERA_IDS,
-            )
-            self.assertTrue(
-                all(
-                    item.visible()
-                    for camera_items in (
-                        viewer.unused_face_camera_indicator_items.values()
-                    )
-                    for item in camera_items
-                )
-            )
-
-            checkboxes["neg_x"].setChecked(False)
-            checkboxes["bottom"].setChecked(False)
-
-            expected_camera_ids = tuple(
-                camera_id
-                for camera_id in ALL_CAMERA_IDS
-                if camera_id not in {"neg_x", "bottom"}
-            )
-            self.assertTrue(
-                self.workspace.object_3d_panel.unused_face_camera_controls.isEnabled()
-            )
-            request = self.workspace._build_generation_request()
-            self.assertIsNotNone(request)
-            self.assertEqual(
-                request.enabled_camera_ids,  # type: ignore[union-attr]
-                expected_camera_ids,
-            )
-            self.assertEqual(
-                viewer.get_enabled_unused_face_camera_ids(),
-                expected_camera_ids,
-            )
-            self.assertTrue(
-                all(
-                    item.visible()
-                    == (camera_id in expected_camera_ids)
-                    for camera_id, camera_items in (
-                        viewer.unused_face_camera_indicator_items.items()
-                    )
-                    for item in camera_items
-                )
-            )
-
-            checkboxes["pos_x"].setChecked(False)
-            self.assertEqual(
-                request.enabled_camera_ids,  # type: ignore[union-attr]
-                expected_camera_ids,
-            )
-            self.assertNotEqual(
-                viewer.get_enabled_unused_face_camera_ids(),
-                request.enabled_camera_ids,  # type: ignore[union-attr]
-            )
-            for checkbox in checkboxes.values():
-                checkbox.setChecked(False)
-            generate_is_enabled = self.workspace.generate_button.isEnabled()
-            self.workspace.shutdown()
-            self.assertFalse(generate_is_enabled)
 
     def test_staged_success_persists_all_revisions_and_task_provenance(
         self,
@@ -1033,9 +912,8 @@ class GenerationWorkspaceTests(unittest.TestCase):
             self.assertTrue(
                 meshy_planner.requests[0].settings.unused_face_removal
             )
-            self.assertEqual(
-                meshy_planner.requests[0].enabled_camera_ids,
-                ALL_CAMERA_IDS,
+            self.assertFalse(
+                hasattr(meshy_planner.requests[0], "enabled_camera_ids")
             )
             self.assertEqual(meshy_executor.results, [staged_result])
             self.assertIs(self.workspace.result_view.model, final_model)
@@ -1049,10 +927,9 @@ class GenerationWorkspaceTests(unittest.TestCase):
                 record.pipeline["geometry_task_id"],
                 "geometry-task-123",
             )
-            self.assertEqual(
-                record.pipeline["enabled_camera_ids"],
-                ["pos_x", "top"],
-            )
+            self.assertNotIn("enabled_camera_ids", record.pipeline)
+            self.assertNotIn("unchecked_camera_ids", record.pipeline)
+            self.assertNotIn("camera_face_purge_applied", record.pipeline)
             self.assertEqual(record.pipeline["removed_face_count"], 40)
             self.assertEqual(record.pipeline["retained_face_count"], 80)
             self.assertEqual(
@@ -1681,12 +1558,22 @@ class GenerationWorkspaceTests(unittest.TestCase):
                 cached_model,
             )
 
-    def test_ambient_slider_updates_generated_object_view_lighting(self) -> None:
-        self.workspace.ambient_light_slider.setValue(72)
+    def test_generated_object_view_uses_fixed_maximum_ambient_light(self) -> None:
+        self.assertFalse(hasattr(self.workspace, "ambient_light_slider"))
         self.assertAlmostEqual(
             self.workspace.result_view.get_ambient_light_intensity(),
-            0.72,
+            1.0,
         )
+
+    def test_paint_and_erase_controls_are_stacked_vertically(self) -> None:
+        layout = self.workspace.mask_mode_control.layout()
+
+        self.assertIsNotNone(layout)
+        self.assertEqual(layout.getContentsMargins(), (0, 0, 0, 0))
+        self.assertEqual(layout.spacing(), 0)
+        self.assertEqual(layout.count(), 2)
+        self.assertIs(layout.itemAt(0).widget(), self.workspace.paint_mask_button)
+        self.assertIs(layout.itemAt(1).widget(), self.workspace.erase_mask_button)
 
     def test_shutdown_discards_an_in_flight_meshy_result(self) -> None:
         planner = _BlockingMeshyPlanner()

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import copy
 import math
-import random
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from itertools import combinations
@@ -23,22 +22,9 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QWidget
 
-from housemaker.camera_models import (
-    CameraPose,
-    DEFAULT_FIRST_PERSON_LIGHT_INTENSITY,
-    InitialFirstPersonCamera,
-    normalize_first_person_light_intensity,
-)
-from housemaker.level_coordinates import (
-    level_image_to_world_xy,
-    level_world_to_image_xy,
-)
 from housemaker.models import (
     DEFAULT_DOORWAY_DEPTH_METERS,
     DOORWAY_SHAPE_ARCH,
-    DEFAULT_IMAGE_OFFSET,
-    DEFAULT_IMAGE_SCALE,
-    DEFAULT_ROOM_HEIGHT_METERS,
     DoorwayData,
     DoorwayPreset,
     Edge,
@@ -62,8 +48,6 @@ from housemaker.models import (
     normalize_doorway_shape,
     snap_point,
 )
-from housemaker.uv_layout import initialize_room_uv_map_size
-
 # ### Constants ###
 CANVAS_BACKGROUND_COLOR = QColor("#1c1f24")
 CANVAS_PANEL_COLOR = QColor("#252a31")
@@ -75,7 +59,6 @@ ACTIVE_VERTEX_FILL_COLOR = QColor("#ff7f50")
 SELECTED_VERTEX_FILL_COLOR = QColor("#90cdf4")
 VERTEX_OUTLINE_COLOR = QColor("#20242a")
 TEXT_COLOR = QColor("#f5f7fa")
-ROOM_LABEL_BACKGROUND_COLOR = QColor(10, 12, 16, 170)
 FLOOR_CONTOUR_FILL_COLOR = QColor(65, 180, 130, 52)
 FLOOR_CONTOUR_EDGE_COLOR = QColor("#41d69a")
 PENDING_FLOOR_CONTOUR_COLOR = QColor("#ffd166")
@@ -84,10 +67,6 @@ DOORWAY_EDGE_COLOR = QColor("#32b8ff")
 SELECTED_DOORWAY_EDGE_COLOR = QColor("#f6c85f")
 PENDING_DOORWAY_FILL_COLOR = QColor(255, 209, 102, 115)
 PENDING_DOORWAY_EDGE_COLOR = QColor("#ffd166")
-FIRST_PERSON_CAMERA_FILL_COLOR = QColor("#f8fafc")
-FIRST_PERSON_CAMERA_SELECTED_COLOR = QColor("#f6c85f")
-FIRST_PERSON_CAMERA_DIRECTION_COLOR = QColor("#ef8354")
-FIRST_PERSON_CAMERA_TEXT_COLOR = QColor("#ffffff")
 STAIR_SUPPORTED_COLOR = QColor("#65d6ff")
 STAIR_FLOATING_COLOR = QColor("#c99cff")
 STAIR_FLOATING_WITH_RISER_COLOR = QColor("#ff9f6e")
@@ -110,16 +89,10 @@ EDGE_HIT_TOLERANCE_SCREEN = 8.0
 AXIS_SNAP_TOLERANCE_SCREEN = 10.0
 CENTER_SNAP_TOLERANCE_SCREEN = 10.0
 CENTER_SNAP_EQUAL_ANGLE_TOLERANCE_DEGREES = 1.0
-ROOM_FILL_ALPHA = 72
 DRAG_THRESHOLD_SCREEN = 4.0
 DOORWAY_HEIGHT_WHEEL_STEP_METERS = 0.05
 DOORWAY_RESIZE_AXIS_DEPTH = "depth"
 DOORWAY_RESIZE_AXIS_WIDTH = "width"
-FIRST_PERSON_CAMERA_BODY_RADIUS_SCREEN = 11.0
-FIRST_PERSON_CAMERA_BODY_HIT_RADIUS_SCREEN = 16.0
-FIRST_PERSON_CAMERA_DIRECTION_LENGTH_SCREEN = 72.0
-FIRST_PERSON_CAMERA_DIRECTION_HANDLE_RADIUS_SCREEN = 7.0
-FIRST_PERSON_CAMERA_DIRECTION_HIT_RADIUS_SCREEN = 13.0
 MIN_ZOOM_SCALE = 1.0
 MAX_ZOOM_SCALE = 16.0
 ZOOM_STEP_FACTOR = 1.15
@@ -133,9 +106,7 @@ class CanvasSnapshot:
     floor_contour_vertex_ids: tuple[int, ...]
     active_vertex_id: int | None
     selected_vertex_id: int | None
-    selected_vertex_ids: set[int]
     preview_point: tuple[float, float] | None
-    initial_first_person_camera: InitialFirstPersonCamera | None
 
 
 @dataclass(frozen=True)
@@ -311,13 +282,11 @@ class BlueprintCanvas(QWidget):
     doorway_dimension_drag_finished = Signal()
     selected_doorway_changed = Signal(int)
     floor_contour_changed = Signal(object)
-    first_person_camera_changed = Signal(object)
     stair_start_placed = Signal(object)
     stair_placement_ready = Signal(object)
     stair_placement_completed = Signal(object)
     stair_placement_cancelled = Signal()
     stair_placement_invalid_endpoint = Signal(str)
-    stair_selected = Signal(int)
     stair_delete_requested = Signal(int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -330,12 +299,8 @@ class BlueprintCanvas(QWidget):
         self.blueprint_image: QImage | None = None
         self.blueprint_path: str | None = None
         self._blueprint_image_revision: tuple[object, ...] | None = None
-        self.image_scale = DEFAULT_IMAGE_SCALE
-        self.image_offset_x = DEFAULT_IMAGE_OFFSET
-        self.image_offset_y = DEFAULT_IMAGE_OFFSET
         self.active_vertex_id: int | None = None
         self.selected_vertex_id: int | None = None
-        self.selected_vertex_ids: set[int] = set()
         self.preview_point: tuple[float, float] | None = None
         self.preview_guides: list[SnapGuide] = []
         self.undo_stack: list[CanvasSnapshot] = []
@@ -348,9 +313,6 @@ class BlueprintCanvas(QWidget):
         self.pan_press_position: QPointF | None = None
         self.pan_start_offset = QPointF(0.0, 0.0)
         self.snap_middle_equal_angle_only = True
-        self.pending_room_name: str | None = None
-        self.pending_room_vertex_ids: tuple[int, ...] = ()
-        self.pending_room_height_meters = DEFAULT_ROOM_HEIGHT_METERS
         self.pending_floor_contour_vertex_ids: list[int] | None = None
         self.pending_floor_contour_preview_point: tuple[float, float] | None = None
         self.pending_doorway_preset: DoorwayPreset | None = None
@@ -374,14 +336,6 @@ class BlueprintCanvas(QWidget):
         self.pending_stair_preview_point: tuple[float, float] | None = None
         self.pending_stair_preview_guides: list[SnapGuide] = []
         self.level_context: LevelData | None = None
-        self.initial_first_person_camera: InitialFirstPersonCamera | None = None
-        self.initial_first_person_camera_selected = False
-        self.pending_first_person_camera_z: float | None = None
-        self.pressed_first_person_camera_handle: str | None = None
-        self.drag_first_person_camera_handle: str | None = None
-        self.first_person_camera_drag_press_position: QPointF | None = None
-        self._is_adjusting_first_person_camera_light_intensity = False
-        self._has_light_intensity_undo_state = False
 
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -396,9 +350,6 @@ class BlueprintCanvas(QWidget):
         file_path: str,
         vertex_data: VertexData | None = None,
         rooms: list[RoomData] | None = None,
-        image_scale: float = DEFAULT_IMAGE_SCALE,
-        image_offset_x: float = DEFAULT_IMAGE_OFFSET,
-        image_offset_y: float = DEFAULT_IMAGE_OFFSET,
         floor_contour_vertex_ids: tuple[int, ...] = (),
         doorways: list[DoorwayData] | None = None,
     ) -> None:
@@ -410,9 +361,6 @@ class BlueprintCanvas(QWidget):
             rooms=rooms,
             blueprint_image=image,
             blueprint_path=file_path,
-            image_scale=image_scale,
-            image_offset_x=image_offset_x,
-            image_offset_y=image_offset_y,
             floor_contour_vertex_ids=floor_contour_vertex_ids,
             doorways=doorways,
             blueprint_revision=(
@@ -432,9 +380,6 @@ class BlueprintCanvas(QWidget):
             vertex_data=vertex_data,
             rooms=self.rooms,
             image_path=self.blueprint_path,
-            image_scale=self.image_scale,
-            image_offset_x=self.image_offset_x,
-            image_offset_y=self.image_offset_y,
             floor_contour_vertex_ids=(
                 self.floor_contour_vertex_ids
                 if floor_contour_vertex_ids is None
@@ -448,9 +393,6 @@ class BlueprintCanvas(QWidget):
         vertex_data: VertexData,
         rooms: list[RoomData] | None,
         image_path: str | None,
-        image_scale: float = DEFAULT_IMAGE_SCALE,
-        image_offset_x: float = DEFAULT_IMAGE_OFFSET,
-        image_offset_y: float = DEFAULT_IMAGE_OFFSET,
         floor_contour_vertex_ids: tuple[int, ...] = (),
         doorways: list[DoorwayData] | None = None,
     ) -> None:
@@ -480,9 +422,6 @@ class BlueprintCanvas(QWidget):
             rooms=rooms,
             blueprint_image=blueprint_image,
             blueprint_path=image_path,
-            image_scale=image_scale,
-            image_offset_x=image_offset_x,
-            image_offset_y=image_offset_y,
             floor_contour_vertex_ids=floor_contour_vertex_ids,
             doorways=doorways,
             blueprint_revision=blueprint_revision,
@@ -527,17 +466,6 @@ class BlueprintCanvas(QWidget):
         self.update()
         return True
 
-    def set_image_transform(
-        self,
-        image_scale: float,
-        image_offset_x: float,
-        image_offset_y: float,
-    ) -> None:
-        self.image_scale = max(0.01, float(image_scale))
-        self.image_offset_x = float(image_offset_x)
-        self.image_offset_y = float(image_offset_y)
-        self.update()
-
     # ### Stair context and placement ###
     def set_stair_context(
         self,
@@ -572,20 +500,16 @@ class BlueprintCanvas(QWidget):
             self.setCursor(Qt.CursorShape.CrossCursor)
             self.update()
             return
-        self._reset_first_person_camera_placement()
-        self._reset_room_designation()
         self._reset_floor_contour_designation()
         self._reset_doorway_placement()
         self._set_selected_doorway_index(None)
         self._reset_doorway_pointer_state()
         self.active_vertex_id = None
         self.selected_vertex_id = None
-        self.selected_vertex_ids.clear()
         self.selected_stair_index = None
         self.preview_point = None
         self.preview_guides = []
         self._reset_pointer_state()
-        self._reset_first_person_camera_pointer_state()
         self.pending_stair_style = _normalize_stair_style(style)
         self.pending_stair_placement = None
         self.pending_stair_draft = None
@@ -700,142 +624,14 @@ class BlueprintCanvas(QWidget):
         self.update()
         return True
 
-    def set_initial_first_person_camera_context(
-        self,
-        camera: InitialFirstPersonCamera | None,
-        level: LevelData,
-    ) -> None:
-        self.end_first_person_camera_light_intensity_adjustment()
-        previous_camera = self.initial_first_person_camera
-        self.initial_first_person_camera = camera
-        self.level_context = level
-        if camera != previous_camera:
-            for snapshot in self.undo_stack:
-                snapshot.initial_first_person_camera = camera
-        if not self._initial_first_person_camera_is_visible():
-            self.initial_first_person_camera_selected = False
-            self._reset_first_person_camera_pointer_state()
-        self.update()
-
-    def start_first_person_camera_placement(
-        self,
-        z_meters: float,
-    ) -> None:
-        self._cancel_stair_placement_for_other_mode()
-        self._reset_room_designation()
-        self._reset_floor_contour_designation()
-        self._reset_doorway_placement()
-        self._set_selected_doorway_index(None)
-        self._reset_doorway_pointer_state()
-        self.active_vertex_id = None
-        self.selected_vertex_id = None
-        self.selected_vertex_ids.clear()
-        self.preview_point = None
-        self.preview_guides = []
-        self._reset_pointer_state()
-        self._reset_first_person_camera_pointer_state()
-        self.initial_first_person_camera_selected = False
-        self.pending_first_person_camera_z = float(z_meters)
-        self.setCursor(Qt.CursorShape.CrossCursor)
-        self.update()
-
-    def update_first_person_camera_z(self, z_meters: float) -> None:
-        camera = self.initial_first_person_camera
-        if camera is None or math.isclose(camera.pose.z, float(z_meters)):
-            return
-
-        self._push_undo_state()
-        self.initial_first_person_camera = replace(
-            camera,
-            pose=replace(camera.pose, z=float(z_meters)),
-        )
-        self.first_person_camera_changed.emit(self.initial_first_person_camera)
-        self.update()
-
-    def update_first_person_camera_light_intensity(
-        self,
-        intensity: float,
-    ) -> None:
-        camera = self.initial_first_person_camera
-        normalized_intensity = normalize_first_person_light_intensity(intensity)
-        if camera is None or math.isclose(
-            camera.light_intensity,
-            normalized_intensity,
-        ):
-            return
-
-        if not self._is_adjusting_first_person_camera_light_intensity:
-            self._push_undo_state()
-        elif not self._has_light_intensity_undo_state:
-            self._push_undo_state()
-            self._has_light_intensity_undo_state = True
-        self.initial_first_person_camera = replace(
-            camera,
-            light_intensity=normalized_intensity,
-        )
-        self.first_person_camera_changed.emit(self.initial_first_person_camera)
-        self.update()
-
-    def begin_first_person_camera_light_intensity_adjustment(self) -> None:
-        self._is_adjusting_first_person_camera_light_intensity = (
-            self.initial_first_person_camera is not None
-        )
-        self._has_light_intensity_undo_state = False
-
-    def end_first_person_camera_light_intensity_adjustment(self) -> None:
-        self._is_adjusting_first_person_camera_light_intensity = False
-        self._has_light_intensity_undo_state = False
-
-    def clear_first_person_camera(self) -> None:
-        if self.initial_first_person_camera is None:
-            return
-
-        self.end_first_person_camera_light_intensity_adjustment()
-        self._push_undo_state()
-        self.initial_first_person_camera = None
-        self.initial_first_person_camera_selected = False
-        self._reset_first_person_camera_pointer_state()
-        self.first_person_camera_changed.emit(None)
-        self.update()
-
     def set_snap_middle_equal_angle_only(self, enabled: bool) -> None:
         self.snap_middle_equal_angle_only = bool(enabled)
         self.preview_point = None
         self.preview_guides = []
         self.update()
 
-    def get_selected_vertex_ids(self) -> list[int]:
-        existing_vertex_ids = {vertex.id for vertex in self.vertex_data.vertices}
-        return sorted(
-            vertex_id
-            for vertex_id in self.selected_vertex_ids
-            if vertex_id in existing_vertex_ids
-        )
-
-    def start_room_designation(
-        self,
-        room_name: str,
-        vertex_ids: list[int],
-        room_height_meters: float,
-    ) -> None:
-        self._cancel_stair_placement_for_other_mode()
-        self._reset_first_person_camera_placement()
-        self._reset_floor_contour_designation()
-        self._reset_doorway_placement()
-        self._set_selected_doorway_index(None)
-        self._reset_doorway_pointer_state()
-        self.unsetCursor()
-        self.pending_room_name = room_name.strip()
-        self.pending_room_vertex_ids = tuple(sorted(set(vertex_ids)))
-        self.pending_room_height_meters = room_height_meters
-        self.preview_point = None
-        self.preview_guides = []
-        self.update()
-
     def start_floor_contour_designation(self) -> None:
         self._cancel_stair_placement_for_other_mode()
-        self._reset_first_person_camera_placement()
-        self._reset_room_designation()
         self._reset_doorway_placement()
         self._set_selected_doorway_index(None)
         self._reset_doorway_pointer_state()
@@ -844,7 +640,6 @@ class BlueprintCanvas(QWidget):
         self.preview_point = None
         self.preview_guides = []
         self.selected_vertex_id = None
-        self.selected_vertex_ids.clear()
         self.pending_floor_contour_vertex_ids = []
         self.pending_floor_contour_preview_point = None
         self._reset_pointer_state()
@@ -853,12 +648,9 @@ class BlueprintCanvas(QWidget):
     def start_doorway_placement(self, preset: DoorwayPreset) -> None:
         """Begin placing one doorway using the selected hole dimensions."""
         self._cancel_stair_placement_for_other_mode()
-        self._reset_first_person_camera_placement()
-        self._reset_room_designation()
         self._reset_floor_contour_designation()
         self.active_vertex_id = None
         self.selected_vertex_id = None
-        self.selected_vertex_ids.clear()
         self._set_selected_doorway_index(None)
         self.preview_point = None
         self.preview_guides = []
@@ -880,25 +672,12 @@ class BlueprintCanvas(QWidget):
         self.floor_contour_changed.emit(())
         self.update()
 
-    def delete_room_at_index(self, room_index: int) -> bool:
-        if room_index < 0 or room_index >= len(self.rooms):
-            return False
-
-        self._push_undo_state()
-        del self.rooms[room_index]
-        self.rooms_changed.emit()
-        self.update()
-        return True
-
     def _set_level_contents(
         self,
         vertex_data: VertexData,
         rooms: list[RoomData] | None,
         blueprint_image: QImage | None,
         blueprint_path: str | None,
-        image_scale: float,
-        image_offset_x: float,
-        image_offset_y: float,
         floor_contour_vertex_ids: tuple[int, ...],
         doorways: list[DoorwayData] | None,
         blueprint_revision: tuple[object, ...] | None,
@@ -906,9 +685,6 @@ class BlueprintCanvas(QWidget):
         self.blueprint_image = blueprint_image
         self.blueprint_path = blueprint_path
         self._blueprint_image_revision = blueprint_revision
-        self.image_scale = max(0.01, float(image_scale))
-        self.image_offset_x = float(image_offset_x)
-        self.image_offset_y = float(image_offset_y)
         self.vertex_data = vertex_data
         self.rooms = rooms if rooms is not None else []
         self.doorways = doorways if doorways is not None else []
@@ -917,23 +693,18 @@ class BlueprintCanvas(QWidget):
         )
         self.active_vertex_id = None
         self.selected_vertex_id = None
-        self.selected_vertex_ids.clear()
         self.preview_point = None
         self.preview_guides = []
         self.undo_stack.clear()
-        self._reset_room_designation()
         self._reset_floor_contour_designation()
         self._reset_doorway_placement()
-        self.pending_first_person_camera_z = None
         self.pending_stair_preview_point = None
         self.pending_stair_preview_guides = []
-        self.initial_first_person_camera_selected = False
         self.level_context = None
         self._set_selected_doorway_index(None)
         self.selected_stair_index = None
         self._reset_pointer_state()
         self._reset_doorway_pointer_state()
-        self._reset_first_person_camera_pointer_state()
         self._reset_view()
         if self._is_stair_placement_active():
             self.setCursor(Qt.CursorShape.CrossCursor)
@@ -950,7 +721,6 @@ class BlueprintCanvas(QWidget):
         previous_rooms = copy.deepcopy(self.rooms)
         previous_floor_contour_vertex_ids = self.floor_contour_vertex_ids
         previous_doorways = copy.deepcopy(self.doorways)
-        previous_first_person_camera = self.initial_first_person_camera
         self.vertex_data.copy_from(snapshot.vertex_data)
         self.rooms.clear()
         self.rooms.extend(copy.deepcopy(snapshot.rooms))
@@ -959,18 +729,13 @@ class BlueprintCanvas(QWidget):
         self.floor_contour_vertex_ids = snapshot.floor_contour_vertex_ids
         self.active_vertex_id = snapshot.active_vertex_id
         self.selected_vertex_id = snapshot.selected_vertex_id
-        self.selected_vertex_ids = set(snapshot.selected_vertex_ids)
         self.preview_point = snapshot.preview_point
         self.preview_guides = []
-        self.initial_first_person_camera = snapshot.initial_first_person_camera
-        self.initial_first_person_camera_selected = False
-        self._reset_room_designation()
         self._reset_floor_contour_designation()
         self._reset_doorway_placement()
         self._set_selected_doorway_index(None)
         self._reset_pointer_state()
         self._reset_doorway_pointer_state()
-        self._reset_first_person_camera_pointer_state()
         self.update()
         if (
             self.vertex_data != previous_vertex_data
@@ -981,10 +746,6 @@ class BlueprintCanvas(QWidget):
             self.doorways_changed.emit()
         if self.floor_contour_vertex_ids != previous_floor_contour_vertex_ids:
             self.floor_contour_changed.emit(self.floor_contour_vertex_ids)
-        if self.initial_first_person_camera != previous_first_person_camera:
-            self.first_person_camera_changed.emit(
-                self.initial_first_person_camera
-            )
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
         if (
@@ -1003,16 +764,6 @@ class BlueprintCanvas(QWidget):
             return
 
         if (
-            event.key() == Qt.Key.Key_Escape
-            and self.pending_first_person_camera_z is not None
-        ):
-            self.pending_first_person_camera_z = None
-            self.unsetCursor()
-            self.update()
-            event.accept()
-            return
-
-        if (
             event.key() == Qt.Key.Key_Delete
             and self._request_selected_stair_deletion()
         ):
@@ -1026,15 +777,6 @@ class BlueprintCanvas(QWidget):
             self._reset_doorway_placement()
             self.unsetCursor()
             self.update()
-            event.accept()
-            return
-
-        if (
-            event.key() == Qt.Key.Key_Delete
-            and self.initial_first_person_camera_selected
-            and self._initial_first_person_camera_is_visible()
-        ):
-            self.clear_first_person_camera()
             event.accept()
             return
 
@@ -1119,13 +861,6 @@ class BlueprintCanvas(QWidget):
                 event.accept()
                 return
 
-            if self.pending_first_person_camera_z is not None:
-                self.pending_first_person_camera_z = None
-                self.unsetCursor()
-                self.update()
-                event.accept()
-                return
-
             if self.pending_doorway_preset is not None:
                 self._reset_doorway_placement()
                 self.unsetCursor()
@@ -1163,13 +898,6 @@ class BlueprintCanvas(QWidget):
             event.accept()
             return
 
-        if self.pending_first_person_camera_z is not None:
-            image_point = self._widget_to_image(event.position())
-            if image_point is not None:
-                self._place_initial_first_person_camera(image_point)
-            event.accept()
-            return
-
         if self.pending_doorway_preset is not None:
             image_point = self._widget_to_image(event.position())
             if image_point is not None:
@@ -1178,39 +906,12 @@ class BlueprintCanvas(QWidget):
             event.accept()
             return
 
-        first_person_camera_handle = None
-        if (
-            self.pending_floor_contour_vertex_ids is None
-            and self.pending_room_name is None
-        ):
-            first_person_camera_handle = self._find_first_person_camera_handle(
-                event.position()
-            )
-        if first_person_camera_handle is not None:
-            self.initial_first_person_camera_selected = True
-            self._set_selected_doorway_index(None)
-            self.selected_vertex_id = None
-            self.selected_vertex_ids.clear()
-            self.pressed_first_person_camera_handle = (
-                first_person_camera_handle
-            )
-            self.first_person_camera_drag_press_position = QPointF(
-                event.position()
-            )
-            self.drag_first_person_camera_handle = None
-            self.update()
-            event.accept()
-            return
-
-        self.initial_first_person_camera_selected = False
         if event.modifiers() & Qt.KeyboardModifier.AltModifier:
             stair_hit = self._find_stair_hit(event.position())
             if stair_hit is not None:
                 self.selected_stair_index = stair_hit.stair_index
                 self._set_selected_doorway_index(None)
                 self.selected_vertex_id = None
-                self.selected_vertex_ids.clear()
-                self.stair_selected.emit(stair_hit.stair_index)
                 self.update()
                 event.accept()
                 return
@@ -1220,7 +921,6 @@ class BlueprintCanvas(QWidget):
         if doorway_hit is not None:
             self._set_selected_doorway_index(doorway_hit.doorway_index)
             self.selected_vertex_id = None
-            self.selected_vertex_ids.clear()
             self._reset_doorway_pointer_state()
             resize_axis = doorway_hit.resize_axis
             if resize_axis is not None:
@@ -1256,30 +956,12 @@ class BlueprintCanvas(QWidget):
             event.accept()
             return
 
-        if self.pending_room_name is not None:
-            if hit_vertex is not None:
-                self._finish_room_designation(hit_vertex.id)
-                self.update()
-            event.accept()
-            return
-
         if hit_vertex is not None:
-            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-                self._toggle_vertex_selection(hit_vertex.id)
-                self.update()
-                event.accept()
-                return
-
             self.selected_vertex_id = hit_vertex.id
-            self.selected_vertex_ids = {hit_vertex.id}
             self.pressed_vertex_id = hit_vertex.id
             self.drag_press_position = QPointF(event.position())
             self.drag_vertex_id = None
             self.update()
-            event.accept()
-            return
-
-        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
             event.accept()
             return
 
@@ -1329,26 +1011,6 @@ class BlueprintCanvas(QWidget):
                     [] if preview is None else preview.guides
                 )
             self.update()
-            event.accept()
-            return
-
-        if self.pending_first_person_camera_z is not None:
-            event.accept()
-            return
-
-        if (
-            self.pressed_first_person_camera_handle is not None
-            and event.buttons() & Qt.MouseButton.LeftButton
-        ):
-            if self._should_start_first_person_camera_drag(event.position()):
-                self._push_undo_state()
-                self.drag_first_person_camera_handle = (
-                    self.pressed_first_person_camera_handle
-                )
-            if self.drag_first_person_camera_handle is not None:
-                self._drag_initial_first_person_camera(event.position())
-                event.accept()
-                return
             event.accept()
             return
 
@@ -1414,8 +1076,7 @@ class BlueprintCanvas(QWidget):
             event.accept()
             return
 
-        if not self._update_first_person_camera_hover_cursor(event.position()):
-            self._update_doorway_hover_cursor(event.position())
+        self._update_doorway_hover_cursor(event.position())
         if self.active_vertex_id is None:
             super().mouseMoveEvent(event)
             return
@@ -1435,15 +1096,6 @@ class BlueprintCanvas(QWidget):
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.MouseButton.MiddleButton:
             self._stop_panning()
-            event.accept()
-            return
-
-        if (
-            event.button() == Qt.MouseButton.LeftButton
-            and self.pressed_first_person_camera_handle is not None
-        ):
-            self._reset_first_person_camera_pointer_state()
-            self.update()
             event.accept()
             return
 
@@ -1496,7 +1148,6 @@ class BlueprintCanvas(QWidget):
             self.update()
         if (
             self.pending_doorway_preset is None
-            and self.pending_first_person_camera_z is None
             and not self._is_stair_placement_active()
         ):
             self.unsetCursor()
@@ -1516,10 +1167,8 @@ class BlueprintCanvas(QWidget):
         painter.drawImage(display_rect, self.blueprint_image)
 
         self._paint_floor_contour(painter)
-        self._paint_rooms(painter)
         self._paint_edges(painter)
         self._paint_doorways(painter)
-        self._paint_initial_first_person_camera(painter)
         self._paint_pending_doorway(painter)
         self._paint_pending_floor_contour(painter)
         self._paint_preview_guides(painter)
@@ -1542,7 +1191,6 @@ class BlueprintCanvas(QWidget):
 
     def _handle_existing_vertex_click(self, vertex: Vertex) -> None:
         self.selected_vertex_id = vertex.id
-        self.selected_vertex_ids = {vertex.id}
 
         if self.active_vertex_id is None:
             self.active_vertex_id = vertex.id
@@ -1568,7 +1216,6 @@ class BlueprintCanvas(QWidget):
 
         self.active_vertex_id = new_vertex.id
         self.selected_vertex_id = new_vertex.id
-        self.selected_vertex_ids = {new_vertex.id}
         self.preview_point = point
         self.preview_guides = []
 
@@ -1609,7 +1256,6 @@ class BlueprintCanvas(QWidget):
 
         self.active_vertex_id = new_vertex.id
         self.selected_vertex_id = new_vertex.id
-        self.selected_vertex_ids = {new_vertex.id}
         self.preview_point = point
         self.preview_guides = []
 
@@ -1726,10 +1372,8 @@ class BlueprintCanvas(QWidget):
 
         if target.vertex_id is None:
             self.selected_vertex_id = None
-            self.selected_vertex_ids.clear()
         else:
             self.selected_vertex_id = target.vertex_id
-            self.selected_vertex_ids = {target.vertex_id}
 
         if pending_point is None:
             self.pending_stair_point = PendingStairPoint(
@@ -1996,6 +1640,8 @@ class BlueprintCanvas(QWidget):
             height_meters=float(preset.height_meters),
             depth_meters=DEFAULT_DOORWAY_DEPTH_METERS,
             rotation_degrees=0.0,
+            shape=preset.shape,
+            arch_amount=preset.arch_amount,
         )
         self.pending_doorway = self._snap_doorway_to_walls(
             doorway,
@@ -2489,21 +2135,9 @@ class BlueprintCanvas(QWidget):
             floor_contour_vertex_ids=self.floor_contour_vertex_ids,
             active_vertex_id=self.active_vertex_id,
             selected_vertex_id=self.selected_vertex_id,
-            selected_vertex_ids=set(self.selected_vertex_ids),
             preview_point=self.preview_point,
-            initial_first_person_camera=self.initial_first_person_camera,
         )
         self.undo_stack.append(snapshot)
-
-    def _toggle_vertex_selection(self, vertex_id: int) -> None:
-        if vertex_id in self.selected_vertex_ids:
-            self.selected_vertex_ids.remove(vertex_id)
-            if self.selected_vertex_id == vertex_id:
-                self.selected_vertex_id = next(iter(self.selected_vertex_ids), None)
-            return
-
-        self.selected_vertex_ids.add(vertex_id)
-        self.selected_vertex_id = vertex_id
 
     def _delete_selected_doorway(self) -> bool:
         doorway_index = self.selected_doorway_index
@@ -2523,7 +2157,6 @@ class BlueprintCanvas(QWidget):
             return
 
         if self.vertex_data.get_vertex(self.selected_vertex_id) is None:
-            self.selected_vertex_ids.discard(self.selected_vertex_id)
             self.selected_vertex_id = None
             self.update()
             return
@@ -2542,7 +2175,6 @@ class BlueprintCanvas(QWidget):
             self.preview_point = None
 
         self.selected_vertex_id = None
-        self.selected_vertex_ids.discard(deleted_vertex_id)
         self.preview_guides = []
         self._reset_pointer_state()
         self.update()
@@ -2602,45 +2234,6 @@ class BlueprintCanvas(QWidget):
             return ()
 
         return normalized_vertex_ids
-
-    def _finish_room_designation(self, center_vertex_id: int) -> None:
-        if self.pending_room_name is None or len(self.pending_room_vertex_ids) < 3:
-            self._reset_room_designation()
-            return
-
-        existing_vertex_ids = {vertex.id for vertex in self.vertex_data.vertices}
-        room_vertex_ids = tuple(
-            vertex_id
-            for vertex_id in self.pending_room_vertex_ids
-            if vertex_id in existing_vertex_ids and vertex_id != center_vertex_id
-        )
-        if len(room_vertex_ids) < 3:
-            self._reset_room_designation()
-            return
-
-        self._push_undo_state()
-        room = RoomData(
-            name=self.pending_room_name,
-            vertex_ids=room_vertex_ids,
-            center_vertex_id=center_vertex_id,
-            color_rgb=_build_random_room_color(),
-            height_meters=self.pending_room_height_meters,
-        )
-        initialize_room_uv_map_size(
-            room=room,
-            vertex_data=self.vertex_data,
-            wall_height_meters=room.height_meters,
-        )
-        self.rooms.append(room)
-        self.selected_vertex_id = center_vertex_id
-        self.selected_vertex_ids.clear()
-        self._reset_room_designation()
-        self.rooms_changed.emit()
-
-    def _reset_room_designation(self) -> None:
-        self.pending_room_name = None
-        self.pending_room_vertex_ids = ()
-        self.pending_room_height_meters = DEFAULT_ROOM_HEIGHT_METERS
 
     def _remove_vertex_from_rooms(self, deleted_vertex_id: int) -> None:
         original_rooms = list(self.rooms)
@@ -2853,159 +2446,6 @@ class BlueprintCanvas(QWidget):
         self.drag_vertex_id = None
         self.drag_press_position = None
         self._stop_panning()
-
-    def _place_initial_first_person_camera(self, image_point: QPointF) -> None:
-        level = self.level_context
-        z_meters = self.pending_first_person_camera_z
-        if level is None or z_meters is None:
-            return
-
-        world_x, world_y = level_image_to_world_xy(
-            level,
-            image_point.x(),
-            image_point.y(),
-        )
-        current_camera = self.initial_first_person_camera
-        base_pose = CameraPose(z=z_meters)
-        light_intensity = DEFAULT_FIRST_PERSON_LIGHT_INTENSITY
-        if current_camera is not None:
-            base_pose = current_camera.pose
-            light_intensity = current_camera.light_intensity
-
-        self._push_undo_state()
-        self.initial_first_person_camera = InitialFirstPersonCamera(
-            level_index=level.index,
-            pose=replace(
-                base_pose,
-                x=world_x,
-                y=world_y,
-                z=z_meters,
-            ),
-            light_intensity=light_intensity,
-        )
-        self.initial_first_person_camera_selected = True
-        self.pending_first_person_camera_z = None
-        self.unsetCursor()
-        self.first_person_camera_changed.emit(self.initial_first_person_camera)
-        self.update()
-
-    def _initial_first_person_camera_is_visible(self) -> bool:
-        camera = self.initial_first_person_camera
-        level = self.level_context
-        return (
-            camera is not None
-            and level is not None
-            and camera.level_index == level.index
-            and self.blueprint_image is not None
-        )
-
-    def _get_initial_first_person_camera_widget_points(
-        self,
-    ) -> tuple[QPointF, QPointF] | None:
-        if not self._initial_first_person_camera_is_visible():
-            return None
-
-        camera = self.initial_first_person_camera
-        level = self.level_context
-        if camera is None or level is None:
-            return None
-        image_x, image_y = level_world_to_image_xy(
-            level,
-            camera.pose.x,
-            camera.pose.y,
-        )
-        center = self._image_to_widget(image_x, image_y)
-        yaw_radians = math.radians(camera.pose.yaw_degrees)
-        direction = QPointF(
-            math.cos(yaw_radians),
-            -math.sin(yaw_radians),
-        )
-        arrow_tip = center + direction * FIRST_PERSON_CAMERA_DIRECTION_LENGTH_SCREEN
-        return center, arrow_tip
-
-    def _find_first_person_camera_handle(
-        self,
-        widget_point: QPointF,
-    ) -> str | None:
-        camera_points = self._get_initial_first_person_camera_widget_points()
-        if camera_points is None:
-            return None
-
-        center, arrow_tip = camera_points
-        if _qpoint_distance(widget_point, arrow_tip) <= (
-            FIRST_PERSON_CAMERA_DIRECTION_HIT_RADIUS_SCREEN
-        ):
-            return "direction"
-        if _qpoint_distance(widget_point, center) <= (
-            FIRST_PERSON_CAMERA_BODY_HIT_RADIUS_SCREEN
-        ):
-            return "position"
-        return None
-
-    def _should_start_first_person_camera_drag(
-        self,
-        widget_point: QPointF,
-    ) -> bool:
-        if (
-            self.drag_first_person_camera_handle is not None
-            or self.first_person_camera_drag_press_position is None
-        ):
-            return False
-        return _qpoint_distance(
-            widget_point,
-            self.first_person_camera_drag_press_position,
-        ) >= DRAG_THRESHOLD_SCREEN
-
-    def _drag_initial_first_person_camera(self, widget_point: QPointF) -> None:
-        camera = self.initial_first_person_camera
-        level = self.level_context
-        drag_handle = self.drag_first_person_camera_handle
-        if camera is None or level is None or drag_handle is None:
-            return
-
-        if drag_handle == "position":
-            image_point = self._widget_to_image_clamped(widget_point)
-            world_x, world_y = level_image_to_world_xy(
-                level,
-                image_point.x(),
-                image_point.y(),
-            )
-            next_pose = replace(camera.pose, x=world_x, y=world_y)
-        else:
-            camera_points = self._get_initial_first_person_camera_widget_points()
-            if camera_points is None:
-                return
-            center, _arrow_tip = camera_points
-            delta = widget_point - center
-            if math.hypot(delta.x(), delta.y()) <= 1e-6:
-                return
-            yaw_degrees = math.degrees(math.atan2(-delta.y(), delta.x()))
-            next_pose = replace(camera.pose, yaw_degrees=yaw_degrees)
-
-        self.initial_first_person_camera = replace(camera, pose=next_pose)
-        self.first_person_camera_changed.emit(self.initial_first_person_camera)
-        self.update()
-
-    def _update_first_person_camera_hover_cursor(
-        self,
-        widget_point: QPointF,
-    ) -> bool:
-        camera_handle = self._find_first_person_camera_handle(widget_point)
-        if camera_handle == "position":
-            self.setCursor(Qt.CursorShape.SizeAllCursor)
-            return True
-        if camera_handle == "direction":
-            self.setCursor(Qt.CursorShape.CrossCursor)
-            return True
-        return False
-
-    def _reset_first_person_camera_pointer_state(self) -> None:
-        self.pressed_first_person_camera_handle = None
-        self.drag_first_person_camera_handle = None
-        self.first_person_camera_drag_press_position = None
-
-    def _reset_first_person_camera_placement(self) -> None:
-        self.pending_first_person_camera_z = None
 
     def _reset_view(self) -> None:
         self.zoom_scale = MIN_ZOOM_SCALE
@@ -3411,12 +2851,9 @@ class BlueprintCanvas(QWidget):
             available_rect.height() / image_height,
         )
 
-        display_width = image_width * scale * self.image_scale
-        display_height = image_height * scale * self.image_scale
-        display_center = available_rect.center() + QPointF(
-            self.image_offset_x,
-            self.image_offset_y,
-        )
+        display_width = image_width * scale
+        display_height = image_height * scale
+        display_center = available_rect.center()
         display_x = display_center.x() - display_width / 2.0
         display_y = display_center.y() - display_height / 2.0
         return QRectF(display_x, display_y, display_width, display_height)
@@ -3543,72 +2980,6 @@ class BlueprintCanvas(QWidget):
                 vertices.append(vertex)
 
         return vertices
-
-    def _paint_rooms(self, painter: QPainter) -> None:
-        label_font = QFont("Segoe UI", 10)
-        label_font.setBold(True)
-
-        for room in self.rooms:
-            room_vertices = self._get_room_vertices(room)
-            if len(room_vertices) < 3:
-                continue
-
-            ordered_vertices = _order_vertices_around_center(room_vertices)
-            polygon = QPolygonF(
-                [
-                    self._image_to_widget(vertex.x, vertex.y)
-                    for vertex in ordered_vertices
-                ]
-            )
-            fill_color = QColor(
-                room.color_rgb[0],
-                room.color_rgb[1],
-                room.color_rgb[2],
-                ROOM_FILL_ALPHA,
-            )
-
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(fill_color)
-            painter.drawPolygon(polygon)
-
-            label_point = self._get_room_label_point(room, ordered_vertices)
-            label_rect = QRectF(
-                label_point.x() - 90.0,
-                label_point.y() - 14.0,
-                180.0,
-                28.0,
-            )
-            painter.setBrush(ROOM_LABEL_BACKGROUND_COLOR)
-            painter.drawRoundedRect(label_rect, 6.0, 6.0)
-            painter.setPen(QPen(TEXT_COLOR))
-            painter.setFont(label_font)
-            painter.drawText(
-                label_rect,
-                int(Qt.AlignmentFlag.AlignCenter),
-                room.name,
-            )
-
-    def _get_room_vertices(self, room: RoomData) -> list[Vertex]:
-        vertices: list[Vertex] = []
-        for vertex_id in room.vertex_ids:
-            vertex = self.vertex_data.get_vertex(vertex_id)
-            if vertex is not None:
-                vertices.append(vertex)
-
-        return vertices
-
-    def _get_room_label_point(
-        self,
-        room: RoomData,
-        ordered_vertices: list[Vertex],
-    ) -> QPointF:
-        center_vertex = self.vertex_data.get_vertex(room.center_vertex_id)
-        if center_vertex is not None:
-            return self._image_to_widget(center_vertex.x, center_vertex.y)
-
-        center_x = sum(vertex.x for vertex in ordered_vertices) / len(ordered_vertices)
-        center_y = sum(vertex.y for vertex in ordered_vertices) / len(ordered_vertices)
-        return self._image_to_widget(center_x, center_y)
 
     def _paint_edges(self, painter: QPainter) -> None:
         edge_pen = QPen(EDGE_COLOR, 2.0)
@@ -4176,69 +3547,6 @@ class BlueprintCanvas(QWidget):
         painter.drawText(point + QPointF(13.0, -13.0), label)
         painter.restore()
 
-    def _paint_initial_first_person_camera(self, painter: QPainter) -> None:
-        camera_points = self._get_initial_first_person_camera_widget_points()
-        camera = self.initial_first_person_camera
-        if camera_points is None or camera is None:
-            return
-
-        center, arrow_tip = camera_points
-        yaw_radians = math.radians(camera.pose.yaw_degrees)
-        direction = QPointF(
-            math.cos(yaw_radians),
-            -math.sin(yaw_radians),
-        )
-        perpendicular = QPointF(-direction.y(), direction.x())
-        arrow_base = arrow_tip - direction * 14.0
-        arrow_head = QPolygonF(
-            [
-                arrow_tip,
-                arrow_base + perpendicular * 7.0,
-                arrow_base - perpendicular * 7.0,
-            ]
-        )
-        camera_color = (
-            FIRST_PERSON_CAMERA_SELECTED_COLOR
-            if self.initial_first_person_camera_selected
-            else FIRST_PERSON_CAMERA_FILL_COLOR
-        )
-
-        painter.save()
-        direction_pen = QPen(FIRST_PERSON_CAMERA_DIRECTION_COLOR, 3.0)
-        direction_pen.setCosmetic(True)
-        painter.setPen(direction_pen)
-        painter.setBrush(FIRST_PERSON_CAMERA_DIRECTION_COLOR)
-        painter.drawLine(center, arrow_tip)
-        painter.drawPolygon(arrow_head)
-        painter.drawEllipse(
-            arrow_tip,
-            FIRST_PERSON_CAMERA_DIRECTION_HANDLE_RADIUS_SCREEN,
-            FIRST_PERSON_CAMERA_DIRECTION_HANDLE_RADIUS_SCREEN,
-        )
-
-        body_pen = QPen(QColor("#20242a"), 2.0)
-        body_pen.setCosmetic(True)
-        painter.setPen(body_pen)
-        painter.setBrush(camera_color)
-        painter.drawEllipse(
-            center,
-            FIRST_PERSON_CAMERA_BODY_RADIUS_SCREEN,
-            FIRST_PERSON_CAMERA_BODY_RADIUS_SCREEN,
-        )
-        painter.setPen(QPen(QColor("#20242a"), 2.0))
-        painter.drawLine(
-            center,
-            center + direction * (FIRST_PERSON_CAMERA_BODY_RADIUS_SCREEN - 2.0),
-        )
-
-        painter.setPen(QPen(FIRST_PERSON_CAMERA_TEXT_COLOR))
-        painter.setFont(QFont("Segoe UI", 9))
-        painter.drawText(
-            center + QPointF(14.0, 23.0),
-            f"First POV | Z {camera.pose.z:.2f} m",
-        )
-        painter.restore()
-
     def _paint_pending_doorway(self, painter: QPainter) -> None:
         doorway = self.pending_doorway
         if doorway is None:
@@ -4365,10 +3673,7 @@ class BlueprintCanvas(QWidget):
         for vertex in self.vertex_data.vertices:
             center = self._image_to_widget(vertex.x, vertex.y)
             is_active = vertex.id == self.active_vertex_id
-            is_selected = (
-                vertex.id == self.selected_vertex_id
-                or vertex.id in self.selected_vertex_ids
-            )
+            is_selected = vertex.id == self.selected_vertex_id
 
             painter.setPen(QPen(VERTEX_OUTLINE_COLOR, 1.5))
             if is_active:
@@ -4391,11 +3696,9 @@ class BlueprintCanvas(QWidget):
 
         overlay_lines = [
             f"Blueprint: {Path(self.blueprint_path).name}",
-            "Left click: add/connect/select/drag | Shift click: multi-select vertices",
+            "Left click: add/connect/select/drag",
             "Mouse wheel: zoom | Delete: remove selected vertex | Ctrl+Z: undo | Hold Ctrl: free placement",
         ]
-        if self.pending_room_name is not None:
-            overlay_lines.append("Click a vertex to set the current room center.")
         if self._is_stair_placement_active():
             pending_point = self.pending_stair_point
             pending_stair = self.pending_stair_placement
@@ -4429,14 +3732,6 @@ class BlueprintCanvas(QWidget):
                     f"Stairs: place end point B on level "
                     f"{pending_point.level_index}."
                 )
-        if self.pending_first_person_camera_z is not None:
-            overlay_lines.append(
-                "First POV: click to place | Right click or Escape: cancel."
-            )
-        elif self._initial_first_person_camera_is_visible():
-            overlay_lines.append(
-                "First POV: drag its body to move; drag the orange handle to aim."
-            )
         if self.pending_doorway_preset is not None:
             overlay_lines.append(
                 "Doorway: click to place | Mouse wheel: zoom | Right click or Escape: cancel."
@@ -4982,20 +4277,3 @@ def _calculate_corner_angle(
     cosine = dot_product / (previous_length * next_length)
     clamped_cosine = min(max(cosine, -1.0), 1.0)
     return math.degrees(math.acos(clamped_cosine))
-
-
-def _order_vertices_around_center(vertices: list[Vertex]) -> list[Vertex]:
-    center_x = sum(vertex.x for vertex in vertices) / len(vertices)
-    center_y = sum(vertex.y for vertex in vertices) / len(vertices)
-    return sorted(
-        vertices,
-        key=lambda vertex: math.atan2(vertex.y - center_y, vertex.x - center_x),
-    )
-
-
-def _build_random_room_color() -> tuple[int, int, int]:
-    return (
-        random.randint(70, 230),
-        random.randint(70, 230),
-        random.randint(70, 230),
-    )

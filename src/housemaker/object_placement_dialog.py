@@ -167,9 +167,6 @@ class ObjectPlacementDialog(QDialog):
             vertex_data=level.vertex_data,
             rooms=level.rooms,
             image_path=level.image_path,
-            image_scale=level.image_scale,
-            image_offset_x=level.image_offset_x,
-            image_offset_y=level.image_offset_y,
             floor_contour_vertex_ids=level.floor_contour_vertex_ids,
             doorways=level.doorways,
         )

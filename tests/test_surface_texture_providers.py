@@ -15,7 +15,6 @@ from PIL import Image, features
 from housemaker.surface_texture_providers import (
     DEFAULT_MESHY_IMAGE_MODEL,
     MESHY_IMAGE_TO_IMAGE_ENDPOINT,
-    OPENAI_FILES_ENDPOINT,
     OPENAI_IMAGE_EDITS_ENDPOINT,
     OPENAI_RESPONSES_ENDPOINT,
     SurfaceTextureProviderSettings,
@@ -25,10 +24,8 @@ from housemaker.surface_texture_providers import (
     SurfaceTextureTaskError,
     build_meshy_image_to_image_request_body,
     build_openai_analysis_request_body,
-    build_openai_file_upload_multipart,
     build_openai_image_edit_multipart,
     build_openai_responses_request_body,
-    composite_partial_texture_edit,
     generate_surface_texture,
     request_surface_texture,
 )
@@ -119,19 +116,6 @@ def _encoded_image_bytes(
 ) -> bytes:
     output = io.BytesIO()
     Image.new("RGB", (3, 2), color).save(output, format=image_format)
-    return output.getvalue()
-
-
-def _pil_png(
-    mode: str,
-    size: tuple[int, int],
-    values: list[object] | object,
-) -> bytes:
-    image = Image.new(mode, size, None if isinstance(values, list) else values)
-    if isinstance(values, list):
-        image.putdata(values)
-    output = io.BytesIO()
-    image.save(output, format="PNG")
     return output.getvalue()
 
 
@@ -249,45 +233,6 @@ class SurfaceTextureValidationTests(unittest.TestCase):
         self.assertEqual(result.provider, "meshy")
         self.assertEqual(result.task_id, "task-1")
 
-    def test_partial_edit_requires_matching_nonempty_texture_space_mask(self) -> None:
-        settings = _meshy_settings()
-        base = _pil_png("RGBA", (2, 2), (10, 20, 30, 255))
-        mask = _pil_png("L", (2, 2), [0, 255, 0, 0])
-
-        request = SurfaceTextureRequest(
-            (_png_bytes(),),
-            "stone",
-            settings,
-            existing_texture_png=base,
-            edit_mask_png=mask,
-        )
-
-        self.assertTrue(request.is_partial_edit)
-        with self.assertRaisesRegex(ValueError, "provided together"):
-            SurfaceTextureRequest(
-                (_png_bytes(),),
-                "stone",
-                settings,
-                existing_texture_png=base,
-            )
-        with self.assertRaisesRegex(ValueError, "identical dimensions"):
-            SurfaceTextureRequest(
-                (_png_bytes(),),
-                "stone",
-                settings,
-                existing_texture_png=base,
-                edit_mask_png=_pil_png("L", (1, 2), 255),
-            )
-        with self.assertRaisesRegex(ValueError, "no editable pixels"):
-            SurfaceTextureRequest(
-                (_png_bytes(),),
-                "stone",
-                settings,
-                existing_texture_png=base,
-                edit_mask_png=_pil_png("L", (2, 2), 0),
-            )
-
-
 # ### Request construction tests ###
 class SurfaceTextureRequestConstructionTests(unittest.TestCase):
     def test_meshy_body_uses_multi_reference_image_to_image(self) -> None:
@@ -341,108 +286,6 @@ class SurfaceTextureRequestConstructionTests(unittest.TestCase):
                 self.assertEqual(content[1]["type"], "input_image")
                 self.assertEqual(content[1]["detail"], "high")
 
-    def test_partial_meshy_request_reserves_base_and_control_references(self) -> None:
-        base = _pil_png("RGBA", (2, 2), (10, 20, 30, 255))
-        mask = _pil_png("L", (2, 2), [0, 255, 0, 0])
-        references = tuple(_png_bytes(index, 2, 3) for index in range(1, 6))
-        request = SurfaceTextureRequest(
-            references,
-            "repair the wall finish",
-            _meshy_settings(),
-            existing_texture_png=base,
-            edit_mask_png=mask,
-        )
-
-        body = build_meshy_image_to_image_request_body(request)
-        decoded = [
-            base64.b64decode(value.removeprefix("data:image/png;base64,"))
-            for value in body["reference_image_urls"]
-        ]
-
-        self.assertEqual(len(decoded), 5)
-        self.assertEqual(decoded[0], base)
-        with Image.open(io.BytesIO(decoded[1])) as control:
-            self.assertEqual(control.convert("RGB").getpixel((1, 0)), (211, 4, 214))
-            self.assertEqual(control.convert("RGB").getpixel((0, 0)), (10, 20, 30))
-        packed_colors: set[tuple[int, int, int, int]] = set()
-        for packed_reference in decoded[2:]:
-            with Image.open(io.BytesIO(packed_reference)) as image:
-                rgba = image.convert("RGBA")
-                packed_colors.update(
-                    rgba.getpixel((column, row))
-                    for row in range(rgba.height)
-                    for column in range(rgba.width)
-                    if rgba.getpixel((column, row))[3] > 0
-                )
-        self.assertEqual(
-            packed_colors,
-            {(index, 2, 3, 255) for index in range(1, 6)},
-        )
-        self.assertIn("bright magenta", body["prompt"])
-
-    def test_partial_openai_responses_request_forces_masked_edit(self) -> None:
-        request = SurfaceTextureRequest(
-            (_png_bytes(),),
-            "repair the wall finish",
-            _openai_settings("gpt-5.6-luna"),
-            existing_texture_png=_pil_png("RGBA", (2, 2), (1, 2, 3, 255)),
-            edit_mask_png=_pil_png("L", (2, 2), [255, 0, 0, 0]),
-        )
-
-        body = build_openai_responses_request_body(
-            request,
-            existing_texture_file_id="file-base",
-            edit_mask_file_id="file-mask",
-        )
-
-        content = body["input"][0]["content"]
-        self.assertEqual(content[1]["file_id"], "file-base")
-        self.assertEqual(body["tools"][0]["action"], "edit")
-        self.assertEqual(
-            body["tools"][0]["input_image_mask"],
-            {"file_id": "file-mask"},
-        )
-
-    def test_openai_multipart_mask_has_transparent_editable_pixels(self) -> None:
-        base = _pil_png("RGBA", (2, 1), [(10, 20, 30, 255)] * 2)
-        edit_mask = _pil_png("L", (2, 1), [255, 0])
-
-        body, content_type = build_openai_image_edit_multipart(
-            (_png_bytes(),),
-            "repair only the marked area",
-            existing_texture_png=base,
-            edit_mask_png=edit_mask,
-        )
-
-        boundary = content_type.removeprefix("multipart/form-data; boundary=")
-        mask_part = next(
-            part
-            for part in body.split(("--" + boundary).encode("ascii"))
-            if b'name="mask"' in part
-        )
-        encoded_mask = mask_part.split(b"\r\n\r\n", 1)[1].removesuffix(b"\r\n")
-        with Image.open(io.BytesIO(encoded_mask)) as mask_image:
-            alpha = mask_image.convert("RGBA").getchannel("A")
-            self.assertEqual(
-                [alpha.getpixel((0, 0)), alpha.getpixel((1, 0))],
-                [0, 255],
-            )
-        self.assertEqual(body.count(b'name="image[]"'), 2)
-
-    def test_openai_vision_upload_is_a_png_file_with_vision_purpose(self) -> None:
-        image_png = _png_bytes()
-
-        body, content_type = build_openai_file_upload_multipart(
-            image_png,
-            "existing_texture.png",
-        )
-
-        self.assertTrue(content_type.startswith("multipart/form-data; boundary="))
-        self.assertIn(b'name="purpose"', body)
-        self.assertIn(b"vision", body)
-        self.assertIn(b'name="file"', body)
-        self.assertIn(image_png, body)
-
     def test_mini_analysis_then_image_edit_bodies_are_well_formed(self) -> None:
         images = (_png_bytes(10, 20, 30), _png_bytes(40, 50, 60))
         request = _request(_openai_settings("gpt-4o-mini"), images)
@@ -465,73 +308,8 @@ class SurfaceTextureRequestConstructionTests(unittest.TestCase):
             self.assertIn(image, multipart)
 
 
-# ### Partial compositing tests ###
-class SurfaceTexturePartialCompositingTests(unittest.TestCase):
-    def test_composite_preserves_unmasked_pixels_and_resizes_generation(self) -> None:
-        base_pixels = [
-            (10, 20, 30, 40),
-            (50, 60, 70, 80),
-            (90, 100, 110, 120),
-            (130, 140, 150, 160),
-        ]
-        base = _pil_png("RGBA", (2, 2), base_pixels)
-        generated = _pil_png("RGBA", (1, 1), (200, 210, 220, 230))
-        mask = _pil_png("L", (2, 2), [0, 255, 0, 255])
-
-        output = composite_partial_texture_edit(generated, base, mask)
-
-        with Image.open(io.BytesIO(output)) as image:
-            rgba = image.convert("RGBA")
-            pixels = [
-                rgba.getpixel((column, row))
-                for row in range(2)
-                for column in range(2)
-            ]
-        self.assertEqual(pixels[0], base_pixels[0])
-        self.assertEqual(pixels[2], base_pixels[2])
-        self.assertEqual(pixels[1], (200, 210, 220, 230))
-        self.assertEqual(pixels[3], (200, 210, 220, 230))
-
 # ### Meshy adapter tests ###
 class MeshySurfaceTextureAdapterTests(unittest.TestCase):
-    def test_partial_meshy_result_is_composited_with_the_exact_base_pixels(self) -> None:
-        base_pixels = [(10, 20, 30, 40), (50, 60, 70, 80)]
-        base = _pil_png("RGBA", (2, 1), base_pixels)
-        edit_mask = _pil_png("L", (2, 1), [0, 255])
-        generated = _pil_png("RGBA", (2, 1), [(200, 210, 220, 230)] * 2)
-        opener = SequentialOpener(
-            [
-                _json_bytes({"result": "task-partial"}),
-                _json_bytes(
-                    {
-                        "id": "task-partial",
-                        "status": "SUCCEEDED",
-                        "progress": 100,
-                        "image_urls": [
-                            "https://assets.meshy.ai/partial-texture.png"
-                        ],
-                    }
-                ),
-                generated,
-            ]
-        )
-
-        result = request_surface_texture(
-            "meshy",
-            "msy-secret",
-            (_png_bytes(),),
-            "repair the marked plaster",
-            existing_texture_png=base,
-            edit_mask_png=edit_mask,
-            opener=opener,
-            sleep=lambda _seconds: None,
-        )
-
-        with Image.open(io.BytesIO(result.texture_png)) as output:
-            rgba = output.convert("RGBA")
-            self.assertEqual(rgba.getpixel((0, 0)), base_pixels[0])
-            self.assertEqual(rgba.getpixel((1, 0)), (200, 210, 220, 230))
-
     def test_public_adapter_creates_polls_and_downloads_texture(self) -> None:
         texture_png = _png_bytes(200, 170, 90)
         opener = SequentialOpener(
@@ -780,62 +558,6 @@ class MeshySurfaceTextureAdapterTests(unittest.TestCase):
 
 # ### OpenAI adapter tests ###
 class OpenAISurfaceTextureAdapterTests(unittest.TestCase):
-    def test_direct_partial_edit_uploads_mask_and_preserves_outside_pixels(self) -> None:
-        base_pixels = [(10, 20, 30, 40), (50, 60, 70, 80)]
-        base = _pil_png("RGBA", (2, 1), base_pixels)
-        edit_mask = _pil_png("L", (2, 1), [0, 255])
-        generated = _pil_png("RGBA", (2, 1), [(200, 210, 220, 230)] * 2)
-        opener = SequentialOpener(
-            [
-                _json_bytes({"id": "file-base"}),
-                _json_bytes({"id": "file-mask"}),
-                _json_bytes(
-                    {
-                        "output": [
-                            {
-                                "type": "image_generation_call",
-                                "result": base64.b64encode(generated).decode("ascii"),
-                            }
-                        ]
-                    }
-                ),
-                _json_bytes({"deleted": True, "id": "file-mask"}),
-                _json_bytes({"deleted": True, "id": "file-base"}),
-            ]
-        )
-
-        result = request_surface_texture(
-            "gpt-5.6-terra",
-            "sk-secret",
-            (_png_bytes(),),
-            "repair the marked plaster",
-            existing_texture_png=base,
-            edit_mask_png=edit_mask,
-            opener=opener,
-        )
-
-        with Image.open(io.BytesIO(result.texture_png)) as output:
-            rgba = output.convert("RGBA")
-            self.assertEqual(rgba.size, (2, 1))
-            self.assertEqual(rgba.getpixel((0, 0)), base_pixels[0])
-            self.assertEqual(rgba.getpixel((1, 0)), (200, 210, 220, 230))
-        self.assertEqual(
-            [request.full_url for request in opener.requests],
-            [
-                OPENAI_FILES_ENDPOINT,
-                OPENAI_FILES_ENDPOINT,
-                OPENAI_RESPONSES_ENDPOINT,
-                f"{OPENAI_FILES_ENDPOINT}/file-mask",
-                f"{OPENAI_FILES_ENDPOINT}/file-base",
-            ],
-        )
-        response_body = json.loads(opener.requests[2].data.decode("utf-8"))
-        self.assertEqual(response_body["tools"][0]["action"], "edit")
-        self.assertEqual(
-            response_body["tools"][0]["input_image_mask"]["file_id"],
-            "file-mask",
-        )
-
     def test_terra_returns_responses_image_generation_png(self) -> None:
         texture_png = _png_bytes(90, 100, 110)
         opener = SequentialOpener(

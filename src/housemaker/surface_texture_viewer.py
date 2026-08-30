@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 
-import cv2
 import numpy as np
 import pyqtgraph.opengl as gl
 import trimesh
@@ -16,14 +15,8 @@ from PySide6.QtGui import QCursor, QKeyEvent, QMouseEvent, QVector3D
 from PySide6.QtWidgets import QLabel, QStackedLayout, QWidget
 from PIL import Image
 
-from housemaker.camera_models import CameraPose, InitialFirstPersonCamera
+from housemaker.camera_models import CameraPose
 from housemaker.glb import GeneratedModel, PreviewTexturedSurface
-from housemaker.generation_state import (
-    MASK_MODE_ERASE,
-    MASK_MODE_PAINT,
-    MaskPoint,
-    MaskStroke,
-)
 from housemaker.models import LevelData
 from housemaker.surface_geometry import (
     SURFACE_TYPE_CEILING,
@@ -54,7 +47,6 @@ DEFAULT_FIRST_PERSON_MOVE_SPEED_METERS_PER_SECOND = 2.5
 DEFAULT_MOUSE_LOOK_SENSITIVITY_DEGREES = 0.16
 DEFAULT_TEXTURE_WORLD_SIZE_METERS = 2.0
 DEFAULT_AMBIENT_LIGHT_INTENSITY = CANVAS_AMBIENT_LIGHT_INTENSITY
-DEFAULT_TEXTURE_INPAINT_BRUSH_RADIUS_PIXELS = 24
 FIRST_PERSON_UPDATE_INTERVAL_MILLISECONDS = 16
 FIRST_PERSON_LOOK_DISTANCE_METERS = 1.0
 MAX_FIRST_PERSON_PITCH_DEGREES = 89.0
@@ -70,8 +62,6 @@ SURFACE_FACE_COLORS = {
     SURFACE_TYPE_FLOOR: np.array((0.44, 0.48, 0.54, 1.0), dtype=float),
     SURFACE_TYPE_CEILING: np.array((0.82, 0.83, 0.86, 1.0), dtype=float),
 }
-TEXTURE_MASK_OVERLAY_RGBA = np.array((255, 126, 24, 255), dtype=np.uint8)
-TEXTURE_MASK_OVERLAY_STRENGTH = 0.68
 
 
 # ### Render models ###
@@ -91,15 +81,6 @@ class CanvasSceneRenderItems:
     mesh_item: gl.GLMeshItem | None = None
     textured_mesh_item: TexturedMeshItem | None = None
     legacy_wall_items: tuple[gl.GLImageItem, ...] = ()
-
-
-@dataclass(frozen=True)
-class SurfaceTextureHit:
-    """Nearest semantic surface hit and its repeating texture-space point."""
-
-    surface_id: str
-    world_position: tuple[float, float, float]
-    texture_point: MaskPoint
 
 
 @dataclass(frozen=True)
@@ -134,9 +115,9 @@ class RepeatingTexturedMeshItem(TexturedMeshItem):
         *,
         double_sided: bool = False,
     ) -> None:
-        # Keep the complete shared texture renderer, including its edit-mask
-        # sampler.  The old custom resource upload omitted that sampler, so the
-        # textured draw failed after the fallback surface face was hidden.
+        # Keep the complete shared texture renderer. The old custom resource
+        # upload omitted required shader resources, so textured drawing failed
+        # after the fallback surface face was hidden.
         super().__init__(
             texture_mesh_data,
             ambient_light_intensity,
@@ -153,9 +134,6 @@ class SurfaceFirstPersonViewWidget(gl.GLViewWidget):
     surface_pick_requested = Signal(object, object)
     camera_pose_changed = Signal(object)
     first_person_active_changed = Signal(bool)
-    inpaint_pointer_pressed = Signal(object)
-    inpaint_pointer_moved = Signal(object)
-    inpaint_pointer_released = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -163,7 +141,6 @@ class SurfaceFirstPersonViewWidget(gl.GLViewWidget):
         self.setMouseTracking(True)
         self._camera_pose = CameraPose(z=DEFAULT_FIRST_PERSON_HEIGHT_METERS)
         self._first_person_active = False
-        self._inpaint_enabled = False
         self._pressed_movement_keys: set[int] = set()
         self._ignore_center_mouse_move = False
         self._mouse_look_sensitivity = DEFAULT_MOUSE_LOOK_SENSITIVITY_DEGREES
@@ -176,18 +153,6 @@ class SurfaceFirstPersonViewWidget(gl.GLViewWidget):
     @property
     def is_first_person_active(self) -> bool:
         return self._first_person_active
-
-    @property
-    def is_inpaint_enabled(self) -> bool:
-        return self._inpaint_enabled
-
-    def set_inpaint_enabled(self, enabled: bool) -> None:
-        self._inpaint_enabled = bool(enabled)
-        if self._inpaint_enabled:
-            self.exit_first_person_mode()
-            self.setCursor(Qt.CursorShape.CrossCursor)
-        else:
-            self.unsetCursor()
 
     def get_camera_pose(self) -> CameraPose:
         return self._camera_pose
@@ -217,7 +182,7 @@ class SurfaceFirstPersonViewWidget(gl.GLViewWidget):
             self.camera_pose_changed.emit(self._camera_pose)
 
     def enter_first_person_mode(self) -> None:
-        if self._first_person_active or self._inpaint_enabled:
+        if self._first_person_active:
             return
         self._first_person_active = True
         self.setFocus(Qt.FocusReason.MouseFocusReason)
@@ -294,10 +259,6 @@ class SurfaceFirstPersonViewWidget(gl.GLViewWidget):
         )
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
-        if self._inpaint_enabled and event.button() == Qt.MouseButton.LeftButton:
-            self.inpaint_pointer_pressed.emit(event.position())
-            event.accept()
-            return
         if event.button() == Qt.MouseButton.RightButton:
             if self._first_person_active:
                 self.exit_first_person_mode()
@@ -317,11 +278,6 @@ class SurfaceFirstPersonViewWidget(gl.GLViewWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
-        if self._inpaint_enabled:
-            if event.buttons() & Qt.MouseButton.LeftButton:
-                self.inpaint_pointer_moved.emit(event.position())
-            event.accept()
-            return
         if not self._first_person_active:
             super().mouseMoveEvent(event)
             return
@@ -352,13 +308,6 @@ class SurfaceFirstPersonViewWidget(gl.GLViewWidget):
             if self.isVisible():
                 self._center_pointer()
         event.accept()
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
-        if self._inpaint_enabled and event.button() == Qt.MouseButton.LeftButton:
-            self.inpaint_pointer_released.emit(event.position())
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
         if self._first_person_active and event.key() in _movement_keys():
@@ -426,7 +375,6 @@ class SurfaceTextureViewer(QWidget):
     selection_changed = Signal(object)
     camera_pose_changed = Signal(object)
     first_person_active_changed = Signal(bool)
-    texture_mask_strokes_changed = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -436,7 +384,6 @@ class SurfaceTextureViewer(QWidget):
         self._surface_id_by_item_id: dict[int, str] = {}
         self._selected_surface_ids: list[str] = []
         self._surface_textures: dict[str, np.ndarray] = {}
-        self._texture_mask_strokes: dict[str, list[MaskStroke]] = {}
         self._scene_model: GeneratedModel | None = None
         self._canvas_scene_render_items = CanvasSceneRenderItems()
         self._preview_surfaces_by_id: dict[
@@ -448,13 +395,6 @@ class SurfaceTextureViewer(QWidget):
         self._ambient_shader = _build_ambient_shader(
             self._ambient_light_intensity
         )
-        self._inpaint_brush_mode = MASK_MODE_PAINT
-        self._inpaint_brush_radius_pixels = (
-            DEFAULT_TEXTURE_INPAINT_BRUSH_RADIUS_PIXELS
-        )
-        self._active_inpaint_surface_id: str | None = None
-        self._active_inpaint_points: list[MaskPoint] = []
-        self._last_inpaint_surface_id: str | None = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -469,15 +409,6 @@ class SurfaceTextureViewer(QWidget):
         self.view.camera_pose_changed.connect(self.camera_pose_changed.emit)
         self.view.first_person_active_changed.connect(
             self.first_person_active_changed.emit
-        )
-        self.view.inpaint_pointer_pressed.connect(
-            self._handle_inpaint_pointer_pressed
-        )
-        self.view.inpaint_pointer_moved.connect(
-            self._handle_inpaint_pointer_moved
-        )
-        self.view.inpaint_pointer_released.connect(
-            self._handle_inpaint_pointer_released
         )
         layout.addWidget(self.view)
 
@@ -501,13 +432,12 @@ class SurfaceTextureViewer(QWidget):
     def set_levels(
         self,
         levels: Sequence[LevelData],
-        initial_camera: InitialFirstPersonCamera | CameraPose | None = None,
     ) -> None:
         self.set_surfaces(build_fixed_surfaces(levels))
-        pose = _get_initial_pose(initial_camera)
-        if pose is None:
-            pose = _build_default_camera_pose(self._surfaces)
-        self.set_camera_pose(pose, emit_signal=False)
+        self.set_camera_pose(
+            _build_default_camera_pose(self._surfaces),
+            emit_signal=False,
+        )
 
     def set_scene_model(
         self,
@@ -538,17 +468,11 @@ class SurfaceTextureViewer(QWidget):
             for surface_id, texture in self._surface_textures.items()
             if surface_id in surface_ids
         }
-        retained_texture_mask_strokes = {
-            surface_id: list(strokes)
-            for surface_id, strokes in self._texture_mask_strokes.items()
-            if surface_id in surface_ids
-        }
         self._surfaces = normalized
         self._surface_by_id = {
             surface.surface_id: surface for surface in self._surfaces
         }
         self._surface_textures = retained_textures
-        self._texture_mask_strokes = retained_texture_mask_strokes
         self._selected_surface_ids = [
             surface_id
             for surface_id in self._selected_surface_ids
@@ -652,165 +576,6 @@ class SurfaceTextureViewer(QWidget):
         texture = self._surface_textures.get(str(surface_id))
         return None if texture is None else texture.copy()
 
-    def get_texture_mask_strokes(self) -> dict[str, list[MaskStroke]]:
-        return {
-            surface_id: list(strokes)
-            for surface_id, strokes in self._texture_mask_strokes.items()
-        }
-
-    def set_texture_mask_strokes(
-        self,
-        strokes_by_surface_id: Mapping[str, Sequence[MaskStroke]],
-        *,
-        emit_signal: bool = False,
-    ) -> None:
-        if not isinstance(strokes_by_surface_id, Mapping):
-            raise TypeError("3D texture masks must contain a surface mapping.")
-        normalized: dict[str, list[MaskStroke]] = {}
-        for raw_surface_id, raw_strokes in strokes_by_surface_id.items():
-            surface_id = str(raw_surface_id)
-            if surface_id not in self._surface_by_id:
-                continue
-            strokes = list(raw_strokes)
-            if not all(isinstance(stroke, MaskStroke) for stroke in strokes):
-                raise ValueError("3D texture masks must contain MaskStroke values.")
-            if strokes:
-                normalized[surface_id] = strokes
-        changed_ids = set(self._texture_mask_strokes) | set(normalized)
-        self._texture_mask_strokes = normalized
-        for surface_id in changed_ids:
-            if surface_id in self._surface_textures:
-                self._rebuild_surface_texture_item(surface_id)
-        if emit_signal:
-            self.texture_mask_strokes_changed.emit(
-                self.get_texture_mask_strokes()
-            )
-
-    def add_texture_mask_stroke(
-        self,
-        surface_id: str,
-        stroke: MaskStroke,
-    ) -> None:
-        normalized_id = str(surface_id)
-        if normalized_id not in self._selected_surface_ids:
-            raise ValueError("3D inpainting is limited to selected surfaces.")
-        if normalized_id not in self._surface_textures:
-            raise ValueError("Apply a texture before inpainting this surface.")
-        if not isinstance(stroke, MaskStroke):
-            raise TypeError("A 3D texture mask stroke must be a MaskStroke.")
-        self._texture_mask_strokes.setdefault(normalized_id, []).append(stroke)
-        self._last_inpaint_surface_id = normalized_id
-        self._rebuild_surface_texture_item(normalized_id)
-        self.texture_mask_strokes_changed.emit(self.get_texture_mask_strokes())
-
-    def clear_texture_mask(self, surface_ids: Iterable[str] | None = None) -> None:
-        target_ids = (
-            list(self._selected_surface_ids)
-            if surface_ids is None
-            else _deduplicate_strings(surface_ids)
-        )
-        changed_ids = [
-            surface_id
-            for surface_id in target_ids
-            if self._texture_mask_strokes.pop(surface_id, None) is not None
-        ]
-        if not changed_ids:
-            return
-        for surface_id in changed_ids:
-            if surface_id in self._surface_textures:
-                self._rebuild_surface_texture_item(surface_id)
-        self.texture_mask_strokes_changed.emit(self.get_texture_mask_strokes())
-
-    def undo_last_texture_mask_stroke(self) -> None:
-        candidate_ids = list(reversed(self._selected_surface_ids))
-        if self._last_inpaint_surface_id in candidate_ids:
-            candidate_ids.remove(self._last_inpaint_surface_id)
-            candidate_ids.insert(0, self._last_inpaint_surface_id)
-        for surface_id in candidate_ids:
-            strokes = self._texture_mask_strokes.get(surface_id)
-            if not strokes:
-                continue
-            strokes.pop()
-            if not strokes:
-                self._texture_mask_strokes.pop(surface_id, None)
-            self._rebuild_surface_texture_item(surface_id)
-            self.texture_mask_strokes_changed.emit(
-                self.get_texture_mask_strokes()
-            )
-            return
-
-    def has_selected_texture_mask(self) -> bool:
-        return bool(self.get_masked_selected_surface_ids())
-
-    def get_masked_selected_surface_ids(self) -> tuple[str, ...]:
-        return tuple(
-            surface_id
-            for surface_id in self._selected_surface_ids
-            if self._texture_mask_strokes.get(surface_id)
-        )
-
-    def get_combined_masked_selected_area(self) -> float:
-        return get_combined_surface_area(
-            self._surfaces,
-            self.get_masked_selected_surface_ids(),
-        )
-
-    def get_selected_texture_edit_data(
-        self,
-    ) -> tuple[np.ndarray, np.ndarray] | None:
-        """Return identical base texture and editable-white union mask."""
-
-        masked_ids = self.get_masked_selected_surface_ids()
-        if not masked_ids:
-            return None
-        textures: list[np.ndarray] = []
-        for surface_id in masked_ids:
-            texture = self._surface_textures.get(surface_id)
-            if texture is None:
-                raise ValueError(
-                    "Every selected 3D surface needs an applied texture."
-                )
-            textures.append(texture)
-        base_texture = textures[0]
-        if any(
-            texture.shape != base_texture.shape
-            or not np.array_equal(texture, base_texture)
-            for texture in textures[1:]
-        ):
-            raise ValueError(
-                "Selected surfaces must share the same texture for partial inpainting."
-            )
-        mask = np.zeros(base_texture.shape[:2], dtype=np.uint8)
-        for surface_id in masked_ids:
-            strokes = self._texture_mask_strokes.get(surface_id, [])
-            if strokes:
-                mask = np.maximum(
-                    mask,
-                    rasterize_texture_mask_strokes(
-                        (base_texture.shape[1], base_texture.shape[0]),
-                        strokes,
-                    ),
-                )
-        if not np.any(mask):
-            return None
-        return base_texture.copy(), mask
-
-    def get_selected_texture_edit_masks(self) -> dict[str, np.ndarray]:
-        """Return editable-white masks for only selected, painted textures."""
-
-        masked_ids = self.get_masked_selected_surface_ids()
-        edit_data = self.get_selected_texture_edit_data()
-        if edit_data is None:
-            return {}
-        base_texture, _union_mask = edit_data
-        return {
-            surface_id: rasterize_texture_mask_strokes(
-                (base_texture.shape[1], base_texture.shape[0]),
-                self._texture_mask_strokes[surface_id],
-            )
-            for surface_id in masked_ids
-        }
-
     def set_surface_textures(
         self,
         textures: Mapping[str, object],
@@ -881,33 +646,6 @@ class SurfaceTextureViewer(QWidget):
     def exit_first_person_mode(self) -> None:
         self.view.exit_first_person_mode()
 
-    @property
-    def is_inpaint_enabled(self) -> bool:
-        return self.view.is_inpaint_enabled
-
-    def can_inpaint_selection(self) -> bool:
-        return any(
-            surface_id in self._surface_textures
-            for surface_id in self._selected_surface_ids
-        )
-
-    def set_inpaint_enabled(self, enabled: bool) -> None:
-        should_enable = bool(enabled)
-        if should_enable and not self.can_inpaint_selection():
-            raise ValueError(
-                "Select at least one surface with an applied texture first."
-            )
-        self._commit_active_inpaint_stroke()
-        self.view.set_inpaint_enabled(should_enable)
-
-    def set_inpaint_brush_mode(self, mode: str) -> None:
-        if mode not in (MASK_MODE_PAINT, MASK_MODE_ERASE):
-            raise ValueError(f"Unknown 3D inpaint brush mode: {mode!r}.")
-        self._inpaint_brush_mode = mode
-
-    def set_inpaint_brush_radius_pixels(self, radius_pixels: int) -> None:
-        self._inpaint_brush_radius_pixels = max(1, int(radius_pixels))
-
     def pick_surface_at_view_position(
         self,
         position: QPointF | tuple[float, float],
@@ -966,77 +704,6 @@ class SurfaceTextureViewer(QWidget):
         ]
         return min(nearest_candidates, key=lambda candidate: candidate[1:])[2]
 
-    def pick_surface_texture_hit_at_view_position(
-        self,
-        position: QPointF | tuple[float, float],
-    ) -> SurfaceTextureHit | None:
-        if isinstance(position, QPointF):
-            position_x, position_y = position.x(), position.y()
-        else:
-            try:
-                position_x, position_y = position
-            except (TypeError, ValueError) as error:
-                raise ValueError("A pick position must contain X and Y.") from error
-        ray_origin, ray_direction = _build_camera_ray(
-            self.get_camera_pose(),
-            float(position_x),
-            float(position_y),
-            self.view.width(),
-            self.view.height(),
-        )
-        return self.pick_surface_texture_hit_from_ray(ray_origin, ray_direction)
-
-    def pick_surface_texture_hit_from_ray(
-        self,
-        ray_origin: Sequence[float],
-        ray_direction: Sequence[float],
-    ) -> SurfaceTextureHit | None:
-        origin = _normalize_vector3(ray_origin, "Ray origin", normalize=False)
-        direction = _normalize_vector3(
-            ray_direction,
-            "Ray direction",
-            normalize=True,
-        )
-        candidates: list[tuple[float, int, str, _MeshRayHit]] = []
-        for surface in self._surfaces:
-            hit = _get_nearest_mesh_ray_hit_details(
-                surface.mesh,
-                origin,
-                direction,
-            )
-            if hit is None:
-                continue
-            candidates.append(
-                (
-                    hit.distance,
-                    int(hit.is_back_facing),
-                    surface.surface_id,
-                    hit,
-                )
-            )
-        if not candidates:
-            return None
-        distance, _back_facing, surface_id, hit = min(
-            candidates,
-            key=lambda candidate: candidate[:3],
-        )
-        world_position = origin + direction * distance
-        surface = self._surface_by_id[surface_id]
-        face_normal = np.asarray(
-            surface.mesh.face_normals[hit.face_index],
-            dtype=float,
-        )
-        texture_point = _world_position_to_texture_point(
-            surface.surface_type,
-            world_position,
-            face_normal,
-            self._texture_world_size_meters,
-        )
-        return SurfaceTextureHit(
-            surface_id=surface_id,
-            world_position=tuple(float(value) for value in world_position),
-            texture_point=texture_point,
-        )
 
     def _populate_scene(self) -> None:
         self.view.clear()
@@ -1187,13 +854,9 @@ class SurfaceTextureViewer(QWidget):
         texture_rgba = self._surface_textures.get(surface_id)
         if surface is None or render_items is None or texture_rgba is None:
             return
-        preview_texture_rgba = _build_texture_mask_preview(
-            texture_rgba,
-            self._texture_mask_strokes.get(surface_id, []),
-        )
         texture_data_values = self._build_surface_texture_data_values(
             surface,
-            preview_texture_rgba,
+            texture_rgba,
         )
         texture_items = tuple(
             RepeatingTexturedMeshItem(
@@ -1303,58 +966,6 @@ class SurfaceTextureViewer(QWidget):
                 modifiers & Qt.KeyboardModifier.ShiftModifier
             ),
         )
-
-    def _handle_inpaint_pointer_pressed(self, position: QPointF) -> None:
-        self._commit_active_inpaint_stroke()
-        self._append_inpaint_point_at_view_position(position)
-
-    def _handle_inpaint_pointer_moved(self, position: QPointF) -> None:
-        self._append_inpaint_point_at_view_position(position)
-
-    def _handle_inpaint_pointer_released(self, position: QPointF) -> None:
-        self._append_inpaint_point_at_view_position(position)
-        self._commit_active_inpaint_stroke()
-
-    def _append_inpaint_point_at_view_position(self, position: QPointF) -> None:
-        hit = self.pick_surface_texture_hit_at_view_position(position)
-        if (
-            hit is None
-            or hit.surface_id not in self._selected_surface_ids
-            or hit.surface_id not in self._surface_textures
-        ):
-            self._commit_active_inpaint_stroke()
-            return
-        if self._active_inpaint_surface_id != hit.surface_id:
-            self._commit_active_inpaint_stroke()
-            self._active_inpaint_surface_id = hit.surface_id
-        if self._active_inpaint_points and not _texture_points_are_distinct(
-            self._active_inpaint_points[-1],
-            hit.texture_point,
-            self._surface_textures[hit.surface_id].shape,
-        ):
-            return
-        self._active_inpaint_points.append(hit.texture_point)
-
-    def _commit_active_inpaint_stroke(self) -> None:
-        surface_id = self._active_inpaint_surface_id
-        points = tuple(self._active_inpaint_points)
-        self._active_inpaint_surface_id = None
-        self._active_inpaint_points = []
-        if surface_id is None or not points:
-            return
-        texture = self._surface_textures.get(surface_id)
-        if texture is None:
-            return
-        shortest_side = max(1, min(texture.shape[:2]))
-        stroke = MaskStroke(
-            mode=self._inpaint_brush_mode,
-            radius_normalized=min(
-                float(self._inpaint_brush_radius_pixels) / shortest_side,
-                1.0,
-            ),
-            points=points,
-        )
-        self.add_texture_mask_stroke(surface_id, stroke)
 
     def _sync_selection_rendering(self) -> None:
         for surface_id in self._render_items_by_surface_id:
@@ -1522,78 +1133,6 @@ def _build_surface_texture_mesh_data(
     )
 
 
-def rasterize_texture_mask_strokes(
-    texture_size: tuple[int, int],
-    strokes: Sequence[MaskStroke],
-) -> np.ndarray:
-    """Rasterize repeating normalized UV strokes as editable-white pixels."""
-
-    width = max(0, int(texture_size[0]))
-    height = max(0, int(texture_size[1]))
-    if width <= 0 or height <= 0:
-        return np.empty((0, 0), dtype=np.uint8)
-    mask = np.zeros((height, width), dtype=np.uint8)
-    shortest_side = max(1, min(width, height))
-    for stroke in strokes:
-        radius = max(1, int(round(stroke.radius_normalized * shortest_side)))
-        value = 0 if stroke.mode == MASK_MODE_ERASE else 255
-        points = [
-            (
-                int(round(point.x * width)) % width,
-                int(round((1.0 - point.y) * height)) % height,
-            )
-            for point in stroke.points
-        ]
-        _draw_periodic_circle(mask, points[0], radius, value)
-        for start_point, end_point in zip(points, points[1:]):
-            end_point = (
-                start_point[0]
-                + _shortest_periodic_delta(
-                    end_point[0] - start_point[0],
-                    width,
-                ),
-                start_point[1]
-                + _shortest_periodic_delta(
-                    end_point[1] - start_point[1],
-                    height,
-                ),
-            )
-            _draw_periodic_segment(
-                mask,
-                start_point,
-                end_point,
-                radius,
-                value,
-            )
-            _draw_periodic_circle(mask, end_point, radius, value)
-    return mask
-
-
-def _build_texture_mask_preview(
-    texture_rgba: np.ndarray,
-    strokes: Sequence[MaskStroke],
-) -> np.ndarray:
-    if not strokes:
-        return texture_rgba
-    mask = rasterize_texture_mask_strokes(
-        (texture_rgba.shape[1], texture_rgba.shape[0]),
-        strokes,
-    )
-    if not np.any(mask):
-        return texture_rgba
-    preview = texture_rgba.copy()
-    selected = mask > 0
-    preview[selected, :3] = np.clip(
-        preview[selected, :3].astype(float)
-        * (1.0 - TEXTURE_MASK_OVERLAY_STRENGTH)
-        + TEXTURE_MASK_OVERLAY_RGBA[:3].astype(float)
-        * TEXTURE_MASK_OVERLAY_STRENGTH,
-        0.0,
-        255.0,
-    ).astype(np.uint8)
-    return preview
-
-
 SURFACE_GEOMETRY_MINIMUM = 1e-8
 
 
@@ -1728,91 +1267,6 @@ def _get_nearest_mesh_ray_hit_details(
     )
 
 
-def _world_position_to_texture_point(
-    surface_type: str,
-    world_position: np.ndarray,
-    face_normal: np.ndarray,
-    texture_world_size_meters: float,
-) -> MaskPoint:
-    tile_size = max(float(texture_world_size_meters), SURFACE_GEOMETRY_MINIMUM)
-    if surface_type == SURFACE_TYPE_WALL and abs(face_normal[2]) < 0.7:
-        tangent = np.asarray((-face_normal[1], face_normal[0], 0.0), dtype=float)
-        tangent_length = float(np.linalg.norm(tangent))
-        if tangent_length <= SURFACE_GEOMETRY_MINIMUM:
-            tangent = np.asarray((1.0, 0.0, 0.0), dtype=float)
-        else:
-            tangent /= tangent_length
-        coordinate_u = float(np.dot(world_position, tangent)) / tile_size
-        coordinate_v = float(world_position[2]) / tile_size
-    else:
-        coordinate_u = float(world_position[0]) / tile_size
-        coordinate_v = float(world_position[1]) / tile_size
-    return MaskPoint(x=coordinate_u % 1.0, y=coordinate_v % 1.0)
-
-
-def _texture_points_are_distinct(
-    first: MaskPoint,
-    second: MaskPoint,
-    texture_shape: Sequence[int],
-) -> bool:
-    height = max(1, int(texture_shape[0]))
-    width = max(1, int(texture_shape[1]))
-    return math.hypot(
-        _shortest_periodic_delta_float(first.x - second.x) * width,
-        _shortest_periodic_delta_float(first.y - second.y) * height,
-    ) >= 0.75
-
-
-def _shortest_periodic_delta(delta: int, period: int) -> int:
-    if period <= 0:
-        return int(delta)
-    return int((int(delta) + period // 2) % period - period // 2)
-
-
-def _shortest_periodic_delta_float(delta: float) -> float:
-    return (float(delta) + 0.5) % 1.0 - 0.5
-
-
-def _draw_periodic_circle(
-    mask: np.ndarray,
-    point: tuple[int, int],
-    radius: int,
-    value: int,
-) -> None:
-    height, width = mask.shape
-    for offset_x in (-width, 0, width):
-        for offset_y in (-height, 0, height):
-            cv2.circle(
-                mask,
-                (point[0] + offset_x, point[1] + offset_y),
-                radius,
-                value,
-                -1,
-                cv2.LINE_8,
-            )
-
-
-def _draw_periodic_segment(
-    mask: np.ndarray,
-    start: tuple[int, int],
-    end: tuple[int, int],
-    radius: int,
-    value: int,
-) -> None:
-    height, width = mask.shape
-    for offset_x in (-width, 0, width):
-        for offset_y in (-height, 0, height):
-            offset = (offset_x, offset_y)
-            cv2.line(
-                mask,
-                (start[0] + offset[0], start[1] + offset[1]),
-                (end[0] + offset[0], end[1] + offset[1]),
-                value,
-                radius * 2,
-                cv2.LINE_8,
-            )
-
-
 def _normalize_vector3(
     value: Sequence[float],
     label: str,
@@ -1831,18 +1285,6 @@ def _normalize_vector3(
 
 
 # ### Camera initialization helpers ###
-def _get_initial_pose(
-    camera: InitialFirstPersonCamera | CameraPose | None,
-) -> CameraPose | None:
-    if isinstance(camera, InitialFirstPersonCamera):
-        return camera.pose
-    if isinstance(camera, CameraPose):
-        return camera
-    if camera is not None:
-        raise TypeError("Initial camera must be a CameraPose or project camera.")
-    return None
-
-
 def _build_default_camera_pose(surfaces: Sequence[FixedSurface]) -> CameraPose:
     if not surfaces:
         return CameraPose(z=DEFAULT_FIRST_PERSON_HEIGHT_METERS)

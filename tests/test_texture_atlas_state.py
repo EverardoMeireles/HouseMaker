@@ -9,7 +9,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from housemaker.camera_models import CameraPose, InitialFirstPersonCamera
 from housemaker.generation_state import GenerationData
 from housemaker.models import create_default_doorway_presets, create_default_levels
 from housemaker.project_io import ProjectData, load_project, save_project
@@ -1145,10 +1144,6 @@ class TextureAtlasStateTests(unittest.TestCase):
 
     def test_new_atlas_field_preserves_prior_positional_api_order(self) -> None:
         levels = create_default_levels()
-        camera = InitialFirstPersonCamera(
-            level_index=2,
-            pose=CameraPose(x=1.0, y=2.0, z=1.7),
-        )
         generation = GenerationData()
         surface_generation = SurfaceTextureData()
         presets = create_default_doorway_presets()
@@ -1161,10 +1156,8 @@ class TextureAtlasStateTests(unittest.TestCase):
             presets,
             generation,
             surface_generation,
-            camera,
             [],
         )
-        self.assertEqual(project_data.initial_first_person_camera, camera)
         self.assertEqual(project_data.stairs, [])
         self.assertEqual(project_data.texture_atlases, TextureAtlasData())
 
@@ -1178,12 +1171,10 @@ class TextureAtlasStateTests(unittest.TestCase):
                 presets,
                 generation,
                 surface_generation,
-                camera,
                 [],
             )
             loaded = load_project(project_path)
 
-        self.assertEqual(loaded.initial_first_person_camera, camera)
         self.assertEqual(loaded.stairs, [])
         self.assertEqual(loaded.texture_atlases, TextureAtlasData())
 

@@ -297,11 +297,33 @@ class DoorwayTests(unittest.TestCase):
                         shape=invalid_shape,  # type: ignore[arg-type]
                     )
 
+        preset = DoorwayPreset(
+            width_meters=1.15,
+            height_meters=2.35,
+            shape=" ARCH ",
+            arch_amount=0.425,
+        )
+        self.assertEqual(preset.shape, DOORWAY_SHAPE_ARCH)
+        self.assertEqual(preset.arch_amount, 0.425)
+
+        with self.assertRaisesRegex(ValueError, "Doorway arch amount"):
+            DoorwayPreset(
+                width_meters=1.15,
+                height_meters=2.35,
+                shape=DOORWAY_SHAPE_ARCH,
+                arch_amount=1.1,
+            )
+
     def test_project_round_trip_persists_doorway_presets_and_level_doorways(self) -> None:
         levels = create_default_levels()
         doorway_presets = [
             DoorwayPreset(width_meters=0.8, height_meters=2.0),
-            DoorwayPreset(width_meters=1.4, height_meters=2.4),
+            DoorwayPreset(
+                width_meters=1.4,
+                height_meters=2.4,
+                shape=DOORWAY_SHAPE_ARCH,
+                arch_amount=0.375,
+            ),
         ]
         levels[2].doorways = [
             DoorwayData(
@@ -328,8 +350,18 @@ class DoorwayTests(unittest.TestCase):
             self.assertEqual(
                 payload["doorway_presets"],
                 [
-                    {"width_meters": 0.8, "height_meters": 2.0},
-                    {"width_meters": 1.4, "height_meters": 2.4},
+                    {
+                        "width_meters": 0.8,
+                        "height_meters": 2.0,
+                        "shape": DEFAULT_DOORWAY_SHAPE,
+                        "arch_amount": doorway_presets[0].arch_amount,
+                    },
+                    {
+                        "width_meters": 1.4,
+                        "height_meters": 2.4,
+                        "shape": DOORWAY_SHAPE_ARCH,
+                        "arch_amount": 0.375,
+                    },
                 ],
             )
             self.assertEqual(payload["levels"][2]["doorways"][0]["depth_meters"], 0.36)
@@ -341,6 +373,19 @@ class DoorwayTests(unittest.TestCase):
             loaded_project = load_project(project_path)
             self.assertEqual(loaded_project.doorway_presets, doorway_presets)
             self.assertEqual(loaded_project.levels[2].doorways, levels[2].doorways)
+
+            for raw_preset in payload["doorway_presets"]:
+                raw_preset.pop("shape")
+                raw_preset.pop("arch_amount")
+            project_path.write_text(json.dumps(payload), encoding="utf-8")
+            legacy_preset_project = load_project(project_path)
+            self.assertEqual(
+                legacy_preset_project.doorway_presets,
+                [
+                    DoorwayPreset(width_meters=0.8, height_meters=2.0),
+                    DoorwayPreset(width_meters=1.4, height_meters=2.4),
+                ],
+            )
 
             payload.pop("doorway_presets")
             payload["levels"][2].pop("doorways")
@@ -549,7 +594,12 @@ class DoorwayTests(unittest.TestCase):
         )
 
         canvas.start_doorway_placement(
-            DoorwayPreset(width_meters=0.9, height_meters=2.1)
+            DoorwayPreset(
+                width_meters=0.9,
+                height_meters=2.1,
+                shape=DOORWAY_SHAPE_ARCH,
+                arch_amount=0.44,
+            )
         )
         placement_position = _image_position(canvas, 56.0, 67.0)
         placement_image_point = canvas._widget_to_image(QPointF(placement_position))
@@ -593,6 +643,8 @@ class DoorwayTests(unittest.TestCase):
         self.assertAlmostEqual(doorway.width_meters, 0.9)
         self.assertAlmostEqual(doorway.height_meters, 2.1)
         self.assertAlmostEqual(doorway.depth_meters, DEFAULT_DOORWAY_DEPTH_METERS)
+        self.assertEqual(doorway.shape, DOORWAY_SHAPE_ARCH)
+        self.assertAlmostEqual(doorway.arch_amount, 0.44)
         self.assertAlmostEqual(
             abs(math.cos(math.radians(doorway.rotation_degrees))),
             0.0,
@@ -1134,6 +1186,69 @@ class DoorwayTests(unittest.TestCase):
             workspace.canvas.pending_doorway_preset,
             workspace.doorway_presets[0],
         )
+
+    def test_general_tab_saves_selected_doorway_as_new_template(self) -> None:
+        from housemaker.main import BlueprintWorkspace
+
+        workspace = self._track_widget(BlueprintWorkspace())
+        self.assertIsInstance(workspace, BlueprintWorkspace)
+        workspace.resize(1500, 900)
+        workspace.show()
+        _qt_application.processEvents()
+
+        self.assertEqual(
+            workspace.save_doorway_template_button.text(),
+            "Save doorway template",
+        )
+        self.assertFalse(workspace.save_doorway_template_button.isEnabled())
+
+        doorway = DoorwayData(
+            center_x=50.0,
+            center_y=50.0,
+            width_meters=1.35,
+            height_meters=2.45,
+            depth_meters=0.3,
+            rotation_degrees=90.0,
+            shape=DOORWAY_SHAPE_ARCH,
+            arch_amount=0.625,
+        )
+        workspace.current_level.doorways.append(doorway)
+        workspace.canvas._set_selected_doorway_index(0)
+        self.assertTrue(workspace.save_doorway_template_button.isEnabled())
+
+        original_preset_count = len(workspace.doorway_presets)
+        QTest.mouseClick(
+            workspace.save_doorway_template_button,
+            Qt.MouseButton.LeftButton,
+        )
+        _qt_application.processEvents()
+
+        self.assertEqual(
+            len(workspace.doorway_presets),
+            original_preset_count + 1,
+        )
+        self.assertEqual(
+            workspace.doorway_presets[-1],
+            DoorwayPreset(
+                width_meters=1.35,
+                height_meters=2.45,
+                shape=DOORWAY_SHAPE_ARCH,
+                arch_amount=0.625,
+            ),
+        )
+        self.assertEqual(
+            workspace.doorway_preset_list.currentRow(),
+            original_preset_count,
+        )
+        self.assertEqual(
+            workspace.doorway_preset_list.currentItem().text(),
+            "1.35 m × 2.45 m — Arch 62.5%",
+        )
+        self.assertTrue(workspace.remove_doorway_preset_button.isEnabled())
+        self.assertTrue(workspace.save_doorway_template_button.isEnabled())
+
+        workspace.canvas._set_selected_doorway_index(None)
+        self.assertFalse(workspace.save_doorway_template_button.isEnabled())
 
     def _build_workspace_with_committed_doorway(
         self,

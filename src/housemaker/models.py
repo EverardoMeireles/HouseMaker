@@ -42,8 +42,6 @@ MAX_WINDOW_ID_LENGTH = 128
 MAX_WINDOW_SURFACE_ID_LENGTH = 512
 MIN_WINDOW_RATIO_SPAN = 1e-6
 DEFAULT_ROOM_HEIGHT_METERS = 3.0
-DEFAULT_IMAGE_SCALE = 1.0
-DEFAULT_IMAGE_OFFSET = 0.0
 DEFAULT_INCLUDE_IN_EXPORT = True
 DEFAULT_UV_MAP_WIDTH = 1024
 DEFAULT_UV_MAP_HEIGHT = 1024
@@ -124,6 +122,16 @@ class WallTextureData:
 class DoorwayPreset:
     width_meters: float
     height_meters: float
+    shape: str = DEFAULT_DOORWAY_SHAPE
+    arch_amount: float = DEFAULT_DOORWAY_ARCH_AMOUNT
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "shape", normalize_doorway_shape(self.shape))
+        object.__setattr__(
+            self,
+            "arch_amount",
+            normalize_doorway_arch_amount(self.arch_amount),
+        )
 
 
 @dataclass
@@ -800,9 +808,6 @@ class LevelData:
     doorways: list[DoorwayData] = field(default_factory=list)
     image_path: str | None = None
     image_size_pixels: tuple[float, float] | None = None
-    image_scale: float = DEFAULT_IMAGE_SCALE
-    image_offset_x: float = DEFAULT_IMAGE_OFFSET
-    image_offset_y: float = DEFAULT_IMAGE_OFFSET
     include_in_export: bool = DEFAULT_INCLUDE_IN_EXPORT
     floor_thickness_meters: float = DEFAULT_FLOOR_THICKNESS_METERS
     floor_contour_vertex_ids: tuple[int, ...] = ()

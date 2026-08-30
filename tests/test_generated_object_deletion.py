@@ -24,7 +24,6 @@ from housemaker.generation_workspace import (
     GenerationWorkspace,
 )
 from housemaker.main import BlueprintWorkspace
-from housemaker.unused_face_removal import ALL_CAMERA_IDS
 
 
 # ### Module state ###
@@ -278,9 +277,6 @@ class ExternalGeneratedObjectDeletionTests(unittest.TestCase):
             _generated_box_glb(),
         )
         generation = self.workspace.generation
-        self.workspace.settings_widget.unused_face_removal_checkbox.setChecked(
-            True
-        )
         generation.set_data(
             GenerationData(
                 generated_objects=[_record("external", asset_path.name)]
@@ -301,10 +297,6 @@ class ExternalGeneratedObjectDeletionTests(unittest.TestCase):
         panel = generation.object_3d_panel
         self.assertIs(self.workspace._external_viewer_host.viewer, panel)
         self.assertIsNotNone(panel.viewer.model)
-        self.assertEqual(
-            tuple(panel.viewer.unused_face_camera_indicator_items),
-            ALL_CAMERA_IDS,
-        )
 
         self.assertTrue(generation.delete_generated_object("external"))
         _qt_application.processEvents()
@@ -312,8 +304,6 @@ class ExternalGeneratedObjectDeletionTests(unittest.TestCase):
         self.assertTrue(self.workspace._external_viewer_host.is_active)
         self.assertIs(self.workspace._external_viewer_host.viewer, panel)
         self.assertIsNone(panel.viewer.model)
-        self.assertEqual(panel.viewer.unused_face_camera_indicator_items, {})
-        self.assertEqual(panel.viewer.unused_face_camera_indicator_labels, {})
         self.assertEqual(generation.texture_view.entries, ())
         self.assertFalse(generation.delete_generated_object_button.isEnabled())
         self.assertFalse(asset_path.exists())

@@ -74,22 +74,6 @@ class UnusedFaceRemovalOptions:
 
 
 @dataclass(frozen=True)
-class UncheckedCameraFacePurgeOptions:
-    """Bounds for removing faces exposed to unchecked fixed cameras."""
-
-    image_size: int = DEFAULT_CAPTURE_IMAGE_SIZE
-    max_face_count: int = DEFAULT_MAX_FACE_COUNT
-    progress_interval_faces: int = DEFAULT_PROGRESS_INTERVAL_FACES
-
-    def __post_init__(self) -> None:
-        _validate_processing_bounds(
-            image_size=self.image_size,
-            max_face_count=self.max_face_count,
-            progress_interval_faces=self.progress_interval_faces,
-        )
-
-
-@dataclass(frozen=True)
 class UnusedFaceRemovalProgress:
     """One throttled progress notification suitable for a worker signal."""
 
@@ -109,21 +93,6 @@ class UnusedFaceRemovalResult:
     retained_face_count: int
     removed_face_count: int
     protected_face_count: int
-
-    @property
-    def glb_bytes(self) -> bytes:
-        return self.model.glb_bytes
-
-
-@dataclass(frozen=True)
-class UncheckedCameraFacePurgeResult:
-    """Model produced by deleting the union visible from unchecked cameras."""
-
-    model: GeneratedModel
-    unchecked_camera_ids: tuple[str, ...]
-    original_face_count: int
-    retained_face_count: int
-    removed_face_count: int
 
     @property
     def glb_bytes(self) -> bytes:
@@ -421,141 +390,6 @@ def remove_unused_faces_from_glb(
         retained_face_count=retained_face_count,
         removed_face_count=total_face_count - retained_face_count,
         protected_face_count=retained_face_count,
-    )
-
-
-def purge_faces_visible_from_unchecked_cameras_from_glb(
-    glb_bytes: bytes,
-    *,
-    unchecked_camera_ids: Iterable[str],
-    options: UncheckedCameraFacePurgeOptions | None = None,
-    cancel_requested: CancelCallback | None = None,
-    progress_callback: ProgressCallback | None = None,
-) -> UncheckedCameraFacePurgeResult:
-    """Delete every face owning a depth pixel in any unchecked camera view.
-
-    Visibility comes from the same six fixed orthographic depth captures used
-    by unused-face removal. An unchecked face is removed once even when it is
-    visible from several unchecked cameras. Passing no unchecked cameras is an
-    explicit no-op that preserves the original GLB bytes.
-    """
-
-    normalized_options = options or UncheckedCameraFacePurgeOptions()
-    normalized_camera_ids = _normalize_optional_camera_ids(
-        unchecked_camera_ids
-    )
-    _raise_if_cancelled(cancel_requested)
-    payload = bytes(glb_bytes)
-    if not payload:
-        raise ValueError("The generated GLB is empty.")
-    scene = _load_glb_scene(payload)
-    instances, vertices, faces = _collect_scene_geometry(scene)
-    total_face_count = len(faces)
-    if total_face_count == 0:
-        raise ValueError("The generated GLB contains no triangle faces.")
-    if total_face_count > normalized_options.max_face_count:
-        raise ValueError(
-            f"The generated GLB has {total_face_count} faces; the configured "
-            f"camera-face purge limit is {normalized_options.max_face_count}."
-        )
-
-    if not normalized_camera_ids:
-        _report_progress(
-            progress_callback,
-            stage="complete",
-            completed_face_count=total_face_count,
-            total_face_count=total_face_count,
-        )
-        return UncheckedCameraFacePurgeResult(
-            model=import_generated_glb(payload),
-            unchecked_camera_ids=(),
-            original_face_count=total_face_count,
-            retained_face_count=total_face_count,
-            removed_face_count=0,
-        )
-
-    _report_progress(
-        progress_callback,
-        stage="capturing",
-        completed_face_count=0,
-        total_face_count=total_face_count,
-    )
-    captures: list[_CameraCapture] = []
-    for camera_id in normalized_camera_ids:
-        _raise_if_cancelled(cancel_requested)
-        captures.append(
-            _capture_camera(
-                vertices=vertices,
-                faces=faces,
-                definition=_CAMERA_DEFINITIONS[camera_id],
-                image_size=normalized_options.image_size,
-                cancel_requested=cancel_requested,
-                progress_interval_faces=(
-                    normalized_options.progress_interval_faces
-                ),
-            )
-        )
-        _report_progress(
-            progress_callback,
-            stage="capturing",
-            completed_face_count=total_face_count,
-            total_face_count=total_face_count,
-            camera_id=camera_id,
-        )
-
-    remove_faces = np.zeros(total_face_count, dtype=bool)
-    _report_progress(
-        progress_callback,
-        stage="checking",
-        completed_face_count=0,
-        total_face_count=total_face_count,
-    )
-    for face_index in range(total_face_count):
-        if face_index % normalized_options.progress_interval_faces == 0:
-            _raise_if_cancelled(cancel_requested)
-            _report_progress(
-                progress_callback,
-                stage="checking",
-                completed_face_count=face_index,
-                total_face_count=total_face_count,
-            )
-        remove_faces[face_index] = any(
-            _sample_changes_frame(capture.face_samples.get(face_index))
-            for capture in captures
-        )
-
-    removed_face_count = int(np.count_nonzero(remove_faces))
-    retained_face_count = total_face_count - removed_face_count
-    if retained_face_count == 0:
-        raise ValueError(
-            "Camera-face purge would remove every face; check at least one "
-            "fixed camera."
-        )
-    _raise_if_cancelled(cancel_requested)
-    _report_progress(
-        progress_callback,
-        stage="exporting",
-        completed_face_count=total_face_count,
-        total_face_count=total_face_count,
-    )
-
-    if removed_face_count == 0:
-        processed_model = import_generated_glb(payload)
-    else:
-        processed_glb = _export_filtered_scene(instances, ~remove_faces)
-        processed_model = import_generated_glb(processed_glb)
-    _report_progress(
-        progress_callback,
-        stage="complete",
-        completed_face_count=total_face_count,
-        total_face_count=total_face_count,
-    )
-    return UncheckedCameraFacePurgeResult(
-        model=processed_model,
-        unchecked_camera_ids=normalized_camera_ids,
-        original_face_count=total_face_count,
-        retained_face_count=retained_face_count,
-        removed_face_count=removed_face_count,
     )
 
 
@@ -885,23 +719,17 @@ def _make_unique_name(
 
 # ### Validation and callback helpers ###
 def _normalize_camera_ids(camera_ids: Iterable[str]) -> tuple[str, ...]:
-    normalized_camera_ids = _normalize_optional_camera_ids(camera_ids)
-    if not normalized_camera_ids:
-        raise ValueError("Select at least one unused-face camera.")
-    return normalized_camera_ids
-
-
-def _normalize_optional_camera_ids(
-    camera_ids: Iterable[str],
-) -> tuple[str, ...]:
     requested_camera_ids = tuple(str(camera_id) for camera_id in camera_ids)
     unknown_camera_ids = set(requested_camera_ids).difference(ALL_CAMERA_IDS)
     if unknown_camera_ids:
         unknown_labels = ", ".join(sorted(unknown_camera_ids))
         raise ValueError(f"Unknown unused-face camera IDs: {unknown_labels}.")
-    return tuple(
+    normalized_camera_ids = tuple(
         camera_id for camera_id in ALL_CAMERA_IDS if camera_id in requested_camera_ids
     )
+    if not normalized_camera_ids:
+        raise ValueError("Select at least one unused-face camera.")
+    return normalized_camera_ids
 
 
 def _validate_processing_bounds(

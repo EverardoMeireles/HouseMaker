@@ -28,7 +28,6 @@ MESHY_IMAGE_TO_IMAGE_ENDPOINT = (
 )
 OPENAI_RESPONSES_ENDPOINT = "https://api.openai.com/v1/responses"
 OPENAI_IMAGE_EDITS_ENDPOINT = "https://api.openai.com/v1/images/edits"
-OPENAI_FILES_ENDPOINT = "https://api.openai.com/v1/files"
 
 MESHY_PROVIDER = "meshy"
 OPENAI_PROVIDER = "openai"
@@ -64,7 +63,6 @@ MAX_PROMPT_CHARACTERS = 4_000
 MAX_ANALYSIS_CHARACTERS = 8_000
 MAX_PNG_EDGE_PIXELS = 32_768
 MAX_PNG_PIXELS = 100_000_000
-MAX_PACKED_REFERENCE_EDGE_PIXELS = 4_096
 
 # GPT Image requests can legitimately take around two minutes to complete.
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 180.0
@@ -118,22 +116,6 @@ OPENAI_ANALYSIS_INSTRUCTION = (
     "reflections, objects, borders, and seams. Return only the final prompt "
     "without markdown. User direction: "
 )
-PARTIAL_TEXTURE_PROMPT_PREFIX = (
-    "Edit only the marked portion of the existing texture. Keep its scale, "
-    "layout, and continuity at the edit boundary; leave every unmarked pixel "
-    "unchanged. Use the painted video references as the source for the new "
-    "material detail. "
-)
-MESHY_PARTIAL_TEXTURE_PROMPT_PREFIX = (
-    "This is a localized texture edit. The first reference is the existing "
-    "texture. The second is a control image of that texture with the editable "
-    "region highlighted in bright magenta. Only replace the magenta-marked "
-    "region, using the remaining video references as visual evidence. Preserve "
-    "the original texture everywhere else and blend the edit naturally at its "
-    "boundary. "
-)
-
-
 # ### Data models ###
 @dataclass(frozen=True)
 class SurfaceTextureProviderSettings:
@@ -190,8 +172,6 @@ class SurfaceTextureRequest:
     reference_pngs: tuple[bytes, ...]
     prompt: str
     settings: SurfaceTextureProviderSettings
-    existing_texture_png: bytes | None = None
-    edit_mask_png: bytes | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.settings, SurfaceTextureProviderSettings):
@@ -202,16 +182,6 @@ class SurfaceTextureRequest:
             _normalize_reference_pngs(self.reference_pngs),
         )
         object.__setattr__(self, "prompt", _normalize_prompt(self.prompt))
-        existing_texture_png, edit_mask_png = _normalize_partial_edit_images(
-            self.existing_texture_png,
-            self.edit_mask_png,
-        )
-        object.__setattr__(self, "existing_texture_png", existing_texture_png)
-        object.__setattr__(self, "edit_mask_png", edit_mask_png)
-
-    @property
-    def is_partial_edit(self) -> bool:
-        return self.existing_texture_png is not None
 
 
 @dataclass(frozen=True)
@@ -268,33 +238,11 @@ def build_meshy_image_to_image_request_body(
     """Build Meshy's documented multi-reference Image-to-Image payload."""
 
     _require_request_provider(request, MESHY_PROVIDER)
-    reference_pngs = list(request.reference_pngs)
-    prompt_prefix = ""
-    if request.is_partial_edit:
-        assert request.existing_texture_png is not None
-        assert request.edit_mask_png is not None
-        control_png = _build_meshy_partial_edit_control_png(
-            request.existing_texture_png,
-            request.edit_mask_png,
-        )
-        packed_video_references = _pack_meshy_partial_video_references(
-            request.reference_pngs,
-            MAX_REFERENCE_IMAGE_COUNT - 2,
-        )
-        reference_pngs = [
-            request.existing_texture_png,
-            control_png,
-            *packed_video_references,
-        ]
-        prompt_prefix = MESHY_PARTIAL_TEXTURE_PROMPT_PREFIX
     return {
         "ai_model": request.settings.model,
-        "prompt": prompt_prefix + _build_surface_texture_prompt(
-            request.prompt,
-            partial_edit=request.is_partial_edit,
-        ),
+        "prompt": _build_surface_texture_prompt(request.prompt),
         "reference_image_urls": [
-            _png_data_uri(image_png) for image_png in reference_pngs
+            _png_data_uri(image_png) for image_png in request.reference_pngs
         ],
         "generate_multi_view": False,
         "aspect_ratio": "1:1",
@@ -303,9 +251,6 @@ def build_meshy_image_to_image_request_body(
 
 def build_openai_responses_request_body(
     request: SurfaceTextureRequest,
-    *,
-    existing_texture_file_id: str | None = None,
-    edit_mask_file_id: str | None = None,
 ) -> dict[str, Any]:
     """Build a direct GPT-5.6 Responses image-generation request."""
 
@@ -314,39 +259,12 @@ def build_openai_responses_request_body(
         raise ValueError(
             "Direct OpenAI texture generation requires GPT-5.6 Luna or Terra."
         )
-    if request.is_partial_edit:
-        existing_file_id = _normalize_openai_file_id(
-            existing_texture_file_id,
-            "existing texture",
-        )
-        mask_file_id = _normalize_openai_file_id(
-            edit_mask_file_id,
-            "texture edit mask",
-        )
-        existing_content = [
-            {
-                "type": "input_image",
-                "file_id": existing_file_id,
-                "detail": "high",
-            }
-        ]
-        image_tool: dict[str, Any] = {
-            "type": "image_generation",
-            "action": "edit",
-            "quality": "high",
-            "size": "2048x2048",
-            "input_image_mask": {"file_id": mask_file_id},
-        }
-    else:
-        if existing_texture_file_id is not None or edit_mask_file_id is not None:
-            raise ValueError("OpenAI edit file IDs require a partial texture edit.")
-        existing_content = []
-        image_tool = {
-            "type": "image_generation",
-            "action": "generate",
-            "quality": "high",
-            "size": "2048x2048",
-        }
+    image_tool: dict[str, Any] = {
+        "type": "image_generation",
+        "action": "generate",
+        "quality": "high",
+        "size": "2048x2048",
+    }
     return {
         "model": request.settings.model,
         "store": False,
@@ -358,10 +276,8 @@ def build_openai_responses_request_body(
                         "type": "input_text",
                         "text": _build_surface_texture_prompt(
                             request.prompt,
-                            partial_edit=request.is_partial_edit,
                         ),
                     },
-                    *existing_content,
                     *[
                         {
                             "type": "input_image",
@@ -395,13 +311,7 @@ def build_openai_analysis_request_body(
                     {
                         "type": "input_text",
                         "text": (
-                            OPENAI_ANALYSIS_INSTRUCTION
-                            + (
-                                PARTIAL_TEXTURE_PROMPT_PREFIX
-                                if request.is_partial_edit
-                                else ""
-                            )
-                            + request.prompt
+                            OPENAI_ANALYSIS_INSTRUCTION + request.prompt
                         ),
                     },
                     *[
@@ -422,24 +332,11 @@ def build_openai_analysis_request_body(
 def build_openai_image_edit_multipart(
     reference_pngs: Sequence[bytes],
     prompt: str,
-    *,
-    existing_texture_png: bytes | None = None,
-    edit_mask_png: bytes | None = None,
 ) -> tuple[bytes, str]:
     """Build the GPT Image 2 multipart edit request used after mini analysis."""
 
     normalized_images = _normalize_reference_pngs(reference_pngs)
     normalized_prompt = _normalize_analysis(prompt)
-    normalized_existing, normalized_mask = _normalize_partial_edit_images(
-        existing_texture_png,
-        edit_mask_png,
-    )
-    if normalized_existing is not None:
-        normalized_prompt = (
-            PARTIAL_TEXTURE_PROMPT_PREFIX + normalized_prompt
-        )
-        normalized_images = (normalized_existing, *normalized_images)
-        normalized_mask = _build_openai_edit_mask_png(normalized_mask)
     fields = (
         ("model", OPENAI_IMAGE_RENDER_MODEL),
         ("prompt", normalized_prompt),
@@ -449,7 +346,6 @@ def build_openai_image_edit_multipart(
     boundary = _new_multipart_boundary(
         [value.encode("utf-8") for _, value in fields]
         + list(normalized_images)
-        + ([] if normalized_mask is None else [normalized_mask])
     )
     boundary_bytes = boundary.encode("ascii")
     chunks: list[bytes] = []
@@ -478,57 +374,8 @@ def build_openai_image_edit_multipart(
                 b"\r\n",
             )
         )
-    if normalized_mask is not None:
-        chunks.extend(
-            (
-                b"--" + boundary_bytes + b"\r\n",
-                (
-                    "Content-Disposition: form-data; name=\"mask\"; "
-                    'filename="texture_edit_mask.png"\r\n'
-                ).encode("ascii"),
-                b"Content-Type: image/png\r\n\r\n",
-                normalized_mask,
-                b"\r\n",
-            )
-        )
     chunks.append(b"--" + boundary_bytes + b"--\r\n")
     return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
-
-
-def build_openai_file_upload_multipart(
-    image_png: bytes,
-    filename: str,
-) -> tuple[bytes, str]:
-    """Build one documented ``purpose=vision`` OpenAI file upload."""
-
-    normalized_image = _validate_png(
-        image_png,
-        "OpenAI vision upload",
-        MAX_OUTPUT_PNG_BYTES,
-    )
-    if filename not in {"existing_texture.png", "texture_edit_mask.png"}:
-        raise ValueError("OpenAI vision upload filename is invalid.")
-    purpose = b"vision"
-    boundary = _new_multipart_boundary([purpose, normalized_image])
-    boundary_bytes = boundary.encode("ascii")
-    body = b"".join(
-        (
-            b"--" + boundary_bytes + b"\r\n",
-            b'Content-Disposition: form-data; name="purpose"\r\n\r\n',
-            purpose,
-            b"\r\n",
-            b"--" + boundary_bytes + b"\r\n",
-            (
-                "Content-Disposition: form-data; name=\"file\"; "
-                f'filename="{filename}"\r\n'
-            ).encode("ascii"),
-            b"Content-Type: image/png\r\n\r\n",
-            normalized_image,
-            b"\r\n",
-            b"--" + boundary_bytes + b"--\r\n",
-        )
-    )
-    return body, f"multipart/form-data; boundary={boundary}"
 
 
 # ### Public generation API ###
@@ -538,8 +385,6 @@ def request_surface_texture(
     reference_pngs: Sequence[bytes],
     prompt: str,
     *,
-    existing_texture_png: bytes | None = None,
-    edit_mask_png: bytes | None = None,
     progress_callback: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
     opener: UrlOpenFunction | None = None,
@@ -563,8 +408,6 @@ def request_surface_texture(
         reference_pngs=tuple(reference_pngs),
         prompt=prompt,
         settings=settings,
-        existing_texture_png=existing_texture_png,
-        edit_mask_png=edit_mask_png,
     )
     _raise_if_cancelled(cancel_event)
     if provider_choice == MESHY_PROVIDER:
@@ -686,11 +529,6 @@ def _generate_meshy_result(
         timeout_seconds=timeout_seconds,
         opener=opener,
     )
-    image_png = composite_partial_texture_edit(
-        image_png,
-        request.existing_texture_png,
-        request.edit_mask_png,
-    )
     return SurfaceTextureResult(
         provider=MESHY_PROVIDER,
         texture_png=image_png,
@@ -806,64 +644,6 @@ def _wait_for_meshy_task(
 
 
 # ### OpenAI adapter ###
-def _upload_openai_vision_png(
-    api_key: str,
-    image_png: bytes,
-    filename: str,
-    timeout_seconds: float,
-    opener: UrlOpenFunction | None,
-) -> str:
-    multipart_body, content_type = build_openai_file_upload_multipart(
-        image_png,
-        filename,
-    )
-    response = _request_json(
-        Request(
-            OPENAI_FILES_ENDPOINT,
-            data=multipart_body,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": content_type,
-                "Accept": "application/json",
-            },
-            method="POST",
-        ),
-        provider_name="OpenAI",
-        timeout_seconds=timeout_seconds,
-        opener=opener,
-        secrets=(api_key,),
-        max_bytes=MAX_METADATA_JSON_RESPONSE_BYTES,
-    )
-    return _normalize_openai_file_id(response.get("id"), filename)
-
-
-def _best_effort_delete_openai_file(
-    api_key: str,
-    file_id: str,
-    timeout_seconds: float,
-    opener: UrlOpenFunction | None,
-) -> None:
-    try:
-        _request_json(
-            Request(
-                f"{OPENAI_FILES_ENDPOINT}/{quote(file_id, safe='')}",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Accept": "application/json",
-                },
-                method="DELETE",
-            ),
-            provider_name="OpenAI",
-            timeout_seconds=min(timeout_seconds, 15.0),
-            opener=opener,
-            secrets=(api_key,),
-            max_bytes=MAX_METADATA_JSON_RESPONSE_BYTES,
-        )
-    except Exception:
-        # Cleanup failure must not discard an otherwise valid generated texture.
-        return
-
-
 def _generate_with_openai(
     request: SurfaceTextureRequest,
     timeout_seconds: float,
@@ -887,11 +667,7 @@ def _generate_with_openai(
             progress_callback=progress_callback,
             cancel_event=cancel_event,
         )
-    return composite_partial_texture_edit(
-        generated_png,
-        request.existing_texture_png,
-        request.edit_mask_png,
-    )
+    return generated_png
 
 
 def _generate_with_openai_responses(
@@ -903,67 +679,27 @@ def _generate_with_openai_responses(
 ) -> bytes:
     api_key = request.settings.openai_api_key
     _notify_progress(progress_callback, "IN_PROGRESS", 10)
-    uploaded_file_ids: list[str] = []
-    try:
-        existing_file_id: str | None = None
-        mask_file_id: str | None = None
-        if request.is_partial_edit:
-            assert request.existing_texture_png is not None
-            assert request.edit_mask_png is not None
-            existing_file_id = _upload_openai_vision_png(
-                api_key,
-                request.existing_texture_png,
-                "existing_texture.png",
-                timeout_seconds,
-                opener,
-            )
-            uploaded_file_ids.append(existing_file_id)
-            _raise_if_cancelled(cancel_event)
-            mask_file_id = _upload_openai_vision_png(
-                api_key,
-                _build_openai_edit_mask_png(request.edit_mask_png),
-                "texture_edit_mask.png",
-                timeout_seconds,
-                opener,
-            )
-            uploaded_file_ids.append(mask_file_id)
-            _raise_if_cancelled(cancel_event)
-            _notify_progress(progress_callback, "IN_PROGRESS", 30)
-        response = _request_json(
-            Request(
-                OPENAI_RESPONSES_ENDPOINT,
-                data=_encode_json(
-                    build_openai_responses_request_body(
-                        request,
-                        existing_texture_file_id=existing_file_id,
-                        edit_mask_file_id=mask_file_id,
-                    )
-                ),
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                },
-                method="POST",
-            ),
-            provider_name="OpenAI",
-            timeout_seconds=timeout_seconds,
-            opener=opener,
-            secrets=(api_key,),
-            max_bytes=MAX_IMAGE_JSON_RESPONSE_BYTES,
-        )
-        _raise_if_cancelled(cancel_event)
-        result = _extract_openai_responses_png(response)
-        _notify_progress(progress_callback, "SUCCEEDED", 100)
-        return result
-    finally:
-        for file_id in reversed(uploaded_file_ids):
-            _best_effort_delete_openai_file(
-                api_key,
-                file_id,
-                timeout_seconds,
-                opener,
-            )
+    response = _request_json(
+        Request(
+            OPENAI_RESPONSES_ENDPOINT,
+            data=_encode_json(build_openai_responses_request_body(request)),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
+        ),
+        provider_name="OpenAI",
+        timeout_seconds=timeout_seconds,
+        opener=opener,
+        secrets=(api_key,),
+        max_bytes=MAX_IMAGE_JSON_RESPONSE_BYTES,
+    )
+    _raise_if_cancelled(cancel_event)
+    result = _extract_openai_responses_png(response)
+    _notify_progress(progress_callback, "SUCCEEDED", 100)
+    return result
 
 
 def _generate_with_openai_mini_pipeline(
@@ -998,8 +734,6 @@ def _generate_with_openai_mini_pipeline(
     multipart_body, content_type = build_openai_image_edit_multipart(
         request.reference_pngs,
         analysis_prompt,
-        existing_texture_png=request.existing_texture_png,
-        edit_mask_png=request.edit_mask_png,
     )
     image_response = _request_json(
         Request(
@@ -1548,202 +1282,6 @@ def _png_data_uri(image_png: bytes) -> str:
     return f"data:image/png;base64,{encoded}"
 
 
-# ### Partial texture edit helpers ###
-def composite_partial_texture_edit(
-    generated_texture_png: bytes,
-    existing_texture_png: bytes | None,
-    edit_mask_png: bytes | None,
-) -> bytes:
-    """Composite a generated texture only where the white edit mask permits."""
-
-    existing, edit_mask = _normalize_partial_edit_images(
-        existing_texture_png,
-        edit_mask_png,
-    )
-    if existing is None or edit_mask is None:
-        try:
-            return _validate_png(
-                generated_texture_png,
-                "Generated texture",
-                MAX_OUTPUT_PNG_BYTES,
-            )
-        except (TypeError, ValueError) as error:
-            raise SurfaceTextureTaskError(str(error)) from error
-
-    try:
-        base_image = _load_static_png(existing, "Existing texture").convert("RGBA")
-        generated_image = _load_static_png(
-            generated_texture_png,
-            "Generated texture",
-        ).convert("RGBA")
-        editable_mask = _load_static_png(edit_mask, "Texture edit mask").convert(
-            "L"
-        )
-        if generated_image.size != base_image.size:
-            generated_image = Image.merge(
-                "RGBA",
-                tuple(
-                    channel.resize(base_image.size, Image.Resampling.LANCZOS)
-                    for channel in generated_image.split()
-                ),
-            )
-        composited = Image.composite(
-            generated_image,
-            base_image,
-            editable_mask,
-        )
-        return _encode_pil_png(composited, "Composited texture")
-    except SurfaceTextureTaskError:
-        raise
-    except (OSError, ValueError) as error:
-        raise SurfaceTextureTaskError(
-            "The partial texture edit could not be composited."
-        ) from error
-
-
-def _normalize_partial_edit_images(
-    existing_texture_png: bytes | None,
-    edit_mask_png: bytes | None,
-) -> tuple[bytes | None, bytes | None]:
-    if existing_texture_png is None and edit_mask_png is None:
-        return None, None
-    if existing_texture_png is None or edit_mask_png is None:
-        raise ValueError(
-            "An existing texture and its edit mask must be provided together."
-        )
-    existing = _validate_png(
-        existing_texture_png,
-        "Existing texture",
-        MAX_OUTPUT_PNG_BYTES,
-    )
-    mask = _validate_png(
-        edit_mask_png,
-        "Texture edit mask",
-        MAX_REFERENCE_PNG_BYTES,
-    )
-    existing_image = _load_static_png(existing, "Existing texture")
-    mask_image = _load_static_png(mask, "Texture edit mask").convert("L")
-    if existing_image.size != mask_image.size:
-        raise ValueError(
-            "The existing texture and edit mask must have identical dimensions."
-        )
-    if mask_image.getbbox() is None:
-        raise ValueError("The texture edit mask has no editable pixels.")
-    return existing, _encode_pil_png(mask_image, "Texture edit mask")
-
-
-def _build_openai_edit_mask_png(edit_mask_png: bytes | None) -> bytes:
-    if edit_mask_png is None:
-        raise ValueError("An OpenAI texture edit requires a mask.")
-    editable_mask = _load_static_png(
-        edit_mask_png,
-        "Texture edit mask",
-    ).convert("L")
-    preserved_alpha = editable_mask.point(lambda value: 255 - value)
-    openai_mask = Image.new("RGBA", editable_mask.size, (255, 255, 255, 255))
-    openai_mask.putalpha(preserved_alpha)
-    return _encode_pil_png(openai_mask, "OpenAI texture edit mask")
-
-
-def _build_meshy_partial_edit_control_png(
-    existing_texture_png: bytes,
-    edit_mask_png: bytes,
-) -> bytes:
-    base_image = _load_static_png(
-        existing_texture_png,
-        "Existing texture",
-    ).convert("RGBA")
-    editable_mask = _load_static_png(
-        edit_mask_png,
-        "Texture edit mask",
-    ).convert("L")
-    highlight_strength = editable_mask.point(
-        lambda value: round(value * 0.82)
-    )
-    magenta = Image.new("RGBA", base_image.size, (255, 0, 255, 255))
-    control_image = Image.composite(magenta, base_image, highlight_strength)
-    return _encode_pil_png(control_image, "Meshy texture edit control")
-
-
-def _pack_meshy_partial_video_references(
-    reference_pngs: Sequence[bytes],
-    maximum_images: int,
-) -> tuple[bytes, ...]:
-    if len(reference_pngs) <= maximum_images:
-        return tuple(reference_pngs)
-    groups: list[list[bytes]] = [[] for _ in range(maximum_images)]
-    for index, reference_png in enumerate(reference_pngs):
-        groups[index % maximum_images].append(reference_png)
-    return tuple(
-        _build_horizontal_reference_sheet(group)
-        for group in groups
-        if group
-    )
-
-
-def _build_horizontal_reference_sheet(reference_pngs: Sequence[bytes]) -> bytes:
-    images = [
-        _load_static_png(reference_png, "Video texture reference").convert("RGBA")
-        for reference_png in reference_pngs
-    ]
-    scale = min(
-        1.0,
-        MAX_PACKED_REFERENCE_EDGE_PIXELS / sum(image.width for image in images),
-        MAX_PACKED_REFERENCE_EDGE_PIXELS / max(image.height for image in images),
-    )
-    if scale < 1.0:
-        images = [
-            image.resize(
-                (
-                    max(1, int(image.width * scale)),
-                    max(1, int(image.height * scale)),
-                ),
-                Image.Resampling.LANCZOS,
-            )
-            for image in images
-        ]
-    sheet_width = sum(image.width for image in images)
-    sheet_height = max(image.height for image in images)
-    sheet = Image.new("RGBA", (sheet_width, sheet_height), (0, 0, 0, 0))
-    left = 0
-    for image in images:
-        top = (sheet_height - image.height) // 2
-        sheet.alpha_composite(image, (left, top))
-        left += image.width
-    return _encode_pil_png(sheet, "Packed video texture references")
-
-
-def _load_static_png(image_png: bytes, label: str) -> Image.Image:
-    try:
-        validated = _validate_png(image_png, label, MAX_OUTPUT_PNG_BYTES)
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(BytesIO(validated)) as source_image:
-                if int(getattr(source_image, "n_frames", 1)) != 1:
-                    raise ValueError(f"{label} must be a static image.")
-                source_image.load()
-                return source_image.copy()
-    except ValueError:
-        raise
-    except (
-        Image.DecompressionBombError,
-        Image.DecompressionBombWarning,
-        OSError,
-        SyntaxError,
-        UnidentifiedImageError,
-    ) as error:
-        raise ValueError(f"{label} is not a valid PNG image.") from error
-
-
-def _encode_pil_png(image: Image.Image, label: str) -> bytes:
-    output = BytesIO()
-    try:
-        image.save(output, format="PNG", compress_level=6)
-        return _validate_png(output.getvalue(), label, MAX_OUTPUT_PNG_BYTES)
-    except (OSError, ValueError) as error:
-        raise ValueError(f"{label} could not be encoded as PNG.") from error
-
-
 # ### Validation helpers ###
 def _normalize_provider(provider: str) -> str:
     if not isinstance(provider, str):
@@ -1826,23 +1364,6 @@ def _normalize_task_id(task_id: str) -> str:
     return normalized
 
 
-def _normalize_openai_file_id(file_id: object, label: str) -> str:
-    if not isinstance(file_id, str):
-        raise SurfaceTextureRequestError(
-            f"OpenAI returned an invalid {label} file identifier."
-        )
-    normalized = file_id.strip()
-    if (
-        not normalized
-        or len(normalized) > 256
-        or any(ord(character) < 33 for character in normalized)
-    ):
-        raise SurfaceTextureRequestError(
-            f"OpenAI returned an invalid {label} file identifier."
-        )
-    return normalized
-
-
 def _normalize_positive_float(value: float, label: str) -> float:
     try:
         normalized = float(value)
@@ -1881,13 +1402,8 @@ def _require_request_provider(
         raise ValueError(f"This request does not use the {provider} provider.")
 
 
-def _build_surface_texture_prompt(
-    prompt: str,
-    *,
-    partial_edit: bool = False,
-) -> str:
-    prefix = PARTIAL_TEXTURE_PROMPT_PREFIX if partial_edit else ""
-    return prefix + SURFACE_TEXTURE_PROMPT_PREFIX + prompt
+def _build_surface_texture_prompt(prompt: str) -> str:
+    return SURFACE_TEXTURE_PROMPT_PREFIX + prompt
 
 
 def _new_multipart_boundary(values: Sequence[bytes]) -> str:

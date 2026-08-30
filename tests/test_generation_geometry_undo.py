@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -20,7 +19,6 @@ from PySide6.QtWidgets import QApplication
 
 from housemaker.generation_state import GeneratedObjectRecord
 from housemaker.generation_workspace import (
-    ALL_CAMERA_IDS,
     MAX_OBJECT_OPERATION_UNDO_COUNT,
     OBJECT_OPERATION_GENERATE_TEXTURE,
     OBJECT_OPERATION_UNDO_STACK_PIPELINE_KEY,
@@ -63,56 +61,6 @@ def _record(index: int) -> GeneratedObjectRecord:
 
 # ### Geometry-only planner tests ###
 class GeometryOnlyPlannerTests(unittest.TestCase):
-    def test_geometry_only_runs_unchecked_camera_purge_before_returning(
-        self,
-    ) -> None:
-        geometry_glb = _box_glb()
-        enabled_camera_ids = ALL_CAMERA_IDS[:-1]
-        request = GenerationRequest(
-            frame_index=2,
-            selected_object_bgra=np.full((8, 8, 4), 255, dtype=np.uint8),
-            settings=GenerationServiceSettings(meshy_api_key="test-key"),
-            enabled_camera_ids=enabled_camera_ids,
-            geometry_only=True,
-        )
-
-        with (
-            patch(
-                "housemaker.generation_workspace.request_image_to_3d_model",
-                return_value=MeshyGenerationResult(
-                    "geometry-task",
-                    geometry_glb,
-                    "Table",
-                ),
-            ),
-            patch(
-                "housemaker.generation_workspace."
-                "purge_faces_visible_from_unchecked_cameras_from_glb",
-                return_value=SimpleNamespace(
-                    glb_bytes=b"purged geometry",
-                    original_face_count=12,
-                    retained_face_count=10,
-                    removed_face_count=2,
-                ),
-            ) as purge,
-            patch(
-                "housemaker.generation_workspace.request_retextured_model"
-            ) as generate_texture,
-        ):
-            result = MeshyImagePlanner().plan(request)
-
-        self.assertIsInstance(result, StagedMeshyGenerationResult)
-        assert isinstance(result, StagedMeshyGenerationResult)
-        self.assertTrue(result.geometry_only)
-        self.assertTrue(result.camera_face_purge_applied)
-        self.assertEqual(result.glb_bytes, b"purged geometry")
-        self.assertEqual(result.unchecked_camera_ids, (ALL_CAMERA_IDS[-1],))
-        self.assertEqual(
-            purge.call_args.kwargs["unchecked_camera_ids"],
-            (ALL_CAMERA_IDS[-1],),
-        )
-        generate_texture.assert_not_called()
-
     def test_geometry_only_skips_retexture_and_returns_processed_revision(
         self,
     ) -> None:
@@ -121,7 +69,6 @@ class GeometryOnlyPlannerTests(unittest.TestCase):
             frame_index=2,
             selected_object_bgra=np.full((8, 8, 4), 255, dtype=np.uint8),
             settings=GenerationServiceSettings(meshy_api_key="test-key"),
-            enabled_camera_ids=ALL_CAMERA_IDS,
             geometry_only=True,
         )
 
@@ -170,7 +117,6 @@ class GeometryOnlyPlannerTests(unittest.TestCase):
                     geometry_task_id="geometry-task",
                     source_glb_bytes=geometry_glb,
                     postprocessed_glb_bytes=geometry_glb,
-                    enabled_camera_ids=ALL_CAMERA_IDS,
                     geometry_only=True,
                 )
 

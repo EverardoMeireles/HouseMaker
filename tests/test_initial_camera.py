@@ -8,11 +8,6 @@ from pathlib import Path
 
 import numpy as np
 
-from housemaker.camera_models import (
-    CameraPose,
-    DEFAULT_FIRST_PERSON_LIGHT_INTENSITY,
-    InitialFirstPersonCamera,
-)
 from housemaker.doorway_geometry import build_doorway_cross_section_outline
 from housemaker.level_coordinates import (
     build_doorway_world_outline_positions,
@@ -28,8 +23,6 @@ from housemaker.models import (
     create_default_levels,
 )
 from housemaker.project_io import load_project, save_project
-
-
 # ### Outline test helpers ###
 def _get_first_depth_face_profile(
     positions: np.ndarray,
@@ -317,187 +310,37 @@ class LevelCoordinateTests(unittest.TestCase):
             build_doorway_world_outline_positions((level,), level, doorway)
 
 
-# ### Camera model tests ###
-class InitialFirstPersonCameraModelTests(unittest.TestCase):
-    def test_camera_round_trip_and_validation(self) -> None:
-        camera = InitialFirstPersonCamera(
-            level_index=2,
-            pose=CameraPose(
-                x=1.0,
-                y=-2.0,
-                z=1.65,
-                yaw_degrees=35.0,
-                pitch_degrees=-4.0,
-                roll_degrees=1.0,
-                fov_degrees=75.0,
-            ),
-            light_intensity=1.35,
-        )
-
-        self.assertEqual(
-            InitialFirstPersonCamera.from_dict(camera.to_dict()),
-            camera,
-        )
-        legacy_payload = camera.to_dict()
-        legacy_payload.pop("light_intensity")
-        self.assertEqual(
-            InitialFirstPersonCamera.from_dict(legacy_payload),
-            InitialFirstPersonCamera(
-                level_index=camera.level_index,
-                pose=camera.pose,
-                light_intensity=DEFAULT_FIRST_PERSON_LIGHT_INTENSITY,
-            ),
-        )
-        with self.assertRaises(ValueError):
-            InitialFirstPersonCamera(level_index=-1, pose=camera.pose)
-        with self.assertRaises(ValueError):
-            InitialFirstPersonCamera.from_dict({"level_index": 2})
-        for invalid_intensity in (-0.01, 2.01, float("nan"), "bright"):
-            with self.subTest(invalid_intensity=invalid_intensity):
-                with self.assertRaises(ValueError):
-                    InitialFirstPersonCamera(
-                        level_index=2,
-                        pose=camera.pose,
-                        light_intensity=invalid_intensity,
-                    )
-
-
-# ### Project persistence tests ###
-class InitialFirstPersonCameraPersistenceTests(unittest.TestCase):
-    def test_project_round_trip_preserves_initial_camera(self) -> None:
-        camera = InitialFirstPersonCamera(
-            level_index=2,
-            pose=CameraPose(
-                x=3.25,
-                y=-1.5,
-                z=1.72,
-                yaw_degrees=92.0,
-                pitch_degrees=-7.0,
-                roll_degrees=2.0,
-                fov_degrees=68.0,
-            ),
-            light_intensity=1.6,
-        )
-
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            project_path = Path(temporary_directory) / "camera-project.json"
-            save_project(
-                project_path,
-                current_level_index=2,
-                levels=create_default_levels(),
-                initial_first_person_camera=camera,
-            )
-            raw_payload = json.loads(project_path.read_text(encoding="utf-8"))
-            loaded_project = load_project(project_path)
-
-        self.assertEqual(raw_payload["project_version"], 1)
-        self.assertEqual(raw_payload["initial_first_person_camera"], camera.to_dict())
-        self.assertEqual(loaded_project.initial_first_person_camera, camera)
-
-    def test_legacy_project_camera_without_light_uses_default_intensity(
+# ### Removed initial-camera persistence tests ###
+class RemovedInitialCameraPersistenceTests(unittest.TestCase):
+    def test_projects_omit_and_ignore_the_retired_initial_camera_field(
         self,
     ) -> None:
-        camera = InitialFirstPersonCamera(
-            level_index=2,
-            pose=CameraPose(x=2.0, y=-0.5, z=1.65),
-            light_intensity=1.8,
-        )
-
         with tempfile.TemporaryDirectory() as temporary_directory:
-            project_path = Path(temporary_directory) / "legacy-light.json"
+            project_path = Path(temporary_directory) / "project.json"
             save_project(
                 project_path,
                 current_level_index=2,
                 levels=create_default_levels(),
-                initial_first_person_camera=camera,
             )
-            raw_payload = json.loads(project_path.read_text(encoding="utf-8"))
-            raw_payload["initial_first_person_camera"].pop("light_intensity")
-            project_path.write_text(json.dumps(raw_payload), encoding="utf-8")
-            loaded_camera = load_project(project_path).initial_first_person_camera
+            payload = json.loads(project_path.read_text(encoding="utf-8"))
+            self.assertNotIn("initial_first_person_camera", payload)
 
-        self.assertEqual(
-            loaded_camera,
-            InitialFirstPersonCamera(
-                level_index=camera.level_index,
-                pose=camera.pose,
-                light_intensity=DEFAULT_FIRST_PERSON_LIGHT_INTENSITY,
-            ),
-        )
-
-    def test_explicitly_cleared_camera_is_not_restored_from_frame_zero(self) -> None:
-        frame_zero_pose = CameraPose(x=1.0, y=2.0, z=1.65)
-
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            project_path = Path(temporary_directory) / "cleared-camera.json"
-            save_project(
-                project_path,
-                current_level_index=2,
-                levels=create_default_levels(),
-                initial_first_person_camera=None,
-            )
-            raw_payload = json.loads(project_path.read_text(encoding="utf-8"))
-            raw_payload["dynamic_generation"] = {
-                "video_metadata": None,
-                "geometry_revision": 0,
-                "alignments": [
-                    {
-                        "frame_index": 0,
-                        "timestamp_seconds": 0.0,
-                        "pose": frame_zero_pose.to_dict(),
-                        "source": "manual",
-                        "manual": True,
-                    }
-                ],
+            payload["initial_first_person_camera"] = {
+                "level_index": 2,
+                "pose": {
+                    "x": 1.0,
+                    "y": 2.0,
+                    "z": 1.65,
+                    "yaw_degrees": 0.0,
+                    "pitch_degrees": 0.0,
+                    "roll_degrees": 0.0,
+                    "fov_degrees": 70.0,
+                },
             }
-            project_path.write_text(json.dumps(raw_payload), encoding="utf-8")
-            self.assertIn("initial_first_person_camera", raw_payload)
-            self.assertIsNone(
-                load_project(project_path).initial_first_person_camera
-            )
+            project_path.write_text(json.dumps(payload), encoding="utf-8")
+            project = load_project(project_path)
 
-            raw_payload.pop("initial_first_person_camera")
-            project_path.write_text(json.dumps(raw_payload), encoding="utf-8")
-            migrated_camera = load_project(project_path).initial_first_person_camera
-
-        self.assertEqual(
-            migrated_camera,
-            InitialFirstPersonCamera(level_index=2, pose=frame_zero_pose),
-        )
-
-    def test_legacy_and_malformed_camera_payloads_load_as_none(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            project_path = Path(temporary_directory) / "legacy-project.json"
-            save_project(
-                project_path,
-                current_level_index=2,
-                levels=create_default_levels(),
-            )
-            raw_payload = json.loads(project_path.read_text(encoding="utf-8"))
-
-            raw_payload.pop("initial_first_person_camera")
-            project_path.write_text(json.dumps(raw_payload), encoding="utf-8")
-            self.assertIsNone(
-                load_project(project_path).initial_first_person_camera
-            )
-
-            malformed_payloads = (
-                [],
-                {"level_index": 2},
-                {"level_index": "2", "pose": CameraPose().to_dict()},
-                {"level_index": 99, "pose": CameraPose().to_dict()},
-                {"level_index": 2, "pose": {"x": "invalid"}},
-            )
-            for malformed_payload in malformed_payloads:
-                with self.subTest(payload=malformed_payload):
-                    raw_payload["initial_first_person_camera"] = malformed_payload
-                    project_path.write_text(
-                        json.dumps(raw_payload),
-                        encoding="utf-8",
-                    )
-                    self.assertIsNone(
-                        load_project(project_path).initial_first_person_camera
-                    )
+        self.assertFalse(hasattr(project, "initial_first_person_camera"))
 
 
 # ### Test runner ###

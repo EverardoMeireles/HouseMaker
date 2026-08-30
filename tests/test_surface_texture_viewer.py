@@ -17,7 +17,6 @@ from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QApplication
 
 from housemaker.camera_models import CameraPose
-from housemaker.generation_state import MASK_MODE_PAINT, MaskPoint, MaskStroke
 from housemaker.glb import GeneratedModel, PreviewTexturedSurface
 from housemaker.surface_materials import (
     ResolvedSurfaceMaterial,
@@ -36,7 +35,6 @@ from housemaker.surface_texture_viewer import (
     RepeatingTexturedMeshItem,
     _build_camera_ray,
     _build_surface_texture_mesh_data,
-    rasterize_texture_mask_strokes,
 )
 from housemaker.viewer import GlbViewerWidget
 
@@ -465,7 +463,7 @@ class SurfaceTextureViewerCanvasParityTests(unittest.TestCase):
             self.canvas_viewer.get_ambient_light_intensity(),
         )
 
-    def test_shared_repeating_renderer_keeps_complete_mask_resources(self) -> None:
+    def test_shared_repeating_renderer_keeps_complete_shader_resources(self) -> None:
         self.surface_viewer.set_surfaces((self.surface,))
         self.surface_viewer.set_surface_texture(
             (self.surface.surface_id,),
@@ -543,7 +541,7 @@ class SurfaceTextureViewerCanvasParityTests(unittest.TestCase):
         self.assertFalse(semantic_item.face_item.opts["drawFaces"])
         self.assertIsNotNone(semantic_item.texture_item)
 
-    def test_scene_model_preserves_semantic_selection_and_inpaint_masks(self) -> None:
+    def test_scene_model_preserves_semantic_selection(self) -> None:
         surface_id = self.surface.surface_id
         self.surface_viewer.set_surfaces((self.surface,))
         self.surface_viewer.set_surface_texture(
@@ -557,14 +555,6 @@ class SurfaceTextureViewerCanvasParityTests(unittest.TestCase):
             (0.0, 1.0, 0.0),
         )
         self.surface_viewer.select_surface(surface_id)
-        self.surface_viewer.add_texture_mask_stroke(
-            surface_id,
-            MaskStroke(
-                mode=MASK_MODE_PAINT,
-                radius_normalized=0.1,
-                points=(MaskPoint(x=0.5, y=0.5),),
-            ),
-        )
 
         render_items = self.surface_viewer._render_items_by_surface_id[
             surface_id
@@ -573,7 +563,6 @@ class SurfaceTextureViewerCanvasParityTests(unittest.TestCase):
         self.assertIsNotNone(render_items.outline_item)
         assert render_items.outline_item is not None
         self.assertTrue(render_items.outline_item.visible())
-        self.assertTrue(self.surface_viewer.has_selected_texture_mask())
         self.assertIsNotNone(render_items.texture_item)
 
 
@@ -636,66 +625,36 @@ class SurfaceTextureMappingTests(unittest.TestCase):
             viewer.deleteLater()
             _qt_application.processEvents()
 
-    def test_repeating_texture_mask_wraps_edges_without_center_artifact(self) -> None:
-        seam_stroke = MaskStroke(
-            mode=MASK_MODE_PAINT,
-            radius_normalized=0.04,
-            points=(
-                MaskPoint(x=0.98, y=0.5),
-                MaskPoint(x=0.02, y=0.5),
-            ),
-        )
-
-        mask = rasterize_texture_mask_strokes((100, 100), [seam_stroke])
-
-        self.assertGreater(int(mask[:, :5].max()), 0)
-        self.assertGreater(int(mask[:, -5:].max()), 0)
-        self.assertEqual(int(mask[50, 50]), 0)
-
-    def test_repeating_texture_mask_wraps_corner_brush(self) -> None:
-        corner_stroke = MaskStroke(
-            mode=MASK_MODE_PAINT,
-            radius_normalized=0.08,
-            points=(MaskPoint(x=0.0, y=0.0),),
-        )
-
-        mask = rasterize_texture_mask_strokes((100, 100), [corner_stroke])
-
-        for row, column in ((0, 0), (0, 99), (99, 0), (99, 99)):
-            self.assertEqual(int(mask[row, column]), 255)
-
-    def test_partial_edit_data_targets_only_masked_selected_surfaces(self) -> None:
+    def test_retired_3d_inpaint_apis_are_absent(self) -> None:
         viewer = SurfaceTextureViewer()
         try:
-            surfaces = (
-                _build_quad_surface("wall-one", SURFACE_TYPE_WALL),
-                _build_quad_surface(
-                    "wall-two",
-                    SURFACE_TYPE_WALL,
-                    x_offset=3.0,
-                ),
+            retired_viewer_names = (
+                "texture_mask_strokes_changed",
+                "get_texture_mask_strokes",
+                "set_texture_mask_strokes",
+                "add_texture_mask_stroke",
+                "clear_texture_mask",
+                "undo_last_texture_mask_stroke",
+                "get_selected_texture_edit_data",
+                "get_selected_texture_edit_masks",
+                "is_inpaint_enabled",
+                "set_inpaint_enabled",
+                "set_inpaint_brush_mode",
+                "set_inpaint_brush_radius_pixels",
+                "pick_surface_texture_hit_at_view_position",
+                "pick_surface_texture_hit_from_ray",
             )
-            viewer.set_surfaces(surfaces)
-            texture = np.full((32, 32, 4), (20, 40, 80, 255), dtype=np.uint8)
-            viewer.set_surface_texture(("wall-one", "wall-two"), texture)
-            viewer.set_selected_surface_ids(("wall-one", "wall-two"))
-            viewer.add_texture_mask_stroke(
-                "wall-one",
-                MaskStroke(
-                    mode=MASK_MODE_PAINT,
-                    radius_normalized=0.1,
-                    points=(MaskPoint(x=0.5, y=0.5),),
-                ),
+            retired_view_names = (
+                "inpaint_pointer_pressed",
+                "inpaint_pointer_moved",
+                "inpaint_pointer_released",
+                "is_inpaint_enabled",
+                "set_inpaint_enabled",
             )
-
-            result = viewer.get_selected_texture_edit_data()
-
-            self.assertEqual(viewer.get_masked_selected_surface_ids(), ("wall-one",))
-            self.assertIsNotNone(result)
-            assert result is not None
-            base_rgba, editable_mask = result
-            np.testing.assert_array_equal(base_rgba, texture)
-            self.assertGreater(int(editable_mask.max()), 0)
+            for name in retired_viewer_names:
+                self.assertFalse(hasattr(viewer, name), name)
+            for name in retired_view_names:
+                self.assertFalse(hasattr(viewer.view, name), name)
         finally:
             viewer.close()
             viewer.deleteLater()

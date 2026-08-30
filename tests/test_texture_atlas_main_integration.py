@@ -1805,10 +1805,6 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
                 changed_record,
                 _generated_box_model(),
             )
-            self.workspace.generation.face_purge_completed.emit(
-                changed_record,
-                _generated_box_model(),
-            )
             _qt_application.processEvents()
 
         refresh_regenerated.assert_called_once_with("chair")
@@ -1816,6 +1812,9 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
     def test_object_generation_exposes_no_texture_inpaint_signal(self) -> None:
         self.assertFalse(
             hasattr(self.workspace.generation, "texture_inpaint_completed")
+        )
+        self.assertFalse(
+            hasattr(self.workspace.generation, "face_purge_completed")
         )
 
     def test_invalid_object_change_does_not_refresh_atlas(self) -> None:

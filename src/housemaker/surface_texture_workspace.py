@@ -40,7 +40,6 @@ from PySide6.QtWidgets import (
 from shiboken6 import isValid as is_valid_qt_object
 
 from housemaker.app_settings import ApplicationSettingsStore
-from housemaker.camera_models import InitialFirstPersonCamera
 from housemaker.generation_state import MASK_MODE_ERASE, MASK_MODE_PAINT, MaskStroke
 from housemaker.generation_jobs import GenerationJobManager
 from housemaker.generation_views import VideoInpaintView, rasterize_mask_strokes
@@ -57,11 +56,9 @@ from housemaker.surface_texture_providers import (
     request_surface_texture,
 )
 from housemaker.surface_texture_state import (
-    MAX_LOCALIZED_INPAINT_UNDO_HISTORY,
     SURFACE_TYPE_WALL,
     SurfaceTextureAssignment,
     SurfaceTextureData,
-    SurfaceTextureInpaintUndoSnapshot,
     SurfaceTextureVariant,
 )
 from housemaker.surface_texture_variants import (
@@ -70,10 +67,7 @@ from housemaker.surface_texture_variants import (
     SurfaceTextureVariants,
     build_surface_texture_variants,
 )
-from housemaker.surface_texture_viewer import (
-    SurfaceTextureViewer,
-    rasterize_texture_mask_strokes,
-)
+from housemaker.surface_texture_viewer import SurfaceTextureViewer
 from housemaker.texture_atlas_view import TextureAtlasEntry, TextureAtlasView
 from housemaker.video_source import VIDEO_FILE_FILTER, VideoFrameSource, probe_video
 
@@ -95,14 +89,10 @@ _PROGRESS_PERCENT_PATTERN = re.compile(r"(?<!\d)(100|[1-9]?\d)\s*%")
 # ### Level synchronization helpers ###
 def _build_level_sync_signature(
     levels: Sequence[LevelData],
-    initial_camera: InitialFirstPersonCamera | None,
 ) -> tuple[object, ...]:
     """Snapshot mutable level content used by the Surface scene."""
 
-    return (
-        _freeze_level_sync_value(tuple(levels)),
-        _freeze_level_sync_value(initial_camera),
-    )
+    return (_freeze_level_sync_value(tuple(levels)),)
 
 
 def _freeze_level_sync_value(value: object) -> object:
@@ -206,9 +196,6 @@ class SurfaceTextureRequest:
     surface_ids: tuple[str, ...]
     combined_area_m2: float
     prompt: str
-    existing_texture_png: bytes | None = None
-    edit_mask_png: bytes | None = None
-    surface_edit_mask_pngs: tuple[tuple[str, bytes], ...] = ()
     display_name: str = ""
 
 
@@ -221,28 +208,11 @@ class _PreparedSurfaceTextureOutput:
 
 
 @dataclass(frozen=True)
-class _SurfaceTextureLocalizedEditSource:
-    """Immutable file revision and strokes for one localized edit target."""
-
-    surface_id: str
-    assignment_id: str
-    asset_path: str | None
-    asset_revision: tuple[object, ...] | None
-    strokes: tuple[MaskStroke, ...]
-    texture_rgba_bytes: bytes | None = None
-    texture_shape: tuple[int, int, int] | None = None
-
-
-@dataclass(frozen=True)
 class _SurfaceTextureReferenceInput:
-    """Immutable video and localized-edit inputs prepared by one worker."""
+    """Immutable video inputs prepared by one worker."""
 
     video_path: str
     frame_strokes: tuple[tuple[int, tuple[MaskStroke, ...]], ...]
-    localized_edit_sources: tuple[
-        _SurfaceTextureLocalizedEditSource,
-        ...,
-    ] = ()
 
 
 @dataclass(frozen=True)
@@ -284,8 +254,6 @@ class DefaultSurfaceTextureProvider:
             api_key=request.api_key,
             reference_pngs=request.reference_pngs,
             prompt=request.prompt,
-            existing_texture_png=request.existing_texture_png,
-            edit_mask_png=request.edit_mask_png,
             progress_callback=(
                 None
                 if progress_callback is None
@@ -348,17 +316,6 @@ class SurfaceTextureWorker(QObject):
         try:
             request = self._request
             if self._reference_input is not None:
-                if self._reference_input.localized_edit_sources:
-                    self.progress.emit(
-                        self._job_id,
-                        "Preparing localized texture edit (3%)",
-                    )
-                    request = _prepare_localized_surface_texture_request(
-                        request,
-                        self._reference_input.localized_edit_sources,
-                        self._asset_directory,
-                        self._cancel_event,
-                    )
                 self.progress.emit(
                     self._job_id,
                     "Preparing reference frames (5%)",
@@ -443,7 +400,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     data_changed = Signal(object)
     generation_completed = Signal(object)
     assignments_removed = Signal(object)
-    localized_inpaint_undone = Signal(object)
     surface_content_changed = Signal()
 
     def __init__(
@@ -481,7 +437,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._is_syncing_provider = False
         self._data = SurfaceTextureData()
         self._levels: list[LevelData] = []
-        self._initial_camera: InitialFirstPersonCamera | None = None
         self._level_sync_signature: tuple[object, ...] | None = None
         self._video_source: VideoFrameSource | None = None
         self._displayed_frame_index: int | None = None
@@ -490,14 +445,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._generation_workers: dict[str, SurfaceTextureWorker] = {}
         self._generation_requests: dict[str, SurfaceTextureRequest] = {}
         self._generation_surface_targets: dict[str, frozenset[str]] = {}
-        self._generation_submitted_texture_strokes: dict[
-            str,
-            dict[str, tuple[MaskStroke, ...]],
-        ] = {}
-        self._generation_localized_edit_sources: dict[
-            str,
-            tuple[_SurfaceTextureLocalizedEditSource, ...],
-        ] = {}
         self._cancelled_generation_job_ids: set[str] = set()
         self._is_shutting_down = False
         self._texture_atlas_entry_cache: dict[
@@ -847,48 +794,19 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             return False
 
         previous_assignments = list(self._data.assignments)
-        previous_strokes = {
-            surface_id: list(strokes)
-            for surface_id, strokes in self._data.texture_mask_strokes.items()
-        }
-        previous_undo_stack = list(
-            self._data.localized_inpaint_undo_stack
-        )
-        affected_surface_ids = set(assignment.surface_ids)
         next_assignments = [
             candidate
             for candidate in previous_assignments
             if candidate.assignment_id != assignment.assignment_id
         ]
-        retained_surface_ids = {
-            surface_id
-            for candidate in next_assignments
-            for surface_id in candidate.surface_ids
-        }
-        untextured_surface_ids = affected_surface_ids.difference(
-            retained_surface_ids
-        )
-        next_strokes = {
-            surface_id: strokes
-            for surface_id, strokes in previous_strokes.items()
-            if surface_id not in untextured_surface_ids
-        }
 
         self._data.assignments = next_assignments
-        self._data.texture_mask_strokes = next_strokes
-        discarded_undo_assignments = (
-            self._clear_localized_inpaint_undo_history()
-        )
         try:
             self._restore_assignment_textures()
-            self.surface_view.set_texture_mask_strokes(next_strokes)
         except (OSError, TypeError, ValueError):
             self._data.assignments = previous_assignments
-            self._data.texture_mask_strokes = previous_strokes
-            self._data.localized_inpaint_undo_stack = previous_undo_stack
             try:
                 self._restore_assignment_textures()
-                self.surface_view.set_texture_mask_strokes(previous_strokes)
             except (OSError, TypeError, ValueError):
                 pass
             self.status_label.setText(
@@ -897,16 +815,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             self._sync_controls()
             return False
 
-        if (
-            self.inpaint_3d_button.isChecked()
-            and not self.surface_view.can_inpaint_selection()
-        ):
-            self.inpaint_3d_button.setChecked(False)
-
-        removed_assignments = [
-            assignment,
-            *discarded_undo_assignments,
-        ]
+        removed_assignments = [assignment]
         self._texture_atlas_entry_cache.clear()
         self._refresh_texture_atlases()
         cleanup_failure_count = self._delete_orphaned_assignment_assets(
@@ -973,10 +882,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             return True
 
         previous_assignments = list(self._data.assignments)
-        previous_strokes = {
-            surface_id: list(strokes)
-            for surface_id, strokes in self._data.texture_mask_strokes.items()
-        }
         source_surface_ids = tuple(
             dict.fromkeys(
                 (*source_assignment.surface_ids, *normalized_targets)
@@ -1009,42 +914,28 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             source_surface_ids,
         )
         next_assignments = [*retained_assignments, selected_assignment]
-        changed_family_ids = target_set.difference(
-            source_assignment.surface_ids
-        )
-        next_strokes = {
-            surface_id: strokes
-            for surface_id, strokes in previous_strokes.items()
-            if surface_id not in changed_family_ids
-        }
-
         try:
             self.surface_view.set_surface_texture(
                 selected_assignment.surface_ids,
                 texture_png,
             )
             self._data.assignments = next_assignments
-            self._data.texture_mask_strokes = next_strokes
-            self.surface_view.set_texture_mask_strokes(next_strokes)
             # The caller supplied bytes read before this commit.  Do not bind
             # them to a file revision sampled afterward: the backing PNG may
             # have been replaced between the read and this installation.
             self._restored_assignment_texture_signature = None
         except (OSError, TypeError, ValueError):
             self._data.assignments = previous_assignments
-            self._data.texture_mask_strokes = previous_strokes
             self._restore_assignment_textures()
-            self.surface_view.set_texture_mask_strokes(previous_strokes)
             return False
 
-        discarded_assignments = self._clear_localized_inpaint_undo_history()
         self._texture_atlas_entry_cache.clear()
         self._refresh_texture_atlases()
         cleanup_failure_count = self._delete_orphaned_assignment_assets(
-            [*removed_assignments, *discarded_assignments]
+            removed_assignments
         )
         removed_assignment_ids = self._unretained_assignment_ids(
-            [*removed_assignments, *discarded_assignments]
+            removed_assignments
         )
         if removed_assignment_ids:
             self.assignments_removed.emit(removed_assignment_ids)
@@ -1088,10 +979,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
 
         self.video_view.clear_frame("Load a source video to paint references")
         saved_camera_pose = self._data.camera_pose
-        self.surface_view.set_levels(
-            self._levels,
-            self._initial_camera,
-        )
+        self.surface_view.set_levels(self._levels)
         self._data.camera_pose = saved_camera_pose
         self._restore_viewer_state()
         self._restore_assignment_textures()
@@ -1105,11 +993,9 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     def set_levels(
         self,
         levels: Sequence[LevelData],
-        initial_camera: InitialFirstPersonCamera | None = None,
     ) -> None:
         self._set_level_context(
             levels,
-            initial_camera,
             preview_model=None,
             replace_preview_model=False,
         )
@@ -1117,14 +1003,12 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     def set_preview_context(
         self,
         levels: Sequence[LevelData],
-        initial_camera: InitialFirstPersonCamera | None,
         model: GeneratedModel | None,
     ) -> None:
         """Synchronize semantic levels and the shared model with one GL rebuild."""
 
         self._set_level_context(
             levels,
-            initial_camera,
             preview_model=model,
             replace_preview_model=True,
         )
@@ -1132,21 +1016,16 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     def _set_level_context(
         self,
         levels: Sequence[LevelData],
-        initial_camera: InitialFirstPersonCamera | None,
         *,
         preview_model: GeneratedModel | None,
         replace_preview_model: bool,
     ) -> None:
         normalized_levels = list(levels)
-        next_signature = _build_level_sync_signature(
-            normalized_levels,
-            initial_camera,
-        )
+        next_signature = _build_level_sync_signature(normalized_levels)
         if next_signature == self._level_sync_signature:
             # Retain the latest model objects without rebuilding equivalent
             # semantic geometry, textures, atlas controls, or OpenGL items.
             self._levels = normalized_levels
-            self._initial_camera = initial_camera
             self.refresh_file_backed_previews()
             if replace_preview_model:
                 self.set_preview_model(preview_model)
@@ -1155,17 +1034,13 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         if self._levels:
             self._store_viewer_state()
         self._levels = normalized_levels
-        self._initial_camera = initial_camera
         if replace_preview_model:
             self.surface_view.set_scene_model(
                 preview_model,
                 repopulate=False,
             )
             self.surface_view.clear_surface_textures()
-        self.surface_view.set_levels(
-            self._levels,
-            initial_camera,
-        )
+        self.surface_view.set_levels(self._levels)
         self._restore_viewer_state()
         self._restore_assignment_textures()
         self._refresh_texture_atlases()
@@ -1174,7 +1049,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._level_sync_signature = next_signature
 
     def set_preview_model(self, model: GeneratedModel | None) -> None:
-        """Use the Canvas model while retaining semantic selection and inpainting."""
+        """Use the Canvas model while retaining semantic surface selection."""
 
         self.surface_view.set_scene_model(model)
 
@@ -1256,84 +1131,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         if self._start_generation(request, reference_input=reference_input):
             self.job_name_edit.clear()
 
-    def undo_localized_texture_inpaint(self) -> bool:
-        """Restore the complete state before the latest successful 3D inpaint."""
-
-        history = self._data.localized_inpaint_undo_stack
-        if not history:
-            self.status_label.setText("There is no localized texture inpaint to undo.")
-            self._sync_controls()
-            return False
-        snapshot = history[-1]
-        if self._surface_targets_are_reserved(snapshot.affected_surface_ids):
-            self.status_label.setText(
-                "Wait for the job editing these surfaces before undoing."
-            )
-            return False
-        try:
-            required_assignment_ids = self._validate_undo_snapshot_assets(snapshot)
-        except (OSError, ValueError) as error:
-            self.status_label.setText(
-                f"The localized texture inpaint cannot be undone: {error}"
-            )
-            return False
-
-        current_assignments = list(self._data.assignments)
-        current_strokes = {
-            surface_id: list(strokes)
-            for surface_id, strokes in self._data.texture_mask_strokes.items()
-        }
-        restored_strokes = {
-            surface_id: list(strokes)
-            for surface_id, strokes in current_strokes.items()
-        }
-        for surface_id in snapshot.affected_surface_ids:
-            restored_strokes.pop(surface_id, None)
-            previous = snapshot.previous_texture_mask_strokes.get(surface_id)
-            if previous:
-                restored_strokes[surface_id] = list(previous)
-
-        try:
-            self._data.assignments = list(snapshot.previous_assignments)
-            self._data.texture_mask_strokes = restored_strokes
-            self._restore_assignment_textures(
-                required_assignment_ids=required_assignment_ids
-            )
-            self.surface_view.set_texture_mask_strokes(restored_strokes)
-        except (OSError, TypeError, ValueError) as error:
-            self._data.assignments = current_assignments
-            self._data.texture_mask_strokes = current_strokes
-            self._restore_assignment_textures()
-            self.surface_view.set_texture_mask_strokes(current_strokes)
-            self.status_label.setText(
-                f"The localized texture inpaint could not be undone: {error}"
-            )
-            return False
-
-        history.pop()
-        self._texture_atlas_entry_cache.clear()
-        self._refresh_texture_atlases()
-        cleanup_failure_count = self._delete_orphaned_assignment_assets(
-            current_assignments
-        )
-        removed_assignment_ids = self._unretained_assignment_ids(
-            current_assignments
-        )
-        self.status_label.setText("Restored the texture before localized inpainting.")
-        if cleanup_failure_count:
-            self.status_label.setText(
-                self.status_label.text()
-                + f" {cleanup_failure_count} replaced texture file(s) could not "
-                "be deleted."
-            )
-        self._emit_data_changed()
-        if removed_assignment_ids:
-            self.assignments_removed.emit(removed_assignment_ids)
-        self.localized_inpaint_undone.emit(snapshot)
-        self.surface_content_changed.emit()
-        self._sync_controls()
-        return True
-
     def shutdown(self) -> None:
         if self._is_shutting_down:
             self._close_video_source()
@@ -1375,8 +1172,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._generation_workers.clear()
         self._generation_requests.clear()
         self._generation_surface_targets.clear()
-        self._generation_submitted_texture_strokes.clear()
-        self._generation_localized_edit_sources.clear()
         self._close_video_source()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
@@ -1405,9 +1200,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         )
         self.surface_view.camera_pose_changed.connect(
             self._handle_camera_pose_changed
-        )
-        self.surface_view.texture_mask_strokes_changed.connect(
-            self._handle_texture_mask_strokes_changed
         )
         self.surface_3d_page = _build_labeled_view(
             "Fixed surfaces",
@@ -1539,14 +1331,16 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._mask_mode_group.addButton(self.paint_mask_button)
         self._mask_mode_group.addButton(self.erase_mask_button)
         self.paint_mask_button.toggled.connect(self._handle_mask_mode_changed)
-        second_row.addWidget(self.paint_mask_button)
-        second_row.addWidget(self.erase_mask_button)
-        self.inpaint_3d_button = QPushButton("Inpaint 3D texture")
-        self.inpaint_3d_button.setCheckable(True)
-        self.inpaint_3d_button.toggled.connect(
-            self._handle_3d_inpaint_toggled
+        self.mask_mode_control = QWidget()
+        self.mask_mode_control.setObjectName(
+            "surface_texture_mask_mode_control"
         )
-        second_row.addWidget(self.inpaint_3d_button)
+        mask_mode_layout = QVBoxLayout(self.mask_mode_control)
+        mask_mode_layout.setContentsMargins(0, 0, 0, 0)
+        mask_mode_layout.setSpacing(0)
+        mask_mode_layout.addWidget(self.paint_mask_button)
+        mask_mode_layout.addWidget(self.erase_mask_button)
+        second_row.addWidget(self.mask_mode_control)
         second_row.addWidget(QLabel("Brush"))
         self.brush_size_spinbox = QSpinBox()
         self.brush_size_spinbox.setRange(
@@ -1558,26 +1352,10 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self.brush_size_spinbox.valueChanged.connect(
             self.video_view.set_brush_radius_pixels
         )
-        self.brush_size_spinbox.valueChanged.connect(
-            self.surface_view.set_inpaint_brush_radius_pixels
-        )
         second_row.addWidget(self.brush_size_spinbox)
-        self.undo_mask_button = QPushButton("Undo stroke")
-        self.undo_mask_button.clicked.connect(self.video_view.undo_last_stroke)
-        second_row.addWidget(self.undo_mask_button)
         self.clear_mask_button = QPushButton("Clear frame mask")
         self.clear_mask_button.clicked.connect(self.video_view.clear_mask)
         second_row.addWidget(self.clear_mask_button)
-        self.undo_3d_mask_button = QPushButton("Undo 3D stroke")
-        self.undo_3d_mask_button.clicked.connect(
-            self.surface_view.undo_last_texture_mask_stroke
-        )
-        second_row.addWidget(self.undo_3d_mask_button)
-        self.clear_3d_mask_button = QPushButton("Clear 3D mask")
-        self.clear_3d_mask_button.clicked.connect(
-            self.surface_view.clear_texture_mask
-        )
-        second_row.addWidget(self.clear_3d_mask_button)
         self.material_notes_edit = QLineEdit()
         self.material_notes_edit.setPlaceholderText(
             "Optional material notes, e.g. pale oak or matte plaster"
@@ -1593,19 +1371,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self.generate_button.setMinimumHeight(38)
         self.generate_button.clicked.connect(self.generate)
         second_row.addWidget(self.generate_button)
-        self.undo_inpaint_button = QPushButton("Undo inpaint")
-        self.undo_inpaint_button.setObjectName(
-            "undo_surface_texture_inpaint_button"
-        )
-        self.undo_inpaint_button.setMinimumHeight(38)
-        self.undo_inpaint_button.setToolTip(
-            "Restore the texture and painted region before the latest successful "
-            "localized 3D inpaint."
-        )
-        self.undo_inpaint_button.clicked.connect(
-            self.undo_localized_texture_inpaint
-        )
-        second_row.addWidget(self.undo_inpaint_button)
         root_layout.addLayout(second_row)
 
         self.status_label = QLabel(
@@ -1647,8 +1412,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             )
             self._sync_controls()
             return False
-        if self.inpaint_3d_button.isChecked():
-            self.inpaint_3d_button.setChecked(False)
         job = self._job_manager.create_job(
             kind="Surface texture",
             requested_name=request.display_name,
@@ -1669,17 +1432,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._generation_requests[job_id] = request
         self._generation_surface_targets[job_id] = frozenset(
             request.surface_ids
-        )
-        self._generation_submitted_texture_strokes[job_id] = {
-            surface_id: tuple(
-                self._data.texture_mask_strokes.get(surface_id, ())
-            )
-            for surface_id in request.surface_ids
-        }
-        self._generation_localized_edit_sources[job_id] = (
-            ()
-            if reference_input is None
-            else reference_input.localized_edit_sources
         )
         self._job_manager.set_cancel_callback(
             job_id,
@@ -1747,38 +1499,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                     "The painted reference masks are empty."
                 )
                 return None
-        existing_texture_png: bytes | None = None
-        edit_mask_png: bytes | None = None
-        masked_surface_ids = self.surface_view.get_masked_selected_surface_ids()
-        if masked_surface_ids:
-            surface_edit_mask_pngs: tuple[tuple[str, bytes], ...] = ()
-            if not defer_reference_preparation:
-                try:
-                    base_rgba, edit_masks = (
-                        self._build_canonical_selected_texture_edit_data(
-                            masked_surface_ids
-                        )
-                    )
-                except (OSError, ValueError) as error:
-                    self.status_label.setText(str(error))
-                    return None
-                if not edit_masks:
-                    self.status_label.setText(
-                        "Paint an edit region on the 3D texture."
-                    )
-                    return None
-                editable_mask = np.maximum.reduce(tuple(edit_masks.values()))
-                existing_texture_png = _encode_rgba_png(base_rgba)
-                edit_mask_png = _encode_png(editable_mask)
-                surface_edit_mask_pngs = tuple(
-                    (surface_id, _encode_png(mask))
-                    for surface_id, mask in edit_masks.items()
-                )
-            selected_ids = masked_surface_ids
-            area_m2 = self.surface_view.get_combined_masked_selected_area()
-        else:
-            area_m2 = self.surface_view.get_combined_selected_area()
-            surface_edit_mask_pngs = ()
+        area_m2 = self.surface_view.get_combined_selected_area()
         prompt = _build_material_prompt(
             surface_type,
             area_m2,
@@ -1793,9 +1514,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             surface_ids=selected_ids,
             combined_area_m2=area_m2,
             prompt=prompt,
-            existing_texture_png=existing_texture_png,
-            edit_mask_png=edit_mask_png,
-            surface_edit_mask_pngs=surface_edit_mask_pngs,
             display_name=str(display_name).strip()[:256],
         )
 
@@ -1809,22 +1527,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         if video_source is None:
             self.status_label.setText("Load the source video before generating.")
             return None
-        localized_edit_sources: tuple[
-            _SurfaceTextureLocalizedEditSource,
-            ...,
-        ] = ()
-        if (
-            request.existing_texture_png is None
-            and any(
-                self._data.texture_mask_strokes.get(surface_id)
-                for surface_id in request.surface_ids
-            )
-        ):
-            localized_edit_sources = self._build_localized_edit_sources(
-                request.surface_ids
-            )
-            if not localized_edit_sources:
-                return None
         return _SurfaceTextureReferenceInput(
             video_path=video_source.metadata.path,
             frame_strokes=tuple(
@@ -1834,124 +1536,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 )
                 for frame_index in request.reference_frame_indices
             ),
-            localized_edit_sources=localized_edit_sources,
         )
-
-    def _build_localized_edit_sources(
-        self,
-        surface_ids: Sequence[str],
-    ) -> tuple[_SurfaceTextureLocalizedEditSource, ...]:
-        """Snapshot file revisions or legacy viewer pixels plus mask strokes."""
-
-        normalized_surface_ids = tuple(str(value) for value in surface_ids)
-        strokes_by_surface_id = self.surface_view.get_texture_mask_strokes()
-        strokes_by_target: dict[str, tuple[MaskStroke, ...]] = {}
-        assignments: list[SurfaceTextureAssignment | None] = []
-        for surface_id in normalized_surface_ids:
-            strokes = tuple(strokes_by_surface_id.get(surface_id, ()))
-            if not strokes:
-                self.status_label.setText(
-                    "Paint an edit region on the 3D texture."
-                )
-                return ()
-            strokes_by_target[surface_id] = strokes
-            assignments.append(
-                next(
-                    (
-                        candidate
-                        for candidate in reversed(self._data.assignments)
-                        if surface_id in candidate.surface_ids
-                    ),
-                    None,
-                )
-            )
-
-        if any(assignment is None for assignment in assignments):
-            return self._build_legacy_localized_edit_sources(
-                normalized_surface_ids,
-                assignments,
-                strokes_by_target,
-            )
-
-        sources: list[_SurfaceTextureLocalizedEditSource] = []
-        for surface_id, assignment in zip(
-            normalized_surface_ids,
-            assignments,
-            strict=True,
-        ):
-            assert assignment is not None
-            if assignment.texture_variants:
-                canonical_variant = assignment.texture_variant_for_resolution(
-                    2048
-                )
-                if canonical_variant is None:
-                    self.status_label.setText(
-                        "The canonical 2048 surface texture is unavailable."
-                    )
-                    return ()
-                asset_path = canonical_variant.asset_path
-            else:
-                asset_path = assignment.asset_path
-            asset_revision = _build_surface_asset_revision(
-                self._asset_directory,
-                asset_path,
-            )
-            if any(value is None for value in asset_revision[1:]):
-                self.status_label.setText(
-                    "The canonical 2048 surface texture is unavailable."
-                )
-                return ()
-            sources.append(
-                _SurfaceTextureLocalizedEditSource(
-                    surface_id=surface_id,
-                    assignment_id=assignment.assignment_id,
-                    asset_path=asset_path,
-                    asset_revision=asset_revision,
-                    strokes=strokes_by_target[surface_id],
-                )
-            )
-        return tuple(sources)
-
-    def _build_legacy_localized_edit_sources(
-        self,
-        surface_ids: Sequence[str],
-        assignments: Sequence[SurfaceTextureAssignment | None],
-        strokes_by_target: dict[str, tuple[MaskStroke, ...]],
-    ) -> tuple[_SurfaceTextureLocalizedEditSource, ...]:
-        """Snapshot immutable raw RGBA for viewer-only legacy textures."""
-
-        sources: list[_SurfaceTextureLocalizedEditSource] = []
-        for surface_id, assignment in zip(
-            surface_ids,
-            assignments,
-            strict=True,
-        ):
-            texture = self.surface_view.get_surface_texture_rgba(surface_id)
-            if texture is None:
-                self.status_label.setText(
-                    "Every selected 3D surface needs an applied texture."
-                )
-                return ()
-            texture_rgba = np.ascontiguousarray(texture, dtype=np.uint8)
-            if texture_rgba.ndim != 3 or texture_rgba.shape[2] != 4:
-                self.status_label.setText(
-                    "A base surface texture must contain RGBA pixels."
-                )
-                return ()
-            sources.append(
-                _SurfaceTextureLocalizedEditSource(
-                    surface_id=surface_id,
-                    assignment_id=(
-                        "" if assignment is None else assignment.assignment_id
-                    ),
-                    asset_path=None,
-                    asset_revision=None,
-                    strokes=strokes_by_target[surface_id],
-                    texture_rgba_bytes=texture_rgba.tobytes(),
-                    texture_shape=tuple(texture_rgba.shape),
-                )
-            )
-        return tuple(sources)
 
     def _build_reference_pngs(
         self,
@@ -1979,72 +1564,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         )
         return tuple(_encode_png(image) for image in packed_images), tuple(used_indices)
 
-    def _build_canonical_selected_texture_edit_data(
-        self,
-        masked_surface_ids: Sequence[str],
-    ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-        """Load one family's canonical texture and rasterize normalized masks."""
-
-        base_textures: list[np.ndarray] = []
-        strokes_by_surface_id = self.surface_view.get_texture_mask_strokes()
-        edit_masks: dict[str, np.ndarray] = {}
-        assignments = tuple(
-            next(
-                (
-                    candidate
-                    for candidate in reversed(self._data.assignments)
-                    if surface_id in candidate.surface_ids
-                ),
-                None,
-            )
-            for surface_id in masked_surface_ids
-        )
-        if any(assignment is None for assignment in assignments):
-            edit_data = self.surface_view.get_selected_texture_edit_data()
-            if edit_data is None:
-                raise ValueError("Paint an edit region on the 3D texture.")
-            return (
-                edit_data[0],
-                self.surface_view.get_selected_texture_edit_masks(),
-            )
-        for assignment in assignments:
-            assert assignment is not None
-            target_resolution = (
-                2048 if assignment.texture_variants else None
-            )
-            texture_path = self.get_assignment_asset_path(
-                assignment.assignment_id,
-                target_resolution,
-            )
-            if texture_path is None:
-                raise ValueError(
-                    "The canonical 2048 surface texture is unavailable."
-                )
-            texture = _decode_png_rgba(
-                texture_path.read_bytes(),
-                "Base surface texture",
-            )
-            base_textures.append(texture)
-        base_texture = base_textures[0]
-        if any(
-            texture.shape != base_texture.shape
-            or not np.array_equal(texture, base_texture)
-            for texture in base_textures[1:]
-        ):
-            raise ValueError(
-                "Selected surfaces must share the same texture for partial "
-                "inpainting."
-            )
-        for surface_id in masked_surface_ids:
-            strokes = strokes_by_surface_id.get(surface_id, ())
-            if not strokes:
-                continue
-            edit_masks[surface_id] = rasterize_texture_mask_strokes(
-                (base_texture.shape[1], base_texture.shape[0]),
-                strokes,
-            )
-        return base_texture.copy(), edit_masks
-
     @Slot(object)
     def _handle_surface_selection_changed(self, raw_ids: object) -> None:
         if not isinstance(raw_ids, tuple | list):
@@ -2058,11 +1577,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 self.other_texture_list.blockSignals(signals_were_blocked)
         self._data.selected_surface_ids = tuple(str(value) for value in raw_ids)
         self._data.selected_surface_type = self.surface_view.get_selected_surface_type()
-        if (
-            self.inpaint_3d_button.isChecked()
-            and not self.surface_view.can_inpaint_selection()
-        ):
-            self.inpaint_3d_button.setChecked(False)
         self._sync_selection_status()
         self._refresh_texture_atlases()
         self._emit_data_changed()
@@ -2087,17 +1601,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._emit_data_changed()
         self._sync_controls()
 
-    @Slot(object)
-    def _handle_texture_mask_strokes_changed(self, raw_strokes: object) -> None:
-        if not isinstance(raw_strokes, dict):
-            return
-        self._data.texture_mask_strokes = {
-            str(surface_id): list(strokes)
-            for surface_id, strokes in raw_strokes.items()
-        }
-        self._emit_data_changed()
-        self._sync_controls()
-
     @Slot(object, object)
     def _handle_generation_succeeded(
         self,
@@ -2105,17 +1608,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         result: SurfaceTextureResult,
         prepared_outputs: Sequence[_PreparedSurfaceTextureOutput] | None = None,
         saved_outputs: Sequence[_SavedSurfaceTextureOutput] | None = None,
-        submitted_texture_strokes: (
-            dict[str, tuple[MaskStroke, ...]] | None
-        ) = None,
     ) -> bool:
-        is_localized_inpaint = _is_localized_surface_texture_inpaint(request)
-        previous_assignments = tuple(self._data.assignments)
-        previous_texture_mask_strokes = {
-            surface_id: tuple(self._data.texture_mask_strokes.get(surface_id, ()))
-            for surface_id in request.surface_ids
-            if self._data.texture_mask_strokes.get(surface_id)
-        }
         if prepared_outputs is None and saved_outputs is None:
             try:
                 raw_outputs = _build_surface_texture_outputs(
@@ -2156,14 +1649,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         assignments: list[SurfaceTextureAssignment] = []
         try:
             for saved_output in saved_output_items:
-                selected_resolution = (
-                    self._replacement_texture_resolution(
-                        saved_output.surface_ids,
-                        previous_assignments,
-                    )
-                    if is_localized_inpaint
-                    else DEFAULT_SURFACE_TEXTURE_RESOLUTION
-                )
+                selected_resolution = DEFAULT_SURFACE_TEXTURE_RESOLUTION
                 active_variant = next(
                     variant
                     for variant in saved_output.variants
@@ -2230,48 +1716,10 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         # file-backed cache unvalidated so activation confirms the exact bytes
         # that were persisted, including a concurrent same-path replacement.
         self._restored_assignment_texture_signature = None
-        discarded_snapshots: list[SurfaceTextureInpaintUndoSnapshot] = []
-        if is_localized_inpaint:
-            self._data.localized_inpaint_undo_stack.append(
-                SurfaceTextureInpaintUndoSnapshot(
-                    previous_assignments=previous_assignments,
-                    replacement_assignment_ids=tuple(
-                        assignment.assignment_id for assignment in assignments
-                    ),
-                    affected_surface_ids=request.surface_ids,
-                    previous_texture_mask_strokes=(
-                        previous_texture_mask_strokes
-                    ),
-                )
-            )
-            excess_count = max(
-                0,
-                len(self._data.localized_inpaint_undo_stack)
-                - MAX_LOCALIZED_INPAINT_UNDO_HISTORY,
-            )
-            if excess_count:
-                discarded_snapshots = (
-                    self._data.localized_inpaint_undo_stack[:excess_count]
-                )
-                del self._data.localized_inpaint_undo_stack[:excess_count]
-        else:
-            discarded_snapshots = list(
-                self._data.localized_inpaint_undo_stack
-            )
-            self._data.localized_inpaint_undo_stack.clear()
         self._texture_atlas_entry_cache.clear()
         self._refresh_texture_atlases()
-        self._clear_submitted_texture_masks(
-            request.surface_ids,
-            submitted_texture_strokes,
-        )
-        discarded_assignments = [
-            assignment
-            for snapshot in discarded_snapshots
-            for assignment in snapshot.previous_assignments
-        ]
         cleanup_failure_count = self._delete_orphaned_assignment_assets(
-            [*removed_assignments, *discarded_assignments]
+            removed_assignments
         )
         status = (
             f"Applied {request.display_name!r} to {len(request.surface_ids)} "
@@ -2286,15 +1734,11 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             status += (
                 f" {cleanup_failure_count} replaced texture file(s) could not "
                 "be deleted."
-            )
+        )
         self.status_label.setText(status)
         self._emit_data_changed()
-        removable_assignments = [
-            *([] if is_localized_inpaint else removed_assignments),
-            *discarded_assignments,
-        ]
         removed_assignment_ids = self._unretained_assignment_ids(
-            removable_assignments
+            removed_assignments
         )
         if removed_assignment_ids:
             self.assignments_removed.emit(removed_assignment_ids)
@@ -2357,38 +1801,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             ),
         )
 
-    @staticmethod
-    def _replacement_texture_resolution(
-        surface_ids: Sequence[str],
-        previous_assignments: Sequence[SurfaceTextureAssignment],
-    ) -> int:
-        """Preserve one unambiguous active resolution through inpainting."""
-
-        resolutions: set[int] = set()
-        for surface_id in surface_ids:
-            assignment = next(
-                (
-                    candidate
-                    for candidate in reversed(previous_assignments)
-                    if surface_id in candidate.surface_ids
-                ),
-                None,
-            )
-            if (
-                assignment is None
-                or assignment.selected_texture_resolution is None
-            ):
-                return DEFAULT_SURFACE_TEXTURE_RESOLUTION
-            resolutions.add(assignment.selected_texture_resolution)
-        if len(resolutions) != 1:
-            return DEFAULT_SURFACE_TEXTURE_RESOLUTION
-        resolution = next(iter(resolutions))
-        return (
-            resolution
-            if resolution in SURFACE_TEXTURE_RESOLUTIONS
-            else DEFAULT_SURFACE_TEXTURE_RESOLUTION
-        )
-
     def _discard_saved_outputs(
         self,
         saved_outputs: Sequence[_SavedSurfaceTextureOutput],
@@ -2407,15 +1819,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         removed_assignments: Sequence[SurfaceTextureAssignment],
     ) -> int:
         active_asset_paths: set[Path] = set()
-        retained_assignments = [
-            *self._data.assignments,
-            *(
-                assignment
-                for snapshot in self._data.localized_inpaint_undo_stack
-                for assignment in snapshot.previous_assignments
-            ),
-        ]
-        for assignment in retained_assignments:
+        for assignment in self._data.assignments:
             for raw_path in self._assignment_asset_relative_paths(assignment):
                 try:
                     active_asset_paths.add(self._resolve_asset_path(raw_path))
@@ -2464,11 +1868,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         retained_ids = {
             assignment.assignment_id for assignment in self._data.assignments
         }
-        retained_ids.update(
-            assignment.assignment_id
-            for snapshot in self._data.localized_inpaint_undo_stack
-            for assignment in snapshot.previous_assignments
-        )
         return tuple(
             dict.fromkeys(
                 assignment.assignment_id
@@ -2476,52 +1875,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 if assignment.assignment_id not in retained_ids
             )
         )
-
-    def _clear_localized_inpaint_undo_history(
-        self,
-    ) -> list[SurfaceTextureAssignment]:
-        discarded = [
-            assignment
-            for snapshot in self._data.localized_inpaint_undo_stack
-            for assignment in snapshot.previous_assignments
-        ]
-        self._data.localized_inpaint_undo_stack.clear()
-        return discarded
-
-    def _validate_undo_snapshot_assets(
-        self,
-        snapshot: SurfaceTextureInpaintUndoSnapshot,
-    ) -> set[str]:
-        validated_paths: set[Path] = set()
-        required_assignment_ids: set[str] = set()
-        for surface_id in snapshot.affected_surface_ids:
-            assignment = next(
-                (
-                    candidate
-                    for candidate in reversed(snapshot.previous_assignments)
-                    if surface_id in candidate.surface_ids
-                ),
-                None,
-            )
-            if assignment is None:
-                raise ValueError(
-                    f"the prior texture for {surface_id!r} is unavailable."
-                )
-            required_assignment_ids.add(assignment.assignment_id)
-            for raw_path in self._assignment_asset_relative_paths(assignment):
-                texture_path = self._resolve_asset_path(raw_path)
-                if texture_path in validated_paths:
-                    continue
-                if not texture_path.is_file():
-                    raise ValueError(
-                        f"the prior texture asset {raw_path!r} is missing."
-                    )
-                _decode_png_rgba(
-                    texture_path.read_bytes(),
-                    "Prior surface texture",
-                )
-                validated_paths.add(texture_path)
-        return required_assignment_ids
 
     @Slot(str)
     def _handle_generation_failed(self, message: str) -> None:
@@ -2553,24 +1906,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             if worker is not None:
                 worker.discard_unclaimed_outputs()
             return
-        localized_edit_sources = self._generation_localized_edit_sources.get(
-            job_id,
-            (),
-        )
-        if (
-            localized_edit_sources
-            and not self._localized_edit_sources_are_current(
-                localized_edit_sources
-            )
-        ):
-            message = (
-                "The canonical surface texture changed while the localized "
-                "edit was running. Start the edit again."
-            )
-            self._handle_generation_failed(message)
-            self._job_manager.fail_job(job_id, message)
-            worker.discard_unclaimed_outputs()
-            return
         missing_targets = tuple(
             surface_id
             for surface_id in raw_request.surface_ids
@@ -2595,9 +1930,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             raw_request,
             raw_result,
             saved_outputs=tuple(raw_prepared_outputs),
-            submitted_texture_strokes=(
-                self._generation_submitted_texture_strokes.get(job_id)
-            ),
         )
         if committed:
             self._job_manager.complete_job(job_id)
@@ -2672,8 +2004,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._generation_workers.pop(job_id, None)
         self._generation_requests.pop(job_id, None)
         self._generation_surface_targets.pop(job_id, None)
-        self._generation_submitted_texture_strokes.pop(job_id, None)
-        self._generation_localized_edit_sources.pop(job_id, None)
         self._cancelled_generation_job_ids.discard(job_id)
         self._sync_controls()
 
@@ -2710,22 +2040,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     def _handle_mask_mode_changed(self, paint_checked: bool) -> None:
         mode = MASK_MODE_PAINT if paint_checked else MASK_MODE_ERASE
         self.video_view.set_brush_mode(mode)
-        self.surface_view.set_inpaint_brush_mode(mode)
-
-    def _handle_3d_inpaint_toggled(self, checked: bool) -> None:
-        try:
-            self.surface_view.set_inpaint_enabled(checked)
-        except ValueError as error:
-            self.inpaint_3d_button.blockSignals(True)
-            self.inpaint_3d_button.setChecked(False)
-            self.inpaint_3d_button.blockSignals(False)
-            self.status_label.setText(str(error))
-            return
-        self.status_label.setText(
-            "Paint the orange edit region directly on selected textured surfaces."
-            if checked
-            else "3D inpainting stopped."
-        )
 
     def _handle_surface_texture_provider_changed(self, _index: int) -> None:
         if self._is_syncing_provider:
@@ -2774,9 +2088,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._data.selected_surface_type = (
             self.surface_view.get_selected_surface_type()
         )
-        self._data.texture_mask_strokes = (
-            self.surface_view.get_texture_mask_strokes()
-        )
 
     def _restore_viewer_state(self) -> None:
         if self._data.camera_pose is not None:
@@ -2794,16 +2105,8 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._data.selected_surface_type = (
             self.surface_view.get_selected_surface_type()
         )
-        self.surface_view.set_texture_mask_strokes(
-            self._data.texture_mask_strokes
-        )
 
-    def _restore_assignment_textures(
-        self,
-        *,
-        required_assignment_ids: set[str] | None = None,
-    ) -> None:
-        required_ids = required_assignment_ids or set()
+    def _restore_assignment_textures(self) -> None:
         signature_before = self.get_preview_dependency_signature()
         restore_succeeded = True
         self.surface_view.clear_surface_textures()
@@ -2811,12 +2114,8 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             try:
                 texture_path = self._resolve_asset_path(assignment.asset_path)
             except (OSError, TypeError, ValueError):
-                if assignment.assignment_id in required_ids:
-                    raise
                 continue
             if not texture_path.is_file():
-                if assignment.assignment_id in required_ids:
-                    raise OSError("The required surface texture is missing.")
                 continue
             try:
                 self.surface_view.set_surface_texture(
@@ -2824,8 +2123,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                     texture_path,
                 )
             except (OSError, TypeError, ValueError):
-                if assignment.assignment_id in required_ids:
-                    raise
                 restore_succeeded = False
                 continue
         signature_after = self.get_preview_dependency_signature()
@@ -3438,82 +2735,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     ) -> bool:
         return self._surface_targets_are_reserved(assignment.surface_ids)
 
-    def _localized_edit_sources_are_current(
-        self,
-        sources: Sequence[_SurfaceTextureLocalizedEditSource],
-    ) -> bool:
-        """Confirm a long-running edit still targets its submitted texture."""
-
-        for source in sources:
-            assignment = next(
-                (
-                    candidate
-                    for candidate in reversed(self._data.assignments)
-                    if source.surface_id in candidate.surface_ids
-                ),
-                None,
-            )
-            if source.assignment_id:
-                if (
-                    assignment is None
-                    or assignment.assignment_id != source.assignment_id
-                ):
-                    return False
-            elif assignment is not None:
-                return False
-            if source.asset_path is None:
-                continue
-            if assignment is None or source.asset_revision is None:
-                return False
-            if assignment.texture_variants:
-                canonical_variant = assignment.texture_variant_for_resolution(
-                    2048
-                )
-                if canonical_variant is None:
-                    return False
-                asset_path = canonical_variant.asset_path
-            else:
-                asset_path = assignment.asset_path
-            if asset_path != source.asset_path:
-                return False
-            if (
-                _build_surface_asset_revision(
-                    self._asset_directory,
-                    asset_path,
-                )
-                != source.asset_revision
-            ):
-                return False
-        return True
-
-    def _clear_submitted_texture_masks(
-        self,
-        surface_ids: Sequence[str],
-        submitted_strokes: dict[str, tuple[MaskStroke, ...]] | None,
-    ) -> None:
-        """Clear consumed masks while preserving strokes painted after submit."""
-
-        if submitted_strokes is None:
-            self.surface_view.clear_texture_mask(surface_ids)
-            return
-        next_strokes = {
-            surface_id: list(strokes)
-            for surface_id, strokes in self._data.texture_mask_strokes.items()
-        }
-        changed = False
-        for raw_surface_id in surface_ids:
-            surface_id = str(raw_surface_id)
-            submitted = submitted_strokes.get(surface_id, ())
-            current = tuple(next_strokes.get(surface_id, ()))
-            if current != submitted or not current:
-                continue
-            next_strokes.pop(surface_id, None)
-            changed = True
-        if not changed:
-            return
-        self._data.texture_mask_strokes = next_strokes
-        self.surface_view.set_texture_mask_strokes(next_strokes)
-
     def _sync_controls(self) -> None:
         has_video = self._video_source is not None
         has_mask = bool(self._data.frame_strokes) or self.video_view.has_selection()
@@ -3528,17 +2749,8 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self.paint_mask_button.setEnabled(has_video)
         self.erase_mask_button.setEnabled(has_video)
         self.brush_size_spinbox.setEnabled(has_video)
-        self.undo_mask_button.setEnabled(has_video)
         self.clear_mask_button.setEnabled(
             has_video and self.video_view.has_selection()
-        )
-        can_inpaint_3d = self.surface_view.can_inpaint_selection()
-        self.inpaint_3d_button.setEnabled(can_inpaint_3d)
-        self.undo_3d_mask_button.setEnabled(
-            self.surface_view.has_selected_texture_mask()
-        )
-        self.clear_3d_mask_button.setEnabled(
-            self.surface_view.has_selected_texture_mask()
         )
         self.material_notes_edit.setEnabled(True)
         self.job_name_edit.setEnabled(True)
@@ -3561,17 +2773,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             and has_surface
             and has_key
             and not selection_is_reserved
-        )
-        last_undo_snapshot = (
-            self._data.localized_inpaint_undo_stack[-1]
-            if self._data.localized_inpaint_undo_stack
-            else None
-        )
-        self.undo_inpaint_button.setEnabled(
-            last_undo_snapshot is not None
-            and not self._surface_targets_are_reserved(
-                last_undo_snapshot.affected_surface_ids
-            )
         )
         self.video_view.set_interaction_enabled(has_video)
 
@@ -3634,103 +2835,6 @@ def _build_reference_pngs_from_input(
         _raise_surface_worker_cancelled(cancel_event)
         encoded_images.append(_encode_png(image))
     return tuple(encoded_images), tuple(used_indices)
-
-
-def _prepare_localized_surface_texture_request(
-    request: SurfaceTextureRequest,
-    sources: Sequence[_SurfaceTextureLocalizedEditSource],
-    asset_directory: Path,
-    cancel_event: threading.Event,
-) -> SurfaceTextureRequest:
-    """Read revision-validated bases and rasterize edit masks off the GUI."""
-
-    if tuple(source.surface_id for source in sources) != request.surface_ids:
-        raise ValueError("The localized texture targets changed before preparation.")
-    base_textures: list[np.ndarray] = []
-    for source in sources:
-        _raise_surface_worker_cancelled(cancel_event)
-        if (
-            source.texture_rgba_bytes is not None
-            and source.texture_shape is not None
-        ):
-            try:
-                texture = np.frombuffer(
-                    source.texture_rgba_bytes,
-                    dtype=np.uint8,
-                ).reshape(source.texture_shape)
-            except ValueError as error:
-                raise ValueError(
-                    "A legacy base surface texture has invalid dimensions."
-                ) from error
-            base_textures.append(texture)
-            continue
-        if source.asset_path is None or source.asset_revision is None:
-            raise ValueError("A localized texture source is incomplete.")
-        current_revision = _build_surface_asset_revision(
-            asset_directory,
-            source.asset_path,
-        )
-        if current_revision != source.asset_revision:
-            raise ValueError(
-                "The canonical surface texture changed after this job was "
-                "submitted. Start the localized edit again."
-            )
-        try:
-            asset_root = asset_directory.resolve()
-            texture_path = (asset_directory / source.asset_path).resolve()
-            texture_path.relative_to(asset_root)
-            texture_png = texture_path.read_bytes()
-        except (OSError, RuntimeError, ValueError) as error:
-            raise ValueError(
-                "The canonical 2048 surface texture is unavailable."
-            ) from error
-        if (
-            _build_surface_asset_revision(asset_directory, source.asset_path)
-            != source.asset_revision
-        ):
-            raise ValueError(
-                "The canonical surface texture changed while it was being "
-                "prepared. Start the localized edit again."
-            )
-        base_textures.append(
-            _decode_png_rgba(texture_png, "Base surface texture")
-        )
-    if not base_textures:
-        raise ValueError("Paint an edit region on the 3D texture.")
-    base_texture = base_textures[0]
-    if any(
-        texture.shape != base_texture.shape
-        or not np.array_equal(texture, base_texture)
-        for texture in base_textures[1:]
-    ):
-        raise ValueError(
-            "Selected surfaces must share the same texture for partial "
-            "inpainting."
-        )
-
-    edit_masks: list[tuple[str, np.ndarray]] = []
-    texture_size = (base_texture.shape[1], base_texture.shape[0])
-    for source in sources:
-        _raise_surface_worker_cancelled(cancel_event)
-        edit_masks.append(
-            (
-                source.surface_id,
-                rasterize_texture_mask_strokes(texture_size, source.strokes),
-            )
-        )
-    editable_mask = np.maximum.reduce(
-        tuple(mask for _surface_id, mask in edit_masks)
-    )
-    _raise_surface_worker_cancelled(cancel_event)
-    return replace(
-        request,
-        existing_texture_png=_encode_rgba_png(base_texture),
-        edit_mask_png=_encode_png(editable_mask),
-        surface_edit_mask_pngs=tuple(
-            (surface_id, _encode_png(mask))
-            for surface_id, mask in edit_masks
-        ),
-    )
 
 
 def _prepare_surface_texture_outputs(
@@ -4024,13 +3128,6 @@ def _encode_png(image: np.ndarray) -> bytes:
     return bytes(encoded)
 
 
-def _encode_rgba_png(image_rgba: np.ndarray) -> bytes:
-    rgba = np.asarray(image_rgba, dtype=np.uint8)
-    if rgba.ndim != 3 or rgba.shape[2] != 4:
-        raise ValueError("A base texture must contain RGBA pixels.")
-    return _encode_png(cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA))
-
-
 def _decode_png_rgba(png_bytes: bytes, label: str) -> np.ndarray:
     decoded = cv2.imdecode(
         np.frombuffer(bytes(png_bytes), dtype=np.uint8),
@@ -4049,58 +3146,12 @@ def _decode_png_rgba(png_bytes: bytes, label: str) -> np.ndarray:
     return np.ascontiguousarray(decoded, dtype=np.uint8)
 
 
-def _decode_png_mask(png_bytes: bytes, expected_shape: tuple[int, int]) -> np.ndarray:
-    decoded = cv2.imdecode(
-        np.frombuffer(bytes(png_bytes), dtype=np.uint8),
-        cv2.IMREAD_GRAYSCALE,
-    )
-    if decoded is None or decoded.shape != expected_shape:
-        raise ValueError("A 3D edit mask has invalid dimensions.")
-    return np.where(decoded > 0, 255, 0).astype(np.uint8)
-
-
-def _is_localized_surface_texture_inpaint(
-    request: SurfaceTextureRequest,
-) -> bool:
-    return bool(
-        request.existing_texture_png is not None
-        and request.edit_mask_png is not None
-        and request.surface_edit_mask_pngs
-    )
-
-
 def _build_surface_texture_outputs(
     request: SurfaceTextureRequest,
     generated_texture_png: bytes,
 ) -> list[tuple[tuple[str, ...], bytes]]:
-    if not request.surface_edit_mask_pngs:
-        _decode_png_rgba(generated_texture_png, "Generated texture")
-        return [(request.surface_ids, bytes(generated_texture_png))]
-    if request.existing_texture_png is None:
-        raise ValueError("A partial texture edit is missing its base texture.")
-    base = _decode_png_rgba(request.existing_texture_png, "Base texture")
-    generated = _decode_png_rgba(generated_texture_png, "Generated texture")
-    if generated.shape[:2] != base.shape[:2]:
-        generated = cv2.resize(
-            generated,
-            (base.shape[1], base.shape[0]),
-            interpolation=cv2.INTER_LANCZOS4,
-        )
-    groups: dict[bytes, tuple[list[str], np.ndarray]] = {}
-    for surface_id, mask_png in request.surface_edit_mask_pngs:
-        mask = _decode_png_mask(mask_png, base.shape[:2])
-        key = mask.tobytes()
-        group = groups.get(key)
-        if group is None:
-            groups[key] = ([surface_id], mask)
-        else:
-            group[0].append(surface_id)
-    outputs: list[tuple[tuple[str, ...], bytes]] = []
-    for surface_ids, mask in groups.values():
-        composite = base.copy()
-        composite[mask > 0] = generated[mask > 0]
-        outputs.append((tuple(surface_ids), _encode_rgba_png(composite)))
-    return outputs
+    _decode_png_rgba(generated_texture_png, "Generated texture")
+    return [(request.surface_ids, bytes(generated_texture_png))]
 
 
 # ### Text helpers ###

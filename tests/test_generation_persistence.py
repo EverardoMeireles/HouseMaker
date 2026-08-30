@@ -8,10 +8,6 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from housemaker.camera_models import (
-    CameraPose,
-    InitialFirstPersonCamera,
-)
 from housemaker.generation_state import (
     GeneratedObjectRecord,
     GenerationData,
@@ -166,47 +162,6 @@ class GenerationProjectMigrationTests(unittest.TestCase):
         self.assertEqual(loaded_project.generation.current_frame_index, 0)
         self.assertEqual(loaded_project.generation.frame_strokes, {})
         self.assertEqual(loaded_project.generation.generated_objects, [])
-
-    def test_legacy_manual_frame_zero_migrates_to_initial_camera(self) -> None:
-        legacy_pose = CameraPose(
-            x=3.25,
-            y=-1.5,
-            z=1.72,
-            yaw_degrees=92.0,
-            pitch_degrees=-7.0,
-            roll_degrees=2.0,
-            fov_degrees=68.0,
-        )
-
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            project_path = Path(temporary_directory) / "legacy-camera.json"
-            payload = _write_base_project(project_path)
-            payload.pop("initial_first_person_camera", None)
-            payload["dynamic_generation"] = {
-                "video_metadata": None,
-                "alignments": [
-                    {
-                        "frame_index": 8,
-                        "source": "manual",
-                        "pose": CameraPose(x=99.0).to_dict(),
-                    },
-                    {
-                        "frame_index": 0,
-                        "source": "manual",
-                        "pose": legacy_pose.to_dict(),
-                    },
-                ],
-            }
-            _write_payload(project_path, payload)
-
-            loaded_camera = load_project(
-                project_path
-            ).initial_first_person_camera
-
-        self.assertEqual(
-            loaded_camera,
-            InitialFirstPersonCamera(level_index=2, pose=legacy_pose),
-        )
 
     def test_malformed_generation_payloads_fall_back_to_empty_state(self) -> None:
         malformed_payloads: tuple[object, ...] = (

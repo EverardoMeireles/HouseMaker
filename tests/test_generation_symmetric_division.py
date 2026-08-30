@@ -33,8 +33,6 @@ from housemaker.generation_workspace import (
     StagedMeshyGenerationResult,
     TextureRegenerationOutcome,
     TextureRegenerationRequest,
-    UncheckedCameraFacePurgeOutcome,
-    UncheckedCameraFacePurgeRequest,
 )
 from housemaker.glb import import_generated_glb
 from housemaker.meshy_generation import MeshyGenerationResult
@@ -63,10 +61,6 @@ from housemaker.object_texture_variants import (
     ObjectTextureVariants,
 )
 from housemaker.settings_widget import GenerationServiceSettings
-from housemaker.unused_face_removal import (
-    ALL_CAMERA_IDS,
-    UncheckedCameraFacePurgeResult,
-)
 
 
 # ### Test application ###
@@ -277,27 +271,6 @@ class GenerationSymmetricDivisionTests(unittest.TestCase):
             )
         record = self.workspace.get_data().generated_objects[0]
         return record, pair_variants
-
-    def _purge_outcome(
-        self,
-        record: GeneratedObjectRecord,
-    ) -> UncheckedCameraFacePurgeOutcome:
-        purged_model = import_generated_glb(_box_glb(9.0))
-        unchecked = (ALL_CAMERA_IDS[0],)
-        return UncheckedCameraFacePurgeOutcome(
-            request=UncheckedCameraFacePurgeRequest(
-                object_id=record.object_id,
-                model_glb=purged_model.glb_bytes,
-                unchecked_camera_ids=unchecked,
-            ),
-            result=UncheckedCameraFacePurgeResult(
-                model=purged_model,
-                unchecked_camera_ids=unchecked,
-                original_face_count=12,
-                retained_face_count=8,
-                removed_face_count=4,
-            ),
-        )
 
     def test_ui_captures_checkbox_and_orientation_only_for_full_generate(
         self,
@@ -539,7 +512,7 @@ class GenerationSymmetricDivisionTests(unittest.TestCase):
         self.assertEqual(generated_spy.count(), 0)
         self.assertIsNone(self.workspace._active_generation_request)
 
-    def test_v4_retexture_and_purge_preserve_pair_layout_and_undo(self) -> None:
+    def test_v4_retexture_preserves_pair_layout_and_undo(self) -> None:
         original, _initial_variants = self._generate_symmetric_record()
         before = self.workspace.get_data().generated_objects[0]
         fingerprint = _fingerprint()
@@ -592,30 +565,7 @@ class GenerationSymmetricDivisionTests(unittest.TestCase):
         self.assertEqual(restored.asset_path, before.asset_path)
         self.assertEqual(restored.provider_task_id, before.provider_task_id)
 
-        purged_variants = _square_pair_variants(10)
-        with patch(
-            "housemaker.generation_workspace."
-            "build_symmetric_square_pair_texture_variants",
-            return_value=purged_variants,
-        ) as pair_purge:
-            self.workspace._handle_unchecked_camera_face_purge_succeeded(
-                self._purge_outcome(restored)
-            )
-        pair_purge.assert_called_once()
-        self.assertTrue(
-            pair_purge.call_args.kwargs["uvs_already_left_packed"]
-        )
-        purged = self.workspace.get_data().generated_objects[0]
-        self.assertEqual(
-            purged.pipeline[SYMMETRIC_DIVISION_PIPELINE_KEY],
-            restored.pipeline[SYMMETRIC_DIVISION_PIPELINE_KEY],
-        )
-        self.assertIn(
-            ".texture-1024.glb",
-            purged.pipeline["postprocessed_asset_path"],
-        )
-
-    def test_v2_quarter_record_retexture_and_purge_remain_compatible(
+    def test_v2_quarter_record_retexture_remains_compatible(
         self,
     ) -> None:
         quarter_variants = _quarter_variants(14)
@@ -700,27 +650,6 @@ class GenerationSymmetricDivisionTests(unittest.TestCase):
             {"512", "1024"},
         )
 
-        purged_quarter_variants = _quarter_variants(17)
-        with patch(
-            "housemaker.generation_workspace."
-            "build_symmetric_quarter_texture_variants",
-            return_value=purged_quarter_variants,
-        ) as quarter_purge:
-            self.workspace._handle_unchecked_camera_face_purge_succeeded(
-                self._purge_outcome(regenerated)
-            )
-        quarter_purge.assert_called_once()
-        self.assertTrue(
-            quarter_purge.call_args.kwargs[
-                "uvs_already_top_left_quarter"
-            ]
-        )
-        purged = self.workspace.get_data().generated_objects[0]
-        self.assertEqual(
-            purged.pipeline[SYMMETRIC_DIVISION_PIPELINE_KEY],
-            symmetry.to_pipeline_dict(),
-        )
-
     def test_v3_double_sized_pair_retexture_remains_compatible(self) -> None:
         legacy_pair_variants = _legacy_pair_variants(18)
         variant_metadata = self.workspace._persist_object_texture_variants(
@@ -800,25 +729,6 @@ class GenerationSymmetricDivisionTests(unittest.TestCase):
         self.assertEqual(
             set(replacement.pipeline[TEXTURE_VARIANTS_PIPELINE_KEY]),
             {"512", "1024"},
-        )
-
-        purged_pair_variants = _legacy_pair_variants(21)
-        with patch(
-            "housemaker.generation_workspace."
-            "build_symmetric_pair_texture_variants",
-            return_value=purged_pair_variants,
-        ) as pair_purge:
-            self.workspace._handle_unchecked_camera_face_purge_succeeded(
-                self._purge_outcome(replacement)
-            )
-        pair_purge.assert_called_once()
-        self.assertTrue(
-            pair_purge.call_args.kwargs["uvs_already_left_packed"]
-        )
-        purged = self.workspace.get_data().generated_objects[0]
-        self.assertEqual(
-            purged.pipeline[SYMMETRIC_DIVISION_PIPELINE_KEY],
-            symmetry.to_pipeline_dict(),
         )
 
     def test_legacy_v1_record_keeps_half_metadata_and_three_resolutions(
@@ -904,33 +814,6 @@ class GenerationSymmetricDivisionTests(unittest.TestCase):
         )
         self.assertEqual(
             replacement.pipeline[SYMMETRIC_DIVISION_PIPELINE_KEY],
-            record.pipeline[SYMMETRIC_DIVISION_PIPELINE_KEY],
-        )
-
-        purged_legacy_variants = _ordinary_variants(14)
-        with (
-            patch(
-                "housemaker.generation_workspace."
-                "build_object_texture_variants",
-                return_value=purged_legacy_variants,
-            ) as ordinary_purge,
-            patch(
-                "housemaker.generation_workspace."
-                "build_symmetric_half_texture_variants",
-            ) as half_purge,
-        ):
-            self.workspace._handle_unchecked_camera_face_purge_succeeded(
-                self._purge_outcome(replacement)
-            )
-        ordinary_purge.assert_called_once()
-        half_purge.assert_not_called()
-        purged = self.workspace.get_data().generated_objects[0]
-        self.assertEqual(
-            set(purged.pipeline[TEXTURE_VARIANTS_PIPELINE_KEY]),
-            {str(resolution) for resolution in TEXTURE_RESOLUTIONS},
-        )
-        self.assertEqual(
-            purged.pipeline[SYMMETRIC_DIVISION_PIPELINE_KEY],
             record.pipeline[SYMMETRIC_DIVISION_PIPELINE_KEY],
         )
 
