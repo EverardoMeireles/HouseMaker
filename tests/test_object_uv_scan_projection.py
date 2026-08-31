@@ -11,10 +11,14 @@ from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
 from housemaker.object_texture_variants import (
+    TEXTURE_RESOLUTIONS,
     _collect_material_textures,
     _load_glb_scene,
+    _replace_material_textures,
     _validate_shared_texture,
+    build_object_texture_variants,
 )
+from housemaker.object_face_edit import delete_object_faces_preserving_uvs
 from housemaker.object_uv_scan_projection import (
     DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
     LEFT_HALF_OUTER_SAFETY_INSET_PIXELS,
@@ -22,7 +26,9 @@ from housemaker.object_uv_scan_projection import (
     SCAN_PROJECTION_MINIMUM_VISIBLE_FRACTION,
     SCAN_PROJECTION_TARGET_FULL,
     SCAN_PROJECTION_TARGET_LEFT_HALF,
+    SCAN_PROJECTION_TARGET_TOP_LEFT_QUARTER,
     SCAN_PROJECTION_VERSION,
+    TOP_LEFT_QUARTER_OUTER_SAFETY_INSET_PIXELS,
     ScanProjectionCancelled,
     _FALLBACK_CAMERA_INDEX,
     _FaceGroup,
@@ -38,6 +44,10 @@ from housemaker.object_uv_scan_projection import (
     scan_project_textured_glb,
 )
 from housemaker.unused_face_removal import ALL_CAMERA_IDS
+from housemaker.scan_projection_layout import (
+    SCAN_PROJECTION_LAYOUT_METADATA_KEY,
+    remap_scan_projection_scene_uvs,
+)
 
 
 # ### Test constants ###
@@ -235,6 +245,52 @@ def _sample_source_gradient(uv: np.ndarray) -> np.ndarray:
     return top * (1.0 - fraction_y) + bottom * fraction_y
 
 
+def _sample_clamp_bilinear_rgba(
+    texture: np.ndarray,
+    uv: np.ndarray,
+) -> np.ndarray:
+    height, width = texture.shape[:2]
+    pixel_x = float(uv[0]) * width - 0.5
+    pixel_y = (1.0 - float(uv[1])) * height - 0.5
+    x0 = int(np.floor(pixel_x))
+    y0 = int(np.floor(pixel_y))
+    fraction_x = pixel_x - x0
+    fraction_y = pixel_y - y0
+    x0 = min(max(x0, 0), width - 1)
+    y0 = min(max(y0, 0), height - 1)
+    x1 = min(x0 + 1, width - 1)
+    y1 = min(y0 + 1, height - 1)
+    top = texture[y0, x0].astype(float) * (1.0 - fraction_x)
+    top += texture[y0, x1].astype(float) * fraction_x
+    bottom = texture[y1, x0].astype(float) * (1.0 - fraction_x)
+    bottom += texture[y1, x1].astype(float) * fraction_x
+    return top * (1.0 - fraction_y) + bottom * fraction_y
+
+
+def _face_scan_cell(
+    face_uvs: np.ndarray,
+    *,
+    texture_resolution: int,
+) -> tuple[int, int, int, int]:
+    canonical_resolution = 2048
+    reduction = canonical_resolution // texture_resolution
+    points = np.column_stack(
+        (
+            face_uvs[:, 0] * canonical_resolution,
+            (1.0 - face_uvs[:, 1]) * canonical_resolution,
+        )
+    )
+    inset = reduction * 0.5
+    minimums = np.rint(np.min(points, axis=0) - inset).astype(int)
+    maximums = np.rint(np.max(points, axis=0) + inset).astype(int)
+    return (
+        int(minimums[0]),
+        int(minimums[1]),
+        int(maximums[0] - minimums[0]),
+        int(maximums[1] - minimums[1]),
+    )
+
+
 # ### Percentage validation tests ###
 def test_normalizes_sequence_and_mapping_in_canonical_camera_order() -> None:
     assert sum(DEFAULT_PROJECTION_CAMERA_PERCENTAGES) == 100
@@ -273,6 +329,9 @@ def test_dense_scan_bake_fills_cube_without_dots_and_preserves_gradients() -> No
         texture_resolution=TEST_TEXTURE_RESOLUTION,
     )
 
+    _source_scene, source_mesh, _source_texture = _load_single_mesh_and_texture(
+        source_glb
+    )
     _scene, output_mesh, output_texture = _load_single_mesh_and_texture(
         result.glb_bytes
     )
@@ -299,8 +358,19 @@ def test_dense_scan_bake_fills_cube_without_dots_and_preserves_gradients() -> No
         matrix,
         np.asarray((pixel_center[0], pixel_center[1], 1.0)),
     )
-    source_uv = barycentric @ np.asarray(
-        ((0.08, 0.12), (0.91, 0.18), (0.21, 0.89)),
+    surface_position = barycentric @ np.asarray(
+        output_mesh.vertices[output_face],
+        dtype=float,
+    )
+    source_face = np.asarray(source_mesh.faces[0], dtype=np.int64)
+    source_positions = np.asarray(source_mesh.vertices[source_face], dtype=float)
+    source_barycentric = np.linalg.lstsq(
+        np.vstack((source_positions.T, np.ones(3))),
+        np.append(surface_position, 1.0),
+        rcond=None,
+    )[0]
+    source_uv = source_barycentric @ np.asarray(
+        source_mesh.visual.uv[source_face],
         dtype=float,
     )
     expected = _sample_source_gradient(source_uv)
@@ -309,6 +379,134 @@ def test_dense_scan_bake_fills_cube_without_dots_and_preserves_gradients() -> No
         expected,
         atol=1.5,
     )
+
+
+def test_texture_variants_keep_every_scan_edge_inside_its_own_texels() -> None:
+    canonical_resolution = 2048
+    source_texture = _gradient_rgba(canonical_resolution)
+    projected = scan_project_textured_glb(
+        _build_textured_cube_glb(texture=source_texture),
+        texture_resolution=canonical_resolution,
+    )
+    scene, mesh, _texture = _load_single_mesh_and_texture(projected.glb_bytes)
+    source_uvs = np.asarray(mesh.visual.uv, dtype=float)
+    source_faces = np.asarray(mesh.faces, dtype=np.int64)
+    cells = {
+        _face_scan_cell(
+            source_uvs[face],
+            texture_resolution=canonical_resolution,
+        )
+        for face in source_faces
+    }
+    color_by_cell = {
+        cell: np.asarray(
+            (
+                31 + cell_index * 13,
+                47 + cell_index * 7,
+                71 + cell_index * 5,
+                255,
+            ),
+            dtype=np.uint8,
+        )
+        for cell_index, cell in enumerate(sorted(cells))
+    }
+    cell_texture = np.zeros(
+        (canonical_resolution, canonical_resolution, 4),
+        dtype=np.uint8,
+    )
+    for (x, y, width, height), color in color_by_cell.items():
+        cell_texture[y : y + height, x : x + width] = color
+    _replace_material_textures(scene, [cell_texture])
+    tagged_glb = bytes(scene.export(file_type="glb"))
+
+    variants = build_object_texture_variants(tagged_glb)
+
+    assert variants is not None
+    for resolution in TEXTURE_RESOLUTIONS:
+        _variant_scene, variant_mesh, variant_texture = (
+            _load_single_mesh_and_texture(variants.glb_by_resolution[resolution])
+        )
+        layout = variant_mesh.metadata[SCAN_PROJECTION_LAYOUT_METADATA_KEY]
+        assert layout["uv_texture_resolution"] == resolution
+        variant_uvs = np.asarray(variant_mesh.visual.uv, dtype=float)
+        variant_faces = np.asarray(variant_mesh.faces, dtype=np.int64)
+        variant_points = np.column_stack(
+            (
+                variant_uvs[:, 0] * resolution,
+                (1.0 - variant_uvs[:, 1]) * resolution,
+            )
+        )
+        np.testing.assert_allclose(
+            np.mod(variant_points, 1.0),
+            0.5,
+            rtol=0.0,
+            atol=1e-6,
+        )
+        for face in variant_faces:
+            triangle_uvs = variant_uvs[face]
+            expected = color_by_cell[
+                _face_scan_cell(
+                    triangle_uvs,
+                    texture_resolution=resolution,
+                )
+            ]
+            centroid = np.mean(triangle_uvs, axis=0)
+            for edge_index in range(3):
+                edge_midpoint = (
+                    triangle_uvs[edge_index]
+                    + triangle_uvs[(edge_index + 1) % 3]
+                ) * 0.5
+                just_inside = edge_midpoint * 0.9999 + centroid * 0.0001
+                np.testing.assert_allclose(
+                    _sample_clamp_bilinear_rgba(
+                        variant_texture,
+                        just_inside,
+                    ),
+                    expected,
+                    rtol=0.0,
+                    atol=0.01,
+                )
+
+    edited = delete_object_faces_preserving_uvs(tagged_glb, {0})
+    edited_variants = build_object_texture_variants(edited.glb_bytes)
+    assert edited_variants is not None
+    for resolution in TEXTURE_RESOLUTIONS:
+        _edited_scene, edited_mesh, _edited_texture = (
+            _load_single_mesh_and_texture(
+                edited_variants.glb_by_resolution[resolution]
+            )
+        )
+        assert len(edited_mesh.faces) == len(source_faces) - 1
+        edited_layout = edited_mesh.metadata[
+            SCAN_PROJECTION_LAYOUT_METADATA_KEY
+        ]
+        assert edited_layout["uv_texture_resolution"] == resolution
+
+    multi_scene = trimesh.Scene()
+    canonical_faces = np.asarray(mesh.faces, dtype=np.int64).copy()
+    for instance_index in range(2):
+        multi_scene.add_geometry(
+            mesh.copy(),
+            geom_name=f"scan-geometry-{instance_index}",
+            node_name=f"scan-node-{instance_index}",
+        )
+    assert remap_scan_projection_scene_uvs(multi_scene, 512)
+    for geometry in multi_scene.geometry.values():
+        np.testing.assert_array_equal(geometry.faces, canonical_faces)
+        assert geometry.visual.material.name == mesh.visual.material.name
+        geometry_uvs = np.asarray(geometry.visual.uv, dtype=float)
+        geometry_points = np.column_stack(
+            (
+                geometry_uvs[:, 0] * 512,
+                (1.0 - geometry_uvs[:, 1]) * 512,
+            )
+        )
+        np.testing.assert_allclose(
+            np.mod(geometry_points, 1.0),
+            0.5,
+            rtol=0.0,
+            atol=1e-6,
+        )
 
 
 def test_custom_view_percentages_control_pixel_area_and_are_auditable() -> None:
@@ -324,12 +522,13 @@ def test_custom_view_percentages_control_pixel_area_and_are_auditable() -> None:
     assert stats.view_face_counts == (2, 2, 2, 2, 2, 2)
     achieved_percentages = np.asarray(stats.view_pixel_counts, dtype=float)
     achieved_percentages *= 100.0 / stats.covered_pixel_count
-    np.testing.assert_allclose(achieved_percentages, CUSTOM_PERCENTAGES, atol=0.8)
+    np.testing.assert_allclose(achieved_percentages, CUSTOM_PERCENTAGES, atol=2.0)
     pipeline = stats.to_pipeline_dict()
     assert pipeline["camera_percentages"] == dict(
         zip(ALL_CAMERA_IDS, CUSTOM_PERCENTAGES, strict=True)
     )
     assert pipeline["triangle_occupancy"] >= 0.999
+    assert pipeline["output_face_count"] == stats.output_face_count
 
 
 def test_left_half_keeps_outer_safety_inset_but_no_island_padding() -> None:
@@ -357,6 +556,47 @@ def test_left_half_keeps_outer_safety_inset_but_no_island_padding() -> None:
     assert np.min(uvs[:, 1]) >= inset - 1e-9
     assert np.max(uvs[:, 1]) <= 1.0 - inset + 1e-9
     assert np.all(texture[:, TEST_TEXTURE_RESOLUTION // 2 :, :3] == 0)
+    assert result.stats.triangle_occupancy >= 0.999
+
+
+def test_top_left_quarter_uses_the_legacy_content_gutter() -> None:
+    result = scan_project_textured_glb(
+        _build_textured_cube_glb(
+            texture=_gradient_rgba(TEST_TEXTURE_RESOLUTION)
+        ),
+        target_domain=SCAN_PROJECTION_TARGET_TOP_LEFT_QUARTER,
+        texture_resolution=TEST_TEXTURE_RESOLUTION,
+    )
+    _scene, mesh, texture = _load_single_mesh_and_texture(result.glb_bytes)
+    uvs = np.asarray(mesh.visual.uv, dtype=float)
+    inset = (
+        TOP_LEFT_QUARTER_OUTER_SAFETY_INSET_PIXELS
+        / TEST_TEXTURE_RESOLUTION
+    )
+
+    assert (
+        result.stats.target_domain
+        == SCAN_PROJECTION_TARGET_TOP_LEFT_QUARTER
+    )
+    assert (
+        result.stats.outer_safety_inset_pixels
+        == TOP_LEFT_QUARTER_OUTER_SAFETY_INSET_PIXELS
+    )
+    assert result.stats.target_width == (
+        TEST_TEXTURE_RESOLUTION // 2
+        - 2 * TOP_LEFT_QUARTER_OUTER_SAFETY_INSET_PIXELS
+    )
+    assert result.stats.target_height == result.stats.target_width
+    assert np.min(uvs[:, 0]) >= inset - 1e-9
+    assert np.max(uvs[:, 0]) <= 0.5 - inset + 1e-9
+    assert np.min(uvs[:, 1]) >= 0.5 + inset - 1e-9
+    assert np.max(uvs[:, 1]) <= 1.0 - inset + 1e-9
+    target_right = (
+        TEST_TEXTURE_RESOLUTION // 2
+        - TOP_LEFT_QUARTER_OUTER_SAFETY_INSET_PIXELS
+    )
+    assert np.all(texture[:, target_right:, :3] == 0)
+    assert np.all(texture[target_right:, :, :3] == 0)
     assert result.stats.triangle_occupancy >= 0.999
 
 
@@ -398,6 +638,7 @@ def test_single_populated_view_redistributes_space_and_splits_one_face() -> None
     )
 
     assert result.stats.face_count == 1
+    assert result.stats.output_face_count == 2
     assert result.stats.output_vertex_count == 6
     assert len(output_mesh.faces) == 2
     assert result.stats.triangle_occupancy >= 0.999
@@ -435,7 +676,9 @@ def test_projection_is_deterministic_and_preserves_transform_and_faces() -> None
     source_transform, _source_geometry = source_scene.graph.get(source_node)
     output_transform, _output_geometry = output_scene.graph.get(output_node)
     np.testing.assert_allclose(output_transform, source_transform)
-    assert len(output_mesh.faces) == len(source_mesh.faces)
+    assert len(source_mesh.faces) <= len(output_mesh.faces) <= 2 * len(
+        source_mesh.faces
+    )
     np.testing.assert_allclose(output_mesh.bounds, source_mesh.bounds)
     np.testing.assert_allclose(
         np.unique(np.asarray(output_mesh.vertex_normals), axis=0),
@@ -445,7 +688,8 @@ def test_projection_is_deterministic_and_preserves_transform_and_faces() -> None
     assert output_mesh.visual.material.roughnessFactor == pytest.approx(
         source_mesh.visual.material.roughnessFactor
     )
-    assert first.stats.output_vertex_count == 3 * len(source_mesh.faces)
+    assert first.stats.output_vertex_count == 3 * len(output_mesh.faces)
+    assert first.stats.output_face_count == len(output_mesh.faces)
 
 
 def test_reversed_coplanar_faces_choose_high_percentage_camera() -> None:
@@ -502,8 +746,9 @@ def test_same_camera_faces_receive_exact_projected_area_ratios() -> None:
     np.testing.assert_allclose(
         allocated_areas / allocated_areas[2],
         (2.0, 1.0, 1.0),
+        atol=0.15,
     )
-    assert len(placements) == 4
+    assert len(placements) == 6
 
 
 def test_face_below_half_visibility_uses_minimum_fallback_pool() -> None:
@@ -540,7 +785,7 @@ def test_face_below_half_visibility_uses_minimum_fallback_pool() -> None:
         if placement.face.camera_index == _FALLBACK_CAMERA_INDEX
         for point in placement.destination_points
     }
-    assert max(fallback_rows) - min(fallback_rows) == 1
+    assert max(fallback_rows) - min(fallback_rows) >= 3
 
 
 def test_visibility_raster_keeps_exact_centers_near_rounded_edges() -> None:
@@ -592,21 +837,21 @@ def test_scan_rows_handle_extreme_group_weights_in_a_tiny_exact_atlas() -> None:
     )
 
     rectangles = _partition_group_rectangles(
-        _PixelRectangle(0, 0, 2, 4),
+        _PixelRectangle(0, 0, 8, 8),
         groups,
     )
 
     assert len(rectangles) == 4
-    assert all(rectangle.width == 2 for rectangle in rectangles)
-    assert all(rectangle.height == 1 for rectangle in rectangles)
+    assert all(rectangle.width == 4 for rectangle in rectangles)
+    assert all(rectangle.height == 4 for rectangle in rectangles)
     assert {
         (rectangle.x, rectangle.y)
         for rectangle in rectangles
-    } == {(0, 0), (0, 1), (0, 2), (0, 3)}
+    } == {(0, 0), (4, 0), (0, 4), (4, 4)}
 
 
-def test_scan_rows_use_vertical_cells_at_odd_width_capacity() -> None:
-    rectangle = _PixelRectangle(0, 0, 7, 34)
+def test_scan_rows_preserve_reduction_alignment_near_capacity() -> None:
+    rectangle = _PixelRectangle(0, 0, 44, 40)
     groups = tuple(
         _FaceGroup(faces=(), weight=float(weight))
         for weight in np.geomspace(1.0, 1e-8, 103)
@@ -617,7 +862,11 @@ def test_scan_rows_use_vertical_cells_at_odd_width_capacity() -> None:
     coverage = np.zeros((rectangle.height, rectangle.width), dtype=bool)
     assert len(rectangles) == len(groups)
     for item in rectangles:
-        assert item.width * item.height >= 2
+        assert item.width >= 4
+        assert item.height >= 4
+        assert not any(
+            value % 4 for value in (item.x, item.y, item.width, item.height)
+        )
         assert not np.any(
             coverage[item.y : item.bottom, item.x : item.right]
         )
@@ -636,12 +885,13 @@ def test_winding_independent_tie_uses_percentage_and_preserves_capacity() -> Non
         result.glb_bytes
     )
     assert result.stats.face_count == 201
+    assert result.stats.output_face_count == 402
     assert result.stats.view_face_counts[:2] == (1, 200)
     assert result.stats.fallback_face_count == 0
     assert result.stats.view_pixel_counts[0] >= 2
     assert result.stats.covered_pixel_count == result.stats.usable_pixel_count
     assert result.stats.triangle_occupancy == pytest.approx(1.0)
-    assert len(output_mesh.faces) == 202
+    assert len(output_mesh.faces) == 402
 
 
 def test_camera_groups_share_rows_when_full_width_bands_do_not_fit() -> None:
@@ -653,7 +903,7 @@ def test_camera_groups_share_rows_when_full_width_bands_do_not_fit() -> None:
     placements = _build_face_placements(
         faces,
         (25, 25, 25, 25, 0, 0),
-        _PixelRectangle(0, 0, 4, 2),
+        _PixelRectangle(0, 0, 8, 8),
     )
 
     assert len(placements) == 8
@@ -666,17 +916,17 @@ def test_camera_groups_share_rows_when_full_width_bands_do_not_fit() -> None:
 def test_scan_layout_reports_only_true_global_group_overcapacity() -> None:
     faces = tuple(
         _projected_face(face_index, 0)
-        for face_index in range(10)
+        for face_index in range(2)
     )
 
     with pytest.raises(
         ValueError,
-        match=r"5 groups require at least 10 pixels.*contains 4",
+        match=r"2 groups require at least 32 pixels.*contains 16",
     ):
         _build_face_placements(
             faces,
             (100, 0, 0, 0, 0, 0),
-            _PixelRectangle(0, 0, 2, 2),
+            _PixelRectangle(0, 0, 4, 4),
         )
 
 

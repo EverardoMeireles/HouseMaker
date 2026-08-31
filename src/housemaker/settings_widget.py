@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QKeySequenceEdit,
     QLabel,
     QLineEdit,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -40,12 +41,18 @@ UNUSED_FACE_REMOVAL_SETTING_KEY = "generation/unused_face_removal"
 USE_UV_RAYCAST_FOR_OBJECT_GENERATION_SETTING_KEY = (
     "generation/use_uv_raycast_for_object_generation"
 )
+MINIMUM_FACE_VISIBILITY_PERCENTAGE_SETTING_KEY = (
+    "generation/minimum_face_visibility_percentage"
+)
 DOORWAY_MESH_UPDATE_DELAY_SECONDS_SETTING_KEY = (
     "canvas/doorway_mesh_update_delay_seconds"
 )
 DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY = "N"
 DEFAULT_UNUSED_FACE_REMOVAL = False
 DEFAULT_USE_UV_RAYCAST_FOR_OBJECT_GENERATION = False
+DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE = 5
+MINIMUM_FACE_VISIBILITY_PERCENTAGE = 0
+MAXIMUM_FACE_VISIBILITY_PERCENTAGE = 100
 DEFAULT_DOORWAY_MESH_UPDATE_DELAY_SECONDS = 1.0
 MIN_DOORWAY_MESH_UPDATE_DELAY_SECONDS = 0.1
 MAX_DOORWAY_MESH_UPDATE_DELAY_SECONDS = 10.0
@@ -118,6 +125,9 @@ class GenerationServiceSettings:
     use_uv_raycast_for_object_generation: bool = (
         DEFAULT_USE_UV_RAYCAST_FOR_OBJECT_GENERATION
     )
+    minimum_face_visibility_percentage: int = (
+        DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.unused_face_removal, bool):
@@ -126,6 +136,20 @@ class GenerationServiceSettings:
             raise ValueError(
                 "Weighted camera projection for object generation must be "
                 "enabled or disabled."
+            )
+        if (
+            isinstance(self.minimum_face_visibility_percentage, bool)
+            or not isinstance(self.minimum_face_visibility_percentage, int)
+            or not (
+                MINIMUM_FACE_VISIBILITY_PERCENTAGE
+                <= self.minimum_face_visibility_percentage
+                <= MAXIMUM_FACE_VISIBILITY_PERCENTAGE
+            )
+        ):
+            raise ValueError(
+                "Minimum face visibility percentage must be between "
+                f"{MINIMUM_FACE_VISIBILITY_PERCENTAGE}% and "
+                f"{MAXIMUM_FACE_VISIBILITY_PERCENTAGE}%."
             )
         if (
             isinstance(self.meshy_target_polycount, bool)
@@ -280,6 +304,9 @@ class SettingsWidget(QWidget):
             unused_face_removal=self.unused_face_removal_checkbox.isChecked(),
             use_uv_raycast_for_object_generation=(
                 self.use_uv_raycast_for_object_generation_checkbox.isChecked()
+            ),
+            minimum_face_visibility_percentage=(
+                self.minimum_face_visibility_percentage_spinbox.value()
             ),
             doorway_mesh_update_delay_seconds=(
                 self.doorway_mesh_update_delay_spinbox.value()
@@ -439,9 +466,10 @@ class SettingsWidget(QWidget):
             "unused_face_removal_checkbox"
         )
         self.unused_face_removal_checkbox.setToolTip(
-            "Generate geometry first, remove faces invisible from the enabled "
-            "Object-generation cameras, then submit the edited GLB to Meshy "
-            "Retexture. This uses two Meshy tasks."
+            "Generate geometry first, remove faces that do not meet the "
+            "configured minimum visibility in the six Object-generation "
+            "cameras, then submit the edited GLB to Meshy Retexture. This "
+            "uses two Meshy tasks."
         )
         self.unused_face_removal_checkbox.toggled.connect(
             self._handle_unused_face_removal_changed
@@ -467,6 +495,32 @@ class SettingsWidget(QWidget):
         form_layout.addRow(
             "Use weighted camera projection",
             self.use_uv_raycast_for_object_generation_checkbox,
+        )
+
+        self.minimum_face_visibility_percentage_spinbox = QSpinBox()
+        self.minimum_face_visibility_percentage_spinbox.setObjectName(
+            "minimum_face_visibility_percentage_spinbox"
+        )
+        self.minimum_face_visibility_percentage_spinbox.setRange(
+            MINIMUM_FACE_VISIBILITY_PERCENTAGE,
+            MAXIMUM_FACE_VISIBILITY_PERCENTAGE,
+        )
+        self.minimum_face_visibility_percentage_spinbox.setSingleStep(1)
+        self.minimum_face_visibility_percentage_spinbox.setSuffix("%")
+        self.minimum_face_visibility_percentage_spinbox.setKeyboardTracking(
+            False
+        )
+        self.minimum_face_visibility_percentage_spinbox.setToolTip(
+            "During unused-face removal, retain a face from a camera only "
+            "when at least this percentage of the face is visible. Higher "
+            "values reject tiny glimpses through gaps."
+        )
+        self.minimum_face_visibility_percentage_spinbox.valueChanged.connect(
+            self._handle_minimum_face_visibility_percentage_changed
+        )
+        form_layout.addRow(
+            "Minimum percentage of face visible",
+            self.minimum_face_visibility_percentage_spinbox,
         )
 
         root_layout.addLayout(form_layout)
@@ -547,6 +601,11 @@ class SettingsWidget(QWidget):
         )
         self.use_uv_raycast_for_object_generation_checkbox.setChecked(
             read_use_uv_raycast_for_object_generation(
+                self._application_settings
+            )
+        )
+        self.minimum_face_visibility_percentage_spinbox.setValue(
+            read_minimum_face_visibility_percentage(
                 self._application_settings
             )
         )
@@ -719,6 +778,18 @@ class SettingsWidget(QWidget):
         )
         self.settings_changed.emit()
 
+    def _handle_minimum_face_visibility_percentage_changed(
+        self,
+        value: int,
+    ) -> None:
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            MINIMUM_FACE_VISIBILITY_PERCENTAGE_SETTING_KEY,
+            int(value),
+        )
+        self.settings_changed.emit()
+
     def _handle_doorway_mesh_update_delay_changed(self, value: float) -> None:
         if self._is_loading_settings:
             return
@@ -843,6 +914,28 @@ def read_use_uv_raycast_for_object_generation(
     if isinstance(value, bool):
         return value
     return DEFAULT_USE_UV_RAYCAST_FOR_OBJECT_GENERATION
+
+
+def read_minimum_face_visibility_percentage(
+    application_settings: ApplicationSettingsStore,
+) -> int:
+    """Read the camera face-visibility threshold with a safe default."""
+
+    value = application_settings.get(
+        MINIMUM_FACE_VISIBILITY_PERCENTAGE_SETTING_KEY,
+        DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE,
+    )
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not (
+            MINIMUM_FACE_VISIBILITY_PERCENTAGE
+            <= value
+            <= MAXIMUM_FACE_VISIBILITY_PERCENTAGE
+        )
+    ):
+        return DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE
+    return int(value)
 
 
 # ### Doorway preview setting helpers ###

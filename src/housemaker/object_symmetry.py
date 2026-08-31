@@ -36,6 +36,11 @@ from housemaker.object_uv_scan_projection import (
     ScanProjectionStats,
     scan_project_textured_glb,
 )
+from housemaker.scan_projection_layout import (
+    SCAN_PROJECTION_LAYOUT_METADATA_KEY,
+    clear_scan_projection_layout_metadata,
+    remap_scan_projection_scene_uvs,
+)
 
 
 # ### Constants ###
@@ -1457,6 +1462,7 @@ def _build_output_mesh(
         process=False,
         metadata=copy.deepcopy(source_mesh.metadata),
     )
+    output.metadata.pop(SCAN_PROJECTION_LAYOUT_METADATA_KEY, None)
     if uvs is not None:
         output.visual = TextureVisuals(
             uv=np.asarray(uvs, dtype=float).copy(),
@@ -2994,6 +3000,7 @@ def _repack_retained_texture(
             destination.x : destination.right,
         ] = patch
     _apply_uv_pack_placements(scene, islands, groups, placements)
+    clear_scan_projection_layout_metadata(scene)
     _validate_scene_uvs_in_left_half(scene)
     return np.ascontiguousarray(packed)
 
@@ -4184,6 +4191,7 @@ def _map_scene_uvs_to_top_left_quarter(scene: trimesh.Scene) -> None:
                 / atlas_resolution,
             )
         )
+    clear_scan_projection_layout_metadata(scene)
     if not found_textured:
         raise ValueError("The retained GLB contains no textured mesh UVs.")
 
@@ -4336,6 +4344,10 @@ def _build_square_pair_texture_variants(
     glb_by_resolution: dict[int, bytes] = {}
     for resolution in SYMMETRIC_SQUARE_PAIR_CONTENT_RESOLUTIONS:
         variant_scene = _clone_scene_with_vertex_normals(scene)
+        remap_scan_projection_scene_uvs(
+            variant_scene,
+            int(texture_by_resolution[resolution].shape[0]),
+        )
         _replace_material_textures(
             variant_scene,
             [texture_by_resolution[resolution]] * material_texture_count,
@@ -4381,6 +4393,10 @@ def _build_pair_texture_variants(
     glb_by_resolution: dict[int, bytes] = {}
     for content_resolution in SYMMETRIC_PAIR_CONTENT_RESOLUTIONS:
         variant_scene = _clone_scene_with_vertex_normals(scene)
+        remap_scan_projection_scene_uvs(
+            variant_scene,
+            int(texture_by_resolution[content_resolution].shape[0]),
+        )
         _replace_material_textures(
             variant_scene,
             [texture_by_resolution[content_resolution]]
@@ -4456,6 +4472,10 @@ def _build_quarter_texture_variants(
     glb_by_resolution: dict[int, bytes] = {}
     for content_resolution in SYMMETRIC_QUARTER_CONTENT_RESOLUTIONS:
         variant_scene = _clone_scene_with_vertex_normals(scene)
+        remap_scan_projection_scene_uvs(
+            variant_scene,
+            int(texture_by_resolution[content_resolution].shape[0]),
+        )
         _replace_material_textures(
             variant_scene,
             [texture_by_resolution[content_resolution]]
@@ -4525,6 +4545,10 @@ def _build_half_texture_variants(
     glb_by_resolution: dict[int, bytes] = {}
     for resolution in TEXTURE_RESOLUTIONS:
         variant_scene = _clone_scene_with_vertex_normals(scene)
+        remap_scan_projection_scene_uvs(
+            variant_scene,
+            int(texture_by_resolution[resolution].shape[0]),
+        )
         _replace_material_textures(
             variant_scene,
             [texture_by_resolution[resolution]] * material_texture_count,

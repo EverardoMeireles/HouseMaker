@@ -18,6 +18,12 @@ from housemaker.object_texture_variants import (
     _replace_material_textures,
     _validate_shared_texture,
 )
+from housemaker.scan_projection_layout import (
+    SCAN_PROJECTION_LAYOUT_ALIGNMENT_PIXELS,
+    SCAN_PROJECTION_LAYOUT_METADATA_KEY,
+    SCAN_PROJECTION_UV_EDGE_INSET_TEXELS,
+    build_scan_projection_layout_metadata,
+)
 from housemaker.unused_face_removal import (
     ALL_CAMERA_IDS,
     FixedCameraView,
@@ -26,27 +32,38 @@ from housemaker.unused_face_removal import (
 
 
 # ### Public constants ###
-SCAN_PROJECTION_VERSION = 3
+SCAN_PROJECTION_VERSION = 4
 SCAN_PROJECTION_TARGET_FULL = "full"
 SCAN_PROJECTION_TARGET_LEFT_HALF = "left_half"
+SCAN_PROJECTION_TARGET_TOP_LEFT_QUARTER = "top_left_quarter"
 DEFAULT_SCAN_PROJECTION_TEXTURE_RESOLUTION = 2048
 DEFAULT_PROJECTION_CAMERA_PERCENTAGES = (17, 17, 17, 17, 16, 16)
 SCAN_PROJECTION_ISLAND_PADDING_PIXELS = 0
 SCAN_PROJECTION_MINIMUM_VISIBLE_FRACTION = 0.5
 SCAN_PROJECTION_VISIBILITY_IMAGE_SIZE = 512
 LEFT_HALF_OUTER_SAFETY_INSET_PIXELS = 4
+TOP_LEFT_QUARTER_OUTER_SAFETY_INSET_PIXELS = 8
 
 
 # ### Processing constants ###
 _TARGET_DOMAINS = frozenset(
-    {SCAN_PROJECTION_TARGET_FULL, SCAN_PROJECTION_TARGET_LEFT_HALF}
+    {
+        SCAN_PROJECTION_TARGET_FULL,
+        SCAN_PROJECTION_TARGET_LEFT_HALF,
+        SCAN_PROJECTION_TARGET_TOP_LEFT_QUARTER,
+    }
 )
 _MINIMUM_TEXTURE_RESOLUTION = 32
 _MAXIMUM_FACE_COUNT = 200_000
 _AREA_EPSILON = 1e-18
 _BARYCENTRIC_EPSILON = 1e-9
-_DESTINATION_PIXELS_PER_GROUP = 2
+_MINIMUM_DESTINATION_CELL_EXTENT_PIXELS = 4
+_DESTINATION_PIXELS_PER_GROUP = (
+    _MINIMUM_DESTINATION_CELL_EXTENT_PIXELS**2
+)
 _MINIMUM_EXPORTED_UV_TOLERANCE = 1e-9
+_CONTINUOUS_EDGE_POSITION_TOLERANCE = 1e-7
+_CONTINUOUS_EDGE_UV_TOLERANCE = 1e-7
 _FALLBACK_CAMERA_INDEX = len(ALL_CAMERA_IDS)
 _CAMERA_AREA_TIE_RELATIVE_TOLERANCE = 1e-6
 _MINIMUM_VISIBILITY_SAMPLES_FOR_CAMERA_ALLOCATION = 4
@@ -78,6 +95,7 @@ class ScanProjectionStats:
     view_face_counts: tuple[int, ...]
     view_pixel_counts: tuple[int, ...]
     face_count: int
+    output_face_count: int
     source_vertex_count: int
     output_vertex_count: int
     texture_resolution: int
@@ -128,6 +146,7 @@ class ScanProjectionStats:
                 )
             },
             "face_count": self.face_count,
+            "output_face_count": self.output_face_count,
             "source_vertex_count": self.source_vertex_count,
             "output_vertex_count": self.output_vertex_count,
             "texture_resolution": self.texture_resolution,
@@ -384,6 +403,7 @@ def scan_project_textured_glb(
             view_face_counts=view_face_counts,
             view_pixel_counts=view_pixel_counts,
             face_count=len(projected_faces),
+            output_face_count=len(placements),
             source_vertex_count=source_vertex_count,
             output_vertex_count=output_vertex_count,
             texture_resolution=normalized_resolution,
@@ -392,9 +412,7 @@ def scan_project_textured_glb(
             target_height=target.height,
             island_padding_pixels=SCAN_PROJECTION_ISLAND_PADDING_PIXELS,
             outer_safety_inset_pixels=(
-                LEFT_HALF_OUTER_SAFETY_INSET_PIXELS
-                if target_domain == SCAN_PROJECTION_TARGET_LEFT_HALF
-                else 0
+                _target_outer_safety_inset_pixels(target_domain)
             ),
             usable_pixel_count=usable_pixel_count,
             covered_pixel_count=covered_pixel_count,
@@ -427,14 +445,34 @@ def _validate_projection_options(
             "Scan-projection texture resolution must be at least "
             f"{_MINIMUM_TEXTURE_RESOLUTION}."
         )
-    if texture_resolution % 2:
-        raise ValueError("Scan-projection texture resolution must be even.")
+    if texture_resolution % SCAN_PROJECTION_LAYOUT_ALIGNMENT_PIXELS:
+        raise ValueError(
+            "Scan-projection texture resolution must be even and divisible "
+            f"by {SCAN_PROJECTION_LAYOUT_ALIGNMENT_PIXELS}."
+        )
+    if (
+        target_domain != SCAN_PROJECTION_TARGET_FULL
+        and texture_resolution
+        % (2 * SCAN_PROJECTION_LAYOUT_ALIGNMENT_PIXELS)
+    ):
+        raise ValueError(
+            "Compact scan-projection texture resolution must be divisible "
+            f"by {2 * SCAN_PROJECTION_LAYOUT_ALIGNMENT_PIXELS}."
+        )
     if (
         target_domain == SCAN_PROJECTION_TARGET_LEFT_HALF
         and texture_resolution // 2
         <= 2 * LEFT_HALF_OUTER_SAFETY_INSET_PIXELS
     ):
         raise ValueError("The left-half safety inset leaves no texture space.")
+    if (
+        target_domain == SCAN_PROJECTION_TARGET_TOP_LEFT_QUARTER
+        and texture_resolution // 2
+        <= 2 * TOP_LEFT_QUARTER_OUTER_SAFETY_INSET_PIXELS
+    ):
+        raise ValueError(
+            "The top-left-quarter safety inset leaves no texture space."
+        )
     return texture_resolution
 
 
@@ -883,12 +921,28 @@ def _select_face_camera(
 
 
 # ### Target layout helpers ###
+def _target_outer_safety_inset_pixels(target_domain: str) -> int:
+    if target_domain == SCAN_PROJECTION_TARGET_LEFT_HALF:
+        return LEFT_HALF_OUTER_SAFETY_INSET_PIXELS
+    if target_domain == SCAN_PROJECTION_TARGET_TOP_LEFT_QUARTER:
+        return TOP_LEFT_QUARTER_OUTER_SAFETY_INSET_PIXELS
+    return 0
+
+
 def _build_target_rectangle(
     texture_resolution: int,
     target_domain: str,
 ) -> _PixelRectangle:
     if target_domain == SCAN_PROJECTION_TARGET_FULL:
         return _PixelRectangle(0, 0, texture_resolution, texture_resolution)
+    if target_domain == SCAN_PROJECTION_TARGET_TOP_LEFT_QUARTER:
+        inset = TOP_LEFT_QUARTER_OUTER_SAFETY_INSET_PIXELS
+        return _PixelRectangle(
+            inset,
+            inset,
+            texture_resolution // 2 - 2 * inset,
+            texture_resolution // 2 - 2 * inset,
+        )
     inset = LEFT_HALF_OUTER_SAFETY_INSET_PIXELS
     return _PixelRectangle(
         inset,
@@ -898,12 +952,33 @@ def _build_target_rectangle(
     )
 
 
+def _validate_aligned_rectangle(
+    rectangle: _PixelRectangle,
+    description: str,
+) -> None:
+    """Require boundaries that survive exact 4-to-1 texture reduction."""
+
+    alignment = SCAN_PROJECTION_LAYOUT_ALIGNMENT_PIXELS
+    values = (
+        rectangle.x,
+        rectangle.y,
+        rectangle.width,
+        rectangle.height,
+    )
+    if any(value % alignment for value in values):
+        raise ValueError(
+            f"The {description} must align to {alignment}-pixel boundaries."
+        )
+
+
 def _build_face_placements(
     faces: Sequence[_ProjectedFace],
     percentages: tuple[int, ...],
     target: _PixelRectangle,
 ) -> list[_FacePlacement]:
     """Allocate capacity-safe camera regions and build triangle placements."""
+
+    _validate_aligned_rectangle(target, "scan target")
 
     camera_faces = tuple(
         tuple(
@@ -924,17 +999,15 @@ def _build_face_placements(
     )
     group_counts = tuple(len(groups) for groups in camera_groups)
     total_group_count = sum(group_counts)
-    required_pixel_count = (
-        total_group_count * _DESTINATION_PIXELS_PER_GROUP
-    )
+    required_pixel_count = total_group_count * _DESTINATION_PIXELS_PER_GROUP
     target_pixel_count = target.width * target.height
     if required_pixel_count > target_pixel_count:
         raise ValueError(
             "The scan atlas cannot represent all face groups: "
             f"{total_group_count} groups require at least "
             f"{required_pixel_count} pixels, but the target contains "
-            f"{target_pixel_count}. Increase the texture resolution or "
-            "reduce the model's face count."
+            f"{target_pixel_count}. Reduce the model's face count before "
+            "texture generation."
         )
     qualified_group_count = sum(group_counts[:_FALLBACK_CAMERA_INDEX])
     effective_percentages = tuple(
@@ -943,22 +1016,27 @@ def _build_face_placements(
     ) + (
         int(bool(group_counts[_FALLBACK_CAMERA_INDEX]) and not qualified_group_count),
     )
-    minimum_band_heights = tuple(
-        math.ceil(
-            group_count
-            * _DESTINATION_PIXELS_PER_GROUP
-            / target.width
+    alignment = SCAN_PROJECTION_LAYOUT_ALIGNMENT_PIXELS
+    horizontal_cell_capacity = (
+        target.width // _MINIMUM_DESTINATION_CELL_EXTENT_PIXELS
+    )
+    minimum_band_height_units = tuple(
+        (
+            math.ceil(group_count / horizontal_cell_capacity)
+            * (_MINIMUM_DESTINATION_CELL_EXTENT_PIXELS // alignment)
         )
         if group_count
         else 0
         for group_count in group_counts
     )
-    if sum(minimum_band_heights) <= target.height:
-        heights = _allocate_bounded_integer_shares(
-            target.height,
+    target_height_units = target.height // alignment
+    if sum(minimum_band_height_units) <= target_height_units:
+        height_units = _allocate_bounded_integer_shares(
+            target_height_units,
             effective_percentages,
-            minimum_band_heights,
+            minimum_band_height_units,
         )
+        heights = tuple(height * alignment for height in height_units)
     else:
         return _build_shared_row_face_placements(
             faces,
@@ -1034,15 +1112,14 @@ def _append_group_placements(
     if len(group.faces) == 1:
         source_fragments = _split_singleton_face(group.faces[0])
     else:
-        source_fragments = tuple(
-            (
-                face,
-                face.source_positions,
-                face.source_normals,
-                face.source_uvs,
-            )
-            for face in group.faces
+        source_fragments = _orient_continuous_face_pair(
+            group.faces[0],
+            group.faces[1],
         )
+        if source_fragments is None:
+            raise RuntimeError(
+                "A scan cell paired faces whose texture edge is discontinuous."
+            )
     destinations = _triangulate_group_rectangle(
         rectangle,
         len(source_fragments),
@@ -1210,6 +1287,72 @@ def _split_singleton_face(
     )
 
 
+def _orient_continuous_face_pair(
+    first: _ProjectedFace,
+    second: _ProjectedFace,
+) -> tuple[
+    tuple[_ProjectedFace, np.ndarray, np.ndarray, np.ndarray],
+    tuple[_ProjectedFace, np.ndarray, np.ndarray, np.ndarray],
+] | None:
+    """Orient adjacent textured faces along one continuous cell diagonal."""
+
+    if first.geometry_name != second.geometry_name:
+        return None
+    cyclic_orders = ((0, 1, 2), (1, 2, 0), (2, 0, 1))
+    for first_order in cyclic_orders:
+        first_positions = first.source_positions[list(first_order)]
+        first_uvs = first.source_uvs[list(first_order)]
+        for second_order in cyclic_orders:
+            second_positions = second.source_positions[list(second_order)]
+            second_uvs = second.source_uvs[list(second_order)]
+            if not _scan_edges_match(
+                first_positions[[0, 2]],
+                first_uvs[[0, 2]],
+                second_positions[[0, 1]],
+                second_uvs[[0, 1]],
+            ):
+                continue
+            return (
+                (
+                    first,
+                    first_positions,
+                    first.source_normals[list(first_order)],
+                    first_uvs,
+                ),
+                (
+                    second,
+                    second_positions,
+                    second.source_normals[list(second_order)],
+                    second_uvs,
+                ),
+            )
+    return None
+
+
+def _scan_edges_match(
+    first_positions: np.ndarray,
+    first_uvs: np.ndarray,
+    second_positions: np.ndarray,
+    second_uvs: np.ndarray,
+) -> bool:
+    """Return whether two equally directed edges share geometry and texels."""
+
+    return bool(
+        np.allclose(
+            first_positions,
+            second_positions,
+            rtol=0.0,
+            atol=_CONTINUOUS_EDGE_POSITION_TOLERANCE,
+        )
+        and np.allclose(
+            first_uvs,
+            second_uvs,
+            rtol=0.0,
+            atol=_CONTINUOUS_EDGE_UV_TOLERANCE,
+        )
+    )
+
+
 def _normalize_interpolated_normal(normal: np.ndarray) -> np.ndarray:
     length = float(np.linalg.norm(normal))
     if length <= _AREA_EPSILON:
@@ -1218,13 +1361,14 @@ def _normalize_interpolated_normal(normal: np.ndarray) -> np.ndarray:
 
 
 def _group_camera_faces(faces: Sequence[_ProjectedFace]) -> list[_FaceGroup]:
-    """Give unequal source faces exact projected-area rectangles.
+    """Give source faces independent, texture-safe projected-area rectangles.
 
     A rectangle diagonal always divides its area equally, so pairing unequal
-    source faces cannot preserve their requested texel ratio. Adjacent faces
-    are paired only when their projected areas are equal within numerical
-    tolerance. Every other triangle owns a rectangle and is split into its
-    existing two texture-preserving fragments to fill that rectangle exactly.
+    source faces cannot preserve their requested texel ratio. Equal faces are
+    paired only when their shared geometric edge also has continuous source
+    UVs. Every other triangle owns a rectangle and is split into two
+    texture-preserving fragments. Consequently no unrelated textures ever
+    meet along the diagonal inside a scan cell.
     """
 
     groups: list[_FaceGroup] = []
@@ -1238,7 +1382,7 @@ def _group_camera_faces(faces: Sequence[_ProjectedFace]) -> list[_FaceGroup]:
                 second.projected_area,
                 rel_tol=_CAMERA_AREA_TIE_RELATIVE_TOLERANCE,
                 abs_tol=_AREA_EPSILON,
-            ):
+            ) and _orient_continuous_face_pair(first, second) is not None:
                 groups.append(
                     _FaceGroup(
                         faces=(first, second),
@@ -1258,27 +1402,26 @@ def _partition_group_rectangles(
     rectangle: _PixelRectangle,
     groups: Sequence[_FaceGroup],
 ) -> list[_PixelRectangle]:
-    """Tile groups in scan rows with two owned pixels per group."""
+    """Tile groups into reduction-aligned cells with safe edge extents."""
 
     if not groups:
         return []
+    _validate_aligned_rectangle(rectangle, "scan region")
     group_count = len(groups)
-    pixel_count = rectangle.width * rectangle.height
-    required_pixel_count = group_count * _DESTINATION_PIXELS_PER_GROUP
-    if required_pixel_count > pixel_count:
+    minimum_extent = _MINIMUM_DESTINATION_CELL_EXTENT_PIXELS
+    groups_per_row = rectangle.width // minimum_extent
+    available_row_count = rectangle.height // minimum_extent
+    group_capacity = groups_per_row * available_row_count
+    if group_count > group_capacity:
+        required_pixel_count = group_count * _DESTINATION_PIXELS_PER_GROUP
         raise ValueError(
             "The scan atlas cannot represent all face groups: "
             f"{group_count} groups require at least {required_pixel_count} "
-            f"pixels, but this region contains {pixel_count}."
+            "reduction-safe pixels, but this region can hold only "
+            f"{group_capacity} groups. Reduce the model's face count before "
+            "texture generation."
         )
 
-    horizontal_capacity = (
-        rectangle.width // _DESTINATION_PIXELS_PER_GROUP
-    ) * rectangle.height
-    if group_count > horizontal_capacity:
-        return _partition_groups_with_overflow_column(rectangle, groups)
-
-    groups_per_row = rectangle.width // _DESTINATION_PIXELS_PER_GROUP
     minimum_row_count = math.ceil(group_count / groups_per_row)
     balanced_row_count = int(
         round(
@@ -1288,7 +1431,7 @@ def _partition_group_rectangles(
         )
     )
     row_count = min(
-        rectangle.height,
+        available_row_count,
         group_count,
         max(minimum_row_count, balanced_row_count, 1),
     )
@@ -1306,18 +1449,24 @@ def _partition_group_rectangles(
         sum(group.weight for _group_index, group in row)
         for row in indexed_rows
     )
-    row_heights = _allocate_bounded_integer_shares(
-        rectangle.height,
+    alignment = SCAN_PROJECTION_LAYOUT_ALIGNMENT_PIXELS
+    minimum_extent_units = minimum_extent // alignment
+    row_height_units = _allocate_bounded_integer_shares(
+        rectangle.height // alignment,
         row_weights,
-        (1,) * row_count,
+        (minimum_extent_units,) * row_count,
     )
+    row_heights = tuple(height * alignment for height in row_height_units)
     output: list[_PixelRectangle | None] = [None] * group_count
     row_y = rectangle.y
     for row, row_height in zip(indexed_rows, row_heights, strict=True):
-        column_widths = _allocate_bounded_integer_shares(
-            rectangle.width,
+        column_width_units = _allocate_bounded_integer_shares(
+            rectangle.width // alignment,
             tuple(group.weight for _group_index, group in row),
-            (_DESTINATION_PIXELS_PER_GROUP,) * len(row),
+            (minimum_extent_units,) * len(row),
+        )
+        column_widths = tuple(
+            width * alignment for width in column_width_units
         )
         column_x = rectangle.x
         for (group_index, _group), column_width in zip(
@@ -1338,90 +1487,17 @@ def _partition_group_rectangles(
     return [item for item in output if item is not None]
 
 
-def _partition_groups_with_overflow_column(
-    rectangle: _PixelRectangle,
-    groups: Sequence[_FaceGroup],
-) -> list[_PixelRectangle]:
-    """Use vertical cells in an odd column at exact horizontal capacity."""
-
-    even_width = rectangle.width - 1
-    horizontal_capacity = (
-        even_width // _DESTINATION_PIXELS_PER_GROUP
-    ) * rectangle.height
-    vertical_group_count = len(groups) - horizontal_capacity
-    vertical_capacity = rectangle.height // _DESTINATION_PIXELS_PER_GROUP
-    if not 0 < vertical_group_count <= vertical_capacity:
-        raise RuntimeError("The mixed scan-cell capacity proof failed.")
-
-    indexed_groups = tuple(enumerate(groups))
-    vertical_indices = {
-        group_index
-        for group_index, _group in sorted(
-            indexed_groups,
-            key=lambda item: (-item[1].weight, item[0]),
-        )[:vertical_group_count]
-    }
-    horizontal_groups = tuple(
-        group
-        for group_index, group in indexed_groups
-        if group_index not in vertical_indices
-    )
-    horizontal_rectangles = _partition_group_rectangles(
-        _PixelRectangle(
-            rectangle.x,
-            rectangle.y,
-            even_width,
-            rectangle.height,
-        ),
-        horizontal_groups,
-    )
-    output: list[_PixelRectangle | None] = [None] * len(groups)
-    horizontal_rectangle_index = 0
-    for group_index, _group in indexed_groups:
-        if group_index in vertical_indices:
-            continue
-        output[group_index] = horizontal_rectangles[
-            horizontal_rectangle_index
-        ]
-        horizontal_rectangle_index += 1
-
-    vertical_rows = tuple(
-        indexed_groups[group_index]
-        for group_index in sorted(vertical_indices)
-    )
-    vertical_heights = _allocate_bounded_integer_shares(
-        rectangle.height,
-        tuple(group.weight for _group_index, group in vertical_rows),
-        (_DESTINATION_PIXELS_PER_GROUP,) * vertical_group_count,
-    )
-    vertical_y = rectangle.y
-    for (group_index, _group), vertical_height in zip(
-        vertical_rows,
-        vertical_heights,
-        strict=True,
-    ):
-        output[group_index] = _PixelRectangle(
-            rectangle.right - 1,
-            vertical_y,
-            1,
-            vertical_height,
-        )
-        vertical_y += vertical_height
-    if any(item is None for item in output):
-        raise RuntimeError("The mixed scan-cell layout lost a face group.")
-    return [item for item in output if item is not None]
-
-
 def _triangulate_group_rectangle(
     rectangle: _PixelRectangle,
     face_count: int,
 ) -> tuple[np.ndarray, ...]:
     if face_count != 2:
         raise RuntimeError("Every scan cell must contain two face fragments.")
-    x0 = float(rectangle.x)
-    y0 = float(rectangle.y)
-    x1 = float(rectangle.right)
-    y1 = float(rectangle.bottom)
+    inset = SCAN_PROJECTION_UV_EDGE_INSET_TEXELS
+    x0 = float(rectangle.x) + inset
+    y0 = float(rectangle.y) + inset
+    x1 = float(rectangle.right) - inset
+    y1 = float(rectangle.bottom) - inset
     top_left = np.asarray((x0, y0), dtype=float)
     top_right = np.asarray((x1, y0), dtype=float)
     bottom_right = np.asarray((x1, y1), dtype=float)
@@ -1638,6 +1714,12 @@ def _apply_face_placements(
                 if source_face_materials is None
                 else np.asarray(output_face_materials, dtype=np.int64)
             ),
+        )
+        rebuilt.metadata[SCAN_PROJECTION_LAYOUT_METADATA_KEY] = (
+            build_scan_projection_layout_metadata(
+                canonical_texture_resolution=texture_resolution,
+                version=SCAN_PROJECTION_VERSION,
+            )
         )
         rebuilt.units = mesh.units
         scene.geometry[geometry.geometry_name] = rebuilt

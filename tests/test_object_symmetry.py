@@ -48,6 +48,9 @@ from housemaker.object_uv_scan_projection import (
     ScanProjectionResult,
     ScanProjectionStats,
 )
+from housemaker.scan_projection_layout import (
+    SCAN_PROJECTION_LAYOUT_METADATA_KEY,
+)
 
 
 # ### Fixture helpers ###
@@ -64,6 +67,7 @@ def _test_symmetric_scan_stats(
         view_face_counts=(1, 0, 0, 0, 0, 0),
         view_pixel_counts=(1_000, 0, 0, 0, 0, 0),
         face_count=1,
+        output_face_count=2,
         source_vertex_count=3,
         output_vertex_count=3,
         texture_resolution=2_048,
@@ -826,6 +830,70 @@ class AutomaticSymmetricDivisionTests(unittest.TestCase):
                 ).to_geometry()
                 output_uvs = np.asarray(output_mesh.visual.uv, dtype=float)
                 self.assertLessEqual(float(np.max(output_uvs[:, 0])), 0.5)
+                output_points = np.column_stack(
+                    (
+                        output_uvs[:, 0] * resolution,
+                        (1.0 - output_uvs[:, 1]) * resolution,
+                    )
+                )
+                np.testing.assert_allclose(
+                    np.mod(output_points, 1.0),
+                    0.5,
+                    rtol=0.0,
+                    atol=1e-6,
+                )
+                output_geometry = next(
+                    iter(
+                        _load_scene(
+                            result.variants.glb_by_resolution[resolution]
+                        ).geometry.values()
+                    )
+                )
+                layout = output_geometry.metadata[
+                    SCAN_PROJECTION_LAYOUT_METADATA_KEY
+                ]
+                self.assertEqual(layout["uv_texture_resolution"], resolution)
+
+    def test_weighted_square_pair_rebuild_from_1024_is_uv_idempotent(
+        self,
+    ) -> None:
+        generated = build_automatic_symmetric_object_variants(
+            _automatic_asymmetric_glb(),
+            "vertical",
+            rng=random.Random(9),
+            projection_camera_percentages=(30, 20, 15, 15, 10, 10),
+        )
+        source_1024 = generated.variants.glb_by_resolution[1024]
+        source_geometry = _load_scene(source_1024).to_geometry()
+
+        rebuilt = build_symmetric_square_pair_texture_variants(
+            source_1024,
+            uvs_already_left_packed=True,
+        )
+
+        rebuilt_geometry = _load_scene(
+            rebuilt.glb_by_resolution[1024]
+        ).to_geometry()
+        np.testing.assert_allclose(
+            np.asarray(rebuilt_geometry.visual.uv),
+            np.asarray(source_geometry.visual.uv),
+            rtol=0.0,
+            atol=1e-7,
+        )
+        for resolution in (512, 1024):
+            geometry = _load_scene(
+                rebuilt.glb_by_resolution[resolution]
+            ).to_geometry()
+            uvs = np.asarray(geometry.visual.uv, dtype=float)
+            points = np.column_stack(
+                (uvs[:, 0] * resolution, (1.0 - uvs[:, 1]) * resolution)
+            )
+            np.testing.assert_allclose(
+                np.mod(points, 1.0),
+                0.5,
+                rtol=0.0,
+                atol=1e-6,
+            )
 
     def test_exact_triangle_tie_uses_the_seeded_random_source(self) -> None:
         source = _box_glb()
@@ -926,6 +994,43 @@ class AutomaticSymmetricDivisionTests(unittest.TestCase):
         self.assertTrue(
             all(call.args[0].shape == (2048, 2048, 4) for call in calls)
         )
+
+    def test_every_symmetric_export_remaps_against_physical_atlas_size(
+        self,
+    ) -> None:
+        cases = (
+            (
+                build_symmetric_square_pair_texture_variants,
+                (512, 1024),
+            ),
+            (
+                build_symmetric_pair_texture_variants,
+                (1024, 2048),
+            ),
+            (
+                build_symmetric_quarter_texture_variants,
+                (1024, 2048),
+            ),
+            (
+                build_symmetric_half_texture_variants,
+                (512, 1024, 2048),
+            ),
+        )
+        for builder, expected_physical_resolutions in cases:
+            with (
+                self.subTest(builder=builder.__name__),
+                mock.patch.object(
+                    object_symmetry,
+                    "remap_scan_projection_scene_uvs",
+                    wraps=object_symmetry.remap_scan_projection_scene_uvs,
+                ) as remap,
+            ):
+                builder(_box_glb())
+
+            self.assertEqual(
+                tuple(call.args[1] for call in remap.call_args_list),
+                expected_physical_resolutions,
+            )
 
     def test_square_pair_preserves_a_packed_1024_operation_source(self) -> None:
         fresh = build_symmetric_square_pair_texture_variants(_box_glb())

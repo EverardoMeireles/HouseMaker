@@ -14,6 +14,8 @@ from PIL import Image
 from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
+from housemaker.scan_projection_layout import remap_scan_projection_scene_uvs
+
 
 # ### Constants ###
 TEXTURE_RESOLUTION_512 = 512
@@ -30,7 +32,11 @@ DEFAULT_TEXTURE_RESOLUTION = TEXTURE_RESOLUTION_1024
 # ### Data models ###
 @dataclass(frozen=True)
 class ObjectTextureVariants:
-    """Three GLBs that differ only in embedded base-color texture size."""
+    """Three exact-resolution GLBs sharing one geometry and material layout.
+
+    Tagged scan-projection atlases use resolution-specific half-texel UV edge
+    insets so linear filtering cannot cross into an unrelated packed cell.
+    """
 
     glb_by_resolution: dict[int, bytes]
     texture_png_by_resolution: dict[int, bytes]
@@ -58,8 +64,9 @@ def build_object_texture_variants(
     Meshy's 2K atlas is the canonical 2048 variant. The 1024 and 512 variants
     are each reduced directly from that canonical image with area resampling.
     ``None`` means that the GLB contains no supported embedded base-color
-    texture. Geometry, scene graph transforms, materials and UV coordinates
-    are retained; only the material images are replaced.
+    texture. Geometry, scene graph transforms and materials are retained.
+    Ordinary UVs remain unchanged; tagged scan-projection UV bounds receive
+    the half-texel inset required by each output resolution.
     """
 
     payload = bytes(glb_bytes)
@@ -81,7 +88,11 @@ def build_object_texture_variants_from_texture(
     glb_bytes: bytes,
     texture_png: bytes,
 ) -> ObjectTextureVariants:
-    """Replace one shared 2048 atlas without changing geometry or UVs."""
+    """Replace one shared 2048 atlas and build resolution-safe variants.
+
+    Geometry stays fixed. Ordinary UVs remain unchanged, while tagged scan
+    UV bounds receive the exact half-texel inset for each output resolution.
+    """
 
     payload = bytes(glb_bytes)
     if not payload:
@@ -150,7 +161,7 @@ def _build_variants_from_scene(
     texture_2048: np.ndarray,
     material_texture_count: int,
 ) -> ObjectTextureVariants:
-    """Build every exact-resolution artifact from one owned 2048 atlas."""
+    """Build exact-resolution images and matching resolution-safe GLBs."""
 
     texture_1024 = _resize_rgba(
         texture_2048,
@@ -171,6 +182,7 @@ def _build_variants_from_scene(
     glb_by_resolution: dict[int, bytes] = {}
     for resolution in TEXTURE_RESOLUTIONS:
         variant_scene = copy.deepcopy(scene)
+        remap_scan_projection_scene_uvs(variant_scene, resolution)
         _replace_material_textures(
             variant_scene,
             textures_by_resolution[resolution],

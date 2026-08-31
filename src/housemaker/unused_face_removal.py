@@ -1,6 +1,8 @@
 # ### Imports ###
 from __future__ import annotations
 
+import math
+import operator
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from io import BytesIO
@@ -40,12 +42,19 @@ DEFAULT_CAPTURE_IMAGE_SIZE = 256
 MIN_CAPTURE_IMAGE_SIZE = 32
 MAX_CAPTURE_IMAGE_SIZE = 1024
 DEFAULT_MAX_FACE_COUNT = 200_000
-MAX_FACE_ID_COLOR_COUNT = (1 << 24) - 1
+MAX_SUPPORTED_FACE_COUNT = (1 << 24) - 1
 DEFAULT_PROGRESS_INTERVAL_FACES = 128
+DEFAULT_MINIMUM_VISIBLE_FRACTION = 0.05
+DEFAULT_MINIMUM_PROJECTED_SAMPLES = 4
 CAMERA_FRAME_MARGIN_RATIO = 0.05
 MINIMUM_CAMERA_EXTENT = 1e-9
 DEPTH_EPSILON_RATIO = 1e-9
 MINIMUM_DEPTH_EPSILON = 1e-12
+RASTER_AREA_EPSILON = 1e-18
+BARYCENTRIC_EPSILON = 1e-9
+STACK_NORMAL_ALIGNMENT_COSINE = 0.995
+STACK_MINIMUM_OCCLUDED_FRACTION = 0.95
+STACK_MAXIMUM_DEPTH_GAP_RATIO = 0.005
 
 
 # ### Callback types ###
@@ -62,10 +71,28 @@ class UnusedFaceRemovalOptions:
     image_size: int = DEFAULT_CAPTURE_IMAGE_SIZE
     max_face_count: int = DEFAULT_MAX_FACE_COUNT
     progress_interval_faces: int = DEFAULT_PROGRESS_INTERVAL_FACES
+    minimum_visible_fraction: float = DEFAULT_MINIMUM_VISIBLE_FRACTION
+    minimum_projected_samples: int = DEFAULT_MINIMUM_PROJECTED_SAMPLES
 
     def __post_init__(self) -> None:
         normalized_camera_ids = _normalize_camera_ids(self.enabled_camera_ids)
         object.__setattr__(self, "enabled_camera_ids", normalized_camera_ids)
+        minimum_visible_fraction = _normalize_minimum_visible_fraction(
+            self.minimum_visible_fraction
+        )
+        minimum_projected_samples = _normalize_minimum_projected_samples(
+            self.minimum_projected_samples
+        )
+        object.__setattr__(
+            self,
+            "minimum_visible_fraction",
+            minimum_visible_fraction,
+        )
+        object.__setattr__(
+            self,
+            "minimum_projected_samples",
+            minimum_projected_samples,
+        )
         _validate_processing_bounds(
             image_size=self.image_size,
             max_face_count=self.max_face_count,
@@ -93,6 +120,8 @@ class UnusedFaceRemovalResult:
     retained_face_count: int
     removed_face_count: int
     protected_face_count: int
+    visibility_removed_face_count: int = 0
+    stacked_face_removed_count: int = 0
 
     @property
     def glb_bytes(self) -> bytes:
@@ -137,15 +166,12 @@ class _MeshInstance:
 
 
 @dataclass(frozen=True)
-class _FaceChangeSample:
-    before_bgr: np.ndarray
-    after_bgr: np.ndarray
-
-
-@dataclass(frozen=True)
 class _CameraCapture:
     camera_id: str
-    face_samples: dict[int, _FaceChangeSample]
+    projected_sample_counts: np.ndarray
+    visible_sample_counts: np.ndarray
+    top_depth: np.ndarray
+    top_faces: np.ndarray
 
 
 # ### Camera definitions ###
@@ -252,7 +278,10 @@ def capture_visible_face_indices(
         cancel_requested=cancel_requested,
         progress_interval_faces=normalized_progress_interval,
     )
-    return frozenset(capture.face_samples)
+    return frozenset(
+        int(face_index)
+        for face_index in np.flatnonzero(capture.visible_sample_counts > 0)
+    )
 
 
 # ### Public processing API ###
@@ -284,12 +313,11 @@ def remove_unused_faces_from_glb(
 ) -> UnusedFaceRemovalResult:
     """Return a self-contained GLB after conservative six-view face removal.
 
-    Each capture stores a face-ID image rather than a beauty render. This is
-    deliberately conservative: deleting any raster-visible triangle changes
-    at least one OpenCV pixel even when two materials happen to share a color.
-    Faces that do not own a pixel in any checked view are removed. Because a
-    visible face is always retained, removing hidden faces cannot expose
-    another candidate during the same operation.
+    Each capture measures exact projected pixel-center coverage and top-depth
+    ownership rather than material color. A face must have meaningful coverage
+    and meet the configured visible fraction in at least one selected view. A
+    separate, conservative pass removes same-facing, near-coplanar wafer layers
+    that are almost completely covered by a parallel face.
     """
 
     normalized_options = options or UnusedFaceRemovalOptions()
@@ -337,32 +365,53 @@ def remove_unused_faces_from_glb(
             camera_id=camera_id,
         )
 
-    keep_faces = np.zeros(total_face_count, dtype=bool)
     _report_progress(
         progress_callback,
         stage="checking",
         completed_face_count=0,
         total_face_count=total_face_count,
     )
-    for face_index in range(total_face_count):
-        if face_index % normalized_options.progress_interval_faces == 0:
-            _raise_if_cancelled(cancel_requested)
-            _report_progress(
-                progress_callback,
-                stage="checking",
-                completed_face_count=face_index,
-                total_face_count=total_face_count,
-            )
-        keep_faces[face_index] = any(
-            _sample_changes_frame(capture.face_samples.get(face_index))
-            for capture in captures
-        )
-
+    visibility_keep_faces = _build_visibility_keep_mask(
+        captures,
+        minimum_visible_fraction=(
+            normalized_options.minimum_visible_fraction
+        ),
+        minimum_projected_samples=(
+            normalized_options.minimum_projected_samples
+        ),
+    )
+    stacked_faces = _find_stacked_faces(
+        vertices=vertices,
+        faces=faces,
+        captures=captures,
+        image_size=normalized_options.image_size,
+        minimum_projected_samples=(
+            normalized_options.minimum_projected_samples
+        ),
+        cancel_requested=cancel_requested,
+        progress_interval_faces=(
+            normalized_options.progress_interval_faces
+        ),
+    )
+    keep_faces = visibility_keep_faces & ~stacked_faces
+    _report_progress(
+        progress_callback,
+        stage="checking",
+        completed_face_count=total_face_count,
+        total_face_count=total_face_count,
+    )
     retained_face_count = int(np.count_nonzero(keep_faces))
+    visibility_removed_face_count = int(
+        np.count_nonzero(~visibility_keep_faces)
+    )
+    stacked_face_removed_count = int(
+        np.count_nonzero(visibility_keep_faces & stacked_faces)
+    )
     if retained_face_count == 0:
         raise ValueError(
             "Unused-face removal would remove every face; increase the "
-            "capture resolution or select additional cameras."
+            "capture resolution, lower the minimum visible percentage, or "
+            "select additional cameras."
         )
     _raise_if_cancelled(cancel_requested)
     _report_progress(
@@ -390,6 +439,8 @@ def remove_unused_faces_from_glb(
         retained_face_count=retained_face_count,
         removed_face_count=total_face_count - retained_face_count,
         protected_face_count=retained_face_count,
+        visibility_removed_face_count=visibility_removed_face_count,
+        stacked_face_removed_count=stacked_face_removed_count,
     )
 
 
@@ -479,9 +530,9 @@ def _capture_camera(
         image_size,
     )
     top_depth = np.full((image_size, image_size), -np.inf, dtype=np.float64)
-    second_depth = np.full((image_size, image_size), -np.inf, dtype=np.float64)
     top_faces = np.full((image_size, image_size), -1, dtype=np.int32)
-    second_faces = np.full((image_size, image_size), -1, dtype=np.int32)
+    projected_sample_counts = np.zeros(len(faces), dtype=np.int64)
+    visible_sample_counts = np.zeros(len(faces), dtype=np.int64)
     bounds_diagonal = float(np.linalg.norm(np.ptp(vertices, axis=0)))
     depth_epsilon = max(
         bounds_diagonal * DEPTH_EPSILON_RATIO,
@@ -490,19 +541,37 @@ def _capture_camera(
     for face_index, face in enumerate(faces):
         if face_index % progress_interval_faces == 0:
             _raise_if_cancelled(cancel_requested)
-        _rasterize_face_depth_layers(
-            face_index=face_index,
-            screen_points=screen_vertices[face],
+        screen_points = screen_vertices[face]
+        rows, columns, sample_depths = _rasterize_face_samples(
+            screen_points=screen_points,
             depths=vertex_depths[face],
-            top_depth=top_depth,
-            second_depth=second_depth,
-            top_faces=top_faces,
-            second_faces=second_faces,
-            depth_epsilon=depth_epsilon,
+            image_shape=top_faces.shape,
         )
+        projected_sample_counts[face_index] = len(rows)
+        if not len(rows):
+            continue
+        current_depths = top_depth[rows, columns]
+        becomes_top = sample_depths > current_depths + depth_epsilon
+        if not np.any(becomes_top):
+            continue
+        selected_rows = rows[becomes_top]
+        selected_columns = columns[becomes_top]
+        previous_owners = top_faces[selected_rows, selected_columns]
+        replaced_owners, replaced_counts = np.unique(
+            previous_owners[previous_owners >= 0],
+            return_counts=True,
+        )
+        if len(replaced_owners):
+            visible_sample_counts[replaced_owners] -= replaced_counts
+        visible_sample_counts[face_index] += len(selected_rows)
+        top_depth[selected_rows, selected_columns] = sample_depths[becomes_top]
+        top_faces[selected_rows, selected_columns] = face_index
     return _CameraCapture(
         camera_id=definition.camera_id,
-        face_samples=_build_face_change_samples(top_faces, second_faces),
+        projected_sample_counts=projected_sample_counts,
+        visible_sample_counts=visible_sample_counts,
+        top_depth=top_depth,
+        top_faces=top_faces,
     )
 
 
@@ -533,32 +602,29 @@ def _project_vertices(
     return screen_vertices, depths
 
 
-def _rasterize_face_depth_layers(
+# ### Exact raster helpers ###
+def _rasterize_face_samples(
     *,
-    face_index: int,
     screen_points: np.ndarray,
     depths: np.ndarray,
-    top_depth: np.ndarray,
-    second_depth: np.ndarray,
-    top_faces: np.ndarray,
-    second_faces: np.ndarray,
-    depth_epsilon: float,
-) -> None:
-    image_height, image_width = top_faces.shape
+    image_shape: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return only pixel centers inside the original projected triangle."""
+
+    image_height, image_width = image_shape
     minimum_x = max(0, int(np.floor(np.min(screen_points[:, 0]))))
     maximum_x = min(image_width - 1, int(np.ceil(np.max(screen_points[:, 0]))))
     minimum_y = max(0, int(np.floor(np.min(screen_points[:, 1]))))
     maximum_y = min(image_height - 1, int(np.ceil(np.max(screen_points[:, 1]))))
     if maximum_x < minimum_x or maximum_y < minimum_y:
-        return
+        return _empty_face_samples()
 
-    first, second, third = screen_points
-    denominator = (
-        (second[1] - third[1]) * (first[0] - third[0])
-        + (third[0] - second[0]) * (first[1] - third[1])
+    denominator = _cross_2d(
+        screen_points[1] - screen_points[0],
+        screen_points[2] - screen_points[0],
     )
-    if abs(float(denominator)) <= np.finfo(float).eps:
-        return
+    if abs(denominator) <= RASTER_AREA_EPSILON:
+        return _empty_face_samples()
 
     mask = np.zeros(
         (maximum_y - minimum_y + 1, maximum_x - minimum_x + 1),
@@ -568,95 +634,207 @@ def _rasterize_face_depth_layers(
         screen_points - np.array([minimum_x, minimum_y], dtype=float)
     ).astype(np.int32)
     cv2.fillConvexPoly(mask, local_polygon, 255, lineType=cv2.LINE_8)
-    local_y, local_x = np.nonzero(mask)
-    if len(local_x) == 0:
-        return
-    pixel_x = local_x.astype(float) + minimum_x
-    pixel_y = local_y.astype(float) + minimum_y
-    first_weight = (
-        (second[1] - third[1]) * (pixel_x - third[0])
-        + (third[0] - second[0]) * (pixel_y - third[1])
+    mask = cv2.dilate(mask, None, iterations=1)
+    local_rows, local_columns = np.nonzero(mask)
+    if not len(local_columns):
+        return _empty_face_samples()
+    rows = local_rows.astype(np.int64) + minimum_y
+    columns = local_columns.astype(np.int64) + minimum_x
+    sample_points = np.column_stack(
+        (columns.astype(float) + 0.5, rows.astype(float) + 0.5)
+    )
+    barycentric = _triangle_barycentric_weights(sample_points, screen_points)
+    inside = np.all(barycentric >= -BARYCENTRIC_EPSILON, axis=1)
+    inside &= np.all(barycentric <= 1.0 + BARYCENTRIC_EPSILON, axis=1)
+    if not np.any(inside):
+        return _empty_face_samples()
+    return (
+        rows[inside],
+        columns[inside],
+        barycentric[inside] @ depths,
+    )
+
+
+def _empty_face_samples() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    return (
+        np.empty(0, dtype=np.int64),
+        np.empty(0, dtype=np.int64),
+        np.empty(0, dtype=float),
+    )
+
+
+def _triangle_barycentric_weights(
+    points: np.ndarray,
+    triangle: np.ndarray,
+) -> np.ndarray:
+    first = triangle[0]
+    second = triangle[1]
+    third = triangle[2]
+    denominator = _cross_2d(second - first, third - first)
+    first_weights = (
+        (second[0] - points[:, 0]) * (third[1] - points[:, 1])
+        - (second[1] - points[:, 1]) * (third[0] - points[:, 0])
     ) / denominator
-    second_weight = (
-        (third[1] - first[1]) * (pixel_x - third[0])
-        + (first[0] - third[0]) * (pixel_y - third[1])
+    second_weights = (
+        (third[0] - points[:, 0]) * (first[1] - points[:, 1])
+        - (third[1] - points[:, 1]) * (first[0] - points[:, 0])
     ) / denominator
-    third_weight = 1.0 - first_weight - second_weight
-    interpolated_depth = (
-        first_weight * depths[0]
-        + second_weight * depths[1]
-        + third_weight * depths[2]
-    )
-    pixel_y_indices = local_y + minimum_y
-    pixel_x_indices = local_x + minimum_x
-    current_top_depth = top_depth[pixel_y_indices, pixel_x_indices]
-    current_second_depth = second_depth[pixel_y_indices, pixel_x_indices]
-
-    becomes_top = interpolated_depth > current_top_depth + depth_epsilon
-    if np.any(becomes_top):
-        top_y = pixel_y_indices[becomes_top]
-        top_x = pixel_x_indices[becomes_top]
-        second_depth[top_y, top_x] = current_top_depth[becomes_top]
-        second_faces[top_y, top_x] = top_faces[top_y, top_x]
-        top_depth[top_y, top_x] = interpolated_depth[becomes_top]
-        top_faces[top_y, top_x] = face_index
-
-    remains_below_top = ~becomes_top
-    becomes_second = remains_below_top & (
-        interpolated_depth > current_second_depth + depth_epsilon
-    )
-    if np.any(becomes_second):
-        second_y = pixel_y_indices[becomes_second]
-        second_x = pixel_x_indices[becomes_second]
-        second_depth[second_y, second_x] = interpolated_depth[becomes_second]
-        second_faces[second_y, second_x] = face_index
+    third_weights = 1.0 - first_weights - second_weights
+    return np.column_stack((first_weights, second_weights, third_weights))
 
 
-def _build_face_change_samples(
-    top_faces: np.ndarray,
-    second_faces: np.ndarray,
-) -> dict[int, _FaceChangeSample]:
-    flattened_top = top_faces.reshape(-1)
-    visible_pixels = np.flatnonzero(flattened_top >= 0)
-    if len(visible_pixels) == 0:
-        return {}
-    visible_face_ids, first_occurrences = np.unique(
-        flattened_top[visible_pixels],
-        return_index=True,
-    )
-    sample_pixels = visible_pixels[first_occurrences]
-    underlying_face_ids = second_faces.reshape(-1)[sample_pixels]
-    return {
-        int(face_id): _FaceChangeSample(
-            before_bgr=_encode_face_id_bgr(int(face_id)),
-            after_bgr=_encode_face_id_bgr(int(underlying_face_id)),
+def _cross_2d(first: np.ndarray, second: np.ndarray) -> float:
+    return float(first[0] * second[1] - first[1] * second[0])
+
+
+# ### Visibility classification helpers ###
+def _build_visibility_keep_mask(
+    captures: Sequence[_CameraCapture],
+    *,
+    minimum_visible_fraction: float,
+    minimum_projected_samples: int,
+) -> np.ndarray:
+    """Keep measured visible faces and protect genuine subpixel projections."""
+
+    if not captures:
+        return np.empty(0, dtype=bool)
+    face_count = len(captures[0].projected_sample_counts)
+    has_meaningful_projection = np.zeros(face_count, dtype=bool)
+    has_visible_sample = np.zeros(face_count, dtype=bool)
+    qualifies_as_visible = np.zeros(face_count, dtype=bool)
+    for capture in captures:
+        projected = capture.projected_sample_counts
+        visible = capture.visible_sample_counts
+        meaningful = projected >= minimum_projected_samples
+        has_meaningful_projection |= meaningful
+        has_visible_sample |= visible > 0
+        qualifies_as_visible |= (
+            meaningful
+            & (visible > 0)
+            & (
+                visible.astype(float)
+                >= projected.astype(float) * minimum_visible_fraction
+            )
         )
-        for face_id, underlying_face_id in zip(
-            visible_face_ids,
-            underlying_face_ids,
-        )
-    }
+    unmeasurable_subpixel = ~has_meaningful_projection & has_visible_sample
+    return qualifies_as_visible | unmeasurable_subpixel
 
 
-def _encode_face_id_bgr(face_id: int) -> np.ndarray:
-    encoded_id = int(face_id) + 1
-    if encoded_id < 0 or encoded_id > MAX_FACE_ID_COLOR_COUNT:
-        raise ValueError("Face ID cannot be encoded in a capture frame.")
-    return np.asarray(
+# ### Stacked-layer helpers ###
+def _find_stacked_faces(
+    *,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    captures: Sequence[_CameraCapture],
+    image_size: int,
+    minimum_projected_samples: int,
+    cancel_requested: CancelCallback | None,
+    progress_interval_faces: int,
+) -> np.ndarray:
+    """Find same-facing wafer layers hidden by a nearby parallel surface."""
+
+    face_count = len(faces)
+    stacked_faces = np.zeros(face_count, dtype=bool)
+    if face_count == 0 or not captures:
+        return stacked_faces
+    face_normals, normal_is_reliable = _build_face_unit_normals(
+        vertices,
+        faces,
+    )
+    camera_directions = np.asarray(
         [
-            encoded_id & 0xFF,
-            (encoded_id >> 8) & 0xFF,
-            (encoded_id >> 16) & 0xFF,
+            _CAMERA_DEFINITIONS[camera_id].depth_axis
+            for camera_id in ALL_CAMERA_IDS
         ],
-        dtype=np.uint8,
-    ).reshape(1, 1, 3)
+        dtype=float,
+    )
+    camera_alignment = face_normals @ camera_directions.T
+    dominant_camera_indices = np.argmax(camera_alignment, axis=1)
+    dominant_camera_indices[~normal_is_reliable] = -1
+    capture_by_id = {capture.camera_id: capture for capture in captures}
+    bounds_diagonal = float(np.linalg.norm(np.ptp(vertices, axis=0)))
+    depth_epsilon = max(
+        bounds_diagonal * DEPTH_EPSILON_RATIO,
+        MINIMUM_DEPTH_EPSILON,
+    )
+    maximum_depth_gap = max(
+        bounds_diagonal * STACK_MAXIMUM_DEPTH_GAP_RATIO,
+        depth_epsilon,
+    )
+    checked_face_count = 0
+    for camera_index, camera_id in enumerate(ALL_CAMERA_IDS):
+        capture = capture_by_id.get(camera_id)
+        if capture is None:
+            continue
+        definition = _CAMERA_DEFINITIONS[camera_id]
+        screen_vertices, vertex_depths = _project_vertices(
+            vertices,
+            definition,
+            image_size,
+        )
+        candidate_indices = np.flatnonzero(
+            dominant_camera_indices == camera_index
+        )
+        for face_index in candidate_indices:
+            if checked_face_count % progress_interval_faces == 0:
+                _raise_if_cancelled(cancel_requested)
+            checked_face_count += 1
+            face = faces[face_index]
+            rows, columns, sample_depths = _rasterize_face_samples(
+                screen_points=screen_vertices[face],
+                depths=vertex_depths[face],
+                image_shape=capture.top_faces.shape,
+            )
+            if len(rows) < minimum_projected_samples:
+                continue
+            top_face_indices = capture.top_faces[rows, columns]
+            occluded = (
+                (top_face_indices >= 0)
+                & (top_face_indices != face_index)
+            )
+            if not np.any(occluded):
+                continue
+            occluded_positions = np.flatnonzero(occluded)
+            occluder_indices = top_face_indices[occluded_positions]
+            normal_alignment = (
+                face_normals[occluder_indices] @ face_normals[face_index]
+            )
+            depth_gaps = (
+                capture.top_depth[
+                    rows[occluded_positions],
+                    columns[occluded_positions],
+                ]
+                - sample_depths[occluded_positions]
+            )
+            qualifying_occlusion = (
+                normal_alignment >= STACK_NORMAL_ALIGNMENT_COSINE
+            ) & (depth_gaps >= -depth_epsilon) & (
+                depth_gaps <= maximum_depth_gap
+            )
+            if (
+                np.count_nonzero(qualifying_occlusion) / len(rows)
+                >= STACK_MINIMUM_OCCLUDED_FRACTION
+            ):
+                stacked_faces[face_index] = True
+    return stacked_faces
 
 
-def _sample_changes_frame(sample: _FaceChangeSample | None) -> bool:
-    if sample is None:
-        return False
-    pixel_difference = cv2.absdiff(sample.before_bgr, sample.after_bgr)
-    return bool(cv2.countNonZero(pixel_difference.reshape(-1, 1)))
+def _build_face_unit_normals(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    triangles = vertices[faces]
+    weighted_normals = np.cross(
+        triangles[:, 1] - triangles[:, 0],
+        triangles[:, 2] - triangles[:, 0],
+    )
+    magnitudes = np.linalg.norm(weighted_normals, axis=1)
+    reliable = magnitudes > np.finfo(float).eps
+    unit_normals = np.zeros_like(weighted_normals, dtype=float)
+    unit_normals[reliable] = (
+        weighted_normals[reliable] / magnitudes[reliable, np.newaxis]
+    )
+    return unit_normals, reliable
 
 
 # ### Export helpers ###
@@ -732,6 +910,37 @@ def _normalize_camera_ids(camera_ids: Iterable[str]) -> tuple[str, ...]:
     return normalized_camera_ids
 
 
+def _normalize_minimum_visible_fraction(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            "Unused-face minimum visible fraction must be a number."
+        )
+    normalized = float(value)
+    if not math.isfinite(normalized) or not 0.0 <= normalized <= 1.0:
+        raise ValueError(
+            "Unused-face minimum visible fraction must be between 0 and 1."
+        )
+    return normalized
+
+
+def _normalize_minimum_projected_samples(value: object) -> int:
+    if isinstance(value, bool):
+        raise ValueError(
+            "Unused-face minimum projected samples must be a positive integer."
+        )
+    try:
+        normalized = operator.index(value)
+    except TypeError as error:
+        raise ValueError(
+            "Unused-face minimum projected samples must be a positive integer."
+        ) from error
+    if normalized < 1:
+        raise ValueError(
+            "Unused-face minimum projected samples must be a positive integer."
+        )
+    return int(normalized)
+
+
 def _validate_processing_bounds(
     *,
     image_size: int,
@@ -743,10 +952,10 @@ def _validate_processing_bounds(
             "Unused-face capture size must be between "
             f"{MIN_CAPTURE_IMAGE_SIZE} and {MAX_CAPTURE_IMAGE_SIZE} pixels."
         )
-    if not 1 <= int(max_face_count) <= MAX_FACE_ID_COLOR_COUNT:
+    if not 1 <= int(max_face_count) <= MAX_SUPPORTED_FACE_COUNT:
         raise ValueError(
             "Unused-face maximum face count must be between 1 and "
-            f"{MAX_FACE_ID_COLOR_COUNT}."
+            f"{MAX_SUPPORTED_FACE_COUNT}."
         )
     if int(progress_interval_faces) < 1:
         raise ValueError("Progress interval must contain at least one face.")

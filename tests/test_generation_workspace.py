@@ -49,6 +49,7 @@ from housemaker.generation_workspace import (
     VISIBILITY_UV_UNWRAP_PIPELINE_KEY,
     _ObjectGenerationProgressMapper,
     _GenerationCancelled,
+    _build_geometry_fingerprint,
     _build_staged_generation_pipeline_metadata,
     _build_texture_resolution_entries,
     _format_model_statistics,
@@ -89,8 +90,10 @@ _qt_application = QApplication.instance() or QApplication([])
 
 
 # ### Fixture helpers ###
-def _test_model() -> GeneratedModel:
-    mesh = trimesh.creation.box(extents=(1.0, 0.5, 0.75))
+def _test_model(
+    extents: tuple[float, float, float] = (1.0, 0.5, 0.75),
+) -> GeneratedModel:
+    mesh = trimesh.creation.box(extents=extents)
     scene = trimesh.Scene(mesh)
     return GeneratedModel(
         mesh=mesh,
@@ -170,6 +173,7 @@ def _test_scan_projection_stats() -> ScanProjectionStats:
         view_face_counts=(2, 2, 2, 2, 2, 2),
         view_pixel_counts=(170, 170, 170, 170, 160, 160),
         face_count=12,
+        output_face_count=12,
         source_vertex_count=8,
         output_vertex_count=36,
         texture_resolution=2_048,
@@ -516,6 +520,26 @@ class GenerationMaskViewTests(unittest.TestCase):
 
 # ### Meshy-adapter tests ###
 class MeshyGenerationAdapterTests(unittest.TestCase):
+    def test_geometry_fingerprint_ignores_face_order_but_detects_surface_change(
+        self,
+    ) -> None:
+        source = _test_model()
+        reordered_mesh = source.mesh.copy()
+        reordered_mesh.faces = reordered_mesh.faces[::-1, ::-1]
+        reordered_glb = bytes(
+            trimesh.Scene(reordered_mesh).export(file_type="glb")
+        )
+        changed = _test_model((1.01, 0.5, 0.75))
+
+        self.assertEqual(
+            _build_geometry_fingerprint(source.glb_bytes),
+            _build_geometry_fingerprint(reordered_glb),
+        )
+        self.assertNotEqual(
+            _build_geometry_fingerprint(source.glb_bytes),
+            _build_geometry_fingerprint(changed.glb_bytes),
+        )
+
     def test_staged_progress_reserves_separate_geometry_and_texture_phases(
         self,
     ) -> None:
@@ -944,6 +968,14 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
             removed_face_count=2,
             protected_face_count=10,
         )
+        final_removal_result = UnusedFaceRemovalResult(
+            model=textured_model,
+            enabled_camera_ids=ALL_CAMERA_IDS,
+            original_face_count=12,
+            retained_face_count=12,
+            removed_face_count=0,
+            protected_face_count=12,
+        )
 
         with (
             patch(
@@ -952,7 +984,7 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
             ) as image_to_3d,
             patch(
                 "housemaker.generation_workspace.remove_unused_faces_from_glb",
-                return_value=removal_result,
+                side_effect=(removal_result, final_removal_result),
             ) as removal_mock,
             patch(
                 "housemaker.generation_workspace.scan_project_textured_glb",
@@ -965,7 +997,17 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
             result = MeshyImagePlanner().plan(request)
 
         self.assertFalse(image_to_3d.call_args.kwargs["should_texture"])
-        removal_mock.assert_called_once()
+        self.assertEqual(removal_mock.call_count, 2)
+        self.assertEqual(
+            removal_mock.call_args_list[1].args[0],
+            textured_model.glb_bytes,
+        )
+        self.assertEqual(
+            removal_mock.call_args_list[0].kwargs[
+                "options"
+            ].minimum_visible_fraction,
+            0.05,
+        )
         scan_projection.assert_not_called()
         retexture.assert_called_once()
         self.assertEqual(
@@ -978,6 +1020,9 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
         self.assertEqual(result.removed_face_count, 2)
         self.assertEqual(result.glb_bytes, textured_model.glb_bytes)
         self.assertEqual(result.postprocessed_glb_bytes, retained_model.glb_bytes)
+        self.assertTrue(result.final_face_removal_applied)
+        self.assertEqual(result.final_removed_face_count, 0)
+        self.assertFalse(result.retexture_topology_changed)
         self.assertIsNone(result.scan_projection_stats)
 
     def test_staged_planner_generates_geometry_removes_faces_then_textures(
@@ -992,11 +1037,23 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
                 meshy_api_key="meshy-staged-key",
                 meshy_target_polycount=5_400,
                 unused_face_removal=True,
+                minimum_face_visibility_percentage=7,
             ),
         )
         geometry_model = _test_model()
         processed_model = _test_model()
-        final_model = _test_model()
+        final_model = _test_model((1.05, 0.5, 0.75))
+        final_cleaned_mesh = final_model.mesh.copy()
+        final_cleaned_mesh.update_faces(
+            np.arange(len(final_cleaned_mesh.faces) - 1)
+        )
+        final_cleaned_mesh.remove_unreferenced_vertices()
+        final_cleaned_scene = trimesh.Scene(final_cleaned_mesh)
+        final_cleaned_model = GeneratedModel(
+            mesh=final_cleaned_mesh,
+            scene=final_cleaned_scene,
+            glb_bytes=bytes(final_cleaned_scene.export(file_type="glb")),
+        )
         geometry_result = MeshyGenerationResult(
             task_id="geometry-task",
             glb_bytes=geometry_model.glb_bytes,
@@ -1015,6 +1072,15 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
             removed_face_count=3,
             protected_face_count=9,
         )
+        final_removal_result = UnusedFaceRemovalResult(
+            model=final_cleaned_model,
+            enabled_camera_ids=ALL_CAMERA_IDS,
+            original_face_count=12,
+            retained_face_count=11,
+            removed_face_count=1,
+            protected_face_count=11,
+            visibility_removed_face_count=1,
+        )
         image_calls: list[dict[str, object]] = []
         removal_calls: list[tuple[bytes, dict[str, object]]] = []
         texture_calls: list[dict[str, object]] = []
@@ -1029,7 +1095,11 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
             **kwargs: object,
         ) -> UnusedFaceRemovalResult:
             removal_calls.append((glb_bytes, kwargs))
-            return removal_result
+            return (
+                removal_result
+                if len(removal_calls) == 1
+                else final_removal_result
+            )
 
         def fake_retexture_request(**kwargs: object) -> MeshyGenerationResult:
             texture_calls.append(kwargs)
@@ -1059,11 +1129,17 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
         self.assertFalse(image_calls[0]["should_texture"])
         self.assertEqual(image_calls[0]["target_polycount"], 5_400)
         self.assertEqual(removal_calls[0][0], geometry_model.glb_bytes)
+        self.assertEqual(removal_calls[1][0], final_model.glb_bytes)
         removal_options = removal_calls[0][1]["options"]
         self.assertEqual(
             removal_options.enabled_camera_ids,  # type: ignore[union-attr]
             ALL_CAMERA_IDS,
         )
+        self.assertEqual(
+            removal_options.minimum_visible_fraction,  # type: ignore[union-attr]
+            0.07,
+        )
+        self.assertIs(removal_calls[1][1]["options"], removal_options)
         self.assertEqual(
             texture_calls[0]["model_glb"],
             processed_model.glb_bytes,
@@ -1085,6 +1161,12 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
             processed_model.glb_bytes,
         )
         self.assertEqual(result.removed_face_count, 3)
+        self.assertEqual(result.minimum_face_visibility_percentage, 7)
+        self.assertTrue(result.final_face_removal_applied)
+        self.assertEqual(result.final_removed_face_count, 1)
+        self.assertEqual(result.final_visibility_removed_face_count, 1)
+        self.assertTrue(result.retexture_topology_changed)
+        self.assertEqual(result.glb_bytes, final_removal_result.glb_bytes)
         self.assertIn("Submitting geometry-only Meshy task...", progress_messages)
 
     def test_staged_planner_stops_before_retexture_on_removal_cancellation(

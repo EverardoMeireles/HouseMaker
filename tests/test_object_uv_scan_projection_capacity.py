@@ -12,9 +12,9 @@ from trimesh.visual.texture import TextureVisuals
 
 from housemaker.object_uv_scan_projection import (
     _BARYCENTRIC_EPSILON,
-    _DESTINATION_PIXELS_PER_GROUP,
     SCAN_PROJECTION_TARGET_FULL,
     SCAN_PROJECTION_TARGET_LEFT_HALF,
+    SCAN_PROJECTION_TARGET_TOP_LEFT_QUARTER,
     _FaceGroup,
     _PixelRectangle,
     _ProjectedFace,
@@ -152,17 +152,15 @@ def _assert_dense_layout(
 def test_scan_row_tiler_never_rejects_a_group_set_that_fits(seed: int) -> None:
     generator = np.random.default_rng(seed)
     for _case_index in range(80):
-        width = int(generator.integers(2, 49))
-        height = int(generator.integers(1, 49))
-        group_capacity = (
-            width * height // _DESTINATION_PIXELS_PER_GROUP
-        )
+        width = 4 * int(generator.integers(1, 13))
+        height = 4 * int(generator.integers(1, 13))
+        group_capacity = (width // 4) * (height // 4)
         group_count = int(generator.integers(1, group_capacity + 1))
         weights = 10.0 ** generator.uniform(-12.0, 12.0, group_count)
         groups = tuple(
             _FaceGroup(faces=(), weight=float(weight)) for weight in weights
         )
-        target = _PixelRectangle(3, 7, width, height)
+        target = _PixelRectangle(4, 8, width, height)
 
         rectangles = _partition_group_rectangles(target, groups)
         repeated = _partition_group_rectangles(target, groups)
@@ -171,8 +169,17 @@ def test_scan_row_tiler_never_rejects_a_group_set_that_fits(seed: int) -> None:
         assert len(rectangles) == group_count
         coverage = np.zeros((height, width), dtype=np.uint8)
         for rectangle in rectangles:
-            assert rectangle.width >= 1
-            assert rectangle.height >= 1
+            assert rectangle.width >= 4
+            assert rectangle.height >= 4
+            assert not any(
+                value % 4
+                for value in (
+                    rectangle.x,
+                    rectangle.y,
+                    rectangle.width,
+                    rectangle.height,
+                )
+            )
             assert target.x <= rectangle.x < rectangle.right <= target.right
             assert target.y <= rectangle.y < rectangle.bottom <= target.bottom
             local_x = rectangle.x - target.x
@@ -186,18 +193,18 @@ def test_scan_row_tiler_never_rejects_a_group_set_that_fits(seed: int) -> None:
 
 @pytest.mark.parametrize(
     "width, height",
-    ((3, 28), (5, 25), (7, 34), (17, 35)),
+    ((12, 112), (20, 100), (28, 136), (68, 140)),
 )
-def test_scan_row_tiler_reaches_exact_odd_rectangle_capacity(
+def test_scan_row_tiler_reaches_exact_aligned_rectangle_capacity(
     width: int,
     height: int,
 ) -> None:
-    group_count = width * height // _DESTINATION_PIXELS_PER_GROUP
+    group_count = (width // 4) * (height // 4)
     groups = tuple(
         _FaceGroup(faces=(), weight=(1e-12 if index % 2 else 1e12))
         for index in range(group_count)
     )
-    target = _PixelRectangle(3, 7, width, height)
+    target = _PixelRectangle(4, 8, width, height)
 
     rectangles = _partition_group_rectangles(target, groups)
 
@@ -217,24 +224,24 @@ def test_scan_row_tiler_reaches_exact_odd_rectangle_capacity(
     "face_counts, percentages, target",
     (
         (
-            (76, 4, 4, 4, 4, 4),
+            (7, 1, 1, 1, 1, 1),
             EXTREME_PERCENTAGES,
             LEFT_HALF_TARGET,
         ),
         (
-            (17, 17, 16, 16, 15, 15),
+            (2, 2, 2, 2, 1, 1),
             EXTREME_PERCENTAGES,
             LEFT_HALF_TARGET,
         ),
         (
-            (144, 120, 80, 70, 50, 48),
+            (20, 12, 10, 8, 7, 7),
             EXTREME_PERCENTAGES,
             _PixelRectangle(0, 0, 32, 32),
         ),
         (
-            (14, 14, 14, 14, 16, 15),
+            (4, 4, 4, 4, 5, 4),
             EXTREME_PERCENTAGES,
-            _PixelRectangle(0, 0, 7, 25),
+            _PixelRectangle(0, 0, 20, 20),
         ),
     ),
 )
@@ -244,10 +251,7 @@ def test_camera_bands_honor_global_capacity_under_extreme_inputs(
     target: _PixelRectangle,
 ) -> None:
     faces = _build_projected_faces(face_counts)
-    assert (
-        _group_count(faces) * _DESTINATION_PIXELS_PER_GROUP
-        <= target.width * target.height
-    )
+    assert _group_count(faces) <= (target.width // 4) * (target.height // 4)
 
     _assert_dense_layout(faces, percentages, target)
 
@@ -328,18 +332,23 @@ def _build_directional_stress_glb(
     (
         (
             SCAN_PROJECTION_TARGET_FULL,
-            (300, 16, 16, 16, 16, 16),
+            (20, 12, 10, 8, 7, 7),
             STRESS_TEXTURE_RESOLUTION,
         ),
         (
             SCAN_PROJECTION_TARGET_LEFT_HALF,
-            (17, 17, 16, 16, 15, 15),
+            (2, 2, 2, 2, 1, 1),
             STRESS_TEXTURE_RESOLUTION,
         ),
         (
             SCAN_PROJECTION_TARGET_LEFT_HALF,
-            (20, 20, 20, 20, 19, 18),
-            34,
+            (4, 4, 4, 4, 4, 4),
+            40,
+        ),
+        (
+            SCAN_PROJECTION_TARGET_TOP_LEFT_QUARTER,
+            (4, 3, 3, 2, 2, 2),
+            64,
         ),
     ),
 )

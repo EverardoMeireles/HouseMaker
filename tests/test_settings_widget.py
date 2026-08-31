@@ -19,12 +19,16 @@ from housemaker.settings_widget import (
     CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY_SETTING_KEY,
     DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY,
     DEFAULT_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
+    DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE,
     DOORWAY_MESH_UPDATE_DELAY_SECONDS_SETTING_KEY,
     DOORWAY_MESH_UPDATE_DELAY_STEP_SECONDS,
     FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY,
+    MAXIMUM_FACE_VISIBILITY_PERCENTAGE,
     MAX_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
     MESHY_API_KEY_ENVIRONMENT_VARIABLE,
     MESHY_API_KEY_SETTING_KEY,
+    MINIMUM_FACE_VISIBILITY_PERCENTAGE,
+    MINIMUM_FACE_VISIBILITY_PERCENTAGE_SETTING_KEY,
     MIN_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
     OPENAI_API_KEY_ENVIRONMENT_VARIABLE,
     OPENAI_API_KEY_SETTING_KEY,
@@ -38,6 +42,7 @@ from housemaker.settings_widget import (
     fullscreen_3d_viewer_screen_id,
     read_canvas_3d_navigation_toggle_hotkey,
     read_doorway_mesh_update_delay_seconds,
+    read_minimum_face_visibility_percentage,
     read_unused_face_removal,
     read_use_uv_raycast_for_object_generation,
 )
@@ -79,6 +84,12 @@ class SettingsWidgetTests(unittest.TestCase):
                 hasattr(
                     widget,
                     "use_uv_raycast_for_object_generation_checkbox",
+                )
+            )
+            self.assertTrue(
+                hasattr(
+                    widget,
+                    "minimum_face_visibility_percentage_spinbox",
                 )
             )
             self.assertFalse(
@@ -263,6 +274,111 @@ class SettingsWidgetTests(unittest.TestCase):
         self.assertEqual(settings.jobs_window_screen_id, "jobs-screen")
         self.assertEqual(settings.doorway_mesh_update_delay_seconds, 1.25)
         self.assertFalse(settings.use_uv_raycast_for_object_generation)
+        self.assertEqual(
+            settings.minimum_face_visibility_percentage,
+            DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE,
+        )
+
+    def test_minimum_face_visibility_persists_and_emits_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            widget = SettingsWidget(
+                application_settings=application_settings,
+                environment={},
+            )
+            spinbox = widget.minimum_face_visibility_percentage_spinbox
+            emitted_changes: list[bool] = []
+            widget.settings_changed.connect(
+                lambda: emitted_changes.append(True)
+            )
+
+            self.assertEqual(
+                widget.get_settings().minimum_face_visibility_percentage,
+                DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE,
+            )
+            self.assertEqual(
+                spinbox.minimum(),
+                MINIMUM_FACE_VISIBILITY_PERCENTAGE,
+            )
+            self.assertEqual(
+                spinbox.maximum(),
+                MAXIMUM_FACE_VISIBILITY_PERCENTAGE,
+            )
+            self.assertEqual(spinbox.singleStep(), 1)
+            self.assertEqual(spinbox.suffix(), "%")
+            self.assertFalse(spinbox.keyboardTracking())
+            self.assertIn("tiny glimpses", spinbox.toolTip())
+
+            spinbox.setValue(37)
+
+            self.assertEqual(
+                application_settings.get(
+                    MINIMUM_FACE_VISIBILITY_PERCENTAGE_SETTING_KEY
+                ),
+                37,
+            )
+            self.assertEqual(
+                widget.get_settings().minimum_face_visibility_percentage,
+                37,
+            )
+            self.assertEqual(emitted_changes, [True])
+
+            restored = SettingsWidget(
+                application_settings=_build_test_settings(temporary_directory),
+                environment={},
+            )
+            self.assertEqual(
+                restored.get_settings().minimum_face_visibility_percentage,
+                37,
+            )
+
+    def test_minimum_face_visibility_rejects_malformed_values(self) -> None:
+        invalid_values: tuple[object, ...] = (
+            True,
+            "5",
+            5.0,
+            MINIMUM_FACE_VISIBILITY_PERCENTAGE - 1,
+            MAXIMUM_FACE_VISIBILITY_PERCENTAGE + 1,
+        )
+        for value in invalid_values:
+            with self.subTest(model_value=value):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "Minimum face visibility percentage",
+                ):
+                    GenerationServiceSettings(
+                        minimum_face_visibility_percentage=(
+                            value  # type: ignore[arg-type]
+                        )
+                    )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            for value in invalid_values:
+                with self.subTest(persisted_value=value):
+                    application_settings.set(
+                        MINIMUM_FACE_VISIBILITY_PERCENTAGE_SETTING_KEY,
+                        value,
+                    )
+                    self.assertEqual(
+                        read_minimum_face_visibility_percentage(
+                            application_settings
+                        ),
+                        DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE,
+                    )
+
+    def test_minimum_face_visibility_accepts_range_boundaries(self) -> None:
+        for value in (
+            MINIMUM_FACE_VISIBILITY_PERCENTAGE,
+            MAXIMUM_FACE_VISIBILITY_PERCENTAGE,
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    GenerationServiceSettings(
+                        minimum_face_visibility_percentage=value
+                    ).minimum_face_visibility_percentage,
+                    value,
+                )
 
     def test_doorway_mesh_update_delay_persists_and_emits_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

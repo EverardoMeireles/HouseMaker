@@ -87,6 +87,8 @@ from housemaker.object_face_edit import (
 from housemaker.object_uv_scan_projection import (
     DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
     SCAN_PROJECTION_TARGET_FULL,
+    SCAN_PROJECTION_TARGET_LEFT_HALF,
+    SCAN_PROJECTION_TARGET_TOP_LEFT_QUARTER,
     ScanProjectionCancelled,
     ScanProjectionResult,
     ScanProjectionStats,
@@ -169,6 +171,7 @@ OBJECT_DETAILS_EXTERNAL_MINIMUM_WIDTH = 320
 OBJECT_DETAILS_EXTERNAL_MAXIMUM_WIDTH = 440
 QT_WIDGET_MAXIMUM_SIZE = 16_777_215
 OBJECT_FACE_GEOMETRY_CACHE_MAX_ENTRIES = 16
+GEOMETRY_FINGERPRINT_DECIMALS = 6
 MESHY_REVISION_GEOMETRY = "geometry"
 MESHY_REVISION_POSTPROCESSED = "postprocessed"
 MESHY_REVISION_NAMES = frozenset(
@@ -203,6 +206,17 @@ FACE_EDIT_INVALIDATED_UV_PROVENANCE_PIPELINE_KEYS = (
     "texture_regeneration_submitted_uv_fingerprint",
     "texture_regeneration_final_uv_fingerprint",
     "texture_regeneration_uv_face_count",
+    "texture_regeneration_submitted_uv_face_count",
+    "texture_regeneration_final_uv_face_count",
+)
+LAST_TEXTURE_FACE_REMOVAL_DETAIL_PIPELINE_KEYS = (
+    "last_texture_minimum_face_visibility_percentage",
+    "last_texture_face_removal_original_face_count",
+    "last_texture_face_removal_retained_face_count",
+    "last_texture_face_removal_removed_face_count",
+    "last_texture_face_removal_visibility_removed_face_count",
+    "last_texture_face_removal_stacked_face_removed_count",
+    "last_texture_retexture_topology_changed",
 )
 GENERATION_JOB_KIND_MODEL = "Object generation"
 GENERATION_JOB_KIND_TEXTURE = "Object texture generation"
@@ -613,6 +627,9 @@ class TextureRegenerationRequest:
     enable_original_uv: bool = False
     submitted_uv_fingerprint: UvFingerprint | None = None
     preserve_symmetric_uvs: bool = False
+    projection_camera_percentages: tuple[int, ...] = (
+        DEFAULT_PROJECTION_CAMERA_PERCENTAGES
+    )
 
     def __post_init__(self) -> None:
         normalized_object_id = str(self.object_id).strip()
@@ -664,6 +681,13 @@ class TextureRegenerationRequest:
             "preserve_symmetric_uvs",
             bool(self.preserve_symmetric_uvs),
         )
+        object.__setattr__(
+            self,
+            "projection_camera_percentages",
+            normalize_projection_camera_percentages(
+                self.projection_camera_percentages
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -678,6 +702,9 @@ class _TextureRegenerationPreflight:
     settings: GenerationServiceSettings
     enable_original_uv: bool = False
     preserve_symmetric_uvs: bool = False
+    projection_camera_percentages: tuple[int, ...] = (
+        DEFAULT_PROJECTION_CAMERA_PERCENTAGES
+    )
 
     def __post_init__(self) -> None:
         normalized_object_id = str(self.object_id).strip()
@@ -733,6 +760,13 @@ class _TextureRegenerationPreflight:
             self,
             "preserve_symmetric_uvs",
             bool(self.preserve_symmetric_uvs),
+        )
+        object.__setattr__(
+            self,
+            "projection_camera_percentages",
+            normalize_projection_camera_percentages(
+                self.projection_camera_percentages
+            ),
         )
 
 
@@ -807,7 +841,17 @@ class TextureRegenerationOutcome:
 
     request: TextureRegenerationRequest
     result: MeshyGenerationResult
+    preserved_uv_fingerprint: UvFingerprint | None = None
     final_uv_fingerprint: UvFingerprint | None = None
+    scan_projection_stats: ScanProjectionStats | None = None
+    final_face_removal_applied: bool = False
+    minimum_face_visibility_percentage: int = 0
+    final_original_face_count: int = 0
+    final_retained_face_count: int = 0
+    final_removed_face_count: int = 0
+    final_visibility_removed_face_count: int = 0
+    final_stacked_face_removed_count: int = 0
+    retexture_topology_changed: bool = False
 
 
 @dataclass(frozen=True)
@@ -853,7 +897,17 @@ class StagedMeshyGenerationResult(MeshyGenerationResult):
     retained_face_count: int = 0
     removed_face_count: int = 0
     protected_face_count: int = 0
+    visibility_removed_face_count: int = 0
+    stacked_face_removed_count: int = 0
     unused_face_removal_applied: bool = False
+    minimum_face_visibility_percentage: int = 0
+    final_face_removal_applied: bool = False
+    final_original_face_count: int = 0
+    final_retained_face_count: int = 0
+    final_removed_face_count: int = 0
+    final_visibility_removed_face_count: int = 0
+    final_stacked_face_removed_count: int = 0
+    retexture_topology_changed: bool = False
     visibility_uv_stats: VisibilityUvUnwrapStats | None = None
     scan_projection_stats: ScanProjectionStats | None = None
     geometry_only: bool = False
@@ -864,6 +918,14 @@ class ScanProjectedMeshyGenerationResult(MeshyGenerationResult):
     """One directly textured result rebuilt with weighted camera UVs."""
 
     scan_projection_stats: ScanProjectionStats | None = None
+
+
+@dataclass(frozen=True)
+class _GeometryFingerprint:
+    """Order-independent world-space triangle identity for one GLB."""
+
+    face_count: int
+    sha256: str
 
 
 @dataclass(frozen=True)
@@ -891,6 +953,18 @@ class ObjectTextureImageVariant:
 
 
 # ### Generation-pipeline decisions ###
+def _build_unused_face_removal_options(
+    settings: GenerationServiceSettings,
+) -> UnusedFaceRemovalOptions:
+    """Translate the persisted whole-percent setting into purge options."""
+
+    return UnusedFaceRemovalOptions(
+        minimum_visible_fraction=(
+            settings.minimum_face_visibility_percentage / 100.0
+        ),
+    )
+
+
 def _uses_weighted_camera_projection(request: GenerationRequest) -> bool:
     """Whether this textured generation uses the weighted scan atlas."""
 
@@ -898,6 +972,21 @@ def _uses_weighted_camera_projection(request: GenerationRequest) -> bool:
         request.settings.use_uv_raycast_for_object_generation
         and not request.geometry_only
     )
+
+
+def _texture_regeneration_scan_target(
+    request: TextureRegenerationRequest,
+    symmetry: ObjectSymmetricDivisionMetadata | None,
+) -> str | None:
+    """Return the safe atlas region for one regenerated object's new UVs."""
+
+    if not request.settings.use_uv_raycast_for_object_generation:
+        return None
+    if symmetry is None:
+        return SCAN_PROJECTION_TARGET_FULL
+    if symmetry.version == SYMMETRIC_QUARTER_METADATA_VERSION:
+        return SCAN_PROJECTION_TARGET_TOP_LEFT_QUARTER
+    return SCAN_PROJECTION_TARGET_LEFT_HALF
 
 
 def _scan_project_provider_result(
@@ -940,6 +1029,43 @@ def _scan_project_provider_result(
     )
 
 
+# ### Geometry integrity helpers ###
+def _build_geometry_fingerprint(glb_bytes: bytes) -> _GeometryFingerprint:
+    """Hash triangle positions independent of primitive, face, and winding order."""
+
+    model = import_generated_glb(glb_bytes)
+    triangles = np.asarray(model.mesh.triangles, dtype=np.float64)
+    if triangles.ndim != 3 or triangles.shape[1:] != (3, 3) or not len(triangles):
+        raise ValueError("Geometry validation requires triangle faces.")
+    rounded = np.round(triangles, decimals=GEOMETRY_FINGERPRINT_DECIMALS)
+    rounded[rounded == 0.0] = 0.0
+    corner_order = np.lexsort(
+        (rounded[:, :, 2], rounded[:, :, 1], rounded[:, :, 0]),
+        axis=1,
+    )
+    canonical_corners = np.take_along_axis(
+        rounded,
+        corner_order[:, :, np.newaxis],
+        axis=1,
+    )
+    flattened_faces = canonical_corners.reshape((-1, 9))
+    face_order = np.lexsort(
+        tuple(flattened_faces[:, index] for index in range(8, -1, -1))
+    )
+    canonical_faces = np.ascontiguousarray(
+        flattened_faces[face_order],
+        dtype="<f8",
+    )
+    digest = hashlib.sha256()
+    digest.update(b"housemaker-world-triangles-v1\0")
+    digest.update(len(canonical_faces).to_bytes(8, "little"))
+    digest.update(canonical_faces.tobytes())
+    return _GeometryFingerprint(
+        face_count=len(canonical_faces),
+        sha256=digest.hexdigest(),
+    )
+
+
 # ### Default adapters ###
 class MeshyImagePlanner:
     """Submit only the isolated object crop to Meshy Image-to-3D."""
@@ -967,6 +1093,11 @@ class MeshyImagePlanner:
                 progress_callback("Meshy generation complete. Downloading GLB...")
 
         use_unused_face_removal = request.settings.unused_face_removal
+        face_removal_options = (
+            _build_unused_face_removal_options(request.settings)
+            if use_unused_face_removal
+            else None
+        )
         if not request.geometry_only and not use_unused_face_removal:
             _raise_if_generation_cancelled(cancel_event)
             provider_result = request_image_to_3d_model(
@@ -1000,12 +1131,19 @@ class MeshyImagePlanner:
         retained_face_count = 0
         removed_face_count = 0
         protected_face_count = 0
+        visibility_removed_face_count = 0
+        stacked_face_removed_count = 0
         if use_unused_face_removal:
+            assert face_removal_options is not None
+
             def report_face_removal(
                 update: UnusedFaceRemovalProgress,
+                *,
+                final_texture: bool = False,
             ) -> None:
                 if progress_callback is None:
                     return
+                phase_label = "final textured" if final_texture else "generated"
                 if update.stage == "capturing":
                     camera_suffix = (
                         ""
@@ -1013,20 +1151,22 @@ class MeshyImagePlanner:
                         else f" ({update.camera_id})"
                     )
                     progress_callback(
-                        "Capturing unused-face views" + camera_suffix + "..."
+                        f"Capturing {phase_label} unused-face views"
+                        + camera_suffix
+                        + "..."
                     )
                 elif update.stage == "checking":
                     progress_callback(
-                        "Checking faces: "
+                        f"Checking {phase_label} faces: "
                         f"{update.completed_face_count}/"
                         f"{update.total_face_count}"
                     )
                 elif update.stage == "exporting":
-                    progress_callback("Saving visible geometry...")
+                    progress_callback(f"Saving {phase_label} visible geometry...")
 
             removed = remove_unused_faces_from_glb(
                 processed_glb_bytes,
-                options=UnusedFaceRemovalOptions(),
+                options=face_removal_options,
                 cancel_requested=(
                     None if cancel_event is None else cancel_event.is_set
                 ),
@@ -1037,6 +1177,10 @@ class MeshyImagePlanner:
             retained_face_count = removed.retained_face_count
             removed_face_count = removed.removed_face_count
             protected_face_count = removed.protected_face_count
+            visibility_removed_face_count = (
+                removed.visibility_removed_face_count
+            )
+            stacked_face_removed_count = removed.stacked_face_removed_count
 
         if request.geometry_only:
             return StagedMeshyGenerationResult(
@@ -1050,7 +1194,12 @@ class MeshyImagePlanner:
                 retained_face_count=retained_face_count,
                 removed_face_count=removed_face_count,
                 protected_face_count=protected_face_count,
+                visibility_removed_face_count=visibility_removed_face_count,
+                stacked_face_removed_count=stacked_face_removed_count,
                 unused_face_removal_applied=use_unused_face_removal,
+                minimum_face_visibility_percentage=(
+                    request.settings.minimum_face_visibility_percentage
+                ),
                 geometry_only=True,
             )
 
@@ -1067,6 +1216,9 @@ class MeshyImagePlanner:
         _raise_if_generation_cancelled(cancel_event)
         if progress_callback is not None:
             progress_callback("Submitting Meshy texture task...")
+        submitted_geometry_fingerprint = _build_geometry_fingerprint(
+            processed_glb_bytes
+        )
         textured_result = request_retextured_model(
             api_key=request.settings.meshy_api_key,
             model_glb=processed_glb_bytes,
@@ -1074,6 +1226,32 @@ class MeshyImagePlanner:
             enable_original_uv=False,
             progress_callback=report_texture_progress,
             cancel_event=cancel_event,
+        )
+        _raise_if_generation_cancelled(cancel_event)
+        returned_geometry_fingerprint = _build_geometry_fingerprint(
+            textured_result.glb_bytes
+        )
+        retexture_topology_changed = (
+            submitted_geometry_fingerprint != returned_geometry_fingerprint
+        )
+        if progress_callback is not None:
+            progress_callback("Verifying final textured face visibility...")
+        assert face_removal_options is not None
+        final_removed = remove_unused_faces_from_glb(
+            textured_result.glb_bytes,
+            options=face_removal_options,
+            cancel_requested=(
+                None if cancel_event is None else cancel_event.is_set
+            ),
+            progress_callback=lambda update: report_face_removal(
+                update,
+                final_texture=True,
+            ),
+        )
+        textured_result = MeshyGenerationResult(
+            task_id=textured_result.task_id,
+            glb_bytes=final_removed.glb_bytes,
+            name=textured_result.name,
         )
         final_result = _scan_project_provider_result(
             request,
@@ -1092,7 +1270,23 @@ class MeshyImagePlanner:
             retained_face_count=retained_face_count,
             removed_face_count=removed_face_count,
             protected_face_count=protected_face_count,
+            visibility_removed_face_count=visibility_removed_face_count,
+            stacked_face_removed_count=stacked_face_removed_count,
             unused_face_removal_applied=use_unused_face_removal,
+            minimum_face_visibility_percentage=(
+                request.settings.minimum_face_visibility_percentage
+            ),
+            final_face_removal_applied=True,
+            final_original_face_count=final_removed.original_face_count,
+            final_retained_face_count=final_removed.retained_face_count,
+            final_removed_face_count=final_removed.removed_face_count,
+            final_visibility_removed_face_count=(
+                final_removed.visibility_removed_face_count
+            ),
+            final_stacked_face_removed_count=(
+                final_removed.stacked_face_removed_count
+            ),
+            retexture_topology_changed=retexture_topology_changed,
             scan_projection_stats=(
                 final_result.scan_projection_stats
                 if isinstance(
@@ -1778,12 +1972,106 @@ class TextureRegenerationWorker(QObject):
                     name=result.name,
                 )
                 _raise_if_generation_cancelled(self._cancel_event)
-            final_uv_fingerprint = self._validate_final_uvs(
+            final_face_removal = None
+            retexture_topology_changed = False
+            if (
+                request.settings.unused_face_removal
+                and not request.enable_original_uv
+            ):
+                self.progress.emit(
+                    "Verifying regenerated texture face visibility (82%)"
+                )
+                submitted_geometry_fingerprint = _build_geometry_fingerprint(
+                    request.model_glb
+                )
+                returned_geometry_fingerprint = _build_geometry_fingerprint(
+                    result.glb_bytes
+                )
+                retexture_topology_changed = (
+                    submitted_geometry_fingerprint
+                    != returned_geometry_fingerprint
+                )
+
+                def report_final_face_removal(
+                    update: UnusedFaceRemovalProgress,
+                ) -> None:
+                    if update.stage == "capturing":
+                        camera_suffix = (
+                            ""
+                            if update.camera_id is None
+                            else f" ({update.camera_id})"
+                        )
+                        self.progress.emit(
+                            "Capturing regenerated texture faces"
+                            + camera_suffix
+                            + "..."
+                        )
+                    elif update.stage == "checking":
+                        self.progress.emit(
+                            "Checking regenerated texture faces: "
+                            f"{update.completed_face_count}/"
+                            f"{update.total_face_count}"
+                        )
+                    elif update.stage == "exporting":
+                        self.progress.emit(
+                            "Saving regenerated visible geometry..."
+                        )
+
+                final_face_removal = remove_unused_faces_from_glb(
+                    result.glb_bytes,
+                    options=_build_unused_face_removal_options(request.settings),
+                    cancel_requested=self._cancel_event.is_set,
+                    progress_callback=report_final_face_removal,
+                )
+                result = MeshyGenerationResult(
+                    task_id=result.task_id,
+                    glb_bytes=final_face_removal.glb_bytes,
+                    name=result.name,
+                )
+                _raise_if_generation_cancelled(self._cancel_event)
+            preserved_uv_fingerprint = self._validate_final_uvs(
                 result,
                 request,
             )
+            scan_projection_stats = None
+            scan_target = _texture_regeneration_scan_target(
+                request,
+                self._symmetry,
+            )
+            if scan_target is not None:
+                self.progress.emit(
+                    "Rebuilding UVs from the current weighted cameras (84%)"
+                )
+                try:
+                    projected = scan_project_textured_glb(
+                        result.glb_bytes,
+                        request.projection_camera_percentages,
+                        target_domain=scan_target,
+                        cancellation_check=self._cancel_event.is_set,
+                    )
+                except ScanProjectionCancelled as error:
+                    raise _GenerationCancelled from error
+                if not isinstance(projected, ScanProjectionResult):
+                    raise TypeError(
+                        "The weighted camera projection returned no result."
+                    )
+                result = MeshyGenerationResult(
+                    task_id=result.task_id,
+                    glb_bytes=projected.glb_bytes,
+                    name=result.name,
+                )
+                scan_projection_stats = projected.stats
+                _raise_if_generation_cancelled(self._cancel_event)
+            final_uv_fingerprint = (
+                build_uv_fingerprint(result.glb_bytes)
+                if (
+                    request.submitted_uv_fingerprint is not None
+                    or scan_projection_stats is not None
+                )
+                else None
+            )
             self.progress.emit(
-                "Preparing local 512, 1024 and 2048 texture variants (84%)"
+                "Preparing local 512, 1024 and 2048 texture variants (87%)"
             )
             generated_model = _run_interruptible_stage(
                 lambda: _invoke_executor(self._executor, result),
@@ -1796,7 +2084,41 @@ class TextureRegenerationWorker(QObject):
             outcome = TextureRegenerationOutcome(
                 request=request,
                 result=result,
+                preserved_uv_fingerprint=preserved_uv_fingerprint,
                 final_uv_fingerprint=final_uv_fingerprint,
+                scan_projection_stats=scan_projection_stats,
+                final_face_removal_applied=(final_face_removal is not None),
+                minimum_face_visibility_percentage=(
+                    request.settings.minimum_face_visibility_percentage
+                    if final_face_removal is not None
+                    else 0
+                ),
+                final_original_face_count=(
+                    final_face_removal.original_face_count
+                    if final_face_removal is not None
+                    else 0
+                ),
+                final_retained_face_count=(
+                    final_face_removal.retained_face_count
+                    if final_face_removal is not None
+                    else 0
+                ),
+                final_removed_face_count=(
+                    final_face_removal.removed_face_count
+                    if final_face_removal is not None
+                    else 0
+                ),
+                final_visibility_removed_face_count=(
+                    final_face_removal.visibility_removed_face_count
+                    if final_face_removal is not None
+                    else 0
+                ),
+                final_stacked_face_removed_count=(
+                    final_face_removal.stacked_face_removed_count
+                    if final_face_removal is not None
+                    else 0
+                ),
+                retexture_topology_changed=retexture_topology_changed,
             )
             success_payload: object = outcome
             if self._asset_directory is not None:
@@ -3823,6 +4145,8 @@ class GenerationWorkspace(QWidget):
         self.generate_texture_button.setMinimumHeight(38)
         self.generate_texture_button.setToolTip(
             "Submit a Meshy texture task for the selected generated object. "
+            "When weighted camera projection is enabled, rebuild its UVs "
+            "from the current geometry and current camera allocations. "
             "Meshy tasks consume account credits."
         )
         self.generate_texture_button.clicked.connect(
@@ -4786,7 +5110,10 @@ class GenerationWorkspace(QWidget):
                 )
             symmetry = _get_object_symmetric_division_metadata(record)
             if symmetry is not None:
-                _validate_symmetric_texture_regeneration_uvs(outcome)
+                _validate_symmetric_texture_regeneration_uvs(
+                    outcome,
+                    symmetry,
+                )
                 canonical_provider_glb = texture_variants.glb_by_resolution[
                     TEXTURE_RESOLUTION_2048
                 ]
@@ -4794,6 +5121,11 @@ class GenerationWorkspace(QWidget):
                     canonical_provider_glb,
                     symmetry,
                 )
+            outcome = _with_persisted_canonical_uv_fingerprint(
+                outcome,
+                record,
+                texture_variants,
+            )
             variant_metadata = self._persist_object_texture_variants(
                 record.object_id,
                 texture_variants,
@@ -4877,7 +5209,9 @@ class GenerationWorkspace(QWidget):
         self.status_label.setText(
             self._format_object_job_status(
                 runtime,
-                f"Generated texture: {record.object_name}." + status_suffix,
+                f"Generated texture: {record.object_name}."
+                + _format_texture_face_cleanup_status(outcome)
+                + status_suffix,
             )
         )
         self._emit_data_changed()
@@ -5004,7 +5338,9 @@ class GenerationWorkspace(QWidget):
         )
         status = self._format_object_job_status(
             runtime,
-            f"Generated texture: {record.object_name}." + status_suffix,
+            f"Generated texture: {record.object_name}."
+            + _format_texture_face_cleanup_status(outcome)
+            + status_suffix,
         )
         self.status_label.setText(status)
         self._emit_data_changed()
@@ -5314,6 +5650,24 @@ class GenerationWorkspace(QWidget):
         if selected_crop.size == 0:
             self.status_label.setText("The selected texture reference is empty.")
             return None
+        projection_camera_percentages = (
+            self.object_3d_panel.get_projection_camera_percentages()
+        )
+        projection_camera_percentages_are_valid = (
+            sum(projection_camera_percentages) == 100
+        )
+        if (
+            self._settings.use_uv_raycast_for_object_generation
+            and not projection_camera_percentages_are_valid
+        ):
+            self.status_label.setText(
+                "Projection camera texture allocations must total 100%."
+            )
+            return None
+        if not projection_camera_percentages_are_valid:
+            projection_camera_percentages = (
+                DEFAULT_PROJECTION_CAMERA_PERCENTAGES
+            )
         try:
             source_asset_path = _texture_regeneration_source_asset_path(
                 record
@@ -5342,6 +5696,9 @@ class GenerationWorkspace(QWidget):
                 settings=self._settings,
                 enable_original_uv=enable_original_uv,
                 preserve_symmetric_uvs=preserve_symmetric_uvs,
+                projection_camera_percentages=(
+                    projection_camera_percentages
+                ),
             )
         except Exception as error:
             self.status_label.setText(
@@ -5466,6 +5823,7 @@ class GenerationWorkspace(QWidget):
         )
         self.regenerate_texture_button.setEnabled(
             self._can_regenerate_object_texture(selected_record)
+            and projection_camera_percentages_are_valid
         )
         self.undo_object_change_button.setEnabled(
             not selected_object_is_busy
@@ -6298,10 +6656,14 @@ def _staged_result_used_face_removal(
 ) -> bool:
     return bool(
         result.unused_face_removal_applied
+        or result.final_face_removal_applied
         or result.original_face_count
         or result.retained_face_count
         or result.removed_face_count
         or result.protected_face_count
+        or result.final_original_face_count
+        or result.final_retained_face_count
+        or result.final_removed_face_count
     )
 
 
@@ -6347,11 +6709,37 @@ def _format_staged_generation_status(
             f"Removed {result.removed_face_count} of "
             f"{result.original_face_count} faces."
         )
+    if result.final_face_removal_applied:
+        messages.append(
+            f"Final texture cleanup removed {result.final_removed_face_count} "
+            f"of {result.final_original_face_count} faces."
+        )
+    if result.retexture_topology_changed:
+        messages.append("Retexture topology changed and was revalidated.")
     if _staged_result_used_visibility_uv(result):
         messages.append("Applied visibility-optimized UVs.")
     if _staged_result_used_scan_projection(result):
         messages.append("Applied weighted camera scan-projection UVs.")
     return " ".join(messages)
+
+
+# ### Texture-regeneration status helpers ###
+def _format_texture_face_cleanup_status(
+    outcome: TextureRegenerationOutcome,
+) -> str:
+    """Describe optional final geometry verification without hiding counts."""
+
+    status = ""
+    if outcome.final_face_removal_applied:
+        status = (
+            f" Final cleanup removed {outcome.final_removed_face_count} of "
+            f"{outcome.final_original_face_count} faces."
+        )
+        if outcome.retexture_topology_changed:
+            status += " Retexture topology changed and was revalidated."
+    if outcome.scan_projection_stats is not None:
+        status += " Rebuilt UVs from the current weighted cameras."
+    return status
 
 
 def _build_scan_projection_pipeline_metadata(
@@ -6389,6 +6777,30 @@ def _build_staged_generation_pipeline_metadata(
                 "retained_face_count": result.retained_face_count,
                 "removed_face_count": result.removed_face_count,
                 "protected_face_count": result.protected_face_count,
+                "minimum_face_visibility_percentage": (
+                    result.minimum_face_visibility_percentage
+                ),
+                "visibility_removed_face_count": (
+                    result.visibility_removed_face_count
+                ),
+                "stacked_face_removed_count": (
+                    result.stacked_face_removed_count
+                ),
+                "final_face_removal_applied": (
+                    result.final_face_removal_applied
+                ),
+                "final_original_face_count": result.final_original_face_count,
+                "final_retained_face_count": result.final_retained_face_count,
+                "final_removed_face_count": result.final_removed_face_count,
+                "final_visibility_removed_face_count": (
+                    result.final_visibility_removed_face_count
+                ),
+                "final_stacked_face_removed_count": (
+                    result.final_stacked_face_removed_count
+                ),
+                "retexture_topology_changed": (
+                    result.retexture_topology_changed
+                ),
             }
         )
     stats = result.visibility_uv_stats
@@ -6473,12 +6885,16 @@ def _resolve_staged_postprocessed_asset_path(
 # ### Symmetric-division helpers ###
 def _validate_symmetric_texture_regeneration_uvs(
     outcome: TextureRegenerationOutcome,
+    symmetry: ObjectSymmetricDivisionMetadata | None = None,
 ) -> None:
-    """Require proof that the rebuilt result retained its packed UVs."""
+    """Require proof that symmetric geometry survived texture regeneration."""
 
     request = outcome.request
     submitted_fingerprint = request.submitted_uv_fingerprint
+    preserved_fingerprint = outcome.preserved_uv_fingerprint
     final_fingerprint = outcome.final_uv_fingerprint
+    if preserved_fingerprint is None and outcome.scan_projection_stats is None:
+        preserved_fingerprint = final_fingerprint
     if (
         not request.enable_original_uv
         or not request.preserve_symmetric_uvs
@@ -6488,15 +6904,40 @@ def _validate_symmetric_texture_regeneration_uvs(
             "Symmetric texture generation must preserve the existing packed "
             "UV layout. The existing texture was kept."
         )
-    if final_fingerprint is None:
+    if preserved_fingerprint is None:
         raise UvIntegrityError(
-            "The symmetric texture result has no verified UV fingerprint. "
-            "The existing texture was kept."
+            "The symmetric texture result has no verified preserved UV "
+            "fingerprint. The existing texture was kept."
         )
     _validate_preserved_uv_retexture_integrity(
         submitted_fingerprint,
-        final_fingerprint,
+        preserved_fingerprint,
     )
+    if final_fingerprint is None:
+        raise UvIntegrityError(
+            "The symmetric texture result has no final UV fingerprint. "
+            "The existing texture was kept."
+        )
+    if outcome.scan_projection_stats is None:
+        _validate_preserved_uv_retexture_integrity(
+            submitted_fingerprint,
+            final_fingerprint,
+        )
+    else:
+        expected_target = (
+            SCAN_PROJECTION_TARGET_TOP_LEFT_QUARTER
+            if (
+                symmetry is not None
+                and symmetry.version == SYMMETRIC_QUARTER_METADATA_VERSION
+            )
+            else SCAN_PROJECTION_TARGET_LEFT_HALF
+        )
+        if outcome.scan_projection_stats.target_domain == expected_target:
+            return
+        raise UvIntegrityError(
+            "Weighted camera UV rebuilding used an invalid symmetric texture "
+            "region. The existing texture was kept."
+        )
 
 
 def _validate_preserved_uv_retexture_integrity(
@@ -6662,6 +7103,31 @@ def _canonical_texture_resolution(record: GeneratedObjectRecord) -> int:
     if _uses_compact_symmetric_resolutions(symmetry):
         return TEXTURE_RESOLUTION_1024
     return TEXTURE_RESOLUTION_2048
+
+
+def _with_persisted_canonical_uv_fingerprint(
+    outcome: TextureRegenerationOutcome,
+    record: GeneratedObjectRecord,
+    variants: PersistableObjectTextureVariants,
+) -> TextureRegenerationOutcome:
+    """Fingerprint the exact canonical GLB retained for the next operation."""
+
+    if (
+        outcome.final_uv_fingerprint is None
+        or outcome.scan_projection_stats is None
+    ):
+        return outcome
+    canonical_resolution = _canonical_texture_resolution(record)
+    try:
+        canonical_glb = variants.glb_by_resolution[canonical_resolution]
+    except KeyError as error:
+        raise ValueError(
+            "The regenerated texture variants have no canonical UV source."
+        ) from error
+    return replace(
+        outcome,
+        final_uv_fingerprint=build_uv_fingerprint(canonical_glb),
+    )
 
 
 def _validate_automatic_symmetric_division_result(
@@ -6866,6 +7332,8 @@ def _build_regenerated_texture_pipeline(
     pipeline.pop(TEXTURE_INPAINT_STROKES_PIPELINE_KEY, None)
     pipeline.pop(FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY, None)
     pipeline.pop(FACE_EDIT_ATLAS_PLACEHOLDERS_PIPELINE_KEY, None)
+    for key in LAST_TEXTURE_FACE_REMOVAL_DETAIL_PIPELINE_KEYS:
+        pipeline.pop(key, None)
     selected_resolution = _get_selected_texture_resolution(record)
     if selected_resolution not in _selectable_texture_resolutions(record):
         selected_resolution = DEFAULT_TEXTURE_RESOLUTION
@@ -6889,6 +7357,45 @@ def _build_regenerated_texture_pipeline(
         "enable_original_uv": request.enable_original_uv,
         "preserve_symmetric_uvs": request.preserve_symmetric_uvs,
     }
+    scan_projection_stats = outcome.scan_projection_stats
+    if scan_projection_stats is not None:
+        history_entry["projection_camera_percentages"] = dict(
+            scan_projection_stats.to_pipeline_dict()["camera_percentages"]
+        )
+    if request.submitted_uv_fingerprint is not None:
+        history_entry["submitted_uv_face_count"] = (
+            request.submitted_uv_fingerprint.face_count
+        )
+    if outcome.final_uv_fingerprint is not None:
+        history_entry["final_uv_face_count"] = (
+            outcome.final_uv_fingerprint.face_count
+        )
+    if outcome.final_face_removal_applied:
+        history_entry.update(
+            {
+                "minimum_face_visibility_percentage": (
+                    outcome.minimum_face_visibility_percentage
+                ),
+                "face_removal_original_face_count": (
+                    outcome.final_original_face_count
+                ),
+                "face_removal_retained_face_count": (
+                    outcome.final_retained_face_count
+                ),
+                "face_removal_removed_face_count": (
+                    outcome.final_removed_face_count
+                ),
+                "face_removal_visibility_removed_face_count": (
+                    outcome.final_visibility_removed_face_count
+                ),
+                "face_removal_stacked_face_removed_count": (
+                    outcome.final_stacked_face_removed_count
+                ),
+                "retexture_topology_changed": (
+                    outcome.retexture_topology_changed
+                ),
+            }
+        )
     raw_history = pipeline.get("texture_regeneration_history")
     history = (
         [dict(entry) for entry in raw_history if isinstance(entry, dict)]
@@ -6916,10 +7423,47 @@ def _build_regenerated_texture_pipeline(
             "last_texture_regeneration_preserve_symmetric_uvs": (
                 request.preserve_symmetric_uvs
             ),
+            "last_texture_face_removal_applied": (
+                outcome.final_face_removal_applied
+            ),
             "texture_regeneration_history": history[-25:],
         }
     )
-    if record.pipeline.get(LOCALLY_AUTHORED_UVS_PIPELINE_KEY) is True:
+    if scan_projection_stats is not None:
+        pipeline.pop(VISIBILITY_UV_UNWRAP_PIPELINE_KEY, None)
+        pipeline.update(
+            _build_scan_projection_pipeline_metadata(scan_projection_stats)
+        )
+    if outcome.final_face_removal_applied:
+        pipeline.update(
+            {
+                "last_texture_minimum_face_visibility_percentage": (
+                    outcome.minimum_face_visibility_percentage
+                ),
+                "last_texture_face_removal_original_face_count": (
+                    outcome.final_original_face_count
+                ),
+                "last_texture_face_removal_retained_face_count": (
+                    outcome.final_retained_face_count
+                ),
+                "last_texture_face_removal_removed_face_count": (
+                    outcome.final_removed_face_count
+                ),
+                "last_texture_face_removal_visibility_removed_face_count": (
+                    outcome.final_visibility_removed_face_count
+                ),
+                "last_texture_face_removal_stacked_face_removed_count": (
+                    outcome.final_stacked_face_removed_count
+                ),
+                "last_texture_retexture_topology_changed": (
+                    outcome.retexture_topology_changed
+                ),
+            }
+        )
+    if (
+        scan_projection_stats is not None
+        or record.pipeline.get(LOCALLY_AUTHORED_UVS_PIPELINE_KEY) is True
+    ):
         canonical_resolution = _canonical_texture_resolution(record)
         canonical_variant = variant_metadata.get(str(canonical_resolution))
         if canonical_variant is None:
@@ -6929,8 +7473,25 @@ def _build_regenerated_texture_pipeline(
         pipeline["postprocessed_asset_path"] = canonical_variant[
             TEXTURE_VARIANT_GLB_PATH_KEY
         ]
+    final_fingerprint = outcome.final_uv_fingerprint
+    if final_fingerprint is not None:
+        pipeline.update(
+            {
+                "texture_regeneration_uv_fingerprint_version": (
+                    UV_FINGERPRINT_VERSION
+                ),
+                "texture_regeneration_final_uv_fingerprint": (
+                    final_fingerprint.sha256
+                ),
+                "texture_regeneration_uv_face_count": (
+                    final_fingerprint.face_count
+                ),
+                "texture_regeneration_final_uv_face_count": (
+                    final_fingerprint.face_count
+                ),
+            }
+        )
     if request.submitted_uv_fingerprint is not None:
-        final_fingerprint = outcome.final_uv_fingerprint
         if final_fingerprint is None:
             raise UvIntegrityError(
                 "The regenerated texture UV fingerprint is unavailable."
@@ -6938,22 +7499,18 @@ def _build_regenerated_texture_pipeline(
         pipeline.update(
             {
                 "retexture_enable_original_uv": True,
-                "texture_regeneration_uv_fingerprint_version": (
-                    UV_FINGERPRINT_VERSION
-                ),
                 "texture_regeneration_submitted_uv_fingerprint": (
                     request.submitted_uv_fingerprint.sha256
                 ),
-                "texture_regeneration_final_uv_fingerprint": (
-                    final_fingerprint.sha256
-                ),
-                "texture_regeneration_uv_face_count": (
+                "texture_regeneration_submitted_uv_face_count": (
                     request.submitted_uv_fingerprint.face_count
                 ),
             }
         )
     else:
         pipeline["retexture_enable_original_uv"] = False
+        pipeline.pop("texture_regeneration_submitted_uv_fingerprint", None)
+        pipeline.pop("texture_regeneration_submitted_uv_face_count", None)
     return pipeline
 
 
@@ -7229,6 +7786,9 @@ def _materialize_texture_regeneration_preflight(
         enable_original_uv=raw_request.enable_original_uv,
         submitted_uv_fingerprint=submitted_fingerprint,
         preserve_symmetric_uvs=raw_request.preserve_symmetric_uvs,
+        projection_camera_percentages=(
+            raw_request.projection_camera_percentages
+        ),
     )
     return _MaterializedTextureRegeneration(
         request=request,
@@ -7439,7 +7999,7 @@ def _prepare_and_persist_texture_regeneration(
                 "The regenerated model has no selectable texture variants."
             )
         if symmetry is not None:
-            _validate_symmetric_texture_regeneration_uvs(outcome)
+            _validate_symmetric_texture_regeneration_uvs(outcome, symmetry)
             canonical_provider_glb = texture_variants.glb_by_resolution[
                 TEXTURE_RESOLUTION_2048
             ]
@@ -7447,6 +8007,11 @@ def _prepare_and_persist_texture_regeneration(
                 canonical_provider_glb,
                 symmetry,
             )
+        outcome = _with_persisted_canonical_uv_fingerprint(
+            outcome,
+            record_snapshot,
+            texture_variants,
+        )
         _raise_if_generation_cancelled(cancel_event)
         variant_metadata = _persist_object_texture_variants_to_directory(
             asset_directory,

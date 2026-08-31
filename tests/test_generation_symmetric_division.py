@@ -213,6 +213,7 @@ def _symmetric_scan_projection_stats() -> ScanProjectionStats:
         view_face_counts=(4, 3, 2, 1, 1, 1),
         view_pixel_counts=(300, 200, 150, 150, 100, 100),
         face_count=12,
+        output_face_count=12,
         source_vertex_count=8,
         output_vertex_count=36,
         texture_resolution=2_048,

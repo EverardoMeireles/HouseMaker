@@ -29,6 +29,7 @@ from trimesh.visual.texture import TextureVisuals
 from housemaker.uv_integrity import (
     UV_FINGERPRINT_VERSION,
     UvFingerprint,
+    UvIntegrityError,
     build_uv_fingerprint,
 )
 from housemaker.generation_state import (
@@ -40,7 +41,11 @@ from housemaker.generation_state import (
 )
 from housemaker.generation_workspace import (
     LOCALLY_AUTHORED_UVS_PIPELINE_KEY,
+    ObjectSymmetricDivisionMetadata,
+    SCAN_PROJECTION_PIPELINE_KEY,
     TEXTURE_INPAINT_STROKES_PIPELINE_KEY,
+    VISIBILITY_UV_UNWRAP_PIPELINE_KEY,
+    TextureRegenerationOutcome,
     TextureRegenerationRequest,
     TextureRegenerationWorker,
     GenerationWorkspace,
@@ -48,8 +53,12 @@ from housemaker.generation_workspace import (
     MeshyTextureRegenerator,
     _TextureRegenerationPreflight,
     _GenerationCancelled,
+    _build_regenerated_texture_pipeline,
     _materialize_texture_regeneration_preflight,
     _persist_generated_named_asset,
+    _validate_symmetric_texture_regeneration_uvs,
+    _with_persisted_canonical_uv_fingerprint,
+    _texture_regeneration_scan_target,
 )
 from housemaker.glb import (
     GLTF_Y_UP_TO_Z_UP_TRANSFORM,
@@ -64,16 +73,33 @@ from housemaker.object_symmetry import (
     SYMMETRIC_DIVISION_SIDE_LEFT,
     SYMMETRIC_DIVISION_SIDE_RIGHT,
     SYMMETRIC_SELECTION_MODE_FEWEST_TRIANGLES_RANDOM_TIE,
+    SYMMETRIC_QUARTER_METADATA_VERSION,
+    SYMMETRIC_TEXTURE_CONTENT_QUADRANT_TOP_LEFT,
     SYMMETRIC_TEXTURE_CONTENT_HALF_LEFT,
     SYMMETRIC_TEXTURE_PACKING_MODE_PAIR,
+    SYMMETRIC_TEXTURE_PACKING_MODE_TOP_LEFT_QUARTER,
     SymmetricDivisionMetadata,
+    SymmetricSquarePairTextureVariants,
     build_symmetric_retexture_proxy_glb,
+)
+from housemaker.object_uv_scan_projection import (
+    DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
+    SCAN_PROJECTION_TARGET_FULL,
+    SCAN_PROJECTION_TARGET_LEFT_HALF,
+    SCAN_PROJECTION_TARGET_TOP_LEFT_QUARTER,
+    SCAN_PROJECTION_VERSION,
+    ScanProjectionResult,
+    ScanProjectionStats,
 )
 from housemaker.object_texture_variants import (
     TEXTURE_RESOLUTIONS,
     ObjectTextureVariants,
 )
 from housemaker.settings_widget import GenerationServiceSettings
+from housemaker.unused_face_removal import (
+    ALL_CAMERA_IDS,
+    UnusedFaceRemovalResult,
+)
 
 
 # ### Test application ###
@@ -227,6 +253,50 @@ def _model_with_variants(variants: ObjectTextureVariants) -> GeneratedModel:
     return model
 
 
+def _scan_projection_result(
+    glb_bytes: bytes,
+    percentages: tuple[int, ...],
+    target_domain: str,
+) -> ScanProjectionResult:
+    """Build deterministic weighted-projection output for worker tests."""
+
+    compact_target = target_domain in {
+        SCAN_PROJECTION_TARGET_LEFT_HALF,
+        SCAN_PROJECTION_TARGET_TOP_LEFT_QUARTER,
+    }
+    target_width = 1_024 if compact_target else 2_048
+    target_height = (
+        1_024
+        if target_domain == SCAN_PROJECTION_TARGET_TOP_LEFT_QUARTER
+        else 2_048
+    )
+    face_count = build_uv_fingerprint(glb_bytes).face_count
+    return ScanProjectionResult(
+        glb_bytes=glb_bytes,
+        stats=ScanProjectionStats(
+            version=SCAN_PROJECTION_VERSION,
+            camera_percentages=percentages,
+            view_face_counts=(1, 1, 0, 0, 0, 0),
+            view_pixel_counts=percentages,
+            face_count=face_count,
+            output_face_count=face_count,
+            source_vertex_count=4,
+            output_vertex_count=face_count * 3,
+            texture_resolution=2_048,
+            target_domain=target_domain,
+            target_width=target_width,
+            target_height=target_height,
+            island_padding_pixels=0,
+            outer_safety_inset_pixels=(
+                4 if target_domain == SCAN_PROJECTION_TARGET_LEFT_HALF else 0
+            ),
+            usable_pixel_count=100,
+            covered_pixel_count=98,
+            triangle_occupancy=0.98,
+        ),
+    )
+
+
 def _record_variant_paths(record: GeneratedObjectRecord) -> set[str]:
     raw_variants = record.pipeline["texture_variants"]
     return {
@@ -358,6 +428,32 @@ class TextureRegenerationRequestTests(unittest.TestCase):
         self.assertTrue(locally_unwrapped_request.enable_original_uv)
         self.assertFalse(locally_unwrapped_request.preserve_symmetric_uvs)
 
+    def test_request_snapshots_and_validates_camera_percentages(self) -> None:
+        percentages = [35, 25, 15, 10, 10, 5]
+        request = TextureRegenerationRequest(
+            object_id="chair",
+            reference_frame_index=0,
+            reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
+            model_glb=b"model",
+            settings=GenerationServiceSettings(),
+            projection_camera_percentages=percentages,
+        )
+        percentages[0] = 1
+
+        self.assertEqual(
+            request.projection_camera_percentages,
+            (35, 25, 15, 10, 10, 5),
+        )
+        with self.assertRaisesRegex(ValueError, "exactly 100"):
+            TextureRegenerationRequest(
+                object_id="chair",
+                reference_frame_index=0,
+                reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
+                model_glb=b"model",
+                settings=GenerationServiceSettings(),
+                projection_camera_percentages=(20, 20, 20, 20, 20, 20),
+            )
+
     def test_request_rejects_empty_identity_image_and_model(self) -> None:
         settings = GenerationServiceSettings(meshy_api_key="msy-key")
         valid_image = np.zeros((2, 2, 4), dtype=np.uint8)
@@ -374,6 +470,314 @@ class TextureRegenerationRequestTests(unittest.TestCase):
                         settings=settings,
                         **invalid,
                     )
+
+    def test_regenerated_pipeline_replaces_weighted_camera_metadata(
+        self,
+    ) -> None:
+        percentages = (35, 25, 15, 10, 10, 5)
+        source_glb = _uv_glb(texture_resolution=2048)
+        submitted_fingerprint = build_uv_fingerprint(source_glb)
+        projected_glb = _uv_glb(
+            mutate_uv=True,
+            subdivide_faces=True,
+            texture_resolution=2048,
+        )
+        final_fingerprint = build_uv_fingerprint(projected_glb)
+        projection = _scan_projection_result(
+            projected_glb,
+            percentages,
+            SCAN_PROJECTION_TARGET_FULL,
+        )
+        record = replace(
+            _record("chair", "old.glb"),
+            pipeline={
+                VISIBILITY_UV_UNWRAP_PIPELINE_KEY: {
+                    "version": 1,
+                    "source": "superseded",
+                },
+                SCAN_PROJECTION_PIPELINE_KEY: {
+                    "camera_percentages": {
+                        camera_id: 0 for camera_id in ALL_CAMERA_IDS
+                    }
+                }
+            },
+        )
+        request = TextureRegenerationRequest(
+            object_id="chair",
+            reference_frame_index=4,
+            reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
+            model_glb=source_glb,
+            settings=GenerationServiceSettings(
+                use_uv_raycast_for_object_generation=True,
+            ),
+            enable_original_uv=True,
+            submitted_uv_fingerprint=submitted_fingerprint,
+            projection_camera_percentages=percentages,
+        )
+        outcome = TextureRegenerationOutcome(
+            request=request,
+            result=MeshyGenerationResult("texture-task", projected_glb),
+            preserved_uv_fingerprint=submitted_fingerprint,
+            final_uv_fingerprint=final_fingerprint,
+            scan_projection_stats=projection.stats,
+        )
+        variants = {
+            str(resolution): {
+                "glb_asset_path": f"chair-{resolution}.glb",
+                "texture_asset_path": f"chair-{resolution}.png",
+            }
+            for resolution in TEXTURE_RESOLUTIONS
+        }
+
+        pipeline = _build_regenerated_texture_pipeline(
+            record,
+            outcome,
+            variants,
+        )
+
+        self.assertTrue(pipeline[LOCALLY_AUTHORED_UVS_PIPELINE_KEY])
+        self.assertNotIn(VISIBILITY_UV_UNWRAP_PIPELINE_KEY, pipeline)
+        self.assertEqual(
+            tuple(
+                pipeline[SCAN_PROJECTION_PIPELINE_KEY][
+                    "camera_percentages"
+                ].values()
+            ),
+            percentages,
+        )
+        self.assertEqual(
+            pipeline["postprocessed_asset_path"],
+            "chair-2048.glb",
+        )
+        self.assertEqual(pipeline["texture_regeneration_uv_face_count"], 4)
+        self.assertEqual(
+            pipeline["texture_regeneration_submitted_uv_face_count"],
+            2,
+        )
+        self.assertEqual(
+            pipeline["texture_regeneration_final_uv_face_count"],
+            4,
+        )
+        self.assertEqual(
+            tuple(
+                pipeline["texture_regeneration_history"][-1][
+                    "projection_camera_percentages"
+                ].values()
+            ),
+            percentages,
+        )
+        history_entry = pipeline["texture_regeneration_history"][-1]
+        self.assertEqual(history_entry["submitted_uv_face_count"], 2)
+        self.assertEqual(history_entry["final_uv_face_count"], 4)
+
+    def test_symmetric_final_fingerprint_uses_persisted_1024_glb(self) -> None:
+        intermediate_glb = _uv_glb(
+            left_packed=True,
+            texture_resolution=2048,
+        )
+        persisted_glb = _uv_glb(
+            left_packed=True,
+            mutate_uv=True,
+            texture_resolution=1024,
+        )
+        intermediate_fingerprint = build_uv_fingerprint(intermediate_glb)
+        persisted_fingerprint = build_uv_fingerprint(persisted_glb)
+        self.assertNotEqual(
+            intermediate_fingerprint.sha256,
+            persisted_fingerprint.sha256,
+        )
+        symmetry = SymmetricDivisionMetadata(
+            version=AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
+            orientation=SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+            kept_side=SYMMETRIC_DIVISION_SIDE_LEFT,
+            plane_coordinate=0.0,
+            packing_mode=SYMMETRIC_TEXTURE_PACKING_MODE_PAIR,
+            texture_content_half=SYMMETRIC_TEXTURE_CONTENT_HALF_LEFT,
+            selection_mode=(
+                SYMMETRIC_SELECTION_MODE_FEWEST_TRIANGLES_RANDOM_TIE
+            ),
+            triangle_count_by_side=(("left", 2), ("right", 5)),
+            tie_broken_randomly=False,
+        )
+        record = replace(
+            _record("symmetric", "symmetric-1024.glb"),
+            pipeline={"symmetric_division": symmetry.to_pipeline_dict()},
+        )
+        request = TextureRegenerationRequest(
+            object_id="symmetric",
+            reference_frame_index=0,
+            reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
+            model_glb=intermediate_glb,
+            settings=GenerationServiceSettings(),
+            enable_original_uv=True,
+            submitted_uv_fingerprint=intermediate_fingerprint,
+            preserve_symmetric_uvs=True,
+        )
+        outcome = TextureRegenerationOutcome(
+            request=request,
+            result=MeshyGenerationResult("texture-task", intermediate_glb),
+            preserved_uv_fingerprint=intermediate_fingerprint,
+            final_uv_fingerprint=intermediate_fingerprint,
+            scan_projection_stats=_scan_projection_result(
+                intermediate_glb,
+                DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
+                SCAN_PROJECTION_TARGET_LEFT_HALF,
+            ).stats,
+        )
+        variants = SymmetricSquarePairTextureVariants(
+            glb_by_resolution={512: persisted_glb, 1024: persisted_glb},
+            texture_png_by_resolution={512: b"png-512", 1024: b"png-1024"},
+            preview_rgba_by_resolution={
+                512: np.zeros((512, 512, 4), dtype=np.uint8),
+                1024: np.zeros((1024, 1024, 4), dtype=np.uint8),
+            },
+        )
+
+        updated = _with_persisted_canonical_uv_fingerprint(
+            outcome,
+            record,
+            variants,
+        )
+
+        self.assertEqual(updated.final_uv_fingerprint, persisted_fingerprint)
+
+    def test_first_weighted_retexture_records_its_final_uv_face_count(
+        self,
+    ) -> None:
+        percentages = (35, 25, 15, 10, 10, 5)
+        projected_glb = _uv_glb(
+            mutate_uv=True,
+            subdivide_faces=True,
+            texture_resolution=2048,
+        )
+        final_fingerprint = build_uv_fingerprint(projected_glb)
+        projection = _scan_projection_result(
+            projected_glb,
+            percentages,
+            SCAN_PROJECTION_TARGET_FULL,
+        )
+        request = TextureRegenerationRequest(
+            object_id="chair",
+            reference_frame_index=0,
+            reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
+            model_glb=_uv_glb(texture_resolution=2048),
+            settings=GenerationServiceSettings(
+                use_uv_raycast_for_object_generation=True,
+            ),
+            projection_camera_percentages=percentages,
+        )
+        outcome = TextureRegenerationOutcome(
+            request=request,
+            result=MeshyGenerationResult("texture-task", projected_glb),
+            final_uv_fingerprint=final_fingerprint,
+            scan_projection_stats=projection.stats,
+        )
+        variants = {
+            str(resolution): {
+                "glb_asset_path": f"chair-{resolution}.glb",
+                "texture_asset_path": f"chair-{resolution}.png",
+            }
+            for resolution in TEXTURE_RESOLUTIONS
+        }
+
+        pipeline = _build_regenerated_texture_pipeline(
+            _record("chair", "old.glb"),
+            outcome,
+            variants,
+        )
+
+        self.assertTrue(pipeline[LOCALLY_AUTHORED_UVS_PIPELINE_KEY])
+        self.assertFalse(pipeline["retexture_enable_original_uv"])
+        self.assertEqual(
+            pipeline["texture_regeneration_final_uv_fingerprint"],
+            final_fingerprint.sha256,
+        )
+        self.assertEqual(
+            pipeline["texture_regeneration_final_uv_face_count"],
+            final_fingerprint.face_count,
+        )
+        self.assertEqual(
+            pipeline["texture_regeneration_uv_face_count"],
+            final_fingerprint.face_count,
+        )
+        self.assertNotIn(
+            "texture_regeneration_submitted_uv_fingerprint",
+            pipeline,
+        )
+
+    def test_legacy_quarter_symmetry_rebuilds_inside_its_saved_layout(
+        self,
+    ) -> None:
+        source_glb = _uv_glb(
+            left_packed=True,
+            texture_resolution=2048,
+        )
+        source_fingerprint = build_uv_fingerprint(source_glb)
+        projected_glb = _uv_glb(
+            left_packed=True,
+            mutate_uv=True,
+            texture_resolution=2048,
+        )
+        final_fingerprint = build_uv_fingerprint(projected_glb)
+        percentages = (35, 25, 15, 10, 10, 5)
+        symmetry = ObjectSymmetricDivisionMetadata(
+            version=SYMMETRIC_QUARTER_METADATA_VERSION,
+            orientation=SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+            kept_side=SYMMETRIC_DIVISION_SIDE_LEFT,
+            plane_coordinate=0.0,
+            packing_mode=SYMMETRIC_TEXTURE_PACKING_MODE_TOP_LEFT_QUARTER,
+            texture_content_quadrant=(
+                SYMMETRIC_TEXTURE_CONTENT_QUADRANT_TOP_LEFT
+            ),
+            selection_mode=(
+                SYMMETRIC_SELECTION_MODE_FEWEST_TRIANGLES_RANDOM_TIE
+            ),
+            triangle_count_by_side=(("left", 2), ("right", 5)),
+            tie_broken_randomly=False,
+        )
+        request = TextureRegenerationRequest(
+            object_id="legacy-quarter",
+            reference_frame_index=0,
+            reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
+            model_glb=source_glb,
+            settings=GenerationServiceSettings(
+                use_uv_raycast_for_object_generation=True,
+            ),
+            enable_original_uv=True,
+            submitted_uv_fingerprint=source_fingerprint,
+            preserve_symmetric_uvs=True,
+            projection_camera_percentages=percentages,
+        )
+        projection = _scan_projection_result(
+            projected_glb,
+            percentages,
+            SCAN_PROJECTION_TARGET_TOP_LEFT_QUARTER,
+        )
+        outcome = TextureRegenerationOutcome(
+            request=request,
+            result=MeshyGenerationResult("texture-task", projected_glb),
+            preserved_uv_fingerprint=source_fingerprint,
+            final_uv_fingerprint=final_fingerprint,
+            scan_projection_stats=projection.stats,
+        )
+
+        self.assertEqual(
+            _texture_regeneration_scan_target(request, symmetry),
+            SCAN_PROJECTION_TARGET_TOP_LEFT_QUARTER,
+        )
+        _validate_symmetric_texture_regeneration_uvs(outcome, symmetry)
+        invalid_outcome = replace(
+            outcome,
+            scan_projection_stats=replace(
+                projection.stats,
+                target_domain=SCAN_PROJECTION_TARGET_LEFT_HALF,
+            ),
+        )
+        with self.assertRaises(UvIntegrityError):
+            _validate_symmetric_texture_regeneration_uvs(
+                invalid_outcome,
+                symmetry,
+            )
 
 
 # ### Symmetric provider-proxy tests ###
@@ -631,7 +1035,10 @@ class MeshyTextureRegeneratorTests(unittest.TestCase):
             reference_frame_index=0,
             reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
             model_glb=submitted_glb,
-            settings=GenerationServiceSettings(meshy_api_key="msy-secret"),
+            settings=GenerationServiceSettings(
+                meshy_api_key="msy-secret",
+                unused_face_removal=True,
+            ),
             enable_original_uv=True,
             submitted_uv_fingerprint=submitted_fingerprint,
             preserve_symmetric_uvs=True,
@@ -673,11 +1080,15 @@ class MeshyTextureRegeneratorTests(unittest.TestCase):
         failed = QSignalSpy(worker.failed)
         finished = QSignalSpy(worker.finished)
 
-        worker.run()
+        with patch(
+            "housemaker.generation_workspace.remove_unused_faces_from_glb"
+        ) as remove_faces:
+            worker.run()
 
         self.assertEqual(succeeded.count(), 1)
         self.assertEqual(failed.count(), 0)
         self.assertEqual(finished.count(), 1)
+        remove_faces.assert_not_called()
         self.assertEqual(len(regenerator.requests), 1)
         provider_request = regenerator.requests[0]
         self.assertEqual(
@@ -711,6 +1122,340 @@ class MeshyTextureRegeneratorTests(unittest.TestCase):
                 build_uv_fingerprint(variant_glb),
                 submitted_fingerprint,
             )
+
+    def test_worker_repurges_changed_ordinary_retexture_geometry(self) -> None:
+        submitted_glb = _uv_glb(texture_resolution=2048)
+        provider_glb = _uv_glb(
+            subdivide_faces=True,
+            texture_resolution=2048,
+            texture_color=(170, 45, 80, 255),
+        )
+        cleaned_glb = _uv_glb(
+            texture_resolution=2048,
+            texture_color=(170, 45, 80, 255),
+        )
+        request = TextureRegenerationRequest(
+            object_id="ordinary-chair",
+            reference_frame_index=0,
+            reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
+            model_glb=submitted_glb,
+            settings=GenerationServiceSettings(
+                meshy_api_key="msy-secret",
+                unused_face_removal=True,
+                minimum_face_visibility_percentage=9,
+            ),
+        )
+        regenerator = _SequenceTextureRegenerator(
+            [MeshyGenerationResult("changed-task", provider_glb, "Changed")]
+        )
+        cleanup = UnusedFaceRemovalResult(
+            model=import_generated_glb(cleaned_glb),
+            enabled_camera_ids=ALL_CAMERA_IDS,
+            original_face_count=4,
+            retained_face_count=2,
+            removed_face_count=2,
+            protected_face_count=2,
+            visibility_removed_face_count=1,
+            stacked_face_removed_count=1,
+        )
+        worker = TextureRegenerationWorker(
+            regenerator,
+            MeshyModelExecutor(),
+            request,
+        )
+        succeeded = QSignalSpy(worker.succeeded)
+        failed = QSignalSpy(worker.failed)
+
+        with patch(
+            "housemaker.generation_workspace.remove_unused_faces_from_glb",
+            return_value=cleanup,
+        ) as remove_faces:
+            worker.run()
+
+        self.assertEqual(failed.count(), 0)
+        self.assertEqual(succeeded.count(), 1)
+        remove_faces.assert_called_once()
+        self.assertEqual(remove_faces.call_args.args[0], provider_glb)
+        self.assertEqual(
+            remove_faces.call_args.kwargs["options"].minimum_visible_fraction,
+            0.09,
+        )
+        outcome = succeeded.at(0)[0]
+        self.assertTrue(outcome.final_face_removal_applied)
+        self.assertEqual(outcome.final_removed_face_count, 2)
+        self.assertEqual(outcome.final_visibility_removed_face_count, 1)
+        self.assertEqual(outcome.final_stacked_face_removed_count, 1)
+        self.assertTrue(outcome.retexture_topology_changed)
+        self.assertEqual(outcome.result.glb_bytes, cleaned_glb)
+
+    def test_worker_rebuilds_ordinary_uvs_after_final_face_cleanup(self) -> None:
+        percentages = (35, 25, 15, 10, 10, 5)
+        submitted_glb = _uv_glb(texture_resolution=2048)
+        provider_glb = _uv_glb(
+            subdivide_faces=True,
+            texture_resolution=2048,
+        )
+        cleaned_glb = _uv_glb(texture_resolution=2048)
+        projected_glb = _uv_glb(
+            mutate_uv=True,
+            texture_resolution=2048,
+        )
+        request = TextureRegenerationRequest(
+            object_id="ordinary-chair",
+            reference_frame_index=0,
+            reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
+            model_glb=submitted_glb,
+            settings=GenerationServiceSettings(
+                unused_face_removal=True,
+                use_uv_raycast_for_object_generation=True,
+            ),
+            projection_camera_percentages=percentages,
+        )
+        cleanup = UnusedFaceRemovalResult(
+            model=import_generated_glb(cleaned_glb),
+            enabled_camera_ids=ALL_CAMERA_IDS,
+            original_face_count=4,
+            retained_face_count=2,
+            removed_face_count=2,
+            protected_face_count=2,
+        )
+        worker = TextureRegenerationWorker(
+            _SequenceTextureRegenerator(
+                [MeshyGenerationResult("texture-task", provider_glb)]
+            ),
+            MeshyModelExecutor(),
+            request,
+        )
+        succeeded = QSignalSpy(worker.succeeded)
+        failed = QSignalSpy(worker.failed)
+
+        with patch(
+            "housemaker.generation_workspace.remove_unused_faces_from_glb",
+            return_value=cleanup,
+        ), patch(
+            "housemaker.generation_workspace.scan_project_textured_glb",
+            return_value=_scan_projection_result(
+                projected_glb,
+                percentages,
+                SCAN_PROJECTION_TARGET_FULL,
+            ),
+        ) as scan_projection:
+            worker.run()
+
+        self.assertEqual(failed.count(), 0)
+        self.assertEqual(succeeded.count(), 1)
+        scan_projection.assert_called_once()
+        self.assertEqual(scan_projection.call_args.args[0], cleaned_glb)
+        self.assertEqual(scan_projection.call_args.args[1], percentages)
+        self.assertEqual(
+            scan_projection.call_args.kwargs["target_domain"],
+            SCAN_PROJECTION_TARGET_FULL,
+        )
+        outcome = succeeded.at(0)[0]
+        self.assertEqual(outcome.result.glb_bytes, projected_glb)
+        self.assertEqual(
+            outcome.scan_projection_stats.camera_percentages,
+            percentages,
+        )
+        self.assertEqual(
+            outcome.final_uv_fingerprint,
+            build_uv_fingerprint(projected_glb),
+        )
+
+    def test_worker_rebuilds_uvs_on_authoritative_face_edited_geometry(
+        self,
+    ) -> None:
+        percentages = (5, 10, 15, 20, 25, 25)
+        submitted_glb = _uv_glb(texture_resolution=2048)
+        submitted_fingerprint = build_uv_fingerprint(submitted_glb)
+        provider_glb = _uv_glb(
+            subdivide_faces=True,
+            texture_resolution=2048,
+            texture_color=(80, 160, 30, 255),
+        )
+        projected_glb = _uv_glb(
+            mutate_uv=True,
+            texture_resolution=2048,
+            texture_color=(80, 160, 30, 255),
+        )
+        request = TextureRegenerationRequest(
+            object_id="edited-chair",
+            reference_frame_index=0,
+            reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
+            model_glb=submitted_glb,
+            settings=GenerationServiceSettings(
+                use_uv_raycast_for_object_generation=True,
+            ),
+            enable_original_uv=True,
+            submitted_uv_fingerprint=submitted_fingerprint,
+            projection_camera_percentages=percentages,
+        )
+        worker = TextureRegenerationWorker(
+            _SequenceTextureRegenerator(
+                [MeshyGenerationResult("texture-task", provider_glb)]
+            ),
+            MeshyModelExecutor(),
+            request,
+        )
+        succeeded = QSignalSpy(worker.succeeded)
+        failed = QSignalSpy(worker.failed)
+
+        def project_authoritative_geometry(
+            glb_bytes: bytes,
+            camera_percentages: tuple[int, ...],
+            **kwargs: object,
+        ) -> ScanProjectionResult:
+            self.assertEqual(
+                len(import_generated_glb(glb_bytes).mesh.faces),
+                2,
+            )
+            self.assertEqual(camera_percentages, percentages)
+            self.assertEqual(
+                kwargs["target_domain"],
+                SCAN_PROJECTION_TARGET_FULL,
+            )
+            return _scan_projection_result(
+                projected_glb,
+                percentages,
+                SCAN_PROJECTION_TARGET_FULL,
+            )
+
+        with patch(
+            "housemaker.generation_workspace.scan_project_textured_glb",
+            side_effect=project_authoritative_geometry,
+        ) as scan_projection:
+            worker.run()
+
+        self.assertEqual(failed.count(), 0)
+        self.assertEqual(succeeded.count(), 1)
+        scan_projection.assert_called_once()
+        outcome = succeeded.at(0)[0]
+        self.assertEqual(
+            outcome.preserved_uv_fingerprint,
+            submitted_fingerprint,
+        )
+        self.assertEqual(
+            outcome.final_uv_fingerprint,
+            build_uv_fingerprint(projected_glb),
+        )
+        self.assertNotEqual(
+            outcome.final_uv_fingerprint,
+            submitted_fingerprint,
+        )
+
+    def test_worker_rebuilds_symmetric_uvs_inside_left_half(self) -> None:
+        percentages = (10, 10, 20, 20, 20, 20)
+        submitted_glb = _uv_glb(
+            left_packed=True,
+            texture_resolution=2048,
+        )
+        submitted_fingerprint = build_uv_fingerprint(submitted_glb)
+        provider_glb = build_symmetric_retexture_proxy_glb(
+            _uv_glb(
+                left_packed=True,
+                texture_resolution=2048,
+                texture_color=(120, 40, 180, 255),
+            ),
+            SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+            0.0,
+        )
+        projected_glb = _uv_glb(
+            mutate_uv=True,
+            subdivide_faces=True,
+            left_packed=True,
+            texture_resolution=2048,
+            texture_color=(120, 40, 180, 255),
+        )
+        request = TextureRegenerationRequest(
+            object_id="symmetric-chair",
+            reference_frame_index=0,
+            reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
+            model_glb=submitted_glb,
+            settings=GenerationServiceSettings(
+                use_uv_raycast_for_object_generation=True,
+            ),
+            enable_original_uv=True,
+            submitted_uv_fingerprint=submitted_fingerprint,
+            preserve_symmetric_uvs=True,
+            projection_camera_percentages=percentages,
+        )
+        symmetry = SymmetricDivisionMetadata(
+            orientation=SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+            kept_side=SYMMETRIC_DIVISION_SIDE_RIGHT,
+            plane_coordinate=0.0,
+        )
+        worker = TextureRegenerationWorker(
+            _SequenceTextureRegenerator(
+                [MeshyGenerationResult("texture-task", provider_glb)]
+            ),
+            MeshyModelExecutor(),
+            request,
+            symmetry=symmetry,
+        )
+        succeeded = QSignalSpy(worker.succeeded)
+        failed = QSignalSpy(worker.failed)
+
+        with patch(
+            "housemaker.generation_workspace.scan_project_textured_glb",
+            return_value=_scan_projection_result(
+                projected_glb,
+                percentages,
+                SCAN_PROJECTION_TARGET_LEFT_HALF,
+            ),
+        ) as scan_projection:
+            worker.run()
+
+        self.assertEqual(failed.count(), 0)
+        self.assertEqual(succeeded.count(), 1)
+        self.assertEqual(
+            scan_projection.call_args.kwargs["target_domain"],
+            SCAN_PROJECTION_TARGET_LEFT_HALF,
+        )
+        outcome = succeeded.at(0)[0]
+        self.assertEqual(
+            outcome.preserved_uv_fingerprint,
+            submitted_fingerprint,
+        )
+        self.assertEqual(outcome.result.glb_bytes, projected_glb)
+        self.assertEqual(outcome.final_uv_fingerprint.face_count, 4)
+        _validate_symmetric_texture_regeneration_uvs(outcome)
+
+    def test_worker_keeps_uvs_when_weighted_projection_is_disabled(self) -> None:
+        submitted_glb = _uv_glb(texture_resolution=2048)
+        provider_glb = _uv_glb(
+            mutate_uv=True,
+            texture_resolution=2048,
+        )
+        request = TextureRegenerationRequest(
+            object_id="ordinary-chair",
+            reference_frame_index=0,
+            reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
+            model_glb=submitted_glb,
+            settings=GenerationServiceSettings(
+                use_uv_raycast_for_object_generation=False,
+            ),
+        )
+        worker = TextureRegenerationWorker(
+            _SequenceTextureRegenerator(
+                [MeshyGenerationResult("texture-task", provider_glb)]
+            ),
+            MeshyModelExecutor(),
+            request,
+        )
+        succeeded = QSignalSpy(worker.succeeded)
+        failed = QSignalSpy(worker.failed)
+
+        with patch(
+            "housemaker.generation_workspace.scan_project_textured_glb"
+        ) as scan_projection:
+            worker.run()
+
+        self.assertEqual(failed.count(), 0)
+        self.assertEqual(succeeded.count(), 1)
+        scan_projection.assert_not_called()
+        outcome = succeeded.at(0)[0]
+        self.assertEqual(outcome.result.glb_bytes, provider_glb)
+        self.assertIsNone(outcome.scan_projection_stats)
 
     def test_worker_preserves_locally_unwrapped_geometry_when_meshy_remeshes(
         self,
@@ -1077,6 +1822,59 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
             _qt_application.processEvents()
             QTest.qWait(10)
         self.assertTrue(event.is_set(), "Blocking provider did not start.")
+
+    def test_texture_request_snapshots_current_camera_allocations(self) -> None:
+        self._seed_object(0, name="Chair", task_id="geometry-task")
+        self._load_reference()
+        self.workspace.set_runtime_settings(
+            GenerationServiceSettings(
+                meshy_api_key="msy-test-key",
+                use_uv_raycast_for_object_generation=True,
+            )
+        )
+        panel = self.workspace.object_3d_panel
+        expected = panel.set_projection_camera_percentage(
+            ALL_CAMERA_IDS[0],
+            35,
+        )
+
+        preflight = self.workspace._build_texture_regeneration_request()
+
+        self.assertIsNotNone(preflight)
+        assert preflight is not None
+        self.assertEqual(
+            preflight.projection_camera_percentages,
+            expected,
+        )
+        panel.set_projection_camera_percentage(ALL_CAMERA_IDS[0], 36)
+        self.assertEqual(
+            preflight.projection_camera_percentages,
+            expected,
+        )
+
+    def test_invalid_camera_total_disables_texture_generation(self) -> None:
+        self._seed_object(0, name="Chair", task_id="geometry-task")
+        self._load_reference()
+        self.workspace.set_runtime_settings(
+            GenerationServiceSettings(
+                meshy_api_key="msy-test-key",
+                use_uv_raycast_for_object_generation=True,
+            )
+        )
+        panel = self.workspace.object_3d_panel
+        panel.projection_camera_percentage_spinboxes[
+            ALL_CAMERA_IDS[0]
+        ].setValue(16)
+        _qt_application.processEvents()
+
+        self.assertFalse(panel.projection_camera_percentages_are_valid())
+        self.assertFalse(
+            self.workspace.regenerate_texture_button.isEnabled()
+        )
+        self.assertIsNone(
+            self.workspace._build_texture_regeneration_request()
+        )
+        self.assertIn("must total 100%", self.workspace.status_label.text())
 
     def test_global_resolution_selection_updates_object_generation_once(
         self,
