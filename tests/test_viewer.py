@@ -16,18 +16,22 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # ### Imports ###
 from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
 from PySide6.QtGui import QFocusEvent, QKeyEvent, QVector3D
+from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import QApplication
 from PIL import Image
 from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
 from housemaker.camera_models import CameraPose
+from housemaker.camera_indicators import INDICATOR_SELECTED_COLOR
 from housemaker.glb import GeneratedModel, PreviewTexturedWall
+from housemaker.unused_face_removal import ALL_CAMERA_IDS
 from housemaker.viewer import (
     NAVIGATION_MODE_FIRST_PERSON,
     NAVIGATION_MODE_ORBIT,
     GlbViewerWidget,
     SelectableGLViewWidget,
+    _project_vertices_to_view,
 )
 
 
@@ -443,17 +447,212 @@ class GlbViewerRenderingTests(unittest.TestCase):
         self.assertEqual(viewer.get_first_person_camera_pose(), pose)
         self.assertAlmostEqual(float(viewer.view.opts["distance"]), 1.0)
 
-    def test_generated_model_has_no_camera_indicator_scene_items(self) -> None:
+    def test_projection_camera_indicators_are_opt_in(self) -> None:
         viewer = self._build_viewer()
 
         viewer.set_model(_build_generated_model())
 
+        self.assertFalse(viewer.get_projection_camera_indicators_visible())
+        self.assertEqual(viewer.projection_camera_indicator_items, {})
         self.assertFalse(
             any(
                 isinstance(item, (gl.GLLinePlotItem, gl.GLTextItem))
                 for item in viewer.view.items
             )
         )
+
+    def test_projection_camera_indicators_follow_model_lifecycle(self) -> None:
+        viewer = self._build_viewer()
+
+        viewer.set_projection_camera_indicators_visible(True)
+
+        self.assertTrue(viewer.get_projection_camera_indicators_visible())
+        self.assertEqual(viewer.projection_camera_indicator_items, {})
+
+        viewer.set_model(_build_generated_model())
+
+        first_indicators = viewer.projection_camera_indicator_items
+        self.assertEqual(tuple(first_indicators), ALL_CAMERA_IDS)
+        first_items = tuple(
+            item
+            for camera_items in first_indicators.values()
+            for item in camera_items
+        )
+        self.assertTrue(
+            all(item.visible() and item in viewer.view.items for item in first_items)
+        )
+
+        viewer.clear_model()
+
+        self.assertTrue(viewer.get_projection_camera_indicators_visible())
+        self.assertEqual(viewer.projection_camera_indicator_items, {})
+        self.assertTrue(all(item not in viewer.view.items for item in first_items))
+
+        viewer.set_model(_build_generated_model())
+
+        rebuilt_indicators = viewer.projection_camera_indicator_items
+        self.assertEqual(tuple(rebuilt_indicators), ALL_CAMERA_IDS)
+        self.assertTrue(
+            all(
+                item not in first_items
+                for camera_items in rebuilt_indicators.values()
+                for item in camera_items
+            )
+        )
+
+        viewer.set_projection_camera_indicators_visible(False)
+
+        self.assertFalse(viewer.get_projection_camera_indicators_visible())
+        self.assertEqual(viewer.projection_camera_indicator_items, {})
+        self.assertTrue(
+            all(
+                item not in viewer.view.items
+                for camera_items in rebuilt_indicators.values()
+                for item in camera_items
+            )
+        )
+
+    def test_projection_camera_bounds_include_symmetric_mirror(self) -> None:
+        viewer = self._build_viewer()
+        model = _build_generated_model()
+        model.mesh.apply_translation((0.5, 0.0, 0.0))
+        viewer.set_projection_camera_indicators_visible(True)
+        viewer.set_model(model)
+
+        np.testing.assert_allclose(
+            viewer._get_projection_camera_indicator_bounds(),
+            ((0.0, -0.5, -0.5), (1.0, 0.5, 0.5)),
+        )
+        original_items = tuple(
+            item
+            for camera_items in (
+                viewer.projection_camera_indicator_items.values()
+            )
+            for item in camera_items
+        )
+
+        viewer.set_symmetric_division_preview("vertical", 0.0)
+
+        np.testing.assert_allclose(
+            viewer._get_projection_camera_indicator_bounds(),
+            ((-1.0, -0.5, -0.5), (1.0, 0.5, 0.5)),
+        )
+        self.assertTrue(
+            all(item not in viewer.view.items for item in original_items)
+        )
+        self.assertEqual(
+            tuple(viewer.projection_camera_indicator_items),
+            ALL_CAMERA_IDS,
+        )
+
+    def test_projection_camera_picker_selects_screen_geometry_without_items_at(
+        self,
+    ) -> None:
+        viewer = self._build_viewer(face_editing_enabled=True)
+        viewer.resize(640, 480)
+        viewer.set_projection_camera_indicators_visible(True)
+        viewer.set_model(_build_generated_model())
+        viewer.show()
+        _qt_application.processEvents()
+        viewport = (0, 0, viewer.view.width(), viewer.view.height())
+        view_projection = (
+            viewer.view.projectionMatrix(viewport, viewport)
+            * viewer.view.viewMatrix()
+        )
+        target_id = ALL_CAMERA_IDS[0]
+        geometry = viewer.projection_camera_indicator_geometries[target_id]
+        projected = _project_vertices_to_view(
+            geometry.selection_line_positions,
+            view_projection,
+            viewer.view.width(),
+            viewer.view.height(),
+        )
+        usable = projected[
+            np.all(np.isfinite(projected), axis=1)
+            & (projected[:, 3] > 0.0)
+            & (projected[:, 2] >= -1.0)
+            & (projected[:, 2] <= 1.0)
+        ]
+        self.assertGreater(len(usable), 0)
+        position = QPointF(float(usable[0, 0]), float(usable[0, 1]))
+        selected = QSignalSpy(viewer.projection_camera_selection_changed)
+
+        with patch.object(
+            viewer.view,
+            "_get_clicked_items",
+            side_effect=AssertionError("Camera picking must never use itemsAt()."),
+        ):
+            QTest.mouseClick(
+                viewer.view,
+                Qt.MouseButton.LeftButton,
+                pos=position.toPoint(),
+            )
+
+        self.assertEqual(viewer.get_selected_projection_camera_id(), target_id)
+        self.assertEqual(selected.count(), 1)
+        selected_line = viewer.projection_camera_indicator_items[target_id][0]
+        self.assertEqual(tuple(selected_line.color), INDICATOR_SELECTED_COLOR)
+
+    def test_selected_camera_wheel_emits_ticks_without_zooming(self) -> None:
+        viewer = self._build_viewer()
+        viewer.set_projection_camera_indicators_visible(True)
+        viewer.set_model(_build_generated_model())
+        viewer.set_selected_projection_camera_id(ALL_CAMERA_IDS[1])
+        requested = QSignalSpy(
+            viewer.projection_camera_percentage_step_requested
+        )
+        original_distance = float(viewer.view.opts["distance"])
+
+        viewer.view.wheelEvent(FakeWheelEvent(120))
+        viewer.view.wheelEvent(FakeWheelEvent(-240))
+
+        self.assertEqual(requested.count(), 2)
+        self.assertEqual(requested.at(0), [ALL_CAMERA_IDS[1], 1])
+        self.assertEqual(requested.at(1), [ALL_CAMERA_IDS[1], -2])
+        self.assertEqual(float(viewer.view.opts["distance"]), original_distance)
+
+        viewer.set_selected_projection_camera_id(None)
+        viewer.view.wheelEvent(FakeWheelEvent(120))
+
+        self.assertLess(float(viewer.view.opts["distance"]), original_distance)
+
+    def test_partial_wheel_tick_does_not_leak_between_selected_cameras(self) -> None:
+        viewer = self._build_viewer()
+        viewer.set_projection_camera_indicators_visible(True)
+        viewer.set_model(_build_generated_model())
+        viewer.set_selected_projection_camera_id(ALL_CAMERA_IDS[0])
+        requested = QSignalSpy(
+            viewer.projection_camera_percentage_step_requested
+        )
+
+        viewer.view.wheelEvent(FakeWheelEvent(60))
+        viewer.set_selected_projection_camera_id(ALL_CAMERA_IDS[1])
+        viewer.view.wheelEvent(FakeWheelEvent(60))
+
+        self.assertEqual(requested.count(), 0)
+
+        viewer.view.wheelEvent(FakeWheelEvent(60))
+
+        self.assertEqual(requested.count(), 1)
+        self.assertEqual(requested.at(0), [ALL_CAMERA_IDS[1], 1])
+
+    def test_projection_camera_percentage_api_updates_bars_and_labels(self) -> None:
+        viewer = self._build_viewer()
+        viewer.set_projection_camera_indicators_visible(True)
+        viewer.set_model(_build_generated_model())
+        percentages = (40, 20, 10, 10, 10, 10)
+
+        viewer.set_projection_camera_percentages(percentages)
+
+        self.assertEqual(viewer.get_projection_camera_percentages(), percentages)
+        for index, camera_id in enumerate(ALL_CAMERA_IDS):
+            label_item = viewer.projection_camera_indicator_items[camera_id][3]
+            self.assertTrue(label_item.text.endswith(f"{percentages[index]}%"))
+
+        with self.assertRaisesRegex(ValueError, "between 1 and 95"):
+            viewer.set_projection_camera_percentages((0, 20, 20, 20, 20, 20))
+        with self.assertRaisesRegex(ValueError, "more than 100"):
+            viewer.set_projection_camera_percentages((20, 20, 20, 20, 20, 1))
 
 
 class BlenderNavigationTests(unittest.TestCase):

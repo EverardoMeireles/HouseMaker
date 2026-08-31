@@ -24,15 +24,19 @@ from housemaker.uv_integrity import (
 )
 from housemaker.generation_state import GeneratedObjectRecord
 from housemaker.generation_workspace import (
+    LOCALLY_AUTHORED_UVS_PIPELINE_KEY,
     OBJECT_OPERATION_UNDO_STACK_PIPELINE_KEY,
     SELECTED_TEXTURE_RESOLUTION_PIPELINE_KEY,
+    SCAN_PROJECTION_PIPELINE_KEY,
     SYMMETRIC_DIVISION_PIPELINE_KEY,
     TEXTURE_VARIANTS_PIPELINE_KEY,
+    VISIBILITY_UV_UNWRAP_PIPELINE_KEY,
     GenerationRequest,
     GenerationWorkspace,
     StagedMeshyGenerationResult,
     TextureRegenerationOutcome,
     TextureRegenerationRequest,
+    _prepare_and_persist_object_generation,
 )
 from housemaker.glb import import_generated_glb
 from housemaker.meshy_generation import MeshyGenerationResult
@@ -60,11 +64,21 @@ from housemaker.object_texture_variants import (
     TEXTURE_RESOLUTIONS,
     ObjectTextureVariants,
 )
+from housemaker.object_uv_scan_projection import (
+    LEFT_HALF_OUTER_SAFETY_INSET_PIXELS,
+    SCAN_PROJECTION_TARGET_LEFT_HALF,
+    SCAN_PROJECTION_VERSION,
+    ScanProjectionStats,
+)
 from housemaker.settings_widget import GenerationServiceSettings
 
 
 # ### Test application ###
 _qt_application = QApplication.instance() or QApplication([])
+
+
+# ### Projection fixtures ###
+_TEST_CAMERA_PERCENTAGES = (30, 20, 15, 15, 10, 10)
 
 
 # ### Fixture helpers ###
@@ -161,6 +175,7 @@ def _automatic_result(
     variants: SymmetricSquarePairTextureVariants,
     *,
     orientation: str = SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+    scan_projection_stats: ScanProjectionStats | None = None,
 ) -> SymmetricDivisionResult:
     if orientation == SYMMETRIC_DIVISION_ORIENTATION_VERTICAL:
         kept_side = SYMMETRIC_DIVISION_SIDE_LEFT
@@ -187,6 +202,28 @@ def _automatic_result(
         kept_side=kept_side,
         plane_coordinate=metadata.plane_coordinate,
         metadata=metadata,
+        scan_projection_stats=scan_projection_stats,
+    )
+
+
+def _symmetric_scan_projection_stats() -> ScanProjectionStats:
+    return ScanProjectionStats(
+        version=SCAN_PROJECTION_VERSION,
+        camera_percentages=_TEST_CAMERA_PERCENTAGES,
+        view_face_counts=(4, 3, 2, 1, 1, 1),
+        view_pixel_counts=(300, 200, 150, 150, 100, 100),
+        face_count=12,
+        source_vertex_count=8,
+        output_vertex_count=36,
+        texture_resolution=2_048,
+        target_domain=SCAN_PROJECTION_TARGET_LEFT_HALF,
+        target_width=1_024,
+        target_height=2_048,
+        island_padding_pixels=0,
+        outer_safety_inset_pixels=LEFT_HALF_OUTER_SAFETY_INSET_PIXELS,
+        usable_pixel_count=1_000,
+        covered_pixel_count=985,
+        triangle_occupancy=0.985,
     )
 
 
@@ -232,13 +269,18 @@ class GenerationSymmetricDivisionTests(unittest.TestCase):
         self,
         *,
         orientation: str = SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+        use_weighted_projection: bool = False,
     ) -> GenerationRequest:
         return GenerationRequest(
             frame_index=7,
             selected_object_bgra=np.full((4, 4, 4), 255, dtype=np.uint8),
-            settings=GenerationServiceSettings(meshy_api_key="key"),
+            settings=GenerationServiceSettings(
+                meshy_api_key="key",
+                use_uv_raycast_for_object_generation=use_weighted_projection,
+            ),
             symmetric_division_enabled=True,
             symmetric_division_orientation=orientation,
+            projection_camera_percentages=_TEST_CAMERA_PERCENTAGES,
         )
 
     def _generate_symmetric_record(
@@ -448,12 +490,19 @@ class GenerationSymmetricDivisionTests(unittest.TestCase):
             {"512 x 512", "1024 x 1024"},
         )
 
-    def test_staged_generation_does_not_persist_raw_postprocessed_revision(
+    def test_symmetric_staged_generation_uses_weighted_left_half_scan(
         self,
     ) -> None:
         source_variants = _ordinary_variants(5)
         pair_variants = _square_pair_variants(6)
-        self.workspace._active_generation_request = self._request()
+        scan_stats = _symmetric_scan_projection_stats()
+        automatic_result = _automatic_result(
+            pair_variants,
+            scan_projection_stats=scan_stats,
+        )
+        self.workspace._active_generation_request = self._request(
+            use_weighted_projection=True
+        )
         staged = StagedMeshyGenerationResult(
             task_id="texture-task",
             glb_bytes=source_variants.glb_by_resolution[2048],
@@ -461,16 +510,27 @@ class GenerationSymmetricDivisionTests(unittest.TestCase):
             geometry_task_id="geometry-task",
             source_glb_bytes=_box_glb(2.0),
             postprocessed_glb_bytes=_box_glb(3.0),
+            original_face_count=20,
+            retained_face_count=12,
+            removed_face_count=8,
+            unused_face_removal_applied=True,
         )
         with patch(
             "housemaker.generation_workspace."
             "build_automatic_symmetric_object_variants",
-            return_value=_automatic_result(pair_variants),
-        ):
+            return_value=automatic_result,
+        ) as divide_and_project:
             self.workspace._handle_generation_succeeded(
                 staged,
                 _model_with_variants(source_variants),
             )
+
+        divide_and_project.assert_called_once_with(
+            source_variants.glb_by_resolution[2048],
+            SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+            projection_camera_percentages=_TEST_CAMERA_PERCENTAGES,
+            cancellation_check=None,
+        )
         record = self.workspace.get_data().generated_objects[0]
         self.assertTrue(
             (self.asset_directory / record.pipeline["source_asset_path"]).is_file()
@@ -485,6 +545,137 @@ class GenerationSymmetricDivisionTests(unittest.TestCase):
             ".texture-1024.glb",
             record.pipeline["postprocessed_asset_path"],
         )
+        self.assertEqual(
+            record.pipeline[SYMMETRIC_DIVISION_PIPELINE_KEY],
+            automatic_result.metadata.to_pipeline_dict(),
+        )
+        self.assertTrue(record.pipeline[LOCALLY_AUTHORED_UVS_PIPELINE_KEY])
+        self.assertEqual(
+            record.pipeline[SCAN_PROJECTION_PIPELINE_KEY],
+            scan_stats.to_pipeline_dict(),
+        )
+        self.assertNotIn(VISIBILITY_UV_UNWRAP_PIPELINE_KEY, record.pipeline)
+
+    def test_weighted_projection_is_forwarded_in_gui_persistence(
+        self,
+    ) -> None:
+        source_variants = _ordinary_variants(17)
+        pair_variants = _square_pair_variants(17)
+        scan_stats = _symmetric_scan_projection_stats()
+        automatic_result = _automatic_result(
+            pair_variants,
+            orientation=SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL,
+            scan_projection_stats=scan_stats,
+        )
+        self.workspace._active_generation_request = self._request(
+            orientation=SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL,
+            use_weighted_projection=True,
+        )
+        provider_result = MeshyGenerationResult(
+            task_id="texture-task",
+            glb_bytes=source_variants.glb_by_resolution[2048],
+            name="Dense symmetric table",
+        )
+
+        with patch(
+            "housemaker.generation_workspace."
+            "build_automatic_symmetric_object_variants",
+            return_value=automatic_result,
+        ) as divide_and_project:
+            self.workspace._handle_generation_succeeded(
+                provider_result,
+                _model_with_variants(source_variants),
+            )
+
+        divide_and_project.assert_called_once_with(
+            source_variants.glb_by_resolution[2048],
+            SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL,
+            projection_camera_percentages=_TEST_CAMERA_PERCENTAGES,
+            cancellation_check=None,
+        )
+        record = self.workspace.get_data().generated_objects[0]
+        self.assertEqual(
+            record.pipeline[SYMMETRIC_DIVISION_PIPELINE_KEY],
+            automatic_result.metadata.to_pipeline_dict(),
+        )
+        self.assertEqual(
+            set(record.pipeline[TEXTURE_VARIANTS_PIPELINE_KEY]),
+            {"512", "1024"},
+        )
+        self.assertEqual(
+            record.pipeline["postprocessed_asset_path"],
+            record.pipeline[TEXTURE_VARIANTS_PIPELINE_KEY]["1024"][
+                "glb_asset_path"
+            ],
+        )
+        self.assertFalse(
+            any(
+                path.name.endswith(".postprocessed.glb")
+                for path in self.asset_directory.iterdir()
+            )
+        )
+        self.assertTrue(record.pipeline[LOCALLY_AUTHORED_UVS_PIPELINE_KEY])
+        self.assertEqual(
+            record.pipeline[SCAN_PROJECTION_PIPELINE_KEY],
+            scan_stats.to_pipeline_dict(),
+        )
+        self.assertNotIn(VISIBILITY_UV_UNWRAP_PIPELINE_KEY, record.pipeline)
+
+    def test_weighted_projection_is_forwarded_in_background_persistence(
+        self,
+    ) -> None:
+        source_variants = _ordinary_variants(19)
+        pair_variants = _square_pair_variants(19)
+        scan_stats = _symmetric_scan_projection_stats()
+        automatic_result = _automatic_result(
+            pair_variants,
+            scan_projection_stats=scan_stats,
+        )
+        provider_result = MeshyGenerationResult(
+            task_id="texture-task",
+            glb_bytes=source_variants.glb_by_resolution[2048],
+            name="Dense symmetric cupboard",
+        )
+
+        with patch(
+            "housemaker.generation_workspace."
+            "build_automatic_symmetric_object_variants",
+            return_value=automatic_result,
+        ) as divide_and_project:
+            saved = _prepare_and_persist_object_generation(
+                self.asset_directory,
+                "background-object",
+                self._request(use_weighted_projection=True),
+                provider_result,
+                _model_with_variants(source_variants),
+            )
+
+        divide_and_project.assert_called_once_with(
+            source_variants.glb_by_resolution[2048],
+            SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+            projection_camera_percentages=_TEST_CAMERA_PERCENTAGES,
+            cancellation_check=None,
+        )
+        self.assertIsNotNone(saved.symmetry)
+        assert saved.symmetry is not None
+        self.assertEqual(
+            saved.symmetry.to_pipeline_dict(),
+            automatic_result.metadata.to_pipeline_dict(),
+        )
+        self.assertEqual(
+            saved.pipeline[SYMMETRIC_DIVISION_PIPELINE_KEY],
+            automatic_result.metadata.to_pipeline_dict(),
+        )
+        self.assertEqual(
+            set(saved.pipeline[TEXTURE_VARIANTS_PIPELINE_KEY]),
+            {"512", "1024"},
+        )
+        self.assertTrue(saved.pipeline[LOCALLY_AUTHORED_UVS_PIPELINE_KEY])
+        self.assertEqual(
+            saved.pipeline[SCAN_PROJECTION_PIPELINE_KEY],
+            scan_stats.to_pipeline_dict(),
+        )
+        self.assertNotIn(VISIBILITY_UV_UNWRAP_PIPELINE_KEY, saved.pipeline)
 
     def test_transform_failure_is_transactional(self) -> None:
         source_variants = _ordinary_variants(7)

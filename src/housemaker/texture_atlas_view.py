@@ -18,15 +18,18 @@ from PySide6.QtCore import (
     QTimer,
 )
 from PySide6.QtGui import (
+    QBrush,
     QColor,
     QIcon,
     QImage,
     QImageReader,
+    QMouseEvent,
     QPainter,
     QPen,
     QPixmap,
     QPolygonF,
     QResizeEvent,
+    QShowEvent,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -62,6 +65,12 @@ UV_VERTEX_RADIUS_PIXELS = 2.5
 UV_VERTEX_OUTLINE_WIDTH_PIXELS = 1.25
 UV_OVERLAY_RESIZE_DEBOUNCE_MS = 100
 EDIT_MASK_OVERLAY_COLOR = QColor(255, 104, 24, 148)
+UV_SELECTED_FACE_FILL_COLOR = QColor(255, 104, 24, 112)
+UV_SELECTED_FACE_EDGE_COLOR = QColor("#fff0c2")
+UV_SELECTED_FACE_EDGE_WIDTH_PIXELS = 2.0
+UV_FACE_HIT_EPSILON = 1e-9
+UV_FACE_CLICK_RADIUS_PIXELS = 4.0
+UV_FACE_NEAREST_TIE_EPSILON_PIXELS = 1e-6
 
 
 # ### Atlas data model ###
@@ -77,6 +86,32 @@ AtlasImageSource = (
 UvPoint = tuple[float, float]
 UvTriangle = tuple[UvPoint, UvPoint, UvPoint]
 UvEdge = tuple[UvPoint, UvPoint]
+
+
+@dataclass(frozen=True)
+class UvFaceSelectionRequest:
+    """One texture-preview face hit using canonical object face IDs."""
+
+    face_indices: tuple[int, ...]
+    context_token: object | None = None
+
+
+@dataclass(frozen=True)
+class _UvPreviewClick:
+    """One normalized click inside the displayed texture pixmap."""
+
+    uv: UvPoint
+    pixmap_scale: UvPoint
+
+
+@dataclass(frozen=True, eq=False)
+class _IndexedUvFaceGeometry:
+    """Cached arrays for fast point queries across many UV triangles."""
+
+    triangles: np.ndarray
+    face_indices: np.ndarray
+    minimums: np.ndarray
+    maximums: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -145,6 +180,8 @@ class TextureAtlasEntry:
 class _AspectFitPreviewLabel(QLabel):
     """A label that retains its source image while the widget is resized."""
 
+    uv_clicked = Signal(object)
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._source_pixmap = QPixmap()
@@ -154,6 +191,8 @@ class _AspectFitPreviewLabel(QLabel):
         self._edit_mask_overlay_image = QImage()
         self._uv_overlay_enabled = False
         self._uv_overlay_triangles: tuple[UvTriangle, ...] = ()
+        self._selected_uv_triangles: tuple[UvTriangle, ...] = ()
+        self._uv_face_selection_enabled = False
         self._uv_overlay_geometry = _UvOverlayGeometry((), ())
         self._scaled_uv_overlay_geometry: (
             _ScaledUvOverlayGeometry | None
@@ -198,6 +237,10 @@ class _AspectFitPreviewLabel(QLabel):
     def edit_mask_image(self) -> QImage:
         return self._edit_mask_image.copy()
 
+    @property
+    def selected_uv_triangles(self) -> tuple[UvTriangle, ...]:
+        return self._selected_uv_triangles
+
     def set_edit_mask_enabled(self, enabled: bool) -> None:
         enabled = bool(enabled)
         if enabled == self._edit_mask_enabled:
@@ -232,6 +275,31 @@ class _AspectFitPreviewLabel(QLabel):
         self._invalidate_scaled_uv_overlay_geometry()
         self._sync_scaled_pixmap(defer_overlay=False)
 
+    def set_selected_uv_triangles(
+        self,
+        triangles: Sequence[Sequence[Sequence[float]]],
+    ) -> None:
+        """Highlight selected UV triangles independently of wireframe."""
+
+        normalized = _normalize_uv_triangles(triangles)
+        if normalized == self._selected_uv_triangles:
+            return
+        self._selected_uv_triangles = normalized
+        if self.isVisible():
+            self._sync_scaled_pixmap(defer_overlay=False)
+
+    def set_uv_face_selection_enabled(self, enabled: bool) -> None:
+        """Enable normalized click delivery without affecting other views."""
+
+        normalized_enabled = bool(enabled)
+        if normalized_enabled == self._uv_face_selection_enabled:
+            return
+        self._uv_face_selection_enabled = normalized_enabled
+        if normalized_enabled:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            self.unsetCursor()
+
     def flush_pending_uv_overlay(self) -> None:
         """Compose the latest coalesced resize overlay, if one is pending."""
 
@@ -252,6 +320,60 @@ class _AspectFitPreviewLabel(QLabel):
     def resizeEvent(self, event: QResizeEvent) -> None:  # type: ignore[override]
         super().resizeEvent(event)
         self._sync_scaled_pixmap(defer_overlay=True)
+
+    def showEvent(self, event: QShowEvent) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        self._sync_scaled_pixmap(defer_overlay=False)
+
+    def mouseReleaseEvent(  # type: ignore[override]
+        self,
+        event: QMouseEvent,
+    ) -> None:
+        if (
+            self._uv_face_selection_enabled
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            uv = self._map_position_to_uv(event.position())
+            if uv is not None:
+                self.uv_clicked.emit(
+                    _UvPreviewClick(
+                        uv=uv,
+                        pixmap_scale=(
+                            float(
+                                max(self._scaled_base_pixmap.width() - 1, 1)
+                            ),
+                            float(
+                                max(self._scaled_base_pixmap.height() - 1, 1)
+                            ),
+                        ),
+                    )
+                )
+                event.accept()
+                return
+        super().mouseReleaseEvent(event)
+
+    def _map_position_to_uv(self, position: QPointF) -> UvPoint | None:
+        """Map a widget point through the centered aspect-fit pixmap."""
+
+        pixmap = self._scaled_base_pixmap
+        if pixmap.isNull():
+            return None
+        contents = self.contentsRect()
+        left = contents.x() + (contents.width() - pixmap.width()) / 2.0
+        top = contents.y() + (contents.height() - pixmap.height()) / 2.0
+        width_scale = max(pixmap.width() - 1, 1)
+        height_scale = max(pixmap.height() - 1, 1)
+        local_x = float(position.x()) - left
+        local_y = float(position.y()) - top
+        if not (
+            0.0 <= local_x <= width_scale
+            and 0.0 <= local_y <= height_scale
+        ):
+            return None
+        return (
+            local_x / width_scale,
+            1.0 - local_y / height_scale,
+        )
 
     def _sync_scaled_pixmap(self, *, defer_overlay: bool) -> None:
         self._cancel_pending_uv_overlay()
@@ -293,9 +415,16 @@ class _AspectFitPreviewLabel(QLabel):
             and not self._scaled_base_pixmap.isNull()
         )
 
+    def _should_compose_selected_uv_faces(self) -> bool:
+        return bool(
+            self._selected_uv_triangles
+            and not self._scaled_base_pixmap.isNull()
+        )
+
     def _should_compose_any_overlay(self) -> bool:
         return (
             self._should_compose_edit_mask()
+            or self._should_compose_selected_uv_faces()
             or self._should_compose_uv_overlay()
         )
 
@@ -307,6 +436,11 @@ class _AspectFitPreviewLabel(QLabel):
             _compose_edit_mask_overlay(
                 composed_pixmap,
                 self._edit_mask_overlay_image,
+            )
+        if self._should_compose_selected_uv_faces():
+            _compose_selected_uv_faces(
+                composed_pixmap,
+                self._selected_uv_triangles,
             )
         if self._should_compose_uv_overlay():
             scaled_geometry = self._get_scaled_uv_overlay_geometry(
@@ -338,6 +472,7 @@ class TextureAtlasView(QWidget):
 
     atlas_selected = Signal(object)
     atlas_activated = Signal(object)
+    uv_face_selection_requested = Signal(object)
 
     def __init__(
         self,
@@ -353,6 +488,10 @@ class TextureAtlasView(QWidget):
         self._entry_by_id: dict[str, TextureAtlasEntry] = {}
         self._selected_atlas_id: str | None = None
         self._is_rebuilding_list = False
+        self._uv_face_selection_enabled = False
+        self._uv_face_geometry: _IndexedUvFaceGeometry | None = None
+        self._uv_face_selection_context_token: object | None = None
+        self._selected_uv_face_indices: tuple[int, ...] = ()
         self._build_ui()
         self.preview_label.show_message(self._empty_preview_text)
 
@@ -390,6 +529,29 @@ class TextureAtlasView(QWidget):
     def edit_mask_image(self) -> QImage:
         return self.preview_label.edit_mask_image
 
+    @property
+    def uv_face_selection_enabled(self) -> bool:
+        return self._uv_face_selection_enabled
+
+    @property
+    def uv_face_indices(self) -> tuple[int, ...]:
+        geometry = self._uv_face_geometry
+        if geometry is None:
+            return ()
+        return tuple(int(index) for index in geometry.face_indices)
+
+    @property
+    def selected_uv_face_indices(self) -> tuple[int, ...]:
+        return self._selected_uv_face_indices
+
+    @property
+    def uv_face_selection_context_token(self) -> object | None:
+        return self._uv_face_selection_context_token
+
+    @property
+    def selected_uv_triangles(self) -> tuple[UvTriangle, ...]:
+        return self.preview_label.selected_uv_triangles
+
     def set_edit_mask_enabled(self, enabled: bool) -> None:
         """Show or hide the non-destructive object-texture edit mask."""
 
@@ -412,6 +574,71 @@ class TextureAtlasView(QWidget):
         """Replace the normalized UV triangles used by the preview overlay."""
 
         self.preview_label.set_uv_overlay_triangles(triangles)
+
+    def set_uv_face_selection_enabled(self, enabled: bool) -> None:
+        """Enable face clicks for this view without changing atlas selection."""
+
+        self._uv_face_selection_enabled = bool(enabled)
+        self._sync_uv_face_selection_input()
+
+    def set_uv_face_selection_geometry(
+        self,
+        triangles: Sequence[Sequence[Sequence[float]]],
+        face_indices: Sequence[int],
+        *,
+        context_token: object | None = None,
+    ) -> None:
+        """Install selectable UV triangles mapped to canonical face IDs."""
+
+        normalized_triangles = _normalize_uv_triangles(triangles)
+        normalized_indices = _normalize_uv_face_indices(
+            face_indices,
+            sort_result=False,
+        )
+        if len(normalized_triangles) != len(normalized_indices):
+            raise ValueError(
+                "Selectable UV triangles and face IDs must have equal length."
+            )
+        if len(set(normalized_indices)) != len(normalized_indices):
+            raise ValueError("Selectable UV face IDs must be unique.")
+        self._uv_face_geometry = _build_indexed_uv_face_geometry(
+            normalized_triangles,
+            normalized_indices,
+        )
+        self._uv_face_selection_context_token = context_token
+        self._selected_uv_face_indices = ()
+        self.preview_label.set_selected_uv_triangles(())
+        self._sync_uv_face_selection_input()
+
+    def clear_uv_face_selection_geometry(self) -> None:
+        """Remove selectable face mappings and every 2D selection highlight."""
+
+        self._uv_face_geometry = None
+        self._uv_face_selection_context_token = None
+        self._selected_uv_face_indices = ()
+        self.preview_label.set_selected_uv_triangles(())
+        self._sync_uv_face_selection_input()
+
+    def set_selected_uv_face_indices(self, face_indices: object) -> None:
+        """Mirror the authoritative 3D/editor selection into this preview."""
+
+        normalized = _normalize_uv_face_indices(face_indices)
+        if normalized == self._selected_uv_face_indices:
+            return
+        self._selected_uv_face_indices = normalized
+        geometry = self._uv_face_geometry
+        if geometry is None or not normalized:
+            selected_triangles: tuple[UvTriangle, ...] = ()
+        else:
+            selected_mask = np.isin(
+                geometry.face_indices,
+                np.asarray(normalized, dtype=np.int64),
+                assume_unique=True,
+            )
+            selected_triangles = _uv_array_to_triangles(
+                geometry.triangles[selected_mask]
+            )
+        self.preview_label.set_selected_uv_triangles(selected_triangles)
 
     def flush_pending_uv_overlay(self) -> None:
         """Render the terminal coalesced overlay without waiting for its timer."""
@@ -467,6 +694,7 @@ class TextureAtlasView(QWidget):
     def clear(self) -> None:
         self.set_edit_mask(None)
         self.set_uv_overlay_triangles(())
+        self.clear_uv_face_selection_geometry()
         self.set_atlases(())
 
     def _build_ui(self) -> None:
@@ -476,6 +704,9 @@ class TextureAtlasView(QWidget):
 
         self.preview_label = _AspectFitPreviewLabel()
         self.preview_label.setObjectName("texture_atlas_preview")
+        self.preview_label.uv_clicked.connect(
+            self._handle_uv_preview_clicked
+        )
         layout.addWidget(self.preview_label, 1)
 
         self.atlas_list = QListWidget()
@@ -504,6 +735,36 @@ class TextureAtlasView(QWidget):
             self._handle_item_double_clicked
         )
         layout.addWidget(self.atlas_list)
+
+    def _sync_uv_face_selection_input(self) -> None:
+        geometry = self._uv_face_geometry
+        self.preview_label.set_uv_face_selection_enabled(
+            self._uv_face_selection_enabled
+            and geometry is not None
+            and len(geometry.face_indices) > 0
+            and self._selected_atlas_id is not None
+        )
+
+    def _handle_uv_preview_clicked(self, raw_click: object) -> None:
+        if (
+            not self._uv_face_selection_enabled
+            or not isinstance(raw_click, _UvPreviewClick)
+        ):
+            return
+        geometry = self._uv_face_geometry
+        if geometry is None:
+            return
+        hit_indices = _find_uv_face_indices_at_point(
+            geometry,
+            raw_click.uv,
+            pixmap_scale=raw_click.pixmap_scale,
+        )
+        self.uv_face_selection_requested.emit(
+            UvFaceSelectionRequest(
+                face_indices=hit_indices,
+                context_token=self._uv_face_selection_context_token,
+            )
+        )
 
     def _resolve_replacement_selection(
         self,
@@ -596,8 +857,210 @@ class TextureAtlasView(QWidget):
         else:
             self.preview_label.setToolTip(entry.display_name)
             self.preview_label.set_atlas_image(entry.get_image())
+        self._sync_uv_face_selection_input()
         if emit_signal:
             self.atlas_selected.emit(entry)
+
+
+# ### UV face selection helpers ###
+def _normalize_uv_face_indices(
+    face_indices: object,
+    *,
+    sort_result: bool = True,
+) -> tuple[int, ...]:
+    if isinstance(face_indices, str | bytes | bytearray):
+        raise TypeError("UV face IDs must be an iterable of integers.")
+    try:
+        raw_indices = tuple(face_indices)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise TypeError(
+            "UV face IDs must be an iterable of integers."
+        ) from error
+    normalized: list[int] = []
+    for raw_index in raw_indices:
+        if isinstance(raw_index, bool) or not isinstance(
+            raw_index,
+            int | np.integer,
+        ):
+            raise TypeError("UV face IDs must be integers.")
+        index = int(raw_index)
+        if index < 0:
+            raise ValueError("UV face IDs must be nonnegative.")
+        normalized.append(index)
+    if sort_result:
+        return tuple(sorted(set(normalized)))
+    return tuple(normalized)
+
+
+def _build_indexed_uv_face_geometry(
+    triangles: Sequence[UvTriangle],
+    face_indices: Sequence[int],
+) -> _IndexedUvFaceGeometry:
+    coordinates = np.asarray(triangles, dtype=float).reshape((-1, 3, 2))
+    indices = np.asarray(face_indices, dtype=np.int64)
+    minimums = np.min(coordinates, axis=1)
+    maximums = np.max(coordinates, axis=1)
+    for array in (coordinates, indices, minimums, maximums):
+        array.setflags(write=False)
+    return _IndexedUvFaceGeometry(
+        triangles=coordinates,
+        face_indices=indices,
+        minimums=minimums,
+        maximums=maximums,
+    )
+
+
+def _find_uv_face_indices_at_point(
+    geometry: _IndexedUvFaceGeometry,
+    uv: UvPoint,
+    *,
+    pixmap_scale: UvPoint | None = None,
+) -> tuple[int, ...]:
+    """Return exact hits, or the nearest subpixel face within click range."""
+
+    point = np.asarray(uv, dtype=float)
+    if point.shape != (2,) or not np.all(np.isfinite(point)):
+        return ()
+    exact_candidates = np.flatnonzero(
+        np.all(point >= geometry.minimums - UV_FACE_HIT_EPSILON, axis=1)
+        & np.all(point <= geometry.maximums + UV_FACE_HIT_EPSILON, axis=1)
+    )
+    exact_hits = _find_containing_uv_faces(
+        geometry,
+        exact_candidates,
+        point,
+    )
+    if exact_hits:
+        return exact_hits
+    return _find_nearest_uv_faces(
+        geometry,
+        point,
+        pixmap_scale,
+    )
+
+
+def _find_containing_uv_faces(
+    geometry: _IndexedUvFaceGeometry,
+    candidates: np.ndarray,
+    point: np.ndarray,
+) -> tuple[int, ...]:
+    """Return every candidate whose nondegenerate triangle contains a point."""
+
+    if not len(candidates):
+        return ()
+    triangles = geometry.triangles[candidates]
+    first = triangles[:, 0]
+    second = triangles[:, 1]
+    third = triangles[:, 2]
+    denominator = (
+        (second[:, 0] - first[:, 0])
+        * (third[:, 1] - first[:, 1])
+        - (second[:, 1] - first[:, 1])
+        * (third[:, 0] - first[:, 0])
+    )
+    nondegenerate = np.abs(denominator) > UV_FACE_HIT_EPSILON
+    if not np.any(nondegenerate):
+        return ()
+    candidates = candidates[nondegenerate]
+    first = first[nondegenerate]
+    second = second[nondegenerate]
+    third = third[nondegenerate]
+    denominator = denominator[nondegenerate]
+    first_weights = (
+        (second[:, 0] - point[0]) * (third[:, 1] - point[1])
+        - (second[:, 1] - point[1]) * (third[:, 0] - point[0])
+    ) / denominator
+    second_weights = (
+        (third[:, 0] - point[0]) * (first[:, 1] - point[1])
+        - (third[:, 1] - point[1]) * (first[:, 0] - point[0])
+    ) / denominator
+    third_weights = 1.0 - first_weights - second_weights
+    inside = (
+        (first_weights >= -UV_FACE_HIT_EPSILON)
+        & (second_weights >= -UV_FACE_HIT_EPSILON)
+        & (third_weights >= -UV_FACE_HIT_EPSILON)
+    )
+    return tuple(
+        sorted(int(index) for index in geometry.face_indices[candidates[inside]])
+    )
+
+
+def _find_nearest_uv_faces(
+    geometry: _IndexedUvFaceGeometry,
+    point: np.ndarray,
+    pixmap_scale: UvPoint | None,
+) -> tuple[int, ...]:
+    """Resolve UV faces too small to contain a displayed pixel center."""
+
+    if pixmap_scale is None:
+        return ()
+    scale = np.asarray(pixmap_scale, dtype=float)
+    if (
+        scale.shape != (2,)
+        or not np.all(np.isfinite(scale))
+        or np.any(scale <= 0.0)
+    ):
+        return ()
+    uv_radius = UV_FACE_CLICK_RADIUS_PIXELS / scale
+    candidates = np.flatnonzero(
+        np.all(point >= geometry.minimums - uv_radius, axis=1)
+        & np.all(point <= geometry.maximums + uv_radius, axis=1)
+    )
+    if not len(candidates):
+        return ()
+    triangles = geometry.triangles[candidates]
+    signed_double_areas = (
+        (triangles[:, 1, 0] - triangles[:, 0, 0])
+        * (triangles[:, 2, 1] - triangles[:, 0, 1])
+        - (triangles[:, 1, 1] - triangles[:, 0, 1])
+        * (triangles[:, 2, 0] - triangles[:, 0, 0])
+    )
+    nondegenerate = np.abs(signed_double_areas) > UV_FACE_HIT_EPSILON
+    if not np.any(nondegenerate):
+        return ()
+    candidates = candidates[nondegenerate]
+    pixel_triangles = triangles[nondegenerate] * scale
+    pixel_point = point * scale
+    segment_starts = pixel_triangles
+    segment_ends = pixel_triangles[:, (1, 2, 0)]
+    segment_vectors = segment_ends - segment_starts
+    segment_lengths_squared = np.sum(segment_vectors**2, axis=2)
+    point_vectors = pixel_point - segment_starts
+    projections = np.divide(
+        np.sum(point_vectors * segment_vectors, axis=2),
+        segment_lengths_squared,
+        out=np.zeros_like(segment_lengths_squared),
+        where=segment_lengths_squared > 0.0,
+    )
+    projections = np.clip(projections, 0.0, 1.0)
+    closest_points = segment_starts + projections[..., None] * segment_vectors
+    distances_squared = np.min(
+        np.sum((closest_points - pixel_point) ** 2, axis=2),
+        axis=1,
+    )
+    nearest_distance_squared = float(np.min(distances_squared))
+    if nearest_distance_squared > UV_FACE_CLICK_RADIUS_PIXELS**2:
+        return ()
+    nearest_distance = nearest_distance_squared**0.5
+    distances = np.sqrt(distances_squared)
+    nearest = (
+        distances
+        <= nearest_distance + UV_FACE_NEAREST_TIE_EPSILON_PIXELS
+    )
+    return tuple(
+        sorted(int(index) for index in geometry.face_indices[candidates[nearest]])
+    )
+
+
+def _uv_array_to_triangles(coordinates: np.ndarray) -> tuple[UvTriangle, ...]:
+    return tuple(
+        (
+            (float(triangle[0, 0]), float(triangle[0, 1])),
+            (float(triangle[1, 0]), float(triangle[1, 1])),
+            (float(triangle[2, 0]), float(triangle[2, 1])),
+        )
+        for triangle in np.asarray(coordinates, dtype=float)
+    )
 
 
 # ### Edit-mask overlay helpers ###
@@ -664,6 +1127,40 @@ def _compose_edit_mask_overlay(
     )
     painter = QPainter(pixmap)
     painter.drawPixmap(0, 0, scaled_overlay)
+    painter.end()
+
+
+def _compose_selected_uv_faces(
+    pixmap: QPixmap,
+    triangles: Sequence[UvTriangle],
+) -> None:
+    """Draw selected face fills before the optional wireframe overlay."""
+
+    if pixmap.isNull() or not triangles:
+        return
+    width_scale = max(pixmap.width() - 1, 1)
+    height_scale = max(pixmap.height() - 1, 1)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setPen(
+        QPen(
+            UV_SELECTED_FACE_EDGE_COLOR,
+            UV_SELECTED_FACE_EDGE_WIDTH_PIXELS,
+        )
+    )
+    painter.setBrush(QBrush(UV_SELECTED_FACE_FILL_COLOR))
+    for triangle in triangles:
+        painter.drawPolygon(
+            QPolygonF(
+                [
+                    QPointF(
+                        uv[0] * width_scale,
+                        (1.0 - uv[1]) * height_scale,
+                    )
+                    for uv in triangle
+                ]
+            )
+        )
     painter.end()
 
 

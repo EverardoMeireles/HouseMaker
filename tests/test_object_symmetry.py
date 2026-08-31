@@ -29,20 +29,53 @@ from housemaker.object_symmetry import (
     SYMMETRIC_TEXTURE_PACKING_MODE_PAIR,
     SYMMETRIC_TEXTURE_PACKING_MODE_TOP_LEFT_QUARTER,
     SymmetricDivisionMetadata,
+    SymmetricGeometryDivisionResult,
     SymmetricPairTextureVariants,
     SymmetricQuarterTextureVariants,
     SymmetricSquarePairTextureVariants,
+    build_automatic_symmetric_geometry,
     build_automatic_symmetric_object_variants,
     build_symmetric_half_texture_variants,
     build_symmetric_pair_texture_variants,
     build_symmetric_quarter_texture_variants,
+    build_symmetric_retexture_proxy_glb,
     build_symmetric_square_pair_texture_variants,
+)
+from housemaker.object_uv_scan_projection import (
+    LEFT_HALF_OUTER_SAFETY_INSET_PIXELS,
+    SCAN_PROJECTION_TARGET_LEFT_HALF,
+    SCAN_PROJECTION_VERSION,
+    ScanProjectionResult,
+    ScanProjectionStats,
 )
 
 
 # ### Fixture helpers ###
 def _solid_texture(color: tuple[int, int, int, int]) -> np.ndarray:
     return np.full((2048, 2048, 4), color, dtype=np.uint8)
+
+
+def _test_symmetric_scan_stats(
+    camera_percentages: tuple[int, ...],
+) -> ScanProjectionStats:
+    return ScanProjectionStats(
+        version=SCAN_PROJECTION_VERSION,
+        camera_percentages=camera_percentages,
+        view_face_counts=(1, 0, 0, 0, 0, 0),
+        view_pixel_counts=(1_000, 0, 0, 0, 0, 0),
+        face_count=1,
+        source_vertex_count=3,
+        output_vertex_count=3,
+        texture_resolution=2_048,
+        target_domain=SCAN_PROJECTION_TARGET_LEFT_HALF,
+        target_width=1_024,
+        target_height=2_048,
+        island_padding_pixels=0,
+        outer_safety_inset_pixels=LEFT_HALF_OUTER_SAFETY_INSET_PIXELS,
+        usable_pixel_count=1_000,
+        covered_pixel_count=990,
+        triangle_occupancy=0.99,
+    )
 
 
 def _textured_mesh(
@@ -105,6 +138,14 @@ def _z_up_world_mesh(payload: bytes) -> trimesh.Trimesh:
     mesh = _load_scene(payload).to_geometry()
     assert isinstance(mesh, trimesh.Trimesh)
     mesh = mesh.copy()
+    mesh.apply_transform(GLTF_Y_UP_TO_Z_UP_TRANSFORM)
+    return mesh
+
+
+def _z_up_node_mesh(scene: trimesh.Scene, node_name: str) -> trimesh.Trimesh:
+    transform, geometry_name = scene.graph.get(node_name)
+    mesh = scene.geometry[geometry_name].copy()
+    mesh.apply_transform(transform)
     mesh.apply_transform(GLTF_Y_UP_TO_Z_UP_TRANSFORM)
     return mesh
 
@@ -238,6 +279,57 @@ def _automatic_asymmetric_glb() -> bytes:
         uvs,
         texture=_coordinate_texture(),
     )
+
+
+def _automatic_asymmetric_geometry_glb(orientation: str) -> bytes:
+    if orientation == "vertical":
+        vertices = np.asarray(
+            (
+                (-2.0, -1.0, 0.0),
+                (-1.0, -1.0, 0.0),
+                (-1.0, 0.0, 0.0),
+                (1.0, -1.0, 0.0),
+                (2.0, -1.0, 0.0),
+                (2.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+            ),
+            dtype=float,
+        )
+    else:
+        vertices = np.asarray(
+            (
+                (-1.0, -2.0, 0.0),
+                (0.0, -1.0, 0.0),
+                (0.0, -1.0, 1.0),
+                (-1.0, 1.0, 0.0),
+                (0.0, 2.0, 0.0),
+                (0.0, 2.0, 1.0),
+                (-1.0, 1.0, 1.0),
+            ),
+            dtype=float,
+        )
+    faces = np.asarray(
+        ((0, 1, 2), (3, 4, 5), (3, 5, 6)),
+        dtype=np.int64,
+    )
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    return _scene_glb([("geometry-node", mesh, np.eye(4))])
+
+
+def _untextured_half_glb(*, with_uvs: bool) -> bytes:
+    mesh = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+    mesh.apply_translation((-1.0, 0.0, 0.0))
+    if with_uvs:
+        mesh.visual = TextureVisuals(
+            uv=np.column_stack(
+                (
+                    np.linspace(0.05, 0.45, len(mesh.vertices)),
+                    np.linspace(0.1, 0.9, len(mesh.vertices)),
+                )
+            ),
+            material=PBRMaterial(name="untextured-uv-material"),
+        )
+    return _scene_glb([("half-node", mesh, np.eye(4))])
 
 
 def _first_texture_rgba(payload: bytes) -> np.ndarray:
@@ -442,7 +534,186 @@ class SymmetricDivisionMetadataTests(unittest.TestCase):
         )
 
 
-# ### Automatic symmetry tests ###
+# ### Geometry-only automatic symmetry tests ###
+class GeometryOnlyAutomaticSymmetryTests(unittest.TestCase):
+    def test_vertical_division_keeps_the_lower_triangle_side(self) -> None:
+        result = build_automatic_symmetric_geometry(
+            _automatic_asymmetric_geometry_glb("vertical"),
+            "vertical",
+            rng=random.Random(3),
+        )
+        retained = _z_up_world_mesh(result.glb_bytes)
+
+        self.assertIsInstance(result, SymmetricGeometryDivisionResult)
+        self.assertEqual(result.kept_side, "left")
+        self.assertEqual(len(retained.faces), 1)
+        np.testing.assert_allclose(retained.bounds[:, 0], (-2.0, -1.0))
+        self.assertEqual(result.metadata.version, 4)
+        self.assertEqual(
+            result.metadata.triangle_count_by_side,
+            (("left", 1), ("right", 2)),
+        )
+        self.assertEqual(
+            object_symmetry._collect_material_textures(
+                _load_scene(result.glb_bytes)
+            ),
+            [],
+        )
+        with self.assertRaises(FrozenInstanceError):
+            result.kept_side = "right"  # type: ignore[misc]
+
+    def test_horizontal_division_keeps_the_lower_triangle_side(self) -> None:
+        result = build_automatic_symmetric_geometry(
+            _automatic_asymmetric_geometry_glb("horizontal"),
+            "horizontal",
+            rng=random.Random(4),
+        )
+        retained = _z_up_world_mesh(result.glb_bytes)
+
+        self.assertEqual(result.kept_side, "bottom")
+        self.assertEqual(len(retained.faces), 1)
+        np.testing.assert_allclose(retained.bounds[:, 2], (-2.0, -1.0))
+        self.assertEqual(
+            result.metadata.triangle_count_by_side,
+            (("bottom", 1), ("top", 2)),
+        )
+
+    def test_triangle_tie_uses_the_injected_random_source(self) -> None:
+        source = _scene_glb(
+            [("box-node", trimesh.creation.box(), np.eye(4))]
+        )
+        for seed in (0, 1):
+            with self.subTest(seed=seed):
+                expected = random.Random(seed).choice(("left", "right"))
+                result = build_automatic_symmetric_geometry(
+                    source,
+                    "vertical",
+                    rng=random.Random(seed),
+                )
+
+                self.assertEqual(result.kept_side, expected)
+                self.assertTrue(result.metadata.tie_broken_randomly)
+                counts = dict(result.metadata.triangle_count_by_side)
+                self.assertEqual(counts["left"], counts["right"])
+
+    def test_geometry_division_discards_stale_provider_uvs(self) -> None:
+        mesh = trimesh.creation.box()
+        mesh.visual = TextureVisuals(
+            uv=np.column_stack(
+                (
+                    np.linspace(0.0, 1.0, len(mesh.vertices)),
+                    np.linspace(1.0, 0.0, len(mesh.vertices)),
+                )
+            ),
+            material=PBRMaterial(name="untextured-provider-material"),
+        )
+        result = build_automatic_symmetric_geometry(
+            _scene_glb([("box-node", mesh, np.eye(4))]),
+            "vertical",
+            rng=random.Random(2),
+        )
+        retained = _load_scene(result.glb_bytes)
+
+        self.assertTrue(
+            all(
+                getattr(geometry.visual, "uv", None) is None
+                for geometry in retained.geometry.values()
+            )
+        )
+        proxy = _load_scene(
+            build_symmetric_retexture_proxy_glb(
+                result.glb_bytes,
+                result.orientation,
+                result.plane_coordinate,
+            )
+        )
+        self.assertEqual(
+            sum(len(geometry.faces) for geometry in proxy.geometry.values()),
+            2 * sum(
+                len(geometry.faces)
+                for geometry in retained.geometry.values()
+            ),
+        )
+
+
+# ### Symmetric Retexture proxy tests ###
+class SymmetricRetextureProxyTests(unittest.TestCase):
+    @staticmethod
+    def _sorted_rows(values: np.ndarray) -> np.ndarray:
+        array = np.asarray(values, dtype=float)
+        columns = tuple(
+            array[:, index] for index in reversed(range(array.shape[1]))
+        )
+        order = np.lexsort(columns)
+        return array[order]
+
+    def test_untextured_proxy_mirrors_geometry_without_uvs(self) -> None:
+        proxy = build_symmetric_retexture_proxy_glb(
+            _untextured_half_glb(with_uvs=False),
+            "vertical",
+            0.0,
+        )
+        scene = _load_scene(proxy)
+        mirror_node = next(
+            node
+            for node in scene.graph.nodes_geometry
+            if "symmetric-mirror" in node
+        )
+        retained = _z_up_node_mesh(scene, "half-node")
+        mirrored = _z_up_node_mesh(scene, mirror_node)
+        expected_vertices = np.asarray(retained.vertices, dtype=float).copy()
+        expected_vertices[:, 0] *= -1.0
+
+        self.assertEqual(len(mirrored.faces), len(retained.faces))
+        self.assertEqual(
+            sum(len(mesh.faces) for mesh in scene.geometry.values()),
+            2 * len(retained.faces),
+        )
+        np.testing.assert_allclose(
+            self._sorted_rows(mirrored.vertices),
+            self._sorted_rows(expected_vertices),
+            atol=1e-7,
+        )
+        self.assertEqual(object_symmetry._collect_material_textures(scene), [])
+        self.assertTrue(
+            all(
+                getattr(mesh.visual, "uv", None) is None
+                for mesh in scene.geometry.values()
+            )
+        )
+
+    def test_untextured_proxy_moves_existing_left_uvs_to_right(self) -> None:
+        proxy = build_symmetric_retexture_proxy_glb(
+            _untextured_half_glb(with_uvs=True),
+            "vertical",
+            0.0,
+        )
+        scene = _load_scene(proxy)
+        mirror_node = next(
+            node
+            for node in scene.graph.nodes_geometry
+            if "symmetric-mirror" in node
+        )
+        retained = _z_up_node_mesh(scene, "half-node")
+        mirrored = _z_up_node_mesh(scene, mirror_node)
+        retained_uvs = np.asarray(retained.visual.uv, dtype=float)
+        mirrored_uvs = np.asarray(mirrored.visual.uv, dtype=float)
+        expected_mirrored_uvs = retained_uvs.copy()
+        expected_mirrored_uvs[:, 0] += 0.5
+
+        self.assertEqual(len(mirrored.faces), len(retained.faces))
+        self.assertLessEqual(float(np.max(retained_uvs[:, 0])), 0.5)
+        self.assertGreaterEqual(float(np.min(mirrored_uvs[:, 0])), 0.5)
+        self.assertLessEqual(float(np.max(mirrored_uvs[:, 0])), 1.0)
+        np.testing.assert_allclose(
+            self._sorted_rows(mirrored_uvs),
+            self._sorted_rows(expected_mirrored_uvs),
+            atol=1e-7,
+        )
+        self.assertEqual(object_symmetry._collect_material_textures(scene), [])
+
+
+# ### Automatic textured symmetry tests ###
 class AutomaticSymmetricDivisionTests(unittest.TestCase):
     def test_fewer_clipped_triangles_choose_the_retained_side(self) -> None:
         result = build_automatic_symmetric_object_variants(
@@ -475,6 +746,86 @@ class AutomaticSymmetricDivisionTests(unittest.TestCase):
                 "tie_broken_randomly": False,
             },
         )
+
+    def test_weighted_projection_scans_the_retained_half_into_left_domain(
+        self,
+    ) -> None:
+        camera_percentages = (30, 20, 15, 15, 10, 10)
+        scan_stats = _test_symmetric_scan_stats(camera_percentages)
+        scanned_inputs: list[bytes] = []
+
+        def fake_scan_projection(
+            glb_bytes: bytes,
+            percentages: tuple[int, ...],
+            **kwargs: object,
+        ) -> ScanProjectionResult:
+            scanned_inputs.append(glb_bytes)
+            self.assertEqual(percentages, camera_percentages)
+            self.assertEqual(
+                kwargs["target_domain"],
+                SCAN_PROJECTION_TARGET_LEFT_HALF,
+            )
+            return ScanProjectionResult(glb_bytes, scan_stats)
+
+        with (
+            mock.patch.object(
+                object_symmetry,
+                "scan_project_textured_glb",
+                side_effect=fake_scan_projection,
+            ) as scan_projection,
+            mock.patch.object(
+                object_symmetry,
+                "_repack_retained_texture",
+            ) as legacy_compactor,
+        ):
+            result = build_automatic_symmetric_object_variants(
+                _automatic_asymmetric_glb(),
+                "vertical",
+                rng=random.Random(9),
+                projection_camera_percentages=camera_percentages,
+            )
+
+        scan_projection.assert_called_once()
+        legacy_compactor.assert_not_called()
+        self.assertEqual(len(scanned_inputs), 1)
+        self.assertEqual(len(_z_up_world_mesh(scanned_inputs[0]).faces), 1)
+        self.assertIs(result.scan_projection_stats, scan_stats)
+        self.assertEqual(result.kept_side, "left")
+
+    def test_real_weighted_projection_nearly_fills_symmetric_left_half(
+        self,
+    ) -> None:
+        camera_percentages = (30, 20, 15, 15, 10, 10)
+
+        result = build_automatic_symmetric_object_variants(
+            _automatic_asymmetric_glb(),
+            "vertical",
+            rng=random.Random(9),
+            projection_camera_percentages=camera_percentages,
+        )
+
+        stats = result.scan_projection_stats
+        assert stats is not None
+        self.assertEqual(stats.camera_percentages, camera_percentages)
+        self.assertEqual(stats.target_domain, SCAN_PROJECTION_TARGET_LEFT_HALF)
+        self.assertEqual(stats.island_padding_pixels, 0)
+        self.assertGreaterEqual(stats.triangle_occupancy, 0.98)
+        self.assertIsInstance(
+            result.variants,
+            SymmetricSquarePairTextureVariants,
+        )
+        self.assertEqual(set(result.variants.glb_by_resolution), {512, 1024})
+        for resolution, preview in (
+            result.variants.preview_rgba_by_resolution.items()
+        ):
+            with self.subTest(resolution=resolution):
+                self.assertEqual(preview.shape, (resolution, resolution, 4))
+                self.assertTrue(np.all(preview[:, resolution // 2 :, :3] == 0))
+                output_mesh = _load_scene(
+                    result.variants.glb_by_resolution[resolution]
+                ).to_geometry()
+                output_uvs = np.asarray(output_mesh.visual.uv, dtype=float)
+                self.assertLessEqual(float(np.max(output_uvs[:, 0])), 0.5)
 
     def test_exact_triangle_tie_uses_the_seeded_random_source(self) -> None:
         source = _box_glb()
@@ -609,6 +960,34 @@ class AutomaticSymmetricDivisionTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "verified left-packed"):
             build_symmetric_square_pair_texture_variants(packed_source)
+
+    def test_declared_left_packed_source_never_falls_back_to_repacking(
+        self,
+    ) -> None:
+        mesh = trimesh.creation.box()
+        source = _scene_glb(
+            [
+                (
+                    "full-uv-node",
+                    _textured_mesh(
+                        mesh,
+                        _solid_texture((80, 120, 160, 255)),
+                        uvs=np.column_stack(
+                            (
+                                np.linspace(0.1, 0.9, len(mesh.vertices)),
+                                np.linspace(0.2, 0.8, len(mesh.vertices)),
+                            )
+                        ),
+                    ),
+                    np.eye(4),
+                )
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "boundary inset"):
+            build_symmetric_square_pair_texture_variants(
+                source,
+                uvs_already_left_packed=True,
+            )
 
     def test_pair_rigid_pack_retains_normal_1024_texel_density(self) -> None:
         vertices = np.asarray(

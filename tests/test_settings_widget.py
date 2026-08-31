@@ -29,6 +29,7 @@ from housemaker.settings_widget import (
     OPENAI_API_KEY_ENVIRONMENT_VARIABLE,
     OPENAI_API_KEY_SETTING_KEY,
     UNUSED_FACE_REMOVAL_SETTING_KEY,
+    USE_UV_RAYCAST_FOR_OBJECT_GENERATION_SETTING_KEY,
     Fullscreen3DViewerScreenOption,
     SURFACE_TEXTURE_PROVIDER_GPT_5_6_TERRA,
     SURFACE_TEXTURE_PROVIDER_SETTING_KEY,
@@ -38,6 +39,7 @@ from housemaker.settings_widget import (
     read_canvas_3d_navigation_toggle_hotkey,
     read_doorway_mesh_update_delay_seconds,
     read_unused_face_removal,
+    read_use_uv_raycast_for_object_generation,
 )
 
 
@@ -73,6 +75,12 @@ class SettingsWidgetTests(unittest.TestCase):
             )
             self.assertFalse(hasattr(widget, "surface_texture_provider_combo"))
             self.assertTrue(hasattr(widget, "unused_face_removal_checkbox"))
+            self.assertTrue(
+                hasattr(
+                    widget,
+                    "use_uv_raycast_for_object_generation_checkbox",
+                )
+            )
             self.assertFalse(
                 hasattr(widget, "project_uvs_from_camera_views_checkbox")
             )
@@ -172,6 +180,89 @@ class SettingsWidgetTests(unittest.TestCase):
             application_settings.set(UNUSED_FACE_REMOVAL_SETTING_KEY, "yes")
 
             self.assertFalse(read_unused_face_removal(application_settings))
+
+    def test_weighted_projection_setting_persists_and_emits_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            widget = SettingsWidget(
+                application_settings=application_settings,
+                environment={},
+            )
+            emitted_changes: list[bool] = []
+            widget.settings_changed.connect(
+                lambda: emitted_changes.append(True)
+            )
+
+            self.assertFalse(
+                widget.get_settings().use_uv_raycast_for_object_generation
+            )
+            self.assertIn(
+                "Use weighted camera projection",
+                [label.text() for label in widget.findChildren(QLabel)],
+            )
+            self.assertIn(
+                "without island spacing",
+                widget.use_uv_raycast_for_object_generation_checkbox.toolTip(),
+            )
+            widget.use_uv_raycast_for_object_generation_checkbox.setChecked(
+                True
+            )
+
+            self.assertTrue(
+                application_settings.get(
+                    USE_UV_RAYCAST_FOR_OBJECT_GENERATION_SETTING_KEY
+                )
+            )
+            self.assertTrue(
+                widget.get_settings().use_uv_raycast_for_object_generation
+            )
+            self.assertEqual(emitted_changes, [True])
+
+            restored = SettingsWidget(
+                application_settings=_build_test_settings(temporary_directory),
+                environment={},
+            )
+            self.assertTrue(
+                restored.get_settings().use_uv_raycast_for_object_generation
+            )
+
+    def test_weighted_projection_setting_rejects_malformed_values(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Weighted camera projection"):
+            GenerationServiceSettings(
+                use_uv_raycast_for_object_generation=(
+                    1  # type: ignore[arg-type]
+                )
+            )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            application_settings.set(
+                USE_UV_RAYCAST_FOR_OBJECT_GENERATION_SETTING_KEY,
+                "yes",
+            )
+
+            self.assertFalse(
+                read_use_uv_raycast_for_object_generation(
+                    application_settings
+                )
+            )
+
+    def test_uv_raycast_field_preserves_legacy_positional_settings(self) -> None:
+        settings = GenerationServiceSettings(
+            "meshy-key",
+            4_000,
+            "openai-key",
+            "meshy",
+            "viewer-screen",
+            "N",
+            True,
+            "jobs-screen",
+            1.25,
+        )
+
+        self.assertEqual(settings.jobs_window_screen_id, "jobs-screen")
+        self.assertEqual(settings.doorway_mesh_update_delay_seconds, 1.25)
+        self.assertFalse(settings.use_uv_raycast_for_object_generation)
 
     def test_doorway_mesh_update_delay_persists_and_emits_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

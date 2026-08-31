@@ -40,16 +40,38 @@ from housemaker.generation_workspace import (
     GenerationWorkspace,
     MeshyImagePlanner,
     MeshyModelExecutor,
+    LOCALLY_AUTHORED_UVS_PIPELINE_KEY,
+    SCAN_PROJECTION_PIPELINE_KEY,
+    ScanProjectedMeshyGenerationResult,
     StagedMeshyGenerationResult,
     TEXTURE_VARIANTS_PIPELINE_KEY,
+    TEXTURE_VARIANT_GLB_PATH_KEY,
+    VISIBILITY_UV_UNWRAP_PIPELINE_KEY,
     _ObjectGenerationProgressMapper,
+    _GenerationCancelled,
+    _build_staged_generation_pipeline_metadata,
     _build_texture_resolution_entries,
     _format_model_statistics,
     _collect_model_uv_triangles,
+    _resolve_staged_postprocessed_asset_path,
     _staged_generation_mode,
+    update_projection_camera_percentage,
 )
 from housemaker.glb import GeneratedModel, import_generated_glb
 from housemaker.meshy_generation import MeshyGenerationResult
+from housemaker.object_uv_raycast import (
+    UV_TARGET_DOMAIN_FULL,
+    VISIBILITY_UV_UNWRAP_VERSION,
+    VisibilityUvUnwrapStats,
+)
+from housemaker.object_uv_scan_projection import (
+    DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
+    SCAN_PROJECTION_TARGET_FULL,
+    SCAN_PROJECTION_VERSION,
+    ScanProjectionCancelled,
+    ScanProjectionResult,
+    ScanProjectionStats,
+)
 from housemaker.settings_widget import GenerationServiceSettings
 from housemaker.texture_atlas_view import TextureAtlasEntry
 from housemaker.unused_face_removal import (
@@ -115,6 +137,50 @@ def _test_staged_meshy_result(
         retained_face_count=80,
         removed_face_count=40,
         protected_face_count=80,
+    )
+
+
+def _test_visibility_uv_stats() -> VisibilityUvUnwrapStats:
+    return VisibilityUvUnwrapStats(
+        face_count=12,
+        instance_face_count=12,
+        chart_count=6,
+        exterior_face_count=10,
+        hidden_face_count=2,
+        camera_count=14,
+        ray_sample_count=1_024,
+        texture_resolution=2_048,
+        gutter_pixels=8,
+        effective_gutter_pixels=8.0,
+        atlas_width=2_048,
+        atlas_height=2_048,
+        atlas_utilization=0.86,
+        requested_exterior_uv_share=0.95,
+        achieved_exterior_uv_share=0.94,
+        uv_triangle_occupancy=0.82,
+        exterior_face_indices=tuple(range(10)),
+        visibility_hits=(1,) * 10 + (0, 0),
+    )
+
+
+def _test_scan_projection_stats() -> ScanProjectionStats:
+    return ScanProjectionStats(
+        version=SCAN_PROJECTION_VERSION,
+        camera_percentages=DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
+        view_face_counts=(2, 2, 2, 2, 2, 2),
+        view_pixel_counts=(170, 170, 170, 170, 160, 160),
+        face_count=12,
+        source_vertex_count=8,
+        output_vertex_count=36,
+        texture_resolution=2_048,
+        target_domain=SCAN_PROJECTION_TARGET_FULL,
+        target_width=2_048,
+        target_height=2_048,
+        island_padding_pixels=0,
+        outer_safety_inset_pixels=0,
+        usable_pixel_count=1_000,
+        covered_pixel_count=990,
+        triangle_occupancy=0.99,
     )
 
 
@@ -481,6 +547,132 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
         self.assertIn("56%", texture_started)
         self.assertIn("80%", texture_complete)
 
+    def test_weighted_projection_uses_one_normal_meshy_progress_range(
+        self,
+    ) -> None:
+        request = GenerationRequest(
+            frame_index=0,
+            selected_object_bgra=np.zeros((4, 4, 4), dtype=np.uint8),
+            settings=GenerationServiceSettings(
+                meshy_api_key="key",
+                use_uv_raycast_for_object_generation=True,
+            ),
+        )
+        mapper = _ObjectGenerationProgressMapper(request)
+
+        generation_complete = mapper.map_provider_message(
+            "Meshy is generating: 100%"
+        )
+
+        self.assertIn("80%", generation_complete)
+
+    def test_symmetric_weighted_projection_uses_normal_meshy_progress(
+        self,
+    ) -> None:
+        request = GenerationRequest(
+            frame_index=0,
+            selected_object_bgra=np.zeros((4, 4, 4), dtype=np.uint8),
+            settings=GenerationServiceSettings(
+                meshy_api_key="key",
+                use_uv_raycast_for_object_generation=True,
+            ),
+            symmetric_division_enabled=True,
+        )
+        mapper = _ObjectGenerationProgressMapper(request)
+
+        generation_complete = mapper.map_provider_message(
+            "Meshy is generating: 100%"
+        )
+
+        self.assertIn("80%", generation_complete)
+
+    def test_uv_raycast_stage_persists_versioned_provenance(self) -> None:
+        result = replace(
+            _test_staged_meshy_result(),
+            visibility_uv_stats=_test_visibility_uv_stats(),
+        )
+        variant_metadata = {
+            "2048": {
+                TEXTURE_VARIANT_GLB_PATH_KEY: "chair.texture-2048.glb",
+            }
+        }
+
+        pipeline = _build_staged_generation_pipeline_metadata(
+            result,
+            "chair.geometry.glb",
+        )
+        postprocessed_path = _resolve_staged_postprocessed_asset_path(
+            result,
+            "chair.texture-1024.glb",
+            variant_metadata,
+        )
+
+        self.assertTrue(pipeline[LOCALLY_AUTHORED_UVS_PIPELINE_KEY])
+        provenance = pipeline[VISIBILITY_UV_UNWRAP_PIPELINE_KEY]
+        self.assertIsInstance(provenance, dict)
+        assert isinstance(provenance, dict)
+        self.assertEqual(
+            provenance["version"],
+            VISIBILITY_UV_UNWRAP_VERSION,
+        )
+        self.assertEqual(provenance["exterior_face_count"], 10)
+        self.assertEqual(provenance["hidden_face_count"], 2)
+        self.assertEqual(provenance["requested_exterior_uv_share"], 0.95)
+        self.assertEqual(provenance["target_domain"], UV_TARGET_DOMAIN_FULL)
+        self.assertEqual(
+            provenance["packing_strategy"],
+            "rotate_and_align_charts",
+        )
+        self.assertEqual(postprocessed_path, "chair.texture-2048.glb")
+        self.assertEqual(
+            _resolve_staged_postprocessed_asset_path(
+                replace(result, geometry_only=True),
+                "chair.glb",
+                None,
+            ),
+            "chair.glb",
+        )
+
+    def test_weighted_scan_stage_persists_zero_padding_provenance(self) -> None:
+        result = replace(
+            _test_staged_meshy_result(),
+            scan_projection_stats=_test_scan_projection_stats(),
+        )
+        variant_metadata = {
+            "2048": {
+                TEXTURE_VARIANT_GLB_PATH_KEY: "chair.texture-2048.glb",
+            }
+        }
+
+        pipeline = _build_staged_generation_pipeline_metadata(
+            result,
+            "chair.geometry.glb",
+        )
+
+        self.assertTrue(pipeline[LOCALLY_AUTHORED_UVS_PIPELINE_KEY])
+        provenance = pipeline[SCAN_PROJECTION_PIPELINE_KEY]
+        self.assertIsInstance(provenance, dict)
+        assert isinstance(provenance, dict)
+        self.assertEqual(provenance["version"], SCAN_PROJECTION_VERSION)
+        self.assertEqual(
+            tuple(provenance["camera_percentages"].values()),
+            DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
+        )
+        self.assertEqual(provenance["island_padding_pixels"], 0)
+        self.assertEqual(provenance["triangle_occupancy"], 0.99)
+        self.assertEqual(
+            _staged_generation_mode(result),
+            "unused_face_removal_and_weighted_camera_scan_projection",
+        )
+        self.assertEqual(
+            _resolve_staged_postprocessed_asset_path(
+                result,
+                "chair.texture-1024.glb",
+                variant_metadata,
+            ),
+            "chair.texture-2048.glb",
+        )
+
     def test_meshy_planner_sends_the_selected_png_and_meshy_settings(self) -> None:
         selected = np.zeros((7, 11, 4), dtype=np.uint8)
         selected[1:6, 2:9] = (20, 80, 190, 255)
@@ -526,6 +718,267 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
         )
         self.assertEqual(decoded.shape, selected.shape)
         np.testing.assert_array_equal(decoded, selected)
+
+    def test_weighted_projection_scans_one_normal_textured_meshy_result(
+        self,
+    ) -> None:
+        request = GenerationRequest(
+            frame_index=3,
+            selected_object_bgra=np.zeros((7, 11, 4), dtype=np.uint8),
+            settings=GenerationServiceSettings(
+                meshy_api_key="meshy-test-key",
+                use_uv_raycast_for_object_generation=True,
+            ),
+        )
+        provider_result = MeshyGenerationResult(
+            task_id="texture-task",
+            glb_bytes=b"provider-textured-glb",
+            name="Textured chair",
+        )
+        scan_result = ScanProjectionResult(
+            glb_bytes=b"scan-projected-glb",
+            stats=_test_scan_projection_stats(),
+        )
+        events: list[str] = []
+
+        def fake_image_to_3d(**kwargs: object) -> MeshyGenerationResult:
+            events.append("image_to_3d")
+            self.assertNotIn("should_texture", kwargs)
+            return provider_result
+
+        def fake_scan_projection(
+            glb_bytes: bytes,
+            percentages: tuple[int, ...],
+            **kwargs: object,
+        ) -> ScanProjectionResult:
+            events.append("scan_projection")
+            self.assertEqual(glb_bytes, provider_result.glb_bytes)
+            self.assertEqual(
+                percentages,
+                DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
+            )
+            self.assertEqual(
+                kwargs["target_domain"],
+                SCAN_PROJECTION_TARGET_FULL,
+            )
+            return scan_result
+
+        with (
+            patch(
+                "housemaker.generation_workspace.request_image_to_3d_model",
+                side_effect=fake_image_to_3d,
+            ),
+            patch(
+                "housemaker.generation_workspace.scan_project_textured_glb",
+                side_effect=fake_scan_projection,
+            ),
+        ):
+            result = MeshyImagePlanner().plan(request)
+
+        self.assertEqual(events, ["image_to_3d", "scan_projection"])
+        self.assertNotIsInstance(result, StagedMeshyGenerationResult)
+        self.assertEqual(result.task_id, provider_result.task_id)
+        self.assertEqual(result.name, provider_result.name)
+        self.assertEqual(result.glb_bytes, scan_result.glb_bytes)
+        self.assertIs(result.scan_projection_stats, scan_result.stats)
+
+    def test_symmetric_weighted_projection_is_deferred_until_half_is_known(
+        self,
+    ) -> None:
+        request = GenerationRequest(
+            frame_index=3,
+            selected_object_bgra=np.zeros((7, 11, 4), dtype=np.uint8),
+            settings=GenerationServiceSettings(
+                meshy_api_key="meshy-test-key",
+                use_uv_raycast_for_object_generation=True,
+            ),
+            symmetric_division_enabled=True,
+            symmetric_division_orientation="vertical",
+        )
+        provider_result = MeshyGenerationResult(
+            task_id="image-to-3d-task",
+            glb_bytes=b"provider-textured-glb",
+            name="Textured chair",
+        )
+
+        with (
+            patch(
+                "housemaker.generation_workspace.request_image_to_3d_model",
+                return_value=provider_result,
+            ) as image_to_3d,
+            patch(
+                "housemaker.generation_workspace."
+                "scan_project_textured_glb",
+            ) as scan_projection,
+            patch(
+                "housemaker.generation_workspace.request_retextured_model",
+            ) as retexture,
+        ):
+            result = MeshyImagePlanner().plan(request)
+
+        self.assertIs(result, provider_result)
+        self.assertNotIsInstance(result, StagedMeshyGenerationResult)
+        image_to_3d.assert_called_once()
+        self.assertNotIn("should_texture", image_to_3d.call_args.kwargs)
+        scan_projection.assert_not_called()
+        retexture.assert_not_called()
+
+    def test_textured_staged_result_builds_normal_object_variants(self) -> None:
+        staged = replace(
+            _test_staged_meshy_result(),
+            glb_bytes=_test_model().glb_bytes,
+        )
+        expected_variants = object()
+
+        with patch(
+            "housemaker.generation_workspace.build_object_texture_variants",
+            return_value=expected_variants,
+        ) as build_regular_variants:
+            model = MeshyModelExecutor().execute(staged)
+
+        build_regular_variants.assert_called_once_with(staged.glb_bytes)
+        self.assertIs(model.object_texture_variants, expected_variants)
+
+    def test_weighted_projection_does_not_modify_geometry_only_output(
+        self,
+    ) -> None:
+        request = GenerationRequest(
+            frame_index=0,
+            selected_object_bgra=np.zeros((4, 4, 4), dtype=np.uint8),
+            settings=GenerationServiceSettings(
+                meshy_api_key="meshy-key",
+                use_uv_raycast_for_object_generation=True,
+            ),
+            geometry_only=True,
+        )
+        geometry_result = MeshyGenerationResult(
+            task_id="geometry-task",
+            glb_bytes=b"geometry-glb",
+            name="Geometry",
+        )
+        with (
+            patch(
+                "housemaker.generation_workspace.request_image_to_3d_model",
+                return_value=geometry_result,
+            ) as image_to_3d,
+            patch(
+                "housemaker.generation_workspace.scan_project_textured_glb",
+            ) as scan_projection,
+            patch(
+                "housemaker.generation_workspace.request_retextured_model"
+            ) as retexture_mock,
+        ):
+            result = MeshyImagePlanner().plan(request)
+
+        self.assertFalse(image_to_3d.call_args.kwargs["should_texture"])
+        scan_projection.assert_not_called()
+        retexture_mock.assert_not_called()
+        self.assertIsInstance(result, StagedMeshyGenerationResult)
+        assert isinstance(result, StagedMeshyGenerationResult)
+        self.assertTrue(result.geometry_only)
+        self.assertEqual(result.glb_bytes, geometry_result.glb_bytes)
+        self.assertEqual(
+            result.postprocessed_glb_bytes,
+            geometry_result.glb_bytes,
+        )
+        self.assertIsNone(result.scan_projection_stats)
+
+    def test_weighted_projection_cancellation_discards_provider_result(
+        self,
+    ) -> None:
+        request = GenerationRequest(
+            frame_index=0,
+            selected_object_bgra=np.zeros((4, 4, 4), dtype=np.uint8),
+            settings=GenerationServiceSettings(
+                meshy_api_key="meshy-key",
+                use_uv_raycast_for_object_generation=True,
+            ),
+        )
+
+        with (
+            patch(
+                "housemaker.generation_workspace.request_image_to_3d_model",
+                return_value=_test_meshy_result(),
+            ),
+            patch(
+                "housemaker.generation_workspace.scan_project_textured_glb",
+                side_effect=ScanProjectionCancelled("cancelled"),
+            ) as scan_projection,
+        ):
+            with self.assertRaises(_GenerationCancelled):
+                MeshyImagePlanner().plan(request)
+
+        scan_projection.assert_called_once()
+
+    def test_symmetric_face_removal_defers_weighted_scan_projection(
+        self,
+    ) -> None:
+        request = GenerationRequest(
+            frame_index=0,
+            selected_object_bgra=np.zeros((4, 4, 4), dtype=np.uint8),
+            settings=GenerationServiceSettings(
+                meshy_api_key="meshy-key",
+                unused_face_removal=True,
+                use_uv_raycast_for_object_generation=True,
+            ),
+            symmetric_division_enabled=True,
+        )
+        geometry_model = _test_model()
+        retained_model = _test_model()
+        textured_model = _test_model()
+        geometry_result = MeshyGenerationResult(
+            task_id="geometry-task",
+            glb_bytes=geometry_model.glb_bytes,
+            name="Geometry",
+        )
+        textured_result = MeshyGenerationResult(
+            task_id="texture-task",
+            glb_bytes=textured_model.glb_bytes,
+            name="Textured chair",
+        )
+        removal_result = UnusedFaceRemovalResult(
+            model=retained_model,
+            enabled_camera_ids=ALL_CAMERA_IDS,
+            original_face_count=12,
+            retained_face_count=10,
+            removed_face_count=2,
+            protected_face_count=10,
+        )
+
+        with (
+            patch(
+                "housemaker.generation_workspace.request_image_to_3d_model",
+                return_value=geometry_result,
+            ) as image_to_3d,
+            patch(
+                "housemaker.generation_workspace.remove_unused_faces_from_glb",
+                return_value=removal_result,
+            ) as removal_mock,
+            patch(
+                "housemaker.generation_workspace.scan_project_textured_glb",
+            ) as scan_projection,
+            patch(
+                "housemaker.generation_workspace.request_retextured_model",
+                return_value=textured_result,
+            ) as retexture,
+        ):
+            result = MeshyImagePlanner().plan(request)
+
+        self.assertFalse(image_to_3d.call_args.kwargs["should_texture"])
+        removal_mock.assert_called_once()
+        scan_projection.assert_not_called()
+        retexture.assert_called_once()
+        self.assertEqual(
+            retexture.call_args.kwargs["model_glb"],
+            retained_model.glb_bytes,
+        )
+        self.assertFalse(retexture.call_args.kwargs["enable_original_uv"])
+        self.assertIsInstance(result, StagedMeshyGenerationResult)
+        assert isinstance(result, StagedMeshyGenerationResult)
+        self.assertEqual(result.removed_face_count, 2)
+        self.assertEqual(result.glb_bytes, textured_model.glb_bytes)
+        self.assertEqual(result.postprocessed_glb_bytes, retained_model.glb_bytes)
+        self.assertIsNone(result.scan_projection_stats)
 
     def test_staged_planner_generates_geometry_removes_faces_then_textures(
         self,
@@ -754,6 +1207,77 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
         self.assertIn("model processor unavailable", failed_spy.at(0)[0])
 
 
+# ### Projection camera percentage tests ###
+class ProjectionCameraPercentageTests(unittest.TestCase):
+    def test_decrease_preserves_free_capacity_for_later_increases(self) -> None:
+        decreased = update_projection_camera_percentage(
+            DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
+            ALL_CAMERA_IDS[0],
+            16,
+        )
+
+        self.assertEqual(decreased, (16, 17, 17, 17, 16, 16))
+        self.assertEqual(sum(decreased), 99)
+        self.assertEqual(
+            update_projection_camera_percentage(
+                decreased,
+                ALL_CAMERA_IDS[1],
+                18,
+            ),
+            (16, 18, 17, 17, 16, 16),
+        )
+
+    def test_overflow_dilutes_larger_cameras_proportionally(self) -> None:
+        updated = update_projection_camera_percentage(
+            (10, 40, 25, 10, 10, 5),
+            ALL_CAMERA_IDS[0],
+            20,
+        )
+
+        self.assertEqual(updated, (20, 35, 22, 9, 9, 5))
+        self.assertEqual(sum(updated), 100)
+
+    def test_rounding_is_deterministic_and_every_camera_keeps_one_percent(
+        self,
+    ) -> None:
+        self.assertEqual(
+            update_projection_camera_percentage(
+                DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
+                ALL_CAMERA_IDS[0],
+                18,
+            ),
+            (18, 16, 17, 17, 16, 16),
+        )
+        self.assertEqual(
+            update_projection_camera_percentage(
+                (94, 2, 1, 1, 1, 1),
+                ALL_CAMERA_IDS[0],
+                100,
+            ),
+            (95, 1, 1, 1, 1, 1),
+        )
+
+    def test_rejects_invalid_live_states_and_unknown_cameras(self) -> None:
+        with self.assertRaisesRegex(ValueError, "at least 1"):
+            update_projection_camera_percentage(
+                (20, 20, 20, 20, 20, 0),
+                ALL_CAMERA_IDS[0],
+                19,
+            )
+        with self.assertRaisesRegex(ValueError, "cannot exceed"):
+            update_projection_camera_percentage(
+                (20, 20, 20, 20, 20, 1),
+                ALL_CAMERA_IDS[0],
+                19,
+            )
+        with self.assertRaisesRegex(ValueError, "Unknown projection camera"):
+            update_projection_camera_percentage(
+                DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
+                "diagonal",
+                10,
+            )
+
+
 # ### Workspace tests ###
 class GenerationWorkspaceTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -850,7 +1374,7 @@ class GenerationWorkspaceTests(unittest.TestCase):
         )
         self.assertEqual(spinbox.value(), 5_600)
 
-    def test_face_purge_and_camera_selection_controls_are_absent(self) -> None:
+    def test_face_purge_and_legacy_camera_checkboxes_are_absent(self) -> None:
         panel = self.workspace.object_3d_panel
 
         self.assertFalse(hasattr(panel, "unused_face_camera_controls"))
@@ -860,6 +1384,155 @@ class GenerationWorkspaceTests(unittest.TestCase):
         self.assertFalse(
             hasattr(self.workspace, "purge_selected_object_faces")
         )
+
+    def test_weighted_camera_allocations_require_exact_total_and_snapshot(
+        self,
+    ) -> None:
+        panel = self.workspace.object_3d_panel
+        controls = panel.projection_camera_percentage_spinboxes
+
+        self.assertTrue(
+            panel.viewer.get_projection_camera_indicators_visible()
+        )
+        self.assertEqual(tuple(controls), ALL_CAMERA_IDS)
+        self.assertEqual(
+            panel.get_projection_camera_percentages(),
+            DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
+        )
+        self.assertTrue(panel.projection_camera_percentages_are_valid())
+        self.assertEqual(
+            panel.projection_camera_total_label.text(),
+            "Total: 100%",
+        )
+        self.assertTrue(
+            all(
+                control.minimum() == 1 and control.maximum() == 95
+                for control in controls.values()
+            )
+        )
+
+        self.workspace.set_runtime_settings(
+            GenerationServiceSettings(
+                meshy_api_key="meshy-key",
+                use_uv_raycast_for_object_generation=True,
+            )
+        )
+        controls[ALL_CAMERA_IDS[0]].setValue(
+            DEFAULT_PROJECTION_CAMERA_PERCENTAGES[0] - 1
+        )
+        _qt_application.processEvents()
+        self.assertFalse(panel.projection_camera_percentages_are_valid())
+        self.assertEqual(
+            panel.get_projection_camera_percentages(),
+            (16, 17, 17, 17, 16, 16),
+        )
+        self.assertIn(
+            "must equal 100%",
+            panel.projection_camera_total_label.text(),
+        )
+
+        request_patches = (
+            patch.object(
+                self.workspace.video_view,
+                "get_frame_bgr",
+                return_value=np.zeros((8, 8, 3), dtype=np.uint8),
+            ),
+            patch.object(
+                self.workspace.video_view,
+                "has_selection",
+                return_value=True,
+            ),
+            patch.object(
+                self.workspace.video_view,
+                "build_selected_object_crop",
+                return_value=np.full((4, 4, 4), 255, dtype=np.uint8),
+            ),
+        )
+        with request_patches[0], request_patches[1], request_patches[2]:
+            self.assertIsNone(self.workspace._build_generation_request())
+            geometry_request = self.workspace._build_generation_request(
+                geometry_only=True
+            )
+        assert geometry_request is not None
+        self.assertEqual(
+            geometry_request.projection_camera_percentages,
+            DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
+        )
+
+        controls[ALL_CAMERA_IDS[0]].setValue(
+            DEFAULT_PROJECTION_CAMERA_PERCENTAGES[0]
+        )
+        _qt_application.processEvents()
+        expected_snapshot = panel.get_projection_camera_percentages()
+        self.assertEqual(sum(expected_snapshot), 100)
+        with (
+            patch.object(
+                self.workspace.video_view,
+                "get_frame_bgr",
+                return_value=np.zeros((8, 8, 3), dtype=np.uint8),
+            ),
+            patch.object(
+                self.workspace.video_view,
+                "has_selection",
+                return_value=True,
+            ),
+            patch.object(
+                self.workspace.video_view,
+                "build_selected_object_crop",
+                return_value=np.full((4, 4, 4), 255, dtype=np.uint8),
+            ),
+        ):
+            request = self.workspace._build_generation_request()
+        assert request is not None
+        controls[ALL_CAMERA_IDS[0]].setValue(
+            DEFAULT_PROJECTION_CAMERA_PERCENTAGES[0] + 1
+        )
+        self.assertEqual(
+            panel.get_projection_camera_percentages(),
+            (18, 16, 17, 17, 16, 16),
+        )
+        self.assertEqual(
+            request.projection_camera_percentages,
+            expected_snapshot,
+        )
+
+    def test_camera_fields_and_viewport_steps_share_percentage_pipeline(
+        self,
+    ) -> None:
+        panel = self.workspace.object_3d_panel
+        changed_spy = QSignalSpy(panel.projection_camera_percentages_changed)
+
+        with patch.object(
+            panel.viewer,
+            "set_projection_camera_percentages",
+            wraps=panel.viewer.set_projection_camera_percentages,
+        ) as viewer_sync:
+            panel.projection_camera_percentage_spinboxes[
+                ALL_CAMERA_IDS[0]
+            ].setValue(18)
+            field_percentages = panel.get_projection_camera_percentages()
+
+            self.assertEqual(field_percentages, (18, 16, 17, 17, 16, 16))
+            viewer_sync.assert_called_once_with(field_percentages)
+
+            panel.viewer.projection_camera_percentage_step_requested.emit(
+                ALL_CAMERA_IDS[0],
+                -1,
+            )
+            stepped_percentages = panel.get_projection_camera_percentages()
+
+        self.assertEqual(stepped_percentages, (17, 16, 17, 17, 16, 16))
+        self.assertEqual(
+            tuple(
+                panel.projection_camera_percentage_spinboxes[
+                    camera_id
+                ].value()
+                for camera_id in ALL_CAMERA_IDS
+            ),
+            stepped_percentages,
+        )
+        self.assertEqual(changed_spy.count(), 2)
+        self.assertEqual(viewer_sync.call_args_list[-1].args, (stepped_percentages,))
 
     def test_staged_success_persists_all_revisions_and_task_provenance(
         self,
@@ -1112,6 +1785,63 @@ class GenerationWorkspaceTests(unittest.TestCase):
         self.assertEqual(
             self.workspace.model_statistics_label.text(),
             "No generated object",
+        )
+
+    def test_scan_projected_success_persists_uv_authority_metadata(self) -> None:
+        model = _test_model()
+        stats = _test_scan_projection_stats()
+        result = ScanProjectedMeshyGenerationResult(
+            task_id="scan-task",
+            glb_bytes=model.glb_bytes,
+            name="Scanned chair",
+            scan_projection_stats=stats,
+        )
+
+        self.workspace._handle_generation_succeeded(result, model)
+
+        record = self.workspace.get_data().generated_objects[0]
+        self.assertTrue(record.pipeline[LOCALLY_AUTHORED_UVS_PIPELINE_KEY])
+        self.assertEqual(
+            record.pipeline[SCAN_PROJECTION_PIPELINE_KEY],
+            stats.to_pipeline_dict(),
+        )
+
+    def test_visibility_uv_geometry_only_reuses_saved_asset_as_revision(
+        self,
+    ) -> None:
+        uv_glb = _test_uv_glb()
+        result = StagedMeshyGenerationResult(
+            task_id="geometry-task",
+            glb_bytes=uv_glb,
+            name="UV chair",
+            geometry_task_id="geometry-task",
+            source_glb_bytes=_test_model().glb_bytes,
+            postprocessed_glb_bytes=uv_glb,
+            visibility_uv_stats=_test_visibility_uv_stats(),
+            geometry_only=True,
+        )
+
+        self.workspace._handle_generation_succeeded(
+            result,
+            import_generated_glb(uv_glb),
+        )
+
+        record = self.workspace.get_data().generated_objects[0]
+        self.assertEqual(
+            record.pipeline["postprocessed_asset_path"],
+            record.asset_path,
+        )
+        self.assertTrue(record.pipeline[LOCALLY_AUTHORED_UVS_PIPELINE_KEY])
+        self.assertEqual(
+            record.pipeline[VISIBILITY_UV_UNWRAP_PIPELINE_KEY]["version"],
+            VISIBILITY_UV_UNWRAP_VERSION,
+        )
+        saved_glbs = tuple(
+            self.workspace._asset_directory.glob(f"{record.object_id}*.glb")
+        )
+        self.assertEqual(len(saved_glbs), 2)
+        self.assertFalse(
+            any(path.name.endswith(".postprocessed.glb") for path in saved_glbs)
         )
 
     def test_object_list_selects_saved_models_and_current_texture_preview(

@@ -11,6 +11,8 @@ import cv2
 import numpy as np
 import trimesh
 from PIL import Image
+from trimesh.visual.material import PBRMaterial
+from trimesh.visual.texture import TextureVisuals
 
 
 # ### Constants ###
@@ -108,7 +110,8 @@ def replace_object_base_color_texture_from_glb(
 
     Texture-only operations keep the submitted model's scene, geometry and
     UVs authoritative. Only the shared 2048 base-color atlas is copied from
-    the provider result.
+    the provider result. An untextured UV model receives a new material;
+    an already textured model keeps its existing material structure.
     """
 
     model_payload = bytes(model_glb)
@@ -120,11 +123,6 @@ def replace_object_base_color_texture_from_glb(
 
     model_scene = _load_glb_scene(model_payload)
     model_textures = _collect_material_textures(model_scene)
-    if not model_textures:
-        raise ValueError(
-            "The preserved object GLB has no embedded base-color texture."
-        )
-    _validate_shared_texture(model_textures)
 
     texture_scene = _load_glb_scene(texture_payload)
     generated_textures = _collect_material_textures(texture_scene)
@@ -135,10 +133,9 @@ def replace_object_base_color_texture_from_glb(
     generated_texture = _validate_shared_2048_texture(
         generated_textures
     ).copy()
-    _replace_material_textures(
-        model_scene,
-        [generated_texture] * len(model_textures),
-    )
+    if model_textures:
+        _validate_shared_texture(model_textures)
+    _attach_texture_to_uv_meshes(model_scene, generated_texture)
     try:
         return bytes(model_scene.export(file_type="glb"))
     except Exception as error:
@@ -308,6 +305,85 @@ def _replace_material_texture_tree(
             raise ValueError("Not enough replacement material textures.") from error
         setattr(material, attribute_name, Image.fromarray(rgba, mode="RGBA"))
         return
+
+
+def _attach_texture_to_uv_meshes(
+    scene: trimesh.Scene,
+    texture_rgba: np.ndarray,
+) -> None:
+    """Attach one provider atlas to an untextured authoritative UV scene."""
+
+    attached_count = 0
+    for geometry in scene.geometry.values():
+        if not isinstance(geometry, trimesh.Trimesh) or len(geometry.faces) == 0:
+            continue
+        uv = np.asarray(getattr(geometry.visual, "uv", None), dtype=float)
+        if (
+            uv.shape != (len(geometry.vertices), 2)
+            or not np.all(np.isfinite(uv))
+        ):
+            raise ValueError(
+                "The preserved object GLB has no valid UV coordinates for "
+                "the generated texture."
+            )
+        raw_material = getattr(geometry.visual, "material", None)
+        material = (
+            PBRMaterial()
+            if raw_material is None
+            else copy.deepcopy(raw_material)
+        )
+        _attach_texture_to_material_tree(material, texture_rgba)
+        raw_face_materials = getattr(
+            geometry.visual,
+            "face_materials",
+            None,
+        )
+        face_materials = (
+            None
+            if raw_face_materials is None
+            else np.asarray(raw_face_materials, dtype=np.int64).copy()
+        )
+        if face_materials is not None and face_materials.shape != (
+            len(geometry.faces),
+        ):
+            raise ValueError(
+                "The preserved object GLB has invalid face material indices."
+            )
+        geometry.visual = TextureVisuals(
+            uv=uv.copy(),
+            material=material,
+            face_materials=face_materials,
+        )
+        attached_count += 1
+    if attached_count == 0:
+        raise ValueError(
+            "The preserved object GLB has no textured triangle meshes."
+        )
+
+
+def _attach_texture_to_material_tree(
+    material: object,
+    texture_rgba: np.ndarray,
+) -> None:
+    """Set one shared atlas on every leaf while retaining material factors."""
+
+    nested_materials = getattr(material, "materials", None)
+    if isinstance(nested_materials, list | tuple):
+        if not nested_materials:
+            raise ValueError("The preserved object has an empty material set.")
+        for nested_material in nested_materials:
+            _attach_texture_to_material_tree(nested_material, texture_rgba)
+        return
+    texture_image = Image.fromarray(texture_rgba.copy(), mode="RGBA")
+    if hasattr(material, "baseColorTexture"):
+        setattr(material, "baseColorTexture", texture_image)
+        return
+    if hasattr(material, "image"):
+        setattr(material, "image", texture_image)
+        return
+    raise ValueError(
+        "The preserved object uses an unsupported material type."
+    )
 
 
 # ### Image helpers ###

@@ -751,6 +751,89 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             commit_callback=commit,
         )
 
+    def test_face_edit_keeps_pinned_atlas_texture_pixels_and_path(
+        self,
+    ) -> None:
+        generation_assets = self.workspace.generation._asset_directory
+        generation_assets.mkdir(parents=True, exist_ok=True)
+        texture_path = generation_assets / "chair-512.png"
+        texture_color = (35, 75, 125, 255)
+        Image.new("RGBA", (512, 512), texture_color).save(
+            texture_path
+        )
+        old_record = GeneratedObjectRecord(
+            object_id="chair",
+            frame_index=0,
+            object_name="Chair",
+            pipeline={
+                "texture_variants": {
+                    "512": {
+                        "glb_asset_path": "chair-old-512.glb",
+                        "texture_asset_path": texture_path.name,
+                    }
+                },
+                "selected_texture_resolution": 512,
+            },
+            provider_task_id="task-old",
+            asset_path="chair-old-512.glb",
+        )
+        replacement = replace(
+            old_record,
+            pipeline={
+                "texture_variants": {
+                    "512": {
+                        "glb_asset_path": "chair-face-edit-512.glb",
+                        "texture_asset_path": texture_path.name,
+                    }
+                },
+                "selected_texture_resolution": 512,
+                "locally_authored_uvs": True,
+            },
+            asset_path="chair-face-edit-512.glb",
+        )
+        atlas_data = TextureAtlasData()
+        atlas = atlas_data.create_atlas(
+            "Edited object",
+            2048,
+            atlas_id="atlas-a",
+        )
+        atlas_data.assign_object(
+            atlas.atlas_id,
+            "chair",
+            texture_path.name,
+            512,
+        )
+        self.workspace.texture_atlas_workspace.set_data(atlas_data)
+        commit = Mock(return_value=True)
+
+        accepted = self.workspace \
+            ._handle_generation_object_packing_change_requested(
+                old_record,
+                replacement,
+                _generated_box_model(),
+                commit,
+            )
+
+        self.assertTrue(accepted)
+        commit.assert_called_once_with()
+        updated_atlas = self.workspace.texture_atlas_workspace.selected_atlas
+        self.assertIsNotNone(updated_atlas)
+        assert updated_atlas is not None
+        placement = updated_atlas.placement_for_object("chair")
+        self.assertIsNotNone(placement)
+        assert placement is not None
+        self.assertEqual(placement.texture_path, texture_path.name)
+        self.assertIsNotNone(updated_atlas.image_path)
+        atlas_png = (
+            self.workspace.texture_atlas_workspace._asset_directory
+            / str(updated_atlas.image_path)
+        )
+        with Image.open(atlas_png) as image:
+            self.assertEqual(
+                image.getpixel((placement.x, placement.y)),
+                texture_color,
+            )
+
     def test_generation_quarter_packing_callback_skips_missing_2048_variant(
         self,
     ) -> None:

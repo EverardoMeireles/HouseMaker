@@ -56,7 +56,10 @@ from housemaker.generation_state import (
     GenerationData,
 )
 from housemaker.generation_jobs import GenerationJobManager, JobsWindow
-from housemaker.generation_workspace import GenerationWorkspace
+from housemaker.generation_workspace import (
+    FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY,
+    GenerationWorkspace,
+)
 from housemaker.object_placement_dialog import ObjectPlacementDialog
 from housemaker.surface_texture_state import (
     SURFACE_TYPE_WALL,
@@ -2332,9 +2335,12 @@ class BlueprintWorkspace(QWidget):
         symmetry = self.generation.resolve_symmetric_division_for_record(
             replacement_record
         )
+        resolve_variant = (
+            self.generation.resolve_atlas_texture_image_variant_for_record
+        )
         candidate_sources: list[AtlasObjectTextureSource] = []
         for resolution in sorted(OBJECT_TEXTURE_RESOLUTIONS):
-            variant = self.generation.resolve_texture_image_variant_for_record(
+            variant = resolve_variant(
                 replacement_record,
                 resolution,
             )
@@ -2348,6 +2354,13 @@ class BlueprintWorkspace(QWidget):
                 return False
             candidate_sources.append(source)
         if not candidate_sources:
+            if (
+                replacement_record.pipeline.get(
+                    FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY
+                )
+                is True
+            ):
+                return False
             return bool(commit_callback())
         return self.texture_atlas_workspace.transition_object_packing(
             replacement_record.object_id,
@@ -2642,7 +2655,7 @@ class BlueprintWorkspace(QWidget):
                     resolution,
                 )
             return self._build_atlas_object_texture_source(
-                self.generation.get_texture_image_variant(
+                self.generation.get_atlas_texture_image_variant(
                     object_id,
                     resolution,
                 ),

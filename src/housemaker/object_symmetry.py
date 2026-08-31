@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import math
 import random
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -29,6 +30,11 @@ from housemaker.object_texture_variants import (
     _replace_material_textures,
     _resize_rgba,
     _validate_shared_2048_texture,
+)
+from housemaker.object_uv_scan_projection import (
+    SCAN_PROJECTION_TARGET_LEFT_HALF,
+    ScanProjectionStats,
+    scan_project_textured_glb,
 )
 
 
@@ -71,6 +77,11 @@ SYMMETRIC_TEXTURE_PACKING_MODE_TOP_LEFT_QUARTER = "symmetric_quarter"
 SYMMETRIC_TEXTURE_PACKING_MODE_PAIR = "symmetric_pair"
 SYMMETRIC_TEXTURE_CONTENT_QUADRANT_TOP_LEFT = "top_left"
 SYMMETRIC_TEXTURE_CONTENT_HALF_LEFT = "left"
+SYMMETRIC_LEFT_PACKED_UV_SAFETY_PIXELS = 4
+SYMMETRIC_LEFT_PACKED_UV_SAFETY_INSET = (
+    float(SYMMETRIC_LEFT_PACKED_UV_SAFETY_PIXELS)
+    / float(TEXTURE_RESOLUTION_2048)
+)
 SYMMETRIC_SELECTION_MODE_FEWEST_TRIANGLES_RANDOM_TIE = (
     "fewest_triangles_random_tie"
 )
@@ -101,8 +112,7 @@ SYMMETRIC_SQUARE_PAIR_ATLAS_RESOLUTION_BY_CONTENT_RESOLUTION = {
 _CLIP_RELATIVE_EPSILON = 1e-9
 _NORMAL_EPSILON = 1e-12
 _UV_RASTER_FIXED_POINT_BITS = 8
-_UV_PACK_LATTICE_PIXELS = 4
-_PRESERVED_UV_SAFETY_PIXELS = _UV_PACK_LATTICE_PIXELS
+_UV_PACK_LATTICE_PIXELS = SYMMETRIC_LEFT_PACKED_UV_SAFETY_PIXELS
 _UV_GUTTER_PIXELS = 16
 _SCALED_UV_GUTTER_PIXELS = 8
 _QUARTER_CONTENT_GUTTER_PIXELS_1024 = 8
@@ -424,6 +434,7 @@ class SymmetricDivisionResult:
     kept_side: SymmetricDivisionKeptSide
     plane_coordinate: float
     metadata: SymmetricDivisionMetadata
+    scan_projection_stats: ScanProjectionStats | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(
@@ -448,6 +459,45 @@ class SymmetricDivisionResult:
         ):
             raise ValueError(
                 "Symmetric variants do not match their metadata packing mode."
+            )
+        if (
+            self.scan_projection_stats is not None
+            and not isinstance(
+                self.scan_projection_stats,
+                ScanProjectionStats,
+            )
+        ):
+            raise TypeError("Symmetric scan-projection statistics are invalid.")
+
+
+@dataclass(frozen=True)
+class SymmetricGeometryDivisionResult:
+    """One retained untextured half plus automatic symmetry provenance."""
+
+    glb_bytes: bytes
+    orientation: SymmetricDivisionOrientation
+    kept_side: SymmetricDivisionKeptSide
+    plane_coordinate: float
+    metadata: SymmetricDivisionMetadata
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.glb_bytes, bytes) or not self.glb_bytes:
+            raise ValueError("The symmetric geometry-only GLB is empty.")
+        _validate_orientation_and_side(self.orientation, self.kept_side)
+        if not math.isfinite(self.plane_coordinate):
+            raise ValueError("The symmetric-division plane must be finite.")
+        if (
+            self.metadata.orientation != self.orientation
+            or self.metadata.kept_side != self.kept_side
+            or self.metadata.plane_coordinate != self.plane_coordinate
+        ):
+            raise ValueError("Symmetric-division metadata does not match its result.")
+        if (
+            self.metadata.version
+            != AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION
+        ):
+            raise ValueError(
+                "Symmetric geometry does not match its metadata packing mode."
             )
 
 
@@ -549,6 +599,18 @@ class _UvPackPlacement:
     scale: float
 
 
+@dataclass(frozen=True)
+class _AutomaticSymmetricSelection:
+    """One chosen clipped half and the facts used to select it."""
+
+    retained_scene: trimesh.Scene
+    orientation: SymmetricDivisionOrientation
+    kept_side: SymmetricDivisionKeptSide
+    plane_coordinate: float
+    triangle_count_by_side: tuple[tuple[str, int], ...]
+    tie_broken_randomly: bool
+
+
 # ### Public symmetric transforms ###
 def build_symmetric_retexture_proxy_glb(
     retained_glb: bytes,
@@ -557,10 +619,11 @@ def build_symmetric_retexture_proxy_glb(
 ) -> bytes:
     """Mirror a retained half solely for Meshy's full-object context.
 
-    The authoritative half keeps its left-atlas UVs. Its temporary mirror uses
-    the corresponding right-atlas coordinates, so the full reference image
-    and the submitted geometry describe the same complete object. This proxy
-    is never persisted or exported as the user's model.
+    Geometry without UVs can be mirrored before unwrapping. When left-atlas
+    UVs already exist, the temporary mirror uses the corresponding right-atlas
+    coordinates. An existing base-color atlas is duplicated for the mirror,
+    while an untextured source remains untextured. This proxy is never
+    persisted or exported as the user's model.
     """
 
     _validate_orientation(orientation)
@@ -574,14 +637,12 @@ def build_symmetric_retexture_proxy_glb(
     source_scene = _load_glb_scene(payload)
     _reject_auxiliary_material_textures(source_scene)
     source_textures = _collect_material_textures(source_scene)
-    if not source_textures:
-        raise ValueError(
-            "The symmetric Retexture source has no base-color atlas."
-        )
-    source_texture = _validate_shared_square_pair_texture(
-        source_textures
-    ).copy()
-    _validate_scene_uvs_in_left_half(source_scene)
+    source_texture = (
+        _validate_shared_square_pair_texture(source_textures).copy()
+        if source_textures
+        else None
+    )
+    _validate_existing_scene_uvs_in_left_half(source_scene)
     instances = _collect_mesh_instances(source_scene)
 
     proxy_scene = copy.deepcopy(source_scene)
@@ -593,14 +654,8 @@ def build_symmetric_retexture_proxy_glb(
     reflection[axis, 3] = 2.0 * normalized_plane
     for instance in instances:
         mirrored_mesh = copy.deepcopy(instance.mesh)
-        mirrored_uvs: np.ndarray | None = None
-        if _material_textures(mirrored_mesh):
-            mirrored_uvs = _get_vertex_uvs(mirrored_mesh)
-            if mirrored_uvs is None:
-                raise ValueError(
-                    "A textured symmetric Retexture mesh is missing UV "
-                    "coordinates."
-                )
+        mirrored_uvs = _get_vertex_uvs(mirrored_mesh)
+        if mirrored_uvs is not None:
             mirrored_uvs[:, 0] += 0.5
             if np.any(
                 mirrored_uvs[:, 0] > 1.0 + _REPEAT_UV_TOLERANCE
@@ -631,14 +686,15 @@ def build_symmetric_retexture_proxy_glb(
             node_name=node_name,
         )
 
-    half_width = source_texture.shape[1] // 2
-    proxy_texture = source_texture.copy()
-    proxy_texture[:, half_width:] = source_texture[:, :half_width]
-    proxy_textures = _collect_material_textures(proxy_scene)
-    _replace_material_textures(
-        proxy_scene,
-        [proxy_texture] * len(proxy_textures),
-    )
+    if source_texture is not None:
+        half_width = source_texture.shape[1] // 2
+        proxy_texture = source_texture.copy()
+        proxy_texture[:, half_width:] = source_texture[:, :half_width]
+        proxy_textures = _collect_material_textures(proxy_scene)
+        _replace_material_textures(
+            proxy_scene,
+            [proxy_texture] * len(proxy_textures),
+        )
     try:
         return bytes(proxy_scene.export(file_type="glb"))
     except Exception as error:
@@ -647,11 +703,44 @@ def build_symmetric_retexture_proxy_glb(
         ) from error
 
 
+def build_automatic_symmetric_geometry(
+    geometry_glb: bytes,
+    orientation: SymmetricDivisionOrientation,
+    *,
+    rng: random.Random | None = None,
+) -> SymmetricGeometryDivisionResult:
+    """Clip untextured geometry and retain the lower-triangle midpoint half."""
+
+    _validate_automatic_symmetry_request(orientation, rng)
+    payload = bytes(geometry_glb)
+    if not payload:
+        raise ValueError("The geometry-only GLB is empty.")
+
+    scene = _load_glb_scene(payload)
+    _reject_auxiliary_material_textures(scene)
+    if _collect_material_textures(scene):
+        raise ValueError(
+            "Automatic geometry-only symmetry requires an untextured model."
+        )
+    selection = _select_automatic_symmetric_half(scene, orientation, rng)
+    _strip_scene_uvs(selection.retained_scene)
+    metadata = _build_automatic_symmetry_metadata(selection)
+    return SymmetricGeometryDivisionResult(
+        glb_bytes=_export_symmetric_geometry_scene(selection.retained_scene),
+        orientation=selection.orientation,
+        kept_side=selection.kept_side,
+        plane_coordinate=selection.plane_coordinate,
+        metadata=metadata,
+    )
+
+
 def build_automatic_symmetric_object_variants(
     canonical_2048_glb: bytes,
     orientation: SymmetricDivisionOrientation,
     *,
     rng: random.Random | None = None,
+    projection_camera_percentages: Sequence[int] | None = None,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> SymmetricDivisionResult:
     """Clip both midpoint halves and pair-pack the lower-triangle side.
 
@@ -659,9 +748,7 @@ def build_automatic_symmetric_object_variants(
     ``random.SystemRandom`` provides a nondeterministic tie choice.
     """
 
-    _validate_orientation(orientation)
-    if rng is not None and not callable(getattr(rng, "choice", None)):
-        raise TypeError("The automatic symmetry RNG must provide choice().")
+    _validate_automatic_symmetry_request(orientation, rng)
     payload = bytes(canonical_2048_glb)
     if not payload:
         raise ValueError("The canonical 2048 GLB is empty.")
@@ -674,72 +761,47 @@ def build_automatic_symmetric_object_variants(
             "Automatic symmetry requires one embedded base-color texture atlas."
         )
     canonical_texture = _validate_shared_2048_texture(source_textures).copy()
-    instances = _collect_mesh_instances(scene)
-    axis = _get_z_up_axis(orientation)
-    plane_coordinate = _get_world_midpoint(instances, axis)
-    ordered_sides = SYMMETRIC_DIVISION_SIDE_ORDER_BY_ORIENTATION[orientation]
-    clipped_scene_by_side = {
-        side: _build_clipped_scene(
-            instances,
-            axis=axis,
-            plane_coordinate=plane_coordinate,
-            kept_side=side,
-            metadata=scene.metadata,
-        )
-        for side in ordered_sides
-    }
-    triangle_count_by_side = tuple(
-        (side, _count_scene_triangles(clipped_scene_by_side[side]))
-        for side in ordered_sides
-    )
-    minimum_count = min(count for _side, count in triangle_count_by_side)
-    minimum_sides = tuple(
-        side
-        for side, count in triangle_count_by_side
-        if count == minimum_count
-    )
-    tie_broken_randomly = len(minimum_sides) > 1
-    if tie_broken_randomly:
-        random_source = rng if rng is not None else random.SystemRandom()
-        kept_side = random_source.choice(minimum_sides)
-    else:
-        kept_side = minimum_sides[0]
-    clipped_scene = clipped_scene_by_side[kept_side]
-    _normalize_scene_repeat_uvs(clipped_scene)
+    selection = _select_automatic_symmetric_half(scene, orientation, rng)
+    clipped_scene = selection.retained_scene
     output_textures = _collect_material_textures(clipped_scene)
     if not output_textures:
         raise ValueError(
             "Automatic symmetry removed every textured mesh from the kept half."
         )
     _validate_shared_2048_texture(output_textures)
-    packed_texture = _repack_retained_texture(
-        clipped_scene,
-        canonical_texture,
-    )
+    scan_projection_stats: ScanProjectionStats | None = None
+    if projection_camera_percentages is None:
+        _normalize_scene_repeat_uvs(clipped_scene)
+        packed_texture = _repack_retained_texture(
+            clipped_scene,
+            canonical_texture,
+        )
+    else:
+        projected = scan_project_textured_glb(
+            _export_symmetric_geometry_scene(clipped_scene),
+            projection_camera_percentages,
+            target_domain=SCAN_PROJECTION_TARGET_LEFT_HALF,
+            cancellation_check=cancellation_check,
+        )
+        clipped_scene = _load_glb_scene(projected.glb_bytes)
+        output_textures = _collect_material_textures(clipped_scene)
+        packed_texture = _validate_shared_2048_texture(
+            output_textures
+        ).copy()
+        scan_projection_stats = projected.stats
     variants = _build_square_pair_texture_variants(
         clipped_scene,
         packed_texture,
         len(output_textures),
     )
-    metadata = SymmetricDivisionMetadata(
-        orientation=orientation,
-        kept_side=kept_side,
-        plane_coordinate=plane_coordinate,
-        version=AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
-        packing_mode=SYMMETRIC_TEXTURE_PACKING_MODE_PAIR,
-        texture_content_half=SYMMETRIC_TEXTURE_CONTENT_HALF_LEFT,
-        selection_mode=(
-            SYMMETRIC_SELECTION_MODE_FEWEST_TRIANGLES_RANDOM_TIE
-        ),
-        triangle_count_by_side=triangle_count_by_side,
-        tie_broken_randomly=tie_broken_randomly,
-    )
+    metadata = _build_automatic_symmetry_metadata(selection)
     return SymmetricDivisionResult(
         variants=variants,
-        orientation=orientation,
-        kept_side=kept_side,
-        plane_coordinate=plane_coordinate,
+        orientation=selection.orientation,
+        kept_side=selection.kept_side,
+        plane_coordinate=selection.plane_coordinate,
         metadata=metadata,
+        scan_projection_stats=scan_projection_stats,
     )
 
 
@@ -806,12 +868,15 @@ def build_symmetric_square_pair_texture_variants(
         )
     source_texture = _validate_shared_square_pair_texture(source_textures).copy()
     source_resolution = int(source_texture.shape[0])
-    left_packed = (
-        uvs_already_left_packed and _scene_uvs_are_left_packed(scene)
-    )
-    if left_packed and source_resolution == TEXTURE_RESOLUTION_2048:
+    left_packed = _scene_uvs_are_left_packed(scene)
+    if uvs_already_left_packed and not left_packed:
+        raise ValueError(
+            "The declared left-packed symmetric UVs do not preserve the "
+            "required texture boundary inset."
+        )
+    if uvs_already_left_packed and source_resolution == TEXTURE_RESOLUTION_2048:
         packed_texture = _mask_existing_left_texture(scene, source_texture)
-    elif left_packed:
+    elif uvs_already_left_packed:
         packed_texture = _mask_existing_square_pair_texture(
             scene,
             source_texture,
@@ -1011,6 +1076,104 @@ def _get_world_midpoint(instances: list[_MeshInstance], axis: int) -> float:
             "The selected symmetric-division axis has no measurable extent."
         )
     return (coordinate_minimum + coordinate_maximum) * 0.5
+
+
+# ### Automatic symmetric selection helpers ###
+def _validate_automatic_symmetry_request(
+    orientation: str,
+    rng: random.Random | None,
+) -> None:
+    _validate_orientation(orientation)
+    if rng is not None and not callable(getattr(rng, "choice", None)):
+        raise TypeError("The automatic symmetry RNG must provide choice().")
+
+
+def _select_automatic_symmetric_half(
+    scene: trimesh.Scene,
+    orientation: SymmetricDivisionOrientation,
+    rng: random.Random | None,
+) -> _AutomaticSymmetricSelection:
+    """Clip both midpoint halves and select the lower-triangle result."""
+
+    instances = _collect_mesh_instances(scene)
+    axis = _get_z_up_axis(orientation)
+    plane_coordinate = _get_world_midpoint(instances, axis)
+    ordered_sides = SYMMETRIC_DIVISION_SIDE_ORDER_BY_ORIENTATION[orientation]
+    clipped_scene_by_side = {
+        side: _build_clipped_scene(
+            instances,
+            axis=axis,
+            plane_coordinate=plane_coordinate,
+            kept_side=side,
+            metadata=scene.metadata,
+        )
+        for side in ordered_sides
+    }
+    triangle_count_by_side = tuple(
+        (side, _count_scene_triangles(clipped_scene_by_side[side]))
+        for side in ordered_sides
+    )
+    minimum_count = min(count for _side, count in triangle_count_by_side)
+    minimum_sides = tuple(
+        side
+        for side, count in triangle_count_by_side
+        if count == minimum_count
+    )
+    tie_broken_randomly = len(minimum_sides) > 1
+    if tie_broken_randomly:
+        random_source = rng if rng is not None else random.SystemRandom()
+        kept_side = random_source.choice(minimum_sides)
+    else:
+        kept_side = minimum_sides[0]
+    return _AutomaticSymmetricSelection(
+        retained_scene=clipped_scene_by_side[kept_side],
+        orientation=orientation,
+        kept_side=kept_side,
+        plane_coordinate=plane_coordinate,
+        triangle_count_by_side=triangle_count_by_side,
+        tie_broken_randomly=tie_broken_randomly,
+    )
+
+
+def _build_automatic_symmetry_metadata(
+    selection: _AutomaticSymmetricSelection,
+) -> SymmetricDivisionMetadata:
+    return SymmetricDivisionMetadata(
+        orientation=selection.orientation,
+        kept_side=selection.kept_side,
+        plane_coordinate=selection.plane_coordinate,
+        version=AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
+        packing_mode=SYMMETRIC_TEXTURE_PACKING_MODE_PAIR,
+        texture_content_half=SYMMETRIC_TEXTURE_CONTENT_HALF_LEFT,
+        selection_mode=(
+            SYMMETRIC_SELECTION_MODE_FEWEST_TRIANGLES_RANDOM_TIE
+        ),
+        triangle_count_by_side=selection.triangle_count_by_side,
+        tie_broken_randomly=selection.tie_broken_randomly,
+    )
+
+
+def _strip_scene_uvs(scene: trimesh.Scene) -> None:
+    """Discard provider UVs that will be replaced by the local unwrap."""
+
+    for geometry in scene.geometry.values():
+        if (
+            isinstance(geometry, trimesh.Trimesh)
+            and isinstance(geometry.visual, TextureVisuals)
+        ):
+            geometry.visual.uv = None
+
+
+def _export_symmetric_geometry_scene(scene: trimesh.Scene) -> bytes:
+    try:
+        payload = scene.export(file_type="glb")
+    except Exception as error:
+        raise ValueError(
+            "The automatic symmetric geometry could not be exported."
+        ) from error
+    if not isinstance(payload, bytes) or not payload:
+        raise ValueError("The automatic symmetric geometry export was empty.")
+    return payload
 
 
 # ### Geometry clipping helpers ###
@@ -4055,6 +4218,36 @@ def _validate_scene_uvs_in_top_left_quarter(scene: trimesh.Scene) -> None:
         raise ValueError("The retextured GLB contains no textured mesh UVs.")
 
 
+def _validate_existing_scene_uvs_in_left_half(scene: trimesh.Scene) -> bool:
+    """Validate every authored UV set while permitting geometry without UVs."""
+
+    found_uvs = False
+    tolerance = _REPEAT_UV_TOLERANCE
+    for geometry in scene.geometry.values():
+        if not isinstance(geometry, trimesh.Trimesh):
+            continue
+        raw_uvs = getattr(geometry.visual, "uv", None)
+        if raw_uvs is None:
+            if _material_textures(geometry):
+                _get_vertex_uvs(geometry)
+            continue
+        uvs = _get_vertex_uvs(geometry, allow_repeat=True)
+        if uvs is None:
+            raise RuntimeError("An authored UV set unexpectedly disappeared.")
+        found_uvs = True
+        if (
+            np.any(uvs[:, 0] < -tolerance)
+            or np.any(uvs[:, 0] > 0.5 + tolerance)
+            or np.any(uvs[:, 1] < -tolerance)
+            or np.any(uvs[:, 1] > 1.0 + tolerance)
+        ):
+            raise ValueError(
+                "Symmetric Retexture UVs must fit inside the left half of the "
+                "texture."
+            )
+    return found_uvs
+
+
 def _validate_scene_uvs_in_left_half(scene: trimesh.Scene) -> None:
     found_textured = False
     tolerance = 1e-7
@@ -4086,10 +4279,7 @@ def _scene_uvs_are_left_packed(scene: trimesh.Scene) -> bool:
 
     found_textured = False
     tolerance = _REPEAT_UV_TOLERANCE
-    safety_inset = (
-        float(_PRESERVED_UV_SAFETY_PIXELS)
-        / float(TEXTURE_RESOLUTION_2048)
-    )
+    safety_inset = SYMMETRIC_LEFT_PACKED_UV_SAFETY_INSET
     minimum_u = safety_inset
     maximum_u = 0.5 - safety_inset
     minimum_v = safety_inset

@@ -1,9 +1,12 @@
 # ### Imports ###
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from io import BytesIO
 import math
+import threading
+import weakref
 
 import numpy as np
 import trimesh
@@ -13,18 +16,27 @@ from pyqtgraph import Transform3D
 import pyqtgraph.opengl as gl
 from pyqtgraph.opengl import shaders as gl_shaders
 from pyqtgraph.opengl.GLGraphicsItem import GLGraphicsItem
-from PySide6.QtCore import QPointF, QTimer, Qt, Signal
+from PySide6.QtCore import QPoint, QPointF, QRect, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QCursor, QKeyEvent, QMouseEvent, QVector3D
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QRubberBand,
     QStackedLayout,
     QVBoxLayout,
     QWidget,
 )
 from PIL import Image
 
+from housemaker.camera_indicators import (
+    DEFAULT_CAMERA_INDICATOR_PERCENTAGES,
+    ProjectionCameraIndicatorGeometry,
+    build_projection_camera_indicator_geometries,
+    create_projection_camera_indicator_items,
+    normalize_projection_camera_indicator_percentages,
+    update_projection_camera_indicator_items,
+)
 from housemaker.camera_models import CameraPose
 from housemaker.glb import (
     SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION,
@@ -39,6 +51,7 @@ from housemaker.surface_geometry import (
     build_wall_window_placement,
     get_wall_window_world_corners,
 )
+from housemaker.unused_face_removal import ALL_CAMERA_IDS
 
 # ### Constants ###
 EDGE_COLOR = (0.12, 0.12, 0.16, 1.0)
@@ -46,6 +59,9 @@ FACE_COLOR = np.array([0.78, 0.80, 0.84, 1.0], dtype=float)
 TEXTURE_PREVIEW_OFFSET_METERS = 0.01
 CAMERA_STATE_KEYS = ("center", "distance", "elevation", "azimuth", "fov")
 CLICK_SELECTION_TOLERANCE = 4.0
+PROJECTION_CAMERA_SELECTION_TOLERANCE_PIXELS = 10.0
+PROJECTION_CAMERA_LABEL_SELECTION_TOLERANCE_PIXELS = 16.0
+MOUSE_WHEEL_DELTA_PER_STEP = 120
 DEFAULT_AMBIENT_LIGHT_INTENSITY = 0.35
 MIN_AMBIENT_LIGHT_INTENSITY = 0.0
 MAX_AMBIENT_LIGHT_INTENSITY = 1.0
@@ -89,6 +105,15 @@ TRANSFORM_GIZMO_RING_HIT_RATIO = 0.085
 TRANSFORM_GIZMO_SELECTION_COLOR = (1.0, 0.72, 0.18, 0.95)
 TRANSFORM_GIZMO_TRANSLATE = "translate"
 TRANSFORM_GIZMO_ROTATE = "rotate"
+FACE_SELECTION_COLOR = (1.0, 0.36, 0.08, 0.72)
+FACE_SELECTION_EDGE_COLOR = (1.0, 0.78, 0.18, 1.0)
+FACE_SELECTION_MAX_RASTER_DIMENSION = 768
+FACE_SELECTION_REPLACE = "replace"
+FACE_SELECTION_TOGGLE = "toggle"
+FACE_SELECTION_ADD = "add"
+FACE_SELECTION_UPDATE_MODES = frozenset(
+    (FACE_SELECTION_REPLACE, FACE_SELECTION_TOGGLE, FACE_SELECTION_ADD)
+)
 # ### Shader source ###
 AMBIENT_LIT_VERTEX_SHADER = """
     uniform mat4 u_mvp;
@@ -202,6 +227,12 @@ class SelectableGLViewWidget(gl.GLViewWidget):
     primary_pointer_moved = Signal(object)
     primary_pointer_released = Signal(object)
     primary_pointer_cancel_requested = Signal()
+    face_selection_pointer_pressed = Signal(object)
+    face_selection_pointer_moved = Signal(object)
+    face_selection_pointer_released = Signal(object)
+    face_selection_pointer_cancel_requested = Signal()
+    overlay_selection_requested = Signal(object)
+    overlay_wheel_steps_requested = Signal(int)
     delete_requested = Signal()
     navigation_mode_changed = Signal(str)
     first_person_active_changed = Signal(bool)
@@ -213,6 +244,13 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self._is_middle_navigation_active = False
         self._rectangle_drawing_enabled = False
         self._primary_pointer_drag_reserved = False
+        self._item_click_selection_enabled = True
+        self._overlay_selection_enabled = False
+        self._overlay_wheel_steps_enabled = False
+        self._overlay_wheel_delta_remainder = 0
+        self._face_selection_gestures_enabled = False
+        self._face_selection_gesture_active = False
+        self._face_selection_release_suppressed = False
         self._navigation_mode = NAVIGATION_MODE_ORBIT
         self._first_person_pointer_captured = False
         self._first_person_camera_pose = CameraPose(
@@ -264,6 +302,57 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         """Return primary-pointer input to ordinary selection."""
 
         self._primary_pointer_drag_reserved = False
+
+    def set_item_click_selection_enabled(self, enabled: bool) -> None:
+        """Enable the legacy item-pick pass only for viewers that use it."""
+
+        self._item_click_selection_enabled = bool(enabled)
+
+    def set_overlay_selection_enabled(self, enabled: bool) -> None:
+        """Enable safe click requests for CPU-picked viewport overlays."""
+
+        self._overlay_selection_enabled = bool(enabled)
+
+    def set_overlay_wheel_steps_enabled(self, enabled: bool) -> None:
+        """Route wheel ticks to a selected overlay instead of camera zoom."""
+
+        normalized_enabled = bool(enabled)
+        if normalized_enabled == self._overlay_wheel_steps_enabled:
+            return
+        self._overlay_wheel_steps_enabled = normalized_enabled
+        self._overlay_wheel_delta_remainder = 0
+
+    @property
+    def is_face_selection_gesture_active(self) -> bool:
+        """Whether Ctrl+left selection currently owns pointer movement."""
+
+        return self._face_selection_gesture_active
+
+    @property
+    def is_middle_navigation_active(self) -> bool:
+        """Whether an orbit/pan gesture currently owns the middle button."""
+
+        return self._is_middle_navigation_active
+
+    def cancel_face_selection_gesture(self) -> None:
+        """Release a pending Ctrl+left gesture after a context change."""
+
+        self._cancel_face_selection_gesture()
+
+    def cancel_transient_pointer_interactions(self) -> None:
+        """Release selection/navigation ownership that cannot cross contexts."""
+
+        self._cancel_face_selection_gesture()
+        self._is_middle_navigation_active = False
+        if QWidget.mouseGrabber() is self:
+            self.releaseMouse()
+
+    def set_face_selection_gestures_enabled(self, enabled: bool) -> None:
+        """Enable Ctrl+primary-pointer gestures for object face editing."""
+
+        self._face_selection_gestures_enabled = bool(enabled)
+        if not self._face_selection_gestures_enabled:
+            self._cancel_face_selection_gesture()
 
     @property
     def navigation_mode(self) -> str:
@@ -474,12 +563,53 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             self._sync_view_to_first_person_camera_pose()
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._face_selection_release_suppressed = False
         if self._rectangle_drawing_enabled:
             if event.button() == Qt.MouseButton.LeftButton:
                 self.click_press_position = event.position()
                 self.rectangle_pointer_pressed.emit(event.position())
             elif event.button() == Qt.MouseButton.RightButton:
                 self.rectangle_drawing_cancel_requested.emit()
+            event.accept()
+            return
+
+        if (
+            self._face_selection_gestures_enabled
+            and event.button() == Qt.MouseButton.LeftButton
+            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+            and not self.is_first_person_pointer_captured
+        ):
+            self.click_press_position = event.position()
+            self._face_selection_gesture_active = True
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+            self.face_selection_pointer_pressed.emit(event.position())
+            event.accept()
+            return
+
+        if (
+            (
+                self._face_selection_gestures_enabled
+                or not self._item_click_selection_enabled
+                or self._overlay_selection_enabled
+            )
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            # Plain clicks have no meaning in non-item-picking viewers such
+            # as the object face editor.  Do not run GLViewWidget's legacy
+            # OpenGL item-pick pass: custom textured items can leave that
+            # selection render in a bad state and make later camera/model
+            # updates appear frozen.
+            self.click_press_position = event.position()
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+            event.accept()
+            return
+
+        if (
+            event.button() == Qt.MouseButton.RightButton
+            and self._face_selection_gesture_active
+        ):
+            self._cancel_face_selection_gesture()
             event.accept()
             return
 
@@ -527,6 +657,45 @@ class SelectableGLViewWidget(gl.GLViewWidget):
                 self.rectangle_pointer_released.emit(event.position())
             elif event.button() == Qt.MouseButton.RightButton:
                 self.rectangle_drawing_cancel_requested.emit()
+            event.accept()
+            return
+
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._face_selection_release_suppressed
+        ):
+            self._face_selection_release_suppressed = False
+            event.accept()
+            return
+
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._face_selection_gesture_active
+        ):
+            self._face_selection_gesture_active = False
+            self.face_selection_pointer_released.emit(event.position())
+            event.accept()
+            return
+
+        if (
+            (
+                self._face_selection_gestures_enabled
+                or not self._item_click_selection_enabled
+                or self._overlay_selection_enabled
+            )
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            # Match the inert press above without invoking itemsAt().  In the
+            # face editor, 3D selection is deliberately Ctrl+click/drag only.
+            if (
+                self._overlay_selection_enabled
+                and _get_point_distance(
+                    self.click_press_position,
+                    event.position(),
+                )
+                <= CLICK_SELECTION_TOLERANCE
+            ):
+                self.overlay_selection_requested.emit(event.position())
             event.accept()
             return
 
@@ -587,6 +756,12 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             event.accept()
             return
 
+        if self._face_selection_gesture_active:
+            if event.buttons() & Qt.MouseButton.LeftButton:
+                self.face_selection_pointer_moved.emit(event.position())
+            event.accept()
+            return
+
         if self._primary_pointer_drag_reserved:
             if event.buttons() & Qt.MouseButton.LeftButton:
                 self.primary_pointer_moved.emit(event.position())
@@ -626,6 +801,23 @@ class SelectableGLViewWidget(gl.GLViewWidget):
     def wheelEvent(self, event) -> None:  # type: ignore[override]
         """Zoom with the wheel, including when a modifier key is held."""
 
+        if self._overlay_wheel_steps_enabled:
+            delta = event.angleDelta().y()
+            if delta == 0:
+                delta = event.angleDelta().x()
+            self._overlay_wheel_delta_remainder += int(delta)
+            wheel_steps = math.trunc(
+                self._overlay_wheel_delta_remainder
+                / MOUSE_WHEEL_DELTA_PER_STEP
+            )
+            if wheel_steps:
+                self._overlay_wheel_delta_remainder -= (
+                    wheel_steps * MOUSE_WHEEL_DELTA_PER_STEP
+                )
+                self.overlay_wheel_steps_requested.emit(wheel_steps)
+            event.accept()
+            return
+
         if self.is_first_person_active:
             event.accept()
             return
@@ -644,6 +836,13 @@ class SelectableGLViewWidget(gl.GLViewWidget):
     def keyPressEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
         if event.key() == Qt.Key.Key_Delete:
             self.delete_requested.emit()
+            event.accept()
+            return
+        if (
+            self._face_selection_gesture_active
+            and event.key() == Qt.Key.Key_Escape
+        ):
+            self._cancel_face_selection_gesture()
             event.accept()
             return
         if (
@@ -674,10 +873,25 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         super().keyReleaseEvent(event)
 
     def focusOutEvent(self, event) -> None:  # type: ignore[override]
+        self.cancel_transient_pointer_interactions()
         if self._primary_pointer_drag_reserved:
             self.primary_pointer_cancel_requested.emit()
         self.release_first_person_pointer_capture()
         super().focusOutEvent(event)
+
+    def hideEvent(self, event) -> None:  # type: ignore[override]
+        self.cancel_transient_pointer_interactions()
+        self.release_first_person_pointer_capture()
+        super().hideEvent(event)
+
+    def _cancel_face_selection_gesture(self) -> None:
+        """Cancel one active face-selection gesture, if present."""
+
+        if not self._face_selection_gesture_active:
+            return
+        self._face_selection_gesture_active = False
+        self._face_selection_release_suppressed = True
+        self.face_selection_pointer_cancel_requested.emit()
 
     def _enter_first_person_mode(self) -> None:
         self._orbit_camera_state = self._capture_camera_state()
@@ -1160,6 +1374,27 @@ class _PlacedObjectTransformDrag:
     preview_rotation_degrees: tuple[float, float, float] | None = None
 
 
+# ### Face-selection background models ###
+@dataclass(frozen=True)
+class _FaceRectangleSelectionTask:
+    """Immutable projected input owned by one background raster pass."""
+
+    request_revision: int
+    geometry_revision: int
+    projected_geometry: tuple[tuple[np.ndarray, np.ndarray], ...]
+    rectangle: tuple[int, int, int, int]
+    xray: bool
+
+
+@dataclass(frozen=True)
+class _FaceRectangleSelectionResult:
+    """Logical face IDs produced for one exact request and geometry."""
+
+    request_revision: int
+    geometry_revision: int
+    face_indices: frozenset[int]
+
+
 class GlbViewerWidget(QWidget):
     """Generated-model viewer with Blender orbit and first-person navigation."""
 
@@ -1167,6 +1402,10 @@ class GlbViewerWidget(QWidget):
     window_placement_requested = Signal(object)
     window_undo_requested = Signal()
     placed_object_transform_changed = Signal(str, object, object)
+    face_selection_changed = Signal(object)
+    projection_camera_selection_changed = Signal(object)
+    projection_camera_percentage_step_requested = Signal(str, int)
+    _face_rectangle_selection_completed = Signal(object)
     delete_requested = Signal()
     navigation_mode_changed = Signal(str)
     first_person_active_changed = Signal(bool)
@@ -1180,6 +1419,7 @@ class GlbViewerWidget(QWidget):
         wireframe_enabled: bool = DEFAULT_WIREFRAME_ENABLED,
         wireframe_only: bool = DEFAULT_WIREFRAME_ONLY,
         window_editing_enabled: bool = False,
+        face_editing_enabled: bool = False,
     ) -> None:
         super().__init__(parent)
         self.model: GeneratedModel | None = None
@@ -1191,6 +1431,18 @@ class GlbViewerWidget(QWidget):
         self.textured_surface_items: list[TexturedMeshItem] = []
         self.textured_wall_items: list[gl.GLImageItem] = []
         self.wall_by_item_id: dict[int, PreviewTexturedWall] = {}
+        self.projection_camera_indicator_items: dict[
+            str,
+            tuple[GLGraphicsItem, ...],
+        ] = {}
+        self.projection_camera_indicator_geometries: dict[
+            str,
+            ProjectionCameraIndicatorGeometry,
+        ] = {}
+        self._projection_camera_percentages = (
+            DEFAULT_CAMERA_INDICATOR_PERCENTAGES
+        )
+        self._selected_projection_camera_id: str | None = None
         self._doorway_preview_outline_positions: np.ndarray | None = None
         self._doorway_preview_outline_item: gl.GLLinePlotItem | None = None
         self._ambient_light_intensity = DEFAULT_AMBIENT_LIGHT_INTENSITY
@@ -1198,6 +1450,21 @@ class GlbViewerWidget(QWidget):
         self._wireframe_enabled = bool(wireframe_enabled)
         self._wireframe_only = bool(wireframe_only)
         self._window_editing_enabled = bool(window_editing_enabled)
+        self._projection_camera_indicators_visible = False
+        self._face_editing_enabled = bool(face_editing_enabled)
+        self._face_selection_xray_enabled = False
+        self._face_edit_vertices: np.ndarray | None = None
+        self._face_edit_faces: np.ndarray | None = None
+        self._selected_face_indices: set[int] = set()
+        self._face_selection_press_position: QPointF | None = None
+        self._face_selection_rubber_band: QRubberBand | None = None
+        self._face_selection_item: gl.GLMeshItem | None = None
+        self._mirrored_face_selection_item: gl.GLMeshItem | None = None
+        self._face_selection_geometry_revision = 0
+        self._face_rectangle_selection_request_revision = 0
+        self._face_rectangle_selection_cancel_event: (
+            threading.Event | None
+        ) = None
         self._placed_object_editing_enabled = self._window_editing_enabled
         self._placed_object_render_groups: dict[
             str,
@@ -1252,6 +1519,7 @@ class GlbViewerWidget(QWidget):
             self._connect_window_editor_input()
         if self._placed_object_editing_enabled:
             self._connect_placed_object_editor_input()
+        self._connect_face_editor_input()
         self._populate_scene()
 
     # ### Doorway preview outline API ###
@@ -1294,6 +1562,9 @@ class GlbViewerWidget(QWidget):
 
         self.view = SelectableGLViewWidget()
         self.view.setBackgroundColor((24, 24, 28))
+        self.view.set_item_click_selection_enabled(
+            self._window_editing_enabled
+        )
         self.view.items_clicked.connect(self._handle_view_items_clicked)
         self.view.delete_requested.connect(self.delete_requested.emit)
         self.view.navigation_mode_changed.connect(self.navigation_mode_changed.emit)
@@ -1302,6 +1573,15 @@ class GlbViewerWidget(QWidget):
         )
         self.view.first_person_camera_pose_changed.connect(
             self.first_person_camera_pose_changed.emit
+        )
+        self.view.set_face_selection_gestures_enabled(
+            self._face_editing_enabled
+        )
+        self.view.overlay_selection_requested.connect(
+            self._handle_projection_camera_selection_requested
+        )
+        self.view.overlay_wheel_steps_requested.connect(
+            self._handle_projection_camera_wheel_steps_requested
         )
         layout.addWidget(self.view)
 
@@ -1332,6 +1612,12 @@ class GlbViewerWidget(QWidget):
     def hideEvent(self, event) -> None:  # type: ignore[override]
         self._symmetric_preview_timer.stop()
         super().hideEvent(event)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        """Invalidate daemon work before this viewer closes or is destroyed."""
+
+        self._invalidate_face_rectangle_selection_requests()
+        super().closeEvent(event)
 
     def _build_window_tools_panel(self) -> QWidget:
         """Build the Canvas-only controls that travel with the 3D viewer."""
@@ -1975,7 +2261,9 @@ class GlbViewerWidget(QWidget):
         self.view.set_first_person_camera_pose(pose)
 
     def set_model(self, model: GeneratedModel, preserve_camera: bool = False) -> None:
+        self.view.cancel_transient_pointer_interactions()
         self._cancel_placed_object_gizmo_drag()
+        self.clear_face_edit_geometry()
         if self._window_editing_enabled:
             self.cancel_window_placement(status_message=None)
         self._clear_symmetric_preview()
@@ -1991,7 +2279,9 @@ class GlbViewerWidget(QWidget):
             self._sync_window_tools_controls()
 
     def clear_model(self) -> None:
+        self.view.cancel_transient_pointer_interactions()
         self._cancel_placed_object_gizmo_drag()
+        self.clear_face_edit_geometry()
         self._selected_placed_object_id = None
         if self._window_editing_enabled:
             self.cancel_window_placement(status_message=None)
@@ -2002,6 +2292,420 @@ class GlbViewerWidget(QWidget):
         self._populate_scene()
         if self._window_editing_enabled:
             self._sync_window_tools_controls()
+
+    # ### Face editor API ###
+    def set_face_editing_enabled(self, enabled: bool) -> None:
+        """Enable or disable Ctrl-based face-selection input."""
+
+        normalized_enabled = bool(enabled)
+        if normalized_enabled == self._face_editing_enabled:
+            return
+        self._face_editing_enabled = normalized_enabled
+        self.view.set_face_selection_gestures_enabled(
+            self._face_editing_enabled
+        )
+        if not self._face_editing_enabled:
+            self._cancel_face_selection_gesture()
+
+    def set_face_edit_geometry(
+        self,
+        vertices: object,
+        faces: object,
+    ) -> None:
+        """Set the authoritative global face order used by editing/export."""
+
+        normalized_vertices = np.asarray(vertices, dtype=np.float32)
+        normalized_faces = np.asarray(faces, dtype=np.int64)
+        if (
+            normalized_vertices.ndim != 2
+            or normalized_vertices.shape[1:] != (3,)
+            or normalized_faces.ndim != 2
+            or normalized_faces.shape[1:] != (3,)
+            or not np.all(np.isfinite(normalized_vertices))
+            or np.any(normalized_faces < 0)
+            or (
+                normalized_faces.size
+                and np.any(normalized_faces >= len(normalized_vertices))
+            )
+        ):
+            raise ValueError(
+                "Face-edit geometry requires finite vertices and triangle faces."
+            )
+        self._face_edit_vertices = np.ascontiguousarray(
+            normalized_vertices
+        ).copy()
+        self._face_edit_faces = np.ascontiguousarray(normalized_faces).copy()
+        self._face_selection_geometry_revision += 1
+        self.clear_face_selection()
+
+    def clear_face_edit_geometry(self) -> None:
+        """Forget editable geometry and clear every transient selection."""
+
+        self.cancel_face_selection_interaction()
+        self._face_edit_vertices = None
+        self._face_edit_faces = None
+        self._face_selection_geometry_revision += 1
+        self.clear_face_selection()
+
+    def cancel_face_selection_interaction(self) -> None:
+        """Cancel both viewport and controller layers of one selection drag."""
+
+        self.view.cancel_face_selection_gesture()
+        self._cancel_face_selection_gesture()
+
+    def cancel_transient_pointer_interactions(self) -> None:
+        """Release orbit, pan, and face-selection pointer ownership."""
+
+        self.view.cancel_transient_pointer_interactions()
+        self._cancel_face_selection_gesture()
+
+    def set_face_selection_xray_enabled(self, enabled: bool) -> None:
+        """Select occluded faces during rectangle gestures when enabled."""
+
+        normalized_enabled = bool(enabled)
+        if normalized_enabled == self._face_selection_xray_enabled:
+            return
+        self._face_selection_xray_enabled = normalized_enabled
+        self._invalidate_face_rectangle_selection_requests()
+
+    def get_selected_face_indices(self) -> tuple[int, ...]:
+        """Return stable global face indices in ascending order."""
+
+        return tuple(sorted(self._selected_face_indices))
+
+    def set_selected_face_indices(self, face_indices: object) -> None:
+        """Set a validated selection, primarily for controller/tests."""
+
+        self.update_face_selection(
+            face_indices,
+            mode=FACE_SELECTION_REPLACE,
+        )
+
+    def update_face_selection(
+        self,
+        face_indices: object,
+        *,
+        mode: str,
+    ) -> None:
+        """Apply every 2D, 3D, and programmatic selection through one path."""
+
+        face_count = (
+            0 if self._face_edit_faces is None else len(self._face_edit_faces)
+        )
+        try:
+            normalized = {int(index) for index in face_indices}  # type: ignore[arg-type]
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError("Selected face indices must be integers.") from error
+        if any(index < 0 or index >= face_count for index in normalized):
+            raise ValueError("A selected face index is outside the object.")
+        normalized_mode = str(mode)
+        if normalized_mode not in FACE_SELECTION_UPDATE_MODES:
+            raise ValueError("Unknown face-selection update mode.")
+        self._invalidate_face_rectangle_selection_requests()
+        if normalized_mode == FACE_SELECTION_REPLACE:
+            self._selected_face_indices = normalized
+        elif normalized_mode == FACE_SELECTION_TOGGLE:
+            self._selected_face_indices.symmetric_difference_update(normalized)
+        else:
+            self._selected_face_indices.update(normalized)
+        self._refresh_face_selection_items()
+        self.face_selection_changed.emit(self.get_selected_face_indices())
+
+    def clear_face_selection(self) -> None:
+        """Clear selected faces and hide the drag/selection overlays."""
+
+        self._invalidate_face_rectangle_selection_requests()
+        had_selection = bool(self._selected_face_indices)
+        self._selected_face_indices.clear()
+        self._face_selection_press_position = None
+        self._hide_face_selection_rubber_band()
+        self._remove_face_selection_items()
+        if had_selection:
+            self.face_selection_changed.emit(())
+
+    @property
+    def face_edit_face_count(self) -> int:
+        """Return the number of authoritative editable triangles."""
+
+        return 0 if self._face_edit_faces is None else len(self._face_edit_faces)
+
+    # ### Face editor input ###
+    def _connect_face_editor_input(self) -> None:
+        """Connect opt-in pointer gestures without affecting other viewers."""
+
+        self.view.face_selection_pointer_pressed.connect(
+            self._handle_face_selection_pointer_pressed
+        )
+        self.view.face_selection_pointer_moved.connect(
+            self._handle_face_selection_pointer_moved
+        )
+        self.view.face_selection_pointer_released.connect(
+            self._handle_face_selection_pointer_released
+        )
+        self.view.face_selection_pointer_cancel_requested.connect(
+            self._cancel_face_selection_gesture
+        )
+        self._face_rectangle_selection_completed.connect(
+            self._apply_face_rectangle_selection_result,
+            Qt.ConnectionType.QueuedConnection,
+        )
+
+    @Slot(object)
+    def _handle_face_selection_pointer_pressed(self, position: object) -> None:
+        self._invalidate_face_rectangle_selection_requests()
+        if not self._can_select_faces():
+            return
+        self._face_selection_press_position = QPointF(position)
+
+    @Slot(object)
+    def _handle_face_selection_pointer_moved(self, position: object) -> None:
+        start = self._face_selection_press_position
+        if start is None or not self._can_select_faces():
+            return
+        current = QPointF(position)
+        if _get_point_distance(start, current) <= CLICK_SELECTION_TOLERANCE:
+            return
+        rubber_band = self._ensure_face_selection_rubber_band()
+        rubber_band.setGeometry(
+            QRect(start.toPoint(), current.toPoint()).normalized()
+        )
+        rubber_band.show()
+
+    @Slot(object)
+    def _handle_face_selection_pointer_released(self, position: object) -> None:
+        start = self._face_selection_press_position
+        self._face_selection_press_position = None
+        self._hide_face_selection_rubber_band()
+        if start is None or not self._can_select_faces():
+            return
+        end = QPointF(position)
+        if _get_point_distance(start, end) <= CLICK_SELECTION_TOLERANCE:
+            face_index = self._pick_editable_face(end)
+            if face_index is None:
+                return
+            self.update_face_selection(
+                (face_index,),
+                mode=FACE_SELECTION_TOGGLE,
+            )
+        else:
+            self._start_editable_face_rectangle_selection(start, end)
+            return
+
+    @Slot()
+    def _cancel_face_selection_gesture(self) -> None:
+        self._invalidate_face_rectangle_selection_requests()
+        self._face_selection_press_position = None
+        self._hide_face_selection_rubber_band()
+
+    def _can_select_faces(self) -> bool:
+        return bool(
+            self._face_editing_enabled
+            and self.model is not None
+            and self._face_edit_vertices is not None
+            and self._face_edit_faces is not None
+            and len(self._face_edit_faces)
+        )
+
+    def _pick_editable_face(self, position: QPointF) -> int | None:
+        """Return the closest retained logical face on either preview half."""
+
+        if self._face_edit_vertices is None or self._face_edit_faces is None:
+            return None
+        ray = self.view.build_camera_ray(position)
+        if ray is None:
+            return None
+        ray_origin, ray_direction = ray
+        hits: list[tuple[int, float]] = []
+        retained_hit = _get_nearest_triangle_ray_face_index(
+            self._face_edit_vertices,
+            self._face_edit_faces,
+            ray_origin,
+            ray_direction,
+        )
+        if retained_hit is not None:
+            hits.append(retained_hit)
+        if (
+            self._symmetric_preview_orientation is not None
+            and self._symmetric_preview_plane_coordinate is not None
+        ):
+            mirrored_vertices = _mirror_preview_vertices(
+                self._face_edit_vertices,
+                self._symmetric_preview_orientation,
+                self._symmetric_preview_plane_coordinate,
+            )
+            mirrored_hit = _get_nearest_triangle_ray_face_index(
+                mirrored_vertices,
+                self._face_edit_faces[:, (0, 2, 1)],
+                ray_origin,
+                ray_direction,
+            )
+            if mirrored_hit is not None:
+                hits.append(mirrored_hit)
+        if not hits:
+            return None
+        return min(hits, key=lambda item: item[1])[0]
+
+    def _start_editable_face_rectangle_selection(
+        self,
+        start: QPointF,
+        end: QPointF,
+    ) -> bool:
+        """Capture the camera and start one daemon raster task."""
+
+        if self._face_edit_vertices is None or self._face_edit_faces is None:
+            return False
+        geometry = [(self._face_edit_vertices, self._face_edit_faces)]
+        if (
+            self._symmetric_preview_orientation is not None
+            and self._symmetric_preview_plane_coordinate is not None
+        ):
+            geometry.append(
+                (
+                    _mirror_preview_vertices(
+                        self._face_edit_vertices,
+                        self._symmetric_preview_orientation,
+                        self._symmetric_preview_plane_coordinate,
+                    ),
+                    self._face_edit_faces[:, (0, 2, 1)],
+                )
+            )
+        captured = _capture_face_selection_raster_input(
+            self.view,
+            geometry,
+            QRect(start.toPoint(), end.toPoint()).normalized(),
+        )
+        if captured is None:
+            return False
+        projected_geometry, rectangle = captured
+        self._invalidate_face_rectangle_selection_requests()
+        cancel_event = threading.Event()
+        self._face_rectangle_selection_cancel_event = cancel_event
+        task = _FaceRectangleSelectionTask(
+            request_revision=(
+                self._face_rectangle_selection_request_revision
+            ),
+            geometry_revision=self._face_selection_geometry_revision,
+            projected_geometry=projected_geometry,
+            rectangle=rectangle,
+            xray=self._face_selection_xray_enabled,
+        )
+        viewer_reference = weakref.ref(self)
+        worker = threading.Thread(
+            target=_run_face_rectangle_selection_task,
+            args=(task, cancel_event, viewer_reference),
+            name=(
+                "housemaker-face-selection-"
+                f"{task.request_revision}"
+            ),
+            daemon=True,
+        )
+        worker.start()
+        return True
+
+    def _invalidate_face_rectangle_selection_requests(self) -> None:
+        """Cancel delivery from the active raster task and advance its ID."""
+
+        cancel_event = self._face_rectangle_selection_cancel_event
+        if cancel_event is not None:
+            cancel_event.set()
+        self._face_rectangle_selection_cancel_event = None
+        self._face_rectangle_selection_request_revision += 1
+
+    @Slot(object)
+    def _apply_face_rectangle_selection_result(self, raw_result: object) -> None:
+        """Apply one current background result on the Qt GUI thread."""
+
+        if not isinstance(raw_result, _FaceRectangleSelectionResult):
+            return
+        if (
+            raw_result.request_revision
+            != self._face_rectangle_selection_request_revision
+            or raw_result.geometry_revision
+            != self._face_selection_geometry_revision
+            or not self._can_select_faces()
+        ):
+            return
+        face_count = self.face_edit_face_count
+        if any(
+            face_index < 0 or face_index >= face_count
+            for face_index in raw_result.face_indices
+        ):
+            return
+        self._face_rectangle_selection_cancel_event = None
+        self.update_face_selection(
+            raw_result.face_indices,
+            mode=FACE_SELECTION_ADD,
+        )
+
+    def _ensure_face_selection_rubber_band(self) -> QRubberBand:
+        if self._face_selection_rubber_band is None:
+            self._face_selection_rubber_band = QRubberBand(
+                QRubberBand.Shape.Rectangle,
+                self.view,
+            )
+        return self._face_selection_rubber_band
+
+    def _hide_face_selection_rubber_band(self) -> None:
+        if self._face_selection_rubber_band is not None:
+            self._face_selection_rubber_band.hide()
+
+    def _refresh_face_selection_items(self) -> None:
+        self._remove_face_selection_items()
+        if (
+            not self._selected_face_indices
+            or self._face_edit_vertices is None
+            or self._face_edit_faces is None
+            or not hasattr(self, "view")
+        ):
+            return
+        selected = np.asarray(
+            sorted(self._selected_face_indices),
+            dtype=np.int64,
+        )
+        selected_triangles = self._face_edit_vertices[
+            self._face_edit_faces[selected]
+        ]
+        selected_vertices = np.ascontiguousarray(
+            selected_triangles.reshape((-1, 3)),
+            dtype=np.float32,
+        )
+        selected_faces = np.arange(
+            len(selected_vertices),
+            dtype=np.int32,
+        ).reshape((-1, 3))
+        self._face_selection_item = _build_face_selection_item(
+            selected_vertices,
+            selected_faces,
+        )
+        self.view.addItem(self._face_selection_item)
+        if (
+            self._symmetric_preview_orientation is not None
+            and self._symmetric_preview_plane_coordinate is not None
+        ):
+            mirrored_vertices = _mirror_preview_vertices(
+                selected_vertices,
+                self._symmetric_preview_orientation,
+                self._symmetric_preview_plane_coordinate,
+            )
+            self._mirrored_face_selection_item = _build_face_selection_item(
+                mirrored_vertices,
+                selected_faces[:, (0, 2, 1)],
+            )
+            self.view.addItem(self._mirrored_face_selection_item)
+        self.view.update()
+
+    def _remove_face_selection_items(self) -> None:
+        for item in (
+            self._face_selection_item,
+            self._mirrored_face_selection_item,
+        ):
+            if item is not None and hasattr(self, "view"):
+                try:
+                    self.view.removeItem(item)
+                except ValueError:
+                    pass
+        self._face_selection_item = None
+        self._mirrored_face_selection_item = None
 
     # ### Symmetric divided-object preview API ###
     def set_symmetric_division_preview(
@@ -2033,10 +2737,14 @@ class GlbViewerWidget(QWidget):
             )
         ):
             return
+        self._face_selection_geometry_revision += 1
+        self._invalidate_face_rectangle_selection_requests()
         self._remove_symmetric_preview_items()
         self._symmetric_preview_orientation = normalized_orientation
         self._symmetric_preview_plane_coordinate = normalized_plane
         self._build_symmetric_preview_items()
+        self._refresh_face_selection_items()
+        self._rebuild_projection_camera_indicators()
         self.view.update()
 
     def _build_symmetric_preview_items(self) -> None:
@@ -2331,10 +3039,19 @@ class GlbViewerWidget(QWidget):
         self._explicit_symmetric_preview_group = None
 
     def _clear_symmetric_preview(self) -> None:
+        had_preview = (
+            self._symmetric_preview_orientation is not None
+            or self._symmetric_preview_plane_coordinate is not None
+        )
+        if had_preview:
+            self._face_selection_geometry_revision += 1
+            self._invalidate_face_rectangle_selection_requests()
         self._remove_symmetric_preview_items()
         self._symmetric_preview_orientation = None
         self._symmetric_preview_plane_coordinate = None
         if hasattr(self, "view"):
+            self._refresh_face_selection_items()
+            self._rebuild_projection_camera_indicators()
             self.view.update()
 
     def set_texture_edit_mask(self, mask: np.ndarray | None) -> None:
@@ -2415,6 +3132,257 @@ class GlbViewerWidget(QWidget):
     def get_wireframe_only(self) -> bool:
         return self._wireframe_only
 
+    # ### Projection camera indicator API ###
+    def set_projection_camera_indicators_visible(self, visible: bool) -> None:
+        """Show or hide the six illustrative texture-projection cameras."""
+
+        self._projection_camera_indicators_visible = bool(visible)
+        if self._projection_camera_indicators_visible:
+            self._ensure_projection_camera_indicators()
+        else:
+            self.set_selected_projection_camera_id(None)
+            self._remove_projection_camera_indicators()
+        self._sync_projection_camera_input_state()
+
+    def get_projection_camera_indicators_visible(self) -> bool:
+        """Return whether this viewer requests projection camera markers."""
+
+        return self._projection_camera_indicators_visible
+
+    def set_projection_camera_percentages(
+        self,
+        percentages: Sequence[int] | Mapping[str, int],
+    ) -> None:
+        """Update all six allocation bars and labels immediately."""
+
+        normalized = normalize_projection_camera_indicator_percentages(
+            percentages
+        )
+        if normalized == self._projection_camera_percentages:
+            return
+        self._projection_camera_percentages = normalized
+        self._refresh_projection_camera_indicator_items()
+
+    def get_projection_camera_percentages(self) -> tuple[int, ...]:
+        """Return the displayed percentages in canonical camera order."""
+
+        return self._projection_camera_percentages
+
+    def set_selected_projection_camera_id(
+        self,
+        camera_id: str | None,
+    ) -> bool:
+        """Select one camera indicator, or clear the current selection."""
+
+        if camera_id is None:
+            normalized_id = None
+        else:
+            normalized_id = str(camera_id).strip()
+            if normalized_id not in ALL_CAMERA_IDS:
+                raise ValueError("Unknown projection camera ID.")
+        if normalized_id == self._selected_projection_camera_id:
+            return False
+        # A partial high-resolution wheel gesture belongs to the camera that
+        # was selected when it began.  Disable routing before changing IDs so
+        # that its sub-tick remainder cannot leak into the next camera.
+        self.view.set_overlay_wheel_steps_enabled(False)
+        self._selected_projection_camera_id = normalized_id
+        self._refresh_projection_camera_indicator_items()
+        self._sync_projection_camera_input_state()
+        self.projection_camera_selection_changed.emit(normalized_id)
+        return True
+
+    def get_selected_projection_camera_id(self) -> str | None:
+        """Return the selected canonical camera ID, if any."""
+
+        return self._selected_projection_camera_id
+
+    @Slot(object)
+    def _handle_projection_camera_selection_requested(
+        self,
+        position: object,
+    ) -> None:
+        if not self._projection_camera_indicators_visible:
+            return
+        selected_id = self._pick_projection_camera_indicator(QPointF(position))
+        self.set_selected_projection_camera_id(selected_id)
+
+    @Slot(int)
+    def _handle_projection_camera_wheel_steps_requested(
+        self,
+        steps: int,
+    ) -> None:
+        selected_id = self._selected_projection_camera_id
+        normalized_steps = int(steps)
+        if selected_id is None or normalized_steps == 0:
+            return
+        self.projection_camera_percentage_step_requested.emit(
+            selected_id,
+            normalized_steps,
+        )
+
+    def _pick_projection_camera_indicator(
+        self,
+        position: QPointF,
+    ) -> str | None:
+        """Pick the nearest camera body/bar in screen space without GL_SELECT."""
+
+        if not self.projection_camera_indicator_geometries:
+            return None
+        viewport_width = max(int(self.view.width()), 1)
+        viewport_height = max(int(self.view.height()), 1)
+        viewport = (0, 0, viewport_width, viewport_height)
+        view_projection = (
+            self.view.projectionMatrix(viewport, viewport)
+            * self.view.viewMatrix()
+        )
+        point = np.asarray((float(position.x()), float(position.y())), dtype=float)
+        candidates: list[tuple[float, float, int, str]] = []
+        for camera_index, camera_id in enumerate(ALL_CAMERA_IDS):
+            geometry = self.projection_camera_indicator_geometries.get(camera_id)
+            if geometry is None:
+                continue
+            projected_lines = _project_vertices_to_view(
+                geometry.selection_line_positions,
+                view_projection,
+                viewport_width,
+                viewport_height,
+            )
+            line_hit = _get_nearest_projected_line_hit(point, projected_lines)
+            if (
+                line_hit is not None
+                and line_hit[0] <= PROJECTION_CAMERA_SELECTION_TOLERANCE_PIXELS
+            ):
+                candidates.append(
+                    (line_hit[0], line_hit[1], camera_index, camera_id)
+                )
+            projected_label = _project_vertices_to_view(
+                geometry.label_position[np.newaxis, :],
+                view_projection,
+                viewport_width,
+                viewport_height,
+            )[0]
+            if _is_usable_projected_point(projected_label):
+                label_distance = float(
+                    np.linalg.norm(point - projected_label[:2])
+                )
+                if (
+                    label_distance
+                    <= PROJECTION_CAMERA_LABEL_SELECTION_TOLERANCE_PIXELS
+                ):
+                    candidates.append(
+                        (
+                            label_distance,
+                            float(projected_label[2]),
+                            camera_index,
+                            camera_id,
+                        )
+                    )
+        if not candidates:
+            return None
+        return min(candidates)[3]
+
+    def _sync_projection_camera_input_state(self) -> None:
+        has_indicators = bool(
+            self._projection_camera_indicators_visible
+            and self.projection_camera_indicator_items
+        )
+        self.view.set_overlay_selection_enabled(has_indicators)
+        self.view.set_overlay_wheel_steps_enabled(
+            has_indicators
+            and self._selected_projection_camera_id is not None
+        )
+
+    def _refresh_projection_camera_indicator_items(self) -> None:
+        if (
+            not self.projection_camera_indicator_items
+            or not self.projection_camera_indicator_geometries
+        ):
+            return
+        update_projection_camera_indicator_items(
+            self.projection_camera_indicator_items,
+            self.projection_camera_indicator_geometries,
+            self._projection_camera_percentages,
+            selected_camera_id=self._selected_projection_camera_id,
+        )
+        self.view.update()
+
+    def _ensure_projection_camera_indicators(self) -> None:
+        """Lazily add camera markers once model bounds are available."""
+
+        if (
+            not self._projection_camera_indicators_visible
+            or self.projection_camera_indicator_items
+        ):
+            return
+        bounds = self._get_projection_camera_indicator_bounds()
+        if bounds is None:
+            self._sync_projection_camera_input_state()
+            return
+        self.projection_camera_indicator_geometries = (
+            build_projection_camera_indicator_geometries(bounds)
+        )
+        self.projection_camera_indicator_items = (
+            create_projection_camera_indicator_items(
+                bounds,
+                self._projection_camera_percentages,
+                selected_camera_id=self._selected_projection_camera_id,
+            )
+        )
+        for indicator_items in self.projection_camera_indicator_items.values():
+            for indicator_item in indicator_items:
+                self.view.addItem(indicator_item)
+        self._sync_projection_camera_input_state()
+        self.view.update()
+
+    def _remove_projection_camera_indicators(self) -> None:
+        """Remove every projection camera marker from the live scene."""
+
+        for indicator_items in self.projection_camera_indicator_items.values():
+            for indicator_item in indicator_items:
+                indicator_item.setVisible(False)
+                if indicator_item in self.view.items:
+                    self.view.removeItem(indicator_item)
+        self.projection_camera_indicator_items = {}
+        self.projection_camera_indicator_geometries = {}
+        self._sync_projection_camera_input_state()
+        self.view.update()
+
+    def _rebuild_projection_camera_indicators(self) -> None:
+        """Reframe markers after the displayed model bounds change."""
+
+        if not self._projection_camera_indicators_visible:
+            return
+        self._remove_projection_camera_indicators()
+        self._ensure_projection_camera_indicators()
+
+    def _get_projection_camera_indicator_bounds(
+        self,
+    ) -> np.ndarray | None:
+        """Return bounds covering both retained and mirrored preview halves."""
+
+        display_mesh = self._get_display_mesh()
+        if display_mesh is None:
+            return None
+        retained_vertices = np.asarray(display_mesh.vertices, dtype=float)
+        if retained_vertices.ndim != 2 or retained_vertices.shape[1:] != (3,):
+            return None
+        displayed_vertices = retained_vertices
+        mirrored_vertices = self._symmetric_preview_vertices
+        if mirrored_vertices is not None and len(mirrored_vertices):
+            displayed_vertices = np.vstack(
+                (retained_vertices, np.asarray(mirrored_vertices, dtype=float))
+            )
+        if not len(displayed_vertices) or not np.all(np.isfinite(displayed_vertices)):
+            return None
+        return np.asarray(
+            (
+                np.min(displayed_vertices, axis=0),
+                np.max(displayed_vertices, axis=0),
+            ),
+            dtype=float,
+        )
+
     def _populate_scene(self) -> None:
         self._clear_scene()
         self._add_grid()
@@ -2463,6 +3431,7 @@ class GlbViewerWidget(QWidget):
         else:
             self._build_embedded_symmetric_preview_items()
         self._apply_render_display_options()
+        self._ensure_projection_camera_indicators()
 
         bounding_box = self.model.mesh.bounding_box
         center = np.asarray(bounding_box.centroid, dtype=float)
@@ -3223,6 +4192,8 @@ class GlbViewerWidget(QWidget):
         self.grid_item = None
         self.mesh_item = None
         self.textured_mesh_item = None
+        self._face_selection_item = None
+        self._mirrored_face_selection_item = None
         self._reset_symmetric_preview_item_state()
         self._embedded_symmetric_preview_groups = []
         self._placed_object_render_groups = {}
@@ -3230,6 +4201,9 @@ class GlbViewerWidget(QWidget):
         self.textured_surface_items = []
         self.textured_wall_items = []
         self.wall_by_item_id = {}
+        self.projection_camera_indicator_items = {}
+        self.projection_camera_indicator_geometries = {}
+        self._sync_projection_camera_input_state()
         self._window_selection_item = None
         self._window_preview_item = None
         self._doorway_preview_outline_item = None
@@ -3253,6 +4227,520 @@ class GlbViewerWidget(QWidget):
         self.view.remember_orbit_camera_state()
         self.view.apply_navigation_camera()
         self.view.update()
+
+
+# ### Face selection helpers ###
+def _build_face_selection_item(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+) -> _WireframeOverlayMeshItem:
+    """Build one translucent overlay for selected logical triangles."""
+
+    face_colors = np.tile(
+        np.asarray(FACE_SELECTION_COLOR, dtype=float),
+        (len(faces), 1),
+    )
+    item = _WireframeOverlayMeshItem(
+        vertexes=np.asarray(vertices, dtype=np.float32),
+        faces=np.asarray(faces, dtype=np.int32),
+        faceColors=face_colors,
+        smooth=False,
+        drawFaces=True,
+        drawEdges=True,
+        edgeColor=FACE_SELECTION_EDGE_COLOR,
+        shader="shaded",
+    )
+    item.setGLOptions("translucent")
+    return item
+
+
+def _get_nearest_triangle_ray_face_index(
+    vertices: object,
+    faces: object,
+    ray_origin: object,
+    ray_direction: object,
+) -> tuple[int, float] | None:
+    """Return the closest double-sided triangle index and ray distance."""
+
+    normalized_vertices = np.asarray(vertices, dtype=float)
+    normalized_faces = np.asarray(faces, dtype=np.int64)
+    origin = np.asarray(ray_origin, dtype=float)
+    direction = np.asarray(ray_direction, dtype=float)
+    if (
+        normalized_vertices.ndim != 2
+        or normalized_vertices.shape[1:] != (3,)
+        or normalized_faces.ndim != 2
+        or normalized_faces.shape[1:] != (3,)
+        or origin.shape != (3,)
+        or direction.shape != (3,)
+        or not np.all(np.isfinite(normalized_vertices))
+        or not np.all(np.isfinite(origin))
+        or not np.all(np.isfinite(direction))
+        or np.any(normalized_faces < 0)
+        or (
+            normalized_faces.size
+            and np.any(normalized_faces >= len(normalized_vertices))
+        )
+    ):
+        return None
+    direction_length = float(np.linalg.norm(direction))
+    if direction_length <= 1e-12 or len(normalized_faces) == 0:
+        return None
+    direction = direction / direction_length
+    triangles = normalized_vertices[normalized_faces]
+    first_edges = triangles[:, 1] - triangles[:, 0]
+    second_edges = triangles[:, 2] - triangles[:, 0]
+    cross_direction = np.cross(
+        np.broadcast_to(direction, second_edges.shape),
+        second_edges,
+    )
+    determinants = np.einsum("ij,ij->i", first_edges, cross_direction)
+    usable = np.abs(determinants) > 1e-10
+    inverse_determinants = np.zeros_like(determinants)
+    inverse_determinants[usable] = 1.0 / determinants[usable]
+    origin_offsets = origin[np.newaxis, :] - triangles[:, 0]
+    first_coordinates = (
+        np.einsum("ij,ij->i", origin_offsets, cross_direction)
+        * inverse_determinants
+    )
+    offset_crosses = np.cross(origin_offsets, first_edges)
+    second_coordinates = (
+        np.einsum("j,ij->i", direction, offset_crosses)
+        * inverse_determinants
+    )
+    distances = (
+        np.einsum("ij,ij->i", second_edges, offset_crosses)
+        * inverse_determinants
+    )
+    usable &= first_coordinates >= -1e-9
+    usable &= second_coordinates >= -1e-9
+    usable &= first_coordinates + second_coordinates <= 1.0 + 1e-9
+    usable &= distances >= 0.0
+    hit_indices = np.flatnonzero(usable)
+    if hit_indices.size == 0:
+        return None
+    face_index = int(hit_indices[np.argmin(distances[hit_indices])])
+    return face_index, float(distances[face_index])
+
+
+def _select_face_indices_in_view_rectangle(
+    view: SelectableGLViewWidget,
+    geometry: Sequence[tuple[np.ndarray, np.ndarray]],
+    rectangle: QRect,
+    *,
+    xray: bool,
+) -> set[int]:
+    """Select logical IDs owning pixels inside a current-camera rectangle."""
+
+    captured = _capture_face_selection_raster_input(
+        view,
+        geometry,
+        rectangle,
+    )
+    if captured is None:
+        return set()
+    projected_geometry, rectangle_values = captured
+    return _rasterize_face_selection(
+        projected_geometry,
+        QRect(*rectangle_values),
+        xray=bool(xray),
+    )
+
+
+def _capture_face_selection_raster_input(
+    view: SelectableGLViewWidget,
+    geometry: Sequence[tuple[np.ndarray, np.ndarray]],
+    rectangle: QRect,
+) -> tuple[
+    tuple[tuple[np.ndarray, np.ndarray], ...],
+    tuple[int, int, int, int],
+] | None:
+    """Capture camera projection and own read-only arrays on the GUI thread."""
+
+    viewport_width = max(int(view.width()), 1)
+    viewport_height = max(int(view.height()), 1)
+    clipped = rectangle.normalized().intersected(
+        QRect(0, 0, viewport_width, viewport_height)
+    )
+    if clipped.isEmpty():
+        return None
+    viewport = (0, 0, viewport_width, viewport_height)
+    view_projection = (
+        view.projectionMatrix(viewport, viewport) * view.viewMatrix()
+    )
+    projected_geometry: list[tuple[np.ndarray, np.ndarray]] = []
+    for vertices, faces in geometry:
+        projected_vertices = np.ascontiguousarray(
+            _project_vertices_to_view(
+                vertices,
+                view_projection,
+                viewport_width,
+                viewport_height,
+            ),
+            dtype=float,
+        )
+        owned_faces = np.ascontiguousarray(
+            np.asarray(faces, dtype=np.int64)
+        ).copy()
+        projected_vertices.setflags(write=False)
+        owned_faces.setflags(write=False)
+        projected_geometry.append((projected_vertices, owned_faces))
+    return (
+        tuple(projected_geometry),
+        (
+            int(clipped.x()),
+            int(clipped.y()),
+            int(clipped.width()),
+            int(clipped.height()),
+        ),
+    )
+
+
+def _project_vertices_to_view(
+    vertices: np.ndarray,
+    view_projection: object,
+    viewport_width: int,
+    viewport_height: int,
+) -> np.ndarray:
+    """Project every XYZ vertex with one captured Qt matrix."""
+
+    normalized_vertices = np.asarray(vertices, dtype=np.float32)
+    projected = np.full((len(normalized_vertices), 4), np.nan, dtype=float)
+    if len(normalized_vertices) == 0:
+        return projected
+
+    matrix_data = np.asarray(view_projection.data(), dtype=np.float32)
+    if matrix_data.shape != (16,):
+        raise ValueError("Face selection requires a 4x4 view-projection matrix.")
+    matrix = matrix_data.reshape((4, 4), order="F")
+    clip_vertices = np.empty((len(normalized_vertices), 4), dtype=np.float32)
+    with np.errstate(invalid="ignore", over="ignore"):
+        for component_index, row in enumerate(matrix):
+            clip_vertices[:, component_index] = (
+                row[0] * normalized_vertices[:, 0]
+                + row[1] * normalized_vertices[:, 1]
+                + row[2] * normalized_vertices[:, 2]
+                + row[3]
+            )
+
+    clip_w = clip_vertices[:, 3]
+    usable = np.isfinite(clip_w) & (clip_w > 1e-10)
+    normalized_clip = np.full(
+        (len(normalized_vertices), 3),
+        np.nan,
+        dtype=float,
+    )
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        np.divide(
+            np.asarray(clip_vertices[:, :3], dtype=float),
+            np.asarray(clip_w[:, np.newaxis], dtype=float),
+            out=normalized_clip,
+            where=usable[:, np.newaxis],
+        )
+    usable &= np.all(np.isfinite(normalized_clip), axis=1)
+    projected[usable, 0] = (
+        (normalized_clip[usable, 0] + 1.0) * 0.5 * viewport_width
+    )
+    projected[usable, 1] = (
+        (1.0 - normalized_clip[usable, 1]) * 0.5 * viewport_height
+    )
+    projected[usable, 2] = normalized_clip[usable, 2]
+    projected[usable, 3] = 1.0
+    return projected
+
+
+def _get_nearest_projected_line_hit(
+    point: np.ndarray,
+    projected_line_positions: np.ndarray,
+) -> tuple[float, float] | None:
+    """Return screen distance and depth for paired projected line segments."""
+
+    normalized_point = np.asarray(point, dtype=float)
+    projected = np.asarray(projected_line_positions, dtype=float)
+    if (
+        normalized_point.shape != (2,)
+        or not np.all(np.isfinite(normalized_point))
+        or projected.ndim != 2
+        or projected.shape[1:] != (4,)
+        or len(projected) % 2
+    ):
+        return None
+    nearest: tuple[float, float] | None = None
+    for first, second in projected.reshape((-1, 2, 4)):
+        if not (
+            _is_usable_projected_point(first)
+            and _is_usable_projected_point(second)
+        ):
+            continue
+        segment = second[:2] - first[:2]
+        segment_length_squared = float(np.dot(segment, segment))
+        if segment_length_squared <= 1e-12:
+            parameter = 0.0
+        else:
+            parameter = float(
+                np.clip(
+                    np.dot(normalized_point - first[:2], segment)
+                    / segment_length_squared,
+                    0.0,
+                    1.0,
+                )
+            )
+        nearest_point = first[:2] + segment * parameter
+        distance = float(np.linalg.norm(normalized_point - nearest_point))
+        depth = float(first[2] + (second[2] - first[2]) * parameter)
+        candidate = (distance, depth)
+        if nearest is None or candidate < nearest:
+            nearest = candidate
+    return nearest
+
+
+def _is_usable_projected_point(point: np.ndarray) -> bool:
+    normalized = np.asarray(point, dtype=float)
+    return bool(
+        normalized.shape == (4,)
+        and np.all(np.isfinite(normalized))
+        and normalized[3] > 0.0
+        and -1.0 <= normalized[2] <= 1.0
+    )
+
+
+def _rasterize_face_selection(
+    projected_geometry: Sequence[tuple[np.ndarray, np.ndarray]],
+    rectangle: QRect,
+    *,
+    xray: bool,
+    cancel_event: threading.Event | None = None,
+) -> set[int]:
+    """Depth-test current-camera faces in a bounded logical-ID buffer.
+
+    Candidate filtering and the capped buffer keep detached 4K views
+    responsive. Screen-space barycentric weights use the same pixel centers
+    for triangle coverage and interpolated depth, so hidden faces remain
+    excluded without rounding the projected triangle boundary.
+    """
+
+    left = float(rectangle.left())
+    top = float(rectangle.top())
+    width = max(int(rectangle.width()), 1)
+    height = max(int(rectangle.height()), 1)
+    right = left + width
+    bottom = top + height
+    candidate_triangles: list[np.ndarray] = []
+    candidate_face_indices: list[np.ndarray] = []
+
+    for projected_vertices, faces in projected_geometry:
+        if cancel_event is not None and cancel_event.is_set():
+            return set()
+        normalized_faces = np.asarray(faces, dtype=np.int64)
+        if len(normalized_faces) == 0:
+            continue
+        triangles = np.asarray(
+            projected_vertices[normalized_faces],
+            dtype=float,
+        )
+        finite = np.all(np.isfinite(triangles), axis=(1, 2))
+        minimum = np.min(triangles[:, :, :2], axis=1)
+        maximum = np.max(triangles[:, :, :2], axis=1)
+        overlaps_bounds = (
+            (maximum[:, 0] >= left)
+            & (minimum[:, 0] <= right)
+            & (maximum[:, 1] >= top)
+            & (minimum[:, 1] <= bottom)
+        )
+        depth = triangles[:, :, 2]
+        overlaps_depth = (
+            (np.max(depth, axis=1) >= -1.0 - 1e-6)
+            & (np.min(depth, axis=1) <= 1.0 + 1e-6)
+        )
+        candidates = finite & overlaps_bounds & overlaps_depth
+        if not np.any(candidates):
+            continue
+        candidate_triangles.append(triangles[candidates])
+        candidate_face_indices.append(
+            np.flatnonzero(candidates).astype(np.int64)
+        )
+
+    if not candidate_triangles:
+        return set()
+    triangles = np.concatenate(candidate_triangles, axis=0)
+    logical_face_indices = np.concatenate(candidate_face_indices, axis=0)
+    intersects = _triangles_intersect_screen_rectangle(
+        triangles[:, :, :2],
+        left=left,
+        top=top,
+        right=right,
+        bottom=bottom,
+    )
+    triangles = triangles[intersects]
+    logical_face_indices = logical_face_indices[intersects]
+    if not len(triangles):
+        return set()
+    if cancel_event is not None and cancel_event.is_set():
+        return set()
+    if xray:
+        return {int(index) for index in logical_face_indices}
+
+    raster_scale = min(
+        1.0,
+        FACE_SELECTION_MAX_RASTER_DIMENSION / max(width, height),
+    )
+    raster_width = max(int(math.ceil(width * raster_scale)), 1)
+    raster_height = max(int(math.ceil(height * raster_scale)), 1)
+    depth_buffer = np.full(
+        (raster_height, raster_width),
+        np.inf,
+        dtype=np.float32,
+    )
+    face_buffer = np.full((raster_height, raster_width), -1, dtype=np.int32)
+    sample_x = np.arange(raster_width, dtype=np.float32) + 0.5
+    sample_y = np.arange(raster_height, dtype=np.float32) + 0.5
+    local_triangles = triangles[:, :, :2].copy()
+    local_triangles[:, :, 0] = (
+        local_triangles[:, :, 0] - left
+    ) * raster_scale
+    local_triangles[:, :, 1] = (
+        local_triangles[:, :, 1] - top
+    ) * raster_scale
+    for candidate_index, triangle in enumerate(local_triangles):
+        if cancel_event is not None and cancel_event.is_set():
+            return set()
+        triangle_depth = triangles[candidate_index, :, 2]
+        first, second, third = triangle
+        denominator = (
+            (first[0] - third[0]) * (second[1] - third[1])
+            - (second[0] - third[0]) * (first[1] - third[1])
+        )
+        if abs(float(denominator)) <= 1e-12:
+            continue
+        minimum_x = max(int(math.floor(np.min(triangle[:, 0]))), 0)
+        maximum_x = min(
+            int(math.ceil(np.max(triangle[:, 0]))),
+            raster_width - 1,
+        )
+        minimum_y = max(int(math.floor(np.min(triangle[:, 1]))), 0)
+        maximum_y = min(
+            int(math.ceil(np.max(triangle[:, 1]))),
+            raster_height - 1,
+        )
+        if minimum_x > maximum_x or minimum_y > maximum_y:
+            continue
+        local_y = slice(minimum_y, maximum_y + 1)
+        local_x = slice(minimum_x, maximum_x + 1)
+        sample_region_x = sample_x[local_x][np.newaxis, :]
+        sample_region_y = sample_y[local_y][:, np.newaxis]
+        first_weight = (
+            (second[1] - third[1]) * (sample_region_x - third[0])
+            + (third[0] - second[0]) * (sample_region_y - third[1])
+        ) / denominator
+        second_weight = (
+            (third[1] - first[1]) * (sample_region_x - third[0])
+            + (first[0] - third[0]) * (sample_region_y - third[1])
+        ) / denominator
+        third_weight = 1.0 - first_weight - second_weight
+        inside = (
+            (first_weight >= -1e-7)
+            & (second_weight >= -1e-7)
+            & (third_weight >= -1e-7)
+        )
+        interpolated_depth = (
+            first_weight * triangle_depth[0]
+            + second_weight * triangle_depth[1]
+            + third_weight * triangle_depth[2]
+        )
+        inside &= (
+            (interpolated_depth >= -1.0 - 1e-6)
+            & (interpolated_depth <= 1.0 + 1e-6)
+        )
+        current_depth = depth_buffer[local_y, local_x]
+        nearer = inside & (interpolated_depth < current_depth)
+        if not np.any(nearer):
+            continue
+        current_depth[nearer] = interpolated_depth[nearer]
+        face_buffer[local_y, local_x][nearer] = int(
+            logical_face_indices[candidate_index]
+        )
+    return {
+        int(face_index)
+        for face_index in np.unique(face_buffer)
+        if face_index >= 0
+    }
+
+
+def _run_face_rectangle_selection_task(
+    task: _FaceRectangleSelectionTask,
+    cancel_event: threading.Event,
+    viewer_reference: weakref.ReferenceType[GlbViewerWidget],
+) -> None:
+    """Rasterize immutable input and queue its result back to the GUI."""
+
+    if cancel_event.is_set():
+        return
+    try:
+        selected = _rasterize_face_selection(
+            task.projected_geometry,
+            QRect(*task.rectangle),
+            xray=task.xray,
+            cancel_event=cancel_event,
+        )
+    except Exception:
+        return
+    if cancel_event.is_set():
+        return
+    viewer = viewer_reference()
+    if viewer is None:
+        return
+    result = _FaceRectangleSelectionResult(
+        request_revision=task.request_revision,
+        geometry_revision=task.geometry_revision,
+        face_indices=frozenset(selected),
+    )
+    try:
+        viewer._face_rectangle_selection_completed.emit(result)
+    except RuntimeError:
+        # The Qt wrapper may disappear between weak-reference lookup and emit.
+        return
+
+
+def _triangles_intersect_screen_rectangle(
+    triangles: np.ndarray,
+    *,
+    left: float,
+    top: float,
+    right: float,
+    bottom: float,
+) -> np.ndarray:
+    """Use the triangle/axis-aligned-rectangle separating-axis test."""
+
+    separated = np.zeros(len(triangles), dtype=bool)
+    rectangle_corners = np.asarray(
+        ((left, top), (right, top), (right, bottom), (left, bottom)),
+        dtype=float,
+    )
+    for edge_index in range(3):
+        edge = (
+            triangles[:, (edge_index + 1) % 3]
+            - triangles[:, edge_index]
+        )
+        axes = np.column_stack((-edge[:, 1], edge[:, 0]))
+        axis_lengths = np.linalg.norm(axes, axis=1)
+        usable = axis_lengths > 1e-12
+        triangle_projection = np.einsum(
+            "fvc,fc->fv",
+            triangles,
+            axes,
+        )
+        rectangle_projection = np.einsum(
+            "vc,fc->fv",
+            rectangle_corners,
+            axes,
+        )
+        separated |= usable & (
+            (np.max(triangle_projection, axis=1)
+             < np.min(rectangle_projection, axis=1) - 1e-7)
+            | (np.min(triangle_projection, axis=1)
+               > np.max(rectangle_projection, axis=1) + 1e-7)
+        )
+    return ~separated
 
 
 # ### Doorway preview helpers ###

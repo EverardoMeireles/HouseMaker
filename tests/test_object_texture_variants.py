@@ -105,6 +105,24 @@ def _nonuniform_2048_rgba_glb() -> tuple[bytes, np.ndarray]:
     return bytes(trimesh.Scene(mesh).export(file_type="glb")), source_rgba
 
 
+def _untextured_uv_glb() -> bytes:
+    """Build geometry-only GLB content with authoritative UV coordinates."""
+
+    mesh = trimesh.creation.box(extents=(1.0, 2.0, 3.0))
+    mesh.visual = TextureVisuals(
+        uv=np.linspace(0.05, 0.95, len(mesh.vertices) * 2).reshape((-1, 2))
+    )
+    transform = trimesh.transformations.translation_matrix((3.0, 4.0, 5.0))
+    scene = trimesh.Scene()
+    scene.add_geometry(
+        mesh,
+        geom_name="uv-box",
+        node_name="uv-box-node",
+        transform=transform,
+    )
+    return bytes(scene.export(file_type="glb"))
+
+
 def _texture_images(glb_bytes: bytes) -> list[Image.Image]:
     scene = trimesh.load(
         BytesIO(glb_bytes),
@@ -407,6 +425,52 @@ class ObjectTextureVariantAlgorithmTests(unittest.TestCase):
                 np.asarray(texture.convert("RGBA"), dtype=np.uint8),
                 generated_texture,
             )
+
+    def test_provider_texture_attaches_to_untextured_authoritative_uvs(
+        self,
+    ) -> None:
+        model_glb = _untextured_uv_glb()
+        model_scene = trimesh.load(
+            BytesIO(model_glb),
+            file_type="glb",
+            force="scene",
+            process=False,
+        )
+        texture_source_glb, generated_texture = _nonuniform_2048_rgba_glb()
+
+        replaced_glb = replace_object_base_color_texture_from_glb(
+            model_glb,
+            texture_source_glb,
+        )
+
+        replaced_scene = trimesh.load(
+            BytesIO(replaced_glb),
+            file_type="glb",
+            force="scene",
+            process=False,
+        )
+        np.testing.assert_allclose(
+            replaced_scene.geometry["uv-box"].vertices,
+            model_scene.geometry["uv-box"].vertices,
+        )
+        np.testing.assert_array_equal(
+            replaced_scene.geometry["uv-box"].faces,
+            model_scene.geometry["uv-box"].faces,
+        )
+        np.testing.assert_allclose(
+            replaced_scene.geometry["uv-box"].visual.uv,
+            model_scene.geometry["uv-box"].visual.uv,
+        )
+        np.testing.assert_allclose(
+            replaced_scene.graph.get("uv-box-node")[0],
+            model_scene.graph.get("uv-box-node")[0],
+        )
+        embedded_texture = _texture_images(replaced_glb)[0]
+        self.assertEqual(embedded_texture.size, (2048, 2048))
+        np.testing.assert_array_equal(
+            np.asarray(embedded_texture.convert("RGBA"), dtype=np.uint8),
+            generated_texture,
+        )
 
     def test_provider_texture_requires_one_shared_2048_atlas(self) -> None:
         model_glb = _textured_glb(texture_size=(1024, 1024))

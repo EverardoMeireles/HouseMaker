@@ -19,6 +19,9 @@ from PySide6.QtWidgets import QApplication
 
 from housemaker.generation_state import GeneratedObjectRecord
 from housemaker.generation_workspace import (
+    FACE_EDIT_ATLAS_PLACEHOLDERS_PIPELINE_KEY,
+    FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY,
+    LOCALLY_AUTHORED_UVS_PIPELINE_KEY,
     MAX_OBJECT_OPERATION_UNDO_COUNT,
     OBJECT_OPERATION_GENERATE_TEXTURE,
     OBJECT_OPERATION_UNDO_STACK_PIPELINE_KEY,
@@ -256,6 +259,64 @@ class PersistentObjectUndoTests(unittest.TestCase):
             undo_stack[:-1],
         )
         self.assertEqual(restored, original)
+
+    def test_retexture_promotes_latest_authored_uv_glb_as_next_source(
+        self,
+    ) -> None:
+        geometry_glb = _box_glb()
+        original = GeneratedObjectRecord(
+            object_id="object",
+            frame_index=3,
+            object_name="Chair",
+            pipeline={
+                "postprocessed_asset_path": "face-edit-black.glb",
+                LOCALLY_AUTHORED_UVS_PIPELINE_KEY: True,
+                FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY: True,
+                FACE_EDIT_ATLAS_PLACEHOLDERS_PIPELINE_KEY: {
+                    "512": "face-edit-black-512.png",
+                },
+            },
+            provider_task_id="geometry-task",
+            asset_path="face-edit-black.glb",
+        )
+        request = TextureRegenerationRequest(
+            object_id=original.object_id,
+            reference_frame_index=3,
+            reference_image_bgra=np.full((8, 8, 4), 255, dtype=np.uint8),
+            model_glb=geometry_glb,
+            settings=GenerationServiceSettings(meshy_api_key="test-key"),
+        )
+        outcome = TextureRegenerationOutcome(
+            request=request,
+            result=MeshyGenerationResult(
+                "texture-task",
+                geometry_glb,
+                original.object_name,
+            ),
+        )
+        variant_metadata = {
+            str(resolution): {
+                "glb_asset_path": f"textured-{resolution}.glb",
+                "texture_asset_path": f"textured-{resolution}.png",
+            }
+            for resolution in (512, 1024, 2048)
+        }
+
+        pipeline = _build_regenerated_texture_pipeline(
+            original,
+            outcome,
+            variant_metadata,
+        )
+
+        self.assertEqual(
+            pipeline["postprocessed_asset_path"],
+            "textured-2048.glb",
+        )
+        self.assertNotIn(FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY, pipeline)
+        self.assertNotIn(
+            FACE_EDIT_ATLAS_PLACEHOLDERS_PIPELINE_KEY,
+            pipeline,
+        )
 
 
 if __name__ == "__main__":

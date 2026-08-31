@@ -37,11 +37,15 @@ CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY_SETTING_KEY = (
     "navigation/canvas_3d_navigation_toggle_hotkey"
 )
 UNUSED_FACE_REMOVAL_SETTING_KEY = "generation/unused_face_removal"
+USE_UV_RAYCAST_FOR_OBJECT_GENERATION_SETTING_KEY = (
+    "generation/use_uv_raycast_for_object_generation"
+)
 DOORWAY_MESH_UPDATE_DELAY_SECONDS_SETTING_KEY = (
     "canvas/doorway_mesh_update_delay_seconds"
 )
 DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY = "N"
 DEFAULT_UNUSED_FACE_REMOVAL = False
+DEFAULT_USE_UV_RAYCAST_FOR_OBJECT_GENERATION = False
 DEFAULT_DOORWAY_MESH_UPDATE_DELAY_SECONDS = 1.0
 MIN_DOORWAY_MESH_UPDATE_DELAY_SECONDS = 0.1
 MAX_DOORWAY_MESH_UPDATE_DELAY_SECONDS = 10.0
@@ -111,10 +115,18 @@ class GenerationServiceSettings:
     doorway_mesh_update_delay_seconds: float = (
         DEFAULT_DOORWAY_MESH_UPDATE_DELAY_SECONDS
     )
+    use_uv_raycast_for_object_generation: bool = (
+        DEFAULT_USE_UV_RAYCAST_FOR_OBJECT_GENERATION
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.unused_face_removal, bool):
             raise ValueError("Unused face removal must be enabled or disabled.")
+        if not isinstance(self.use_uv_raycast_for_object_generation, bool):
+            raise ValueError(
+                "Weighted camera projection for object generation must be "
+                "enabled or disabled."
+            )
         if (
             isinstance(self.meshy_target_polycount, bool)
             or not isinstance(self.meshy_target_polycount, int)
@@ -266,6 +278,9 @@ class SettingsWidget(QWidget):
                 self._selected_canvas_3d_navigation_toggle_hotkey()
             ),
             unused_face_removal=self.unused_face_removal_checkbox.isChecked(),
+            use_uv_raycast_for_object_generation=(
+                self.use_uv_raycast_for_object_generation_checkbox.isChecked()
+            ),
             doorway_mesh_update_delay_seconds=(
                 self.doorway_mesh_update_delay_spinbox.value()
             ),
@@ -436,6 +451,24 @@ class SettingsWidget(QWidget):
             self.unused_face_removal_checkbox,
         )
 
+        self.use_uv_raycast_for_object_generation_checkbox = QCheckBox()
+        self.use_uv_raycast_for_object_generation_checkbox.setObjectName(
+            "use_uv_raycast_for_object_generation_checkbox"
+        )
+        self.use_uv_raycast_for_object_generation_checkbox.setToolTip(
+            "After Meshy textures the model, rebuild its UVs from the six "
+            "weighted Object-generation cameras and copy the existing "
+            "texture continuously into the new layout. This first version "
+            "packs without island spacing."
+        )
+        self.use_uv_raycast_for_object_generation_checkbox.toggled.connect(
+            self._handle_use_uv_raycast_for_object_generation_changed
+        )
+        form_layout.addRow(
+            "Use weighted camera projection",
+            self.use_uv_raycast_for_object_generation_checkbox,
+        )
+
         root_layout.addLayout(form_layout)
 
         security_note = QLabel(
@@ -511,6 +544,11 @@ class SettingsWidget(QWidget):
         )
         self.unused_face_removal_checkbox.setChecked(
             read_unused_face_removal(self._application_settings)
+        )
+        self.use_uv_raycast_for_object_generation_checkbox.setChecked(
+            read_use_uv_raycast_for_object_generation(
+                self._application_settings
+            )
         )
         self._is_loading_settings = False
 
@@ -669,6 +707,18 @@ class SettingsWidget(QWidget):
         )
         self.settings_changed.emit()
 
+    def _handle_use_uv_raycast_for_object_generation_changed(
+        self,
+        enabled: bool,
+    ) -> None:
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            USE_UV_RAYCAST_FOR_OBJECT_GENERATION_SETTING_KEY,
+            bool(enabled),
+        )
+        self.settings_changed.emit()
+
     def _handle_doorway_mesh_update_delay_changed(self, value: float) -> None:
         if self._is_loading_settings:
             return
@@ -779,6 +829,20 @@ def read_unused_face_removal(
         DEFAULT_UNUSED_FACE_REMOVAL,
     )
     return value if isinstance(value, bool) else DEFAULT_UNUSED_FACE_REMOVAL
+
+
+def read_use_uv_raycast_for_object_generation(
+    application_settings: ApplicationSettingsStore,
+) -> bool:
+    """Read the persisted weighted-projection option safely."""
+
+    value = application_settings.get(
+        USE_UV_RAYCAST_FOR_OBJECT_GENERATION_SETTING_KEY,
+        DEFAULT_USE_UV_RAYCAST_FOR_OBJECT_GENERATION,
+    )
+    if isinstance(value, bool):
+        return value
+    return DEFAULT_USE_UV_RAYCAST_FOR_OBJECT_GENERATION
 
 
 # ### Doorway preview setting helpers ###

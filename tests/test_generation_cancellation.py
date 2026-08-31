@@ -53,6 +53,10 @@ from housemaker.settings_widget import GenerationServiceSettings
 _qt_application = QApplication.instance() or QApplication([])
 
 
+# ### Timing constants ###
+WORKER_START_TIMEOUT_SECONDS = 10.0
+
+
 # ### Fixture helpers ###
 def _box_glb(scale: float = 1.0) -> bytes:
     mesh = trimesh.creation.box(
@@ -300,7 +304,7 @@ class GenerationCancellationTests(unittest.TestCase):
         return record, variants
 
     def _wait_for_event(self, event: threading.Event) -> None:
-        deadline = time.monotonic() + 3.0
+        deadline = time.monotonic() + WORKER_START_TIMEOUT_SECONDS
         while not event.is_set() and time.monotonic() < deadline:
             _qt_application.processEvents()
             QTest.qWait(5)

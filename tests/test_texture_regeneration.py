@@ -39,6 +39,7 @@ from housemaker.generation_state import (
     MaskStroke,
 )
 from housemaker.generation_workspace import (
+    LOCALLY_AUTHORED_UVS_PIPELINE_KEY,
     TEXTURE_INPAINT_STROKES_PIPELINE_KEY,
     TextureRegenerationRequest,
     TextureRegenerationWorker,
@@ -345,16 +346,17 @@ class TextureRegenerationRequestTests(unittest.TestCase):
                 settings=settings,
                 submitted_uv_fingerprint=fingerprint,
             )
-        with self.assertRaisesRegex(ValueError, "only supported for symmetric"):
-            TextureRegenerationRequest(
-                object_id="chair",
-                reference_frame_index=0,
-                reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
-                model_glb=b"model",
-                settings=settings,
-                enable_original_uv=True,
-                submitted_uv_fingerprint=fingerprint,
-            )
+        locally_unwrapped_request = TextureRegenerationRequest(
+            object_id="chair",
+            reference_frame_index=0,
+            reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
+            model_glb=b"model",
+            settings=settings,
+            enable_original_uv=True,
+            submitted_uv_fingerprint=fingerprint,
+        )
+        self.assertTrue(locally_unwrapped_request.enable_original_uv)
+        self.assertFalse(locally_unwrapped_request.preserve_symmetric_uvs)
 
     def test_request_rejects_empty_identity_image_and_model(self) -> None:
         settings = GenerationServiceSettings(meshy_api_key="msy-key")
@@ -709,6 +711,55 @@ class MeshyTextureRegeneratorTests(unittest.TestCase):
                 build_uv_fingerprint(variant_glb),
                 submitted_fingerprint,
             )
+
+    def test_worker_preserves_locally_unwrapped_geometry_when_meshy_remeshes(
+        self,
+    ) -> None:
+        submitted_glb = _uv_glb()
+        submitted_fingerprint = build_uv_fingerprint(submitted_glb)
+        request = TextureRegenerationRequest(
+            object_id="chair",
+            reference_frame_index=0,
+            reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
+            model_glb=submitted_glb,
+            settings=GenerationServiceSettings(meshy_api_key="msy-secret"),
+            enable_original_uv=True,
+            submitted_uv_fingerprint=submitted_fingerprint,
+        )
+        generated_color = (35, 180, 90, 255)
+        provider_glb = _uv_glb(
+            subdivide_faces=True,
+            texture_resolution=2048,
+            texture_color=generated_color,
+        )
+        regenerator = _SequenceTextureRegenerator(
+            [MeshyGenerationResult("changed-task", provider_glb, "Changed")]
+        )
+        worker = TextureRegenerationWorker(
+            regenerator,
+            MeshyModelExecutor(),
+            request,
+        )
+        succeeded = QSignalSpy(worker.succeeded)
+        failed = QSignalSpy(worker.failed)
+
+        worker.run()
+
+        self.assertEqual(failed.count(), 0)
+        self.assertEqual(succeeded.count(), 1)
+        outcome = succeeded.at(0)[0]
+        self.assertEqual(
+            build_uv_fingerprint(outcome.result.glb_bytes),
+            submitted_fingerprint,
+        )
+        preserved_model = import_generated_glb(outcome.result.glb_bytes)
+        self.assertEqual(len(preserved_model.mesh.faces), 2)
+        self.assertEqual(
+            preserved_model.mesh.visual.material.baseColorTexture.getpixel(
+                (0, 0)
+            ),
+            generated_color,
+        )
 
     def test_worker_rejects_symmetric_result_without_a_texture(self) -> None:
         submitted_glb = _uv_glb(texture_resolution=1024)
@@ -1118,6 +1169,40 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
         for key, value in legacy_pipeline.items():
             self.assertEqual(replacement.pipeline[key], value)
             self.assertEqual(restored.generated_objects[0].pipeline[key], value)
+
+    def test_locally_unwrapped_object_requests_original_uv_retexture(self) -> None:
+        record, _variants = self._seed_object(
+            0,
+            name="Chair",
+            task_id="geometry-task",
+        )
+        self._load_reference()
+        postprocessed_glb = _uv_glb(texture_resolution=2048)
+        postprocessed_name = f"{record.object_id}.face-edit.glb"
+        self.asset_directory.joinpath(postprocessed_name).write_bytes(
+            postprocessed_glb
+        )
+        self._replace_record(
+            record,
+            postprocessed_asset_path=postprocessed_name,
+            **{LOCALLY_AUTHORED_UVS_PIPELINE_KEY: True},
+        )
+
+        preflight = self.workspace._build_texture_regeneration_request()
+
+        self.assertIsNotNone(preflight)
+        assert preflight is not None
+        self.assertTrue(preflight.enable_original_uv)
+        self.assertFalse(preflight.preserve_symmetric_uvs)
+        materialized = _materialize_texture_regeneration_preflight(
+            preflight,
+            self.asset_directory,
+        ).request
+        self.assertEqual(materialized.model_glb, postprocessed_glb)
+        self.assertEqual(
+            materialized.submitted_uv_fingerprint,
+            build_uv_fingerprint(postprocessed_glb),
+        )
 
     def test_source_read_import_and_symmetric_fingerprint_run_off_gui(
         self,

@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -76,6 +77,26 @@ from housemaker.object_texture_variants import (
     build_object_texture_variants,
     replace_object_base_color_texture_from_glb,
 )
+from housemaker.object_face_edit import (
+    ObjectFaceDeletionResult,
+    ObjectFaceGeometry,
+    _delete_object_faces_preserving_uvs_with_geometry,
+    load_object_face_geometry,
+    load_object_face_geometry_from_scene,
+)
+from housemaker.object_uv_scan_projection import (
+    DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
+    SCAN_PROJECTION_TARGET_FULL,
+    ScanProjectionCancelled,
+    ScanProjectionResult,
+    ScanProjectionStats,
+    normalize_projection_camera_percentages,
+    scan_project_textured_glb,
+)
+from housemaker.object_uv_raycast import (
+    VISIBILITY_UV_UNWRAP_VERSION,
+    VisibilityUvUnwrapStats,
+)
 from housemaker.object_symmetry import (
     AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
     LEGACY_SYMMETRIC_PAIR_METADATA_VERSION,
@@ -86,7 +107,10 @@ from housemaker.object_symmetry import (
     SYMMETRIC_DIVISION_SIDE_ORDER_BY_ORIENTATION,
     SYMMETRIC_DIVISION_SIDES_BY_ORIENTATION,
     SYMMETRIC_QUARTER_METADATA_VERSION,
+    SYMMETRIC_SELECTION_MODE_FEWEST_TRIANGLES_RANDOM_TIE,
     SYMMETRIC_SQUARE_PAIR_CONTENT_RESOLUTIONS,
+    SYMMETRIC_TEXTURE_CONTENT_HALF_LEFT,
+    SYMMETRIC_TEXTURE_PACKING_MODE_PAIR,
     SymmetricDivisionMetadata,
     SymmetricDivisionResult,
     SymmetricPairTextureVariants,
@@ -109,8 +133,11 @@ from housemaker.texture_atlas_view import (
     TextureAtlasEntry,
     TextureAtlasView,
     UvTriangle,
+    UvFaceSelectionRequest,
 )
 from housemaker.unused_face_removal import (
+    ALL_CAMERA_IDS,
+    CAMERA_OPTIONS,
     UnusedFaceRemovalOptions,
     UnusedFaceRemovalProgress,
     remove_unused_faces_from_glb,
@@ -120,7 +147,10 @@ from housemaker.video_source import (
     VideoFrameSource,
     probe_video,
 )
-from housemaker.viewer import GlbViewerWidget
+from housemaker.viewer import (
+    FACE_SELECTION_TOGGLE,
+    GlbViewerWidget,
+)
 
 
 # ### Constants ###
@@ -138,6 +168,7 @@ OBJECT_LIST_MAXIMUM_HEIGHT = 124
 OBJECT_DETAILS_EXTERNAL_MINIMUM_WIDTH = 320
 OBJECT_DETAILS_EXTERNAL_MAXIMUM_WIDTH = 440
 QT_WIDGET_MAXIMUM_SIZE = 16_777_215
+OBJECT_FACE_GEOMETRY_CACHE_MAX_ENTRIES = 16
 MESHY_REVISION_GEOMETRY = "geometry"
 MESHY_REVISION_POSTPROCESSED = "postprocessed"
 MESHY_REVISION_NAMES = frozenset(
@@ -158,8 +189,24 @@ OBJECT_OPERATION_UNDO_STACK_PIPELINE_KEY = "object_operation_undo_stack"
 MAX_OBJECT_OPERATION_UNDO_COUNT = 10
 OBJECT_OPERATION_GENERATE_MODEL = "generate_model"
 OBJECT_OPERATION_GENERATE_TEXTURE = "generate_texture"
+OBJECT_OPERATION_DELETE_FACES = "delete_faces"
+FACE_EDIT_REVISION_PIPELINE_KEY = "face_edit_revision"
+FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY = "face_edit_texture_stale"
+FACE_EDIT_ATLAS_PLACEHOLDERS_PIPELINE_KEY = "face_edit_atlas_placeholders"
+LOCALLY_AUTHORED_UVS_PIPELINE_KEY = "locally_authored_uvs"
+VISIBILITY_UV_UNWRAP_PIPELINE_KEY = "visibility_uv_unwrap"
+SCAN_PROJECTION_PIPELINE_KEY = "weighted_camera_scan_projection"
+FACE_EDIT_INVALIDATED_UV_PROVENANCE_PIPELINE_KEYS = (
+    VISIBILITY_UV_UNWRAP_PIPELINE_KEY,
+    SCAN_PROJECTION_PIPELINE_KEY,
+    "texture_regeneration_uv_fingerprint_version",
+    "texture_regeneration_submitted_uv_fingerprint",
+    "texture_regeneration_final_uv_fingerprint",
+    "texture_regeneration_uv_face_count",
+)
 GENERATION_JOB_KIND_MODEL = "Object generation"
 GENERATION_JOB_KIND_TEXTURE = "Object texture generation"
+GENERATION_JOB_KIND_FACE_EDIT = "Object face editing"
 SYMMETRIC_DIVISION_PIPELINE_KEY = "symmetric_division"
 SYMMETRIC_DIVISION_TEXTURE_CONTENT_HALF = "left"
 SYMMETRIC_TEXTURE_RESOLUTIONS = SYMMETRIC_SQUARE_PAIR_CONTENT_RESOLUTIONS
@@ -186,6 +233,120 @@ _STAGED_GEOMETRY_PROGRESS_END = 48
 _STAGED_TEXTURE_PROGRESS_START = 56
 _TEXTURE_PROVIDER_PROGRESS_START = 5
 _TEXTURE_PROVIDER_PROGRESS_END = 80
+
+
+# ### Projection camera percentage helpers ###
+def update_projection_camera_percentage(
+    current_percentages: Sequence[int],
+    camera_id: str,
+    requested_percentage: int,
+) -> tuple[int, ...]:
+    """Update one camera without allowing the six-value total above 100%."""
+
+    percentages = _normalize_editable_projection_camera_percentages(
+        current_percentages
+    )
+    if camera_id not in ALL_CAMERA_IDS:
+        raise ValueError(f"Unknown projection camera: {camera_id!r}.")
+    if isinstance(requested_percentage, bool) or not isinstance(
+        requested_percentage,
+        int,
+    ):
+        raise ValueError("A projection camera percentage must be an integer.")
+
+    target_index = ALL_CAMERA_IDS.index(camera_id)
+    maximum_percentage = 100 - (len(ALL_CAMERA_IDS) - 1)
+    target_percentage = min(
+        maximum_percentage,
+        max(1, int(requested_percentage)),
+    )
+    current_percentage = percentages[target_index]
+    if target_percentage == current_percentage:
+        return percentages
+
+    updated = list(percentages)
+    updated[target_index] = target_percentage
+    if target_percentage < current_percentage:
+        return tuple(updated)
+
+    overflow = max(0, sum(updated) - 100)
+    if overflow == 0:
+        return tuple(updated)
+
+    other_indices = tuple(
+        index for index in range(len(updated)) if index != target_index
+    )
+    reducible_percentages = tuple(
+        percentages[index] - 1 for index in other_indices
+    )
+    reductions = _apportion_integer_percentage(
+        overflow,
+        reducible_percentages,
+    )
+    for index, reduction in zip(other_indices, reductions, strict=True):
+        updated[index] -= reduction
+    return tuple(updated)
+
+
+def _normalize_editable_projection_camera_percentages(
+    values: Sequence[int],
+) -> tuple[int, ...]:
+    """Validate a live control state, which may intentionally total below 100%."""
+
+    if isinstance(values, str | bytes | bytearray):
+        raise ValueError("Projection camera percentages must be a sequence.")
+    try:
+        percentages = tuple(values)
+    except TypeError as error:
+        raise ValueError(
+            "Projection camera percentages must be a sequence."
+        ) from error
+    if len(percentages) != len(ALL_CAMERA_IDS):
+        raise ValueError("Projection camera percentages require six values.")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in percentages
+    ):
+        raise ValueError("Projection camera percentages must be integers.")
+    normalized = tuple(int(value) for value in percentages)
+    if any(value < 1 for value in normalized):
+        raise ValueError("Every projection camera requires at least 1%.")
+    if sum(normalized) > 100:
+        raise ValueError("Projection camera percentages cannot exceed 100%.")
+    return normalized
+
+
+def _apportion_integer_percentage(
+    amount: int,
+    weights: Sequence[int],
+) -> tuple[int, ...]:
+    """Apportion integer points by weight with deterministic remainder ties."""
+
+    normalized_weights = tuple(max(0, int(weight)) for weight in weights)
+    if amount <= 0:
+        return tuple(0 for _weight in normalized_weights)
+    total_weight = sum(normalized_weights)
+    if amount > total_weight:
+        raise ValueError("The percentage reduction exceeds available capacity.")
+
+    allocations: list[int] = []
+    remainders: list[int] = []
+    for weight in normalized_weights:
+        allocation, remainder = divmod(amount * weight, total_weight)
+        allocations.append(allocation)
+        remainders.append(remainder)
+    points_left = amount - sum(allocations)
+    remainder_order = sorted(
+        range(len(normalized_weights)),
+        key=lambda index: (
+            -remainders[index],
+            -normalized_weights[index],
+            index,
+        ),
+    )
+    for index in remainder_order[:points_left]:
+        allocations[index] += 1
+    return tuple(allocations)
 
 
 # ### Active operation state ###
@@ -254,11 +415,13 @@ class _ObjectJobRuntime:
 
     operation: _ActiveObjectOperation
     thread: QThread
-    worker: GenerationWorker | TextureRegenerationWorker
+    worker: GenerationWorker | TextureRegenerationWorker | ObjectFaceDeletionWorker
     relay: _ObjectJobSignalRelay
     generation_request: GenerationRequest | None = None
     requested_name: str = ""
     managed_job_id: str | None = None
+    record_snapshot: GeneratedObjectRecord | None = None
+    source_asset_revision: tuple[object, ...] | None = None
 
     @property
     def operation_id(self) -> str:
@@ -410,6 +573,9 @@ class GenerationRequest:
         symmetric_division_orientation: str = (
             SYMMETRIC_DIVISION_ORIENTATION_VERTICAL
         ),
+        projection_camera_percentages: Sequence[int] = (
+            DEFAULT_PROJECTION_CAMERA_PERCENTAGES
+        ),
     ) -> None:
         self.frame_index = int(frame_index)
         self.selected_object_bgra = np.ascontiguousarray(
@@ -428,6 +594,11 @@ class GenerationRequest:
                 "Geometry-only generation cannot apply symmetric division."
             )
         self.symmetric_division_orientation = normalized_orientation
+        self.projection_camera_percentages = (
+            normalize_projection_camera_percentages(
+                projection_camera_percentages
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -470,11 +641,6 @@ class TextureRegenerationRequest:
         if self.preserve_symmetric_uvs and not self.enable_original_uv:
             raise ValueError(
                 "Symmetric texture regeneration must preserve original UVs."
-            )
-        if self.enable_original_uv and not self.preserve_symmetric_uvs:
-            raise ValueError(
-                "Original-UV texture regeneration is only supported for "
-                "symmetric objects."
             )
         object.__setattr__(self, "object_id", normalized_object_id)
         object.__setattr__(
@@ -541,11 +707,6 @@ class _TextureRegenerationPreflight:
             raise ValueError(
                 "Symmetric texture regeneration must preserve original UVs."
             )
-        if self.enable_original_uv and not self.preserve_symmetric_uvs:
-            raise ValueError(
-                "Original-UV texture regeneration is only supported for "
-                "symmetric objects."
-            )
         object.__setattr__(self, "object_id", normalized_object_id)
         object.__setattr__(
             self,
@@ -582,6 +743,62 @@ class _MaterializedTextureRegeneration:
     request: TextureRegenerationRequest
     source_asset_path: str | None = None
     source_asset_revision: tuple[object, ...] | None = None
+
+
+@dataclass(frozen=True)
+class ObjectFaceDeletionRequest:
+    """Contained GLB revisions and logical face IDs for one local edit job."""
+
+    object_id: str
+    reference_asset_path: str
+    source_asset_paths: tuple[str, ...]
+    selected_face_indices: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        normalized_object_id = str(self.object_id).strip()
+        reference_asset_path = _normalize_face_edit_asset_path(
+            self.reference_asset_path
+        )
+        source_asset_paths = tuple(
+            dict.fromkeys(
+                _normalize_face_edit_asset_path(path)
+                for path in self.source_asset_paths
+            )
+        )
+        selected = tuple(int(index) for index in self.selected_face_indices)
+        if not normalized_object_id:
+            raise ValueError("Face deletion requires an object ID.")
+        if (
+            not source_asset_paths
+            or reference_asset_path not in source_asset_paths
+        ):
+            raise ValueError(
+                "Face deletion requires its displayed GLB revision."
+            )
+        if not selected or any(index < 0 for index in selected):
+            raise ValueError("Face deletion requires selected face indices.")
+        object.__setattr__(self, "object_id", normalized_object_id)
+        object.__setattr__(
+            self,
+            "reference_asset_path",
+            reference_asset_path,
+        )
+        object.__setattr__(self, "source_asset_paths", source_asset_paths)
+        object.__setattr__(
+            self,
+            "selected_face_indices",
+            tuple(sorted(set(selected))),
+        )
+
+
+@dataclass(frozen=True)
+class PreparedObjectFaceDeletion:
+    """Every edited GLB revision plus reference face-count metadata."""
+
+    request: ObjectFaceDeletionRequest
+    reference_result: ObjectFaceDeletionResult
+    edited_glbs: tuple[tuple[str, bytes], ...]
+    preview_model: GeneratedModel
 
 
 @dataclass(frozen=True)
@@ -637,7 +854,16 @@ class StagedMeshyGenerationResult(MeshyGenerationResult):
     removed_face_count: int = 0
     protected_face_count: int = 0
     unused_face_removal_applied: bool = False
+    visibility_uv_stats: VisibilityUvUnwrapStats | None = None
+    scan_projection_stats: ScanProjectionStats | None = None
     geometry_only: bool = False
+
+
+@dataclass(frozen=True)
+class ScanProjectedMeshyGenerationResult(MeshyGenerationResult):
+    """One directly textured result rebuilt with weighted camera UVs."""
+
+    scan_projection_stats: ScanProjectionStats | None = None
 
 
 @dataclass(frozen=True)
@@ -662,6 +888,56 @@ class ObjectTextureImageVariant:
     resolution: int
     texture_asset_relative_path: str
     texture_asset_path: Path
+
+
+# ### Generation-pipeline decisions ###
+def _uses_weighted_camera_projection(request: GenerationRequest) -> bool:
+    """Whether this textured generation uses the weighted scan atlas."""
+
+    return bool(
+        request.settings.use_uv_raycast_for_object_generation
+        and not request.geometry_only
+    )
+
+
+def _scan_project_provider_result(
+    request: GenerationRequest,
+    provider_result: MeshyGenerationResult,
+    progress_callback: Callable[[str], None] | None,
+    cancel_event: threading.Event | None,
+) -> MeshyGenerationResult:
+    """Apply a full scan atlas after Meshy, or defer it until symmetry clips."""
+
+    if (
+        not _uses_weighted_camera_projection(request)
+        or request.symmetric_division_enabled
+    ):
+        return provider_result
+    _raise_if_generation_cancelled(cancel_event)
+    if progress_callback is not None:
+        progress_callback(
+            "Scanning the six weighted camera projections line by line..."
+        )
+    try:
+        projected = scan_project_textured_glb(
+            provider_result.glb_bytes,
+            request.projection_camera_percentages,
+            target_domain=SCAN_PROJECTION_TARGET_FULL,
+            cancellation_check=(
+                None if cancel_event is None else cancel_event.is_set
+            ),
+        )
+    except ScanProjectionCancelled as error:
+        raise _GenerationCancelled from error
+    if not isinstance(projected, ScanProjectionResult):
+        raise TypeError("The weighted camera projection returned no result.")
+    _raise_if_generation_cancelled(cancel_event)
+    return ScanProjectedMeshyGenerationResult(
+        task_id=provider_result.task_id,
+        glb_bytes=projected.glb_bytes,
+        name=provider_result.name,
+        scan_projection_stats=projected.stats,
+    )
 
 
 # ### Default adapters ###
@@ -693,12 +969,18 @@ class MeshyImagePlanner:
         use_unused_face_removal = request.settings.unused_face_removal
         if not request.geometry_only and not use_unused_face_removal:
             _raise_if_generation_cancelled(cancel_event)
-            return request_image_to_3d_model(
+            provider_result = request_image_to_3d_model(
                 api_key=request.settings.meshy_api_key,
                 image_png=image_png,
                 target_polycount=request.settings.meshy_target_polycount,
                 progress_callback=report_generation_progress,
                 cancel_event=cancel_event,
+            )
+            return _scan_project_provider_result(
+                request,
+                provider_result,
+                progress_callback,
+                cancel_event,
             )
 
         if progress_callback is not None:
@@ -793,10 +1075,16 @@ class MeshyImagePlanner:
             progress_callback=report_texture_progress,
             cancel_event=cancel_event,
         )
+        final_result = _scan_project_provider_result(
+            request,
+            textured_result,
+            progress_callback,
+            cancel_event,
+        )
         return StagedMeshyGenerationResult(
-            task_id=textured_result.task_id,
-            glb_bytes=textured_result.glb_bytes,
-            name=textured_result.name,
+            task_id=final_result.task_id,
+            glb_bytes=final_result.glb_bytes,
+            name=final_result.name,
             geometry_task_id=geometry_result.task_id,
             source_glb_bytes=geometry_result.glb_bytes,
             postprocessed_glb_bytes=processed_glb_bytes,
@@ -805,9 +1093,18 @@ class MeshyImagePlanner:
             removed_face_count=removed_face_count,
             protected_face_count=protected_face_count,
             unused_face_removal_applied=use_unused_face_removal,
+            scan_projection_stats=(
+                final_result.scan_projection_stats
+                if isinstance(
+                    final_result,
+                    ScanProjectedMeshyGenerationResult,
+                )
+                else None
+            ),
         )
 
 
+# ### Texture regeneration adapter ###
 class MeshyTextureRegenerator:
     """Submit an existing processed model to Meshy Retexture."""
 
@@ -869,6 +1166,8 @@ class MeshyModelExecutor:
 class ObjectGenerationViewerPanel(QWidget):
     """Keep the generated-object selector with its detachable 3D viewer."""
 
+    projection_camera_percentages_changed = Signal()
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._is_external_presentation_active = False
@@ -876,7 +1175,14 @@ class ObjectGenerationViewerPanel(QWidget):
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(8)
 
-        self.viewer = GlbViewerWidget(wireframe_enabled=False)
+        self.viewer = GlbViewerWidget(
+            wireframe_enabled=False,
+            face_editing_enabled=True,
+        )
+        self.viewer.set_projection_camera_indicators_visible(True)
+        self.viewer.projection_camera_percentage_step_requested.connect(
+            self.adjust_projection_camera_percentage
+        )
         self._layout.addWidget(self.viewer, 1)
 
         self.details_panel = QWidget()
@@ -884,6 +1190,79 @@ class ObjectGenerationViewerPanel(QWidget):
         details_layout = QVBoxLayout(self.details_panel)
         details_layout.setContentsMargins(0, 0, 0, 0)
         details_layout.setSpacing(4)
+
+        self.projection_camera_controls = QWidget()
+        self.projection_camera_controls.setObjectName(
+            "projection_camera_controls"
+        )
+        camera_layout = QGridLayout(self.projection_camera_controls)
+        camera_layout.setContentsMargins(4, 2, 4, 2)
+        camera_layout.setSpacing(6)
+        camera_title = QLabel("Projection texture allocation")
+        camera_title.setToolTip(
+            "Allocate the available texture area between the six fixed "
+            "projection cameras."
+        )
+        camera_layout.addWidget(camera_title, 0, 0, 1, 4)
+        self.projection_camera_percentage_spinboxes: dict[str, QSpinBox] = {}
+        for index, ((camera_id, label), default_percentage) in enumerate(
+            zip(
+                CAMERA_OPTIONS,
+                DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
+                strict=True,
+            )
+        ):
+            row = 1 + index // 2
+            column = (index % 2) * 2
+            camera_label = QLabel(label)
+            percentage_spinbox = QSpinBox()
+            percentage_spinbox.setObjectName(
+                f"projection_camera_{camera_id}_percentage"
+            )
+            percentage_spinbox.setRange(
+                1,
+                100 - (len(ALL_CAMERA_IDS) - 1),
+            )
+            percentage_spinbox.setSuffix("%")
+            percentage_spinbox.setValue(default_percentage)
+            percentage_spinbox.setKeyboardTracking(False)
+            percentage_spinbox.setToolTip(
+                f"The {label} camera receives this percentage of the UV "
+                "texture area. Increases never let the total exceed 100%, "
+                "and every camera keeps at least 1%."
+            )
+            percentage_spinbox.valueChanged.connect(
+                lambda value, selected_camera_id=camera_id: (
+                    self.set_projection_camera_percentage(
+                        selected_camera_id,
+                        value,
+                    )
+                )
+            )
+            self.projection_camera_percentage_spinboxes[camera_id] = (
+                percentage_spinbox
+            )
+            camera_layout.addWidget(camera_label, row, column)
+            camera_layout.addWidget(percentage_spinbox, row, column + 1)
+        self.projection_camera_total_label = QLabel()
+        self.projection_camera_total_label.setObjectName(
+            "projection_camera_percentage_total"
+        )
+        camera_layout.addWidget(
+            self.projection_camera_total_label,
+            4,
+            0,
+            1,
+            4,
+        )
+        details_layout.addWidget(self.projection_camera_controls)
+        self._projection_camera_percentages = tuple(
+            DEFAULT_PROJECTION_CAMERA_PERCENTAGES
+        )
+        self.viewer.set_projection_camera_percentages(
+            self._projection_camera_percentages
+        )
+        self._sync_projection_camera_percentage_total()
 
         self.object_list = QListWidget()
         self.object_list.setObjectName("generated_objects_list")
@@ -893,6 +1272,43 @@ class ObjectGenerationViewerPanel(QWidget):
             "Select which generated Meshy object is shown in the 3D view."
         )
         details_layout.addWidget(self.object_list, 1)
+
+        self.face_selection_help_label = QLabel(
+            "Toggle faces with Ctrl+click in 3D or a click in Texture "
+            "resolution. Ctrl+drag adds faces in 3D. All methods share one "
+            "selection; deletion retains existing UVs and textures."
+        )
+        self.face_selection_help_label.setObjectName(
+            "object_face_selection_help"
+        )
+        self.face_selection_help_label.setWordWrap(True)
+        details_layout.addWidget(self.face_selection_help_label)
+
+        self.face_selection_xray_checkbox = QCheckBox("X-ray face selection")
+        self.face_selection_xray_checkbox.setObjectName(
+            "object_face_selection_xray_checkbox"
+        )
+        self.face_selection_xray_checkbox.setToolTip(
+            "Include faces hidden behind the visible surface during Ctrl-drag."
+        )
+        details_layout.addWidget(self.face_selection_xray_checkbox)
+
+        self.face_selection_count_label = QLabel("No faces selected")
+        self.face_selection_count_label.setObjectName(
+            "object_face_selection_count"
+        )
+        details_layout.addWidget(self.face_selection_count_label)
+
+        self.delete_faces_button = QPushButton("Delete selected faces")
+        self.delete_faces_button.setObjectName(
+            "delete_generated_object_faces_button"
+        )
+        self.delete_faces_button.setToolTip(
+            "Delete the selected triangles without changing the remaining "
+            "UVs or texture."
+        )
+        self.delete_faces_button.setEnabled(False)
+        details_layout.addWidget(self.delete_faces_button)
 
         self.delete_object_button = QPushButton("Delete object")
         self.delete_object_button.setObjectName(
@@ -912,6 +1328,80 @@ class ObjectGenerationViewerPanel(QWidget):
         )
         details_layout.addWidget(self.statistics_label)
         self._layout.addWidget(self.details_panel)
+
+    # ### Projection camera controls ###
+    def get_projection_camera_percentages(self) -> tuple[int, ...]:
+        """Return the six percentages in canonical camera order."""
+
+        return self._projection_camera_percentages
+
+    def set_projection_camera_percentage(
+        self,
+        camera_id: str,
+        percentage: int,
+    ) -> tuple[int, ...]:
+        """Apply one field or viewport adjustment through the shared pipeline."""
+
+        updated = update_projection_camera_percentage(
+            self._projection_camera_percentages,
+            camera_id,
+            percentage,
+        )
+        if updated == self._projection_camera_percentages:
+            return updated
+        self._projection_camera_percentages = updated
+        previous_signal_states: list[tuple[QSpinBox, bool]] = []
+        try:
+            for selected_camera_id, value in zip(
+                ALL_CAMERA_IDS,
+                updated,
+                strict=True,
+            ):
+                spinbox = self.projection_camera_percentage_spinboxes[
+                    selected_camera_id
+                ]
+                previous_signal_states.append(
+                    (spinbox, spinbox.blockSignals(True))
+                )
+                spinbox.setValue(value)
+        finally:
+            for spinbox, was_blocked in previous_signal_states:
+                spinbox.blockSignals(was_blocked)
+        self.viewer.set_projection_camera_percentages(updated)
+        self._sync_projection_camera_percentage_total()
+        self.projection_camera_percentages_changed.emit()
+        return updated
+
+    def adjust_projection_camera_percentage(
+        self,
+        camera_id: str,
+        step_count: int,
+    ) -> tuple[int, ...]:
+        """Adjust one camera by one percentage point per viewport wheel tick."""
+
+        if isinstance(step_count, bool) or not isinstance(step_count, int):
+            raise ValueError("A projection camera step count must be an integer.")
+        if camera_id not in ALL_CAMERA_IDS:
+            raise ValueError(f"Unknown projection camera: {camera_id!r}.")
+        camera_index = ALL_CAMERA_IDS.index(camera_id)
+        return self.set_projection_camera_percentage(
+            camera_id,
+            self._projection_camera_percentages[camera_index] + step_count,
+        )
+
+    def projection_camera_percentages_are_valid(self) -> bool:
+        return sum(self.get_projection_camera_percentages()) == 100
+
+    def _sync_projection_camera_percentage_total(self) -> None:
+        total = sum(self.get_projection_camera_percentages())
+        is_valid = total == 100
+        self.projection_camera_total_label.setText(
+            f"Total: {total}%"
+            + ("" if is_valid else " — must equal 100%")
+        )
+        self.projection_camera_total_label.setStyleSheet(
+            "color: #aeb7c5;" if is_valid else "color: #ff6b6b;"
+        )
 
     def focus_navigation(self) -> None:
         """Forward external-window focus to the actual OpenGL viewer."""
@@ -1084,7 +1574,10 @@ class GenerationWorker(QObject):
             prepare_executor = getattr(self._executor, "prepare", None)
             if callable(prepare_executor):
                 self.progress.emit("Preparing model processor...")
-                _run_interruptible_stage(prepare_executor)
+                _run_interruptible_stage(
+                    prepare_executor,
+                    self._cancel_event,
+                )
                 _raise_if_generation_cancelled(self._cancel_event)
             progress_mapper = _ObjectGenerationProgressMapper(self._request)
             result = _run_interruptible_stage(
@@ -1095,7 +1588,8 @@ class GenerationWorker(QObject):
                         progress_mapper.map_provider_message(message)
                     ),
                     self._cancel_event,
-                )
+                ),
+                self._cancel_event,
             )
             _raise_if_generation_cancelled(self._cancel_event)
             self.progress.emit(
@@ -1107,14 +1601,30 @@ class GenerationWorker(QObject):
                 )
             )
             generated_model = _run_interruptible_stage(
-                lambda: _invoke_executor(self._executor, result)
+                lambda: _invoke_executor(self._executor, result),
+                self._cancel_event,
             )
             if not isinstance(generated_model, GeneratedModel):
                 raise TypeError("The Meshy executor returned an invalid model.")
             _raise_if_generation_cancelled(self._cancel_event)
             success_payload: object = result
             if self._asset_directory is not None and self._object_id is not None:
-                self.progress.emit("Saving local object assets (94%)")
+                self.progress.emit(
+                    (
+                        "Scanning weighted camera projections and saving "
+                        "assets (94%)"
+                    )
+                    if (
+                        self._request.symmetric_division_enabled
+                        and _uses_weighted_camera_projection(self._request)
+                    )
+                    else (
+                        "Compacting existing symmetric UVs and saving assets "
+                        "(94%)"
+                        if self._request.symmetric_division_enabled
+                        else "Saving local object assets (94%)"
+                    )
+                )
                 saved_output = _prepare_and_persist_object_generation(
                     self._asset_directory,
                     self._object_id,
@@ -1214,7 +1724,10 @@ class TextureRegenerationWorker(QObject):
             prepare_executor = getattr(self._executor, "prepare", None)
             if callable(prepare_executor):
                 self.progress.emit("Preparing model processor...")
-                _run_interruptible_stage(prepare_executor)
+                _run_interruptible_stage(
+                    prepare_executor,
+                    self._cancel_event,
+                )
                 _raise_if_generation_cancelled(self._cancel_event)
             provider_request = request
             if request.preserve_symmetric_uvs and self._symmetry is not None:
@@ -1243,17 +1756,18 @@ class TextureRegenerationWorker(QObject):
                         progress_mapper.map_provider_message(message)
                     ),
                     self._cancel_event,
-                )
+                ),
+                self._cancel_event,
             )
             if not isinstance(result, MeshyGenerationResult):
                 raise TypeError("Meshy returned an invalid texture result.")
             _raise_if_generation_cancelled(self._cancel_event)
-            if request.preserve_symmetric_uvs:
-                # The provider proxy keeps the authoritative half in the left
-                # UV region. Copy only its atlas because Meshy may still
-                # retriangulate the temporary full model.
+            if request.enable_original_uv:
+                # Locally retained UVs and geometry remain authoritative.
+                # Meshy contributes only its new atlas, so deleted faces and
+                # provider retriangulation can never return to the object.
                 self.progress.emit(
-                    "Applying texture to preserved symmetric geometry (82%)"
+                    "Applying texture to preserved local geometry (82%)"
                 )
                 result = MeshyGenerationResult(
                     task_id=result.task_id,
@@ -1272,7 +1786,8 @@ class TextureRegenerationWorker(QObject):
                 "Preparing local 512, 1024 and 2048 texture variants (84%)"
             )
             generated_model = _run_interruptible_stage(
-                lambda: _invoke_executor(self._executor, result)
+                lambda: _invoke_executor(self._executor, result),
+                self._cancel_event,
             )
             if not isinstance(generated_model, GeneratedModel):
                 raise TypeError("The Meshy executor returned an invalid model.")
@@ -1339,11 +1854,289 @@ class TextureRegenerationWorker(QObject):
                 "layout could not be verified. The existing texture was "
                 f"kept. Detail: {error}"
             ) from error
-        _validate_symmetric_uv_retexture_integrity(
+        _validate_preserved_uv_retexture_integrity(
             submitted,
             final_fingerprint,
         )
         return final_fingerprint
+
+
+# ### Local face-edit preparation ###
+def _normalize_face_edit_asset_path(raw_path: object) -> str:
+    """Normalize one contained relative GLB path without touching disk."""
+
+    normalized = str(raw_path).strip()
+    path = Path(normalized)
+    if (
+        not normalized
+        or path.is_absolute()
+        or ".." in path.parts
+        or path.suffix.lower() != ".glb"
+    ):
+        raise ValueError("A face-edit source GLB path is unsafe.")
+    return path.as_posix()
+
+
+def _get_face_edit_glb_asset_paths(
+    record: GeneratedObjectRecord,
+) -> tuple[str, ...]:
+    """Return every GLB revision that may later display this object."""
+
+    raw_paths: list[object] = [record.asset_path]
+    raw_postprocessed_path = record.pipeline.get("postprocessed_asset_path")
+    if isinstance(raw_postprocessed_path, str):
+        raw_paths.append(raw_postprocessed_path)
+    raw_variants = record.pipeline.get(TEXTURE_VARIANTS_PIPELINE_KEY)
+    if isinstance(raw_variants, Mapping):
+        for raw_variant in raw_variants.values():
+            if not isinstance(raw_variant, Mapping):
+                continue
+            raw_glb_path = raw_variant.get(TEXTURE_VARIANT_GLB_PATH_KEY)
+            if isinstance(raw_glb_path, str):
+                raw_paths.append(raw_glb_path)
+    return tuple(
+        dict.fromkeys(
+            _normalize_face_edit_asset_path(raw_path)
+            for raw_path in raw_paths
+        )
+    )
+
+
+def _resolve_face_edit_source_path(
+    asset_directory: Path,
+    raw_path: str,
+) -> Path:
+    """Resolve one face-edit GLB inside the generated-asset directory."""
+
+    asset_root = Path(asset_directory).resolve()
+    candidate = (
+        asset_root / _normalize_face_edit_asset_path(raw_path)
+    ).resolve()
+    try:
+        candidate.relative_to(asset_root)
+    except ValueError as error:
+        raise ValueError("A face-edit source GLB is outside the project.") from error
+    if candidate.suffix.lower() != ".glb" or not candidate.is_file():
+        raise ValueError("A face-edit source GLB is missing.")
+    return candidate
+
+
+def _build_face_edit_source_revisions(
+    asset_directory: Path,
+    source_asset_paths: Sequence[str],
+) -> tuple[tuple[object, ...], ...]:
+    """Snapshot every source file so a stale worker result cannot commit."""
+
+    return tuple(
+        (
+            _normalize_face_edit_asset_path(raw_path),
+            *_build_generation_asset_revision(asset_directory, raw_path),
+        )
+        for raw_path in source_asset_paths
+    )
+
+
+def _prepare_object_face_deletion(
+    asset_directory: Path,
+    request: ObjectFaceDeletionRequest,
+) -> PreparedObjectFaceDeletion:
+    """Read, validate, and edit every geometry-bearing saved GLB revision."""
+
+    source_glbs = tuple(
+        (
+            raw_path,
+            _resolve_face_edit_source_path(
+                asset_directory,
+                raw_path,
+            ).read_bytes(),
+        )
+        for raw_path in request.source_asset_paths
+    )
+    reference_geometry: ObjectFaceGeometry | None = None
+    edited_glbs: list[tuple[str, bytes]] = []
+    reference_result: ObjectFaceDeletionResult | None = None
+    retained_face_counts: list[int] = []
+    ordered_source_glbs = tuple(
+        sorted(
+            source_glbs,
+            key=lambda pair: pair[0] != request.reference_asset_path,
+        )
+    )
+    for raw_path, source_glb in ordered_source_glbs:
+        result, source_geometry = (
+            _delete_object_faces_preserving_uvs_with_geometry(
+                source_glb,
+                request.selected_face_indices,
+                validate_export=False,
+            )
+        )
+        if reference_geometry is None:
+            reference_geometry = source_geometry
+        elif not _face_edit_geometry_matches(
+            reference_geometry,
+            source_geometry,
+        ):
+            raise ValueError(
+                "Saved texture revisions do not share the displayed face "
+                "index layout. The existing object was kept."
+            )
+        if reference_result is None and raw_path == request.reference_asset_path:
+            reference_result = result
+        edited_glbs.append((raw_path, result.glb_bytes))
+        retained_face_counts.append(result.retained_face_count)
+    if reference_result is None:
+        raise ValueError("The displayed face-edit revision is unavailable.")
+    if any(
+        retained_face_count != reference_result.retained_face_count
+        for retained_face_count in retained_face_counts
+    ):
+        raise ValueError("Face deletion changed inconsistent saved revisions.")
+    edited_by_path = dict(edited_glbs)
+    preview_model = import_generated_glb(
+        edited_by_path[request.reference_asset_path]
+    )
+    if len(preview_model.mesh.faces) != reference_result.retained_face_count:
+        raise ValueError("Face deletion exported an unexpected face count.")
+    return PreparedObjectFaceDeletion(
+        request=request,
+        reference_result=reference_result,
+        edited_glbs=tuple(edited_glbs),
+        preview_model=preview_model,
+    )
+
+
+def _face_edit_geometry_matches(
+    reference: ObjectFaceGeometry,
+    candidate: ObjectFaceGeometry,
+) -> bool:
+    """Require identical ordered world triangles across texture revisions."""
+
+    if reference.faces.shape != candidate.faces.shape:
+        return False
+    reference_triangles = reference.vertices[reference.faces]
+    candidate_triangles = candidate.vertices[candidate.faces]
+    if reference_triangles.shape != candidate_triangles.shape:
+        return False
+    span = np.ptp(reference.vertices, axis=0)
+    scale = max(float(np.max(span)), np.finfo(float).tiny)
+    magnitude = max(
+        float(np.max(np.abs(reference.vertices))),
+        1.0,
+    )
+    tolerance = max(
+        scale * 1e-7,
+        np.finfo(float).eps * magnitude * 64.0,
+    )
+    return bool(
+        np.all(np.isfinite(candidate_triangles))
+        and np.allclose(
+            reference_triangles,
+            candidate_triangles,
+            rtol=0.0,
+            atol=tolerance,
+        )
+    )
+
+
+def _rewrite_face_edit_glb_paths(
+    record: GeneratedObjectRecord,
+    pipeline: dict[str, object],
+    replacement_paths: Mapping[str, str],
+) -> str:
+    """Point every saved geometry revision at its edited GLB counterpart."""
+
+    try:
+        next_asset_path = replacement_paths[
+            _normalize_face_edit_asset_path(record.asset_path)
+        ]
+    except KeyError as error:
+        raise ValueError("The displayed face-edit GLB was not saved.") from error
+    for pipeline_key in MESHY_REVISION_ASSET_PIPELINE_KEYS:
+        raw_path = pipeline.get(pipeline_key)
+        normalized_path = (
+            _normalize_face_edit_asset_path(raw_path)
+            if isinstance(raw_path, str)
+            else None
+        )
+        if normalized_path in replacement_paths:
+            pipeline[pipeline_key] = replacement_paths[normalized_path]
+    raw_variants = pipeline.get(TEXTURE_VARIANTS_PIPELINE_KEY)
+    if isinstance(raw_variants, dict):
+        for raw_variant in raw_variants.values():
+            if not isinstance(raw_variant, dict):
+                continue
+            raw_glb_path = raw_variant.get(TEXTURE_VARIANT_GLB_PATH_KEY)
+            normalized_path = (
+                _normalize_face_edit_asset_path(raw_glb_path)
+                if isinstance(raw_glb_path, str)
+                else None
+            )
+            if normalized_path in replacement_paths:
+                raw_variant[TEXTURE_VARIANT_GLB_PATH_KEY] = (
+                    replacement_paths[normalized_path]
+                )
+    if not isinstance(pipeline.get("postprocessed_asset_path"), str):
+        canonical_resolution = _canonical_texture_resolution(record)
+        canonical_variant = (
+            raw_variants.get(str(canonical_resolution))
+            if isinstance(raw_variants, dict)
+            else None
+        )
+        pipeline["postprocessed_asset_path"] = (
+            canonical_variant.get(TEXTURE_VARIANT_GLB_PATH_KEY)
+            if isinstance(canonical_variant, dict)
+            else next_asset_path
+        )
+    return next_asset_path
+
+
+# ### Local face-edit worker ###
+class ObjectFaceDeletionWorker(QObject):
+    """Delete faces from every selectable GLB without blocking Qt."""
+
+    succeeded = Signal(object, object)
+    failed = Signal(str)
+    finished = Signal()
+    progress = Signal(str)
+
+    def __init__(
+        self,
+        request: ObjectFaceDeletionRequest,
+        asset_directory: Path,
+    ) -> None:
+        super().__init__()
+        self._request = request
+        self._asset_directory = Path(asset_directory)
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            _raise_if_generation_cancelled(self._cancel_event)
+            self.progress.emit("Deleting selected faces (10%)")
+            request = self._request
+            result = _run_interruptible_stage(
+                lambda: _prepare_object_face_deletion(
+                    self._asset_directory,
+                    request,
+                ),
+                self._cancel_event,
+            )
+            _raise_if_generation_cancelled(self._cancel_event)
+            self.progress.emit("Existing UVs and textures retained (90%)")
+        except _GenerationCancelled:
+            return
+        except Exception as error:
+            if not self._cancel_event.is_set():
+                self.failed.emit(str(error).strip() or error.__class__.__name__)
+            return
+        else:
+            self.succeeded.emit(result, None)
+        finally:
+            self.finished.emit()
 
 
 # ### Generation workspace ###
@@ -1401,13 +2194,20 @@ class GenerationWorkspace(QWidget):
         self._object_job_runtimes: dict[str, _ObjectJobRuntime] = {}
         self._generation_thread: QThread | None = None
         self._generation_worker: (
-            GenerationWorker | TextureRegenerationWorker | None
+            GenerationWorker
+            | TextureRegenerationWorker
+            | ObjectFaceDeletionWorker
+            | None
         ) = None
         self._generated_model: GeneratedModel | None = None
         self._generated_model_cache: dict[str, GeneratedModel] = {}
         self._generated_model_cache_revisions: dict[
             str,
             tuple[object, ...],
+        ] = {}
+        self._object_face_geometry_cache: dict[
+            tuple[object, ...],
+            ObjectFaceGeometry,
         ] = {}
         self._displayed_object_snapshot: tuple[object, ...] | None = None
         self._texture_resolution_entry_cache: dict[
@@ -1460,10 +2260,19 @@ class GenerationWorkspace(QWidget):
         cached_entries = self._texture_resolution_entry_cache.get(
             record.object_id
         )
+        selection_context_token = (
+            _build_object_face_selection_context_token(
+                record,
+                self._asset_directory,
+            )
+        )
         if (
             display_snapshot == self._displayed_object_snapshot
             and self._generated_model is not None
             and self.result_view.model is self._generated_model
+            and self.result_view.face_edit_face_count > 0
+            and self.texture_view.uv_face_selection_context_token
+            == selection_context_token
             and cached_entries is not None
             and cached_entries[0] == texture_signature
         ):
@@ -1507,6 +2316,7 @@ class GenerationWorkspace(QWidget):
             self.show_frame(self._data.current_frame_index)
         self._generated_model_cache.clear()
         self._generated_model_cache_revisions.clear()
+        self._object_face_geometry_cache.clear()
         self._displayed_object_snapshot = None
         self._texture_resolution_entry_cache.clear()
         self._is_rebuilding_generation_data = True
@@ -1727,6 +2537,8 @@ class GenerationWorkspace(QWidget):
 
         if not isinstance(record, GeneratedObjectRecord):
             return None
+        if record.pipeline.get(FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY) is True:
+            return None
         try:
             normalized_resolution = int(resolution)
         except (TypeError, ValueError):
@@ -1736,7 +2548,77 @@ class GenerationWorkspace(QWidget):
         variant = _get_texture_variant_metadata(record, normalized_resolution)
         if variant is None:
             return None
-        texture_relative_path = variant[TEXTURE_VARIANT_PNG_PATH_KEY]
+        return self._resolve_texture_image_variant_path(
+            record,
+            normalized_resolution,
+            variant[TEXTURE_VARIANT_PNG_PATH_KEY],
+        )
+
+    def get_atlas_texture_image_variant(
+        self,
+        object_id: str,
+        resolution: int,
+    ) -> ObjectTextureImageVariant | None:
+        """Resolve a current texture or a face-edit Atlas placeholder."""
+
+        current_variant = self.get_texture_image_variant(
+            object_id,
+            resolution,
+        )
+        if current_variant is not None:
+            return current_variant
+        record = self._find_generated_object_record(object_id)
+        if record is None:
+            return None
+        return self.resolve_atlas_texture_image_variant_for_record(
+            record,
+            resolution,
+        )
+
+    def resolve_atlas_texture_image_variant_for_record(
+        self,
+        record: GeneratedObjectRecord,
+        resolution: int,
+    ) -> ObjectTextureImageVariant | None:
+        """Resolve prepared Atlas pixels without exposing stale UI variants."""
+
+        if not isinstance(record, GeneratedObjectRecord):
+            return None
+        if record.pipeline.get(FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY) is not True:
+            return self.resolve_texture_image_variant_for_record(
+                record,
+                resolution,
+            )
+        try:
+            normalized_resolution = int(resolution)
+        except (TypeError, ValueError):
+            return None
+        if normalized_resolution not in _selectable_texture_resolutions(record):
+            return None
+        raw_placeholders = record.pipeline.get(
+            FACE_EDIT_ATLAS_PLACEHOLDERS_PIPELINE_KEY
+        )
+        if not isinstance(raw_placeholders, Mapping):
+            return None
+        texture_relative_path = raw_placeholders.get(
+            str(normalized_resolution)
+        )
+        if not isinstance(texture_relative_path, str):
+            return None
+        return self._resolve_texture_image_variant_path(
+            record,
+            normalized_resolution,
+            texture_relative_path,
+        )
+
+    def _resolve_texture_image_variant_path(
+        self,
+        record: GeneratedObjectRecord,
+        resolution: int,
+        texture_relative_path: str,
+    ) -> ObjectTextureImageVariant | None:
+        """Resolve one contained PNG path into a public image variant."""
+
         try:
             texture_path = self._resolve_generated_asset_path(
                 texture_relative_path,
@@ -1749,7 +2631,7 @@ class GenerationWorkspace(QWidget):
         return ObjectTextureImageVariant(
             object_id=record.object_id,
             object_name=record.object_name,
-            resolution=normalized_resolution,
+            resolution=resolution,
             texture_asset_relative_path=texture_relative_path,
             texture_asset_path=texture_path,
         )
@@ -2018,6 +2900,34 @@ class GenerationWorkspace(QWidget):
             return False
         return self.delete_generated_object(self._selected_object_id)
 
+    def delete_selected_object_faces(self) -> bool:
+        """Start a local face deletion for the current viewer selection."""
+
+        self.result_view.cancel_transient_pointer_interactions()
+        self._sync_face_selection_outputs()
+        record = self._find_generated_object_record(self._selected_object_id)
+        selected_faces = self.result_view.get_selected_face_indices()
+        if record is None or not selected_faces:
+            return False
+        if self._object_has_active_mutation_job(record.object_id):
+            self.status_label.setText(
+                "Wait for this object's active job to finish before editing it."
+            )
+            return False
+        generated_model = self._generated_model
+        if (
+            generated_model is None
+            or self.result_view.model is not generated_model
+        ):
+            return False
+        request = ObjectFaceDeletionRequest(
+            object_id=record.object_id,
+            reference_asset_path=record.asset_path,
+            source_asset_paths=_get_face_edit_glb_asset_paths(record),
+            selected_face_indices=selected_faces,
+        )
+        return self._start_object_face_deletion(request, record)
+
     def regenerate_selected_object_texture(self) -> bool:
         """Compatibility alias for :meth:`generate_selected_object_texture`."""
 
@@ -2101,6 +3011,7 @@ class GenerationWorkspace(QWidget):
         operation = str(snapshot.get("operation", "object change"))
         operation_label = {
             OBJECT_OPERATION_GENERATE_TEXTURE: "texture generation",
+            OBJECT_OPERATION_DELETE_FACES: "face deletion",
         }.get(operation, "object change")
         status_suffix = (
             " Some superseded files could not be removed."
@@ -2159,6 +3070,7 @@ class GenerationWorkspace(QWidget):
         deleted_record = self._data.generated_objects.pop(record_index)
         self._generated_model_cache.pop(object_id, None)
         self._generated_model_cache_revisions.pop(object_id, None)
+        self._discard_object_face_geometry_cache(object_id)
         self._texture_resolution_entry_cache.pop(object_id, None)
         asset_cleanup_failed = self._delete_unreferenced_object_assets(
             deleted_record
@@ -2414,6 +3326,71 @@ class GenerationWorkspace(QWidget):
         self._sync_controls()
         return True
 
+    def _start_object_face_deletion(
+        self,
+        request: ObjectFaceDeletionRequest,
+        record: GeneratedObjectRecord,
+    ) -> bool:
+        """Run one exact face-edit snapshot on an independent worker."""
+
+        if (
+            request.object_id != record.object_id
+            or self._object_has_active_mutation_job(record.object_id)
+        ):
+            return False
+        self.result_view.cancel_transient_pointer_interactions()
+        operation = _ActiveObjectOperation(
+            kind=OBJECT_OPERATION_DELETE_FACES,
+            target_object_id=record.object_id,
+        )
+        thread = QThread(self)
+        worker = ObjectFaceDeletionWorker(request, self._asset_directory)
+        relay = _ObjectJobSignalRelay(operation.operation_id, self)
+        managed_job_id = self._create_managed_job(
+            operation,
+            kind=GENERATION_JOB_KIND_FACE_EDIT,
+            requested_name=None,
+            default_name=f"Face edit: {record.object_name}",
+            stage="Preparing face deletion...",
+        )
+        runtime = _ObjectJobRuntime(
+            operation=operation,
+            thread=thread,
+            worker=worker,
+            relay=relay,
+            managed_job_id=managed_job_id,
+            record_snapshot=replace(
+                record,
+                pipeline=copy.deepcopy(record.pipeline),
+            ),
+            source_asset_revision=_build_face_edit_source_revisions(
+                self._asset_directory,
+                request.source_asset_paths,
+            ),
+        )
+        self._register_object_job_runtime(runtime)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(relay.forward_pair_succeeded)
+        worker.failed.connect(relay.forward_failed)
+        worker.progress.connect(relay.forward_progress)
+        relay.pair_succeeded.connect(
+            self._handle_job_face_deletion_succeeded
+        )
+        relay.failed.connect(self._handle_job_face_deletion_failed)
+        relay.progress.connect(self._handle_job_generation_progress)
+        relay.thread_finished.connect(
+            self._handle_object_job_thread_finished
+        )
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(relay.forward_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        self.status_label.setText("Preparing face deletion...")
+        thread.start()
+        self._sync_controls()
+        return True
+
     # ### Multi-job runtime helpers ###
     def _take_requested_job_name(self) -> str:
         """Snapshot and clear the optional name for the next accepted job."""
@@ -2611,15 +3588,39 @@ class GenerationWorkspace(QWidget):
             OBJECT_GENERATION_AMBIENT_LIGHT_INTENSITY
         )
         self.generated_objects_list = self.object_3d_panel.object_list
+        self.face_selection_xray_checkbox = (
+            self.object_3d_panel.face_selection_xray_checkbox
+        )
+        self.face_selection_count_label = (
+            self.object_3d_panel.face_selection_count_label
+        )
+        self.delete_selected_faces_button = (
+            self.object_3d_panel.delete_faces_button
+        )
         self.delete_generated_object_button = (
             self.object_3d_panel.delete_object_button
         )
         self.model_statistics_label = self.object_3d_panel.statistics_label
+        self.object_3d_panel.projection_camera_percentages_changed.connect(
+            self._sync_controls
+        )
         self.generated_objects_list.currentItemChanged.connect(
             self._handle_generated_object_selection_changed
         )
         self.delete_generated_object_button.clicked.connect(
             self._handle_delete_generated_object_clicked
+        )
+        self.face_selection_xray_checkbox.toggled.connect(
+            self.result_view.set_face_selection_xray_enabled
+        )
+        self.result_view.face_selection_changed.connect(
+            self._handle_face_selection_changed
+        )
+        self.delete_selected_faces_button.clicked.connect(
+            self._handle_delete_selected_faces_clicked
+        )
+        self.result_view.delete_requested.connect(
+            self._handle_delete_selected_faces_clicked
         )
 
         self.object_3d_page = _build_labeled_view(
@@ -2633,6 +3634,9 @@ class GenerationWorkspace(QWidget):
         self.texture_view.setObjectName("object_texture_resolution_view")
         self.texture_view.atlas_selected.connect(
             self._handle_texture_resolution_selected
+        )
+        self.texture_view.uv_face_selection_requested.connect(
+            self._handle_texture_uv_face_selection_requested
         )
         self.texture_view_page = _build_labeled_view(
             "Texture resolution",
@@ -2849,7 +3853,7 @@ class GenerationWorkspace(QWidget):
         self.undo_object_change_button.setMinimumHeight(38)
         self.undo_object_change_button.setToolTip(
             "Restore the selected object to its state before the latest "
-            "Generate texture operation."
+            "texture generation or face deletion."
         )
         self.undo_object_change_button.clicked.connect(
             self.undo_selected_object_change
@@ -2862,8 +3866,8 @@ class GenerationWorkspace(QWidget):
         )
         self.cancel_operation_button.setMinimumHeight(38)
         self.cancel_operation_button.setToolTip(
-            "Cancel the current generation operation and restore "
-            "the object state from before it started."
+            "Cancel the current object operation and restore the object "
+            "state from before it started."
         )
         self.cancel_operation_button.clicked.connect(
             self.cancel_current_operation
@@ -2892,6 +3896,73 @@ class GenerationWorkspace(QWidget):
             self.load_video(file_path)
         except (RuntimeError, ValueError) as error:
             QMessageBox.critical(self, "Video load failed", str(error))
+
+    @Slot(object)
+    def _handle_face_selection_changed(self, _raw_indices: object) -> None:
+        """Push the authoritative viewer selection to every output."""
+
+        self._sync_face_selection_outputs()
+
+    def _sync_face_selection_outputs(self) -> None:
+        """Synchronize the UV view, count, and deletion state from one source."""
+
+        selected_indices = self.result_view.get_selected_face_indices()
+        selected_count = len(selected_indices)
+        self.texture_view.set_selected_uv_face_indices(selected_indices)
+        self.face_selection_count_label.setText(
+            "No faces selected"
+            if selected_count == 0
+            else f"{selected_count:,} face"
+            + ("" if selected_count == 1 else "s")
+            + " selected"
+        )
+        self._sync_controls()
+
+    @Slot(object)
+    def _handle_texture_uv_face_selection_requested(
+        self,
+        raw_request: object,
+    ) -> None:
+        """Apply a 2D UV hit through the authoritative 3D face selection."""
+
+        if not isinstance(raw_request, UvFaceSelectionRequest):
+            return
+        record = self._find_generated_object_record(self._selected_object_id)
+        expected_context_token = (
+            None
+            if record is None
+            else _build_object_face_selection_context_token(
+                record,
+                self._asset_directory,
+            )
+        )
+        if (
+            record is None
+            or self._object_has_active_mutation_job(record.object_id)
+            or not self.texture_view.uv_face_selection_enabled
+            or raw_request.context_token != expected_context_token
+            or self.texture_view.uv_face_selection_context_token
+            != expected_context_token
+        ):
+            self._sync_face_selection_outputs()
+            return
+        face_count = self.result_view.face_edit_face_count
+        hits = set(raw_request.face_indices)
+        if any(index < 0 or index >= face_count for index in hits):
+            self._sync_face_selection_outputs()
+            return
+        self.result_view.cancel_face_selection_interaction()
+        if not hits:
+            self._sync_face_selection_outputs()
+            return
+        self.result_view.update_face_selection(
+            hits,
+            mode=FACE_SELECTION_TOGGLE,
+        )
+
+    @Slot()
+    def _handle_delete_selected_faces_clicked(self) -> None:
+        self.delete_selected_object_faces()
 
     @Slot()
     def _handle_delete_generated_object_clicked(self) -> None:
@@ -3112,6 +4183,194 @@ class GenerationWorkspace(QWidget):
             if isinstance(worker, TextureRegenerationWorker):
                 worker.claim_saved_output()
 
+    @Slot(str, object, object)
+    def _handle_job_face_deletion_succeeded(
+        self,
+        operation_id: str,
+        raw_result: object,
+        _unused_preview: object,
+    ) -> None:
+        """Commit one background face edit only if its source is unchanged."""
+
+        if self._should_ignore_operation_result(
+            OBJECT_OPERATION_DELETE_FACES,
+            operation_id,
+        ):
+            return
+        runtime = self._object_job_runtimes.get(str(operation_id))
+        if runtime is None:
+            return
+        self._set_legacy_active_job_runtime(runtime)
+        prepared = raw_result
+        snapshot = runtime.record_snapshot
+        if (
+            not isinstance(prepared, PreparedObjectFaceDeletion)
+            or snapshot is None
+        ):
+            self._handle_job_face_deletion_failed(
+                operation_id,
+                "The local face-edit result is invalid.",
+            )
+            return
+        record = self._find_generated_object_record(snapshot.object_id)
+        if (
+            record is None
+            or record != snapshot
+            or _build_face_edit_source_revisions(
+                self._asset_directory,
+                prepared.request.source_asset_paths,
+            )
+            != runtime.source_asset_revision
+        ):
+            self._handle_job_face_deletion_failed(
+                operation_id,
+                "The object changed before its face edit could be applied.",
+            )
+            return
+
+        persisted_paths: list[str] = []
+        try:
+            if prepared.request.object_id != record.object_id:
+                raise ValueError(
+                    "The face-edit result targets a different object."
+                )
+            result = prepared.reference_result
+            face_edit_id = uuid.uuid4().hex
+            replacement_paths: dict[str, str] = {}
+            for source_index, (source_path, edited_glb) in enumerate(
+                prepared.edited_glbs,
+                start=1,
+            ):
+                persisted_path = self._persist_meshy_named_asset(
+                    f"{record.object_id}.face-edit-{face_edit_id}."
+                    f"revision-{source_index}.glb",
+                    edited_glb,
+                )
+                persisted_paths.append(persisted_path)
+                replacement_paths[source_path] = persisted_path
+
+            next_pipeline = copy.deepcopy(record.pipeline)
+            next_asset_path = _rewrite_face_edit_glb_paths(
+                record,
+                next_pipeline,
+                replacement_paths,
+            )
+            preview_model = prepared.preview_model
+            preview_revision = _build_generation_asset_revision(
+                self._asset_directory,
+                next_asset_path,
+            )
+            if preview_revision[1] is None:
+                raise OSError("The saved face-edit revision is unavailable.")
+            raw_revision = record.pipeline.get(
+                FACE_EDIT_REVISION_PIPELINE_KEY,
+                0,
+            )
+            try:
+                face_edit_revision = max(int(raw_revision), 0) + 1
+            except (TypeError, ValueError):
+                face_edit_revision = 1
+            next_pipeline.pop(FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY, None)
+            next_pipeline.pop(
+                FACE_EDIT_ATLAS_PLACEHOLDERS_PIPELINE_KEY,
+                None,
+            )
+            next_pipeline.pop("face_edit_uv_utilization", None)
+            for pipeline_key in FACE_EDIT_INVALIDATED_UV_PROVENANCE_PIPELINE_KEYS:
+                next_pipeline.pop(pipeline_key, None)
+            next_pipeline.update(
+                {
+                    FACE_EDIT_REVISION_PIPELINE_KEY: face_edit_revision,
+                    LOCALLY_AUTHORED_UVS_PIPELINE_KEY: True,
+                    "face_edit_texture_preserved": (
+                        result.preserved_textured_uvs
+                    ),
+                    "face_edit_original_face_count": (
+                        result.original_face_count
+                    ),
+                    "face_edit_retained_face_count": (
+                        result.retained_face_count
+                    ),
+                    "face_edit_deleted_face_count": (
+                        result.deleted_face_count
+                    ),
+                }
+            )
+            replacement = replace(
+                record,
+                asset_path=next_asset_path,
+                pipeline=_push_object_operation_undo_snapshot(
+                    record,
+                    next_pipeline,
+                    operation=OBJECT_OPERATION_DELETE_FACES,
+                ),
+            )
+        except Exception as error:
+            self._remove_newly_persisted_assets(persisted_paths)
+            self._handle_job_face_deletion_failed(
+                operation_id,
+                f"The edited object could not be saved: {error}",
+            )
+            return
+
+        if not self._request_object_packing_change(
+            record,
+            replacement,
+            preview_model,
+            preview_asset_revision=preview_revision,
+        ):
+            self._remove_newly_persisted_assets(persisted_paths)
+            self._handle_job_face_deletion_failed(
+                operation_id,
+                "The Atlas packing change could not be committed.",
+            )
+            return
+
+        self._record_operation_commit(
+            OBJECT_OPERATION_DELETE_FACES,
+            record.object_id,
+            operation_id,
+        )
+        cleanup_failed = self._delete_unreferenced_object_assets(record)
+        status = (
+            f"Deleted {result.deleted_face_count:,} face"
+            + ("" if result.deleted_face_count == 1 else "s")
+            + f" from {record.object_name}. "
+            + (
+                "Its existing UVs and texture were retained."
+                if result.preserved_textured_uvs
+                else "Its remaining material data was retained."
+            )
+            + (
+                " Some superseded files could not be removed."
+                if cleanup_failed
+                else ""
+            )
+        )
+        self.status_label.setText(status)
+        self._emit_data_changed()
+        self.generated_object_changed.emit(replacement, preview_model)
+        self._complete_managed_job(runtime, status)
+
+    @Slot(str, str)
+    def _handle_job_face_deletion_failed(
+        self,
+        operation_id: str,
+        error_message: str,
+    ) -> None:
+        if self._should_ignore_operation_result(
+            OBJECT_OPERATION_DELETE_FACES,
+            operation_id,
+        ):
+            return
+        runtime = self._object_job_runtimes.get(str(operation_id))
+        if runtime is None:
+            return
+        self._set_legacy_active_job_runtime(runtime)
+        message = f"Face deletion failed: {str(error_message)}"
+        self.status_label.setText(message)
+        self._fail_managed_job(runtime, message)
+
     @Slot(object, object)
     def _handle_generation_succeeded(
         self,
@@ -3160,7 +4419,17 @@ class GenerationWorkspace(QWidget):
         pipeline: dict[str, object] = {}
         persisted_asset_paths: list[str] = []
         symmetry: ObjectSymmetricDivisionMetadata | None = None
+        scan_projection_stats: ScanProjectionStats | None = None
+        variant_metadata: dict[str, dict[str, str]] | None = None
         try:
+            if isinstance(result, ScanProjectedMeshyGenerationResult):
+                scan_projection_stats = result.scan_projection_stats
+                if scan_projection_stats is not None:
+                    pipeline.update(
+                        _build_scan_projection_pipeline_metadata(
+                            scan_projection_stats
+                        )
+                    )
             geometry_only = (
                 isinstance(result, StagedMeshyGenerationResult)
                 and result.geometry_only
@@ -3175,25 +4444,41 @@ class GenerationWorkspace(QWidget):
                 and generation_request.symmetric_division_enabled
             )
             if symmetric_division_was_requested:
-                if geometry_only or not isinstance(
-                    texture_variants,
-                    ObjectTextureVariants,
-                ):
+                if geometry_only:
                     raise ValueError(
                         "Symmetric division requires a newly generated "
                         "textured model."
+                    )
+                if not isinstance(texture_variants, ObjectTextureVariants):
+                    raise ValueError(
+                        "Symmetric division requires a newly generated "
+                        "textured model."
+                    )
+                symmetric_builder_kwargs: dict[str, object] = {}
+                if _uses_weighted_camera_projection(generation_request):
+                    symmetric_builder_kwargs.update(
+                        {
+                            "projection_camera_percentages": (
+                                generation_request.projection_camera_percentages
+                            ),
+                            "cancellation_check": None,
+                        }
                     )
                 division_result = build_automatic_symmetric_object_variants(
                     texture_variants.glb_by_resolution[
                         TEXTURE_RESOLUTION_2048
                     ],
                     generation_request.symmetric_division_orientation,
+                    **symmetric_builder_kwargs,
                 )
                 symmetry = _validate_automatic_symmetric_division_result(
                     division_result,
                     generation_request.symmetric_division_orientation,
                 )
                 texture_variants = division_result.variants
+                scan_projection_stats = (
+                    division_result.scan_projection_stats
+                )
             if texture_variants is None:
                 asset_path = self._persist_meshy_asset(
                     object_id,
@@ -3235,37 +4520,31 @@ class GenerationWorkspace(QWidget):
                     result.source_glb_bytes,
                 )
                 persisted_asset_paths.append(source_asset_path)
-                staged_pipeline: dict[str, object] = {
-                    "mode": _staged_generation_mode(result),
-                    "geometry_task_id": result.geometry_task_id,
-                    "source_asset_path": source_asset_path,
-                    "unused_face_removal_applied": (
-                        _staged_result_used_face_removal(result)
-                    ),
-                    "geometry_only": result.geometry_only,
-                }
+                staged_pipeline = _build_staged_generation_pipeline_metadata(
+                    result,
+                    source_asset_path,
+                )
                 if symmetry is None:
                     postprocessed_asset_path = (
-                        self._persist_meshy_revision_asset(
-                            object_id,
-                            MESHY_REVISION_POSTPROCESSED,
-                            result.postprocessed_glb_bytes,
+                        _resolve_staged_postprocessed_asset_path(
+                            result,
+                            asset_path,
+                            variant_metadata,
                         )
                     )
-                    persisted_asset_paths.append(postprocessed_asset_path)
+                    if postprocessed_asset_path is None:
+                        postprocessed_asset_path = (
+                            self._persist_meshy_revision_asset(
+                                object_id,
+                                MESHY_REVISION_POSTPROCESSED,
+                                result.postprocessed_glb_bytes,
+                            )
+                        )
+                        persisted_asset_paths.append(postprocessed_asset_path)
                     staged_pipeline["postprocessed_asset_path"] = (
                         postprocessed_asset_path
                     )
                 pipeline.update(staged_pipeline)
-                if _staged_result_used_face_removal(result):
-                    pipeline.update(
-                        {
-                            "original_face_count": result.original_face_count,
-                            "retained_face_count": result.retained_face_count,
-                            "removed_face_count": result.removed_face_count,
-                            "protected_face_count": result.protected_face_count,
-                        }
-                    )
             if symmetry is not None:
                 assert isinstance(
                     texture_variants,
@@ -3275,6 +4554,7 @@ class GenerationWorkspace(QWidget):
                     pipeline,
                     symmetry,
                     variant_metadata,
+                    scan_projection_stats=scan_projection_stats,
                 )
         except Exception as error:
             self._remove_newly_persisted_assets(persisted_asset_paths)
@@ -3331,6 +4611,11 @@ class GenerationWorkspace(QWidget):
                 self.status_label.setText(
                     _format_staged_generation_status(object_name, result)
                 )
+        elif isinstance(result, ScanProjectedMeshyGenerationResult):
+            self.status_label.setText(
+                f"Generated: {object_name}. Applied weighted camera "
+                "scan-projection UVs."
+            )
         else:
             self.status_label.setText(f"Generated: {object_name}")
         if symmetry is not None:
@@ -3427,6 +4712,11 @@ class GenerationWorkspace(QWidget):
                     if result.geometry_only
                     else "Generated"
                 ),
+            )
+        elif isinstance(result, ScanProjectedMeshyGenerationResult):
+            status = (
+                f"Generated: {object_name}. Applied weighted camera "
+                "scan-projection UVs."
             )
         else:
             status = f"Generated: {object_name}"
@@ -3839,7 +5129,10 @@ class GenerationWorkspace(QWidget):
                 object_id,
                 allow_operation_id=operation_id,
             )
-        if operation.kind != OBJECT_OPERATION_GENERATE_TEXTURE:
+        if operation.kind not in {
+            OBJECT_OPERATION_GENERATE_TEXTURE,
+            OBJECT_OPERATION_DELETE_FACES,
+        }:
             return False
         if operation.target_object_id != object_id:
             return False
@@ -3877,6 +5170,14 @@ class GenerationWorkspace(QWidget):
                 else "The existing texture was kept."
             )
             self.status_label.setText("Texture generation cancelled. " + outcome)
+            return
+        if operation.kind == OBJECT_OPERATION_DELETE_FACES:
+            outcome = (
+                "The previous geometry was restored."
+                if had_commit
+                else "The existing geometry was kept."
+            )
+            self.status_label.setText("Face deletion cancelled. " + outcome)
             return
         self.status_label.setText("Operation cancelled.")
 
@@ -3935,7 +5236,11 @@ class GenerationWorkspace(QWidget):
         self._set_legacy_active_job_runtime(
             self._legacy_active_job_runtime()
         )
-        self._sync_controls()
+        if operation.kind == OBJECT_OPERATION_DELETE_FACES:
+            self.result_view.cancel_transient_pointer_interactions()
+            self._sync_face_selection_outputs()
+        else:
+            self._sync_controls()
 
     def _build_generation_request(
         self,
@@ -3961,6 +5266,25 @@ class GenerationWorkspace(QWidget):
             self.symmetric_division_orientation_combo.currentData()
             or SYMMETRIC_DIVISION_ORIENTATION_VERTICAL
         )
+        projection_camera_percentages = (
+            self.object_3d_panel.get_projection_camera_percentages()
+        )
+        projection_camera_percentages_are_valid = (
+            sum(projection_camera_percentages) == 100
+        )
+        if (
+            not geometry_only
+            and self._settings.use_uv_raycast_for_object_generation
+            and not projection_camera_percentages_are_valid
+        ):
+            self.status_label.setText(
+                "Projection camera texture allocations must total 100%."
+            )
+            return None
+        if not projection_camera_percentages_are_valid:
+            projection_camera_percentages = (
+                DEFAULT_PROJECTION_CAMERA_PERCENTAGES
+            )
         return GenerationRequest(
             frame_index=self._data.current_frame_index,
             selected_object_bgra=selected_crop,
@@ -3969,6 +5293,9 @@ class GenerationWorkspace(QWidget):
             symmetric_division_enabled=symmetric_division_enabled,
             symmetric_division_orientation=(
                 symmetric_division_orientation
+            ),
+            projection_camera_percentages=(
+                projection_camera_percentages
             ),
         )
 
@@ -4002,6 +5329,10 @@ class GenerationWorkspace(QWidget):
             preserve_symmetric_uvs = (
                 _get_object_symmetric_division_metadata(record) is not None
             )
+            enable_original_uv = bool(
+                preserve_symmetric_uvs
+                or record.pipeline.get(LOCALLY_AUTHORED_UVS_PIPELINE_KEY)
+            )
             request = _TextureRegenerationPreflight(
                 object_id=record.object_id,
                 reference_frame_index=self._data.current_frame_index,
@@ -4009,7 +5340,7 @@ class GenerationWorkspace(QWidget):
                 source_asset_path=source_asset_path,
                 source_asset_revision=source_asset_revision,
                 settings=self._settings,
-                enable_original_uv=preserve_symmetric_uvs,
+                enable_original_uv=enable_original_uv,
                 preserve_symmetric_uvs=preserve_symmetric_uvs,
             )
         except Exception as error:
@@ -4095,6 +5426,10 @@ class GenerationWorkspace(QWidget):
             has_video and has_mask and not has_untracked_legacy_job
         )
         required_key_is_available = bool(self._settings.meshy_api_key)
+        projection_camera_percentages_are_valid = (
+            not self._settings.use_uv_raycast_for_object_generation
+            or self.object_3d_panel.projection_camera_percentages_are_valid()
+        )
         self.meshy_target_polycount_control.setVisible(True)
         self.meshy_target_polycount_spinbox.setEnabled(
             not has_untracked_legacy_job
@@ -4106,6 +5441,28 @@ class GenerationWorkspace(QWidget):
         self.delete_generated_object_button.setEnabled(
             selected_record is not None
             and not selected_object_is_busy
+        )
+        selected_face_count = len(
+            self.result_view.get_selected_face_indices()
+        )
+        face_selection_is_available = (
+            selected_record is not None
+            and self.result_view.face_edit_face_count > 0
+            and not selected_object_is_busy
+        )
+        self.face_selection_xray_checkbox.setEnabled(
+            face_selection_is_available
+        )
+        self.delete_selected_faces_button.setEnabled(
+            selected_record is not None
+            and selected_face_count > 0
+            and not selected_object_is_busy
+        )
+        self.result_view.set_face_editing_enabled(
+            face_selection_is_available
+        )
+        self.texture_view.set_uv_face_selection_enabled(
+            face_selection_is_available
         )
         self.regenerate_texture_button.setEnabled(
             self._can_regenerate_object_texture(selected_record)
@@ -4145,6 +5502,7 @@ class GenerationWorkspace(QWidget):
             has_video
             and has_mask
             and required_key_is_available
+            and projection_camera_percentages_are_valid
             and not has_untracked_legacy_job
         )
         self.generate_geometry_button.setEnabled(
@@ -4325,18 +5683,29 @@ class GenerationWorkspace(QWidget):
             record,
             self._asset_directory,
         )
+        selection_context_token = (
+            _build_object_face_selection_context_token(
+                record,
+                self._asset_directory,
+            )
+        )
         if (
             next_snapshot == self._displayed_object_snapshot
             and self._generated_model is not None
             and self.result_view.model is self._generated_model
+            and self.result_view.face_edit_face_count > 0
+            and self.texture_view.uv_face_selection_context_token
+            == selection_context_token
         ):
             self._refresh_object_texture_atlases(record.object_id)
+            self._sync_face_selection_outputs()
             return
         self._displayed_object_snapshot = None
         self._generated_model = None
+        self.result_view.cancel_transient_pointer_interactions()
         self.result_view.clear_model()
         self._sync_model_statistics(None)
-        self.texture_view.set_uv_overlay_triangles(())
+        self.texture_view.clear()
         try:
             generated_model = self._load_generated_object_model(record)
         except Exception as error:
@@ -4344,22 +5713,52 @@ class GenerationWorkspace(QWidget):
                 f"Saved generated object could not be rebuilt: {error}"
             )
             self._refresh_object_texture_atlases(record.object_id)
+            self._sync_face_selection_outputs()
             return
+        next_snapshot = _build_generated_object_display_snapshot(
+            record,
+            self._asset_directory,
+        )
+        selection_context_token = (
+            _build_object_face_selection_context_token(
+                record,
+                self._asset_directory,
+            )
+        )
         self._generated_model = generated_model
         self.result_view.set_model(generated_model)
+        try:
+            face_geometry = self._load_object_face_geometry(
+                record,
+                generated_model,
+            )
+            self.result_view.set_face_edit_geometry(
+                face_geometry.vertices,
+                face_geometry.faces,
+            )
+            self.texture_view.set_uv_overlay_triangles(
+                face_geometry.uv_triangles
+            )
+            self.texture_view.set_uv_face_selection_geometry(
+                face_geometry.uv_triangles,
+                face_geometry.uv_face_indices,
+                context_token=selection_context_token,
+            )
+        except Exception as error:
+            self.status_label.setText(
+                f"This object's faces cannot be edited: {error}"
+            )
         symmetry = _get_object_symmetric_division_metadata(record)
         self.result_view.set_symmetric_division_preview(
             None if symmetry is None else symmetry.orientation,
             None if symmetry is None else symmetry.plane_coordinate,
         )
         self._sync_model_statistics(generated_model)
-        self.texture_view.set_uv_overlay_triangles(
-            _collect_model_uv_triangles(generated_model)
-        )
         self._refresh_object_texture_atlases(
             record.object_id,
         )
         self._displayed_object_snapshot = next_snapshot
+        self._sync_face_selection_outputs()
 
     def _repair_missing_active_texture_variant(
         self,
@@ -4416,18 +5815,21 @@ class GenerationWorkspace(QWidget):
         return record
 
     def _clear_generated_object_display(self) -> None:
+        self.result_view.cancel_transient_pointer_interactions()
         if (
             self._displayed_object_snapshot is None
             and self._generated_model is None
             and self.result_view.model is None
             and not self.texture_view.entries
         ):
+            self._sync_face_selection_outputs()
             return
         self._displayed_object_snapshot = None
         self._generated_model = None
         self.result_view.clear_model()
         self._sync_model_statistics(None)
         self.texture_view.clear()
+        self._sync_face_selection_outputs()
 
     def _refresh_object_texture_atlases(
         self,
@@ -4611,6 +6013,9 @@ class GenerationWorkspace(QWidget):
         packing_change_requires_host = (
             _get_object_symmetric_division_metadata(record) is not None
             or _get_object_symmetric_division_metadata(replacement) is not None
+            or record.pipeline.get(FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY) is True
+            or replacement.pipeline.get(FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY)
+            is True
         )
         if handler is None or not packing_change_requires_host:
             return commit_record()
@@ -4663,6 +6068,51 @@ class GenerationWorkspace(QWidget):
             )
             return generated_model
         raise OSError("The generated GLB changed repeatedly while loading.")
+
+    def _load_object_face_geometry(
+        self,
+        record: GeneratedObjectRecord,
+        model: GeneratedModel,
+    ) -> ObjectFaceGeometry:
+        """Reuse immutable face/UV geometry for one exact asset revision."""
+
+        asset_revision = _build_generation_asset_revision(
+            self._asset_directory,
+            record.asset_path,
+        )
+        cache_key = (record.object_id, *asset_revision)
+        cached = self._object_face_geometry_cache.pop(cache_key, None)
+        if cached is not None:
+            self._object_face_geometry_cache[cache_key] = cached
+            return cached
+        geometry = load_object_face_geometry_from_scene(model.scene)
+        for array in (
+            geometry.vertices,
+            geometry.faces,
+            geometry.uv_triangles,
+            geometry.uv_face_indices,
+        ):
+            array.setflags(write=False)
+        self._object_face_geometry_cache[cache_key] = geometry
+        while (
+            len(self._object_face_geometry_cache)
+            > OBJECT_FACE_GEOMETRY_CACHE_MAX_ENTRIES
+        ):
+            oldest_key = next(iter(self._object_face_geometry_cache))
+            self._object_face_geometry_cache.pop(oldest_key, None)
+        return geometry
+
+    def _discard_object_face_geometry_cache(self, object_id: str) -> None:
+        """Remove every cached asset revision owned by one object."""
+
+        normalized_id = str(object_id)
+        stale_keys = tuple(
+            cache_key
+            for cache_key in self._object_face_geometry_cache
+            if cache_key and cache_key[0] == normalized_id
+        )
+        for cache_key in stale_keys:
+            self._object_face_geometry_cache.pop(cache_key, None)
 
     def _cache_generated_model(
         self,
@@ -4855,10 +6305,26 @@ def _staged_result_used_face_removal(
     )
 
 
+def _staged_result_used_visibility_uv(
+    result: StagedMeshyGenerationResult,
+) -> bool:
+    return result.visibility_uv_stats is not None
+
+
+def _staged_result_used_scan_projection(
+    result: StagedMeshyGenerationResult,
+) -> bool:
+    return result.scan_projection_stats is not None
+
+
 def _staged_generation_mode(result: StagedMeshyGenerationResult) -> str:
     stages: list[str] = []
     if _staged_result_used_face_removal(result):
         stages.append("unused_face_removal")
+    if _staged_result_used_visibility_uv(result):
+        stages.append("visibility_uv_raycast")
+    if _staged_result_used_scan_projection(result):
+        stages.append("weighted_camera_scan_projection")
     stage_mode = "_and_".join(stages)
     if result.geometry_only:
         return (
@@ -4881,7 +6347,127 @@ def _format_staged_generation_status(
             f"Removed {result.removed_face_count} of "
             f"{result.original_face_count} faces."
         )
+    if _staged_result_used_visibility_uv(result):
+        messages.append("Applied visibility-optimized UVs.")
+    if _staged_result_used_scan_projection(result):
+        messages.append("Applied weighted camera scan-projection UVs.")
     return " ".join(messages)
+
+
+def _build_scan_projection_pipeline_metadata(
+    stats: ScanProjectionStats,
+) -> dict[str, object]:
+    """Build stable UV-authority metadata for one scan-projected object."""
+
+    if not isinstance(stats, ScanProjectionStats):
+        raise TypeError("Scan-projection statistics are invalid.")
+    return {
+        LOCALLY_AUTHORED_UVS_PIPELINE_KEY: True,
+        SCAN_PROJECTION_PIPELINE_KEY: stats.to_pipeline_dict(),
+    }
+
+
+def _build_staged_generation_pipeline_metadata(
+    result: StagedMeshyGenerationResult,
+    source_asset_path: str,
+) -> dict[str, object]:
+    """Build one shared persisted description of local generation stages."""
+
+    pipeline: dict[str, object] = {
+        "mode": _staged_generation_mode(result),
+        "geometry_task_id": result.geometry_task_id,
+        "source_asset_path": source_asset_path,
+        "unused_face_removal_applied": (
+            _staged_result_used_face_removal(result)
+        ),
+        "geometry_only": result.geometry_only,
+    }
+    if _staged_result_used_face_removal(result):
+        pipeline.update(
+            {
+                "original_face_count": result.original_face_count,
+                "retained_face_count": result.retained_face_count,
+                "removed_face_count": result.removed_face_count,
+                "protected_face_count": result.protected_face_count,
+            }
+        )
+    stats = result.visibility_uv_stats
+    if stats is not None:
+        pipeline.update(
+            {
+                LOCALLY_AUTHORED_UVS_PIPELINE_KEY: True,
+                VISIBILITY_UV_UNWRAP_PIPELINE_KEY: {
+                    "version": VISIBILITY_UV_UNWRAP_VERSION,
+                    "face_count": stats.face_count,
+                    "instance_face_count": stats.instance_face_count,
+                    "chart_count": stats.chart_count,
+                    "exterior_face_count": stats.exterior_face_count,
+                    "hidden_face_count": stats.hidden_face_count,
+                    "camera_count": stats.camera_count,
+                    "ray_sample_count": stats.ray_sample_count,
+                    "texture_resolution": stats.texture_resolution,
+                    "gutter_pixels": stats.gutter_pixels,
+                    "effective_gutter_pixels": (
+                        stats.effective_gutter_pixels
+                    ),
+                    "effective_horizontal_gutter_pixels": (
+                        stats.effective_horizontal_gutter_pixels
+                    ),
+                    "effective_vertical_gutter_pixels": (
+                        stats.effective_vertical_gutter_pixels
+                    ),
+                    "atlas_width": stats.atlas_width,
+                    "atlas_height": stats.atlas_height,
+                    "atlas_utilization": stats.atlas_utilization,
+                    "target_domain": stats.target_domain,
+                    "packing_strategy": stats.packing_strategy,
+                    "requested_exterior_uv_share": (
+                        stats.requested_exterior_uv_share
+                    ),
+                    "achieved_exterior_uv_share": (
+                        stats.achieved_exterior_uv_share
+                    ),
+                    "uv_triangle_occupancy": stats.uv_triangle_occupancy,
+                },
+            }
+        )
+    scan_stats = result.scan_projection_stats
+    if scan_stats is not None:
+        pipeline.update(
+            _build_scan_projection_pipeline_metadata(scan_stats)
+        )
+    return pipeline
+
+
+def _resolve_staged_postprocessed_asset_path(
+    result: StagedMeshyGenerationResult,
+    asset_path: str,
+    variant_metadata: Mapping[str, Mapping[str, str]] | None,
+) -> str | None:
+    """Reuse an authoritative saved UV GLB instead of writing a duplicate."""
+
+    if not (
+        _staged_result_used_visibility_uv(result)
+        or _staged_result_used_scan_projection(result)
+    ):
+        return None
+    if result.geometry_only:
+        return asset_path
+    canonical_variant = (
+        None
+        if variant_metadata is None
+        else variant_metadata.get(str(TEXTURE_RESOLUTION_2048))
+    )
+    if canonical_variant is None:
+        raise ValueError(
+            "Locally authored UV generation has no canonical texture variant."
+        )
+    canonical_path = canonical_variant.get(TEXTURE_VARIANT_GLB_PATH_KEY)
+    if not isinstance(canonical_path, str) or not canonical_path:
+        raise ValueError(
+            "Locally authored UV generation has no canonical GLB path."
+        )
+    return canonical_path
 
 
 # ### Symmetric-division helpers ###
@@ -4907,17 +6493,17 @@ def _validate_symmetric_texture_regeneration_uvs(
             "The symmetric texture result has no verified UV fingerprint. "
             "The existing texture was kept."
         )
-    _validate_symmetric_uv_retexture_integrity(
+    _validate_preserved_uv_retexture_integrity(
         submitted_fingerprint,
         final_fingerprint,
     )
 
 
-def _validate_symmetric_uv_retexture_integrity(
+def _validate_preserved_uv_retexture_integrity(
     submitted: UvFingerprint,
     returned: UvFingerprint,
 ) -> None:
-    """Reject local reconstruction changes before replacing the object."""
+    """Reject topology or authored-UV changes before replacing the object."""
 
     if submitted.version != returned.version:
         raise UvIntegrityError(
@@ -4926,12 +6512,12 @@ def _validate_symmetric_uv_retexture_integrity(
         )
     if submitted.face_count != returned.face_count:
         raise UvIntegrityError(
-            "HouseMaker could not preserve the symmetric object's face count "
+            "HouseMaker could not preserve the edited object's face count "
             "while applying its new texture. The existing texture was kept."
         )
     if submitted.sha256 != returned.sha256:
         raise UvIntegrityError(
-            "HouseMaker could not preserve the symmetric object's packed UV "
+            "HouseMaker could not preserve the edited object's packed UV "
             "layout while applying its new texture. The existing texture was "
             "kept."
         )
@@ -5119,6 +6705,8 @@ def _build_automatic_symmetric_generation_pipeline(
     raw_pipeline: Mapping[str, object],
     metadata: ObjectSymmetricDivisionMetadata,
     variant_metadata: dict[str, dict[str, str]],
+    *,
+    scan_projection_stats: ScanProjectionStats | None = None,
 ) -> dict[str, object]:
     """Make pair variants the final persisted new-generation revision."""
 
@@ -5137,6 +6725,12 @@ def _build_automatic_symmetric_generation_pipeline(
             SYMMETRIC_DIVISION_PIPELINE_KEY: metadata.to_pipeline_dict(),
         }
     )
+    if scan_projection_stats is not None:
+        pipeline.update(
+            _build_scan_projection_pipeline_metadata(
+                scan_projection_stats
+            )
+        )
     return pipeline
 
 
@@ -5159,7 +6753,10 @@ def _get_object_operation_undo_stack(
         asset_path = raw_snapshot.get("asset_path")
         provider_task_id = raw_snapshot.get("provider_task_id")
         pipeline = raw_snapshot.get("pipeline")
-        if operation != OBJECT_OPERATION_GENERATE_TEXTURE:
+        if operation not in {
+            OBJECT_OPERATION_GENERATE_TEXTURE,
+            OBJECT_OPERATION_DELETE_FACES,
+        }:
             continue
         if not isinstance(asset_path, str) or not asset_path.strip():
             continue
@@ -5188,7 +6785,10 @@ def _push_object_operation_undo_snapshot(
 ) -> dict[str, object]:
     """Attach one bounded pre-operation snapshot to a replacement pipeline."""
 
-    if operation != OBJECT_OPERATION_GENERATE_TEXTURE:
+    if operation not in {
+        OBJECT_OPERATION_GENERATE_TEXTURE,
+        OBJECT_OPERATION_DELETE_FACES,
+    }:
         raise ValueError("Unknown undoable object operation.")
     snapshot_pipeline = copy.deepcopy(record.pipeline)
     snapshot_pipeline.pop(OBJECT_OPERATION_UNDO_STACK_PIPELINE_KEY, None)
@@ -5264,6 +6864,8 @@ def _build_regenerated_texture_pipeline(
     result = outcome.result
     pipeline: dict[str, object] = dict(record.pipeline)
     pipeline.pop(TEXTURE_INPAINT_STROKES_PIPELINE_KEY, None)
+    pipeline.pop(FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY, None)
+    pipeline.pop(FACE_EDIT_ATLAS_PLACEHOLDERS_PIPELINE_KEY, None)
     selected_resolution = _get_selected_texture_resolution(record)
     if selected_resolution not in _selectable_texture_resolutions(record):
         selected_resolution = DEFAULT_TEXTURE_RESOLUTION
@@ -5317,6 +6919,16 @@ def _build_regenerated_texture_pipeline(
             "texture_regeneration_history": history[-25:],
         }
     )
+    if record.pipeline.get(LOCALLY_AUTHORED_UVS_PIPELINE_KEY) is True:
+        canonical_resolution = _canonical_texture_resolution(record)
+        canonical_variant = variant_metadata.get(str(canonical_resolution))
+        if canonical_variant is None:
+            raise ValueError(
+                "The regenerated authored-UV source variant is unavailable."
+            )
+        pipeline["postprocessed_asset_path"] = canonical_variant[
+            TEXTURE_VARIANT_GLB_PATH_KEY
+        ]
     if request.submitted_uv_fingerprint is not None:
         final_fingerprint = outcome.final_uv_fingerprint
         if final_fingerprint is None:
@@ -5349,43 +6961,17 @@ def _build_regenerated_texture_pipeline(
 def _collect_model_uv_triangles(
     model: GeneratedModel,
 ) -> tuple[UvTriangle, ...]:
-    """Return finite per-face UV triangles from every model geometry."""
+    """Return UV triangles in the canonical editable-face traversal order."""
 
-    triangles: list[UvTriangle] = []
-    for _geometry_name, geometry in sorted(
-        model.scene.geometry.items(),
-        key=lambda item: str(item[0]),
-    ):
-        raw_faces = getattr(geometry, "faces", None)
-        raw_uv = getattr(getattr(geometry, "visual", None), "uv", None)
-        if raw_faces is None or raw_uv is None:
-            continue
-        try:
-            faces = np.asarray(raw_faces, dtype=np.int64)
-            uv = np.asarray(raw_uv, dtype=float)
-        except (TypeError, ValueError):
-            continue
-        if (
-            faces.ndim != 2
-            or faces.shape[1:] != (3,)
-            or uv.ndim != 2
-            or uv.shape[1:] != (2,)
-            or not np.all(np.isfinite(uv))
-        ):
-            continue
-        if len(faces) == 0:
-            continue
-        if np.any(faces < 0) or np.any(faces >= len(uv)):
-            continue
-        for triangle in uv[faces]:
-            triangles.append(
-                (
-                    (float(triangle[0, 0]), float(triangle[0, 1])),
-                    (float(triangle[1, 0]), float(triangle[1, 1])),
-                    (float(triangle[2, 0]), float(triangle[2, 1])),
-                )
-            )
-    return tuple(triangles)
+    geometry = load_object_face_geometry(model.glb_bytes)
+    return tuple(
+        (
+            (float(triangle[0, 0]), float(triangle[0, 1])),
+            (float(triangle[1, 0]), float(triangle[1, 1])),
+            (float(triangle[2, 0]), float(triangle[2, 1])),
+        )
+        for triangle in geometry.uv_triangles
+    )
 
 
 # ### Generated-object asset helpers ###
@@ -5404,16 +6990,22 @@ def _get_generated_object_asset_paths(
             if isinstance(raw_path, str) and raw_path.strip():
                 raw_paths.append(raw_path)
         raw_variants = pipeline.get(TEXTURE_VARIANTS_PIPELINE_KEY)
-        if not isinstance(raw_variants, dict):
-            return
-        for raw_variant in raw_variants.values():
-            if not isinstance(raw_variant, dict):
-                continue
-            for path_key in (
-                TEXTURE_VARIANT_GLB_PATH_KEY,
-                TEXTURE_VARIANT_PNG_PATH_KEY,
-            ):
-                raw_path = raw_variant.get(path_key)
+        if isinstance(raw_variants, dict):
+            for raw_variant in raw_variants.values():
+                if not isinstance(raw_variant, dict):
+                    continue
+                for path_key in (
+                    TEXTURE_VARIANT_GLB_PATH_KEY,
+                    TEXTURE_VARIANT_PNG_PATH_KEY,
+                ):
+                    raw_path = raw_variant.get(path_key)
+                    if isinstance(raw_path, str) and raw_path.strip():
+                        raw_paths.append(raw_path)
+        raw_placeholders = pipeline.get(
+            FACE_EDIT_ATLAS_PLACEHOLDERS_PIPELINE_KEY
+        )
+        if isinstance(raw_placeholders, Mapping):
+            for raw_path in raw_placeholders.values():
                 if isinstance(raw_path, str) and raw_path.strip():
                     raw_paths.append(raw_path)
 
@@ -5658,9 +7250,18 @@ def _prepare_and_persist_object_generation(
     pipeline: dict[str, object] = {}
     persisted_asset_paths: list[str] = []
     symmetry: ObjectSymmetricDivisionMetadata | None = None
+    scan_projection_stats: ScanProjectionStats | None = None
     variant_metadata: dict[str, dict[str, str]] | None = None
     try:
         _raise_if_generation_cancelled(cancel_event)
+        if isinstance(result, ScanProjectedMeshyGenerationResult):
+            scan_projection_stats = result.scan_projection_stats
+            if scan_projection_stats is not None:
+                pipeline.update(
+                    _build_scan_projection_pipeline_metadata(
+                        scan_projection_stats
+                    )
+                )
         geometry_only = (
             isinstance(result, StagedMeshyGenerationResult)
             and result.geometry_only
@@ -5671,23 +7272,41 @@ def _prepare_and_persist_object_generation(
             else generated_model.object_texture_variants
         )
         if request.symmetric_division_enabled:
-            if geometry_only or not isinstance(
-                texture_variants,
-                ObjectTextureVariants,
-            ):
+            if geometry_only:
                 raise ValueError(
                     "Symmetric division requires a newly generated textured "
                     "model."
                 )
+            if not isinstance(texture_variants, ObjectTextureVariants):
+                raise ValueError(
+                    "Symmetric division requires a newly generated "
+                    "textured model."
+                )
+            symmetric_builder_kwargs: dict[str, object] = {}
+            if _uses_weighted_camera_projection(request):
+                symmetric_builder_kwargs.update(
+                    {
+                        "projection_camera_percentages": (
+                            request.projection_camera_percentages
+                        ),
+                        "cancellation_check": (
+                            None
+                            if cancel_event is None
+                            else cancel_event.is_set
+                        ),
+                    }
+                )
             division_result = build_automatic_symmetric_object_variants(
                 texture_variants.glb_by_resolution[TEXTURE_RESOLUTION_2048],
                 request.symmetric_division_orientation,
+                **symmetric_builder_kwargs,
             )
             symmetry = _validate_automatic_symmetric_division_result(
                 division_result,
                 request.symmetric_division_orientation,
             )
             texture_variants = division_result.variants
+            scan_projection_stats = division_result.scan_projection_stats
             _raise_if_generation_cancelled(cancel_event)
 
         if texture_variants is None:
@@ -5741,35 +7360,29 @@ def _prepare_and_persist_object_generation(
                 result.source_glb_bytes,
             )
             persisted_asset_paths.append(source_asset_path)
-            staged_pipeline: dict[str, object] = {
-                "mode": _staged_generation_mode(result),
-                "geometry_task_id": result.geometry_task_id,
-                "source_asset_path": source_asset_path,
-                "unused_face_removal_applied": (
-                    _staged_result_used_face_removal(result)
-                ),
-                "geometry_only": result.geometry_only,
-            }
+            staged_pipeline = _build_staged_generation_pipeline_metadata(
+                result,
+                source_asset_path,
+            )
             if symmetry is None:
-                postprocessed_asset_path = _persist_generated_named_asset(
-                    asset_directory,
-                    f"{object_id}.{MESHY_REVISION_POSTPROCESSED}.glb",
-                    result.postprocessed_glb_bytes,
+                postprocessed_asset_path = (
+                    _resolve_staged_postprocessed_asset_path(
+                        result,
+                        asset_path,
+                        variant_metadata,
+                    )
                 )
-                persisted_asset_paths.append(postprocessed_asset_path)
+                if postprocessed_asset_path is None:
+                    postprocessed_asset_path = _persist_generated_named_asset(
+                        asset_directory,
+                        f"{object_id}.{MESHY_REVISION_POSTPROCESSED}.glb",
+                        result.postprocessed_glb_bytes,
+                    )
+                    persisted_asset_paths.append(postprocessed_asset_path)
                 staged_pipeline["postprocessed_asset_path"] = (
                     postprocessed_asset_path
                 )
             pipeline.update(staged_pipeline)
-            if _staged_result_used_face_removal(result):
-                pipeline.update(
-                    {
-                        "original_face_count": result.original_face_count,
-                        "retained_face_count": result.retained_face_count,
-                        "removed_face_count": result.removed_face_count,
-                        "protected_face_count": result.protected_face_count,
-                    }
-                )
 
         if symmetry is not None:
             if variant_metadata is None:
@@ -5778,6 +7391,7 @@ def _prepare_and_persist_object_generation(
                 pipeline,
                 symmetry,
                 variant_metadata,
+                scan_projection_stats=scan_projection_stats,
             )
         _raise_if_generation_cancelled(cancel_event)
         preview_asset_revision = _build_generation_asset_revision(
@@ -5906,7 +7520,10 @@ def _raise_if_generation_cancelled(
         raise _GenerationCancelled
 
 
-def _run_interruptible_stage(operation: Callable[[], object]) -> object:
+def _run_interruptible_stage(
+    operation: Callable[[], object],
+    cancel_event: threading.Event | None = None,
+) -> object:
     """Run blocking provider work on a daemon and poll Qt cancellation.
 
     The short-lived QThread remains responsive to shutdown even while a network
@@ -5934,9 +7551,15 @@ def _run_interruptible_stage(operation: Callable[[], object]) -> object:
 
     qt_thread = QThread.currentThread()
     while not completed.wait(INTERRUPT_POLL_SECONDS):
-        if qt_thread.isInterruptionRequested():
+        if (
+            (cancel_event is not None and cancel_event.is_set())
+            or qt_thread.isInterruptionRequested()
+        ):
             raise _GenerationCancelled
-    if qt_thread.isInterruptionRequested():
+    if (
+        (cancel_event is not None and cancel_event.is_set())
+        or qt_thread.isInterruptionRequested()
+    ):
         raise _GenerationCancelled
 
     succeeded, value = outcome[0]
@@ -6029,6 +7652,22 @@ def _default_generation_asset_directory() -> Path:
 
 
 # ### Generated-object presentation helpers ###
+def _build_object_face_selection_context_token(
+    record: GeneratedObjectRecord,
+    asset_directory: Path,
+) -> tuple[object, ...]:
+    """Identify the exact object revision behind one selectable UV map."""
+
+    return (
+        record.object_id,
+        record.asset_path,
+        _build_generation_asset_revision(
+            asset_directory,
+            record.asset_path,
+        ),
+    )
+
+
 def _build_generated_object_display_snapshot(
     record: GeneratedObjectRecord,
     asset_directory: Path,
@@ -6123,6 +7762,7 @@ def _build_texture_resolution_entry_signature(
                 (resolution, path_key, raw_path, revision)
             )
     return (
+        record.pipeline.get(FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY) is True,
         copy.deepcopy(raw_variants),
         tuple(file_revisions),
     )
@@ -6170,6 +7810,8 @@ def _build_texture_resolution_entries(
     record: GeneratedObjectRecord,
     asset_directory: Path,
 ) -> list[TextureAtlasEntry]:
+    if record.pipeline.get(FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY) is True:
+        return []
     entries: list[TextureAtlasEntry] = []
     asset_root = asset_directory.resolve()
     for resolution in _selectable_texture_resolutions(record):
