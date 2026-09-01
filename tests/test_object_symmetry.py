@@ -54,6 +54,9 @@ from housemaker.object_uv_scan_projection import (
     ScanProjectionResult,
     ScanProjectionStats,
 )
+from housemaker.safe_duplicate_face_removal import (
+    SafeDuplicateFaceRemovalCancelled,
+)
 from housemaker.scan_projection_layout import (
     SCAN_PROJECTION_LAYOUT_METADATA_KEY,
 )
@@ -289,6 +292,41 @@ def _automatic_asymmetric_glb() -> bytes:
         uvs,
         texture=_coordinate_texture(),
     )
+
+
+def _clip_created_duplicate_glb(*, textured: bool) -> bytes:
+    """Build distinct faces whose retained clips become one safe duplicate."""
+
+    vertices = np.asarray(
+        (
+            (-1.0, 0.0, 0.0),
+            (0.0, -1.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (-1.0, 0.0, 0.0),
+            (1.0, -2.0, 0.0),
+            (1.0, 2.0, 0.0),
+        ),
+        dtype=float,
+    )
+    faces = np.asarray(((0, 1, 2), (3, 4, 5)), dtype=np.int64)
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    if textured:
+        mesh = _textured_mesh(
+            mesh,
+            _solid_texture((31, 79, 151, 255)),
+            uvs=np.asarray(
+                (
+                    (0.0, 0.5),
+                    (0.5, 0.25),
+                    (0.5, 0.75),
+                    (0.0, 0.5),
+                    (1.0, 0.0),
+                    (1.0, 1.0),
+                ),
+                dtype=float,
+            ),
+        )
+    return _scene_glb([("clip-duplicate-node", mesh, np.eye(4))])
 
 
 def _automatic_asymmetric_geometry_glb(orientation: str) -> bytes:
@@ -546,6 +584,25 @@ class SymmetricDivisionMetadataTests(unittest.TestCase):
 
 # ### Geometry-only automatic symmetry tests ###
 class GeometryOnlyAutomaticSymmetryTests(unittest.TestCase):
+    def test_clipped_duplicates_are_removed_before_side_selection(self) -> None:
+        tie_chooser = _fixed_choice_rng("right")
+
+        result = build_automatic_symmetric_geometry(
+            _clip_created_duplicate_glb(textured=False),
+            "vertical",
+            rng=tie_chooser,
+        )
+        retained = _z_up_world_mesh(result.glb_bytes)
+
+        self.assertEqual(result.kept_side, "left")
+        self.assertEqual(len(retained.faces), 1)
+        self.assertEqual(
+            result.metadata.triangle_count_by_side,
+            (("left", 1), ("right", 2)),
+        )
+        self.assertFalse(result.metadata.tie_broken_randomly)
+        tie_chooser.choice.assert_not_called()
+
     def test_vertical_division_keeps_the_lower_triangle_side(self) -> None:
         result = build_automatic_symmetric_geometry(
             _automatic_asymmetric_geometry_glb("vertical"),
@@ -725,6 +782,41 @@ class SymmetricRetextureProxyTests(unittest.TestCase):
 
 # ### Automatic textured symmetry tests ###
 class AutomaticSymmetricDivisionTests(unittest.TestCase):
+    def test_clipped_duplicates_are_removed_before_textured_side_selection(
+        self,
+    ) -> None:
+        tie_chooser = _fixed_choice_rng("right")
+
+        result = build_automatic_symmetric_object_variants(
+            _clip_created_duplicate_glb(textured=True),
+            "vertical",
+            rng=tie_chooser,
+        )
+        retained = _z_up_world_mesh(
+            result.variants.glb_by_resolution[1024]
+        )
+
+        self.assertEqual(result.kept_side, "left")
+        self.assertEqual(len(retained.faces), 1)
+        self.assertEqual(
+            result.metadata.triangle_count_by_side,
+            (("left", 1), ("right", 2)),
+        )
+        self.assertFalse(result.metadata.tie_broken_randomly)
+        tie_chooser.choice.assert_not_called()
+
+    def test_duplicate_cleanup_honors_weighted_projection_cancellation(
+        self,
+    ) -> None:
+        with self.assertRaises(SafeDuplicateFaceRemovalCancelled):
+            build_automatic_symmetric_object_variants(
+                _clip_created_duplicate_glb(textured=True),
+                "vertical",
+                rng=random.Random(9),
+                projection_camera_percentages=(30, 20, 15, 15, 10, 10),
+                cancellation_check=lambda: True,
+            )
+
     def test_fewer_clipped_triangles_choose_the_retained_side(self) -> None:
         result = build_automatic_symmetric_object_variants(
             _automatic_asymmetric_glb(),
@@ -1565,6 +1657,54 @@ class SymmetricDivisionGeometryTests(unittest.TestCase):
 
 # ### Texture tests ###
 class SymmetricDivisionTextureTests(unittest.TestCase):
+    def test_optional_maps_do_not_block_symmetric_pbr_variants(self) -> None:
+        scene = _load_scene(_box_glb())
+        material = next(iter(scene.geometry.values())).visual.material
+        normal = Image.fromarray(
+            _solid_texture((128, 128, 255, 255)),
+            mode="RGBA",
+        )
+        metallic_roughness = Image.fromarray(
+            _solid_texture((83, 61, 197, 255)),
+            mode="RGBA",
+        )
+        material.normalTexture = normal
+        material.metallicRoughnessTexture = metallic_roughness
+        material.occlusionTexture = metallic_roughness
+        material.emissiveTexture = Image.fromarray(
+            _solid_texture((40, 80, 120, 255)),
+            mode="RGBA",
+        )
+        material.emissiveFactor = (0.25, 0.5, 0.75)
+
+        variants = build_symmetric_square_pair_texture_variants(
+            bytes(scene.export(file_type="glb")),
+            uvs_already_left_packed=True,
+        )
+
+        for resolution, payload in variants.glb_by_resolution.items():
+            with self.subTest(resolution=resolution):
+                output_scene = _load_scene(payload)
+                output_material = next(
+                    iter(output_scene.geometry.values())
+                ).visual.material
+                self.assertIsNotNone(output_material.normalTexture)
+                self.assertIsNotNone(output_material.metallicRoughnessTexture)
+                self.assertIsNotNone(output_material.occlusionTexture)
+                self.assertIsNone(output_material.emissiveTexture)
+                np.testing.assert_allclose(
+                    output_material.emissiveFactor,
+                    (0.0, 0.0, 0.0),
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(
+                        output_material.occlusionTexture.convert("RGBA")
+                    ),
+                    np.asarray(
+                        output_material.metallicRoughnessTexture.convert("RGBA")
+                    ),
+                )
+
     def test_uvs_and_texture_fit_exactly_in_left_half(self) -> None:
         result = build_automatic_symmetric_object_variants(
             _box_glb(),

@@ -17,6 +17,10 @@ from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
 from housemaker.generation_workspace import GenerationWorkspace
+from housemaker.glass_material import (
+    build_housemaker_glass_material,
+    is_housemaker_glass_material,
+)
 from housemaker.glb import import_generated_glb
 from housemaker.meshy_generation import MeshyGenerationResult
 import housemaker.object_texture_variants as object_texture_variants
@@ -28,6 +32,7 @@ from housemaker.object_texture_variants import (
     TEXTURE_RESOLUTIONS,
     build_object_texture_variants,
     build_object_texture_variants_from_texture,
+    prepare_uv_rewrite_material_textures,
     replace_object_base_color_texture_from_glb,
 )
 
@@ -164,6 +169,27 @@ def _rewrite_uv_layout(
 
 # ### Variant algorithm tests ###
 class ObjectTextureVariantAlgorithmTests(unittest.TestCase):
+    def test_uv_rewrite_preparation_strips_legacy_specular_glossiness(self) -> None:
+        scene = trimesh.Scene(trimesh.creation.box())
+        material = PBRMaterial(emissiveFactor=(0.1, 0.2, 0.3))
+        material.specularGlossinessTexture = Image.new(
+            "RGBA",
+            (8, 8),
+            (10, 20, 30, 255),
+        )
+        next(iter(scene.geometry.values())).visual = TextureVisuals(
+            uv=np.zeros((8, 2), dtype=float),
+            material=material,
+        )
+
+        prepare_uv_rewrite_material_textures(
+            scene,
+            operation_name="Test UV rewrite",
+        )
+
+        self.assertIsNone(material.specularGlossinessTexture)
+        np.testing.assert_allclose(material.emissiveFactor, (0.1, 0.2, 0.3))
+
     def test_builds_and_splits_pbr_maps_at_every_resolution(self) -> None:
         scene = trimesh.load(
             BytesIO(_textured_glb()),
@@ -219,6 +245,41 @@ class ObjectTextureVariantAlgorithmTests(unittest.TestCase):
                     ) as image:
                         self.assertEqual(image.size, (resolution, resolution))
                         self.assertEqual(image.getpixel((0, 0)), expected_pixel)
+
+    def test_variants_preserve_untextured_prefab_glass(self) -> None:
+        scene = trimesh.load(
+            BytesIO(_textured_glb()),
+            file_type="glb",
+            force="scene",
+            process=False,
+        )
+        glass_geometry = scene.geometry["box"]
+        glass_geometry.visual = TextureVisuals(
+            uv=np.asarray(glass_geometry.visual.uv, dtype=float).copy(),
+            material=build_housemaker_glass_material(True),
+        )
+
+        variants = build_object_texture_variants(
+            bytes(scene.export(file_type="glb"))
+        )
+
+        self.assertIsNotNone(variants)
+        assert variants is not None
+        for payload in variants.glb_by_resolution.values():
+            variant_scene = trimesh.load(
+                BytesIO(payload),
+                file_type="glb",
+                force="scene",
+                process=False,
+            )
+            glass_materials = [
+                geometry.visual.material
+                for geometry in variant_scene.geometry.values()
+                if is_housemaker_glass_material(geometry.visual.material)
+            ]
+            self.assertEqual(len(glass_materials), 1)
+            self.assertTrue(glass_materials[0].doubleSided)
+            self.assertIsNone(glass_materials[0].baseColorTexture)
 
     def test_native_2048_rgba_source_is_preserved_and_directly_downsized(
         self,
@@ -532,24 +593,18 @@ class ObjectTextureVariantAlgorithmTests(unittest.TestCase):
             generated_texture,
         )
 
-    def test_provider_pbr_maps_preserve_the_local_glass_alpha_mask(self) -> None:
+    def test_provider_pbr_maps_leave_prefab_glass_atlas_independent(self) -> None:
         model_scene = trimesh.load(
-            BytesIO(
-                _textured_glb(
-                    texture_size=(1024, 1024),
-                    texture_color=(12, 34, 56, 48),
-                )
-            ),
+            BytesIO(_textured_glb(texture_color=(12, 34, 56, 255))),
             file_type="glb",
             force="scene",
             process=False,
         )
-        for geometry in model_scene.geometry.values():
-            material = geometry.visual.material
-            material.name = (
-                object_texture_variants.HOUSEMAKER_GLASS_MATERIAL_NAME
-            )
-            material.alphaMode = "BLEND"
+        glass_geometry = model_scene.geometry["box"]
+        glass_geometry.visual = TextureVisuals(
+            uv=np.asarray(glass_geometry.visual.uv, dtype=float).copy(),
+            material=build_housemaker_glass_material(False),
+        )
 
         provider_scene = trimesh.load(
             BytesIO(_textured_glb(texture_color=(91, 72, 53, 255))),
@@ -581,20 +636,31 @@ class ObjectTextureVariantAlgorithmTests(unittest.TestCase):
             force="scene",
             process=False,
         )
-        for geometry in replaced_scene.geometry.values():
-            material = geometry.visual.material
-            self.assertEqual(
-                material.name,
-                object_texture_variants.HOUSEMAKER_GLASS_MATERIAL_NAME,
-            )
-            self.assertEqual(material.alphaMode, "BLEND")
+        prefab_materials = [
+            geometry.visual.material
+            for geometry in replaced_scene.geometry.values()
+            if is_housemaker_glass_material(geometry.visual.material)
+        ]
+        opaque_materials = [
+            geometry.visual.material
+            for geometry in replaced_scene.geometry.values()
+            if not is_housemaker_glass_material(geometry.visual.material)
+        ]
+        self.assertEqual(len(prefab_materials), 1)
+        self.assertTrue(opaque_materials)
+        glass_material = prefab_materials[0]
+        self.assertEqual(glass_material.alphaMode, "BLEND")
+        self.assertFalse(glass_material.doubleSided)
+        self.assertIsNone(glass_material.baseColorTexture)
+        self.assertIsNone(glass_material.normalTexture)
+        self.assertIsNone(glass_material.metallicRoughnessTexture)
+        for material in opaque_materials:
             base_color = np.asarray(
-                material.baseColorTexture.convert("RGBA"),
-                dtype=np.uint8,
+                material.baseColorTexture.convert("RGBA"), dtype=np.uint8
             )
             np.testing.assert_array_equal(
                 base_color[0, 0],
-                np.asarray((91, 72, 53, 48), dtype=np.uint8),
+                np.asarray((91, 72, 53, 255), dtype=np.uint8),
             )
             np.testing.assert_array_equal(
                 np.asarray(

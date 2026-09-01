@@ -29,7 +29,9 @@ from housemaker.glb import (
     PreviewPlacedObject,
     PreviewTexturedSurface,
     PreviewTexturedWall,
+    import_generated_glb,
 )
+from housemaker.glass_material import build_housemaker_glass_material
 from housemaker.object_texture_variants import (
     PBR_MAP_METALLIC,
     PBR_MAP_NORMAL,
@@ -142,6 +144,31 @@ def _build_generated_model(*, textured: bool = False) -> GeneratedModel:
         scene=trimesh.Scene(mesh),
         glb_bytes=b"",
     )
+
+
+def _build_mixed_prefab_glass_model(
+    *,
+    double_sided: bool,
+) -> GeneratedModel:
+    """Build an imported object with separate opaque and prefab primitives."""
+
+    scene = trimesh.Scene()
+    opaque_model = _build_generated_model(textured=True)
+    scene.add_geometry(opaque_model.mesh, geom_name="opaque")
+    glass_mesh = trimesh.Trimesh(
+        vertices=np.asarray(
+            ((2.0, 0.0, 0.0), (3.0, 0.0, 0.0), (2.0, 1.0, 0.0)),
+            dtype=float,
+        ),
+        faces=np.asarray(((0, 1, 2),), dtype=np.int64),
+        process=False,
+    )
+    glass_mesh.visual = TextureVisuals(
+        uv=np.zeros((3, 2), dtype=float),
+        material=build_housemaker_glass_material(double_sided),
+    )
+    scene.add_geometry(glass_mesh, geom_name="glass")
+    return import_generated_glb(scene.export(file_type="glb"))
 
 
 # ### Module state ###
@@ -277,6 +304,66 @@ class GlbViewerRenderingTests(unittest.TestCase):
             textured_item._metallic_texture_rgba[0, 0],
             np.asarray((0, 0, 0, 255), dtype=np.uint8),
         )
+
+    def test_prefab_glass_preview_is_atlas_independent_and_respects_sides(
+        self,
+    ) -> None:
+        for double_sided in (False, True):
+            with self.subTest(double_sided=double_sided):
+                model = _build_mixed_prefab_glass_model(
+                    double_sided=double_sided
+                )
+                viewer = self._build_viewer()
+
+                viewer.set_model(model)
+
+                self.assertEqual(len(viewer.model_material_items), 2)
+                glass_items = [
+                    item
+                    for item in viewer.model_material_items
+                    if item._is_prefab_glass
+                ]
+                self.assertEqual(len(glass_items), 1)
+                glass_item = glass_items[0]
+                self.assertEqual(glass_item._double_sided, double_sided)
+                np.testing.assert_array_equal(
+                    glass_item._texture_rgba,
+                    np.asarray([[[205, 232, 242, 48]]], dtype=np.uint8),
+                )
+                self.assertEqual(glass_item._texture_rgba.shape, (1, 1, 4))
+                np.testing.assert_array_equal(
+                    glass_item._roughness_texture_rgba[0, 0],
+                    np.asarray((10, 10, 10, 255), dtype=np.uint8),
+                )
+                np.testing.assert_array_equal(
+                    glass_item._metallic_texture_rgba[0, 0],
+                    np.asarray((255, 255, 255, 255), dtype=np.uint8),
+                )
+
+                viewer.set_textures_enabled(False)
+
+                self.assertFalse(glass_item.visible())
+                assert viewer.mesh_item is not None
+                self.assertTrue(viewer.mesh_item.opts["drawFaces"])
+
+    def test_prefab_glass_stays_separate_in_symmetric_preview(self) -> None:
+        viewer = self._build_viewer()
+        viewer.set_model(
+            _build_mixed_prefab_glass_model(double_sided=False)
+        )
+
+        viewer.set_symmetric_division_preview("vertical", 0.0)
+
+        groups = viewer._explicit_symmetric_preview_groups
+        self.assertEqual(len(groups), 2)
+        glass_items = [
+            group.textured_item
+            for group in groups
+            if group.textured_item is not None
+            and group.textured_item._is_prefab_glass
+        ]
+        self.assertEqual(len(glass_items), 1)
+        self.assertFalse(glass_items[0]._double_sided)
 
     def test_pbr_map_state_updates_all_textured_preview_kinds(self) -> None:
         model = _build_generated_model(textured=True)

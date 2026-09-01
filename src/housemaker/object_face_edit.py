@@ -9,6 +9,7 @@ from io import BytesIO
 import numpy as np
 import trimesh
 
+from housemaker.glass_material import is_housemaker_glass_material
 from housemaker.glb import GLTF_Y_UP_TO_Z_UP_TRANSFORM
 
 
@@ -431,7 +432,7 @@ def _instances_have_textured_uvs(instances: Sequence[_MeshInstance]) -> bool:
         if (
             uvs.shape != (len(mesh.vertices), 2)
             or not np.all(np.isfinite(uvs))
-            or not _material_has_base_color_texture(
+            or not _material_supports_preserved_uvs(
                 getattr(mesh.visual, "material", None)
             )
         ):
@@ -439,13 +440,17 @@ def _instances_have_textured_uvs(instances: Sequence[_MeshInstance]) -> bool:
     return True
 
 
-def _material_has_base_color_texture(material: object) -> bool:
+def _material_supports_preserved_uvs(material: object) -> bool:
+    """Accept either an atlas texture or the untextured glass prefab."""
+
     if material is None:
         return False
+    if is_housemaker_glass_material(material):
+        return True
     nested_materials = getattr(material, "materials", None)
     if isinstance(nested_materials, list | tuple):
         return bool(nested_materials) and all(
-            _material_has_base_color_texture(nested)
+            _material_supports_preserved_uvs(nested)
             for nested in nested_materials
         )
     return any(

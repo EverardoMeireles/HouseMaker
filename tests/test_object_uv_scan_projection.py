@@ -2,14 +2,19 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 
 import numpy as np
 import pytest
 import trimesh
 from PIL import Image
-from trimesh.visual.material import PBRMaterial
+from trimesh.visual.material import MultiMaterial, PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
+from housemaker.glass_material import (
+    HOUSEMAKER_GLASS_BASE_COLOR_FACTOR,
+    is_housemaker_glass_material,
+)
 from housemaker.object_texture_variants import (
     MATERIAL_TEXTURE_METALLIC_ROUGHNESS,
     MATERIAL_TEXTURE_NORMAL,
@@ -21,7 +26,10 @@ from housemaker.object_texture_variants import (
     _validate_shared_texture,
     build_object_texture_variants,
 )
-from housemaker.object_face_edit import delete_object_faces_preserving_uvs
+from housemaker.object_face_edit import (
+    delete_object_faces_preserving_uvs,
+    load_object_face_geometry,
+)
 from housemaker.object_uv_scan_projection import (
     DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
     LEFT_HALF_OUTER_SAFETY_INSET_PIXELS,
@@ -35,12 +43,16 @@ from housemaker.object_uv_scan_projection import (
     ScanProjectionCancelled,
     _FALLBACK_CAMERA_INDEX,
     _FaceGroup,
+    _FacePlacement,
     _PixelRectangle,
     _ProjectedFace,
     _SceneGeometry,
     _assign_faces_to_cameras,
     _build_face_placements,
     _build_effective_group_percentages,
+    _build_geometry_glass_material,
+    _fit_selected_faces_rectangle,
+    _normalize_glass_face_indices,
     _partition_group_rectangles,
     _rasterize_visibility_face_samples,
     _select_face_camera,
@@ -122,6 +134,122 @@ def _build_textured_triangle_glb() -> bytes:
         ),
     )
     return bytes(trimesh.Scene(mesh).export(file_type="glb"))
+
+
+def _build_subdivided_glass_panel_glb(
+    *,
+    transform: np.ndarray | None = None,
+) -> bytes:
+    """Build four triangles whose slightly uneven surface fits one panel."""
+
+    mesh = trimesh.Trimesh(
+        vertices=np.asarray(
+            (
+                (-1.0, -0.5, 0.00),
+                (1.0, -0.5, 0.02),
+                (1.0, 0.5, 0.00),
+                (-1.0, 0.5, -0.02),
+                (0.0, 0.0, 0.04),
+            ),
+            dtype=float,
+        ),
+        faces=np.asarray(
+            ((0, 1, 4), (1, 2, 4), (2, 3, 4), (3, 0, 4)),
+            dtype=np.int64,
+        ),
+        process=False,
+    )
+    mesh.visual = TextureVisuals(
+        uv=np.asarray(
+            (
+                (0.0, 0.0),
+                (1.0, 0.0),
+                (1.0, 1.0),
+                (0.0, 1.0),
+                (0.5, 0.5),
+            ),
+            dtype=float,
+        ),
+        material=PBRMaterial(
+            baseColorTexture=Image.fromarray(_gradient_rgba(), mode="RGBA")
+        ),
+    )
+    scene = trimesh.Scene()
+    scene.add_geometry(
+        mesh,
+        geom_name="panel-geometry",
+        node_name="panel-node",
+        transform=np.eye(4) if transform is None else transform,
+    )
+    retained = trimesh.Trimesh(
+        vertices=np.asarray(
+            ((3.0, 0.0, 0.0), (4.0, 0.0, 0.0), (3.0, 1.0, 0.0)),
+            dtype=float,
+        ),
+        faces=np.asarray(((0, 1, 2),), dtype=np.int64),
+        process=False,
+    )
+    retained.visual = TextureVisuals(
+        uv=np.asarray(((0.0, 0.0), (1.0, 0.0), (0.0, 1.0))),
+        material=PBRMaterial(
+            baseColorTexture=Image.fromarray(_gradient_rgba(), mode="RGBA")
+        ),
+    )
+    scene.add_geometry(
+        retained,
+        geom_name="retained-geometry",
+        node_name="retained-node",
+        transform=np.eye(4) if transform is None else transform,
+    )
+    return bytes(scene.export(file_type="glb"))
+
+
+def _build_split_geometry_glass_panel_glb() -> bytes:
+    """Build one rectangle split across two independently named meshes."""
+
+    scene = trimesh.Scene()
+    texture = Image.fromarray(_gradient_rgba(), mode="RGBA")
+    triangle_specs = (
+        (
+            "panel-a",
+            ((0.0, 0.0, 0.0), (2.0, 0.0, 0.0), (2.0, 1.0, 0.0)),
+            ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0)),
+        ),
+        (
+            "panel-b",
+            ((0.0, 0.0, 0.0), (2.0, 1.0, 0.0), (0.0, 1.0, 0.0)),
+            ((0.0, 0.0), (1.0, 1.0), (0.0, 1.0)),
+        ),
+    )
+    for name, vertices, uvs in triangle_specs:
+        mesh = trimesh.Trimesh(
+            vertices=np.asarray(vertices, dtype=float),
+            faces=np.asarray(((0, 1, 2),), dtype=np.int64),
+            process=False,
+        )
+        mesh.visual = TextureVisuals(
+            uv=np.asarray(uvs, dtype=float),
+            material=PBRMaterial(baseColorTexture=texture.copy()),
+        )
+        scene.add_geometry(mesh, geom_name=name, node_name=f"{name}-node")
+    retained = trimesh.Trimesh(
+        vertices=np.asarray(
+            ((3.0, 0.0, 0.0), (4.0, 0.0, 0.0), (3.0, 1.0, 0.0)),
+            dtype=float,
+        ),
+        faces=np.asarray(((0, 1, 2),), dtype=np.int64),
+        process=False,
+    )
+    retained.visual = TextureVisuals(
+        uv=np.asarray(((0.0, 0.0), (1.0, 0.0), (0.0, 1.0))),
+        material=PBRMaterial(baseColorTexture=texture.copy()),
+    )
+    scene.add_geometry(
+        retained,
+        geom_name="retained",
+        node_name="retained-node",
+    )
+    return bytes(scene.export(file_type="glb"))
 
 
 def _build_low_percentage_many_faces_glb(
@@ -934,21 +1062,115 @@ def test_scan_layout_reports_only_true_global_group_overcapacity() -> None:
         )
 
 
-def test_glass_share_stays_one_percent_when_regular_groups_are_sparse() -> None:
+def test_atlas_independent_glass_does_not_reduce_opaque_camera_share() -> None:
     camera_sparse = _build_effective_group_percentages(
         DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
-        (1, 0, 0, 0, 0, 0, 0, 1),
+        (1, 0, 0, 0, 0, 0, 0),
     )
     fallback_only = _build_effective_group_percentages(
         DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
-        (0, 0, 0, 0, 0, 0, 1, 1),
+        (0, 0, 0, 0, 0, 0, 1),
     )
 
-    assert camera_sparse[0] == 99.0
-    assert camera_sparse[-1] == 1.0
+    assert camera_sparse[0] == 100.0
     assert sum(camera_sparse) == 100.0
-    assert fallback_only[-2:] == (99.0, 1.0)
+    assert fallback_only[-1] == 100.0
     assert sum(fallback_only) == 100.0
+
+
+@pytest.mark.parametrize("invalid_index", (True, 1.5, "1"))
+def test_glass_face_indices_require_exact_integers(invalid_index: object) -> None:
+    with pytest.raises(ValueError, match="must be integers"):
+        _normalize_glass_face_indices((invalid_index,))  # type: ignore[arg-type]
+
+
+def test_glass_rectangle_fit_ignores_zero_area_selected_faces() -> None:
+    triangles = np.asarray(
+        (
+            ((0.0, 0.0, 0.0), (2.0, 0.0, 0.0), (2.0, 1.0, 0.0)),
+            ((0.0, 0.0, 0.0), (2.0, 1.0, 0.0), (0.0, 1.0, 0.0)),
+            ((100.0, 0.0, 0.0), (110.0, 0.0, 0.0), (120.0, 0.0, 0.0)),
+        ),
+        dtype=float,
+    )
+
+    rectangle = _fit_selected_faces_rectangle(triangles)
+
+    np.testing.assert_allclose(np.min(rectangle, axis=0), (0.0, 0.0, 0.0))
+    np.testing.assert_allclose(np.max(rectangle, axis=0), (2.0, 1.0, 0.0))
+
+
+def test_glass_material_changes_only_the_selected_material_leaf() -> None:
+    selected_material = PBRMaterial(
+        name="selected",
+        metallicFactor=0.2,
+        roughnessFactor=0.3,
+    )
+    retained_material = PBRMaterial(
+        name="retained",
+        metallicFactor=0.25,
+        roughnessFactor=0.75,
+    )
+    mesh = trimesh.Trimesh(
+        vertices=np.asarray(
+            ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+            dtype=float,
+        ),
+        faces=np.asarray(((0, 1, 2),), dtype=np.int64),
+        process=False,
+    )
+    mesh.visual = TextureVisuals(
+        uv=np.asarray(((0.0, 0.0), (1.0, 0.0), (0.0, 1.0))),
+        material=MultiMaterial((selected_material, retained_material)),
+        face_materials=np.asarray((0,), dtype=np.int64),
+    )
+    selected_face = replace(
+        _projected_face(0, 0),
+        face_material_index=0,
+        is_glass=True,
+    )
+    retained_face = replace(
+        _projected_face(1, 0),
+        face_material_index=1,
+    )
+    placements = tuple(
+        _FacePlacement(
+            face=face,
+            fragment_index=0,
+            source_positions=face.source_positions,
+            source_normals=face.source_normals,
+            source_uvs=face.source_uvs,
+            destination_points=np.asarray(
+                ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)),
+                dtype=float,
+            ),
+        )
+        for face in (selected_face, retained_face)
+    )
+
+    material, glass_indices = _build_geometry_glass_material(
+        mesh,
+        placements,
+    )
+
+    selected_output, retained_output, glass_output = material.materials
+    assert glass_indices == {(0, False): 2}
+    assert selected_output.name == "selected"
+    assert selected_output.metallicFactor == pytest.approx(0.2)
+    assert selected_output.roughnessFactor == pytest.approx(0.3)
+    assert retained_output.name == "retained"
+    assert retained_output.metallicFactor == pytest.approx(0.25)
+    assert retained_output.roughnessFactor == pytest.approx(0.75)
+    assert glass_output.name == "HouseMaker Glass"
+    assert glass_output.alphaMode == "BLEND"
+    assert glass_output.metallicFactor == pytest.approx(1.0)
+    assert glass_output.roughnessFactor == pytest.approx(10.0 / 255.0)
+    assert glass_output.doubleSided is False
+    assert glass_output.baseColorTexture is None
+    np.testing.assert_array_equal(
+        glass_output.baseColorFactor,
+        HOUSEMAKER_GLASS_BASE_COLOR_FACTOR,
+    )
 
 
 # ### Failure and cancellation tests ###
@@ -1024,27 +1246,98 @@ def test_rebakes_pbr_material_maps_with_the_same_scan_layout() -> None:
     )
 
 
-def test_rejects_uv_dependent_maps_that_cannot_be_rebaked() -> None:
+def test_strips_unrequested_uv_maps_without_rejecting_pbr_generation() -> None:
     scene, mesh, _texture = _load_single_mesh_and_texture(
         _build_textured_cube_glb()
+    )
+    normal = np.full(
+        (TEST_TEXTURE_RESOLUTION, TEST_TEXTURE_RESOLUTION, 4),
+        (128, 128, 255, 255),
+        dtype=np.uint8,
+    )
+    metallic_roughness = np.full(
+        (TEST_TEXTURE_RESOLUTION, TEST_TEXTURE_RESOLUTION, 4),
+        (31, 72, 190, 255),
+        dtype=np.uint8,
+    )
+    mesh.visual.material.normalTexture = Image.fromarray(normal, mode="RGBA")
+    mesh.visual.material.metallicRoughnessTexture = Image.fromarray(
+        metallic_roughness,
+        mode="RGBA",
+    )
+    mesh.visual.material.occlusionTexture = Image.fromarray(
+        np.flipud(_gradient_rgba()).copy(),
+        mode="RGBA",
     )
     mesh.visual.material.emissiveTexture = Image.fromarray(
         _gradient_rgba(),
         mode="RGBA",
     )
+    mesh.visual.material.emissiveFactor = (0.2, 0.4, 0.6)
 
-    with pytest.raises(ValueError, match="does not support emissive"):
-        scan_project_textured_glb(
-            bytes(scene.export(file_type="glb")),
-            texture_resolution=TEST_TEXTURE_RESOLUTION,
-        )
+    result = scan_project_textured_glb(
+        bytes(scene.export(file_type="glb")),
+        texture_resolution=TEST_TEXTURE_RESOLUTION,
+    )
+
+    output_scene = _load_glb_scene(result.glb_bytes)
+    output_material = next(
+        iter(output_scene.geometry.values())
+    ).visual.material
+    output_maps = _collect_material_texture_maps(output_scene)
+    assert set(output_maps) == {
+        "base_color",
+        MATERIAL_TEXTURE_NORMAL,
+        MATERIAL_TEXTURE_METALLIC_ROUGHNESS,
+    }
+    assert output_material.occlusionTexture is None
+    assert output_material.emissiveTexture is None
+    np.testing.assert_allclose(output_material.emissiveFactor, (0.0, 0.0, 0.0))
+    packed_output = output_maps[MATERIAL_TEXTURE_METALLIC_ROUGHNESS][0]
+    assert np.any(np.all(packed_output == (31, 72, 190, 255), axis=2))
 
 
-def test_glass_faces_receive_one_percent_group_and_persisted_pbr_mask() -> None:
+def test_rebaked_packed_metallic_roughness_retains_its_occlusion_alias() -> None:
+    scene, mesh, _texture = _load_single_mesh_and_texture(
+        _build_textured_cube_glb()
+    )
+    metallic_roughness = Image.fromarray(
+        np.full(
+            (TEST_TEXTURE_RESOLUTION, TEST_TEXTURE_RESOLUTION, 4),
+            (91, 72, 190, 255),
+            dtype=np.uint8,
+        ),
+        mode="RGBA",
+    )
+    mesh.visual.material.metallicRoughnessTexture = metallic_roughness
+    mesh.visual.material.occlusionTexture = metallic_roughness
+
+    result = scan_project_textured_glb(
+        bytes(scene.export(file_type="glb")),
+        texture_resolution=TEST_TEXTURE_RESOLUTION,
+    )
+
+    output_scene = _load_glb_scene(result.glb_bytes)
+    output_material = next(
+        iter(output_scene.geometry.values())
+    ).visual.material
+    assert output_material.occlusionTexture is not None
+    assert output_material.metallicRoughnessTexture is not None
+    np.testing.assert_array_equal(
+        np.asarray(output_material.occlusionTexture.convert("RGBA")),
+        np.asarray(output_material.metallicRoughnessTexture.convert("RGBA")),
+    )
+
+
+@pytest.mark.parametrize("double_sided", (False, True))
+def test_glass_faces_use_atlas_independent_prefab_and_preserve_side(
+    double_sided: bool,
+) -> None:
     first = scan_project_textured_glb(
         _build_textured_cube_glb(),
         texture_resolution=TEST_TEXTURE_RESOLUTION,
         glass_face_indices=(0,),
+        glass_double_sided=double_sided,
     )
 
     first_scene = _load_glb_scene(first.glb_bytes)
@@ -1054,33 +1347,147 @@ def test_glass_faces_receive_one_percent_group_and_persisted_pbr_mask() -> None:
             first_scene
         ).items()
     }
-    glass_mask = first_maps["base_color"][:, :, 3] <= 96
-    assert first.stats.glass_face_count == 1
-    assert first.stats.glass_pixel_count == np.count_nonzero(glass_mask)
-    assert np.all(
-        first_maps[MATERIAL_TEXTURE_NORMAL][glass_mask, :3]
-        == (128, 128, 255)
+    assert first.stats.glass_face_count == 2
+    assert first.stats.glass_pixel_count == 0
+    assert first.stats.covered_pixel_count == first.stats.usable_pixel_count
+    assert set(first_maps) == {"base_color"}
+    glass_meshes = tuple(
+        geometry
+        for geometry in first_scene.geometry.values()
+        if is_housemaker_glass_material(geometry.visual.material)
     )
-    assert np.all(
-        first_maps[MATERIAL_TEXTURE_METALLIC_ROUGHNESS][glass_mask, 1]
-        == 10
+    opaque_meshes = tuple(
+        geometry
+        for geometry in first_scene.geometry.values()
+        if not is_housemaker_glass_material(geometry.visual.material)
     )
-    assert np.all(
-        first_maps[MATERIAL_TEXTURE_METALLIC_ROUGHNESS][glass_mask, 2]
-        == 0
+    assert len(glass_meshes) == 1
+    assert opaque_meshes
+    glass_mesh = glass_meshes[0]
+    glass_material = glass_mesh.visual.material
+    assert all(
+        geometry.visual.material.alphaMode != "BLEND"
+        for geometry in opaque_meshes
     )
-    material = next(iter(first_scene.geometry.values())).visual.material
-    assert material.name == "HouseMaker Glass"
-    assert material.alphaMode == "BLEND"
-    assert material.doubleSided is True
+    assert glass_material.alphaMode == "BLEND"
+    assert glass_material.doubleSided is double_sided
+    assert glass_material.metallicFactor == pytest.approx(1.0)
+    assert glass_material.roughnessFactor == pytest.approx(10.0 / 255.0)
+    assert glass_material.baseColorTexture is None
+    assert glass_material.normalTexture is None
+    assert glass_material.metallicRoughnessTexture is None
+    np.testing.assert_array_equal(
+        glass_material.baseColorFactor,
+        HOUSEMAKER_GLASS_BASE_COLOR_FACTOR,
+    )
+    assert len(np.unique(glass_mesh.visual.uv, axis=0)) == 1
+    assert SCAN_PROJECTION_LAYOUT_METADATA_KEY not in glass_mesh.metadata
+    assert all(
+        SCAN_PROJECTION_LAYOUT_METADATA_KEY in geometry.metadata
+        for geometry in opaque_meshes
+    )
 
     second = scan_project_textured_glb(
         first.glb_bytes,
         texture_resolution=TEST_TEXTURE_RESOLUTION,
     )
 
-    assert second.stats.glass_face_count > 0
-    assert second.stats.glass_pixel_count == first.stats.glass_pixel_count
+    assert second.stats.glass_face_count == 2
+    assert second.stats.glass_pixel_count == 0
+    second_scene = _load_glb_scene(second.glb_bytes)
+    second_glass = next(
+        geometry.visual.material
+        for geometry in second_scene.geometry.values()
+        if is_housemaker_glass_material(geometry.visual.material)
+    )
+    assert second_glass.doubleSided is double_sided
+    assert second_glass.baseColorTexture is None
+
+
+def test_selected_glass_faces_join_into_one_approximated_rectangle() -> None:
+    transform = trimesh.transformations.rotation_matrix(
+        0.37,
+        (0.0, 0.0, 1.0),
+    )
+    transform[:3, 3] = (2.5, -1.25, 0.75)
+    source_glb = _build_subdivided_glass_panel_glb(transform=transform)
+    source_geometry = load_object_face_geometry(source_glb)
+    expected_center = np.mean(
+        np.unique(
+            source_geometry.vertices[
+                source_geometry.faces[:4]
+            ].reshape((-1, 3)),
+            axis=0,
+        ),
+        axis=0,
+    )
+    projected = scan_project_textured_glb(
+        source_glb,
+        texture_resolution=TEST_TEXTURE_RESOLUTION,
+        glass_face_indices=(0, 1, 2, 3),
+    )
+
+    scene = _load_glb_scene(projected.glb_bytes)
+    meshes = [
+        geometry
+        for geometry in scene.geometry.values()
+        if isinstance(geometry, trimesh.Trimesh) and len(geometry.faces)
+    ]
+    assert len(meshes) == 2
+    mesh = next(
+        geometry
+        for geometry in meshes
+        if is_housemaker_glass_material(geometry.visual.material)
+    )
+    assert len(mesh.faces) == 2
+    rectangle_points = np.unique(
+        np.round(np.asarray(mesh.vertices)[mesh.faces].reshape((-1, 3)), 6),
+        axis=0,
+    )
+    assert len(rectangle_points) == 4
+    centered = rectangle_points - np.mean(rectangle_points, axis=0)
+    assert np.linalg.matrix_rank(centered, tol=1e-5) == 2
+    output_geometry = load_object_face_geometry(projected.glb_bytes)
+    output_center = np.mean(
+        np.unique(
+            output_geometry.vertices[
+                output_geometry.faces[:2]
+            ].reshape((-1, 3)),
+            axis=0,
+        ),
+        axis=0,
+    )
+    np.testing.assert_allclose(output_center, expected_center, atol=2e-4)
+    assert projected.stats.glass_face_count == 2
+
+
+def test_selected_glass_faces_join_across_mesh_parts() -> None:
+    projected = scan_project_textured_glb(
+        _build_split_geometry_glass_panel_glb(),
+        texture_resolution=TEST_TEXTURE_RESOLUTION,
+        glass_face_indices=(0, 1),
+    )
+
+    geometry = load_object_face_geometry(projected.glb_bytes)
+    assert geometry.face_count == 4
+    assert projected.stats.glass_face_count == 2
+    scene = _load_glb_scene(projected.glb_bytes)
+    glass_geometry = next(
+        mesh
+        for mesh in scene.geometry.values()
+        if is_housemaker_glass_material(mesh.visual.material)
+    )
+    assert len(
+        np.unique(
+            np.round(
+                np.asarray(glass_geometry.vertices)[
+                    glass_geometry.faces
+                ].reshape((-1, 3)),
+                6,
+            ),
+            axis=0,
+        )
+    ) == 4
 
 
 def test_validates_target_and_honors_cancellation() -> None:
@@ -1093,10 +1500,25 @@ def test_validates_target_and_honors_cancellation() -> None:
         )
     with pytest.raises(ValueError, match="even"):
         scan_project_textured_glb(source_glb, texture_resolution=127)
+    with pytest.raises(ValueError, match="sidedness"):
+        scan_project_textured_glb(
+            source_glb,
+            texture_resolution=TEST_TEXTURE_RESOLUTION,
+            glass_double_sided=1,  # type: ignore[arg-type]
+        )
     with pytest.raises(ScanProjectionCancelled):
         scan_project_textured_glb(
             source_glb,
             target_domain=SCAN_PROJECTION_TARGET_FULL,
             texture_resolution=TEST_TEXTURE_RESOLUTION,
             cancellation_check=lambda: True,
+        )
+
+
+def test_rejects_an_all_glass_result_with_a_clear_message() -> None:
+    with pytest.raises(ValueError, match="Leave at least one non-glass face"):
+        scan_project_textured_glb(
+            _build_textured_triangle_glb(),
+            texture_resolution=TEST_TEXTURE_RESOLUTION,
+            glass_face_indices=(0,),
         )

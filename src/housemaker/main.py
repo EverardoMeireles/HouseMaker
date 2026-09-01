@@ -537,6 +537,9 @@ class BlueprintWorkspace(QWidget):
         self.viewer.placed_object_transform_changed.connect(
             self._handle_placed_object_transform_changed
         )
+        self.viewer.placed_object_removal_requested.connect(
+            self._handle_placed_object_removal_requested
+        )
         self.viewer.navigation_mode_changed.connect(
             self._handle_canvas_3d_navigation_mode_changed
         )
@@ -1821,11 +1824,17 @@ class BlueprintWorkspace(QWidget):
         self,
         raw_record: object,
     ) -> None:
-        """Move a completed object in the Canvas preview immediately."""
+        """Move or remove a completed object in the Canvas preview."""
 
-        if (
-            isinstance(raw_record, GeneratedObjectRecord)
-            and raw_record.placement is not None
+        if isinstance(raw_record, GeneratedObjectRecord):
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+
+    def _handle_placed_object_removal_requested(self, object_id: str) -> None:
+        """Remove only the selected object's Canvas placement state."""
+
+        normalized_object_id = str(object_id).strip()
+        if not self.generation.remove_generated_object_placement(
+            normalized_object_id
         ):
             self._schedule_viewer_preview_refresh(preserve_camera=True)
 

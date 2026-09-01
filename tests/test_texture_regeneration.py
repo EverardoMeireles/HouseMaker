@@ -40,6 +40,8 @@ from housemaker.generation_state import (
     MaskStroke,
 )
 from housemaker.generation_workspace import (
+    GLASS_CONVERSION_PIPELINE_KEY,
+    GLASS_MATERIAL_SOURCE_PREFAB,
     LOCALLY_AUTHORED_UVS_PIPELINE_KEY,
     ObjectSymmetricDivisionMetadata,
     SCAN_PROJECTION_PIPELINE_KEY,
@@ -56,9 +58,15 @@ from housemaker.generation_workspace import (
     _build_regenerated_texture_pipeline,
     _materialize_texture_regeneration_preflight,
     _persist_generated_named_asset,
+    _remap_faces_by_world_geometry,
     _validate_symmetric_texture_regeneration_uvs,
     _with_persisted_canonical_uv_fingerprint,
     _texture_regeneration_scan_target,
+)
+from housemaker.glass_material import (
+    HOUSEMAKER_GLASS_MATERIAL_PROFILE,
+    build_housemaker_glass_material,
+    get_housemaker_glass_runtime_key,
 )
 from housemaker.glb import (
     GLTF_Y_UP_TO_Z_UP_TRANSFORM,
@@ -96,6 +104,9 @@ from housemaker.object_texture_variants import (
     ObjectTextureVariants,
 )
 from housemaker.settings_widget import GenerationServiceSettings
+from housemaker.safe_duplicate_face_removal import (
+    remove_safe_duplicate_faces_from_glb,
+)
 from housemaker.unused_face_removal import (
     ALL_CAMERA_IDS,
     UnusedFaceRemovalResult,
@@ -575,6 +586,102 @@ class TextureRegenerationRequestTests(unittest.TestCase):
         history_entry = pipeline["texture_regeneration_history"][-1]
         self.assertEqual(history_entry["submitted_uv_face_count"], 2)
         self.assertEqual(history_entry["final_uv_face_count"], 4)
+
+    def test_glass_pipeline_persists_prefab_sidedness_across_retexture(
+        self,
+    ) -> None:
+        source_glb = _uv_glb(texture_resolution=2048)
+        projection = _scan_projection_result(
+            source_glb,
+            DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
+            SCAN_PROJECTION_TARGET_FULL,
+        )
+        glass_stats = replace(
+            projection.stats,
+            glass_face_count=2,
+            glass_pixel_count=0,
+        )
+        variants = {
+            str(resolution): {
+                "glb_asset_path": f"cabinet-{resolution}.glb",
+                "texture_asset_path": f"cabinet-{resolution}.png",
+            }
+            for resolution in TEXTURE_RESOLUTIONS
+        }
+        first_request = TextureRegenerationRequest(
+            object_id="cabinet",
+            reference_frame_index=0,
+            reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
+            model_glb=source_glb,
+            settings=GenerationServiceSettings(),
+            glass_face_indices=(0,),
+            glass_double_sided=False,
+        )
+        first_pipeline = _build_regenerated_texture_pipeline(
+            _record("cabinet", "old.glb"),
+            TextureRegenerationOutcome(
+                request=first_request,
+                result=MeshyGenerationResult("glass-task-1", source_glb),
+                scan_projection_stats=glass_stats,
+            ),
+            variants,
+        )
+
+        first_glass = first_pipeline[GLASS_CONVERSION_PIPELINE_KEY]
+        self.assertEqual(
+            first_glass["material_source"],
+            GLASS_MATERIAL_SOURCE_PREFAB,
+        )
+        self.assertTrue(first_glass["atlas_independent"])
+        self.assertEqual(
+            first_glass["material_profile"],
+            HOUSEMAKER_GLASS_MATERIAL_PROFILE,
+        )
+        self.assertFalse(first_glass["double_sided"])
+        self.assertEqual(
+            first_glass["runtime_material_key"],
+            get_housemaker_glass_runtime_key(
+                build_housemaker_glass_material(False)
+            ),
+        )
+        self.assertEqual(first_glass["atlas_pixel_count"], 0)
+        self.assertNotIn("allocation_percentage", first_glass)
+        self.assertNotIn("pixel_count", first_glass)
+
+        fingerprint = build_uv_fingerprint(source_glb)
+        second_request = TextureRegenerationRequest(
+            object_id="cabinet",
+            reference_frame_index=1,
+            reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
+            model_glb=source_glb,
+            settings=GenerationServiceSettings(),
+            enable_original_uv=True,
+            submitted_uv_fingerprint=fingerprint,
+            preserve_existing_glass=True,
+            glass_double_sided=None,
+        )
+        second_pipeline = _build_regenerated_texture_pipeline(
+            replace(
+                _record("cabinet", "old.glb"),
+                pipeline=first_pipeline,
+            ),
+            TextureRegenerationOutcome(
+                request=second_request,
+                result=MeshyGenerationResult("glass-task-2", source_glb),
+                scan_projection_stats=glass_stats,
+                final_uv_fingerprint=fingerprint,
+            ),
+            variants,
+        )
+
+        second_glass = second_pipeline[GLASS_CONVERSION_PIPELINE_KEY]
+        self.assertFalse(second_glass["double_sided"])
+        self.assertEqual(second_glass["source_face_count"], 1)
+        self.assertFalse(
+            second_pipeline["texture_regeneration_history"][-1][
+                "glass_double_sided"
+            ]
+        )
 
     def test_symmetric_final_fingerprint_uses_persisted_1024_glb(self) -> None:
         intermediate_glb = _uv_glb(
@@ -1136,6 +1243,21 @@ class MeshyTextureRegeneratorTests(unittest.TestCase):
             texture_resolution=2048,
             texture_color=(170, 45, 80, 255),
         )
+        provider_scene = trimesh.load(
+            BytesIO(provider_glb),
+            file_type="glb",
+            force="scene",
+            process=False,
+        )
+        provider_mesh = next(iter(provider_scene.geometry.values()))
+        provider_mesh.faces = np.asarray(
+            np.vstack((provider_mesh.faces, provider_mesh.faces[-1:])),
+            dtype=np.int64,
+        )
+        provider_glb = bytes(provider_scene.export(file_type="glb"))
+        duplicate_cleaned_provider_glb = (
+            remove_safe_duplicate_faces_from_glb(provider_glb).glb_bytes
+        )
         cleaned_glb = _uv_glb(
             texture_resolution=2048,
             texture_color=(170, 45, 80, 255),
@@ -1181,7 +1303,10 @@ class MeshyTextureRegeneratorTests(unittest.TestCase):
         self.assertEqual(failed.count(), 0)
         self.assertEqual(succeeded.count(), 1)
         remove_faces.assert_called_once()
-        self.assertEqual(remove_faces.call_args.args[0], provider_glb)
+        self.assertEqual(
+            remove_faces.call_args.args[0],
+            duplicate_cleaned_provider_glb,
+        )
         self.assertEqual(
             remove_faces.call_args.kwargs["options"].minimum_visible_fraction,
             0.09,
@@ -1192,7 +1317,97 @@ class MeshyTextureRegeneratorTests(unittest.TestCase):
         self.assertEqual(outcome.final_visibility_removed_face_count, 1)
         self.assertEqual(outcome.final_stacked_face_removed_count, 1)
         self.assertTrue(outcome.retexture_topology_changed)
+        self.assertEqual(outcome.safe_duplicate_removed_face_count, 1)
+        self.assertEqual(outcome.safe_duplicate_group_count, 1)
         self.assertEqual(outcome.result.glb_bytes, cleaned_glb)
+
+    def test_worker_remaps_geometry_only_glass_faces_after_retexture(self) -> None:
+        source_glb = _box_glb()
+        provider_scene = trimesh.load(
+            BytesIO(source_glb),
+            file_type="glb",
+            force="scene",
+            process=False,
+        )
+        provider_mesh = next(iter(provider_scene.geometry.values()))
+        provider_mesh.faces = np.asarray(
+            np.vstack(
+                (
+                    provider_mesh.faces[::-1, ::-1],
+                    provider_mesh.faces[-1:, ::-1],
+                )
+            ),
+            dtype=np.int64,
+        )
+        provider_mesh.visual = TextureVisuals(
+            uv=np.zeros((len(provider_mesh.vertices), 2), dtype=float),
+            material=PBRMaterial(
+                baseColorTexture=Image.new(
+                    "RGBA",
+                    (2048, 2048),
+                    (80, 130, 170, 255),
+                )
+            ),
+        )
+        provider_glb = bytes(provider_scene.export(file_type="glb"))
+        request = TextureRegenerationRequest(
+            object_id="geometry-only-glass",
+            reference_frame_index=0,
+            reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
+            model_glb=source_glb,
+            settings=GenerationServiceSettings(unused_face_removal=True),
+            glass_face_indices=(0,),
+            glass_double_sided=False,
+        )
+        worker = TextureRegenerationWorker(
+            _SequenceTextureRegenerator(
+                [MeshyGenerationResult("texture-task", provider_glb)]
+            ),
+            MeshyModelExecutor(),
+            request,
+        )
+        succeeded = QSignalSpy(worker.succeeded)
+        failed = QSignalSpy(worker.failed)
+        cleaned_provider_glb = remove_safe_duplicate_faces_from_glb(
+            provider_glb
+        ).glb_bytes
+        expected_faces = _remap_faces_by_world_geometry(
+            source_glb,
+            cleaned_provider_glb,
+            (0,),
+        )
+
+        with patch(
+            "housemaker.generation_workspace.remove_unused_faces_from_glb"
+        ) as remove_faces, patch(
+            "housemaker.generation_workspace.scan_project_textured_glb",
+            return_value=_scan_projection_result(
+                cleaned_provider_glb,
+                DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
+                SCAN_PROJECTION_TARGET_FULL,
+            ),
+        ) as scan_projection:
+            worker.run()
+
+        self.assertEqual(failed.count(), 0)
+        self.assertEqual(succeeded.count(), 1)
+        remove_faces.assert_not_called()
+        self.assertEqual(
+            scan_projection.call_args.args[0],
+            cleaned_provider_glb,
+        )
+        self.assertEqual(
+            scan_projection.call_args.kwargs["glass_face_indices"],
+            expected_faces,
+        )
+        self.assertFalse(
+            scan_projection.call_args.kwargs["glass_double_sided"]
+        )
+        self.assertFalse(request.enable_original_uv)
+        outcome = succeeded.at(0)[0]
+        self.assertEqual(outcome.safe_duplicate_removed_face_count, 1)
+        self.assertEqual(outcome.safe_duplicate_group_count, 1)
+        self.assertEqual(outcome.result.glb_bytes, cleaned_provider_glb)
 
     def test_worker_rebuilds_ordinary_uvs_after_final_face_cleanup(self) -> None:
         percentages = (35, 25, 15, 10, 10, 5)
@@ -1329,12 +1544,16 @@ class MeshyTextureRegeneratorTests(unittest.TestCase):
         with patch(
             "housemaker.generation_workspace.scan_project_textured_glb",
             side_effect=project_authoritative_geometry,
-        ) as scan_projection:
+        ) as scan_projection, patch(
+            "housemaker.generation_workspace."
+            "remove_safe_duplicate_faces_from_glb",
+        ) as duplicate_removal:
             worker.run()
 
         self.assertEqual(failed.count(), 0)
         self.assertEqual(succeeded.count(), 1)
         scan_projection.assert_called_once()
+        duplicate_removal.assert_not_called()
         outcome = succeeded.at(0)[0]
         self.assertEqual(
             outcome.preserved_uv_fingerprint,
@@ -1881,6 +2100,55 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
             expected,
         )
 
+    def test_existing_glass_retexture_defers_to_authored_sidedness(self) -> None:
+        record, _variants = self._seed_object(
+            0,
+            name="Glass cabinet",
+            task_id="geometry-task",
+        )
+        self._load_reference()
+        authored_glb = _uv_glb(texture_resolution=2048)
+        authored_asset_name = f"{record.object_id}.glass.glb"
+        self.asset_directory.joinpath(authored_asset_name).write_bytes(
+            authored_glb
+        )
+        self._replace_record(
+            record,
+            postprocessed_asset_path=authored_asset_name,
+            **{
+                GLASS_CONVERSION_PIPELINE_KEY: {
+                    "material_name": "HouseMaker Glass",
+                    "material_source": GLASS_MATERIAL_SOURCE_PREFAB,
+                    "material_profile": HOUSEMAKER_GLASS_MATERIAL_PROFILE,
+                    "atlas_independent": True,
+                    "runtime_material_key": (
+                        get_housemaker_glass_runtime_key(
+                            build_housemaker_glass_material(False)
+                        )
+                    ),
+                    "double_sided": False,
+                    "source_face_count": 1,
+                    "output_face_count": 2,
+                    "atlas_pixel_count": 0,
+                }
+            },
+        )
+
+        preflight = self.workspace._build_texture_regeneration_request()
+
+        self.assertIsNotNone(preflight)
+        assert preflight is not None
+        self.assertTrue(preflight.preserve_existing_glass)
+        self.assertIsNone(preflight.glass_double_sided)
+        self.assertFalse(
+            self.workspace.glass_double_sided_checkbox.isChecked()
+        )
+        materialized = _materialize_texture_regeneration_preflight(
+            preflight,
+            self.asset_directory,
+        ).request
+        self.assertIsNone(materialized.glass_double_sided)
+
     def test_invalid_camera_total_disables_texture_generation(self) -> None:
         self._seed_object(0, name="Chair", task_id="geometry-task")
         self._load_reference()
@@ -1893,7 +2161,7 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
         panel = self.workspace.object_3d_panel
         panel.projection_camera_percentage_spinboxes[
             ALL_CAMERA_IDS[0]
-        ].setValue(16)
+        ].setValue(DEFAULT_PROJECTION_CAMERA_PERCENTAGES[0] - 1)
         _qt_application.processEvents()
 
         self.assertFalse(panel.projection_camera_percentages_are_valid())

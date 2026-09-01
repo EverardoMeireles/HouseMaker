@@ -10,6 +10,10 @@ from PIL import Image
 from trimesh.visual.material import MultiMaterial, PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
+from housemaker.glass_material import (
+    build_housemaker_glass_material,
+    is_housemaker_glass_material,
+)
 from housemaker.object_face_edit import (
     _filter_face_materials,
     delete_object_faces_preserving_uvs,
@@ -389,6 +393,31 @@ class ObjectFaceDeletionTests(unittest.TestCase):
 
         self.assertFalse(result.preserved_textured_uvs)
         self.assertEqual(result.retained_face_count, 11)
+
+    def test_atlas_independent_glass_is_compatible_with_preserved_uvs(
+        self,
+    ) -> None:
+        scene = _load_scene(_two_node_glb())
+        glass_mesh = scene.geometry["right-geometry"]
+        glass_mesh.visual = TextureVisuals(
+            uv=np.asarray(glass_mesh.visual.uv, dtype=float).copy(),
+            material=build_housemaker_glass_material(False),
+        )
+
+        result = delete_object_faces_preserving_uvs(
+            bytes(scene.export(file_type="glb")),
+            {0},
+        )
+
+        self.assertTrue(result.preserved_textured_uvs)
+        output = _load_scene(result.glb_bytes)
+        output_glass = next(
+            geometry.visual.material
+            for geometry in output.geometry.values()
+            if is_housemaker_glass_material(geometry.visual.material)
+        )
+        self.assertFalse(output_glass.doubleSided)
+        self.assertIsNone(output_glass.baseColorTexture)
 
 
 # ### Multi-material filtering tests ###

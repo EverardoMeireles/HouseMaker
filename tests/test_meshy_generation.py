@@ -161,6 +161,7 @@ class MeshyRequestConstructionTests(unittest.TestCase):
     def test_request_body_uses_compatible_smart_topology_t2_options(self) -> None:
         body = build_image_to_3d_request_body(b"png bytes")
 
+        self.assertEqual(DEFAULT_SMART_TOPOLOGY_TARGET_POLYCOUNT, 2_000)
         self.assertEqual(body["model_type"], "smart-topology")
         self.assertEqual(body["ai_model"], "meshy-t2")
         self.assertEqual(body["texture_resolution"], "2k")

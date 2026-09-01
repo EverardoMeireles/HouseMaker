@@ -245,6 +245,38 @@ class GeneratedObjectPlacementMainTests(unittest.TestCase):
 
         schedule_refresh.assert_called_once_with(preserve_camera=True)
 
+    def test_canvas_removal_signal_routes_only_to_placement_controller(
+        self,
+    ) -> None:
+        with (
+            patch.object(
+                self.workspace.generation,
+                "remove_generated_object_placement",
+                return_value=True,
+            ) as remove_placement,
+            patch.object(
+                self.workspace.generation,
+                "delete_generated_object",
+            ) as delete_object,
+        ):
+            self.workspace.viewer.placed_object_removal_requested.emit("chair")
+
+        remove_placement.assert_called_once_with("chair")
+        delete_object.assert_not_called()
+
+    def test_removed_placement_event_refreshes_canvas_preview(self) -> None:
+        unplaced_record = _record("chair", None)
+
+        with patch.object(
+            self.workspace,
+            "_schedule_viewer_preview_refresh",
+        ) as schedule_refresh:
+            self.workspace.generation.generated_object_placement_changed.emit(
+                unplaced_record
+            )
+
+        schedule_refresh.assert_called_once_with(preserve_camera=True)
+
     def test_build_model_places_visible_record_using_current_level_transform(
         self,
     ) -> None:

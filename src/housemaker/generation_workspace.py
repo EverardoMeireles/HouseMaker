@@ -62,6 +62,14 @@ from housemaker.generation_state import (
 )
 from housemaker.generation_jobs import GenerationJobManager
 from housemaker.generation_views import VideoInpaintView
+from housemaker.glass_material import (
+    DEFAULT_HOUSEMAKER_GLASS_DOUBLE_SIDED,
+    HOUSEMAKER_GLASS_MATERIAL_NAME,
+    HOUSEMAKER_GLASS_MATERIAL_PROFILE,
+    build_housemaker_glass_material,
+    get_housemaker_glass_runtime_key,
+    is_housemaker_glass_material,
+)
 from housemaker.glb import GeneratedModel, import_generated_glb
 from housemaker.meshy_generation import (
     MeshyGenerationResult,
@@ -98,7 +106,6 @@ from housemaker.object_uv_scan_projection import (
     ScanProjectionCancelled,
     ScanProjectionResult,
     ScanProjectionStats,
-    HOUSEMAKER_GLASS_MATERIAL_NAME,
     normalize_projection_camera_percentages,
     scan_project_textured_glb,
 )
@@ -151,6 +158,11 @@ from housemaker.unused_face_removal import (
     UnusedFaceRemovalProgress,
     remove_unused_faces_from_glb,
 )
+from housemaker.safe_duplicate_face_removal import (
+    SafeDuplicateFaceRemovalCancelled,
+    SafeDuplicateFaceRemovalResult,
+    remove_safe_duplicate_faces_from_glb,
+)
 from housemaker.video_source import (
     VIDEO_FILE_FILTER,
     VideoFrameSource,
@@ -196,6 +208,8 @@ TEXTURE_VARIANT_MAP_PNG_PATHS_KEY = "map_texture_asset_paths"
 PBR_MAPS_AVAILABLE_PIPELINE_KEY = "pbr_maps_available"
 PBR_MAPS_ENABLED_PIPELINE_KEY = "pbr_maps_enabled"
 GLASS_CONVERSION_PIPELINE_KEY = "glass_conversion"
+GLASS_MATERIAL_SOURCE_PREFAB = "housemaker_prefab"
+SAFE_DUPLICATE_REMOVAL_PIPELINE_KEY = "safe_duplicate_face_removal"
 # Legacy-only key retained so later geometry operations can discard obsolete
 # masks from projects saved before Object Generation inpainting was removed.
 TEXTURE_INPAINT_STROKES_PIPELINE_KEY = "texture_inpaint_strokes"
@@ -647,6 +661,7 @@ class TextureRegenerationRequest:
     )
     enabled_pbr_maps: tuple[str, ...] = ()
     glass_face_indices: tuple[int, ...] = ()
+    glass_double_sided: bool | None = None
     preserve_existing_glass: bool = False
 
     def __post_init__(self) -> None:
@@ -716,14 +731,21 @@ class TextureRegenerationRequest:
         )
         if any(index < 0 for index in glass_faces):
             raise ValueError("Glass face indices cannot be negative.")
-        if (
-            (glass_faces or self.preserve_existing_glass)
-            and not self.enable_original_uv
-        ):
+        if self.preserve_existing_glass and not self.enable_original_uv:
             raise ValueError(
-                "Glass texture regeneration must preserve original UVs."
+                "Existing glass texture regeneration must preserve original "
+                "UVs."
             )
         object.__setattr__(self, "glass_face_indices", glass_faces)
+        object.__setattr__(
+            self,
+            "glass_double_sided",
+            (
+                None
+                if self.glass_double_sided is None
+                else bool(self.glass_double_sided)
+            ),
+        )
         object.__setattr__(
             self,
             "preserve_existing_glass",
@@ -748,6 +770,7 @@ class _TextureRegenerationPreflight:
     )
     enabled_pbr_maps: tuple[str, ...] = ()
     glass_face_indices: tuple[int, ...] = ()
+    glass_double_sided: bool | None = None
     preserve_existing_glass: bool = False
 
     def __post_init__(self) -> None:
@@ -822,14 +845,21 @@ class _TextureRegenerationPreflight:
         )
         if any(index < 0 for index in glass_faces):
             raise ValueError("Glass face indices cannot be negative.")
-        if (
-            (glass_faces or self.preserve_existing_glass)
-            and not self.enable_original_uv
-        ):
+        if self.preserve_existing_glass and not self.enable_original_uv:
             raise ValueError(
-                "Glass texture regeneration must preserve original UVs."
+                "Existing glass texture regeneration must preserve original "
+                "UVs."
             )
         object.__setattr__(self, "glass_face_indices", glass_faces)
+        object.__setattr__(
+            self,
+            "glass_double_sided",
+            (
+                None
+                if self.glass_double_sided is None
+                else bool(self.glass_double_sided)
+            ),
+        )
         object.__setattr__(
             self,
             "preserve_existing_glass",
@@ -919,6 +949,8 @@ class TextureRegenerationOutcome:
     final_visibility_removed_face_count: int = 0
     final_stacked_face_removed_count: int = 0
     retexture_topology_changed: bool = False
+    safe_duplicate_removed_face_count: int = 0
+    safe_duplicate_group_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -954,9 +986,21 @@ class _SavedObjectTextureRegeneration:
 
 
 @dataclass(frozen=True)
-class StagedMeshyGenerationResult(MeshyGenerationResult):
+class SafeDuplicateProcessedMeshyGenerationResult(MeshyGenerationResult):
+    """Provider result after conservative coincident-triangle cleanup."""
+
+    safe_duplicate_removed_face_count: int = 0
+    safe_duplicate_group_count: int = 0
+
+
+@dataclass(frozen=True)
+class StagedMeshyGenerationResult(SafeDuplicateProcessedMeshyGenerationResult):
     """Final textured result plus auditable geometry-processing revisions."""
 
+    geometry_safe_duplicate_removed_face_count: int = 0
+    geometry_safe_duplicate_group_count: int = 0
+    retextured_safe_duplicate_removed_face_count: int = 0
+    retextured_safe_duplicate_group_count: int = 0
     geometry_task_id: str = ""
     source_glb_bytes: bytes = b""
     postprocessed_glb_bytes: bytes = b""
@@ -981,7 +1025,9 @@ class StagedMeshyGenerationResult(MeshyGenerationResult):
 
 
 @dataclass(frozen=True)
-class ScanProjectedMeshyGenerationResult(MeshyGenerationResult):
+class ScanProjectedMeshyGenerationResult(
+    SafeDuplicateProcessedMeshyGenerationResult
+):
     """One directly textured result rebuilt with weighted camera UVs."""
 
     scan_projection_stats: ScanProjectionStats | None = None
@@ -1070,6 +1116,107 @@ def _build_pbr_pipeline_metadata(
     }
 
 
+def _resolve_glass_double_sided(
+    pipeline: Mapping[str, object],
+    requested_value: bool | None,
+) -> bool:
+    """Resolve new user intent or one persisted legacy glass setting."""
+
+    if requested_value is not None:
+        return bool(requested_value)
+    raw_metadata = pipeline.get(GLASS_CONVERSION_PIPELINE_KEY)
+    if isinstance(raw_metadata, Mapping):
+        raw_value = raw_metadata.get("double_sided")
+        if isinstance(raw_value, bool):
+            return raw_value
+    if isinstance(raw_metadata, Mapping):
+        # Every HouseMaker glass material created before this setting existed
+        # was double-sided, so this is the lossless legacy fallback.
+        return True
+    return DEFAULT_HOUSEMAKER_GLASS_DOUBLE_SIDED
+
+
+def _iter_material_leaves(material: object) -> tuple[object, ...]:
+    """Flatten one trimesh material tree in face-material index order."""
+
+    if material is None:
+        return ()
+    nested_materials = getattr(material, "materials", None)
+    if isinstance(nested_materials, list | tuple):
+        return tuple(
+            leaf
+            for nested_material in nested_materials
+            for leaf in _iter_material_leaves(nested_material)
+        )
+    return (material,)
+
+
+def _collect_scene_glass_face_indices(
+    scene: object,
+) -> frozenset[int] | None:
+    """Return exact selected-face IDs using HouseMaker's canonical node order."""
+
+    try:
+        node_names = sorted(scene.graph.nodes_geometry, key=str)
+        geometry_by_name = scene.geometry
+    except (AttributeError, TypeError):
+        return None
+    glass_faces: set[int] = set()
+    face_offset = 0
+    for node_name in node_names:
+        try:
+            _transform, geometry_name = scene.graph.get(node_name)
+            geometry = geometry_by_name.get(geometry_name)
+            faces = np.asarray(getattr(geometry, "faces", None), dtype=np.int64)
+            vertices = np.asarray(
+                getattr(geometry, "vertices", None),
+                dtype=float,
+            )
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if (
+            faces.ndim != 2
+            or faces.shape[1:] != (3,)
+            or vertices.ndim != 2
+            or vertices.shape[1:] != (3,)
+            or not len(faces)
+            or not len(vertices)
+        ):
+            continue
+        material = getattr(getattr(geometry, "visual", None), "material", None)
+        material_leaves = _iter_material_leaves(material)
+        raw_face_materials = getattr(
+            getattr(geometry, "visual", None),
+            "face_materials",
+            None,
+        )
+        if raw_face_materials is None:
+            face_materials = np.zeros(len(faces), dtype=np.int64)
+        else:
+            try:
+                face_materials = np.asarray(
+                    raw_face_materials,
+                    dtype=np.int64,
+                )
+            except (TypeError, ValueError):
+                return None
+            if face_materials.shape != (len(faces),):
+                return None
+        for local_face_index, material_index in enumerate(face_materials):
+            normalized_material_index = int(material_index)
+            if (
+                normalized_material_index < 0
+                or normalized_material_index >= len(material_leaves)
+            ):
+                return None
+            if is_housemaker_glass_material(
+                material_leaves[normalized_material_index]
+            ):
+                glass_faces.add(face_offset + local_face_index)
+        face_offset += len(faces)
+    return frozenset(glass_faces)
+
+
 def _available_metadata_pbr_maps(
     variant_metadata: Mapping[str, Mapping[str, object]],
 ) -> tuple[str, ...]:
@@ -1130,6 +1277,65 @@ def _texture_regeneration_scan_target(
     return SCAN_PROJECTION_TARGET_LEFT_HALF
 
 
+def _remove_safe_duplicates_from_meshy_result(
+    result: MeshyGenerationResult,
+    progress_callback: Callable[[str], None] | None,
+    cancel_event: threading.Event | None,
+) -> tuple[MeshyGenerationResult, SafeDuplicateFaceRemovalResult]:
+    """Remove only lossless same-facing duplicate triangles from one result."""
+
+    _raise_if_generation_cancelled(cancel_event)
+    if progress_callback is not None:
+        progress_callback("Removing coincident duplicate faces...")
+    try:
+        cleanup = remove_safe_duplicate_faces_from_glb(
+            result.glb_bytes,
+            cancel_requested=(
+                None if cancel_event is None else cancel_event.is_set
+            ),
+        )
+    except SafeDuplicateFaceRemovalCancelled as error:
+        raise _GenerationCancelled from error
+    _raise_if_generation_cancelled(cancel_event)
+    if cleanup.removed_face_count == 0:
+        return result, cleanup
+    if progress_callback is not None:
+        progress_callback(
+            f"Removed {cleanup.removed_face_count} coincident duplicate "
+            + (
+                "face."
+                if cleanup.removed_face_count == 1
+                else "faces."
+            )
+        )
+    previous_removed = int(
+        getattr(result, "safe_duplicate_removed_face_count", 0)
+    )
+    previous_groups = int(
+        getattr(result, "safe_duplicate_group_count", 0)
+    )
+    if isinstance(result, SafeDuplicateProcessedMeshyGenerationResult):
+        cleaned_result = replace(
+            result,
+            glb_bytes=cleanup.glb_bytes,
+            safe_duplicate_removed_face_count=(
+                previous_removed + cleanup.removed_face_count
+            ),
+            safe_duplicate_group_count=(
+                previous_groups + cleanup.duplicate_group_count
+            ),
+        )
+    else:
+        cleaned_result = SafeDuplicateProcessedMeshyGenerationResult(
+            task_id=result.task_id,
+            glb_bytes=cleanup.glb_bytes,
+            name=result.name,
+            safe_duplicate_removed_face_count=cleanup.removed_face_count,
+            safe_duplicate_group_count=cleanup.duplicate_group_count,
+        )
+    return cleaned_result, cleanup
+
+
 def _scan_project_provider_result(
     request: GenerationRequest,
     provider_result: MeshyGenerationResult,
@@ -1166,6 +1372,12 @@ def _scan_project_provider_result(
         task_id=provider_result.task_id,
         glb_bytes=projected.glb_bytes,
         name=provider_result.name,
+        safe_duplicate_removed_face_count=int(
+            getattr(provider_result, "safe_duplicate_removed_face_count", 0)
+        ),
+        safe_duplicate_group_count=int(
+            getattr(provider_result, "safe_duplicate_group_count", 0)
+        ),
         scan_projection_stats=projected.stats,
     )
 
@@ -1204,6 +1416,80 @@ def _build_geometry_fingerprint(glb_bytes: bytes) -> _GeometryFingerprint:
     return _GeometryFingerprint(
         face_count=len(canonical_faces),
         sha256=digest.hexdigest(),
+    )
+
+
+def _remap_faces_by_world_geometry(
+    source_glb: bytes,
+    target_glb: bytes,
+    source_face_indices: Sequence[int],
+) -> tuple[int, ...]:
+    """Map selected source triangles onto a retextured GLB's face order."""
+
+    selected = tuple(sorted(set(int(index) for index in source_face_indices)))
+    if not selected:
+        return ()
+    source = load_object_face_geometry(source_glb)
+    target = load_object_face_geometry(target_glb)
+    if selected[0] < 0 or selected[-1] >= source.face_count:
+        raise ValueError(
+            "The selected glass faces no longer belong to the source model."
+        )
+    source_triangles = _canonicalize_world_triangles(
+        source.vertices[source.faces[np.asarray(selected, dtype=np.int64)]]
+    )
+    target_triangles = _canonicalize_world_triangles(
+        target.vertices[target.faces]
+    )
+    if not len(target_triangles):
+        raise ValueError("Meshy Retexture returned no triangle faces.")
+    coordinate_span = np.ptp(source.vertices, axis=0)
+    model_scale = max(float(np.max(coordinate_span)), np.finfo(float).tiny)
+    coordinate_magnitude = max(
+        float(np.max(np.abs(source.vertices))),
+        float(np.max(np.abs(target.vertices))),
+        1.0,
+    )
+    tolerance = max(
+        model_scale * 1e-6,
+        np.finfo(float).eps * coordinate_magnitude * 256.0,
+    )
+    mapped: set[int] = set()
+    for triangle in source_triangles:
+        maximum_deviation = np.max(
+            np.abs(target_triangles - triangle[np.newaxis, :, :]),
+            axis=(1, 2),
+        )
+        matches = np.flatnonzero(maximum_deviation <= tolerance)
+        if not len(matches):
+            raise ValueError(
+                "Meshy Retexture changed the selected geometry, so its glass "
+                "faces could not be identified safely. The existing object "
+                "was kept."
+            )
+        mapped.update(int(index) for index in matches)
+    return tuple(sorted(mapped))
+
+
+def _canonicalize_world_triangles(triangles: np.ndarray) -> np.ndarray:
+    """Sort every triangle's corners so winding and vertex order do not matter."""
+
+    normalized = np.asarray(triangles, dtype=np.float64)
+    if normalized.ndim != 3 or normalized.shape[1:] != (3, 3):
+        raise ValueError("Face remapping requires triangle geometry.")
+    if not np.all(np.isfinite(normalized)):
+        raise ValueError("Face remapping requires finite triangle geometry.")
+    corner_order = np.lexsort(
+        (normalized[:, :, 2], normalized[:, :, 1], normalized[:, :, 0]),
+        axis=1,
+    )
+    return np.ascontiguousarray(
+        np.take_along_axis(
+            normalized,
+            corner_order[:, :, np.newaxis],
+            axis=1,
+        ),
+        dtype=np.float64,
     )
 
 
@@ -1249,6 +1535,13 @@ class MeshyImagePlanner:
                 cancel_event=cancel_event,
                 enable_pbr=bool(request.enabled_pbr_maps),
             )
+            provider_result, _duplicate_cleanup = (
+                _remove_safe_duplicates_from_meshy_result(
+                    provider_result,
+                    progress_callback,
+                    cancel_event,
+                )
+            )
             return _scan_project_provider_result(
                 request,
                 provider_result,
@@ -1268,7 +1561,14 @@ class MeshyImagePlanner:
             should_texture=False,
         )
 
-        processed_glb_bytes = geometry_result.glb_bytes
+        cleaned_geometry_result, geometry_duplicate_cleanup = (
+            _remove_safe_duplicates_from_meshy_result(
+                geometry_result,
+                progress_callback,
+                cancel_event,
+            )
+        )
+        processed_glb_bytes = cleaned_geometry_result.glb_bytes
         original_face_count = 0
         retained_face_count = 0
         removed_face_count = 0
@@ -1338,6 +1638,18 @@ class MeshyImagePlanner:
                 protected_face_count=protected_face_count,
                 visibility_removed_face_count=visibility_removed_face_count,
                 stacked_face_removed_count=stacked_face_removed_count,
+                safe_duplicate_removed_face_count=(
+                    geometry_duplicate_cleanup.removed_face_count
+                ),
+                safe_duplicate_group_count=(
+                    geometry_duplicate_cleanup.duplicate_group_count
+                ),
+                geometry_safe_duplicate_removed_face_count=(
+                    geometry_duplicate_cleanup.removed_face_count
+                ),
+                geometry_safe_duplicate_group_count=(
+                    geometry_duplicate_cleanup.duplicate_group_count
+                ),
                 unused_face_removal_applied=use_unused_face_removal,
                 minimum_face_visibility_percentage=(
                     request.settings.minimum_face_visibility_percentage
@@ -1371,6 +1683,13 @@ class MeshyImagePlanner:
             enable_pbr=bool(request.enabled_pbr_maps),
         )
         _raise_if_generation_cancelled(cancel_event)
+        textured_result, final_duplicate_cleanup = (
+            _remove_safe_duplicates_from_meshy_result(
+                textured_result,
+                progress_callback,
+                cancel_event,
+            )
+        )
         returned_geometry_fingerprint = _build_geometry_fingerprint(
             textured_result.glb_bytes
         )
@@ -1415,6 +1734,26 @@ class MeshyImagePlanner:
             protected_face_count=protected_face_count,
             visibility_removed_face_count=visibility_removed_face_count,
             stacked_face_removed_count=stacked_face_removed_count,
+            safe_duplicate_removed_face_count=(
+                geometry_duplicate_cleanup.removed_face_count
+                + final_duplicate_cleanup.removed_face_count
+            ),
+            safe_duplicate_group_count=(
+                geometry_duplicate_cleanup.duplicate_group_count
+                + final_duplicate_cleanup.duplicate_group_count
+            ),
+            geometry_safe_duplicate_removed_face_count=(
+                geometry_duplicate_cleanup.removed_face_count
+            ),
+            geometry_safe_duplicate_group_count=(
+                geometry_duplicate_cleanup.duplicate_group_count
+            ),
+            retextured_safe_duplicate_removed_face_count=(
+                final_duplicate_cleanup.removed_face_count
+            ),
+            retextured_safe_duplicate_group_count=(
+                final_duplicate_cleanup.duplicate_group_count
+            ),
             unused_face_removal_applied=use_unused_face_removal,
             minimum_face_visibility_percentage=(
                 request.settings.minimum_face_visibility_percentage
@@ -1622,15 +1961,6 @@ class ObjectGenerationViewerPanel(QWidget):
         self.face_selection_help_label.setWordWrap(True)
         details_layout.addWidget(self.face_selection_help_label)
 
-        self.face_selection_xray_checkbox = QCheckBox("X-ray face selection")
-        self.face_selection_xray_checkbox.setObjectName(
-            "object_face_selection_xray_checkbox"
-        )
-        self.face_selection_xray_checkbox.setToolTip(
-            "Include faces hidden behind the visible surface during Ctrl-drag."
-        )
-        details_layout.addWidget(self.face_selection_xray_checkbox)
-
         self.face_selection_count_label = QLabel("No faces selected")
         self.face_selection_count_label.setObjectName(
             "object_face_selection_count"
@@ -1655,12 +1985,39 @@ class ObjectGenerationViewerPanel(QWidget):
             "convert_generated_object_faces_to_glass_button"
         )
         self.convert_faces_to_glass_button.setToolTip(
-            "Rebuild UVs, reserve a one-percent glass region, generate PBR "
-            "maps, and convert the selected faces to reflective transparent "
-            "glass."
+            "Join the selection into one best-fit two-triangle rectangle, "
+            "rebuild the object's UVs, generate its PBR maps, and assign an "
+            "atlas-independent reflective glass material."
         )
         self.convert_faces_to_glass_button.setEnabled(False)
-        details_layout.addWidget(self.convert_faces_to_glass_button)
+        self.glass_double_sided_checkbox = QCheckBox("Double-sided")
+        self.glass_double_sided_checkbox.setObjectName(
+            "glass_double_sided_checkbox"
+        )
+        self.glass_double_sided_checkbox.setChecked(
+            DEFAULT_HOUSEMAKER_GLASS_DOUBLE_SIDED
+        )
+        self.glass_double_sided_checkbox.setToolTip(
+            "Render converted glass from both sides. Uncheck this to cull "
+            "the panel's back face."
+        )
+        self.glass_conversion_controls = QWidget()
+        self.glass_conversion_controls.setObjectName(
+            "glass_conversion_controls"
+        )
+        glass_conversion_layout = QHBoxLayout(
+            self.glass_conversion_controls
+        )
+        glass_conversion_layout.setContentsMargins(0, 0, 0, 0)
+        glass_conversion_layout.setSpacing(6)
+        glass_conversion_layout.addWidget(
+            self.convert_faces_to_glass_button,
+            1,
+        )
+        glass_conversion_layout.addWidget(
+            self.glass_double_sided_checkbox,
+        )
+        details_layout.addWidget(self.glass_conversion_controls)
 
         self.delete_object_button = QPushButton("Delete object")
         self.delete_object_button.setObjectName(
@@ -2114,6 +2471,26 @@ class TextureRegenerationWorker(QObject):
             if not isinstance(result, MeshyGenerationResult):
                 raise TypeError("Meshy returned an invalid texture result.")
             _raise_if_generation_cancelled(self._cancel_event)
+            safe_duplicate_cleanup: SafeDuplicateFaceRemovalResult | None = None
+            if not request.enable_original_uv:
+                result, safe_duplicate_cleanup = (
+                    _remove_safe_duplicates_from_meshy_result(
+                        result,
+                        self.progress.emit,
+                        self._cancel_event,
+                    )
+                )
+            scan_glass_face_indices = request.glass_face_indices
+            if request.glass_face_indices and not request.enable_original_uv:
+                self.progress.emit(
+                    "Matching selected faces to the newly textured model (81%)"
+                )
+                scan_glass_face_indices = _remap_faces_by_world_geometry(
+                    request.model_glb,
+                    result.glb_bytes,
+                    request.glass_face_indices,
+                )
+                _raise_if_generation_cancelled(self._cancel_event)
             if request.enable_original_uv:
                 # Locally retained UVs and geometry remain authoritative.
                 # Meshy contributes only its new atlas, so deleted faces and
@@ -2135,6 +2512,7 @@ class TextureRegenerationWorker(QObject):
             if (
                 request.settings.unused_face_removal
                 and not request.enable_original_uv
+                and not request.glass_face_indices
             ):
                 self.progress.emit(
                     "Verifying regenerated texture face visibility (82%)"
@@ -2197,15 +2575,20 @@ class TextureRegenerationWorker(QObject):
                 self._symmetry,
             )
             if scan_target is not None:
-                self.progress.emit(
-                    "Rebuilding UVs from the current weighted cameras (84%)"
+                projection_stage = (
+                    "Joining selected glass faces and rebuilding UVs (84%)"
+                    if request.glass_face_indices
+                    else "Rebuilding UVs from the current weighted cameras "
+                    "(84%)"
                 )
+                self.progress.emit(projection_stage)
                 try:
                     projected = scan_project_textured_glb(
                         result.glb_bytes,
                         request.projection_camera_percentages,
                         target_domain=scan_target,
-                        glass_face_indices=request.glass_face_indices,
+                        glass_face_indices=scan_glass_face_indices,
+                        glass_double_sided=request.glass_double_sided,
                         cancellation_check=self._cancel_event.is_set,
                     )
                 except ScanProjectionCancelled as error:
@@ -2278,6 +2661,16 @@ class TextureRegenerationWorker(QObject):
                     else 0
                 ),
                 retexture_topology_changed=retexture_topology_changed,
+                safe_duplicate_removed_face_count=(
+                    0
+                    if safe_duplicate_cleanup is None
+                    else safe_duplicate_cleanup.removed_face_count
+                ),
+                safe_duplicate_group_count=(
+                    0
+                    if safe_duplicate_cleanup is None
+                    else safe_duplicate_cleanup.duplicate_group_count
+                ),
             )
             success_payload: object = outcome
             if self._asset_directory is not None:
@@ -3379,6 +3772,34 @@ class GenerationWorkspace(QWidget):
             self.generated_object_placement_changed.emit(replacement)
         return True
 
+    def remove_generated_object_placement(self, object_id: str) -> bool:
+        """Remove one Canvas placement without deleting its object or assets."""
+
+        normalized_object_id = str(object_id).strip()
+        record_index = next(
+            (
+                index
+                for index, record in enumerate(self._data.generated_objects)
+                if record.object_id == normalized_object_id
+                and record.placement is not None
+            ),
+            None,
+        )
+        if record_index is None:
+            return False
+        request = self._existing_object_placement_request
+        if request is not None and request.object_id == normalized_object_id:
+            self._finish_existing_object_placement_request()
+
+        record = self._data.generated_objects[record_index]
+        replacement = replace(record, placement=None)
+        self._data.generated_objects[record_index] = replacement
+        self.status_label.setText(f"Removed from Canvas: {record.object_name}")
+        self._emit_data_changed()
+        self.generated_object_placement_changed.emit(replacement)
+        self._sync_controls()
+        return True
+
     def cancel_object_placement_request(self, request_id: str) -> bool:
         """Forget one exact completed-object placement request."""
 
@@ -3486,8 +3907,33 @@ class GenerationWorkspace(QWidget):
         selected_faces = self.result_view.get_selected_face_indices()
         if not selected_faces:
             return False
+        generated_model = self._generated_model
+        existing_glass_faces = (
+            None
+            if generated_model is None
+            else _collect_scene_glass_face_indices(generated_model.scene)
+        )
+        face_count = self.result_view.face_edit_face_count
+        if (
+            face_count > 0
+            and (
+                len(selected_faces) >= face_count
+                or (
+                    existing_glass_faces is not None
+                    and len(existing_glass_faces.union(selected_faces))
+                    >= face_count
+                )
+            )
+        ):
+            self.status_label.setText(
+                "Glass conversion must leave at least one non-glass face."
+            )
+            return False
         request = self._build_texture_regeneration_request(
             glass_face_indices=selected_faces,
+            glass_double_sided=(
+                self.glass_double_sided_checkbox.isChecked()
+            ),
         )
         if request is None:
             return False
@@ -4142,9 +4588,6 @@ class GenerationWorkspace(QWidget):
             OBJECT_GENERATION_AMBIENT_LIGHT_INTENSITY
         )
         self.generated_objects_list = self.object_3d_panel.object_list
-        self.face_selection_xray_checkbox = (
-            self.object_3d_panel.face_selection_xray_checkbox
-        )
         self.face_selection_count_label = (
             self.object_3d_panel.face_selection_count_label
         )
@@ -4153,6 +4596,9 @@ class GenerationWorkspace(QWidget):
         )
         self.convert_faces_to_glass_button = (
             self.object_3d_panel.convert_faces_to_glass_button
+        )
+        self.glass_double_sided_checkbox = (
+            self.object_3d_panel.glass_double_sided_checkbox
         )
         self.delete_generated_object_button = (
             self.object_3d_panel.delete_object_button
@@ -4166,9 +4612,6 @@ class GenerationWorkspace(QWidget):
         )
         self.delete_generated_object_button.clicked.connect(
             self._handle_delete_generated_object_clicked
-        )
-        self.face_selection_xray_checkbox.toggled.connect(
-            self.result_view.set_face_selection_xray_enabled
         )
         self.result_view.face_selection_changed.connect(
             self._handle_face_selection_changed
@@ -5018,7 +5461,9 @@ class GenerationWorkspace(QWidget):
             if runtime is not None and runtime.requested_name
             else result.name
         )
-        pipeline: dict[str, object] = {}
+        pipeline: dict[str, object] = (
+            _build_safe_duplicate_removal_pipeline_metadata(result)
+        )
         persisted_asset_paths: list[str] = []
         symmetry: ObjectSymmetricDivisionMetadata | None = None
         scan_projection_stats: ScanProjectionStats | None = None
@@ -5226,6 +5671,14 @@ class GenerationWorkspace(QWidget):
             )
         else:
             self.status_label.setText(f"Generated: {object_name}")
+        if not isinstance(result, StagedMeshyGenerationResult):
+            duplicate_status = _format_safe_duplicate_removal_status(result)
+            if duplicate_status:
+                self.status_label.setText(
+                    self.status_label.text().rstrip(".")
+                    + ". "
+                    + duplicate_status
+                )
         if symmetry is not None:
             self.status_label.setText(
                 f"{self.status_label.text()} Automatic symmetric division "
@@ -5328,6 +5781,10 @@ class GenerationWorkspace(QWidget):
             )
         else:
             status = f"Generated: {object_name}"
+        if not isinstance(result, StagedMeshyGenerationResult):
+            duplicate_status = _format_safe_duplicate_removal_status(result)
+            if duplicate_status:
+                status = status.rstrip(".") + ". " + duplicate_status
         if saved.symmetry is not None:
             status += (
                 " Automatic symmetric division kept the "
@@ -5922,6 +6379,7 @@ class GenerationWorkspace(QWidget):
         self,
         *,
         glass_face_indices: Sequence[int] = (),
+        glass_double_sided: bool | None = None,
     ) -> _TextureRegenerationPreflight | None:
         record = self._find_generated_object_record(self._selected_object_id)
         if not self._can_regenerate_object_texture(record):
@@ -5936,15 +6394,6 @@ class GenerationWorkspace(QWidget):
         )
         if any(index < 0 for index in normalized_glass_faces):
             self.status_label.setText("Selected glass faces are invalid.")
-            return None
-        if (
-            normalized_glass_faces
-            and not self._selected_object_has_complete_texture_uvs(record)
-        ):
-            self.status_label.setText(
-                "Convert faces to glass requires a textured object with UVs. "
-                "Generate its texture first."
-            )
             return None
         selected_crop = self.video_view.build_selected_object_crop()
         if selected_crop.size == 0:
@@ -5987,11 +6436,14 @@ class GenerationWorkspace(QWidget):
                 record.pipeline.get(GLASS_CONVERSION_PIPELINE_KEY),
                 Mapping,
             )
+            has_complete_texture_uvs = (
+                self._selected_object_has_complete_texture_uvs(record)
+            )
             enable_original_uv = bool(
                 preserve_symmetric_uvs
                 or record.pipeline.get(LOCALLY_AUTHORED_UVS_PIPELINE_KEY)
-                or normalized_glass_faces
                 or preserve_existing_glass
+                or (normalized_glass_faces and has_complete_texture_uvs)
             )
             enabled_pbr_maps = (
                 PBR_MAP_TYPES
@@ -6012,6 +6464,7 @@ class GenerationWorkspace(QWidget):
                 ),
                 enabled_pbr_maps=enabled_pbr_maps,
                 glass_face_indices=normalized_glass_faces,
+                glass_double_sided=glass_double_sided,
                 preserve_existing_glass=preserve_existing_glass,
             )
         except Exception as error:
@@ -6117,16 +6570,10 @@ class GenerationWorkspace(QWidget):
         selected_face_count = len(
             self.result_view.get_selected_face_indices()
         )
-        selected_object_has_texture_uvs = (
-            self._selected_object_has_complete_texture_uvs(selected_record)
-        )
         face_selection_is_available = (
             selected_record is not None
             and self.result_view.face_edit_face_count > 0
             and not selected_object_is_busy
-        )
-        self.face_selection_xray_checkbox.setEnabled(
-            face_selection_is_available
         )
         self.delete_selected_faces_button.setEnabled(
             selected_record is not None
@@ -6142,7 +6589,6 @@ class GenerationWorkspace(QWidget):
             and self.video_view.get_frame_bgr() is not None
             and self.video_view.has_selection()
             and projection_camera_percentages_are_valid
-            and selected_object_has_texture_uvs
         )
         self.result_view.set_face_editing_enabled(
             face_selection_is_available
@@ -6398,6 +6844,9 @@ class GenerationWorkspace(QWidget):
     ) -> None:
         if repair_missing_variant:
             record = self._repair_missing_active_texture_variant(record)
+        self.glass_double_sided_checkbox.setChecked(
+            _resolve_glass_double_sided(record.pipeline, None)
+        )
         next_snapshot = _build_generated_object_display_snapshot(
             record,
             self._asset_directory,
@@ -7042,6 +7491,8 @@ def _staged_result_used_scan_projection(
 
 def _staged_generation_mode(result: StagedMeshyGenerationResult) -> str:
     stages: list[str] = []
+    if result.safe_duplicate_removed_face_count > 0:
+        stages.append("safe_duplicate_face_removal")
     if _staged_result_used_face_removal(result):
         stages.append("unused_face_removal")
     if _staged_result_used_visibility_uv(result):
@@ -7065,6 +7516,9 @@ def _format_staged_generation_status(
     generated_label: str = "Generated",
 ) -> str:
     messages = [f"{generated_label}: {object_name}."]
+    duplicate_status = _format_safe_duplicate_removal_status(result)
+    if duplicate_status:
+        messages.append(duplicate_status)
     if _staged_result_used_face_removal(result):
         messages.append(
             f"Removed {result.removed_face_count} of "
@@ -7084,6 +7538,44 @@ def _format_staged_generation_status(
     return " ".join(messages)
 
 
+def _format_safe_duplicate_removal_status(result: object) -> str:
+    """Describe a conservative cleanup only when it changed the model."""
+
+    removed_face_count = int(
+        getattr(result, "safe_duplicate_removed_face_count", 0)
+    )
+    if removed_face_count <= 0:
+        return ""
+    if isinstance(result, StagedMeshyGenerationResult):
+        geometry_count = result.geometry_safe_duplicate_removed_face_count
+        retextured_count = (
+            result.retextured_safe_duplicate_removed_face_count
+        )
+        if geometry_count > 0 and retextured_count > 0:
+            return (
+                f"Removed {removed_face_count} coincident duplicate face "
+                "occurrences across preprocessing passes "
+                f"({geometry_count} from geometry and {retextured_count} "
+                "from the retextured model)."
+            )
+        if geometry_count > 0:
+            return (
+                f"Removed {geometry_count} coincident duplicate "
+                + ("face" if geometry_count == 1 else "faces")
+                + " from generated geometry."
+            )
+        if retextured_count > 0:
+            return (
+                f"Removed {retextured_count} coincident duplicate "
+                + ("face" if retextured_count == 1 else "faces")
+                + " from the retextured model."
+            )
+    return (
+        f"Removed {removed_face_count} coincident duplicate "
+        + ("face." if removed_face_count == 1 else "faces.")
+    )
+
+
 # ### Texture-regeneration status helpers ###
 def _format_texture_face_cleanup_status(
     outcome: TextureRegenerationOutcome,
@@ -7091,8 +7583,11 @@ def _format_texture_face_cleanup_status(
     """Describe optional final geometry verification without hiding counts."""
 
     status = ""
+    duplicate_status = _format_safe_duplicate_removal_status(outcome)
+    if duplicate_status:
+        status = f" {duplicate_status}"
     if outcome.final_face_removal_applied:
-        status = (
+        status += (
             f" Final cleanup removed {outcome.final_removed_face_count} of "
             f"{outcome.final_original_face_count} faces."
         )
@@ -7116,21 +7611,68 @@ def _build_scan_projection_pipeline_metadata(
     }
 
 
+def _build_safe_duplicate_removal_pipeline_metadata(
+    result: object,
+) -> dict[str, object]:
+    """Persist only a cleanup that removed proven duplicate triangles."""
+
+    removed_face_count = int(
+        getattr(result, "safe_duplicate_removed_face_count", 0)
+    )
+    duplicate_group_count = int(
+        getattr(result, "safe_duplicate_group_count", 0)
+    )
+    if removed_face_count <= 0:
+        return {}
+    cleanup_metadata: dict[str, object] = {
+        "removed_face_count": removed_face_count,
+        "duplicate_group_count": duplicate_group_count,
+    }
+    if isinstance(result, StagedMeshyGenerationResult):
+        cleanup_metadata["count_scope"] = "preprocessing_pass_occurrences"
+        passes: dict[str, object] = {}
+        if result.geometry_safe_duplicate_removed_face_count > 0:
+            passes["generated_geometry"] = {
+                "removed_face_count": (
+                    result.geometry_safe_duplicate_removed_face_count
+                ),
+                "duplicate_group_count": (
+                    result.geometry_safe_duplicate_group_count
+                ),
+            }
+        if result.retextured_safe_duplicate_removed_face_count > 0:
+            passes["retextured_model"] = {
+                "removed_face_count": (
+                    result.retextured_safe_duplicate_removed_face_count
+                ),
+                "duplicate_group_count": (
+                    result.retextured_safe_duplicate_group_count
+                ),
+            }
+        cleanup_metadata["passes"] = passes
+    return {
+        SAFE_DUPLICATE_REMOVAL_PIPELINE_KEY: cleanup_metadata
+    }
+
+
 def _build_staged_generation_pipeline_metadata(
     result: StagedMeshyGenerationResult,
     source_asset_path: str,
 ) -> dict[str, object]:
     """Build one shared persisted description of local generation stages."""
 
-    pipeline: dict[str, object] = {
-        "mode": _staged_generation_mode(result),
-        "geometry_task_id": result.geometry_task_id,
-        "source_asset_path": source_asset_path,
-        "unused_face_removal_applied": (
-            _staged_result_used_face_removal(result)
-        ),
-        "geometry_only": result.geometry_only,
-    }
+    pipeline = _build_safe_duplicate_removal_pipeline_metadata(result)
+    pipeline.update(
+        {
+            "mode": _staged_generation_mode(result),
+            "geometry_task_id": result.geometry_task_id,
+            "source_asset_path": source_asset_path,
+            "unused_face_removal_applied": (
+                _staged_result_used_face_removal(result)
+            ),
+            "geometry_only": result.geometry_only,
+        }
+    )
     if _staged_result_used_face_removal(result):
         pipeline.update(
             {
@@ -7690,6 +8232,11 @@ def _build_regenerated_texture_pipeline(
     request = outcome.request
     result = outcome.result
     pipeline: dict[str, object] = dict(record.pipeline)
+    previous_glass_metadata = pipeline.get(GLASS_CONVERSION_PIPELINE_KEY)
+    resolved_glass_double_sided = _resolve_glass_double_sided(
+        pipeline,
+        request.glass_double_sided,
+    )
     pipeline.pop(TEXTURE_INPAINT_STROKES_PIPELINE_KEY, None)
     pipeline.pop(FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY, None)
     pipeline.pop(FACE_EDIT_ATLAS_PLACEHOLDERS_PIPELINE_KEY, None)
@@ -7723,6 +8270,10 @@ def _build_regenerated_texture_pipeline(
     if request.glass_face_indices:
         history_entry["glass_source_face_count"] = len(
             request.glass_face_indices
+        )
+    if request.glass_face_indices or request.preserve_existing_glass:
+        history_entry["glass_double_sided"] = (
+            resolved_glass_double_sided
         )
     scan_projection_stats = outcome.scan_projection_stats
     if scan_projection_stats is not None:
@@ -7763,6 +8314,13 @@ def _build_regenerated_texture_pipeline(
                 ),
             }
         )
+    if outcome.safe_duplicate_removed_face_count > 0:
+        history_entry[SAFE_DUPLICATE_REMOVAL_PIPELINE_KEY] = {
+            "removed_face_count": (
+                outcome.safe_duplicate_removed_face_count
+            ),
+            "duplicate_group_count": outcome.safe_duplicate_group_count,
+        }
     raw_history = pipeline.get("texture_regeneration_history")
     history = (
         [dict(entry) for entry in raw_history if isinstance(entry, dict)]
@@ -7793,6 +8351,12 @@ def _build_regenerated_texture_pipeline(
             "last_texture_face_removal_applied": (
                 outcome.final_face_removal_applied
             ),
+            "last_texture_safe_duplicate_removed_face_count": (
+                outcome.safe_duplicate_removed_face_count
+            ),
+            "last_texture_safe_duplicate_group_count": (
+                outcome.safe_duplicate_group_count
+            ),
             "texture_regeneration_history": history[-25:],
             PBR_MAPS_ENABLED_PIPELINE_KEY: list(request.enabled_pbr_maps),
             PBR_MAPS_AVAILABLE_PIPELINE_KEY: list(
@@ -7807,12 +8371,40 @@ def _build_regenerated_texture_pipeline(
             _build_scan_projection_pipeline_metadata(scan_projection_stats)
         )
         if scan_projection_stats.glass_face_count:
+            source_face_count = len(request.glass_face_indices)
+            if (
+                source_face_count == 0
+                and isinstance(previous_glass_metadata, Mapping)
+            ):
+                raw_source_face_count = previous_glass_metadata.get(
+                    "source_face_count",
+                    0,
+                )
+                if (
+                    isinstance(raw_source_face_count, int)
+                    and not isinstance(raw_source_face_count, bool)
+                ):
+                    source_face_count = max(raw_source_face_count, 0)
+            prefab_glass_material = build_housemaker_glass_material(
+                resolved_glass_double_sided
+            )
+            runtime_material_key = get_housemaker_glass_runtime_key(
+                prefab_glass_material
+            )
+            if runtime_material_key is None:
+                raise RuntimeError(
+                    "The prefab glass runtime key could not be resolved."
+                )
             pipeline[GLASS_CONVERSION_PIPELINE_KEY] = {
                 "material_name": HOUSEMAKER_GLASS_MATERIAL_NAME,
-                "source_face_count": len(request.glass_face_indices),
+                "material_source": GLASS_MATERIAL_SOURCE_PREFAB,
+                "material_profile": HOUSEMAKER_GLASS_MATERIAL_PROFILE,
+                "atlas_independent": True,
+                "runtime_material_key": runtime_material_key,
+                "double_sided": resolved_glass_double_sided,
+                "source_face_count": source_face_count,
                 "output_face_count": scan_projection_stats.glass_face_count,
-                "pixel_count": scan_projection_stats.glass_pixel_count,
-                "allocation_percentage": 1,
+                "atlas_pixel_count": scan_projection_stats.glass_pixel_count,
             }
     if outcome.final_face_removal_applied:
         pipeline.update(
@@ -8224,6 +8816,7 @@ def _materialize_texture_regeneration_preflight(
         ),
         enabled_pbr_maps=raw_request.enabled_pbr_maps,
         glass_face_indices=raw_request.glass_face_indices,
+        glass_double_sided=raw_request.glass_double_sided,
         preserve_existing_glass=raw_request.preserve_existing_glass,
     )
     return _MaterializedTextureRegeneration(
@@ -8243,7 +8836,9 @@ def _prepare_and_persist_object_generation(
 ) -> _SavedObjectGeneration:
     """Prepare every model revision without touching GUI-owned state."""
 
-    pipeline: dict[str, object] = {}
+    pipeline: dict[str, object] = (
+        _build_safe_duplicate_removal_pipeline_metadata(result)
+    )
     persisted_asset_paths: list[str] = []
     symmetry: ObjectSymmetricDivisionMetadata | None = None
     scan_projection_stats: ScanProjectionStats | None = None

@@ -25,10 +25,10 @@ from housemaker.viewer import (
     SelectableGLViewWidget,
     _FaceRectangleSelectionResult,
     _WireframeOverlayMeshItem,
+    _capture_face_selection_raster_input,
     _get_nearest_triangle_ray_face_index,
     _project_vertices_to_view,
     _rasterize_face_selection,
-    _select_face_indices_in_view_rectangle,
 )
 
 
@@ -262,11 +262,17 @@ class ObjectFaceSelectionGeometryTests(unittest.TestCase):
         )
         faces = np.asarray(((0, 1, 2),), dtype=np.int64)
 
-        selected = _select_face_indices_in_view_rectangle(
+        captured = _capture_face_selection_raster_input(
             IdentityView(),  # type: ignore[arg-type]
             [(vertices, faces)],
             QRect(20, 20, 60, 60),
-            xray=False,
+        )
+        self.assertIsNotNone(captured)
+        assert captured is not None
+        projected_geometry, rectangle = captured
+        selected = _rasterize_face_selection(
+            projected_geometry,
+            QRect(*rectangle),
         )
 
         self.assertEqual(selected, {0})
@@ -315,16 +321,9 @@ class ObjectFaceSelectionGeometryTests(unittest.TestCase):
         visible = _rasterize_face_selection(
             [(projected_vertices, faces)],
             rectangle,
-            xray=False,
-        )
-        xray = _rasterize_face_selection(
-            [(projected_vertices, faces)],
-            rectangle,
-            xray=True,
         )
 
         self.assertEqual(visible, {1})
-        self.assertEqual(xray, {0, 1})
 
     def test_slanted_overlap_uses_per_pixel_depth(self) -> None:
         projected_vertices = np.asarray(
@@ -343,7 +342,6 @@ class ObjectFaceSelectionGeometryTests(unittest.TestCase):
         visible = _rasterize_face_selection(
             [(projected_vertices, faces)],
             QRect(0, 0, 11, 11),
-            xray=False,
         )
 
         self.assertEqual(visible, {0, 1})
@@ -365,7 +363,6 @@ class ObjectFaceSelectionGeometryTests(unittest.TestCase):
         visible = _rasterize_face_selection(
             [(projected_vertices, faces)],
             QRect(0, 0, 11, 11),
-            xray=False,
         )
 
         self.assertEqual(visible, {0})
@@ -399,7 +396,6 @@ class ObjectFaceSelectionGeometryTests(unittest.TestCase):
                 actual = _rasterize_face_selection(
                     [(coordinates, faces)],
                     QRect(0, 0, width, height),
-                    xray=False,
                 )
 
                 self.assertEqual(actual, expected)
@@ -418,7 +414,6 @@ class ObjectFaceSelectionGeometryTests(unittest.TestCase):
         visible = _rasterize_face_selection(
             [(projected_vertices, faces)],
             QRect(0, 0, 24, 20),
-            xray=False,
         )
 
         self.assertEqual(visible, {0})
@@ -693,7 +688,6 @@ class ObjectFaceSelectionWidgetTests(unittest.TestCase):
             projected_geometry: object,
             _rectangle: object,
             *,
-            xray: bool,
             cancel_event: threading.Event | None = None,
         ) -> set[int]:
             arrays = tuple(
@@ -706,7 +700,6 @@ class ObjectFaceSelectionWidgetTests(unittest.TestCase):
             observations["read_only"] = all(
                 not array.flags.writeable for array in arrays
             )
-            observations["xray"] = xray
             observations["cancel_event"] = cancel_event is not None
             started.set()
             release.wait(5.0)
@@ -739,7 +732,6 @@ class ObjectFaceSelectionWidgetTests(unittest.TestCase):
         self.assertNotEqual(observations["thread_id"], main_thread_id)
         self.assertTrue(observations["daemon"])
         self.assertTrue(observations["read_only"])
-        self.assertFalse(observations["xray"])
         self.assertTrue(observations["cancel_event"])
         self.assertEqual(delivery_threads, [main_thread_id])
         self.assertEqual(viewer.get_selected_face_indices(), (1,))
@@ -802,10 +794,8 @@ class ObjectFaceSelectionWidgetTests(unittest.TestCase):
             _projected_geometry: object,
             _rectangle: object,
             *,
-            xray: bool,
             cancel_event: threading.Event | None = None,
         ) -> set[int]:
-            del xray
             del cancel_event
             started.set()
             release.wait(5.0)

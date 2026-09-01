@@ -33,6 +33,7 @@ from housemaker.generation_state import (
     MaskStroke,
 )
 from housemaker.generation_views import VideoInpaintView, rasterize_mask_strokes
+from housemaker.glass_material import HOUSEMAKER_GLASS_MATERIAL_NAME
 from housemaker.generation_workspace import (
     GENERATION_BACKEND_MESHY,
     GenerationRequest,
@@ -41,6 +42,7 @@ from housemaker.generation_workspace import (
     MeshyImagePlanner,
     MeshyModelExecutor,
     LOCALLY_AUTHORED_UVS_PIPELINE_KEY,
+    SAFE_DUPLICATE_REMOVAL_PIPELINE_KEY,
     SCAN_PROJECTION_PIPELINE_KEY,
     ScanProjectedMeshyGenerationResult,
     StagedMeshyGenerationResult,
@@ -50,16 +52,20 @@ from housemaker.generation_workspace import (
     _ObjectGenerationProgressMapper,
     _GenerationCancelled,
     _build_geometry_fingerprint,
+    _build_safe_duplicate_removal_pipeline_metadata,
     _build_staged_generation_pipeline_metadata,
     _build_texture_resolution_entries,
+    _collect_scene_glass_face_indices,
     _format_model_statistics,
     _collect_model_uv_triangles,
+    _remap_faces_by_world_geometry,
     _resolve_staged_postprocessed_asset_path,
     _staged_generation_mode,
     update_projection_camera_percentage,
 )
 from housemaker.glb import GeneratedModel, import_generated_glb
 from housemaker.meshy_generation import MeshyGenerationResult
+from housemaker.object_face_edit import load_object_face_geometry
 from housemaker.object_uv_raycast import (
     UV_TARGET_DOMAIN_FULL,
     VISIBILITY_UV_UNWRAP_VERSION,
@@ -79,7 +85,10 @@ from housemaker.object_texture_variants import (
     PBR_MAP_ROUGHNESS,
     PBR_MAP_TYPES,
 )
-from housemaker.settings_widget import GenerationServiceSettings
+from housemaker.settings_widget import (
+    DEFAULT_MESHY_TARGET_POLYCOUNT,
+    GenerationServiceSettings,
+)
 from housemaker.texture_atlas_view import TextureAtlasEntry
 from housemaker.unused_face_removal import (
     ALL_CAMERA_IDS,
@@ -218,6 +227,24 @@ def _test_uv_glb() -> bytes:
     faces = np.asarray(((0, 1, 2), (0, 2, 3)), dtype=np.int64)
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     mesh.visual = TextureVisuals(uv=uv, material=PBRMaterial())
+    return bytes(trimesh.Scene(mesh).export(file_type="glb"))
+
+
+def _test_duplicate_triangle_glb() -> bytes:
+    """Build two visually equivalent same-facing coincident triangles."""
+
+    mesh = trimesh.Trimesh(
+        vertices=np.asarray(
+            (
+                (0.0, 0.0, 0.0),
+                (1.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0),
+            ),
+            dtype=float,
+        ),
+        faces=np.asarray(((0, 1, 2), (0, 1, 2)), dtype=np.int64),
+        process=False,
+    )
     return bytes(trimesh.Scene(mesh).export(file_type="glb"))
 
 
@@ -749,6 +776,212 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
         self.assertEqual(decoded.shape, selected.shape)
         np.testing.assert_array_equal(decoded, selected)
 
+    def test_direct_generation_removes_safe_duplicates_before_uv_scan(self) -> None:
+        request = GenerationRequest(
+            frame_index=0,
+            selected_object_bgra=np.zeros((4, 4, 4), dtype=np.uint8),
+            settings=GenerationServiceSettings(
+                meshy_api_key="meshy-key",
+                use_uv_raycast_for_object_generation=True,
+            ),
+        )
+        provider_result = MeshyGenerationResult(
+            task_id="duplicate-task",
+            glb_bytes=_test_duplicate_triangle_glb(),
+            name="Duplicate panel",
+        )
+        cleaned_glbs: list[bytes] = []
+
+        def capture_scan(
+            glb_bytes: bytes,
+            _percentages: tuple[int, ...],
+            **_kwargs: object,
+        ) -> ScanProjectionResult:
+            cleaned_glbs.append(glb_bytes)
+            return ScanProjectionResult(
+                glb_bytes=glb_bytes,
+                stats=_test_scan_projection_stats(),
+            )
+
+        with (
+            patch(
+                "housemaker.generation_workspace.request_image_to_3d_model",
+                return_value=provider_result,
+            ),
+            patch(
+                "housemaker.generation_workspace.scan_project_textured_glb",
+                side_effect=capture_scan,
+            ),
+        ):
+            result = MeshyImagePlanner().plan(request)
+
+        self.assertEqual(len(cleaned_glbs), 1)
+        self.assertEqual(
+            len(import_generated_glb(cleaned_glbs[0]).mesh.faces),
+            1,
+        )
+        self.assertEqual(result.safe_duplicate_removed_face_count, 1)
+        self.assertEqual(result.safe_duplicate_group_count, 1)
+        self.assertEqual(
+            _build_safe_duplicate_removal_pipeline_metadata(result),
+            {
+                SAFE_DUPLICATE_REMOVAL_PIPELINE_KEY: {
+                    "removed_face_count": 1,
+                    "duplicate_group_count": 1,
+                }
+            },
+        )
+
+    def test_geometry_only_keeps_raw_revision_and_displays_clean_revision(
+        self,
+    ) -> None:
+        source_glb = _test_duplicate_triangle_glb()
+        request = GenerationRequest(
+            frame_index=0,
+            selected_object_bgra=np.zeros((4, 4, 4), dtype=np.uint8),
+            settings=GenerationServiceSettings(meshy_api_key="meshy-key"),
+            geometry_only=True,
+        )
+
+        with patch(
+            "housemaker.generation_workspace.request_image_to_3d_model",
+            return_value=MeshyGenerationResult(
+                task_id="geometry-task",
+                glb_bytes=source_glb,
+                name="Duplicate geometry",
+            ),
+        ):
+            result = MeshyImagePlanner().plan(request)
+
+        self.assertIsInstance(result, StagedMeshyGenerationResult)
+        assert isinstance(result, StagedMeshyGenerationResult)
+        self.assertEqual(result.source_glb_bytes, source_glb)
+        self.assertEqual(
+            len(import_generated_glb(result.source_glb_bytes).mesh.faces),
+            2,
+        )
+        self.assertEqual(
+            len(import_generated_glb(result.postprocessed_glb_bytes).mesh.faces),
+            1,
+        )
+        self.assertEqual(result.glb_bytes, result.postprocessed_glb_bytes)
+        self.assertEqual(result.safe_duplicate_removed_face_count, 1)
+        self.assertEqual(
+            result.geometry_safe_duplicate_removed_face_count,
+            1,
+        )
+        self.assertEqual(
+            result.retextured_safe_duplicate_removed_face_count,
+            0,
+        )
+        self.assertEqual(
+            _staged_generation_mode(result),
+            "safe_duplicate_face_removal_geometry_only",
+        )
+        pipeline = _build_staged_generation_pipeline_metadata(
+            result,
+            "objects/source.glb",
+        )
+        self.assertEqual(
+            pipeline[SAFE_DUPLICATE_REMOVAL_PIPELINE_KEY],
+            {
+                "removed_face_count": 1,
+                "duplicate_group_count": 1,
+                "count_scope": "preprocessing_pass_occurrences",
+                "passes": {
+                    "generated_geometry": {
+                        "removed_face_count": 1,
+                        "duplicate_group_count": 1,
+                    }
+                },
+            },
+        )
+
+    def test_staged_generation_records_each_duplicate_cleanup_pass(
+        self,
+    ) -> None:
+        duplicate_glb = _test_duplicate_triangle_glb()
+        request = GenerationRequest(
+            frame_index=0,
+            selected_object_bgra=np.zeros((4, 4, 4), dtype=np.uint8),
+            settings=GenerationServiceSettings(
+                meshy_api_key="meshy-key",
+                unused_face_removal=True,
+            ),
+        )
+        removal_inputs: list[bytes] = []
+
+        def keep_all_faces(
+            glb_bytes: bytes,
+            **_kwargs: object,
+        ) -> UnusedFaceRemovalResult:
+            removal_inputs.append(glb_bytes)
+            model = import_generated_glb(glb_bytes)
+            face_count = len(model.mesh.faces)
+            return UnusedFaceRemovalResult(
+                model=model,
+                enabled_camera_ids=ALL_CAMERA_IDS,
+                original_face_count=face_count,
+                retained_face_count=face_count,
+                removed_face_count=0,
+                protected_face_count=face_count,
+            )
+
+        with (
+            patch(
+                "housemaker.generation_workspace.request_image_to_3d_model",
+                return_value=MeshyGenerationResult(
+                    "geometry-task",
+                    duplicate_glb,
+                    "Geometry",
+                ),
+            ),
+            patch(
+                "housemaker.generation_workspace.request_retextured_model",
+                return_value=MeshyGenerationResult(
+                    "texture-task",
+                    duplicate_glb,
+                    "Textured",
+                ),
+            ),
+            patch(
+                "housemaker.generation_workspace.remove_unused_faces_from_glb",
+                side_effect=keep_all_faces,
+            ),
+        ):
+            result = MeshyImagePlanner().plan(request)
+
+        self.assertIsInstance(result, StagedMeshyGenerationResult)
+        assert isinstance(result, StagedMeshyGenerationResult)
+        self.assertEqual(len(removal_inputs), 2)
+        self.assertTrue(
+            all(
+                len(import_generated_glb(payload).mesh.faces) == 1
+                for payload in removal_inputs
+            )
+        )
+        self.assertEqual(result.safe_duplicate_removed_face_count, 2)
+        self.assertEqual(
+            result.geometry_safe_duplicate_removed_face_count,
+            1,
+        )
+        self.assertEqual(
+            result.retextured_safe_duplicate_removed_face_count,
+            1,
+        )
+        metadata = _build_safe_duplicate_removal_pipeline_metadata(result)
+        cleanup = metadata[SAFE_DUPLICATE_REMOVAL_PIPELINE_KEY]
+        self.assertIsInstance(cleanup, dict)
+        assert isinstance(cleanup, dict)
+        self.assertEqual(
+            cleanup["count_scope"],
+            "preprocessing_pass_occurrences",
+        )
+        self.assertEqual(
+            set(cleanup["passes"]),  # type: ignore[arg-type]
+            {"generated_geometry", "retextured_model"},
+        )
+
     def test_weighted_projection_scans_one_normal_textured_meshy_result(
         self,
     ) -> None:
@@ -762,7 +995,7 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
         )
         provider_result = MeshyGenerationResult(
             task_id="texture-task",
-            glb_bytes=b"provider-textured-glb",
+            glb_bytes=_test_model().glb_bytes,
             name="Textured chair",
         )
         scan_result = ScanProjectionResult(
@@ -827,7 +1060,7 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
         )
         provider_result = MeshyGenerationResult(
             task_id="image-to-3d-task",
-            glb_bytes=b"provider-textured-glb",
+            glb_bytes=_test_model().glb_bytes,
             name="Textured chair",
         )
 
@@ -883,7 +1116,7 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
         )
         geometry_result = MeshyGenerationResult(
             task_id="geometry-task",
-            glb_bytes=b"geometry-glb",
+            glb_bytes=_test_model().glb_bytes,
             name="Geometry",
         )
         with (
@@ -1298,8 +1531,9 @@ class MeshyGenerationAdapterTests(unittest.TestCase):
 # ### Projection camera percentage tests ###
 class ProjectionCameraPercentageTests(unittest.TestCase):
     def test_decrease_preserves_free_capacity_for_later_increases(self) -> None:
+        balanced_percentages = (17, 17, 17, 17, 16, 16)
         decreased = update_projection_camera_percentage(
-            DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
+            balanced_percentages,
             ALL_CAMERA_IDS[0],
             16,
         )
@@ -1328,9 +1562,10 @@ class ProjectionCameraPercentageTests(unittest.TestCase):
     def test_rounding_is_deterministic_and_every_camera_keeps_one_percent(
         self,
     ) -> None:
+        balanced_percentages = (17, 17, 17, 17, 16, 16)
         self.assertEqual(
             update_projection_camera_percentage(
-                DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
+                balanced_percentages,
                 ALL_CAMERA_IDS[0],
                 18,
             ),
@@ -1442,6 +1677,8 @@ class GenerationWorkspaceTests(unittest.TestCase):
         spinbox = self.workspace.meshy_target_polycount_spinbox
 
         self.assertTrue(control.isVisible())
+        self.assertEqual(spinbox.value(), DEFAULT_MESHY_TARGET_POLYCOUNT)
+        self.assertEqual(DEFAULT_MESHY_TARGET_POLYCOUNT, 2_000)
         self.workspace.set_runtime_settings(
             GenerationServiceSettings(
                 meshy_api_key="meshy-key",
@@ -1462,7 +1699,7 @@ class GenerationWorkspaceTests(unittest.TestCase):
         )
         self.assertEqual(spinbox.value(), 5_600)
 
-    def test_face_purge_and_legacy_camera_checkboxes_are_absent(self) -> None:
+    def test_removed_face_tools_and_legacy_camera_controls_are_absent(self) -> None:
         panel = self.workspace.object_3d_panel
 
         self.assertFalse(hasattr(panel, "unused_face_camera_controls"))
@@ -1471,6 +1708,16 @@ class GenerationWorkspaceTests(unittest.TestCase):
         self.assertFalse(hasattr(self.workspace, "purge_faces_button"))
         self.assertFalse(
             hasattr(self.workspace, "purge_selected_object_faces")
+        )
+        self.assertFalse(hasattr(panel, "face_selection_xray_checkbox"))
+        self.assertFalse(
+            hasattr(self.workspace, "face_selection_xray_checkbox")
+        )
+        self.assertFalse(
+            hasattr(
+                self.workspace.result_view,
+                "set_face_selection_xray_enabled",
+            )
         )
 
     def test_weighted_camera_allocations_require_exact_total_and_snapshot(
@@ -1486,6 +1733,10 @@ class GenerationWorkspaceTests(unittest.TestCase):
         self.assertEqual(
             panel.get_projection_camera_percentages(),
             DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
+        )
+        self.assertEqual(
+            DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
+            (10, 1, 1, 82, 5, 1),
         )
         self.assertTrue(panel.projection_camera_percentages_are_valid())
         self.assertEqual(
@@ -1512,7 +1763,7 @@ class GenerationWorkspaceTests(unittest.TestCase):
         self.assertFalse(panel.projection_camera_percentages_are_valid())
         self.assertEqual(
             panel.get_projection_camera_percentages(),
-            (16, 17, 17, 17, 16, 16),
+            (9, 1, 1, 82, 5, 1),
         )
         self.assertIn(
             "must equal 100%",
@@ -1577,7 +1828,7 @@ class GenerationWorkspaceTests(unittest.TestCase):
         )
         self.assertEqual(
             panel.get_projection_camera_percentages(),
-            (18, 16, 17, 17, 16, 16),
+            (11, 1, 1, 81, 5, 1),
         )
         self.assertEqual(
             request.projection_camera_percentages,
@@ -1597,10 +1848,10 @@ class GenerationWorkspaceTests(unittest.TestCase):
         ) as viewer_sync:
             panel.projection_camera_percentage_spinboxes[
                 ALL_CAMERA_IDS[0]
-            ].setValue(18)
+            ].setValue(11)
             field_percentages = panel.get_projection_camera_percentages()
 
-            self.assertEqual(field_percentages, (18, 16, 17, 17, 16, 16))
+            self.assertEqual(field_percentages, (11, 1, 1, 81, 5, 1))
             viewer_sync.assert_called_once_with(field_percentages)
 
             panel.viewer.projection_camera_percentage_step_requested.emit(
@@ -1609,7 +1860,7 @@ class GenerationWorkspaceTests(unittest.TestCase):
             )
             stepped_percentages = panel.get_projection_camera_percentages()
 
-        self.assertEqual(stepped_percentages, (17, 16, 17, 17, 16, 16))
+        self.assertEqual(stepped_percentages, (10, 1, 1, 81, 5, 1))
         self.assertEqual(
             tuple(
                 panel.projection_camera_percentage_spinboxes[
@@ -1912,6 +2163,9 @@ class GenerationWorkspaceTests(unittest.TestCase):
         self,
     ) -> None:
         button = self.workspace.convert_faces_to_glass_button
+        double_sided_checkbox = self.workspace.glass_double_sided_checkbox
+        self.assertIs(button.parent(), double_sided_checkbox.parent())
+        self.assertFalse(double_sided_checkbox.isChecked())
         self.assertFalse(button.isEnabled())
 
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1961,6 +2215,7 @@ class GenerationWorkspaceTests(unittest.TestCase):
                     GenerationServiceSettings(meshy_api_key="meshy-key")
                 )
                 self.assertTrue(button.isEnabled())
+                double_sided_checkbox.setChecked(False)
 
                 with patch.object(
                     self.workspace,
@@ -1973,6 +2228,7 @@ class GenerationWorkspaceTests(unittest.TestCase):
         start_regeneration.assert_called_once()
         request = start_regeneration.call_args.args[0]
         self.assertEqual(request.glass_face_indices, (1, 4))
+        self.assertFalse(request.glass_double_sided)
         self.assertEqual(request.enabled_pbr_maps, PBR_MAP_TYPES)
         self.assertTrue(request.enable_original_uv)
         self.assertEqual(
@@ -1989,8 +2245,97 @@ class GenerationWorkspaceTests(unittest.TestCase):
             self.workspace.result_view.get_pbr_maps_enabled(),
             {map_type: True for map_type in PBR_MAP_TYPES},
         )
+        double_sided_checkbox.setChecked(True)
+        self.assertFalse(request.glass_double_sided)
 
-    def test_glass_conversion_requires_existing_complete_uvs(self) -> None:
+    def test_glass_conversion_rejects_faces_covering_the_whole_object(
+        self,
+    ) -> None:
+        mesh = trimesh.creation.box(extents=(1.0, 0.5, 0.75))
+        texture = Image.new("RGBA", (8, 8), (120, 150, 180, 255))
+        glass_material = PBRMaterial(
+            name=HOUSEMAKER_GLASS_MATERIAL_NAME,
+            baseColorTexture=texture.copy(),
+        )
+        opaque_material = PBRMaterial(
+            name="Opaque",
+            baseColorTexture=texture.copy(),
+        )
+        glass_mesh = trimesh.Trimesh(
+            vertices=np.asarray(mesh.vertices, dtype=float),
+            faces=np.asarray(mesh.faces[:2], dtype=np.int64),
+            process=False,
+        )
+        glass_mesh.visual = TextureVisuals(
+            uv=np.zeros((len(glass_mesh.vertices), 2), dtype=float),
+            material=glass_material,
+        )
+        opaque_mesh = trimesh.Trimesh(
+            vertices=np.asarray(mesh.vertices, dtype=float),
+            faces=np.asarray(mesh.faces[2:], dtype=np.int64),
+            process=False,
+        )
+        opaque_mesh.visual = TextureVisuals(
+            uv=np.zeros((len(opaque_mesh.vertices), 2), dtype=float),
+            material=opaque_material,
+        )
+        scene = trimesh.Scene()
+        scene.add_geometry(
+            glass_mesh,
+            geom_name="glass",
+            node_name="glass",
+        )
+        scene.add_geometry(
+            opaque_mesh,
+            geom_name="opaque",
+            node_name="opaque",
+        )
+        glb_bytes = bytes(scene.export(file_type="glb"))
+        generated_model = import_generated_glb(glb_bytes)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            self.workspace._asset_directory = Path(temporary_directory)
+            self.workspace._handle_generation_succeeded(
+                MeshyGenerationResult(
+                    "task-all-glass",
+                    glb_bytes,
+                    "Mixed cabinet",
+                ),
+                generated_model,
+            )
+            displayed_model = self.workspace._generated_model
+            self.assertIsNotNone(displayed_model)
+            assert displayed_model is not None
+            existing_glass_faces = _collect_scene_glass_face_indices(
+                displayed_model.scene
+            )
+            self.assertIsNotNone(existing_glass_faces)
+            assert existing_glass_faces is not None
+            self.assertGreater(len(existing_glass_faces), 0)
+            face_count = self.workspace.result_view.face_edit_face_count
+            selected_faces = tuple(
+                sorted(set(range(face_count)) - existing_glass_faces)
+            )
+            self.assertTrue(selected_faces)
+            self.workspace.result_view.set_selected_face_indices(
+                selected_faces
+            )
+
+            with patch.object(
+                self.workspace,
+                "_start_texture_regeneration",
+                return_value=True,
+            ) as start_regeneration:
+                converted = self.workspace.convert_selected_faces_to_glass()
+
+        self.assertFalse(converted)
+        start_regeneration.assert_not_called()
+        self.assertIn(
+            "leave at least one non-glass face",
+            self.workspace.status_label.text(),
+        )
+
+    def test_glass_conversion_can_texture_geometry_only_object(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             asset_directory = Path(temporary_directory) / "generation_assets"
             asset_directory.mkdir()
@@ -2024,16 +2369,63 @@ class GenerationWorkspaceTests(unittest.TestCase):
                 self.workspace.result_view.set_selected_face_indices((0,))
                 _qt_application.processEvents()
 
-                self.assertFalse(
+                self.assertTrue(
                     self.workspace.convert_faces_to_glass_button.isEnabled()
                 )
-                self.assertFalse(
-                    self.workspace.convert_selected_faces_to_glass()
-                )
-                self.assertIn(
-                    "requires a textured object with UVs",
-                    self.workspace.status_label.text(),
-                )
+                with patch.object(
+                    self.workspace,
+                    "_start_texture_regeneration",
+                    return_value=True,
+                ) as start_regeneration:
+                    self.assertTrue(
+                        self.workspace.convert_selected_faces_to_glass()
+                    )
+
+                request = start_regeneration.call_args.args[0]
+                self.assertEqual(request.glass_face_indices, (0,))
+                self.assertFalse(request.enable_original_uv)
+
+    def test_glass_face_remap_survives_face_and_winding_reordering(self) -> None:
+        source_mesh = trimesh.creation.box(extents=(1.0, 0.5, 0.75))
+        source_glb = bytes(trimesh.Scene(source_mesh).export(file_type="glb"))
+        target_mesh = source_mesh.copy()
+        target_mesh.faces = np.asarray(
+            target_mesh.faces[::-1, ::-1],
+            dtype=np.int64,
+        )
+        target_glb = bytes(trimesh.Scene(target_mesh).export(file_type="glb"))
+
+        mapped = _remap_faces_by_world_geometry(
+            source_glb,
+            target_glb,
+            (1, 7),
+        )
+
+        source_geometry = load_object_face_geometry(source_glb)
+        target_geometry = load_object_face_geometry(target_glb)
+        source_triangles = source_geometry.vertices[
+            source_geometry.faces[np.asarray((1, 7), dtype=np.int64)]
+        ]
+        target_triangles = target_geometry.vertices[
+            target_geometry.faces[np.asarray(mapped, dtype=np.int64)]
+        ]
+        self.assertEqual(len(mapped), 2)
+        self.assertEqual(
+            _build_geometry_fingerprint(
+                bytes(trimesh.Scene(trimesh.Trimesh(
+                    vertices=source_triangles.reshape((-1, 3)),
+                    faces=np.arange(6, dtype=np.int64).reshape((-1, 3)),
+                    process=False,
+                )).export(file_type="glb"))
+            ),
+            _build_geometry_fingerprint(
+                bytes(trimesh.Scene(trimesh.Trimesh(
+                    vertices=target_triangles.reshape((-1, 3)),
+                    faces=np.arange(6, dtype=np.int64).reshape((-1, 3)),
+                    process=False,
+                )).export(file_type="glb"))
+            ),
+        )
 
     def test_model_uv_triangles_are_collected_per_face_for_texture_preview(
         self,
@@ -2706,6 +3098,42 @@ class GeneratedObjectDeletionTests(unittest.TestCase):
         _qt_application.processEvents()
         self.assertFalse(button.isEnabled())
         self.assertFalse(self.workspace.delete_selected_generated_object())
+
+    def test_remove_placement_retains_generated_record_and_assets(self) -> None:
+        records = self._set_generated_objects(
+            [("chair", "Chair", (180, 30, 20, 255))]
+        )
+        placed_record = replace(
+            records[0],
+            placement=GeneratedObjectPlacement(2, 25.0, 40.0),
+        )
+        self.workspace.set_data(
+            GenerationData(generated_objects=[placed_record])
+        )
+        asset_path = self.asset_directory / placed_record.asset_path
+        data_changed = QSignalSpy(self.workspace.data_changed)
+        placement_changed = QSignalSpy(
+            self.workspace.generated_object_placement_changed
+        )
+        object_deleted = QSignalSpy(self.workspace.generated_object_deleted)
+
+        self.assertTrue(
+            self.workspace.remove_generated_object_placement("chair")
+        )
+
+        records_after = self.workspace.get_data().generated_objects
+        self.assertEqual(len(records_after), 1)
+        self.assertEqual(records_after[0].object_id, "chair")
+        self.assertIsNone(records_after[0].placement)
+        self.assertTrue(asset_path.is_file())
+        self.assertEqual(data_changed.count(), 1)
+        self.assertEqual(placement_changed.count(), 1)
+        self.assertIsNone(placement_changed.at(0)[0].placement)
+        self.assertEqual(object_deleted.count(), 0)
+        self.assertIn("Removed from Canvas", self.workspace.status_label.text())
+        self.assertFalse(
+            self.workspace.remove_generated_object_placement("chair")
+        )
 
     def test_delete_button_confirms_and_cancel_preserves_the_object(self) -> None:
         self._set_generated_objects(

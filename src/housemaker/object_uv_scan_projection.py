@@ -5,23 +5,30 @@ import copy
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from numbers import Integral
 
 import cv2
 import numpy as np
 import trimesh
+from trimesh.visual.material import MultiMaterial
 from trimesh.visual.texture import TextureVisuals
 
+from housemaker.glass_material import (
+    DEFAULT_HOUSEMAKER_GLASS_DOUBLE_SIDED,
+    build_housemaker_glass_material,
+    get_housemaker_glass_double_sided,
+    is_housemaker_glass_material,
+)
 from housemaker.glb import GLTF_Y_UP_TO_Z_UP_TRANSFORM
 from housemaker.object_texture_variants import (
     MATERIAL_TEXTURE_BASE_COLOR,
     MATERIAL_TEXTURE_METALLIC_ROUGHNESS,
     MATERIAL_TEXTURE_NORMAL,
-    HOUSEMAKER_GLASS_MATERIAL_NAME,
     _collect_material_texture_maps,
     _load_glb_scene,
     _replace_material_texture_maps_with_shared,
     _validate_shared_texture_maps,
-    reject_unsupported_uv_material_textures,
+    prepare_uv_rewrite_material_textures,
 )
 from housemaker.scan_projection_layout import (
     SCAN_PROJECTION_LAYOUT_ALIGNMENT_PIXELS,
@@ -37,18 +44,18 @@ from housemaker.unused_face_removal import (
 
 
 # ### Public constants ###
-SCAN_PROJECTION_VERSION = 4
+SCAN_PROJECTION_VERSION = 5
 SCAN_PROJECTION_TARGET_FULL = "full"
 SCAN_PROJECTION_TARGET_LEFT_HALF = "left_half"
 SCAN_PROJECTION_TARGET_TOP_LEFT_QUARTER = "top_left_quarter"
 DEFAULT_SCAN_PROJECTION_TEXTURE_RESOLUTION = 2048
-DEFAULT_PROJECTION_CAMERA_PERCENTAGES = (17, 17, 17, 17, 16, 16)
+# ALL_CAMERA_IDS order: +X, -X, +Y, -Y, +Z, -Z.
+DEFAULT_PROJECTION_CAMERA_PERCENTAGES = (10, 1, 1, 82, 5, 1)
 SCAN_PROJECTION_ISLAND_PADDING_PIXELS = 0
 SCAN_PROJECTION_MINIMUM_VISIBLE_FRACTION = 0.5
 SCAN_PROJECTION_VISIBILITY_IMAGE_SIZE = 512
 LEFT_HALF_OUTER_SAFETY_INSET_PIXELS = 4
 TOP_LEFT_QUARTER_OUTER_SAFETY_INSET_PIXELS = 8
-HOUSEMAKER_GLASS_ALLOCATION_PERCENTAGE = 1
 
 
 # ### Processing constants ###
@@ -81,10 +88,6 @@ _VISIBILITY_MINIMUM_DEPTH_EPSILON = 1e-12
 _OPAQUE_BLACK = np.asarray((0, 0, 0, 255), dtype=np.uint8)
 _NEUTRAL_NORMAL = np.asarray((128, 128, 255, 255), dtype=np.uint8)
 _NEUTRAL_METALLIC_ROUGHNESS = np.asarray((0, 255, 0, 255), dtype=np.uint8)
-_GLASS_BASE_COLOR = np.asarray((205, 232, 242, 48), dtype=np.uint8)
-_GLASS_NORMAL = _NEUTRAL_NORMAL
-_GLASS_METALLIC_ROUGHNESS = np.asarray((0, 10, 0, 255), dtype=np.uint8)
-_GLASS_ALPHA_THRESHOLD = 96
 
 
 # ### Callback types ###
@@ -221,6 +224,7 @@ class _ProjectedFace:
     projected_area: float
     visible_fraction: float = 1.0
     is_glass: bool = False
+    glass_double_sided: bool | None = None
 
     @property
     def stable_key(self) -> tuple[str, int]:
@@ -304,6 +308,7 @@ def scan_project_textured_glb(
     target_domain: str = SCAN_PROJECTION_TARGET_FULL,
     texture_resolution: int = DEFAULT_SCAN_PROJECTION_TEXTURE_RESOLUTION,
     glass_face_indices: Sequence[int] = (),
+    glass_double_sided: bool | None = None,
     cancellation_check: CancellationCheck | None = None,
 ) -> ScanProjectionResult:
     """Rebuild UVs and continuously bake source texels into a dense atlas.
@@ -314,7 +319,8 @@ def scan_project_textured_glb(
     Each view normally receives a horizontal atlas band matching its
     requested integer percentage. Faces without a qualifying view occupy
     only a minimum-sized fallback band. At exact capacity, all bands may share
-    scan rows instead.
+    scan rows instead. A new glass selection is replaced by one best-fit
+    four-corner panel whose prefab material is independent from the atlas.
     Every covered pixel pulls one bilinear sample from the original texture;
     no source pixel is ever splatted into the destination.
     """
@@ -326,13 +332,16 @@ def scan_project_textured_glb(
     normalized_glass_faces = _normalize_glass_face_indices(
         glass_face_indices
     )
+    normalized_glass_double_sided = _normalize_glass_double_sided(
+        glass_double_sided
+    )
     normalized_resolution = _validate_projection_options(
         target_domain=target_domain,
         texture_resolution=texture_resolution,
     )
     _raise_if_cancelled(cancellation_check)
     scene = _load_glb_scene(payload)
-    reject_unsupported_uv_material_textures(
+    prepare_uv_rewrite_material_textures(
         scene,
         operation_name="Scan projection",
     )
@@ -354,18 +363,28 @@ def scan_project_textured_glb(
             "texture resolution."
         )
     geometries = _collect_scene_geometries(scene)
+    if normalized_glass_faces:
+        geometries, normalized_glass_faces = (
+            _join_selected_glass_faces_as_rectangle(
+                scene,
+                geometries,
+                normalized_glass_faces,
+                cancellation_check,
+            )
+        )
     projected_faces = _assign_faces_to_cameras(
         geometries,
         percentages,
         cancellation_check,
         glass_face_indices=normalized_glass_faces,
+        glass_double_sided=normalized_glass_double_sided,
     )
     if not projected_faces:
         raise ValueError("Scan projection requires at least one triangle face.")
-    if any(face.is_glass for face in projected_faces):
-        source_texture_maps = _ensure_glass_material_maps(
-            source_texture_maps,
-            source_rgba.shape,
+    if all(face.is_glass for face in projected_faces):
+        raise ValueError(
+            "Scan projection cannot convert every object face to glass. "
+            "Leave at least one non-glass face for the texture atlas."
         )
     if len(projected_faces) > _MAXIMUM_FACE_COUNT:
         raise ValueError(
@@ -428,9 +447,7 @@ def scan_project_textured_glb(
         np.count_nonzero(usable_owner_camera == _FALLBACK_CAMERA_INDEX)
     )
     glass_face_count = sum(face.is_glass for face in projected_faces)
-    glass_pixel_count = int(
-        np.count_nonzero(usable_owner_camera == _GLASS_CAMERA_INDEX)
-    )
+    glass_pixel_count = 0
     covered_pixel_count = int(np.count_nonzero(usable_owner_camera >= 0))
     usable_pixel_count = target.width * target.height
     source_vertex_count = sum(
@@ -475,39 +492,25 @@ def _normalize_glass_face_indices(values: Sequence[int]) -> frozenset[int]:
         raise ValueError("Glass face indices must be an integer sequence.")
     try:
         raw_values = tuple(values)
-        normalized = tuple(int(value) for value in raw_values)
-    except (TypeError, ValueError) as error:
+    except TypeError as error:
         raise ValueError("Glass face indices must be integers.") from error
-    if any(isinstance(value, bool) for value in raw_values):
+    if any(
+        isinstance(value, bool) or not isinstance(value, Integral)
+        for value in raw_values
+    ):
         raise ValueError("Glass face indices must be integers.")
+    normalized = tuple(int(value) for value in raw_values)
     if any(value < 0 for value in normalized):
         raise ValueError("Glass face indices cannot be negative.")
     return frozenset(normalized)
 
 
-def _ensure_glass_material_maps(
-    texture_maps: Mapping[str, np.ndarray],
-    texture_shape: tuple[int, ...],
-) -> dict[str, np.ndarray]:
-    """Supply neutral PBR inputs so glass conversion always emits its maps."""
+def _normalize_glass_double_sided(value: bool | None) -> bool | None:
+    """Validate an optional sidedness override for newly selected glass."""
 
-    output = {
-        map_type: np.asarray(texture, dtype=np.uint8).copy()
-        for map_type, texture in texture_maps.items()
-    }
-    for map_type, color in (
-        (MATERIAL_TEXTURE_NORMAL, _NEUTRAL_NORMAL),
-        (
-            MATERIAL_TEXTURE_METALLIC_ROUGHNESS,
-            _NEUTRAL_METALLIC_ROUGHNESS,
-        ),
-    ):
-        if map_type in output:
-            continue
-        texture = np.empty(texture_shape, dtype=np.uint8)
-        texture[:] = color
-        output[map_type] = texture
-    return output
+    if value is not None and not isinstance(value, bool):
+        raise ValueError("Glass sidedness must be a boolean when provided.")
+    return value
 
 
 # ### Option validation helpers ###
@@ -609,6 +612,334 @@ def _collect_scene_geometries(scene: trimesh.Scene) -> list[_SceneGeometry]:
     return geometries
 
 
+def _join_selected_glass_faces_as_rectangle(
+    scene: trimesh.Scene,
+    geometries: Sequence[_SceneGeometry],
+    glass_face_indices: frozenset[int],
+    cancellation_check: CancellationCheck | None,
+) -> tuple[list[_SceneGeometry], frozenset[int]]:
+    """Replace all newly selected faces with one best-fit two-triangle panel."""
+
+    total_face_count = sum(len(geometry.mesh.faces) for geometry in geometries)
+    if not glass_face_indices:
+        return list(geometries), glass_face_indices
+    if max(glass_face_indices) >= total_face_count:
+        raise ValueError(
+            "A selected glass face no longer exists in the source model."
+        )
+
+    selected_by_geometry: dict[object, np.ndarray] = {}
+    selected_world_triangles: list[np.ndarray] = []
+    anchor_geometry_name: object | None = None
+    face_offset = 0
+    for geometry in geometries:
+        _raise_if_cancelled(cancellation_check)
+        local_indices = np.asarray(
+            [
+                global_index - face_offset
+                for global_index in sorted(glass_face_indices)
+                if face_offset
+                <= global_index
+                < face_offset + len(geometry.mesh.faces)
+            ],
+            dtype=np.int64,
+        )
+        face_offset += len(geometry.mesh.faces)
+        if not len(local_indices):
+            continue
+        if anchor_geometry_name is None:
+            anchor_geometry_name = geometry.geometry_name
+        selected_by_geometry[geometry.geometry_name] = local_indices
+        selected_world_triangles.append(
+            geometry.world_vertices[
+                np.asarray(geometry.mesh.faces, dtype=np.int64)[local_indices]
+            ]
+        )
+
+    if anchor_geometry_name is None or not selected_world_triangles:
+        raise ValueError("No selected glass faces could be joined.")
+    rectangle_world = _fit_selected_faces_rectangle(
+        np.vstack(selected_world_triangles)
+    )
+    anchor_world_transform = _geometry_world_transform(
+        scene,
+        anchor_geometry_name,
+    )
+    try:
+        inverse_anchor_transform = np.linalg.inv(anchor_world_transform)
+    except np.linalg.LinAlgError as error:
+        raise ValueError(
+            "The selected glass geometry has a non-invertible transform."
+        ) from error
+    rectangle_local = trimesh.transform_points(
+        rectangle_world,
+        inverse_anchor_transform,
+    )
+
+    panel_first_local_face_index: int | None = None
+    for geometry in geometries:
+        selected_local_indices = selected_by_geometry.get(
+            geometry.geometry_name
+        )
+        if selected_local_indices is None:
+            continue
+        rebuilt, panel_face_index = _rebuild_geometry_with_glass_rectangle(
+            geometry.mesh,
+            selected_local_indices,
+            (
+                rectangle_local
+                if geometry.geometry_name == anchor_geometry_name
+                else None
+            ),
+        )
+        scene.geometry[geometry.geometry_name] = rebuilt
+        if panel_face_index is not None:
+            panel_first_local_face_index = panel_face_index
+
+    if panel_first_local_face_index is None:
+        raise RuntimeError("The joined glass rectangle was not created.")
+    rebuilt_geometries = _collect_scene_geometries(scene)
+    rebuilt_glass_faces: set[int] = set()
+    face_offset = 0
+    for geometry in rebuilt_geometries:
+        if geometry.geometry_name == anchor_geometry_name:
+            rebuilt_glass_faces.update(
+                (
+                    face_offset + panel_first_local_face_index,
+                    face_offset + panel_first_local_face_index + 1,
+                )
+            )
+            break
+        face_offset += len(geometry.mesh.faces)
+    if len(rebuilt_glass_faces) != 2:
+        raise RuntimeError("The joined glass rectangle lost its two faces.")
+    return rebuilt_geometries, frozenset(rebuilt_glass_faces)
+
+
+def _fit_selected_faces_rectangle(
+    world_triangles: np.ndarray,
+) -> np.ndarray:
+    """Return a minimum-area rectangle on the selection's best-fit plane."""
+
+    triangles = np.asarray(world_triangles, dtype=float)
+    if (
+        triangles.ndim != 3
+        or triangles.shape[1:] != (3, 3)
+        or not len(triangles)
+        or not np.all(np.isfinite(triangles))
+    ):
+        raise ValueError("Selected glass faces contain invalid geometry.")
+    raw_normals = np.cross(
+        triangles[:, 1] - triangles[:, 0],
+        triangles[:, 2] - triangles[:, 0],
+    )
+    triangles = triangles[
+        np.linalg.norm(raw_normals, axis=1) > _AREA_EPSILON
+    ]
+    if not len(triangles):
+        raise ValueError("Selected glass faces have no measurable area.")
+    points = np.unique(triangles.reshape((-1, 3)), axis=0)
+    if len(points) < 3:
+        raise ValueError("Selected glass faces cannot form a rectangle.")
+    center = np.mean(points, axis=0)
+    centered = points - center
+    try:
+        _left, singular_values, axes = np.linalg.svd(
+            centered,
+            full_matrices=False,
+        )
+    except np.linalg.LinAlgError as error:
+        raise ValueError(
+            "The selected glass faces could not be approximated."
+        ) from error
+    scale = max(float(np.ptp(points, axis=0).max()), 1.0)
+    extent_tolerance = scale * 1e-8
+    if len(singular_values) < 2 or singular_values[1] <= extent_tolerance:
+        raise ValueError("Selected glass faces cannot form a rectangle.")
+
+    axis_u = np.asarray(axes[0], dtype=float)
+    plane_normal = np.asarray(axes[-1], dtype=float)
+    reference_normal = _aligned_selection_normal(triangles)
+    if float(np.dot(plane_normal, reference_normal)) < 0.0:
+        plane_normal *= -1.0
+    axis_v = np.cross(plane_normal, axis_u)
+    axis_v_length = float(np.linalg.norm(axis_v))
+    if axis_v_length <= _AREA_EPSILON:
+        raise ValueError("Selected glass faces cannot form a stable plane.")
+    axis_v /= axis_v_length
+    projected = np.column_stack((centered @ axis_u, centered @ axis_v))
+    fitted = cv2.minAreaRect(np.asarray(projected, dtype=np.float32))
+    rectangle_2d = np.asarray(cv2.boxPoints(fitted), dtype=float)
+    widths = np.linalg.norm(
+        np.roll(rectangle_2d, -1, axis=0) - rectangle_2d,
+        axis=1,
+    )
+    if np.count_nonzero(widths > extent_tolerance) < 4:
+        raise ValueError("Selected glass faces cannot form a rectangle.")
+    rectangle_world = (
+        center
+        + rectangle_2d[:, 0, np.newaxis] * axis_u
+        + rectangle_2d[:, 1, np.newaxis] * axis_v
+    )
+    if float(
+        np.dot(
+            np.cross(
+                rectangle_world[1] - rectangle_world[0],
+                rectangle_world[2] - rectangle_world[0],
+            ),
+            plane_normal,
+        )
+    ) < 0.0:
+        rectangle_world = rectangle_world[[0, 3, 2, 1]]
+    return np.ascontiguousarray(rectangle_world, dtype=float)
+
+
+def _aligned_selection_normal(world_triangles: np.ndarray) -> np.ndarray:
+    """Average selected face normals without opposing winding cancellation."""
+
+    raw_normals = np.cross(
+        world_triangles[:, 1] - world_triangles[:, 0],
+        world_triangles[:, 2] - world_triangles[:, 0],
+    )
+    lengths = np.linalg.norm(raw_normals, axis=1)
+    valid_normals = raw_normals[lengths > _AREA_EPSILON]
+    if not len(valid_normals):
+        raise ValueError("Selected glass faces have no measurable area.")
+    reference = valid_normals[0]
+    aligned = valid_normals.copy()
+    aligned[np.einsum("ij,j->i", aligned, reference) < 0.0] *= -1.0
+    averaged = np.sum(aligned, axis=0)
+    averaged_length = float(np.linalg.norm(averaged))
+    if averaged_length <= _AREA_EPSILON:
+        raise ValueError("Selected glass faces cannot form a stable plane.")
+    return averaged / averaged_length
+
+
+def _geometry_world_transform(
+    scene: trimesh.Scene,
+    geometry_name: object,
+) -> np.ndarray:
+    """Return the exact local-to-viewer transform for one unique geometry."""
+
+    matching_transforms: list[np.ndarray] = []
+    for node_name in sorted(scene.graph.nodes_geometry, key=str):
+        transform, candidate_geometry_name = scene.graph.get(node_name)
+        if candidate_geometry_name == geometry_name:
+            matching_transforms.append(np.asarray(transform, dtype=float))
+    if len(matching_transforms) != 1:
+        raise ValueError(
+            "Joined glass faces require one unique scene node per geometry."
+        )
+    return np.asarray(
+        GLTF_Y_UP_TO_Z_UP_TRANSFORM @ matching_transforms[0],
+        dtype=float,
+    )
+
+
+def _rebuild_geometry_with_glass_rectangle(
+    mesh: trimesh.Trimesh,
+    selected_face_indices: np.ndarray,
+    rectangle_vertices: np.ndarray | None,
+) -> tuple[trimesh.Trimesh, int | None]:
+    """Filter selected faces and optionally append a four-vertex panel."""
+
+    vertices = np.asarray(mesh.vertices, dtype=float)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    uvs = np.asarray(getattr(mesh.visual, "uv", None), dtype=float)
+    if uvs.shape != (len(vertices), 2):
+        raise ValueError("Joined glass faces require complete source UVs.")
+    selected = np.zeros(len(faces), dtype=bool)
+    selected[np.asarray(selected_face_indices, dtype=np.int64)] = True
+    remaining_face_indices = np.flatnonzero(~selected)
+    next_vertices = vertices.copy()
+    next_normals = _get_source_vertex_normals(mesh)
+    next_uvs = uvs.copy()
+    next_faces = faces[remaining_face_indices].copy()
+    panel_first_face_index: int | None = None
+
+    if rectangle_vertices is not None:
+        rectangle = np.asarray(rectangle_vertices, dtype=float)
+        if rectangle.shape != (4, 3) or not np.all(np.isfinite(rectangle)):
+            raise ValueError("The joined glass rectangle is invalid.")
+        first_panel_vertex = len(next_vertices)
+        panel_faces = np.asarray(
+            (
+                (
+                    first_panel_vertex,
+                    first_panel_vertex + 1,
+                    first_panel_vertex + 2,
+                ),
+                (
+                    first_panel_vertex,
+                    first_panel_vertex + 2,
+                    first_panel_vertex + 3,
+                ),
+            ),
+            dtype=np.int64,
+        )
+        panel_normal = np.cross(
+            rectangle[1] - rectangle[0],
+            rectangle[2] - rectangle[0],
+        )
+        panel_normal_length = float(np.linalg.norm(panel_normal))
+        if panel_normal_length <= _AREA_EPSILON:
+            raise ValueError("The joined glass rectangle has no area.")
+        panel_normal /= panel_normal_length
+        panel_first_face_index = len(next_faces)
+        next_vertices = np.vstack((next_vertices, rectangle))
+        next_normals = np.vstack(
+            (next_normals, np.tile(panel_normal, (4, 1)))
+        )
+        next_uvs = np.vstack(
+            (
+                next_uvs,
+                np.asarray(
+                    ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)),
+                    dtype=float,
+                ),
+            )
+        )
+        next_faces = np.vstack((next_faces, panel_faces))
+
+    face_materials = getattr(mesh.visual, "face_materials", None)
+    next_face_materials: np.ndarray | None = None
+    if face_materials is not None:
+        normalized_face_materials = np.asarray(face_materials, dtype=np.int64)
+        if normalized_face_materials.shape != (len(faces),):
+            raise ValueError("Joined glass faces found invalid face materials.")
+        next_face_materials = normalized_face_materials[
+            remaining_face_indices
+        ].copy()
+        if rectangle_vertices is not None:
+            source_material_index = int(
+                normalized_face_materials[int(selected_face_indices[0])]
+            )
+            next_face_materials = np.concatenate(
+                (
+                    next_face_materials,
+                    np.asarray(
+                        (source_material_index, source_material_index),
+                        dtype=np.int64,
+                    ),
+                )
+            )
+
+    rebuilt = trimesh.Trimesh(
+        vertices=np.ascontiguousarray(next_vertices, dtype=float),
+        faces=np.ascontiguousarray(next_faces, dtype=np.int64).reshape((-1, 3)),
+        vertex_normals=np.ascontiguousarray(next_normals, dtype=float),
+        process=False,
+        metadata=copy.deepcopy(mesh.metadata),
+    )
+    rebuilt.visual = TextureVisuals(
+        uv=np.ascontiguousarray(next_uvs, dtype=float),
+        material=copy.deepcopy(mesh.visual.material),
+        face_materials=next_face_materials,
+    )
+    rebuilt.units = mesh.units
+    return rebuilt, panel_first_face_index
+
+
 # ### Camera assignment helpers ###
 def _assign_faces_to_cameras(
     geometries: Sequence[_SceneGeometry],
@@ -616,6 +947,7 @@ def _assign_faces_to_cameras(
     cancellation_check: CancellationCheck | None,
     *,
     glass_face_indices: frozenset[int] = frozenset(),
+    glass_double_sided: bool | None = None,
 ) -> list[_ProjectedFace]:
     """Assign sufficiently visible faces without trusting triangle winding."""
 
@@ -686,13 +1018,23 @@ def _assign_faces_to_cameras(
             if face_index % 128 == 0:
                 _raise_if_cancelled(cancellation_check)
             global_face_index = global_face_offset + face_index
+            is_new_glass = global_face_index in glass_face_indices
+            existing_glass_double_sided = _face_glass_double_sided(
+                geometry.mesh,
+                face_index,
+                face_materials,
+            )
             is_glass = bool(
-                global_face_index in glass_face_indices
-                or _face_material_is_glass(
-                    geometry.mesh,
-                    face_index,
-                    face_materials,
+                is_new_glass or existing_glass_double_sided is not None
+            )
+            face_glass_double_sided = (
+                (
+                    DEFAULT_HOUSEMAKER_GLASS_DOUBLE_SIDED
+                    if glass_double_sided is None
+                    else glass_double_sided
                 )
+                if is_new_glass
+                else existing_glass_double_sided
             )
             camera_index = (
                 _GLASS_CAMERA_INDEX
@@ -747,57 +1089,33 @@ def _assign_faces_to_cameras(
                     projected_area=projected_area,
                     visible_fraction=visible_fraction,
                     is_glass=is_glass,
+                    glass_double_sided=face_glass_double_sided,
                 )
             )
         global_face_offset += len(faces)
     return projected_faces
 
 
-def _face_material_is_glass(
+def _face_glass_double_sided(
     mesh: trimesh.Trimesh,
     face_index: int,
     face_materials: np.ndarray | None,
-) -> bool:
-    """Return whether one persisted face uses HouseMaker's glass marker."""
+) -> bool | None:
+    """Return the persisted prefab glass sidedness for one face."""
 
     material = getattr(getattr(mesh, "visual", None), "material", None)
     leaves = _iter_material_leaves(material)
     if not leaves:
-        return False
+        return None
     material_index = (
         0
         if face_materials is None
         else int(face_materials[face_index])
     )
     if material_index < 0 or material_index >= len(leaves):
-        return False
+        return None
     leaf = leaves[material_index]
-    if str(getattr(leaf, "name", "")).strip() != (
-        HOUSEMAKER_GLASS_MATERIAL_NAME
-    ):
-        return False
-    texture = getattr(leaf, "baseColorTexture", None)
-    if texture is None:
-        texture = getattr(leaf, "image", None)
-    if texture is None:
-        return False
-    try:
-        texture_rgba = np.asarray(texture.convert("RGBA"), dtype=np.uint8)
-    except (AttributeError, TypeError, ValueError):
-        return False
-    uvs = np.asarray(getattr(mesh.visual, "uv", None), dtype=float)
-    faces = np.asarray(mesh.faces, dtype=np.int64)
-    if (
-        uvs.shape != (len(mesh.vertices), 2)
-        or face_index < 0
-        or face_index >= len(faces)
-    ):
-        return False
-    centroid_uv = np.mean(uvs[faces[face_index]], axis=0, keepdims=True)
-    alpha = int(
-        _sample_repeat_bilinear_rgba(texture_rgba, centroid_uv)[0, 3]
-    )
-    return alpha <= _GLASS_ALPHA_THRESHOLD
+    return get_housemaker_glass_double_sided(leaf)
 
 
 def _iter_material_leaves(material: object) -> tuple[object, ...]:
@@ -1102,22 +1420,29 @@ def _build_face_placements(
     percentages: tuple[int, ...],
     target: _PixelRectangle,
 ) -> list[_FacePlacement]:
-    """Allocate capacity-safe camera regions and build triangle placements."""
+    """Pack opaque faces densely and give glass constant atlas-free UVs."""
 
     _validate_aligned_rectangle(target, "scan target")
+    atlas_faces = tuple(face for face in faces if not face.is_glass)
+    glass_faces = tuple(face for face in faces if face.is_glass)
+    if not atlas_faces:
+        raise ValueError(
+            "Scan projection cannot convert every object face to glass. "
+            "Leave at least one non-glass face for the texture atlas."
+        )
 
     camera_faces = tuple(
         tuple(
             sorted(
                 (
                     face
-                    for face in faces
+                    for face in atlas_faces
                     if face.camera_index == camera_index
                 ),
                 key=lambda face: (-face.projected_area, face.stable_key),
             )
         )
-        for camera_index in range(_GLASS_CAMERA_INDEX + 1)
+        for camera_index in range(_FALLBACK_CAMERA_INDEX + 1)
     )
     camera_groups = tuple(
         tuple(_group_camera_faces(view_faces))
@@ -1161,13 +1486,15 @@ def _build_face_placements(
         )
         heights = tuple(height * alignment for height in height_units)
     else:
-        return _build_shared_row_face_placements(
-            faces,
+        placements = _build_shared_row_face_placements(
+            atlas_faces,
             camera_groups,
             effective_percentages,
             group_counts,
             target,
         )
+        placements.extend(_build_glass_face_placements(glass_faces, target))
+        return _validate_and_sort_face_placements(placements, faces)
     placements: list[_FacePlacement] = []
     band_y = target.y
     for camera_index, band_height in enumerate(heights):
@@ -1181,6 +1508,7 @@ def _build_face_placements(
         rectangles = _partition_group_rectangles(band, groups)
         for group, rectangle in zip(groups, rectangles, strict=True):
             _append_group_placements(placements, group, rectangle)
+    placements.extend(_build_glass_face_placements(glass_faces, target))
     return _validate_and_sort_face_placements(placements, faces)
 
 
@@ -1188,18 +1516,12 @@ def _build_effective_group_percentages(
     percentages: tuple[int, ...],
     group_counts: tuple[int, ...],
 ) -> tuple[float, ...]:
-    """Reserve glass at one percent and redistribute only the regular share."""
+    """Redistribute all atlas space among nonempty opaque face groups."""
 
     if len(percentages) != len(ALL_CAMERA_IDS):
         raise ValueError("Scan projection requires all camera percentages.")
-    if len(group_counts) != _GLASS_CAMERA_INDEX + 1:
+    if len(group_counts) != _FALLBACK_CAMERA_INDEX + 1:
         raise ValueError("Scan projection group counts are incomplete.")
-    has_glass = bool(group_counts[_GLASS_CAMERA_INDEX])
-    regular_share = float(
-        100 - HOUSEMAKER_GLASS_ALLOCATION_PERCENTAGE
-        if has_glass
-        else 100
-    )
     active_camera_weight = float(
         sum(
             percentages[camera_index]
@@ -1211,7 +1533,7 @@ def _build_effective_group_percentages(
         camera_shares = tuple(
             (
                 percentages[camera_index]
-                * regular_share
+                * 100.0
                 / active_camera_weight
                 if group_counts[camera_index]
                 else 0.0
@@ -1221,15 +1543,39 @@ def _build_effective_group_percentages(
         fallback_share = 0.0
     else:
         camera_shares = (0.0,) * len(ALL_CAMERA_IDS)
-        # With only fallback or glass faces, this band owns the unused regular
-        # budget instead of allowing the glass band to expand beyond 1%.
-        fallback_share = regular_share
-    glass_share = (
-        float(HOUSEMAKER_GLASS_ALLOCATION_PERCENTAGE)
-        if has_glass
-        else 0.0
+        fallback_share = 100.0
+    return (*camera_shares, fallback_share)
+
+
+def _build_glass_face_placements(
+    faces: Sequence[_ProjectedFace],
+    target: _PixelRectangle,
+) -> list[_FacePlacement]:
+    """Keep glass geometry while assigning one finite unused atlas point."""
+
+    target_center = np.asarray(
+        (
+            target.x + target.width * 0.5,
+            target.y + target.height * 0.5,
+        ),
+        dtype=float,
     )
-    return (*camera_shares, fallback_share, glass_share)
+    constant_uv_triangle = np.repeat(
+        target_center[np.newaxis, :],
+        3,
+        axis=0,
+    )
+    return [
+        _FacePlacement(
+            face=face,
+            fragment_index=0,
+            source_positions=face.source_positions,
+            source_normals=face.source_normals,
+            source_uvs=face.source_uvs,
+            destination_points=constant_uv_triangle.copy(),
+        )
+        for face in faces
+    ]
 
 
 def _build_shared_row_face_placements(
@@ -1721,6 +2067,8 @@ def _bake_face_scanlines(
     *,
     map_type: str = MATERIAL_TEXTURE_BASE_COLOR,
 ) -> None:
+    if placement.face.is_glass:
+        return
     points = np.asarray(placement.destination_points, dtype=float)
     minimum_x = max(0, int(math.floor(float(np.min(points[:, 0])))))
     maximum_x = min(
@@ -1763,8 +2111,6 @@ def _bake_face_scanlines(
                 samples,
                 placement,
             )
-        if placement.face.is_glass:
-            samples[:] = _glass_map_color(map_type)
         destination[row, selected_columns] = samples
         owner_camera[row, selected_columns] = placement.face.camera_index
 
@@ -1775,14 +2121,6 @@ def _empty_map_color(map_type: str) -> np.ndarray:
     if map_type == MATERIAL_TEXTURE_METALLIC_ROUGHNESS:
         return _NEUTRAL_METALLIC_ROUGHNESS
     return _OPAQUE_BLACK
-
-
-def _glass_map_color(map_type: str) -> np.ndarray:
-    if map_type == MATERIAL_TEXTURE_NORMAL:
-        return _GLASS_NORMAL
-    if map_type == MATERIAL_TEXTURE_METALLIC_ROUGHNESS:
-        return _GLASS_METALLIC_ROUGHNESS
-    return _GLASS_BASE_COLOR
 
 
 def _transform_tangent_space_normal_samples(
@@ -1986,53 +2324,182 @@ def _apply_face_placements(
                 else placement.face.face_material_index
             )
             output_face_materials.append(
-                glass_material_indices[source_material_index]
+                glass_material_indices[
+                    (
+                        source_material_index,
+                        (
+                            DEFAULT_HOUSEMAKER_GLASS_DOUBLE_SIDED
+                            if placement.face.glass_double_sided is None
+                            else placement.face.glass_double_sided
+                        ),
+                    )
+                ]
                 if placement.face.is_glass
                 else source_material_index
             )
-        source_face_materials = getattr(mesh.visual, "face_materials", None)
         if len(output_face_materials) != len(output_faces):
             raise ValueError("Scan projection lost a face material index.")
-        rebuilt = trimesh.Trimesh(
+        output_vertex_count += _replace_geometry_with_material_meshes(
+            scene,
+            geometry.geometry_name,
+            mesh,
             vertices=np.asarray(output_vertices, dtype=float),
             faces=np.asarray(output_faces, dtype=np.int64),
-            vertex_normals=np.asarray(output_normals, dtype=float),
-            process=False,
-            metadata=copy.deepcopy(mesh.metadata),
-        )
-        rebuilt.visual = TextureVisuals(
-            uv=np.asarray(output_uvs, dtype=float),
+            normals=np.asarray(output_normals, dtype=float),
+            uvs=np.asarray(output_uvs, dtype=float),
+            face_materials=np.asarray(output_face_materials, dtype=np.int64),
             material=output_material,
-            face_materials=(
-                None
-                if source_face_materials is None
-                and not glass_material_indices
-                else np.asarray(output_face_materials, dtype=np.int64)
-            ),
+            texture_resolution=texture_resolution,
         )
+    return output_vertex_count
+
+
+def _replace_geometry_with_material_meshes(
+    scene: trimesh.Scene,
+    geometry_name: object,
+    source_mesh: trimesh.Trimesh,
+    *,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    normals: np.ndarray,
+    uvs: np.ndarray,
+    face_materials: np.ndarray,
+    material: object,
+    texture_resolution: int,
+) -> int:
+    """Persist each material as a GLB primitive with an independent mesh."""
+
+    node_name, node_transform = _get_unique_geometry_node(
+        scene,
+        geometry_name,
+    )
+    material_leaves = _iter_material_leaves(material)
+    used_material_indices = tuple(
+        int(index) for index in np.unique(face_materials)
+    )
+    if (
+        not used_material_indices
+        or used_material_indices[0] < 0
+        or used_material_indices[-1] >= len(material_leaves)
+    ):
+        raise ValueError("Scan projection found an invalid material index.")
+    rebuilt_meshes: list[tuple[int, trimesh.Trimesh]] = []
+    for material_index in used_material_indices:
+        selected_faces = np.flatnonzero(face_materials == material_index)
+        rebuilt_meshes.append(
+            (
+                material_index,
+                _build_single_material_mesh(
+                    source_mesh,
+                    vertices,
+                    faces,
+                    normals,
+                    uvs,
+                    selected_faces,
+                    copy.deepcopy(material_leaves[material_index]),
+                    texture_resolution,
+                ),
+            )
+        )
+    scene.delete_geometry([geometry_name])
+    base_geometry_name = str(geometry_name)
+    base_node_name = str(node_name)
+    for group_index, (material_index, rebuilt) in enumerate(rebuilt_meshes):
+        suffix = "" if group_index == 0 else f"__material_{material_index}"
+        scene.add_geometry(
+            rebuilt,
+            geom_name=base_geometry_name + suffix,
+            node_name=base_node_name + suffix,
+            transform=node_transform,
+        )
+    return sum(len(mesh.vertices) for _index, mesh in rebuilt_meshes)
+
+
+def _get_unique_geometry_node(
+    scene: trimesh.Scene,
+    geometry_name: object,
+) -> tuple[object, np.ndarray]:
+    """Return the only node and world transform owning one geometry."""
+
+    matches: list[tuple[object, np.ndarray]] = []
+    for node_name in sorted(scene.graph.nodes_geometry, key=str):
+        transform, candidate_geometry_name = scene.graph.get(node_name)
+        if candidate_geometry_name == geometry_name:
+            matches.append((node_name, np.asarray(transform, dtype=float)))
+    if len(matches) != 1:
+        raise ValueError(
+            "Scan projection requires one unique scene node per geometry."
+        )
+    return matches[0]
+
+
+def _build_single_material_mesh(
+    source_mesh: trimesh.Trimesh,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    normals: np.ndarray,
+    uvs: np.ndarray,
+    selected_face_indices: np.ndarray,
+    material: object,
+    texture_resolution: int,
+) -> trimesh.Trimesh:
+    """Build one compact mesh whose GLB primitive has exactly one material."""
+
+    selected_faces = faces[selected_face_indices]
+    vertex_indices, remapped_indices = np.unique(
+        selected_faces.reshape(-1),
+        return_inverse=True,
+    )
+    rebuilt = trimesh.Trimesh(
+        vertices=vertices[vertex_indices],
+        faces=remapped_indices.reshape((-1, 3)),
+        vertex_normals=normals[vertex_indices],
+        process=False,
+        metadata=copy.deepcopy(source_mesh.metadata),
+    )
+    rebuilt.visual = TextureVisuals(
+        uv=uvs[vertex_indices],
+        material=material,
+    )
+    rebuilt.metadata.pop(SCAN_PROJECTION_LAYOUT_METADATA_KEY, None)
+    if not is_housemaker_glass_material(material):
         rebuilt.metadata[SCAN_PROJECTION_LAYOUT_METADATA_KEY] = (
             build_scan_projection_layout_metadata(
                 canonical_texture_resolution=texture_resolution,
                 version=SCAN_PROJECTION_VERSION,
             )
         )
-        rebuilt.units = mesh.units
-        scene.geometry[geometry.geometry_name] = rebuilt
-        output_vertex_count += len(output_vertices)
-    return output_vertex_count
+    rebuilt.units = source_mesh.units
+    return rebuilt
 
 
 def _build_geometry_glass_material(
     mesh: trimesh.Trimesh,
     placements: Sequence[_FacePlacement],
-) -> tuple[object, dict[int, int]]:
-    """Mark one shared atlas as blended while retaining material indices."""
+) -> tuple[object, dict[tuple[int, bool], int]]:
+    """Map every glass face to a shared atlas-independent side variant."""
 
     source_material = copy.deepcopy(mesh.visual.material)
     if not any(placement.face.is_glass for placement in placements):
         return source_material, {}
-    materials = _iter_material_leaves(source_material)
-    glass_source_indices: set[int] = set()
+    source_materials = list(_iter_material_leaves(source_material))
+    output_materials = [
+        (
+            build_housemaker_glass_material(
+                bool(get_housemaker_glass_double_sided(material))
+            )
+            if is_housemaker_glass_material(material)
+            else material
+        )
+        for material in source_materials
+    ]
+    side_material_indices: dict[bool, int] = {}
+    for material_index, material in enumerate(output_materials):
+        double_sided = get_housemaker_glass_double_sided(material)
+        if double_sided is not None:
+            side_material_indices.setdefault(double_sided, material_index)
+
+    glass_material_indices: dict[tuple[int, bool], int] = {}
     for placement in placements:
         if not placement.face.is_glass:
             continue
@@ -2041,24 +2508,22 @@ def _build_geometry_glass_material(
             if placement.face.face_material_index is None
             else int(placement.face.face_material_index)
         )
-        if source_index < 0 or source_index >= len(materials):
+        if source_index < 0 or source_index >= len(source_materials):
             raise ValueError("A glass face uses an invalid material index.")
-        glass_source_indices.add(source_index)
-    for material in materials:
-        if hasattr(material, "name"):
-            material.name = HOUSEMAKER_GLASS_MATERIAL_NAME
-        if hasattr(material, "alphaMode"):
-            material.alphaMode = "BLEND"
-        if hasattr(material, "doubleSided"):
-            material.doubleSided = True
-        if hasattr(material, "metallicFactor"):
-            material.metallicFactor = 1.0
-        if hasattr(material, "roughnessFactor"):
-            material.roughnessFactor = 1.0
-    return source_material, {
-        source_index: source_index
-        for source_index in glass_source_indices
-    }
+        double_sided = (
+            DEFAULT_HOUSEMAKER_GLASS_DOUBLE_SIDED
+            if placement.face.glass_double_sided is None
+            else placement.face.glass_double_sided
+        )
+        material_index = side_material_indices.get(double_sided)
+        if material_index is None:
+            material_index = len(output_materials)
+            output_materials.append(
+                build_housemaker_glass_material(double_sided)
+            )
+            side_material_indices[double_sided] = material_index
+        glass_material_indices[(source_index, double_sided)] = material_index
+    return MultiMaterial(output_materials), glass_material_indices
 
 
 def _get_source_vertex_normals(mesh: trimesh.Trimesh) -> np.ndarray:

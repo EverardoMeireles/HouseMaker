@@ -14,8 +14,10 @@ from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QApplication
 import trimesh
+from trimesh.visual.texture import TextureVisuals
 
 from housemaker.glb import GeneratedModel, PreviewPlacedObject
+from housemaker.glass_material import build_housemaker_glass_material
 from housemaker.surface_geometry import FixedSurface, SURFACE_TYPE_WALL
 from housemaker.viewer import (
     NAVIGATION_MODE_FIRST_PERSON,
@@ -333,6 +335,37 @@ class CanvasObjectGizmoTests(unittest.TestCase):
         self.assertTrue(viewer.begin_window_placement())
         self.assertIsNone(viewer.get_selected_placed_object_id())
 
+    def test_delete_key_requests_only_selected_placement_removal(self) -> None:
+        viewer = self._build_viewer(_build_placed_object("chair"))
+        placement_removals: list[str] = []
+        generic_deletions: list[bool] = []
+        viewer.placed_object_removal_requested.connect(
+            placement_removals.append
+        )
+        viewer.delete_requested.connect(lambda: generic_deletions.append(True))
+        viewer.select_placed_object("chair")
+
+        viewer.view.keyPressEvent(
+            QKeyEvent(
+                QKeyEvent.Type.KeyPress,
+                Qt.Key.Key_Delete,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+
+        self.assertEqual(placement_removals, ["chair"])
+        self.assertEqual(generic_deletions, [])
+        self.assertIsNone(viewer.get_selected_placed_object_id())
+
+        viewer.view.keyPressEvent(
+            QKeyEvent(
+                QKeyEvent.Type.KeyPress,
+                Qt.Key.Key_Delete,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+        self.assertEqual(generic_deletions, [True])
+
     def test_released_first_person_pointer_can_select_an_object(self) -> None:
         viewer = self._build_viewer(_build_placed_object("chair"))
         position = QPointF(40.0, 24.0)
@@ -517,6 +550,43 @@ class CanvasObjectGizmoTests(unittest.TestCase):
             self.assertIs(retained.textured_item.parentItem(), group.root_item)
         if mirrored.textured_item is not None:
             self.assertIs(mirrored.textured_item.parentItem(), group.root_item)
+
+    def test_placed_prefab_glass_and_its_mirror_keep_sidedness(self) -> None:
+        glass_mesh = trimesh.Trimesh(
+            vertices=np.asarray(
+                ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+                dtype=float,
+            ),
+            faces=np.asarray(((0, 1, 2),), dtype=np.int64),
+            process=False,
+        )
+        glass_mesh.visual = TextureVisuals(
+            uv=np.zeros((3, 2), dtype=float),
+            material=build_housemaker_glass_material(False),
+        )
+        preview = PreviewPlacedObject(
+            object_id="glass-half",
+            meshes=(glass_mesh,),
+            placement_transform=np.eye(4, dtype=float),
+            world_position=(0.0, 0.0, 0.0),
+            rotation_degrees=(0.0, 0.0, 0.0),
+            symmetric_preview_orientation="vertical",
+            symmetric_preview_plane_coordinate=0.0,
+        )
+
+        viewer = self._build_viewer(preview)
+        group = viewer._placed_object_render_groups["glass-half"]
+
+        retained = group.retained_parts[0].textured_item
+        mirrored = group.symmetric_groups[0].textured_item
+        self.assertIsNotNone(retained)
+        self.assertIsNotNone(mirrored)
+        assert retained is not None
+        assert mirrored is not None
+        self.assertTrue(retained._is_prefab_glass)
+        self.assertTrue(mirrored._is_prefab_glass)
+        self.assertFalse(retained._double_sided)
+        self.assertFalse(mirrored._double_sided)
 
 
 if __name__ == "__main__":

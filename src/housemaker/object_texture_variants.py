@@ -14,6 +14,10 @@ from PIL import Image
 from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
+from housemaker.glass_material import (
+    HOUSEMAKER_GLASS_MATERIAL_NAME,
+    is_housemaker_glass_material,
+)
 from housemaker.scan_projection_layout import remap_scan_projection_scene_uvs
 
 
@@ -51,17 +55,11 @@ ATLAS_MAP_LABELS = {
     PBR_MAP_ROUGHNESS: "Roughness",
     PBR_MAP_METALLIC: "Metallic",
 }
-HOUSEMAKER_GLASS_MATERIAL_NAME = "HouseMaker Glass"
 _MATERIAL_ATTRIBUTE_BY_TEXTURE_TYPE = {
     MATERIAL_TEXTURE_BASE_COLOR: "baseColorTexture",
     MATERIAL_TEXTURE_NORMAL: "normalTexture",
     MATERIAL_TEXTURE_METALLIC_ROUGHNESS: "metallicRoughnessTexture",
 }
-_UNSUPPORTED_UV_TEXTURE_ATTRIBUTES = (
-    "emissiveTexture",
-    "occlusionTexture",
-    "specularGlossinessTexture",
-)
 _OPAQUE_BLACK = np.asarray((0, 0, 0, 255), dtype=np.uint8)
 _NEUTRAL_NORMAL = np.asarray((128, 128, 255, 255), dtype=np.uint8)
 _NEUTRAL_METALLIC_ROUGHNESS = np.asarray((0, 255, 0, 255), dtype=np.uint8)
@@ -214,8 +212,6 @@ def replace_object_base_color_texture_from_glb(
         raise ValueError("The generated texture GLB is empty.")
 
     model_scene = _load_glb_scene(model_payload)
-    model_textures = _collect_material_textures(model_scene)
-
     texture_scene = _load_glb_scene(texture_payload)
     generated_maps = _collect_material_texture_maps(texture_scene)
     generated_textures = generated_maps.get(MATERIAL_TEXTURE_BASE_COLOR, [])
@@ -226,13 +222,6 @@ def replace_object_base_color_texture_from_glb(
     generated_texture_maps = _validate_shared_2048_texture_maps(
         generated_maps
     )
-    if model_textures:
-        existing_base_color = _validate_shared_texture(model_textures)
-        generated_texture_maps = _preserve_housemaker_glass_alpha(
-            model_scene,
-            generated_texture_maps,
-            existing_base_color,
-        )
     _attach_texture_maps_to_uv_meshes(model_scene, generated_texture_maps)
     try:
         return bytes(model_scene.export(file_type="glb"))
@@ -241,43 +230,6 @@ def replace_object_base_color_texture_from_glb(
             "The generated texture could not be applied to the preserved "
             "object geometry."
         ) from error
-
-
-def _preserve_housemaker_glass_alpha(
-    scene: trimesh.Scene,
-    texture_maps: Mapping[str, np.ndarray],
-    existing_base_color: np.ndarray,
-) -> dict[str, np.ndarray]:
-    """Retain the local glass mask while accepting provider-authored color."""
-
-    uses_glass_atlas = any(
-        str(getattr(leaf, "name", "")).strip()
-        == HOUSEMAKER_GLASS_MATERIAL_NAME
-        for geometry in scene.geometry.values()
-        for leaf in _iter_material_leaves(
-            getattr(getattr(geometry, "visual", None), "material", None)
-        )
-    )
-    output = {
-        map_type: np.asarray(texture, dtype=np.uint8).copy()
-        for map_type, texture in texture_maps.items()
-    }
-    if not uses_glass_atlas:
-        return output
-    generated_base_color = output[MATERIAL_TEXTURE_BASE_COLOR]
-    existing_alpha = np.asarray(existing_base_color[:, :, 3], dtype=np.uint8)
-    if generated_base_color.shape[:2] != existing_alpha.shape:
-        existing_alpha = cv2.resize(
-            existing_alpha,
-            (
-                generated_base_color.shape[1],
-                generated_base_color.shape[0],
-            ),
-            interpolation=cv2.INTER_NEAREST,
-        )
-    generated_base_color[:, :, 3] = existing_alpha
-    return output
-
 
 def _build_variants_from_scene(
     scene: trimesh.Scene,
@@ -485,6 +437,8 @@ def _collect_material_texture_maps(
     ):
         material = getattr(getattr(geometry, "visual", None), "material", None)
         for leaf in _iter_material_leaves(material):
+            if is_housemaker_glass_material(leaf):
+                continue
             base_texture = _get_material_texture(
                 leaf,
                 MATERIAL_TEXTURE_BASE_COLOR,
@@ -524,12 +478,19 @@ def _iter_material_leaves(material: object) -> tuple[object, ...]:
     return (material,)
 
 
-def reject_unsupported_uv_material_textures(
+def prepare_uv_rewrite_material_textures(
     scene: trimesh.Scene,
     *,
     operation_name: str,
 ) -> None:
-    """Reject maps that cannot remain valid after HouseMaker rewrites UVs."""
+    """Remove unsafe optional maps before HouseMaker rewrites shared UVs.
+
+    glTF commonly aliases occlusion to the red channel of the packed
+    metallic-roughness image. That alias remains valid because HouseMaker
+    rebakes the whole packed image. Independent occlusion, emissive, and
+    legacy specular-glossiness images are not requested output maps, so they
+    must not retain UVs that no longer address their pixels.
+    """
 
     normalized_operation_name = str(operation_name).strip()
     if not normalized_operation_name:
@@ -537,21 +498,60 @@ def reject_unsupported_uv_material_textures(
     for geometry in scene.geometry.values():
         material = getattr(getattr(geometry, "visual", None), "material", None)
         for leaf in _iter_material_leaves(material):
-            if any(
-                getattr(leaf, attribute_name, None) is not None
-                for attribute_name in _UNSUPPORTED_UV_TEXTURE_ATTRIBUTES
-            ):
-                raise ValueError(
-                    f"{normalized_operation_name} does not support emissive, "
-                    "occlusion, or specular-glossiness textures because their "
-                    "pixels cannot follow the rewritten UVs."
-                )
+            if is_housemaker_glass_material(leaf):
+                continue
+            _prepare_uv_rewrite_material_leaf(leaf)
+
+
+def _prepare_uv_rewrite_material_leaf(material: object) -> None:
+    """Preserve a packed AO alias and clear UV-dependent optional maps."""
+
+    metallic_roughness = getattr(material, "metallicRoughnessTexture", None)
+    occlusion = getattr(material, "occlusionTexture", None)
+    packed_occlusion = (
+        metallic_roughness is not None
+        and occlusion is not None
+        and _material_textures_share_pixels(occlusion, metallic_roughness)
+    )
+    if hasattr(material, "occlusionTexture"):
+        setattr(
+            material,
+            "occlusionTexture",
+            metallic_roughness if packed_occlusion else None,
+        )
+
+    if getattr(material, "emissiveTexture", None) is not None:
+        if hasattr(material, "emissiveTexture"):
+            setattr(material, "emissiveTexture", None)
+        if hasattr(material, "emissiveFactor"):
+            setattr(material, "emissiveFactor", np.zeros(3, dtype=float))
+
+    if hasattr(material, "specularGlossinessTexture"):
+        setattr(material, "specularGlossinessTexture", None)
+
+
+def _material_textures_share_pixels(first: object, second: object) -> bool:
+    """Return whether two material slots address one equivalent image."""
+
+    if first is second:
+        return True
+    try:
+        first_rgba = _decode_texture_rgba(first)
+        second_rgba = _decode_texture_rgba(second)
+    except Exception:
+        return False
+    return first_rgba.shape == second_rgba.shape and np.array_equal(
+        first_rgba,
+        second_rgba,
+    )
 
 
 def _get_material_texture(
     material: object,
     map_type: str,
 ) -> object | None:
+    if is_housemaker_glass_material(material):
+        return None
     if map_type == MATERIAL_TEXTURE_BASE_COLOR:
         for attribute_name in ("baseColorTexture", "image"):
             texture = getattr(material, attribute_name, None)
@@ -603,6 +603,8 @@ def _replace_material_texture_maps_with_shared(
         if not leaves:
             continue
         for leaf in leaves:
+            if is_housemaker_glass_material(leaf):
+                continue
             if _get_material_texture(leaf, MATERIAL_TEXTURE_BASE_COLOR) is None:
                 continue
             _attach_texture_maps_to_material_leaf(leaf, normalized_maps)
@@ -659,6 +661,8 @@ def _replace_material_texture_tree(
 ) -> None:
     if material is None:
         return
+    if is_housemaker_glass_material(material):
+        return
     nested_materials = getattr(material, "materials", None)
     if isinstance(nested_materials, list | tuple):
         for nested_material in nested_materials:
@@ -712,6 +716,12 @@ def _attach_texture_maps_to_uv_meshes(
             if raw_material is None
             else copy.deepcopy(raw_material)
         )
+        attachable_leaf_count = sum(
+            not is_housemaker_glass_material(leaf)
+            for leaf in _iter_material_leaves(material)
+        )
+        if attachable_leaf_count == 0:
+            continue
         _attach_texture_maps_to_material_tree(material, texture_maps)
         raw_face_materials = getattr(
             geometry.visual,
@@ -734,7 +744,7 @@ def _attach_texture_maps_to_uv_meshes(
             material=material,
             face_materials=face_materials,
         )
-        attached_count += 1
+        attached_count += attachable_leaf_count
     if attached_count == 0:
         raise ValueError(
             "The preserved object GLB has no textured triangle meshes."
@@ -747,6 +757,8 @@ def _attach_texture_to_material_tree(
 ) -> None:
     """Set one shared atlas on every leaf while retaining material factors."""
 
+    if is_housemaker_glass_material(material):
+        return
     nested_materials = getattr(material, "materials", None)
     if isinstance(nested_materials, list | tuple):
         if not nested_materials:
@@ -772,6 +784,8 @@ def _attach_texture_maps_to_material_tree(
 ) -> None:
     """Set every supported map on each leaf while retaining material factors."""
 
+    if is_housemaker_glass_material(material):
+        return
     nested_materials = getattr(material, "materials", None)
     if isinstance(nested_materials, list | tuple):
         if not nested_materials:
@@ -786,6 +800,16 @@ def _attach_texture_maps_to_material_leaf(
     material: object,
     texture_maps: Mapping[str, np.ndarray],
 ) -> None:
+    if is_housemaker_glass_material(material):
+        return
+    packed_occlusion = (
+        getattr(material, "occlusionTexture", None) is not None
+        and getattr(material, "metallicRoughnessTexture", None) is not None
+        and _material_textures_share_pixels(
+            getattr(material, "occlusionTexture"),
+            getattr(material, "metallicRoughnessTexture"),
+        )
+    )
     base_color = texture_maps.get(MATERIAL_TEXTURE_BASE_COLOR)
     if base_color is None:
         raise ValueError("Provider material maps require base color.")
@@ -807,6 +831,12 @@ def _attach_texture_maps_to_material_leaf(
                     mode="RGBA",
                 ),
             )
+    if packed_occlusion and hasattr(material, "occlusionTexture"):
+        setattr(
+            material,
+            "occlusionTexture",
+            getattr(material, "metallicRoughnessTexture", None),
+        )
     if MATERIAL_TEXTURE_METALLIC_ROUGHNESS in texture_maps:
         if hasattr(material, "metallicFactor"):
             setattr(material, "metallicFactor", 1.0)

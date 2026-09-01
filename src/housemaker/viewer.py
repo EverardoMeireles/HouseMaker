@@ -1,6 +1,7 @@
 # ### Imports ###
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from io import BytesIO
@@ -45,10 +46,15 @@ from housemaker.camera_indicators import (
 )
 from housemaker.camera_models import CameraPose
 from housemaker.glb import (
+    GLTF_Y_UP_TO_Z_UP_TRANSFORM,
     SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION,
     GeneratedModel,
     PreviewPlacedObject,
     PreviewTexturedWall,
+)
+from housemaker.glass_material import (
+    get_housemaker_glass_double_sided,
+    is_housemaker_glass_material,
 )
 from housemaker.object_texture_variants import (
     PBR_MAP_METALLIC,
@@ -304,6 +310,8 @@ class TextureMeshData:
     normal_texture_rgba: np.ndarray | None = None
     roughness_texture_rgba: np.ndarray | None = None
     metallic_texture_rgba: np.ndarray | None = None
+    double_sided: bool = True
+    is_prefab_glass: bool = False
 
 
 @dataclass(frozen=True)
@@ -1200,6 +1208,7 @@ class TexturedMeshItem(GLGraphicsItem):
             texture_mesh_data.texture_rgba,
             dtype=np.uint8,
         )
+        self._is_prefab_glass = bool(texture_mesh_data.is_prefab_glass)
         self._contains_transparent_texels = bool(
             np.any(self._texture_rgba[:, :, 3] < 255)
         )
@@ -1862,7 +1871,6 @@ class _FaceRectangleSelectionTask:
     geometry_revision: int
     projected_geometry: tuple[tuple[np.ndarray, np.ndarray], ...]
     rectangle: tuple[int, int, int, int]
-    xray: bool
 
 
 @dataclass(frozen=True)
@@ -1880,6 +1888,7 @@ class GlbViewerWidget(QWidget):
     wall_selected = Signal(int, int, str)
     window_placement_requested = Signal(object)
     window_undo_requested = Signal()
+    placed_object_removal_requested = Signal(str)
     placed_object_transform_changed = Signal(str, object, object)
     face_selection_changed = Signal(object)
     projection_camera_selection_changed = Signal(object)
@@ -1906,6 +1915,8 @@ class GlbViewerWidget(QWidget):
         self.grid_item: gl.GLGridItem | None = None
         self.mesh_item: gl.GLMeshItem | None = None
         self.textured_mesh_item: TexturedMeshItem | None = None
+        self.model_material_items: list[TexturedMeshItem] = []
+        self._model_material_preview_meshes: tuple[trimesh.Trimesh, ...] = ()
         self.symmetric_preview_textured_mesh_item: TexturedMeshItem | None = None
         self.symmetric_preview_mesh_item: gl.GLMeshItem | None = None
         self.textured_surface_items: list[TexturedMeshItem] = []
@@ -1933,7 +1944,6 @@ class GlbViewerWidget(QWidget):
         self._window_editing_enabled = bool(window_editing_enabled)
         self._projection_camera_indicators_visible = False
         self._face_editing_enabled = bool(face_editing_enabled)
-        self._face_selection_xray_enabled = False
         self._face_edit_vertices: np.ndarray | None = None
         self._face_edit_faces: np.ndarray | None = None
         self._selected_face_indices: set[int] = set()
@@ -1980,6 +1990,9 @@ class GlbViewerWidget(QWidget):
         self._explicit_symmetric_preview_group: (
             _SymmetricPreviewRenderGroup | None
         ) = None
+        self._explicit_symmetric_preview_groups: list[
+            _SymmetricPreviewRenderGroup
+        ] = []
         self._embedded_symmetric_preview_groups: list[
             _SymmetricPreviewRenderGroup
         ] = []
@@ -2047,7 +2060,7 @@ class GlbViewerWidget(QWidget):
             self._window_editing_enabled
         )
         self.view.items_clicked.connect(self._handle_view_items_clicked)
-        self.view.delete_requested.connect(self.delete_requested.emit)
+        self.view.delete_requested.connect(self._handle_view_delete_requested)
         self.view.navigation_mode_changed.connect(self.navigation_mode_changed.emit)
         self.view.first_person_active_changed.connect(
             self.first_person_active_changed.emit
@@ -2240,6 +2253,19 @@ class GlbViewerWidget(QWidget):
         """Return the stable ID currently controlled by the Canvas gizmo."""
 
         return self._selected_placed_object_id
+
+    def _handle_view_delete_requested(self) -> None:
+        """Route Delete to Canvas placement removal or the generic consumer."""
+
+        selected_id = self._selected_placed_object_id
+        if (
+            self._placed_object_editing_enabled
+            and selected_id in self._placed_object_render_groups
+        ):
+            self._set_selected_placed_object(None)
+            self.placed_object_removal_requested.emit(selected_id)
+            return
+        self.delete_requested.emit()
 
     def select_placed_object(self, object_id: str | None) -> bool:
         """Select one rendered placed object, or clear the transform gizmo."""
@@ -2840,15 +2866,6 @@ class GlbViewerWidget(QWidget):
         self.view.cancel_transient_pointer_interactions()
         self._cancel_face_selection_gesture()
 
-    def set_face_selection_xray_enabled(self, enabled: bool) -> None:
-        """Select occluded faces during rectangle gestures when enabled."""
-
-        normalized_enabled = bool(enabled)
-        if normalized_enabled == self._face_selection_xray_enabled:
-            return
-        self._face_selection_xray_enabled = normalized_enabled
-        self._invalidate_face_rectangle_selection_requests()
-
     def get_selected_face_indices(self) -> tuple[int, ...]:
         """Return stable global face indices in ascending order."""
 
@@ -3068,7 +3085,6 @@ class GlbViewerWidget(QWidget):
             geometry_revision=self._face_selection_geometry_revision,
             projected_geometry=projected_geometry,
             rectangle=rectangle,
-            xray=self._face_selection_xray_enabled,
         )
         viewer_reference = weakref.ref(self)
         worker = threading.Thread(
@@ -3239,24 +3255,64 @@ class GlbViewerWidget(QWidget):
             return
         display_mesh = self._get_display_mesh()
         assert display_mesh is not None
-        group = self._create_symmetric_preview_group(
-            display_mesh,
-            self._symmetric_preview_orientation,
-            self._symmetric_preview_plane_coordinate,
-        )
-        if group is None:
-            return
-        self._explicit_symmetric_preview_group = group
-        self.symmetric_preview_textured_mesh_item = group.textured_item
-        self.symmetric_preview_mesh_item = group.mesh_item
-        self._symmetric_preview_vertices = group.vertices
-        self._symmetric_preview_faces = group.faces
-        self._symmetric_preview_face_colors = group.face_colors
         retained_vertices = np.asarray(display_mesh.vertices, dtype=np.float32)
+        material_meshes = self._model_material_preview_meshes
+        if material_meshes:
+            groups = [
+                group
+                for material_mesh in material_meshes
+                if (
+                    group := self._create_symmetric_preview_group(
+                        material_mesh,
+                        self._symmetric_preview_orientation,
+                        self._symmetric_preview_plane_coordinate,
+                    )
+                )
+                is not None
+            ]
+            if not groups:
+                return
+            self._explicit_symmetric_preview_groups = groups
+            first_group = groups[0]
+            self._explicit_symmetric_preview_group = first_group
+            self.symmetric_preview_textured_mesh_item = (
+                first_group.textured_item
+            )
+            self.symmetric_preview_mesh_item = first_group.mesh_item
+            mirrored_vertices = _mirror_preview_vertices(
+                retained_vertices,
+                self._symmetric_preview_orientation,
+                self._symmetric_preview_plane_coordinate,
+            )
+            self._symmetric_preview_vertices = mirrored_vertices
+            self._symmetric_preview_faces = np.asarray(
+                display_mesh.faces,
+                dtype=np.int32,
+            )[:, (0, 2, 1)]
+            self._symmetric_preview_face_colors = np.tile(
+                FACE_COLOR,
+                (len(self._symmetric_preview_faces), 1),
+            )
+        else:
+            group = self._create_symmetric_preview_group(
+                display_mesh,
+                self._symmetric_preview_orientation,
+                self._symmetric_preview_plane_coordinate,
+            )
+            if group is None:
+                return
+            self._explicit_symmetric_preview_group = group
+            self._explicit_symmetric_preview_groups = [group]
+            self.symmetric_preview_textured_mesh_item = group.textured_item
+            self.symmetric_preview_mesh_item = group.mesh_item
+            self._symmetric_preview_vertices = group.vertices
+            self._symmetric_preview_faces = group.faces
+            self._symmetric_preview_face_colors = group.face_colors
+            mirrored_vertices = group.vertices
         self._start_symmetric_preview_animation()
         self._apply_render_display_options()
         if not self._last_set_model_preserved_camera:
-            self._frame_symmetric_preview(retained_vertices, group.vertices)
+            self._frame_symmetric_preview(retained_vertices, mirrored_vertices)
 
     def _build_embedded_symmetric_preview_items(self) -> None:
         """Build mirrors recorded by placed symmetric-object composition."""
@@ -3323,6 +3379,7 @@ class GlbViewerWidget(QWidget):
             textured_item = TexturedMeshItem(
                 mirrored_texture_data,
                 self._ambient_light_intensity,
+                double_sided=mirrored_texture_data.double_sided,
                 opacity=opacity,
                 translucent=True,
                 pbr_maps_enabled=self._pbr_maps_enabled,
@@ -3381,6 +3438,7 @@ class GlbViewerWidget(QWidget):
             textured_item = TexturedMeshItem(
                 texture_mesh_data,
                 self._ambient_light_intensity,
+                double_sided=texture_mesh_data.double_sided,
                 opacity=opacity,
                 translucent=True,
                 pbr_maps_enabled=self._pbr_maps_enabled,
@@ -3437,8 +3495,7 @@ class GlbViewerWidget(QWidget):
         groups = list(self._embedded_symmetric_preview_groups)
         for placed_group in self._placed_object_render_groups.values():
             groups.extend(placed_group.symmetric_groups)
-        if self._explicit_symmetric_preview_group is not None:
-            groups.append(self._explicit_symmetric_preview_group)
+        groups.extend(self._explicit_symmetric_preview_groups)
         return tuple(groups)
 
     def _advance_symmetric_preview_fade(self) -> None:
@@ -3502,8 +3559,7 @@ class GlbViewerWidget(QWidget):
         self.view.apply_navigation_camera()
 
     def _remove_symmetric_preview_items(self) -> None:
-        group = self._explicit_symmetric_preview_group
-        if group is not None:
+        for group in self._explicit_symmetric_preview_groups:
             for item in (group.textured_item, group.mesh_item):
                 if item is not None and item in self.view.items:
                     self.view.removeItem(item)
@@ -3520,6 +3576,7 @@ class GlbViewerWidget(QWidget):
         self._symmetric_preview_faces = None
         self._symmetric_preview_face_colors = None
         self._explicit_symmetric_preview_group = None
+        self._explicit_symmetric_preview_groups = []
 
     def _clear_symmetric_preview(self) -> None:
         had_preview = (
@@ -3550,8 +3607,15 @@ class GlbViewerWidget(QWidget):
                 raw_mask > 0,
                 dtype=np.uint8,
             )
-        if self.textured_mesh_item is not None:
-            self.textured_mesh_item.set_edit_mask(self._texture_edit_mask)
+        for textured_item in (
+            self.textured_mesh_item,
+            *self.model_material_items,
+        ):
+            if (
+                textured_item is not None
+                and not textured_item._is_prefab_glass
+            ):
+                textured_item.set_edit_mask(self._texture_edit_mask)
         self.view.update()
 
     def set_ambient_light_intensity(self, intensity: float) -> None:
@@ -3566,6 +3630,10 @@ class GlbViewerWidget(QWidget):
         )
         if self.textured_mesh_item is not None:
             self.textured_mesh_item.set_ambient_light_intensity(
+                self._ambient_light_intensity
+            )
+        for material_item in self.model_material_items:
+            material_item.set_ambient_light_intensity(
                 self._ambient_light_intensity
             )
         for group in self._get_symmetric_preview_groups():
@@ -3622,6 +3690,7 @@ class GlbViewerWidget(QWidget):
 
         candidates: list[TexturedMeshItem | None] = [
             self.textured_mesh_item,
+            *self.model_material_items,
             *self.textured_surface_items,
         ]
         candidates.extend(
@@ -3925,10 +3994,18 @@ class GlbViewerWidget(QWidget):
         vertices = np.asarray(display_mesh.vertices, dtype=np.float32)
         faces = np.asarray(display_mesh.faces, dtype=np.int32)
         if vertices.size and faces.size:
-            texture_mesh_data = _build_texture_mesh_data(display_mesh)
+            material_preview_meshes = _build_model_material_preview_meshes(
+                self.model
+            )
+            self._model_material_preview_meshes = material_preview_meshes
+            texture_mesh_data = (
+                None
+                if material_preview_meshes
+                else _build_texture_mesh_data(display_mesh)
+            )
             face_colors = (
                 np.tile(FACE_COLOR, (faces.shape[0], 1))
-                if texture_mesh_data is not None
+                if texture_mesh_data is not None or material_preview_meshes
                 else _get_mesh_face_colors(display_mesh, faces)
             )
 
@@ -3936,17 +4013,38 @@ class GlbViewerWidget(QWidget):
                 self.textured_mesh_item = TexturedMeshItem(
                     texture_mesh_data,
                     self._ambient_light_intensity,
+                    double_sided=texture_mesh_data.double_sided,
                     pbr_maps_enabled=self._pbr_maps_enabled,
                 )
                 self.textured_mesh_item.set_edit_mask(self._texture_edit_mask)
                 self.view.addItem(self.textured_mesh_item)
+
+            for material_mesh in material_preview_meshes:
+                material_texture_data = _build_texture_mesh_data(
+                    material_mesh
+                )
+                if material_texture_data is None:
+                    continue
+                material_item = TexturedMeshItem(
+                    material_texture_data,
+                    self._ambient_light_intensity,
+                    double_sided=material_texture_data.double_sided,
+                    pbr_maps_enabled=self._pbr_maps_enabled,
+                )
+                if not material_texture_data.is_prefab_glass:
+                    material_item.set_edit_mask(self._texture_edit_mask)
+                self.view.addItem(material_item)
+                self.model_material_items.append(material_item)
 
             self.mesh_item = _WireframeOverlayMeshItem(
                 vertexes=vertices,
                 faces=faces,
                 faceColors=face_colors,
                 smooth=False,
-                drawFaces=texture_mesh_data is None,
+                drawFaces=(
+                    texture_mesh_data is None
+                    and not self.model_material_items
+                ),
                 drawEdges=True,
                 edgeColor=EDGE_COLOR,
                 shader=self._ambient_shader,
@@ -4148,6 +4246,7 @@ class GlbViewerWidget(QWidget):
                 texture_data,
                 self._ambient_light_intensity,
                 texture_repeat=True,
+                double_sided=texture_data.double_sided,
                 pbr_maps_enabled=self._pbr_maps_enabled,
             )
             textured_item.setParentItem(root_item)
@@ -4614,6 +4713,8 @@ class GlbViewerWidget(QWidget):
         textures_visible = self._textures_enabled and not self._wireframe_only
         if self.textured_mesh_item is not None:
             self.textured_mesh_item.setVisible(textures_visible)
+        for material_item in self.model_material_items:
+            material_item.setVisible(textures_visible)
         symmetric_groups = self._get_symmetric_preview_groups()
         for group in symmetric_groups:
             if group.textured_item is not None:
@@ -4640,7 +4741,10 @@ class GlbViewerWidget(QWidget):
                 retained_part.mesh_item.update()
 
         if self.mesh_item is not None:
-            has_textured_surface = self.textured_mesh_item is not None
+            has_textured_surface = (
+                self.textured_mesh_item is not None
+                or bool(self.model_material_items)
+            )
             self.mesh_item.opts["drawFaces"] = (
                 not self._wireframe_only
                 and (not has_textured_surface or not self._textures_enabled)
@@ -4724,6 +4828,8 @@ class GlbViewerWidget(QWidget):
         self.grid_item = None
         self.mesh_item = None
         self.textured_mesh_item = None
+        self.model_material_items = []
+        self._model_material_preview_meshes = ()
         self._face_selection_item = None
         self._mirrored_face_selection_item = None
         self._reset_symmetric_preview_item_state()
@@ -4891,30 +4997,6 @@ def _get_nearest_triangle_ray_face_index(
     return face_index, float(distances[face_index])
 
 
-def _select_face_indices_in_view_rectangle(
-    view: SelectableGLViewWidget,
-    geometry: Sequence[tuple[np.ndarray, np.ndarray]],
-    rectangle: QRect,
-    *,
-    xray: bool,
-) -> set[int]:
-    """Select logical IDs owning pixels inside a current-camera rectangle."""
-
-    captured = _capture_face_selection_raster_input(
-        view,
-        geometry,
-        rectangle,
-    )
-    if captured is None:
-        return set()
-    projected_geometry, rectangle_values = captured
-    return _rasterize_face_selection(
-        projected_geometry,
-        QRect(*rectangle_values),
-        xray=bool(xray),
-    )
-
-
 def _capture_face_selection_raster_input(
     view: SelectableGLViewWidget,
     geometry: Sequence[tuple[np.ndarray, np.ndarray]],
@@ -5076,7 +5158,6 @@ def _rasterize_face_selection(
     projected_geometry: Sequence[tuple[np.ndarray, np.ndarray]],
     rectangle: QRect,
     *,
-    xray: bool,
     cancel_event: threading.Event | None = None,
 ) -> set[int]:
     """Depth-test current-camera faces in a bounded logical-ID buffer.
@@ -5145,9 +5226,6 @@ def _rasterize_face_selection(
         return set()
     if cancel_event is not None and cancel_event.is_set():
         return set()
-    if xray:
-        return {int(index) for index in logical_face_indices}
-
     raster_scale = min(
         1.0,
         FACE_SELECTION_MAX_RASTER_DIMENSION / max(width, height),
@@ -5247,7 +5325,6 @@ def _run_face_rectangle_selection_task(
         selected = _rasterize_face_selection(
             task.projected_geometry,
             QRect(*task.rectangle),
-            xray=task.xray,
             cancel_event=cancel_event,
         )
     except Exception:
@@ -6112,6 +6189,8 @@ def _mirror_texture_mesh_data(
         normal_texture_rgba=texture_mesh_data.normal_texture_rgba,
         roughness_texture_rgba=texture_mesh_data.roughness_texture_rgba,
         metallic_texture_rgba=texture_mesh_data.metallic_texture_rgba,
+        double_sided=texture_mesh_data.double_sided,
+        is_prefab_glass=texture_mesh_data.is_prefab_glass,
     )
 
 
@@ -6122,23 +6201,41 @@ def _build_texture_mesh_data(mesh) -> TextureMeshData | None:
     if getattr(visual, "kind", None) != "texture":
         return None
 
-    texture_rgba = _get_base_color_texture_rgba(visual)
-    normal_texture_rgba = _get_material_texture_rgba(
-        visual,
-        ("normalTexture",),
+    material_leaves = _iter_material_leaves(
+        getattr(visual, "material", None)
     )
-    combined_metallic_roughness_rgba = _get_material_texture_rgba(
-        visual,
-        ("metallicRoughnessTexture",),
+    prefab_glass_material = (
+        material_leaves[0]
+        if len(material_leaves) == 1
+        and is_housemaker_glass_material(material_leaves[0])
+        else None
     )
-    roughness_texture_rgba = _get_material_texture_rgba(
-        visual,
-        ("roughnessTexture",),
-    )
-    metallic_texture_rgba = _get_material_texture_rgba(
-        visual,
-        ("metallicTexture",),
-    )
+    if prefab_glass_material is None:
+        texture_rgba = _get_base_color_texture_rgba(visual)
+        normal_texture_rgba = _get_material_texture_rgba(
+            visual,
+            ("normalTexture",),
+        )
+        combined_metallic_roughness_rgba = _get_material_texture_rgba(
+            visual,
+            ("metallicRoughnessTexture",),
+        )
+        roughness_texture_rgba = _get_material_texture_rgba(
+            visual,
+            ("roughnessTexture",),
+        )
+        metallic_texture_rgba = _get_material_texture_rgba(
+            visual,
+            ("metallicTexture",),
+        )
+    else:
+        (
+            texture_rgba,
+            normal_texture_rgba,
+            roughness_texture_rgba,
+            metallic_texture_rgba,
+        ) = _build_prefab_glass_preview_textures(prefab_glass_material)
+        combined_metallic_roughness_rgba = None
     if roughness_texture_rgba is None and combined_metallic_roughness_rgba is not None:
         roughness_texture_rgba = _extract_texture_channel_rgba(
             combined_metallic_roughness_rgba,
@@ -6197,7 +6294,92 @@ def _build_texture_mesh_data(mesh) -> TextureMeshData | None:
         metallic_texture_rgba=_limit_optional_texture_preview_size(
             metallic_texture_rgba
         ),
+        double_sided=(
+            get_housemaker_glass_double_sided(prefab_glass_material)
+            if prefab_glass_material is not None
+            else True
+        ),
+        is_prefab_glass=prefab_glass_material is not None,
     )
+
+
+def _build_prefab_glass_preview_textures(
+    material: object,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build tiny preview maps from an atlas-independent glass material."""
+
+    base_color = _normalize_material_rgba_factor(
+        getattr(material, "baseColorFactor", None),
+        default=(205, 232, 242, 48),
+    )
+    roughness = _normalize_material_scalar_factor(
+        getattr(material, "roughnessFactor", None),
+        default=10.0 / 255.0,
+    )
+    metallic = _normalize_material_scalar_factor(
+        getattr(material, "metallicFactor", None),
+        default=1.0,
+    )
+    roughness_channel = int(round(roughness * 255.0))
+    metallic_channel = int(round(metallic * 255.0))
+    return (
+        base_color.reshape((1, 1, 4)),
+        np.asarray(NEUTRAL_NORMAL_TEXTURE_RGBA, dtype=np.uint8).reshape(
+            (1, 1, 4)
+        ),
+        np.asarray(
+            (
+                roughness_channel,
+                roughness_channel,
+                roughness_channel,
+                255,
+            ),
+            dtype=np.uint8,
+        ).reshape((1, 1, 4)),
+        np.asarray(
+            (
+                metallic_channel,
+                metallic_channel,
+                metallic_channel,
+                255,
+            ),
+            dtype=np.uint8,
+        ).reshape((1, 1, 4)),
+    )
+
+
+def _normalize_material_rgba_factor(
+    raw_factor: object,
+    *,
+    default: Sequence[int],
+) -> np.ndarray:
+    """Normalize glTF float or trimesh byte color factors to RGBA bytes."""
+
+    try:
+        factor = np.asarray(raw_factor, dtype=float).reshape(-1)
+    except (TypeError, ValueError):
+        factor = np.asarray(default, dtype=float)
+    if factor.shape != (4,) or not np.all(np.isfinite(factor)):
+        factor = np.asarray(default, dtype=float)
+    if float(np.max(factor)) <= 1.0:
+        factor = factor * 255.0
+    return np.asarray(np.clip(np.rint(factor), 0, 255), dtype=np.uint8)
+
+
+def _normalize_material_scalar_factor(
+    raw_factor: object,
+    *,
+    default: float,
+) -> float:
+    """Normalize one finite glTF PBR factor to the closed unit interval."""
+
+    try:
+        factor = float(raw_factor)
+    except (TypeError, ValueError):
+        factor = float(default)
+    if not math.isfinite(factor):
+        factor = float(default)
+    return min(1.0, max(0.0, factor))
 
 
 def _get_base_color_texture_rgba(visual) -> np.ndarray | None:
@@ -6238,6 +6420,47 @@ def _iter_material_leaves(material: object) -> tuple[object, ...]:
             for leaf in _iter_material_leaves(nested_material)
         )
     return (material,)
+
+
+def _build_model_material_preview_meshes(
+    model: GeneratedModel,
+) -> tuple[trimesh.Trimesh, ...]:
+    """Return separated Z-up scene primitives when prefab glass is present."""
+
+    if (
+        model.preview_placed_objects
+        or model.preview_textured_surfaces
+        or model.preview_textured_walls
+        or not isinstance(model.scene, trimesh.Scene)
+    ):
+        return ()
+    source_parts: list[tuple[np.ndarray, trimesh.Trimesh]] = []
+    contains_prefab_glass = False
+    for node_name in sorted(model.scene.graph.nodes_geometry, key=str):
+        node_transform, geometry_name = model.scene.graph.get(node_name)
+        source_mesh = model.scene.geometry.get(geometry_name)
+        if not isinstance(source_mesh, trimesh.Trimesh):
+            continue
+        contains_prefab_glass = contains_prefab_glass or any(
+            is_housemaker_glass_material(material)
+            for material in _iter_material_leaves(
+                getattr(source_mesh.visual, "material", None)
+            )
+        )
+        source_parts.append(
+            (np.asarray(node_transform, dtype=float), source_mesh)
+        )
+    if not contains_prefab_glass:
+        return ()
+
+    preview_meshes: list[trimesh.Trimesh] = []
+    for node_transform, source_mesh in source_parts:
+        preview_mesh = copy.deepcopy(source_mesh)
+        preview_mesh.apply_transform(
+            GLTF_Y_UP_TO_Z_UP_TRANSFORM @ node_transform
+        )
+        preview_meshes.append(preview_mesh)
+    return tuple(preview_meshes)
 
 
 def _decode_texture_rgba(texture: object) -> np.ndarray | None:

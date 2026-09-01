@@ -13,6 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
 
 from housemaker.camera_indicators import (
+    DEFAULT_CAMERA_INDICATOR_PERCENTAGES,
     INDICATOR_BAR_FILL_SELECTED_COLOR,
     INDICATOR_COLOR,
     INDICATOR_LABEL_COLOR,
@@ -131,10 +132,14 @@ class ProjectionCameraIndicatorGeometryTests(unittest.TestCase):
                     fill_item.depthValue(),
                     track_item.depthValue(),
                 )
+                percentage_index = ALL_CAMERA_IDS.index(camera_id)
+                expected_percentage = (
+                    DEFAULT_CAMERA_INDICATOR_PERCENTAGES[percentage_index]
+                )
                 self.assertEqual(
                     label_item.text,
                     f"{PROJECTION_CAMERA_INDICATOR_LABELS[camera_id]} "
-                    f"{(17, 17, 17, 17, 16, 16)[ALL_CAMERA_IDS.index(camera_id)]}%",
+                    f"{expected_percentage}%",
                 )
                 np.testing.assert_allclose(
                     label_item.pos,

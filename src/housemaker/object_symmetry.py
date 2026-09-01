@@ -39,12 +39,15 @@ from housemaker.object_texture_variants import (
     _validate_shared_2048_texture,
     _validate_shared_2048_texture_maps,
     _validate_shared_texture_maps,
-    reject_unsupported_uv_material_textures,
+    prepare_uv_rewrite_material_textures,
 )
 from housemaker.object_uv_scan_projection import (
     SCAN_PROJECTION_TARGET_LEFT_HALF,
     ScanProjectionStats,
     scan_project_textured_glb,
+)
+from housemaker.safe_duplicate_face_removal import (
+    remove_safe_duplicate_faces_from_glb,
 )
 from housemaker.scan_projection_layout import (
     SCAN_PROJECTION_LAYOUT_METADATA_KEY,
@@ -699,7 +702,7 @@ def build_symmetric_retexture_proxy_glb(
         raise ValueError("The symmetric Retexture source GLB is empty.")
 
     source_scene = _load_glb_scene(payload)
-    _reject_auxiliary_material_textures(source_scene)
+    _prepare_auxiliary_material_textures(source_scene)
     source_texture_maps = _collect_material_texture_maps(source_scene)
     source_textures = source_texture_maps.get(MATERIAL_TEXTURE_BASE_COLOR, [])
     validated_source_maps = (
@@ -781,7 +784,7 @@ def build_automatic_symmetric_geometry(
         raise ValueError("The geometry-only GLB is empty.")
 
     scene = _load_glb_scene(payload)
-    _reject_auxiliary_material_textures(scene)
+    _prepare_auxiliary_material_textures(scene)
     if _collect_material_textures(scene):
         raise ValueError(
             "Automatic geometry-only symmetry requires an untextured model."
@@ -818,7 +821,7 @@ def build_automatic_symmetric_object_variants(
         raise ValueError("The canonical 2048 GLB is empty.")
 
     scene = _load_glb_scene(payload)
-    _reject_auxiliary_material_textures(scene)
+    _prepare_auxiliary_material_textures(scene)
     source_texture_maps = _collect_material_texture_maps(scene)
     source_textures = source_texture_maps.get(MATERIAL_TEXTURE_BASE_COLOR, [])
     if not source_textures:
@@ -826,7 +829,12 @@ def build_automatic_symmetric_object_variants(
             "Automatic symmetry requires one embedded base-color texture atlas."
         )
     canonical_maps = _validate_shared_2048_texture_maps(source_texture_maps)
-    selection = _select_automatic_symmetric_half(scene, orientation, rng)
+    selection = _select_automatic_symmetric_half(
+        scene,
+        orientation,
+        rng,
+        cancellation_check=cancellation_check,
+    )
     clipped_scene = selection.retained_scene
     output_textures = _collect_material_textures(clipped_scene)
     if not output_textures:
@@ -886,7 +894,7 @@ def build_symmetric_pair_texture_variants(
     if not payload:
         raise ValueError("The retextured canonical 2048 GLB is empty.")
     scene = _load_glb_scene(payload)
-    _reject_auxiliary_material_textures(scene)
+    _prepare_auxiliary_material_textures(scene)
     source_texture_maps = _collect_material_texture_maps(scene)
     source_textures = source_texture_maps.get(MATERIAL_TEXTURE_BASE_COLOR, [])
     if not source_textures:
@@ -927,7 +935,7 @@ def build_symmetric_square_pair_texture_variants(
     if not payload:
         raise ValueError("The symmetric square-pair source GLB is empty.")
     scene = _load_glb_scene(payload)
-    _reject_auxiliary_material_textures(scene)
+    _prepare_auxiliary_material_textures(scene)
     source_texture_maps = _collect_material_texture_maps(scene)
     source_textures = source_texture_maps.get(MATERIAL_TEXTURE_BASE_COLOR, [])
     if not source_textures:
@@ -979,7 +987,7 @@ def build_symmetric_quarter_texture_variants(
     if not payload:
         raise ValueError("The retextured canonical 2048 GLB is empty.")
     scene = _load_glb_scene(payload)
-    _reject_auxiliary_material_textures(scene)
+    _prepare_auxiliary_material_textures(scene)
     source_texture_maps = _collect_material_texture_maps(scene)
     source_textures = source_texture_maps.get(MATERIAL_TEXTURE_BASE_COLOR, [])
     if not source_textures:
@@ -1017,7 +1025,7 @@ def build_symmetric_half_texture_variants(
     if not payload:
         raise ValueError("The retextured canonical 2048 GLB is empty.")
     scene = _load_glb_scene(payload)
-    _reject_auxiliary_material_textures(scene)
+    _prepare_auxiliary_material_textures(scene)
     source_texture_maps = _collect_material_texture_maps(scene)
     source_textures = source_texture_maps.get(MATERIAL_TEXTURE_BASE_COLOR, [])
     if not source_textures:
@@ -1163,23 +1171,30 @@ def _select_automatic_symmetric_half(
     scene: trimesh.Scene,
     orientation: SymmetricDivisionOrientation,
     rng: random.Random | None,
+    *,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> _AutomaticSymmetricSelection:
-    """Clip both midpoint halves and select the lower-triangle result."""
+    """Clip, deduplicate, and select the lower-triangle result."""
 
     instances = _collect_mesh_instances(scene)
     axis = _get_z_up_axis(orientation)
     plane_coordinate = _get_world_midpoint(instances, axis)
     ordered_sides = SYMMETRIC_DIVISION_SIDE_ORDER_BY_ORIENTATION[orientation]
-    clipped_scene_by_side = {
-        side: _build_clipped_scene(
+    clipped_scene_by_side: dict[str, trimesh.Scene] = {}
+    for side in ordered_sides:
+        clipped_scene = _build_clipped_scene(
             instances,
             axis=axis,
             plane_coordinate=plane_coordinate,
             kept_side=side,
             metadata=scene.metadata,
         )
-        for side in ordered_sides
-    }
+        clipped_scene_by_side[side] = (
+            _remove_safe_duplicates_from_clipped_scene(
+                clipped_scene,
+                cancellation_check=cancellation_check,
+            )
+        )
     triangle_count_by_side = tuple(
         (side, _count_scene_triangles(clipped_scene_by_side[side]))
         for side in ordered_sides
@@ -1204,6 +1219,23 @@ def _select_automatic_symmetric_half(
         triangle_count_by_side=triangle_count_by_side,
         tie_broken_randomly=tie_broken_randomly,
     )
+
+
+def _remove_safe_duplicates_from_clipped_scene(
+    scene: trimesh.Scene,
+    *,
+    cancellation_check: Callable[[], bool] | None,
+) -> trimesh.Scene:
+    """Return one clipped candidate without safe coincident duplicates."""
+
+    exported = _export_symmetric_geometry_scene(scene)
+    cleanup = remove_safe_duplicate_faces_from_glb(
+        exported,
+        cancel_requested=cancellation_check,
+    )
+    if not cleanup.changed:
+        return scene
+    return _load_glb_scene(cleanup.glb_bytes)
 
 
 def _build_automatic_symmetry_metadata(
@@ -1638,10 +1670,10 @@ def _get_face_materials(mesh: trimesh.Trimesh) -> np.ndarray | None:
 
 
 # ### Material compatibility helpers ###
-def _reject_auxiliary_material_textures(scene: trimesh.Scene) -> None:
-    """Reject unsupported maps while allowing Meshy's shared-UV PBR maps."""
+def _prepare_auxiliary_material_textures(scene: trimesh.Scene) -> None:
+    """Normalize optional maps while allowing Meshy's shared-UV PBR maps."""
 
-    reject_unsupported_uv_material_textures(
+    prepare_uv_rewrite_material_textures(
         scene,
         operation_name="Symmetric UV packing",
     )

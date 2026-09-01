@@ -20,6 +20,7 @@ from housemaker.settings_widget import (
     DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY,
     DEFAULT_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
     DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE,
+    DEFAULT_MESHY_TARGET_POLYCOUNT,
     DOORWAY_MESH_UPDATE_DELAY_SECONDS_SETTING_KEY,
     DOORWAY_MESH_UPDATE_DELAY_STEP_SECONDS,
     FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY,
@@ -55,6 +56,13 @@ _qt_application.setQuitOnLastWindowClosed(False)
 
 # ### Test cases ###
 class SettingsWidgetTests(unittest.TestCase):
+    def test_generation_service_defaults_to_two_thousand_target_tris(self) -> None:
+        self.assertEqual(DEFAULT_MESHY_TARGET_POLYCOUNT, 2_000)
+        self.assertEqual(
+            GenerationServiceSettings().meshy_target_polycount,
+            2_000,
+        )
+
     def test_api_key_fields_and_fullscreen_display_selector_are_visible(
         self,
     ) -> None:
