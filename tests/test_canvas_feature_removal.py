@@ -65,7 +65,25 @@ class CanvasFeatureRemovalTests(unittest.TestCase):
             with self.subTest(removed_attribute=removed_attribute):
                 self.assertFalse(hasattr(workspace, removed_attribute))
 
-        self.assertTrue(hasattr(workspace, "uv_rooms_list"))
+        self.assertEqual(
+            [
+                workspace.side_tabs.tabText(index)
+                for index in range(workspace.side_tabs.count())
+            ],
+            ["Generals"],
+        )
+        for removed_attribute in (
+            "uvs_tab",
+            "uv_canvas",
+            "uv_rooms_list",
+            "images_tab",
+            "image_thumbnail_list",
+            "texture_creator_tab",
+            "texture_creator_canvas",
+            "png_export_button",
+        ):
+            with self.subTest(removed_texture_attribute=removed_attribute):
+                self.assertFalse(hasattr(workspace, removed_attribute))
 
     def test_blueprint_canvas_omits_retired_editing_entry_points(self) -> None:
         canvas = self._track_widget(BlueprintCanvas())

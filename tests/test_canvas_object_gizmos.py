@@ -12,6 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import numpy as np
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QKeyEvent
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 import trimesh
 from trimesh.visual.texture import TextureVisuals
@@ -366,11 +367,11 @@ class CanvasObjectGizmoTests(unittest.TestCase):
         )
         self.assertEqual(generic_deletions, [True])
 
-    def test_released_first_person_pointer_can_select_an_object(self) -> None:
+    def test_ctrl_first_person_pointer_can_select_an_object(self) -> None:
         viewer = self._build_viewer(_build_placed_object("chair"))
         position = QPointF(40.0, 24.0)
         viewer.enter_first_person_mode()
-        viewer.release_first_person_pointer_capture()
+        QTest.keyPress(viewer.view, Qt.Key.Key_Control)
 
         with (
             patch.object(viewer.view, "build_camera_ray", return_value=_forward_ray()),
@@ -388,10 +389,11 @@ class CanvasObjectGizmoTests(unittest.TestCase):
                     position=position,
                 )
             )
+        QTest.keyRelease(viewer.view, Qt.Key.Key_Control)
 
         self.assertEqual(viewer.get_selected_placed_object_id(), "chair")
         self.assertEqual(viewer.get_navigation_mode(), NAVIGATION_MODE_FIRST_PERSON)
-        self.assertFalse(viewer.is_first_person_pointer_captured)
+        self.assertTrue(viewer.is_first_person_pointer_captured)
 
     def test_translation_drag_emits_one_world_transform_on_release(self) -> None:
         viewer = self._build_viewer(_build_placed_object("chair"))

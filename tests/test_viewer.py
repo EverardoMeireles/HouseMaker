@@ -17,7 +17,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
 from PySide6.QtGui import QFocusEvent, QKeyEvent, QVector3D
 from PySide6.QtTest import QSignalSpy, QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QPushButton
 from PIL import Image
 from trimesh.visual.material import MultiMaterial, PBRMaterial
 from trimesh.visual.texture import TextureVisuals
@@ -1291,6 +1291,196 @@ class FirstPersonNavigationTests(unittest.TestCase):
             float(self.view.opts["distance"]),
             first_person_distance,
         )
+
+    def test_canvas_ctrl_temporarily_frees_and_recaptures_pointer(self) -> None:
+        panel_button = QPushButton(self.view)
+        self.view.set_first_person_ctrl_interaction_enabled(True)
+        self.view.enter_first_person_mode()
+
+        QTest.keyPress(self.view, Qt.Key.Key_Control)
+
+        self.assertTrue(self.view.is_first_person_ctrl_interaction_active)
+        self.assertFalse(self.view.is_first_person_pointer_captured)
+
+        QTest.keyRelease(panel_button, Qt.Key.Key_Control)
+
+        self.assertFalse(self.view.is_first_person_ctrl_interaction_active)
+        self.assertTrue(self.view.is_first_person_pointer_captured)
+
+    def test_canvas_right_click_persistently_frees_the_pointer(self) -> None:
+        panel_button = QPushButton(self.view)
+        self.view.set_first_person_ctrl_interaction_enabled(True)
+        self.view.enter_first_person_mode()
+
+        right_click = FakeMousePressEvent(button=Qt.MouseButton.RightButton)
+        self.view.mousePressEvent(right_click)
+
+        self.assertTrue(right_click.was_accepted)
+        self.assertEqual(
+            self.view.get_navigation_mode(),
+            NAVIGATION_MODE_FIRST_PERSON,
+        )
+        self.assertFalse(self.view.is_first_person_pointer_captured)
+
+        QTest.keyPress(self.view, Qt.Key.Key_Control)
+        QTest.keyRelease(panel_button, Qt.Key.Key_Control)
+        self.view.eventFilter(
+            _qt_application,
+            QEvent(QEvent.Type.ApplicationDeactivate),
+        )
+        self.view.eventFilter(
+            _qt_application,
+            QEvent(QEvent.Type.ApplicationActivate),
+        )
+        self.view.set_rectangle_drawing_enabled(True)
+        self.view.set_rectangle_drawing_enabled(False)
+
+        self.assertFalse(self.view.is_first_person_pointer_captured)
+
+        self.view.exit_first_person_mode()
+        self.view.enter_first_person_mode()
+
+        self.assertTrue(self.view.is_first_person_pointer_captured)
+
+    def test_canvas_left_click_recaptures_after_right_click_release(self) -> None:
+        self.view.set_first_person_ctrl_interaction_enabled(True)
+        self.view.enter_first_person_mode()
+        self.view.mousePressEvent(
+            FakeMousePressEvent(button=Qt.MouseButton.RightButton)
+        )
+
+        self.assertFalse(self.view.is_first_person_pointer_captured)
+
+        left_click = FakeMousePressEvent(button=Qt.MouseButton.LeftButton)
+        self.view.mousePressEvent(left_click)
+
+        self.assertTrue(left_click.was_accepted)
+        self.assertTrue(self.view.is_first_person_pointer_captured)
+        self.assertEqual(
+            self.view.get_navigation_mode(),
+            NAVIGATION_MODE_FIRST_PERSON,
+        )
+
+    def test_canvas_ctrl_click_does_not_recapture_a_right_click_release(
+        self,
+    ) -> None:
+        self.view.set_first_person_ctrl_interaction_enabled(True)
+        self.view.enter_first_person_mode()
+        self.view.mousePressEvent(
+            FakeMousePressEvent(button=Qt.MouseButton.RightButton)
+        )
+        QTest.keyPress(self.view, Qt.Key.Key_Control)
+
+        left_click = FakeMousePressEvent(button=Qt.MouseButton.LeftButton)
+        self.view.mousePressEvent(left_click)
+
+        self.assertTrue(left_click.was_accepted)
+        self.assertFalse(self.view.is_first_person_pointer_captured)
+
+        QTest.keyRelease(self.view, Qt.Key.Key_Control)
+        self.assertFalse(self.view.is_first_person_pointer_captured)
+
+    def test_canvas_window_tool_keeps_cursor_until_tool_finishes(self) -> None:
+        panel_button = QPushButton(self.view)
+        self.view.set_first_person_ctrl_interaction_enabled(True)
+        self.view.enter_first_person_mode()
+        QTest.keyPress(self.view, Qt.Key.Key_Control)
+
+        self.view.set_rectangle_drawing_enabled(True)
+        QTest.keyRelease(panel_button, Qt.Key.Key_Control)
+
+        self.assertTrue(self.view.is_rectangle_drawing_enabled)
+        self.assertFalse(self.view.is_first_person_ctrl_interaction_active)
+        self.assertFalse(self.view.is_first_person_pointer_captured)
+
+        self.view.set_rectangle_drawing_enabled(False)
+
+        self.assertTrue(self.view.is_first_person_pointer_captured)
+
+    def test_canvas_gizmo_drag_delays_recapture_until_drag_finishes(self) -> None:
+        panel_button = QPushButton(self.view)
+        self.view.set_first_person_ctrl_interaction_enabled(True)
+        self.view.enter_first_person_mode()
+        QTest.keyPress(self.view, Qt.Key.Key_Control)
+
+        self.view.reserve_primary_pointer_drag()
+        QTest.keyRelease(panel_button, Qt.Key.Key_Control)
+
+        self.assertFalse(self.view.is_first_person_pointer_captured)
+
+        self.view.release_primary_pointer_drag()
+
+        self.assertTrue(self.view.is_first_person_pointer_captured)
+
+    def test_canvas_ctrl_release_does_not_recapture_while_app_is_inactive(
+        self,
+    ) -> None:
+        panel_button = QPushButton(self.view)
+        self.view.set_first_person_ctrl_interaction_enabled(True)
+        self.view.enter_first_person_mode()
+        QTest.keyPress(self.view, Qt.Key.Key_Control)
+
+        self.view.eventFilter(
+            _qt_application,
+            QEvent(QEvent.Type.ApplicationDeactivate),
+        )
+        QTest.keyRelease(panel_button, Qt.Key.Key_Control)
+
+        self.assertFalse(self.view.is_first_person_pointer_captured)
+
+        self.view.eventFilter(
+            _qt_application,
+            QEvent(QEvent.Type.ApplicationActivate),
+        )
+        self.assertTrue(self.view.is_first_person_pointer_captured)
+        QTest.keyPress(self.view, Qt.Key.Key_Control)
+        QTest.keyRelease(panel_button, Qt.Key.Key_Control)
+
+        self.assertTrue(self.view.is_first_person_pointer_captured)
+
+    def test_canvas_first_person_recaptures_after_becoming_visible(self) -> None:
+        self.view.set_first_person_ctrl_interaction_enabled(True)
+        self.view.show()
+        self.view.enter_first_person_mode()
+
+        self.view.hide()
+        self.assertFalse(self.view.is_first_person_pointer_captured)
+
+        self.view.show()
+
+        self.assertTrue(self.view.is_first_person_pointer_captured)
+
+    def test_canvas_first_person_selection_uses_ctrl_and_cpu_click(self) -> None:
+        self.view.set_item_click_selection_enabled(False)
+        self.view.set_viewport_click_selection_enabled(True)
+        self.view.set_first_person_ctrl_interaction_enabled(True)
+        self.view.enter_first_person_mode()
+        clicked_positions: list[QPointF] = []
+        self.view.viewport_clicked.connect(clicked_positions.append)
+        self.view._get_clicked_items = Mock(
+            side_effect=AssertionError("Canvas must not use GL item picking.")
+        )
+        position = QPointF(42.0, 24.0)
+
+        QTest.keyPress(self.view, Qt.Key.Key_Control)
+        self.view.mousePressEvent(
+            FakeMousePressEvent(
+                button=Qt.MouseButton.LeftButton,
+                position=position,
+            )
+        )
+        self.view.mouseReleaseEvent(
+            FakeMousePressEvent(
+                button=Qt.MouseButton.LeftButton,
+                position=position,
+            )
+        )
+
+        self.assertEqual(clicked_positions, [position])
+        self.assertFalse(self.view._get_clicked_items.called)
+
+        QTest.keyRelease(self.view, Qt.Key.Key_Control)
+        self.assertTrue(self.view.is_first_person_pointer_captured)
 
     def test_released_first_person_pointer_can_select_viewport_content(
         self,

@@ -13,11 +13,10 @@ from PySide6.QtCore import (
     QObject,
     QPointF,
     QSignalBlocker,
-    QSize,
     QTimer,
     Qt,
 )
-from PySide6.QtGui import QIcon, QKeySequence, QPixmap, QShortcut, QWheelEvent
+from PySide6.QtGui import QKeySequence, QShortcut, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -32,8 +31,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
-    QListView,
-    QDialog,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -41,7 +38,6 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSplitter,
-    QSpinBox,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -85,7 +81,6 @@ from housemaker.glb import (
     convert_to_glb,
     convert_to_preview_model,
     export_glb_file,
-    export_room_texture_pngs,
     import_generated_glb,
 )
 from housemaker.models import (
@@ -93,12 +88,7 @@ from housemaker.models import (
     DEFAULT_FLOOR_THICKNESS_METERS,
     DEFAULT_LEVEL_OFFSET_METERS,
     DEFAULT_LEVEL_SCALE,
-    DEFAULT_ROOM_HEIGHT_METERS,
     DEFAULT_STAIR_STYLE,
-    DEFAULT_UV_MAP_HEIGHT,
-    DEFAULT_UV_MAP_WIDTH,
-    DEFAULT_WALL_UV_ROTATION_DEGREES,
-    DEFAULT_WALL_UV_SCALE,
     DOORWAY_SHAPE_ARCH,
     DOORWAY_SHAPE_RECTANGULAR,
     DoorwayData,
@@ -113,7 +103,6 @@ from housemaker.models import (
     MIN_FLOOR_THICKNESS_METERS,
     MIN_LEVEL_OFFSET_METERS,
     MIN_LEVEL_SCALE,
-    RoomData,
     STAIR_STYLE_FLOATING,
     STAIR_STYLE_FLOATING_WITH_RISER,
     STAIR_STYLE_SUPPORTED,
@@ -135,7 +124,6 @@ from housemaker.settings_widget import (
     SettingsWidget,
     resolve_fullscreen_3d_viewer_screen,
 )
-from housemaker.texture_creator_canvas import TextureCreatorCanvas
 from housemaker.texture_atlas_state import (
     ATLAS_PACKING_MODE_FULL,
     ATLAS_PACKING_MODE_SYMMETRIC_HALF,
@@ -155,28 +143,12 @@ from housemaker.texture_atlas_workspace import (
     is_atlas_wall_texture_source_id,
     load_atlas_object_texture_source,
 )
-from housemaker.uv_canvas import UvCanvas
-from housemaker.uv_layout import (
-    UvOptimizationResult,
-    UvWallPlacement,
-    build_uv_wall_layout,
-    calculate_unoccupied_uv_pixels,
-    optimize_room_wall_uvs,
-    rebuild_room_subdivision_uvs,
-)
 from housemaker.viewer import (
     NAVIGATION_MODE_FIRST_PERSON,
     GlbViewerWidget,
 )
-from housemaker.manual_stitching import (
-    VIDEO_FILE_FILTER,
-    ManualVideoStitchDialog,
-    build_unique_stitched_output_path,
-    save_stitched_image,
-)
 
 # ### Constants ###
-TEXTURE_CREATOR_DETAIL_SIZES = (512, 1024, 2048)
 LAST_PROJECT_PATH_SETTING_KEY = "last_project_path"
 PROJECT_LOAD_FAILURES = (
     AttributeError,
@@ -187,41 +159,6 @@ PROJECT_LOAD_FAILURES = (
     TypeError,
     ValueError,
 )
-
-# ### Widgets ###
-class PowerOfTwoSpinBox(QSpinBox):
-    def setValue(self, value: int) -> None:  # type: ignore[override]
-        super().setValue(_nearest_power_of_two_value(value))
-
-    def stepBy(self, steps: int) -> None:  # type: ignore[override]
-        self.setValue(_step_power_of_two_value(self.value(), steps))
-
-    def valueFromText(self, text: str) -> int:  # type: ignore[override]
-        try:
-            return _nearest_power_of_two_value(int(text or self.minimum()))
-        except ValueError:
-            return self.value()
-
-    def textFromValue(self, value: int) -> str:  # type: ignore[override]
-        return str(_nearest_power_of_two_value(value))
-
-
-class DegreeSpinBox(QSpinBox):
-    def setValue(self, value: int) -> None:  # type: ignore[override]
-        super().setValue(_normalize_degree_value(value))
-
-    def stepBy(self, steps: int) -> None:  # type: ignore[override]
-        self.setValue(self.value() + steps)
-
-    def valueFromText(self, text: str) -> int:  # type: ignore[override]
-        try:
-            return _normalize_degree_value(int(text or self.minimum()))
-        except ValueError:
-            return self.value()
-
-    def textFromValue(self, value: int) -> str:  # type: ignore[override]
-        return str(_normalize_degree_value(value))
-
 
 # ### Event filters ###
 class RightPanelSpinBoxWheelFilter(QObject):
@@ -283,9 +220,6 @@ class BlueprintWorkspace(QWidget):
         self.stairs: list[StairData] = []
         self.current_level_index = GROUND_LEVEL_INDEX
         self._is_syncing_level_controls = False
-        self._is_syncing_image_library_controls = False
-        self._is_syncing_texture_controls = False
-        self._is_syncing_uv_controls = False
         self._is_viewer_refresh_scheduled = False
         self._scheduled_viewer_refresh_preserve_camera = True
         self._viewer_preview_revision = 0
@@ -329,13 +263,6 @@ class BlueprintWorkspace(QWidget):
         self._atlas_pending_source_content_refresh_ids: set[str] = set()
         self._atlas_wall_texture_source_ids: set[str] = set()
         self._atlas_preview_variant_key: tuple[object, ...] | None = None
-        self._image_preview_source_key: tuple[object, ...] | None = None
-        self._image_preview_source_pixmap: QPixmap | None = None
-        self._image_preview_scaled_key: tuple[object, ...] | None = None
-        self._image_thumbnail_source_keys: dict[
-            str,
-            tuple[object, ...],
-        ] = {}
         self._level_blueprint_image_revisions: dict[
             int,
             tuple[object, ...],
@@ -344,9 +271,6 @@ class BlueprintWorkspace(QWidget):
         self._object_placement_dialog: ObjectPlacementDialog | None = None
         self._object_placement_operation_id: str | None = None
         self._is_shutdown = False
-        self.texture_creator_level_index: int | None = None
-        self.texture_creator_room_index: int | None = None
-        self.texture_creator_wall_key: str | None = None
         self._build_ui()
 
     @property
@@ -527,7 +451,6 @@ class BlueprintWorkspace(QWidget):
         self.workspace_tabs.currentChanged.connect(
             self._handle_workspace_tab_changed
         )
-        self.viewer.wall_selected.connect(self._handle_viewer_wall_selected)
         self.viewer.window_placement_requested.connect(
             self._handle_canvas_window_placement_requested
         )
@@ -864,11 +787,6 @@ class BlueprintWorkspace(QWidget):
         self.export_button.clicked.connect(self._handle_glb_export_clicked)
         buttons_layout.addWidget(self.export_button, 1)
 
-        self.png_export_button = QPushButton("PNG")
-        self.png_export_button.setMinimumHeight(56)
-        self.png_export_button.setStyleSheet("font-size: 18px; font-weight: 600;")
-        self.png_export_button.clicked.connect(self._handle_png_export_clicked)
-        buttons_layout.addWidget(self.png_export_button, 1)
         side_layout.addLayout(buttons_layout)
 
         self._refresh_doorway_preset_list(selected_index=0)
@@ -882,21 +800,11 @@ class BlueprintWorkspace(QWidget):
                 self._generals_spinbox_wheel_filter
             )
 
-        self.uvs_tab = self._build_uvs_tab()
-        self.side_tabs.addTab(self.uvs_tab, "UVs")
-        self.images_tab = self._build_images_tab()
-        self.side_tabs.addTab(self.images_tab, "Images")
-        self.side_tabs.addTab(self._build_texture_creator_tab(), "Texture creator")
-        self.side_tabs.currentChanged.connect(self._handle_side_tab_changed)
-
         self.workspace_splitter.addWidget(self.side_panel)
         self.workspace_splitter.setStretchFactor(0, 9)
         self.workspace_splitter.setStretchFactor(1, 1)
         self.workspace_splitter.setSizes([1160, 440])
 
-        self.canvas.rooms_changed.connect(
-            self._refresh_room_dependent_controls
-        )
         self.canvas.rooms_changed.connect(self._schedule_viewer_preview_refresh)
         self.canvas.floor_contour_changed.connect(
             self._handle_floor_contour_changed
@@ -934,10 +842,8 @@ class BlueprintWorkspace(QWidget):
         )
         self._refresh_levels_list()
         self._update_stair_button_state()
-        self._refresh_room_dependent_controls()
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
-        self._sync_texture_creator_tab()
         self._schedule_viewer_preview_refresh(preserve_camera=False)
         self._apply_fullscreen_3d_viewer_screen(
             generation_settings.fullscreen_3d_viewer_screen_id
@@ -1219,259 +1125,6 @@ class BlueprintWorkspace(QWidget):
 
         self._remove_canvas_window(window_id)
 
-    def _build_uvs_tab(self) -> QWidget:
-        uvs_tab = QWidget()
-        uvs_layout = QVBoxLayout(uvs_tab)
-        uvs_layout.setContentsMargins(10, 12, 10, 10)
-        uvs_layout.setSpacing(12)
-
-        uv_map_label = QLabel("UV Map")
-        uv_map_label.setStyleSheet("font-size: 18px; font-weight: 600;")
-        uvs_layout.addWidget(uv_map_label)
-
-        self.uv_canvas = UvCanvas()
-        self.uv_canvas.selected_wall_changed.connect(self._handle_uv_wall_selected)
-        self.uv_canvas.uv_values_changed.connect(self._handle_uv_values_changed)
-        uvs_layout.addWidget(self.uv_canvas, 2)
-
-        uv_controls_layout = QFormLayout()
-        uv_controls_layout.setContentsMargins(0, 0, 0, 0)
-        uv_controls_layout.setSpacing(8)
-
-        self.unoccupied_uv_pixels_label = QLabel("Unoccupied pixels: 0")
-        self.unoccupied_uv_pixels_label.setMinimumHeight(24)
-        uv_controls_layout.addRow("", self.unoccupied_uv_pixels_label)
-
-        self.uv_aspect_ratio_label = QLabel("Aspect ratio: none")
-        self.uv_aspect_ratio_label.setMinimumHeight(24)
-        uv_controls_layout.addRow("", self.uv_aspect_ratio_label)
-
-        optimize_layout = QHBoxLayout()
-        optimize_layout.setContentsMargins(0, 0, 0, 0)
-        optimize_layout.setSpacing(8)
-
-        self.optimize_uv_button = QPushButton("Optimize")
-        self.optimize_uv_button.setMinimumHeight(34)
-        self.optimize_uv_button.clicked.connect(self._handle_optimize_uv_clicked)
-        optimize_layout.addWidget(self.optimize_uv_button, 1)
-
-        self.optimize_all_uv_button = QPushButton("Optimize all")
-        self.optimize_all_uv_button.setMinimumHeight(34)
-        self.optimize_all_uv_button.clicked.connect(
-            self._handle_optimize_all_uv_clicked
-        )
-        optimize_layout.addWidget(self.optimize_all_uv_button, 1)
-
-        self.uv_optimization_mode_group = QButtonGroup(self)
-        self.uv_optimization_mode_group.setExclusive(True)
-        self.basic_optimization_radio = QRadioButton("Basic")
-        self.free_placement_radio = QRadioButton("Free placement")
-        self.subdivision_optimization_radio = QRadioButton("Subdivision")
-        self.uv_optimization_mode_group.addButton(self.basic_optimization_radio)
-        self.uv_optimization_mode_group.addButton(self.free_placement_radio)
-        self.uv_optimization_mode_group.addButton(
-            self.subdivision_optimization_radio
-        )
-        self.basic_optimization_radio.toggled.connect(
-            self._handle_optimization_mode_toggled
-        )
-        self.free_placement_radio.toggled.connect(
-            self._handle_optimization_mode_toggled
-        )
-        self.subdivision_optimization_radio.toggled.connect(
-            self._handle_optimization_mode_toggled
-        )
-        self.subdivision_optimization_radio.setChecked(True)
-        optimize_layout.addWidget(self.basic_optimization_radio)
-        optimize_layout.addWidget(self.free_placement_radio)
-        optimize_layout.addWidget(self.subdivision_optimization_radio)
-        uv_controls_layout.addRow("", optimize_layout)
-
-        self.complex_optimization_passes_spinbox = QSpinBox()
-        self.complex_optimization_passes_spinbox.setRange(1, 100)
-        self.complex_optimization_passes_spinbox.setValue(3)
-        self.complex_optimization_passes_spinbox.setMinimumHeight(34)
-        uv_controls_layout.addRow(
-            "Free placement passes",
-            self.complex_optimization_passes_spinbox,
-        )
-
-        self.reset_uv_defaults_button = QPushButton("Reset defaults")
-        self.reset_uv_defaults_button.setMinimumHeight(34)
-        self.reset_uv_defaults_button.clicked.connect(
-            self._handle_reset_uv_defaults_clicked
-        )
-        uv_controls_layout.addRow("", self.reset_uv_defaults_button)
-
-        self.uv_map_width_spinbox = PowerOfTwoSpinBox()
-        self.uv_map_width_spinbox.setRange(64, 8192)
-        self.uv_map_width_spinbox.valueChanged.connect(
-            self._handle_uv_map_width_changed
-        )
-        uv_controls_layout.addRow("Map X", self.uv_map_width_spinbox)
-
-        self.uv_map_height_spinbox = PowerOfTwoSpinBox()
-        self.uv_map_height_spinbox.setRange(64, 8192)
-        self.uv_map_height_spinbox.valueChanged.connect(
-            self._handle_uv_map_height_changed
-        )
-        uv_controls_layout.addRow("Map Y", self.uv_map_height_spinbox)
-
-        self.uv_wall_scale_spinbox = QDoubleSpinBox()
-        self.uv_wall_scale_spinbox.setRange(0.01, 100.0)
-        self.uv_wall_scale_spinbox.setDecimals(3)
-        self.uv_wall_scale_spinbox.setSingleStep(0.05)
-        self.uv_wall_scale_spinbox.valueChanged.connect(
-            self._handle_uv_wall_scale_changed
-        )
-        uv_controls_layout.addRow("Wall scale", self.uv_wall_scale_spinbox)
-
-        self.uv_wall_rotation_spinbox = DegreeSpinBox()
-        self.uv_wall_rotation_spinbox.setRange(0, 359)
-        self.uv_wall_rotation_spinbox.setSingleStep(1)
-        self.uv_wall_rotation_spinbox.setWrapping(True)
-        self.uv_wall_rotation_spinbox.setSuffix(" deg")
-        self.uv_wall_rotation_spinbox.valueChanged.connect(
-            self._handle_uv_wall_rotation_changed
-        )
-        uv_controls_layout.addRow("Wall rotation", self.uv_wall_rotation_spinbox)
-        uvs_layout.addLayout(uv_controls_layout)
-
-        uv_rooms_label = QLabel("Rooms")
-        uv_rooms_label.setStyleSheet("font-size: 18px; font-weight: 600;")
-        uvs_layout.addWidget(uv_rooms_label)
-
-        self.uv_rooms_list = QListWidget()
-        self.uv_rooms_list.currentRowChanged.connect(
-            self._handle_uv_room_selection_changed
-        )
-        uvs_layout.addWidget(self.uv_rooms_list, 1)
-        return uvs_tab
-
-    def _build_images_tab(self) -> QWidget:
-        images_tab = QWidget()
-        images_layout = QVBoxLayout(images_tab)
-        images_layout.setContentsMargins(10, 12, 10, 10)
-        images_layout.setSpacing(12)
-
-        images_label = QLabel("Selected image")
-        images_label.setStyleSheet("font-size: 18px; font-weight: 600;")
-        images_layout.addWidget(images_label)
-
-        self.image_preview_label = QLabel("No image loaded")
-        self.image_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_preview_label.setMinimumHeight(260)
-        self.image_preview_label.setStyleSheet(
-            "border: 1px solid #4b5563; background: #1f242b; color: #f5f7fa;"
-        )
-        images_layout.addWidget(self.image_preview_label, 1)
-
-        self.image_path_label = QLabel("No image selected")
-        self.image_path_label.setWordWrap(True)
-        images_layout.addWidget(self.image_path_label)
-
-        loaded_images_label = QLabel("Loaded images")
-        loaded_images_label.setStyleSheet("font-size: 16px; font-weight: 600;")
-        images_layout.addWidget(loaded_images_label)
-
-        self.image_thumbnail_list = QListWidget()
-        self.image_thumbnail_list.setViewMode(QListView.ViewMode.IconMode)
-        self.image_thumbnail_list.setFlow(QListView.Flow.LeftToRight)
-        self.image_thumbnail_list.setWrapping(False)
-        self.image_thumbnail_list.setMovement(QListView.Movement.Static)
-        self.image_thumbnail_list.setResizeMode(QListView.ResizeMode.Adjust)
-        self.image_thumbnail_list.setIconSize(QSize(72, 72))
-        self.image_thumbnail_list.setGridSize(QSize(104, 104))
-        self.image_thumbnail_list.setMinimumHeight(120)
-        self.image_thumbnail_list.setMaximumHeight(132)
-        self.image_thumbnail_list.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded
-        )
-        self.image_thumbnail_list.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        self.image_thumbnail_list.currentRowChanged.connect(
-            self._handle_image_thumbnail_selection_changed
-        )
-        images_layout.addWidget(self.image_thumbnail_list)
-
-        image_buttons_layout = QHBoxLayout()
-        image_buttons_layout.setContentsMargins(0, 0, 0, 0)
-        image_buttons_layout.setSpacing(10)
-
-        self.images_load_button = QPushButton("Load image")
-        self.images_load_button.setMinimumHeight(44)
-        self.images_load_button.clicked.connect(
-            self._handle_load_library_image_clicked
-        )
-        image_buttons_layout.addWidget(self.images_load_button)
-
-        self.images_convert_video_button = QPushButton("Convert video to image")
-        self.images_convert_video_button.setMinimumHeight(44)
-        self.images_convert_video_button.clicked.connect(
-            self._handle_convert_video_to_image_clicked
-        )
-        image_buttons_layout.addWidget(self.images_convert_video_button)
-
-        self.images_save_png_button = QPushButton("Save png")
-        self.images_save_png_button.setMinimumHeight(44)
-        self.images_save_png_button.setEnabled(False)
-        self.images_save_png_button.clicked.connect(
-            self._handle_save_selected_image_clicked
-        )
-        image_buttons_layout.addWidget(self.images_save_png_button)
-
-        self.images_delete_button = QPushButton("Delete image")
-        self.images_delete_button.setMinimumHeight(44)
-        self.images_delete_button.clicked.connect(
-            self._handle_delete_image_clicked
-        )
-        image_buttons_layout.addWidget(self.images_delete_button)
-
-        images_layout.addLayout(image_buttons_layout)
-        return images_tab
-
-    def _build_texture_creator_tab(self) -> QWidget:
-        self.texture_creator_tab = QWidget()
-        texture_layout = QVBoxLayout(self.texture_creator_tab)
-        texture_layout.setContentsMargins(10, 12, 10, 10)
-        texture_layout.setSpacing(12)
-
-        texture_label = QLabel("Wall texture")
-        texture_label.setStyleSheet("font-size: 18px; font-weight: 600;")
-        texture_layout.addWidget(texture_label)
-
-        self.texture_creator_wall_label = QLabel("Select a wall in Viewer")
-        self.texture_creator_wall_label.setWordWrap(True)
-        texture_layout.addWidget(self.texture_creator_wall_label)
-
-        self.texture_creator_aspect_ratio_label = QLabel("Aspect ratio: none")
-        self.texture_creator_aspect_ratio_label.setWordWrap(True)
-        texture_layout.addWidget(self.texture_creator_aspect_ratio_label)
-
-        self.texture_creator_resolution_label = QLabel("Resolutions: none")
-        self.texture_creator_resolution_label.setWordWrap(True)
-        texture_layout.addWidget(self.texture_creator_resolution_label)
-
-        texture_form_layout = QFormLayout()
-        texture_form_layout.setContentsMargins(0, 0, 0, 0)
-        texture_form_layout.setSpacing(8)
-
-        self.texture_image_combo = QComboBox()
-        self.texture_image_combo.setMinimumHeight(34)
-        self.texture_image_combo.currentIndexChanged.connect(
-            self._handle_texture_image_selection_changed
-        )
-        texture_form_layout.addRow("Image", self.texture_image_combo)
-        texture_layout.addLayout(texture_form_layout)
-
-        self.texture_creator_canvas = TextureCreatorCanvas()
-        self.texture_creator_canvas.texture_changed.connect(
-            self._handle_texture_creator_texture_changed
-        )
-        texture_layout.addWidget(self.texture_creator_canvas, 1)
-        return self.texture_creator_tab
-
     def load_blueprint(self, file_path: str) -> None:
         self._set_current_level_image(file_path)
 
@@ -1527,53 +1180,6 @@ class BlueprintWorkspace(QWidget):
             "GLB exported",
             f"Saved GLB to:\n{exported_path}",
         )
-
-    def _handle_png_export_clicked(self) -> None:
-        directory_path = QFileDialog.getExistingDirectory(
-            self,
-            "Export PNG textures",
-            str(Path.cwd()),
-        )
-        if not directory_path:
-            return
-
-        try:
-            exported_paths = export_room_texture_pngs(
-                levels=self.levels,
-                directory=directory_path,
-            )
-        except OSError as error:
-            QMessageBox.critical(self, "PNG export failed", str(error))
-            return
-
-        if not exported_paths:
-            QMessageBox.warning(
-                self,
-                "PNG export skipped",
-                "No room textures are available to export.",
-            )
-            return
-
-        QMessageBox.information(
-            self,
-            "PNG textures exported",
-            f"Saved {len(exported_paths)} PNG texture(s) to:\n{directory_path}",
-        )
-
-    # ### Workspace tab activation ###
-    def _handle_side_tab_changed(self, tab_index: int) -> None:
-        """Refresh only file-backed content owned by the visible side tab."""
-
-        self._sync_visible_side_tab(self.side_tabs.widget(tab_index))
-
-    def _sync_visible_side_tab(self, selected_widget: QWidget | None) -> None:
-        """Recheck cheap revisions without rebuilding unrelated side tabs."""
-
-        if selected_widget is self.images_tab:
-            self._refresh_stale_image_thumbnails()
-            self._sync_images_tab()
-        elif selected_widget is self.texture_creator_tab:
-            self._sync_texture_creator_canvas()
 
     def _refresh_blueprint_file_dependencies(
         self,
@@ -1690,7 +1296,6 @@ class BlueprintWorkspace(QWidget):
             self._refresh_blueprint_file_dependencies(
                 include_exported_levels=False
             )
-        self._sync_visible_side_tab(self.side_tabs.currentWidget())
         self._ensure_viewer_preview_current(preserve_camera=False)
 
     def _handle_generation_data_changed_for_atlases(
@@ -3653,166 +3258,12 @@ class BlueprintWorkspace(QWidget):
         except ValueError as error:
             QMessageBox.critical(self, "Image load failed", str(error))
 
-    def _handle_load_library_image_clicked(self) -> None:
-        file_paths = self._get_image_file_paths()
-        if not file_paths:
-            return
-
-        loaded_image_paths: list[str] = []
-        skipped_image_paths: list[str] = []
-        for file_path in file_paths:
-            normalized_path = str(Path(file_path).resolve())
-            if QPixmap(normalized_path).isNull():
-                skipped_image_paths.append(normalized_path)
-                continue
-
-            self._add_image_to_library(normalized_path)
-            loaded_image_paths.append(normalized_path)
-
-        if not loaded_image_paths:
-            QMessageBox.critical(
-                self,
-                "Image load failed",
-                "Unable to load the selected image files.",
-            )
-            return
-
-        self._refresh_image_thumbnail_list(
-            selected_image_path=loaded_image_paths[-1]
-        )
-        if skipped_image_paths:
-            QMessageBox.warning(
-                self,
-                "Some images skipped",
-                f"Unable to load {len(skipped_image_paths)} selected image(s).",
-            )
-
-    def _handle_convert_video_to_image_clicked(self) -> None:
-        file_path = self._get_video_file_path()
-        if not file_path:
-            return
-
-        try:
-            manual_dialog = ManualVideoStitchDialog(file_path, self)
-        except ValueError as error:
-            QMessageBox.critical(self, "Video conversion failed", str(error))
-            return
-
-        if manual_dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-
-        stitched_image = manual_dialog.get_stitched_image()
-        if stitched_image is None:
-            return
-
-        try:
-            output_path = save_stitched_image(
-                stitched_image,
-                build_unique_stitched_output_path(file_path),
-            )
-        except OSError as error:
-            QMessageBox.critical(self, "Video conversion failed", str(error))
-            return
-
-        normalized_path = str(output_path.resolve())
-        self._add_image_to_library(normalized_path)
-        self._refresh_image_thumbnail_list(selected_image_path=normalized_path)
-        QMessageBox.information(
-            self,
-            "Video converted",
-            "Saved stitched image to:\n"
-            f"{normalized_path}\n\n"
-            f"Stitched frames: {manual_dialog.stitched_frame_count}",
-        )
-
-    def _handle_image_thumbnail_selection_changed(self, row: int) -> None:
-        if self._is_syncing_image_library_controls:
-            return
-
-        self._sync_images_tab()
-
-    def _handle_save_selected_image_clicked(self) -> None:
-        selected_image_path = self._get_selected_image_library_path()
-        if selected_image_path is None:
-            return
-
-        selected_pixmap = QPixmap(selected_image_path)
-        if selected_pixmap.isNull():
-            QMessageBox.critical(
-                self,
-                "Image save failed",
-                f"Unable to load selected image:\n{selected_image_path}",
-            )
-            return
-
-        output_path = self._get_png_save_file_path(Path(selected_image_path).stem)
-        if not output_path:
-            return
-
-        normalized_output_path = _ensure_png_file_suffix(output_path)
-        if not selected_pixmap.save(normalized_output_path, "PNG"):
-            QMessageBox.critical(
-                self,
-                "Image save failed",
-                f"Unable to save PNG file:\n{normalized_output_path}",
-            )
-            return
-
-        QMessageBox.information(
-            self,
-            "Image saved",
-            f"Saved PNG image to:\n{normalized_output_path}",
-        )
-
-    def _handle_delete_image_clicked(self) -> None:
-        selected_image_path = self._get_selected_image_library_path()
-        if selected_image_path is None:
-            return
-
-        normalized_path = str(Path(selected_image_path).resolve())
-        self.image_library_paths = [
-            library_path
-            for library_path in self.image_library_paths
-            if library_path != normalized_path
-        ]
-        did_clear_textures = self._clear_wall_textures_using_image(normalized_path)
-        self._refresh_image_thumbnail_list()
-        if did_clear_textures:
-            self._handle_texture_creator_texture_changed()
-
     def _get_image_file_path(self) -> str:
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "load image",
             str(Path.home()),
             "Image Files (*.png *.jpg *.jpeg *.bmp *.webp)",
-        )
-        return file_path
-
-    def _get_image_file_paths(self) -> list[str]:
-        file_paths, _ = QFileDialog.getOpenFileNames(
-            self,
-            "load images",
-            str(Path.home()),
-            "Image Files (*.png *.jpg *.jpeg *.bmp *.webp)",
-        )
-        return file_paths
-
-    def _get_video_file_path(self) -> str:
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "convert video to image",
-            str(Path.home()),
-            VIDEO_FILE_FILTER,
-        )
-        return file_path
-
-    def _get_png_save_file_path(self, default_image_name: str) -> str:
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "save png",
-            str(Path.home() / f"{default_image_name}.png"),
-            "PNG Files (*.png)",
         )
         return file_path
 
@@ -3887,219 +3338,6 @@ class BlueprintWorkspace(QWidget):
             self._get_selected_placed_doorway() is not None
         )
 
-    def _refresh_room_dependent_controls(self) -> None:
-        """Refresh features that still consume persisted room geometry."""
-
-        self._refresh_uv_rooms_list()
-        self._sync_uv_controls()
-        self._sync_texture_creator_tab()
-
-    def _refresh_uv_rooms_list(self) -> None:
-        selected_room_index = self._get_selected_uv_room_index()
-        self.uv_rooms_list.clear()
-        for room_index, room in enumerate(self.current_level.rooms):
-            room_item = self._build_room_item(room_index, room)
-            self.uv_rooms_list.addItem(room_item)
-
-        if self.uv_rooms_list.count() == 0:
-            self._sync_uv_controls()
-            return
-
-        if selected_room_index is None:
-            self.uv_rooms_list.setCurrentRow(0)
-            return
-
-        if selected_room_index < self.uv_rooms_list.count():
-            self.uv_rooms_list.setCurrentRow(selected_room_index)
-            return
-
-        self.uv_rooms_list.setCurrentRow(self.uv_rooms_list.count() - 1)
-
-    def _build_room_item(self, room_index: int, room: RoomData) -> QListWidgetItem:
-        room_name = room.name or "Room"
-        room_item = QListWidgetItem(f"{room_name} ({room.height_meters:.2f} m)")
-        room_item.setData(Qt.ItemDataRole.UserRole, room_index)
-        return room_item
-
-    def _get_selected_uv_room_index(self) -> int | None:
-        selected_item = self.uv_rooms_list.currentItem()
-        if selected_item is None:
-            return None
-
-        room_index = selected_item.data(Qt.ItemDataRole.UserRole)
-        if room_index is None:
-            return None
-
-        return int(room_index)
-
-    def _get_selected_uv_room(self) -> RoomData | None:
-        room_index = self._get_selected_uv_room_index()
-        if room_index is None or room_index >= len(self.current_level.rooms):
-            return None
-
-        return self.current_level.rooms[room_index]
-
-    def _get_selected_uv_wall_placement(self) -> UvWallPlacement | None:
-        selected_room = self._get_selected_uv_room()
-        selected_wall_key = self.uv_canvas.get_selected_wall_key()
-        if selected_room is None or selected_wall_key is None:
-            return None
-
-        layout = build_uv_wall_layout(
-            room=selected_room,
-            vertex_data=self.current_level.vertex_data,
-            wall_height_meters=selected_room.height_meters,
-        )
-        for placement in layout.placements:
-            if placement.wall.key == selected_wall_key:
-                return placement
-
-        return None
-
-    def _refresh_image_thumbnail_list(
-        self,
-        selected_image_path: str | None = None,
-    ) -> None:
-        if not hasattr(self, "image_thumbnail_list"):
-            return
-
-        if selected_image_path is None:
-            selected_image_path = self._get_selected_image_library_path()
-
-        self._is_syncing_image_library_controls = True
-        self.image_thumbnail_list.clear()
-        self._image_thumbnail_source_keys.clear()
-        for image_path in self.image_library_paths:
-            self.image_thumbnail_list.addItem(
-                self._build_image_thumbnail_item(image_path)
-            )
-        self._select_image_thumbnail_path(selected_image_path)
-        self._is_syncing_image_library_controls = False
-        self._sync_images_tab()
-        self._refresh_texture_image_combo()
-
-    def _build_image_thumbnail_item(self, image_path: str) -> QListWidgetItem:
-        image_name = Path(image_path).name
-        thumbnail_item = QListWidgetItem(image_name)
-        thumbnail_item.setData(Qt.ItemDataRole.UserRole, image_path)
-        thumbnail_item.setToolTip(image_path)
-
-        self._sync_image_thumbnail_item(thumbnail_item, image_path)
-        return thumbnail_item
-
-    def _refresh_stale_image_thumbnails(self) -> None:
-        """Reload only library icons whose file revisions changed."""
-
-        if not hasattr(self, "image_thumbnail_list"):
-            return
-        active_paths: set[str] = set()
-        for row_index in range(self.image_thumbnail_list.count()):
-            thumbnail_item = self.image_thumbnail_list.item(row_index)
-            image_path = str(
-                thumbnail_item.data(Qt.ItemDataRole.UserRole) or ""
-            )
-            if not image_path:
-                continue
-            active_paths.add(image_path)
-            self._sync_image_thumbnail_item(thumbnail_item, image_path)
-        self._image_thumbnail_source_keys = {
-            image_path: revision
-            for image_path, revision in self._image_thumbnail_source_keys.items()
-            if image_path in active_paths
-        }
-
-    def _sync_image_thumbnail_item(
-        self,
-        thumbnail_item: QListWidgetItem,
-        image_path: str,
-    ) -> None:
-        """Install one thumbnail only after its current revision decodes."""
-
-        source_key = _build_local_file_revision(image_path)
-        if self._image_thumbnail_source_keys.get(image_path) == source_key:
-            return
-
-        if not Path(image_path).is_file():
-            thumbnail_item.setIcon(QIcon())
-            thumbnail_item.setText(f"{Path(image_path).name}\nmissing")
-            self._image_thumbnail_source_keys[image_path] = source_key
-            return
-
-        thumbnail_pixmap = _load_image_pixmap(image_path)
-        if thumbnail_pixmap.isNull():
-            thumbnail_item.setIcon(QIcon())
-            thumbnail_item.setText(f"{Path(image_path).name}\nmissing")
-            self._image_thumbnail_source_keys.pop(image_path, None)
-            return
-
-        thumbnail_item.setText(Path(image_path).name)
-        thumbnail_item.setIcon(
-            QIcon(
-                thumbnail_pixmap.scaled(
-                    72,
-                    72,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-            )
-        )
-        self._image_thumbnail_source_keys[image_path] = source_key
-
-    def _select_image_thumbnail_path(self, selected_image_path: str | None) -> None:
-        self.image_thumbnail_list.clearSelection()
-        self.image_thumbnail_list.setCurrentRow(-1)
-        if selected_image_path is None:
-            return
-
-        normalized_path = str(Path(selected_image_path).resolve())
-        for row_index in range(self.image_thumbnail_list.count()):
-            thumbnail_item = self.image_thumbnail_list.item(row_index)
-            image_path = thumbnail_item.data(Qt.ItemDataRole.UserRole)
-            if image_path != normalized_path:
-                continue
-
-            self.image_thumbnail_list.setCurrentRow(row_index)
-            return
-
-    def _get_selected_image_library_path(self) -> str | None:
-        if not hasattr(self, "image_thumbnail_list"):
-            return None
-
-        selected_item = self.image_thumbnail_list.currentItem()
-        if selected_item is None:
-            return None
-
-        image_path = selected_item.data(Qt.ItemDataRole.UserRole)
-        if image_path is None:
-            return None
-
-        return str(image_path)
-
-    def _add_image_to_library(self, image_path: str) -> None:
-        normalized_path = str(Path(image_path).resolve())
-        if normalized_path in self.image_library_paths:
-            return
-
-        self.image_library_paths.append(normalized_path)
-
-    def _clear_wall_textures_using_image(self, image_path: str) -> bool:
-        normalized_path = str(Path(image_path).resolve())
-        did_clear_textures = False
-        for level in self.levels:
-            for room in level.rooms:
-                original_texture_count = len(room.wall_textures)
-                room.wall_textures = {
-                    wall_key: texture_data
-                    for wall_key, texture_data in room.wall_textures.items()
-                    if texture_data.image_path != normalized_path
-                }
-                did_clear_textures = (
-                    did_clear_textures
-                    or len(room.wall_textures) != original_texture_count
-                )
-
-        return did_clear_textures
-
     @staticmethod
     def _normalize_image_library_paths(image_paths: list[str]) -> list[str]:
         normalized_paths: list[str] = []
@@ -4111,177 +3349,6 @@ class BlueprintWorkspace(QWidget):
             normalized_paths.append(normalized_path)
 
         return normalized_paths
-
-    def _refresh_texture_image_combo(
-        self,
-        selected_image_path: str | None = None,
-    ) -> None:
-        if not hasattr(self, "texture_image_combo"):
-            return
-
-        if selected_image_path is None:
-            selected_image_path = self._get_selected_texture_image_path()
-        if selected_image_path is None:
-            selected_image_path = self._get_texture_creator_saved_image_path()
-
-        has_wall = self._get_texture_creator_wall_placement() is not None
-        self.texture_image_combo.setEnabled(has_wall and bool(self.image_library_paths))
-        self._is_syncing_texture_controls = True
-        self.texture_image_combo.clear()
-        self.texture_image_combo.addItem("Select image", None)
-        for image_path in self.image_library_paths:
-            self.texture_image_combo.addItem(Path(image_path).name, image_path)
-
-        if selected_image_path is not None:
-            normalized_path = str(Path(selected_image_path).resolve())
-            for item_index in range(self.texture_image_combo.count()):
-                if self.texture_image_combo.itemData(item_index) != normalized_path:
-                    continue
-
-                self.texture_image_combo.setCurrentIndex(item_index)
-                break
-
-        self._is_syncing_texture_controls = False
-        self._sync_texture_creator_canvas()
-
-    def _get_selected_texture_image_path(self) -> str | None:
-        if not hasattr(self, "texture_image_combo"):
-            return None
-
-        image_path = self.texture_image_combo.currentData()
-        if image_path is None:
-            return None
-
-        return str(image_path)
-
-    def _get_texture_creator_saved_image_path(self) -> str | None:
-        selected_room = self._get_texture_creator_room()
-        if selected_room is None or self.texture_creator_wall_key is None:
-            return None
-
-        texture_data = selected_room.wall_textures.get(self.texture_creator_wall_key)
-        if texture_data is None:
-            return None
-
-        return texture_data.image_path
-
-    def _handle_viewer_wall_selected(
-        self,
-        level_index: int,
-        room_index: int,
-        wall_key: str,
-    ) -> None:
-        level_position = self._get_level_position_for_level_index(level_index)
-        if level_position is None:
-            return
-        if room_index < 0 or room_index >= len(self.levels[level_position].rooms):
-            return
-
-        self.texture_creator_level_index = level_position
-        self.texture_creator_room_index = room_index
-        self.texture_creator_wall_key = wall_key
-        if self.current_level_index != level_position:
-            self.current_level_index = level_position
-            self._sync_level_controls()
-            self._sync_canvas_to_current_level()
-            self._refresh_room_dependent_controls()
-
-        if self.uv_rooms_list.currentRow() != room_index:
-            self.uv_rooms_list.setCurrentRow(room_index)
-        self.uv_canvas.set_selected_wall_key(wall_key)
-        self._sync_uv_controls()
-        self._sync_texture_creator_tab()
-        self.side_tabs.setCurrentWidget(self.texture_creator_tab)
-
-    def _handle_texture_image_selection_changed(self, item_index: int) -> None:
-        if self._is_syncing_texture_controls:
-            return
-
-        self._sync_texture_creator_canvas()
-
-    def _handle_texture_creator_texture_changed(self) -> None:
-        self.uv_canvas.update()
-        self._schedule_viewer_preview_refresh()
-
-    def _sync_texture_creator_tab(self) -> None:
-        if not hasattr(self, "texture_creator_canvas"):
-            return
-
-        selected_room = self._get_texture_creator_room()
-        selected_placement = self._get_texture_creator_wall_placement()
-        has_wall = selected_room is not None and selected_placement is not None
-        self.texture_image_combo.setEnabled(has_wall and bool(self.image_library_paths))
-        if not has_wall:
-            self.texture_creator_wall_label.setText("Select a wall in Viewer")
-            self._update_texture_creator_aspect_ratio_label(None)
-            self._refresh_texture_image_combo(selected_image_path=None)
-            return
-
-        self.texture_creator_wall_label.setText(
-            f"{selected_room.name or 'Room'} - "
-            f"{selected_placement.wall.projection_direction} wall"
-        )
-        self._update_texture_creator_aspect_ratio_label(selected_placement)
-        self._refresh_texture_image_combo()
-
-    def _sync_texture_creator_canvas(self) -> None:
-        if not hasattr(self, "texture_creator_canvas"):
-            return
-
-        selected_room = self._get_texture_creator_room()
-        selected_placement = self._get_texture_creator_wall_placement()
-        selected_image_path = self._get_selected_texture_image_path()
-        if selected_room is None or selected_placement is None:
-            self.texture_creator_canvas.set_context(None, None, None, None)
-            return
-
-        self.texture_creator_canvas.set_context(
-            room=selected_room,
-            wall_key=selected_placement.wall.key,
-            wall_size=_get_logical_wall_size(selected_placement),
-            image_path=selected_image_path,
-            segment_count=selected_placement.segment_count,
-        )
-
-    def _get_texture_creator_room(self) -> RoomData | None:
-        if self.texture_creator_level_index is None:
-            return None
-        if self.texture_creator_room_index is None:
-            return None
-        if self.texture_creator_level_index >= len(self.levels):
-            return None
-
-        level = self.levels[self.texture_creator_level_index]
-        if self.texture_creator_room_index >= len(level.rooms):
-            return None
-
-        return level.rooms[self.texture_creator_room_index]
-
-    def _get_texture_creator_wall_placement(self) -> UvWallPlacement | None:
-        selected_room = self._get_texture_creator_room()
-        if selected_room is None or self.texture_creator_wall_key is None:
-            return None
-        if self.texture_creator_level_index is None:
-            return None
-
-        selected_level = self.levels[self.texture_creator_level_index]
-        layout = build_uv_wall_layout(
-            room=selected_room,
-            vertex_data=selected_level.vertex_data,
-            wall_height_meters=selected_room.height_meters,
-        )
-        for placement in layout.placements:
-            if placement.wall.key == self.texture_creator_wall_key:
-                return placement
-
-        return None
-
-    def _get_level_position_for_level_index(self, level_index: int) -> int | None:
-        for level_position, level in enumerate(self.levels):
-            if level.index == level_index:
-                return level_position
-
-        return None
 
     def _sync_level_controls(self) -> None:
         self._is_syncing_level_controls = True
@@ -4304,105 +3371,6 @@ class BlueprintWorkspace(QWidget):
         self._update_blueprint_name_label()
         self._is_syncing_level_controls = False
 
-    def _sync_uv_controls(self) -> None:
-        self._is_syncing_uv_controls = True
-        selected_room = self._get_selected_uv_room()
-        has_room = selected_room is not None
-        self.uv_map_width_spinbox.setEnabled(has_room)
-        self.uv_map_height_spinbox.setEnabled(has_room)
-        self.optimize_uv_button.setEnabled(has_room)
-        self.optimize_all_uv_button.setEnabled(has_room)
-        self.reset_uv_defaults_button.setEnabled(has_room)
-        self.basic_optimization_radio.setEnabled(has_room)
-        self.free_placement_radio.setEnabled(has_room)
-        self.subdivision_optimization_radio.setEnabled(has_room)
-        self.complex_optimization_passes_spinbox.setEnabled(
-            has_room and self.free_placement_radio.isChecked()
-        )
-        self.unoccupied_uv_pixels_label.setEnabled(has_room)
-        self.uv_aspect_ratio_label.setEnabled(has_room)
-
-        if selected_room is None:
-            self.uv_canvas.set_room_context(None, None, DEFAULT_ROOM_HEIGHT_METERS)
-            self.uv_map_width_spinbox.setValue(DEFAULT_UV_MAP_WIDTH)
-            self.uv_map_height_spinbox.setValue(DEFAULT_UV_MAP_HEIGHT)
-            self.uv_wall_scale_spinbox.setValue(DEFAULT_WALL_UV_SCALE)
-            self.uv_wall_scale_spinbox.setEnabled(False)
-            self.uv_wall_rotation_spinbox.setValue(DEFAULT_WALL_UV_ROTATION_DEGREES)
-            self.uv_wall_rotation_spinbox.setEnabled(False)
-            self.unoccupied_uv_pixels_label.setText("Unoccupied pixels: 0")
-            self._update_uv_aspect_ratio_label(None)
-            self._is_syncing_uv_controls = False
-            return
-
-        self.uv_canvas.set_room_context(
-            selected_room,
-            self.current_level.vertex_data,
-            selected_room.height_meters,
-        )
-        self.uv_map_width_spinbox.setValue(selected_room.uv_map_width)
-        self.uv_map_height_spinbox.setValue(selected_room.uv_map_height)
-
-        selected_wall_key = self.uv_canvas.get_selected_wall_key()
-        selected_placement = self._get_selected_uv_wall_placement()
-        has_selected_wall = selected_wall_key is not None
-        self.uv_wall_scale_spinbox.setEnabled(has_selected_wall)
-        self.uv_wall_rotation_spinbox.setEnabled(has_selected_wall)
-        if selected_wall_key is None:
-            self.uv_wall_scale_spinbox.setValue(DEFAULT_WALL_UV_SCALE)
-            self.uv_wall_rotation_spinbox.setValue(DEFAULT_WALL_UV_ROTATION_DEGREES)
-        else:
-            self.uv_wall_scale_spinbox.setValue(
-                selected_room.wall_uv_scales.get(
-                    selected_wall_key,
-                    DEFAULT_WALL_UV_SCALE,
-                )
-            )
-            self.uv_wall_rotation_spinbox.setValue(
-                selected_room.wall_uv_rotations.get(
-                    selected_wall_key,
-                    DEFAULT_WALL_UV_ROTATION_DEGREES,
-                )
-            )
-
-        self._update_unoccupied_uv_pixels_label()
-        self._update_uv_aspect_ratio_label(selected_placement)
-        self._is_syncing_uv_controls = False
-
-    def _update_unoccupied_uv_pixels_label(self) -> None:
-        selected_room = self._get_selected_uv_room()
-        if selected_room is None:
-            self.unoccupied_uv_pixels_label.setText("Unoccupied pixels: 0")
-            return
-
-        unoccupied_pixels = calculate_unoccupied_uv_pixels(
-            room=selected_room,
-            vertex_data=self.current_level.vertex_data,
-            wall_height_meters=selected_room.height_meters,
-        )
-        self.unoccupied_uv_pixels_label.setText(
-            f"Unoccupied pixels: {unoccupied_pixels:,}"
-        )
-
-    def _update_uv_aspect_ratio_label(
-        self,
-        placement: UvWallPlacement | None,
-    ) -> None:
-        self.uv_aspect_ratio_label.setText(
-            _build_wall_aspect_ratio_text(placement)
-        )
-
-    def _update_texture_creator_aspect_ratio_label(
-        self,
-        placement: UvWallPlacement | None,
-    ) -> None:
-        self.texture_creator_aspect_ratio_label.setText(
-            _build_wall_aspect_ratio_text(placement)
-        )
-        self.texture_creator_resolution_label.setText(
-            _build_wall_resolution_text(placement)
-        )
-
     def _handle_level_selection_changed(self, level_index: int) -> None:
         if (
             self._is_syncing_level_controls
@@ -4417,7 +3385,6 @@ class BlueprintWorkspace(QWidget):
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
         self._update_pending_stair_level_status()
-        self._refresh_room_dependent_controls()
         self._ensure_viewer_preview_current()
 
     def _handle_height_level_changed(self, value: float) -> None:
@@ -4894,205 +3861,6 @@ class BlueprintWorkspace(QWidget):
     def _handle_snap_middle_equal_angle_toggled(self, checked: bool) -> None:
         self.canvas.set_snap_middle_equal_angle_only(checked)
 
-    def _handle_uv_room_selection_changed(self, room_index: int) -> None:
-        self._sync_uv_controls()
-
-    def _handle_optimization_mode_toggled(self, checked: bool) -> None:
-        if not hasattr(self, "uv_rooms_list"):
-            return
-
-        selected_room = self._get_selected_uv_room()
-        self.complex_optimization_passes_spinbox.setEnabled(
-            selected_room is not None
-            and self.free_placement_radio.isChecked()
-        )
-
-    def _handle_uv_map_width_changed(self, value: int) -> None:
-        if self._is_syncing_uv_controls:
-            return
-
-        selected_room = self._get_selected_uv_room()
-        if selected_room is None:
-            return
-
-        selected_room.uv_map_width = int(value)
-        self._refresh_room_subdivision_layout(selected_room)
-        self.uv_canvas.update()
-        self._update_unoccupied_uv_pixels_label()
-        self._schedule_viewer_preview_refresh()
-
-    def _handle_uv_map_height_changed(self, value: int) -> None:
-        if self._is_syncing_uv_controls:
-            return
-
-        selected_room = self._get_selected_uv_room()
-        if selected_room is None:
-            return
-
-        selected_room.uv_map_height = int(value)
-        self._refresh_room_subdivision_layout(selected_room)
-        self.uv_canvas.update()
-        self._update_unoccupied_uv_pixels_label()
-        self._schedule_viewer_preview_refresh()
-
-    def _handle_optimize_uv_clicked(self) -> None:
-        selected_room = self._get_selected_uv_room()
-        if selected_room is None:
-            return
-
-        optimized_result = self._optimize_uv_room(selected_room)
-        if not optimized_result.wall_uv_rotations:
-            QMessageBox.warning(
-                self,
-                "Optimization skipped",
-                "No layout can show every wall with the current map size.",
-            )
-            return
-
-        self._apply_uv_optimization_result(selected_room, optimized_result)
-        self.uv_canvas.update()
-        self._sync_uv_controls()
-        self._schedule_viewer_preview_refresh()
-
-    def _handle_optimize_all_uv_clicked(self) -> None:
-        skipped_room_names: list[str] = []
-        optimized_count = 0
-        for room in self.current_level.rooms:
-            optimized_result = self._optimize_uv_room(room)
-            if not optimized_result.wall_uv_rotations:
-                skipped_room_names.append(room.name or "Room")
-                continue
-
-            self._apply_uv_optimization_result(room, optimized_result)
-            optimized_count += 1
-
-        if optimized_count == 0:
-            QMessageBox.warning(
-                self,
-                "Optimization skipped",
-                "No layout can show every wall for any room with the current map sizes.",
-            )
-            return
-
-        self.uv_canvas.update()
-        self._sync_uv_controls()
-        self._schedule_viewer_preview_refresh()
-        if skipped_room_names:
-            QMessageBox.warning(
-                self,
-                "Some rooms skipped",
-                "No layout can show every wall for: "
-                + ", ".join(skipped_room_names),
-            )
-
-    def _handle_reset_uv_defaults_clicked(self) -> None:
-        selected_room = self._get_selected_uv_room()
-        if selected_room is None:
-            return
-
-        selected_room.uv_map_width = DEFAULT_UV_MAP_WIDTH
-        selected_room.uv_map_height = DEFAULT_UV_MAP_HEIGHT
-        selected_room.wall_uv_scales.clear()
-        selected_room.wall_uv_rotations.clear()
-        selected_room.wall_uv_positions.clear()
-        selected_room.wall_subdivisions.clear()
-        selected_room.wall_subdivision_positions.clear()
-        selected_room.wall_subdivision_source_ranges.clear()
-        self.uv_canvas.update()
-        self._sync_uv_controls()
-        self._schedule_viewer_preview_refresh()
-
-    def _optimize_uv_room(self, room: RoomData) -> UvOptimizationResult:
-        return optimize_room_wall_uvs(
-            room=room,
-            vertex_data=self.current_level.vertex_data,
-            wall_height_meters=room.height_meters,
-            use_complex_optimization=(
-                self.free_placement_radio.isChecked()
-            ),
-            use_subdivision_optimization=(
-                self.subdivision_optimization_radio.isChecked()
-            ),
-            complex_optimization_passes=(
-                self.complex_optimization_passes_spinbox.value()
-            ),
-        )
-
-    @staticmethod
-    def _apply_uv_optimization_result(
-        selected_room: RoomData,
-        optimized_result: UvOptimizationResult,
-    ) -> None:
-        selected_room.wall_uv_rotations = dict(optimized_result.wall_uv_rotations)
-        selected_room.wall_uv_scales = dict(optimized_result.wall_uv_scales)
-        selected_room.wall_uv_positions = dict(optimized_result.wall_uv_positions)
-        selected_room.wall_subdivisions = dict(optimized_result.wall_subdivisions)
-        selected_room.wall_subdivision_positions = dict(
-            optimized_result.wall_subdivision_positions
-        )
-        selected_room.wall_subdivision_source_ranges = dict(
-            optimized_result.wall_subdivision_source_ranges
-        )
-
-    def _refresh_room_subdivision_layout(self, room: RoomData) -> None:
-        optimized_result = rebuild_room_subdivision_uvs(
-            room=room,
-            vertex_data=self.current_level.vertex_data,
-            wall_height_meters=room.height_meters,
-        )
-        if optimized_result is None:
-            return
-
-        self._apply_uv_optimization_result(room, optimized_result)
-
-    def _handle_uv_wall_selected(self, wall_key: str) -> None:
-        if self.uv_canvas.get_selected_wall_key() != wall_key:
-            self.uv_canvas.set_selected_wall_key(wall_key)
-
-        selected_room_index = self._get_selected_uv_room_index()
-        if selected_room_index is not None:
-            self.texture_creator_level_index = self.current_level_index
-            self.texture_creator_room_index = selected_room_index
-            self.texture_creator_wall_key = wall_key
-            self._sync_texture_creator_tab()
-        self._sync_uv_controls()
-
-    def _handle_uv_values_changed(self) -> None:
-        self._sync_uv_controls()
-        self._schedule_viewer_preview_refresh()
-
-    def _handle_uv_wall_scale_changed(self, value: float) -> None:
-        if self._is_syncing_uv_controls:
-            return
-
-        selected_room = self._get_selected_uv_room()
-        selected_wall_key = self.uv_canvas.get_selected_wall_key()
-        if selected_room is None or selected_wall_key is None:
-            return
-
-        selected_room.wall_uv_scales[selected_wall_key] = float(value)
-        self._refresh_room_subdivision_layout(selected_room)
-        self.uv_canvas.update()
-        self._update_unoccupied_uv_pixels_label()
-        self._schedule_viewer_preview_refresh()
-
-    def _handle_uv_wall_rotation_changed(self, value: int) -> None:
-        if self._is_syncing_uv_controls:
-            return
-
-        selected_room = self._get_selected_uv_room()
-        selected_wall_key = self.uv_canvas.get_selected_wall_key()
-        if selected_room is None or selected_wall_key is None:
-            return
-
-        selected_room.wall_uv_rotations[selected_wall_key] = _normalize_degree_value(
-            value
-        )
-        self._refresh_room_subdivision_layout(selected_room)
-        self.uv_canvas.update()
-        self._update_unoccupied_uv_pixels_label()
-        self._schedule_viewer_preview_refresh()
-
     def _apply_loaded_project(self, project_data: ProjectData) -> None:
         self._apply_project_state(
             levels=project_data.levels,
@@ -5144,11 +3912,6 @@ class BlueprintWorkspace(QWidget):
                 list(doorway_presets) or create_default_doorway_presets()
             )
         self.current_level_index = min(max(current_level_index, 0), len(self.levels) - 1)
-        self.texture_creator_level_index = None
-        self.texture_creator_room_index = None
-        self.texture_creator_wall_key = None
-
-        self._refresh_image_thumbnail_list()
         self._refresh_doorway_preset_list(
             selected_index=0 if self.doorway_presets else -1
         )
@@ -5161,7 +3924,6 @@ class BlueprintWorkspace(QWidget):
         )
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
-        self._refresh_room_dependent_controls()
         self._atlas_generation_signature = None
         self._atlas_source_content_paths = None
         self._atlas_source_content_revisions = None
@@ -5230,7 +3992,6 @@ class BlueprintWorkspace(QWidget):
             label_text = f"Image: {Path(image_path).name}"
 
         self.blueprint_name_label.setText(label_text)
-        self._sync_images_tab()
 
     def _update_floor_contour_status_label(self) -> None:
         vertex_count = len(self.current_level.floor_contour_vertex_ids)
@@ -5241,65 +4002,6 @@ class BlueprintWorkspace(QWidget):
         self.floor_contour_status_label.setText(
             f"Floor contour: {vertex_count} vertices"
         )
-
-    def _sync_images_tab(self) -> None:
-        if not hasattr(self, "image_preview_label"):
-            return
-
-        selected_image_path = self._get_selected_image_library_path()
-        self.images_delete_button.setEnabled(selected_image_path is not None)
-        self.images_save_png_button.setEnabled(selected_image_path is not None)
-
-        if selected_image_path is None:
-            self._image_preview_source_key = None
-            self._image_preview_source_pixmap = None
-            self._image_preview_scaled_key = None
-            self.image_path_label.setText("No image selected")
-            self.image_preview_label.setPixmap(QPixmap())
-            self.image_preview_label.setText("No image loaded")
-            return
-
-        source_key = _build_local_file_revision(selected_image_path)
-        if source_key != self._image_preview_source_key:
-            if not Path(selected_image_path).is_file():
-                self._image_preview_source_key = source_key
-                self._image_preview_source_pixmap = None
-                self._image_preview_scaled_key = None
-            else:
-                next_pixmap = _load_image_pixmap(selected_image_path)
-                if next_pixmap.isNull():
-                    self._image_preview_source_key = None
-                    self._image_preview_source_pixmap = None
-                    self._image_preview_scaled_key = None
-                else:
-                    self._image_preview_source_key = source_key
-                    self._image_preview_source_pixmap = next_pixmap
-                    self._image_preview_scaled_key = None
-        preview_pixmap = self._image_preview_source_pixmap
-        if preview_pixmap is None or preview_pixmap.isNull():
-            self.image_path_label.setText(f"Image missing: {selected_image_path}")
-            self.image_preview_label.setPixmap(QPixmap())
-            self.image_preview_label.setText("Image missing")
-            self.images_save_png_button.setEnabled(False)
-            return
-
-        self.image_path_label.setText(f"Image: {Path(selected_image_path).name}")
-        target_width = max(320, self.image_preview_label.width() - 16)
-        target_height = max(220, self.image_preview_label.height() - 16)
-        scaled_key = (*source_key, target_width, target_height)
-        if scaled_key == self._image_preview_scaled_key:
-            return
-        self.image_preview_label.setText("")
-        self.image_preview_label.setPixmap(
-            preview_pixmap.scaled(
-                target_width,
-                target_height,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        )
-        self._image_preview_scaled_key = scaled_key
-
 
 class MainWindow(QMainWindow):
     def __init__(
@@ -5327,35 +4029,6 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.blueprint_workspace.shutdown()
         super().closeEvent(event)
-
-
-# ### Numeric helpers ###
-def _nearest_power_of_two_value(value: int) -> int:
-    clamped_value = min(max(int(value), 64), 8192)
-    lower_power = 64
-    while lower_power * 2 <= clamped_value:
-        lower_power *= 2
-
-    upper_power = min(lower_power * 2, 8192)
-    if clamped_value - lower_power <= upper_power - clamped_value:
-        return lower_power
-
-    return upper_power
-
-
-def _step_power_of_two_value(value: int, steps: int) -> int:
-    power_value = _nearest_power_of_two_value(value)
-    for _ in range(abs(steps)):
-        if steps > 0:
-            power_value = min(power_value * 2, 8192)
-        else:
-            power_value = max(power_value // 2, 64)
-
-    return power_value
-
-
-def _normalize_degree_value(value: int) -> int:
-    return int(value) % 360
 
 
 # ### Text helpers ###
@@ -5488,54 +4161,6 @@ def _format_doorway_preset_label(doorway_preset: DoorwayPreset) -> str:
     return f"{dimension_text} — Arch {arch_amount_percent:g}%"
 
 
-def _build_wall_aspect_ratio_text(placement: UvWallPlacement | None) -> str:
-    if placement is None:
-        return "Aspect ratio: none"
-
-    wall_width, wall_height = _get_logical_wall_size(placement)
-    aspect_ratio = float(wall_width) / max(1.0, float(wall_height))
-    return f"Aspect ratio: {aspect_ratio:.3f}:1"
-
-
-def _build_wall_resolution_text(placement: UvWallPlacement | None) -> str:
-    if placement is None:
-        return "Resolutions: none"
-
-    wall_width, wall_height = _get_logical_wall_size(placement)
-    aspect_ratio = float(wall_width) / max(1.0, float(wall_height))
-    resolution_lines = ["Suggested resolutions:"]
-    for detail_size in TEXTURE_CREATOR_DETAIL_SIZES:
-        resolution_width, resolution_height = _calculate_aspect_resolution(
-            aspect_ratio=aspect_ratio,
-            target_square_size=detail_size,
-        )
-        resolution_lines.append(
-            f"{detail_size} detail: {resolution_width} x {resolution_height}"
-        )
-
-    return "\n".join(resolution_lines)
-
-
-def _calculate_aspect_resolution(
-    aspect_ratio: float,
-    target_square_size: int,
-) -> tuple[int, int]:
-    target_area = float(target_square_size * target_square_size)
-    safe_aspect_ratio = max(0.01, float(aspect_ratio))
-    resolution_width = max(1, int(round((target_area * safe_aspect_ratio) ** 0.5)))
-    resolution_height = max(1, int(round((target_area / safe_aspect_ratio) ** 0.5)))
-    return resolution_width, resolution_height
-
-
-def _get_logical_wall_size(placement: UvWallPlacement) -> tuple[float, float]:
-    wall_width, wall_height = placement.natural_size
-    source_span = max(
-        0.001,
-        placement.source_end_ratio - placement.source_start_ratio,
-    )
-    return wall_width / source_span, wall_height
-
-
 # ### Path helpers ###
 def _build_atlas_source_base_path_signature(
     source_paths: tuple[tuple[object, ...], ...] | None,
@@ -5579,20 +4204,6 @@ def _local_file_revision_has_file(revision: tuple[object, ...]) -> bool:
     """Return whether a local-file revision represents an existing file."""
 
     return len(revision) == 4 and all(value is not None for value in revision[1:])
-
-
-def _load_image_pixmap(image_path: str) -> QPixmap:
-    """Decode one library image after its revision cache misses."""
-
-    return QPixmap(image_path)
-
-
-def _ensure_png_file_suffix(file_path: str) -> str:
-    output_path = Path(file_path)
-    if output_path.suffix.lower() == ".png":
-        return str(output_path)
-
-    return f"{output_path}.png"
 
 
 # ### Entrypoint helpers ###

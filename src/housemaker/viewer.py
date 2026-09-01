@@ -17,7 +17,7 @@ from pyqtgraph import Transform3D
 import pyqtgraph.opengl as gl
 from pyqtgraph.opengl import shaders as gl_shaders
 from pyqtgraph.opengl.GLGraphicsItem import GLGraphicsItem
-from PySide6.QtCore import QPoint, QPointF, QRect, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import (
     QCursor,
     QKeyEvent,
@@ -26,6 +26,7 @@ from PySide6.QtGui import (
     QVector3D,
 )
 from PySide6.QtWidgets import (
+    QApplication,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -336,6 +337,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
 
     items_clicked = Signal(object)
     viewport_clicked = Signal(object)
+    first_person_pointer_capture_changed = Signal(bool)
     rectangle_pointer_pressed = Signal(object)
     rectangle_pointer_moved = Signal(object)
     rectangle_pointer_released = Signal(object)
@@ -362,6 +364,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self._rectangle_drawing_enabled = False
         self._primary_pointer_drag_reserved = False
         self._item_click_selection_enabled = True
+        self._viewport_click_selection_enabled = True
         self._overlay_selection_enabled = False
         self._overlay_wheel_steps_enabled = False
         self._overlay_wheel_delta_remainder = 0
@@ -370,6 +373,11 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self._face_selection_release_suppressed = False
         self._navigation_mode = NAVIGATION_MODE_ORBIT
         self._first_person_pointer_captured = False
+        self._first_person_ctrl_interaction_enabled = False
+        self._first_person_ctrl_interaction_active = False
+        self._first_person_pointer_release_latched = False
+        self._first_person_application_deactivated = False
+        self._application_event_filter_installed = False
         self._first_person_camera_pose = CameraPose(
             z=DEFAULT_FIRST_PERSON_HEIGHT_METERS
         )
@@ -403,6 +411,8 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self._rectangle_drawing_enabled = normalized_enabled
         if normalized_enabled:
             self.focus_navigation()
+            return
+        self._resume_first_person_pointer_capture_if_ready()
 
     @property
     def is_primary_pointer_drag_reserved(self) -> bool:
@@ -419,11 +429,92 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         """Return primary-pointer input to ordinary selection."""
 
         self._primary_pointer_drag_reserved = False
+        self._resume_first_person_pointer_capture_if_ready()
 
     def set_item_click_selection_enabled(self, enabled: bool) -> None:
         """Enable the legacy item-pick pass only for viewers that use it."""
 
         self._item_click_selection_enabled = bool(enabled)
+
+    def set_viewport_click_selection_enabled(self, enabled: bool) -> None:
+        """Enable click positions for viewers that perform their own CPU picking."""
+
+        self._viewport_click_selection_enabled = bool(enabled)
+
+    def set_first_person_ctrl_interaction_enabled(self, enabled: bool) -> None:
+        """Allow Ctrl to temporarily free the pointer in first-person mode."""
+
+        normalized_enabled = bool(enabled)
+        if normalized_enabled == self._first_person_ctrl_interaction_enabled:
+            return
+        self._first_person_ctrl_interaction_enabled = normalized_enabled
+        if normalized_enabled:
+            if self.is_first_person_active:
+                self._install_first_person_ctrl_event_filter()
+            if (
+                self.is_first_person_active
+                and QApplication.keyboardModifiers()
+                & Qt.KeyboardModifier.ControlModifier
+            ):
+                self._begin_first_person_ctrl_interaction()
+            return
+
+        self._remove_first_person_ctrl_event_filter()
+        should_restore_capture = bool(
+            self._first_person_ctrl_interaction_active
+            or self._first_person_pointer_release_latched
+        )
+        self._first_person_ctrl_interaction_active = False
+        self._first_person_pointer_release_latched = False
+        if (
+            should_restore_capture
+            and self.is_first_person_active
+            and not self._rectangle_drawing_enabled
+        ):
+            self._capture_first_person_pointer()
+        self._update_navigation_tooltip()
+
+    @property
+    def is_first_person_ctrl_interaction_active(self) -> bool:
+        """Whether held Ctrl currently owns the visible Canvas pointer."""
+
+        return bool(
+            self.is_first_person_active
+            and self._first_person_ctrl_interaction_enabled
+            and self._first_person_ctrl_interaction_active
+        )
+
+    def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
+        """Observe Canvas Ctrl release after a side-panel button gains focus."""
+
+        if event.type() == QEvent.Type.ApplicationDeactivate:
+            self._first_person_application_deactivated = True
+            return super().eventFilter(watched, event)
+        if event.type() == QEvent.Type.ApplicationActivate:
+            self._first_person_application_deactivated = False
+            if (
+                QApplication.keyboardModifiers()
+                & Qt.KeyboardModifier.ControlModifier
+            ):
+                self._begin_first_person_ctrl_interaction()
+            else:
+                self._first_person_ctrl_interaction_active = False
+                self._resume_first_person_pointer_capture_if_ready()
+            return super().eventFilter(watched, event)
+        if (
+            self._first_person_ctrl_interaction_enabled
+            and self.is_first_person_active
+            and self._event_belongs_to_viewer_window(watched)
+            and event.type() in {QEvent.Type.KeyPress, QEvent.Type.KeyRelease}
+            and event.key() == Qt.Key.Key_Control
+        ):
+            if event.type() == QEvent.Type.KeyPress:
+                self._begin_first_person_ctrl_interaction()
+            else:
+                self._end_first_person_ctrl_interaction()
+            event.accept()
+            return True
+        return super().eventFilter(watched, event)
 
     def set_overlay_selection_enabled(self, enabled: bool) -> None:
         """Enable safe click requests for CPU-picked viewport overlays."""
@@ -517,7 +608,91 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         if self.isVisible():
             self.releaseMouse()
         self.unsetCursor()
+        self.first_person_pointer_capture_changed.emit(False)
         self._update_navigation_tooltip()
+
+    def _begin_first_person_ctrl_interaction(self) -> bool:
+        """Free the Canvas pointer for as long as Ctrl remains held."""
+
+        if (
+            not self._first_person_ctrl_interaction_enabled
+            or not self.is_first_person_active
+        ):
+            return False
+        if self._first_person_ctrl_interaction_active:
+            return True
+        self._first_person_ctrl_interaction_active = True
+        self.release_first_person_pointer_capture()
+        self._update_navigation_tooltip()
+        return True
+
+    def _end_first_person_ctrl_interaction(self) -> bool:
+        """Restore Canvas mouse-look after the temporary Ctrl interaction."""
+
+        if (
+            not self._first_person_ctrl_interaction_enabled
+            or not self.is_first_person_active
+            or not self._first_person_ctrl_interaction_active
+        ):
+            return False
+        self._first_person_ctrl_interaction_active = False
+        self._resume_first_person_pointer_capture_if_ready()
+        self._update_navigation_tooltip()
+        return True
+
+    def _resume_first_person_pointer_capture_if_ready(self) -> None:
+        """Resume mouse-look unless a Canvas pointer tool still needs the cursor."""
+
+        if (
+            not self._first_person_ctrl_interaction_enabled
+            or not self.is_first_person_active
+            or self._first_person_ctrl_interaction_active
+            or self._first_person_pointer_release_latched
+            or self._rectangle_drawing_enabled
+            or self._primary_pointer_drag_reserved
+            or self._face_selection_gesture_active
+            or self.is_first_person_pointer_captured
+            or self._first_person_application_deactivated
+        ):
+            return
+        self._capture_first_person_pointer()
+
+    def _event_belongs_to_viewer_window(self, watched: object) -> bool:
+        """Return whether a global key event targets this viewer's window."""
+
+        if watched is self:
+            return True
+        return isinstance(watched, QWidget) and watched.window() is self.window()
+
+    def _install_first_person_ctrl_event_filter(self) -> None:
+        """Observe Ctrl only while this Canvas first-person view is in use."""
+
+        if self._application_event_filter_installed:
+            return
+        application = QApplication.instance()
+        if application is None:
+            return
+        application.installEventFilter(self)
+        self._application_event_filter_installed = True
+
+    def _remove_first_person_ctrl_event_filter(self) -> None:
+        """Stop observing application keys when Canvas first-person is inactive."""
+
+        if not self._application_event_filter_installed:
+            return
+        application = QApplication.instance()
+        if application is not None:
+            application.removeEventFilter(self)
+        self._application_event_filter_installed = False
+
+    def _first_person_viewport_interaction_is_allowed(self) -> bool:
+        """Require held Ctrl for Canvas clicks while first-person remains active."""
+
+        return bool(
+            not self.is_first_person_active
+            or not self._first_person_ctrl_interaction_enabled
+            or self._first_person_ctrl_interaction_active
+        )
 
     def build_camera_ray(
         self,
@@ -707,7 +882,10 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         if (
             (
                 self._face_selection_gestures_enabled
-                or not self._item_click_selection_enabled
+                or (
+                    not self._item_click_selection_enabled
+                    and not self._viewport_click_selection_enabled
+                )
                 or self._overlay_selection_enabled
             )
             and event.button() == Qt.MouseButton.LeftButton
@@ -741,6 +919,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         if (
             event.button() == Qt.MouseButton.LeftButton
             and not self.is_first_person_pointer_captured
+            and self._first_person_viewport_interaction_is_allowed()
         ):
             self.click_press_position = event.position()
             self.primary_pointer_pressed.emit(event.position())
@@ -750,10 +929,19 @@ class SelectableGLViewWidget(gl.GLViewWidget):
 
         if self.is_first_person_active:
             if event.button() == Qt.MouseButton.RightButton:
+                if self._first_person_ctrl_interaction_enabled:
+                    self._first_person_pointer_release_latched = True
                 self.release_first_person_pointer_capture()
             elif not self.is_first_person_pointer_captured:
-                self.click_press_position = event.position()
-                self.setFocus(Qt.FocusReason.MouseFocusReason)
+                if (
+                    event.button() == Qt.MouseButton.LeftButton
+                    and self._first_person_pointer_release_latched
+                    and not self._first_person_ctrl_interaction_active
+                ):
+                    self._capture_first_person_pointer()
+                else:
+                    self.click_press_position = event.position()
+                    self.setFocus(Qt.FocusReason.MouseFocusReason)
             event.accept()
             return
 
@@ -797,7 +985,10 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         if (
             (
                 self._face_selection_gestures_enabled
-                or not self._item_click_selection_enabled
+                or (
+                    not self._item_click_selection_enabled
+                    and not self._viewport_click_selection_enabled
+                )
                 or self._overlay_selection_enabled
             )
             and event.button() == Qt.MouseButton.LeftButton
@@ -829,16 +1020,19 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             if (
                 not self.is_first_person_pointer_captured
                 and event.button() == Qt.MouseButton.LeftButton
+                and self._first_person_viewport_interaction_is_allowed()
                 and _get_point_distance(
                     self.click_press_position,
                     event.position(),
                 )
                 <= CLICK_SELECTION_TOLERANCE
             ):
-                clicked_items = self._get_clicked_items(event.position())
-                if clicked_items:
-                    self.items_clicked.emit(clicked_items)
-                self.viewport_clicked.emit(event.position())
+                if self._item_click_selection_enabled:
+                    clicked_items = self._get_clicked_items(event.position())
+                    if clicked_items:
+                        self.items_clicked.emit(clicked_items)
+                if self._viewport_click_selection_enabled:
+                    self.viewport_clicked.emit(event.position())
             event.accept()
             return
 
@@ -857,10 +1051,12 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             and _get_point_distance(self.click_press_position, event.position())
             <= CLICK_SELECTION_TOLERANCE
         ):
-            clicked_items = self._get_clicked_items(event.position())
-            if clicked_items:
-                self.items_clicked.emit(clicked_items)
-            self.viewport_clicked.emit(event.position())
+            if self._item_click_selection_enabled:
+                clicked_items = self._get_clicked_items(event.position())
+                if clicked_items:
+                    self.items_clicked.emit(clicked_items)
+            if self._viewport_click_selection_enabled:
+                self.viewport_clicked.emit(event.position())
 
         super().mouseReleaseEvent(event)
 
@@ -951,6 +1147,12 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         super().wheelEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
+        if (
+            event.key() == Qt.Key.Key_Control
+            and self._begin_first_person_ctrl_interaction()
+        ):
+            event.accept()
+            return
         if event.key() == Qt.Key.Key_Delete:
             self.delete_requested.emit()
             event.accept()
@@ -976,13 +1178,23 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             self.rectangle_drawing_cancel_requested.emit()
             event.accept()
             return
-        if self.is_first_person_active and event.key() in _first_person_movement_keys():
+        if (
+            self.is_first_person_active
+            and not self._first_person_ctrl_interaction_active
+            and event.key() in _first_person_movement_keys()
+        ):
             self._pressed_movement_keys.add(event.key())
             event.accept()
             return
         super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
+        if (
+            event.key() == Qt.Key.Key_Control
+            and self._end_first_person_ctrl_interaction()
+        ):
+            event.accept()
+            return
         if event.key() in _first_person_movement_keys():
             self._pressed_movement_keys.discard(event.key())
             event.accept()
@@ -996,10 +1208,43 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self.release_first_person_pointer_capture()
         super().focusOutEvent(event)
 
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        """Remove the application filter before the OpenGL widget closes."""
+
+        self._remove_first_person_ctrl_event_filter()
+        self._first_person_ctrl_interaction_active = False
+        self.release_first_person_pointer_capture()
+        super().closeEvent(event)
+
+    def event(self, event) -> bool:  # type: ignore[override]
+        """Remove the application filter before deferred QObject deletion."""
+
+        if event.type() == QEvent.Type.DeferredDelete:
+            self._remove_first_person_ctrl_event_filter()
+        return super().event(event)
+
     def hideEvent(self, event) -> None:  # type: ignore[override]
+        self._remove_first_person_ctrl_event_filter()
+        self._first_person_ctrl_interaction_active = False
         self.cancel_transient_pointer_interactions()
         self.release_first_person_pointer_capture()
         super().hideEvent(event)
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        self._first_person_application_deactivated = False
+        if (
+            self._first_person_ctrl_interaction_enabled
+            and self.is_first_person_active
+        ):
+            self._install_first_person_ctrl_event_filter()
+            if (
+                QApplication.keyboardModifiers()
+                & Qt.KeyboardModifier.ControlModifier
+            ):
+                self._begin_first_person_ctrl_interaction()
+            else:
+                self._resume_first_person_pointer_capture_if_ready()
 
     def _cancel_face_selection_gesture(self) -> None:
         """Cancel one active face-selection gesture, if present."""
@@ -1014,9 +1259,18 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self._orbit_camera_state = self._capture_camera_state()
         self._navigation_mode = NAVIGATION_MODE_FIRST_PERSON
         self._is_middle_navigation_active = False
+        self._first_person_pointer_release_latched = False
+        if self._first_person_ctrl_interaction_enabled:
+            self._install_first_person_ctrl_event_filter()
+        self._first_person_ctrl_interaction_active = bool(
+            self._first_person_ctrl_interaction_enabled
+            and QApplication.keyboardModifiers()
+            & Qt.KeyboardModifier.ControlModifier
+        )
         self.setFocus(Qt.FocusReason.OtherFocusReason)
         self._sync_view_to_first_person_camera_pose()
-        self._capture_first_person_pointer()
+        if not self._first_person_ctrl_interaction_active:
+            self._capture_first_person_pointer()
         self._movement_timer.start()
         self._update_navigation_tooltip()
         self.navigation_mode_changed.emit(self._navigation_mode)
@@ -1025,19 +1279,26 @@ class SelectableGLViewWidget(gl.GLViewWidget):
     def _capture_first_person_pointer(self) -> None:
         """Capture the pointer for mouse-look while first-person mode is active."""
 
-        if not self.is_first_person_active:
+        if not self.is_first_person_active or self._first_person_pointer_captured:
             return
+        self._first_person_pointer_release_latched = False
         self._first_person_pointer_captured = True
+        self.setFocus(Qt.FocusReason.OtherFocusReason)
         self.setCursor(Qt.CursorShape.BlankCursor)
         if self.isVisible():
             self.grabMouse()
             self._center_pointer()
+        self.first_person_pointer_capture_changed.emit(True)
+        self._update_navigation_tooltip()
 
     def _exit_first_person_mode(self) -> None:
         was_first_person_active = self.is_first_person_active
         if not was_first_person_active:
             return
         self.release_first_person_pointer_capture()
+        self._remove_first_person_ctrl_event_filter()
+        self._first_person_ctrl_interaction_active = False
+        self._first_person_pointer_release_latched = False
         self._navigation_mode = NAVIGATION_MODE_ORBIT
         self._pressed_movement_keys.clear()
         self._movement_timer.stop()
@@ -1137,16 +1398,47 @@ class SelectableGLViewWidget(gl.GLViewWidget):
 
     def _update_navigation_tooltip(self) -> None:
         if self.is_first_person_pointer_captured:
+            if self._first_person_ctrl_interaction_enabled:
+                self.setToolTip(
+                    "First-person controls: Z/Q/S/D to move, R/F to move "
+                    "down/up, move the mouse to look, hold Ctrl temporarily "
+                    "or right-click to keep the Canvas cursor free."
+                )
+                return
             self.setToolTip(
                 "First-person controls: Z/Q/S/D to move, R/F to move down/up, "
                 "move the mouse to look, right-click to release the pointer "
                 "for selection."
             )
             return
-        if self.is_first_person_active:
+        if self.is_first_person_ctrl_interaction_active:
             self.setToolTip(
-                "First-person view: click to select, Z/Q/S/D to move, and use "
-                "the Canvas 3D navigation hotkey to return to orbit controls."
+                "Canvas interaction: keep Ctrl held while selecting walls or "
+                "using the side controls; release Ctrl to resume mouse-look."
+            )
+            return
+        if (
+            self.is_first_person_active
+            and self._first_person_pointer_release_latched
+        ):
+            self.setToolTip(
+                "Canvas interaction: the cursor remains free while the camera "
+                "stays in first-person. Left-click the 3D view to resume "
+                "mouse-look, or use the Canvas 3D navigation hotkey to "
+                "return to orbit controls."
+            )
+            return
+        if self.is_first_person_active:
+            if not self._first_person_ctrl_interaction_enabled:
+                self.setToolTip(
+                    "First-person view: click to select, Z/Q/S/D to move, and "
+                    "use the navigation hotkey to return to orbit controls."
+                )
+                return
+            self.setToolTip(
+                "First-person view: finish the active pointer tool, then "
+                "mouse-look resumes automatically. Use the Canvas 3D "
+                "navigation hotkey to return to orbit controls."
             )
             return
         self.setToolTip(
@@ -1885,7 +2177,6 @@ class _FaceRectangleSelectionResult:
 class GlbViewerWidget(QWidget):
     """Generated-model viewer with Blender orbit and first-person navigation."""
 
-    wall_selected = Signal(int, int, str)
     window_placement_requested = Signal(object)
     window_undo_requested = Signal()
     placed_object_removal_requested = Signal(str)
@@ -1921,7 +2212,6 @@ class GlbViewerWidget(QWidget):
         self.symmetric_preview_mesh_item: gl.GLMeshItem | None = None
         self.textured_surface_items: list[TexturedMeshItem] = []
         self.textured_wall_items: list[gl.GLImageItem] = []
-        self.wall_by_item_id: dict[int, PreviewTexturedWall] = {}
         self.projection_camera_indicator_items: dict[
             str,
             tuple[GLGraphicsItem, ...],
@@ -2056,10 +2346,13 @@ class GlbViewerWidget(QWidget):
 
         self.view = SelectableGLViewWidget()
         self.view.setBackgroundColor((24, 24, 28))
-        self.view.set_item_click_selection_enabled(
+        self.view.set_item_click_selection_enabled(False)
+        self.view.set_viewport_click_selection_enabled(
             self._window_editing_enabled
         )
-        self.view.items_clicked.connect(self._handle_view_items_clicked)
+        self.view.set_first_person_ctrl_interaction_enabled(
+            self._window_editing_enabled
+        )
         self.view.delete_requested.connect(self._handle_view_delete_requested)
         self.view.navigation_mode_changed.connect(self.navigation_mode_changed.emit)
         self.view.first_person_active_changed.connect(
@@ -2093,7 +2386,7 @@ class GlbViewerWidget(QWidget):
             "font-weight: 600; background: transparent;"
         )
         self.first_person_crosshair_label.hide()
-        self.view.first_person_active_changed.connect(
+        self.view.first_person_pointer_capture_changed.connect(
             self.first_person_crosshair_label.setVisible
         )
         layout.addWidget(self.first_person_crosshair_label)
@@ -4705,7 +4998,6 @@ class GlbViewerWidget(QWidget):
         )
         self.view.addItem(image_item)
         self.textured_wall_items.append(image_item)
-        self.wall_by_item_id[id(image_item)] = textured_wall
 
     def _apply_render_display_options(self) -> None:
         """Apply texture and wireframe state without requiring an OpenGL paint."""
@@ -4769,19 +5061,6 @@ class GlbViewerWidget(QWidget):
         if hasattr(self, "view"):
             self.view.update()
 
-    def _handle_view_items_clicked(self, clicked_items: list[object]) -> None:
-        for clicked_item in clicked_items:
-            textured_wall = self.wall_by_item_id.get(id(clicked_item))
-            if textured_wall is None:
-                continue
-
-            self.wall_selected.emit(
-                textured_wall.level_index,
-                textured_wall.room_index,
-                textured_wall.wall_key,
-            )
-            return
-
     def _set_default_camera(self) -> None:
         self.view.opts["center"] = QVector3D(0.0, 0.0, 0.0)
         self.view.setCameraPosition(distance=18.0, elevation=28.0, azimuth=-40.0)
@@ -4838,7 +5117,6 @@ class GlbViewerWidget(QWidget):
         self._remove_transform_gizmo_items()
         self.textured_surface_items = []
         self.textured_wall_items = []
-        self.wall_by_item_id = {}
         self.projection_camera_indicator_items = {}
         self.projection_camera_indicator_geometries = {}
         self._sync_projection_camera_input_state()

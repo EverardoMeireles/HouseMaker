@@ -833,17 +833,44 @@ class SurfaceMaterialOrdinaryViewerTests(unittest.TestCase):
             self.assertTrue(
                 viewer.mesh_item._GLGraphicsItem__glOpts[GL.GL_CULL_FACE]
             )
+            assigned_wall_keys = {
+                (
+                    surface.level_index,
+                    surface.room_index,
+                    surface.wall_key,
+                )
+                for surface in model.preview_textured_surfaces
+                if surface.surface_type == "wall"
+            }
+            rendered_legacy_previews = [
+                wall
+                for wall in model.preview_textured_walls
+                if (
+                    wall.level_index,
+                    wall.room_index,
+                    wall.wall_key,
+                )
+                not in assigned_wall_keys
+            ]
             shared_legacy_items = [
                 item
-                for item in viewer.textured_wall_items
-                if viewer.wall_by_item_id[id(item)].wall_key == shared_wall_key
+                for item, wall in zip(
+                    viewer.textured_wall_items,
+                    rendered_legacy_previews,
+                    strict=True,
+                )
+                if wall.wall_key == shared_wall_key
             ]
             self.assertEqual(len(shared_legacy_items), 3)
+            shared_legacy_previews = [
+                wall
+                for wall in model.preview_textured_walls
+                if wall.wall_key == shared_wall_key
+                and wall.room_index == 1
+            ]
+            self.assertEqual(len(shared_legacy_previews), 3)
             self.assertEqual(
-                {
-                    viewer.wall_by_item_id[id(item)].room_index
-                    for item in shared_legacy_items
-                },
+                {wall.room_index for wall in shared_legacy_previews},
                 {1},
             )
             legacy_plane_x_values = {
@@ -907,8 +934,14 @@ class SurfaceMaterialOrdinaryViewerTests(unittest.TestCase):
 
             self.assertEqual(len(viewer.textured_surface_items), 1)
             remaining_legacy_wall_keys = [
-                wall.wall_key for wall in viewer.wall_by_item_id.values()
+                wall.wall_key
+                for wall in model.preview_textured_walls
+                if wall.wall_key != assigned_wall_key
             ]
+            self.assertEqual(
+                len(viewer.textured_wall_items),
+                len(remaining_legacy_wall_keys),
+            )
             self.assertNotIn(assigned_wall_key, remaining_legacy_wall_keys)
             self.assertEqual(len(remaining_legacy_wall_keys), 3)
             self.assertEqual(

@@ -139,7 +139,7 @@ class CanvasFirstPersonSelectionMainTests(unittest.TestCase):
         )
         return wall, ray
 
-    def test_released_first_person_view_selects_and_arms_a_wall_window(
+    def test_ctrl_first_person_view_selects_and_arms_a_wall_window(
         self,
     ) -> None:
         wall, ray = self._install_wall_target()
@@ -157,12 +157,7 @@ class CanvasFirstPersonSelectionMainTests(unittest.TestCase):
         self.assertNotEqual(first_person_state, orbit_state)
 
         click_position = QPoint(120, 90)
-        QTest.mouseClick(
-            viewer.view,
-            Qt.MouseButton.RightButton,
-            Qt.KeyboardModifier.NoModifier,
-            click_position,
-        )
+        QTest.keyPress(viewer.view, Qt.Key.Key_Control)
 
         self.assertFalse(viewer.is_first_person_pointer_captured)
         self.assertEqual(
@@ -188,6 +183,16 @@ class CanvasFirstPersonSelectionMainTests(unittest.TestCase):
         self.assertEqual(viewer.get_selected_wall_surface_id(), wall.surface_id)
         assert viewer.add_window_button is not None
         self.assertTrue(viewer.add_window_button.isEnabled())
+        QTest.keyRelease(viewer.view, Qt.Key.Key_Control)
+
+        self.assertTrue(viewer.is_first_person_pointer_captured)
+        QTest.mouseClick(viewer.view, Qt.MouseButton.RightButton)
+
+        self.assertFalse(viewer.is_first_person_pointer_captured)
+        self.assertEqual(
+            viewer.get_navigation_mode(),
+            NAVIGATION_MODE_FIRST_PERSON,
+        )
         viewer.add_window_button.click()
 
         self.assertTrue(viewer.is_window_placement_active())
@@ -197,6 +202,16 @@ class CanvasFirstPersonSelectionMainTests(unittest.TestCase):
             NAVIGATION_MODE_FIRST_PERSON,
         )
         self.assertEqual(_camera_state(viewer.view), first_person_state)
+
+        viewer.cancel_window_placement()
+        QTest.mouseClick(viewer.view, Qt.MouseButton.LeftButton)
+
+        self.assertFalse(viewer.is_window_placement_active())
+        self.assertTrue(viewer.is_first_person_pointer_captured)
+        self.assertEqual(
+            viewer.get_navigation_mode(),
+            NAVIGATION_MODE_FIRST_PERSON,
+        )
 
         QTest.keyClick(viewer.view, Qt.Key.Key_N)
         _qt_application.processEvents()
@@ -237,12 +252,7 @@ class CanvasFirstPersonSelectionMainTests(unittest.TestCase):
         )
 
         click_position = QPoint(160, 110)
-        QTest.mouseClick(
-            viewer.view,
-            Qt.MouseButton.RightButton,
-            Qt.KeyboardModifier.NoModifier,
-            click_position,
-        )
+        QTest.keyPress(viewer.view, Qt.Key.Key_Control)
         with patch.object(viewer.view, "build_camera_ray", return_value=ray):
             QTest.mouseClick(
                 viewer.view,
@@ -250,9 +260,10 @@ class CanvasFirstPersonSelectionMainTests(unittest.TestCase):
                 Qt.KeyboardModifier.NoModifier,
                 click_position,
             )
+        QTest.keyRelease(viewer.view, Qt.Key.Key_Control)
 
         self.assertIs(host.viewer, viewer)
-        self.assertFalse(viewer.is_first_person_pointer_captured)
+        self.assertTrue(viewer.is_first_person_pointer_captured)
         self.assertEqual(
             viewer.get_navigation_mode(),
             NAVIGATION_MODE_FIRST_PERSON,
