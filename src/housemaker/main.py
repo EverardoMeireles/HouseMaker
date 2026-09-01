@@ -120,7 +120,7 @@ from housemaker.level_coordinates import (
 )
 from housemaker.project_io import ProjectData, load_project, save_project
 from housemaker.settings_widget import (
-    DEFAULT_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
+    DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS,
     SettingsWidget,
     resolve_fullscreen_3d_viewer_screen,
 )
@@ -231,17 +231,17 @@ class BlueprintWorkspace(QWidget):
             None
         )
         self._viewer_preview_dependency_signature_revision = -1
-        # Doorway dimensions remain live in project data while this separate
-        # snapshot controls which openings have reached the expensive 3D mesh.
+        # Doorway edits remain live in project data while this separate
+        # snapshot controls which edits have reached the expensive 3D mesh.
         self._viewer_doorways_by_level_index: dict[
             int,
             tuple[DoorwayData, ...],
         ] = {}
         self._reset_viewer_doorway_snapshots()
         self._doorway_mesh_update_delay_seconds = (
-            DEFAULT_DOORWAY_MESH_UPDATE_DELAY_SECONDS
+            DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS
         )
-        self._is_doorway_dimension_drag_active = False
+        self._is_doorway_move_drag_active = False
         self._pending_doorway_mesh_level_index: int | None = None
         self._doorway_outline_commit_revision: int | None = None
         self._doorway_mesh_update_timer = QTimer(self)
@@ -388,7 +388,7 @@ class BlueprintWorkspace(QWidget):
         )
         generation_settings = self.settings_widget.get_settings()
         self._set_doorway_mesh_update_delay_seconds(
-            generation_settings.doorway_mesh_update_delay_seconds
+            generation_settings.mesh_edit_update_delay_seconds
         )
         self._set_canvas_3d_navigation_shortcut(
             generation_settings.canvas_3d_navigation_toggle_hotkey
@@ -819,11 +819,11 @@ class BlueprintWorkspace(QWidget):
         self.canvas.doorway_dimension_preview_changed.connect(
             self._handle_doorway_dimension_preview_changed
         )
-        self.canvas.doorway_dimension_drag_started.connect(
-            self._handle_doorway_dimension_drag_started
+        self.canvas.doorway_move_drag_started.connect(
+            self._handle_doorway_move_drag_started
         )
-        self.canvas.doorway_dimension_drag_finished.connect(
-            self._handle_doorway_dimension_drag_finished
+        self.canvas.doorway_move_drag_finished.connect(
+            self._handle_doorway_move_drag_finished
         )
         self.canvas.selected_doorway_changed.connect(
             self._handle_canvas_doorway_selection_changed
@@ -967,6 +967,16 @@ class BlueprintWorkspace(QWidget):
         except (TypeError, ValueError) as error:
             self.viewer.set_window_tools_status(f"Window not added: {error}")
             return
+        added_window = self._find_canvas_window(window.window_id)
+        if added_window is None:
+            self._rollback_canvas_window(window.window_id)
+            self.canvas.update()
+            self.viewer.set_window_tools_status(
+                "Window not added because its owning level could not be found."
+            )
+            return
+        window_level, _, _ = added_window
+        self._refresh_canvas_windows_for_level(window_level)
 
         try:
             validated_build = self._build_model_with_stable_dependencies(
@@ -974,10 +984,12 @@ class BlueprintWorkspace(QWidget):
             )
         except Exception as error:
             self._rollback_canvas_window(window.window_id)
+            self._refresh_canvas_windows_for_level(window_level)
             self.viewer.set_window_tools_status(f"Window not added: {error}")
             return
         if validated_build is None:
             self._rollback_canvas_window(window.window_id)
+            self._refresh_canvas_windows_for_level(window_level)
             self.viewer.set_window_tools_status(
                 "Window not added because the updated model could not be built."
             )
@@ -991,6 +1003,7 @@ class BlueprintWorkspace(QWidget):
             )
         except Exception as error:
             self._rollback_canvas_window(window.window_id)
+            self._refresh_canvas_windows_for_level(window_level)
             self._restore_canvas_window_preview_after_rollback()
             self.viewer.set_window_tools_status(f"Window not added: {error}")
             return
@@ -1014,6 +1027,7 @@ class BlueprintWorkspace(QWidget):
             self.viewer.set_window_tools_status("No added window to undo.")
             return
         level, window_index, window = removed
+        self._refresh_canvas_windows_for_level(level)
 
         try:
             validated_build = self._build_model_with_stable_dependencies(
@@ -1021,6 +1035,7 @@ class BlueprintWorkspace(QWidget):
             )
         except Exception as error:
             level.windows.insert(window_index, window)
+            self._refresh_canvas_windows_for_level(level)
             self._sync_canvas_window_undo_availability()
             self.viewer.set_window_tools_status(
                 f"Window could not be undone: {error}"
@@ -1028,6 +1043,7 @@ class BlueprintWorkspace(QWidget):
             return
         if validated_build is None:
             level.windows.insert(window_index, window)
+            self._refresh_canvas_windows_for_level(level)
             self._sync_canvas_window_undo_availability()
             self.viewer.set_window_tools_status(
                 "Window could not be undone because the model could not be built."
@@ -1042,6 +1058,7 @@ class BlueprintWorkspace(QWidget):
             )
         except Exception as error:
             level.windows.insert(window_index, window)
+            self._refresh_canvas_windows_for_level(level)
             self._restore_canvas_window_preview_after_rollback()
             self._sync_canvas_window_undo_availability()
             self.viewer.set_window_tools_status(
@@ -1115,6 +1132,16 @@ class BlueprintWorkspace(QWidget):
                 if window.window_id == normalized_id:
                     return level, index, window
         return None
+
+    def _refresh_canvas_windows_for_level(self, level: LevelData) -> None:
+        """Repaint 2D windows after one structural transaction."""
+
+        if not 0 <= self.current_level_index < len(self.levels):
+            return
+        if level.index != self.levels[self.current_level_index].index:
+            return
+        self.canvas.windows = level.windows
+        self.canvas.update()
 
     def _remove_canvas_window(
         self,
@@ -2844,7 +2871,7 @@ class BlueprintWorkspace(QWidget):
 
         normalized_delay = float(delay_seconds)
         if normalized_delay <= 0.0:
-            raise ValueError("Doorway mesh update delay must be positive.")
+            raise ValueError("Mesh edit update delay must be positive.")
         if normalized_delay == self._doorway_mesh_update_delay_seconds:
             return
 
@@ -2860,7 +2887,7 @@ class BlueprintWorkspace(QWidget):
         self,
         clear_outline: bool = True,
     ) -> None:
-        """Cancel transient doorway work and optionally remove its outline."""
+        """Cancel transient mesh-edit work and optionally remove its outline."""
 
         self._doorway_mesh_update_timer.stop()
         self._pending_doorway_mesh_level_index = None
@@ -2883,7 +2910,7 @@ class BlueprintWorkspace(QWidget):
         self.viewer.set_doorway_preview_outline(None)
 
     def _commit_pending_doorway_mesh_update(self) -> None:
-        """Commit the latest stable doorway dimensions to the 3D mesh cache."""
+        """Commit the latest stable doorway edit to the 3D mesh cache."""
 
         self._doorway_mesh_update_timer.stop()
         level_index = self._pending_doorway_mesh_level_index
@@ -3545,7 +3572,7 @@ class BlueprintWorkspace(QWidget):
     def _handle_doorways_changed(self) -> None:
         """Commit structural doorway changes without a debounce delay."""
 
-        self._is_doorway_dimension_drag_active = False
+        self._is_doorway_move_drag_active = False
         self.current_level.doorways = self.canvas.doorways
         next_snapshot = self._copy_doorways(self.current_level.doorways)
         snapshot_changed = bool(
@@ -3562,23 +3589,26 @@ class BlueprintWorkspace(QWidget):
         )
         self._schedule_viewer_preview_refresh()
 
-    def _handle_doorway_dimension_drag_started(self) -> None:
-        """Pause doorway stabilization while a resize handle remains held."""
+    def _handle_doorway_move_drag_started(self) -> None:
+        """Hold the old wall mesh while a doorway is moving in the Canvas."""
 
-        self._is_doorway_dimension_drag_active = True
+        self._is_doorway_move_drag_active = True
         self._doorway_mesh_update_timer.stop()
 
-    def _handle_doorway_dimension_drag_finished(self) -> None:
-        """Begin a fresh stabilization interval after the handle is released."""
+    def _handle_doorway_move_drag_finished(self, changed: bool) -> None:
+        """Commit a moved doorway immediately when the mouse is released."""
 
-        self._is_doorway_dimension_drag_active = False
+        self._is_doorway_move_drag_active = False
+        if changed:
+            if self._pending_doorway_mesh_level_index is None:
+                self._handle_doorway_dimension_preview_changed()
+            self._commit_pending_doorway_mesh_update()
+            return
         if self._pending_doorway_mesh_level_index is not None:
             self._doorway_mesh_update_timer.start()
-            return
-        self._handle_doorway_dimension_preview_changed()
 
     def _handle_doorway_dimension_preview_changed(self) -> None:
-        """Show live dimensions as an outline and debounce the wall rebuild."""
+        """Show a live doorway outline and debounce an arch mesh rebuild."""
 
         self.current_level.doorways = self.canvas.doorways
         level = self.current_level
@@ -3628,7 +3658,7 @@ class BlueprintWorkspace(QWidget):
             self.viewer.set_doorway_preview_outline(outline_positions)
 
         self._pending_doorway_mesh_level_index = level.index
-        if self._is_doorway_dimension_drag_active:
+        if self._is_doorway_move_drag_active:
             self._doorway_mesh_update_timer.stop()
         else:
             self._doorway_mesh_update_timer.start()
@@ -3831,7 +3861,7 @@ class BlueprintWorkspace(QWidget):
     def _handle_generation_settings_changed(self) -> None:
         settings = self.settings_widget.get_settings()
         self._set_doorway_mesh_update_delay_seconds(
-            settings.doorway_mesh_update_delay_seconds
+            settings.mesh_edit_update_delay_seconds
         )
         self._set_canvas_3d_navigation_shortcut(
             settings.canvas_3d_navigation_toggle_hotkey
@@ -3904,7 +3934,7 @@ class BlueprintWorkspace(QWidget):
                 "loading another project."
             )
 
-        self._is_doorway_dimension_drag_active = False
+        self._is_doorway_move_drag_active = False
         self._cancel_pending_doorway_mesh_update(clear_outline=True)
         self.canvas.cancel_stair_placement()
         self._canvas_window_undo_ids.clear()
@@ -3961,6 +3991,7 @@ class BlueprintWorkspace(QWidget):
             vertex_data=self.current_level.vertex_data,
             rooms=self.current_level.rooms,
             doorways=self.current_level.doorways,
+            windows=self.current_level.windows,
             floor_contour_vertex_ids=(
                 self.current_level.floor_contour_vertex_ids
             ),
@@ -3981,6 +4012,7 @@ class BlueprintWorkspace(QWidget):
             vertex_data=self.current_level.vertex_data,
             rooms=self.current_level.rooms,
             doorways=self.current_level.doorways,
+            windows=self.current_level.windows,
             floor_contour_vertex_ids=(
                 self.current_level.floor_contour_vertex_ids
             ),

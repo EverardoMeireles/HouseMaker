@@ -44,7 +44,8 @@ USE_UV_RAYCAST_FOR_OBJECT_GENERATION_SETTING_KEY = (
 MINIMUM_FACE_VISIBILITY_PERCENTAGE_SETTING_KEY = (
     "generation/minimum_face_visibility_percentage"
 )
-DOORWAY_MESH_UPDATE_DELAY_SECONDS_SETTING_KEY = (
+MESH_EDIT_UPDATE_DELAY_SECONDS_SETTING_KEY = (
+    # Keep the original persisted key so existing preferences remain valid.
     "canvas/doorway_mesh_update_delay_seconds"
 )
 DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY = "N"
@@ -53,10 +54,10 @@ DEFAULT_USE_UV_RAYCAST_FOR_OBJECT_GENERATION = False
 DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE = 5
 MINIMUM_FACE_VISIBILITY_PERCENTAGE = 0
 MAXIMUM_FACE_VISIBILITY_PERCENTAGE = 100
-DEFAULT_DOORWAY_MESH_UPDATE_DELAY_SECONDS = 1.0
-MIN_DOORWAY_MESH_UPDATE_DELAY_SECONDS = 0.1
-MAX_DOORWAY_MESH_UPDATE_DELAY_SECONDS = 10.0
-DOORWAY_MESH_UPDATE_DELAY_STEP_SECONDS = 0.1
+DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS = 1.0
+MIN_MESH_EDIT_UPDATE_DELAY_SECONDS = 0.1
+MAX_MESH_EDIT_UPDATE_DELAY_SECONDS = 10.0
+MESH_EDIT_UPDATE_DELAY_STEP_SECONDS = 0.1
 MESHY_SMART_TOPOLOGY_MIN_TARGET_POLYCOUNT = 100
 MESHY_SMART_TOPOLOGY_MAX_TARGET_POLYCOUNT = 15_000
 DEFAULT_MESHY_TARGET_POLYCOUNT = 2_000
@@ -119,8 +120,8 @@ class GenerationServiceSettings:
     )
     unused_face_removal: bool = DEFAULT_UNUSED_FACE_REMOVAL
     jobs_window_screen_id: str | None = None
-    doorway_mesh_update_delay_seconds: float = (
-        DEFAULT_DOORWAY_MESH_UPDATE_DELAY_SECONDS
+    mesh_edit_update_delay_seconds: float = (
+        DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS
     )
     use_uv_raycast_for_object_generation: bool = (
         DEFAULT_USE_UV_RAYCAST_FOR_OBJECT_GENERATION
@@ -209,21 +210,21 @@ class GenerationServiceSettings:
             "canvas_3d_navigation_toggle_hotkey",
             normalized_hotkey,
         )
-        normalized_doorway_delay = (
-            _normalize_doorway_mesh_update_delay_seconds(
-                self.doorway_mesh_update_delay_seconds
+        normalized_mesh_edit_delay = (
+            _normalize_mesh_edit_update_delay_seconds(
+                self.mesh_edit_update_delay_seconds
             )
         )
-        if normalized_doorway_delay is None:
+        if normalized_mesh_edit_delay is None:
             raise ValueError(
-                "Doorway mesh update delay must be between "
-                f"{MIN_DOORWAY_MESH_UPDATE_DELAY_SECONDS} and "
-                f"{MAX_DOORWAY_MESH_UPDATE_DELAY_SECONDS} seconds."
+                "Mesh edit update delay must be between "
+                f"{MIN_MESH_EDIT_UPDATE_DELAY_SECONDS} and "
+                f"{MAX_MESH_EDIT_UPDATE_DELAY_SECONDS} seconds."
             )
         object.__setattr__(
             self,
-            "doorway_mesh_update_delay_seconds",
-            normalized_doorway_delay,
+            "mesh_edit_update_delay_seconds",
+            normalized_mesh_edit_delay,
         )
 
     @property
@@ -308,8 +309,8 @@ class SettingsWidget(QWidget):
             minimum_face_visibility_percentage=(
                 self.minimum_face_visibility_percentage_spinbox.value()
             ),
-            doorway_mesh_update_delay_seconds=(
-                self.doorway_mesh_update_delay_spinbox.value()
+            mesh_edit_update_delay_seconds=(
+                self.mesh_edit_update_delay_spinbox.value()
             ),
         )
 
@@ -435,30 +436,30 @@ class SettingsWidget(QWidget):
             self.canvas_3d_navigation_toggle_hotkey_edit,
         )
 
-        self.doorway_mesh_update_delay_spinbox = QDoubleSpinBox()
-        self.doorway_mesh_update_delay_spinbox.setObjectName(
-            "doorway_mesh_update_delay_spinbox"
+        self.mesh_edit_update_delay_spinbox = QDoubleSpinBox()
+        self.mesh_edit_update_delay_spinbox.setObjectName(
+            "mesh_edit_update_delay_spinbox"
         )
-        self.doorway_mesh_update_delay_spinbox.setRange(
-            MIN_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
-            MAX_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
+        self.mesh_edit_update_delay_spinbox.setRange(
+            MIN_MESH_EDIT_UPDATE_DELAY_SECONDS,
+            MAX_MESH_EDIT_UPDATE_DELAY_SECONDS,
         )
-        self.doorway_mesh_update_delay_spinbox.setDecimals(1)
-        self.doorway_mesh_update_delay_spinbox.setSingleStep(
-            DOORWAY_MESH_UPDATE_DELAY_STEP_SECONDS
+        self.mesh_edit_update_delay_spinbox.setDecimals(1)
+        self.mesh_edit_update_delay_spinbox.setSingleStep(
+            MESH_EDIT_UPDATE_DELAY_STEP_SECONDS
         )
-        self.doorway_mesh_update_delay_spinbox.setSuffix(" s")
-        self.doorway_mesh_update_delay_spinbox.setKeyboardTracking(False)
-        self.doorway_mesh_update_delay_spinbox.setToolTip(
-            "Wait this long after the last doorway size change before "
+        self.mesh_edit_update_delay_spinbox.setSuffix(" s")
+        self.mesh_edit_update_delay_spinbox.setKeyboardTracking(False)
+        self.mesh_edit_update_delay_spinbox.setToolTip(
+            "Wait this long after changing a doorway's arch settings before "
             "rebuilding the Canvas 3D wall mesh."
         )
-        self.doorway_mesh_update_delay_spinbox.valueChanged.connect(
-            self._handle_doorway_mesh_update_delay_changed
+        self.mesh_edit_update_delay_spinbox.valueChanged.connect(
+            self._handle_mesh_edit_update_delay_changed
         )
         form_layout.addRow(
-            "Doorway mesh update delay",
-            self.doorway_mesh_update_delay_spinbox,
+            "Mesh edit update delay",
+            self.mesh_edit_update_delay_spinbox,
         )
 
         self.unused_face_removal_checkbox = QCheckBox()
@@ -591,8 +592,8 @@ class SettingsWidget(QWidget):
                 QKeySequence.SequenceFormat.PortableText,
             )
         )
-        self.doorway_mesh_update_delay_spinbox.setValue(
-            read_doorway_mesh_update_delay_seconds(
+        self.mesh_edit_update_delay_spinbox.setValue(
+            read_mesh_edit_update_delay_seconds(
                 self._application_settings
             )
         )
@@ -790,11 +791,11 @@ class SettingsWidget(QWidget):
         )
         self.settings_changed.emit()
 
-    def _handle_doorway_mesh_update_delay_changed(self, value: float) -> None:
+    def _handle_mesh_edit_update_delay_changed(self, value: float) -> None:
         if self._is_loading_settings:
             return
         self._application_settings.set(
-            DOORWAY_MESH_UPDATE_DELAY_SECONDS_SETTING_KEY,
+            MESH_EDIT_UPDATE_DELAY_SECONDS_SETTING_KEY,
             float(value),
         )
         self.settings_changed.emit()
@@ -938,24 +939,24 @@ def read_minimum_face_visibility_percentage(
     return int(value)
 
 
-# ### Doorway preview setting helpers ###
-def read_doorway_mesh_update_delay_seconds(
+# ### Mesh edit preview setting helpers ###
+def read_mesh_edit_update_delay_seconds(
     application_settings: ApplicationSettingsStore,
 ) -> float:
-    """Read the doorway rebuild debounce delay with a safe default."""
+    """Read the Canvas mesh-edit debounce delay with a safe default."""
 
-    normalized_delay = _normalize_doorway_mesh_update_delay_seconds(
+    normalized_delay = _normalize_mesh_edit_update_delay_seconds(
         application_settings.get(
-            DOORWAY_MESH_UPDATE_DELAY_SECONDS_SETTING_KEY,
-            DEFAULT_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
+            MESH_EDIT_UPDATE_DELAY_SECONDS_SETTING_KEY,
+            DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS,
         )
     )
     if normalized_delay is None:
-        return DEFAULT_DOORWAY_MESH_UPDATE_DELAY_SECONDS
+        return DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS
     return normalized_delay
 
 
-def _normalize_doorway_mesh_update_delay_seconds(
+def _normalize_mesh_edit_update_delay_seconds(
     value: object,
 ) -> float | None:
     if isinstance(value, bool) or not isinstance(value, int | float):
@@ -964,9 +965,9 @@ def _normalize_doorway_mesh_update_delay_seconds(
     if not math.isfinite(normalized_value):
         return None
     if not (
-        MIN_DOORWAY_MESH_UPDATE_DELAY_SECONDS
+        MIN_MESH_EDIT_UPDATE_DELAY_SECONDS
         <= normalized_value
-        <= MAX_DOORWAY_MESH_UPDATE_DELAY_SECONDS
+        <= MAX_MESH_EDIT_UPDATE_DELAY_SECONDS
     ):
         return None
     return normalized_value

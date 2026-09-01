@@ -18,19 +18,19 @@ from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.settings_widget import (
     CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY_SETTING_KEY,
     DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY,
-    DEFAULT_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
     DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE,
+    DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS,
     DEFAULT_MESHY_TARGET_POLYCOUNT,
-    DOORWAY_MESH_UPDATE_DELAY_SECONDS_SETTING_KEY,
-    DOORWAY_MESH_UPDATE_DELAY_STEP_SECONDS,
     FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY,
     MAXIMUM_FACE_VISIBILITY_PERCENTAGE,
-    MAX_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
+    MAX_MESH_EDIT_UPDATE_DELAY_SECONDS,
+    MESH_EDIT_UPDATE_DELAY_SECONDS_SETTING_KEY,
+    MESH_EDIT_UPDATE_DELAY_STEP_SECONDS,
     MESHY_API_KEY_ENVIRONMENT_VARIABLE,
     MESHY_API_KEY_SETTING_KEY,
     MINIMUM_FACE_VISIBILITY_PERCENTAGE,
     MINIMUM_FACE_VISIBILITY_PERCENTAGE_SETTING_KEY,
-    MIN_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
+    MIN_MESH_EDIT_UPDATE_DELAY_SECONDS,
     OPENAI_API_KEY_ENVIRONMENT_VARIABLE,
     OPENAI_API_KEY_SETTING_KEY,
     UNUSED_FACE_REMOVAL_SETTING_KEY,
@@ -42,7 +42,7 @@ from housemaker.settings_widget import (
     SettingsWidget,
     fullscreen_3d_viewer_screen_id,
     read_canvas_3d_navigation_toggle_hotkey,
-    read_doorway_mesh_update_delay_seconds,
+    read_mesh_edit_update_delay_seconds,
     read_minimum_face_visibility_percentage,
     read_unused_face_removal,
     read_use_uv_raycast_for_object_generation,
@@ -84,7 +84,7 @@ class SettingsWidgetTests(unittest.TestCase):
                 )
             )
             self.assertTrue(
-                hasattr(widget, "doorway_mesh_update_delay_spinbox")
+                hasattr(widget, "mesh_edit_update_delay_spinbox")
             )
             self.assertFalse(hasattr(widget, "surface_texture_provider_combo"))
             self.assertTrue(hasattr(widget, "unused_face_removal_checkbox"))
@@ -280,7 +280,7 @@ class SettingsWidgetTests(unittest.TestCase):
         )
 
         self.assertEqual(settings.jobs_window_screen_id, "jobs-screen")
-        self.assertEqual(settings.doorway_mesh_update_delay_seconds, 1.25)
+        self.assertEqual(settings.mesh_edit_update_delay_seconds, 1.25)
         self.assertFalse(settings.use_uv_raycast_for_object_generation)
         self.assertEqual(
             settings.minimum_face_visibility_percentage,
@@ -388,7 +388,7 @@ class SettingsWidgetTests(unittest.TestCase):
                     value,
                 )
 
-    def test_doorway_mesh_update_delay_persists_and_emits_changes(self) -> None:
+    def test_mesh_edit_update_delay_persists_and_emits_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             application_settings = _build_test_settings(temporary_directory)
             widget = SettingsWidget(
@@ -401,38 +401,54 @@ class SettingsWidgetTests(unittest.TestCase):
             )
 
             self.assertEqual(
-                widget.get_settings().doorway_mesh_update_delay_seconds,
-                DEFAULT_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
+                MESH_EDIT_UPDATE_DELAY_SECONDS_SETTING_KEY,
+                "canvas/doorway_mesh_update_delay_seconds",
+            )
+            self.assertEqual(
+                widget.get_settings().mesh_edit_update_delay_seconds,
+                DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS,
             )
             self.assertFalse(
-                widget.doorway_mesh_update_delay_spinbox.keyboardTracking()
+                widget.mesh_edit_update_delay_spinbox.keyboardTracking()
             )
             self.assertEqual(
-                widget.doorway_mesh_update_delay_spinbox.minimum(),
-                MIN_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
+                widget.mesh_edit_update_delay_spinbox.minimum(),
+                MIN_MESH_EDIT_UPDATE_DELAY_SECONDS,
             )
             self.assertEqual(
-                widget.doorway_mesh_update_delay_spinbox.maximum(),
-                MAX_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
+                widget.mesh_edit_update_delay_spinbox.maximum(),
+                MAX_MESH_EDIT_UPDATE_DELAY_SECONDS,
             )
             self.assertEqual(
-                widget.doorway_mesh_update_delay_spinbox.singleStep(),
-                DOORWAY_MESH_UPDATE_DELAY_STEP_SECONDS,
+                widget.mesh_edit_update_delay_spinbox.singleStep(),
+                MESH_EDIT_UPDATE_DELAY_STEP_SECONDS,
             )
             self.assertEqual(
-                widget.doorway_mesh_update_delay_spinbox.suffix(),
+                widget.mesh_edit_update_delay_spinbox.suffix(),
                 " s",
             )
-            widget.doorway_mesh_update_delay_spinbox.setValue(2.4)
+            self.assertIn(
+                "doorway's arch settings",
+                widget.mesh_edit_update_delay_spinbox.toolTip(),
+            )
+            form_layout = widget.layout().itemAt(1).layout()
+            self.assertIsNotNone(form_layout)
+            self.assertEqual(
+                form_layout.labelForField(
+                    widget.mesh_edit_update_delay_spinbox
+                ).text(),
+                "Mesh edit update delay",
+            )
+            widget.mesh_edit_update_delay_spinbox.setValue(2.4)
 
             self.assertEqual(
                 application_settings.get(
-                    DOORWAY_MESH_UPDATE_DELAY_SECONDS_SETTING_KEY
+                    MESH_EDIT_UPDATE_DELAY_SECONDS_SETTING_KEY
                 ),
                 2.4,
             )
             self.assertEqual(
-                widget.get_settings().doorway_mesh_update_delay_seconds,
+                widget.get_settings().mesh_edit_update_delay_seconds,
                 2.4,
             )
             self.assertEqual(emitted_changes, [True])
@@ -442,28 +458,28 @@ class SettingsWidgetTests(unittest.TestCase):
                 environment={},
             )
             self.assertEqual(
-                restored.get_settings().doorway_mesh_update_delay_seconds,
+                restored.get_settings().mesh_edit_update_delay_seconds,
                 2.4,
             )
 
-    def test_doorway_mesh_update_delay_rejects_malformed_values(self) -> None:
+    def test_mesh_edit_update_delay_rejects_malformed_values(self) -> None:
         invalid_values: tuple[object, ...] = (
             True,
             "1.0",
             float("nan"),
             float("inf"),
             float("-inf"),
-            MIN_DOORWAY_MESH_UPDATE_DELAY_SECONDS - 0.01,
-            MAX_DOORWAY_MESH_UPDATE_DELAY_SECONDS + 0.01,
+            MIN_MESH_EDIT_UPDATE_DELAY_SECONDS - 0.01,
+            MAX_MESH_EDIT_UPDATE_DELAY_SECONDS + 0.01,
         )
         for value in invalid_values:
             with self.subTest(model_value=value):
                 with self.assertRaisesRegex(
                     ValueError,
-                    "Doorway mesh update delay",
+                    "Mesh edit update delay",
                 ):
                     GenerationServiceSettings(
-                        doorway_mesh_update_delay_seconds=(
+                        mesh_edit_update_delay_seconds=(
                             value  # type: ignore[arg-type]
                         )
                     )
@@ -473,32 +489,32 @@ class SettingsWidgetTests(unittest.TestCase):
             for value in invalid_values:
                 with self.subTest(persisted_value=value):
                     application_settings.set(
-                        DOORWAY_MESH_UPDATE_DELAY_SECONDS_SETTING_KEY,
+                        MESH_EDIT_UPDATE_DELAY_SECONDS_SETTING_KEY,
                         value,
                     )
                     self.assertEqual(
-                        read_doorway_mesh_update_delay_seconds(
+                        read_mesh_edit_update_delay_seconds(
                             application_settings
                         ),
-                        DEFAULT_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
+                        DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS,
                     )
 
-    def test_doorway_mesh_update_delay_accepts_range_boundaries(self) -> None:
+    def test_mesh_edit_update_delay_accepts_range_boundaries(self) -> None:
         for value in (
-            MIN_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
-            MAX_DOORWAY_MESH_UPDATE_DELAY_SECONDS,
+            MIN_MESH_EDIT_UPDATE_DELAY_SECONDS,
+            MAX_MESH_EDIT_UPDATE_DELAY_SECONDS,
         ):
             with self.subTest(value=value):
                 self.assertEqual(
                     GenerationServiceSettings(
-                        doorway_mesh_update_delay_seconds=value
-                    ).doorway_mesh_update_delay_seconds,
+                        mesh_edit_update_delay_seconds=value
+                    ).mesh_edit_update_delay_seconds,
                     value,
                 )
         self.assertIsInstance(
             GenerationServiceSettings(
-                doorway_mesh_update_delay_seconds=1
-            ).doorway_mesh_update_delay_seconds,
+                mesh_edit_update_delay_seconds=1
+            ).mesh_edit_update_delay_seconds,
             float,
         )
 

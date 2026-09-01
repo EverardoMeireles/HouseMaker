@@ -29,7 +29,7 @@ from housemaker.models import (
     DoorwayData,
 )
 from housemaker.settings_widget import (
-    DOORWAY_MESH_UPDATE_DELAY_SECONDS_SETTING_KEY,
+    MESH_EDIT_UPDATE_DELAY_SECONDS_SETTING_KEY,
 )
 
 
@@ -76,7 +76,7 @@ class DoorwayArchMainIntegrationTests(unittest.TestCase):
             Path(self._temporary_directory.name) / "settings.json"
         )
         application_settings.set(
-            DOORWAY_MESH_UPDATE_DELAY_SECONDS_SETTING_KEY,
+            MESH_EDIT_UPDATE_DELAY_SECONDS_SETTING_KEY,
             TEST_DOORWAY_DELAY_SECONDS,
         )
         self.workspace = BlueprintWorkspace(

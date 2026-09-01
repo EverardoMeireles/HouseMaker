@@ -40,7 +40,7 @@ from housemaker.models import (
 )
 from housemaker.project_io import load_project, save_project
 from housemaker.settings_widget import (
-    DOORWAY_MESH_UPDATE_DELAY_SECONDS_SETTING_KEY,
+    MESH_EDIT_UPDATE_DELAY_SECONDS_SETTING_KEY,
 )
 
 # ### Module state ###
@@ -535,49 +535,47 @@ class DoorwayTests(unittest.TestCase):
             )
         )
 
-    def test_arch_shape_survives_wheel_height_and_width_drag_edits(self) -> None:
+    def test_arch_shape_and_dimensions_survive_wall_constrained_move(self) -> None:
+        vertex_data = VertexData()
+        _add_wall(vertex_data, (10.0, 50.0), (90.0, 50.0))
         doorway = DoorwayData(
             center_x=50.0,
             center_y=50.0,
-            width_meters=0.9,
+            width_meters=0.4,
             height_meters=2.1,
             depth_meters=0.2,
-            rotation_degrees=0.0,
+            rotation_degrees=90.0,
             shape=DOORWAY_SHAPE_ARCH,
             arch_amount=0.4,
         )
-        canvas = self._track_widget(_build_canvas(VertexData(), [doorway]))
+        canvas = self._track_widget(_build_canvas(vertex_data, [doorway]))
         doorway_position = _image_position(canvas, doorway.center_x, doorway.center_y)
-        QTest.mouseClick(
+        target_position = _image_position(canvas, 65.0, 80.0)
+
+        QTest.mousePress(
             canvas,
             Qt.MouseButton.LeftButton,
             pos=doorway_position,
         )
-
-        _send_wheel_event(canvas, doorway_position, 120)
-        self.assertEqual(canvas.doorways[0].shape, DOORWAY_SHAPE_ARCH)
-        self.assertEqual(canvas.doorways[0].arch_amount, 0.4)
-
-        width_border_position = _image_position(
-            canvas,
-            *_get_width_border_image_position(canvas.doorways[0]),
-        )
-        resized_position = _image_position(canvas, doorway.center_x, 85.0)
-        QTest.mousePress(
-            canvas,
-            Qt.MouseButton.LeftButton,
-            pos=width_border_position,
-        )
-        _send_drag_move(canvas, resized_position)
+        _send_drag_move(canvas, target_position)
         QTest.mouseRelease(
             canvas,
             Qt.MouseButton.LeftButton,
-            pos=resized_position,
+            pos=target_position,
         )
 
-        self.assertEqual(canvas.doorways[0].shape, DOORWAY_SHAPE_ARCH)
-        self.assertEqual(canvas.doorways[0].arch_amount, 0.4)
-        self.assertGreater(canvas.doorways[0].width_meters, doorway.width_meters)
+        moved_doorway = canvas.doorways[0]
+        self.assertGreater(moved_doorway.center_x, doorway.center_x)
+        self.assertAlmostEqual(moved_doorway.center_y, doorway.center_y)
+        self.assertAlmostEqual(moved_doorway.width_meters, doorway.width_meters)
+        self.assertAlmostEqual(moved_doorway.height_meters, doorway.height_meters)
+        self.assertAlmostEqual(moved_doorway.depth_meters, doorway.depth_meters)
+        self.assertAlmostEqual(
+            moved_doorway.rotation_degrees,
+            doorway.rotation_degrees,
+        )
+        self.assertEqual(moved_doorway.shape, DOORWAY_SHAPE_ARCH)
+        self.assertEqual(moved_doorway.arch_amount, 0.4)
 
     def test_canvas_auto_aligns_doorway_to_wall_and_wheel_zooms(self) -> None:
         vertex_data = VertexData()
@@ -658,320 +656,206 @@ class DoorwayTests(unittest.TestCase):
         self.assertEqual(tuple(vertex_data.vertices), original_vertices)
         self.assertEqual(tuple(vertex_data.edges), original_edges)
 
-    def test_canvas_resizes_depth_borders_with_directional_cursors(self) -> None:
+    def test_canvas_doorway_borders_move_without_resizing(self) -> None:
         vertex_data = VertexData()
+        _add_wall(vertex_data, (10.0, 50.0), (90.0, 50.0))
         doorway = DoorwayData(
             center_x=50.0,
             center_y=50.0,
-            width_meters=0.9,
+            width_meters=0.4,
             height_meters=2.1,
             depth_meters=0.2,
-            rotation_degrees=0.0,
+            rotation_degrees=90.0,
         )
         canvas = self._track_widget(_build_canvas(vertex_data, [doorway]))
         self.assertIsInstance(canvas, BlueprintCanvas)
-        center_position = _image_position(canvas, doorway.center_x, doorway.center_y)
+        width_border_position = _image_position(
+            canvas,
+            *_get_width_border_image_position(canvas.doorways[0]),
+        )
+        depth_border_position = _image_position(
+            canvas,
+            *_get_depth_border_image_position(canvas.doorways[0]),
+        )
+        for border_position in (width_border_position, depth_border_position):
+            with self.subTest(border_position=border_position):
+                QTest.mouseMove(canvas, _image_position(canvas, 15.0, 15.0))
+                QTest.mouseMove(canvas, border_position)
+                _qt_application.processEvents()
+                self.assertEqual(
+                    canvas.cursor().shape(),
+                    Qt.CursorShape.OpenHandCursor,
+                )
+
+        original_dimensions = (
+            doorway.width_meters,
+            doorway.height_meters,
+            doorway.depth_meters,
+            doorway.rotation_degrees,
+        )
+        target_position = _image_position(canvas, 75.0, 80.0)
+        QTest.mousePress(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            pos=width_border_position,
+        )
+        _send_drag_move(canvas, target_position)
+        QTest.mouseRelease(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            pos=target_position,
+        )
+
+        moved_doorway = canvas.doorways[0]
+        self.assertNotAlmostEqual(moved_doorway.center_x, doorway.center_x)
+        self.assertEqual(
+            (
+                moved_doorway.width_meters,
+                moved_doorway.height_meters,
+                moved_doorway.depth_meters,
+                moved_doorway.rotation_degrees,
+            ),
+            original_dimensions,
+        )
+
+    def test_canvas_moves_doorway_only_along_its_wall_and_undoes_once(
+        self,
+    ) -> None:
+        vertex_data = VertexData()
+        _add_wall(vertex_data, (10.0, 50.0), (90.0, 50.0))
+        doorway = DoorwayData(
+            center_x=50.0,
+            center_y=50.0,
+            width_meters=0.4,
+            height_meters=2.1,
+            depth_meters=0.2,
+            rotation_degrees=90.0,
+        )
+        canvas = self._track_widget(_build_canvas(vertex_data, [doorway]))
+        center_position = _image_position(canvas, 50.0, 50.0)
         QTest.mouseMove(canvas, center_position)
         _qt_application.processEvents()
-        self.assertEqual(canvas.cursor().shape(), Qt.CursorShape.ArrowCursor)
-
-        cursor_cases = (
-            (0.0, Qt.CursorShape.SizeHorCursor),
-            (90.0, Qt.CursorShape.SizeVerCursor),
-            (45.0, Qt.CursorShape.SizeFDiagCursor),
-            (135.0, Qt.CursorShape.SizeBDiagCursor),
+        self.assertEqual(
+            canvas.cursor().shape(),
+            Qt.CursorShape.OpenHandCursor,
         )
-        for rotation_degrees, expected_cursor in cursor_cases:
-            with self.subTest(rotation_degrees=rotation_degrees):
-                canvas.doorways[0].rotation_degrees = rotation_degrees
-                edge_position = _image_position(
-                    canvas,
-                    *_get_depth_border_image_position(canvas.doorways[0]),
-                )
-                QTest.mouseMove(canvas, _image_position(canvas, 15.0, 15.0))
-                QTest.mouseMove(canvas, edge_position)
-                _qt_application.processEvents()
-                self.assertEqual(canvas.cursor().shape(), expected_cursor)
-
-        canvas.doorways[0].rotation_degrees = 0.0
-        committed_changes: list[None] = []
-        preview_changes: list[None] = []
-        drag_events: list[str] = []
-        canvas.doorways_changed.connect(lambda: committed_changes.append(None))
+        move_events: list[object] = []
+        preview_events: list[None] = []
+        committed_events: list[None] = []
+        canvas.doorway_move_drag_started.connect(
+            lambda: move_events.append("started")
+        )
+        canvas.doorway_move_drag_finished.connect(move_events.append)
         canvas.doorway_dimension_preview_changed.connect(
-            lambda: preview_changes.append(None)
+            lambda: preview_events.append(None)
         )
-        canvas.doorway_dimension_drag_started.connect(
-            lambda: drag_events.append("started")
-        )
-        canvas.doorway_dimension_drag_finished.connect(
-            lambda: drag_events.append("finished")
-        )
-        initial_depth_meters = canvas.doorways[0].depth_meters
+        canvas.doorways_changed.connect(lambda: committed_events.append(None))
+        initial_undo_count = len(canvas.undo_stack)
+        target_position = _image_position(canvas, 65.0, 80.0)
+        target_image_point = canvas._widget_to_image(QPointF(target_position))
+        self.assertIsNotNone(target_image_point)
 
         QTest.mousePress(
             canvas,
             Qt.MouseButton.LeftButton,
             pos=center_position,
         )
-        _send_drag_move(canvas, _image_position(canvas, 70.0, 50.0))
+        _send_drag_move(canvas, target_position)
+        self.assertEqual(
+            canvas.cursor().shape(),
+            Qt.CursorShape.ClosedHandCursor,
+        )
+        moved = canvas.doorways[0]
+        self.assertAlmostEqual(moved.center_x, target_image_point.x())
+        self.assertAlmostEqual(moved.center_y, 50.0)
+        self.assertEqual(move_events, ["started"])
+        self.assertEqual(preview_events, [None])
+        self.assertEqual(committed_events, [])
+        self.assertEqual(len(canvas.undo_stack), initial_undo_count + 1)
+
         QTest.mouseRelease(
             canvas,
             Qt.MouseButton.LeftButton,
-            pos=_image_position(canvas, 70.0, 50.0),
+            pos=target_position,
         )
-        self.assertAlmostEqual(canvas.doorways[0].depth_meters, initial_depth_meters)
-        self.assertEqual(committed_changes, [])
-        self.assertEqual(preview_changes, [])
-        self.assertEqual(drag_events, [])
 
-        depth_border_position = _image_position(
-            canvas,
-            *_get_depth_border_image_position(canvas.doorways[0]),
-        )
-        depth_border_image_point = canvas._widget_to_image(
-            QPointF(depth_border_position)
-        )
-        self.assertIsNotNone(depth_border_image_point)
-        QTest.mousePress(
-            canvas,
-            Qt.MouseButton.LeftButton,
-            pos=depth_border_position,
-        )
-        self.assertEqual(drag_events, ["started"])
-        resized_position = _image_position(canvas, 70.0, 50.0)
-        resized_image_point = canvas._widget_to_image(QPointF(resized_position))
-        self.assertIsNotNone(resized_image_point)
-        _send_drag_move(canvas, resized_position)
-        self.assertEqual(committed_changes, [])
-        self.assertEqual(preview_changes, [None])
-        self.assertEqual(drag_events, ["started"])
-        QTest.mouseRelease(
-            canvas,
-            Qt.MouseButton.LeftButton,
-            pos=resized_position,
-        )
-        _qt_application.processEvents()
-
-        expected_depth_meters = (
-            initial_depth_meters
-            + 2.0
-            * (resized_image_point.x() - depth_border_image_point.x())
-            * PIXEL_TO_METER
-        )
-        self.assertAlmostEqual(
-            canvas.doorways[0].depth_meters,
-            expected_depth_meters,
-        )
-        self.assertEqual(committed_changes, [])
-        self.assertEqual(preview_changes, [None])
-        self.assertEqual(drag_events, ["started", "finished"])
-
+        self.assertEqual(move_events, ["started", True])
+        self.assertEqual(committed_events, [])
         canvas.undo_last_step()
-        self.assertAlmostEqual(
-            canvas.doorways[0].depth_meters,
-            DEFAULT_DOORWAY_DEPTH_METERS,
-        )
-        self.assertEqual(committed_changes, [None])
-        self.assertEqual(preview_changes, [None])
+        self.assertEqual(canvas.doorways[0], doorway)
+        self.assertEqual(committed_events, [None])
 
-    def test_canvas_resizes_width_border_live_and_undoes_as_one_step(self) -> None:
+    def test_doorway_returned_to_its_start_does_not_commit_or_add_undo(
+        self,
+    ) -> None:
+        vertex_data = VertexData()
+        _add_wall(vertex_data, (10.0, 50.0), (90.0, 50.0))
         doorway = DoorwayData(
             center_x=50.0,
             center_y=50.0,
-            width_meters=0.9,
+            width_meters=0.4,
             height_meters=2.1,
             depth_meters=0.2,
-            rotation_degrees=0.0,
+            rotation_degrees=90.0,
         )
-        canvas = self._track_widget(_build_canvas(VertexData(), [doorway]))
-        self.assertIsInstance(canvas, BlueprintCanvas)
-
-        cursor_cases = (
-            (0.0, Qt.CursorShape.SizeVerCursor),
-            (90.0, Qt.CursorShape.SizeHorCursor),
-            (45.0, Qt.CursorShape.SizeBDiagCursor),
-            (135.0, Qt.CursorShape.SizeFDiagCursor),
-        )
-        for rotation_degrees, expected_cursor in cursor_cases:
-            with self.subTest(rotation_degrees=rotation_degrees):
-                canvas.doorways[0].rotation_degrees = rotation_degrees
-                border_position = _image_position(
-                    canvas,
-                    *_get_width_border_image_position(canvas.doorways[0]),
-                )
-                QTest.mouseMove(canvas, _image_position(canvas, 15.0, 15.0))
-                QTest.mouseMove(canvas, border_position)
-                _qt_application.processEvents()
-                self.assertEqual(canvas.cursor().shape(), expected_cursor)
-
-        canvas.doorways[0].rotation_degrees = 0.0
-        initial_doorway = DoorwayData(**vars(canvas.doorways[0]))
+        canvas = self._track_widget(_build_canvas(vertex_data, [doorway]))
+        center_position = _image_position(canvas, 50.0, 50.0)
+        moved_position = _image_position(canvas, 65.0, 50.0)
+        finished_events: list[bool] = []
+        canvas.doorway_move_drag_finished.connect(finished_events.append)
         initial_undo_count = len(canvas.undo_stack)
-        room_changes: list[None] = []
-        committed_changes: list[None] = []
-        preview_changes: list[None] = []
-        drag_events: list[str] = []
-        canvas.rooms_changed.connect(lambda: room_changes.append(None))
-        canvas.doorways_changed.connect(lambda: committed_changes.append(None))
-        canvas.doorway_dimension_preview_changed.connect(
-            lambda: preview_changes.append(None)
-        )
-        canvas.doorway_dimension_drag_started.connect(
-            lambda: drag_events.append("started")
-        )
-        canvas.doorway_dimension_drag_finished.connect(
-            lambda: drag_events.append("finished")
-        )
-        width_border_position = _image_position(
-            canvas,
-            *_get_width_border_image_position(canvas.doorways[0]),
-        )
-        width_border_image_point = canvas._widget_to_image(
-            QPointF(width_border_position)
-        )
-        self.assertIsNotNone(width_border_image_point)
 
         QTest.mousePress(
             canvas,
             Qt.MouseButton.LeftButton,
-            pos=width_border_position,
+            pos=center_position,
         )
-        self.assertEqual(drag_events, ["started"])
-        orthogonal_position = _image_position(
-            canvas,
-            70.0,
-            width_border_image_point.y(),
-        )
-        _send_drag_move(canvas, orthogonal_position)
+        _send_drag_move(canvas, moved_position)
+        _send_drag_move(canvas, center_position)
         QTest.mouseRelease(
             canvas,
             Qt.MouseButton.LeftButton,
-            pos=orthogonal_position,
+            pos=center_position,
         )
-        self.assertEqual(committed_changes, [])
-        self.assertEqual(preview_changes, [])
-        self.assertEqual(drag_events, ["started", "finished"])
+
+        self.assertEqual(canvas.doorways[0], doorway)
+        self.assertEqual(finished_events, [False])
         self.assertEqual(len(canvas.undo_stack), initial_undo_count)
 
-        QTest.mousePress(
-            canvas,
-            Qt.MouseButton.LeftButton,
-            pos=width_border_position,
-        )
-        self.assertEqual(
-            drag_events,
-            ["started", "finished", "started"],
-        )
-        resized_position = _image_position(canvas, 50.0, 90.0)
-        resized_image_point = canvas._widget_to_image(QPointF(resized_position))
-        self.assertIsNotNone(resized_image_point)
-        _send_drag_move(canvas, resized_position)
-
-        expected_width_meters = (
-            initial_doorway.width_meters
-            + 2.0
-            * (resized_image_point.y() - width_border_image_point.y())
-            * PIXEL_TO_METER
-        )
-        resized_doorway = canvas.doorways[0]
-        self.assertAlmostEqual(resized_doorway.width_meters, expected_width_meters)
-        self.assertAlmostEqual(resized_doorway.center_x, initial_doorway.center_x)
-        self.assertAlmostEqual(resized_doorway.center_y, initial_doorway.center_y)
-        self.assertAlmostEqual(
-            resized_doorway.height_meters,
-            initial_doorway.height_meters,
-        )
-        self.assertAlmostEqual(
-            resized_doorway.depth_meters,
-            initial_doorway.depth_meters,
-        )
-        self.assertEqual(committed_changes, [])
-        self.assertEqual(preview_changes, [None])
-        self.assertEqual(
-            drag_events,
-            ["started", "finished", "started"],
-        )
-        self.assertEqual(len(canvas.undo_stack), initial_undo_count + 1)
-
-        QTest.mouseRelease(
-            canvas,
-            Qt.MouseButton.LeftButton,
-            pos=resized_position,
-        )
-        _qt_application.processEvents()
-        self.assertEqual(committed_changes, [])
-        self.assertEqual(preview_changes, [None])
-        self.assertEqual(
-            drag_events,
-            ["started", "finished", "started", "finished"],
-        )
-        self.assertEqual(len(canvas.undo_stack), initial_undo_count + 1)
-
-        canvas.undo_last_step()
-        self.assertAlmostEqual(
-            canvas.doorways[0].width_meters,
-            initial_doorway.width_meters,
-        )
-        self.assertEqual(committed_changes, [None])
-        self.assertEqual(preview_changes, [None])
-        self.assertEqual(room_changes, [])
-
-    def test_doorway_drag_preserves_wheel_updated_height(self) -> None:
+    def test_doorway_drag_preserves_all_dimensions(self) -> None:
+        vertex_data = VertexData()
+        _add_wall(vertex_data, (10.0, 50.0), (90.0, 50.0))
         doorway = DoorwayData(
             center_x=50.0,
             center_y=50.0,
-            width_meters=0.9,
+            width_meters=0.4,
             height_meters=2.1,
             depth_meters=0.2,
-            rotation_degrees=0.0,
+            rotation_degrees=90.0,
         )
-        canvas = self._track_widget(_build_canvas(VertexData(), [doorway]))
-        width_border_position = _image_position(
-            canvas,
-            *_get_width_border_image_position(doorway),
-        )
-        first_resized_position = _image_position(
-            canvas,
-            doorway.center_x,
-            90.0,
-        )
-        second_resized_position = _image_position(
-            canvas,
-            doorway.center_x,
-            80.0,
-        )
+        canvas = self._track_widget(_build_canvas(vertex_data, [doorway]))
+        doorway_position = _image_position(canvas, doorway.center_x, doorway.center_y)
+        target_position = _image_position(canvas, 65.0, 80.0)
 
         QTest.mousePress(
             canvas,
             Qt.MouseButton.LeftButton,
-            pos=width_border_position,
+            pos=doorway_position,
         )
-        _send_drag_move(canvas, first_resized_position)
-        first_resized_width_meters = canvas.doorways[0].width_meters
-
-        _send_wheel_event(canvas, first_resized_position, 120)
-        wheel_updated_height_meters = canvas.doorways[0].height_meters
-        self.assertAlmostEqual(
-            wheel_updated_height_meters,
-            doorway.height_meters + 0.05,
-        )
-
-        _send_drag_move(canvas, second_resized_position)
-        self.assertNotEqual(
-            canvas.doorways[0].width_meters,
-            first_resized_width_meters,
-        )
-        self.assertAlmostEqual(
-            canvas.doorways[0].height_meters,
-            wheel_updated_height_meters,
-        )
-
+        _send_drag_move(canvas, target_position)
         QTest.mouseRelease(
             canvas,
             Qt.MouseButton.LeftButton,
-            pos=second_resized_position,
+            pos=target_position,
         )
+
+        moved_doorway = canvas.doorways[0]
+        self.assertGreater(moved_doorway.center_x, doorway.center_x)
+        self.assertAlmostEqual(moved_doorway.center_y, doorway.center_y)
+        self.assertEqual(moved_doorway.width_meters, doorway.width_meters)
+        self.assertEqual(moved_doorway.height_meters, doorway.height_meters)
+        self.assertEqual(moved_doorway.depth_meters, doorway.depth_meters)
+        self.assertEqual(moved_doorway.rotation_degrees, doorway.rotation_degrees)
 
     def test_vertex_undo_still_emits_rooms_changed(self) -> None:
         vertex_data = VertexData()
@@ -990,32 +874,33 @@ class DoorwayTests(unittest.TestCase):
         self.assertAlmostEqual(restored_vertex.x, 20.0)
         self.assertAlmostEqual(restored_vertex.y, 30.0)
 
-    def test_loading_level_finishes_active_doorway_dimension_drag(self) -> None:
+    def test_loading_level_finishes_active_doorway_move(self) -> None:
+        vertex_data = VertexData()
+        _add_wall(vertex_data, (10.0, 50.0), (90.0, 50.0))
         doorway = DoorwayData(
             center_x=50.0,
             center_y=50.0,
-            width_meters=0.9,
+            width_meters=0.4,
             height_meters=2.1,
             depth_meters=0.2,
-            rotation_degrees=0.0,
+            rotation_degrees=90.0,
         )
-        canvas = self._track_widget(_build_canvas(VertexData(), [doorway]))
-        drag_events: list[str] = []
-        canvas.doorway_dimension_drag_started.connect(
+        canvas = self._track_widget(_build_canvas(vertex_data, [doorway]))
+        drag_events: list[object] = []
+        canvas.doorway_move_drag_started.connect(
             lambda: drag_events.append("started")
         )
-        canvas.doorway_dimension_drag_finished.connect(
-            lambda: drag_events.append("finished")
-        )
-        width_border_position = _image_position(
+        canvas.doorway_move_drag_finished.connect(drag_events.append)
+        doorway_position = _image_position(
             canvas,
-            *_get_width_border_image_position(doorway),
+            doorway.center_x,
+            doorway.center_y,
         )
 
         QTest.mousePress(
             canvas,
             Qt.MouseButton.LeftButton,
-            pos=width_border_position,
+            pos=doorway_position,
         )
         self.assertEqual(drag_events, ["started"])
 
@@ -1026,10 +911,10 @@ class DoorwayTests(unittest.TestCase):
             doorways=[],
         )
 
-        self.assertEqual(drag_events, ["started", "finished"])
+        self.assertEqual(drag_events, ["started", False])
         self.assertIsNone(canvas.pressed_doorway_index)
 
-    def test_selected_doorway_wheel_changes_height_without_zooming(self) -> None:
+    def test_selected_doorway_wheel_zooms_without_editing_doorway(self) -> None:
         doorway = DoorwayData(
             center_x=50.0,
             center_y=50.0,
@@ -1049,7 +934,7 @@ class DoorwayTests(unittest.TestCase):
         self.assertEqual(canvas.selected_doorway_index, 0)
 
         initial_zoom_scale = canvas.zoom_scale
-        initial_height_meters = canvas.doorways[0].height_meters
+        initial_doorway = DoorwayData(**vars(canvas.doorways[0]))
         initial_undo_count = len(canvas.undo_stack)
         committed_changes: list[None] = []
         preview_changes: list[None] = []
@@ -1059,47 +944,24 @@ class DoorwayTests(unittest.TestCase):
         )
 
         _send_wheel_event(canvas, doorway_position, 120)
-        self.assertAlmostEqual(
-            canvas.doorways[0].height_meters,
-            initial_height_meters + 0.05,
-        )
-        self.assertAlmostEqual(canvas.zoom_scale, initial_zoom_scale)
+        self.assertEqual(canvas.doorways[0], initial_doorway)
+        self.assertGreater(canvas.zoom_scale, initial_zoom_scale)
         self.assertEqual(committed_changes, [])
-        self.assertEqual(preview_changes, [None])
-        self.assertEqual(len(canvas.undo_stack), initial_undo_count + 1)
+        self.assertEqual(preview_changes, [])
+        self.assertEqual(len(canvas.undo_stack), initial_undo_count)
 
         _send_wheel_event(canvas, doorway_position, -120)
-        self.assertAlmostEqual(
-            canvas.doorways[0].height_meters,
-            initial_height_meters,
-        )
+        self.assertEqual(canvas.doorways[0], initial_doorway)
         self.assertAlmostEqual(canvas.zoom_scale, initial_zoom_scale)
         self.assertEqual(committed_changes, [])
-        self.assertEqual(preview_changes, [None, None])
-        self.assertEqual(len(canvas.undo_stack), initial_undo_count + 2)
-
-        canvas.undo_last_step()
-        self.assertAlmostEqual(
-            canvas.doorways[0].height_meters,
-            initial_height_meters + 0.05,
-        )
-        self.assertEqual(committed_changes, [None])
-        canvas.undo_last_step()
-        self.assertAlmostEqual(
-            canvas.doorways[0].height_meters,
-            initial_height_meters,
-        )
-        self.assertEqual(committed_changes, [None, None])
-        self.assertEqual(preview_changes, [None, None])
+        self.assertEqual(preview_changes, [])
+        self.assertEqual(len(canvas.undo_stack), initial_undo_count)
 
         canvas.selected_doorway_index = None
         unselected_zoom_scale = canvas.zoom_scale
         _send_wheel_event(canvas, _image_position(canvas, 15.0, 15.0), 120)
         self.assertGreater(canvas.zoom_scale, unselected_zoom_scale)
-        self.assertAlmostEqual(
-            canvas.doorways[0].height_meters,
-            initial_height_meters,
-        )
+        self.assertEqual(canvas.doorways[0], initial_doorway)
 
     def test_canvas_selects_doorway_center_and_delete_removes_it(self) -> None:
         doorway = DoorwayData(
@@ -1262,7 +1124,7 @@ class DoorwayTests(unittest.TestCase):
             Path(settings_directory) / "settings.json"
         )
         application_settings.set(
-            DOORWAY_MESH_UPDATE_DELAY_SECONDS_SETTING_KEY,
+            MESH_EDIT_UPDATE_DELAY_SECONDS_SETTING_KEY,
             delay_seconds,
         )
         workspace = self._track_widget(
@@ -1297,86 +1159,39 @@ class DoorwayTests(unittest.TestCase):
         )
         return workspace, doorway_position
 
-    def test_workspace_debounces_doorway_mesh_until_timer_timeout(self) -> None:
+    def test_workspace_commits_doorway_move_immediately_on_release(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            workspace, doorway_position = (
-                self._build_workspace_with_committed_doorway(
-                    temporary_directory,
-                )
+            workspace, _ = self._build_workspace_with_committed_doorway(
+                temporary_directory,
+                delay_seconds=1.0,
             )
-
-            initial_revision = workspace._viewer_preview_revision
-            with patch.object(
-                workspace,
-                "_schedule_viewer_preview_refresh",
-                wraps=workspace._schedule_viewer_preview_refresh,
-            ) as schedule_refresh:
-                _send_wheel_event(workspace.canvas, doorway_position, 120)
-
-                schedule_refresh.assert_not_called()
-                self.assertEqual(
-                    workspace._viewer_preview_revision,
-                    initial_revision,
-                )
-                self.assertTrue(
-                    workspace._doorway_mesh_update_timer.isSingleShot()
-                )
-                self.assertTrue(workspace._doorway_mesh_update_timer.isActive())
-                self.assertEqual(
-                    workspace._doorway_mesh_update_timer.interval(),
-                    700,
-                )
-                self.assertEqual(
-                    workspace._pending_doorway_mesh_level_index,
-                    workspace.current_level.index,
-                )
-                self.assertIsNotNone(
-                    workspace.viewer._doorway_preview_outline_positions
-                )
-
-                workspace._doorway_mesh_update_timer.timeout.emit()
-                workspace._doorway_mesh_update_timer.timeout.emit()
-
-                schedule_refresh.assert_called_once_with(
-                    preserve_camera=True
-                )
-
-            self.assertFalse(workspace._doorway_mesh_update_timer.isActive())
-            self.assertIsNone(workspace._pending_doorway_mesh_level_index)
-            self.assertEqual(
-                workspace._viewer_preview_revision,
-                initial_revision + 1,
+            _add_wall(
+                workspace.current_level.vertex_data,
+                (10.0, 50.0),
+                (90.0, 50.0),
             )
-            self.assertEqual(
-                workspace._doorway_outline_commit_revision,
-                workspace._viewer_preview_revision,
+            workspace.current_level.doorways[0] = DoorwayData(
+                center_x=50.0,
+                center_y=50.0,
+                width_meters=0.4,
+                height_meters=2.1,
+                depth_meters=0.2,
+                rotation_degrees=90.0,
             )
-            self.assertEqual(
-                workspace._viewer_doorways_by_level_index[
-                    workspace.current_level.index
-                ],
-                tuple(workspace.current_level.doorways),
-            )
-
-    def test_workspace_starts_doorway_delay_only_after_drag_release(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            workspace, _doorway_position = (
-                self._build_workspace_with_committed_doorway(
-                    temporary_directory,
-                    delay_seconds=0.1,
-                )
-            )
-            doorway = workspace.canvas.doorways[0]
-            width_border_position = _image_position(
+            workspace._reset_viewer_doorway_snapshots()
+            committed_doorways = workspace._viewer_doorways_by_level_index[
+                workspace.current_level.index
+            ]
+            center_position = _image_position(
                 workspace.canvas,
-                *_get_width_border_image_position(doorway),
+                50.0,
+                50.0,
             )
-            resized_position = _image_position(
+            moved_position = _image_position(
                 workspace.canvas,
-                doorway.center_x,
+                65.0,
                 80.0,
             )
-            initial_revision = workspace._viewer_preview_revision
 
             with patch.object(
                 workspace,
@@ -1386,48 +1201,52 @@ class DoorwayTests(unittest.TestCase):
                 QTest.mousePress(
                     workspace.canvas,
                     Qt.MouseButton.LeftButton,
-                    pos=width_border_position,
+                    pos=center_position,
                 )
-                _send_drag_move(workspace.canvas, resized_position)
+                _send_drag_move(workspace.canvas, moved_position)
 
                 self.assertTrue(
-                    workspace._is_doorway_dimension_drag_active
+                    workspace._is_doorway_move_drag_active
                 )
                 self.assertFalse(
                     workspace._doorway_mesh_update_timer.isActive()
+                )
+                self.assertEqual(
+                    workspace._viewer_doorways_by_level_index[
+                        workspace.current_level.index
+                    ],
+                    committed_doorways,
                 )
                 self.assertIsNotNone(
                     workspace.viewer._doorway_preview_outline_positions
                 )
-
-                QTest.qWait(150)
-
                 schedule_refresh.assert_not_called()
-                self.assertEqual(
-                    workspace._viewer_preview_revision,
-                    initial_revision,
-                )
-                self.assertFalse(
-                    workspace._doorway_mesh_update_timer.isActive()
-                )
 
                 QTest.mouseRelease(
                     workspace.canvas,
                     Qt.MouseButton.LeftButton,
-                    pos=resized_position,
+                    pos=moved_position,
                 )
 
-                self.assertFalse(
-                    workspace._is_doorway_dimension_drag_active
+                schedule_refresh.assert_called_once_with(
+                    preserve_camera=True
                 )
-                self.assertTrue(
-                    workspace._doorway_mesh_update_timer.isActive()
-                )
-                self.assertEqual(
-                    workspace._doorway_mesh_update_timer.interval(),
-                    100,
-                )
-                schedule_refresh.assert_not_called()
+
+            self.assertFalse(
+                workspace._is_doorway_move_drag_active
+            )
+            self.assertFalse(workspace._doorway_mesh_update_timer.isActive())
+            self.assertIsNone(workspace._pending_doorway_mesh_level_index)
+            self.assertEqual(
+                workspace._viewer_doorways_by_level_index[
+                    workspace.current_level.index
+                ],
+                tuple(workspace.current_level.doorways),
+            )
+            self.assertNotEqual(
+                workspace.current_level.doorways[0].center_x,
+                committed_doorways[0].center_x,
+            )
 
     def test_stationary_drag_does_not_replace_another_doorway_outline(
         self,
@@ -1455,10 +1274,10 @@ class DoorwayTests(unittest.TestCase):
             )
 
             workspace.canvas.selected_doorway_index = 0
-            _send_wheel_event(
-                workspace.canvas,
-                doorway_a_position,
-                120,
+            self.assertTrue(
+                workspace.canvas.set_selected_doorway_shape(
+                    DOORWAY_SHAPE_ARCH
+                )
             )
             doorway_a_outline = (
                 workspace.viewer._doorway_preview_outline_positions
@@ -1466,18 +1285,19 @@ class DoorwayTests(unittest.TestCase):
             self.assertIsNotNone(doorway_a_outline)
             self.assertTrue(workspace._doorway_mesh_update_timer.isActive())
 
-            doorway_b_border_position = _image_position(
+            doorway_b_position = _image_position(
                 workspace.canvas,
-                *_get_width_border_image_position(doorway_b),
+                doorway_b.center_x,
+                doorway_b.center_y,
             )
             QTest.mousePress(
                 workspace.canvas,
                 Qt.MouseButton.LeftButton,
-                pos=doorway_b_border_position,
+                pos=doorway_b_position,
             )
 
             self.assertEqual(workspace.canvas.selected_doorway_index, 1)
-            self.assertTrue(workspace._is_doorway_dimension_drag_active)
+            self.assertTrue(workspace._is_doorway_move_drag_active)
             self.assertFalse(workspace._doorway_mesh_update_timer.isActive())
             np.testing.assert_array_equal(
                 workspace.viewer._doorway_preview_outline_positions,
@@ -1487,10 +1307,10 @@ class DoorwayTests(unittest.TestCase):
             QTest.mouseRelease(
                 workspace.canvas,
                 Qt.MouseButton.LeftButton,
-                pos=doorway_b_border_position,
+                pos=doorway_b_position,
             )
 
-            self.assertFalse(workspace._is_doorway_dimension_drag_active)
+            self.assertFalse(workspace._is_doorway_move_drag_active)
             self.assertTrue(workspace._doorway_mesh_update_timer.isActive())
             self.assertEqual(
                 workspace._doorway_mesh_update_timer.interval(),
@@ -1518,40 +1338,53 @@ class DoorwayTests(unittest.TestCase):
                     temporary_directory,
                 )
             )
-            doorway = workspace.canvas.doorways[0]
+            _add_wall(
+                workspace.current_level.vertex_data,
+                (10.0, 50.0),
+                (90.0, 50.0),
+            )
+            workspace.current_level.doorways[0] = DoorwayData(
+                center_x=50.0,
+                center_y=50.0,
+                width_meters=0.4,
+                height_meters=2.1,
+                depth_meters=0.2,
+                rotation_degrees=90.0,
+            )
+            workspace._reset_viewer_doorway_snapshots()
             committed_doorways = (
                 workspace._viewer_doorways_by_level_index[
                     workspace.current_level.index
                 ]
             )
             initial_revision = workspace._viewer_preview_revision
-            initial_width_meters = doorway.width_meters
-            width_border_position = _image_position(
+            doorway_position = _image_position(
                 workspace.canvas,
-                *_get_width_border_image_position(doorway),
+                50.0,
+                50.0,
             )
-            resized_position = _image_position(
+            moved_position = _image_position(
                 workspace.canvas,
-                doorway.center_x,
+                65.0,
                 80.0,
             )
 
             QTest.mousePress(
                 workspace.canvas,
                 Qt.MouseButton.LeftButton,
-                pos=width_border_position,
+                pos=doorway_position,
             )
-            _send_drag_move(workspace.canvas, resized_position)
+            _send_drag_move(workspace.canvas, moved_position)
             pending_outline = (
                 workspace.viewer._doorway_preview_outline_positions
             )
 
             self.assertIsNotNone(pending_outline)
             self.assertNotEqual(
-                workspace.canvas.doorways[0].width_meters,
-                initial_width_meters,
+                workspace.canvas.doorways[0].center_x,
+                committed_doorways[0].center_x,
             )
-            self.assertTrue(workspace._is_doorway_dimension_drag_active)
+            self.assertTrue(workspace._is_doorway_move_drag_active)
             self.assertFalse(workspace._doorway_mesh_update_timer.isActive())
             self.assertEqual(
                 workspace._pending_doorway_mesh_level_index,
@@ -1561,16 +1394,9 @@ class DoorwayTests(unittest.TestCase):
             workspace.canvas.start_floor_contour_designation()
 
             self.assertIsNone(workspace.canvas.selected_doorway_index)
-            self.assertFalse(workspace._is_doorway_dimension_drag_active)
-            self.assertTrue(workspace._doorway_mesh_update_timer.isActive())
-            self.assertEqual(
-                workspace._doorway_mesh_update_timer.interval(),
-                700,
-            )
-            self.assertEqual(
-                workspace._pending_doorway_mesh_level_index,
-                workspace.current_level.index,
-            )
+            self.assertFalse(workspace._is_doorway_move_drag_active)
+            self.assertFalse(workspace._doorway_mesh_update_timer.isActive())
+            self.assertIsNone(workspace._pending_doorway_mesh_level_index)
             np.testing.assert_array_equal(
                 workspace.viewer._doorway_preview_outline_positions,
                 pending_outline,
@@ -1579,16 +1405,16 @@ class DoorwayTests(unittest.TestCase):
                 workspace._viewer_doorways_by_level_index[
                     workspace.current_level.index
                 ],
-                committed_doorways,
+                tuple(workspace.current_level.doorways),
             )
             self.assertEqual(
                 workspace._viewer_preview_revision,
-                initial_revision,
+                initial_revision + 1,
             )
 
     def test_returning_to_committed_doorway_cancels_pending_update(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            workspace, doorway_position = (
+            workspace, _doorway_position = (
                 self._build_workspace_with_committed_doorway(
                     temporary_directory,
                 )
@@ -1604,7 +1430,11 @@ class DoorwayTests(unittest.TestCase):
                 "_schedule_viewer_preview_refresh",
                 wraps=workspace._schedule_viewer_preview_refresh,
             ) as schedule_refresh:
-                _send_wheel_event(workspace.canvas, doorway_position, 120)
+                self.assertTrue(
+                    workspace.canvas.set_selected_doorway_shape(
+                        DOORWAY_SHAPE_ARCH
+                    )
+                )
                 self.assertTrue(workspace._doorway_mesh_update_timer.isActive())
 
                 workspace.current_level.doorways[:] = [
@@ -1631,12 +1461,16 @@ class DoorwayTests(unittest.TestCase):
 
     def test_structural_doorway_change_cancels_pending_and_commits_now(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            workspace, doorway_position = (
+            workspace, _doorway_position = (
                 self._build_workspace_with_committed_doorway(
                     temporary_directory,
                 )
             )
-            _send_wheel_event(workspace.canvas, doorway_position, 120)
+            self.assertTrue(
+                workspace.canvas.set_selected_doorway_shape(
+                    DOORWAY_SHAPE_ARCH
+                )
+            )
             self.assertTrue(workspace._doorway_mesh_update_timer.isActive())
             initial_revision = workspace._viewer_preview_revision
 
@@ -1672,7 +1506,7 @@ class DoorwayTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            workspace, doorway_position = (
+            workspace, _doorway_position = (
                 self._build_workspace_with_committed_doorway(
                     temporary_directory,
                 )
@@ -1681,11 +1515,15 @@ class DoorwayTests(unittest.TestCase):
             committed_doorways = workspace._viewer_doorways_by_level_index[
                 level_index
             ]
-            _send_wheel_event(workspace.canvas, doorway_position, 120)
-            live_height = workspace.current_level.doorways[0].height_meters
+            self.assertTrue(
+                workspace.canvas.set_selected_doorway_shape(
+                    DOORWAY_SHAPE_ARCH
+                )
+            )
+            live_shape = workspace.current_level.doorways[0].shape
             self.assertNotEqual(
-                live_height,
-                committed_doorways[0].height_meters,
+                live_shape,
+                committed_doorways[0].shape,
             )
 
             with patch(
@@ -1709,8 +1547,8 @@ class DoorwayTests(unittest.TestCase):
                 committed_doorways,
             )
             self.assertNotEqual(
-                preview_level.doorways[0].height_meters,
-                live_height,
+                preview_level.doorways[0].shape,
+                live_shape,
             )
             self.assertTrue(workspace._doorway_mesh_update_timer.isActive())
 
