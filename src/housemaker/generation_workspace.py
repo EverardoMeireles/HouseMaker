@@ -69,7 +69,13 @@ from housemaker.meshy_generation import (
     request_retextured_model,
 )
 from housemaker.object_texture_variants import (
+    ATLAS_MAP_BASE_COLOR,
+    ATLAS_MAP_TYPES,
     DEFAULT_TEXTURE_RESOLUTION,
+    PBR_MAP_METALLIC,
+    PBR_MAP_NORMAL,
+    PBR_MAP_ROUGHNESS,
+    PBR_MAP_TYPES,
     TEXTURE_RESOLUTION_1024,
     TEXTURE_RESOLUTION_2048,
     TEXTURE_RESOLUTIONS,
@@ -92,6 +98,7 @@ from housemaker.object_uv_scan_projection import (
     ScanProjectionCancelled,
     ScanProjectionResult,
     ScanProjectionStats,
+    HOUSEMAKER_GLASS_MATERIAL_NAME,
     normalize_projection_camera_percentages,
     scan_project_textured_glb,
 )
@@ -185,6 +192,10 @@ TEXTURE_VARIANTS_PIPELINE_KEY = "texture_variants"
 SELECTED_TEXTURE_RESOLUTION_PIPELINE_KEY = "selected_texture_resolution"
 TEXTURE_VARIANT_GLB_PATH_KEY = "glb_asset_path"
 TEXTURE_VARIANT_PNG_PATH_KEY = "texture_asset_path"
+TEXTURE_VARIANT_MAP_PNG_PATHS_KEY = "map_texture_asset_paths"
+PBR_MAPS_AVAILABLE_PIPELINE_KEY = "pbr_maps_available"
+PBR_MAPS_ENABLED_PIPELINE_KEY = "pbr_maps_enabled"
+GLASS_CONVERSION_PIPELINE_KEY = "glass_conversion"
 # Legacy-only key retained so later geometry operations can discard obsolete
 # masks from projects saved before Object Generation inpainting was removed.
 TEXTURE_INPAINT_STROKES_PIPELINE_KEY = "texture_inpaint_strokes"
@@ -590,6 +601,7 @@ class GenerationRequest:
         projection_camera_percentages: Sequence[int] = (
             DEFAULT_PROJECTION_CAMERA_PERCENTAGES
         ),
+        enabled_pbr_maps: Sequence[str] = (),
     ) -> None:
         self.frame_index = int(frame_index)
         self.selected_object_bgra = np.ascontiguousarray(
@@ -613,6 +625,9 @@ class GenerationRequest:
                 projection_camera_percentages
             )
         )
+        self.enabled_pbr_maps = _normalize_enabled_pbr_maps(
+            enabled_pbr_maps
+        )
 
 
 @dataclass(frozen=True)
@@ -630,6 +645,9 @@ class TextureRegenerationRequest:
     projection_camera_percentages: tuple[int, ...] = (
         DEFAULT_PROJECTION_CAMERA_PERCENTAGES
     )
+    enabled_pbr_maps: tuple[str, ...] = ()
+    glass_face_indices: tuple[int, ...] = ()
+    preserve_existing_glass: bool = False
 
     def __post_init__(self) -> None:
         normalized_object_id = str(self.object_id).strip()
@@ -688,6 +706,29 @@ class TextureRegenerationRequest:
                 self.projection_camera_percentages
             ),
         )
+        object.__setattr__(
+            self,
+            "enabled_pbr_maps",
+            _normalize_enabled_pbr_maps(self.enabled_pbr_maps),
+        )
+        glass_faces = tuple(
+            sorted(set(int(index) for index in self.glass_face_indices))
+        )
+        if any(index < 0 for index in glass_faces):
+            raise ValueError("Glass face indices cannot be negative.")
+        if (
+            (glass_faces or self.preserve_existing_glass)
+            and not self.enable_original_uv
+        ):
+            raise ValueError(
+                "Glass texture regeneration must preserve original UVs."
+            )
+        object.__setattr__(self, "glass_face_indices", glass_faces)
+        object.__setattr__(
+            self,
+            "preserve_existing_glass",
+            bool(self.preserve_existing_glass),
+        )
 
 
 @dataclass(frozen=True)
@@ -705,6 +746,9 @@ class _TextureRegenerationPreflight:
     projection_camera_percentages: tuple[int, ...] = (
         DEFAULT_PROJECTION_CAMERA_PERCENTAGES
     )
+    enabled_pbr_maps: tuple[str, ...] = ()
+    glass_face_indices: tuple[int, ...] = ()
+    preserve_existing_glass: bool = False
 
     def __post_init__(self) -> None:
         normalized_object_id = str(self.object_id).strip()
@@ -767,6 +811,29 @@ class _TextureRegenerationPreflight:
             normalize_projection_camera_percentages(
                 self.projection_camera_percentages
             ),
+        )
+        object.__setattr__(
+            self,
+            "enabled_pbr_maps",
+            _normalize_enabled_pbr_maps(self.enabled_pbr_maps),
+        )
+        glass_faces = tuple(
+            sorted(set(int(index) for index in self.glass_face_indices))
+        )
+        if any(index < 0 for index in glass_faces):
+            raise ValueError("Glass face indices cannot be negative.")
+        if (
+            (glass_faces or self.preserve_existing_glass)
+            and not self.enable_original_uv
+        ):
+            raise ValueError(
+                "Glass texture regeneration must preserve original UVs."
+            )
+        object.__setattr__(self, "glass_face_indices", glass_faces)
+        object.__setattr__(
+            self,
+            "preserve_existing_glass",
+            bool(self.preserve_existing_glass),
         )
 
 
@@ -873,7 +940,7 @@ class _SavedObjectTextureRegeneration:
     """Fully prepared texture assets awaiting target and Atlas validation."""
 
     outcome: TextureRegenerationOutcome
-    variant_metadata: dict[str, dict[str, str]]
+    variant_metadata: dict[str, dict[str, object]]
     selected_resolution: int
     base_asset_path: str
     base_provider_task_id: str
@@ -939,6 +1006,10 @@ class ActiveObjectTextureVariant:
     texture_asset_relative_path: str
     glb_asset_path: Path
     texture_asset_path: Path
+    map_texture_asset_relative_paths: Mapping[str, str] = field(
+        default_factory=dict
+    )
+    map_texture_asset_paths: Mapping[str, Path] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -950,9 +1021,75 @@ class ObjectTextureImageVariant:
     resolution: int
     texture_asset_relative_path: str
     texture_asset_path: Path
+    map_texture_asset_relative_paths: Mapping[str, str] = field(
+        default_factory=dict
+    )
+    map_texture_asset_paths: Mapping[str, Path] = field(default_factory=dict)
 
 
 # ### Generation-pipeline decisions ###
+def _normalize_enabled_pbr_maps(values: Sequence[str]) -> tuple[str, ...]:
+    """Return supported Meshy PBR map IDs in stable UI order."""
+
+    if isinstance(values, str | bytes | bytearray):
+        raise ValueError("Enabled PBR maps must be a sequence.")
+    try:
+        normalized = {str(value).strip().lower() for value in values}
+    except TypeError as error:
+        raise ValueError("Enabled PBR maps must be a sequence.") from error
+    unknown = normalized - set(PBR_MAP_TYPES)
+    if unknown:
+        raise ValueError(
+            "Unknown PBR map selection: " + ", ".join(sorted(unknown))
+        )
+    return tuple(map_type for map_type in PBR_MAP_TYPES if map_type in normalized)
+
+
+def _available_variant_pbr_maps(
+    variants: PersistableObjectTextureVariants,
+) -> tuple[str, ...]:
+    raw_maps = getattr(variants, "map_png_by_resolution", None)
+    if not isinstance(raw_maps, Mapping):
+        return ()
+    return tuple(map_type for map_type in PBR_MAP_TYPES if map_type in raw_maps)
+
+
+def _build_pbr_pipeline_metadata(
+    enabled_maps: Sequence[str],
+    variants: PersistableObjectTextureVariants,
+) -> dict[str, object]:
+    """Persist requested contributions separately from provider availability."""
+
+    return {
+        PBR_MAPS_ENABLED_PIPELINE_KEY: list(
+            _normalize_enabled_pbr_maps(enabled_maps)
+        ),
+        PBR_MAPS_AVAILABLE_PIPELINE_KEY: list(
+            _available_variant_pbr_maps(variants)
+        ),
+    }
+
+
+def _available_metadata_pbr_maps(
+    variant_metadata: Mapping[str, Mapping[str, object]],
+) -> tuple[str, ...]:
+    available: set[str] = set(PBR_MAP_TYPES)
+    found_variant = False
+    for raw_variant in variant_metadata.values():
+        raw_paths = raw_variant.get(TEXTURE_VARIANT_MAP_PNG_PATHS_KEY)
+        if not isinstance(raw_paths, Mapping):
+            return ()
+        found_variant = True
+        available &= {
+            str(map_type)
+            for map_type, raw_path in raw_paths.items()
+            if isinstance(raw_path, str) and raw_path.strip()
+        }
+    if not found_variant:
+        return ()
+    return tuple(map_type for map_type in PBR_MAP_TYPES if map_type in available)
+
+
 def _build_unused_face_removal_options(
     settings: GenerationServiceSettings,
 ) -> UnusedFaceRemovalOptions:
@@ -980,7 +1117,11 @@ def _texture_regeneration_scan_target(
 ) -> str | None:
     """Return the safe atlas region for one regenerated object's new UVs."""
 
-    if not request.settings.use_uv_raycast_for_object_generation:
+    if (
+        not request.settings.use_uv_raycast_for_object_generation
+        and not request.glass_face_indices
+        and not request.preserve_existing_glass
+    ):
         return None
     if symmetry is None:
         return SCAN_PROJECTION_TARGET_FULL
@@ -1106,6 +1247,7 @@ class MeshyImagePlanner:
                 target_polycount=request.settings.meshy_target_polycount,
                 progress_callback=report_generation_progress,
                 cancel_event=cancel_event,
+                enable_pbr=bool(request.enabled_pbr_maps),
             )
             return _scan_project_provider_result(
                 request,
@@ -1226,6 +1368,7 @@ class MeshyImagePlanner:
             enable_original_uv=False,
             progress_callback=report_texture_progress,
             cancel_event=cancel_event,
+            enable_pbr=bool(request.enabled_pbr_maps),
         )
         _raise_if_generation_cancelled(cancel_event)
         returned_geometry_fingerprint = _build_geometry_fingerprint(
@@ -1336,6 +1479,7 @@ class MeshyTextureRegenerator:
             enable_original_uv=request.enable_original_uv,
             progress_callback=report_texture_progress,
             cancel_event=cancel_event,
+            enable_pbr=bool(request.enabled_pbr_maps),
         )
 
 
@@ -1503,6 +1647,20 @@ class ObjectGenerationViewerPanel(QWidget):
         )
         self.delete_faces_button.setEnabled(False)
         details_layout.addWidget(self.delete_faces_button)
+
+        self.convert_faces_to_glass_button = QPushButton(
+            "Convert faces to glass"
+        )
+        self.convert_faces_to_glass_button.setObjectName(
+            "convert_generated_object_faces_to_glass_button"
+        )
+        self.convert_faces_to_glass_button.setToolTip(
+            "Rebuild UVs, reserve a one-percent glass region, generate PBR "
+            "maps, and convert the selected faces to reflective transparent "
+            "glass."
+        )
+        self.convert_faces_to_glass_button.setEnabled(False)
+        details_layout.addWidget(self.convert_faces_to_glass_button)
 
         self.delete_object_button = QPushButton("Delete object")
         self.delete_object_button.setObjectName(
@@ -2047,6 +2205,7 @@ class TextureRegenerationWorker(QObject):
                         result.glb_bytes,
                         request.projection_camera_percentages,
                         target_domain=scan_target,
+                        glass_face_indices=request.glass_face_indices,
                         cancellation_check=self._cancel_event.is_set,
                     )
                 except ScanProjectionCancelled as error:
@@ -2728,6 +2887,25 @@ class GenerationWorkspace(QWidget):
                         variant[TEXTURE_VARIANT_PNG_PATH_KEY],
                     )
                 ),
+                (
+                    ()
+                    if variant is None
+                    else tuple(
+                        (
+                            map_type,
+                            raw_path,
+                            _build_generation_asset_revision(
+                                self._asset_directory,
+                                raw_path,
+                            ),
+                        )
+                        for map_type, raw_path in sorted(
+                            variant[
+                                TEXTURE_VARIANT_MAP_PNG_PATHS_KEY
+                            ].items()
+                        )
+                    )
+                ),
             )
             for resolution in sorted(TEXTURE_RESOLUTIONS)
             for variant in (
@@ -2833,6 +3011,10 @@ class GenerationWorkspace(QWidget):
             ),
             glb_asset_path=glb_path,
             texture_asset_path=image_variant.texture_asset_path,
+            map_texture_asset_relative_paths=(
+                image_variant.map_texture_asset_relative_paths
+            ),
+            map_texture_asset_paths=image_variant.map_texture_asset_paths,
         )
 
     def get_texture_image_variant(
@@ -2874,6 +3056,7 @@ class GenerationWorkspace(QWidget):
             record,
             normalized_resolution,
             variant[TEXTURE_VARIANT_PNG_PATH_KEY],
+            variant[TEXTURE_VARIANT_MAP_PNG_PATHS_KEY],
         )
 
     def get_atlas_texture_image_variant(
@@ -2938,8 +3121,9 @@ class GenerationWorkspace(QWidget):
         record: GeneratedObjectRecord,
         resolution: int,
         texture_relative_path: str,
+        map_texture_relative_paths: object = None,
     ) -> ObjectTextureImageVariant | None:
-        """Resolve one contained PNG path into a public image variant."""
+        """Resolve contained base-color and optional PBR PNG paths safely."""
 
         try:
             texture_path = self._resolve_generated_asset_path(
@@ -2950,12 +3134,36 @@ class GenerationWorkspace(QWidget):
             return None
         if not texture_path.is_file():
             return None
+        resolved_map_relative_paths: dict[str, str] = {
+            ATLAS_MAP_BASE_COLOR: texture_relative_path
+        }
+        resolved_map_paths: dict[str, Path] = {
+            ATLAS_MAP_BASE_COLOR: texture_path
+        }
+        if isinstance(map_texture_relative_paths, Mapping):
+            for map_type in ATLAS_MAP_TYPES:
+                raw_map_path = map_texture_relative_paths.get(map_type)
+                if not isinstance(raw_map_path, str) or not raw_map_path.strip():
+                    continue
+                try:
+                    map_path = self._resolve_generated_asset_path(
+                        raw_map_path,
+                        allowed_suffixes=frozenset({".png"}),
+                    )
+                except (OSError, RuntimeError, ValueError):
+                    continue
+                if not map_path.is_file():
+                    continue
+                resolved_map_relative_paths[map_type] = raw_map_path
+                resolved_map_paths[map_type] = map_path
         return ObjectTextureImageVariant(
             object_id=record.object_id,
             object_name=record.object_name,
             resolution=resolution,
             texture_asset_relative_path=texture_relative_path,
             texture_asset_path=texture_path,
+            map_texture_asset_relative_paths=resolved_map_relative_paths,
+            map_texture_asset_paths=resolved_map_paths,
         )
 
     def select_object_texture_resolution(
@@ -3261,6 +3469,30 @@ class GenerationWorkspace(QWidget):
         request = self._build_texture_regeneration_request()
         if request is None:
             return False
+        requested_name = self.job_name_edit.text().strip()
+        if not self._start_texture_regeneration(
+            request,
+            requested_name=requested_name,
+        ):
+            return False
+        self.job_name_edit.clear()
+        return True
+
+    def convert_selected_faces_to_glass(self) -> bool:
+        """Run a PBR texture job for the authoritative selected faces."""
+
+        self.result_view.cancel_transient_pointer_interactions()
+        self._sync_face_selection_outputs()
+        selected_faces = self.result_view.get_selected_face_indices()
+        if not selected_faces:
+            return False
+        request = self._build_texture_regeneration_request(
+            glass_face_indices=selected_faces,
+        )
+        if request is None:
+            return False
+        for checkbox in self.pbr_map_checkboxes.values():
+            checkbox.setChecked(True)
         requested_name = self.job_name_edit.text().strip()
         if not self._start_texture_regeneration(
             request,
@@ -3919,6 +4151,9 @@ class GenerationWorkspace(QWidget):
         self.delete_selected_faces_button = (
             self.object_3d_panel.delete_faces_button
         )
+        self.convert_faces_to_glass_button = (
+            self.object_3d_panel.convert_faces_to_glass_button
+        )
         self.delete_generated_object_button = (
             self.object_3d_panel.delete_object_button
         )
@@ -3940,6 +4175,9 @@ class GenerationWorkspace(QWidget):
         )
         self.delete_selected_faces_button.clicked.connect(
             self._handle_delete_selected_faces_clicked
+        )
+        self.convert_faces_to_glass_button.clicked.connect(
+            self.convert_selected_faces_to_glass
         )
         self.result_view.delete_requested.connect(
             self._handle_delete_selected_faces_clicked
@@ -4034,6 +4272,30 @@ class GenerationWorkspace(QWidget):
             self.result_view.set_textures_enabled
         )
         buttons_layout.addWidget(self.textures_checkbox)
+
+        self.pbr_map_control = QWidget()
+        self.pbr_map_control.setObjectName("object_generation_pbr_map_control")
+        pbr_map_layout = QGridLayout(self.pbr_map_control)
+        pbr_map_layout.setContentsMargins(0, 0, 0, 0)
+        pbr_map_layout.setHorizontalSpacing(6)
+        pbr_map_layout.setVerticalSpacing(0)
+        self.pbr_map_checkboxes: dict[str, QCheckBox] = {}
+        pbr_labels = {
+            PBR_MAP_NORMAL: "Normal",
+            PBR_MAP_ROUGHNESS: "Roughness",
+            PBR_MAP_METALLIC: "Metallic",
+        }
+        for index, map_type in enumerate(PBR_MAP_TYPES):
+            checkbox = QCheckBox(pbr_labels[map_type])
+            checkbox.setObjectName(f"pbr_{map_type}_checkbox")
+            checkbox.setToolTip(
+                f"Request Meshy PBR maps and dynamically apply the "
+                f"{pbr_labels[map_type].lower()} map in the 3D preview."
+            )
+            checkbox.toggled.connect(self._handle_pbr_map_toggled)
+            self.pbr_map_checkboxes[map_type] = checkbox
+            pbr_map_layout.addWidget(checkbox, index % 3, index // 3)
+        buttons_layout.addWidget(self.pbr_map_control)
 
         self.wireframe_checkbox = QCheckBox("Wireframe")
         self.wireframe_checkbox.setObjectName("wireframe_checkbox")
@@ -4327,6 +4589,22 @@ class GenerationWorkspace(QWidget):
             self._settings,
             meshy_target_polycount=int(value),
         )
+
+    def _get_enabled_pbr_maps(self) -> tuple[str, ...]:
+        """Snapshot PBR checkbox state for one immutable async request."""
+
+        return tuple(
+            map_type
+            for map_type in PBR_MAP_TYPES
+            if self.pbr_map_checkboxes[map_type].isChecked()
+        )
+
+    @Slot(bool)
+    def _handle_pbr_map_toggled(self, _enabled: bool) -> None:
+        """Apply PBR contribution changes without reloading the model."""
+
+        self.result_view.set_pbr_maps_enabled(self._get_enabled_pbr_maps())
+        self._sync_controls()
 
     @Slot(bool)
     def _handle_wireframe_toggled(self, enabled: bool) -> None:
@@ -4744,7 +5022,7 @@ class GenerationWorkspace(QWidget):
         persisted_asset_paths: list[str] = []
         symmetry: ObjectSymmetricDivisionMetadata | None = None
         scan_projection_stats: ScanProjectionStats | None = None
-        variant_metadata: dict[str, dict[str, str]] | None = None
+        variant_metadata: dict[str, dict[str, object]] | None = None
         try:
             if isinstance(result, ScanProjectedMeshyGenerationResult):
                 scan_projection_stats = result.scan_projection_stats
@@ -4822,12 +5100,18 @@ class GenerationWorkspace(QWidget):
                         SELECTED_TEXTURE_RESOLUTION_PIPELINE_KEY: (
                             DEFAULT_TEXTURE_RESOLUTION
                         ),
+                        **_build_pbr_pipeline_metadata(
+                            (
+                                ()
+                                if generation_request is None
+                                else generation_request.enabled_pbr_maps
+                            ),
+                            texture_variants,
+                        ),
                     }
                 )
                 persisted_asset_paths.extend(
-                    path
-                    for variant in variant_metadata.values()
-                    for path in variant.values()
+                    _iter_variant_metadata_asset_paths(variant_metadata)
                 )
                 asset_path = variant_metadata[
                     str(DEFAULT_TEXTURE_RESOLUTION)
@@ -5132,9 +5416,7 @@ class GenerationWorkspace(QWidget):
                 asset_stem=f"regenerated-{uuid.uuid4().hex}",
             )
             persisted_asset_paths.extend(
-                path
-                for variant in variant_metadata.values()
-                for path in variant.values()
+                _iter_variant_metadata_asset_paths(variant_metadata)
             )
             selected_resolution = _get_selected_texture_resolution(record)
             if selected_resolution not in _selectable_texture_resolutions(
@@ -5633,10 +5915,13 @@ class GenerationWorkspace(QWidget):
             projection_camera_percentages=(
                 projection_camera_percentages
             ),
+            enabled_pbr_maps=self._get_enabled_pbr_maps(),
         )
 
     def _build_texture_regeneration_request(
         self,
+        *,
+        glass_face_indices: Sequence[int] = (),
     ) -> _TextureRegenerationPreflight | None:
         record = self._find_generated_object_record(self._selected_object_id)
         if not self._can_regenerate_object_texture(record):
@@ -5646,6 +5931,21 @@ class GenerationWorkspace(QWidget):
             )
             return None
         assert record is not None
+        normalized_glass_faces = tuple(
+            sorted(set(int(index) for index in glass_face_indices))
+        )
+        if any(index < 0 for index in normalized_glass_faces):
+            self.status_label.setText("Selected glass faces are invalid.")
+            return None
+        if (
+            normalized_glass_faces
+            and not self._selected_object_has_complete_texture_uvs(record)
+        ):
+            self.status_label.setText(
+                "Convert faces to glass requires a textured object with UVs. "
+                "Generate its texture first."
+            )
+            return None
         selected_crop = self.video_view.build_selected_object_crop()
         if selected_crop.size == 0:
             self.status_label.setText("The selected texture reference is empty.")
@@ -5683,9 +5983,20 @@ class GenerationWorkspace(QWidget):
             preserve_symmetric_uvs = (
                 _get_object_symmetric_division_metadata(record) is not None
             )
+            preserve_existing_glass = isinstance(
+                record.pipeline.get(GLASS_CONVERSION_PIPELINE_KEY),
+                Mapping,
+            )
             enable_original_uv = bool(
                 preserve_symmetric_uvs
                 or record.pipeline.get(LOCALLY_AUTHORED_UVS_PIPELINE_KEY)
+                or normalized_glass_faces
+                or preserve_existing_glass
+            )
+            enabled_pbr_maps = (
+                PBR_MAP_TYPES
+                if normalized_glass_faces
+                else self._get_enabled_pbr_maps()
             )
             request = _TextureRegenerationPreflight(
                 object_id=record.object_id,
@@ -5699,6 +6010,9 @@ class GenerationWorkspace(QWidget):
                 projection_camera_percentages=(
                     projection_camera_percentages
                 ),
+                enabled_pbr_maps=enabled_pbr_maps,
+                glass_face_indices=normalized_glass_faces,
+                preserve_existing_glass=preserve_existing_glass,
             )
         except Exception as error:
             self.status_label.setText(
@@ -5792,6 +6106,7 @@ class GenerationWorkspace(QWidget):
             not has_untracked_legacy_job
         )
         self.textures_checkbox.setEnabled(not has_untracked_legacy_job)
+        self.pbr_map_control.setEnabled(not has_untracked_legacy_job)
         self.wireframe_checkbox.setEnabled(not has_untracked_legacy_job)
         self.generated_objects_list.setEnabled(not has_untracked_legacy_job)
         self.texture_view.setEnabled(not has_untracked_legacy_job)
@@ -5801,6 +6116,9 @@ class GenerationWorkspace(QWidget):
         )
         selected_face_count = len(
             self.result_view.get_selected_face_indices()
+        )
+        selected_object_has_texture_uvs = (
+            self._selected_object_has_complete_texture_uvs(selected_record)
         )
         face_selection_is_available = (
             selected_record is not None
@@ -5814,6 +6132,17 @@ class GenerationWorkspace(QWidget):
             selected_record is not None
             and selected_face_count > 0
             and not selected_object_is_busy
+        )
+        self.convert_faces_to_glass_button.setEnabled(
+            selected_record is not None
+            and selected_face_count > 0
+            and not selected_object_is_busy
+            and required_key_is_available
+            and self._video_source is not None
+            and self.video_view.get_frame_bgr() is not None
+            and self.video_view.has_selection()
+            and projection_camera_percentages_are_valid
+            and selected_object_has_texture_uvs
         )
         self.result_view.set_face_editing_enabled(
             face_selection_is_available
@@ -5833,6 +6162,7 @@ class GenerationWorkspace(QWidget):
                 )
             )
         )
+
         self.place_object_button.setEnabled(
             any(
                 self._can_place_active_operation(runtime.operation)
@@ -5872,6 +6202,37 @@ class GenerationWorkspace(QWidget):
         )
         self.video_view.set_interaction_enabled(
             has_video and not has_untracked_legacy_job
+        )
+
+    def _selected_object_has_complete_texture_uvs(
+        self,
+        record: GeneratedObjectRecord | None,
+    ) -> bool:
+        """Return whether every selected-model face has a stable finite UV."""
+
+        model = self._generated_model
+        if (
+            record is None
+            or model is None
+            or self._selected_object_id != record.object_id
+            or self.result_view.model is not model
+        ):
+            return False
+        try:
+            geometry = self._load_object_face_geometry(record, model)
+        except Exception:
+            return False
+        uv_face_indices = np.asarray(
+            geometry.uv_face_indices,
+            dtype=np.int64,
+        )
+        return bool(
+            geometry.face_count > 0
+            and len(uv_face_indices) == geometry.face_count
+            and np.array_equal(
+                np.sort(uv_face_indices),
+                np.arange(geometry.face_count, dtype=np.int64),
+            )
         )
 
     def _can_regenerate_object_texture(
@@ -6539,7 +6900,7 @@ class GenerationWorkspace(QWidget):
         variants: PersistableObjectTextureVariants,
         *,
         asset_stem: str | None = None,
-    ) -> dict[str, dict[str, str]]:
+    ) -> dict[str, dict[str, object]]:
         """Atomically persist each selectable GLB and its atlas-ready PNG."""
 
         return _persist_object_texture_variants_to_directory(
@@ -7170,7 +7531,7 @@ def _validate_automatic_symmetric_division_result(
 def _build_automatic_symmetric_generation_pipeline(
     raw_pipeline: Mapping[str, object],
     metadata: ObjectSymmetricDivisionMetadata,
-    variant_metadata: dict[str, dict[str, str]],
+    variant_metadata: dict[str, dict[str, object]],
     *,
     scan_projection_stats: ScanProjectionStats | None = None,
 ) -> dict[str, object]:
@@ -7324,7 +7685,7 @@ def _texture_regeneration_source_asset_path(
 def _build_regenerated_texture_pipeline(
     record: GeneratedObjectRecord,
     outcome: TextureRegenerationOutcome,
-    variant_metadata: dict[str, dict[str, str]],
+    variant_metadata: dict[str, dict[str, object]],
 ) -> dict[str, object]:
     request = outcome.request
     result = outcome.result
@@ -7356,7 +7717,13 @@ def _build_regenerated_texture_pipeline(
         "reference_image_sha256": hashlib.sha256(reference_png).hexdigest(),
         "enable_original_uv": request.enable_original_uv,
         "preserve_symmetric_uvs": request.preserve_symmetric_uvs,
+        "preserve_existing_glass": request.preserve_existing_glass,
+        "enabled_pbr_maps": list(request.enabled_pbr_maps),
     }
+    if request.glass_face_indices:
+        history_entry["glass_source_face_count"] = len(
+            request.glass_face_indices
+        )
     scan_projection_stats = outcome.scan_projection_stats
     if scan_projection_stats is not None:
         history_entry["projection_camera_percentages"] = dict(
@@ -7427,13 +7794,26 @@ def _build_regenerated_texture_pipeline(
                 outcome.final_face_removal_applied
             ),
             "texture_regeneration_history": history[-25:],
+            PBR_MAPS_ENABLED_PIPELINE_KEY: list(request.enabled_pbr_maps),
+            PBR_MAPS_AVAILABLE_PIPELINE_KEY: list(
+                _available_metadata_pbr_maps(variant_metadata)
+            ),
         }
     )
     if scan_projection_stats is not None:
         pipeline.pop(VISIBILITY_UV_UNWRAP_PIPELINE_KEY, None)
+        pipeline.pop(GLASS_CONVERSION_PIPELINE_KEY, None)
         pipeline.update(
             _build_scan_projection_pipeline_metadata(scan_projection_stats)
         )
+        if scan_projection_stats.glass_face_count:
+            pipeline[GLASS_CONVERSION_PIPELINE_KEY] = {
+                "material_name": HOUSEMAKER_GLASS_MATERIAL_NAME,
+                "source_face_count": len(request.glass_face_indices),
+                "output_face_count": scan_projection_stats.glass_face_count,
+                "pixel_count": scan_projection_stats.glass_pixel_count,
+                "allocation_percentage": 1,
+            }
     if outcome.final_face_removal_applied:
         pipeline.update(
             {
@@ -7558,6 +7938,13 @@ def _get_generated_object_asset_paths(
                     raw_path = raw_variant.get(path_key)
                     if isinstance(raw_path, str) and raw_path.strip():
                         raw_paths.append(raw_path)
+                raw_map_paths = raw_variant.get(
+                    TEXTURE_VARIANT_MAP_PNG_PATHS_KEY
+                )
+                if isinstance(raw_map_paths, Mapping):
+                    for raw_path in raw_map_paths.values():
+                        if isinstance(raw_path, str) and raw_path.strip():
+                            raw_paths.append(raw_path)
         raw_placeholders = pipeline.get(
             FACE_EDIT_ATLAS_PLACEHOLDERS_PIPELINE_KEY
         )
@@ -7643,7 +8030,7 @@ def _persist_object_texture_variants_to_directory(
     asset_stem: str | None = None,
     cancel_event: threading.Event | None = None,
     persist_asset: Callable[[str, bytes], str] | None = None,
-) -> dict[str, dict[str, str]]:
+) -> dict[str, dict[str, object]]:
     """Persist all selectable variants with rollback on failure/cancel."""
 
     normalized_asset_stem = (
@@ -7660,7 +8047,7 @@ def _persist_object_texture_variants_to_directory(
         if isinstance(variants, ObjectTextureVariants)
         else variants.selectable_resolutions
     )
-    metadata: dict[str, dict[str, str]] = {}
+    metadata: dict[str, dict[str, object]] = {}
     created_paths: list[str] = []
     persist = persist_asset
     if persist is None:
@@ -7683,14 +8070,60 @@ def _persist_object_texture_variants_to_directory(
                 variants.texture_png_by_resolution[resolution],
             )
             created_paths.append(png_path)
+            map_paths: dict[str, str] = {
+                ATLAS_MAP_BASE_COLOR: png_path
+            }
+            raw_map_pngs = getattr(
+                variants,
+                "map_png_by_resolution",
+                None,
+            )
+            if isinstance(raw_map_pngs, Mapping):
+                for map_type in PBR_MAP_TYPES:
+                    raw_resolution_map = raw_map_pngs.get(map_type)
+                    if not isinstance(raw_resolution_map, Mapping):
+                        continue
+                    map_png = raw_resolution_map.get(resolution)
+                    if not isinstance(map_png, bytes | bytearray | memoryview):
+                        continue
+                    map_path = persist(
+                        f"{normalized_asset_stem}.texture-{resolution}."
+                        f"{map_type}.png",
+                        bytes(map_png),
+                    )
+                    created_paths.append(map_path)
+                    map_paths[map_type] = map_path
             metadata[str(resolution)] = {
                 TEXTURE_VARIANT_GLB_PATH_KEY: glb_path,
                 TEXTURE_VARIANT_PNG_PATH_KEY: png_path,
+                TEXTURE_VARIANT_MAP_PNG_PATHS_KEY: map_paths,
             }
         return metadata
     except Exception:
         _discard_generated_asset_paths(asset_directory, created_paths)
         raise
+
+
+def _iter_variant_metadata_asset_paths(
+    variant_metadata: Mapping[str, Mapping[str, object]],
+) -> tuple[str, ...]:
+    """Flatten GLB, base-color, and PBR paths without treating maps as paths."""
+
+    paths: list[str] = []
+    for raw_variant in variant_metadata.values():
+        for path_key in (
+            TEXTURE_VARIANT_GLB_PATH_KEY,
+            TEXTURE_VARIANT_PNG_PATH_KEY,
+        ):
+            raw_path = raw_variant.get(path_key)
+            if isinstance(raw_path, str) and raw_path.strip():
+                paths.append(raw_path)
+        raw_map_paths = raw_variant.get(TEXTURE_VARIANT_MAP_PNG_PATHS_KEY)
+        if isinstance(raw_map_paths, Mapping):
+            for raw_path in raw_map_paths.values():
+                if isinstance(raw_path, str) and raw_path.strip():
+                    paths.append(raw_path)
+    return tuple(dict.fromkeys(paths))
 
 
 def _discard_generated_asset_paths(
@@ -7789,6 +8222,9 @@ def _materialize_texture_regeneration_preflight(
         projection_camera_percentages=(
             raw_request.projection_camera_percentages
         ),
+        enabled_pbr_maps=raw_request.enabled_pbr_maps,
+        glass_face_indices=raw_request.glass_face_indices,
+        preserve_existing_glass=raw_request.preserve_existing_glass,
     )
     return _MaterializedTextureRegeneration(
         request=request,
@@ -7811,7 +8247,7 @@ def _prepare_and_persist_object_generation(
     persisted_asset_paths: list[str] = []
     symmetry: ObjectSymmetricDivisionMetadata | None = None
     scan_projection_stats: ScanProjectionStats | None = None
-    variant_metadata: dict[str, dict[str, str]] | None = None
+    variant_metadata: dict[str, dict[str, object]] | None = None
     try:
         _raise_if_generation_cancelled(cancel_event)
         if isinstance(result, ScanProjectedMeshyGenerationResult):
@@ -7891,15 +8327,17 @@ def _prepare_and_persist_object_generation(
                 )
             )
             persisted_asset_paths.extend(
-                path
-                for variant in variant_metadata.values()
-                for path in variant.values()
+                _iter_variant_metadata_asset_paths(variant_metadata)
             )
             pipeline.update(
                 {
                     TEXTURE_VARIANTS_PIPELINE_KEY: variant_metadata,
                     SELECTED_TEXTURE_RESOLUTION_PIPELINE_KEY: (
                         DEFAULT_TEXTURE_RESOLUTION
+                    ),
+                    **_build_pbr_pipeline_metadata(
+                        request.enabled_pbr_maps,
+                        texture_variants,
                     ),
                 }
             )
@@ -8021,9 +8459,7 @@ def _prepare_and_persist_texture_regeneration(
             cancel_event=cancel_event,
         )
         persisted_asset_paths.extend(
-            path
-            for variant in variant_metadata.values()
-            for path in variant.values()
+            _iter_variant_metadata_asset_paths(variant_metadata)
         )
         selectable_resolutions = (
             TEXTURE_RESOLUTIONS
@@ -8326,6 +8762,29 @@ def _build_texture_resolution_entry_signature(
             file_revisions.append(
                 (resolution, path_key, raw_path, revision)
             )
+        raw_map_paths = variant[TEXTURE_VARIANT_MAP_PNG_PATHS_KEY]
+        assert isinstance(raw_map_paths, Mapping)
+        for map_type, raw_path in sorted(raw_map_paths.items()):
+            try:
+                map_asset_path = (asset_directory / str(raw_path)).resolve()
+                map_asset_path.relative_to(asset_root)
+                map_stat = map_asset_path.stat()
+                map_revision = (
+                    map_stat.st_size,
+                    map_stat.st_mtime_ns,
+                    map_stat.st_ctime_ns,
+                )
+            except (OSError, RuntimeError, ValueError):
+                map_revision = None
+            file_revisions.append(
+                (
+                    resolution,
+                    TEXTURE_VARIANT_MAP_PNG_PATHS_KEY,
+                    map_type,
+                    raw_path,
+                    map_revision,
+                )
+            )
     return (
         record.pipeline.get(FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY) is True,
         copy.deepcopy(raw_variants),
@@ -8350,7 +8809,7 @@ def _get_selected_texture_resolution(record: GeneratedObjectRecord) -> int:
 def _get_texture_variant_metadata(
     record: GeneratedObjectRecord,
     resolution: int,
-) -> dict[str, str] | None:
+) -> dict[str, object] | None:
     if int(resolution) not in TEXTURE_RESOLUTIONS:
         return None
     raw_variants = record.pipeline.get(TEXTURE_VARIANTS_PIPELINE_KEY)
@@ -8365,9 +8824,17 @@ def _get_texture_variant_metadata(
         return None
     if not isinstance(png_path, str) or not png_path.strip():
         return None
+    raw_map_paths = raw_variant.get(TEXTURE_VARIANT_MAP_PNG_PATHS_KEY)
+    map_paths: dict[str, str] = {ATLAS_MAP_BASE_COLOR: png_path}
+    if isinstance(raw_map_paths, Mapping):
+        for map_type in ATLAS_MAP_TYPES:
+            raw_path = raw_map_paths.get(map_type)
+            if isinstance(raw_path, str) and raw_path.strip():
+                map_paths[map_type] = raw_path
     return {
         TEXTURE_VARIANT_GLB_PATH_KEY: glb_path,
         TEXTURE_VARIANT_PNG_PATH_KEY: png_path,
+        TEXTURE_VARIANT_MAP_PNG_PATHS_KEY: map_paths,
     }
 
 

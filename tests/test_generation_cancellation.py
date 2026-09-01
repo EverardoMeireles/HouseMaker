@@ -111,12 +111,19 @@ def _model_with_variants(variants: ObjectTextureVariants) -> GeneratedModel:
 def _variant_paths(record: GeneratedObjectRecord) -> set[str]:
     raw_variants = record.pipeline["texture_variants"]
     assert isinstance(raw_variants, dict)
-    return {
-        str(path)
-        for variant in raw_variants.values()
-        if isinstance(variant, dict)
-        for path in variant.values()
-    }
+    paths: set[str] = set()
+    for variant in raw_variants.values():
+        if not isinstance(variant, dict):
+            continue
+        paths.update(
+            str(variant[path_key])
+            for path_key in ("glb_asset_path", "texture_asset_path")
+        )
+        paths.update(
+            str(path)
+            for path in variant.get("map_texture_asset_paths", {}).values()
+        )
+    return paths
 
 
 class _ImmediatePlanner:

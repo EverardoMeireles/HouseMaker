@@ -189,6 +189,31 @@ class MeshyRequestConstructionTests(unittest.TestCase):
         self.assertNotIn("texture_resolution", body)
         self.assertNotIn("enable_pbr", body)
 
+    def test_image_to_3d_request_can_enable_pbr_maps(self) -> None:
+        body = build_image_to_3d_request_body(
+            b"png bytes",
+            enable_pbr=True,
+        )
+
+        self.assertTrue(body["should_texture"])
+        self.assertTrue(body["enable_pbr"])
+
+    def test_image_to_3d_request_rejects_invalid_pbr_options(self) -> None:
+        for invalid_value in (1, "true", None):
+            with self.subTest(enable_pbr=invalid_value):
+                with self.assertRaisesRegex(ValueError, "enable_pbr"):
+                    build_image_to_3d_request_body(
+                        b"png bytes",
+                        enable_pbr=invalid_value,  # type: ignore[arg-type]
+                    )
+
+        with self.assertRaisesRegex(ValueError, "require texture generation"):
+            build_image_to_3d_request_body(
+                b"png bytes",
+                should_texture=False,
+                enable_pbr=True,
+            )
+
     def test_single_image_retexture_uses_edited_glb_without_task_id(self) -> None:
         model_glb = b"edited glb"
         reference_png = b"reference png"
@@ -244,6 +269,25 @@ class MeshyRequestConstructionTests(unittest.TestCase):
         self.assertTrue(body["enable_original_uv"])
         self.assertNotIn("image_style_url", body)
 
+    def test_retexture_request_can_enable_pbr_maps(self) -> None:
+        body = build_retexture_request_body(
+            model_glb=b"edited glb",
+            reference_images_png=[b"reference png"],
+            enable_pbr=True,
+        )
+
+        self.assertTrue(body["enable_pbr"])
+
+    def test_retexture_request_rejects_non_boolean_pbr_option(self) -> None:
+        for invalid_value in (1, "true", None):
+            with self.subTest(enable_pbr=invalid_value):
+                with self.assertRaisesRegex(ValueError, "enable_pbr"):
+                    build_retexture_request_body(
+                        model_glb=b"edited glb",
+                        reference_images_png=[b"reference png"],
+                        enable_pbr=invalid_value,  # type: ignore[arg-type]
+                    )
+
     def test_retexture_request_rejects_invalid_binary_inputs_and_image_counts(
         self,
     ) -> None:
@@ -293,6 +337,7 @@ class MeshyRequestConstructionTests(unittest.TestCase):
             timeout_seconds=8.5,
             opener=opener,
             target_polycount=6_789,
+            enable_pbr=True,
         )
 
         self.assertEqual(task_id, "task-123")
@@ -309,6 +354,7 @@ class MeshyRequestConstructionTests(unittest.TestCase):
         self.assertTrue(sent_body["image_url"].startswith("data:image/png;base64,"))
         self.assertIn("glb", sent_body["target_formats"])
         self.assertEqual(sent_body["target_polycount"], 6_789)
+        self.assertTrue(sent_body["enable_pbr"])
 
     def test_get_task_uses_same_endpoint_and_bearer_auth(self) -> None:
         task_payload = {
@@ -359,6 +405,7 @@ class MeshyRequestConstructionTests(unittest.TestCase):
             reference_images_png=[b"front", b"side"],
             timeout_seconds=7.5,
             opener=opener,
+            enable_pbr=True,
         )
         task = get_retexture_task(
             api_key="msy-test-secret",
@@ -375,6 +422,7 @@ class MeshyRequestConstructionTests(unittest.TestCase):
         sent_body = json.loads(create_request.data.decode("utf-8"))
         self.assertIn("model_url", sent_body)
         self.assertNotIn("input_task_id", sent_body)
+        self.assertTrue(sent_body["enable_pbr"])
         self.assertEqual(
             get_request.full_url,
             f"{MESHY_RETEXTURE_ENDPOINT}/retexture-123",
@@ -633,6 +681,7 @@ class MeshyImageTo3DClientTests(unittest.TestCase):
             opener=opener,
             sleep=lambda _seconds: None,
             target_polycount=5_432,
+            enable_pbr=True,
         )
 
         self.assertEqual(result.task_id, "task-123")
@@ -640,6 +689,7 @@ class MeshyImageTo3DClientTests(unittest.TestCase):
         self.assertEqual(len(opener.requests), 3)
         submitted_body = json.loads(opener.requests[0].data.decode("utf-8"))
         self.assertEqual(submitted_body["target_polycount"], 5_432)
+        self.assertTrue(submitted_body["enable_pbr"])
 
     def test_geometry_only_client_submits_without_texture_and_downloads_glb(
         self,
@@ -709,6 +759,7 @@ class MeshyImageTo3DClientTests(unittest.TestCase):
             progress_callback=lambda status, progress: progress_updates.append(
                 (status, progress)
             ),
+            enable_pbr=True,
         )
 
         self.assertEqual(result.task_id, "retexture-123")
@@ -719,6 +770,7 @@ class MeshyImageTo3DClientTests(unittest.TestCase):
         self.assertIn("model_url", submitted_body)
         self.assertNotIn("input_task_id", submitted_body)
         self.assertEqual(submitted_body["ai_model"], "meshy-7")
+        self.assertTrue(submitted_body["enable_pbr"])
 
     def test_http_and_network_errors_are_safe_and_retryable_when_expected(
         self,

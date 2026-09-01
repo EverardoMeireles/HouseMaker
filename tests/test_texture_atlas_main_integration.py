@@ -41,7 +41,9 @@ from housemaker.texture_atlas_state import (
     TextureAtlasData,
 )
 from housemaker.texture_atlas_workspace import (
+    ATLAS_MAP_NORMAL,
     build_atlas_wall_texture_source_id,
+    build_texture_atlas_map_image_relative_path,
 )
 
 
@@ -1364,6 +1366,118 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             self.assertEqual(
                 atlas_image.convert("RGBA").getpixel((256, 256)),
                 (20, 90, 160, 255),
+            )
+
+    def test_direct_object_change_refreshes_pbr_path_and_revision_changes(
+        self,
+    ) -> None:
+        asset_directory = self.settings.path.parent / "generated"
+        asset_directory.mkdir(parents=True, exist_ok=True)
+        glb_name = "pbr-refresh.glb"
+        base_name = "pbr-refresh.png"
+        first_normal_name = "pbr-refresh-normal-a.png"
+        second_normal_name = "pbr-refresh-normal-b.png"
+        (asset_directory / glb_name).write_bytes(b"available glb")
+        Image.new("RGBA", (512, 512), (40, 60, 80, 255)).save(
+            asset_directory / base_name
+        )
+        Image.new("RGBA", (512, 512), (110, 120, 230, 255)).save(
+            asset_directory / first_normal_name
+        )
+        variant_metadata = {
+            "glb_asset_path": glb_name,
+            "texture_asset_path": base_name,
+            "map_texture_asset_paths": {
+                "base_color": base_name,
+                "normal": first_normal_name,
+            },
+        }
+        record = GeneratedObjectRecord(
+            object_id="pbr-refresh",
+            frame_index=0,
+            object_name="PBR refresh",
+            pipeline={
+                "texture_variants": {"512": variant_metadata},
+                "selected_texture_resolution": 512,
+            },
+            provider_task_id="pbr-refresh-task",
+            asset_path=glb_name,
+        )
+        self.workspace.generation._data.generated_objects = [record]
+        self.workspace._atlas_generation_signature = None
+        self.workspace._atlas_source_content_paths = None
+        self.workspace._atlas_source_content_revisions = None
+        self.workspace._sync_atlas_object_texture_sources()
+
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        source = atlas_workspace._sources_by_object_id[record.object_id]
+        atlas_data = TextureAtlasData()
+        atlas = atlas_data.create_atlas(
+            "PBR refresh",
+            2048,
+            atlas_id="pbr-refresh-atlas",
+        )
+        atlas_data.assign_object(
+            atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+            source.packing_mode,
+        )
+        atlas_workspace.set_data(atlas_data)
+        self.assertEqual(atlas_workspace.materialize_missing_atlases(), 1)
+        normal_atlas_path = (
+            self.settings.path.parent
+            / "texture_atlases"
+            / build_texture_atlas_map_image_relative_path(
+                atlas.atlas_id,
+                ATLAS_MAP_NORMAL,
+            )
+        )
+        with Image.open(normal_atlas_path) as normal_atlas:
+            self.assertEqual(
+                normal_atlas.convert("RGBA").getpixel((256, 256)),
+                (110, 120, 230, 255),
+            )
+
+        Image.new("RGBA", (512, 512), (70, 150, 210, 255)).save(
+            asset_directory / second_normal_name
+        )
+        variant_metadata["map_texture_asset_paths"][
+            "normal"
+        ] = second_normal_name
+        self.workspace._handle_generated_object_changed_for_atlases(
+            record,
+            object(),
+        )
+
+        with Image.open(normal_atlas_path) as normal_atlas:
+            self.assertEqual(
+                normal_atlas.convert("RGBA").getpixel((256, 256)),
+                (70, 150, 210, 255),
+            )
+
+        second_normal_path = asset_directory / second_normal_name
+        Image.new("RGBA", (512, 512), (25, 190, 140, 255)).save(
+            second_normal_path
+        )
+        current_stat = second_normal_path.stat()
+        os.utime(
+            second_normal_path,
+            ns=(
+                current_stat.st_atime_ns,
+                current_stat.st_mtime_ns + 1_000_000,
+            ),
+        )
+        self.workspace._handle_generated_object_changed_for_atlases(
+            record,
+            object(),
+        )
+
+        with Image.open(normal_atlas_path) as normal_atlas:
+            self.assertEqual(
+                normal_atlas.convert("RGBA").getpixel((256, 256)),
+                (25, 190, 140, 255),
             )
 
     def test_fixed_wall_replacement_keeps_its_pinned_atlas_resolution(

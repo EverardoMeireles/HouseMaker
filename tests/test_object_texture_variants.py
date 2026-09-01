@@ -21,6 +21,10 @@ from housemaker.glb import import_generated_glb
 from housemaker.meshy_generation import MeshyGenerationResult
 import housemaker.object_texture_variants as object_texture_variants
 from housemaker.object_texture_variants import (
+    ATLAS_MAP_BASE_COLOR,
+    PBR_MAP_METALLIC,
+    PBR_MAP_NORMAL,
+    PBR_MAP_ROUGHNESS,
     TEXTURE_RESOLUTIONS,
     build_object_texture_variants,
     build_object_texture_variants_from_texture,
@@ -160,6 +164,62 @@ def _rewrite_uv_layout(
 
 # ### Variant algorithm tests ###
 class ObjectTextureVariantAlgorithmTests(unittest.TestCase):
+    def test_builds_and_splits_pbr_maps_at_every_resolution(self) -> None:
+        scene = trimesh.load(
+            BytesIO(_textured_glb()),
+            file_type="glb",
+            force="scene",
+            process=False,
+        )
+        for geometry in scene.geometry.values():
+            geometry.visual.material.normalTexture = Image.new(
+                "RGBA",
+                (2048, 2048),
+                (96, 144, 240, 255),
+            )
+            geometry.visual.material.metallicRoughnessTexture = Image.new(
+                "RGBA",
+                (2048, 2048),
+                (0, 72, 180, 255),
+            )
+
+        variants = build_object_texture_variants(
+            bytes(scene.export(file_type="glb"))
+        )
+
+        self.assertIsNotNone(variants)
+        assert variants is not None
+        self.assertEqual(
+            variants.available_map_types,
+            (
+                ATLAS_MAP_BASE_COLOR,
+                PBR_MAP_NORMAL,
+                PBR_MAP_ROUGHNESS,
+                PBR_MAP_METALLIC,
+            ),
+        )
+        assert variants.map_png_by_resolution is not None
+        expected_pixels = {
+            PBR_MAP_NORMAL: (96, 144, 240, 255),
+            PBR_MAP_ROUGHNESS: (72, 72, 72, 255),
+            PBR_MAP_METALLIC: (180, 180, 180, 255),
+        }
+        for resolution in TEXTURE_RESOLUTIONS:
+            for map_type, expected_pixel in expected_pixels.items():
+                with self.subTest(
+                    resolution=resolution,
+                    map_type=map_type,
+                ):
+                    with Image.open(
+                        BytesIO(
+                            variants.map_png_by_resolution[map_type][
+                                resolution
+                            ]
+                        )
+                    ) as image:
+                        self.assertEqual(image.size, (resolution, resolution))
+                        self.assertEqual(image.getpixel((0, 0)), expected_pixel)
+
     def test_native_2048_rgba_source_is_preserved_and_directly_downsized(
         self,
     ) -> None:
@@ -472,6 +532,85 @@ class ObjectTextureVariantAlgorithmTests(unittest.TestCase):
             generated_texture,
         )
 
+    def test_provider_pbr_maps_preserve_the_local_glass_alpha_mask(self) -> None:
+        model_scene = trimesh.load(
+            BytesIO(
+                _textured_glb(
+                    texture_size=(1024, 1024),
+                    texture_color=(12, 34, 56, 48),
+                )
+            ),
+            file_type="glb",
+            force="scene",
+            process=False,
+        )
+        for geometry in model_scene.geometry.values():
+            material = geometry.visual.material
+            material.name = (
+                object_texture_variants.HOUSEMAKER_GLASS_MATERIAL_NAME
+            )
+            material.alphaMode = "BLEND"
+
+        provider_scene = trimesh.load(
+            BytesIO(_textured_glb(texture_color=(91, 72, 53, 255))),
+            file_type="glb",
+            force="scene",
+            process=False,
+        )
+        for geometry in provider_scene.geometry.values():
+            material = geometry.visual.material
+            material.normalTexture = Image.new(
+                "RGBA",
+                (2048, 2048),
+                (110, 140, 240, 255),
+            )
+            material.metallicRoughnessTexture = Image.new(
+                "RGBA",
+                (2048, 2048),
+                (0, 9, 0, 255),
+            )
+
+        replaced_glb = replace_object_base_color_texture_from_glb(
+            bytes(model_scene.export(file_type="glb")),
+            bytes(provider_scene.export(file_type="glb")),
+        )
+
+        replaced_scene = trimesh.load(
+            BytesIO(replaced_glb),
+            file_type="glb",
+            force="scene",
+            process=False,
+        )
+        for geometry in replaced_scene.geometry.values():
+            material = geometry.visual.material
+            self.assertEqual(
+                material.name,
+                object_texture_variants.HOUSEMAKER_GLASS_MATERIAL_NAME,
+            )
+            self.assertEqual(material.alphaMode, "BLEND")
+            base_color = np.asarray(
+                material.baseColorTexture.convert("RGBA"),
+                dtype=np.uint8,
+            )
+            np.testing.assert_array_equal(
+                base_color[0, 0],
+                np.asarray((91, 72, 53, 48), dtype=np.uint8),
+            )
+            np.testing.assert_array_equal(
+                np.asarray(
+                    material.normalTexture.convert("RGBA"),
+                    dtype=np.uint8,
+                )[0, 0],
+                np.asarray((110, 140, 240, 255), dtype=np.uint8),
+            )
+            np.testing.assert_array_equal(
+                np.asarray(
+                    material.metallicRoughnessTexture.convert("RGBA"),
+                    dtype=np.uint8,
+                )[0, 0],
+                np.asarray((0, 9, 0, 255), dtype=np.uint8),
+            )
+
     def test_provider_texture_requires_one_shared_2048_atlas(self) -> None:
         model_glb = _textured_glb(texture_size=(1024, 1024))
 
@@ -547,11 +686,20 @@ class ObjectTextureVariantWorkspaceTests(unittest.TestCase):
             2048,
         )
 
-        all_paths = [
-            self.asset_directory / raw_path
-            for variant in selected.pipeline["texture_variants"].values()
-            for raw_path in variant.values()
-        ]
+        all_paths = []
+        for variant in selected.pipeline["texture_variants"].values():
+            all_paths.extend(
+                self.asset_directory / variant[path_key]
+                for path_key in ("glb_asset_path", "texture_asset_path")
+            )
+            all_paths.extend(
+                self.asset_directory / raw_path
+                for raw_path in variant.get(
+                    "map_texture_asset_paths",
+                    {},
+                ).values()
+            )
+        all_paths = list(dict.fromkeys(all_paths))
         self.assertTrue(all(path.is_file() for path in all_paths))
         exact_512.glb_asset_path.unlink()
         self.assertIsNone(

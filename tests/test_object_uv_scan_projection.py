@@ -11,7 +11,10 @@ from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
 from housemaker.object_texture_variants import (
+    MATERIAL_TEXTURE_METALLIC_ROUGHNESS,
+    MATERIAL_TEXTURE_NORMAL,
     TEXTURE_RESOLUTIONS,
+    _collect_material_texture_maps,
     _collect_material_textures,
     _load_glb_scene,
     _replace_material_textures,
@@ -37,6 +40,7 @@ from housemaker.object_uv_scan_projection import (
     _SceneGeometry,
     _assign_faces_to_cameras,
     _build_face_placements,
+    _build_effective_group_percentages,
     _partition_group_rectangles,
     _rasterize_visibility_face_samples,
     _select_face_camera,
@@ -930,6 +934,23 @@ def test_scan_layout_reports_only_true_global_group_overcapacity() -> None:
         )
 
 
+def test_glass_share_stays_one_percent_when_regular_groups_are_sparse() -> None:
+    camera_sparse = _build_effective_group_percentages(
+        DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
+        (1, 0, 0, 0, 0, 0, 0, 1),
+    )
+    fallback_only = _build_effective_group_percentages(
+        DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
+        (0, 0, 0, 0, 0, 0, 1, 1),
+    )
+
+    assert camera_sparse[0] == 99.0
+    assert camera_sparse[-1] == 1.0
+    assert sum(camera_sparse) == 100.0
+    assert fallback_only[-2:] == (99.0, 1.0)
+    assert sum(fallback_only) == 100.0
+
+
 # ### Failure and cancellation tests ###
 def test_rejects_untextured_wrong_resolution_and_distinct_atlases() -> None:
     untextured = trimesh.Scene(trimesh.creation.box()).export(file_type="glb")
@@ -965,7 +986,7 @@ def test_rejects_untextured_wrong_resolution_and_distinct_atlases() -> None:
         )
 
 
-def test_rejects_auxiliary_material_maps_instead_of_corrupting_them() -> None:
+def test_rebakes_pbr_material_maps_with_the_same_scan_layout() -> None:
     scene, mesh, _texture = _load_single_mesh_and_texture(
         _build_textured_cube_glb()
     )
@@ -973,12 +994,93 @@ def test_rejects_auxiliary_material_maps_instead_of_corrupting_them() -> None:
         _gradient_rgba(),
         mode="RGBA",
     )
+    metallic_roughness = np.empty(
+        (TEST_TEXTURE_RESOLUTION, TEST_TEXTURE_RESOLUTION, 4),
+        dtype=np.uint8,
+    )
+    metallic_roughness[:, :, :] = (0, 72, 190, 255)
+    mesh.visual.material.metallicRoughnessTexture = Image.fromarray(
+        metallic_roughness,
+        mode="RGBA",
+    )
 
-    with pytest.raises(ValueError, match="auxiliary material textures"):
+    result = scan_project_textured_glb(
+        bytes(scene.export(file_type="glb")),
+        texture_resolution=TEST_TEXTURE_RESOLUTION,
+    )
+
+    output_scene = _load_glb_scene(result.glb_bytes)
+    output_maps = _collect_material_texture_maps(output_scene)
+    assert set(output_maps) == {
+        "base_color",
+        MATERIAL_TEXTURE_NORMAL,
+        MATERIAL_TEXTURE_METALLIC_ROUGHNESS,
+    }
+    assert all(
+        texture.shape
+        == (TEST_TEXTURE_RESOLUTION, TEST_TEXTURE_RESOLUTION, 4)
+        for textures in output_maps.values()
+        for texture in textures
+    )
+
+
+def test_rejects_uv_dependent_maps_that_cannot_be_rebaked() -> None:
+    scene, mesh, _texture = _load_single_mesh_and_texture(
+        _build_textured_cube_glb()
+    )
+    mesh.visual.material.emissiveTexture = Image.fromarray(
+        _gradient_rgba(),
+        mode="RGBA",
+    )
+
+    with pytest.raises(ValueError, match="does not support emissive"):
         scan_project_textured_glb(
             bytes(scene.export(file_type="glb")),
             texture_resolution=TEST_TEXTURE_RESOLUTION,
         )
+
+
+def test_glass_faces_receive_one_percent_group_and_persisted_pbr_mask() -> None:
+    first = scan_project_textured_glb(
+        _build_textured_cube_glb(),
+        texture_resolution=TEST_TEXTURE_RESOLUTION,
+        glass_face_indices=(0,),
+    )
+
+    first_scene = _load_glb_scene(first.glb_bytes)
+    first_maps = {
+        map_type: textures[0]
+        for map_type, textures in _collect_material_texture_maps(
+            first_scene
+        ).items()
+    }
+    glass_mask = first_maps["base_color"][:, :, 3] <= 96
+    assert first.stats.glass_face_count == 1
+    assert first.stats.glass_pixel_count == np.count_nonzero(glass_mask)
+    assert np.all(
+        first_maps[MATERIAL_TEXTURE_NORMAL][glass_mask, :3]
+        == (128, 128, 255)
+    )
+    assert np.all(
+        first_maps[MATERIAL_TEXTURE_METALLIC_ROUGHNESS][glass_mask, 1]
+        == 10
+    )
+    assert np.all(
+        first_maps[MATERIAL_TEXTURE_METALLIC_ROUGHNESS][glass_mask, 2]
+        == 0
+    )
+    material = next(iter(first_scene.geometry.values())).visual.material
+    assert material.name == "HouseMaker Glass"
+    assert material.alphaMode == "BLEND"
+    assert material.doubleSided is True
+
+    second = scan_project_textured_glb(
+        first.glb_bytes,
+        texture_resolution=TEST_TEXTURE_RESOLUTION,
+    )
+
+    assert second.stats.glass_face_count > 0
+    assert second.stats.glass_pixel_count == first.stats.glass_pixel_count
 
 
 def test_validates_target_and_honors_cancellation() -> None:

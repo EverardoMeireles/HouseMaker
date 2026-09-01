@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import numpy as np
 from OpenGL import GL
@@ -19,18 +19,30 @@ from PySide6.QtGui import QFocusEvent, QKeyEvent, QVector3D
 from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import QApplication
 from PIL import Image
-from trimesh.visual.material import PBRMaterial
+from trimesh.visual.material import MultiMaterial, PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
 from housemaker.camera_models import CameraPose
 from housemaker.camera_indicators import INDICATOR_SELECTED_COLOR
-from housemaker.glb import GeneratedModel, PreviewTexturedWall
+from housemaker.glb import (
+    GeneratedModel,
+    PreviewPlacedObject,
+    PreviewTexturedSurface,
+    PreviewTexturedWall,
+)
+from housemaker.object_texture_variants import (
+    PBR_MAP_METALLIC,
+    PBR_MAP_NORMAL,
+    PBR_MAP_ROUGHNESS,
+)
 from housemaker.unused_face_removal import ALL_CAMERA_IDS
 from housemaker.viewer import (
     NAVIGATION_MODE_FIRST_PERSON,
     NAVIGATION_MODE_ORBIT,
     GlbViewerWidget,
     SelectableGLViewWidget,
+    TexturedMeshItem,
+    _build_texture_mesh_data,
     _project_vertices_to_view,
 )
 
@@ -192,6 +204,304 @@ class GlbViewerRenderingTests(unittest.TestCase):
 
         self.assertFalse(textured_item._edit_mask_enabled)
         np.testing.assert_array_equal(textured_item._texture_rgba, base_texture)
+
+    def test_nested_material_pbr_maps_are_extracted_by_gltf_channel(self) -> None:
+        model = _build_generated_model(textured=True)
+        normal_pixels = np.full(
+            (2, 2, 4),
+            (80, 120, 240, 255),
+            dtype=np.uint8,
+        )
+        packed_pixels = np.full(
+            (2, 2, 4),
+            (11, 73, 191, 255),
+            dtype=np.uint8,
+        )
+        nested_material = MultiMaterial(
+            materials=[
+                PBRMaterial(
+                    baseColorTexture=model.mesh.visual.material.baseColorTexture,
+                    normalTexture=Image.fromarray(normal_pixels, mode="RGBA"),
+                    metallicRoughnessTexture=Image.fromarray(
+                        packed_pixels,
+                        mode="RGBA",
+                    ),
+                )
+            ]
+        )
+        model.mesh.visual = TextureVisuals(
+            uv=np.asarray(model.mesh.visual.uv, dtype=float),
+            material=nested_material,
+            face_materials=np.zeros(len(model.mesh.faces), dtype=np.int64),
+        )
+
+        texture_data = _build_texture_mesh_data(model.mesh)
+
+        self.assertIsNotNone(texture_data)
+        assert texture_data is not None
+        np.testing.assert_array_equal(
+            texture_data.normal_texture_rgba,
+            normal_pixels,
+        )
+        assert texture_data.roughness_texture_rgba is not None
+        assert texture_data.metallic_texture_rgba is not None
+        np.testing.assert_array_equal(
+            texture_data.roughness_texture_rgba[:, :, 0],
+            np.full((2, 2), 73, dtype=np.uint8),
+        )
+        np.testing.assert_array_equal(
+            texture_data.metallic_texture_rgba[:, :, 0],
+            np.full((2, 2), 191, dtype=np.uint8),
+        )
+
+    def test_missing_pbr_maps_use_neutral_preview_textures(self) -> None:
+        viewer = self._build_viewer()
+        viewer.set_model(_build_generated_model(textured=True))
+
+        assert viewer.textured_mesh_item is not None
+        textured_item = viewer.textured_mesh_item
+        self.assertFalse(textured_item._normal_texture_available)
+        self.assertFalse(textured_item._roughness_texture_available)
+        self.assertFalse(textured_item._metallic_texture_available)
+        self.assertIsNone(textured_item._tangents)
+        self.assertIsNone(textured_item._bitangents)
+        np.testing.assert_array_equal(
+            textured_item._normal_texture_rgba[0, 0],
+            np.asarray((128, 128, 255, 255), dtype=np.uint8),
+        )
+        np.testing.assert_array_equal(
+            textured_item._roughness_texture_rgba[0, 0],
+            np.asarray((255, 255, 255, 255), dtype=np.uint8),
+        )
+        np.testing.assert_array_equal(
+            textured_item._metallic_texture_rgba[0, 0],
+            np.asarray((0, 0, 0, 255), dtype=np.uint8),
+        )
+
+    def test_pbr_map_state_updates_all_textured_preview_kinds(self) -> None:
+        model = _build_generated_model(textured=True)
+        normal_pixels = np.full(
+            (2, 2, 4),
+            (128, 128, 255, 255),
+            dtype=np.uint8,
+        )
+        packed_pixels = np.full(
+            (2, 2, 4),
+            (0, 180, 40, 255),
+            dtype=np.uint8,
+        )
+        model.mesh.visual.material.normalTexture = Image.fromarray(
+            normal_pixels,
+            mode="RGBA",
+        )
+        model.mesh.visual.material.metallicRoughnessTexture = Image.fromarray(
+            packed_pixels,
+            mode="RGBA",
+        )
+        surface_mesh = model.mesh.copy()
+        placed_mesh = model.mesh.copy()
+        model.preview_base_mesh = model.mesh
+        model.preview_textured_surfaces = [
+            PreviewTexturedSurface(
+                surface_id="floor-one",
+                surface_type="floor",
+                mesh=surface_mesh,
+            )
+        ]
+        model.preview_placed_objects = [
+            PreviewPlacedObject(
+                object_id="placed-one",
+                meshes=(placed_mesh,),
+                placement_transform=np.eye(4, dtype=float),
+                world_position=(0.0, 0.0, 0.0),
+                rotation_degrees=(0.0, 0.0, 0.0),
+                symmetric_preview_orientation="vertical",
+                symmetric_preview_plane_coordinate=0.5,
+            )
+        ]
+        viewer = self._build_viewer(window_editing_enabled=True)
+        viewer.set_pbr_maps_enabled((PBR_MAP_NORMAL,))
+
+        viewer.set_model(model)
+
+        initial_items = viewer._iter_textured_mesh_items()
+        self.assertGreaterEqual(len(initial_items), 4)
+        for item in initial_items:
+            self.assertTrue(np.all(np.isfinite(item._tangents)))
+            self.assertTrue(np.all(np.isfinite(item._bitangents)))
+            self.assertEqual(
+                item.get_pbr_maps_enabled(),
+                {
+                    PBR_MAP_NORMAL: True,
+                    PBR_MAP_ROUGHNESS: False,
+                    PBR_MAP_METALLIC: False,
+                },
+            )
+
+        expected = {
+            PBR_MAP_NORMAL: False,
+            PBR_MAP_ROUGHNESS: True,
+            PBR_MAP_METALLIC: True,
+        }
+        viewer.set_pbr_maps_enabled(expected)
+
+        self.assertEqual(viewer.get_pbr_maps_enabled(), expected)
+        for item in viewer._iter_textured_mesh_items():
+            self.assertEqual(item.get_pbr_maps_enabled(), expected)
+
+        viewer.set_textures_enabled(False)
+
+        for item in viewer._iter_textured_mesh_items():
+            self.assertFalse(item.visible())
+
+    def test_image_wall_items_are_not_treated_as_textured_mesh_items(self) -> None:
+        viewer = self._build_viewer()
+        wall_item = gl.GLImageItem(
+            np.zeros((2, 2, 4), dtype=np.uint8)
+        )
+        viewer.textured_wall_items = [wall_item]
+
+        viewer.set_pbr_maps_enabled((PBR_MAP_ROUGHNESS,))
+
+        self.assertNotIn(wall_item, viewer._iter_textured_mesh_items())
+
+    def test_disabled_pbr_maps_defer_tangents_and_gl_uploads(self) -> None:
+        model = _build_generated_model(textured=True)
+        normal_pixels = np.full(
+            (2, 2, 4),
+            (128, 128, 255, 255),
+            dtype=np.uint8,
+        )
+        packed_pixels = np.full(
+            (2, 2, 4),
+            (0, 160, 70, 255),
+            dtype=np.uint8,
+        )
+        model.mesh.visual.material.normalTexture = Image.fromarray(
+            normal_pixels,
+            mode="RGBA",
+        )
+        model.mesh.visual.material.metallicRoughnessTexture = Image.fromarray(
+            packed_pixels,
+            mode="RGBA",
+        )
+        texture_data = _build_texture_mesh_data(model.mesh)
+        assert texture_data is not None
+
+        item = TexturedMeshItem(texture_data, 1.0)
+
+        self.assertIsNone(item._tangents)
+        self.assertIsNone(item._bitangents)
+        self.assertIsNone(item._normal_texture_id)
+        self.assertIsNone(item._roughness_texture_id)
+        self.assertIsNone(item._metallic_texture_id)
+
+        item.set_pbr_maps_enabled((PBR_MAP_ROUGHNESS,))
+        self.assertIsNone(item._tangents)
+        item.set_pbr_maps_enabled((PBR_MAP_NORMAL, PBR_MAP_ROUGHNESS))
+        self.assertIsNotNone(item._tangents)
+        self.assertIsNotNone(item._bitangents)
+        self.assertIsNone(item._normal_texture_id)
+        self.assertIsNone(item._roughness_texture_id)
+
+    def test_textured_item_releases_every_owned_gl_resource(self) -> None:
+        model = _build_generated_model(textured=True)
+        texture_data = _build_texture_mesh_data(model.mesh)
+        assert texture_data is not None
+        item = TexturedMeshItem(texture_data, 1.0)
+        item._position_buffer = 11
+        item._normal_buffer = 12
+        item._tangent_buffer = 13
+        item._bitangent_buffer = 14
+        item._texture_coordinate_buffer = 15
+        item._texture_id = 21
+        item._edit_mask_texture_id = 22
+        item._normal_texture_id = 23
+        item._roughness_texture_id = 24
+        item._metallic_texture_id = 25
+        item._shader_program = 31
+        item._resources_uploaded = True
+
+        with (
+            patch.object(GL, "glDeleteBuffers") as delete_buffers,
+            patch.object(GL, "glDeleteTextures") as delete_textures,
+            patch.object(GL, "glDeleteProgram") as delete_program,
+        ):
+            released = item._release_gl_resources_in_current_context()
+
+        self.assertTrue(released)
+        self.assertEqual(delete_buffers.call_args.args[0], 5)
+        self.assertEqual(
+            tuple(delete_buffers.call_args.args[1]),
+            (11, 12, 13, 14, 15),
+        )
+        self.assertEqual(delete_textures.call_args.args[0], 5)
+        self.assertEqual(
+            tuple(delete_textures.call_args.args[1]),
+            (21, 22, 23, 24, 25),
+        )
+        delete_program.assert_called_once_with(31)
+        self.assertFalse(item._has_gl_resource_handles())
+        self.assertFalse(item._resources_uploaded)
+
+    def test_model_rebuild_releases_textured_resources_before_clear(self) -> None:
+        viewer = self._build_viewer()
+        viewer.set_model(_build_generated_model(textured=True))
+
+        with patch.object(
+            viewer,
+            "_release_textured_mesh_gl_resources",
+        ) as release_resources:
+            viewer.set_model(_build_generated_model(textured=True))
+
+        release_resources.assert_called_once_with()
+
+    def test_mixed_alpha_uses_scoped_opaque_and_translucent_passes(self) -> None:
+        model = _build_generated_model(textured=True)
+        mixed_texture = np.full((2, 2, 4), 255, dtype=np.uint8)
+        mixed_texture[0, 0, 3] = 48
+        model.mesh.visual.material.baseColorTexture = Image.fromarray(
+            mixed_texture,
+            mode="RGBA",
+        )
+        texture_data = _build_texture_mesh_data(model.mesh)
+        assert texture_data is not None
+        item = TexturedMeshItem(texture_data, 1.0)
+        item._shader_program = 37
+
+        options = item._GLGraphicsItem__glOpts
+        self.assertFalse(options[GL.GL_BLEND])
+        self.assertEqual(item._transparency_mode, "mixed")
+        with (
+            patch("housemaker.viewer._set_float_uniform") as set_uniform,
+            patch.object(GL, "glDrawArrays") as draw_arrays,
+            patch.object(GL, "glDepthMask") as depth_mask,
+            patch.object(GL, "glBlendFuncSeparate") as blend_function,
+            patch.object(GL, "glEnable") as enable,
+            patch.object(GL, "glDisable") as disable,
+        ):
+            item._draw_bound_triangles()
+
+        self.assertEqual(draw_arrays.call_count, 2)
+        self.assertEqual(
+            [call.args[2] for call in set_uniform.call_args_list],
+            [1.0, 2.0],
+        )
+        self.assertEqual(
+            [call.args[0] for call in depth_mask.call_args_list],
+            [GL.GL_TRUE, GL.GL_FALSE, GL.GL_TRUE],
+        )
+        blend_function.assert_called_once_with(
+            GL.GL_SRC_ALPHA,
+            GL.GL_ONE_MINUS_SRC_ALPHA,
+            GL.GL_ONE,
+            GL.GL_ONE_MINUS_SRC_ALPHA,
+        )
+        enable.assert_called_once_with(GL.GL_BLEND)
+        self.assertEqual(
+            disable.call_args_list,
+            [call(GL.GL_BLEND), call(GL.GL_BLEND)],
+        )
 
     def test_textured_wall_uses_translucent_gl_options_for_alpha_mask(
         self,

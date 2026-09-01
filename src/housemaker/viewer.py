@@ -17,7 +17,13 @@ import pyqtgraph.opengl as gl
 from pyqtgraph.opengl import shaders as gl_shaders
 from pyqtgraph.opengl.GLGraphicsItem import GLGraphicsItem
 from PySide6.QtCore import QPoint, QPointF, QRect, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QCursor, QKeyEvent, QMouseEvent, QVector3D
+from PySide6.QtGui import (
+    QCursor,
+    QKeyEvent,
+    QMouseEvent,
+    QOpenGLContext,
+    QVector3D,
+)
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -44,6 +50,12 @@ from housemaker.glb import (
     PreviewPlacedObject,
     PreviewTexturedWall,
 )
+from housemaker.object_texture_variants import (
+    PBR_MAP_METALLIC,
+    PBR_MAP_NORMAL,
+    PBR_MAP_ROUGHNESS,
+    PBR_MAP_TYPES,
+)
 from housemaker.surface_geometry import (
     FixedSurface,
     SURFACE_TYPE_WALL,
@@ -69,6 +81,16 @@ MAX_TEXTURE_PREVIEW_DIMENSION = 4096
 DEFAULT_TEXTURES_ENABLED = True
 DEFAULT_WIREFRAME_ENABLED = True
 DEFAULT_WIREFRAME_ONLY = False
+DEFAULT_PBR_MAPS_ENABLED = {
+    map_type: False
+    for map_type in PBR_MAP_TYPES
+}
+NEUTRAL_NORMAL_TEXTURE_RGBA = (128, 128, 255, 255)
+NEUTRAL_ROUGHNESS_TEXTURE_RGBA = (255, 255, 255, 255)
+NEUTRAL_METALLIC_TEXTURE_RGBA = (0, 0, 0, 255)
+TEXTURE_ALPHA_MODE_OPAQUE = "opaque"
+TEXTURE_ALPHA_MODE_MIXED = "mixed"
+TEXTURE_ALPHA_MODE_TRANSLUCENT = "translucent"
 NAVIGATION_MODE_ORBIT = "orbit"
 NAVIGATION_MODE_FIRST_PERSON = "first_person"
 VIEWER_NAVIGATION_MODES = frozenset(
@@ -147,11 +169,17 @@ TEXTURED_AMBIENT_VERTEX_SHADER = """
     uniform mat3 u_normal;
     attribute vec3 a_position;
     attribute vec3 a_normal;
+    attribute vec3 a_tangent;
+    attribute vec3 a_bitangent;
     attribute vec2 a_texcoord;
     varying vec3 v_normal;
+    varying vec3 v_tangent;
+    varying vec3 v_bitangent;
     varying vec2 v_texcoord;
     void main() {
         v_normal = normalize(u_normal * a_normal);
+        v_tangent = normalize(u_normal * a_tangent);
+        v_bitangent = normalize(u_normal * a_bitangent);
         v_texcoord = a_texcoord;
         gl_Position = u_mvp * vec4(a_position, 1.0);
     }
@@ -162,13 +190,36 @@ TEXTURED_AMBIENT_FRAGMENT_SHADER = """
     #endif
     uniform sampler2D u_texture;
     uniform sampler2D u_edit_mask;
+    uniform sampler2D u_normal_texture;
+    uniform sampler2D u_roughness_texture;
+    uniform sampler2D u_metallic_texture;
     uniform float u_edit_mask_enabled;
+    uniform float u_normal_map_enabled;
+    uniform float u_roughness_map_enabled;
+    uniform float u_metallic_map_enabled;
+    uniform float u_alpha_pass;
     uniform float u_ambient_light;
     uniform float u_opacity;
     varying vec3 v_normal;
+    varying vec3 v_tangent;
+    varying vec3 v_bitangent;
     varying vec2 v_texcoord;
     void main() {
         vec4 base_color = texture2D(u_texture, v_texcoord);
+        float output_alpha = base_color.a * u_opacity;
+        if (output_alpha <= 0.001) {
+            discard;
+        }
+        if (u_alpha_pass > 1.5 && output_alpha >= 0.999) {
+            discard;
+        }
+        if (
+            u_alpha_pass > 0.5
+            && u_alpha_pass <= 1.5
+            && output_alpha < 0.999
+        ) {
+            discard;
+        }
         float edit_amount = texture2D(u_edit_mask, v_texcoord).r
             * u_edit_mask_enabled * 0.58;
         base_color.rgb = mix(
@@ -176,11 +227,66 @@ TEXTURED_AMBIENT_FRAGMENT_SHADER = """
             vec3(1.0, 0.49411765, 0.12549020),
             edit_amount
         );
-        float diffuse = max(dot(v_normal, normalize(vec3(1.0, -1.0, -1.0))), 0.0);
+        vec3 surface_normal = normalize(v_normal);
+        if (u_normal_map_enabled > 0.5) {
+            vec3 tangent_normal = texture2D(
+                u_normal_texture,
+                v_texcoord
+            ).rgb * 2.0 - 1.0;
+            mat3 tangent_basis = mat3(
+                normalize(v_tangent),
+                normalize(v_bitangent),
+                surface_normal
+            );
+            surface_normal = normalize(tangent_basis * tangent_normal);
+        }
+        vec3 light_direction = normalize(vec3(1.0, -1.0, -1.0));
+        float diffuse = max(dot(surface_normal, light_direction), 0.0);
         float illumination = min(1.0, u_ambient_light + diffuse * 0.65);
+        float normal_detail_illumination = mix(0.72, 1.0, diffuse);
+        illumination = mix(
+            illumination,
+            normal_detail_illumination,
+            u_normal_map_enabled
+        );
+        float roughness = 1.0;
+        if (u_roughness_map_enabled > 0.5) {
+            roughness = texture2D(
+                u_roughness_texture,
+                v_texcoord
+            ).r;
+        }
+        float metallic = 0.0;
+        if (u_metallic_map_enabled > 0.5) {
+            metallic = texture2D(
+                u_metallic_texture,
+                v_texcoord
+            ).r;
+        }
+        vec3 lit_color = base_color.rgb * illumination;
+        if (
+            u_roughness_map_enabled > 0.5
+            || u_metallic_map_enabled > 0.5
+        ) {
+            vec3 view_direction = vec3(0.0, 0.0, 1.0);
+            vec3 half_direction = normalize(light_direction + view_direction);
+            float shininess = mix(96.0, 4.0, roughness);
+            float specular_amount = pow(
+                max(dot(surface_normal, half_direction), 0.0),
+                shininess
+            ) * (1.0 - roughness * 0.72);
+            vec3 reflection_color = mix(
+                vec3(0.04),
+                base_color.rgb,
+                metallic
+            );
+            vec3 diffuse_color = base_color.rgb * (1.0 - metallic * 0.68);
+            lit_color = diffuse_color * illumination
+                + reflection_color * specular_amount * 0.8;
+        }
         gl_FragColor = vec4(
-            base_color.rgb * illumination,
-            base_color.a * u_opacity
+            lit_color,
+            output_alpha
         );
     }
 """
@@ -189,12 +295,15 @@ TEXTURED_AMBIENT_FRAGMENT_SHADER = """
 # ### Data models ###
 @dataclass(frozen=True)
 class TextureMeshData:
-    """Face-expanded geometry and one embedded base-color texture."""
+    """Face-expanded geometry and its embedded material textures."""
 
     vertices: np.ndarray
     normals: np.ndarray
     texture_coordinates: np.ndarray
     texture_rgba: np.ndarray
+    normal_texture_rgba: np.ndarray | None = None
+    roughness_texture_rgba: np.ndarray | None = None
+    metallic_texture_rgba: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -1072,9 +1181,9 @@ class TexturedMeshItem(GLGraphicsItem):
         double_sided: bool = True,
         opacity: float = 1.0,
         translucent: bool = False,
+        pbr_maps_enabled: Mapping[str, bool] | Sequence[str] | None = None,
     ) -> None:
         super().__init__()
-        self.setGLOptions("translucent" if translucent else "opaque")
         self._vertices = np.ascontiguousarray(
             texture_mesh_data.vertices,
             dtype=np.float32,
@@ -1091,6 +1200,38 @@ class TexturedMeshItem(GLGraphicsItem):
             texture_mesh_data.texture_rgba,
             dtype=np.uint8,
         )
+        self._contains_transparent_texels = bool(
+            np.any(self._texture_rgba[:, :, 3] < 255)
+        )
+        self._translucent_requested = bool(translucent)
+        self._opacity = _normalize_preview_opacity(opacity)
+        self._transparency_mode = TEXTURE_ALPHA_MODE_OPAQUE
+        self._normal_texture_available = (
+            texture_mesh_data.normal_texture_rgba is not None
+        )
+        self._roughness_texture_available = (
+            texture_mesh_data.roughness_texture_rgba is not None
+        )
+        self._metallic_texture_available = (
+            texture_mesh_data.metallic_texture_rgba is not None
+        )
+        self._normal_texture_rgba = _normalize_optional_texture_rgba(
+            texture_mesh_data.normal_texture_rgba,
+            NEUTRAL_NORMAL_TEXTURE_RGBA,
+        )
+        self._roughness_texture_rgba = _normalize_optional_texture_rgba(
+            texture_mesh_data.roughness_texture_rgba,
+            NEUTRAL_ROUGHNESS_TEXTURE_RGBA,
+        )
+        self._metallic_texture_rgba = _normalize_optional_texture_rgba(
+            texture_mesh_data.metallic_texture_rgba,
+            NEUTRAL_METALLIC_TEXTURE_RGBA,
+        )
+        self._pbr_maps_enabled = _normalize_pbr_maps_enabled(pbr_maps_enabled)
+        self._tangents: np.ndarray | None = None
+        self._bitangents: np.ndarray | None = None
+        if self._pbr_maps_enabled[PBR_MAP_NORMAL]:
+            self._ensure_tangent_frames()
         self._edit_mask = np.zeros((1, 1), dtype=np.uint8)
         self._edit_mask_enabled = False
         self._ambient_light_intensity = _normalize_ambient_light_intensity(
@@ -1098,15 +1239,64 @@ class TexturedMeshItem(GLGraphicsItem):
         )
         self._texture_repeat = bool(texture_repeat)
         self._double_sided = bool(double_sided)
-        self._opacity = _normalize_preview_opacity(opacity)
         self._position_buffer: int | None = None
         self._normal_buffer: int | None = None
+        self._tangent_buffer: int | None = None
+        self._bitangent_buffer: int | None = None
         self._texture_coordinate_buffer: int | None = None
         self._texture_id: int | None = None
         self._edit_mask_texture_id: int | None = None
+        self._normal_texture_id: int | None = None
+        self._roughness_texture_id: int | None = None
+        self._metallic_texture_id: int | None = None
         self._shader_program: int | None = None
         self._resources_uploaded = False
         self._edit_mask_dirty = False
+        self._sync_transparency_mode()
+
+    def _sync_transparency_mode(self) -> None:
+        """Choose opaque, mixed-alpha, or fully translucent rendering."""
+
+        if self._translucent_requested or self._opacity < 1.0:
+            self._transparency_mode = TEXTURE_ALPHA_MODE_TRANSLUCENT
+            self.setGLOptions(
+                {
+                    GL.GL_DEPTH_TEST: True,
+                    GL.GL_BLEND: True,
+                    GL.GL_CULL_FACE: False,
+                    "glBlendFuncSeparate": (
+                        GL.GL_SRC_ALPHA,
+                        GL.GL_ONE_MINUS_SRC_ALPHA,
+                        GL.GL_ONE,
+                        GL.GL_ONE_MINUS_SRC_ALPHA,
+                    ),
+                    "glDepthMask": (False,),
+                }
+            )
+            return
+        self._transparency_mode = (
+            TEXTURE_ALPHA_MODE_MIXED
+            if self._contains_transparent_texels
+            else TEXTURE_ALPHA_MODE_OPAQUE
+        )
+        # Mixed-alpha meshes start in the opaque state. Their paint method
+        # writes opaque texels first, then blends only translucent texels.
+        self.setGLOptions("opaque")
+
+    def _ensure_tangent_frames(self) -> None:
+        """Build normal-map tangent data only once it can affect rendering."""
+
+        if (
+            not self._normal_texture_available
+            or self._tangents is not None
+            or self._bitangents is not None
+        ):
+            return
+        self._tangents, self._bitangents = _build_texture_tangent_frames(
+            self._vertices,
+            self._normals,
+            self._texture_coordinates,
+        )
 
     def set_ambient_light_intensity(self, intensity: float) -> None:
         self._ambient_light_intensity = _normalize_ambient_light_intensity(
@@ -1121,7 +1311,27 @@ class TexturedMeshItem(GLGraphicsItem):
         if normalized == self._opacity:
             return
         self._opacity = normalized
+        self._sync_transparency_mode()
         self.update()
+
+    def set_pbr_maps_enabled(
+        self,
+        enabled_maps: Mapping[str, bool] | Sequence[str] | None,
+    ) -> None:
+        """Apply map-preview toggles without rebuilding mesh resources."""
+
+        normalized = _normalize_pbr_maps_enabled(enabled_maps)
+        if normalized == self._pbr_maps_enabled:
+            return
+        self._pbr_maps_enabled = normalized
+        if normalized[PBR_MAP_NORMAL]:
+            self._ensure_tangent_frames()
+        self.update()
+
+    def get_pbr_maps_enabled(self) -> dict[str, bool]:
+        """Return an isolated copy of the active material-map toggles."""
+
+        return dict(self._pbr_maps_enabled)
 
     def set_edit_mask(self, mask: np.ndarray | None) -> None:
         """Overlay the editable texels in orange without changing the model."""
@@ -1147,8 +1357,136 @@ class TexturedMeshItem(GLGraphicsItem):
         self._edit_mask_dirty = True
         self.update()
 
-    def initializeGL(self) -> None:
+    def _setView(self, view) -> None:
+        """Release owned GL names before pyqtgraph detaches this item."""
+
+        if view is None and self.view() is not None:
+            self.release_gl_resources()
+        super()._setView(view)
+
+    def release_gl_resources(self) -> bool:
+        """Delete this item's OpenGL objects using its owning view context."""
+
+        if not self._has_gl_resource_handles():
+            self._reset_gl_resource_handles()
+            return True
+        view = self.view()
+        if view is None:
+            return False
+        try:
+            context = view.context()
+        except (AttributeError, RuntimeError):
+            return False
+        if context is None or not context.isValid():
+            # An invalid/destroyed context has already discarded its objects.
+            self._reset_gl_resource_handles()
+            return True
+
+        current_context = QOpenGLContext.currentContext()
+        made_current = current_context is not context
+        if made_current:
+            try:
+                view.makeCurrent()
+            except RuntimeError:
+                return False
+            if QOpenGLContext.currentContext() is not context:
+                view.doneCurrent()
+                return False
+        try:
+            return self._release_gl_resources_in_current_context()
+        finally:
+            if made_current:
+                view.doneCurrent()
+
+    def _has_gl_resource_handles(self) -> bool:
+        return any(
+            handle is not None
+            for handle in (
+                self._position_buffer,
+                self._normal_buffer,
+                self._tangent_buffer,
+                self._bitangent_buffer,
+                self._texture_coordinate_buffer,
+                self._texture_id,
+                self._edit_mask_texture_id,
+                self._normal_texture_id,
+                self._roughness_texture_id,
+                self._metallic_texture_id,
+                self._shader_program,
+            )
+        )
+
+    def _release_gl_resources_in_current_context(self) -> bool:
+        """Delete every currently allocated GL name, then clear local handles."""
+
+        buffer_ids = tuple(
+            int(buffer_id)
+            for buffer_id in (
+                self._position_buffer,
+                self._normal_buffer,
+                self._tangent_buffer,
+                self._bitangent_buffer,
+                self._texture_coordinate_buffer,
+            )
+            if buffer_id is not None
+        )
+        texture_ids = tuple(
+            int(texture_id)
+            for texture_id in (
+                self._texture_id,
+                self._edit_mask_texture_id,
+                self._normal_texture_id,
+                self._roughness_texture_id,
+                self._metallic_texture_id,
+            )
+            if texture_id is not None
+        )
+        shader_program = self._shader_program
+        released = True
+        try:
+            if buffer_ids:
+                GL.glDeleteBuffers(
+                    len(buffer_ids),
+                    np.asarray(buffer_ids, dtype=np.uint32),
+                )
+        except Exception:
+            released = False
+        try:
+            if texture_ids:
+                GL.glDeleteTextures(
+                    len(texture_ids),
+                    np.asarray(texture_ids, dtype=np.uint32),
+                )
+        except Exception:
+            released = False
+        try:
+            if shader_program is not None:
+                GL.glDeleteProgram(int(shader_program))
+        except Exception:
+            released = False
+        self._reset_gl_resource_handles()
+        return released
+
+    def _reset_gl_resource_handles(self) -> None:
+        self._position_buffer = None
+        self._normal_buffer = None
+        self._tangent_buffer = None
+        self._bitangent_buffer = None
+        self._texture_coordinate_buffer = None
+        self._texture_id = None
+        self._edit_mask_texture_id = None
+        self._normal_texture_id = None
+        self._roughness_texture_id = None
+        self._metallic_texture_id = None
+        self._shader_program = None
         self._resources_uploaded = False
+        self._edit_mask_dirty = False
+
+    def initializeGL(self) -> None:
+        if self._has_gl_resource_handles():
+            self._release_gl_resources_in_current_context()
+        else:
+            self._reset_gl_resource_handles()
 
     def paint(self) -> None:  # type: ignore[override]
         self.setupGLState()
@@ -1158,6 +1496,8 @@ class TexturedMeshItem(GLGraphicsItem):
             GL.glCullFace(GL.GL_BACK)
         self._ensure_gl_resources()
         if self._shader_program is None or self._texture_id is None:
+            if self._transparency_mode == TEXTURE_ALPHA_MODE_TRANSLUCENT:
+                GL.glDepthMask(GL.GL_TRUE)
             if not self._double_sided and not culling_was_enabled:
                 GL.glDisable(GL.GL_CULL_FACE)
             return
@@ -1196,10 +1536,37 @@ class TexturedMeshItem(GLGraphicsItem):
         )
         _set_integer_uniform(self._shader_program, "u_texture", 0)
         _set_integer_uniform(self._shader_program, "u_edit_mask", 1)
+        _set_integer_uniform(self._shader_program, "u_normal_texture", 2)
+        _set_integer_uniform(self._shader_program, "u_roughness_texture", 3)
+        _set_integer_uniform(self._shader_program, "u_metallic_texture", 4)
         _set_float_uniform(
             self._shader_program,
             "u_edit_mask_enabled",
             float(self._edit_mask_enabled),
+        )
+        _set_float_uniform(
+            self._shader_program,
+            "u_normal_map_enabled",
+            float(
+                self._pbr_maps_enabled[PBR_MAP_NORMAL]
+                and self._normal_texture_available
+            ),
+        )
+        _set_float_uniform(
+            self._shader_program,
+            "u_roughness_map_enabled",
+            float(
+                self._pbr_maps_enabled[PBR_MAP_ROUGHNESS]
+                and self._roughness_texture_available
+            ),
+        )
+        _set_float_uniform(
+            self._shader_program,
+            "u_metallic_map_enabled",
+            float(
+                self._pbr_maps_enabled[PBR_MAP_METALLIC]
+                and self._metallic_texture_available
+            ),
         )
 
         enabled_locations: list[int] = []
@@ -1220,6 +1587,20 @@ class TexturedMeshItem(GLGraphicsItem):
             )
             _bind_float_attribute(
                 self._shader_program,
+                "a_tangent",
+                self._tangent_buffer,
+                3,
+                enabled_locations,
+            )
+            _bind_float_attribute(
+                self._shader_program,
+                "a_bitangent",
+                self._bitangent_buffer,
+                3,
+                enabled_locations,
+            )
+            _bind_float_attribute(
+                self._shader_program,
                 "a_texcoord",
                 self._texture_coordinate_buffer,
                 2,
@@ -1228,12 +1609,36 @@ class TexturedMeshItem(GLGraphicsItem):
             GL.glActiveTexture(GL.GL_TEXTURE0)
             GL.glBindTexture(GL.GL_TEXTURE_2D, self._texture_id)
             GL.glActiveTexture(GL.GL_TEXTURE1)
-            GL.glBindTexture(GL.GL_TEXTURE_2D, self._edit_mask_texture_id)
-            GL.glDrawArrays(GL.GL_TRIANGLES, 0, len(self._vertices))
+            GL.glBindTexture(
+                GL.GL_TEXTURE_2D,
+                int(self._edit_mask_texture_id or 0),
+            )
+            GL.glActiveTexture(GL.GL_TEXTURE2)
+            GL.glBindTexture(
+                GL.GL_TEXTURE_2D,
+                int(self._normal_texture_id or 0),
+            )
+            GL.glActiveTexture(GL.GL_TEXTURE3)
+            GL.glBindTexture(
+                GL.GL_TEXTURE_2D,
+                int(self._roughness_texture_id or 0),
+            )
+            GL.glActiveTexture(GL.GL_TEXTURE4)
+            GL.glBindTexture(
+                GL.GL_TEXTURE_2D,
+                int(self._metallic_texture_id or 0),
+            )
+            self._draw_bound_triangles()
         finally:
             for location in enabled_locations:
                 GL.glDisableVertexAttribArray(location)
             GL.glBindBuffer(GL.GL_ARRAY_BUFFER, 0)
+            GL.glActiveTexture(GL.GL_TEXTURE4)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+            GL.glActiveTexture(GL.GL_TEXTURE3)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+            GL.glActiveTexture(GL.GL_TEXTURE2)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
             GL.glActiveTexture(GL.GL_TEXTURE1)
             GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
             GL.glActiveTexture(GL.GL_TEXTURE0)
@@ -1242,8 +1647,45 @@ class TexturedMeshItem(GLGraphicsItem):
             if not self._double_sided and not culling_was_enabled:
                 GL.glDisable(GL.GL_CULL_FACE)
 
+    def _draw_bound_triangles(self) -> None:
+        """Draw opaque and translucent texels with scoped depth-write state."""
+
+        assert self._shader_program is not None
+        if self._transparency_mode == TEXTURE_ALPHA_MODE_MIXED:
+            try:
+                GL.glDisable(GL.GL_BLEND)
+                GL.glDepthMask(GL.GL_TRUE)
+                _set_float_uniform(self._shader_program, "u_alpha_pass", 1.0)
+                GL.glDrawArrays(GL.GL_TRIANGLES, 0, len(self._vertices))
+
+                GL.glEnable(GL.GL_BLEND)
+                GL.glBlendFuncSeparate(
+                    GL.GL_SRC_ALPHA,
+                    GL.GL_ONE_MINUS_SRC_ALPHA,
+                    GL.GL_ONE,
+                    GL.GL_ONE_MINUS_SRC_ALPHA,
+                )
+                GL.glDepthMask(GL.GL_FALSE)
+                _set_float_uniform(self._shader_program, "u_alpha_pass", 2.0)
+                GL.glDrawArrays(GL.GL_TRIANGLES, 0, len(self._vertices))
+            finally:
+                GL.glDepthMask(GL.GL_TRUE)
+                GL.glDisable(GL.GL_BLEND)
+            return
+
+        _set_float_uniform(self._shader_program, "u_alpha_pass", 0.0)
+        if self._transparency_mode == TEXTURE_ALPHA_MODE_TRANSLUCENT:
+            try:
+                GL.glDepthMask(GL.GL_FALSE)
+                GL.glDrawArrays(GL.GL_TRIANGLES, 0, len(self._vertices))
+            finally:
+                GL.glDepthMask(GL.GL_TRUE)
+            return
+        GL.glDrawArrays(GL.GL_TRIANGLES, 0, len(self._vertices))
+
     def _ensure_gl_resources(self) -> None:
         if self._resources_uploaded:
+            self._ensure_enabled_pbr_gl_resources()
             if (
                 self._edit_mask_dirty
                 and self._edit_mask_texture_id is not None
@@ -1275,7 +1717,44 @@ class TexturedMeshItem(GLGraphicsItem):
         )
         self._edit_mask_texture_id = _upload_mask_texture(self._edit_mask)
         self._resources_uploaded = True
+        self._ensure_enabled_pbr_gl_resources()
         self._edit_mask_dirty = False
+
+    def _ensure_enabled_pbr_gl_resources(self) -> None:
+        """Lazily upload optional maps while retaining instant later toggles."""
+
+        if (
+            self._pbr_maps_enabled[PBR_MAP_NORMAL]
+            and self._normal_texture_available
+        ):
+            self._ensure_tangent_frames()
+            if self._tangent_buffer is None and self._tangents is not None:
+                self._tangent_buffer = _upload_array_buffer(self._tangents)
+            if self._bitangent_buffer is None and self._bitangents is not None:
+                self._bitangent_buffer = _upload_array_buffer(self._bitangents)
+            if self._normal_texture_id is None:
+                self._normal_texture_id = _upload_texture(
+                    self._normal_texture_rgba,
+                    repeat=self._texture_repeat,
+                )
+        if (
+            self._pbr_maps_enabled[PBR_MAP_ROUGHNESS]
+            and self._roughness_texture_available
+            and self._roughness_texture_id is None
+        ):
+            self._roughness_texture_id = _upload_texture(
+                self._roughness_texture_rgba,
+                repeat=self._texture_repeat,
+            )
+        if (
+            self._pbr_maps_enabled[PBR_MAP_METALLIC]
+            and self._metallic_texture_available
+            and self._metallic_texture_id is None
+        ):
+            self._metallic_texture_id = _upload_texture(
+                self._metallic_texture_rgba,
+                repeat=self._texture_repeat,
+            )
 
 
 class _WireframeOverlayMeshItem(gl.GLMeshItem):
@@ -1420,6 +1899,7 @@ class GlbViewerWidget(QWidget):
         wireframe_only: bool = DEFAULT_WIREFRAME_ONLY,
         window_editing_enabled: bool = False,
         face_editing_enabled: bool = False,
+        pbr_maps_enabled: Mapping[str, bool] | Sequence[str] | None = None,
     ) -> None:
         super().__init__(parent)
         self.model: GeneratedModel | None = None
@@ -1449,6 +1929,7 @@ class GlbViewerWidget(QWidget):
         self._textures_enabled = bool(textures_enabled)
         self._wireframe_enabled = bool(wireframe_enabled)
         self._wireframe_only = bool(wireframe_only)
+        self._pbr_maps_enabled = _normalize_pbr_maps_enabled(pbr_maps_enabled)
         self._window_editing_enabled = bool(window_editing_enabled)
         self._projection_camera_indicators_visible = False
         self._face_editing_enabled = bool(face_editing_enabled)
@@ -2844,6 +3325,7 @@ class GlbViewerWidget(QWidget):
                 self._ambient_light_intensity,
                 opacity=opacity,
                 translucent=True,
+                pbr_maps_enabled=self._pbr_maps_enabled,
             )
             self._attach_preview_item(textured_item, parent_item)
         face_colors = (
@@ -2901,6 +3383,7 @@ class GlbViewerWidget(QWidget):
                 self._ambient_light_intensity,
                 opacity=opacity,
                 translucent=True,
+                pbr_maps_enabled=self._pbr_maps_enabled,
             )
             self._attach_preview_item(textured_item, parent_item)
         face_colors = (
@@ -3113,6 +3596,51 @@ class GlbViewerWidget(QWidget):
 
     def get_textures_enabled(self) -> bool:
         return self._textures_enabled
+
+    def set_pbr_maps_enabled(
+        self,
+        enabled_maps: Mapping[str, bool] | Sequence[str] | None,
+    ) -> None:
+        """Enable selected auxiliary maps on every textured preview item."""
+
+        normalized = _normalize_pbr_maps_enabled(enabled_maps)
+        if normalized == self._pbr_maps_enabled:
+            return
+        self._pbr_maps_enabled = normalized
+        for textured_item in self._iter_textured_mesh_items():
+            textured_item.set_pbr_maps_enabled(normalized)
+        if hasattr(self, "view"):
+            self.view.update()
+
+    def get_pbr_maps_enabled(self) -> dict[str, bool]:
+        """Return an isolated copy of the current auxiliary-map state."""
+
+        return dict(self._pbr_maps_enabled)
+
+    def _iter_textured_mesh_items(self) -> tuple[TexturedMeshItem, ...]:
+        """Return each current textured draw item exactly once."""
+
+        candidates: list[TexturedMeshItem | None] = [
+            self.textured_mesh_item,
+            *self.textured_surface_items,
+        ]
+        candidates.extend(
+            group.textured_item
+            for group in self._get_symmetric_preview_groups()
+        )
+        for placed_group in self._placed_object_render_groups.values():
+            candidates.extend(
+                retained_part.textured_item
+                for retained_part in placed_group.retained_parts
+            )
+        unique_items: list[TexturedMeshItem] = []
+        seen_ids: set[int] = set()
+        for item in candidates:
+            if item is None or id(item) in seen_ids:
+                continue
+            seen_ids.add(id(item))
+            unique_items.append(item)
+        return tuple(unique_items)
 
     def set_wireframe_enabled(self, enabled: bool) -> None:
         """Show or hide wireframe edges over the current surface display."""
@@ -3408,6 +3936,7 @@ class GlbViewerWidget(QWidget):
                 self.textured_mesh_item = TexturedMeshItem(
                     texture_mesh_data,
                     self._ambient_light_intensity,
+                    pbr_maps_enabled=self._pbr_maps_enabled,
                 )
                 self.textured_mesh_item.set_edit_mask(self._texture_edit_mask)
                 self.view.addItem(self.textured_mesh_item)
@@ -3522,6 +4051,7 @@ class GlbViewerWidget(QWidget):
                 self._ambient_light_intensity,
                 texture_repeat=True,
                 double_sided=textured_surface.double_sided,
+                pbr_maps_enabled=self._pbr_maps_enabled,
             )
             self.view.addItem(texture_item)
             self.textured_surface_items.append(texture_item)
@@ -3618,6 +4148,7 @@ class GlbViewerWidget(QWidget):
                 texture_data,
                 self._ambient_light_intensity,
                 texture_repeat=True,
+                pbr_maps_enabled=self._pbr_maps_enabled,
             )
             textured_item.setParentItem(root_item)
         face_colors = (
@@ -4188,6 +4719,7 @@ class GlbViewerWidget(QWidget):
             return
 
         self._symmetric_preview_timer.stop()
+        self._release_textured_mesh_gl_resources()
         self.view.clear()
         self.grid_item = None
         self.mesh_item = None
@@ -4207,6 +4739,42 @@ class GlbViewerWidget(QWidget):
         self._window_selection_item = None
         self._window_preview_item = None
         self._doorway_preview_outline_item = None
+
+    def _release_textured_mesh_gl_resources(self) -> None:
+        """Delete all textured-item GL names before detaching scene parents."""
+
+        textured_items = tuple(
+            item
+            for item in self._iter_textured_mesh_items()
+            if item._has_gl_resource_handles()
+        )
+        if not textured_items:
+            return
+        try:
+            context = self.view.context()
+        except RuntimeError:
+            return
+        if context is None or not context.isValid():
+            for item in textured_items:
+                item._reset_gl_resource_handles()
+            return
+
+        current_context = QOpenGLContext.currentContext()
+        made_current = current_context is not context
+        if made_current:
+            try:
+                self.view.makeCurrent()
+            except RuntimeError:
+                return
+            if QOpenGLContext.currentContext() is not context:
+                self.view.doneCurrent()
+                return
+        try:
+            for item in textured_items:
+                item._release_gl_resources_in_current_context()
+        finally:
+            if made_current:
+                self.view.doneCurrent()
 
     def _capture_camera_state(self) -> dict[str, object]:
         camera_state: dict[str, object] = {}
@@ -5541,6 +6109,9 @@ def _mirror_texture_mesh_data(
             texture_coordinates[:, reverse_winding, :].reshape((-1, 2))
         ),
         texture_rgba=texture_mesh_data.texture_rgba,
+        normal_texture_rgba=texture_mesh_data.normal_texture_rgba,
+        roughness_texture_rgba=texture_mesh_data.roughness_texture_rgba,
+        metallic_texture_rgba=texture_mesh_data.metallic_texture_rgba,
     )
 
 
@@ -5552,6 +6123,32 @@ def _build_texture_mesh_data(mesh) -> TextureMeshData | None:
         return None
 
     texture_rgba = _get_base_color_texture_rgba(visual)
+    normal_texture_rgba = _get_material_texture_rgba(
+        visual,
+        ("normalTexture",),
+    )
+    combined_metallic_roughness_rgba = _get_material_texture_rgba(
+        visual,
+        ("metallicRoughnessTexture",),
+    )
+    roughness_texture_rgba = _get_material_texture_rgba(
+        visual,
+        ("roughnessTexture",),
+    )
+    metallic_texture_rgba = _get_material_texture_rgba(
+        visual,
+        ("metallicTexture",),
+    )
+    if roughness_texture_rgba is None and combined_metallic_roughness_rgba is not None:
+        roughness_texture_rgba = _extract_texture_channel_rgba(
+            combined_metallic_roughness_rgba,
+            channel_index=1,
+        )
+    if metallic_texture_rgba is None and combined_metallic_roughness_rgba is not None:
+        metallic_texture_rgba = _extract_texture_channel_rgba(
+            combined_metallic_roughness_rgba,
+            channel_index=2,
+        )
     texture_coordinates = getattr(visual, "uv", None)
     faces = np.asarray(getattr(mesh, "faces", ()), dtype=np.int64)
     vertices = np.asarray(getattr(mesh, "vertices", ()), dtype=np.float32)
@@ -5591,16 +6188,60 @@ def _build_texture_mesh_data(mesh) -> TextureMeshData | None:
             texture_coordinates[face_vertex_indices]
         ),
         texture_rgba=_limit_texture_preview_size(texture_rgba),
+        normal_texture_rgba=_limit_optional_texture_preview_size(
+            normal_texture_rgba
+        ),
+        roughness_texture_rgba=_limit_optional_texture_preview_size(
+            roughness_texture_rgba
+        ),
+        metallic_texture_rgba=_limit_optional_texture_preview_size(
+            metallic_texture_rgba
+        ),
     )
 
 
 def _get_base_color_texture_rgba(visual) -> np.ndarray | None:
+    return _get_material_texture_rgba(
+        visual,
+        ("baseColorTexture", "image"),
+    )
+
+
+def _get_material_texture_rgba(
+    visual,
+    attribute_names: Sequence[str],
+) -> np.ndarray | None:
+    """Decode the first matching image from a possibly nested material."""
+
     material = getattr(visual, "material", None)
-    texture = getattr(material, "baseColorTexture", None)
-    if texture is None:
-        texture = getattr(material, "image", None)
-    if texture is None:
-        return None
+    for leaf_material in _iter_material_leaves(material):
+        for attribute_name in attribute_names:
+            texture = getattr(leaf_material, attribute_name, None)
+            if texture is None:
+                continue
+            rgba = _decode_texture_rgba(texture)
+            if rgba is not None:
+                return rgba
+    return None
+
+
+def _iter_material_leaves(material: object) -> tuple[object, ...]:
+    """Flatten trimesh MultiMaterial-style containers in source order."""
+
+    if material is None:
+        return ()
+    nested_materials = getattr(material, "materials", None)
+    if isinstance(nested_materials, (list, tuple)):
+        return tuple(
+            leaf
+            for nested_material in nested_materials
+            for leaf in _iter_material_leaves(nested_material)
+        )
+    return (material,)
+
+
+def _decode_texture_rgba(texture: object) -> np.ndarray | None:
+    """Decode PIL images, pixel arrays, and encoded byte arrays as RGBA."""
 
     try:
         if hasattr(texture, "convert"):
@@ -5627,6 +6268,33 @@ def _get_base_color_texture_rgba(visual) -> np.ndarray | None:
     return np.ascontiguousarray(rgba, dtype=np.uint8)
 
 
+def _extract_texture_channel_rgba(
+    texture_rgba: np.ndarray,
+    *,
+    channel_index: int,
+) -> np.ndarray:
+    """Expand one packed PBR channel to a shader-friendly RGBA texture."""
+
+    source = np.asarray(texture_rgba, dtype=np.uint8)
+    if source.ndim != 3 or source.shape[2] != 4:
+        raise ValueError("PBR texture extraction requires an RGBA image.")
+    if channel_index < 0 or channel_index >= 3:
+        raise ValueError("PBR texture channels must be red, green, or blue.")
+    channel = source[:, :, channel_index : channel_index + 1]
+    alpha = np.full(source.shape[:2] + (1,), 255, dtype=np.uint8)
+    return np.ascontiguousarray(
+        np.concatenate((channel, channel, channel, alpha), axis=2)
+    )
+
+
+def _limit_optional_texture_preview_size(
+    texture_rgba: np.ndarray | None,
+) -> np.ndarray | None:
+    if texture_rgba is None:
+        return None
+    return _limit_texture_preview_size(texture_rgba)
+
+
 def _limit_texture_preview_size(texture_rgba: np.ndarray) -> np.ndarray:
     height, width = texture_rgba.shape[:2]
     largest_dimension = max(height, width)
@@ -5643,6 +6311,188 @@ def _limit_texture_preview_size(texture_rgba: np.ndarray) -> np.ndarray:
         Image.Resampling.LANCZOS,
     )
     return np.ascontiguousarray(np.asarray(resized, dtype=np.uint8))
+
+
+def _normalize_optional_texture_rgba(
+    texture_rgba: np.ndarray | None,
+    neutral_rgba: tuple[int, int, int, int],
+) -> np.ndarray:
+    """Return a valid texture, substituting one neutral texel when absent."""
+
+    if texture_rgba is None:
+        return np.asarray([[neutral_rgba]], dtype=np.uint8)
+    normalized = np.asarray(texture_rgba, dtype=np.uint8)
+    if (
+        normalized.ndim != 3
+        or normalized.shape[2] != 4
+        or normalized.shape[0] <= 0
+        or normalized.shape[1] <= 0
+    ):
+        raise ValueError("PBR preview maps must be non-empty RGBA images.")
+    return np.ascontiguousarray(normalized)
+
+
+def _normalize_pbr_maps_enabled(
+    enabled_maps: Mapping[str, bool] | Sequence[str] | None,
+) -> dict[str, bool]:
+    """Normalize mapping and enabled-name inputs to one canonical map state."""
+
+    normalized = dict(DEFAULT_PBR_MAPS_ENABLED)
+    if enabled_maps is None:
+        return normalized
+    if isinstance(enabled_maps, Mapping):
+        unknown_names = set(enabled_maps) - set(PBR_MAP_TYPES)
+        if unknown_names:
+            raise ValueError(
+                "Unknown PBR preview map: "
+                + ", ".join(sorted(str(name) for name in unknown_names))
+            )
+        for map_type in PBR_MAP_TYPES:
+            if map_type in enabled_maps:
+                normalized[map_type] = bool(enabled_maps[map_type])
+        return normalized
+
+    requested_names = (
+        (enabled_maps,)
+        if isinstance(enabled_maps, str)
+        else tuple(enabled_maps)
+    )
+    unknown_names = set(requested_names) - set(PBR_MAP_TYPES)
+    if unknown_names:
+        raise ValueError(
+            "Unknown PBR preview map: "
+            + ", ".join(sorted(str(name) for name in unknown_names))
+        )
+    for map_type in requested_names:
+        normalized[map_type] = True
+    return normalized
+
+
+def _build_texture_tangent_frames(
+    vertices: np.ndarray,
+    normals: np.ndarray,
+    texture_coordinates: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build robust per-corner tangent frames for face-expanded triangles."""
+
+    normalized_vertices = np.asarray(vertices, dtype=np.float32)
+    normalized_normals = np.asarray(normals, dtype=np.float32)
+    normalized_uvs = np.asarray(texture_coordinates, dtype=np.float32)
+    if (
+        normalized_vertices.ndim != 2
+        or normalized_vertices.shape[1:] != (3,)
+        or normalized_normals.shape != normalized_vertices.shape
+        or normalized_uvs.shape != (len(normalized_vertices), 2)
+        or len(normalized_vertices) % 3
+    ):
+        raise ValueError(
+            "Texture tangent frames require face-expanded triangle geometry."
+        )
+
+    triangle_vertices = normalized_vertices.reshape((-1, 3, 3))
+    triangle_uvs = normalized_uvs.reshape((-1, 3, 2))
+    first_edges = triangle_vertices[:, 1] - triangle_vertices[:, 0]
+    second_edges = triangle_vertices[:, 2] - triangle_vertices[:, 0]
+    first_uv_edges = triangle_uvs[:, 1] - triangle_uvs[:, 0]
+    second_uv_edges = triangle_uvs[:, 2] - triangle_uvs[:, 0]
+    denominators = (
+        first_uv_edges[:, 0] * second_uv_edges[:, 1]
+        - first_uv_edges[:, 1] * second_uv_edges[:, 0]
+    )
+    valid_frames = np.isfinite(denominators) & (np.abs(denominators) > 1e-12)
+    safe_reciprocals = np.zeros_like(denominators, dtype=np.float32)
+    np.divide(
+        1.0,
+        denominators,
+        out=safe_reciprocals,
+        where=valid_frames,
+    )
+    raw_tangents = (
+        first_edges * second_uv_edges[:, 1, np.newaxis]
+        - second_edges * first_uv_edges[:, 1, np.newaxis]
+    ) * safe_reciprocals[:, np.newaxis]
+    raw_bitangents = (
+        second_edges * first_uv_edges[:, 0, np.newaxis]
+        - first_edges * second_uv_edges[:, 0, np.newaxis]
+    ) * safe_reciprocals[:, np.newaxis]
+    valid_frames &= np.all(np.isfinite(raw_tangents), axis=1)
+    valid_frames &= np.all(np.isfinite(raw_bitangents), axis=1)
+
+    normals = _normalize_directions_or_fallback(
+        normalized_normals,
+        (0.0, 0.0, 1.0),
+    )
+    expanded_tangents = np.repeat(raw_tangents, 3, axis=0)
+    expanded_bitangents = np.repeat(raw_bitangents, 3, axis=0)
+    expanded_valid_frames = np.repeat(valid_frames, 3)
+    projected_tangents = expanded_tangents - normals * np.sum(
+        normals * expanded_tangents,
+        axis=1,
+        keepdims=True,
+    )
+    fallback_tangents = _build_orthogonal_tangents(normals)
+    projected_lengths = np.linalg.norm(projected_tangents, axis=1)
+    valid_projected_tangents = (
+        expanded_valid_frames
+        & np.all(np.isfinite(projected_tangents), axis=1)
+        & (projected_lengths > 1e-12)
+    )
+    tangents = _normalize_directions_or_fallback(
+        np.where(
+            valid_projected_tangents[:, np.newaxis],
+            projected_tangents,
+            fallback_tangents,
+        ),
+        (1.0, 0.0, 0.0),
+    )
+    bitangents = np.cross(normals, tangents)
+    reverse_handedness = (
+        expanded_valid_frames
+        & (np.sum(bitangents * expanded_bitangents, axis=1) < 0.0)
+    )
+    bitangents[reverse_handedness] *= -1.0
+    bitangents = _normalize_directions_or_fallback(
+        bitangents,
+        (0.0, 1.0, 0.0),
+    )
+    return (
+        np.ascontiguousarray(tangents, dtype=np.float32),
+        np.ascontiguousarray(bitangents, dtype=np.float32),
+    )
+
+
+def _normalize_directions_or_fallback(
+    directions: np.ndarray,
+    fallback: tuple[float, float, float],
+) -> np.ndarray:
+    normalized = np.asarray(directions, dtype=np.float32)
+    if normalized.ndim != 2 or normalized.shape[1:] != (3,):
+        raise ValueError("Direction normalization requires an Nx3 array.")
+    magnitudes = np.linalg.norm(normalized, axis=1)
+    valid = np.all(np.isfinite(normalized), axis=1) & (magnitudes > 1e-12)
+    result = np.tile(np.asarray(fallback, dtype=np.float32), (len(normalized), 1))
+    np.divide(
+        normalized,
+        magnitudes[:, np.newaxis],
+        out=result,
+        where=valid[:, np.newaxis],
+    )
+    return result
+
+
+def _build_orthogonal_tangents(normals: np.ndarray) -> np.ndarray:
+    reference_axes = np.tile(
+        np.asarray((0.0, 0.0, 1.0), dtype=np.float32),
+        (len(normals), 1),
+    )
+    reference_axes[np.abs(normals[:, 2]) >= 0.9] = np.asarray(
+        (0.0, 1.0, 0.0),
+        dtype=np.float32,
+    )
+    return _normalize_directions_or_fallback(
+        np.cross(reference_axes, normals),
+        (1.0, 0.0, 0.0),
+    )
 
 
 # ### Lighting helpers ###

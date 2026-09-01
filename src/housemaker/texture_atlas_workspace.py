@@ -5,8 +5,10 @@ import copy
 import math
 import os
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Callable
 
 import numpy as np
@@ -49,10 +51,19 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QPushButton,
     QSplitter,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from housemaker.object_texture_variants import (
+    ATLAS_MAP_BASE_COLOR,
+    ATLAS_MAP_LABELS,
+    ATLAS_MAP_TYPES,
+    PBR_MAP_METALLIC as ATLAS_MAP_METALLIC,
+    PBR_MAP_NORMAL as ATLAS_MAP_NORMAL,
+    PBR_MAP_ROUGHNESS as ATLAS_MAP_ROUGHNESS,
+)
 from housemaker.texture_atlas_state import (
     ATLAS_BASE_CELL_SIZE,
     ATLAS_DOUBLE_SIZED_PACKING_MODES,
@@ -104,6 +115,12 @@ ATLAS_TEXTURE_SOURCE_MIME_TYPE = (
     "application/x-housemaker-texture-atlas-source"
 )
 MAX_DRAG_SOURCE_ID_BYTES = 4_096
+ATLAS_MAP_NEUTRAL_RGBA = {
+    ATLAS_MAP_NORMAL: (128, 128, 255, 255),
+    ATLAS_MAP_ROUGHNESS: (255, 255, 255, 255),
+    ATLAS_MAP_METALLIC: (0, 0, 0, 255),
+}
+ATLAS_PBR_MAP_DIRECTORY = "pbr_maps"
 
 
 # ### Public texture-source model ###
@@ -123,6 +140,9 @@ class AtlasObjectTextureSource:
     packing_mode: str = ATLAS_PACKING_MODE_FULL
     symmetric_preview_orientation: str | None = None
     symmetric_preview_plane_coordinate: float | None = None
+    map_texture_paths: Mapping[str, str] | None = None
+    physical_map_texture_paths: Mapping[str, Path] | None = None
+    preview_rgba_by_map: Mapping[str, np.ndarray] | None = None
 
     def __post_init__(self) -> None:
         object_id = str(self.object_id).strip()
@@ -149,6 +169,38 @@ class AtlasObjectTextureSource:
         object.__setattr__(self, "texture_resolution", int(self.texture_resolution))
         object.__setattr__(self, "physical_texture_path", physical_texture_path)
         object.__setattr__(self, "preview_rgba", rgba)
+        logical_map_paths = _normalize_map_texture_paths(
+            self.map_texture_paths,
+            base_color_path=texture_path,
+        )
+        physical_map_paths = _normalize_physical_map_texture_paths(
+            self.physical_map_texture_paths,
+            base_color_path=physical_texture_path,
+        )
+        if set(logical_map_paths) != set(physical_map_paths):
+            raise ValueError(
+                "Atlas logical and physical texture-map paths must describe "
+                "the same maps."
+            )
+        preview_rgba_by_map = _normalize_map_previews(
+            self.preview_rgba_by_map,
+            base_color_preview=rgba,
+        )
+        object.__setattr__(
+            self,
+            "map_texture_paths",
+            MappingProxyType(logical_map_paths),
+        )
+        object.__setattr__(
+            self,
+            "physical_map_texture_paths",
+            MappingProxyType(physical_map_paths),
+        )
+        object.__setattr__(
+            self,
+            "preview_rgba_by_map",
+            MappingProxyType(preview_rgba_by_map),
+        )
         object.__setattr__(self, "fit_to_square", bool(self.fit_to_square))
         object.__setattr__(
             self,
@@ -207,10 +259,15 @@ class AtlasObjectTextureSource:
             plane_coordinate,
         )
 
-    def get_preview_image(self) -> QImage:
+    def get_preview_image(
+        self,
+        map_type: str = ATLAS_MAP_BASE_COLOR,
+    ) -> QImage:
         """Return an owned Qt image for atlas preview painting."""
 
-        rgba = self.preview_rgba
+        normalized_map_type = _normalize_atlas_map_type(map_type)
+        assert self.preview_rgba_by_map is not None
+        rgba = self.preview_rgba_by_map[normalized_map_type]
         image = QImage(
             rgba.data,
             rgba.shape[1],
@@ -220,10 +277,32 @@ class AtlasObjectTextureSource:
         )
         return image.copy()
 
-    def load_texture_rgba(self) -> np.ndarray:
+    def load_texture_rgba(
+        self,
+        map_type: str = ATLAS_MAP_BASE_COLOR,
+    ) -> np.ndarray:
         """Decode and validate the exact PNG only when atlas output needs it."""
 
-        with Image.open(self.physical_texture_path) as image:
+        normalized_map_type = _normalize_atlas_map_type(map_type)
+        assert self.map_texture_paths is not None
+        assert self.physical_map_texture_paths is not None
+        physical_resolution = _physical_texture_resolution(
+            self.packing_mode,
+            self.texture_resolution,
+        )
+        physical_path = self.physical_map_texture_paths.get(
+            normalized_map_type
+        )
+        if physical_path is None:
+            neutral_color = ATLAS_MAP_NEUTRAL_RGBA[normalized_map_type]
+            fallback = np.empty(
+                (physical_resolution, physical_resolution, 4),
+                dtype=np.uint8,
+            )
+            fallback[:, :] = np.asarray(neutral_color, dtype=np.uint8)
+            return fallback
+
+        with Image.open(physical_path) as image:
             if self.fit_to_square:
                 loaded_image = _fit_image_to_square(
                     image,
@@ -232,14 +311,11 @@ class AtlasObjectTextureSource:
             else:
                 loaded_image = image.convert("RGBA")
             rgba = np.asarray(loaded_image, dtype=np.uint8)
-        physical_resolution = _physical_texture_resolution(
-            self.packing_mode,
-            self.texture_resolution,
-        )
         expected_shape = (physical_resolution, physical_resolution)
         if rgba.shape[:2] != expected_shape:
+            logical_path = self.map_texture_paths[normalized_map_type]
             raise ValueError(
-                f"Texture {self.texture_path!r} must be "
+                f"Texture {logical_path!r} must be "
                 f"{physical_resolution} x {physical_resolution}; "
                 f"received {rgba.shape[1]} x {rgba.shape[0]}."
             )
@@ -274,6 +350,8 @@ def load_atlas_object_texture_source(
     texture_path: str,
     texture_resolution: int,
     physical_texture_path: str | Path,
+    map_texture_paths: Mapping[str, str] | None = None,
+    physical_map_texture_paths: Mapping[str, str | Path] | None = None,
     fit_to_square: bool = False,
     supports_resolution_changes: bool = True,
     supports_3d_preview: bool = True,
@@ -284,30 +362,31 @@ def load_atlas_object_texture_source(
     """Load one texture-source descriptor for the Atlas workspace."""
 
     normalized_physical_path = Path(physical_texture_path)
-    with Image.open(normalized_physical_path) as image:
-        physical_resolution = _physical_texture_resolution(
-            packing_mode,
-            int(texture_resolution),
+    normalized_logical_map_paths = _normalize_map_texture_paths(
+        map_texture_paths,
+        base_color_path=str(texture_path).strip(),
+    )
+    normalized_physical_map_paths = _normalize_physical_map_texture_paths(
+        physical_map_texture_paths,
+        base_color_path=normalized_physical_path,
+    )
+    if set(normalized_logical_map_paths) != set(
+        normalized_physical_map_paths
+    ):
+        raise ValueError(
+            "Atlas logical and physical texture-map paths must describe the "
+            "same maps."
         )
-        if not fit_to_square and image.size != (
-            physical_resolution,
-            physical_resolution,
-        ):
-            raise ValueError(
-                f"Texture {str(texture_path)!r} must be "
-                f"{physical_resolution} x {physical_resolution}; "
-                f"received {image.width} x {image.height}."
-            )
-        thumbnail = (
-            _fit_image_to_square(image, int(texture_resolution))
-            if fit_to_square
-            else image.convert("RGBA")
+    preview_rgba_by_map: dict[str, np.ndarray] = {}
+    for map_type, physical_map_path in normalized_physical_map_paths.items():
+        preview_rgba_by_map[map_type] = _load_texture_thumbnail_rgba(
+            physical_map_path,
+            logical_texture_path=normalized_logical_map_paths[map_type],
+            texture_resolution=int(texture_resolution),
+            packing_mode=packing_mode,
+            fit_to_square=fit_to_square,
         )
-        thumbnail.thumbnail(
-            (MAX_SOURCE_THUMBNAIL_SIZE, MAX_SOURCE_THUMBNAIL_SIZE),
-            Image.Resampling.LANCZOS,
-        )
-        rgba = np.asarray(thumbnail, dtype=np.uint8)
+    rgba = preview_rgba_by_map[ATLAS_MAP_BASE_COLOR]
     return AtlasObjectTextureSource(
         object_id=object_id,
         object_name=object_name,
@@ -315,6 +394,9 @@ def load_atlas_object_texture_source(
         texture_resolution=texture_resolution,
         physical_texture_path=normalized_physical_path,
         preview_rgba=rgba,
+        map_texture_paths=normalized_logical_map_paths,
+        physical_map_texture_paths=normalized_physical_map_paths,
+        preview_rgba_by_map=preview_rgba_by_map,
         fit_to_square=fit_to_square,
         supports_resolution_changes=supports_resolution_changes,
         supports_3d_preview=supports_3d_preview,
@@ -324,6 +406,160 @@ def load_atlas_object_texture_source(
     )
 
 
+# ### Texture-map helpers ###
+def _normalize_atlas_map_type(map_type: object) -> str:
+    normalized_map_type = str(map_type).strip().lower()
+    if normalized_map_type not in ATLAS_MAP_TYPES:
+        raise ValueError(f"Unknown Atlas texture map: {map_type!r}.")
+    return normalized_map_type
+
+
+def _normalize_map_texture_paths(
+    raw_paths: Mapping[str, str] | None,
+    *,
+    base_color_path: str,
+) -> dict[str, str]:
+    """Normalize logical map paths while retaining the legacy base path."""
+
+    normalized_base_path = str(base_color_path).strip()
+    if not normalized_base_path:
+        raise ValueError("Atlas texture path cannot be empty.")
+    if raw_paths is not None and not isinstance(raw_paths, Mapping):
+        raise TypeError("Atlas logical texture-map paths must be a mapping.")
+    normalized: dict[str, str] = {}
+    for raw_map_type, raw_path in (raw_paths or {}).items():
+        map_type = _normalize_atlas_map_type(raw_map_type)
+        path = str(raw_path).strip()
+        if not path:
+            raise ValueError("Atlas texture-map paths cannot be empty.")
+        if map_type in normalized:
+            raise ValueError("Atlas texture-map paths contain a duplicate map.")
+        normalized[map_type] = path
+    if (
+        ATLAS_MAP_BASE_COLOR in normalized
+        and normalized[ATLAS_MAP_BASE_COLOR] != normalized_base_path
+    ):
+        raise ValueError(
+            "The Atlas base-color map must match the legacy texture path."
+        )
+    normalized[ATLAS_MAP_BASE_COLOR] = normalized_base_path
+    return {
+        map_type: normalized[map_type]
+        for map_type in ATLAS_MAP_TYPES
+        if map_type in normalized
+    }
+
+
+def _normalize_physical_map_texture_paths(
+    raw_paths: Mapping[str, str | Path] | None,
+    *,
+    base_color_path: Path,
+) -> dict[str, Path]:
+    """Normalize physical map paths while retaining the legacy base path."""
+
+    normalized_base_path = Path(base_color_path)
+    if raw_paths is not None and not isinstance(raw_paths, Mapping):
+        raise TypeError("Atlas physical texture-map paths must be a mapping.")
+    normalized: dict[str, Path] = {}
+    for raw_map_type, raw_path in (raw_paths or {}).items():
+        map_type = _normalize_atlas_map_type(raw_map_type)
+        try:
+            path = Path(raw_path)
+        except TypeError as error:
+            raise TypeError("Atlas physical texture-map path is invalid.") from error
+        if map_type in normalized:
+            raise ValueError("Atlas texture-map paths contain a duplicate map.")
+        normalized[map_type] = path
+    if (
+        ATLAS_MAP_BASE_COLOR in normalized
+        and normalized[ATLAS_MAP_BASE_COLOR] != normalized_base_path
+    ):
+        raise ValueError(
+            "The physical Atlas base-color map must match the legacy path."
+        )
+    normalized[ATLAS_MAP_BASE_COLOR] = normalized_base_path
+    return {
+        map_type: normalized[map_type]
+        for map_type in ATLAS_MAP_TYPES
+        if map_type in normalized
+    }
+
+
+def _normalize_map_previews(
+    raw_previews: Mapping[str, np.ndarray] | None,
+    *,
+    base_color_preview: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Build immutable real or neutral thumbnails for every Atlas map."""
+
+    if raw_previews is not None and not isinstance(raw_previews, Mapping):
+        raise TypeError("Atlas texture-map previews must be a mapping.")
+    provided: dict[str, np.ndarray] = {}
+    for raw_map_type, raw_preview in (raw_previews or {}).items():
+        map_type = _normalize_atlas_map_type(raw_map_type)
+        if map_type in provided:
+            raise ValueError("Atlas texture-map previews contain a duplicate map.")
+        provided[map_type] = _normalize_preview_rgba(raw_preview)
+
+    normalized_base_preview = _normalize_preview_rgba(base_color_preview)
+    normalized: dict[str, np.ndarray] = {
+        ATLAS_MAP_BASE_COLOR: normalized_base_preview,
+    }
+    for map_type in ATLAS_MAP_TYPES[1:]:
+        preview = provided.get(map_type)
+        if preview is None:
+            preview = np.empty_like(normalized_base_preview)
+            preview[:, :] = np.asarray(
+                ATLAS_MAP_NEUTRAL_RGBA[map_type],
+                dtype=np.uint8,
+            )
+        if max(preview.shape[:2]) > MAX_SOURCE_THUMBNAIL_SIZE:
+            raise ValueError(
+                "Atlas source previews cannot exceed 256 pixels per side."
+            )
+        preview.setflags(write=False)
+        normalized[map_type] = preview
+    normalized_base_preview.setflags(write=False)
+    return normalized
+
+
+def _load_texture_thumbnail_rgba(
+    physical_path: Path,
+    *,
+    logical_texture_path: str,
+    texture_resolution: int,
+    packing_mode: str,
+    fit_to_square: bool,
+) -> np.ndarray:
+    """Load and validate one small map thumbnail without retaining its image."""
+
+    with Image.open(physical_path) as image:
+        physical_resolution = _physical_texture_resolution(
+            packing_mode,
+            texture_resolution,
+        )
+        if not fit_to_square and image.size != (
+            physical_resolution,
+            physical_resolution,
+        ):
+            raise ValueError(
+                f"Texture {logical_texture_path!r} must be "
+                f"{physical_resolution} x {physical_resolution}; "
+                f"received {image.width} x {image.height}."
+            )
+        thumbnail = (
+            _fit_image_to_square(image, texture_resolution)
+            if fit_to_square
+            else image.convert("RGBA")
+        )
+        thumbnail.thumbnail(
+            (MAX_SOURCE_THUMBNAIL_SIZE, MAX_SOURCE_THUMBNAIL_SIZE),
+            Image.Resampling.LANCZOS,
+        )
+        return np.asarray(thumbnail, dtype=np.uint8)
+
+
+# ### Public source helpers ###
 def choose_atlas_texture_resolution(width: int, height: int) -> int:
     """Choose the smallest supported square that contains an image."""
 
@@ -342,6 +578,30 @@ def choose_atlas_texture_resolution(width: int, height: int) -> int:
             if longest_side <= resolution
         ),
         TEXTURE_RESOLUTION_ORDER[-1],
+    )
+
+
+def build_texture_atlas_map_image_relative_path(
+    atlas_id: str,
+    map_type: str,
+) -> str:
+    """Return one deterministic base-color or PBR Atlas PNG path."""
+
+    normalized_atlas_id = str(atlas_id).strip()
+    if (
+        not normalized_atlas_id
+        or Path(normalized_atlas_id).name != normalized_atlas_id
+        or normalized_atlas_id in {".", ".."}
+    ):
+        raise ValueError(
+            "Texture atlas output path escapes its asset directory."
+        )
+    normalized_map_type = _normalize_atlas_map_type(map_type)
+    if normalized_map_type == ATLAS_MAP_BASE_COLOR:
+        return f"{normalized_atlas_id}.png"
+    return (
+        f"{ATLAS_PBR_MAP_DIRECTORY}/"
+        f"{normalized_atlas_id}.{normalized_map_type}.png"
     )
 
 
@@ -453,8 +713,13 @@ class TextureAtlasPreview(QWidget):
     object_wheeled = Signal(str, int)
     object_dropped = Signal(str, int, int)
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        map_type: str = ATLAS_MAP_BASE_COLOR,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
+        self._map_type = _normalize_atlas_map_type(map_type)
         self._atlas: TextureAtlasRecord | None = None
         self._sources: dict[str, AtlasObjectTextureSource] = {}
         self._source_preview_images: dict[str, QImage] = {}
@@ -467,6 +732,12 @@ class TextureAtlasPreview(QWidget):
         self.setMinimumSize(360, 360)
         self.setAcceptDrops(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    @property
+    def map_type(self) -> str:
+        """Return the material map rendered by this synchronized preview."""
+
+        return self._map_type
 
     def set_content(
         self,
@@ -491,7 +762,9 @@ class TextureAtlasPreview(QWidget):
             ):
                 source_preview_images[object_id] = previous_images[object_id]
             else:
-                source_preview_images[object_id] = source.get_preview_image()
+                source_preview_images[object_id] = source.get_preview_image(
+                    self._map_type
+                )
 
         self._atlas = atlas
         self._sources = dict(sources)
@@ -1893,12 +2166,19 @@ class TextureAtlasWorkspace(QWidget):
     ) -> dict[Path, bytes | None]:
         snapshots: dict[Path, bytes | None] = {}
         for atlas_id in atlas_ids:
-            output_path = self._resolve_owned_atlas_path(f"{atlas_id}.png")
-            if output_path is None:
-                raise ValueError("An atlas output path is unsafe.")
-            snapshots[output_path] = (
-                output_path.read_bytes() if output_path.is_file() else None
+            atlas = self._data.atlas_by_id(atlas_id)
+            output_paths = set(
+                self._resolve_atlas_map_output_paths(atlas_id).values()
             )
+            current_output_path = self._resolve_owned_atlas_path(
+                None if atlas is None else atlas.image_path
+            )
+            if current_output_path is not None:
+                output_paths.add(current_output_path)
+            for output_path in output_paths:
+                snapshots[output_path] = (
+                    output_path.read_bytes() if output_path.is_file() else None
+                )
         return snapshots
 
     def request_selected_object_preview(self) -> bool:
@@ -2013,15 +2293,26 @@ class TextureAtlasWorkspace(QWidget):
         selectors_layout.addLayout(assignment_buttons)
 
         content_splitter.addWidget(selectors)
-        self.preview = TextureAtlasPreview()
-        self.preview.setObjectName("texture_atlas_workspace_preview")
-        self.preview.object_clicked.connect(self._handle_object_mouse_click)
-        self.preview.object_wheeled.connect(self._handle_object_wheel)
-        self.preview.object_dropped.connect(self._handle_object_drop)
-        content_splitter.addWidget(self.preview)
+        self.preview_tabs = QTabWidget()
+        self.preview_tabs.setObjectName("texture_atlas_workspace_preview_tabs")
+        self.map_previews: dict[str, TextureAtlasPreview] = {}
+        for map_type in ATLAS_MAP_TYPES:
+            preview = TextureAtlasPreview(map_type)
+            preview.setObjectName(
+                "texture_atlas_workspace_preview"
+                if map_type == ATLAS_MAP_BASE_COLOR
+                else f"texture_atlas_workspace_preview_{map_type}"
+            )
+            preview.object_clicked.connect(self._handle_object_mouse_click)
+            preview.object_wheeled.connect(self._handle_object_wheel)
+            preview.object_dropped.connect(self._handle_object_drop)
+            self.map_previews[map_type] = preview
+            self.preview_tabs.addTab(preview, ATLAS_MAP_LABELS[map_type])
+        self.preview = self.map_previews[ATLAS_MAP_BASE_COLOR]
+        content_splitter.addWidget(self.preview_tabs)
         self.delete_preview_shortcut = QShortcut(
             QKeySequence.StandardKey.Delete,
-            self.preview,
+            self.preview_tabs,
         )
         self.delete_preview_shortcut.setContext(
             Qt.ShortcutContext.WidgetWithChildrenShortcut
@@ -2065,24 +2356,30 @@ class TextureAtlasWorkspace(QWidget):
         if atlas is None:
             return
         name = atlas.name
+        atlas_id = atlas.atlas_id
         image_path = atlas.image_path
-        if not self._data.remove_atlas(atlas.atlas_id):
+        if not self._data.remove_atlas(atlas_id):
             return
-        cleanup_error: OSError | None = None
+        cleanup_errors: list[OSError] = []
+        owned_image_paths = set(
+            self._resolve_atlas_map_output_paths(atlas_id).values()
+        )
         owned_image_path = self._resolve_owned_atlas_path(image_path)
         if owned_image_path is not None:
+            owned_image_paths.add(owned_image_path)
+        for owned_image_path in owned_image_paths:
             try:
                 owned_image_path.unlink(missing_ok=True)
             except OSError as error:
-                cleanup_error = error
+                cleanup_errors.append(error)
         self._refresh_all()
         self._emit_data_changed()
-        if cleanup_error is None:
+        if not cleanup_errors:
             self.status_label.setText(f"Deleted atlas: {name}.")
         else:
             self.status_label.setText(
-                f"Deleted atlas: {name}. Its PNG could not be removed: "
-                f"{cleanup_error}"
+                f"Deleted atlas: {name}. Some PNG files could not be removed: "
+                f"{cleanup_errors[0]}"
             )
 
     def _assign_selected_object(self) -> None:
@@ -2162,7 +2459,9 @@ class TextureAtlasWorkspace(QWidget):
         _current: QListWidgetItem | None,
         _previous: QListWidgetItem | None,
     ) -> None:
-        self.preview.set_selected_object_id(self._selected_object_id())
+        selected_object_id = self._selected_object_id()
+        for preview in self.map_previews.values():
+            preview.set_selected_object_id(selected_object_id)
         self._sync_controls()
         if (
             not self._is_syncing
@@ -2197,6 +2496,11 @@ class TextureAtlasWorkspace(QWidget):
 
         atlas = self.selected_atlas
         source = self._manual_drop_source(str(object_id), atlas)
+        sender = self.sender()
+        active_preview = (
+            sender if isinstance(sender, TextureAtlasPreview) else self.preview
+        )
+        drag_slot_preview = active_preview.drag_slot_preview
         if atlas is None or source is None:
             self.status_label.setText(
                 "Texture placement blocked: the atlas or source is unavailable."
@@ -2212,11 +2516,11 @@ class TextureAtlasWorkspace(QWidget):
                 x,
                 y,
                 source.packing_mode,
-                self.preview.drag_slot_preview.slot_half
-                if self.preview.drag_slot_preview is not None
+                drag_slot_preview.slot_half
+                if drag_slot_preview is not None
                 else None,
-                self.preview.drag_slot_preview.slot_quadrant
-                if self.preview.drag_slot_preview is not None
+                drag_slot_preview.slot_quadrant
+                if drag_slot_preview is not None
                 else None,
             )
             self._materialize_atlas(atlas)
@@ -2482,7 +2786,8 @@ class TextureAtlasWorkspace(QWidget):
             if not self._source_has_fixed_resolution(placement.object_id)
         }
         self.object_list.set_wheel_resize_object_ids(wheel_resize_object_ids)
-        self.preview.set_wheel_resize_object_ids(wheel_resize_object_ids)
+        for preview in self.map_previews.values():
+            preview.set_wheel_resize_object_ids(wheel_resize_object_ids)
         self._sync_controls()
 
     def _refresh_preview(self) -> None:
@@ -2495,11 +2800,13 @@ class TextureAtlasWorkspace(QWidget):
                 preview_sources.pop(placement.object_id, None)
             else:
                 preview_sources[placement.object_id] = exact_source
-        self.preview.set_content(
-            atlas,
-            preview_sources,
-        )
-        self.preview.set_selected_object_id(self._selected_object_id())
+        selected_object_id = self._selected_object_id()
+        for preview in self.map_previews.values():
+            preview.set_content(
+                atlas,
+                preview_sources,
+            )
+            preview.set_selected_object_id(selected_object_id)
         atlas = self.selected_atlas
         if atlas is None:
             self.status_label.setText("Create an atlas to begin packing textures.")
@@ -2559,7 +2866,8 @@ class TextureAtlasWorkspace(QWidget):
             item = self.object_list.item(row)
             if str(item.data(OBJECT_ID_ROLE)) == normalized_id:
                 self.object_list.setCurrentRow(row)
-                self.preview.set_selected_object_id(normalized_id)
+                for preview in self.map_previews.values():
+                    preview.set_selected_object_id(normalized_id)
                 return True
         return False
 
@@ -2594,10 +2902,15 @@ class TextureAtlasWorkspace(QWidget):
         self._lazy_materialization_error = None
         if atlas is None or not atlas.placements:
             return False
-        if atlas.image_path:
-            candidate = self._resolve_owned_atlas_path(atlas.image_path)
-            if candidate is not None and candidate.is_file():
-                return False
+        expected_output_paths = self._resolve_atlas_map_output_paths(
+            atlas.atlas_id
+        )
+        current_base_path = self._resolve_owned_atlas_path(atlas.image_path)
+        if (
+            current_base_path == expected_output_paths[ATLAS_MAP_BASE_COLOR]
+            and all(path.is_file() for path in expected_output_paths.values())
+        ):
+            return False
         if any(
             self._resolve_placement_source(placement) is None
             for placement in atlas.placements
@@ -2620,17 +2933,30 @@ class TextureAtlasWorkspace(QWidget):
         ]
         | None = None,
     ) -> None:
-        """Write a complete atlas before exposing its updated state."""
+        """Atomically materialize base-color and PBR companion Atlas PNGs."""
 
         self._asset_directory.mkdir(parents=True, exist_ok=True)
-        relative_path = f"{atlas.atlas_id}.png"
-        output_path = self._resolve_owned_atlas_path(relative_path)
-        if output_path is None:
-            raise ValueError(
-                "Texture atlas output path escapes its asset directory."
+        relative_paths = {
+            map_type: build_texture_atlas_map_image_relative_path(
+                atlas.atlas_id,
+                map_type,
             )
+            for map_type in ATLAS_MAP_TYPES
+        }
+        output_paths = self._resolve_atlas_map_output_paths(atlas.atlas_id)
+        snapshot_paths = set(output_paths.values())
+        previous_output_path = self._resolve_owned_atlas_path(atlas.image_path)
+        if previous_output_path is not None:
+            snapshot_paths.add(previous_output_path)
+        snapshots = {
+            path: path.read_bytes() if path.is_file() else None
+            for path in snapshot_paths
+        }
+        previous_image_path = atlas.image_path
 
-        def load_source(placement: TextureAtlasPlacement) -> np.ndarray:
+        def resolve_source(
+            placement: TextureAtlasPlacement,
+        ) -> AtlasObjectTextureSource:
             source = (
                 None
                 if source_overrides is None
@@ -2654,15 +2980,38 @@ class TextureAtlasWorkspace(QWidget):
                 raise ValueError(
                     "The exact texture source does not match its Atlas placement."
                 )
-            rgba = source.load_texture_rgba()
-            return np.ascontiguousarray(rgba[:, :, (2, 1, 0, 3)])
+            return source
 
-        write_texture_atlas_png(
-            atlas,
-            output_path,
-            source_loader=load_source,
-            project_relative_image_path=relative_path,
-        )
+        try:
+            for map_type in (*ATLAS_MAP_TYPES[1:], ATLAS_MAP_BASE_COLOR):
+                output_atlas = (
+                    atlas
+                    if map_type == ATLAS_MAP_BASE_COLOR
+                    else copy.deepcopy(atlas)
+                )
+
+                def load_source(
+                    placement: TextureAtlasPlacement,
+                    selected_map_type: str = map_type,
+                ) -> np.ndarray:
+                    source = resolve_source(placement)
+                    rgba = source.load_texture_rgba(selected_map_type)
+                    return np.ascontiguousarray(rgba[:, :, (2, 1, 0, 3)])
+
+                write_texture_atlas_png(
+                    output_atlas,
+                    output_paths[map_type],
+                    source_loader=load_source,
+                    project_relative_image_path=(
+                        relative_paths[map_type]
+                        if map_type == ATLAS_MAP_BASE_COLOR
+                        else None
+                    ),
+                )
+        except Exception:
+            atlas.image_path = previous_image_path
+            _restore_atlas_png_snapshots(snapshots)
+            raise
         if (
             self._lazy_materialization_error is not None
             and self._lazy_materialization_error[0] == atlas.atlas_id
@@ -2691,17 +3040,21 @@ class TextureAtlasWorkspace(QWidget):
         if not rebuilt:
             atlas.image_path = None
 
-        previous_owned_path = self._resolve_owned_atlas_path(
-            previous_image_path
+        cleanup_paths = set(
+            self._resolve_atlas_map_output_paths(atlas.atlas_id).values()
         )
-        current_owned_path = self._resolve_owned_atlas_path(atlas.image_path)
+        previous_owned_path = self._resolve_owned_atlas_path(previous_image_path)
+        if previous_owned_path is not None:
+            cleanup_paths.add(previous_owned_path)
+        retained_paths = (
+            set(self._resolve_atlas_map_output_paths(atlas.atlas_id).values())
+            if rebuilt
+            else set()
+        )
         cleanup_failed = False
-        if (
-            previous_owned_path is not None
-            and previous_owned_path != current_owned_path
-        ):
+        for cleanup_path in cleanup_paths - retained_paths:
             try:
-                previous_owned_path.unlink(missing_ok=True)
+                cleanup_path.unlink(missing_ok=True)
             except OSError:
                 cleanup_failed = True
         return rebuilt, cleanup_failed
@@ -2816,6 +3169,26 @@ class TextureAtlasWorkspace(QWidget):
             self._variant_source_cache.pop(oldest_key, None)
         self._variant_source_cache[cache_key] = source
         return source
+
+    def _resolve_atlas_map_output_paths(
+        self,
+        atlas_id: str,
+    ) -> dict[str, Path]:
+        """Resolve every deterministic Atlas map path inside the asset root."""
+
+        output_paths: dict[str, Path] = {}
+        for map_type in ATLAS_MAP_TYPES:
+            relative_path = build_texture_atlas_map_image_relative_path(
+                atlas_id,
+                map_type,
+            )
+            output_path = self._resolve_owned_atlas_path(relative_path)
+            if output_path is None:
+                raise ValueError(
+                    "Texture atlas output path escapes its asset directory."
+                )
+            output_paths[map_type] = output_path
+        return output_paths
 
     def _resolve_owned_atlas_path(
         self,

@@ -2005,6 +2005,7 @@ class BlueprintWorkspace(QWidget):
         object_id = getattr(raw_record, "object_id", None)
         if not isinstance(object_id, str) or not object_id:
             return
+        self._sync_atlas_object_texture_sources()
         self.texture_atlas_workspace.refresh_regenerated_object_texture(
             object_id
         )
@@ -2422,14 +2423,35 @@ class BlueprintWorkspace(QWidget):
                 )
             )
             texture_source_signature = tuple(
-                (item[0], item[3], item[4])
+                (
+                    item[0],
+                    item[3],
+                    item[4],
+                    item[5] if len(item) > 5 else (),
+                )
                 for item in texture_variant_signature
             )
             source_content_paths[object_id] = tuple(
-                (item[0], item[3]) for item in texture_variant_signature
+                (
+                    item[0],
+                    item[3],
+                    tuple(
+                        (map_item[0], map_item[1])
+                        for map_item in (item[5] if len(item) > 5 else ())
+                    ),
+                )
+                for item in texture_variant_signature
             )
             source_content_revisions[object_id] = tuple(
-                (item[0], item[4]) for item in texture_variant_signature
+                (
+                    item[0],
+                    item[4],
+                    tuple(
+                        (map_item[0], map_item[2])
+                        for map_item in (item[5] if len(item) > 5 else ())
+                    ),
+                )
+                for item in texture_variant_signature
             )
             if variant is None:
                 signature_items.append(
@@ -2568,19 +2590,27 @@ class BlueprintWorkspace(QWidget):
         if signature == self._atlas_generation_signature:
             self._request_hosted_atlas_object_preview()
             return
-        changed_source_ids = tuple(
-            source_id
-            for source_id, content_revision in source_content_revisions.items()
-            if (
-                self._atlas_source_content_paths is not None
-                and self._atlas_source_content_revisions is not None
-                and source_id in self._atlas_source_content_revisions
-                and self._atlas_source_content_paths.get(source_id)
-                == source_content_paths.get(source_id)
-                and self._atlas_source_content_revisions.get(source_id)
-                != content_revision
-            )
-        )
+        changed_source_ids: list[str] = []
+        if (
+            self._atlas_source_content_paths is not None
+            and self._atlas_source_content_revisions is not None
+        ):
+            for source_id, content_revision in source_content_revisions.items():
+                if source_id not in self._atlas_source_content_revisions:
+                    continue
+                previous_paths = self._atlas_source_content_paths.get(source_id)
+                current_paths = source_content_paths.get(source_id)
+                if (
+                    _build_atlas_source_base_path_signature(previous_paths)
+                    != _build_atlas_source_base_path_signature(current_paths)
+                ):
+                    continue
+                if (
+                    previous_paths != current_paths
+                    or self._atlas_source_content_revisions.get(source_id)
+                    != content_revision
+                ):
+                    changed_source_ids.append(source_id)
 
         active_sources: list[AtlasObjectTextureSource] = []
         available_source_ids: set[str] = set()
@@ -2781,6 +2811,16 @@ class BlueprintWorkspace(QWidget):
                 physical_texture_path=getattr(
                     variant,
                     "texture_asset_path",
+                ),
+                map_texture_paths=getattr(
+                    variant,
+                    "map_texture_asset_relative_paths",
+                    {},
+                ),
+                physical_map_texture_paths=getattr(
+                    variant,
+                    "map_texture_asset_paths",
+                    {},
                 ),
                 packing_mode=packing_mode,
                 symmetric_preview_orientation=(
@@ -5488,6 +5528,20 @@ def _get_logical_wall_size(placement: UvWallPlacement) -> tuple[float, float]:
 
 
 # ### Path helpers ###
+def _build_atlas_source_base_path_signature(
+    source_paths: tuple[tuple[object, ...], ...] | None,
+) -> tuple[tuple[object, object], ...]:
+    """Return resolution and base path while ignoring optional PBR paths."""
+
+    if source_paths is None:
+        return ()
+    return tuple(
+        (source_path[0], source_path[1])
+        for source_path in source_paths
+        if len(source_path) >= 2
+    )
+
+
 def _build_local_file_revision(raw_path: object) -> tuple[object, ...]:
     """Return a cheap replacement-aware revision for one local file."""
 

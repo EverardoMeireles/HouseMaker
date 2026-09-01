@@ -86,6 +86,7 @@ def build_image_to_3d_request_body(
     image_png: bytes,
     target_polycount: int = DEFAULT_SMART_TOPOLOGY_TARGET_POLYCOUNT,
     should_texture: bool = True,
+    enable_pbr: bool = False,
 ) -> dict[str, Any]:
     """Build a Smart Topology Meshy Image-to-3D request."""
 
@@ -95,6 +96,12 @@ def build_image_to_3d_request_body(
     )
     if not isinstance(should_texture, bool):
         raise ValueError("Meshy should_texture must be a boolean.")
+    if not isinstance(enable_pbr, bool):
+        raise ValueError("Meshy enable_pbr must be a boolean.")
+    if enable_pbr and not should_texture:
+        raise ValueError(
+            "Meshy PBR maps require texture generation to be enabled."
+        )
     normalized_polycount = _normalize_smart_topology_target_polycount(
         target_polycount
     )
@@ -112,7 +119,7 @@ def build_image_to_3d_request_body(
     if should_texture:
         body.update(
             {
-                "enable_pbr": False,
+                "enable_pbr": enable_pbr,
                 "texture_resolution": "2k",
             }
         )
@@ -123,6 +130,7 @@ def build_retexture_request_body(
     model_glb: bytes,
     reference_images_png: Sequence[bytes],
     enable_original_uv: bool = False,
+    enable_pbr: bool = False,
 ) -> dict[str, Any]:
     """Build a Retexture request for a locally post-processed GLB."""
 
@@ -132,11 +140,13 @@ def build_retexture_request_body(
     )
     if not isinstance(enable_original_uv, bool):
         raise ValueError("Meshy enable_original_uv must be a boolean.")
+    if not isinstance(enable_pbr, bool):
+        raise ValueError("Meshy enable_pbr must be a boolean.")
     image_data_uris = _normalize_retexture_reference_images(reference_images_png)
     body: dict[str, Any] = {
         "model_url": _build_data_uri("application/octet-stream", normalized_model),
         "enable_original_uv": enable_original_uv,
-        "enable_pbr": False,
+        "enable_pbr": enable_pbr,
         "texture_resolution": "2k",
         "target_formats": ["glb"],
     }
@@ -211,12 +221,14 @@ def create_image_to_3d_task(
     opener: UrlOpenFunction | None = None,
     target_polycount: int = DEFAULT_SMART_TOPOLOGY_TARGET_POLYCOUNT,
     should_texture: bool = True,
+    enable_pbr: bool = False,
 ) -> str:
     normalized_key = _require_api_key(api_key)
     payload = build_image_to_3d_request_body(
         image_png,
         target_polycount=target_polycount,
         should_texture=should_texture,
+        enable_pbr=enable_pbr,
     )
     response = _request_json(
         Request(
@@ -290,12 +302,14 @@ def create_retexture_task(
     timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
     opener: UrlOpenFunction | None = None,
     enable_original_uv: bool = False,
+    enable_pbr: bool = False,
 ) -> str:
     normalized_key = _require_api_key(api_key)
     payload = build_retexture_request_body(
         model_glb=model_glb,
         reference_images_png=reference_images_png,
         enable_original_uv=enable_original_uv,
+        enable_pbr=enable_pbr,
     )
     response = _request_json(
         Request(
@@ -412,6 +426,7 @@ def request_image_to_3d_model(
     cancel_event: threading.Event | None = None,
     target_polycount: int = DEFAULT_SMART_TOPOLOGY_TARGET_POLYCOUNT,
     should_texture: bool = True,
+    enable_pbr: bool = False,
 ) -> MeshyGenerationResult:
     task_id = create_image_to_3d_task(
         api_key=api_key,
@@ -419,6 +434,7 @@ def request_image_to_3d_model(
         opener=opener,
         target_polycount=target_polycount,
         should_texture=should_texture,
+        enable_pbr=enable_pbr,
     )
     task = wait_for_image_to_3d_task(
         api_key=api_key,
@@ -446,6 +462,7 @@ def request_retextured_model(
     progress_callback: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
     enable_original_uv: bool = False,
+    enable_pbr: bool = False,
 ) -> MeshyGenerationResult:
     if cancel_event is not None and cancel_event.is_set():
         raise MeshyTaskError(
@@ -457,6 +474,7 @@ def request_retextured_model(
         reference_images_png=reference_images_png,
         opener=opener,
         enable_original_uv=enable_original_uv,
+        enable_pbr=enable_pbr,
     )
     task = wait_for_retexture_task(
         api_key=api_key,

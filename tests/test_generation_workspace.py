@@ -13,7 +13,7 @@ import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import cv2
 import numpy as np
@@ -72,6 +72,12 @@ from housemaker.object_uv_scan_projection import (
     ScanProjectionCancelled,
     ScanProjectionResult,
     ScanProjectionStats,
+)
+from housemaker.object_texture_variants import (
+    PBR_MAP_METALLIC,
+    PBR_MAP_NORMAL,
+    PBR_MAP_ROUGHNESS,
+    PBR_MAP_TYPES,
 )
 from housemaker.settings_widget import GenerationServiceSettings
 from housemaker.texture_atlas_view import TextureAtlasEntry
@@ -1806,6 +1812,228 @@ class GenerationWorkspaceTests(unittest.TestCase):
         self.assertFalse(self.workspace.result_view.get_textures_enabled())
         self.assertTrue(self.workspace.result_view.get_wireframe_enabled())
         self.assertTrue(self.workspace.texture_view.uv_overlay_enabled)
+
+    def test_pbr_map_checkboxes_use_three_rows_in_stable_map_order(self) -> None:
+        layout = self.workspace.pbr_map_control.layout()
+
+        self.assertIsNotNone(layout)
+        self.assertEqual(layout.rowCount(), 3)
+        self.assertEqual(layout.columnCount(), 1)
+        self.assertEqual(tuple(self.workspace.pbr_map_checkboxes), PBR_MAP_TYPES)
+        expected_labels = ("Normal", "Roughness", "Metallic")
+        for row, (map_type, expected_label) in enumerate(
+            zip(PBR_MAP_TYPES, expected_labels, strict=True)
+        ):
+            checkbox = self.workspace.pbr_map_checkboxes[map_type]
+            item = layout.itemAtPosition(row, 0)
+            self.assertIsNotNone(item)
+            assert item is not None
+            self.assertIs(item.widget(), checkbox)
+            self.assertEqual(checkbox.text(), expected_label)
+            self.assertFalse(checkbox.isChecked())
+
+    def test_pbr_toggle_updates_viewer_without_reloading_its_model(self) -> None:
+        model = _test_textured_model((70, 100, 130, 255))
+        viewer = self.workspace.result_view
+        viewer.set_model(model)
+
+        with (
+            patch.object(
+                viewer,
+                "set_pbr_maps_enabled",
+                wraps=viewer.set_pbr_maps_enabled,
+            ) as apply_pbr_maps,
+            patch.object(viewer, "set_model") as reload_model,
+        ):
+            self.workspace.pbr_map_checkboxes[PBR_MAP_NORMAL].setChecked(True)
+            self.workspace.pbr_map_checkboxes[PBR_MAP_METALLIC].setChecked(True)
+
+        self.assertEqual(apply_pbr_maps.call_count, 2)
+        self.assertEqual(
+            apply_pbr_maps.call_args.args,
+            ((PBR_MAP_NORMAL, PBR_MAP_METALLIC),),
+        )
+        reload_model.assert_not_called()
+        self.assertIs(viewer.model, model)
+        self.assertEqual(
+            viewer.get_pbr_maps_enabled(),
+            {
+                PBR_MAP_NORMAL: True,
+                PBR_MAP_ROUGHNESS: False,
+                PBR_MAP_METALLIC: True,
+            },
+        )
+
+    def test_enabled_pbr_map_is_snapshotted_and_requests_meshy_pbr(self) -> None:
+        self.workspace.set_runtime_settings(
+            GenerationServiceSettings(meshy_api_key="meshy-key")
+        )
+        roughness_checkbox = self.workspace.pbr_map_checkboxes[
+            PBR_MAP_ROUGHNESS
+        ]
+        roughness_checkbox.setChecked(True)
+        with (
+            patch.object(
+                self.workspace.video_view,
+                "get_frame_bgr",
+                return_value=np.zeros((8, 8, 3), dtype=np.uint8),
+            ),
+            patch.object(
+                self.workspace.video_view,
+                "has_selection",
+                return_value=True,
+            ),
+            patch.object(
+                self.workspace.video_view,
+                "build_selected_object_crop",
+                return_value=np.full((4, 4, 4), 255, dtype=np.uint8),
+            ),
+        ):
+            request = self.workspace._build_generation_request()
+
+        self.assertIsNotNone(request)
+        assert request is not None
+        self.assertEqual(request.enabled_pbr_maps, (PBR_MAP_ROUGHNESS,))
+        roughness_checkbox.setChecked(False)
+        self.workspace.pbr_map_checkboxes[PBR_MAP_NORMAL].setChecked(True)
+        self.assertEqual(request.enabled_pbr_maps, (PBR_MAP_ROUGHNESS,))
+
+        provider_result = _test_meshy_result("PBR chair")
+        with patch(
+            "housemaker.generation_workspace.request_image_to_3d_model",
+            return_value=provider_result,
+        ) as request_model:
+            result = MeshyImagePlanner().plan(request)
+
+        self.assertIs(result, provider_result)
+        self.assertIs(request_model.call_args.kwargs["enable_pbr"], True)
+
+    def test_glass_conversion_snapshots_faces_maps_and_button_prerequisites(
+        self,
+    ) -> None:
+        button = self.workspace.convert_faces_to_glass_button
+        self.assertFalse(button.isEnabled())
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            asset_directory = temporary_path / "generation_assets"
+            asset_directory.mkdir()
+            self.workspace._asset_directory = asset_directory
+            self.workspace._video_source = Mock()
+            with (
+                patch.object(
+                    self.workspace.video_view,
+                    "get_frame_bgr",
+                    return_value=np.zeros((8, 8, 3), dtype=np.uint8),
+                ),
+                patch.object(
+                    self.workspace.video_view,
+                    "has_selection",
+                    return_value=True,
+                ),
+                patch.object(
+                    self.workspace.video_view,
+                    "build_selected_object_crop",
+                    return_value=np.full((4, 4, 4), 255, dtype=np.uint8),
+                ),
+            ):
+                self.workspace.set_runtime_settings(
+                    GenerationServiceSettings(meshy_api_key="meshy-key")
+                )
+                model = _test_textured_model((80, 110, 140, 255))
+                self.workspace._handle_generation_succeeded(
+                    MeshyGenerationResult(
+                        "task-test-chair",
+                        model.glb_bytes,
+                        "Glass cabinet",
+                    ),
+                    model,
+                )
+
+                self.assertFalse(button.isEnabled())
+                self.workspace.result_view.set_selected_face_indices((4, 1))
+                _qt_application.processEvents()
+                self.assertTrue(button.isEnabled())
+
+                self.workspace.set_runtime_settings(GenerationServiceSettings())
+                self.assertFalse(button.isEnabled())
+                self.workspace.set_runtime_settings(
+                    GenerationServiceSettings(meshy_api_key="meshy-key")
+                )
+                self.assertTrue(button.isEnabled())
+
+                with patch.object(
+                    self.workspace,
+                    "_start_texture_regeneration",
+                    return_value=True,
+                ) as start_regeneration:
+                    converted = self.workspace.convert_selected_faces_to_glass()
+
+        self.assertTrue(converted)
+        start_regeneration.assert_called_once()
+        request = start_regeneration.call_args.args[0]
+        self.assertEqual(request.glass_face_indices, (1, 4))
+        self.assertEqual(request.enabled_pbr_maps, PBR_MAP_TYPES)
+        self.assertTrue(request.enable_original_uv)
+        self.assertEqual(
+            start_regeneration.call_args.kwargs,
+            {"requested_name": ""},
+        )
+        self.assertTrue(
+            all(
+                checkbox.isChecked()
+                for checkbox in self.workspace.pbr_map_checkboxes.values()
+            )
+        )
+        self.assertEqual(
+            self.workspace.result_view.get_pbr_maps_enabled(),
+            {map_type: True for map_type in PBR_MAP_TYPES},
+        )
+
+    def test_glass_conversion_requires_existing_complete_uvs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            asset_directory = Path(temporary_directory) / "generation_assets"
+            asset_directory.mkdir()
+            self.workspace._asset_directory = asset_directory
+            self.workspace._video_source = Mock()
+            with (
+                patch.object(
+                    self.workspace.video_view,
+                    "get_frame_bgr",
+                    return_value=np.zeros((8, 8, 3), dtype=np.uint8),
+                ),
+                patch.object(
+                    self.workspace.video_view,
+                    "has_selection",
+                    return_value=True,
+                ),
+                patch.object(
+                    self.workspace.video_view,
+                    "build_selected_object_crop",
+                    return_value=np.full((4, 4, 4), 255, dtype=np.uint8),
+                ),
+            ):
+                self.workspace.set_runtime_settings(
+                    GenerationServiceSettings(meshy_api_key="meshy-key")
+                )
+                model = _test_model()
+                self.workspace._handle_generation_succeeded(
+                    _test_meshy_result("Untextured cabinet"),
+                    model,
+                )
+                self.workspace.result_view.set_selected_face_indices((0,))
+                _qt_application.processEvents()
+
+                self.assertFalse(
+                    self.workspace.convert_faces_to_glass_button.isEnabled()
+                )
+                self.assertFalse(
+                    self.workspace.convert_selected_faces_to_glass()
+                )
+                self.assertIn(
+                    "requires a textured object with UVs",
+                    self.workspace.status_label.text(),
+                )
 
     def test_model_uv_triangles_are_collected_per_face_for_texture_preview(
         self,

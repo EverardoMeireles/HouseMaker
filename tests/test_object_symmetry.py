@@ -18,6 +18,12 @@ from trimesh.visual.texture import TextureVisuals
 
 from housemaker import object_symmetry
 from housemaker.glb import GLTF_Y_UP_TO_Z_UP_TRANSFORM
+from housemaker.object_texture_variants import (
+    PBR_MAP_METALLIC,
+    PBR_MAP_NORMAL,
+    PBR_MAP_ROUGHNESS,
+    TEXTURE_RESOLUTIONS,
+)
 from housemaker.object_symmetry import (
     AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
     LEGACY_SYMMETRIC_PAIR_METADATA_VERSION,
@@ -2765,6 +2771,67 @@ class SymmetricDivisionRepeatedUvTests(unittest.TestCase):
 
 # ### Degenerate UV repair tests ###
 class SymmetricDivisionDegenerateUvRepairTests(unittest.TestCase):
+    def test_point_chart_samples_each_pbr_source_map(self) -> None:
+        vertices = np.asarray(
+            ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+            dtype=float,
+        )
+        faces = np.asarray(((0, 1, 2),), dtype=np.int64)
+        original_uv = np.asarray((0.25, 0.4), dtype=float)
+        uvs = np.repeat(original_uv[np.newaxis, :], 3, axis=0)
+        source_scene = _load_scene(
+            _custom_textured_glb(vertices, faces, uvs)
+        )
+        source_material = next(
+            iter(source_scene.geometry.values())
+        ).visual.material
+        normal_color = (76, 164, 238, 255)
+        metallic_roughness_color = (0, 63, 207, 255)
+        source_material.normalTexture = Image.fromarray(
+            _solid_texture(normal_color),
+            mode="RGBA",
+        )
+        source_material.metallicRoughnessTexture = Image.fromarray(
+            _solid_texture(metallic_roughness_color),
+            mode="RGBA",
+        )
+        source = bytes(source_scene.export(file_type="glb"))
+
+        variants = build_symmetric_half_texture_variants(source)
+
+        output_scene = _load_scene(variants.glb_by_resolution[2048])
+        output_mesh = next(iter(output_scene.geometry.values()))
+        output_uvs = np.asarray(output_mesh.visual.uv, dtype=float)
+        output_face = np.asarray(output_mesh.faces, dtype=np.int64)[0]
+        output_uv = np.mean(output_uvs[output_face], axis=0)
+        map_previews = variants.map_preview_rgba_by_resolution
+        self.assertIsNotNone(map_previews)
+        assert map_previews is not None
+        np.testing.assert_allclose(
+            _sample_texture_bilinear(
+                map_previews[PBR_MAP_NORMAL][2048],
+                output_uv,
+            ),
+            np.asarray(normal_color, dtype=float),
+            atol=2.0,
+        )
+        np.testing.assert_allclose(
+            _sample_texture_bilinear(
+                map_previews[PBR_MAP_ROUGHNESS][2048],
+                output_uv,
+            ),
+            np.asarray((63, 63, 63, 255), dtype=float),
+            atol=2.0,
+        )
+        np.testing.assert_allclose(
+            _sample_texture_bilinear(
+                map_previews[PBR_MAP_METALLIC][2048],
+                output_uv,
+            ),
+            np.asarray((207, 207, 207, 255), dtype=float),
+            atol=2.0,
+        )
+
     def test_point_chart_becomes_nonzero_and_keeps_constant_appearance(
         self,
     ) -> None:
@@ -3219,7 +3286,7 @@ class SymmetricDivisionFallbackAndRejectionTests(unittest.TestCase):
         expected_black = _solid_texture((0, 0, 0, 255))[:, :1024]
         np.testing.assert_array_equal(output_texture[:, 1024:], expected_black)
 
-    def test_auxiliary_material_maps_are_rejected_before_uv_changes(self) -> None:
+    def test_normal_maps_follow_symmetric_uv_repacking(self) -> None:
         mesh = trimesh.creation.box()
         uvs = np.column_stack(
             (
@@ -3242,8 +3309,35 @@ class SymmetricDivisionFallbackAndRejectionTests(unittest.TestCase):
         )
         source = _scene_glb([("normal-map-node", mesh, np.eye(4))])
 
-        with self.assertRaisesRegex(ValueError, "auxiliary material"):
-            build_symmetric_half_texture_variants(source)
+        variants = build_symmetric_half_texture_variants(source)
+
+        self.assertIsNotNone(variants.map_png_by_resolution)
+        assert variants.map_png_by_resolution is not None
+        self.assertIn("normal", variants.map_png_by_resolution)
+        self.assertEqual(
+            set(variants.map_png_by_resolution["normal"]),
+            set(TEXTURE_RESOLUTIONS),
+        )
+        output_scene = _load_scene(variants.glb_by_resolution[2048])
+        output_material = next(
+            iter(output_scene.geometry.values())
+        ).visual.material
+        self.assertIsNotNone(output_material.normalTexture)
+
+    def test_clockwise_normal_rotation_uses_destination_tangent_basis(
+        self,
+    ) -> None:
+        source = np.asarray(
+            (((168, 78, 240, 255),),),
+            dtype=np.uint8,
+        )
+
+        rotated = object_symmetry._rotate_normal_map_clockwise(source)
+
+        np.testing.assert_array_equal(
+            rotated,
+            np.asarray((((78, 88, 240, 255),),), dtype=np.uint8),
+        )
 
     def test_uv_island_count_is_bounded_before_mask_growth(self) -> None:
         vertices = np.asarray(

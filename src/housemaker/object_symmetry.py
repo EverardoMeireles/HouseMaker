@@ -5,7 +5,7 @@ import copy
 import math
 import random
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import cv2
@@ -19,17 +19,27 @@ from housemaker.glb import (
     Z_UP_TO_GLTF_Y_UP_TRANSFORM,
 )
 from housemaker.object_texture_variants import (
+    ATLAS_MAP_BASE_COLOR,
+    ATLAS_MAP_TYPES,
+    MATERIAL_TEXTURE_BASE_COLOR,
+    MATERIAL_TEXTURE_METALLIC_ROUGHNESS,
+    MATERIAL_TEXTURE_NORMAL,
     TEXTURE_RESOLUTION_512,
     TEXTURE_RESOLUTION_1024,
     TEXTURE_RESOLUTION_2048,
     TEXTURE_RESOLUTIONS,
     ObjectTextureVariants,
+    _collect_material_texture_maps,
     _collect_material_textures,
     _encode_rgba_png,
     _load_glb_scene,
-    _replace_material_textures,
+    _replace_material_texture_maps_with_shared,
     _resize_rgba,
+    _split_atlas_texture_maps,
     _validate_shared_2048_texture,
+    _validate_shared_2048_texture_maps,
+    _validate_shared_texture_maps,
+    reject_unsupported_uv_material_textures,
 )
 from housemaker.object_uv_scan_projection import (
     SCAN_PROJECTION_TARGET_LEFT_HALF,
@@ -155,6 +165,10 @@ class SymmetricQuarterTextureVariants:
     glb_by_resolution: dict[int, bytes]
     texture_png_by_resolution: dict[int, bytes]
     preview_rgba_by_resolution: dict[int, np.ndarray]
+    map_png_by_resolution: dict[str, dict[int, bytes]] | None = None
+    map_preview_rgba_by_resolution: (
+        dict[str, dict[int, np.ndarray]] | None
+    ) = None
 
     def __post_init__(self) -> None:
         required = set(SYMMETRIC_QUARTER_CONTENT_RESOLUTIONS)
@@ -181,6 +195,7 @@ class SymmetricQuarterTextureVariants:
                     "A quarter texture preview has the wrong physical atlas "
                     "size."
                 )
+        _normalize_symmetric_variant_maps(self)
 
     @property
     def selectable_resolutions(self) -> tuple[int, int]:
@@ -209,6 +224,10 @@ class SymmetricPairTextureVariants:
     glb_by_resolution: dict[int, bytes]
     texture_png_by_resolution: dict[int, bytes]
     preview_rgba_by_resolution: dict[int, np.ndarray]
+    map_png_by_resolution: dict[str, dict[int, bytes]] | None = None
+    map_preview_rgba_by_resolution: (
+        dict[str, dict[int, np.ndarray]] | None
+    ) = None
 
     def __post_init__(self) -> None:
         required = set(SYMMETRIC_PAIR_CONTENT_RESOLUTIONS)
@@ -230,6 +249,7 @@ class SymmetricPairTextureVariants:
                 raise ValueError(
                     "A pair texture preview has the wrong physical atlas size."
                 )
+        _normalize_symmetric_variant_maps(self)
 
     @property
     def selectable_resolutions(self) -> tuple[int, int]:
@@ -256,6 +276,10 @@ class SymmetricSquarePairTextureVariants:
     glb_by_resolution: dict[int, bytes]
     texture_png_by_resolution: dict[int, bytes]
     preview_rgba_by_resolution: dict[int, np.ndarray]
+    map_png_by_resolution: dict[str, dict[int, bytes]] | None = None
+    map_preview_rgba_by_resolution: (
+        dict[str, dict[int, np.ndarray]] | None
+    ) = None
 
     def __post_init__(self) -> None:
         required = set(SYMMETRIC_SQUARE_PAIR_CONTENT_RESOLUTIONS)
@@ -282,6 +306,7 @@ class SymmetricSquarePairTextureVariants:
                     "A square-pair texture preview has the wrong physical "
                     "atlas size."
                 )
+        _normalize_symmetric_variant_maps(self)
 
     @property
     def selectable_resolutions(self) -> tuple[int, int]:
@@ -303,6 +328,39 @@ class SymmetricSquarePairTextureVariants:
             raise ValueError(
                 "Unknown symmetric square-pair resolution."
             ) from error
+
+
+def _normalize_symmetric_variant_maps(variants: object) -> None:
+    """Add base-color aliases and validate optional per-map artifacts."""
+
+    texture_pngs = getattr(variants, "texture_png_by_resolution")
+    texture_previews = getattr(variants, "preview_rgba_by_resolution")
+    map_pngs = dict(getattr(variants, "map_png_by_resolution") or {})
+    map_previews = dict(
+        getattr(variants, "map_preview_rgba_by_resolution") or {}
+    )
+    map_pngs.setdefault(ATLAS_MAP_BASE_COLOR, dict(texture_pngs))
+    map_previews.setdefault(ATLAS_MAP_BASE_COLOR, dict(texture_previews))
+    if set(map_pngs) != set(map_previews):
+        raise ValueError("Symmetric map PNGs and previews must match.")
+    if any(map_type not in ATLAS_MAP_TYPES for map_type in map_pngs):
+        raise ValueError("A symmetric texture variant has an unknown map.")
+    required = set(texture_pngs)
+    for map_type in map_pngs:
+        if set(map_pngs[map_type]) != required:
+            raise ValueError(
+                f"The symmetric {map_type} map is missing a resolution."
+            )
+        if set(map_previews[map_type]) != required:
+            raise ValueError(
+                f"The symmetric {map_type} preview is missing a resolution."
+            )
+    object.__setattr__(variants, "map_png_by_resolution", map_pngs)
+    object.__setattr__(
+        variants,
+        "map_preview_rgba_by_resolution",
+        map_previews,
+    )
 
 
 @dataclass(frozen=True)
@@ -578,6 +636,7 @@ class _UvIsland:
     source_mask: np.ndarray
     exact_repeat_seams: _RepeatSeamEdges
     source_pixel_coordinates: np.ndarray | None = None
+    repair_source_uvs: np.ndarray | None = None
     source_rgba: np.ndarray | None = None
 
 
@@ -641,11 +700,12 @@ def build_symmetric_retexture_proxy_glb(
 
     source_scene = _load_glb_scene(payload)
     _reject_auxiliary_material_textures(source_scene)
-    source_textures = _collect_material_textures(source_scene)
-    source_texture = (
-        _validate_shared_square_pair_texture(source_textures).copy()
+    source_texture_maps = _collect_material_texture_maps(source_scene)
+    source_textures = source_texture_maps.get(MATERIAL_TEXTURE_BASE_COLOR, [])
+    validated_source_maps = (
+        _validate_shared_square_pair_texture_maps(source_texture_maps)
         if source_textures
-        else None
+        else {}
     )
     _validate_existing_scene_uvs_in_left_half(source_scene)
     instances = _collect_mesh_instances(source_scene)
@@ -691,15 +751,14 @@ def build_symmetric_retexture_proxy_glb(
             node_name=node_name,
         )
 
-    if source_texture is not None:
-        half_width = source_texture.shape[1] // 2
-        proxy_texture = source_texture.copy()
-        proxy_texture[:, half_width:] = source_texture[:, :half_width]
-        proxy_textures = _collect_material_textures(proxy_scene)
-        _replace_material_textures(
-            proxy_scene,
-            [proxy_texture] * len(proxy_textures),
-        )
+    if validated_source_maps:
+        proxy_maps: dict[str, np.ndarray] = {}
+        for map_type, source_texture in validated_source_maps.items():
+            half_width = source_texture.shape[1] // 2
+            proxy_texture = source_texture.copy()
+            proxy_texture[:, half_width:] = source_texture[:, :half_width]
+            proxy_maps[map_type] = proxy_texture
+        _replace_material_texture_maps_with_shared(proxy_scene, proxy_maps)
     try:
         return bytes(proxy_scene.export(file_type="glb"))
     except Exception as error:
@@ -760,12 +819,13 @@ def build_automatic_symmetric_object_variants(
 
     scene = _load_glb_scene(payload)
     _reject_auxiliary_material_textures(scene)
-    source_textures = _collect_material_textures(scene)
+    source_texture_maps = _collect_material_texture_maps(scene)
+    source_textures = source_texture_maps.get(MATERIAL_TEXTURE_BASE_COLOR, [])
     if not source_textures:
         raise ValueError(
             "Automatic symmetry requires one embedded base-color texture atlas."
         )
-    canonical_texture = _validate_shared_2048_texture(source_textures).copy()
+    canonical_maps = _validate_shared_2048_texture_maps(source_texture_maps)
     selection = _select_automatic_symmetric_half(scene, orientation, rng)
     clipped_scene = selection.retained_scene
     output_textures = _collect_material_textures(clipped_scene)
@@ -777,9 +837,9 @@ def build_automatic_symmetric_object_variants(
     scan_projection_stats: ScanProjectionStats | None = None
     if projection_camera_percentages is None:
         _normalize_scene_repeat_uvs(clipped_scene)
-        packed_texture = _repack_retained_texture(
+        packed_maps = _repack_retained_texture_maps(
             clipped_scene,
-            canonical_texture,
+            canonical_maps,
         )
     else:
         projected = scan_project_textured_glb(
@@ -789,15 +849,18 @@ def build_automatic_symmetric_object_variants(
             cancellation_check=cancellation_check,
         )
         clipped_scene = _load_glb_scene(projected.glb_bytes)
-        output_textures = _collect_material_textures(clipped_scene)
-        packed_texture = _validate_shared_2048_texture(
-            output_textures
-        ).copy()
+        output_texture_maps = _collect_material_texture_maps(clipped_scene)
+        output_textures = output_texture_maps.get(
+            MATERIAL_TEXTURE_BASE_COLOR,
+            [],
+        )
+        packed_maps = _validate_shared_2048_texture_maps(
+            output_texture_maps
+        )
         scan_projection_stats = projected.stats
     variants = _build_square_pair_texture_variants(
         clipped_scene,
-        packed_texture,
-        len(output_textures),
+        packed_maps,
     )
     metadata = _build_automatic_symmetry_metadata(selection)
     return SymmetricDivisionResult(
@@ -824,24 +887,24 @@ def build_symmetric_pair_texture_variants(
         raise ValueError("The retextured canonical 2048 GLB is empty.")
     scene = _load_glb_scene(payload)
     _reject_auxiliary_material_textures(scene)
-    source_textures = _collect_material_textures(scene)
+    source_texture_maps = _collect_material_texture_maps(scene)
+    source_textures = source_texture_maps.get(MATERIAL_TEXTURE_BASE_COLOR, [])
     if not source_textures:
         raise ValueError(
             "Symmetric pair packing requires one embedded base-color atlas."
         )
-    canonical_texture = _validate_shared_2048_texture(source_textures).copy()
+    canonical_maps = _validate_shared_2048_texture_maps(source_texture_maps)
     if uvs_already_left_packed and _scene_uvs_are_left_packed(scene):
-        packed_texture = _mask_existing_left_texture(
+        packed_maps = _mask_existing_left_texture_maps(
             scene,
-            canonical_texture,
+            canonical_maps,
         )
     else:
         _normalize_scene_repeat_uvs(scene)
-        packed_texture = _repack_retained_texture(scene, canonical_texture)
+        packed_maps = _repack_retained_texture_maps(scene, canonical_maps)
     return _build_pair_texture_variants(
         scene,
-        packed_texture,
-        len(source_textures),
+        packed_maps,
     )
 
 
@@ -865,13 +928,17 @@ def build_symmetric_square_pair_texture_variants(
         raise ValueError("The symmetric square-pair source GLB is empty.")
     scene = _load_glb_scene(payload)
     _reject_auxiliary_material_textures(scene)
-    source_textures = _collect_material_textures(scene)
+    source_texture_maps = _collect_material_texture_maps(scene)
+    source_textures = source_texture_maps.get(MATERIAL_TEXTURE_BASE_COLOR, [])
     if not source_textures:
         raise ValueError(
             "Symmetric square-pair packing requires one embedded base-color "
             "atlas."
         )
-    source_texture = _validate_shared_square_pair_texture(source_textures).copy()
+    source_maps = _validate_shared_square_pair_texture_maps(
+        source_texture_maps
+    )
+    source_texture = source_maps[MATERIAL_TEXTURE_BASE_COLOR]
     source_resolution = int(source_texture.shape[0])
     left_packed = _scene_uvs_are_left_packed(scene)
     if uvs_already_left_packed and not left_packed:
@@ -880,23 +947,22 @@ def build_symmetric_square_pair_texture_variants(
             "required texture boundary inset."
         )
     if uvs_already_left_packed and source_resolution == TEXTURE_RESOLUTION_2048:
-        packed_texture = _mask_existing_left_texture(scene, source_texture)
+        packed_maps = _mask_existing_left_texture_maps(scene, source_maps)
     elif uvs_already_left_packed:
-        packed_texture = _mask_existing_square_pair_texture(
+        packed_maps = _mask_existing_square_pair_texture_maps(
             scene,
-            source_texture,
+            source_maps,
         )
     elif source_resolution == TEXTURE_RESOLUTION_2048:
         _normalize_scene_repeat_uvs(scene)
-        packed_texture = _repack_retained_texture(scene, source_texture)
+        packed_maps = _repack_retained_texture_maps(scene, source_maps)
     else:
         raise ValueError(
             "A 1024 square-pair source requires verified left-packed UVs."
         )
     return _build_square_pair_texture_variants(
         scene,
-        packed_texture,
-        len(source_textures),
+        packed_maps,
     )
 
 
@@ -914,12 +980,13 @@ def build_symmetric_quarter_texture_variants(
         raise ValueError("The retextured canonical 2048 GLB is empty.")
     scene = _load_glb_scene(payload)
     _reject_auxiliary_material_textures(scene)
-    source_textures = _collect_material_textures(scene)
+    source_texture_maps = _collect_material_texture_maps(scene)
+    source_textures = source_texture_maps.get(MATERIAL_TEXTURE_BASE_COLOR, [])
     if not source_textures:
         raise ValueError(
             "Symmetric quarter packing requires one embedded base-color atlas."
         )
-    canonical_texture = _validate_shared_2048_texture(source_textures).copy()
+    canonical_maps = _validate_shared_2048_texture_maps(source_texture_maps)
     if uvs_already_top_left_quarter:
         _validate_scene_uvs_in_top_left_quarter(scene)
     else:
@@ -927,8 +994,7 @@ def build_symmetric_quarter_texture_variants(
         _map_scene_uvs_to_top_left_quarter(scene)
     return _build_quarter_texture_variants(
         scene,
-        canonical_texture,
-        len(source_textures),
+        canonical_maps,
         source_is_already_quarter=uvs_already_top_left_quarter,
     )
 
@@ -952,21 +1018,21 @@ def build_symmetric_half_texture_variants(
         raise ValueError("The retextured canonical 2048 GLB is empty.")
     scene = _load_glb_scene(payload)
     _reject_auxiliary_material_textures(scene)
-    source_textures = _collect_material_textures(scene)
+    source_texture_maps = _collect_material_texture_maps(scene)
+    source_textures = source_texture_maps.get(MATERIAL_TEXTURE_BASE_COLOR, [])
     if not source_textures:
         raise ValueError(
             "Symmetric texture packing requires one embedded base-color atlas."
         )
-    canonical_texture = _validate_shared_2048_texture(source_textures).copy()
+    canonical_maps = _validate_shared_2048_texture_maps(source_texture_maps)
     if uvs_already_left_packed and _scene_uvs_are_left_packed(scene):
-        packed_texture = _mask_existing_left_texture(scene, canonical_texture)
+        packed_maps = _mask_existing_left_texture_maps(scene, canonical_maps)
     else:
         _normalize_scene_repeat_uvs(scene)
-        packed_texture = _repack_retained_texture(scene, canonical_texture)
+        packed_maps = _repack_retained_texture_maps(scene, canonical_maps)
     return _build_half_texture_variants(
         scene,
-        packed_texture,
-        len(source_textures),
+        packed_maps,
     )
 
 
@@ -1573,38 +1639,12 @@ def _get_face_materials(mesh: trimesh.Trimesh) -> np.ndarray | None:
 
 # ### Material compatibility helpers ###
 def _reject_auxiliary_material_textures(scene: trimesh.Scene) -> None:
-    """Reject maps which cannot share a base-color-only atlas transform."""
+    """Reject unsupported maps while allowing Meshy's shared-UV PBR maps."""
 
-    auxiliary_names = (
-        "normalTexture",
-        "emissiveTexture",
-        "occlusionTexture",
-        "metallicRoughnessTexture",
+    reject_unsupported_uv_material_textures(
+        scene,
+        operation_name="Symmetric UV packing",
     )
-    for geometry in scene.geometry.values():
-        material = getattr(getattr(geometry, "visual", None), "material", None)
-        for nested_material in _iter_material_tree(material):
-            if any(
-                getattr(nested_material, name, None) is not None
-                for name in auxiliary_names
-            ):
-                raise ValueError(
-                    "Symmetric UV packing does not support auxiliary material "
-                    "textures. Remove normal, emissive, occlusion and "
-                    "metallic-roughness maps before dividing the object."
-                )
-
-
-def _iter_material_tree(material: object) -> list[object]:
-    if material is None:
-        return []
-    nested = getattr(material, "materials", None)
-    if isinstance(nested, list | tuple):
-        flattened: list[object] = []
-        for child in nested:
-            flattened.extend(_iter_material_tree(child))
-        return flattened
-    return [material]
 
 
 # ### Repeated UV normalization ###
@@ -2113,16 +2153,18 @@ def _prepare_uv_islands(
                 bounds, mask = _align_uv_mask_to_pack_lattice(bounds, mask)
                 estimated_pixels = max(estimated_pixels, int(mask.size))
                 source_pixel_coordinates = None
+                repair_source_uvs = None
                 repaired_rgba = None
             else:
                 repaired_vertices = rebuilt_faces[int(face_indices[0])]
+                repair_source_uvs = rebuilt_uvs[repaired_vertices].copy()
                 (
                     bounds,
                     mask,
                     repaired_rgba,
                     source_pixel_coordinates,
                 ) = _build_repaired_uv_face_scratch(
-                    rebuilt_uvs[repaired_vertices],
+                    repair_source_uvs,
                     source_rgba,
                     repair_kind,
                 )
@@ -2152,6 +2194,7 @@ def _prepare_uv_islands(
                         rebuilt_uvs[vertex_indices]
                     ),
                     source_pixel_coordinates=source_pixel_coordinates,
+                    repair_source_uvs=repair_source_uvs,
                     source_rgba=repaired_rgba,
                 )
             )
@@ -2300,29 +2343,44 @@ def _build_repaired_uv_face_scratch(
     mask = _rasterize_pixel_triangle(chart_points, width, height)
     if not np.any(mask):
         raise RuntimeError("A repaired UV chart could not be rasterized.")
-    scratch = np.empty((height, width, 4), dtype=np.uint8)
-    scratch[:] = _OPAQUE_BLACK
-    rows, columns = np.nonzero(mask)
-    if repair_kind == "point":
-        representative_uv = np.mean(original_uvs, axis=0)
-        color = _sample_repeat_bilinear_rgba(source_rgba, representative_uv)
-        scratch[rows, columns] = color
-    else:
-        weights = _triangle_barycentric_weights(
-            np.column_stack((columns, rows)),
-            chart_points,
-        )
-        sampled_uvs = weights @ np.asarray(original_uvs, dtype=np.float64)
-        scratch[rows, columns] = _sample_repeat_bilinear_rgba(
-            source_rgba,
-            sampled_uvs,
-        )
+    scratch = _sample_repaired_uv_face_scratch(
+        original_uvs,
+        source_rgba,
+        chart_points,
+        mask,
+        map_type=MATERIAL_TEXTURE_BASE_COLOR,
+    )
     return (
         _PixelRectangle(0, 0, width, height),
         mask,
         scratch,
         chart_points,
     )
+
+
+def _sample_repaired_uv_face_scratch(
+    original_uvs: np.ndarray,
+    source_rgba: np.ndarray,
+    chart_points: np.ndarray,
+    mask: np.ndarray,
+    *,
+    map_type: str,
+) -> np.ndarray:
+    """Sample one repaired chart from the corresponding material map."""
+
+    scratch = np.empty((*mask.shape, 4), dtype=np.uint8)
+    scratch[:] = _material_empty_color(map_type)
+    rows, columns = np.nonzero(mask)
+    weights = _triangle_barycentric_weights(
+        np.column_stack((columns, rows)),
+        chart_points,
+    )
+    sampled_uvs = weights @ np.asarray(original_uvs, dtype=np.float64)
+    scratch[rows, columns] = _sample_repeat_bilinear_rgba(
+        source_rgba,
+        sampled_uvs,
+    )
+    return scratch
 
 
 def _uvs_to_source_pixels(uvs: np.ndarray) -> np.ndarray:
@@ -2977,32 +3035,107 @@ def _repack_retained_texture(
     scene: trimesh.Scene,
     source_rgba: np.ndarray,
 ) -> np.ndarray:
-    _validate_canonical_texture(source_rgba)
-    islands = _prepare_uv_islands(scene, source_rgba)
+    return _repack_retained_texture_maps(
+        scene,
+        {MATERIAL_TEXTURE_BASE_COLOR: source_rgba},
+    )[MATERIAL_TEXTURE_BASE_COLOR]
+
+
+def _repack_retained_texture_maps(
+    scene: trimesh.Scene,
+    source_maps: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    """Apply one island packing plan to base color and every PBR map."""
+
+    if MATERIAL_TEXTURE_BASE_COLOR not in source_maps:
+        raise ValueError("Symmetric repacking requires a base-color map.")
+    for source_texture in source_maps.values():
+        _validate_canonical_texture(source_texture)
+    islands = _prepare_uv_islands(
+        scene,
+        source_maps[MATERIAL_TEXTURE_BASE_COLOR],
+    )
     groups = _coalesce_overlapping_islands(islands)
     placements = _pack_uv_groups(groups)
-    packed = _opaque_black_texture()
     group_by_id = {group.group_id: group for group in groups}
-    for placement in placements:
-        group = group_by_id[placement.group_id]
-        patch = _build_retained_texture_patch(
-            source_rgba,
-            group,
-            placement,
-        )
-        if placement.rotated_clockwise:
-            patch = np.rot90(patch, k=-1)
-        destination = placement.destination
-        if patch.shape[:2] != (destination.height, destination.width):
-            raise RuntimeError("The UV packer produced an invalid texture patch.")
-        packed[
-            destination.y : destination.bottom,
-            destination.x : destination.right,
-        ] = patch
+    island_by_id = {island.island_id: island for island in islands}
+    packed_maps: dict[str, np.ndarray] = {}
+    for map_type, source_texture in source_maps.items():
+        packed = _empty_material_texture(map_type)
+        for placement in placements:
+            group = group_by_id[placement.group_id]
+            map_group = _map_specific_uv_pack_group(
+                group,
+                map_type,
+                source_texture,
+                island_by_id,
+            )
+            patch = _build_retained_texture_patch(
+                source_texture,
+                map_group,
+                placement,
+            )
+            if placement.rotated_clockwise:
+                patch = np.rot90(patch, k=-1)
+                if map_type == MATERIAL_TEXTURE_NORMAL:
+                    patch = _rotate_normal_map_clockwise(patch)
+            destination = placement.destination
+            if patch.shape[:2] != (destination.height, destination.width):
+                raise RuntimeError(
+                    "The UV packer produced an invalid texture patch."
+                )
+            packed[
+                destination.y : destination.bottom,
+                destination.x : destination.right,
+            ] = patch
+        packed_maps[map_type] = np.ascontiguousarray(packed)
     _apply_uv_pack_placements(scene, islands, groups, placements)
     clear_scan_projection_layout_metadata(scene)
     _validate_scene_uvs_in_left_half(scene)
-    return np.ascontiguousarray(packed)
+    return packed_maps
+
+
+def _map_specific_uv_pack_group(
+    group: _UvPackGroup,
+    map_type: str,
+    source_texture: np.ndarray,
+    island_by_id: dict[int, _UvIsland],
+) -> _UvPackGroup:
+    if group.source_rgba is None or map_type == MATERIAL_TEXTURE_BASE_COLOR:
+        return group
+    if len(group.island_ids) != 1:
+        raise RuntimeError("A repaired UV chart must own its pack group.")
+    island = island_by_id[group.island_ids[0]]
+    if (
+        island.repair_source_uvs is None
+        or island.source_pixel_coordinates is None
+    ):
+        raise RuntimeError("A repaired UV chart lost its source mapping.")
+    repaired = _sample_repaired_uv_face_scratch(
+        island.repair_source_uvs,
+        source_texture,
+        island.source_pixel_coordinates,
+        group.source_mask,
+        map_type=map_type,
+    )
+    return replace(group, source_rgba=repaired)
+
+
+def _rotate_normal_map_clockwise(source_rgba: np.ndarray) -> np.ndarray:
+    """Rotate tangent X/Y channels with one clockwise UV island rotation."""
+
+    rotated = np.ascontiguousarray(source_rgba).copy()
+    source_x = np.asarray(rotated[:, :, 0], dtype=np.int16) - 128
+    source_y = np.asarray(rotated[:, :, 1], dtype=np.int16) - 128
+    rotated[:, :, 0] = np.asarray(
+        np.clip(128 + source_y, 0, 255),
+        dtype=np.uint8,
+    )
+    rotated[:, :, 1] = np.asarray(
+        np.clip(128 - source_x, 0, 255),
+        dtype=np.uint8,
+    )
+    return rotated
 
 
 def _group_touches_repeat_boundary(group: _UvPackGroup) -> bool:
@@ -3956,6 +4089,8 @@ def _build_texture_gutter_mask(
 def _mask_existing_left_texture(
     scene: trimesh.Scene,
     source_rgba: np.ndarray,
+    *,
+    map_type: str = MATERIAL_TEXTURE_BASE_COLOR,
 ) -> np.ndarray:
     _validate_canonical_texture(source_rgba)
     _validate_scene_uvs_in_left_half(scene)
@@ -3985,7 +4120,7 @@ def _mask_existing_left_texture(
         ] |= source_mask[:, :copied_width]
     if not found_faces or not np.any(core_mask):
         raise ValueError("The retained GLB has no textured UV triangle area.")
-    packed = _opaque_black_texture()
+    packed = _empty_material_texture(map_type)
     left_texture = packed[:, :half_width]
     source_left = source_rgba[:, :half_width]
     left_texture[core_mask] = source_left[core_mask]
@@ -3993,9 +4128,27 @@ def _mask_existing_left_texture(
     return np.ascontiguousarray(packed)
 
 
+def _mask_existing_left_texture_maps(
+    scene: trimesh.Scene,
+    source_maps: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    """Mask every shared map with the exact retained left-packed UV area."""
+
+    return {
+        map_type: _mask_existing_left_texture(
+            scene,
+            texture,
+            map_type=map_type,
+        )
+        for map_type, texture in source_maps.items()
+    }
+
+
 def _mask_existing_square_pair_texture(
     scene: trimesh.Scene,
     source_rgba: np.ndarray,
+    *,
+    map_type: str = MATERIAL_TEXTURE_BASE_COLOR,
 ) -> np.ndarray:
     """Preserve a physical 1024 pair source without an upscale round trip."""
 
@@ -4010,11 +4163,33 @@ def _mask_existing_square_pair_texture(
         )
     _validate_scene_uvs_in_left_half(scene)
     packed = np.asarray(source_rgba, dtype=np.uint8).copy()
-    packed[:, TEXTURE_RESOLUTION_1024 // 2 :] = _OPAQUE_BLACK
+    packed[:, TEXTURE_RESOLUTION_1024 // 2 :] = _material_empty_color(
+        map_type
+    )
     return np.ascontiguousarray(packed)
 
 
+def _mask_existing_square_pair_texture_maps(
+    scene: trimesh.Scene,
+    source_maps: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    """Mask every 1024 map without introducing an upscale round trip."""
+
+    return {
+        map_type: _mask_existing_square_pair_texture(
+            scene,
+            texture,
+            map_type=map_type,
+        )
+        for map_type, texture in source_maps.items()
+    }
+
+
 def _opaque_black_texture() -> np.ndarray:
+    return _empty_material_texture(MATERIAL_TEXTURE_BASE_COLOR)
+
+
+def _empty_material_texture(map_type: str) -> np.ndarray:
     packed = np.empty(
         (
             TEXTURE_RESOLUTION_2048,
@@ -4023,8 +4198,16 @@ def _opaque_black_texture() -> np.ndarray:
         ),
         dtype=np.uint8,
     )
-    packed[:] = _OPAQUE_BLACK
+    packed[:] = _material_empty_color(map_type)
     return packed
+
+
+def _material_empty_color(map_type: str) -> np.ndarray:
+    if map_type == MATERIAL_TEXTURE_NORMAL:
+        return np.asarray((128, 128, 255, 255), dtype=np.uint8)
+    if map_type == MATERIAL_TEXTURE_METALLIC_ROUGHNESS:
+        return np.asarray((0, 255, 0, 255), dtype=np.uint8)
+    return _OPAQUE_BLACK
 
 
 def _validate_canonical_texture(source_rgba: np.ndarray) -> None:
@@ -4061,6 +4244,20 @@ def _validate_shared_square_pair_texture(
             "a preserved 1024 x 1024 pair texture."
         )
     return source_texture
+
+
+def _validate_shared_square_pair_texture_maps(
+    source_maps: dict[str, list[np.ndarray]],
+) -> dict[str, np.ndarray]:
+    """Validate same-sized 1024 or 2048 maps for square-pair operations."""
+
+    validated = _validate_shared_texture_maps(source_maps)
+    base = _validate_shared_square_pair_texture(
+        source_maps[MATERIAL_TEXTURE_BASE_COLOR]
+    )
+    if validated[MATERIAL_TEXTURE_BASE_COLOR].shape != base.shape:
+        raise ValueError("The symmetric base-color map layout changed.")
+    return validated
 
 
 # ### UV transform application ###
@@ -4316,11 +4513,11 @@ def _scene_uvs_are_left_packed(scene: trimesh.Scene) -> bool:
 # ### Texture variant export ###
 def _build_square_pair_texture_variants(
     scene: trimesh.Scene,
-    packed_source_texture: np.ndarray,
-    material_texture_count: int,
+    packed_source_maps: dict[str, np.ndarray],
 ) -> SymmetricSquarePairTextureVariants:
     """Export left-half content in physical 512 and 1024 square textures."""
 
+    packed_source_texture = packed_source_maps[MATERIAL_TEXTURE_BASE_COLOR]
     source_resolution = int(packed_source_texture.shape[0])
     if packed_source_texture.shape not in {
         (TEXTURE_RESOLUTION_1024, TEXTURE_RESOLUTION_1024, 4),
@@ -4329,16 +4526,19 @@ def _build_square_pair_texture_variants(
         raise ValueError(
             "A square-pair source texture must be 1024 or 2048 square RGBA."
         )
-    texture_by_resolution = {
-        resolution: (
-            packed_source_texture.copy()
-            if resolution == source_resolution
-            else _resize_rgba(
-                packed_source_texture,
-                resolution,
-                cv2.INTER_AREA,
+    maps_by_resolution = {
+        resolution: {
+            map_type: (
+                source_texture.copy()
+                if resolution == source_resolution
+                else _resize_rgba(
+                    source_texture,
+                    resolution,
+                    cv2.INTER_AREA,
+                )
             )
-        )
+            for map_type, source_texture in packed_source_maps.items()
+        }
         for resolution in SYMMETRIC_SQUARE_PAIR_CONTENT_RESOLUTIONS
     }
     glb_by_resolution: dict[int, bytes] = {}
@@ -4346,11 +4546,15 @@ def _build_square_pair_texture_variants(
         variant_scene = _clone_scene_with_vertex_normals(scene)
         remap_scan_projection_scene_uvs(
             variant_scene,
-            int(texture_by_resolution[resolution].shape[0]),
+            int(
+                maps_by_resolution[resolution][
+                    MATERIAL_TEXTURE_BASE_COLOR
+                ].shape[0]
+            ),
         )
-        _replace_material_textures(
+        _replace_material_texture_maps_with_shared(
             variant_scene,
-            [texture_by_resolution[resolution]] * material_texture_count,
+            maps_by_resolution[resolution],
         )
         try:
             glb_by_resolution[resolution] = bytes(
@@ -4361,46 +4565,49 @@ def _build_square_pair_texture_variants(
                 "The automatic-symmetry square-pair GLB could not be "
                 "exported."
             ) from error
-    return SymmetricSquarePairTextureVariants(
-        glb_by_resolution=glb_by_resolution,
-        texture_png_by_resolution={
-            resolution: _encode_rgba_png(texture)
-            for resolution, texture in texture_by_resolution.items()
-        },
-        preview_rgba_by_resolution={
-            resolution: texture.copy()
-            for resolution, texture in texture_by_resolution.items()
-        },
+    return _build_symmetric_variant_result(
+        SymmetricSquarePairTextureVariants,
+        glb_by_resolution,
+        maps_by_resolution,
     )
 
 
 def _build_pair_texture_variants(
     scene: trimesh.Scene,
-    packed_texture_2048: np.ndarray,
-    material_texture_count: int,
+    packed_maps_2048: dict[str, np.ndarray],
 ) -> SymmetricPairTextureVariants:
     """Export full-height left-half content at logical 512 and 1024."""
 
-    _validate_canonical_texture(packed_texture_2048)
-    texture_by_resolution = {
-        TEXTURE_RESOLUTION_512: _resize_rgba(
-            packed_texture_2048,
-            TEXTURE_RESOLUTION_1024,
-            cv2.INTER_AREA,
-        ),
-        TEXTURE_RESOLUTION_1024: packed_texture_2048.copy(),
+    for texture in packed_maps_2048.values():
+        _validate_canonical_texture(texture)
+    maps_by_resolution = {
+        TEXTURE_RESOLUTION_512: {
+            map_type: _resize_rgba(
+                texture,
+                TEXTURE_RESOLUTION_1024,
+                cv2.INTER_AREA,
+            )
+            for map_type, texture in packed_maps_2048.items()
+        },
+        TEXTURE_RESOLUTION_1024: {
+            map_type: texture.copy()
+            for map_type, texture in packed_maps_2048.items()
+        },
     }
     glb_by_resolution: dict[int, bytes] = {}
     for content_resolution in SYMMETRIC_PAIR_CONTENT_RESOLUTIONS:
         variant_scene = _clone_scene_with_vertex_normals(scene)
         remap_scan_projection_scene_uvs(
             variant_scene,
-            int(texture_by_resolution[content_resolution].shape[0]),
+            int(
+                maps_by_resolution[content_resolution][
+                    MATERIAL_TEXTURE_BASE_COLOR
+                ].shape[0]
+            ),
         )
-        _replace_material_textures(
+        _replace_material_texture_maps_with_shared(
             variant_scene,
-            [texture_by_resolution[content_resolution]]
-            * material_texture_count,
+            maps_by_resolution[content_resolution],
         )
         try:
             glb_by_resolution[content_resolution] = bytes(
@@ -4410,76 +4617,87 @@ def _build_pair_texture_variants(
             raise ValueError(
                 "The automatic-symmetry pair GLB could not be exported."
             ) from error
-    return SymmetricPairTextureVariants(
-        glb_by_resolution=glb_by_resolution,
-        texture_png_by_resolution={
-            resolution: _encode_rgba_png(texture)
-            for resolution, texture in texture_by_resolution.items()
-        },
-        preview_rgba_by_resolution={
-            resolution: texture.copy()
-            for resolution, texture in texture_by_resolution.items()
-        },
+    return _build_symmetric_variant_result(
+        SymmetricPairTextureVariants,
+        glb_by_resolution,
+        maps_by_resolution,
     )
 
 
 def _build_quarter_texture_variants(
     scene: trimesh.Scene,
-    source_texture_2048: np.ndarray,
-    material_texture_count: int,
+    source_maps_2048: dict[str, np.ndarray],
     *,
     source_is_already_quarter: bool,
 ) -> SymmetricQuarterTextureVariants:
     """Export logical 512/1024 content in double-sized square atlases."""
 
-    _validate_canonical_texture(source_texture_2048)
-    if source_is_already_quarter:
-        content_1024 = source_texture_2048[
-            :TEXTURE_RESOLUTION_1024,
-            :TEXTURE_RESOLUTION_1024,
-        ].copy()
-    else:
-        inner_resolution = (
-            TEXTURE_RESOLUTION_1024
-            - 2 * _QUARTER_CONTENT_GUTTER_PIXELS_1024
-        )
-        inner_content = _resize_rgba(
-            source_texture_2048,
-            inner_resolution,
+    for texture in source_maps_2048.values():
+        _validate_canonical_texture(texture)
+    content_maps_1024: dict[str, np.ndarray] = {}
+    for map_type, source_texture_2048 in source_maps_2048.items():
+        if source_is_already_quarter:
+            content_1024 = source_texture_2048[
+                :TEXTURE_RESOLUTION_1024,
+                :TEXTURE_RESOLUTION_1024,
+            ].copy()
+        else:
+            inner_resolution = (
+                TEXTURE_RESOLUTION_1024
+                - 2 * _QUARTER_CONTENT_GUTTER_PIXELS_1024
+            )
+            inner_content = _resize_rgba(
+                source_texture_2048,
+                inner_resolution,
+                cv2.INTER_AREA,
+            )
+            gutter = _QUARTER_CONTENT_GUTTER_PIXELS_1024
+            content_1024 = np.pad(
+                inner_content,
+                ((gutter, gutter), (gutter, gutter), (0, 0)),
+                mode="wrap",
+            )
+        content_maps_1024[map_type] = content_1024
+    content_maps_512 = {
+        map_type: _resize_rgba(
+            texture,
+            TEXTURE_RESOLUTION_512,
             cv2.INTER_AREA,
         )
-        gutter = _QUARTER_CONTENT_GUTTER_PIXELS_1024
-        content_1024 = np.pad(
-            inner_content,
-            ((gutter, gutter), (gutter, gutter), (0, 0)),
-            mode="wrap",
-        )
-    content_512 = _resize_rgba(
-        content_1024,
-        TEXTURE_RESOLUTION_512,
-        cv2.INTER_AREA,
-    )
-    texture_by_resolution = {
-        TEXTURE_RESOLUTION_512: _place_content_in_top_left_quarter(
-            content_512,
-            TEXTURE_RESOLUTION_1024,
-        ),
-        TEXTURE_RESOLUTION_1024: _place_content_in_top_left_quarter(
-            content_1024,
-            TEXTURE_RESOLUTION_2048,
-        ),
+        for map_type, texture in content_maps_1024.items()
+    }
+    maps_by_resolution = {
+        TEXTURE_RESOLUTION_512: {
+            map_type: _place_content_in_top_left_quarter(
+                texture,
+                TEXTURE_RESOLUTION_1024,
+                map_type=map_type,
+            )
+            for map_type, texture in content_maps_512.items()
+        },
+        TEXTURE_RESOLUTION_1024: {
+            map_type: _place_content_in_top_left_quarter(
+                texture,
+                TEXTURE_RESOLUTION_2048,
+                map_type=map_type,
+            )
+            for map_type, texture in content_maps_1024.items()
+        },
     }
     glb_by_resolution: dict[int, bytes] = {}
     for content_resolution in SYMMETRIC_QUARTER_CONTENT_RESOLUTIONS:
         variant_scene = _clone_scene_with_vertex_normals(scene)
         remap_scan_projection_scene_uvs(
             variant_scene,
-            int(texture_by_resolution[content_resolution].shape[0]),
+            int(
+                maps_by_resolution[content_resolution][
+                    MATERIAL_TEXTURE_BASE_COLOR
+                ].shape[0]
+            ),
         )
-        _replace_material_textures(
+        _replace_material_texture_maps_with_shared(
             variant_scene,
-            [texture_by_resolution[content_resolution]]
-            * material_texture_count,
+            maps_by_resolution[content_resolution],
         )
         try:
             glb_by_resolution[content_resolution] = bytes(
@@ -4489,22 +4707,18 @@ def _build_quarter_texture_variants(
             raise ValueError(
                 "The automatic-symmetry GLB could not be exported."
             ) from error
-    return SymmetricQuarterTextureVariants(
-        glb_by_resolution=glb_by_resolution,
-        texture_png_by_resolution={
-            resolution: _encode_rgba_png(texture)
-            for resolution, texture in texture_by_resolution.items()
-        },
-        preview_rgba_by_resolution={
-            resolution: texture.copy()
-            for resolution, texture in texture_by_resolution.items()
-        },
+    return _build_symmetric_variant_result(
+        SymmetricQuarterTextureVariants,
+        glb_by_resolution,
+        maps_by_resolution,
     )
 
 
 def _place_content_in_top_left_quarter(
     content_rgba: np.ndarray,
     atlas_resolution: int,
+    *,
+    map_type: str = MATERIAL_TEXTURE_BASE_COLOR,
 ) -> np.ndarray:
     content_resolution = atlas_resolution // 2
     if np.asarray(content_rgba).shape != (
@@ -4517,41 +4731,42 @@ def _place_content_in_top_left_quarter(
         (atlas_resolution, atlas_resolution, 4),
         dtype=np.uint8,
     )
-    atlas[:] = _OPAQUE_BLACK
+    atlas[:] = _material_empty_color(map_type)
     atlas[:content_resolution, :content_resolution] = content_rgba
     return atlas
 
 
 def _build_half_texture_variants(
     scene: trimesh.Scene,
-    packed_texture_2048: np.ndarray,
-    material_texture_count: int,
+    packed_maps_2048: dict[str, np.ndarray],
 ) -> ObjectTextureVariants:
     """Export direct texture reductions while retaining authored normals."""
 
-    texture_by_resolution = {
-        TEXTURE_RESOLUTION_512: _resize_rgba(
-            packed_texture_2048,
-            TEXTURE_RESOLUTION_512,
-            cv2.INTER_AREA,
-        ),
-        TEXTURE_RESOLUTION_1024: _resize_rgba(
-            packed_texture_2048,
-            TEXTURE_RESOLUTION_1024,
-            cv2.INTER_AREA,
-        ),
-        TEXTURE_RESOLUTION_2048: packed_texture_2048.copy(),
+    maps_by_resolution = {
+        resolution: {
+            map_type: (
+                texture.copy()
+                if resolution == TEXTURE_RESOLUTION_2048
+                else _resize_rgba(texture, resolution, cv2.INTER_AREA)
+            )
+            for map_type, texture in packed_maps_2048.items()
+        }
+        for resolution in TEXTURE_RESOLUTIONS
     }
     glb_by_resolution: dict[int, bytes] = {}
     for resolution in TEXTURE_RESOLUTIONS:
         variant_scene = _clone_scene_with_vertex_normals(scene)
         remap_scan_projection_scene_uvs(
             variant_scene,
-            int(texture_by_resolution[resolution].shape[0]),
+            int(
+                maps_by_resolution[resolution][
+                    MATERIAL_TEXTURE_BASE_COLOR
+                ].shape[0]
+            ),
         )
-        _replace_material_textures(
+        _replace_material_texture_maps_with_shared(
             variant_scene,
-            [texture_by_resolution[resolution]] * material_texture_count,
+            maps_by_resolution[resolution],
         )
         try:
             glb_by_resolution[resolution] = bytes(
@@ -4561,15 +4776,63 @@ def _build_half_texture_variants(
             raise ValueError(
                 "The symmetric-division GLB could not be exported."
             ) from error
-    return ObjectTextureVariants(
+    return _build_symmetric_variant_result(
+        ObjectTextureVariants,
+        glb_by_resolution,
+        maps_by_resolution,
+    )
+
+
+def _build_symmetric_variant_result(
+    variant_type: type,
+    glb_by_resolution: dict[int, bytes],
+    material_maps_by_resolution: dict[int, dict[str, np.ndarray]],
+) -> object:
+    """Build base-color compatibility fields plus separate Atlas PBR maps."""
+
+    atlas_maps_by_resolution = {
+        resolution: _split_atlas_texture_maps(material_maps)
+        for resolution, material_maps in material_maps_by_resolution.items()
+    }
+    base_by_resolution = {
+        resolution: atlas_maps[ATLAS_MAP_BASE_COLOR]
+        for resolution, atlas_maps in atlas_maps_by_resolution.items()
+    }
+    map_types = tuple(
+        map_type
+        for map_type in ATLAS_MAP_TYPES
+        if all(
+            map_type in atlas_maps
+            for atlas_maps in atlas_maps_by_resolution.values()
+        )
+    )
+    return variant_type(
         glb_by_resolution=glb_by_resolution,
         texture_png_by_resolution={
             resolution: _encode_rgba_png(texture)
-            for resolution, texture in texture_by_resolution.items()
+            for resolution, texture in base_by_resolution.items()
         },
         preview_rgba_by_resolution={
             resolution: texture.copy()
-            for resolution, texture in texture_by_resolution.items()
+            for resolution, texture in base_by_resolution.items()
+        },
+        map_png_by_resolution={
+            map_type: {
+                resolution: _encode_rgba_png(
+                    atlas_maps_by_resolution[resolution][map_type]
+                )
+                for resolution in material_maps_by_resolution
+            }
+            for map_type in map_types
+        },
+        map_preview_rgba_by_resolution={
+            map_type: {
+                resolution: atlas_maps_by_resolution[resolution][
+                    map_type
+                ].copy()
+                for resolution in material_maps_by_resolution
+            }
+            for map_type in map_types
         },
     )
 

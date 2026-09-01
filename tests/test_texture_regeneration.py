@@ -299,11 +299,17 @@ def _scan_projection_result(
 
 def _record_variant_paths(record: GeneratedObjectRecord) -> set[str]:
     raw_variants = record.pipeline["texture_variants"]
-    return {
-        str(path)
-        for variant in raw_variants.values()
-        for path in variant.values()
-    }
+    paths: set[str] = set()
+    for variant in raw_variants.values():
+        paths.update(
+            str(variant[path_key])
+            for path_key in ("glb_asset_path", "texture_asset_path")
+        )
+        paths.update(
+            str(path)
+            for path in variant.get("map_texture_asset_paths", {}).values()
+        )
+    return paths
 
 
 def _asset_bytes(
@@ -1456,6 +1462,29 @@ class MeshyTextureRegeneratorTests(unittest.TestCase):
         outcome = succeeded.at(0)[0]
         self.assertEqual(outcome.result.glb_bytes, provider_glb)
         self.assertIsNone(outcome.scan_projection_stats)
+
+    def test_existing_glass_forces_scan_when_weighted_projection_is_disabled(
+        self,
+    ) -> None:
+        source_glb = _uv_glb(texture_resolution=2048)
+        source_fingerprint = build_uv_fingerprint(source_glb)
+        request = TextureRegenerationRequest(
+            object_id="glass-chair",
+            reference_frame_index=0,
+            reference_image_bgra=np.zeros((2, 2, 4), dtype=np.uint8),
+            model_glb=source_glb,
+            settings=GenerationServiceSettings(
+                use_uv_raycast_for_object_generation=False,
+            ),
+            enable_original_uv=True,
+            submitted_uv_fingerprint=source_fingerprint,
+            preserve_existing_glass=True,
+        )
+
+        self.assertEqual(
+            _texture_regeneration_scan_target(request, None),
+            SCAN_PROJECTION_TARGET_FULL,
+        )
 
     def test_worker_preserves_locally_unwrapped_geometry_when_meshy_remeshes(
         self,

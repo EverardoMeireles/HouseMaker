@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from io import BytesIO
 
@@ -27,6 +27,44 @@ TEXTURE_RESOLUTIONS = (
     TEXTURE_RESOLUTION_2048,
 )
 DEFAULT_TEXTURE_RESOLUTION = TEXTURE_RESOLUTION_1024
+MATERIAL_TEXTURE_BASE_COLOR = "base_color"
+MATERIAL_TEXTURE_NORMAL = "normal"
+MATERIAL_TEXTURE_METALLIC_ROUGHNESS = "metallic_roughness"
+MATERIAL_TEXTURE_TYPES = (
+    MATERIAL_TEXTURE_BASE_COLOR,
+    MATERIAL_TEXTURE_NORMAL,
+    MATERIAL_TEXTURE_METALLIC_ROUGHNESS,
+)
+PBR_MAP_NORMAL = "normal"
+PBR_MAP_ROUGHNESS = "roughness"
+PBR_MAP_METALLIC = "metallic"
+PBR_MAP_TYPES = (
+    PBR_MAP_NORMAL,
+    PBR_MAP_ROUGHNESS,
+    PBR_MAP_METALLIC,
+)
+ATLAS_MAP_BASE_COLOR = MATERIAL_TEXTURE_BASE_COLOR
+ATLAS_MAP_TYPES = (ATLAS_MAP_BASE_COLOR, *PBR_MAP_TYPES)
+ATLAS_MAP_LABELS = {
+    ATLAS_MAP_BASE_COLOR: "Base color",
+    PBR_MAP_NORMAL: "Normal",
+    PBR_MAP_ROUGHNESS: "Roughness",
+    PBR_MAP_METALLIC: "Metallic",
+}
+HOUSEMAKER_GLASS_MATERIAL_NAME = "HouseMaker Glass"
+_MATERIAL_ATTRIBUTE_BY_TEXTURE_TYPE = {
+    MATERIAL_TEXTURE_BASE_COLOR: "baseColorTexture",
+    MATERIAL_TEXTURE_NORMAL: "normalTexture",
+    MATERIAL_TEXTURE_METALLIC_ROUGHNESS: "metallicRoughnessTexture",
+}
+_UNSUPPORTED_UV_TEXTURE_ATTRIBUTES = (
+    "emissiveTexture",
+    "occlusionTexture",
+    "specularGlossinessTexture",
+)
+_OPAQUE_BLACK = np.asarray((0, 0, 0, 255), dtype=np.uint8)
+_NEUTRAL_NORMAL = np.asarray((128, 128, 255, 255), dtype=np.uint8)
+_NEUTRAL_METALLIC_ROUGHNESS = np.asarray((0, 255, 0, 255), dtype=np.uint8)
 
 
 # ### Data models ###
@@ -41,6 +79,10 @@ class ObjectTextureVariants:
     glb_by_resolution: dict[int, bytes]
     texture_png_by_resolution: dict[int, bytes]
     preview_rgba_by_resolution: dict[int, np.ndarray]
+    map_png_by_resolution: dict[str, dict[int, bytes]] | None = None
+    map_preview_rgba_by_resolution: (
+        dict[str, dict[int, np.ndarray]] | None
+    ) = None
 
     def __post_init__(self) -> None:
         if set(self.glb_by_resolution) != set(TEXTURE_RESOLUTIONS):
@@ -53,6 +95,46 @@ class ObjectTextureVariants:
             raise ValueError(
                 "Object texture variants require 512, 1024 and 2048 PNGs."
             )
+        map_pngs = dict(self.map_png_by_resolution or {})
+        map_previews = dict(self.map_preview_rgba_by_resolution or {})
+        map_pngs.setdefault(
+            ATLAS_MAP_BASE_COLOR,
+            dict(self.texture_png_by_resolution),
+        )
+        map_previews.setdefault(
+            ATLAS_MAP_BASE_COLOR,
+            dict(self.preview_rgba_by_resolution),
+        )
+        if set(map_pngs) != set(map_previews):
+            raise ValueError("Texture map PNGs and previews must match.")
+        if any(map_type not in ATLAS_MAP_TYPES for map_type in map_pngs):
+            raise ValueError("Object texture variants contain an unknown map.")
+        for map_type in map_pngs:
+            if set(map_pngs[map_type]) != set(TEXTURE_RESOLUTIONS):
+                raise ValueError(
+                    f"The {map_type} map requires every texture resolution."
+                )
+            if set(map_previews[map_type]) != set(TEXTURE_RESOLUTIONS):
+                raise ValueError(
+                    f"The {map_type} preview requires every resolution."
+                )
+        object.__setattr__(self, "map_png_by_resolution", map_pngs)
+        object.__setattr__(
+            self,
+            "map_preview_rgba_by_resolution",
+            map_previews,
+        )
+
+    @property
+    def available_map_types(self) -> tuple[str, ...]:
+        """Return Atlas-visible maps in canonical UI order."""
+
+        assert self.map_png_by_resolution is not None
+        return tuple(
+            map_type
+            for map_type in ATLAS_MAP_TYPES
+            if map_type in self.map_png_by_resolution
+        )
 
 
 # ### Public variant generation ###
@@ -73,14 +155,14 @@ def build_object_texture_variants(
     if not payload:
         raise ValueError("The generated GLB is empty.")
     scene = _load_glb_scene(payload)
-    source_textures = _collect_material_textures(scene)
+    source_maps = _collect_material_texture_maps(scene)
+    source_textures = source_maps.get(MATERIAL_TEXTURE_BASE_COLOR, [])
     if not source_textures:
         return None
-    texture_2048 = _validate_shared_2048_texture(source_textures).copy()
+    texture_maps_2048 = _validate_shared_2048_texture_maps(source_maps)
     return _build_variants_from_scene(
         scene,
-        texture_2048,
-        len(source_textures),
+        texture_maps_2048,
     )
 
 
@@ -98,7 +180,8 @@ def build_object_texture_variants_from_texture(
     if not payload:
         raise ValueError("The generated GLB is empty.")
     scene = _load_glb_scene(payload)
-    source_textures = _collect_material_textures(scene)
+    source_maps = _collect_material_texture_maps(scene)
+    source_textures = source_maps.get(MATERIAL_TEXTURE_BASE_COLOR, [])
     if not source_textures:
         raise ValueError("The generated GLB has no embedded base-color texture.")
     _validate_shared_2048_texture(source_textures)
@@ -106,23 +189,21 @@ def build_object_texture_variants_from_texture(
     expected_shape = (TEXTURE_RESOLUTION_2048, TEXTURE_RESOLUTION_2048)
     if replacement_texture.shape[:2] != expected_shape:
         raise ValueError("The replacement texture must be 2048 x 2048.")
-    return _build_variants_from_scene(
-        scene,
-        replacement_texture,
-        len(source_textures),
-    )
+    canonical_maps = _validate_shared_2048_texture_maps(source_maps)
+    canonical_maps[MATERIAL_TEXTURE_BASE_COLOR] = replacement_texture
+    return _build_variants_from_scene(scene, canonical_maps)
 
 
 def replace_object_base_color_texture_from_glb(
     model_glb: bytes,
     texture_source_glb: bytes,
 ) -> bytes:
-    """Apply a provider atlas without accepting its replacement geometry.
+    """Apply provider texture maps without accepting replacement geometry.
 
     Texture-only operations keep the submitted model's scene, geometry and
-    UVs authoritative. Only the shared 2048 base-color atlas is copied from
-    the provider result. An untextured UV model receives a new material;
-    an already textured model keeps its existing material structure.
+    UVs authoritative. The shared 2048 base-color and supported PBR atlases
+    are copied from the provider result. An untextured UV model receives a
+    new material; a textured model keeps its existing material structure.
     """
 
     model_payload = bytes(model_glb)
@@ -136,17 +217,23 @@ def replace_object_base_color_texture_from_glb(
     model_textures = _collect_material_textures(model_scene)
 
     texture_scene = _load_glb_scene(texture_payload)
-    generated_textures = _collect_material_textures(texture_scene)
+    generated_maps = _collect_material_texture_maps(texture_scene)
+    generated_textures = generated_maps.get(MATERIAL_TEXTURE_BASE_COLOR, [])
     if not generated_textures:
         raise ValueError(
             "Meshy returned no embedded base-color texture."
         )
-    generated_texture = _validate_shared_2048_texture(
-        generated_textures
-    ).copy()
+    generated_texture_maps = _validate_shared_2048_texture_maps(
+        generated_maps
+    )
     if model_textures:
-        _validate_shared_texture(model_textures)
-    _attach_texture_to_uv_meshes(model_scene, generated_texture)
+        existing_base_color = _validate_shared_texture(model_textures)
+        generated_texture_maps = _preserve_housemaker_glass_alpha(
+            model_scene,
+            generated_texture_maps,
+            existing_base_color,
+        )
+    _attach_texture_maps_to_uv_meshes(model_scene, generated_texture_maps)
     try:
         return bytes(model_scene.export(file_type="glb"))
     except Exception as error:
@@ -156,50 +243,170 @@ def replace_object_base_color_texture_from_glb(
         ) from error
 
 
+def _preserve_housemaker_glass_alpha(
+    scene: trimesh.Scene,
+    texture_maps: Mapping[str, np.ndarray],
+    existing_base_color: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Retain the local glass mask while accepting provider-authored color."""
+
+    uses_glass_atlas = any(
+        str(getattr(leaf, "name", "")).strip()
+        == HOUSEMAKER_GLASS_MATERIAL_NAME
+        for geometry in scene.geometry.values()
+        for leaf in _iter_material_leaves(
+            getattr(getattr(geometry, "visual", None), "material", None)
+        )
+    )
+    output = {
+        map_type: np.asarray(texture, dtype=np.uint8).copy()
+        for map_type, texture in texture_maps.items()
+    }
+    if not uses_glass_atlas:
+        return output
+    generated_base_color = output[MATERIAL_TEXTURE_BASE_COLOR]
+    existing_alpha = np.asarray(existing_base_color[:, :, 3], dtype=np.uint8)
+    if generated_base_color.shape[:2] != existing_alpha.shape:
+        existing_alpha = cv2.resize(
+            existing_alpha,
+            (
+                generated_base_color.shape[1],
+                generated_base_color.shape[0],
+            ),
+            interpolation=cv2.INTER_NEAREST,
+        )
+    generated_base_color[:, :, 3] = existing_alpha
+    return output
+
+
 def _build_variants_from_scene(
     scene: trimesh.Scene,
-    texture_2048: np.ndarray,
-    material_texture_count: int,
+    texture_maps_2048: Mapping[str, np.ndarray],
 ) -> ObjectTextureVariants:
     """Build exact-resolution images and matching resolution-safe GLBs."""
 
-    texture_1024 = _resize_rgba(
-        texture_2048,
-        TEXTURE_RESOLUTION_1024,
-        cv2.INTER_AREA,
-    )
-    texture_512 = _resize_rgba(
-        texture_2048,
-        TEXTURE_RESOLUTION_512,
-        cv2.INTER_AREA,
-    )
-    textures_by_resolution = {
-        TEXTURE_RESOLUTION_512: [texture_512] * material_texture_count,
-        TEXTURE_RESOLUTION_1024: [texture_1024] * material_texture_count,
-        TEXTURE_RESOLUTION_2048: [texture_2048] * material_texture_count,
+    normalized_maps = {
+        map_type: _normalize_rgba_array(texture).copy()
+        for map_type, texture in texture_maps_2048.items()
+    }
+    if MATERIAL_TEXTURE_BASE_COLOR not in normalized_maps:
+        raise ValueError("Object texture variants require a base-color map.")
+    maps_by_resolution = {
+        TEXTURE_RESOLUTION_2048: {
+            map_type: texture.copy()
+            for map_type, texture in normalized_maps.items()
+        },
+        TEXTURE_RESOLUTION_1024: {
+            map_type: _resize_rgba(
+                texture,
+                TEXTURE_RESOLUTION_1024,
+                cv2.INTER_AREA,
+            )
+            for map_type, texture in normalized_maps.items()
+        },
+        TEXTURE_RESOLUTION_512: {
+            map_type: _resize_rgba(
+                texture,
+                TEXTURE_RESOLUTION_512,
+                cv2.INTER_AREA,
+            )
+            for map_type, texture in normalized_maps.items()
+        },
     }
 
     glb_by_resolution: dict[int, bytes] = {}
     for resolution in TEXTURE_RESOLUTIONS:
         variant_scene = copy.deepcopy(scene)
         remap_scan_projection_scene_uvs(variant_scene, resolution)
-        _replace_material_textures(
+        _replace_material_texture_maps_with_shared(
             variant_scene,
-            textures_by_resolution[resolution],
+            maps_by_resolution[resolution],
         )
         glb_by_resolution[resolution] = bytes(
             variant_scene.export(file_type="glb")
         )
+    atlas_maps_by_resolution = {
+        resolution: _split_atlas_texture_maps(texture_maps)
+        for resolution, texture_maps in maps_by_resolution.items()
+    }
+    base_by_resolution = {
+        resolution: atlas_maps[ATLAS_MAP_BASE_COLOR]
+        for resolution, atlas_maps in atlas_maps_by_resolution.items()
+    }
+    map_types = tuple(
+        map_type
+        for map_type in ATLAS_MAP_TYPES
+        if any(
+            map_type in atlas_maps
+            for atlas_maps in atlas_maps_by_resolution.values()
+        )
+    )
     return ObjectTextureVariants(
         glb_by_resolution=glb_by_resolution,
         texture_png_by_resolution={
-            resolution: _encode_rgba_png(textures[0])
-            for resolution, textures in textures_by_resolution.items()
+            resolution: _encode_rgba_png(texture)
+            for resolution, texture in base_by_resolution.items()
         },
         preview_rgba_by_resolution={
-            resolution: textures[0].copy()
-            for resolution, textures in textures_by_resolution.items()
+            resolution: texture.copy()
+            for resolution, texture in base_by_resolution.items()
         },
+        map_png_by_resolution={
+            map_type: {
+                resolution: _encode_rgba_png(
+                    atlas_maps_by_resolution[resolution][map_type]
+                )
+                for resolution in TEXTURE_RESOLUTIONS
+            }
+            for map_type in map_types
+        },
+        map_preview_rgba_by_resolution={
+            map_type: {
+                resolution: atlas_maps_by_resolution[resolution][
+                    map_type
+                ].copy()
+                for resolution in TEXTURE_RESOLUTIONS
+            }
+            for map_type in map_types
+        },
+    )
+
+
+def _split_atlas_texture_maps(
+    material_maps: Mapping[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    """Expose glTF's packed material maps as separate Atlas images."""
+
+    base_color = _normalize_rgba_array(
+        material_maps[MATERIAL_TEXTURE_BASE_COLOR]
+    )
+    output = {ATLAS_MAP_BASE_COLOR: base_color.copy()}
+    normal = material_maps.get(MATERIAL_TEXTURE_NORMAL)
+    if normal is not None:
+        output[PBR_MAP_NORMAL] = _normalize_rgba_array(normal).copy()
+    metallic_roughness = material_maps.get(
+        MATERIAL_TEXTURE_METALLIC_ROUGHNESS
+    )
+    if metallic_roughness is not None:
+        packed = _normalize_rgba_array(metallic_roughness)
+        roughness = packed[:, :, 1]
+        metallic = packed[:, :, 2]
+        output[PBR_MAP_ROUGHNESS] = _grayscale_rgba(roughness)
+        output[PBR_MAP_METALLIC] = _grayscale_rgba(metallic)
+    return output
+
+
+def _grayscale_rgba(channel: np.ndarray) -> np.ndarray:
+    normalized = np.asarray(channel, dtype=np.uint8)
+    return np.ascontiguousarray(
+        np.dstack(
+            (
+                normalized,
+                normalized,
+                normalized,
+                np.full(normalized.shape, 255, dtype=np.uint8),
+            )
+        )
     )
 
 
@@ -252,31 +459,109 @@ def _load_glb_scene(payload: bytes) -> trimesh.Scene:
 
 
 def _collect_material_textures(scene: trimesh.Scene) -> list[np.ndarray]:
-    textures: list[np.ndarray] = []
+    """Compatibility accessor for shared base-color material textures."""
+
+    return _collect_material_texture_maps(scene).get(
+        MATERIAL_TEXTURE_BASE_COLOR,
+        [],
+    )
+
+
+def _collect_material_texture_maps(
+    scene: trimesh.Scene,
+) -> dict[str, list[np.ndarray]]:
+    """Collect every supported embedded map in deterministic leaf order."""
+
+    texture_maps: dict[str, list[np.ndarray]] = {
+        map_type: [] for map_type in MATERIAL_TEXTURE_TYPES
+    }
+    textured_leaf_count = 0
+    leaves_with_map: dict[str, int] = {
+        map_type: 0 for map_type in MATERIAL_TEXTURE_TYPES
+    }
     for _geometry_name, geometry in sorted(
         scene.geometry.items(),
         key=lambda item: str(item[0]),
     ):
         material = getattr(getattr(geometry, "visual", None), "material", None)
-        for texture in _iter_material_textures(material):
-            textures.append(_decode_texture_rgba(texture))
-    return textures
+        for leaf in _iter_material_leaves(material):
+            base_texture = _get_material_texture(
+                leaf,
+                MATERIAL_TEXTURE_BASE_COLOR,
+            )
+            if base_texture is None:
+                continue
+            textured_leaf_count += 1
+            for map_type in MATERIAL_TEXTURE_TYPES:
+                texture = _get_material_texture(leaf, map_type)
+                if texture is None:
+                    continue
+                texture_maps[map_type].append(_decode_texture_rgba(texture))
+                leaves_with_map[map_type] += 1
+    for map_type in MATERIAL_TEXTURE_TYPES:
+        if leaves_with_map[map_type] not in {0, textured_leaf_count}:
+            raise ValueError(
+                f"The generated object has an inconsistent {map_type} map "
+                "layout across its textured materials."
+            )
+    return {
+        map_type: textures
+        for map_type, textures in texture_maps.items()
+        if textures
+    }
 
 
-def _iter_material_textures(material: object) -> list[object]:
+def _iter_material_leaves(material: object) -> tuple[object, ...]:
     if material is None:
-        return []
+        return ()
     nested_materials = getattr(material, "materials", None)
     if isinstance(nested_materials, list | tuple):
-        textures: list[object] = []
-        for nested_material in nested_materials:
-            textures.extend(_iter_material_textures(nested_material))
-        return textures
-    for attribute_name in ("baseColorTexture", "image"):
-        texture = getattr(material, attribute_name, None)
-        if texture is not None:
-            return [texture]
-    return []
+        return tuple(
+            leaf
+            for nested_material in nested_materials
+            for leaf in _iter_material_leaves(nested_material)
+        )
+    return (material,)
+
+
+def reject_unsupported_uv_material_textures(
+    scene: trimesh.Scene,
+    *,
+    operation_name: str,
+) -> None:
+    """Reject maps that cannot remain valid after HouseMaker rewrites UVs."""
+
+    normalized_operation_name = str(operation_name).strip()
+    if not normalized_operation_name:
+        raise ValueError("A UV texture operation name is required.")
+    for geometry in scene.geometry.values():
+        material = getattr(getattr(geometry, "visual", None), "material", None)
+        for leaf in _iter_material_leaves(material):
+            if any(
+                getattr(leaf, attribute_name, None) is not None
+                for attribute_name in _UNSUPPORTED_UV_TEXTURE_ATTRIBUTES
+            ):
+                raise ValueError(
+                    f"{normalized_operation_name} does not support emissive, "
+                    "occlusion, or specular-glossiness textures because their "
+                    "pixels cannot follow the rewritten UVs."
+                )
+
+
+def _get_material_texture(
+    material: object,
+    map_type: str,
+) -> object | None:
+    if map_type == MATERIAL_TEXTURE_BASE_COLOR:
+        for attribute_name in ("baseColorTexture", "image"):
+            texture = getattr(material, attribute_name, None)
+            if texture is not None:
+                return texture
+        return None
+    attribute_name = _MATERIAL_ATTRIBUTE_BY_TEXTURE_TYPE.get(map_type)
+    if attribute_name is None:
+        raise ValueError("Unknown material texture map type.")
+    return getattr(material, attribute_name, None)
 
 
 def _replace_material_textures(
@@ -295,6 +580,77 @@ def _replace_material_textures(
     except StopIteration:
         return
     raise ValueError("The GLB material texture layout changed during export.")
+
+
+def _replace_material_texture_maps_with_shared(
+    scene: trimesh.Scene,
+    shared_maps: Mapping[str, np.ndarray],
+) -> None:
+    """Attach one shared UV atlas per map to every textured material leaf."""
+
+    normalized_maps = {
+        map_type: _normalize_rgba_array(texture)
+        for map_type, texture in shared_maps.items()
+    }
+    if MATERIAL_TEXTURE_BASE_COLOR not in normalized_maps:
+        raise ValueError("A shared material map set needs base color.")
+    attached_count = 0
+    for geometry in scene.geometry.values():
+        if not isinstance(geometry, trimesh.Trimesh) or not len(geometry.faces):
+            continue
+        material = getattr(getattr(geometry, "visual", None), "material", None)
+        leaves = _iter_material_leaves(material)
+        if not leaves:
+            continue
+        for leaf in leaves:
+            if _get_material_texture(leaf, MATERIAL_TEXTURE_BASE_COLOR) is None:
+                continue
+            _attach_texture_maps_to_material_leaf(leaf, normalized_maps)
+            attached_count += 1
+    if attached_count == 0:
+        raise ValueError("The GLB has no textured material leaves.")
+
+
+def _validate_shared_2048_texture_maps(
+    source_maps: Mapping[str, list[np.ndarray]],
+) -> dict[str, np.ndarray]:
+    """Validate one shared square atlas for each supported material map."""
+
+    validated = _validate_shared_texture_maps(source_maps)
+    base = validated[MATERIAL_TEXTURE_BASE_COLOR]
+    if base.shape[:2] != (
+        TEXTURE_RESOLUTION_2048,
+        TEXTURE_RESOLUTION_2048,
+    ):
+        raise ValueError(
+            "Meshy returned a base-color texture that is not 2048 x 2048. "
+            "HouseMaker will not upscale or stretch it."
+        )
+    return validated
+
+
+def _validate_shared_texture_maps(
+    source_maps: Mapping[str, list[np.ndarray]],
+) -> dict[str, np.ndarray]:
+    """Validate one shared same-sized atlas for every supported map."""
+
+    base_textures = source_maps.get(MATERIAL_TEXTURE_BASE_COLOR, [])
+    base = _validate_shared_texture(base_textures).copy()
+    validated = {MATERIAL_TEXTURE_BASE_COLOR: base}
+    for map_type in (
+        MATERIAL_TEXTURE_NORMAL,
+        MATERIAL_TEXTURE_METALLIC_ROUGHNESS,
+    ):
+        textures = source_maps.get(map_type, [])
+        if not textures:
+            continue
+        texture = _validate_shared_texture(textures).copy()
+        if texture.shape != base.shape:
+            raise ValueError(
+                f"The {map_type} map must match the base-color atlas."
+            )
+        validated[map_type] = texture
+    return validated
 
 
 def _replace_material_texture_tree(
@@ -325,6 +681,18 @@ def _attach_texture_to_uv_meshes(
 ) -> None:
     """Attach one provider atlas to an untextured authoritative UV scene."""
 
+    _attach_texture_maps_to_uv_meshes(
+        scene,
+        {MATERIAL_TEXTURE_BASE_COLOR: texture_rgba},
+    )
+
+
+def _attach_texture_maps_to_uv_meshes(
+    scene: trimesh.Scene,
+    texture_maps: Mapping[str, np.ndarray],
+) -> None:
+    """Attach provider maps to the authoritative UV scene and materials."""
+
     attached_count = 0
     for geometry in scene.geometry.values():
         if not isinstance(geometry, trimesh.Trimesh) or len(geometry.faces) == 0:
@@ -344,7 +712,7 @@ def _attach_texture_to_uv_meshes(
             if raw_material is None
             else copy.deepcopy(raw_material)
         )
-        _attach_texture_to_material_tree(material, texture_rgba)
+        _attach_texture_maps_to_material_tree(material, texture_maps)
         raw_face_materials = getattr(
             geometry.visual,
             "face_materials",
@@ -396,6 +764,54 @@ def _attach_texture_to_material_tree(
     raise ValueError(
         "The preserved object uses an unsupported material type."
     )
+
+
+def _attach_texture_maps_to_material_tree(
+    material: object,
+    texture_maps: Mapping[str, np.ndarray],
+) -> None:
+    """Set every supported map on each leaf while retaining material factors."""
+
+    nested_materials = getattr(material, "materials", None)
+    if isinstance(nested_materials, list | tuple):
+        if not nested_materials:
+            raise ValueError("The preserved object has an empty material set.")
+        for nested_material in nested_materials:
+            _attach_texture_maps_to_material_tree(nested_material, texture_maps)
+        return
+    _attach_texture_maps_to_material_leaf(material, texture_maps)
+
+
+def _attach_texture_maps_to_material_leaf(
+    material: object,
+    texture_maps: Mapping[str, np.ndarray],
+) -> None:
+    base_color = texture_maps.get(MATERIAL_TEXTURE_BASE_COLOR)
+    if base_color is None:
+        raise ValueError("Provider material maps require base color.")
+    _attach_texture_to_material_tree(material, base_color)
+    for map_type in (
+        MATERIAL_TEXTURE_NORMAL,
+        MATERIAL_TEXTURE_METALLIC_ROUGHNESS,
+    ):
+        attribute_name = _MATERIAL_ATTRIBUTE_BY_TEXTURE_TYPE[map_type]
+        texture = texture_maps.get(map_type)
+        if hasattr(material, attribute_name):
+            setattr(
+                material,
+                attribute_name,
+                None
+                if texture is None
+                else Image.fromarray(
+                    _normalize_rgba_array(texture).copy(),
+                    mode="RGBA",
+                ),
+            )
+    if MATERIAL_TEXTURE_METALLIC_ROUGHNESS in texture_maps:
+        if hasattr(material, "metallicFactor"):
+            setattr(material, "metallicFactor", 1.0)
+        if hasattr(material, "roughnessFactor"):
+            setattr(material, "roughnessFactor", 1.0)
 
 
 # ### Image helpers ###

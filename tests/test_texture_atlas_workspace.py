@@ -30,6 +30,7 @@ from PySide6.QtGui import (
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
+import housemaker.texture_atlas_workspace as texture_atlas_workspace_module
 from housemaker.texture_atlas_state import (
     ATLAS_PACKING_MODE_SYMMETRIC_HALF,
     ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
@@ -44,10 +45,16 @@ from housemaker.texture_atlas_state import (
     TextureAtlasData,
 )
 from housemaker.texture_atlas_workspace import (
+    ATLAS_MAP_BASE_COLOR,
+    ATLAS_MAP_METALLIC,
+    ATLAS_MAP_NORMAL,
+    ATLAS_MAP_ROUGHNESS,
+    ATLAS_MAP_TYPES,
     AtlasObjectTextureSource,
     TextureAtlasWorkspace,
     _build_texture_source_mime_data,
     build_atlas_wall_texture_source_id,
+    build_texture_atlas_map_image_relative_path,
     choose_atlas_texture_resolution,
     get_atlas_wall_texture_assignment_id,
     load_atlas_object_texture_source,
@@ -106,6 +113,35 @@ def _source(
         packing_mode=resolved_packing_mode,
         symmetric_preview_orientation=symmetric_orientation,
         symmetric_preview_plane_coordinate=symmetric_plane_coordinate,
+    )
+
+
+def _mapped_source(
+    object_id: str,
+    *,
+    directory: str | Path,
+    map_colors: dict[str, tuple[int, int, int, int]],
+    resolution: int = 512,
+) -> AtlasObjectTextureSource:
+    """Create one exact source with any requested real PBR map PNGs."""
+
+    root = Path(directory)
+    logical_paths: dict[str, str] = {}
+    physical_paths: dict[str, Path] = {}
+    for map_type, color in map_colors.items():
+        suffix = "" if map_type == ATLAS_MAP_BASE_COLOR else f".{map_type}"
+        physical_path = root / f"{object_id}-{resolution}{suffix}.png"
+        Image.new("RGBA", (resolution, resolution), color).save(physical_path)
+        logical_paths[map_type] = f"textures/{physical_path.name}"
+        physical_paths[map_type] = physical_path
+    return load_atlas_object_texture_source(
+        object_id=object_id,
+        object_name=object_id.title(),
+        texture_path=logical_paths[ATLAS_MAP_BASE_COLOR],
+        texture_resolution=resolution,
+        physical_texture_path=physical_paths[ATLAS_MAP_BASE_COLOR],
+        map_texture_paths=logical_paths,
+        physical_map_texture_paths=physical_paths,
     )
 
 
@@ -263,6 +299,265 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             source.preview_rgba[0, 0, 0] = 0
+
+    def test_map_aware_source_loads_real_maps_and_neutral_fallbacks(self) -> None:
+        source = _mapped_source(
+            "mapped",
+            directory=self._temporary_directory.name,
+            map_colors={
+                ATLAS_MAP_BASE_COLOR: (20, 40, 60, 255),
+                ATLAS_MAP_NORMAL: (80, 100, 220, 255),
+            },
+        )
+
+        self.assertEqual(
+            tuple(source.map_texture_paths or {}),
+            (ATLAS_MAP_BASE_COLOR, ATLAS_MAP_NORMAL),
+        )
+        self.assertEqual(
+            tuple(source.load_texture_rgba(ATLAS_MAP_NORMAL)[0, 0]),
+            (80, 100, 220, 255),
+        )
+        self.assertEqual(
+            tuple(source.load_texture_rgba(ATLAS_MAP_ROUGHNESS)[0, 0]),
+            (255, 255, 255, 255),
+        )
+        self.assertEqual(
+            tuple(source.load_texture_rgba(ATLAS_MAP_METALLIC)[0, 0]),
+            (0, 0, 0, 255),
+        )
+        self.assertEqual(
+            source.get_preview_image(ATLAS_MAP_NORMAL).pixelColor(0, 0).getRgb(),
+            (80, 100, 220, 255),
+        )
+        self.assertEqual(
+            source.get_preview_image(ATLAS_MAP_ROUGHNESS)
+            .pixelColor(0, 0)
+            .getRgb(),
+            (255, 255, 255, 255),
+        )
+        source_paths = source.map_texture_paths
+        assert source_paths is not None
+        with self.assertRaises(TypeError):
+            source_paths[ATLAS_MAP_NORMAL] = "changed.png"  # type: ignore[index]
+
+    def test_pbr_preview_tabs_share_selection_deletion_and_content(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("PBR tabs", 2048, atlas_id="atlas-tabs")
+        first = _mapped_source(
+            "first",
+            directory=self._temporary_directory.name,
+            map_colors={ATLAS_MAP_BASE_COLOR: (30, 60, 90, 255)},
+        )
+        second = _source("second", directory=self._temporary_directory.name)
+        data.assign_object(
+            atlas.atlas_id,
+            first.object_id,
+            first.texture_path,
+            first.texture_resolution,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([first, second])
+
+        self.assertIs(
+            self.workspace.preview,
+            self.workspace.map_previews[ATLAS_MAP_BASE_COLOR],
+        )
+        self.assertEqual(self.workspace.preview_tabs.count(), 4)
+        self.assertEqual(
+            tuple(
+                self.workspace.preview_tabs.tabText(index)
+                for index in range(self.workspace.preview_tabs.count())
+            ),
+            ("Base color", "Normal", "Roughness", "Metallic"),
+        )
+        for map_type, preview in self.workspace.map_previews.items():
+            with self.subTest(map_type=map_type):
+                self.assertEqual(preview.map_type, map_type)
+                self.assertIs(preview._atlas, self.workspace.selected_atlas)
+                self.assertEqual(set(preview._sources), {"first", "second"})
+
+        normal_preview = self.workspace.map_previews[ATLAS_MAP_NORMAL]
+        normal_preview.object_dropped.emit(second.object_id, 512, 0)
+        dropped = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert dropped is not None
+        second_placement = dropped.placement_for_object(second.object_id)
+        assert second_placement is not None
+        self.assertEqual((second_placement.x, second_placement.y), (512, 0))
+
+        normal_preview.object_clicked.emit(
+            second.object_id,
+            Qt.MouseButton.LeftButton,
+        )
+        self.assertEqual(self.workspace.selected_object_id, second.object_id)
+        self.assertTrue(
+            all(
+                preview._selected_object_id == second.object_id
+                for preview in self.workspace.map_previews.values()
+            )
+        )
+
+        normal_preview.object_clicked.emit(
+            first.object_id,
+            Qt.MouseButton.LeftButton,
+        )
+        self.workspace.preview_tabs.setCurrentWidget(normal_preview)
+        normal_preview.setFocus()
+        QTest.keyClick(normal_preview, Qt.Key.Key_Delete)
+
+        updated = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert updated is not None
+        self.assertIsNone(updated.placement_for_object(first.object_id))
+        self.assertTrue(
+            all(
+                preview._atlas is self.workspace.selected_atlas
+                for preview in self.workspace.map_previews.values()
+            )
+        )
+
+    def test_materializes_predictable_pbr_atlases_without_schema_changes(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("PBR", 2048, atlas_id="atlas-pbr")
+        source = _mapped_source(
+            "cabinet",
+            directory=self._temporary_directory.name,
+            map_colors={
+                ATLAS_MAP_BASE_COLOR: (10, 20, 30, 255),
+                ATLAS_MAP_NORMAL: (40, 50, 200, 255),
+                ATLAS_MAP_METALLIC: (80, 80, 80, 255),
+            },
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([source])
+
+        self.workspace.assign_object_button.click()
+
+        materialized = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert materialized is not None
+        self.assertEqual(materialized.image_path, "atlas-pbr.png")
+        expected_colors = {
+            ATLAS_MAP_BASE_COLOR: (10, 20, 30, 255),
+            ATLAS_MAP_NORMAL: (40, 50, 200, 255),
+            ATLAS_MAP_ROUGHNESS: (255, 255, 255, 255),
+            ATLAS_MAP_METALLIC: (80, 80, 80, 255),
+        }
+        for map_type, expected_color in expected_colors.items():
+            relative_path = build_texture_atlas_map_image_relative_path(
+                atlas.atlas_id,
+                map_type,
+            )
+            output_path = Path(self._temporary_directory.name) / relative_path
+            with self.subTest(map_type=map_type), Image.open(output_path) as image:
+                self.assertEqual(image.getpixel((10, 10)), expected_color)
+        self.assertEqual(
+            set(materialized.to_dict()),
+            {"atlas_id", "name", "resolution", "image_path", "placements"},
+        )
+
+    def test_pbr_output_paths_do_not_collide_with_valid_atlas_ids(self) -> None:
+        atlas_ids = (
+            "cabinet",
+            "cabinet.normal",
+            "cabinet.roughness",
+            "cabinet.metallic",
+        )
+
+        output_paths = {
+            build_texture_atlas_map_image_relative_path(atlas_id, map_type)
+            for atlas_id in atlas_ids
+            for map_type in ATLAS_MAP_TYPES
+        }
+
+        self.assertEqual(len(output_paths), len(atlas_ids) * len(ATLAS_MAP_TYPES))
+        self.assertEqual(
+            build_texture_atlas_map_image_relative_path(
+                "cabinet",
+                ATLAS_MAP_BASE_COLOR,
+            ),
+            "cabinet.png",
+        )
+        self.assertEqual(
+            build_texture_atlas_map_image_relative_path(
+                "cabinet",
+                ATLAS_MAP_NORMAL,
+            ),
+            "pbr_maps/cabinet.normal.png",
+        )
+
+    def test_delete_atlas_removes_every_materialized_map(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Delete PBR", 2048, atlas_id="atlas-delete")
+        source = _mapped_source(
+            "deletable",
+            directory=self._temporary_directory.name,
+            map_colors={ATLAS_MAP_BASE_COLOR: (70, 80, 90, 255)},
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([source])
+        self.workspace.assign_object_button.click()
+        output_paths = tuple(
+            Path(self._temporary_directory.name)
+            / build_texture_atlas_map_image_relative_path(atlas.atlas_id, map_type)
+            for map_type in ATLAS_MAP_TYPES
+        )
+        self.assertTrue(all(path.is_file() for path in output_paths))
+
+        self.workspace.remove_atlas_button.click()
+
+        self.assertTrue(all(not path.exists() for path in output_paths))
+
+    def test_pbr_materialization_failure_restores_every_prior_map(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Atomic PBR", 2048, atlas_id="atlas-atomic")
+        source = _mapped_source(
+            "atomic",
+            directory=self._temporary_directory.name,
+            map_colors={
+                ATLAS_MAP_BASE_COLOR: (20, 40, 60, 255),
+                ATLAS_MAP_NORMAL: (128, 128, 255, 255),
+            },
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([source])
+        self.workspace.assign_object_button.click()
+        output_paths = tuple(
+            Path(self._temporary_directory.name)
+            / build_texture_atlas_map_image_relative_path(atlas.atlas_id, map_type)
+            for map_type in ATLAS_MAP_TYPES
+        )
+        previous_payloads = {
+            output_path: output_path.read_bytes()
+            for output_path in output_paths
+        }
+        Image.new("RGBA", (512, 512), (200, 10, 20, 255)).save(
+            source.physical_texture_path
+        )
+        original_writer = texture_atlas_workspace_module.write_texture_atlas_png
+        write_count = 0
+
+        def fail_third_map(*args, **kwargs):
+            nonlocal write_count
+            write_count += 1
+            if write_count == 3:
+                raise OSError("PBR write failed")
+            return original_writer(*args, **kwargs)
+
+        with patch.object(
+            texture_atlas_workspace_module,
+            "write_texture_atlas_png",
+            side_effect=fail_third_map,
+        ):
+            refreshed = self.workspace.refresh_texture_source_content(
+                [source.object_id]
+            )
+
+        self.assertFalse(refreshed)
+        self.assertEqual(write_count, 3)
+        for output_path, previous_payload in previous_payloads.items():
+            with self.subTest(output_path=output_path.name):
+                self.assertEqual(output_path.read_bytes(), previous_payload)
 
     def test_creates_named_atlas_with_selected_resolution(self) -> None:
         self.workspace.atlas_name_edit.setText("Furniture")
