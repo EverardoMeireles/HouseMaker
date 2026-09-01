@@ -466,6 +466,12 @@ class BlueprintWorkspace(QWidget):
         self.viewer.navigation_mode_changed.connect(
             self._handle_canvas_3d_navigation_mode_changed
         )
+        self.viewer.first_person_camera_pose_changed.connect(
+            self.canvas.set_camera_indicator_pose
+        )
+        self.canvas.set_camera_indicator_pose(
+            self.viewer.get_first_person_camera_pose()
+        )
         self.settings_widget.settings_changed.connect(
             self._handle_generation_settings_changed
         )
@@ -936,6 +942,9 @@ class BlueprintWorkspace(QWidget):
         tab_label = "3D view"
         if mode == NAVIGATION_MODE_FIRST_PERSON:
             tab_label = "3D view (first person)"
+            self.canvas.set_camera_indicator_pose(
+                self.viewer.get_first_person_camera_pose()
+            )
         self.canvas_viewer_tabs.setTabText(
             self.canvas_3d_view_tab_index,
             tab_label,

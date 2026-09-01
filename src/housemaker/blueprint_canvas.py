@@ -22,6 +22,8 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QWidget
 
+from housemaker.camera_models import CameraPose
+from housemaker.level_coordinates import level_world_to_image_xy
 from housemaker.models import (
     DEFAULT_DOORWAY_DEPTH_METERS,
     DOORWAY_SHAPE_ARCH,
@@ -96,6 +98,12 @@ DOORWAY_RESIZE_AXIS_WIDTH = "width"
 MIN_ZOOM_SCALE = 1.0
 MAX_ZOOM_SCALE = 16.0
 ZOOM_STEP_FACTOR = 1.15
+CAMERA_INDICATOR_COLOR = QColor("#ffcf4a")
+CAMERA_INDICATOR_OUTLINE_COLOR = QColor("#1a1d22")
+CAMERA_INDICATOR_RADIUS_SCREEN = 7.0
+CAMERA_INDICATOR_DIRECTION_LENGTH_SCREEN = 34.0
+CAMERA_INDICATOR_ARROW_HEAD_LENGTH_SCREEN = 10.0
+CAMERA_INDICATOR_ARROW_HEAD_HALF_WIDTH_SCREEN = 6.0
 
 # ### Snapshot models ###
 @dataclass
@@ -336,6 +344,7 @@ class BlueprintCanvas(QWidget):
         self.pending_stair_preview_point: tuple[float, float] | None = None
         self.pending_stair_preview_guides: list[SnapGuide] = []
         self.level_context: LevelData | None = None
+        self._camera_indicator_pose: CameraPose | None = None
 
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -440,6 +449,22 @@ class BlueprintCanvas(QWidget):
         """Return the file revision validated for the displayed pixels."""
 
         return self._blueprint_image_revision
+
+    # ### First-person camera indicator ###
+    def set_camera_indicator_pose(self, pose: CameraPose | None) -> None:
+        """Display one world-space camera pose over the current blueprint."""
+
+        if pose is not None and not isinstance(pose, CameraPose):
+            raise TypeError("The Canvas camera indicator requires a CameraPose.")
+        if pose == self._camera_indicator_pose:
+            return
+        self._camera_indicator_pose = pose
+        self.update()
+
+    def get_camera_indicator_pose(self) -> CameraPose | None:
+        """Return the world-space pose currently represented on the Canvas."""
+
+        return self._camera_indicator_pose
 
     def refresh_blueprint_image_if_stale(self) -> bool:
         """Reload changed pixels without resetting Canvas editing state."""
@@ -1176,7 +1201,95 @@ class BlueprintCanvas(QWidget):
         self._paint_vertices(painter)
         self._paint_stairs(painter)
         self._paint_pending_stair_placement(painter)
+        self._paint_camera_indicator(painter)
         self._paint_overlay_text(painter)
+
+    # ### First-person camera indicator painting ###
+    def _paint_camera_indicator(self, painter: QPainter) -> None:
+        """Paint a fixed-size position marker and top-down look-direction arrow."""
+
+        geometry = self._get_camera_indicator_geometry()
+        if geometry is None:
+            return
+        center, direction_tip = geometry
+        direction = direction_tip - center
+        direction_length = math.hypot(direction.x(), direction.y())
+        if direction_length <= 1e-6:
+            return
+
+        unit_direction = direction / direction_length
+        perpendicular = QPointF(-unit_direction.y(), unit_direction.x())
+        shaft_start = center + unit_direction * CAMERA_INDICATOR_RADIUS_SCREEN
+        arrow_base = (
+            direction_tip
+            - unit_direction * CAMERA_INDICATOR_ARROW_HEAD_LENGTH_SCREEN
+        )
+        arrow_head = QPolygonF(
+            (
+                direction_tip,
+                arrow_base
+                + perpendicular * CAMERA_INDICATOR_ARROW_HEAD_HALF_WIDTH_SCREEN,
+                arrow_base
+                - perpendicular * CAMERA_INDICATOR_ARROW_HEAD_HALF_WIDTH_SCREEN,
+            )
+        )
+
+        painter.save()
+        outline_pen = QPen(CAMERA_INDICATOR_OUTLINE_COLOR, 4.5)
+        outline_pen.setCosmetic(True)
+        outline_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(outline_pen)
+        painter.setBrush(CAMERA_INDICATOR_OUTLINE_COLOR)
+        painter.drawLine(shaft_start, arrow_base)
+        painter.drawPolygon(arrow_head)
+        painter.drawEllipse(
+            center,
+            CAMERA_INDICATOR_RADIUS_SCREEN + 1.5,
+            CAMERA_INDICATOR_RADIUS_SCREEN + 1.5,
+        )
+
+        indicator_pen = QPen(CAMERA_INDICATOR_COLOR, 2.5)
+        indicator_pen.setCosmetic(True)
+        indicator_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(indicator_pen)
+        painter.setBrush(CAMERA_INDICATOR_COLOR)
+        painter.drawLine(shaft_start, arrow_base)
+        painter.drawPolygon(arrow_head)
+        painter.drawEllipse(
+            center,
+            CAMERA_INDICATOR_RADIUS_SCREEN,
+            CAMERA_INDICATOR_RADIUS_SCREEN,
+        )
+        painter.restore()
+
+    def _get_camera_indicator_geometry(
+        self,
+    ) -> tuple[QPointF, QPointF] | None:
+        """Return the marker center and fixed-length arrow tip in widget space."""
+
+        pose = self._camera_indicator_pose
+        level = self.level_context
+        if pose is None or level is None or self.blueprint_image is None:
+            return None
+
+        yaw_radians = math.radians(pose.yaw_degrees)
+        try:
+            center_image = level_world_to_image_xy(level, pose.x, pose.y)
+            direction_image = level_world_to_image_xy(
+                level,
+                pose.x + math.cos(yaw_radians),
+                pose.y + math.sin(yaw_radians),
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+        center = self._image_to_widget(*center_image)
+        direction_point = self._image_to_widget(*direction_image)
+        direction = direction_point - center
+        direction_length = math.hypot(direction.x(), direction.y())
+        if direction_length <= 1e-6:
+            return None
+        direction *= CAMERA_INDICATOR_DIRECTION_LENGTH_SCREEN / direction_length
+        return center, center + direction
 
     def _apply_active_chain(self) -> None:
         if self.active_vertex_id is None:

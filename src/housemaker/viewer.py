@@ -774,7 +774,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
 
         if self._has_custom_first_person_camera_pose:
             return
-        self._set_first_person_camera_pose(pose, is_custom=False, emit_signal=False)
+        self._set_first_person_camera_pose(pose, is_custom=False)
 
     def step_first_person_movement(self, elapsed_seconds: float) -> None:
         """Advance held Z/Q/S/D/R/F movement for deterministic callers/tests."""
