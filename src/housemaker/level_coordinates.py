@@ -83,6 +83,12 @@ def build_doorway_world_outline_positions(
         doorway.rotation_degrees,
         "rotation",
     )
+    bottom_height_meters = _get_valid_doorway_outline_value(
+        doorway.bottom_height_meters,
+        "bottom height",
+    )
+    if bottom_height_meters < 0.0:
+        raise ValueError("Doorway outline bottom height cannot be negative.")
 
     rotation_radians = math.radians(rotation_degrees)
     depth_direction = (
@@ -125,7 +131,9 @@ def build_doorway_world_outline_positions(
                 (
                     world_x,
                     world_y,
-                    base_z_meters + height_offset_meters,
+                    base_z_meters
+                    + bottom_height_meters
+                    + height_offset_meters,
                 )
             )
         depth_faces.append(tuple(profile_positions))

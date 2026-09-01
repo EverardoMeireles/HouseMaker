@@ -787,7 +787,10 @@ def _append_connected_doorway_reveals(
     for image_quad in _build_wall_opening_reveal_quads(
         doorway_reveal.reveal_pair,
         doorway_reveal.opening,
-        include_sill=False,
+        include_sill=(
+            doorway_reveal.opening.bottom_height_meters
+            > WALL_OPENING_EPSILON
+        ),
     ):
         world_quad = tuple(
             (

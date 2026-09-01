@@ -38,6 +38,7 @@ from housemaker.level_coordinates import (
 )
 from housemaker.models import (
     DEFAULT_DOORWAY_ARCH_AMOUNT,
+    DEFAULT_DOORWAY_BOTTOM_HEIGHT_METERS,
     DEFAULT_DOORWAY_SHAPE,
     DEFAULT_LEVEL_HEIGHT_METERS,
     GROUND_LEVEL_INDEX,
@@ -3438,6 +3439,13 @@ def _build_wall_openings(doorways: Sequence[object]) -> list[WallOpening]:
             height_meters = float(getattr(doorway, "height_meters"))
             depth_meters = float(getattr(doorway, "depth_meters"))
             rotation_degrees = float(getattr(doorway, "rotation_degrees"))
+            bottom_height_meters = float(
+                getattr(
+                    doorway,
+                    "bottom_height_meters",
+                    DEFAULT_DOORWAY_BOTTOM_HEIGHT_METERS,
+                )
+            )
             profile_points = build_doorway_cross_section_outline(
                 width_meters,
                 height_meters,
@@ -3458,6 +3466,7 @@ def _build_wall_openings(doorways: Sequence[object]) -> list[WallOpening]:
             height_meters,
             depth_meters,
             rotation_degrees,
+            bottom_height_meters,
         )
         if not all(math.isfinite(value) for value in doorway_values):
             continue
@@ -3465,6 +3474,7 @@ def _build_wall_openings(doorways: Sequence[object]) -> list[WallOpening]:
             width_meters <= WALL_OPENING_EPSILON
             or height_meters <= WALL_OPENING_EPSILON
             or depth_meters <= WALL_OPENING_EPSILON
+            or bottom_height_meters < 0.0
         ):
             continue
 
@@ -3482,6 +3492,7 @@ def _build_wall_openings(doorways: Sequence[object]) -> list[WallOpening]:
                 half_width_pixels=width_meters / PIXEL_TO_METER / 2.0,
                 half_depth_pixels=depth_meters / PIXEL_TO_METER / 2.0,
                 height_meters=height_meters,
+                bottom_height_meters=bottom_height_meters,
                 profile_points=profile_points,
             )
         )
@@ -4820,7 +4831,9 @@ def _append_doorway_reveal_geometry(
         reveal_pair=reveal_pair,
         base_z_meters=base_z_meters,
         blueprint_size_pixels=blueprint_size_pixels,
-        include_sill=False,
+        include_sill=(
+            opening.bottom_height_meters > WALL_OPENING_EPSILON
+        ),
     )
 
 

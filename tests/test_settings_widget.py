@@ -428,7 +428,7 @@ class SettingsWidgetTests(unittest.TestCase):
                 " s",
             )
             self.assertIn(
-                "doorway's arch settings",
+                "doorway or window edit",
                 widget.mesh_edit_update_delay_spinbox.toolTip(),
             )
             form_layout = widget.layout().itemAt(1).layout()

@@ -45,6 +45,14 @@ from PySide6.QtWidgets import (
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.blueprint_canvas import BlueprintCanvas
+from housemaker.canvas_openings import (
+    CANVAS_OPENING_DOORWAY,
+    CanvasOpeningEdit,
+    CanvasOpeningReference,
+    CanvasOpeningTarget,
+    apply_canvas_opening_edit,
+    build_canvas_opening_targets,
+)
 from housemaker.external_viewer_host import ExternalFullscreenViewerHost
 from housemaker.generation_state import (
     GeneratedObjectPlacement,
@@ -66,6 +74,7 @@ from housemaker.surface_texture_workspace import (
     SurfaceTextureGenerationWorkspace,
 )
 from housemaker.surface_geometry import (
+    FixedSurface,
     WallWindowPlacement,
     add_wall_window,
     build_fixed_surfaces,
@@ -231,18 +240,35 @@ class BlueprintWorkspace(QWidget):
             None
         )
         self._viewer_preview_dependency_signature_revision = -1
-        # Doorway edits remain live in project data while this separate
-        # snapshot controls which edits have reached the expensive 3D mesh.
+        # Opening edits remain live in project data while these separate
+        # snapshots control which edits have reached the expensive 3D mesh.
         self._viewer_doorways_by_level_index: dict[
             int,
             tuple[DoorwayData, ...],
+        ] = {}
+        self._viewer_windows_by_level_index: dict[
+            int,
+            tuple[WindowData, ...],
         ] = {}
         self._reset_viewer_doorway_snapshots()
         self._doorway_mesh_update_delay_seconds = (
             DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS
         )
         self._is_doorway_move_drag_active = False
+        self._is_canvas_opening_drag_active = False
+        self._active_canvas_opening_reference: (
+            CanvasOpeningReference | None
+        ) = None
+        self._active_canvas_opening_start_edit: CanvasOpeningEdit | None = None
+        self._canvas_opening_targets_by_key: dict[
+            str,
+            CanvasOpeningTarget,
+        ] = {}
+        self._pending_canvas_opening_key: str | None = None
+        self._staged_canvas_opening_mesh_update = False
+        self._staged_doorway_mesh_update = False
         self._pending_doorway_mesh_level_index: int | None = None
+        self._pending_window_mesh_level_index: int | None = None
         self._doorway_outline_commit_revision: int | None = None
         self._doorway_mesh_update_timer = QTimer(self)
         self._doorway_mesh_update_timer.setSingleShot(True)
@@ -456,6 +482,21 @@ class BlueprintWorkspace(QWidget):
         )
         self.viewer.window_undo_requested.connect(
             self._handle_canvas_window_undo_requested
+        )
+        self.viewer.canvas_opening_selection_changed.connect(
+            self._handle_canvas_opening_selection_changed
+        )
+        self.viewer.canvas_opening_edit_started.connect(
+            self._handle_canvas_opening_edit_started
+        )
+        self.viewer.canvas_opening_edit_preview_changed.connect(
+            self._handle_canvas_opening_edit_preview_changed
+        )
+        self.viewer.canvas_opening_edit_finished.connect(
+            self._handle_canvas_opening_edit_finished
+        )
+        self.viewer.canvas_opening_edit_cancelled.connect(
+            self._handle_canvas_opening_edit_cancelled
         )
         self.viewer.placed_object_transform_changed.connect(
             self._handle_placed_object_transform_changed
@@ -970,12 +1011,14 @@ class BlueprintWorkspace(QWidget):
         added_window = self._find_canvas_window(window.window_id)
         if added_window is None:
             self._rollback_canvas_window(window.window_id)
+            self._reset_viewer_window_snapshots()
             self.canvas.update()
             self.viewer.set_window_tools_status(
                 "Window not added because its owning level could not be found."
             )
             return
         window_level, _, _ = added_window
+        self._sync_viewer_window_snapshot(window_level)
         self._refresh_canvas_windows_for_level(window_level)
 
         try:
@@ -984,11 +1027,13 @@ class BlueprintWorkspace(QWidget):
             )
         except Exception as error:
             self._rollback_canvas_window(window.window_id)
+            self._sync_viewer_window_snapshot(window_level)
             self._refresh_canvas_windows_for_level(window_level)
             self.viewer.set_window_tools_status(f"Window not added: {error}")
             return
         if validated_build is None:
             self._rollback_canvas_window(window.window_id)
+            self._sync_viewer_window_snapshot(window_level)
             self._refresh_canvas_windows_for_level(window_level)
             self.viewer.set_window_tools_status(
                 "Window not added because the updated model could not be built."
@@ -1003,6 +1048,7 @@ class BlueprintWorkspace(QWidget):
             )
         except Exception as error:
             self._rollback_canvas_window(window.window_id)
+            self._sync_viewer_window_snapshot(window_level)
             self._refresh_canvas_windows_for_level(window_level)
             self._restore_canvas_window_preview_after_rollback()
             self.viewer.set_window_tools_status(f"Window not added: {error}")
@@ -1027,6 +1073,7 @@ class BlueprintWorkspace(QWidget):
             self.viewer.set_window_tools_status("No added window to undo.")
             return
         level, window_index, window = removed
+        self._sync_viewer_window_snapshot(level)
         self._refresh_canvas_windows_for_level(level)
 
         try:
@@ -1035,6 +1082,7 @@ class BlueprintWorkspace(QWidget):
             )
         except Exception as error:
             level.windows.insert(window_index, window)
+            self._sync_viewer_window_snapshot(level)
             self._refresh_canvas_windows_for_level(level)
             self._sync_canvas_window_undo_availability()
             self.viewer.set_window_tools_status(
@@ -1043,6 +1091,7 @@ class BlueprintWorkspace(QWidget):
             return
         if validated_build is None:
             level.windows.insert(window_index, window)
+            self._sync_viewer_window_snapshot(level)
             self._refresh_canvas_windows_for_level(level)
             self._sync_canvas_window_undo_availability()
             self.viewer.set_window_tools_status(
@@ -1058,6 +1107,7 @@ class BlueprintWorkspace(QWidget):
             )
         except Exception as error:
             level.windows.insert(window_index, window)
+            self._sync_viewer_window_snapshot(level)
             self._refresh_canvas_windows_for_level(level)
             self._restore_canvas_window_preview_after_rollback()
             self._sync_canvas_window_undo_availability()
@@ -1070,6 +1120,176 @@ class BlueprintWorkspace(QWidget):
         self._sync_canvas_window_undo_availability()
         self.viewer.set_window_tools_status("Window undone.")
 
+    # ### Canvas opening gizmo edits ###
+    def _handle_canvas_opening_selection_changed(
+        self,
+        raw_reference: object,
+    ) -> None:
+        """Keep doorway controls aligned with selection in the 3D viewer."""
+
+        reference = (
+            raw_reference
+            if isinstance(raw_reference, CanvasOpeningReference)
+            else None
+        )
+        doorway_index: int | None = None
+        if (
+            reference is not None
+            and reference.kind == CANVAS_OPENING_DOORWAY
+            and reference.level_index == self.current_level.index
+        ):
+            doorway_index = reference.item_index
+        self.canvas._set_selected_doorway_index(doorway_index)
+        self.canvas.update()
+
+    def _handle_canvas_opening_edit_started(
+        self,
+        raw_edit: object,
+    ) -> None:
+        """Freeze the committed wall mesh for the duration of one drag."""
+
+        if not isinstance(raw_edit, CanvasOpeningEdit):
+            return
+        pending_key = self._pending_canvas_opening_key
+        if pending_key is not None and pending_key != raw_edit.reference.key:
+            self._stage_pending_canvas_opening_snapshots()
+
+        self._is_canvas_opening_drag_active = True
+        self._active_canvas_opening_reference = raw_edit.reference
+        self._active_canvas_opening_start_edit = raw_edit
+        self._doorway_mesh_update_timer.stop()
+
+    def _handle_canvas_opening_edit_preview_changed(
+        self,
+        raw_edit: object,
+    ) -> None:
+        """Apply a lightweight opening rectangle while retaining the old mesh."""
+
+        if not isinstance(raw_edit, CanvasOpeningEdit):
+            return
+        target = self._canvas_opening_targets_by_key.get(
+            raw_edit.reference.key
+        )
+        if target is None:
+            self.viewer.set_window_tools_status(
+                "Opening edit stopped because its wall is no longer available."
+            )
+            self.viewer.select_canvas_opening(None)
+            return
+
+        try:
+            applied = apply_canvas_opening_edit(
+                self.levels,
+                target,
+                raw_edit,
+            )
+        except (TypeError, ValueError) as error:
+            self.viewer.set_window_tools_status(
+                f"Opening could not be resized: {error}"
+            )
+            return
+
+        self._canvas_opening_targets_by_key[target.key] = target.with_bounds(
+            raw_edit.bounds
+        )
+        self._sync_live_canvas_opening(applied.reference, applied.level)
+        self._refresh_pending_canvas_opening_state(applied.reference)
+        if self._is_canvas_opening_drag_active:
+            self._doorway_mesh_update_timer.stop()
+
+    def _handle_canvas_opening_edit_finished(
+        self,
+        raw_edit: object,
+        _changed: bool,
+    ) -> None:
+        """Start the complete configured delay only after mouse release."""
+
+        if not isinstance(raw_edit, CanvasOpeningEdit):
+            return
+        if (
+            self._active_canvas_opening_reference is not None
+            and raw_edit.reference != self._active_canvas_opening_reference
+        ):
+            return
+        self._finish_canvas_opening_drag()
+
+    def _handle_canvas_opening_edit_cancelled(
+        self,
+        raw_start_edit: object,
+    ) -> None:
+        """Restore the exact drag-start rectangle after viewer cancellation."""
+
+        start_edit = (
+            raw_start_edit
+            if isinstance(raw_start_edit, CanvasOpeningEdit)
+            else self._active_canvas_opening_start_edit
+        )
+        if start_edit is not None:
+            self._handle_canvas_opening_edit_preview_changed(start_edit)
+        self._finish_canvas_opening_drag()
+
+    def _finish_canvas_opening_drag(self) -> None:
+        """End pointer ownership and resume a pending opening debounce."""
+
+        self._is_canvas_opening_drag_active = False
+        self._active_canvas_opening_reference = None
+        self._active_canvas_opening_start_edit = None
+        if (
+            self._staged_canvas_opening_mesh_update
+            or self._pending_doorway_mesh_level_index is not None
+            or self._pending_window_mesh_level_index is not None
+        ):
+            self._doorway_mesh_update_timer.start()
+
+    def _sync_live_canvas_opening(
+        self,
+        reference: CanvasOpeningReference,
+        level: LevelData,
+    ) -> None:
+        """Repaint the active 2D Canvas from the same edited project object."""
+
+        if level.index != self.current_level.index:
+            return
+        if reference.kind == CANVAS_OPENING_DOORWAY:
+            self.canvas.doorways = level.doorways
+            self.canvas._set_selected_doorway_index(reference.item_index)
+        else:
+            self.canvas.windows = level.windows
+        self.canvas.update()
+
+    def _refresh_pending_canvas_opening_state(
+        self,
+        reference: CanvasOpeningReference,
+    ) -> None:
+        """Compare live data with the rendered snapshot without rebuilding."""
+
+        level = next(
+            (
+                candidate
+                for candidate in self.levels
+                if candidate.index == reference.level_index
+            ),
+            None,
+        )
+        if level is None:
+            return
+        if reference.kind == CANVAS_OPENING_DOORWAY:
+            committed = self._viewer_doorways_by_level_index.get(level.index)
+            is_pending = self._copy_doorways(level.doorways) != committed
+            self._pending_doorway_mesh_level_index = (
+                level.index if is_pending else None
+            )
+        else:
+            committed = self._viewer_windows_by_level_index.get(level.index)
+            is_pending = self._copy_windows(level.windows) != committed
+            self._pending_window_mesh_level_index = (
+                level.index if is_pending else None
+            )
+        if is_pending:
+            self._pending_canvas_opening_key = reference.key
+        elif self._pending_canvas_opening_key == reference.key:
+            self._pending_canvas_opening_key = None
+
     def _apply_canvas_window_preview(
         self,
         generated_model: GeneratedModel,
@@ -1081,7 +1301,7 @@ class BlueprintWorkspace(QWidget):
         wall_targets = tuple(
             build_fixed_surfaces(self._build_viewer_preview_levels())
         )
-        self.viewer.set_wall_targets(wall_targets)
+        self._set_canvas_viewer_targets(wall_targets)
         self.viewer.set_model(generated_model, preserve_camera=True)
         self._mark_viewer_preview_dirty(preserve_camera=True)
         if self._remember_current_canvas_preview_model(
@@ -1091,6 +1311,40 @@ class BlueprintWorkspace(QWidget):
             return True
         self._queue_viewer_preview_refresh()
         return False
+
+    def _set_canvas_viewer_targets(
+        self,
+        surfaces: Sequence[FixedSurface],
+    ) -> None:
+        """Install wall targets and their explicit selectable hole overlays."""
+
+        wall_targets = tuple(
+            surface
+            for surface in surfaces
+            if isinstance(surface, FixedSurface)
+        )
+        self.viewer.set_wall_targets(wall_targets)
+        try:
+            opening_targets = build_canvas_opening_targets(
+                self.levels,
+                wall_targets,
+            )
+        except (TypeError, ValueError):
+            opening_targets = ()
+        drag_start = self._active_canvas_opening_start_edit
+        if drag_start is not None:
+            opening_targets = tuple(
+                (
+                    target.with_bounds(drag_start.bounds)
+                    if target.key == drag_start.reference.key
+                    else target
+                )
+                for target in opening_targets
+            )
+        self._canvas_opening_targets_by_key = {
+            target.key: target for target in opening_targets
+        }
+        self.viewer.set_canvas_opening_targets(opening_targets)
 
     def _restore_canvas_window_preview_after_rollback(self) -> None:
         """Best-effort repair after a display refresh failed mid-transaction."""
@@ -1201,7 +1455,7 @@ class BlueprintWorkspace(QWidget):
             return
 
         self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
-        self.viewer.set_wall_targets(
+        self._set_canvas_viewer_targets(
             tuple(build_fixed_surfaces(self._build_viewer_preview_levels()))
         )
         self.viewer.set_model(generated_model)
@@ -2828,7 +3082,7 @@ class BlueprintWorkspace(QWidget):
             return
         self._mark_viewer_preview_dirty(preserve_camera=preserve_camera)
 
-    # ### Debounced doorway mesh previews ###
+    # ### Debounced opening mesh previews ###
     @staticmethod
     def _copy_doorways(
         doorways: Sequence[DoorwayData],
@@ -2837,16 +3091,53 @@ class BlueprintWorkspace(QWidget):
 
         return tuple(copy.deepcopy(tuple(doorways)))
 
+    @staticmethod
+    def _copy_windows(
+        windows: Sequence[WindowData],
+    ) -> tuple[WindowData, ...]:
+        """Own a window snapshot that cannot follow live Canvas mutations."""
+
+        return tuple(copy.deepcopy(tuple(windows)))
+
     def _reset_viewer_doorway_snapshots(self) -> None:
-        """Make every rendered doorway snapshot match the loaded project."""
+        """Make every rendered opening snapshot match the loaded project."""
 
         self._viewer_doorways_by_level_index = {
             level.index: self._copy_doorways(level.doorways)
             for level in self.levels
         }
+        self._reset_viewer_window_snapshots()
+
+    def _reset_viewer_window_snapshots(self) -> None:
+        """Make every rendered window snapshot match the loaded project."""
+
+        self._viewer_windows_by_level_index = {
+            level.index: self._copy_windows(level.windows)
+            for level in self.levels
+        }
+
+    def _sync_viewer_window_snapshot(self, level: LevelData) -> None:
+        """Commit one structural window list change before its model build."""
+
+        self._viewer_windows_by_level_index[level.index] = self._copy_windows(
+            level.windows
+        )
+        if self._pending_window_mesh_level_index != level.index:
+            return
+        self._pending_window_mesh_level_index = None
+        if (
+            self._pending_canvas_opening_key is not None
+            and self._pending_canvas_opening_key.startswith("window:")
+        ):
+            self._pending_canvas_opening_key = None
+        if (
+            self._pending_doorway_mesh_level_index is None
+            and not self._staged_canvas_opening_mesh_update
+        ):
+            self._doorway_mesh_update_timer.stop()
 
     def _build_viewer_preview_levels(self) -> list[LevelData]:
-        """Copy levels while substituting only committed doorway dimensions."""
+        """Copy levels while substituting only committed opening dimensions."""
 
         preview_levels: list[LevelData] = []
         for level in self.levels:
@@ -2858,8 +3149,17 @@ class BlueprintWorkspace(QWidget):
                 self._viewer_doorways_by_level_index[level.index] = (
                     doorway_snapshot
                 )
+            window_snapshot = self._viewer_windows_by_level_index.get(
+                level.index
+            )
+            if window_snapshot is None:
+                window_snapshot = self._copy_windows(level.windows)
+                self._viewer_windows_by_level_index[level.index] = (
+                    window_snapshot
+                )
             preview_level = copy.copy(level)
             preview_level.doorways = list(copy.deepcopy(doorway_snapshot))
+            preview_level.windows = list(copy.deepcopy(window_snapshot))
             preview_levels.append(preview_level)
         return preview_levels
 
@@ -2883,6 +3183,38 @@ class BlueprintWorkspace(QWidget):
         if timer_was_active:
             self._doorway_mesh_update_timer.start()
 
+    def _stage_pending_canvas_opening_snapshots(self) -> None:
+        """Stage all stable live openings without refreshing during a drag."""
+
+        doorway_level_index = self._pending_doorway_mesh_level_index
+        window_level_index = self._pending_window_mesh_level_index
+        self._pending_doorway_mesh_level_index = None
+        self._pending_window_mesh_level_index = None
+        self._pending_canvas_opening_key = None
+
+        for level in self.levels:
+            if level.index == doorway_level_index:
+                next_doorways = self._copy_doorways(level.doorways)
+                if (
+                    self._viewer_doorways_by_level_index.get(level.index)
+                    != next_doorways
+                ):
+                    self._viewer_doorways_by_level_index[level.index] = (
+                        next_doorways
+                    )
+                    self._staged_canvas_opening_mesh_update = True
+                    self._staged_doorway_mesh_update = True
+            if level.index == window_level_index:
+                next_windows = self._copy_windows(level.windows)
+                if (
+                    self._viewer_windows_by_level_index.get(level.index)
+                    != next_windows
+                ):
+                    self._viewer_windows_by_level_index[level.index] = (
+                        next_windows
+                    )
+                    self._staged_canvas_opening_mesh_update = True
+
     def _cancel_pending_doorway_mesh_update(
         self,
         clear_outline: bool = True,
@@ -2891,6 +3223,13 @@ class BlueprintWorkspace(QWidget):
 
         self._doorway_mesh_update_timer.stop()
         self._pending_doorway_mesh_level_index = None
+        self._pending_window_mesh_level_index = None
+        self._pending_canvas_opening_key = None
+        self._staged_canvas_opening_mesh_update = False
+        self._staged_doorway_mesh_update = False
+        self._is_canvas_opening_drag_active = False
+        self._active_canvas_opening_reference = None
+        self._active_canvas_opening_start_edit = None
         if not clear_outline:
             return
         self._doorway_outline_commit_revision = None
@@ -2910,40 +3249,22 @@ class BlueprintWorkspace(QWidget):
         self.viewer.set_doorway_preview_outline(None)
 
     def _commit_pending_doorway_mesh_update(self) -> None:
-        """Commit the latest stable doorway edit to the 3D mesh cache."""
+        """Commit the latest stable doorway/window edit to the 3D mesh cache."""
 
         self._doorway_mesh_update_timer.stop()
-        level_index = self._pending_doorway_mesh_level_index
-        self._pending_doorway_mesh_level_index = None
-        if level_index is None:
-            return
-
-        level = next(
-            (
-                candidate
-                for candidate in self.levels
-                if candidate.index == level_index
-            ),
-            None,
-        )
-        if level is None:
-            self._doorway_outline_commit_revision = None
-            self.viewer.set_doorway_preview_outline(None)
-            return
-
-        next_snapshot = self._copy_doorways(level.doorways)
-        if (
-            self._viewer_doorways_by_level_index.get(level.index)
-            == next_snapshot
-        ):
+        self._stage_pending_canvas_opening_snapshots()
+        snapshot_changed = self._staged_canvas_opening_mesh_update
+        doorway_snapshot_changed = self._staged_doorway_mesh_update
+        self._staged_canvas_opening_mesh_update = False
+        self._staged_doorway_mesh_update = False
+        if not snapshot_changed:
             self._clear_committed_doorway_outline_if_displayed()
             if self._doorway_outline_commit_revision is None:
                 self.viewer.set_doorway_preview_outline(None)
             return
-
-        self._viewer_doorways_by_level_index[level.index] = next_snapshot
         self._schedule_viewer_preview_refresh(preserve_camera=True)
-        self._doorway_outline_commit_revision = self._viewer_preview_revision
+        if doorway_snapshot_changed:
+            self._doorway_outline_commit_revision = self._viewer_preview_revision
 
     def _build_generated_model(
         self,
@@ -3103,10 +3424,10 @@ class BlueprintWorkspace(QWidget):
 
         if canvas_is_stale:
             if generated_model is None:
-                self.viewer.set_wall_targets(())
+                self._set_canvas_viewer_targets(())
                 self.viewer.clear_model()
             else:
-                self.viewer.set_wall_targets(
+                self._set_canvas_viewer_targets(
                     tuple(build_fixed_surfaces(preview_levels))
                 )
                 self.viewer.set_model(
@@ -3624,6 +3945,14 @@ class BlueprintWorkspace(QWidget):
         if self._copy_doorways(level.doorways) == committed_doorways:
             self._doorway_mesh_update_timer.stop()
             self._pending_doorway_mesh_level_index = None
+            doorway_key_prefix = f"doorway:{level.index}:"
+            if (
+                self._pending_canvas_opening_key is not None
+                and self._pending_canvas_opening_key.startswith(
+                    doorway_key_prefix
+                )
+            ):
+                self._pending_canvas_opening_key = None
             self._clear_committed_doorway_outline_if_displayed()
             if self._doorway_outline_commit_revision is None:
                 self.viewer.set_doorway_preview_outline(None)
@@ -3658,6 +3987,9 @@ class BlueprintWorkspace(QWidget):
             self.viewer.set_doorway_preview_outline(outline_positions)
 
         self._pending_doorway_mesh_level_index = level.index
+        self._pending_canvas_opening_key = (
+            f"doorway:{level.index}:{selected_index}"
+        )
         if self._is_doorway_move_drag_active:
             self._doorway_mesh_update_timer.stop()
         else:
@@ -4007,6 +4339,10 @@ class BlueprintWorkspace(QWidget):
         self._viewer_doorways_by_level_index.setdefault(
             self.current_level.index,
             self._copy_doorways(self.current_level.doorways),
+        )
+        self._viewer_windows_by_level_index.setdefault(
+            self.current_level.index,
+            self._copy_windows(self.current_level.windows),
         )
         self.canvas.set_level_data(
             vertex_data=self.current_level.vertex_data,

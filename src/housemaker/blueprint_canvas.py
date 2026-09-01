@@ -2260,6 +2260,7 @@ class BlueprintCanvas(QWidget):
         rotation_degrees: float | None = None,
         shape: str | None = None,
         arch_amount: float | None = None,
+        bottom_height_meters: float | None = None,
     ) -> DoorwayData:
         return DoorwayData(
             center_x=doorway.center_x if center_x is None else center_x,
@@ -2281,6 +2282,11 @@ class BlueprintCanvas(QWidget):
             shape=doorway.shape if shape is None else shape,
             arch_amount=(
                 doorway.arch_amount if arch_amount is None else arch_amount
+            ),
+            bottom_height_meters=(
+                doorway.bottom_height_meters
+                if bottom_height_meters is None
+                else bottom_height_meters
             ),
         )
 

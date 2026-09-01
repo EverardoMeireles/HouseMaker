@@ -13,6 +13,7 @@ from housemaker.surface_texture_state import SurfaceTextureData
 from housemaker.texture_atlas_state import TextureAtlasData
 from housemaker.models import (
     DEFAULT_DOORWAY_ARCH_AMOUNT,
+    DEFAULT_DOORWAY_BOTTOM_HEIGHT_METERS,
     DEFAULT_DOORWAY_DEPTH_METERS,
     DEFAULT_DOORWAY_HEIGHT_METERS,
     DEFAULT_DOORWAY_SHAPE,
@@ -27,12 +28,14 @@ from housemaker.models import (
     GROUND_LEVEL_INDEX,
     MAX_FLOOR_THICKNESS_METERS,
     MAX_DOORWAY_DEPTH_METERS,
+    MAX_DOORWAY_BOTTOM_HEIGHT_METERS,
     MAX_DOORWAY_HEIGHT_METERS,
     MAX_DOORWAY_WIDTH_METERS,
     MAX_LEVEL_OFFSET_METERS,
     MAX_LEVEL_SCALE,
     MIN_FLOOR_THICKNESS_METERS,
     MIN_DOORWAY_DEPTH_METERS,
+    MIN_DOORWAY_BOTTOM_HEIGHT_METERS,
     MIN_DOORWAY_HEIGHT_METERS,
     MIN_DOORWAY_WIDTH_METERS,
     MIN_LEVEL_OFFSET_METERS,
@@ -510,6 +513,7 @@ def _serialize_doorway(doorway: DoorwayData) -> dict[str, float | str]:
         "rotation_degrees": float(doorway.rotation_degrees),
         "shape": doorway.shape,
         "arch_amount": float(doorway.arch_amount),
+        "bottom_height_meters": float(doorway.bottom_height_meters),
     }
 
 
@@ -559,6 +563,14 @@ def _deserialize_doorways(raw_doorways: object) -> list[DoorwayData]:
                     raw_doorway.get(
                         "arch_amount",
                         DEFAULT_DOORWAY_ARCH_AMOUNT,
+                    )
+                ),
+                bottom_height_meters=(
+                    _deserialize_doorway_bottom_height_meters(
+                        raw_doorway.get(
+                            "bottom_height_meters",
+                            DEFAULT_DOORWAY_BOTTOM_HEIGHT_METERS,
+                        )
                     )
                 ),
             )
@@ -620,6 +632,19 @@ def _deserialize_doorway_depth_meters(raw_depth_meters: object) -> float:
         default_value=DEFAULT_DOORWAY_DEPTH_METERS,
         minimum=MIN_DOORWAY_DEPTH_METERS,
         maximum=MAX_DOORWAY_DEPTH_METERS,
+    )
+
+
+def _deserialize_doorway_bottom_height_meters(
+    raw_bottom_height_meters: object,
+) -> float:
+    """Return a finite non-negative doorway sill height."""
+
+    return _deserialize_doorway_measurement_meters(
+        raw_bottom_height_meters,
+        default_value=DEFAULT_DOORWAY_BOTTOM_HEIGHT_METERS,
+        minimum=MIN_DOORWAY_BOTTOM_HEIGHT_METERS,
+        maximum=MAX_DOORWAY_BOTTOM_HEIGHT_METERS,
     )
 
 

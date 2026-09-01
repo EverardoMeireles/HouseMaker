@@ -17,7 +17,7 @@ from pyqtgraph import Transform3D
 import pyqtgraph.opengl as gl
 from pyqtgraph.opengl import shaders as gl_shaders
 from pyqtgraph.opengl.GLGraphicsItem import GLGraphicsItem
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QEvent, QPointF, QRect, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import (
     QCursor,
     QKeyEvent,
@@ -46,6 +46,13 @@ from housemaker.camera_indicators import (
     update_projection_camera_indicator_items,
 )
 from housemaker.camera_models import CameraPose
+from housemaker.canvas_openings import (
+    CANVAS_OPENING_DOORWAY,
+    CanvasOpeningBounds,
+    CanvasOpeningEdit,
+    CanvasOpeningReference,
+    CanvasOpeningTarget,
+)
 from housemaker.glb import (
     GLTF_Y_UP_TO_Z_UP_TRANSFORM,
     SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION,
@@ -134,6 +141,41 @@ TRANSFORM_GIZMO_RING_HIT_RATIO = 0.085
 TRANSFORM_GIZMO_SELECTION_COLOR = (1.0, 0.72, 0.18, 0.95)
 TRANSFORM_GIZMO_TRANSLATE = "translate"
 TRANSFORM_GIZMO_ROTATE = "rotate"
+CANVAS_OPENING_GIZMO_SIDE = "side"
+CANVAS_OPENING_GIZMO_ANCHOR = "anchor"
+CANVAS_OPENING_SIDE_LEFT = "left"
+CANVAS_OPENING_SIDE_RIGHT = "right"
+CANVAS_OPENING_SIDE_BOTTOM = "bottom"
+CANVAS_OPENING_SIDE_TOP = "top"
+CANVAS_OPENING_RESIZE_SIDES = frozenset(
+    (
+        CANVAS_OPENING_SIDE_LEFT,
+        CANVAS_OPENING_SIDE_RIGHT,
+        CANVAS_OPENING_SIDE_BOTTOM,
+        CANVAS_OPENING_SIDE_TOP,
+    )
+)
+CANVAS_OPENING_SELECTION_COLOR = (0.20, 0.72, 1.0, 0.98)
+CANVAS_OPENING_PREVIEW_COLOR = (1.0, 0.72, 0.18, 0.98)
+CANVAS_OPENING_SIDE_COLOR = (1.0, 0.46, 0.12, 1.0)
+CANVAS_OPENING_ANCHOR_COLOR = (0.20, 0.86, 0.38, 1.0)
+CANVAS_OPENING_OUTLINE_WIDTH = 4.0
+CANVAS_OPENING_SIDE_SIZE_PIXELS = 22.0
+CANVAS_OPENING_ANCHOR_SIZE_PIXELS = 20.0
+CANVAS_OPENING_HANDLE_HIT_RADIUS_PIXELS = 20.0
+CANVAS_OPENING_HANDLE_MIN_HIT_RADIUS_METERS = 0.04
+CANVAS_OPENING_OVERLAY_DEPTH_VALUE = 10_000.0
+CANVAS_OPENING_OVERLAY_GL_OPTIONS = {
+    GL.GL_DEPTH_TEST: False,
+    GL.GL_BLEND: True,
+    GL.GL_CULL_FACE: False,
+    "glBlendFuncSeparate": (
+        GL.GL_SRC_ALPHA,
+        GL.GL_ONE_MINUS_SRC_ALPHA,
+        GL.GL_ONE,
+        GL.GL_ONE_MINUS_SRC_ALPHA,
+    ),
+}
 FACE_SELECTION_COLOR = (1.0, 0.36, 0.08, 0.72)
 FACE_SELECTION_EDGE_COLOR = (1.0, 0.78, 0.18, 1.0)
 FACE_SELECTION_MAX_RASTER_DIMENSION = 768
@@ -330,6 +372,39 @@ class _TransformGizmoHandle:
             raise ValueError("Unknown placed-object gizmo handle kind.")
         if self.axis_index not in {0, 1, 2}:
             raise ValueError("Placed-object gizmo axes must be X, Y, or Z.")
+
+
+@dataclass(frozen=True)
+class _CanvasOpeningGizmoHandle:
+    """One side resizer or center movement anchor for an opening."""
+
+    kind: str
+    side: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in {
+            CANVAS_OPENING_GIZMO_SIDE,
+            CANVAS_OPENING_GIZMO_ANCHOR,
+        }:
+            raise ValueError("Unknown Canvas opening gizmo handle kind.")
+        if self.kind == CANVAS_OPENING_GIZMO_SIDE:
+            if self.side not in CANVAS_OPENING_RESIZE_SIDES:
+                raise ValueError("Canvas opening side handles must name one side.")
+            return
+        if self.side is not None:
+            raise ValueError("A Canvas opening anchor has no resize side.")
+
+
+@dataclass
+class _CanvasOpeningEditDrag:
+    """Stable wall frame and live bounds for one opening gizmo drag."""
+
+    start_target: CanvasOpeningTarget
+    preview_target: CanvasOpeningTarget
+    handle: _CanvasOpeningGizmoHandle
+    pointer_offset_local: tuple[float, float]
+    last_emitted_bounds: CanvasOpeningBounds
+
 
 # ### Widgets ###
 class SelectableGLViewWidget(gl.GLViewWidget):
@@ -2179,6 +2254,11 @@ class GlbViewerWidget(QWidget):
 
     window_placement_requested = Signal(object)
     window_undo_requested = Signal()
+    canvas_opening_selection_changed = Signal(object)
+    canvas_opening_edit_started = Signal(object)
+    canvas_opening_edit_preview_changed = Signal(object)
+    canvas_opening_edit_finished = Signal(object, bool)
+    canvas_opening_edit_cancelled = Signal(object)
     placed_object_removal_requested = Signal(str)
     placed_object_transform_changed = Signal(str, object, object)
     face_selection_changed = Signal(object)
@@ -2257,6 +2337,10 @@ class GlbViewerWidget(QWidget):
         ) = None
         self._transform_gizmo_items: list[GLGraphicsItem] = []
         self._transform_gizmo_size = TRANSFORM_GIZMO_MIN_SIZE_METERS
+        self._canvas_opening_targets: dict[str, CanvasOpeningTarget] = {}
+        self._selected_canvas_opening_key: str | None = None
+        self._canvas_opening_edit_drag: _CanvasOpeningEditDrag | None = None
+        self._canvas_opening_gizmo_items: list[GLGraphicsItem] = []
         self.object_transform_status_label: QLabel | None = None
         self._window_wall_targets: dict[str, FixedSurface] = {}
         self._selected_window_wall_surface_id: str | None = None
@@ -2510,6 +2594,7 @@ class GlbViewerWidget(QWidget):
         if normalized_id is not None and normalized_id not in self._window_wall_targets:
             return False
         if normalized_id is not None:
+            self._set_selected_canvas_opening_key(None)
             self._set_selected_placed_object(None)
         if normalized_id == self._selected_window_wall_surface_id:
             return False
@@ -2541,6 +2626,98 @@ class GlbViewerWidget(QWidget):
         self._window_undo_available = bool(available)
         self._sync_window_undo_button()
 
+    # ### Canvas opening edit API ###
+    def set_canvas_opening_targets(
+        self,
+        targets: tuple[CanvasOpeningTarget, ...],
+    ) -> None:
+        """Replace the explicit hole-plane targets available for 3D editing."""
+
+        if not self._window_editing_enabled:
+            return
+        if not isinstance(targets, tuple):
+            raise TypeError("Canvas opening targets must be supplied as a tuple.")
+
+        normalized_targets: dict[str, CanvasOpeningTarget] = {}
+        for target in targets:
+            if not isinstance(target, CanvasOpeningTarget):
+                raise TypeError(
+                    "Canvas opening targets must contain CanvasOpeningTarget values."
+                )
+            if target.key in normalized_targets:
+                raise ValueError(f"Duplicate Canvas opening target: {target.key!r}.")
+            normalized_targets[target.key] = target
+
+        self._cancel_canvas_opening_edit_drag()
+        selected_key = self._selected_canvas_opening_key
+        self._canvas_opening_targets = normalized_targets
+        if selected_key not in normalized_targets:
+            self._set_selected_canvas_opening_key(None)
+            return
+        self._refresh_canvas_opening_gizmo_items()
+
+    def get_selected_canvas_opening_reference(
+        self,
+    ) -> CanvasOpeningReference | None:
+        """Return the selected doorway/window identity, if it still exists."""
+
+        target = self._get_selected_canvas_opening_target()
+        return None if target is None else target.reference
+
+    def select_canvas_opening(
+        self,
+        reference: CanvasOpeningReference | None,
+    ) -> bool:
+        """Select one explicit opening target, or clear its editing gizmos."""
+
+        if not self._window_editing_enabled:
+            return False
+        if reference is None:
+            return self._set_selected_canvas_opening_key(None)
+        if not isinstance(reference, CanvasOpeningReference):
+            raise TypeError("Canvas opening selection requires an opening reference.")
+        target = self._canvas_opening_targets.get(reference.key)
+        if target is None:
+            return False
+        return self._set_selected_canvas_opening_key(target.key)
+
+    def _get_selected_canvas_opening_target(
+        self,
+    ) -> CanvasOpeningTarget | None:
+        target = self._canvas_opening_targets.get(
+            self._selected_canvas_opening_key or ""
+        )
+        return target if isinstance(target, CanvasOpeningTarget) else None
+
+    def _set_selected_canvas_opening_key(self, key: str | None) -> bool:
+        normalized_key = None if key is None else str(key)
+        if normalized_key is not None and normalized_key not in (
+            self._canvas_opening_targets
+        ):
+            return False
+        if normalized_key == self._selected_canvas_opening_key:
+            return False
+
+        self._cancel_canvas_opening_edit_drag()
+        self._selected_canvas_opening_key = normalized_key
+        if normalized_key is not None:
+            if self.is_window_placement_active():
+                self.cancel_window_placement(status_message=None)
+            self._set_selected_placed_object(None)
+            self._selected_window_wall_surface_id = None
+            self._refresh_window_selection_outline()
+        self._sync_window_tools_controls()
+        if normalized_key is not None:
+            self._set_window_tools_status(
+                "Drag a side handle to resize or the center anchor to move."
+            )
+        self._refresh_canvas_opening_gizmo_items()
+        target = self._get_selected_canvas_opening_target()
+        self.canvas_opening_selection_changed.emit(
+            None if target is None else target.reference
+        )
+        return True
+
     # ### Placed-object transform API ###
     def get_selected_placed_object_id(self) -> str | None:
         """Return the stable ID currently controlled by the Canvas gizmo."""
@@ -2550,6 +2727,10 @@ class GlbViewerWidget(QWidget):
     def _handle_view_delete_requested(self) -> None:
         """Route Delete to Canvas placement removal or the generic consumer."""
 
+        if self._get_selected_canvas_opening_target() is not None:
+            # Openings are structural edits. Delete must never fall through to
+            # an unrelated face/object consumer merely because one is selected.
+            return
         selected_id = self._selected_placed_object_id
         if (
             self._placed_object_editing_enabled
@@ -2571,6 +2752,7 @@ class GlbViewerWidget(QWidget):
         ):
             return False
         if normalized_id is not None:
+            self._set_selected_canvas_opening_key(None)
             self.select_wall_target(None)
         return self._set_selected_placed_object(normalized_id)
 
@@ -2595,6 +2777,7 @@ class GlbViewerWidget(QWidget):
             return False
 
         self._set_selected_placed_object(None)
+        self._set_selected_canvas_opening_key(None)
         self._window_drag_first_world = None
         self._window_preview_placement = None
         self._window_preview_is_valid = False
@@ -2648,22 +2831,22 @@ class GlbViewerWidget(QWidget):
         )
 
     def _connect_placed_object_editor_input(self) -> None:
-        """Connect Canvas-only pointer events used by transform gizmos."""
+        """Connect Canvas-only pointer events used by 3D editing gizmos."""
 
         self.view.primary_pointer_pressed.connect(
             self._handle_placed_object_pointer_pressed
         )
         self.view.primary_pointer_moved.connect(
-            self._update_placed_object_gizmo_drag
+            self._handle_canvas_gizmo_pointer_moved
         )
         self.view.primary_pointer_released.connect(
-            self._finish_placed_object_gizmo_drag
+            self._handle_canvas_gizmo_pointer_released
         )
         self.view.primary_pointer_cancel_requested.connect(
-            self._cancel_placed_object_gizmo_drag
+            self._cancel_canvas_gizmo_drag
         )
         self.navigation_mode_changed.connect(
-            self._cancel_placed_object_gizmo_drag
+            self._cancel_canvas_gizmo_drag
         )
 
     def _handle_add_window_button_toggled(self, checked: bool) -> None:
@@ -2686,10 +2869,16 @@ class GlbViewerWidget(QWidget):
             return
         camera_ray = self.view.build_camera_ray(position)
         if camera_ray is None:
+            self._set_selected_canvas_opening_key(None)
             self._set_selected_placed_object(None)
             self.select_wall_target(None)
             return
         ray_origin, ray_direction = camera_ray
+        opening_hit = _get_nearest_canvas_opening_ray_hit(
+            tuple(self._canvas_opening_targets.values()),
+            ray_origin,
+            ray_direction,
+        )
         object_hit = _get_nearest_preview_placed_object_ray_hit(
             tuple(
                 group.preview
@@ -2703,11 +2892,26 @@ class GlbViewerWidget(QWidget):
             ray_origin,
             ray_direction,
         )
-        if object_hit is not None and (
-            wall_hit is None or object_hit[2] <= wall_hit[2] + 1e-9
+        visible_object_hit = object_hit
+        if (
+            object_hit is not None
+            and wall_hit is not None
+            and object_hit[2] > wall_hit[2] + 1e-9
         ):
-            self.select_placed_object(object_hit[0].object_id)
+            visible_object_hit = None
+        if (
+            opening_hit is not None
+            and (
+                visible_object_hit is None
+                or opening_hit[2] <= visible_object_hit[2] + 1e-9
+            )
+        ):
+            self.select_canvas_opening(opening_hit[0].reference)
             return
+        if visible_object_hit is not None:
+            self.select_placed_object(visible_object_hit[0].object_id)
+            return
+        self._set_selected_canvas_opening_key(None)
         self._set_selected_placed_object(None)
         self.select_wall_target(
             None if wall_hit is None else wall_hit[0].surface_id
@@ -2724,10 +2928,38 @@ class GlbViewerWidget(QWidget):
         camera_ray = self.view.build_camera_ray(position)
         if camera_ray is None:
             return
+        opening_handle = self._pick_canvas_opening_gizmo_handle(*camera_ray)
+        if opening_handle is not None:
+            self._begin_canvas_opening_gizmo_drag(opening_handle, position)
+            return
         handle = self._pick_transform_gizmo_handle(*camera_ray)
         if handle is None:
             return
         self._begin_placed_object_gizmo_drag(handle, position)
+
+    def _handle_canvas_gizmo_pointer_moved(self, position: QPointF) -> None:
+        """Update the one Canvas gizmo that currently owns the pointer."""
+
+        if self._canvas_opening_edit_drag is not None:
+            self._update_canvas_opening_gizmo_drag(position)
+            return
+        self._update_placed_object_gizmo_drag(position)
+
+    def _handle_canvas_gizmo_pointer_released(self, position: QPointF) -> None:
+        """Finish the one Canvas gizmo that currently owns the pointer."""
+
+        if self._canvas_opening_edit_drag is not None:
+            self._finish_canvas_opening_gizmo_drag(position)
+            return
+        self._finish_placed_object_gizmo_drag(position)
+
+    def _cancel_canvas_gizmo_drag(self, *_args: object) -> None:
+        """Cancel opening or placed-object edits before navigation resumes."""
+
+        if self._canvas_opening_edit_drag is not None:
+            self._cancel_canvas_opening_edit_drag()
+            return
+        self._cancel_placed_object_gizmo_drag()
 
     def _handle_window_pointer_pressed(self, position: QPointF) -> None:
         surface = self._get_selected_window_wall()
@@ -3062,6 +3294,7 @@ class GlbViewerWidget(QWidget):
 
     def set_model(self, model: GeneratedModel, preserve_camera: bool = False) -> None:
         self.view.cancel_transient_pointer_interactions()
+        self._cancel_canvas_opening_edit_drag()
         self._cancel_placed_object_gizmo_drag()
         self.clear_face_edit_geometry()
         if self._window_editing_enabled:
@@ -3080,9 +3313,11 @@ class GlbViewerWidget(QWidget):
 
     def clear_model(self) -> None:
         self.view.cancel_transient_pointer_interactions()
+        self._cancel_canvas_opening_edit_drag()
         self._cancel_placed_object_gizmo_drag()
         self.clear_face_edit_geometry()
         self._selected_placed_object_id = None
+        self._set_selected_canvas_opening_key(None)
         if self._window_editing_enabled:
             self.cancel_window_placement(status_message=None)
         self._texture_edit_mask = None
@@ -4279,6 +4514,7 @@ class GlbViewerWidget(QWidget):
         if self.model is None:
             self._set_default_camera()
             self._refresh_window_selection_outline()
+            self._refresh_canvas_opening_gizmo_items()
             self._refresh_doorway_preview_outline_item()
             return
 
@@ -4367,6 +4603,7 @@ class GlbViewerWidget(QWidget):
         self._set_default_first_person_camera_pose_from_bounding_box(bounding_box)
         self.view.apply_navigation_camera()
         self._refresh_window_selection_outline()
+        self._refresh_canvas_opening_gizmo_items()
         self._sync_placed_object_selection_rendering()
         self._refresh_doorway_preview_outline_item()
         self.view.update()
@@ -4563,6 +4800,300 @@ class GlbViewerWidget(QWidget):
             textured_item=textured_item,
             mesh_item=mesh_item,
         )
+
+    # ### Canvas opening selection and gizmo rendering ###
+    def _refresh_canvas_opening_gizmo_items(self) -> None:
+        """Draw one selected outline, four side handles, and its anchor."""
+
+        self._remove_canvas_opening_gizmo_items()
+        target = self._get_selected_canvas_opening_target()
+        drag = self._canvas_opening_edit_drag
+        if (
+            drag is not None
+            and drag.start_target.key == self._selected_canvas_opening_key
+        ):
+            target = drag.preview_target
+        if target is None or not hasattr(self, "view"):
+            if hasattr(self, "view"):
+                self.view.update()
+            return
+
+        corners = np.asarray(target.get_world_corners(), dtype=float)
+        display_corners = _offset_points_toward_camera(
+            corners,
+            target.wall_normal_world,
+            self.view.cameraPosition(),
+            WINDOW_PREVIEW_OFFSET_METERS * 2.0,
+        )
+        outline_color = (
+            CANVAS_OPENING_PREVIEW_COLOR
+            if drag is not None
+            else CANVAS_OPENING_SELECTION_COLOR
+        )
+        outline_item = gl.GLLinePlotItem(
+            pos=np.vstack((display_corners, display_corners[:1])),
+            color=outline_color,
+            width=CANVAS_OPENING_OUTLINE_WIDTH,
+            antialias=True,
+            mode="line_strip",
+        )
+        self._add_canvas_opening_overlay_item(outline_item)
+
+        side_positions = np.asarray(
+            tuple(
+                target.local_to_world(*local_position)
+                for _side, local_position in (
+                    _get_canvas_opening_side_local_positions(target)
+                )
+            ),
+            dtype=float,
+        )
+        display_side_positions = _offset_points_toward_camera(
+            side_positions,
+            target.wall_normal_world,
+            self.view.cameraPosition(),
+            WINDOW_PREVIEW_OFFSET_METERS * 2.0,
+        )
+        side_item = gl.GLScatterPlotItem(
+            pos=display_side_positions,
+            color=CANVAS_OPENING_SIDE_COLOR,
+            size=CANVAS_OPENING_SIDE_SIZE_PIXELS,
+            pxMode=True,
+        )
+        self._add_canvas_opening_overlay_item(side_item)
+
+        center = np.asarray(target.get_world_center(), dtype=float)
+        display_center = _offset_points_toward_camera(
+            center[np.newaxis, :],
+            target.wall_normal_world,
+            self.view.cameraPosition(),
+            WINDOW_PREVIEW_OFFSET_METERS * 2.0,
+        )
+        anchor_item = gl.GLScatterPlotItem(
+            pos=display_center,
+            color=CANVAS_OPENING_ANCHOR_COLOR,
+            size=CANVAS_OPENING_ANCHOR_SIZE_PIXELS,
+            pxMode=True,
+        )
+        self._add_canvas_opening_overlay_item(anchor_item)
+        self.view.update()
+
+    def _add_canvas_opening_overlay_item(
+        self,
+        item: GLGraphicsItem,
+    ) -> None:
+        """Render one opening control last and without wall depth occlusion."""
+
+        item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+        item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE)
+        self.view.addItem(item)
+        self._canvas_opening_gizmo_items.append(item)
+
+    def _remove_canvas_opening_gizmo_items(self) -> None:
+        if not hasattr(self, "view"):
+            self._canvas_opening_gizmo_items = []
+            return
+        for item in self._canvas_opening_gizmo_items:
+            if item in self.view.items:
+                self.view.removeItem(item)
+        self._canvas_opening_gizmo_items = []
+
+    def _pick_canvas_opening_gizmo_handle(
+        self,
+        ray_origin: object,
+        ray_direction: object,
+    ) -> _CanvasOpeningGizmoHandle | None:
+        """Return the nearest screen-sized handle under one camera ray."""
+
+        target = self._get_selected_canvas_opening_target()
+        origin, direction = _normalize_ray(ray_origin, ray_direction)
+        if target is None or origin is None or direction is None:
+            return None
+
+        candidates: list[
+            tuple[float, float, int, _CanvasOpeningGizmoHandle]
+        ] = []
+        for side, local_position in _get_canvas_opening_side_local_positions(target):
+            side_position = np.asarray(
+                target.local_to_world(*local_position),
+                dtype=float,
+            )
+            hit = _get_ray_point_distance(origin, direction, side_position)
+            if hit is None:
+                continue
+            distance, ray_parameter = hit
+            tolerance = self._get_canvas_opening_handle_hit_radius(
+                target,
+                side_position,
+            )
+            if distance <= tolerance:
+                candidates.append(
+                    (
+                        distance / max(tolerance, 1e-12),
+                        ray_parameter,
+                        0,
+                        _CanvasOpeningGizmoHandle(
+                            CANVAS_OPENING_GIZMO_SIDE,
+                            side,
+                        ),
+                    )
+                )
+
+        center = np.asarray(target.get_world_center(), dtype=float)
+        center_hit = _get_ray_point_distance(origin, direction, center)
+        if center_hit is not None:
+            distance, ray_parameter = center_hit
+            tolerance = self._get_canvas_opening_handle_hit_radius(target, center)
+            if distance <= tolerance:
+                candidates.append(
+                    (
+                        distance / max(tolerance, 1e-12),
+                        ray_parameter,
+                        1,
+                        _CanvasOpeningGizmoHandle(
+                            CANVAS_OPENING_GIZMO_ANCHOR,
+                        ),
+                    )
+                )
+        if not candidates:
+            return None
+        return min(candidates, key=lambda candidate: candidate[:3])[3]
+
+    def _get_canvas_opening_handle_hit_radius(
+        self,
+        target: CanvasOpeningTarget,
+        world_point: object,
+    ) -> float:
+        point = np.asarray(world_point, dtype=float)
+        try:
+            pixel_size = float(
+                self.view.pixelSize(
+                    QVector3D(*[float(value) for value in point])
+                )
+            )
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            pixel_size = 0.0
+        if math.isfinite(pixel_size) and pixel_size > 0.0:
+            return max(
+                CANVAS_OPENING_HANDLE_MIN_HIT_RADIUS_METERS,
+                pixel_size * CANVAS_OPENING_HANDLE_HIT_RADIUS_PIXELS,
+            )
+        fallback = min(target.wall_width_meters, target.wall_height_meters) * 0.025
+        return max(CANVAS_OPENING_HANDLE_MIN_HIT_RADIUS_METERS, fallback)
+
+    # ### Canvas opening gizmo dragging ###
+    def _begin_canvas_opening_gizmo_drag(
+        self,
+        handle: _CanvasOpeningGizmoHandle,
+        position: QPointF,
+    ) -> bool:
+        """Reserve primary input and snapshot one selected opening edit."""
+
+        target = self._get_selected_canvas_opening_target()
+        camera_ray = self.view.build_camera_ray(position)
+        if target is None or camera_ray is None:
+            return False
+        ray_origin, ray_direction = camera_ray
+        hit = _intersect_ray_with_plane(
+            ray_origin,
+            ray_direction,
+            target.plane_start_world,
+            target.wall_normal_world,
+        )
+        if hit is None:
+            return False
+        pointer_local = target.world_to_local(hit)
+        handle_local = _get_canvas_opening_handle_local_position(target, handle)
+        pointer_offset = (
+            handle_local[0] - pointer_local[0],
+            handle_local[1] - pointer_local[1],
+        )
+        self._canvas_opening_edit_drag = _CanvasOpeningEditDrag(
+            start_target=target,
+            preview_target=target,
+            handle=handle,
+            pointer_offset_local=pointer_offset,
+            last_emitted_bounds=target.bounds,
+        )
+        self.view.reserve_primary_pointer_drag()
+        self._refresh_canvas_opening_gizmo_items()
+        self.canvas_opening_edit_started.emit(_build_canvas_opening_edit(target))
+        return True
+
+    def _update_canvas_opening_gizmo_drag(self, position: QPointF) -> bool:
+        """Project a pointer onto the opening wall and emit clamped live bounds."""
+
+        drag = self._canvas_opening_edit_drag
+        camera_ray = self.view.build_camera_ray(position)
+        if drag is None or camera_ray is None:
+            return False
+        target = drag.start_target
+        ray_origin, ray_direction = camera_ray
+        hit = _intersect_ray_with_plane(
+            ray_origin,
+            ray_direction,
+            target.plane_start_world,
+            target.wall_normal_world,
+        )
+        if hit is None:
+            return False
+        pointer_local = target.world_to_local(hit)
+        requested_local = (
+            pointer_local[0] + drag.pointer_offset_local[0],
+            pointer_local[1] + drag.pointer_offset_local[1],
+        )
+        bounds = _build_dragged_canvas_opening_bounds(
+            target,
+            drag.handle,
+            requested_local,
+        )
+        drag.preview_target = target.with_bounds(bounds)
+        self._refresh_canvas_opening_gizmo_items()
+        if bounds == drag.last_emitted_bounds:
+            return False
+        drag.last_emitted_bounds = bounds
+        self.canvas_opening_edit_preview_changed.emit(
+            _build_canvas_opening_edit(drag.preview_target)
+        )
+        return True
+
+    def _finish_canvas_opening_gizmo_drag(self, position: QPointF) -> bool:
+        """Commit the live viewer baseline and emit exactly one release event."""
+
+        drag = self._canvas_opening_edit_drag
+        if drag is None:
+            return False
+        self._update_canvas_opening_gizmo_drag(position)
+        final_target = drag.preview_target
+        changed = final_target.bounds != drag.start_target.bounds
+        if changed:
+            self._canvas_opening_targets[final_target.key] = final_target
+        else:
+            self._canvas_opening_targets[drag.start_target.key] = drag.start_target
+            final_target = drag.start_target
+        self._canvas_opening_edit_drag = None
+        self.view.release_primary_pointer_drag()
+        self._refresh_canvas_opening_gizmo_items()
+        self.canvas_opening_edit_finished.emit(
+            _build_canvas_opening_edit(final_target),
+            changed,
+        )
+        return changed
+
+    def _cancel_canvas_opening_edit_drag(self, *_args: object) -> bool:
+        """Restore one opening's starting bounds and release pointer ownership."""
+
+        drag = self._canvas_opening_edit_drag
+        if drag is None:
+            return False
+        self._canvas_opening_edit_drag = None
+        self._canvas_opening_targets[drag.start_target.key] = drag.start_target
+        self.view.release_primary_pointer_drag()
+        self._refresh_canvas_opening_gizmo_items()
+        self.canvas_opening_edit_cancelled.emit(
+            _build_canvas_opening_edit(drag.start_target)
+        )
+        return True
 
     # ### Placed-object selection and gizmo rendering ###
     def _sync_placed_object_selection_rendering(self) -> None:
@@ -5115,6 +5646,7 @@ class GlbViewerWidget(QWidget):
         self._embedded_symmetric_preview_groups = []
         self._placed_object_render_groups = {}
         self._remove_transform_gizmo_items()
+        self._canvas_opening_gizmo_items = []
         self.textured_surface_items = []
         self.textured_wall_items = []
         self.projection_camera_indicator_items = {}
@@ -5706,6 +6238,192 @@ def _world_point_tuple(point: object) -> tuple[float, float, float]:
     return tuple(float(value) for value in raw_point)
 
 
+def _get_nearest_canvas_opening_ray_hit(
+    targets: tuple[CanvasOpeningTarget, ...],
+    ray_origin: object,
+    ray_direction: object,
+) -> tuple[CanvasOpeningTarget, np.ndarray, float] | None:
+    """Pick explicit opening rectangles even though their wall faces are holes."""
+
+    origin, direction = _normalize_ray(ray_origin, ray_direction)
+    if origin is None or direction is None:
+        return None
+    nearest: tuple[CanvasOpeningTarget, np.ndarray, float] | None = None
+    for target in targets:
+        if not isinstance(target, CanvasOpeningTarget):
+            continue
+        hit = _intersect_ray_with_plane(
+            origin,
+            direction,
+            target.plane_start_world,
+            target.wall_normal_world,
+        )
+        if hit is None:
+            continue
+        horizontal_ratio, vertical_ratio = target.world_to_local(hit)
+        bounds = target.bounds
+        if not (
+            bounds.start_ratio - 1e-9
+            <= horizontal_ratio
+            <= bounds.end_ratio + 1e-9
+            and bounds.bottom_ratio - 1e-9
+            <= vertical_ratio
+            <= bounds.top_ratio + 1e-9
+        ):
+            continue
+        distance = float(np.dot(hit - origin, direction))
+        if distance < 0.0:
+            continue
+        if (
+            nearest is None
+            or distance < nearest[2] - 1e-9
+            or (
+                abs(distance - nearest[2]) <= 1e-9
+                and target.key < nearest[0].key
+            )
+        ):
+            nearest = (target, hit, distance)
+    return nearest
+
+
+def _build_canvas_opening_edit(target: CanvasOpeningTarget) -> CanvasOpeningEdit:
+    """Create the immutable domain payload emitted by viewer gizmo signals."""
+
+    return CanvasOpeningEdit(
+        reference=target.reference,
+        wall_surface_id=target.wall_surface_id,
+        bounds=target.bounds,
+    )
+
+
+def _get_canvas_opening_handle_local_position(
+    target: CanvasOpeningTarget,
+    handle: _CanvasOpeningGizmoHandle,
+) -> tuple[float, float]:
+    """Return one handle in normalized wall-local coordinates."""
+
+    bounds = target.bounds
+    if handle.kind == CANVAS_OPENING_GIZMO_ANCHOR:
+        return (
+            (bounds.start_ratio + bounds.end_ratio) * 0.5,
+            (bounds.bottom_ratio + bounds.top_ratio) * 0.5,
+        )
+    assert handle.side is not None
+    return dict(_get_canvas_opening_side_local_positions(target))[handle.side]
+
+
+def _get_canvas_opening_side_local_positions(
+    target: CanvasOpeningTarget,
+) -> tuple[tuple[str, tuple[float, float]], ...]:
+    """Return left, right, bottom, and top handle centers."""
+
+    bounds = target.bounds
+    center_horizontal = (bounds.start_ratio + bounds.end_ratio) * 0.5
+    center_vertical = (bounds.bottom_ratio + bounds.top_ratio) * 0.5
+    return (
+        (
+            CANVAS_OPENING_SIDE_LEFT,
+            (bounds.start_ratio, center_vertical),
+        ),
+        (
+            CANVAS_OPENING_SIDE_RIGHT,
+            (bounds.end_ratio, center_vertical),
+        ),
+        (
+            CANVAS_OPENING_SIDE_BOTTOM,
+            (center_horizontal, bounds.bottom_ratio),
+        ),
+        (
+            CANVAS_OPENING_SIDE_TOP,
+            (center_horizontal, bounds.top_ratio),
+        ),
+    )
+
+
+def _build_dragged_canvas_opening_bounds(
+    target: CanvasOpeningTarget,
+    handle: _CanvasOpeningGizmoHandle,
+    requested_local: tuple[float, float],
+) -> CanvasOpeningBounds:
+    """Clamp anchor motion or move exactly one selected rectangle boundary."""
+
+    bounds = target.bounds
+    requested_horizontal = float(requested_local[0])
+    requested_vertical = float(requested_local[1])
+    if handle.kind == CANVAS_OPENING_GIZMO_ANCHOR:
+        center_horizontal = (bounds.start_ratio + bounds.end_ratio) * 0.5
+        center_vertical = (bounds.bottom_ratio + bounds.top_ratio) * 0.5
+        horizontal_delta = float(
+            np.clip(
+                requested_horizontal - center_horizontal,
+                -bounds.start_ratio,
+                1.0 - bounds.end_ratio,
+            )
+        )
+        vertical_delta = 0.0
+        if target.reference.kind != CANVAS_OPENING_DOORWAY:
+            vertical_delta = float(
+                np.clip(
+                    requested_vertical - center_vertical,
+                    -bounds.bottom_ratio,
+                    1.0 - bounds.top_ratio,
+                )
+            )
+        return CanvasOpeningBounds(
+            start_ratio=bounds.start_ratio + horizontal_delta,
+            end_ratio=bounds.end_ratio + horizontal_delta,
+            bottom_ratio=bounds.bottom_ratio + vertical_delta,
+            top_ratio=bounds.top_ratio + vertical_delta,
+        )
+
+    assert handle.side is not None
+    minimum_horizontal = target.minimum_horizontal_span
+    minimum_vertical = target.minimum_vertical_span
+    start_ratio = bounds.start_ratio
+    end_ratio = bounds.end_ratio
+    bottom_ratio = bounds.bottom_ratio
+    top_ratio = bounds.top_ratio
+    if handle.side == CANVAS_OPENING_SIDE_LEFT:
+        start_ratio = float(
+            np.clip(
+                requested_horizontal,
+                0.0,
+                max(0.0, end_ratio - minimum_horizontal),
+            )
+        )
+    elif handle.side == CANVAS_OPENING_SIDE_RIGHT:
+        end_ratio = float(
+            np.clip(
+                requested_horizontal,
+                min(1.0, start_ratio + minimum_horizontal),
+                1.0,
+            )
+        )
+    elif handle.side == CANVAS_OPENING_SIDE_BOTTOM:
+        bottom_ratio = float(
+            np.clip(
+                requested_vertical,
+                0.0,
+                max(0.0, top_ratio - minimum_vertical),
+            )
+        )
+    else:
+        assert handle.side == CANVAS_OPENING_SIDE_TOP
+        top_ratio = float(
+            np.clip(
+                requested_vertical,
+                min(1.0, bottom_ratio + minimum_vertical),
+                1.0,
+            )
+        )
+    return CanvasOpeningBounds(
+        start_ratio=start_ratio,
+        end_ratio=end_ratio,
+        bottom_ratio=bottom_ratio,
+        top_ratio=top_ratio,
+    )
+
+
 def _get_nearest_fixed_surface_ray_hit(
     surfaces: tuple[FixedSurface, ...],
     ray_origin: object,
@@ -6143,6 +6861,29 @@ def _normalize_ray(
     if origin.shape != (3,) or not np.all(np.isfinite(origin)):
         return None, None
     return origin, direction
+
+
+def _get_ray_point_distance(
+    ray_origin: object,
+    ray_direction: object,
+    point: object,
+) -> tuple[float, float] | None:
+    """Return perpendicular distance and forward parameter to one point."""
+
+    origin, direction = _normalize_ray(ray_origin, ray_direction)
+    raw_point = np.asarray(point, dtype=float)
+    if (
+        origin is None
+        or direction is None
+        or raw_point.shape != (3,)
+        or not np.all(np.isfinite(raw_point))
+    ):
+        return None
+    ray_parameter = float(np.dot(raw_point - origin, direction))
+    if ray_parameter < 0.0:
+        return None
+    nearest_point = origin + direction * ray_parameter
+    return float(np.linalg.norm(raw_point - nearest_point)), ray_parameter
 
 
 def _intersect_ray_with_plane(

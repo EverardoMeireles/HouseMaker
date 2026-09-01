@@ -20,6 +20,7 @@ MAX_FLOOR_THICKNESS_METERS = 10.0
 DEFAULT_DOORWAY_WIDTH_METERS = 0.90
 DEFAULT_DOORWAY_HEIGHT_METERS = 2.10
 DEFAULT_DOORWAY_DEPTH_METERS = 0.20
+DEFAULT_DOORWAY_BOTTOM_HEIGHT_METERS = 0.0
 DOORWAY_SHAPE_RECTANGULAR = "rectangular"
 DOORWAY_SHAPE_ARCH = "arch"
 DOORWAY_SHAPES = frozenset(
@@ -38,6 +39,8 @@ MIN_DOORWAY_HEIGHT_METERS = 0.10
 MAX_DOORWAY_HEIGHT_METERS = 20.0
 MIN_DOORWAY_DEPTH_METERS = 0.01
 MAX_DOORWAY_DEPTH_METERS = 10.0
+MIN_DOORWAY_BOTTOM_HEIGHT_METERS = 0.0
+MAX_DOORWAY_BOTTOM_HEIGHT_METERS = 20.0
 MAX_WINDOW_ID_LENGTH = 128
 MAX_WINDOW_SURFACE_ID_LENGTH = 512
 MIN_WINDOW_RATIO_SPAN = 1e-6
@@ -144,10 +147,14 @@ class DoorwayData:
     rotation_degrees: float = 0.0
     shape: str = DEFAULT_DOORWAY_SHAPE
     arch_amount: float = DEFAULT_DOORWAY_ARCH_AMOUNT
+    bottom_height_meters: float = DEFAULT_DOORWAY_BOTTOM_HEIGHT_METERS
 
     def __post_init__(self) -> None:
         self.shape = normalize_doorway_shape(self.shape)
         self.arch_amount = normalize_doorway_arch_amount(self.arch_amount)
+        self.bottom_height_meters = normalize_doorway_bottom_height_meters(
+            self.bottom_height_meters
+        )
 
 
 @dataclass(frozen=True)
@@ -851,6 +858,30 @@ def normalize_doorway_arch_amount(value: object) -> float:
             f"{MIN_DOORWAY_ARCH_AMOUNT:g} and {MAX_DOORWAY_ARCH_AMOUNT:g}."
         )
     return arch_amount
+
+
+def normalize_doorway_bottom_height_meters(value: object) -> float:
+    """Return a finite non-negative doorway bottom height."""
+
+    if isinstance(value, bool):
+        raise ValueError("Doorway bottom height must be a number.")
+    try:
+        bottom_height = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Doorway bottom height must be a number.") from error
+    if not math.isfinite(bottom_height):
+        raise ValueError("Doorway bottom height must be finite.")
+    if not (
+        MIN_DOORWAY_BOTTOM_HEIGHT_METERS
+        <= bottom_height
+        <= MAX_DOORWAY_BOTTOM_HEIGHT_METERS
+    ):
+        raise ValueError(
+            "Doorway bottom height must be between "
+            f"{MIN_DOORWAY_BOTTOM_HEIGHT_METERS:g} and "
+            f"{MAX_DOORWAY_BOTTOM_HEIGHT_METERS:g} meters."
+        )
+    return bottom_height
 
 
 # ### Window validation helpers ###
