@@ -12,9 +12,16 @@ from urllib.error import HTTPError, URLError
 
 from PIL import Image, features
 
+from housemaker.pbr_maps import (
+    PBR_MAP_METALLIC,
+    PBR_MAP_NORMAL,
+    PBR_MAP_ROUGHNESS,
+    PBR_MAP_TYPES,
+)
 from housemaker.surface_texture_providers import (
     DEFAULT_MESHY_IMAGE_MODEL,
     MESHY_IMAGE_TO_IMAGE_ENDPOINT,
+    MESHY_RETEXTURE_ENDPOINT,
     OPENAI_IMAGE_EDITS_ENDPOINT,
     OPENAI_RESPONSES_ENDPOINT,
     SurfaceTextureProviderSettings,
@@ -22,7 +29,9 @@ from housemaker.surface_texture_providers import (
     SurfaceTextureRequestError,
     SurfaceTextureResult,
     SurfaceTextureTaskError,
+    _align_surface_pbr_primary_region,
     build_meshy_image_to_image_request_body,
+    build_meshy_surface_pbr_request_body,
     build_openai_analysis_request_body,
     build_openai_image_edit_multipart,
     build_openai_responses_request_body,
@@ -116,6 +125,25 @@ def _encoded_image_bytes(
 ) -> bytes:
     output = io.BytesIO()
     Image.new("RGB", (3, 2), color).save(output, format=image_format)
+    return output.getvalue()
+
+
+def _surface_pbr_map_png(
+    primary_color: tuple[int, int, int],
+    support_color: tuple[int, int, int],
+    *,
+    size: int = 20,
+) -> bytes:
+    """Build a square fixture whose right 5% represents helper-face pixels."""
+
+    image = Image.new("RGB", (size, size), primary_color)
+    support_width = max(1, round(size * 0.05))
+    image.paste(
+        support_color,
+        (size - support_width, 0, size, size),
+    )
+    output = io.BytesIO()
+    image.save(output, format="PNG")
     return output.getvalue()
 
 
@@ -223,15 +251,47 @@ class SurfaceTextureValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "prompt"):
             SurfaceTextureRequest((_png_bytes(),), "  ", settings)
 
+    def test_request_normalizes_meshy_pbr_maps_and_rejects_them_for_openai(
+        self,
+    ) -> None:
+        request = SurfaceTextureRequest(
+            (_png_bytes(),),
+            "stone",
+            _meshy_settings(),
+            (PBR_MAP_METALLIC, PBR_MAP_NORMAL, PBR_MAP_NORMAL),
+        )
+
+        self.assertEqual(
+            request.enabled_pbr_maps,
+            (PBR_MAP_NORMAL, PBR_MAP_METALLIC),
+        )
+        with self.assertRaisesRegex(ValueError, "requires the Meshy"):
+            SurfaceTextureRequest(
+                (_png_bytes(),),
+                "stone",
+                _openai_settings("gpt-5.6-luna"),
+                (PBR_MAP_NORMAL,),
+            )
+
     def test_result_contract_has_provider_texture_and_optional_task(self) -> None:
         result = SurfaceTextureResult(
             provider="meshy",
             texture_png=_png_bytes(),
             task_id="task-1",
+            pbr_texture_pngs={
+                PBR_MAP_METALLIC: _png_bytes(3, 3, 3),
+                PBR_MAP_NORMAL: _png_bytes(128, 128, 255),
+            },
+            pbr_task_id="pbr-task-1",
         )
 
         self.assertEqual(result.provider, "meshy")
         self.assertEqual(result.task_id, "task-1")
+        self.assertEqual(
+            result.available_pbr_maps,
+            (PBR_MAP_NORMAL, PBR_MAP_METALLIC),
+        )
+        self.assertEqual(result.pbr_task_id, "pbr-task-1")
 
 # ### Request construction tests ###
 class SurfaceTextureRequestConstructionTests(unittest.TestCase):
@@ -261,6 +321,68 @@ class SurfaceTextureRequestConstructionTests(unittest.TestCase):
             for url in body["reference_image_urls"]
         ]
         self.assertEqual(decoded_images, list(images))
+
+    def test_meshy_surface_pbr_body_uses_isolated_non_overlapping_uvs(
+        self,
+    ) -> None:
+        base_color = _png_bytes(30, 60, 90)
+
+        first_body = build_meshy_surface_pbr_request_body(base_color)
+        second_body = build_meshy_surface_pbr_request_body(base_color)
+
+        self.assertEqual(first_body, second_body)
+        self.assertEqual(first_body["ai_model"], "meshy-6")
+        self.assertTrue(first_body["enable_original_uv"])
+        self.assertTrue(first_body["enable_pbr"])
+        self.assertEqual(first_body["texture_resolution"], "2k")
+        self.assertEqual(first_body["target_formats"], ["glb"])
+        self.assertEqual(
+            base64.b64decode(
+                first_body["image_style_url"].removeprefix(
+                    "data:image/png;base64,"
+                )
+            ),
+            base_color,
+        )
+        slab_glb = base64.b64decode(
+            first_body["model_url"].removeprefix(
+                "data:application/octet-stream;base64,"
+            )
+        )
+        self.assertEqual(slab_glb[:4], b"glTF")
+        json_length = struct.unpack("<I", slab_glb[12:16])[0]
+        self.assertEqual(slab_glb[16:20], b"JSON")
+        document = json.loads(
+            slab_glb[20 : 20 + json_length].decode("utf-8")
+        )
+        primitive = document["meshes"][0]["primitives"][0]
+        position_accessor = document["accessors"][
+            primitive["attributes"]["POSITION"]
+        ]
+        uv_accessor = document["accessors"][
+            primitive["attributes"]["TEXCOORD_0"]
+        ]
+        self.assertEqual(position_accessor["count"], 24)
+        self.assertLess(position_accessor["min"][2], 0.0)
+        self.assertGreater(position_accessor["max"][2], 0.0)
+        self.assertEqual(uv_accessor["min"], [0.0, 0.0])
+        self.assertEqual(uv_accessor["max"], [1.0, 1.0])
+        self.assertEqual(
+            document["accessors"][primitive["indices"]]["count"],
+            36,
+        )
+        binary_offset = 20 + json_length + 8
+        uv_view = document["bufferViews"][uv_accessor["bufferView"]]
+        uv_offset = binary_offset + uv_view.get("byteOffset", 0)
+        uv_values = struct.unpack_from("<48f", slab_glb, uv_offset)
+        uv_pairs = tuple(zip(uv_values[::2], uv_values[1::2]))
+        self.assertEqual(
+            tuple(round(u, 2) for u, _v in uv_pairs[:4]),
+            (0.0, 0.95, 0.95, 0.0),
+        )
+        self.assertTrue(
+            all(round(u, 2) >= 0.95 for u, _v in uv_pairs[4:])
+        )
 
     def test_luna_and_terra_use_responses_image_generation_tool(self) -> None:
         for model in ("gpt-5.6-luna", "gpt-5.6-terra"):
@@ -371,6 +493,305 @@ class MeshySurfaceTextureAdapterTests(unittest.TestCase):
         self.assertIsNone(opener.requests[-1].get_header("Authorization"))
         sent_body = json.loads(opener.requests[0].data.decode("utf-8"))
         self.assertEqual(sent_body["ai_model"], DEFAULT_MESHY_IMAGE_MODEL)
+
+    def test_generic_image_processing_failure_retries_with_backoff(self) -> None:
+        texture_png = _png_bytes(80, 120, 160)
+        opener = SequentialOpener(
+            [
+                _json_bytes({"result": "image-failed"}),
+                _json_bytes(
+                    {
+                        "status": "FAILED",
+                        "progress": 25,
+                        "task_error": {
+                            "type": "invalid_input",
+                            "code": "invalid_input",
+                            "message": (
+                                "The input file or parameters could not be "
+                                "processed. Please check your input and try "
+                                "again."
+                            ),
+                        },
+                    }
+                ),
+                _json_bytes({"result": "image-recovered"}),
+                _json_bytes(
+                    {
+                        "status": "SUCCEEDED",
+                        "progress": 100,
+                        "image_urls": ["https://assets.meshy.ai/recovered.png"],
+                    }
+                ),
+                texture_png,
+            ]
+        )
+        sleeps: list[float] = []
+        updates: list[tuple[str, int]] = []
+
+        result = request_surface_texture(
+            "meshy",
+            "msy-secret",
+            (_png_bytes(),),
+            "warm plaster",
+            opener=opener,
+            sleep=sleeps.append,
+            progress_callback=lambda status, progress: updates.append(
+                (status, progress)
+            ),
+        )
+
+        self.assertEqual(result.task_id, "image-recovered")
+        self.assertEqual(result.texture_png, texture_png)
+        self.assertEqual(sleeps, [5.0])
+        self.assertIn(("RETRYING_1", 25), updates)
+        self.assertEqual(
+            [progress for _status, progress in updates],
+            sorted(progress for _status, progress in updates),
+        )
+
+    def test_pbr_server_failure_retries_without_repeating_image_stage(
+        self,
+    ) -> None:
+        style_png = _png_bytes(20, 40, 60)
+        normal_png = _png_bytes(128, 128, 255)
+        roughness_png = _png_bytes(180, 180, 180)
+        metallic_png = _png_bytes(5, 5, 5)
+        texture_urls = {
+            "base_color": "https://assets.meshy.ai/final-base.png",
+            PBR_MAP_NORMAL: "https://assets.meshy.ai/final-normal.png",
+            PBR_MAP_ROUGHNESS: "https://assets.meshy.ai/final-roughness.png",
+            PBR_MAP_METALLIC: "https://assets.meshy.ai/final-metallic.png",
+        }
+        opener = SequentialOpener(
+            [
+                _json_bytes({"result": "image-task"}),
+                _json_bytes(
+                    {
+                        "status": "SUCCEEDED",
+                        "progress": 100,
+                        "image_urls": ["https://assets.meshy.ai/style.png"],
+                    }
+                ),
+                style_png,
+                _json_bytes({"result": "pbr-failed"}),
+                _json_bytes(
+                    {
+                        "status": "FAILED",
+                        "progress": 30,
+                        "task_error": {
+                            "type": "server_error",
+                            "message": "An unexpected error occurred.",
+                        },
+                    }
+                ),
+                _json_bytes({"result": "pbr-recovered"}),
+                _json_bytes(
+                    {
+                        "status": "SUCCEEDED",
+                        "progress": 100,
+                        "texture_urls": [texture_urls],
+                    }
+                ),
+                normal_png,
+                roughness_png,
+                metallic_png,
+            ]
+        )
+        sleeps: list[float] = []
+
+        result = request_surface_texture(
+            "meshy",
+            "msy-secret",
+            (_png_bytes(),),
+            "warm stone",
+            enabled_pbr_maps=(PBR_MAP_NORMAL,),
+            opener=opener,
+            sleep=sleeps.append,
+        )
+
+        self.assertEqual(result.task_id, "image-task")
+        self.assertEqual(result.pbr_task_id, "pbr-recovered")
+        self.assertEqual(result.texture_png, style_png)
+        self.assertEqual(sleeps, [5.0])
+        image_posts = [
+            request
+            for request in opener.requests
+            if request.full_url == MESHY_IMAGE_TO_IMAGE_ENDPOINT
+        ]
+        pbr_posts = [
+            request
+            for request in opener.requests
+            if request.full_url == MESHY_RETEXTURE_ENDPOINT
+        ]
+        self.assertEqual(len(image_posts), 1)
+        self.assertEqual(len(pbr_posts), 2)
+
+    def test_pbr_generation_retextures_a_slab_and_downloads_aligned_maps(
+        self,
+    ) -> None:
+        style_png = _png_bytes(20, 40, 60)
+        normal_png = _surface_pbr_map_png(
+            (128, 128, 255),
+            (255, 0, 255),
+        )
+        roughness_png = _png_bytes(180, 180, 180)
+        metallic_png = _png_bytes(5, 5, 5)
+        texture_urls = {
+            "base_color": "https://assets.meshy.ai/final-base.png",
+            PBR_MAP_NORMAL: "https://assets.meshy.ai/final-normal.png",
+            PBR_MAP_ROUGHNESS: "https://assets.meshy.ai/final-roughness.png",
+            PBR_MAP_METALLIC: "https://assets.meshy.ai/final-metallic.png",
+        }
+        opener = SequentialOpener(
+            [
+                _json_bytes({"result": "image-task"}),
+                _json_bytes(
+                    {
+                        "status": "SUCCEEDED",
+                        "progress": 100,
+                        "image_urls": ["https://assets.meshy.ai/style.png"],
+                    }
+                ),
+                style_png,
+                _json_bytes({"result": "pbr-task"}),
+                _json_bytes({"status": "PENDING", "progress": 0}),
+                _json_bytes(
+                    {
+                        "status": "SUCCEEDED",
+                        "progress": 100,
+                        "texture_urls": [texture_urls],
+                    }
+                ),
+                normal_png,
+                roughness_png,
+                metallic_png,
+            ]
+        )
+        updates: list[tuple[str, int]] = []
+
+        result = request_surface_texture(
+            "meshy",
+            "msy-secret",
+            (_png_bytes(),),
+            "warm stone",
+            enabled_pbr_maps=(PBR_MAP_NORMAL,),
+            opener=opener,
+            sleep=lambda _seconds: None,
+            progress_callback=lambda status, progress: updates.append(
+                (status, progress)
+            ),
+        )
+
+        self.assertEqual(result.task_id, "image-task")
+        self.assertEqual(result.pbr_task_id, "pbr-task")
+        self.assertEqual(result.texture_png, style_png)
+        self.assertEqual(result.available_pbr_maps, PBR_MAP_TYPES)
+        self.assertEqual(result.pbr_texture_pngs[PBR_MAP_ROUGHNESS], roughness_png)
+        self.assertEqual(result.pbr_texture_pngs[PBR_MAP_METALLIC], metallic_png)
+        with Image.open(
+            io.BytesIO(result.pbr_texture_pngs[PBR_MAP_NORMAL])
+        ) as isolated_normal:
+            isolated_normal.load()
+            self.assertEqual(isolated_normal.size, (20, 20))
+            self.assertEqual(
+                isolated_normal.convert("RGB").getpixel((19, 10)),
+                (127, 128, 255),
+            )
+        self.assertEqual(
+            [request.full_url for request in opener.requests],
+            [
+                MESHY_IMAGE_TO_IMAGE_ENDPOINT,
+                f"{MESHY_IMAGE_TO_IMAGE_ENDPOINT}/image-task",
+                "https://assets.meshy.ai/style.png",
+                MESHY_RETEXTURE_ENDPOINT,
+                f"{MESHY_RETEXTURE_ENDPOINT}/pbr-task",
+                f"{MESHY_RETEXTURE_ENDPOINT}/pbr-task",
+                *(texture_urls[map_type] for map_type in PBR_MAP_TYPES),
+            ],
+        )
+        retexture_body = json.loads(opener.requests[3].data.decode("utf-8"))
+        self.assertEqual(retexture_body["ai_model"], "meshy-6")
+        self.assertEqual(
+            base64.b64decode(
+                retexture_body["image_style_url"].removeprefix(
+                    "data:image/png;base64,"
+                )
+            ),
+            style_png,
+        )
+        self.assertEqual(updates[-1], ("SUCCEEDED", 100))
+        self.assertEqual(
+            [progress for _status, progress in updates],
+            sorted(progress for _status, progress in updates),
+        )
+
+    def test_surface_pbr_alignment_mirrors_pixels_and_normal_tangent_x(
+        self,
+    ) -> None:
+        source = Image.new("RGBA", (20, 10), (0, 0, 0, 255))
+        source.paste((32, 70, 220, 255), (0, 0, 9, 10))
+        source.paste((210, 90, 180, 255), (9, 0, 19, 10))
+        source.paste((255, 0, 255, 255), (19, 0, 20, 10))
+        payload = io.BytesIO()
+        source.save(payload, format="PNG")
+
+        aligned_normal = _align_surface_pbr_primary_region(
+            payload.getvalue(),
+            map_type=PBR_MAP_NORMAL,
+            label="normal fixture",
+        )
+
+        with Image.open(io.BytesIO(aligned_normal)) as aligned:
+            aligned.load()
+            rgba = aligned.convert("RGBA")
+            self.assertEqual(rgba.getpixel((0, 5)), (45, 90, 180, 255))
+            self.assertEqual(rgba.getpixel((19, 5)), (223, 70, 220, 255))
+
+    def test_pbr_generation_fails_if_a_requested_map_is_missing(self) -> None:
+        opener = SequentialOpener(
+            [
+                _json_bytes({"result": "image-task"}),
+                _json_bytes(
+                    {
+                        "status": "SUCCEEDED",
+                        "progress": 100,
+                        "image_urls": ["https://assets.meshy.ai/style.png"],
+                    }
+                ),
+                _png_bytes(),
+                _json_bytes({"result": "pbr-task"}),
+                _json_bytes(
+                    {
+                        "status": "SUCCEEDED",
+                        "progress": 100,
+                        "texture_urls": [
+                            {
+                                "base_color": (
+                                    "https://assets.meshy.ai/base.png"
+                                ),
+                                PBR_MAP_ROUGHNESS: (
+                                    "https://assets.meshy.ai/roughness.png"
+                                ),
+                            }
+                        ],
+                    }
+                ),
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            SurfaceTextureTaskError,
+            "omitted requested maps: normal",
+        ):
+            request_surface_texture(
+                "meshy",
+                "msy-secret",
+                (_png_bytes(),),
+                "stone",
+                enabled_pbr_maps=(PBR_MAP_NORMAL,),
+                opener=opener,
+                sleep=lambda _seconds: None,
+            )
 
     def test_jpeg_and_webp_artifacts_are_safely_normalized_to_png(self) -> None:
         fixture_formats = [("JPEG", "image/jpeg", "texture.jpg")]
@@ -515,7 +936,13 @@ class MeshySurfaceTextureAdapterTests(unittest.TestCase):
                         "status": "FAILED",
                         "progress": 20,
                         "task_error": {
-                            "message": f"bad reference for {api_key}"
+                            "type": "invalid_input",
+                            "code": "bad_reference",
+                            "message": f"bad reference for {api_key}",
+                            "doc_url": (
+                                "https://docs.meshy.ai/en/api/errors"
+                                "#invalid-input"
+                            ),
                         },
                     }
                 ),
@@ -533,6 +960,13 @@ class MeshySurfaceTextureAdapterTests(unittest.TestCase):
             )
         self.assertIn("[redacted]", str(failed.exception))
         self.assertNotIn(api_key, str(failed.exception))
+        self.assertFalse(failed.exception.retryable)
+        self.assertEqual(failed.exception.error_type, "invalid_input")
+        self.assertEqual(failed.exception.error_code, "bad_reference")
+        self.assertEqual(
+            failed.exception.doc_url,
+            "https://docs.meshy.ai/en/api/errors#invalid-input",
+        )
 
         http_opener = SequentialOpener(
             [
@@ -540,9 +974,20 @@ class MeshySurfaceTextureAdapterTests(unittest.TestCase):
                     MESHY_IMAGE_TO_IMAGE_ENDPOINT,
                     429,
                     f"limited {api_key}",
-                )
+                ),
+                _http_error(
+                    MESHY_IMAGE_TO_IMAGE_ENDPOINT,
+                    429,
+                    f"limited {api_key}",
+                ),
+                _http_error(
+                    MESHY_IMAGE_TO_IMAGE_ENDPOINT,
+                    429,
+                    f"limited {api_key}",
+                ),
             ]
         )
+        retry_sleeps: list[float] = []
         with self.assertRaises(SurfaceTextureRequestError) as rejected:
             request_surface_texture(
                 "meshy",
@@ -550,10 +995,13 @@ class MeshySurfaceTextureAdapterTests(unittest.TestCase):
                 (_png_bytes(),),
                 "stone",
                 opener=http_opener,
+                sleep=retry_sleeps.append,
             )
         self.assertEqual(rejected.exception.status_code, 429)
         self.assertTrue(rejected.exception.retryable)
         self.assertNotIn(api_key, str(rejected.exception))
+        self.assertEqual(retry_sleeps, [5.0, 15.0])
+        self.assertEqual(len(http_opener.requests), 3)
 
 
 # ### OpenAI adapter tests ###

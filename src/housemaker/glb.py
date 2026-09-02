@@ -5,8 +5,8 @@ import copy
 import math
 import os
 from io import BytesIO
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from itertools import permutations
 from pathlib import Path
 
@@ -103,6 +103,9 @@ SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION = {
     "vertical": 0,
     "horizontal": 2,
 }
+NAMED_MESH_ROLE_SURFACE = "surface"
+NAMED_MESH_ROLE_OPENING_REVEAL = "opening_reveal"
+NAMED_MESH_ROLE_STAIR = "stair"
 
 # ### Module state ###
 _fallback_qt_application: QGuiApplication | None = None
@@ -260,6 +263,7 @@ class NamedMesh:
     source_transform: np.ndarray = field(
         default_factory=lambda: np.eye(4, dtype=float)
     )
+    export_role: str = NAMED_MESH_ROLE_SURFACE
 
 
 @dataclass(frozen=True)
@@ -475,24 +479,32 @@ def convert_to_glb(
     level_source: VertexData | Sequence[LevelData],
     wall_height_meters: float = DEFAULT_WALL_HEIGHT_METERS,
     blueprint_size_pixels: tuple[float, float] | None = None,
-    surface_materials: (
-        Mapping[str, bytes | bytearray | memoryview | str | Path] | None
-    ) = None,
+    surface_materials: Mapping[str, object] | None = None,
     surface_texture_world_size_meters: float = 2.0,
     stairs: Sequence[StairData] = (),
+    export_untextured_surfaces: bool = True,
 ) -> GeneratedModel:
-    """Build an export-ready house model and serialize its GLB payload."""
+    """Build an export-ready house model and serialize its GLB payload.
+
+    ``export_untextured_surfaces=False`` removes only semantic walls, floors,
+    and ceilings without a Surface texture from the serialized scene. Preview
+    geometry and non-surface meshes such as stairs remain unchanged.
+    """
+
+    if not isinstance(export_untextured_surfaces, bool):
+        raise TypeError("The untextured-surface export option must be boolean.")
 
     return _build_blueprint_model(
         level_source=level_source,
         wall_height_meters=wall_height_meters,
         blueprint_size_pixels=blueprint_size_pixels,
-        surface_materials=surface_materials,
+        surface_materials=(surface_materials or {}),
         surface_texture_world_size_meters=(
             surface_texture_world_size_meters
         ),
         stairs=stairs,
         serialize_glb=True,
+        export_untextured_surfaces=export_untextured_surfaces,
     )
 
 
@@ -500,9 +512,7 @@ def convert_to_preview_model(
     level_source: VertexData | Sequence[LevelData],
     wall_height_meters: float = DEFAULT_WALL_HEIGHT_METERS,
     blueprint_size_pixels: tuple[float, float] | None = None,
-    surface_materials: (
-        Mapping[str, bytes | bytearray | memoryview | str | Path] | None
-    ) = None,
+    surface_materials: Mapping[str, object] | None = None,
     surface_texture_world_size_meters: float = 2.0,
     stairs: Sequence[StairData] = (),
 ) -> GeneratedModel:
@@ -518,6 +528,7 @@ def convert_to_preview_model(
         ),
         stairs=stairs,
         serialize_glb=False,
+        export_untextured_surfaces=True,
     )
 
 
@@ -527,12 +538,11 @@ def _build_blueprint_model(
     level_source: VertexData | Sequence[LevelData],
     wall_height_meters: float,
     blueprint_size_pixels: tuple[float, float] | None,
-    surface_materials: (
-        Mapping[str, bytes | bytearray | memoryview | str | Path] | None
-    ),
+    surface_materials: Mapping[str, object] | None,
     surface_texture_world_size_meters: float,
     stairs: Sequence[StairData],
     serialize_glb: bool,
+    export_untextured_surfaces: bool,
 ) -> GeneratedModel:
     if isinstance(level_source, VertexData):
         if stairs:
@@ -573,7 +583,7 @@ def _build_blueprint_model(
         glb_bytes=glb_bytes,
         preview_textured_walls=preview_textured_walls,
     )
-    if not surface_materials:
+    if not surface_materials and export_untextured_surfaces:
         return model
     return _apply_surface_materials(
         model=model,
@@ -584,6 +594,7 @@ def _build_blueprint_model(
             surface_texture_world_size_meters
         ),
         serialize_glb=serialize_glb,
+        export_untextured_surfaces=export_untextured_surfaces,
     )
 
 
@@ -936,9 +947,12 @@ def _append_placed_model_scene(
         for source_name in source_scene.geometry
     }
     for source_name, geometry in source_scene.geometry.items():
-        output_scene.geometry[geometry_names[source_name]] = copy.deepcopy(
-            geometry
+        copied_geometry = copy.deepcopy(geometry)
+        copied_geometry.metadata = copy.deepcopy(
+            dict(getattr(copied_geometry, "metadata", {}) or {})
         )
+        copied_geometry.metadata["housemaker_object_id"] = placement.object_id
+        output_scene.geometry[geometry_names[source_name]] = copied_geometry
 
     source_base_frame = source_scene.graph.base_frame
     node_names: dict[object, object] = {source_base_frame: root_name}
@@ -1144,6 +1158,7 @@ def build_stair_meshes(
             NamedMesh(
                 name=_get_stair_object_name(stair_index, stair),
                 mesh=mesh,
+                export_role=NAMED_MESH_ROLE_STAIR,
             )
         )
 
@@ -2282,14 +2297,12 @@ def _apply_surface_materials(
     model: GeneratedModel,
     named_meshes: Sequence[NamedMesh],
     level_source: VertexData | Sequence[LevelData],
-    surface_materials: Mapping[
-        str,
-        bytes | bytearray | memoryview | str | Path,
-    ],
+    surface_materials: Mapping[str, object],
     surface_texture_world_size_meters: float,
     serialize_glb: bool,
+    export_untextured_surfaces: bool,
 ) -> GeneratedModel:
-    """Replace assigned semantic faces with their textured geometry."""
+    """Replace assigned faces and optionally omit unassigned export surfaces."""
 
     if not isinstance(surface_materials, Mapping):
         raise TypeError("Surface materials must be provided as a mapping.")
@@ -2314,7 +2327,7 @@ def _apply_surface_materials(
         for surface_id, source in surface_materials.items()
         if str(surface_id) in known_surface_ids
     }
-    if not live_sources:
+    if not live_sources and export_untextured_surfaces:
         return model
     texture_world_size = normalize_texture_world_size(
         surface_texture_world_size_meters
@@ -2329,8 +2342,22 @@ def _apply_surface_materials(
         texture_world_size_meters=texture_world_size,
         build_textured_mesh=build_world_planar_textured_mesh,
     )
-    if not textured_named_meshes:
+    if not textured_named_meshes and export_untextured_surfaces:
         return model
+    if not textured_named_meshes:
+        export_named_meshes = _build_assigned_surface_export_named_meshes(
+            named_meshes,
+            base_surfaces,
+            textured_named_meshes,
+        )
+        export_scene = _build_export_scene(export_named_meshes)
+        return replace(
+            model,
+            scene=export_scene,
+            glb_bytes=(
+                _serialize_export_scene(export_scene) if serialize_glb else b""
+            ),
+        )
     replacement_surface_ids = set(resolved_materials).intersection(
         surface.surface_id for surface in base_surfaces
     )
@@ -2388,9 +2415,17 @@ def _apply_surface_materials(
             *[named_mesh.mesh for named_mesh in textured_named_meshes],
         ]
     )
-    scene = _build_export_scene(
-        [*retained_named_meshes, *textured_named_meshes]
-    )
+    export_named_meshes = [
+        *retained_named_meshes,
+        *textured_named_meshes,
+    ]
+    if not export_untextured_surfaces:
+        export_named_meshes = _build_assigned_surface_export_named_meshes(
+            named_meshes,
+            base_surfaces,
+            textured_named_meshes,
+        )
+    scene = _build_export_scene(export_named_meshes)
     return GeneratedModel(
         mesh=combined_mesh,
         scene=scene,
@@ -2433,6 +2468,10 @@ def _build_surface_named_meshes(
             material_name=f"Surface {surface_id}",
             double_sided=double_sided,
         )
+        mesh.metadata = copy.deepcopy(
+            dict(getattr(mesh, "metadata", {}) or {})
+        )
+        mesh.metadata["housemaker_surface_id"] = surface_id
         preview_surfaces.append(
             PreviewTexturedSurface(
                 surface_id=surface_id,
@@ -2451,6 +2490,26 @@ def _build_surface_named_meshes(
             )
         )
     return named_meshes, preview_surfaces
+
+
+def _build_assigned_surface_export_named_meshes(
+    named_meshes: Sequence[NamedMesh],
+    fixed_surfaces: Sequence[object],
+    textured_named_meshes: Sequence[NamedMesh],
+) -> list[NamedMesh]:
+    """Keep assigned surfaces plus non-surface geometry in the export scene."""
+
+    retained = _remove_named_mesh_surface_faces(
+        named_meshes,
+        _build_oriented_surface_face_keys(fixed_surfaces),
+        _build_surface_plane_coverage(fixed_surfaces),
+    )
+    non_surface_meshes = [
+        named_mesh
+        for named_mesh in retained
+        if named_mesh.export_role != NAMED_MESH_ROLE_SURFACE
+    ]
+    return [*non_surface_meshes, *textured_named_meshes]
 
 
 def _build_oriented_surface_face_keys(
@@ -2505,6 +2564,7 @@ def _remove_named_mesh_surface_faces(
                 name=named_mesh.name,
                 mesh=filtered_mesh,
                 source_transform=named_mesh.source_transform.copy(),
+                export_role=named_mesh.export_role,
             )
         )
     return retained
@@ -2677,6 +2737,30 @@ def _build_export_scene(named_meshes: list[NamedMesh]) -> trimesh.Scene:
             ),
         )
     return scene
+
+
+def _serialize_export_scene(scene: trimesh.Scene) -> bytes:
+    """Serialize a scene, including the valid empty-scene GLB edge case."""
+
+    if scene.geometry:
+        payload = scene.export(file_type="glb")
+        if not isinstance(payload, (bytes, bytearray, memoryview)):
+            raise ValueError("The house scene could not be exported as GLB.")
+        return bytes(payload)
+
+    json_chunk = b'{"asset":{"version":"2.0"},"scene":0,"scenes":[{}]}'
+    json_chunk += b" " * (-len(json_chunk) % 4)
+    total_length = 12 + 8 + len(json_chunk)
+    return b"".join(
+        (
+            b"glTF",
+            (2).to_bytes(4, "little"),
+            total_length.to_bytes(4, "little"),
+            len(json_chunk).to_bytes(4, "little"),
+            b"JSON",
+            json_chunk,
+        )
+    )
 
 
 def _to_gltf_y_up_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
@@ -2865,6 +2949,7 @@ def _build_named_meshes_for_level(
             NamedMesh(
                 name=_get_level_doorway_reveal_object_name(level),
                 mesh=doorway_reveal_mesh,
+                export_role=NAMED_MESH_ROLE_OPENING_REVEAL,
             )
         )
 
@@ -2878,6 +2963,7 @@ def _build_named_meshes_for_level(
             NamedMesh(
                 name=_get_level_window_reveal_object_name(level),
                 mesh=window_reveal_mesh,
+                export_role=NAMED_MESH_ROLE_OPENING_REVEAL,
             )
         )
 

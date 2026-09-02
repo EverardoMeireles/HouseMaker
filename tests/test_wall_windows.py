@@ -773,6 +773,14 @@ class WallWindowGeometryTests(unittest.TestCase):
                 near_surface.surface_id: _solid_png(),
                 far_surface.surface_id: _solid_png(),
             },
+            export_untextured_surfaces=False,
+        )
+        self.assertTrue(
+            all(
+                getattr(getattr(mesh.visual, "material", None), "name", None)
+                not in {None, "DefaultMaterial"}
+                for mesh in model.scene.geometry.values()
+            )
         )
         textured_by_id = {
             surface.surface_id: surface.mesh

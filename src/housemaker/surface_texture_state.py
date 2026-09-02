@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import math
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath, PureWindowsPath
 
@@ -12,11 +13,18 @@ from housemaker.generation_state import (
     MAX_MASK_STROKES_PER_FRAME,
     MaskStroke,
 )
+from housemaker.pbr_maps import (
+    ATLAS_MAP_BASE_COLOR,
+    ATLAS_MAP_TYPES,
+    PBR_MAP_TYPES,
+    normalize_pbr_map_types,
+)
 from housemaker.video_source import VideoMetadata
 
 
 # ### Constants ###
-SURFACE_TEXTURE_SCHEMA_VERSION = 6
+SURFACE_TEXTURE_SCHEMA_VERSION = 8
+SURFACE_PBR_ALIGNMENT_VERSION = 1
 SURFACE_TYPE_WALL = "wall"
 SURFACE_TYPE_FLOOR = "floor"
 SURFACE_TYPE_CEILING = "ceiling"
@@ -59,26 +67,50 @@ class SurfaceTextureVariant:
 
     resolution: int
     asset_path: str
+    map_asset_paths: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         resolution = _normalize_surface_texture_resolution(self.resolution)
         asset_path = _normalize_safe_relative_asset_path(self.asset_path)
+        map_asset_paths = _normalize_surface_texture_map_asset_paths(
+            self.map_asset_paths,
+            asset_path,
+        )
         object.__setattr__(self, "resolution", resolution)
         object.__setattr__(self, "asset_path", asset_path)
+        object.__setattr__(self, "map_asset_paths", map_asset_paths)
 
     def to_dict(self) -> dict[str, object]:
         return {
             "resolution": self.resolution,
             "asset_path": self.asset_path,
+            "map_asset_paths": dict(self.map_asset_paths),
         }
+
+    def asset_path_for_map(self, map_type: str) -> str | None:
+        """Return this resolution's persisted map path, when available."""
+
+        normalized_map_type = str(map_type).strip().lower()
+        if normalized_map_type not in ATLAS_MAP_TYPES:
+            return None
+        return self.map_asset_paths.get(normalized_map_type)
 
     @classmethod
     def from_dict(cls, payload: object) -> "SurfaceTextureVariant":
         if not isinstance(payload, dict):
             raise ValueError("A surface texture variant must contain an object.")
+        raw_map_asset_paths = payload.get(
+            "map_asset_paths",
+            payload.get("map_paths", payload.get("pbr_asset_paths", {})),
+        )
+        if not isinstance(raw_map_asset_paths, dict):
+            raise ValueError(
+                "Surface texture variant map paths must contain an object."
+            )
         return cls(
             resolution=payload.get("resolution", payload.get("size")),
             asset_path=str(payload.get("asset_path", payload.get("path", ""))),
+            map_asset_paths=dict(raw_map_asset_paths),
         )
 
 
@@ -100,6 +132,10 @@ class SurfaceTextureAssignment:
     texture_variants: tuple[SurfaceTextureVariant, ...] = ()
     selected_texture_resolution: int | None = None
     display_name: str = ""
+    provider_pbr_task_id: str | None = None
+    enabled_pbr_maps: tuple[str, ...] = ()
+    available_pbr_maps: tuple[str, ...] = ()
+    pbr_alignment_version: int = 0
 
     def __post_init__(self) -> None:
         assignment_id = _normalize_required_text(
@@ -125,6 +161,11 @@ class SurfaceTextureAssignment:
             "Surface texture provider task ID",
             MAX_PROVIDER_TASK_ID_LENGTH,
         )
+        provider_pbr_task_id = _normalize_optional_text(
+            self.provider_pbr_task_id,
+            "Surface texture provider PBR task ID",
+            MAX_PROVIDER_TASK_ID_LENGTH,
+        )
         display_name = _normalize_optional_text(
             self.display_name,
             "Surface texture display name",
@@ -146,6 +187,22 @@ class SurfaceTextureAssignment:
         texture_variants = _normalize_surface_texture_variants(
             self.texture_variants
         )
+        enabled_pbr_maps = normalize_pbr_map_types(
+            self.enabled_pbr_maps,
+            label="Enabled surface texture PBR maps",
+        )
+        available_pbr_maps = _normalize_available_pbr_maps(
+            self.available_pbr_maps,
+            texture_variants,
+        )
+        if (
+            isinstance(self.pbr_alignment_version, bool)
+            or not isinstance(self.pbr_alignment_version, int)
+            or not 0
+            <= self.pbr_alignment_version
+            <= SURFACE_PBR_ALIGNMENT_VERSION
+        ):
+            raise ValueError("Surface PBR alignment version is invalid.")
         selected_texture_resolution = _normalize_selected_texture_resolution(
             self.selected_texture_resolution,
             texture_variants,
@@ -180,6 +237,11 @@ class SurfaceTextureAssignment:
         object.__setattr__(self, "provider", provider)
         object.__setattr__(self, "asset_path", asset_path)
         object.__setattr__(self, "provider_task_id", provider_task_id)
+        object.__setattr__(
+            self,
+            "provider_pbr_task_id",
+            provider_pbr_task_id,
+        )
         object.__setattr__(self, "display_name", display_name)
         object.__setattr__(self, "combined_area_m2", combined_area_m2)
         object.__setattr__(self, "area_description", area_description)
@@ -195,6 +257,13 @@ class SurfaceTextureAssignment:
             self,
             "selected_texture_resolution",
             selected_texture_resolution,
+        )
+        object.__setattr__(self, "enabled_pbr_maps", enabled_pbr_maps)
+        object.__setattr__(self, "available_pbr_maps", available_pbr_maps)
+        object.__setattr__(
+            self,
+            "pbr_alignment_version",
+            int(self.pbr_alignment_version),
         )
 
     def texture_variant_for_resolution(
@@ -225,6 +294,7 @@ class SurfaceTextureAssignment:
             "surface_ids": list(self.surface_ids),
             "provider": self.provider,
             "provider_task_id": self.provider_task_id,
+            "provider_pbr_task_id": self.provider_pbr_task_id,
             "asset_path": self.asset_path,
             "combined_area_m2": float(self.combined_area_m2),
             "area_description": self.area_description,
@@ -236,6 +306,9 @@ class SurfaceTextureAssignment:
             ],
             "selected_texture_resolution": self.selected_texture_resolution,
             "display_name": self.display_name,
+            "enabled_pbr_maps": list(self.enabled_pbr_maps),
+            "available_pbr_maps": list(self.available_pbr_maps),
+            "pbr_alignment_version": self.pbr_alignment_version,
         }
 
     @classmethod
@@ -270,6 +343,18 @@ class SurfaceTextureAssignment:
             SurfaceTextureVariant.from_dict(raw_variant)
             for raw_variant in raw_texture_variants
         )
+        raw_enabled_pbr_maps = payload.get(
+            "enabled_pbr_maps",
+            payload.get("pbr_maps_enabled", ()),
+        )
+        raw_available_pbr_maps = payload.get(
+            "available_pbr_maps",
+            payload.get("pbr_maps_available", ()),
+        )
+        if not isinstance(raw_enabled_pbr_maps, list | tuple):
+            raise ValueError("Enabled surface PBR maps must contain a list.")
+        if not isinstance(raw_available_pbr_maps, list | tuple):
+            raise ValueError("Available surface PBR maps must contain a list.")
 
         return cls(
             assignment_id=str(payload.get("assignment_id", payload.get("id", ""))),
@@ -297,6 +382,13 @@ class SurfaceTextureAssignment:
                 "display_name",
                 payload.get("name", ""),
             ),
+            provider_pbr_task_id=payload.get(
+                "provider_pbr_task_id",
+                payload.get("pbr_task_id"),
+            ),
+            enabled_pbr_maps=tuple(raw_enabled_pbr_maps),
+            available_pbr_maps=tuple(raw_available_pbr_maps),
+            pbr_alignment_version=payload.get("pbr_alignment_version", 0),
         )
 
 
@@ -811,6 +903,39 @@ def _normalize_surface_texture_resolution(value: object) -> int:
     return resolution
 
 
+def _normalize_surface_texture_map_asset_paths(
+    raw_paths: object,
+    base_asset_path: str,
+) -> dict[str, str]:
+    if not isinstance(raw_paths, Mapping):
+        raise ValueError("Surface texture map asset paths must contain a mapping.")
+    normalized_by_type: dict[str, str] = {}
+    for raw_map_type, raw_path in raw_paths.items():
+        map_type = str(raw_map_type).strip().lower()
+        if map_type not in ATLAS_MAP_TYPES:
+            raise ValueError(f"Unknown surface texture map type: {raw_map_type!r}.")
+        if map_type in normalized_by_type:
+            raise ValueError("Surface texture map asset paths contain duplicates.")
+        normalized_by_type[map_type] = _normalize_safe_relative_asset_path(
+            raw_path
+        )
+
+    stored_base_path = normalized_by_type.get(ATLAS_MAP_BASE_COLOR)
+    if stored_base_path is not None and stored_base_path != base_asset_path:
+        raise ValueError(
+            "The surface base-color map path must match its active asset path."
+        )
+    normalized_by_type[ATLAS_MAP_BASE_COLOR] = base_asset_path
+    asset_paths = tuple(normalized_by_type.values())
+    if len(asset_paths) != len(set(asset_paths)):
+        raise ValueError("Surface texture map asset paths must be unique.")
+    return {
+        map_type: normalized_by_type[map_type]
+        for map_type in ATLAS_MAP_TYPES
+        if map_type in normalized_by_type
+    }
+
+
 def _normalize_surface_texture_variants(
     raw_variants: object,
 ) -> tuple[SurfaceTextureVariant, ...]:
@@ -834,7 +959,46 @@ def _normalize_surface_texture_variants(
     asset_paths = tuple(variant.asset_path for variant in variants)
     if len(asset_paths) != len(set(asset_paths)):
         raise ValueError("Surface texture variant asset paths must be unique.")
+    map_types = tuple(variants[0].map_asset_paths)
+    if any(tuple(variant.map_asset_paths) != map_types for variant in variants):
+        raise ValueError(
+            "Every surface texture resolution must contain the same maps."
+        )
+    for map_type in map_types:
+        map_paths = tuple(
+            variant.map_asset_paths[map_type] for variant in variants
+        )
+        if len(map_paths) != len(set(map_paths)):
+            raise ValueError(
+                "Surface texture map paths must be unique across resolutions."
+            )
     return tuple(sorted(variants, key=lambda variant: variant.resolution))
+
+
+def _normalize_available_pbr_maps(
+    raw_map_types: object,
+    variants: tuple[SurfaceTextureVariant, ...],
+) -> tuple[str, ...]:
+    normalized = normalize_pbr_map_types(
+        raw_map_types,  # type: ignore[arg-type]
+        label="Available surface texture PBR maps",
+    )
+    derived = (
+        ()
+        if not variants
+        else tuple(
+            map_type
+            for map_type in PBR_MAP_TYPES
+            if map_type in variants[0].map_asset_paths
+        )
+    )
+    if normalized and normalized != derived:
+        raise ValueError(
+            "Available surface texture PBR maps do not match their assets."
+        )
+    if not normalized:
+        return derived
+    return normalized
 
 
 def _normalize_selected_texture_resolution(

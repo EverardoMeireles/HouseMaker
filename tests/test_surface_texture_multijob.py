@@ -7,6 +7,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 # ### Imports ###
+import math
 import shutil
 import tempfile
 import threading
@@ -15,6 +16,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from PIL import Image
 from PySide6.QtCore import QThread
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
@@ -25,7 +27,14 @@ from housemaker.generation_jobs import (
     JOB_STATUS_FAILED,
     GenerationJobManager,
 )
-from housemaker.settings_widget import GenerationServiceSettings
+from housemaker.pbr_maps import (
+    ATLAS_MAP_BASE_COLOR,
+    PBR_MAP_METALLIC,
+    PBR_MAP_NORMAL,
+    PBR_MAP_ROUGHNESS,
+    PBR_MAP_TYPES,
+)
+from housemaker.surface_geometry import build_fixed_surfaces
 from housemaker.surface_texture_providers import SurfaceTextureResult
 from housemaker.surface_texture_state import (
     SurfaceTextureData,
@@ -91,6 +100,49 @@ class _ControlledSurfaceProvider:
             event.set()
 
 
+class _FiveJobPbrProvider:
+    """Synchronize five uniquely colored PBR jobs at the provider boundary."""
+
+    def __init__(self, surface_ids: tuple[str, ...]) -> None:
+        if len(surface_ids) != 5:
+            raise ValueError("The five-job provider requires five surfaces.")
+        self._barrier = threading.Barrier(len(surface_ids))
+        self._request_lock = threading.Lock()
+        self.requests: list[SurfaceTextureRequest] = []
+        self.map_colors_by_surface_id = {
+            surface_id: {
+                ATLAS_MAP_BASE_COLOR: (30 + index * 20, 40, 50, 255),
+                PBR_MAP_NORMAL: (90 + index * 10, 120, 230, 255),
+                PBR_MAP_ROUGHNESS: (40 + index * 15,) * 3 + (255,),
+                PBR_MAP_METALLIC: (10 + index * 25,) * 3 + (255,),
+            }
+            for index, surface_id in enumerate(surface_ids)
+        }
+
+    def generate(self, request: SurfaceTextureRequest) -> SurfaceTextureResult:
+        surface_id = request.surface_ids[0]
+        colors = self.map_colors_by_surface_id[surface_id]
+        with self._request_lock:
+            self.requests.append(request)
+        try:
+            self._barrier.wait(timeout=10.0)
+        except threading.BrokenBarrierError as error:
+            raise RuntimeError("Five Surface jobs did not overlap.") from error
+        job_index = tuple(self.map_colors_by_surface_id).index(surface_id)
+        return SurfaceTextureResult(
+            provider="meshy",
+            texture_png=_colored_texture_png(
+                colors[ATLAS_MAP_BASE_COLOR]
+            ),
+            task_id=f"image-task-{job_index}",
+            pbr_texture_pngs={
+                map_type: _colored_texture_png(colors[map_type])
+                for map_type in PBR_MAP_TYPES
+            },
+            pbr_task_id=f"pbr-task-{job_index}",
+        )
+
+
 class _LateOutputThread(QThread):
     """Inject a saved worker output while shutdown is waiting for the thread."""
 
@@ -130,6 +182,20 @@ def _wait_until(predicate, timeout_seconds: float = 10.0) -> None:
         QTest.qWait(5)
     if not predicate():
         raise AssertionError("Timed out waiting for the Surface job state")
+
+
+def _normalized_normal_color(
+    color: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    """Match the unit-vector normalization applied to persisted normal maps."""
+
+    vector = tuple(channel / 127.5 - 1.0 for channel in color[:3])
+    length = math.sqrt(sum(component**2 for component in vector))
+    normalized = tuple(component / length for component in vector)
+    return tuple(
+        round((component * 0.5 + 0.5) * 255.0)
+        for component in normalized
+    ) + (color[3],)
 
 
 # ### Multi-job tests ###
@@ -183,6 +249,98 @@ class SurfaceTextureMultiJobTests(unittest.TestCase):
         self.assertEqual(
             len(list((self._temporary_path / "surface_assets").glob("*.png"))),
             6,
+        )
+
+    def test_five_disjoint_pbr_jobs_keep_unique_tasks_and_map_families(
+        self,
+    ) -> None:
+        surfaces = tuple(build_fixed_surfaces([_test_level()])[:5])
+        surface_ids = tuple(surface.surface_id for surface in surfaces)
+        provider = _FiveJobPbrProvider(surface_ids)
+        self.workspace.set_provider(provider)
+
+        for surface in surfaces:
+            self.assertTrue(
+                self.workspace._start_generation(
+                    SurfaceTextureRequest(
+                        provider="meshy",
+                        api_key="test-key",
+                        reference_pngs=(_texture_png(),),
+                        reference_frame_indices=(0,),
+                        surface_type=surface.surface_type,
+                        surface_ids=(surface.surface_id,),
+                        combined_area_m2=surface.area_square_meters,
+                        prompt=f"Texture {surface.surface_id}",
+                        enabled_pbr_maps=PBR_MAP_TYPES,
+                    )
+                )
+            )
+        _wait_until(lambda: len(provider.requests) == 5)
+        self.assertEqual(len(self.workspace._generation_threads), 5)
+        _wait_until(lambda: not self.workspace.is_generating, timeout_seconds=20.0)
+
+        assignments = self.workspace.get_data().assignments
+        assignments_by_surface_id = {
+            assignment.surface_ids[0]: assignment
+            for assignment in assignments
+        }
+        self.assertEqual(set(assignments_by_surface_id), set(surface_ids))
+        self.assertEqual(
+            {assignment.provider_task_id for assignment in assignments},
+            {f"image-task-{index}" for index in range(5)},
+        )
+        self.assertEqual(
+            {assignment.provider_pbr_task_id for assignment in assignments},
+            {f"pbr-task-{index}" for index in range(5)},
+        )
+        self.assertTrue(
+            all(
+                assignment.enabled_pbr_maps == PBR_MAP_TYPES
+                and assignment.available_pbr_maps == PBR_MAP_TYPES
+                for assignment in assignments
+            )
+        )
+        self.assertEqual(
+            {job.status for job in self.manager.jobs()},
+            {JOB_STATUS_COMPLETED},
+        )
+
+        asset_directory = self._temporary_path / "surface_assets"
+        persisted_paths: list[str] = []
+        for surface_id, assignment in assignments_by_surface_id.items():
+            job_index = surface_ids.index(surface_id)
+            self.assertEqual(
+                assignment.provider_task_id,
+                f"image-task-{job_index}",
+            )
+            self.assertEqual(
+                assignment.provider_pbr_task_id,
+                f"pbr-task-{job_index}",
+            )
+            expected_colors = provider.map_colors_by_surface_id[surface_id]
+            self.assertEqual(len(assignment.texture_variants), 3)
+            for variant in assignment.texture_variants:
+                self.assertEqual(
+                    set(variant.map_asset_paths),
+                    {ATLAS_MAP_BASE_COLOR, *PBR_MAP_TYPES},
+                )
+                persisted_paths.extend(variant.map_asset_paths.values())
+                for map_type, asset_path in variant.map_asset_paths.items():
+                    expected_color = expected_colors[map_type]
+                    if map_type == PBR_MAP_NORMAL:
+                        expected_color = _normalized_normal_color(
+                            expected_color
+                        )
+                    with Image.open(asset_directory / asset_path) as image:
+                        self.assertEqual(
+                            image.convert("RGBA").getpixel((0, 0)),
+                            expected_color,
+                        )
+        self.assertEqual(len(persisted_paths), 60)
+        self.assertEqual(len(set(persisted_paths)), 60)
+        self.assertEqual(
+            {path.name for path in asset_directory.glob("*.png")},
+            set(persisted_paths),
         )
 
     def test_same_target_is_rejected_without_starting_a_second_job(self) -> None:

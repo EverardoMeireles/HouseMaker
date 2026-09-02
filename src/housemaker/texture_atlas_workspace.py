@@ -5,7 +5,7 @@ import copy
 import math
 import os
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -24,6 +24,7 @@ from PySide6.QtCore import (
     Signal,
 )
 from PySide6.QtGui import (
+    QBrush,
     QColor,
     QDrag,
     QDragEnterEvent,
@@ -56,6 +57,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from housemaker.atlas_export import MaterializedTextureAtlas
 from housemaker.object_texture_variants import (
     ATLAS_MAP_BASE_COLOR,
     ATLAS_MAP_LABELS,
@@ -94,6 +96,8 @@ from housemaker.texture_atlas_state import (
 ATLAS_ID_ROLE = Qt.ItemDataRole.UserRole
 OBJECT_ID_ROLE = Qt.ItemDataRole.UserRole
 OBJECT_MISSING_ROLE = Qt.ItemDataRole.UserRole + 1
+OBJECT_SCENE_REQUIRED_UNPACKED_ROLE = Qt.ItemDataRole.UserRole + 2
+OBJECT_SCENE_REQUIRED_UNPACKED_COLOR = QColor(235, 87, 87)
 PREVIEW_MARGIN_PIXELS = 16.0
 PREVIEW_BACKGROUND_COLOR = QColor(31, 34, 39)
 PREVIEW_EMPTY_COLOR = QColor(50, 54, 61)
@@ -107,6 +111,10 @@ PREVIEW_DRAG_VALID_BORDER_COLOR = QColor(77, 255, 142, 235)
 PREVIEW_DRAG_BLOCKED_FILL_COLOR = QColor(225, 56, 64, 88)
 PREVIEW_DRAG_BLOCKED_BORDER_COLOR = QColor(255, 104, 111, 240)
 PREVIEW_DRAG_IMAGE_OPACITY = 0.46
+ATLAS_PREVIEW_MIN_ZOOM = 1.0
+ATLAS_PREVIEW_MAX_ZOOM = 16.0
+ATLAS_PREVIEW_BUTTON_ZOOM_FACTOR = 1.25
+ATLAS_PREVIEW_WHEEL_ZOOM_DIVISOR = 480.0
 MAX_SOURCE_THUMBNAIL_SIZE = 256
 MAX_VARIANT_SOURCE_CACHE_ENTRIES = 256
 TEXTURE_RESOLUTION_ORDER = (512, 1024, 2048)
@@ -121,12 +129,15 @@ ATLAS_MAP_NEUTRAL_RGBA = {
     ATLAS_MAP_METALLIC: (0, 0, 0, 255),
 }
 ATLAS_PBR_MAP_DIRECTORY = "pbr_maps"
+NON_PBR_ATLAS_NAME_PREFIX = "[NON-PBR]"
+NON_PBR_ATLAS_BASE_NAME = f"{NON_PBR_ATLAS_NAME_PREFIX} Atlas"
+DEFAULT_AUTOMATIC_ATLAS_RESOLUTION = min(ATLAS_RESOLUTIONS)
 
 
 # ### Public texture-source model ###
 @dataclass(frozen=True, eq=False)
 class AtlasObjectTextureSource:
-    """One generated object or wall texture that can be packed into an atlas."""
+    """One generated object or architectural texture packable into an Atlas."""
 
     object_id: str
     object_name: str
@@ -143,6 +154,7 @@ class AtlasObjectTextureSource:
     map_texture_paths: Mapping[str, str] | None = None
     physical_map_texture_paths: Mapping[str, Path] | None = None
     preview_rgba_by_map: Mapping[str, np.ndarray] | None = None
+    fallback_map_rgba: Mapping[str, tuple[int, int, int, int]] | None = None
 
     def __post_init__(self) -> None:
         object_id = str(self.object_id).strip()
@@ -182,9 +194,13 @@ class AtlasObjectTextureSource:
                 "Atlas logical and physical texture-map paths must describe "
                 "the same maps."
             )
+        fallback_map_rgba = _normalize_fallback_map_rgba(
+            self.fallback_map_rgba
+        )
         preview_rgba_by_map = _normalize_map_previews(
             self.preview_rgba_by_map,
             base_color_preview=rgba,
+            fallback_map_rgba=fallback_map_rgba,
         )
         object.__setattr__(
             self,
@@ -200,6 +216,11 @@ class AtlasObjectTextureSource:
             self,
             "preview_rgba_by_map",
             MappingProxyType(preview_rgba_by_map),
+        )
+        object.__setattr__(
+            self,
+            "fallback_map_rgba",
+            MappingProxyType(fallback_map_rgba),
         )
         object.__setattr__(self, "fit_to_square", bool(self.fit_to_square))
         object.__setattr__(
@@ -277,6 +298,13 @@ class AtlasObjectTextureSource:
         )
         return image.copy()
 
+    def has_texture_map(self, map_type: str) -> bool:
+        """Return whether this source owns pixels for the requested map."""
+
+        normalized_map_type = _normalize_atlas_map_type(map_type)
+        assert self.physical_map_texture_paths is not None
+        return normalized_map_type in self.physical_map_texture_paths
+
     def load_texture_rgba(
         self,
         map_type: str = ATLAS_MAP_BASE_COLOR,
@@ -294,7 +322,8 @@ class AtlasObjectTextureSource:
             normalized_map_type
         )
         if physical_path is None:
-            neutral_color = ATLAS_MAP_NEUTRAL_RGBA[normalized_map_type]
+            assert self.fallback_map_rgba is not None
+            neutral_color = self.fallback_map_rgba[normalized_map_type]
             fallback = np.empty(
                 (physical_resolution, physical_resolution, 4),
                 dtype=np.uint8,
@@ -341,6 +370,7 @@ TextureVariantResolver = Callable[
 ]
 TextureVariantSelectabilityResolver = Callable[[str, int], bool]
 TextureResolutionCommitCallback = Callable[[], bool]
+SceneTextureAssignmentCommitCallback = Callable[[tuple[str, ...]], bool]
 
 
 def load_atlas_object_texture_source(
@@ -352,6 +382,7 @@ def load_atlas_object_texture_source(
     physical_texture_path: str | Path,
     map_texture_paths: Mapping[str, str] | None = None,
     physical_map_texture_paths: Mapping[str, str | Path] | None = None,
+    fallback_map_rgba: Mapping[str, tuple[int, int, int, int]] | None = None,
     fit_to_square: bool = False,
     supports_resolution_changes: bool = True,
     supports_3d_preview: bool = True,
@@ -397,6 +428,7 @@ def load_atlas_object_texture_source(
         map_texture_paths=normalized_logical_map_paths,
         physical_map_texture_paths=normalized_physical_map_paths,
         preview_rgba_by_map=preview_rgba_by_map,
+        fallback_map_rgba=fallback_map_rgba,
         fit_to_square=fit_to_square,
         supports_resolution_changes=supports_resolution_changes,
         supports_3d_preview=supports_3d_preview,
@@ -485,10 +517,38 @@ def _normalize_physical_map_texture_paths(
     }
 
 
+def _normalize_fallback_map_rgba(
+    raw_colors: Mapping[str, tuple[int, int, int, int]] | None,
+) -> dict[str, tuple[int, int, int, int]]:
+    """Resolve per-source neutral PBR pixels used for absent maps."""
+
+    if raw_colors is not None and not isinstance(raw_colors, Mapping):
+        raise TypeError("Atlas fallback map colors must be a mapping.")
+    normalized = dict(ATLAS_MAP_NEUTRAL_RGBA)
+    for raw_map_type, raw_color in (raw_colors or {}).items():
+        map_type = _normalize_atlas_map_type(raw_map_type)
+        if map_type == ATLAS_MAP_BASE_COLOR:
+            raise ValueError("The Atlas base color cannot use a fallback pixel.")
+        try:
+            color = tuple(raw_color)
+        except TypeError as error:
+            raise ValueError("Atlas fallback colors must contain RGBA values.") from error
+        if len(color) != 4 or any(
+            isinstance(channel, bool)
+            or not isinstance(channel, int)
+            or not 0 <= channel <= 255
+            for channel in color
+        ):
+            raise ValueError("Atlas fallback colors must contain byte RGBA values.")
+        normalized[map_type] = color
+    return normalized
+
+
 def _normalize_map_previews(
     raw_previews: Mapping[str, np.ndarray] | None,
     *,
     base_color_preview: np.ndarray,
+    fallback_map_rgba: Mapping[str, tuple[int, int, int, int]],
 ) -> dict[str, np.ndarray]:
     """Build immutable real or neutral thumbnails for every Atlas map."""
 
@@ -510,7 +570,7 @@ def _normalize_map_previews(
         if preview is None:
             preview = np.empty_like(normalized_base_preview)
             preview[:, :] = np.asarray(
-                ATLAS_MAP_NEUTRAL_RGBA[map_type],
+                fallback_map_rgba[map_type],
                 dtype=np.uint8,
             )
         if max(preview.shape[:2]) > MAX_SOURCE_THUMBNAIL_SIZE:
@@ -712,6 +772,7 @@ class TextureAtlasPreview(QWidget):
     object_clicked = Signal(str, object)
     object_wheeled = Signal(str, int)
     object_dropped = Signal(str, int, int)
+    view_transform_changed = Signal(float, float, float)
 
     def __init__(
         self,
@@ -729,6 +790,10 @@ class TextureAtlasPreview(QWidget):
         self._drag_object_id: str | None = None
         self._drag_slot_preview: AtlasDragSlotPreview | None = None
         self._wheel_resize_object_ids: frozenset[str] = frozenset()
+        self._zoom_factor = ATLAS_PREVIEW_MIN_ZOOM
+        self._view_center = QPointF(0.5, 0.5)
+        self._pan_start_position: QPointF | None = None
+        self._pan_start_center: QPointF | None = None
         self.setMinimumSize(360, 360)
         self.setAcceptDrops(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -738,6 +803,112 @@ class TextureAtlasPreview(QWidget):
         """Return the material map rendered by this synchronized preview."""
 
         return self._map_type
+
+    @property
+    def zoom_factor(self) -> float:
+        """Return the current magnification relative to the fitted Atlas."""
+
+        return self._zoom_factor
+
+    @property
+    def view_center(self) -> QPointF:
+        """Return the normalized Atlas point at the viewport center."""
+
+        return QPointF(self._view_center)
+
+    def set_view_transform(
+        self,
+        zoom_factor: float,
+        center_x: float,
+        center_y: float,
+        *,
+        emit_signal: bool = True,
+    ) -> None:
+        """Apply a clamped zoom and normalized center to this preview."""
+
+        zoom = float(zoom_factor)
+        normalized_center_x = float(center_x)
+        normalized_center_y = float(center_y)
+        if not all(
+            math.isfinite(value)
+            for value in (zoom, normalized_center_x, normalized_center_y)
+        ):
+            raise ValueError("Atlas preview transforms must be finite.")
+        zoom = min(
+            ATLAS_PREVIEW_MAX_ZOOM,
+            max(ATLAS_PREVIEW_MIN_ZOOM, zoom),
+        )
+        visible_half = 0.5 / zoom
+        if math.isclose(zoom, ATLAS_PREVIEW_MIN_ZOOM):
+            zoom = ATLAS_PREVIEW_MIN_ZOOM
+            normalized_center_x = 0.5
+            normalized_center_y = 0.5
+        else:
+            normalized_center_x = min(
+                1.0 - visible_half,
+                max(visible_half, normalized_center_x),
+            )
+            normalized_center_y = min(
+                1.0 - visible_half,
+                max(visible_half, normalized_center_y),
+            )
+        if (
+            math.isclose(self._zoom_factor, zoom)
+            and math.isclose(self._view_center.x(), normalized_center_x)
+            and math.isclose(self._view_center.y(), normalized_center_y)
+        ):
+            return
+        self._zoom_factor = zoom
+        self._view_center = QPointF(
+            normalized_center_x,
+            normalized_center_y,
+        )
+        self._clear_drag_slot_preview()
+        self.update()
+        if emit_signal:
+            self.view_transform_changed.emit(
+                self._zoom_factor,
+                self._view_center.x(),
+                self._view_center.y(),
+            )
+
+    def fit_to_view(self) -> None:
+        """Reset the Atlas to its complete fitted view."""
+
+        self.set_view_transform(ATLAS_PREVIEW_MIN_ZOOM, 0.5, 0.5)
+
+    def zoom_in(self) -> None:
+        """Magnify around the center of the visible Atlas area."""
+
+        self._zoom_at(
+            self._atlas_viewport_rect().center(),
+            ATLAS_PREVIEW_BUTTON_ZOOM_FACTOR,
+        )
+
+    def zoom_out(self) -> None:
+        """Reduce magnification around the visible Atlas center."""
+
+        self._zoom_at(
+            self._atlas_viewport_rect().center(),
+            1.0 / ATLAS_PREVIEW_BUTTON_ZOOM_FACTOR,
+        )
+
+    def atlas_point_to_widget(
+        self,
+        atlas_x: float,
+        atlas_y: float,
+    ) -> QPointF:
+        """Map an Atlas pixel coordinate through the active view transform."""
+
+        atlas = self._atlas
+        if atlas is None:
+            raise ValueError("An Atlas must be displayed before mapping points.")
+        atlas_rect = self._atlas_preview_rect()
+        scale = atlas_rect.width() / float(atlas.resolution)
+        return QPointF(
+            atlas_rect.left() + float(atlas_x) * scale,
+            atlas_rect.top() + float(atlas_y) * scale,
+        )
 
     def set_content(
         self,
@@ -801,18 +972,11 @@ class TextureAtlasPreview(QWidget):
         atlas = self._atlas
         if atlas is None:
             return None
-        atlas_rect = _aspect_fit_square(self.width(), self.height())
-        if (
-            atlas_rect.width() <= 0.0
-            or position.x() < atlas_rect.left()
-            or position.y() < atlas_rect.top()
-            or position.x() >= atlas_rect.right()
-            or position.y() >= atlas_rect.bottom()
-        ):
+        atlas_position = self._widget_point_to_atlas(position)
+        if atlas_position is None:
             return None
-        scale = float(atlas.resolution) / atlas_rect.width()
-        atlas_x = (position.x() - atlas_rect.left()) * scale
-        atlas_y = (position.y() - atlas_rect.top()) * scale
+        atlas_x = atlas_position.x()
+        atlas_y = atlas_position.y()
         for placement in atlas.placements:
             content_x = placement.x
             content_y = placement.y
@@ -852,24 +1016,31 @@ class TextureAtlasPreview(QWidget):
         source = self._sources.get(str(object_id))
         if atlas is None or source is None:
             return None
-        atlas_rect = _aspect_fit_square(self.width(), self.height())
-        if (
-            atlas_rect.width() <= 0.0
-            or position.x() < atlas_rect.left()
-            or position.y() < atlas_rect.top()
-            or position.x() >= atlas_rect.right()
-            or position.y() >= atlas_rect.bottom()
-        ):
+        atlas_position = self._widget_point_to_atlas(position)
+        if atlas_position is None:
             return None
-        scale = float(atlas.resolution) / atlas_rect.width()
-        atlas_x = int((position.x() - atlas_rect.left()) * scale)
-        atlas_y = int((position.y() - atlas_rect.top()) * scale)
+        atlas_x = int(atlas_position.x())
+        atlas_y = int(atlas_position.y())
         return (
             (atlas_x // ATLAS_BASE_CELL_SIZE) * ATLAS_BASE_CELL_SIZE,
             (atlas_y // ATLAS_BASE_CELL_SIZE) * ATLAS_BASE_CELL_SIZE,
         )
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
+        if (
+            event.button() == Qt.MouseButton.MiddleButton
+            and self._atlas is not None
+            and self._zoom_factor > ATLAS_PREVIEW_MIN_ZOOM
+            and _point_is_inside_rect(
+                event.position(),
+                self._atlas_viewport_rect(),
+            )
+        ):
+            self._pan_start_position = QPointF(event.position())
+            self._pan_start_center = QPointF(self._view_center)
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
         super().mousePressEvent(event)
         if event.button() not in {
             Qt.MouseButton.LeftButton,
@@ -885,6 +1056,24 @@ class TextureAtlasPreview(QWidget):
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
         """Drag an existing placement to another exact Atlas slot."""
+
+        if (
+            bool(event.buttons() & Qt.MouseButton.MiddleButton)
+            and self._pan_start_position is not None
+            and self._pan_start_center is not None
+        ):
+            atlas_rect = self._atlas_preview_rect()
+            if atlas_rect.width() > 0.0:
+                delta = event.position() - self._pan_start_position
+                self.set_view_transform(
+                    self._zoom_factor,
+                    self._pan_start_center.x()
+                    - delta.x() / atlas_rect.width(),
+                    self._pan_start_center.y()
+                    - delta.y() / atlas_rect.height(),
+                )
+            event.accept()
+            return
 
         if not bool(event.buttons() & Qt.MouseButton.LeftButton):
             super().mouseMoveEvent(event)
@@ -914,13 +1103,40 @@ class TextureAtlasPreview(QWidget):
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
         """Clear a pending placement drag when the left button is released."""
 
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._pan_start_position = None
+            self._pan_start_center = None
+            self.unsetCursor()
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_start_position = None
             self._drag_object_id = None
         super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event: QWheelEvent) -> None:  # type: ignore[override]
-        """Resize the selected placement regardless of pointer position."""
+        """Zoom with Ctrl or resize the selected packed texture normally."""
+
+        if bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            wheel_delta = int(event.angleDelta().y())
+            if wheel_delta == 0:
+                wheel_delta = int(event.pixelDelta().y())
+            if (
+                self._atlas is not None
+                and wheel_delta != 0
+                and _point_is_inside_rect(
+                    event.position(),
+                    self._atlas_viewport_rect(),
+                )
+            ):
+                zoom_multiplier = 2.0 ** (
+                    wheel_delta / ATLAS_PREVIEW_WHEEL_ZOOM_DIVISOR
+                )
+                self._zoom_at(event.position(), zoom_multiplier)
+                event.accept()
+                return
+            super().wheelEvent(event)
+            return
 
         object_id = self._selected_object_id
         wheel_delta = int(event.angleDelta().y())
@@ -1002,7 +1218,10 @@ class TextureAtlasPreview(QWidget):
             )
             return
 
-        atlas_rect = _aspect_fit_square(self.width(), self.height())
+        viewport_rect = self._atlas_viewport_rect()
+        atlas_rect = self._atlas_preview_rect()
+        painter.save()
+        painter.setClipRect(viewport_rect)
         painter.fillRect(atlas_rect, PREVIEW_EMPTY_COLOR)
         self._paint_quadtree_grid(painter, atlas_rect, atlas.resolution)
         painted_symmetric_slots: set[tuple[int, int, int]] = set()
@@ -1060,11 +1279,17 @@ class TextureAtlasPreview(QWidget):
                     )
                 else:
                     painter.drawImage(placement_rect, preview_image)
-                label = (
-                    f"{source.object_name}\n"
-                    f"{placement.texture_resolution} x "
-                    f"{placement.texture_resolution}"
-                )
+                if source.has_texture_map(self._map_type):
+                    label = (
+                        f"{source.object_name}\n"
+                        f"{placement.texture_resolution} x "
+                        f"{placement.texture_resolution}"
+                    )
+                else:
+                    label = (
+                        f"{source.object_name}\n"
+                        f"No {ATLAS_MAP_LABELS[self._map_type]} map"
+                    )
             is_selected = placement.object_id == self._selected_object_id
             painter.setPen(
                 QPen(
@@ -1084,10 +1309,17 @@ class TextureAtlasPreview(QWidget):
                 label,
             )
 
-        self._paint_drag_slot_preview(painter, atlas_rect)
+        self._paint_drag_slot_preview(
+            painter,
+            atlas_rect,
+            viewport_rect,
+        )
 
         painter.setPen(QPen(PREVIEW_BORDER_COLOR, 2.0))
         painter.drawRect(atlas_rect)
+        painter.restore()
+        painter.setPen(QPen(PREVIEW_BORDER_COLOR, 2.0))
+        painter.drawRect(viewport_rect)
 
     def _drag_slot_preview_at(
         self,
@@ -1100,16 +1332,12 @@ class TextureAtlasPreview(QWidget):
         source = self._sources.get(str(object_id))
         if atlas is None or source is None:
             return None
-        atlas_rect = _aspect_fit_square(self.width(), self.height())
+        viewport_rect = self._atlas_viewport_rect()
+        atlas_rect = self._atlas_preview_rect()
         if atlas_rect.width() <= 0.0:
             return None
 
-        pointer_is_inside = (
-            position.x() >= atlas_rect.left()
-            and position.y() >= atlas_rect.top()
-            and position.x() < atlas_rect.right()
-            and position.y() < atlas_rect.bottom()
-        )
+        pointer_is_inside = _point_is_inside_rect(position, viewport_rect)
         scale = float(atlas.resolution) / atlas_rect.width()
         raw_x = int((position.x() - atlas_rect.left()) * scale)
         raw_y = int((position.y() - atlas_rect.top()) * scale)
@@ -1280,6 +1508,7 @@ class TextureAtlasPreview(QWidget):
         self,
         painter: QPainter,
         atlas_rect: QRectF,
+        viewport_rect: QRectF | None = None,
     ) -> None:
         """Paint a translucent source footprint and valid/blocked feedback."""
 
@@ -1313,8 +1542,9 @@ class TextureAtlasPreview(QWidget):
             else PREVIEW_DRAG_BLOCKED_BORDER_COLOR
         )
 
+        clip_rect = atlas_rect if viewport_rect is None else viewport_rect
         painter.save()
-        painter.setClipRect(atlas_rect)
+        painter.setClipRect(clip_rect)
         painter.setOpacity(PREVIEW_DRAG_IMAGE_OPACITY)
         if slot_preview.slot_half is not None:
             painter.drawImage(
@@ -1340,8 +1570,8 @@ class TextureAtlasPreview(QWidget):
             )
         else:
             painter.drawImage(preview_rect, preview_image)
-        painter.restore()
-        clipped_rect = preview_rect.intersected(atlas_rect)
+        painter.setOpacity(1.0)
+        clipped_rect = preview_rect.intersected(clip_rect)
         painter.fillRect(clipped_rect, fill_color)
         border_pen = QPen(border_color, 3.0)
         if not slot_preview.is_valid:
@@ -1355,6 +1585,77 @@ class TextureAtlasPreview(QWidget):
             painter.drawLine(
                 QLineF(clipped_rect.topRight(), clipped_rect.bottomLeft())
             )
+        painter.restore()
+
+    def _atlas_viewport_rect(self) -> QRectF:
+        """Return the fixed widget area through which the Atlas is viewed."""
+
+        return _aspect_fit_square(self.width(), self.height())
+
+    def _atlas_preview_rect(self) -> QRectF:
+        """Return the zoomed and panned Atlas rectangle in widget space."""
+
+        viewport_rect = self._atlas_viewport_rect()
+        side = viewport_rect.width() * self._zoom_factor
+        return QRectF(
+            viewport_rect.center().x() - self._view_center.x() * side,
+            viewport_rect.center().y() - self._view_center.y() * side,
+            side,
+            side,
+        )
+
+    def _widget_point_to_atlas(self, position: QPointF) -> QPointF | None:
+        """Map a visible widget point to Atlas pixels using half-open bounds."""
+
+        atlas = self._atlas
+        viewport_rect = self._atlas_viewport_rect()
+        atlas_rect = self._atlas_preview_rect()
+        if (
+            atlas is None
+            or atlas_rect.width() <= 0.0
+            or not _point_is_inside_rect(position, viewport_rect)
+        ):
+            return None
+        scale = float(atlas.resolution) / atlas_rect.width()
+        atlas_position = QPointF(
+            (position.x() - atlas_rect.left()) * scale,
+            (position.y() - atlas_rect.top()) * scale,
+        )
+        if not (
+            0.0 <= atlas_position.x() < float(atlas.resolution)
+            and 0.0 <= atlas_position.y() < float(atlas.resolution)
+        ):
+            return None
+        return atlas_position
+
+    def _zoom_at(self, position: QPointF, multiplier: float) -> None:
+        """Change zoom while keeping the Atlas point under the cursor fixed."""
+
+        if self._atlas is None or multiplier <= 0.0:
+            return
+        old_rect = self._atlas_preview_rect()
+        if old_rect.width() <= 0.0:
+            return
+        normalized_x = (position.x() - old_rect.left()) / old_rect.width()
+        normalized_y = (position.y() - old_rect.top()) / old_rect.height()
+        new_zoom = min(
+            ATLAS_PREVIEW_MAX_ZOOM,
+            max(
+                ATLAS_PREVIEW_MIN_ZOOM,
+                self._zoom_factor * float(multiplier),
+            ),
+        )
+        viewport_rect = self._atlas_viewport_rect()
+        new_side = viewport_rect.width() * new_zoom
+        if new_side <= 0.0:
+            return
+        self.set_view_transform(
+            new_zoom,
+            normalized_x
+            + (viewport_rect.center().x() - position.x()) / new_side,
+            normalized_y
+            + (viewport_rect.center().y() - position.y()) / new_side,
+        )
 
     @staticmethod
     def _paint_quadtree_grid(
@@ -1396,6 +1697,7 @@ class TextureAtlasWorkspace(QWidget):
     object_preview_requested = Signal(str, int)
     object_preview_clear_requested = Signal()
     object_texture_resolution_changed = Signal(str, int)
+    selected_atlas_changed = Signal(object)
 
     def __init__(
         self,
@@ -1410,6 +1712,7 @@ class TextureAtlasWorkspace(QWidget):
         )
         self._data = TextureAtlasData()
         self._sources_by_object_id: dict[str, AtlasObjectTextureSource] = {}
+        self._scene_texture_source_ids: tuple[str, ...] = ()
         self._texture_variant_resolver: TextureVariantResolver | None = None
         self._texture_variant_selectability_resolver: (
             TextureVariantSelectabilityResolver | None
@@ -1423,6 +1726,7 @@ class TextureAtlasWorkspace(QWidget):
         self._is_handling_object_click = False
         self._is_coalescing_preview_requests = False
         self._coalesced_preview_request_key: tuple[str, int] | None = None
+        self._previewed_atlas_id: str | None = None
         self._build_ui()
         self._refresh_all()
 
@@ -1474,6 +1778,360 @@ class TextureAtlasWorkspace(QWidget):
         self._refresh_object_list(selected_object_id)
         self._refresh_preview()
 
+    def set_scene_texture_source_ids(self, source_ids: Sequence[str]) -> None:
+        """Set the ordered, ephemeral Atlas sources required by the scene."""
+
+        self._scene_texture_source_ids = tuple(
+            dict.fromkeys(
+                source_id
+                for source_id in (str(value).strip() for value in source_ids)
+                if source_id
+            )
+        )
+        self._refresh_object_list(self._selected_object_id())
+
+    def get_unpacked_scene_texture_source_ids(self) -> tuple[str, ...]:
+        """Return required source IDs which are absent from every atlas."""
+
+        packed_ids = {
+            placement.object_id
+            for atlas in self._data.atlases
+            for placement in atlas.placements
+        }
+        return tuple(
+            source_id
+            for source_id in self._scene_texture_source_ids
+            if source_id not in packed_ids
+        )
+
+    def get_unpacked_scene_texture_source_names(self) -> tuple[str, ...]:
+        """Return display labels for scene-required sources not yet packed."""
+
+        return tuple(
+            self._object_display_name(source_id)
+            for source_id in self.get_unpacked_scene_texture_source_ids()
+        )
+
+    def auto_assign_scene_texture_sources(
+        self,
+        resolution: int,
+        commit_callback: SceneTextureAssignmentCommitCallback | None = None,
+        *,
+        sort_by_pbr: bool = False,
+    ) -> tuple[str, ...]:
+        """Pack every currently-unpacked source into an appropriate Atlas.
+
+        By default this preserves selected-Atlas behavior. PBR sorting sends
+        base-color-only sources to an Atlas whose exact sources own no PBR
+        maps, creating a ``[NON-PBR]`` Atlas when no existing candidate fits.
+        The successful subset is published as one Atlas/PNG transaction.
+        """
+
+        selected_atlas = self.selected_atlas
+        if selected_atlas is None and not bool(sort_by_pbr):
+            self._refresh_object_list(self._selected_object_id())
+            return ()
+        try:
+            target_resolution = int(resolution)
+        except (TypeError, ValueError, OverflowError):
+            return ()
+        if target_resolution not in TEXTURE_RESOLUTION_ORDER:
+            return ()
+
+        next_data = self._data.clone()
+        assigned_ids: list[str] = []
+        affected_atlas_ids: list[str] = []
+        source_overrides: dict[
+            tuple[str, int], AtlasObjectTextureSource
+        ] = {}
+        failed_names: list[str] = []
+        selectability_resolver = self._texture_variant_selectability_resolver
+        for source_id in self.get_unpacked_scene_texture_source_ids():
+            active_source = self._sources_by_object_id.get(source_id)
+            if active_source is None:
+                failed_names.append(self._object_display_name(source_id))
+                continue
+            # Automatic placement owns its initial Atlas raster size. Fixed
+            # sources cannot be resized later from the Atlas UI, but their
+            # pixels can still be sampled into the configured initial size.
+            source_resolution = target_resolution
+            source = self._resolve_object_variant(
+                source_id,
+                source_resolution,
+            )
+            if source is None:
+                failed_names.append(active_source.object_name)
+                continue
+            if active_source.supports_resolution_changes:
+                try:
+                    selectable = (
+                        selectability_resolver is not None
+                        and bool(
+                            selectability_resolver(
+                                source_id,
+                                source_resolution,
+                            )
+                        )
+                    )
+                except Exception:
+                    selectable = False
+                if not selectable:
+                    failed_names.append(active_source.object_name)
+                    continue
+            assigned_atlas_id = self._assign_automatic_scene_source(
+                next_data,
+                source,
+                selected_atlas_id=(
+                    None if selected_atlas is None else selected_atlas.atlas_id
+                ),
+                sort_by_pbr=bool(sort_by_pbr),
+                source_overrides=source_overrides,
+            )
+            if assigned_atlas_id is None:
+                failed_names.append(active_source.object_name)
+                continue
+            assigned_ids.append(source_id)
+            if assigned_atlas_id not in affected_atlas_ids:
+                affected_atlas_ids.append(assigned_atlas_id)
+            source_overrides[(source_id, source.texture_resolution)] = source
+
+        assigned = tuple(assigned_ids)
+        if not assigned:
+            self._refresh_object_list(self._selected_object_id())
+            if failed_names:
+                self.status_label.setText(
+                    "No required scene textures could be added to a "
+                    "compatible Atlas."
+                )
+            return ()
+
+        previous_lazy_error = self._lazy_materialization_error
+        affected_ids = tuple(affected_atlas_ids)
+        png_snapshots = self._snapshot_atlas_pngs(affected_ids)
+        try:
+            for atlas_id in affected_ids:
+                candidate_atlas = next_data.atlas_by_id(atlas_id)
+                assert candidate_atlas is not None
+                self._materialize_atlas(
+                    candidate_atlas,
+                    source_overrides=source_overrides,
+                )
+        except (OSError, TypeError, ValueError) as error:
+            _restore_atlas_png_snapshots(png_snapshots)
+            self._lazy_materialization_error = previous_lazy_error
+            self._refresh_object_list(self._selected_object_id())
+            self.status_label.setText(
+                "Automatic Atlas assignment failed; all placements and PNGs "
+                f"remain unchanged: {error}"
+            )
+            return ()
+        if commit_callback is not None:
+            try:
+                accepted = bool(commit_callback(assigned))
+            except Exception:
+                accepted = False
+            if not accepted:
+                _restore_atlas_png_snapshots(png_snapshots)
+                self._lazy_materialization_error = previous_lazy_error
+                self._refresh_object_list(self._selected_object_id())
+                self.status_label.setText(
+                    "Automatic Atlas assignment was rejected; all placements "
+                    "and PNGs were restored."
+                )
+                return ()
+
+        selection_changed = (
+            self._data.selected_atlas_id != next_data.selected_atlas_id
+        )
+        self._data = next_data
+        self._refresh_all()
+        self._emit_data_changed()
+        if selection_changed:
+            self.selected_atlas_changed.emit(copy.deepcopy(self.selected_atlas))
+        atlas_count = len(affected_ids)
+        self.status_label.setText(
+            f"Added {len(assigned)} required scene texture"
+            f"{'s' if len(assigned) != 1 else ''} to {atlas_count} Atlas"
+            f"{'es' if atlas_count != 1 else ''}."
+            + (
+                f" {len(failed_names)} source"
+                f"{'s' if len(failed_names) != 1 else ''} could not be added."
+                if failed_names
+                else ""
+            )
+        )
+        return assigned
+
+    def _assign_automatic_scene_source(
+        self,
+        data: TextureAtlasData,
+        source: AtlasObjectTextureSource,
+        *,
+        selected_atlas_id: str | None,
+        sort_by_pbr: bool,
+        source_overrides: dict[
+            tuple[str, int], AtlasObjectTextureSource
+        ],
+    ) -> str | None:
+        """Assign one prepared source and return its destination Atlas ID."""
+
+        if not sort_by_pbr or self._source_has_pbr_maps(source):
+            candidate_ids = (
+                () if selected_atlas_id is None else (selected_atlas_id,)
+            )
+        else:
+            candidate_ids = tuple(
+                atlas.atlas_id
+                for atlas in self._ordered_non_pbr_atlases(
+                    data,
+                    selected_atlas_id=selected_atlas_id,
+                    source_overrides=source_overrides,
+                )
+            )
+
+        for atlas_id in candidate_ids:
+            try:
+                data.assign_object(
+                    atlas_id,
+                    source.object_id,
+                    source.texture_path,
+                    source.texture_resolution,
+                    source.packing_mode,
+                    allow_pairing=True,
+                )
+            except (OSError, TypeError, ValueError):
+                continue
+            return atlas_id
+
+        if (
+            not sort_by_pbr
+            or self._source_has_pbr_maps(source)
+        ):
+            return None
+        return self._create_non_pbr_atlas_for_source(
+            data,
+            source,
+            selected_atlas_id=selected_atlas_id,
+        )
+
+    def _ordered_non_pbr_atlases(
+        self,
+        data: TextureAtlasData,
+        *,
+        selected_atlas_id: str | None,
+        source_overrides: dict[
+            tuple[str, int], AtlasObjectTextureSource
+        ],
+    ) -> tuple[TextureAtlasRecord, ...]:
+        """Return safe non-PBR destinations in deterministic preference order."""
+
+        candidates = [
+            atlas
+            for atlas in data.atlases
+            if self._atlas_has_no_pbr_sources(atlas, source_overrides)
+        ]
+        return tuple(
+            sorted(
+                candidates,
+                key=lambda atlas: (
+                    0 if atlas.atlas_id == selected_atlas_id else 1,
+                    (
+                        0
+                        if atlas.name.casefold().startswith(
+                            NON_PBR_ATLAS_NAME_PREFIX.casefold()
+                        )
+                        else 1
+                    ),
+                    data.atlases.index(atlas),
+                ),
+            )
+        )
+
+    def _atlas_has_no_pbr_sources(
+        self,
+        atlas: TextureAtlasRecord,
+        source_overrides: dict[
+            tuple[str, int], AtlasObjectTextureSource
+        ],
+    ) -> bool:
+        """Return whether every exact source in an Atlas is known non-PBR."""
+
+        for placement in atlas.placements:
+            source = source_overrides.get(
+                (placement.object_id, placement.texture_resolution)
+            )
+            if source is None:
+                source = self._resolve_placement_source(placement)
+            if source is None or self._source_has_pbr_maps(source):
+                return False
+        return True
+
+    @staticmethod
+    def _source_has_pbr_maps(source: AtlasObjectTextureSource) -> bool:
+        """Classify one exact source from real maps, excluding neutral fallbacks."""
+
+        return any(
+            source.has_texture_map(map_type)
+            for map_type in ATLAS_MAP_TYPES
+            if map_type != ATLAS_MAP_BASE_COLOR
+        )
+
+    def _create_non_pbr_atlas_for_source(
+        self,
+        data: TextureAtlasData,
+        source: AtlasObjectTextureSource,
+        *,
+        selected_atlas_id: str | None,
+    ) -> str | None:
+        """Create one uniquely named non-PBR Atlas and place the source."""
+
+        selected_atlas = (
+            None
+            if selected_atlas_id is None
+            else data.atlas_by_id(selected_atlas_id)
+        )
+        atlas_resolution = (
+            DEFAULT_AUTOMATIC_ATLAS_RESOLUTION
+            if selected_atlas is None
+            else selected_atlas.resolution
+        )
+        previous_selected_atlas_id = data.selected_atlas_id
+        created_atlas_id: str | None = None
+        try:
+            atlas = data.create_atlas(
+                self._next_non_pbr_atlas_name(data),
+                atlas_resolution,
+            )
+            created_atlas_id = atlas.atlas_id
+            data.assign_object(
+                atlas.atlas_id,
+                source.object_id,
+                source.texture_path,
+                source.texture_resolution,
+                source.packing_mode,
+                allow_pairing=True,
+            )
+        except (OSError, TypeError, ValueError):
+            if created_atlas_id is not None:
+                data.remove_atlas(created_atlas_id)
+                data.select_atlas(previous_selected_atlas_id)
+            return None
+        return atlas.atlas_id
+
+    @staticmethod
+    def _next_non_pbr_atlas_name(data: TextureAtlasData) -> str:
+        """Return a unique, deterministic name with the required prefix."""
+
+        existing_names = {atlas.name.casefold() for atlas in data.atlases}
+        if NON_PBR_ATLAS_BASE_NAME.casefold() not in existing_names:
+            return NON_PBR_ATLAS_BASE_NAME
+        suffix = 2
+        while True:
+            candidate = f"{NON_PBR_ATLAS_BASE_NAME} {suffix}"
+            if candidate.casefold() not in existing_names:
+                return candidate
+            suffix += 1
+
     def materialize_missing_atlases(self) -> int:
         """Materialize the selected non-empty atlas PNG when it is missing."""
 
@@ -1484,6 +2142,75 @@ class TextureAtlasWorkspace(QWidget):
         self._refresh_all()
         self._emit_data_changed()
         return 1
+
+    def prepare_export_atlases(
+        self,
+        required_source_ids: Sequence[str] | None = None,
+    ) -> tuple[MaterializedTextureAtlas, ...]:
+        """Return exact map families for every Atlas needed by this export."""
+
+        required_ids = (
+            None
+            if required_source_ids is None
+            else {
+                source_id
+                for source_id in (
+                    str(value).strip() for value in required_source_ids
+                )
+                if source_id
+            }
+        )
+        selected_id = self._data.selected_atlas_id
+        ordered_atlases = sorted(
+            self._data.atlases,
+            key=lambda atlas: 0 if atlas.atlas_id == selected_id else 1,
+        )
+        prepared: list[MaterializedTextureAtlas] = []
+        for atlas in ordered_atlases:
+            if not atlas.placements:
+                continue
+            if required_ids is not None and not any(
+                placement.object_id in required_ids
+                for placement in atlas.placements
+            ):
+                continue
+            active_map_types = self._active_export_map_types(atlas)
+            output_paths = self._resolve_atlas_map_output_paths(atlas.atlas_id)
+            # Export is the authoritative boundary: rebuild even an existing
+            # derived PNG so migrated or externally replaced source pixels are
+            # never paired with a stale Atlas material.
+            self._materialize_atlas(atlas)
+            prepared.append(
+                MaterializedTextureAtlas(
+                    atlas=atlas,
+                    map_paths=output_paths,
+                    active_map_types=active_map_types,
+                )
+            )
+        return tuple(prepared)
+
+    def _active_export_map_types(
+        self,
+        atlas: TextureAtlasRecord,
+    ) -> frozenset[str]:
+        """Return maps genuinely owned by any exact source in an Atlas."""
+
+        active_map_types: set[str] = set()
+        for placement in atlas.placements:
+            source = self._resolve_placement_source(placement)
+            if source is None:
+                raise ValueError(
+                    "The atlas cannot be exported because the exact "
+                    f"{placement.texture_resolution} x "
+                    f"{placement.texture_resolution} texture for source "
+                    f"{placement.object_id!r} is unavailable."
+                )
+            active_map_types.update(
+                map_type
+                for map_type in ATLAS_MAP_TYPES
+                if source.has_texture_map(map_type)
+            )
+        return frozenset(active_map_types)
 
     def refresh_texture_source_content(
         self,
@@ -1586,6 +2313,68 @@ class TextureAtlasWorkspace(QWidget):
                 else f"{len(source_ids)} deleted wall textures"
             ),
         )
+
+    def remove_scene_texture_from_atlases(self, source_id: str) -> int:
+        """Unassign one scene instance while keeping its generated source."""
+
+        normalized_id = str(source_id).strip()
+        if not normalized_id:
+            return 0
+        affected_atlas_ids = tuple(
+            atlas.atlas_id
+            for atlas in self._data.atlases
+            if atlas.placement_for_object(normalized_id) is not None
+        )
+        if not affected_atlas_ids:
+            return 0
+
+        next_data = self._data.clone()
+        for atlas_id in affected_atlas_ids:
+            next_data.unassign_object(atlas_id, normalized_id)
+
+        previous_lazy_error = self._lazy_materialization_error
+        png_snapshots = self._snapshot_atlas_pngs(affected_atlas_ids)
+        try:
+            for atlas_id in affected_atlas_ids:
+                candidate_atlas = next_data.atlas_by_id(atlas_id)
+                assert candidate_atlas is not None
+                can_rebuild = bool(candidate_atlas.placements) and all(
+                    self._resolve_placement_source(placement) is not None
+                    for placement in candidate_atlas.placements
+                )
+                if can_rebuild:
+                    self._materialize_atlas(candidate_atlas)
+                    continue
+                candidate_atlas.image_path = None
+                for output_path in self._resolve_atlas_map_output_paths(
+                    atlas_id
+                ).values():
+                    output_path.unlink(missing_ok=True)
+        except (OSError, TypeError, ValueError) as error:
+            restore_failures = _restore_atlas_png_snapshots(png_snapshots)
+            self._lazy_materialization_error = previous_lazy_error
+            self.status_label.setText(
+                "Scene texture removal failed; every Atlas placement and PNG "
+                f"was kept: {error}"
+            )
+            if restore_failures:
+                self.status_label.setText(
+                    self.status_label.text()
+                    + f" {restore_failures} Atlas PNG file(s) could not be "
+                    "restored."
+                )
+            return 0
+
+        self._data = next_data
+        self._refresh_all()
+        self._emit_data_changed()
+        atlas_count = len(affected_atlas_ids)
+        self.status_label.setText(
+            f"Removed the scene texture from {atlas_count} texture atlas"
+            f"{'es' if atlas_count != 1 else ''}; its generated source "
+            "remains available."
+        )
+        return atlas_count
 
     def _remove_deleted_texture_sources(
         self,
@@ -2249,6 +3038,46 @@ class TextureAtlasWorkspace(QWidget):
             self._handle_atlas_selection_changed
         )
         selectors_layout.addWidget(self.atlas_list, 1)
+
+        selected_atlas_editor = QWidget()
+        selected_atlas_editor_layout = QFormLayout(selected_atlas_editor)
+        selected_atlas_editor_layout.setContentsMargins(0, 0, 0, 0)
+        self.selected_atlas_name_edit = QLineEdit()
+        self.selected_atlas_name_edit.setObjectName(
+            "selected_texture_atlas_name_edit"
+        )
+        self.selected_atlas_name_edit.setPlaceholderText("Selected atlas name")
+        self.selected_atlas_name_edit.editingFinished.connect(
+            self._apply_selected_atlas_changes
+        )
+        selected_atlas_editor_layout.addRow(
+            "Selected name",
+            self.selected_atlas_name_edit,
+        )
+        self.selected_atlas_resolution_combo = QComboBox()
+        self.selected_atlas_resolution_combo.setObjectName(
+            "selected_texture_atlas_resolution_combo"
+        )
+        for resolution in sorted(ATLAS_RESOLUTIONS):
+            self.selected_atlas_resolution_combo.addItem(
+                f"{resolution} x {resolution}",
+                resolution,
+            )
+        self.selected_atlas_resolution_combo.activated.connect(
+            self._apply_selected_atlas_changes
+        )
+        selected_atlas_editor_layout.addRow(
+            "Selected resolution",
+            self.selected_atlas_resolution_combo,
+        )
+        self.update_atlas_button = QPushButton("Apply atlas changes")
+        self.update_atlas_button.setObjectName("update_texture_atlas_button")
+        self.update_atlas_button.clicked.connect(
+            self._apply_selected_atlas_changes
+        )
+        selected_atlas_editor_layout.addRow("", self.update_atlas_button)
+        selectors_layout.addWidget(selected_atlas_editor)
+
         self.remove_atlas_button = QPushButton("Delete atlas")
         self.remove_atlas_button.setObjectName("delete_texture_atlas_button")
         self.remove_atlas_button.clicked.connect(self._remove_selected_atlas)
@@ -2293,6 +3122,41 @@ class TextureAtlasWorkspace(QWidget):
         selectors_layout.addLayout(assignment_buttons)
 
         content_splitter.addWidget(selectors)
+        preview_container = QWidget()
+        preview_layout = QVBoxLayout(preview_container)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setSpacing(6)
+        zoom_controls = QHBoxLayout()
+        zoom_controls.addStretch(1)
+        self.zoom_out_button = QPushButton("Zoom out")
+        self.zoom_out_button.setObjectName("texture_atlas_zoom_out_button")
+        self.zoom_out_button.setToolTip(
+            "Zoom out. You can also hold Ctrl and use the mouse wheel."
+        )
+        self.zoom_out_button.clicked.connect(self._zoom_preview_out)
+        zoom_controls.addWidget(self.zoom_out_button)
+        self.zoom_percent_label = QLabel("100%")
+        self.zoom_percent_label.setObjectName("texture_atlas_zoom_percent_label")
+        self.zoom_percent_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.zoom_percent_label.setMinimumWidth(52)
+        zoom_controls.addWidget(self.zoom_percent_label)
+        self.zoom_in_button = QPushButton("Zoom in")
+        self.zoom_in_button.setObjectName("texture_atlas_zoom_in_button")
+        self.zoom_in_button.setToolTip(
+            "Zoom in. You can also hold Ctrl and use the mouse wheel."
+        )
+        self.zoom_in_button.clicked.connect(self._zoom_preview_in)
+        zoom_controls.addWidget(self.zoom_in_button)
+        self.fit_preview_button = QPushButton("Fit")
+        self.fit_preview_button.setObjectName("texture_atlas_fit_preview_button")
+        self.fit_preview_button.setToolTip(
+            "Fit the complete Atlas in the preview. Middle-drag to pan while "
+            "zoomed."
+        )
+        self.fit_preview_button.clicked.connect(self._fit_preview)
+        zoom_controls.addWidget(self.fit_preview_button)
+        preview_layout.addLayout(zoom_controls)
+
         self.preview_tabs = QTabWidget()
         self.preview_tabs.setObjectName("texture_atlas_workspace_preview_tabs")
         self.map_previews: dict[str, TextureAtlasPreview] = {}
@@ -2306,10 +3170,14 @@ class TextureAtlasWorkspace(QWidget):
             preview.object_clicked.connect(self._handle_object_mouse_click)
             preview.object_wheeled.connect(self._handle_object_wheel)
             preview.object_dropped.connect(self._handle_object_drop)
+            preview.view_transform_changed.connect(
+                self._handle_preview_view_transform_changed
+            )
             self.map_previews[map_type] = preview
             self.preview_tabs.addTab(preview, ATLAS_MAP_LABELS[map_type])
         self.preview = self.map_previews[ATLAS_MAP_BASE_COLOR]
-        content_splitter.addWidget(self.preview_tabs)
+        preview_layout.addWidget(self.preview_tabs, 1)
+        content_splitter.addWidget(preview_container)
         self.delete_preview_shortcut = QShortcut(
             QKeySequence.StandardKey.Delete,
             self.preview_tabs,
@@ -2329,6 +3197,58 @@ class TextureAtlasWorkspace(QWidget):
         self.status_label.setWordWrap(True)
         root_layout.addWidget(self.status_label)
 
+    def _zoom_preview_in(self) -> None:
+        """Zoom every synchronized map preview through the active tab."""
+
+        preview = self.preview_tabs.currentWidget()
+        if isinstance(preview, TextureAtlasPreview):
+            preview.zoom_in()
+
+    def _zoom_preview_out(self) -> None:
+        """Zoom every synchronized map preview through the active tab."""
+
+        preview = self.preview_tabs.currentWidget()
+        if isinstance(preview, TextureAtlasPreview):
+            preview.zoom_out()
+
+    def _fit_preview(self) -> None:
+        """Restore the complete Atlas view across every material map."""
+
+        preview = self.preview_tabs.currentWidget()
+        if isinstance(preview, TextureAtlasPreview):
+            preview.fit_to_view()
+
+    def _handle_preview_view_transform_changed(
+        self,
+        zoom_factor: float,
+        center_x: float,
+        center_y: float,
+    ) -> None:
+        """Keep base-color and PBR preview navigation identical."""
+
+        self._set_preview_view_transform(
+            zoom_factor,
+            center_x,
+            center_y,
+        )
+
+    def _set_preview_view_transform(
+        self,
+        zoom_factor: float,
+        center_x: float,
+        center_y: float,
+    ) -> None:
+        """Apply one view without recursively relaying peer signals."""
+
+        for preview in self.map_previews.values():
+            preview.set_view_transform(
+                zoom_factor,
+                center_x,
+                center_y,
+                emit_signal=False,
+            )
+        self.zoom_percent_label.setText(f"{round(zoom_factor * 100.0)}%")
+
     def _create_atlas(self) -> None:
         name = self.atlas_name_edit.text().strip()
         if not name:
@@ -2347,9 +3267,186 @@ class TextureAtlasWorkspace(QWidget):
         self.atlas_name_edit.clear()
         self._refresh_all()
         self._emit_data_changed()
+        self.selected_atlas_changed.emit(copy.deepcopy(self.selected_atlas))
         self.status_label.setText(
             f"Created {name} at {resolution} x {resolution}."
         )
+
+    def _apply_selected_atlas_changes(self) -> bool:
+        """Transactionally rename or resize the selected Atlas in place."""
+
+        if self._is_syncing:
+            return False
+        atlas = self.selected_atlas
+        if atlas is None:
+            return False
+        target_name = self.selected_atlas_name_edit.text().strip()
+        try:
+            target_resolution = int(
+                self.selected_atlas_resolution_combo.currentData()
+            )
+        except (TypeError, ValueError, OverflowError):
+            self._sync_selected_atlas_editor()
+            self.status_label.setText("Select a valid texture atlas resolution.")
+            return False
+        if (
+            target_name == atlas.name
+            and target_resolution == atlas.resolution
+        ):
+            return True
+
+        old_name = atlas.name
+        old_resolution = atlas.resolution
+        try:
+            next_data, was_repacked = self._build_atlas_edit_candidate(
+                atlas.atlas_id,
+                target_name,
+                target_resolution,
+            )
+        except (OSError, TypeError, ValueError) as error:
+            self._sync_selected_atlas_editor()
+            if (
+                target_resolution < old_resolution
+                and "No valid packed layout" in str(error)
+            ):
+                self.status_label.setText(
+                    "Atlas downsizing blocked: its current textures cannot "
+                    f"fit in {target_resolution} x {target_resolution}. "
+                    f"Keeping {old_resolution} x {old_resolution}: {error}"
+                )
+            else:
+                self.status_label.setText(
+                    "Atlas changes were not applied; the existing Atlas was "
+                    f"kept: {error}"
+                )
+            return False
+
+        candidate_atlas = next_data.atlas_by_id(atlas.atlas_id)
+        assert candidate_atlas is not None
+        resolution_changed = target_resolution != old_resolution
+        png_snapshots: dict[Path, bytes | None] = {}
+        if resolution_changed and candidate_atlas.placements:
+            previous_lazy_error = self._lazy_materialization_error
+            try:
+                png_snapshots = self._snapshot_atlas_pngs((atlas.atlas_id,))
+                self._materialize_atlas(candidate_atlas)
+            except (OSError, TypeError, ValueError) as error:
+                _restore_atlas_png_snapshots(png_snapshots)
+                self._lazy_materialization_error = previous_lazy_error
+                self._sync_selected_atlas_editor()
+                self.status_label.setText(
+                    "Atlas resize failed; its resolution, placements, and "
+                    f"PNG files remain unchanged: {error}"
+                )
+                return False
+
+        self._data = next_data
+        self._refresh_all()
+        self._emit_data_changed()
+        self.selected_atlas_changed.emit(copy.deepcopy(self.selected_atlas))
+        if resolution_changed:
+            placement_note = (
+                " Textures were repacked because one or more previous "
+                "positions were outside the new bounds."
+                if was_repacked
+                else " Existing texture positions were preserved."
+            )
+            self.status_label.setText(
+                f"Updated {target_name} from {old_resolution} x "
+                f"{old_resolution} to {target_resolution} x "
+                f"{target_resolution}.{placement_note}"
+            )
+        else:
+            self.status_label.setText(
+                f"Renamed texture atlas from {old_name} to {target_name}."
+            )
+        return True
+
+    def _build_atlas_edit_candidate(
+        self,
+        atlas_id: str,
+        name: str,
+        resolution: int,
+    ) -> tuple[TextureAtlasData, bool]:
+        """Build a validated edit while retaining valid placement coordinates."""
+
+        current_atlas = self._data.atlas_by_id(atlas_id)
+        if current_atlas is None:
+            raise ValueError("The selected texture atlas no longer exists.")
+
+        normalized_name = str(name).strip()
+        normalized_resolution = int(resolution)
+        # Constructing the empty record validates the requested metadata before
+        # any placement or PNG work begins.
+        replacement = TextureAtlasRecord(
+            atlas_id=current_atlas.atlas_id,
+            name=normalized_name,
+            resolution=normalized_resolution,
+        )
+        was_repacked = False
+        try:
+            replacement = TextureAtlasRecord(
+                atlas_id=current_atlas.atlas_id,
+                name=normalized_name,
+                resolution=normalized_resolution,
+                placements=copy.deepcopy(current_atlas.placements),
+                image_path=current_atlas.image_path,
+            )
+        except ValueError:
+            if normalized_resolution >= current_atlas.resolution:
+                raise
+            replacement = self._repack_atlas_for_resolution(
+                current_atlas,
+                normalized_name,
+                normalized_resolution,
+            )
+            was_repacked = True
+
+        next_data = self._data.clone()
+        next_data.atlases = [
+            replacement if atlas.atlas_id == atlas_id else atlas
+            for atlas in next_data.atlases
+        ]
+        # Round-tripping performs collection-wide validation, including the
+        # case-insensitive unique-name requirement.
+        return TextureAtlasData.from_dict(next_data.to_dict()), was_repacked
+
+    @staticmethod
+    def _repack_atlas_for_resolution(
+        atlas: TextureAtlasRecord,
+        name: str,
+        resolution: int,
+    ) -> TextureAtlasRecord:
+        """Repack out-of-bounds placements without changing their source data."""
+
+        replacement = TextureAtlasRecord(
+            atlas_id=atlas.atlas_id,
+            name=name,
+            resolution=resolution,
+        )
+        packing_data = TextureAtlasData(
+            atlases=[replacement],
+            selected_atlas_id=replacement.atlas_id,
+        )
+        try:
+            for placement in _ordered_placements_for_atlas_repack(
+                atlas.placements
+            ):
+                packing_data.assign_object(
+                    replacement.atlas_id,
+                    placement.object_id,
+                    placement.texture_path,
+                    placement.texture_resolution,
+                    placement.packing_mode,
+                    allow_pairing=True,
+                )
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "No valid packed layout exists at the requested resolution."
+            ) from error
+        packed_atlas = packing_data.atlas_by_id(replacement.atlas_id)
+        assert packed_atlas is not None
+        return packed_atlas
 
     def _remove_selected_atlas(self) -> None:
         atlas = self.selected_atlas
@@ -2374,6 +3471,7 @@ class TextureAtlasWorkspace(QWidget):
                 cleanup_errors.append(error)
         self._refresh_all()
         self._emit_data_changed()
+        self.selected_atlas_changed.emit(copy.deepcopy(self.selected_atlas))
         if not cleanup_errors:
             self.status_label.setText(f"Deleted atlas: {name}.")
         else:
@@ -2686,7 +3784,9 @@ class TextureAtlasWorkspace(QWidget):
         self._refresh_object_list(self._selected_object_id())
         self._refresh_preview()
         self._sync_controls()
+        self._sync_selected_atlas_editor()
         self._emit_data_changed()
+        self.selected_atlas_changed.emit(copy.deepcopy(self.selected_atlas))
         self.request_selected_object_preview()
 
     def _refresh_all(self) -> None:
@@ -2694,6 +3794,7 @@ class TextureAtlasWorkspace(QWidget):
         self._refresh_object_list(self._selected_object_id())
         self._refresh_preview()
         self._sync_controls()
+        self._sync_selected_atlas_editor()
 
     def _refresh_atlas_list(self, selected_atlas_id: str | None) -> None:
         self._is_syncing = True
@@ -2719,6 +3820,9 @@ class TextureAtlasWorkspace(QWidget):
         self._is_syncing = True
         try:
             self.object_list.clear()
+            unpacked_scene_ids = set(
+                self.get_unpacked_scene_texture_source_ids()
+            )
             selected_row = -1
             row = 0
             for source in self._sources_by_object_id.values():
@@ -2738,10 +3842,19 @@ class TextureAtlasWorkspace(QWidget):
                 )
                 item.setData(OBJECT_ID_ROLE, source.object_id)
                 item.setData(OBJECT_MISSING_ROLE, False)
+                is_required_unpacked = source.object_id in unpacked_scene_ids
+                item.setData(
+                    OBJECT_SCENE_REQUIRED_UNPACKED_ROLE,
+                    is_required_unpacked,
+                )
+                if is_required_unpacked:
+                    item.setForeground(
+                        QBrush(OBJECT_SCENE_REQUIRED_UNPACKED_COLOR)
+                    )
                 item.setFlags(
                     item.flags() | Qt.ItemFlag.ItemIsDragEnabled
                 )
-                item.setToolTip(
+                tooltip = (
                     source.texture_path
                     if placement is None
                     else (
@@ -2750,6 +3863,12 @@ class TextureAtlasWorkspace(QWidget):
                         f"{placement.texture_path}"
                     )
                 )
+                if is_required_unpacked:
+                    tooltip += (
+                        "\nRequired by the current scene but not assigned to "
+                        "any texture atlas."
+                    )
+                item.setToolTip(tooltip)
                 self.object_list.addItem(item)
                 if source.object_id == selected_object_id:
                     selected_row = row
@@ -2762,6 +3881,10 @@ class TextureAtlasWorkspace(QWidget):
                     item = QListWidgetItem(f"[Missing] {placement.object_id}")
                     item.setData(OBJECT_ID_ROLE, placement.object_id)
                     item.setData(OBJECT_MISSING_ROLE, True)
+                    item.setData(
+                        OBJECT_SCENE_REQUIRED_UNPACKED_ROLE,
+                        False,
+                    )
                     item.setFlags(
                         item.flags() & ~Qt.ItemFlag.ItemIsDragEnabled
                     )
@@ -2791,9 +3914,17 @@ class TextureAtlasWorkspace(QWidget):
         self._sync_controls()
 
     def _refresh_preview(self) -> None:
-        resolved_sources = self._resolve_placement_sources(self.selected_atlas)
-        preview_sources = dict(self._sources_by_object_id)
         atlas = self.selected_atlas
+        atlas_id = None if atlas is None else atlas.atlas_id
+        if atlas_id != self._previewed_atlas_id:
+            self._previewed_atlas_id = atlas_id
+            self._set_preview_view_transform(
+                ATLAS_PREVIEW_MIN_ZOOM,
+                0.5,
+                0.5,
+            )
+        resolved_sources = self._resolve_placement_sources(atlas)
+        preview_sources = dict(self._sources_by_object_id)
         for placement in (() if atlas is None else atlas.placements):
             exact_source = resolved_sources.get(placement.object_id)
             if exact_source is None:
@@ -2807,7 +3938,6 @@ class TextureAtlasWorkspace(QWidget):
                 preview_sources,
             )
             preview.set_selected_object_id(selected_object_id)
-        atlas = self.selected_atlas
         if atlas is None:
             self.status_label.setText("Create an atlas to begin packing textures.")
             return
@@ -2841,12 +3971,34 @@ class TextureAtlasWorkspace(QWidget):
         object_id = self._selected_object_id()
         source = self._selected_object_source()
         self.remove_atlas_button.setEnabled(atlas is not None)
+        self.selected_atlas_name_edit.setEnabled(atlas is not None)
+        self.selected_atlas_resolution_combo.setEnabled(atlas is not None)
+        self.update_atlas_button.setEnabled(atlas is not None)
         self.assign_object_button.setEnabled(atlas is not None and source is not None)
         self.unassign_object_button.setEnabled(
             atlas is not None
             and object_id is not None
             and atlas.placement_for_object(object_id) is not None
         )
+
+    def _sync_selected_atlas_editor(self) -> None:
+        """Show the selected Atlas metadata in its inline editor."""
+
+        atlas = self.selected_atlas
+        was_syncing = self._is_syncing
+        self._is_syncing = True
+        try:
+            self.selected_atlas_name_edit.setText(
+                "" if atlas is None else atlas.name
+            )
+            resolution_index = self.selected_atlas_resolution_combo.findData(
+                None if atlas is None else atlas.resolution
+            )
+            self.selected_atlas_resolution_combo.setCurrentIndex(
+                max(0, resolution_index)
+            )
+        finally:
+            self._is_syncing = was_syncing
 
     def _selected_object_id(self) -> str | None:
         item = self.object_list.currentItem()
@@ -3207,6 +4359,50 @@ class TextureAtlasWorkspace(QWidget):
         return candidate
 
 
+# ### Atlas editing helpers ###
+def _ordered_placements_for_atlas_repack(
+    placements: Sequence[TextureAtlasPlacement],
+) -> tuple[TextureAtlasPlacement, ...]:
+    """Keep established shared-slot members adjacent during a compact repack."""
+
+    grouped: dict[
+        tuple[int, int, int, int, str],
+        list[TextureAtlasPlacement],
+    ] = {}
+    for placement in placements:
+        group_key = (
+            placement.x,
+            placement.y,
+            placement.size,
+            placement.texture_resolution,
+            placement.packing_mode,
+        )
+        grouped.setdefault(group_key, []).append(placement)
+
+    quadrant_rank = {
+        quadrant: rank
+        for rank, quadrant in enumerate(ATLAS_SLOT_QUADRANT_ORDER)
+    }
+
+    def member_key(
+        placement: TextureAtlasPlacement,
+    ) -> tuple[int, int, str]:
+        half_rank = 1 if placement.slot_half == ATLAS_SLOT_HALF_RIGHT else 0
+        return (
+            half_rank,
+            quadrant_rank.get(placement.slot_quadrant, 0),
+            placement.object_id,
+        )
+
+    ordered: list[TextureAtlasPlacement] = []
+    for group_key in sorted(
+        grouped,
+        key=lambda key: (-key[2], key[1], key[0], key[4]),
+    ):
+        ordered.extend(sorted(grouped[group_key], key=member_key))
+    return tuple(ordered)
+
+
 # ### Atlas preview cache helpers ###
 def _build_atlas_preview_content_signature(
     atlas: TextureAtlasRecord | None,
@@ -3351,6 +4547,17 @@ def _aspect_fit_square(width: int, height: int) -> QRectF:
         (float(height) - side) / 2.0,
         side,
         side,
+    )
+
+
+def _point_is_inside_rect(point: QPointF, rect: QRectF) -> bool:
+    """Return whether a point is inside a rectangle's half-open bounds."""
+
+    return (
+        rect.width() > 0.0
+        and rect.height() > 0.0
+        and rect.left() <= point.x() < rect.right()
+        and rect.top() <= point.y() < rect.bottom()
     )
 
 

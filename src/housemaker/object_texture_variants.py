@@ -15,10 +15,23 @@ from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
 from housemaker.glass_material import (
-    HOUSEMAKER_GLASS_MATERIAL_NAME,
     is_housemaker_glass_material,
 )
+from housemaker.pbr_maps import (
+    ATLAS_MAP_BASE_COLOR,
+    ATLAS_MAP_LABELS as _ATLAS_MAP_LABELS,
+    ATLAS_MAP_TYPES,
+    PBR_MAP_METALLIC,
+    PBR_MAP_NORMAL,
+    PBR_MAP_ROUGHNESS,
+    PBR_MAP_TYPES as _PBR_MAP_TYPES,
+)
 from housemaker.scan_projection_layout import remap_scan_projection_scene_uvs
+
+
+# ### Shared-map compatibility exports ###
+ATLAS_MAP_LABELS = _ATLAS_MAP_LABELS
+PBR_MAP_TYPES = _PBR_MAP_TYPES
 
 
 # ### Constants ###
@@ -31,30 +44,14 @@ TEXTURE_RESOLUTIONS = (
     TEXTURE_RESOLUTION_2048,
 )
 DEFAULT_TEXTURE_RESOLUTION = TEXTURE_RESOLUTION_1024
-MATERIAL_TEXTURE_BASE_COLOR = "base_color"
-MATERIAL_TEXTURE_NORMAL = "normal"
+MATERIAL_TEXTURE_BASE_COLOR = ATLAS_MAP_BASE_COLOR
+MATERIAL_TEXTURE_NORMAL = PBR_MAP_NORMAL
 MATERIAL_TEXTURE_METALLIC_ROUGHNESS = "metallic_roughness"
 MATERIAL_TEXTURE_TYPES = (
     MATERIAL_TEXTURE_BASE_COLOR,
     MATERIAL_TEXTURE_NORMAL,
     MATERIAL_TEXTURE_METALLIC_ROUGHNESS,
 )
-PBR_MAP_NORMAL = "normal"
-PBR_MAP_ROUGHNESS = "roughness"
-PBR_MAP_METALLIC = "metallic"
-PBR_MAP_TYPES = (
-    PBR_MAP_NORMAL,
-    PBR_MAP_ROUGHNESS,
-    PBR_MAP_METALLIC,
-)
-ATLAS_MAP_BASE_COLOR = MATERIAL_TEXTURE_BASE_COLOR
-ATLAS_MAP_TYPES = (ATLAS_MAP_BASE_COLOR, *PBR_MAP_TYPES)
-ATLAS_MAP_LABELS = {
-    ATLAS_MAP_BASE_COLOR: "Base color",
-    PBR_MAP_NORMAL: "Normal",
-    PBR_MAP_ROUGHNESS: "Roughness",
-    PBR_MAP_METALLIC: "Metallic",
-}
 _MATERIAL_ATTRIBUTE_BY_TEXTURE_TYPE = {
     MATERIAL_TEXTURE_BASE_COLOR: "baseColorTexture",
     MATERIAL_TEXTURE_NORMAL: "normalTexture",

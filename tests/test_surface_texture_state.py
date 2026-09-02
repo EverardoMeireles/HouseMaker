@@ -5,8 +5,16 @@ import unittest
 
 from housemaker.camera_models import CameraPose
 from housemaker.generation_state import MASK_MODE_PAINT, MaskPoint, MaskStroke
+from housemaker.pbr_maps import (
+    ATLAS_MAP_BASE_COLOR,
+    PBR_MAP_METALLIC,
+    PBR_MAP_NORMAL,
+    PBR_MAP_ROUGHNESS,
+    PBR_MAP_TYPES,
+)
 from housemaker.surface_texture_state import (
     DEFAULT_SURFACE_TEXTURE_RESOLUTION,
+    SURFACE_PBR_ALIGNMENT_VERSION,
     SURFACE_TEXTURE_RESOLUTIONS,
     SURFACE_TEXTURE_SCHEMA_VERSION,
     SURFACE_TYPE_CEILING,
@@ -203,7 +211,7 @@ class SurfaceTextureAssignmentTests(unittest.TestCase):
 
         restored = SurfaceTextureAssignment.from_dict(assignment.to_dict())
 
-        self.assertEqual(SURFACE_TEXTURE_SCHEMA_VERSION, 6)
+        self.assertEqual(SURFACE_TEXTURE_SCHEMA_VERSION, 8)
         self.assertEqual(
             restored.selected_texture_resolution,
             DEFAULT_SURFACE_TEXTURE_RESOLUTION,
@@ -288,6 +296,85 @@ class SurfaceTextureAssignmentTests(unittest.TestCase):
             with self.subTest(resolution=resolution, asset_path=asset_path):
                 with self.assertRaises(ValueError):
                     SurfaceTextureVariant(resolution, asset_path)
+
+    def test_pbr_map_paths_and_selection_round_trip(self) -> None:
+        variants = tuple(
+            SurfaceTextureVariant(
+                resolution=resolution,
+                asset_path=f"textures/stone-{resolution}.png",
+                map_asset_paths={
+                    ATLAS_MAP_BASE_COLOR: f"textures/stone-{resolution}.png",
+                    PBR_MAP_NORMAL: f"textures/stone-{resolution}.normal.png",
+                    PBR_MAP_ROUGHNESS: (
+                        f"textures/stone-{resolution}.roughness.png"
+                    ),
+                    PBR_MAP_METALLIC: (
+                        f"textures/stone-{resolution}.metallic.png"
+                    ),
+                },
+            )
+            for resolution in SURFACE_TEXTURE_RESOLUTIONS
+        )
+        assignment = SurfaceTextureAssignment(
+            assignment_id="stone",
+            surface_type=SURFACE_TYPE_WALL,
+            surface_ids=("level:2/room:0/wall:1:2",),
+            provider="meshy",
+            asset_path="textures/stone-1024.png",
+            provider_task_id="image-task",
+            provider_pbr_task_id="pbr-task",
+            texture_variants=variants,
+            enabled_pbr_maps=(PBR_MAP_METALLIC, PBR_MAP_NORMAL),
+            pbr_alignment_version=SURFACE_PBR_ALIGNMENT_VERSION,
+        )
+
+        restored = SurfaceTextureAssignment.from_dict(assignment.to_dict())
+
+        self.assertEqual(
+            restored.enabled_pbr_maps,
+            (PBR_MAP_NORMAL, PBR_MAP_METALLIC),
+        )
+        self.assertEqual(restored.available_pbr_maps, PBR_MAP_TYPES)
+        self.assertEqual(restored.provider_pbr_task_id, "pbr-task")
+        self.assertEqual(
+            restored.pbr_alignment_version,
+            SURFACE_PBR_ALIGNMENT_VERSION,
+        )
+        normal_path = restored.texture_variants[1].asset_path_for_map(
+            PBR_MAP_NORMAL
+        )
+        self.assertEqual(normal_path, "textures/stone-1024.normal.png")
+
+    def test_pbr_map_paths_are_safe_and_consistent_across_resolutions(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unsafe"):
+            SurfaceTextureVariant(
+                512,
+                "textures/base.png",
+                {PBR_MAP_NORMAL: "../normal.png"},
+            )
+
+        variants = (
+            SurfaceTextureVariant(
+                512,
+                "textures/base-512.png",
+                {PBR_MAP_NORMAL: "textures/normal-512.png"},
+            ),
+            SurfaceTextureVariant(1024, "textures/base-1024.png"),
+            SurfaceTextureVariant(
+                2048,
+                "textures/base-2048.png",
+                {PBR_MAP_NORMAL: "textures/normal-2048.png"},
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "same maps"):
+            SurfaceTextureAssignment(
+                assignment_id="stone",
+                surface_type=SURFACE_TYPE_FLOOR,
+                surface_ids=("level:2/room:0/floor",),
+                provider="meshy",
+                asset_path="textures/base-1024.png",
+                texture_variants=variants,
+            )
 
     def test_assignment_normalizes_safe_relative_paths_and_legacy_aliases(self) -> None:
         assignment = SurfaceTextureAssignment.from_dict(

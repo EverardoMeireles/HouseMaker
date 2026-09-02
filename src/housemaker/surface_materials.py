@@ -17,6 +17,13 @@ from housemaker.surface_geometry import (
     SURFACE_TYPE_WALL,
     SURFACE_TYPES,
 )
+from housemaker.pbr_maps import (
+    ATLAS_MAP_BASE_COLOR,
+    ATLAS_MAP_TYPES,
+    PBR_MAP_METALLIC,
+    PBR_MAP_NORMAL,
+    PBR_MAP_ROUGHNESS,
+)
 
 
 # ### Constants ###
@@ -24,15 +31,24 @@ DEFAULT_SURFACE_TEXTURE_WORLD_SIZE_METERS = 2.0
 SURFACE_MATERIAL_EPSILON = 1e-8
 MAX_SURFACE_TEXTURE_BYTES = 64 * 1024 * 1024
 MAX_SURFACE_TEXTURE_DIMENSION_PIXELS = 16_384
+LEGACY_SURFACE_ROUGHNESS_FACTOR = 0.72
+
+
+# ### Public source types ###
+SurfaceTextureSource = bytes | bytearray | memoryview | str | Path
+SurfaceMaterialSource = SurfaceTextureSource | Mapping[str, SurfaceTextureSource]
 
 
 # ### Material models ###
 @dataclass(frozen=True)
 class ResolvedSurfaceMaterial:
-    """Validated PNG data shared by GLB export and OpenGL preview."""
+    """Validated aligned PNG data shared by GLB export and OpenGL preview."""
 
     png_bytes: bytes
     texture_rgba: np.ndarray
+    normal_texture_rgba: np.ndarray | None = None
+    roughness_texture_rgba: np.ndarray | None = None
+    metallic_texture_rgba: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if not self.png_bytes:
@@ -41,11 +57,31 @@ class ResolvedSurfaceMaterial:
         if rgba.ndim != 3 or rgba.shape[2] != 4:
             raise ValueError("A surface material must contain RGBA pixels.")
         object.__setattr__(self, "texture_rgba", np.ascontiguousarray(rgba))
+        for field_name in (
+            "normal_texture_rgba",
+            "roughness_texture_rgba",
+            "metallic_texture_rgba",
+        ):
+            raw_map = getattr(self, field_name)
+            if raw_map is None:
+                continue
+            map_rgba = np.asarray(raw_map, dtype=np.uint8)
+            if map_rgba.ndim != 3 or map_rgba.shape[2] != 4:
+                raise ValueError("A surface PBR map must contain RGBA pixels.")
+            if map_rgba.shape[:2] != rgba.shape[:2]:
+                raise ValueError(
+                    "Surface PBR maps must match the base-color dimensions."
+                )
+            object.__setattr__(
+                self,
+                field_name,
+                np.ascontiguousarray(map_rgba),
+            )
 
 
 # ### Public material helpers ###
 def resolve_surface_materials(
-    surface_materials: Mapping[str, bytes | bytearray | memoryview | str | Path],
+    surface_materials: Mapping[str, SurfaceMaterialSource],
 ) -> dict[str, ResolvedSurfaceMaterial]:
     """Resolve a stable-surface material map without retaining open files."""
 
@@ -99,9 +135,58 @@ def build_assignment_surface_material_source_map(
 
 
 def resolve_surface_material(
-    source: bytes | bytearray | memoryview | str | Path,
+    source: SurfaceMaterialSource,
 ) -> ResolvedSurfaceMaterial:
-    """Load one PNG byte string or path and normalize it to owned RGBA data."""
+    """Load one base PNG or aligned PBR family into owned RGBA arrays."""
+
+    if isinstance(source, Mapping):
+        unknown_map_types = {
+            str(map_type).strip().lower() for map_type in source
+        } - set(ATLAS_MAP_TYPES)
+        if unknown_map_types:
+            raise ValueError(
+                "Unknown surface material maps: "
+                + ", ".join(sorted(unknown_map_types))
+            )
+        normalized_sources = {
+            str(map_type).strip().lower(): map_source
+            for map_type, map_source in source.items()
+        }
+        base_source = normalized_sources.get(ATLAS_MAP_BASE_COLOR)
+        if base_source is None:
+            raise ValueError("A surface material family requires a base-color map.")
+        base_material = _resolve_surface_texture_source(base_source)
+        resolved_maps = {
+            map_type: _resolve_surface_texture_source(map_source)
+            for map_type, map_source in normalized_sources.items()
+            if map_type != ATLAS_MAP_BASE_COLOR
+        }
+        return ResolvedSurfaceMaterial(
+            png_bytes=base_material.png_bytes,
+            texture_rgba=base_material.texture_rgba,
+            normal_texture_rgba=(
+                None
+                if PBR_MAP_NORMAL not in resolved_maps
+                else resolved_maps[PBR_MAP_NORMAL].texture_rgba
+            ),
+            roughness_texture_rgba=(
+                None
+                if PBR_MAP_ROUGHNESS not in resolved_maps
+                else resolved_maps[PBR_MAP_ROUGHNESS].texture_rgba
+            ),
+            metallic_texture_rgba=(
+                None
+                if PBR_MAP_METALLIC not in resolved_maps
+                else resolved_maps[PBR_MAP_METALLIC].texture_rgba
+            ),
+        )
+    return _resolve_surface_texture_source(source)
+
+
+def _resolve_surface_texture_source(
+    source: SurfaceTextureSource,
+) -> ResolvedSurfaceMaterial:
+    """Decode one bounded PNG source without retaining an open file."""
 
     if isinstance(source, (str, Path)):
         try:
@@ -178,6 +263,20 @@ def build_world_planar_textured_mesh(
     expanded_vertices = face_vertices.reshape(-1, 3)
     expanded_faces = np.arange(len(expanded_vertices), dtype=np.int64).reshape(-1, 3)
     texture_image = Image.fromarray(material.texture_rgba, mode="RGBA")
+    normal_texture = (
+        None
+        if material.normal_texture_rgba is None
+        else Image.fromarray(material.normal_texture_rgba, mode="RGBA")
+    )
+    metallic_roughness_texture = _build_metallic_roughness_texture(material)
+    metallic_factor = (
+        1.0 if material.metallic_texture_rgba is not None else 0.0
+    )
+    roughness_factor = (
+        1.0
+        if material.roughness_texture_rgba is not None
+        else LEGACY_SURFACE_ROUGHNESS_FACTOR
+    )
     return trimesh.Trimesh(
         vertices=np.ascontiguousarray(expanded_vertices),
         faces=np.ascontiguousarray(expanded_faces),
@@ -187,13 +286,33 @@ def build_world_planar_textured_mesh(
                 name=material_name,
                 baseColorFactor=[255, 255, 255, 255],
                 baseColorTexture=texture_image,
-                metallicFactor=0.0,
-                roughnessFactor=0.72,
+                normalTexture=normal_texture,
+                metallicRoughnessTexture=metallic_roughness_texture,
+                metallicFactor=metallic_factor,
+                roughnessFactor=roughness_factor,
                 doubleSided=bool(double_sided),
             ),
         ),
         process=False,
     )
+
+
+def _build_metallic_roughness_texture(
+    material: ResolvedSurfaceMaterial,
+) -> Image.Image | None:
+    """Pack separate Meshy grayscale maps into glTF G/B channels."""
+
+    roughness = material.roughness_texture_rgba
+    metallic = material.metallic_texture_rgba
+    if roughness is None and metallic is None:
+        return None
+    height, width = material.texture_rgba.shape[:2]
+    packed = np.empty((height, width, 4), dtype=np.uint8)
+    packed[:, :, 0] = 255
+    packed[:, :, 1] = 255 if roughness is None else roughness[:, :, 0]
+    packed[:, :, 2] = 0 if metallic is None else metallic[:, :, 0]
+    packed[:, :, 3] = 255
+    return Image.fromarray(packed, mode="RGBA")
 
 
 def build_world_planar_face_uvs(

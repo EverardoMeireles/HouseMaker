@@ -35,6 +35,13 @@ from housemaker.camera_models import CameraPose
 from housemaker.generation_state import MASK_MODE_PAINT, MaskPoint, MaskStroke
 from housemaker.glb import GeneratedModel
 from housemaker.models import LevelData, RoomData, VertexData
+from housemaker.pbr_maps import (
+    ATLAS_MAP_BASE_COLOR,
+    PBR_MAP_METALLIC,
+    PBR_MAP_NORMAL,
+    PBR_MAP_ROUGHNESS,
+    PBR_MAP_TYPES,
+)
 from housemaker.settings_widget import (
     SURFACE_TEXTURE_PROVIDER_GPT_4O_MINI,
     SURFACE_TEXTURE_PROVIDER_GPT_5_6_LUNA,
@@ -45,17 +52,21 @@ from housemaker.settings_widget import (
 )
 from housemaker.surface_texture_providers import SurfaceTextureResult
 from housemaker.surface_texture_state import (
+    SURFACE_PBR_ALIGNMENT_VERSION,
     SURFACE_TEXTURE_RESOLUTIONS,
     SurfaceTextureAssignment,
     SurfaceTextureData,
     SurfaceTextureVariant,
 )
 from housemaker.surface_texture_workspace import (
+    MAX_PROVIDER_REFERENCE_EDGE_PIXELS,
     SurfaceTextureGenerationWorkspace,
     SurfaceTextureRequest,
+    _build_contact_sheet,
     _build_masked_crop,
     _build_surface_asset_revision,
     _decode_png_rgba,
+    _encode_provider_reference_png,
 )
 from housemaker.texture_atlas_view import TextureAtlasEntry
 
@@ -347,6 +358,190 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
             self.workspace.erase_mask_button.parentWidget(),
             self.workspace.mask_mode_control,
         )
+
+    def test_surface_pbr_controls_use_three_rows_and_toggle_in_place(self) -> None:
+        layout = self.workspace.pbr_map_control.layout()
+
+        self.assertIsNotNone(layout)
+        assert layout is not None
+        self.assertEqual(layout.count(), len(PBR_MAP_TYPES))
+        for index, map_type in enumerate(PBR_MAP_TYPES):
+            row, column, row_span, column_span = layout.getItemPosition(index)
+            self.assertEqual((row, column, row_span, column_span), (index, 0, 1, 1))
+            self.assertIs(
+                layout.itemAt(index).widget(),
+                self.workspace.pbr_map_checkboxes[map_type],
+            )
+
+        with patch.object(
+            self.workspace.surface_view,
+            "set_pbr_maps_enabled",
+        ) as set_enabled:
+            self.workspace.pbr_map_checkboxes[PBR_MAP_NORMAL].setChecked(True)
+
+        set_enabled.assert_called_once_with((PBR_MAP_NORMAL,))
+        self.assertEqual(
+            self.workspace._get_enabled_pbr_maps(),
+            (PBR_MAP_NORMAL,),
+        )
+
+    def test_generated_pbr_family_is_persisted_applied_and_deleted(self) -> None:
+        surface_id = "level:2/room:5/wall:1:2"
+        base_png = _colored_texture_png((170, 90, 40, 255))
+        pbr_pngs = {
+            PBR_MAP_NORMAL: _colored_texture_png((128, 128, 255, 255)),
+            PBR_MAP_ROUGHNESS: _colored_texture_png((80, 80, 80, 255)),
+            PBR_MAP_METALLIC: _colored_texture_png((210, 210, 210, 255)),
+        }
+        request = SurfaceTextureRequest(
+            provider="meshy",
+            api_key="test-key",
+            reference_pngs=(_texture_png(),),
+            reference_frame_indices=(0,),
+            surface_type="wall",
+            surface_ids=(surface_id,),
+            combined_area_m2=6.0,
+            prompt="Generate one wall",
+            enabled_pbr_maps=(PBR_MAP_NORMAL,),
+        )
+
+        self.assertTrue(
+            self.workspace._handle_generation_succeeded(
+                request,
+                SurfaceTextureResult(
+                    provider="meshy",
+                    texture_png=base_png,
+                    task_id="image-task",
+                    pbr_texture_pngs=pbr_pngs,
+                    pbr_task_id="pbr-task",
+                ),
+            )
+        )
+
+        assignment = self.workspace.get_data().assignments[0]
+        self.assertEqual(assignment.provider_task_id, "image-task")
+        self.assertEqual(assignment.provider_pbr_task_id, "pbr-task")
+        self.assertEqual(assignment.enabled_pbr_maps, (PBR_MAP_NORMAL,))
+        self.assertEqual(assignment.available_pbr_maps, PBR_MAP_TYPES)
+        self.assertEqual(
+            assignment.pbr_alignment_version,
+            SURFACE_PBR_ALIGNMENT_VERSION,
+        )
+        for variant in assignment.texture_variants:
+            self.assertEqual(
+                tuple(variant.map_asset_paths),
+                (ATLAS_MAP_BASE_COLOR, *PBR_MAP_TYPES),
+            )
+            for asset_path in variant.map_asset_paths.values():
+                self.assertTrue(
+                    (self._temporary_path / "surface_assets" / asset_path).is_file()
+                )
+
+        material_sources = self.workspace.get_surface_material_sources()
+        self.assertIsInstance(material_sources[surface_id], dict)
+        assert isinstance(material_sources[surface_id], dict)
+        self.assertEqual(
+            tuple(material_sources[surface_id]),
+            (ATLAS_MAP_BASE_COLOR, *PBR_MAP_TYPES),
+        )
+        self.assertEqual(
+            tuple(
+                self.workspace.surface_view._surface_materials[
+                    surface_id
+                ].map_textures()
+            ),
+            PBR_MAP_TYPES,
+        )
+
+        self.assertTrue(
+            self.workspace.delete_assignment_texture(
+                assignment.assignment_id
+            )
+        )
+        self.assertEqual(
+            tuple((self._temporary_path / "surface_assets").iterdir()),
+            (),
+        )
+
+    def test_legacy_meshy_pbr_maps_are_aligned_once_when_loaded(self) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(parents=True, exist_ok=True)
+        variants: list[SurfaceTextureVariant] = []
+        for resolution in SURFACE_TEXTURE_RESOLUTIONS:
+            base_path = f"legacy-{resolution}.png"
+            normal_path = f"legacy-{resolution}.normal.png"
+            Image.new(
+                "RGBA",
+                (resolution, resolution),
+                (90, 100, 110, 255),
+            ).save(asset_directory / base_path)
+            normal = Image.new(
+                "RGBA",
+                (resolution, resolution),
+                (20, 80, 220, 255),
+            )
+            normal.paste(
+                (220, 100, 180, 255),
+                (resolution // 2, 0, resolution, resolution),
+            )
+            normal.save(asset_directory / normal_path)
+            variants.append(
+                SurfaceTextureVariant(
+                    resolution,
+                    base_path,
+                    {
+                        ATLAS_MAP_BASE_COLOR: base_path,
+                        PBR_MAP_NORMAL: normal_path,
+                    },
+                )
+            )
+        legacy = SurfaceTextureAssignment(
+            assignment_id="legacy",
+            surface_type="wall",
+            surface_ids=("level:2/room:5/wall:1:2",),
+            provider="meshy",
+            provider_pbr_task_id="legacy-pbr-task",
+            asset_path="legacy-1024.png",
+            texture_width=1024,
+            texture_height=1024,
+            texture_variants=tuple(variants),
+            selected_texture_resolution=1024,
+            enabled_pbr_maps=(PBR_MAP_NORMAL,),
+        )
+
+        self.workspace.set_data(SurfaceTextureData(assignments=[legacy]))
+
+        migrated = self.workspace.get_data().assignments[0]
+        self.assertEqual(
+            migrated.pbr_alignment_version,
+            SURFACE_PBR_ALIGNMENT_VERSION,
+        )
+        migrated_variant = migrated.texture_variant_for_resolution(512)
+        assert migrated_variant is not None
+        aligned_relative_path = migrated_variant.map_asset_paths[PBR_MAP_NORMAL]
+        self.assertNotEqual(aligned_relative_path, "legacy-512.normal.png")
+        aligned_path = asset_directory / aligned_relative_path
+        with Image.open(aligned_path) as image:
+            image.load()
+            self.assertEqual(image.getpixel((10, 10)), (35, 100, 180, 255))
+            self.assertEqual(image.getpixel((500, 10)), (235, 80, 220, 255))
+        with Image.open(asset_directory / "legacy-512.normal.png") as image:
+            image.load()
+            self.assertEqual(image.getpixel((10, 10)), (20, 80, 220, 255))
+            self.assertEqual(image.getpixel((500, 10)), (220, 100, 180, 255))
+
+        first_pass = aligned_path.read_bytes()
+        self.workspace.set_data(SurfaceTextureData(assignments=[legacy]))
+        reloaded = self.workspace.get_data().assignments[0]
+        reloaded_variant = reloaded.texture_variant_for_resolution(512)
+        assert reloaded_variant is not None
+        self.assertEqual(
+            reloaded_variant.map_asset_paths[PBR_MAP_NORMAL],
+            aligned_relative_path,
+        )
+        self.assertEqual(aligned_path.read_bytes(), first_pass)
+        self.workspace.set_data(self.workspace.get_data())
+        self.assertEqual(aligned_path.read_bytes(), first_pass)
 
     def test_equivalent_levels_skip_all_surface_rebuilding(self) -> None:
         equivalent_level = copy.deepcopy(self.workspace._levels[0])
@@ -2353,6 +2548,64 @@ class SurfaceTextureReferenceCropTests(unittest.TestCase):
         transparent_pixels = crop[:, :, 3] == 0
         self.assertTrue(np.any(transparent_pixels))
         self.assertTrue(np.all(crop[transparent_pixels, :3] == 0))
+
+    def test_twenty_crop_contact_sheet_uses_a_squareish_five_by_four_grid(
+        self,
+    ) -> None:
+        crops = [
+            np.full((12, 12, 4), (index, 40, 80, 255), dtype=np.uint8)
+            for index in range(20)
+        ]
+
+        sheet = _build_contact_sheet(crops)
+
+        self.assertEqual(sheet.shape, (4 * 384, 5 * 384, 4))
+        for index in range(20):
+            row, column = divmod(index, 5)
+            center_pixel = sheet[row * 384 + 192, column * 384 + 192]
+            np.testing.assert_array_equal(
+                center_pixel,
+                np.array((index, 40, 80, 255), dtype=np.uint8),
+            )
+
+    def test_large_provider_reference_is_bounded_with_rgba_mask_preserved(
+        self,
+    ) -> None:
+        image = np.zeros((1024, 4096, 4), dtype=np.uint8)
+        image[:, :2048, :3] = (25, 75, 125)
+        image[:, :2048, 3] = 255
+
+        encoded = _encode_provider_reference_png(image)
+        decoded = cv2.imdecode(
+            np.frombuffer(encoded, dtype=np.uint8),
+            cv2.IMREAD_UNCHANGED,
+        )
+
+        self.assertIsNotNone(decoded)
+        assert decoded is not None
+        self.assertEqual(
+            decoded.shape,
+            (512, MAX_PROVIDER_REFERENCE_EDGE_PIXELS, 4),
+        )
+        self.assertEqual(decoded.shape[1] / decoded.shape[0], 4.0)
+        self.assertTrue(np.any(decoded[:, :, 3] == 0))
+        self.assertTrue(np.any(decoded[:, :, 3] == 255))
+        transparent_pixels = decoded[:, :, 3] == 0
+        self.assertTrue(np.all(decoded[transparent_pixels, :3] == 0))
+
+    def test_tiny_provider_reference_remains_a_valid_rgba_png(self) -> None:
+        image = np.array([[[11, 22, 33, 77]]], dtype=np.uint8)
+
+        encoded = _encode_provider_reference_png(image)
+        decoded = cv2.imdecode(
+            np.frombuffer(encoded, dtype=np.uint8),
+            cv2.IMREAD_UNCHANGED,
+        )
+
+        self.assertIsNotNone(decoded)
+        assert decoded is not None
+        self.assertEqual(decoded.shape, (1, 1, 4))
+        np.testing.assert_array_equal(decoded, image)
 
 # ### Test entry point ###
 if __name__ == "__main__":

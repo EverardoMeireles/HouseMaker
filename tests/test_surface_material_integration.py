@@ -21,7 +21,13 @@ from PySide6.QtWidgets import QApplication
 from shapely import Polygon
 
 from housemaker.app_settings import ApplicationSettingsStore
-from housemaker.glb import GLTF_Y_UP_TO_Z_UP_TRANSFORM, convert_to_glb
+from housemaker.glb import (
+    GLTF_Y_UP_TO_Z_UP_TRANSFORM,
+    PlacedGeneratedModel,
+    compose_placed_generated_models,
+    convert_to_glb,
+    import_generated_glb,
+)
 from housemaker.main import BlueprintWorkspace
 from housemaker.models import (
     DoorwayData,
@@ -29,6 +35,12 @@ from housemaker.models import (
     RoomData,
     VertexData,
     WallTextureData,
+)
+from housemaker.pbr_maps import (
+    ATLAS_MAP_BASE_COLOR,
+    PBR_MAP_METALLIC,
+    PBR_MAP_NORMAL,
+    PBR_MAP_ROUGHNESS,
 )
 from housemaker.surface_geometry import build_fixed_surfaces
 from housemaker.surface_materials import (
@@ -307,6 +319,168 @@ class StableRoomSurfaceIdentityTests(unittest.TestCase):
 
 # ### GLB material tests ###
 class SurfaceMaterialGlbTests(unittest.TestCase):
+    def test_empty_surface_export_still_accepts_geometry_only_objects(
+        self,
+    ) -> None:
+        level, _room = _build_one_room_level()
+        base_model = convert_to_glb(
+            [level],
+            export_untextured_surfaces=False,
+        )
+        object_scene = trimesh.Scene(trimesh.creation.box())
+        object_model = import_generated_glb(
+            bytes(object_scene.export(file_type="glb"))
+        )
+
+        composed = compose_placed_generated_models(
+            base_model,
+            (
+                PlacedGeneratedModel(
+                    object_id="geometry-only-chair",
+                    model=object_model,
+                    world_position=(1.0, 2.0, 0.0),
+                ),
+            ),
+        )
+
+        self.assertEqual(list(base_model.scene.geometry), [])
+        self.assertGreater(len(base_model.glb_bytes), 0)
+        self.assertTrue(base_model.glb_bytes.startswith(b"glTF"))
+        self.assertTrue(composed.glb_bytes.startswith(b"glTF"))
+        self.assertTrue(
+            any(
+                mesh.metadata.get("housemaker_object_id")
+                == "geometry-only-chair"
+                for mesh in composed.scene.geometry.values()
+            )
+        )
+
+    def test_export_omits_only_unassigned_surfaces_and_preserves_preview(
+        self,
+    ) -> None:
+        level, room = _build_one_room_level()
+        surface_id = f"level:2/room:{room.center_vertex_id}/floor"
+        material_source = _solid_png((80, 120, 190, 255))
+        complete_model = convert_to_glb(
+            [level],
+            surface_materials={surface_id: material_source},
+        )
+
+        filtered_model = convert_to_glb(
+            [level],
+            surface_materials={surface_id: material_source},
+            export_untextured_surfaces=False,
+        )
+
+        self.assertEqual(
+            list(filtered_model.scene.geometry),
+            [f"surface_level_2_room_{room.center_vertex_id}_floor"],
+        )
+        self.assertEqual(
+            len(filtered_model.mesh.faces),
+            len(complete_model.mesh.faces),
+        )
+        self.assertIsNotNone(filtered_model.preview_untextured_mesh)
+        self.assertIsNotNone(complete_model.preview_untextured_mesh)
+        assert filtered_model.preview_untextured_mesh is not None
+        assert complete_model.preview_untextured_mesh is not None
+        self.assertEqual(
+            len(filtered_model.preview_untextured_mesh.faces),
+            len(complete_model.preview_untextured_mesh.faces),
+        )
+        self.assertEqual(
+            [
+                surface.surface_id
+                for surface in filtered_model.preview_textured_surfaces
+            ],
+            [surface_id],
+        )
+
+    def test_structured_pbr_family_reaches_canvas_preview_and_export(
+        self,
+    ) -> None:
+        level, room = _build_one_room_level()
+        surface_id = f"level:2/room:{room.center_vertex_id}/floor"
+        normal_color = (36, 144, 228, 255)
+        roughness_value = 47
+        metallic_value = 203
+        model = convert_to_glb(
+            [level],
+            surface_materials={
+                surface_id: {
+                    ATLAS_MAP_BASE_COLOR: _solid_png((80, 120, 190, 255)),
+                    PBR_MAP_NORMAL: _solid_png(normal_color),
+                    PBR_MAP_ROUGHNESS: _solid_png(
+                        (roughness_value,) * 3 + (255,)
+                    ),
+                    PBR_MAP_METALLIC: _solid_png(
+                        (metallic_value,) * 3 + (255,)
+                    ),
+                }
+            },
+        )
+
+        viewer = GlbViewerWidget()
+        try:
+            viewer.set_model(model)
+
+            self.assertEqual(len(viewer.textured_surface_items), 1)
+            texture_item = viewer.textured_surface_items[0]
+            self.assertTrue(texture_item._normal_texture_available)
+            self.assertTrue(texture_item._roughness_texture_available)
+            self.assertTrue(texture_item._metallic_texture_available)
+            np.testing.assert_array_equal(
+                texture_item._normal_texture_rgba[0, 0],
+                np.asarray(normal_color, dtype=np.uint8),
+            )
+            np.testing.assert_array_equal(
+                texture_item._roughness_texture_rgba[0, 0],
+                np.asarray((roughness_value,) * 3 + (255,), dtype=np.uint8),
+            )
+            np.testing.assert_array_equal(
+                texture_item._metallic_texture_rgba[0, 0],
+                np.asarray((metallic_value,) * 3 + (255,), dtype=np.uint8),
+            )
+        finally:
+            viewer.close()
+            viewer.deleteLater()
+            _qt_application.processEvents()
+
+        exported_scene = trimesh.load(
+            BytesIO(model.glb_bytes),
+            file_type="glb",
+            force="scene",
+            process=False,
+        )
+        self.assertIsInstance(exported_scene, trimesh.Scene)
+        exported_material = next(
+            mesh.visual.material
+            for mesh in exported_scene.geometry.values()
+            if getattr(getattr(mesh.visual, "material", None), "name", "")
+            == f"Surface {surface_id}"
+        )
+        self.assertIsNotNone(exported_material.normalTexture)
+        self.assertIsNotNone(exported_material.metallicRoughnessTexture)
+        exported_normal = np.asarray(
+            exported_material.normalTexture.convert("RGBA"),
+            dtype=np.uint8,
+        )
+        exported_metallic_roughness = np.asarray(
+            exported_material.metallicRoughnessTexture.convert("RGBA"),
+            dtype=np.uint8,
+        )
+        np.testing.assert_array_equal(
+            exported_normal[0, 0],
+            np.asarray(normal_color, dtype=np.uint8),
+        )
+        np.testing.assert_array_equal(
+            exported_metallic_roughness[0, 0],
+            np.asarray(
+                (255, roughness_value, metallic_value, 255),
+                dtype=np.uint8,
+            ),
+        )
+
     def test_floor_material_replaces_base_faces_without_growing_geometry(
         self,
     ) -> None:
@@ -758,6 +932,7 @@ class SurfaceMaterialWorkspaceTests(unittest.TestCase):
                     surface_materials={
                         floor_surface_id: texture_path.resolve(),
                     },
+                    export_untextured_surfaces=False,
                 )
                 with patch.object(
                     workspace,

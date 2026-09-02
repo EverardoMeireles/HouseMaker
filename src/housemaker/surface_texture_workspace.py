@@ -7,9 +7,9 @@ import re
 import tempfile
 import threading
 import uuid
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass, fields, is_dataclass, replace
-from pathlib import Path
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, fields, is_dataclass, replace
+from pathlib import Path, PurePosixPath
 from typing import Protocol
 
 import cv2
@@ -19,8 +19,10 @@ from PySide6.QtGui import QIcon, QKeyEvent, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QFileDialog,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -45,6 +47,12 @@ from housemaker.generation_jobs import GenerationJobManager
 from housemaker.generation_views import VideoInpaintView, rasterize_mask_strokes
 from housemaker.glb import GeneratedModel
 from housemaker.models import LevelData
+from housemaker.pbr_maps import (
+    ATLAS_MAP_BASE_COLOR,
+    ATLAS_MAP_LABELS,
+    PBR_MAP_TYPES,
+    normalize_pbr_map_types,
+)
 from housemaker.settings_widget import (
     SURFACE_TEXTURE_PROVIDER_OPTIONS,
     SURFACE_TEXTURE_PROVIDER_SETTING_KEY,
@@ -52,10 +60,13 @@ from housemaker.settings_widget import (
     read_surface_texture_provider,
 )
 from housemaker.surface_texture_providers import (
+    MESHY_PROVIDER,
     SurfaceTextureResult,
+    align_surface_pbr_map_png,
     request_surface_texture,
 )
 from housemaker.surface_texture_state import (
+    SURFACE_PBR_ALIGNMENT_VERSION,
     SURFACE_TYPE_WALL,
     SurfaceTextureAssignment,
     SurfaceTextureData,
@@ -77,6 +88,7 @@ DEFAULT_BRUSH_RADIUS_PIXELS = 24
 MIN_BRUSH_RADIUS_PIXELS = 1
 MAX_BRUSH_RADIUS_PIXELS = 256
 MAX_PROVIDER_REFERENCE_IMAGES = 5
+MAX_PROVIDER_REFERENCE_EDGE_PIXELS = 2048
 MAX_REFERENCE_FRAMES = 100
 REFERENCE_PADDING_RATIO = 0.08
 INTERRUPT_POLL_SECONDS = 0.05
@@ -197,6 +209,17 @@ class SurfaceTextureRequest:
     combined_area_m2: float
     prompt: str
     display_name: str = ""
+    enabled_pbr_maps: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "enabled_pbr_maps",
+            normalize_pbr_map_types(
+                self.enabled_pbr_maps,
+                label="Enabled surface texture PBR maps",
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -223,12 +246,26 @@ class _SavedSurfaceTextureOutput:
     assignment_id: str
     variants: tuple[SurfaceTextureVariant, ...]
     texture_png_by_resolution: tuple[tuple[int, bytes], ...]
+    map_png_by_resolution: dict[str, dict[int, bytes]] = field(
+        default_factory=dict
+    )
 
     def png_for_resolution(self, resolution: int) -> bytes:
         for candidate_resolution, texture_png in self.texture_png_by_resolution:
             if candidate_resolution == int(resolution):
                 return texture_png
         raise ValueError("The saved surface texture resolution is unavailable.")
+
+    def map_pngs_for_resolution(self, resolution: int) -> dict[str, bytes]:
+        """Return owned companion-map PNGs for one saved resolution."""
+
+        normalized_resolution = int(resolution)
+        return {
+            map_type: bytes(resolution_map[normalized_resolution])
+            for map_type, resolution_map in self.map_png_by_resolution.items()
+            if map_type in PBR_MAP_TYPES
+            and normalized_resolution in resolution_map
+        }
 
 
 class SurfaceTextureProvider(Protocol):
@@ -254,6 +291,7 @@ class DefaultSurfaceTextureProvider:
             api_key=request.api_key,
             reference_pngs=request.reference_pngs,
             prompt=request.prompt,
+            enabled_pbr_maps=request.enabled_pbr_maps,
             progress_callback=(
                 None
                 if progress_callback is None
@@ -495,19 +533,25 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._store_viewer_state()
         return self._data.clone()
 
-    def get_surface_material_sources(self) -> dict[str, Path]:
+    def get_surface_material_sources(
+        self,
+    ) -> dict[str, Path | dict[str, Path]]:
         """Resolve live assignment assets with later assignments taking priority."""
 
-        material_sources: dict[str, Path] = {}
+        material_sources: dict[str, Path | dict[str, Path]] = {}
         for assignment in self._data.assignments:
-            try:
-                texture_path = self._resolve_asset_path(assignment.asset_path)
-            except ValueError:
+            map_paths = self.get_assignment_map_asset_paths(
+                assignment.assignment_id,
+                assignment.selected_texture_resolution,
+            )
+            base_path = map_paths.get(ATLAS_MAP_BASE_COLOR)
+            if base_path is None:
                 continue
-            if not texture_path.is_file():
-                continue
+            source: Path | dict[str, Path] = (
+                base_path if len(map_paths) == 1 else map_paths
+            )
             for surface_id in assignment.surface_ids:
-                material_sources[surface_id] = texture_path
+                material_sources[surface_id] = source
         return material_sources
 
     def get_preview_dependency_signature(
@@ -523,32 +567,50 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     ) -> tuple[tuple[object, ...], ...]:
         """Snapshot active PNGs using one caller-owned stat cache."""
 
-        return tuple(
-            (
-                assignment.assignment_id,
-                assignment.selected_texture_resolution,
-                assignment.asset_path,
-                _get_cached_surface_asset_revision(
-                    revision_cache,
-                    self._asset_directory,
+        signature: list[tuple[object, ...]] = []
+        for assignment in self._data.assignments:
+            raw_map_paths = self._active_assignment_map_asset_paths(assignment)
+            signature.append(
+                (
+                    assignment.assignment_id,
+                    assignment.selected_texture_resolution,
                     assignment.asset_path,
-                ),
+                    tuple(
+                        (
+                            map_type,
+                            asset_path,
+                            _get_cached_surface_asset_revision(
+                                revision_cache,
+                                self._asset_directory,
+                                asset_path,
+                            ),
+                        )
+                        for map_type, asset_path in raw_map_paths.items()
+                    ),
+                )
             )
-            for assignment in self._data.assignments
-        )
+        return tuple(signature)
 
     def refresh_file_backed_previews(self) -> None:
         """Reload only Surface assets whose on-disk revisions changed."""
 
         revision_cache: dict[str, tuple[object, ...]] = {}
         material_signature = self.get_preview_dependency_signature()
-        for assignment, signature_item in zip(
-            self._data.assignments,
-            material_signature,
-            strict=False,
-        ):
-            if len(signature_item) >= 4:
-                revision_cache[str(assignment.asset_path)] = signature_item[3]
+        for signature_item in material_signature:
+            if len(signature_item) < 4:
+                continue
+            raw_map_revisions = signature_item[3]
+            if not isinstance(raw_map_revisions, tuple | list):
+                continue
+            for raw_map_revision in raw_map_revisions:
+                if (
+                    not isinstance(raw_map_revision, tuple | list)
+                    or len(raw_map_revision) < 3
+                    or not isinstance(raw_map_revision[1], str)
+                    or not isinstance(raw_map_revision[2], tuple)
+                ):
+                    continue
+                revision_cache[raw_map_revision[1]] = raw_map_revision[2]
         if material_signature != self._restored_assignment_texture_signature:
             self._restore_assignment_textures()
 
@@ -581,10 +643,19 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                     (
                         variant.resolution,
                         variant.asset_path,
-                        _get_cached_surface_asset_revision(
-                            cached_revisions,
-                            self._asset_directory,
-                            variant.asset_path,
+                        tuple(
+                            (
+                                map_type,
+                                map_asset_path,
+                                _get_cached_surface_asset_revision(
+                                    cached_revisions,
+                                    self._asset_directory,
+                                    map_asset_path,
+                                ),
+                            )
+                            for map_type, map_asset_path in (
+                                variant.map_asset_paths.items()
+                            )
                         ),
                     )
                     for variant in assignment.texture_variants
@@ -623,6 +694,61 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             return None
         return texture_path if texture_path.is_file() else None
 
+    def get_assignment_map_asset_paths(
+        self,
+        assignment_id: str,
+        resolution: int | None = None,
+    ) -> dict[str, Path]:
+        """Resolve every live map belonging to one exact assignment variant."""
+
+        assignment = self._assignment_by_id(assignment_id)
+        if assignment is None:
+            return {}
+        raw_paths: Mapping[str, str]
+        if assignment.texture_variants:
+            target_resolution = (
+                assignment.selected_texture_resolution
+                if resolution is None
+                else int(resolution)
+            )
+            if target_resolution is None:
+                return {}
+            variant = assignment.texture_variant_for_resolution(
+                target_resolution
+            )
+            if variant is None:
+                return {}
+            raw_paths = variant.map_asset_paths
+        else:
+            raw_paths = {ATLAS_MAP_BASE_COLOR: assignment.asset_path}
+        resolved: dict[str, Path] = {}
+        for map_type, raw_path in raw_paths.items():
+            try:
+                map_path = self._resolve_asset_path(raw_path)
+            except ValueError:
+                continue
+            if map_path.is_file():
+                resolved[map_type] = map_path
+        if ATLAS_MAP_BASE_COLOR not in resolved:
+            return {}
+        return resolved
+
+    @staticmethod
+    def _active_assignment_map_asset_paths(
+        assignment: SurfaceTextureAssignment,
+    ) -> dict[str, str]:
+        """Return logical map paths for the assignment's active resolution."""
+
+        if assignment.texture_variants:
+            selected_resolution = assignment.selected_texture_resolution
+            if selected_resolution is not None:
+                variant = assignment.texture_variant_for_resolution(
+                    selected_resolution
+                )
+                if variant is not None:
+                    return dict(variant.map_asset_paths)
+        return {ATLAS_MAP_BASE_COLOR: assignment.asset_path}
+
     def get_assignment(
         self,
         assignment_id: str,
@@ -639,6 +765,11 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             for assignment in self._data.assignments
             if assignment.surface_type == SURFACE_TYPE_WALL
         )
+
+    def get_assignments(self) -> tuple[SurfaceTextureAssignment, ...]:
+        """Return every immutable generated-surface assignment."""
+
+        return tuple(self._data.assignments)
 
     def can_select_assignment_texture_resolution(
         self,
@@ -705,14 +836,20 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         )
         if variant is None:
             return False
-        texture_path = self.get_assignment_asset_path(
+        map_paths = self.get_assignment_map_asset_paths(
             source_assignment.assignment_id,
             target_resolution,
         )
+        texture_path = map_paths.get(ATLAS_MAP_BASE_COLOR)
         if texture_path is None:
             return False
         try:
             texture_png = texture_path.read_bytes()
+            map_pngs = {
+                map_type: map_path.read_bytes()
+                for map_type, map_path in map_paths.items()
+                if map_type in PBR_MAP_TYPES
+            }
             texture_rgba = _decode_png_rgba(
                 texture_png,
                 "Surface texture variant",
@@ -737,6 +874,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             texture_png,
             target_surface_ids,
             texture_size=(target_resolution, target_resolution),
+            map_texture_pngs=map_pngs,
         )
 
     def apply_assignment_texture(
@@ -780,6 +918,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             texture_png,
             target_surface_ids,
             texture_size=(width, height),
+            map_texture_pngs={},
         )
 
     def delete_assignment_texture(self, assignment_id: str) -> bool:
@@ -807,7 +946,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             self._data.assignments = previous_assignments
             try:
                 self._restore_assignment_textures()
-            except (OSError, TypeError, ValueError):
+            except (OSError, RuntimeError, TypeError, ValueError):
                 pass
             self.status_label.setText(
                 "The selected surface texture could not be deleted."
@@ -850,6 +989,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         target_surface_ids: Sequence[str],
         *,
         texture_size: tuple[int, int],
+        map_texture_pngs: Mapping[str, bytes] | None = None,
     ) -> bool:
         """Commit one validated active family asset to homogeneous surfaces."""
 
@@ -915,9 +1055,10 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         )
         next_assignments = [*retained_assignments, selected_assignment]
         try:
-            self.surface_view.set_surface_texture(
+            self._set_surface_view_texture(
                 selected_assignment.surface_ids,
                 texture_png,
+                map_texture_pngs,
             )
             self._data.assignments = next_assignments
             # The caller supplied bytes read before this commit.  Do not bind
@@ -967,6 +1108,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._texture_variant_entry_targets.clear()
         self._other_texture_entry_targets.clear()
         self._data = SurfaceTextureData() if data is None else data.clone()
+        migration_failure_count = self._migrate_legacy_meshy_pbr_alignment()
         metadata = self._data.video_metadata
         if metadata is not None and Path(metadata.path).exists():
             try:
@@ -989,6 +1131,11 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             self.show_frame(self._data.current_frame_index)
         self._sync_selection_status()
         self._sync_controls()
+        if migration_failure_count:
+            self.status_label.setText(
+                f"{migration_failure_count} legacy surface PBR texture set(s) "
+                "could not be aligned automatically."
+            )
 
     def set_levels(
         self,
@@ -1047,6 +1194,118 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._sync_selection_status()
         self._sync_controls()
         self._level_sync_signature = next_signature
+
+    def _migrate_legacy_meshy_pbr_alignment(self) -> int:
+        """Point pre-v1 Meshy families at versioned aligned derivatives."""
+
+        migrated_assignments: list[SurfaceTextureAssignment] = []
+        failure_count = 0
+        for assignment in self._data.assignments:
+            if assignment.pbr_alignment_version >= SURFACE_PBR_ALIGNMENT_VERSION:
+                migrated_assignments.append(assignment)
+                continue
+            if assignment.provider.casefold() != MESHY_PROVIDER:
+                migrated_assignments.append(assignment)
+                continue
+
+            map_files: dict[tuple[str, str], tuple[Path, Path]] = {}
+            aligned_paths: dict[tuple[str, str], str] = {}
+            migration_is_valid = True
+            for variant in assignment.texture_variants:
+                for map_type in PBR_MAP_TYPES:
+                    raw_path = variant.map_asset_paths.get(map_type)
+                    if raw_path is None:
+                        continue
+                    try:
+                        source_path = self._resolve_asset_path(raw_path)
+                        aligned_path = _build_aligned_pbr_asset_path(
+                            raw_path,
+                            map_type,
+                        )
+                        destination_path = self._resolve_asset_path(aligned_path)
+                    except ValueError:
+                        migration_is_valid = False
+                        break
+                    source_key = (raw_path, map_type)
+                    if source_key in map_files:
+                        continue
+                    if destination_path in {
+                        candidate[1] for candidate in map_files.values()
+                    }:
+                        migration_is_valid = False
+                        break
+                    map_files[source_key] = (source_path, destination_path)
+                    aligned_paths[source_key] = aligned_path
+                if not migration_is_valid:
+                    break
+
+            if not map_files:
+                migrated_assignments.append(assignment)
+                continue
+            if not migration_is_valid:
+                migrated_assignments.append(assignment)
+                failure_count += 1
+                continue
+
+            aligned_variants = tuple(
+                replace(
+                    variant,
+                    map_asset_paths={
+                        map_type: aligned_paths.get(
+                            (raw_path, map_type),
+                            raw_path,
+                        )
+                        for map_type, raw_path in variant.map_asset_paths.items()
+                    },
+                )
+                for variant in assignment.texture_variants
+            )
+            try:
+                migrated_assignment = replace(
+                    assignment,
+                    texture_variants=aligned_variants,
+                    pbr_alignment_version=SURFACE_PBR_ALIGNMENT_VERSION,
+                )
+            except ValueError:
+                migrated_assignments.append(assignment)
+                failure_count += 1
+                continue
+
+            target_snapshots: dict[Path, bytes | None] = {}
+            aligned_payloads: dict[Path, bytes] = {}
+            try:
+                for (raw_path, map_type), (
+                    source_path,
+                    destination_path,
+                ) in map_files.items():
+                    payload = source_path.read_bytes()
+                    target_snapshots[destination_path] = (
+                        destination_path.read_bytes()
+                        if destination_path.is_file()
+                        else None
+                    )
+                    aligned_payloads[destination_path] = align_surface_pbr_map_png(
+                        payload,
+                        map_type=map_type,
+                        label=f"Legacy surface {map_type} texture {raw_path}",
+                    )
+                for path, payload in aligned_payloads.items():
+                    _replace_surface_texture_file(path, payload)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                for path, payload in target_snapshots.items():
+                    try:
+                        if payload is None:
+                            path.unlink(missing_ok=True)
+                        else:
+                            _replace_surface_texture_file(path, payload)
+                    except OSError:
+                        pass
+                migrated_assignments.append(assignment)
+                failure_count += 1
+                continue
+            migrated_assignments.append(migrated_assignment)
+        self._data.assignments = migrated_assignments
+        return failure_count
 
     def set_preview_model(self, model: GeneratedModel | None) -> None:
         """Use the Canvas model while retaining semantic surface selection."""
@@ -1367,6 +1626,29 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self.job_name_edit.setPlaceholderText("Optional")
         self.job_name_edit.setMaxLength(256)
         second_row.addWidget(self.job_name_edit)
+        self.pbr_map_control = QWidget()
+        self.pbr_map_control.setObjectName(
+            "surface_texture_pbr_map_control"
+        )
+        pbr_map_layout = QGridLayout(self.pbr_map_control)
+        pbr_map_layout.setContentsMargins(0, 0, 0, 0)
+        pbr_map_layout.setHorizontalSpacing(6)
+        pbr_map_layout.setVerticalSpacing(0)
+        self.pbr_map_checkboxes: dict[str, QCheckBox] = {}
+        for index, map_type in enumerate(PBR_MAP_TYPES):
+            checkbox = QCheckBox(ATLAS_MAP_LABELS[map_type])
+            checkbox.setObjectName(
+                f"surface_pbr_{map_type}_checkbox"
+            )
+            checkbox.setToolTip(
+                "Request Meshy's aligned Surface PBR family and dynamically "
+                f"apply the {ATLAS_MAP_LABELS[map_type].lower()} map in the "
+                "3D preview."
+            )
+            checkbox.toggled.connect(self._handle_pbr_map_toggled)
+            self.pbr_map_checkboxes[map_type] = checkbox
+            pbr_map_layout.addWidget(checkbox, index % 3, index // 3)
+        second_row.addWidget(self.pbr_map_control)
         self.generate_button = QPushButton("Generate texture")
         self.generate_button.setMinimumHeight(38)
         self.generate_button.clicked.connect(self.generate)
@@ -1515,6 +1797,11 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             combined_area_m2=area_m2,
             prompt=prompt,
             display_name=str(display_name).strip()[:256],
+            enabled_pbr_maps=(
+                self._get_enabled_pbr_maps()
+                if self._settings.surface_texture_provider == MESHY_PROVIDER
+                else ()
+            ),
         )
 
     def _build_reference_input(
@@ -1562,7 +1849,9 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             crops,
             MAX_PROVIDER_REFERENCE_IMAGES,
         )
-        return tuple(_encode_png(image) for image in packed_images), tuple(used_indices)
+        return tuple(
+            _encode_provider_reference_png(image) for image in packed_images
+        ), tuple(used_indices)
 
     @Slot(object)
     def _handle_surface_selection_changed(self, raw_ids: object) -> None:
@@ -1619,7 +1908,8 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                     _PreparedSurfaceTextureOutput(
                         surface_ids=surface_ids,
                         texture_variants=build_surface_texture_variants(
-                            texture_png
+                            texture_png,
+                            result.pbr_texture_pngs,
                         ),
                     )
                     for surface_ids, texture_png in raw_outputs
@@ -1665,6 +1955,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                         surface_ids=saved_output.surface_ids,
                         provider=result.provider,
                         provider_task_id=result.task_id,
+                        provider_pbr_task_id=result.pbr_task_id,
                         asset_path=active_variant.asset_path,
                         combined_area_m2=area_m2,
                         area_description=(
@@ -1678,6 +1969,13 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                         texture_variants=saved_output.variants,
                         selected_texture_resolution=selected_resolution,
                         display_name=request.display_name,
+                        enabled_pbr_maps=request.enabled_pbr_maps,
+                        available_pbr_maps=tuple(
+                            map_type
+                            for map_type in PBR_MAP_TYPES
+                            if map_type in active_variant.map_asset_paths
+                        ),
+                        pbr_alignment_version=SURFACE_PBR_ALIGNMENT_VERSION,
                     )
                 )
         except (OSError, ValueError) as error:
@@ -1696,9 +1994,13 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 assignments,
                 strict=True,
             ):
-                self.surface_view.set_surface_texture(
+                self._set_surface_view_texture(
                     saved_output.surface_ids,
                     saved_output.png_for_resolution(
+                        assignment.selected_texture_resolution
+                        or DEFAULT_SURFACE_TEXTURE_RESOLUTION
+                    ),
+                    saved_output.map_pngs_for_resolution(
                         assignment.selected_texture_resolution
                         or DEFAULT_SURFACE_TEXTURE_RESOLUTION
                     ),
@@ -1807,12 +2109,13 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     ) -> None:
         for saved_output in saved_outputs:
             for variant in saved_output.variants:
-                try:
-                    self._resolve_asset_path(variant.asset_path).unlink(
-                        missing_ok=True
-                    )
-                except (OSError, ValueError):
-                    continue
+                for raw_asset_path in variant.map_asset_paths.values():
+                    try:
+                        self._resolve_asset_path(raw_asset_path).unlink(
+                            missing_ok=True
+                        )
+                    except (OSError, ValueError):
+                        continue
 
     def _delete_orphaned_assignment_assets(
         self,
@@ -1854,8 +2157,11 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 (
                     assignment.asset_path,
                     *(
-                        variant.asset_path
+                        map_asset_path
                         for variant in assignment.texture_variants
+                        for map_asset_path in (
+                            variant.map_asset_paths.values()
+                        )
                     ),
                 )
             )
@@ -2041,6 +2347,24 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         mode = MASK_MODE_PAINT if paint_checked else MASK_MODE_ERASE
         self.video_view.set_brush_mode(mode)
 
+    def _get_enabled_pbr_maps(self) -> tuple[str, ...]:
+        """Snapshot the current Surface PBR contribution selection."""
+
+        return tuple(
+            map_type
+            for map_type in PBR_MAP_TYPES
+            if self.pbr_map_checkboxes[map_type].isChecked()
+        )
+
+    @Slot(bool)
+    def _handle_pbr_map_toggled(self, _enabled: bool) -> None:
+        """Apply Surface PBR changes without rebuilding the preview model."""
+
+        self.surface_view.set_pbr_maps_enabled(
+            self._get_enabled_pbr_maps()
+        )
+        self._sync_controls()
+
     def _handle_surface_texture_provider_changed(self, _index: int) -> None:
         if self._is_syncing_provider:
             return
@@ -2111,16 +2435,22 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         restore_succeeded = True
         self.surface_view.clear_surface_textures()
         for assignment in self._data.assignments:
-            try:
-                texture_path = self._resolve_asset_path(assignment.asset_path)
-            except (OSError, TypeError, ValueError):
+            map_paths = self.get_assignment_map_asset_paths(
+                assignment.assignment_id,
+                assignment.selected_texture_resolution,
+            )
+            texture_path = map_paths.get(ATLAS_MAP_BASE_COLOR)
+            if texture_path is None:
                 continue
-            if not texture_path.is_file():
-                continue
             try:
-                self.surface_view.set_surface_texture(
+                self._set_surface_view_texture(
                     assignment.surface_ids,
                     texture_path,
+                    {
+                        map_type: map_path
+                        for map_type, map_path in map_paths.items()
+                        if map_type in PBR_MAP_TYPES
+                    },
                 )
             except (OSError, TypeError, ValueError):
                 restore_succeeded = False
@@ -2130,6 +2460,26 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             signature_after
             if restore_succeeded and signature_before == signature_after
             else None
+        )
+
+    def _set_surface_view_texture(
+        self,
+        surface_ids: Sequence[str],
+        texture: object,
+        map_textures: Mapping[str, object] | None = None,
+    ) -> None:
+        """Preserve the legacy two-argument viewer call for base-only assets."""
+
+        if map_textures:
+            self.surface_view.set_surface_texture(
+                surface_ids,
+                texture,  # type: ignore[arg-type]
+                map_textures,
+            )
+            return
+        self.surface_view.set_surface_texture(
+            surface_ids,
+            texture,  # type: ignore[arg-type]
         )
 
     def _refresh_texture_atlases(self) -> None:
@@ -2755,6 +3105,9 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self.material_notes_edit.setEnabled(True)
         self.job_name_edit.setEnabled(True)
         self.surface_texture_provider_combo.setEnabled(True)
+        self.pbr_map_control.setEnabled(
+            self._settings.surface_texture_provider == MESHY_PROVIDER
+        )
         self.texture_view.setEnabled(True)
         self.other_texture_list.setEnabled(True)
         deletion_id = self._selected_texture_assignment_id_for_deletion()
@@ -2833,7 +3186,7 @@ def _build_reference_pngs_from_input(
     encoded_images: list[bytes] = []
     for image in packed_images:
         _raise_surface_worker_cancelled(cancel_event)
-        encoded_images.append(_encode_png(image))
+        encoded_images.append(_encode_provider_reference_png(image))
     return tuple(encoded_images), tuple(used_indices)
 
 
@@ -2854,7 +3207,10 @@ def _prepare_surface_texture_outputs(
         prepared_outputs.append(
             _PreparedSurfaceTextureOutput(
                 surface_ids=surface_ids,
-                texture_variants=build_surface_texture_variants(texture_png),
+                texture_variants=build_surface_texture_variants(
+                    texture_png,
+                    result.pbr_texture_pngs,
+                ),
             )
         )
     if not prepared_outputs:
@@ -2902,6 +3258,13 @@ def _persist_surface_texture_variants(
         (resolution, texture_variants.texture_png_by_resolution[resolution])
         for resolution in SURFACE_TEXTURE_RESOLUTIONS
     )
+    map_png_by_resolution = {
+        map_type: dict(resolution_map)
+        for map_type, resolution_map in (
+            texture_variants.map_png_by_resolution or {}
+        ).items()
+    }
+    created_asset_paths: list[str] = []
     try:
         for resolution, texture_png in png_items:
             if cancel_event is not None:
@@ -2912,23 +3275,35 @@ def _persist_surface_texture_variants(
                 file_name,
                 texture_png,
             )
+            created_asset_paths.append(asset_path)
+            map_asset_paths = {ATLAS_MAP_BASE_COLOR: asset_path}
+            for map_type in PBR_MAP_TYPES:
+                resolution_map = map_png_by_resolution.get(map_type)
+                if resolution_map is None:
+                    continue
+                if cancel_event is not None:
+                    _raise_surface_worker_cancelled(cancel_event)
+                map_asset_path = _persist_surface_texture_file(
+                    asset_directory,
+                    (
+                        f"{assignment_id}.texture-{resolution}."
+                        f"{map_type}.png"
+                    ),
+                    resolution_map[resolution],
+                )
+                created_asset_paths.append(map_asset_path)
+                map_asset_paths[map_type] = map_asset_path
             persisted.append(
                 SurfaceTextureVariant(
                     resolution=resolution,
                     asset_path=asset_path,
+                    map_asset_paths=map_asset_paths,
                 )
             )
     except Exception:
-        _discard_surface_texture_outputs(
+        _discard_surface_texture_asset_paths(
             asset_directory,
-            (
-                _SavedSurfaceTextureOutput(
-                    surface_ids=surface_ids,
-                    assignment_id=assignment_id,
-                    variants=tuple(persisted),
-                    texture_png_by_resolution=png_items,
-                ),
-            ),
+            created_asset_paths,
         )
         raise
     return _SavedSurfaceTextureOutput(
@@ -2936,7 +3311,23 @@ def _persist_surface_texture_variants(
         assignment_id=assignment_id,
         variants=tuple(persisted),
         texture_png_by_resolution=png_items,
+        map_png_by_resolution=map_png_by_resolution,
     )
+
+
+def _build_aligned_pbr_asset_path(
+    raw_asset_path: str,
+    map_type: str,
+) -> str:
+    """Build a deterministic derivative path without changing source pixels."""
+
+    source_path = PurePosixPath(str(raw_asset_path).replace("\\", "/"))
+    suffix = source_path.suffix or ".png"
+    aligned_name = (
+        f"{source_path.stem}.housemaker-aligned-v"
+        f"{SURFACE_PBR_ALIGNMENT_VERSION}-{map_type}{suffix}"
+    )
+    return (source_path.parent / aligned_name).as_posix()
 
 
 def _persist_surface_texture_file(
@@ -2968,6 +3359,27 @@ def _persist_surface_texture_file(
     return file_name
 
 
+def _replace_surface_texture_file(destination: Path, texture_png: bytes) -> None:
+    """Atomically replace one existing derived surface texture PNG."""
+
+    target = Path(destination)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=str(target.parent),
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(bytes(texture_png))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, target)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
 def _discard_surface_texture_outputs(
     asset_directory: Path,
     saved_outputs: Sequence[_SavedSurfaceTextureOutput],
@@ -2978,12 +3390,34 @@ def _discard_surface_texture_outputs(
         return
     for saved_output in saved_outputs:
         for variant in saved_output.variants:
-            try:
-                asset_path = (asset_directory / variant.asset_path).resolve()
-                asset_path.relative_to(asset_root)
-                asset_path.unlink(missing_ok=True)
-            except (OSError, ValueError):
-                continue
+            for raw_asset_path in variant.map_asset_paths.values():
+                try:
+                    asset_path = (
+                        asset_directory / raw_asset_path
+                    ).resolve()
+                    asset_path.relative_to(asset_root)
+                    asset_path.unlink(missing_ok=True)
+                except (OSError, ValueError):
+                    continue
+
+
+def _discard_surface_texture_asset_paths(
+    asset_directory: Path,
+    raw_asset_paths: Sequence[str],
+) -> None:
+    """Best-effort cleanup for one partially persisted texture family."""
+
+    try:
+        asset_root = asset_directory.resolve()
+    except OSError:
+        return
+    for raw_asset_path in raw_asset_paths:
+        try:
+            asset_path = (asset_directory / raw_asset_path).resolve()
+            asset_path.relative_to(asset_root)
+            asset_path.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            continue
 
 
 def _format_surface_provider_progress(message: str) -> str:
@@ -3092,7 +3526,7 @@ def _pack_reference_crops(
 
 def _build_contact_sheet(crops: Sequence[np.ndarray]) -> np.ndarray:
     tile_size = 384
-    columns = min(3, max(1, math.ceil(math.sqrt(len(crops)))))
+    columns = max(1, math.ceil(math.sqrt(len(crops))))
     rows = math.ceil(len(crops) / columns)
     sheet = np.zeros((rows * tile_size, columns * tile_size, 4), dtype=np.uint8)
     for index, crop in enumerate(crops):
@@ -3119,6 +3553,34 @@ def _sample_frame_indices(
         return frame_indices
     positions = np.linspace(0, len(frame_indices) - 1, maximum_count)
     return tuple(frame_indices[int(round(position))] for position in positions)
+
+
+def _prepare_provider_reference_image(image: np.ndarray) -> np.ndarray:
+    """Bound one reference while retaining its channels and aspect ratio."""
+
+    source = np.asarray(image)
+    if source.ndim not in {2, 3} or source.shape[0] <= 0 or source.shape[1] <= 0:
+        raise ValueError("A painted video reference has invalid dimensions.")
+    height, width = source.shape[:2]
+    longest_edge = max(height, width)
+    if longest_edge <= MAX_PROVIDER_REFERENCE_EDGE_PIXELS:
+        return np.ascontiguousarray(source)
+
+    scale = MAX_PROVIDER_REFERENCE_EDGE_PIXELS / longest_edge
+    target_width = max(1, round(width * scale))
+    target_height = max(1, round(height * scale))
+    resized = cv2.resize(
+        source,
+        (target_width, target_height),
+        interpolation=cv2.INTER_AREA,
+    )
+    return np.ascontiguousarray(resized)
+
+
+def _encode_provider_reference_png(image: np.ndarray) -> bytes:
+    """Normalize and encode one image sent to the texture provider."""
+
+    return _encode_png(_prepare_provider_reference_image(image))
 
 
 def _encode_png(image: np.ndarray) -> bytes:

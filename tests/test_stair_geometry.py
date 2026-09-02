@@ -282,6 +282,20 @@ class StairGeometryTests(unittest.TestCase):
         self.assertIn("stair_2_floating", model.scene.geometry)
         self.assertIn("stair_3_floating_with_riser", model.scene.geometry)
 
+        surfaces_omitted_model = convert_to_glb(
+            [ground_level, upper_level],
+            stairs=[supported_stair, floating_stair, floating_with_riser_stair],
+            export_untextured_surfaces=False,
+        )
+        self.assertEqual(
+            set(surfaces_omitted_model.scene.geometry),
+            {
+                "stair_1_supported",
+                "stair_2_floating",
+                "stair_3_floating_with_riser",
+            },
+        )
+
     def test_each_intermediate_section_shapes_all_stair_styles(self) -> None:
         ground_level = _build_level(2, "Ground")
         upper_level = _build_level(3, "Story")

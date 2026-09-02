@@ -18,6 +18,13 @@ from PIL import Image
 from housemaker.camera_models import CameraPose
 from housemaker.glb import GeneratedModel, PreviewTexturedSurface
 from housemaker.models import LevelData
+from housemaker.pbr_maps import (
+    PBR_MAP_METALLIC,
+    PBR_MAP_NORMAL,
+    PBR_MAP_ROUGHNESS,
+    PBR_MAP_TYPES,
+    normalize_pbr_map_types,
+)
 from housemaker.surface_geometry import (
     SURFACE_TYPE_CEILING,
     SURFACE_TYPE_FLOOR,
@@ -37,7 +44,9 @@ from housemaker.viewer import (
     _build_texture_mesh_data,
     _build_textured_wall_transform,
     _get_mesh_face_colors,
+    _limit_optional_texture_preview_size,
     _limit_texture_preview_size,
+    _normalize_pbr_maps_enabled,
 )
 
 
@@ -84,6 +93,30 @@ class CanvasSceneRenderItems:
 
 
 @dataclass(frozen=True)
+class _SurfaceTextureMaterial:
+    """Owned base color and optional PBR maps for one semantic surface."""
+
+    texture_rgba: np.ndarray
+    normal_texture_rgba: np.ndarray | None = None
+    roughness_texture_rgba: np.ndarray | None = None
+    metallic_texture_rgba: np.ndarray | None = None
+
+    def map_textures(self) -> dict[str, np.ndarray]:
+        """Return only available auxiliary maps in canonical order."""
+
+        candidates = {
+            PBR_MAP_NORMAL: self.normal_texture_rgba,
+            PBR_MAP_ROUGHNESS: self.roughness_texture_rgba,
+            PBR_MAP_METALLIC: self.metallic_texture_rgba,
+        }
+        return {
+            map_type: candidates[map_type]
+            for map_type in PBR_MAP_TYPES
+            if candidates[map_type] is not None
+        }
+
+
+@dataclass(frozen=True)
 class _MeshRayHit:
     distance: float
     face_index: int
@@ -114,6 +147,7 @@ class RepeatingTexturedMeshItem(TexturedMeshItem):
         ambient_light_intensity: float,
         *,
         double_sided: bool = False,
+        pbr_maps_enabled: Mapping[str, bool] | Sequence[str] | None = None,
     ) -> None:
         # Keep the complete shared texture renderer. The old custom resource
         # upload omitted required shader resources, so textured drawing failed
@@ -123,6 +157,7 @@ class RepeatingTexturedMeshItem(TexturedMeshItem):
             ambient_light_intensity,
             texture_repeat=True,
             double_sided=double_sided,
+            pbr_maps_enabled=pbr_maps_enabled,
         )
 
 
@@ -383,7 +418,10 @@ class SurfaceTextureViewer(QWidget):
         self._render_items_by_surface_id: dict[str, SurfaceRenderItems] = {}
         self._surface_id_by_item_id: dict[int, str] = {}
         self._selected_surface_ids: list[str] = []
+        self._surface_materials: dict[str, _SurfaceTextureMaterial] = {}
+        # Retain the established base-color cache for callers that inspect it.
         self._surface_textures: dict[str, np.ndarray] = {}
+        self._pbr_maps_enabled = _normalize_pbr_maps_enabled(None)
         self._scene_model: GeneratedModel | None = None
         self._canvas_scene_render_items = CanvasSceneRenderItems()
         self._preview_surfaces_by_id: dict[
@@ -463,16 +501,20 @@ class SurfaceTextureViewer(QWidget):
         surface_ids = [surface.surface_id for surface in normalized]
         if len(surface_ids) != len(set(surface_ids)):
             raise ValueError("Fixed surface IDs must be unique.")
-        retained_textures = {
-            surface_id: texture
-            for surface_id, texture in self._surface_textures.items()
+        retained_materials = {
+            surface_id: material
+            for surface_id, material in self._surface_materials.items()
             if surface_id in surface_ids
         }
         self._surfaces = normalized
         self._surface_by_id = {
             surface.surface_id: surface for surface in self._surfaces
         }
-        self._surface_textures = retained_textures
+        self._surface_materials = retained_materials
+        self._surface_textures = {
+            surface_id: material.texture_rgba
+            for surface_id, material in retained_materials.items()
+        }
         self._selected_surface_ids = [
             surface_id
             for surface_id in self._selected_surface_ids
@@ -558,13 +600,17 @@ class SurfaceTextureViewer(QWidget):
         self,
         surface_ids: Iterable[str],
         texture: bytes | bytearray | memoryview | str | Path | np.ndarray | Image.Image,
+        map_textures: Mapping[str, object] | None = None,
     ) -> None:
-        texture_rgba = _load_texture_rgba(texture)
+        """Apply one owned material family to each known semantic surface."""
+
+        material = _build_surface_texture_material(texture, map_textures)
         changed_ids: list[str] = []
         for surface_id in _deduplicate_strings(surface_ids):
             if surface_id not in self._surface_by_id:
                 continue
-            self._surface_textures[surface_id] = texture_rgba.copy()
+            self._surface_materials[surface_id] = material
+            self._surface_textures[surface_id] = material.texture_rgba
             changed_ids.append(surface_id)
         for surface_id in changed_ids:
             self._rebuild_surface_texture_item(surface_id)
@@ -613,10 +659,42 @@ class SurfaceTextureViewer(QWidget):
                 continue
 
     def clear_surface_textures(self) -> None:
+        self._surface_materials = {}
         self._surface_textures = {}
         for surface_id in list(self._render_items_by_surface_id):
             self._remove_surface_texture_item(surface_id)
         self._sync_selection_rendering()
+
+    def set_pbr_maps_enabled(
+        self,
+        enabled_maps: Mapping[str, bool] | Sequence[str] | None,
+    ) -> None:
+        """Toggle auxiliary maps on existing surface items without rebuilding."""
+
+        normalized = _normalize_pbr_maps_enabled(enabled_maps)
+        if normalized == self._pbr_maps_enabled:
+            return
+        self._pbr_maps_enabled = normalized
+        for texture_item in self._iter_surface_texture_items():
+            texture_item.set_pbr_maps_enabled(normalized)
+        self.view.update()
+
+    def get_pbr_maps_enabled(self) -> dict[str, bool]:
+        """Return an isolated copy of the current auxiliary-map state."""
+
+        return dict(self._pbr_maps_enabled)
+
+    def _iter_surface_texture_items(
+        self,
+    ) -> tuple[RepeatingTexturedMeshItem, ...]:
+        """Return every current semantic-surface texture item exactly once."""
+
+        items: list[RepeatingTexturedMeshItem] = []
+        for render_items in self._render_items_by_surface_id.values():
+            if render_items.texture_item is not None:
+                items.append(render_items.texture_item)
+            items.extend(render_items.additional_texture_items)
+        return tuple(items)
 
     def set_texture_world_size_meters(self, size_meters: float) -> None:
         size = float(size_meters)
@@ -851,18 +929,19 @@ class SurfaceTextureViewer(QWidget):
         self._remove_surface_texture_item(surface_id)
         surface = self._surface_by_id.get(surface_id)
         render_items = self._render_items_by_surface_id.get(surface_id)
-        texture_rgba = self._surface_textures.get(surface_id)
-        if surface is None or render_items is None or texture_rgba is None:
+        material = self._surface_materials.get(surface_id)
+        if surface is None or render_items is None or material is None:
             return
         texture_data_values = self._build_surface_texture_data_values(
             surface,
-            texture_rgba,
+            material,
         )
         texture_items = tuple(
             RepeatingTexturedMeshItem(
                 texture_data,
                 self._ambient_light_intensity,
                 double_sided=double_sided,
+                pbr_maps_enabled=self._pbr_maps_enabled,
             )
             for texture_data, double_sided in texture_data_values
         )
@@ -878,7 +957,7 @@ class SurfaceTextureViewer(QWidget):
     def _build_surface_texture_data_values(
         self,
         surface: FixedSurface,
-        texture_rgba: np.ndarray,
+        material: _SurfaceTextureMaterial,
     ) -> tuple[tuple[TextureMeshData, bool], ...]:
         previews = self._preview_surfaces_by_id.get(surface.surface_id, ())
         preview_data = tuple(
@@ -894,7 +973,24 @@ class SurfaceTextureViewer(QWidget):
                         vertices=texture_data.vertices,
                         normals=texture_data.normals,
                         texture_coordinates=texture_data.texture_coordinates,
-                        texture_rgba=_limit_texture_preview_size(texture_rgba),
+                        texture_rgba=_limit_texture_preview_size(
+                            material.texture_rgba
+                        ),
+                        normal_texture_rgba=(
+                            _limit_optional_texture_preview_size(
+                                material.normal_texture_rgba
+                            )
+                        ),
+                        roughness_texture_rgba=(
+                            _limit_optional_texture_preview_size(
+                                material.roughness_texture_rgba
+                            )
+                        ),
+                        metallic_texture_rgba=(
+                            _limit_optional_texture_preview_size(
+                                material.metallic_texture_rgba
+                            )
+                        ),
                     ),
                     double_sided,
                 )
@@ -909,8 +1005,9 @@ class SurfaceTextureViewer(QWidget):
 
         texture_data = _build_surface_texture_mesh_data(
             surface,
-            texture_rgba,
+            material.texture_rgba,
             self._texture_world_size_meters,
+            map_textures=material.map_textures(),
         )
         double_sided = (
             surface.surface_type == SURFACE_TYPE_WALL
@@ -1090,11 +1187,56 @@ def _build_outline_point_key(
     return float(rounded[0]), float(rounded[1]), float(rounded[2])
 
 
+# ### Surface material helpers ###
+def _build_surface_texture_material(
+    texture: object,
+    map_textures: Mapping[str, object] | None,
+) -> _SurfaceTextureMaterial:
+    """Load and own one aligned base-color and PBR texture family."""
+
+    texture_rgba = _load_texture_rgba(texture)  # type: ignore[arg-type]
+    if map_textures is None:
+        normalized_sources: dict[str, object] = {}
+    else:
+        if not isinstance(map_textures, Mapping):
+            raise TypeError("Surface PBR maps must contain a mapping.")
+        normalized_sources = {}
+        raw_map_types: list[str] = []
+        for raw_map_type, source in map_textures.items():
+            map_type = str(raw_map_type).strip().lower()
+            if map_type in normalized_sources:
+                raise ValueError("Surface PBR maps contain a duplicate map.")
+            normalized_sources[map_type] = source
+            raw_map_types.append(map_type)
+        normalize_pbr_map_types(raw_map_types, label="Surface PBR maps")
+
+    normalized_maps: dict[str, np.ndarray] = {}
+    for map_type in PBR_MAP_TYPES:
+        source = normalized_sources.get(map_type)
+        if source is None:
+            continue
+        map_rgba = _load_texture_rgba(source)  # type: ignore[arg-type]
+        if map_rgba.shape[:2] != texture_rgba.shape[:2]:
+            raise ValueError(
+                "Surface PBR maps must match the base-color dimensions."
+            )
+        normalized_maps[map_type] = map_rgba.copy()
+
+    return _SurfaceTextureMaterial(
+        texture_rgba=texture_rgba.copy(),
+        normal_texture_rgba=normalized_maps.get(PBR_MAP_NORMAL),
+        roughness_texture_rgba=normalized_maps.get(PBR_MAP_ROUGHNESS),
+        metallic_texture_rgba=normalized_maps.get(PBR_MAP_METALLIC),
+    )
+
+
 # ### Texture coordinate helpers ###
 def _build_surface_texture_mesh_data(
     surface: FixedSurface,
     texture_rgba: np.ndarray,
     texture_world_size_meters: float,
+    *,
+    map_textures: Mapping[str, np.ndarray] | None = None,
 ) -> TextureMeshData:
     mesh = surface.mesh
     faces = np.asarray(mesh.faces, dtype=np.int64)
@@ -1123,6 +1265,7 @@ def _build_surface_texture_mesh_data(
             texture_coordinates[face_index, :, 1] = (
                 triangle_vertices[:, 1] / tile_size
             )
+    normalized_maps = dict(map_textures or {})
     return TextureMeshData(
         vertices=np.ascontiguousarray(face_vertices.reshape(-1, 3)),
         normals=np.ascontiguousarray(np.repeat(face_normals, 3, axis=0)),
@@ -1130,6 +1273,15 @@ def _build_surface_texture_mesh_data(
             texture_coordinates.reshape(-1, 2)
         ),
         texture_rgba=_limit_texture_preview_size(texture_rgba),
+        normal_texture_rgba=_limit_optional_texture_preview_size(
+            normalized_maps.get(PBR_MAP_NORMAL)
+        ),
+        roughness_texture_rgba=_limit_optional_texture_preview_size(
+            normalized_maps.get(PBR_MAP_ROUGHNESS)
+        ),
+        metallic_texture_rgba=_limit_optional_texture_preview_size(
+            normalized_maps.get(PBR_MAP_METALLIC)
+        ),
     )
 
 

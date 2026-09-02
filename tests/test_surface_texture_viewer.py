@@ -18,12 +18,16 @@ from PySide6.QtWidgets import QApplication
 
 from housemaker.camera_models import CameraPose
 from housemaker.glb import GeneratedModel, PreviewTexturedSurface
+from housemaker.pbr_maps import (
+    PBR_MAP_METALLIC,
+    PBR_MAP_NORMAL,
+    PBR_MAP_ROUGHNESS,
+)
 from housemaker.surface_materials import (
     ResolvedSurfaceMaterial,
     build_world_planar_textured_mesh,
 )
 from housemaker.surface_geometry import (
-    SURFACE_TYPE_CEILING,
     SURFACE_TYPE_FLOOR,
     SURFACE_TYPE_WALL,
     FixedSurface,
@@ -120,6 +124,28 @@ def _build_canvas_model_with_surface(
         ],
         preview_untextured_mesh=base_mesh,
     )
+
+
+def _build_pbr_map_textures(
+    size: int = 16,
+) -> dict[str, np.ndarray]:
+    return {
+        PBR_MAP_NORMAL: np.full(
+            (size, size, 4),
+            (96, 144, 240, 255),
+            dtype=np.uint8,
+        ),
+        PBR_MAP_ROUGHNESS: np.full(
+            (size, size, 4),
+            (72, 72, 72, 255),
+            dtype=np.uint8,
+        ),
+        PBR_MAP_METALLIC: np.full(
+            (size, size, 4),
+            (180, 180, 180, 255),
+            dtype=np.uint8,
+        ),
+    }
 
 
 # ### Tests ###
@@ -481,6 +507,144 @@ class SurfaceTextureViewerCanvasParityTests(unittest.TestCase):
             RepeatingTexturedMeshItem.__dict__,
         )
         self.assertTrue(hasattr(texture_item, "_edit_mask_texture_id"))
+
+    def test_pbr_maps_reach_preview_geometry_and_toggle_without_rebuild(
+        self,
+    ) -> None:
+        map_textures = _build_pbr_map_textures()
+        self.surface_viewer.set_surfaces((self.surface,))
+        self.surface_viewer.set_scene_model(self.model)
+        self.surface_viewer.set_surface_texture(
+            (self.surface.surface_id,),
+            self.texture_rgba,
+            map_textures=map_textures,
+        )
+        render_items = self.surface_viewer._render_items_by_surface_id[
+            self.surface.surface_id
+        ]
+        texture_item = render_items.texture_item
+
+        self.assertIsNotNone(texture_item)
+        assert texture_item is not None
+        self.assertTrue(texture_item._normal_texture_available)
+        self.assertTrue(texture_item._roughness_texture_available)
+        self.assertTrue(texture_item._metallic_texture_available)
+        np.testing.assert_array_equal(
+            texture_item._normal_texture_rgba,
+            map_textures[PBR_MAP_NORMAL],
+        )
+        np.testing.assert_array_equal(
+            texture_item._roughness_texture_rgba,
+            map_textures[PBR_MAP_ROUGHNESS],
+        )
+        np.testing.assert_array_equal(
+            texture_item._metallic_texture_rgba,
+            map_textures[PBR_MAP_METALLIC],
+        )
+        self.assertEqual(
+            self.surface_viewer.get_pbr_maps_enabled(),
+            {
+                PBR_MAP_NORMAL: False,
+                PBR_MAP_ROUGHNESS: False,
+                PBR_MAP_METALLIC: False,
+            },
+        )
+        self.assertIsNone(texture_item._tangents)
+
+        self.surface_viewer.set_pbr_maps_enabled(
+            (PBR_MAP_NORMAL, PBR_MAP_ROUGHNESS)
+        )
+
+        self.assertIs(
+            render_items.texture_item,
+            texture_item,
+        )
+        self.assertEqual(
+            texture_item.get_pbr_maps_enabled(),
+            {
+                PBR_MAP_NORMAL: True,
+                PBR_MAP_ROUGHNESS: True,
+                PBR_MAP_METALLIC: False,
+            },
+        )
+        self.assertIsNotNone(texture_item._tangents)
+
+    def test_pbr_maps_reach_fallback_geometry_and_base_only_replaces_them(
+        self,
+    ) -> None:
+        map_textures = _build_pbr_map_textures()
+        self.surface_viewer.set_surfaces((self.surface,))
+        self.surface_viewer.set_pbr_maps_enabled((PBR_MAP_METALLIC,))
+        self.surface_viewer.set_surface_texture(
+            (self.surface.surface_id,),
+            self.texture_rgba,
+            map_textures=map_textures,
+        )
+        first_item = self.surface_viewer._render_items_by_surface_id[
+            self.surface.surface_id
+        ].texture_item
+
+        self.assertIsNotNone(first_item)
+        assert first_item is not None
+        self.assertTrue(first_item._normal_texture_available)
+        self.assertEqual(
+            first_item.get_pbr_maps_enabled(),
+            {
+                PBR_MAP_NORMAL: False,
+                PBR_MAP_ROUGHNESS: False,
+                PBR_MAP_METALLIC: True,
+            },
+        )
+
+        self.surface_viewer.set_surface_texture(
+            (self.surface.surface_id,),
+            self.texture_rgba,
+        )
+        replacement_item = self.surface_viewer._render_items_by_surface_id[
+            self.surface.surface_id
+        ].texture_item
+
+        self.assertIsNotNone(replacement_item)
+        assert replacement_item is not None
+        self.assertIsNot(replacement_item, first_item)
+        self.assertFalse(replacement_item._normal_texture_available)
+        self.assertFalse(replacement_item._roughness_texture_available)
+        self.assertFalse(replacement_item._metallic_texture_available)
+
+    def test_surface_pbr_inputs_are_owned_and_dimension_checked(self) -> None:
+        map_textures = _build_pbr_map_textures()
+        self.surface_viewer.set_surfaces((self.surface,))
+        self.surface_viewer.set_surface_texture(
+            (self.surface.surface_id,),
+            self.texture_rgba,
+            map_textures=map_textures,
+        )
+        map_textures[PBR_MAP_NORMAL][:] = 0
+        texture_item = self.surface_viewer._render_items_by_surface_id[
+            self.surface.surface_id
+        ].texture_item
+
+        self.assertIsNotNone(texture_item)
+        assert texture_item is not None
+        self.assertFalse(np.all(texture_item._normal_texture_rgba == 0))
+        with self.assertRaises(ValueError):
+            self.surface_viewer.set_surface_texture(
+                (self.surface.surface_id,),
+                self.texture_rgba,
+                map_textures={"unknown": self.texture_rgba},
+            )
+        with self.assertRaisesRegex(ValueError, "dimensions"):
+            self.surface_viewer.set_surface_texture(
+                (self.surface.surface_id,),
+                self.texture_rgba,
+                map_textures=_build_pbr_map_textures(8),
+            )
+        self.assertIs(
+            self.surface_viewer._render_items_by_surface_id[
+                self.surface.surface_id
+            ].texture_item,
+            texture_item,
+        )
 
     def test_both_canvas_sides_of_one_wall_remain_visible(self) -> None:
         first_preview = self.model.preview_textured_surfaces[0]

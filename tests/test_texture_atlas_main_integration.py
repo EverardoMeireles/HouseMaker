@@ -19,20 +19,40 @@ from PIL import Image
 from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtGui import QWheelEvent
 from PySide6.QtWidgets import QApplication
+from trimesh.visual.material import PBRMaterial
+from trimesh.visual.texture import TextureVisuals
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.glb import GeneratedModel
-from housemaker.generation_state import GeneratedObjectRecord
+from housemaker.generation_state import (
+    GeneratedObjectPlacement,
+    GeneratedObjectRecord,
+    GenerationData,
+)
 from housemaker.main import BlueprintWorkspace
-from housemaker.models import GROUND_LEVEL_INDEX, create_default_levels
+from housemaker.models import (
+    GROUND_LEVEL_INDEX,
+    LevelData,
+    RoomData,
+    VertexData,
+    create_default_levels,
+)
+from housemaker.pbr_maps import (
+    ATLAS_MAP_BASE_COLOR,
+    PBR_MAP_METALLIC,
+    PBR_MAP_NORMAL,
+    PBR_MAP_ROUGHNESS,
+)
 from housemaker.project_io import ProjectData
 from housemaker.surface_texture_state import (
+    SURFACE_TYPE_FLOOR,
     SURFACE_TYPE_WALL,
     SURFACE_TEXTURE_RESOLUTIONS,
     SurfaceTextureAssignment,
     SurfaceTextureData,
     SurfaceTextureVariant,
 )
+from housemaker.surface_geometry import build_fixed_surfaces
 from housemaker.texture_atlas_state import (
     ATLAS_PACKING_MODE_SYMMETRIC_HALF,
     ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
@@ -41,7 +61,8 @@ from housemaker.texture_atlas_state import (
     TextureAtlasData,
 )
 from housemaker.texture_atlas_workspace import (
-    ATLAS_MAP_NORMAL,
+    OBJECT_SCENE_REQUIRED_UNPACKED_COLOR,
+    OBJECT_SCENE_REQUIRED_UNPACKED_ROLE,
     build_atlas_wall_texture_source_id,
     build_texture_atlas_map_image_relative_path,
 )
@@ -58,6 +79,7 @@ def _wall_texture_assignment(
     *,
     assignment_id: str = "brick-wall",
     surface_ids: tuple[str, ...] = ("level:2/wall:1:2",),
+    surface_type: str = SURFACE_TYPE_WALL,
     size: tuple[int, int] = (12, 8),
     color: tuple[int, int, int, int] = (170, 70, 25, 255),
 ) -> SurfaceTextureAssignment:
@@ -67,7 +89,7 @@ def _wall_texture_assignment(
     Image.new("RGBA", size, color).save(directory / asset_path)
     return SurfaceTextureAssignment(
         assignment_id=assignment_id,
-        surface_type=SURFACE_TYPE_WALL,
+        surface_type=surface_type,
         surface_ids=surface_ids,
         provider="test",
         asset_path=asset_path,
@@ -116,6 +138,158 @@ def _wall_texture_assignment_with_variants(
         texture_height=selected_resolution,
         texture_variants=tuple(variants),
         selected_texture_resolution=selected_resolution,
+    )
+
+
+def _wall_texture_assignment_with_pbr_variants(
+    asset_directory: str | Path,
+    *,
+    assignment_id: str = "pbr-wall-variants",
+    surface_ids: tuple[str, ...] = ("level:2/wall:1:2",),
+    selected_resolution: int = 512,
+) -> SurfaceTextureAssignment:
+    directory = Path(asset_directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    map_colors = {
+        ATLAS_MAP_BASE_COLOR: (40, 60, 80, 255),
+        PBR_MAP_NORMAL: (110, 120, 230, 255),
+        PBR_MAP_ROUGHNESS: (70, 70, 70, 255),
+        PBR_MAP_METALLIC: (190, 190, 190, 255),
+    }
+    variants: list[SurfaceTextureVariant] = []
+    for resolution in SURFACE_TEXTURE_RESOLUTIONS:
+        map_asset_paths: dict[str, str] = {}
+        for map_type, color in map_colors.items():
+            asset_path = (
+                f"{assignment_id}.{map_type}-{resolution}.png"
+            )
+            Image.new("RGBA", (resolution, resolution), color).save(
+                directory / asset_path,
+                format="PNG",
+            )
+            map_asset_paths[map_type] = asset_path
+        variants.append(
+            SurfaceTextureVariant(
+                resolution=resolution,
+                asset_path=map_asset_paths[ATLAS_MAP_BASE_COLOR],
+                map_asset_paths=map_asset_paths,
+            )
+        )
+    active_variant = next(
+        variant
+        for variant in variants
+        if variant.resolution == selected_resolution
+    )
+    return SurfaceTextureAssignment(
+        assignment_id=assignment_id,
+        surface_type=SURFACE_TYPE_WALL,
+        surface_ids=surface_ids,
+        provider="test",
+        asset_path=active_variant.asset_path,
+        texture_width=selected_resolution,
+        texture_height=selected_resolution,
+        texture_variants=tuple(variants),
+        selected_texture_resolution=selected_resolution,
+        enabled_pbr_maps=(
+            PBR_MAP_NORMAL,
+            PBR_MAP_ROUGHNESS,
+            PBR_MAP_METALLIC,
+        ),
+    )
+
+
+def _generated_object_record_with_variants(
+    asset_directory: str | Path,
+    *,
+    object_id: str,
+    object_name: str,
+    resolutions: tuple[int, ...],
+    selected_resolution: int,
+    placement: GeneratedObjectPlacement | None = None,
+    pbr_map_types: tuple[str, ...] = (),
+) -> GeneratedObjectRecord:
+    directory = Path(asset_directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    glb_payload = bytes(
+        trimesh.Scene(trimesh.creation.box()).export(file_type="glb")
+    )
+    variants: dict[str, dict[str, object]] = {}
+    for index, resolution in enumerate(resolutions):
+        glb_name = f"{object_id}.texture-{resolution}.glb"
+        texture_name = f"{object_id}.texture-{resolution}.png"
+        (directory / glb_name).write_bytes(glb_payload)
+        Image.new(
+            "RGBA",
+            (resolution, resolution),
+            (40 + index * 30, 80, 120, 255),
+        ).save(directory / texture_name, format="PNG")
+        variant: dict[str, object] = {
+            "glb_asset_path": glb_name,
+            "texture_asset_path": texture_name,
+        }
+        if pbr_map_types:
+            map_paths = {ATLAS_MAP_BASE_COLOR: texture_name}
+            for map_index, map_type in enumerate(pbr_map_types):
+                map_name = (
+                    f"{object_id}.texture-{resolution}.{map_type}.png"
+                )
+                Image.new(
+                    "RGBA",
+                    (resolution, resolution),
+                    (80 + map_index * 30, 90, 180, 255),
+                ).save(directory / map_name, format="PNG")
+                map_paths[map_type] = map_name
+            variant["map_texture_asset_paths"] = map_paths
+        variants[str(resolution)] = variant
+    selected_glb_name = str(
+        variants[str(selected_resolution)]["glb_asset_path"]
+    )
+    return GeneratedObjectRecord(
+        object_id=object_id,
+        frame_index=0,
+        object_name=object_name,
+        pipeline={
+            "texture_variants": variants,
+            "selected_texture_resolution": selected_resolution,
+        },
+        provider_task_id=f"{object_id}-task",
+        asset_path=selected_glb_name,
+        placement=placement,
+    )
+
+
+def _add_square_room_to_level(level: LevelData) -> str:
+    vertex_data = VertexData()
+    boundary_ids = tuple(
+        vertex_data.add_vertex(*point).id
+        for point in (
+            (0.0, 0.0),
+            (100.0, 0.0),
+            (100.0, 100.0),
+            (0.0, 100.0),
+        )
+    )
+    for start_id, end_id in zip(
+        boundary_ids,
+        (*boundary_ids[1:], boundary_ids[0]),
+        strict=True,
+    ):
+        vertex_data.add_edge(start_id, end_id)
+    center = vertex_data.add_vertex(50.0, 50.0)
+    level.vertex_data = vertex_data
+    level.rooms = [
+        RoomData(
+            name="Atlas room",
+            vertex_ids=boundary_ids,
+            center_vertex_id=center.id,
+            color_rgb=(120, 140, 160),
+        )
+    ]
+    level.floor_contour_vertex_ids = boundary_ids
+    return next(
+        surface.surface_id
+        for surface in build_fixed_surfaces([level])
+        if surface.surface_type == SURFACE_TYPE_WALL
     )
 
 
@@ -307,6 +481,638 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             "3D texture variant is missing",
             self.workspace.texture_atlas_workspace.status_label.text(),
         )
+
+    def test_placed_object_is_automatically_added_at_settings_resolution(
+        self,
+    ) -> None:
+        resolution_combo = (
+            self.workspace.settings_widget
+            .automatic_atlas_texture_resolution_combo
+        )
+        resolution_combo.setCurrentIndex(resolution_combo.findData(1024))
+        atlas_data = TextureAtlasData()
+        atlas = atlas_data.create_atlas(
+            "Placed objects",
+            2048,
+            atlas_id="placed-objects",
+        )
+        self.workspace.texture_atlas_workspace.set_data(atlas_data)
+        record = _generated_object_record_with_variants(
+            self.settings.path.parent / "generated",
+            object_id="placed-chair",
+            object_name="Placed chair",
+            resolutions=(512, 1024),
+            selected_resolution=512,
+            placement=GeneratedObjectPlacement(
+                level_index=self.workspace.current_level.index,
+                image_x=50.0,
+                image_y=60.0,
+            ),
+        )
+        generation_data = GenerationData(generated_objects=[record])
+
+        self.workspace.generation.set_data(generation_data)
+        self.workspace.generation.data_changed.emit(generation_data)
+
+        packed = self.workspace.texture_atlas_workspace.get_data().atlas_by_id(
+            atlas.atlas_id
+        )
+        assert packed is not None
+        placement = packed.placement_for_object(record.object_id)
+        self.assertIsNotNone(placement)
+        assert placement is not None
+        self.assertEqual(placement.texture_resolution, 1024)
+        active_variant = self.workspace.generation.get_active_texture_variant(
+            record.object_id
+        )
+        self.assertIsNotNone(active_variant)
+        assert active_variant is not None
+        self.assertEqual(active_variant.resolution, 1024)
+        self.assertEqual(
+            self.workspace.texture_atlas_workspace
+            .get_unpacked_scene_texture_source_ids(),
+            (),
+        )
+
+    def test_pbr_sort_routes_non_pbr_object_to_unique_auxiliary_atlas(
+        self,
+    ) -> None:
+        settings_widget = self.workspace.settings_widget
+        settings_widget.automatic_atlas_texture_sort_by_pbr_checkbox.setChecked(
+            True
+        )
+        resolution_combo = (
+            settings_widget.automatic_atlas_texture_resolution_combo
+        )
+        resolution_combo.setCurrentIndex(resolution_combo.findData(1024))
+        asset_directory = self.settings.path.parent / "generated"
+        pbr_record = _generated_object_record_with_variants(
+            asset_directory,
+            object_id="pbr-cabinet",
+            object_name="PBR cabinet",
+            resolutions=(1024,),
+            selected_resolution=1024,
+            pbr_map_types=(PBR_MAP_NORMAL,),
+        )
+        pbr_data = GenerationData(generated_objects=[pbr_record])
+        self.workspace.generation.set_data(pbr_data)
+        self.workspace.generation.data_changed.emit(pbr_data)
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        pbr_source = atlas_workspace._sources_by_object_id[
+            pbr_record.object_id
+        ]
+        self.assertTrue(pbr_source.has_texture_map(PBR_MAP_NORMAL))
+
+        atlas_data = TextureAtlasData()
+        selected_atlas = atlas_data.create_atlas(
+            "Selected PBR",
+            2048,
+            atlas_id="selected-pbr",
+        )
+        reserved_name_atlas = atlas_data.create_atlas(
+            "[NON-PBR] Atlas",
+            2048,
+            atlas_id="reserved-non-pbr-name",
+        )
+        for atlas in (selected_atlas, reserved_name_atlas):
+            atlas_data.assign_object(
+                atlas.atlas_id,
+                pbr_source.object_id,
+                pbr_source.texture_path,
+                pbr_source.texture_resolution,
+            )
+        atlas_data.select_atlas(selected_atlas.atlas_id)
+        atlas_workspace.set_data(atlas_data)
+
+        non_pbr_record = _generated_object_record_with_variants(
+            asset_directory,
+            object_id="plain-chair",
+            object_name="Plain chair",
+            resolutions=(512, 1024),
+            selected_resolution=512,
+            placement=GeneratedObjectPlacement(
+                level_index=self.workspace.current_level.index,
+                image_x=40.0,
+                image_y=55.0,
+            ),
+        )
+        scene_data = GenerationData(
+            generated_objects=[pbr_record, non_pbr_record]
+        )
+
+        self.workspace.generation.set_data(scene_data)
+        self.workspace.generation.data_changed.emit(scene_data)
+
+        packed_data = atlas_workspace.get_data()
+        self.assertEqual(packed_data.selected_atlas_id, selected_atlas.atlas_id)
+        packed_selected_atlas = packed_data.atlas_by_id(
+            selected_atlas.atlas_id
+        )
+        packed_reserved_atlas = packed_data.atlas_by_id(
+            reserved_name_atlas.atlas_id
+        )
+        assert packed_selected_atlas is not None
+        assert packed_reserved_atlas is not None
+        self.assertIsNone(
+            packed_selected_atlas.placement_for_object(
+                non_pbr_record.object_id
+            )
+        )
+        self.assertIsNone(
+            packed_reserved_atlas.placement_for_object(
+                non_pbr_record.object_id
+            )
+        )
+        auxiliary_atlases = [
+            atlas
+            for atlas in packed_data.atlases
+            if atlas.atlas_id
+            not in {selected_atlas.atlas_id, reserved_name_atlas.atlas_id}
+        ]
+        self.assertEqual(len(auxiliary_atlases), 1)
+        auxiliary_atlas = auxiliary_atlases[0]
+        self.assertTrue(auxiliary_atlas.name.startswith("[NON-PBR]"))
+        self.assertEqual(
+            len({atlas.name.casefold() for atlas in packed_data.atlases}),
+            len(packed_data.atlases),
+        )
+        placement = auxiliary_atlas.placement_for_object(
+            non_pbr_record.object_id
+        )
+        self.assertIsNotNone(placement)
+        assert placement is not None
+        self.assertEqual(placement.texture_resolution, 1024)
+
+    def test_disabled_pbr_sort_keeps_non_pbr_object_in_selected_atlas(
+        self,
+    ) -> None:
+        self.workspace.settings_widget \
+            .automatic_atlas_texture_sort_by_pbr_checkbox.setChecked(False)
+        asset_directory = self.settings.path.parent / "generated"
+        pbr_record = _generated_object_record_with_variants(
+            asset_directory,
+            object_id="mapped-desk",
+            object_name="Mapped desk",
+            resolutions=(512,),
+            selected_resolution=512,
+            pbr_map_types=(PBR_MAP_ROUGHNESS,),
+        )
+        pbr_data = GenerationData(generated_objects=[pbr_record])
+        self.workspace.generation.set_data(pbr_data)
+        self.workspace.generation.data_changed.emit(pbr_data)
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        pbr_source = atlas_workspace._sources_by_object_id[
+            pbr_record.object_id
+        ]
+        atlas_data = TextureAtlasData()
+        selected_atlas = atlas_data.create_atlas(
+            "Mixed Atlas",
+            2048,
+            atlas_id="mixed-atlas",
+        )
+        atlas_data.assign_object(
+            selected_atlas.atlas_id,
+            pbr_source.object_id,
+            pbr_source.texture_path,
+            pbr_source.texture_resolution,
+        )
+        atlas_workspace.set_data(atlas_data)
+        non_pbr_record = _generated_object_record_with_variants(
+            asset_directory,
+            object_id="plain-stool",
+            object_name="Plain stool",
+            resolutions=(512,),
+            selected_resolution=512,
+            placement=GeneratedObjectPlacement(
+                level_index=self.workspace.current_level.index,
+                image_x=35.0,
+                image_y=50.0,
+            ),
+        )
+        scene_data = GenerationData(
+            generated_objects=[pbr_record, non_pbr_record]
+        )
+
+        self.workspace.generation.set_data(scene_data)
+        self.workspace.generation.data_changed.emit(scene_data)
+
+        packed_data = atlas_workspace.get_data()
+        self.assertEqual(len(packed_data.atlases), 1)
+        packed_atlas = packed_data.atlas_by_id(selected_atlas.atlas_id)
+        assert packed_atlas is not None
+        self.assertIsNotNone(
+            packed_atlas.placement_for_object(non_pbr_record.object_id)
+        )
+
+    def test_canvas_removal_unassigns_texture_but_retains_generated_source(
+        self,
+    ) -> None:
+        asset_directory = self.settings.path.parent / "generated"
+        record = _generated_object_record_with_variants(
+            asset_directory,
+            object_id="placed-sideboard",
+            object_name="Placed sideboard",
+            resolutions=(512,),
+            selected_resolution=512,
+            placement=GeneratedObjectPlacement(
+                level_index=self.workspace.current_level.index,
+                image_x=30.0,
+                image_y=45.0,
+            ),
+        )
+        generation_data = GenerationData(generated_objects=[record])
+        self.workspace.generation.set_data(generation_data)
+        self.workspace.generation.data_changed.emit(generation_data)
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        source = atlas_workspace._sources_by_object_id[record.object_id]
+        atlas_data = TextureAtlasData()
+        first_atlas = atlas_data.create_atlas(
+            "First placement",
+            2048,
+            atlas_id="first-placement",
+        )
+        second_atlas = atlas_data.create_atlas(
+            "Second placement",
+            2048,
+            atlas_id="second-placement",
+        )
+        for atlas in (first_atlas, second_atlas):
+            atlas_data.assign_object(
+                atlas.atlas_id,
+                source.object_id,
+                source.texture_path,
+                source.texture_resolution,
+            )
+        atlas_workspace.set_data(atlas_data)
+
+        self.workspace.viewer.placed_object_removal_requested.emit(
+            record.object_id
+        )
+
+        retained_data = self.workspace.generation.get_data()
+        self.assertEqual(
+            [item.object_id for item in retained_data.generated_objects],
+            [record.object_id],
+        )
+        self.assertIsNone(retained_data.generated_objects[0].placement)
+        self.assertIn(record.object_id, atlas_workspace._sources_by_object_id)
+        self.assertTrue(source.physical_texture_path.is_file())
+        for atlas in atlas_workspace.get_data().atlases:
+            with self.subTest(atlas=atlas.name):
+                self.assertIsNone(
+                    atlas.placement_for_object(record.object_id)
+                )
+        self.assertEqual(
+            atlas_workspace.get_unpacked_scene_texture_source_ids(),
+            (),
+        )
+
+    def test_included_textured_surface_is_auto_added_at_settings_resolution(
+        self,
+    ) -> None:
+        resolution_combo = (
+            self.workspace.settings_widget
+            .automatic_atlas_texture_resolution_combo
+        )
+        resolution_combo.setCurrentIndex(resolution_combo.findData(1024))
+        wall_surface_id = _add_square_room_to_level(
+            self.workspace.current_level
+        )
+        self.workspace.surface_texture_generation.set_levels(
+            self.workspace.levels
+        )
+        atlas_data = TextureAtlasData()
+        atlas = atlas_data.create_atlas(
+            "Included surfaces",
+            2048,
+            atlas_id="included-surfaces",
+        )
+        self.workspace.texture_atlas_workspace.set_data(atlas_data)
+        assignment = _wall_texture_assignment_with_variants(
+            self.settings.path.parent / "surface_textures",
+            assignment_id="included-wall",
+            surface_ids=(wall_surface_id,),
+            selected_resolution=512,
+        )
+        surface_data = SurfaceTextureData(assignments=[assignment])
+
+        self.workspace.surface_texture_generation.set_data(surface_data)
+        self.workspace.surface_texture_generation.data_changed.emit(surface_data)
+
+        source_id = build_atlas_wall_texture_source_id(
+            assignment.assignment_id
+        )
+        packed = self.workspace.texture_atlas_workspace.get_data().atlas_by_id(
+            atlas.atlas_id
+        )
+        assert packed is not None
+        placement = packed.placement_for_object(source_id)
+        self.assertIsNotNone(placement)
+        assert placement is not None
+        self.assertEqual(placement.texture_resolution, 1024)
+        selected_assignment = (
+            self.workspace.surface_texture_generation.get_assignment(
+                assignment.assignment_id
+            )
+        )
+        self.assertIsNotNone(selected_assignment)
+        assert selected_assignment is not None
+        self.assertEqual(selected_assignment.selected_texture_resolution, 1024)
+        self.assertEqual(
+            self.workspace.texture_atlas_workspace
+            .get_unpacked_scene_texture_source_ids(),
+            (),
+        )
+
+    def test_required_texture_stays_unpacked_and_red_when_atlas_is_full(
+        self,
+    ) -> None:
+        atlas_data = TextureAtlasData()
+        atlas = atlas_data.create_atlas(
+            "Full atlas",
+            2048,
+            atlas_id="full-atlas",
+        )
+        atlas_data.assign_object(
+            atlas.atlas_id,
+            "occupier",
+            "occupier.png",
+            2048,
+        )
+        self.workspace.texture_atlas_workspace.set_data(atlas_data)
+        record = _generated_object_record_with_variants(
+            self.settings.path.parent / "generated",
+            object_id="unpacked-table",
+            object_name="Unpacked table",
+            resolutions=(512,),
+            selected_resolution=512,
+            placement=GeneratedObjectPlacement(
+                level_index=self.workspace.current_level.index,
+                image_x=25.0,
+                image_y=35.0,
+            ),
+        )
+        generation_data = GenerationData(generated_objects=[record])
+
+        self.workspace.generation.set_data(generation_data)
+        self.workspace.generation.data_changed.emit(generation_data)
+
+        self.assertEqual(
+            self.workspace.texture_atlas_workspace
+            .get_unpacked_scene_texture_source_ids(),
+            (record.object_id,),
+        )
+        packed = self.workspace.texture_atlas_workspace.get_data().atlas_by_id(
+            atlas.atlas_id
+        )
+        assert packed is not None
+        self.assertIsNone(packed.placement_for_object(record.object_id))
+        source_item = next(
+            self.workspace.texture_atlas_workspace.object_list.item(index)
+            for index in range(
+                self.workspace.texture_atlas_workspace.object_list.count()
+            )
+            if self.workspace.texture_atlas_workspace.object_list.item(
+                index
+            ).data(Qt.ItemDataRole.UserRole)
+            == record.object_id
+        )
+        self.assertTrue(
+            source_item.data(OBJECT_SCENE_REQUIRED_UNPACKED_ROLE)
+        )
+        self.assertEqual(
+            source_item.foreground().color(),
+            OBJECT_SCENE_REQUIRED_UNPACKED_COLOR,
+        )
+
+    def test_export_blocks_before_file_dialog_for_unpacked_scene_texture(
+        self,
+    ) -> None:
+        record = _generated_object_record_with_variants(
+            self.settings.path.parent / "generated",
+            object_id="unatlased-sofa",
+            object_name="Unatlased sofa",
+            resolutions=(512,),
+            selected_resolution=512,
+            placement=GeneratedObjectPlacement(
+                level_index=self.workspace.current_level.index,
+                image_x=15.0,
+                image_y=20.0,
+            ),
+        )
+        self.workspace.generation.set_data(
+            GenerationData(generated_objects=[record])
+        )
+
+        with (
+            patch("housemaker.main.QMessageBox.warning") as warning,
+            patch(
+                "housemaker.main.QFileDialog.getSaveFileName"
+            ) as file_dialog,
+        ):
+            self.workspace._handle_glb_export_clicked()
+
+        file_dialog.assert_not_called()
+        warning.assert_called_once()
+        self.assertEqual(warning.call_args.args[1], "Export blocked")
+        self.assertIn(record.object_name, warning.call_args.args[2])
+        self.assertEqual(
+            self.workspace.texture_atlas_workspace
+            .get_unpacked_scene_texture_source_ids(),
+            (record.object_id,),
+        )
+
+    def test_export_does_not_readd_a_manually_unpacked_scene_texture(
+        self,
+    ) -> None:
+        atlas_data = TextureAtlasData()
+        atlas = atlas_data.create_atlas(
+            "Manual removal",
+            2048,
+            atlas_id="manual-removal",
+        )
+        self.workspace.texture_atlas_workspace.set_data(atlas_data)
+        record = _generated_object_record_with_variants(
+            self.settings.path.parent / "generated",
+            object_id="removed-lamp",
+            object_name="Removed lamp",
+            resolutions=(512,),
+            selected_resolution=512,
+            placement=GeneratedObjectPlacement(
+                level_index=self.workspace.current_level.index,
+                image_x=15.0,
+                image_y=20.0,
+            ),
+        )
+        generation_data = GenerationData(generated_objects=[record])
+        self.workspace.generation.set_data(generation_data)
+        self.workspace.generation.data_changed.emit(generation_data)
+        self.assertTrue(
+            self.workspace.texture_atlas_workspace._select_object_row(
+                record.object_id
+            )
+        )
+        self.workspace.texture_atlas_workspace \
+            .remove_selected_texture_from_atlas()
+
+        with (
+            patch("housemaker.main.QMessageBox.warning") as warning,
+            patch(
+                "housemaker.main.QFileDialog.getSaveFileName"
+            ) as file_dialog,
+        ):
+            self.workspace._handle_glb_export_clicked()
+
+        file_dialog.assert_not_called()
+        warning.assert_called_once()
+        retained_atlas = (
+            self.workspace.texture_atlas_workspace.get_data().atlas_by_id(
+                atlas.atlas_id
+            )
+        )
+        assert retained_atlas is not None
+        self.assertIsNone(
+            retained_atlas.placement_for_object(record.object_id)
+        )
+
+    def test_non_wall_surface_texture_is_exposed_to_atlas(self) -> None:
+        assignment = _wall_texture_assignment(
+            self.settings.path.parent / "surface_textures",
+            assignment_id="oak-floor",
+            surface_ids=("level:2/room:1/floor",),
+            surface_type=SURFACE_TYPE_FLOOR,
+        )
+        surface_data = SurfaceTextureData(assignments=[assignment])
+        self.workspace.surface_texture_generation.set_data(surface_data)
+        self.workspace.surface_texture_generation.data_changed.emit(surface_data)
+
+        source_id = build_atlas_wall_texture_source_id(
+            assignment.assignment_id
+        )
+        source_items = [
+            self.workspace.texture_atlas_workspace.object_list.item(index)
+            for index in range(
+                self.workspace.texture_atlas_workspace.object_list.count()
+            )
+        ]
+        source_item = next(
+            item
+            for item in source_items
+            if item.data(Qt.ItemDataRole.UserRole) == source_id
+        )
+
+        self.assertIn("Floor texture", source_item.text())
+        source = (
+            self.workspace.texture_atlas_workspace
+            ._sources_by_object_id[source_id]
+        )
+        self.assertEqual(
+            tuple(source.load_texture_rgba(PBR_MAP_ROUGHNESS)[0, 0]),
+            (184, 184, 184, 255),
+        )
+        self.assertEqual(
+            self.workspace._build_atlas_surface_source_ids(),
+            {"level:2/room:1/floor": source_id},
+        )
+
+    def test_canvas_export_uses_one_atlas_material_for_surface_source(
+        self,
+    ) -> None:
+        assignment = _wall_texture_assignment(
+            self.settings.path.parent / "surface_textures",
+        )
+        surface_data = SurfaceTextureData(assignments=[assignment])
+        self.workspace.surface_texture_generation.set_data(surface_data)
+        self.workspace.surface_texture_generation.data_changed.emit(surface_data)
+        atlas_data = TextureAtlasData()
+        atlas_data.create_atlas("Architecture", 2048, atlas_id="architecture")
+        self.workspace.texture_atlas_workspace.set_data(atlas_data)
+        source_id = build_atlas_wall_texture_source_id(
+            assignment.assignment_id
+        )
+        source_item = next(
+            self.workspace.texture_atlas_workspace.object_list.item(index)
+            for index in range(
+                self.workspace.texture_atlas_workspace.object_list.count()
+            )
+            if self.workspace.texture_atlas_workspace.object_list.item(
+                index
+            ).data(Qt.ItemDataRole.UserRole)
+            == source_id
+        )
+        self.workspace.texture_atlas_workspace.object_list.setCurrentItem(
+            source_item
+        )
+        self.workspace.texture_atlas_workspace.assign_object_button.click()
+
+        with patch(
+            "housemaker.main.convert_to_glb",
+            return_value=_generated_textured_surface_model(
+                assignment.surface_ids[0]
+            ),
+        ):
+            result = self.workspace._build_generated_model(None)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        atlas_materials = [
+            getattr(getattr(mesh.visual, "material", None), "name", "")
+            for mesh in result.scene.geometry.values()
+        ]
+        self.assertEqual(atlas_materials, ["HouseMaker Atlas architecture"])
+
+    def test_canvas_export_omits_unassigned_materialless_surfaces(self) -> None:
+        wall_surface_id = _add_square_room_to_level(
+            self.workspace.current_level
+        )
+        self.workspace.surface_texture_generation.set_levels(
+            self.workspace.levels
+        )
+        assignment = _wall_texture_assignment(
+            self.settings.path.parent / "surface_textures",
+            assignment_id="exported-wall",
+            surface_ids=(wall_surface_id,),
+        )
+        surface_data = SurfaceTextureData(assignments=[assignment])
+        self.workspace.surface_texture_generation.set_data(surface_data)
+        self.workspace.surface_texture_generation.data_changed.emit(
+            surface_data
+        )
+        atlas_data = TextureAtlasData()
+        atlas = atlas_data.create_atlas(
+            "Architecture",
+            2048,
+            atlas_id="architecture",
+        )
+        self.workspace.texture_atlas_workspace.set_data(atlas_data)
+        source_id = build_atlas_wall_texture_source_id(
+            assignment.assignment_id
+        )
+        source = self.workspace.texture_atlas_workspace \
+            ._sources_by_object_id[source_id]
+        atlas_data.assign_object(
+            atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+        )
+        self.workspace.texture_atlas_workspace.set_data(atlas_data)
+
+        result = self.workspace._build_generated_model(None)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        materialless_surface_names = [
+            name
+            for name, mesh in result.scene.geometry.items()
+            if (
+                getattr(getattr(mesh.visual, "material", None), "name", None)
+                in {None, "DefaultMaterial"}
+                and "housemaker_object_id"
+                not in dict(getattr(mesh, "metadata", {}) or {})
+            )
+        ]
+        self.assertEqual(materialless_surface_names, [])
 
     def test_wall_preview_uses_exact_pinned_texture_variant(self) -> None:
         assignment = _wall_texture_assignment_with_variants(
@@ -1368,6 +2174,116 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
                 (20, 90, 160, 255),
             )
 
+    def test_wall_pbr_paths_and_map_only_revision_refresh_atlas_content(
+        self,
+    ) -> None:
+        surface_asset_directory = self.settings.path.parent / "surface_textures"
+        assignment = _wall_texture_assignment_with_pbr_variants(
+            surface_asset_directory
+        )
+        surface_data = SurfaceTextureData(assignments=[assignment])
+        self.workspace.surface_texture_generation.set_data(surface_data)
+        self.workspace._atlas_generation_signature = None
+        self.workspace._atlas_source_content_paths = None
+        self.workspace._atlas_source_content_revisions = None
+        self.workspace._sync_atlas_object_texture_sources()
+
+        source_id = build_atlas_wall_texture_source_id(
+            assignment.assignment_id
+        )
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        source = atlas_workspace._sources_by_object_id[source_id]
+        active_variant = assignment.texture_variant_for_resolution(512)
+        assert active_variant is not None
+        expected_logical_paths = {
+            map_type: f"surface_textures/{asset_path}"
+            for map_type, asset_path in active_variant.map_asset_paths.items()
+        }
+        expected_physical_paths = {
+            map_type: surface_asset_directory / asset_path
+            for map_type, asset_path in active_variant.map_asset_paths.items()
+        }
+        self.assertEqual(dict(source.map_texture_paths), expected_logical_paths)
+        self.assertEqual(
+            dict(source.physical_map_texture_paths),
+            expected_physical_paths,
+        )
+        np.testing.assert_array_equal(
+            source.load_texture_rgba(PBR_MAP_NORMAL)[256, 256],
+            np.asarray((110, 120, 230, 255), dtype=np.uint8),
+        )
+
+        atlas_data = TextureAtlasData()
+        atlas = atlas_data.create_atlas(
+            "Surface PBR refresh",
+            2048,
+            atlas_id="surface-pbr-refresh",
+        )
+        atlas_data.assign_object(
+            atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+            source.packing_mode,
+        )
+        atlas_workspace.set_data(atlas_data)
+        self.assertEqual(atlas_workspace.materialize_missing_atlases(), 1)
+        normal_atlas_path = (
+            self.settings.path.parent
+            / "texture_atlases"
+            / build_texture_atlas_map_image_relative_path(
+                atlas.atlas_id,
+                PBR_MAP_NORMAL,
+            )
+        )
+        base_atlas_path = (
+            self.settings.path.parent
+            / "texture_atlases"
+            / f"{atlas.atlas_id}.png"
+        )
+        with Image.open(normal_atlas_path) as normal_atlas:
+            self.assertEqual(
+                normal_atlas.convert("RGBA").getpixel((256, 256)),
+                (110, 120, 230, 255),
+            )
+
+        normal_path = expected_physical_paths[PBR_MAP_NORMAL]
+        Image.new("RGBA", (512, 512), (25, 190, 140, 255)).save(
+            normal_path,
+            format="PNG",
+        )
+        current_stat = normal_path.stat()
+        os.utime(
+            normal_path,
+            ns=(
+                current_stat.st_atime_ns,
+                current_stat.st_mtime_ns + 1_000_000,
+            ),
+        )
+        self.workspace._handle_surface_texture_data_changed_for_atlases(
+            surface_data
+        )
+
+        refreshed_source = atlas_workspace._sources_by_object_id[source_id]
+        self.assertEqual(
+            dict(refreshed_source.map_texture_paths),
+            expected_logical_paths,
+        )
+        np.testing.assert_array_equal(
+            refreshed_source.load_texture_rgba(PBR_MAP_NORMAL)[256, 256],
+            np.asarray((25, 190, 140, 255), dtype=np.uint8),
+        )
+        with Image.open(normal_atlas_path) as normal_atlas:
+            self.assertEqual(
+                normal_atlas.convert("RGBA").getpixel((256, 256)),
+                (25, 190, 140, 255),
+            )
+        with Image.open(base_atlas_path) as base_atlas:
+            self.assertEqual(
+                base_atlas.convert("RGBA").getpixel((256, 256)),
+                (40, 60, 80, 255),
+            )
+
     def test_direct_object_change_refreshes_pbr_path_and_revision_changes(
         self,
     ) -> None:
@@ -1431,7 +2347,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             / "texture_atlases"
             / build_texture_atlas_map_image_relative_path(
                 atlas.atlas_id,
-                ATLAS_MAP_NORMAL,
+                PBR_MAP_NORMAL,
             )
         )
         with Image.open(normal_atlas_path) as normal_atlas:
@@ -1835,9 +2751,13 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             ) as set_sources,
         ):
             self.workspace._sync_atlas_object_texture_sources()
+            surface_source_ids = (
+                self.workspace._build_atlas_surface_source_ids()
+            )
 
         wall_source_builder.assert_not_called()
         self.assertEqual(set_sources.call_args.args[0], [object_source])
+        self.assertEqual(surface_source_ids, {})
         self.assertIn(
             "generated object uses the same reserved Atlas ID",
             self.workspace.texture_atlas_workspace.status_label.text(),
@@ -2160,6 +3080,28 @@ def _generated_box_model() -> GeneratedModel:
         scene=trimesh.Scene(mesh),
         glb_bytes=b"",
     )
+
+
+def _generated_textured_surface_model(surface_id: str) -> GeneratedModel:
+    mesh = trimesh.Trimesh(
+        vertices=np.asarray(
+            ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+            dtype=float,
+        ),
+        faces=np.asarray(((0, 1, 2),), dtype=np.int64),
+        process=False,
+        metadata={"housemaker_surface_id": surface_id},
+    )
+    mesh.visual = TextureVisuals(
+        uv=np.asarray(((0.0, 0.0), (1.0, 0.0), (0.0, 1.0))),
+        material=PBRMaterial(
+            name=f"Surface {surface_id}",
+            baseColorTexture=Image.new("RGBA", (4, 4), (80, 90, 100, 255)),
+        ),
+    )
+    scene = trimesh.Scene()
+    scene.add_geometry(mesh, node_name="surface")
+    return GeneratedModel(mesh=mesh, scene=scene, glb_bytes=b"")
 
 
 def _write_texture_png(

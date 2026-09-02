@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
 )
 
 from housemaker.app_settings import ApplicationSettingsStore
+from housemaker.atlas_export import apply_texture_atlases_to_export
 from housemaker.blueprint_canvas import BlueprintCanvas
 from housemaker.canvas_openings import (
     CANVAS_OPENING_DOORWAY,
@@ -65,8 +66,13 @@ from housemaker.generation_workspace import (
     GenerationWorkspace,
 )
 from housemaker.object_placement_dialog import ObjectPlacementDialog
+from housemaker.pbr_maps import (
+    ATLAS_MAP_BASE_COLOR,
+    ATLAS_MAP_TYPES,
+    PBR_MAP_ROUGHNESS,
+)
+from housemaker.surface_materials import LEGACY_SURFACE_ROUGHNESS_FACTOR
 from housemaker.surface_texture_state import (
-    SURFACE_TYPE_WALL,
     SurfaceTextureAssignment,
     SurfaceTextureData,
 )
@@ -167,6 +173,9 @@ PROJECT_LOAD_FAILURES = (
     RuntimeError,
     TypeError,
     ValueError,
+)
+SURFACE_ATLAS_ROUGHNESS_BYTE = round(
+    LEGACY_SURFACE_ROUGHNESS_FACTOR * 255.0
 )
 
 # ### Event filters ###
@@ -288,6 +297,11 @@ class BlueprintWorkspace(QWidget):
         ) = None
         self._atlas_pending_source_content_refresh_ids: set[str] = set()
         self._atlas_wall_texture_source_ids: set[str] = set()
+        self._atlas_available_source_ids: set[str] = set()
+        self._is_automatically_assigning_atlas_textures = False
+        self._last_automatic_atlas_assignment_key: tuple[object, ...] | None = (
+            None
+        )
         self._atlas_preview_variant_key: tuple[object, ...] | None = None
         self._level_blueprint_image_revisions: dict[
             int,
@@ -411,6 +425,9 @@ class BlueprintWorkspace(QWidget):
         )
         self.settings_widget = SettingsWidget(
             application_settings=self._application_settings
+        )
+        self.texture_atlas_workspace.selected_atlas_changed.connect(
+            self._handle_selected_atlas_changed_for_automatic_assignment
         )
         generation_settings = self.settings_widget.get_settings()
         self._set_doorway_mesh_update_delay_seconds(
@@ -1419,6 +1436,12 @@ class BlueprintWorkspace(QWidget):
         self._set_current_level_image(file_path)
 
     def _handle_glb_export_clicked(self) -> None:
+        self._sync_atlas_object_texture_sources(
+            automatically_assign_scene_textures=False
+        )
+        if self._show_unpacked_scene_texture_export_error():
+            return
+
         default_path = Path.cwd() / "housemaker_export.glb"
         file_path, _ = QFileDialog.getSaveFileName(
             self,
@@ -1594,6 +1617,9 @@ class BlueprintWorkspace(QWidget):
     ) -> None:
         """Refresh Atlas object choices after generation, deletion, or selection."""
 
+        if self._is_automatically_assigning_atlas_textures:
+            self._atlas_generation_signature = None
+            return
         self._sync_atlas_object_texture_sources()
         self._request_hosted_atlas_object_preview()
 
@@ -1725,13 +1751,17 @@ class BlueprintWorkspace(QWidget):
             self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     def _handle_placed_object_removal_requested(self, object_id: str) -> None:
-        """Remove only the selected object's Canvas placement state."""
+        """Remove a Canvas placement and unassign its texture from Atlases."""
 
         normalized_object_id = str(object_id).strip()
-        if not self.generation.remove_generated_object_placement(
+        if self.generation.remove_generated_object_placement(
             normalized_object_id
         ):
-            self._schedule_viewer_preview_refresh(preserve_camera=True)
+            self.texture_atlas_workspace.remove_scene_texture_from_atlases(
+                normalized_object_id
+            )
+            return
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     def _handle_placed_object_transform_changed(
         self,
@@ -1856,13 +1886,25 @@ class BlueprintWorkspace(QWidget):
         ):
             self._schedule_viewer_preview_refresh(preserve_camera=True)
 
+    # ### Texture Atlas synchronization ###
     def _handle_surface_texture_data_changed_for_atlases(
         self,
         _surface_texture_data: object,
     ) -> None:
-        """Refresh Atlas wall choices without reloading unchanged thumbnails."""
+        """Refresh Atlas surface choices without reloading unchanged thumbnails."""
 
+        if self._is_automatically_assigning_atlas_textures:
+            self._atlas_generation_signature = None
+            return
         self._sync_atlas_object_texture_sources()
+
+    def _handle_selected_atlas_changed_for_automatic_assignment(
+        self,
+        _selected_atlas: object,
+    ) -> None:
+        """Retry pending scene textures when the user chooses an Atlas."""
+
+        self._refresh_scene_atlas_texture_requirements()
 
     def _handle_surface_texture_assignments_removed_for_atlases(
         self,
@@ -2148,15 +2190,6 @@ class BlueprintWorkspace(QWidget):
         source_id = build_atlas_wall_texture_source_id(
             assignment.assignment_id
         )
-        if assignment.surface_type != SURFACE_TYPE_WALL:
-            return (
-                self.surface_texture_generation
-                .select_assignment_texture_resolution(
-                    assignment.assignment_id,
-                    target_resolution,
-                )
-            )
-
         self._sync_atlas_object_texture_sources()
         if source_id not in self._atlas_wall_texture_source_ids:
             return (
@@ -2299,8 +2332,275 @@ class BlueprintWorkspace(QWidget):
         self._atlas_preview_variant_key = None
         self.atlas_object_preview_viewer.clear_model()
 
-    def _sync_atlas_object_texture_sources(self) -> None:
-        """Expose generated object and wall texture sources to Atlas."""
+    def _refresh_scene_atlas_texture_requirements(
+        self,
+        *,
+        automatically_assign: bool = True,
+    ) -> None:
+        """Mark exported scene textures and optionally pack missing ones."""
+
+        required_source_ids = self._build_required_scene_atlas_source_ids()
+        self.texture_atlas_workspace.set_scene_texture_source_ids(
+            required_source_ids
+        )
+        if (
+            not automatically_assign
+            or self._is_automatically_assigning_atlas_textures
+        ):
+            return
+        self._automatically_assign_scene_textures()
+
+    def _build_required_scene_atlas_source_ids(self) -> tuple[str, ...]:
+        """Return available texture sources used by included scene content."""
+
+        included_level_indices = {
+            level.index for level in self.levels if level.include_in_export
+        }
+        required_ids: list[str] = []
+        for object_id in self.generation.get_generated_object_ids():
+            placement = self.generation.get_generated_object_placement(
+                object_id
+            )
+            if (
+                placement is not None
+                and placement.level_index in included_level_indices
+                and object_id in self._atlas_available_source_ids
+            ):
+                required_ids.append(object_id)
+        exported_surface_ids = {
+            surface.surface_id for surface in build_fixed_surfaces(self.levels)
+        }
+        required_ids.extend(
+            source_id
+            for surface_id, source_id in (
+                self._build_atlas_surface_source_ids().items()
+            )
+            if (
+                surface_id in exported_surface_ids
+                and source_id in self._atlas_available_source_ids
+            )
+        )
+        return tuple(dict.fromkeys(required_ids))
+
+    def _automatically_assign_scene_textures(self) -> None:
+        """Pack all currently unassigned scene textures in one Atlas update."""
+
+        if self._is_automatically_assigning_atlas_textures:
+            return
+        settings = self.settings_widget.get_settings()
+        target_resolution = settings.automatic_atlas_texture_resolution
+        sort_by_pbr = settings.automatic_atlas_texture_sort_by_pbr
+        attempt_key = self._build_automatic_atlas_assignment_key(
+            target_resolution,
+            sort_by_pbr,
+        )
+        if attempt_key == self._last_automatic_atlas_assignment_key:
+            return
+        self._last_automatic_atlas_assignment_key = attempt_key
+        self._is_automatically_assigning_atlas_textures = True
+        try:
+            assigned_source_ids = (
+                self.texture_atlas_workspace.auto_assign_scene_texture_sources(
+                    target_resolution,
+                    commit_callback=lambda source_ids: (
+                        self._commit_automatic_atlas_texture_resolutions(
+                            source_ids,
+                            target_resolution,
+                        )
+                    ),
+                    sort_by_pbr=sort_by_pbr,
+                )
+            )
+            if not assigned_source_ids:
+                return
+            self._atlas_generation_signature = None
+            self._sync_atlas_object_texture_sources()
+            for source_id in assigned_source_ids:
+                if not is_atlas_wall_texture_source_id(source_id):
+                    self._refresh_placed_object_texture_if_needed(source_id)
+        finally:
+            self._is_automatically_assigning_atlas_textures = False
+            self._last_automatic_atlas_assignment_key = (
+                self._build_automatic_atlas_assignment_key(
+                    target_resolution,
+                    sort_by_pbr,
+                )
+            )
+
+    def _build_automatic_atlas_assignment_key(
+        self,
+        target_resolution: int,
+        sort_by_pbr: bool,
+    ) -> tuple[object, ...]:
+        """Describe inputs whose changes make a failed auto-pack worth retrying."""
+
+        atlas_data = self.texture_atlas_workspace.get_data()
+        atlas_signature = tuple(
+            (
+                atlas.atlas_id,
+                atlas.name,
+                atlas.resolution,
+                tuple(
+                    (
+                        placement.object_id,
+                        placement.texture_resolution,
+                        placement.x,
+                        placement.y,
+                        placement.size,
+                        placement.packing_mode,
+                        placement.slot_half,
+                        placement.slot_quadrant,
+                    )
+                    for placement in atlas.placements
+                ),
+            )
+            for atlas in atlas_data.atlases
+        )
+        return (
+            atlas_data.selected_atlas_id,
+            int(target_resolution),
+            bool(sort_by_pbr),
+            self.texture_atlas_workspace.get_unpacked_scene_texture_source_ids(),
+            atlas_signature,
+            self._atlas_generation_signature,
+        )
+
+    def _commit_automatic_atlas_texture_resolutions(
+        self,
+        source_ids: tuple[str, ...],
+        target_resolution: int,
+    ) -> bool:
+        """Select exact owning-workspace variants after Atlas materialization."""
+
+        applied_changes: list[tuple[str, str, int]] = []
+        for source_id in source_ids:
+            assignment_id = get_atlas_wall_texture_assignment_id(source_id)
+            if assignment_id is not None:
+                assignment = self.surface_texture_generation.get_assignment(
+                    assignment_id
+                )
+                if assignment is None:
+                    self._rollback_automatic_atlas_texture_resolutions(
+                        applied_changes
+                    )
+                    return False
+                if not assignment.texture_variants:
+                    continue
+                previous_resolution = assignment.selected_texture_resolution
+                if previous_resolution is None:
+                    self._rollback_automatic_atlas_texture_resolutions(
+                        applied_changes
+                    )
+                    return False
+                if previous_resolution == target_resolution:
+                    continue
+                if not self.surface_texture_generation.select_assignment_texture_resolution(
+                    assignment_id,
+                    target_resolution,
+                ):
+                    self._rollback_automatic_atlas_texture_resolutions(
+                        applied_changes
+                    )
+                    return False
+                applied_changes.append(
+                    ("surface", assignment_id, previous_resolution)
+                )
+                continue
+
+            active_variant = self.generation.get_active_texture_variant(
+                source_id
+            )
+            if active_variant is None:
+                self._rollback_automatic_atlas_texture_resolutions(
+                    applied_changes
+                )
+                return False
+            previous_resolution = active_variant.resolution
+            if previous_resolution == target_resolution:
+                continue
+            if not self.generation.select_object_texture_resolution(
+                source_id,
+                target_resolution,
+            ):
+                self._rollback_automatic_atlas_texture_resolutions(
+                    applied_changes
+                )
+                return False
+            applied_changes.append(
+                ("object", source_id, previous_resolution)
+            )
+        return True
+
+    def _rollback_automatic_atlas_texture_resolutions(
+        self,
+        applied_changes: list[tuple[str, str, int]],
+    ) -> None:
+        """Best-effort restore owning workspaces after a rejected batch."""
+
+        for source_kind, source_id, previous_resolution in reversed(
+            applied_changes
+        ):
+            if source_kind == "surface":
+                self.surface_texture_generation.select_assignment_texture_resolution(
+                    source_id,
+                    previous_resolution,
+                )
+            else:
+                self.generation.select_object_texture_resolution(
+                    source_id,
+                    previous_resolution,
+                )
+
+    def _show_unpacked_scene_texture_export_error(self) -> bool:
+        """Block GLB export while any required source remains outside Atlases."""
+
+        unpacked_source_ids = (
+            self.texture_atlas_workspace.get_unpacked_scene_texture_source_ids()
+        )
+        if not unpacked_source_ids:
+            return False
+        display_names = [
+            self._atlas_texture_source_display_name(source_id)
+            for source_id in unpacked_source_ids
+        ]
+        visible_names = display_names[:10]
+        remaining_count = len(display_names) - len(visible_names)
+        detail_lines = [f"- {name}" for name in visible_names]
+        if remaining_count:
+            detail_lines.append(f"- and {remaining_count} more")
+        QMessageBox.warning(
+            self,
+            "Export blocked",
+            "Every texture used by the exported scene must be assigned to "
+            "an Atlas before GLB export. The unassigned textures are shown "
+            "in red in the Atlas tab:\n\n"
+            + "\n".join(detail_lines),
+        )
+        return True
+
+    def _atlas_texture_source_display_name(self, source_id: str) -> str:
+        """Resolve a human-readable name for one export-blocking source."""
+
+        assignment_id = get_atlas_wall_texture_assignment_id(source_id)
+        if assignment_id is not None:
+            assignment = self.surface_texture_generation.get_assignment(
+                assignment_id
+            )
+            if assignment is not None:
+                return assignment.display_name or (
+                    f"{assignment.surface_type.title()} texture"
+                )
+        for record in self.generation.get_data().generated_objects:
+            if record.object_id == source_id:
+                return record.object_name
+        return source_id
+
+    def _sync_atlas_object_texture_sources(
+        self,
+        *,
+        automatically_assign_scene_textures: bool = True,
+    ) -> None:
+        """Expose generated object and architectural-surface textures to Atlas."""
 
         active_variants: list[tuple[object, object | None]] = []
         signature_items: list[tuple[object, ...]] = []
@@ -2432,10 +2732,10 @@ class BlueprintWorkspace(QWidget):
                 )
             )
 
-        wall_assignments = list(
-            self.surface_texture_generation.get_wall_assignments()
+        surface_assignments = list(
+            self.surface_texture_generation.get_assignments()
         )
-        for assignment in wall_assignments:
+        for assignment in surface_assignments:
             variant_signature: list[tuple[object, ...]] = []
             candidate_variants = (
                 tuple(assignment.texture_variants)
@@ -2453,10 +2753,31 @@ class BlueprintWorkspace(QWidget):
                     if texture_variant is None
                     else texture_variant.asset_path
                 )
-                physical_path = (
-                    self.surface_texture_generation.get_assignment_asset_path(
+                physical_map_paths = (
+                    self.surface_texture_generation
+                    .get_assignment_map_asset_paths(
                         assignment.assignment_id,
                         resolution,
+                    )
+                )
+                physical_path = physical_map_paths.get(
+                    ATLAS_MAP_BASE_COLOR
+                )
+                logical_map_paths = (
+                    {ATLAS_MAP_BASE_COLOR: logical_path}
+                    if texture_variant is None
+                    else texture_variant.map_asset_paths
+                )
+                map_signature = tuple(
+                    (
+                        map_type,
+                        map_asset_path,
+                        _build_local_file_revision(
+                            physical_map_paths.get(map_type)
+                        ),
+                    )
+                    for map_type, map_asset_path in (
+                        logical_map_paths.items()
                     )
                 )
                 variant_signature.append(
@@ -2464,11 +2785,12 @@ class BlueprintWorkspace(QWidget):
                         resolution,
                         str(logical_path),
                         _build_local_file_revision(physical_path),
+                        map_signature,
                     )
                 )
             signature_items.append(
                 (
-                    "wall",
+                    "surface",
                     assignment.assignment_id,
                     assignment.asset_path,
                     assignment.selected_texture_resolution,
@@ -2478,20 +2800,37 @@ class BlueprintWorkspace(QWidget):
                     tuple(variant_signature),
                 )
             )
-            wall_source_id = build_atlas_wall_texture_source_id(
+            surface_source_id = build_atlas_wall_texture_source_id(
                 assignment.assignment_id
             )
-            if wall_source_id not in generated_object_id_lookup:
-                source_content_paths[wall_source_id] = tuple(
-                    (resolution, logical_path)
-                    for resolution, logical_path, _revision in variant_signature
+            if surface_source_id not in generated_object_id_lookup:
+                source_content_paths[surface_source_id] = tuple(
+                    (
+                        item[0],
+                        item[1],
+                        tuple(
+                            (map_item[0], map_item[1])
+                            for map_item in item[3]
+                        ),
+                    )
+                    for item in variant_signature
                 )
-                source_content_revisions[wall_source_id] = tuple(
-                    (resolution, revision)
-                    for resolution, _logical_path, revision in variant_signature
+                source_content_revisions[surface_source_id] = tuple(
+                    (
+                        item[0],
+                        item[2],
+                        tuple(
+                            (map_item[0], map_item[2])
+                            for map_item in item[3]
+                        ),
+                    )
+                    for item in variant_signature
                 )
         signature = tuple(signature_items)
         if signature == self._atlas_generation_signature:
+            self._refresh_scene_atlas_texture_requirements(
+                automatically_assign=automatically_assign_scene_textures
+            )
             self._request_hosted_atlas_object_preview()
             return
         changed_source_ids: list[str] = []
@@ -2531,15 +2870,18 @@ class BlueprintWorkspace(QWidget):
                 continue
             active_sources.append(source)
             available_source_ids.add(str(getattr(variant, "object_id")))
-        wall_sources: dict[str, AtlasObjectTextureSource] = {}
-        wall_assignments_by_source_id: dict[str, SurfaceTextureAssignment] = {}
-        colliding_wall_texture_count = 0
-        for assignment in wall_assignments:
-            wall_source_id = build_atlas_wall_texture_source_id(
+        surface_sources: dict[str, AtlasObjectTextureSource] = {}
+        surface_assignments_by_source_id: dict[
+            str,
+            SurfaceTextureAssignment,
+        ] = {}
+        colliding_surface_texture_count = 0
+        for assignment in surface_assignments:
+            surface_source_id = build_atlas_wall_texture_source_id(
                 assignment.assignment_id
             )
-            if wall_source_id in generated_object_id_lookup:
-                colliding_wall_texture_count += 1
+            if surface_source_id in generated_object_id_lookup:
+                colliding_surface_texture_count += 1
                 continue
             active_resolution = (
                 assignment.selected_texture_resolution
@@ -2557,12 +2899,12 @@ class BlueprintWorkspace(QWidget):
             source = self._build_atlas_wall_texture_source(assignment)
             if source is None:
                 source_build_failed = True
-                failed_source_ids.add(wall_source_id)
+                failed_source_ids.add(surface_source_id)
                 continue
             active_sources.append(source)
-            available_source_ids.add(wall_source_id)
-            wall_sources[source.object_id] = source
-            wall_assignments_by_source_id[source.object_id] = assignment
+            available_source_ids.add(surface_source_id)
+            surface_sources[source.object_id] = source
+            surface_assignments_by_source_id[source.object_id] = assignment
 
         self._atlas_pending_source_content_refresh_ids.update(
             failed_source_ids
@@ -2582,10 +2924,10 @@ class BlueprintWorkspace(QWidget):
             object_id: str,
             resolution: int,
         ) -> AtlasObjectTextureSource | None:
-            wall_assignment = wall_assignments_by_source_id.get(object_id)
-            if wall_assignment is not None:
+            surface_assignment = surface_assignments_by_source_id.get(object_id)
+            if surface_assignment is not None:
                 return self._build_atlas_wall_texture_source(
-                    wall_assignment,
+                    surface_assignment,
                     resolution,
                 )
             return self._build_atlas_object_texture_source(
@@ -2600,12 +2942,12 @@ class BlueprintWorkspace(QWidget):
             object_id: str,
             resolution: int,
         ) -> bool:
-            wall_assignment = wall_assignments_by_source_id.get(object_id)
-            if wall_assignment is not None:
+            surface_assignment = surface_assignments_by_source_id.get(object_id)
+            if surface_assignment is not None:
                 return (
                     self.surface_texture_generation
                     .can_select_assignment_texture_resolution(
-                        wall_assignment.assignment_id,
+                        surface_assignment.assignment_id,
                         resolution,
                     )
                 )
@@ -2639,17 +2981,23 @@ class BlueprintWorkspace(QWidget):
         self._atlas_pending_source_content_refresh_ids.difference_update(
             refreshable_source_ids
         )
-        self._atlas_wall_texture_source_ids.update(wall_sources)
+        # The backing field and source-ID prefix retain their legacy "wall"
+        # names so existing project files and integrations remain compatible.
+        self._atlas_wall_texture_source_ids.update(surface_sources)
+        self._atlas_available_source_ids = set(available_source_ids)
         self._atlas_generation_signature = (
             None if source_build_failed else signature
         )
         self._atlas_source_content_paths = source_content_paths
         self._atlas_source_content_revisions = source_content_revisions
+        self._refresh_scene_atlas_texture_requirements(
+            automatically_assign=automatically_assign_scene_textures
+        )
         self._request_hosted_atlas_object_preview()
-        if colliding_wall_texture_count:
+        if colliding_surface_texture_count:
             self._append_atlas_preview_status(
-                f"Skipped {colliding_wall_texture_count} wall texture source"
-                f"{'s' if colliding_wall_texture_count != 1 else ''} because "
+                f"Skipped {colliding_surface_texture_count} surface texture source"
+                f"{'s' if colliding_surface_texture_count != 1 else ''} because "
                 "a generated object uses the same reserved Atlas ID."
             )
 
@@ -2746,10 +3094,8 @@ class BlueprintWorkspace(QWidget):
         assignment: SurfaceTextureAssignment,
         resolution: int | None = None,
     ) -> AtlasObjectTextureSource | None:
-        """Adapt one generated wall texture and its exact active variant."""
+        """Adapt one generated surface texture and its exact active variant."""
 
-        if assignment.surface_type != SURFACE_TYPE_WALL:
-            return None
         supports_resolution_changes = bool(assignment.texture_variants)
         requested_resolution = resolution
         if supports_resolution_changes:
@@ -2760,12 +3106,40 @@ class BlueprintWorkspace(QWidget):
             )
             if requested_resolution is None:
                 return None
-        physical_path = self.surface_texture_generation.get_assignment_asset_path(
-            assignment.assignment_id,
-            requested_resolution if supports_resolution_changes else None,
+        physical_map_paths = (
+            self.surface_texture_generation.get_assignment_map_asset_paths(
+                assignment.assignment_id,
+                requested_resolution if supports_resolution_changes else None,
+            )
         )
+        physical_path = physical_map_paths.get(ATLAS_MAP_BASE_COLOR)
         if physical_path is None:
             return None
+        legacy_logical_map_paths = {
+            ATLAS_MAP_BASE_COLOR: assignment.asset_path
+        }
+        logical_map_paths = legacy_logical_map_paths
+        if supports_resolution_changes:
+            selected_variant = assignment.texture_variant_for_resolution(
+                int(requested_resolution)
+            )
+            if selected_variant is None:
+                return None
+            logical_map_paths = selected_variant.map_asset_paths
+        live_map_types = tuple(
+            map_type
+            for map_type in ATLAS_MAP_TYPES
+            if map_type in logical_map_paths
+            and map_type in physical_map_paths
+        )
+        atlas_logical_map_paths = {
+            map_type: f"surface_textures/{logical_map_paths[map_type]}"
+            for map_type in live_map_types
+        }
+        atlas_physical_map_paths = {
+            map_type: physical_map_paths[map_type]
+            for map_type in live_map_types
+        }
         try:
             if supports_resolution_changes:
                 texture_resolution = int(requested_resolution)
@@ -2796,13 +3170,24 @@ class BlueprintWorkspace(QWidget):
                 object_name=(
                     assignment.display_name
                     or (
-                        f"Wall texture Â· {surface_count} surface"
+                        f"{assignment.surface_type.title()} texture · "
+                        f"{surface_count} surface"
                         f"{'s' if surface_count != 1 else ''}"
                     )
                 ),
                 texture_path=f"surface_textures/{asset_path}",
                 texture_resolution=texture_resolution,
                 physical_texture_path=physical_path,
+                map_texture_paths=atlas_logical_map_paths,
+                physical_map_texture_paths=atlas_physical_map_paths,
+                fallback_map_rgba={
+                    PBR_MAP_ROUGHNESS: (
+                        SURFACE_ATLAS_ROUGHNESS_BYTE,
+                        SURFACE_ATLAS_ROUGHNESS_BYTE,
+                        SURFACE_ATLAS_ROUGHNESS_BYTE,
+                        255,
+                    )
+                },
                 fit_to_square=fit_to_square,
                 supports_resolution_changes=supports_resolution_changes,
             )
@@ -3277,18 +3662,57 @@ class BlueprintWorkspace(QWidget):
                 surface_materials=(
                     self.surface_texture_generation.get_surface_material_sources()
                 ),
+                export_untextured_surfaces=False,
             )
             placed_models = self._build_placed_generated_models()
-            if not placed_models:
-                return base_model
-            return compose_placed_generated_models(
-                base_model,
-                placed_models,
+            generated_model = (
+                base_model
+                if not placed_models
+                else compose_placed_generated_models(
+                    base_model,
+                    placed_models,
+                )
             )
-        except (TypeError, ValueError) as error:
+            surface_source_ids = self._build_atlas_surface_source_ids()
+            required_source_ids = tuple(
+                dict.fromkeys(
+                    (
+                        *(placement.object_id for placement in placed_models),
+                        *surface_source_ids.values(),
+                    )
+                )
+            )
+            materialized_atlases = (
+                self.texture_atlas_workspace.prepare_export_atlases(
+                    required_source_ids
+                )
+            )
+            if not materialized_atlases:
+                return generated_model
+            return apply_texture_atlases_to_export(
+                generated_model,
+                materialized_atlases,
+                surface_source_ids=surface_source_ids,
+            )
+        except (OSError, TypeError, ValueError) as error:
             if failure_title is not None:
                 QMessageBox.warning(self, failure_title, str(error))
             return None
+
+    def _build_atlas_surface_source_ids(self) -> dict[str, str]:
+        """Map each assigned architectural surface to its Atlas source ID."""
+
+        source_ids: dict[str, str] = {}
+        generated_object_ids = set(self.generation.get_generated_object_ids())
+        for assignment in self.surface_texture_generation.get_assignments():
+            source_id = build_atlas_wall_texture_source_id(
+                assignment.assignment_id
+            )
+            if source_id in generated_object_ids:
+                continue
+            for surface_id in assignment.surface_ids:
+                source_ids[surface_id] = source_id
+        return source_ids
 
     def _build_viewer_preview_model(
         self,
@@ -4204,6 +4628,7 @@ class BlueprintWorkspace(QWidget):
             settings.fullscreen_3d_viewer_screen_id
         )
         self._apply_jobs_window_screen(settings.jobs_window_screen_id)
+        self._refresh_scene_atlas_texture_requirements()
 
     def _handle_set_floor_contour_clicked(self) -> None:
         self.canvas.start_floor_contour_designation()
@@ -4227,6 +4652,7 @@ class BlueprintWorkspace(QWidget):
             return
 
         self.current_level.include_in_export = self.include_yes_radio.isChecked()
+        self._refresh_scene_atlas_texture_requirements()
         self._schedule_viewer_preview_refresh()
 
     def _handle_snap_middle_equal_angle_toggled(self, checked: bool) -> None:
@@ -4300,6 +4726,8 @@ class BlueprintWorkspace(QWidget):
         self._atlas_source_content_revisions = None
         self._atlas_pending_source_content_refresh_ids.clear()
         self._atlas_wall_texture_source_ids.clear()
+        self._atlas_available_source_ids.clear()
+        self._last_automatic_atlas_assignment_key = None
         self._clear_atlas_object_preview()
         self.generation.set_data(generation)
         self.texture_atlas_workspace.set_data(texture_atlases)
@@ -4312,6 +4740,8 @@ class BlueprintWorkspace(QWidget):
         self._atlas_source_content_revisions = None
         self._atlas_pending_source_content_refresh_ids.clear()
         self._atlas_wall_texture_source_ids.clear()
+        self._atlas_available_source_ids.clear()
+        self._last_automatic_atlas_assignment_key = None
         self._sync_atlas_object_texture_sources()
         self.texture_atlas_workspace.materialize_missing_atlases()
         self._schedule_viewer_preview_refresh()

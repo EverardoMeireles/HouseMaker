@@ -13,13 +13,25 @@ import warnings
 import zlib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import lru_cache
 from io import BytesIO
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
+import numpy as np
 from PIL import Image, UnidentifiedImageError
+
+from housemaker.meshy_generation import (
+    MESHY_RETEXTURE_ENDPOINT,
+    build_retexture_request_body,
+)
+from housemaker.pbr_maps import (
+    PBR_MAP_NORMAL,
+    PBR_MAP_TYPES,
+    normalize_pbr_map_types,
+)
 
 
 # ### Provider constants ###
@@ -51,8 +63,6 @@ OPENAI_DIRECT_IMAGE_MODELS = frozenset(
 SUPPORTED_OPENAI_IMAGE_MODELS = (
     OPENAI_DIRECT_IMAGE_MODELS | {OPENAI_MINI_ANALYSIS_MODEL}
 )
-
-
 # ### Request limits ###
 MIN_REFERENCE_IMAGE_COUNT = 1
 MAX_REFERENCE_IMAGE_COUNT = 5
@@ -77,6 +87,14 @@ RETRYABLE_HTTP_STATUS_CODES = frozenset(
 ACTIVE_TASK_STATUSES = frozenset({"PENDING", "IN_PROGRESS"})
 TERMINAL_TASK_STATUSES = frozenset({"SUCCEEDED", "FAILED", "CANCELED"})
 KNOWN_TASK_STATUSES = ACTIVE_TASK_STATUSES | TERMINAL_TASK_STATUSES
+MESHY_TASK_RETRY_DELAYS_SECONDS = (5.0, 15.0)
+RETRYABLE_MESHY_TASK_ERROR_TYPES = frozenset(
+    {"server_error", "service_unavailable", "timeout"}
+)
+GENERIC_MESHY_INVALID_INPUT_MESSAGE = (
+    "the input file or parameters could not be processed"
+)
+SURFACE_PBR_PRIMARY_U_MAX = 0.95
 
 
 # ### Image constants ###
@@ -172,6 +190,7 @@ class SurfaceTextureRequest:
     reference_pngs: tuple[bytes, ...]
     prompt: str
     settings: SurfaceTextureProviderSettings
+    enabled_pbr_maps: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.settings, SurfaceTextureProviderSettings):
@@ -182,6 +201,15 @@ class SurfaceTextureRequest:
             _normalize_reference_pngs(self.reference_pngs),
         )
         object.__setattr__(self, "prompt", _normalize_prompt(self.prompt))
+        enabled_pbr_maps = normalize_pbr_map_types(
+            self.enabled_pbr_maps,
+            label="Enabled surface texture PBR maps",
+        )
+        if enabled_pbr_maps and self.settings.provider != MESHY_PROVIDER:
+            raise ValueError(
+                "Surface PBR map generation requires the Meshy provider."
+            )
+        object.__setattr__(self, "enabled_pbr_maps", enabled_pbr_maps)
 
 
 @dataclass(frozen=True)
@@ -191,6 +219,38 @@ class SurfaceTextureResult:
     provider: str
     texture_png: bytes
     task_id: str | None = None
+    pbr_texture_pngs: Mapping[str, bytes] = field(default_factory=dict)
+    pbr_task_id: str | None = None
+
+    def __post_init__(self) -> None:
+        provider = str(self.provider).strip()
+        if not provider:
+            raise ValueError("A surface texture result provider is required.")
+        texture_png = _validate_png(
+            self.texture_png,
+            "Surface base-color texture",
+            MAX_OUTPUT_PNG_BYTES,
+        )
+        pbr_texture_pngs = _normalize_result_pbr_texture_pngs(
+            self.pbr_texture_pngs
+        )
+        task_id = _normalize_optional_task_id(self.task_id)
+        pbr_task_id = _normalize_optional_task_id(self.pbr_task_id)
+        object.__setattr__(self, "provider", provider)
+        object.__setattr__(self, "texture_png", texture_png)
+        object.__setattr__(self, "task_id", task_id)
+        object.__setattr__(self, "pbr_texture_pngs", pbr_texture_pngs)
+        object.__setattr__(self, "pbr_task_id", pbr_task_id)
+
+    @property
+    def available_pbr_maps(self) -> tuple[str, ...]:
+        """Return downloaded PBR artifacts in canonical display order."""
+
+        return tuple(
+            map_type
+            for map_type in PBR_MAP_TYPES
+            if map_type in self.pbr_texture_pngs
+        )
 
 
 # ### Exceptions ###
@@ -211,7 +271,24 @@ class SurfaceTextureRequestError(SurfaceTextureProviderError):
 
 
 class SurfaceTextureTaskError(SurfaceTextureProviderError):
-    pass
+    """A completed provider task failed or returned unusable output."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        task_id: str | None = None,
+        error_type: str | None = None,
+        error_code: str | None = None,
+        doc_url: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retryable = bool(retryable)
+        self.task_id = task_id
+        self.error_type = error_type
+        self.error_code = error_code
+        self.doc_url = doc_url
 
 
 # ### Transport protocols ###
@@ -291,6 +368,25 @@ def build_openai_responses_request_body(
         ],
         "tools": [image_tool],
     }
+
+
+def build_meshy_surface_pbr_request_body(
+    base_color_png: bytes,
+) -> dict[str, Any]:
+    """Build the documented Retexture payload for an aligned surface map set."""
+
+    normalized_base_color = _validate_png(
+        base_color_png,
+        "Generated surface base-color texture",
+        MAX_OUTPUT_PNG_BYTES,
+    )
+    body = build_retexture_request_body(
+        model_glb=_build_surface_pbr_slab_glb(),
+        reference_images_png=(normalized_base_color,),
+        enable_original_uv=True,
+        enable_pbr=True,
+    )
+    return body
 
 
 def build_openai_analysis_request_body(
@@ -378,6 +474,215 @@ def build_openai_image_edit_multipart(
     return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
 
 
+# ### Surface PBR slab ###
+@lru_cache(maxsize=1)
+def _build_surface_pbr_slab_glb() -> bytes:
+    """Build a thin slab with a large, isolated primary surface UV island.
+
+    Meshy's Retexture backend rejects zero-volume planes intermittently. A
+    closed slab gives the provider valid three-dimensional geometry. The front
+    face owns 95% of the atlas while the five support faces share the remainder
+    without overlap, preventing conflicting PBR pixels from being baked over
+    one another.
+    """
+
+    half_depth = 0.01
+    faces = (
+        # Front, back, right, left, top, bottom. Each face owns its vertices so
+        # it can retain a flat normal and an independent UV island.
+        (
+            ((-0.5, -0.5, half_depth), (0.5, -0.5, half_depth),
+             (0.5, 0.5, half_depth), (-0.5, 0.5, half_depth)),
+            (0.0, 0.0, 1.0),
+        ),
+        (
+            ((0.5, -0.5, -half_depth), (-0.5, -0.5, -half_depth),
+             (-0.5, 0.5, -half_depth), (0.5, 0.5, -half_depth)),
+            (0.0, 0.0, -1.0),
+        ),
+        (
+            ((0.5, -0.5, half_depth), (0.5, -0.5, -half_depth),
+             (0.5, 0.5, -half_depth), (0.5, 0.5, half_depth)),
+            (1.0, 0.0, 0.0),
+        ),
+        (
+            ((-0.5, -0.5, -half_depth), (-0.5, -0.5, half_depth),
+             (-0.5, 0.5, half_depth), (-0.5, 0.5, -half_depth)),
+            (-1.0, 0.0, 0.0),
+        ),
+        (
+            ((-0.5, 0.5, half_depth), (0.5, 0.5, half_depth),
+             (0.5, 0.5, -half_depth), (-0.5, 0.5, -half_depth)),
+            (0.0, 1.0, 0.0),
+        ),
+        (
+            ((-0.5, -0.5, -half_depth), (0.5, -0.5, -half_depth),
+             (0.5, -0.5, half_depth), (-0.5, -0.5, half_depth)),
+            (0.0, -1.0, 0.0),
+        ),
+    )
+    primary_uvs = (
+        (0.0, 0.0),
+        (SURFACE_PBR_PRIMARY_U_MAX, 0.0),
+        (SURFACE_PBR_PRIMARY_U_MAX, 1.0),
+        (0.0, 1.0),
+    )
+    support_uvs = tuple(
+        (
+            (SURFACE_PBR_PRIMARY_U_MAX, support_index / 5.0),
+            (1.0, support_index / 5.0),
+            (1.0, (support_index + 1) / 5.0),
+            (SURFACE_PBR_PRIMARY_U_MAX, (support_index + 1) / 5.0),
+        )
+        for support_index in range(5)
+    )
+    face_uvs = (primary_uvs, *support_uvs)
+    position_values = tuple(
+        component
+        for vertices, _normal in faces
+        for vertex in vertices
+        for component in vertex
+    )
+    normal_values = tuple(
+        component
+        for _vertices, normal in faces
+        for _vertex_index in range(4)
+        for component in normal
+    )
+    texture_coordinate_values = tuple(
+        component
+        for coordinates in face_uvs
+        for coordinate in coordinates
+        for component in coordinate
+    )
+    index_values = tuple(
+        face_index * 4 + local_index
+        for face_index in range(len(faces))
+        for local_index in (0, 1, 2, 0, 2, 3)
+    )
+    positions = struct.pack(f"<{len(position_values)}f", *position_values)
+    normals = struct.pack(f"<{len(normal_values)}f", *normal_values)
+    texture_coordinates = struct.pack(
+        f"<{len(texture_coordinate_values)}f",
+        *texture_coordinate_values,
+    )
+    indices = struct.pack(f"<{len(index_values)}H", *index_values)
+    binary_payload = positions + normals + texture_coordinates + indices
+    position_offset = 0
+    normal_offset = len(positions)
+    texture_coordinate_offset = normal_offset + len(normals)
+    index_offset = texture_coordinate_offset + len(texture_coordinates)
+    document = {
+        "accessors": [
+            {
+                "bufferView": 0,
+                "componentType": 5126,
+                "count": 24,
+                "max": [0.5, 0.5, half_depth],
+                "min": [-0.5, -0.5, -half_depth],
+                "type": "VEC3",
+            },
+            {
+                "bufferView": 1,
+                "componentType": 5126,
+                "count": 24,
+                "type": "VEC3",
+            },
+            {
+                "bufferView": 2,
+                "componentType": 5126,
+                "count": 24,
+                "max": [1.0, 1.0],
+                "min": [0.0, 0.0],
+                "type": "VEC2",
+            },
+            {
+                "bufferView": 3,
+                "componentType": 5123,
+                "count": 36,
+                "max": [23],
+                "min": [0],
+                "type": "SCALAR",
+            },
+        ],
+        "asset": {"generator": "HouseMaker", "version": "2.0"},
+        "bufferViews": [
+            {
+                "buffer": 0,
+                "byteLength": len(positions),
+                "byteOffset": position_offset,
+                "target": 34962,
+            },
+            {
+                "buffer": 0,
+                "byteLength": len(normals),
+                "byteOffset": normal_offset,
+                "target": 34962,
+            },
+            {
+                "buffer": 0,
+                "byteLength": len(texture_coordinates),
+                "byteOffset": texture_coordinate_offset,
+                "target": 34962,
+            },
+            {
+                "buffer": 0,
+                "byteLength": len(indices),
+                "byteOffset": index_offset,
+                "target": 34963,
+            },
+        ],
+        "buffers": [{"byteLength": len(binary_payload)}],
+        "materials": [
+            {
+                "doubleSided": False,
+                "pbrMetallicRoughness": {
+                    "baseColorFactor": [1.0, 1.0, 1.0, 1.0],
+                    "metallicFactor": 0.0,
+                    "roughnessFactor": 1.0,
+                },
+            }
+        ],
+        "meshes": [
+            {
+                "primitives": [
+                    {
+                        "attributes": {
+                            "NORMAL": 1,
+                            "POSITION": 0,
+                            "TEXCOORD_0": 2,
+                        },
+                        "indices": 3,
+                        "material": 0,
+                        "mode": 4,
+                    }
+                ]
+            }
+        ],
+        "nodes": [{"mesh": 0}],
+        "scene": 0,
+        "scenes": [{"nodes": [0]}],
+    }
+    json_payload = json.dumps(
+        document,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    json_payload += b" " * ((-len(json_payload)) % 4)
+    binary_payload += b"\x00" * ((-len(binary_payload)) % 4)
+    total_length = 12 + 8 + len(json_payload) + 8 + len(binary_payload)
+    return b"".join(
+        (
+            struct.pack("<4sII", b"glTF", 2, total_length),
+            struct.pack("<I4s", len(json_payload), b"JSON"),
+            json_payload,
+            struct.pack("<I4s", len(binary_payload), b"BIN\x00"),
+            binary_payload,
+        )
+    )
+
+
 # ### Public generation API ###
 def request_surface_texture(
     provider: str,
@@ -385,6 +690,7 @@ def request_surface_texture(
     reference_pngs: Sequence[bytes],
     prompt: str,
     *,
+    enabled_pbr_maps: Sequence[str] = (),
     progress_callback: ProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
     opener: UrlOpenFunction | None = None,
@@ -408,6 +714,7 @@ def request_surface_texture(
         reference_pngs=tuple(reference_pngs),
         prompt=prompt,
         settings=settings,
+        enabled_pbr_maps=tuple(enabled_pbr_maps),
     )
     _raise_if_cancelled(cancel_event)
     if provider_choice == MESHY_PROVIDER:
@@ -505,20 +812,32 @@ def _generate_meshy_result(
     cancel_event: threading.Event | None,
 ) -> SurfaceTextureResult:
     api_key = request.settings.meshy_api_key
-    task_id = _create_meshy_task(
-        request=request,
-        timeout_seconds=timeout_seconds,
-        opener=opener,
+    has_pbr_stage = bool(request.enabled_pbr_maps)
+    image_progress_callback = (
+        progress_callback
+        if not has_pbr_stage
+        else _build_stage_progress_callback(
+            progress_callback,
+            "IMAGE_TO_IMAGE",
+            start_percent=0,
+            span_percent=45,
+        )
     )
-    task = _wait_for_meshy_task(
+    task_id, task = _create_and_wait_for_meshy_task(
         api_key=api_key,
-        task_id=task_id,
+        create_task=lambda: _create_meshy_image_task(
+            request=request,
+            timeout_seconds=timeout_seconds,
+            opener=opener,
+        ),
+        endpoint=MESHY_IMAGE_TO_IMAGE_ENDPOINT,
+        task_label="image",
         timeout_seconds=timeout_seconds,
         poll_interval_seconds=poll_interval_seconds,
         max_polls=max_polls,
         opener=opener,
         sleep=sleep,
-        progress_callback=progress_callback,
+        progress_callback=image_progress_callback,
         cancel_event=cancel_event,
     )
     _raise_if_cancelled(cancel_event)
@@ -529,23 +848,182 @@ def _generate_meshy_result(
         timeout_seconds=timeout_seconds,
         opener=opener,
     )
+    if not has_pbr_stage:
+        return SurfaceTextureResult(
+            provider=MESHY_PROVIDER,
+            texture_png=image_png,
+            task_id=task_id,
+        )
+
+    _raise_if_cancelled(cancel_event)
+    _notify_progress(progress_callback, "PBR_RETEXTURE_SUBMITTING", 48)
+    pbr_task_id, pbr_task = _create_and_wait_for_meshy_task(
+        api_key=api_key,
+        create_task=lambda: _create_meshy_pbr_task(
+            api_key=api_key,
+            base_color_png=image_png,
+            timeout_seconds=timeout_seconds,
+            opener=opener,
+        ),
+        endpoint=MESHY_RETEXTURE_ENDPOINT,
+        task_label="surface PBR retexture",
+        timeout_seconds=timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+        max_polls=max_polls,
+        opener=opener,
+        sleep=sleep,
+        progress_callback=_build_stage_progress_callback(
+            progress_callback,
+            "PBR_RETEXTURE",
+            start_percent=50,
+            span_percent=45,
+        ),
+        cancel_event=cancel_event,
+    )
+    _base_color_url, pbr_urls = _get_meshy_texture_urls(
+        pbr_task,
+        pbr_task_id,
+    )
+    missing_requested_maps = set(request.enabled_pbr_maps) - set(pbr_urls)
+    if missing_requested_maps:
+        raise SurfaceTextureTaskError(
+            "Meshy surface PBR task "
+            f"{pbr_task_id} omitted requested maps: "
+            + ", ".join(sorted(missing_requested_maps))
+            + "."
+        )
+    _raise_if_cancelled(cancel_event)
+    _notify_progress(progress_callback, "DOWNLOADING_PBR_MAPS", 96)
+    downloaded_pbr_maps: dict[str, bytes] = {}
+    for map_type in PBR_MAP_TYPES:
+        map_url = pbr_urls.get(map_type)
+        if map_url is None:
+            continue
+        _raise_if_cancelled(cancel_event)
+        downloaded_map = _download_image_as_png(
+            map_url,
+            provider_name=f"Meshy {map_type}",
+            timeout_seconds=timeout_seconds,
+            opener=opener,
+        )
+        downloaded_pbr_maps[map_type] = _align_surface_pbr_primary_region(
+            downloaded_map,
+            map_type=map_type,
+            label=f"Meshy {map_type} texture image",
+        )
+    _notify_progress(progress_callback, "SUCCEEDED", 100)
     return SurfaceTextureResult(
         provider=MESHY_PROVIDER,
+        # Retexture's helper-slab base color is less faithful than the detailed
+        # image-to-image result that was supplied to it as the style source.
         texture_png=image_png,
         task_id=task_id,
+        pbr_texture_pngs=downloaded_pbr_maps,
+        pbr_task_id=pbr_task_id,
     )
 
 
-def _create_meshy_task(
+def _create_and_wait_for_meshy_task(
+    *,
+    api_key: str,
+    create_task: Callable[[], str],
+    endpoint: str,
+    task_label: str,
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+    max_polls: int,
+    opener: UrlOpenFunction | None,
+    sleep: SleepFunction,
+    progress_callback: ProgressCallback | None,
+    cancel_event: threading.Event | None,
+) -> tuple[str, dict[str, Any]]:
+    """Run one Meshy task with bounded backoff for classified failures."""
+
+    latest_progress = 0
+
+    def report_progress(status: str, progress: int) -> None:
+        nonlocal latest_progress
+        latest_progress = max(latest_progress, min(max(int(progress), 0), 100))
+        _notify_progress(progress_callback, status, latest_progress)
+
+    retry_delays = MESHY_TASK_RETRY_DELAYS_SECONDS
+    for attempt_index in range(len(retry_delays) + 1):
+        _raise_if_cancelled(cancel_event)
+        try:
+            task_id = create_task()
+            task = _wait_for_meshy_task(
+                api_key=api_key,
+                task_id=task_id,
+                endpoint=endpoint,
+                task_label=task_label,
+                timeout_seconds=timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+                max_polls=max_polls,
+                opener=opener,
+                sleep=sleep,
+                progress_callback=report_progress,
+                cancel_event=cancel_event,
+            )
+            return task_id, task
+        except (SurfaceTextureRequestError, SurfaceTextureTaskError) as error:
+            is_retryable = bool(getattr(error, "retryable", False))
+            if not is_retryable or attempt_index >= len(retry_delays):
+                raise
+            retry_number = attempt_index + 1
+            report_progress(f"RETRYING_{retry_number}", latest_progress)
+            _interruptible_sleep(
+                retry_delays[attempt_index],
+                sleep,
+                cancel_event,
+            )
+
+    raise AssertionError("The Meshy retry loop ended without a result.")
+
+
+def _create_meshy_image_task(
     request: SurfaceTextureRequest,
     timeout_seconds: float,
     opener: UrlOpenFunction | None,
 ) -> str:
     api_key = request.settings.meshy_api_key
+    return _create_meshy_task(
+        api_key=api_key,
+        endpoint=MESHY_IMAGE_TO_IMAGE_ENDPOINT,
+        request_body=build_meshy_image_to_image_request_body(request),
+        task_label="image",
+        timeout_seconds=timeout_seconds,
+        opener=opener,
+    )
+
+
+def _create_meshy_pbr_task(
+    api_key: str,
+    base_color_png: bytes,
+    timeout_seconds: float,
+    opener: UrlOpenFunction | None,
+) -> str:
+    return _create_meshy_task(
+        api_key=api_key,
+        endpoint=MESHY_RETEXTURE_ENDPOINT,
+        request_body=build_meshy_surface_pbr_request_body(base_color_png),
+        task_label="surface PBR retexture",
+        timeout_seconds=timeout_seconds,
+        opener=opener,
+    )
+
+
+def _create_meshy_task(
+    api_key: str,
+    endpoint: str,
+    request_body: Mapping[str, Any],
+    task_label: str,
+    timeout_seconds: float,
+    opener: UrlOpenFunction | None,
+) -> str:
     response = _request_json(
         Request(
-            MESHY_IMAGE_TO_IMAGE_ENDPOINT,
-            data=_encode_json(build_meshy_image_to_image_request_body(request)),
+            endpoint,
+            data=_encode_json(request_body),
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
@@ -562,7 +1040,7 @@ def _create_meshy_task(
     task_id = response.get("result")
     if not isinstance(task_id, str) or not task_id.strip():
         raise SurfaceTextureRequestError(
-            "Meshy returned an invalid image task identifier."
+            f"Meshy returned an invalid {task_label} task identifier."
         )
     return _normalize_task_id(task_id)
 
@@ -570,13 +1048,13 @@ def _create_meshy_task(
 def _get_meshy_task(
     api_key: str,
     task_id: str,
+    endpoint: str,
     timeout_seconds: float,
     opener: UrlOpenFunction | None,
 ) -> dict[str, Any]:
     response = _request_json(
         Request(
-            f"{MESHY_IMAGE_TO_IMAGE_ENDPOINT}/"
-            f"{quote(task_id, safe='')}",
+            f"{endpoint}/{quote(task_id, safe='')}",
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Accept": "application/json",
@@ -595,6 +1073,8 @@ def _get_meshy_task(
 def _wait_for_meshy_task(
     api_key: str,
     task_id: str,
+    endpoint: str,
+    task_label: str,
     timeout_seconds: float,
     poll_interval_seconds: float,
     max_polls: int,
@@ -614,6 +1094,7 @@ def _wait_for_meshy_task(
         task = _get_meshy_task(
             api_key=api_key,
             task_id=task_id,
+            endpoint=endpoint,
             timeout_seconds=timeout_seconds,
             opener=opener,
         )
@@ -621,15 +1102,32 @@ def _wait_for_meshy_task(
         progress = _get_task_progress(task, status, task_id)
         _notify_progress(progress_callback, status, progress)
         if status == "SUCCEEDED":
-            _get_meshy_image_url(task, task_id)
             return task
         if status in {"FAILED", "CANCELED"}:
-            detail = _redact(
-                _get_task_error_message(task),
-                (api_key,),
+            error_message, error_type, error_code, doc_url = (
+                _get_task_error_details(task)
+            )
+            detail = _redact(error_message, (api_key,))
+            classification = "/".join(
+                value for value in (error_type, error_code) if value
+            )
+            if classification:
+                detail += f" [{classification}]"
+            retryable = _is_retryable_meshy_task_failure(
+                task_label,
+                status,
+                error_message,
+                error_type,
+                error_code,
             )
             raise SurfaceTextureTaskError(
-                f"Meshy image task {task_id} {status.lower()}: {detail}"
+                f"Meshy {task_label} task {task_id} "
+                f"{status.lower()}: {detail}",
+                retryable=retryable,
+                task_id=task_id,
+                error_type=error_type,
+                error_code=error_code,
+                doc_url=doc_url,
             )
         if poll_index + 1 < poll_count:
             _interruptible_sleep(
@@ -639,7 +1137,7 @@ def _wait_for_meshy_task(
             )
 
     raise SurfaceTextureTaskError(
-        f"Meshy image task {task_id} timed out before completion."
+        f"Meshy {task_label} task {task_id} timed out before completion."
     )
 
 
@@ -759,6 +1257,126 @@ def _generate_with_openai_mini_pipeline(
 
 
 # ### Artifact helpers ###
+def _align_surface_pbr_primary_region(
+    texture_png: bytes,
+    *,
+    map_type: str,
+    label: str,
+) -> bytes:
+    """Restore and align Meshy's deterministic mirrored slab artifacts."""
+
+    isolated_png = _extract_surface_pbr_primary_region(
+        texture_png,
+        label=label,
+    )
+    return align_surface_pbr_map_png(
+        isolated_png,
+        map_type=map_type,
+        label=label,
+    )
+
+
+def align_surface_pbr_map_png(
+    texture_png: bytes,
+    *,
+    map_type: str,
+    label: str = "Surface PBR texture",
+) -> bytes:
+    """Mirror one Meshy surface map into HouseMaker's base-color orientation."""
+
+    normalized_map_type = str(map_type).strip().lower()
+    if normalized_map_type not in PBR_MAP_TYPES:
+        raise ValueError("Surface PBR alignment requires a supported map type.")
+    normalized_png = _validate_png(
+        texture_png,
+        label,
+        MAX_OUTPUT_PNG_BYTES,
+    )
+    try:
+        with Image.open(BytesIO(normalized_png)) as source_image:
+            source_image.load()
+            aligned_rgba = np.asarray(
+                source_image.convert("RGBA").transpose(
+                    Image.Transpose.FLIP_LEFT_RIGHT
+                ),
+                dtype=np.uint8,
+            ).copy()
+    except (OSError, SyntaxError, UnidentifiedImageError) as error:
+        raise SurfaceTextureTaskError(
+            f"{label} could not be aligned with the base color."
+        ) from error
+
+    if normalized_map_type == PBR_MAP_NORMAL:
+        # Mirroring U reverses the tangent-space X axis. Negating the encoded
+        # red channel keeps highlights and relief aligned with base-color pixels.
+        aligned_rgba[:, :, 0] = 255 - aligned_rgba[:, :, 0]
+
+    output = BytesIO()
+    try:
+        Image.fromarray(aligned_rgba, mode="RGBA").save(
+            output,
+            format="PNG",
+            compress_level=6,
+        )
+    except (OSError, ValueError) as error:
+        raise SurfaceTextureTaskError(
+            f"{label} could not be aligned with the base color."
+        ) from error
+    return _validate_png(
+        output.getvalue(),
+        label,
+        MAX_OUTPUT_PNG_BYTES,
+    )
+
+
+def _extract_surface_pbr_primary_region(
+    texture_png: bytes,
+    *,
+    label: str,
+) -> bytes:
+    """Remove helper-face pixels and restore the primary island to a square."""
+
+    normalized_png = _validate_png(
+        texture_png,
+        label,
+        MAX_OUTPUT_PNG_BYTES,
+    )
+    try:
+        with Image.open(BytesIO(normalized_png)) as source_image:
+            source_image.load()
+            width, height = source_image.size
+            primary_width = max(
+                1,
+                min(width, round(width * SURFACE_PBR_PRIMARY_U_MAX)),
+            )
+            if primary_width == width:
+                return normalized_png
+            primary_region = source_image.convert("RGBA").crop(
+                (0, 0, primary_width, height)
+            )
+            restored = primary_region.resize(
+                (width, height),
+                resample=Image.Resampling.LANCZOS,
+            )
+    except (OSError, SyntaxError, UnidentifiedImageError) as error:
+        raise SurfaceTextureTaskError(
+            f"{label} could not be isolated from the helper atlas."
+        ) from error
+
+    output = BytesIO()
+    try:
+        restored.save(output, format="PNG", compress_level=6)
+    except (OSError, ValueError) as error:
+        raise SurfaceTextureTaskError(
+            f"{label} could not be restored to a square texture."
+        ) from error
+    return _validate_png(
+        output.getvalue(),
+        label,
+        MAX_OUTPUT_PNG_BYTES,
+    )
+
+
 def _download_image_as_png(
     url: str,
     provider_name: str,
@@ -1098,6 +1716,41 @@ def _get_meshy_image_url(task: Mapping[str, Any], task_id: str) -> str:
     return image_url.strip()
 
 
+def _get_meshy_texture_urls(
+    task: Mapping[str, Any],
+    task_id: str,
+) -> tuple[str, dict[str, str]]:
+    """Return one aligned Meshy base color and every supported PBR URL."""
+
+    texture_urls = task.get("texture_urls")
+    if not isinstance(texture_urls, list) or not texture_urls:
+        raise SurfaceTextureTaskError(
+            f"Meshy surface PBR task {task_id} succeeded without textures."
+        )
+    first_texture_set = texture_urls[0]
+    if not isinstance(first_texture_set, Mapping):
+        raise SurfaceTextureTaskError(
+            f"Meshy surface PBR task {task_id} returned invalid textures."
+        )
+    raw_base_color_url = first_texture_set.get("base_color")
+    if not isinstance(raw_base_color_url, str) or not raw_base_color_url.strip():
+        raise SurfaceTextureTaskError(
+            f"Meshy surface PBR task {task_id} omitted its base color."
+        )
+    pbr_urls: dict[str, str] = {}
+    for map_type in PBR_MAP_TYPES:
+        raw_url = first_texture_set.get(map_type)
+        if raw_url is None:
+            continue
+        if not isinstance(raw_url, str) or not raw_url.strip():
+            raise SurfaceTextureTaskError(
+                f"Meshy surface PBR task {task_id} returned an invalid "
+                f"{map_type} artifact."
+            )
+        pbr_urls[map_type] = raw_url.strip()
+    return raw_base_color_url.strip(), pbr_urls
+
+
 def _get_task_status(task: Mapping[str, Any], task_id: str) -> str:
     status = task.get("status")
     if not isinstance(status, str):
@@ -1130,13 +1783,65 @@ def _get_task_progress(
     return progress
 
 
-def _get_task_error_message(task: Mapping[str, Any]) -> str:
+def _get_task_error_details(
+    task: Mapping[str, Any],
+) -> tuple[str, str | None, str | None, str | None]:
+    """Return safe, structured Meshy task failure metadata."""
+
     task_error = task.get("task_error")
     if isinstance(task_error, dict):
-        message = task_error.get("message")
-        if isinstance(message, str) and message.strip():
-            return message.strip()
-    return "unknown provider error"
+        message = _normalize_optional_provider_text(task_error.get("message"))
+        error_type = _normalize_optional_provider_text(task_error.get("type"))
+        error_code = _normalize_optional_provider_text(task_error.get("code"))
+        doc_url = _normalize_optional_provider_url(task_error.get("doc_url"))
+        return (
+            message or "unknown provider error",
+            error_type,
+            error_code,
+            doc_url,
+        )
+    return "unknown provider error", None, None, None
+
+
+def _is_retryable_meshy_task_failure(
+    task_label: str,
+    status: str,
+    message: str,
+    error_type: str | None,
+    error_code: str | None,
+) -> bool:
+    """Classify documented transient failures and Meshy's generic image fault."""
+
+    if status == "CANCELED":
+        return False
+    normalized_type = str(error_type or "").strip().lower()
+    if normalized_type in RETRYABLE_MESHY_TASK_ERROR_TYPES:
+        return True
+    normalized_code = str(error_code or "").strip().lower()
+    normalized_message = str(message).strip().lower()
+    return (
+        task_label == "image"
+        and normalized_type == "invalid_input"
+        and normalized_code == "invalid_input"
+        and GENERIC_MESHY_INVALID_INPUT_MESSAGE in normalized_message
+    )
+
+
+def _normalize_optional_provider_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized[:1_000] or None
+
+
+def _normalize_optional_provider_url(value: object) -> str | None:
+    normalized = _normalize_optional_provider_text(value)
+    if normalized is None or len(normalized) > 2_048:
+        return None
+    parsed = urlparse(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return normalized
 
 
 def _get_error_message(decoded: object) -> str:
@@ -1364,6 +2069,42 @@ def _normalize_task_id(task_id: str) -> str:
     return normalized
 
 
+def _normalize_optional_task_id(task_id: object) -> str | None:
+    if task_id is None:
+        return None
+    if not isinstance(task_id, str):
+        raise ValueError("A surface texture task identifier must be a string.")
+    try:
+        return _normalize_task_id(task_id)
+    except SurfaceTextureRequestError as error:
+        raise ValueError(str(error)) from error
+
+
+def _normalize_result_pbr_texture_pngs(
+    raw_maps: object,
+) -> dict[str, bytes]:
+    if not isinstance(raw_maps, Mapping):
+        raise ValueError("Surface PBR texture results must contain a mapping.")
+    normalized_types = normalize_pbr_map_types(
+        tuple(raw_maps),
+        label="Surface PBR texture results",
+    )
+    if len(normalized_types) != len(raw_maps):
+        raise ValueError("Surface PBR texture results contain duplicate map IDs.")
+    normalized_payloads: dict[str, bytes] = {}
+    for raw_map_type, raw_payload in raw_maps.items():
+        map_type = str(raw_map_type).strip().lower()
+        normalized_payloads[map_type] = _validate_png(
+            raw_payload,
+            f"Surface {map_type} texture",
+            MAX_OUTPUT_PNG_BYTES,
+        )
+    return {
+        map_type: normalized_payloads[map_type]
+        for map_type in normalized_types
+    }
+
+
 def _normalize_positive_float(value: float, label: str) -> float:
     try:
         normalized = float(value)
@@ -1418,6 +2159,25 @@ def _new_multipart_boundary(values: Sequence[bytes]) -> str:
 
 
 # ### Progress and cancellation helpers ###
+def _build_stage_progress_callback(
+    callback: ProgressCallback | None,
+    stage_name: str,
+    *,
+    start_percent: int,
+    span_percent: int,
+) -> ProgressCallback | None:
+    if callback is None:
+        return None
+
+    def report(status: str, progress: int) -> None:
+        stage_progress = int(start_percent) + round(
+            min(max(int(progress), 0), 100) * int(span_percent) / 100.0
+        )
+        callback(f"{stage_name}_{status}", stage_progress)
+
+    return report
+
+
 def _notify_progress(
     callback: ProgressCallback | None,
     status: str,

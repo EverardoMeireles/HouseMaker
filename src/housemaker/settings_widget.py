@@ -34,6 +34,12 @@ FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY = (
     "display/fullscreen_3d_viewer_screen_id"
 )
 JOBS_WINDOW_SCREEN_SETTING_KEY = "display/jobs_window_screen_id"
+AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR_SETTING_KEY = (
+    "atlas/automatic_texture_sort_by_pbr"
+)
+AUTOMATIC_ATLAS_TEXTURE_RESOLUTION_SETTING_KEY = (
+    "atlas/automatic_texture_resolution"
+)
 CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY_SETTING_KEY = (
     "navigation/canvas_3d_navigation_toggle_hotkey"
 )
@@ -52,6 +58,9 @@ DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY = "N"
 DEFAULT_UNUSED_FACE_REMOVAL = False
 DEFAULT_USE_UV_RAYCAST_FOR_OBJECT_GENERATION = False
 DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE = 5
+AUTOMATIC_ATLAS_TEXTURE_RESOLUTIONS = (512, 1024)
+DEFAULT_AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR = False
+DEFAULT_AUTOMATIC_ATLAS_TEXTURE_RESOLUTION = 512
 MINIMUM_FACE_VISIBILITY_PERCENTAGE = 0
 MAXIMUM_FACE_VISIBILITY_PERCENTAGE = 100
 DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS = 1.0
@@ -129,8 +138,27 @@ class GenerationServiceSettings:
     minimum_face_visibility_percentage: int = (
         DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE
     )
+    automatic_atlas_texture_resolution: int = (
+        DEFAULT_AUTOMATIC_ATLAS_TEXTURE_RESOLUTION
+    )
+    automatic_atlas_texture_sort_by_pbr: bool = (
+        DEFAULT_AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR
+    )
 
     def __post_init__(self) -> None:
+        if not isinstance(self.automatic_atlas_texture_sort_by_pbr, bool):
+            raise ValueError(
+                "Automatic Atlas PBR sorting must be enabled or disabled."
+            )
+        if (
+            isinstance(self.automatic_atlas_texture_resolution, bool)
+            or not isinstance(self.automatic_atlas_texture_resolution, int)
+            or self.automatic_atlas_texture_resolution
+            not in AUTOMATIC_ATLAS_TEXTURE_RESOLUTIONS
+        ):
+            raise ValueError(
+                "Automatic Atlas texture resolution must be 512 or 1024."
+            )
         if not isinstance(self.unused_face_removal, bool):
             raise ValueError("Unused face removal must be enabled or disabled.")
         if not isinstance(self.use_uv_raycast_for_object_generation, bool):
@@ -299,6 +327,12 @@ class SettingsWidget(QWidget):
                 self._selected_fullscreen_3d_viewer_screen_id()
             ),
             jobs_window_screen_id=self._selected_jobs_window_screen_id(),
+            automatic_atlas_texture_sort_by_pbr=(
+                self.automatic_atlas_texture_sort_by_pbr_checkbox.isChecked()
+            ),
+            automatic_atlas_texture_resolution=int(
+                self.automatic_atlas_texture_resolution_combo.currentData()
+            ),
             canvas_3d_navigation_toggle_hotkey=(
                 self._selected_canvas_3d_navigation_toggle_hotkey()
             ),
@@ -415,6 +449,44 @@ class SettingsWidget(QWidget):
         form_layout.addRow(
             "Jobs window display",
             self.jobs_window_screen_combo,
+        )
+
+        self.automatic_atlas_texture_sort_by_pbr_checkbox = QCheckBox()
+        self.automatic_atlas_texture_sort_by_pbr_checkbox.setObjectName(
+            "automatic_atlas_texture_sort_by_pbr_checkbox"
+        )
+        self.automatic_atlas_texture_sort_by_pbr_checkbox.setToolTip(
+            "Keep automatically assigned base-color-only textures out of "
+            "Atlases containing generated PBR maps."
+        )
+        self.automatic_atlas_texture_sort_by_pbr_checkbox.toggled.connect(
+            self._handle_automatic_atlas_texture_sort_by_pbr_changed
+        )
+        form_layout.addRow(
+            "Automatic Atlas texture sort by PBR",
+            self.automatic_atlas_texture_sort_by_pbr_checkbox,
+        )
+
+        self.automatic_atlas_texture_resolution_combo = QComboBox()
+        self.automatic_atlas_texture_resolution_combo.setObjectName(
+            "automatic_atlas_texture_resolution_combo"
+        )
+        self.automatic_atlas_texture_resolution_combo.setToolTip(
+            "Choose the resolution used when a newly placed object or "
+            "textured surface is first added to the selected Atlas. Existing "
+            "Atlas placements are not resized."
+        )
+        for resolution in AUTOMATIC_ATLAS_TEXTURE_RESOLUTIONS:
+            self.automatic_atlas_texture_resolution_combo.addItem(
+                f"{resolution} x {resolution}",
+                resolution,
+            )
+        self.automatic_atlas_texture_resolution_combo.currentIndexChanged.connect(
+            self._handle_automatic_atlas_texture_resolution_changed
+        )
+        form_layout.addRow(
+            "Automatic Atlas texture resolution",
+            self.automatic_atlas_texture_resolution_combo,
         )
 
         self.canvas_3d_navigation_toggle_hotkey_edit = QKeySequenceEdit()
@@ -584,6 +656,22 @@ class SettingsWidget(QWidget):
         )
         self._refresh_fullscreen_3d_viewer_screen_options()
         self._refresh_jobs_window_screen_options()
+        self.automatic_atlas_texture_sort_by_pbr_checkbox.setChecked(
+            read_automatic_atlas_texture_sort_by_pbr(
+                self._application_settings
+            )
+        )
+        automatic_atlas_resolution = read_automatic_atlas_texture_resolution(
+            self._application_settings
+        )
+        automatic_atlas_index = (
+            self.automatic_atlas_texture_resolution_combo.findData(
+                automatic_atlas_resolution
+            )
+        )
+        self.automatic_atlas_texture_resolution_combo.setCurrentIndex(
+            max(0, automatic_atlas_index)
+        )
         self.canvas_3d_navigation_toggle_hotkey_edit.setKeySequence(
             QKeySequence(
                 read_canvas_3d_navigation_toggle_hotkey(
@@ -724,6 +812,34 @@ class SettingsWidget(QWidget):
         self._application_settings.set(
             JOBS_WINDOW_SCREEN_SETTING_KEY,
             self._selected_jobs_window_screen_id(),
+        )
+        self.settings_changed.emit()
+
+    def _handle_automatic_atlas_texture_resolution_changed(
+        self,
+        _index: int,
+    ) -> None:
+        """Persist the resolution used for future automatic Atlas entries."""
+
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            AUTOMATIC_ATLAS_TEXTURE_RESOLUTION_SETTING_KEY,
+            int(self.automatic_atlas_texture_resolution_combo.currentData()),
+        )
+        self.settings_changed.emit()
+
+    def _handle_automatic_atlas_texture_sort_by_pbr_changed(
+        self,
+        checked: bool,
+    ) -> None:
+        """Persist whether automatic Atlas placement separates non-PBR maps."""
+
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR_SETTING_KEY,
+            bool(checked),
         )
         self.settings_changed.emit()
 
@@ -888,6 +1004,39 @@ def read_jobs_window_screen_id(
     return _normalize_fullscreen_3d_viewer_screen_id(
         application_settings.get(JOBS_WINDOW_SCREEN_SETTING_KEY)
     )
+
+
+# ### Atlas setting helpers ###
+def read_automatic_atlas_texture_sort_by_pbr(
+    application_settings: ApplicationSettingsStore,
+) -> bool:
+    """Read the persisted PBR-sorting policy with a safe default."""
+
+    value = application_settings.get(
+        AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR_SETTING_KEY,
+        DEFAULT_AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR,
+    )
+    if isinstance(value, bool):
+        return value
+    return DEFAULT_AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR
+
+
+def read_automatic_atlas_texture_resolution(
+    application_settings: ApplicationSettingsStore,
+) -> int:
+    """Read the automatic Atlas resolution with a safe supported default."""
+
+    value = application_settings.get(
+        AUTOMATIC_ATLAS_TEXTURE_RESOLUTION_SETTING_KEY,
+        DEFAULT_AUTOMATIC_ATLAS_TEXTURE_RESOLUTION,
+    )
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value not in AUTOMATIC_ATLAS_TEXTURE_RESOLUTIONS
+    ):
+        return DEFAULT_AUTOMATIC_ATLAS_TEXTURE_RESOLUTION
+    return int(value)
 
 
 # ### Object post-processing setting helpers ###

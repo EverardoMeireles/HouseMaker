@@ -16,7 +16,12 @@ from PySide6.QtWidgets import QApplication, QLabel, QLineEdit
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.settings_widget import (
+    AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR_SETTING_KEY,
+    AUTOMATIC_ATLAS_TEXTURE_RESOLUTION_SETTING_KEY,
+    AUTOMATIC_ATLAS_TEXTURE_RESOLUTIONS,
     CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY_SETTING_KEY,
+    DEFAULT_AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR,
+    DEFAULT_AUTOMATIC_ATLAS_TEXTURE_RESOLUTION,
     DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY,
     DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE,
     DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS,
@@ -41,6 +46,8 @@ from housemaker.settings_widget import (
     GenerationServiceSettings,
     SettingsWidget,
     fullscreen_3d_viewer_screen_id,
+    read_automatic_atlas_texture_sort_by_pbr,
+    read_automatic_atlas_texture_resolution,
     read_canvas_3d_navigation_toggle_hotkey,
     read_mesh_edit_update_delay_seconds,
     read_minimum_face_visibility_percentage,
@@ -62,6 +69,172 @@ class SettingsWidgetTests(unittest.TestCase):
             GenerationServiceSettings().meshy_target_polycount,
             2_000,
         )
+
+    def test_automatic_atlas_resolution_defaults_persists_and_emits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            widget = SettingsWidget(
+                application_settings=application_settings,
+                environment={},
+            )
+            combo = widget.automatic_atlas_texture_resolution_combo
+            emitted_changes: list[bool] = []
+            widget.settings_changed.connect(
+                lambda: emitted_changes.append(True)
+            )
+
+            self.assertEqual(
+                DEFAULT_AUTOMATIC_ATLAS_TEXTURE_RESOLUTION,
+                512,
+            )
+            self.assertEqual(
+                widget.get_settings().automatic_atlas_texture_resolution,
+                DEFAULT_AUTOMATIC_ATLAS_TEXTURE_RESOLUTION,
+            )
+            self.assertEqual(
+                tuple(combo.itemData(index) for index in range(combo.count())),
+                AUTOMATIC_ATLAS_TEXTURE_RESOLUTIONS,
+            )
+
+            combo.setCurrentIndex(combo.findData(1024))
+
+            self.assertEqual(
+                application_settings.get(
+                    AUTOMATIC_ATLAS_TEXTURE_RESOLUTION_SETTING_KEY
+                ),
+                1024,
+            )
+            self.assertEqual(
+                widget.get_settings().automatic_atlas_texture_resolution,
+                1024,
+            )
+            self.assertEqual(emitted_changes, [True])
+
+            restored = SettingsWidget(
+                application_settings=_build_test_settings(temporary_directory),
+                environment={},
+            )
+            self.assertEqual(
+                restored.get_settings().automatic_atlas_texture_resolution,
+                1024,
+            )
+
+    def test_automatic_atlas_resolution_rejects_malformed_values(self) -> None:
+        invalid_values: tuple[object, ...] = (
+            True,
+            "1024",
+            1024.0,
+            256,
+            2048,
+            None,
+        )
+        for value in invalid_values:
+            with self.subTest(model_value=value):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "Automatic Atlas texture resolution",
+                ):
+                    GenerationServiceSettings(
+                        automatic_atlas_texture_resolution=(
+                            value  # type: ignore[arg-type]
+                        )
+                    )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            for value in invalid_values:
+                with self.subTest(persisted_value=value):
+                    application_settings.set(
+                        AUTOMATIC_ATLAS_TEXTURE_RESOLUTION_SETTING_KEY,
+                        value,
+                    )
+                    self.assertEqual(
+                        read_automatic_atlas_texture_resolution(
+                            application_settings
+                        ),
+                        DEFAULT_AUTOMATIC_ATLAS_TEXTURE_RESOLUTION,
+                    )
+
+    def test_automatic_atlas_resolution_accepts_supported_values(self) -> None:
+        self.assertEqual(
+            AUTOMATIC_ATLAS_TEXTURE_RESOLUTIONS,
+            (512, 1024),
+        )
+        for resolution in AUTOMATIC_ATLAS_TEXTURE_RESOLUTIONS:
+            with self.subTest(resolution=resolution):
+                self.assertEqual(
+                    GenerationServiceSettings(
+                        automatic_atlas_texture_resolution=resolution
+                    ).automatic_atlas_texture_resolution,
+                    resolution,
+                )
+
+    def test_automatic_atlas_pbr_sort_defaults_persists_and_restores(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            widget = SettingsWidget(
+                application_settings=application_settings,
+                environment={},
+            )
+            checkbox = widget.automatic_atlas_texture_sort_by_pbr_checkbox
+            emitted_changes: list[bool] = []
+            widget.settings_changed.connect(
+                lambda: emitted_changes.append(True)
+            )
+
+            self.assertFalse(DEFAULT_AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR)
+            self.assertFalse(checkbox.isChecked())
+            self.assertFalse(
+                widget.get_settings().automatic_atlas_texture_sort_by_pbr
+            )
+
+            checkbox.setChecked(True)
+
+            self.assertTrue(
+                application_settings.get(
+                    AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR_SETTING_KEY
+                )
+            )
+            self.assertTrue(
+                widget.get_settings().automatic_atlas_texture_sort_by_pbr
+            )
+            self.assertEqual(emitted_changes, [True])
+            restored = SettingsWidget(
+                application_settings=_build_test_settings(temporary_directory),
+                environment={},
+            )
+            self.assertTrue(
+                restored.get_settings().automatic_atlas_texture_sort_by_pbr
+            )
+
+    def test_automatic_atlas_pbr_sort_rejects_malformed_values(self) -> None:
+        for value in (0, 1, "true", None):
+            with self.subTest(model_value=value):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "Automatic Atlas PBR sorting",
+                ):
+                    GenerationServiceSettings(
+                        automatic_atlas_texture_sort_by_pbr=(
+                            value  # type: ignore[arg-type]
+                        )
+                    )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            for value in (0, 1, "true", None):
+                with self.subTest(persisted_value=value):
+                    application_settings.set(
+                        AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR_SETTING_KEY,
+                        value,
+                    )
+                    self.assertFalse(
+                        read_automatic_atlas_texture_sort_by_pbr(
+                            application_settings
+                        )
+                    )
 
     def test_api_key_fields_and_fullscreen_display_selector_are_visible(
         self,
