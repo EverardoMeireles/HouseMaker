@@ -357,6 +357,7 @@ class GeneratedObjectPlacementMainTests(unittest.TestCase):
         placed_model = placed_models[0]
         self.assertIsInstance(placed_model, PlacedGeneratedModel)
         self.assertEqual(placed_model.object_id, "visible")
+        self.assertEqual(placed_model.object_name, "Object visible")
         self.assertIs(placed_model.model, object_model)
         expected_x, expected_y = level_image_to_world_xy(
             target_level,

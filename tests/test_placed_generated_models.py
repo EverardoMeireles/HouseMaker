@@ -2,13 +2,18 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 import unittest
 from io import BytesIO
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import numpy as np
 import trimesh
 from PIL import Image
+from trimesh.exchange.gltf import load_glb
 from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
@@ -21,7 +26,9 @@ from housemaker.glb import (
     PreviewSymmetricObject,
     PreviewTexturedSurface,
     PreviewTexturedWall,
+    _serialize_scene_glb_with_half_mesh_extras,
     compose_placed_generated_models,
+    export_glb_file,
     import_generated_glb,
 )
 
@@ -190,6 +197,285 @@ def _texture_average(mesh: trimesh.Trimesh) -> np.ndarray:
     return np.mean(texture_rgba, axis=(0, 1))
 
 
+def _load_glb_json(payload: bytes) -> dict[str, object]:
+    """Read the JSON chunk without depending on scene-import metadata policy."""
+
+    if payload[:4] != b"glTF" or len(payload) < 20:
+        raise ValueError("The fixture GLB is invalid.")
+    offset = 12
+    while offset + 8 <= len(payload):
+        chunk_length = int.from_bytes(payload[offset : offset + 4], "little")
+        chunk_type = payload[offset + 4 : offset + 8]
+        offset += 8
+        chunk = payload[offset : offset + chunk_length]
+        offset += chunk_length
+        if chunk_type == b"JSON":
+            document = json.loads(chunk.rstrip(b" \x00").decode("utf-8"))
+            if not isinstance(document, dict):
+                raise ValueError("The fixture GLB JSON root is invalid.")
+            return document
+    raise ValueError("The fixture GLB has no JSON chunk.")
+
+
+def _build_json_only_glb(document: dict[str, object]) -> bytes:
+    """Serialize a minimal JSON-only GLB for final-byte rewrite tests."""
+
+    encoded = json.dumps(document, separators=(",", ":")).encode("utf-8")
+    encoded += b" " * (-len(encoded) % 4)
+    total_byte_count = 12 + 8 + len(encoded)
+    return b"".join(
+        (
+            b"glTF",
+            (2).to_bytes(4, "little"),
+            total_byte_count.to_bytes(4, "little"),
+            len(encoded).to_bytes(4, "little"),
+            b"JSON",
+            encoded,
+        )
+    )
+
+
+def _find_exported_node(
+    payload: bytes,
+    node_name: str,
+) -> dict[str, object]:
+    document = _load_glb_json(payload)
+    nodes = document.get("nodes")
+    if not isinstance(nodes, list):
+        raise ValueError("The fixture GLB has no nodes.")
+    matches = [
+        node
+        for node in nodes
+        if isinstance(node, dict) and node.get("name") == node_name
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"Expected one exported node named {node_name!r}.")
+    return matches[0]
+
+
+def _assert_direct_half_mesh_nodes(
+    payload: bytes,
+    expected_half_mesh_by_name: dict[str, dict[str, object]],
+) -> None:
+    """Require every half marker to live directly on one root mesh node."""
+
+    document = _load_glb_json(payload)
+    nodes = document.get("nodes")
+    meshes = document.get("meshes")
+    scenes = document.get("scenes")
+    if (
+        not isinstance(nodes, list)
+        or not isinstance(meshes, list)
+        or not isinstance(scenes, list)
+    ):
+        raise AssertionError("The exported GLB has no node hierarchy.")
+    half_node_indices = {
+        index
+        for index, node in enumerate(nodes)
+        if isinstance(node, dict)
+        and str(node.get("name", "")).startswith("[HALF] ")
+    }
+    actual_names = {
+        str(nodes[index].get("name")) for index in half_node_indices
+    }
+    if actual_names != set(expected_half_mesh_by_name):
+        raise AssertionError("The exported half-mesh node names are invalid.")
+    metadata_node_indices = {
+        index
+        for index, node in enumerate(nodes)
+        if isinstance(node, dict)
+        and isinstance(node.get("extras"), dict)
+        and "halfMesh" in node["extras"]
+    }
+    if metadata_node_indices != half_node_indices:
+        raise AssertionError("Half-mesh metadata depends on a wrapper node.")
+
+    scene_index = int(document.get("scene", 0))
+    active_scene = scenes[scene_index]
+    if not isinstance(active_scene, dict):
+        raise AssertionError("The exported GLB scene is invalid.")
+    root_node_indices = set(active_scene.get("nodes", ()))
+    if not half_node_indices.issubset(root_node_indices):
+        raise AssertionError("A half mesh depends on a separate parent node.")
+
+    for index in half_node_indices:
+        node = nodes[index]
+        assert isinstance(node, dict)
+        name = str(node["name"])
+        if "mesh" not in node or "children" in node:
+            raise AssertionError("A half marker is not on a leaf mesh node.")
+        expected_half_mesh = expected_half_mesh_by_name[name]
+        extras = node.get("extras")
+        if (
+            not isinstance(extras, dict)
+            or extras.get("halfMesh") != expected_half_mesh
+        ):
+            raise AssertionError("A half mesh has invalid mirror instructions.")
+        mesh_index = node["mesh"]
+        if (
+            isinstance(mesh_index, bool)
+            or not isinstance(mesh_index, int)
+            or mesh_index < 0
+            or mesh_index >= len(meshes)
+            or not isinstance(meshes[mesh_index], dict)
+        ):
+            raise AssertionError("A half mesh has no glTF mesh definition.")
+        mesh_extras = meshes[mesh_index].get("extras")
+        if (
+            not isinstance(mesh_extras, dict)
+            or mesh_extras.get("halfMesh") != expected_half_mesh
+        ):
+            raise AssertionError(
+                "A renderable half mesh has no mirror instructions."
+            )
+        if set(expected_half_mesh) != {"mirrorPlane", "uvMode"}:
+            raise AssertionError("The expected half-mesh schema is invalid.")
+        if expected_half_mesh["uvMode"] != "reuse":
+            raise AssertionError("The mirrored half must reuse authored UVs.")
+        mirror_plane = expected_half_mesh["mirrorPlane"]
+        if not isinstance(mirror_plane, dict) or set(mirror_plane) != {
+            "point",
+            "normal",
+        }:
+            raise AssertionError("The half-mesh mirror plane is invalid.")
+
+
+def _metadata_preserving_trimesh_round_trip(payload: bytes) -> bytes:
+    """Exercise Trimesh's glTF parser while retaining parsed graph extras."""
+
+    loaded = load_glb(BytesIO(payload))
+    scene = trimesh.Scene(base_frame=str(loaded["base_frame"]))
+    for geometry_name, mesh_kwargs in loaded["geometry"].items():
+        scene.geometry[geometry_name] = trimesh.Trimesh(**mesh_kwargs)
+    for raw_edge in loaded["graph"]:
+        scene.graph.update(**dict(raw_edge))
+    return bytes(scene.export(file_type="glb"))
+
+
+# ### Half-mesh serialization tests ###
+class HalfMeshGlbSerializationTests(unittest.TestCase):
+    def _build_half_mesh_scene(
+        self,
+    ) -> tuple[trimesh.Scene, str, dict[str, object]]:
+        node_name = "[HALF] serializer_fixture"
+        half_mesh = {
+            "mirrorPlane": {
+                "point": [1.0, 2.0, 3.0],
+                "normal": [1.0, 0.0, 0.0],
+            },
+            "uvMode": "reuse",
+        }
+        scene = trimesh.Scene()
+        scene.add_geometry(
+            trimesh.creation.box(),
+            node_name=node_name,
+            metadata={"halfMesh": half_mesh},
+        )
+        return scene, node_name, half_mesh
+
+    def test_serializer_injects_extras_when_gltf_tree_omits_them(
+        self,
+    ) -> None:
+        scene, node_name, half_mesh = self._build_half_mesh_scene()
+        source_tree = {
+            "asset": {"version": "2.0"},
+            "scene": 0,
+            "scenes": [{"nodes": [0]}],
+            "nodes": [{"name": node_name, "mesh": 0}],
+            "meshes": [{"primitives": []}],
+        }
+
+        def export_without_implicit_extras(
+            *,
+            file_type: str,
+        ) -> bytes:
+            self.assertEqual(file_type, "glb")
+            return _build_json_only_glb(source_tree)
+
+        with patch.object(
+            scene,
+            "export",
+            side_effect=export_without_implicit_extras,
+        ):
+            payload = _serialize_scene_glb_with_half_mesh_extras(
+                scene,
+                failure_message="serialization failed",
+            )
+
+        exported_tree = _load_glb_json(payload)
+        self.assertEqual(
+            exported_tree["nodes"][0]["extras"],
+            {"halfMesh": half_mesh},
+        )
+        self.assertEqual(
+            exported_tree["meshes"][0]["extras"],
+            {"halfMesh": half_mesh},
+        )
+
+    def test_serializer_rejects_missing_or_non_mesh_half_target(self) -> None:
+        invalid_nodes = (
+            ({"name": "ordinary", "mesh": 0}, "omitted half-mesh"),
+            ({"name": "[HALF] serializer_fixture"}, "mesh node"),
+        )
+        for raw_node, expected_message in invalid_nodes:
+            with self.subTest(raw_node=raw_node):
+                scene, _node_name, _half_mesh = self._build_half_mesh_scene()
+
+                def export_invalid_tree(
+                    *,
+                    file_type: str,
+                ) -> bytes:
+                    self.assertEqual(file_type, "glb")
+                    return _build_json_only_glb(
+                        {
+                            "asset": {"version": "2.0"},
+                            "nodes": [dict(raw_node)],
+                            "meshes": [{"primitives": []}],
+                        }
+                    )
+
+                with patch.object(
+                    scene,
+                    "export",
+                    side_effect=export_invalid_tree,
+                ), self.assertRaisesRegex(ValueError, expected_message):
+                    _serialize_scene_glb_with_half_mesh_extras(
+                        scene,
+                        failure_message="serialization failed",
+                    )
+
+    def test_final_file_writer_repairs_stripped_half_mesh_extras(self) -> None:
+        scene, node_name, half_mesh = self._build_half_mesh_scene()
+        stripped_payload = _build_json_only_glb(
+            {
+                "asset": {"version": "2.0"},
+                "scene": 0,
+                "scenes": [{"nodes": [0]}],
+                "nodes": [{"name": node_name, "mesh": 0}],
+                "meshes": [{"primitives": []}],
+            }
+        )
+        model = GeneratedModel(
+            mesh=trimesh.creation.box(),
+            scene=scene,
+            glb_bytes=stripped_payload,
+        )
+
+        with TemporaryDirectory() as temporary_directory:
+            output_path = Path(temporary_directory) / "final.glb"
+            export_glb_file(model, output_path)
+            document = _load_glb_json(output_path.read_bytes())
+
+        self.assertEqual(
+            document["nodes"][0]["extras"]["halfMesh"],
+            half_mesh,
+        )
+        self.assertEqual(
+            document["meshes"][0]["extras"]["halfMesh"],
+            half_mesh,
+        )
+
+
 # ### Composition tests ###
 class PlacedGeneratedModelCompositionTests(unittest.TestCase):
     def test_rotation_keeps_the_source_bottom_center_on_the_world_anchor(
@@ -339,6 +625,242 @@ class PlacedGeneratedModelCompositionTests(unittest.TestCase):
         self.assertEqual(
             len(exported.mesh.faces),
             len(base_model.mesh.faces) + retained_face_count,
+        )
+
+    def test_multiple_half_models_export_as_distinct_named_authored_objects(
+        self,
+    ) -> None:
+        base_model = _base_box_model()
+        retained_mesh = trimesh.creation.box(extents=(1.0, 2.0, 2.0))
+        retained_mesh.apply_translation((-0.5, 0.0, 1.0))
+        retained_model = _single_mesh_model(retained_mesh)
+        retained_face_count = len(retained_model.mesh.faces)
+
+        composed = compose_placed_generated_models(
+            base_model,
+            (
+                PlacedGeneratedModel(
+                    object_id="half-window",
+                    object_name="  window_frame_01  ",
+                    model=retained_model,
+                    world_position=(10.0, 20.0, 30.0),
+                    rotation_degrees=(0.0, 0.0, 90.0),
+                    symmetric_preview_orientation="vertical",
+                    symmetric_preview_plane_coordinate=0.0,
+                ),
+                PlacedGeneratedModel(
+                    object_id="half-arch",
+                    object_name="arch_frame_01",
+                    model=retained_model,
+                    world_position=(40.0, 50.0, 60.0),
+                    symmetric_preview_orientation="horizontal",
+                    symmetric_preview_plane_coordinate=1.0,
+                ),
+            ),
+        )
+
+        document = _load_glb_json(composed.glb_bytes)
+        nodes = document.get("nodes")
+        self.assertIsInstance(nodes, list)
+        assert isinstance(nodes, list)
+        half_node_names = {
+            str(node.get("name"))
+            for node in nodes
+            if isinstance(node, dict)
+            and str(node.get("name", "")).startswith("[HALF] ")
+        }
+        self.assertEqual(
+            half_node_names,
+            {"[HALF] window_frame_01", "[HALF] arch_frame_01"},
+        )
+        half_mesh_nodes = [
+            node
+            for node in nodes
+            if isinstance(node, dict)
+            and isinstance(node.get("extras"), dict)
+            and "halfMesh" in node["extras"]
+        ]
+        self.assertEqual(len(half_mesh_nodes), 2)
+        self.assertTrue(all("mesh" in node for node in half_mesh_nodes))
+        self.assertTrue(
+            all(
+                str(node.get("name", "")).startswith("[HALF] ")
+                for node in half_mesh_nodes
+            )
+        )
+
+        vertical_node = _find_exported_node(
+            composed.glb_bytes,
+            "[HALF] window_frame_01",
+        )
+        self.assertIn("mesh", vertical_node)
+        vertical_half = vertical_node["extras"]["halfMesh"]
+        self.assertEqual(set(vertical_half), {"mirrorPlane", "uvMode"})
+        self.assertEqual(vertical_half["uvMode"], "reuse")
+        self.assertEqual(
+            set(vertical_half["mirrorPlane"]),
+            {"point", "normal"},
+        )
+        np.testing.assert_allclose(
+            vertical_half["mirrorPlane"]["point"],
+            (10.0, 30.0, -20.5),
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            vertical_half["mirrorPlane"]["normal"],
+            (0.0, 0.0, -1.0),
+            atol=1e-12,
+        )
+        horizontal_node = _find_exported_node(
+            composed.glb_bytes,
+            "[HALF] arch_frame_01",
+        )
+        self.assertIn("mesh", horizontal_node)
+        horizontal_half = horizontal_node["extras"]["halfMesh"]
+        self.assertEqual(set(horizontal_half), {"mirrorPlane", "uvMode"})
+        self.assertEqual(horizontal_half["uvMode"], "reuse")
+        np.testing.assert_allclose(
+            horizontal_half["mirrorPlane"]["point"],
+            (40.5, 61.0, -50.0),
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            horizontal_half["mirrorPlane"]["normal"],
+            (0.0, 1.0, 0.0),
+            atol=1e-12,
+        )
+        _assert_direct_half_mesh_nodes(
+            composed.glb_bytes,
+            {
+                "[HALF] window_frame_01": {
+                    "mirrorPlane": {
+                        "point": [10.0, 30.0, -20.5],
+                        "normal": [0.0, 0.0, -1.0],
+                    },
+                    "uvMode": "reuse",
+                },
+                "[HALF] arch_frame_01": {
+                    "mirrorPlane": {
+                        "point": [40.5, 61.0, -50.0],
+                        "normal": [0.0, 1.0, 0.0],
+                    },
+                    "uvMode": "reuse",
+                },
+            },
+        )
+
+        exported = import_generated_glb(composed.glb_bytes)
+        self.assertEqual(
+            len(exported.mesh.faces),
+            len(base_model.mesh.faces) + retained_face_count * 2,
+        )
+
+    def test_half_name_falls_back_to_id_and_non_half_export_stays_normal(
+        self,
+    ) -> None:
+        base_model = _base_box_model()
+        object_model = _single_mesh_model(trimesh.creation.icosphere())
+
+        composed = compose_placed_generated_models(
+            base_model,
+            (
+                PlacedGeneratedModel(
+                    object_id="fallback_half",
+                    model=object_model,
+                    world_position=(2.0, 3.0, 4.0),
+                    symmetric_preview_orientation="vertical",
+                    symmetric_preview_plane_coordinate=0.0,
+                ),
+                PlacedGeneratedModel(
+                    object_id="ordinary-object",
+                    object_name="ordinary_display_name",
+                    model=object_model,
+                    world_position=(5.0, 6.0, 7.0),
+                ),
+            ),
+        )
+
+        half_node = _find_exported_node(
+            composed.glb_bytes,
+            "[HALF] fallback_half",
+        )
+        self.assertIn("mesh", half_node)
+        self.assertIn("halfMesh", half_node["extras"])
+        document = _load_glb_json(composed.glb_bytes)
+        nodes = document.get("nodes")
+        self.assertIsInstance(nodes, list)
+        assert isinstance(nodes, list)
+        ordinary_nodes = [
+            node
+            for node in nodes
+            if isinstance(node, dict)
+            and isinstance(node.get("extras"), dict)
+            and node["extras"].get("housemaker_object_id")
+            == "ordinary-object"
+        ]
+        self.assertEqual(len(ordinary_nodes), 1)
+        ordinary_node = ordinary_nodes[0]
+        self.assertFalse(str(ordinary_node.get("name", "")).startswith("[HALF]"))
+        self.assertNotIn("halfMesh", ordinary_node["extras"])
+
+    def test_half_extras_survive_gltf_parser_and_reexport(self) -> None:
+        base_model = _base_box_model()
+        retained_mesh = trimesh.creation.box(extents=(1.0, 2.0, 2.0))
+        retained_mesh.apply_translation((-0.5, 0.0, 1.0))
+        retained_model = _single_mesh_model(retained_mesh)
+        composed = compose_placed_generated_models(
+            base_model,
+            (
+                PlacedGeneratedModel(
+                    object_id="round-trip-half",
+                    object_name="round_trip_half",
+                    model=retained_model,
+                    world_position=(1.0, 2.0, 3.0),
+                    symmetric_preview_orientation="vertical",
+                    symmetric_preview_plane_coordinate=0.0,
+                ),
+            ),
+        )
+        expected_half_mesh = {
+            "mirrorPlane": {
+                "point": [1.5, 3.0, -2.0],
+                "normal": [1.0, 0.0, 0.0],
+            },
+            "uvMode": "reuse",
+        }
+        _assert_direct_half_mesh_nodes(
+            composed.glb_bytes,
+            {"[HALF] round_trip_half": expected_half_mesh},
+        )
+
+        loaded = load_glb(BytesIO(composed.glb_bytes))
+        half_edges = [
+            dict(edge)
+            for edge in loaded["graph"]
+            if edge.get("frame_to") == "[HALF] round_trip_half"
+        ]
+        self.assertEqual(len(half_edges), 1)
+        self.assertIn("geometry", half_edges[0])
+        self.assertEqual(
+            half_edges[0]["metadata"]["halfMesh"],
+            expected_half_mesh,
+        )
+
+        round_trip_payload = _metadata_preserving_trimesh_round_trip(
+            composed.glb_bytes
+        )
+        round_trip_node = _find_exported_node(
+            round_trip_payload,
+            "[HALF] round_trip_half",
+        )
+        self.assertIn("mesh", round_trip_node)
+        self.assertEqual(
+            round_trip_node["extras"]["halfMesh"],
+            half_edges[0]["metadata"]["halfMesh"],
+        )
+        _assert_direct_half_mesh_nodes(
+            round_trip_payload,
+            {"[HALF] round_trip_half": expected_half_mesh},
         )
 
     def test_bottom_center_moves_to_world_target_and_exports_exact_bounds(

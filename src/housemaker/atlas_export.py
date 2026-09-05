@@ -18,7 +18,12 @@ from housemaker.glass_material import (
     get_housemaker_glass_runtime_key,
     is_housemaker_glass_material,
 )
-from housemaker.glb import GeneratedModel
+from housemaker.glb import (
+    HALF_MESH_EXTRAS_KEY,
+    HALF_NODE_NAME_PREFIX,
+    GeneratedModel,
+    _serialize_scene_glb_with_half_mesh_extras,
+)
 from housemaker.pbr_maps import (
     ATLAS_MAP_BASE_COLOR,
     ATLAS_MAP_TYPES,
@@ -40,7 +45,6 @@ from housemaker.texture_atlas_state import (
 
 
 # ### Constants ###
-ATLAS_MATERIAL_NAME_PREFIX = "HouseMaker Atlas"
 SURFACE_ID_METADATA_KEY = "housemaker_surface_id"
 OBJECT_ID_METADATA_KEY = "housemaker_object_id"
 ATLAS_ID_METADATA_KEY = "housemaker_atlas_id"
@@ -112,6 +116,24 @@ class MaterializedTextureAtlas:
         object.__setattr__(self, "active_map_types", active_map_types)
 
 
+@dataclass(frozen=True)
+class _HalfModelContext:
+    """One half-model marker retained through Atlas rebuilding."""
+
+    source_marker_name: object
+    export_mesh_name: str
+    metadata: dict[str, object]
+
+
+@dataclass(frozen=True)
+class _HalfModelPart:
+    """One authored material fragment carrying a half-model marker."""
+
+    fragment: trimesh.Trimesh
+    world_transform: np.ndarray
+    metadata: dict[str, object]
+
+
 # ### Public export helpers ###
 def apply_texture_atlases_to_export(
     model: GeneratedModel,
@@ -121,9 +143,9 @@ def apply_texture_atlases_to_export(
 ) -> GeneratedModel:
     """Remap Atlas-bound UVs and batch opaque geometry per shared material.
 
-    The interactive preview fields remain unchanged. Only the exported scene is
-    flattened and batched, so Canvas selection and object gizmos retain their
-    individual meshes while the GLB gets one opaque primitive per Atlas.
+    The interactive preview fields remain unchanged. Ordinary opaque geometry
+    is flattened and batched, while marked symmetric half-models remain
+    separate mesh nodes with their authored geometry only.
     """
 
     if not isinstance(model, GeneratedModel):
@@ -145,14 +167,24 @@ def apply_texture_atlases_to_export(
         for surface_id, source_id in (surface_source_ids or {}).items()
     }
     output_scene = trimesh.Scene()
+    half_contexts, half_context_by_node = _collect_half_model_contexts(
+        model.scene
+    )
+    half_parts_by_marker: dict[object, list[_HalfModelPart]] = {
+        marker_name: [] for marker_name in half_contexts
+    }
     atlas_parts: dict[str, list[trimesh.Trimesh]] = {
         item.atlas.atlas_id: [] for item in normalized_atlases
     }
     atlas_source_ids: dict[str, set[str]] = {
         item.atlas.atlas_id: set() for item in normalized_atlases
     }
+    materialized_by_id = {
+        item.atlas.atlas_id: item for item in normalized_atlases
+    }
+    atlas_materials: dict[str, PBRMaterial] = {}
     shared_glass_materials: dict[str, object] = {}
-    occupied_names: set[str] = set()
+    occupied_names: set[str] = {str(output_scene.graph.base_frame)}
     passthrough_index = 0
 
     for node_name in sorted(model.scene.graph.nodes_geometry, key=str):
@@ -166,10 +198,11 @@ def apply_texture_atlases_to_export(
             normalized_surface_sources,
         )
         binding = bindings.get(source_id) if source_id is not None else None
+        half_context = half_context_by_node.get(node_name)
+        node_metadata = _get_scene_node_metadata(model.scene, node_name)
 
         for face_indices, material in _iter_face_material_groups(geometry):
             fragment = _build_face_fragment(geometry, face_indices, material)
-            fragment.apply_transform(world_transform)
             if (
                 binding is not None
                 and not is_housemaker_glass_material(material)
@@ -187,21 +220,47 @@ def apply_texture_atlases_to_export(
                         f"Atlas source {source_id!r} cannot share its material: "
                         f"{error}"
                     ) from error
+                if half_context is not None:
+                    atlas_material = _get_atlas_material(
+                        atlas_item,
+                        atlas_materials,
+                    )
+                    remapped.visual = TextureVisuals(
+                        uv=_optional_valid_uv(remapped),
+                        material=atlas_material,
+                    )
+                    half_parts_by_marker[
+                        half_context.source_marker_name
+                    ].append(
+                        _HalfModelPart(
+                            fragment=remapped,
+                            world_transform=world_transform,
+                            metadata=node_metadata,
+                        )
+                    )
+                    continue
+                remapped.apply_transform(world_transform)
                 atlas_parts[atlas_item.atlas.atlas_id].append(remapped)
                 atlas_source_ids[atlas_item.atlas.atlas_id].add(source_id)
                 continue
 
             if is_housemaker_glass_material(material):
-                runtime_key = get_housemaker_glass_runtime_key(material)
-                if runtime_key is not None:
-                    material = shared_glass_materials.setdefault(
-                        runtime_key,
-                        copy.deepcopy(material),
+                _apply_shared_glass_material(
+                    fragment,
+                    material,
+                    shared_glass_materials,
+                )
+            if half_context is not None:
+                half_parts_by_marker[half_context.source_marker_name].append(
+                    _HalfModelPart(
+                        fragment=fragment,
+                        world_transform=world_transform,
+                        metadata=node_metadata,
                     )
-                    fragment.visual = TextureVisuals(
-                        uv=_optional_valid_uv(fragment),
-                        material=material,
-                    )
+                )
+                continue
+
+            fragment.apply_transform(world_transform)
             passthrough_index += 1
             name = _reserve_name(
                 f"{node_name}_part_{passthrough_index}",
@@ -213,15 +272,25 @@ def apply_texture_atlases_to_export(
                 node_name=name,
             )
 
-    materialized_by_id = {
-        item.atlas.atlas_id: item for item in normalized_atlases
-    }
+    half_model_count = 0
+    for marker_name, context in half_contexts.items():
+        parts = half_parts_by_marker[marker_name]
+        if not parts:
+            continue
+        _append_half_model_meshes_to_scene(
+            output_scene,
+            context,
+            parts,
+            occupied_names,
+        )
+        half_model_count += 1
+
     batched_count = 0
     for atlas_id, parts in atlas_parts.items():
         if not parts:
             continue
         atlas_item = materialized_by_id[atlas_id]
-        material = _build_atlas_material(atlas_item)
+        material = _get_atlas_material(atlas_item, atlas_materials)
         combined = _combine_textured_parts(parts, material)
         combined.metadata[ATLAS_ID_METADATA_KEY] = atlas_id
         combined.metadata["housemaker_atlas_source_ids"] = sorted(
@@ -238,16 +307,111 @@ def apply_texture_atlases_to_export(
         )
         batched_count += 1
 
-    if batched_count == 0:
+    if batched_count == 0 and half_model_count == 0:
         return model
-    exported = output_scene.export(file_type="glb")
-    if not isinstance(exported, (bytes, bytearray, memoryview)):
-        raise ValueError("The texture Atlas scene could not be exported.")
+    exported = _serialize_scene_glb_with_half_mesh_extras(
+        output_scene,
+        failure_message="The texture Atlas scene could not be exported.",
+    )
     return replace(
         model,
         scene=output_scene,
-        glb_bytes=bytes(exported),
+        glb_bytes=exported,
     )
+
+
+# ### Half-model hierarchy helpers ###
+def _collect_half_model_contexts(
+    scene: trimesh.Scene,
+) -> tuple[
+    dict[object, _HalfModelContext],
+    dict[object, _HalfModelContext],
+]:
+    """Resolve marked roots and their descendant geometry nodes."""
+
+    contexts: dict[object, _HalfModelContext] = {}
+    for node_name in scene.graph.nodes:
+        metadata = _get_scene_node_metadata(scene, node_name)
+        if not isinstance(metadata.get(HALF_MESH_EXTRAS_KEY), Mapping):
+            continue
+        source_name = str(node_name)
+        export_name = (
+            source_name
+            if source_name.startswith(HALF_NODE_NAME_PREFIX)
+            else f"{HALF_NODE_NAME_PREFIX}{source_name}"
+        )
+        contexts[node_name] = _HalfModelContext(
+            source_marker_name=node_name,
+            export_mesh_name=export_name,
+            metadata=metadata,
+        )
+
+    context_by_geometry_node: dict[object, _HalfModelContext] = {}
+    parents = scene.graph.transforms.parents
+    base_frame = scene.graph.base_frame
+    for node_name in scene.graph.nodes_geometry:
+        current_name = node_name
+        visited: set[object] = set()
+        while current_name != base_frame and current_name not in visited:
+            visited.add(current_name)
+            context = contexts.get(current_name)
+            if context is not None:
+                context_by_geometry_node[node_name] = context
+                break
+            parent_name = parents.get(current_name)
+            if parent_name is None:
+                break
+            current_name = parent_name
+    return contexts, context_by_geometry_node
+
+
+def _get_scene_node_metadata(
+    scene: trimesh.Scene,
+    node_name: object,
+) -> dict[str, object]:
+    """Copy metadata from the incoming edge that becomes glTF node extras."""
+
+    parent_name = scene.graph.transforms.parents.get(node_name)
+    if parent_name is None:
+        return {}
+    edge_data = scene.graph.transforms.edge_data.get(
+        (parent_name, node_name),
+        {},
+    )
+    raw_metadata = edge_data.get("metadata")
+    if not isinstance(raw_metadata, Mapping):
+        return {}
+    return copy.deepcopy(dict(raw_metadata))
+
+
+def _append_half_model_meshes_to_scene(
+    output_scene: trimesh.Scene,
+    context: _HalfModelContext,
+    parts: Sequence[_HalfModelPart],
+    occupied_names: set[str],
+) -> None:
+    """Emit marked authored meshes directly, without an empty parent node."""
+
+    for part_index, part in enumerate(parts, start=1):
+        child_metadata = copy.deepcopy(part.metadata)
+        child_metadata.pop(HALF_MESH_EXTRAS_KEY, None)
+        child_metadata.update(copy.deepcopy(context.metadata))
+        preferred_name = (
+            context.export_mesh_name
+            if part_index == 1
+            else f"{context.export_mesh_name}_{part_index}"
+        )
+        mesh_name = _reserve_name(
+            preferred_name,
+            occupied_names,
+        )
+        output_scene.add_geometry(
+            part.fragment,
+            geom_name=mesh_name,
+            node_name=mesh_name,
+            transform=_normalize_transform(part.world_transform),
+            metadata=child_metadata or None,
+        )
 
 
 # ### Binding helpers ###
@@ -291,6 +455,40 @@ def _resolve_geometry_source_id(
 
 
 # ### Material helpers ###
+def _get_atlas_material(
+    atlas_item: MaterializedTextureAtlas,
+    material_cache: dict[str, PBRMaterial],
+) -> PBRMaterial:
+    """Build one shared material instance per exported Atlas."""
+
+    atlas_id = atlas_item.atlas.atlas_id
+    material = material_cache.get(atlas_id)
+    if material is None:
+        material = _build_atlas_material(atlas_item)
+        material_cache[atlas_id] = material
+    return material
+
+
+def _apply_shared_glass_material(
+    fragment: trimesh.Trimesh,
+    source_material: object,
+    material_cache: dict[str, object],
+) -> None:
+    """Reuse the prefab glass instance without changing fragment geometry."""
+
+    runtime_key = get_housemaker_glass_runtime_key(source_material)
+    if runtime_key is None:
+        return
+    material = material_cache.setdefault(
+        runtime_key,
+        copy.deepcopy(source_material),
+    )
+    fragment.visual = TextureVisuals(
+        uv=_optional_valid_uv(fragment),
+        material=material,
+    )
+
+
 def _build_atlas_material(atlas_item: MaterializedTextureAtlas) -> PBRMaterial:
     active_map_types = atlas_item.active_map_types
     maps = {
@@ -331,7 +529,7 @@ def _build_atlas_material(atlas_item: MaterializedTextureAtlas) -> PBRMaterial:
             mode="RGBA",
         )
     return PBRMaterial(
-        name=f"{ATLAS_MATERIAL_NAME_PREFIX} {atlas_item.atlas.atlas_id}",
+        name=atlas_item.atlas.name,
         baseColorFactor=[255, 255, 255, 255],
         baseColorTexture=Image.fromarray(base, mode="RGBA"),
         normalTexture=normal_texture,

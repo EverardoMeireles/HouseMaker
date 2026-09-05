@@ -131,6 +131,9 @@ ATLAS_MAP_NEUTRAL_RGBA = {
 ATLAS_PBR_MAP_DIRECTORY = "pbr_maps"
 NON_PBR_ATLAS_NAME_PREFIX = "[NON-PBR]"
 NON_PBR_ATLAS_BASE_NAME = f"{NON_PBR_ATLAS_NAME_PREFIX} Atlas"
+HALF_MESH_ATLAS_NAME_PREFIX = "[HALF]"
+HALF_MESH_ATLAS_BASE_NAME = f"{HALF_MESH_ATLAS_NAME_PREFIX} Atlas"
+HALF_MESH_ATLAS_RESOLUTION = 4096
 DEFAULT_AUTOMATIC_ATLAS_RESOLUTION = min(ATLAS_RESOLUTIONS)
 
 
@@ -1818,17 +1821,24 @@ class TextureAtlasWorkspace(QWidget):
         commit_callback: SceneTextureAssignmentCommitCallback | None = None,
         *,
         sort_by_pbr: bool = False,
+        use_half_mesh_texture_prefix: bool = False,
     ) -> tuple[str, ...]:
         """Pack every currently-unpacked source into an appropriate Atlas.
 
-        By default this preserves selected-Atlas behavior. PBR sorting sends
-        base-color-only sources to an Atlas whose exact sources own no PBR
-        maps, creating a ``[NON-PBR]`` Atlas when no existing candidate fits.
-        The successful subset is published as one Atlas/PNG transaction.
+        By default this preserves selected-Atlas behavior. Half-mesh routing
+        takes precedence over PBR sorting and sends symmetric sources to a
+        ``[HALF]`` Atlas. PBR sorting sends other base-color-only sources to an
+        Atlas whose exact sources own no PBR maps. Missing auxiliary Atlases
+        are created as needed. The successful subset is published as one
+        Atlas/PNG transaction.
         """
 
         selected_atlas = self.selected_atlas
-        if selected_atlas is None and not bool(sort_by_pbr):
+        if (
+            selected_atlas is None
+            and not bool(sort_by_pbr)
+            and not bool(use_half_mesh_texture_prefix)
+        ):
             self._refresh_object_list(self._selected_object_id())
             return ()
         try:
@@ -1885,6 +1895,9 @@ class TextureAtlasWorkspace(QWidget):
                     None if selected_atlas is None else selected_atlas.atlas_id
                 ),
                 sort_by_pbr=bool(sort_by_pbr),
+                use_half_mesh_texture_prefix=bool(
+                    use_half_mesh_texture_prefix
+                ),
                 source_overrides=source_overrides,
             )
             if assigned_atlas_id is None:
@@ -1969,11 +1982,22 @@ class TextureAtlasWorkspace(QWidget):
         *,
         selected_atlas_id: str | None,
         sort_by_pbr: bool,
+        use_half_mesh_texture_prefix: bool,
         source_overrides: dict[
             tuple[str, int], AtlasObjectTextureSource
         ],
     ) -> str | None:
         """Assign one prepared source and return its destination Atlas ID."""
+
+        if (
+            use_half_mesh_texture_prefix
+            and source.packing_mode != ATLAS_PACKING_MODE_FULL
+        ):
+            return self._assign_half_mesh_source(
+                data,
+                source,
+                selected_atlas_id=selected_atlas_id,
+            )
 
         if not sort_by_pbr or self._source_has_pbr_maps(source):
             candidate_ids = (
@@ -2013,6 +2037,88 @@ class TextureAtlasWorkspace(QWidget):
             source,
             selected_atlas_id=selected_atlas_id,
         )
+
+    def _assign_half_mesh_source(
+        self,
+        data: TextureAtlasData,
+        source: AtlasObjectTextureSource,
+        *,
+        selected_atlas_id: str | None,
+    ) -> str | None:
+        """Put one symmetric source in a prefixed Atlas, creating one if full."""
+
+        candidate_atlases = sorted(
+            (
+                atlas
+                for atlas in data.atlases
+                if atlas.name.casefold().startswith(
+                    HALF_MESH_ATLAS_NAME_PREFIX.casefold()
+                )
+            ),
+            key=lambda atlas: (
+                0 if atlas.atlas_id == selected_atlas_id else 1,
+                data.atlases.index(atlas),
+            ),
+        )
+        for atlas in candidate_atlases:
+            try:
+                data.assign_object(
+                    atlas.atlas_id,
+                    source.object_id,
+                    source.texture_path,
+                    source.texture_resolution,
+                    source.packing_mode,
+                    allow_pairing=True,
+                )
+            except (OSError, TypeError, ValueError):
+                continue
+            return atlas.atlas_id
+
+        return self._create_half_mesh_atlas_for_source(data, source)
+
+    def _create_half_mesh_atlas_for_source(
+        self,
+        data: TextureAtlasData,
+        source: AtlasObjectTextureSource,
+    ) -> str | None:
+        """Create one uniquely named 4096 half-mesh Atlas and place a source."""
+
+        previous_selected_atlas_id = data.selected_atlas_id
+        created_atlas_id: str | None = None
+        try:
+            atlas = data.create_atlas(
+                self._next_half_mesh_atlas_name(data),
+                HALF_MESH_ATLAS_RESOLUTION,
+            )
+            created_atlas_id = atlas.atlas_id
+            data.assign_object(
+                atlas.atlas_id,
+                source.object_id,
+                source.texture_path,
+                source.texture_resolution,
+                source.packing_mode,
+                allow_pairing=True,
+            )
+        except (OSError, TypeError, ValueError):
+            if created_atlas_id is not None:
+                data.remove_atlas(created_atlas_id)
+                data.select_atlas(previous_selected_atlas_id)
+            return None
+        return atlas.atlas_id
+
+    @staticmethod
+    def _next_half_mesh_atlas_name(data: TextureAtlasData) -> str:
+        """Return a unique, deterministic name with the required prefix."""
+
+        existing_names = {atlas.name.casefold() for atlas in data.atlases}
+        if HALF_MESH_ATLAS_BASE_NAME.casefold() not in existing_names:
+            return HALF_MESH_ATLAS_BASE_NAME
+        suffix = 2
+        while True:
+            candidate = f"{HALF_MESH_ATLAS_BASE_NAME} {suffix}"
+            if candidate.casefold() not in existing_names:
+                return candidate
+            suffix += 1
 
     def _ordered_non_pbr_atlases(
         self,

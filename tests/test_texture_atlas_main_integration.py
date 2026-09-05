@@ -534,6 +534,148 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             (),
         )
 
+    def test_main_passes_half_mesh_prefix_setting_to_auto_assignment(
+        self,
+    ) -> None:
+        checkbox = (
+            self.workspace.settings_widget
+            .use_half_mesh_texture_prefix_checkbox
+        )
+        checkbox.setChecked(True)
+        self.workspace._last_automatic_atlas_assignment_key = None
+
+        with patch.object(
+            self.workspace.texture_atlas_workspace,
+            "auto_assign_scene_texture_sources",
+            return_value=(),
+        ) as auto_assign:
+            self.workspace._automatically_assign_scene_textures()
+
+        auto_assign.assert_called_once()
+        self.assertTrue(
+            auto_assign.call_args.kwargs["use_half_mesh_texture_prefix"]
+        )
+
+    def test_half_mesh_prefix_setting_change_retries_cached_assignment(
+        self,
+    ) -> None:
+        self.workspace._last_automatic_atlas_assignment_key = None
+        checkbox = (
+            self.workspace.settings_widget
+            .use_half_mesh_texture_prefix_checkbox
+        )
+
+        with patch.object(
+            self.workspace.texture_atlas_workspace,
+            "auto_assign_scene_texture_sources",
+            return_value=(),
+        ) as auto_assign:
+            self.workspace._automatically_assign_scene_textures()
+            self.workspace._automatically_assign_scene_textures()
+            self.assertEqual(auto_assign.call_count, 1)
+
+            checkbox.setChecked(True)
+
+        self.assertEqual(auto_assign.call_count, 2)
+        self.assertFalse(
+            auto_assign.call_args_list[0].kwargs[
+                "use_half_mesh_texture_prefix"
+            ]
+        )
+        self.assertTrue(
+            auto_assign.call_args_list[1].kwargs[
+                "use_half_mesh_texture_prefix"
+            ]
+        )
+
+    def test_placed_half_mesh_uses_prefixed_atlas_and_full_mesh_does_not(
+        self,
+    ) -> None:
+        settings_widget = self.workspace.settings_widget
+        settings_widget.automatic_atlas_texture_sort_by_pbr_checkbox.setChecked(
+            True
+        )
+        settings_widget.use_half_mesh_texture_prefix_checkbox.setChecked(True)
+        atlas_data = TextureAtlasData()
+        selected_atlas = atlas_data.create_atlas(
+            "Placed objects",
+            2048,
+            atlas_id="placed-objects",
+        )
+        self.workspace.texture_atlas_workspace.set_data(atlas_data)
+        asset_directory = self.settings.path.parent / "generated"
+        half_record = _generated_object_record_with_variants(
+            asset_directory,
+            object_id="half-window",
+            object_name="Half window",
+            resolutions=(512,),
+            selected_resolution=512,
+            placement=GeneratedObjectPlacement(
+                level_index=self.workspace.current_level.index,
+                image_x=25.0,
+                image_y=30.0,
+            ),
+        )
+        half_record = replace(
+            half_record,
+            pipeline={
+                **half_record.pipeline,
+                "symmetric_division": {
+                    "version": 1,
+                    "orientation": "vertical",
+                    "kept_side": "left",
+                    "plane_coordinate": 0.0,
+                    "texture_content_half": "left",
+                },
+            },
+        )
+        full_record = _generated_object_record_with_variants(
+            asset_directory,
+            object_id="full-chair",
+            object_name="Full chair",
+            resolutions=(512,),
+            selected_resolution=512,
+            placement=GeneratedObjectPlacement(
+                level_index=self.workspace.current_level.index,
+                image_x=50.0,
+                image_y=60.0,
+            ),
+        )
+        generation_data = GenerationData(
+            generated_objects=[half_record, full_record]
+        )
+
+        with patch.object(
+            self.workspace.texture_atlas_workspace,
+            "_materialize_atlas",
+        ):
+            self.workspace.generation.set_data(generation_data)
+            self.workspace.generation.data_changed.emit(generation_data)
+
+        packed_data = self.workspace.texture_atlas_workspace.get_data()
+        self.assertEqual(packed_data.selected_atlas_id, selected_atlas.atlas_id)
+        regular_atlas = packed_data.atlas_by_id(selected_atlas.atlas_id)
+        assert regular_atlas is not None
+        self.assertIsNotNone(
+            regular_atlas.placement_for_object(full_record.object_id)
+        )
+        self.assertIsNone(
+            regular_atlas.placement_for_object(half_record.object_id)
+        )
+        half_atlases = [
+            atlas
+            for atlas in packed_data.atlases
+            if atlas.name.startswith("[HALF]")
+        ]
+        self.assertEqual(len(half_atlases), 1)
+        self.assertEqual(half_atlases[0].resolution, 4096)
+        self.assertIsNotNone(
+            half_atlases[0].placement_for_object(half_record.object_id)
+        )
+        self.assertIsNone(
+            half_atlases[0].placement_for_object(full_record.object_id)
+        )
+
     def test_pbr_sort_routes_non_pbr_object_to_unique_auxiliary_atlas(
         self,
     ) -> None:
@@ -1059,7 +1201,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             getattr(getattr(mesh.visual, "material", None), "name", "")
             for mesh in result.scene.geometry.values()
         ]
-        self.assertEqual(atlas_materials, ["HouseMaker Atlas architecture"])
+        self.assertEqual(atlas_materials, ["Architecture"])
 
     def test_canvas_export_omits_unassigned_materialless_surfaces(self) -> None:
         wall_surface_id = _add_square_room_to_level(

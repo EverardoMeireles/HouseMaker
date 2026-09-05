@@ -4642,6 +4642,260 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.assertEqual(changes.call_count, 1)
         self.assertEqual(self.workspace.get_unpacked_scene_texture_source_ids(), ())
 
+    def test_half_prefix_routing_reuses_prefixed_atlas_and_preserves_selection(
+        self,
+    ) -> None:
+        ordinary_source = _source(
+            "ordinary",
+            directory=self._temporary_directory.name,
+        )
+        half_sources = tuple(
+            _source(
+                object_id,
+                directory=self._temporary_directory.name,
+                packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+                symmetric_orientation="vertical",
+                symmetric_plane_coordinate=0.0,
+            )
+            for object_id in ("half-left", "half-right")
+        )
+        data = TextureAtlasData()
+        selected_atlas = data.create_atlas(
+            "Selected Atlas",
+            2048,
+            atlas_id="selected-atlas",
+        )
+        half_atlas = data.create_atlas(
+            "[HALF] Existing",
+            2048,
+            atlas_id="half-atlas",
+        )
+        data.select_atlas(selected_atlas.atlas_id)
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources(
+            (ordinary_source, *half_sources),
+            selectability_resolver=lambda _source_id, _resolution: True,
+        )
+        self.workspace.set_scene_texture_source_ids(
+            (
+                ordinary_source.object_id,
+                *(source.object_id for source in half_sources),
+            )
+        )
+
+        with patch.object(self.workspace, "_materialize_atlas"):
+            assigned = self.workspace.auto_assign_scene_texture_sources(
+                512,
+                use_half_mesh_texture_prefix=True,
+            )
+
+        self.assertEqual(
+            assigned,
+            (
+                ordinary_source.object_id,
+                *(source.object_id for source in half_sources),
+            ),
+        )
+        packed_data = self.workspace.get_data()
+        self.assertEqual(packed_data.selected_atlas_id, selected_atlas.atlas_id)
+        packed_selected = packed_data.atlas_by_id(selected_atlas.atlas_id)
+        packed_half = packed_data.atlas_by_id(half_atlas.atlas_id)
+        assert packed_selected is not None
+        assert packed_half is not None
+        self.assertIsNotNone(
+            packed_selected.placement_for_object(ordinary_source.object_id)
+        )
+        self.assertTrue(
+            all(
+                packed_selected.placement_for_object(source.object_id) is None
+                for source in half_sources
+            )
+        )
+        half_placements = [
+            packed_half.placement_for_object(source.object_id)
+            for source in half_sources
+        ]
+        self.assertTrue(all(placement is not None for placement in half_placements))
+        self.assertEqual(
+            {(placement.x, placement.y) for placement in half_placements},
+            {(0, 0)},
+        )
+        self.assertEqual(
+            {placement.slot_half for placement in half_placements},
+            {ATLAS_SLOT_HALF_LEFT, ATLAS_SLOT_HALF_RIGHT},
+        )
+
+    def test_half_prefix_routing_tries_next_prefixed_atlas_when_first_is_full(
+        self,
+    ) -> None:
+        existing_sources = tuple(
+            _source(
+                f"existing-{index}",
+                directory=self._temporary_directory.name,
+                resolution=1024,
+            )
+            for index in range(4)
+        )
+        half_source = _source(
+            "pending-half",
+            directory=self._temporary_directory.name,
+            resolution=1024,
+            packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+            symmetric_orientation="vertical",
+            symmetric_plane_coordinate=0.0,
+        )
+        data = TextureAtlasData()
+        selected_atlas = data.create_atlas(
+            "Selected Atlas",
+            2048,
+            atlas_id="selected-atlas",
+        )
+        full_half_atlas = data.create_atlas(
+            "[HALF] Full",
+            2048,
+            atlas_id="full-half-atlas",
+        )
+        available_half_atlas = data.create_atlas(
+            "[HALF] Available",
+            2048,
+            atlas_id="available-half-atlas",
+        )
+        for source in existing_sources:
+            data.assign_object(
+                full_half_atlas.atlas_id,
+                source.object_id,
+                source.texture_path,
+                source.texture_resolution,
+            )
+        data.select_atlas(selected_atlas.atlas_id)
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources(
+            (*existing_sources, half_source),
+            selectability_resolver=lambda _source_id, _resolution: True,
+        )
+        self.workspace.set_scene_texture_source_ids((half_source.object_id,))
+
+        with patch.object(self.workspace, "_materialize_atlas"):
+            assigned = self.workspace.auto_assign_scene_texture_sources(
+                1024,
+                use_half_mesh_texture_prefix=True,
+            )
+
+        self.assertEqual(assigned, (half_source.object_id,))
+        packed_data = self.workspace.get_data()
+        self.assertEqual(packed_data.selected_atlas_id, selected_atlas.atlas_id)
+        packed_full = packed_data.atlas_by_id(full_half_atlas.atlas_id)
+        packed_available = packed_data.atlas_by_id(available_half_atlas.atlas_id)
+        assert packed_full is not None
+        assert packed_available is not None
+        self.assertIsNone(
+            packed_full.placement_for_object(half_source.object_id)
+        )
+        self.assertIsNotNone(
+            packed_available.placement_for_object(half_source.object_id)
+        )
+        self.assertEqual(len(packed_data.atlases), 3)
+
+    def test_half_prefix_routing_creates_selected_4096_atlas_when_none_exist(
+        self,
+    ) -> None:
+        half_source = _source(
+            "pending-half",
+            directory=self._temporary_directory.name,
+            packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+            symmetric_orientation="vertical",
+            symmetric_plane_coordinate=0.0,
+        )
+        self.workspace.set_object_texture_sources(
+            (half_source,),
+            selectability_resolver=lambda _source_id, _resolution: True,
+        )
+        self.workspace.set_scene_texture_source_ids((half_source.object_id,))
+
+        with patch.object(self.workspace, "_materialize_atlas"):
+            assigned = self.workspace.auto_assign_scene_texture_sources(
+                512,
+                use_half_mesh_texture_prefix=True,
+            )
+
+        self.assertEqual(assigned, (half_source.object_id,))
+        packed_data = self.workspace.get_data()
+        self.assertEqual(len(packed_data.atlases), 1)
+        created_atlas = packed_data.atlases[0]
+        self.assertEqual(created_atlas.name, "[HALF] Atlas")
+        self.assertEqual(created_atlas.resolution, 4096)
+        self.assertEqual(packed_data.selected_atlas_id, created_atlas.atlas_id)
+        self.assertIsNotNone(
+            created_atlas.placement_for_object(half_source.object_id)
+        )
+
+    def test_half_prefix_routing_creates_unique_4096_atlas_when_all_are_full(
+        self,
+    ) -> None:
+        existing_sources = tuple(
+            _source(
+                f"existing-{index}",
+                directory=self._temporary_directory.name,
+                resolution=1024,
+            )
+            for index in range(4)
+        )
+        half_source = _source(
+            "pending-half",
+            directory=self._temporary_directory.name,
+            resolution=1024,
+            packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+            symmetric_orientation="vertical",
+            symmetric_plane_coordinate=0.0,
+        )
+        data = TextureAtlasData()
+        selected_atlas = data.create_atlas(
+            "Selected Atlas",
+            2048,
+            atlas_id="selected-atlas",
+        )
+        full_half_atlas = data.create_atlas(
+            "[HALF] Atlas",
+            2048,
+            atlas_id="full-half-atlas",
+        )
+        for source in existing_sources:
+            data.assign_object(
+                full_half_atlas.atlas_id,
+                source.object_id,
+                source.texture_path,
+                source.texture_resolution,
+            )
+        data.select_atlas(selected_atlas.atlas_id)
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources(
+            (*existing_sources, half_source),
+            selectability_resolver=lambda _source_id, _resolution: True,
+        )
+        self.workspace.set_scene_texture_source_ids((half_source.object_id,))
+
+        with patch.object(self.workspace, "_materialize_atlas"):
+            assigned = self.workspace.auto_assign_scene_texture_sources(
+                1024,
+                use_half_mesh_texture_prefix=True,
+            )
+
+        self.assertEqual(assigned, (half_source.object_id,))
+        packed_data = self.workspace.get_data()
+        self.assertEqual(packed_data.selected_atlas_id, selected_atlas.atlas_id)
+        self.assertEqual(len(packed_data.atlases), 3)
+        created_atlas = next(
+            atlas
+            for atlas in packed_data.atlases
+            if atlas.atlas_id
+            not in {selected_atlas.atlas_id, full_half_atlas.atlas_id}
+        )
+        self.assertEqual(created_atlas.name, "[HALF] Atlas 2")
+        self.assertEqual(created_atlas.resolution, 4096)
+        self.assertIsNotNone(
+            created_atlas.placement_for_object(half_source.object_id)
+        )
+
     def test_pbr_sort_creates_non_pbr_atlas_beside_selected_pbr_atlas(
         self,
     ) -> None:

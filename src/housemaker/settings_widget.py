@@ -37,6 +37,9 @@ JOBS_WINDOW_SCREEN_SETTING_KEY = "display/jobs_window_screen_id"
 AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR_SETTING_KEY = (
     "atlas/automatic_texture_sort_by_pbr"
 )
+USE_HALF_MESH_TEXTURE_PREFIX_SETTING_KEY = (
+    "atlas/use_half_mesh_texture_prefix"
+)
 AUTOMATIC_ATLAS_TEXTURE_RESOLUTION_SETTING_KEY = (
     "atlas/automatic_texture_resolution"
 )
@@ -60,6 +63,7 @@ DEFAULT_USE_UV_RAYCAST_FOR_OBJECT_GENERATION = False
 DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE = 5
 AUTOMATIC_ATLAS_TEXTURE_RESOLUTIONS = (512, 1024)
 DEFAULT_AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR = False
+DEFAULT_USE_HALF_MESH_TEXTURE_PREFIX = False
 DEFAULT_AUTOMATIC_ATLAS_TEXTURE_RESOLUTION = 512
 MINIMUM_FACE_VISIBILITY_PERCENTAGE = 0
 MAXIMUM_FACE_VISIBILITY_PERCENTAGE = 100
@@ -144,8 +148,15 @@ class GenerationServiceSettings:
     automatic_atlas_texture_sort_by_pbr: bool = (
         DEFAULT_AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR
     )
+    use_half_mesh_texture_prefix: bool = (
+        DEFAULT_USE_HALF_MESH_TEXTURE_PREFIX
+    )
 
     def __post_init__(self) -> None:
+        if not isinstance(self.use_half_mesh_texture_prefix, bool):
+            raise ValueError(
+                "Half-mesh texture prefix must be enabled or disabled."
+            )
         if not isinstance(self.automatic_atlas_texture_sort_by_pbr, bool):
             raise ValueError(
                 "Automatic Atlas PBR sorting must be enabled or disabled."
@@ -330,6 +341,9 @@ class SettingsWidget(QWidget):
             automatic_atlas_texture_sort_by_pbr=(
                 self.automatic_atlas_texture_sort_by_pbr_checkbox.isChecked()
             ),
+            use_half_mesh_texture_prefix=(
+                self.use_half_mesh_texture_prefix_checkbox.isChecked()
+            ),
             automatic_atlas_texture_resolution=int(
                 self.automatic_atlas_texture_resolution_combo.currentData()
             ),
@@ -465,6 +479,22 @@ class SettingsWidget(QWidget):
         form_layout.addRow(
             "Automatic Atlas texture sort by PBR",
             self.automatic_atlas_texture_sort_by_pbr_checkbox,
+        )
+
+        self.use_half_mesh_texture_prefix_checkbox = QCheckBox()
+        self.use_half_mesh_texture_prefix_checkbox.setObjectName(
+            "use_half_mesh_texture_prefix_checkbox"
+        )
+        self.use_half_mesh_texture_prefix_checkbox.setToolTip(
+            "Automatically place symmetric half-mesh textures in Atlases "
+            "whose names start with [HALF]."
+        )
+        self.use_half_mesh_texture_prefix_checkbox.toggled.connect(
+            self._handle_use_half_mesh_texture_prefix_changed
+        )
+        form_layout.addRow(
+            "Use [HALF] half-mesh texture prefix",
+            self.use_half_mesh_texture_prefix_checkbox,
         )
 
         self.automatic_atlas_texture_resolution_combo = QComboBox()
@@ -661,6 +691,9 @@ class SettingsWidget(QWidget):
                 self._application_settings
             )
         )
+        self.use_half_mesh_texture_prefix_checkbox.setChecked(
+            read_use_half_mesh_texture_prefix(self._application_settings)
+        )
         automatic_atlas_resolution = read_automatic_atlas_texture_resolution(
             self._application_settings
         )
@@ -843,6 +876,20 @@ class SettingsWidget(QWidget):
         )
         self.settings_changed.emit()
 
+    def _handle_use_half_mesh_texture_prefix_changed(
+        self,
+        checked: bool,
+    ) -> None:
+        """Persist whether half meshes use dedicated prefixed Atlases."""
+
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            USE_HALF_MESH_TEXTURE_PREFIX_SETTING_KEY,
+            bool(checked),
+        )
+        self.settings_changed.emit()
+
     def _selected_canvas_3d_navigation_toggle_hotkey(self) -> str:
         hotkey = _hotkey_from_key_sequence(
             self.canvas_3d_navigation_toggle_hotkey_edit.keySequence()
@@ -1019,6 +1066,20 @@ def read_automatic_atlas_texture_sort_by_pbr(
     if isinstance(value, bool):
         return value
     return DEFAULT_AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR
+
+
+def read_use_half_mesh_texture_prefix(
+    application_settings: ApplicationSettingsStore,
+) -> bool:
+    """Read the persisted half-mesh Atlas routing policy safely."""
+
+    value = application_settings.get(
+        USE_HALF_MESH_TEXTURE_PREFIX_SETTING_KEY,
+        DEFAULT_USE_HALF_MESH_TEXTURE_PREFIX,
+    )
+    if isinstance(value, bool):
+        return value
+    return DEFAULT_USE_HALF_MESH_TEXTURE_PREFIX
 
 
 def read_automatic_atlas_texture_resolution(

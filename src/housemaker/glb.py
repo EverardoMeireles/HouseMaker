@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 import os
 from io import BytesIO
@@ -103,6 +104,14 @@ SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION = {
     "vertical": 0,
     "horizontal": 2,
 }
+HALF_NODE_NAME_PREFIX = "[HALF] "
+HALF_MESH_EXTRAS_KEY = "halfMesh"
+HALF_MESH_UV_MODE = "reuse"
+GLB_MAGIC = b"glTF"
+GLB_VERSION = 2
+GLB_HEADER_BYTE_COUNT = 12
+GLB_CHUNK_HEADER_BYTE_COUNT = 8
+GLB_JSON_CHUNK_TYPE = b"JSON"
 NAMED_MESH_ROLE_SURFACE = "surface"
 NAMED_MESH_ROLE_OPENING_REVEAL = "opening_reveal"
 NAMED_MESH_ROLE_STAIR = "stair"
@@ -133,7 +142,11 @@ class GeneratedModel:
 
 @dataclass(frozen=True)
 class PlacedGeneratedModel:
-    """One generated model anchored at a world-space floor position."""
+    """One generated model anchored at a world-space floor position.
+
+    Symmetric preview fields also identify an authored half for GLB metadata;
+    the fading mirrored geometry remains an interactive-preview concern only.
+    """
 
     object_id: str
     model: GeneratedModel
@@ -141,6 +154,7 @@ class PlacedGeneratedModel:
     symmetric_preview_orientation: str | None = None
     symmetric_preview_plane_coordinate: float | None = None
     rotation_degrees: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    object_name: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.object_id, str):
@@ -160,7 +174,15 @@ class PlacedGeneratedModel:
         normalized_rotation = _normalize_placed_rotation(
             self.rotation_degrees
         )
+        normalized_object_name = (
+            normalized_object_id
+            if self.object_name is None
+            else str(self.object_name).strip()
+        )
+        if not normalized_object_name:
+            raise ValueError("Placed generated-object names cannot be empty.")
         object.__setattr__(self, "object_id", normalized_object_id)
+        object.__setattr__(self, "object_name", normalized_object_name)
         object.__setattr__(self, "world_position", normalized_position)
         object.__setattr__(self, "rotation_degrees", normalized_rotation)
         object.__setattr__(self, "symmetric_preview_orientation", orientation)
@@ -761,12 +783,12 @@ def _compose_placed_generated_models(
 
     glb_bytes = b""
     if serialize_glb:
-        exported_glb = output_scene.export(file_type="glb")
-        if not isinstance(exported_glb, (bytes, bytearray, memoryview)):
-            raise ValueError(
+        glb_bytes = _serialize_scene_glb_with_half_mesh_extras(
+            output_scene,
+            failure_message=(
                 "The placed generated-object scene could not be exported."
-            )
-        glb_bytes = bytes(exported_glb)
+            ),
+        )
     return GeneratedModel(
         mesh=combined_mesh,
         scene=output_scene,
@@ -917,6 +939,179 @@ def _build_placed_model_transform(
     return move_to_world @ rotation @ move_pivot_to_origin
 
 
+def _build_half_mesh_node_metadata(
+    placement: PlacedGeneratedModel,
+    placement_transform: np.ndarray,
+) -> dict[str, object] | None:
+    """Build glTF node extras for one authored symmetric half-model."""
+
+    orientation = placement.symmetric_preview_orientation
+    if orientation is None:
+        return None
+    plane_coordinate = placement.symmetric_preview_plane_coordinate
+    assert plane_coordinate is not None
+    axis = SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION[orientation]
+
+    local_point = np.zeros(4, dtype=float)
+    local_point[axis] = plane_coordinate
+    local_point[3] = 1.0
+    local_normal = np.zeros(3, dtype=float)
+    local_normal[axis] = 1.0
+
+    transform = _get_valid_source_transform(placement_transform)
+    linear_transform = transform[:3, :3]
+    try:
+        normal_transform = np.linalg.inv(linear_transform).T
+    except np.linalg.LinAlgError as error:
+        raise ValueError(
+            "A symmetric half-model has a singular placement transform."
+        ) from error
+    world_point_z_up = transform @ local_point
+    world_normal_z_up = normal_transform @ local_normal
+    world_point_gltf = (
+        Z_UP_TO_GLTF_Y_UP_TRANSFORM @ world_point_z_up
+    )[:3]
+    world_normal_gltf = (
+        Z_UP_TO_GLTF_Y_UP_TRANSFORM[:3, :3] @ world_normal_z_up
+    )
+    normal_length = float(np.linalg.norm(world_normal_gltf))
+    if not math.isfinite(normal_length) or normal_length <= 0.0:
+        raise ValueError("A symmetric half-model has an invalid mirror normal.")
+    world_normal_gltf /= normal_length
+    return {
+        HALF_MESH_EXTRAS_KEY: {
+            "mirrorPlane": {
+                "point": _clean_export_vector(world_point_gltf),
+                "normal": _clean_export_vector(world_normal_gltf),
+            },
+            "uvMode": HALF_MESH_UV_MODE,
+        }
+    }
+
+
+def _clean_export_vector(values: np.ndarray) -> list[float]:
+    """Return stable JSON-safe coordinates without negative signed zero."""
+
+    return [
+        0.0 if abs(float(value)) <= 1e-12 else float(value)
+        for value in values
+    ]
+
+
+def _get_half_model_node_name(placement: PlacedGeneratedModel) -> str:
+    """Return the user-facing name written directly on a half mesh node."""
+
+    assert placement.object_name is not None
+    return (
+        placement.object_name
+        if placement.object_name.startswith(HALF_NODE_NAME_PREFIX)
+        else f"{HALF_NODE_NAME_PREFIX}{placement.object_name}"
+    )
+
+
+def _get_scene_node_metadata(
+    scene: trimesh.Scene,
+    node_name: object,
+) -> dict[str, object]:
+    """Copy metadata attached to one source scene node."""
+
+    parent_name = scene.graph.transforms.parents.get(node_name)
+    if parent_name is None:
+        return {}
+    edge_data = scene.graph.transforms.edge_data.get(
+        (parent_name, node_name),
+        {},
+    )
+    raw_metadata = edge_data.get("metadata")
+    if not isinstance(raw_metadata, Mapping):
+        return {}
+    return copy.deepcopy(dict(raw_metadata))
+
+
+def _append_placed_half_model_meshes(
+    *,
+    output_scene: trimesh.Scene,
+    placement: PlacedGeneratedModel,
+    placement_index: int,
+    placement_transform: np.ndarray,
+    occupied_geometry_names: set[object],
+    occupied_node_names: set[object],
+) -> None:
+    """Place authored half meshes directly, without a metadata-only root."""
+
+    source_scene = placement.model.scene
+    half_metadata = _build_half_mesh_node_metadata(
+        placement,
+        placement_transform,
+    )
+    assert half_metadata is not None
+    prefix = f"placed_{placement_index}_{_slugify_name(placement.object_id)}"
+    geometry_names: dict[object, str] = {}
+    for source_name, geometry in source_scene.geometry.items():
+        geometry_name = _reserve_unique_scene_name(
+            f"{prefix}_geometry_{_slugify_scene_name(source_name)}",
+            occupied_geometry_names,
+        )
+        copied_geometry = copy.deepcopy(geometry)
+        copied_geometry.metadata = copy.deepcopy(
+            dict(getattr(copied_geometry, "metadata", {}) or {})
+        )
+        copied_geometry.metadata["housemaker_object_id"] = placement.object_id
+        output_scene.geometry[geometry_name] = copied_geometry
+        geometry_names[source_name] = geometry_name
+
+    placement_transform_gltf = _source_to_gltf_y_up_transform(
+        placement_transform
+    )
+    base_node_name = _get_half_model_node_name(placement)
+    raw_base_metadata = source_scene.graph.transforms.node_data.get(
+        source_scene.graph.base_frame,
+        {},
+    ).get("metadata")
+    source_base_metadata = (
+        copy.deepcopy(dict(raw_base_metadata))
+        if isinstance(raw_base_metadata, Mapping)
+        else {}
+    )
+    for node_index, source_node_name in enumerate(
+        sorted(source_scene.graph.nodes_geometry, key=str),
+        start=1,
+    ):
+        source_transform, source_geometry_name = source_scene.graph.get(
+            source_node_name
+        )
+        geometry_name = geometry_names.get(source_geometry_name)
+        if geometry_name is None:
+            raise ValueError(
+                "A placed generated-object node references missing geometry."
+            )
+        preferred_name = (
+            base_node_name
+            if node_index == 1
+            else f"{base_node_name}_{node_index}"
+        )
+        node_name = _reserve_unique_scene_name(
+            preferred_name,
+            occupied_node_names,
+        )
+        node_metadata = copy.deepcopy(source_base_metadata)
+        node_metadata.update(
+            _get_scene_node_metadata(source_scene, source_node_name)
+        )
+        node_metadata["housemaker_object_id"] = placement.object_id
+        node_metadata.update(half_metadata)
+        output_scene.graph.update(
+            frame_to=node_name,
+            frame_from=output_scene.graph.base_frame,
+            matrix=(
+                placement_transform_gltf
+                @ _get_valid_source_transform(source_transform)
+            ),
+            geometry=geometry_name,
+            metadata=node_metadata,
+        )
+
+
 def _append_placed_model_scene(
     *,
     output_scene: trimesh.Scene,
@@ -931,6 +1126,16 @@ def _append_placed_model_scene(
         raise TypeError("Placed generated objects must contain trimesh scenes.")
     if not source_scene.geometry or not source_scene.graph.nodes_geometry:
         raise ValueError("Placed generated objects must contain scene geometry.")
+    if placement.symmetric_preview_orientation is not None:
+        _append_placed_half_model_meshes(
+            output_scene=output_scene,
+            placement=placement,
+            placement_index=placement_index,
+            placement_transform=placement_transform,
+            occupied_geometry_names=occupied_geometry_names,
+            occupied_node_names=occupied_node_names,
+        )
+        return
 
     prefix = (
         f"placed_{placement_index}_{_slugify_name(placement.object_id)}"
@@ -2676,7 +2881,12 @@ def _get_surface_object_name(surface_id: str) -> str:
 
 def export_glb_file(model: GeneratedModel, path: str | Path) -> Path:
     export_path = Path(path)
-    export_path.write_bytes(model.glb_bytes)
+    payload = _rewrite_serialized_glb_half_mesh_extras(
+        model.glb_bytes,
+        _collect_half_mesh_extras_by_node_name(model.scene),
+        failure_message="The final house GLB is invalid.",
+    )
+    export_path.write_bytes(payload)
     return export_path
 
 
@@ -2743,10 +2953,10 @@ def _serialize_export_scene(scene: trimesh.Scene) -> bytes:
     """Serialize a scene, including the valid empty-scene GLB edge case."""
 
     if scene.geometry:
-        payload = scene.export(file_type="glb")
-        if not isinstance(payload, (bytes, bytearray, memoryview)):
-            raise ValueError("The house scene could not be exported as GLB.")
-        return bytes(payload)
+        return _serialize_scene_glb_with_half_mesh_extras(
+            scene,
+            failure_message="The house scene could not be exported as GLB.",
+        )
 
     json_chunk = b'{"asset":{"version":"2.0"},"scene":0,"scenes":[{}]}'
     json_chunk += b" " * (-len(json_chunk) % 4)
@@ -2761,6 +2971,262 @@ def _serialize_export_scene(scene: trimesh.Scene) -> bytes:
             json_chunk,
         )
     )
+
+
+def _serialize_scene_glb_with_half_mesh_extras(
+    scene: trimesh.Scene,
+    *,
+    failure_message: str,
+) -> bytes:
+    """Serialize a scene while explicitly preserving half-mesh node extras."""
+
+    if not isinstance(scene, trimesh.Scene):
+        raise TypeError("GLB serialization requires a triangle-mesh scene.")
+    half_mesh_by_node_name = _collect_half_mesh_extras_by_node_name(scene)
+    payload = scene.export(file_type="glb")
+    if not isinstance(payload, (bytes, bytearray, memoryview)):
+        raise ValueError(failure_message)
+    return _rewrite_serialized_glb_half_mesh_extras(
+        bytes(payload),
+        half_mesh_by_node_name,
+        failure_message=failure_message,
+    )
+
+
+def _rewrite_serialized_glb_half_mesh_extras(
+    payload: bytes,
+    half_mesh_by_node_name: Mapping[str, Mapping[str, object]],
+    *,
+    failure_message: str,
+) -> bytes:
+    """Inject half-mesh extras into the literal final GLB JSON chunk."""
+
+    try:
+        if (
+            len(payload)
+            < GLB_HEADER_BYTE_COUNT + GLB_CHUNK_HEADER_BYTE_COUNT
+            or payload[:4] != GLB_MAGIC
+            or int.from_bytes(payload[4:8], "little") != GLB_VERSION
+            or int.from_bytes(payload[8:12], "little") != len(payload)
+        ):
+            raise ValueError("The GLB header is invalid.")
+        json_byte_count = int.from_bytes(payload[12:16], "little")
+        if payload[16:20] != GLB_JSON_CHUNK_TYPE:
+            raise ValueError("The first GLB chunk is not JSON.")
+        json_end = (
+            GLB_HEADER_BYTE_COUNT
+            + GLB_CHUNK_HEADER_BYTE_COUNT
+            + json_byte_count
+        )
+        if json_byte_count <= 0 or json_end > len(payload):
+            raise ValueError("The GLB JSON chunk is invalid.")
+        raw_document = payload[20:json_end].rstrip(b" \t\r\n\0")
+        document = json.loads(raw_document.decode("utf-8"))
+        if not isinstance(document, dict):
+            raise ValueError("The GLB JSON root is invalid.")
+    except (TypeError, UnicodeError, ValueError) as error:
+        raise ValueError(failure_message) from error
+
+    _inject_half_mesh_extras_into_gltf_tree(
+        document,
+        half_mesh_by_node_name,
+    )
+    try:
+        encoded_document = json.dumps(
+            document,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, UnicodeError, ValueError) as error:
+        raise ValueError(failure_message) from error
+
+    encoded_document += b" " * (-len(encoded_document) % 4)
+    trailing_chunks = payload[json_end:]
+    total_byte_count = (
+        GLB_HEADER_BYTE_COUNT
+        + GLB_CHUNK_HEADER_BYTE_COUNT
+        + len(encoded_document)
+        + len(trailing_chunks)
+    )
+    return b"".join(
+        (
+            GLB_MAGIC,
+            GLB_VERSION.to_bytes(4, "little"),
+            total_byte_count.to_bytes(4, "little"),
+            len(encoded_document).to_bytes(4, "little"),
+            GLB_JSON_CHUNK_TYPE,
+            encoded_document,
+            trailing_chunks,
+        )
+    )
+
+
+def _collect_half_mesh_extras_by_node_name(
+    scene: trimesh.Scene,
+) -> dict[str, dict[str, object]]:
+    """Collect validated mirror instructions from geometry-bearing nodes."""
+
+    result: dict[str, dict[str, object]] = {}
+    for node_name in scene.graph.nodes_geometry:
+        metadata = _get_scene_node_metadata(scene, node_name)
+        raw_half_mesh = metadata.get(HALF_MESH_EXTRAS_KEY)
+        if raw_half_mesh is None:
+            continue
+        normalized_name = str(node_name)
+        if normalized_name in result:
+            raise ValueError("Half-mesh GLB node names must be unique.")
+        result[normalized_name] = _normalize_half_mesh_extras(raw_half_mesh)
+    return result
+
+
+def _normalize_half_mesh_extras(raw_half_mesh: object) -> dict[str, object]:
+    """Validate and copy the public ``extras.halfMesh`` schema."""
+
+    if not isinstance(raw_half_mesh, Mapping) or set(raw_half_mesh) != {
+        "mirrorPlane",
+        "uvMode",
+    }:
+        raise ValueError("Half-mesh extras have an invalid schema.")
+    if raw_half_mesh.get("uvMode") != HALF_MESH_UV_MODE:
+        raise ValueError("Half-mesh extras require UV reuse.")
+    raw_mirror_plane = raw_half_mesh.get("mirrorPlane")
+    if not isinstance(raw_mirror_plane, Mapping) or set(raw_mirror_plane) != {
+        "point",
+        "normal",
+    }:
+        raise ValueError("Half-mesh mirror-plane extras are invalid.")
+    point = _normalize_half_mesh_extras_vector(
+        raw_mirror_plane.get("point"),
+        "point",
+    )
+    normal = _normalize_half_mesh_extras_vector(
+        raw_mirror_plane.get("normal"),
+        "normal",
+    )
+    if float(np.linalg.norm(normal)) <= 0.0:
+        raise ValueError("Half-mesh mirror-plane normals cannot be zero.")
+    return {
+        "mirrorPlane": {
+            "point": point,
+            "normal": normal,
+        },
+        "uvMode": HALF_MESH_UV_MODE,
+    }
+
+
+def _normalize_half_mesh_extras_vector(
+    raw_values: object,
+    field_name: str,
+) -> list[float]:
+    """Return one finite XYZ vector suitable for glTF JSON."""
+
+    if (
+        isinstance(raw_values, (str, bytes, bytearray))
+        or not isinstance(raw_values, Sequence)
+        or len(raw_values) != 3
+    ):
+        raise ValueError(
+            f"Half-mesh mirror-plane {field_name} must contain XYZ values."
+        )
+    values: list[float] = []
+    for raw_value in raw_values:
+        if isinstance(raw_value, bool) or not isinstance(
+            raw_value,
+            (int, float, np.integer, np.floating),
+        ):
+            raise ValueError(
+                f"Half-mesh mirror-plane {field_name} must be numeric."
+            )
+        value = float(raw_value)
+        if not math.isfinite(value):
+            raise ValueError(
+                f"Half-mesh mirror-plane {field_name} must be finite."
+            )
+        values.append(0.0 if abs(value) <= 1e-12 else value)
+    return values
+
+
+def _inject_half_mesh_extras_into_gltf_tree(
+    tree: dict[str, object],
+    half_mesh_by_node_name: Mapping[str, Mapping[str, object]],
+) -> None:
+    """Put authoritative metadata on glTF nodes and their mesh definitions."""
+
+    raw_nodes = tree.get("nodes")
+    if raw_nodes is None and not half_mesh_by_node_name:
+        return
+    if not isinstance(raw_nodes, list):
+        raise ValueError("The exported glTF has no node list.")
+    raw_meshes = tree.get("meshes")
+    if half_mesh_by_node_name and not isinstance(raw_meshes, list):
+        raise ValueError("The exported glTF has no mesh list.")
+
+    prefixed_mesh_node_names = {
+        str(raw_node.get("name", ""))
+        for raw_node in raw_nodes
+        if isinstance(raw_node, dict)
+        and "mesh" in raw_node
+        and str(raw_node.get("name", "")).startswith(HALF_NODE_NAME_PREFIX)
+    }
+    undeclared_names = (
+        prefixed_mesh_node_names - set(half_mesh_by_node_name)
+    )
+    if undeclared_names:
+        raise ValueError(
+            "The exported glTF has [HALF] mesh nodes without mirror metadata: "
+            + ", ".join(sorted(undeclared_names))
+        )
+
+    injected_names: set[str] = set()
+    half_mesh_by_mesh_index: dict[int, Mapping[str, object]] = {}
+    for raw_node in raw_nodes:
+        if not isinstance(raw_node, dict):
+            continue
+        node_name = str(raw_node.get("name", ""))
+        half_mesh = half_mesh_by_node_name.get(node_name)
+        if half_mesh is None:
+            continue
+        if node_name in injected_names:
+            raise ValueError("The exported glTF contains duplicate half nodes.")
+        raw_mesh_index = raw_node.get("mesh")
+        if (
+            isinstance(raw_mesh_index, bool)
+            or not isinstance(raw_mesh_index, int)
+            or not isinstance(raw_meshes, list)
+            or raw_mesh_index < 0
+            or raw_mesh_index >= len(raw_meshes)
+        ):
+            raise ValueError("Half-mesh extras must belong to a mesh node.")
+        raw_mesh = raw_meshes[raw_mesh_index]
+        if not isinstance(raw_mesh, dict):
+            raise ValueError("A half-mesh glTF mesh definition is invalid.")
+        existing_half_mesh = half_mesh_by_mesh_index.get(raw_mesh_index)
+        if existing_half_mesh is not None and existing_half_mesh != half_mesh:
+            raise ValueError(
+                "Half-mesh instances with different world mirror planes cannot "
+                "share one glTF mesh definition."
+            )
+        raw_extras = raw_node.get("extras")
+        extras = dict(raw_extras) if isinstance(raw_extras, Mapping) else {}
+        extras[HALF_MESH_EXTRAS_KEY] = copy.deepcopy(dict(half_mesh))
+        raw_node["extras"] = extras
+        raw_mesh_extras = raw_mesh.get("extras")
+        mesh_extras = (
+            dict(raw_mesh_extras)
+            if isinstance(raw_mesh_extras, Mapping)
+            else {}
+        )
+        mesh_extras[HALF_MESH_EXTRAS_KEY] = copy.deepcopy(dict(half_mesh))
+        raw_mesh["extras"] = mesh_extras
+        half_mesh_by_mesh_index[raw_mesh_index] = half_mesh
+        injected_names.add(node_name)
+
+    missing_names = set(half_mesh_by_node_name) - injected_names
+    if missing_names:
+        raise ValueError(
+            "The exported glTF omitted half-mesh node extras for: "
+            + ", ".join(sorted(missing_names))
+        )
 
 
 def _to_gltf_y_up_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:

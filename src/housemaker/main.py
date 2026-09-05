@@ -1473,7 +1473,7 @@ class BlueprintWorkspace(QWidget):
 
         try:
             exported_path = export_glb_file(generated_model, export_path)
-        except OSError as error:
+        except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Export failed", str(error))
             return
 
@@ -2390,9 +2390,13 @@ class BlueprintWorkspace(QWidget):
         settings = self.settings_widget.get_settings()
         target_resolution = settings.automatic_atlas_texture_resolution
         sort_by_pbr = settings.automatic_atlas_texture_sort_by_pbr
+        use_half_mesh_texture_prefix = (
+            settings.use_half_mesh_texture_prefix
+        )
         attempt_key = self._build_automatic_atlas_assignment_key(
             target_resolution,
             sort_by_pbr,
+            use_half_mesh_texture_prefix,
         )
         if attempt_key == self._last_automatic_atlas_assignment_key:
             return
@@ -2409,6 +2413,9 @@ class BlueprintWorkspace(QWidget):
                         )
                     ),
                     sort_by_pbr=sort_by_pbr,
+                    use_half_mesh_texture_prefix=(
+                        use_half_mesh_texture_prefix
+                    ),
                 )
             )
             if not assigned_source_ids:
@@ -2424,6 +2431,7 @@ class BlueprintWorkspace(QWidget):
                 self._build_automatic_atlas_assignment_key(
                     target_resolution,
                     sort_by_pbr,
+                    use_half_mesh_texture_prefix,
                 )
             )
 
@@ -2431,6 +2439,7 @@ class BlueprintWorkspace(QWidget):
         self,
         target_resolution: int,
         sort_by_pbr: bool,
+        use_half_mesh_texture_prefix: bool,
     ) -> tuple[object, ...]:
         """Describe inputs whose changes make a failed auto-pack worth retrying."""
 
@@ -2460,6 +2469,7 @@ class BlueprintWorkspace(QWidget):
             atlas_data.selected_atlas_id,
             int(target_resolution),
             bool(sort_by_pbr),
+            bool(use_half_mesh_texture_prefix),
             self.texture_atlas_workspace.get_unpacked_scene_texture_source_ids(),
             atlas_signature,
             self._atlas_generation_signature,
@@ -3786,6 +3796,7 @@ class BlueprintWorkspace(QWidget):
             placed_models.append(
                 PlacedGeneratedModel(
                     object_id=record.object_id,
+                    object_name=record.object_name,
                     model=generated_model,
                     world_position=(
                         world_x,
