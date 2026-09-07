@@ -18,6 +18,7 @@ from PIL import Image
 from PySide6.QtWidgets import QApplication
 
 from housemaker.app_settings import ApplicationSettingsStore
+from housemaker.camera_models import CameraPose
 from housemaker.generation_state import GeneratedObjectPlacement
 from housemaker.glb import GeneratedModel
 from housemaker.main import BlueprintWorkspace
@@ -225,6 +226,35 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
             self.workspace.surface_texture_generation.surface_view
             .get_scene_model(),
             refreshed_model,
+        )
+
+    def test_surface_camera_navigation_does_not_rescan_atlas_sources(
+        self,
+    ) -> None:
+        surface_workspace = self.workspace.surface_texture_generation
+
+        with patch.object(
+            self.workspace,
+            "_sync_atlas_object_texture_sources",
+        ) as sync_atlas_sources:
+            surface_workspace.surface_view.set_camera_pose(
+                CameraPose(
+                    x=2.0,
+                    y=3.0,
+                    z=1.7,
+                    yaw_degrees=24.0,
+                )
+            )
+
+        sync_atlas_sources.assert_not_called()
+        self.assertEqual(
+            surface_workspace.get_data().camera_pose,
+            CameraPose(
+                x=2.0,
+                y=3.0,
+                z=1.7,
+                yaw_degrees=24.0,
+            ),
         )
 
     def test_surface_refreshes_a_changed_non_current_blueprint(self) -> None:

@@ -1075,11 +1075,15 @@ class SurfaceTextureViewer(QWidget):
             return
         is_selected = surface_id in self._selected_surface_ids
         has_texture = render_items.texture_item is not None
-        render_items.face_item.opts["drawFaces"] = (
-            self._scene_model is None and not has_texture
-        )
-        render_items.face_item.opts["drawEdges"] = False
-        render_items.face_item.meshDataChanged()
+        show_semantic_faces = self._scene_model is None and not has_texture
+        render_items.face_item.setVisible(show_semantic_faces)
+        if (
+            render_items.face_item.opts["drawFaces"] != show_semantic_faces
+            or render_items.face_item.opts["drawEdges"]
+        ):
+            render_items.face_item.opts["drawFaces"] = show_semantic_faces
+            render_items.face_item.opts["drawEdges"] = False
+            render_items.face_item.meshDataChanged()
         if render_items.outline_item is not None:
             render_items.outline_item.setVisible(is_selected)
         if render_items.texture_item is not None:

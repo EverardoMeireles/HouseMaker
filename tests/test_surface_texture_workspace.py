@@ -609,6 +609,23 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         self.assertEqual(restored_data.selected_surface_ids, (selected_wall,))
         self.assertEqual(changed.count(), 0)
 
+    def test_camera_navigation_is_saved_without_emitting_content_change(
+        self,
+    ) -> None:
+        camera_pose = CameraPose(
+            x=3.0,
+            y=4.0,
+            z=1.8,
+            yaw_degrees=32.0,
+            pitch_degrees=-8.0,
+        )
+        changed = QSignalSpy(self.workspace.data_changed)
+
+        self.workspace.surface_view.set_camera_pose(camera_pose)
+
+        self.assertEqual(changed.count(), 0)
+        self.assertEqual(self.workspace.get_data().camera_pose, camera_pose)
+
     def test_in_place_level_change_rebuilds_surface_content(self) -> None:
         mutable_level = self.workspace._levels[0]
         mutable_level.height_meters += 0.5

@@ -2057,11 +2057,17 @@ class SurfaceTextureGenerationWorkspace(QWidget):
 
     @Slot(object)
     def _handle_camera_pose_changed(self, pose: object) -> None:
+        """Retain navigation state without refreshing unrelated Atlas data."""
+
         try:
             self._data.camera_pose = pose
         except (TypeError, ValueError):
             return
-        self._emit_data_changed()
+        # Mouse-look and held movement keys can update the pose every 16 ms.
+        # Emitting the general data signal here deep-copies the complete
+        # workspace state and makes Main rebuild Atlas source signatures on
+        # every frame. ``get_data()`` captures the live viewer pose before a
+        # project is saved, so camera-only navigation needs no content signal.
 
     def _handle_video_strokes_changed(self, raw_strokes: object) -> None:
         if not isinstance(raw_strokes, list) or self._displayed_frame_index is None:

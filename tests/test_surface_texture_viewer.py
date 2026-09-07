@@ -472,6 +472,7 @@ class SurfaceTextureViewerCanvasParityTests(unittest.TestCase):
             self.surface.surface_id
         ]
         self.assertFalse(surface_items.face_item.opts["drawFaces"])
+        self.assertFalse(surface_items.face_item.visible())
         self.assertIsNotNone(surface_items.texture_item)
         self.assertEqual(len(self.canvas_viewer.textured_surface_items), 1)
         assert surface_items.texture_item is not None
@@ -703,6 +704,7 @@ class SurfaceTextureViewerCanvasParityTests(unittest.TestCase):
         assert background_item is not None
         self.assertTrue(background_item.opts["drawFaces"])
         self.assertFalse(semantic_item.face_item.opts["drawFaces"])
+        self.assertFalse(semantic_item.face_item.visible())
         self.assertIsNotNone(semantic_item.texture_item)
 
     def test_scene_model_preserves_semantic_selection(self) -> None:
