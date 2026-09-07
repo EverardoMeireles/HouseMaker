@@ -13,10 +13,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 import trimesh
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor, QImage
 from PySide6.QtWidgets import QApplication
 from shiboken6 import isValid as is_valid_qt_object
 
 from housemaker.app_settings import ApplicationSettingsStore
+from housemaker.camera_models import CameraPose
 from housemaker.generation_state import (
     GeneratedObjectPlacement,
     GeneratedObjectRecord,
@@ -74,6 +77,17 @@ def _level(
         image_size_pixels=(200.0, 100.0),
         include_in_export=include_in_export,
     )
+
+
+def _write_blueprint(directory: Path, name: str) -> str:
+    """Create one readable image used by the modeless placement picker."""
+
+    path = directory / name
+    image = QImage(64, 48, QImage.Format.Format_RGB32)
+    image.fill(QColor("#334155"))
+    if not image.save(str(path), "PNG"):
+        raise RuntimeError("The placement test blueprint could not be saved.")
+    return str(path)
 
 
 def _record(
@@ -146,6 +160,52 @@ class GeneratedObjectPlacementMainTests(unittest.TestCase):
         self.assertIsNone(self.workspace._object_placement_operation_id)
         if second_dialog is not None and is_valid_qt_object(second_dialog):
             self.assertFalse(second_dialog.isVisible())
+
+    def test_place_dialog_preselects_level_containing_canvas_camera(self) -> None:
+        directory = Path(self.temporary_directory.name)
+        underground = _level(1, height_meters=2.0)
+        ground = _level(2, height_meters=4.25)
+        story = _level(3, height_meters=2.75)
+        underground.image_path = _write_blueprint(directory, "underground.png")
+        ground.image_path = _write_blueprint(directory, "ground.png")
+        story.image_path = _write_blueprint(directory, "story.png")
+        self.workspace.levels = [underground, ground, story]
+        self.workspace.viewer.set_first_person_camera_pose(
+            CameraPose(z=5.0)
+        )
+
+        self.workspace.generation.placement_requested.emit("camera-level")
+        _qt_application.processEvents()
+
+        dialog = self.workspace._object_placement_dialog
+        self.assertIsNotNone(dialog)
+        assert dialog is not None
+        current_item = dialog.level_list.currentItem()
+        self.assertIsNotNone(current_item)
+        assert current_item is not None
+        self.assertEqual(current_item.data(Qt.ItemDataRole.UserRole), story.index)
+
+    def test_place_dialog_shared_floor_elevation_selects_upper_level(self) -> None:
+        directory = Path(self.temporary_directory.name)
+        ground = _level(2, height_meters=4.25)
+        story = _level(3, height_meters=2.75)
+        ground.image_path = _write_blueprint(directory, "ground-boundary.png")
+        story.image_path = _write_blueprint(directory, "story-boundary.png")
+        self.workspace.levels = [ground, story]
+        self.workspace.viewer.set_first_person_camera_pose(
+            CameraPose(z=ground.height_meters)
+        )
+
+        self.workspace.generation.placement_requested.emit("floor-boundary")
+        _qt_application.processEvents()
+
+        dialog = self.workspace._object_placement_dialog
+        self.assertIsNotNone(dialog)
+        assert dialog is not None
+        current_item = dialog.level_list.currentItem()
+        self.assertIsNotNone(current_item)
+        assert current_item is not None
+        self.assertEqual(current_item.data(Qt.ItemDataRole.UserRole), story.index)
 
     def test_stale_dialog_or_token_cannot_place_the_active_operation(self) -> None:
         self.workspace.generation.placement_requested.emit("old-token")

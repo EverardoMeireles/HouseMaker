@@ -2509,7 +2509,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(self.workspace._atlas_preview_variant_key[1], 1024)
 
-    def test_wall_wheel_resize_selects_surface_resolution_globally(
+    def test_wall_list_wheel_does_not_resize_and_preview_updates_globally(
         self,
     ) -> None:
         wall_id = _add_square_room_to_level(self.workspace.current_level)
@@ -2561,7 +2561,37 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         atlas_workspace.surface_list.wheelEvent(wheel)
         _qt_application.processEvents()
 
-        self.assertTrue(wheel.isAccepted())
+        unchanged_assignment = self.workspace.surface_texture_generation \
+            .get_data().assignments[0]
+        self.assertEqual(unchanged_assignment.selected_texture_resolution, 512)
+        unchanged_atlas = atlas_workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert unchanged_atlas is not None
+        unchanged_placement = unchanged_atlas.placement_for_object(source_id)
+        assert unchanged_placement is not None
+        self.assertEqual(unchanged_placement.texture_resolution, 512)
+
+        preview = atlas_workspace.preview
+        preview_side = min(preview.width() - 32.0, preview.height() - 32.0)
+        preview_origin = QPointF(
+            (preview.width() - preview_side) / 2.0,
+            (preview.height() - preview_side) / 2.0,
+        )
+        placement_center = QPointF(
+            preview_origin.x()
+            + (unchanged_placement.x + unchanged_placement.size / 2.0)
+            * preview_side
+            / atlas.resolution,
+            preview_origin.y()
+            + (unchanged_placement.y + unchanged_placement.size / 2.0)
+            * preview_side
+            / atlas.resolution,
+        )
+        preview_wheel = _wheel_event(placement_center, 120)
+
+        preview.wheelEvent(preview_wheel)
+        _qt_application.processEvents()
+
+        self.assertTrue(preview_wheel.isAccepted())
         updated_assignment = self.workspace.surface_texture_generation \
             .get_data().assignments[0]
         self.assertEqual(updated_assignment.assignment_id, assignment.assignment_id)

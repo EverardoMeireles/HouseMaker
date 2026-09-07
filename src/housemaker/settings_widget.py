@@ -13,9 +13,11 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
+    QGroupBox,
     QKeySequenceEdit,
     QLabel,
     QLineEdit,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -58,6 +60,9 @@ MESH_EDIT_UPDATE_DELAY_SECONDS_SETTING_KEY = (
     # Keep the original persisted key so existing preferences remain valid.
     "canvas/doorway_mesh_update_delay_seconds"
 )
+SNAP_MIDDLE_EQUAL_ANGLE_ONLY_SETTING_KEY = (
+    "canvas/snap_middle_equal_angle_only"
+)
 DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY = "N"
 DEFAULT_UNUSED_FACE_REMOVAL = False
 DEFAULT_USE_UV_RAYCAST_FOR_OBJECT_GENERATION = False
@@ -69,6 +74,7 @@ DEFAULT_AUTOMATIC_ATLAS_TEXTURE_RESOLUTION = 512
 MINIMUM_FACE_VISIBILITY_PERCENTAGE = 0
 MAXIMUM_FACE_VISIBILITY_PERCENTAGE = 100
 DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS = 1.0
+DEFAULT_SNAP_MIDDLE_EQUAL_ANGLE_ONLY = True
 MIN_MESH_EDIT_UPDATE_DELAY_SECONDS = 0.1
 MAX_MESH_EDIT_UPDATE_DELAY_SECONDS = 10.0
 MESH_EDIT_UPDATE_DELAY_STEP_SECONDS = 0.1
@@ -153,8 +159,16 @@ class GenerationServiceSettings:
         DEFAULT_USE_HALF_MESH_TEXTURE_PREFIX
     )
     atlas_display_screen_id: str | None = None
+    snap_middle_equal_angle_only: bool = (
+        DEFAULT_SNAP_MIDDLE_EQUAL_ANGLE_ONLY
+    )
 
     def __post_init__(self) -> None:
+        if not isinstance(self.snap_middle_equal_angle_only, bool):
+            raise ValueError(
+                "Snap-to-middle equal-angle filtering must be enabled or "
+                "disabled."
+            )
         if not isinstance(self.use_half_mesh_texture_prefix, bool):
             raise ValueError(
                 "Half-mesh texture prefix must be enabled or disabled."
@@ -375,6 +389,9 @@ class SettingsWidget(QWidget):
             mesh_edit_update_delay_seconds=(
                 self.mesh_edit_update_delay_spinbox.value()
             ),
+            snap_middle_equal_angle_only=(
+                self.snap_middle_equal_angle_only_checkbox.isChecked()
+            ),
         )
 
     def get_fullscreen_3d_viewer_screen_id(self) -> str | None:
@@ -425,12 +442,59 @@ class SettingsWidget(QWidget):
         root_layout.setContentsMargins(20, 20, 20, 20)
         root_layout.setSpacing(14)
 
-        title_label = QLabel("Generation settings")
+        title_label = QLabel("Settings")
         title_label.setStyleSheet("font-size: 20px; font-weight: 600;")
         root_layout.addWidget(title_label)
 
-        form_layout = QFormLayout()
-        form_layout.setSpacing(10)
+        self.settings_scroll_area = QScrollArea()
+        self.settings_scroll_area.setObjectName("settings_scroll_area")
+        self.settings_scroll_area.setWidgetResizable(True)
+        self.settings_scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.settings_content = QWidget()
+        self.settings_content.setObjectName("settings_content")
+        sections_layout = QVBoxLayout(self.settings_content)
+        sections_layout.setContentsMargins(0, 0, 0, 0)
+        sections_layout.setSpacing(12)
+
+        (
+            self.api_credentials_group,
+            api_credentials_form,
+        ) = self._build_form_group(
+            "API credentials",
+            "api_credentials_settings_group",
+        )
+        self.display_settings_group, display_form = self._build_form_group(
+            "Displays",
+            "display_settings_group",
+        )
+        self.canvas_settings_group, canvas_form = self._build_form_group(
+            "Canvas",
+            "canvas_settings_group",
+        )
+        (
+            self.object_generation_settings_group,
+            object_generation_form,
+        ) = self._build_form_group(
+            "Object generation",
+            "object_generation_settings_group",
+        )
+        (
+            self.atlas_automation_settings_group,
+            atlas_automation_form,
+        ) = self._build_form_group(
+            "Atlas automation",
+            "atlas_automation_settings_group",
+        )
+        sections_layout.addWidget(self.api_credentials_group)
+        sections_layout.addWidget(self.display_settings_group)
+        sections_layout.addWidget(self.canvas_settings_group)
+        sections_layout.addWidget(self.object_generation_settings_group)
+        sections_layout.addWidget(self.atlas_automation_settings_group)
+        sections_layout.addStretch(1)
+        self.settings_scroll_area.setWidget(self.settings_content)
+        root_layout.addWidget(self.settings_scroll_area, 1)
 
         self.meshy_api_key_edit = self._build_secret_input(
             "Meshy AI API key"
@@ -439,11 +503,14 @@ class SettingsWidget(QWidget):
         self.meshy_api_key_edit.textChanged.connect(
             self._handle_secret_text_changed
         )
-        form_layout.addRow("Meshy AI API key", self.meshy_api_key_edit)
+        api_credentials_form.addRow(
+            "Meshy AI API key",
+            self.meshy_api_key_edit,
+        )
 
         self.meshy_key_status_label = QLabel()
         self.meshy_key_status_label.setObjectName("meshy_key_status_label")
-        form_layout.addRow("", self.meshy_key_status_label)
+        api_credentials_form.addRow("", self.meshy_key_status_label)
 
         self.openai_api_key_edit = self._build_secret_input(
             "OpenAI API key"
@@ -452,11 +519,14 @@ class SettingsWidget(QWidget):
         self.openai_api_key_edit.textChanged.connect(
             self._handle_secret_text_changed
         )
-        form_layout.addRow("OpenAI API key", self.openai_api_key_edit)
+        api_credentials_form.addRow(
+            "OpenAI API key",
+            self.openai_api_key_edit,
+        )
 
         self.openai_key_status_label = QLabel()
         self.openai_key_status_label.setObjectName("openai_key_status_label")
-        form_layout.addRow("", self.openai_key_status_label)
+        api_credentials_form.addRow("", self.openai_key_status_label)
 
         self.fullscreen_3d_viewer_screen_combo = QComboBox()
         self.fullscreen_3d_viewer_screen_combo.setObjectName(
@@ -465,7 +535,7 @@ class SettingsWidget(QWidget):
         self.fullscreen_3d_viewer_screen_combo.currentIndexChanged.connect(
             self._handle_fullscreen_3d_viewer_screen_changed
         )
-        form_layout.addRow(
+        display_form.addRow(
             "Fullscreen 3D viewer display",
             self.fullscreen_3d_viewer_screen_combo,
         )
@@ -480,7 +550,7 @@ class SettingsWidget(QWidget):
         self.jobs_window_screen_combo.currentIndexChanged.connect(
             self._handle_jobs_window_screen_changed
         )
-        form_layout.addRow(
+        display_form.addRow(
             "Jobs window display",
             self.jobs_window_screen_combo,
         )
@@ -496,7 +566,7 @@ class SettingsWidget(QWidget):
         self.atlas_display_screen_combo.currentIndexChanged.connect(
             self._handle_atlas_display_screen_changed
         )
-        form_layout.addRow(
+        display_form.addRow(
             "Atlas display",
             self.atlas_display_screen_combo,
         )
@@ -512,7 +582,7 @@ class SettingsWidget(QWidget):
         self.automatic_atlas_texture_sort_by_pbr_checkbox.toggled.connect(
             self._handle_automatic_atlas_texture_sort_by_pbr_changed
         )
-        form_layout.addRow(
+        atlas_automation_form.addRow(
             "Automatic Atlas texture sort by PBR",
             self.automatic_atlas_texture_sort_by_pbr_checkbox,
         )
@@ -528,7 +598,7 @@ class SettingsWidget(QWidget):
         self.use_half_mesh_texture_prefix_checkbox.toggled.connect(
             self._handle_use_half_mesh_texture_prefix_changed
         )
-        form_layout.addRow(
+        atlas_automation_form.addRow(
             "Use [HALF] half-mesh texture prefix",
             self.use_half_mesh_texture_prefix_checkbox,
         )
@@ -550,7 +620,7 @@ class SettingsWidget(QWidget):
         self.automatic_atlas_texture_resolution_combo.currentIndexChanged.connect(
             self._handle_automatic_atlas_texture_resolution_changed
         )
-        form_layout.addRow(
+        atlas_automation_form.addRow(
             "Automatic Atlas texture resolution",
             self.automatic_atlas_texture_resolution_combo,
         )
@@ -569,9 +639,25 @@ class SettingsWidget(QWidget):
         self.canvas_3d_navigation_toggle_hotkey_edit.keySequenceChanged.connect(
             self._handle_canvas_3d_navigation_toggle_hotkey_changed
         )
-        form_layout.addRow(
+        canvas_form.addRow(
             "Canvas 3D navigation hotkey",
             self.canvas_3d_navigation_toggle_hotkey_edit,
+        )
+
+        self.snap_middle_equal_angle_only_checkbox = QCheckBox()
+        self.snap_middle_equal_angle_only_checkbox.setObjectName(
+            "snap_middle_equal_angle_only_checkbox"
+        )
+        self.snap_middle_equal_angle_only_checkbox.setToolTip(
+            "Only snap a preview point to a wall midpoint when the two "
+            "resulting corner angles are equal."
+        )
+        self.snap_middle_equal_angle_only_checkbox.toggled.connect(
+            self._handle_snap_middle_equal_angle_only_changed
+        )
+        canvas_form.addRow(
+            "Snap to middle equal angle only",
+            self.snap_middle_equal_angle_only_checkbox,
         )
 
         self.mesh_edit_update_delay_spinbox = QDoubleSpinBox()
@@ -595,7 +681,7 @@ class SettingsWidget(QWidget):
         self.mesh_edit_update_delay_spinbox.valueChanged.connect(
             self._handle_mesh_edit_update_delay_changed
         )
-        form_layout.addRow(
+        canvas_form.addRow(
             "Mesh edit update delay",
             self.mesh_edit_update_delay_spinbox,
         )
@@ -613,7 +699,7 @@ class SettingsWidget(QWidget):
         self.unused_face_removal_checkbox.toggled.connect(
             self._handle_unused_face_removal_changed
         )
-        form_layout.addRow(
+        object_generation_form.addRow(
             "Unused face removal",
             self.unused_face_removal_checkbox,
         )
@@ -631,7 +717,7 @@ class SettingsWidget(QWidget):
         self.use_uv_raycast_for_object_generation_checkbox.toggled.connect(
             self._handle_use_uv_raycast_for_object_generation_changed
         )
-        form_layout.addRow(
+        object_generation_form.addRow(
             "Use weighted camera projection",
             self.use_uv_raycast_for_object_generation_checkbox,
         )
@@ -657,12 +743,10 @@ class SettingsWidget(QWidget):
         self.minimum_face_visibility_percentage_spinbox.valueChanged.connect(
             self._handle_minimum_face_visibility_percentage_changed
         )
-        form_layout.addRow(
+        object_generation_form.addRow(
             "Minimum percentage of face visible",
             self.minimum_face_visibility_percentage_spinbox,
         )
-
-        root_layout.addLayout(form_layout)
 
         security_note = QLabel(
             "Testing mode: API keys are stored as plaintext in the local "
@@ -674,7 +758,7 @@ class SettingsWidget(QWidget):
         security_note.setObjectName("api_key_security_note")
         security_note.setWordWrap(True)
         security_note.setStyleSheet("color: #666;")
-        root_layout.addWidget(security_note)
+        api_credentials_form.addRow(security_note)
 
         meshy_note = QLabel(
             "Object generation uses Meshy Image-to-3D. Surface texture "
@@ -687,10 +771,23 @@ class SettingsWidget(QWidget):
         meshy_note.setObjectName("meshy_availability_note")
         meshy_note.setWordWrap(True)
         meshy_note.setStyleSheet("color: #666;")
-        root_layout.addWidget(meshy_note)
-        root_layout.addStretch(1)
+        api_credentials_form.addRow(meshy_note)
 
         self._connect_screen_change_signals()
+
+    @staticmethod
+    def _build_form_group(
+        title: str,
+        object_name: str,
+    ) -> tuple[QGroupBox, QFormLayout]:
+        """Build one consistently spaced Settings section."""
+
+        group = QGroupBox(title)
+        group.setObjectName(object_name)
+        form_layout = QFormLayout(group)
+        form_layout.setContentsMargins(12, 12, 12, 12)
+        form_layout.setSpacing(10)
+        return group, form_layout
 
     @staticmethod
     def _build_secret_input(placeholder_text: str) -> QLineEdit:
@@ -749,6 +846,9 @@ class SettingsWidget(QWidget):
                 ),
                 QKeySequence.SequenceFormat.PortableText,
             )
+        )
+        self.snap_middle_equal_angle_only_checkbox.setChecked(
+            read_snap_middle_equal_angle_only(self._application_settings)
         )
         self.mesh_edit_update_delay_spinbox.setValue(
             read_mesh_edit_update_delay_seconds(
@@ -1002,6 +1102,20 @@ class SettingsWidget(QWidget):
         )
         self.settings_changed.emit()
 
+    def _handle_snap_middle_equal_angle_only_changed(
+        self,
+        enabled: bool,
+    ) -> None:
+        """Persist the Canvas midpoint angle-filtering preference."""
+
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            SNAP_MIDDLE_EQUAL_ANGLE_ONLY_SETTING_KEY,
+            bool(enabled),
+        )
+        self.settings_changed.emit()
+
     def _handle_use_uv_raycast_for_object_generation_changed(
         self,
         enabled: bool,
@@ -1229,6 +1343,21 @@ def read_minimum_face_visibility_percentage(
     ):
         return DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE
     return int(value)
+
+
+# ### Canvas snapping setting helpers ###
+def read_snap_middle_equal_angle_only(
+    application_settings: ApplicationSettingsStore,
+) -> bool:
+    """Read the persisted Canvas midpoint angle filter safely."""
+
+    value = application_settings.get(
+        SNAP_MIDDLE_EQUAL_ANGLE_ONLY_SETTING_KEY,
+        DEFAULT_SNAP_MIDDLE_EQUAL_ANGLE_ONLY,
+    )
+    if isinstance(value, bool):
+        return value
+    return DEFAULT_SNAP_MIDDLE_EQUAL_ANGLE_ONLY
 
 
 # ### Mesh edit preview setting helpers ###

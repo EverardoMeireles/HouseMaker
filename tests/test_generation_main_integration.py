@@ -291,6 +291,20 @@ class GenerationMainIntegrationTests(unittest.TestCase):
             "orbit",
         )
 
+    def test_canvas_snap_filter_is_controlled_from_settings(self) -> None:
+        self.assertFalse(
+            hasattr(self.workspace, "snap_middle_equal_angle_radio")
+        )
+        self.assertTrue(self.workspace.canvas.snap_middle_equal_angle_only)
+
+        snap_checkbox = (
+            self.workspace.settings_widget.snap_middle_equal_angle_only_checkbox
+        )
+        snap_checkbox.setChecked(False)
+        _qt_application.processEvents()
+
+        self.assertFalse(self.workspace.canvas.snap_middle_equal_angle_only)
+
     def test_external_canvas_3d_viewer_hides_local_subtabs(self) -> None:
         canvas_viewer_tabs = self.workspace.canvas_viewer_tabs
         canvas_viewer_tabs.setCurrentIndex(

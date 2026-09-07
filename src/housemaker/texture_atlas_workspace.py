@@ -732,17 +732,9 @@ def get_atlas_wall_texture_assignment_id(source_id: object) -> str | None:
 
 # ### Interactive object list ###
 class TextureAtlasObjectList(QListWidget):
-    """Selectable, draggable texture sources with wheel-only resizing."""
+    """Selectable and draggable texture sources."""
 
     object_clicked = Signal(str, object)
-    object_wheeled = Signal(str, int)
-
-    def set_wheel_resize_object_ids(self, object_ids: set[str]) -> None:
-        """Limit wheel capture to packed sources that can actually resize."""
-
-        self._wheel_resize_object_ids = frozenset(
-            str(object_id) for object_id in object_ids
-        )
 
     def startDrag(self, supported_actions: Qt.DropAction) -> None:  # type: ignore[override]
         del supported_actions
@@ -777,28 +769,6 @@ class TextureAtlasObjectList(QListWidget):
         object_id = item.data(OBJECT_ID_ROLE)
         if object_id is not None:
             self.object_clicked.emit(str(object_id), button)
-
-    def wheelEvent(self, event: QWheelEvent) -> None:  # type: ignore[override]
-        """Resize the selected texture instead of the hovered list row."""
-
-        item = self.currentItem()
-        wheel_delta = int(event.angleDelta().y())
-        if item is None or wheel_delta == 0:
-            super().wheelEvent(event)
-            return
-        object_id = item.data(OBJECT_ID_ROLE)
-        if object_id is None or str(object_id) not in getattr(
-            self,
-            "_wheel_resize_object_ids",
-            frozenset(),
-        ):
-            super().wheelEvent(event)
-            return
-        self.object_wheeled.emit(
-            str(object_id),
-            1 if wheel_delta > 0 else -1,
-        )
-        event.accept()
 
     @property
     def mouse_button_in_progress(self) -> object | None:
@@ -3409,7 +3379,6 @@ class TextureAtlasWorkspace(QWidget):
             self._handle_object_list_selection_changed
         )
         self.object_list.object_clicked.connect(self._handle_object_mouse_click)
-        self.object_list.object_wheeled.connect(self._handle_object_wheel)
         texture_column_layout.addWidget(self.object_list, 1)
         self.delete_object_list_shortcut = QShortcut(
             QKeySequence.StandardKey.Delete,
@@ -3434,7 +3403,6 @@ class TextureAtlasWorkspace(QWidget):
             self._handle_surface_list_selection_changed
         )
         self.surface_list.object_clicked.connect(self._handle_object_mouse_click)
-        self.surface_list.object_wheeled.connect(self._handle_object_wheel)
         texture_column_layout.addWidget(self.surface_list, 1)
         self.delete_surface_list_shortcut = QShortcut(
             QKeySequence.StandardKey.Delete,
@@ -4293,8 +4261,8 @@ class TextureAtlasWorkspace(QWidget):
                 )
             else:
                 self.status_label.setText(
-                    "Selected the texture. Use the mouse wheel to change the "
-                    "size of a packed texture."
+                    "Selected the texture. Use the mouse wheel over the Atlas "
+                    "preview to change the size of a packed texture."
                 )
         finally:
             self._is_handling_object_click = False
@@ -4730,8 +4698,6 @@ class TextureAtlasWorkspace(QWidget):
             for placement in (() if atlas is None else atlas.placements)
             if not self._source_has_fixed_resolution(placement.object_id)
         }
-        self.object_list.set_wheel_resize_object_ids(wheel_resize_object_ids)
-        self.surface_list.set_wheel_resize_object_ids(wheel_resize_object_ids)
         for preview in self.map_previews.values():
             preview.set_wheel_resize_object_ids(wheel_resize_object_ids)
         self._sync_controls()

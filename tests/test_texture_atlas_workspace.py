@@ -1909,7 +1909,9 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.assertEqual((slot_preview.x, slot_preview.y), (1024, 512))
         self.assertTrue(slot_preview.is_valid)
 
-    def test_mouse_wheel_resizes_wall_texture_from_list_and_atlas(self) -> None:
+    def test_surface_source_list_wheel_scrolls_without_resizing_texture(
+        self,
+    ) -> None:
         data = TextureAtlasData()
         atlas = data.create_atlas("Walls", 2048, atlas_id="atlas-a")
         variants = _resizable_wall_variants(
@@ -1945,12 +1947,12 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         list_wheel = _wheel_event(row_center, 120)
         self.workspace.surface_list.wheelEvent(list_wheel)
 
-        enlarged = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
-        assert enlarged is not None
-        placement = enlarged.placement_for_object(source_id)
+        unchanged = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert unchanged is not None
+        placement = unchanged.placement_for_object(source_id)
         assert placement is not None
-        self.assertTrue(list_wheel.isAccepted())
-        self.assertEqual(placement.texture_resolution, 1024)
+        self.assertEqual(placement.texture_resolution, 512)
+        self.assertEqual(resolution_changes, [])
 
         preview = self.workspace.preview
         preview_side = min(preview.width() - 32.0, preview.height() - 32.0)
@@ -1969,7 +1971,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             / atlas.resolution,
         )
         preview_zoom = preview.zoom_factor
-        preview_wheel = _wheel_event(placement_center, -120)
+        preview_wheel = _wheel_event(placement_center, 120)
         preview.wheelEvent(preview_wheel)
 
         restored = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
@@ -1978,14 +1980,14 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         assert placement is not None
         self.assertTrue(preview_wheel.isAccepted())
         self.assertEqual(preview.zoom_factor, preview_zoom)
-        self.assertEqual(placement.texture_resolution, 512)
+        self.assertEqual(placement.texture_resolution, 1024)
         self.assertEqual(
             resolution_changes,
-            [(source_id, 1024), (source_id, 512)],
+            [(source_id, 1024)],
         )
         self.assertEqual(self.workspace.selected_object_id, source_id)
 
-    def test_mouse_wheel_resizes_selection_instead_of_hovered_texture(
+    def test_object_source_list_wheel_scrolls_without_resizing_selection(
         self,
     ) -> None:
         data = TextureAtlasData()
@@ -2027,7 +2029,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         selected = updated.placement_for_object("selected")
         hovered = updated.placement_for_object("hovered")
         assert selected is not None and hovered is not None
-        self.assertEqual(selected.texture_resolution, 1024)
+        self.assertEqual(selected.texture_resolution, 512)
         self.assertEqual(hovered.texture_resolution, 512)
         self.assertEqual(self.workspace.selected_object_id, "selected")
 
@@ -2043,7 +2045,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         hovered = updated.placement_for_object("hovered")
         assert selected is not None and hovered is not None
         self.assertTrue(preview_wheel.isAccepted())
-        self.assertEqual(selected.texture_resolution, 2048)
+        self.assertEqual(selected.texture_resolution, 1024)
         self.assertEqual(hovered.texture_resolution, 512)
 
         before = self.workspace.get_data()

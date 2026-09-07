@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # ### Imports ###
 from PySide6.QtGui import QKeySequence
-from PySide6.QtWidgets import QApplication, QLabel, QLineEdit
+from PySide6.QtWidgets import QApplication, QGroupBox, QLabel, QLineEdit
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.settings_widget import (
@@ -27,6 +27,7 @@ from housemaker.settings_widget import (
     DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE,
     DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS,
     DEFAULT_MESHY_TARGET_POLYCOUNT,
+    DEFAULT_SNAP_MIDDLE_EQUAL_ANGLE_ONLY,
     DEFAULT_USE_HALF_MESH_TEXTURE_PREFIX,
     FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY,
     MAXIMUM_FACE_VISIBILITY_PERCENTAGE,
@@ -40,6 +41,7 @@ from housemaker.settings_widget import (
     MIN_MESH_EDIT_UPDATE_DELAY_SECONDS,
     OPENAI_API_KEY_ENVIRONMENT_VARIABLE,
     OPENAI_API_KEY_SETTING_KEY,
+    SNAP_MIDDLE_EQUAL_ANGLE_ONLY_SETTING_KEY,
     UNUSED_FACE_REMOVAL_SETTING_KEY,
     USE_HALF_MESH_TEXTURE_PREFIX_SETTING_KEY,
     USE_UV_RAYCAST_FOR_OBJECT_GENERATION_SETTING_KEY,
@@ -55,6 +57,7 @@ from housemaker.settings_widget import (
     read_canvas_3d_navigation_toggle_hotkey,
     read_mesh_edit_update_delay_seconds,
     read_minimum_face_visibility_percentage,
+    read_snap_middle_equal_angle_only,
     read_unused_face_removal,
     read_use_half_mesh_texture_prefix,
     read_use_uv_raycast_for_object_generation,
@@ -74,6 +77,157 @@ class SettingsWidgetTests(unittest.TestCase):
             GenerationServiceSettings().meshy_target_polycount,
             2_000,
         )
+
+    def test_controls_are_organized_into_clear_settings_sections(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            widget = SettingsWidget(
+                application_settings=_build_test_settings(temporary_directory),
+                environment={},
+            )
+
+            self.assertIs(
+                widget.settings_scroll_area.widget(),
+                widget.settings_content,
+            )
+            expected_sections = (
+                (
+                    widget.api_credentials_group,
+                    "API credentials",
+                    (
+                        widget.meshy_api_key_edit,
+                        widget.meshy_key_status_label,
+                        widget.openai_api_key_edit,
+                        widget.openai_key_status_label,
+                    ),
+                ),
+                (
+                    widget.display_settings_group,
+                    "Displays",
+                    (
+                        widget.fullscreen_3d_viewer_screen_combo,
+                        widget.jobs_window_screen_combo,
+                        widget.atlas_display_screen_combo,
+                    ),
+                ),
+                (
+                    widget.canvas_settings_group,
+                    "Canvas",
+                    (
+                        widget.canvas_3d_navigation_toggle_hotkey_edit,
+                        widget.snap_middle_equal_angle_only_checkbox,
+                        widget.mesh_edit_update_delay_spinbox,
+                    ),
+                ),
+                (
+                    widget.object_generation_settings_group,
+                    "Object generation",
+                    (
+                        widget.unused_face_removal_checkbox,
+                        widget.use_uv_raycast_for_object_generation_checkbox,
+                        widget.minimum_face_visibility_percentage_spinbox,
+                    ),
+                ),
+                (
+                    widget.atlas_automation_settings_group,
+                    "Atlas automation",
+                    (
+                        widget.automatic_atlas_texture_sort_by_pbr_checkbox,
+                        widget.use_half_mesh_texture_prefix_checkbox,
+                        widget.automatic_atlas_texture_resolution_combo,
+                    ),
+                ),
+            )
+            for group, title, controls in expected_sections:
+                with self.subTest(section=title):
+                    self.assertIsInstance(group, QGroupBox)
+                    self.assertEqual(group.title(), title)
+                    self.assertTrue(widget.settings_content.isAncestorOf(group))
+                    for control in controls:
+                        self.assertTrue(group.isAncestorOf(control))
+
+            security_note = widget.findChild(QLabel, "api_key_security_note")
+            availability_note = widget.findChild(
+                QLabel,
+                "meshy_availability_note",
+            )
+            self.assertIsNotNone(security_note)
+            self.assertIsNotNone(availability_note)
+            assert security_note is not None and availability_note is not None
+            self.assertTrue(
+                widget.api_credentials_group.isAncestorOf(security_note)
+            )
+            self.assertTrue(
+                widget.api_credentials_group.isAncestorOf(availability_note)
+            )
+            widget.dispose()
+
+    def test_snap_middle_equal_angle_setting_persists_and_emits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            widget = SettingsWidget(
+                application_settings=application_settings,
+                environment={},
+            )
+            emitted_changes: list[bool] = []
+            widget.settings_changed.connect(
+                lambda: emitted_changes.append(True)
+            )
+
+            self.assertTrue(DEFAULT_SNAP_MIDDLE_EQUAL_ANGLE_ONLY)
+            self.assertTrue(
+                widget.snap_middle_equal_angle_only_checkbox.isChecked()
+            )
+            self.assertTrue(
+                widget.get_settings().snap_middle_equal_angle_only
+            )
+
+            widget.snap_middle_equal_angle_only_checkbox.setChecked(False)
+
+            self.assertFalse(
+                application_settings.get(
+                    SNAP_MIDDLE_EQUAL_ANGLE_ONLY_SETTING_KEY
+                )
+            )
+            self.assertFalse(
+                widget.get_settings().snap_middle_equal_angle_only
+            )
+            self.assertEqual(emitted_changes, [True])
+
+            restored = SettingsWidget(
+                application_settings=_build_test_settings(temporary_directory),
+                environment={},
+            )
+            self.assertFalse(
+                restored.get_settings().snap_middle_equal_angle_only
+            )
+            widget.dispose()
+            restored.dispose()
+
+    def test_snap_middle_equal_angle_setting_rejects_malformed_values(
+        self,
+    ) -> None:
+        for value in (1, "true", None, []):
+            with self.subTest(model_value=value):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "Snap-to-middle equal-angle",
+                ):
+                    GenerationServiceSettings(
+                        snap_middle_equal_angle_only=(
+                            value  # type: ignore[arg-type]
+                        )
+                    )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            application_settings.set(
+                SNAP_MIDDLE_EQUAL_ANGLE_ONLY_SETTING_KEY,
+                "yes",
+            )
+
+            self.assertTrue(
+                read_snap_middle_equal_angle_only(application_settings)
+            )
 
     def test_atlas_display_model_defaults_normalizes_and_validates(self) -> None:
         self.assertIsNone(GenerationServiceSettings().atlas_display_screen_id)
@@ -775,8 +929,9 @@ class SettingsWidgetTests(unittest.TestCase):
                 "doorway or window edit",
                 widget.mesh_edit_update_delay_spinbox.toolTip(),
             )
-            form_layout = widget.layout().itemAt(1).layout()
+            form_layout = widget.canvas_settings_group.layout()
             self.assertIsNotNone(form_layout)
+            assert form_layout is not None
             self.assertEqual(
                 form_layout.labelForField(
                     widget.mesh_edit_update_delay_spinbox

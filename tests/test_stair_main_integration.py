@@ -11,10 +11,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 # ### Imports ###
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QImage
+from PySide6.QtCore import QPoint, QPointF, Qt
+from PySide6.QtGui import QImage, QWheelEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QWidget
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.main import BlueprintWorkspace
@@ -69,6 +69,25 @@ def _add_wall_segment(
         start_vertex.id,
         end_vertex.id,
     )
+
+
+def _send_wheel_event(widget: QWidget, delta: int) -> QWheelEvent:
+    """Send one vertical wheel step to a visible widget."""
+
+    position = QPointF(widget.rect().center())
+    global_position = QPointF(widget.mapToGlobal(position.toPoint()))
+    event = QWheelEvent(
+        position,
+        global_position,
+        QPoint(),
+        QPoint(0, int(delta)),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+    QApplication.sendEvent(widget, event)
+    return event
 
 
 # ### Main integration tests ###
@@ -181,6 +200,39 @@ class StairMainIntegrationTests(unittest.TestCase):
         self.assertEqual(
             self.workspace.stair_style_combo.itemText(style_index),
             "Floating with riser",
+        )
+
+    def test_stair_style_combo_ignores_wheel_and_accepts_keyboard(self) -> None:
+        combo = self.workspace.stair_style_combo
+        combo.setCurrentIndex(0)
+
+        wheel_event = _send_wheel_event(combo, -120)
+
+        self.assertTrue(wheel_event.isAccepted())
+        self.assertEqual(combo.currentIndex(), 0)
+
+        combo.setFocus(Qt.FocusReason.OtherFocusReason)
+        QTest.keyClick(combo, Qt.Key.Key_Down)
+
+        self.assertEqual(combo.currentData(), STAIR_STYLE_FLOATING)
+
+    def test_stair_style_combo_accepts_popup_clicks(self) -> None:
+        combo = self.workspace.stair_style_combo
+        combo.setCurrentIndex(0)
+        target_index = combo.model().index(2, 0)
+        combo.showPopup()
+        _qt_application.processEvents()
+
+        QTest.mouseClick(
+            combo.view().viewport(),
+            Qt.MouseButton.LeftButton,
+            pos=combo.view().visualRect(target_index).center(),
+        )
+        _qt_application.processEvents()
+
+        self.assertEqual(
+            combo.currentData(),
+            STAIR_STYLE_FLOATING_WITH_RISER,
         )
 
     def test_selected_canvas_stair_can_be_deleted_without_a_list(self) -> None:

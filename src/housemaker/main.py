@@ -180,7 +180,7 @@ SURFACE_ATLAS_ROUGHNESS_BYTE = round(
 )
 
 # ### Event filters ###
-class RightPanelSpinBoxWheelFilter(QObject):
+class RightPanelValueInputWheelFilter(QObject):
     """Scrolls a containing panel when its value inputs receive wheel events."""
 
     def __init__(self, scroll_area: QScrollArea) -> None:
@@ -475,6 +475,9 @@ class BlueprintWorkspace(QWidget):
         )
         self._set_canvas_3d_navigation_shortcut(
             generation_settings.canvas_3d_navigation_toggle_hotkey
+        )
+        self.canvas.set_snap_middle_equal_angle_only(
+            generation_settings.snap_middle_equal_angle_only
         )
         self.generation.set_runtime_settings(generation_settings)
         self.surface_texture_generation.set_runtime_settings(
@@ -837,20 +840,6 @@ class BlueprintWorkspace(QWidget):
         self.load_image_button.clicked.connect(self._handle_load_image_clicked)
         side_layout.addWidget(self.load_image_button)
 
-        snap_label = QLabel("Snap")
-        snap_label.setStyleSheet("font-size: 18px; font-weight: 600;")
-        side_layout.addWidget(snap_label)
-
-        self.snap_middle_equal_angle_radio = QRadioButton(
-            "Snap to middle equal angle only"
-        )
-        self.snap_middle_equal_angle_radio.setAutoExclusive(False)
-        self.snap_middle_equal_angle_radio.setChecked(True)
-        self.snap_middle_equal_angle_radio.toggled.connect(
-            self._handle_snap_middle_equal_angle_toggled
-        )
-        side_layout.addWidget(self.snap_middle_equal_angle_radio)
-
         self.blueprint_name_label = QLabel("Image: none for this level")
         self.blueprint_name_label.setWordWrap(True)
         side_layout.addWidget(self.blueprint_name_label)
@@ -907,14 +896,19 @@ class BlueprintWorkspace(QWidget):
 
         self._refresh_doorway_preset_list(selected_index=0)
 
-        self._generals_spinbox_wheel_filter = RightPanelSpinBoxWheelFilter(
+        self._generals_value_input_wheel_filter = RightPanelValueInputWheelFilter(
             generals_tab
         )
         for spinbox in generals_content.findChildren(QAbstractSpinBox):
-            spinbox.installEventFilter(self._generals_spinbox_wheel_filter)
-            spinbox.lineEdit().installEventFilter(
-                self._generals_spinbox_wheel_filter
+            spinbox.installEventFilter(
+                self._generals_value_input_wheel_filter
             )
+            spinbox.lineEdit().installEventFilter(
+                self._generals_value_input_wheel_filter
+            )
+        self.stair_style_combo.installEventFilter(
+            self._generals_value_input_wheel_filter
+        )
 
         self.workspace_splitter.addWidget(self.side_panel)
         self.workspace_splitter.setStretchFactor(0, 9)
@@ -1807,6 +1801,9 @@ class BlueprintWorkspace(QWidget):
 
         self._close_object_placement_dialog()
         dialog = ObjectPlacementDialog(self.levels, self)
+        camera_level_index = self._get_canvas_camera_level_index()
+        if camera_level_index is not None:
+            dialog.select_level(camera_level_index)
         self._object_placement_dialog = dialog
         self._object_placement_operation_id = exact_operation_id
         dialog.placement_selected.connect(
@@ -1825,6 +1822,23 @@ class BlueprintWorkspace(QWidget):
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
+
+    def _get_canvas_camera_level_index(self) -> int | None:
+        """Return the level volume containing the Canvas first-person camera."""
+
+        camera_z = float(self.viewer.get_first_person_camera_pose().z)
+        base_z_by_level_index = build_level_base_z_lookup(self.levels)
+        levels_by_descending_elevation = sorted(
+            self.levels,
+            key=lambda level: base_z_by_level_index[level.index],
+            reverse=True,
+        )
+        for level in levels_by_descending_elevation:
+            base_z = base_z_by_level_index[level.index]
+            top_z = base_z + float(level.height_meters)
+            if base_z <= camera_z < top_z:
+                return level.index
+        return None
 
     def _handle_object_placement_selected(
         self,
@@ -5362,6 +5376,9 @@ class BlueprintWorkspace(QWidget):
         self._set_canvas_3d_navigation_shortcut(
             settings.canvas_3d_navigation_toggle_hotkey
         )
+        self.canvas.set_snap_middle_equal_angle_only(
+            settings.snap_middle_equal_angle_only
+        )
         self.generation.set_runtime_settings(settings)
         self.surface_texture_generation.set_runtime_settings(settings)
         self._apply_fullscreen_3d_viewer_screen(
@@ -5406,9 +5423,6 @@ class BlueprintWorkspace(QWidget):
         self.current_level.include_in_export = self.include_yes_radio.isChecked()
         self._refresh_scene_atlas_texture_requirements()
         self._schedule_viewer_preview_refresh()
-
-    def _handle_snap_middle_equal_angle_toggled(self, checked: bool) -> None:
-        self.canvas.set_snap_middle_equal_angle_only(checked)
 
     def _apply_loaded_project(self, project_data: ProjectData) -> None:
         self._apply_project_state(
