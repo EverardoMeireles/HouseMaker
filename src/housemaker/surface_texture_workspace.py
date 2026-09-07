@@ -59,6 +59,7 @@ from housemaker.settings_widget import (
     GenerationServiceSettings,
     read_surface_texture_provider,
 )
+from housemaker.surface_geometry import FixedSurface, build_fixed_surfaces
 from housemaker.surface_texture_providers import (
     MESHY_PROVIDER,
     SurfaceTextureResult,
@@ -154,6 +155,23 @@ def _freeze_level_sync_value(value: object) -> object:
     if value is None or isinstance(value, str | bytes | int | bool):
         return value
     return (type(value).__qualname__, repr(value))
+
+
+def _build_all_existing_surfaces(
+    levels: Sequence[LevelData],
+) -> dict[str, FixedSurface]:
+    """Map every existing semantic surface without applying export filters."""
+
+    normalized_levels = list(levels)
+    if not all(isinstance(level, LevelData) for level in normalized_levels):
+        raise TypeError("Surface levels must contain LevelData values.")
+    all_included_levels = [
+        replace(level, include_in_export=True) for level in normalized_levels
+    ]
+    return {
+        surface.surface_id: surface
+        for surface in build_fixed_surfaces(all_included_levels)
+    }
 
 
 # ### Asset revision helpers ###
@@ -476,6 +494,8 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._data = SurfaceTextureData()
         self._levels: list[LevelData] = []
         self._level_sync_signature: tuple[object, ...] | None = None
+        self._semantic_surface_cache_signature: tuple[object, ...] | None = None
+        self._semantic_surfaces_by_id: dict[str, FixedSurface] = {}
         self._video_source: VideoFrameSource | None = None
         self._displayed_frame_index: int | None = None
         self._is_syncing_seekbar = False
@@ -771,6 +791,122 @@ class SurfaceTextureGenerationWorkspace(QWidget):
 
         return tuple(self._data.assignments)
 
+    def assignment_targets_are_valid(
+        self,
+        assignment_id: str,
+        target_surface_ids: Sequence[str],
+    ) -> bool:
+        """Validate assignment targets against current semantic level data."""
+
+        assignment = self._assignment_by_id(str(assignment_id).strip())
+        target_ids = tuple(
+            dict.fromkeys(str(surface_id) for surface_id in target_surface_ids)
+        )
+        if (
+            assignment is None
+            or not target_ids
+            or self._assignment_is_reserved(assignment)
+            or self._surface_targets_are_reserved(target_ids)
+        ):
+            return False
+        surfaces_by_id = self._all_existing_surfaces_by_id()
+        return all(
+            (surface := surfaces_by_id.get(surface_id)) is not None
+            and surface.surface_type == assignment.surface_type
+            for surface_id in target_ids
+        )
+
+    def _all_existing_surfaces_by_id(
+        self,
+        levels: Sequence[LevelData] | None = None,
+    ) -> dict[str, FixedSurface]:
+        """Return a revision-cached semantic surface lookup."""
+
+        normalized_levels = list(self._levels if levels is None else levels)
+        signature = _build_level_sync_signature(normalized_levels)
+        if signature != self._semantic_surface_cache_signature:
+            self._semantic_surfaces_by_id = _build_all_existing_surfaces(
+                normalized_levels
+            )
+            self._semantic_surface_cache_signature = signature
+        return self._semantic_surfaces_by_id
+
+    def _all_existing_surface_areas(
+        self,
+        levels: Sequence[LevelData] | None = None,
+    ) -> dict[str, float]:
+        """Return current semantic areas without consulting the hidden view."""
+
+        return {
+            surface_id: float(surface.area_square_meters)
+            for surface_id, surface in self._all_existing_surfaces_by_id(
+                levels
+            ).items()
+        }
+
+    def reconcile_assignments_with_levels(
+        self,
+        levels: Sequence[LevelData],
+        *,
+        emit_signals: bool = True,
+    ) -> bool:
+        """Drop only targets whose semantic surfaces no longer exist.
+
+        Level inclusion is intentionally ignored when determining existence,
+        so temporarily excluding a level from export keeps its assignments.
+        """
+
+        assignments_changed = self._reconcile_assignment_targets(levels)
+        if not assignments_changed:
+            return False
+        self._restore_assignment_textures()
+        self._refresh_texture_atlases()
+        self._sync_selection_status()
+        self._sync_controls()
+        if emit_signals:
+            self._emit_data_changed()
+            self.surface_content_changed.emit()
+        return True
+
+    def _reconcile_assignment_targets(
+        self,
+        levels: Sequence[LevelData],
+    ) -> bool:
+        """Rebuild assignment targets and areas from all existing surfaces."""
+
+        if not self._data.assignments:
+            return False
+        surface_areas = self._all_existing_surface_areas(levels)
+        next_assignments: list[SurfaceTextureAssignment] = []
+        for assignment in self._data.assignments:
+            retained_surface_ids = tuple(
+                surface_id
+                for surface_id in assignment.surface_ids
+                if surface_id in surface_areas
+            )
+            combined_area_m2 = sum(
+                surface_areas[surface_id]
+                for surface_id in retained_surface_ids
+            )
+            next_assignments.append(
+                replace(
+                    assignment,
+                    surface_ids=retained_surface_ids,
+                    combined_area_m2=combined_area_m2,
+                    area_description=_build_surface_area_description(
+                        assignment.surface_type,
+                        retained_surface_ids,
+                        combined_area_m2,
+                    ),
+                )
+            )
+        if next_assignments == self._data.assignments:
+            return False
+        self._data.assignments = next_assignments
+        self._restored_assignment_texture_signature = None
+        self._texture_atlas_entry_cache.clear()
+        return True
+
     def can_select_assignment_texture_resolution(
         self,
         assignment_id: str,
@@ -921,6 +1057,49 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             map_texture_pngs={},
         )
 
+    def clear_assignment_surfaces(self, assignment_id: str) -> bool:
+        """Unbind a texture family while retaining all generated assets."""
+
+        assignment = self._assignment_by_id(str(assignment_id).strip())
+        if assignment is None or self._assignment_is_reserved(assignment):
+            return False
+        if not assignment.surface_ids:
+            return True
+
+        previous_assignments = list(self._data.assignments)
+        self._data.assignments = [
+            (
+                self._assignment_with_surfaces(candidate, ())
+                if candidate.assignment_id == assignment.assignment_id
+                else candidate
+            )
+            for candidate in previous_assignments
+        ]
+        try:
+            self._restore_assignment_textures()
+        except (OSError, RuntimeError, TypeError, ValueError):
+            self._data.assignments = previous_assignments
+            try:
+                self._restore_assignment_textures()
+            except (OSError, RuntimeError, TypeError, ValueError):
+                pass
+            self.status_label.setText(
+                "The selected surface texture could not be removed from Canvas."
+            )
+            self._sync_controls()
+            return False
+
+        self._texture_atlas_entry_cache.clear()
+        self._refresh_texture_atlases()
+        self.status_label.setText(
+            "Removed the selected texture from "
+            f"{len(assignment.surface_ids)} surface(s)."
+        )
+        self._emit_data_changed()
+        self.surface_content_changed.emit()
+        self._sync_controls()
+        return True
+
     def delete_assignment_texture(self, assignment_id: str) -> bool:
         """Delete one complete texture family from every assigned surface."""
 
@@ -1000,21 +1179,24 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             source_assignment
         ) or self._surface_targets_are_reserved(normalized_targets):
             return False
+        surface_by_id = self._all_existing_surfaces_by_id()
         if normalized_targets:
-            target_surfaces = tuple(
-                self.surface_view.get_surface(surface_id)
-                for surface_id in normalized_targets
-            )
-            if any(surface is None for surface in target_surfaces):
-                return False
             if any(
-                surface.surface_type != source_assignment.surface_type
-                for surface in target_surfaces
-                if surface is not None
+                (surface := surface_by_id.get(surface_id)) is None
+                or surface.surface_type != source_assignment.surface_type
+                for surface_id in normalized_targets
             ):
                 return False
         else:
-            normalized_targets = source_assignment.surface_ids
+            normalized_targets = tuple(
+                surface_id
+                for surface_id in source_assignment.surface_ids
+                if surface_id in surface_by_id
+            )
+        surface_areas = {
+            surface_id: float(surface.area_square_meters)
+            for surface_id, surface in surface_by_id.items()
+        }
         if (
             applied_assignment == source_assignment
             and set(normalized_targets).issubset(source_assignment.surface_ids)
@@ -1023,12 +1205,13 @@ class SurfaceTextureGenerationWorkspace(QWidget):
 
         previous_assignments = list(self._data.assignments)
         source_surface_ids = tuple(
-            dict.fromkeys(
+            surface_id
+            for surface_id in dict.fromkeys(
                 (*source_assignment.surface_ids, *normalized_targets)
             )
+            if surface_id in surface_by_id
         )
         retained_assignments: list[SurfaceTextureAssignment] = []
-        removed_assignments: list[SurfaceTextureAssignment] = []
         target_set = set(normalized_targets)
         for assignment in self._data.assignments:
             if assignment.assignment_id == source_assignment.assignment_id:
@@ -1041,17 +1224,25 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             if remaining_ids == assignment.surface_ids:
                 retained_assignments.append(assignment)
             elif not remaining_ids:
-                removed_assignments.append(assignment)
+                retained_assignments.append(
+                    self._assignment_with_surfaces(
+                        assignment,
+                        (),
+                        surface_areas=surface_areas,
+                    )
+                )
             else:
                 retained_assignments.append(
                     self._assignment_with_surfaces(
                         assignment,
                         remaining_ids,
+                        surface_areas=surface_areas,
                     )
                 )
         selected_assignment = self._assignment_with_surfaces(
             applied_assignment,
             source_surface_ids,
+            surface_areas=surface_areas,
         )
         next_assignments = [*retained_assignments, selected_assignment]
         try:
@@ -1072,26 +1263,12 @@ class SurfaceTextureGenerationWorkspace(QWidget):
 
         self._texture_atlas_entry_cache.clear()
         self._refresh_texture_atlases()
-        cleanup_failure_count = self._delete_orphaned_assignment_assets(
-            removed_assignments
-        )
-        removed_assignment_ids = self._unretained_assignment_ids(
-            removed_assignments
-        )
-        if removed_assignment_ids:
-            self.assignments_removed.emit(removed_assignment_ids)
         texture_width, texture_height = texture_size
         self.status_label.setText(
             f"Applied the {texture_width} x {texture_height} texture "
             f"to {len(selected_assignment.surface_ids)} "
             f"{selected_assignment.surface_type} surface(s)."
         )
-        if cleanup_failure_count:
-            self.status_label.setText(
-                self.status_label.text()
-                + f" {cleanup_failure_count} unused texture file(s) could not "
-                "be deleted."
-            )
         self._emit_data_changed()
         self.surface_content_changed.emit()
         self._sync_controls()
@@ -1188,12 +1365,19 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             )
             self.surface_view.clear_surface_textures()
         self.surface_view.set_levels(self._levels)
+        assignments_changed = bool(
+            replace_preview_model
+            and self._reconcile_assignment_targets(self._levels)
+        )
         self._restore_viewer_state()
         self._restore_assignment_textures()
         self._refresh_texture_atlases()
         self._sync_selection_status()
         self._sync_controls()
         self._level_sync_signature = next_signature
+        if assignments_changed:
+            self._emit_data_changed()
+            self.surface_content_changed.emit()
 
     def _migrate_legacy_meshy_pbr_alignment(self) -> int:
         """Point pre-v1 Meshy families at versioned aligned derivatives."""
@@ -1898,6 +2082,22 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         prepared_outputs: Sequence[_PreparedSurfaceTextureOutput] | None = None,
         saved_outputs: Sequence[_SavedSurfaceTextureOutput] | None = None,
     ) -> bool:
+        surface_by_id = self._all_existing_surfaces_by_id()
+        if any(
+            (surface := surface_by_id.get(surface_id)) is None
+            or surface.surface_type != request.surface_type
+            for surface_id in request.surface_ids
+        ):
+            self._discard_saved_outputs(tuple(saved_outputs or ()))
+            self._handle_generation_failed(
+                "The target surfaces changed before the generated texture "
+                "could be applied."
+            )
+            return False
+        surface_areas = {
+            surface_id: float(surface.area_square_meters)
+            for surface_id, surface in surface_by_id.items()
+        }
         if prepared_outputs is None and saved_outputs is None:
             try:
                 raw_outputs = _build_surface_texture_outputs(
@@ -1945,8 +2145,11 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                     for variant in saved_output.variants
                     if variant.resolution == selected_resolution
                 )
-                area_m2 = self.surface_view.get_combined_surface_area(
-                    saved_output.surface_ids
+                area_m2 = float(
+                    sum(
+                        surface_areas.get(surface_id, 0.0)
+                        for surface_id in saved_output.surface_ids
+                    )
                 )
                 assignments.append(
                     SurfaceTextureAssignment(
@@ -1986,8 +2189,9 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             return False
 
         try:
-            retained_assignments, removed_assignments = (
-                self._replace_assignments_for_surfaces(assignments)
+            retained_assignments = self._replace_assignments_for_surfaces(
+                assignments,
+                surface_areas=surface_areas,
             )
             for saved_output, assignment in zip(
                 saved_output_items,
@@ -2020,9 +2224,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._restored_assignment_texture_signature = None
         self._texture_atlas_entry_cache.clear()
         self._refresh_texture_atlases()
-        cleanup_failure_count = self._delete_orphaned_assignment_assets(
-            removed_assignments
-        )
         status = (
             f"Applied {request.display_name!r} to {len(request.surface_ids)} "
             f"{request.surface_type} surface(s)."
@@ -2032,18 +2233,8 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 f"{request.surface_type} surface(s)."
             )
         )
-        if cleanup_failure_count:
-            status += (
-                f" {cleanup_failure_count} replaced texture file(s) could not "
-                "be deleted."
-        )
         self.status_label.setText(status)
         self._emit_data_changed()
-        removed_assignment_ids = self._unretained_assignment_ids(
-            removed_assignments
-        )
-        if removed_assignment_ids:
-            self.assignments_removed.emit(removed_assignment_ids)
         for assignment in assignments:
             self.generation_completed.emit(assignment)
         self.surface_content_changed.emit()
@@ -2053,17 +2244,22 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     def _replace_assignments_for_surfaces(
         self,
         replacements: Sequence[SurfaceTextureAssignment],
-    ) -> tuple[
-        list[SurfaceTextureAssignment],
-        list[SurfaceTextureAssignment],
-    ]:
+        *,
+        surface_areas: Mapping[str, float] | None = None,
+    ) -> list[SurfaceTextureAssignment]:
+        """Retarget surfaces while preserving displaced texture families."""
+
+        current_surface_areas = (
+            self._all_existing_surface_areas()
+            if surface_areas is None
+            else surface_areas
+        )
         replaced_surface_ids = {
             surface_id
             for assignment in replacements
             for surface_id in assignment.surface_ids
         }
         retained: list[SurfaceTextureAssignment] = []
-        removed: list[SurfaceTextureAssignment] = []
         for assignment in self._data.assignments:
             remaining_surface_ids = tuple(
                 surface_id
@@ -2074,32 +2270,52 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 retained.append(assignment)
                 continue
             if not remaining_surface_ids:
-                removed.append(assignment)
+                retained.append(
+                    self._assignment_with_surfaces(
+                        assignment,
+                        (),
+                        surface_areas=current_surface_areas,
+                    )
+                )
                 continue
             retained.append(
                 self._assignment_with_surfaces(
                     assignment,
                     remaining_surface_ids,
+                    surface_areas=current_surface_areas,
                 )
             )
-        return retained, removed
+        return retained
 
     def _assignment_with_surfaces(
         self,
         assignment: SurfaceTextureAssignment,
         surface_ids: Sequence[str],
+        *,
+        surface_areas: Mapping[str, float] | None = None,
     ) -> SurfaceTextureAssignment:
         """Return assignment metadata recomputed for one surface group."""
 
         normalized_ids = tuple(dict.fromkeys(str(value) for value in surface_ids))
-        area_m2 = self.surface_view.get_combined_surface_area(normalized_ids)
+        current_surface_areas = (
+            self._all_existing_surface_areas()
+            if surface_areas is None
+            else surface_areas
+        )
+        area_m2 = float(
+            sum(
+                current_surface_areas.get(surface_id, 0.0)
+                for surface_id in normalized_ids
+            )
+        )
         return replace(
             assignment,
             surface_ids=normalized_ids,
             combined_area_m2=area_m2,
-            area_description=(
-                f"{len(normalized_ids)} {assignment.surface_type} "
-                f"surface(s), {area_m2:.2f} m²"
+            area_description=_build_surface_area_description(
+                assignment.surface_type,
+                normalized_ids,
+                area_m2,
             ),
         )
 
@@ -2212,12 +2428,16 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             if worker is not None:
                 worker.discard_unclaimed_outputs()
             return
-        missing_targets = tuple(
+        current_surfaces = self._all_existing_surfaces_by_id()
+        invalid_targets = tuple(
             surface_id
             for surface_id in raw_request.surface_ids
-            if self.surface_view.get_surface(surface_id) is None
+            if (
+                (surface := current_surfaces.get(surface_id)) is None
+                or surface.surface_type != raw_request.surface_type
+            )
         )
-        if missing_targets:
+        if invalid_targets:
             message = (
                 "The target surfaces changed before the generated texture "
                 "could be applied."
@@ -3627,6 +3847,19 @@ def _surface_texture_display_name(
     return (
         assignment.display_name
         or _default_surface_texture_name(assignment.surface_type)
+    )
+
+
+def _build_surface_area_description(
+    surface_type: str,
+    surface_ids: Sequence[str],
+    area_m2: float,
+) -> str:
+    """Format consistent assignment count and area metadata."""
+
+    return (
+        f"{len(surface_ids)} {surface_type} surface(s), "
+        f"{float(area_m2):.2f} m²"
     )
 
 

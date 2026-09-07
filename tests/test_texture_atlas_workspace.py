@@ -28,7 +28,7 @@ from PySide6.QtGui import (
     QWheelEvent,
 )
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QWidget
 
 import housemaker.texture_atlas_workspace as texture_atlas_workspace_module
 from housemaker.texture_atlas_state import (
@@ -50,9 +50,8 @@ from housemaker.texture_atlas_workspace import (
     ATLAS_MAP_NORMAL,
     ATLAS_MAP_ROUGHNESS,
     ATLAS_MAP_TYPES,
-    OBJECT_SCENE_REQUIRED_UNPACKED_COLOR,
-    OBJECT_SCENE_REQUIRED_UNPACKED_ROLE,
     AtlasObjectTextureSource,
+    AtlasSurfaceTextureEntry,
     TextureAtlasWorkspace,
     _build_texture_source_mime_data,
     build_atlas_wall_texture_source_id,
@@ -174,6 +173,7 @@ def _wall_source(
     directory: str | Path,
     size: tuple[int, int] = (12, 8),
     color: tuple[int, int, int, int] = (180, 80, 30, 255),
+    surface_usage_count: int = 0,
 ) -> AtlasObjectTextureSource:
     texture_path = Path(directory) / f"wall-{assignment_id}.png"
     pixels = np.empty((size[1], size[0], 4), dtype=np.uint8)
@@ -188,6 +188,7 @@ def _wall_source(
         physical_texture_path=texture_path,
         fit_to_square=True,
         supports_resolution_changes=False,
+        surface_usage_count=surface_usage_count,
     )
 
 
@@ -309,6 +310,365 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.assertIsNone(
             get_atlas_wall_texture_assignment_id("surface-wall-texture:")
         )
+
+    def test_object_and_surface_textures_use_separate_lists(self) -> None:
+        object_source = _source(
+            "chair",
+            directory=self._temporary_directory.name,
+        )
+        surface_source = _wall_source(
+            "plaster",
+            directory=self._temporary_directory.name,
+            surface_usage_count=3,
+        )
+
+        self.workspace.set_object_texture_sources(
+            (object_source, surface_source)
+        )
+
+        self.assertEqual(self.workspace.object_textures_label.text(), "Object textures")
+        self.assertEqual(
+            self.workspace.surface_textures_label.text(),
+            "Surface textures",
+        )
+        self.assertEqual(self.workspace.object_list.count(), 1)
+        self.assertEqual(self.workspace.surface_list.count(), 1)
+        self.assertIn("Chair", self.workspace.object_list.item(0).text())
+        self.assertNotIn("Plaster", self.workspace.object_list.item(0).text())
+        self.assertIn("3 surfaces", self.workspace.surface_list.item(0).text())
+
+    def test_missing_surface_texture_keeps_its_name_and_usage_count(self) -> None:
+        source_id = build_atlas_wall_texture_source_id("missing-plaster")
+
+        self.workspace.set_object_texture_sources(
+            (),
+            surface_texture_entries=(
+                AtlasSurfaceTextureEntry(
+                    source_id=source_id,
+                    display_name="Missing plaster",
+                    surface_usage_count=4,
+                ),
+            ),
+        )
+
+        self.assertEqual(self.workspace.object_list.count(), 0)
+        self.assertEqual(self.workspace.surface_list.count(), 1)
+        item = self.workspace.surface_list.item(0)
+        self.assertEqual(item.data(Qt.ItemDataRole.UserRole), source_id)
+        self.assertIn("Missing plaster", item.text())
+        self.assertIn("4 surfaces", item.text())
+        self.assertFalse(self.workspace.place_assign_button.isEnabled())
+
+    def test_reserved_source_id_is_an_object_when_placeable_object_exists(
+        self,
+    ) -> None:
+        object_id = build_atlas_wall_texture_source_id("real-object")
+        object_source = _source(
+            object_id,
+            directory=self._temporary_directory.name,
+        )
+
+        self.workspace.set_object_texture_sources(
+            (object_source,),
+            placeable_objects={object_id: "Reserved ID object"},
+        )
+
+        self.assertEqual(self.workspace.object_list.count(), 1)
+        self.assertEqual(self.workspace.surface_list.count(), 0)
+        self.assertEqual(self.workspace.selected_object_texture_id, object_id)
+
+    def test_removing_selected_source_leaves_lists_unselected(self) -> None:
+        first = _source(
+            "first-object",
+            directory=self._temporary_directory.name,
+        )
+        second = _source(
+            "second-object",
+            directory=self._temporary_directory.name,
+        )
+        self.workspace.set_object_texture_sources((first, second))
+        self.workspace.object_list.object_clicked.emit(
+            second.object_id,
+            Qt.MouseButton.LeftButton,
+        )
+        self.workspace.set_object_texture_sources((first,))
+
+        self.assertIsNone(self.workspace.selected_object_id)
+        self.assertIsNone(self.workspace.selected_object_texture_id)
+        self.assertIsNone(self.workspace.selected_surface_texture_id)
+        self.assertEqual(self.workspace.object_list.currentRow(), -1)
+        self.assertEqual(self.workspace.surface_list.currentRow(), -1)
+
+    def test_source_action_tracks_typed_selection(self) -> None:
+        data = TextureAtlasData()
+        data.create_atlas("Scene", 2048, atlas_id="atlas-scene")
+        self.workspace.set_data(data)
+        object_source = _source(
+            "chair",
+            directory=self._temporary_directory.name,
+        )
+        surface_source = _wall_source(
+            "plaster",
+            directory=self._temporary_directory.name,
+        )
+        self.workspace.set_object_texture_sources(
+            (object_source, surface_source)
+        )
+        place_requests = Mock()
+        assign_requests = Mock()
+        object_selections = Mock()
+        surface_selections = Mock()
+        self.workspace.object_place_requested.connect(place_requests)
+        self.workspace.surface_assign_requested.connect(assign_requests)
+        self.workspace.object_texture_selected.connect(object_selections)
+        self.workspace.surface_texture_selected.connect(surface_selections)
+
+        self.assertEqual(self.workspace.place_assign_button.text(), "Place")
+        self.assertEqual(
+            self.workspace.selected_object_texture_id,
+            object_source.object_id,
+        )
+        self.assertFalse(hasattr(self.workspace, "assign_object_button"))
+        self.assertFalse(hasattr(self.workspace, "unassign_object_button"))
+        self.workspace._handle_object_mouse_click(
+            object_source.object_id,
+            Qt.MouseButton.LeftButton,
+        )
+        object_selections.assert_called_once_with(object_source.object_id)
+        self.workspace.place_assign_button.click()
+        place_requests.assert_called_once_with(object_source.object_id)
+
+        self.workspace.surface_list.setCurrentRow(0)
+        self.assertEqual(self.workspace.place_assign_button.text(), "Assign")
+        self.assertIsNone(self.workspace.selected_object_texture_id)
+        self.assertEqual(
+            self.workspace.selected_surface_texture_id,
+            surface_source.object_id,
+        )
+        self.assertTrue(self.workspace.place_assign_button.isEnabled())
+        surface_selections.assert_called_once_with(surface_source.object_id)
+        self.workspace.place_assign_button.click()
+        assign_requests.assert_called_once_with(surface_source.object_id)
+
+    def test_remove_button_requests_typed_semantic_source_removal(self) -> None:
+        object_source = _source(
+            "chair",
+            directory=self._temporary_directory.name,
+        )
+        surface_source = _wall_source(
+            "plaster",
+            directory=self._temporary_directory.name,
+        )
+        self.workspace.set_object_texture_sources(
+            (object_source, surface_source),
+            placeable_objects={"geometry-only": "Geometry only"},
+        )
+        removal_requests = Mock()
+        self.workspace.source_remove_requested.connect(removal_requests)
+
+        self.assertGreater(
+            self.workspace.remove_source_button.x(),
+            self.workspace.place_assign_button.x(),
+        )
+        self.workspace.remove_source_button.click()
+        removal_requests.assert_called_once_with("object", "chair")
+
+        self.workspace.object_list.setCurrentRow(1)
+        self.assertTrue(self.workspace.remove_source_button.isEnabled())
+        self.workspace.remove_source_button.click()
+        removal_requests.assert_called_with("object", "geometry-only")
+
+        self.workspace.surface_list.setCurrentRow(0)
+        self.workspace.remove_source_button.click()
+        removal_requests.assert_called_with(
+            "surface",
+            surface_source.object_id,
+        )
+
+    def test_scene_bound_sources_are_green_only_in_lists(
+        self,
+    ) -> None:
+        object_source = _source(
+            "chair",
+            directory=self._temporary_directory.name,
+        )
+        surface_source = _wall_source(
+            "plaster",
+            directory=self._temporary_directory.name,
+        )
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Scene", 2048, atlas_id="scene")
+        data.assign_object(
+            atlas.atlas_id,
+            object_source.object_id,
+            object_source.texture_path,
+            object_source.texture_resolution,
+        )
+        data.assign_object(
+            atlas.atlas_id,
+            surface_source.object_id,
+            surface_source.texture_path,
+            surface_source.texture_resolution,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources(
+            (object_source, surface_source),
+            placeable_objects={"geometry-only": "Geometry only"},
+        )
+
+        self.workspace.set_scene_bound_source_ids(
+            (
+                object_source.object_id,
+                surface_source.object_id,
+                "geometry-only",
+            )
+        )
+
+        expected_color = texture_atlas_workspace_module.SCENE_BOUND_SOURCE_COLOR
+        self.assertEqual(
+            self.workspace.object_list.item(0).foreground().color(),
+            expected_color,
+        )
+        self.assertEqual(
+            self.workspace.object_list.item(1).foreground().color(),
+            expected_color,
+        )
+        self.assertEqual(
+            self.workspace.surface_list.item(0).foreground().color(),
+            expected_color,
+        )
+        for preview in self.workspace.map_previews.values():
+            self.assertEqual(
+                preview._green_outline_source_ids,
+                frozenset(),
+            )
+
+        self.workspace.set_scene_bound_source_ids((surface_source.object_id,))
+
+        self.assertNotEqual(
+            self.workspace.object_list.item(0).foreground().color(),
+            expected_color,
+        )
+        self.assertEqual(
+            self.workspace.surface_list.item(0).foreground().color(),
+            expected_color,
+        )
+
+    def test_green_outline_sources_are_independent_from_scene_bound_lists(
+        self,
+    ) -> None:
+        object_source = _source(
+            "chair",
+            directory=self._temporary_directory.name,
+        )
+        surface_source = _wall_source(
+            "plaster",
+            directory=self._temporary_directory.name,
+        )
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Scene", 2048, atlas_id="scene")
+        for source in (object_source, surface_source):
+            data.assign_object(
+                atlas.atlas_id,
+                source.object_id,
+                source.texture_path,
+                source.texture_resolution,
+            )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources(
+            (object_source, surface_source),
+        )
+        self.workspace.set_scene_bound_source_ids((object_source.object_id,))
+
+        self.workspace.set_green_outline_source_ids(
+            ("", surface_source.object_id, surface_source.object_id)
+        )
+
+        expected_color = texture_atlas_workspace_module.SCENE_BOUND_SOURCE_COLOR
+        self.assertEqual(
+            self.workspace.object_list.item(0).foreground().color(),
+            expected_color,
+        )
+        self.assertNotEqual(
+            self.workspace.surface_list.item(0).foreground().color(),
+            expected_color,
+        )
+        for preview in self.workspace.map_previews.values():
+            self.assertEqual(
+                preview._green_outline_source_ids,
+                frozenset({surface_source.object_id}),
+            )
+
+        self.workspace.set_green_outline_source_ids(())
+
+        for preview in self.workspace.map_previews.values():
+            self.assertEqual(preview._green_outline_source_ids, frozenset())
+
+    def test_geometry_only_object_can_be_previewed_and_placed(self) -> None:
+        data = TextureAtlasData()
+        data.create_atlas("Objects", 2048, atlas_id="objects")
+        textured_source = _source(
+            "chair",
+            directory=self._temporary_directory.name,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources(
+            (textured_source,),
+            placeable_objects={
+                textured_source.object_id: textured_source.object_name,
+                "geometry-cabinet": "Geometry cabinet",
+            },
+        )
+        preview_requests = Mock()
+        textured_preview_requests = Mock()
+        place_requests = Mock()
+        self.workspace.placeable_object_preview_requested.connect(
+            preview_requests
+        )
+        self.workspace.object_preview_requested.connect(
+            textured_preview_requests
+        )
+        self.workspace.object_place_requested.connect(place_requests)
+
+        self.assertEqual(self.workspace.object_list.count(), 2)
+        geometry_item = self.workspace.object_list.item(1)
+        self.assertEqual(
+            geometry_item.text(),
+            "[No texture] Geometry cabinet",
+        )
+        self.assertFalse(
+            bool(geometry_item.flags() & Qt.ItemFlag.ItemIsDragEnabled)
+        )
+
+        self.workspace.object_list.setCurrentRow(1)
+
+        self.assertEqual(
+            self.workspace.selected_object_texture_id,
+            "geometry-cabinet",
+        )
+        self.assertTrue(self.workspace.place_assign_button.isEnabled())
+        preview_requests.assert_called_once_with("geometry-cabinet")
+        textured_preview_requests.assert_not_called()
+
+        self.workspace.place_assign_button.click()
+
+        place_requests.assert_called_once_with("geometry-cabinet")
+        atlas = self.workspace.selected_atlas
+        assert atlas is not None
+        self.assertEqual(atlas.placements, [])
+
+    def test_atlas_3d_preview_can_be_embedded_in_second_menu_column(self) -> None:
+        preview_widget = QWidget()
+
+        self.workspace.set_object_preview_widget(preview_widget)
+
+        self.assertIs(self.workspace.object_preview_widget, preview_widget)
+        self.assertIs(
+            preview_widget.parentWidget(),
+            self.workspace.object_preview_container,
+        )
+        self.assertFalse(self.workspace.object_preview_placeholder.isVisible())
+        self.assertEqual(self.workspace.content_splitter.count(), 3)
 
     def test_source_preview_pixels_are_immutable_after_normalization(self) -> None:
         source = _source(
@@ -451,7 +811,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.workspace.set_data(data)
         self.workspace.set_object_texture_sources([source])
 
-        self.workspace.assign_object_button.click()
+        self.workspace._assign_selected_object()
 
         materialized = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
         assert materialized is not None
@@ -627,7 +987,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.workspace.set_data(data)
         self.workspace.set_object_texture_sources([source])
 
-        self.workspace.assign_object_button.click()
+        self.workspace._assign_selected_object()
 
         preview = source.get_preview_image(ATLAS_MAP_NORMAL)
         output_path = root / build_texture_atlas_map_image_relative_path(
@@ -703,7 +1063,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         )
         self.workspace.set_data(data)
         self.workspace.set_object_texture_sources([source])
-        self.workspace.assign_object_button.click()
+        self.workspace._assign_selected_object()
         output_paths = tuple(
             Path(self._temporary_directory.name)
             / build_texture_atlas_map_image_relative_path(atlas.atlas_id, map_type)
@@ -728,7 +1088,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         )
         self.workspace.set_data(data)
         self.workspace.set_object_texture_sources([source])
-        self.workspace.assign_object_button.click()
+        self.workspace._assign_selected_object()
         output_paths = tuple(
             Path(self._temporary_directory.name)
             / build_texture_atlas_map_image_relative_path(atlas.atlas_id, map_type)
@@ -986,6 +1346,36 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.assertEqual(self.workspace.object_list.count(), 1)
         self.assertIn("remains available", self.workspace.status_label.text())
 
+    def test_removing_last_scene_texture_deletes_custom_atlas_png(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Custom", 2048, atlas_id="atlas-custom")
+        source = _source("chair", directory=self._temporary_directory.name)
+        data.assign_object(
+            atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+        )
+        custom_relative_path = "texture_atlases/custom-render.png"
+        custom_path = (
+            Path(self._temporary_directory.name) / custom_relative_path
+        )
+        custom_path.parent.mkdir(parents=True, exist_ok=True)
+        custom_path.write_bytes(b"obsolete atlas")
+        atlas.image_path = custom_relative_path
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([source])
+
+        removed_count = self.workspace.remove_scene_texture_from_atlases(
+            source.object_id
+        )
+
+        self.assertEqual(removed_count, 1)
+        self.assertFalse(custom_path.exists())
+        updated = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert updated is not None
+        self.assertIsNone(updated.image_path)
+
     def test_scene_texture_removal_failure_restores_state_and_pngs(self) -> None:
         data = TextureAtlasData()
         atlas = data.create_atlas("Room", 2048, atlas_id="atlas-a")
@@ -1053,7 +1443,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
 
         for row in range(4):
             self.workspace.object_list.setCurrentRow(row)
-            self.workspace.assign_object_button.click()
+            self.workspace._assign_selected_object()
 
         packed = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
         assert packed is not None
@@ -1080,7 +1470,11 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.workspace.set_data(data)
         self.workspace.set_object_texture_sources([wall_source])
 
-        self.workspace.assign_object_button.click()
+        self.assertTrue(
+            self.workspace.assign_source_to_selected_atlas(
+                wall_source.object_id
+            )
+        )
 
         packed = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
         assert packed is not None
@@ -1347,7 +1741,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         )
         self.assertEqual(selectability_checks, [(source_id, 1024)])
         self.assertEqual(resolution_changes, [(source_id, 1024)])
-        self.assertIn("1024 x 1024", self.workspace.object_list.item(0).text())
+        self.assertIn("1024 x 1024", self.workspace.surface_list.item(0).text())
 
     # ### Atlas zoom tests ###
     def test_ctrl_wheel_zoom_is_cursor_anchored_without_resizing(self) -> None:
@@ -1544,12 +1938,12 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         _qt_application.processEvents()
 
         row_center = QPointF(
-            self.workspace.object_list.visualItemRect(
-                self.workspace.object_list.item(0)
+            self.workspace.surface_list.visualItemRect(
+                self.workspace.surface_list.item(0)
             ).center()
         )
         list_wheel = _wheel_event(row_center, 120)
-        self.workspace.object_list.wheelEvent(list_wheel)
+        self.workspace.surface_list.wheelEvent(list_wheel)
 
         enlarged = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
         assert enlarged is not None
@@ -2198,7 +2592,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
 
         for should_be_assigned in (False, True):
             if should_be_assigned:
-                self.workspace.assign_object_button.click()
+                self.workspace._assign_selected_object()
             with patch(
                 "housemaker.texture_atlas_workspace.QDrag"
             ) as drag_class:
@@ -2351,7 +2745,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         )
 
         self.workspace._select_object_row("resizable")
-        self.workspace.unassign_object_button.click()
+        self.workspace.remove_selected_texture_from_atlas()
         after_removal = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
         assert after_removal is not None
         fixed_placement = after_removal.placement_for_object("fixed")
@@ -2624,7 +3018,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.workspace.set_object_texture_sources(
             [_source("lamp", directory=self._temporary_directory.name)]
         )
-        self.workspace.assign_object_button.click()
+        self.workspace._assign_selected_object()
 
         self.workspace.set_object_texture_sources(
             [
@@ -2635,7 +3029,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
                 )
             ]
         )
-        self.workspace.assign_object_button.click()
+        self.workspace._assign_selected_object()
 
         placement = self.workspace.get_data().atlas_by_id(
             atlas.atlas_id
@@ -2654,7 +3048,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             color=(30, 120, 210, 255),
         )
         self.workspace.set_object_texture_sources([old_source])
-        self.workspace.assign_object_button.click()
+        self.workspace._assign_selected_object()
         before = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
         assert before is not None
         old_placement = before.placement_for_object("chair")
@@ -3165,8 +3559,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             self.workspace.object_list.item(0).text(),
             "[Missing] deleted-chair",
         )
-        self.assertFalse(self.workspace.assign_object_button.isEnabled())
-        self.assertTrue(self.workspace.unassign_object_button.isEnabled())
+        self.assertTrue(self.workspace.remove_source_button.isEnabled())
 
     def test_missing_placement_can_be_removed_before_another_assignment(
         self,
@@ -3183,7 +3576,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.workspace.set_object_texture_sources([])
 
         self.workspace.object_list.setCurrentRow(0)
-        self.workspace.unassign_object_button.click()
+        self.workspace.remove_selected_texture_from_atlas()
 
         cleaned = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
         assert cleaned is not None
@@ -3198,7 +3591,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         )
         self.workspace.set_object_texture_sources([replacement])
         self.workspace.object_list.setCurrentRow(0)
-        self.workspace.assign_object_button.click()
+        self.workspace._assign_selected_object()
 
         updated = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
         assert updated is not None
@@ -3233,7 +3626,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.workspace.data_changed.connect(changes.append)
 
         self.workspace.object_list.setCurrentRow(0)
-        self.workspace.unassign_object_button.click()
+        self.workspace.remove_selected_texture_from_atlas()
 
         updated = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
         assert updated is not None
@@ -3518,12 +3911,320 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             "housemaker.texture_atlas_workspace.write_texture_atlas_png",
             side_effect=ValueError("write failed"),
         ):
-            self.workspace.assign_object_button.click()
+            self.workspace._assign_selected_object()
 
         loaded = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
         assert loaded is not None
         self.assertEqual(loaded.placements, [])
         self.assertEqual(self.workspace.status_label.text(), "write failed")
+
+    def test_source_assignment_queries_report_membership_and_capacity(
+        self,
+    ) -> None:
+        first = _source(
+            "first",
+            directory=self._temporary_directory.name,
+            resolution=2048,
+        )
+        second = _source(
+            "second",
+            directory=self._temporary_directory.name,
+            resolution=2048,
+        )
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Full", 2048, atlas_id="atlas-a")
+        data.assign_object(
+            atlas.atlas_id,
+            first.object_id,
+            first.texture_path,
+            first.texture_resolution,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources((first, second))
+
+        self.assertTrue(
+            self.workspace.is_source_assigned_to_any_atlas(first.object_id)
+        )
+        self.assertFalse(
+            self.workspace.is_source_assigned_to_any_atlas(second.object_id)
+        )
+        self.assertTrue(
+            self.workspace.can_assign_source_to_selected_atlas(first.object_id)
+        )
+        self.assertFalse(
+            self.workspace.can_assign_source_to_selected_atlas(second.object_id)
+        )
+
+    def test_assignment_callback_rejection_restores_data_and_png(self) -> None:
+        first = _source("first", directory=self._temporary_directory.name)
+        second = _source("second", directory=self._temporary_directory.name)
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Atomic", 2048, atlas_id="atlas-a")
+        data.assign_object(
+            atlas.atlas_id,
+            first.object_id,
+            first.texture_path,
+            first.texture_resolution,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources((first, second))
+        selected_atlas = self.workspace.selected_atlas
+        assert selected_atlas is not None
+        self.workspace._materialize_atlas(selected_atlas)
+        before_data = self.workspace.get_data()
+        assert selected_atlas.image_path is not None
+        png_path = (
+            Path(self._temporary_directory.name) / selected_atlas.image_path
+        )
+        before_png = png_path.read_bytes()
+        callback = Mock(return_value=False)
+        changes = Mock()
+        self.workspace.data_changed.connect(changes)
+
+        assigned = self.workspace.assign_source_to_selected_atlas(
+            second.object_id,
+            callback,
+        )
+
+        self.assertFalse(assigned)
+        callback.assert_called_once_with()
+        self.assertEqual(self.workspace.get_data(), before_data)
+        self.assertEqual(png_path.read_bytes(), before_png)
+        self.assertEqual(changes.call_count, 0)
+
+    def test_transactional_source_removal_makes_room_in_full_atlas(self) -> None:
+        old_source = _source(
+            "old",
+            directory=self._temporary_directory.name,
+            resolution=2048,
+            color=(180, 40, 20, 255),
+        )
+        new_source = _source(
+            "new",
+            directory=self._temporary_directory.name,
+            resolution=2048,
+            color=(20, 80, 200, 255),
+        )
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Full", 2048, atlas_id="atlas-a")
+        data.assign_object(
+            atlas.atlas_id,
+            old_source.object_id,
+            old_source.texture_path,
+            old_source.texture_resolution,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources((old_source, new_source))
+
+        self.assertFalse(
+            self.workspace.can_assign_source_to_selected_atlas(
+                new_source.object_id
+            )
+        )
+        self.assertTrue(
+            self.workspace.can_assign_source_to_selected_atlas(
+                new_source.object_id,
+                source_ids_to_remove=(old_source.object_id,),
+            )
+        )
+
+        assigned = self.workspace.assign_source_to_selected_atlas(
+            new_source.object_id,
+            source_ids_to_remove=(old_source.object_id,),
+        )
+
+        self.assertTrue(assigned)
+        updated_data = self.workspace.get_data()
+        self.assertEqual(len(updated_data.atlases), 1)
+        updated_atlas = updated_data.atlas_by_id(atlas.atlas_id)
+        assert updated_atlas is not None
+        self.assertIsNone(
+            updated_atlas.placement_for_object(old_source.object_id)
+        )
+        self.assertIsNotNone(
+            updated_atlas.placement_for_object(new_source.object_id)
+        )
+
+    def test_transactional_removal_rejection_restores_all_atlas_pngs(
+        self,
+    ) -> None:
+        old_source = _source(
+            "old",
+            directory=self._temporary_directory.name,
+            resolution=2048,
+            color=(180, 40, 20, 255),
+        )
+        new_source = _source(
+            "new",
+            directory=self._temporary_directory.name,
+            resolution=2048,
+            color=(20, 80, 200, 255),
+        )
+        data = TextureAtlasData()
+        first_atlas = data.create_atlas("First", 2048, atlas_id="atlas-a")
+        second_atlas = data.create_atlas("Second", 2048, atlas_id="atlas-b")
+        for atlas in (first_atlas, second_atlas):
+            data.assign_object(
+                atlas.atlas_id,
+                old_source.object_id,
+                old_source.texture_path,
+                old_source.texture_resolution,
+            )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources((old_source, new_source))
+        for atlas in self.workspace._data.atlases:
+            self.workspace._materialize_atlas(atlas)
+        before_data = self.workspace.get_data()
+        png_paths = tuple(
+            Path(self._temporary_directory.name) / atlas.image_path
+            for atlas in self.workspace._data.atlases
+            if atlas.image_path is not None
+        )
+        before_pngs = {path: path.read_bytes() for path in png_paths}
+        callback = Mock(return_value=False)
+        changes = Mock()
+        self.workspace.data_changed.connect(changes)
+
+        assigned = self.workspace.assign_source_to_selected_atlas(
+            new_source.object_id,
+            callback,
+            source_ids_to_remove=(old_source.object_id,),
+        )
+
+        self.assertFalse(assigned)
+        callback.assert_called_once_with()
+        self.assertEqual(self.workspace.get_data(), before_data)
+        self.assertEqual(
+            {path: path.read_bytes() for path in png_paths},
+            before_pngs,
+        )
+        self.assertEqual(changes.call_count, 0)
+
+    def test_assignment_materialization_failure_skips_callback(self) -> None:
+        source = _source("chair", directory=self._temporary_directory.name)
+        data = TextureAtlasData()
+        data.create_atlas("Atomic", 2048, atlas_id="atlas-a")
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources((source,))
+        before_data = self.workspace.get_data()
+        callback = Mock(return_value=True)
+
+        with patch.object(
+            self.workspace,
+            "_materialize_atlas",
+            side_effect=OSError("write failed"),
+        ):
+            assigned = self.workspace.assign_source_to_selected_atlas(
+                source.object_id,
+                callback,
+            )
+
+        self.assertFalse(assigned)
+        callback.assert_not_called()
+        self.assertEqual(self.workspace.get_data(), before_data)
+
+    def test_create_atlas_and_assign_source_uses_unique_name_and_resolution(
+        self,
+    ) -> None:
+        source = _source("chair", directory=self._temporary_directory.name)
+        data = TextureAtlasData()
+        data.create_atlas("Atlas", 2048, atlas_id="atlas-a")
+        data.create_atlas("Atlas 2", 4096, atlas_id="atlas-b")
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources((source,))
+        callback = Mock(return_value=True)
+        selected_changes = Mock()
+        self.workspace.selected_atlas_changed.connect(selected_changes)
+
+        created = self.workspace.create_atlas_and_assign_source(
+            source.object_id,
+            2048,
+            callback,
+        )
+
+        self.assertTrue(created)
+        callback.assert_called_once_with()
+        selected_atlas = self.workspace.selected_atlas
+        assert selected_atlas is not None
+        self.assertEqual(selected_atlas.name, "Atlas 3")
+        self.assertEqual(selected_atlas.resolution, 2048)
+        self.assertIsNotNone(
+            selected_atlas.placement_for_object(source.object_id)
+        )
+        self.assertTrue(
+            self.workspace.is_source_assigned_to_any_atlas(source.object_id)
+        )
+        selected_changes.assert_called_once()
+
+    def test_create_atlas_transaction_removes_stale_sources_everywhere(
+        self,
+    ) -> None:
+        old_source = _source("old", directory=self._temporary_directory.name)
+        new_source = _source("new", directory=self._temporary_directory.name)
+        data = TextureAtlasData()
+        old_atlas = data.create_atlas("Existing", 2048, atlas_id="atlas-a")
+        data.assign_object(
+            old_atlas.atlas_id,
+            old_source.object_id,
+            old_source.texture_path,
+            old_source.texture_resolution,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources((old_source, new_source))
+        selected_atlas = self.workspace.selected_atlas
+        assert selected_atlas is not None
+        self.workspace._materialize_atlas(selected_atlas)
+        assert selected_atlas.image_path is not None
+        old_png_path = (
+            Path(self._temporary_directory.name) / selected_atlas.image_path
+        )
+
+        created = self.workspace.create_atlas_and_assign_source(
+            new_source.object_id,
+            source_ids_to_remove=(old_source.object_id,),
+        )
+
+        self.assertTrue(created)
+        updated_data = self.workspace.get_data()
+        self.assertEqual(len(updated_data.atlases), 2)
+        emptied_atlas = updated_data.atlas_by_id(old_atlas.atlas_id)
+        assert emptied_atlas is not None
+        self.assertEqual(emptied_atlas.placements, [])
+        self.assertIsNone(emptied_atlas.image_path)
+        self.assertFalse(old_png_path.exists())
+        new_atlas = self.workspace.selected_atlas
+        assert new_atlas is not None
+        self.assertIsNotNone(
+            new_atlas.placement_for_object(new_source.object_id)
+        )
+
+    def test_create_atlas_callback_rejection_restores_everything(self) -> None:
+        source = _source("chair", directory=self._temporary_directory.name)
+        self.workspace.set_object_texture_sources((source,))
+        before_files = {
+            path.relative_to(self._temporary_directory.name): path.read_bytes()
+            for path in Path(self._temporary_directory.name).rglob("*")
+            if path.is_file()
+        }
+        callback = Mock(return_value=False)
+        changes = Mock()
+        self.workspace.data_changed.connect(changes)
+
+        created = self.workspace.create_atlas_and_assign_source(
+            source.object_id,
+            commit_callback=callback,
+        )
+
+        after_files = {
+            path.relative_to(self._temporary_directory.name): path.read_bytes()
+            for path in Path(self._temporary_directory.name).rglob("*")
+            if path.is_file()
+        }
+        self.assertFalse(created)
+        callback.assert_called_once_with()
+        self.assertEqual(self.workspace.get_data().atlases, [])
+        self.assertEqual(after_files, before_files)
+        self.assertEqual(changes.call_count, 0)
 
     def test_lazy_png_failure_and_subsequent_materialization(self) -> None:
         data = TextureAtlasData()
@@ -3562,7 +4263,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.workspace.set_object_texture_sources(
             [_source("chair", directory=self._temporary_directory.name)]
         )
-        self.workspace.assign_object_button.click()
+        self.workspace._assign_selected_object()
         atlas = self.workspace.get_data().atlases[0]
         assert atlas.image_path is not None
         image_path = Path(self._temporary_directory.name) / atlas.image_path
@@ -3579,7 +4280,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.workspace.set_object_texture_sources(
             [_source("chair", directory=self._temporary_directory.name)]
         )
-        self.workspace.assign_object_button.click()
+        self.workspace._assign_selected_object()
 
         with patch.object(Path, "unlink", side_effect=OSError("locked")):
             self.workspace.remove_atlas_button.click()
@@ -3629,7 +4330,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.workspace.set_object_texture_sources([vertical, horizontal])
         for row in range(2):
             self.workspace.object_list.setCurrentRow(row)
-            self.workspace.assign_object_button.click()
+            self.workspace._assign_selected_object()
 
         packed = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
         assert packed is not None
@@ -4556,7 +5257,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.assertFalse(outside_path.exists())
 
     # ### Automatic scene-texture assignment ###
-    def test_unpacked_scene_source_has_role_red_text_and_explanatory_tooltip(
+    def test_unpacked_scene_source_is_not_highlighted_in_object_list(
         self,
     ) -> None:
         source = _source("required", directory=self._temporary_directory.name)
@@ -4564,12 +5265,8 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.workspace.set_scene_texture_source_ids(("required",))
 
         item = self.workspace.object_list.item(0)
-        self.assertTrue(item.data(OBJECT_SCENE_REQUIRED_UNPACKED_ROLE))
-        self.assertEqual(
-            item.foreground().color(),
-            OBJECT_SCENE_REQUIRED_UNPACKED_COLOR,
-        )
-        self.assertIn("not assigned to any texture atlas", item.toolTip())
+        self.assertEqual(item.foreground().style(), Qt.BrushStyle.NoBrush)
+        self.assertNotIn("not assigned to any texture atlas", item.toolTip())
         self.assertEqual(
             self.workspace.get_unpacked_scene_texture_source_ids(),
             ("required",),
@@ -4593,11 +5290,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.workspace.set_data(data)
 
         item = self.workspace.object_list.item(0)
-        self.assertFalse(item.data(OBJECT_SCENE_REQUIRED_UNPACKED_ROLE))
-        self.assertNotEqual(
-            item.foreground().color(),
-            OBJECT_SCENE_REQUIRED_UNPACKED_COLOR,
-        )
+        self.assertEqual(item.foreground().style(), Qt.BrushStyle.NoBrush)
         self.assertNotIn("not assigned to any texture atlas", item.toolTip())
         self.assertEqual(
             self.workspace.get_unpacked_scene_texture_source_ids(),
@@ -5522,10 +6215,9 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.assertEqual(assigned, ())
         self.assertEqual(changes.call_count, 0)
         callback.assert_not_called()
-        self.assertTrue(
-            self.workspace.object_list.item(0).data(
-                OBJECT_SCENE_REQUIRED_UNPACKED_ROLE
-            )
+        self.assertEqual(
+            self.workspace.get_unpacked_scene_texture_source_ids(),
+            (source.object_id,),
         )
 
     def test_auto_assignment_callback_rejection_restores_state_and_pngs(

@@ -430,7 +430,6 @@ class GenerationCancellationTests(unittest.TestCase):
             self._texture_request(original)
         )
         self._wait_for_event(regenerator.started)
-        self.assertFalse(self.workspace.place_object_button.isEnabled())
         self.assertFalse(self.workspace.request_active_object_placement())
         self.assertTrue(self.workspace.cancel_current_operation())
         regenerator.release.set()
@@ -506,7 +505,6 @@ class GenerationCancellationTests(unittest.TestCase):
 
         self.workspace._start_generation(self._generation_request())
         self._wait_for_event(planner.started)
-        self.assertTrue(self.workspace.place_object_button.isEnabled())
         self.assertTrue(self.workspace.request_active_object_placement())
         operation_id = str(requested.at(0)[0])
         with self.assertRaises(AttributeError):
@@ -536,6 +534,143 @@ class GenerationCancellationTests(unittest.TestCase):
             self.workspace.set_active_object_placement(operation_id, placement)
         )
 
+    def test_in_flight_canvas_binding_can_be_removed_without_cancelling_job(
+        self,
+    ) -> None:
+        result = MeshyGenerationResult("task", _box_glb(), "Chair")
+        planner = _BlockingPlanner(result)
+        self.workspace.set_meshy_planner(planner)
+        self.workspace.set_meshy_executor(_ImmediateExecutor(_plain_model()))
+        requested = QSignalSpy(self.workspace.placement_requested)
+        catalog_changes = QSignalSpy(self.workspace.placeable_objects_changed)
+
+        self.workspace._start_generation(self._generation_request())
+        self._wait_for_event(planner.started)
+        self.assertTrue(self.workspace.request_active_object_placement())
+        operation_id = str(requested.at(0)[0])
+        self.assertTrue(
+            self.workspace.set_active_object_placement(
+                operation_id,
+                GeneratedObjectPlacement(2, 123.5, 48.25),
+            )
+        )
+        self.assertEqual(
+            self.workspace.get_scene_bound_placeable_object_ids(),
+            (operation_id,),
+        )
+
+        self.assertTrue(
+            self.workspace.remove_placeable_object_placement(operation_id)
+        )
+        self.assertEqual(
+            self.workspace.get_scene_bound_placeable_object_ids(),
+            (),
+        )
+        self.assertFalse(
+            self.workspace.remove_placeable_object_placement(operation_id)
+        )
+        self.assertGreaterEqual(catalog_changes.count(), 3)
+        planner.release.set()
+        self._wait_until_idle()
+
+        record = self.workspace.get_data().generated_objects[0]
+        self.assertIsNone(record.placement)
+
+    def test_placeable_catalog_includes_named_active_model_job(self) -> None:
+        original, _variants = self._seed_textured_object()
+        result = MeshyGenerationResult("active-task", _box_glb(), "Result name")
+        planner = _BlockingPlanner(result)
+        self.workspace.set_meshy_planner(planner)
+        self.workspace.set_meshy_executor(_ImmediateExecutor(_plain_model()))
+        catalog_changes = QSignalSpy(self.workspace.placeable_objects_changed)
+        placement_requests = QSignalSpy(self.workspace.placement_requested)
+
+        self.workspace._start_generation(
+            self._generation_request(),
+            requested_name="Custom cabinet",
+        )
+        self._wait_for_event(planner.started)
+        active_operation_id = next(iter(self.workspace._object_job_runtimes))
+
+        self.assertEqual(
+            self.workspace.get_placeable_object_names_by_id(),
+            {
+                original.object_id: original.object_name,
+                active_operation_id: "Custom cabinet",
+            },
+        )
+        self.assertGreaterEqual(catalog_changes.count(), 1)
+        self.assertEqual(
+            dict(catalog_changes.at(catalog_changes.count() - 1)[0]),
+            self.workspace.get_placeable_object_names_by_id(),
+        )
+        self.assertTrue(
+            self.workspace.request_placeable_object_placement(
+                active_operation_id
+            )
+        )
+        self.assertEqual(
+            str(placement_requests.at(0)[0]),
+            active_operation_id,
+        )
+
+        self.assertTrue(self.workspace.cancel_operation(active_operation_id))
+        self.assertEqual(
+            self.workspace.get_placeable_object_names_by_id(),
+            {original.object_id: original.object_name},
+        )
+        planner.release.set()
+        self._wait_until_idle()
+
+    def test_placeable_catalog_transitions_active_job_to_completed_object(
+        self,
+    ) -> None:
+        result = MeshyGenerationResult("finished-task", _box_glb(), "Bookcase")
+        planner = _BlockingPlanner(result)
+        self.workspace.set_meshy_planner(planner)
+        self.workspace.set_meshy_executor(_ImmediateExecutor(_plain_model()))
+        catalog_changes = QSignalSpy(self.workspace.placeable_objects_changed)
+
+        self.workspace._start_generation(self._generation_request())
+        self._wait_for_event(planner.started)
+        active_operation_id = next(iter(self.workspace._object_job_runtimes))
+        self.assertEqual(
+            self.workspace.get_placeable_object_names_by_id()[
+                active_operation_id
+            ],
+            "Object from frame 1",
+        )
+        planner.release.set()
+        self._wait_until_idle()
+
+        record = self.workspace.get_data().generated_objects[0]
+        self.assertNotEqual(active_operation_id, record.object_id)
+        self.assertEqual(
+            self.workspace.get_placeable_object_names_by_id(),
+            {record.object_id: "Bookcase"},
+        )
+        self.assertGreaterEqual(catalog_changes.count(), 2)
+        self.assertIn(
+            active_operation_id,
+            dict(catalog_changes.at(0)[0]),
+        )
+        self.assertEqual(
+            dict(catalog_changes.at(catalog_changes.count() - 1)[0]),
+            {record.object_id: "Bookcase"},
+        )
+        placement_requests = QSignalSpy(self.workspace.placement_requested)
+        self.assertTrue(
+            self.workspace.request_placeable_object_placement(record.object_id)
+        )
+        request_id = str(placement_requests.at(0)[0])
+        self.assertNotEqual(request_id, record.object_id)
+        self.assertTrue(
+            self.workspace.set_active_object_placement(
+                request_id,
+                GeneratedObjectPlacement(1, 10.0, 20.0),
+            )
+        )
+
     def test_completed_object_can_be_repositioned_with_a_fresh_bound_token(
         self,
     ) -> None:
@@ -547,10 +682,13 @@ class GenerationCancellationTests(unittest.TestCase):
         )
         object_changed = QSignalSpy(self.workspace.generated_object_changed)
 
-        self.assertTrue(self.workspace.place_object_button.isEnabled())
-        self.assertTrue(self.workspace.request_object_placement())
+        self.assertTrue(
+            self.workspace.request_generated_object_placement(original.object_id)
+        )
         first_request_id = str(requested.at(0)[0])
-        self.assertTrue(self.workspace.request_object_placement())
+        self.assertTrue(
+            self.workspace.request_generated_object_placement(original.object_id)
+        )
         second_request_id = str(requested.at(1)[0])
 
         self.assertNotEqual(first_request_id, second_request_id)
@@ -659,9 +797,11 @@ class GenerationCancellationTests(unittest.TestCase):
     def test_closed_completed_object_picker_invalidates_only_its_token(
         self,
     ) -> None:
-        self._seed_textured_object()
+        original, _variants = self._seed_textured_object()
         requested = QSignalSpy(self.workspace.placement_requested)
-        self.assertTrue(self.workspace.request_object_placement())
+        self.assertTrue(
+            self.workspace.request_generated_object_placement(original.object_id)
+        )
         request_id = str(requested.at(0)[0])
 
         self.assertFalse(
@@ -700,7 +840,9 @@ class GenerationCancellationTests(unittest.TestCase):
         self.workspace.generated_objects_list.setCurrentRow(1)
         requested = QSignalSpy(self.workspace.placement_requested)
 
-        self.assertTrue(self.workspace.request_object_placement())
+        self.assertTrue(
+            self.workspace.request_generated_object_placement(table.object_id)
+        )
         request_id = str(requested.at(0)[0])
         self.workspace.generated_objects_list.setCurrentRow(0)
         placement = GeneratedObjectPlacement(4, 31.0, 57.0)

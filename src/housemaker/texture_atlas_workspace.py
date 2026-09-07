@@ -24,7 +24,6 @@ from PySide6.QtCore import (
     Signal,
 )
 from PySide6.QtGui import (
-    QBrush,
     QColor,
     QDrag,
     QDragEnterEvent,
@@ -96,8 +95,6 @@ from housemaker.texture_atlas_state import (
 ATLAS_ID_ROLE = Qt.ItemDataRole.UserRole
 OBJECT_ID_ROLE = Qt.ItemDataRole.UserRole
 OBJECT_MISSING_ROLE = Qt.ItemDataRole.UserRole + 1
-OBJECT_SCENE_REQUIRED_UNPACKED_ROLE = Qt.ItemDataRole.UserRole + 2
-OBJECT_SCENE_REQUIRED_UNPACKED_COLOR = QColor(235, 87, 87)
 PREVIEW_MARGIN_PIXELS = 16.0
 PREVIEW_BACKGROUND_COLOR = QColor(31, 34, 39)
 PREVIEW_EMPTY_COLOR = QColor(50, 54, 61)
@@ -105,6 +102,7 @@ PREVIEW_GRID_COLOR = QColor(76, 82, 92)
 PREVIEW_MISSING_COLOR = QColor(105, 59, 52)
 PREVIEW_BORDER_COLOR = QColor(220, 224, 230)
 PREVIEW_SELECTED_BORDER_COLOR = QColor(255, 139, 31)
+SCENE_BOUND_SOURCE_COLOR = QColor(77, 255, 142)
 PREVIEW_LABEL_COLOR = QColor(245, 247, 250)
 PREVIEW_DRAG_VALID_FILL_COLOR = QColor(38, 190, 95, 72)
 PREVIEW_DRAG_VALID_BORDER_COLOR = QColor(77, 255, 142, 235)
@@ -134,10 +132,37 @@ NON_PBR_ATLAS_BASE_NAME = f"{NON_PBR_ATLAS_NAME_PREFIX} Atlas"
 HALF_MESH_ATLAS_NAME_PREFIX = "[HALF]"
 HALF_MESH_ATLAS_BASE_NAME = f"{HALF_MESH_ATLAS_NAME_PREFIX} Atlas"
 HALF_MESH_ATLAS_RESOLUTION = 4096
+DEFAULT_ATLAS_BASE_NAME = "Atlas"
 DEFAULT_AUTOMATIC_ATLAS_RESOLUTION = min(ATLAS_RESOLUTIONS)
 
 
 # ### Public texture-source model ###
+@dataclass(frozen=True)
+class AtlasSurfaceTextureEntry:
+    """Lightweight list metadata retained when texture pixels are unavailable."""
+
+    source_id: str
+    display_name: str
+    surface_usage_count: int
+
+    def __post_init__(self) -> None:
+        source_id = str(self.source_id).strip()
+        display_name = str(self.display_name).strip()
+        usage_count = self.surface_usage_count
+        if not source_id.startswith(WALL_TEXTURE_SOURCE_ID_PREFIX):
+            raise ValueError("Atlas surface entries require a reserved source ID.")
+        if not display_name:
+            raise ValueError("Atlas surface entry names cannot be empty.")
+        if (
+            not isinstance(usage_count, int)
+            or isinstance(usage_count, bool)
+            or usage_count < 0
+        ):
+            raise ValueError("Atlas surface usage count cannot be negative.")
+        object.__setattr__(self, "source_id", source_id)
+        object.__setattr__(self, "display_name", display_name)
+
+
 @dataclass(frozen=True, eq=False)
 class AtlasObjectTextureSource:
     """One generated object or architectural texture packable into an Atlas."""
@@ -158,6 +183,7 @@ class AtlasObjectTextureSource:
     physical_map_texture_paths: Mapping[str, Path] | None = None
     preview_rgba_by_map: Mapping[str, np.ndarray] | None = None
     fallback_map_rgba: Mapping[str, tuple[int, int, int, int]] | None = None
+    surface_usage_count: int = 0
 
     def __post_init__(self) -> None:
         object_id = str(self.object_id).strip()
@@ -226,6 +252,14 @@ class AtlasObjectTextureSource:
             MappingProxyType(fallback_map_rgba),
         )
         object.__setattr__(self, "fit_to_square", bool(self.fit_to_square))
+        surface_usage_count = self.surface_usage_count
+        if (
+            not isinstance(surface_usage_count, int)
+            or isinstance(surface_usage_count, bool)
+            or surface_usage_count < 0
+        ):
+            raise ValueError("Atlas surface usage count cannot be negative.")
+        object.__setattr__(self, "surface_usage_count", surface_usage_count)
         object.__setattr__(
             self,
             "supports_resolution_changes",
@@ -373,6 +407,7 @@ TextureVariantResolver = Callable[
 ]
 TextureVariantSelectabilityResolver = Callable[[str, int], bool]
 TextureResolutionCommitCallback = Callable[[], bool]
+SourceAssignmentCommitCallback = Callable[[], bool]
 SceneTextureAssignmentCommitCallback = Callable[[tuple[str, ...]], bool]
 
 
@@ -392,6 +427,7 @@ def load_atlas_object_texture_source(
     packing_mode: str = ATLAS_PACKING_MODE_FULL,
     symmetric_preview_orientation: str | None = None,
     symmetric_preview_plane_coordinate: float | None = None,
+    surface_usage_count: int = 0,
 ) -> AtlasObjectTextureSource:
     """Load one texture-source descriptor for the Atlas workspace."""
 
@@ -438,6 +474,7 @@ def load_atlas_object_texture_source(
         packing_mode=packing_mode,
         symmetric_preview_orientation=symmetric_preview_orientation,
         symmetric_preview_plane_coordinate=symmetric_preview_plane_coordinate,
+        surface_usage_count=surface_usage_count,
     )
 
 
@@ -789,6 +826,7 @@ class TextureAtlasPreview(QWidget):
         self._source_preview_images: dict[str, QImage] = {}
         self._content_signature: tuple[object, ...] | None = None
         self._selected_object_id: str | None = None
+        self._green_outline_source_ids: frozenset[str] = frozenset()
         self._drag_start_position: QPointF | None = None
         self._drag_object_id: str | None = None
         self._drag_slot_preview: AtlasDragSlotPreview | None = None
@@ -960,6 +998,19 @@ class TextureAtlasPreview(QWidget):
         if normalized_id == self._selected_object_id:
             return
         self._selected_object_id = normalized_id
+        self.update()
+
+    def set_green_outline_source_ids(self, source_ids: Sequence[str]) -> None:
+        """Draw green borders around the requested Atlas placements."""
+
+        normalized_ids = frozenset(
+            source_id
+            for source_id in (str(value).strip() for value in source_ids)
+            if source_id
+        )
+        if normalized_ids == self._green_outline_source_ids:
+            return
+        self._green_outline_source_ids = normalized_ids
         self.update()
 
     def set_wheel_resize_object_ids(self, object_ids: set[str]) -> None:
@@ -1294,14 +1345,21 @@ class TextureAtlasPreview(QWidget):
                         f"No {ATLAS_MAP_LABELS[self._map_type]} map"
                     )
             is_selected = placement.object_id == self._selected_object_id
+            has_green_outline = (
+                placement.object_id in self._green_outline_source_ids
+            )
             painter.setPen(
                 QPen(
                     (
-                        PREVIEW_SELECTED_BORDER_COLOR
-                        if is_selected
-                        else PREVIEW_BORDER_COLOR
+                        SCENE_BOUND_SOURCE_COLOR
+                        if has_green_outline
+                        else (
+                            PREVIEW_SELECTED_BORDER_COLOR
+                            if is_selected
+                            else PREVIEW_BORDER_COLOR
+                        )
                     ),
-                    3.0 if is_selected else 1.0,
+                    3.0 if is_selected or has_green_outline else 1.0,
                 )
             )
             painter.drawRect(placement_rect)
@@ -1694,12 +1752,18 @@ class TextureAtlasPreview(QWidget):
 
 # ### Atlas workspace ###
 class TextureAtlasWorkspace(QWidget):
-    """Create atlases and assign generated object or wall textures."""
+    """Create atlases and manage generated object and surface textures."""
 
     data_changed = Signal(object)
     object_preview_requested = Signal(str, int)
+    placeable_object_preview_requested = Signal(str)
     object_preview_clear_requested = Signal()
     object_texture_resolution_changed = Signal(str, int)
+    object_texture_selected = Signal(str)
+    surface_texture_selected = Signal(str)
+    object_place_requested = Signal(str)
+    surface_assign_requested = Signal(str)
+    source_remove_requested = Signal(str, str)
     selected_atlas_changed = Signal(object)
 
     def __init__(
@@ -1715,7 +1779,14 @@ class TextureAtlasWorkspace(QWidget):
         )
         self._data = TextureAtlasData()
         self._sources_by_object_id: dict[str, AtlasObjectTextureSource] = {}
+        self._placeable_objects_by_id: dict[str, str] = {}
+        self._surface_texture_entries_by_id: dict[
+            str,
+            AtlasSurfaceTextureEntry,
+        ] = {}
         self._scene_texture_source_ids: tuple[str, ...] = ()
+        self._scene_bound_source_ids: frozenset[str] = frozenset()
+        self._green_outline_source_ids: frozenset[str] = frozenset()
         self._texture_variant_resolver: TextureVariantResolver | None = None
         self._texture_variant_selectability_resolver: (
             TextureVariantSelectabilityResolver | None
@@ -1730,6 +1801,8 @@ class TextureAtlasWorkspace(QWidget):
         self._is_coalescing_preview_requests = False
         self._coalesced_preview_request_key: tuple[str, int] | None = None
         self._previewed_atlas_id: str | None = None
+        self._active_source_kind: str | None = None
+        self._object_preview_widget: QWidget | None = None
         self._build_ui()
         self._refresh_all()
 
@@ -1748,6 +1821,8 @@ class TextureAtlasWorkspace(QWidget):
         sources: list[AtlasObjectTextureSource]
         | tuple[AtlasObjectTextureSource, ...],
         *,
+        placeable_objects: Mapping[str, str] | None = None,
+        surface_texture_entries: Sequence[AtlasSurfaceTextureEntry] = (),
         variant_resolver: TextureVariantResolver | None = None,
         selectability_resolver: (
             TextureVariantSelectabilityResolver | None
@@ -1758,6 +1833,10 @@ class TextureAtlasWorkspace(QWidget):
         ``variant_resolver`` may resolve a PNG-only Atlas source. The optional
         ``selectability_resolver`` is stricter and prevents a packed resize
         unless the application can also assign the matching 3D model variant.
+        ``placeable_objects`` also exposes generated geometry which does not
+        yet have a texture, without making it packable or draggable.
+        ``surface_texture_entries`` keeps names and usage counts visible when
+        a surface texture file is temporarily unavailable.
         """
 
         normalized_sources = list(sources)
@@ -1771,9 +1850,45 @@ class TextureAtlasWorkspace(QWidget):
         source_ids = [source.object_id for source in normalized_sources]
         if len(source_ids) != len(set(source_ids)):
             raise ValueError("Atlas texture source IDs must be unique.")
+        if placeable_objects is not None and not isinstance(
+            placeable_objects,
+            Mapping,
+        ):
+            raise TypeError("Atlas placeable objects must be a mapping.")
+        normalized_placeable_objects: dict[str, str] = {}
+        for raw_object_id, raw_display_name in (placeable_objects or {}).items():
+            object_id = str(raw_object_id).strip()
+            display_name = str(raw_display_name).strip()
+            if not object_id or not display_name:
+                raise ValueError(
+                    "Atlas placeable-object IDs and names cannot be empty."
+                )
+            normalized_placeable_objects[object_id] = display_name
+        normalized_surface_entries = tuple(surface_texture_entries)
+        if not all(
+            isinstance(entry, AtlasSurfaceTextureEntry)
+            for entry in normalized_surface_entries
+        ):
+            raise TypeError(
+                "Atlas surface texture entries must be "
+                "AtlasSurfaceTextureEntry values."
+            )
+        surface_entry_ids = [
+            entry.source_id for entry in normalized_surface_entries
+        ]
+        if len(surface_entry_ids) != len(set(surface_entry_ids)):
+            raise ValueError("Atlas surface texture entry IDs must be unique.")
+        if set(normalized_placeable_objects).intersection(surface_entry_ids):
+            raise ValueError(
+                "Atlas object and surface entries cannot share a source ID."
+            )
         selected_object_id = self._selected_object_id()
         self._sources_by_object_id = {
             source.object_id: source for source in normalized_sources
+        }
+        self._placeable_objects_by_id = normalized_placeable_objects
+        self._surface_texture_entries_by_id = {
+            entry.source_id: entry for entry in normalized_surface_entries
         }
         self._texture_variant_resolver = variant_resolver
         self._texture_variant_selectability_resolver = selectability_resolver
@@ -1792,6 +1907,33 @@ class TextureAtlasWorkspace(QWidget):
             )
         )
         self._refresh_object_list(self._selected_object_id())
+
+    def set_scene_bound_source_ids(self, source_ids: Sequence[str]) -> None:
+        """Highlight list entries bound to scene objects or surfaces."""
+
+        normalized_ids = frozenset(
+            source_id
+            for source_id in (str(value).strip() for value in source_ids)
+            if source_id
+        )
+        if normalized_ids == self._scene_bound_source_ids:
+            return
+        self._scene_bound_source_ids = normalized_ids
+        self._refresh_object_list(self._selected_object_id())
+
+    def set_green_outline_source_ids(self, source_ids: Sequence[str]) -> None:
+        """Set the Atlas placements outlined like highlighted Canvas surfaces."""
+
+        normalized_ids = frozenset(
+            source_id
+            for source_id in (str(value).strip() for value in source_ids)
+            if source_id
+        )
+        if normalized_ids == self._green_outline_source_ids:
+            return
+        self._green_outline_source_ids = normalized_ids
+        for preview in self.map_previews.values():
+            preview.set_green_outline_source_ids(normalized_ids)
 
     def get_unpacked_scene_texture_source_ids(self) -> tuple[str, ...]:
         """Return required source IDs which are absent from every atlas."""
@@ -2444,6 +2586,10 @@ class TextureAtlasWorkspace(QWidget):
             for atlas_id in affected_atlas_ids:
                 candidate_atlas = next_data.atlas_by_id(atlas_id)
                 assert candidate_atlas is not None
+                original_atlas = self._data.atlas_by_id(atlas_id)
+                original_image_path = self._resolve_owned_atlas_path(
+                    None if original_atlas is None else original_atlas.image_path
+                )
                 can_rebuild = bool(candidate_atlas.placements) and all(
                     self._resolve_placement_source(placement) is not None
                     for placement in candidate_atlas.placements
@@ -2452,9 +2598,12 @@ class TextureAtlasWorkspace(QWidget):
                     self._materialize_atlas(candidate_atlas)
                     continue
                 candidate_atlas.image_path = None
-                for output_path in self._resolve_atlas_map_output_paths(
-                    atlas_id
-                ).values():
+                cleanup_paths = set(
+                    self._resolve_atlas_map_output_paths(atlas_id).values()
+                )
+                if original_image_path is not None:
+                    cleanup_paths.add(original_image_path)
+                for output_path in cleanup_paths:
                     output_path.unlink(missing_ok=True)
         except (OSError, TypeError, ValueError) as error:
             restore_failures = _restore_atlas_png_snapshots(png_snapshots)
@@ -2662,6 +2811,48 @@ class TextureAtlasWorkspace(QWidget):
         """Return the texture source currently selected in the Atlas tab."""
 
         return self._selected_object_id()
+
+    @property
+    def selected_object_texture_id(self) -> str | None:
+        """Return the selected generated-object source, if one is active."""
+
+        if self._active_source_kind != "object":
+            return None
+        return self._selected_object_id()
+
+    @property
+    def selected_surface_texture_id(self) -> str | None:
+        """Return the selected architectural-surface source, if active."""
+
+        if self._active_source_kind != "surface":
+            return None
+        return self._selected_object_id()
+
+    @property
+    def object_preview_widget(self) -> QWidget | None:
+        """Return the 3D viewer currently embedded beside the source lists."""
+
+        return self._object_preview_widget
+
+    def set_object_preview_widget(self, widget: QWidget | None) -> None:
+        """Embed the Atlas 3D preview in the texture-source menu column."""
+
+        if widget is not None and not isinstance(widget, QWidget):
+            raise TypeError("The Atlas object preview must be a QWidget.")
+        if widget is self._object_preview_widget:
+            return
+        previous_widget = self._object_preview_widget
+        if previous_widget is not None:
+            self.object_preview_layout.removeWidget(previous_widget)
+            previous_widget.hide()
+            previous_widget.setParent(None)
+        self._object_preview_widget = widget
+        self.object_preview_placeholder.setVisible(widget is None)
+        if widget is None:
+            return
+        widget.setParent(self.object_preview_container)
+        self.object_preview_layout.addWidget(widget, 1)
+        widget.show()
 
     def get_selected_object_texture_resolution(self) -> int | None:
         """Return the selected atlas allocation, or its active resolution."""
@@ -3077,7 +3268,7 @@ class TextureAtlasWorkspace(QWidget):
         return snapshots
 
     def request_selected_object_preview(self) -> bool:
-        """Request a 3D preview for the selected Atlas texture source."""
+        """Request the selected textured or geometry-only 3D preview."""
 
         object_id = self._selected_object_id()
         source = (
@@ -3085,6 +3276,14 @@ class TextureAtlasWorkspace(QWidget):
             if object_id is None
             else self._sources_by_object_id.get(str(object_id))
         )
+        if (
+            object_id is not None
+            and self._active_source_kind == "object"
+            and object_id in self._placeable_objects_by_id
+            and source is None
+        ):
+            self.placeable_object_preview_requested.emit(object_id)
+            return True
         resolution = self.get_selected_object_texture_resolution()
         if (
             object_id is None
@@ -3133,17 +3332,20 @@ class TextureAtlasWorkspace(QWidget):
 
         content_splitter = QSplitter(Qt.Orientation.Horizontal)
         content_splitter.setChildrenCollapsible(False)
-        selectors = QWidget()
-        selectors_layout = QVBoxLayout(selectors)
-        selectors_layout.setContentsMargins(0, 0, 0, 0)
+        self.content_splitter = content_splitter
 
-        selectors_layout.addWidget(QLabel("Atlases"))
+        atlas_column = QWidget()
+        atlas_column.setObjectName("texture_atlas_atlas_menu_column")
+        atlas_column_layout = QVBoxLayout(atlas_column)
+        atlas_column_layout.setContentsMargins(0, 0, 0, 0)
+
+        atlas_column_layout.addWidget(QLabel("Atlases"))
         self.atlas_list = QListWidget()
         self.atlas_list.setObjectName("texture_atlas_list")
         self.atlas_list.currentItemChanged.connect(
             self._handle_atlas_selection_changed
         )
-        selectors_layout.addWidget(self.atlas_list, 1)
+        atlas_column_layout.addWidget(self.atlas_list, 1)
 
         selected_atlas_editor = QWidget()
         selected_atlas_editor_layout = QFormLayout(selected_atlas_editor)
@@ -3182,25 +3384,33 @@ class TextureAtlasWorkspace(QWidget):
             self._apply_selected_atlas_changes
         )
         selected_atlas_editor_layout.addRow("", self.update_atlas_button)
-        selectors_layout.addWidget(selected_atlas_editor)
+        atlas_column_layout.addWidget(selected_atlas_editor)
 
         self.remove_atlas_button = QPushButton("Delete atlas")
         self.remove_atlas_button.setObjectName("delete_texture_atlas_button")
         self.remove_atlas_button.clicked.connect(self._remove_selected_atlas)
-        selectors_layout.addWidget(self.remove_atlas_button)
+        atlas_column_layout.addWidget(self.remove_atlas_button)
+        content_splitter.addWidget(atlas_column)
 
-        selectors_layout.addWidget(QLabel("Texture sources"))
+        texture_column = QWidget()
+        texture_column.setObjectName("texture_atlas_texture_menu_column")
+        texture_column_layout = QVBoxLayout(texture_column)
+        texture_column_layout.setContentsMargins(0, 0, 0, 0)
+        texture_column_layout.setSpacing(6)
+
+        self.object_textures_label = QLabel("Object textures")
+        texture_column_layout.addWidget(self.object_textures_label)
         self.object_list = TextureAtlasObjectList()
         self.object_list.setObjectName("texture_atlas_object_list")
         self.object_list.setDragEnabled(True)
         self.object_list.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
         self.object_list.setDefaultDropAction(Qt.DropAction.CopyAction)
         self.object_list.currentItemChanged.connect(
-            self._handle_object_selection_changed
+            self._handle_object_list_selection_changed
         )
         self.object_list.object_clicked.connect(self._handle_object_mouse_click)
         self.object_list.object_wheeled.connect(self._handle_object_wheel)
-        selectors_layout.addWidget(self.object_list, 1)
+        texture_column_layout.addWidget(self.object_list, 1)
         self.delete_object_list_shortcut = QShortcut(
             QKeySequence.StandardKey.Delete,
             self.object_list,
@@ -3212,22 +3422,69 @@ class TextureAtlasWorkspace(QWidget):
             self.remove_selected_texture_from_atlas
         )
 
-        assignment_buttons = QHBoxLayout()
-        self.assign_object_button = QPushButton("Add selected texture")
-        self.assign_object_button.setObjectName("assign_texture_atlas_object_button")
-        self.assign_object_button.clicked.connect(self._assign_selected_object)
-        assignment_buttons.addWidget(self.assign_object_button)
-        self.unassign_object_button = QPushButton("Remove from atlas")
-        self.unassign_object_button.setObjectName(
-            "unassign_texture_atlas_object_button"
+        self.surface_textures_label = QLabel("Surface textures")
+        texture_column_layout.addWidget(self.surface_textures_label)
+        self.surface_list = TextureAtlasObjectList()
+        self.surface_list.setObjectName("texture_atlas_surface_list")
+        self.surface_list.setDragEnabled(False)
+        self.surface_list.setDragDropMode(
+            QAbstractItemView.DragDropMode.NoDragDrop
         )
-        self.unassign_object_button.clicked.connect(
+        self.surface_list.currentItemChanged.connect(
+            self._handle_surface_list_selection_changed
+        )
+        self.surface_list.object_clicked.connect(self._handle_object_mouse_click)
+        self.surface_list.object_wheeled.connect(self._handle_object_wheel)
+        texture_column_layout.addWidget(self.surface_list, 1)
+        self.delete_surface_list_shortcut = QShortcut(
+            QKeySequence.StandardKey.Delete,
+            self.surface_list,
+        )
+        self.delete_surface_list_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self.delete_surface_list_shortcut.activated.connect(
             self.remove_selected_texture_from_atlas
         )
-        assignment_buttons.addWidget(self.unassign_object_button)
-        selectors_layout.addLayout(assignment_buttons)
 
-        content_splitter.addWidget(selectors)
+        source_action_buttons = QHBoxLayout()
+        self.place_assign_button = QPushButton("Place")
+        self.place_assign_button.setObjectName(
+            "texture_atlas_place_assign_button"
+        )
+        self.place_assign_button.clicked.connect(
+            self._request_selected_source_action
+        )
+        source_action_buttons.addWidget(self.place_assign_button)
+        self.remove_source_button = QPushButton("Remove")
+        self.remove_source_button.setObjectName(
+            "texture_atlas_remove_source_button"
+        )
+        self.remove_source_button.clicked.connect(
+            self._request_selected_source_removal
+        )
+        source_action_buttons.addWidget(self.remove_source_button)
+        texture_column_layout.addLayout(source_action_buttons)
+
+        texture_column_layout.addWidget(QLabel("3D preview"))
+        self.object_preview_container = QWidget()
+        self.object_preview_container.setObjectName(
+            "texture_atlas_embedded_3d_preview"
+        )
+        self.object_preview_container.setMinimumHeight(180)
+        self.object_preview_layout = QVBoxLayout(self.object_preview_container)
+        self.object_preview_layout.setContentsMargins(0, 0, 0, 0)
+        self.object_preview_placeholder = QLabel(
+            "Select a texture to preview its object."
+        )
+        self.object_preview_placeholder.setAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+        self.object_preview_placeholder.setWordWrap(True)
+        self.object_preview_layout.addWidget(self.object_preview_placeholder, 1)
+        texture_column_layout.addWidget(self.object_preview_container, 1)
+
+        content_splitter.addWidget(texture_column)
         preview_container = QWidget()
         preview_layout = QVBoxLayout(preview_container)
         preview_layout.setContentsMargins(0, 0, 0, 0)
@@ -3295,7 +3552,8 @@ class TextureAtlasWorkspace(QWidget):
             self.remove_selected_texture_from_atlas
         )
         content_splitter.setStretchFactor(0, 1)
-        content_splitter.setStretchFactor(1, 3)
+        content_splitter.setStretchFactor(1, 1)
+        content_splitter.setStretchFactor(2, 3)
         root_layout.addWidget(content_splitter, 1)
 
         self.status_label = QLabel()
@@ -3587,25 +3845,74 @@ class TextureAtlasWorkspace(QWidget):
             )
 
     def _assign_selected_object(self) -> None:
+        source_id = self._selected_object_id()
+        if source_id is not None:
+            self.assign_source_to_selected_atlas(source_id)
+
+    def is_source_assigned_to_any_atlas(self, source_id: str) -> bool:
+        """Return whether any Atlas contains the requested texture source."""
+
+        normalized_source_id = str(source_id).strip()
+        if not normalized_source_id:
+            return False
+        return any(
+            atlas.placement_for_object(normalized_source_id) is not None
+            for atlas in self._data.atlases
+        )
+
+    def can_assign_source_to_selected_atlas(
+        self,
+        source_id: str,
+        *,
+        source_ids_to_remove: Sequence[str] = (),
+    ) -> bool:
+        """Check selected-Atlas capacity after optional source removals."""
+
         atlas = self.selected_atlas
-        source = self._selected_object_source()
+        normalized_source_id = str(source_id).strip()
+        source = self._sources_by_object_id.get(normalized_source_id)
         if atlas is None or source is None:
-            return
-        previous_data = self._data.clone()
+            return False
         try:
-            placement = self._data.assign_object(
-                atlas.atlas_id,
-                source.object_id,
-                source.texture_path,
-                source.texture_resolution,
-                source.packing_mode,
+            self._build_selected_source_assignment_candidate(
+                source,
+                source_ids_to_remove=source_ids_to_remove,
             )
-            self._materialize_atlas(atlas)
+        except (OSError, TypeError, ValueError):
+            return False
+        return True
+
+    def assign_source_to_selected_atlas(
+        self,
+        source_id: str,
+        commit_callback: SourceAssignmentCommitCallback | None = None,
+        *,
+        source_ids_to_remove: Sequence[str] = (),
+    ) -> bool:
+        """Atomically remove stale sources and add one source to the Atlas."""
+
+        atlas = self.selected_atlas
+        normalized_source_id = str(source_id).strip()
+        source = self._sources_by_object_id.get(normalized_source_id)
+        if atlas is None or source is None:
+            return False
+        try:
+            candidate_data, placement, affected_atlas_ids = (
+                self._build_selected_source_assignment_candidate(
+                    source,
+                    source_ids_to_remove=source_ids_to_remove,
+                )
+            )
         except (OSError, TypeError, ValueError) as error:
-            self._data = previous_data
-            self._refresh_all()
             self.status_label.setText(str(error))
-            return
+            return False
+
+        if not self._commit_source_assignment_candidate(
+            candidate_data,
+            affected_atlas_ids,
+            commit_callback,
+        ):
+            return False
         self._refresh_atlas_list(atlas.atlas_id)
         self._refresh_object_list(source.object_id)
         self._refresh_preview()
@@ -3615,6 +3922,255 @@ class TextureAtlasWorkspace(QWidget):
             f"Added {source.object_name} at ({placement.x}, {placement.y}) "
             f"using its {placement.texture_resolution} x "
             f"{placement.texture_resolution} texture."
+        )
+        return True
+
+    def create_atlas_and_assign_source(
+        self,
+        source_id: str,
+        resolution: int | None = None,
+        commit_callback: SourceAssignmentCommitCallback | None = None,
+        *,
+        source_ids_to_remove: Sequence[str] = (),
+    ) -> bool:
+        """Create, select, and atomically populate one uniquely named Atlas.
+
+        Omitting ``resolution`` reuses the selected Atlas resolution, or the
+        smallest supported Atlas resolution when no Atlas is selected. Optional
+        stale sources are removed from every existing Atlas in the transaction.
+        """
+
+        normalized_source_id = str(source_id).strip()
+        source = self._sources_by_object_id.get(normalized_source_id)
+        if source is None:
+            return False
+        selected_atlas = self.selected_atlas
+        target_resolution = (
+            (
+                DEFAULT_AUTOMATIC_ATLAS_RESOLUTION
+                if selected_atlas is None
+                else selected_atlas.resolution
+            )
+            if resolution is None
+            else resolution
+        )
+        candidate_data = self._data.clone()
+        try:
+            affected_atlas_ids = list(
+                self._remove_sources_from_candidate(
+                    candidate_data,
+                    source_ids_to_remove,
+                )
+            )
+            atlas = candidate_data.create_atlas(
+                self._next_generic_atlas_name(candidate_data),
+                target_resolution,
+            )
+            candidate_data.select_atlas(atlas.atlas_id)
+            placement = candidate_data.assign_object(
+                atlas.atlas_id,
+                source.object_id,
+                source.texture_path,
+                source.texture_resolution,
+                source.packing_mode,
+            )
+            affected_atlas_ids.append(atlas.atlas_id)
+        except (OSError, TypeError, ValueError) as error:
+            self.status_label.setText(str(error))
+            return False
+
+        if not self._commit_source_assignment_candidate(
+            candidate_data,
+            affected_atlas_ids,
+            commit_callback,
+        ):
+            return False
+        self._refresh_all()
+        self._emit_data_changed()
+        self.selected_atlas_changed.emit(copy.deepcopy(self.selected_atlas))
+        self.status_label.setText(
+            f"Created {atlas.name} at {atlas.resolution} x "
+            f"{atlas.resolution} and added {source.object_name} at "
+            f"({placement.x}, {placement.y})."
+        )
+        return True
+
+    @staticmethod
+    def _next_generic_atlas_name(data: TextureAtlasData) -> str:
+        """Return the next deterministic default Atlas name."""
+
+        existing_names = {atlas.name.casefold() for atlas in data.atlases}
+        if DEFAULT_ATLAS_BASE_NAME.casefold() not in existing_names:
+            return DEFAULT_ATLAS_BASE_NAME
+        suffix = 2
+        while True:
+            candidate = f"{DEFAULT_ATLAS_BASE_NAME} {suffix}"
+            if candidate.casefold() not in existing_names:
+                return candidate
+            suffix += 1
+
+    def _build_selected_source_assignment_candidate(
+        self,
+        source: AtlasObjectTextureSource,
+        *,
+        source_ids_to_remove: Sequence[str],
+    ) -> tuple[
+        TextureAtlasData,
+        TextureAtlasPlacement,
+        tuple[str, ...],
+    ]:
+        """Build one replacement candidate without touching live state."""
+
+        selected_atlas = self.selected_atlas
+        if selected_atlas is None:
+            raise ValueError("Select a texture atlas first.")
+        candidate_data = self._data.clone()
+        affected_atlas_ids = list(
+            self._remove_sources_from_candidate(
+                candidate_data,
+                source_ids_to_remove,
+            )
+        )
+
+        placement = candidate_data.assign_object(
+            selected_atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+            source.packing_mode,
+        )
+        if selected_atlas.atlas_id not in affected_atlas_ids:
+            affected_atlas_ids.append(selected_atlas.atlas_id)
+        return candidate_data, placement, tuple(affected_atlas_ids)
+
+    def _remove_sources_from_candidate(
+        self,
+        candidate_data: TextureAtlasData,
+        source_ids: Sequence[str],
+    ) -> tuple[str, ...]:
+        """Remove sources from every candidate Atlas and return affected IDs."""
+
+        removal_ids = self._normalize_source_ids(source_ids)
+        affected_atlas_ids: list[str] = []
+        for candidate_atlas in candidate_data.atlases:
+            removed_from_atlas = False
+            for removal_id in removal_ids:
+                removed_from_atlas = (
+                    candidate_data.unassign_object(
+                        candidate_atlas.atlas_id,
+                        removal_id,
+                    )
+                    or removed_from_atlas
+                )
+            if removed_from_atlas:
+                affected_atlas_ids.append(candidate_atlas.atlas_id)
+        return tuple(affected_atlas_ids)
+
+    @staticmethod
+    def _normalize_source_ids(source_ids: Sequence[str]) -> tuple[str, ...]:
+        """Normalize and deduplicate optional transactional removal IDs."""
+
+        values = (source_ids,) if isinstance(source_ids, str) else source_ids
+        return tuple(
+            dict.fromkeys(
+                normalized_id
+                for normalized_id in (
+                    str(source_id).strip() for source_id in values
+                )
+                if normalized_id
+            )
+        )
+
+    def _commit_source_assignment_candidate(
+        self,
+        candidate_data: TextureAtlasData,
+        atlas_ids: Sequence[str],
+        commit_callback: SourceAssignmentCommitCallback | None,
+    ) -> bool:
+        """Materialize or detach candidates before publishing their data."""
+
+        affected_atlas_ids = tuple(dict.fromkeys(atlas_ids))
+        candidate_atlases = tuple(
+            candidate_data.atlas_by_id(atlas_id)
+            for atlas_id in affected_atlas_ids
+        )
+        if not candidate_atlases or any(
+            atlas is None for atlas in candidate_atlases
+        ):
+            return False
+        previous_lazy_error = self._lazy_materialization_error
+        png_snapshots: dict[Path, bytes | None] = {}
+        try:
+            png_snapshots = self._snapshot_atlas_pngs(affected_atlas_ids)
+            for candidate_atlas in candidate_atlases:
+                assert candidate_atlas is not None
+                self._materialize_or_detach_candidate_atlas(candidate_atlas)
+        except (OSError, TypeError, ValueError) as error:
+            restore_failures = _restore_atlas_png_snapshots(png_snapshots)
+            self._lazy_materialization_error = previous_lazy_error
+            self.status_label.setText(str(error))
+            self._append_png_restore_failure_status(restore_failures)
+            return False
+
+        if commit_callback is not None:
+            try:
+                accepted = bool(commit_callback())
+            except Exception:
+                accepted = False
+            if not accepted:
+                restore_failures = _restore_atlas_png_snapshots(png_snapshots)
+                self._lazy_materialization_error = previous_lazy_error
+                self.status_label.setText(
+                    "Atlas assignment was rejected; its placements and PNG "
+                    "files were restored."
+                )
+                self._append_png_restore_failure_status(restore_failures)
+                return False
+
+        self._data = candidate_data
+        return True
+
+    def _materialize_or_detach_candidate_atlas(
+        self,
+        candidate_atlas: TextureAtlasRecord,
+    ) -> None:
+        """Write a populated candidate or remove an empty Atlas's PNGs."""
+
+        original_atlas = self._data.atlas_by_id(candidate_atlas.atlas_id)
+        original_image_path = self._resolve_owned_atlas_path(
+            None if original_atlas is None else original_atlas.image_path
+        )
+        if candidate_atlas.placements:
+            self._materialize_atlas(candidate_atlas)
+            candidate_image_path = self._resolve_owned_atlas_path(
+                candidate_atlas.image_path
+            )
+            if (
+                original_image_path is not None
+                and original_image_path != candidate_image_path
+            ):
+                original_image_path.unlink(missing_ok=True)
+            return
+
+        candidate_atlas.image_path = None
+        output_paths = set(
+            self._resolve_atlas_map_output_paths(
+                candidate_atlas.atlas_id
+            ).values()
+        )
+        if original_image_path is not None:
+            output_paths.add(original_image_path)
+        for output_path in output_paths:
+            output_path.unlink(missing_ok=True)
+
+    def _append_png_restore_failure_status(self, failure_count: int) -> None:
+        """Append a consistent warning when transaction recovery is partial."""
+
+        if failure_count <= 0:
+            return
+        self.status_label.setText(
+            self.status_label.text()
+            + f" {failure_count} prior Atlas PNG file(s) could not be restored."
         )
 
     def remove_selected_texture_from_atlas(self) -> None:
@@ -3637,7 +4193,7 @@ class TextureAtlasWorkspace(QWidget):
             previous_image_path,
         )
         self._refresh_atlas_list(atlas.atlas_id)
-        self._refresh_object_list(None)
+        self._refresh_object_list(object_id)
         self._refresh_preview()
         self._sync_controls()
         self._emit_data_changed()
@@ -3658,21 +4214,61 @@ class TextureAtlasWorkspace(QWidget):
                 "longer referenced by the project."
             )
 
-    def _handle_object_selection_changed(
+    def _handle_object_list_selection_changed(
         self,
-        _current: QListWidgetItem | None,
+        current: QListWidgetItem | None,
         _previous: QListWidgetItem | None,
     ) -> None:
+        self._handle_source_selection_changed("object", current)
+
+    def _handle_surface_list_selection_changed(
+        self,
+        current: QListWidgetItem | None,
+        _previous: QListWidgetItem | None,
+    ) -> None:
+        self._handle_source_selection_changed("surface", current)
+
+    def _handle_source_selection_changed(
+        self,
+        source_kind: str,
+        current: QListWidgetItem | None,
+    ) -> None:
+        """Keep the two source lists mutually exclusive and synchronized."""
+
+        if self._is_syncing:
+            return
+        if current is None:
+            if self._active_source_kind == source_kind:
+                self._active_source_kind = None
+                for preview in self.map_previews.values():
+                    preview.set_selected_object_id(None)
+                self.object_preview_clear_requested.emit()
+            self._sync_controls()
+            return
+        other_list = (
+            self.surface_list if source_kind == "object" else self.object_list
+        )
+        self._is_syncing = True
+        try:
+            other_list.setCurrentRow(-1)
+            other_list.clearSelection()
+        finally:
+            self._is_syncing = False
+        self._active_source_kind = source_kind
         selected_object_id = self._selected_object_id()
         for preview in self.map_previews.values():
             preview.set_selected_object_id(selected_object_id)
         self._sync_controls()
+        source_list = (
+            self.object_list if source_kind == "object" else self.surface_list
+        )
         if (
             not self._is_syncing
             and not self._is_handling_object_click
-            and self.object_list.mouse_button_in_progress is None
+            and source_list.mouse_button_in_progress is None
         ):
             self.request_selected_object_preview()
+            self._emit_selected_source_signal()
 
     def _handle_object_mouse_click(
         self,
@@ -3687,13 +4283,59 @@ class TextureAtlasWorkspace(QWidget):
         self._is_handling_object_click = True
         try:
             self._select_object_row(object_id)
-            self.status_label.setText(
-                "Selected the texture. Use the mouse wheel to change the "
-                "size of a packed texture."
-            )
+            if (
+                object_id in self._placeable_objects_by_id
+                and object_id not in self._sources_by_object_id
+            ):
+                self.status_label.setText(
+                    "Selected an untextured object. It can be placed but not "
+                    "added to an Atlas."
+                )
+            else:
+                self.status_label.setText(
+                    "Selected the texture. Use the mouse wheel to change the "
+                    "size of a packed texture."
+                )
         finally:
             self._is_handling_object_click = False
         self.request_selected_object_preview()
+        self._emit_selected_source_signal()
+
+    def _emit_selected_source_signal(self) -> None:
+        """Publish the active typed selection for Canvas synchronization."""
+
+        source_id = self._selected_object_id()
+        if source_id is None:
+            return
+        if self._active_source_kind == "surface":
+            self.surface_texture_selected.emit(source_id)
+        elif self._active_source_kind == "object":
+            self.object_texture_selected.emit(source_id)
+
+    def _request_selected_source_action(self) -> None:
+        """Request placement or assignment according to the selected list."""
+
+        source_id = self._selected_object_id()
+        if source_id is None:
+            return
+        if self._active_source_kind == "surface":
+            if source_id in self._sources_by_object_id:
+                self.surface_assign_requested.emit(source_id)
+        elif self._active_source_kind == "object":
+            if (
+                source_id in self._sources_by_object_id
+                or source_id in self._placeable_objects_by_id
+            ):
+                self.object_place_requested.emit(source_id)
+
+    def _request_selected_source_removal(self) -> None:
+        """Request semantic scene removal for the active typed source."""
+
+        source_id = self._selected_object_id()
+        source_kind = self._active_source_kind
+        if source_id is None or source_kind not in {"object", "surface"}:
+            return
+        self.source_remove_requested.emit(source_kind, source_id)
 
     def _handle_object_drop(self, object_id: str, x: int, y: int) -> None:
         """Place one dragged exact source without moving other allocations."""
@@ -3926,11 +4568,9 @@ class TextureAtlasWorkspace(QWidget):
         self._is_syncing = True
         try:
             self.object_list.clear()
-            unpacked_scene_ids = set(
-                self.get_unpacked_scene_texture_source_ids()
-            )
+            self.surface_list.clear()
+            selected_list: TextureAtlasObjectList | None = None
             selected_row = -1
-            row = 0
             for source in self._sources_by_object_id.values():
                 placement = (
                     None
@@ -3942,24 +4582,32 @@ class TextureAtlasWorkspace(QWidget):
                     if placement is None
                     else placement.texture_resolution
                 )
+                is_surface = self._is_surface_texture_source_id(
+                    source.object_id
+                )
+                target_list = self.surface_list if is_surface else self.object_list
+                usage_suffix = (
+                    f" · {source.surface_usage_count} surface"
+                    f"{'s' if source.surface_usage_count != 1 else ''}"
+                    if is_surface
+                    else ""
+                )
                 item = QListWidgetItem(
-                    f"{source.object_name} · {displayed_resolution} x "
+                    f"{source.object_name}{usage_suffix} · "
+                    f"{displayed_resolution} x "
                     f"{displayed_resolution}"
                 )
                 item.setData(OBJECT_ID_ROLE, source.object_id)
                 item.setData(OBJECT_MISSING_ROLE, False)
-                is_required_unpacked = source.object_id in unpacked_scene_ids
-                item.setData(
-                    OBJECT_SCENE_REQUIRED_UNPACKED_ROLE,
-                    is_required_unpacked,
-                )
-                if is_required_unpacked:
-                    item.setForeground(
-                        QBrush(OBJECT_SCENE_REQUIRED_UNPACKED_COLOR)
+                self._apply_scene_bound_item_highlight(item, source.object_id)
+                if is_surface:
+                    item.setFlags(
+                        item.flags() & ~Qt.ItemFlag.ItemIsDragEnabled
                     )
-                item.setFlags(
-                    item.flags() | Qt.ItemFlag.ItemIsDragEnabled
-                )
+                else:
+                    item.setFlags(
+                        item.flags() | Qt.ItemFlag.ItemIsDragEnabled
+                    )
                 tooltip = (
                     source.texture_path
                     if placement is None
@@ -3969,27 +4617,77 @@ class TextureAtlasWorkspace(QWidget):
                         f"{placement.texture_path}"
                     )
                 )
-                if is_required_unpacked:
-                    tooltip += (
-                        "\nRequired by the current scene but not assigned to "
-                        "any texture atlas."
-                    )
                 item.setToolTip(tooltip)
-                self.object_list.addItem(item)
+                target_list.addItem(item)
                 if source.object_id == selected_object_id:
-                    selected_row = row
-                row += 1
+                    selected_list = target_list
+                    selected_row = target_list.count() - 1
+
+            for object_id, display_name in self._placeable_objects_by_id.items():
+                if object_id in self._sources_by_object_id:
+                    continue
+                item = QListWidgetItem(f"[No texture] {display_name}")
+                item.setData(OBJECT_ID_ROLE, object_id)
+                item.setData(OBJECT_MISSING_ROLE, True)
+                self._apply_scene_bound_item_highlight(item, object_id)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsDragEnabled)
+                item.setToolTip(
+                    "This generated object can be placed, but it has no "
+                    "texture to add to an Atlas."
+                )
+                self.object_list.addItem(item)
+                if object_id == selected_object_id:
+                    selected_list = self.object_list
+                    selected_row = self.object_list.count() - 1
+
+            for entry in self._surface_texture_entries_by_id.values():
+                if entry.source_id in self._sources_by_object_id:
+                    continue
+                usage_suffix = (
+                    f"{entry.surface_usage_count} surface"
+                    f"{'s' if entry.surface_usage_count != 1 else ''}"
+                )
+                item = QListWidgetItem(
+                    f"[Missing texture] {entry.display_name} · {usage_suffix}"
+                )
+                item.setData(OBJECT_ID_ROLE, entry.source_id)
+                item.setData(OBJECT_MISSING_ROLE, True)
+                self._apply_scene_bound_item_highlight(item, entry.source_id)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsDragEnabled)
+                item.setToolTip(
+                    "This surface texture's active image file is unavailable."
+                )
+                self.surface_list.addItem(item)
+                if entry.source_id == selected_object_id:
+                    selected_list = self.surface_list
+                    selected_row = self.surface_list.count() - 1
 
             if atlas is not None:
                 for placement in atlas.placements:
                     if placement.object_id in self._sources_by_object_id:
                         continue
-                    item = QListWidgetItem(f"[Missing] {placement.object_id}")
+                    if placement.object_id in self._placeable_objects_by_id:
+                        continue
+                    if (
+                        placement.object_id
+                        in self._surface_texture_entries_by_id
+                    ):
+                        continue
+                    is_surface = self._is_surface_texture_source_id(
+                        placement.object_id
+                    )
+                    target_list = (
+                        self.surface_list if is_surface else self.object_list
+                    )
+                    item = QListWidgetItem(
+                        f"[Missing] {placement.object_id}"
+                        + (" · 0 surfaces" if is_surface else "")
+                    )
                     item.setData(OBJECT_ID_ROLE, placement.object_id)
                     item.setData(OBJECT_MISSING_ROLE, True)
-                    item.setData(
-                        OBJECT_SCENE_REQUIRED_UNPACKED_ROLE,
-                        False,
+                    self._apply_scene_bound_item_highlight(
+                        item,
+                        placement.object_id,
                     )
                     item.setFlags(
                         item.flags() & ~Qt.ItemFlag.ItemIsDragEnabled
@@ -3999,25 +4697,54 @@ class TextureAtlasWorkspace(QWidget):
                         f"{placement.texture_resolution}: "
                         f"{placement.texture_path}"
                     )
-                    self.object_list.addItem(item)
+                    target_list.addItem(item)
                     if placement.object_id == selected_object_id:
-                        selected_row = row
-                    row += 1
-            if selected_row >= 0:
-                self.object_list.setCurrentRow(selected_row)
+                        selected_list = target_list
+                        selected_row = target_list.count() - 1
+            if selected_list is not None and selected_row >= 0:
+                selected_list.setCurrentRow(selected_row)
+                self._active_source_kind = (
+                    "surface"
+                    if selected_list is self.surface_list
+                    else "object"
+                )
+            elif selected_object_id is not None:
+                self.object_list.setCurrentRow(-1)
+                self.surface_list.setCurrentRow(-1)
+                self._active_source_kind = None
             elif self.object_list.count() > 0:
                 self.object_list.setCurrentRow(0)
+                self._active_source_kind = "object"
+            elif self.surface_list.count() > 0:
+                self.surface_list.setCurrentRow(0)
+                self._active_source_kind = "surface"
+            else:
+                self._active_source_kind = None
         finally:
             self._is_syncing = was_syncing
+        selected_id = self._selected_object_id()
+        for preview in self.map_previews.values():
+            preview.set_selected_object_id(selected_id)
         wheel_resize_object_ids = {
             placement.object_id
             for placement in (() if atlas is None else atlas.placements)
             if not self._source_has_fixed_resolution(placement.object_id)
         }
         self.object_list.set_wheel_resize_object_ids(wheel_resize_object_ids)
+        self.surface_list.set_wheel_resize_object_ids(wheel_resize_object_ids)
         for preview in self.map_previews.values():
             preview.set_wheel_resize_object_ids(wheel_resize_object_ids)
         self._sync_controls()
+
+    def _apply_scene_bound_item_highlight(
+        self,
+        item: QListWidgetItem,
+        source_id: str,
+    ) -> None:
+        """Use one green list treatment for every scene-bound source type."""
+
+        if str(source_id) in self._scene_bound_source_ids:
+            item.setForeground(SCENE_BOUND_SOURCE_COLOR)
 
     def _refresh_preview(self) -> None:
         atlas = self.selected_atlas
@@ -4044,6 +4771,9 @@ class TextureAtlasWorkspace(QWidget):
                 preview_sources,
             )
             preview.set_selected_object_id(selected_object_id)
+            preview.set_green_outline_source_ids(
+                self._green_outline_source_ids
+            )
         if atlas is None:
             self.status_label.setText("Create an atlas to begin packing textures.")
             return
@@ -4080,11 +4810,26 @@ class TextureAtlasWorkspace(QWidget):
         self.selected_atlas_name_edit.setEnabled(atlas is not None)
         self.selected_atlas_resolution_combo.setEnabled(atlas is not None)
         self.update_atlas_button.setEnabled(atlas is not None)
-        self.assign_object_button.setEnabled(atlas is not None and source is not None)
-        self.unassign_object_button.setEnabled(
-            atlas is not None
+        self.place_assign_button.setText(
+            "Assign" if self._active_source_kind == "surface" else "Place"
+        )
+        can_place_object = (
+            self._active_source_kind == "object"
             and object_id is not None
-            and atlas.placement_for_object(object_id) is not None
+            and (
+                source is not None
+                or object_id in self._placeable_objects_by_id
+            )
+        )
+        can_assign_surface = (
+            self._active_source_kind == "surface" and source is not None
+        )
+        self.place_assign_button.setEnabled(
+            can_place_object or can_assign_surface
+        )
+        self.remove_source_button.setEnabled(
+            object_id is not None
+            and self._active_source_kind in {"object", "surface"}
         )
 
     def _sync_selected_atlas_editor(self) -> None:
@@ -4107,7 +4852,14 @@ class TextureAtlasWorkspace(QWidget):
             self._is_syncing = was_syncing
 
     def _selected_object_id(self) -> str | None:
-        item = self.object_list.currentItem()
+        if self._active_source_kind == "surface":
+            item = self.surface_list.currentItem()
+        elif self._active_source_kind == "object":
+            item = self.object_list.currentItem()
+        else:
+            item = self.object_list.currentItem()
+            if item is None:
+                item = self.surface_list.currentItem()
         return None if item is None else str(item.data(OBJECT_ID_ROLE))
 
     def _selected_object_source(self) -> AtlasObjectTextureSource | None:
@@ -4120,18 +4872,57 @@ class TextureAtlasWorkspace(QWidget):
 
     def _select_object_row(self, object_id: str) -> bool:
         normalized_id = str(object_id)
-        for row in range(self.object_list.count()):
-            item = self.object_list.item(row)
+        target_list = (
+            self.surface_list
+            if self._is_surface_texture_source_id(normalized_id)
+            else self.object_list
+        )
+        other_list = (
+            self.object_list
+            if target_list is self.surface_list
+            else self.surface_list
+        )
+        for row in range(target_list.count()):
+            item = target_list.item(row)
             if str(item.data(OBJECT_ID_ROLE)) == normalized_id:
-                self.object_list.setCurrentRow(row)
+                was_syncing = self._is_syncing
+                self._is_syncing = True
+                try:
+                    other_list.setCurrentRow(-1)
+                    other_list.clearSelection()
+                    target_list.setCurrentRow(row)
+                finally:
+                    self._is_syncing = was_syncing
+                self._active_source_kind = (
+                    "surface"
+                    if target_list is self.surface_list
+                    else "object"
+                )
                 for preview in self.map_previews.values():
                     preview.set_selected_object_id(normalized_id)
+                self._sync_controls()
                 return True
         return False
 
     def _object_display_name(self, object_id: str) -> str:
         source = self._sources_by_object_id.get(object_id)
-        return object_id if source is None else source.object_name
+        if source is not None:
+            return source.object_name
+        surface_entry = self._surface_texture_entries_by_id.get(object_id)
+        if surface_entry is not None:
+            return surface_entry.display_name
+        return self._placeable_objects_by_id.get(object_id, object_id)
+
+    def _is_surface_texture_source_id(self, source_id: str) -> bool:
+        """Classify reserved IDs while allowing concrete objects to win."""
+
+        normalized_id = str(source_id)
+        if normalized_id in self._placeable_objects_by_id:
+            return False
+        return bool(
+            normalized_id in self._surface_texture_entries_by_id
+            or is_atlas_wall_texture_source_id(normalized_id)
+        )
 
     def _source_has_fixed_resolution(self, source_id: str) -> bool:
         source = self._sources_by_object_id.get(str(source_id))

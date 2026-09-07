@@ -485,6 +485,7 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
                 for workspace in workspaces:
                     self.workspace.workspace_tabs.setCurrentWidget(workspace)
             _qt_application.processEvents()
+            self.workspace._sync_atlas_object_texture_sources()
 
         build_preview.assert_not_called()
         set_canvas_model.assert_not_called()

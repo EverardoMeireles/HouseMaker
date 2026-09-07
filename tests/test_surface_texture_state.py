@@ -396,6 +396,23 @@ class SurfaceTextureAssignmentTests(unittest.TestCase):
         self.assertEqual(assignment.reference_frame_indices, (4, 6))
         self.assertEqual((assignment.texture_width, assignment.texture_height), (512, 256))
 
+    def test_unused_assignment_round_trips_with_no_surface_ids(self) -> None:
+        assignment = SurfaceTextureAssignment(
+            assignment_id="unused-stone",
+            surface_type=SURFACE_TYPE_FLOOR,
+            surface_ids=(),
+            provider="meshy",
+            asset_path="textures/unused-stone.png",
+        )
+
+        restored = SurfaceTextureData.from_dict(
+            SurfaceTextureData(assignments=[assignment]).to_dict()
+        )
+
+        self.assertEqual(len(restored.assignments), 1)
+        self.assertEqual(restored.assignments[0].assignment_id, "unused-stone")
+        self.assertEqual(restored.assignments[0].surface_ids, ())
+
     def test_assignment_rejects_unsafe_assets_invalid_area_and_partial_dimensions(self) -> None:
         base_arguments = {
             "assignment_id": "texture-1",

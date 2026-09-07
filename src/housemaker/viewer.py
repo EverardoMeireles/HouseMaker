@@ -119,6 +119,8 @@ MAX_FIRST_PERSON_PITCH_DEGREES = 89.0
 WINDOW_EDITOR_PANEL_WIDTH = 190
 WINDOW_PREVIEW_OFFSET_METERS = 0.006
 WINDOW_SELECTION_COLOR = (0.20, 0.72, 1.0, 1.0)
+ATLAS_SURFACE_SELECTION_COLOR = (1.0, 0.72, 0.18, 1.0)
+ATLAS_SURFACE_HIGHLIGHT_COLOR = (0.20, 0.86, 0.38, 1.0)
 WINDOW_VALID_PREVIEW_COLOR = (0.20, 0.86, 0.38, 0.34)
 WINDOW_INVALID_PREVIEW_COLOR = (1.0, 0.24, 0.20, 0.34)
 DOORWAY_PREVIEW_OUTLINE_COLOR = (1.0, 0.72, 0.18, 0.98)
@@ -2261,6 +2263,8 @@ class GlbViewerWidget(QWidget):
     canvas_opening_edit_cancelled = Signal(object)
     placed_object_removal_requested = Signal(str)
     placed_object_transform_changed = Signal(str, object, object)
+    placed_object_selection_changed = Signal(object)
+    canvas_surface_selection_changed = Signal(object)
     face_selection_changed = Signal(object)
     projection_camera_selection_changed = Signal(object)
     projection_camera_percentage_step_requested = Signal(str, int)
@@ -2343,6 +2347,11 @@ class GlbViewerWidget(QWidget):
         self._canvas_opening_gizmo_items: list[GLGraphicsItem] = []
         self.object_transform_status_label: QLabel | None = None
         self._window_wall_targets: dict[str, FixedSurface] = {}
+        self._canvas_surface_targets: dict[str, FixedSurface] = {}
+        self._selected_canvas_surface_ids: tuple[str, ...] = ()
+        self._atlas_surface_selection_items: list[gl.GLLinePlotItem] = []
+        self._highlighted_canvas_surface_ids: tuple[str, ...] = ()
+        self._atlas_surface_highlight_items: list[gl.GLLinePlotItem] = []
         self._selected_window_wall_surface_id: str | None = None
         self._window_drag_first_world: tuple[float, float, float] | None = None
         self._window_preview_placement: WallWindowPlacement | None = None
@@ -2552,38 +2561,185 @@ class GlbViewerWidget(QWidget):
         return self._window_editing_enabled
 
     def set_wall_targets(self, surfaces: tuple[FixedSurface, ...]) -> None:
-        """Replace the immutable semantic walls available for selection."""
+        """Replace selectable surfaces and the wall-only window-tool subset."""
 
         if not self._window_editing_enabled:
             return
         if not isinstance(surfaces, tuple):
-            raise TypeError("Canvas wall targets must be supplied as a tuple.")
+            raise TypeError("Canvas surface targets must be supplied as a tuple.")
 
+        all_targets: dict[str, FixedSurface] = {}
         targets: dict[str, FixedSurface] = {}
         for surface in surfaces:
             if not isinstance(surface, FixedSurface):
-                raise TypeError("Canvas wall targets must be FixedSurface values.")
+                raise TypeError(
+                    "Canvas surface targets must be FixedSurface values."
+                )
+            if surface.surface_id in all_targets:
+                raise ValueError(
+                    f"Duplicate Canvas surface target: {surface.surface_id!r}."
+                )
+            all_targets[surface.surface_id] = surface
             if surface.surface_type != SURFACE_TYPE_WALL:
                 continue
-            if surface.surface_id in targets:
-                raise ValueError(
-                    f"Duplicate Canvas wall target: {surface.surface_id!r}."
-                )
             targets[surface.surface_id] = surface
 
         selected_id = self._selected_window_wall_surface_id
+        self._canvas_surface_targets = all_targets
+        previous_canvas_surface_ids = self._selected_canvas_surface_ids
+        self._selected_canvas_surface_ids = tuple(
+            surface_id
+            for surface_id in self._selected_canvas_surface_ids
+            if surface_id in all_targets
+        )
+        self._highlighted_canvas_surface_ids = tuple(
+            surface_id
+            for surface_id in self._highlighted_canvas_surface_ids
+            if surface_id in all_targets
+        )
         self._window_wall_targets = targets
         self._selected_window_wall_surface_id = (
             selected_id if selected_id in targets else None
         )
         self.cancel_window_placement(status_message=None)
         self._refresh_window_selection_outline()
+        self._refresh_atlas_surface_selection_outlines()
+        self._refresh_atlas_surface_highlight_outlines()
+        if self._selected_canvas_surface_ids != previous_canvas_surface_ids:
+            self.canvas_surface_selection_changed.emit(
+                self._selected_canvas_surface_ids
+            )
         self._sync_window_tools_controls()
 
     def get_selected_wall_surface_id(self) -> str | None:
         """Return the one selected semantic wall, if any."""
 
         return self._selected_window_wall_surface_id
+
+    def get_selected_canvas_surface_ids(self) -> tuple[str, ...]:
+        """Return semantic surfaces selected for Canvas editing."""
+
+        return self._selected_canvas_surface_ids
+
+    def set_selected_canvas_surface_ids(self, surface_ids: object) -> bool:
+        """Select known semantic surfaces without changing window editing."""
+
+        try:
+            requested_ids = tuple(
+                str(value).strip() for value in surface_ids  # type: ignore[arg-type]
+            )
+        except TypeError:
+            return False
+        normalized_ids = tuple(
+            dict.fromkeys(
+                surface_id
+                for surface_id in requested_ids
+                if surface_id in self._canvas_surface_targets
+            )
+        )
+        if normalized_ids == self._selected_canvas_surface_ids:
+            return False
+        self._selected_canvas_surface_ids = normalized_ids
+        self._refresh_atlas_surface_selection_outlines()
+        self.canvas_surface_selection_changed.emit(normalized_ids)
+        return True
+
+    def get_highlighted_canvas_surface_ids(self) -> tuple[str, ...]:
+        """Return non-selecting semantic surface highlights from the Atlas."""
+
+        return self._highlighted_canvas_surface_ids
+
+    def set_highlighted_canvas_surface_ids(self, surface_ids: object) -> bool:
+        """Show green outlines without changing or emitting Canvas selection."""
+
+        try:
+            requested_ids = tuple(
+                str(value).strip() for value in surface_ids  # type: ignore[arg-type]
+            )
+        except TypeError:
+            return False
+        normalized_ids = tuple(
+            dict.fromkeys(
+                surface_id
+                for surface_id in requested_ids
+                if surface_id in self._canvas_surface_targets
+            )
+        )
+        if normalized_ids == self._highlighted_canvas_surface_ids:
+            return False
+        self._highlighted_canvas_surface_ids = normalized_ids
+        self._refresh_atlas_surface_highlight_outlines()
+        return True
+
+    def select_canvas_surface_target(
+        self,
+        surface_id: str | None,
+        *,
+        additive: bool = False,
+    ) -> bool:
+        """Select one picked semantic surface, optionally toggling a set member."""
+
+        if not self._window_editing_enabled:
+            return False
+        normalized_id = None if surface_id is None else str(surface_id).strip()
+        surface = (
+            None
+            if normalized_id is None
+            else self._canvas_surface_targets.get(normalized_id)
+        )
+        if normalized_id is not None and surface is None:
+            return False
+        if normalized_id is None and additive:
+            return False
+
+        selected_ids = list(self._selected_canvas_surface_ids)
+        selected_surface = surface
+        if normalized_id is None:
+            selected_ids = []
+        elif additive and normalized_id in selected_ids:
+            selected_ids.remove(normalized_id)
+        elif additive:
+            selected_ids.append(normalized_id)
+        else:
+            selected_ids = [normalized_id]
+
+        if normalized_id is not None:
+            self._set_selected_canvas_opening_key(None)
+            self._set_selected_placed_object(None)
+        canvas_selection_changed = self.set_selected_canvas_surface_ids(
+            selected_ids
+        )
+
+        selected_wall_id = self._selected_window_wall_surface_id
+        if not additive:
+            selected_wall_id = (
+                normalized_id
+                if selected_surface is not None
+                and selected_surface.surface_type == SURFACE_TYPE_WALL
+                else None
+            )
+        elif (
+            selected_surface is not None
+            and selected_surface.surface_type == SURFACE_TYPE_WALL
+            and normalized_id in selected_ids
+        ):
+            selected_wall_id = normalized_id
+        elif (
+            normalized_id == selected_wall_id
+            and normalized_id not in selected_ids
+        ):
+            selected_wall_id = next(
+                (
+                    candidate_id
+                    for candidate_id in reversed(selected_ids)
+                    if candidate_id in self._window_wall_targets
+                ),
+                None,
+            )
+        wall_selection_changed = self._set_window_wall_selection(
+            selected_wall_id
+        )
+        return canvas_selection_changed or wall_selection_changed
 
     def select_wall_target(self, surface_id: str | None) -> bool:
         """Select one semantic wall, or clear selection with ``None``."""
@@ -2596,11 +2752,19 @@ class GlbViewerWidget(QWidget):
         if normalized_id is not None:
             self._set_selected_canvas_opening_key(None)
             self._set_selected_placed_object(None)
-        if normalized_id == self._selected_window_wall_surface_id:
-            return False
+        canvas_selection_changed = self.set_selected_canvas_surface_ids(
+            () if normalized_id is None else (normalized_id,)
+        )
+        wall_selection_changed = self._set_window_wall_selection(normalized_id)
+        return canvas_selection_changed or wall_selection_changed
 
+    def _set_window_wall_selection(self, surface_id: str | None) -> bool:
+        """Update only the singular wall used by the window-placement tools."""
+
+        if surface_id == self._selected_window_wall_surface_id:
+            return False
         self.cancel_window_placement(status_message=None)
-        self._selected_window_wall_surface_id = normalized_id
+        self._selected_window_wall_surface_id = surface_id
         self._refresh_window_selection_outline()
         self._sync_window_tools_controls()
         return True
@@ -2705,6 +2869,7 @@ class GlbViewerWidget(QWidget):
                 self.cancel_window_placement(status_message=None)
             self._set_selected_placed_object(None)
             self._selected_window_wall_surface_id = None
+            self.set_selected_canvas_surface_ids(())
             self._refresh_window_selection_outline()
         self._sync_window_tools_controls()
         if normalized_key is not None:
@@ -2762,6 +2927,7 @@ class GlbViewerWidget(QWidget):
         self._cancel_placed_object_gizmo_drag()
         self._selected_placed_object_id = object_id
         self._sync_placed_object_selection_rendering()
+        self.placed_object_selection_changed.emit(object_id)
         return True
 
     def begin_window_placement(self) -> bool:
@@ -2867,11 +3033,17 @@ class GlbViewerWidget(QWidget):
     def _handle_window_wall_pick_requested(self, position: QPointF) -> None:
         if not self._window_editing_enabled or self.is_window_placement_active():
             return
+        additive = bool(
+            QApplication.keyboardModifiers()
+            & Qt.KeyboardModifier.ControlModifier
+        )
         camera_ray = self.view.build_camera_ray(position)
         if camera_ray is None:
+            if additive:
+                return
             self._set_selected_canvas_opening_key(None)
             self._set_selected_placed_object(None)
-            self.select_wall_target(None)
+            self.select_canvas_surface_target(None)
             return
         ray_origin, ray_direction = camera_ray
         opening_hit = _get_nearest_canvas_opening_ray_hit(
@@ -2887,16 +3059,16 @@ class GlbViewerWidget(QWidget):
             ray_origin,
             ray_direction,
         )
-        wall_hit = _get_nearest_fixed_surface_ray_hit(
-            tuple(self._window_wall_targets.values()),
+        surface_hit = _get_nearest_fixed_surface_ray_hit(
+            tuple(self._canvas_surface_targets.values()),
             ray_origin,
             ray_direction,
         )
         visible_object_hit = object_hit
         if (
             object_hit is not None
-            and wall_hit is not None
-            and object_hit[2] > wall_hit[2] + 1e-9
+            and surface_hit is not None
+            and object_hit[2] > surface_hit[2] + 1e-9
         ):
             visible_object_hit = None
         if (
@@ -2913,8 +3085,9 @@ class GlbViewerWidget(QWidget):
             return
         self._set_selected_canvas_opening_key(None)
         self._set_selected_placed_object(None)
-        self.select_wall_target(
-            None if wall_hit is None else wall_hit[0].surface_id
+        self.select_canvas_surface_target(
+            None if surface_hit is None else surface_hit[0].surface_id,
+            additive=additive,
         )
 
     # ### Placed-object gizmo input ###
@@ -3113,6 +3286,80 @@ class GlbViewerWidget(QWidget):
         self._window_selection_item = None
         if item is not None and item in self.view.items:
             self.view.removeItem(item)
+
+    def _refresh_atlas_surface_selection_outlines(self) -> None:
+        """Render every editable Canvas surface selection above scene geometry."""
+
+        self._remove_atlas_surface_selection_items()
+        if self.model is None:
+            return
+        for surface_id in self._selected_canvas_surface_ids:
+            surface = self._canvas_surface_targets.get(surface_id)
+            if surface is None:
+                continue
+            positions = _build_fixed_surface_boundary_line_positions(surface)
+            if positions is None:
+                continue
+            positions = _offset_points_toward_camera(
+                positions,
+                _get_fixed_surface_plane_normal(surface),
+                self.view.cameraPosition(),
+                WINDOW_PREVIEW_OFFSET_METERS * 2.0,
+            )
+            item = gl.GLLinePlotItem(
+                pos=np.asarray(positions, dtype=float),
+                color=ATLAS_SURFACE_SELECTION_COLOR,
+                width=4.0,
+                antialias=True,
+                mode="lines",
+            )
+            item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+            self.view.addItem(item)
+            self._atlas_surface_selection_items.append(item)
+        self.view.update()
+
+    def _remove_atlas_surface_selection_items(self) -> None:
+        for item in self._atlas_surface_selection_items:
+            if item in self.view.items:
+                self.view.removeItem(item)
+        self._atlas_surface_selection_items = []
+
+    def _refresh_atlas_surface_highlight_outlines(self) -> None:
+        """Render non-selecting Atlas surface highlights in green."""
+
+        self._remove_atlas_surface_highlight_items()
+        if self.model is None:
+            return
+        for surface_id in self._highlighted_canvas_surface_ids:
+            surface = self._canvas_surface_targets.get(surface_id)
+            if surface is None:
+                continue
+            positions = _build_fixed_surface_boundary_line_positions(surface)
+            if positions is None:
+                continue
+            positions = _offset_points_toward_camera(
+                positions,
+                _get_fixed_surface_plane_normal(surface),
+                self.view.cameraPosition(),
+                WINDOW_PREVIEW_OFFSET_METERS * 3.0,
+            )
+            item = gl.GLLinePlotItem(
+                pos=np.asarray(positions, dtype=float),
+                color=ATLAS_SURFACE_HIGHLIGHT_COLOR,
+                width=4.0,
+                antialias=True,
+                mode="lines",
+            )
+            item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+            self.view.addItem(item)
+            self._atlas_surface_highlight_items.append(item)
+        self.view.update()
+
+    def _remove_atlas_surface_highlight_items(self) -> None:
+        for item in self._atlas_surface_highlight_items:
+            if item in self.view.items:
+                self.view.removeItem(item)
+        self._atlas_surface_highlight_items = []
 
     def _set_window_preview_item(
         self,
@@ -3316,7 +3563,10 @@ class GlbViewerWidget(QWidget):
         self._cancel_canvas_opening_edit_drag()
         self._cancel_placed_object_gizmo_drag()
         self.clear_face_edit_geometry()
+        had_selected_placed_object = self._selected_placed_object_id is not None
         self._selected_placed_object_id = None
+        if had_selected_placed_object:
+            self.placed_object_selection_changed.emit(None)
         self._set_selected_canvas_opening_key(None)
         if self._window_editing_enabled:
             self.cancel_window_placement(status_message=None)
@@ -4514,6 +4764,8 @@ class GlbViewerWidget(QWidget):
         if self.model is None:
             self._set_default_camera()
             self._refresh_window_selection_outline()
+            self._refresh_atlas_surface_selection_outlines()
+            self._refresh_atlas_surface_highlight_outlines()
             self._refresh_canvas_opening_gizmo_items()
             self._refresh_doorway_preview_outline_item()
             return
@@ -4603,6 +4855,8 @@ class GlbViewerWidget(QWidget):
         self._set_default_first_person_camera_pose_from_bounding_box(bounding_box)
         self.view.apply_navigation_camera()
         self._refresh_window_selection_outline()
+        self._refresh_atlas_surface_selection_outlines()
+        self._refresh_atlas_surface_highlight_outlines()
         self._refresh_canvas_opening_gizmo_items()
         self._sync_placed_object_selection_rendering()
         self._refresh_doorway_preview_outline_item()
@@ -5099,8 +5353,11 @@ class GlbViewerWidget(QWidget):
     def _sync_placed_object_selection_rendering(self) -> None:
         selected_id = self._selected_placed_object_id
         if selected_id not in self._placed_object_render_groups:
+            selection_changed = selected_id is not None
             selected_id = None
             self._selected_placed_object_id = None
+            if selection_changed:
+                self.placed_object_selection_changed.emit(None)
         for object_id, group in self._placed_object_render_groups.items():
             group.selection_item.setVisible(object_id == selected_id)
         self._remove_transform_gizmo_items()
@@ -5653,6 +5910,8 @@ class GlbViewerWidget(QWidget):
         self.projection_camera_indicator_geometries = {}
         self._sync_projection_camera_input_state()
         self._window_selection_item = None
+        self._atlas_surface_selection_items = []
+        self._atlas_surface_highlight_items = []
         self._window_preview_item = None
         self._doorway_preview_outline_item = None
 

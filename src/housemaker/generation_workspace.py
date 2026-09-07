@@ -123,10 +123,7 @@ from housemaker.object_symmetry import (
     SYMMETRIC_DIVISION_SIDE_ORDER_BY_ORIENTATION,
     SYMMETRIC_DIVISION_SIDES_BY_ORIENTATION,
     SYMMETRIC_QUARTER_METADATA_VERSION,
-    SYMMETRIC_SELECTION_MODE_FEWEST_TRIANGLES_RANDOM_TIE,
     SYMMETRIC_SQUARE_PAIR_CONTENT_RESOLUTIONS,
-    SYMMETRIC_TEXTURE_CONTENT_HALF_LEFT,
-    SYMMETRIC_TEXTURE_PACKING_MODE_PAIR,
     SymmetricDivisionMetadata,
     SymmetricDivisionResult,
     SymmetricPairTextureVariants,
@@ -3023,6 +3020,7 @@ class GenerationWorkspace(QWidget):
     texture_regeneration_completed = Signal(object, object)
     generated_object_changed = Signal(object, object)
     generated_object_placement_changed = Signal(object)
+    placeable_objects_changed = Signal(object)
     operation_cancelled = Signal(str, object)
     placement_requested = Signal(str)
     placement_request_finished = Signal(str)
@@ -3116,6 +3114,51 @@ class GenerationWorkspace(QWidget):
 
         return tuple(record.object_id for record in self._data.generated_objects)
 
+    def get_generated_object_names_by_id(self) -> dict[str, str]:
+        """Return lightweight display names for completed objects."""
+
+        return {
+            record.object_id: record.object_name
+            for record in self._data.generated_objects
+        }
+
+    def has_generated_object_texture_variants(self, object_id: str) -> bool:
+        """Report whether a completed object declares generated textures."""
+
+        record = self._find_generated_object_record(str(object_id).strip())
+        if record is None:
+            return False
+        raw_variants = record.pipeline.get(TEXTURE_VARIANTS_PIPELINE_KEY)
+        return isinstance(raw_variants, dict) and bool(raw_variants)
+
+    def get_placeable_object_names_by_id(self) -> dict[str, str]:
+        """Return completed object IDs and eligible active operation IDs."""
+
+        placeable_objects = self.get_generated_object_names_by_id()
+        for runtime in self._object_job_runtimes.values():
+            if not self._can_place_active_operation(runtime.operation):
+                continue
+            placeable_objects[runtime.operation_id] = (
+                self._active_placeable_object_name(runtime)
+            )
+        return placeable_objects
+
+    def get_scene_bound_placeable_object_ids(self) -> tuple[str, ...]:
+        """Return completed and in-flight objects with a Canvas placement."""
+
+        bound_ids = [
+            record.object_id
+            for record in self._data.generated_objects
+            if record.placement is not None
+        ]
+        bound_ids.extend(
+            runtime.operation_id
+            for runtime in self._object_job_runtimes.values()
+            if self._can_place_active_operation(runtime.operation)
+            and runtime.operation.pending_placement is not None
+        )
+        return tuple(bound_ids)
+
     def refresh_file_backed_previews(self) -> None:
         """Reload the selected Object preview only after an asset revision."""
 
@@ -3199,6 +3242,7 @@ class GenerationWorkspace(QWidget):
         finally:
             self._is_rebuilding_generation_data = False
         self._sync_controls()
+        self._emit_placeable_objects_changed()
 
     def set_runtime_settings(self, settings: GenerationServiceSettings) -> None:
         if not isinstance(settings, GenerationServiceSettings):
@@ -3654,10 +3698,32 @@ class GenerationWorkspace(QWidget):
             if self._can_place_active_operation(runtime.operation)
         )
         if len(placeable_jobs) == 1:
-            operation = placeable_jobs[0].operation
-            self.placement_requested.emit(operation.operation_id)
-            return True
+            return self.request_placeable_object_placement(
+                placeable_jobs[0].operation_id
+            )
         record = self._find_generated_object_record(self._selected_object_id)
+        if record is None:
+            return False
+
+        return self.request_generated_object_placement(record.object_id)
+
+    def request_placeable_object_placement(self, placeable_id: str) -> bool:
+        """Request placement by active operation ID or completed object ID."""
+
+        normalized_id = str(placeable_id).strip()
+        runtime = self._object_job_runtimes.get(normalized_id)
+        if runtime is not None:
+            if not self._can_place_active_operation(runtime.operation):
+                return False
+            self._finish_existing_object_placement_request()
+            self.placement_requested.emit(runtime.operation_id)
+            return True
+        return self.request_generated_object_placement(normalized_id)
+
+    def request_generated_object_placement(self, object_id: str) -> bool:
+        """Request Canvas placement for one exact completed generated object."""
+
+        record = self._find_generated_object_record(str(object_id).strip())
         if (
             record is None
             or self._object_has_active_mutation_job(record.object_id)
@@ -3695,6 +3761,7 @@ class GenerationWorkspace(QWidget):
             self.status_label.setText(
                 "Object placement selected. Generation is still in progress."
             )
+            self._emit_placeable_objects_changed()
             return True
 
         request = self._existing_object_placement_request
@@ -3800,6 +3867,23 @@ class GenerationWorkspace(QWidget):
         self._sync_controls()
         return True
 
+    def remove_placeable_object_placement(self, placeable_id: str) -> bool:
+        """Remove a completed or in-flight object's Canvas binding."""
+
+        normalized_id = str(placeable_id).strip()
+        runtime = self._object_job_runtimes.get(normalized_id)
+        if runtime is not None:
+            operation = runtime.operation
+            if operation.pending_placement is None:
+                return False
+            operation.pending_placement = None
+            self.status_label.setText(
+                "Removed the pending object placement from Canvas."
+            )
+            self._emit_placeable_objects_changed()
+            return True
+        return self.remove_generated_object_placement(normalized_id)
+
     def cancel_object_placement_request(self, request_id: str) -> bool:
         """Forget one exact completed-object placement request."""
 
@@ -3832,8 +3916,11 @@ class GenerationWorkspace(QWidget):
         operation = runtime.operation
         if operation.cancel_requested:
             return True
+        was_placeable = self._can_place_active_operation(operation)
         operation.cancel_requested = True
         operation.pending_placement = None
+        if was_placeable:
+            self._emit_placeable_objects_changed()
         worker = runtime.worker
         if worker is not None and is_valid_qt_object(worker):
             worker.cancel()
@@ -4095,6 +4182,7 @@ class GenerationWorkspace(QWidget):
             self.status_label.setText(f"Deleted: {deleted_record.object_name}")
         self.generated_object_deleted.emit(deleted_record.object_id)
         self._emit_data_changed()
+        self._emit_placeable_objects_changed()
         self._sync_controls()
         return True
 
@@ -4434,6 +4522,34 @@ class GenerationWorkspace(QWidget):
                     operation_id
                 ),
             )
+        if self._can_place_active_operation(runtime.operation):
+            self._emit_placeable_objects_changed()
+
+    def _active_placeable_object_name(
+        self,
+        runtime: _ObjectJobRuntime,
+    ) -> str:
+        """Return the best available user-facing name for an active model."""
+
+        requested_name = runtime.requested_name.strip()
+        if requested_name:
+            return requested_name
+        manager = self._job_manager
+        if manager is not None and runtime.managed_job_id is not None:
+            managed_job = manager.get_job(runtime.managed_job_id)
+            if managed_job is not None and managed_job.name.strip():
+                return managed_job.name.strip()
+        request = runtime.generation_request
+        if request is not None:
+            return f"Object from frame {request.frame_index + 1}"
+        return "Generating object"
+
+    def _emit_placeable_objects_changed(self) -> None:
+        """Publish a fresh lightweight catalog for Atlas synchronization."""
+
+        self.placeable_objects_changed.emit(
+            self.get_placeable_object_names_by_id()
+        )
 
     def _set_legacy_active_job_runtime(
         self,
@@ -4860,21 +4976,6 @@ class GenerationWorkspace(QWidget):
         buttons_layout.addWidget(self.generate_texture_button)
         self.regenerate_texture_button = self.generate_texture_button
 
-        buttons_layout.addSpacing(30)
-        buttons_layout.addStretch(1)
-
-        self.place_object_button = QPushButton("Place")
-        self.place_object_button.setObjectName("place_generated_object_button")
-        self.place_object_button.setMinimumHeight(38)
-        self.place_object_button.setToolTip(
-            "Choose where the selected object appears on the Canvas, or set "
-            "the destination while a new model is still generating."
-        )
-        self.place_object_button.clicked.connect(
-            self.request_object_placement
-        )
-        buttons_layout.addWidget(self.place_object_button)
-
         self.undo_object_change_button = QPushButton("Undo")
         self.undo_object_change_button.setObjectName(
             "undo_object_change_button"
@@ -5171,7 +5272,10 @@ class GenerationWorkspace(QWidget):
             and operation.target_object_id != object_id
         ):
             return
+        was_placeable = self._can_place_active_operation(operation)
         operation.committed_object_id = object_id
+        if was_placeable:
+            self._emit_placeable_objects_changed()
         self._sync_controls()
 
     @Slot(str, object, object)
@@ -6306,7 +6410,10 @@ class GenerationWorkspace(QWidget):
                     runtime,
                     "The job ended before its result could be committed.",
                 )
+        was_placeable = self._can_place_active_operation(operation)
         self._object_job_runtimes.pop(runtime.operation_id, None)
+        if was_placeable:
+            self._emit_placeable_objects_changed()
         runtime.relay.deleteLater()
         self._set_legacy_active_job_runtime(
             self._legacy_active_job_runtime()
@@ -6609,16 +6716,6 @@ class GenerationWorkspace(QWidget):
             )
         )
 
-        self.place_object_button.setEnabled(
-            any(
-                self._can_place_active_operation(runtime.operation)
-                for runtime in self._object_job_runtimes.values()
-            )
-            or (
-                selected_record is not None
-                and not selected_object_is_busy
-            )
-        )
         self.cancel_operation_button.setEnabled(
             self._active_object_operation is not None
             and self._legacy_active_job_runtime() is not None

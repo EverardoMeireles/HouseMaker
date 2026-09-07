@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QApplication, QLabel, QLineEdit
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.settings_widget import (
+    ATLAS_DISPLAY_SCREEN_SETTING_KEY,
     AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR_SETTING_KEY,
     AUTOMATIC_ATLAS_TEXTURE_RESOLUTION_SETTING_KEY,
     AUTOMATIC_ATLAS_TEXTURE_RESOLUTIONS,
@@ -48,6 +49,7 @@ from housemaker.settings_widget import (
     GenerationServiceSettings,
     SettingsWidget,
     fullscreen_3d_viewer_screen_id,
+    read_atlas_display_screen_id,
     read_automatic_atlas_texture_sort_by_pbr,
     read_automatic_atlas_texture_resolution,
     read_canvas_3d_navigation_toggle_hotkey,
@@ -72,6 +74,24 @@ class SettingsWidgetTests(unittest.TestCase):
             GenerationServiceSettings().meshy_target_polycount,
             2_000,
         )
+
+    def test_atlas_display_model_defaults_normalizes_and_validates(self) -> None:
+        self.assertIsNone(GenerationServiceSettings().atlas_display_screen_id)
+        self.assertEqual(
+            GenerationServiceSettings(
+                atlas_display_screen_id="  screen:atlas  "
+            ).atlas_display_screen_id,
+            "screen:atlas",
+        )
+
+        for value in (False, 1, []):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "Atlas display"):
+                    GenerationServiceSettings(
+                        atlas_display_screen_id=(
+                            value  # type: ignore[arg-type]
+                        )
+                    )
 
     def test_automatic_atlas_resolution_defaults_persists_and_emits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -322,6 +342,7 @@ class SettingsWidgetTests(unittest.TestCase):
             self.assertTrue(
                 hasattr(widget, "fullscreen_3d_viewer_screen_combo")
             )
+            self.assertTrue(hasattr(widget, "atlas_display_screen_combo"))
             self.assertTrue(
                 hasattr(
                     widget,
@@ -382,6 +403,84 @@ class SettingsWidgetTests(unittest.TestCase):
                 screen_id = widget.get_fullscreen_3d_viewer_screen_id()
 
             self.assertEqual(screen_id, "screen:cached")
+
+    def test_atlas_display_persists_restores_and_is_cached(self) -> None:
+        options = (
+            Fullscreen3DViewerScreenOption(
+                screen_id="monitor:Acme|Atlas|002",
+                label="Atlas display (1920 x 1080)",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            with patch(
+                "housemaker.settings_widget."
+                "connected_fullscreen_3d_viewer_display_options",
+                return_value=options,
+            ):
+                widget = SettingsWidget(
+                    application_settings=application_settings,
+                    environment={},
+                )
+                combo = widget.atlas_display_screen_combo
+                emitted_changes: list[bool] = []
+                widget.settings_changed.connect(
+                    lambda: emitted_changes.append(True)
+                )
+
+                self.assertEqual(combo.itemText(0), "None")
+                self.assertIsNone(combo.itemData(0))
+                self.assertIsNone(
+                    widget.get_settings().atlas_display_screen_id
+                )
+
+                combo.setCurrentIndex(combo.findData(options[0].screen_id))
+
+                self.assertEqual(
+                    application_settings.get(ATLAS_DISPLAY_SCREEN_SETTING_KEY),
+                    options[0].screen_id,
+                )
+                self.assertEqual(
+                    read_atlas_display_screen_id(application_settings),
+                    options[0].screen_id,
+                )
+                self.assertEqual(
+                    widget.get_settings().atlas_display_screen_id,
+                    options[0].screen_id,
+                )
+                self.assertEqual(emitted_changes, [True])
+
+                with patch.object(
+                    application_settings,
+                    "get",
+                    side_effect=AssertionError("unexpected settings-file read"),
+                ):
+                    selected_id = widget.get_atlas_display_screen_id()
+                self.assertEqual(selected_id, options[0].screen_id)
+
+                restored = SettingsWidget(
+                    application_settings=_build_test_settings(
+                        temporary_directory
+                    ),
+                    environment={},
+                )
+                self.assertEqual(
+                    restored.atlas_display_screen_combo.currentData(),
+                    options[0].screen_id,
+                )
+
+    def test_atlas_display_reader_ignores_malformed_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            for value in (False, 1, []):
+                with self.subTest(value=value):
+                    application_settings.set(
+                        ATLAS_DISPLAY_SCREEN_SETTING_KEY,
+                        value,
+                    )
+                    self.assertIsNone(
+                        read_atlas_display_screen_id(application_settings)
+                    )
 
     def test_unused_face_removal_persists_and_emits_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -286,6 +286,7 @@ class StairHit:
 
 # ### Widgets ###
 class BlueprintCanvas(QWidget):
+    geometry_changed = Signal()
     rooms_changed = Signal()
     doorways_changed = Signal()
     doorway_dimension_preview_changed = Signal()
@@ -777,6 +778,7 @@ class BlueprintCanvas(QWidget):
             or self.rooms != previous_rooms
         ):
             self.rooms_changed.emit()
+            self.geometry_changed.emit()
         if self.doorways != previous_doorways:
             self.doorways_changed.emit()
         if self.floor_contour_vertex_ids != previous_floor_contour_vertex_ids:
@@ -1127,6 +1129,7 @@ class BlueprintCanvas(QWidget):
             self.preview_guides = []
             self._reset_pointer_state()
             self.update()
+            self.geometry_changed.emit()
             event.accept()
             return
 
@@ -1304,6 +1307,7 @@ class BlueprintCanvas(QWidget):
         self.active_vertex_id = vertex.id
         self.preview_point = (vertex.x, vertex.y)
         self.preview_guides = []
+        self.geometry_changed.emit()
 
     def _handle_new_vertex_click(self, point: tuple[float, float]) -> None:
         self._push_undo_state()
@@ -1316,6 +1320,7 @@ class BlueprintCanvas(QWidget):
         self.selected_vertex_id = new_vertex.id
         self.preview_point = point
         self.preview_guides = []
+        self.geometry_changed.emit()
 
     def _join_dragged_vertex_to_edge(self, vertex_id: int) -> None:
         vertex = self.vertex_data.get_vertex(vertex_id)
@@ -1356,6 +1361,7 @@ class BlueprintCanvas(QWidget):
         self.selected_vertex_id = new_vertex.id
         self.preview_point = point
         self.preview_guides = []
+        self.geometry_changed.emit()
 
     # ### Stair helpers ###
     def _is_stair_placement_active(self) -> bool:
@@ -2341,6 +2347,7 @@ class BlueprintCanvas(QWidget):
         self.preview_guides = []
         self._reset_pointer_state()
         self.update()
+        self.geometry_changed.emit()
 
     def _handle_floor_contour_vertex_click(self, vertex_id: int) -> None:
         pending_vertex_ids = self.pending_floor_contour_vertex_ids

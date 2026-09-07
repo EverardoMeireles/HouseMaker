@@ -144,8 +144,10 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
             self.workspace.workspace_tabs.setCurrentWidget(
                 self.workspace.texture_atlas_workspace
             )
-            self._assert_externally_hosted_viewer_is(
-                self.workspace.atlas_object_preview_viewer
+            self.assertFalse(self.workspace._external_viewer_host.is_active)
+            self.assertIs(
+                self.workspace.atlas_object_preview_viewer.parentWidget(),
+                self.workspace.texture_atlas_workspace.object_preview_container,
             )
             self.assertFalse(
                 self.workspace.atlas_object_preview_viewer.isHidden()
@@ -203,10 +205,7 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
             )
             self._assert_externally_hosted_viewer_is(self.workspace.viewer)
 
-    def test_atlas_click_loads_exact_variant_in_detached_viewer(self) -> None:
-        screen_id = "screen:external-atlas-preview-test"
-        combo = self.workspace.settings_widget.fullscreen_3d_viewer_screen_combo
-        combo.addItem("External Atlas preview display", screen_id)
+    def test_atlas_click_loads_exact_variant_in_embedded_viewer(self) -> None:
         asset_path = Path(self._temporary_directory.name) / "chair-2048.glb"
         asset_path.write_bytes(b"test glb")
         variant = SimpleNamespace(
@@ -217,10 +216,6 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
         model = _generated_box_model()
 
         with (
-            patch(
-                "housemaker.main.resolve_fullscreen_3d_viewer_screen",
-                return_value=_primary_screen(),
-            ),
             patch.object(
                 self.workspace.generation,
                 "get_texture_variant",
@@ -231,7 +226,6 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
                 return_value=model,
             ) as importer,
         ):
-            combo.setCurrentIndex(combo.findData(screen_id))
             self.workspace.workspace_tabs.setCurrentWidget(
                 self.workspace.texture_atlas_workspace
             )
@@ -243,8 +237,9 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
 
         variant_resolver.assert_called_once_with("chair", 2048)
         importer.assert_called_once_with(b"test glb")
-        self._assert_externally_hosted_viewer_is(
-            self.workspace.atlas_object_preview_viewer
+        self.assertIs(
+            self.workspace.atlas_object_preview_viewer.parentWidget(),
+            self.workspace.texture_atlas_workspace.object_preview_container,
         )
         self.assertEqual(
             self.workspace.atlas_object_preview_viewer
@@ -254,13 +249,11 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
         self.assertIs(self.workspace.atlas_object_preview_viewer.model, model)
         self.assertTrue(self.workspace.atlas_object_preview_viewer.isVisible())
 
-    def test_atlas_surface_texture_uses_plane_in_detached_viewer(self) -> None:
+    def test_atlas_surface_texture_uses_plane_in_embedded_viewer(self) -> None:
         assignment, source_id, _atlas_id = self._seed_packed_wall_texture()
         self.workspace.workspace_tabs.setCurrentWidget(
             self.workspace.texture_atlas_workspace
         )
-        self._detach_viewer("screen:external-atlas-surface-preview")
-
         self.assertTrue(
             self.workspace.texture_atlas_workspace
             .request_selected_object_preview()
@@ -268,7 +261,10 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
         _qt_application.processEvents()
 
         viewer = self.workspace.atlas_object_preview_viewer
-        self._assert_externally_hosted_viewer_is(viewer)
+        self.assertIs(
+            viewer.parentWidget(),
+            self.workspace.texture_atlas_workspace.object_preview_container,
+        )
         self.assertTrue(viewer.isVisible())
         self.assertIsNotNone(viewer.model)
         assert viewer.model is not None
@@ -323,11 +319,10 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
             cached_model,
         )
 
-    def test_delete_key_in_detached_atlas_viewer_unassigns_texture(self) -> None:
+    def test_delete_key_in_embedded_atlas_viewer_unassigns_texture(self) -> None:
         assignment, source_id, atlas_id = self._seed_packed_wall_texture()
         atlas_workspace = self.workspace.texture_atlas_workspace
         self.workspace.workspace_tabs.setCurrentWidget(atlas_workspace)
-        self._detach_viewer("screen:external-atlas-delete")
         changes: list[TextureAtlasData] = []
         atlas_workspace.data_changed.connect(changes.append)
 
@@ -349,40 +344,123 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
         assert source_path is not None
         self.assertTrue(source_path.is_file())
 
-    def test_returning_to_atlas_refreshes_the_selected_external_preview(
+    def test_atlas_display_detaches_complete_workspace_and_restores_tab(
         self,
     ) -> None:
-        screen_id = "screen:external-atlas-refresh-test"
-        combo = self.workspace.settings_widget.fullscreen_3d_viewer_screen_combo
-        combo.addItem("External Atlas refresh display", screen_id)
+        screen = _primary_screen()
+        screen_id = "screen:external-atlas-test"
+        combo = self.workspace.settings_widget.atlas_display_screen_combo
+        combo.addItem("External Atlas display", screen_id)
 
-        with (
-            patch(
-                "housemaker.main.resolve_fullscreen_3d_viewer_screen",
-                return_value=_primary_screen(),
+        with patch(
+            "housemaker.main.resolve_fullscreen_3d_viewer_screen",
+            side_effect=lambda requested_id: (
+                screen if requested_id == screen_id else None
             ),
-            patch.object(
-                self.workspace.texture_atlas_workspace,
-                "request_selected_object_preview",
-            ) as request_preview,
         ):
             combo.setCurrentIndex(combo.findData(screen_id))
-            self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.texture_atlas_workspace
+            _qt_application.processEvents()
+
+            self.assertTrue(self.workspace._external_atlas_host.is_active)
+            self.assertIs(
+                self.workspace._external_atlas_host.viewer,
+                self.workspace.texture_atlas_workspace,
             )
-            request_preview.assert_called_once_with()
+            self.assertIs(
+                self.workspace.texture_atlas_workspace.parentWidget(),
+                self.workspace._external_atlas_host.window,
+            )
+            self.assertTrue(
+                self.workspace._external_atlas_host.window.isMaximized()
+            )
+            self.assertEqual(
+                self.workspace.workspace_tabs.indexOf(
+                    self.workspace.texture_atlas_workspace
+                ),
+                -1,
+            )
+            self.assertEqual(self.workspace.atlas_workspace_tab_index, -1)
+            self.assertNotIn(
+                "Atlas",
+                [
+                    self.workspace.workspace_tabs.tabText(index)
+                    for index in range(self.workspace.workspace_tabs.count())
+                ],
+            )
 
             self.workspace.workspace_tabs.setCurrentWidget(
                 self.workspace.generation
             )
-            request_preview.reset_mock()
-            self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.texture_atlas_workspace
-            )
+            self.assertTrue(self.workspace._external_atlas_host.is_active)
 
-        request_preview.assert_called_once_with()
-        self._assert_externally_hosted_viewer_is(
-            self.workspace.atlas_object_preview_viewer
+            combo.setCurrentIndex(0)
+            _qt_application.processEvents()
+
+        self.assertFalse(self.workspace._external_atlas_host.is_active)
+        restored_atlas_index = self.workspace.workspace_tabs.indexOf(
+            self.workspace.texture_atlas_workspace
+        )
+        self.assertEqual(
+            restored_atlas_index,
+            self.workspace.workspace_tabs.indexOf(
+                self.workspace.canvas_viewer_workspace
+            )
+            + 1,
+        )
+        self.assertEqual(
+            self.workspace.atlas_workspace_tab_index,
+            restored_atlas_index,
+        )
+        self.assertIs(
+            self.workspace.workspace_tabs.widget(
+                self.workspace.atlas_workspace_tab_index
+            ),
+            self.workspace.texture_atlas_workspace,
+        )
+        self.assertIs(
+            self.workspace.workspace_tabs.currentWidget(),
+            self.workspace.generation,
+        )
+        self.assertTrue(self.workspace.generation.isVisible())
+        self.assertFalse(
+            self.workspace.texture_atlas_workspace.isVisible()
+        )
+
+    def test_closing_detached_atlas_restores_tab_without_stealing_focus(
+        self,
+    ) -> None:
+        screen = _primary_screen()
+        screen_id = "screen:external-atlas-close-test"
+        combo = self.workspace.settings_widget.atlas_display_screen_combo
+        combo.addItem("External Atlas display", screen_id)
+
+        with patch(
+            "housemaker.main.resolve_fullscreen_3d_viewer_screen",
+            side_effect=lambda requested_id: (
+                screen if requested_id == screen_id else None
+            ),
+        ):
+            combo.setCurrentIndex(combo.findData(screen_id))
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.generation
+            )
+            self.workspace._external_atlas_host.window.close()
+            _qt_application.processEvents()
+
+        self.assertFalse(self.workspace._external_atlas_host.is_active)
+        self.assertIsNone(combo.currentData())
+        self.assertIs(
+            self.workspace.workspace_tabs.currentWidget(),
+            self.workspace.generation,
+        )
+        self.assertEqual(
+            self.workspace.workspace_tabs.indexOf(
+                self.workspace.texture_atlas_workspace
+            ),
+            self.workspace.workspace_tabs.indexOf(
+                self.workspace.canvas_viewer_workspace
+            )
+            + 1,
         )
 
     def test_missing_atlas_variant_clears_stale_detached_preview(self) -> None:
@@ -640,7 +718,9 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
             assignment.assignment_id
         )
         self.assertTrue(atlas_workspace._select_object_row(source_id))
-        atlas_workspace.assign_object_button.click()
+        self.assertTrue(
+            atlas_workspace.assign_source_to_selected_atlas(source_id)
+        )
         return assignment, source_id, atlas.atlas_id
 
     def _detach_viewer(self, screen_id: str) -> None:

@@ -13,7 +13,6 @@ import unittest
 from pathlib import Path
 
 import trimesh
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QHBoxLayout
 
 from housemaker.generation_state import GeneratedObjectRecord, GenerationData
@@ -121,7 +120,9 @@ class RetiredObjectTextureInpaintWorkspaceTests(unittest.TestCase):
     def test_removed_video_mask_undo_control_stays_absent(self) -> None:
         self.assertFalse(hasattr(self.workspace, "undo_mask_button"))
 
-    def test_action_order_spacing_and_far_right_operation_controls(self) -> None:
+    def test_action_controls_are_consecutive_without_removed_place_button(
+        self,
+    ) -> None:
         layout = _action_layout(self.workspace)
         widgets = [
             layout.itemAt(index).widget()
@@ -131,7 +132,6 @@ class RetiredObjectTextureInpaintWorkspaceTests(unittest.TestCase):
             self.workspace.generate_button,
             self.workspace.generate_geometry_button,
             self.workspace.generate_texture_button,
-            self.workspace.place_object_button,
             self.workspace.undo_object_change_button,
             self.workspace.cancel_operation_button,
         )
@@ -141,27 +141,11 @@ class RetiredObjectTextureInpaintWorkspaceTests(unittest.TestCase):
         generate_index, geometry_index, texture_index = action_indices[:3]
         self.assertEqual(geometry_index, generate_index + 1)
         self.assertEqual(texture_index, geometry_index + 1)
-
-        fixed_spacing = layout.itemAt(texture_index + 1).spacerItem()
-        self.assertIsNotNone(fixed_spacing)
-        assert fixed_spacing is not None
-        self.assertGreaterEqual(fixed_spacing.sizeHint().width(), 30)
-        self.assertFalse(
-            fixed_spacing.expandingDirections() & Qt.Orientation.Horizontal
-        )
-
-        place_index = action_indices[-3]
-        stretch = layout.itemAt(place_index - 1).spacerItem()
-        self.assertIsNotNone(stretch)
-        assert stretch is not None
-        self.assertTrue(
-            stretch.expandingDirections() & Qt.Orientation.Horizontal
-        )
+        self.assertFalse(hasattr(self.workspace, "place_object_button"))
         self.assertEqual(action_indices[-1], layout.count() - 1)
-        self.assertEqual(action_indices[-1] - action_indices[-2], 1)
-        self.assertGreater(
-            self.workspace.undo_object_change_button.geometry().left(),
-            self.workspace.generate_texture_button.geometry().right(),
+        self.assertEqual(
+            action_indices,
+            tuple(range(action_indices[0], action_indices[-1] + 1)),
         )
 
 

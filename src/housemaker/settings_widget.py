@@ -34,6 +34,7 @@ FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY = (
     "display/fullscreen_3d_viewer_screen_id"
 )
 JOBS_WINDOW_SCREEN_SETTING_KEY = "display/jobs_window_screen_id"
+ATLAS_DISPLAY_SCREEN_SETTING_KEY = "display/atlas_screen_id"
 AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR_SETTING_KEY = (
     "atlas/automatic_texture_sort_by_pbr"
 )
@@ -151,6 +152,7 @@ class GenerationServiceSettings:
     use_half_mesh_texture_prefix: bool = (
         DEFAULT_USE_HALF_MESH_TEXTURE_PREFIX
     )
+    atlas_display_screen_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.use_half_mesh_texture_prefix, bool):
@@ -234,6 +236,18 @@ class GenerationServiceSettings:
             "jobs_window_screen_id",
             _normalize_fullscreen_3d_viewer_screen_id(
                 self.jobs_window_screen_id
+            ),
+        )
+        if (
+            self.atlas_display_screen_id is not None
+            and not isinstance(self.atlas_display_screen_id, str)
+        ):
+            raise ValueError("Atlas display screen ID must be a string or None.")
+        object.__setattr__(
+            self,
+            "atlas_display_screen_id",
+            _normalize_fullscreen_3d_viewer_screen_id(
+                self.atlas_display_screen_id
             ),
         )
         normalized_hotkey = _normalize_canvas_3d_navigation_toggle_hotkey(
@@ -338,6 +352,7 @@ class SettingsWidget(QWidget):
                 self._selected_fullscreen_3d_viewer_screen_id()
             ),
             jobs_window_screen_id=self._selected_jobs_window_screen_id(),
+            atlas_display_screen_id=self._selected_atlas_display_screen_id(),
             automatic_atlas_texture_sort_by_pbr=(
                 self.automatic_atlas_texture_sort_by_pbr_checkbox.isChecked()
             ),
@@ -371,6 +386,11 @@ class SettingsWidget(QWidget):
         """Return the selected Jobs-window display without rereading disk."""
 
         return self._selected_jobs_window_screen_id()
+
+    def get_atlas_display_screen_id(self) -> str | None:
+        """Return the selected Atlas display without rereading disk."""
+
+        return self._selected_atlas_display_screen_id()
 
     def clear_session_keys(self) -> None:
         """Clear the temporary plaintext key values from settings.json."""
@@ -463,6 +483,22 @@ class SettingsWidget(QWidget):
         form_layout.addRow(
             "Jobs window display",
             self.jobs_window_screen_combo,
+        )
+
+        self.atlas_display_screen_combo = QComboBox()
+        self.atlas_display_screen_combo.setObjectName(
+            "atlas_display_screen_combo"
+        )
+        self.atlas_display_screen_combo.setToolTip(
+            "Choose a display for a detached, maximized Atlas window, or "
+            "None to keep the Atlas embedded."
+        )
+        self.atlas_display_screen_combo.currentIndexChanged.connect(
+            self._handle_atlas_display_screen_changed
+        )
+        form_layout.addRow(
+            "Atlas display",
+            self.atlas_display_screen_combo,
         )
 
         self.automatic_atlas_texture_sort_by_pbr_checkbox = QCheckBox()
@@ -686,6 +722,7 @@ class SettingsWidget(QWidget):
         )
         self._refresh_fullscreen_3d_viewer_screen_options()
         self._refresh_jobs_window_screen_options()
+        self._refresh_atlas_display_screen_options()
         self.automatic_atlas_texture_sort_by_pbr_checkbox.setChecked(
             read_automatic_atlas_texture_sort_by_pbr(
                 self._application_settings
@@ -772,6 +809,7 @@ class SettingsWidget(QWidget):
             return
         self._refresh_fullscreen_3d_viewer_screen_options()
         self._refresh_jobs_window_screen_options()
+        self._refresh_atlas_display_screen_options()
         if not self._is_loading_settings:
             # Reapply even unchanged "Primary display" selections because the
             # primary screen itself may have changed or been disconnected.
@@ -827,6 +865,31 @@ class SettingsWidget(QWidget):
             self.jobs_window_screen_combo.currentData()
         )
 
+    def _refresh_atlas_display_screen_options(self) -> None:
+        selected_screen_id = read_atlas_display_screen_id(
+            self._application_settings
+        )
+        blocker = QSignalBlocker(self.atlas_display_screen_combo)
+        self.atlas_display_screen_combo.clear()
+        self.atlas_display_screen_combo.addItem("None", None)
+        for option in connected_fullscreen_3d_viewer_display_options():
+            self.atlas_display_screen_combo.addItem(
+                option.label,
+                option.screen_id,
+            )
+        selected_index = self.atlas_display_screen_combo.findData(
+            selected_screen_id
+        )
+        self.atlas_display_screen_combo.setCurrentIndex(
+            selected_index if selected_index >= 0 else 0
+        )
+        del blocker
+
+    def _selected_atlas_display_screen_id(self) -> str | None:
+        return _normalize_fullscreen_3d_viewer_screen_id(
+            self.atlas_display_screen_combo.currentData()
+        )
+
     def _handle_fullscreen_3d_viewer_screen_changed(
         self,
         _index: int,
@@ -845,6 +908,15 @@ class SettingsWidget(QWidget):
         self._application_settings.set(
             JOBS_WINDOW_SCREEN_SETTING_KEY,
             self._selected_jobs_window_screen_id(),
+        )
+        self.settings_changed.emit()
+
+    def _handle_atlas_display_screen_changed(self, _index: int) -> None:
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            ATLAS_DISPLAY_SCREEN_SETTING_KEY,
+            self._selected_atlas_display_screen_id(),
         )
         self.settings_changed.emit()
 
@@ -1050,6 +1122,16 @@ def read_jobs_window_screen_id(
 
     return _normalize_fullscreen_3d_viewer_screen_id(
         application_settings.get(JOBS_WINDOW_SCREEN_SETTING_KEY)
+    )
+
+
+def read_atlas_display_screen_id(
+    application_settings: ApplicationSettingsStore,
+) -> str | None:
+    """Read the persisted detached Atlas display identity."""
+
+    return _normalize_fullscreen_3d_viewer_screen_id(
+        application_settings.get(ATLAS_DISPLAY_SCREEN_SETTING_KEY)
     )
 
 

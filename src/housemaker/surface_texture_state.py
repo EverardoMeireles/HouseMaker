@@ -152,7 +152,7 @@ class SurfaceTextureAssignment:
         surface_ids = _normalize_surface_ids(
             self.surface_ids,
             expected_type=surface_type,
-            allow_empty=False,
+            allow_empty=True,
             maximum_count=MAX_SELECTED_SURFACES,
         )
         asset_path = _normalize_safe_relative_asset_path(self.asset_path)
@@ -687,7 +687,7 @@ def _without_legacy_overlay_assignment_surfaces(
         for surface_id in raw_surface_ids
         if not _is_legacy_surface_overlay_id(surface_id)
     ]
-    if not retained_ids:
+    if not retained_ids and raw_surface_ids:
         return None
     if len(retained_ids) == len(raw_surface_ids):
         return raw_assignment

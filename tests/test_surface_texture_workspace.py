@@ -50,6 +50,7 @@ from housemaker.settings_widget import (
     SURFACE_TEXTURE_PROVIDER_SETTING_KEY,
     GenerationServiceSettings,
 )
+from housemaker.surface_geometry import build_fixed_surfaces
 from housemaker.surface_texture_providers import SurfaceTextureResult
 from housemaker.surface_texture_state import (
     SURFACE_PBR_ALIGNMENT_VERSION,
@@ -642,6 +643,188 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         refresh_atlases.assert_called_once_with()
         sync_selection.assert_called_once_with()
         sync_controls.assert_called_once_with()
+
+    def test_assignment_uses_current_levels_when_hidden_view_is_stale(
+        self,
+    ) -> None:
+        level = copy.deepcopy(_test_level())
+        room = level.rooms.pop()
+        level.floor_contour_vertex_ids = ()
+        self.workspace.set_levels([level])
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(parents=True, exist_ok=True)
+        asset_path = asset_directory / "stale-view.png"
+        asset_path.write_bytes(_colored_texture_png((150, 70, 30, 255)))
+        assignment = _surface_assignment("stale-view", (), asset_path.name)
+        self.workspace.set_data(
+            SurfaceTextureData(assignments=[assignment])
+        )
+
+        level.rooms.append(room)
+        surface_id = "level:2/room:5/wall:1:2"
+        expected_surface = next(
+            surface
+            for surface in build_fixed_surfaces([level])
+            if surface.surface_id == surface_id
+        )
+        self.assertIsNone(self.workspace.surface_view.get_surface(surface_id))
+        self.assertTrue(
+            self.workspace.assignment_targets_are_valid(
+                assignment.assignment_id,
+                (surface_id,),
+            )
+        )
+        self.assertFalse(
+            self.workspace.assignment_targets_are_valid(
+                assignment.assignment_id,
+                ("level:2/room:5/floor",),
+            )
+        )
+        self.assertFalse(
+            self.workspace.assignment_targets_are_valid(
+                assignment.assignment_id,
+                ("level:2/room:missing/wall:1:2",),
+            )
+        )
+
+        applied = self.workspace.apply_assignment_texture(
+            assignment.assignment_id,
+            (surface_id,),
+        )
+
+        self.assertTrue(applied)
+        updated = self.workspace.get_assignment(assignment.assignment_id)
+        assert updated is not None
+        self.assertEqual(updated.surface_ids, (surface_id,))
+        self.assertAlmostEqual(
+            updated.combined_area_m2,
+            expected_surface.area_square_meters,
+        )
+        self.assertIsNone(
+            self.workspace.surface_view.get_surface_texture_rgba(surface_id)
+        )
+
+        self.workspace.set_preview_context([level], None)
+
+        self.assertIsNotNone(self.workspace.surface_view.get_surface(surface_id))
+        self.assertIsNotNone(
+            self.workspace.surface_view.get_surface_texture_rgba(surface_id)
+        )
+
+    def test_generation_rejects_target_deleted_while_view_is_stale(self) -> None:
+        surface_id = "level:2/room:5/wall:1:2"
+        request = SurfaceTextureRequest(
+            provider="meshy",
+            api_key="test-key",
+            reference_pngs=(_texture_png(),),
+            reference_frame_indices=(0,),
+            surface_type="wall",
+            surface_ids=(surface_id,),
+            combined_area_m2=6.0,
+            prompt="Generate one wall",
+        )
+        self.assertIsNotNone(self.workspace.surface_view.get_surface(surface_id))
+        self.workspace._levels[0].rooms.clear()
+
+        committed = self.workspace._handle_generation_succeeded(
+            request,
+            SurfaceTextureResult(
+                provider="meshy",
+                texture_png=_colored_texture_png((150, 70, 30, 255)),
+            ),
+        )
+
+        self.assertFalse(committed)
+        self.assertEqual(self.workspace.get_assignments(), ())
+        self.assertIn("target surfaces changed", self.workspace.status_label.text())
+        self.assertEqual(
+            tuple((self._temporary_path / "surface_assets").glob("*.png")),
+            (),
+        )
+
+    def test_deleted_only_assigned_wall_retains_empty_texture_family(
+        self,
+    ) -> None:
+        level = _test_level()
+        level.rooms = []
+        level.floor_contour_vertex_ids = ()
+        self.workspace.set_levels([level])
+        surface_id = "level:2/wall:1:2"
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(parents=True, exist_ok=True)
+        asset_path = asset_directory / "deleted-wall.png"
+        asset_path.write_bytes(_colored_texture_png((150, 70, 30, 255)))
+        self.workspace.set_data(
+            SurfaceTextureData(
+                assignments=[
+                    _surface_assignment(
+                        "deleted-wall",
+                        (surface_id,),
+                        asset_path.name,
+                    )
+                ]
+            )
+        )
+        changed = QSignalSpy(self.workspace.data_changed)
+        content_changed = QSignalSpy(self.workspace.surface_content_changed)
+        removed = QSignalSpy(self.workspace.assignments_removed)
+        edited_level = copy.deepcopy(level)
+        self.assertTrue(edited_level.vertex_data.remove_edge(1, 2))
+
+        reconciled = self.workspace.reconcile_assignments_with_levels(
+            [edited_level]
+        )
+
+        self.assertTrue(reconciled)
+        assignments = self.workspace.get_assignments()
+        self.assertEqual(len(assignments), 1)
+        assignment = assignments[0]
+        self.assertEqual(assignment.assignment_id, "deleted-wall")
+        self.assertEqual(assignment.surface_ids, ())
+        self.assertEqual(assignment.combined_area_m2, 0.0)
+        self.assertEqual(
+            assignment.area_description,
+            "0 wall surface(s), 0.00 m²",
+        )
+        self.assertTrue(asset_path.is_file())
+        self.assertEqual(changed.count(), 1)
+        self.assertEqual(content_changed.count(), 1)
+        self.assertEqual(removed.count(), 0)
+
+    def test_excluding_level_keeps_its_surface_texture_assignment(self) -> None:
+        level = copy.deepcopy(self.workspace._levels[0])
+        surface_id = "level:2/room:5/wall:1:2"
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(parents=True, exist_ok=True)
+        asset_path = asset_directory / "excluded-level-wall.png"
+        asset_path.write_bytes(_colored_texture_png((150, 70, 30, 255)))
+        self.workspace.set_data(
+            SurfaceTextureData(
+                assignments=[
+                    _surface_assignment(
+                        "excluded-level-wall",
+                        (surface_id,),
+                        asset_path.name,
+                    )
+                ]
+            )
+        )
+        self.workspace.reconcile_assignments_with_levels([level])
+        assignment_before = self.workspace.get_assignments()[0]
+        changed = QSignalSpy(self.workspace.data_changed)
+        content_changed = QSignalSpy(self.workspace.surface_content_changed)
+        level.include_in_export = False
+
+        reconciled = self.workspace.reconcile_assignments_with_levels([level])
+
+        self.assertFalse(reconciled)
+        self.assertEqual(
+            self.workspace.get_assignments(),
+            (assignment_before,),
+        )
+        self.assertEqual(changed.count(), 0)
+        self.assertEqual(content_changed.count(), 0)
+        self.assertTrue(asset_path.is_file())
 
     def test_changed_preview_context_populates_the_gl_scene_once(self) -> None:
         mutable_level = self.workspace._levels[0]
@@ -1554,6 +1737,56 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
             )
         )
 
+    def test_clear_assignment_surfaces_retains_family_and_assets(self) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        target_surface = "level:2/room:5/wall:1:2"
+        retained_surface = "level:2/room:5/wall:2:3"
+        target = _surface_assignment_with_variants(
+            asset_directory,
+            "unassign-plaster",
+            (target_surface,),
+        )
+        retained = _surface_assignment_with_variants(
+            asset_directory,
+            "keep-brick",
+            (retained_surface,),
+        )
+        self.workspace.set_data(
+            SurfaceTextureData(assignments=[target, retained])
+        )
+        removed = QSignalSpy(self.workspace.assignments_removed)
+        changed = QSignalSpy(self.workspace.data_changed)
+        content_changed = QSignalSpy(self.workspace.surface_content_changed)
+
+        self.assertTrue(
+            self.workspace.clear_assignment_surfaces("unassign-plaster")
+        )
+
+        assignments = {
+            assignment.assignment_id: assignment
+            for assignment in self.workspace.get_data().assignments
+        }
+        self.assertEqual(assignments["unassign-plaster"].surface_ids, ())
+        self.assertEqual(assignments["keep-brick"].surface_ids, (retained_surface,))
+        self.assertEqual(removed.count(), 0)
+        self.assertEqual(changed.count(), 1)
+        self.assertEqual(content_changed.count(), 1)
+        self.assertIsNone(
+            self.workspace.surface_view.get_surface_texture_rgba(target_surface)
+        )
+        self.assertIsNotNone(
+            self.workspace.surface_view.get_surface_texture_rgba(retained_surface)
+        )
+        self.assertTrue(
+            all(
+                (
+                    asset_directory
+                    / f"unassign-plaster.texture-{resolution}.png"
+                ).is_file()
+                for resolution in SURFACE_TEXTURE_RESOLUTIONS
+            )
+        )
+
     def test_delete_key_targets_explicit_other_texture_after_confirmation(
         self,
     ) -> None:
@@ -1835,14 +2068,16 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         _qt_application.processEvents()
 
         data = self.workspace.get_data()
-        self.assertEqual(len(data.assignments), 1)
-        selected_assignment = data.assignments[0]
+        self.assertEqual(len(data.assignments), 2)
+        emptied_assignment, selected_assignment = data.assignments
+        self.assertEqual(emptied_assignment.assignment_id, "replaced-plaster")
+        self.assertEqual(emptied_assignment.surface_ids, ())
         self.assertEqual(selected_assignment.assignment_id, "reusable-brick")
         self.assertEqual(
             selected_assignment.surface_ids,
             (source_surface, target_surface),
         )
-        self.assertEqual(tuple(removed.at(0)[0]), ("replaced-plaster",))
+        self.assertEqual(removed.count(), 0)
         self.assertEqual(changed.count(), 1)
         self.assertEqual(content_changed.count(), 1)
         target_texture = self.workspace.surface_view.get_surface_texture_rgba(
@@ -1854,10 +2089,10 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
             self.workspace.texture_view.selected_atlas_id,
             "reusable-brick:resolution:1024",
         )
-        self.assertEqual(self.workspace.other_texture_list.count(), 0)
+        self.assertEqual(self.workspace.other_texture_list.count(), 1)
         self.assertTrue(
             all(
-                not (
+                (
                     asset_directory
                     / f"replaced-plaster.texture-{resolution}.png"
                 ).exists()
@@ -1903,8 +2138,10 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         _qt_application.processEvents()
 
         data = self.workspace.get_data()
-        self.assertEqual(len(data.assignments), 1)
-        applied = data.assignments[0]
+        self.assertEqual(len(data.assignments), 2)
+        emptied_assignment, applied = data.assignments
+        self.assertEqual(emptied_assignment.assignment_id, "replaced-wall")
+        self.assertEqual(emptied_assignment.surface_ids, ())
         self.assertEqual(applied.assignment_id, "legacy-stone")
         self.assertEqual(
             applied.surface_ids,
@@ -1915,7 +2152,7 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         self.assertIsNone(applied.selected_texture_resolution)
         self.assertIsNone(applied.texture_width)
         self.assertIsNone(applied.texture_height)
-        self.assertEqual(tuple(removed.at(0)[0]), ("replaced-wall",))
+        self.assertEqual(removed.count(), 0)
         self.assertEqual(changed.count(), 1)
         self.assertEqual(content_changed.count(), 1)
         texture = self.workspace.surface_view.get_surface_texture_rgba(
@@ -1924,11 +2161,11 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         self.assertIsNotNone(texture)
         self.assertEqual(texture.shape[:2], (6, 11))
         self.assertEqual(self.workspace.texture_view.entries, ())
-        self.assertEqual(self.workspace.other_texture_list.count(), 0)
+        self.assertEqual(self.workspace.other_texture_list.count(), 1)
         self.assertTrue((asset_directory / legacy_asset_path).is_file())
         self.assertTrue(
             all(
-                not (
+                (
                     asset_directory
                     / f"replaced-wall.texture-{resolution}.png"
                 ).exists()
@@ -2049,8 +2286,10 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         _qt_application.processEvents()
 
         data = self.workspace.get_data()
-        self.assertEqual(len(data.assignments), 1)
-        selected_assignment = data.assignments[0]
+        self.assertEqual(len(data.assignments), 2)
+        emptied_assignment, selected_assignment = data.assignments
+        self.assertEqual(emptied_assignment.assignment_id, "old-plaster")
+        self.assertEqual(emptied_assignment.surface_ids, ())
         self.assertEqual(selected_assignment.assignment_id, "new-brick")
         self.assertEqual(
             selected_assignment.surface_ids,
@@ -2061,7 +2300,7 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
             selected_assignment.asset_path,
             "new-brick.texture-2048.png",
         )
-        self.assertEqual(tuple(removed.at(0)[0]), ("old-plaster",))
+        self.assertEqual(removed.count(), 0)
         self.assertEqual(
             self.workspace.surface_view.get_surface_texture_rgba(
                 target_surface_id
@@ -2075,7 +2314,7 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         self.assertEqual(len(self.workspace.texture_view.entries), 3)
         self.assertTrue(
             all(
-                not (
+                (
                     asset_directory
                     / f"old-plaster.texture-{resolution}.png"
                 ).exists()
@@ -2208,7 +2447,7 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
             restored.shutdown()
             restored.close()
 
-    def test_generation_replaces_fully_covered_assignment_and_deletes_asset(
+    def test_generation_keeps_fully_replaced_texture_as_unused_library_item(
         self,
     ) -> None:
         asset_directory = self._temporary_path / "surface_assets"
@@ -2251,12 +2490,16 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         )
 
         assignments = self.workspace.get_data().assignments
-        self.assertEqual(len(assignments), 1)
-        self.assertNotEqual(assignments[0].assignment_id, "old-walls")
-        self.assertEqual(assignments[0].surface_ids, (first_wall, second_wall))
-        self.assertFalse(old_asset_path.exists())
-        self.assertEqual(removed.count(), 1)
-        self.assertEqual(tuple(removed.at(0)[0]), ("old-walls",))
+        self.assertEqual(len(assignments), 2)
+        old_assignment, replacement_assignment = assignments
+        self.assertEqual(old_assignment.assignment_id, "old-walls")
+        self.assertEqual(old_assignment.surface_ids, ())
+        self.assertEqual(
+            replacement_assignment.surface_ids,
+            (first_wall, second_wall),
+        )
+        self.assertTrue(old_asset_path.exists())
+        self.assertEqual(removed.count(), 0)
         self.assertEqual(completed.count(), 1)
 
     def test_generation_trims_partially_covered_assignment_and_keeps_asset(
@@ -2358,10 +2601,11 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         assignments = self.workspace.get_data().assignments
         self.assertEqual(
             [assignment.assignment_id for assignment in assignments[:-1]],
-            ["second-record"],
+            ["first-record", "second-record"],
         )
+        self.assertEqual(assignments[0].surface_ids, ())
         self.assertTrue(shared_asset_path.exists())
-        self.assertEqual(tuple(removed.at(0)[0]), ("first-record",))
+        self.assertEqual(removed.count(), 0)
 
     @unittest.skipUnless(os.name == "nt", "Windows path casing regression")
     def test_orphan_cleanup_keeps_case_aliased_active_asset(self) -> None:

@@ -129,6 +129,27 @@ class ExternalFullscreenViewerHostTests(unittest.TestCase):
             bool(host.window.windowState() & Qt.WindowState.WindowFullScreen)
         )
 
+    def test_reselecting_maximized_host_preserves_user_window_state(self) -> None:
+        container = self._build_widget()
+        layout = QHBoxLayout(container)
+        viewer = QWidget(container)
+        layout.addWidget(viewer)
+        host = ExternalFullscreenViewerHost(start_maximized=True)
+        self.hosts.append(host)
+        screen = _primary_screen()
+
+        host.show_on_screen(viewer, screen)
+        _qt_application.processEvents()
+        self.assertTrue(host.window.isMaximized())
+        host.window.showNormal()
+        _qt_application.processEvents()
+        self.assertFalse(host.window.isMaximized())
+
+        host.show_on_screen(viewer, screen)
+        _qt_application.processEvents()
+
+        self.assertFalse(host.window.isMaximized())
+
     def test_hidden_tab_viewer_is_shown_on_the_external_display(self) -> None:
         container = self._build_widget()
         layout = QHBoxLayout(container)
@@ -159,6 +180,33 @@ class ExternalFullscreenViewerHostTests(unittest.TestCase):
         self.assertIs(tabs.widget(1), viewer)
         self.assertFalse(viewer.isVisible())
         self.assertTrue(viewer.isHidden())
+
+    def test_restored_active_tab_stays_hidden_after_another_tab_is_selected(
+        self,
+    ) -> None:
+        container = self._build_widget()
+        layout = QHBoxLayout(container)
+        tabs = QTabWidget(container)
+        other_view = QWidget(tabs)
+        viewer = QWidget(tabs)
+        tabs.addTab(other_view, "Other")
+        tabs.addTab(viewer, "Viewer")
+        tabs.setCurrentWidget(viewer)
+        layout.addWidget(tabs)
+        container.resize(800, 600)
+        container.show()
+        _qt_application.processEvents()
+        host = self._build_host()
+
+        self.assertTrue(viewer.isVisible())
+        host.show_on_screen(viewer, _primary_screen())
+        tabs.setCurrentWidget(other_view)
+        host.restore()
+        _qt_application.processEvents()
+
+        self.assertIs(tabs.currentWidget(), other_view)
+        self.assertTrue(other_view.isVisible())
+        self.assertFalse(viewer.isVisible())
 
     def test_invalid_screen_is_rejected_without_detaching_the_viewer(self) -> None:
         container = self._build_widget()

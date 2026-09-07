@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 import os
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -19,11 +20,12 @@ import trimesh
 from housemaker.glb import GeneratedModel
 from housemaker.surface_geometry import (
     FixedSurface,
+    SURFACE_TYPE_CEILING,
     SURFACE_TYPE_FLOOR,
     SURFACE_TYPE_WALL,
     WallWindowPlacement,
 )
-from housemaker.viewer import GlbViewerWidget
+from housemaker.viewer import ATLAS_SURFACE_HIGHLIGHT_COLOR, GlbViewerWidget
 
 
 # ### Module state ###
@@ -77,6 +79,25 @@ def _build_floor() -> FixedSurface:
     return FixedSurface(
         surface_id="level:0/floor",
         surface_type=SURFACE_TYPE_FLOOR,
+        level_index=0,
+        room_index=None,
+        mesh=mesh,
+        area_square_meters=8.0,
+    )
+
+
+def _build_ceiling() -> FixedSurface:
+    mesh = trimesh.Trimesh(
+        vertices=np.asarray(
+            ((0.0, 0.0, 3.0), (4.0, 0.0, 3.0), (0.0, 4.0, 3.0)),
+            dtype=float,
+        ),
+        faces=np.asarray(((0, 1, 2),), dtype=np.int64),
+        process=False,
+    )
+    return FixedSurface(
+        surface_id="level:0/ceiling",
+        surface_type=SURFACE_TYPE_CEILING,
         level_index=0,
         room_index=None,
         mesh=mesh,
@@ -206,6 +227,229 @@ class CanvasWindowEditorTests(unittest.TestCase):
         self.assertEqual(viewer.get_selected_wall_surface_id(), wall.surface_id)
         assert viewer.add_window_button is not None
         self.assertTrue(viewer.add_window_button.isEnabled())
+
+    def test_plain_pick_selects_floor_or_ceiling_and_clears_window_wall(
+        self,
+    ) -> None:
+        viewer = self._build_viewer()
+        wall = _build_wall()
+        floor = _build_floor()
+        ceiling = _build_ceiling()
+        viewer.set_wall_targets((wall, floor, ceiling))
+        viewer.select_wall_target(wall.surface_id)
+
+        with (
+            patch.object(
+                QApplication,
+                "keyboardModifiers",
+                return_value=Qt.KeyboardModifier.NoModifier,
+            ),
+            patch.object(
+                viewer.view,
+                "build_camera_ray",
+                return_value=(
+                    np.asarray((1.0, 1.0, 1.0), dtype=float),
+                    np.asarray((0.0, 0.0, -1.0), dtype=float),
+                ),
+            ),
+        ):
+            viewer._handle_window_wall_pick_requested(QPointF())
+
+        self.assertEqual(
+            viewer.get_selected_canvas_surface_ids(),
+            (floor.surface_id,),
+        )
+        self.assertIsNone(viewer.get_selected_wall_surface_id())
+        assert viewer.add_window_button is not None
+        self.assertFalse(viewer.add_window_button.isEnabled())
+
+        with (
+            patch.object(
+                QApplication,
+                "keyboardModifiers",
+                return_value=Qt.KeyboardModifier.NoModifier,
+            ),
+            patch.object(
+                viewer.view,
+                "build_camera_ray",
+                return_value=(
+                    np.asarray((1.0, 1.0, 1.0), dtype=float),
+                    np.asarray((0.0, 0.0, 1.0), dtype=float),
+                ),
+            ),
+        ):
+            viewer._handle_window_wall_pick_requested(QPointF())
+
+        self.assertEqual(
+            viewer.get_selected_canvas_surface_ids(),
+            (ceiling.surface_id,),
+        )
+
+    def test_ctrl_pick_adds_and_toggles_every_semantic_surface_type(self) -> None:
+        viewer = self._build_viewer()
+        wall = _build_wall()
+        floor = _build_floor()
+        ceiling = _build_ceiling()
+        viewer.set_wall_targets((wall, floor, ceiling))
+        emitted: list[object] = []
+        viewer.canvas_surface_selection_changed.connect(emitted.append)
+        rays = (
+            _ray_at(2.0, 1.0),
+            (
+                np.asarray((1.0, 1.0, 1.0), dtype=float),
+                np.asarray((0.0, 0.0, -1.0), dtype=float),
+            ),
+            (
+                np.asarray((1.0, 1.0, 1.0), dtype=float),
+                np.asarray((0.0, 0.0, 1.0), dtype=float),
+            ),
+        )
+
+        with patch.object(
+            QApplication,
+            "keyboardModifiers",
+            return_value=Qt.KeyboardModifier.ControlModifier,
+        ):
+            for ray in rays:
+                with patch.object(
+                    viewer.view,
+                    "build_camera_ray",
+                    return_value=ray,
+                ):
+                    viewer._handle_window_wall_pick_requested(QPointF())
+
+            with patch.object(
+                viewer.view,
+                "build_camera_ray",
+                return_value=rays[1],
+            ):
+                viewer._handle_window_wall_pick_requested(QPointF())
+
+            with patch.object(
+                viewer.view,
+                "build_camera_ray",
+                return_value=rays[0],
+            ):
+                viewer._handle_window_wall_pick_requested(QPointF())
+
+        self.assertEqual(
+            emitted,
+            [
+                (wall.surface_id,),
+                (wall.surface_id, floor.surface_id),
+                (wall.surface_id, floor.surface_id, ceiling.surface_id),
+                (wall.surface_id, ceiling.surface_id),
+                (ceiling.surface_id,),
+            ],
+        )
+        self.assertEqual(
+            viewer.get_selected_canvas_surface_ids(),
+            (ceiling.surface_id,),
+        )
+        self.assertIsNone(viewer.get_selected_wall_surface_id())
+        assert viewer.add_window_button is not None
+        self.assertFalse(viewer.add_window_button.isEnabled())
+
+    def test_floor_hit_occludes_a_placed_object_behind_it(self) -> None:
+        viewer = self._build_viewer()
+        floor = _build_floor()
+        viewer.set_wall_targets((floor,))
+        ray_origin = np.asarray((1.0, 1.0, 1.0), dtype=float)
+        ray_direction = np.asarray((0.0, 0.0, -1.0), dtype=float)
+
+        with (
+            patch.object(
+                QApplication,
+                "keyboardModifiers",
+                return_value=Qt.KeyboardModifier.NoModifier,
+            ),
+            patch.object(
+                viewer.view,
+                "build_camera_ray",
+                return_value=(ray_origin, ray_direction),
+            ),
+            patch(
+                "housemaker.viewer._get_nearest_preview_placed_object_ray_hit",
+                return_value=(
+                    SimpleNamespace(object_id="object-behind-floor"),
+                    np.asarray((1.0, 1.0, -1.0), dtype=float),
+                    2.0,
+                ),
+            ),
+        ):
+            viewer._handle_window_wall_pick_requested(QPointF())
+
+        self.assertEqual(
+            viewer.get_selected_canvas_surface_ids(),
+            (floor.surface_id,),
+        )
+        self.assertIsNone(viewer.get_selected_placed_object_id())
+
+    def test_atlas_surface_highlight_is_green_and_does_not_select(self) -> None:
+        viewer = self._build_viewer()
+        wall = _build_wall()
+        floor = _build_floor()
+        viewer.set_wall_targets((wall, floor))
+        viewer.set_model(_build_model())
+        viewer.select_canvas_surface_target(wall.surface_id)
+        emitted: list[object] = []
+        viewer.canvas_surface_selection_changed.connect(emitted.append)
+
+        did_change = viewer.set_highlighted_canvas_surface_ids(
+            (floor.surface_id, "missing-surface", floor.surface_id)
+        )
+
+        self.assertTrue(did_change)
+        self.assertEqual(
+            viewer.get_highlighted_canvas_surface_ids(),
+            (floor.surface_id,),
+        )
+        self.assertEqual(
+            viewer.get_selected_canvas_surface_ids(),
+            (wall.surface_id,),
+        )
+        self.assertEqual(emitted, [])
+        self.assertEqual(len(viewer._atlas_surface_highlight_items), 1)
+        self.assertEqual(
+            viewer._atlas_surface_highlight_items[0].color,
+            ATLAS_SURFACE_HIGHLIGHT_COLOR,
+        )
+
+    def test_atlas_surface_highlight_survives_refresh_and_prunes_stale_ids(
+        self,
+    ) -> None:
+        viewer = self._build_viewer()
+        wall = _build_wall()
+        floor = _build_floor()
+        viewer.set_wall_targets((wall, floor))
+        viewer.set_model(_build_model())
+        viewer.set_highlighted_canvas_surface_ids(
+            (wall.surface_id, floor.surface_id)
+        )
+        initial_items = tuple(viewer._atlas_surface_highlight_items)
+        emitted: list[object] = []
+        viewer.canvas_surface_selection_changed.connect(emitted.append)
+
+        refreshed_wall = _build_wall(
+            surface_id=wall.surface_id,
+            x_offset=0.5,
+        )
+        viewer.set_wall_targets((refreshed_wall,))
+        target_refresh_items = tuple(viewer._atlas_surface_highlight_items)
+        viewer.set_model(_build_model(), preserve_camera=True)
+
+        self.assertEqual(
+            viewer.get_highlighted_canvas_surface_ids(),
+            (wall.surface_id,),
+        )
+        self.assertEqual(len(target_refresh_items), 1)
+        self.assertNotEqual(target_refresh_items, initial_items)
+        self.assertEqual(len(viewer._atlas_surface_highlight_items), 1)
+        self.assertIsNot(
+            viewer._atlas_surface_highlight_items[0],
+            target_refresh_items[0],
+        )
+        self.assertEqual(emitted, [])
 
     def test_valid_drag_emits_one_bounded_immutable_placement(self) -> None:
         viewer = self._build_viewer()

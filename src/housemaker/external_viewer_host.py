@@ -5,7 +5,13 @@ from dataclasses import dataclass
 
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QCloseEvent, QScreen
-from PySide6.QtWidgets import QLayout, QSplitter, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QLayout,
+    QSplitter,
+    QStackedLayout,
+    QVBoxLayout,
+    QWidget,
+)
 
 
 # ### Placement models ###
@@ -27,10 +33,10 @@ class _ExternalFullscreenViewerWindow(QWidget):
 
     close_requested = Signal()
 
-    def __init__(self) -> None:
+    def __init__(self, window_title: str = "HouseMaker 3D Viewer") -> None:
         super().__init__(None)
         self.setObjectName("external-fullscreen-viewer-window")
-        self.setWindowTitle("HouseMaker 3D Viewer")
+        self.setWindowTitle(str(window_title).strip() or "HouseMaker 3D Viewer")
 
         self.viewer_layout = QVBoxLayout(self)
         self.viewer_layout.setContentsMargins(0, 0, 0, 0)
@@ -54,10 +60,17 @@ class ExternalFullscreenViewerHost(QObject):
     viewer_attached = Signal(object, object)
     viewer_restored = Signal(object)
 
-    def __init__(self, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        parent: QObject | None = None,
+        *,
+        window_title: str = "HouseMaker 3D Viewer",
+        start_maximized: bool = False,
+    ) -> None:
         super().__init__(parent)
-        self._window = _ExternalFullscreenViewerWindow()
+        self._window = _ExternalFullscreenViewerWindow(window_title)
         self._window.close_requested.connect(self._handle_window_close_request)
+        self._start_maximized = bool(start_maximized)
         self._viewer: QWidget | None = None
         self._placement: _ViewerPlacement | None = None
         self._screen: QScreen | None = None
@@ -98,8 +111,10 @@ class ExternalFullscreenViewerHost(QObject):
         _validate_viewer_and_screen(viewer, screen)
 
         if viewer is self._viewer and self.is_active:
+            screen_changed = screen is not self._screen
             self._screen = screen
-            self._show_window_on_screen(screen)
+            if screen_changed or not self._start_maximized:
+                self._show_window_on_screen(screen)
             _show_and_repaint_detached_viewer(viewer)
             return
 
@@ -153,8 +168,12 @@ class ExternalFullscreenViewerHost(QObject):
 
     def _show_window_on_screen(self, screen: QScreen) -> None:
         self._window.setScreen(screen)
-        self._window.setGeometry(screen.geometry())
-        self._window.showFullScreen()
+        if self._start_maximized:
+            self._window.setGeometry(screen.availableGeometry())
+            self._window.showMaximized()
+        else:
+            self._window.setGeometry(screen.geometry())
+            self._window.showFullScreen()
         self._window.raise_()
         self._window.activateWindow()
 
@@ -260,6 +279,11 @@ def _dispose_placeholder(placeholder: QWidget) -> None:
 
 
 def _restore_visibility(viewer: QWidget, was_visible: bool) -> None:
+    parent = viewer.parentWidget()
+    parent_layout = None if parent is None else parent.layout()
+    if isinstance(parent_layout, QStackedLayout):
+        viewer.setVisible(parent_layout.currentWidget() is viewer)
+        return
     viewer.setVisible(was_visible)
 
 
