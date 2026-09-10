@@ -53,6 +53,12 @@ from housemaker.canvas_openings import (
     CanvasOpeningReference,
     CanvasOpeningTarget,
 )
+from housemaker.canvas_surface_edits import (
+    CANVAS_SURFACE_EDIT_FLOOR_THICKNESS,
+    CANVAS_SURFACE_EDIT_WALL_VERTEX,
+    CanvasSurfaceEdit,
+    CanvasSurfaceEditHandleTarget,
+)
 from housemaker.first_person_navigation import (
     DEFAULT_FIRST_PERSON_NAVIGATION_MODE,
     build_first_person_forward_vector,
@@ -183,6 +189,15 @@ CANVAS_OPENING_OVERLAY_GL_OPTIONS = {
         GL.GL_ONE_MINUS_SRC_ALPHA,
     ),
 }
+CANVAS_SURFACE_EDIT_SELECTION_COLOR = (1.0, 0.72, 0.18, 1.0)
+CANVAS_SURFACE_EDIT_PREVIEW_COLOR = (0.20, 0.86, 0.38, 1.0)
+CANVAS_SURFACE_EDIT_OUTLINE_WIDTH = 5.0
+CANVAS_SURFACE_EDIT_GIZMO_SCREEN_SIZE_PIXELS = 86.0
+CANVAS_SURFACE_EDIT_GIZMO_MIN_SIZE_METERS = 0.40
+CANVAS_SURFACE_EDIT_GIZMO_LINE_WIDTH = 5.0
+CANVAS_SURFACE_EDIT_GIZMO_ENDPOINT_SIZE_PIXELS = 16.0
+CANVAS_SURFACE_EDIT_GIZMO_HIT_RATIO = 0.14
+CANVAS_SURFACE_EDIT_GIZMO_MIN_HIT_RADIUS_METERS = 0.05
 FACE_SELECTION_COLOR = (1.0, 0.36, 0.08, 0.72)
 FACE_SELECTION_EDGE_COLOR = (1.0, 0.78, 0.18, 1.0)
 FACE_SELECTION_MAX_RASTER_DIMENSION = 768
@@ -411,6 +426,19 @@ class _CanvasOpeningEditDrag:
     handle: _CanvasOpeningGizmoHandle
     pointer_offset_local: tuple[float, float]
     last_emitted_bounds: CanvasOpeningBounds
+
+
+@dataclass
+class _CanvasSurfaceEditDrag:
+    """Stable target and absolute live delta for one structural drag."""
+
+    target: CanvasSurfaceEditHandleTarget
+    axis: np.ndarray
+    drag_plane_normal: np.ndarray
+    start_axis_parameter: float
+    baseline_outline_positions: np.ndarray | None = None
+    preview_delta_meters: float = 0.0
+    last_emitted_delta_meters: float = 0.0
 
 
 # ### Widgets ###
@@ -2285,6 +2313,10 @@ class GlbViewerWidget(QWidget):
     canvas_opening_edit_preview_changed = Signal(object)
     canvas_opening_edit_finished = Signal(object, bool)
     canvas_opening_edit_cancelled = Signal(object)
+    canvas_surface_edit_started = Signal(object)
+    canvas_surface_edit_preview_changed = Signal(object)
+    canvas_surface_edit_finished = Signal(object, bool)
+    canvas_surface_edit_cancelled = Signal(object)
     placed_object_removal_requested = Signal(str)
     placed_object_transform_changed = Signal(str, object, object)
     placed_object_selection_changed = Signal(object)
@@ -2369,6 +2401,18 @@ class GlbViewerWidget(QWidget):
         self._selected_canvas_opening_key: str | None = None
         self._canvas_opening_edit_drag: _CanvasOpeningEditDrag | None = None
         self._canvas_opening_gizmo_items: list[GLGraphicsItem] = []
+        self._canvas_surface_edit_targets: dict[
+            tuple[str, str],
+            CanvasSurfaceEditHandleTarget,
+        ] = {}
+        self._active_canvas_surface_id: str | None = None
+        self._canvas_surface_edit_drag: _CanvasSurfaceEditDrag | None = None
+        self._canvas_surface_edit_pending_outline_positions: (
+            np.ndarray | None
+        ) = None
+        self._canvas_surface_edit_pending_outline_surface_id: str | None = None
+        self._canvas_surface_edit_gizmo_items: list[GLGraphicsItem] = []
+        self._canvas_surface_edit_gizmo_sizes: dict[tuple[str, str], float] = {}
         self.object_transform_status_label: QLabel | None = None
         self._window_wall_targets: dict[str, FixedSurface] = {}
         self._canvas_surface_targets: dict[str, FixedSurface] = {}
@@ -2608,6 +2652,7 @@ class GlbViewerWidget(QWidget):
                 continue
             targets[surface.surface_id] = surface
 
+        self._cancel_canvas_surface_edit_drag()
         selected_id = self._selected_window_wall_surface_id
         self._canvas_surface_targets = all_targets
         previous_canvas_surface_ids = self._selected_canvas_surface_ids
@@ -2621,14 +2666,23 @@ class GlbViewerWidget(QWidget):
             for surface_id in self._highlighted_canvas_surface_ids
             if surface_id in all_targets
         )
+        next_active_surface_id = self._active_canvas_surface_id
+        if next_active_surface_id not in self._selected_canvas_surface_ids:
+            next_active_surface_id = (
+                self._selected_canvas_surface_ids[-1]
+                if self._selected_canvas_surface_ids
+                else None
+            )
         self._window_wall_targets = targets
         self._selected_window_wall_surface_id = (
             selected_id if selected_id in targets else None
         )
+        self._set_active_canvas_surface_id(next_active_surface_id)
         self.cancel_window_placement(status_message=None)
         self._refresh_window_selection_outline()
         self._refresh_atlas_surface_selection_outlines()
         self._refresh_atlas_surface_highlight_outlines()
+        self._refresh_canvas_surface_edit_gizmo_items()
         if self._selected_canvas_surface_ids != previous_canvas_surface_ids:
             self.canvas_surface_selection_changed.emit(
                 self._selected_canvas_surface_ids
@@ -2661,12 +2715,18 @@ class GlbViewerWidget(QWidget):
                 if surface_id in self._canvas_surface_targets
             )
         )
-        if normalized_ids == self._selected_canvas_surface_ids:
-            return False
+        selection_changed = normalized_ids != self._selected_canvas_surface_ids
+        if selection_changed:
+            self._cancel_canvas_surface_edit_drag()
         self._selected_canvas_surface_ids = normalized_ids
-        self._refresh_atlas_surface_selection_outlines()
-        self.canvas_surface_selection_changed.emit(normalized_ids)
-        return True
+        active_surface_id = self._active_canvas_surface_id
+        if active_surface_id not in normalized_ids:
+            active_surface_id = normalized_ids[-1] if normalized_ids else None
+        active_changed = self._set_active_canvas_surface_id(active_surface_id)
+        if selection_changed:
+            self._refresh_atlas_surface_selection_outlines()
+            self.canvas_surface_selection_changed.emit(normalized_ids)
+        return selection_changed or active_changed
 
     def get_highlighted_canvas_surface_ids(self) -> tuple[str, ...]:
         """Return non-selecting semantic surface highlights from the Atlas."""
@@ -2733,6 +2793,14 @@ class GlbViewerWidget(QWidget):
         canvas_selection_changed = self.set_selected_canvas_surface_ids(
             selected_ids
         )
+        active_surface_id = (
+            normalized_id
+            if normalized_id is not None and normalized_id in selected_ids
+            else (selected_ids[-1] if selected_ids else None)
+        )
+        active_selection_changed = self._set_active_canvas_surface_id(
+            active_surface_id
+        )
 
         selected_wall_id = self._selected_window_wall_surface_id
         if not additive:
@@ -2763,7 +2831,11 @@ class GlbViewerWidget(QWidget):
         wall_selection_changed = self._set_window_wall_selection(
             selected_wall_id
         )
-        return canvas_selection_changed or wall_selection_changed
+        return (
+            canvas_selection_changed
+            or active_selection_changed
+            or wall_selection_changed
+        )
 
     def select_wall_target(self, surface_id: str | None) -> bool:
         """Select one semantic wall, or clear selection with ``None``."""
@@ -2813,6 +2885,84 @@ class GlbViewerWidget(QWidget):
 
         self._window_undo_available = bool(available)
         self._sync_window_undo_button()
+
+    # ### Canvas structural edit API ###
+    def set_canvas_surface_edit_targets(
+        self,
+        targets: tuple[CanvasSurfaceEditHandleTarget, ...],
+        *,
+        preserve_pending_outline: bool = False,
+    ) -> None:
+        """Replace immutable structural handles without rebuilding the scene."""
+
+        if not self._window_editing_enabled:
+            return
+        if not isinstance(targets, tuple):
+            raise TypeError(
+                "Canvas surface edit targets must be supplied as a tuple."
+            )
+        normalized_targets: dict[
+            tuple[str, str],
+            CanvasSurfaceEditHandleTarget,
+        ] = {}
+        for target in targets:
+            if not isinstance(target, CanvasSurfaceEditHandleTarget):
+                raise TypeError(
+                    "Canvas surface edit targets must contain "
+                    "CanvasSurfaceEditHandleTarget values."
+                )
+            target_key = (target.surface_id, target.reference.key)
+            if target_key in normalized_targets:
+                raise ValueError(
+                    "Duplicate Canvas surface edit target: "
+                    f"{target_key!r}."
+                )
+            normalized_targets[target_key] = target
+
+        self._cancel_canvas_surface_edit_drag()
+        self._canvas_surface_edit_targets = normalized_targets
+        if not preserve_pending_outline:
+            self._canvas_surface_edit_pending_outline_positions = None
+            self._canvas_surface_edit_pending_outline_surface_id = None
+        self._refresh_canvas_surface_edit_gizmo_items()
+
+    def get_active_canvas_surface_id(self) -> str | None:
+        """Return the last-picked member of the semantic surface selection."""
+
+        return self._active_canvas_surface_id
+
+    def cancel_canvas_surface_edit(self) -> bool:
+        """Cancel one live structural drag and restore its zero-delta preview."""
+
+        return self._cancel_canvas_surface_edit_drag()
+
+    def clear_canvas_surface_edit_pending_outline(self) -> None:
+        """Remove passive structural feedback retained during a delayed rebuild."""
+
+        if (
+            self._canvas_surface_edit_pending_outline_positions is None
+            and self._canvas_surface_edit_pending_outline_surface_id is None
+        ):
+            return
+        self._canvas_surface_edit_pending_outline_positions = None
+        self._canvas_surface_edit_pending_outline_surface_id = None
+        self._refresh_canvas_surface_edit_gizmo_items()
+
+    def _set_active_canvas_surface_id(self, surface_id: str | None) -> bool:
+        """Change the singular gizmo owner without emitting a selection signal."""
+
+        normalized_id = None if surface_id is None else str(surface_id).strip()
+        if (
+            normalized_id not in self._selected_canvas_surface_ids
+            or normalized_id not in self._canvas_surface_targets
+        ):
+            normalized_id = None
+        if normalized_id == self._active_canvas_surface_id:
+            return False
+        self._cancel_canvas_surface_edit_drag()
+        self._active_canvas_surface_id = normalized_id
+        self._refresh_canvas_surface_edit_gizmo_items()
+        return True
 
     # ### Canvas opening edit API ###
     def set_canvas_opening_targets(
@@ -3129,6 +3279,10 @@ class GlbViewerWidget(QWidget):
         if opening_handle is not None:
             self._begin_canvas_opening_gizmo_drag(opening_handle, position)
             return
+        surface_edit_target = self._pick_canvas_surface_edit_handle(*camera_ray)
+        if surface_edit_target is not None:
+            self._begin_canvas_surface_edit_drag(surface_edit_target, position)
+            return
         handle = self._pick_transform_gizmo_handle(*camera_ray)
         if handle is None:
             return
@@ -3140,6 +3294,9 @@ class GlbViewerWidget(QWidget):
         if self._canvas_opening_edit_drag is not None:
             self._update_canvas_opening_gizmo_drag(position)
             return
+        if self._canvas_surface_edit_drag is not None:
+            self._update_canvas_surface_edit_drag(position)
+            return
         self._update_placed_object_gizmo_drag(position)
 
     def _handle_canvas_gizmo_pointer_released(self, position: QPointF) -> None:
@@ -3148,13 +3305,19 @@ class GlbViewerWidget(QWidget):
         if self._canvas_opening_edit_drag is not None:
             self._finish_canvas_opening_gizmo_drag(position)
             return
+        if self._canvas_surface_edit_drag is not None:
+            self._finish_canvas_surface_edit_drag(position)
+            return
         self._finish_placed_object_gizmo_drag(position)
 
     def _cancel_canvas_gizmo_drag(self, *_args: object) -> None:
-        """Cancel opening or placed-object edits before navigation resumes."""
+        """Cancel the Canvas gizmo that owns the pointer before navigation."""
 
         if self._canvas_opening_edit_drag is not None:
             self._cancel_canvas_opening_edit_drag()
+            return
+        if self._canvas_surface_edit_drag is not None:
+            self._cancel_canvas_surface_edit_drag()
             return
         self._cancel_placed_object_gizmo_drag()
 
@@ -3576,6 +3739,7 @@ class GlbViewerWidget(QWidget):
     def set_model(self, model: GeneratedModel, preserve_camera: bool = False) -> None:
         self.view.cancel_transient_pointer_interactions()
         self._cancel_canvas_opening_edit_drag()
+        self._cancel_canvas_surface_edit_drag()
         self._cancel_placed_object_gizmo_drag()
         self.clear_face_edit_geometry()
         if self._window_editing_enabled:
@@ -3589,12 +3753,14 @@ class GlbViewerWidget(QWidget):
         if camera_state is not None:
             self._restore_camera_state(camera_state)
             self._refresh_window_selection_outline()
+            self._refresh_canvas_surface_edit_gizmo_items()
         if self._window_editing_enabled:
             self._sync_window_tools_controls()
 
     def clear_model(self) -> None:
         self.view.cancel_transient_pointer_interactions()
         self._cancel_canvas_opening_edit_drag()
+        self._cancel_canvas_surface_edit_drag()
         self._cancel_placed_object_gizmo_drag()
         self.clear_face_edit_geometry()
         had_selected_placed_object = self._selected_placed_object_id is not None
@@ -4801,6 +4967,7 @@ class GlbViewerWidget(QWidget):
             self._refresh_atlas_surface_selection_outlines()
             self._refresh_atlas_surface_highlight_outlines()
             self._refresh_canvas_opening_gizmo_items()
+            self._refresh_canvas_surface_edit_gizmo_items()
             self._refresh_doorway_preview_outline_item()
             return
 
@@ -4892,6 +5059,7 @@ class GlbViewerWidget(QWidget):
         self._refresh_atlas_surface_selection_outlines()
         self._refresh_atlas_surface_highlight_outlines()
         self._refresh_canvas_opening_gizmo_items()
+        self._refresh_canvas_surface_edit_gizmo_items()
         self._sync_placed_object_selection_rendering()
         self._refresh_doorway_preview_outline_item()
         self.view.update()
@@ -5380,6 +5548,375 @@ class GlbViewerWidget(QWidget):
         self._refresh_canvas_opening_gizmo_items()
         self.canvas_opening_edit_cancelled.emit(
             _build_canvas_opening_edit(drag.start_target)
+        )
+        return True
+
+    # ### Canvas structural selection and gizmo rendering ###
+    def _get_active_canvas_surface_edit_targets(
+        self,
+    ) -> tuple[CanvasSurfaceEditHandleTarget, ...]:
+        """Return ordered handles owned by the active semantic surface."""
+
+        active_surface_id = self._active_canvas_surface_id
+        if active_surface_id is None:
+            return ()
+        return tuple(
+            target
+            for target in self._canvas_surface_edit_targets.values()
+            if target.surface_id == active_surface_id
+        )
+
+    def _refresh_canvas_surface_edit_gizmo_items(self) -> None:
+        """Draw the active structural outline and its depth-free axis handles."""
+
+        self._remove_canvas_surface_edit_gizmo_items()
+        surface = self._canvas_surface_targets.get(
+            self._active_canvas_surface_id or ""
+        )
+        targets = self._get_active_canvas_surface_edit_targets()
+        if not hasattr(self, "view"):
+            return
+        pending_outline = self._canvas_surface_edit_pending_outline_positions
+        pending_outline_matches_surface = bool(
+            pending_outline is not None
+            and self._canvas_surface_edit_pending_outline_surface_id
+            == self._active_canvas_surface_id
+        )
+        if not targets and pending_outline_matches_surface:
+            assert pending_outline is not None
+            outline_item = gl.GLLinePlotItem(
+                pos=np.asarray(pending_outline, dtype=float),
+                color=CANVAS_SURFACE_EDIT_PREVIEW_COLOR,
+                width=CANVAS_SURFACE_EDIT_OUTLINE_WIDTH,
+                antialias=True,
+                mode="lines",
+            )
+            self._add_canvas_surface_edit_overlay_item(outline_item)
+        if surface is None or not targets:
+            self.view.update()
+            return
+
+        drag = self._canvas_surface_edit_drag
+        outline_positions = _build_canvas_surface_edit_outline_positions(
+            surface,
+            drag,
+            baseline_positions=(
+                pending_outline if pending_outline_matches_surface else None
+            ),
+        )
+        if outline_positions is not None:
+            outline_item = gl.GLLinePlotItem(
+                pos=np.asarray(outline_positions, dtype=float),
+                color=(
+                    CANVAS_SURFACE_EDIT_PREVIEW_COLOR
+                    if drag is not None or pending_outline_matches_surface
+                    else CANVAS_SURFACE_EDIT_SELECTION_COLOR
+                ),
+                width=CANVAS_SURFACE_EDIT_OUTLINE_WIDTH,
+                antialias=True,
+                mode="lines",
+            )
+            self._add_canvas_surface_edit_overlay_item(outline_item)
+
+        for target in targets:
+            origin = _get_canvas_surface_edit_display_origin(target, drag)
+            gizmo_size = self._get_canvas_surface_edit_gizmo_size(
+                surface,
+                target,
+                origin,
+            )
+            target_key = (target.surface_id, target.reference.key)
+            self._canvas_surface_edit_gizmo_sizes[target_key] = (
+                gizmo_size
+            )
+            axis = np.asarray(target.axis_world, dtype=float)
+            endpoint = origin + axis * gizmo_size
+            color = TRANSFORM_GIZMO_AXIS_COLORS[target.reference.axis_index]
+            axis_item = gl.GLLinePlotItem(
+                pos=np.asarray((origin, endpoint), dtype=float),
+                color=color,
+                width=CANVAS_SURFACE_EDIT_GIZMO_LINE_WIDTH,
+                antialias=True,
+                mode="lines",
+            )
+            self._add_canvas_surface_edit_overlay_item(axis_item)
+
+            endpoint_item = gl.GLScatterPlotItem(
+                pos=np.asarray((endpoint,), dtype=float),
+                color=color,
+                size=CANVAS_SURFACE_EDIT_GIZMO_ENDPOINT_SIZE_PIXELS,
+                pxMode=True,
+            )
+            self._add_canvas_surface_edit_overlay_item(endpoint_item)
+        self.view.update()
+
+    def _get_canvas_surface_edit_gizmo_size(
+        self,
+        surface: FixedSurface,
+        target: CanvasSurfaceEditHandleTarget,
+        origin: np.ndarray,
+    ) -> float:
+        """Resolve one prominent, approximately screen-sized axis length."""
+
+        try:
+            pixel_size = float(
+                self.view.pixelSize(
+                    QVector3D(*[float(value) for value in origin])
+                )
+            )
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            pixel_size = 0.0
+        if math.isfinite(pixel_size) and pixel_size > 0.0:
+            return max(
+                CANVAS_SURFACE_EDIT_GIZMO_MIN_SIZE_METERS,
+                pixel_size * CANVAS_SURFACE_EDIT_GIZMO_SCREEN_SIZE_PIXELS,
+            )
+        extents = np.asarray(surface.mesh.extents, dtype=float)
+        fallback = (
+            float(np.max(extents)) * 0.18
+            if extents.shape == (3,) and np.all(np.isfinite(extents))
+            else 0.0
+        )
+        return max(CANVAS_SURFACE_EDIT_GIZMO_MIN_SIZE_METERS, fallback)
+
+    def _add_canvas_surface_edit_overlay_item(
+        self,
+        item: GLGraphicsItem,
+    ) -> None:
+        """Render one structural control last and through scene geometry."""
+
+        item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+        item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE)
+        self.view.addItem(item)
+        self._canvas_surface_edit_gizmo_items.append(item)
+
+    def _remove_canvas_surface_edit_gizmo_items(self) -> None:
+        if not hasattr(self, "view"):
+            self._canvas_surface_edit_gizmo_items = []
+            self._canvas_surface_edit_gizmo_sizes = {}
+            return
+        for item in self._canvas_surface_edit_gizmo_items:
+            if item in self.view.items:
+                self.view.removeItem(item)
+        self._canvas_surface_edit_gizmo_items = []
+        self._canvas_surface_edit_gizmo_sizes = {}
+
+    def _pick_canvas_surface_edit_handle(
+        self,
+        ray_origin: object,
+        ray_direction: object,
+    ) -> CanvasSurfaceEditHandleTarget | None:
+        """CPU-pick the nearest active structural axis segment."""
+
+        surface = self._canvas_surface_targets.get(
+            self._active_canvas_surface_id or ""
+        )
+        origin, direction = _normalize_ray(ray_origin, ray_direction)
+        targets = self._get_active_canvas_surface_edit_targets()
+        if surface is None or origin is None or direction is None or not targets:
+            return None
+
+        candidates: list[
+            tuple[float, float, str, CanvasSurfaceEditHandleTarget]
+        ] = []
+        for target in targets:
+            handle_origin = _get_canvas_surface_edit_display_origin(target, None)
+            gizmo_size = self._canvas_surface_edit_gizmo_sizes.get(
+                (target.surface_id, target.reference.key)
+            )
+            if gizmo_size is None:
+                gizmo_size = self._get_canvas_surface_edit_gizmo_size(
+                    surface,
+                    target,
+                    handle_origin,
+                )
+            handle_end = (
+                handle_origin
+                + np.asarray(target.axis_world, dtype=float) * gizmo_size
+            )
+            segment_distance = _get_ray_segment_distance(
+                origin,
+                direction,
+                handle_origin,
+                handle_end,
+            )
+            if segment_distance is None:
+                continue
+            tolerance = max(
+                CANVAS_SURFACE_EDIT_GIZMO_MIN_HIT_RADIUS_METERS,
+                gizmo_size * CANVAS_SURFACE_EDIT_GIZMO_HIT_RATIO,
+            )
+            if segment_distance > tolerance:
+                continue
+            midpoint_hit = _get_ray_point_distance(
+                origin,
+                direction,
+                (handle_origin + handle_end) * 0.5,
+            )
+            ray_parameter = (
+                midpoint_hit[1] if midpoint_hit is not None else math.inf
+            )
+            candidates.append(
+                (
+                    segment_distance / max(tolerance, 1e-12),
+                    ray_parameter,
+                    target.reference.key,
+                    target,
+                )
+            )
+        if not candidates:
+            return None
+        return min(candidates, key=lambda candidate: candidate[:3])[3]
+
+    # ### Canvas structural gizmo dragging ###
+    def _begin_canvas_surface_edit_drag(
+        self,
+        target: CanvasSurfaceEditHandleTarget,
+        position: QPointF,
+    ) -> bool:
+        """Reserve primary input and snapshot an absolute structural edit."""
+
+        active_targets = self._get_active_canvas_surface_edit_targets()
+        if target not in active_targets:
+            return False
+        camera_ray = self.view.build_camera_ray(position)
+        if camera_ray is None:
+            return False
+        ray_origin, ray_direction = camera_ray
+        axis = np.asarray(target.axis_world, dtype=float)
+        drag_plane_normal = _build_axis_drag_plane_normal(axis, ray_direction)
+        hit = _intersect_ray_with_plane(
+            ray_origin,
+            ray_direction,
+            target.origin_world,
+            drag_plane_normal,
+        )
+        if hit is None:
+            return False
+        target_origin = np.asarray(target.origin_world, dtype=float)
+        start_axis_parameter = float(np.dot(hit - target_origin, axis))
+        self._canvas_surface_edit_drag = _CanvasSurfaceEditDrag(
+            target=target,
+            axis=axis,
+            drag_plane_normal=drag_plane_normal,
+            start_axis_parameter=start_axis_parameter,
+            baseline_outline_positions=(
+                np.asarray(
+                    self._canvas_surface_edit_pending_outline_positions,
+                    dtype=float,
+                ).copy()
+                if self._canvas_surface_edit_pending_outline_positions
+                is not None
+                and self._canvas_surface_edit_pending_outline_surface_id
+                == target.surface_id
+                else None
+            ),
+        )
+        self.view.reserve_primary_pointer_drag()
+        self._refresh_canvas_surface_edit_gizmo_items()
+        self.canvas_surface_edit_started.emit(
+            _build_canvas_surface_edit(target, 0.0)
+        )
+        return self._canvas_surface_edit_drag is not None
+
+    def _update_canvas_surface_edit_drag(self, position: QPointF) -> bool:
+        """Emit one clamped absolute delta and move only overlay geometry."""
+
+        drag = self._canvas_surface_edit_drag
+        camera_ray = self.view.build_camera_ray(position)
+        if drag is None or camera_ray is None:
+            return False
+        ray_origin, ray_direction = camera_ray
+        target_origin = np.asarray(drag.target.origin_world, dtype=float)
+        hit = _intersect_ray_with_plane(
+            ray_origin,
+            ray_direction,
+            target_origin,
+            drag.drag_plane_normal,
+        )
+        if hit is None:
+            return False
+        axis_parameter = float(np.dot(hit - target_origin, drag.axis))
+        delta_meters = float(
+            np.clip(
+                axis_parameter - drag.start_axis_parameter,
+                drag.target.minimum_delta_meters,
+                drag.target.maximum_delta_meters,
+            )
+        )
+        if math.isclose(
+            delta_meters,
+            drag.preview_delta_meters,
+            abs_tol=1e-9,
+            rel_tol=0.0,
+        ):
+            return False
+        drag.preview_delta_meters = delta_meters
+        self._refresh_canvas_surface_edit_gizmo_items()
+        if math.isclose(
+            delta_meters,
+            drag.last_emitted_delta_meters,
+            abs_tol=1e-9,
+            rel_tol=0.0,
+        ):
+            return False
+        drag.last_emitted_delta_meters = delta_meters
+        self.canvas_surface_edit_preview_changed.emit(
+            _build_canvas_surface_edit(drag.target, delta_meters)
+        )
+        return True
+
+    def _finish_canvas_surface_edit_drag(self, position: QPointF) -> bool:
+        """Finish one structural edit without rebuilding the displayed model."""
+
+        if self._canvas_surface_edit_drag is None:
+            return False
+        self._update_canvas_surface_edit_drag(position)
+        drag = self._canvas_surface_edit_drag
+        if drag is None:
+            return False
+        edit = _build_canvas_surface_edit(
+            drag.target,
+            drag.preview_delta_meters,
+        )
+        changed = not math.isclose(
+            drag.preview_delta_meters,
+            0.0,
+            abs_tol=1e-9,
+            rel_tol=0.0,
+        )
+        surface = self._canvas_surface_targets.get(drag.target.surface_id)
+        if changed and surface is not None:
+            pending_outline = _build_canvas_surface_edit_outline_positions(
+                surface,
+                drag,
+                baseline_positions=drag.baseline_outline_positions,
+            )
+            self._canvas_surface_edit_pending_outline_positions = (
+                None
+                if pending_outline is None
+                else np.asarray(pending_outline, dtype=float).copy()
+            )
+            self._canvas_surface_edit_pending_outline_surface_id = (
+                None if pending_outline is None else drag.target.surface_id
+            )
+        self._canvas_surface_edit_drag = None
+        self.view.release_primary_pointer_drag()
+        self.canvas_surface_edit_finished.emit(edit, changed)
+        self._refresh_canvas_surface_edit_gizmo_items()
+        return changed
+
+    def _cancel_canvas_surface_edit_drag(self, *_args: object) -> bool:
+        """Restore a zero-delta overlay and release structural pointer input."""
+
+        drag = self._canvas_surface_edit_drag
+        if drag is None:
+            return False
+        self._canvas_surface_edit_drag = None
+        self.view.release_primary_pointer_drag()
+        self._refresh_canvas_surface_edit_gizmo_items()
+        self.canvas_surface_edit_cancelled.emit(
+            _build_canvas_surface_edit(drag.target, 0.0)
         )
         return True
 
@@ -5938,6 +6475,8 @@ class GlbViewerWidget(QWidget):
         self._placed_object_render_groups = {}
         self._remove_transform_gizmo_items()
         self._canvas_opening_gizmo_items = []
+        self._canvas_surface_edit_gizmo_items = []
+        self._canvas_surface_edit_gizmo_sizes = {}
         self.textured_surface_items = []
         self.textured_wall_items = []
         self.projection_camera_indicator_items = {}
@@ -6587,6 +7126,83 @@ def _build_canvas_opening_edit(target: CanvasOpeningTarget) -> CanvasOpeningEdit
         wall_surface_id=target.wall_surface_id,
         bounds=target.bounds,
     )
+
+
+# ### Canvas structural edit helpers ###
+def _build_canvas_surface_edit(
+    target: CanvasSurfaceEditHandleTarget,
+    delta_meters: float,
+) -> CanvasSurfaceEdit:
+    """Create one immutable absolute-from-start structural edit payload."""
+
+    return CanvasSurfaceEdit(
+        reference=target.reference,
+        surface_id=target.surface_id,
+        delta_meters=float(delta_meters),
+    )
+
+
+def _get_canvas_surface_edit_display_origin(
+    target: CanvasSurfaceEditHandleTarget,
+    drag: _CanvasSurfaceEditDrag | None,
+) -> np.ndarray:
+    """Move related wall-axis handles with their shared live endpoint."""
+
+    origin = np.asarray(target.origin_world, dtype=float)
+    if drag is None or drag.target.surface_id != target.surface_id:
+        return origin
+    references_match = drag.target.reference.key == target.reference.key
+    shared_wall_vertex = bool(
+        drag.target.reference.kind == CANVAS_SURFACE_EDIT_WALL_VERTEX
+        and target.reference.kind == CANVAS_SURFACE_EDIT_WALL_VERTEX
+        and drag.target.reference.vertex_id == target.reference.vertex_id
+    )
+    if not references_match and not shared_wall_vertex:
+        return origin
+    return origin + drag.axis * drag.preview_delta_meters
+
+
+def _build_canvas_surface_edit_outline_positions(
+    surface: FixedSurface,
+    drag: _CanvasSurfaceEditDrag | None,
+    *,
+    baseline_positions: object | None = None,
+) -> np.ndarray | None:
+    """Build a cheap moved boundary preview without touching scene meshes."""
+
+    positions = (
+        _build_fixed_surface_boundary_line_positions(surface)
+        if baseline_positions is None
+        else np.asarray(baseline_positions, dtype=float).copy()
+    )
+    if (
+        positions is None
+        or drag is None
+        or drag.target.surface_id != surface.surface_id
+    ):
+        return positions
+    preview_positions = np.asarray(positions, dtype=float).copy()
+    preview_distance = drag.preview_delta_meters
+    if (
+        drag.target.reference.kind
+        == CANVAS_SURFACE_EDIT_FLOOR_THICKNESS
+    ):
+        preview_distance += drag.target.baseline_value_meters
+    offset = drag.axis * preview_distance
+    if drag.target.reference.kind != CANVAS_SURFACE_EDIT_WALL_VERTEX:
+        return preview_positions + offset[np.newaxis, :]
+
+    endpoint = np.asarray(drag.target.origin_world, dtype=float)
+    surface_extent = max(
+        1.0,
+        float(np.max(np.asarray(surface.mesh.extents, dtype=float))),
+    )
+    endpoint_mask = np.linalg.norm(
+        preview_positions[:, :2] - endpoint[np.newaxis, :2],
+        axis=1,
+    ) <= surface_extent * 1e-7
+    preview_positions[endpoint_mask] += offset
+    return preview_positions
 
 
 def _get_canvas_opening_handle_local_position(

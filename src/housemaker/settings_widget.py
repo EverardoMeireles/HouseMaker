@@ -722,8 +722,8 @@ class SettingsWidget(QWidget):
         self.mesh_edit_update_delay_spinbox.setSuffix(" s")
         self.mesh_edit_update_delay_spinbox.setKeyboardTracking(False)
         self.mesh_edit_update_delay_spinbox.setToolTip(
-            "Wait this long after releasing a doorway or window edit before "
-            "rebuilding the Canvas 3D wall mesh."
+            "Wait this long after releasing a doorway or window edit, or a "
+            "wall dimension edit, before rebuilding the Canvas 3D mesh."
         )
         self.mesh_edit_update_delay_spinbox.valueChanged.connect(
             self._handle_mesh_edit_update_delay_changed

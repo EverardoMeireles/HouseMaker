@@ -54,6 +54,17 @@ from housemaker.canvas_openings import (
     apply_canvas_opening_edit,
     build_canvas_opening_targets,
 )
+from housemaker.canvas_surface_edits import (
+    CANVAS_SURFACE_EDIT_WALL_VERTEX,
+    AppliedCanvasSurfaceEdit,
+    CanvasSurfaceEdit,
+    CanvasSurfaceEditHandleTarget,
+    apply_canvas_surface_edit,
+    build_canvas_surface_edit_targets,
+    rebase_canvas_wall_edit_targets,
+    restore_canvas_surface_edit,
+    validate_canvas_surface_edit_geometry,
+)
 from housemaker.external_viewer_host import ExternalFullscreenViewerHost
 from housemaker.generation_state import (
     GeneratedObjectPlacement,
@@ -81,6 +92,7 @@ from housemaker.surface_texture_workspace import (
 )
 from housemaker.surface_geometry import (
     FixedSurface,
+    SURFACE_TYPE_WALL,
     WallWindowPlacement,
     add_wall_window,
     build_fixed_surfaces,
@@ -261,7 +273,7 @@ class BlueprintWorkspace(QWidget):
             tuple[WindowData, ...],
         ] = {}
         self._reset_viewer_doorway_snapshots()
-        self._doorway_mesh_update_delay_seconds = (
+        self._mesh_edit_update_delay_seconds = (
             DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS
         )
         self._is_doorway_move_drag_active = False
@@ -274,6 +286,18 @@ class BlueprintWorkspace(QWidget):
             str,
             CanvasOpeningTarget,
         ] = {}
+        self._canvas_surface_targets_by_id: dict[str, FixedSurface] = {}
+        self._canvas_surface_edit_targets_by_key: dict[
+            tuple[str, str],
+            CanvasSurfaceEditHandleTarget,
+        ] = {}
+        self._active_canvas_surface_edit_target: (
+            CanvasSurfaceEditHandleTarget | None
+        ) = None
+        self._pending_canvas_surface_mesh_update = False
+        self._pending_canvas_surface_mesh_baseline: (
+            CanvasSurfaceEditHandleTarget | None
+        ) = None
         self._pending_canvas_opening_key: str | None = None
         self._staged_canvas_opening_mesh_update = False
         self._staged_doorway_mesh_update = False
@@ -283,10 +307,18 @@ class BlueprintWorkspace(QWidget):
         self._doorway_mesh_update_timer = QTimer(self)
         self._doorway_mesh_update_timer.setSingleShot(True)
         self._doorway_mesh_update_timer.setInterval(
-            round(self._doorway_mesh_update_delay_seconds * 1000.0)
+            round(self._mesh_edit_update_delay_seconds * 1000.0)
         )
         self._doorway_mesh_update_timer.timeout.connect(
             self._commit_pending_doorway_mesh_update
+        )
+        self._canvas_surface_mesh_update_timer = QTimer(self)
+        self._canvas_surface_mesh_update_timer.setSingleShot(True)
+        self._canvas_surface_mesh_update_timer.setInterval(
+            round(self._mesh_edit_update_delay_seconds * 1000.0)
+        )
+        self._canvas_surface_mesh_update_timer.timeout.connect(
+            self._commit_pending_canvas_surface_mesh_update
         )
         self._canvas_3d_viewer_is_external = False
         self._atlas_generation_signature: tuple[tuple[object, ...], ...] | None = None
@@ -334,6 +366,8 @@ class BlueprintWorkspace(QWidget):
         if self._is_shutdown:
             return
         self._is_shutdown = True
+        self._cancel_active_canvas_surface_edit()
+        self._cancel_pending_canvas_surface_mesh_update()
         self._cancel_pending_doorway_mesh_update(clear_outline=True)
         try:
             self.settings_widget.settings_changed.disconnect(
@@ -470,7 +504,7 @@ class BlueprintWorkspace(QWidget):
         )
         generation_settings = self.settings_widget.get_settings()
         self._generation_settings = generation_settings
-        self._set_doorway_mesh_update_delay_seconds(
+        self._set_mesh_edit_update_delay_seconds(
             generation_settings.mesh_edit_update_delay_seconds
         )
         self._set_canvas_3d_navigation_shortcut(
@@ -575,6 +609,18 @@ class BlueprintWorkspace(QWidget):
         )
         self.viewer.canvas_surface_selection_changed.connect(
             self._handle_canvas_surface_selection_changed
+        )
+        self.viewer.canvas_surface_edit_started.connect(
+            self._handle_canvas_surface_edit_started
+        )
+        self.viewer.canvas_surface_edit_preview_changed.connect(
+            self._handle_canvas_surface_edit_preview_changed
+        )
+        self.viewer.canvas_surface_edit_finished.connect(
+            self._handle_canvas_surface_edit_finished
+        )
+        self.viewer.canvas_surface_edit_cancelled.connect(
+            self._handle_canvas_surface_edit_cancelled
         )
         self.viewer.placed_object_removal_requested.connect(
             self._handle_placed_object_removal_requested
@@ -1406,6 +1452,9 @@ class BlueprintWorkspace(QWidget):
         installed_surface_ids = {
             surface.surface_id for surface in surface_targets
         }
+        self._canvas_surface_targets_by_id = {
+            surface.surface_id: surface for surface in surface_targets
+        }
         self._desired_canvas_surface_ids = tuple(
             surface_id
             for surface_id in self._desired_canvas_surface_ids
@@ -1419,6 +1468,18 @@ class BlueprintWorkspace(QWidget):
         self._is_syncing_canvas_scene_selection = True
         try:
             self.viewer.set_wall_targets(surface_targets)
+            try:
+                edit_targets = build_canvas_surface_edit_targets(
+                    self.levels,
+                    surface_targets,
+                )
+            except (TypeError, ValueError):
+                edit_targets = ()
+            self._canvas_surface_edit_targets_by_key = {
+                (target.surface_id, target.reference.key): target
+                for target in edit_targets
+            }
+            self.viewer.set_canvas_surface_edit_targets(edit_targets)
             if self._desired_canvas_surface_ids:
                 self.viewer.set_selected_canvas_surface_ids(
                     self._desired_canvas_surface_ids
@@ -1454,7 +1515,11 @@ class BlueprintWorkspace(QWidget):
             target.key: target for target in opening_targets
         }
         self.viewer.set_canvas_opening_targets(opening_targets)
+        self._sync_selected_canvas_wall_highlight(
+            self.viewer.get_active_canvas_surface_id()
+        )
 
+    # ### Canvas surface selection synchronization ###
     def _handle_canvas_surface_selection_changed(
         self,
         raw_surface_ids: object,
@@ -1474,6 +1539,362 @@ class BlueprintWorkspace(QWidget):
         self._atlas_surface_assignment_target_ids = surface_ids
         if surface_ids:
             self._desired_canvas_object_id = None
+        active_surface_id = surface_ids[-1] if surface_ids else None
+        self._sync_selected_canvas_wall_highlight(
+            active_surface_id
+        )
+        pending_baseline = self._pending_canvas_surface_mesh_baseline
+        if self._pending_canvas_surface_mesh_update and (
+            pending_baseline is None
+            or active_surface_id != pending_baseline.surface_id
+        ):
+            self._commit_pending_canvas_surface_mesh_update()
+
+    def _sync_selected_canvas_wall_highlight(
+        self,
+        surface_id: str | None,
+    ) -> None:
+        """Mirror the active 3D wall selection onto the current 2D Canvas."""
+
+        surface = self._canvas_surface_targets_by_id.get(surface_id or "")
+        current_level = (
+            self.levels[self.current_level_index]
+            if 0 <= self.current_level_index < len(self.levels)
+            else None
+        )
+        selected_wall_id = (
+            surface.surface_id
+            if surface is not None
+            and surface.surface_type == SURFACE_TYPE_WALL
+            and current_level is not None
+            and surface.level_index == current_level.index
+            else None
+        )
+        self.canvas.set_selected_wall_surface_id(selected_wall_id)
+
+    # ### Canvas structural surface edits ###
+    def _handle_canvas_surface_edit_started(self, raw_edit: object) -> None:
+        """Remember the immutable baseline for one live structural drag."""
+
+        if not isinstance(raw_edit, CanvasSurfaceEdit):
+            return
+        target = self._canvas_surface_edit_targets_by_key.get(
+            (raw_edit.surface_id, raw_edit.reference.key)
+        )
+        if (
+            target is None
+            or target.reference != raw_edit.reference
+            or target.surface_id != raw_edit.surface_id
+        ):
+            return
+
+        previous_target = self._active_canvas_surface_edit_target
+        if previous_target is not None and previous_target != target:
+            try:
+                applied = restore_canvas_surface_edit(
+                    self.levels,
+                    previous_target,
+                    validate_project_geometry=False,
+                )
+            except (TypeError, ValueError):
+                pass
+            else:
+                self._sync_live_canvas_surface_edit(applied)
+        if target.reference.kind == CANVAS_SURFACE_EDIT_WALL_VERTEX:
+            self._canvas_surface_mesh_update_timer.stop()
+        self._active_canvas_surface_edit_target = target
+
+    def _handle_canvas_surface_edit_preview_changed(
+        self,
+        raw_edit: object,
+    ) -> None:
+        """Apply absolute drag deltas without rebuilding the complete 3D mesh."""
+
+        self._apply_active_canvas_surface_edit(
+            raw_edit,
+            validate_project_geometry=False,
+        )
+
+    def _handle_canvas_surface_edit_finished(
+        self,
+        raw_edit: object,
+        changed: bool,
+    ) -> None:
+        """Commit one valid drag and schedule its one required mesh rebuild."""
+
+        target = self._active_canvas_surface_edit_target
+        if target is None or not isinstance(raw_edit, CanvasSurfaceEdit):
+            return
+        is_wall_edit = (
+            target.reference.kind == CANVAS_SURFACE_EDIT_WALL_VERTEX
+        )
+        if changed and not self._apply_active_canvas_surface_edit(
+            raw_edit,
+            validate_project_geometry=not is_wall_edit,
+        ):
+            return
+        if not changed:
+            try:
+                applied = restore_canvas_surface_edit(
+                    self.levels,
+                    target,
+                    validate_project_geometry=False,
+                )
+            except (TypeError, ValueError):
+                pass
+            else:
+                self._sync_live_canvas_surface_edit(applied)
+
+        self._active_canvas_surface_edit_target = None
+        if not changed:
+            if self._pending_canvas_surface_mesh_update and is_wall_edit:
+                self._canvas_surface_mesh_update_timer.start()
+            else:
+                self._queue_viewer_preview_refresh()
+            return
+
+        if is_wall_edit:
+            if self._pending_canvas_surface_mesh_baseline is None:
+                self._pending_canvas_surface_mesh_baseline = target
+            self._pending_canvas_surface_mesh_update = True
+            current_wall_targets = tuple(
+                candidate
+                for candidate in self._canvas_surface_edit_targets_by_key.values()
+                if candidate.surface_id == target.surface_id
+                and (
+                    candidate.reference.kind
+                    == CANVAS_SURFACE_EDIT_WALL_VERTEX
+                )
+            )
+            try:
+                rebased_targets = rebase_canvas_wall_edit_targets(
+                    self.levels,
+                    current_wall_targets,
+                )
+            except (TypeError, ValueError) as error:
+                self._reject_pending_canvas_surface_mesh_update(error)
+                return
+            self._canvas_surface_edit_targets_by_key = {
+                (candidate.surface_id, candidate.reference.key): candidate
+                for candidate in rebased_targets
+            }
+            self.viewer.set_canvas_surface_edit_targets(
+                rebased_targets,
+                preserve_pending_outline=True,
+            )
+            self._canvas_surface_mesh_update_timer.start()
+            return
+
+        # Height and floor edits rebuild immediately, so their old immutable
+        # baselines are retired until the refreshed scene installs new ones.
+        self._canvas_surface_edit_targets_by_key = {}
+        self.viewer.set_canvas_surface_edit_targets(())
+        self._reconcile_canvas_surface_edit_and_refresh()
+
+    def _reconcile_canvas_surface_edit_and_refresh(self) -> None:
+        """Reconcile semantic assignments before one structural mesh rebuild."""
+
+        assignments_changed = (
+            self.surface_texture_generation.reconcile_assignments_with_levels(
+                self.levels
+            )
+        )
+        if not assignments_changed:
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+
+    def _commit_pending_canvas_surface_mesh_update(self) -> None:
+        """Release one validated wall edit after its configured quiet period."""
+
+        self._canvas_surface_mesh_update_timer.stop()
+        if not self._pending_canvas_surface_mesh_update:
+            return
+        baseline = self._pending_canvas_surface_mesh_baseline
+        if baseline is not None:
+            try:
+                validate_canvas_surface_edit_geometry(
+                    self.levels,
+                    baseline,
+                )
+            except (TypeError, ValueError) as error:
+                self._reject_pending_canvas_surface_mesh_update(error)
+                return
+
+        self._pending_canvas_surface_mesh_update = False
+        self._pending_canvas_surface_mesh_baseline = None
+        self._canvas_surface_edit_targets_by_key = {}
+        self.viewer.set_canvas_surface_edit_targets(
+            (),
+            preserve_pending_outline=True,
+        )
+        self._reconcile_canvas_surface_edit_and_refresh()
+
+    def _cancel_pending_canvas_surface_mesh_update(self) -> None:
+        """Discard delayed wall-mesh work without changing authoritative data."""
+
+        self._canvas_surface_mesh_update_timer.stop()
+        self._pending_canvas_surface_mesh_update = False
+        self._pending_canvas_surface_mesh_baseline = None
+        self.viewer.clear_canvas_surface_edit_pending_outline()
+
+    def _reject_pending_canvas_surface_mesh_update(
+        self,
+        error: Exception,
+    ) -> None:
+        """Roll a rejected adjustment burst back to its first wall baseline."""
+
+        baseline = self._pending_canvas_surface_mesh_baseline
+        self._canvas_surface_mesh_update_timer.stop()
+        self._pending_canvas_surface_mesh_update = False
+        self._pending_canvas_surface_mesh_baseline = None
+        if baseline is not None:
+            try:
+                restored = restore_canvas_surface_edit(
+                    self.levels,
+                    baseline,
+                    validate_project_geometry=False,
+                )
+            except (TypeError, ValueError):
+                pass
+            else:
+                self._sync_live_canvas_surface_edit(restored)
+        self.viewer.set_window_tools_status(
+            f"Surface edit stopped: {error}"
+        )
+        self.viewer.clear_canvas_surface_edit_pending_outline()
+        self._restore_canvas_surface_edit_targets_after_rejection()
+        self._queue_viewer_preview_refresh()
+
+    def _restore_canvas_surface_edit_targets_after_rejection(self) -> None:
+        """Re-arm unchanged viewer handles after delayed validation rolls back."""
+
+        try:
+            edit_targets = build_canvas_surface_edit_targets(
+                self.levels,
+                tuple(self._canvas_surface_targets_by_id.values()),
+            )
+        except (TypeError, ValueError):
+            edit_targets = ()
+        self._canvas_surface_edit_targets_by_key = {
+            (target.surface_id, target.reference.key): target
+            for target in edit_targets
+        }
+        self.viewer.set_canvas_surface_edit_targets(edit_targets)
+
+    def _handle_canvas_surface_edit_cancelled(self, raw_edit: object) -> None:
+        """Restore the exact structural baseline after Escape or navigation."""
+
+        target = self._active_canvas_surface_edit_target
+        if target is None:
+            return
+        if (
+            isinstance(raw_edit, CanvasSurfaceEdit)
+            and (
+                raw_edit.reference != target.reference
+                or raw_edit.surface_id != target.surface_id
+            )
+        ):
+            return
+        try:
+            applied = restore_canvas_surface_edit(
+                self.levels,
+                target,
+                validate_project_geometry=False,
+            )
+        except (TypeError, ValueError):
+            pass
+        else:
+            self._sync_live_canvas_surface_edit(applied)
+        self._active_canvas_surface_edit_target = None
+        if (
+            self._pending_canvas_surface_mesh_update
+            and target.reference.kind == CANVAS_SURFACE_EDIT_WALL_VERTEX
+        ):
+            self._canvas_surface_mesh_update_timer.start()
+        else:
+            self._queue_viewer_preview_refresh()
+
+    def _cancel_active_canvas_surface_edit(self) -> bool:
+        """Cancel viewer ownership or restore a stranded Main transaction."""
+
+        viewer_cancelled = self.viewer.cancel_canvas_surface_edit()
+        if self._active_canvas_surface_edit_target is None:
+            return viewer_cancelled
+        self._handle_canvas_surface_edit_cancelled(None)
+        return True
+
+    def _apply_active_canvas_surface_edit(
+        self,
+        raw_edit: object,
+        *,
+        validate_project_geometry: bool,
+    ) -> bool:
+        """Validate and apply one absolute edit against its drag-start target."""
+
+        target = self._active_canvas_surface_edit_target
+        if not isinstance(raw_edit, CanvasSurfaceEdit) or target is None:
+            return False
+        if (
+            raw_edit.reference != target.reference
+            or raw_edit.surface_id != target.surface_id
+        ):
+            return False
+        try:
+            applied = apply_canvas_surface_edit(
+                self.levels,
+                target,
+                raw_edit,
+                validate_project_geometry=validate_project_geometry,
+            )
+        except (TypeError, ValueError) as error:
+            resume_pending_wall_update = bool(
+                self._pending_canvas_surface_mesh_update
+                and target.reference.kind == CANVAS_SURFACE_EDIT_WALL_VERTEX
+            )
+            try:
+                restored = restore_canvas_surface_edit(
+                    self.levels,
+                    target,
+                    validate_project_geometry=False,
+                )
+            except (TypeError, ValueError):
+                pass
+            else:
+                self._sync_live_canvas_surface_edit(restored)
+            self._active_canvas_surface_edit_target = None
+            self.viewer.set_window_tools_status(
+                f"Surface edit stopped: {error}"
+            )
+            if not resume_pending_wall_update:
+                self.viewer.clear_canvas_surface_edit_pending_outline()
+            self.viewer.cancel_canvas_surface_edit()
+            if resume_pending_wall_update:
+                self._canvas_surface_mesh_update_timer.start()
+            else:
+                self._queue_viewer_preview_refresh()
+            return False
+        self._sync_live_canvas_surface_edit(applied)
+        return True
+
+    def _sync_live_canvas_surface_edit(
+        self,
+        applied: AppliedCanvasSurfaceEdit,
+    ) -> None:
+        """Repaint shared 2D data and reflect edited level-wide values."""
+
+        level = applied.level
+        if level.index != self.current_level.index:
+            return
+        self.canvas.update()
+        self._is_syncing_level_controls = True
+        try:
+            self.height_level_spinbox.setValue(level.height_meters)
+            self.floor_thickness_spinbox.setValue(
+                level.floor_thickness_meters
+            )
+            self.level_x_offset_spinbox.setValue(level.offset_x_meters)
+            self.level_y_offset_spinbox.setValue(level.offset_y_meters)
+        finally:
+            self._is_syncing_level_controls = False
 
     def _handle_canvas_placed_object_selection_changed(
         self,
@@ -1498,14 +1919,31 @@ class BlueprintWorkspace(QWidget):
 
         if self._desired_canvas_object_id is not None:
             self.viewer.select_placed_object(self._desired_canvas_object_id)
+            self._sync_selected_canvas_wall_highlight(None)
             return
         if self._desired_canvas_surface_ids:
             self.viewer.select_placed_object(None)
             self.viewer.select_canvas_opening(None)
-            self.viewer.select_wall_target(None)
-            self.viewer.set_selected_canvas_surface_ids(
-                self._desired_canvas_surface_ids
+            selected_surface = (
+                self._canvas_surface_targets_by_id.get(
+                    self._desired_canvas_surface_ids[0]
+                )
+                if len(self._desired_canvas_surface_ids) == 1
+                else None
             )
+            if (
+                selected_surface is not None
+                and selected_surface.surface_type == SURFACE_TYPE_WALL
+            ):
+                self.viewer.select_wall_target(selected_surface.surface_id)
+            else:
+                self.viewer.select_wall_target(None)
+                self.viewer.set_selected_canvas_surface_ids(
+                    self._desired_canvas_surface_ids
+                )
+        self._sync_selected_canvas_wall_highlight(
+            self.viewer.get_active_canvas_surface_id()
+        )
 
     def _restore_canvas_window_preview_after_rollback(self) -> None:
         """Best-effort repair after a display refresh failed mid-transaction."""
@@ -1580,6 +2018,8 @@ class BlueprintWorkspace(QWidget):
         self._set_current_level_image(file_path)
 
     def _handle_glb_export_clicked(self) -> None:
+        self._cancel_active_canvas_surface_edit()
+        self._commit_pending_canvas_surface_mesh_update()
         self._sync_atlas_object_texture_sources(
             automatically_assign_scene_textures=False
         )
@@ -4294,25 +4734,29 @@ class BlueprintWorkspace(QWidget):
             preview_levels.append(preview_level)
         return preview_levels
 
-    def _set_doorway_mesh_update_delay_seconds(
+    def _set_mesh_edit_update_delay_seconds(
         self,
         delay_seconds: float,
     ) -> None:
-        """Apply the setting and restart a live debounce only when it changed."""
+        """Apply the shared setting and restart active mesh-edit debounces."""
 
         normalized_delay = float(delay_seconds)
         if normalized_delay <= 0.0:
             raise ValueError("Mesh edit update delay must be positive.")
-        if normalized_delay == self._doorway_mesh_update_delay_seconds:
+        if normalized_delay == self._mesh_edit_update_delay_seconds:
             return
 
-        timer_was_active = self._doorway_mesh_update_timer.isActive()
-        self._doorway_mesh_update_delay_seconds = normalized_delay
-        self._doorway_mesh_update_timer.setInterval(
-            max(1, round(normalized_delay * 1000.0))
+        interval_milliseconds = max(1, round(normalized_delay * 1000.0))
+        timers = (
+            self._doorway_mesh_update_timer,
+            self._canvas_surface_mesh_update_timer,
         )
-        if timer_was_active:
-            self._doorway_mesh_update_timer.start()
+        active_timers = tuple(timer.isActive() for timer in timers)
+        self._mesh_edit_update_delay_seconds = normalized_delay
+        for timer, was_active in zip(timers, active_timers, strict=True):
+            timer.setInterval(interval_milliseconds)
+            if was_active:
+                timer.start()
 
     def _stage_pending_canvas_opening_snapshots(self) -> None:
         """Stage all stable live openings without refreshing during a drag."""
@@ -4560,6 +5004,11 @@ class BlueprintWorkspace(QWidget):
         self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     def _refresh_viewer_preview(self, preserve_camera: bool = False) -> None:
+        if (
+            self._active_canvas_surface_edit_target is not None
+            or self._pending_canvas_surface_mesh_update
+        ):
+            return
         revision = self._viewer_preview_revision
         canvas_is_stale = bool(
             self._canvas_viewer_preview_is_active()
@@ -4640,7 +5089,14 @@ class BlueprintWorkspace(QWidget):
         return self._viewer_preview_revision
 
     def _queue_viewer_preview_refresh(self) -> None:
+        if self._is_shutdown:
+            return
         if not self._active_viewer_preview_needs_refresh():
+            return
+        if (
+            self._active_canvas_surface_edit_target is not None
+            or self._pending_canvas_surface_mesh_update
+        ):
             return
         if self._is_viewer_refresh_scheduled:
             return
@@ -4682,11 +5138,17 @@ class BlueprintWorkspace(QWidget):
         self._is_viewer_refresh_scheduled = False
         if not self._active_viewer_preview_needs_refresh():
             return
+        if (
+            self._active_canvas_surface_edit_target is not None
+            or self._pending_canvas_surface_mesh_update
+        ):
+            return
 
         preserve_camera = self._scheduled_viewer_refresh_preserve_camera
         self._refresh_viewer_preview(preserve_camera=preserve_camera)
 
     def _handle_save_clicked(self) -> None:
+        self._cancel_active_canvas_surface_edit()
         default_path = (
             Path(self.current_project_path)
             if self.current_project_path is not None
@@ -4700,6 +5162,8 @@ class BlueprintWorkspace(QWidget):
         )
         if not file_path:
             return
+
+        self._commit_pending_canvas_surface_mesh_update()
 
         try:
             save_project(
@@ -4743,6 +5207,8 @@ class BlueprintWorkspace(QWidget):
         )
         if not file_path:
             return
+
+        self._commit_pending_canvas_surface_mesh_update()
 
         try:
             self._load_project_path(file_path)
@@ -4917,6 +5383,8 @@ class BlueprintWorkspace(QWidget):
             return
 
         if level_index != self.current_level_index:
+            self._cancel_active_canvas_surface_edit()
+            self._commit_pending_canvas_surface_mesh_update()
             self._commit_pending_doorway_mesh_update()
         self.current_level_index = level_index
         self._sync_level_controls()
@@ -5373,7 +5841,7 @@ class BlueprintWorkspace(QWidget):
     def _handle_generation_settings_changed(self) -> None:
         settings = self.settings_widget.get_settings()
         self._generation_settings = settings
-        self._set_doorway_mesh_update_delay_seconds(
+        self._set_mesh_edit_update_delay_seconds(
             settings.mesh_edit_update_delay_seconds
         )
         self._set_canvas_3d_navigation_shortcut(
@@ -5465,6 +5933,8 @@ class BlueprintWorkspace(QWidget):
             )
 
         self._is_doorway_move_drag_active = False
+        self._cancel_active_canvas_surface_edit()
+        self._cancel_pending_canvas_surface_mesh_update()
         self._cancel_pending_doorway_mesh_update(clear_outline=True)
         self.canvas.cancel_stair_placement()
         self._desired_canvas_object_id = None
@@ -5569,6 +6039,9 @@ class BlueprintWorkspace(QWidget):
         if self.canvas.blueprint_image is not None:
             self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
         self.canvas.set_stair_context(self.stairs, self.current_level)
+        self._sync_selected_canvas_wall_highlight(
+            self.viewer.get_active_canvas_surface_id()
+        )
         self._update_blueprint_name_label()
 
     def _update_blueprint_name_label(self) -> None:

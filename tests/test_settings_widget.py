@@ -1047,6 +1047,10 @@ class SettingsWidgetTests(unittest.TestCase):
                 "doorway or window edit",
                 widget.mesh_edit_update_delay_spinbox.toolTip(),
             )
+            self.assertIn(
+                "wall dimension edit",
+                widget.mesh_edit_update_delay_spinbox.toolTip(),
+            )
             form_layout = widget.canvas_settings_group.layout()
             self.assertIsInstance(form_layout, QFormLayout)
             assert isinstance(form_layout, QFormLayout)

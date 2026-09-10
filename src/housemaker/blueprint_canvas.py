@@ -53,6 +53,8 @@ from housemaker.uv_layout import build_room_walls
 CANVAS_BACKGROUND_COLOR = QColor("#1c1f24")
 CANVAS_PANEL_COLOR = QColor("#252a31")
 EDGE_COLOR = QColor("#63c0ff")
+SELECTED_WALL_EDGE_COLOR = QColor("#f6c85f")
+SELECTED_WALL_EDGE_WIDTH_SCREEN = 5.0
 PREVIEW_EDGE_COLOR = QColor("#f6c85f")
 GUIDE_COLOR = QColor("#39d98a")
 VERTEX_FILL_COLOR = QColor("#ffffff")
@@ -348,6 +350,7 @@ class BlueprintCanvas(QWidget):
         self.pending_stair_preview_guides: list[SnapGuide] = []
         self.level_context: LevelData | None = None
         self._camera_indicator_pose: CameraPose | None = None
+        self._selected_wall_surface_id: str | None = None
 
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -473,6 +476,26 @@ class BlueprintCanvas(QWidget):
         """Return the world-space pose currently represented on the Canvas."""
 
         return self._camera_indicator_pose
+
+    # ### Selected wall highlight ###
+    def set_selected_wall_surface_id(self, surface_id: str | None) -> bool:
+        """Highlight one semantic wall from the detached Canvas 3D view."""
+
+        normalized_id = (
+            None
+            if surface_id is None
+            else str(surface_id).strip() or None
+        )
+        if normalized_id == self._selected_wall_surface_id:
+            return False
+        self._selected_wall_surface_id = normalized_id
+        self.update()
+        return True
+
+    def get_selected_wall_surface_id(self) -> str | None:
+        """Return the semantic wall currently highlighted in plan view."""
+
+        return self._selected_wall_surface_id
 
     def refresh_blueprint_image_if_stale(self) -> bool:
         """Reload changed pixels without resetting Canvas editing state."""
@@ -1180,6 +1203,7 @@ class BlueprintCanvas(QWidget):
 
         self._paint_floor_contour(painter)
         self._paint_edges(painter)
+        self._paint_selected_wall(painter)
         self._paint_windows(painter)
         self._paint_doorways(painter)
         self._paint_pending_doorway(painter)
@@ -3165,6 +3189,31 @@ class BlueprintCanvas(QWidget):
                 self._image_to_widget(start_vertex.x, start_vertex.y),
                 self._image_to_widget(end_vertex.x, end_vertex.y),
             )
+
+    # ### Selected wall highlight painting ###
+    def _paint_selected_wall(self, painter: QPainter) -> None:
+        """Overlay the selected semantic wall using its current endpoints."""
+
+        surface_id = self._selected_wall_surface_id
+        if surface_id is None:
+            return
+        frame = self._build_window_wall_frames().get(surface_id)
+        if frame is None:
+            return
+
+        pen = QPen(
+            SELECTED_WALL_EDGE_COLOR,
+            SELECTED_WALL_EDGE_WIDTH_SCREEN,
+        )
+        pen.setCosmetic(True)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.save()
+        painter.setPen(pen)
+        painter.drawLine(
+            self._image_to_widget(*frame.start_point),
+            self._image_to_widget(*frame.end_point),
+        )
+        painter.restore()
 
     # ### Window painting ###
     def _paint_windows(self, painter: QPainter) -> None:
