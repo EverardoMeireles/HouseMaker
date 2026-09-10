@@ -41,10 +41,12 @@ from housemaker.settings_widget import (
     DEFAULT_MESHY_TARGET_POLYCOUNT,
     DEFAULT_SNAP_MIDDLE_EQUAL_ANGLE_ONLY,
     DEFAULT_USE_HALF_MESH_TEXTURE_PREFIX,
+    DEFAULT_WALL_VERTEX_UPDATE_DELAY_SECONDS,
     FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY,
     FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY,
     MAXIMUM_FACE_VISIBILITY_PERCENTAGE,
     MAX_MESH_EDIT_UPDATE_DELAY_SECONDS,
+    MAX_WALL_VERTEX_UPDATE_DELAY_SECONDS,
     MESH_EDIT_UPDATE_DELAY_SECONDS_SETTING_KEY,
     MESH_EDIT_UPDATE_DELAY_STEP_SECONDS,
     MESHY_API_KEY_ENVIRONMENT_VARIABLE,
@@ -52,12 +54,15 @@ from housemaker.settings_widget import (
     MINIMUM_FACE_VISIBILITY_PERCENTAGE,
     MINIMUM_FACE_VISIBILITY_PERCENTAGE_SETTING_KEY,
     MIN_MESH_EDIT_UPDATE_DELAY_SECONDS,
+    MIN_WALL_VERTEX_UPDATE_DELAY_SECONDS,
     OPENAI_API_KEY_ENVIRONMENT_VARIABLE,
     OPENAI_API_KEY_SETTING_KEY,
     SNAP_MIDDLE_EQUAL_ANGLE_ONLY_SETTING_KEY,
     UNUSED_FACE_REMOVAL_SETTING_KEY,
     USE_HALF_MESH_TEXTURE_PREFIX_SETTING_KEY,
     USE_UV_RAYCAST_FOR_OBJECT_GENERATION_SETTING_KEY,
+    WALL_VERTEX_UPDATE_DELAY_SECONDS_SETTING_KEY,
+    WALL_VERTEX_UPDATE_DELAY_STEP_SECONDS,
     Fullscreen3DViewerScreenOption,
     SURFACE_TEXTURE_PROVIDER_GPT_5_6_TERRA,
     SURFACE_TEXTURE_PROVIDER_SETTING_KEY,
@@ -75,6 +80,7 @@ from housemaker.settings_widget import (
     read_unused_face_removal,
     read_use_half_mesh_texture_prefix,
     read_use_uv_raycast_for_object_generation,
+    read_wall_vertex_update_delay_seconds,
 )
 
 
@@ -131,6 +137,7 @@ class SettingsWidgetTests(unittest.TestCase):
                         widget.first_person_navigation_combo,
                         widget.snap_middle_equal_angle_only_checkbox,
                         widget.mesh_edit_update_delay_spinbox,
+                        widget.wall_vertex_update_delay_spinbox,
                     ),
                 ),
                 (
@@ -624,6 +631,9 @@ class SettingsWidgetTests(unittest.TestCase):
             self.assertTrue(
                 hasattr(widget, "mesh_edit_update_delay_spinbox")
             )
+            self.assertTrue(
+                hasattr(widget, "wall_vertex_update_delay_spinbox")
+            )
             self.assertFalse(hasattr(widget, "surface_texture_provider_combo"))
             self.assertTrue(hasattr(widget, "unused_face_removal_checkbox"))
             self.assertTrue(
@@ -897,6 +907,10 @@ class SettingsWidgetTests(unittest.TestCase):
 
         self.assertEqual(settings.jobs_window_screen_id, "jobs-screen")
         self.assertEqual(settings.mesh_edit_update_delay_seconds, 1.25)
+        self.assertEqual(
+            settings.wall_vertex_update_delay_seconds,
+            DEFAULT_WALL_VERTEX_UPDATE_DELAY_SECONDS,
+        )
         self.assertFalse(settings.use_uv_raycast_for_object_generation)
         self.assertEqual(
             settings.minimum_face_visibility_percentage,
@@ -1136,6 +1150,152 @@ class SettingsWidgetTests(unittest.TestCase):
             GenerationServiceSettings(
                 mesh_edit_update_delay_seconds=1
             ).mesh_edit_update_delay_seconds,
+            float,
+        )
+
+    def test_wall_vertex_update_delay_persists_independently(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            application_settings.set(
+                MESH_EDIT_UPDATE_DELAY_SECONDS_SETTING_KEY,
+                2.4,
+            )
+            widget = SettingsWidget(
+                application_settings=application_settings,
+                environment={},
+            )
+            emitted_changes: list[bool] = []
+            widget.settings_changed.connect(
+                lambda: emitted_changes.append(True)
+            )
+
+            self.assertEqual(
+                WALL_VERTEX_UPDATE_DELAY_SECONDS_SETTING_KEY,
+                "canvas/wall_vertex_update_delay_seconds",
+            )
+            self.assertEqual(
+                widget.get_settings().wall_vertex_update_delay_seconds,
+                DEFAULT_WALL_VERTEX_UPDATE_DELAY_SECONDS,
+            )
+            self.assertEqual(
+                widget.get_settings().mesh_edit_update_delay_seconds,
+                2.4,
+            )
+            self.assertFalse(
+                widget.wall_vertex_update_delay_spinbox.keyboardTracking()
+            )
+            self.assertEqual(
+                widget.wall_vertex_update_delay_spinbox.minimum(),
+                MIN_WALL_VERTEX_UPDATE_DELAY_SECONDS,
+            )
+            self.assertEqual(
+                widget.wall_vertex_update_delay_spinbox.maximum(),
+                MAX_WALL_VERTEX_UPDATE_DELAY_SECONDS,
+            )
+            self.assertEqual(
+                widget.wall_vertex_update_delay_spinbox.singleStep(),
+                WALL_VERTEX_UPDATE_DELAY_STEP_SECONDS,
+            )
+            self.assertEqual(
+                widget.wall_vertex_update_delay_spinbox.suffix(),
+                " s",
+            )
+            self.assertIn(
+                "adding a wall vertex",
+                widget.wall_vertex_update_delay_spinbox.toolTip(),
+            )
+            form_layout = widget.canvas_settings_group.layout()
+            self.assertIsInstance(form_layout, QFormLayout)
+            assert isinstance(form_layout, QFormLayout)
+            self.assertEqual(
+                form_layout.labelForField(
+                    widget.wall_vertex_update_delay_spinbox
+                ).text(),
+                "Wall vertex update delay",
+            )
+
+            widget.wall_vertex_update_delay_spinbox.setValue(18.5)
+
+            self.assertEqual(
+                application_settings.get(
+                    WALL_VERTEX_UPDATE_DELAY_SECONDS_SETTING_KEY
+                ),
+                18.5,
+            )
+            self.assertEqual(
+                application_settings.get(
+                    MESH_EDIT_UPDATE_DELAY_SECONDS_SETTING_KEY
+                ),
+                2.4,
+            )
+            self.assertEqual(
+                widget.get_settings().wall_vertex_update_delay_seconds,
+                18.5,
+            )
+            self.assertEqual(emitted_changes, [True])
+
+            restored = SettingsWidget(
+                application_settings=_build_test_settings(temporary_directory),
+                environment={},
+            )
+            self.assertEqual(
+                restored.get_settings().wall_vertex_update_delay_seconds,
+                18.5,
+            )
+
+    def test_wall_vertex_update_delay_rejects_malformed_values(self) -> None:
+        invalid_values: tuple[object, ...] = (
+            True,
+            "15.0",
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            MIN_WALL_VERTEX_UPDATE_DELAY_SECONDS - 0.01,
+            MAX_WALL_VERTEX_UPDATE_DELAY_SECONDS + 0.01,
+        )
+        for value in invalid_values:
+            with self.subTest(model_value=value):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "Wall vertex update delay",
+                ):
+                    GenerationServiceSettings(
+                        wall_vertex_update_delay_seconds=(
+                            value  # type: ignore[arg-type]
+                        )
+                    )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            for value in invalid_values:
+                with self.subTest(persisted_value=value):
+                    application_settings.set(
+                        WALL_VERTEX_UPDATE_DELAY_SECONDS_SETTING_KEY,
+                        value,
+                    )
+                    self.assertEqual(
+                        read_wall_vertex_update_delay_seconds(
+                            application_settings
+                        ),
+                        DEFAULT_WALL_VERTEX_UPDATE_DELAY_SECONDS,
+                    )
+
+    def test_wall_vertex_update_delay_accepts_range_boundaries(self) -> None:
+        for value in (
+            MIN_WALL_VERTEX_UPDATE_DELAY_SECONDS,
+            MAX_WALL_VERTEX_UPDATE_DELAY_SECONDS,
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    GenerationServiceSettings(
+                        wall_vertex_update_delay_seconds=value
+                    ).wall_vertex_update_delay_seconds,
+                    value,
+                )
+        self.assertIsInstance(
+            GenerationServiceSettings(
+                wall_vertex_update_delay_seconds=15
+            ).wall_vertex_update_delay_seconds,
             float,
         )
 

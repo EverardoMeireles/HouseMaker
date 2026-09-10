@@ -68,6 +68,9 @@ MESH_EDIT_UPDATE_DELAY_SECONDS_SETTING_KEY = (
     # Keep the original persisted key so existing preferences remain valid.
     "canvas/doorway_mesh_update_delay_seconds"
 )
+WALL_VERTEX_UPDATE_DELAY_SECONDS_SETTING_KEY = (
+    "canvas/wall_vertex_update_delay_seconds"
+)
 SNAP_MIDDLE_EQUAL_ANGLE_ONLY_SETTING_KEY = (
     "canvas/snap_middle_equal_angle_only"
 )
@@ -82,10 +85,14 @@ DEFAULT_AUTOMATIC_ATLAS_TEXTURE_RESOLUTION = 512
 MINIMUM_FACE_VISIBILITY_PERCENTAGE = 0
 MAXIMUM_FACE_VISIBILITY_PERCENTAGE = 100
 DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS = 1.0
+DEFAULT_WALL_VERTEX_UPDATE_DELAY_SECONDS = 15.0
 DEFAULT_SNAP_MIDDLE_EQUAL_ANGLE_ONLY = True
 MIN_MESH_EDIT_UPDATE_DELAY_SECONDS = 0.1
 MAX_MESH_EDIT_UPDATE_DELAY_SECONDS = 10.0
 MESH_EDIT_UPDATE_DELAY_STEP_SECONDS = 0.1
+MIN_WALL_VERTEX_UPDATE_DELAY_SECONDS = 0.1
+MAX_WALL_VERTEX_UPDATE_DELAY_SECONDS = 60.0
+WALL_VERTEX_UPDATE_DELAY_STEP_SECONDS = 0.1
 MESHY_SMART_TOPOLOGY_MIN_TARGET_POLYCOUNT = 100
 MESHY_SMART_TOPOLOGY_MAX_TARGET_POLYCOUNT = 15_000
 DEFAULT_MESHY_TARGET_POLYCOUNT = 2_000
@@ -172,6 +179,10 @@ class GenerationServiceSettings:
     )
     first_person_navigation_mode: str = (
         DEFAULT_FIRST_PERSON_NAVIGATION_MODE
+    )
+    # Keep new fields at the end to preserve legacy positional construction.
+    wall_vertex_update_delay_seconds: float = (
+        DEFAULT_WALL_VERTEX_UPDATE_DELAY_SECONDS
     )
 
     def __post_init__(self) -> None:
@@ -319,6 +330,22 @@ class GenerationServiceSettings:
             "mesh_edit_update_delay_seconds",
             normalized_mesh_edit_delay,
         )
+        normalized_wall_vertex_delay = (
+            _normalize_wall_vertex_update_delay_seconds(
+                self.wall_vertex_update_delay_seconds
+            )
+        )
+        if normalized_wall_vertex_delay is None:
+            raise ValueError(
+                "Wall vertex update delay must be between "
+                f"{MIN_WALL_VERTEX_UPDATE_DELAY_SECONDS} and "
+                f"{MAX_WALL_VERTEX_UPDATE_DELAY_SECONDS} seconds."
+            )
+        object.__setattr__(
+            self,
+            "wall_vertex_update_delay_seconds",
+            normalized_wall_vertex_delay,
+        )
 
     @property
     def has_meshy_api_key(self) -> bool:
@@ -414,6 +441,9 @@ class SettingsWidget(QWidget):
             ),
             mesh_edit_update_delay_seconds=(
                 self.mesh_edit_update_delay_spinbox.value()
+            ),
+            wall_vertex_update_delay_seconds=(
+                self.wall_vertex_update_delay_spinbox.value()
             ),
             snap_middle_equal_angle_only=(
                 self.snap_middle_equal_angle_only_checkbox.isChecked()
@@ -733,6 +763,32 @@ class SettingsWidget(QWidget):
             self.mesh_edit_update_delay_spinbox,
         )
 
+        self.wall_vertex_update_delay_spinbox = QDoubleSpinBox()
+        self.wall_vertex_update_delay_spinbox.setObjectName(
+            "wall_vertex_update_delay_spinbox"
+        )
+        self.wall_vertex_update_delay_spinbox.setRange(
+            MIN_WALL_VERTEX_UPDATE_DELAY_SECONDS,
+            MAX_WALL_VERTEX_UPDATE_DELAY_SECONDS,
+        )
+        self.wall_vertex_update_delay_spinbox.setDecimals(1)
+        self.wall_vertex_update_delay_spinbox.setSingleStep(
+            WALL_VERTEX_UPDATE_DELAY_STEP_SECONDS
+        )
+        self.wall_vertex_update_delay_spinbox.setSuffix(" s")
+        self.wall_vertex_update_delay_spinbox.setKeyboardTracking(False)
+        self.wall_vertex_update_delay_spinbox.setToolTip(
+            "Wait this long after adding a wall vertex before rebuilding the "
+            "Canvas 3D mesh. Adding another wall vertex restarts the delay."
+        )
+        self.wall_vertex_update_delay_spinbox.valueChanged.connect(
+            self._handle_wall_vertex_update_delay_changed
+        )
+        canvas_form.addRow(
+            "Wall vertex update delay",
+            self.wall_vertex_update_delay_spinbox,
+        )
+
         self.unused_face_removal_checkbox = QCheckBox()
         self.unused_face_removal_checkbox.setObjectName(
             "unused_face_removal_checkbox"
@@ -910,6 +966,11 @@ class SettingsWidget(QWidget):
         )
         self.mesh_edit_update_delay_spinbox.setValue(
             read_mesh_edit_update_delay_seconds(
+                self._application_settings
+            )
+        )
+        self.wall_vertex_update_delay_spinbox.setValue(
+            read_wall_vertex_update_delay_seconds(
                 self._application_settings
             )
         )
@@ -1221,6 +1282,15 @@ class SettingsWidget(QWidget):
         )
         self.settings_changed.emit()
 
+    def _handle_wall_vertex_update_delay_changed(self, value: float) -> None:
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            WALL_VERTEX_UPDATE_DELAY_SECONDS_SETTING_KEY,
+            float(value),
+        )
+        self.settings_changed.emit()
+
     def _sync_key_status_labels(self) -> None:
         self.meshy_key_status_label.setText(
             self._build_key_status_text(
@@ -1461,6 +1531,40 @@ def _normalize_mesh_edit_update_delay_seconds(
         MIN_MESH_EDIT_UPDATE_DELAY_SECONDS
         <= normalized_value
         <= MAX_MESH_EDIT_UPDATE_DELAY_SECONDS
+    ):
+        return None
+    return normalized_value
+
+
+# ### Wall vertex update delay setting helpers ###
+def read_wall_vertex_update_delay_seconds(
+    application_settings: ApplicationSettingsStore,
+) -> float:
+    """Read the wall-vertex mesh rebuild delay with a safe default."""
+
+    normalized_delay = _normalize_wall_vertex_update_delay_seconds(
+        application_settings.get(
+            WALL_VERTEX_UPDATE_DELAY_SECONDS_SETTING_KEY,
+            DEFAULT_WALL_VERTEX_UPDATE_DELAY_SECONDS,
+        )
+    )
+    if normalized_delay is None:
+        return DEFAULT_WALL_VERTEX_UPDATE_DELAY_SECONDS
+    return normalized_delay
+
+
+def _normalize_wall_vertex_update_delay_seconds(
+    value: object,
+) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    normalized_value = float(value)
+    if not math.isfinite(normalized_value):
+        return None
+    if not (
+        MIN_WALL_VERTEX_UPDATE_DELAY_SECONDS
+        <= normalized_value
+        <= MAX_WALL_VERTEX_UPDATE_DELAY_SECONDS
     ):
         return None
     return normalized_value

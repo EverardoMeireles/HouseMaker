@@ -289,6 +289,8 @@ class StairHit:
 # ### Widgets ###
 class BlueprintCanvas(QWidget):
     geometry_changed = Signal()
+    wall_vertex_added = Signal()
+    wall_vertex_interaction_changed = Signal(bool)
     rooms_changed = Signal()
     doorways_changed = Signal()
     doorway_dimension_preview_changed = Signal()
@@ -322,6 +324,7 @@ class BlueprintCanvas(QWidget):
         self.pressed_vertex_id: int | None = None
         self.drag_vertex_id: int | None = None
         self.drag_press_position: QPointF | None = None
+        self._is_wall_vertex_interaction_active = False
         self.zoom_scale = MIN_ZOOM_SCALE
         self.view_offset = QPointF(0.0, 0.0)
         self.is_panning = False
@@ -990,6 +993,7 @@ class BlueprintCanvas(QWidget):
             return
 
         if hit_vertex is not None:
+            self._begin_wall_vertex_interaction()
             self.selected_vertex_id = hit_vertex.id
             self.pressed_vertex_id = hit_vertex.id
             self.drag_press_position = QPointF(event.position())
@@ -1005,12 +1009,14 @@ class BlueprintCanvas(QWidget):
 
         hit_edge = self._find_edge_at(event.position())
         if hit_edge is not None:
+            self._begin_wall_vertex_interaction()
             self._handle_new_vertex_on_edge_click(hit_edge.point, hit_edge.edge)
             self.update()
             event.accept()
             return
 
         snap_preview = self._build_connection_preview(image_point, event.modifiers())
+        self._begin_wall_vertex_interaction()
         self._handle_new_vertex_click(snap_preview.point)
 
         self.update()
@@ -1127,44 +1133,55 @@ class BlueprintCanvas(QWidget):
         event.accept()
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
-        if event.button() == Qt.MouseButton.MiddleButton:
-            self._stop_panning()
-            event.accept()
-            return
-
-        if (
+        finish_wall_interaction = (
             event.button() == Qt.MouseButton.LeftButton
-            and self.pressed_doorway_index is not None
-        ):
-            self._reset_doorway_pointer_state()
-            self._update_edit_hover_cursor(event.position())
+            and self._is_wall_vertex_interaction_active
+        )
+        try:
+            if event.button() == Qt.MouseButton.MiddleButton:
+                self._stop_panning()
+                event.accept()
+                return
+
+            if (
+                event.button() == Qt.MouseButton.LeftButton
+                and self.pressed_doorway_index is not None
+            ):
+                self._reset_doorway_pointer_state()
+                self._update_edit_hover_cursor(event.position())
+                self.update()
+                event.accept()
+                return
+
+            if (
+                event.button() != Qt.MouseButton.LeftButton
+                or self.pressed_vertex_id is None
+            ):
+                super().mouseReleaseEvent(event)
+                return
+
+            if self.drag_vertex_id is not None:
+                self._join_dragged_vertex_to_edge(self.drag_vertex_id)
+                self.preview_point = None
+                self.preview_guides = []
+                self._reset_pointer_state(finish_wall_interaction=False)
+                self.update()
+                self.geometry_changed.emit()
+                event.accept()
+                return
+
+            clicked_vertex = self.vertex_data.get_vertex(self.pressed_vertex_id)
+            self._reset_pointer_state(finish_wall_interaction=False)
+            if clicked_vertex is None:
+                event.accept()
+                return
+
+            self._handle_existing_vertex_click(clicked_vertex)
             self.update()
             event.accept()
-            return
-
-        if event.button() != Qt.MouseButton.LeftButton or self.pressed_vertex_id is None:
-            super().mouseReleaseEvent(event)
-            return
-
-        if self.drag_vertex_id is not None:
-            self._join_dragged_vertex_to_edge(self.drag_vertex_id)
-            self.preview_point = None
-            self.preview_guides = []
-            self._reset_pointer_state()
-            self.update()
-            self.geometry_changed.emit()
-            event.accept()
-            return
-
-        clicked_vertex = self.vertex_data.get_vertex(self.pressed_vertex_id)
-        self._reset_pointer_state()
-        if clicked_vertex is None:
-            event.accept()
-            return
-
-        self._handle_existing_vertex_click(clicked_vertex)
-        self.update()
-        event.accept()
+        finally:
+            if finish_wall_interaction:
+                self._finish_wall_vertex_interaction()
 
     def leaveEvent(self, event) -> None:  # type: ignore[override]
         if self._is_stair_placement_active():
@@ -1344,6 +1361,7 @@ class BlueprintCanvas(QWidget):
         self.selected_vertex_id = new_vertex.id
         self.preview_point = point
         self.preview_guides = []
+        self.wall_vertex_added.emit()
         self.geometry_changed.emit()
 
     def _join_dragged_vertex_to_edge(self, vertex_id: int) -> None:
@@ -1385,6 +1403,7 @@ class BlueprintCanvas(QWidget):
         self.selected_vertex_id = new_vertex.id
         self.preview_point = point
         self.preview_guides = []
+        self.wall_vertex_added.emit()
         self.geometry_changed.emit()
 
     # ### Stair helpers ###
@@ -2635,11 +2654,33 @@ class BlueprintCanvas(QWidget):
         self._push_undo_state()
         self.drag_vertex_id = self.pressed_vertex_id
 
-    def _reset_pointer_state(self) -> None:
+    def _begin_wall_vertex_interaction(self) -> None:
+        """Notify listeners that a wall vertex is held by the pointer."""
+
+        if self._is_wall_vertex_interaction_active:
+            return
+        self._is_wall_vertex_interaction_active = True
+        self.wall_vertex_interaction_changed.emit(True)
+
+    def _finish_wall_vertex_interaction(self) -> None:
+        """Notify listeners after all release-side wall edits are complete."""
+
+        if not self._is_wall_vertex_interaction_active:
+            return
+        self._is_wall_vertex_interaction_active = False
+        self.wall_vertex_interaction_changed.emit(False)
+
+    def _reset_pointer_state(
+        self,
+        *,
+        finish_wall_interaction: bool = True,
+    ) -> None:
         self.pressed_vertex_id = None
         self.drag_vertex_id = None
         self.drag_press_position = None
         self._stop_panning()
+        if finish_wall_interaction:
+            self._finish_wall_vertex_interaction()
 
     def _reset_view(self) -> None:
         self.zoom_scale = MIN_ZOOM_SCALE

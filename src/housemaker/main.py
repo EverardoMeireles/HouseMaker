@@ -148,6 +148,7 @@ from housemaker.level_coordinates import (
 from housemaker.project_io import ProjectData, load_project, save_project
 from housemaker.settings_widget import (
     DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS,
+    DEFAULT_WALL_VERTEX_UPDATE_DELAY_SECONDS,
     SettingsWidget,
     resolve_fullscreen_3d_viewer_screen,
 )
@@ -276,6 +277,11 @@ class BlueprintWorkspace(QWidget):
         self._mesh_edit_update_delay_seconds = (
             DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS
         )
+        self._wall_vertex_update_delay_seconds = (
+            DEFAULT_WALL_VERTEX_UPDATE_DELAY_SECONDS
+        )
+        self._pending_wall_vertex_mesh_update = False
+        self._is_canvas_wall_vertex_interaction_active = False
         self._is_doorway_move_drag_active = False
         self._is_canvas_opening_drag_active = False
         self._active_canvas_opening_reference: (
@@ -319,6 +325,14 @@ class BlueprintWorkspace(QWidget):
         )
         self._canvas_surface_mesh_update_timer.timeout.connect(
             self._commit_pending_canvas_surface_mesh_update
+        )
+        self._wall_vertex_update_timer = QTimer(self)
+        self._wall_vertex_update_timer.setSingleShot(True)
+        self._wall_vertex_update_timer.setInterval(
+            round(self._wall_vertex_update_delay_seconds * 1000.0)
+        )
+        self._wall_vertex_update_timer.timeout.connect(
+            self._commit_pending_wall_vertex_update
         )
         self._canvas_3d_viewer_is_external = False
         self._atlas_generation_signature: tuple[tuple[object, ...], ...] | None = None
@@ -368,6 +382,7 @@ class BlueprintWorkspace(QWidget):
         self._is_shutdown = True
         self._cancel_active_canvas_surface_edit()
         self._cancel_pending_canvas_surface_mesh_update()
+        self._cancel_pending_wall_vertex_update()
         self._cancel_pending_doorway_mesh_update(clear_outline=True)
         try:
             self.settings_widget.settings_changed.disconnect(
@@ -506,6 +521,9 @@ class BlueprintWorkspace(QWidget):
         self._generation_settings = generation_settings
         self._set_mesh_edit_update_delay_seconds(
             generation_settings.mesh_edit_update_delay_seconds
+        )
+        self._set_wall_vertex_update_delay_seconds(
+            generation_settings.wall_vertex_update_delay_seconds
         )
         self._set_canvas_3d_navigation_shortcut(
             generation_settings.canvas_3d_navigation_toggle_hotkey
@@ -966,6 +984,12 @@ class BlueprintWorkspace(QWidget):
 
         self.canvas.geometry_changed.connect(
             self._handle_canvas_surface_geometry_changed
+        )
+        self.canvas.wall_vertex_added.connect(
+            self._handle_canvas_wall_vertex_added
+        )
+        self.canvas.wall_vertex_interaction_changed.connect(
+            self._handle_canvas_wall_vertex_interaction_changed
         )
         self.canvas.floor_contour_changed.connect(
             self._handle_floor_contour_changed
@@ -1543,6 +1567,7 @@ class BlueprintWorkspace(QWidget):
         self._sync_selected_canvas_wall_highlight(
             active_surface_id
         )
+        self._commit_pending_wall_vertex_update()
         pending_baseline = self._pending_canvas_surface_mesh_baseline
         if self._pending_canvas_surface_mesh_update and (
             pending_baseline is None
@@ -1576,6 +1601,10 @@ class BlueprintWorkspace(QWidget):
     def _handle_canvas_surface_edit_started(self, raw_edit: object) -> None:
         """Remember the immutable baseline for one live structural drag."""
 
+        if self._pending_wall_vertex_mesh_update:
+            self._commit_pending_wall_vertex_update()
+            self.viewer.cancel_canvas_surface_edit()
+            return
         if not isinstance(raw_edit, CanvasSurfaceEdit):
             return
         target = self._canvas_surface_edit_targets_by_key.get(
@@ -2020,6 +2049,7 @@ class BlueprintWorkspace(QWidget):
     def _handle_glb_export_clicked(self) -> None:
         self._cancel_active_canvas_surface_edit()
         self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_wall_vertex_update()
         self._sync_atlas_object_texture_sources(
             automatically_assign_scene_textures=False
         )
@@ -4653,7 +4683,7 @@ class BlueprintWorkspace(QWidget):
             return
         self._mark_viewer_preview_dirty(preserve_camera=preserve_camera)
 
-    # ### Debounced opening mesh previews ###
+    # ### Debounced Canvas mesh previews ###
     @staticmethod
     def _copy_doorways(
         doorways: Sequence[DoorwayData],
@@ -4757,6 +4787,26 @@ class BlueprintWorkspace(QWidget):
             timer.setInterval(interval_milliseconds)
             if was_active:
                 timer.start()
+
+    def _set_wall_vertex_update_delay_seconds(
+        self,
+        delay_seconds: float,
+    ) -> None:
+        """Apply the independent wall-vertex rebuild debounce interval."""
+
+        normalized_delay = float(delay_seconds)
+        if normalized_delay <= 0.0:
+            raise ValueError("Wall vertex update delay must be positive.")
+        if normalized_delay == self._wall_vertex_update_delay_seconds:
+            return
+
+        was_active = self._wall_vertex_update_timer.isActive()
+        self._wall_vertex_update_delay_seconds = normalized_delay
+        self._wall_vertex_update_timer.setInterval(
+            max(1, round(normalized_delay * 1000.0))
+        )
+        if was_active:
+            self._wall_vertex_update_timer.start()
 
     def _stage_pending_canvas_opening_snapshots(self) -> None:
         """Stage all stable live openings without refreshing during a drag."""
@@ -5007,6 +5057,7 @@ class BlueprintWorkspace(QWidget):
         if (
             self._active_canvas_surface_edit_target is not None
             or self._pending_canvas_surface_mesh_update
+            or self._pending_wall_vertex_mesh_update
         ):
             return
         revision = self._viewer_preview_revision
@@ -5096,6 +5147,7 @@ class BlueprintWorkspace(QWidget):
         if (
             self._active_canvas_surface_edit_target is not None
             or self._pending_canvas_surface_mesh_update
+            or self._pending_wall_vertex_mesh_update
         ):
             return
         if self._is_viewer_refresh_scheduled:
@@ -5141,6 +5193,7 @@ class BlueprintWorkspace(QWidget):
         if (
             self._active_canvas_surface_edit_target is not None
             or self._pending_canvas_surface_mesh_update
+            or self._pending_wall_vertex_mesh_update
         ):
             return
 
@@ -5164,6 +5217,7 @@ class BlueprintWorkspace(QWidget):
             return
 
         self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_wall_vertex_update()
 
         try:
             save_project(
@@ -5209,6 +5263,7 @@ class BlueprintWorkspace(QWidget):
             return
 
         self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_wall_vertex_update()
 
         try:
             self._load_project_path(file_path)
@@ -5385,6 +5440,7 @@ class BlueprintWorkspace(QWidget):
         if level_index != self.current_level_index:
             self._cancel_active_canvas_surface_edit()
             self._commit_pending_canvas_surface_mesh_update()
+            self._commit_pending_wall_vertex_update()
             self._commit_pending_doorway_mesh_update()
         self.current_level_index = level_index
         self._sync_level_controls()
@@ -5844,6 +5900,9 @@ class BlueprintWorkspace(QWidget):
         self._set_mesh_edit_update_delay_seconds(
             settings.mesh_edit_update_delay_seconds
         )
+        self._set_wall_vertex_update_delay_seconds(
+            settings.wall_vertex_update_delay_seconds
+        )
         self._set_canvas_3d_navigation_shortcut(
             settings.canvas_3d_navigation_toggle_hotkey
         )
@@ -5882,13 +5941,59 @@ class BlueprintWorkspace(QWidget):
         )
         self._schedule_viewer_preview_refresh()
 
+    # ### Canvas wall drawing updates ###
     def _handle_canvas_surface_geometry_changed(self) -> None:
         """Reconcile changed surfaces before refreshing Canvas geometry."""
 
+        if self._pending_wall_vertex_mesh_update:
+            self._restart_pending_wall_vertex_update_if_idle()
+            return
         self.surface_texture_generation.reconcile_assignments_with_levels(
             self.levels
         )
         self._schedule_viewer_preview_refresh()
+
+    def _handle_canvas_wall_vertex_added(self) -> None:
+        """Debounce mesh work while new Canvas wall vertices are added."""
+
+        self._pending_wall_vertex_mesh_update = True
+        self._restart_pending_wall_vertex_update_if_idle()
+
+    def _handle_canvas_wall_vertex_interaction_changed(
+        self,
+        active: bool,
+    ) -> None:
+        """Pause the wall rebuild countdown while a vertex is held."""
+
+        self._is_canvas_wall_vertex_interaction_active = bool(active)
+        self._restart_pending_wall_vertex_update_if_idle()
+
+    def _restart_pending_wall_vertex_update_if_idle(self) -> None:
+        """Run the wall debounce only after the pointer interaction ends."""
+
+        if (
+            not self._pending_wall_vertex_mesh_update
+            or self._is_canvas_wall_vertex_interaction_active
+        ):
+            self._wall_vertex_update_timer.stop()
+            return
+        self._wall_vertex_update_timer.start()
+
+    def _commit_pending_wall_vertex_update(self) -> None:
+        """Reconcile and rebuild once after a wall-vertex editing burst."""
+
+        self._wall_vertex_update_timer.stop()
+        if not self._pending_wall_vertex_mesh_update:
+            return
+        self._pending_wall_vertex_mesh_update = False
+        self._reconcile_canvas_surface_edit_and_refresh()
+
+    def _cancel_pending_wall_vertex_update(self) -> None:
+        """Discard a wall-vertex timer when its project context is retired."""
+
+        self._wall_vertex_update_timer.stop()
+        self._pending_wall_vertex_mesh_update = False
+        self._is_canvas_wall_vertex_interaction_active = False
 
     def _handle_include_toggled(self, checked: bool) -> None:
         if self._is_syncing_level_controls or not checked:
@@ -5935,6 +6040,7 @@ class BlueprintWorkspace(QWidget):
         self._is_doorway_move_drag_active = False
         self._cancel_active_canvas_surface_edit()
         self._cancel_pending_canvas_surface_mesh_update()
+        self._cancel_pending_wall_vertex_update()
         self._cancel_pending_doorway_mesh_update(clear_outline=True)
         self.canvas.cancel_stair_placement()
         self._desired_canvas_object_id = None
