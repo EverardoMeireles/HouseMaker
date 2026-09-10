@@ -57,6 +57,7 @@ from housemaker.settings_widget import (
     SURFACE_TEXTURE_PROVIDER_OPTIONS,
     SURFACE_TEXTURE_PROVIDER_SETTING_KEY,
     GenerationServiceSettings,
+    read_first_person_navigation_mode,
     read_surface_texture_provider,
 )
 from housemaker.surface_geometry import FixedSurface, build_fixed_surfaces
@@ -488,7 +489,10 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._settings = GenerationServiceSettings(
             surface_texture_provider=read_surface_texture_provider(
                 self._application_settings
-            )
+            ),
+            first_person_navigation_mode=read_first_person_navigation_mode(
+                self._application_settings
+            ),
         )
         self._is_syncing_provider = False
         self._data = SurfaceTextureData()
@@ -529,6 +533,9 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._is_refreshing_texture_atlases = False
 
         self._build_ui()
+        self.surface_view.set_first_person_movement_mode(
+            self._settings.first_person_navigation_mode
+        )
         self._sync_video_controls()
         self._sync_controls()
 
@@ -1500,6 +1507,9 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         if not isinstance(settings, GenerationServiceSettings):
             raise TypeError("Generation settings have an invalid type.")
         self._settings = settings
+        self.surface_view.set_first_person_movement_mode(
+            settings.first_person_navigation_mode
+        )
         self._sync_provider_combo(settings.surface_texture_provider)
         self._sync_controls()
 

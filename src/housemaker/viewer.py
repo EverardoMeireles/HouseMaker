@@ -53,6 +53,11 @@ from housemaker.canvas_openings import (
     CanvasOpeningReference,
     CanvasOpeningTarget,
 )
+from housemaker.first_person_navigation import (
+    DEFAULT_FIRST_PERSON_NAVIGATION_MODE,
+    build_first_person_forward_vector,
+    normalize_first_person_navigation_mode,
+)
 from housemaker.glb import (
     GLTF_Y_UP_TO_Z_UP_TRANSFORM,
     SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION,
@@ -458,6 +463,9 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self._first_person_camera_pose = CameraPose(
             z=DEFAULT_FIRST_PERSON_HEIGHT_METERS
         )
+        self._first_person_movement_mode = (
+            DEFAULT_FIRST_PERSON_NAVIGATION_MODE
+        )
         self._has_custom_first_person_camera_pose = False
         self._orbit_camera_state = self._capture_camera_state()
         self._pressed_movement_keys: set[int] = set()
@@ -837,9 +845,21 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self.set_navigation_mode(NAVIGATION_MODE_ORBIT)
 
     def get_first_person_camera_pose(self) -> CameraPose:
-        """Return the no-gravity first-person camera pose."""
+        """Return the persistent first-person camera pose."""
 
         return self._first_person_camera_pose
+
+    def get_first_person_movement_mode(self) -> str:
+        """Return ``gravity`` or ``noclip`` first-person movement behavior."""
+
+        return self._first_person_movement_mode
+
+    def set_first_person_movement_mode(self, mode: str) -> None:
+        """Choose planar gravity movement or camera-relative free flight."""
+
+        self._first_person_movement_mode = (
+            normalize_first_person_navigation_mode(mode)
+        )
 
     def set_first_person_camera_pose(self, pose: CameraPose) -> None:
         """Set a persistent first-person pose, for example from the Canvas camera."""
@@ -887,15 +907,18 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         forward_amount /= magnitude
         right_amount /= magnitude
         vertical_amount /= magnitude
-        yaw_radians = math.radians(self._first_person_camera_pose.yaw_degrees)
-        forward_x = math.cos(yaw_radians)
-        forward_y = math.sin(yaw_radians)
+        pose = self._first_person_camera_pose
+        yaw_radians = math.radians(pose.yaw_degrees)
+        forward_x, forward_y, forward_z = build_first_person_forward_vector(
+            pose.yaw_degrees,
+            pose.pitch_degrees,
+            self._first_person_movement_mode,
+        )
         # In this Z-up coordinate system, camera-right is forward cross up.
         # This makes French-layout Q move left and D move right.
         right_x = math.sin(yaw_radians)
         right_y = -math.cos(yaw_radians)
         distance = self._move_speed * elapsed
-        pose = self._first_person_camera_pose
         self._set_first_person_camera_pose(
             CameraPose(
                 x=pose.x
@@ -904,7 +927,8 @@ class SelectableGLViewWidget(gl.GLViewWidget):
                 y=pose.y
                 + (forward_y * forward_amount + right_y * right_amount)
                 * distance,
-                z=pose.z + vertical_amount * distance,
+                z=pose.z
+                + (forward_z * forward_amount + vertical_amount) * distance,
                 yaw_degrees=pose.yaw_degrees,
                 pitch_degrees=pose.pitch_degrees,
                 roll_degrees=pose.roll_degrees,
@@ -3530,7 +3554,7 @@ class GlbViewerWidget(QWidget):
         self.view.exit_first_person_mode()
 
     def get_first_person_camera_pose(self) -> CameraPose:
-        """Return the stored no-gravity first-person camera pose."""
+        """Return the stored first-person camera pose."""
 
         return self.view.get_first_person_camera_pose()
 
@@ -3538,6 +3562,16 @@ class GlbViewerWidget(QWidget):
         """Provide an explicit first-person pose, such as the Canvas camera."""
 
         self.view.set_first_person_camera_pose(pose)
+
+    def get_first_person_movement_mode(self) -> str:
+        """Return the viewport's ``gravity`` or ``noclip`` behavior."""
+
+        return self.view.get_first_person_movement_mode()
+
+    def set_first_person_movement_mode(self, mode: str) -> None:
+        """Choose planar gravity movement or camera-relative free flight."""
+
+        self.view.set_first_person_movement_mode(mode)
 
     def set_model(self, model: GeneratedModel, preserve_camera: bool = False) -> None:
         self.view.cancel_transient_pointer_interactions()

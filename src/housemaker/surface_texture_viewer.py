@@ -16,6 +16,11 @@ from PySide6.QtWidgets import QLabel, QStackedLayout, QWidget
 from PIL import Image
 
 from housemaker.camera_models import CameraPose
+from housemaker.first_person_navigation import (
+    DEFAULT_FIRST_PERSON_NAVIGATION_MODE,
+    build_first_person_forward_vector,
+    normalize_first_person_navigation_mode,
+)
 from housemaker.glb import GeneratedModel, PreviewTexturedSurface
 from housemaker.models import LevelData
 from housemaker.pbr_maps import (
@@ -175,6 +180,9 @@ class SurfaceFirstPersonViewWidget(gl.GLViewWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
         self._camera_pose = CameraPose(z=DEFAULT_FIRST_PERSON_HEIGHT_METERS)
+        self._first_person_movement_mode = (
+            DEFAULT_FIRST_PERSON_NAVIGATION_MODE
+        )
         self._first_person_active = False
         self._pressed_movement_keys: set[int] = set()
         self._ignore_center_mouse_move = False
@@ -191,6 +199,18 @@ class SurfaceFirstPersonViewWidget(gl.GLViewWidget):
 
     def get_camera_pose(self) -> CameraPose:
         return self._camera_pose
+
+    def get_first_person_movement_mode(self) -> str:
+        """Return ``gravity`` or ``noclip`` first-person movement behavior."""
+
+        return self._first_person_movement_mode
+
+    def set_first_person_movement_mode(self, mode: str) -> None:
+        """Choose planar gravity movement or camera-relative free flight."""
+
+        self._first_person_movement_mode = (
+            normalize_first_person_navigation_mode(mode)
+        )
 
     def set_camera_pose(
         self,
@@ -270,8 +290,11 @@ class SurfaceFirstPersonViewWidget(gl.GLViewWidget):
         right_amount /= magnitude
         vertical_amount /= magnitude
         yaw_radians = math.radians(self._camera_pose.yaw_degrees)
-        forward_x = math.cos(yaw_radians)
-        forward_y = math.sin(yaw_radians)
+        forward_x, forward_y, forward_z = build_first_person_forward_vector(
+            self._camera_pose.yaw_degrees,
+            self._camera_pose.pitch_degrees,
+            self._first_person_movement_mode,
+        )
         # In this Z-up coordinate system, camera-right is forward cross up.
         # The previous inverse vector made French-layout Q and D feel swapped.
         right_x = math.sin(yaw_radians)
@@ -285,7 +308,8 @@ class SurfaceFirstPersonViewWidget(gl.GLViewWidget):
                 y=self._camera_pose.y
                 + (forward_y * forward_amount + right_y * right_amount)
                 * distance,
-                z=self._camera_pose.z + vertical_amount * distance,
+                z=self._camera_pose.z
+                + (forward_z * forward_amount + vertical_amount) * distance,
                 yaw_degrees=self._camera_pose.yaw_degrees,
                 pitch_degrees=self._camera_pose.pitch_degrees,
                 roll_degrees=self._camera_pose.roll_degrees,
@@ -717,6 +741,16 @@ class SurfaceTextureViewer(QWidget):
 
     def get_camera_pose(self) -> CameraPose:
         return self.view.get_camera_pose()
+
+    def get_first_person_movement_mode(self) -> str:
+        """Return the viewport's ``gravity`` or ``noclip`` behavior."""
+
+        return self.view.get_first_person_movement_mode()
+
+    def set_first_person_movement_mode(self, mode: str) -> None:
+        """Choose planar gravity movement or camera-relative free flight."""
+
+        self.view.set_first_person_movement_mode(mode)
 
     def enter_first_person_mode(self) -> None:
         self.view.enter_first_person_mode()

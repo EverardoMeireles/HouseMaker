@@ -12,9 +12,21 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # ### Imports ###
 from PySide6.QtGui import QKeySequence
-from PySide6.QtWidgets import QApplication, QGroupBox, QLabel, QLineEdit
+from PySide6.QtWidgets import (
+    QApplication,
+    QFormLayout,
+    QGroupBox,
+    QLabel,
+    QLineEdit,
+)
 
 from housemaker.app_settings import ApplicationSettingsStore
+from housemaker.first_person_navigation import (
+    DEFAULT_FIRST_PERSON_NAVIGATION_MODE,
+    FIRST_PERSON_NAVIGATION_MODE_GRAVITY,
+    FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
+    FIRST_PERSON_NAVIGATION_MODE_OPTIONS,
+)
 from housemaker.settings_widget import (
     ATLAS_DISPLAY_SCREEN_SETTING_KEY,
     AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR_SETTING_KEY,
@@ -30,6 +42,7 @@ from housemaker.settings_widget import (
     DEFAULT_SNAP_MIDDLE_EQUAL_ANGLE_ONLY,
     DEFAULT_USE_HALF_MESH_TEXTURE_PREFIX,
     FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY,
+    FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY,
     MAXIMUM_FACE_VISIBILITY_PERCENTAGE,
     MAX_MESH_EDIT_UPDATE_DELAY_SECONDS,
     MESH_EDIT_UPDATE_DELAY_SECONDS_SETTING_KEY,
@@ -55,6 +68,7 @@ from housemaker.settings_widget import (
     read_automatic_atlas_texture_sort_by_pbr,
     read_automatic_atlas_texture_resolution,
     read_canvas_3d_navigation_toggle_hotkey,
+    read_first_person_navigation_mode,
     read_mesh_edit_update_delay_seconds,
     read_minimum_face_visibility_percentage,
     read_snap_middle_equal_angle_only,
@@ -114,6 +128,7 @@ class SettingsWidgetTests(unittest.TestCase):
                     "Canvas",
                     (
                         widget.canvas_3d_navigation_toggle_hotkey_edit,
+                        widget.first_person_navigation_combo,
                         widget.snap_middle_equal_angle_only_checkbox,
                         widget.mesh_edit_update_delay_spinbox,
                     ),
@@ -159,7 +174,110 @@ class SettingsWidgetTests(unittest.TestCase):
             self.assertTrue(
                 widget.api_credentials_group.isAncestorOf(availability_note)
             )
+            canvas_form = widget.canvas_settings_group.layout()
+            self.assertIsInstance(canvas_form, QFormLayout)
+            assert isinstance(canvas_form, QFormLayout)
+            self.assertEqual(
+                canvas_form.labelForField(
+                    widget.first_person_navigation_combo
+                ).text(),
+                "First person navigation",
+            )
             widget.dispose()
+
+    def test_first_person_navigation_mode_persists_and_emits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            widget = SettingsWidget(
+                application_settings=application_settings,
+                environment={},
+            )
+            combo = widget.first_person_navigation_combo
+            emitted_changes: list[bool] = []
+            widget.settings_changed.connect(
+                lambda: emitted_changes.append(True)
+            )
+
+            self.assertEqual(
+                FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY,
+                "navigation/first_person_navigation_mode",
+            )
+            self.assertEqual(
+                DEFAULT_FIRST_PERSON_NAVIGATION_MODE,
+                FIRST_PERSON_NAVIGATION_MODE_GRAVITY,
+            )
+            self.assertEqual(
+                tuple(
+                    (combo.itemText(index), combo.itemData(index))
+                    for index in range(combo.count())
+                ),
+                FIRST_PERSON_NAVIGATION_MODE_OPTIONS,
+            )
+            self.assertEqual(
+                widget.get_settings().first_person_navigation_mode,
+                FIRST_PERSON_NAVIGATION_MODE_GRAVITY,
+            )
+
+            combo.setCurrentIndex(
+                combo.findData(FIRST_PERSON_NAVIGATION_MODE_NOCLIP)
+            )
+
+            self.assertEqual(
+                application_settings.get(
+                    FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY
+                ),
+                FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
+            )
+            self.assertEqual(
+                widget.get_settings().first_person_navigation_mode,
+                FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
+            )
+            self.assertEqual(emitted_changes, [True])
+
+            restored = SettingsWidget(
+                application_settings=_build_test_settings(temporary_directory),
+                environment={},
+            )
+            self.assertEqual(
+                restored.get_settings().first_person_navigation_mode,
+                FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
+            )
+            widget.dispose()
+            restored.dispose()
+
+    def test_first_person_navigation_mode_rejects_malformed_values(
+        self,
+    ) -> None:
+        self.assertEqual(
+            GenerationServiceSettings(
+                first_person_navigation_mode=" Gravity "
+            ).first_person_navigation_mode,
+            FIRST_PERSON_NAVIGATION_MODE_GRAVITY,
+        )
+
+        for value in ("", "fly", 1, None, []):
+            with self.subTest(model_value=value):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "First-person navigation mode",
+                ):
+                    GenerationServiceSettings(
+                        first_person_navigation_mode=(
+                            value  # type: ignore[arg-type]
+                        )
+                    )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            application_settings.set(
+                FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY,
+                "fly",
+            )
+
+            self.assertEqual(
+                read_first_person_navigation_mode(application_settings),
+                FIRST_PERSON_NAVIGATION_MODE_GRAVITY,
+            )
 
     def test_snap_middle_equal_angle_setting_persists_and_emits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -930,8 +1048,8 @@ class SettingsWidgetTests(unittest.TestCase):
                 widget.mesh_edit_update_delay_spinbox.toolTip(),
             )
             form_layout = widget.canvas_settings_group.layout()
-            self.assertIsNotNone(form_layout)
-            assert form_layout is not None
+            self.assertIsInstance(form_layout, QFormLayout)
+            assert isinstance(form_layout, QFormLayout)
             self.assertEqual(
                 form_layout.labelForField(
                     widget.mesh_edit_update_delay_spinbox

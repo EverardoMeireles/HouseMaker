@@ -476,6 +476,9 @@ class BlueprintWorkspace(QWidget):
         self._set_canvas_3d_navigation_shortcut(
             generation_settings.canvas_3d_navigation_toggle_hotkey
         )
+        self.viewer.set_first_person_movement_mode(
+            generation_settings.first_person_navigation_mode
+        )
         self.canvas.set_snap_middle_equal_angle_only(
             generation_settings.snap_middle_equal_angle_only
         )
@@ -5375,6 +5378,9 @@ class BlueprintWorkspace(QWidget):
         )
         self._set_canvas_3d_navigation_shortcut(
             settings.canvas_3d_navigation_toggle_hotkey
+        )
+        self.viewer.set_first_person_movement_mode(
+            settings.first_person_navigation_mode
         )
         self.canvas.set_snap_middle_equal_angle_only(
             settings.snap_middle_equal_angle_only

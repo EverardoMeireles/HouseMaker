@@ -22,12 +22,15 @@ from PySide6.QtWidgets import QApplication, QPushButton
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.camera_models import CameraPose
+from housemaker.first_person_navigation import (
+    FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
+)
 from housemaker.generation_state import GenerationData, MaskPoint, MaskStroke
 from housemaker.generation_workspace import GenerationRequest
 from housemaker.main import BlueprintWorkspace
 from housemaker.models import GROUND_LEVEL_INDEX, create_default_levels
 from housemaker.project_io import ProjectData
-from housemaker.settings_widget import GenerationServiceSettings, SettingsWidget
+from housemaker.settings_widget import GenerationServiceSettings
 
 
 # ### Module state ###
@@ -289,6 +292,41 @@ class GenerationMainIntegrationTests(unittest.TestCase):
         self.assertEqual(
             self.workspace.viewer.get_navigation_mode(),
             "orbit",
+        )
+
+    def test_first_person_mode_updates_live_without_resetting_canvas(self) -> None:
+        camera_pose = CameraPose(
+            x=1.0,
+            y=2.0,
+            z=3.0,
+            yaw_degrees=25.0,
+            pitch_degrees=15.0,
+        )
+        viewer = self.workspace.viewer
+        surface_view = self.workspace.surface_texture_generation.surface_view
+        viewer.set_first_person_camera_pose(camera_pose)
+        viewer.enter_first_person_mode()
+        pointer_was_captured = viewer.is_first_person_pointer_captured
+        combo = self.workspace.settings_widget.first_person_navigation_combo
+
+        combo.setCurrentIndex(
+            combo.findData(FIRST_PERSON_NAVIGATION_MODE_NOCLIP)
+        )
+        _qt_application.processEvents()
+
+        self.assertEqual(
+            viewer.get_first_person_movement_mode(),
+            FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
+        )
+        self.assertEqual(viewer.get_navigation_mode(), "first_person")
+        self.assertEqual(viewer.get_first_person_camera_pose(), camera_pose)
+        self.assertEqual(
+            viewer.is_first_person_pointer_captured,
+            pointer_was_captured,
+        )
+        self.assertEqual(
+            surface_view.get_first_person_movement_mode(),
+            FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
         )
 
     def test_canvas_snap_filter_is_controlled_from_settings(self) -> None:

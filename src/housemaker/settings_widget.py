@@ -24,6 +24,11 @@ from PySide6.QtWidgets import (
 )
 
 from housemaker.app_settings import ApplicationSettingsStore
+from housemaker.first_person_navigation import (
+    DEFAULT_FIRST_PERSON_NAVIGATION_MODE,
+    FIRST_PERSON_NAVIGATION_MODE_OPTIONS,
+    normalize_first_person_navigation_mode,
+)
 
 
 # ### Constants ###
@@ -48,6 +53,9 @@ AUTOMATIC_ATLAS_TEXTURE_RESOLUTION_SETTING_KEY = (
 )
 CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY_SETTING_KEY = (
     "navigation/canvas_3d_navigation_toggle_hotkey"
+)
+FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY = (
+    "navigation/first_person_navigation_mode"
 )
 UNUSED_FACE_REMOVAL_SETTING_KEY = "generation/unused_face_removal"
 USE_UV_RAYCAST_FOR_OBJECT_GENERATION_SETTING_KEY = (
@@ -162,8 +170,26 @@ class GenerationServiceSettings:
     snap_middle_equal_angle_only: bool = (
         DEFAULT_SNAP_MIDDLE_EQUAL_ANGLE_ONLY
     )
+    first_person_navigation_mode: str = (
+        DEFAULT_FIRST_PERSON_NAVIGATION_MODE
+    )
 
     def __post_init__(self) -> None:
+        try:
+            normalized_first_person_navigation_mode = (
+                normalize_first_person_navigation_mode(
+                    self.first_person_navigation_mode
+                )
+            )
+        except ValueError as error:
+            raise ValueError(
+                "First-person navigation mode must be Gravity or Noclip."
+            ) from error
+        object.__setattr__(
+            self,
+            "first_person_navigation_mode",
+            normalized_first_person_navigation_mode,
+        )
         if not isinstance(self.snap_middle_equal_angle_only, bool):
             raise ValueError(
                 "Snap-to-middle equal-angle filtering must be enabled or "
@@ -391,6 +417,9 @@ class SettingsWidget(QWidget):
             ),
             snap_middle_equal_angle_only=(
                 self.snap_middle_equal_angle_only_checkbox.isChecked()
+            ),
+            first_person_navigation_mode=str(
+                self.first_person_navigation_combo.currentData()
             ),
         )
 
@@ -644,6 +673,24 @@ class SettingsWidget(QWidget):
             self.canvas_3d_navigation_toggle_hotkey_edit,
         )
 
+        self.first_person_navigation_combo = QComboBox()
+        self.first_person_navigation_combo.setObjectName(
+            "first_person_navigation_combo"
+        )
+        self.first_person_navigation_combo.setToolTip(
+            "Use Gravity for the current level movement, or Noclip to fly "
+            "freely in the viewing direction."
+        )
+        for label, mode in FIRST_PERSON_NAVIGATION_MODE_OPTIONS:
+            self.first_person_navigation_combo.addItem(label, mode)
+        self.first_person_navigation_combo.currentIndexChanged.connect(
+            self._handle_first_person_navigation_mode_changed
+        )
+        canvas_form.addRow(
+            "First person navigation",
+            self.first_person_navigation_combo,
+        )
+
         self.snap_middle_equal_angle_only_checkbox = QCheckBox()
         self.snap_middle_equal_angle_only_checkbox.setObjectName(
             "snap_middle_equal_angle_only_checkbox"
@@ -846,6 +893,17 @@ class SettingsWidget(QWidget):
                 ),
                 QKeySequence.SequenceFormat.PortableText,
             )
+        )
+        first_person_navigation_mode = read_first_person_navigation_mode(
+            self._application_settings
+        )
+        first_person_navigation_index = (
+            self.first_person_navigation_combo.findData(
+                first_person_navigation_mode
+            )
+        )
+        self.first_person_navigation_combo.setCurrentIndex(
+            max(0, first_person_navigation_index)
         )
         self.snap_middle_equal_angle_only_checkbox.setChecked(
             read_snap_middle_equal_angle_only(self._application_settings)
@@ -1090,6 +1148,20 @@ class SettingsWidget(QWidget):
         self._application_settings.set(
             CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY_SETTING_KEY,
             hotkey,
+        )
+        self.settings_changed.emit()
+
+    def _handle_first_person_navigation_mode_changed(
+        self,
+        _index: int,
+    ) -> None:
+        """Persist the movement model used by first-person viewers."""
+
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY,
+            str(self.first_person_navigation_combo.currentData()),
         )
         self.settings_changed.emit()
 
@@ -1394,7 +1466,22 @@ def _normalize_mesh_edit_update_delay_seconds(
     return normalized_value
 
 
-# ### Canvas navigation hotkey helpers ###
+# ### Canvas navigation setting helpers ###
+def read_first_person_navigation_mode(
+    application_settings: ApplicationSettingsStore,
+) -> str:
+    """Read the first-person movement model with a safe default."""
+
+    value = application_settings.get(
+        FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY,
+        DEFAULT_FIRST_PERSON_NAVIGATION_MODE,
+    )
+    try:
+        return normalize_first_person_navigation_mode(value)
+    except ValueError:
+        return DEFAULT_FIRST_PERSON_NAVIGATION_MODE
+
+
 def read_canvas_3d_navigation_toggle_hotkey(
     application_settings: ApplicationSettingsStore,
 ) -> str:

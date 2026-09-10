@@ -24,6 +24,11 @@ from trimesh.visual.texture import TextureVisuals
 
 from housemaker.camera_models import CameraPose
 from housemaker.camera_indicators import INDICATOR_SELECTED_COLOR
+from housemaker.first_person_navigation import (
+    DEFAULT_FIRST_PERSON_NAVIGATION_MODE,
+    FIRST_PERSON_NAVIGATION_MODE_GRAVITY,
+    FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
+)
 from housemaker.glb import (
     GeneratedModel,
     PreviewPlacedObject,
@@ -817,12 +822,23 @@ class GlbViewerRenderingTests(unittest.TestCase):
         pose = CameraPose(x=1.0, y=2.0, z=1.7, yaw_degrees=45.0)
 
         self.assertTrue(viewer.first_person_crosshair_label.isHidden())
+        self.assertEqual(
+            viewer.get_first_person_movement_mode(),
+            DEFAULT_FIRST_PERSON_NAVIGATION_MODE,
+        )
 
         viewer.set_first_person_camera_pose(pose)
+        viewer.set_first_person_movement_mode(
+            FIRST_PERSON_NAVIGATION_MODE_NOCLIP
+        )
         viewer.set_navigation_mode(NAVIGATION_MODE_FIRST_PERSON)
 
         self.assertEqual(viewer.get_navigation_mode(), NAVIGATION_MODE_FIRST_PERSON)
         self.assertEqual(viewer.get_first_person_camera_pose(), pose)
+        self.assertEqual(
+            viewer.get_first_person_movement_mode(),
+            FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
+        )
         self.assertTrue(viewer.is_first_person_pointer_captured)
         self.assertFalse(viewer.first_person_crosshair_label.isHidden())
         viewer.release_first_person_pointer_capture()
@@ -1139,9 +1155,14 @@ class FirstPersonNavigationTests(unittest.TestCase):
         )
         self.assertFalse(self.view.is_first_person_active)
 
-    def test_zqsd_movement_uses_yaw_and_preserves_camera_z(self) -> None:
+    def test_gravity_zqsd_uses_yaw_and_preserves_camera_z(self) -> None:
         self.view.set_first_person_camera_pose(
-            CameraPose(x=1.0, y=2.0, z=1.7)
+            CameraPose(
+                x=1.0,
+                y=2.0,
+                z=1.7,
+                pitch_degrees=60.0,
+            )
         )
         self.view.enter_first_person_mode()
         self.view.keyPressEvent(
@@ -1158,6 +1179,98 @@ class FirstPersonNavigationTests(unittest.TestCase):
         self.assertAlmostEqual(moved_pose.x, 2.0)
         self.assertAlmostEqual(moved_pose.y, 2.0)
         self.assertAlmostEqual(moved_pose.z, 1.7)
+
+    def test_noclip_forward_movement_follows_camera_pitch(self) -> None:
+        self.view.set_first_person_movement_mode(
+            FIRST_PERSON_NAVIGATION_MODE_NOCLIP
+        )
+        self.view.set_first_person_camera_pose(
+            CameraPose(
+                x=1.0,
+                y=2.0,
+                z=1.7,
+                pitch_degrees=30.0,
+            )
+        )
+        self.view.enter_first_person_mode()
+        self.view.keyPressEvent(
+            QKeyEvent(
+                QEvent.Type.KeyPress,
+                Qt.Key.Key_Z,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+
+        self.view.step_first_person_movement(0.4)
+        moved_pose = self.view.get_first_person_camera_pose()
+
+        self.assertAlmostEqual(moved_pose.x, 1.0 + np.sqrt(3.0) / 2.0)
+        self.assertAlmostEqual(moved_pose.y, 2.0)
+        self.assertAlmostEqual(moved_pose.z, 2.2)
+
+    def test_noclip_strafe_remains_horizontal_at_nonzero_pitch(self) -> None:
+        self.view.set_first_person_movement_mode(
+            FIRST_PERSON_NAVIGATION_MODE_NOCLIP
+        )
+        self.view.set_first_person_camera_pose(
+            CameraPose(
+                x=1.0,
+                y=2.0,
+                z=1.7,
+                pitch_degrees=75.0,
+            )
+        )
+        self.view.enter_first_person_mode()
+        self.view.keyPressEvent(
+            QKeyEvent(
+                QEvent.Type.KeyPress,
+                Qt.Key.Key_D,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+
+        self.view.step_first_person_movement(0.4)
+        moved_pose = self.view.get_first_person_camera_pose()
+
+        self.assertAlmostEqual(moved_pose.x, 1.0)
+        self.assertAlmostEqual(moved_pose.y, 1.0)
+        self.assertAlmostEqual(moved_pose.z, 1.7)
+
+    def test_noclip_has_no_automatic_fall_or_floor_clamp(self) -> None:
+        self.view.set_first_person_movement_mode(
+            FIRST_PERSON_NAVIGATION_MODE_NOCLIP
+        )
+        self.view.set_first_person_camera_pose(CameraPose(z=0.2))
+        self.view.enter_first_person_mode()
+
+        self.view.step_first_person_movement(1.0)
+        self.assertAlmostEqual(
+            self.view.get_first_person_camera_pose().z,
+            0.2,
+        )
+
+        self.view.keyPressEvent(
+            QKeyEvent(
+                QEvent.Type.KeyPress,
+                Qt.Key.Key_R,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+        self.view.step_first_person_movement(0.4)
+
+        self.assertAlmostEqual(
+            self.view.get_first_person_camera_pose().z,
+            -0.8,
+        )
+
+    def test_first_person_movement_mode_rejects_unknown_values(self) -> None:
+        self.assertEqual(
+            self.view.get_first_person_movement_mode(),
+            FIRST_PERSON_NAVIGATION_MODE_GRAVITY,
+        )
+
+        with self.assertRaisesRegex(ValueError, "expected one of"):
+            self.view.set_first_person_movement_mode("fly")
 
     def test_q_moves_left_and_d_moves_right_on_french_layout(self) -> None:
         self.view.enter_first_person_mode()
@@ -1193,7 +1306,7 @@ class FirstPersonNavigationTests(unittest.TestCase):
                 self.assertAlmostEqual(moved_pose.y, expected_xy[1])
                 self.assertAlmostEqual(moved_pose.z, 1.7)
 
-    def test_r_moves_down_and_f_moves_up_without_gravity(self) -> None:
+    def test_gravity_mode_r_moves_down_and_f_moves_up(self) -> None:
         self.view.enter_first_person_mode()
         cases = (
             (Qt.Key.Key_R, 0.7),

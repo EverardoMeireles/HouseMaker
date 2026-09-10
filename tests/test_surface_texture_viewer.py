@@ -17,6 +17,10 @@ from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QApplication
 
 from housemaker.camera_models import CameraPose
+from housemaker.first_person_navigation import (
+    FIRST_PERSON_NAVIGATION_MODE_GRAVITY,
+    FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
+)
 from housemaker.glb import GeneratedModel, PreviewTexturedSurface
 from housemaker.pbr_maps import (
     PBR_MAP_METALLIC,
@@ -298,7 +302,11 @@ class SurfaceTextureViewerCameraTests(unittest.TestCase):
         self.viewer.deleteLater()
         _qt_application.processEvents()
 
-    def test_zqsd_movement_uses_camera_yaw_without_gravity(self) -> None:
+    def test_gravity_zqsd_uses_camera_yaw_and_preserves_height(self) -> None:
+        self.assertEqual(
+            self.viewer.get_first_person_movement_mode(),
+            FIRST_PERSON_NAVIGATION_MODE_GRAVITY,
+        )
         self.viewer.set_camera_pose(CameraPose(x=1.0, y=2.0, z=1.7))
         view = self.viewer.view
         view.enter_first_person_mode()
@@ -322,6 +330,74 @@ class SurfaceTextureViewerCameraTests(unittest.TestCase):
                 Qt.Key.Key_Z,
                 Qt.KeyboardModifier.NoModifier,
             )
+        )
+
+    def test_noclip_forward_movement_follows_camera_pitch(self) -> None:
+        self.viewer.set_first_person_movement_mode(
+            FIRST_PERSON_NAVIGATION_MODE_NOCLIP
+        )
+        self.viewer.set_camera_pose(
+            CameraPose(x=1.0, y=2.0, z=1.7, pitch_degrees=30.0)
+        )
+        view = self.viewer.view
+        view.enter_first_person_mode()
+        view.keyPressEvent(
+            QKeyEvent(
+                QEvent.Type.KeyPress,
+                Qt.Key.Key_Z,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+
+        view.step_movement(0.4)
+        moved_pose = view.get_camera_pose()
+
+        self.assertAlmostEqual(moved_pose.x, 1.0 + np.sqrt(3.0) / 2.0)
+        self.assertAlmostEqual(moved_pose.y, 2.0)
+        self.assertAlmostEqual(moved_pose.z, 2.2)
+
+    def test_noclip_vertical_keys_remain_global_at_nonzero_pitch(self) -> None:
+        self.viewer.set_first_person_movement_mode(
+            FIRST_PERSON_NAVIGATION_MODE_NOCLIP
+        )
+        self.viewer.set_camera_pose(
+            CameraPose(x=1.0, y=2.0, z=1.7, pitch_degrees=75.0)
+        )
+        view = self.viewer.view
+        view.enter_first_person_mode()
+        view.keyPressEvent(
+            QKeyEvent(
+                QEvent.Type.KeyPress,
+                Qt.Key.Key_F,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+
+        view.step_movement(0.4)
+        moved_pose = view.get_camera_pose()
+
+        self.assertAlmostEqual(moved_pose.x, 1.0)
+        self.assertAlmostEqual(moved_pose.y, 2.0)
+        self.assertAlmostEqual(moved_pose.z, 2.7)
+
+    def test_first_person_movement_mode_normalizes_and_rejects_values(
+        self,
+    ) -> None:
+        self.viewer.set_first_person_movement_mode("  NOCLIP  ")
+
+        self.assertEqual(
+            self.viewer.get_first_person_movement_mode(),
+            FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
+        )
+        self.assertEqual(
+            self.viewer.view.get_first_person_movement_mode(),
+            FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
+        )
+        with self.assertRaisesRegex(ValueError, "expected one of"):
+            self.viewer.set_first_person_movement_mode("fly")
+        self.assertEqual(
+            self.viewer.get_first_person_movement_mode(),
+            FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
         )
 
     def test_q_moves_camera_left_and_d_moves_camera_right(self) -> None:

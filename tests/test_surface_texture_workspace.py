@@ -32,6 +32,10 @@ from PySide6.QtWidgets import (
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.camera_models import CameraPose
+from housemaker.first_person_navigation import (
+    DEFAULT_FIRST_PERSON_NAVIGATION_MODE,
+    FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
+)
 from housemaker.generation_state import MASK_MODE_PAINT, MaskPoint, MaskStroke
 from housemaker.glb import GeneratedModel
 from housemaker.models import LevelData, RoomData, VertexData
@@ -43,6 +47,7 @@ from housemaker.pbr_maps import (
     PBR_MAP_TYPES,
 )
 from housemaker.settings_widget import (
+    FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY,
     SURFACE_TEXTURE_PROVIDER_GPT_4O_MINI,
     SURFACE_TEXTURE_PROVIDER_GPT_5_6_LUNA,
     SURFACE_TEXTURE_PROVIDER_GPT_5_6_TERRA,
@@ -334,6 +339,54 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
                 "remove_surface_texture_plane_button",
             )
         )
+
+    def test_runtime_settings_control_surface_first_person_movement(self) -> None:
+        self.assertEqual(
+            self.workspace.surface_view.get_first_person_movement_mode(),
+            DEFAULT_FIRST_PERSON_NAVIGATION_MODE,
+        )
+        self.workspace.surface_view.enter_first_person_mode()
+
+        self.workspace.set_runtime_settings(
+            GenerationServiceSettings(
+                first_person_navigation_mode=(
+                    FIRST_PERSON_NAVIGATION_MODE_NOCLIP
+                )
+            )
+        )
+
+        self.assertEqual(
+            self.workspace.surface_view.get_first_person_movement_mode(),
+            FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
+        )
+        self.assertTrue(
+            self.workspace.surface_view.view.is_first_person_active
+        )
+
+    def test_persisted_first_person_mode_initializes_surface_view(self) -> None:
+        settings = ApplicationSettingsStore(
+            self._temporary_path / "noclip-settings.json"
+        )
+        settings.set(
+            FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY,
+            FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
+        )
+        workspace = SurfaceTextureGenerationWorkspace(
+            provider=self.provider,
+            asset_directory=self._temporary_path / "noclip-surface-assets",
+            application_settings=settings,
+        )
+
+        try:
+            self.assertEqual(
+                workspace.surface_view.get_first_person_movement_mode(),
+                FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
+            )
+        finally:
+            workspace.shutdown()
+            workspace.close()
+            workspace.deleteLater()
+            _qt_application.processEvents()
 
     def test_mask_mode_buttons_are_stacked_paint_above_erase(self) -> None:
         layout = self.workspace.mask_mode_control.layout()
