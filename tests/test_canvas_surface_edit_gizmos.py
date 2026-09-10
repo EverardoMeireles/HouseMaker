@@ -17,7 +17,6 @@ from PySide6.QtWidgets import QApplication
 import trimesh
 
 from housemaker.canvas_surface_edits import (
-    CANVAS_SURFACE_EDIT_FLOOR_THICKNESS,
     CANVAS_SURFACE_EDIT_LEVEL_HEIGHT,
     CANVAS_SURFACE_EDIT_WALL_VERTEX,
     CanvasSurfaceEditHandleTarget,
@@ -26,7 +25,6 @@ from housemaker.canvas_surface_edits import (
 from housemaker.glb import GeneratedModel
 from housemaker.surface_geometry import (
     SURFACE_TYPE_CEILING,
-    SURFACE_TYPE_FLOOR,
     SURFACE_TYPE_WALL,
     FixedSurface,
 )
@@ -37,9 +35,7 @@ from housemaker.viewer import (
     CANVAS_SURFACE_EDIT_GIZMO_LINE_WIDTH,
     GlbViewerWidget,
     _CanvasOpeningGizmoHandle,
-    _CanvasSurfaceEditDrag,
     _TransformGizmoHandle,
-    _build_canvas_surface_edit_outline_positions,
 )
 
 
@@ -141,29 +137,19 @@ def _build_wall_targets(
 def _build_vertical_target(
     surface: FixedSurface,
 ) -> CanvasSurfaceEditHandleTarget:
-    is_floor = surface.surface_type == SURFACE_TYPE_FLOOR
-    kind = (
-        CANVAS_SURFACE_EDIT_FLOOR_THICKNESS
-        if is_floor
-        else CANVAS_SURFACE_EDIT_LEVEL_HEIGHT
-    )
-    axis = (0.0, 0.0, -1.0 if is_floor else 1.0)
     origin = np.asarray(surface.mesh.centroid, dtype=float).copy()
-    baseline_value = 0.3 if is_floor else 3.0
-    if is_floor:
-        origin[2] -= baseline_value
     return CanvasSurfaceEditHandleTarget(
         reference=CanvasSurfaceEditReference(
-            kind=kind,
+            kind=CANVAS_SURFACE_EDIT_LEVEL_HEIGHT,
             level_index=0,
             axis_index=2,
         ),
         surface_id=surface.surface_id,
         origin_world=tuple(float(value) for value in origin),
-        axis_world=axis,
+        axis_world=(0.0, 0.0, 1.0),
         minimum_delta_meters=-0.5,
         maximum_delta_meters=0.75,
-        baseline_value_meters=baseline_value,
+        baseline_value_meters=3.0,
     )
 
 
@@ -279,54 +265,26 @@ class CanvasSurfaceEditGizmoTests(unittest.TestCase):
             14.0,
         )
 
-    def test_ceiling_and_floor_handles_point_up_and_down(self) -> None:
-        floor = _build_horizontal_surface(
-            SURFACE_TYPE_FLOOR,
-            surface_id="level:0/floor",
-            z=0.0,
-        )
+    def test_ceiling_handle_points_up(self) -> None:
         ceiling = _build_horizontal_surface(
             SURFACE_TYPE_CEILING,
             surface_id="level:0/ceiling",
             z=3.0,
         )
-        targets = (_build_vertical_target(floor), _build_vertical_target(ceiling))
-        viewer = self._build_viewer((floor, ceiling), targets)
+        target = _build_vertical_target(ceiling)
+        viewer = self._build_viewer((ceiling,), (target,))
 
-        for surface, expected_sign in ((floor, -1.0), (ceiling, 1.0)):
-            with self.subTest(surface_type=surface.surface_type):
-                with patch.object(viewer.view, "pixelSize", return_value=0.01):
-                    viewer.select_canvas_surface_target(surface.surface_id)
-                    viewer._refresh_canvas_surface_edit_gizmo_items()
-                axis_positions = np.asarray(
-                    viewer._canvas_surface_edit_gizmo_items[1].pos,
-                    dtype=float,
-                )
-                delta = axis_positions[1] - axis_positions[0]
-                self.assertAlmostEqual(delta[0], 0.0)
-                self.assertAlmostEqual(delta[1], 0.0)
-                self.assertEqual(float(np.sign(delta[2])), expected_sign)
-
-    def test_floor_preview_tracks_the_actual_slab_bottom(self) -> None:
-        floor = _build_horizontal_surface(
-            SURFACE_TYPE_FLOOR,
-            surface_id="level:0/floor",
-            z=0.0,
+        with patch.object(viewer.view, "pixelSize", return_value=0.01):
+            viewer.select_canvas_surface_target(ceiling.surface_id)
+            viewer._refresh_canvas_surface_edit_gizmo_items()
+        axis_positions = np.asarray(
+            viewer._canvas_surface_edit_gizmo_items[1].pos,
+            dtype=float,
         )
-        target = _build_vertical_target(floor)
-        drag = _CanvasSurfaceEditDrag(
-            target=target,
-            axis=np.asarray(target.axis_world, dtype=float),
-            drag_plane_normal=np.asarray((0.0, 1.0, 0.0), dtype=float),
-            start_axis_parameter=0.0,
-            preview_delta_meters=0.2,
-        )
-
-        outline = _build_canvas_surface_edit_outline_positions(floor, drag)
-
-        self.assertIsNotNone(outline)
-        assert outline is not None
-        np.testing.assert_allclose(outline[:, 2], -0.5, atol=1e-9)
+        delta = axis_positions[1] - axis_positions[0]
+        self.assertAlmostEqual(delta[0], 0.0)
+        self.assertAlmostEqual(delta[1], 0.0)
+        self.assertGreater(delta[2], 0.0)
 
     def test_cpu_segment_pick_returns_the_matching_wall_axis(self) -> None:
         wall = _build_wall()

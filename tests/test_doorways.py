@@ -1391,7 +1391,7 @@ class DoorwayTests(unittest.TestCase):
                 workspace.current_level.index,
             )
 
-            workspace.canvas.start_floor_contour_designation()
+            workspace.canvas.start_stair_placement()
 
             self.assertIsNone(workspace.canvas.selected_doorway_index)
             self.assertFalse(workspace._is_doorway_move_drag_active)
@@ -1645,7 +1645,12 @@ class DoorwayTests(unittest.TestCase):
         )
 
     def test_glb_seals_parallel_wall_doorway_with_jambs_and_soffit(self) -> None:
-        model = convert_to_glb([_build_parallel_wall_doorway_level()])
+        level = _build_parallel_wall_doorway_level()
+        model = convert_to_glb([level])
+        doorway_top = (
+            level.floor_thickness_meters
+            + level.doorways[0].height_meters
+        )
 
         # The openings in the front and back wall planes remain empty.
         for wall_plane_y in (-0.9, -1.1):
@@ -1673,7 +1678,7 @@ class DoorwayTests(unittest.TestCase):
         self.assertTrue(
             _mesh_covers_point_on_plane(
                 model.mesh,
-                (1.0, -1.0, 2.1),
+                (1.0, -1.0, doorway_top),
                 fixed_axis=2,
             )
         )
@@ -1709,7 +1714,7 @@ class DoorwayTests(unittest.TestCase):
         self.assertTrue(
             _mesh_covers_point_on_plane(
                 exported_mesh,
-                (1.0, 2.1, 1.0),
+                (1.0, doorway_top, 1.0),
                 fixed_axis=1,
             )
         )

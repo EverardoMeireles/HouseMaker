@@ -108,7 +108,6 @@ def _build_room_arch_level(arch_amount: float = 1.0) -> LevelData:
                 arch_amount=arch_amount,
             )
         ],
-        floor_contour_vertex_ids=boundary_ids,
     )
 
 

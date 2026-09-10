@@ -58,7 +58,6 @@ def _build_level(index: int) -> LevelData:
                 color_rgb=(120, 160, 200),
             )
         ],
-        floor_contour_vertex_ids=boundary_ids,
     )
 
 

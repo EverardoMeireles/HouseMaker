@@ -99,7 +99,6 @@ def _build_one_room_level() -> tuple[LevelData, RoomData]:
             name="Ground",
             vertex_data=vertex_data,
             rooms=[room],
-            floor_contour_vertex_ids=room.vertex_ids,
         ),
         room,
     )
@@ -234,7 +233,6 @@ def _build_concave_u_room_level() -> tuple[LevelData, RoomData]:
             name="Ground",
             vertex_data=vertex_data,
             rooms=[room],
-            floor_contour_vertex_ids=room.vertex_ids,
         ),
         room,
     )
@@ -481,7 +479,7 @@ class SurfaceMaterialGlbTests(unittest.TestCase):
             ),
         )
 
-    def test_floor_material_replaces_base_faces_without_growing_geometry(
+    def test_floor_material_replaces_slab_top_without_growing_geometry(
         self,
     ) -> None:
         level, room = _build_one_room_level()
@@ -508,21 +506,11 @@ class SurfaceMaterialGlbTests(unittest.TestCase):
             fixed_surface.mesh.triangles,
         )
 
-    def test_selected_room_floor_partitions_a_shared_level_cap_without_overlap(
+    def test_selected_room_floor_does_not_overlap_other_room_floor(
         self,
     ) -> None:
         level, _shared_wall_key = _build_adjacent_room_level_with_doorway()
         first_room = level.rooms[0]
-        vertex_id_by_point = {
-            (vertex.x, vertex.y): vertex.id
-            for vertex in level.vertex_data.vertices
-        }
-        level.floor_contour_vertex_ids = (
-            vertex_id_by_point[(0.0, 0.0)],
-            vertex_id_by_point[(200.0, 0.0)],
-            vertex_id_by_point[(200.0, 100.0)],
-            vertex_id_by_point[(0.0, 100.0)],
-        )
         surface_id = f"level:2/room:{first_room.center_vertex_id}/floor"
         legacy_model = convert_to_glb([level])
 

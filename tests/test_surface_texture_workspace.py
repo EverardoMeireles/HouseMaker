@@ -108,7 +108,6 @@ def _test_level() -> LevelData:
             )
         ],
         image_size_pixels=(100.0, 100.0),
-        floor_contour_vertex_ids=(1, 2, 3, 4),
     )
 
 
@@ -719,7 +718,6 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
     ) -> None:
         level = copy.deepcopy(_test_level())
         room = level.rooms.pop()
-        level.floor_contour_vertex_ids = ()
         self.workspace.set_levels([level])
         asset_directory = self._temporary_path / "surface_assets"
         asset_directory.mkdir(parents=True, exist_ok=True)
@@ -817,7 +815,6 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
     ) -> None:
         level = _test_level()
         level.rooms = []
-        level.floor_contour_vertex_ids = ()
         self.workspace.set_levels([level])
         surface_id = "level:2/wall:1:2"
         asset_directory = self._temporary_path / "surface_assets"

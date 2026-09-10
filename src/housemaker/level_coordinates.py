@@ -6,6 +6,7 @@ from collections.abc import Sequence
 
 from housemaker.doorway_geometry import build_doorway_cross_section_outline
 from housemaker.models import (
+    DEFAULT_FLOOR_THICKNESS_METERS,
     GROUND_LEVEL_INDEX,
     PIXEL_TO_METER,
     DoorwayData,
@@ -14,27 +15,41 @@ from housemaker.models import (
 
 
 # ### Public coordinate helpers ###
+def build_level_floor_base_z_lookup(
+    levels: Sequence[LevelData],
+) -> dict[int, float]:
+    """Return each floor slab's anchored bottom Z coordinate in meters."""
+
+    level_lookup = {level.index: level for level in levels}
+    sorted_levels = sorted(
+        level_lookup.values(),
+        key=lambda level: level.index,
+    )
+    floor_base_z = -sum(
+        float(level.height_meters) + DEFAULT_FLOOR_THICKNESS_METERS
+        for level in sorted_levels
+        if level.index < GROUND_LEVEL_INDEX
+    )
+    floor_base_z_by_index: dict[int, float] = {}
+    for level in sorted_levels:
+        floor_base_z_by_index[level.index] = floor_base_z
+        floor_base_z += _get_level_story_span(level)
+    return floor_base_z_by_index
+
+
 def build_level_base_z_lookup(
     levels: Sequence[LevelData],
 ) -> dict[int, float]:
-    """Return each level floor's absolute Z coordinate in meters."""
+    """Return the walkable slab-top Z used by each level's contents."""
 
-    level_lookup = {level.index: level for level in levels}
-    base_z_by_index: dict[int, float] = {}
-    for level in levels:
-        if level.index >= GROUND_LEVEL_INDEX:
-            base_z_by_index[level.index] = sum(
-                level_lookup[index].height_meters
-                for index in range(GROUND_LEVEL_INDEX, level.index)
-                if index in level_lookup
-            )
-        else:
-            base_z_by_index[level.index] = -sum(
-                level_lookup[index].height_meters
-                for index in range(level.index, GROUND_LEVEL_INDEX)
-                if index in level_lookup
-            )
-    return base_z_by_index
+    floor_base_z_by_index = build_level_floor_base_z_lookup(levels)
+    return {
+        level.index: (
+            floor_base_z_by_index[level.index]
+            + float(level.floor_thickness_meters)
+        )
+        for level in levels
+    }
 
 
 def build_doorway_world_outline_positions(
@@ -220,6 +235,12 @@ def level_world_to_image_xy(
 
 
 # ### Internal coordinate helpers ###
+def _get_level_story_span(level: LevelData) -> float:
+    """Return one clear-height plus floor-thickness vertical span."""
+
+    return float(level.height_meters) + float(level.floor_thickness_meters)
+
+
 def _image_to_unscaled_world_xy(
     level: LevelData,
     image_x: float,

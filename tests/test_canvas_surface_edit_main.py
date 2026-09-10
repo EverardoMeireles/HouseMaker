@@ -17,7 +17,6 @@ from PySide6.QtWidgets import QApplication
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.canvas_surface_edits import (
     CANVAS_SURFACE_EDIT_AXIS_X,
-    CANVAS_SURFACE_EDIT_FLOOR_THICKNESS,
     CANVAS_SURFACE_EDIT_LEVEL_HEIGHT,
     CANVAS_SURFACE_EDIT_ROOM_HEIGHT,
     CANVAS_SURFACE_EDIT_WALL_VERTEX,
@@ -29,7 +28,6 @@ from housemaker.main import BlueprintWorkspace
 from housemaker.models import LevelData, RoomData, VertexData
 from housemaker.surface_geometry import (
     SURFACE_TYPE_CEILING,
-    SURFACE_TYPE_FLOOR,
     SURFACE_TYPE_WALL,
     FixedSurface,
     build_fixed_surfaces,
@@ -94,8 +92,6 @@ def _build_square_level(*, with_room: bool) -> LevelData:
         height_meters=3.0,
         vertex_data=vertex_data,
         rooms=rooms,
-        floor_contour_vertex_ids=boundary_ids,
-        floor_thickness_meters=0.3,
     )
 
 
@@ -518,61 +514,44 @@ class CanvasSurfaceEditMainTests(unittest.TestCase):
         self.assertTrue(surface_timer.isActive())
         self.assertGreater(surface_timer.remainingTime(), remaining_before)
 
-    def test_floor_and_ceiling_finishes_remain_immediate(self) -> None:
-        cases = (
-            (
-                SURFACE_TYPE_FLOOR,
-                CANVAS_SURFACE_EDIT_FLOOR_THICKNESS,
-            ),
-            (
-                SURFACE_TYPE_CEILING,
-                CANVAS_SURFACE_EDIT_LEVEL_HEIGHT,
-            ),
+    def test_room_ceiling_finish_remains_immediate(self) -> None:
+        level = _build_square_level(with_room=True)
+        surfaces = self._install_level(level)
+        ceiling = _surface(
+            surfaces,
+            surface_type=SURFACE_TYPE_CEILING,
+            room_owned=True,
         )
-        for surface_type, edit_kind in cases:
-            with self.subTest(surface_type=surface_type):
-                level = _build_square_level(with_room=False)
-                surfaces = self._install_level(level)
-                surface = _surface(
-                    surfaces,
-                    surface_type=surface_type,
-                    room_owned=False,
-                )
-                target = self._target(surface.surface_id, edit_kind)
-                final_edit = _edit(target, 0.2)
-                self.workspace._handle_canvas_surface_edit_started(
-                    _edit(target, 0.0)
-                )
-                self.workspace._handle_canvas_surface_edit_preview_changed(
-                    final_edit
-                )
+        target = self._target(
+            ceiling.surface_id,
+            CANVAS_SURFACE_EDIT_ROOM_HEIGHT,
+        )
+        final_edit = _edit(target, 0.2)
+        self.workspace._handle_canvas_surface_edit_started(_edit(target, 0.0))
+        self.workspace._handle_canvas_surface_edit_preview_changed(final_edit)
 
-                with (
-                    patch.object(
-                        self.workspace.surface_texture_generation,
-                        "reconcile_assignments_with_levels",
-                        return_value=False,
-                    ) as reconcile_assignments,
-                    patch.object(
-                        self.workspace,
-                        "_schedule_viewer_preview_refresh",
-                    ) as schedule_refresh,
-                ):
-                    self.workspace._handle_canvas_surface_edit_finished(
-                        final_edit,
-                        True,
-                    )
+        with (
+            patch.object(
+                self.workspace.surface_texture_generation,
+                "reconcile_assignments_with_levels",
+                return_value=False,
+            ) as reconcile_assignments,
+            patch.object(
+                self.workspace,
+                "_schedule_viewer_preview_refresh",
+            ) as schedule_refresh,
+        ):
+            self.workspace._handle_canvas_surface_edit_finished(
+                final_edit,
+                True,
+            )
 
-                reconcile_assignments.assert_called_once_with([level])
-                schedule_refresh.assert_called_once_with(
-                    preserve_camera=True
-                )
-                self.assertFalse(
-                    self.workspace._pending_canvas_surface_mesh_update
-                )
-                self.assertFalse(
-                    self.workspace._canvas_surface_mesh_update_timer.isActive()
-                )
+        reconcile_assignments.assert_called_once_with([level])
+        schedule_refresh.assert_called_once_with(preserve_camera=True)
+        self.assertFalse(self.workspace._pending_canvas_surface_mesh_update)
+        self.assertFalse(
+            self.workspace._canvas_surface_mesh_update_timer.isActive()
+        )
 
     def test_room_ceiling_edits_only_its_stable_room_owner(self) -> None:
         level = _build_square_level(with_room=True)
@@ -610,7 +589,7 @@ class CanvasSurfaceEditMainTests(unittest.TestCase):
             _edit(target, 0.0)
         )
 
-    def test_residual_ceiling_edits_level_height(self) -> None:
+    def test_inferred_ceiling_edits_level_height(self) -> None:
         level = _build_square_level(with_room=False)
         surfaces = self._install_level(level)
         ceiling = _surface(
@@ -634,40 +613,6 @@ class CanvasSurfaceEditMainTests(unittest.TestCase):
         self.assertAlmostEqual(
             self.workspace.height_level_spinbox.value(),
             2.5,
-        )
-        self.workspace._handle_canvas_surface_edit_cancelled(
-            _edit(target, 0.0)
-        )
-
-    def test_floor_handle_edits_only_owning_level_thickness(self) -> None:
-        level = _build_square_level(with_room=True)
-        surfaces = self._install_level(level)
-        floor = _surface(
-            surfaces,
-            surface_type=SURFACE_TYPE_FLOOR,
-            room_owned=True,
-        )
-        target = self._target(
-            floor.surface_id,
-            CANVAS_SURFACE_EDIT_FLOOR_THICKNESS,
-        )
-        room_height_before = level.rooms[0].height_meters
-
-        self.workspace._handle_canvas_surface_edit_started(
-            _edit(target, 0.0)
-        )
-        self.workspace._handle_canvas_surface_edit_preview_changed(
-            _edit(target, 0.25)
-        )
-
-        self.assertAlmostEqual(level.floor_thickness_meters, 0.55)
-        self.assertAlmostEqual(
-            self.workspace.floor_thickness_spinbox.value(),
-            0.55,
-        )
-        self.assertAlmostEqual(
-            level.rooms[0].height_meters,
-            room_height_before,
         )
         self.workspace._handle_canvas_surface_edit_cancelled(
             _edit(target, 0.0)

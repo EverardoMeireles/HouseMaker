@@ -33,11 +33,11 @@ from housemaker.models import (
     MAX_DOORWAY_WIDTH_METERS,
     MAX_LEVEL_OFFSET_METERS,
     MAX_LEVEL_SCALE,
-    MIN_FLOOR_THICKNESS_METERS,
     MIN_DOORWAY_DEPTH_METERS,
     MIN_DOORWAY_BOTTOM_HEIGHT_METERS,
     MIN_DOORWAY_HEIGHT_METERS,
     MIN_DOORWAY_WIDTH_METERS,
+    MIN_FLOOR_THICKNESS_METERS,
     MIN_LEVEL_OFFSET_METERS,
     MIN_LEVEL_SCALE,
     DoorwayData,
@@ -126,9 +126,6 @@ def save_project(
                 "offset_x_meters": float(level.offset_x_meters),
                 "offset_y_meters": float(level.offset_y_meters),
                 "floor_thickness_meters": level.floor_thickness_meters,
-                "floor_contour_vertex_ids": list(
-                    level.floor_contour_vertex_ids
-                ),
                 "image_path": _normalize_optional_path(level.image_path),
                 "image_size_pixels": _serialize_image_size(level.image_size_pixels),
                 "include_in_export": bool(level.include_in_export),
@@ -200,10 +197,6 @@ def load_project(path: str | Path) -> ProjectData:
             raw_level.get("include_in_export", DEFAULT_INCLUDE_IN_EXPORT)
         )
         level.vertex_data = VertexData.from_dict(raw_level.get("vertex_data", {}))
-        level.floor_contour_vertex_ids = _deserialize_floor_contour_vertex_ids(
-            raw_level.get("floor_contour_vertex_ids"),
-            level.vertex_data,
-        )
         level.rooms = _deserialize_rooms(
             raw_level.get("rooms", []),
             default_height_meters=level.height_meters,
@@ -355,28 +348,6 @@ def _deserialize_image_size(raw_image_size: object) -> tuple[float, float] | Non
         return None
 
     return (float(raw_image_size[0]), float(raw_image_size[1]))
-
-
-def _deserialize_floor_contour_vertex_ids(
-    raw_vertex_ids: object,
-    vertex_data: VertexData,
-) -> tuple[int, ...]:
-    if not isinstance(raw_vertex_ids, list | tuple):
-        return ()
-    if len(raw_vertex_ids) < 3:
-        return ()
-    if any(type(vertex_id) is not int for vertex_id in raw_vertex_ids):
-        return ()
-
-    vertex_ids = tuple(raw_vertex_ids)
-    if len(set(vertex_ids)) != len(vertex_ids):
-        return ()
-
-    existing_vertex_ids = {vertex.id for vertex in vertex_data.vertices}
-    if any(vertex_id not in existing_vertex_ids for vertex_id in vertex_ids):
-        return ()
-
-    return vertex_ids
 
 
 def _serialize_image_library_paths(image_paths: list[str]) -> list[str]:
@@ -827,9 +798,13 @@ def _deserialize_room_height_meters(
 
 
 def _deserialize_floor_thickness_meters(raw_thickness_meters: object) -> float:
+    """Return one finite floor thickness constrained to the supported range."""
+
+    if isinstance(raw_thickness_meters, bool):
+        return DEFAULT_FLOOR_THICKNESS_METERS
     try:
         thickness_meters = float(raw_thickness_meters)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return DEFAULT_FLOOR_THICKNESS_METERS
 
     if not math.isfinite(thickness_meters):

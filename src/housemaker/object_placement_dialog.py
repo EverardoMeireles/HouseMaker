@@ -167,7 +167,6 @@ class ObjectPlacementDialog(QDialog):
             vertex_data=level.vertex_data,
             rooms=level.rooms,
             image_path=level.image_path,
-            floor_contour_vertex_ids=level.floor_contour_vertex_ids,
             doorways=level.doorways,
         )
         if self.canvas.blueprint_image is None:

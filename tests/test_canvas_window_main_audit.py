@@ -61,7 +61,6 @@ def _build_square_level() -> LevelData:
         name="Ground",
         vertex_data=vertex_data,
         rooms=[room],
-        floor_contour_vertex_ids=boundary_ids,
     )
 
 

@@ -284,7 +284,6 @@ def _add_square_room_to_level(level: LevelData) -> str:
             color_rgb=(120, 140, 160),
         )
     ]
-    level.floor_contour_vertex_ids = boundary_ids
     return next(
         surface.surface_id
         for surface in build_fixed_surfaces([level])
@@ -1375,7 +1374,6 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         vertex_data.add_edge(start.id, end.id)
         self.workspace.current_level.vertex_data = vertex_data
         self.workspace.current_level.rooms = []
-        self.workspace.current_level.floor_contour_vertex_ids = ()
         self.workspace._sync_canvas_to_current_level()
         wall_id = next(
             surface.surface_id
@@ -1414,66 +1412,6 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
 
         self.workspace.canvas.selected_vertex_id = start.id
         self.workspace.canvas._delete_selected_vertex()
-
-        retained = surface_workspace.get_assignment(assignment.assignment_id)
-        assert retained is not None
-        self.assertEqual(retained.surface_ids, ())
-        updated_atlas = atlas_workspace.get_data().atlas_by_id(atlas.atlas_id)
-        assert updated_atlas is not None
-        self.assertIsNone(updated_atlas.placement_for_object(source_id))
-
-    def test_cleared_floor_contour_removes_unused_atlas_texture(self) -> None:
-        vertex_data = VertexData()
-        contour_ids = tuple(
-            vertex_data.add_vertex(*point).id
-            for point in (
-                (0.0, 0.0),
-                (100.0, 0.0),
-                (100.0, 100.0),
-                (0.0, 100.0),
-            )
-        )
-        self.workspace.current_level.vertex_data = vertex_data
-        self.workspace.current_level.rooms = []
-        self.workspace.current_level.floor_contour_vertex_ids = contour_ids
-        surfaces = tuple(build_fixed_surfaces(self.workspace.levels))
-        floor_id = next(
-            surface.surface_id
-            for surface in surfaces
-            if surface.surface_type == SURFACE_TYPE_FLOOR
-        )
-        surface_workspace = self.workspace.surface_texture_generation
-        surface_workspace.set_levels(self.workspace.levels)
-        assignment = _wall_texture_assignment(
-            self.settings.path.parent / "surface_textures",
-            assignment_id="cleared-floor-texture",
-            surface_ids=(floor_id,),
-            surface_type=SURFACE_TYPE_FLOOR,
-        )
-        surface_workspace.set_data(
-            SurfaceTextureData(assignments=[assignment])
-        )
-        surface_workspace.data_changed.emit(surface_workspace.get_data())
-        atlas_data = TextureAtlasData()
-        atlas = atlas_data.create_atlas(
-            "Cleared floor",
-            2048,
-            atlas_id="cleared-floor",
-        )
-        atlas_workspace = self.workspace.texture_atlas_workspace
-        atlas_workspace.set_data(atlas_data)
-        self.workspace._atlas_generation_signature = None
-        self.workspace._sync_atlas_object_texture_sources(
-            automatically_assign_scene_textures=False
-        )
-        source_id = build_atlas_wall_texture_source_id(
-            assignment.assignment_id
-        )
-        self.assertTrue(
-            atlas_workspace.assign_source_to_selected_atlas(source_id)
-        )
-
-        self.workspace._handle_floor_contour_changed(())
 
         retained = surface_workspace.get_assignment(assignment.assignment_id)
         assert retained is not None

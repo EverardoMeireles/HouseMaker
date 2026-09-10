@@ -150,9 +150,22 @@ class DoorwayBottomHeightTests(unittest.TestCase):
             ),
             dtype=float,
         )
+        upper_floor_top = (
+            lower_level.floor_thickness_meters
+            + lower_level.height_meters
+            + upper_level.floor_thickness_meters
+        )
 
-        self.assertAlmostEqual(float(np.min(positions[:, 2])), 3.55)
-        self.assertAlmostEqual(float(np.max(positions[:, 2])), 5.15)
+        self.assertAlmostEqual(
+            float(np.min(positions[:, 2])),
+            upper_floor_top + doorway.bottom_height_meters,
+        )
+        self.assertAlmostEqual(
+            float(np.max(positions[:, 2])),
+            upper_floor_top
+            + doorway.bottom_height_meters
+            + doorway.height_meters,
+        )
 
     def test_raised_doorway_is_cut_at_height_and_gets_a_sealed_sill(self) -> None:
         raised_level = _build_parallel_wall_level(0.4)
@@ -182,9 +195,16 @@ class DoorwayBottomHeightTests(unittest.TestCase):
         self.assertFalse(_mesh_has_horizontal_face_at_height(floor_reveal, 0.0))
 
         raised_surfaces = build_fixed_surfaces([raised_level])
+        world_sill_height = (
+            raised_level.floor_thickness_meters
+            + opening.bottom_height_meters
+        )
         self.assertTrue(
             any(
-                _mesh_has_horizontal_face_at_height(surface.mesh, 0.4)
+                _mesh_has_horizontal_face_at_height(
+                    surface.mesh,
+                    world_sill_height,
+                )
                 for surface in raised_surfaces
             )
         )

@@ -26,7 +26,6 @@ from housemaker.level_coordinates import level_image_to_world_xy
 from housemaker.models import LevelData, RoomData, VertexData
 from housemaker.surface_geometry import (
     SURFACE_TYPE_CEILING,
-    SURFACE_TYPE_FLOOR,
     SURFACE_TYPE_WALL,
     build_fixed_surfaces,
 )
@@ -73,7 +72,6 @@ def _build_room_level(
         scale=scale,
         offset_x_meters=offset_x_meters,
         offset_y_meters=offset_y_meters,
-        floor_thickness_meters=0.3,
         vertex_data=vertex_data,
         rooms=[room],
     )
@@ -96,9 +94,7 @@ def _build_plain_level() -> LevelData:
         index=2,
         name="Ground",
         height_meters=3.0,
-        floor_thickness_meters=0.3,
         vertex_data=vertex_data,
-        floor_contour_vertex_ids=tuple(vertex.id for vertex in vertices),
     )
 
 
@@ -217,7 +213,7 @@ class CanvasSurfaceEditTargetTests(unittest.TestCase):
                 (0.0, 0.5, 1.0),
             )
 
-    def test_floor_and_room_ceiling_targets_name_authoritative_properties(
+    def test_room_floor_and_ceiling_targets_name_authoritative_properties(
         self,
     ) -> None:
         level = _build_room_level()
@@ -237,9 +233,9 @@ class CanvasSurfaceEditTargetTests(unittest.TestCase):
             floor_target.reference.kind,
             CANVAS_SURFACE_EDIT_FLOOR_THICKNESS,
         )
-        self.assertEqual(floor_target.axis_world, (0.0, 0.0, -1.0))
+        self.assertEqual(floor_target.axis_world, (0.0, 0.0, 1.0))
         self.assertEqual(floor_target.baseline_value_meters, 0.3)
-        self.assertAlmostEqual(floor_target.origin_world[2], -0.3)
+        self.assertEqual(floor_target.surface_id, "level:2/room:6/floor")
         self.assertEqual(
             ceiling_target.reference.kind,
             CANVAS_SURFACE_EDIT_ROOM_HEIGHT,
@@ -247,7 +243,7 @@ class CanvasSurfaceEditTargetTests(unittest.TestCase):
         self.assertEqual(ceiling_target.reference.room_center_vertex_id, 6)
         self.assertEqual(ceiling_target.axis_world, (0.0, 0.0, 1.0))
 
-    def test_plain_ceiling_controls_level_height(self) -> None:
+    def test_inferred_level_ceiling_controls_level_height(self) -> None:
         level = _build_plain_level()
         _surfaces, targets = _build_targets(level)
         target = next(
@@ -519,31 +515,6 @@ class CanvasSurfaceEditApplicationTests(unittest.TestCase):
         )
         self.assertAlmostEqual(plain_level.height_meters, 4.25)
 
-    def test_floor_delta_follows_negative_z_and_restores_baseline(self) -> None:
-        level = _build_plain_level()
-        _surfaces, targets = _build_targets(level)
-        target = next(
-            candidate
-            for candidate in targets
-            if candidate.surface_id == "level:2/floor"
-        )
-
-        preview_origin = target.get_preview_origin(0.4)
-        result = apply_canvas_surface_edit(
-            (level,),
-            target,
-            CanvasSurfaceEdit(target.reference, target.surface_id, 0.4),
-        )
-
-        self.assertAlmostEqual(
-            preview_origin[2],
-            -0.7,
-        )
-        self.assertAlmostEqual(level.floor_thickness_meters, 0.7)
-        self.assertEqual(result.current.delta_meters, 0.4)
-        restore_canvas_surface_edit((level,), target)
-        self.assertAlmostEqual(level.floor_thickness_meters, 0.3)
-
     def test_wall_minimum_length_failure_is_atomic(self) -> None:
         level = _build_room_level()
         _surfaces, targets = _build_targets(level)
@@ -575,12 +546,12 @@ class CanvasSurfaceEditApplicationTests(unittest.TestCase):
     def test_full_surface_validation_is_optional_and_rolls_back_failure(
         self,
     ) -> None:
-        level = _build_plain_level()
+        level = _build_room_level()
         _surfaces, targets = _build_targets(level)
         target = next(
             candidate
             for candidate in targets
-            if candidate.reference.kind == CANVAS_SURFACE_EDIT_LEVEL_HEIGHT
+            if candidate.reference.kind == CANVAS_SURFACE_EDIT_ROOM_HEIGHT
         )
 
         with patch(
@@ -593,7 +564,7 @@ class CanvasSurfaceEditApplicationTests(unittest.TestCase):
                 validate_project_geometry=False,
             )
         rebuild.assert_not_called()
-        self.assertAlmostEqual(level.height_meters, 3.2)
+        self.assertAlmostEqual(level.rooms[0].height_meters, 3.2)
 
         with (
             patch(
@@ -607,7 +578,7 @@ class CanvasSurfaceEditApplicationTests(unittest.TestCase):
                 target,
                 CanvasSurfaceEdit(target.reference, target.surface_id, 0.4),
             )
-        self.assertAlmostEqual(level.height_meters, 3.2)
+        self.assertAlmostEqual(level.rooms[0].height_meters, 3.2)
 
     def test_current_geometry_validation_does_not_replay_an_edit(self) -> None:
         level = _build_plain_level()
@@ -657,26 +628,6 @@ class CanvasSurfaceEditApplicationTests(unittest.TestCase):
             tuple(level.vertex_data.vertices),
             vertices_before_validation,
         )
-
-    def test_out_of_range_delta_does_not_change_floor_thickness(self) -> None:
-        level = _build_plain_level()
-        _surfaces, targets = _build_targets(level)
-        target = next(
-            candidate
-            for candidate in targets
-            if candidate.reference.kind
-            == CANVAS_SURFACE_EDIT_FLOOR_THICKNESS
-        )
-
-        with self.assertRaisesRegex(ValueError, "allowed range"):
-            apply_canvas_surface_edit(
-                (level,),
-                target,
-                CanvasSurfaceEdit(target.reference, target.surface_id, 20.0),
-            )
-
-        self.assertAlmostEqual(level.floor_thickness_meters, 0.3)
-
 
 # ### Test entry point ###
 if __name__ == "__main__":

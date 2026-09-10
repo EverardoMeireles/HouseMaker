@@ -60,7 +60,6 @@ def _test_level() -> LevelData:
             )
         ],
         image_size_pixels=(100.0, 100.0),
-        floor_contour_vertex_ids=(1, 2, 3, 4),
     )
 
 

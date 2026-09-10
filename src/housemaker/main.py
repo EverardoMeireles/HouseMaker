@@ -55,12 +55,14 @@ from housemaker.canvas_openings import (
     build_canvas_opening_targets,
 )
 from housemaker.canvas_surface_edits import (
+    CANVAS_SURFACE_EDIT_FLOOR_THICKNESS,
     CANVAS_SURFACE_EDIT_WALL_VERTEX,
     AppliedCanvasSurfaceEdit,
     CanvasSurfaceEdit,
     CanvasSurfaceEditHandleTarget,
     apply_canvas_surface_edit,
     build_canvas_surface_edit_targets,
+    rebase_canvas_floor_edit_target,
     rebase_canvas_wall_edit_targets,
     restore_canvas_surface_edit,
     validate_canvas_surface_edit_geometry,
@@ -191,6 +193,12 @@ PROJECT_LOAD_FAILURES = (
 SURFACE_ATLAS_ROUGHNESS_BYTE = round(
     LEGACY_SURFACE_ROUGHNESS_FACTOR * 255.0
 )
+DELAYED_CANVAS_SURFACE_EDIT_KINDS = frozenset(
+    (
+        CANVAS_SURFACE_EDIT_WALL_VERTEX,
+        CANVAS_SURFACE_EDIT_FLOOR_THICKNESS,
+    )
+)
 
 # ### Event filters ###
 class RightPanelValueInputWheelFilter(QObject):
@@ -263,7 +271,7 @@ class BlueprintWorkspace(QWidget):
             None
         )
         self._viewer_preview_dependency_signature_revision = -1
-        # Opening edits remain live in project data while these separate
+        # Structural edits remain live in project data while these separate
         # snapshots control which edits have reached the expensive 3D mesh.
         self._viewer_doorways_by_level_index: dict[
             int,
@@ -273,6 +281,7 @@ class BlueprintWorkspace(QWidget):
             int,
             tuple[WindowData, ...],
         ] = {}
+        self._viewer_floor_thickness_by_level_index: dict[int, float] = {}
         self._reset_viewer_doorway_snapshots()
         self._mesh_edit_update_delay_seconds = (
             DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS
@@ -304,6 +313,7 @@ class BlueprintWorkspace(QWidget):
         self._pending_canvas_surface_mesh_baseline: (
             CanvasSurfaceEditHandleTarget | None
         ) = None
+        self._pending_floor_thickness_level_index: int | None = None
         self._pending_canvas_opening_key: str | None = None
         self._staged_canvas_opening_mesh_update = False
         self._staged_doorway_mesh_update = False
@@ -699,7 +709,9 @@ class BlueprintWorkspace(QWidget):
         side_layout.addWidget(self.height_level_spinbox)
 
         floor_thickness_label = QLabel("Floor thickness")
-        floor_thickness_label.setStyleSheet("font-size: 18px; font-weight: 600;")
+        floor_thickness_label.setStyleSheet(
+            "font-size: 18px; font-weight: 600;"
+        )
         side_layout.addWidget(floor_thickness_label)
 
         self.floor_thickness_spinbox = QDoubleSpinBox()
@@ -770,27 +782,6 @@ class BlueprintWorkspace(QWidget):
             self._handle_level_y_offset_changed
         )
         side_layout.addWidget(self.level_y_offset_spinbox)
-
-        self.floor_contour_status_label = QLabel("Floor contour: Not set")
-        side_layout.addWidget(self.floor_contour_status_label)
-
-        floor_contour_buttons_layout = QHBoxLayout()
-        floor_contour_buttons_layout.setSpacing(10)
-
-        self.set_floor_contour_button = QPushButton("Set floor contour")
-        self.set_floor_contour_button.setMinimumHeight(40)
-        self.set_floor_contour_button.clicked.connect(
-            self._handle_set_floor_contour_clicked
-        )
-        floor_contour_buttons_layout.addWidget(self.set_floor_contour_button)
-
-        self.clear_floor_contour_button = QPushButton("Clear floor contour")
-        self.clear_floor_contour_button.setMinimumHeight(40)
-        self.clear_floor_contour_button.clicked.connect(
-            self._handle_clear_floor_contour_clicked
-        )
-        floor_contour_buttons_layout.addWidget(self.clear_floor_contour_button)
-        side_layout.addLayout(floor_contour_buttons_layout)
 
         stairs_label = QLabel("Stairs")
         stairs_label.setStyleSheet("font-size: 18px; font-weight: 600;")
@@ -990,9 +981,6 @@ class BlueprintWorkspace(QWidget):
         )
         self.canvas.wall_vertex_interaction_changed.connect(
             self._handle_canvas_wall_vertex_interaction_changed
-        )
-        self.canvas.floor_contour_changed.connect(
-            self._handle_floor_contour_changed
         )
         self.canvas.doorways_changed.connect(self._handle_doorways_changed)
         self.canvas.doorway_dimension_preview_changed.connect(
@@ -1629,7 +1617,7 @@ class BlueprintWorkspace(QWidget):
                 pass
             else:
                 self._sync_live_canvas_surface_edit(applied)
-        if target.reference.kind == CANVAS_SURFACE_EDIT_WALL_VERTEX:
+        if target.reference.kind in DELAYED_CANVAS_SURFACE_EDIT_KINDS:
             self._canvas_surface_mesh_update_timer.stop()
         self._active_canvas_surface_edit_target = target
 
@@ -1654,12 +1642,15 @@ class BlueprintWorkspace(QWidget):
         target = self._active_canvas_surface_edit_target
         if target is None or not isinstance(raw_edit, CanvasSurfaceEdit):
             return
-        is_wall_edit = (
-            target.reference.kind == CANVAS_SURFACE_EDIT_WALL_VERTEX
+        is_floor_edit = (
+            target.reference.kind == CANVAS_SURFACE_EDIT_FLOOR_THICKNESS
+        )
+        uses_mesh_delay = (
+            target.reference.kind in DELAYED_CANVAS_SURFACE_EDIT_KINDS
         )
         if changed and not self._apply_active_canvas_surface_edit(
             raw_edit,
-            validate_project_geometry=not is_wall_edit,
+            validate_project_geometry=not uses_mesh_delay,
         ):
             return
         if not changed:
@@ -1676,29 +1667,46 @@ class BlueprintWorkspace(QWidget):
 
         self._active_canvas_surface_edit_target = None
         if not changed:
-            if self._pending_canvas_surface_mesh_update and is_wall_edit:
+            if self._pending_canvas_surface_mesh_update and uses_mesh_delay:
                 self._canvas_surface_mesh_update_timer.start()
             else:
                 self._queue_viewer_preview_refresh()
             return
 
-        if is_wall_edit:
+        if uses_mesh_delay:
             if self._pending_canvas_surface_mesh_baseline is None:
                 self._pending_canvas_surface_mesh_baseline = target
             self._pending_canvas_surface_mesh_update = True
-            current_wall_targets = tuple(
-                candidate
-                for candidate in self._canvas_surface_edit_targets_by_key.values()
-                if candidate.surface_id == target.surface_id
-                and (
-                    candidate.reference.kind
-                    == CANVAS_SURFACE_EDIT_WALL_VERTEX
+            if is_floor_edit:
+                self._pending_floor_thickness_level_index = (
+                    target.reference.level_index
                 )
-            )
+                current_targets = (target,)
+            else:
+                current_targets = tuple(
+                    candidate
+                    for candidate in (
+                        self._canvas_surface_edit_targets_by_key.values()
+                    )
+                    if candidate.surface_id == target.surface_id
+                    and (
+                        candidate.reference.kind
+                        == CANVAS_SURFACE_EDIT_WALL_VERTEX
+                    )
+                )
             try:
-                rebased_targets = rebase_canvas_wall_edit_targets(
-                    self.levels,
-                    current_wall_targets,
+                rebased_targets = (
+                    (
+                        rebase_canvas_floor_edit_target(
+                            self.levels,
+                            target,
+                        ),
+                    )
+                    if is_floor_edit
+                    else rebase_canvas_wall_edit_targets(
+                        self.levels,
+                        current_targets,
+                    )
                 )
             except (TypeError, ValueError) as error:
                 self._reject_pending_canvas_surface_mesh_update(error)
@@ -1714,8 +1722,8 @@ class BlueprintWorkspace(QWidget):
             self._canvas_surface_mesh_update_timer.start()
             return
 
-        # Height and floor edits rebuild immediately, so their old immutable
-        # baselines are retired until the refreshed scene installs new ones.
+        # Height edits rebuild immediately, so their old immutable baselines
+        # are retired until the refreshed scene installs new ones.
         self._canvas_surface_edit_targets_by_key = {}
         self.viewer.set_canvas_surface_edit_targets(())
         self._reconcile_canvas_surface_edit_and_refresh()
@@ -1732,7 +1740,7 @@ class BlueprintWorkspace(QWidget):
             self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     def _commit_pending_canvas_surface_mesh_update(self) -> None:
-        """Release one validated wall edit after its configured quiet period."""
+        """Release one validated surface edit after its quiet period."""
 
         self._canvas_surface_mesh_update_timer.stop()
         if not self._pending_canvas_surface_mesh_update:
@@ -1748,6 +1756,7 @@ class BlueprintWorkspace(QWidget):
                 self._reject_pending_canvas_surface_mesh_update(error)
                 return
 
+        self._commit_viewer_floor_thickness_snapshot()
         self._pending_canvas_surface_mesh_update = False
         self._pending_canvas_surface_mesh_baseline = None
         self._canvas_surface_edit_targets_by_key = {}
@@ -1758,23 +1767,25 @@ class BlueprintWorkspace(QWidget):
         self._reconcile_canvas_surface_edit_and_refresh()
 
     def _cancel_pending_canvas_surface_mesh_update(self) -> None:
-        """Discard delayed wall-mesh work without changing authoritative data."""
+        """Discard delayed surface-mesh work without changing project data."""
 
         self._canvas_surface_mesh_update_timer.stop()
         self._pending_canvas_surface_mesh_update = False
         self._pending_canvas_surface_mesh_baseline = None
+        self._pending_floor_thickness_level_index = None
         self.viewer.clear_canvas_surface_edit_pending_outline()
 
     def _reject_pending_canvas_surface_mesh_update(
         self,
         error: Exception,
     ) -> None:
-        """Roll a rejected adjustment burst back to its first wall baseline."""
+        """Roll a rejected adjustment burst back to its first baseline."""
 
         baseline = self._pending_canvas_surface_mesh_baseline
         self._canvas_surface_mesh_update_timer.stop()
         self._pending_canvas_surface_mesh_update = False
         self._pending_canvas_surface_mesh_baseline = None
+        self._pending_floor_thickness_level_index = None
         if baseline is not None:
             try:
                 restored = restore_canvas_surface_edit(
@@ -1836,7 +1847,7 @@ class BlueprintWorkspace(QWidget):
         self._active_canvas_surface_edit_target = None
         if (
             self._pending_canvas_surface_mesh_update
-            and target.reference.kind == CANVAS_SURFACE_EDIT_WALL_VERTEX
+            and target.reference.kind in DELAYED_CANVAS_SURFACE_EDIT_KINDS
         ):
             self._canvas_surface_mesh_update_timer.start()
         else:
@@ -1875,9 +1886,10 @@ class BlueprintWorkspace(QWidget):
                 validate_project_geometry=validate_project_geometry,
             )
         except (TypeError, ValueError) as error:
-            resume_pending_wall_update = bool(
+            resume_pending_surface_update = bool(
                 self._pending_canvas_surface_mesh_update
-                and target.reference.kind == CANVAS_SURFACE_EDIT_WALL_VERTEX
+                and target.reference.kind
+                in DELAYED_CANVAS_SURFACE_EDIT_KINDS
             )
             try:
                 restored = restore_canvas_surface_edit(
@@ -1893,10 +1905,10 @@ class BlueprintWorkspace(QWidget):
             self.viewer.set_window_tools_status(
                 f"Surface edit stopped: {error}"
             )
-            if not resume_pending_wall_update:
+            if not resume_pending_surface_update:
                 self.viewer.clear_canvas_surface_edit_pending_outline()
             self.viewer.cancel_canvas_surface_edit()
-            if resume_pending_wall_update:
+            if resume_pending_surface_update:
                 self._canvas_surface_mesh_update_timer.start()
             else:
                 self._queue_viewer_preview_refresh()
@@ -1924,6 +1936,100 @@ class BlueprintWorkspace(QWidget):
             self.level_y_offset_spinbox.setValue(level.offset_y_meters)
         finally:
             self._is_syncing_level_controls = False
+
+    def _get_canvas_floor_edit_target(
+        self,
+        level_index: int,
+    ) -> CanvasSurfaceEditHandleTarget | None:
+        """Return the active floor handle, or another handle for its level."""
+
+        candidates = tuple(
+            target
+            for target in self._canvas_surface_edit_targets_by_key.values()
+            if (
+                target.reference.kind
+                == CANVAS_SURFACE_EDIT_FLOOR_THICKNESS
+                and target.reference.level_index == level_index
+            )
+        )
+        active_surface_id = self.viewer.get_active_canvas_surface_id()
+        return next(
+            (
+                target
+                for target in candidates
+                if target.surface_id == active_surface_id
+            ),
+            candidates[0] if candidates else None,
+        )
+
+    def _stage_floor_thickness_mesh_update(
+        self,
+        level: LevelData,
+        thickness_meters: float,
+    ) -> None:
+        """Stage a live floor value behind the shared mesh-edit debounce."""
+
+        if self._pending_canvas_surface_mesh_update and (
+            self._pending_floor_thickness_level_index != level.index
+        ):
+            self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_wall_vertex_update()
+
+        previous_thickness = float(level.floor_thickness_meters)
+        next_thickness = float(thickness_meters)
+        if next_thickness == previous_thickness:
+            return
+        self._viewer_floor_thickness_by_level_index.setdefault(
+            level.index,
+            previous_thickness,
+        )
+
+        target = self._get_canvas_floor_edit_target(level.index)
+        if target is not None and (
+            target.baseline_value_meters != previous_thickness
+        ):
+            try:
+                target = rebase_canvas_floor_edit_target(
+                    self.levels,
+                    target,
+                )
+            except (TypeError, ValueError):
+                target = None
+        if (
+            self._pending_canvas_surface_mesh_baseline is None
+            and target is not None
+        ):
+            self._pending_canvas_surface_mesh_baseline = target
+
+        level.floor_thickness_meters = next_thickness
+        self._pending_floor_thickness_level_index = level.index
+        self._pending_canvas_surface_mesh_update = True
+        self._is_syncing_level_controls = True
+        try:
+            self.floor_thickness_spinbox.setValue(next_thickness)
+        finally:
+            self._is_syncing_level_controls = False
+
+        if target is not None:
+            try:
+                rebased_target = rebase_canvas_floor_edit_target(
+                    self.levels,
+                    target,
+                )
+            except (TypeError, ValueError) as error:
+                self._reject_pending_canvas_surface_mesh_update(error)
+                return
+            self._canvas_surface_edit_targets_by_key = {
+                (
+                    rebased_target.surface_id,
+                    rebased_target.reference.key,
+                ): rebased_target
+            }
+            self.viewer.set_canvas_surface_edit_targets(
+                (rebased_target,),
+                preserve_pending_outline=True,
+            )
+        self._canvas_surface_mesh_update_timer.start()
 
     def _handle_canvas_placed_object_selection_changed(
         self,
@@ -4701,13 +4807,14 @@ class BlueprintWorkspace(QWidget):
         return tuple(copy.deepcopy(tuple(windows)))
 
     def _reset_viewer_doorway_snapshots(self) -> None:
-        """Make every rendered opening snapshot match the loaded project."""
+        """Make every rendered structural snapshot match the project."""
 
         self._viewer_doorways_by_level_index = {
             level.index: self._copy_doorways(level.doorways)
             for level in self.levels
         }
         self._reset_viewer_window_snapshots()
+        self._reset_viewer_floor_thickness_snapshots()
 
     def _reset_viewer_window_snapshots(self) -> None:
         """Make every rendered window snapshot match the loaded project."""
@@ -4716,6 +4823,35 @@ class BlueprintWorkspace(QWidget):
             level.index: self._copy_windows(level.windows)
             for level in self.levels
         }
+
+    def _reset_viewer_floor_thickness_snapshots(self) -> None:
+        """Make rendered floor thicknesses match authoritative level data."""
+
+        self._viewer_floor_thickness_by_level_index = {
+            level.index: float(level.floor_thickness_meters)
+            for level in self.levels
+        }
+
+    def _commit_viewer_floor_thickness_snapshot(self) -> None:
+        """Publish one delayed floor value to future preview builds."""
+
+        level_index = self._pending_floor_thickness_level_index
+        self._pending_floor_thickness_level_index = None
+        if level_index is None:
+            return
+        level = next(
+            (
+                candidate
+                for candidate in self.levels
+                if candidate.index == level_index
+            ),
+            None,
+        )
+        if level is None:
+            return
+        self._viewer_floor_thickness_by_level_index[level_index] = float(
+            level.floor_thickness_meters
+        )
 
     def _sync_viewer_window_snapshot(self, level: LevelData) -> None:
         """Commit one structural window list change before its model build."""
@@ -4738,7 +4874,7 @@ class BlueprintWorkspace(QWidget):
             self._doorway_mesh_update_timer.stop()
 
     def _build_viewer_preview_levels(self) -> list[LevelData]:
-        """Copy levels while substituting only committed opening dimensions."""
+        """Copy levels while substituting committed structural values."""
 
         preview_levels: list[LevelData] = []
         for level in self.levels:
@@ -4758,9 +4894,18 @@ class BlueprintWorkspace(QWidget):
                 self._viewer_windows_by_level_index[level.index] = (
                     window_snapshot
                 )
+            floor_thickness = (
+                self._viewer_floor_thickness_by_level_index.get(level.index)
+            )
+            if floor_thickness is None:
+                floor_thickness = float(level.floor_thickness_meters)
+                self._viewer_floor_thickness_by_level_index[level.index] = (
+                    floor_thickness
+                )
             preview_level = copy.copy(level)
             preview_level.doorways = list(copy.deepcopy(doorway_snapshot))
             preview_level.windows = list(copy.deepcopy(window_snapshot))
+            preview_level.floor_thickness_meters = floor_thickness
             preview_levels.append(preview_level)
         return preview_levels
 
@@ -5411,6 +5556,9 @@ class BlueprintWorkspace(QWidget):
     def _sync_level_controls(self) -> None:
         self._is_syncing_level_controls = True
         self.height_level_spinbox.setValue(self.current_level.height_meters)
+        self.floor_thickness_spinbox.setValue(
+            self.current_level.floor_thickness_meters
+        )
         self.level_scale_spinbox.setValue(self.current_level.scale)
         self.level_x_offset_spinbox.setValue(
             self.current_level.offset_x_meters
@@ -5418,10 +5566,6 @@ class BlueprintWorkspace(QWidget):
         self.level_y_offset_spinbox.setValue(
             self.current_level.offset_y_meters
         )
-        self.floor_thickness_spinbox.setValue(
-            self.current_level.floor_thickness_meters
-        )
-        self._update_floor_contour_status_label()
         self.include_yes_radio.setChecked(self.current_level.include_in_export)
         self.include_no_radio.setChecked(not self.current_level.include_in_export)
         if self.levels_list.currentRow() != self.current_level_index:
@@ -5455,6 +5599,16 @@ class BlueprintWorkspace(QWidget):
         self.current_level.height_meters = value
         self._schedule_viewer_preview_refresh()
 
+    def _handle_floor_thickness_changed(self, value: float) -> None:
+        """Stage a floor thickness change for one delayed mesh rebuild."""
+
+        if self._is_syncing_level_controls:
+            return
+        self._stage_floor_thickness_mesh_update(
+            self.current_level,
+            float(value),
+        )
+
     def _handle_level_scale_changed(self, value: float) -> None:
         if self._is_syncing_level_controls:
             return
@@ -5477,13 +5631,6 @@ class BlueprintWorkspace(QWidget):
 
         self.current_level.offset_y_meters = float(value)
         self.canvas.update()
-        self._schedule_viewer_preview_refresh()
-
-    def _handle_floor_thickness_changed(self, value: float) -> None:
-        if self._is_syncing_level_controls:
-            return
-
-        self.current_level.floor_thickness_meters = float(value)
         self._schedule_viewer_preview_refresh()
 
     def _handle_doorway_preset_selection_changed(self, _row: int) -> None:
@@ -5921,26 +6068,6 @@ class BlueprintWorkspace(QWidget):
         self._apply_atlas_display_screen(settings.atlas_display_screen_id)
         self._refresh_scene_atlas_texture_requirements()
 
-    def _handle_set_floor_contour_clicked(self) -> None:
-        self.canvas.start_floor_contour_designation()
-        self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
-
-    def _handle_clear_floor_contour_clicked(self) -> None:
-        self.canvas.clear_floor_contour()
-
-    def _handle_floor_contour_changed(self, vertex_ids: object) -> None:
-        if not isinstance(vertex_ids, list | tuple):
-            return
-
-        self.current_level.floor_contour_vertex_ids = tuple(
-            int(vertex_id) for vertex_id in vertex_ids
-        )
-        self._update_floor_contour_status_label()
-        self.surface_texture_generation.reconcile_assignments_with_levels(
-            self.levels
-        )
-        self._schedule_viewer_preview_refresh()
-
     # ### Canvas wall drawing updates ###
     def _handle_canvas_surface_geometry_changed(self) -> None:
         """Reconcile changed surfaces before refreshing Canvas geometry."""
@@ -6112,9 +6239,6 @@ class BlueprintWorkspace(QWidget):
             rooms=self.current_level.rooms,
             doorways=self.current_level.doorways,
             windows=self.current_level.windows,
-            floor_contour_vertex_ids=(
-                self.current_level.floor_contour_vertex_ids
-            ),
         )
         self.current_level.image_path = normalized_path
         self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
@@ -6137,9 +6261,6 @@ class BlueprintWorkspace(QWidget):
             rooms=self.current_level.rooms,
             doorways=self.current_level.doorways,
             windows=self.current_level.windows,
-            floor_contour_vertex_ids=(
-                self.current_level.floor_contour_vertex_ids
-            ),
             image_path=self.current_level.image_path,
         )
         if self.canvas.blueprint_image is not None:
@@ -6161,15 +6282,6 @@ class BlueprintWorkspace(QWidget):
 
         self.blueprint_name_label.setText(label_text)
 
-    def _update_floor_contour_status_label(self) -> None:
-        vertex_count = len(self.current_level.floor_contour_vertex_ids)
-        if vertex_count == 0:
-            self.floor_contour_status_label.setText("Floor contour: Not set")
-            return
-
-        self.floor_contour_status_label.setText(
-            f"Floor contour: {vertex_count} vertices"
-        )
 
 class MainWindow(QMainWindow):
     def __init__(

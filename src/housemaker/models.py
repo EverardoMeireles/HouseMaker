@@ -817,7 +817,6 @@ class LevelData:
     image_size_pixels: tuple[float, float] | None = None
     include_in_export: bool = DEFAULT_INCLUDE_IN_EXPORT
     floor_thickness_meters: float = DEFAULT_FLOOR_THICKNESS_METERS
-    floor_contour_vertex_ids: tuple[int, ...] = ()
     windows: list[WindowData] = field(default_factory=list)
 
     @property

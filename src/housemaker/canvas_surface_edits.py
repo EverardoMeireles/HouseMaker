@@ -10,7 +10,6 @@ import re
 import numpy as np
 
 from housemaker.level_coordinates import (
-    build_level_base_z_lookup,
     get_level_world_pivot,
     level_image_to_world_xy,
 )
@@ -116,12 +115,10 @@ class CanvasSurfaceEditReference:
         else:
             if vertex_id is not None or room_center_vertex_id is not None:
                 raise ValueError(
-                    "Level height and floor thickness have no item owner ID."
+                    "Level-wide edits have no item owner ID."
                 )
             if axis_index != CANVAS_SURFACE_EDIT_AXIS_Z:
-                raise ValueError(
-                    "Level height and floor thickness can only change on Z."
-                )
+                raise ValueError("Level-wide values can only change on Z.")
 
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "level_index", level_index)
@@ -148,9 +145,10 @@ class CanvasSurfaceEditReference:
                 f"level:{self.level_index}/"
                 f"room:{self.room_center_vertex_id}/height"
             )
-        if self.kind == CANVAS_SURFACE_EDIT_LEVEL_HEIGHT:
-            return f"level:{self.level_index}/height"
-        return f"level:{self.level_index}/floor-thickness"
+        if self.kind == CANVAS_SURFACE_EDIT_FLOOR_THICKNESS:
+            return f"level:{self.level_index}/floor_thickness"
+        assert self.kind == CANVAS_SURFACE_EDIT_LEVEL_HEIGHT
+        return f"level:{self.level_index}/height"
 
 
 @dataclass(frozen=True)
@@ -319,12 +317,11 @@ def build_canvas_surface_edit_targets(
     levels: Sequence[LevelData],
     surfaces: Sequence[FixedSurface],
 ) -> tuple[CanvasSurfaceEditHandleTarget, ...]:
-    """Build deterministic edit handles for every semantic fixed surface."""
+    """Build deterministic handles for editable structural surfaces."""
 
     level_sequence = _normalize_levels(levels)
     surface_sequence = _normalize_surfaces(surfaces)
     level_by_index = {level.index: level for level in level_sequence}
-    base_z_by_level_index = build_level_base_z_lookup(level_sequence)
     required_ids_by_level: dict[int, tuple[str, ...]] = {}
     for level_index in level_by_index:
         required_ids_by_level[level_index] = tuple(
@@ -343,6 +340,12 @@ def build_canvas_surface_edit_targets(
         level = level_by_index.get(surface.level_index)
         if level is None:
             continue
+        if surface.surface_type not in {
+            SURFACE_TYPE_WALL,
+            SURFACE_TYPE_CEILING,
+            SURFACE_TYPE_FLOOR,
+        }:
+            continue
         common = _build_common_target_values(
             level,
             surface,
@@ -351,16 +354,11 @@ def build_canvas_surface_edit_targets(
         if surface.surface_type == SURFACE_TYPE_WALL:
             targets.extend(_build_wall_targets(level, surface, common))
             continue
-        if surface.surface_type == SURFACE_TYPE_CEILING:
-            target = _build_ceiling_target(level, surface, common)
-        else:
-            assert surface.surface_type == SURFACE_TYPE_FLOOR
-            target = _build_floor_target(
-                level,
-                surface,
-                common,
-                base_z_by_level_index.get(level.index, 0.0),
-            )
+        target = (
+            _build_floor_target(level, surface, common)
+            if surface.surface_type == SURFACE_TYPE_FLOOR
+            else _build_ceiling_target(level, surface, common)
+        )
         if target is not None:
             targets.append(target)
     return tuple(
@@ -411,6 +409,44 @@ def rebase_canvas_wall_edit_targets(
     return tuple(
         _rebase_canvas_wall_edit_target(level, target)
         for target in target_sequence
+    )
+
+
+def rebase_canvas_floor_edit_target(
+    levels: Sequence[LevelData],
+    target: CanvasSurfaceEditHandleTarget,
+) -> CanvasSurfaceEditHandleTarget:
+    """Rebase a floor handle onto its current delayed thickness preview."""
+
+    level_sequence = _normalize_levels(levels)
+    if not isinstance(target, CanvasSurfaceEditHandleTarget):
+        raise TypeError("Canvas floor target rebasing requires a handle target.")
+    if target.reference.kind != CANVAS_SURFACE_EDIT_FLOOR_THICKNESS:
+        raise ValueError("Canvas floor target rebasing requires a floor handle.")
+
+    level = _find_level(level_sequence, target.reference.level_index)
+    _validate_level_baseline(level, target)
+    current_thickness = _validate_range(
+        level.floor_thickness_meters,
+        MIN_FLOOR_THICKNESS_METERS,
+        MAX_FLOOR_THICKNESS_METERS,
+        "Floor thickness",
+    )
+    thickness_delta = current_thickness - target.baseline_value_meters
+    current_origin = (
+        np.asarray(target.origin_world, dtype=float)
+        + np.asarray(target.axis_world, dtype=float) * thickness_delta
+    )
+    return replace(
+        target,
+        origin_world=tuple(float(value) for value in current_origin),
+        minimum_delta_meters=(
+            MIN_FLOOR_THICKNESS_METERS - current_thickness
+        ),
+        maximum_delta_meters=(
+            MAX_FLOOR_THICKNESS_METERS - current_thickness
+        ),
+        baseline_value_meters=current_thickness,
     )
 
 
@@ -523,7 +559,6 @@ def _build_floor_target(
     level: LevelData,
     surface: FixedSurface,
     common: dict[str, object],
-    level_base_z: float,
 ) -> CanvasSurfaceEditHandleTarget | None:
     origin = _get_surface_centroid(surface)
     if origin is None:
@@ -535,12 +570,8 @@ def _build_floor_target(
             level.index,
             CANVAS_SURFACE_EDIT_AXIS_Z,
         ),
-        origin_world=(
-            origin[0],
-            origin[1],
-            float(level_base_z) - baseline_thickness,
-        ),
-        axis_world=(0.0, 0.0, -1.0),
+        origin_world=origin,
+        axis_world=(0.0, 0.0, 1.0),
         minimum_delta_meters=(
             MIN_FLOOR_THICKNESS_METERS - baseline_thickness
         ),
@@ -790,24 +821,33 @@ def _validate_applied_values(
     if kind in {
         CANVAS_SURFACE_EDIT_LEVEL_HEIGHT,
         CANVAS_SURFACE_EDIT_ROOM_HEIGHT,
+        CANVAS_SURFACE_EDIT_FLOOR_THICKNESS,
     }:
-        value = (
-            level.height_meters
-            if kind == CANVAS_SURFACE_EDIT_LEVEL_HEIGHT
-            else _get_required_room_height(level, target.reference)
+        if kind == CANVAS_SURFACE_EDIT_LEVEL_HEIGHT:
+            value = level.height_meters
+        elif kind == CANVAS_SURFACE_EDIT_ROOM_HEIGHT:
+            value = _get_required_room_height(level, target.reference)
+        else:
+            value = level.floor_thickness_meters
+        minimum_value = (
+            MIN_FLOOR_THICKNESS_METERS
+            if kind == CANVAS_SURFACE_EDIT_FLOOR_THICKNESS
+            else MIN_CANVAS_SURFACE_HEIGHT_METERS
+        )
+        maximum_value = (
+            MAX_FLOOR_THICKNESS_METERS
+            if kind == CANVAS_SURFACE_EDIT_FLOOR_THICKNESS
+            else MAX_CANVAS_SURFACE_HEIGHT_METERS
         )
         _validate_range(
             value,
-            MIN_CANVAS_SURFACE_HEIGHT_METERS,
-            MAX_CANVAS_SURFACE_HEIGHT_METERS,
-            "Canvas surface height",
-        )
-    elif kind == CANVAS_SURFACE_EDIT_FLOOR_THICKNESS:
-        _validate_range(
-            level.floor_thickness_meters,
-            MIN_FLOOR_THICKNESS_METERS,
-            MAX_FLOOR_THICKNESS_METERS,
-            "Canvas floor thickness",
+            minimum_value,
+            maximum_value,
+            (
+                "Floor thickness"
+                if kind == CANVAS_SURFACE_EDIT_FLOOR_THICKNESS
+                else "Canvas surface height"
+            ),
         )
 
 
@@ -1142,6 +1182,7 @@ def _measure_current_delta(
     elif reference.kind == CANVAS_SURFACE_EDIT_FLOOR_THICKNESS:
         value = float(level.floor_thickness_meters)
     else:
+        assert reference.kind == CANVAS_SURFACE_EDIT_ROOM_HEIGHT
         value = _get_required_room_height(level, reference)
     return value - target.baseline_value_meters
 

@@ -58,7 +58,6 @@ def _build_square_level() -> LevelData:
         name="Ground",
         vertex_data=vertex_data,
         rooms=[room],
-        floor_contour_vertex_ids=boundary_ids,
     )
 
 
@@ -160,13 +159,97 @@ def _build_plain_window_depth_level(
     )
 
 
+def _build_plain_closed_window_depth_level(
+) -> tuple[LevelData, tuple[str, str]]:
+    vertex_data = VertexData()
+    boundary_ids = tuple(
+        vertex_data.add_vertex(*point).id
+        for point in (
+            (0.0, 0.0),
+            (100.0, 0.0),
+            (100.0, 100.0),
+            (0.0, 100.0),
+        )
+    )
+    for start_id, end_id in zip(
+        boundary_ids,
+        (*boundary_ids[1:], boundary_ids[0]),
+    ):
+        vertex_data.add_edge(start_id, end_id)
+
+    parallel_wall_ids: list[str] = []
+    for image_y in (-12.5, 12.5):
+        start = vertex_data.add_vertex(0.0, image_y)
+        end = vertex_data.add_vertex(100.0, image_y)
+        vertex_data.add_edge(start.id, end.id)
+        parallel_wall_ids.append(
+            f"level:2/wall:{min(start.id, end.id)}:{max(start.id, end.id)}"
+        )
+    return (
+        LevelData(
+            index=2,
+            name="Plain closed walls",
+            vertex_data=vertex_data,
+        ),
+        tuple(parallel_wall_ids),
+    )
+
+
+def _build_mixed_room_plain_window_depth_level(
+) -> tuple[LevelData, tuple[str, str]]:
+    """Build a legacy partial room inside one complete structural loop."""
+
+    vertex_data = VertexData()
+    boundary_ids = tuple(
+        vertex_data.add_vertex(*point).id
+        for point in (
+            (0.0, 0.0),
+            (100.0, 0.0),
+            (100.0, 100.0),
+            (0.0, 100.0),
+        )
+    )
+    for start_id, end_id in (
+        (boundary_ids[0], boundary_ids[1]),
+        (boundary_ids[1], boundary_ids[2]),
+        (boundary_ids[3], boundary_ids[2]),
+        (boundary_ids[0], boundary_ids[3]),
+    ):
+        vertex_data.add_edge(start_id, end_id)
+    center = vertex_data.add_vertex(65.0, 35.0)
+    legacy_room = RoomData(
+        name="Legacy partial room",
+        vertex_ids=boundary_ids[:3],
+        center_vertex_id=center.id,
+        color_rgb=(140, 180, 220),
+    )
+
+    parallel_wall_ids: list[str] = []
+    for image_y in (112.5, 87.5):
+        start = vertex_data.add_vertex(0.0, image_y)
+        end = vertex_data.add_vertex(100.0, image_y)
+        vertex_data.add_edge(start.id, end.id)
+        parallel_wall_ids.append(
+            f"level:2/wall:{min(start.id, end.id)}:{max(start.id, end.id)}"
+        )
+    return (
+        LevelData(
+            index=2,
+            name="Mixed room and plain walls",
+            vertex_data=vertex_data,
+            rooms=[legacy_room],
+        ),
+        tuple(parallel_wall_ids),
+    )
+
+
 def _get_wall_midpoint(surface) -> tuple[float, float, float]:
     assert surface.wall_start_world is not None
     assert surface.wall_end_world is not None
     start = np.asarray(surface.wall_start_world, dtype=float)
     end = np.asarray(surface.wall_end_world, dtype=float)
     midpoint = (start + end) / 2.0
-    midpoint[2] = 1.5
+    midpoint[2] = start[2] + 1.5
     return tuple(float(value) for value in midpoint)
 
 
@@ -180,7 +263,7 @@ def _get_wall_ratio_point(
     start = np.asarray(surface.wall_start_world, dtype=float)
     end = np.asarray(surface.wall_end_world, dtype=float)
     point = start + (end - start) * horizontal_ratio
-    point[2] = height_meters
+    point[2] = start[2] + height_meters
     return point
 
 
@@ -413,9 +496,16 @@ class WallWindowGeometryTests(unittest.TestCase):
         wall = _get_window_wall(level)
 
         corners = get_wall_window_world_corners(wall, placement)
+        floor_top = level.floor_thickness_meters
 
-        np.testing.assert_allclose(corners[0], (3.0, -3.0, 1.0))
-        np.testing.assert_allclose(corners[2], (5.0, -3.0, 3.0))
+        np.testing.assert_allclose(
+            corners[0],
+            (3.0, -3.0, floor_top + 1.0),
+        )
+        np.testing.assert_allclose(
+            corners[2],
+            (5.0, -3.0, floor_top + 3.0),
+        )
 
     def test_window_penetrates_50cm_outward_but_no_farther_or_inward(
         self,
@@ -426,8 +516,9 @@ class WallWindowGeometryTests(unittest.TestCase):
         wall_end = np.asarray(wall.wall_end_world, dtype=float)
         first = wall_start + (wall_end - wall_start) * 0.25
         second = wall_start + (wall_end - wall_start) * 0.75
-        first[2] = 0.75
-        second[2] = 2.25
+        floor_top = wall_start[2]
+        first[2] = floor_top + 0.75
+        second[2] = floor_top + 2.25
         placement = build_wall_window_placement(wall, first, second)
 
         add_wall_window([level], placement, window_id="deep-window")
@@ -490,9 +581,11 @@ class WallWindowGeometryTests(unittest.TestCase):
         low_jamb = (target_low + outer_low) / 2.0
         high_jamb = (target_high + outer_high) / 2.0
         sill = (low_jamb + high_jamb) / 2.0
-        sill[2] = 0.75
+        assert target.wall_start_world is not None
+        floor_top = target.wall_start_world[2]
+        sill[2] = floor_top + 0.75
         head = sill.copy()
-        head[2] = 2.25
+        head[2] = floor_top + 2.25
 
         model = convert_to_glb([level])
         reveal_name = next(
@@ -742,6 +835,104 @@ class WallWindowGeometryTests(unittest.TestCase):
             )
         )
 
+    def test_plain_closed_loop_infers_normals_and_outward_window_depth(
+        self,
+    ) -> None:
+        level, parallel_wall_ids = _build_plain_closed_window_depth_level()
+        original_surfaces = {
+            surface.surface_id: surface
+            for surface in build_fixed_surfaces([level])
+        }
+        expected_normals = {
+            "level:2/wall:1:2": (0.0, -1.0, 0.0),
+            "level:2/wall:2:3": (-1.0, 0.0, 0.0),
+            "level:2/wall:3:4": (0.0, 1.0, 0.0),
+            "level:2/wall:1:4": (1.0, 0.0, 0.0),
+        }
+        for surface_id, expected_normal in expected_normals.items():
+            np.testing.assert_allclose(
+                original_surfaces[surface_id].mesh.face_normals,
+                np.tile(expected_normal, (2, 1)),
+                atol=1e-7,
+            )
+
+        target = original_surfaces["level:2/wall:1:2"]
+        wall_start = np.asarray(target.wall_start_world, dtype=float)
+        wall_end = np.asarray(target.wall_end_world, dtype=float)
+        first = wall_start + (wall_end - wall_start) * 0.25
+        second = wall_start + (wall_end - wall_start) * 0.75
+        first[2] = 0.75
+        second[2] = 2.25
+        add_wall_window(
+            [level],
+            build_wall_window_placement(target, first, second),
+            window_id="plain-closed-depth-window",
+        )
+        updated_surfaces = {
+            surface.surface_id: surface
+            for surface in build_fixed_surfaces([level])
+        }
+
+        outward_wall = updated_surfaces[parallel_wall_ids[0]]
+        self.assertFalse(
+            _mesh_covers_point_on_plane(
+                outward_wall.mesh,
+                _get_wall_midpoint(outward_wall),
+                fixed_axis=1,
+            )
+        )
+        inward_wall = updated_surfaces[parallel_wall_ids[1]]
+        self.assertTrue(
+            _mesh_covers_point_on_plane(
+                inward_wall.mesh,
+                _get_wall_midpoint(inward_wall),
+                fixed_axis=1,
+            )
+        )
+
+    def test_mixed_room_plain_loop_keeps_window_depth_outward(self) -> None:
+        level, parallel_wall_ids = _build_mixed_room_plain_window_depth_level()
+        original_surfaces = {
+            surface.surface_id: surface
+            for surface in build_fixed_surfaces([level])
+        }
+        target = original_surfaces["level:2/wall:3:4"]
+        np.testing.assert_allclose(
+            target.mesh.face_normals,
+            np.tile((0.0, 1.0, 0.0), (2, 1)),
+            atol=1e-7,
+        )
+        add_wall_window(
+            [level],
+            build_wall_window_placement(
+                target,
+                _get_wall_ratio_point(target, 0.25, 0.75),
+                _get_wall_ratio_point(target, 0.75, 2.25),
+            ),
+            window_id="mixed-room-plain-window",
+        )
+        updated_surfaces = {
+            surface.surface_id: surface
+            for surface in build_fixed_surfaces([level])
+        }
+
+        outward_wall = updated_surfaces[parallel_wall_ids[0]]
+        self.assertFalse(
+            _mesh_covers_point_on_plane(
+                outward_wall.mesh,
+                _get_wall_midpoint(outward_wall),
+                fixed_axis=1,
+            )
+        )
+        inward_wall = updated_surfaces[parallel_wall_ids[1]]
+        self.assertTrue(
+            _mesh_covers_point_on_plane(
+                inward_wall.mesh,
+                _get_wall_midpoint(inward_wall),
+                fixed_axis=1,
+            )
+        )
+
     def test_deep_window_cut_survives_surface_textures_and_glb_export(
         self,
     ) -> None:
@@ -751,8 +942,9 @@ class WallWindowGeometryTests(unittest.TestCase):
         wall_end = np.asarray(wall.wall_end_world, dtype=float)
         first = wall_start + (wall_end - wall_start) * 0.25
         second = wall_start + (wall_end - wall_start) * 0.75
-        first[2] = 0.75
-        second[2] = 2.25
+        floor_top = wall_start[2]
+        first[2] = floor_top + 0.75
+        second[2] = floor_top + 2.25
         add_wall_window(
             [level],
             build_wall_window_placement(wall, first, second),
@@ -801,7 +993,7 @@ class WallWindowGeometryTests(unittest.TestCase):
                         near_point[0],
                         (near_point[1] + _get_wall_midpoint(target_surface)[1])
                         / 2.0,
-                        0.75,
+                        floor_top + 0.75,
                     )
                 ),
                 2,
@@ -812,7 +1004,7 @@ class WallWindowGeometryTests(unittest.TestCase):
                         near_point[0],
                         (near_point[1] + _get_wall_midpoint(target_surface)[1])
                         / 2.0,
-                        2.25,
+                        floor_top + 2.25,
                     )
                 ),
                 2,

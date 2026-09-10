@@ -54,7 +54,6 @@ def _set_canvas_level(
         vertex_data=level.vertex_data,
         rooms=level.rooms,
         image_path=None,
-        floor_contour_vertex_ids=level.floor_contour_vertex_ids,
         doorways=level.doorways,
     )
     canvas.blueprint_image = QImage(100, 100, QImage.Format.Format_RGB32)

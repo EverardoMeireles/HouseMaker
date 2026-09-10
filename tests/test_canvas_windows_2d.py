@@ -53,7 +53,6 @@ def _build_square_level() -> LevelData:
         name="Ground",
         vertex_data=vertex_data,
         rooms=[room],
-        floor_contour_vertex_ids=boundary_ids,
     )
 
 
@@ -84,7 +83,6 @@ def _build_canvas(level: LevelData) -> BlueprintCanvas:
         vertex_data=level.vertex_data,
         rooms=level.rooms,
         image_path=None,
-        floor_contour_vertex_ids=level.floor_contour_vertex_ids,
         doorways=level.doorways,
         windows=level.windows,
     )

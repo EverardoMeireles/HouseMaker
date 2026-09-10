@@ -247,19 +247,37 @@ class StairGeometryTests(unittest.TestCase):
         supported_mesh = meshes["stair_1_supported"]
         floating_mesh = meshes["stair_2_floating"]
         floating_with_riser_mesh = meshes["stair_3_floating_with_riser"]
+        lower_floor_top = ground_level.floor_thickness_meters
+        upper_floor_top = (
+            lower_floor_top
+            + ground_level.height_meters
+            + upper_level.floor_thickness_meters
+        )
 
-        self.assertAlmostEqual(float(supported_mesh.bounds[0, 2]), 0.0)
-        self.assertGreater(float(floating_mesh.bounds[0, 2]), 0.0)
-        self.assertAlmostEqual(float(supported_mesh.bounds[1, 2]), 3.0)
-        self.assertAlmostEqual(float(floating_mesh.bounds[1, 2]), 3.0)
+        self.assertAlmostEqual(
+            float(supported_mesh.bounds[0, 2]),
+            lower_floor_top,
+        )
+        self.assertGreater(
+            float(floating_mesh.bounds[0, 2]),
+            lower_floor_top,
+        )
+        self.assertAlmostEqual(
+            float(supported_mesh.bounds[1, 2]),
+            upper_floor_top,
+        )
+        self.assertAlmostEqual(
+            float(floating_mesh.bounds[1, 2]),
+            upper_floor_top,
+        )
         self.assertGreater(float(supported_mesh.volume), float(floating_mesh.volume))
         self.assertAlmostEqual(
             float(floating_with_riser_mesh.bounds[1, 2]),
-            3.0,
+            upper_floor_top,
         )
         self.assertGreater(
             float(floating_with_riser_mesh.bounds[0, 2]),
-            0.0,
+            lower_floor_top,
         )
         self.assertGreater(
             float(floating_with_riser_mesh.volume),
@@ -558,7 +576,13 @@ class StairGeometryTests(unittest.TestCase):
             [ground_level, upper_level],
             riser_stair,
         )
-        step_count = math.ceil(3.0 / DEFAULT_STAIR_RISER_HEIGHT_METERS)
+        floor_to_floor_rise = (
+            ground_level.height_meters
+            + upper_level.floor_thickness_meters
+        )
+        step_count = math.ceil(
+            floor_to_floor_rise / DEFAULT_STAIR_RISER_HEIGHT_METERS
+        )
 
         self.assertEqual(
             len(riser_mesh.faces),
@@ -706,8 +730,20 @@ class StairGeometryTests(unittest.TestCase):
         self.assertGreater(len(mesh.faces), 0)
         self.assertTrue(np.all(np.isfinite(mesh.vertices)))
         self.assertTrue(math.isfinite(float(mesh.volume)))
-        self.assertAlmostEqual(float(mesh.bounds[0, 2]), 0.0)
-        self.assertAlmostEqual(float(mesh.bounds[1, 2]), 3.0)
+        lower_floor_top = ground_level.floor_thickness_meters
+        upper_floor_top = (
+            lower_floor_top
+            + ground_level.height_meters
+            + upper_level.floor_thickness_meters
+        )
+        self.assertAlmostEqual(
+            float(mesh.bounds[0, 2]),
+            lower_floor_top,
+        )
+        self.assertAlmostEqual(
+            float(mesh.bounds[1, 2]),
+            upper_floor_top,
+        )
 
     def test_missing_endpoint_level_is_rejected(self) -> None:
         ground_level = _build_level(2, "Ground")

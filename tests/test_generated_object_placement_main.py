@@ -192,8 +192,17 @@ class GeneratedObjectPlacementMainTests(unittest.TestCase):
         ground.image_path = _write_blueprint(directory, "ground-boundary.png")
         story.image_path = _write_blueprint(directory, "story-boundary.png")
         self.workspace.levels = [ground, story]
+        story_floor_top = build_level_base_z_lookup(self.workspace.levels)[
+            story.index
+        ]
+        self.assertAlmostEqual(
+            story_floor_top,
+            ground.floor_thickness_meters
+            + ground.height_meters
+            + story.floor_thickness_meters,
+        )
         self.workspace.viewer.set_first_person_camera_pose(
-            CameraPose(z=ground.height_meters)
+            CameraPose(z=story_floor_top)
         )
 
         self.workspace.generation.placement_requested.emit("floor-boundary")

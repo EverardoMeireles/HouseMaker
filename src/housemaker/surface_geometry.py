@@ -10,7 +10,12 @@ import numpy as np
 import shapely
 import trimesh
 from shapely import LineString, Point, Polygon
+from shapely.geometry.base import BaseGeometry
 
+from housemaker.floor_geometry import (
+    OUTER_ENVELOPE_CLOSING_RADIUS_METERS,
+    build_level_floor_footprint,
+)
 from housemaker.glb import (
     DoorwayReveal,
     WALL_OPENING_EPSILON,
@@ -24,6 +29,7 @@ from housemaker.glb import (
     _interpolate_2d_point,
 )
 from housemaker.level_coordinates import (
+    _get_valid_level_scale,
     build_level_base_z_lookup,
     level_image_to_world_xy,
 )
@@ -39,6 +45,8 @@ SURFACE_TYPES = frozenset(
     (SURFACE_TYPE_WALL, SURFACE_TYPE_FLOOR, SURFACE_TYPE_CEILING)
 )
 SURFACE_GEOMETRY_EPSILON = 1e-8
+# Keep the visible underside distinct from the next level's floor bottom.
+CEILING_FLOOR_CLEARANCE_METERS = 0.001
 MIN_WINDOW_SIZE_METERS = 0.05
 WINDOW_PLANE_DISTANCE_TOLERANCE_METERS = 0.01
 WINDOW_PATCH_COVERAGE_TOLERANCE_METERS = 1e-7
@@ -149,7 +157,10 @@ def build_fixed_surfaces(levels: Sequence[LevelData]) -> list[FixedSurface]:
             )
 
         surfaces.extend(
-            _build_level_residual_horizontal_surfaces(level, base_z_meters)
+            _build_level_residual_horizontal_surfaces(
+                level,
+                base_z_meters,
+            )
         )
 
     return sorted(surfaces, key=_get_surface_sort_key)
@@ -420,7 +431,11 @@ def _build_room_surfaces(
         surface_type=SURFACE_TYPE_CEILING,
         level_index=level.index,
         room_index=room_index,
-        z_meters=base_z_meters + room.height_meters,
+        z_meters=(
+            base_z_meters
+            + room.height_meters
+            - CEILING_FLOOR_CLEARANCE_METERS
+        ),
         normal_points_up=False,
     )
     if floor_surface is not None:
@@ -442,20 +457,28 @@ def _build_plain_level_wall_surfaces(
     room_vertex_sets = [set(room.vertex_ids) for room in level.rooms]
     ignored_vertex_ids = {room.center_vertex_id for room in level.rooms}
     wall_openings = _build_level_wall_openings(level)
-    interior_polygon = _build_level_contour_world_polygon(level)
     vertex_lookup = {vertex.id: vertex for vertex in level.vertex_data.vertices}
+    structural_edges = [
+        edge
+        for edge in sorted(level.vertex_data.edges, key=_get_edge_sort_key)
+        if edge.start_vertex_id not in ignored_vertex_ids
+        and edge.end_vertex_id not in ignored_vertex_ids
+    ]
+    plain_edges = [
+        edge
+        for edge in structural_edges
+        if not any(
+            edge.start_vertex_id in vertex_ids
+            and edge.end_vertex_id in vertex_ids
+            for vertex_ids in room_vertex_sets
+        )
+    ]
+    interior_geometry = _build_closed_wall_interior_geometry(
+        level,
+        structural_edges,
+    )
     surfaces: list[FixedSurface] = []
-    for edge in sorted(level.vertex_data.edges, key=_get_edge_sort_key):
-        if (
-            edge.start_vertex_id in ignored_vertex_ids
-            or edge.end_vertex_id in ignored_vertex_ids
-            or any(
-                edge.start_vertex_id in vertex_ids
-                and edge.end_vertex_id in vertex_ids
-                for vertex_ids in room_vertex_sets
-            )
-        ):
-            continue
+    for edge in plain_edges:
         start_vertex = vertex_lookup.get(edge.start_vertex_id)
         end_vertex = vertex_lookup.get(edge.end_vertex_id)
         if start_vertex is None or end_vertex is None:
@@ -475,7 +498,7 @@ def _build_plain_level_wall_surfaces(
             room_index=None,
             room_identity=None,
             doorway_reveals_by_surface_id=doorway_reveals_by_surface_id,
-            interior_polygon=interior_polygon,
+            interior_polygon=interior_geometry,
             window_reveals_by_surface_id=window_reveals_by_surface_id,
         )
         if surface is not None:
@@ -652,7 +675,7 @@ def _build_wall_surface(
         str,
         Sequence[DoorwayReveal],
     ],
-    interior_polygon: Polygon | None,
+    interior_polygon: BaseGeometry | None,
     window_reveals_by_surface_id: Mapping[str, Sequence[WindowReveal]],
 ) -> FixedSurface | None:
     if (
@@ -810,41 +833,62 @@ def _append_connected_doorway_reveals(
 def _build_level_residual_horizontal_surfaces(
     level: LevelData,
     base_z_meters: float,
-) -> list[FixedSurface]:
-    level_polygon = _build_level_contour_world_polygon(level)
-    if level_polygon is None:
-        return []
+) -> tuple[FixedSurface, ...]:
+    """Build automatic non-room floor and ceiling surfaces from closed walls."""
+
+    level_interior = _build_level_world_floor_footprint(level)
+    if level_interior is None:
+        return ()
+
     room_polygons = [
         polygon
         for room in level.rooms
         if (polygon := _build_room_world_polygon(level, room)) is not None
     ]
-    residual_geometry = level_polygon
+    residual_geometry = level_interior
     if room_polygons:
-        residual_geometry = level_polygon.difference(shapely.union_all(room_polygons))
-    if residual_geometry.is_empty or residual_geometry.area <= SURFACE_GEOMETRY_EPSILON:
-        return []
-    surfaces: list[FixedSurface] = []
-    for surface_type, z_meters, points_up in (
-        (SURFACE_TYPE_FLOOR, base_z_meters, True),
-        (
-            SURFACE_TYPE_CEILING,
-            base_z_meters + level.height_meters,
-            False,
-        ),
-    ):
-        surface = _build_horizontal_surface(
-            polygon=residual_geometry,
-            surface_id=build_horizontal_surface_id(level.index, surface_type),
-            surface_type=surface_type,
-            level_index=level.index,
-            room_index=None,
-            z_meters=z_meters,
-            normal_points_up=points_up,
+        residual_geometry = level_interior.difference(
+            shapely.union_all(room_polygons)
         )
-        if surface is not None:
-            surfaces.append(surface)
-    return surfaces
+    if (
+        residual_geometry.is_empty
+        or residual_geometry.area <= SURFACE_GEOMETRY_EPSILON
+    ):
+        return ()
+
+    floor_surface = _build_horizontal_surface(
+        polygon=residual_geometry,
+        surface_id=build_horizontal_surface_id(
+            level.index,
+            SURFACE_TYPE_FLOOR,
+        ),
+        surface_type=SURFACE_TYPE_FLOOR,
+        level_index=level.index,
+        room_index=None,
+        z_meters=base_z_meters,
+        normal_points_up=True,
+    )
+    ceiling_surface = _build_horizontal_surface(
+        polygon=residual_geometry,
+        surface_id=build_horizontal_surface_id(
+            level.index,
+            SURFACE_TYPE_CEILING,
+        ),
+        surface_type=SURFACE_TYPE_CEILING,
+        level_index=level.index,
+        room_index=None,
+        z_meters=(
+            base_z_meters
+            + level.height_meters
+            - CEILING_FLOOR_CLEARANCE_METERS
+        ),
+        normal_points_up=False,
+    )
+    return tuple(
+        surface
+        for surface in (floor_surface, ceiling_surface)
+        if surface is not None
+    )
 
 
 def _build_horizontal_surface(
@@ -954,20 +998,75 @@ def _build_room_world_polygon(
     return _build_polygon_from_vertices(level, room.vertex_ids, room.center_vertex_id)
 
 
-def _build_level_contour_world_polygon(level: LevelData) -> Polygon | None:
-    return _build_polygon_from_vertices(
-        level,
-        level.floor_contour_vertex_ids,
-        None,
-        preserve_order=True,
+def _build_level_world_floor_footprint(
+    level: LevelData,
+) -> BaseGeometry | None:
+    """Build the shared floor footprint in transformed level coordinates."""
+
+    def point_to_world(
+        image_point: tuple[float, float],
+        _blueprint_size_pixels: tuple[float, float] | None,
+    ) -> np.ndarray:
+        return np.asarray(
+            level_image_to_world_xy(level, *image_point),
+            dtype=float,
+        )
+
+    return build_level_floor_footprint(
+        level=level,
+        blueprint_size_pixels=level.image_size_pixels,
+        point_to_world_xy=point_to_world,
+        closing_radius_meters=(
+            OUTER_ENVELOPE_CLOSING_RADIUS_METERS
+            * _get_valid_level_scale(level)
+        ),
     )
+
+
+def _build_closed_wall_interior_geometry(
+    level: LevelData,
+    edges: Sequence[Edge],
+) -> BaseGeometry | None:
+    """Infer wall-facing interiors from exact closed structural loops."""
+
+    lines: list[LineString] = []
+    for edge in edges:
+        start_vertex = level.vertex_data.get_vertex(edge.start_vertex_id)
+        end_vertex = level.vertex_data.get_vertex(edge.end_vertex_id)
+        if start_vertex is None or end_vertex is None:
+            continue
+        lines.append(
+            LineString(
+                (
+                    level_image_to_world_xy(
+                        level,
+                        start_vertex.x,
+                        start_vertex.y,
+                    ),
+                    level_image_to_world_xy(
+                        level,
+                        end_vertex.x,
+                        end_vertex.y,
+                    ),
+                )
+            )
+        )
+
+    polygons = [
+        candidate
+        for candidate in shapely.get_parts(shapely.polygonize(lines))
+        if isinstance(candidate, Polygon)
+        and candidate.area > SURFACE_GEOMETRY_EPSILON
+    ]
+    if not polygons:
+        return None
+    return shapely.union_all(polygons)
 
 
 def _build_polygon_from_vertices(
     level: LevelData,
     vertex_ids: Sequence[int],
     center_vertex_id: int | None,
-    preserve_order: bool = False,
 ) -> Polygon | None:
     vertices = [
         vertex
@@ -977,15 +1076,14 @@ def _build_polygon_from_vertices(
     ]
     if len(vertices) < 3:
         return None
-    if not preserve_order:
-        center_x = sum(vertex.x for vertex in vertices) / len(vertices)
-        center_y = sum(vertex.y for vertex in vertices) / len(vertices)
-        vertices.sort(
-            key=lambda vertex: math.atan2(
-                vertex.y - center_y,
-                vertex.x - center_x,
-            )
+    center_x = sum(vertex.x for vertex in vertices) / len(vertices)
+    center_y = sum(vertex.y for vertex in vertices) / len(vertices)
+    vertices.sort(
+        key=lambda vertex: math.atan2(
+            vertex.y - center_y,
+            vertex.x - center_x,
         )
+    )
     polygon = Polygon(
         [level_image_to_world_xy(level, vertex.x, vertex.y) for vertex in vertices]
     )
@@ -1077,7 +1175,7 @@ def _append_quad(
 
 def _quad_front_points_outside_polygon(
     corners: Sequence[tuple[float, float, float]],
-    interior_polygon: Polygon | None,
+    interior_polygon: BaseGeometry | None,
 ) -> bool:
     """Return whether one planar quad must flip to face its local interior."""
 

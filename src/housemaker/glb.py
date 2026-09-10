@@ -16,6 +16,7 @@ import shapely
 import trimesh
 from PIL import Image
 from shapely import Point, Polygon
+from shapely.geometry.base import BaseGeometry
 from PySide6.QtCore import QByteArray, QBuffer, QIODevice, QRectF, Qt
 from PySide6.QtGui import (
     QColor,
@@ -35,6 +36,7 @@ from housemaker.doorway_geometry import (
 from housemaker.floor_geometry import build_level_floor_mesh
 from housemaker.level_coordinates import (
     build_level_base_z_lookup,
+    build_level_floor_base_z_lookup,
     level_image_to_world_xy,
 )
 from housemaker.models import (
@@ -42,7 +44,6 @@ from housemaker.models import (
     DEFAULT_DOORWAY_BOTTOM_HEIGHT_METERS,
     DEFAULT_DOORWAY_SHAPE,
     DEFAULT_LEVEL_HEIGHT_METERS,
-    GROUND_LEVEL_INDEX,
     STAIR_STYLE_FLOATING,
     STAIR_STYLE_FLOATING_WITH_RISER,
     STAIR_STYLE_SUPPORTED,
@@ -566,6 +567,7 @@ def _build_blueprint_model(
     serialize_glb: bool,
     export_untextured_surfaces: bool,
 ) -> GeneratedModel:
+    fixed_surfaces: Sequence[object] | None = None
     if isinstance(level_source, VertexData):
         if stairs:
             raise ValueError("Stairs require level data with endpoint levels.")
@@ -578,10 +580,19 @@ def _build_blueprint_model(
         )
         named_meshes = _build_named_meshes_for_single_level(wall_meshes)
     else:
+        from housemaker.surface_geometry import build_fixed_surfaces
+
         named_meshes = _build_multi_level_meshes(
             level_source,
             blueprint_size_pixels=blueprint_size_pixels,
             stairs=stairs,
+        )
+        fixed_surfaces = build_fixed_surfaces(level_source)
+        named_meshes.extend(
+            _build_untextured_ceiling_named_meshes(
+                level_source,
+                fixed_surfaces,
+            )
         )
         preview_textured_walls = _build_preview_textured_walls(
             level_source,
@@ -617,7 +628,37 @@ def _build_blueprint_model(
         ),
         serialize_glb=serialize_glb,
         export_untextured_surfaces=export_untextured_surfaces,
+        fixed_surfaces=fixed_surfaces,
     )
+
+
+def _build_untextured_ceiling_named_meshes(
+    levels: Sequence[LevelData],
+    fixed_surfaces: Sequence[object],
+) -> list[NamedMesh]:
+    """Build one opaque ceiling underside from each level's pick surfaces."""
+
+    ceiling_meshes_by_level: dict[int, list[trimesh.Trimesh]] = {}
+    for surface in fixed_surfaces:
+        if getattr(surface, "surface_type", None) != "ceiling":
+            continue
+        level_index = int(getattr(surface, "level_index"))
+        ceiling_meshes_by_level.setdefault(level_index, []).append(
+            getattr(surface, "mesh").copy()
+        )
+
+    named_meshes: list[NamedMesh] = []
+    for level in sorted(levels, key=lambda item: item.index):
+        ceiling_meshes = ceiling_meshes_by_level.get(level.index, [])
+        if not ceiling_meshes:
+            continue
+        named_meshes.append(
+            NamedMesh(
+                name=_get_level_ceiling_object_name(level),
+                mesh=_combine_mesh_geometry(ceiling_meshes),
+            )
+        )
+    return named_meshes
 
 
 # ### Placed generated-model composition ###
@@ -2506,6 +2547,7 @@ def _apply_surface_materials(
     surface_texture_world_size_meters: float,
     serialize_glb: bool,
     export_untextured_surfaces: bool,
+    fixed_surfaces: Sequence[object] | None = None,
 ) -> GeneratedModel:
     """Replace assigned faces and optionally omit unassigned export surfaces."""
 
@@ -2516,7 +2558,6 @@ def _apply_surface_materials(
             "Surface materials require level data with stable surface IDs."
         )
 
-    from housemaker.surface_geometry import build_fixed_surfaces
     from housemaker.surface_materials import (
         build_world_planar_textured_mesh,
         normalize_texture_world_size,
@@ -2524,7 +2565,10 @@ def _apply_surface_materials(
     )
 
     levels = list(level_source)
-    fixed_surfaces = build_fixed_surfaces(levels)
+    if fixed_surfaces is None:
+        from housemaker.surface_geometry import build_fixed_surfaces
+
+        fixed_surfaces = build_fixed_surfaces(levels)
     base_surfaces = list(fixed_surfaces)
     known_surface_ids = {surface.surface_id for surface in fixed_surfaces}
     live_sources = {
@@ -2571,13 +2615,19 @@ def _apply_surface_materials(
         for surface in base_surfaces
         if surface.surface_id in replacement_surface_ids
     ]
-    level_by_index = {level.index: level for level in levels}
+    floor_mesh_level_indices = {
+        level.index
+        for level in levels
+        if any(
+            named_mesh.name == _get_level_floor_object_name(level)
+            for named_mesh in named_meshes
+        )
+    }
     partitioned_floor_levels = {
         surface.level_index
         for surface in replacement_surfaces
         if surface.surface_type == "floor"
-        and level_by_index.get(surface.level_index) is not None
-        and level_by_index[surface.level_index].floor_contour_vertex_ids
+        and surface.level_index in floor_mesh_level_indices
     }
     untextured_partition_surfaces = [
         surface
@@ -3288,6 +3338,10 @@ def _build_multi_level_meshes(
 
     sorted_levels = sorted(levels, key=lambda level: level.index)
     level_lookup = {level.index: level for level in sorted_levels}
+    floor_base_z_by_level_index = build_level_floor_base_z_lookup(
+        sorted_levels
+    )
+    base_z_by_level_index = build_level_base_z_lookup(sorted_levels)
     named_meshes: list[NamedMesh] = []
 
     for level in sorted_levels:
@@ -3296,16 +3350,11 @@ def _build_multi_level_meshes(
 
         if not math.isfinite(level.height_meters) or level.height_meters <= 0.0:
             raise ValueError(f"Level {level.index} height must be greater than zero.")
-        if (
-            not math.isfinite(level.floor_thickness_meters)
-            or level.floor_thickness_meters <= 0.0
-        ):
-            raise ValueError(
-                f"Level {level.index} floor thickness must be greater than zero."
-            )
+        _get_valid_level_floor_thickness(level)
         level_named_meshes = _build_named_meshes_for_level(
             level=level,
-            level_lookup=level_lookup,
+            floor_base_z_meters=floor_base_z_by_level_index[level.index],
+            base_z_meters=base_z_by_level_index[level.index],
             blueprint_size_pixels=blueprint_size_pixels,
         )
         if not level_named_meshes:
@@ -3352,10 +3401,10 @@ def _filter_stairs_for_export(
 
 def _build_named_meshes_for_level(
     level: LevelData,
-    level_lookup: dict[int, LevelData],
+    floor_base_z_meters: float,
+    base_z_meters: float,
     blueprint_size_pixels: tuple[float, float] | None,
 ) -> list[NamedMesh]:
-    base_z_meters = _get_level_base_z(level_lookup, level.index)
     level_blueprint_size = level.image_size_pixels or blueprint_size_pixels
     level_source_transform = _build_level_source_transform(
         level,
@@ -3365,7 +3414,7 @@ def _build_named_meshes_for_level(
     named_meshes: list[NamedMesh] = []
     floor_mesh = build_level_floor_mesh(
         level=level,
-        floor_surface_z_meters=base_z_meters,
+        floor_base_z_meters=floor_base_z_meters,
         blueprint_size_pixels=level_blueprint_size,
         point_to_world_xy=_point_to_world_xy,
     )
@@ -4156,14 +4205,22 @@ def _build_window_wall_target_lookup(
     room_vertex_sets = _get_room_vertex_sets(level.rooms)
     ignored_vertex_ids = _get_room_center_vertex_ids(level.rooms)
     vertex_lookup = {vertex.id: vertex for vertex in level.vertex_data.vertices}
-    level_contour = _build_level_image_contour_polygon(level)
-    for edge in level.vertex_data.edges:
-        if (
-            edge.start_vertex_id in ignored_vertex_ids
-            or edge.end_vertex_id in ignored_vertex_ids
-            or _is_edge_inside_any_room(edge, room_vertex_sets)
-        ):
-            continue
+    structural_edges = [
+        edge
+        for edge in level.vertex_data.edges
+        if edge.start_vertex_id not in ignored_vertex_ids
+        and edge.end_vertex_id not in ignored_vertex_ids
+    ]
+    plain_edges = [
+        edge
+        for edge in structural_edges
+        if not _is_edge_inside_any_room(edge, room_vertex_sets)
+    ]
+    level_interior = _build_closed_wall_image_interior(
+        level,
+        structural_edges,
+    )
+    for edge in plain_edges:
         start_vertex = vertex_lookup.get(edge.start_vertex_id)
         end_vertex = vertex_lookup.get(edge.end_vertex_id)
         if start_vertex is None or end_vertex is None:
@@ -4180,10 +4237,10 @@ def _build_window_wall_target_lookup(
             height_meters=level.height_meters,
             wall_key=wall_key,
             surface_id=surface_id,
-            exterior_direction=_get_wall_exterior_from_contour(
+            exterior_direction=_get_wall_exterior_from_interior(
                 (start_vertex.x, start_vertex.y),
                 (end_vertex.x, end_vertex.y),
-                level_contour,
+                level_interior,
             ),
         )
     return targets
@@ -4235,31 +4292,44 @@ def _get_wall_right_normal(
     return delta_y / length, -delta_x / length
 
 
-def _build_level_image_contour_polygon(level: LevelData) -> Polygon | None:
-    points: list[tuple[float, float]] = []
-    for vertex_id in level.floor_contour_vertex_ids:
-        vertex = level.vertex_data.get_vertex(vertex_id)
-        if vertex is not None:
-            points.append((vertex.x, vertex.y))
-    if len(points) < 3:
+def _build_closed_wall_image_interior(
+    level: LevelData,
+    edges: Sequence[Edge],
+) -> BaseGeometry | None:
+    """Infer the interior of every closed structural wall loop."""
+
+    lines = []
+    for edge in edges:
+        start_vertex = level.vertex_data.get_vertex(edge.start_vertex_id)
+        end_vertex = level.vertex_data.get_vertex(edge.end_vertex_id)
+        if start_vertex is None or end_vertex is None:
+            continue
+        lines.append(
+            shapely.LineString(
+                (
+                    (start_vertex.x, start_vertex.y),
+                    (end_vertex.x, end_vertex.y),
+                )
+            )
+        )
+
+    polygons = [
+        candidate
+        for candidate in shapely.get_parts(shapely.polygonize(lines))
+        if isinstance(candidate, Polygon)
+        and candidate.area > WALL_OPENING_EPSILON
+    ]
+    if not polygons:
         return None
-    polygon = Polygon(points)
-    if not polygon.is_valid:
-        repaired = polygon.buffer(0)
-        if not isinstance(repaired, Polygon):
-            return None
-        polygon = repaired
-    if polygon.area <= WALL_OPENING_EPSILON:
-        return None
-    return polygon
+    return shapely.union_all(polygons)
 
 
-def _get_wall_exterior_from_contour(
+def _get_wall_exterior_from_interior(
     start_point: tuple[float, float],
     end_point: tuple[float, float],
-    contour: Polygon | None,
+    interior: BaseGeometry | None,
 ) -> tuple[float, float] | None:
-    if contour is None or contour.is_empty:
+    if interior is None or interior.is_empty:
         return None
     right_normal = _get_wall_right_normal(start_point, end_point)
     if right_normal is None:
@@ -4275,13 +4345,13 @@ def _get_wall_exterior_from_contour(
             WALL_OPENING_EPSILON * 10.0,
             wall_length * probe_ratio,
         )
-        right_is_inside = contour.contains(
+        right_is_inside = interior.contains(
             Point(
                 midpoint[0] + right_normal[0] * probe_distance,
                 midpoint[1] + right_normal[1] * probe_distance,
             )
         )
-        left_is_inside = contour.contains(
+        left_is_inside = interior.contains(
             Point(
                 midpoint[0] + left_normal[0] * probe_distance,
                 midpoint[1] + left_normal[1] * probe_distance,
@@ -5850,7 +5920,7 @@ def _build_preview_textured_walls(
     blueprint_size_pixels: tuple[float, float] | None,
 ) -> list[PreviewTexturedWall]:
     sorted_levels = sorted(levels, key=lambda level: level.index)
-    level_lookup = {level.index: level for level in sorted_levels}
+    base_z_by_level_index = build_level_base_z_lookup(sorted_levels)
     preview_walls: list[PreviewTexturedWall] = []
 
     for level in sorted_levels:
@@ -5861,7 +5931,7 @@ def _build_preview_textured_walls(
         preview_walls.extend(
             _build_level_preview_textured_walls(
                 level=level,
-                base_z_meters=_get_level_base_z(level_lookup, level.index),
+                base_z_meters=base_z_by_level_index[level.index],
                 blueprint_size_pixels=level_blueprint_size,
                 source_transform=_build_level_source_transform(
                     level,
@@ -6036,6 +6106,25 @@ def _get_valid_level_scale(level: LevelData) -> float:
     return scale
 
 
+def _get_valid_level_floor_thickness(level: LevelData) -> float:
+    raw_thickness = level.floor_thickness_meters
+    if isinstance(raw_thickness, bool):
+        raise ValueError(
+            f"Level {level.index} floor thickness must be greater than zero."
+        )
+    try:
+        thickness_meters = float(raw_thickness)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            f"Level {level.index} floor thickness must be greater than zero."
+        ) from error
+    if not math.isfinite(thickness_meters) or thickness_meters <= 0.0:
+        raise ValueError(
+            f"Level {level.index} floor thickness must be greater than zero."
+        )
+    return thickness_meters
+
+
 def _get_valid_level_offset(level: LevelData, axis: str) -> float:
     raw_offset = getattr(level, f"offset_{axis}_meters")
     if isinstance(raw_offset, bool):
@@ -6106,30 +6195,16 @@ def _transform_source_point(
 
 
 # ### Level helpers ###
-def _get_level_base_z(
-    level_lookup: dict[int, LevelData],
-    level_index: int,
-) -> float:
-    if level_index >= GROUND_LEVEL_INDEX:
-        return sum(
-            level_lookup[index].height_meters
-            for index in range(GROUND_LEVEL_INDEX, level_index)
-            if index in level_lookup
-        )
-
-    return -sum(
-        level_lookup[index].height_meters
-        for index in range(level_index, GROUND_LEVEL_INDEX)
-        if index in level_lookup
-    )
-
-
 def _get_level_object_name(level: LevelData) -> str:
     return level.display_name.lower().replace(" ", "_")
 
 
 def _get_level_floor_object_name(level: LevelData) -> str:
     return f"{_get_level_object_name(level)}_floor"
+
+
+def _get_level_ceiling_object_name(level: LevelData) -> str:
+    return f"{_get_level_object_name(level)}_ceiling"
 
 
 def _get_level_doorway_reveal_object_name(level: LevelData) -> str:

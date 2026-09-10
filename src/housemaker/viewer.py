@@ -54,7 +54,6 @@ from housemaker.canvas_openings import (
     CanvasOpeningTarget,
 )
 from housemaker.canvas_surface_edits import (
-    CANVAS_SURFACE_EDIT_FLOOR_THICKNESS,
     CANVAS_SURFACE_EDIT_WALL_VERTEX,
     CanvasSurfaceEdit,
     CanvasSurfaceEditHandleTarget,
@@ -7182,13 +7181,7 @@ def _build_canvas_surface_edit_outline_positions(
     ):
         return positions
     preview_positions = np.asarray(positions, dtype=float).copy()
-    preview_distance = drag.preview_delta_meters
-    if (
-        drag.target.reference.kind
-        == CANVAS_SURFACE_EDIT_FLOOR_THICKNESS
-    ):
-        preview_distance += drag.target.baseline_value_meters
-    offset = drag.axis * preview_distance
+    offset = drag.axis * drag.preview_delta_meters
     if drag.target.reference.kind != CANVAS_SURFACE_EDIT_WALL_VERTEX:
         return preview_positions + offset[np.newaxis, :]
 

@@ -17,6 +17,7 @@ from housemaker.level_coordinates import (
     level_world_to_image_xy,
 )
 from housemaker.models import (
+    DEFAULT_FLOOR_THICKNESS_METERS,
     DOORWAY_SHAPE_ARCH,
     DoorwayData,
     LevelData,
@@ -92,12 +93,13 @@ class LevelCoordinateTests(unittest.TestCase):
         levels[3].height_meters = 4.0
 
         base_z = build_level_base_z_lookup(levels)
+        thickness = DEFAULT_FLOOR_THICKNESS_METERS
 
-        self.assertEqual(base_z[0], -4.5)
-        self.assertEqual(base_z[1], -2.5)
-        self.assertEqual(base_z[2], 0.0)
-        self.assertEqual(base_z[3], 3.0)
-        self.assertEqual(base_z[4], 7.0)
+        self.assertAlmostEqual(base_z[0], -4.5 - thickness)
+        self.assertAlmostEqual(base_z[1], -2.5)
+        self.assertAlmostEqual(base_z[2], thickness)
+        self.assertAlmostEqual(base_z[3], 3.0 + 2.0 * thickness)
+        self.assertAlmostEqual(base_z[4], 7.0 + 3.0 * thickness)
 
     def test_doorway_outline_matches_scaled_level_xy_and_unscaled_height(
         self,
@@ -132,13 +134,18 @@ class LevelCoordinateTests(unittest.TestCase):
         self.assertEqual(positions.shape, (24, 3))
         unique_positions = np.unique(positions, axis=0)
         self.assertEqual(unique_positions.shape, (8, 3))
+        upper_floor_top = (
+            ground_level.floor_thickness_meters
+            + ground_level.height_meters
+            + upper_level.floor_thickness_meters
+        )
         np.testing.assert_allclose(
             np.min(unique_positions, axis=0),
-            (2.8, -4.8, 3.0),
+            (2.8, -4.8, upper_floor_top),
         )
         np.testing.assert_allclose(
             np.max(unique_positions, axis=0),
-            (3.2, -3.2, 5.2),
+            (3.2, -3.2, upper_floor_top + doorway.height_meters),
         )
         edge_lengths = np.linalg.norm(
             positions[0::2] - positions[1::2],
@@ -172,12 +179,13 @@ class LevelCoordinateTests(unittest.TestCase):
             doorway.shape,
             arch_amount=doorway.arch_amount,
         )
+        floor_top = level.floor_thickness_meters
         negative_depth_profile = tuple(
-            (-0.1, -width_offset, height_offset)
+            (-0.1, -width_offset, floor_top + height_offset)
             for width_offset, height_offset in cross_section
         )
         positive_depth_profile = tuple(
-            (0.1, -width_offset, height_offset)
+            (0.1, -width_offset, floor_top + height_offset)
             for width_offset, height_offset in cross_section
         )
         expected_positions: list[tuple[float, float, float]] = []
@@ -201,10 +209,10 @@ class LevelCoordinateTests(unittest.TestCase):
         )
         self.assertGreater(positions.shape[0], 24)
         np.testing.assert_allclose(positions, expected_positions, atol=1e-12)
-        self.assertAlmostEqual(float(np.min(positions[:, 2])), 0.0)
+        self.assertAlmostEqual(float(np.min(positions[:, 2])), floor_top)
         self.assertAlmostEqual(
             float(np.max(positions[:, 2])),
-            doorway.height_meters,
+            floor_top + doorway.height_meters,
         )
 
     def test_arch_amount_changes_smooth_curve_but_preserves_bounds(
@@ -258,7 +266,10 @@ class LevelCoordinateTests(unittest.TestCase):
             self.assertEqual(positions.shape[0] % 2, 0)
             profile = _get_first_depth_face_profile(positions)
             self.assertAlmostEqual(float(np.ptp(profile[:, 1])), 0.8)
-            self.assertAlmostEqual(float(np.max(profile[:, 2])), 2.2)
+            self.assertAlmostEqual(
+                float(np.max(profile[:, 2])),
+                level.floor_thickness_meters + 2.2,
+            )
 
         shallow_profile = _get_first_depth_face_profile(shallow_positions)
         full_profile = _get_first_depth_face_profile(full_positions)

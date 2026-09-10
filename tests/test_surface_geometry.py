@@ -58,7 +58,6 @@ def _build_square_level(*, doorway: bool = False, with_room: bool = True) -> Lev
         vertex_data=vertex_data,
         rooms=rooms,
         doorways=doorways,
-        floor_contour_vertex_ids=boundary_ids,
     )
 
 
@@ -103,8 +102,61 @@ def _build_concave_u_level(
         name="Ground",
         vertex_data=vertex_data,
         rooms=rooms,
-        floor_contour_vertex_ids=boundary_ids,
     )
+
+
+def _build_partially_room_owned_square_level() -> LevelData:
+    """Build one legacy room that owns only half of an outer wall loop."""
+
+    vertex_data = VertexData()
+    boundary_ids = tuple(
+        vertex_data.add_vertex(*point).id
+        for point in (
+            (0.0, 0.0),
+            (100.0, 0.0),
+            (100.0, 100.0),
+            (0.0, 100.0),
+        )
+    )
+    for start_id, end_id in (
+        (boundary_ids[0], boundary_ids[1]),
+        (boundary_ids[1], boundary_ids[2]),
+        (boundary_ids[3], boundary_ids[2]),
+        (boundary_ids[0], boundary_ids[3]),
+    ):
+        vertex_data.add_edge(start_id, end_id)
+    center = vertex_data.add_vertex(65.0, 35.0)
+    legacy_room = RoomData(
+        name="Legacy partial room",
+        vertex_ids=boundary_ids[:3],
+        center_vertex_id=center.id,
+        color_rgb=(140, 180, 220),
+    )
+    return LevelData(
+        index=2,
+        name="Ground",
+        vertex_data=vertex_data,
+        rooms=[legacy_room],
+    )
+
+
+def _build_level_from_segments(
+    segments: tuple[
+        tuple[tuple[float, float], tuple[float, float]],
+        ...,
+    ],
+) -> LevelData:
+    vertex_data = VertexData()
+    vertex_by_point = {}
+    for start_point, end_point in segments:
+        for point in (start_point, end_point):
+            if point not in vertex_by_point:
+                vertex_by_point[point] = vertex_data.add_vertex(*point)
+        vertex_data.add_edge(
+            vertex_by_point[start_point].id,
+            vertex_by_point[end_point].id,
+        )
+    return LevelData(index=2, name="Ground", vertex_data=vertex_data)
 
 
 def _surface_by_id(level: LevelData) -> dict[str, object]:
@@ -193,55 +245,105 @@ class FixedSurfaceGeometryTests(unittest.TestCase):
             12.0,
         )
 
-    def test_level_contour_fallback_exposes_floor_ceiling_and_plain_walls(self) -> None:
+    def test_plain_closed_wall_loop_exposes_walls_floor_and_ceiling(
+        self,
+    ) -> None:
         surfaces = build_fixed_surfaces(
             [_build_square_level(with_room=False)]
         )
 
         self.assertEqual(len(surfaces), 6)
-        self.assertIn("level:2/floor", {item.surface_id for item in surfaces})
-        self.assertIn("level:2/ceiling", {item.surface_id for item in surfaces})
         self.assertEqual(
             sum(item.surface_type == SURFACE_TYPE_WALL for item in surfaces),
             4,
         )
+        self.assertIn("level:2/floor", {item.surface_id for item in surfaces})
+        self.assertIn("level:2/ceiling", {item.surface_id for item in surfaces})
         floor = next(
             item for item in surfaces if item.surface_type == SURFACE_TYPE_FLOOR
         )
         ceiling = next(
-            item for item in surfaces if item.surface_type == SURFACE_TYPE_CEILING
+            item
+            for item in surfaces
+            if item.surface_type == SURFACE_TYPE_CEILING
         )
+        self.assertAlmostEqual(floor.area_square_meters, 4.0)
+        self.assertAlmostEqual(ceiling.area_square_meters, 4.0)
         self.assertTrue(np.all(floor.mesh.face_normals[:, 2] > 0.0))
         self.assertTrue(np.all(ceiling.mesh.face_normals[:, 2] < 0.0))
+        self.assertEqual(
+            {
+                surface.surface_id
+                for surface in surfaces
+                if surface.surface_type == SURFACE_TYPE_WALL
+            },
+            {
+                "level:2/wall:1:2",
+                "level:2/wall:1:4",
+                "level:2/wall:2:3",
+                "level:2/wall:3:4",
+            },
+        )
 
-    def test_level_contour_residual_outside_rooms_is_selectable_without_overlap(
+    def test_gapped_outer_walls_share_one_floor_and_ceiling_footprint(
         self,
     ) -> None:
-        level = _build_square_level()
-        outer_ids = tuple(
-            level.vertex_data.add_vertex(*point).id
-            for point in (
-                (-50.0, -50.0),
-                (150.0, -50.0),
-                (150.0, 150.0),
-                (-50.0, 150.0),
+        level = _build_level_from_segments(
+            (
+                ((0.0, 0.0), (210.0, 0.0)),
+                ((250.0, 0.0), (500.0, 0.0)),
+                ((500.0, 0.0), (500.0, 170.0)),
+                ((500.0, 200.0), (500.0, 400.0)),
+                ((500.0, 400.0), (320.0, 400.0)),
+                ((270.0, 400.0), (0.0, 400.0)),
+                ((0.0, 400.0), (0.0, 260.0)),
+                ((0.0, 220.0), (0.0, 0.0)),
+                ((300.0, 80.0), (380.0, 80.0)),
+                ((380.0, 80.0), (380.0, 140.0)),
+                ((380.0, 140.0), (300.0, 140.0)),
+                ((300.0, 140.0), (300.0, 80.0)),
             )
         )
-        level.floor_contour_vertex_ids = outer_ids
 
         surfaces = build_fixed_surfaces([level])
-        floor_surfaces = [
-            surface
+        horizontal_surfaces = {
+            surface.surface_type: surface
             for surface in surfaces
-            if surface.surface_type == SURFACE_TYPE_FLOOR
-        ]
+            if surface.surface_type in (
+                SURFACE_TYPE_FLOOR,
+                SURFACE_TYPE_CEILING,
+            )
+        }
 
-        self.assertEqual(len(floor_surfaces), 2)
-        self.assertIn("level:2/floor", {item.surface_id for item in floor_surfaces})
-        self.assertAlmostEqual(
-            sum(surface.area_square_meters for surface in floor_surfaces),
-            16.0,
+        self.assertEqual(
+            set(horizontal_surfaces),
+            {SURFACE_TYPE_FLOOR, SURFACE_TYPE_CEILING},
         )
+        for surface in horizontal_surfaces.values():
+            self.assertAlmostEqual(surface.area_square_meters, 80.0)
+            np.testing.assert_allclose(
+                surface.mesh.bounds[:, :2],
+                np.asarray(((0.0, -8.0), (10.0, 0.0))),
+                atol=1e-9,
+            )
+
+    def test_mixed_room_and_reversed_plain_edges_share_inferred_interior(
+        self,
+    ) -> None:
+        surfaces = _surface_by_id(_build_partially_room_owned_square_level())
+
+        self.assertIn("level:2/room:5/wall:1:2", surfaces)
+        self.assertIn("level:2/room:5/wall:2:3", surfaces)
+        expected_plain_normals = {
+            "level:2/wall:3:4": (0.0, 1.0, 0.0),
+            "level:2/wall:1:4": (1.0, 0.0, 0.0),
+        }
+        for surface_id, expected_normal in expected_plain_normals.items():
+            np.testing.assert_allclose(
+                surfaces[surface_id].mesh.face_normals,  # type: ignore[attr-defined]
+                np.tile(expected_normal, (2, 1)),
+                atol=1e-7,
+            )
 
     def test_level_scale_and_offsets_are_reflected_in_surface_geometry(self) -> None:
         level = _build_square_level()
@@ -257,7 +359,12 @@ class FixedSurfaceGeometryTests(unittest.TestCase):
         self.assertAlmostEqual(floor.area_square_meters, 16.0)
         np.testing.assert_allclose(
             floor.mesh.bounds,
-            np.asarray(((0.25, -3.75, 0.0), (4.25, 0.25, 0.0))),
+            np.asarray(
+                (
+                    (0.25, -3.75, level.floor_thickness_meters),
+                    (4.25, 0.25, level.floor_thickness_meters),
+                )
+            ),
         )
 
     def test_concave_room_wall_normals_point_locally_into_the_room(self) -> None:

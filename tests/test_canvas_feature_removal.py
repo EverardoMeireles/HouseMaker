@@ -47,6 +47,11 @@ class CanvasFeatureRemovalTests(unittest.TestCase):
         self.assertNotIn("Blueprint scale", general_labels)
         self.assertNotIn("Blueprint X offset", general_labels)
         self.assertNotIn("Blueprint Y offset", general_labels)
+        self.assertIn("Floor thickness", general_labels)
+        self.assertFalse(
+            any(text.startswith("Floor contour:") for text in general_labels)
+        )
+        self.assertTrue(hasattr(workspace, "floor_thickness_spinbox"))
 
         for removed_attribute in (
             "first_person_camera_status_label",
@@ -61,6 +66,13 @@ class CanvasFeatureRemovalTests(unittest.TestCase):
             "image_scale_spinbox",
             "image_x_offset_spinbox",
             "image_y_offset_spinbox",
+            "floor_contour_status_label",
+            "set_floor_contour_button",
+            "clear_floor_contour_button",
+            "_handle_set_floor_contour_clicked",
+            "_handle_clear_floor_contour_clicked",
+            "_handle_floor_contour_changed",
+            "_update_floor_contour_status_label",
         ):
             with self.subTest(removed_attribute=removed_attribute):
                 self.assertFalse(hasattr(workspace, removed_attribute))
@@ -97,6 +109,12 @@ class CanvasFeatureRemovalTests(unittest.TestCase):
             "clear_first_person_camera",
             "initial_first_person_camera",
             "first_person_camera_changed",
+            "floor_contour_vertex_ids",
+            "pending_floor_contour_vertex_ids",
+            "pending_floor_contour_preview_point",
+            "floor_contour_changed",
+            "start_floor_contour_designation",
+            "clear_floor_contour",
         ):
             with self.subTest(removed_attribute=removed_attribute):
                 self.assertFalse(hasattr(canvas, removed_attribute))

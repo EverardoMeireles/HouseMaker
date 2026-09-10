@@ -285,7 +285,6 @@ def _architectural_surface_model() -> tuple[GeneratedModel, tuple[str, ...]]:
         name="Ground",
         vertex_data=vertex_data,
         rooms=[room],
-        floor_contour_vertex_ids=boundary_ids,
     )
     selected_ids = tuple(
         next(
