@@ -2506,6 +2506,13 @@ class GlbViewerWidget(QWidget):
         self._selected_projection_camera_id: str | None = None
         self._doorway_preview_outline_positions: np.ndarray | None = None
         self._doorway_preview_outline_item: gl.GLLinePlotItem | None = None
+        self._level_transform_preview_level_index: int | None = None
+        self._level_transform_preview_source_positions: np.ndarray | None = None
+        self._level_transform_preview_delta_matrix: np.ndarray | None = None
+        self._level_transform_preview_outline_positions: np.ndarray | None = None
+        self._level_transform_preview_outline_item: (
+            _DepthTestedOverlayLineItem | None
+        ) = None
         self._ambient_light_intensity = DEFAULT_AMBIENT_LIGHT_INTENSITY
         self._textures_enabled = bool(textures_enabled)
         self._wireframe_enabled = bool(wireframe_enabled)
@@ -2665,6 +2672,64 @@ class GlbViewerWidget(QWidget):
             _normalize_doorway_preview_outline_positions(positions)
         )
         self._refresh_doorway_preview_outline_item()
+
+    # ### Level transform preview API ###
+    def set_level_transform_preview(
+        self,
+        level_index: int,
+        delta_matrix: object,
+    ) -> None:
+        """Preview one level through a delta in world-space Z-up coordinates."""
+
+        if isinstance(level_index, bool) or not isinstance(level_index, int):
+            raise TypeError(
+                "A level transform preview requires an integer level index."
+            )
+        normalized_delta = _normalize_level_transform_preview_delta(
+            delta_matrix
+        )
+        preview_was_active = self._level_transform_preview_level_index is not None
+        self._level_transform_preview_delta_matrix = normalized_delta
+        if level_index != self._level_transform_preview_level_index:
+            self._level_transform_preview_level_index = level_index
+            self._level_transform_preview_source_positions = None
+            self._rebuild_level_transform_preview_source_positions()
+        else:
+            self._update_level_transform_preview_outline_positions()
+        if not preview_was_active:
+            self.cancel_window_placement(status_message=None)
+            self.cancel_surface_vertex_placement()
+            self._cancel_canvas_opening_edit_drag()
+            self._cancel_canvas_surface_edit_drag()
+            self._cancel_canvas_face_extrusion_drag()
+            self._cancel_placed_object_gizmo_drag()
+            self._refresh_canvas_opening_gizmo_items()
+            self._refresh_canvas_surface_edit_gizmo_items()
+            self._refresh_canvas_face_extrusion_gizmo_items()
+            self._sync_placed_object_selection_rendering()
+            self._sync_window_tools_controls()
+            self._sync_surface_tools_controls()
+
+    def clear_level_transform_preview(
+        self,
+        *,
+        restore_canvas_tools: bool = True,
+    ) -> None:
+        """Clear the transient level-transform geometry and its cached source."""
+
+        preview_was_active = self._level_transform_preview_level_index is not None
+        self._level_transform_preview_level_index = None
+        self._level_transform_preview_source_positions = None
+        self._level_transform_preview_delta_matrix = None
+        self._level_transform_preview_outline_positions = None
+        self._remove_level_transform_preview_outline_item()
+        if preview_was_active and restore_canvas_tools:
+            self._refresh_canvas_opening_gizmo_items()
+            self._refresh_canvas_surface_edit_gizmo_items()
+            self._refresh_canvas_face_extrusion_gizmo_items()
+            self._sync_placed_object_selection_rendering()
+            self._sync_window_tools_controls()
+            self._sync_surface_tools_controls()
 
     # ### Viewer UI ###
     @Slot()
@@ -2906,6 +2971,7 @@ class GlbViewerWidget(QWidget):
         self._refresh_canvas_surface_drawing_items()
         self._refresh_canvas_surface_edit_gizmo_items()
         self._refresh_canvas_face_extrusion_gizmo_items()
+        self._rebuild_level_transform_preview_source_positions()
         if self._selected_canvas_surface_ids != previous_canvas_surface_ids:
             self.canvas_surface_selection_changed.emit(
                 self._selected_canvas_surface_ids
@@ -4250,6 +4316,88 @@ class GlbViewerWidget(QWidget):
                 self.view.removeItem(item)
         self._canvas_surface_selection_items = []
 
+    # ### Level transform preview rendering ###
+    def _rebuild_level_transform_preview_source_positions(self) -> None:
+        """Rebuild cached source boundaries after Canvas targets change."""
+
+        level_index = self._level_transform_preview_level_index
+        if level_index is None:
+            return
+        level_boundaries = tuple(
+            positions
+            for surface in self._canvas_surface_targets.values()
+            if surface.level_index == level_index
+            if (
+                positions := _build_fixed_surface_boundary_line_positions(
+                    surface
+                )
+            )
+            is not None
+        )
+        self._level_transform_preview_source_positions = (
+            None
+            if not level_boundaries
+            else np.ascontiguousarray(
+                np.vstack(level_boundaries),
+                dtype=float,
+            )
+        )
+        self._update_level_transform_preview_outline_positions()
+
+    def _update_level_transform_preview_outline_positions(self) -> None:
+        """Apply the retained world-space delta to cached source boundaries."""
+
+        source_positions = self._level_transform_preview_source_positions
+        delta_matrix = self._level_transform_preview_delta_matrix
+        if source_positions is None or delta_matrix is None:
+            self._level_transform_preview_outline_positions = None
+        else:
+            self._level_transform_preview_outline_positions = (
+                _transform_level_preview_outline_positions(
+                    source_positions,
+                    delta_matrix,
+                )
+            )
+        self._refresh_level_transform_preview_outline_item()
+
+    def _refresh_level_transform_preview_outline_item(self) -> None:
+        """Render one depth-tested yellow outline for the pending transform."""
+
+        positions = self._level_transform_preview_outline_positions
+        if positions is None:
+            self._remove_level_transform_preview_outline_item()
+            return
+
+        item = self._level_transform_preview_outline_item
+        if item is not None and item in self.view.items:
+            item.setData(pos=positions)
+            self.view.update()
+            return
+
+        self._remove_level_transform_preview_outline_item()
+        item = _DepthTestedOverlayLineItem(
+            pos=positions,
+            color=CANVAS_SURFACE_SELECTION_COLOR,
+            width=4.0,
+            antialias=True,
+            mode="lines",
+        )
+        item.setGLOptions("translucent")
+        item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE)
+        self._level_transform_preview_outline_item = item
+        self.view.addItem(item)
+        self.view.update()
+
+    def _remove_level_transform_preview_outline_item(self) -> None:
+        """Remove the retained transform preview without discarding its data."""
+
+        item = self._level_transform_preview_outline_item
+        self._level_transform_preview_outline_item = None
+        if item is not None and item in self.view.items:
+            self.view.removeItem(item)
+        if hasattr(self, "view"):
+            self.view.update()
+
     def _refresh_canvas_extrudable_face_outlines(self) -> None:
         """Mark only unselected authored faces that can actually extrude."""
 
@@ -4412,6 +4560,14 @@ class GlbViewerWidget(QWidget):
 
     # ### Canvas window editor controls ###
     def _sync_window_tools_controls(self) -> None:
+        if self._level_transform_preview_level_index is not None:
+            if self.add_window_button is not None:
+                self.add_window_button.setEnabled(False)
+            self._sync_window_undo_button()
+            self._set_window_tools_status(
+                "Window editing resumes after the level transform is applied."
+            )
+            return
         selected = self._get_selected_window_wall() is not None
         if self.add_window_button is not None:
             self.add_window_button.setEnabled(selected)
@@ -4447,6 +4603,13 @@ class GlbViewerWidget(QWidget):
     def _sync_surface_tools_controls(self) -> None:
         """Update insertion availability and explain extrusion readiness."""
 
+        if self._level_transform_preview_level_index is not None:
+            if self.add_surface_vertex_button is not None:
+                self.add_surface_vertex_button.setEnabled(False)
+            self._set_surface_tools_status(
+                "Surface editing resumes after the level transform is applied."
+            )
+            return
         has_surfaces = bool(self._canvas_surface_targets)
         if self.add_surface_vertex_button is not None:
             self.add_surface_vertex_button.setEnabled(has_surfaces)
@@ -5825,6 +5988,7 @@ class GlbViewerWidget(QWidget):
             self._refresh_canvas_surface_drawing_items()
             self._refresh_canvas_surface_edit_gizmo_items()
             self._refresh_canvas_face_extrusion_gizmo_items()
+            self._refresh_level_transform_preview_outline_item()
             self._refresh_doorway_preview_outline_item()
             return
 
@@ -5920,6 +6084,7 @@ class GlbViewerWidget(QWidget):
         self._refresh_canvas_surface_edit_gizmo_items()
         self._refresh_canvas_face_extrusion_gizmo_items()
         self._sync_placed_object_selection_rendering()
+        self._refresh_level_transform_preview_outline_item()
         self._refresh_doorway_preview_outline_item()
         self.view.update()
 
@@ -6121,6 +6286,10 @@ class GlbViewerWidget(QWidget):
         """Draw one selected outline, four side handles, and its anchor."""
 
         self._remove_canvas_opening_gizmo_items()
+        if self._level_transform_preview_level_index is not None:
+            if hasattr(self, "view"):
+                self.view.update()
+            return
         target = self._get_selected_canvas_opening_target()
         drag = self._canvas_opening_edit_drag
         if (
@@ -6448,6 +6617,10 @@ class GlbViewerWidget(QWidget):
         """Draw selected-wall outlines and depth-free structural handles."""
 
         self._remove_canvas_surface_edit_gizmo_items()
+        if self._level_transform_preview_level_index is not None:
+            if hasattr(self, "view"):
+                self.view.update()
+            return
         targets = self._get_active_canvas_surface_edit_targets()
         if not hasattr(self, "view"):
             return
@@ -6962,6 +7135,12 @@ class GlbViewerWidget(QWidget):
         """Draw one normal handle for a valid logical-face selection."""
 
         self._remove_canvas_face_extrusion_gizmo_items()
+        if self._level_transform_preview_level_index is not None:
+            self._canvas_face_extrusion_target = None
+            self._sync_surface_tools_controls()
+            if hasattr(self, "view"):
+                self.view.update()
+            return
         if not hasattr(self, "view"):
             self._canvas_face_extrusion_target = None
             return
@@ -7230,6 +7409,17 @@ class GlbViewerWidget(QWidget):
         for object_id, group in self._placed_object_render_groups.items():
             group.selection_item.setVisible(object_id == selected_id)
         self._remove_transform_gizmo_items()
+        if (
+            selected_id is not None
+            and self._level_transform_preview_level_index is not None
+        ):
+            if self.object_transform_status_label is not None:
+                self.object_transform_status_label.setText(
+                    "Object editing resumes after the level transform is applied."
+                )
+            if hasattr(self, "view"):
+                self.view.update()
+            return
         if selected_id is None:
             if self.object_transform_status_label is not None:
                 self.object_transform_status_label.setText(
@@ -7788,6 +7978,7 @@ class GlbViewerWidget(QWidget):
         self._canvas_extrudable_face_outline_items = []
         self._atlas_surface_highlight_items = []
         self._window_preview_item = None
+        self._level_transform_preview_outline_item = None
         self._doorway_preview_outline_item = None
 
     def _release_textured_mesh_gl_resources(self) -> None:
@@ -8330,6 +8521,57 @@ def _triangles_intersect_screen_rectangle(
                > np.max(rectangle_projection, axis=1) + 1e-7)
         )
     return ~separated
+
+
+# ### Level transform preview helpers ###
+def _normalize_level_transform_preview_delta(delta_matrix: object) -> np.ndarray:
+    """Own one finite affine transform used against world-space boundaries."""
+
+    try:
+        matrix = np.asarray(delta_matrix, dtype=float)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            "A level transform preview requires a numeric 4 by 4 delta matrix."
+        ) from error
+    if matrix.shape != (4, 4):
+        raise ValueError(
+            "A level transform preview requires a 4 by 4 delta matrix."
+        )
+    if not np.all(np.isfinite(matrix)):
+        raise ValueError("A level transform preview delta must be finite.")
+    if not np.allclose(
+        matrix[3],
+        np.asarray((0.0, 0.0, 0.0, 1.0), dtype=float),
+    ):
+        raise ValueError("A level transform preview delta must be affine.")
+    return np.ascontiguousarray(matrix, dtype=float).copy()
+
+
+def _transform_level_preview_outline_positions(
+    positions: object,
+    delta_matrix: object,
+) -> np.ndarray:
+    """Apply an affine world-space delta to paired XYZ line positions."""
+
+    source_positions = np.asarray(positions, dtype=float)
+    matrix = _normalize_level_transform_preview_delta(delta_matrix)
+    if source_positions.ndim != 2 or source_positions.shape[1:] != (3,):
+        raise ValueError(
+            "Level transform preview positions must be shaped (N, 3)."
+        )
+    if not np.all(np.isfinite(source_positions)):
+        raise ValueError("Level transform preview positions must be finite.")
+    homogeneous_positions = np.column_stack(
+        (
+            source_positions,
+            np.ones(len(source_positions), dtype=float),
+        )
+    )
+    transformed_positions = homogeneous_positions @ matrix.T
+    return np.ascontiguousarray(
+        transformed_positions[:, :3],
+        dtype=np.float32,
+    )
 
 
 # ### Doorway preview helpers ###

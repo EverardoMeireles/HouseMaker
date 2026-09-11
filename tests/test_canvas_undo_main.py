@@ -654,10 +654,11 @@ class CanvasUndoMainTests(unittest.TestCase):
         original_y_offset = self.level.offset_y_meters
         original_height = self.level.height_meters
         self._finish_delayed_surface_edit(target, 0.2)
-        self.workspace._commit_pending_canvas_surface_mesh_update()
         wall_edited_vertices = self.level.vertex_data.clone()
+        self.assertTrue(self.workspace._pending_canvas_surface_mesh_update)
 
         self.workspace._handle_level_scale_changed(original_scale + 0.5)
+        self.assertFalse(self.workspace._pending_canvas_surface_mesh_update)
         self.workspace._handle_level_x_offset_changed(original_x_offset + 2.0)
         self.workspace._handle_level_y_offset_changed(original_y_offset - 3.0)
         self.workspace._handle_height_level_changed(original_height + 1.0)
@@ -667,14 +668,8 @@ class CanvasUndoMainTests(unittest.TestCase):
         self.assertEqual(self.level.vertex_data, wall_edited_vertices)
 
         _send_undo_to_viewer(self.workspace)
-        self.assertEqual(self.level.offset_y_meters, original_y_offset)
-        self.assertEqual(self.level.vertex_data, wall_edited_vertices)
-
-        _send_undo_to_viewer(self.workspace)
         self.assertEqual(self.level.offset_x_meters, original_x_offset)
-        self.assertEqual(self.level.vertex_data, wall_edited_vertices)
-
-        _send_undo_to_viewer(self.workspace)
+        self.assertEqual(self.level.offset_y_meters, original_y_offset)
         self.assertEqual(self.level.scale, original_scale)
         self.assertEqual(self.level.vertex_data, wall_edited_vertices)
 

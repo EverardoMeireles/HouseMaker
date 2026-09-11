@@ -168,6 +168,9 @@ class ObjectPlacementDialog(QDialog):
             rooms=level.rooms,
             image_path=level.image_path,
             doorways=level.doorways,
+            canvas_level_scale=level.canvas_level_scale,
+            canvas_offset_x_pixels=level.canvas_offset_x_pixels,
+            canvas_offset_y_pixels=level.canvas_offset_y_pixels,
         )
         if self.canvas.blueprint_image is None:
             self.status_label.setText(

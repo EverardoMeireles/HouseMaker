@@ -448,35 +448,58 @@ class LevelControlsTests(unittest.TestCase):
         workspace.close()
 
     def test_level_scale_control_updates_only_the_selected_level(self) -> None:
-        from housemaker.main import BlueprintWorkspace
+        from housemaker.main import (
+            LEVEL_SCALE_SLIDER_FACTOR,
+            BlueprintWorkspace,
+        )
 
         workspace = BlueprintWorkspace()
         _qt_widgets.append(workspace)
-        self.assertAlmostEqual(workspace.level_scale_spinbox.value(), 1.0)
-        workspace.level_scale_spinbox.setValue(1.75)
+        self.assertAlmostEqual(
+            workspace.level_scale_slider.value()
+            / LEVEL_SCALE_SLIDER_FACTOR,
+            1.0,
+        )
+        workspace.level_scale_slider.setValue(
+            round(1.75 * LEVEL_SCALE_SLIDER_FACTOR)
+        )
         _qt_application.processEvents()
 
+        self.assertAlmostEqual(workspace.current_level.scale, 1.0)
+        workspace._commit_pending_level_transform_update()
         self.assertAlmostEqual(workspace.current_level.scale, 1.75)
         self.assertAlmostEqual(workspace.levels[1].scale, DEFAULT_LEVEL_SCALE)
 
     def test_level_offset_controls_update_only_the_selected_level(self) -> None:
-        from housemaker.main import BlueprintWorkspace
+        from housemaker.main import (
+            LEVEL_OFFSET_SLIDER_FACTOR,
+            BlueprintWorkspace,
+        )
 
         workspace = BlueprintWorkspace()
         _qt_widgets.append(workspace)
         self.assertAlmostEqual(
-            workspace.level_x_offset_spinbox.value(),
+            workspace.level_x_offset_slider.value()
+            / LEVEL_OFFSET_SLIDER_FACTOR,
             DEFAULT_LEVEL_OFFSET_METERS,
         )
         self.assertAlmostEqual(
-            workspace.level_y_offset_spinbox.value(),
+            workspace.level_y_offset_slider.value()
+            / LEVEL_OFFSET_SLIDER_FACTOR,
             DEFAULT_LEVEL_OFFSET_METERS,
         )
 
-        workspace.level_x_offset_spinbox.setValue(1.25)
-        workspace.level_y_offset_spinbox.setValue(-0.75)
+        workspace.level_x_offset_slider.setValue(
+            round(1.25 * LEVEL_OFFSET_SLIDER_FACTOR)
+        )
+        workspace.level_y_offset_slider.setValue(
+            round(-0.75 * LEVEL_OFFSET_SLIDER_FACTOR)
+        )
         _qt_application.processEvents()
 
+        self.assertAlmostEqual(workspace.current_level.offset_x_meters, 0.0)
+        self.assertAlmostEqual(workspace.current_level.offset_y_meters, 0.0)
+        workspace._commit_pending_level_transform_update()
         self.assertAlmostEqual(workspace.current_level.offset_x_meters, 1.25)
         self.assertAlmostEqual(workspace.current_level.offset_y_meters, -0.75)
         self.assertAlmostEqual(
@@ -492,10 +515,15 @@ class LevelControlsTests(unittest.TestCase):
             workspace._level_list_row_for_position(1)
         )
         _qt_application.processEvents()
-        workspace.level_x_offset_spinbox.setValue(-2.0)
-        workspace.level_y_offset_spinbox.setValue(3.5)
+        workspace.level_x_offset_slider.setValue(
+            round(-2.0 * LEVEL_OFFSET_SLIDER_FACTOR)
+        )
+        workspace.level_y_offset_slider.setValue(
+            round(3.5 * LEVEL_OFFSET_SLIDER_FACTOR)
+        )
         _qt_application.processEvents()
 
+        workspace._commit_pending_level_transform_update()
         self.assertAlmostEqual(workspace.levels[1].offset_x_meters, -2.0)
         self.assertAlmostEqual(workspace.levels[1].offset_y_meters, 3.5)
         self.assertAlmostEqual(workspace.levels[2].offset_x_meters, 1.25)
@@ -582,7 +610,7 @@ class LevelControlsTests(unittest.TestCase):
                 Qt.BrushStyle.NoBrush,
             )
 
-    def test_level_controls_place_floor_thickness_after_height(
+    def test_transform_groups_are_below_floor_thickness(
         self,
     ) -> None:
         from housemaker.main import BlueprintWorkspace
@@ -596,9 +624,8 @@ class LevelControlsTests(unittest.TestCase):
         controls = (
             workspace.height_level_spinbox,
             workspace.floor_thickness_spinbox,
-            workspace.level_scale_spinbox,
-            workspace.level_x_offset_spinbox,
-            workspace.level_y_offset_spinbox,
+            workspace.level_transform_group,
+            workspace.canvas_transform_group,
         )
         top_positions = [
             control.mapTo(workspace, QPoint()).y()
@@ -641,7 +668,7 @@ class LevelControlsTests(unittest.TestCase):
 
         workspace.close()
 
-    def test_wheel_over_generals_spinboxes_scrolls_without_changing_values(
+    def test_wheel_over_general_inputs_scrolls_without_changing_values(
         self,
     ) -> None:
         from housemaker.main import BlueprintWorkspace
@@ -660,9 +687,12 @@ class LevelControlsTests(unittest.TestCase):
         controls = (
             ("height", workspace.height_level_spinbox),
             ("floor thickness", workspace.floor_thickness_spinbox),
-            ("level scale", workspace.level_scale_spinbox),
-            ("level X offset", workspace.level_x_offset_spinbox),
-            ("level Y offset", workspace.level_y_offset_spinbox),
+            ("level scale", workspace.level_scale_slider),
+            ("level X offset", workspace.level_x_offset_slider),
+            ("level Y offset", workspace.level_y_offset_slider),
+            ("Canvas level scale", workspace.canvas_level_scale_slider),
+            ("Canvas X offset", workspace.canvas_x_offset_slider),
+            ("Canvas Y offset", workspace.canvas_y_offset_slider),
         )
         for control_name, control in controls:
             with self.subTest(control=control_name):
@@ -673,16 +703,16 @@ class LevelControlsTests(unittest.TestCase):
                 _send_wheel_event(control, angle_delta_y=-120)
                 _qt_application.processEvents()
 
-                self.assertAlmostEqual(control.value(), original_value)
+                self.assertEqual(control.value(), original_value)
                 self.assertGreater(scroll_bar.value(), 0)
 
         scroll_bar.setValue(0)
-        level_scale_value = workspace.level_scale_spinbox.value()
-        _send_wheel_event(workspace.level_scale_spinbox.lineEdit(), -120)
+        height_value = workspace.height_level_spinbox.value()
+        _send_wheel_event(workspace.height_level_spinbox.lineEdit(), -120)
         _qt_application.processEvents()
         self.assertAlmostEqual(
-            workspace.level_scale_spinbox.value(),
-            level_scale_value,
+            workspace.height_level_spinbox.value(),
+            height_value,
         )
         self.assertGreater(scroll_bar.value(), 0)
 

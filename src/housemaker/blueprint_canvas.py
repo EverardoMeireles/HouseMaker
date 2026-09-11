@@ -27,11 +27,14 @@ from housemaker.camera_models import CameraPose
 from housemaker.level_coordinates import level_world_to_image_xy
 from housemaker.models import (
     DEFAULT_CANVAS_LEVEL_SCALE,
+    DEFAULT_CANVAS_OFFSET_PIXELS,
     DEFAULT_DOORWAY_DEPTH_METERS,
     DEFAULT_STAIR_STYLE,
     DOORWAY_SHAPE_ARCH,
     MAX_CANVAS_LEVEL_SCALE,
+    MAX_CANVAS_OFFSET_PIXELS,
     MIN_CANVAS_LEVEL_SCALE,
+    MIN_CANVAS_OFFSET_PIXELS,
     PIXEL_TO_METER,
     STAIR_STYLE_FLOATING,
     STAIR_STYLE_FLOATING_WITH_RISER,
@@ -137,6 +140,8 @@ class CanvasLevelComparisonOverlay:
     level_index: int
     level_name: str
     canvas_level_scale: float
+    canvas_offset_x_pixels: float
+    canvas_offset_y_pixels: float
     blueprint_image: QImage
     vertex_data: VertexData
     rooms: tuple[RoomData, ...]
@@ -356,6 +361,8 @@ class BlueprintCanvas(QWidget):
         self.blueprint_path: str | None = None
         self._blueprint_image_revision: tuple[object, ...] | None = None
         self.canvas_level_scale = DEFAULT_CANVAS_LEVEL_SCALE
+        self.canvas_offset_x_pixels = DEFAULT_CANVAS_OFFSET_PIXELS
+        self.canvas_offset_y_pixels = DEFAULT_CANVAS_OFFSET_PIXELS
         self._level_comparison_overlay: (
             CanvasLevelComparisonOverlay | None
         ) = None
@@ -446,6 +453,8 @@ class BlueprintCanvas(QWidget):
         windows: list[WindowData] | None = None,
         open_spaces: list[OpenSpaceData] | None = None,
         canvas_level_scale: float = DEFAULT_CANVAS_LEVEL_SCALE,
+        canvas_offset_x_pixels: float = DEFAULT_CANVAS_OFFSET_PIXELS,
+        canvas_offset_y_pixels: float = DEFAULT_CANVAS_OFFSET_PIXELS,
     ) -> None:
         revision_before = _build_blueprint_image_revision(file_path)
         image = _load_qimage_from_path(file_path)
@@ -459,6 +468,8 @@ class BlueprintCanvas(QWidget):
             windows=windows,
             open_spaces=open_spaces,
             canvas_level_scale=canvas_level_scale,
+            canvas_offset_x_pixels=canvas_offset_x_pixels,
+            canvas_offset_y_pixels=canvas_offset_y_pixels,
             blueprint_revision=(
                 revision_after
                 if revision_before == revision_after
@@ -479,6 +490,8 @@ class BlueprintCanvas(QWidget):
             windows=self.windows,
             open_spaces=self.open_spaces,
             canvas_level_scale=self.canvas_level_scale,
+            canvas_offset_x_pixels=self.canvas_offset_x_pixels,
+            canvas_offset_y_pixels=self.canvas_offset_y_pixels,
         )
 
     def set_level_data(
@@ -490,6 +503,8 @@ class BlueprintCanvas(QWidget):
         windows: list[WindowData] | None = None,
         open_spaces: list[OpenSpaceData] | None = None,
         canvas_level_scale: float = DEFAULT_CANVAS_LEVEL_SCALE,
+        canvas_offset_x_pixels: float = DEFAULT_CANVAS_OFFSET_PIXELS,
+        canvas_offset_y_pixels: float = DEFAULT_CANVAS_OFFSET_PIXELS,
     ) -> None:
         blueprint_image: QImage | None = None
         blueprint_revision = (
@@ -521,6 +536,8 @@ class BlueprintCanvas(QWidget):
             windows=windows,
             open_spaces=open_spaces,
             canvas_level_scale=canvas_level_scale,
+            canvas_offset_x_pixels=canvas_offset_x_pixels,
+            canvas_offset_y_pixels=canvas_offset_y_pixels,
             blueprint_revision=blueprint_revision,
         )
 
@@ -549,6 +566,25 @@ class BlueprintCanvas(QWidget):
         self.update()
         return True
 
+    def set_canvas_level_offsets(
+        self,
+        offset_x_pixels: float,
+        offset_y_pixels: float,
+    ) -> bool:
+        """Translate the editable plan without changing its 3D coordinates."""
+
+        normalized_x = _normalize_canvas_offset_pixels(offset_x_pixels)
+        normalized_y = _normalize_canvas_offset_pixels(offset_y_pixels)
+        if math.isclose(normalized_x, self.canvas_offset_x_pixels) and math.isclose(
+            normalized_y,
+            self.canvas_offset_y_pixels,
+        ):
+            return False
+        self.canvas_offset_x_pixels = normalized_x
+        self.canvas_offset_y_pixels = normalized_y
+        self.update()
+        return True
+
     def set_level_comparison_overlay(self, level: LevelData | None) -> bool:
         """Show an immutable adjacent-level plan over the current plan."""
 
@@ -566,6 +602,12 @@ class BlueprintCanvas(QWidget):
             level_name=str(level.name),
             canvas_level_scale=_normalize_canvas_level_scale(
                 level.canvas_level_scale
+            ),
+            canvas_offset_x_pixels=_normalize_canvas_offset_pixels(
+                level.canvas_offset_x_pixels
+            ),
+            canvas_offset_y_pixels=_normalize_canvas_offset_pixels(
+                level.canvas_offset_y_pixels
             ),
             blueprint_image=blueprint_image,
             vertex_data=level.vertex_data.clone(),
@@ -937,6 +979,8 @@ class BlueprintCanvas(QWidget):
         windows: list[WindowData] | None,
         open_spaces: list[OpenSpaceData] | None,
         canvas_level_scale: float,
+        canvas_offset_x_pixels: float,
+        canvas_offset_y_pixels: float,
         blueprint_revision: tuple[object, ...] | None,
     ) -> None:
         self.blueprint_image = blueprint_image
@@ -949,6 +993,12 @@ class BlueprintCanvas(QWidget):
         self.open_spaces = open_spaces if open_spaces is not None else []
         self.canvas_level_scale = _normalize_canvas_level_scale(
             canvas_level_scale
+        )
+        self.canvas_offset_x_pixels = _normalize_canvas_offset_pixels(
+            canvas_offset_x_pixels
+        )
+        self.canvas_offset_y_pixels = _normalize_canvas_offset_pixels(
+            canvas_offset_y_pixels
         )
         self._level_comparison_overlay = None
         self.active_vertex_id = None
@@ -3061,7 +3111,7 @@ class BlueprintCanvas(QWidget):
         )
 
         self.zoom_scale = new_zoom_scale
-        self.view_offset = new_center - base_rect.center()
+        self.view_offset = new_center - self._zoomed_base_rect_center(base_rect)
         self.update()
 
     def _start_panning(self, widget_point: QPointF) -> None:
@@ -3397,7 +3447,12 @@ class BlueprintCanvas(QWidget):
         if self.blueprint_image is None:
             return base_rect
 
-        center = base_rect.center() + self.view_offset
+        return self._apply_view_transform_to_base_rect(base_rect)
+
+    def _apply_view_transform_to_base_rect(self, base_rect: QRectF) -> QRectF:
+        """Apply the shared Canvas zoom and pan to one level's base rectangle."""
+
+        center = self._zoomed_base_rect_center(base_rect) + self.view_offset
         display_width = base_rect.width() * self.zoom_scale
         display_height = base_rect.height() * self.zoom_scale
         return QRectF(
@@ -3407,6 +3462,18 @@ class BlueprintCanvas(QWidget):
             display_height,
         )
 
+    def _zoomed_base_rect_center(self, base_rect: QRectF) -> QPointF:
+        """Scale one level's Canvas offset around the shared viewport center."""
+
+        viewport_center = self._available_image_rect().center()
+        base_center = base_rect.center()
+        return QPointF(
+            viewport_center.x()
+            + (base_center.x() - viewport_center.x()) * self.zoom_scale,
+            viewport_center.y()
+            + (base_center.y() - viewport_center.y()) * self.zoom_scale,
+        )
+
     def _base_image_display_rect(self) -> QRectF:
         if self.blueprint_image is None:
             return QRectF()
@@ -3414,21 +3481,20 @@ class BlueprintCanvas(QWidget):
         return self._base_display_rect_for_image(
             self.blueprint_image,
             self.canvas_level_scale,
+            self.canvas_offset_x_pixels,
+            self.canvas_offset_y_pixels,
         )
 
     def _base_display_rect_for_image(
         self,
         image: QImage,
         canvas_level_scale: float,
+        canvas_offset_x_pixels: float = DEFAULT_CANVAS_OFFSET_PIXELS,
+        canvas_offset_y_pixels: float = DEFAULT_CANVAS_OFFSET_PIXELS,
     ) -> QRectF:
         """Fit and Canvas-scale one plan around the shared viewport center."""
 
-        available_rect = QRectF(
-            IMAGE_MARGIN,
-            IMAGE_MARGIN,
-            max(1.0, self.width() - IMAGE_MARGIN * 2.0),
-            max(1.0, self.height() - IMAGE_MARGIN * 2.0),
-        )
+        available_rect = self._available_image_rect()
 
         image_width = float(image.width())
         image_height = float(image.height())
@@ -3439,10 +3505,23 @@ class BlueprintCanvas(QWidget):
 
         display_width = image_width * scale * canvas_level_scale
         display_height = image_height * scale * canvas_level_scale
-        display_center = available_rect.center()
+        display_center = available_rect.center() + QPointF(
+            _normalize_canvas_offset_pixels(canvas_offset_x_pixels),
+            _normalize_canvas_offset_pixels(canvas_offset_y_pixels),
+        )
         display_x = display_center.x() - display_width / 2.0
         display_y = display_center.y() - display_height / 2.0
         return QRectF(display_x, display_y, display_width, display_height)
+
+    def _available_image_rect(self) -> QRectF:
+        """Return the shared viewport used to fit every level blueprint."""
+
+        return QRectF(
+            IMAGE_MARGIN,
+            IMAGE_MARGIN,
+            max(1.0, self.width() - IMAGE_MARGIN * 2.0),
+            max(1.0, self.height() - IMAGE_MARGIN * 2.0),
+        )
 
     def _widget_to_image(self, widget_point: QPointF) -> QPointF | None:
         if self.blueprint_image is None:
@@ -3605,16 +3684,10 @@ class BlueprintCanvas(QWidget):
         base_rect = self._base_display_rect_for_image(
             overlay.blueprint_image,
             overlay.canvas_level_scale,
+            overlay.canvas_offset_x_pixels,
+            overlay.canvas_offset_y_pixels,
         )
-        center = base_rect.center() + self.view_offset
-        display_width = base_rect.width() * self.zoom_scale
-        display_height = base_rect.height() * self.zoom_scale
-        return QRectF(
-            center.x() - display_width / 2.0,
-            center.y() - display_height / 2.0,
-            display_width,
-            display_height,
-        )
+        return self._apply_view_transform_to_base_rect(base_rect)
 
     @staticmethod
     def _build_comparison_window_wall_frames(
@@ -4919,6 +4992,23 @@ def _normalize_canvas_level_scale(raw_scale: object) -> float:
     return min(
         max(scale, MIN_CANVAS_LEVEL_SCALE),
         MAX_CANVAS_LEVEL_SCALE,
+    )
+
+
+def _normalize_canvas_offset_pixels(raw_offset: object) -> float:
+    """Return one finite Canvas-only translation within supported bounds."""
+
+    if isinstance(raw_offset, bool):
+        raise TypeError("Canvas offset must be a number.")
+    try:
+        offset = float(raw_offset)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Canvas offset must be a number.") from error
+    if not math.isfinite(offset):
+        raise ValueError("Canvas offset must be finite.")
+    return min(
+        max(offset, MIN_CANVAS_OFFSET_PIXELS),
+        MAX_CANVAS_OFFSET_PIXELS,
     )
 
 

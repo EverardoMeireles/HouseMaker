@@ -11,6 +11,7 @@ from pathlib import Path
 from housemaker.generation_state import GenerationData
 from housemaker.models import (
     DEFAULT_CANVAS_LEVEL_SCALE,
+    DEFAULT_CANVAS_OFFSET_PIXELS,
     DEFAULT_DOORWAY_ARCH_AMOUNT,
     DEFAULT_DOORWAY_BOTTOM_HEIGHT_METERS,
     DEFAULT_DOORWAY_DEPTH_METERS,
@@ -26,6 +27,7 @@ from housemaker.models import (
     DEFAULT_UV_MAP_WIDTH,
     GROUND_LEVEL_INDEX,
     MAX_CANVAS_LEVEL_SCALE,
+    MAX_CANVAS_OFFSET_PIXELS,
     MAX_DOORWAY_BOTTOM_HEIGHT_METERS,
     MAX_DOORWAY_DEPTH_METERS,
     MAX_DOORWAY_HEIGHT_METERS,
@@ -34,6 +36,7 @@ from housemaker.models import (
     MAX_LEVEL_OFFSET_METERS,
     MAX_LEVEL_SCALE,
     MIN_CANVAS_LEVEL_SCALE,
+    MIN_CANVAS_OFFSET_PIXELS,
     MIN_DOORWAY_BOTTOM_HEIGHT_METERS,
     MIN_DOORWAY_DEPTH_METERS,
     MIN_DOORWAY_HEIGHT_METERS,
@@ -132,6 +135,12 @@ def save_project(
                 "height_meters": level.height_meters,
                 "scale": float(level.scale),
                 "canvas_level_scale": float(level.canvas_level_scale),
+                "canvas_offset_x_pixels": float(
+                    level.canvas_offset_x_pixels
+                ),
+                "canvas_offset_y_pixels": float(
+                    level.canvas_offset_y_pixels
+                ),
                 "offset_x_meters": float(level.offset_x_meters),
                 "offset_y_meters": float(level.offset_y_meters),
                 "floor_thickness_meters": level.floor_thickness_meters,
@@ -196,6 +205,18 @@ def load_project(path: str | Path) -> ProjectData:
             raw_level.get(
                 "canvas_level_scale",
                 DEFAULT_CANVAS_LEVEL_SCALE,
+            )
+        )
+        level.canvas_offset_x_pixels = _deserialize_canvas_offset_pixels(
+            raw_level.get(
+                "canvas_offset_x_pixels",
+                DEFAULT_CANVAS_OFFSET_PIXELS,
+            )
+        )
+        level.canvas_offset_y_pixels = _deserialize_canvas_offset_pixels(
+            raw_level.get(
+                "canvas_offset_y_pixels",
+                DEFAULT_CANVAS_OFFSET_PIXELS,
             )
         )
         level.offset_x_meters = _deserialize_level_offset_meters(
@@ -1030,6 +1051,23 @@ def _deserialize_canvas_level_scale(raw_scale: object) -> float:
     return min(
         max(scale, MIN_CANVAS_LEVEL_SCALE),
         MAX_CANVAS_LEVEL_SCALE,
+    )
+
+
+def _deserialize_canvas_offset_pixels(raw_offset: object) -> float:
+    """Load one finite Canvas-only translation within the UI range."""
+
+    if isinstance(raw_offset, bool):
+        return DEFAULT_CANVAS_OFFSET_PIXELS
+    try:
+        offset = float(raw_offset)
+    except (TypeError, ValueError, OverflowError):
+        return DEFAULT_CANVAS_OFFSET_PIXELS
+    if not math.isfinite(offset):
+        return DEFAULT_CANVAS_OFFSET_PIXELS
+    return min(
+        max(offset, MIN_CANVAS_OFFSET_PIXELS),
+        MAX_CANVAS_OFFSET_PIXELS,
     )
 
 

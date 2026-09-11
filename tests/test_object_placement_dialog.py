@@ -359,6 +359,47 @@ class ObjectPlacementDialogTests(unittest.TestCase):
         self.assertAlmostEqual(placement.image_y, 90.0, delta=0.2)
         self.assertEqual(levels, original_levels)
 
+    def test_selected_level_uses_its_canvas_only_transform(self) -> None:
+        first_image = _write_blueprint(
+            self.directory,
+            "level-two-transform.png",
+            200,
+            100,
+        )
+        second_image = _write_blueprint(
+            self.directory,
+            "level-five-transform.png",
+            300,
+            180,
+        )
+        first_level = _build_level(2, first_image)
+        second_level = _build_level(5, second_image)
+        first_level.canvas_level_scale = 0.75
+        first_level.canvas_offset_x_pixels = -18.0
+        first_level.canvas_offset_y_pixels = 9.0
+        second_level.canvas_level_scale = 1.4
+        second_level.canvas_offset_x_pixels = 42.0
+        second_level.canvas_offset_y_pixels = -27.0
+
+        dialog = self._show_dialog([first_level, second_level])
+
+        self.assertAlmostEqual(dialog.canvas.canvas_level_scale, 0.75)
+        self.assertAlmostEqual(dialog.canvas.canvas_offset_x_pixels, -18.0)
+        self.assertAlmostEqual(dialog.canvas.canvas_offset_y_pixels, 9.0)
+
+        dialog.level_list.setCurrentRow(1)
+        _qt_application.processEvents()
+
+        self.assertAlmostEqual(dialog.canvas.canvas_level_scale, 1.4)
+        self.assertAlmostEqual(dialog.canvas.canvas_offset_x_pixels, 42.0)
+        self.assertAlmostEqual(dialog.canvas.canvas_offset_y_pixels, -27.0)
+        click_position = dialog.canvas._image_to_widget(210.0, 90.0)
+        image_position = dialog.canvas._widget_to_image(click_position)
+        self.assertIsNotNone(image_position)
+        assert image_position is not None
+        self.assertAlmostEqual(image_position.x(), 210.0)
+        self.assertAlmostEqual(image_position.y(), 90.0)
+
     def test_empty_usable_image_list_reports_no_available_levels(self) -> None:
         broken_path = self.directory / "broken-only.png"
         broken_path.write_text("not an image", encoding="utf-8")

@@ -164,7 +164,7 @@ class CanvasLevelScaleWorkspaceTests(unittest.TestCase):
         self,
     ) -> None:
         original_3d_scale = self.workspace.current_level.scale
-        self.workspace._handle_canvas_level_scale_drag_started()
+        self.workspace._handle_canvas_transform_drag_started()
         overlay = self.workspace.canvas.get_level_comparison_overlay()
         self.assertIsNotNone(overlay)
         assert overlay is not None
@@ -185,7 +185,7 @@ class CanvasLevelScaleWorkspaceTests(unittest.TestCase):
         )
         self.assertEqual(self.workspace._canvas_undo_stack, [])
 
-        self.workspace._handle_canvas_level_scale_drag_finished()
+        self.workspace._handle_canvas_transform_drag_finished()
         self.assertIsNone(
             self.workspace.canvas.get_level_comparison_overlay()
         )
@@ -203,14 +203,14 @@ class CanvasLevelScaleWorkspaceTests(unittest.TestCase):
 
     def test_underground_level_compares_with_level_above(self) -> None:
         self.workspace._handle_level_selection_changed(1)
-        self.workspace._handle_canvas_level_scale_drag_started()
+        self.workspace._handle_canvas_transform_drag_started()
 
         overlay = self.workspace.canvas.get_level_comparison_overlay()
         self.assertIsNotNone(overlay)
         assert overlay is not None
         self.assertEqual(overlay.level_index, 2)
 
-        self.workspace._handle_canvas_level_scale_drag_finished()
+        self.workspace._handle_canvas_transform_drag_finished()
 
 
 # ### Project compatibility tests ###

@@ -14,6 +14,9 @@ MAX_LEVEL_SCALE = 20.0
 DEFAULT_CANVAS_LEVEL_SCALE = 1.0
 MIN_CANVAS_LEVEL_SCALE = 0.01
 MAX_CANVAS_LEVEL_SCALE = 20.0
+DEFAULT_CANVAS_OFFSET_PIXELS = 0.0
+MIN_CANVAS_OFFSET_PIXELS = -100000.0
+MAX_CANVAS_OFFSET_PIXELS = 100000.0
 DEFAULT_LEVEL_OFFSET_METERS = 0.0
 MIN_LEVEL_OFFSET_METERS = -10000.0
 MAX_LEVEL_OFFSET_METERS = 10000.0
@@ -1061,6 +1064,8 @@ class LevelData:
     height_meters: float = DEFAULT_LEVEL_HEIGHT_METERS
     scale: float = DEFAULT_LEVEL_SCALE
     canvas_level_scale: float = DEFAULT_CANVAS_LEVEL_SCALE
+    canvas_offset_x_pixels: float = DEFAULT_CANVAS_OFFSET_PIXELS
+    canvas_offset_y_pixels: float = DEFAULT_CANVAS_OFFSET_PIXELS
     offset_x_meters: float = DEFAULT_LEVEL_OFFSET_METERS
     offset_y_meters: float = DEFAULT_LEVEL_OFFSET_METERS
     vertex_data: VertexData = field(default_factory=VertexData)

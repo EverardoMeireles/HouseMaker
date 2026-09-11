@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -116,11 +117,13 @@ from housemaker.glb import (
 from housemaker.level_coordinates import (
     build_doorway_world_outline_positions,
     build_level_base_z_lookup,
+    get_level_world_pivot,
     level_image_to_world_xy,
     level_world_to_image_xy,
 )
 from housemaker.models import (
     DEFAULT_CANVAS_LEVEL_SCALE,
+    DEFAULT_CANVAS_OFFSET_PIXELS,
     DEFAULT_DOORWAY_ARCH_AMOUNT,
     DEFAULT_FLOOR_THICKNESS_METERS,
     DEFAULT_LEVEL_OFFSET_METERS,
@@ -132,12 +135,10 @@ from housemaker.models import (
     MAX_CANVAS_LEVEL_SCALE,
     MAX_DOORWAY_ARCH_AMOUNT,
     MAX_FLOOR_THICKNESS_METERS,
-    MAX_LEVEL_OFFSET_METERS,
     MAX_LEVEL_SCALE,
     MIN_CANVAS_LEVEL_SCALE,
     MIN_DOORWAY_ARCH_AMOUNT,
     MIN_FLOOR_THICKNESS_METERS,
-    MIN_LEVEL_OFFSET_METERS,
     MIN_LEVEL_SCALE,
     STAIR_STYLE_FLOATING,
     STAIR_STYLE_FLOATING_WITH_RISER,
@@ -228,7 +229,14 @@ DELAYED_CANVAS_SURFACE_EDIT_KINDS = frozenset(
 )
 LEVEL_POSITION_ITEM_ROLE = int(Qt.ItemDataRole.UserRole)
 GROUND_LEVEL_BACKGROUND_BLEND = 0.12
+LEVEL_SCALE_SLIDER_FACTOR = 1000
+LEVEL_OFFSET_SLIDER_FACTOR = 100
+LEVEL_OFFSET_SLIDER_MIN_METERS = -100.0
+LEVEL_OFFSET_SLIDER_MAX_METERS = 100.0
 CANVAS_LEVEL_SCALE_SLIDER_FACTOR = 100
+CANVAS_OFFSET_SLIDER_FACTOR = 100
+CANVAS_OFFSET_SLIDER_MIN_PIXELS = -2000.0
+CANVAS_OFFSET_SLIDER_MAX_PIXELS = 2000.0
 
 
 # ### Canvas undo models ###
@@ -275,9 +283,25 @@ class _CanvasLevelPropertiesUndoState:
     height_meters: float
     scale: float
     canvas_level_scale: float
+    canvas_offset_x_pixels: float
+    canvas_offset_y_pixels: float
     offset_x_meters: float
     offset_y_meters: float
     include_in_export: bool
+
+
+@dataclass(frozen=True)
+class _PendingLevelTransform:
+    """One staged level transform waiting for the shared mesh-edit delay."""
+
+    baseline: _CanvasLevelPropertiesUndoState
+    scale: float
+    offset_x_meters: float
+    offset_y_meters: float
+
+    @property
+    def level_index(self) -> int:
+        return self.baseline.level_index
 
 
 @dataclass(frozen=True)
@@ -399,8 +423,11 @@ class BlueprintWorkspace(QWidget):
         self.stairs: list[StairData] = []
         self.current_level_index = GROUND_LEVEL_INDEX
         self._is_syncing_level_controls = False
-        self._canvas_level_scale_drag_active = False
-        self._canvas_level_scale_drag_undo_state: (
+        self._level_transform_drag_active = False
+        self._pending_level_transform: _PendingLevelTransform | None = None
+        self._level_transform_outline_commit_revision: int | None = None
+        self._canvas_transform_drag_active = False
+        self._canvas_transform_drag_undo_state: (
             _CanvasLevelPropertiesUndoState | None
         ) = None
         self._is_viewer_refresh_scheduled = False
@@ -488,6 +515,14 @@ class BlueprintWorkspace(QWidget):
         self._canvas_surface_mesh_update_timer.timeout.connect(
             self._commit_pending_canvas_surface_mesh_update
         )
+        self._level_transform_mesh_update_timer = QTimer(self)
+        self._level_transform_mesh_update_timer.setSingleShot(True)
+        self._level_transform_mesh_update_timer.setInterval(
+            round(self._mesh_edit_update_delay_seconds * 1000.0)
+        )
+        self._level_transform_mesh_update_timer.timeout.connect(
+            self._commit_pending_level_transform_update
+        )
         self._wall_vertex_update_timer = QTimer(self)
         self._wall_vertex_update_timer.setSingleShot(True)
         self._wall_vertex_update_timer.setInterval(
@@ -545,6 +580,11 @@ class BlueprintWorkspace(QWidget):
         if self._is_shutdown:
             return
         self._is_shutdown = True
+        self._is_viewer_refresh_scheduled = False
+        self._cancel_pending_level_transform(
+            sync_controls=False,
+            restore_canvas_tools=False,
+        )
         self._cancel_active_canvas_surface_edit()
         self._cancel_pending_canvas_surface_mesh_update()
         self._cancel_pending_wall_vertex_update()
@@ -567,6 +607,142 @@ class BlueprintWorkspace(QWidget):
         self.shutdown()
         super().closeEvent(event)
 
+    # ### Level transform control builders ###
+    @staticmethod
+    def _build_transform_slider_field(
+        *,
+        minimum: int,
+        maximum: int,
+        value: int,
+        single_step: int,
+        page_step: int,
+        tick_interval: int,
+        value_text: str,
+        tooltip: str,
+        tracking: bool,
+    ) -> tuple[QWidget, QSlider, QLabel]:
+        """Build one horizontal transform bar with a numeric readout."""
+
+        field = QWidget()
+        field_layout = QHBoxLayout(field)
+        field_layout.setContentsMargins(0, 0, 0, 0)
+        field_layout.setSpacing(10)
+
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(minimum, maximum)
+        slider.setSingleStep(single_step)
+        slider.setPageStep(page_step)
+        slider.setTickInterval(tick_interval)
+        slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        slider.setTracking(tracking)
+        slider.setValue(value)
+        slider.setProperty("transformBaseMinimum", minimum)
+        slider.setProperty("transformBaseMaximum", maximum)
+        slider.setMinimumHeight(40)
+        slider.setToolTip(tooltip)
+        field_layout.addWidget(slider, 1)
+
+        value_label = QLabel(value_text)
+        value_label.setMinimumWidth(68)
+        value_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        field_layout.addWidget(value_label)
+        return field, slider, value_label
+
+    @staticmethod
+    def _fit_slider_range_to_value(slider: QSlider, value: int) -> None:
+        """Use the practical base range plus any selected-level outlier."""
+
+        base_minimum = int(slider.property("transformBaseMinimum"))
+        base_maximum = int(slider.property("transformBaseMaximum"))
+        slider.setRange(
+            min(base_minimum, value),
+            max(base_maximum, value),
+        )
+
+    def _add_transform_nudge_buttons(
+        self,
+        field: QWidget,
+        slider: QSlider,
+        control_name: str,
+        pressed_handler: Callable[[QSlider, int], None],
+        released_handler: Callable[[], None],
+    ) -> tuple[QPushButton, QPushButton]:
+        """Add one-shot controls with a press-and-hold level comparison."""
+
+        layout = field.layout()
+        if not isinstance(layout, QHBoxLayout):
+            raise TypeError("Transform slider fields require a horizontal layout.")
+        decrease_button = QPushButton("\N{MINUS SIGN}")
+        increase_button = QPushButton("+")
+        for button in (decrease_button, increase_button):
+            button.setFixedWidth(32)
+            button.setMinimumHeight(32)
+            button.setAutoRepeat(False)
+        decrease_button.setToolTip(
+            f"Decrease {control_name} once. Hold to compare levels."
+        )
+        increase_button.setToolTip(
+            f"Increase {control_name} once. Hold to compare levels."
+        )
+        decrease_button.pressed.connect(
+            partial(pressed_handler, slider, -1)
+        )
+        increase_button.pressed.connect(
+            partial(pressed_handler, slider, 1)
+        )
+        decrease_button.released.connect(released_handler)
+        increase_button.released.connect(released_handler)
+        layout.insertWidget(0, decrease_button)
+        layout.insertWidget(2, increase_button)
+        return decrease_button, increase_button
+
+    def _nudge_canvas_offset(
+        self,
+        axis_name: str,
+        delta_pixels: float,
+    ) -> None:
+        """Move one Canvas offset by an exact model-space pixel."""
+
+        if self._is_syncing_level_controls:
+            return
+        is_active_gesture = self._canvas_transform_drag_active
+        if not is_active_gesture:
+            self._finish_level_transform_drag()
+            self._commit_pending_level_transform_update()
+        level = self.current_level
+        normalized_axis = str(axis_name).strip().lower()
+        if normalized_axis == "x":
+            next_x = float(level.canvas_offset_x_pixels) + float(delta_pixels)
+            next_y = float(level.canvas_offset_y_pixels)
+            slider = self.canvas_x_offset_slider
+            value_label = self.canvas_x_offset_value_label
+            next_value = next_x
+        elif normalized_axis == "y":
+            next_x = float(level.canvas_offset_x_pixels)
+            next_y = float(level.canvas_offset_y_pixels) + float(delta_pixels)
+            slider = self.canvas_y_offset_slider
+            value_label = self.canvas_y_offset_value_label
+            next_value = next_y
+        else:
+            raise ValueError("A Canvas offset nudge requires the X or Y axis.")
+
+        if not is_active_gesture:
+            self._record_canvas_undo_state(
+                self._capture_canvas_level_properties_undo_state(level)
+            )
+        level.canvas_offset_x_pixels = next_x
+        level.canvas_offset_y_pixels = next_y
+        slider_value = round(next_value * CANVAS_OFFSET_SLIDER_FACTOR)
+        self._fit_slider_range_to_value(slider, slider_value)
+        was_blocked = slider.blockSignals(True)
+        slider.setValue(slider_value)
+        slider.blockSignals(was_blocked)
+        value_label.setText(self._format_canvas_offset_pixels(next_value))
+        self.canvas.set_canvas_level_offsets(next_x, next_y)
+
+    # ### Main workspace UI ###
     def _build_ui(self) -> None:
         root_layout = QHBoxLayout(self)
         root_layout.setContentsMargins(12, 12, 12, 12)
@@ -937,121 +1113,290 @@ class BlueprintWorkspace(QWidget):
         )
         side_layout.addWidget(self.add_open_space_button)
 
-        level_scale_label = QLabel("Level scale")
-        level_scale_label.setStyleSheet("font-size: 18px; font-weight: 600;")
-        side_layout.addWidget(level_scale_label)
-
-        self.level_scale_spinbox = QDoubleSpinBox()
-        self.level_scale_spinbox.setRange(MIN_LEVEL_SCALE, MAX_LEVEL_SCALE)
-        self.level_scale_spinbox.setDecimals(3)
-        self.level_scale_spinbox.setSingleStep(0.05)
-        self.level_scale_spinbox.setValue(DEFAULT_LEVEL_SCALE)
-        self.level_scale_spinbox.setSuffix(" x")
-        self.level_scale_spinbox.setMinimumHeight(40)
-        self.level_scale_spinbox.valueChanged.connect(
-            self._handle_level_scale_changed
+        self.level_transform_group = QGroupBox("Level transform")
+        level_transform_layout = QFormLayout(self.level_transform_group)
+        level_transform_layout.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
         )
-        side_layout.addWidget(self.level_scale_spinbox)
 
-        canvas_level_scale_label = QLabel("Canvas level scale")
-        canvas_level_scale_label.setStyleSheet(
-            "font-size: 18px; font-weight: 600;"
-        )
-        side_layout.addWidget(canvas_level_scale_label)
-
-        canvas_level_scale_row = QWidget()
-        canvas_level_scale_layout = QHBoxLayout(canvas_level_scale_row)
-        canvas_level_scale_layout.setContentsMargins(0, 0, 0, 0)
-        canvas_level_scale_layout.setSpacing(10)
-        self.canvas_level_scale_slider = QSlider(Qt.Orientation.Horizontal)
-        self.canvas_level_scale_slider.setRange(
-            round(
-                MIN_CANVAS_LEVEL_SCALE
-                * CANVAS_LEVEL_SCALE_SLIDER_FACTOR
+        (
+            level_scale_field,
+            self.level_scale_slider,
+            self.level_scale_value_label,
+        ) = self._build_transform_slider_field(
+            minimum=round(MIN_LEVEL_SCALE * LEVEL_SCALE_SLIDER_FACTOR),
+            maximum=round(MAX_LEVEL_SCALE * LEVEL_SCALE_SLIDER_FACTOR),
+            value=round(DEFAULT_LEVEL_SCALE * LEVEL_SCALE_SLIDER_FACTOR),
+            single_step=1,
+            page_step=50,
+            tick_interval=500,
+            value_text="1.000 x",
+            tooltip=(
+                "Previews this level's 3D scale in yellow, then applies it "
+                "after the Mesh edit update delay."
             ),
-            round(
-                MAX_CANVAS_LEVEL_SCALE
-                * CANVAS_LEVEL_SCALE_SLIDER_FACTOR
+            tracking=False,
+        )
+        (
+            self.level_scale_decrease_button,
+            self.level_scale_increase_button,
+        ) = self._add_transform_nudge_buttons(
+            level_scale_field,
+            self.level_scale_slider,
+            "Level scale",
+            self._handle_level_transform_button_pressed,
+            self._handle_level_transform_button_released,
+        )
+        level_transform_layout.addRow("Level scale", level_scale_field)
+
+        (
+            level_x_offset_field,
+            self.level_x_offset_slider,
+            self.level_x_offset_value_label,
+        ) = self._build_transform_slider_field(
+            minimum=round(
+                LEVEL_OFFSET_SLIDER_MIN_METERS * LEVEL_OFFSET_SLIDER_FACTOR
             ),
+            maximum=round(
+                LEVEL_OFFSET_SLIDER_MAX_METERS * LEVEL_OFFSET_SLIDER_FACTOR
+            ),
+            value=round(
+                DEFAULT_LEVEL_OFFSET_METERS * LEVEL_OFFSET_SLIDER_FACTOR
+            ),
+            single_step=1,
+            page_step=10,
+            tick_interval=1000,
+            value_text="0.00 m",
+            tooltip=(
+                "Previews this level's X position in yellow, then applies it "
+                "after the Mesh edit update delay."
+            ),
+            tracking=False,
         )
-        self.canvas_level_scale_slider.setSingleStep(1)
-        self.canvas_level_scale_slider.setPageStep(10)
-        self.canvas_level_scale_slider.setTickInterval(50)
-        self.canvas_level_scale_slider.setTickPosition(
-            QSlider.TickPosition.TicksBelow
+        (
+            self.level_x_offset_decrease_button,
+            self.level_x_offset_increase_button,
+        ) = self._add_transform_nudge_buttons(
+            level_x_offset_field,
+            self.level_x_offset_slider,
+            "X offset",
+            self._handle_level_transform_button_pressed,
+            self._handle_level_transform_button_released,
         )
-        self.canvas_level_scale_slider.setValue(
-            round(
+        level_transform_layout.addRow("X offset", level_x_offset_field)
+
+        (
+            level_y_offset_field,
+            self.level_y_offset_slider,
+            self.level_y_offset_value_label,
+        ) = self._build_transform_slider_field(
+            minimum=round(
+                LEVEL_OFFSET_SLIDER_MIN_METERS * LEVEL_OFFSET_SLIDER_FACTOR
+            ),
+            maximum=round(
+                LEVEL_OFFSET_SLIDER_MAX_METERS * LEVEL_OFFSET_SLIDER_FACTOR
+            ),
+            value=round(
+                DEFAULT_LEVEL_OFFSET_METERS * LEVEL_OFFSET_SLIDER_FACTOR
+            ),
+            single_step=1,
+            page_step=10,
+            tick_interval=1000,
+            value_text="0.00 m",
+            tooltip=(
+                "Previews this level's Y position in yellow, then applies it "
+                "after the Mesh edit update delay."
+            ),
+            tracking=False,
+        )
+        (
+            self.level_y_offset_decrease_button,
+            self.level_y_offset_increase_button,
+        ) = self._add_transform_nudge_buttons(
+            level_y_offset_field,
+            self.level_y_offset_slider,
+            "Y offset",
+            self._handle_level_transform_button_pressed,
+            self._handle_level_transform_button_released,
+        )
+        level_transform_layout.addRow("Y offset", level_y_offset_field)
+        side_layout.addWidget(self.level_transform_group)
+
+        for slider in (
+            self.level_scale_slider,
+            self.level_x_offset_slider,
+            self.level_y_offset_slider,
+        ):
+            slider.sliderPressed.connect(
+                self._handle_level_transform_drag_started
+            )
+            slider.sliderReleased.connect(
+                self._handle_level_transform_drag_finished
+            )
+        self.level_scale_slider.sliderMoved.connect(
+            self._preview_level_scale_slider_value
+        )
+        self.level_scale_slider.valueChanged.connect(
+            self._handle_level_scale_slider_changed
+        )
+        self.level_x_offset_slider.sliderMoved.connect(
+            self._preview_level_x_offset_slider_value
+        )
+        self.level_x_offset_slider.valueChanged.connect(
+            self._handle_level_x_offset_slider_changed
+        )
+        self.level_y_offset_slider.sliderMoved.connect(
+            self._preview_level_y_offset_slider_value
+        )
+        self.level_y_offset_slider.valueChanged.connect(
+            self._handle_level_y_offset_slider_changed
+        )
+
+        self.canvas_transform_group = QGroupBox("Canvas transform")
+        canvas_transform_layout = QFormLayout(self.canvas_transform_group)
+        canvas_transform_layout.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+        )
+
+        (
+            canvas_level_scale_field,
+            self.canvas_level_scale_slider,
+            self.canvas_level_scale_value_label,
+        ) = self._build_transform_slider_field(
+            minimum=round(
+                MIN_CANVAS_LEVEL_SCALE * CANVAS_LEVEL_SCALE_SLIDER_FACTOR
+            ),
+            maximum=round(
+                MAX_CANVAS_LEVEL_SCALE * CANVAS_LEVEL_SCALE_SLIDER_FACTOR
+            ),
+            value=round(
                 DEFAULT_CANVAS_LEVEL_SCALE
                 * CANVAS_LEVEL_SCALE_SLIDER_FACTOR
+            ),
+            single_step=1,
+            page_step=10,
+            tick_interval=50,
+            value_text="1.00 x",
+            tooltip=(
+                "Scales only this level's 2D Canvas. Hold and drag to compare "
+                "against the adjacent level."
+            ),
+            tracking=True,
+        )
+        (
+            self.canvas_level_scale_decrease_button,
+            self.canvas_level_scale_increase_button,
+        ) = self._add_transform_nudge_buttons(
+            canvas_level_scale_field,
+            self.canvas_level_scale_slider,
+            "Canvas level scale",
+            self._handle_canvas_transform_button_pressed,
+            self._handle_canvas_transform_button_released,
+        )
+        canvas_transform_layout.addRow(
+            "Canvas level scale",
+            canvas_level_scale_field,
+        )
+
+        (
+            canvas_x_offset_field,
+            self.canvas_x_offset_slider,
+            self.canvas_x_offset_value_label,
+        ) = self._build_transform_slider_field(
+            minimum=round(
+                CANVAS_OFFSET_SLIDER_MIN_PIXELS * CANVAS_OFFSET_SLIDER_FACTOR
+            ),
+            maximum=round(
+                CANVAS_OFFSET_SLIDER_MAX_PIXELS * CANVAS_OFFSET_SLIDER_FACTOR
+            ),
+            value=round(
+                DEFAULT_CANVAS_OFFSET_PIXELS * CANVAS_OFFSET_SLIDER_FACTOR
+            ),
+            single_step=CANVAS_OFFSET_SLIDER_FACTOR,
+            page_step=10 * CANVAS_OFFSET_SLIDER_FACTOR,
+            tick_interval=100 * CANVAS_OFFSET_SLIDER_FACTOR,
+            value_text="0 px",
+            tooltip=(
+                "Moves only this level's 2D Canvas along the horizontal axis. "
+                "Use the side buttons for exact one-pixel steps."
+            ),
+            tracking=True,
+        )
+        (
+            self.canvas_x_offset_decrease_button,
+            self.canvas_x_offset_increase_button,
+        ) = self._add_transform_nudge_buttons(
+            canvas_x_offset_field,
+            self.canvas_x_offset_slider,
+            "Canvas X offset",
+            partial(self._handle_canvas_offset_button_pressed, "X"),
+            self._handle_canvas_transform_button_released,
+        )
+        canvas_transform_layout.addRow(
+            "Canvas X offset",
+            canvas_x_offset_field,
+        )
+
+        (
+            canvas_y_offset_field,
+            self.canvas_y_offset_slider,
+            self.canvas_y_offset_value_label,
+        ) = self._build_transform_slider_field(
+            minimum=round(
+                CANVAS_OFFSET_SLIDER_MIN_PIXELS * CANVAS_OFFSET_SLIDER_FACTOR
+            ),
+            maximum=round(
+                CANVAS_OFFSET_SLIDER_MAX_PIXELS * CANVAS_OFFSET_SLIDER_FACTOR
+            ),
+            value=round(
+                DEFAULT_CANVAS_OFFSET_PIXELS * CANVAS_OFFSET_SLIDER_FACTOR
+            ),
+            single_step=CANVAS_OFFSET_SLIDER_FACTOR,
+            page_step=10 * CANVAS_OFFSET_SLIDER_FACTOR,
+            tick_interval=100 * CANVAS_OFFSET_SLIDER_FACTOR,
+            value_text="0 px",
+            tooltip=(
+                "Moves only this level's 2D Canvas along the vertical axis. "
+                "Use the side buttons for exact one-pixel steps."
+            ),
+            tracking=True,
+        )
+        (
+            self.canvas_y_offset_decrease_button,
+            self.canvas_y_offset_increase_button,
+        ) = self._add_transform_nudge_buttons(
+            canvas_y_offset_field,
+            self.canvas_y_offset_slider,
+            "Canvas Y offset",
+            partial(self._handle_canvas_offset_button_pressed, "Y"),
+            self._handle_canvas_transform_button_released,
+        )
+        canvas_transform_layout.addRow(
+            "Canvas Y offset",
+            canvas_y_offset_field,
+        )
+        side_layout.addWidget(self.canvas_transform_group)
+
+        for slider in (
+            self.canvas_level_scale_slider,
+            self.canvas_x_offset_slider,
+            self.canvas_y_offset_slider,
+        ):
+            slider.sliderPressed.connect(
+                self._handle_canvas_transform_drag_started
             )
-        )
-        self.canvas_level_scale_slider.setMinimumHeight(40)
-        self.canvas_level_scale_slider.setToolTip(
-            "Scales only this level's 2D Canvas. Hold and drag to compare "
-            "against the adjacent level."
-        )
-        self.canvas_level_scale_slider.sliderPressed.connect(
-            self._handle_canvas_level_scale_drag_started
-        )
+            slider.sliderReleased.connect(
+                self._handle_canvas_transform_drag_finished
+            )
         self.canvas_level_scale_slider.valueChanged.connect(
             self._handle_canvas_level_scale_changed
         )
-        self.canvas_level_scale_slider.sliderReleased.connect(
-            self._handle_canvas_level_scale_drag_finished
+        self.canvas_x_offset_slider.valueChanged.connect(
+            self._handle_canvas_x_offset_changed
         )
-        canvas_level_scale_layout.addWidget(
-            self.canvas_level_scale_slider,
-            1,
+        self.canvas_y_offset_slider.valueChanged.connect(
+            self._handle_canvas_y_offset_changed
         )
-
-        self.canvas_level_scale_value_label = QLabel("1.00 x")
-        self.canvas_level_scale_value_label.setMinimumWidth(58)
-        self.canvas_level_scale_value_label.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-        )
-        canvas_level_scale_layout.addWidget(
-            self.canvas_level_scale_value_label
-        )
-        side_layout.addWidget(canvas_level_scale_row)
-
-        level_x_offset_label = QLabel("X offset")
-        level_x_offset_label.setStyleSheet("font-size: 18px; font-weight: 600;")
-        side_layout.addWidget(level_x_offset_label)
-
-        self.level_x_offset_spinbox = QDoubleSpinBox()
-        self.level_x_offset_spinbox.setRange(
-            MIN_LEVEL_OFFSET_METERS,
-            MAX_LEVEL_OFFSET_METERS,
-        )
-        self.level_x_offset_spinbox.setDecimals(2)
-        self.level_x_offset_spinbox.setSingleStep(0.1)
-        self.level_x_offset_spinbox.setValue(DEFAULT_LEVEL_OFFSET_METERS)
-        self.level_x_offset_spinbox.setSuffix(" m")
-        self.level_x_offset_spinbox.setMinimumHeight(40)
-        self.level_x_offset_spinbox.valueChanged.connect(
-            self._handle_level_x_offset_changed
-        )
-        side_layout.addWidget(self.level_x_offset_spinbox)
-
-        level_y_offset_label = QLabel("Y offset")
-        level_y_offset_label.setStyleSheet("font-size: 18px; font-weight: 600;")
-        side_layout.addWidget(level_y_offset_label)
-
-        self.level_y_offset_spinbox = QDoubleSpinBox()
-        self.level_y_offset_spinbox.setRange(
-            MIN_LEVEL_OFFSET_METERS,
-            MAX_LEVEL_OFFSET_METERS,
-        )
-        self.level_y_offset_spinbox.setDecimals(2)
-        self.level_y_offset_spinbox.setSingleStep(0.1)
-        self.level_y_offset_spinbox.setValue(DEFAULT_LEVEL_OFFSET_METERS)
-        self.level_y_offset_spinbox.setSuffix(" m")
-        self.level_y_offset_spinbox.setMinimumHeight(40)
-        self.level_y_offset_spinbox.valueChanged.connect(
-            self._handle_level_y_offset_changed
-        )
-        side_layout.addWidget(self.level_y_offset_spinbox)
 
         stairs_label = QLabel("Stairs")
         stairs_label.setStyleSheet("font-size: 18px; font-weight: 600;")
@@ -1239,9 +1584,17 @@ class BlueprintWorkspace(QWidget):
         self.stair_style_combo.installEventFilter(
             self._generals_value_input_wheel_filter
         )
-        self.canvas_level_scale_slider.installEventFilter(
-            self._generals_value_input_wheel_filter
-        )
+        for slider in (
+            self.level_scale_slider,
+            self.level_x_offset_slider,
+            self.level_y_offset_slider,
+            self.canvas_level_scale_slider,
+            self.canvas_x_offset_slider,
+            self.canvas_y_offset_slider,
+        ):
+            slider.installEventFilter(
+                self._generals_value_input_wheel_filter
+            )
 
         self.workspace_splitter.addWidget(self.side_panel)
         self.workspace_splitter.setStretchFactor(0, 9)
@@ -1945,6 +2298,7 @@ class BlueprintWorkspace(QWidget):
 
         if self._is_restoring_canvas_undo:
             return
+        self._commit_pending_level_transform_update()
         if commit_pending_surface_edit:
             self._commit_pending_canvas_surface_mesh_update()
         self._canvas_undo_stack.append(state)
@@ -2068,6 +2422,8 @@ class BlueprintWorkspace(QWidget):
             height_meters=float(level.height_meters),
             scale=float(level.scale),
             canvas_level_scale=float(level.canvas_level_scale),
+            canvas_offset_x_pixels=float(level.canvas_offset_x_pixels),
+            canvas_offset_y_pixels=float(level.canvas_offset_y_pixels),
             offset_x_meters=float(level.offset_x_meters),
             offset_y_meters=float(level.offset_y_meters),
             include_in_export=bool(level.include_in_export),
@@ -2161,6 +2517,11 @@ class BlueprintWorkspace(QWidget):
         if self._cancel_active_canvas_surface_edit():
             self.viewer.set_surface_tools_status("Current Canvas drag cancelled.")
             return
+        if self._pending_level_transform is not None:
+            self._level_transform_drag_active = False
+            self._cancel_pending_level_transform()
+            self.viewer.set_surface_tools_status("Level transform edit undone.")
+            return
         if self._undo_pending_canvas_surface_mesh_update():
             self.viewer.set_surface_tools_status("Canvas surface edit undone.")
             return
@@ -2232,6 +2593,7 @@ class BlueprintWorkspace(QWidget):
     ) -> None:
         """Restore one direct Canvas level-control change."""
 
+        self._cancel_pending_level_transform(sync_controls=False)
         level = next(
             (
                 candidate
@@ -2245,12 +2607,18 @@ class BlueprintWorkspace(QWidget):
         level.height_meters = state.height_meters
         level.scale = state.scale
         level.canvas_level_scale = state.canvas_level_scale
+        level.canvas_offset_x_pixels = state.canvas_offset_x_pixels
+        level.canvas_offset_y_pixels = state.canvas_offset_y_pixels
         level.offset_x_meters = state.offset_x_meters
         level.offset_y_meters = state.offset_y_meters
         level.include_in_export = state.include_in_export
         if level is self.current_level:
             self._sync_level_controls()
             self.canvas.set_canvas_level_scale(level.canvas_level_scale)
+            self.canvas.set_canvas_level_offsets(
+                level.canvas_offset_x_pixels,
+                level.canvas_offset_y_pixels,
+            )
             self.canvas.update()
         self.surface_texture_generation.reconcile_assignments_with_levels(
             self.levels
@@ -3367,8 +3735,24 @@ class BlueprintWorkspace(QWidget):
             self.floor_thickness_spinbox.setValue(
                 level.floor_thickness_meters
             )
-            self.level_x_offset_spinbox.setValue(level.offset_x_meters)
-            self.level_y_offset_spinbox.setValue(level.offset_y_meters)
+            level_x_slider_value = round(
+                level.offset_x_meters * LEVEL_OFFSET_SLIDER_FACTOR
+            )
+            level_y_slider_value = round(
+                level.offset_y_meters * LEVEL_OFFSET_SLIDER_FACTOR
+            )
+            self._fit_slider_range_to_value(
+                self.level_x_offset_slider,
+                level_x_slider_value,
+            )
+            self._fit_slider_range_to_value(
+                self.level_y_offset_slider,
+                level_y_slider_value,
+            )
+            self.level_x_offset_slider.setValue(level_x_slider_value)
+            self.level_y_offset_slider.setValue(level_y_slider_value)
+            self._update_level_x_offset_value_label(level.offset_x_meters)
+            self._update_level_y_offset_value_label(level.offset_y_meters)
         finally:
             self._is_syncing_level_controls = False
 
@@ -3611,6 +3995,8 @@ class BlueprintWorkspace(QWidget):
 
         # Export is an explicit completion boundary, so include any doorway
         # dimensions that were still waiting for their debounce interval.
+        self._finish_level_transform_drag()
+        self._commit_pending_level_transform_update()
         self._commit_pending_doorway_mesh_update()
 
         export_path = Path(file_path)
@@ -6248,7 +6634,10 @@ class BlueprintWorkspace(QWidget):
         self._viewer_preview_dependency_signature_revision = revision
         self._canvas_viewer_preview_revision = revision
         self._scheduled_viewer_refresh_preserve_camera = True
+        if self._pending_level_transform is not None:
+            self._refresh_pending_level_transform_outline()
         self._clear_committed_doorway_outline_if_displayed()
+        self._clear_committed_level_transform_outline_if_displayed()
         return True
 
     def _build_viewer_preview_dependency_signature(
@@ -6510,6 +6899,7 @@ class BlueprintWorkspace(QWidget):
         timers = (
             self._doorway_mesh_update_timer,
             self._canvas_surface_mesh_update_timer,
+            self._level_transform_mesh_update_timer,
         )
         active_timers = tuple(timer.isActive() for timer in timers)
         self._mesh_edit_update_delay_seconds = normalized_delay
@@ -6847,7 +7237,10 @@ class BlueprintWorkspace(QWidget):
             self._canvas_viewer_preview_revision = revision
             self._scheduled_viewer_refresh_preserve_camera = True
             self._sync_canvas_window_undo_availability()
+            if self._pending_level_transform is not None:
+                self._refresh_pending_level_transform_outline()
             self._clear_committed_doorway_outline_if_displayed()
+            self._clear_committed_level_transform_outline_if_displayed()
 
         if surface_is_stale:
             self.surface_texture_generation.set_preview_context(
@@ -6918,6 +7311,8 @@ class BlueprintWorkspace(QWidget):
 
     def _run_scheduled_viewer_preview_refresh(self) -> None:
         self._is_viewer_refresh_scheduled = False
+        if self._is_shutdown:
+            return
         if not self._active_viewer_preview_needs_refresh():
             return
         if (
@@ -6946,6 +7341,8 @@ class BlueprintWorkspace(QWidget):
         if not file_path:
             return
 
+        self._finish_level_transform_drag()
+        self._commit_pending_level_transform_update()
         self._commit_pending_canvas_surface_mesh_update()
         self._commit_pending_wall_vertex_update()
 
@@ -7168,12 +7565,18 @@ class BlueprintWorkspace(QWidget):
         return normalized_paths
 
     def _sync_level_controls(self) -> None:
+        level_scale, level_offset_x, level_offset_y = (
+            self._get_displayed_level_transform(self.current_level)
+        )
         self._is_syncing_level_controls = True
         self.height_level_spinbox.setValue(self.current_level.height_meters)
         self.floor_thickness_spinbox.setValue(
             self.current_level.floor_thickness_meters
         )
-        self.level_scale_spinbox.setValue(self.current_level.scale)
+        self.level_scale_slider.setValue(
+            round(level_scale * LEVEL_SCALE_SLIDER_FACTOR)
+        )
+        self._update_level_scale_value_label(level_scale)
         self.canvas_level_scale_slider.setValue(
             round(
                 self.current_level.canvas_level_scale
@@ -7183,11 +7586,47 @@ class BlueprintWorkspace(QWidget):
         self._update_canvas_level_scale_value_label(
             self.current_level.canvas_level_scale
         )
-        self.level_x_offset_spinbox.setValue(
-            self.current_level.offset_x_meters
+        level_x_slider_value = round(
+            level_offset_x * LEVEL_OFFSET_SLIDER_FACTOR
         )
-        self.level_y_offset_spinbox.setValue(
-            self.current_level.offset_y_meters
+        self._fit_slider_range_to_value(
+            self.level_x_offset_slider,
+            level_x_slider_value,
+        )
+        self.level_x_offset_slider.setValue(level_x_slider_value)
+        self._update_level_x_offset_value_label(level_offset_x)
+        level_y_slider_value = round(
+            level_offset_y * LEVEL_OFFSET_SLIDER_FACTOR
+        )
+        self._fit_slider_range_to_value(
+            self.level_y_offset_slider,
+            level_y_slider_value,
+        )
+        self.level_y_offset_slider.setValue(level_y_slider_value)
+        self._update_level_y_offset_value_label(level_offset_y)
+        canvas_x_slider_value = round(
+            self.current_level.canvas_offset_x_pixels
+            * CANVAS_OFFSET_SLIDER_FACTOR
+        )
+        self._fit_slider_range_to_value(
+            self.canvas_x_offset_slider,
+            canvas_x_slider_value,
+        )
+        self.canvas_x_offset_slider.setValue(canvas_x_slider_value)
+        self._update_canvas_x_offset_value_label(
+            self.current_level.canvas_offset_x_pixels
+        )
+        canvas_y_slider_value = round(
+            self.current_level.canvas_offset_y_pixels
+            * CANVAS_OFFSET_SLIDER_FACTOR
+        )
+        self._fit_slider_range_to_value(
+            self.canvas_y_offset_slider,
+            canvas_y_slider_value,
+        )
+        self.canvas_y_offset_slider.setValue(canvas_y_slider_value)
+        self._update_canvas_y_offset_value_label(
+            self.current_level.canvas_offset_y_pixels
         )
         self.include_yes_radio.setChecked(self.current_level.include_in_export)
         self.include_no_radio.setChecked(not self.current_level.include_in_export)
@@ -7221,7 +7660,9 @@ class BlueprintWorkspace(QWidget):
 
         if level_index != self.current_level_index:
             self.canvas.cancel_open_space_placement()
-            self._finish_canvas_level_scale_drag()
+            self._finish_level_transform_drag()
+            self._commit_pending_level_transform_update()
+            self._finish_canvas_transform_drag()
             self._cancel_active_canvas_surface_edit()
             self._commit_pending_canvas_surface_mesh_update()
             self._commit_pending_wall_vertex_update()
@@ -7237,6 +7678,8 @@ class BlueprintWorkspace(QWidget):
             return
 
         next_value = float(value)
+        self._finish_level_transform_drag()
+        self._commit_pending_level_transform_update()
         if next_value == self.current_level.height_meters:
             return
         self._record_canvas_undo_state(
@@ -7252,6 +7695,8 @@ class BlueprintWorkspace(QWidget):
 
         if self._is_syncing_level_controls:
             return
+        self._finish_level_transform_drag()
+        self._commit_pending_level_transform_update()
         self._stage_floor_thickness_mesh_update(
             self.current_level,
             float(value),
@@ -7268,7 +7713,8 @@ class BlueprintWorkspace(QWidget):
             self._update_open_space_controls()
             return
 
-        self._finish_canvas_level_scale_drag()
+        self._finish_level_transform_drag()
+        self._finish_canvas_transform_drag()
         self._cancel_active_canvas_surface_edit()
         self._commit_pending_canvas_surface_mesh_update()
         self._commit_pending_wall_vertex_update()
@@ -7324,49 +7770,381 @@ class BlueprintWorkspace(QWidget):
             status = f"Open spaces: {open_space_count} areas"
         self.open_space_status_label.setText(status)
 
-    def _handle_level_scale_changed(self, value: float) -> None:
-        if self._is_syncing_level_controls:
-            return
+    # ### 3D level transform bars ###
+    def _get_displayed_level_transform(
+        self,
+        level: LevelData,
+    ) -> tuple[float, float, float]:
+        """Return pending values for the edited level and committed ones otherwise."""
 
-        next_value = float(value)
-        if next_value == self.current_level.scale:
-            return
-        self._record_canvas_undo_state(
-            self._capture_canvas_level_properties_undo_state(
-                self.current_level
+        pending = self._pending_level_transform
+        if pending is not None and pending.level_index == level.index:
+            return (
+                pending.scale,
+                pending.offset_x_meters,
+                pending.offset_y_meters,
             )
+        return (
+            float(level.scale),
+            float(level.offset_x_meters),
+            float(level.offset_y_meters),
         )
-        self.current_level.scale = next_value
-        self.canvas.update()
-        self._schedule_viewer_preview_refresh()
 
-    # ### Canvas-only level scale ###
-    def _handle_canvas_level_scale_drag_started(self) -> None:
-        """Start one live scale transaction and reveal its comparison level."""
+    def _preview_level_scale_slider_value(self, slider_value: int) -> None:
+        next_value = float(slider_value) / LEVEL_SCALE_SLIDER_FACTOR
+        self._update_level_scale_value_label(next_value)
+        self._handle_level_scale_changed(next_value)
 
-        if self._is_syncing_level_controls or self._canvas_level_scale_drag_active:
+    def _preview_level_x_offset_slider_value(self, slider_value: int) -> None:
+        next_value = float(slider_value) / LEVEL_OFFSET_SLIDER_FACTOR
+        self._update_level_x_offset_value_label(next_value)
+        self._handle_level_x_offset_changed(next_value)
+
+    def _preview_level_y_offset_slider_value(self, slider_value: int) -> None:
+        next_value = float(slider_value) / LEVEL_OFFSET_SLIDER_FACTOR
+        self._update_level_y_offset_value_label(next_value)
+        self._handle_level_y_offset_changed(next_value)
+
+    def _handle_level_scale_slider_changed(self, slider_value: int) -> None:
+        next_value = float(slider_value) / LEVEL_SCALE_SLIDER_FACTOR
+        self._update_level_scale_value_label(next_value)
+        self._handle_level_scale_changed(next_value)
+
+    def _handle_level_x_offset_slider_changed(self, slider_value: int) -> None:
+        next_value = float(slider_value) / LEVEL_OFFSET_SLIDER_FACTOR
+        self._update_level_x_offset_value_label(next_value)
+        self._handle_level_x_offset_changed(next_value)
+
+    def _handle_level_y_offset_slider_changed(self, slider_value: int) -> None:
+        next_value = float(slider_value) / LEVEL_OFFSET_SLIDER_FACTOR
+        self._update_level_y_offset_value_label(next_value)
+        self._handle_level_y_offset_changed(next_value)
+
+    def _handle_level_transform_drag_started(self) -> None:
+        """Pause the mesh debounce while a 3D transform bar is held."""
+
+        if self._is_syncing_level_controls or self._level_transform_drag_active:
             return
         self._commit_pending_canvas_surface_mesh_update()
-        self._canvas_level_scale_drag_active = True
-        self._canvas_level_scale_drag_undo_state = (
+        self._level_transform_mesh_update_timer.stop()
+        self._level_transform_drag_active = True
+
+    def _handle_level_transform_button_pressed(
+        self,
+        slider: QSlider,
+        direction: int,
+    ) -> None:
+        """Nudge one 3D transform and retain its comparison while held."""
+
+        if self._is_syncing_level_controls:
+            return
+        needs_comparison = not self._level_transform_drag_active
+        self._handle_level_transform_drag_started()
+        slider.setValue(slider.value() + direction * slider.singleStep())
+        if (
+            needs_comparison
+            or self.canvas.get_level_comparison_overlay() is None
+        ):
+            self.canvas.set_level_comparison_overlay(
+                self._get_canvas_transform_comparison_level()
+            )
+
+    def _handle_level_transform_button_released(self) -> None:
+        """End a 3D transform-button gesture and begin its delayed update."""
+
+        self.canvas.clear_level_comparison_overlay()
+        self._handle_level_transform_drag_finished()
+
+    def _handle_level_transform_drag_finished(self) -> None:
+        self._finish_level_transform_drag()
+
+    def _finish_level_transform_drag(self) -> None:
+        """Start the full mesh-edit delay after a transform bar is released."""
+
+        if not self._level_transform_drag_active:
+            return
+        self._level_transform_drag_active = False
+        if self._pending_level_transform is not None:
+            self._level_transform_mesh_update_timer.start()
+
+    def _handle_level_scale_changed(self, value: float) -> None:
+        next_value = float(value)
+        self._update_level_scale_value_label(next_value)
+        if self._is_syncing_level_controls:
+            return
+        self._stage_pending_level_transform(scale=next_value)
+
+    def _handle_level_x_offset_changed(self, value: float) -> None:
+        next_value = float(value)
+        self._update_level_x_offset_value_label(next_value)
+        if self._is_syncing_level_controls:
+            return
+        self._stage_pending_level_transform(offset_x_meters=next_value)
+
+    def _handle_level_y_offset_changed(self, value: float) -> None:
+        next_value = float(value)
+        self._update_level_y_offset_value_label(next_value)
+        if self._is_syncing_level_controls:
+            return
+        self._stage_pending_level_transform(offset_y_meters=next_value)
+
+    def _stage_pending_level_transform(
+        self,
+        *,
+        scale: float | None = None,
+        offset_x_meters: float | None = None,
+        offset_y_meters: float | None = None,
+    ) -> None:
+        """Coalesce level transforms while retaining one immutable baseline."""
+
+        level = self.current_level
+        pending = self._pending_level_transform
+        if pending is not None and pending.level_index != level.index:
+            self._commit_pending_level_transform_update()
+            pending = None
+        if pending is None:
+            self._finish_canvas_transform_drag()
+            self._commit_pending_canvas_surface_mesh_update()
+            self._commit_pending_wall_vertex_update()
+            self._commit_pending_doorway_mesh_update()
+            pending = _PendingLevelTransform(
+                baseline=self._capture_canvas_level_properties_undo_state(level),
+                scale=float(level.scale),
+                offset_x_meters=float(level.offset_x_meters),
+                offset_y_meters=float(level.offset_y_meters),
+            )
+
+        next_pending = replace(
+            pending,
+            scale=pending.scale if scale is None else float(scale),
+            offset_x_meters=(
+                pending.offset_x_meters
+                if offset_x_meters is None
+                else float(offset_x_meters)
+            ),
+            offset_y_meters=(
+                pending.offset_y_meters
+                if offset_y_meters is None
+                else float(offset_y_meters)
+            ),
+        )
+        baseline = next_pending.baseline
+        if (
+            math.isclose(next_pending.scale, baseline.scale)
+            and math.isclose(
+                next_pending.offset_x_meters,
+                baseline.offset_x_meters,
+            )
+            and math.isclose(
+                next_pending.offset_y_meters,
+                baseline.offset_y_meters,
+            )
+        ):
+            self._cancel_pending_level_transform(sync_controls=False)
+            return
+
+        self._pending_level_transform = next_pending
+        self._refresh_pending_level_transform_outline()
+        if self._level_transform_drag_active:
+            self._level_transform_mesh_update_timer.stop()
+        else:
+            self._level_transform_mesh_update_timer.start()
+
+    def _refresh_pending_level_transform_outline(self) -> None:
+        """Transform the rendered level boundary without rebuilding its mesh."""
+
+        pending = self._pending_level_transform
+        if pending is None:
+            self.viewer.clear_level_transform_preview()
+            return
+        level = next(
+            (
+                candidate
+                for candidate in self.levels
+                if candidate.index == pending.level_index
+            ),
+            None,
+        )
+        if level is None:
+            self._cancel_pending_level_transform(sync_controls=False)
+            return
+
+        committed_scale = float(level.scale)
+        scale_ratio = pending.scale / committed_scale
+        pivot_x, pivot_y = get_level_world_pivot(level)
+        translation_x = (
+            pivot_x * (1.0 - scale_ratio)
+            + pending.offset_x_meters
+            - scale_ratio * float(level.offset_x_meters)
+        )
+        translation_y = (
+            pivot_y * (1.0 - scale_ratio)
+            + pending.offset_y_meters
+            - scale_ratio * float(level.offset_y_meters)
+        )
+        self.viewer.set_level_transform_preview(
+            pending.level_index,
+            (
+                (scale_ratio, 0.0, 0.0, translation_x),
+                (0.0, scale_ratio, 0.0, translation_y),
+                (0.0, 0.0, 1.0, 0.0),
+                (0.0, 0.0, 0.0, 1.0),
+            ),
+        )
+
+    def _cancel_pending_level_transform(
+        self,
+        *,
+        sync_controls: bool = True,
+        restore_canvas_tools: bool = True,
+    ) -> bool:
+        """Discard a staged transform and its yellow preview."""
+
+        had_pending = self._pending_level_transform is not None
+        self._level_transform_mesh_update_timer.stop()
+        self._pending_level_transform = None
+        self._level_transform_outline_commit_revision = None
+        self.viewer.clear_level_transform_preview(
+            restore_canvas_tools=restore_canvas_tools
+        )
+        if sync_controls and hasattr(self, "level_scale_slider"):
+            self._sync_level_controls()
+        return had_pending
+
+    def _commit_pending_level_transform_update(self) -> bool:
+        """Apply one delayed scale/offset transaction and schedule its mesh."""
+
+        self._level_transform_mesh_update_timer.stop()
+        pending = self._pending_level_transform
+        if pending is None:
+            return False
+        self._level_transform_drag_active = False
+        level = next(
+            (
+                candidate
+                for candidate in self.levels
+                if candidate.index == pending.level_index
+            ),
+            None,
+        )
+        if level is None:
+            self._cancel_pending_level_transform(sync_controls=False)
+            return False
+
+        self._pending_level_transform = None
+        changed = (
+            not math.isclose(float(level.scale), pending.scale)
+            or not math.isclose(
+                float(level.offset_x_meters),
+                pending.offset_x_meters,
+            )
+            or not math.isclose(
+                float(level.offset_y_meters),
+                pending.offset_y_meters,
+            )
+        )
+        if not changed:
+            self.viewer.clear_level_transform_preview()
+            return False
+
+        level.scale = pending.scale
+        level.offset_x_meters = pending.offset_x_meters
+        level.offset_y_meters = pending.offset_y_meters
+        self._record_canvas_undo_state(
+            pending.baseline,
+            commit_pending_surface_edit=False,
+        )
+        if level is self.current_level:
+            self.canvas.update()
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
+        self._level_transform_outline_commit_revision = (
+            self._viewer_preview_revision
+        )
+        return True
+
+    def _clear_committed_level_transform_outline_if_displayed(self) -> None:
+        """Retire the yellow outline after Canvas shows the committed mesh."""
+
+        target_revision = self._level_transform_outline_commit_revision
+        if (
+            target_revision is None
+            or self._pending_level_transform is not None
+            or self._canvas_viewer_preview_revision < target_revision
+        ):
+            return
+        self._level_transform_outline_commit_revision = None
+        self.viewer.clear_level_transform_preview()
+
+    def _update_level_scale_value_label(self, value: float) -> None:
+        self.level_scale_value_label.setText(f"{float(value):.3f} x")
+
+    def _update_level_x_offset_value_label(self, value: float) -> None:
+        self.level_x_offset_value_label.setText(f"{float(value):.2f} m")
+
+    def _update_level_y_offset_value_label(self, value: float) -> None:
+        self.level_y_offset_value_label.setText(f"{float(value):.2f} m")
+
+    # ### 2D Canvas transform bars ###
+    def _handle_canvas_transform_drag_started(self) -> None:
+        """Start one live Canvas transform and reveal its comparison level."""
+
+        if self._is_syncing_level_controls or self._canvas_transform_drag_active:
+            return
+        self._finish_level_transform_drag()
+        self._commit_pending_level_transform_update()
+        self._commit_pending_canvas_surface_mesh_update()
+        self._canvas_transform_drag_active = True
+        self._canvas_transform_drag_undo_state = (
             self._capture_canvas_level_properties_undo_state(
                 self.current_level
             )
         )
         self.canvas.set_level_comparison_overlay(
-            self._get_canvas_scale_comparison_level()
+            self._get_canvas_transform_comparison_level()
         )
 
+    def _handle_canvas_transform_button_pressed(
+        self,
+        slider: QSlider,
+        direction: int,
+    ) -> None:
+        """Nudge one Canvas transform and keep its comparison visible."""
+
+        if self._is_syncing_level_controls:
+            return
+        self._handle_canvas_transform_drag_started()
+        slider.setValue(slider.value() + direction * slider.singleStep())
+
+    def _handle_canvas_offset_button_pressed(
+        self,
+        axis_name: str,
+        _slider: QSlider,
+        direction: int,
+    ) -> None:
+        """Nudge one Canvas offset without discarding persisted subpixels."""
+
+        if self._is_syncing_level_controls:
+            return
+        self._handle_canvas_transform_drag_started()
+        self._nudge_canvas_offset(axis_name, float(direction))
+
+    def _handle_canvas_transform_button_released(self) -> None:
+        """Finish a Canvas transform-button gesture and hide its comparison."""
+
+        self._handle_canvas_transform_drag_finished()
+
     def _handle_canvas_level_scale_changed(self, slider_value: int) -> None:
-        """Apply a slider step immediately to the current 2D plan only."""
+        """Apply one Canvas scale slider step without changing 3D geometry."""
 
         next_value = float(slider_value) / CANVAS_LEVEL_SCALE_SLIDER_FACTOR
         self._update_canvas_level_scale_value_label(next_value)
         if self._is_syncing_level_controls:
             return
+        self._finish_level_transform_drag()
+        self._commit_pending_level_transform_update()
         if math.isclose(next_value, self.current_level.canvas_level_scale):
             return
-        if not self._canvas_level_scale_drag_active:
+        if not self._canvas_transform_drag_active:
             self._record_canvas_undo_state(
                 self._capture_canvas_level_properties_undo_state(
                     self.current_level
@@ -7375,35 +8153,90 @@ class BlueprintWorkspace(QWidget):
         self.current_level.canvas_level_scale = next_value
         self.canvas.set_canvas_level_scale(next_value)
 
-    def _handle_canvas_level_scale_drag_finished(self) -> None:
-        """Commit one slider drag to history and remove the overlay."""
+    def _handle_canvas_x_offset_changed(self, slider_value: int) -> None:
+        """Apply one horizontal Canvas translation step immediately."""
 
-        self._finish_canvas_level_scale_drag()
+        next_value = float(slider_value) / CANVAS_OFFSET_SLIDER_FACTOR
+        self._update_canvas_x_offset_value_label(next_value)
+        if self._is_syncing_level_controls:
+            return
+        self._finish_level_transform_drag()
+        self._commit_pending_level_transform_update()
+        if math.isclose(next_value, self.current_level.canvas_offset_x_pixels):
+            return
+        if not self._canvas_transform_drag_active:
+            self._record_canvas_undo_state(
+                self._capture_canvas_level_properties_undo_state(
+                    self.current_level
+                )
+            )
+        self.current_level.canvas_offset_x_pixels = next_value
+        self.canvas.set_canvas_level_offsets(
+            next_value,
+            self.current_level.canvas_offset_y_pixels,
+        )
 
-    def _finish_canvas_level_scale_drag(self) -> None:
-        """Finalize an active scale gesture, including programmatic cleanup."""
+    def _handle_canvas_y_offset_changed(self, slider_value: int) -> None:
+        """Apply one vertical Canvas translation step immediately."""
 
-        if not self._canvas_level_scale_drag_active:
+        next_value = float(slider_value) / CANVAS_OFFSET_SLIDER_FACTOR
+        self._update_canvas_y_offset_value_label(next_value)
+        if self._is_syncing_level_controls:
+            return
+        self._finish_level_transform_drag()
+        self._commit_pending_level_transform_update()
+        if math.isclose(next_value, self.current_level.canvas_offset_y_pixels):
+            return
+        if not self._canvas_transform_drag_active:
+            self._record_canvas_undo_state(
+                self._capture_canvas_level_properties_undo_state(
+                    self.current_level
+                )
+            )
+        self.current_level.canvas_offset_y_pixels = next_value
+        self.canvas.set_canvas_level_offsets(
+            self.current_level.canvas_offset_x_pixels,
+            next_value,
+        )
+
+    def _handle_canvas_transform_drag_finished(self) -> None:
+        """Commit one Canvas transform drag and remove its comparison."""
+
+        self._finish_canvas_transform_drag()
+
+    def _finish_canvas_transform_drag(self) -> None:
+        """Finalize any active Canvas scale or translation gesture."""
+
+        if not self._canvas_transform_drag_active:
             self.canvas.clear_level_comparison_overlay()
             return
-
-        state = self._canvas_level_scale_drag_undo_state
-        self._canvas_level_scale_drag_active = False
-        self._canvas_level_scale_drag_undo_state = None
+        state = self._canvas_transform_drag_undo_state
+        self._canvas_transform_drag_active = False
+        self._canvas_transform_drag_undo_state = None
         self.canvas.clear_level_comparison_overlay()
-        if (
-            state is not None
-            and not math.isclose(
+        if state is None:
+            return
+        changed = (
+            not math.isclose(
                 state.canvas_level_scale,
                 self.current_level.canvas_level_scale,
             )
-        ):
+            or not math.isclose(
+                state.canvas_offset_x_pixels,
+                self.current_level.canvas_offset_x_pixels,
+            )
+            or not math.isclose(
+                state.canvas_offset_y_pixels,
+                self.current_level.canvas_offset_y_pixels,
+            )
+        )
+        if changed:
             self._record_canvas_undo_state(
                 state,
                 commit_pending_surface_edit=False,
             )
 
-    def _get_canvas_scale_comparison_level(self) -> LevelData | None:
+    def _get_canvas_transform_comparison_level(self) -> LevelData | None:
         """Return the level below, except underground levels compare upward."""
 
         current_index = self.current_level.index
@@ -7426,37 +8259,25 @@ class BlueprintWorkspace(QWidget):
 
         self.canvas_level_scale_value_label.setText(f"{float(value):.2f} x")
 
-    def _handle_level_x_offset_changed(self, value: float) -> None:
-        if self._is_syncing_level_controls:
-            return
-
-        next_value = float(value)
-        if next_value == self.current_level.offset_x_meters:
-            return
-        self._record_canvas_undo_state(
-            self._capture_canvas_level_properties_undo_state(
-                self.current_level
-            )
+    def _update_canvas_x_offset_value_label(self, value: float) -> None:
+        self.canvas_x_offset_value_label.setText(
+            self._format_canvas_offset_pixels(value)
         )
-        self.current_level.offset_x_meters = next_value
-        self.canvas.update()
-        self._schedule_viewer_preview_refresh()
 
-    def _handle_level_y_offset_changed(self, value: float) -> None:
-        if self._is_syncing_level_controls:
-            return
-
-        next_value = float(value)
-        if next_value == self.current_level.offset_y_meters:
-            return
-        self._record_canvas_undo_state(
-            self._capture_canvas_level_properties_undo_state(
-                self.current_level
-            )
+    def _update_canvas_y_offset_value_label(self, value: float) -> None:
+        self.canvas_y_offset_value_label.setText(
+            self._format_canvas_offset_pixels(value)
         )
-        self.current_level.offset_y_meters = next_value
-        self.canvas.update()
-        self._schedule_viewer_preview_refresh()
+
+    @staticmethod
+    def _format_canvas_offset_pixels(value: float) -> str:
+        """Show persisted subpixels without cluttering integer offsets."""
+
+        rounded_value = round(float(value), 6)
+        if rounded_value == 0.0:
+            rounded_value = 0.0
+        value_text = f"{rounded_value:.6f}".rstrip("0").rstrip(".")
+        return f"{value_text} px"
 
     def _handle_doorway_preset_selection_changed(self, _row: int) -> None:
         self._update_doorway_preset_button_state()
@@ -7962,6 +8783,8 @@ class BlueprintWorkspace(QWidget):
             return
 
         next_value = self.include_yes_radio.isChecked()
+        self._finish_level_transform_drag()
+        self._commit_pending_level_transform_update()
         if next_value == self.current_level.include_in_export:
             return
         self._record_canvas_undo_state(
@@ -8008,6 +8831,14 @@ class BlueprintWorkspace(QWidget):
             )
 
         self._is_doorway_move_drag_active = False
+        self._level_transform_drag_active = False
+        self._cancel_pending_level_transform(
+            sync_controls=False,
+            restore_canvas_tools=False,
+        )
+        self._canvas_transform_drag_active = False
+        self._canvas_transform_drag_undo_state = None
+        self.canvas.clear_level_comparison_overlay()
         self._cancel_active_canvas_surface_edit()
         self._cancel_pending_canvas_surface_mesh_update()
         self._cancel_pending_wall_vertex_update()
@@ -8078,6 +8909,8 @@ class BlueprintWorkspace(QWidget):
         self._schedule_viewer_preview_refresh()
 
     def _set_current_level_image(self, file_path: str) -> None:
+        self._finish_level_transform_drag()
+        self._commit_pending_level_transform_update()
         self._cancel_active_canvas_surface_edit()
         self._commit_pending_canvas_surface_mesh_update()
         self._commit_pending_wall_vertex_update()
@@ -8091,6 +8924,12 @@ class BlueprintWorkspace(QWidget):
             windows=self.current_level.windows,
             open_spaces=self.current_level.open_spaces,
             canvas_level_scale=self.current_level.canvas_level_scale,
+            canvas_offset_x_pixels=(
+                self.current_level.canvas_offset_x_pixels
+            ),
+            canvas_offset_y_pixels=(
+                self.current_level.canvas_offset_y_pixels
+            ),
         )
         self._clear_canvas_undo_history()
         self.current_level.image_path = normalized_path
@@ -8118,6 +8957,12 @@ class BlueprintWorkspace(QWidget):
             open_spaces=self.current_level.open_spaces,
             image_path=self.current_level.image_path,
             canvas_level_scale=self.current_level.canvas_level_scale,
+            canvas_offset_x_pixels=(
+                self.current_level.canvas_offset_x_pixels
+            ),
+            canvas_offset_y_pixels=(
+                self.current_level.canvas_offset_y_pixels
+            ),
         )
         if self.canvas.blueprint_image is not None:
             self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
