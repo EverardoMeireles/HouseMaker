@@ -520,6 +520,16 @@ class SurfaceTextureViewerCanvasParityTests(unittest.TestCase):
         self.canvas_viewer.deleteLater()
         _qt_application.processEvents()
 
+    def test_canvas_and_surface_viewers_default_to_half_ambient_light(self) -> None:
+        self.assertAlmostEqual(
+            self.canvas_viewer.get_ambient_light_intensity(),
+            0.5,
+        )
+        self.assertAlmostEqual(
+            self.surface_viewer._ambient_light_intensity,
+            0.5,
+        )
+
     def test_canvas_model_supplies_identical_base_and_texture_geometry(self) -> None:
         self.surface_viewer.set_surfaces((self.surface,))
         self.surface_viewer.set_surface_texture(
