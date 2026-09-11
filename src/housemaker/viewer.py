@@ -21,8 +21,10 @@ from PySide6.QtCore import QEvent, QPointF, QRect, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import (
     QCursor,
     QKeyEvent,
+    QKeySequence,
     QMouseEvent,
     QOpenGLContext,
+    QShortcut,
     QVector3D,
 )
 from PySide6.QtWidgets import (
@@ -208,6 +210,10 @@ CANVAS_SURFACE_VERTEX_PREVIEW_COLOR = (1.0, 0.76, 0.16, 1.0)
 CANVAS_SURFACE_VERTEX_SNAP_PREVIEW_COLOR = (0.20, 0.94, 0.42, 1.0)
 CANVAS_SURFACE_VERTEX_PREVIEW_SIZE_PIXELS = 18.0
 CANVAS_SURFACE_VERTEX_SNAP_DISTANCE_METERS = 0.01
+CANVAS_SURFACE_ANGLE_GUIDE_DOT_LENGTH_PIXELS = 2.0
+CANVAS_SURFACE_ANGLE_GUIDE_SPACING_PIXELS = 12.0
+CANVAS_SURFACE_ANGLE_GUIDE_FALLBACK_DOT_COUNT = 16
+CANVAS_SURFACE_ANGLE_GUIDE_MAX_DOT_COUNT = 512
 CANVAS_FACE_EXTRUSION_COLOR = (0.20, 0.86, 0.38, 1.0)
 CANVAS_FACE_EXTRUSION_PREVIEW_COLOR = (1.0, 0.72, 0.18, 1.0)
 CANVAS_EXTRUDABLE_FACE_OUTLINE_COLOR = (0.16, 0.82, 1.0, 0.96)
@@ -562,6 +568,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
     overlay_selection_requested = Signal(object)
     overlay_wheel_steps_requested = Signal(int)
     delete_requested = Signal()
+    undo_requested = Signal()
     navigation_mode_changed = Signal(str)
     first_person_active_changed = Signal(bool)
     first_person_camera_pose_changed = Signal(object)
@@ -1393,6 +1400,10 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         ):
             event.accept()
             return
+        if event.matches(QKeySequence.StandardKey.Undo):
+            self.undo_requested.emit()
+            event.accept()
+            return
         if event.key() == Qt.Key.Key_Delete:
             self.delete_requested.emit()
             event.accept()
@@ -1421,6 +1432,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         if (
             self.is_first_person_active
             and not self._first_person_ctrl_interaction_active
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier
             and event.key() in _first_person_movement_keys()
         ):
             self._pressed_movement_keys.add(event.key())
@@ -2343,6 +2355,18 @@ class _WireframeOverlayMeshItem(gl.GLMeshItem):
             GL.glDepthFunc(previous_depth_function)
 
 
+class _DepthTestedOverlayLineItem(gl.GLLinePlotItem):
+    """Keep a coplanar guide visible without drawing it through solid meshes."""
+
+    def paint(self) -> None:
+        previous_depth_function = int(GL.glGetIntegerv(GL.GL_DEPTH_FUNC))
+        GL.glDepthFunc(GL.GL_LEQUAL)
+        try:
+            super().paint()
+        finally:
+            GL.glDepthFunc(previous_depth_function)
+
+
 @dataclass
 class _SymmetricPreviewRenderGroup:
     """The textured and fallback draw items for one mirrored retained mesh."""
@@ -2431,6 +2455,7 @@ class GlbViewerWidget(QWidget):
     canvas_surface_vertex_insertion_requested = Signal(object)
     canvas_surface_vertex_chain_reset_requested = Signal()
     canvas_surface_face_extrusion_requested = Signal(object)
+    canvas_surface_face_deletion_requested = Signal(object)
     placed_object_removal_requested = Signal(str)
     placed_object_transform_changed = Signal(str, object, object)
     placed_object_selection_changed = Signal(object)
@@ -2440,6 +2465,7 @@ class GlbViewerWidget(QWidget):
     projection_camera_percentage_step_requested = Signal(str, int)
     _face_rectangle_selection_completed = Signal(object)
     delete_requested = Signal()
+    undo_requested = Signal()
     navigation_mode_changed = Signal(str)
     first_person_active_changed = Signal(bool)
     first_person_camera_pose_changed = Signal(object)
@@ -2608,7 +2634,18 @@ class GlbViewerWidget(QWidget):
         )
 
         self._build_ui()
+        self.undo_shortcut: QShortcut | None = None
         if self._window_editing_enabled:
+            self.undo_shortcut = QShortcut(
+                QKeySequence.StandardKey.Undo,
+                self,
+            )
+            self.undo_shortcut.setContext(
+                Qt.ShortcutContext.WidgetWithChildrenShortcut
+            )
+            self.undo_shortcut.activated.connect(
+                self._forward_undo_request
+            )
             self._connect_window_editor_input()
         if self._placed_object_editing_enabled:
             self._connect_placed_object_editor_input()
@@ -2630,6 +2667,12 @@ class GlbViewerWidget(QWidget):
         self._refresh_doorway_preview_outline_item()
 
     # ### Viewer UI ###
+    @Slot()
+    def _forward_undo_request(self) -> None:
+        """Forward one undo gesture through a stable QObject slot."""
+
+        self.undo_requested.emit()
+
     def _build_ui(self) -> None:
         if not self._window_editing_enabled:
             layout = QStackedLayout(self)
@@ -2663,6 +2706,7 @@ class GlbViewerWidget(QWidget):
             self._window_editing_enabled
         )
         self.view.delete_requested.connect(self._handle_view_delete_requested)
+        self.view.undo_requested.connect(self._forward_undo_request)
         self.view.navigation_mode_changed.connect(self.navigation_mode_changed.emit)
         self.view.first_person_active_changed.connect(
             self.first_person_active_changed.emit
@@ -3230,6 +3274,28 @@ class GlbViewerWidget(QWidget):
 
         return self._cancel_canvas_surface_edit_drag()
 
+    def cancel_canvas_opening_edit(self) -> bool:
+        """Cancel one live doorway or window drag at its exact start bounds."""
+
+        return self._cancel_canvas_opening_edit_drag()
+
+    def cancel_uncommitted_canvas_interaction_for_undo(self) -> bool:
+        """Cancel transient Canvas input that has not entered project history."""
+
+        if self.is_window_placement_active():
+            self.cancel_window_placement(status_message=None)
+            return True
+        if self._surface_vertex_click_ack_pending:
+            # Vertex placement commits on pointer press, so only release the
+            # pending click acknowledgement and let Ctrl+Z reach its history.
+            self._cancel_surface_vertex_pointer_interaction()
+        if self._canvas_face_extrusion_drag is not None:
+            return self._cancel_canvas_face_extrusion_drag()
+        if self._placed_object_transform_drag is not None:
+            self._cancel_placed_object_gizmo_drag()
+            return True
+        return False
+
     def clear_canvas_surface_edit_pending_outline(self) -> None:
         """Remove passive structural feedback retained during a delayed rebuild."""
 
@@ -3411,6 +3477,24 @@ class GlbViewerWidget(QWidget):
         if self._get_selected_canvas_opening_target() is not None:
             # Openings are structural edits. Delete must never fall through to
             # an unrelated face/object consumer merely because one is selected.
+            return
+        if self._window_editing_enabled and self._selected_canvas_surface_ids:
+            selected_surfaces = tuple(
+                self._canvas_surface_targets[surface_id]
+                for surface_id in self._selected_canvas_surface_ids
+                if surface_id in self._canvas_surface_targets
+            )
+            if selected_surfaces and all(
+                surface.is_directly_drawn for surface in selected_surfaces
+            ):
+                surface_ids = tuple(
+                    surface.surface_id for surface in selected_surfaces
+                )
+                self.canvas_surface_face_deletion_requested.emit(surface_ids)
+            else:
+                self.set_surface_tools_status(
+                    "Only faces created by Add vertex can be deleted."
+                )
             return
         selected_id = self._selected_placed_object_id
         if (
@@ -3904,9 +3988,16 @@ class GlbViewerWidget(QWidget):
                 rtol=0.0,
             )
         ):
-            edge_positions = np.asarray(
-                (active.world_point, preview.world_point),
-                dtype=float,
+            edge_positions = (
+                self._build_surface_vertex_angle_guide_positions(
+                    np.asarray(active.world_point, dtype=float),
+                    point,
+                )
+                if preview.snap_kind == "angle"
+                else np.asarray(
+                    (active.world_point, preview.world_point),
+                    dtype=float,
+                )
             )
             edge_item = self._surface_vertex_preview_edge_item
             if edge_item is not None and edge_item in self.view.items:
@@ -3926,6 +4017,62 @@ class GlbViewerWidget(QWidget):
         else:
             self._remove_surface_vertex_preview_edge_item()
         self.view.update()
+
+    def _build_surface_vertex_angle_guide_positions(
+        self,
+        start: np.ndarray,
+        end: np.ndarray,
+    ) -> np.ndarray:
+        """Sample an angle guide at stable screen-space dot intervals."""
+
+        delta = np.asarray(end, dtype=float) - np.asarray(start, dtype=float)
+        distance = float(np.linalg.norm(delta))
+        midpoint = np.asarray(start, dtype=float) + delta * 0.5
+        try:
+            pixel_size = float(
+                self.view.pixelSize(
+                    QVector3D(*[float(component) for component in midpoint])
+                )
+            )
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            pixel_size = 0.0
+        if math.isfinite(pixel_size) and pixel_size > 0.0:
+            interval_count = max(
+                1,
+                int(
+                    math.ceil(
+                        distance
+                        / (
+                            pixel_size
+                            * CANVAS_SURFACE_ANGLE_GUIDE_SPACING_PIXELS
+                        )
+                    )
+                ),
+            )
+            dot_length = (
+                pixel_size * CANVAS_SURFACE_ANGLE_GUIDE_DOT_LENGTH_PIXELS
+            )
+        else:
+            interval_count = CANVAS_SURFACE_ANGLE_GUIDE_FALLBACK_DOT_COUNT - 1
+            dot_length = distance / max(
+                1,
+                CANVAS_SURFACE_ANGLE_GUIDE_FALLBACK_DOT_COUNT * 2,
+            )
+        interval_count = min(
+            CANVAS_SURFACE_ANGLE_GUIDE_MAX_DOT_COUNT - 1,
+            interval_count,
+        )
+        spacing = distance / interval_count
+        half_dot_length = min(dot_length * 0.5, spacing * 0.2)
+        centers = np.linspace(0.0, distance, interval_count + 1, dtype=float)
+        distances = np.empty((len(centers), 2), dtype=float)
+        distances[:, 0] = np.maximum(0.0, centers - half_dot_length)
+        distances[:, 1] = np.minimum(distance, centers + half_dot_length)
+        unit = delta / distance
+        return (
+            np.asarray(start, dtype=float)
+            + distances.reshape((-1, 1)) * unit
+        )
 
     def _remove_surface_vertex_preview_items(self) -> None:
         """Remove both parts of the transient chained-placement preview."""
@@ -4122,14 +4269,14 @@ class GlbViewerWidget(QWidget):
             )
             if target is None:
                 continue
-            item = gl.GLLinePlotItem(
+            item = _DepthTestedOverlayLineItem(
                 pos=np.asarray(target.boundary_line_positions, dtype=float),
                 color=CANVAS_EXTRUDABLE_FACE_OUTLINE_COLOR,
                 width=CANVAS_EXTRUDABLE_FACE_OUTLINE_WIDTH,
                 antialias=True,
                 mode="lines",
             )
-            item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+            item.setGLOptions("translucent")
             item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE)
             self.view.addItem(item)
             self._canvas_extrudable_face_outline_items.append(item)

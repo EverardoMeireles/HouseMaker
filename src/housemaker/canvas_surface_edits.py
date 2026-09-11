@@ -885,6 +885,39 @@ def validate_canvas_surface_edit_geometry(
     _validate_generated_surfaces(level_sequence, target)
 
 
+def canvas_surface_edit_targets_are_at_baseline(
+    levels: Sequence[LevelData],
+    targets: Sequence[CanvasSurfaceEditHandleTarget],
+) -> bool:
+    """Return whether every edited property still equals its saved baseline."""
+
+    level_sequence = _normalize_levels(levels)
+    try:
+        target_sequence = tuple(targets)
+    except TypeError as error:
+        raise TypeError(
+            "Canvas surface baseline comparison requires a target sequence."
+        ) from error
+    if not target_sequence or not all(
+        isinstance(target, CanvasSurfaceEditHandleTarget)
+        for target in target_sequence
+    ):
+        raise ValueError(
+            "Canvas surface baseline comparison requires handle targets."
+        )
+    for target in target_sequence:
+        level = _find_level(level_sequence, target.reference.level_index)
+        _validate_level_baseline(level, target)
+        if not math.isclose(
+            _measure_current_delta(level, target),
+            0.0,
+            rel_tol=0.0,
+            abs_tol=CANVAS_SURFACE_EDIT_EPSILON,
+        ):
+            return False
+    return True
+
+
 def validate_canvas_wall_edit_batch_geometry(
     levels: Sequence[LevelData],
     targets: Sequence[CanvasSurfaceEditHandleTarget],

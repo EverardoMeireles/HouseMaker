@@ -363,18 +363,28 @@ class EditableSurfaceMeshData:
             raise ValueError(
                 "Editable surface vertices, faces, and edges must contain sequences."
             ) from error
+        if not isinstance(self.replaces_source_surface, bool):
+            raise TypeError(
+                "Editable surface replacement state must be a boolean."
+            )
         if not vertices or not all(
             isinstance(vertex, EditableSurfaceVertexData) for vertex in vertices
         ):
             raise ValueError(
                 "Editable surfaces require persistent vertex records."
             )
-        if not faces or not all(
-            isinstance(face, EditableSurfaceFaceData) for face in faces
-        ):
+        if not all(isinstance(face, EditableSurfaceFaceData) for face in faces):
             raise ValueError("Editable surfaces require persistent face records.")
+        if not faces and not self.replaces_source_surface:
+            raise ValueError(
+                "Editable surface drafts require persistent face records."
+            )
         if not all(isinstance(edge, EditableSurfaceEdgeData) for edge in edges):
             raise ValueError("Editable surface edges must contain edge records.")
+        if not faces and edges:
+            raise ValueError(
+                "Empty editable surface replacements cannot retain edges."
+            )
         vertex_ids = tuple(vertex.vertex_id for vertex in vertices)
         face_ids = tuple(face.face_id for face in faces)
         if len(set(vertex_ids)) != len(vertex_ids):
@@ -403,10 +413,6 @@ class EditableSurfaceMeshData:
         ]
         if len(set(edge_keys)) != len(edge_keys):
             raise ValueError("Editable surface edges must be unique.")
-        if not isinstance(self.replaces_source_surface, bool):
-            raise TypeError(
-                "Editable surface replacement state must be a boolean."
-            )
         object.__setattr__(self, "source_surface_id", source_surface_id)
         object.__setattr__(self, "frame_kind", frame_kind)
         object.__setattr__(self, "frame_normal_sign", frame_normal_sign)

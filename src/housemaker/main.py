@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import sys
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 
@@ -49,13 +50,15 @@ from housemaker.architectural_surface_edits import (
     SurfaceTopologyEditResult,
     SurfaceVertexInsertionRequest,
     build_surface_drawing_overlay,
+    delete_directly_drawn_surface_faces,
     extrude_surface_faces,
     place_surface_vertex,
 )
 from housemaker.atlas_export import apply_texture_atlases_to_export
-from housemaker.blueprint_canvas import BlueprintCanvas
+from housemaker.blueprint_canvas import BlueprintCanvas, CanvasSnapshot
 from housemaker.canvas_openings import (
     CANVAS_OPENING_DOORWAY,
+    CANVAS_OPENING_WINDOW,
     CanvasOpeningEdit,
     CanvasOpeningReference,
     CanvasOpeningTarget,
@@ -72,6 +75,7 @@ from housemaker.canvas_surface_edits import (
     apply_canvas_surface_edit,
     apply_canvas_wall_edit_batch,
     build_canvas_surface_edit_targets,
+    canvas_surface_edit_targets_are_at_baseline,
     rebase_canvas_floor_edit_target,
     rebase_canvas_wall_edit_targets_batch,
     restore_canvas_surface_edit,
@@ -134,6 +138,7 @@ from housemaker.models import (
     DOORWAY_SHAPE_RECTANGULAR,
     DoorwayData,
     DoorwayPreset,
+    EditableSurfaceMeshData,
     GROUND_LEVEL_INDEX,
     LevelData,
     MAX_DOORWAY_ARCH_AMOUNT,
@@ -175,6 +180,7 @@ from housemaker.texture_atlas_state import (
     ATLAS_SLOT_HALF_LEFT,
     OBJECT_TEXTURE_RESOLUTIONS,
     TextureAtlasData,
+    TextureAtlasPlacement,
 )
 from housemaker.texture_atlas_workspace import (
     AtlasObjectTextureSource,
@@ -211,6 +217,111 @@ DELAYED_CANVAS_SURFACE_EDIT_KINDS = frozenset(
         CANVAS_SURFACE_EDIT_FLOOR_THICKNESS,
     )
 )
+
+
+# ### Canvas undo models ###
+@dataclass(frozen=True)
+class _CanvasBlueprintUndoState:
+    """One pre-edit snapshot produced by the embedded 2D Canvas."""
+
+    level_index: int
+    snapshot: CanvasSnapshot
+
+
+@dataclass(frozen=True)
+class _CanvasTopologyUndoState:
+    """Persistent topology, texture, and selection state before one 3D edit."""
+
+    editable_surfaces_by_level: tuple[
+        tuple[int, tuple[EditableSurfaceMeshData, ...]],
+        ...,
+    ]
+    assignments: tuple[SurfaceTextureAssignment, ...]
+    assignment_targets_after: tuple[SurfaceTextureAssignment, ...]
+    atlas_placements: tuple[tuple[str, TextureAtlasPlacement], ...]
+    selected_surface_ids: tuple[str, ...]
+    assignment_target_ids: tuple[str, ...]
+    selected_object_id: str | None
+    active_vertex_id: str | None
+
+
+@dataclass(frozen=True)
+class _CanvasSurfaceEditUndoState:
+    """Immutable structural gizmo baselines for one committed edit."""
+
+    targets: tuple[CanvasSurfaceEditHandleTarget, ...]
+
+
+@dataclass(frozen=True)
+class _CanvasLevelPropertiesUndoState:
+    """Transform and export values for one Canvas level before one edit."""
+
+    level_index: int
+    height_meters: float
+    scale: float
+    offset_x_meters: float
+    offset_y_meters: float
+    include_in_export: bool
+
+
+@dataclass(frozen=True)
+class _CanvasOpeningEditUndoState:
+    """One doorway or window rectangle before a committed gizmo edit."""
+
+    start_edit: CanvasOpeningEdit
+
+
+@dataclass(frozen=True)
+class _CanvasWindowAdditionUndoState:
+    """Stable identity of one newly added Canvas wall window."""
+
+    window_id: str
+
+
+@dataclass(frozen=True)
+class _CanvasPlacedObjectUndoState:
+    """One object's prior Canvas state plus any Atlas allocations it owned."""
+
+    object_id: str
+    placement: GeneratedObjectPlacement | None
+    atlas_placements: tuple[tuple[str, TextureAtlasPlacement], ...] = ()
+    restore_atlas_bindings: bool = False
+
+
+@dataclass(frozen=True)
+class _CanvasStairsUndoState:
+    """The ordered stairs collection before one add or delete action."""
+
+    stairs: tuple[StairData, ...]
+
+
+_CanvasUndoState = (
+    _CanvasBlueprintUndoState
+    | _CanvasTopologyUndoState
+    | _CanvasSurfaceEditUndoState
+    | _CanvasLevelPropertiesUndoState
+    | _CanvasOpeningEditUndoState
+    | _CanvasWindowAdditionUndoState
+    | _CanvasPlacedObjectUndoState
+    | _CanvasStairsUndoState
+)
+
+
+# ### Canvas undo helpers ###
+def _surface_assignment_target_signature(
+    assignment: SurfaceTextureAssignment | None,
+) -> tuple[object, ...] | None:
+    """Return only assignment fields changed by surface topology lineage."""
+
+    if assignment is None:
+        return None
+    return (
+        assignment.surface_type,
+        assignment.surface_ids,
+        float(assignment.combined_area_m2),
+        assignment.area_description,
+    )
+
 
 # ### Event filters ###
 class RightPanelValueInputWheelFilter(QObject):
@@ -393,6 +504,8 @@ class BlueprintWorkspace(QWidget):
             tuple[object, ...],
         ] = {}
         self._canvas_window_undo_ids: list[str] = []
+        self._canvas_undo_stack: list[_CanvasUndoState] = []
+        self._is_restoring_canvas_undo = False
         self._object_placement_dialog: ObjectPlacementDialog | None = None
         self._object_placement_operation_id: str | None = None
         self._is_shutdown = False
@@ -451,6 +564,15 @@ class BlueprintWorkspace(QWidget):
         self.workspace_tabs.setSizePolicy(workspace_tabs_policy)
         self.canvas = BlueprintCanvas()
         self.viewer = GlbViewerWidget(window_editing_enabled=True)
+        self.canvas.undo_snapshot_created.connect(
+            self._handle_blueprint_undo_snapshot_created
+        )
+        self.canvas.undo_snapshot_discarded.connect(
+            self._handle_blueprint_undo_snapshot_discarded
+        )
+        self.canvas.undo_requested.connect(self._handle_canvas_undo_requested)
+        self.canvas.set_external_undo_history_enabled(True)
+        self.viewer.undo_requested.connect(self._handle_canvas_undo_requested)
         self.canvas_3d_navigation_shortcut = QShortcut(self.viewer)
         self.canvas_3d_navigation_shortcut.setContext(
             Qt.ShortcutContext.WidgetWithChildrenShortcut
@@ -669,6 +791,9 @@ class BlueprintWorkspace(QWidget):
         self.viewer.canvas_surface_face_extrusion_requested.connect(
             self._handle_canvas_surface_face_extrusion_requested
         )
+        self.viewer.canvas_surface_face_deletion_requested.connect(
+            self._handle_canvas_surface_face_deletion_requested
+        )
         self.viewer.canvas_surface_edit_started.connect(
             self._handle_canvas_surface_edit_started
         )
@@ -704,6 +829,16 @@ class BlueprintWorkspace(QWidget):
         side_panel_policy = self.side_panel.sizePolicy()
         side_panel_policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
         self.side_panel.setSizePolicy(side_panel_policy)
+        self.canvas_side_panel_undo_shortcut = QShortcut(
+            QKeySequence.StandardKey.Undo,
+            self.side_panel,
+        )
+        self.canvas_side_panel_undo_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self.canvas_side_panel_undo_shortcut.activated.connect(
+            self._handle_canvas_undo_requested
+        )
         side_layout = QVBoxLayout(self.side_panel)
         side_layout.setContentsMargins(16, 16, 16, 16)
         side_layout.setSpacing(12)
@@ -1215,6 +1350,9 @@ class BlueprintWorkspace(QWidget):
             return
 
         self._canvas_window_undo_ids.append(window.window_id)
+        self._record_canvas_undo_state(
+            _CanvasWindowAdditionUndoState(window_id=window.window_id)
+        )
         self._sync_canvas_window_undo_availability()
         self.viewer.set_window_tools_status("Window added.")
 
@@ -1277,8 +1415,32 @@ class BlueprintWorkspace(QWidget):
             return
 
         self._canvas_window_undo_ids.pop()
+        if not self._is_restoring_canvas_undo:
+            self._discard_removed_window_undo_states(window_id)
         self._sync_canvas_window_undo_availability()
         self.viewer.set_window_tools_status("Window undone.")
+
+    def _discard_removed_window_undo_states(self, window_id: str) -> None:
+        """Remove history entries whose stable window target was removed."""
+
+        normalized_window_id = str(window_id).strip()
+        self._canvas_undo_stack = [
+            state
+            for state in self._canvas_undo_stack
+            if not (
+                (
+                    isinstance(state, _CanvasWindowAdditionUndoState)
+                    and state.window_id == normalized_window_id
+                )
+                or (
+                    isinstance(state, _CanvasOpeningEditUndoState)
+                    and state.start_edit.reference.kind
+                    == CANVAS_OPENING_WINDOW
+                    and state.start_edit.reference.stable_id
+                    == normalized_window_id
+                )
+            )
+        ]
 
     # ### Canvas opening gizmo edits ###
     def _handle_canvas_opening_selection_changed(
@@ -1314,6 +1476,7 @@ class BlueprintWorkspace(QWidget):
 
         if not isinstance(raw_edit, CanvasOpeningEdit):
             return
+        self._commit_pending_canvas_surface_mesh_update()
         pending_key = self._pending_canvas_opening_key
         if pending_key is not None and pending_key != raw_edit.reference.key:
             self._stage_pending_canvas_opening_snapshots()
@@ -1364,7 +1527,7 @@ class BlueprintWorkspace(QWidget):
     def _handle_canvas_opening_edit_finished(
         self,
         raw_edit: object,
-        _changed: bool,
+        changed: bool,
     ) -> None:
         """Start the complete configured delay only after mouse release."""
 
@@ -1375,6 +1538,16 @@ class BlueprintWorkspace(QWidget):
             and raw_edit.reference != self._active_canvas_opening_reference
         ):
             return
+        start_edit = self._active_canvas_opening_start_edit
+        if (
+            changed
+            and start_edit is not None
+            and raw_edit.bounds != start_edit.bounds
+        ):
+            self._record_canvas_undo_state(
+                _CanvasOpeningEditUndoState(start_edit=start_edit),
+                commit_pending_surface_edit=False,
+            )
         self._finish_canvas_opening_drag()
 
     def _handle_canvas_opening_edit_cancelled(
@@ -1646,6 +1819,515 @@ class BlueprintWorkspace(QWidget):
         self.canvas.set_selected_wall_surface_id(selected_wall_id)
 
     # ### Canvas persistent surface topology edits ###
+    def _record_canvas_undo_state(
+        self,
+        state: _CanvasUndoState,
+        *,
+        commit_pending_surface_edit: bool = True,
+    ) -> None:
+        """Append one action after committing every chronologically older edit."""
+
+        if self._is_restoring_canvas_undo:
+            return
+        if commit_pending_surface_edit:
+            self._commit_pending_canvas_surface_mesh_update()
+        self._canvas_undo_stack.append(state)
+
+    def _clear_canvas_undo_history(self) -> None:
+        """Start a new history branch after replacing Canvas coordinates."""
+
+        self._canvas_undo_stack.clear()
+        self.canvas.undo_stack.clear()
+
+    def _handle_blueprint_undo_snapshot_created(
+        self,
+        raw_snapshot: object,
+    ) -> None:
+        """Add one existing 2D Canvas transaction to shared Canvas history."""
+
+        if self._is_restoring_canvas_undo or not isinstance(
+            raw_snapshot,
+            CanvasSnapshot,
+        ):
+            return
+        self._record_canvas_undo_state(
+            _CanvasBlueprintUndoState(
+                level_index=self.current_level.index,
+                snapshot=raw_snapshot,
+            )
+        )
+
+    def _handle_blueprint_undo_snapshot_discarded(
+        self,
+        raw_snapshot: object,
+    ) -> None:
+        """Retract a provisional 2D snapshot when its drag ends unchanged."""
+
+        if self._is_restoring_canvas_undo or not isinstance(
+            raw_snapshot,
+            CanvasSnapshot,
+        ):
+            return
+        for index in range(len(self._canvas_undo_stack) - 1, -1, -1):
+            state = self._canvas_undo_stack[index]
+            if (
+                isinstance(state, _CanvasBlueprintUndoState)
+                and state.snapshot is raw_snapshot
+            ):
+                del self._canvas_undo_stack[index]
+                return
+
+    def _capture_canvas_level_properties_undo_state(
+        self,
+        level: LevelData,
+    ) -> _CanvasLevelPropertiesUndoState:
+        """Capture the level fields edited directly by Canvas side controls."""
+
+        return _CanvasLevelPropertiesUndoState(
+            level_index=level.index,
+            height_meters=float(level.height_meters),
+            scale=float(level.scale),
+            offset_x_meters=float(level.offset_x_meters),
+            offset_y_meters=float(level.offset_y_meters),
+            include_in_export=bool(level.include_in_export),
+        )
+
+    def _capture_canvas_topology_undo_state(self) -> _CanvasTopologyUndoState:
+        """Capture structurally shared geometry plus assignment provenance."""
+
+        assignments = self.surface_texture_generation.snapshot_assignments()
+        assignment_source_ids = {
+            build_atlas_wall_texture_source_id(assignment.assignment_id)
+            for assignment in assignments
+        }
+        atlas_placements = tuple(
+            (atlas.atlas_id, placement)
+            for atlas in self.texture_atlas_workspace.get_data().atlases
+            for placement in atlas.placements
+            if placement.object_id in assignment_source_ids
+        )
+        return _CanvasTopologyUndoState(
+            editable_surfaces_by_level=tuple(
+                (level.index, tuple(level.editable_surfaces))
+                for level in self.levels
+            ),
+            assignments=assignments,
+            assignment_targets_after=(),
+            atlas_placements=atlas_placements,
+            selected_surface_ids=self._desired_canvas_surface_ids,
+            assignment_target_ids=self._atlas_surface_assignment_target_ids,
+            selected_object_id=self._desired_canvas_object_id,
+            active_vertex_id=self._active_canvas_surface_drawing_vertex_id,
+        )
+
+    def _finalize_canvas_topology_undo_state(
+        self,
+        state: _CanvasTopologyUndoState,
+    ) -> _CanvasTopologyUndoState:
+        """Limit texture history to assignments changed by this topology edit."""
+
+        current_by_id = {
+            assignment.assignment_id: assignment
+            for assignment in self.surface_texture_generation.snapshot_assignments()
+        }
+        affected_assignments = tuple(
+            assignment
+            for assignment in state.assignments
+            if _surface_assignment_target_signature(assignment)
+            != _surface_assignment_target_signature(
+                current_by_id.get(assignment.assignment_id)
+            )
+        )
+        affected_source_ids = {
+            build_atlas_wall_texture_source_id(assignment.assignment_id)
+            for assignment in affected_assignments
+        }
+        return replace(
+            state,
+            assignments=affected_assignments,
+            assignment_targets_after=tuple(
+                current_by_id[assignment.assignment_id]
+                for assignment in affected_assignments
+                if assignment.assignment_id in current_by_id
+            ),
+            atlas_placements=tuple(
+                (atlas_id, placement)
+                for atlas_id, placement in state.atlas_placements
+                if placement.object_id in affected_source_ids
+            ),
+        )
+
+    def _handle_canvas_undo_requested(self) -> None:
+        """Undo the latest committed Canvas action from either Canvas view."""
+
+        if self.canvas.is_stair_placement_active():
+            self.canvas.cancel_stair_placement()
+            self.viewer.set_surface_tools_status("Current stair placement cancelled.")
+            return
+        if self.viewer.cancel_uncommitted_canvas_interaction_for_undo():
+            self.viewer.set_surface_tools_status(
+                "Current Canvas interaction cancelled."
+            )
+            return
+        if self.viewer.cancel_canvas_opening_edit():
+            self.viewer.set_surface_tools_status("Current opening drag cancelled.")
+            return
+        if self._cancel_active_canvas_surface_edit():
+            self.viewer.set_surface_tools_status("Current Canvas drag cancelled.")
+            return
+        if self._undo_pending_canvas_surface_mesh_update():
+            self.viewer.set_surface_tools_status("Canvas surface edit undone.")
+            return
+        if not self._canvas_undo_stack:
+            self.viewer.set_surface_tools_status("No Canvas action to undo.")
+            return
+        state = self._canvas_undo_stack[-1]
+        skipped_texture_bindings = 0
+        self._is_restoring_canvas_undo = True
+        try:
+            self._cancel_pending_canvas_surface_mesh_update()
+            self._cancel_pending_wall_vertex_update()
+            self._cancel_pending_doorway_mesh_update(clear_outline=True)
+            if isinstance(state, _CanvasTopologyUndoState):
+                skipped_texture_bindings = (
+                    self._restore_canvas_topology_undo_state(state)
+                )
+            elif isinstance(state, _CanvasSurfaceEditUndoState):
+                self._restore_canvas_surface_edit_undo_state(state)
+            elif isinstance(state, _CanvasLevelPropertiesUndoState):
+                self._restore_canvas_level_properties_undo_state(state)
+            elif isinstance(state, _CanvasOpeningEditUndoState):
+                self._restore_canvas_opening_edit_undo_state(state)
+            elif isinstance(state, _CanvasWindowAdditionUndoState):
+                self._restore_canvas_window_addition_undo_state(state)
+            elif isinstance(state, _CanvasPlacedObjectUndoState):
+                skipped_texture_bindings = (
+                    self._restore_canvas_placed_object_undo_state(state)
+                )
+            elif isinstance(state, _CanvasStairsUndoState):
+                self._restore_canvas_stairs_undo_state(state)
+            else:
+                self._restore_blueprint_undo_state(state)
+        except (RuntimeError, TypeError, ValueError) as error:
+            self.viewer.set_surface_tools_status(f"Canvas undo stopped: {error}")
+            return
+        finally:
+            self._is_restoring_canvas_undo = False
+
+        self._canvas_undo_stack.pop()
+        if skipped_texture_bindings:
+            self.viewer.set_surface_tools_status(
+                "Canvas action undone; newer texture bindings were kept or "
+                "some Atlas placements could not be restored."
+            )
+        else:
+            self.viewer.set_surface_tools_status("Canvas action undone.")
+
+    def _restore_canvas_surface_edit_undo_state(
+        self,
+        state: _CanvasSurfaceEditUndoState,
+    ) -> None:
+        """Restore wall, floor, or ceiling values from immutable gizmo targets."""
+
+        if not state.targets:
+            raise ValueError("Canvas surface undo has no structural baseline.")
+        applied_edits = self._restore_canvas_surface_edit_targets(state.targets)
+        self._sync_live_canvas_surface_edits(applied_edits)
+        self._canvas_surface_edit_targets_by_key = {}
+        self.viewer.set_canvas_surface_edit_targets(())
+        self.viewer.clear_canvas_surface_edit_pending_outline()
+        self._reconcile_canvas_surface_edit_and_refresh()
+
+    def _restore_canvas_level_properties_undo_state(
+        self,
+        state: _CanvasLevelPropertiesUndoState,
+    ) -> None:
+        """Restore one direct Canvas level-control change."""
+
+        level = next(
+            (
+                candidate
+                for candidate in self.levels
+                if candidate.index == state.level_index
+            ),
+            None,
+        )
+        if level is None:
+            raise ValueError("The Canvas level in this undo step no longer exists.")
+        level.height_meters = state.height_meters
+        level.scale = state.scale
+        level.offset_x_meters = state.offset_x_meters
+        level.offset_y_meters = state.offset_y_meters
+        level.include_in_export = state.include_in_export
+        if level is self.current_level:
+            self._sync_level_controls()
+            self.canvas.update()
+        self.surface_texture_generation.reconcile_assignments_with_levels(
+            self.levels
+        )
+        self._refresh_scene_atlas_texture_requirements()
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
+
+    def _restore_canvas_opening_edit_undo_state(
+        self,
+        state: _CanvasOpeningEditUndoState,
+    ) -> None:
+        """Restore one doorway or window edit and resume its mesh debounce."""
+
+        target = self._canvas_opening_targets_by_key.get(
+            state.start_edit.reference.key
+        )
+        if target is None:
+            raise ValueError("The Canvas opening in this undo step no longer exists.")
+        applied = apply_canvas_opening_edit(
+            self.levels,
+            target,
+            state.start_edit,
+        )
+        restored_target = target.with_bounds(state.start_edit.bounds)
+        self._canvas_opening_targets_by_key[target.key] = restored_target
+        self._sync_live_canvas_opening(applied.reference, applied.level)
+        self._refresh_pending_canvas_opening_state(applied.reference)
+        if (
+            self._pending_doorway_mesh_level_index is not None
+            or self._pending_window_mesh_level_index is not None
+        ):
+            self._doorway_mesh_update_timer.start()
+
+    def _restore_canvas_window_addition_undo_state(
+        self,
+        state: _CanvasWindowAdditionUndoState,
+    ) -> None:
+        """Remove one added window through its existing transactional undo."""
+
+        if (
+            not self._canvas_window_undo_ids
+            or self._canvas_window_undo_ids[-1] != state.window_id
+        ):
+            raise ValueError("The added Canvas window can no longer be undone.")
+        previous_count = len(self._canvas_window_undo_ids)
+        self._handle_canvas_window_undo_requested()
+        if len(self._canvas_window_undo_ids) != previous_count - 1:
+            raise RuntimeError("The added Canvas window could not be undone.")
+
+    def _restore_canvas_placed_object_undo_state(
+        self,
+        state: _CanvasPlacedObjectUndoState,
+    ) -> int:
+        """Restore one object's prior placement and eligible Atlas bindings."""
+
+        restored = self.generation.restore_placeable_object_placement(
+            state.object_id,
+            state.placement,
+            emit_change_signals=False,
+        )
+        if not restored:
+            raise ValueError("The placed object in this undo step no longer exists.")
+        if state.restore_atlas_bindings and state.placement is None:
+            self.texture_atlas_workspace.remove_scene_texture_from_atlases(
+                state.object_id
+            )
+        skipped_atlas_placements = (
+            self._restore_canvas_atlas_placements(state.atlas_placements)
+            if state.restore_atlas_bindings
+            else 0
+        )
+        self._atlas_generation_signature = None
+        self._sync_atlas_object_texture_sources(
+            automatically_assign_scene_textures=False
+        )
+        if state.restore_atlas_bindings and state.atlas_placements:
+            self.texture_atlas_workspace.refresh_texture_source_content(
+                tuple(
+                    dict.fromkeys(
+                        placement.object_id
+                        for _atlas_id, placement in state.atlas_placements
+                    )
+                )
+            )
+        self._desired_canvas_object_id = (
+            state.object_id if state.placement is not None else None
+        )
+        self._desired_canvas_surface_ids = ()
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
+        return skipped_atlas_placements
+
+    def _restore_canvas_stairs_undo_state(
+        self,
+        state: _CanvasStairsUndoState,
+    ) -> None:
+        """Restore the stairs collection before one Canvas add or deletion."""
+
+        self.stairs = list(state.stairs)
+        self.canvas.set_stair_context(self.stairs, self.current_level)
+        self._update_stair_button_state()
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
+
+    def _restore_blueprint_undo_state(
+        self,
+        state: _CanvasBlueprintUndoState,
+    ) -> None:
+        """Restore one 2D wall/doorway snapshot without changing active level."""
+
+        level = next(
+            (
+                candidate
+                for candidate in self.levels
+                if candidate.index == state.level_index
+            ),
+            None,
+        )
+        if level is None:
+            raise ValueError("The Canvas level in this undo step no longer exists.")
+        if level is self.current_level:
+            self.canvas.discard_undo_snapshot(state.snapshot)
+            self.canvas.restore_snapshot(state.snapshot)
+        else:
+            level.vertex_data.copy_from(state.snapshot.vertex_data)
+            level.rooms.clear()
+            level.rooms.extend(copy.deepcopy(state.snapshot.rooms))
+            level.doorways.clear()
+            level.doorways.extend(copy.deepcopy(state.snapshot.doorways))
+            self._reset_viewer_doorway_snapshots()
+            self.surface_texture_generation.reconcile_assignments_with_levels(
+                self.levels
+            )
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+
+    def _restore_canvas_topology_undo_state(
+        self,
+        state: _CanvasTopologyUndoState,
+    ) -> int:
+        """Restore one Add vertex transaction and its texture bindings."""
+
+        levels_by_index = {level.index: level for level in self.levels}
+        restoration_targets: list[
+            tuple[LevelData, tuple[EditableSurfaceMeshData, ...]]
+        ] = []
+        for level_index, editable_surfaces in state.editable_surfaces_by_level:
+            level = levels_by_index.get(level_index)
+            if level is None:
+                raise ValueError(
+                    "The Canvas level in this undo step no longer exists."
+                )
+            restoration_targets.append((level, editable_surfaces))
+        for level, editable_surfaces in restoration_targets:
+            level.editable_surfaces = list(editable_surfaces)
+        self._desired_canvas_surface_ids = state.selected_surface_ids
+        self._atlas_surface_assignment_target_ids = state.assignment_target_ids
+        self._desired_canvas_object_id = state.selected_object_id
+        self._active_canvas_surface_drawing_vertex_id = state.active_vertex_id
+        expected_by_id = {
+            assignment.assignment_id: assignment
+            for assignment in state.assignment_targets_after
+        }
+        current_by_id = {
+            assignment.assignment_id: assignment
+            for assignment in self.surface_texture_generation.snapshot_assignments()
+        }
+        restorable_assignments = tuple(
+            assignment
+            for assignment in state.assignments
+            if (
+                assignment.assignment_id in expected_by_id
+                and _surface_assignment_target_signature(
+                    current_by_id.get(assignment.assignment_id)
+                )
+                == _surface_assignment_target_signature(
+                    expected_by_id[assignment.assignment_id]
+                )
+            )
+        )
+        restorable_assignment_ids = {
+            assignment.assignment_id for assignment in restorable_assignments
+        }
+        self.surface_texture_generation.restore_assignment_target_snapshot(
+            restorable_assignments,
+            emit_signals=False,
+        )
+        restorable_source_ids = {
+            build_atlas_wall_texture_source_id(assignment_id)
+            for assignment_id in restorable_assignment_ids
+        }
+        restorable_atlas_placements = tuple(
+            (atlas_id, placement)
+            for atlas_id, placement in state.atlas_placements
+            if placement.object_id in restorable_source_ids
+        )
+        skipped_atlas_placements = self._restore_canvas_atlas_placements(
+            restorable_atlas_placements
+        )
+        self._atlas_generation_signature = None
+        self._sync_atlas_object_texture_sources(
+            automatically_assign_scene_textures=False
+        )
+        affected_source_ids = tuple(
+            dict.fromkeys(
+                placement.object_id
+                for _atlas_id, placement in restorable_atlas_placements
+            )
+        )
+        self.texture_atlas_workspace.refresh_texture_source_content(
+            affected_source_ids
+        )
+        self._sync_canvas_surface_drawing_overlay()
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
+        return (
+            len(state.assignments)
+            - len(restorable_assignments)
+            + skipped_atlas_placements
+        )
+
+    def _restore_canvas_atlas_placements(
+        self,
+        placements: Sequence[tuple[str, TextureAtlasPlacement]],
+    ) -> int:
+        """Restore each source once without overwriting newer Atlas work."""
+
+        atlas_data = self.texture_atlas_workspace.get_data()
+        requested_by_source_id: dict[
+            str,
+            tuple[str, TextureAtlasPlacement],
+        ] = {}
+        for atlas_id, placement in placements:
+            requested_by_source_id.setdefault(
+                placement.object_id,
+                (atlas_id, placement),
+            )
+        current_by_source_id = {
+            placement.object_id: (atlas.atlas_id, placement)
+            for atlas in atlas_data.atlases
+            for placement in atlas.placements
+        }
+        changed = False
+        skipped = 0
+        for source_id, (atlas_id, placement) in requested_by_source_id.items():
+            current = current_by_source_id.get(source_id)
+            if current is not None:
+                if current != (atlas_id, placement):
+                    skipped += 1
+                continue
+            atlas = atlas_data.atlas_by_id(atlas_id)
+            if atlas is None:
+                skipped += 1
+                continue
+            try:
+                atlas_data.assign_object(
+                    atlas_id,
+                    placement.object_id,
+                    placement.texture_path,
+                    placement.texture_resolution,
+                    placement.packing_mode,
+                )
+            except (OSError, TypeError, ValueError):
+                skipped += 1
+                continue
+            current_by_source_id[source_id] = (atlas_id, placement)
+            changed = True
+        if changed:
+            self.texture_atlas_workspace.set_data(atlas_data)
+        return skipped
+
     def _sync_canvas_surface_drawing_overlay(self) -> None:
         """Keep persistent drawn vertices and edges aligned with preview levels."""
 
@@ -1711,17 +2393,49 @@ class BlueprintWorkspace(QWidget):
             ),
         )
 
+    def _handle_canvas_surface_face_deletion_requested(
+        self,
+        raw_surface_ids: object,
+    ) -> None:
+        """Delete selected Add vertex faces through the topology transaction."""
+
+        try:
+            surface_ids = tuple(
+                dict.fromkeys(str(value) for value in raw_surface_ids)  # type: ignore[arg-type]
+            )
+        except TypeError:
+            return
+        if not surface_ids:
+            return
+        deleted = self._apply_canvas_surface_topology_edit(
+            lambda: delete_directly_drawn_surface_faces(
+                self.levels,
+                surface_ids,
+            ),
+            success_message=(
+                "Selected Add vertex face deleted. Press Ctrl+Z to restore it."
+            ),
+        )
+        if not deleted:
+            return
+        self._is_syncing_canvas_scene_selection = True
+        try:
+            self.viewer.set_selected_canvas_surface_ids(())
+        finally:
+            self._is_syncing_canvas_scene_selection = False
+
     def _apply_canvas_surface_topology_edit(
         self,
         operation: Callable[[], SurfaceTopologyEditResult],
         *,
         success_message: str,
-    ) -> None:
+    ) -> bool:
         """Apply geometry and texture-lineage changes as one UI transaction."""
 
         self._commit_pending_canvas_surface_mesh_update()
         self._commit_pending_wall_vertex_update()
         self._commit_pending_doorway_mesh_update()
+        undo_state = BlueprintWorkspace._capture_canvas_topology_undo_state(self)
         previous_edits = [
             (level, copy.deepcopy(level.editable_surfaces))
             for level in self.levels
@@ -1768,16 +2482,25 @@ class BlueprintWorkspace(QWidget):
             )
             if result is not None and result.requires_mesh_refresh:
                 self._schedule_viewer_preview_refresh(preserve_camera=True)
-            return
+            return False
 
         if result.requires_mesh_refresh:
             self.surface_texture_generation.reconcile_assignments_with_levels(
                 self.levels
             )
+        if result.state_changed:
+            self._record_canvas_undo_state(
+                BlueprintWorkspace._finalize_canvas_topology_undo_state(
+                    self,
+                    undo_state,
+                ),
+                commit_pending_surface_edit=False,
+            )
         self._sync_canvas_surface_drawing_overlay()
         self.viewer.set_surface_tools_status(success_message)
         if result.requires_mesh_refresh:
             self._schedule_viewer_preview_refresh(preserve_camera=True)
+        return True
 
     # ### Canvas structural surface edits ###
     def _resolve_canvas_surface_edit_targets(
@@ -2042,6 +2765,9 @@ class BlueprintWorkspace(QWidget):
 
         # Height edits rebuild immediately, so their old immutable baselines
         # are retired until the refreshed scene installs new ones.
+        self._record_canvas_undo_state(
+            _CanvasSurfaceEditUndoState(targets=tuple(active_targets))
+        )
         self._canvas_surface_edit_targets_by_key = {}
         self.viewer.set_canvas_surface_edit_targets(())
         self._reconcile_canvas_surface_edit_and_refresh()
@@ -2083,6 +2809,17 @@ class BlueprintWorkspace(QWidget):
                 self._reject_pending_canvas_surface_mesh_update(error)
                 return
 
+        if (
+            baselines
+            and not canvas_surface_edit_targets_are_at_baseline(
+                self.levels,
+                baselines,
+            )
+        ):
+            self._record_canvas_undo_state(
+                _CanvasSurfaceEditUndoState(targets=tuple(baselines)),
+                commit_pending_surface_edit=False,
+            )
         self._commit_viewer_floor_thickness_snapshot()
         self._pending_canvas_surface_mesh_update = False
         self._pending_canvas_surface_mesh_baseline = None
@@ -2105,6 +2842,25 @@ class BlueprintWorkspace(QWidget):
         self._pending_canvas_wall_surface_ids = ()
         self._pending_floor_thickness_level_index = None
         self.viewer.clear_canvas_surface_edit_pending_outline()
+
+    def _undo_pending_canvas_surface_mesh_update(self) -> bool:
+        """Restore a delayed structural edit before it enters undo history."""
+
+        if not self._pending_canvas_surface_mesh_update:
+            return False
+        baseline = self._pending_canvas_surface_mesh_baseline
+        baselines = self._pending_canvas_surface_mesh_baselines
+        if not baselines and baseline is not None:
+            baselines = (baseline,)
+        if not baselines:
+            return False
+        applied_edits = self._restore_canvas_surface_edit_targets(baselines)
+        self._cancel_pending_canvas_surface_mesh_update()
+        self._canvas_surface_edit_targets_by_key = {}
+        self.viewer.set_canvas_surface_edit_targets(())
+        self._sync_live_canvas_surface_edits(applied_edits)
+        self._reconcile_canvas_surface_edit_and_refresh()
+        return True
 
     def _reject_pending_canvas_surface_mesh_update(
         self,
@@ -2648,6 +3404,10 @@ class BlueprintWorkspace(QWidget):
                     geometry_dimensions_changed = True
 
         if geometry_dimensions_changed:
+            self._cancel_pending_canvas_surface_mesh_update()
+            self._cancel_pending_wall_vertex_update()
+            self._cancel_pending_doorway_mesh_update(clear_outline=True)
+            self._clear_canvas_undo_history()
             self._mark_viewer_preview_dirty(preserve_camera=False)
 
     def _handle_workspace_tab_changed(self, tab_index: int) -> None:
@@ -2779,11 +3539,38 @@ class BlueprintWorkspace(QWidget):
             or not isinstance(raw_placement, GeneratedObjectPlacement)
         ):
             return
+        previous_state = (
+            self.generation.get_existing_object_placement_request_state(
+                operation_id
+            )
+        )
+        previous_atlas_placements = (
+            self._capture_canvas_atlas_placements(previous_state[0])
+            if previous_state is not None
+            else ()
+        )
         if not self.generation.set_active_object_placement(
             operation_id,
             raw_placement,
         ):
             self._close_object_placement_dialog()
+            return
+        if previous_state is None or self._is_restoring_canvas_undo:
+            return
+        object_id, previous_placement = previous_state
+        current_placement = self.generation.get_generated_object_placement(
+            object_id
+        )
+        if current_placement == previous_placement:
+            return
+        self._record_canvas_undo_state(
+            _CanvasPlacedObjectUndoState(
+                object_id=object_id,
+                placement=previous_placement,
+                atlas_placements=previous_atlas_placements,
+                restore_atlas_bindings=True,
+            )
+        )
 
     def _handle_object_placement_dialog_finished(
         self,
@@ -2807,6 +3594,14 @@ class BlueprintWorkspace(QWidget):
     ) -> None:
         """Close only the picker owned by the completed operation token."""
 
+        self._canvas_undo_stack = [
+            state
+            for state in self._canvas_undo_stack
+            if not (
+                isinstance(state, _CanvasPlacedObjectUndoState)
+                and state.object_id == str(operation_id)
+            )
+        ]
         if str(operation_id) != self._object_placement_operation_id:
             return
         self._close_object_placement_dialog()
@@ -2832,11 +3627,26 @@ class BlueprintWorkspace(QWidget):
     ) -> None:
         """Reveal a newly placed object and refit the Canvas 3D view."""
 
-        if (
-            isinstance(raw_record, GeneratedObjectRecord)
-            and raw_record.placement is not None
-        ):
-            self._schedule_viewer_preview_refresh(preserve_camera=False)
+        if not isinstance(raw_record, GeneratedObjectRecord):
+            return
+        operation_id = self.generation.get_generation_operation_id_for_object(
+            raw_record.object_id
+        )
+        if operation_id is not None:
+            self._migrate_canvas_placement_undo_operation(
+                operation_id,
+                raw_record.object_id,
+            )
+        if raw_record.placement is None:
+            return
+        self._record_canvas_undo_state(
+            _CanvasPlacedObjectUndoState(
+                object_id=raw_record.object_id,
+                placement=None,
+                restore_atlas_bindings=True,
+            )
+        )
+        self._schedule_viewer_preview_refresh(preserve_camera=False)
 
     def _handle_generated_object_changed_for_canvas(
         self,
@@ -2860,13 +3670,70 @@ class BlueprintWorkspace(QWidget):
         if isinstance(raw_record, GeneratedObjectRecord):
             self._schedule_viewer_preview_refresh(preserve_camera=True)
 
+    def _capture_canvas_atlas_placements(
+        self,
+        source_id: str,
+    ) -> tuple[tuple[str, TextureAtlasPlacement], ...]:
+        """Capture every current Atlas occurrence of one source ID."""
+
+        normalized_source_id = str(source_id).strip()
+        return tuple(
+            (atlas.atlas_id, placement)
+            for atlas in self.texture_atlas_workspace.get_data().atlases
+            for placement in atlas.placements
+            if placement.object_id == normalized_source_id
+        )
+
+    def _migrate_canvas_placement_undo_operation(
+        self,
+        operation_id: str,
+        object_id: str,
+    ) -> None:
+        """Move in-flight placement history onto its committed object ID."""
+
+        normalized_operation_id = str(operation_id).strip()
+        normalized_object_id = str(object_id).strip()
+        for index, state in enumerate(self._canvas_undo_stack):
+            if not (
+                isinstance(state, _CanvasPlacedObjectUndoState)
+                and state.object_id == normalized_operation_id
+            ):
+                continue
+            migrated_atlas_placements = tuple(
+                (
+                    atlas_id,
+                    replace(placement, object_id=normalized_object_id),
+                )
+                for atlas_id, placement in state.atlas_placements
+            )
+            self._canvas_undo_stack[index] = replace(
+                state,
+                object_id=normalized_object_id,
+                atlas_placements=migrated_atlas_placements,
+            )
+
     def _handle_placed_object_removal_requested(self, object_id: str) -> None:
         """Remove a Canvas placement and unassign its texture from Atlases."""
 
         normalized_object_id = str(object_id).strip()
+        existing_placement = self.generation.get_generated_object_placement(
+            normalized_object_id
+        )
+        atlas_placements = self._capture_canvas_atlas_placements(
+            normalized_object_id
+        )
         if self.generation.remove_generated_object_placement(
             normalized_object_id
         ):
+            if existing_placement is not None:
+                self._record_canvas_undo_state(
+                    _CanvasPlacedObjectUndoState(
+                        object_id=normalized_object_id,
+                        placement=existing_placement,
+                        atlas_placements=atlas_placements,
+                        restore_atlas_bindings=True,
+                    )
+                )
             if self._desired_canvas_object_id == normalized_object_id:
                 self._desired_canvas_object_id = None
             self.texture_atlas_workspace.remove_scene_texture_from_atlases(
@@ -2949,6 +3816,13 @@ class BlueprintWorkspace(QWidget):
         if not was_updated:
             self._schedule_viewer_preview_refresh(preserve_camera=True)
             return
+        if placement != existing_placement:
+            self._record_canvas_undo_state(
+                _CanvasPlacedObjectUndoState(
+                    object_id=normalized_object_id,
+                    placement=existing_placement,
+                )
+            )
 
         revision = self._mark_viewer_preview_dirty(preserve_camera=True)
         dependency_signature_after = (
@@ -2980,7 +3854,16 @@ class BlueprintWorkspace(QWidget):
     ) -> None:
         """Remove any deleted placed object from the Canvas preview."""
 
-        if self._desired_canvas_object_id == str(object_id).strip():
+        normalized_object_id = str(object_id).strip()
+        self._canvas_undo_stack = [
+            state
+            for state in self._canvas_undo_stack
+            if not (
+                isinstance(state, _CanvasPlacedObjectUndoState)
+                and state.object_id == normalized_object_id
+            )
+        ]
+        if self._desired_canvas_object_id == normalized_object_id:
             self._desired_canvas_object_id = None
         self._schedule_viewer_preview_refresh(preserve_camera=True)
 
@@ -3183,6 +4066,14 @@ class BlueprintWorkspace(QWidget):
         if not normalized_source_id:
             return
         if source_kind == "object":
+            previous_state = (
+                self.generation.get_placeable_object_placement_state(
+                    normalized_source_id
+                )
+            )
+            previous_atlas_placements = self._capture_canvas_atlas_placements(
+                normalized_source_id
+            )
             removed_from_canvas = (
                 self.generation.remove_placeable_object_placement(
                     normalized_source_id
@@ -3192,6 +4083,19 @@ class BlueprintWorkspace(QWidget):
                 self.texture_atlas_workspace
                 .remove_scene_texture_from_atlases(normalized_source_id)
             )
+            if (
+                removed_from_canvas
+                and previous_state is not None
+            ):
+                stable_id, previous_placement = previous_state
+                self._record_canvas_undo_state(
+                    _CanvasPlacedObjectUndoState(
+                        object_id=stable_id,
+                        placement=previous_placement,
+                        atlas_placements=previous_atlas_placements,
+                        restore_atlas_bindings=True,
+                    )
+                )
             if self._desired_canvas_object_id == normalized_source_id:
                 self._desired_canvas_object_id = None
             self._atlas_generation_signature = None
@@ -5942,7 +6846,15 @@ class BlueprintWorkspace(QWidget):
         if self._is_syncing_level_controls:
             return
 
-        self.current_level.height_meters = value
+        next_value = float(value)
+        if next_value == self.current_level.height_meters:
+            return
+        self._record_canvas_undo_state(
+            self._capture_canvas_level_properties_undo_state(
+                self.current_level
+            )
+        )
+        self.current_level.height_meters = next_value
         self._schedule_viewer_preview_refresh()
 
     def _handle_floor_thickness_changed(self, value: float) -> None:
@@ -5959,7 +6871,15 @@ class BlueprintWorkspace(QWidget):
         if self._is_syncing_level_controls:
             return
 
-        self.current_level.scale = float(value)
+        next_value = float(value)
+        if next_value == self.current_level.scale:
+            return
+        self._record_canvas_undo_state(
+            self._capture_canvas_level_properties_undo_state(
+                self.current_level
+            )
+        )
+        self.current_level.scale = next_value
         self.canvas.update()
         self._schedule_viewer_preview_refresh()
 
@@ -5967,7 +6887,15 @@ class BlueprintWorkspace(QWidget):
         if self._is_syncing_level_controls:
             return
 
-        self.current_level.offset_x_meters = float(value)
+        next_value = float(value)
+        if next_value == self.current_level.offset_x_meters:
+            return
+        self._record_canvas_undo_state(
+            self._capture_canvas_level_properties_undo_state(
+                self.current_level
+            )
+        )
+        self.current_level.offset_x_meters = next_value
         self.canvas.update()
         self._schedule_viewer_preview_refresh()
 
@@ -5975,7 +6903,15 @@ class BlueprintWorkspace(QWidget):
         if self._is_syncing_level_controls:
             return
 
-        self.current_level.offset_y_meters = float(value)
+        next_value = float(value)
+        if next_value == self.current_level.offset_y_meters:
+            return
+        self._record_canvas_undo_state(
+            self._capture_canvas_level_properties_undo_state(
+                self.current_level
+            )
+        )
+        self.current_level.offset_y_meters = next_value
         self.canvas.update()
         self._schedule_viewer_preview_refresh()
 
@@ -6287,6 +7223,9 @@ class BlueprintWorkspace(QWidget):
             self._update_stair_button_state()
             return
 
+        self._record_canvas_undo_state(
+            _CanvasStairsUndoState(stairs=tuple(self.stairs))
+        )
         self.stairs.append(stair)
         self.canvas.set_stair_context(self.stairs, self.current_level)
         self.stair_status_label.setText(
@@ -6381,6 +7320,9 @@ class BlueprintWorkspace(QWidget):
         if not 0 <= stair_index < len(self.stairs):
             return
 
+        self._record_canvas_undo_state(
+            _CanvasStairsUndoState(stairs=tuple(self.stairs))
+        )
         del self.stairs[stair_index]
         self.canvas.set_stair_context(self.stairs, self.current_level)
         self._update_stair_button_state()
@@ -6472,7 +7414,15 @@ class BlueprintWorkspace(QWidget):
         if self._is_syncing_level_controls or not checked:
             return
 
-        self.current_level.include_in_export = self.include_yes_radio.isChecked()
+        next_value = self.include_yes_radio.isChecked()
+        if next_value == self.current_level.include_in_export:
+            return
+        self._record_canvas_undo_state(
+            self._capture_canvas_level_properties_undo_state(
+                self.current_level
+            )
+        )
+        self.current_level.include_in_export = next_value
         self._refresh_scene_atlas_texture_requirements()
         self._schedule_viewer_preview_refresh()
 
@@ -6524,6 +7474,7 @@ class BlueprintWorkspace(QWidget):
         self.viewer.set_highlighted_canvas_surface_ids(())
         self.texture_atlas_workspace.set_green_outline_source_ids(())
         self._canvas_window_undo_ids.clear()
+        self._clear_canvas_undo_history()
         self.viewer.set_window_undo_available(False)
         self.levels = levels
         self._reset_viewer_doorway_snapshots()
@@ -6579,6 +7530,10 @@ class BlueprintWorkspace(QWidget):
         self._schedule_viewer_preview_refresh()
 
     def _set_current_level_image(self, file_path: str) -> None:
+        self._cancel_active_canvas_surface_edit()
+        self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_wall_vertex_update()
+        self._commit_pending_doorway_mesh_update()
         normalized_path = str(Path(file_path).resolve())
         self.canvas.load_blueprint(
             file_path=normalized_path,
@@ -6587,6 +7542,7 @@ class BlueprintWorkspace(QWidget):
             doorways=self.current_level.doorways,
             windows=self.current_level.windows,
         )
+        self._clear_canvas_undo_history()
         self.current_level.image_path = normalized_path
         self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
         self.canvas.set_stair_context(self.stairs, self.current_level)

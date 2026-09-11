@@ -12,6 +12,7 @@ from housemaker.architectural_surface_edits import (
 from housemaker.main import BlueprintWorkspace
 from housemaker.models import LevelData, VertexData
 from housemaker.surface_geometry import build_fixed_surfaces
+from housemaker.texture_atlas_state import TextureAtlasData
 
 
 # ### Fixture helpers ###
@@ -39,12 +40,18 @@ def _build_workspace(level: LevelData) -> SimpleNamespace:
     surface_textures = Mock()
     surface_textures.remap_assignments_with_surface_lineage.return_value = True
     surface_textures.reconcile_assignments_with_levels.return_value = False
+    surface_textures.snapshot_assignments.return_value = ()
+    texture_atlases = Mock()
+    texture_atlases.get_data.return_value = TextureAtlasData()
     return SimpleNamespace(
         levels=[level],
         _desired_canvas_surface_ids=("old-surface",),
         _atlas_surface_assignment_target_ids=("old-surface",),
         _desired_canvas_object_id="old-object",
         _active_canvas_surface_drawing_vertex_id=None,
+        _canvas_undo_stack=[],
+        _is_restoring_canvas_undo=False,
+        _record_canvas_undo_state=Mock(),
         _commit_pending_canvas_surface_mesh_update=Mock(),
         _commit_pending_wall_vertex_update=Mock(),
         _commit_pending_doorway_mesh_update=Mock(),
@@ -52,6 +59,7 @@ def _build_workspace(level: LevelData) -> SimpleNamespace:
         _wall_vertex_update_timer=Mock(),
         _doorway_mesh_update_timer=Mock(),
         surface_texture_generation=surface_textures,
+        texture_atlas_workspace=texture_atlases,
         viewer=Mock(),
         _sync_canvas_surface_drawing_overlay=Mock(),
         _schedule_viewer_preview_refresh=Mock(),

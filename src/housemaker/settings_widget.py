@@ -693,7 +693,8 @@ class SettingsWidget(QWidget):
         self.canvas_3d_navigation_toggle_hotkey_edit.setToolTip(
             "Press one key combination to switch the Canvas 3D view between "
             "top-down orbit and first-person navigation. Bare Z, Q, S, D, R, "
-            "and F are reserved for first-person movement."
+            "and F are reserved for first-person movement; Ctrl+Z is reserved "
+            "for Canvas undo."
         )
         self.canvas_3d_navigation_toggle_hotkey_edit.keySequenceChanged.connect(
             self._handle_canvas_3d_navigation_toggle_hotkey_changed
@@ -1681,6 +1682,14 @@ def _normalize_canvas_3d_navigation_toggle_hotkey(
 
 def _hotkey_from_key_sequence(key_sequence: QKeySequence) -> str | None:
     if key_sequence.count() != 1:
+        return None
+    if any(
+        key_sequence.matches(undo_binding)
+        == QKeySequence.SequenceMatch.ExactMatch
+        for undo_binding in QKeySequence.keyBindings(
+            QKeySequence.StandardKey.Undo
+        )
+    ):
         return None
     key_combination = key_sequence[0]
     if key_combination.key() in _MODIFIER_ONLY_SHORTCUT_KEYS:

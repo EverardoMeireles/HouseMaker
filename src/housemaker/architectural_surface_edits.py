@@ -393,6 +393,8 @@ def build_surface_drawing_overlay(
             level.editable_surfaces,
             key=lambda candidate: candidate.source_surface_id,
         ):
+            if not editable_mesh.faces:
+                continue
             source_surface = base_by_id.get(editable_mesh.source_surface_id)
             if source_surface is None:
                 continue
@@ -590,6 +592,137 @@ def place_surface_vertex(
         created_surface_ids=created_surface_ids,
         requires_mesh_refresh=mesh_was_subdivided,
         state_changed=state_changed,
+    )
+
+
+def delete_directly_drawn_surface_faces(
+    levels: Sequence[LevelData],
+    surface_ids: Sequence[str],
+) -> SurfaceTopologyEditResult:
+    """Delete selected faces authored by the Add vertex tool.
+
+    Automatically generated remainder and extrusion-side faces are deliberately
+    retained. Boundary edges owned only by deleted faces are removed so their
+    closed loops cannot block the same region from being drawn again.
+    """
+
+    level_sequence = _normalize_levels(levels)
+    try:
+        normalized_ids = tuple(
+            dict.fromkeys(_normalize_surface_id(value) for value in surface_ids)
+        )
+    except TypeError as error:
+        raise ValueError("Surface deletion IDs must contain a sequence.") from error
+    if not normalized_ids:
+        raise ValueError("Select at least one Add vertex face to delete.")
+
+    levels_by_index = {level.index: level for level in level_sequence}
+    selected_by_mesh: dict[
+        tuple[int, str],
+        set[str],
+    ] = defaultdict(set)
+    mesh_by_key: dict[tuple[int, str], EditableSurfaceMeshData] = {}
+    source_by_key: dict[tuple[int, str], FixedSurface] = {}
+    base_surfaces_by_id = {
+        surface.surface_id: surface
+        for surface in build_base_fixed_surfaces(level_sequence)
+    }
+
+    for surface_id in normalized_ids:
+        parsed = parse_editable_surface_id(surface_id)
+        if parsed is None:
+            raise ValueError("Only faces created by Add vertex can be deleted.")
+        level_index, face_id, surface_type = parsed
+        level = levels_by_index.get(level_index)
+        if level is None:
+            raise ValueError("The selected editable surface level no longer exists.")
+        editable_mesh, face = _find_editable_face(level, face_id)
+        if face.surface_type != surface_type or not face.is_directly_drawn:
+            raise ValueError("Only faces created by Add vertex can be deleted.")
+        source_surface = base_surfaces_by_id.get(editable_mesh.source_surface_id)
+        if source_surface is None:
+            raise ValueError("The edited source surface no longer exists.")
+        key = (level.index, editable_mesh.source_surface_id)
+        selected_by_mesh[key].add(face.face_id)
+        mesh_by_key[key] = editable_mesh
+        source_by_key[key] = source_surface
+
+    replacements: dict[str, tuple[str, ...]] = {
+        surface_id: () for surface_id in normalized_ids
+    }
+    pending_meshes: list[tuple[LevelData, EditableSurfaceMeshData]] = []
+    for key, selected_face_ids in selected_by_mesh.items():
+        level = levels_by_index[key[0]]
+        editable_mesh = mesh_by_key[key]
+        remaining_faces = tuple(
+            face
+            for face in editable_mesh.faces
+            if face.face_id not in selected_face_ids
+        )
+        deleted_boundary_keys = {
+            frozenset(edge)
+            for face in editable_mesh.faces
+            if face.face_id in selected_face_ids
+            for edge in _iter_face_edges(face)
+        }
+        retained_direct_boundary_keys = {
+            frozenset(edge)
+            for face in remaining_faces
+            if face.is_directly_drawn
+            for edge in _iter_face_edges(face)
+        }
+        retained_edges = (
+            tuple(
+                edge
+                for edge in editable_mesh.edges
+                if (
+                    frozenset((edge.start_vertex_id, edge.end_vertex_id))
+                    not in deleted_boundary_keys
+                    or frozenset((edge.start_vertex_id, edge.end_vertex_id))
+                    in retained_direct_boundary_keys
+                )
+            )
+            if remaining_faces
+            else ()
+        )
+        retained_vertex_ids = {
+            vertex_id
+            for face in remaining_faces
+            for vertex_id in face.vertex_ids
+        }
+        retained_vertex_ids.update(
+            vertex_id
+            for edge in retained_edges
+            for vertex_id in (edge.start_vertex_id, edge.end_vertex_id)
+        )
+        next_mesh = replace(
+            editable_mesh,
+            vertices=tuple(
+                vertex
+                for vertex in editable_mesh.vertices
+                if (
+                    not remaining_faces
+                    or vertex.vertex_id in retained_vertex_ids
+                )
+            ),
+            faces=remaining_faces,
+            edges=retained_edges,
+            replaces_source_surface=True,
+        )
+        _validate_editable_mesh_geometry(
+            level,
+            source_by_key[key],
+            next_mesh,
+        )
+        pending_meshes.append((level, next_mesh))
+
+    for level, editable_mesh in pending_meshes:
+        _replace_level_editable_mesh(level, editable_mesh)
+    return SurfaceTopologyEditResult(
+        replacements=replacements,
+        selected_surface_ids=(),
+        requires_mesh_refresh=True,
+        state_changed=True,
     )
 
 

@@ -9,7 +9,7 @@ from itertools import combinations
 from pathlib import Path
 
 import cv2
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal, Slot
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -299,6 +299,9 @@ class BlueprintCanvas(QWidget):
     stair_placement_cancelled = Signal()
     stair_placement_invalid_endpoint = Signal(str)
     stair_delete_requested = Signal(int)
+    undo_snapshot_created = Signal(object)
+    undo_snapshot_discarded = Signal(object)
+    undo_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -315,6 +318,7 @@ class BlueprintCanvas(QWidget):
         self.preview_point: tuple[float, float] | None = None
         self.preview_guides: list[SnapGuide] = []
         self.undo_stack: list[CanvasSnapshot] = []
+        self._uses_external_undo_history = False
         self.pressed_vertex_id: int | None = None
         self.drag_vertex_id: int | None = None
         self.drag_press_position: QPointF | None = None
@@ -354,6 +358,30 @@ class BlueprintCanvas(QWidget):
         self.undo_shortcut = QShortcut(QKeySequence.StandardKey.Undo, self)
         self.undo_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self.undo_shortcut.activated.connect(self.undo_last_step)
+
+    def set_external_undo_history_enabled(self, enabled: bool) -> None:
+        """Route snapshots and Ctrl+Z to the owning workspace when enabled."""
+
+        normalized_enabled = bool(enabled)
+        if normalized_enabled == self._uses_external_undo_history:
+            return
+        try:
+            self.undo_shortcut.activated.disconnect()
+        except RuntimeError:
+            pass
+        self._uses_external_undo_history = normalized_enabled
+        if normalized_enabled:
+            self.undo_shortcut.activated.connect(
+                self._forward_external_undo_request
+            )
+        else:
+            self.undo_shortcut.activated.connect(self.undo_last_step)
+
+    @Slot()
+    def _forward_external_undo_request(self) -> None:
+        """Forward Ctrl+Z without binding a shortcut to a transient emitter."""
+
+        self.undo_requested.emit()
 
     def load_blueprint(
         self,
@@ -728,6 +756,13 @@ class BlueprintCanvas(QWidget):
             return
 
         snapshot = self.undo_stack.pop()
+        self.restore_snapshot(snapshot)
+
+    def restore_snapshot(self, snapshot: CanvasSnapshot) -> None:
+        """Restore one validated 2D Canvas snapshot without creating history."""
+
+        if not isinstance(snapshot, CanvasSnapshot):
+            raise TypeError("Canvas undo history contains an invalid snapshot.")
         previous_vertex_data = self.vertex_data.clone()
         previous_rooms = copy.deepcopy(self.rooms)
         previous_doorways = copy.deepcopy(self.doorways)
@@ -753,6 +788,15 @@ class BlueprintCanvas(QWidget):
             self.geometry_changed.emit()
         if self.doorways != previous_doorways:
             self.doorways_changed.emit()
+
+    def discard_undo_snapshot(self, snapshot: CanvasSnapshot) -> bool:
+        """Remove one shared-history snapshot from the local compatibility mirror."""
+
+        for index in range(len(self.undo_stack) - 1, -1, -1):
+            if self.undo_stack[index] is snapshot:
+                del self.undo_stack[index]
+                return True
+        return False
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
         if (
@@ -1843,7 +1887,9 @@ class BlueprintCanvas(QWidget):
         ):
             drag_changed = False
             if self.undo_stack:
-                self.undo_stack.pop()
+                discarded_snapshot = self.undo_stack.pop()
+                if self._uses_external_undo_history:
+                    self.undo_snapshot_discarded.emit(discarded_snapshot)
         self.pressed_doorway_index = None
         self.drag_doorway_index = None
         self.doorway_drag_press_position = None
@@ -2256,6 +2302,8 @@ class BlueprintCanvas(QWidget):
             preview_point=self.preview_point,
         )
         self.undo_stack.append(snapshot)
+        if self._uses_external_undo_history:
+            self.undo_snapshot_created.emit(snapshot)
 
     def _delete_selected_doorway(self) -> bool:
         doorway_index = self.selected_doorway_index

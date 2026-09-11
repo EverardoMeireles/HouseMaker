@@ -1485,6 +1485,7 @@ class SettingsWidgetTests(unittest.TestCase):
             "R",
             "F",
             "Z, Q",
+            "Ctrl+Z",
         )
         for hotkey in invalid_hotkeys:
             with self.subTest(hotkey=hotkey):
@@ -1496,7 +1497,6 @@ class SettingsWidgetTests(unittest.TestCase):
                     )
 
         for hotkey in (
-            "Ctrl+Z",
             "Alt+Q",
             "Shift+S",
             "Meta+D",

@@ -899,6 +899,112 @@ class SurfaceTextureGenerationWorkspace(QWidget):
 
         return tuple(self._data.assignments)
 
+    def snapshot_assignments(self) -> tuple[SurfaceTextureAssignment, ...]:
+        """Return a lightweight immutable snapshot for Canvas undo history."""
+
+        return tuple(self._data.assignments)
+
+    def restore_assignment_snapshot(
+        self,
+        assignments: Sequence[SurfaceTextureAssignment],
+        *,
+        emit_signals: bool = True,
+    ) -> bool:
+        """Restore only surface assignments without replacing generation state."""
+
+        try:
+            restored = list(assignments)
+        except TypeError as error:
+            raise ValueError(
+                "Surface texture assignment history must contain a sequence."
+            ) from error
+        if not all(
+            isinstance(assignment, SurfaceTextureAssignment)
+            for assignment in restored
+        ):
+            raise ValueError(
+                "Surface texture assignment history contains an invalid item."
+            )
+        assignment_ids = [assignment.assignment_id for assignment in restored]
+        if len(assignment_ids) != len(set(assignment_ids)):
+            raise ValueError(
+                "Surface texture assignment history contains duplicate IDs."
+            )
+        if restored == self._data.assignments:
+            return False
+
+        self._data.assignments = restored
+        self._invalidate_assignment_caches()
+        self._restore_assignment_textures()
+        self._refresh_texture_atlases()
+        self._sync_selection_status()
+        self._sync_controls()
+        if emit_signals:
+            self._emit_data_changed()
+            self.surface_content_changed.emit()
+        return True
+
+    def restore_assignment_target_snapshot(
+        self,
+        assignments: Sequence[SurfaceTextureAssignment],
+        *,
+        emit_signals: bool = True,
+    ) -> bool:
+        """Restore saved surface targets while preserving newer texture data."""
+
+        try:
+            snapshots = tuple(assignments)
+        except TypeError as error:
+            raise ValueError(
+                "Surface texture target history must contain a sequence."
+            ) from error
+        if not all(
+            isinstance(assignment, SurfaceTextureAssignment)
+            for assignment in snapshots
+        ):
+            raise ValueError(
+                "Surface texture target history contains an invalid item."
+            )
+        snapshots_by_id = {
+            assignment.assignment_id: assignment for assignment in snapshots
+        }
+        if len(snapshots_by_id) != len(snapshots):
+            raise ValueError(
+                "Surface texture target history contains duplicate IDs."
+            )
+
+        restored: list[SurfaceTextureAssignment] = []
+        for assignment in self._data.assignments:
+            snapshot = snapshots_by_id.get(assignment.assignment_id)
+            if snapshot is None:
+                restored.append(assignment)
+                continue
+            if snapshot.surface_type != assignment.surface_type:
+                raise ValueError(
+                    "A saved surface texture target changed surface type."
+                )
+            restored.append(
+                replace(
+                    assignment,
+                    surface_ids=snapshot.surface_ids,
+                    combined_area_m2=snapshot.combined_area_m2,
+                    area_description=snapshot.area_description,
+                )
+            )
+        if restored == self._data.assignments:
+            return False
+
+        self._data.assignments = restored
+        self._invalidate_assignment_caches()
+        self._restore_assignment_textures()
+        self._refresh_texture_atlases()
+        self._sync_selection_status()
+        self._sync_controls()
+        if emit_signals:
+            self._emit_data_changed()
+            self.surface_content_changed.emit()
+        return True
+
     def assignment_targets_are_valid(
         self,
         assignment_id: str,

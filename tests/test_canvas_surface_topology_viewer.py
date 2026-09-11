@@ -11,7 +11,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # ### Imports ###
 import numpy as np
 from OpenGL import GL
-from PySide6.QtCore import QPointF
+from PySide6.QtCore import QPointF, Qt
+from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QApplication
 import trimesh
 
@@ -347,6 +348,66 @@ class CanvasSurfaceTopologyViewerTests(unittest.TestCase):
             _canonical_segments(*blue_positions),
             _wall_rectangle_segments(0.25, 1.25),
         )
+        self.assertEqual(len(viewer._canvas_extrudable_face_outline_items), 1)
+        gl_options = getattr(
+            viewer._canvas_extrudable_face_outline_items[0],
+            "_GLGraphicsItem__glOpts",
+        )
+        self.assertTrue(gl_options[GL.GL_DEPTH_TEST])
+
+    def test_delete_requests_removal_for_a_selected_direct_face(self) -> None:
+        parent = _build_wall()
+        directly_drawn = _build_wall(
+            "level:0/edit-face:11111111111111111111111111111111:wall",
+            source_surface_id=parent.surface_id,
+            is_directly_drawn=True,
+        )
+        viewer = self._build_viewer((parent, directly_drawn))
+        deletion_requests: list[tuple[str, ...]] = []
+        generic_deletions: list[bool] = []
+        viewer.canvas_surface_face_deletion_requested.connect(
+            deletion_requests.append
+        )
+        viewer.delete_requested.connect(lambda: generic_deletions.append(True))
+        viewer.select_canvas_surface_target(directly_drawn.surface_id)
+
+        viewer.view.keyPressEvent(
+            QKeyEvent(
+                QKeyEvent.Type.KeyPress,
+                Qt.Key.Key_Delete,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+
+        self.assertEqual(deletion_requests, [(directly_drawn.surface_id,)])
+        self.assertEqual(generic_deletions, [])
+
+    def test_delete_is_consumed_for_a_non_authored_canvas_surface(self) -> None:
+        wall = _build_wall()
+        viewer = self._build_viewer((wall,))
+        deletion_requests: list[tuple[str, ...]] = []
+        generic_deletions: list[bool] = []
+        viewer.canvas_surface_face_deletion_requested.connect(
+            deletion_requests.append
+        )
+        viewer.delete_requested.connect(lambda: generic_deletions.append(True))
+        viewer.select_canvas_surface_target(wall.surface_id)
+
+        viewer.view.keyPressEvent(
+            QKeyEvent(
+                QKeyEvent.Type.KeyPress,
+                Qt.Key.Key_Delete,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+
+        self.assertEqual(deletion_requests, [])
+        self.assertEqual(generic_deletions, [])
+        assert viewer.surface_tools_status_label is not None
+        self.assertIn(
+            "created by Add vertex",
+            viewer.surface_tools_status_label.text(),
+        )
 
     def test_direct_face_selection_swaps_blue_boundary_and_markers_for_yellow(
         self,
@@ -653,6 +714,64 @@ class CanvasSurfaceTopologyViewerTests(unittest.TestCase):
             np.asarray(((0.5, 0.0, 1.0), (2.0, 0.0, 1.0))),
         )
         self.assertFalse(viewer.view.is_primary_pointer_drag_reserved)
+
+    def test_active_45_degree_snap_previews_a_dotted_connection(self) -> None:
+        wall = _build_wall()
+        viewer = self._build_viewer((wall,))
+        active_id = "1" * 32
+        active_point = (0.5, 0.0, 1.0)
+        viewer.set_canvas_surface_drawing_overlay(
+            SurfaceDrawingOverlay(
+                vertices=(
+                    SurfaceDrawingVertexTarget(
+                        vertex_id=active_id,
+                        source_surface_id=wall.surface_id,
+                        world_point=active_point,
+                    ),
+                ),
+                edges=(),
+            ),
+            active_vertex_id=active_id,
+        )
+        self.assertTrue(viewer.begin_surface_vertex_placement())
+
+        with (
+            patch.object(
+                viewer.view,
+                "build_camera_ray",
+                return_value=_ray_at(1.505, 2.0),
+            ),
+            patch.object(viewer.view, "pixelSize", return_value=0.01),
+        ):
+            self.assertTrue(
+                viewer._handle_surface_vertex_pointer_hovered(QPointF())
+            )
+
+        preview = viewer._surface_vertex_hover_preview
+        self.assertIsNotNone(preview)
+        assert preview is not None
+        self.assertEqual(preview.snap_kind, "angle")
+        edge_item = viewer._surface_vertex_preview_edge_item
+        self.assertIsNotNone(edge_item)
+        assert edge_item is not None
+        positions = np.asarray(edge_item.pos, dtype=float)
+        self.assertGreater(len(positions), 2)
+        self.assertEqual(len(positions) % 2, 0)
+        segments = positions.reshape((-1, 2, 3))
+        np.testing.assert_allclose(segments[0, 0], active_point)
+        np.testing.assert_allclose(segments[-1, 1], preview.world_point)
+        self.assertTrue(
+            np.all(np.linalg.norm(segments[:, 1] - segments[:, 0], axis=1) > 0)
+        )
+        self.assertTrue(
+            np.all(
+                np.linalg.norm(
+                    segments[1:, 0] - segments[:-1, 1],
+                    axis=1,
+                )
+                > 0
+            )
+        )
 
     def test_add_vertex_does_not_snap_to_a_vertex_over_one_centimeter_away(
         self,

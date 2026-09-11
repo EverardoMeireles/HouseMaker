@@ -19,6 +19,7 @@ from housemaker.architectural_surface_edits import (
     SurfaceDrawingVertexTarget,
     build_editable_surface_id,
     build_surface_drawing_overlay,
+    delete_directly_drawn_surface_faces,
     extrude_surface_faces,
     insert_surface_vertex,
     place_surface_vertex,
@@ -101,6 +102,31 @@ def _draw_closed_wall_face(level: LevelData) -> tuple[FixedSurface, str]:
         active_vertex_id = result.active_vertex_id
     if result is None or len(result.created_surface_ids) != 1:
         raise AssertionError("The wall fixture did not create one closed face.")
+    return wall, result.created_surface_ids[0]
+
+
+def _draw_full_wall_face(level: LevelData) -> tuple[FixedSurface, str]:
+    wall = _get_wall(level)
+    bounds = np.asarray(wall.mesh.bounds, dtype=float)
+    minimum, maximum = bounds
+    active_vertex_id = None
+    result = None
+    for point in (
+        (minimum[0], minimum[1], minimum[2]),
+        (maximum[0], minimum[1], minimum[2]),
+        (maximum[0], minimum[1], maximum[2]),
+        (minimum[0], minimum[1], maximum[2]),
+        (minimum[0], minimum[1], minimum[2]),
+    ):
+        result = place_surface_vertex(
+            [level],
+            wall.surface_id,
+            point,
+            active_vertex_id,
+        )
+        active_vertex_id = result.active_vertex_id
+    if result is None or len(result.created_surface_ids) != 1:
+        raise AssertionError("The wall fixture did not create one full face.")
     return wall, result.created_surface_ids[0]
 
 
@@ -1246,6 +1272,116 @@ class SurfaceVertexDrawingTests(unittest.TestCase):
         )
         self.assertTrue(extrusion.requires_mesh_refresh)
         self.assertEqual(extrusion.selected_surface_ids, result.created_surface_ids)
+
+    def test_directly_drawn_face_can_be_deleted_without_removing_remainder(
+        self,
+    ) -> None:
+        level = _build_square_level()
+        wall, direct_surface_id = _draw_closed_wall_face(level)
+        editable_mesh = level.editable_surfaces[0]
+        previous_face_count = len(editable_mesh.faces)
+
+        result = delete_directly_drawn_surface_faces(
+            [level],
+            (direct_surface_id,),
+        )
+
+        rebuilt = tuple(
+            surface
+            for surface in build_fixed_surfaces([level])
+            if surface.source_surface_id == wall.surface_id
+        )
+        self.assertEqual(result.replacements, {direct_surface_id: ()})
+        self.assertEqual(result.selected_surface_ids, ())
+        self.assertTrue(result.requires_mesh_refresh)
+        self.assertTrue(result.state_changed)
+        self.assertEqual(
+            len(level.editable_surfaces[0].faces),
+            previous_face_count - 1,
+        )
+        self.assertNotIn(
+            direct_surface_id,
+            {surface.surface_id for surface in rebuilt},
+        )
+        self.assertTrue(rebuilt)
+        self.assertTrue(all(not surface.is_directly_drawn for surface in rebuilt))
+        self.assertEqual(level.editable_surfaces[0].edges, ())
+
+    def test_last_direct_face_deletion_persists_as_an_empty_replacement(
+        self,
+    ) -> None:
+        level = _build_square_level()
+        wall, direct_surface_id = _draw_full_wall_face(level)
+
+        delete_directly_drawn_surface_faces([level], (direct_surface_id,))
+
+        tombstone = level.editable_surfaces[0]
+        self.assertTrue(tombstone.replaces_source_surface)
+        self.assertEqual(tombstone.faces, ())
+        self.assertEqual(tombstone.edges, ())
+        self.assertNotIn(
+            wall.surface_id,
+            {surface.surface_id for surface in build_fixed_surfaces([level])},
+        )
+        self.assertEqual(build_surface_drawing_overlay([level]).vertices, ())
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project_path = Path(temporary_directory) / "deleted-wall.housemaker"
+            save_project(project_path, level.index, [level])
+            loaded = load_project(project_path)
+
+        loaded_level = next(
+            item for item in loaded.levels if item.index == level.index
+        )
+        self.assertEqual(loaded_level.editable_surfaces, level.editable_surfaces)
+        self.assertNotIn(
+            wall.surface_id,
+            {
+                surface.surface_id
+                for surface in build_fixed_surfaces([loaded_level])
+            },
+        )
+
+    def test_automatically_created_surface_face_cannot_be_deleted(self) -> None:
+        level = _build_square_level()
+        wall, _direct_surface_id = _draw_closed_wall_face(level)
+        automatic_surface_id = next(
+            surface.surface_id
+            for surface in build_fixed_surfaces([level])
+            if surface.source_surface_id == wall.surface_id
+            and not surface.is_directly_drawn
+        )
+        previous_meshes = tuple(level.editable_surfaces)
+
+        with self.assertRaisesRegex(ValueError, "created by Add vertex"):
+            delete_directly_drawn_surface_faces(
+                [level],
+                (automatic_surface_id,),
+            )
+
+        self.assertEqual(tuple(level.editable_surfaces), previous_meshes)
+
+    def test_deleting_extruded_direct_face_retains_its_side_ring(self) -> None:
+        level = _build_square_level()
+        _wall, direct_surface_id = _draw_closed_wall_face(level)
+        before_extrusion_ids = {
+            face.face_id for face in level.editable_surfaces[0].faces
+        }
+        extrude_surface_faces([level], (direct_surface_id,), 0.2)
+        extruded_mesh = level.editable_surfaces[0]
+        generated_side_ids = {
+            face.face_id
+            for face in extruded_mesh.faces
+            if face.face_id not in before_extrusion_ids
+        }
+        self.assertTrue(generated_side_ids)
+
+        delete_directly_drawn_surface_faces([level], (direct_surface_id,))
+
+        retained_ids = {
+            face.face_id for face in level.editable_surfaces[0].faces
+        }
+        self.assertTrue(generated_side_ids.issubset(retained_ids))
 
     def test_floor_and_ceiling_loops_create_extrudable_faces(self) -> None:
         for surface_type in (SURFACE_TYPE_FLOOR, SURFACE_TYPE_CEILING):

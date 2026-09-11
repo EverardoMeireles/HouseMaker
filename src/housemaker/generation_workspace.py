@@ -3205,6 +3205,54 @@ class GenerationWorkspace(QWidget):
         record = self._find_generated_object_record(str(object_id).strip())
         return None if record is None else record.placement
 
+    def get_existing_object_placement_request_state(
+        self,
+        request_id: str,
+    ) -> tuple[str, GeneratedObjectPlacement | None] | None:
+        """Return the target and pre-click state of one active placement picker."""
+
+        request = self._existing_object_placement_request
+        if request is None or request.request_id != str(request_id):
+            return None
+        record = self._find_generated_object_record(request.object_id)
+        if record is None:
+            return None
+        return record.object_id, record.placement
+
+    def get_placeable_object_placement_state(
+        self,
+        placeable_id: str,
+    ) -> tuple[str, GeneratedObjectPlacement] | None:
+        """Return one currently bound completed or in-flight placement."""
+
+        normalized_id = str(placeable_id).strip()
+        runtime = self._object_job_runtimes.get(normalized_id)
+        if runtime is not None:
+            placement = runtime.operation.pending_placement
+            if placement is None:
+                return None
+            return runtime.operation_id, placement
+        record = self._find_generated_object_record(normalized_id)
+        if record is None or record.placement is None:
+            return None
+        return record.object_id, record.placement
+
+    def get_generation_operation_id_for_object(
+        self,
+        object_id: str,
+    ) -> str | None:
+        """Return the still-live generation operation that committed an object."""
+
+        normalized_id = str(object_id).strip()
+        return next(
+            (
+                runtime.operation_id
+                for runtime in self._object_job_runtimes.values()
+                if runtime.operation.committed_object_id == normalized_id
+            ),
+            None,
+        )
+
     def set_data(self, data: GenerationData | None) -> None:
         if self.is_generating:
             raise RuntimeError("Cannot replace Generation data while generating.")
@@ -3814,7 +3862,83 @@ class GenerationWorkspace(QWidget):
         directly. Ordinary placement callers keep the default notifications.
         """
 
-        if not isinstance(placement, GeneratedObjectPlacement):
+        return self._set_generated_object_placement(
+            object_id,
+            placement,
+            require_existing_placement=True,
+            emit_change_signals=emit_change_signals,
+        )
+
+    def restore_generated_object_placement(
+        self,
+        object_id: str,
+        placement: GeneratedObjectPlacement | None,
+        *,
+        emit_change_signals: bool = True,
+    ) -> bool:
+        """Restore a completed object's placed or unplaced Canvas state."""
+
+        return self._set_generated_object_placement(
+            object_id,
+            placement,
+            require_existing_placement=False,
+            emit_change_signals=emit_change_signals,
+        )
+
+    def restore_placeable_object_placement(
+        self,
+        placeable_id: str,
+        placement: GeneratedObjectPlacement | None,
+        *,
+        emit_change_signals: bool = True,
+    ) -> bool:
+        """Restore a completed or still-running object's Canvas placement."""
+
+        if placement is not None and not isinstance(
+            placement,
+            GeneratedObjectPlacement,
+        ):
+            return False
+        normalized_id = str(placeable_id).strip()
+        runtime = self._object_job_runtimes.get(normalized_id)
+        if runtime is not None:
+            committed_id = runtime.operation.committed_object_id
+            if committed_id is not None:
+                return self.restore_generated_object_placement(
+                    committed_id,
+                    placement,
+                    emit_change_signals=emit_change_signals,
+                )
+            if not self._can_place_active_operation(runtime.operation):
+                return False
+            if runtime.operation.pending_placement == placement:
+                return True
+            runtime.operation.pending_placement = placement
+            if emit_change_signals:
+                self._emit_placeable_objects_changed()
+            return True
+        return self.restore_generated_object_placement(
+            normalized_id,
+            placement,
+            emit_change_signals=emit_change_signals,
+        )
+
+    def _set_generated_object_placement(
+        self,
+        object_id: str,
+        placement: GeneratedObjectPlacement | None,
+        *,
+        require_existing_placement: bool,
+        emit_change_signals: bool,
+    ) -> bool:
+        """Set one placement with explicit ordinary-edit or restore semantics."""
+
+        if placement is not None and not isinstance(
+            placement,
+            GeneratedObjectPlacement,
+        ):
+            return False
+        if placement is None and require_existing_placement:
             return False
         normalized_object_id = str(object_id).strip()
         record_index = next(
@@ -3822,7 +3946,10 @@ class GenerationWorkspace(QWidget):
                 index
                 for index, record in enumerate(self._data.generated_objects)
                 if record.object_id == normalized_object_id
-                and record.placement is not None
+                and (
+                    not require_existing_placement
+                    or record.placement is not None
+                )
             ),
             None,
         )
