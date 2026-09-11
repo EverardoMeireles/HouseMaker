@@ -64,16 +64,20 @@ from housemaker.canvas_openings import (
 )
 from housemaker.canvas_surface_edits import (
     CANVAS_SURFACE_EDIT_FLOOR_THICKNESS,
-    CANVAS_SURFACE_EDIT_WALL_VERTEX,
+    CANVAS_SURFACE_EDIT_WALL_KINDS,
+    CANVAS_SURFACE_EDIT_WALL_TRANSLATION,
     AppliedCanvasSurfaceEdit,
     CanvasSurfaceEdit,
     CanvasSurfaceEditHandleTarget,
     apply_canvas_surface_edit,
+    apply_canvas_wall_edit_batch,
     build_canvas_surface_edit_targets,
     rebase_canvas_floor_edit_target,
-    rebase_canvas_wall_edit_targets,
+    rebase_canvas_wall_edit_targets_batch,
     restore_canvas_surface_edit,
+    restore_canvas_wall_edit_batch,
     validate_canvas_surface_edit_geometry,
+    validate_canvas_wall_edit_batch_geometry,
 )
 from housemaker.external_viewer_host import ExternalFullscreenViewerHost
 from housemaker.generation_state import (
@@ -203,7 +207,7 @@ SURFACE_ATLAS_ROUGHNESS_BYTE = round(
 )
 DELAYED_CANVAS_SURFACE_EDIT_KINDS = frozenset(
     (
-        CANVAS_SURFACE_EDIT_WALL_VERTEX,
+        *CANVAS_SURFACE_EDIT_WALL_KINDS,
         CANVAS_SURFACE_EDIT_FLOOR_THICKNESS,
     )
 )
@@ -317,10 +321,19 @@ class BlueprintWorkspace(QWidget):
         self._active_canvas_surface_edit_target: (
             CanvasSurfaceEditHandleTarget | None
         ) = None
+        self._active_canvas_surface_edit_targets: tuple[
+            CanvasSurfaceEditHandleTarget,
+            ...,
+        ] = ()
         self._pending_canvas_surface_mesh_update = False
         self._pending_canvas_surface_mesh_baseline: (
             CanvasSurfaceEditHandleTarget | None
         ) = None
+        self._pending_canvas_surface_mesh_baselines: tuple[
+            CanvasSurfaceEditHandleTarget,
+            ...,
+        ] = ()
+        self._pending_canvas_wall_surface_ids: tuple[str, ...] = ()
         self._pending_floor_thickness_level_index: int | None = None
         self._pending_canvas_opening_key: str | None = None
         self._staged_canvas_opening_mesh_update = False
@@ -1551,6 +1564,23 @@ class BlueprintWorkspace(QWidget):
         )
 
     # ### Canvas surface selection synchronization ###
+    def _get_canvas_wall_surface_ids(
+        self,
+        surface_ids: Sequence[str],
+    ) -> tuple[str, ...]:
+        """Return selected root-wall IDs in stable selection order."""
+
+        return tuple(
+            surface_id
+            for surface_id in dict.fromkeys(surface_ids)
+            if (
+                (surface := self._canvas_surface_targets_by_id.get(surface_id))
+                is not None
+                and surface.surface_type == SURFACE_TYPE_WALL
+                and surface.source_surface_id is None
+            )
+        )
+
     def _handle_canvas_surface_selection_changed(
         self,
         raw_surface_ids: object,
@@ -1576,11 +1606,21 @@ class BlueprintWorkspace(QWidget):
         )
         self._commit_pending_wall_vertex_update()
         pending_baseline = self._pending_canvas_surface_mesh_baseline
-        if self._pending_canvas_surface_mesh_update and (
-            pending_baseline is None
-            or active_surface_id != pending_baseline.surface_id
-        ):
-            self._commit_pending_canvas_surface_mesh_update()
+        if self._pending_canvas_surface_mesh_update:
+            selected_wall_ids = self._get_canvas_wall_surface_ids(surface_ids)
+            wall_group_changed = bool(
+                self._pending_canvas_wall_surface_ids
+                and selected_wall_ids != self._pending_canvas_wall_surface_ids
+            )
+            active_owner_changed = bool(
+                not self._pending_canvas_wall_surface_ids
+                and (
+                    pending_baseline is None
+                    or active_surface_id != pending_baseline.surface_id
+                )
+            )
+            if wall_group_changed or active_owner_changed:
+                self._commit_pending_canvas_surface_mesh_update()
 
     def _sync_selected_canvas_wall_highlight(
         self,
@@ -1740,6 +1780,112 @@ class BlueprintWorkspace(QWidget):
             self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     # ### Canvas structural surface edits ###
+    def _resolve_canvas_surface_edit_targets(
+        self,
+        primary: CanvasSurfaceEditHandleTarget,
+    ) -> tuple[CanvasSurfaceEditHandleTarget, ...]:
+        """Resolve every selected wall target controlled by one handle."""
+
+        if primary.reference.kind not in CANVAS_SURFACE_EDIT_WALL_KINDS:
+            return (primary,)
+        selected_wall_ids = set(
+            self._get_canvas_wall_surface_ids(
+                self.viewer.get_selected_canvas_surface_ids()
+            )
+        )
+        selected_wall_ids.add(primary.surface_id)
+        if primary.reference.kind == CANVAS_SURFACE_EDIT_WALL_TRANSLATION:
+            related = tuple(
+                target
+                for target in self._canvas_surface_edit_targets_by_key.values()
+                if (
+                    target.surface_id in selected_wall_ids
+                    and target.reference.kind
+                    == CANVAS_SURFACE_EDIT_WALL_TRANSLATION
+                    and target.reference.axis_index
+                    == primary.reference.axis_index
+                )
+            )
+        else:
+            related = tuple(
+                target
+                for target in self._canvas_surface_edit_targets_by_key.values()
+                if (
+                    target.surface_id in selected_wall_ids
+                    and target.reference == primary.reference
+                )
+            )
+        return tuple(
+            dict.fromkeys((primary, *related))
+        )
+
+    def _get_selected_canvas_wall_baselines(
+        self,
+        primary: CanvasSurfaceEditHandleTarget,
+    ) -> tuple[CanvasSurfaceEditHandleTarget, ...]:
+        """Snapshot one complete-chain baseline for each selected wall."""
+
+        selected_wall_ids = self._get_canvas_wall_surface_ids(
+            self.viewer.get_selected_canvas_surface_ids()
+        )
+        if primary.surface_id not in selected_wall_ids:
+            selected_wall_ids = (*selected_wall_ids, primary.surface_id)
+        baselines: list[CanvasSurfaceEditHandleTarget] = []
+        for surface_id in selected_wall_ids:
+            candidate = next(
+                (
+                    target
+                    for target in self._canvas_surface_edit_targets_by_key.values()
+                    if (
+                        target.surface_id == surface_id
+                        and target.reference.kind
+                        == CANVAS_SURFACE_EDIT_WALL_TRANSLATION
+                        and target.reference.axis_index
+                        == primary.reference.axis_index
+                    )
+                ),
+                None,
+            )
+            if candidate is not None:
+                baselines.append(candidate)
+        return tuple(baselines) or (primary,)
+
+    def _restore_canvas_surface_edit_targets(
+        self,
+        targets: tuple[CanvasSurfaceEditHandleTarget, ...],
+    ) -> tuple[AppliedCanvasSurfaceEdit, ...]:
+        """Restore one structural target or one atomic wall-target group."""
+
+        if not targets:
+            return ()
+        if len(targets) == 1:
+            return (
+                restore_canvas_surface_edit(
+                    self.levels,
+                    targets[0],
+                    validate_project_geometry=False,
+                ),
+            )
+        return restore_canvas_wall_edit_batch(
+            self.levels,
+            targets,
+            validate_project_geometry=False,
+        )
+
+    def _sync_live_canvas_surface_edits(
+        self,
+        applied_edits: Sequence[AppliedCanvasSurfaceEdit],
+    ) -> None:
+        """Repaint each affected level once after an atomic wall edit."""
+
+        synced_level_ids: set[int] = set()
+        for applied in applied_edits:
+            level_identity = id(applied.level)
+            if level_identity in synced_level_ids:
+                continue
+            synced_level_ids.add(level_identity)
+            self._sync_live_canvas_surface_edit(applied)
+
     def _handle_canvas_surface_edit_started(self, raw_edit: object) -> None:
         """Remember the immutable baseline for one live structural drag."""
 
@@ -1762,18 +1908,20 @@ class BlueprintWorkspace(QWidget):
         previous_target = self._active_canvas_surface_edit_target
         if previous_target is not None and previous_target != target:
             try:
-                applied = restore_canvas_surface_edit(
-                    self.levels,
-                    previous_target,
-                    validate_project_geometry=False,
+                applied_edits = self._restore_canvas_surface_edit_targets(
+                    self._active_canvas_surface_edit_targets
+                    or (previous_target,)
                 )
             except (TypeError, ValueError):
                 pass
             else:
-                self._sync_live_canvas_surface_edit(applied)
+                self._sync_live_canvas_surface_edits(applied_edits)
         if target.reference.kind in DELAYED_CANVAS_SURFACE_EDIT_KINDS:
             self._canvas_surface_mesh_update_timer.stop()
         self._active_canvas_surface_edit_target = target
+        self._active_canvas_surface_edit_targets = (
+            self._resolve_canvas_surface_edit_targets(target)
+        )
 
     def _handle_canvas_surface_edit_preview_changed(
         self,
@@ -1796,6 +1944,7 @@ class BlueprintWorkspace(QWidget):
         target = self._active_canvas_surface_edit_target
         if target is None or not isinstance(raw_edit, CanvasSurfaceEdit):
             return
+        active_targets = self._active_canvas_surface_edit_targets or (target,)
         is_floor_edit = (
             target.reference.kind == CANVAS_SURFACE_EDIT_FLOOR_THICKNESS
         )
@@ -1809,17 +1958,16 @@ class BlueprintWorkspace(QWidget):
             return
         if not changed:
             try:
-                applied = restore_canvas_surface_edit(
-                    self.levels,
-                    target,
-                    validate_project_geometry=False,
+                applied_edits = self._restore_canvas_surface_edit_targets(
+                    active_targets
                 )
             except (TypeError, ValueError):
                 pass
             else:
-                self._sync_live_canvas_surface_edit(applied)
+                self._sync_live_canvas_surface_edits(applied_edits)
 
         self._active_canvas_surface_edit_target = None
+        self._active_canvas_surface_edit_targets = ()
         if not changed:
             if self._pending_canvas_surface_mesh_update and uses_mesh_delay:
                 self._canvas_surface_mesh_update_timer.start()
@@ -1830,6 +1978,18 @@ class BlueprintWorkspace(QWidget):
         if uses_mesh_delay:
             if self._pending_canvas_surface_mesh_baseline is None:
                 self._pending_canvas_surface_mesh_baseline = target
+                self._pending_canvas_surface_mesh_baselines = (
+                    (target,)
+                    if is_floor_edit
+                    else self._get_selected_canvas_wall_baselines(target)
+                )
+                self._pending_canvas_wall_surface_ids = (
+                    ()
+                    if is_floor_edit
+                    else self._get_canvas_wall_surface_ids(
+                        self.viewer.get_selected_canvas_surface_ids()
+                    )
+                )
             self._pending_canvas_surface_mesh_update = True
             if is_floor_edit:
                 self._pending_floor_thickness_level_index = (
@@ -1837,16 +1997,20 @@ class BlueprintWorkspace(QWidget):
                 )
                 current_targets = (target,)
             else:
+                selected_wall_ids = set(
+                    self._get_canvas_wall_surface_ids(
+                        self.viewer.get_selected_canvas_surface_ids()
+                    )
+                )
+                selected_wall_ids.add(target.surface_id)
                 current_targets = tuple(
                     candidate
                     for candidate in (
                         self._canvas_surface_edit_targets_by_key.values()
                     )
-                    if candidate.surface_id == target.surface_id
-                    and (
-                        candidate.reference.kind
-                        == CANVAS_SURFACE_EDIT_WALL_VERTEX
-                    )
+                    if candidate.surface_id in selected_wall_ids
+                    and candidate.reference.kind
+                    in CANVAS_SURFACE_EDIT_WALL_KINDS
                 )
             try:
                 rebased_targets = (
@@ -1857,7 +2021,7 @@ class BlueprintWorkspace(QWidget):
                         ),
                     )
                     if is_floor_edit
-                    else rebase_canvas_wall_edit_targets(
+                    else rebase_canvas_wall_edit_targets_batch(
                         self.levels,
                         current_targets,
                     )
@@ -1900,12 +2064,21 @@ class BlueprintWorkspace(QWidget):
         if not self._pending_canvas_surface_mesh_update:
             return
         baseline = self._pending_canvas_surface_mesh_baseline
-        if baseline is not None:
+        baselines = self._pending_canvas_surface_mesh_baselines
+        if not baselines and baseline is not None:
+            baselines = (baseline,)
+        if baselines:
             try:
-                validate_canvas_surface_edit_geometry(
-                    self.levels,
-                    baseline,
-                )
+                if len(baselines) == 1:
+                    validate_canvas_surface_edit_geometry(
+                        self.levels,
+                        baselines[0],
+                    )
+                else:
+                    validate_canvas_wall_edit_batch_geometry(
+                        self.levels,
+                        baselines,
+                    )
             except (TypeError, ValueError) as error:
                 self._reject_pending_canvas_surface_mesh_update(error)
                 return
@@ -1913,6 +2086,8 @@ class BlueprintWorkspace(QWidget):
         self._commit_viewer_floor_thickness_snapshot()
         self._pending_canvas_surface_mesh_update = False
         self._pending_canvas_surface_mesh_baseline = None
+        self._pending_canvas_surface_mesh_baselines = ()
+        self._pending_canvas_wall_surface_ids = ()
         self._canvas_surface_edit_targets_by_key = {}
         self.viewer.set_canvas_surface_edit_targets(
             (),
@@ -1926,6 +2101,8 @@ class BlueprintWorkspace(QWidget):
         self._canvas_surface_mesh_update_timer.stop()
         self._pending_canvas_surface_mesh_update = False
         self._pending_canvas_surface_mesh_baseline = None
+        self._pending_canvas_surface_mesh_baselines = ()
+        self._pending_canvas_wall_surface_ids = ()
         self._pending_floor_thickness_level_index = None
         self.viewer.clear_canvas_surface_edit_pending_outline()
 
@@ -1936,21 +2113,24 @@ class BlueprintWorkspace(QWidget):
         """Roll a rejected adjustment burst back to its first baseline."""
 
         baseline = self._pending_canvas_surface_mesh_baseline
+        baselines = self._pending_canvas_surface_mesh_baselines
+        if not baselines and baseline is not None:
+            baselines = (baseline,)
         self._canvas_surface_mesh_update_timer.stop()
         self._pending_canvas_surface_mesh_update = False
         self._pending_canvas_surface_mesh_baseline = None
+        self._pending_canvas_surface_mesh_baselines = ()
+        self._pending_canvas_wall_surface_ids = ()
         self._pending_floor_thickness_level_index = None
-        if baseline is not None:
+        if baselines:
             try:
-                restored = restore_canvas_surface_edit(
-                    self.levels,
-                    baseline,
-                    validate_project_geometry=False,
+                restored_edits = self._restore_canvas_surface_edit_targets(
+                    baselines
                 )
             except (TypeError, ValueError):
                 pass
             else:
-                self._sync_live_canvas_surface_edit(restored)
+                self._sync_live_canvas_surface_edits(restored_edits)
         self.viewer.set_window_tools_status(
             f"Surface edit stopped: {error}"
         )
@@ -1980,6 +2160,7 @@ class BlueprintWorkspace(QWidget):
         target = self._active_canvas_surface_edit_target
         if target is None:
             return
+        active_targets = self._active_canvas_surface_edit_targets or (target,)
         if (
             isinstance(raw_edit, CanvasSurfaceEdit)
             and (
@@ -1989,16 +2170,15 @@ class BlueprintWorkspace(QWidget):
         ):
             return
         try:
-            applied = restore_canvas_surface_edit(
-                self.levels,
-                target,
-                validate_project_geometry=False,
+            applied_edits = self._restore_canvas_surface_edit_targets(
+                active_targets
             )
         except (TypeError, ValueError):
             pass
         else:
-            self._sync_live_canvas_surface_edit(applied)
+            self._sync_live_canvas_surface_edits(applied_edits)
         self._active_canvas_surface_edit_target = None
+        self._active_canvas_surface_edit_targets = ()
         if (
             self._pending_canvas_surface_mesh_update
             and target.reference.kind in DELAYED_CANVAS_SURFACE_EDIT_KINDS
@@ -2027,18 +2207,29 @@ class BlueprintWorkspace(QWidget):
         target = self._active_canvas_surface_edit_target
         if not isinstance(raw_edit, CanvasSurfaceEdit) or target is None:
             return False
+        active_targets = self._active_canvas_surface_edit_targets or (target,)
         if (
             raw_edit.reference != target.reference
             or raw_edit.surface_id != target.surface_id
         ):
             return False
         try:
-            applied = apply_canvas_surface_edit(
-                self.levels,
-                target,
-                raw_edit,
-                validate_project_geometry=validate_project_geometry,
-            )
+            if len(active_targets) == 1:
+                applied_edits = (
+                    apply_canvas_surface_edit(
+                        self.levels,
+                        target,
+                        raw_edit,
+                        validate_project_geometry=validate_project_geometry,
+                    ),
+                )
+            else:
+                applied_edits = apply_canvas_wall_edit_batch(
+                    self.levels,
+                    active_targets,
+                    raw_edit,
+                    validate_project_geometry=validate_project_geometry,
+                )
         except (TypeError, ValueError) as error:
             resume_pending_surface_update = bool(
                 self._pending_canvas_surface_mesh_update
@@ -2046,16 +2237,15 @@ class BlueprintWorkspace(QWidget):
                 in DELAYED_CANVAS_SURFACE_EDIT_KINDS
             )
             try:
-                restored = restore_canvas_surface_edit(
-                    self.levels,
-                    target,
-                    validate_project_geometry=False,
+                restored_edits = self._restore_canvas_surface_edit_targets(
+                    active_targets
                 )
             except (TypeError, ValueError):
                 pass
             else:
-                self._sync_live_canvas_surface_edit(restored)
+                self._sync_live_canvas_surface_edits(restored_edits)
             self._active_canvas_surface_edit_target = None
+            self._active_canvas_surface_edit_targets = ()
             self.viewer.set_window_tools_status(
                 f"Surface edit stopped: {error}"
             )
@@ -2067,7 +2257,7 @@ class BlueprintWorkspace(QWidget):
             else:
                 self._queue_viewer_preview_refresh()
             return False
-        self._sync_live_canvas_surface_edit(applied)
+        self._sync_live_canvas_surface_edits(applied_edits)
         return True
 
     def _sync_live_canvas_surface_edit(
@@ -2154,6 +2344,8 @@ class BlueprintWorkspace(QWidget):
             and target is not None
         ):
             self._pending_canvas_surface_mesh_baseline = target
+            self._pending_canvas_surface_mesh_baselines = (target,)
+            self._pending_canvas_wall_surface_ids = ()
 
         level.floor_thickness_meters = next_thickness
         self._pending_floor_thickness_level_index = level.index

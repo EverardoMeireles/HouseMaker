@@ -1,7 +1,7 @@
 # ### Imports ###
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 import unittest
 from unittest.mock import patch
 
@@ -13,13 +13,18 @@ from housemaker.canvas_surface_edits import (
     CANVAS_SURFACE_EDIT_FLOOR_THICKNESS,
     CANVAS_SURFACE_EDIT_LEVEL_HEIGHT,
     CANVAS_SURFACE_EDIT_ROOM_HEIGHT,
+    CANVAS_SURFACE_EDIT_WALL_TRANSLATION,
     CANVAS_SURFACE_EDIT_WALL_VERTEX,
     CanvasSurfaceEdit,
     CanvasSurfaceEditReference,
+    apply_canvas_wall_edit_batch,
     apply_canvas_surface_edit,
     build_canvas_surface_edit_targets,
+    rebase_canvas_wall_edit_targets_batch,
     rebase_canvas_wall_edit_targets,
+    restore_canvas_wall_edit_batch,
     restore_canvas_surface_edit,
+    validate_canvas_wall_edit_batch_geometry,
     validate_canvas_surface_edit_geometry,
 )
 from housemaker.level_coordinates import level_image_to_world_xy
@@ -184,7 +189,25 @@ class CanvasSurfaceEditTargetTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             reference.vertex_id = 18  # type: ignore[misc]
 
-    def test_room_wall_has_four_handles_and_preserves_collinear_chain(self) -> None:
+    def test_wall_translation_reference_canonicalizes_endpoint_order(self) -> None:
+        forward = CanvasSurfaceEditReference(
+            CANVAS_SURFACE_EDIT_WALL_TRANSLATION,
+            2,
+            CANVAS_SURFACE_EDIT_AXIS_X,
+            wall_vertex_ids=(3, 17),
+        )
+        reversed_reference = CanvasSurfaceEditReference(
+            CANVAS_SURFACE_EDIT_WALL_TRANSLATION,
+            2,
+            CANVAS_SURFACE_EDIT_AXIS_X,
+            wall_vertex_ids=(17, 3),
+        )
+
+        self.assertEqual(forward.wall_vertex_ids, (3, 17))
+        self.assertEqual(reversed_reference, forward)
+        self.assertEqual(reversed_reference.key, forward.key)
+
+    def test_room_wall_has_six_handles_and_preserves_collinear_chain(self) -> None:
         level = _build_room_level()
         _surfaces, targets = _build_targets(level)
         wall_targets = tuple(
@@ -193,17 +216,47 @@ class CanvasSurfaceEditTargetTests(unittest.TestCase):
             if target.surface_id.endswith("wall:1:3")
         )
 
-        self.assertEqual(len(wall_targets), 4)
+        self.assertEqual(len(wall_targets), 6)
         self.assertEqual(
             {
-                (target.reference.vertex_id, target.reference.axis_index)
+                (
+                    target.reference.kind,
+                    target.reference.vertex_id,
+                    target.reference.axis_index,
+                )
                 for target in wall_targets
             },
             {
-                (1, CANVAS_SURFACE_EDIT_AXIS_X),
-                (1, CANVAS_SURFACE_EDIT_AXIS_Y),
-                (3, CANVAS_SURFACE_EDIT_AXIS_X),
-                (3, CANVAS_SURFACE_EDIT_AXIS_Y),
+                (
+                    CANVAS_SURFACE_EDIT_WALL_VERTEX,
+                    1,
+                    CANVAS_SURFACE_EDIT_AXIS_X,
+                ),
+                (
+                    CANVAS_SURFACE_EDIT_WALL_VERTEX,
+                    1,
+                    CANVAS_SURFACE_EDIT_AXIS_Y,
+                ),
+                (
+                    CANVAS_SURFACE_EDIT_WALL_VERTEX,
+                    3,
+                    CANVAS_SURFACE_EDIT_AXIS_X,
+                ),
+                (
+                    CANVAS_SURFACE_EDIT_WALL_VERTEX,
+                    3,
+                    CANVAS_SURFACE_EDIT_AXIS_Y,
+                ),
+                (
+                    CANVAS_SURFACE_EDIT_WALL_TRANSLATION,
+                    None,
+                    CANVAS_SURFACE_EDIT_AXIS_X,
+                ),
+                (
+                    CANVAS_SURFACE_EDIT_WALL_TRANSLATION,
+                    None,
+                    CANVAS_SURFACE_EDIT_AXIS_Y,
+                ),
             },
         )
         for target in wall_targets:
@@ -211,6 +264,25 @@ class CanvasSurfaceEditTargetTests(unittest.TestCase):
             np.testing.assert_allclose(
                 target.chain_vertex_ratios,
                 (0.0, 0.5, 1.0),
+            )
+
+        endpoint_world = _world_positions(level)
+        expected_midpoint = np.mean(
+            np.asarray((endpoint_world[1], endpoint_world[3]), dtype=float),
+            axis=0,
+        )
+        translation_targets = tuple(
+            target
+            for target in wall_targets
+            if target.reference.kind == CANVAS_SURFACE_EDIT_WALL_TRANSLATION
+        )
+        self.assertEqual(len(translation_targets), 2)
+        for target in translation_targets:
+            self.assertEqual(target.reference.wall_vertex_ids, (1, 3))
+            np.testing.assert_allclose(
+                target.origin_world[:2],
+                expected_midpoint,
+                atol=1e-9,
             )
 
     def test_room_floor_and_ceiling_targets_name_authoritative_properties(
@@ -270,11 +342,11 @@ class CanvasSurfaceEditTargetTests(unittest.TestCase):
             if target.surface_id.endswith("wall:2:3")
         )
 
-        self.assertEqual(len(shared_targets), 8)
+        self.assertEqual(len(shared_targets), 12)
         self.assertEqual(len({target.surface_id for target in shared_targets}), 2)
         self.assertEqual(
             len({target.reference.key for target in shared_targets}),
-            4,
+            6,
         )
 
     def test_wall_rebase_uses_current_data_as_the_next_drag_baseline(
@@ -320,7 +392,7 @@ class CanvasSurfaceEditTargetTests(unittest.TestCase):
             )
 
         rebuild.assert_not_called()
-        self.assertEqual(len(rebased_targets), 4)
+        self.assertEqual(len(rebased_targets), 6)
         current_image_positions = tuple(
             (
                 level.vertex_data.get_vertex(vertex_id).x,
@@ -348,10 +420,25 @@ class CanvasSurfaceEditTargetTests(unittest.TestCase):
                     level.offset_y_meters,
                 ),
             )
-            assert rebased_target.reference.vertex_id is not None
-            expected_world = world_after_first_edit[
-                rebased_target.reference.vertex_id
-            ]
+            if (
+                rebased_target.reference.kind
+                == CANVAS_SURFACE_EDIT_WALL_TRANSLATION
+            ):
+                expected_world = np.mean(
+                    np.asarray(
+                        (
+                            world_after_first_edit[1],
+                            world_after_first_edit[3],
+                        ),
+                        dtype=float,
+                    ),
+                    axis=0,
+                )
+            else:
+                assert rebased_target.reference.vertex_id is not None
+                expected_world = world_after_first_edit[
+                    rebased_target.reference.vertex_id
+                ]
             np.testing.assert_allclose(
                 rebased_target.origin_world[:2],
                 expected_world,
@@ -389,6 +476,373 @@ class CanvasSurfaceEditTargetTests(unittest.TestCase):
 
 # ### Authoritative application tests ###
 class CanvasSurfaceEditApplicationTests(unittest.TestCase):
+    def test_wall_translation_batch_moves_shared_vertex_once(self) -> None:
+        level = _build_adjacent_room_level()
+        _surfaces, targets = _build_targets(level)
+        first_target = _find_target(
+            targets,
+            "wall:1:2",
+            "level:2/wall:1:2/translation/axis:x",
+        )
+        second_target = _find_target(
+            targets,
+            "wall:2:6",
+            "level:2/wall:2:6/translation/axis:x",
+        )
+        selected_targets = (first_target, second_target)
+        baseline_vertices = tuple(level.vertex_data.vertices)
+        baseline_world = _world_positions(level)
+        baseline_offsets = (
+            level.offset_x_meters,
+            level.offset_y_meters,
+        )
+
+        with patch.object(
+            level.vertex_data,
+            "move_vertex",
+            wraps=level.vertex_data.move_vertex,
+        ) as move_vertex:
+            applied = apply_canvas_wall_edit_batch(
+                (level,),
+                selected_targets,
+                CanvasSurfaceEdit(
+                    first_target.reference,
+                    first_target.surface_id,
+                    0.4,
+                ),
+                validate_project_geometry=False,
+            )
+
+        self.assertEqual(len(applied), 2)
+        self.assertEqual(
+            [call.args[0] for call in move_vertex.call_args_list].count(2),
+            1,
+        )
+        self.assertEqual(move_vertex.call_count, 3)
+        translated_world = _world_positions(level)
+        for vertex_id in (1, 2, 6):
+            np.testing.assert_allclose(
+                translated_world[vertex_id],
+                np.asarray(baseline_world[vertex_id]) + (0.4, 0.0),
+                atol=1e-9,
+            )
+        for vertex_id in (3, 4, 5, 7, 8):
+            np.testing.assert_allclose(
+                translated_world[vertex_id],
+                baseline_world[vertex_id],
+                atol=1e-9,
+            )
+
+        rebased = rebase_canvas_wall_edit_targets_batch(
+            (level,),
+            selected_targets,
+        )
+        self.assertEqual(len(rebased), 2)
+        for target in rebased:
+            expected_positions = tuple(
+                (
+                    level.vertex_data.get_vertex(vertex_id).x,
+                    level.vertex_data.get_vertex(vertex_id).y,
+                )
+                for vertex_id in target.chain_vertex_ids
+            )
+            self.assertEqual(
+                target.chain_vertex_image_positions,
+                expected_positions,
+            )
+
+        restore_canvas_wall_edit_batch(
+            (level,),
+            selected_targets,
+            validate_project_geometry=False,
+        )
+        self.assertEqual(tuple(level.vertex_data.vertices), baseline_vertices)
+        np.testing.assert_allclose(
+            (level.offset_x_meters, level.offset_y_meters),
+            baseline_offsets,
+            atol=1e-9,
+        )
+
+    def test_wall_translation_batch_uses_one_world_delta_across_levels(
+        self,
+    ) -> None:
+        first_level = _build_plain_level()
+        second_level = _build_plain_level()
+        second_level.index = 3
+        second_level.scale = 2.5
+        second_level.offset_x_meters = 4.0
+        second_level.offset_y_meters = -3.0
+        levels = (first_level, second_level)
+        surfaces = tuple(build_fixed_surfaces(levels))
+        targets = build_canvas_surface_edit_targets(levels, surfaces)
+        selected_targets = tuple(
+            next(
+                target
+                for target in targets
+                if target.reference.level_index == level_index
+                and target.reference.kind
+                == CANVAS_SURFACE_EDIT_WALL_TRANSLATION
+                and target.reference.axis_index
+                == CANVAS_SURFACE_EDIT_AXIS_X
+            )
+            for level_index in (2, 3)
+        )
+        baseline_world = tuple(_world_positions(level) for level in levels)
+
+        apply_canvas_wall_edit_batch(
+            levels,
+            selected_targets,
+            CanvasSurfaceEdit(
+                selected_targets[0].reference,
+                selected_targets[0].surface_id,
+                0.65,
+            ),
+            validate_project_geometry=False,
+        )
+
+        for level, target, level_baseline in zip(
+            levels,
+            selected_targets,
+            baseline_world,
+            strict=True,
+        ):
+            current_world = _world_positions(level)
+            for vertex_id in target.chain_vertex_ids:
+                np.testing.assert_allclose(
+                    current_world[vertex_id],
+                    np.asarray(level_baseline[vertex_id]) + (0.65, 0.0),
+                    atol=1e-9,
+                )
+
+    def test_wall_translation_batch_rolls_back_all_atomic_failures(self) -> None:
+        for failure_kind in ("conflict", "surface validation"):
+            with self.subTest(failure_kind=failure_kind):
+                level = _build_adjacent_room_level()
+                _surfaces, targets = _build_targets(level)
+                first_target = _find_target(
+                    targets,
+                    "wall:1:2",
+                    "level:2/wall:1:2/translation/axis:x",
+                )
+                second_target = _find_target(
+                    targets,
+                    "wall:2:6",
+                    "level:2/wall:2:6/translation/axis:x",
+                )
+                baseline_vertices = tuple(level.vertex_data.vertices)
+                baseline_offsets = (
+                    level.offset_x_meters,
+                    level.offset_y_meters,
+                )
+                selected_targets = (first_target, second_target)
+
+                if failure_kind == "conflict":
+                    positions = list(
+                        second_target.chain_vertex_image_positions
+                    )
+                    positions[0] = (positions[0][0] + 1.0, positions[0][1])
+                    selected_targets = (
+                        first_target,
+                        replace(
+                            second_target,
+                            chain_vertex_image_positions=tuple(positions),
+                        ),
+                    )
+                    context = self.assertRaisesRegex(
+                        ValueError,
+                        "conflicting positions",
+                    )
+                else:
+                    context = self.assertRaisesRegex(
+                        ValueError,
+                        "required generated surfaces",
+                    )
+
+                with context:
+                    if failure_kind == "surface validation":
+                        with patch(
+                            "housemaker.canvas_surface_edits."
+                            "build_fixed_surfaces",
+                            return_value=(),
+                        ) as rebuild:
+                            apply_canvas_wall_edit_batch(
+                                (level,),
+                                selected_targets,
+                                CanvasSurfaceEdit(
+                                    first_target.reference,
+                                    first_target.surface_id,
+                                    0.4,
+                                ),
+                            )
+                        rebuild.assert_called_once_with((level,))
+                    else:
+                        apply_canvas_wall_edit_batch(
+                            (level,),
+                            selected_targets,
+                            CanvasSurfaceEdit(
+                                first_target.reference,
+                                first_target.surface_id,
+                                0.4,
+                            ),
+                            validate_project_geometry=False,
+                        )
+
+                self.assertEqual(
+                    tuple(level.vertex_data.vertices),
+                    baseline_vertices,
+                )
+                self.assertEqual(
+                    (level.offset_x_meters, level.offset_y_meters),
+                    baseline_offsets,
+                )
+
+    def test_wall_batch_geometry_validation_builds_only_once(self) -> None:
+        level = _build_adjacent_room_level()
+        _surfaces, targets = _build_targets(level)
+        selected_targets = (
+            _find_target(
+                targets,
+                "wall:1:2",
+                "level:2/wall:1:2/translation/axis:x",
+            ),
+            _find_target(
+                targets,
+                "wall:2:6",
+                "level:2/wall:2:6/translation/axis:x",
+            ),
+        )
+
+        with patch(
+            "housemaker.canvas_surface_edits.build_fixed_surfaces",
+            wraps=build_fixed_surfaces,
+        ) as rebuild:
+            validate_canvas_wall_edit_batch_geometry(
+                (level,),
+                selected_targets,
+            )
+
+        rebuild.assert_called_once_with((level,))
+
+    def test_wall_translation_is_rigid_absolute_and_restorable(self) -> None:
+        axis_cases = (
+            (CANVAS_SURFACE_EDIT_AXIS_X, 0.8, 0.3),
+            (CANVAS_SURFACE_EDIT_AXIS_Y, -0.6, 0.25),
+        )
+        for axis_index, first_delta, second_delta in axis_cases:
+            with self.subTest(axis_index=axis_index):
+                level = _build_room_level(
+                    scale=2.0,
+                    offset_x_meters=3.0,
+                    offset_y_meters=-2.0,
+                )
+                _surfaces, targets = _build_targets(level)
+                axis_name = (
+                    "x"
+                    if axis_index == CANVAS_SURFACE_EDIT_AXIS_X
+                    else "y"
+                )
+                target = _find_target(
+                    targets,
+                    "wall:1:3",
+                    f"level:2/wall:1:3/translation/axis:{axis_name}",
+                )
+                baseline_vertices = tuple(level.vertex_data.vertices)
+                baseline_edges = tuple(level.vertex_data.edges)
+                baseline_world = _world_positions(level)
+                baseline_offsets = (
+                    level.offset_x_meters,
+                    level.offset_y_meters,
+                )
+                expected_direction = np.zeros(2, dtype=float)
+                expected_direction[axis_index] = 1.0
+
+                first_result = apply_canvas_surface_edit(
+                    (level,),
+                    target,
+                    CanvasSurfaceEdit(
+                        target.reference,
+                        target.surface_id,
+                        first_delta,
+                    ),
+                    validate_project_geometry=False,
+                )
+
+                first_world = _world_positions(level)
+                self.assertEqual(first_result.previous.delta_meters, 0.0)
+                self.assertEqual(first_result.current.delta_meters, first_delta)
+                for vertex_id in (1, 2, 3):
+                    np.testing.assert_allclose(
+                        first_world[vertex_id],
+                        baseline_world[vertex_id]
+                        + expected_direction * first_delta,
+                        atol=1e-9,
+                    )
+                for vertex_id in (4, 5, 6):
+                    np.testing.assert_allclose(
+                        first_world[vertex_id],
+                        baseline_world[vertex_id],
+                        atol=1e-9,
+                    )
+                np.testing.assert_allclose(
+                    np.asarray(first_world[3]) - np.asarray(first_world[1]),
+                    np.asarray(baseline_world[3])
+                    - np.asarray(baseline_world[1]),
+                    atol=1e-9,
+                )
+                self.assertEqual(tuple(level.vertex_data.edges), baseline_edges)
+
+                second_result = apply_canvas_surface_edit(
+                    (level,),
+                    target,
+                    CanvasSurfaceEdit(
+                        target.reference,
+                        target.surface_id,
+                        second_delta,
+                    ),
+                    validate_project_geometry=False,
+                )
+
+                second_world = _world_positions(level)
+                self.assertAlmostEqual(
+                    second_result.previous.delta_meters,
+                    first_delta,
+                )
+                self.assertEqual(
+                    second_result.current.delta_meters,
+                    second_delta,
+                )
+                for vertex_id in (1, 2, 3):
+                    np.testing.assert_allclose(
+                        second_world[vertex_id],
+                        baseline_world[vertex_id]
+                        + expected_direction * second_delta,
+                        atol=1e-9,
+                    )
+                for vertex_id in (4, 5, 6):
+                    np.testing.assert_allclose(
+                        second_world[vertex_id],
+                        baseline_world[vertex_id],
+                        atol=1e-9,
+                    )
+                self.assertEqual(tuple(level.vertex_data.edges), baseline_edges)
+
+                restore_canvas_surface_edit(
+                    (level,),
+                    target,
+                    validate_project_geometry=False,
+                )
+
+                self.assertEqual(
+                    tuple(level.vertex_data.vertices),
+                    baseline_vertices,
+                )
+                self.assertEqual(tuple(level.vertex_data.edges), baseline_edges)
+                np.testing.assert_allclose(
+                    (level.offset_x_meters, level.offset_y_meters),
+                    baseline_offsets,
+                    atol=1e-9,
+                )
+
     def test_scaled_wall_edit_is_absolute_and_preserves_other_world_points(
         self,
     ) -> None:

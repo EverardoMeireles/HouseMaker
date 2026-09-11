@@ -19,6 +19,7 @@ from housemaker.canvas_surface_edits import (
     CANVAS_SURFACE_EDIT_AXIS_X,
     CANVAS_SURFACE_EDIT_LEVEL_HEIGHT,
     CANVAS_SURFACE_EDIT_ROOM_HEIGHT,
+    CANVAS_SURFACE_EDIT_WALL_TRANSLATION,
     CANVAS_SURFACE_EDIT_WALL_VERTEX,
     CanvasSurfaceEdit,
     CanvasSurfaceEditHandleTarget,
@@ -49,6 +50,25 @@ def _build_plain_connected_level() -> LevelData:
     third = vertex_data.add_vertex(100.0, 100.0)
     vertex_data.add_edge(first.id, shared.id)
     vertex_data.add_edge(shared.id, third.id)
+    return LevelData(
+        index=2,
+        name="Ground",
+        height_meters=3.0,
+        vertex_data=vertex_data,
+    )
+
+
+def _build_multi_wall_level() -> LevelData:
+    """Return two selected walls plus one connected unselected wall."""
+
+    vertex_data = VertexData()
+    first = vertex_data.add_vertex(0.0, 0.0)
+    shared = vertex_data.add_vertex(100.0, 0.0)
+    third = vertex_data.add_vertex(100.0, 100.0)
+    unselected = vertex_data.add_vertex(200.0, 100.0)
+    vertex_data.add_edge(first.id, shared.id)
+    vertex_data.add_edge(shared.id, third.id)
+    vertex_data.add_edge(third.id, unselected.id)
     return LevelData(
         index=2,
         name="Ground",
@@ -268,6 +288,166 @@ class CanvasSurfaceEditMainTests(unittest.TestCase):
             _edit(target, 0.0)
         )
 
+    def test_wall_midpoint_preview_translates_both_endpoints_live(self) -> None:
+        level = _build_plain_connected_level()
+        surfaces = self._install_level(level)
+        wall = _surface(
+            surfaces,
+            surface_type=SURFACE_TYPE_WALL,
+            wall_key="1:2",
+        )
+        target = self._target(
+            wall.surface_id,
+            CANVAS_SURFACE_EDIT_WALL_TRANSLATION,
+            axis_index=CANVAS_SURFACE_EDIT_AXIS_X,
+        )
+        baseline_vertices = tuple(level.vertex_data.vertices)
+        baseline_edges = tuple(level.vertex_data.edges)
+
+        with (
+            patch.object(
+                self.workspace,
+                "_build_viewer_preview_model",
+            ) as build_preview,
+            patch.object(
+                self.workspace,
+                "_schedule_viewer_preview_refresh",
+            ) as schedule_refresh,
+            patch.object(
+                self.workspace.surface_texture_generation,
+                "reconcile_assignments_with_levels",
+            ) as reconcile_assignments,
+        ):
+            self.workspace._handle_canvas_surface_edit_started(
+                _edit(target, 0.0)
+            )
+            self.workspace._handle_canvas_surface_edit_preview_changed(
+                _edit(target, 0.4)
+            )
+
+        first = level.vertex_data.get_vertex(1)
+        second = level.vertex_data.get_vertex(2)
+        connected = level.vertex_data.get_vertex(3)
+        assert first is not None and second is not None and connected is not None
+        self.assertEqual((first.x, first.y), (20.0, 0.0))
+        self.assertEqual((second.x, second.y), (120.0, 0.0))
+        self.assertEqual((connected.x, connected.y), (100.0, 100.0))
+        self.assertEqual(tuple(level.vertex_data.edges), baseline_edges)
+        self.assertIs(self.workspace.canvas.vertex_data, level.vertex_data)
+        self.assertFalse(self.workspace._pending_canvas_surface_mesh_update)
+        build_preview.assert_not_called()
+        schedule_refresh.assert_not_called()
+        reconcile_assignments.assert_not_called()
+
+        self.workspace._handle_canvas_surface_edit_cancelled(
+            _edit(target, 0.0)
+        )
+        self.assertEqual(tuple(level.vertex_data.vertices), baseline_vertices)
+
+    def test_multi_wall_midpoint_moves_selected_wall_union_once(self) -> None:
+        level = _build_multi_wall_level()
+        surfaces = self._install_level(level)
+        first_wall = _surface(
+            surfaces,
+            surface_type=SURFACE_TYPE_WALL,
+            wall_key="1:2",
+        )
+        second_wall = _surface(
+            surfaces,
+            surface_type=SURFACE_TYPE_WALL,
+            wall_key="2:3",
+        )
+        viewer = self.workspace.viewer
+        viewer.select_canvas_surface_target(first_wall.surface_id)
+        viewer.select_canvas_surface_target(
+            second_wall.surface_id,
+            additive=True,
+        )
+        target = self._target(
+            first_wall.surface_id,
+            CANVAS_SURFACE_EDIT_WALL_TRANSLATION,
+            axis_index=CANVAS_SURFACE_EDIT_AXIS_X,
+        )
+        baseline_vertices = tuple(level.vertex_data.vertices)
+        baseline_edges = tuple(level.vertex_data.edges)
+
+        self.assertEqual(
+            viewer.get_selected_canvas_surface_ids(),
+            (first_wall.surface_id, second_wall.surface_id),
+        )
+        active_targets = viewer._get_active_canvas_surface_edit_targets()
+        self.assertEqual(len(active_targets), 12)
+        self.assertEqual(
+            {candidate.surface_id for candidate in active_targets},
+            {first_wall.surface_id, second_wall.surface_id},
+        )
+
+        self.workspace._handle_canvas_surface_edit_started(_edit(target, 0.0))
+        self.workspace._handle_canvas_surface_edit_preview_changed(
+            _edit(target, 0.4)
+        )
+
+        positions = {
+            vertex.id: (vertex.x, vertex.y)
+            for vertex in level.vertex_data.vertices
+        }
+        self.assertEqual(positions[1], (20.0, 0.0))
+        self.assertEqual(positions[2], (120.0, 0.0))
+        self.assertEqual(positions[3], (120.0, 100.0))
+        self.assertEqual(positions[4], (200.0, 100.0))
+        self.assertEqual(tuple(level.vertex_data.edges), baseline_edges)
+
+        self.workspace._handle_canvas_surface_edit_cancelled(
+            _edit(target, 0.0)
+        )
+        self.assertEqual(tuple(level.vertex_data.vertices), baseline_vertices)
+
+    def test_multi_wall_endpoint_handle_only_reshapes_its_owner(self) -> None:
+        level = _build_multi_wall_level()
+        surfaces = self._install_level(level)
+        first_wall = _surface(
+            surfaces,
+            surface_type=SURFACE_TYPE_WALL,
+            wall_key="1:2",
+        )
+        second_wall = _surface(
+            surfaces,
+            surface_type=SURFACE_TYPE_WALL,
+            wall_key="2:3",
+        )
+        viewer = self.workspace.viewer
+        viewer.select_canvas_surface_target(first_wall.surface_id)
+        viewer.select_canvas_surface_target(
+            second_wall.surface_id,
+            additive=True,
+        )
+        target = self._target(
+            first_wall.surface_id,
+            CANVAS_SURFACE_EDIT_WALL_VERTEX,
+            vertex_id=1,
+            axis_index=CANVAS_SURFACE_EDIT_AXIS_X,
+        )
+        baseline_vertices = tuple(level.vertex_data.vertices)
+
+        self.workspace._handle_canvas_surface_edit_started(_edit(target, 0.0))
+        self.workspace._handle_canvas_surface_edit_preview_changed(
+            _edit(target, 0.4)
+        )
+
+        positions = {
+            vertex.id: (vertex.x, vertex.y)
+            for vertex in level.vertex_data.vertices
+        }
+        self.assertEqual(positions[1], (20.0, 0.0))
+        self.assertEqual(positions[2], (100.0, 0.0))
+        self.assertEqual(positions[3], (100.0, 100.0))
+        self.assertEqual(positions[4], (200.0, 100.0))
+
+        self.workspace._handle_canvas_surface_edit_cancelled(
+            _edit(target, 0.0)
+        )
+        self.assertEqual(tuple(level.vertex_data.vertices), baseline_vertices)
+
     def test_wall_cancel_restores_the_exact_drag_baseline(self) -> None:
         level = _build_plain_connected_level()
         surfaces = self._install_level(level)
@@ -389,6 +569,130 @@ class CanvasSurfaceEditMainTests(unittest.TestCase):
             (),
         )
         self.assertAlmostEqual(level.vertex_data.get_vertex(2).x, 125.0)
+
+    def test_wall_midpoint_release_rebases_all_six_wall_handles(self) -> None:
+        level = _build_plain_connected_level()
+        surfaces = self._install_level(level)
+        wall = _surface(
+            surfaces,
+            surface_type=SURFACE_TYPE_WALL,
+            wall_key="1:2",
+        )
+        target = self._target(
+            wall.surface_id,
+            CANVAS_SURFACE_EDIT_WALL_TRANSLATION,
+            axis_index=CANVAS_SURFACE_EDIT_AXIS_X,
+        )
+        final_edit = _edit(target, 0.5)
+        self.workspace._handle_canvas_surface_edit_started(_edit(target, 0.0))
+        self.workspace._handle_canvas_surface_edit_preview_changed(final_edit)
+        self.workspace._handle_canvas_surface_edit_finished(final_edit, True)
+
+        first = level.vertex_data.get_vertex(1)
+        second = level.vertex_data.get_vertex(2)
+        assert first is not None and second is not None
+        self.assertEqual((first.x, first.y), (25.0, 0.0))
+        self.assertEqual((second.x, second.y), (125.0, 0.0))
+        wall_targets = tuple(
+            candidate
+            for candidate in self.workspace._canvas_surface_edit_targets_by_key.values()
+            if candidate.surface_id == wall.surface_id
+        )
+        self.assertEqual(len(wall_targets), 6)
+        midpoint_targets = tuple(
+            candidate
+            for candidate in wall_targets
+            if candidate.reference.kind == CANVAS_SURFACE_EDIT_WALL_TRANSLATION
+        )
+        self.assertEqual(len(midpoint_targets), 2)
+        midpoint_world = level_image_to_world_xy(
+            level,
+            (first.x + second.x) * 0.5,
+            (first.y + second.y) * 0.5,
+        )
+        for midpoint_target in midpoint_targets:
+            self.assertEqual(
+                midpoint_target.chain_vertex_image_positions,
+                ((25.0, 0.0), (125.0, 0.0)),
+            )
+            self.assertAlmostEqual(
+                midpoint_target.origin_world[0],
+                midpoint_world[0],
+            )
+            self.assertAlmostEqual(
+                midpoint_target.origin_world[1],
+                midpoint_world[1],
+            )
+        self.assertTrue(self.workspace._pending_canvas_surface_mesh_update)
+        self.assertTrue(
+            self.workspace._canvas_surface_mesh_update_timer.isActive()
+        )
+
+        self.workspace._cancel_pending_canvas_surface_mesh_update()
+
+    def test_multi_wall_release_rebases_every_selected_wall_handle(self) -> None:
+        level = _build_multi_wall_level()
+        surfaces = self._install_level(level)
+        first_wall = _surface(
+            surfaces,
+            surface_type=SURFACE_TYPE_WALL,
+            wall_key="1:2",
+        )
+        second_wall = _surface(
+            surfaces,
+            surface_type=SURFACE_TYPE_WALL,
+            wall_key="2:3",
+        )
+        viewer = self.workspace.viewer
+        viewer.select_canvas_surface_target(first_wall.surface_id)
+        viewer.select_canvas_surface_target(
+            second_wall.surface_id,
+            additive=True,
+        )
+        target = self._target(
+            first_wall.surface_id,
+            CANVAS_SURFACE_EDIT_WALL_TRANSLATION,
+            axis_index=CANVAS_SURFACE_EDIT_AXIS_X,
+        )
+        final_edit = _edit(target, 0.5)
+
+        self.workspace._handle_canvas_surface_edit_started(_edit(target, 0.0))
+        self.workspace._handle_canvas_surface_edit_preview_changed(final_edit)
+        self.workspace._handle_canvas_surface_edit_finished(final_edit, True)
+
+        rebased_targets = tuple(
+            self.workspace._canvas_surface_edit_targets_by_key.values()
+        )
+        self.assertEqual(len(rebased_targets), 12)
+        for surface_id, expected_chain in (
+            (first_wall.surface_id, ((25.0, 0.0), (125.0, 0.0))),
+            (second_wall.surface_id, ((125.0, 0.0), (125.0, 100.0))),
+        ):
+            wall_targets = tuple(
+                candidate
+                for candidate in rebased_targets
+                if candidate.surface_id == surface_id
+            )
+            self.assertEqual(len(wall_targets), 6)
+            self.assertTrue(
+                all(
+                    candidate.chain_vertex_image_positions == expected_chain
+                    for candidate in wall_targets
+                )
+            )
+        self.assertEqual(
+            {
+                candidate.surface_id
+                for candidate in viewer._get_active_canvas_surface_edit_targets()
+            },
+            {first_wall.surface_id, second_wall.surface_id},
+        )
+        self.assertTrue(self.workspace._pending_canvas_surface_mesh_update)
+        self.assertTrue(
+            self.workspace._canvas_surface_mesh_update_timer.isActive()
+        )
+
+        self.workspace._cancel_pending_canvas_surface_mesh_update()
 
     def test_delayed_wall_validation_failure_restores_and_rearms(self) -> None:
         level = _build_plain_connected_level()

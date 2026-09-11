@@ -18,6 +18,7 @@ from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.canvas_surface_edits import (
     CANVAS_SURFACE_EDIT_AXIS_X,
     CANVAS_SURFACE_EDIT_AXIS_Y,
+    CANVAS_SURFACE_EDIT_WALL_TRANSLATION,
     CANVAS_SURFACE_EDIT_WALL_VERTEX,
     CanvasSurfaceEdit,
     CanvasSurfaceEditHandleTarget,
@@ -124,16 +125,41 @@ class RepeatedCanvasSurfaceEditMainTests(unittest.TestCase):
         surface_id: str,
         *,
         axis_index: int,
-        vertex_id: int = 2,
+        kind: str = CANVAS_SURFACE_EDIT_WALL_VERTEX,
+        vertex_id: int | None = 2,
     ) -> CanvasSurfaceEditHandleTarget:
         return next(
             target
             for target in self.workspace._canvas_surface_edit_targets_by_key.values()
             if target.surface_id == surface_id
-            and target.reference.kind == CANVAS_SURFACE_EDIT_WALL_VERTEX
-            and target.reference.vertex_id == vertex_id
+            and target.reference.kind == kind
+            and (
+                kind == CANVAS_SURFACE_EDIT_WALL_TRANSLATION
+                or target.reference.vertex_id == vertex_id
+            )
             and target.reference.axis_index == axis_index
         )
+
+    def _select_both_walls(self, wall: FixedSurface) -> FixedSurface:
+        """Add the connected wall to the current structural selection."""
+
+        other_wall = next(
+            surface
+            for surface in self.workspace._canvas_surface_targets_by_id.values()
+            if surface.surface_type == SURFACE_TYPE_WALL
+            and surface.surface_id != wall.surface_id
+        )
+        self.assertTrue(
+            self.workspace.viewer.select_canvas_surface_target(
+                other_wall.surface_id,
+                additive=True,
+            )
+        )
+        self.assertEqual(
+            self.workspace.viewer.get_selected_canvas_surface_ids(),
+            (wall.surface_id, other_wall.surface_id),
+        )
+        return other_wall
 
     def _finish_changed_drag(
         self,
@@ -147,7 +173,7 @@ class RepeatedCanvasSurfaceEditMainTests(unittest.TestCase):
         self.workspace._handle_canvas_surface_edit_preview_changed(edit)
         self.workspace._handle_canvas_surface_edit_finished(edit, True)
 
-    def _assert_four_current_handles(
+    def _assert_six_current_handles(
         self,
         level: LevelData,
         wall: FixedSurface,
@@ -157,15 +183,16 @@ class RepeatedCanvasSurfaceEditMainTests(unittest.TestCase):
             for target in self.workspace._canvas_surface_edit_targets_by_key.values()
             if target.surface_id == wall.surface_id
         )
-        self.assertEqual(len(wall_targets), 4)
+        self.assertEqual(len(wall_targets), 6)
         self.assertEqual(
             len(
                 self.workspace.viewer._get_active_canvas_surface_edit_targets()
             ),
-            4,
+            6,
         )
+        first = level.vertex_data.get_vertex(1)
         shared = level.vertex_data.get_vertex(2)
-        assert shared is not None
+        assert first is not None and shared is not None
         expected_world = level_image_to_world_xy(level, shared.x, shared.y)
         shared_targets = tuple(
             target
@@ -179,6 +206,44 @@ class RepeatedCanvasSurfaceEditMainTests(unittest.TestCase):
             self.assertEqual(
                 target.chain_vertex_image_positions[-1],
                 (shared.x, shared.y),
+            )
+        midpoint_world = level_image_to_world_xy(
+            level,
+            (first.x + shared.x) * 0.5,
+            (first.y + shared.y) * 0.5,
+        )
+        midpoint_targets = tuple(
+            target
+            for target in wall_targets
+            if target.reference.kind == CANVAS_SURFACE_EDIT_WALL_TRANSLATION
+        )
+        self.assertEqual(len(midpoint_targets), 2)
+        for target in midpoint_targets:
+            self.assertEqual(target.reference.wall_vertex_ids, (1, 2))
+            self.assertAlmostEqual(target.origin_world[0], midpoint_world[0])
+            self.assertAlmostEqual(target.origin_world[1], midpoint_world[1])
+            self.assertEqual(
+                target.chain_vertex_image_positions,
+                ((first.x, first.y), (shared.x, shared.y)),
+            )
+
+    def _assert_twelve_selected_wall_handles(
+        self,
+        wall_ids: tuple[str, str],
+    ) -> None:
+        """Assert that both selected walls retain their complete handle sets."""
+
+        active_targets = (
+            self.workspace.viewer._get_active_canvas_surface_edit_targets()
+        )
+        self.assertEqual(len(active_targets), 12)
+        for wall_id in wall_ids:
+            self.assertEqual(
+                sum(
+                    target.surface_id == wall_id
+                    for target in active_targets
+                ),
+                6,
             )
 
     def test_first_release_retains_current_handles_and_defers_validation(
@@ -216,7 +281,7 @@ class RepeatedCanvasSurfaceEditMainTests(unittest.TestCase):
         self.assertTrue(
             self.workspace._canvas_surface_mesh_update_timer.isActive()
         )
-        self._assert_four_current_handles(level, wall)
+        self._assert_six_current_handles(level, wall)
         validate_geometry.assert_not_called()
         reconcile_assignments.assert_not_called()
         schedule_refresh.assert_not_called()
@@ -271,7 +336,7 @@ class RepeatedCanvasSurfaceEditMainTests(unittest.TestCase):
             self.assertTrue(
                 self.workspace._canvas_surface_mesh_update_timer.isActive()
             )
-            self._assert_four_current_handles(level, wall)
+            self._assert_six_current_handles(level, wall)
             validate_geometry.assert_not_called()
             reconcile_assignments.assert_not_called()
             schedule_refresh.assert_not_called()
@@ -341,9 +406,9 @@ class RepeatedCanvasSurfaceEditMainTests(unittest.TestCase):
         self.assertTrue(
             self.workspace._canvas_surface_mesh_update_timer.isActive()
         )
-        self._assert_four_current_handles(level, wall)
+        self._assert_six_current_handles(level, wall)
 
-    def test_delayed_failure_after_two_axes_restores_pre_burst_geometry(
+    def test_delayed_failure_after_midpoint_then_endpoint_restores_pre_burst(
         self,
     ) -> None:
         level, wall = self._install_level()
@@ -351,6 +416,8 @@ class RepeatedCanvasSurfaceEditMainTests(unittest.TestCase):
         x_target = self._target(
             wall.surface_id,
             axis_index=CANVAS_SURFACE_EDIT_AXIS_X,
+            kind=CANVAS_SURFACE_EDIT_WALL_TRANSLATION,
+            vertex_id=None,
         )
         self._finish_changed_drag(x_target, 0.5)
         y_target = self._target(
@@ -359,8 +426,10 @@ class RepeatedCanvasSurfaceEditMainTests(unittest.TestCase):
         )
         self._finish_changed_drag(y_target, 0.4)
 
+        moved_first = level.vertex_data.get_vertex(1)
         moved_shared = level.vertex_data.get_vertex(2)
-        assert moved_shared is not None
+        assert moved_first is not None and moved_shared is not None
+        self.assertEqual((moved_first.x, moved_first.y), (25.0, 0.0))
         self.assertEqual((moved_shared.x, moved_shared.y), (125.0, -20.0))
 
         with (
@@ -382,7 +451,7 @@ class RepeatedCanvasSurfaceEditMainTests(unittest.TestCase):
         self.assertFalse(
             self.workspace._canvas_surface_mesh_update_timer.isActive()
         )
-        self._assert_four_current_handles(level, wall)
+        self._assert_six_current_handles(level, wall)
         restored_x_target = self._target(
             wall.surface_id,
             axis_index=CANVAS_SURFACE_EDIT_AXIS_X,
@@ -394,6 +463,75 @@ class RepeatedCanvasSurfaceEditMainTests(unittest.TestCase):
         assert self.workspace.viewer.window_tools_status_label is not None
         self.assertIn(
             "invalid repeated wall edit",
+            self.workspace.viewer.window_tools_status_label.text(),
+        )
+
+    def test_multi_wall_mixed_burst_failure_restores_complete_graph(
+        self,
+    ) -> None:
+        level, first_wall = self._install_level()
+        second_wall = self._select_both_walls(first_wall)
+        original_vertices = tuple(level.vertex_data.vertices)
+        original_edges = tuple(level.vertex_data.edges)
+        original_offsets = (
+            level.offset_x_meters,
+            level.offset_y_meters,
+        )
+        midpoint_target = self._target(
+            first_wall.surface_id,
+            axis_index=CANVAS_SURFACE_EDIT_AXIS_X,
+            kind=CANVAS_SURFACE_EDIT_WALL_TRANSLATION,
+            vertex_id=None,
+        )
+        self._finish_changed_drag(midpoint_target, 0.5)
+        endpoint_target = self._target(
+            first_wall.surface_id,
+            axis_index=CANVAS_SURFACE_EDIT_AXIS_Y,
+        )
+        self._finish_changed_drag(endpoint_target, 0.4)
+
+        first = level.vertex_data.get_vertex(1)
+        shared = level.vertex_data.get_vertex(2)
+        third = level.vertex_data.get_vertex(3)
+        assert first is not None and shared is not None and third is not None
+        self.assertEqual((first.x, first.y), (25.0, 0.0))
+        self.assertEqual((shared.x, shared.y), (125.0, -20.0))
+        self.assertEqual((third.x, third.y), (125.0, 100.0))
+        self._assert_twelve_selected_wall_handles(
+            (first_wall.surface_id, second_wall.surface_id)
+        )
+
+        with (
+            patch(
+                "housemaker.canvas_surface_edits."
+                "_validate_generated_surfaces_batch",
+                side_effect=ValueError("invalid multi-wall burst"),
+            ) as validate_geometry,
+            patch.object(
+                self.workspace.surface_texture_generation,
+                "reconcile_assignments_with_levels",
+            ) as reconcile_assignments,
+        ):
+            self.workspace._commit_pending_canvas_surface_mesh_update()
+
+        validate_geometry.assert_called_once()
+        reconcile_assignments.assert_not_called()
+        self.assertEqual(tuple(level.vertex_data.vertices), original_vertices)
+        self.assertEqual(tuple(level.vertex_data.edges), original_edges)
+        self.assertEqual(
+            (level.offset_x_meters, level.offset_y_meters),
+            original_offsets,
+        )
+        self.assertFalse(self.workspace._pending_canvas_surface_mesh_update)
+        self.assertFalse(
+            self.workspace._canvas_surface_mesh_update_timer.isActive()
+        )
+        self._assert_twelve_selected_wall_handles(
+            (first_wall.surface_id, second_wall.surface_id)
+        )
+        assert self.workspace.viewer.window_tools_status_label is not None
+        self.assertIn(
+            "invalid multi-wall burst",
             self.workspace.viewer.window_tools_status_label.text(),
         )
 
@@ -442,6 +580,61 @@ class RepeatedCanvasSurfaceEditMainTests(unittest.TestCase):
             self.workspace._desired_canvas_surface_ids,
             (other_wall.surface_id,),
         )
+
+    def test_changing_multi_wall_selection_commits_pending_batch(self) -> None:
+        level, first_wall = self._install_level()
+        second_wall = self._select_both_walls(first_wall)
+        midpoint_target = self._target(
+            first_wall.surface_id,
+            axis_index=CANVAS_SURFACE_EDIT_AXIS_X,
+            kind=CANVAS_SURFACE_EDIT_WALL_TRANSLATION,
+            vertex_id=None,
+        )
+        self._finish_changed_drag(midpoint_target, 0.5)
+        self.assertTrue(self.workspace._pending_canvas_surface_mesh_update)
+
+        with (
+            patch(
+                "housemaker.canvas_surface_edits."
+                "_validate_generated_surfaces_batch"
+            ) as validate_geometry,
+            patch.object(
+                self.workspace.surface_texture_generation,
+                "reconcile_assignments_with_levels",
+                return_value=False,
+            ) as reconcile_assignments,
+            patch.object(
+                self.workspace,
+                "_schedule_viewer_preview_refresh",
+            ) as schedule_refresh,
+        ):
+            self.assertTrue(
+                self.workspace.viewer.select_canvas_surface_target(
+                    second_wall.surface_id,
+                    additive=True,
+                )
+            )
+
+        validate_geometry.assert_called_once()
+        reconcile_assignments.assert_called_once_with([level])
+        schedule_refresh.assert_called_once_with(preserve_camera=True)
+        self.assertFalse(self.workspace._pending_canvas_surface_mesh_update)
+        self.assertFalse(
+            self.workspace._canvas_surface_mesh_update_timer.isActive()
+        )
+        self.assertEqual(
+            self.workspace.viewer.get_selected_canvas_surface_ids(),
+            (first_wall.surface_id,),
+        )
+        self.assertEqual(
+            self.workspace._desired_canvas_surface_ids,
+            (first_wall.surface_id,),
+        )
+        first = level.vertex_data.get_vertex(1)
+        shared = level.vertex_data.get_vertex(2)
+        third = level.vertex_data.get_vertex(3)
+        assert first is not None and shared is not None and third is not None
+        self.assertEqual((first.x, shared.x, third.x), (25.0, 125.0, 125.0))
 
     def test_accepted_save_flushes_pending_edit_before_serialization(
         self,
@@ -539,7 +732,7 @@ class RepeatedCanvasSurfaceEditMainTests(unittest.TestCase):
         self.assertTrue(
             self.workspace._canvas_surface_mesh_update_timer.isActive()
         )
-        self._assert_four_current_handles(level, wall)
+        self._assert_six_current_handles(level, wall)
 
 
 if __name__ == "__main__":

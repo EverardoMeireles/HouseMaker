@@ -34,12 +34,19 @@ from housemaker.surface_geometry import (
 
 # ### Constants ###
 CANVAS_SURFACE_EDIT_WALL_VERTEX = "wall_vertex"
+CANVAS_SURFACE_EDIT_WALL_TRANSLATION = "wall_translation"
 CANVAS_SURFACE_EDIT_LEVEL_HEIGHT = "level_height"
 CANVAS_SURFACE_EDIT_ROOM_HEIGHT = "room_height"
 CANVAS_SURFACE_EDIT_FLOOR_THICKNESS = "floor_thickness"
-CANVAS_SURFACE_EDIT_KINDS = frozenset(
+CANVAS_SURFACE_EDIT_WALL_KINDS = frozenset(
     (
         CANVAS_SURFACE_EDIT_WALL_VERTEX,
+        CANVAS_SURFACE_EDIT_WALL_TRANSLATION,
+    )
+)
+CANVAS_SURFACE_EDIT_KINDS = frozenset(
+    (
+        *CANVAS_SURFACE_EDIT_WALL_KINDS,
         CANVAS_SURFACE_EDIT_LEVEL_HEIGHT,
         CANVAS_SURFACE_EDIT_ROOM_HEIGHT,
         CANVAS_SURFACE_EDIT_FLOOR_THICKNESS,
@@ -77,6 +84,7 @@ class CanvasSurfaceEditReference:
     axis_index: int
     vertex_id: int | None = None
     room_center_vertex_id: int | None = None
+    wall_vertex_ids: tuple[int, int] = ()
 
     def __post_init__(self) -> None:
         kind = str(self.kind).strip().lower()
@@ -94,9 +102,19 @@ class CanvasSurfaceEditReference:
             self.room_center_vertex_id,
             "room center vertex ID",
         )
+        wall_vertex_ids = tuple(
+            sorted(
+                _normalize_positive_integer(value, "wall vertex ID")
+                for value in self.wall_vertex_ids
+            )
+        )
 
         if kind == CANVAS_SURFACE_EDIT_WALL_VERTEX:
-            if vertex_id is None or room_center_vertex_id is not None:
+            if (
+                vertex_id is None
+                or room_center_vertex_id is not None
+                or wall_vertex_ids
+            ):
                 raise ValueError(
                     "Wall edits require one persistent vertex ID only."
                 )
@@ -105,15 +123,38 @@ class CanvasSurfaceEditReference:
                 CANVAS_SURFACE_EDIT_AXIS_Y,
             }:
                 raise ValueError("Wall vertices can only move on X or Y.")
+        elif kind == CANVAS_SURFACE_EDIT_WALL_TRANSLATION:
+            if (
+                vertex_id is not None
+                or room_center_vertex_id is not None
+                or len(wall_vertex_ids) != 2
+                or len(set(wall_vertex_ids)) != 2
+            ):
+                raise ValueError(
+                    "Wall translation edits require two distinct endpoint IDs."
+                )
+            if axis_index not in {
+                CANVAS_SURFACE_EDIT_AXIS_X,
+                CANVAS_SURFACE_EDIT_AXIS_Y,
+            }:
+                raise ValueError("Walls can only move on X or Y.")
         elif kind == CANVAS_SURFACE_EDIT_ROOM_HEIGHT:
-            if room_center_vertex_id is None or vertex_id is not None:
+            if (
+                room_center_vertex_id is None
+                or vertex_id is not None
+                or wall_vertex_ids
+            ):
                 raise ValueError(
                     "Room-height edits require one room center vertex ID only."
                 )
             if axis_index != CANVAS_SURFACE_EDIT_AXIS_Z:
                 raise ValueError("Room height can only change on Z.")
         else:
-            if vertex_id is not None or room_center_vertex_id is not None:
+            if (
+                vertex_id is not None
+                or room_center_vertex_id is not None
+                or wall_vertex_ids
+            ):
                 raise ValueError(
                     "Level-wide edits have no item owner ID."
                 )
@@ -129,6 +170,7 @@ class CanvasSurfaceEditReference:
             "room_center_vertex_id",
             room_center_vertex_id,
         )
+        object.__setattr__(self, "wall_vertex_ids", wall_vertex_ids)
 
     @property
     def key(self) -> str:
@@ -139,6 +181,12 @@ class CanvasSurfaceEditReference:
             return (
                 f"level:{self.level_index}/vertex:{self.vertex_id}/"
                 f"axis:{axis_name}"
+            )
+        if self.kind == CANVAS_SURFACE_EDIT_WALL_TRANSLATION:
+            first_id, second_id = self.wall_vertex_ids
+            return (
+                f"level:{self.level_index}/wall:{first_id}:{second_id}/"
+                f"translation/axis:{axis_name}"
             )
         if self.kind == CANVAS_SURFACE_EDIT_ROOM_HEIGHT:
             return (
@@ -401,7 +449,7 @@ def rebase_canvas_wall_edit_targets(
     surface_id = first_target.surface_id
     level_index = first_target.reference.level_index
     if any(
-        target.reference.kind != CANVAS_SURFACE_EDIT_WALL_VERTEX
+        target.reference.kind not in CANVAS_SURFACE_EDIT_WALL_KINDS
         or target.surface_id != surface_id
         or target.reference.level_index != level_index
         for target in target_sequence
@@ -413,6 +461,27 @@ def rebase_canvas_wall_edit_targets(
     level = _find_level(level_sequence, level_index)
     return tuple(
         _rebase_canvas_wall_edit_target(level, target)
+        for target in target_sequence
+    )
+
+
+def rebase_canvas_wall_edit_targets_batch(
+    levels: Sequence[LevelData],
+    targets: Sequence[CanvasSurfaceEditHandleTarget],
+) -> tuple[CanvasSurfaceEditHandleTarget, ...]:
+    """Rebase wall handles from any number of walls and levels."""
+
+    level_sequence = _normalize_levels(levels)
+    target_sequence = _normalize_wall_target_sequence(
+        targets,
+        "Canvas wall batch target rebasing",
+        allow_empty=True,
+    )
+    return tuple(
+        _rebase_canvas_wall_edit_target(
+            _find_level(level_sequence, target.reference.level_index),
+            target,
+        )
         for target in target_sequence
     )
 
@@ -518,6 +587,37 @@ def _build_wall_targets(
                     **common,
                 )
             )
+    midpoint_image = (
+        (chain_positions[0][0] + chain_positions[-1][0]) * 0.5,
+        (chain_positions[0][1] + chain_positions[-1][1]) * 0.5,
+    )
+    midpoint_world = level_image_to_world_xy(level, *midpoint_image)
+    wall_vertex_ids = (chain_vertex_ids[0], chain_vertex_ids[-1])
+    for axis_index in (
+        CANVAS_SURFACE_EDIT_AXIS_X,
+        CANVAS_SURFACE_EDIT_AXIS_Y,
+    ):
+        targets.append(
+            CanvasSurfaceEditHandleTarget(
+                reference=CanvasSurfaceEditReference(
+                    CANVAS_SURFACE_EDIT_WALL_TRANSLATION,
+                    level.index,
+                    axis_index,
+                    wall_vertex_ids=wall_vertex_ids,
+                ),
+                origin_world=(*midpoint_world, base_z),
+                axis_world=tuple(
+                    float(value)
+                    for value in np.eye(3, dtype=float)[axis_index]
+                ),
+                minimum_delta_meters=-MAX_CANVAS_WALL_EDIT_DELTA_METERS,
+                maximum_delta_meters=MAX_CANVAS_WALL_EDIT_DELTA_METERS,
+                chain_vertex_ids=chain_vertex_ids,
+                chain_vertex_ratios=chain_ratios,
+                chain_vertex_image_positions=chain_positions,
+                **common,
+            )
+        )
     return tuple(targets)
 
 
@@ -640,6 +740,97 @@ def apply_canvas_surface_edit(
     )
 
 
+def apply_canvas_wall_edit_batch(
+    levels: Sequence[LevelData],
+    targets: Sequence[CanvasSurfaceEditHandleTarget],
+    edit: CanvasSurfaceEdit,
+    *,
+    validate_project_geometry: bool = True,
+) -> tuple[AppliedCanvasSurfaceEdit, ...]:
+    """Apply one absolute drag delta to a compatible wall-target batch."""
+
+    level_sequence = _normalize_levels(levels)
+    if not isinstance(edit, CanvasSurfaceEdit):
+        raise TypeError("Canvas wall batch edits require an edit payload.")
+    target_sequence = _normalize_wall_edit_batch_targets(targets, edit)
+    delta = _normalize_finite_number(edit.delta_meters, "edit delta")
+    levels_by_index = {level.index: level for level in level_sequence}
+    affected_levels: dict[int, LevelData] = {}
+    previous_edits: list[CanvasSurfaceEdit] = []
+
+    for target in target_sequence:
+        target_delta = _validate_target_delta(target, delta)
+        if not math.isclose(
+            target_delta,
+            delta,
+            rel_tol=0.0,
+            abs_tol=CANVAS_SURFACE_EDIT_EPSILON,
+        ):
+            raise ValueError(
+                "The Canvas wall batch delta was clamped inconsistently."
+            )
+        level = levels_by_index.get(target.reference.level_index)
+        if level is None:
+            raise ValueError("An edited Canvas level no longer exists.")
+        _validate_level_baseline(level, target)
+        _validate_wall_target_vertices_exist(level, target)
+        affected_levels[level.index] = level
+        previous_edits.append(
+            CanvasSurfaceEdit(
+                target.reference,
+                target.surface_id,
+                _measure_current_delta(level, target),
+            )
+        )
+
+    snapshots = {
+        level_index: _capture_level_mutation_snapshot(level)
+        for level_index, level in affected_levels.items()
+    }
+    try:
+        positions_by_level = _collect_wall_batch_positions(
+            target_sequence,
+            delta,
+        )
+        _write_wall_batch_positions(affected_levels, positions_by_level)
+        _reconcile_wall_batch_level_transforms(
+            affected_levels,
+            target_sequence,
+        )
+        _validate_wall_batch_lengths(affected_levels, target_sequence)
+        if validate_project_geometry:
+            _validate_generated_surfaces_batch(
+                level_sequence,
+                target_sequence,
+            )
+    except Exception as error:
+        for level_index, level in affected_levels.items():
+            _restore_level_mutation_snapshot(level, snapshots[level_index])
+        if isinstance(error, (TypeError, ValueError)):
+            raise
+        raise ValueError(
+            "The Canvas wall batch edit would create invalid project geometry."
+        ) from error
+
+    return tuple(
+        AppliedCanvasSurfaceEdit(
+            reference=target.reference,
+            level=affected_levels[target.reference.level_index],
+            previous=previous,
+            current=CanvasSurfaceEdit(
+                target.reference,
+                target.surface_id,
+                delta,
+            ),
+        )
+        for target, previous in zip(
+            target_sequence,
+            previous_edits,
+            strict=True,
+        )
+    )
+
+
 def restore_canvas_surface_edit(
     levels: Sequence[LevelData],
     target: CanvasSurfaceEditHandleTarget,
@@ -654,6 +845,27 @@ def restore_canvas_surface_edit(
         levels,
         target,
         CanvasSurfaceEdit(target.reference, target.surface_id, 0.0),
+        validate_project_geometry=validate_project_geometry,
+    )
+
+
+def restore_canvas_wall_edit_batch(
+    levels: Sequence[LevelData],
+    targets: Sequence[CanvasSurfaceEditHandleTarget],
+    *,
+    validate_project_geometry: bool = True,
+) -> tuple[AppliedCanvasSurfaceEdit, ...]:
+    """Atomically restore every wall target to its drag baseline."""
+
+    target_sequence = _normalize_wall_target_sequence(
+        targets,
+        "Canvas wall batch restoration",
+    )
+    primary = target_sequence[0]
+    return apply_canvas_wall_edit_batch(
+        levels,
+        target_sequence,
+        CanvasSurfaceEdit(primary.reference, primary.surface_id, 0.0),
         validate_project_geometry=validate_project_geometry,
     )
 
@@ -673,14 +885,235 @@ def validate_canvas_surface_edit_geometry(
     _validate_generated_surfaces(level_sequence, target)
 
 
+def validate_canvas_wall_edit_batch_geometry(
+    levels: Sequence[LevelData],
+    targets: Sequence[CanvasSurfaceEditHandleTarget],
+) -> None:
+    """Validate a current multi-wall preview at its commit boundary."""
+
+    level_sequence = _normalize_levels(levels)
+    target_sequence = _normalize_wall_edit_batch_targets(targets)
+    affected_levels: dict[int, LevelData] = {}
+    for target in target_sequence:
+        level = _find_level(level_sequence, target.reference.level_index)
+        _validate_level_baseline(level, target)
+        _validate_wall_target_vertices_exist(level, target)
+        affected_levels[level.index] = level
+    _validate_wall_batch_lengths(affected_levels, target_sequence)
+    _validate_generated_surfaces_batch(level_sequence, target_sequence)
+
+
+# ### Wall batch helpers ###
+def _normalize_wall_target_sequence(
+    targets: Sequence[CanvasSurfaceEditHandleTarget],
+    operation_name: str,
+    *,
+    allow_empty: bool = False,
+) -> tuple[CanvasSurfaceEditHandleTarget, ...]:
+    try:
+        target_sequence = tuple(targets)
+    except TypeError as error:
+        raise TypeError(f"{operation_name} requires a target sequence.") from error
+    if not target_sequence and not allow_empty:
+        raise ValueError(f"{operation_name} requires at least one target.")
+    if not all(
+        isinstance(target, CanvasSurfaceEditHandleTarget)
+        for target in target_sequence
+    ):
+        raise TypeError(f"{operation_name} requires wall handle targets.")
+    if any(
+        target.reference.kind not in CANVAS_SURFACE_EDIT_WALL_KINDS
+        for target in target_sequence
+    ):
+        raise ValueError(f"{operation_name} only accepts wall handle targets.")
+    return target_sequence
+
+
+def _normalize_wall_edit_batch_targets(
+    targets: Sequence[CanvasSurfaceEditHandleTarget],
+    edit: CanvasSurfaceEdit | None = None,
+) -> tuple[CanvasSurfaceEditHandleTarget, ...]:
+    target_sequence = _normalize_wall_target_sequence(
+        targets,
+        "Canvas wall batch editing",
+    )
+    unique_targets: dict[
+        tuple[str, str],
+        CanvasSurfaceEditHandleTarget,
+    ] = {}
+    for target in target_sequence:
+        key = (target.surface_id, target.reference.key)
+        existing = unique_targets.get(key)
+        if existing is not None and existing != target:
+            raise ValueError(
+                "Duplicate Canvas wall batch handles have conflicting baselines."
+            )
+        unique_targets.setdefault(key, target)
+    normalized = tuple(unique_targets.values())
+
+    primary_reference = normalized[0].reference
+    if edit is not None:
+        if edit.reference.kind not in CANVAS_SURFACE_EDIT_WALL_KINDS:
+            raise ValueError("Canvas wall batch edits require a wall reference.")
+        primary_matches = tuple(
+            target
+            for target in normalized
+            if target.reference == edit.reference
+            and target.surface_id == edit.surface_id
+        )
+        if len(primary_matches) != 1:
+            raise ValueError(
+                "The primary Canvas wall handle is not in the edit batch."
+            )
+        primary_reference = edit.reference
+
+    if any(
+        target.reference.axis_index != primary_reference.axis_index
+        for target in normalized
+    ):
+        raise ValueError("Canvas wall batch handles must share one axis.")
+    if primary_reference.kind == CANVAS_SURFACE_EDIT_WALL_TRANSLATION:
+        if any(
+            target.reference.kind != CANVAS_SURFACE_EDIT_WALL_TRANSLATION
+            for target in normalized
+        ):
+            raise ValueError(
+                "Canvas wall translation batches require translation handles."
+            )
+    elif any(
+        target.reference != primary_reference
+        for target in normalized
+    ):
+        raise ValueError(
+            "Canvas endpoint batches require one shared persistent reference."
+        )
+    return normalized
+
+
+def _collect_wall_batch_positions(
+    targets: tuple[CanvasSurfaceEditHandleTarget, ...],
+    delta: float,
+) -> dict[int, dict[int, tuple[float, float]]]:
+    positions_by_level: dict[int, dict[int, tuple[float, float]]] = {}
+    for target in targets:
+        level_positions = positions_by_level.setdefault(
+            target.reference.level_index,
+            {},
+        )
+        target_positions = _build_wall_target_positions(target, delta)
+        for vertex_id, position in zip(
+            target.chain_vertex_ids,
+            target_positions,
+            strict=True,
+        ):
+            existing = level_positions.get(vertex_id)
+            if existing is not None and not _pairs_are_close(
+                existing,
+                position,
+            ):
+                raise ValueError(
+                    "Selected Canvas walls require conflicting positions for "
+                    f"vertex {vertex_id}."
+                )
+            level_positions.setdefault(vertex_id, position)
+    return positions_by_level
+
+
+def _write_wall_batch_positions(
+    levels_by_index: dict[int, LevelData],
+    positions_by_level: dict[int, dict[int, tuple[float, float]]],
+) -> None:
+    for level_index, vertex_positions in positions_by_level.items():
+        level = levels_by_index[level_index]
+        for vertex_id, position in vertex_positions.items():
+            if level.vertex_data.move_vertex(vertex_id, *position) is None:
+                raise ValueError("An edited Canvas wall vertex disappeared.")
+
+
+def _reconcile_wall_batch_level_transforms(
+    levels_by_index: dict[int, LevelData],
+    targets: tuple[CanvasSurfaceEditHandleTarget, ...],
+) -> None:
+    targets_by_level: dict[int, list[CanvasSurfaceEditHandleTarget]] = {}
+    for target in targets:
+        targets_by_level.setdefault(
+            target.reference.level_index,
+            [],
+        ).append(target)
+
+    for level_index, level_targets in targets_by_level.items():
+        baseline = level_targets[0]
+        if any(
+            not _wall_level_baselines_match(baseline, target)
+            for target in level_targets[1:]
+        ):
+            raise ValueError(
+                "Selected Canvas wall handles have inconsistent level baselines."
+            )
+        level = levels_by_index[level_index]
+        level.offset_x_meters, level.offset_y_meters = (
+            baseline.level_offset_world
+        )
+        next_pivot = np.asarray(get_level_world_pivot(level), dtype=float)
+        baseline_pivot = np.asarray(
+            baseline.level_pivot_world,
+            dtype=float,
+        )
+        compensation = (
+            (1.0 - baseline.level_scale) * (baseline_pivot - next_pivot)
+        )
+        level.offset_x_meters += float(compensation[0])
+        level.offset_y_meters += float(compensation[1])
+        _validate_level_offsets(level)
+
+
+def _wall_level_baselines_match(
+    first: CanvasSurfaceEditHandleTarget,
+    second: CanvasSurfaceEditHandleTarget,
+) -> bool:
+    return bool(
+        math.isclose(
+            first.level_scale,
+            second.level_scale,
+            rel_tol=0.0,
+            abs_tol=CANVAS_SURFACE_EDIT_EPSILON,
+        )
+        and _pairs_are_close(
+            first.level_offset_world,
+            second.level_offset_world,
+        )
+        and _pairs_are_close(
+            first.level_pivot_world,
+            second.level_pivot_world,
+        )
+        and first.level_image_size_pixels == second.level_image_size_pixels
+    )
+
+
+def _pairs_are_close(
+    first: tuple[float, float],
+    second: tuple[float, float],
+) -> bool:
+    return all(
+        math.isclose(
+            first_value,
+            second_value,
+            rel_tol=0.0,
+            abs_tol=CANVAS_WALL_CHAIN_RELATIVE_TOLERANCE,
+        )
+        for first_value, second_value in zip(first, second, strict=True)
+    )
+
+
+# ### Single-target application helpers ###
 def _apply_target_delta(
     level: LevelData,
     target: CanvasSurfaceEditHandleTarget,
     delta: float,
 ) -> None:
     kind = target.reference.kind
-    if kind == CANVAS_SURFACE_EDIT_WALL_VERTEX:
-        _apply_wall_vertex_delta(level, target, delta)
+    if kind in CANVAS_SURFACE_EDIT_WALL_KINDS:
+        _apply_wall_delta(level, target, delta)
         return
     new_value = target.baseline_value_meters + delta
     if kind == CANVAS_SURFACE_EDIT_LEVEL_HEIGHT:
@@ -714,23 +1147,31 @@ def _rebase_canvas_wall_edit_target(
         for vertex_id in target.chain_vertex_ids
     ):
         raise ValueError("The edited Canvas wall vertices no longer exist.")
-    reference_vertex_id = target.reference.vertex_id
-    assert reference_vertex_id is not None
-    reference_vertex = vertex_lookup.get(reference_vertex_id)
-    if reference_vertex is None:
-        raise ValueError("The edited Canvas wall vertex no longer exists.")
-
-    world_x, world_y = level_image_to_world_xy(
-        level,
-        reference_vertex.x,
-        reference_vertex.y,
-    )
     chain_positions = tuple(
         (
             float(vertex_lookup[vertex_id].x),
             float(vertex_lookup[vertex_id].y),
         )
         for vertex_id in target.chain_vertex_ids
+    )
+    if target.reference.kind == CANVAS_SURFACE_EDIT_WALL_TRANSLATION:
+        reference_image_position = (
+            (chain_positions[0][0] + chain_positions[-1][0]) * 0.5,
+            (chain_positions[0][1] + chain_positions[-1][1]) * 0.5,
+        )
+    else:
+        reference_vertex_id = target.reference.vertex_id
+        assert reference_vertex_id is not None
+        reference_vertex = vertex_lookup.get(reference_vertex_id)
+        if reference_vertex is None:
+            raise ValueError("The edited Canvas wall vertex no longer exists.")
+        reference_image_position = (
+            float(reference_vertex.x),
+            float(reference_vertex.y),
+        )
+    world_x, world_y = level_image_to_world_xy(
+        level,
+        *reference_image_position,
     )
     return replace(
         target,
@@ -746,46 +1187,13 @@ def _rebase_canvas_wall_edit_target(
     )
 
 
-def _apply_wall_vertex_delta(
+def _apply_wall_delta(
     level: LevelData,
     target: CanvasSurfaceEditHandleTarget,
     delta: float,
 ) -> None:
-    reference = target.reference
-    assert reference.vertex_id is not None
-    vertex_lookup = {
-        vertex.id: vertex for vertex in level.vertex_data.vertices
-    }
-    if any(
-        vertex_id not in vertex_lookup
-        for vertex_id in target.chain_vertex_ids
-    ):
-        raise ValueError("The edited Canvas wall vertices no longer exist.")
-
-    start = np.asarray(target.chain_vertex_image_positions[0], dtype=float)
-    end = np.asarray(target.chain_vertex_image_positions[-1], dtype=float)
-    image_delta = np.zeros(2, dtype=float)
-    if reference.axis_index == CANVAS_SURFACE_EDIT_AXIS_X:
-        image_delta[0] = delta / (PIXEL_TO_METER * target.level_scale)
-    else:
-        image_delta[1] = -delta / (PIXEL_TO_METER * target.level_scale)
-    if reference.vertex_id == target.chain_vertex_ids[0]:
-        start = start + image_delta
-    elif reference.vertex_id == target.chain_vertex_ids[-1]:
-        end = end + image_delta
-    else:
-        raise ValueError("A Canvas wall handle must own one chain endpoint.")
-
-    if abs(delta) <= CANVAS_SURFACE_EDIT_EPSILON:
-        new_positions = target.chain_vertex_image_positions
-    else:
-        new_positions = tuple(
-            tuple(
-                float(value)
-                for value in start + (end - start) * ratio
-            )
-            for ratio in target.chain_vertex_ratios
-        )
+    _validate_wall_target_vertices_exist(level, target)
+    new_positions = _build_wall_target_positions(target, delta)
     for vertex_id, position in zip(
         target.chain_vertex_ids,
         new_positions,
@@ -804,9 +1212,90 @@ def _apply_wall_vertex_delta(
     level.offset_y_meters += float(compensation[1])
     _validate_level_offsets(level)
 
+    _validate_wall_target_length(level, target)
+
+
+def _build_wall_target_positions(
+    target: CanvasSurfaceEditHandleTarget,
+    delta: float,
+) -> tuple[tuple[float, float], ...]:
+    reference = target.reference
+    if abs(delta) <= CANVAS_SURFACE_EDIT_EPSILON:
+        return target.chain_vertex_image_positions
+
+    image_delta = np.zeros(2, dtype=float)
+    image_distance = delta / (PIXEL_TO_METER * target.level_scale)
+    if reference.axis_index == CANVAS_SURFACE_EDIT_AXIS_X:
+        image_delta[0] = image_distance
+    else:
+        image_delta[1] = -image_distance
+    if reference.kind == CANVAS_SURFACE_EDIT_WALL_TRANSLATION:
+        return tuple(
+            tuple(
+                float(value)
+                for value in np.asarray(position, dtype=float) + image_delta
+            )
+            for position in target.chain_vertex_image_positions
+        )
+
+    start = np.asarray(target.chain_vertex_image_positions[0], dtype=float)
+    end = np.asarray(target.chain_vertex_image_positions[-1], dtype=float)
+    if reference.vertex_id == target.chain_vertex_ids[0]:
+        start = start + image_delta
+    elif reference.vertex_id == target.chain_vertex_ids[-1]:
+        end = end + image_delta
+    else:
+        raise ValueError("A Canvas wall handle must own one chain endpoint.")
+    return tuple(
+        tuple(float(value) for value in start + (end - start) * ratio)
+        for ratio in target.chain_vertex_ratios
+    )
+
+
+def _validate_wall_target_vertices_exist(
+    level: LevelData,
+    target: CanvasSurfaceEditHandleTarget,
+) -> None:
+    vertex_ids = {vertex.id for vertex in level.vertex_data.vertices}
+    if any(
+        vertex_id not in vertex_ids
+        for vertex_id in target.chain_vertex_ids
+    ):
+        raise ValueError("The edited Canvas wall vertices no longer exist.")
+
+
+def _validate_wall_batch_lengths(
+    levels_by_index: dict[int, LevelData],
+    targets: tuple[CanvasSurfaceEditHandleTarget, ...],
+) -> None:
+    validated_walls: set[tuple[int, frozenset[int]]] = set()
+    for target in targets:
+        wall_key = (
+            target.reference.level_index,
+            frozenset(
+                (
+                    target.chain_vertex_ids[0],
+                    target.chain_vertex_ids[-1],
+                )
+            ),
+        )
+        if wall_key in validated_walls:
+            continue
+        validated_walls.add(wall_key)
+        _validate_wall_target_length(
+            levels_by_index[target.reference.level_index],
+            target,
+        )
+
+
+def _validate_wall_target_length(
+    level: LevelData,
+    target: CanvasSurfaceEditHandleTarget,
+) -> None:
     first = level.vertex_data.get_vertex(target.chain_vertex_ids[0])
     last = level.vertex_data.get_vertex(target.chain_vertex_ids[-1])
-    assert first is not None and last is not None
+    if first is None or last is None:
+        raise ValueError("The edited Canvas wall vertices no longer exist.")
     first_world = level_image_to_world_xy(level, first.x, first.y)
     last_world = level_image_to_world_xy(level, last.x, last.y)
     wall_length = math.dist(first_world, last_world)
@@ -862,6 +1351,15 @@ def _validate_generated_surfaces(
 ) -> None:
     """Run the expensive topology check only at a requested commit boundary."""
 
+    _validate_generated_surfaces_batch(levels, (target,))
+
+
+def _validate_generated_surfaces_batch(
+    levels: tuple[LevelData, ...],
+    targets: tuple[CanvasSurfaceEditHandleTarget, ...],
+) -> None:
+    """Build once and validate all surfaces required by a wall edit batch."""
+
     try:
         rebuilt_surfaces = tuple(build_fixed_surfaces(levels))
     except Exception as error:
@@ -869,12 +1367,18 @@ def _validate_generated_surfaces(
             "The Canvas surface edit would create invalid generated surfaces."
         ) from error
     rebuilt_ids = {surface.surface_id for surface in rebuilt_surfaces}
-    missing_ids = tuple(
+    required_ids = {
         surface_id
-        for surface_id in target.required_surface_ids
-        if surface_id not in rebuilt_ids
+        for target in targets
+        for surface_id in (
+            target.surface_id,
+            *target.required_surface_ids,
+        )
+    }
+    missing_ids = sorted(
+        surface_id for surface_id in required_ids if surface_id not in rebuilt_ids
     )
-    if target.surface_id not in rebuilt_ids or missing_ids:
+    if missing_ids:
         raise ValueError(
             "The Canvas surface edit would remove required generated surfaces."
         )
@@ -1166,12 +1670,30 @@ def _measure_current_delta(
     target: CanvasSurfaceEditHandleTarget,
 ) -> float:
     reference = target.reference
-    if reference.kind == CANVAS_SURFACE_EDIT_WALL_VERTEX:
-        assert reference.vertex_id is not None
-        vertex = level.vertex_data.get_vertex(reference.vertex_id)
-        if vertex is None:
-            raise ValueError("The edited Canvas wall vertex no longer exists.")
-        world_xy = level_image_to_world_xy(level, vertex.x, vertex.y)
+    if reference.kind in CANVAS_SURFACE_EDIT_WALL_KINDS:
+        if reference.kind == CANVAS_SURFACE_EDIT_WALL_TRANSLATION:
+            endpoints = tuple(
+                level.vertex_data.get_vertex(vertex_id)
+                for vertex_id in (
+                    target.chain_vertex_ids[0],
+                    target.chain_vertex_ids[-1],
+                )
+            )
+            if any(vertex is None for vertex in endpoints):
+                raise ValueError("The edited Canvas wall vertices no longer exist.")
+            first, second = endpoints
+            assert first is not None and second is not None
+            image_position = (
+                (first.x + second.x) * 0.5,
+                (first.y + second.y) * 0.5,
+            )
+        else:
+            assert reference.vertex_id is not None
+            vertex = level.vertex_data.get_vertex(reference.vertex_id)
+            if vertex is None:
+                raise ValueError("The edited Canvas wall vertex no longer exists.")
+            image_position = (vertex.x, vertex.y)
+        world_xy = level_image_to_world_xy(level, *image_position)
         current = np.asarray(
             (world_xy[0], world_xy[1], target.origin_world[2]),
             dtype=float,
@@ -1298,7 +1820,7 @@ def _validate_target_chain(
     ratios: tuple[float, ...],
     positions: tuple[tuple[float, float], ...],
 ) -> None:
-    is_wall = reference.kind == CANVAS_SURFACE_EDIT_WALL_VERTEX
+    is_wall = reference.kind in CANVAS_SURFACE_EDIT_WALL_KINDS
     if not is_wall:
         if vertex_ids or ratios or positions:
             raise ValueError("Only Canvas wall targets may carry a vertex chain.")
@@ -1309,7 +1831,13 @@ def _validate_target_chain(
         raise ValueError("Canvas wall chain vertex IDs must be unique.")
     if not (len(vertex_ids) == len(ratios) == len(positions)):
         raise ValueError("Canvas wall chain baseline arrays must have equal sizes.")
-    if reference.vertex_id not in {vertex_ids[0], vertex_ids[-1]}:
+    endpoint_ids = (vertex_ids[0], vertex_ids[-1])
+    if reference.kind == CANVAS_SURFACE_EDIT_WALL_TRANSLATION:
+        if set(reference.wall_vertex_ids) != set(endpoint_ids):
+            raise ValueError(
+                "Canvas wall translation handles must reference both chain endpoints."
+            )
+    elif reference.vertex_id not in set(endpoint_ids):
         raise ValueError("Canvas wall handles must reference a chain endpoint.")
     if not math.isclose(ratios[0], 0.0, abs_tol=1e-7):
         raise ValueError("Canvas wall chain ratios must start at zero.")
