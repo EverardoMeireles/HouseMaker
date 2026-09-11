@@ -24,9 +24,9 @@ from housemaker.models import (
     DEFAULT_FLOOR_THICKNESS_METERS,
     DEFAULT_LEVEL_OFFSET_METERS,
     DEFAULT_LEVEL_SCALE,
-    LevelData,
     MAX_FLOOR_THICKNESS_METERS,
     MIN_FLOOR_THICKNESS_METERS,
+    LevelData,
     RoomData,
     VertexData,
     create_default_levels,
@@ -488,7 +488,9 @@ class LevelControlsTests(unittest.TestCase):
             DEFAULT_LEVEL_OFFSET_METERS,
         )
 
-        workspace.levels_list.setCurrentRow(1)
+        workspace.levels_list.setCurrentRow(
+            workspace._level_list_row_for_position(1)
+        )
         _qt_application.processEvents()
         workspace.level_x_offset_spinbox.setValue(-2.0)
         workspace.level_y_offset_spinbox.setValue(3.5)
@@ -498,6 +500,87 @@ class LevelControlsTests(unittest.TestCase):
         self.assertAlmostEqual(workspace.levels[1].offset_y_meters, 3.5)
         self.assertAlmostEqual(workspace.levels[2].offset_x_meters, 1.25)
         self.assertAlmostEqual(workspace.levels[2].offset_y_meters, -0.75)
+
+    def test_levels_list_orders_top_floors_before_underground_levels(
+        self,
+    ) -> None:
+        from housemaker.main import BlueprintWorkspace
+
+        workspace = BlueprintWorkspace()
+        _qt_widgets.append(workspace)
+
+        ordered_level_positions = [
+            workspace.levels_list.item(row).data(Qt.ItemDataRole.UserRole)
+            for row in range(workspace.levels_list.count())
+        ]
+        ordered_level_indices = [
+            workspace.levels[position].index
+            for position in ordered_level_positions
+        ]
+
+        self.assertEqual(
+            ordered_level_indices,
+            sorted(ordered_level_indices, reverse=True),
+        )
+        self.assertEqual(
+            workspace.levels_list.currentRow(),
+            workspace._level_list_row_for_position(
+                workspace.current_level_index
+            ),
+        )
+
+        underground_position = next(
+            position
+            for position, level in enumerate(workspace.levels)
+            if level.index == 1
+        )
+        workspace.levels_list.setCurrentRow(
+            workspace._level_list_row_for_position(underground_position)
+        )
+        _qt_application.processEvents()
+
+        self.assertIs(
+            workspace.current_level,
+            workspace.levels[underground_position],
+        )
+
+    def test_ground_level_row_uses_semantic_highlight(self) -> None:
+        from housemaker.main import (
+            BlueprintWorkspace,
+            _build_ground_level_background_color,
+        )
+
+        workspace = BlueprintWorkspace()
+        _qt_widgets.append(workspace)
+        ground_position = next(
+            position
+            for position, level in enumerate(workspace.levels)
+            if level.index == 2
+        )
+        workspace.levels[ground_position].name = "Renamed ground floor"
+        workspace._refresh_levels_list()
+
+        ground_item = workspace.levels_list.item(
+            workspace._level_list_row_for_position(ground_position)
+        )
+        self.assertEqual(
+            ground_item.background().color(),
+            _build_ground_level_background_color(
+                workspace.levels_list.palette()
+            ),
+        )
+        self.assertNotEqual(
+            ground_item.background().color().rgb(),
+            workspace.levels_list.palette().base().color().rgb(),
+        )
+        for row in range(workspace.levels_list.count()):
+            item = workspace.levels_list.item(row)
+            if item is ground_item:
+                continue
+            self.assertEqual(
+                item.background().style(),
+                Qt.BrushStyle.NoBrush,
+            )
 
     def test_level_controls_place_floor_thickness_after_height(
         self,

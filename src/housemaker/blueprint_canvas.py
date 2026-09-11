@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import math
+import uuid
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from itertools import combinations
@@ -25,19 +26,23 @@ from PySide6.QtWidgets import QWidget
 from housemaker.camera_models import CameraPose
 from housemaker.level_coordinates import level_world_to_image_xy
 from housemaker.models import (
+    DEFAULT_CANVAS_LEVEL_SCALE,
     DEFAULT_DOORWAY_DEPTH_METERS,
-    DOORWAY_SHAPE_ARCH,
-    DoorwayData,
-    DoorwayPreset,
-    Edge,
-    PIXEL_TO_METER,
     DEFAULT_STAIR_STYLE,
+    DOORWAY_SHAPE_ARCH,
+    MAX_CANVAS_LEVEL_SCALE,
+    MIN_CANVAS_LEVEL_SCALE,
+    PIXEL_TO_METER,
     STAIR_STYLE_FLOATING,
     STAIR_STYLE_FLOATING_WITH_RISER,
     STAIR_STYLE_SUPPORTED,
-    RoomData,
-    LevelData,
     VERTEX_HIT_RADIUS_SCREEN,
+    DoorwayData,
+    DoorwayPreset,
+    Edge,
+    LevelData,
+    OpenSpaceData,
+    RoomData,
     Vertex,
     VertexData,
     WindowData,
@@ -47,7 +52,6 @@ from housemaker.models import (
 )
 from housemaker.surface_geometry import build_wall_surface_id
 from housemaker.uv_layout import build_room_walls
-
 
 # ### Constants ###
 CANVAS_BACKGROUND_COLOR = QColor("#1c1f24")
@@ -102,6 +106,15 @@ CAMERA_INDICATOR_RADIUS_SCREEN = 7.0
 CAMERA_INDICATOR_DIRECTION_LENGTH_SCREEN = 34.0
 CAMERA_INDICATOR_ARROW_HEAD_LENGTH_SCREEN = 10.0
 CAMERA_INDICATOR_ARROW_HEAD_HALF_WIDTH_SCREEN = 6.0
+LEVEL_COMPARISON_OPACITY = 0.42
+LEVEL_COMPARISON_EDGE_COLOR = QColor("#ff7ad9")
+OPEN_SPACE_FILL_COLOR = QColor(255, 121, 198, 72)
+OPEN_SPACE_EDGE_COLOR = QColor("#ff79c6")
+SELECTED_OPEN_SPACE_EDGE_COLOR = QColor("#f6c85f")
+PENDING_OPEN_SPACE_FILL_COLOR = QColor(255, 209, 102, 64)
+PENDING_OPEN_SPACE_EDGE_COLOR = QColor("#ffd166")
+OPEN_SPACE_HIT_TOLERANCE_SCREEN = 8.0
+CANVAS_SNAPSHOT_ACTION_OPEN_SPACE = "open_space"
 
 # ### Snapshot models ###
 @dataclass
@@ -109,9 +122,35 @@ class CanvasSnapshot:
     vertex_data: VertexData
     rooms: list[RoomData]
     doorways: list[DoorwayData]
+    open_spaces: list[OpenSpaceData]
     active_vertex_id: int | None
     selected_vertex_id: int | None
+    selected_open_space_id: str | None
     preview_point: tuple[float, float] | None
+    action_kind: str | None = None
+
+
+@dataclass(frozen=True)
+class CanvasLevelComparisonOverlay:
+    """One adjacent level rendered temporarily over the editable Canvas."""
+
+    level_index: int
+    level_name: str
+    canvas_level_scale: float
+    blueprint_image: QImage
+    vertex_data: VertexData
+    rooms: tuple[RoomData, ...]
+    doorways: tuple[DoorwayData, ...]
+    windows: tuple[WindowData, ...]
+    open_spaces: tuple[OpenSpaceData, ...]
+
+
+@dataclass(frozen=True)
+class _BlueprintImageCacheEntry:
+    """One decoded image tied to an exact on-disk revision."""
+
+    revision: tuple[object, ...]
+    image: QImage
 
 
 @dataclass(frozen=True)
@@ -289,6 +328,8 @@ class BlueprintCanvas(QWidget):
     wall_vertex_interaction_changed = Signal(bool)
     rooms_changed = Signal()
     doorways_changed = Signal()
+    open_spaces_changed = Signal()
+    open_space_placement_changed = Signal(bool)
     doorway_dimension_preview_changed = Signal()
     doorway_move_drag_started = Signal()
     doorway_move_drag_finished = Signal(bool)
@@ -310,9 +351,17 @@ class BlueprintCanvas(QWidget):
         self.rooms: list[RoomData] = []
         self.doorways: list[DoorwayData] = []
         self.windows: list[WindowData] = []
+        self.open_spaces: list[OpenSpaceData] = []
         self.blueprint_image: QImage | None = None
         self.blueprint_path: str | None = None
         self._blueprint_image_revision: tuple[object, ...] | None = None
+        self.canvas_level_scale = DEFAULT_CANVAS_LEVEL_SCALE
+        self._level_comparison_overlay: (
+            CanvasLevelComparisonOverlay | None
+        ) = None
+        self._level_comparison_image_cache: (
+            _BlueprintImageCacheEntry | None
+        ) = None
         self.active_vertex_id: int | None = None
         self.selected_vertex_id: int | None = None
         self.preview_point: tuple[float, float] | None = None
@@ -350,6 +399,11 @@ class BlueprintCanvas(QWidget):
         self.level_context: LevelData | None = None
         self._camera_indicator_pose: CameraPose | None = None
         self._selected_wall_surface_id: str | None = None
+        self.selected_open_space_id: str | None = None
+        self._open_space_placement_active = False
+        self._open_space_drag_start_image: QPointF | None = None
+        self._open_space_drag_current_image: QPointF | None = None
+        self._open_space_drag_press_widget: QPointF | None = None
 
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -390,6 +444,8 @@ class BlueprintCanvas(QWidget):
         rooms: list[RoomData] | None = None,
         doorways: list[DoorwayData] | None = None,
         windows: list[WindowData] | None = None,
+        open_spaces: list[OpenSpaceData] | None = None,
+        canvas_level_scale: float = DEFAULT_CANVAS_LEVEL_SCALE,
     ) -> None:
         revision_before = _build_blueprint_image_revision(file_path)
         image = _load_qimage_from_path(file_path)
@@ -401,6 +457,8 @@ class BlueprintCanvas(QWidget):
             blueprint_path=file_path,
             doorways=doorways,
             windows=windows,
+            open_spaces=open_spaces,
+            canvas_level_scale=canvas_level_scale,
             blueprint_revision=(
                 revision_after
                 if revision_before == revision_after
@@ -419,6 +477,8 @@ class BlueprintCanvas(QWidget):
             image_path=self.blueprint_path,
             doorways=self.doorways if doorways is None else doorways,
             windows=self.windows,
+            open_spaces=self.open_spaces,
+            canvas_level_scale=self.canvas_level_scale,
         )
 
     def set_level_data(
@@ -428,6 +488,8 @@ class BlueprintCanvas(QWidget):
         image_path: str | None,
         doorways: list[DoorwayData] | None = None,
         windows: list[WindowData] | None = None,
+        open_spaces: list[OpenSpaceData] | None = None,
+        canvas_level_scale: float = DEFAULT_CANVAS_LEVEL_SCALE,
     ) -> None:
         blueprint_image: QImage | None = None
         blueprint_revision = (
@@ -457,6 +519,8 @@ class BlueprintCanvas(QWidget):
             blueprint_path=image_path,
             doorways=doorways,
             windows=windows,
+            open_spaces=open_spaces,
+            canvas_level_scale=canvas_level_scale,
             blueprint_revision=blueprint_revision,
         )
 
@@ -473,6 +537,93 @@ class BlueprintCanvas(QWidget):
         """Return the file revision validated for the displayed pixels."""
 
         return self._blueprint_image_revision
+
+    # ### Canvas-only level scale and comparison overlay ###
+    def set_canvas_level_scale(self, scale: float) -> bool:
+        """Scale the editable plan without changing its 3D coordinates."""
+
+        normalized_scale = _normalize_canvas_level_scale(scale)
+        if math.isclose(normalized_scale, self.canvas_level_scale):
+            return False
+        self.canvas_level_scale = normalized_scale
+        self.update()
+        return True
+
+    def set_level_comparison_overlay(self, level: LevelData | None) -> bool:
+        """Show an immutable adjacent-level plan over the current plan."""
+
+        if level is None or level.image_path is None:
+            return self.clear_level_comparison_overlay()
+        try:
+            blueprint_image = self._load_level_comparison_image(
+                level.image_path
+            )
+        except (OSError, ValueError):
+            return self.clear_level_comparison_overlay()
+
+        overlay = CanvasLevelComparisonOverlay(
+            level_index=int(level.index),
+            level_name=str(level.name),
+            canvas_level_scale=_normalize_canvas_level_scale(
+                level.canvas_level_scale
+            ),
+            blueprint_image=blueprint_image,
+            vertex_data=level.vertex_data.clone(),
+            rooms=tuple(copy.deepcopy(level.rooms)),
+            doorways=tuple(copy.deepcopy(level.doorways)),
+            windows=tuple(level.windows),
+            open_spaces=tuple(level.open_spaces),
+        )
+        if overlay == self._level_comparison_overlay:
+            return False
+        self._level_comparison_overlay = overlay
+        self.update()
+        return True
+
+    def _load_level_comparison_image(self, image_path: str) -> QImage:
+        """Reuse a decoded adjacent plan until its file revision changes."""
+
+        revision_before = _build_blueprint_image_revision(image_path)
+        if not _blueprint_revision_has_file(revision_before):
+            raise ValueError("The comparison blueprint image is missing.")
+
+        if (
+            self.blueprint_image is not None
+            and revision_before == self._blueprint_image_revision
+        ):
+            return self.blueprint_image
+
+        cached = self._level_comparison_image_cache
+        if cached is not None and cached.revision == revision_before:
+            return cached.image
+
+        image = _load_qimage_from_path(image_path)
+        revision_after = _build_blueprint_image_revision(image_path)
+        if revision_before != revision_after:
+            raise ValueError(
+                "The comparison blueprint changed while it was loading."
+            )
+        self._level_comparison_image_cache = _BlueprintImageCacheEntry(
+            revision=revision_after,
+            image=image,
+        )
+        return image
+
+    def clear_level_comparison_overlay(self) -> bool:
+        """Remove the temporary adjacent-level comparison."""
+
+        if self._level_comparison_overlay is None:
+            return False
+        self._level_comparison_overlay = None
+        self.update()
+        return True
+
+    def get_level_comparison_overlay(
+        self,
+    ) -> CanvasLevelComparisonOverlay | None:
+        """Return the currently displayed comparison snapshot for diagnostics."""
+
+        return self._level_comparison_overlay
 
     # ### First-person camera indicator ###
     def set_camera_indicator_pose(self, pose: CameraPose | None) -> None:
@@ -535,6 +686,64 @@ class BlueprintCanvas(QWidget):
         self.update()
         return True
 
+    # ### Open-space placement ###
+    def start_open_space_placement(self) -> bool:
+        """Start a one-shot rectangle drag for the current level."""
+
+        if self.blueprint_image is None:
+            return False
+        if self._open_space_placement_active:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            return True
+
+        self._cancel_stair_placement_for_other_mode()
+        self._reset_doorway_placement()
+        self._reset_doorway_pointer_state()
+        self.active_vertex_id = None
+        self.selected_vertex_id = None
+        self._set_selected_doorway_index(None)
+        self.selected_stair_index = None
+        self.selected_open_space_id = None
+        self.preview_point = None
+        self.preview_guides = []
+        self._reset_pointer_state()
+        self._reset_open_space_drag()
+        self._set_open_space_placement_active(True)
+        self.update()
+        return True
+
+    def cancel_open_space_placement(self) -> bool:
+        """Cancel a pending rectangle without changing persisted openings."""
+
+        if not self._open_space_placement_active:
+            return False
+        self._reset_open_space_drag()
+        self._set_open_space_placement_active(False)
+        self.update()
+        return True
+
+    def is_open_space_placement_active(self) -> bool:
+        return self._open_space_placement_active
+
+    def _set_open_space_placement_active(self, active: bool) -> None:
+        normalized_active = bool(active)
+        if normalized_active == self._open_space_placement_active:
+            return
+        self._open_space_placement_active = normalized_active
+        if normalized_active:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        elif (
+            self.pending_doorway_preset is None
+            and not self._is_stair_placement_active()
+        ):
+            self.unsetCursor()
+        self.open_space_placement_changed.emit(normalized_active)
+
+    def _reset_open_space_drag(self) -> None:
+        self._open_space_drag_start_image = None
+        self._open_space_drag_current_image = None
+        self._open_space_drag_press_widget = None
+
     # ### Stair context and placement ###
     def set_stair_context(
         self,
@@ -562,6 +771,7 @@ class BlueprintCanvas(QWidget):
     ) -> None:
         """Start endpoint placement followed by optional curve refinement."""
 
+        self.cancel_open_space_placement()
         if self._is_stair_placement_active():
             # The Add/Confirm button and level changes can both revisit this
             # entry point while the user is adding curve controls.  Preserve
@@ -575,6 +785,7 @@ class BlueprintCanvas(QWidget):
         self._reset_doorway_pointer_state()
         self.active_vertex_id = None
         self.selected_vertex_id = None
+        self.selected_open_space_id = None
         self.selected_stair_index = None
         self.preview_point = None
         self.preview_guides = []
@@ -701,9 +912,11 @@ class BlueprintCanvas(QWidget):
 
     def start_doorway_placement(self, preset: DoorwayPreset) -> None:
         """Begin placing one doorway using the selected hole dimensions."""
+        self.cancel_open_space_placement()
         self._cancel_stair_placement_for_other_mode()
         self.active_vertex_id = None
         self.selected_vertex_id = None
+        self.selected_open_space_id = None
         self._set_selected_doorway_index(None)
         self.preview_point = None
         self.preview_guides = []
@@ -722,6 +935,8 @@ class BlueprintCanvas(QWidget):
         blueprint_path: str | None,
         doorways: list[DoorwayData] | None,
         windows: list[WindowData] | None,
+        open_spaces: list[OpenSpaceData] | None,
+        canvas_level_scale: float,
         blueprint_revision: tuple[object, ...] | None,
     ) -> None:
         self.blueprint_image = blueprint_image
@@ -731,12 +946,19 @@ class BlueprintCanvas(QWidget):
         self.rooms = rooms if rooms is not None else []
         self.doorways = doorways if doorways is not None else []
         self.windows = windows if windows is not None else []
+        self.open_spaces = open_spaces if open_spaces is not None else []
+        self.canvas_level_scale = _normalize_canvas_level_scale(
+            canvas_level_scale
+        )
+        self._level_comparison_overlay = None
         self.active_vertex_id = None
         self.selected_vertex_id = None
+        self.selected_open_space_id = None
         self.preview_point = None
         self.preview_guides = []
         self.undo_stack.clear()
         self._reset_doorway_placement()
+        self._set_open_space_placement_active(False)
         self.pending_stair_preview_point = None
         self.pending_stair_preview_guides = []
         self.level_context = None
@@ -752,6 +974,8 @@ class BlueprintCanvas(QWidget):
         self.update()
 
     def undo_last_step(self) -> None:
+        if self.cancel_open_space_placement():
+            return
         if not self.undo_stack:
             return
 
@@ -766,25 +990,36 @@ class BlueprintCanvas(QWidget):
         previous_vertex_data = self.vertex_data.clone()
         previous_rooms = copy.deepcopy(self.rooms)
         previous_doorways = copy.deepcopy(self.doorways)
+        previous_open_spaces = list(self.open_spaces)
         self.vertex_data.copy_from(snapshot.vertex_data)
         self.rooms.clear()
         self.rooms.extend(copy.deepcopy(snapshot.rooms))
         self.doorways.clear()
         self.doorways.extend(copy.deepcopy(snapshot.doorways))
+        self.open_spaces.clear()
+        self.open_spaces.extend(snapshot.open_spaces)
         self.active_vertex_id = snapshot.active_vertex_id
         self.selected_vertex_id = snapshot.selected_vertex_id
+        self.selected_open_space_id = snapshot.selected_open_space_id
         self.preview_point = snapshot.preview_point
         self.preview_guides = []
         self._reset_doorway_placement()
+        self._reset_open_space_drag()
+        self._set_open_space_placement_active(False)
         self._set_selected_doorway_index(None)
         self._reset_pointer_state()
         self._reset_doorway_pointer_state()
         self.update()
-        if (
+        room_geometry_changed = (
             self.vertex_data != previous_vertex_data
             or self.rooms != previous_rooms
-        ):
+        )
+        open_spaces_changed = self.open_spaces != previous_open_spaces
+        if room_geometry_changed:
             self.rooms_changed.emit()
+        if open_spaces_changed:
+            self.open_spaces_changed.emit()
+        if room_geometry_changed or open_spaces_changed:
             self.geometry_changed.emit()
         if self.doorways != previous_doorways:
             self.doorways_changed.emit()
@@ -799,6 +1034,20 @@ class BlueprintCanvas(QWidget):
         return False
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if (
+            event.key() == Qt.Key.Key_Escape
+            and self.cancel_open_space_placement()
+        ):
+            event.accept()
+            return
+
+        if (
+            event.key() == Qt.Key.Key_Delete
+            and self._delete_selected_open_space()
+        ):
+            event.accept()
+            return
+
         if (
             event.key() == Qt.Key.Key_Backspace
             and self.remove_last_stair_intermediate_section()
@@ -869,6 +1118,10 @@ class BlueprintCanvas(QWidget):
             return
 
         if event.button() == Qt.MouseButton.RightButton:
+            if self.cancel_open_space_placement():
+                event.accept()
+                return
+
             if self._is_stair_placement_active():
                 self.cancel_stair_placement()
                 event.accept()
@@ -894,6 +1147,16 @@ class BlueprintCanvas(QWidget):
             super().mousePressEvent(event)
             return
 
+        if self._open_space_placement_active:
+            image_point = self._widget_to_image(event.position())
+            if image_point is not None:
+                self._open_space_drag_start_image = QPointF(image_point)
+                self._open_space_drag_current_image = QPointF(image_point)
+                self._open_space_drag_press_widget = QPointF(event.position())
+                self.update()
+            event.accept()
+            return
+
         if self._is_stair_placement_active():
             image_point = self._widget_to_image(event.position())
             if image_point is not None:
@@ -912,6 +1175,9 @@ class BlueprintCanvas(QWidget):
                 self._commit_pending_doorway()
             event.accept()
             return
+
+        open_space = self._find_open_space_at(event.position())
+        self.selected_open_space_id = None
 
         if event.modifiers() & Qt.KeyboardModifier.AltModifier:
             stair_hit = self._find_stair_hit(event.position())
@@ -969,6 +1235,15 @@ class BlueprintCanvas(QWidget):
             event.accept()
             return
 
+        if open_space is not None:
+            self.selected_open_space_id = open_space.open_space_id
+            self.selected_stair_index = None
+            self._set_selected_doorway_index(None)
+            self.selected_vertex_id = None
+            self.update()
+            event.accept()
+            return
+
         image_point = self._widget_to_image(event.position())
         if image_point is None:
             event.accept()
@@ -996,6 +1271,18 @@ class BlueprintCanvas(QWidget):
 
         if self.is_panning and event.buttons() & Qt.MouseButton.MiddleButton:
             self._update_pan(event.position())
+            event.accept()
+            return
+
+        if self._open_space_placement_active:
+            if (
+                self._open_space_drag_start_image is not None
+                and event.buttons() & Qt.MouseButton.LeftButton
+            ):
+                self._open_space_drag_current_image = (
+                    self._widget_to_image_clamped(event.position())
+                )
+                self.update()
             event.accept()
             return
 
@@ -1101,6 +1388,14 @@ class BlueprintCanvas(QWidget):
 
             if (
                 event.button() == Qt.MouseButton.LeftButton
+                and self._open_space_placement_active
+            ):
+                self._finish_open_space_drag(event.position())
+                event.accept()
+                return
+
+            if (
+                event.button() == Qt.MouseButton.LeftButton
                 and self.pressed_doorway_index is not None
             ):
                 self._reset_doorway_pointer_state()
@@ -1147,6 +1442,8 @@ class BlueprintCanvas(QWidget):
         if self.pending_doorway_preset is not None:
             self.pending_doorway = None
             self.update()
+        if self._open_space_placement_active:
+            self.setCursor(Qt.CursorShape.CrossCursor)
         if self.drag_vertex_id is None and self.active_vertex_id is not None:
             self.preview_point = None
             self.preview_guides = []
@@ -1154,6 +1451,7 @@ class BlueprintCanvas(QWidget):
         if (
             self.pending_doorway_preset is None
             and not self._is_stair_placement_active()
+            and not self._open_space_placement_active
         ):
             self.unsetCursor()
         super().leaveEvent(event)
@@ -1171,6 +1469,7 @@ class BlueprintCanvas(QWidget):
         painter.fillRect(display_rect, CANVAS_PANEL_COLOR)
         painter.drawImage(display_rect, self.blueprint_image)
 
+        self._paint_open_spaces(painter)
         self._paint_edges(painter)
         self._paint_selected_wall(painter)
         self._paint_windows(painter)
@@ -1181,8 +1480,148 @@ class BlueprintCanvas(QWidget):
         self._paint_vertices(painter)
         self._paint_stairs(painter)
         self._paint_pending_stair_placement(painter)
+        self._paint_pending_open_space(painter)
         self._paint_camera_indicator(painter)
+        self._paint_level_comparison_overlay(painter)
         self._paint_overlay_text(painter)
+
+    # ### Open-space editing and painting ###
+    def _finish_open_space_drag(self, widget_point: QPointF) -> bool:
+        start_image = self._open_space_drag_start_image
+        press_widget = self._open_space_drag_press_widget
+        if start_image is None or press_widget is None:
+            self._reset_open_space_drag()
+            self.update()
+            return False
+
+        end_image = self._widget_to_image_clamped(widget_point)
+        drag_distance = math.hypot(
+            widget_point.x() - press_widget.x(),
+            widget_point.y() - press_widget.y(),
+        )
+        minimum_x, maximum_x = sorted((start_image.x(), end_image.x()))
+        minimum_y, maximum_y = sorted((start_image.y(), end_image.y()))
+        self._reset_open_space_drag()
+        if (
+            drag_distance < DRAG_THRESHOLD_SCREEN
+            or maximum_x - minimum_x <= 1e-6
+            or maximum_y - minimum_y <= 1e-6
+        ):
+            self.update()
+            return False
+
+        self._push_undo_state(CANVAS_SNAPSHOT_ACTION_OPEN_SPACE)
+        open_space = OpenSpaceData(
+            open_space_id=f"open-space-{uuid.uuid4().hex}",
+            minimum_x=minimum_x,
+            minimum_y=minimum_y,
+            maximum_x=maximum_x,
+            maximum_y=maximum_y,
+        )
+        self.open_spaces.append(open_space)
+        self.selected_open_space_id = open_space.open_space_id
+        self._set_open_space_placement_active(False)
+        self.open_spaces_changed.emit()
+        self.geometry_changed.emit()
+        self.update()
+        return True
+
+    def _delete_selected_open_space(self) -> bool:
+        selected_id = self.selected_open_space_id
+        if selected_id is None:
+            return False
+        open_space_index = next(
+            (
+                index
+                for index, open_space in enumerate(self.open_spaces)
+                if open_space.open_space_id == selected_id
+            ),
+            None,
+        )
+        if open_space_index is None:
+            self.selected_open_space_id = None
+            self.update()
+            return False
+
+        self._push_undo_state(CANVAS_SNAPSHOT_ACTION_OPEN_SPACE)
+        del self.open_spaces[open_space_index]
+        self.selected_open_space_id = None
+        self.open_spaces_changed.emit()
+        self.geometry_changed.emit()
+        self.update()
+        return True
+
+    def _find_open_space_at(
+        self,
+        widget_point: QPointF,
+    ) -> OpenSpaceData | None:
+        """Hit only a rectangle border so its interior remains editable."""
+
+        for open_space in reversed(self.open_spaces):
+            rect = self._open_space_widget_rect(open_space)
+            hit_rect = rect.adjusted(
+                -OPEN_SPACE_HIT_TOLERANCE_SCREEN,
+                -OPEN_SPACE_HIT_TOLERANCE_SCREEN,
+                OPEN_SPACE_HIT_TOLERANCE_SCREEN,
+                OPEN_SPACE_HIT_TOLERANCE_SCREEN,
+            )
+            if not hit_rect.contains(widget_point):
+                continue
+            edge_distance = min(
+                abs(widget_point.x() - rect.left()),
+                abs(widget_point.x() - rect.right()),
+                abs(widget_point.y() - rect.top()),
+                abs(widget_point.y() - rect.bottom()),
+            )
+            if edge_distance <= OPEN_SPACE_HIT_TOLERANCE_SCREEN:
+                return open_space
+        return None
+
+    def _open_space_widget_rect(self, open_space: OpenSpaceData) -> QRectF:
+        minimum = self._image_to_widget(
+            open_space.minimum_x,
+            open_space.minimum_y,
+        )
+        maximum = self._image_to_widget(
+            open_space.maximum_x,
+            open_space.maximum_y,
+        )
+        return QRectF(minimum, maximum).normalized()
+
+    def _paint_open_spaces(self, painter: QPainter) -> None:
+        painter.save()
+        for open_space in self.open_spaces:
+            is_selected = (
+                open_space.open_space_id == self.selected_open_space_id
+            )
+            pen = QPen(
+                SELECTED_OPEN_SPACE_EDGE_COLOR
+                if is_selected
+                else OPEN_SPACE_EDGE_COLOR,
+                3.0 if is_selected else 2.0,
+            )
+            pen.setCosmetic(True)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(OPEN_SPACE_FILL_COLOR)
+            painter.drawRect(self._open_space_widget_rect(open_space))
+        painter.restore()
+
+    def _paint_pending_open_space(self, painter: QPainter) -> None:
+        start_image = self._open_space_drag_start_image
+        end_image = self._open_space_drag_current_image
+        if start_image is None or end_image is None:
+            return
+        start_widget = self._image_to_widget(start_image.x(), start_image.y())
+        end_widget = self._image_to_widget(end_image.x(), end_image.y())
+        pen = QPen(PENDING_OPEN_SPACE_EDGE_COLOR, 2.0)
+        pen.setCosmetic(True)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        painter.save()
+        painter.setPen(pen)
+        painter.setBrush(PENDING_OPEN_SPACE_FILL_COLOR)
+        painter.drawRect(QRectF(start_widget, end_widget).normalized())
+        painter.restore()
 
     # ### First-person camera indicator painting ###
     def _paint_camera_indicator(self, painter: QPainter) -> None:
@@ -2292,14 +2731,19 @@ class BlueprintCanvas(QWidget):
             ),
         )
 
-    def _push_undo_state(self) -> None:
+    def _push_undo_state(self, action_kind: str | None = None) -> None:
+        """Capture one local transaction and identify special shared undo work."""
+
         snapshot = CanvasSnapshot(
             vertex_data=self.vertex_data.clone(),
             rooms=copy.deepcopy(self.rooms),
             doorways=copy.deepcopy(self.doorways),
+            open_spaces=list(self.open_spaces),
             active_vertex_id=self.active_vertex_id,
             selected_vertex_id=self.selected_vertex_id,
+            selected_open_space_id=self.selected_open_space_id,
             preview_point=self.preview_point,
+            action_kind=action_kind,
         )
         self.undo_stack.append(snapshot)
         if self._uses_external_undo_history:
@@ -2621,7 +3065,8 @@ class BlueprintCanvas(QWidget):
         self.update()
 
     def _start_panning(self, widget_point: QPointF) -> None:
-        if self.zoom_scale <= MIN_ZOOM_SCALE:
+        effective_scale = self.zoom_scale * self.canvas_level_scale
+        if effective_scale <= MIN_ZOOM_SCALE:
             return
 
         self.is_panning = True
@@ -2966,6 +3411,18 @@ class BlueprintCanvas(QWidget):
         if self.blueprint_image is None:
             return QRectF()
 
+        return self._base_display_rect_for_image(
+            self.blueprint_image,
+            self.canvas_level_scale,
+        )
+
+    def _base_display_rect_for_image(
+        self,
+        image: QImage,
+        canvas_level_scale: float,
+    ) -> QRectF:
+        """Fit and Canvas-scale one plan around the shared viewport center."""
+
         available_rect = QRectF(
             IMAGE_MARGIN,
             IMAGE_MARGIN,
@@ -2973,15 +3430,15 @@ class BlueprintCanvas(QWidget):
             max(1.0, self.height() - IMAGE_MARGIN * 2.0),
         )
 
-        image_width = float(self.blueprint_image.width())
-        image_height = float(self.blueprint_image.height())
+        image_width = float(image.width())
+        image_height = float(image.height())
         scale = min(
             available_rect.width() / image_width,
             available_rect.height() / image_height,
         )
 
-        display_width = image_width * scale
-        display_height = image_height * scale
+        display_width = image_width * scale * canvas_level_scale
+        display_height = image_height * scale * canvas_level_scale
         display_center = available_rect.center()
         display_x = display_center.x() - display_width / 2.0
         display_y = display_center.y() - display_height / 2.0
@@ -3023,6 +3480,189 @@ class BlueprintCanvas(QWidget):
             image_y / float(self.blueprint_image.height())
         ) * display_rect.height()
         return QPointF(widget_x, widget_y)
+
+    # ### Adjacent-level comparison painting ###
+    def _paint_level_comparison_overlay(self, painter: QPainter) -> None:
+        """Paint the comparison plan in front without making it interactive."""
+
+        overlay = self._level_comparison_overlay
+        if overlay is None:
+            return
+        display_rect = self._comparison_image_display_rect(overlay)
+        if display_rect.isEmpty():
+            return
+
+        def map_point(x: float, y: float) -> QPointF:
+            return QPointF(
+                display_rect.left()
+                + x / float(overlay.blueprint_image.width())
+                * display_rect.width(),
+                display_rect.top()
+                + y / float(overlay.blueprint_image.height())
+                * display_rect.height(),
+            )
+
+        painter.save()
+        painter.setOpacity(LEVEL_COMPARISON_OPACITY)
+        painter.fillRect(display_rect, CANVAS_PANEL_COLOR)
+        painter.drawImage(display_rect, overlay.blueprint_image)
+
+        open_space_pen = QPen(OPEN_SPACE_EDGE_COLOR, 2.0)
+        open_space_pen.setCosmetic(True)
+        open_space_pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(open_space_pen)
+        painter.setBrush(OPEN_SPACE_FILL_COLOR)
+        for open_space in overlay.open_spaces:
+            painter.drawRect(
+                QRectF(
+                    map_point(open_space.minimum_x, open_space.minimum_y),
+                    map_point(open_space.maximum_x, open_space.maximum_y),
+                ).normalized()
+            )
+
+        comparison_pen = QPen(LEVEL_COMPARISON_EDGE_COLOR, 2.0)
+        comparison_pen.setCosmetic(True)
+        painter.setPen(comparison_pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        for edge in overlay.vertex_data.edges:
+            start_vertex = overlay.vertex_data.get_vertex(edge.start_vertex_id)
+            end_vertex = overlay.vertex_data.get_vertex(edge.end_vertex_id)
+            if start_vertex is None or end_vertex is None:
+                continue
+            painter.drawLine(
+                map_point(start_vertex.x, start_vertex.y),
+                map_point(end_vertex.x, end_vertex.y),
+            )
+
+        wall_frames = self._build_comparison_window_wall_frames(overlay)
+        for window in overlay.windows:
+            frame = wall_frames.get(window.wall_surface_id)
+            if frame is None:
+                continue
+            start_x, start_y = frame.start_point
+            delta_x = frame.end_point[0] - start_x
+            delta_y = frame.end_point[1] - start_y
+            start = map_point(
+                start_x + delta_x * window.start_ratio,
+                start_y + delta_y * window.start_ratio,
+            )
+            end = map_point(
+                start_x + delta_x * window.end_ratio,
+                start_y + delta_y * window.end_ratio,
+            )
+            segment_length = math.hypot(end.x() - start.x(), end.y() - start.y())
+            if segment_length <= 1e-6:
+                continue
+            perpendicular = QPointF(
+                -(end.y() - start.y())
+                / segment_length
+                * WINDOW_STRIP_HALF_WIDTH_SCREEN,
+                (end.x() - start.x())
+                / segment_length
+                * WINDOW_STRIP_HALF_WIDTH_SCREEN,
+            )
+            painter.setPen(QPen(WINDOW_EDGE_COLOR, 2.0))
+            painter.setBrush(WINDOW_FILL_COLOR)
+            painter.drawPolygon(
+                QPolygonF(
+                    (
+                        start + perpendicular,
+                        end + perpendicular,
+                        end - perpendicular,
+                        start - perpendicular,
+                    )
+                )
+            )
+
+        painter.setPen(QPen(DOORWAY_EDGE_COLOR, 2.0))
+        painter.setBrush(DOORWAY_FILL_COLOR)
+        for doorway in overlay.doorways:
+            painter.drawPolygon(
+                QPolygonF(
+                    [
+                        map_point(point[0], point[1])
+                        for point in self._get_doorway_corners(doorway)
+                    ]
+                )
+            )
+
+        painter.setPen(QPen(VERTEX_OUTLINE_COLOR, 1.5))
+        painter.setBrush(LEVEL_COMPARISON_EDGE_COLOR)
+        for vertex in overlay.vertex_data.vertices:
+            painter.drawEllipse(
+                map_point(vertex.x, vertex.y),
+                VERTEX_RADIUS_SCREEN,
+                VERTEX_RADIUS_SCREEN,
+            )
+        painter.restore()
+
+    def _comparison_image_display_rect(
+        self,
+        overlay: CanvasLevelComparisonOverlay,
+    ) -> QRectF:
+        """Apply the compared level's scale and the active pan/zoom view."""
+
+        base_rect = self._base_display_rect_for_image(
+            overlay.blueprint_image,
+            overlay.canvas_level_scale,
+        )
+        center = base_rect.center() + self.view_offset
+        display_width = base_rect.width() * self.zoom_scale
+        display_height = base_rect.height() * self.zoom_scale
+        return QRectF(
+            center.x() - display_width / 2.0,
+            center.y() - display_height / 2.0,
+            display_width,
+            display_height,
+        )
+
+    @staticmethod
+    def _build_comparison_window_wall_frames(
+        overlay: CanvasLevelComparisonOverlay,
+    ) -> dict[str, WindowWallFrame]:
+        """Resolve window wall coordinates from the comparison snapshot."""
+
+        frames: dict[str, WindowWallFrame] = {}
+        room_vertex_sets = [set(room.vertex_ids) for room in overlay.rooms]
+        ignored_vertex_ids = {room.center_vertex_id for room in overlay.rooms}
+        for room in overlay.rooms:
+            for wall in build_room_walls(room, overlay.vertex_data):
+                surface_id = build_wall_surface_id(
+                    overlay.level_index,
+                    wall.key,
+                    room.center_vertex_id,
+                )
+                frames[surface_id] = WindowWallFrame(
+                    start_point=wall.start_point,
+                    end_point=wall.end_point,
+                )
+
+        for edge in overlay.vertex_data.edges:
+            if (
+                edge.start_vertex_id in ignored_vertex_ids
+                or edge.end_vertex_id in ignored_vertex_ids
+                or any(
+                    edge.start_vertex_id in vertex_ids
+                    and edge.end_vertex_id in vertex_ids
+                    for vertex_ids in room_vertex_sets
+                )
+            ):
+                continue
+            start_vertex = overlay.vertex_data.get_vertex(edge.start_vertex_id)
+            end_vertex = overlay.vertex_data.get_vertex(edge.end_vertex_id)
+            if start_vertex is None or end_vertex is None:
+                continue
+            wall_key = (
+                f"{min(edge.start_vertex_id, edge.end_vertex_id)}:"
+                f"{max(edge.start_vertex_id, edge.end_vertex_id)}"
+            )
+            frames[
+                build_wall_surface_id(overlay.level_index, wall_key)
+            ] = WindowWallFrame(
+                start_point=(start_vertex.x, start_vertex.y),
+                end_point=(end_vertex.x, end_vertex.y),
+            )
+        return frames
 
     def _paint_empty_state(self, painter: QPainter) -> None:
         painter.setPen(QPen(TEXT_COLOR))
@@ -3814,8 +4454,14 @@ class BlueprintCanvas(QWidget):
         overlay_lines = [
             f"Blueprint: {Path(self.blueprint_path).name}",
             "Left click: add/connect/select/drag",
-            "Mouse wheel: zoom | Delete: remove selected vertex | Ctrl+Z: undo | Hold Ctrl: free placement",
+            "Mouse wheel: zoom | Delete: remove selection | Ctrl+Z: undo | Hold Ctrl: free placement",
         ]
+        comparison = self._level_comparison_overlay
+        if comparison is not None:
+            overlay_lines.append(
+                f"Comparing with L{comparison.level_index} "
+                f"{comparison.level_name}"
+            )
         if self._is_stair_placement_active():
             pending_point = self.pending_stair_point
             pending_stair = self.pending_stair_placement
@@ -3856,6 +4502,14 @@ class BlueprintCanvas(QWidget):
         elif self.doorways:
             overlay_lines.append(
                 "Doorway: select and drag it to move it along its wall."
+            )
+        if self._open_space_placement_active:
+            overlay_lines.append(
+                "Open space: drag a rectangle | Right click or Escape: cancel."
+            )
+        elif self.open_spaces:
+            overlay_lines.append(
+                "Open space: click a rectangle to select; Delete removes it."
             )
         if self.stairs:
             overlay_lines.append(
@@ -4248,6 +4902,24 @@ def _load_qimage_from_path(file_path: str) -> QImage:
         bytes_per_line,
         QImage.Format.Format_RGB888,
     ).copy()
+
+
+# ### Canvas scale validation ###
+def _normalize_canvas_level_scale(raw_scale: object) -> float:
+    """Return one finite Canvas-only display scale within the supported range."""
+
+    if isinstance(raw_scale, bool):
+        raise TypeError("Canvas level scale must be a number.")
+    try:
+        scale = float(raw_scale)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Canvas level scale must be a number.") from error
+    if not math.isfinite(scale):
+        raise ValueError("Canvas level scale must be finite.")
+    return min(
+        max(scale, MIN_CANVAS_LEVEL_SCALE),
+        MAX_CANVAS_LEVEL_SCALE,
+    )
 
 
 # ### Geometry helpers ###

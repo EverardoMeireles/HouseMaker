@@ -11,6 +11,9 @@ DEFAULT_LEVEL_HEIGHT_METERS = 3.0
 DEFAULT_LEVEL_SCALE = 1.0
 MIN_LEVEL_SCALE = 0.01
 MAX_LEVEL_SCALE = 20.0
+DEFAULT_CANVAS_LEVEL_SCALE = 1.0
+MIN_CANVAS_LEVEL_SCALE = 0.01
+MAX_CANVAS_LEVEL_SCALE = 20.0
 DEFAULT_LEVEL_OFFSET_METERS = 0.0
 MIN_LEVEL_OFFSET_METERS = -10000.0
 MAX_LEVEL_OFFSET_METERS = 10000.0
@@ -44,6 +47,8 @@ MAX_DOORWAY_BOTTOM_HEIGHT_METERS = 20.0
 MAX_WINDOW_ID_LENGTH = 128
 MAX_WINDOW_SURFACE_ID_LENGTH = 512
 MIN_WINDOW_RATIO_SPAN = 1e-6
+MAX_OPEN_SPACE_ID_LENGTH = 128
+MIN_OPEN_SPACE_SPAN_PIXELS = 1e-6
 DEFAULT_ROOM_HEIGHT_METERS = 3.0
 DEFAULT_INCLUDE_IN_EXPORT = True
 DEFAULT_UV_MAP_WIDTH = 1024
@@ -994,6 +999,60 @@ class VertexData:
         return tuple(sorted((start_vertex_id, end_vertex_id)))
 
 
+# ### Open-space models ###
+@dataclass(frozen=True)
+class OpenSpaceData:
+    """One stable rectangular opening stored in level image coordinates."""
+
+    open_space_id: str
+    minimum_x: float
+    minimum_y: float
+    maximum_x: float
+    maximum_y: float
+
+    def __post_init__(self) -> None:
+        open_space_id = _normalize_window_text(
+            self.open_space_id,
+            "Open-space ID",
+            MAX_OPEN_SPACE_ID_LENGTH,
+        )
+        minimum_x = _normalize_open_space_coordinate(self.minimum_x, "minimum X")
+        minimum_y = _normalize_open_space_coordinate(self.minimum_y, "minimum Y")
+        maximum_x = _normalize_open_space_coordinate(self.maximum_x, "maximum X")
+        maximum_y = _normalize_open_space_coordinate(self.maximum_y, "maximum Y")
+        if maximum_x - minimum_x <= MIN_OPEN_SPACE_SPAN_PIXELS:
+            raise ValueError("An open space must have a positive width.")
+        if maximum_y - minimum_y <= MIN_OPEN_SPACE_SPAN_PIXELS:
+            raise ValueError("An open space must have a positive height.")
+
+        object.__setattr__(self, "open_space_id", open_space_id)
+        object.__setattr__(self, "minimum_x", minimum_x)
+        object.__setattr__(self, "minimum_y", minimum_y)
+        object.__setattr__(self, "maximum_x", maximum_x)
+        object.__setattr__(self, "maximum_y", maximum_y)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "open_space_id": self.open_space_id,
+            "minimum_x": self.minimum_x,
+            "minimum_y": self.minimum_y,
+            "maximum_x": self.maximum_x,
+            "maximum_y": self.maximum_y,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> OpenSpaceData:
+        if not isinstance(payload, dict):
+            raise TypeError("Open-space JSON must contain an object.")
+        return cls(
+            open_space_id=payload.get("open_space_id", ""),
+            minimum_x=payload.get("minimum_x"),
+            minimum_y=payload.get("minimum_y"),
+            maximum_x=payload.get("maximum_x"),
+            maximum_y=payload.get("maximum_y"),
+        )
+
+
 # ### Level models ###
 @dataclass
 class LevelData:
@@ -1001,6 +1060,7 @@ class LevelData:
     name: str
     height_meters: float = DEFAULT_LEVEL_HEIGHT_METERS
     scale: float = DEFAULT_LEVEL_SCALE
+    canvas_level_scale: float = DEFAULT_CANVAS_LEVEL_SCALE
     offset_x_meters: float = DEFAULT_LEVEL_OFFSET_METERS
     offset_y_meters: float = DEFAULT_LEVEL_OFFSET_METERS
     vertex_data: VertexData = field(default_factory=VertexData)
@@ -1011,6 +1071,7 @@ class LevelData:
     include_in_export: bool = DEFAULT_INCLUDE_IN_EXPORT
     floor_thickness_meters: float = DEFAULT_FLOOR_THICKNESS_METERS
     windows: list[WindowData] = field(default_factory=list)
+    open_spaces: list[OpenSpaceData] = field(default_factory=list)
     editable_surfaces: list[EditableSurfaceMeshData] = field(default_factory=list)
 
     @property
@@ -1133,6 +1194,21 @@ def _normalize_window_ratio(value: object, field_name: str) -> float:
             f"Window {field_name} ratio must be between zero and one."
         )
     return ratio
+
+
+# ### Open-space validation helpers ###
+def _normalize_open_space_coordinate(value: object, field_name: str) -> float:
+    if isinstance(value, bool):
+        raise TypeError(f"Open-space {field_name} must be a number.")
+    try:
+        coordinate = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            f"Open-space {field_name} must be a number."
+        ) from error
+    if not math.isfinite(coordinate):
+        raise ValueError(f"Open-space {field_name} must be finite.")
+    return coordinate
 
 
 # ### Geometry helpers ###

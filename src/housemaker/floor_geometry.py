@@ -12,7 +12,6 @@ from shapely.geometry.base import BaseGeometry
 
 from housemaker.models import LevelData
 
-
 # ### Constants ###
 GEOMETRY_EPSILON = 1e-12
 EDGE_KEY_DECIMALS = 9
@@ -46,6 +45,19 @@ def build_level_floor_mesh(
     if footprint is None:
         return None
 
+    open_space_geometry = build_level_open_space_geometry(
+        level,
+        blueprint_size_pixels,
+        point_to_world_xy,
+    )
+    if open_space_geometry is not None:
+        footprint = footprint.difference(open_space_geometry)
+        if (
+            footprint.is_empty
+            or float(footprint.area) <= GEOMETRY_EPSILON
+        ):
+            return None
+
     thickness_meters = _get_valid_floor_thickness(level)
     return _build_floor_prism_mesh(
         house_footprint=footprint,
@@ -74,6 +86,50 @@ def build_level_floor_footprint(
         structural_lines,
         closing_radius_meters,
     )
+
+
+def build_level_open_space_geometry(
+    level: LevelData,
+    blueprint_size_pixels: tuple[float, float] | None,
+    point_to_world_xy: PointToWorld,
+) -> BaseGeometry | None:
+    """Return the union of one level's rectangular slab openings."""
+
+    polygons: list[Polygon] = []
+    for open_space in level.open_spaces:
+        image_corners = (
+            (open_space.minimum_x, open_space.minimum_y),
+            (open_space.maximum_x, open_space.minimum_y),
+            (open_space.maximum_x, open_space.maximum_y),
+            (open_space.minimum_x, open_space.maximum_y),
+        )
+        world_corners: list[Point2D] = []
+        for image_corner in image_corners:
+            normalized_corner = _to_finite_point(
+                point_to_world_xy(image_corner, blueprint_size_pixels)
+            )
+            if normalized_corner is None:
+                raise ValueError(
+                    f"Level {level.index} open space has an invalid position."
+                )
+            world_corners.append(normalized_corner)
+        polygon = Polygon(world_corners)
+        if not polygon.is_valid:
+            polygon = shapely.make_valid(polygon)
+        polygons.extend(
+            part
+            for part in shapely.get_parts(polygon)
+            if isinstance(part, Polygon)
+            and not part.is_empty
+            and float(part.area) > GEOMETRY_EPSILON
+        )
+
+    if not polygons:
+        return None
+    geometry = shapely.union_all(polygons)
+    if geometry.is_empty or float(geometry.area) <= GEOMETRY_EPSILON:
+        return None
+    return geometry
 
 
 # ### Structural footprint helpers ###

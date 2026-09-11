@@ -9,9 +9,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from housemaker.generation_state import GenerationData
-from housemaker.surface_texture_state import SurfaceTextureData
-from housemaker.texture_atlas_state import TextureAtlasData
 from housemaker.models import (
+    DEFAULT_CANVAS_LEVEL_SCALE,
     DEFAULT_DOORWAY_ARCH_AMOUNT,
     DEFAULT_DOORWAY_BOTTOM_HEIGHT_METERS,
     DEFAULT_DOORWAY_DEPTH_METERS,
@@ -26,15 +25,17 @@ from housemaker.models import (
     DEFAULT_UV_MAP_HEIGHT,
     DEFAULT_UV_MAP_WIDTH,
     GROUND_LEVEL_INDEX,
-    MAX_FLOOR_THICKNESS_METERS,
-    MAX_DOORWAY_DEPTH_METERS,
+    MAX_CANVAS_LEVEL_SCALE,
     MAX_DOORWAY_BOTTOM_HEIGHT_METERS,
+    MAX_DOORWAY_DEPTH_METERS,
     MAX_DOORWAY_HEIGHT_METERS,
     MAX_DOORWAY_WIDTH_METERS,
+    MAX_FLOOR_THICKNESS_METERS,
     MAX_LEVEL_OFFSET_METERS,
     MAX_LEVEL_SCALE,
-    MIN_DOORWAY_DEPTH_METERS,
+    MIN_CANVAS_LEVEL_SCALE,
     MIN_DOORWAY_BOTTOM_HEIGHT_METERS,
+    MIN_DOORWAY_DEPTH_METERS,
     MIN_DOORWAY_HEIGHT_METERS,
     MIN_DOORWAY_WIDTH_METERS,
     MIN_FLOOR_THICKNESS_METERS,
@@ -47,6 +48,7 @@ from housemaker.models import (
     EditableSurfaceMeshData,
     EditableSurfaceVertexData,
     LevelData,
+    OpenSpaceData,
     RoomData,
     StairData,
     VertexData,
@@ -57,6 +59,8 @@ from housemaker.models import (
     normalize_doorway_arch_amount,
     normalize_doorway_shape,
 )
+from housemaker.surface_texture_state import SurfaceTextureData
+from housemaker.texture_atlas_state import TextureAtlasData
 
 # ### Constants ###
 PROJECT_FILE_VERSION = 1
@@ -127,6 +131,7 @@ def save_project(
                 "name": level.name,
                 "height_meters": level.height_meters,
                 "scale": float(level.scale),
+                "canvas_level_scale": float(level.canvas_level_scale),
                 "offset_x_meters": float(level.offset_x_meters),
                 "offset_y_meters": float(level.offset_y_meters),
                 "floor_thickness_meters": level.floor_thickness_meters,
@@ -140,6 +145,10 @@ def save_project(
                     for doorway in level.doorways
                 ],
                 "windows": [window.to_dict() for window in level.windows],
+                "open_spaces": [
+                    open_space.to_dict()
+                    for open_space in level.open_spaces
+                ],
                 "editable_surfaces": [
                     _serialize_editable_surface(editable_surface)
                     for editable_surface in level.editable_surfaces
@@ -183,6 +192,12 @@ def load_project(path: str | Path) -> ProjectData:
         level.scale = _deserialize_level_scale(
             raw_level.get("scale", DEFAULT_LEVEL_SCALE)
         )
+        level.canvas_level_scale = _deserialize_canvas_level_scale(
+            raw_level.get(
+                "canvas_level_scale",
+                DEFAULT_CANVAS_LEVEL_SCALE,
+            )
+        )
         level.offset_x_meters = _deserialize_level_offset_meters(
             raw_level.get("offset_x_meters", DEFAULT_LEVEL_OFFSET_METERS)
         )
@@ -213,6 +228,9 @@ def load_project(path: str | Path) -> ProjectData:
         level.windows = _deserialize_windows(
             raw_level.get("windows", []),
             level_index=level.index,
+        )
+        level.open_spaces = _deserialize_open_spaces(
+            raw_level.get("open_spaces", [])
         )
         level.editable_surfaces = _deserialize_editable_surfaces(
             raw_level.get("editable_surfaces", []),
@@ -690,6 +708,27 @@ def _deserialize_windows(
     return windows
 
 
+# ### Open-space serialization helpers ###
+def _deserialize_open_spaces(raw_open_spaces: object) -> list[OpenSpaceData]:
+    """Load valid unique rectangular openings while isolating bad records."""
+
+    if not isinstance(raw_open_spaces, list | tuple):
+        return []
+
+    open_spaces: list[OpenSpaceData] = []
+    open_space_ids: set[str] = set()
+    for raw_open_space in raw_open_spaces:
+        try:
+            open_space = OpenSpaceData.from_dict(raw_open_space)
+        except (TypeError, ValueError):
+            continue
+        if open_space.open_space_id in open_space_ids:
+            continue
+        open_space_ids.add(open_space.open_space_id)
+        open_spaces.append(open_space)
+    return open_spaces
+
+
 # ### Editable surface serialization helpers ###
 def _serialize_editable_surface(
     editable_surface: EditableSurfaceMeshData,
@@ -973,6 +1012,25 @@ def _deserialize_level_scale(raw_scale: object) -> float:
         return DEFAULT_LEVEL_SCALE
 
     return min(max(scale, MIN_LEVEL_SCALE), MAX_LEVEL_SCALE)
+
+
+def _deserialize_canvas_level_scale(raw_scale: object) -> float:
+    """Load one finite Canvas-only display scale within the UI range."""
+
+    if isinstance(raw_scale, bool):
+        return DEFAULT_CANVAS_LEVEL_SCALE
+    try:
+        scale = float(raw_scale)
+    except (TypeError, ValueError, OverflowError):
+        return DEFAULT_CANVAS_LEVEL_SCALE
+
+    if not math.isfinite(scale):
+        return DEFAULT_CANVAS_LEVEL_SCALE
+
+    return min(
+        max(scale, MIN_CANVAS_LEVEL_SCALE),
+        MAX_CANVAS_LEVEL_SCALE,
+    )
 
 
 def _deserialize_level_offset_meters(raw_offset_meters: object) -> float:

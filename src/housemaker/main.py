@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
@@ -14,14 +15,14 @@ from PySide6.QtCore import (
     QObject,
     QPointF,
     QSignalBlocker,
-    QTimer,
     Qt,
+    QTimer,
 )
-from PySide6.QtGui import QKeySequence, QShortcut, QWheelEvent
+from PySide6.QtGui import QColor, QKeySequence, QPalette, QShortcut, QWheelEvent
 from PySide6.QtWidgets import (
-    QApplication,
     QAbstractItemView,
     QAbstractSpinBox,
+    QApplication,
     QButtonGroup,
     QCheckBox,
     QComboBox,
@@ -38,6 +39,7 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QScrollArea,
     QSizePolicy,
+    QSlider,
     QSplitter,
     QTabWidget,
     QVBoxLayout,
@@ -55,7 +57,11 @@ from housemaker.architectural_surface_edits import (
     place_surface_vertex,
 )
 from housemaker.atlas_export import apply_texture_atlases_to_export
-from housemaker.blueprint_canvas import BlueprintCanvas, CanvasSnapshot
+from housemaker.blueprint_canvas import (
+    CANVAS_SNAPSHOT_ACTION_OPEN_SPACE,
+    BlueprintCanvas,
+    CanvasSnapshot,
+)
 from housemaker.canvas_openings import (
     CANVAS_OPENING_DOORWAY,
     CANVAS_OPENING_WINDOW,
@@ -84,36 +90,15 @@ from housemaker.canvas_surface_edits import (
     validate_canvas_wall_edit_batch_geometry,
 )
 from housemaker.external_viewer_host import ExternalFullscreenViewerHost
+from housemaker.generation_jobs import GenerationJobManager, JobsWindow
 from housemaker.generation_state import (
     GeneratedObjectPlacement,
     GeneratedObjectRecord,
     GenerationData,
 )
-from housemaker.generation_jobs import GenerationJobManager, JobsWindow
 from housemaker.generation_workspace import (
     FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY,
     GenerationWorkspace,
-)
-from housemaker.object_placement_dialog import ObjectPlacementDialog
-from housemaker.pbr_maps import (
-    ATLAS_MAP_BASE_COLOR,
-    ATLAS_MAP_TYPES,
-    PBR_MAP_ROUGHNESS,
-)
-from housemaker.surface_materials import LEGACY_SURFACE_ROUGHNESS_FACTOR
-from housemaker.surface_texture_state import (
-    SurfaceTextureAssignment,
-    SurfaceTextureData,
-)
-from housemaker.surface_texture_workspace import (
-    SurfaceTextureGenerationWorkspace,
-)
-from housemaker.surface_geometry import (
-    FixedSurface,
-    SURFACE_TYPE_WALL,
-    WallWindowPlacement,
-    add_wall_window,
-    build_fixed_surfaces,
 )
 from housemaker.glb import (
     DEFAULT_WALL_HEIGHT_METERS,
@@ -128,7 +113,14 @@ from housemaker.glb import (
     export_glb_file,
     import_generated_glb,
 )
+from housemaker.level_coordinates import (
+    build_doorway_world_outline_positions,
+    build_level_base_z_lookup,
+    level_image_to_world_xy,
+    level_world_to_image_xy,
+)
 from housemaker.models import (
+    DEFAULT_CANVAS_LEVEL_SCALE,
     DEFAULT_DOORWAY_ARCH_AMOUNT,
     DEFAULT_FLOOR_THICKNESS_METERS,
     DEFAULT_LEVEL_OFFSET_METERS,
@@ -136,15 +128,13 @@ from housemaker.models import (
     DEFAULT_STAIR_STYLE,
     DOORWAY_SHAPE_ARCH,
     DOORWAY_SHAPE_RECTANGULAR,
-    DoorwayData,
-    DoorwayPreset,
-    EditableSurfaceMeshData,
     GROUND_LEVEL_INDEX,
-    LevelData,
+    MAX_CANVAS_LEVEL_SCALE,
     MAX_DOORWAY_ARCH_AMOUNT,
     MAX_FLOOR_THICKNESS_METERS,
     MAX_LEVEL_OFFSET_METERS,
     MAX_LEVEL_SCALE,
+    MIN_CANVAS_LEVEL_SCALE,
     MIN_DOORWAY_ARCH_AMOUNT,
     MIN_FLOOR_THICKNESS_METERS,
     MIN_LEVEL_OFFSET_METERS,
@@ -152,17 +142,21 @@ from housemaker.models import (
     STAIR_STYLE_FLOATING,
     STAIR_STYLE_FLOATING_WITH_RISER,
     STAIR_STYLE_SUPPORTED,
+    DoorwayData,
+    DoorwayPreset,
+    EditableSurfaceMeshData,
+    LevelData,
     StairData,
     StairSectionData,
     WindowData,
     create_default_doorway_presets,
     create_default_levels,
 )
-from housemaker.level_coordinates import (
-    build_doorway_world_outline_positions,
-    build_level_base_z_lookup,
-    level_image_to_world_xy,
-    level_world_to_image_xy,
+from housemaker.object_placement_dialog import ObjectPlacementDialog
+from housemaker.pbr_maps import (
+    ATLAS_MAP_BASE_COLOR,
+    ATLAS_MAP_TYPES,
+    PBR_MAP_ROUGHNESS,
 )
 from housemaker.project_io import ProjectData, load_project, save_project
 from housemaker.settings_widget import (
@@ -170,6 +164,21 @@ from housemaker.settings_widget import (
     DEFAULT_WALL_VERTEX_UPDATE_DELAY_SECONDS,
     SettingsWidget,
     resolve_fullscreen_3d_viewer_screen,
+)
+from housemaker.surface_geometry import (
+    SURFACE_TYPE_WALL,
+    FixedSurface,
+    WallWindowPlacement,
+    add_wall_window,
+    build_fixed_surfaces,
+)
+from housemaker.surface_materials import LEGACY_SURFACE_ROUGHNESS_FACTOR
+from housemaker.surface_texture_state import (
+    SurfaceTextureAssignment,
+    SurfaceTextureData,
+)
+from housemaker.surface_texture_workspace import (
+    SurfaceTextureGenerationWorkspace,
 )
 from housemaker.texture_atlas_state import (
     ATLAS_PACKING_MODE_FULL,
@@ -217,6 +226,9 @@ DELAYED_CANVAS_SURFACE_EDIT_KINDS = frozenset(
         CANVAS_SURFACE_EDIT_FLOOR_THICKNESS,
     )
 )
+LEVEL_POSITION_ITEM_ROLE = int(Qt.ItemDataRole.UserRole)
+GROUND_LEVEL_BACKGROUND_BLEND = 0.12
+CANVAS_LEVEL_SCALE_SLIDER_FACTOR = 100
 
 
 # ### Canvas undo models ###
@@ -226,6 +238,9 @@ class _CanvasBlueprintUndoState:
 
     level_index: int
     snapshot: CanvasSnapshot
+    assignments: tuple[SurfaceTextureAssignment, ...] = ()
+    assignment_targets_after: tuple[SurfaceTextureAssignment, ...] | None = ()
+    atlas_placements: tuple[tuple[str, TextureAtlasPlacement], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -259,6 +274,7 @@ class _CanvasLevelPropertiesUndoState:
     level_index: int
     height_meters: float
     scale: float
+    canvas_level_scale: float
     offset_x_meters: float
     offset_y_meters: float
     include_in_export: bool
@@ -383,6 +399,10 @@ class BlueprintWorkspace(QWidget):
         self.stairs: list[StairData] = []
         self.current_level_index = GROUND_LEVEL_INDEX
         self._is_syncing_level_controls = False
+        self._canvas_level_scale_drag_active = False
+        self._canvas_level_scale_drag_undo_state: (
+            _CanvasLevelPropertiesUndoState | None
+        ) = None
         self._is_viewer_refresh_scheduled = False
         self._scheduled_viewer_refresh_preserve_camera = True
         self._viewer_preview_revision = 0
@@ -895,6 +915,28 @@ class BlueprintWorkspace(QWidget):
         )
         side_layout.addWidget(self.floor_thickness_spinbox)
 
+        open_spaces_label = QLabel("Open spaces")
+        open_spaces_label.setStyleSheet(
+            "font-size: 18px; font-weight: 600;"
+        )
+        side_layout.addWidget(open_spaces_label)
+
+        self.open_space_status_label = QLabel("Open spaces: none")
+        self.open_space_status_label.setWordWrap(True)
+        side_layout.addWidget(self.open_space_status_label)
+
+        self.add_open_space_button = QPushButton("Add open space")
+        self.add_open_space_button.setCheckable(True)
+        self.add_open_space_button.setMinimumHeight(40)
+        self.add_open_space_button.setToolTip(
+            "Drag a rectangle on the 2D Canvas to remove this level's floor "
+            "and the level below's ceiling."
+        )
+        self.add_open_space_button.clicked.connect(
+            self._handle_add_open_space_clicked
+        )
+        side_layout.addWidget(self.add_open_space_button)
+
         level_scale_label = QLabel("Level scale")
         level_scale_label.setStyleSheet("font-size: 18px; font-weight: 600;")
         side_layout.addWidget(level_scale_label)
@@ -910,6 +952,68 @@ class BlueprintWorkspace(QWidget):
             self._handle_level_scale_changed
         )
         side_layout.addWidget(self.level_scale_spinbox)
+
+        canvas_level_scale_label = QLabel("Canvas level scale")
+        canvas_level_scale_label.setStyleSheet(
+            "font-size: 18px; font-weight: 600;"
+        )
+        side_layout.addWidget(canvas_level_scale_label)
+
+        canvas_level_scale_row = QWidget()
+        canvas_level_scale_layout = QHBoxLayout(canvas_level_scale_row)
+        canvas_level_scale_layout.setContentsMargins(0, 0, 0, 0)
+        canvas_level_scale_layout.setSpacing(10)
+        self.canvas_level_scale_slider = QSlider(Qt.Orientation.Horizontal)
+        self.canvas_level_scale_slider.setRange(
+            round(
+                MIN_CANVAS_LEVEL_SCALE
+                * CANVAS_LEVEL_SCALE_SLIDER_FACTOR
+            ),
+            round(
+                MAX_CANVAS_LEVEL_SCALE
+                * CANVAS_LEVEL_SCALE_SLIDER_FACTOR
+            ),
+        )
+        self.canvas_level_scale_slider.setSingleStep(1)
+        self.canvas_level_scale_slider.setPageStep(10)
+        self.canvas_level_scale_slider.setTickInterval(50)
+        self.canvas_level_scale_slider.setTickPosition(
+            QSlider.TickPosition.TicksBelow
+        )
+        self.canvas_level_scale_slider.setValue(
+            round(
+                DEFAULT_CANVAS_LEVEL_SCALE
+                * CANVAS_LEVEL_SCALE_SLIDER_FACTOR
+            )
+        )
+        self.canvas_level_scale_slider.setMinimumHeight(40)
+        self.canvas_level_scale_slider.setToolTip(
+            "Scales only this level's 2D Canvas. Hold and drag to compare "
+            "against the adjacent level."
+        )
+        self.canvas_level_scale_slider.sliderPressed.connect(
+            self._handle_canvas_level_scale_drag_started
+        )
+        self.canvas_level_scale_slider.valueChanged.connect(
+            self._handle_canvas_level_scale_changed
+        )
+        self.canvas_level_scale_slider.sliderReleased.connect(
+            self._handle_canvas_level_scale_drag_finished
+        )
+        canvas_level_scale_layout.addWidget(
+            self.canvas_level_scale_slider,
+            1,
+        )
+
+        self.canvas_level_scale_value_label = QLabel("1.00 x")
+        self.canvas_level_scale_value_label.setMinimumWidth(58)
+        self.canvas_level_scale_value_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        canvas_level_scale_layout.addWidget(
+            self.canvas_level_scale_value_label
+        )
+        side_layout.addWidget(canvas_level_scale_row)
 
         level_x_offset_label = QLabel("X offset")
         level_x_offset_label.setStyleSheet("font-size: 18px; font-weight: 600;")
@@ -1073,7 +1177,9 @@ class BlueprintWorkspace(QWidget):
         side_layout.addWidget(levels_label)
 
         self.levels_list = QListWidget()
-        self.levels_list.currentRowChanged.connect(self._handle_level_selection_changed)
+        self.levels_list.currentRowChanged.connect(
+            self._handle_level_list_row_changed
+        )
         side_layout.addWidget(self.levels_list, 1)
 
         level_options_layout = QFormLayout()
@@ -1133,6 +1239,9 @@ class BlueprintWorkspace(QWidget):
         self.stair_style_combo.installEventFilter(
             self._generals_value_input_wheel_filter
         )
+        self.canvas_level_scale_slider.installEventFilter(
+            self._generals_value_input_wheel_filter
+        )
 
         self.workspace_splitter.addWidget(self.side_panel)
         self.workspace_splitter.setStretchFactor(0, 9)
@@ -1149,6 +1258,12 @@ class BlueprintWorkspace(QWidget):
             self._handle_canvas_wall_vertex_interaction_changed
         )
         self.canvas.doorways_changed.connect(self._handle_doorways_changed)
+        self.canvas.open_spaces_changed.connect(
+            self._handle_open_spaces_changed
+        )
+        self.canvas.open_space_placement_changed.connect(
+            self._handle_open_space_placement_changed
+        )
         self.canvas.doorway_dimension_preview_changed.connect(
             self._handle_doorway_dimension_preview_changed
         )
@@ -1181,6 +1296,7 @@ class BlueprintWorkspace(QWidget):
         )
         self._refresh_levels_list()
         self._update_stair_button_state()
+        self._update_open_space_controls()
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
         self._schedule_viewer_preview_refresh(preserve_camera=False)
@@ -1850,11 +1966,75 @@ class BlueprintWorkspace(QWidget):
             CanvasSnapshot,
         ):
             return
+        tracks_surface_bindings = (
+            raw_snapshot.action_kind == CANVAS_SNAPSHOT_ACTION_OPEN_SPACE
+        )
+        assignments = (
+            self.surface_texture_generation.snapshot_assignments()
+            if tracks_surface_bindings
+            else ()
+        )
+        assignment_source_ids = {
+            build_atlas_wall_texture_source_id(assignment.assignment_id)
+            for assignment in assignments
+        }
         self._record_canvas_undo_state(
             _CanvasBlueprintUndoState(
                 level_index=self.current_level.index,
                 snapshot=raw_snapshot,
+                assignments=assignments,
+                assignment_targets_after=(
+                    None if tracks_surface_bindings else ()
+                ),
+                atlas_placements=tuple(
+                    (atlas.atlas_id, placement)
+                    for atlas in self.texture_atlas_workspace.get_data().atlases
+                    for placement in atlas.placements
+                    if placement.object_id in assignment_source_ids
+                ),
             )
+        )
+
+    def _finalize_open_space_blueprint_undo_state(self) -> None:
+        """Record only surface bindings changed by the newest hole edit."""
+
+        if self._is_restoring_canvas_undo or not self._canvas_undo_stack:
+            return
+        state = self._canvas_undo_stack[-1]
+        if not (
+            isinstance(state, _CanvasBlueprintUndoState)
+            and state.assignment_targets_after is None
+        ):
+            return
+        current_by_id = {
+            assignment.assignment_id: assignment
+            for assignment in self.surface_texture_generation.snapshot_assignments()
+        }
+        affected_assignments = tuple(
+            assignment
+            for assignment in state.assignments
+            if _surface_assignment_target_signature(assignment)
+            != _surface_assignment_target_signature(
+                current_by_id.get(assignment.assignment_id)
+            )
+        )
+        affected_source_ids = {
+            build_atlas_wall_texture_source_id(assignment.assignment_id)
+            for assignment in affected_assignments
+        }
+        self._canvas_undo_stack[-1] = replace(
+            state,
+            assignments=affected_assignments,
+            assignment_targets_after=tuple(
+                current_by_id[assignment.assignment_id]
+                for assignment in affected_assignments
+                if assignment.assignment_id in current_by_id
+            ),
+            atlas_placements=tuple(
+                (atlas_id, placement)
+                for atlas_id, placement in state.atlas_placements
+                if placement.object_id in affected_source_ids
+            ),
         )
 
     def _handle_blueprint_undo_snapshot_discarded(
@@ -1887,6 +2067,7 @@ class BlueprintWorkspace(QWidget):
             level_index=level.index,
             height_meters=float(level.height_meters),
             scale=float(level.scale),
+            canvas_level_scale=float(level.canvas_level_scale),
             offset_x_meters=float(level.offset_x_meters),
             offset_y_meters=float(level.offset_y_meters),
             include_in_export=bool(level.include_in_export),
@@ -1960,6 +2141,11 @@ class BlueprintWorkspace(QWidget):
     def _handle_canvas_undo_requested(self) -> None:
         """Undo the latest committed Canvas action from either Canvas view."""
 
+        if self.canvas.cancel_open_space_placement():
+            self.viewer.set_surface_tools_status(
+                "Current open-space placement cancelled."
+            )
+            return
         if self.canvas.is_stair_placement_active():
             self.canvas.cancel_stair_placement()
             self.viewer.set_surface_tools_status("Current stair placement cancelled.")
@@ -2007,7 +2193,9 @@ class BlueprintWorkspace(QWidget):
             elif isinstance(state, _CanvasStairsUndoState):
                 self._restore_canvas_stairs_undo_state(state)
             else:
-                self._restore_blueprint_undo_state(state)
+                skipped_texture_bindings = self._restore_blueprint_undo_state(
+                    state
+                )
         except (RuntimeError, TypeError, ValueError) as error:
             self.viewer.set_surface_tools_status(f"Canvas undo stopped: {error}")
             return
@@ -2056,11 +2244,13 @@ class BlueprintWorkspace(QWidget):
             raise ValueError("The Canvas level in this undo step no longer exists.")
         level.height_meters = state.height_meters
         level.scale = state.scale
+        level.canvas_level_scale = state.canvas_level_scale
         level.offset_x_meters = state.offset_x_meters
         level.offset_y_meters = state.offset_y_meters
         level.include_in_export = state.include_in_export
         if level is self.current_level:
             self._sync_level_controls()
+            self.canvas.set_canvas_level_scale(level.canvas_level_scale)
             self.canvas.update()
         self.surface_texture_generation.reconcile_assignments_with_levels(
             self.levels
@@ -2166,8 +2356,8 @@ class BlueprintWorkspace(QWidget):
     def _restore_blueprint_undo_state(
         self,
         state: _CanvasBlueprintUndoState,
-    ) -> None:
-        """Restore one 2D wall/doorway snapshot without changing active level."""
+    ) -> int:
+        """Restore one 2D snapshot plus conservatively affected bindings."""
 
         level = next(
             (
@@ -2188,11 +2378,111 @@ class BlueprintWorkspace(QWidget):
             level.rooms.extend(copy.deepcopy(state.snapshot.rooms))
             level.doorways.clear()
             level.doorways.extend(copy.deepcopy(state.snapshot.doorways))
+            level.open_spaces.clear()
+            level.open_spaces.extend(state.snapshot.open_spaces)
             self._reset_viewer_doorway_snapshots()
             self.surface_texture_generation.reconcile_assignments_with_levels(
                 self.levels
             )
             self._schedule_viewer_preview_refresh(preserve_camera=True)
+        return self._restore_blueprint_surface_bindings(state)
+
+    def _restore_blueprint_surface_bindings(
+        self,
+        state: _CanvasBlueprintUndoState,
+    ) -> int:
+        """Restore hole-affected targets without replacing newer texture data."""
+
+        expected_after = state.assignment_targets_after
+        if expected_after is None:
+            return len(state.assignments)
+        if not state.assignments:
+            return 0
+        expected_by_id = {
+            assignment.assignment_id: assignment
+            for assignment in expected_after
+        }
+        current_by_id = {
+            assignment.assignment_id: assignment
+            for assignment in self.surface_texture_generation.snapshot_assignments()
+        }
+        restorable_assignments = tuple(
+            assignment
+            for assignment in state.assignments
+            if (
+                assignment.assignment_id in expected_by_id
+                and _surface_assignment_target_signature(
+                    current_by_id.get(assignment.assignment_id)
+                )
+                == _surface_assignment_target_signature(
+                    expected_by_id[assignment.assignment_id]
+                )
+            )
+        )
+        self.surface_texture_generation.restore_assignment_target_snapshot(
+            restorable_assignments,
+            emit_signals=False,
+        )
+        restorable_assignment_ids = {
+            assignment.assignment_id for assignment in restorable_assignments
+        }
+        restorable_source_ids = {
+            build_atlas_wall_texture_source_id(assignment_id)
+            for assignment_id in restorable_assignment_ids
+        }
+        restorable_atlas_placements = tuple(
+            (atlas_id, placement)
+            for atlas_id, placement in state.atlas_placements
+            if placement.object_id in restorable_source_ids
+        )
+
+        self._atlas_generation_signature = None
+        self._sync_atlas_object_texture_sources(
+            automatically_assign_scene_textures=False
+        )
+        restored_assignments_by_id = {
+            assignment.assignment_id: assignment
+            for assignment in self.surface_texture_generation.snapshot_assignments()
+            if assignment.assignment_id in restorable_assignment_ids
+        }
+        live_sources: dict[str, AtlasObjectTextureSource] = {}
+        for assignment_id, assignment in restored_assignments_by_id.items():
+            source = self._build_atlas_wall_texture_source(assignment)
+            if source is not None:
+                live_sources[
+                    build_atlas_wall_texture_source_id(assignment_id)
+                ] = source
+        unresolved_placement_source_ids = {
+            placement.object_id
+            for _atlas_id, placement in restorable_atlas_placements
+            if placement.object_id not in live_sources
+        }
+        live_atlas_placements = tuple(
+            (atlas_id, placement)
+            for atlas_id, placement in restorable_atlas_placements
+            if placement.object_id in live_sources
+        )
+        skipped_atlas_placements = self._restore_canvas_atlas_placements(
+            live_atlas_placements,
+            source_overrides=live_sources,
+        )
+        affected_source_ids = tuple(
+            dict.fromkeys(
+                placement.object_id
+                for _atlas_id, placement in live_atlas_placements
+            )
+        )
+        self.texture_atlas_workspace.refresh_texture_source_content(
+            affected_source_ids
+        )
+        self._sync_canvas_surface_drawing_overlay()
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
+        return (
+            len(state.assignments)
+            - len(restorable_assignments)
+            + skipped_atlas_placements
+            + len(unresolved_placement_source_ids)
+        )
 
     def _restore_canvas_topology_undo_state(
         self,
@@ -2281,9 +2571,12 @@ class BlueprintWorkspace(QWidget):
     def _restore_canvas_atlas_placements(
         self,
         placements: Sequence[tuple[str, TextureAtlasPlacement]],
+        *,
+        source_overrides: dict[str, AtlasObjectTextureSource] | None = None,
     ) -> int:
         """Restore each source once without overwriting newer Atlas work."""
 
+        live_sources = source_overrides or {}
         atlas_data = self.texture_atlas_workspace.get_data()
         requested_by_source_id: dict[
             str,
@@ -2303,26 +2596,67 @@ class BlueprintWorkspace(QWidget):
         skipped = 0
         for source_id, (atlas_id, placement) in requested_by_source_id.items():
             current = current_by_source_id.get(source_id)
+            live_source = live_sources.get(source_id)
             if current is not None:
-                if current != (atlas_id, placement):
+                if current[0] != atlas_id:
                     skipped += 1
+                    continue
+                if live_source is None:
+                    if current != (atlas_id, placement):
+                        skipped += 1
+                    continue
+                try:
+                    restored_placement = atlas_data.assign_object(
+                        atlas_id,
+                        live_source.object_id,
+                        live_source.texture_path,
+                        live_source.texture_resolution,
+                        live_source.packing_mode,
+                    )
+                except (OSError, TypeError, ValueError):
+                    skipped += 1
+                    continue
+                current_by_source_id[source_id] = (
+                    atlas_id,
+                    restored_placement,
+                )
+                changed = bool(restored_placement != current[1] or changed)
                 continue
             atlas = atlas_data.atlas_by_id(atlas_id)
             if atlas is None:
                 skipped += 1
                 continue
             try:
-                atlas_data.assign_object(
+                restored_placement = atlas_data.assign_object(
                     atlas_id,
-                    placement.object_id,
-                    placement.texture_path,
-                    placement.texture_resolution,
-                    placement.packing_mode,
+                    (
+                        placement.object_id
+                        if live_source is None
+                        else live_source.object_id
+                    ),
+                    (
+                        placement.texture_path
+                        if live_source is None
+                        else live_source.texture_path
+                    ),
+                    (
+                        placement.texture_resolution
+                        if live_source is None
+                        else live_source.texture_resolution
+                    ),
+                    (
+                        placement.packing_mode
+                        if live_source is None
+                        else live_source.packing_mode
+                    ),
                 )
             except (OSError, TypeError, ValueError):
                 skipped += 1
                 continue
-            current_by_source_id[source_id] = (atlas_id, placement)
+            current_by_source_id[source_id] = (
+                atlas_id,
+                restored_placement,
+            )
             changed = True
         if changed:
             self.texture_atlas_workspace.set_data(atlas_data)
@@ -2780,6 +3114,7 @@ class BlueprintWorkspace(QWidget):
                 self.levels
             )
         )
+        self._finalize_open_space_blueprint_undo_state()
         if not assignments_changed:
             self._schedule_viewer_preview_refresh(preserve_camera=True)
 
@@ -6723,13 +7058,42 @@ class BlueprintWorkspace(QWidget):
     def _refresh_levels_list(self) -> None:
         self._is_syncing_level_controls = True
         self.levels_list.clear()
-        for level in self.levels:
-            self.levels_list.addItem(self._build_level_item(level))
-        self.levels_list.setCurrentRow(self.current_level_index)
+        ordered_positions = sorted(
+            range(len(self.levels)),
+            key=lambda position: self.levels[position].index,
+            reverse=True,
+        )
+        for level_position in ordered_positions:
+            level = self.levels[level_position]
+            self.levels_list.addItem(
+                self._build_level_item(level, level_position)
+            )
+        self.levels_list.setCurrentRow(
+            self._level_list_row_for_position(self.current_level_index)
+        )
         self._is_syncing_level_controls = False
 
-    def _build_level_item(self, level: LevelData) -> QListWidgetItem:
-        return QListWidgetItem(level.display_name)
+    def _build_level_item(
+        self,
+        level: LevelData,
+        level_position: int,
+    ) -> QListWidgetItem:
+        item = QListWidgetItem(level.display_name)
+        item.setData(LEVEL_POSITION_ITEM_ROLE, level_position)
+        if level.index == GROUND_LEVEL_INDEX:
+            item.setBackground(
+                _build_ground_level_background_color(
+                    self.levels_list.palette()
+                )
+            )
+        return item
+
+    def _level_list_row_for_position(self, level_position: int) -> int:
+        for row in range(self.levels_list.count()):
+            item = self.levels_list.item(row)
+            if item.data(LEVEL_POSITION_ITEM_ROLE) == level_position:
+                return row
+        return -1
 
     def _refresh_doorway_preset_list(
         self,
@@ -6810,6 +7174,15 @@ class BlueprintWorkspace(QWidget):
             self.current_level.floor_thickness_meters
         )
         self.level_scale_spinbox.setValue(self.current_level.scale)
+        self.canvas_level_scale_slider.setValue(
+            round(
+                self.current_level.canvas_level_scale
+                * CANVAS_LEVEL_SCALE_SLIDER_FACTOR
+            )
+        )
+        self._update_canvas_level_scale_value_label(
+            self.current_level.canvas_level_scale
+        )
         self.level_x_offset_spinbox.setValue(
             self.current_level.offset_x_meters
         )
@@ -6818,10 +7191,25 @@ class BlueprintWorkspace(QWidget):
         )
         self.include_yes_radio.setChecked(self.current_level.include_in_export)
         self.include_no_radio.setChecked(not self.current_level.include_in_export)
-        if self.levels_list.currentRow() != self.current_level_index:
-            self.levels_list.setCurrentRow(self.current_level_index)
+        current_level_row = self._level_list_row_for_position(
+            self.current_level_index
+        )
+        if self.levels_list.currentRow() != current_level_row:
+            self.levels_list.setCurrentRow(current_level_row)
         self._update_blueprint_name_label()
         self._is_syncing_level_controls = False
+
+    def _handle_level_list_row_changed(self, level_row: int) -> None:
+        if level_row < 0:
+            return
+        item = self.levels_list.item(level_row)
+        level_position = item.data(LEVEL_POSITION_ITEM_ROLE)
+        if isinstance(level_position, bool) or not isinstance(
+            level_position,
+            int,
+        ):
+            return
+        self._handle_level_selection_changed(level_position)
 
     def _handle_level_selection_changed(self, level_index: int) -> None:
         if (
@@ -6832,6 +7220,8 @@ class BlueprintWorkspace(QWidget):
             return
 
         if level_index != self.current_level_index:
+            self.canvas.cancel_open_space_placement()
+            self._finish_canvas_level_scale_drag()
             self._cancel_active_canvas_surface_edit()
             self._commit_pending_canvas_surface_mesh_update()
             self._commit_pending_wall_vertex_update()
@@ -6867,6 +7257,73 @@ class BlueprintWorkspace(QWidget):
             float(value),
         )
 
+    # ### Open-space controls ###
+    def _handle_add_open_space_clicked(self) -> None:
+        """Toggle the one-shot rectangular floor-opening tool."""
+
+        if self.canvas.is_open_space_placement_active():
+            self.canvas.cancel_open_space_placement()
+            return
+        if self.canvas.blueprint_image is None:
+            self._update_open_space_controls()
+            return
+
+        self._finish_canvas_level_scale_drag()
+        self._cancel_active_canvas_surface_edit()
+        self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_wall_vertex_update()
+        self._commit_pending_doorway_mesh_update()
+        self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
+        self.canvas_viewer_tabs.setCurrentWidget(self.canvas)
+        self.canvas.start_open_space_placement()
+
+    def _handle_open_spaces_changed(self) -> None:
+        """Keep hole UI current and retire unrelated delayed mesh work."""
+
+        if self._pending_wall_vertex_mesh_update:
+            self._commit_pending_wall_vertex_update()
+        if self._pending_doorway_mesh_level_index is not None:
+            self._commit_pending_doorway_mesh_update()
+        self._update_open_space_controls()
+
+    def _handle_open_space_placement_changed(self, active: bool) -> None:
+        """Keep the side-panel tool state synchronized with the Canvas."""
+
+        self._update_open_space_controls(bool(active))
+
+    def _update_open_space_controls(
+        self,
+        placement_active: bool | None = None,
+    ) -> None:
+        """Describe persisted rectangles and the current drag mode."""
+
+        active = (
+            self.canvas.is_open_space_placement_active()
+            if placement_active is None
+            else bool(placement_active)
+        )
+        self.add_open_space_button.setChecked(active)
+        self.add_open_space_button.setText(
+            "Cancel open space" if active else "Add open space"
+        )
+        self.add_open_space_button.setEnabled(
+            active or self.canvas.blueprint_image is not None
+        )
+        if active:
+            self.open_space_status_label.setText(
+                "Drag a rectangle on the 2D Canvas. Escape cancels."
+            )
+            return
+
+        open_space_count = len(self.current_level.open_spaces)
+        if open_space_count == 0:
+            status = "Open spaces: none"
+        elif open_space_count == 1:
+            status = "Open spaces: 1 area"
+        else:
+            status = f"Open spaces: {open_space_count} areas"
+        self.open_space_status_label.setText(status)
+
     def _handle_level_scale_changed(self, value: float) -> None:
         if self._is_syncing_level_controls:
             return
@@ -6882,6 +7339,92 @@ class BlueprintWorkspace(QWidget):
         self.current_level.scale = next_value
         self.canvas.update()
         self._schedule_viewer_preview_refresh()
+
+    # ### Canvas-only level scale ###
+    def _handle_canvas_level_scale_drag_started(self) -> None:
+        """Start one live scale transaction and reveal its comparison level."""
+
+        if self._is_syncing_level_controls or self._canvas_level_scale_drag_active:
+            return
+        self._commit_pending_canvas_surface_mesh_update()
+        self._canvas_level_scale_drag_active = True
+        self._canvas_level_scale_drag_undo_state = (
+            self._capture_canvas_level_properties_undo_state(
+                self.current_level
+            )
+        )
+        self.canvas.set_level_comparison_overlay(
+            self._get_canvas_scale_comparison_level()
+        )
+
+    def _handle_canvas_level_scale_changed(self, slider_value: int) -> None:
+        """Apply a slider step immediately to the current 2D plan only."""
+
+        next_value = float(slider_value) / CANVAS_LEVEL_SCALE_SLIDER_FACTOR
+        self._update_canvas_level_scale_value_label(next_value)
+        if self._is_syncing_level_controls:
+            return
+        if math.isclose(next_value, self.current_level.canvas_level_scale):
+            return
+        if not self._canvas_level_scale_drag_active:
+            self._record_canvas_undo_state(
+                self._capture_canvas_level_properties_undo_state(
+                    self.current_level
+                )
+            )
+        self.current_level.canvas_level_scale = next_value
+        self.canvas.set_canvas_level_scale(next_value)
+
+    def _handle_canvas_level_scale_drag_finished(self) -> None:
+        """Commit one slider drag to history and remove the overlay."""
+
+        self._finish_canvas_level_scale_drag()
+
+    def _finish_canvas_level_scale_drag(self) -> None:
+        """Finalize an active scale gesture, including programmatic cleanup."""
+
+        if not self._canvas_level_scale_drag_active:
+            self.canvas.clear_level_comparison_overlay()
+            return
+
+        state = self._canvas_level_scale_drag_undo_state
+        self._canvas_level_scale_drag_active = False
+        self._canvas_level_scale_drag_undo_state = None
+        self.canvas.clear_level_comparison_overlay()
+        if (
+            state is not None
+            and not math.isclose(
+                state.canvas_level_scale,
+                self.current_level.canvas_level_scale,
+            )
+        ):
+            self._record_canvas_undo_state(
+                state,
+                commit_pending_surface_edit=False,
+            )
+
+    def _get_canvas_scale_comparison_level(self) -> LevelData | None:
+        """Return the level below, except underground levels compare upward."""
+
+        current_index = self.current_level.index
+        comparison_index = (
+            current_index + 1
+            if current_index < GROUND_LEVEL_INDEX
+            else current_index - 1
+        )
+        return next(
+            (
+                level
+                for level in self.levels
+                if level.index == comparison_index
+            ),
+            None,
+        )
+
+    def _update_canvas_level_scale_value_label(self, value: float) -> None:
+        """Keep the numeric readout adjacent to the scale bar."""
+
+        self.canvas_level_scale_value_label.setText(f"{float(value):.2f} x")
 
     def _handle_level_x_offset_changed(self, value: float) -> None:
         if self._is_syncing_level_controls:
@@ -7363,10 +7906,14 @@ class BlueprintWorkspace(QWidget):
         if self._pending_wall_vertex_mesh_update:
             self._restart_pending_wall_vertex_update_if_idle()
             return
-        self.surface_texture_generation.reconcile_assignments_with_levels(
-            self.levels
+        assignments_changed = (
+            self.surface_texture_generation.reconcile_assignments_with_levels(
+                self.levels
+            )
         )
-        self._schedule_viewer_preview_refresh()
+        self._finalize_open_space_blueprint_undo_state()
+        if not assignments_changed:
+            self._schedule_viewer_preview_refresh()
 
     def _handle_canvas_wall_vertex_added(self) -> None:
         """Debounce mesh work while new Canvas wall vertices are added."""
@@ -7465,6 +8012,7 @@ class BlueprintWorkspace(QWidget):
         self._cancel_pending_canvas_surface_mesh_update()
         self._cancel_pending_wall_vertex_update()
         self._cancel_pending_doorway_mesh_update(clear_outline=True)
+        self.canvas.cancel_open_space_placement()
         self.canvas.cancel_stair_placement()
         self._desired_canvas_object_id = None
         self._desired_canvas_surface_ids = ()
@@ -7541,6 +8089,8 @@ class BlueprintWorkspace(QWidget):
             rooms=self.current_level.rooms,
             doorways=self.current_level.doorways,
             windows=self.current_level.windows,
+            open_spaces=self.current_level.open_spaces,
+            canvas_level_scale=self.current_level.canvas_level_scale,
         )
         self._clear_canvas_undo_history()
         self.current_level.image_path = normalized_path
@@ -7548,6 +8098,7 @@ class BlueprintWorkspace(QWidget):
         self.canvas.set_stair_context(self.stairs, self.current_level)
         self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
         self._update_blueprint_name_label()
+        self._update_open_space_controls()
         self._schedule_viewer_preview_refresh()
 
     def _sync_canvas_to_current_level(self) -> None:
@@ -7564,7 +8115,9 @@ class BlueprintWorkspace(QWidget):
             rooms=self.current_level.rooms,
             doorways=self.current_level.doorways,
             windows=self.current_level.windows,
+            open_spaces=self.current_level.open_spaces,
             image_path=self.current_level.image_path,
+            canvas_level_scale=self.current_level.canvas_level_scale,
         )
         if self.canvas.blueprint_image is not None:
             self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
@@ -7573,6 +8126,7 @@ class BlueprintWorkspace(QWidget):
             self.viewer.get_active_canvas_surface_id()
         )
         self._update_blueprint_name_label()
+        self._update_open_space_controls()
 
     def _update_blueprint_name_label(self) -> None:
         image_path = self.current_level.image_path
@@ -7612,6 +8166,32 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.blueprint_workspace.shutdown()
         super().closeEvent(event)
+
+
+# ### Palette helpers ###
+def _build_ground_level_background_color(palette: QPalette) -> QColor:
+    """Return a subtle Ground tint that stays visible on light and dark themes."""
+
+    base = palette.color(QPalette.ColorRole.Base)
+    target = (
+        QColor(255, 255, 255)
+        if base.lightnessF() < 0.75
+        else palette.color(QPalette.ColorRole.Highlight)
+    )
+    blend = GROUND_LEVEL_BACKGROUND_BLEND
+    color = QColor(
+        round(base.red() * (1.0 - blend) + target.red() * blend),
+        round(base.green() * (1.0 - blend) + target.green() * blend),
+        round(base.blue() * (1.0 - blend) + target.blue() * blend),
+    )
+    if color.rgb() == base.rgb():
+        fallback = palette.color(QPalette.ColorRole.Text)
+        color = QColor(
+            round(base.red() * 0.94 + fallback.red() * 0.06),
+            round(base.green() * 0.94 + fallback.green() * 0.06),
+            round(base.blue() * 0.94 + fallback.blue() * 0.06),
+        )
+    return color
 
 
 # ### Text helpers ###

@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import shapely
@@ -15,17 +15,18 @@ from shapely.geometry.base import BaseGeometry
 from housemaker.floor_geometry import (
     OUTER_ENVELOPE_CLOSING_RADIUS_METERS,
     build_level_floor_footprint,
+    build_level_open_space_geometry,
 )
 from housemaker.glb import (
-    DoorwayReveal,
     WALL_OPENING_EPSILON,
+    DoorwayReveal,
     WallOpening,
     WindowReveal,
     _build_level_doorway_reveals,
-    _build_level_window_reveals,
-    _build_wall_opening_reveal_quads,
-    _build_visible_wall_pieces,
     _build_level_wall_openings,
+    _build_level_window_reveals,
+    _build_visible_wall_pieces,
+    _build_wall_opening_reveal_quads,
     _interpolate_2d_point,
 )
 from housemaker.level_coordinates import (
@@ -35,7 +36,6 @@ from housemaker.level_coordinates import (
 )
 from housemaker.models import Edge, LevelData, RoomData, WindowData
 from housemaker.uv_layout import build_room_walls
-
 
 # ### Constants ###
 SURFACE_TYPE_WALL = "wall"
@@ -128,17 +128,119 @@ def build_fixed_surfaces(levels: Sequence[LevelData]) -> list[FixedSurface]:
 
     from housemaker.architectural_surface_edits import apply_editable_surfaces
 
-    base_surfaces = build_base_fixed_surfaces(levels)
+    base_surfaces = build_base_fixed_surfaces(
+        levels,
+        clip_open_spaces=False,
+    )
+    edited_surfaces = apply_editable_surfaces(levels, base_surfaces)
     return sorted(
-        apply_editable_surfaces(levels, base_surfaces),
+        _clip_horizontal_surfaces_for_open_spaces(
+            levels,
+            edited_surfaces,
+        ),
         key=_get_surface_sort_key,
     )
 
 
-def build_base_fixed_surfaces(levels: Sequence[LevelData]) -> list[FixedSurface]:
+def _clip_horizontal_surfaces_for_open_spaces(
+    levels: Sequence[LevelData],
+    surfaces: Sequence[FixedSurface],
+) -> list[FixedSurface]:
+    """Cut holes through floor and ceiling faces after authored edits apply."""
+
+    included_levels = {
+        level.index: level
+        for level in levels
+        if level.include_in_export
+    }
+    open_spaces_by_level_index: dict[int, BaseGeometry] = {}
+    for level in included_levels.values():
+        geometry = _build_level_world_open_space_geometry(level)
+        if geometry is not None:
+            open_spaces_by_level_index[level.index] = geometry
+    if not open_spaces_by_level_index:
+        return list(surfaces)
+
+    clipped_surfaces: list[FixedSurface] = []
+    for surface in surfaces:
+        if surface.surface_type == SURFACE_TYPE_FLOOR:
+            open_space_level_index = surface.level_index
+        elif surface.surface_type == SURFACE_TYPE_CEILING:
+            open_space_level_index = surface.level_index + 1
+        else:
+            clipped_surfaces.append(surface)
+            continue
+        open_space_geometry = open_spaces_by_level_index.get(
+            open_space_level_index
+        )
+        if open_space_geometry is None:
+            clipped_surfaces.append(surface)
+            continue
+        clipped_surface = _clip_horizontal_surface(
+            surface,
+            open_space_geometry,
+        )
+        if clipped_surface is not None:
+            clipped_surfaces.append(clipped_surface)
+    return clipped_surfaces
+
+
+def _clip_horizontal_surface(
+    surface: FixedSurface,
+    open_space_geometry: BaseGeometry,
+) -> FixedSurface | None:
+    """Clip one horizontal face without changing its stable ID."""
+
+    triangles = np.asarray(surface.mesh.triangles, dtype=float)
+    if triangles.size == 0:
+        return None
+    source_geometry = shapely.union_all(
+        [Polygon(triangle[:, :2]) for triangle in triangles]
+    )
+    clipped_geometry = _subtract_open_space_geometry(
+        source_geometry,
+        open_space_geometry,
+    )
+    if clipped_geometry is None:
+        return None
+    if math.isclose(
+        float(clipped_geometry.area),
+        float(source_geometry.area),
+        rel_tol=0.0,
+        abs_tol=SURFACE_GEOMETRY_EPSILON,
+    ):
+        return surface
+
+    face_normals = np.asarray(surface.mesh.face_normals, dtype=float)
+    face_areas = np.asarray(surface.mesh.area_faces, dtype=float)
+    weighted_z_normal = float(np.sum(face_normals[:, 2] * face_areas))
+    rebuilt_surface = _build_horizontal_surface(
+        polygon=clipped_geometry,
+        surface_id=surface.surface_id,
+        surface_type=surface.surface_type,
+        level_index=surface.level_index,
+        room_index=surface.room_index,
+        z_meters=float(np.median(triangles[:, :, 2])),
+        normal_points_up=weighted_z_normal >= 0.0,
+    )
+    if rebuilt_surface is None:
+        return None
+    return replace(
+        surface,
+        mesh=rebuilt_surface.mesh,
+        area_square_meters=rebuilt_surface.area_square_meters,
+    )
+
+
+def build_base_fixed_surfaces(
+    levels: Sequence[LevelData],
+    *,
+    clip_open_spaces: bool = True,
+) -> list[FixedSurface]:
     """Build generated semantic surfaces before authored topology edits."""
 
     level_base_z = build_level_base_z_lookup(levels)
+    level_by_index = {level.index: level for level in levels}
     surfaces: list[FixedSurface] = []
     for level in sorted(levels, key=lambda item: item.index):
         if not level.include_in_export:
@@ -152,6 +254,21 @@ def build_base_fixed_surfaces(levels: Sequence[LevelData]) -> list[FixedSurface]
         )
         window_reveals_by_surface_id = _group_window_reveals_by_surface_id(
             _build_level_window_reveals(level)
+        )
+        floor_open_spaces = (
+            _build_level_world_open_space_geometry(level)
+            if clip_open_spaces
+            else None
+        )
+        upper_level = level_by_index.get(level.index + 1)
+        ceiling_open_spaces = (
+            None
+            if (
+                not clip_open_spaces
+                or upper_level is None
+                or not upper_level.include_in_export
+            )
+            else _build_level_world_open_space_geometry(upper_level)
         )
         surfaces.extend(
             _build_plain_level_wall_surfaces(
@@ -174,6 +291,8 @@ def build_base_fixed_surfaces(levels: Sequence[LevelData]) -> list[FixedSurface]
                     window_reveals_by_surface_id=(
                         window_reveals_by_surface_id
                     ),
+                    floor_open_spaces=floor_open_spaces,
+                    ceiling_open_spaces=ceiling_open_spaces,
                 )
             )
 
@@ -181,6 +300,8 @@ def build_base_fixed_surfaces(levels: Sequence[LevelData]) -> list[FixedSurface]
             _build_level_residual_horizontal_surfaces(
                 level,
                 base_z_meters,
+                floor_open_spaces,
+                ceiling_open_spaces,
             )
         )
 
@@ -404,6 +525,8 @@ def _build_room_surfaces(
         Sequence[DoorwayReveal],
     ],
     window_reveals_by_surface_id: Mapping[str, Sequence[WindowReveal]],
+    floor_open_spaces: BaseGeometry | None,
+    ceiling_open_spaces: BaseGeometry | None,
 ) -> list[FixedSurface]:
     surfaces: list[FixedSurface] = []
     room_identity = room.center_vertex_id
@@ -429,8 +552,16 @@ def _build_room_surfaces(
 
     if room_polygon is None:
         return surfaces
+    floor_geometry = _subtract_open_space_geometry(
+        room_polygon,
+        floor_open_spaces,
+    )
+    ceiling_geometry = _subtract_open_space_geometry(
+        room_polygon,
+        ceiling_open_spaces,
+    )
     floor_surface = _build_horizontal_surface(
-        polygon=room_polygon,
+        polygon=floor_geometry,
         surface_id=build_horizontal_surface_id(
             level.index,
             SURFACE_TYPE_FLOOR,
@@ -443,7 +574,7 @@ def _build_room_surfaces(
         normal_points_up=True,
     )
     ceiling_surface = _build_horizontal_surface(
-        polygon=room_polygon,
+        polygon=ceiling_geometry,
         surface_id=build_horizontal_surface_id(
             level.index,
             SURFACE_TYPE_CEILING,
@@ -851,9 +982,49 @@ def _append_connected_doorway_reveals(
 
 
 # ### Horizontal geometry helpers ###
+def _build_level_world_open_space_geometry(
+    level: LevelData,
+) -> BaseGeometry | None:
+    """Resolve one level's image rectangles through that level's transform."""
+
+    def point_to_world_xy(
+        image_point: tuple[float, float],
+        _blueprint_size_pixels: tuple[float, float] | None,
+    ) -> np.ndarray:
+        return np.asarray(
+            level_image_to_world_xy(level, image_point[0], image_point[1]),
+            dtype=float,
+        )
+
+    return build_level_open_space_geometry(
+        level,
+        level.image_size_pixels,
+        point_to_world_xy,
+    )
+
+
+def _subtract_open_space_geometry(
+    surface_geometry: BaseGeometry,
+    open_space_geometry: BaseGeometry | None,
+) -> BaseGeometry | None:
+    """Clip a generated horizontal region while preserving its semantic ID."""
+
+    if open_space_geometry is None:
+        return surface_geometry
+    clipped_geometry = surface_geometry.difference(open_space_geometry)
+    if (
+        clipped_geometry.is_empty
+        or float(clipped_geometry.area) <= SURFACE_GEOMETRY_EPSILON
+    ):
+        return None
+    return clipped_geometry
+
+
 def _build_level_residual_horizontal_surfaces(
     level: LevelData,
     base_z_meters: float,
+    floor_open_spaces: BaseGeometry | None,
+    ceiling_open_spaces: BaseGeometry | None,
 ) -> tuple[FixedSurface, ...]:
     """Build automatic non-room floor and ceiling surfaces from closed walls."""
 
@@ -877,8 +1048,16 @@ def _build_level_residual_horizontal_surfaces(
     ):
         return ()
 
+    floor_geometry = _subtract_open_space_geometry(
+        residual_geometry,
+        floor_open_spaces,
+    )
+    ceiling_geometry = _subtract_open_space_geometry(
+        residual_geometry,
+        ceiling_open_spaces,
+    )
     floor_surface = _build_horizontal_surface(
-        polygon=residual_geometry,
+        polygon=floor_geometry,
         surface_id=build_horizontal_surface_id(
             level.index,
             SURFACE_TYPE_FLOOR,
@@ -890,7 +1069,7 @@ def _build_level_residual_horizontal_surfaces(
         normal_points_up=True,
     )
     ceiling_surface = _build_horizontal_surface(
-        polygon=residual_geometry,
+        polygon=ceiling_geometry,
         surface_id=build_horizontal_surface_id(
             level.index,
             SURFACE_TYPE_CEILING,
@@ -921,6 +1100,8 @@ def _build_horizontal_surface(
     z_meters: float,
     normal_points_up: bool,
 ) -> FixedSurface | None:
+    if polygon is None:
+        return None
     vertices_2d: list[tuple[float, float]] = []
     vertex_index_by_point: dict[tuple[float, float], int] = {}
     faces: list[list[int]] = []
