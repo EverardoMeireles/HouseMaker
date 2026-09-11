@@ -42,6 +42,10 @@ from housemaker.models import (
     MIN_LEVEL_SCALE,
     DoorwayData,
     DoorwayPreset,
+    EditableSurfaceEdgeData,
+    EditableSurfaceFaceData,
+    EditableSurfaceMeshData,
+    EditableSurfaceVertexData,
     LevelData,
     RoomData,
     StairData,
@@ -136,6 +140,10 @@ def save_project(
                     for doorway in level.doorways
                 ],
                 "windows": [window.to_dict() for window in level.windows],
+                "editable_surfaces": [
+                    _serialize_editable_surface(editable_surface)
+                    for editable_surface in level.editable_surfaces
+                ],
             }
             for level in levels
         ],
@@ -204,6 +212,10 @@ def load_project(path: str | Path) -> ProjectData:
         level.doorways = _deserialize_doorways(raw_level.get("doorways", []))
         level.windows = _deserialize_windows(
             raw_level.get("windows", []),
+            level_index=level.index,
+        )
+        level.editable_surfaces = _deserialize_editable_surfaces(
+            raw_level.get("editable_surfaces", []),
             level_index=level.index,
         )
 
@@ -676,6 +688,141 @@ def _deserialize_windows(
         window_ids.add(window.window_id)
         windows.append(window)
     return windows
+
+
+# ### Editable surface serialization helpers ###
+def _serialize_editable_surface(
+    editable_surface: EditableSurfaceMeshData,
+) -> dict[str, object]:
+    return {
+        "source_surface_id": editable_surface.source_surface_id,
+        "frame_kind": editable_surface.frame_kind,
+        "frame_normal_sign": editable_surface.frame_normal_sign,
+        "replaces_source_surface": editable_surface.replaces_source_surface,
+        "vertices": [
+            {
+                "vertex_id": vertex.vertex_id,
+                "u": vertex.u,
+                "v": vertex.v,
+                "normal_offset_meters": vertex.normal_offset_meters,
+                "is_user_placed": vertex.is_user_placed,
+            }
+            for vertex in editable_surface.vertices
+        ],
+        "faces": [
+            {
+                "face_id": face.face_id,
+                "vertex_ids": list(face.vertex_ids),
+                "surface_type": face.surface_type,
+                "is_directly_drawn": face.is_directly_drawn,
+            }
+            for face in editable_surface.faces
+        ],
+        "edges": [
+            {
+                "start_vertex_id": edge.start_vertex_id,
+                "end_vertex_id": edge.end_vertex_id,
+            }
+            for edge in editable_surface.edges
+        ],
+    }
+
+
+def _deserialize_editable_surfaces(
+    raw_editable_surfaces: object,
+    level_index: int,
+) -> list[EditableSurfaceMeshData]:
+    """Load independent topology records while isolating malformed entries."""
+
+    if not isinstance(raw_editable_surfaces, list | tuple):
+        return []
+    editable_surfaces: list[EditableSurfaceMeshData] = []
+    source_surface_ids: set[str] = set()
+    face_ids: set[str] = set()
+    for raw_editable_surface in raw_editable_surfaces:
+        try:
+            editable_surface = _deserialize_editable_surface(raw_editable_surface)
+        except (TypeError, ValueError):
+            continue
+        if not editable_surface.source_surface_id.startswith(
+            f"level:{level_index}/"
+        ):
+            continue
+        current_face_ids = {face.face_id for face in editable_surface.faces}
+        if (
+            editable_surface.source_surface_id in source_surface_ids
+            or not face_ids.isdisjoint(current_face_ids)
+        ):
+            continue
+        source_surface_ids.add(editable_surface.source_surface_id)
+        face_ids.update(current_face_ids)
+        editable_surfaces.append(editable_surface)
+    return editable_surfaces
+
+
+def _deserialize_editable_surface(
+    raw_editable_surface: object,
+) -> EditableSurfaceMeshData:
+    if not isinstance(raw_editable_surface, dict):
+        raise TypeError("Editable surface JSON must contain an object.")
+    raw_vertices = raw_editable_surface.get("vertices", [])
+    raw_faces = raw_editable_surface.get("faces", [])
+    raw_edges = raw_editable_surface.get("edges", [])
+    if (
+        not isinstance(raw_vertices, list | tuple)
+        or not isinstance(raw_faces, list | tuple)
+        or not isinstance(raw_edges, list | tuple)
+    ):
+        raise TypeError(
+            "Editable surface vertices, faces, and edges must contain lists."
+        )
+    vertices = tuple(
+        EditableSurfaceVertexData(
+            vertex_id=raw_vertex.get("vertex_id", ""),
+            u=raw_vertex.get("u"),
+            v=raw_vertex.get("v"),
+            normal_offset_meters=raw_vertex.get("normal_offset_meters"),
+            is_user_placed=raw_vertex.get("is_user_placed", False),
+        )
+        for raw_vertex in raw_vertices
+        if isinstance(raw_vertex, dict)
+    )
+    faces = tuple(
+        EditableSurfaceFaceData(
+            face_id=raw_face.get("face_id", ""),
+            vertex_ids=tuple(raw_face.get("vertex_ids", ())),
+            surface_type=raw_face.get("surface_type", ""),
+            is_directly_drawn=raw_face.get("is_directly_drawn", False),
+        )
+        for raw_face in raw_faces
+        if isinstance(raw_face, dict)
+    )
+    edges = tuple(
+        EditableSurfaceEdgeData(
+            start_vertex_id=raw_edge.get("start_vertex_id", ""),
+            end_vertex_id=raw_edge.get("end_vertex_id", ""),
+        )
+        for raw_edge in raw_edges
+        if isinstance(raw_edge, dict)
+    )
+    if (
+        len(vertices) != len(raw_vertices)
+        or len(faces) != len(raw_faces)
+        or len(edges) != len(raw_edges)
+    ):
+        raise ValueError("Editable surface records must contain JSON objects.")
+    return EditableSurfaceMeshData(
+        source_surface_id=raw_editable_surface.get("source_surface_id", ""),
+        frame_kind=raw_editable_surface.get("frame_kind", ""),
+        frame_normal_sign=raw_editable_surface.get("frame_normal_sign"),
+        replaces_source_surface=raw_editable_surface.get(
+            "replaces_source_surface",
+            True,
+        ),
+        vertices=vertices,
+        faces=faces,
+        edges=edges,
+    )
 
 
 # ### Room serialization helpers ###

@@ -181,7 +181,7 @@ class CanvasFloorThicknessGizmoTests(unittest.TestCase):
             (target,),
         )
         items = tuple(viewer._canvas_surface_edit_gizmo_items)
-        self.assertEqual(len(items), 3)
+        self.assertEqual(len(items), 2)
         for item in items:
             self.assertEqual(
                 item.depthValue(),
@@ -189,7 +189,7 @@ class CanvasFloorThicknessGizmoTests(unittest.TestCase):
             )
             gl_options = getattr(item, "_GLGraphicsItem__glOpts")
             self.assertFalse(gl_options[GL.GL_DEPTH_TEST])
-        axis_positions = np.asarray(items[1].pos, dtype=float)
+        axis_positions = np.asarray(items[0].pos, dtype=float)
         np.testing.assert_allclose(axis_positions[0], target.origin_world)
         self.assertGreater(axis_positions[1, 2], axis_positions[0, 2])
 

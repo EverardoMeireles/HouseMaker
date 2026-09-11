@@ -4,12 +4,15 @@ from __future__ import annotations
 import unittest
 
 import numpy as np
+from shapely import Polygon
 
 from housemaker.models import DoorwayData, LevelData, RoomData, VertexData
 from housemaker.surface_geometry import (
+    SURFACE_GEOMETRY_EPSILON,
     SURFACE_TYPE_CEILING,
     SURFACE_TYPE_FLOOR,
     SURFACE_TYPE_WALL,
+    _build_horizontal_surface,
     build_fixed_surfaces,
     get_combined_surface_area,
 )
@@ -168,6 +171,38 @@ def _surface_by_id(level: LevelData) -> dict[str, object]:
 
 # ### Tests ###
 class FixedSurfaceGeometryTests(unittest.TestCase):
+    def test_horizontal_triangulation_discards_microscopic_slivers(self) -> None:
+        polygon = Polygon(
+            (
+                (0.0, 0.0),
+                (10.0, 0.0),
+                (10.0, 1e-9),
+                (10.0, 10.0),
+                (0.0, 10.0),
+            )
+        )
+
+        surface = _build_horizontal_surface(
+            polygon,
+            "level:2/floor",
+            SURFACE_TYPE_FLOOR,
+            2,
+            None,
+            0.3,
+            True,
+        )
+
+        self.assertIsNotNone(surface)
+        assert surface is not None
+        self.assertEqual(len(surface.mesh.faces), 2)
+        self.assertTrue(
+            np.all(
+                np.asarray(surface.mesh.area_faces, dtype=float)
+                > SURFACE_GEOMETRY_EPSILON
+            )
+        )
+        self.assertAlmostEqual(float(surface.mesh.area), polygon.area)
+
     def test_room_surfaces_have_stable_ids_types_and_physical_areas(self) -> None:
         surfaces = build_fixed_surfaces([_build_square_level()])
 

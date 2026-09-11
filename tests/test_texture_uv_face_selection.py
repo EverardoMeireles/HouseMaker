@@ -227,7 +227,7 @@ class TextureUvFaceInteractionTests(unittest.TestCase):
         self.view.deleteLater()
         _qt_application.processEvents()
 
-    def test_aspect_fit_click_flips_v_rejects_letterbox_and_accepts_ctrl(
+    def test_aspect_fit_click_flips_v_rejects_letterbox_and_accepts_modifiers(
         self,
     ) -> None:
         top_triangle = (
@@ -255,7 +255,7 @@ class TextureUvFaceInteractionTests(unittest.TestCase):
         QTest.mouseClick(
             self.view.preview_label,
             Qt.MouseButton.LeftButton,
-            Qt.KeyboardModifier.ControlModifier,
+            Qt.KeyboardModifier.ShiftModifier,
             _preview_position_for_uv(self.view, (0.50, 0.18)),
         )
 
@@ -537,7 +537,7 @@ class TextureUvFaceWorkspaceTests(unittest.TestCase):
                     QTest.mouseClick(
                         workspace.result_view.view,
                         Qt.MouseButton.LeftButton,
-                        Qt.KeyboardModifier.ControlModifier,
+                        Qt.KeyboardModifier.ShiftModifier,
                         QPoint(100, 100),
                     )
 

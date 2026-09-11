@@ -73,6 +73,16 @@ _WINDOW_WALL_SURFACE_ID_PATTERN = re.compile(
     r"(?:room:(?:0|[1-9]\d*)/)?"
     r"wall:[1-9]\d*:[1-9]\d*$"
 )
+EDITABLE_SURFACE_FRAME_WALL_RATIO = "wall_ratio"
+EDITABLE_SURFACE_FRAME_LEVEL_IMAGE = "level_image"
+EDITABLE_SURFACE_FRAME_KINDS = frozenset(
+    {
+        EDITABLE_SURFACE_FRAME_WALL_RATIO,
+        EDITABLE_SURFACE_FRAME_LEVEL_IMAGE,
+    }
+)
+EDITABLE_SURFACE_TYPES = frozenset({"wall", "floor", "ceiling"})
+_EDITABLE_SURFACE_UUID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
 # ### Data models ###
 @dataclass(frozen=True)
@@ -226,6 +236,183 @@ class WindowData:
             bottom_ratio=payload.get("bottom_ratio"),
             top_ratio=payload.get("top_ratio"),
         )
+
+
+@dataclass(frozen=True)
+class EditableSurfaceVertexData:
+    """One persistent vertex in an editable source-surface frame."""
+
+    vertex_id: str
+    u: float
+    v: float
+    normal_offset_meters: float
+    is_user_placed: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "vertex_id",
+            _normalize_editable_surface_uuid(self.vertex_id, "vertex ID"),
+        )
+        object.__setattr__(self, "u", _normalize_finite_float(self.u, "vertex U"))
+        object.__setattr__(self, "v", _normalize_finite_float(self.v, "vertex V"))
+        object.__setattr__(
+            self,
+            "normal_offset_meters",
+            _normalize_finite_float(
+                self.normal_offset_meters,
+                "vertex normal offset",
+            ),
+        )
+        if not isinstance(self.is_user_placed, bool):
+            raise TypeError("Editable vertex user-placement state must be boolean.")
+
+
+@dataclass(frozen=True)
+class EditableSurfaceFaceData:
+    """One stable selectable polygon backed by ordered persistent vertices."""
+
+    face_id: str
+    vertex_ids: tuple[str, ...]
+    surface_type: str
+    is_directly_drawn: bool = False
+
+    def __post_init__(self) -> None:
+        face_id = _normalize_editable_surface_uuid(self.face_id, "face ID")
+        try:
+            vertex_ids = tuple(
+                _normalize_editable_surface_uuid(vertex_id, "face vertex ID")
+                for vertex_id in self.vertex_ids
+            )
+        except TypeError as error:
+            raise ValueError(
+                "Editable surface face vertex IDs must contain a sequence."
+            ) from error
+        if len(vertex_ids) < 3:
+            raise ValueError("An editable surface face requires at least 3 vertices.")
+        if len(set(vertex_ids)) != len(vertex_ids):
+            raise ValueError("Editable surface face vertices must be unique.")
+        surface_type = str(self.surface_type).strip().lower()
+        if surface_type not in EDITABLE_SURFACE_TYPES:
+            raise ValueError(
+                f"Unknown editable surface type: {self.surface_type!r}."
+            )
+        if not isinstance(self.is_directly_drawn, bool):
+            raise TypeError("Editable face drawing provenance must be boolean.")
+        object.__setattr__(self, "face_id", face_id)
+        object.__setattr__(self, "vertex_ids", vertex_ids)
+        object.__setattr__(self, "surface_type", surface_type)
+
+
+@dataclass(frozen=True)
+class EditableSurfaceEdgeData:
+    """One persistent user-authored edge between surface vertices."""
+
+    start_vertex_id: str
+    end_vertex_id: str
+
+    def __post_init__(self) -> None:
+        start_vertex_id = _normalize_editable_surface_uuid(
+            self.start_vertex_id,
+            "edge start vertex ID",
+        )
+        end_vertex_id = _normalize_editable_surface_uuid(
+            self.end_vertex_id,
+            "edge end vertex ID",
+        )
+        if start_vertex_id == end_vertex_id:
+            raise ValueError("An editable surface edge requires two vertices.")
+        object.__setattr__(self, "start_vertex_id", start_vertex_id)
+        object.__setattr__(self, "end_vertex_id", end_vertex_id)
+
+
+@dataclass(frozen=True)
+class EditableSurfaceMeshData:
+    """Persistent draft or replacement topology for one semantic surface."""
+
+    source_surface_id: str
+    frame_kind: str
+    frame_normal_sign: int
+    vertices: tuple[EditableSurfaceVertexData, ...]
+    faces: tuple[EditableSurfaceFaceData, ...]
+    edges: tuple[EditableSurfaceEdgeData, ...] = ()
+    replaces_source_surface: bool = True
+
+    def __post_init__(self) -> None:
+        source_surface_id = str(self.source_surface_id).strip().lower()
+        if not source_surface_id or len(source_surface_id) > 512:
+            raise ValueError("Editable source surface ID is empty or too long.")
+        frame_kind = str(self.frame_kind).strip().lower()
+        if frame_kind not in EDITABLE_SURFACE_FRAME_KINDS:
+            raise ValueError(f"Unknown editable surface frame: {self.frame_kind!r}.")
+        if isinstance(self.frame_normal_sign, bool):
+            raise TypeError("Editable surface frame normal sign must be -1 or 1.")
+        try:
+            frame_normal_sign = int(self.frame_normal_sign)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(
+                "Editable surface frame normal sign must be -1 or 1."
+            ) from error
+        if frame_normal_sign not in {-1, 1}:
+            raise ValueError("Editable surface frame normal sign must be -1 or 1.")
+        try:
+            vertices = tuple(self.vertices)
+            faces = tuple(self.faces)
+            edges = tuple(self.edges)
+        except TypeError as error:
+            raise ValueError(
+                "Editable surface vertices, faces, and edges must contain sequences."
+            ) from error
+        if not vertices or not all(
+            isinstance(vertex, EditableSurfaceVertexData) for vertex in vertices
+        ):
+            raise ValueError(
+                "Editable surfaces require persistent vertex records."
+            )
+        if not faces or not all(
+            isinstance(face, EditableSurfaceFaceData) for face in faces
+        ):
+            raise ValueError("Editable surfaces require persistent face records.")
+        if not all(isinstance(edge, EditableSurfaceEdgeData) for edge in edges):
+            raise ValueError("Editable surface edges must contain edge records.")
+        vertex_ids = tuple(vertex.vertex_id for vertex in vertices)
+        face_ids = tuple(face.face_id for face in faces)
+        if len(set(vertex_ids)) != len(vertex_ids):
+            raise ValueError("Editable surface vertex IDs must be unique.")
+        if len(set(face_ids)) != len(face_ids):
+            raise ValueError("Editable surface face IDs must be unique.")
+        known_vertex_ids = set(vertex_ids)
+        if any(
+            vertex_id not in known_vertex_ids
+            for face in faces
+            for vertex_id in face.vertex_ids
+        ):
+            raise ValueError(
+                "Editable surface faces must reference existing vertices."
+            )
+        if any(
+            vertex_id not in known_vertex_ids
+            for edge in edges
+            for vertex_id in (edge.start_vertex_id, edge.end_vertex_id)
+        ):
+            raise ValueError(
+                "Editable surface edges must reference existing vertices."
+            )
+        edge_keys = [
+            frozenset((edge.start_vertex_id, edge.end_vertex_id)) for edge in edges
+        ]
+        if len(set(edge_keys)) != len(edge_keys):
+            raise ValueError("Editable surface edges must be unique.")
+        if not isinstance(self.replaces_source_surface, bool):
+            raise TypeError(
+                "Editable surface replacement state must be a boolean."
+            )
+        object.__setattr__(self, "source_surface_id", source_surface_id)
+        object.__setattr__(self, "frame_kind", frame_kind)
+        object.__setattr__(self, "frame_normal_sign", frame_normal_sign)
+        object.__setattr__(self, "vertices", vertices)
+        object.__setattr__(self, "faces", faces)
+        object.__setattr__(self, "edges", edges)
 
 
 @dataclass(frozen=True, init=False)
@@ -818,6 +1005,7 @@ class LevelData:
     include_in_export: bool = DEFAULT_INCLUDE_IN_EXPORT
     floor_thickness_meters: float = DEFAULT_FLOOR_THICKNESS_METERS
     windows: list[WindowData] = field(default_factory=list)
+    editable_surfaces: list[EditableSurfaceMeshData] = field(default_factory=list)
 
     @property
     def display_name(self) -> str:
@@ -881,6 +1069,30 @@ def normalize_doorway_bottom_height_meters(value: object) -> float:
             f"{MAX_DOORWAY_BOTTOM_HEIGHT_METERS:g} meters."
         )
     return bottom_height
+
+
+# ### Editable surface validation helpers ###
+def _normalize_editable_surface_uuid(value: object, field_name: str) -> str:
+    normalized = str(value).strip().lower()
+    if _EDITABLE_SURFACE_UUID_PATTERN.fullmatch(normalized) is None:
+        raise ValueError(
+            f"Editable surface {field_name} must be a 32-character UUID."
+        )
+    return normalized
+
+
+def _normalize_finite_float(value: object, field_name: str) -> float:
+    if isinstance(value, bool):
+        raise TypeError(f"Editable surface {field_name} must be a number.")
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            f"Editable surface {field_name} must be a number."
+        ) from error
+    if not math.isfinite(normalized):
+        raise ValueError(f"Editable surface {field_name} must be finite.")
+    return normalized
 
 
 # ### Window validation helpers ###

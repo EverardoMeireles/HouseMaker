@@ -449,7 +449,7 @@ class ObjectFaceSelectionWidgetTests(unittest.TestCase):
         viewer.set_face_edit_geometry(vertices, faces)
         return viewer
 
-    def test_ctrl_click_is_opt_in_and_ordinary_click_is_untouched(self) -> None:
+    def test_shift_click_is_opt_in_and_ctrl_click_is_untouched(self) -> None:
         view = SelectableGLViewWidget()
         self.widgets.append(view)
         view.resize(200, 160)
@@ -460,7 +460,7 @@ class ObjectFaceSelectionWidgetTests(unittest.TestCase):
         QTest.mouseClick(
             view,
             Qt.MouseButton.LeftButton,
-            Qt.KeyboardModifier.ControlModifier,
+            Qt.KeyboardModifier.ShiftModifier,
             QPoint(80, 60),
         )
         self.assertEqual(pressed.count(), 0)
@@ -471,6 +471,14 @@ class ObjectFaceSelectionWidgetTests(unittest.TestCase):
             view,
             Qt.MouseButton.LeftButton,
             Qt.KeyboardModifier.ControlModifier,
+            QPoint(80, 60),
+        )
+        self.assertEqual(pressed.count(), 0)
+        self.assertEqual(released.count(), 0)
+        QTest.mouseClick(
+            view,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.ShiftModifier,
             QPoint(80, 60),
         )
         self.assertEqual(pressed.count(), 1)
@@ -560,14 +568,14 @@ class ObjectFaceSelectionWidgetTests(unittest.TestCase):
         QTest.mousePress(
             view,
             Qt.MouseButton.LeftButton,
-            Qt.KeyboardModifier.ControlModifier,
+            Qt.KeyboardModifier.ShiftModifier,
             QPoint(80, 60),
         )
         QTest.keyClick(view, Qt.Key.Key_Escape)
         QTest.mouseRelease(
             view,
             Qt.MouseButton.LeftButton,
-            Qt.KeyboardModifier.ControlModifier,
+            Qt.KeyboardModifier.ShiftModifier,
             QPoint(80, 60),
         )
 
@@ -599,7 +607,7 @@ class ObjectFaceSelectionWidgetTests(unittest.TestCase):
             pos=QPoint(80, 60),
         )
 
-    def test_model_replacement_cancels_an_interrupted_ctrl_gesture(self) -> None:
+    def test_model_replacement_cancels_an_interrupted_shift_gesture(self) -> None:
         viewer = self._build_face_edit_viewer()
         viewer.resize(320, 240)
         viewer.show()
@@ -608,7 +616,7 @@ class ObjectFaceSelectionWidgetTests(unittest.TestCase):
         QTest.mousePress(
             viewer.view,
             Qt.MouseButton.LeftButton,
-            Qt.KeyboardModifier.ControlModifier,
+            Qt.KeyboardModifier.ShiftModifier,
             QPoint(80, 60),
         )
 
@@ -630,7 +638,7 @@ class ObjectFaceSelectionWidgetTests(unittest.TestCase):
         QTest.mouseRelease(
             viewer.view,
             Qt.MouseButton.LeftButton,
-            Qt.KeyboardModifier.ControlModifier,
+            Qt.KeyboardModifier.ShiftModifier,
             QPoint(80, 60),
         )
 
@@ -646,7 +654,7 @@ class ObjectFaceSelectionWidgetTests(unittest.TestCase):
         QTest.mouseClick(
             view,
             Qt.MouseButton.LeftButton,
-            Qt.KeyboardModifier.ControlModifier,
+            Qt.KeyboardModifier.ShiftModifier,
             QPoint(80, 60),
         )
         self.assertEqual(selected.count(), 0)
@@ -661,7 +669,7 @@ class ObjectFaceSelectionWidgetTests(unittest.TestCase):
         QTest.mouseClick(
             view,
             Qt.MouseButton.LeftButton,
-            Qt.KeyboardModifier.ControlModifier,
+            Qt.KeyboardModifier.ShiftModifier,
             QPoint(80, 60),
         )
 

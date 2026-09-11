@@ -82,6 +82,8 @@ from housemaker.object_texture_variants import (
 )
 from housemaker.surface_geometry import (
     FixedSurface,
+    SURFACE_TYPE_CEILING,
+    SURFACE_TYPE_FLOOR,
     SURFACE_TYPE_WALL,
     WallWindowPlacement,
     build_wall_window_placement,
@@ -128,8 +130,7 @@ FIRST_PERSON_LOOK_DISTANCE_METERS = 1.0
 MAX_FIRST_PERSON_PITCH_DEGREES = 89.0
 WINDOW_EDITOR_PANEL_WIDTH = 190
 WINDOW_PREVIEW_OFFSET_METERS = 0.006
-WINDOW_SELECTION_COLOR = (0.20, 0.72, 1.0, 1.0)
-ATLAS_SURFACE_SELECTION_COLOR = (1.0, 0.72, 0.18, 1.0)
+CANVAS_SURFACE_SELECTION_COLOR = (1.0, 0.72, 0.18, 1.0)
 ATLAS_SURFACE_HIGHLIGHT_COLOR = (0.20, 0.86, 0.38, 1.0)
 WINDOW_VALID_PREVIEW_COLOR = (0.20, 0.86, 0.38, 0.34)
 WINDOW_INVALID_PREVIEW_COLOR = (1.0, 0.24, 0.20, 0.34)
@@ -167,7 +168,6 @@ CANVAS_OPENING_RESIZE_SIDES = frozenset(
         CANVAS_OPENING_SIDE_TOP,
     )
 )
-CANVAS_OPENING_SELECTION_COLOR = (0.20, 0.72, 1.0, 0.98)
 CANVAS_OPENING_PREVIEW_COLOR = (1.0, 0.72, 0.18, 0.98)
 CANVAS_OPENING_SIDE_COLOR = (1.0, 0.46, 0.12, 1.0)
 CANVAS_OPENING_ANCHOR_COLOR = (0.20, 0.86, 0.38, 1.0)
@@ -188,7 +188,6 @@ CANVAS_OPENING_OVERLAY_GL_OPTIONS = {
         GL.GL_ONE_MINUS_SRC_ALPHA,
     ),
 }
-CANVAS_SURFACE_EDIT_SELECTION_COLOR = (1.0, 0.72, 0.18, 1.0)
 CANVAS_SURFACE_EDIT_PREVIEW_COLOR = (0.20, 0.86, 0.38, 1.0)
 CANVAS_SURFACE_EDIT_OUTLINE_WIDTH = 5.0
 CANVAS_SURFACE_EDIT_GIZMO_SCREEN_SIZE_PIXELS = 86.0
@@ -197,6 +196,30 @@ CANVAS_SURFACE_EDIT_GIZMO_LINE_WIDTH = 5.0
 CANVAS_SURFACE_EDIT_GIZMO_ENDPOINT_SIZE_PIXELS = 16.0
 CANVAS_SURFACE_EDIT_GIZMO_HIT_RATIO = 0.14
 CANVAS_SURFACE_EDIT_GIZMO_MIN_HIT_RADIUS_METERS = 0.05
+CANVAS_SURFACE_DRAWING_EDGE_COLOR = (1.0, 0.76, 0.16, 1.0)
+CANVAS_SURFACE_DRAWING_EDGE_WIDTH = 3.0
+CANVAS_SURFACE_DRAWING_VERTEX_COLOR = (0.16, 0.82, 1.0, 1.0)
+CANVAS_SURFACE_DRAWING_VERTEX_SIZE_PIXELS = 9.0
+CANVAS_SURFACE_ACTIVE_VERTEX_COLOR = (0.20, 0.94, 0.42, 1.0)
+CANVAS_SURFACE_ACTIVE_VERTEX_SIZE_PIXELS = 22.0
+CANVAS_SURFACE_VERTEX_PREVIEW_COLOR = (1.0, 0.76, 0.16, 1.0)
+CANVAS_SURFACE_VERTEX_SNAP_PREVIEW_COLOR = (0.20, 0.94, 0.42, 1.0)
+CANVAS_SURFACE_VERTEX_PREVIEW_SIZE_PIXELS = 18.0
+CANVAS_SURFACE_VERTEX_SNAP_DISTANCE_METERS = 0.01
+CANVAS_FACE_EXTRUSION_COLOR = (0.20, 0.86, 0.38, 1.0)
+CANVAS_FACE_EXTRUSION_PREVIEW_COLOR = (1.0, 0.72, 0.18, 1.0)
+CANVAS_EXTRUDABLE_FACE_OUTLINE_COLOR = (0.16, 0.82, 1.0, 0.96)
+CANVAS_EXTRUDABLE_FACE_OUTLINE_WIDTH = 3.0
+CANVAS_FACE_EXTRUSION_GIZMO_SCREEN_SIZE_PIXELS = 86.0
+CANVAS_FACE_EXTRUSION_GIZMO_MIN_SIZE_METERS = 0.40
+CANVAS_FACE_EXTRUSION_GIZMO_LINE_WIDTH = 5.0
+CANVAS_FACE_EXTRUSION_GIZMO_ENDPOINT_SIZE_PIXELS = 18.0
+CANVAS_FACE_EXTRUSION_GIZMO_HIT_RATIO = 0.14
+CANVAS_FACE_EXTRUSION_GIZMO_MIN_HIT_RADIUS_METERS = 0.05
+CANVAS_FACE_EXTRUSION_MAX_DISTANCE_METERS = 100.0
+CANVAS_FACE_COPLANAR_NORMAL_TOLERANCE = 1e-6
+CANVAS_FACE_COPLANAR_DISTANCE_TOLERANCE_METERS = 1e-6
+CANVAS_FACE_SHARED_EDGE_TOLERANCE_METERS = 1e-6
 FACE_SELECTION_COLOR = (1.0, 0.36, 0.08, 0.72)
 FACE_SELECTION_EDGE_COLOR = (1.0, 0.78, 0.18, 1.0)
 FACE_SELECTION_MAX_RASTER_DIMENSION = 768
@@ -440,6 +463,76 @@ class _CanvasSurfaceEditDrag:
     last_emitted_delta_meters: float = 0.0
 
 
+@dataclass(frozen=True)
+class _CanvasFaceExtrusionTarget:
+    """One connected coplanar logical-face region and its normal handle."""
+
+    source_surface_id: str
+    surface_ids: tuple[str, ...]
+    center_world: tuple[float, float, float]
+    normal_world: tuple[float, float, float]
+    boundary_line_positions: np.ndarray
+
+
+@dataclass
+class _CanvasFaceExtrusionDrag:
+    """Stable selected region and live signed normal-axis displacement."""
+
+    target: _CanvasFaceExtrusionTarget
+    axis: np.ndarray
+    drag_plane_normal: np.ndarray
+    start_axis_parameter: float
+    preview_delta_meters: float = 0.0
+
+
+# ### Canvas surface drawing models ###
+@dataclass(frozen=True)
+class _CanvasSurfaceDrawingVertex:
+    """One snap target with optional manual-marker face ownership."""
+
+    vertex_id: str
+    source_surface_id: str
+    world_point: tuple[float, float, float]
+    show_marker: bool = True
+    direct_face_surface_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _CanvasSurfaceDrawingEdge:
+    """One unfinished authored edge resolved to world-space endpoints."""
+
+    source_surface_id: str
+    start_vertex_id: str
+    end_vertex_id: str
+    start_world_point: tuple[float, float, float]
+    end_world_point: tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class _CanvasSurfaceVertexPreview:
+    """One exact hover candidate used for both feedback and click requests."""
+
+    surface_id: str
+    source_surface_id: str
+    world_point: tuple[float, float, float]
+    snapped_vertex_id: str | None = None
+    snapped_edge_vertex_ids: tuple[str, str] | None = None
+    snap_kind: str = "surface"
+    active_vertex_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _CanvasSurfaceEdgeSnapCandidate:
+    """One edge snap ranked with the same rules as domain placement."""
+
+    distance_meters: float
+    authored_priority: int
+    edge_length_meters: float
+    edge_key: tuple[str, str]
+    world_point: tuple[float, float, float]
+    snapped_edge_vertex_ids: tuple[str, str] | None
+
+
 # ### Widgets ###
 class SelectableGLViewWidget(gl.GLViewWidget):
     """3D viewport with selectable items and two explicit navigation modes."""
@@ -452,6 +545,8 @@ class SelectableGLViewWidget(gl.GLViewWidget):
     rectangle_pointer_released = Signal(object)
     rectangle_drawing_cancel_requested = Signal()
     primary_pointer_pressed = Signal(object)
+    primary_pointer_hovered = Signal(object)
+    primary_pointer_left = Signal()
     primary_pointer_moved = Signal(object)
     primary_pointer_released = Signal(object)
     primary_pointer_cancel_requested = Signal()
@@ -644,7 +739,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
 
     @property
     def is_face_selection_gesture_active(self) -> bool:
-        """Whether Ctrl+left selection currently owns pointer movement."""
+        """Whether Shift+left selection currently owns pointer movement."""
 
         return self._face_selection_gesture_active
 
@@ -655,7 +750,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         return self._is_middle_navigation_active
 
     def cancel_face_selection_gesture(self) -> None:
-        """Release a pending Ctrl+left gesture after a context change."""
+        """Release a pending Shift+left gesture after a context change."""
 
         self._cancel_face_selection_gesture()
 
@@ -668,7 +763,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             self.releaseMouse()
 
     def set_face_selection_gestures_enabled(self, enabled: bool) -> None:
-        """Enable Ctrl+primary-pointer gestures for object face editing."""
+        """Enable Shift+primary-pointer gestures for object face editing."""
 
         self._face_selection_gestures_enabled = bool(enabled)
         if not self._face_selection_gestures_enabled:
@@ -997,7 +1092,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         if (
             self._face_selection_gestures_enabled
             and event.button() == Qt.MouseButton.LeftButton
-            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+            and event.modifiers() & Qt.KeyboardModifier.ShiftModifier
             and not self.is_first_person_pointer_captured
         ):
             self.click_press_position = event.position()
@@ -1122,7 +1217,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             and event.button() == Qt.MouseButton.LeftButton
         ):
             # Match the inert press above without invoking itemsAt().  In the
-            # face editor, 3D selection is deliberately Ctrl+click/drag only.
+            # face editor, 3D selection is deliberately Shift+click/drag only.
             if (
                 self._overlay_selection_enabled
                 and _get_point_distance(
@@ -1209,6 +1304,12 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             event.accept()
             return
 
+        if (
+            not event.buttons()
+            and not self.is_first_person_pointer_captured
+        ):
+            self.primary_pointer_hovered.emit(event.position())
+
         if self.is_first_person_pointer_captured:
             self._handle_first_person_mouse_look(event)
             return
@@ -1238,6 +1339,12 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             return
 
         super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:  # type: ignore[override]
+        """Clear hover-only Canvas feedback when the pointer leaves the view."""
+
+        self.primary_pointer_left.emit()
+        super().leaveEvent(event)
 
     def wheelEvent(self, event) -> None:  # type: ignore[override]
         """Zoom with the wheel, including when a modifier key is held."""
@@ -2316,6 +2423,9 @@ class GlbViewerWidget(QWidget):
     canvas_surface_edit_preview_changed = Signal(object)
     canvas_surface_edit_finished = Signal(object, bool)
     canvas_surface_edit_cancelled = Signal(object)
+    canvas_surface_vertex_insertion_requested = Signal(object)
+    canvas_surface_vertex_chain_reset_requested = Signal()
+    canvas_surface_face_extrusion_requested = Signal(object)
     placed_object_removal_requested = Signal(str)
     placed_object_transform_changed = Signal(str, object, object)
     placed_object_selection_changed = Signal(object)
@@ -2412,11 +2522,41 @@ class GlbViewerWidget(QWidget):
         self._canvas_surface_edit_pending_outline_surface_id: str | None = None
         self._canvas_surface_edit_gizmo_items: list[GLGraphicsItem] = []
         self._canvas_surface_edit_gizmo_sizes: dict[tuple[str, str], float] = {}
+        self._surface_vertex_placement_active = False
+        self._canvas_surface_drawing_vertices: dict[
+            str,
+            _CanvasSurfaceDrawingVertex,
+        ] = {}
+        self._canvas_surface_drawing_edges: tuple[
+            _CanvasSurfaceDrawingEdge,
+            ...,
+        ] = ()
+        self._canvas_surface_drawing_items: list[GLGraphicsItem] = []
+        self._active_surface_vertex_id: str | None = None
+        self._surface_vertex_hover_preview: (
+            _CanvasSurfaceVertexPreview | None
+        ) = None
+        self._surface_vertex_click_ack_pending = False
+        self._surface_vertex_preview_item: gl.GLScatterPlotItem | None = None
+        self._surface_vertex_preview_edge_item: gl.GLLinePlotItem | None = None
+        self._canvas_face_extrusion_target: (
+            _CanvasFaceExtrusionTarget | None
+        ) = None
+        self._canvas_face_extrusion_drag: _CanvasFaceExtrusionDrag | None = None
+        self._canvas_face_extrusion_gizmo_items: list[GLGraphicsItem] = []
+        self._canvas_face_extrusion_gizmo_size = (
+            CANVAS_FACE_EXTRUSION_GIZMO_MIN_SIZE_METERS
+        )
         self.object_transform_status_label: QLabel | None = None
+        self.surface_tools_status_label: QLabel | None = None
+        self._surface_tools_status_override: str | None = None
         self._window_wall_targets: dict[str, FixedSurface] = {}
         self._canvas_surface_targets: dict[str, FixedSurface] = {}
         self._selected_canvas_surface_ids: tuple[str, ...] = ()
-        self._atlas_surface_selection_items: list[gl.GLLinePlotItem] = []
+        self._canvas_surface_selection_items: list[gl.GLLinePlotItem] = []
+        self._canvas_extrudable_face_outline_items: list[
+            gl.GLLinePlotItem
+        ] = []
         self._highlighted_canvas_surface_ids: tuple[str, ...] = ()
         self._atlas_surface_highlight_items: list[gl.GLLinePlotItem] = []
         self._selected_window_wall_surface_id: str | None = None
@@ -2424,12 +2564,12 @@ class GlbViewerWidget(QWidget):
         self._window_preview_placement: WallWindowPlacement | None = None
         self._window_preview_is_valid = False
         self._window_undo_available = False
-        self._window_selection_item: gl.GLLinePlotItem | None = None
         self._window_preview_item: gl.GLMeshItem | None = None
         self.window_tools_panel: QWidget | None = None
         self.window_tools_status_label: QLabel | None = None
         self.add_window_button: QPushButton | None = None
         self.undo_window_button: QPushButton | None = None
+        self.add_surface_vertex_button: QPushButton | None = None
         self._texture_edit_mask: np.ndarray | None = None
         self._symmetric_preview_orientation: str | None = None
         self._symmetric_preview_plane_coordinate: float | None = None
@@ -2604,6 +2744,30 @@ class GlbViewerWidget(QWidget):
         self.window_tools_status_label.setWordWrap(True)
         panel_layout.addWidget(self.window_tools_status_label)
 
+        surface_title_label = QLabel("Surface tools")
+        surface_title_label.setObjectName("canvas-surface-tools-title")
+        panel_layout.addWidget(surface_title_label)
+
+        self.add_surface_vertex_button = QPushButton("Add vertex")
+        self.add_surface_vertex_button.setObjectName(
+            "canvas-add-surface-vertex-button"
+        )
+        self.add_surface_vertex_button.setCheckable(True)
+        self.add_surface_vertex_button.setEnabled(False)
+        self.add_surface_vertex_button.toggled.connect(
+            self._handle_add_surface_vertex_button_toggled
+        )
+        panel_layout.addWidget(self.add_surface_vertex_button)
+
+        self.surface_tools_status_label = QLabel(
+            "Select a surface to add vertices."
+        )
+        self.surface_tools_status_label.setObjectName(
+            "canvas-surface-tools-status"
+        )
+        self.surface_tools_status_label.setWordWrap(True)
+        panel_layout.addWidget(self.surface_tools_status_label)
+
         object_title_label = QLabel("Object transforms")
         object_title_label.setObjectName("canvas-object-transform-title")
         panel_layout.addWidget(object_title_label)
@@ -2647,11 +2811,16 @@ class GlbViewerWidget(QWidget):
                     f"Duplicate Canvas surface target: {surface.surface_id!r}."
                 )
             all_targets[surface.surface_id] = surface
-            if surface.surface_type != SURFACE_TYPE_WALL:
+            if (
+                surface.surface_type != SURFACE_TYPE_WALL
+                or _get_fixed_surface_source_id(surface) is not None
+            ):
                 continue
             targets[surface.surface_id] = surface
 
         self._cancel_canvas_surface_edit_drag()
+        self._cancel_canvas_face_extrusion_drag()
+        self._cancel_surface_vertex_pointer_interaction()
         selected_id = self._selected_window_wall_surface_id
         self._canvas_surface_targets = all_targets
         previous_canvas_surface_ids = self._selected_canvas_surface_ids
@@ -2678,15 +2847,18 @@ class GlbViewerWidget(QWidget):
         )
         self._set_active_canvas_surface_id(next_active_surface_id)
         self.cancel_window_placement(status_message=None)
-        self._refresh_window_selection_outline()
-        self._refresh_atlas_surface_selection_outlines()
+        self._refresh_canvas_surface_selection_outlines()
+        self._refresh_canvas_extrudable_face_outlines()
         self._refresh_atlas_surface_highlight_outlines()
+        self._refresh_canvas_surface_drawing_items()
         self._refresh_canvas_surface_edit_gizmo_items()
+        self._refresh_canvas_face_extrusion_gizmo_items()
         if self._selected_canvas_surface_ids != previous_canvas_surface_ids:
             self.canvas_surface_selection_changed.emit(
                 self._selected_canvas_surface_ids
             )
         self._sync_window_tools_controls()
+        self._sync_surface_tools_controls()
 
     def get_selected_wall_surface_id(self) -> str | None:
         """Return the one selected semantic wall, if any."""
@@ -2717,14 +2889,21 @@ class GlbViewerWidget(QWidget):
         selection_changed = normalized_ids != self._selected_canvas_surface_ids
         if selection_changed:
             self._cancel_canvas_surface_edit_drag()
+            self._cancel_canvas_face_extrusion_drag()
         self._selected_canvas_surface_ids = normalized_ids
         active_surface_id = self._active_canvas_surface_id
         if active_surface_id not in normalized_ids:
             active_surface_id = normalized_ids[-1] if normalized_ids else None
         active_changed = self._set_active_canvas_surface_id(active_surface_id)
         if selection_changed:
-            self._refresh_atlas_surface_selection_outlines()
+            self._refresh_canvas_surface_selection_outlines()
+            self._refresh_canvas_extrudable_face_outlines()
+            self._refresh_canvas_surface_drawing_items()
+            self._refresh_canvas_face_extrusion_gizmo_items()
             self.canvas_surface_selection_changed.emit(normalized_ids)
+        elif active_changed:
+            self._refresh_canvas_face_extrusion_gizmo_items()
+        self._sync_surface_tools_controls()
         return selection_changed or active_changed
 
     def get_highlighted_canvas_surface_ids(self) -> tuple[str, ...]:
@@ -2774,7 +2953,6 @@ class GlbViewerWidget(QWidget):
             return False
         if normalized_id is None and additive:
             return False
-
         selected_ids = list(self._selected_canvas_surface_ids)
         selected_surface = surface
         if normalized_id is None:
@@ -2786,6 +2964,8 @@ class GlbViewerWidget(QWidget):
         else:
             selected_ids = [normalized_id]
 
+        if tuple(selected_ids) != self._selected_canvas_surface_ids:
+            self._surface_tools_status_override = None
         if normalized_id is not None:
             self._set_selected_canvas_opening_key(None)
             self._set_selected_placed_object(None)
@@ -2806,12 +2986,12 @@ class GlbViewerWidget(QWidget):
             selected_wall_id = (
                 normalized_id
                 if selected_surface is not None
-                and selected_surface.surface_type == SURFACE_TYPE_WALL
+                and normalized_id in self._window_wall_targets
                 else None
             )
         elif (
             selected_surface is not None
-            and selected_surface.surface_type == SURFACE_TYPE_WALL
+            and normalized_id in self._window_wall_targets
             and normalized_id in selected_ids
         ):
             selected_wall_id = normalized_id
@@ -2860,7 +3040,6 @@ class GlbViewerWidget(QWidget):
             return False
         self.cancel_window_placement(status_message=None)
         self._selected_window_wall_surface_id = surface_id
-        self._refresh_window_selection_outline()
         self._sync_window_tools_controls()
         return True
 
@@ -2884,6 +3063,107 @@ class GlbViewerWidget(QWidget):
 
         self._window_undo_available = bool(available)
         self._sync_window_undo_button()
+
+    # ### Canvas surface vertex tool API ###
+    def is_surface_vertex_placement_active(self) -> bool:
+        """Whether Canvas primary clicks currently insert surface vertices."""
+
+        return bool(
+            self._window_editing_enabled
+            and self._surface_vertex_placement_active
+        )
+
+    def begin_surface_vertex_placement(self) -> bool:
+        """Arm continuous vertex-and-edge drawing on Canvas surfaces."""
+
+        self._surface_tools_status_override = None
+        if not self._window_editing_enabled or not self._canvas_surface_targets:
+            self._set_surface_tools_status(
+                "Select a surface to add vertices."
+            )
+            self._set_add_surface_vertex_button_checked(False)
+            return False
+        if self.is_window_placement_active():
+            self.cancel_window_placement(status_message=None)
+        self._cancel_canvas_gizmo_drag()
+        self._surface_vertex_placement_active = True
+        self._set_add_surface_vertex_button_checked(True)
+        self._refresh_canvas_surface_drawing_items()
+        self._refresh_canvas_face_extrusion_gizmo_items()
+        self._set_surface_tools_status(
+            "Hover to preview a snapped vertex. Click to select or place it; "
+            "each following vertex is connected by an edge."
+        )
+        return True
+
+    def cancel_surface_vertex_placement(self) -> None:
+        """Disarm surface drawing and clear its transient active endpoint."""
+
+        self._surface_tools_status_override = None
+        self._cancel_surface_vertex_pointer_interaction()
+        self._surface_vertex_placement_active = False
+        had_active_vertex = self._active_surface_vertex_id is not None
+        self._active_surface_vertex_id = None
+        self._set_add_surface_vertex_button_checked(False)
+        self._refresh_canvas_surface_drawing_items()
+        self._refresh_canvas_face_extrusion_gizmo_items()
+        self._sync_surface_tools_controls()
+        if had_active_vertex:
+            self.canvas_surface_vertex_chain_reset_requested.emit()
+
+    def get_active_surface_vertex_id(self) -> str | None:
+        """Return the persistent vertex used as the next edge's start."""
+
+        return self._active_surface_vertex_id
+
+    def set_active_surface_vertex_id(self, vertex_id: str | None) -> bool:
+        """Synchronize the controller-owned drawing endpoint after an edit."""
+
+        normalized_id = None if vertex_id is None else str(vertex_id).strip()
+        if normalized_id not in self._canvas_surface_drawing_vertices:
+            normalized_id = None
+        if normalized_id == self._active_surface_vertex_id:
+            return False
+        self._active_surface_vertex_id = normalized_id
+        self._surface_vertex_hover_preview = None
+        self._remove_surface_vertex_preview_items()
+        self._refresh_canvas_surface_drawing_items()
+        self._sync_surface_tools_controls()
+        return True
+
+    def set_canvas_surface_drawing_overlay(
+        self,
+        overlay: object,
+        *,
+        active_vertex_id: str | None = None,
+    ) -> None:
+        """Replace persistent world-space vertex and edge drawing targets."""
+
+        vertices, edges = _normalize_canvas_surface_drawing_overlay(overlay)
+        self._canvas_surface_drawing_vertices = {
+            vertex.vertex_id: vertex for vertex in vertices
+        }
+        self._canvas_surface_drawing_edges = edges
+        normalized_active_id = (
+            None if active_vertex_id is None else str(active_vertex_id).strip()
+        )
+        self._active_surface_vertex_id = (
+            normalized_active_id
+            if normalized_active_id in self._canvas_surface_drawing_vertices
+            else None
+        )
+        self._surface_vertex_hover_preview = None
+        self._remove_surface_vertex_preview_items()
+        self._refresh_canvas_surface_drawing_items()
+        self._sync_surface_tools_controls()
+
+    def set_surface_tools_status(self, message: str) -> None:
+        """Show one domain validation or remapping result in Surface tools."""
+
+        if not isinstance(message, str):
+            raise TypeError("A surface-tools status message must be text.")
+        self._surface_tools_status_override = message
+        self._set_surface_tools_status(message)
 
     # ### Canvas structural edit API ###
     def set_canvas_surface_edit_targets(
@@ -2910,6 +3190,12 @@ class GlbViewerWidget(QWidget):
                     "Canvas surface edit targets must contain "
                     "CanvasSurfaceEditHandleTarget values."
                 )
+            surface = self._canvas_surface_targets.get(target.surface_id)
+            if (
+                surface is not None
+                and _get_fixed_surface_source_id(surface) is not None
+            ):
+                continue
             target_key = (target.surface_id, target.reference.key)
             if target_key in normalized_targets:
                 raise ValueError(
@@ -2961,6 +3247,8 @@ class GlbViewerWidget(QWidget):
         self._cancel_canvas_surface_edit_drag()
         self._active_canvas_surface_id = normalized_id
         self._refresh_canvas_surface_edit_gizmo_items()
+        self._refresh_canvas_face_extrusion_gizmo_items()
+        self._sync_surface_tools_controls()
         return True
 
     # ### Canvas opening edit API ###
@@ -3043,7 +3331,6 @@ class GlbViewerWidget(QWidget):
             self._set_selected_placed_object(None)
             self._selected_window_wall_surface_id = None
             self.set_selected_canvas_surface_ids(())
-            self._refresh_window_selection_outline()
         self._sync_window_tools_controls()
         if normalized_key is not None:
             self._set_window_tools_status(
@@ -3115,6 +3402,8 @@ class GlbViewerWidget(QWidget):
             self._set_add_window_button_checked(False)
             return False
 
+        if self.is_surface_vertex_placement_active():
+            self.cancel_surface_vertex_placement()
         self._set_selected_placed_object(None)
         self._set_selected_canvas_opening_key(None)
         self._window_drag_first_world = None
@@ -3175,6 +3464,12 @@ class GlbViewerWidget(QWidget):
         self.view.primary_pointer_pressed.connect(
             self._handle_placed_object_pointer_pressed
         )
+        self.view.primary_pointer_hovered.connect(
+            self._handle_surface_vertex_pointer_hovered
+        )
+        self.view.primary_pointer_left.connect(
+            self._handle_surface_vertex_pointer_left
+        )
         self.view.primary_pointer_moved.connect(
             self._handle_canvas_gizmo_pointer_moved
         )
@@ -3195,6 +3490,15 @@ class GlbViewerWidget(QWidget):
         if self.is_window_placement_active():
             self.cancel_window_placement()
 
+    def _handle_add_surface_vertex_button_toggled(self, checked: bool) -> None:
+        """Synchronize the repeated surface-vertex insertion mode."""
+
+        if checked:
+            self.begin_surface_vertex_placement()
+            return
+        if self.is_surface_vertex_placement_active():
+            self.cancel_surface_vertex_placement()
+
     def _handle_undo_window_button_clicked(self) -> None:
         self.cancel_window_placement(status_message=None)
         self.window_undo_requested.emit()
@@ -3204,11 +3508,14 @@ class GlbViewerWidget(QWidget):
             self.cancel_window_placement()
 
     def _handle_window_wall_pick_requested(self, position: QPointF) -> None:
-        if not self._window_editing_enabled or self.is_window_placement_active():
+        if (
+            not self._window_editing_enabled
+            or self.is_window_placement_active()
+            or self.is_surface_vertex_placement_active()
+        ):
             return
         additive = bool(
-            QApplication.keyboardModifiers()
-            & Qt.KeyboardModifier.ControlModifier
+            QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier
         )
         camera_ray = self.view.build_camera_ray(position)
         if camera_ray is None:
@@ -3274,9 +3581,22 @@ class GlbViewerWidget(QWidget):
         camera_ray = self.view.build_camera_ray(position)
         if camera_ray is None:
             return
+        if self.is_surface_vertex_placement_active():
+            self._begin_surface_vertex_pointer_interaction(
+                position,
+                camera_ray,
+            )
+            return
         opening_handle = self._pick_canvas_opening_gizmo_handle(*camera_ray)
         if opening_handle is not None:
             self._begin_canvas_opening_gizmo_drag(opening_handle, position)
+            return
+        extrusion_target = self._pick_canvas_face_extrusion_handle(*camera_ray)
+        if extrusion_target is not None:
+            self._begin_canvas_face_extrusion_drag(
+                extrusion_target,
+                position,
+            )
             return
         surface_edit_target = self._pick_canvas_surface_edit_handle(*camera_ray)
         if surface_edit_target is not None:
@@ -3290,35 +3610,285 @@ class GlbViewerWidget(QWidget):
     def _handle_canvas_gizmo_pointer_moved(self, position: QPointF) -> None:
         """Update the one Canvas gizmo that currently owns the pointer."""
 
+        if self._surface_vertex_click_ack_pending:
+            self._update_surface_vertex_pointer_interaction(position)
+            return
         if self._canvas_opening_edit_drag is not None:
             self._update_canvas_opening_gizmo_drag(position)
             return
         if self._canvas_surface_edit_drag is not None:
             self._update_canvas_surface_edit_drag(position)
             return
+        if self._canvas_face_extrusion_drag is not None:
+            self._update_canvas_face_extrusion_drag(position)
+            return
         self._update_placed_object_gizmo_drag(position)
 
     def _handle_canvas_gizmo_pointer_released(self, position: QPointF) -> None:
         """Finish the one Canvas gizmo that currently owns the pointer."""
 
+        if self._surface_vertex_click_ack_pending:
+            self._finish_surface_vertex_pointer_interaction(position)
+            return
         if self._canvas_opening_edit_drag is not None:
             self._finish_canvas_opening_gizmo_drag(position)
             return
         if self._canvas_surface_edit_drag is not None:
             self._finish_canvas_surface_edit_drag(position)
             return
+        if self._canvas_face_extrusion_drag is not None:
+            self._finish_canvas_face_extrusion_drag(position)
+            return
         self._finish_placed_object_gizmo_drag(position)
 
     def _cancel_canvas_gizmo_drag(self, *_args: object) -> None:
         """Cancel the Canvas gizmo that owns the pointer before navigation."""
 
+        if self._surface_vertex_click_ack_pending:
+            self._cancel_surface_vertex_pointer_interaction()
+            return
         if self._canvas_opening_edit_drag is not None:
             self._cancel_canvas_opening_edit_drag()
             return
         if self._canvas_surface_edit_drag is not None:
             self._cancel_canvas_surface_edit_drag()
             return
+        if self._canvas_face_extrusion_drag is not None:
+            self._cancel_canvas_face_extrusion_drag()
+            return
         self._cancel_placed_object_gizmo_drag()
+
+    # ### Canvas surface vertex input ###
+    def _begin_surface_vertex_pointer_interaction(
+        self,
+        position: QPointF,
+        camera_ray: tuple[np.ndarray, np.ndarray] | None = None,
+    ) -> bool:
+        """Commit the current hover candidate without starting a drag."""
+
+        self._surface_tools_status_override = None
+        preview, is_occluded = self._resolve_surface_vertex_pointer_preview(
+            position,
+            camera_ray,
+        )
+        if preview is None:
+            self._set_surface_tools_status(
+                "The surface is hidden by a placed object."
+                if is_occluded
+                else "Click directly on a surface to add or select a vertex."
+            )
+            return False
+
+        self.select_canvas_surface_target(preview.surface_id)
+        self._surface_vertex_hover_preview = preview
+        self._set_surface_vertex_preview_items(preview)
+
+        from housemaker.architectural_surface_edits import (
+            SurfaceVertexInsertionRequest,
+        )
+
+        request_arguments = {
+            "surface_id": preview.surface_id,
+            "world_point": preview.world_point,
+            "active_vertex_id": preview.active_vertex_id,
+        }
+        try:
+            request = SurfaceVertexInsertionRequest(**request_arguments)
+        except TypeError:
+            # Keep the viewer usable with projects loaded while the controller
+            # is still migrating the request model.
+            request_arguments.pop("active_vertex_id")
+            request = SurfaceVertexInsertionRequest(**request_arguments)
+        self.canvas_surface_vertex_insertion_requested.emit(request)
+        self._surface_vertex_click_ack_pending = True
+        self.view.reserve_primary_pointer_drag()
+        self._sync_surface_tools_controls()
+        return True
+
+    def _update_surface_vertex_pointer_interaction(
+        self,
+        position: QPointF,
+    ) -> bool:
+        """Compatibility wrapper for continuous hover feedback."""
+
+        return self._handle_surface_vertex_pointer_hovered(position)
+
+    def _finish_surface_vertex_pointer_interaction(
+        self,
+        _position: QPointF,
+    ) -> bool:
+        """Acknowledge legacy callers; clicks now commit on pointer press."""
+
+        committed = self._surface_vertex_click_ack_pending
+        self._surface_vertex_click_ack_pending = False
+        if committed:
+            self.view.release_primary_pointer_drag()
+        return committed
+
+    def _cancel_surface_vertex_pointer_interaction(self) -> bool:
+        """Remove hover-only feedback without modifying persistent topology."""
+
+        had_preview = bool(
+            self._surface_vertex_hover_preview is not None
+            or self._surface_vertex_preview_item is not None
+            or self._surface_vertex_preview_edge_item is not None
+        )
+        self._surface_vertex_hover_preview = None
+        self._surface_vertex_click_ack_pending = False
+        self._remove_surface_vertex_preview_items()
+        if self.view.is_primary_pointer_drag_reserved:
+            self.view.release_primary_pointer_drag()
+        return had_preview
+
+    def _handle_surface_vertex_pointer_hovered(
+        self,
+        position: QPointF,
+    ) -> bool:
+        """Show the exact snapped candidate whenever the drawing tool is armed."""
+
+        if not self.is_surface_vertex_placement_active():
+            return False
+        preview, _is_occluded = self._resolve_surface_vertex_pointer_preview(
+            position
+        )
+        if preview is None:
+            changed = self._surface_vertex_hover_preview is not None
+            self._surface_vertex_hover_preview = None
+            self._remove_surface_vertex_preview_items()
+            return changed
+        if preview == self._surface_vertex_hover_preview:
+            return False
+        self._surface_vertex_hover_preview = preview
+        self._set_surface_vertex_preview_items(preview)
+        return True
+
+    def _handle_surface_vertex_pointer_left(self) -> None:
+        """Hide only the transient hover candidate outside the viewport."""
+
+        self._surface_vertex_hover_preview = None
+        self._remove_surface_vertex_preview_items()
+
+    def _resolve_surface_vertex_pointer_preview(
+        self,
+        position: QPointF,
+        camera_ray: tuple[np.ndarray, np.ndarray] | None = None,
+    ) -> tuple[_CanvasSurfaceVertexPreview | None, bool]:
+        """Ray-pick one visible surface and resolve its local snap targets."""
+
+        ray = camera_ray or self.view.build_camera_ray(position)
+        if ray is None:
+            return None, False
+        hit = _get_nearest_fixed_surface_ray_hit(
+            tuple(self._canvas_surface_targets.values()),
+            *ray,
+            front_facing_horizontal_only=True,
+        )
+        if hit is None:
+            return None, False
+        surface, hit_point, hit_distance = hit
+        object_hit = _get_nearest_preview_placed_object_ray_hit(
+            tuple(
+                group.preview
+                for group in self._placed_object_render_groups.values()
+            ),
+            *ray,
+        )
+        if object_hit is not None and object_hit[2] < hit_distance - 1e-9:
+            return None, True
+        return (
+            _resolve_canvas_surface_vertex_preview(
+                surface,
+                hit_point,
+                tuple(self._canvas_surface_targets.values()),
+                tuple(self._canvas_surface_drawing_vertices.values()),
+                self._canvas_surface_drawing_edges,
+                self._active_surface_vertex_id,
+            ),
+            False,
+        )
+
+    def _set_surface_vertex_preview_items(
+        self,
+        preview: _CanvasSurfaceVertexPreview,
+    ) -> None:
+        """Draw the hover vertex and prospective edge through scene depth."""
+
+        point = np.asarray(preview.world_point, dtype=float)
+        color = (
+            CANVAS_SURFACE_VERTEX_SNAP_PREVIEW_COLOR
+            if preview.snap_kind in {"vertex", "edge"}
+            else CANVAS_SURFACE_VERTEX_PREVIEW_COLOR
+        )
+        item = self._surface_vertex_preview_item
+        if item is not None and item in self.view.items:
+            item.setData(pos=point[np.newaxis, :], color=color)
+        else:
+            self._remove_surface_vertex_preview_items()
+            item = gl.GLScatterPlotItem(
+                pos=point[np.newaxis, :],
+                color=color,
+                size=CANVAS_SURFACE_VERTEX_PREVIEW_SIZE_PIXELS,
+                pxMode=True,
+            )
+            item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+            item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE)
+            self._surface_vertex_preview_item = item
+            self.view.addItem(item)
+
+        active = self._canvas_surface_drawing_vertices.get(
+            preview.active_vertex_id or ""
+        )
+        if (
+            active is not None
+            and active.source_surface_id == preview.source_surface_id
+            and not np.allclose(
+                np.asarray(active.world_point, dtype=float),
+                point,
+                atol=1e-10,
+                rtol=0.0,
+            )
+        ):
+            edge_positions = np.asarray(
+                (active.world_point, preview.world_point),
+                dtype=float,
+            )
+            edge_item = self._surface_vertex_preview_edge_item
+            if edge_item is not None and edge_item in self.view.items:
+                edge_item.setData(pos=edge_positions)
+            else:
+                edge_item = gl.GLLinePlotItem(
+                    pos=edge_positions,
+                    color=CANVAS_SURFACE_VERTEX_PREVIEW_COLOR,
+                    width=CANVAS_SURFACE_DRAWING_EDGE_WIDTH,
+                    antialias=True,
+                    mode="lines",
+                )
+                edge_item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+                edge_item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE)
+                self._surface_vertex_preview_edge_item = edge_item
+                self.view.addItem(edge_item)
+        else:
+            self._remove_surface_vertex_preview_edge_item()
+        self.view.update()
+
+    def _remove_surface_vertex_preview_items(self) -> None:
+        """Remove both parts of the transient chained-placement preview."""
+
+        vertex_item = self._surface_vertex_preview_item
+        self._surface_vertex_preview_item = None
+        if vertex_item is not None and vertex_item in self.view.items:
+            self.view.removeItem(vertex_item)
+        self._remove_surface_vertex_preview_edge_item()
+        if hasattr(self, "view"):
+            self.view.update()
+
+    def _remove_surface_vertex_preview_edge_item(self) -> None:
+        """Remove the prospective edge while retaining a valid hover point."""
+
+        edge_item = self._surface_vertex_preview_edge_item
+        self._surface_vertex_preview_edge_item = None
+        if edge_item is not None and edge_item in self.view.items:
+            self.view.removeItem(edge_item)
 
     def _handle_window_pointer_pressed(self, position: QPointF) -> None:
         surface = self._get_selected_window_wall()
@@ -3442,41 +4012,11 @@ class GlbViewerWidget(QWidget):
         )
         return surface if isinstance(surface, FixedSurface) else None
 
-    def _refresh_window_selection_outline(self) -> None:
-        self._remove_window_selection_item()
-        surface = self._get_selected_window_wall()
-        if surface is None or self.model is None:
-            return
-        positions = _build_fixed_surface_boundary_line_positions(surface)
-        if positions is None:
-            return
-        positions = _offset_points_toward_camera(
-            positions,
-            _get_fixed_surface_plane_normal(surface),
-            self.view.cameraPosition(),
-            WINDOW_PREVIEW_OFFSET_METERS,
-        )
-        self._window_selection_item = gl.GLLinePlotItem(
-            pos=np.asarray(positions, dtype=float),
-            color=WINDOW_SELECTION_COLOR,
-            width=2.0,
-            antialias=True,
-            mode="lines",
-        )
-        self._window_selection_item.setGLOptions("translucent")
-        self.view.addItem(self._window_selection_item)
-        self.view.update()
+    # ### Canvas surface outline rendering ###
+    def _refresh_canvas_surface_selection_outlines(self) -> None:
+        """Render one exact yellow boundary for every selected Canvas surface."""
 
-    def _remove_window_selection_item(self) -> None:
-        item = self._window_selection_item
-        self._window_selection_item = None
-        if item is not None and item in self.view.items:
-            self.view.removeItem(item)
-
-    def _refresh_atlas_surface_selection_outlines(self) -> None:
-        """Render every editable Canvas surface selection above scene geometry."""
-
-        self._remove_atlas_surface_selection_items()
+        self._remove_canvas_surface_selection_items()
         if self.model is None:
             return
         for surface_id in self._selected_canvas_surface_ids:
@@ -3486,29 +4026,66 @@ class GlbViewerWidget(QWidget):
             positions = _build_fixed_surface_boundary_line_positions(surface)
             if positions is None:
                 continue
-            positions = _offset_points_toward_camera(
-                positions,
-                _get_fixed_surface_plane_normal(surface),
-                self.view.cameraPosition(),
-                WINDOW_PREVIEW_OFFSET_METERS * 2.0,
-            )
             item = gl.GLLinePlotItem(
                 pos=np.asarray(positions, dtype=float),
-                color=ATLAS_SURFACE_SELECTION_COLOR,
+                color=CANVAS_SURFACE_SELECTION_COLOR,
                 width=4.0,
                 antialias=True,
                 mode="lines",
             )
             item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+            item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE)
             self.view.addItem(item)
-            self._atlas_surface_selection_items.append(item)
+            self._canvas_surface_selection_items.append(item)
         self.view.update()
 
-    def _remove_atlas_surface_selection_items(self) -> None:
-        for item in self._atlas_surface_selection_items:
+    def _remove_canvas_surface_selection_items(self) -> None:
+        """Remove every canonical Canvas surface-selection boundary."""
+
+        for item in self._canvas_surface_selection_items:
             if item in self.view.items:
                 self.view.removeItem(item)
-        self._atlas_surface_selection_items = []
+        self._canvas_surface_selection_items = []
+
+    def _refresh_canvas_extrudable_face_outlines(self) -> None:
+        """Mark only unselected authored faces that can actually extrude."""
+
+        self._remove_canvas_extrudable_face_outline_items()
+        if self.model is None:
+            return
+        selected_surface_ids = set(self._selected_canvas_surface_ids)
+        for surface_id, surface in self._canvas_surface_targets.items():
+            if (
+                surface_id in selected_surface_ids
+                or not surface.is_directly_drawn
+            ):
+                continue
+            target = _build_canvas_face_extrusion_target(
+                self._canvas_surface_targets,
+                (surface_id,),
+            )
+            if target is None:
+                continue
+            item = gl.GLLinePlotItem(
+                pos=np.asarray(target.boundary_line_positions, dtype=float),
+                color=CANVAS_EXTRUDABLE_FACE_OUTLINE_COLOR,
+                width=CANVAS_EXTRUDABLE_FACE_OUTLINE_WIDTH,
+                antialias=True,
+                mode="lines",
+            )
+            item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+            item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE)
+            self.view.addItem(item)
+            self._canvas_extrudable_face_outline_items.append(item)
+        self.view.update()
+
+    def _remove_canvas_extrudable_face_outline_items(self) -> None:
+        """Remove every blue extrudability boundary."""
+
+        for item in self._canvas_extrudable_face_outline_items:
+            if item in self.view.items:
+                self.view.removeItem(item)
+        self._canvas_extrudable_face_outline_items = []
 
     def _refresh_atlas_surface_highlight_outlines(self) -> None:
         """Render non-selecting Atlas surface highlights in green."""
@@ -3547,6 +4124,7 @@ class GlbViewerWidget(QWidget):
                 self.view.removeItem(item)
         self._atlas_surface_highlight_items = []
 
+    # ### Canvas window preview rendering ###
     def _set_window_preview_item(
         self,
         surface: FixedSurface,
@@ -3662,6 +4240,72 @@ class GlbViewerWidget(QWidget):
         if self.window_tools_status_label is not None:
             self.window_tools_status_label.setText(str(message))
 
+    # ### Canvas surface tool controls ###
+    def _sync_surface_tools_controls(self) -> None:
+        """Update insertion availability and explain extrusion readiness."""
+
+        has_surfaces = bool(self._canvas_surface_targets)
+        if self.add_surface_vertex_button is not None:
+            self.add_surface_vertex_button.setEnabled(has_surfaces)
+        if self._surface_tools_status_override is not None:
+            self._set_surface_tools_status(
+                self._surface_tools_status_override
+            )
+            return
+        if self.is_surface_vertex_placement_active():
+            if self._active_surface_vertex_id is not None:
+                self._set_surface_tools_status(
+                    "Hover to preview the next snapped vertex. Click to draw "
+                    "an edge, or click an existing vertex to continue from it."
+                )
+            else:
+                self._set_surface_tools_status(
+                    "Hover to preview a snapped vertex. Click to select or "
+                    "place the first vertex."
+                )
+            return
+
+        selected = tuple(
+            self._canvas_surface_targets[surface_id]
+            for surface_id in self._selected_canvas_surface_ids
+            if surface_id in self._canvas_surface_targets
+        )
+        child_selection = tuple(
+            surface
+            for surface in selected
+            if _get_fixed_surface_source_id(surface) is not None
+        )
+        if self._canvas_face_extrusion_target is not None:
+            self._set_surface_tools_status(
+                "Drag the green normal handle to extrude the selected face or "
+                "connected faces."
+            )
+        elif child_selection:
+            self._set_surface_tools_status(
+                "Extrusion requires connected coplanar faces from one "
+                "edited surface."
+            )
+        elif selected:
+            self._set_surface_tools_status(
+                "Click Add vertex to draw vertices, split a surface between "
+                "two edges, or close a face."
+            )
+        else:
+            self._set_surface_tools_status(
+                "Select a surface to add vertices."
+            )
+
+    def _set_add_surface_vertex_button_checked(self, checked: bool) -> None:
+        if self.add_surface_vertex_button is None:
+            return
+        was_blocked = self.add_surface_vertex_button.blockSignals(True)
+        self.add_surface_vertex_button.setChecked(bool(checked))
+        self.add_surface_vertex_button.blockSignals(was_blocked)
+
+    def _set_surface_tools_status(self, message: str) -> None:
+        if self.surface_tools_status_label is not None:
+            self.surface_tools_status_label.setText(str(message))
+
     def focus_navigation(self) -> None:
         """Give the OpenGL viewport input focus after external reparenting."""
 
@@ -3739,6 +4383,8 @@ class GlbViewerWidget(QWidget):
         self.view.cancel_transient_pointer_interactions()
         self._cancel_canvas_opening_edit_drag()
         self._cancel_canvas_surface_edit_drag()
+        self._cancel_canvas_face_extrusion_drag()
+        self._cancel_surface_vertex_pointer_interaction()
         self._cancel_placed_object_gizmo_drag()
         self.clear_face_edit_geometry()
         if self._window_editing_enabled:
@@ -3751,15 +4397,18 @@ class GlbViewerWidget(QWidget):
         self._populate_scene()
         if camera_state is not None:
             self._restore_camera_state(camera_state)
-            self._refresh_window_selection_outline()
             self._refresh_canvas_surface_edit_gizmo_items()
+            self._refresh_canvas_face_extrusion_gizmo_items()
         if self._window_editing_enabled:
             self._sync_window_tools_controls()
+            self._sync_surface_tools_controls()
 
     def clear_model(self) -> None:
         self.view.cancel_transient_pointer_interactions()
         self._cancel_canvas_opening_edit_drag()
         self._cancel_canvas_surface_edit_drag()
+        self._cancel_canvas_face_extrusion_drag()
+        self.cancel_surface_vertex_placement()
         self._cancel_placed_object_gizmo_drag()
         self.clear_face_edit_geometry()
         had_selected_placed_object = self._selected_placed_object_id is not None
@@ -3769,6 +4418,9 @@ class GlbViewerWidget(QWidget):
         self._set_selected_canvas_opening_key(None)
         if self._window_editing_enabled:
             self.cancel_window_placement(status_message=None)
+        self._canvas_surface_drawing_vertices = {}
+        self._canvas_surface_drawing_edges = ()
+        self._active_surface_vertex_id = None
         self._texture_edit_mask = None
         self._clear_symmetric_preview()
         self._last_set_model_preserved_camera = False
@@ -3776,10 +4428,11 @@ class GlbViewerWidget(QWidget):
         self._populate_scene()
         if self._window_editing_enabled:
             self._sync_window_tools_controls()
+            self._sync_surface_tools_controls()
 
     # ### Face editor API ###
     def set_face_editing_enabled(self, enabled: bool) -> None:
-        """Enable or disable Ctrl-based face-selection input."""
+        """Enable or disable Shift-based face-selection input."""
 
         normalized_enabled = bool(enabled)
         if normalized_enabled == self._face_editing_enabled:
@@ -4962,11 +5615,13 @@ class GlbViewerWidget(QWidget):
         self._add_grid()
         if self.model is None:
             self._set_default_camera()
-            self._refresh_window_selection_outline()
-            self._refresh_atlas_surface_selection_outlines()
+            self._refresh_canvas_surface_selection_outlines()
+            self._refresh_canvas_extrudable_face_outlines()
             self._refresh_atlas_surface_highlight_outlines()
             self._refresh_canvas_opening_gizmo_items()
+            self._refresh_canvas_surface_drawing_items()
             self._refresh_canvas_surface_edit_gizmo_items()
+            self._refresh_canvas_face_extrusion_gizmo_items()
             self._refresh_doorway_preview_outline_item()
             return
 
@@ -5054,11 +5709,13 @@ class GlbViewerWidget(QWidget):
         self.view.remember_orbit_camera_state()
         self._set_default_first_person_camera_pose_from_bounding_box(bounding_box)
         self.view.apply_navigation_camera()
-        self._refresh_window_selection_outline()
-        self._refresh_atlas_surface_selection_outlines()
+        self._refresh_canvas_surface_selection_outlines()
+        self._refresh_canvas_extrudable_face_outlines()
         self._refresh_atlas_surface_highlight_outlines()
         self._refresh_canvas_opening_gizmo_items()
+        self._refresh_canvas_surface_drawing_items()
         self._refresh_canvas_surface_edit_gizmo_items()
+        self._refresh_canvas_face_extrusion_gizmo_items()
         self._sync_placed_object_selection_rendering()
         self._refresh_doorway_preview_outline_item()
         self.view.update()
@@ -5283,7 +5940,7 @@ class GlbViewerWidget(QWidget):
         outline_color = (
             CANVAS_OPENING_PREVIEW_COLOR
             if drag is not None
-            else CANVAS_OPENING_SELECTION_COLOR
+            else CANVAS_SURFACE_SELECTION_COLOR
         )
         outline_item = gl.GLLinePlotItem(
             pos=np.vstack((display_corners, display_corners[:1])),
@@ -5596,21 +6253,21 @@ class GlbViewerWidget(QWidget):
             return
 
         drag = self._canvas_surface_edit_drag
-        outline_positions = _build_canvas_surface_edit_outline_positions(
-            surface,
-            drag,
-            baseline_positions=(
-                pending_outline if pending_outline_matches_surface else None
-            ),
-        )
+        is_previewing_edit = drag is not None or pending_outline_matches_surface
+        if is_previewing_edit:
+            outline_positions = _build_canvas_surface_edit_outline_positions(
+                surface,
+                drag,
+                baseline_positions=(
+                    pending_outline if pending_outline_matches_surface else None
+                ),
+            )
+        else:
+            outline_positions = None
         if outline_positions is not None:
             outline_item = gl.GLLinePlotItem(
                 pos=np.asarray(outline_positions, dtype=float),
-                color=(
-                    CANVAS_SURFACE_EDIT_PREVIEW_COLOR
-                    if drag is not None or pending_outline_matches_surface
-                    else CANVAS_SURFACE_EDIT_SELECTION_COLOR
-                ),
+                color=CANVAS_SURFACE_EDIT_PREVIEW_COLOR,
                 width=CANVAS_SURFACE_EDIT_OUTLINE_WIDTH,
                 antialias=True,
                 mode="lines",
@@ -5917,6 +6574,352 @@ class GlbViewerWidget(QWidget):
         self.canvas_surface_edit_cancelled.emit(
             _build_canvas_surface_edit(drag.target, 0.0)
         )
+        return True
+
+    # ### Canvas surface drawing overlay ###
+    def _refresh_canvas_surface_drawing_items(self) -> None:
+        """Draw manual vertices and only the currently unfinished edge graph."""
+
+        self._remove_canvas_surface_drawing_items()
+        if not hasattr(self, "view") or self.model is None:
+            return
+
+        placement_active = self.is_surface_vertex_placement_active()
+        if placement_active and self._canvas_surface_drawing_edges:
+            edge_positions = np.asarray(
+                tuple(
+                    point
+                    for edge in self._canvas_surface_drawing_edges
+                    for point in (
+                        edge.start_world_point,
+                        edge.end_world_point,
+                    )
+                ),
+                dtype=float,
+            )
+            edge_item = gl.GLLinePlotItem(
+                pos=edge_positions,
+                color=CANVAS_SURFACE_DRAWING_EDGE_COLOR,
+                width=CANVAS_SURFACE_DRAWING_EDGE_WIDTH,
+                antialias=True,
+                mode="lines",
+            )
+            self._add_canvas_surface_drawing_item(edge_item)
+
+        selected_surface_ids = set(self._selected_canvas_surface_ids)
+        active_vertex_id = (
+            self._active_surface_vertex_id if placement_active else None
+        )
+        inactive_vertices = tuple(
+            vertex.world_point
+            for vertex in self._canvas_surface_drawing_vertices.values()
+            if vertex.show_marker
+            and vertex.vertex_id != active_vertex_id
+            and not any(
+                surface_id in selected_surface_ids
+                for surface_id in vertex.direct_face_surface_ids
+            )
+        )
+        if inactive_vertices:
+            vertex_item = gl.GLScatterPlotItem(
+                pos=np.asarray(inactive_vertices, dtype=float),
+                color=CANVAS_SURFACE_DRAWING_VERTEX_COLOR,
+                size=CANVAS_SURFACE_DRAWING_VERTEX_SIZE_PIXELS,
+                pxMode=True,
+            )
+            self._add_canvas_surface_drawing_item(vertex_item)
+
+        active = self._canvas_surface_drawing_vertices.get(
+            active_vertex_id or ""
+        )
+        if placement_active and active is not None:
+            active_item = gl.GLScatterPlotItem(
+                pos=np.asarray((active.world_point,), dtype=float),
+                color=CANVAS_SURFACE_ACTIVE_VERTEX_COLOR,
+                size=CANVAS_SURFACE_ACTIVE_VERTEX_SIZE_PIXELS,
+                pxMode=True,
+            )
+            self._add_canvas_surface_drawing_item(active_item)
+        self.view.update()
+
+    def _add_canvas_surface_drawing_item(self, item: GLGraphicsItem) -> None:
+        """Render authored topology targets above solid surface depth."""
+
+        item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+        item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE)
+        self.view.addItem(item)
+        self._canvas_surface_drawing_items.append(item)
+
+    def _remove_canvas_surface_drawing_items(self) -> None:
+        """Remove every manual-vertex and open-chain marker."""
+
+        if not hasattr(self, "view"):
+            self._canvas_surface_drawing_items = []
+            return
+        for item in self._canvas_surface_drawing_items:
+            if item in self.view.items:
+                self.view.removeItem(item)
+        self._canvas_surface_drawing_items = []
+
+    # ### Canvas editable-face extrusion gizmo rendering ###
+    def _refresh_canvas_face_extrusion_gizmo_items(self) -> None:
+        """Draw one normal handle for a valid logical-face selection."""
+
+        self._remove_canvas_face_extrusion_gizmo_items()
+        if not hasattr(self, "view"):
+            self._canvas_face_extrusion_target = None
+            return
+        if self.is_surface_vertex_placement_active():
+            self._canvas_face_extrusion_target = None
+            self._sync_surface_tools_controls()
+            self.view.update()
+            return
+        drag = self._canvas_face_extrusion_drag
+        target = (
+            drag.target
+            if drag is not None
+            else _build_canvas_face_extrusion_target(
+                self._canvas_surface_targets,
+                self._selected_canvas_surface_ids,
+            )
+        )
+        self._canvas_face_extrusion_target = target
+        if target is None or self.model is None:
+            self._sync_surface_tools_controls()
+            self.view.update()
+            return
+
+        axis = np.asarray(target.normal_world, dtype=float)
+        origin = np.asarray(target.center_world, dtype=float)
+        if drag is not None:
+            origin = origin + axis * drag.preview_delta_meters
+            preview_positions = _build_canvas_face_extrusion_preview_positions(
+                target,
+                drag.preview_delta_meters,
+            )
+            if preview_positions is not None:
+                preview_item = gl.GLLinePlotItem(
+                    pos=preview_positions,
+                    color=CANVAS_FACE_EXTRUSION_PREVIEW_COLOR,
+                    width=CANVAS_SURFACE_EDIT_OUTLINE_WIDTH,
+                    antialias=True,
+                    mode="lines",
+                )
+                self._add_canvas_face_extrusion_overlay_item(preview_item)
+
+        self._canvas_face_extrusion_gizmo_size = (
+            self._get_canvas_face_extrusion_gizmo_size(origin)
+        )
+        endpoint = (
+            origin + axis * self._canvas_face_extrusion_gizmo_size
+        )
+        axis_item = gl.GLLinePlotItem(
+            pos=np.asarray((origin, endpoint), dtype=float),
+            color=CANVAS_FACE_EXTRUSION_COLOR,
+            width=CANVAS_FACE_EXTRUSION_GIZMO_LINE_WIDTH,
+            antialias=True,
+            mode="lines",
+        )
+        self._add_canvas_face_extrusion_overlay_item(axis_item)
+        endpoint_item = gl.GLScatterPlotItem(
+            pos=np.asarray((endpoint,), dtype=float),
+            color=CANVAS_FACE_EXTRUSION_COLOR,
+            size=CANVAS_FACE_EXTRUSION_GIZMO_ENDPOINT_SIZE_PIXELS,
+            pxMode=True,
+        )
+        self._add_canvas_face_extrusion_overlay_item(endpoint_item)
+        self._sync_surface_tools_controls()
+        self.view.update()
+
+    def _get_canvas_face_extrusion_gizmo_size(
+        self,
+        origin: np.ndarray,
+    ) -> float:
+        """Resolve an approximately screen-sized face-normal handle."""
+
+        try:
+            pixel_size = float(
+                self.view.pixelSize(
+                    QVector3D(*[float(value) for value in origin])
+                )
+            )
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            pixel_size = 0.0
+        if math.isfinite(pixel_size) and pixel_size > 0.0:
+            return max(
+                CANVAS_FACE_EXTRUSION_GIZMO_MIN_SIZE_METERS,
+                pixel_size * CANVAS_FACE_EXTRUSION_GIZMO_SCREEN_SIZE_PIXELS,
+            )
+        return CANVAS_FACE_EXTRUSION_GIZMO_MIN_SIZE_METERS
+
+    def _add_canvas_face_extrusion_overlay_item(
+        self,
+        item: GLGraphicsItem,
+    ) -> None:
+        """Render face-extrusion feedback above all structural geometry."""
+
+        item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+        item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE)
+        self.view.addItem(item)
+        self._canvas_face_extrusion_gizmo_items.append(item)
+
+    def _remove_canvas_face_extrusion_gizmo_items(self) -> None:
+        if not hasattr(self, "view"):
+            self._canvas_face_extrusion_gizmo_items = []
+            return
+        for item in self._canvas_face_extrusion_gizmo_items:
+            if item in self.view.items:
+                self.view.removeItem(item)
+        self._canvas_face_extrusion_gizmo_items = []
+
+    def _pick_canvas_face_extrusion_handle(
+        self,
+        ray_origin: object,
+        ray_direction: object,
+    ) -> _CanvasFaceExtrusionTarget | None:
+        """CPU-pick the selected region's prominent normal-axis segment."""
+
+        target = self._canvas_face_extrusion_target
+        origin, direction = _normalize_ray(ray_origin, ray_direction)
+        if target is None or origin is None or direction is None:
+            return None
+        handle_origin = np.asarray(target.center_world, dtype=float)
+        if self._canvas_face_extrusion_drag is not None:
+            handle_origin = (
+                handle_origin
+                + np.asarray(target.normal_world, dtype=float)
+                * self._canvas_face_extrusion_drag.preview_delta_meters
+            )
+        handle_end = (
+            handle_origin
+            + np.asarray(target.normal_world, dtype=float)
+            * self._canvas_face_extrusion_gizmo_size
+        )
+        distance = _get_ray_segment_distance(
+            origin,
+            direction,
+            handle_origin,
+            handle_end,
+        )
+        if distance is None:
+            return None
+        tolerance = max(
+            CANVAS_FACE_EXTRUSION_GIZMO_MIN_HIT_RADIUS_METERS,
+            self._canvas_face_extrusion_gizmo_size
+            * CANVAS_FACE_EXTRUSION_GIZMO_HIT_RATIO,
+        )
+        return target if distance <= tolerance else None
+
+    # ### Canvas editable-face extrusion dragging ###
+    def _begin_canvas_face_extrusion_drag(
+        self,
+        target: _CanvasFaceExtrusionTarget,
+        position: QPointF,
+    ) -> bool:
+        """Reserve primary input and snapshot one selected face region."""
+
+        self._surface_tools_status_override = None
+        if target is not self._canvas_face_extrusion_target:
+            return False
+        camera_ray = self.view.build_camera_ray(position)
+        if camera_ray is None:
+            return False
+        ray_origin, ray_direction = camera_ray
+        axis = np.asarray(target.normal_world, dtype=float)
+        drag_plane_normal = _build_axis_drag_plane_normal(axis, ray_direction)
+        target_origin = np.asarray(target.center_world, dtype=float)
+        hit = _intersect_ray_with_plane(
+            ray_origin,
+            ray_direction,
+            target_origin,
+            drag_plane_normal,
+        )
+        if hit is None:
+            return False
+        self._canvas_face_extrusion_drag = _CanvasFaceExtrusionDrag(
+            target=target,
+            axis=axis,
+            drag_plane_normal=drag_plane_normal,
+            start_axis_parameter=float(np.dot(hit - target_origin, axis)),
+        )
+        self.view.reserve_primary_pointer_drag()
+        self._refresh_canvas_face_extrusion_gizmo_items()
+        return True
+
+    def _update_canvas_face_extrusion_drag(self, position: QPointF) -> bool:
+        """Move only lightweight outlines along the selected face normal."""
+
+        drag = self._canvas_face_extrusion_drag
+        camera_ray = self.view.build_camera_ray(position)
+        if drag is None or camera_ray is None:
+            return False
+        target_origin = np.asarray(drag.target.center_world, dtype=float)
+        hit = _intersect_ray_with_plane(
+            *camera_ray,
+            target_origin,
+            drag.drag_plane_normal,
+        )
+        if hit is None:
+            return False
+        axis_parameter = float(np.dot(hit - target_origin, drag.axis))
+        delta_meters = float(
+            np.clip(
+                axis_parameter - drag.start_axis_parameter,
+                -CANVAS_FACE_EXTRUSION_MAX_DISTANCE_METERS,
+                CANVAS_FACE_EXTRUSION_MAX_DISTANCE_METERS,
+            )
+        )
+        if math.isclose(
+            delta_meters,
+            drag.preview_delta_meters,
+            abs_tol=1e-9,
+            rel_tol=0.0,
+        ):
+            return False
+        drag.preview_delta_meters = delta_meters
+        self._refresh_canvas_face_extrusion_gizmo_items()
+        return True
+
+    def _finish_canvas_face_extrusion_drag(self, position: QPointF) -> bool:
+        """Emit one signed extrusion request after the pointer is released."""
+
+        drag = self._canvas_face_extrusion_drag
+        if drag is None:
+            return False
+        self._update_canvas_face_extrusion_drag(position)
+        drag = self._canvas_face_extrusion_drag
+        if drag is None:
+            return False
+        changed = not math.isclose(
+            drag.preview_delta_meters,
+            0.0,
+            abs_tol=1e-9,
+            rel_tol=0.0,
+        )
+        self._canvas_face_extrusion_drag = None
+        self.view.release_primary_pointer_drag()
+        if changed:
+            from housemaker.architectural_surface_edits import (
+                SurfaceFaceExtrusionRequest,
+            )
+
+            self.canvas_surface_face_extrusion_requested.emit(
+                SurfaceFaceExtrusionRequest(
+                    surface_ids=drag.target.surface_ids,
+                    delta_meters=drag.preview_delta_meters,
+                )
+            )
+        self._refresh_canvas_face_extrusion_gizmo_items()
+        return changed
+
+    def _cancel_canvas_face_extrusion_drag(self, *_args: object) -> bool:
+        """Restore the selected region's zero-displacement gizmo."""
+
+        if self._canvas_face_extrusion_drag is None:
+            return False
+        self._canvas_face_extrusion_drag = None
+        self.view.release_primary_pointer_drag()
+        self._refresh_canvas_face_extrusion_gizmo_items()
         return True
 
     # ### Placed-object selection and gizmo rendering ###
@@ -6476,13 +7479,17 @@ class GlbViewerWidget(QWidget):
         self._canvas_opening_gizmo_items = []
         self._canvas_surface_edit_gizmo_items = []
         self._canvas_surface_edit_gizmo_sizes = {}
+        self._canvas_surface_drawing_items = []
+        self._canvas_face_extrusion_gizmo_items = []
+        self._surface_vertex_preview_item = None
+        self._surface_vertex_preview_edge_item = None
         self.textured_surface_items = []
         self.textured_wall_items = []
         self.projection_camera_indicator_items = {}
         self.projection_camera_indicator_geometries = {}
         self._sync_projection_camera_input_state()
-        self._window_selection_item = None
-        self._atlas_surface_selection_items = []
+        self._canvas_surface_selection_items = []
+        self._canvas_extrudable_face_outline_items = []
         self._atlas_surface_highlight_items = []
         self._window_preview_item = None
         self._doorway_preview_outline_item = None
@@ -7198,6 +8205,923 @@ def _build_canvas_surface_edit_outline_positions(
     return preview_positions
 
 
+# ### Canvas editable-face helpers ###
+def _get_fixed_surface_source_id(surface: FixedSurface) -> str | None:
+    """Return a child face's stable source ID, if this is an edited face."""
+
+    raw_source_id = getattr(surface, "source_surface_id", None)
+    if raw_source_id is None:
+        return None
+    source_id = str(raw_source_id).strip()
+    return source_id or None
+
+
+def _build_canvas_face_extrusion_target(
+    surfaces_by_id: Mapping[str, FixedSurface],
+    selected_surface_ids: Sequence[str],
+) -> _CanvasFaceExtrusionTarget | None:
+    """Resolve one connected coplanar child-face selection into a gizmo."""
+
+    normalized_surface_ids = tuple(selected_surface_ids)
+    selected = tuple(
+        surfaces_by_id[surface_id]
+        for surface_id in normalized_surface_ids
+        if surface_id in surfaces_by_id
+    )
+    if not selected or len(selected) != len(normalized_surface_ids):
+        return None
+    source_ids = tuple(
+        _get_fixed_surface_source_id(surface) for surface in selected
+    )
+    if any(source_id is None for source_id in source_ids):
+        return None
+    unique_source_ids = set(source_ids)
+    if len(unique_source_ids) != 1:
+        return None
+
+    surface_geometry: list[
+        tuple[FixedSurface, np.ndarray, np.ndarray, float, np.ndarray]
+    ] = []
+    for surface in selected:
+        geometry = _get_fixed_surface_area_center_normal(surface)
+        if geometry is None:
+            return None
+        center, normal, area = geometry
+        boundary = _build_fixed_surface_boundary_line_positions(surface)
+        if boundary is None:
+            return None
+        surface_geometry.append((surface, center, normal, area, boundary))
+
+    reference_center = surface_geometry[0][1]
+    reference_normal = surface_geometry[0][2]
+    edge_keys_by_surface: list[set[tuple[tuple[int, ...], tuple[int, ...]]]] = []
+    for surface, _center, normal, _area, boundary in surface_geometry:
+        if float(np.dot(reference_normal, normal)) < (
+            1.0 - CANVAS_FACE_COPLANAR_NORMAL_TOLERANCE
+        ):
+            return None
+        vertices = np.asarray(surface.mesh.vertices, dtype=float)
+        plane_distances = np.abs(
+            (vertices - reference_center[np.newaxis, :]) @ reference_normal
+        )
+        if (
+            len(plane_distances)
+            and float(np.max(plane_distances))
+            > CANVAS_FACE_COPLANAR_DISTANCE_TOLERANCE_METERS
+        ):
+            return None
+        edge_keys_by_surface.append(
+            {
+                _build_canvas_face_edge_key(first, second)
+                for first, second in boundary.reshape((-1, 2, 3))
+            }
+        )
+    if not _canvas_face_surfaces_are_connected(edge_keys_by_surface):
+        return None
+
+    total_area = float(sum(item[3] for item in surface_geometry))
+    if not math.isfinite(total_area) or total_area <= 1e-12:
+        return None
+    center = sum(
+        (item[1] * item[3] for item in surface_geometry),
+        start=np.zeros(3, dtype=float),
+    ) / total_area
+    boundary_positions = _build_canvas_face_region_boundary_positions(
+        tuple(item[4] for item in surface_geometry)
+    )
+    if boundary_positions is None:
+        return None
+    source_surface_id = next(iter(unique_source_ids))
+    assert source_surface_id is not None
+    return _CanvasFaceExtrusionTarget(
+        source_surface_id=source_surface_id,
+        surface_ids=tuple(surface.surface_id for surface in selected),
+        center_world=_world_point_tuple(center),
+        normal_world=_world_point_tuple(reference_normal),
+        boundary_line_positions=boundary_positions,
+    )
+
+
+def _get_fixed_surface_area_center_normal(
+    surface: FixedSurface,
+) -> tuple[np.ndarray, np.ndarray, float] | None:
+    """Return a finite area-weighted center and consistently wound normal."""
+
+    vertices = np.asarray(surface.mesh.vertices, dtype=float)
+    faces = np.asarray(surface.mesh.faces, dtype=np.int64)
+    if (
+        vertices.ndim != 2
+        or vertices.shape[1:] != (3,)
+        or faces.ndim != 2
+        or faces.shape[1:] != (3,)
+        or not len(vertices)
+        or not len(faces)
+        or not np.all(np.isfinite(vertices))
+        or np.any(faces < 0)
+        or np.any(faces >= len(vertices))
+    ):
+        return None
+    triangles = vertices[faces]
+    crosses = np.cross(
+        triangles[:, 1] - triangles[:, 0],
+        triangles[:, 2] - triangles[:, 0],
+    )
+    doubled_areas = np.linalg.norm(crosses, axis=1)
+    usable = doubled_areas > 1e-12
+    if not np.any(usable):
+        return None
+    reference_cross = crosses[int(np.flatnonzero(usable)[0])]
+    aligned_crosses = crosses.copy()
+    reversed_mask = (aligned_crosses @ reference_cross) < 0.0
+    aligned_crosses[reversed_mask] *= -1.0
+    combined_normal = np.sum(aligned_crosses[usable], axis=0)
+    normal_length = float(np.linalg.norm(combined_normal))
+    if normal_length <= 1e-12:
+        return None
+    areas = doubled_areas[usable] * 0.5
+    area = float(np.sum(areas))
+    centers = np.mean(triangles[usable], axis=1)
+    center = np.sum(centers * areas[:, np.newaxis], axis=0) / area
+    return center, combined_normal / normal_length, area
+
+
+def _build_canvas_face_edge_key(
+    first: object,
+    second: object,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Quantize an undirected world edge for topology adjacency."""
+
+    scale = 1.0 / CANVAS_FACE_SHARED_EDGE_TOLERANCE_METERS
+    first_key = tuple(
+        int(round(float(value) * scale))
+        for value in np.asarray(first, dtype=float)
+    )
+    second_key = tuple(
+        int(round(float(value) * scale))
+        for value in np.asarray(second, dtype=float)
+    )
+    if first_key <= second_key:
+        return first_key, second_key
+    return second_key, first_key
+
+
+def _canvas_face_surfaces_are_connected(
+    edge_keys_by_surface: Sequence[
+        set[tuple[tuple[int, ...], tuple[int, ...]]]
+    ],
+) -> bool:
+    """Return whether every selected logical face shares an edge path."""
+
+    if len(edge_keys_by_surface) <= 1:
+        return True
+    reached = {0}
+    pending = [0]
+    while pending:
+        current = pending.pop()
+        current_edges = edge_keys_by_surface[current]
+        for candidate, candidate_edges in enumerate(edge_keys_by_surface):
+            if candidate in reached or not current_edges.intersection(
+                candidate_edges
+            ):
+                continue
+            reached.add(candidate)
+            pending.append(candidate)
+    return len(reached) == len(edge_keys_by_surface)
+
+
+def _build_canvas_face_region_boundary_positions(
+    surface_boundaries: Sequence[np.ndarray],
+) -> np.ndarray | None:
+    """Cancel shared logical edges and return paired outer-region lines."""
+
+    edge_entries: dict[
+        tuple[tuple[int, ...], tuple[int, ...]],
+        list[tuple[np.ndarray, np.ndarray]],
+    ] = {}
+    for boundary in surface_boundaries:
+        positions = np.asarray(boundary, dtype=float)
+        if positions.ndim != 2 or positions.shape[1:] != (3,) or len(positions) % 2:
+            return None
+        for first, second in positions.reshape((-1, 2, 3)):
+            edge_entries.setdefault(
+                _build_canvas_face_edge_key(first, second),
+                [],
+            ).append((first, second))
+    outer_edges = tuple(
+        entries[0]
+        for entries in edge_entries.values()
+        if len(entries) == 1
+    )
+    if not outer_edges:
+        return None
+    return np.asarray(outer_edges, dtype=float).reshape((-1, 3))
+
+
+def _build_canvas_face_extrusion_preview_positions(
+    target: _CanvasFaceExtrusionTarget,
+    delta_meters: float,
+) -> np.ndarray | None:
+    """Build base, displaced, and connector lines for a live extrusion."""
+
+    boundary = np.asarray(target.boundary_line_positions, dtype=float)
+    if (
+        boundary.ndim != 2
+        or boundary.shape[1:] != (3,)
+        or len(boundary) == 0
+        or len(boundary) % 2
+    ):
+        return None
+    offset = np.asarray(target.normal_world, dtype=float) * float(delta_meters)
+    displaced = boundary + offset[np.newaxis, :]
+    unique_vertices: dict[tuple[int, ...], np.ndarray] = {}
+    scale = 1.0 / CANVAS_FACE_SHARED_EDGE_TOLERANCE_METERS
+    for vertex in boundary:
+        key = tuple(int(round(float(value) * scale)) for value in vertex)
+        unique_vertices.setdefault(key, vertex)
+    connectors = np.asarray(
+        tuple(
+            point
+            for vertex in unique_vertices.values()
+            for point in (vertex, vertex + offset)
+        ),
+        dtype=float,
+    )
+    return np.vstack((boundary, displaced, connectors))
+
+
+# ### Canvas surface drawing helpers ###
+def _normalize_canvas_surface_drawing_overlay(
+    overlay: object,
+) -> tuple[
+    tuple[_CanvasSurfaceDrawingVertex, ...],
+    tuple[_CanvasSurfaceDrawingEdge, ...],
+]:
+    """Normalize the controller's immutable world-space drawing overlay."""
+
+    if overlay is None:
+        return (), ()
+    raw_vertices = getattr(overlay, "vertices", None)
+    raw_edges = getattr(overlay, "edges", None)
+    if raw_vertices is None and raw_edges is None:
+        try:
+            raw_vertices, raw_edges = overlay  # type: ignore[misc]
+        except (TypeError, ValueError) as error:
+            raise TypeError(
+                "A Canvas surface drawing overlay needs vertices and edges."
+            ) from error
+    try:
+        vertex_values = tuple(raw_vertices or ())
+        edge_values = tuple(raw_edges or ())
+    except TypeError as error:
+        raise TypeError(
+            "Canvas surface drawing vertices and edges must be sequences."
+        ) from error
+
+    vertices: list[_CanvasSurfaceDrawingVertex] = []
+    seen_vertex_ids: set[str] = set()
+    for value in vertex_values:
+        vertex_id = str(getattr(value, "vertex_id", "")).strip()
+        source_surface_id = str(
+            getattr(value, "source_surface_id", "")
+        ).strip()
+        if not vertex_id or not source_surface_id:
+            raise ValueError(
+                "Surface drawing vertices need vertex and source-surface IDs."
+            )
+        if vertex_id in seen_vertex_ids:
+            raise ValueError(f"Duplicate surface drawing vertex: {vertex_id!r}.")
+        show_marker = getattr(value, "show_marker", True)
+        if not isinstance(show_marker, bool):
+            raise TypeError("Surface drawing marker state must be boolean.")
+        try:
+            direct_face_surface_ids = tuple(
+                dict.fromkeys(
+                    str(surface_id).strip()
+                    for surface_id in getattr(
+                        value,
+                        "direct_face_surface_ids",
+                        (),
+                    )
+                    if str(surface_id).strip()
+                )
+            )
+        except TypeError as error:
+            raise ValueError(
+                "Surface drawing face IDs must contain a sequence."
+            ) from error
+        seen_vertex_ids.add(vertex_id)
+        vertices.append(
+            _CanvasSurfaceDrawingVertex(
+                vertex_id=vertex_id,
+                source_surface_id=source_surface_id,
+                world_point=_world_point_tuple(
+                    getattr(value, "world_point", None)
+                ),
+                show_marker=show_marker,
+                direct_face_surface_ids=direct_face_surface_ids,
+            )
+        )
+
+    edges: list[_CanvasSurfaceDrawingEdge] = []
+    for value in edge_values:
+        source_surface_id = str(
+            getattr(value, "source_surface_id", "")
+        ).strip()
+        raw_vertex_ids = getattr(value, "vertex_ids", None)
+        if raw_vertex_ids is None:
+            raw_vertex_ids = (
+                getattr(value, "start_vertex_id", ""),
+                getattr(value, "end_vertex_id", ""),
+            )
+        raw_world_points = getattr(value, "world_points", None)
+        if raw_world_points is None:
+            raw_world_points = (
+                getattr(value, "start_world_point", None),
+                getattr(value, "end_world_point", None),
+            )
+        try:
+            vertex_ids = tuple(str(item).strip() for item in raw_vertex_ids)
+            world_points = tuple(
+                _world_point_tuple(item) for item in raw_world_points
+            )
+        except TypeError as error:
+            raise ValueError(
+                "Surface drawing edges need two vertices and world points."
+            ) from error
+        if (
+            not source_surface_id
+            or len(vertex_ids) != 2
+            or len(world_points) != 2
+            or not all(vertex_ids)
+            or vertex_ids[0] == vertex_ids[1]
+        ):
+            raise ValueError(
+                "Surface drawing edges need two distinct vertex endpoints."
+            )
+        edges.append(
+            _CanvasSurfaceDrawingEdge(
+                source_surface_id=source_surface_id,
+                start_vertex_id=vertex_ids[0],
+                end_vertex_id=vertex_ids[1],
+                start_world_point=world_points[0],
+                end_world_point=world_points[1],
+            )
+        )
+    return tuple(vertices), tuple(edges)
+
+
+def _resolve_canvas_surface_vertex_preview(
+    surface: FixedSurface,
+    world_point: object,
+    surfaces: Sequence[FixedSurface],
+    vertices: Sequence[_CanvasSurfaceDrawingVertex],
+    edges: Sequence[_CanvasSurfaceDrawingEdge],
+    active_vertex_id: str | None,
+) -> _CanvasSurfaceVertexPreview:
+    """Resolve direct vertex, edge, and architectural-angle hover snapping."""
+
+    requested = np.asarray(_world_point_tuple(world_point), dtype=float)
+    source_surface_id = surface.source_surface_id or surface.surface_id
+    plane_normal = _get_fixed_surface_plane_normal(surface)
+    source_vertices = tuple(
+        vertex
+        for vertex in vertices
+        if vertex.source_surface_id == source_surface_id
+        and abs(
+            float(
+                np.dot(
+                    np.asarray(vertex.world_point, dtype=float) - requested,
+                    plane_normal,
+                )
+            )
+        )
+        <= CANVAS_FACE_COPLANAR_DISTANCE_TOLERANCE_METERS
+    )
+    active = next(
+        (
+            vertex
+            for vertex in source_vertices
+            if vertex.vertex_id == active_vertex_id
+        ),
+        None,
+    )
+    connected_vertex_id = None if active is None else active.vertex_id
+    coplanar_surfaces = tuple(
+        candidate
+        for candidate in surfaces
+        if (candidate.source_surface_id or candidate.surface_id)
+        == source_surface_id
+        and _fixed_surface_is_coplanar_with_point(
+            candidate,
+            requested,
+            plane_normal,
+        )
+    )
+    direct_vertex = _get_nearest_surface_drawing_vertex(
+        requested,
+        source_vertices,
+    )
+    if direct_vertex is not None:
+        return _CanvasSurfaceVertexPreview(
+            surface_id=surface.surface_id,
+            source_surface_id=source_surface_id,
+            world_point=direct_vertex.world_point,
+            snapped_vertex_id=direct_vertex.vertex_id,
+            snap_kind="vertex",
+            active_vertex_id=connected_vertex_id,
+        )
+
+    surface_vertex = _get_nearest_fixed_surface_vertex_point(
+        requested,
+        coplanar_surfaces,
+    )
+    if surface_vertex is not None:
+        return _CanvasSurfaceVertexPreview(
+            surface_id=surface.surface_id,
+            source_surface_id=source_surface_id,
+            world_point=_world_point_tuple(surface_vertex),
+            snap_kind="vertex",
+            active_vertex_id=connected_vertex_id,
+        )
+
+    direct_edge = _get_nearest_surface_drawing_edge_point(
+        requested,
+        tuple(
+            edge
+            for edge in edges
+            if edge.source_surface_id == source_surface_id
+            and all(
+                abs(
+                    float(
+                        np.dot(
+                            np.asarray(point, dtype=float) - requested,
+                            plane_normal,
+                        )
+                    )
+                )
+                <= CANVAS_FACE_COPLANAR_DISTANCE_TOLERANCE_METERS
+                for point in (edge.start_world_point, edge.end_world_point)
+            )
+        ),
+    )
+    surface_edge = _get_nearest_fixed_surface_edge_point(
+        requested,
+        coplanar_surfaces,
+        source_vertices,
+    )
+    edge_candidates = tuple(
+        candidate
+        for candidate in (direct_edge, surface_edge)
+        if candidate is not None
+    )
+    if edge_candidates:
+        edge_candidate = min(
+            edge_candidates,
+            key=_surface_edge_snap_sort_key,
+        )
+        return _CanvasSurfaceVertexPreview(
+            surface_id=surface.surface_id,
+            source_surface_id=source_surface_id,
+            world_point=edge_candidate.world_point,
+            snapped_edge_vertex_ids=(
+                edge_candidate.snapped_edge_vertex_ids
+            ),
+            snap_kind="edge",
+            active_vertex_id=connected_vertex_id,
+        )
+
+    resolved = np.asarray(
+        _resolve_surface_vertex_preview_world_point(
+            surface,
+            requested,
+            surfaces,
+        ),
+        dtype=float,
+    )
+    snap_kind = (
+        "angle"
+        if not np.allclose(resolved, requested, atol=1e-10, rtol=0.0)
+        else "surface"
+    )
+    if active is not None:
+        angle_candidate = _snap_surface_point_from_active_vertex(
+            surface,
+            requested,
+            np.asarray(active.world_point, dtype=float),
+            coplanar_surfaces,
+        )
+        if angle_candidate is not None:
+            resolved = angle_candidate
+            snap_kind = "angle"
+    return _CanvasSurfaceVertexPreview(
+        surface_id=surface.surface_id,
+        source_surface_id=source_surface_id,
+        world_point=_world_point_tuple(resolved),
+        snap_kind=snap_kind,
+        active_vertex_id=connected_vertex_id,
+    )
+
+
+def _get_nearest_surface_drawing_vertex(
+    point: np.ndarray,
+    vertices: Sequence[_CanvasSurfaceDrawingVertex],
+) -> _CanvasSurfaceDrawingVertex | None:
+    """Return a vertex within the shared one-centimeter capture tolerance."""
+
+    if not vertices:
+        return None
+    distances = np.asarray(
+        [
+            np.linalg.norm(
+                np.asarray(vertex.world_point, dtype=float) - point
+            )
+            for vertex in vertices
+        ],
+        dtype=float,
+    )
+    nearest_index = int(np.argmin(distances))
+    if distances[nearest_index] > CANVAS_SURFACE_VERTEX_SNAP_DISTANCE_METERS:
+        return None
+    return vertices[nearest_index]
+
+
+def _get_nearest_surface_drawing_edge_point(
+    point: np.ndarray,
+    edges: Sequence[_CanvasSurfaceDrawingEdge],
+) -> _CanvasSurfaceEdgeSnapCandidate | None:
+    """Return the closest point on an authored edge within snap tolerance."""
+
+    candidates: list[_CanvasSurfaceEdgeSnapCandidate] = []
+    for edge in edges:
+        start = np.asarray(edge.start_world_point, dtype=float)
+        end = np.asarray(edge.end_world_point, dtype=float)
+        direction = end - start
+        squared_length = float(np.dot(direction, direction))
+        if squared_length <= 1e-14:
+            continue
+        ratio = float(
+            np.clip(
+                np.dot(point - start, direction) / squared_length,
+                0.0,
+                1.0,
+            )
+        )
+        candidate = start + direction * ratio
+        distance = float(np.linalg.norm(candidate - point))
+        if distance > CANVAS_SURFACE_VERTEX_SNAP_DISTANCE_METERS:
+            continue
+        edge_key = tuple(sorted(
+            (edge.start_vertex_id, edge.end_vertex_id)
+        ))
+        candidates.append(
+            _CanvasSurfaceEdgeSnapCandidate(
+                distance_meters=distance,
+                authored_priority=0,
+                edge_length_meters=math.sqrt(squared_length),
+                edge_key=edge_key,
+                world_point=_world_point_tuple(candidate),
+                snapped_edge_vertex_ids=edge_key,
+            )
+        )
+    if not candidates:
+        return None
+    return min(candidates, key=_surface_edge_snap_sort_key)
+
+
+def _get_nearest_fixed_surface_vertex_point(
+    point: np.ndarray,
+    surfaces: Sequence[FixedSurface],
+) -> np.ndarray | None:
+    """Snap to source geometry vertices before persistent IDs exist."""
+
+    candidates = tuple(
+        np.asarray(surface.mesh.vertices[int(vertex_index)], dtype=float)
+        for surface in surfaces
+        for edge in _get_fixed_surface_snap_edges(surface)
+        for vertex_index in edge
+    )
+    if not candidates:
+        return None
+    distances = np.asarray(
+        [np.linalg.norm(candidate - point) for candidate in candidates],
+        dtype=float,
+    )
+    nearest_index = int(np.argmin(distances))
+    if distances[nearest_index] > CANVAS_SURFACE_VERTEX_SNAP_DISTANCE_METERS:
+        return None
+    return candidates[nearest_index]
+
+
+def _fixed_surface_is_coplanar_with_point(
+    surface: FixedSurface,
+    point: np.ndarray,
+    normal: np.ndarray,
+) -> bool:
+    """Return whether one logical surface lies on the current drawing plane."""
+
+    vertices = np.asarray(surface.mesh.vertices, dtype=float)
+    if vertices.ndim != 2 or vertices.shape[1:] != (3,) or not len(vertices):
+        return False
+    distances = np.abs((vertices - point[np.newaxis, :]) @ normal)
+    return bool(
+        float(np.max(distances))
+        <= CANVAS_FACE_COPLANAR_DISTANCE_TOLERANCE_METERS
+    )
+
+
+def _get_nearest_fixed_surface_edge_point(
+    point: np.ndarray,
+    surfaces: Sequence[FixedSurface],
+    vertices: Sequence[_CanvasSurfaceDrawingVertex],
+) -> _CanvasSurfaceEdgeSnapCandidate | None:
+    """Snap to current logical-face edges, including undeclared boundaries."""
+
+    nearest: _CanvasSurfaceEdgeSnapCandidate | None = None
+    for surface in surfaces:
+        mesh_vertices = np.asarray(surface.mesh.vertices, dtype=float)
+        candidate_edges = _get_fixed_surface_snap_edges(surface)
+        if (
+            mesh_vertices.ndim != 2
+            or mesh_vertices.shape[1:] != (3,)
+            or candidate_edges.ndim != 2
+            or candidate_edges.shape[1:] != (2,)
+        ):
+            continue
+        for first_index, second_index in candidate_edges:
+            start = mesh_vertices[int(first_index)]
+            end = mesh_vertices[int(second_index)]
+            candidate, distance = _project_point_to_line_segment(
+                point,
+                start,
+                end,
+            )
+            if distance > CANVAS_SURFACE_VERTEX_SNAP_DISTANCE_METERS:
+                continue
+            vertex_ids = _find_surface_drawing_edge_vertex_ids(
+                start,
+                end,
+                vertices,
+            )
+            normalized_vertex_ids = (
+                None if vertex_ids is None else tuple(sorted(vertex_ids))
+            )
+            edge_length = float(np.linalg.norm(end - start))
+            edge_key = (
+                normalized_vertex_ids
+                if normalized_vertex_ids is not None
+                else _build_world_surface_edge_sort_key(start, end)
+            )
+            entry = _CanvasSurfaceEdgeSnapCandidate(
+                distance_meters=distance,
+                authored_priority=1,
+                edge_length_meters=edge_length,
+                edge_key=edge_key,
+                world_point=_world_point_tuple(candidate),
+                snapped_edge_vertex_ids=normalized_vertex_ids,
+            )
+            if nearest is None or _surface_edge_snap_sort_key(
+                entry
+            ) < _surface_edge_snap_sort_key(nearest):
+                nearest = entry
+    return nearest
+
+
+def _surface_edge_snap_sort_key(
+    candidate: _CanvasSurfaceEdgeSnapCandidate,
+) -> tuple[float, int, float, tuple[str, str]]:
+    """Match domain edge selection: distance, authored, length, then ID."""
+
+    return (
+        round(candidate.distance_meters, 12),
+        candidate.authored_priority,
+        round(candidate.edge_length_meters, 12),
+        candidate.edge_key,
+    )
+
+
+def _build_world_surface_edge_sort_key(
+    start: np.ndarray,
+    end: np.ndarray,
+) -> tuple[str, str]:
+    """Provide deterministic ordering when persistent endpoint IDs are absent."""
+
+    endpoint_keys = sorted(
+        ",".join(f"{float(component):.12g}" for component in endpoint)
+        for endpoint in (start, end)
+    )
+    return endpoint_keys[0], endpoint_keys[1]
+
+
+def _get_fixed_surface_snap_edges(surface: FixedSurface) -> np.ndarray:
+    """Return visible logical boundaries without render-only diagonals."""
+
+    unique_edges = np.asarray(surface.mesh.edges_unique, dtype=np.int64)
+    inverse_edges = np.asarray(
+        surface.mesh.edges_unique_inverse,
+        dtype=np.int64,
+    )
+    if (
+        unique_edges.ndim != 2
+        or unique_edges.shape[1:] != (2,)
+        or not len(unique_edges)
+    ):
+        return np.empty((0, 2), dtype=np.int64)
+    if not len(inverse_edges):
+        return unique_edges
+    edge_counts = np.bincount(inverse_edges, minlength=len(unique_edges))
+    boundary_edges = unique_edges[edge_counts == 1]
+    return boundary_edges if len(boundary_edges) else unique_edges
+
+
+def _project_point_to_line_segment(
+    point: np.ndarray,
+    start: np.ndarray,
+    end: np.ndarray,
+) -> tuple[np.ndarray, float]:
+    """Return the closest finite segment point and its Euclidean distance."""
+
+    direction = end - start
+    squared_length = float(np.dot(direction, direction))
+    if squared_length <= 1e-14:
+        return start.copy(), float(np.linalg.norm(point - start))
+    ratio = float(
+        np.clip(
+            np.dot(point - start, direction) / squared_length,
+            0.0,
+            1.0,
+        )
+    )
+    candidate = start + direction * ratio
+    return candidate, float(np.linalg.norm(candidate - point))
+
+
+def _find_surface_drawing_edge_vertex_ids(
+    start: np.ndarray,
+    end: np.ndarray,
+    vertices: Sequence[_CanvasSurfaceDrawingVertex],
+) -> tuple[str, str] | None:
+    """Recover persistent endpoint IDs for one rendered logical edge."""
+
+    endpoint_ids: list[str] = []
+    for endpoint in (start, end):
+        match = next(
+            (
+                vertex.vertex_id
+                for vertex in vertices
+                if np.allclose(
+                    np.asarray(vertex.world_point, dtype=float),
+                    endpoint,
+                    atol=1e-7,
+                    rtol=0.0,
+                )
+            ),
+            None,
+        )
+        if match is None:
+            return None
+        endpoint_ids.append(match)
+    return endpoint_ids[0], endpoint_ids[1]
+
+
+def _snap_surface_point_from_active_vertex(
+    surface: FixedSurface,
+    point: np.ndarray,
+    active_point: np.ndarray,
+    coplanar_surfaces: Sequence[FixedSurface],
+) -> np.ndarray | None:
+    """Snap a prospective edge to 45-degree increments from its active end."""
+
+    normal = _get_fixed_surface_plane_normal(surface)
+    projected_delta = point - active_point
+    projected_delta -= normal * float(np.dot(projected_delta, normal))
+    distance = float(np.linalg.norm(projected_delta))
+    if distance <= 1e-12 or distance > 2.0:
+        return None
+    vertical = np.asarray((0.0, 0.0, 1.0), dtype=float)
+    if abs(float(np.dot(normal, vertical))) < 0.5:
+        v_axis = vertical
+        u_axis = np.cross(v_axis, normal)
+    else:
+        u_axis = np.asarray((1.0, 0.0, 0.0), dtype=float)
+        u_axis -= normal * float(np.dot(u_axis, normal))
+        if float(np.linalg.norm(u_axis)) <= 1e-12:
+            u_axis = np.asarray((0.0, 1.0, 0.0), dtype=float)
+            u_axis -= normal * float(np.dot(u_axis, normal))
+        v_axis = np.cross(normal, u_axis)
+    u_axis /= float(np.linalg.norm(u_axis))
+    v_axis /= float(np.linalg.norm(v_axis))
+    local_delta = np.asarray(
+        (
+            float(np.dot(projected_delta, u_axis)),
+            float(np.dot(projected_delta, v_axis)),
+        ),
+        dtype=float,
+    )
+    candidates: list[tuple[float, int, np.ndarray]] = []
+    for angle_index in range(8):
+        angle = math.radians(angle_index * 45.0)
+        ray = np.asarray((math.cos(angle), math.sin(angle)), dtype=float)
+        ray_distance = float(np.dot(local_delta, ray))
+        candidate = active_point + ray_distance * (
+            ray[0] * u_axis + ray[1] * v_axis
+        )
+        displacement = float(np.linalg.norm(candidate - point))
+        if displacement > CANVAS_SURFACE_VERTEX_SNAP_DISTANCE_METERS:
+            continue
+        if not _point_is_covered_by_fixed_surfaces(
+            candidate,
+            coplanar_surfaces,
+        ):
+            continue
+        candidates.append((displacement, angle_index, candidate))
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda candidate: (round(candidate[0], 12), candidate[1]),
+    )[2]
+
+
+def _point_is_covered_by_fixed_surfaces(
+    point: np.ndarray,
+    surfaces: Sequence[FixedSurface],
+) -> bool:
+    """Accept an angle snap only while it stays on rendered surface triangles."""
+
+    for surface in surfaces:
+        vertices = np.asarray(surface.mesh.vertices, dtype=float)
+        faces = np.asarray(surface.mesh.faces, dtype=np.int64)
+        if (
+            vertices.ndim != 2
+            or vertices.shape[1:] != (3,)
+            or faces.ndim != 2
+            or faces.shape[1:] != (3,)
+        ):
+            continue
+        for triangle in vertices[faces]:
+            if _point_is_covered_by_triangle(point, triangle):
+                return True
+    return False
+
+
+def _point_is_covered_by_triangle(
+    point: np.ndarray,
+    triangle: np.ndarray,
+) -> bool:
+    """Test one coplanar point against a triangle with a tiny edge tolerance."""
+
+    first = triangle[1] - triangle[0]
+    second = triangle[2] - triangle[0]
+    offset = point - triangle[0]
+    first_dot = float(np.dot(first, first))
+    cross_dot = float(np.dot(first, second))
+    second_dot = float(np.dot(second, second))
+    offset_first_dot = float(np.dot(offset, first))
+    offset_second_dot = float(np.dot(offset, second))
+    denominator = first_dot * second_dot - cross_dot * cross_dot
+    if abs(denominator) <= 1e-14:
+        return False
+    first_weight = (
+        second_dot * offset_first_dot - cross_dot * offset_second_dot
+    ) / denominator
+    second_weight = (
+        first_dot * offset_second_dot - cross_dot * offset_first_dot
+    ) / denominator
+    tolerance = CANVAS_FACE_COPLANAR_DISTANCE_TOLERANCE_METERS
+    reconstructed = (
+        triangle[0] + first * first_weight + second * second_weight
+    )
+    return bool(
+        np.linalg.norm(reconstructed - point) <= tolerance
+        and first_weight >= -tolerance
+        and second_weight >= -tolerance
+        and first_weight + second_weight <= 1.0 + tolerance
+    )
+
+
+def _resolve_surface_vertex_preview_world_point(
+    surface: FixedSurface,
+    world_point: object,
+    surfaces: Sequence[FixedSurface],
+) -> tuple[float, float, float]:
+    """Resolve optional domain snapping for the insertion hover marker."""
+
+    try:
+        from housemaker.architectural_surface_edits import (
+            snap_surface_vertex_world_point,
+        )
+
+        return _world_point_tuple(
+            snap_surface_vertex_world_point(
+                tuple(surfaces),
+                surface.surface_id,
+                _world_point_tuple(world_point),
+            )
+        )
+    except (ImportError, TypeError, ValueError):
+        return _world_point_tuple(world_point)
+
+
 def _get_canvas_opening_handle_local_position(
     target: CanvasOpeningTarget,
     handle: _CanvasOpeningGizmoHandle,
@@ -7330,8 +9254,10 @@ def _get_nearest_fixed_surface_ray_hit(
     surfaces: tuple[FixedSurface, ...],
     ray_origin: object,
     ray_direction: object,
+    *,
+    front_facing_horizontal_only: bool = False,
 ) -> tuple[FixedSurface, np.ndarray, float] | None:
-    """Return the closest double-sided triangle hit without optional ray indexes."""
+    """Return the closest semantic hit with optional horizontal face culling."""
 
     origin = np.asarray(ray_origin, dtype=float)
     direction = np.asarray(ray_direction, dtype=float)
@@ -7349,6 +9275,19 @@ def _get_nearest_fixed_surface_ray_hit(
 
     nearest: tuple[FixedSurface, np.ndarray, float] | None = None
     for surface in surfaces:
+        if (
+            front_facing_horizontal_only
+            and surface.surface_type
+            in {SURFACE_TYPE_FLOOR, SURFACE_TYPE_CEILING}
+            and float(
+                np.dot(
+                    _get_fixed_surface_plane_normal(surface),
+                    direction,
+                )
+            )
+            >= -1e-10
+        ):
+            continue
         hit = _get_nearest_triangle_ray_hit(
             surface.mesh,
             origin,

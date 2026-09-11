@@ -252,12 +252,12 @@ class CanvasSurfaceEditGizmoTests(unittest.TestCase):
             viewer._refresh_canvas_surface_edit_gizmo_items()
 
         items = tuple(viewer._canvas_surface_edit_gizmo_items)
-        self.assertEqual(len(items), 9)
+        self.assertEqual(len(items), 8)
         for item in items:
             self.assertEqual(item.depthValue(), CANVAS_OPENING_OVERLAY_DEPTH_VALUE)
             gl_options = getattr(item, "_GLGraphicsItem__glOpts")
             self.assertFalse(gl_options[GL.GL_DEPTH_TEST])
-        axis_items = items[1::2]
+        axis_items = items[0::2]
         self.assertEqual(len(axis_items), 4)
         self.assertGreaterEqual(CANVAS_SURFACE_EDIT_GIZMO_LINE_WIDTH, 4.0)
         self.assertGreaterEqual(
@@ -278,7 +278,7 @@ class CanvasSurfaceEditGizmoTests(unittest.TestCase):
             viewer.select_canvas_surface_target(ceiling.surface_id)
             viewer._refresh_canvas_surface_edit_gizmo_items()
         axis_positions = np.asarray(
-            viewer._canvas_surface_edit_gizmo_items[1].pos,
+            viewer._canvas_surface_edit_gizmo_items[0].pos,
             dtype=float,
         )
         delta = axis_positions[1] - axis_positions[0]
@@ -649,7 +649,7 @@ class CanvasSurfaceEditGizmoTests(unittest.TestCase):
         viewer.set_model(_build_model(), preserve_camera=True)
 
         self.assertEqual(viewer.get_active_canvas_surface_id(), wall.surface_id)
-        self.assertEqual(len(viewer._canvas_surface_edit_gizmo_items), 9)
+        self.assertEqual(len(viewer._canvas_surface_edit_gizmo_items), 8)
         self.assertNotIn(first_items[0], viewer._canvas_surface_edit_gizmo_items)
 
         begin_drag()

@@ -44,6 +44,14 @@ from PySide6.QtWidgets import (
 )
 
 from housemaker.app_settings import ApplicationSettingsStore
+from housemaker.architectural_surface_edits import (
+    SurfaceFaceExtrusionRequest,
+    SurfaceTopologyEditResult,
+    SurfaceVertexInsertionRequest,
+    build_surface_drawing_overlay,
+    extrude_surface_faces,
+    place_surface_vertex,
+)
 from housemaker.atlas_export import apply_texture_atlases_to_export
 from housemaker.blueprint_canvas import BlueprintCanvas
 from housemaker.canvas_openings import (
@@ -362,6 +370,7 @@ class BlueprintWorkspace(QWidget):
         self._is_syncing_canvas_scene_selection = False
         self._desired_canvas_object_id: str | None = None
         self._desired_canvas_surface_ids: tuple[str, ...] = ()
+        self._active_canvas_surface_drawing_vertex_id: str | None = None
         self._last_automatic_atlas_assignment_key: tuple[object, ...] | None = (
             None
         )
@@ -637,6 +646,15 @@ class BlueprintWorkspace(QWidget):
         )
         self.viewer.canvas_surface_selection_changed.connect(
             self._handle_canvas_surface_selection_changed
+        )
+        self.viewer.canvas_surface_vertex_insertion_requested.connect(
+            self._handle_canvas_surface_vertex_insertion_requested
+        )
+        self.viewer.canvas_surface_vertex_chain_reset_requested.connect(
+            self._handle_canvas_surface_vertex_chain_reset_requested
+        )
+        self.viewer.canvas_surface_face_extrusion_requested.connect(
+            self._handle_canvas_surface_face_extrusion_requested
         )
         self.viewer.canvas_surface_edit_started.connect(
             self._handle_canvas_surface_edit_started
@@ -1492,6 +1510,7 @@ class BlueprintWorkspace(QWidget):
                 for target in edit_targets
             }
             self.viewer.set_canvas_surface_edit_targets(edit_targets)
+            self._sync_canvas_surface_drawing_overlay()
             if self._desired_canvas_surface_ids:
                 self.viewer.set_selected_canvas_surface_ids(
                     self._desired_canvas_surface_ids
@@ -1579,11 +1598,146 @@ class BlueprintWorkspace(QWidget):
             surface.surface_id
             if surface is not None
             and surface.surface_type == SURFACE_TYPE_WALL
+            and surface.source_surface_id is None
             and current_level is not None
             and surface.level_index == current_level.index
             else None
         )
         self.canvas.set_selected_wall_surface_id(selected_wall_id)
+
+    # ### Canvas persistent surface topology edits ###
+    def _sync_canvas_surface_drawing_overlay(self) -> None:
+        """Keep persistent drawn vertices and edges aligned with preview levels."""
+
+        overlay = build_surface_drawing_overlay(
+            self._build_viewer_preview_levels()
+        )
+        known_vertex_ids = {
+            vertex.vertex_id for vertex in overlay.vertices
+        }
+        if self._active_canvas_surface_drawing_vertex_id not in known_vertex_ids:
+            self._active_canvas_surface_drawing_vertex_id = None
+        self.viewer.set_canvas_surface_drawing_overlay(
+            overlay,
+            active_vertex_id=(
+                self._active_canvas_surface_drawing_vertex_id
+            ),
+        )
+
+    def _handle_canvas_surface_vertex_chain_reset_requested(self) -> None:
+        """Forget the transient edge-chain endpoint when drawing is cancelled."""
+
+        self._active_canvas_surface_drawing_vertex_id = None
+        self._sync_canvas_surface_drawing_overlay()
+
+    def _handle_canvas_surface_vertex_insertion_requested(
+        self,
+        raw_request: object,
+    ) -> None:
+        """Insert one persistent vertex and preserve any parent assignment."""
+
+        if not isinstance(raw_request, SurfaceVertexInsertionRequest):
+            return
+        self._apply_canvas_surface_topology_edit(
+            lambda: place_surface_vertex(
+                self.levels,
+                raw_request.surface_id,
+                raw_request.world_point,
+                raw_request.active_vertex_id,
+            ),
+            success_message=(
+                "Surface drawing updated. Edge-to-edge paths split the "
+                "surface; nearby 45-degree alignments snap automatically."
+            ),
+        )
+
+    def _handle_canvas_surface_face_extrusion_requested(
+        self,
+        raw_request: object,
+    ) -> None:
+        """Extrude the selected connected faces after the gizmo is released."""
+
+        if not isinstance(raw_request, SurfaceFaceExtrusionRequest):
+            return
+        self._apply_canvas_surface_topology_edit(
+            lambda: extrude_surface_faces(
+                self.levels,
+                raw_request.surface_ids,
+                raw_request.delta_meters,
+            ),
+            success_message=(
+                "Face extrusion updated. The cap remains selected; any side "
+                "faces can be selected and textured separately."
+            ),
+        )
+
+    def _apply_canvas_surface_topology_edit(
+        self,
+        operation: Callable[[], SurfaceTopologyEditResult],
+        *,
+        success_message: str,
+    ) -> None:
+        """Apply geometry and texture-lineage changes as one UI transaction."""
+
+        self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_wall_vertex_update()
+        self._commit_pending_doorway_mesh_update()
+        previous_edits = [
+            (level, copy.deepcopy(level.editable_surfaces))
+            for level in self.levels
+        ]
+        previous_surface_ids = self._desired_canvas_surface_ids
+        previous_assignment_target_ids = (
+            self._atlas_surface_assignment_target_ids
+        )
+        previous_object_id = self._desired_canvas_object_id
+        previous_active_vertex_id = (
+            self._active_canvas_surface_drawing_vertex_id
+        )
+        result: SurfaceTopologyEditResult | None = None
+        try:
+            result = operation()
+            replacements = result.replacements
+            selected_surface_ids = result.selected_surface_ids
+            self._desired_canvas_surface_ids = selected_surface_ids
+            self._atlas_surface_assignment_target_ids = selected_surface_ids
+            if selected_surface_ids:
+                self._desired_canvas_object_id = None
+            self._active_canvas_surface_drawing_vertex_id = (
+                result.active_vertex_id
+            )
+            if result.requires_mesh_refresh:
+                self.surface_texture_generation.remap_assignments_with_surface_lineage(
+                    self.levels,
+                    replacements,
+                )
+        except (RuntimeError, TypeError, ValueError) as error:
+            for level, editable_surfaces in previous_edits:
+                level.editable_surfaces = editable_surfaces
+            self._desired_canvas_surface_ids = previous_surface_ids
+            self._atlas_surface_assignment_target_ids = (
+                previous_assignment_target_ids
+            )
+            self._desired_canvas_object_id = previous_object_id
+            self._active_canvas_surface_drawing_vertex_id = (
+                previous_active_vertex_id
+            )
+            self._sync_canvas_surface_drawing_overlay()
+            self.viewer.set_surface_tools_status(
+                f"Surface edit stopped: {error}"
+            )
+            if result is not None and result.requires_mesh_refresh:
+                self._schedule_viewer_preview_refresh(preserve_camera=True)
+            return
+
+        if result.requires_mesh_refresh:
+            self.surface_texture_generation.reconcile_assignments_with_levels(
+                self.levels
+            )
+        self._sync_canvas_surface_drawing_overlay()
+        self.viewer.set_surface_tools_status(success_message)
+        if result.requires_mesh_refresh:
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     # ### Canvas structural surface edits ###
     def _handle_canvas_surface_edit_started(self, raw_edit: object) -> None:
@@ -6172,6 +6326,7 @@ class BlueprintWorkspace(QWidget):
         self.canvas.cancel_stair_placement()
         self._desired_canvas_object_id = None
         self._desired_canvas_surface_ids = ()
+        self._active_canvas_surface_drawing_vertex_id = None
         self._atlas_surface_assignment_target_ids = ()
         self._selected_atlas_surface_source_id = None
         self.viewer.set_highlighted_canvas_surface_ids(())

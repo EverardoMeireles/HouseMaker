@@ -168,6 +168,40 @@ class SurfaceTextureSelectionTests(unittest.TestCase):
                 )
                 self.assertEqual(state.selected_surface_ids, (surface_id,))
 
+    def test_selection_accepts_typed_stable_edited_face_ids(self) -> None:
+        for surface_type, face_token in (
+            (SURFACE_TYPE_WALL, "a" * 32),
+            (SURFACE_TYPE_FLOOR, "0123456789abcdef" * 2),
+            (SURFACE_TYPE_CEILING, "f" * 32),
+        ):
+            with self.subTest(surface_type=surface_type):
+                surface_id = (
+                    f"level:2/edit-face:{face_token}:{surface_type}"
+                )
+                state = SurfaceTextureData(
+                    selected_surface_type=None,
+                    selected_surface_ids=(surface_id,),
+                )
+
+                self.assertEqual(state.selected_surface_type, surface_type)
+                self.assertEqual(state.selected_surface_ids, (surface_id,))
+
+    def test_selection_rejects_malformed_edited_face_ids(self) -> None:
+        invalid_surface_ids = (
+            f"level:2/edit-face:{'a' * 31}:wall",
+            f"level:2/edit-face:{'a' * 33}:wall",
+            f"level:2/edit-face:{'A' * 32}:wall",
+            f"level:2/edit-face:{'a' * 32}:roof",
+            f"level:2/room:5/edit-face:{'a' * 32}:wall",
+        )
+        for surface_id in invalid_surface_ids:
+            with self.subTest(surface_id=surface_id):
+                with self.assertRaises(ValueError):
+                    SurfaceTextureData(
+                        selected_surface_type=SURFACE_TYPE_WALL,
+                        selected_surface_ids=(surface_id,),
+                    )
+
     def test_selection_rejects_mixed_types_and_malformed_ids(self) -> None:
         invalid_selections = (
             (
@@ -211,7 +245,7 @@ class SurfaceTextureAssignmentTests(unittest.TestCase):
 
         restored = SurfaceTextureAssignment.from_dict(assignment.to_dict())
 
-        self.assertEqual(SURFACE_TEXTURE_SCHEMA_VERSION, 8)
+        self.assertEqual(SURFACE_TEXTURE_SCHEMA_VERSION, 9)
         self.assertEqual(
             restored.selected_texture_resolution,
             DEFAULT_SURFACE_TEXTURE_RESOLUTION,

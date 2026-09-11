@@ -45,8 +45,11 @@ from housemaker.pbr_maps import (
 from housemaker.surface_geometry import build_fixed_surfaces
 from housemaker.surface_materials import (
     build_assignment_surface_material_source_map,
+    build_world_planar_face_uvs,
 )
 from housemaker.surface_texture_state import (
+    SURFACE_TYPE_FLOOR,
+    SURFACE_TYPE_WALL,
     SurfaceTextureAssignment,
     SurfaceTextureData,
 )
@@ -277,6 +280,69 @@ def _assignment(
         provider="meshy",
         asset_path=asset_path,
     )
+
+
+def _triangle_uv_area(uv: np.ndarray) -> float:
+    """Return twice one UV triangle's area for a nondegeneracy assertion."""
+
+    first_edge = uv[1] - uv[0]
+    second_edge = uv[2] - uv[0]
+    return abs(
+        float(
+            first_edge[0] * second_edge[1]
+            - first_edge[1] * second_edge[0]
+        )
+    )
+
+
+# ### Planar UV tests ###
+class SurfaceMaterialPlanarUvTests(unittest.TestCase):
+    def test_floor_typed_vertical_face_uses_wall_like_projection(self) -> None:
+        face_vertices = np.asarray(
+            (
+                (
+                    (0.0, 0.0, 0.0),
+                    (0.0, 2.0, 0.0),
+                    (-0.6, 0.0, 0.8),
+                ),
+            ),
+            dtype=float,
+        )
+        face_normals = np.asarray(((0.8, 0.0, 0.6),), dtype=float)
+
+        uv = build_world_planar_face_uvs(
+            face_vertices,
+            face_normals,
+            SURFACE_TYPE_FLOOR,
+            texture_world_size_meters=1.0,
+        )[0]
+
+        self.assertGreater(_triangle_uv_area(uv), 0.0)
+        np.testing.assert_allclose(uv[:, 0], (0.0, 2.0, 0.0))
+        np.testing.assert_allclose(uv[:, 1], (0.0, 0.0, 0.8))
+
+    def test_wall_typed_horizontal_face_uses_horizontal_projection(self) -> None:
+        face_vertices = np.asarray(
+            (
+                (
+                    (0.0, 0.0, 2.0),
+                    (2.0, 0.0, 2.0),
+                    (0.0, 3.0, 2.0),
+                ),
+            ),
+            dtype=float,
+        )
+        face_normals = np.asarray(((0.0, 0.0, 1.0),), dtype=float)
+
+        uv = build_world_planar_face_uvs(
+            face_vertices,
+            face_normals,
+            SURFACE_TYPE_WALL,
+            texture_world_size_meters=1.0,
+        )[0]
+
+        self.assertGreater(_triangle_uv_area(uv), 0.0)
+        np.testing.assert_allclose(uv, face_vertices[0, :, :2])
 
 
 # ### Stable identity tests ###

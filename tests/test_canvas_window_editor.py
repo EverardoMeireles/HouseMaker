@@ -285,7 +285,7 @@ class CanvasWindowEditorTests(unittest.TestCase):
             (ceiling.surface_id,),
         )
 
-    def test_ctrl_pick_adds_and_toggles_every_semantic_surface_type(self) -> None:
+    def test_shift_pick_adds_and_toggles_every_semantic_surface_type(self) -> None:
         viewer = self._build_viewer()
         wall = _build_wall()
         floor = _build_floor()
@@ -308,7 +308,7 @@ class CanvasWindowEditorTests(unittest.TestCase):
         with patch.object(
             QApplication,
             "keyboardModifiers",
-            return_value=Qt.KeyboardModifier.ControlModifier,
+            return_value=Qt.KeyboardModifier.ShiftModifier,
         ):
             for ray in rays:
                 with patch.object(
@@ -568,15 +568,17 @@ class CanvasWindowEditorTests(unittest.TestCase):
         viewer.set_wall_targets((wall,))
         viewer.select_wall_target(wall.surface_id)
         viewer.set_model(_build_model())
-        first_outline = viewer._window_selection_item
+        first_outlines = tuple(viewer._canvas_surface_selection_items)
 
-        self.assertIsNotNone(first_outline)
-        self.assertIn(first_outline, viewer.view.items)
+        self.assertEqual(len(first_outlines), 1)
+        self.assertIn(first_outlines[0], viewer.view.items)
         viewer.set_model(_build_model(), preserve_camera=True)
 
         self.assertEqual(viewer.get_selected_wall_surface_id(), wall.surface_id)
-        self.assertIsNot(viewer._window_selection_item, first_outline)
-        self.assertIn(viewer._window_selection_item, viewer.view.items)
+        refreshed_outlines = tuple(viewer._canvas_surface_selection_items)
+        self.assertEqual(len(refreshed_outlines), 1)
+        self.assertIsNot(refreshed_outlines[0], first_outlines[0])
+        self.assertIn(refreshed_outlines[0], viewer.view.items)
 
         moved_wall = _build_wall(x_offset=1.0)
         viewer.set_wall_targets((moved_wall,))
@@ -586,7 +588,7 @@ class CanvasWindowEditorTests(unittest.TestCase):
         )
         viewer.set_wall_targets(())
         self.assertIsNone(viewer.get_selected_wall_surface_id())
-        self.assertIsNone(viewer._window_selection_item)
+        self.assertEqual(viewer._canvas_surface_selection_items, [])
 
 
 if __name__ == "__main__":

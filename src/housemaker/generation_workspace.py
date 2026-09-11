@@ -1948,8 +1948,8 @@ class ObjectGenerationViewerPanel(QWidget):
         details_layout.addWidget(self.object_list, 1)
 
         self.face_selection_help_label = QLabel(
-            "Toggle faces with Ctrl+click in 3D or a click in Texture "
-            "resolution. Ctrl+drag adds faces in 3D. All methods share one "
+            "Toggle faces with Shift+click in 3D or a click in Texture "
+            "resolution. Shift+drag adds faces in 3D. All methods share one "
             "selection; deletion retains existing UVs and textures."
         )
         self.face_selection_help_label.setObjectName(

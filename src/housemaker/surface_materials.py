@@ -13,10 +13,7 @@ from PIL import Image
 from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
-from housemaker.surface_geometry import (
-    SURFACE_TYPE_WALL,
-    SURFACE_TYPES,
-)
+from housemaker.surface_geometry import SURFACE_TYPES
 from housemaker.pbr_maps import (
     ATLAS_MAP_BASE_COLOR,
     ATLAS_MAP_TYPES,
@@ -336,7 +333,10 @@ def build_world_planar_face_uvs(
     uv_coordinates = np.empty((len(vertices), 3, 2), dtype=float)
     for face_index, triangle_vertices in enumerate(vertices):
         normal = normals[face_index]
-        if surface_type == SURFACE_TYPE_WALL and abs(normal[2]) < 0.7:
+        horizontal_normal_magnitude = float(
+            max(abs(normal[0]), abs(normal[1]))
+        )
+        if horizontal_normal_magnitude > abs(float(normal[2])):
             tangent = np.array((-normal[1], normal[0], 0.0), dtype=float)
             tangent_length = float(np.linalg.norm(tangent))
             if tangent_length <= SURFACE_MATERIAL_EPSILON:

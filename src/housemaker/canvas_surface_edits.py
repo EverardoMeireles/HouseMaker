@@ -337,6 +337,11 @@ def build_canvas_surface_edit_targets(
         surface_sequence,
         key=lambda candidate: candidate.surface_id,
     ):
+        # Persistent topology faces have their own normal extrusion control.
+        # Structural wall/level handles belong only to their authoritative
+        # source surface, never to one of its editable descendants.
+        if getattr(surface, "source_surface_id", None) is not None:
+            continue
         level = level_by_index.get(surface.level_index)
         if level is None:
             continue

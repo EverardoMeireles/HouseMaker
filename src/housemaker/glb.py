@@ -580,19 +580,29 @@ def _build_blueprint_model(
         )
         named_meshes = _build_named_meshes_for_single_level(wall_meshes)
     else:
-        from housemaker.surface_geometry import build_fixed_surfaces
+        from housemaker.surface_geometry import (
+            build_base_fixed_surfaces,
+            build_fixed_surfaces,
+        )
 
         named_meshes = _build_multi_level_meshes(
             level_source,
             blueprint_size_pixels=blueprint_size_pixels,
             stairs=stairs,
         )
+        base_fixed_surfaces = build_base_fixed_surfaces(level_source)
         fixed_surfaces = build_fixed_surfaces(level_source)
         named_meshes.extend(
             _build_untextured_ceiling_named_meshes(
                 level_source,
-                fixed_surfaces,
+                base_fixed_surfaces,
             )
+        )
+        named_meshes = _apply_editable_surface_geometry(
+            named_meshes,
+            level_source,
+            base_fixed_surfaces,
+            fixed_surfaces,
         )
         preview_textured_walls = _build_preview_textured_walls(
             level_source,
@@ -659,6 +669,90 @@ def _build_untextured_ceiling_named_meshes(
             )
         )
     return named_meshes
+
+
+def _apply_editable_surface_geometry(
+    named_meshes: Sequence[NamedMesh],
+    levels: Sequence[LevelData],
+    base_surfaces: Sequence[object],
+    current_surfaces: Sequence[object],
+) -> list[NamedMesh]:
+    """Replace generated source skins with persistent edited face geometry."""
+
+    edited_source_ids = {
+        str(edit.source_surface_id)
+        for level in levels
+        for edit in getattr(level, "editable_surfaces", ())
+        if getattr(edit, "replaces_source_surface", True)
+    }
+    if not edited_source_ids:
+        return list(named_meshes)
+
+    base_by_id = {
+        str(getattr(surface, "surface_id")): surface
+        for surface in base_surfaces
+    }
+    live_edited_source_ids = edited_source_ids.intersection(base_by_id)
+    if not live_edited_source_ids:
+        return list(named_meshes)
+
+    horizontal_partition_keys = {
+        (
+            int(getattr(base_by_id[source_id], "level_index")),
+            str(getattr(base_by_id[source_id], "surface_type")),
+        )
+        for source_id in live_edited_source_ids
+        if str(getattr(base_by_id[source_id], "surface_type"))
+        in {"floor", "ceiling"}
+    }
+    removal_surfaces = [
+        surface
+        for surface in base_surfaces
+        if str(getattr(surface, "surface_id")) in live_edited_source_ids
+        or (
+            int(getattr(surface, "level_index")),
+            str(getattr(surface, "surface_type")),
+        )
+        in horizontal_partition_keys
+    ]
+    retained_named_meshes = _remove_named_mesh_surface_faces(
+        named_meshes,
+        _build_oriented_surface_face_keys(removal_surfaces),
+        _build_surface_plane_coverage(removal_surfaces),
+    )
+
+    replacement_surfaces = [
+        surface
+        for surface in current_surfaces
+        if (
+            getattr(surface, "source_surface_id", None)
+            in live_edited_source_ids
+        )
+        or (
+            int(getattr(surface, "level_index")),
+            str(getattr(surface, "surface_type")),
+        )
+        in horizontal_partition_keys
+    ]
+    retained_named_meshes.extend(
+        NamedMesh(
+            name=(
+                f"{_get_surface_object_name(str(getattr(surface, 'surface_id')))}"
+                "_geometry"
+            ),
+            mesh=_build_untextured_editable_surface_mesh(surface),
+        )
+        for surface in replacement_surfaces
+    )
+    return retained_named_meshes
+
+
+def _build_untextured_editable_surface_mesh(
+    surface: object,
+) -> trimesh.Trimesh:
+    """Copy one logical face without duplicating render triangles."""
+
+    return getattr(surface, "mesh").copy()
 
 
 # ### Placed generated-model composition ###

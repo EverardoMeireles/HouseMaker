@@ -55,7 +55,7 @@ from housemaker.settings_widget import (
     SURFACE_TEXTURE_PROVIDER_SETTING_KEY,
     GenerationServiceSettings,
 )
-from housemaker.surface_geometry import build_fixed_surfaces
+from housemaker.surface_geometry import FixedSurface, build_fixed_surfaces
 from housemaker.surface_texture_providers import SurfaceTextureResult
 from housemaker.surface_texture_state import (
     SURFACE_PBR_ALIGNMENT_VERSION,
@@ -221,6 +221,37 @@ def _surface_assignment_with_variants(
         texture_height=selected_resolution,
         texture_variants=tuple(variants),
         selected_texture_resolution=selected_resolution,
+    )
+
+
+def _edited_face_surface(
+    surface_id: str,
+    *,
+    area_square_meters: float,
+    x_offset: float = 0.0,
+) -> FixedSurface:
+    """Build one logical edited face without depending on topology models."""
+
+    width = float(area_square_meters) * 2.0
+    mesh = trimesh.Trimesh(
+        vertices=np.asarray(
+            (
+                (x_offset, 0.0, 0.0),
+                (x_offset + width, 0.0, 0.0),
+                (x_offset, 0.0, 1.0),
+            ),
+            dtype=float,
+        ),
+        faces=np.asarray(((0, 1, 2),), dtype=np.int64),
+        process=False,
+    )
+    return FixedSurface(
+        surface_id=surface_id,
+        surface_type="wall",
+        level_index=2,
+        room_index=None,
+        mesh=mesh,
+        area_square_meters=area_square_meters,
     )
 
 
@@ -857,6 +888,165 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         self.assertEqual(changed.count(), 1)
         self.assertEqual(content_changed.count(), 1)
         self.assertEqual(removed.count(), 0)
+
+    def test_lineage_remap_preserves_family_and_expands_split_face(self) -> None:
+        parent_id = "level:2/room:5/wall:1:2"
+        first_child_id = f"level:2/edit-face:{'a' * 32}:wall"
+        second_child_id = f"level:2/edit-face:{'b' * 32}:wall"
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(parents=True, exist_ok=True)
+        asset_path = asset_directory / "lineage.png"
+        asset_path.write_bytes(_colored_texture_png((150, 70, 30, 255)))
+        assignment = SurfaceTextureAssignment(
+            assignment_id="lineage-family",
+            surface_type="wall",
+            surface_ids=(parent_id,),
+            provider="meshy",
+            asset_path=asset_path.name,
+            provider_task_id="image-task",
+            provider_pbr_task_id="pbr-task",
+            combined_area_m2=2.0,
+            area_description="Original face",
+            reference_frame_indices=(2, 7),
+            display_name="Brick",
+            enabled_pbr_maps=(PBR_MAP_NORMAL, PBR_MAP_ROUGHNESS),
+        )
+        self.workspace.set_data(
+            SurfaceTextureData(assignments=[assignment])
+        )
+        signature_before = self.workspace.get_preview_dependency_signature()
+        changed = QSignalSpy(self.workspace.data_changed)
+        content_changed = QSignalSpy(self.workspace.surface_content_changed)
+        removed = QSignalSpy(self.workspace.assignments_removed)
+        next_level = copy.deepcopy(_test_level())
+        next_level.height_meters += 0.125
+        child_surfaces = (
+            _edited_face_surface(
+                first_child_id,
+                area_square_meters=1.25,
+            ),
+            _edited_face_surface(
+                second_child_id,
+                area_square_meters=2.75,
+                x_offset=3.0,
+            ),
+        )
+
+        with patch(
+            "housemaker.surface_texture_workspace.build_fixed_surfaces",
+            return_value=list(child_surfaces),
+        ):
+            remapped = self.workspace.remap_assignments_with_surface_lineage(
+                [next_level],
+                {parent_id: (first_child_id, second_child_id)},
+            )
+
+        self.assertTrue(remapped)
+        updated = self.workspace.get_assignment(assignment.assignment_id)
+        assert updated is not None
+        self.assertEqual(
+            updated.surface_ids,
+            (first_child_id, second_child_id),
+        )
+        self.assertAlmostEqual(updated.combined_area_m2, 4.0)
+        self.assertEqual(
+            updated.area_description,
+            "2 wall surface(s), 4.00 m²",
+        )
+        for field_name in (
+            "assignment_id",
+            "provider",
+            "provider_task_id",
+            "provider_pbr_task_id",
+            "asset_path",
+            "reference_frame_indices",
+            "display_name",
+            "enabled_pbr_maps",
+        ):
+            self.assertEqual(
+                getattr(updated, field_name),
+                getattr(assignment, field_name),
+            )
+        self.assertNotEqual(
+            self.workspace.get_preview_dependency_signature(),
+            signature_before,
+        )
+        self.assertEqual(changed.count(), 1)
+        self.assertEqual(content_changed.count(), 1)
+        self.assertEqual(removed.count(), 0)
+
+    def test_lineage_remap_rolls_back_and_raises_on_refresh_failure(self) -> None:
+        parent_id = "level:2/room:5/wall:1:2"
+        child_id = f"level:2/edit-face:{'c' * 32}:wall"
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(parents=True, exist_ok=True)
+        asset_path = asset_directory / "rollback.png"
+        asset_path.write_bytes(_colored_texture_png((150, 70, 30, 255)))
+        assignment = _surface_assignment(
+            "rollback-family",
+            (parent_id,),
+            asset_path.name,
+        )
+        self.workspace.set_data(
+            SurfaceTextureData(assignments=[assignment])
+        )
+        next_level = copy.deepcopy(_test_level())
+        next_level.height_meters += 0.25
+        child_surface = _edited_face_surface(
+            child_id,
+            area_square_meters=2.0,
+        )
+        changed = QSignalSpy(self.workspace.data_changed)
+        content_changed = QSignalSpy(self.workspace.surface_content_changed)
+
+        with (
+            patch(
+                "housemaker.surface_texture_workspace.build_fixed_surfaces",
+                return_value=[child_surface],
+            ),
+            patch.object(
+                self.workspace,
+                "_restore_assignment_textures",
+                side_effect=RuntimeError("render failed"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "previous assignments were kept",
+            ):
+                self.workspace.remap_assignments_with_surface_lineage(
+                    [next_level],
+                    {parent_id: (child_id,)},
+                )
+
+        self.assertEqual(
+            self.workspace.get_assignment(assignment.assignment_id),
+            assignment,
+        )
+        self.assertEqual(changed.count(), 0)
+        self.assertEqual(content_changed.count(), 0)
+
+    def test_lineage_remap_rejects_missing_or_cross_type_children(self) -> None:
+        parent_id = "level:2/room:5/wall:1:2"
+        missing_id = f"level:2/edit-face:{'d' * 32}:wall"
+        floor_id = f"level:2/edit-face:{'e' * 32}:floor"
+        previous_assignments = self.workspace.get_assignments()
+
+        with self.assertRaisesRegex(ValueError, "retain its parent's"):
+            self.workspace.remap_assignments_with_surface_lineage(
+                [_test_level()],
+                {parent_id: (floor_id,)},
+            )
+        with self.assertRaisesRegex(ValueError, "does not exist"):
+            self.workspace.remap_assignments_with_surface_lineage(
+                [_test_level()],
+                {parent_id: (missing_id,)},
+            )
+
+        self.assertEqual(
+            self.workspace.get_assignments(),
+            previous_assignments,
+        )
 
     def test_excluding_level_keeps_its_surface_texture_assignment(self) -> None:
         level = copy.deepcopy(self.workspace._levels[0])

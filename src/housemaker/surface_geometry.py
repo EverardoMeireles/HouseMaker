@@ -69,6 +69,8 @@ class FixedSurface:
     wall_start_world: tuple[float, float, float] | None = None
     wall_end_world: tuple[float, float, float] | None = None
     wall_height_meters: float | None = None
+    source_surface_id: str | None = None
+    is_directly_drawn: bool = False
 
     def __post_init__(self) -> None:
         if not self.surface_id:
@@ -82,6 +84,13 @@ class FixedSurface:
             or float(self.area_square_meters) <= 0.0
         ):
             raise ValueError("A fixed surface area must be finite and positive.")
+        if self.source_surface_id is not None:
+            source_surface_id = str(self.source_surface_id).strip()
+            if not source_surface_id:
+                raise ValueError("A fixed surface source ID cannot be empty.")
+            object.__setattr__(self, "source_surface_id", source_surface_id)
+        if not isinstance(self.is_directly_drawn, bool):
+            raise TypeError("Fixed-surface drawing provenance must be boolean.")
 
 
 @dataclass(frozen=True)
@@ -116,6 +125,18 @@ class WallWindowPlacement:
 # ### Public surface builders ###
 def build_fixed_surfaces(levels: Sequence[LevelData]) -> list[FixedSurface]:
     """Build walls, floors, and ceilings with stable semantic identities."""
+
+    from housemaker.architectural_surface_edits import apply_editable_surfaces
+
+    base_surfaces = build_base_fixed_surfaces(levels)
+    return sorted(
+        apply_editable_surfaces(levels, base_surfaces),
+        key=_get_surface_sort_key,
+    )
+
+
+def build_base_fixed_surfaces(levels: Sequence[LevelData]) -> list[FixedSurface]:
+    """Build generated semantic surfaces before authored topology edits."""
 
     level_base_z = build_level_base_z_lookup(levels)
     surfaces: list[FixedSurface] = []
@@ -921,7 +942,10 @@ def _build_horizontal_surface(
             ]
             if len(points) != 3:
                 continue
-            if _signed_triangle_area(points) < 0.0:
+            signed_area = _signed_triangle_area(points)
+            if abs(signed_area) <= SURFACE_GEOMETRY_EPSILON:
+                continue
+            if signed_area < 0.0:
                 points.reverse()
             indices: list[int] = []
             for point in points:

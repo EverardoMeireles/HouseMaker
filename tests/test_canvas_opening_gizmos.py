@@ -35,6 +35,7 @@ from housemaker.viewer import (
     CANVAS_OPENING_SIDE_RIGHT,
     CANVAS_OPENING_SIDE_SIZE_PIXELS,
     CANVAS_OPENING_SIDE_TOP,
+    CANVAS_SURFACE_SELECTION_COLOR,
     GlbViewerWidget,
     _CanvasOpeningGizmoHandle,
 )
@@ -221,6 +222,7 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
         first_items = tuple(viewer._canvas_opening_gizmo_items)
 
         self.assertEqual(len(first_items), 3)
+        self.assertEqual(first_items[0].color, CANVAS_SURFACE_SELECTION_COLOR)
         for item in first_items:
             self.assertEqual(
                 item.depthValue(),

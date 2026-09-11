@@ -23,7 +23,7 @@ from housemaker.video_source import VideoMetadata
 
 
 # ### Constants ###
-SURFACE_TEXTURE_SCHEMA_VERSION = 8
+SURFACE_TEXTURE_SCHEMA_VERSION = 9
 SURFACE_PBR_ALIGNMENT_VERSION = 1
 SURFACE_TYPE_WALL = "wall"
 SURFACE_TYPE_FLOOR = "floor"
@@ -53,11 +53,29 @@ SURFACE_TEXTURE_RESOLUTIONS = (512, 1024, 2048)
 DEFAULT_SURFACE_TEXTURE_RESOLUTION = 1024
 _SURFACE_ID_PATTERN = re.compile(
     r"^level:(?P<level_index>0|[1-9]\d*)/"
+    r"(?:"
     r"(?:room:(?P<room_identity>0|[1-9]\d*)/)?"
     r"(?:(?P<wall>wall):(?P<wall_key>[1-9]\d*:[1-9]\d*)|"
-    r"(?P<plane>floor|ceiling))$"
+    r"(?P<plane>floor|ceiling))|"
+    r"edit-face:(?P<edit_face_id>[0-9a-f]{32}):"
+    r"(?P<edit_face_type>wall|floor|ceiling)"
+    r")$"
 )
 _LEGACY_SURFACE_OVERLAY_ID_PATTERN = re.compile(r"/overlay:[1-9]\d*$")
+
+
+# ### Public surface ID helpers ###
+def normalize_surface_id(surface_id: object) -> str:
+    """Return one supported stable semantic or edited-face surface ID."""
+
+    return _normalize_surface_id(surface_id)
+
+
+def get_surface_type_for_id(surface_id: object) -> str:
+    """Return the material surface type encoded in a stable surface ID."""
+
+    normalized_id = _normalize_surface_id(surface_id)
+    return _surface_type_for_id(normalized_id)
 
 
 # ### Generated-texture models ###
@@ -808,6 +826,9 @@ def _surface_type_for_id(surface_id: str) -> str:
     match = _SURFACE_ID_PATTERN.fullmatch(surface_id)
     if match is None:
         raise ValueError(f"Invalid fixed-surface ID: {surface_id!r}.")
+    edit_face_type = match.group("edit_face_type")
+    if edit_face_type is not None:
+        return str(edit_face_type)
     return SURFACE_TYPE_WALL if match.group("wall") else str(match.group("plane"))
 
 

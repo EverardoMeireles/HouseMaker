@@ -73,6 +73,8 @@ from housemaker.surface_texture_state import (
     SurfaceTextureAssignment,
     SurfaceTextureData,
     SurfaceTextureVariant,
+    get_surface_type_for_id,
+    normalize_surface_id,
 )
 from housemaker.surface_texture_variants import (
     DEFAULT_SURFACE_TEXTURE_RESOLUTION,
@@ -173,6 +175,101 @@ def _build_all_existing_surfaces(
         surface.surface_id: surface
         for surface in build_fixed_surfaces(all_included_levels)
     }
+
+
+# ### Surface lineage helpers ###
+def _normalize_surface_lineage_replacements(
+    replacements: Mapping[str, Sequence[str]],
+) -> dict[str, tuple[str, ...]]:
+    """Validate terminal one-to-many face lineage without reordering it."""
+
+    if not isinstance(replacements, Mapping):
+        raise TypeError("Surface lineage replacements must contain a mapping.")
+    normalized: dict[str, tuple[str, ...]] = {}
+    child_owner_by_id: dict[str, str] = {}
+    for raw_parent_id, raw_child_ids in replacements.items():
+        parent_id = normalize_surface_id(raw_parent_id)
+        if isinstance(raw_child_ids, str | bytes):
+            raise TypeError("Surface lineage children must contain a sequence.")
+        try:
+            child_values = tuple(raw_child_ids)
+        except TypeError as error:
+            raise TypeError(
+                "Surface lineage children must contain a sequence."
+            ) from error
+        child_ids = tuple(
+            dict.fromkeys(normalize_surface_id(value) for value in child_values)
+        )
+        parent_type = get_surface_type_for_id(parent_id)
+        parent_level = parent_id.split("/", maxsplit=1)[0]
+        for child_id in child_ids:
+            if get_surface_type_for_id(child_id) != parent_type:
+                raise ValueError(
+                    "A replacement face must retain its parent's surface type."
+                )
+            if child_id.split("/", maxsplit=1)[0] != parent_level:
+                raise ValueError(
+                    "A replacement face must remain on its parent's level."
+                )
+            previous_owner = child_owner_by_id.get(child_id)
+            if previous_owner is not None and previous_owner != parent_id:
+                raise ValueError(
+                    "A replacement face cannot descend from two surfaces."
+                )
+            child_owner_by_id[child_id] = parent_id
+        previous_children = normalized.get(parent_id)
+        if previous_children is not None and previous_children != child_ids:
+            raise ValueError(
+                "Surface lineage contains conflicting normalized parent IDs."
+            )
+        normalized[parent_id] = child_ids
+    return normalized
+
+
+def _validate_surface_lineage_children(
+    replacements: Mapping[str, Sequence[str]],
+    surfaces_by_id: Mapping[str, FixedSurface],
+) -> None:
+    """Require every terminal child to exist with its declared type."""
+
+    for child_ids in replacements.values():
+        for child_id in child_ids:
+            surface = surfaces_by_id.get(child_id)
+            if surface is None:
+                raise ValueError(
+                    f"Replacement surface does not exist: {child_id!r}."
+                )
+            if surface.surface_type != get_surface_type_for_id(child_id):
+                raise ValueError(
+                    f"Replacement surface has an inconsistent type: "
+                    f"{child_id!r}."
+                )
+
+
+def _remap_assignment_surface_ids(
+    assignment: SurfaceTextureAssignment,
+    replacements: Mapping[str, Sequence[str]],
+    surfaces_by_id: Mapping[str, FixedSurface],
+) -> tuple[str, ...]:
+    """Expand lineage first, then perform ordinary stale-ID reconciliation."""
+
+    expanded_ids: list[str] = []
+    for surface_id in assignment.surface_ids:
+        expanded_ids.extend(replacements.get(surface_id, (surface_id,)))
+    current_ids = tuple(
+        surface_id
+        for surface_id in dict.fromkeys(expanded_ids)
+        if surface_id in surfaces_by_id
+    )
+    if any(
+        surfaces_by_id[surface_id].surface_type != assignment.surface_type
+        for surface_id in current_ids
+    ):
+        raise ValueError(
+            "A texture assignment cannot follow lineage into another "
+            "surface type."
+        )
+    return current_ids
 
 
 # ### Asset revision helpers ###
@@ -614,6 +711,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                         )
                         for map_type, asset_path in raw_map_paths.items()
                     ),
+                    assignment.surface_ids,
                 )
             )
         return tuple(signature)
@@ -659,6 +757,9 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 assignment.assignment_id,
                 assignment.surface_type,
                 assignment.display_name,
+                assignment.surface_ids,
+                float(assignment.combined_area_m2).hex(),
+                assignment.area_description,
                 assignment.selected_texture_resolution,
                 assignment.asset_path,
                 _get_cached_surface_asset_revision(
@@ -875,6 +976,101 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             self.surface_content_changed.emit()
         return True
 
+    def remap_assignments_with_surface_lineage(
+        self,
+        levels: Sequence[LevelData],
+        replacements: Mapping[str, Sequence[str]],
+        *,
+        emit_signals: bool = True,
+    ) -> bool:
+        """Atomically preserve texture families across surface topology edits.
+
+        ``replacements`` maps each retired logical face to its current child
+        faces. Lineage expansion happens before unrelated stale surfaces are
+        reconciled, so a still-used texture family never passes through a
+        transient zero-target state.
+        """
+
+        normalized_replacements = _normalize_surface_lineage_replacements(
+            replacements
+        )
+        previous_semantic_signature = self._semantic_surface_cache_signature
+        previous_semantic_surfaces = dict(self._semantic_surfaces_by_id)
+        try:
+            surfaces_by_id = self._all_existing_surfaces_by_id(levels)
+            _validate_surface_lineage_children(
+                normalized_replacements,
+                surfaces_by_id,
+            )
+        except (TypeError, ValueError):
+            self._semantic_surface_cache_signature = previous_semantic_signature
+            self._semantic_surfaces_by_id = previous_semantic_surfaces
+            raise
+        surface_areas = {
+            surface_id: float(surface.area_square_meters)
+            for surface_id, surface in surfaces_by_id.items()
+        }
+        next_assignments = [
+            self._assignment_with_surfaces(
+                assignment,
+                _remap_assignment_surface_ids(
+                    assignment,
+                    normalized_replacements,
+                    surfaces_by_id,
+                ),
+                surface_areas=surface_areas,
+            )
+            for assignment in self._data.assignments
+        ]
+        if next_assignments == self._data.assignments:
+            return False
+
+        previous_assignments = list(self._data.assignments)
+        previous_atlas_entry_cache = dict(self._texture_atlas_entry_cache)
+        previous_restored_signature = (
+            self._restored_assignment_texture_signature
+        )
+        previous_catalog_signature = self._texture_catalog_dependency_signature
+        previous_other_list_signature = self._other_texture_list_signature
+        self._data.assignments = next_assignments
+        self._invalidate_assignment_caches()
+        try:
+            self._restore_assignment_textures()
+            self._refresh_texture_atlases()
+            self._sync_selection_status()
+            self._sync_controls()
+        except Exception as error:
+            self._data.assignments = previous_assignments
+            self._semantic_surface_cache_signature = previous_semantic_signature
+            self._semantic_surfaces_by_id = previous_semantic_surfaces
+            self._texture_atlas_entry_cache = previous_atlas_entry_cache
+            self._restored_assignment_texture_signature = (
+                previous_restored_signature
+            )
+            self._texture_catalog_dependency_signature = (
+                previous_catalog_signature
+            )
+            self._other_texture_list_signature = previous_other_list_signature
+            try:
+                self._restore_assignment_textures()
+                self._refresh_texture_atlases()
+            except Exception:
+                pass
+            self.status_label.setText(
+                "Surface texture assignments could not follow the edited "
+                "faces; the previous assignments were kept."
+            )
+            self._sync_controls()
+            raise RuntimeError(
+                "Surface texture assignments could not follow the edited "
+                "faces; the previous assignments were kept."
+            ) from error
+
+        if emit_signals:
+            self._emit_data_changed()
+            self.surface_content_changed.emit()
+        return True
+
     def _reconcile_assignment_targets(
         self,
         levels: Sequence[LevelData],
@@ -910,9 +1106,16 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         if next_assignments == self._data.assignments:
             return False
         self._data.assignments = next_assignments
+        self._invalidate_assignment_caches()
+        return True
+
+    def _invalidate_assignment_caches(self) -> None:
+        """Retire every cache whose content depends on assignment targets."""
+
         self._restored_assignment_texture_signature = None
         self._texture_atlas_entry_cache.clear()
-        return True
+        self._texture_catalog_dependency_signature = None
+        self._other_texture_list_signature = None
 
     def can_select_assignment_texture_resolution(
         self,
