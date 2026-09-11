@@ -24,6 +24,10 @@ from housemaker.glb import (
     GeneratedModel,
     _serialize_scene_glb_with_half_mesh_extras,
 )
+from housemaker.object_ao_baking import (
+    ObjectAmbientOcclusionTarget,
+    bake_placed_object_ambient_occlusion,
+)
 from housemaker.pbr_maps import (
     ATLAS_MAP_BASE_COLOR,
     ATLAS_MAP_TYPES,
@@ -51,6 +55,7 @@ ATLAS_ID_METADATA_KEY = "housemaker_atlas_id"
 UV_TOLERANCE = 1e-6
 GEOMETRY_EPSILON = 1e-12
 MAX_TILED_SURFACE_TRIANGLES = 2_000_000
+PACKED_ORM_MATERIAL_MARKER_PREFIX = "__housemaker_packed_orm__:"
 
 
 # ### Public data models ###
@@ -132,6 +137,7 @@ class _HalfModelPart:
     fragment: trimesh.Trimesh
     world_transform: np.ndarray
     metadata: dict[str, object]
+    atlas_id: str | None = None
 
 
 # ### Public export helpers ###
@@ -184,6 +190,26 @@ def apply_texture_atlases_to_export(
     }
     atlas_materials: dict[str, PBRMaterial] = {}
     shared_glass_materials: dict[str, object] = {}
+    object_ao_targets: dict[str, list[ObjectAmbientOcclusionTarget]] = {
+        item.atlas.atlas_id: [] for item in normalized_atlases
+    }
+    opaque_occluders: list[trimesh.Trimesh] = []
+    ao_eligible_atlas_ids = {
+        item.atlas.atlas_id
+        for item in normalized_atlases
+        if item.active_map_types & {PBR_MAP_ROUGHNESS, PBR_MAP_METALLIC}
+    }
+    ao_eligible_source_ids = {
+        placement.object_id
+        for item in normalized_atlases
+        if item.atlas.atlas_id in ao_eligible_atlas_ids
+        for placement in item.atlas.placements
+    }
+    has_object_ao_receiver = _scene_contains_object_ao_receiver(
+        model.scene,
+        ao_eligible_source_ids,
+        normalized_surface_sources,
+    )
     occupied_names: set[str] = {str(output_scene.graph.base_frame)}
     passthrough_index = 0
 
@@ -203,10 +229,22 @@ def apply_texture_atlases_to_export(
 
         for face_indices, material in _iter_face_material_groups(geometry):
             fragment = _build_face_fragment(geometry, face_indices, material)
-            if (
-                binding is not None
-                and not is_housemaker_glass_material(material)
-            ):
+            is_glass = is_housemaker_glass_material(material)
+            mirror_plane = None
+            if has_object_ao_receiver and not is_glass:
+                world_occluder = _build_world_occluder(
+                    fragment,
+                    world_transform,
+                )
+                opaque_occluders.append(world_occluder)
+                if half_context is not None:
+                    mirror_plane = _resolve_half_mirror_plane(half_context.metadata)
+                    mirrored_occluder = _build_mirrored_half_occluder(
+                        world_occluder,
+                        mirror_plane,
+                    )
+                    opaque_occluders.append(mirrored_occluder)
+            if binding is not None and not is_glass:
                 atlas_item, placement = binding
                 try:
                     remapped = _remap_fragment_to_atlas(
@@ -220,31 +258,43 @@ def apply_texture_atlases_to_export(
                         f"Atlas source {source_id!r} cannot share its material: "
                         f"{error}"
                     ) from error
+                atlas_id = atlas_item.atlas.atlas_id
                 if half_context is not None:
-                    atlas_material = _get_atlas_material(
-                        atlas_item,
-                        atlas_materials,
-                    )
-                    remapped.visual = TextureVisuals(
-                        uv=_optional_valid_uv(remapped),
-                        material=atlas_material,
-                    )
-                    half_parts_by_marker[
-                        half_context.source_marker_name
-                    ].append(
+                    world_fragment = remapped.copy()
+                    world_fragment.apply_transform(world_transform)
+                    if not is_surface and atlas_id in ao_eligible_atlas_ids:
+                        assert mirror_plane is not None
+                        mirror_point, mirror_normal = mirror_plane
+                        object_ao_targets[atlas_id].append(
+                            ObjectAmbientOcclusionTarget(
+                                mesh=world_fragment,
+                                atlas_pixel_bounds=_placement_pixel_bounds(placement),
+                                mirror_plane_point=mirror_point,
+                                mirror_plane_normal=mirror_normal,
+                            )
+                        )
+                    half_parts_by_marker[half_context.source_marker_name].append(
                         _HalfModelPart(
                             fragment=remapped,
                             world_transform=world_transform,
                             metadata=node_metadata,
+                            atlas_id=atlas_id,
                         )
                     )
                     continue
                 remapped.apply_transform(world_transform)
-                atlas_parts[atlas_item.atlas.atlas_id].append(remapped)
-                atlas_source_ids[atlas_item.atlas.atlas_id].add(source_id)
+                if not is_surface and atlas_id in ao_eligible_atlas_ids:
+                    object_ao_targets[atlas_id].append(
+                        ObjectAmbientOcclusionTarget(
+                            mesh=remapped,
+                            atlas_pixel_bounds=_placement_pixel_bounds(placement),
+                        )
+                    )
+                atlas_parts[atlas_id].append(remapped)
+                atlas_source_ids[atlas_id].add(source_id)
                 continue
 
-            if is_housemaker_glass_material(material):
+            if is_glass:
                 _apply_shared_glass_material(
                     fragment,
                     material,
@@ -272,6 +322,20 @@ def apply_texture_atlases_to_export(
                 node_name=name,
             )
 
+    ambient_occlusion_by_atlas = bake_placed_object_ambient_occlusion(
+        {
+            atlas_id: tuple(targets)
+            for atlas_id, targets in object_ao_targets.items()
+            if targets
+        },
+        {
+            atlas_id: materialized_by_id[atlas_id].atlas.resolution
+            for atlas_id, targets in object_ao_targets.items()
+            if targets
+        },
+        tuple(opaque_occluders),
+    )
+
     half_model_count = 0
     for marker_name, context in half_contexts.items():
         parts = half_parts_by_marker[marker_name]
@@ -282,6 +346,9 @@ def apply_texture_atlases_to_export(
             context,
             parts,
             occupied_names,
+            materialized_by_id,
+            atlas_materials,
+            ambient_occlusion_by_atlas,
         )
         half_model_count += 1
 
@@ -290,7 +357,11 @@ def apply_texture_atlases_to_export(
         if not parts:
             continue
         atlas_item = materialized_by_id[atlas_id]
-        material = _get_atlas_material(atlas_item, atlas_materials)
+        material = _get_atlas_material(
+            atlas_item,
+            atlas_materials,
+            ambient_occlusion_by_atlas,
+        )
         combined = _combine_textured_parts(parts, material)
         combined.metadata[ATLAS_ID_METADATA_KEY] = atlas_id
         combined.metadata["housemaker_atlas_source_ids"] = sorted(
@@ -309,10 +380,32 @@ def apply_texture_atlases_to_export(
 
     if batched_count == 0 and half_model_count == 0:
         return model
-    exported = _serialize_scene_glb_with_half_mesh_extras(
-        output_scene,
-        failure_message="The texture Atlas scene could not be exported.",
-    )
+    packed_orm_material_names: dict[str, str] = {}
+    renamed_materials: list[tuple[PBRMaterial, str]] = []
+    occupied_material_names = _collect_scene_material_names(output_scene)
+    for atlas_id in sorted(ambient_occlusion_by_atlas):
+        material = atlas_materials.get(atlas_id)
+        if material is None:
+            continue
+        final_name = materialized_by_id[atlas_id].atlas.name
+        marker_name = _reserve_name(
+            f"{PACKED_ORM_MATERIAL_MARKER_PREFIX}{atlas_id}",
+            occupied_material_names,
+        )
+        material.name = marker_name
+        renamed_materials.append((material, final_name))
+        packed_orm_material_names[marker_name] = final_name
+    try:
+        exported = _serialize_scene_glb_with_half_mesh_extras(
+            output_scene,
+            failure_message="The texture Atlas scene could not be exported.",
+            packed_orm_material_names=packed_orm_material_names,
+        )
+    finally:
+        for material, final_name in renamed_materials:
+            material.name = final_name
+    for material, _final_name in renamed_materials:
+        material.occlusionTexture = material.metallicRoughnessTexture
     return replace(
         model,
         scene=output_scene,
@@ -384,15 +477,96 @@ def _get_scene_node_metadata(
     return copy.deepcopy(dict(raw_metadata))
 
 
+def _resolve_half_mirror_plane(
+    node_metadata: Mapping[str, object],
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """Read one validated world-space mirror plane for AO processing."""
+
+    raw_half_mesh = node_metadata.get(HALF_MESH_EXTRAS_KEY)
+    if not isinstance(raw_half_mesh, Mapping):
+        raise TypeError("A half-model AO mirror plane is missing.")
+    raw_plane = raw_half_mesh.get("mirrorPlane")
+    if not isinstance(raw_plane, Mapping):
+        raise TypeError("A half-model AO mirror plane is invalid.")
+    point = np.asarray(raw_plane.get("point"), dtype=float)
+    normal = np.asarray(raw_plane.get("normal"), dtype=float)
+    if (
+        point.shape != (3,)
+        or normal.shape != (3,)
+        or not np.all(np.isfinite(point))
+        or not np.all(np.isfinite(normal))
+    ):
+        raise ValueError("A half-model AO mirror plane is invalid.")
+    normal_length = float(np.linalg.norm(normal))
+    if normal_length <= GEOMETRY_EPSILON:
+        raise ValueError("A half-model AO mirror plane is invalid.")
+    normal /= normal_length
+    return (
+        tuple(float(value) for value in point),
+        tuple(float(value) for value in normal),
+    )
+
+
+def _build_mirrored_half_occluder(
+    world_fragment: trimesh.Trimesh,
+    mirror_plane: tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+    ],
+) -> trimesh.Trimesh:
+    """Build the runtime mirror as ray-only geometry for symmetric AO."""
+
+    point = np.asarray(mirror_plane[0], dtype=float)
+    normal = np.asarray(mirror_plane[1], dtype=float)
+    vertices = np.asarray(world_fragment.vertices, dtype=float)
+    signed_distances = (vertices - point) @ normal
+    mirrored_vertices = vertices - 2.0 * signed_distances[:, np.newaxis] * normal
+    mirrored_faces = np.asarray(world_fragment.faces, dtype=np.int64)[:, (0, 2, 1)]
+    return trimesh.Trimesh(
+        vertices=np.ascontiguousarray(mirrored_vertices),
+        faces=np.ascontiguousarray(mirrored_faces),
+        process=False,
+    )
+
+
+def _build_world_occluder(
+    fragment: trimesh.Trimesh,
+    world_transform: np.ndarray,
+) -> trimesh.Trimesh:
+    """Copy only geometry needed by Embree, without texture payloads."""
+
+    occluder = trimesh.Trimesh(
+        vertices=np.asarray(fragment.vertices, dtype=float).copy(),
+        faces=np.asarray(fragment.faces, dtype=np.int64).copy(),
+        process=False,
+    )
+    occluder.apply_transform(world_transform)
+    return occluder
+
+
 def _append_half_model_meshes_to_scene(
     output_scene: trimesh.Scene,
     context: _HalfModelContext,
     parts: Sequence[_HalfModelPart],
     occupied_names: set[str],
+    materialized_by_id: Mapping[str, MaterializedTextureAtlas],
+    material_cache: dict[str, PBRMaterial],
+    ambient_occlusion_by_atlas: Mapping[str, np.ndarray],
 ) -> None:
     """Emit marked authored meshes directly, without an empty parent node."""
 
     for part_index, part in enumerate(parts, start=1):
+        if part.atlas_id is not None:
+            atlas_item = materialized_by_id[part.atlas_id]
+            material = _get_atlas_material(
+                atlas_item,
+                material_cache,
+                ambient_occlusion_by_atlas,
+            )
+            part.fragment.visual = TextureVisuals(
+                uv=_optional_valid_uv(part.fragment),
+                material=material,
+            )
         child_metadata = copy.deepcopy(part.metadata)
         child_metadata.pop(HALF_MESH_EXTRAS_KEY, None)
         child_metadata.update(copy.deepcopy(context.metadata))
@@ -454,17 +628,42 @@ def _resolve_geometry_source_id(
     return str(object_id), False
 
 
+def _scene_contains_object_ao_receiver(
+    scene: trimesh.Scene,
+    eligible_source_ids: set[str],
+    surface_source_ids: Mapping[str, str],
+) -> bool:
+    """Return whether the exported scene can produce an object AO target."""
+
+    if not eligible_source_ids:
+        return False
+    for geometry in scene.geometry.values():
+        if not isinstance(geometry, trimesh.Trimesh) or not len(geometry.faces):
+            continue
+        source_id, is_surface = _resolve_geometry_source_id(
+            geometry,
+            surface_source_ids,
+        )
+        if not is_surface and source_id in eligible_source_ids:
+            return True
+    return False
+
+
 # ### Material helpers ###
 def _get_atlas_material(
     atlas_item: MaterializedTextureAtlas,
     material_cache: dict[str, PBRMaterial],
+    ambient_occlusion_by_atlas: Mapping[str, np.ndarray],
 ) -> PBRMaterial:
     """Build one shared material instance per exported Atlas."""
 
     atlas_id = atlas_item.atlas.atlas_id
     material = material_cache.get(atlas_id)
     if material is None:
-        material = _build_atlas_material(atlas_item)
+        material = _build_atlas_material(
+            atlas_item,
+            ambient_occlusion=ambient_occlusion_by_atlas.get(atlas_id),
+        )
         material_cache[atlas_id] = material
     return material
 
@@ -489,7 +688,29 @@ def _apply_shared_glass_material(
     )
 
 
-def _build_atlas_material(atlas_item: MaterializedTextureAtlas) -> PBRMaterial:
+def _collect_scene_material_names(scene: trimesh.Scene) -> set[str]:
+    """Collect user-visible names before reserving transient GLB markers."""
+
+    result: set[str] = set()
+    for geometry in scene.geometry.values():
+        material = getattr(getattr(geometry, "visual", None), "material", None)
+        materials = (
+            tuple(material.materials)
+            if isinstance(material, MultiMaterial)
+            else (material,)
+        )
+        for leaf in materials:
+            name = getattr(leaf, "name", None)
+            if name is not None:
+                result.add(str(name))
+    return result
+
+
+def _build_atlas_material(
+    atlas_item: MaterializedTextureAtlas,
+    *,
+    ambient_occlusion: np.ndarray | None = None,
+) -> PBRMaterial:
     active_map_types = atlas_item.active_map_types
     maps = {
         map_type: _load_rgba(atlas_item.map_paths[map_type])
@@ -513,10 +734,20 @@ def _build_atlas_material(atlas_item: MaterializedTextureAtlas) -> PBRMaterial:
     )
     has_roughness = PBR_MAP_ROUGHNESS in active_map_types
     has_metallic = PBR_MAP_METALLIC in active_map_types
+    normalized_ambient_occlusion = _normalize_ambient_occlusion(
+        ambient_occlusion,
+        expected_size,
+    )
+    if normalized_ambient_occlusion is not None and not (has_roughness or has_metallic):
+        raise ValueError("Object AO requires an existing metallic-roughness Atlas map.")
     metallic_roughness_texture = None
     if has_roughness or has_metallic:
         metallic_roughness = np.empty_like(base)
-        metallic_roughness[:, :, 0] = 255
+        metallic_roughness[:, :, 0] = (
+            255
+            if normalized_ambient_occlusion is None
+            else normalized_ambient_occlusion
+        )
         metallic_roughness[:, :, 1] = (
             maps[PBR_MAP_ROUGHNESS][:, :, 0] if has_roughness else 255
         )
@@ -538,6 +769,20 @@ def _build_atlas_material(atlas_item: MaterializedTextureAtlas) -> PBRMaterial:
         roughnessFactor=1.0,
         doubleSided=True,
     )
+
+
+def _normalize_ambient_occlusion(
+    ambient_occlusion: np.ndarray | None,
+    expected_size: tuple[int, int],
+) -> np.ndarray | None:
+    if ambient_occlusion is None:
+        return None
+    values = np.asarray(ambient_occlusion)
+    if values.shape != expected_size or values.dtype != np.uint8:
+        raise ValueError(
+            "Object AO dimensions must match the texture Atlas resolution."
+        )
+    return np.ascontiguousarray(values)
 
 
 def _load_rgba(path: Path) -> np.ndarray:
@@ -758,6 +1003,27 @@ def _placement_content_region(
         content_y,
         content_width,
         content_height,
+    )
+
+
+def _placement_pixel_bounds(
+    placement: TextureAtlasPlacement,
+) -> tuple[int, int, int, int]:
+    """Return the exclusive Atlas-pixel bounds owned by one placement."""
+
+    (
+        _source_lower,
+        _source_upper,
+        content_x,
+        content_y,
+        content_width,
+        content_height,
+    ) = _placement_content_region(placement)
+    return (
+        round(content_x),
+        round(content_y),
+        round(content_x + content_width),
+        round(content_y + content_height),
     )
 
 

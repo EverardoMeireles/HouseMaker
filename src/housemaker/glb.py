@@ -3121,8 +3121,9 @@ def _serialize_scene_glb_with_half_mesh_extras(
     scene: trimesh.Scene,
     *,
     failure_message: str,
+    packed_orm_material_names: Mapping[str, str] | None = None,
 ) -> bytes:
-    """Serialize a scene while explicitly preserving half-mesh node extras."""
+    """Serialize a scene while preserving HouseMaker glTF metadata."""
 
     if not isinstance(scene, trimesh.Scene):
         raise TypeError("GLB serialization requires a triangle-mesh scene.")
@@ -3134,6 +3135,7 @@ def _serialize_scene_glb_with_half_mesh_extras(
         bytes(payload),
         half_mesh_by_node_name,
         failure_message=failure_message,
+        packed_orm_material_names=packed_orm_material_names,
     )
 
 
@@ -3142,8 +3144,9 @@ def _rewrite_serialized_glb_half_mesh_extras(
     half_mesh_by_node_name: Mapping[str, Mapping[str, object]],
     *,
     failure_message: str,
+    packed_orm_material_names: Mapping[str, str] | None = None,
 ) -> bytes:
-    """Inject half-mesh extras into the literal final GLB JSON chunk."""
+    """Inject HouseMaker fields into the literal final GLB JSON chunk."""
 
     try:
         if (
@@ -3171,6 +3174,10 @@ def _rewrite_serialized_glb_half_mesh_extras(
     except (TypeError, UnicodeError, ValueError) as error:
         raise ValueError(failure_message) from error
 
+    _inject_packed_orm_occlusion_textures(
+        document,
+        packed_orm_material_names or {},
+    )
     _inject_half_mesh_extras_into_gltf_tree(
         document,
         half_mesh_by_node_name,
@@ -3203,6 +3210,63 @@ def _rewrite_serialized_glb_half_mesh_extras(
             trailing_chunks,
         )
     )
+
+
+def _inject_packed_orm_occlusion_textures(
+    document: dict[str, object],
+    packed_orm_material_names: Mapping[str, str],
+) -> None:
+    """Point marked glTF AO and metallic-roughness slots at one texture."""
+
+    if not packed_orm_material_names:
+        return
+    normalized_names: dict[str, str] = {}
+    for raw_marker_name, raw_final_name in packed_orm_material_names.items():
+        marker_name = str(raw_marker_name)
+        final_name = str(raw_final_name)
+        if not marker_name or not final_name:
+            raise ValueError("Packed ORM material names cannot be empty.")
+        normalized_names[marker_name] = final_name
+
+    materials = document.get("materials")
+    textures = document.get("textures")
+    if not isinstance(materials, list) or not isinstance(textures, list):
+        raise ValueError("The packed ORM GLB material data is missing.")
+    found_marker_names: set[str] = set()
+    for material in materials:
+        if not isinstance(material, dict):
+            continue
+        marker_name = material.get("name")
+        if not isinstance(marker_name, str) or marker_name not in normalized_names:
+            continue
+        if marker_name in found_marker_names:
+            raise ValueError("Packed ORM material markers must be unique.")
+        pbr = material.get("pbrMetallicRoughness")
+        metallic_roughness = (
+            pbr.get("metallicRoughnessTexture")
+            if isinstance(pbr, dict)
+            else None
+        )
+        texture_index = (
+            metallic_roughness.get("index")
+            if isinstance(metallic_roughness, dict)
+            else None
+        )
+        if (
+            isinstance(texture_index, bool)
+            or not isinstance(texture_index, int)
+            or texture_index < 0
+            or texture_index >= len(textures)
+        ):
+            raise ValueError(
+                "A packed ORM material has no metallic-roughness texture."
+            )
+        material["occlusionTexture"] = copy.deepcopy(metallic_roughness)
+        material["name"] = normalized_names[marker_name]
+        found_marker_names.add(marker_name)
+
+    if found_marker_names != set(normalized_names):
+        raise ValueError("A packed ORM material was not exported.")
 
 
 def _collect_half_mesh_extras_by_node_name(

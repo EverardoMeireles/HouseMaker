@@ -11,6 +11,7 @@ description = "Desktop blueprint-to-GLB house prototyping app."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "embreex>=4.4,<5",
     "numpy>=1.26",
     "opencv-python>=4.10",
     "Pillow>=10.4",

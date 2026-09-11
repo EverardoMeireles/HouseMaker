@@ -8,6 +8,7 @@ import unittest
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import trimesh
@@ -170,6 +171,37 @@ def _read_glb_json(payload: bytes) -> dict[str, object]:
     return json.loads(payload[20 : 20 + json_length].decode("utf-8"))
 
 
+def _read_glb_texture_rgba(
+    payload: bytes,
+    document: dict[str, object],
+    texture_index: int,
+) -> np.ndarray:
+    """Decode one embedded GLB texture through its public glTF references."""
+
+    texture = document["textures"][texture_index]
+    image = document["images"][texture["source"]]
+    buffer_view = document["bufferViews"][image["bufferView"]]
+    json_length = struct.unpack_from("<I", payload, 12)[0]
+    binary_header_offset = 20 + json_length
+    binary_length, binary_type = struct.unpack_from(
+        "<II",
+        payload,
+        binary_header_offset,
+    )
+    if binary_type != 0x004E4942:
+        raise AssertionError("The second GLB chunk is not binary data.")
+    binary_start = binary_header_offset + 8
+    byte_offset = int(buffer_view.get("byteOffset", 0))
+    byte_length = int(buffer_view["byteLength"])
+    if byte_offset + byte_length > binary_length:
+        raise AssertionError("The embedded GLB image leaves its buffer.")
+    encoded_image = payload[
+        binary_start + byte_offset : binary_start + byte_offset + byte_length
+    ]
+    with Image.open(BytesIO(encoded_image)) as decoded:
+        return np.asarray(decoded.convert("RGBA"), dtype=np.uint8).copy()
+
+
 def _assert_direct_half_mesh_nodes(
     document: dict[str, object],
     expected_half_mesh_by_name: dict[str, dict[str, object]],
@@ -324,6 +356,7 @@ class TextureAtlasExportTests(unittest.TestCase):
         pbr = material["pbrMetallicRoughness"]
         self.assertIn("baseColorTexture", pbr)
         self.assertNotIn("normalTexture", material)
+        self.assertNotIn("occlusionTexture", material)
         self.assertNotIn("metallicRoughnessTexture", pbr)
         self.assertEqual(pbr.get("metallicFactor", 1.0), 0.0)
         self.assertEqual(pbr.get("roughnessFactor", 1.0), 1.0)
@@ -338,6 +371,7 @@ class TextureAtlasExportTests(unittest.TestCase):
 
         pbr = material["pbrMetallicRoughness"]
         self.assertIn("normalTexture", material)
+        self.assertNotIn("occlusionTexture", material)
         self.assertNotIn("metallicRoughnessTexture", pbr)
         self.assertEqual(pbr.get("metallicFactor", 1.0), 0.0)
         self.assertEqual(pbr.get("roughnessFactor", 1.0), 1.0)
@@ -364,6 +398,10 @@ class TextureAtlasExportTests(unittest.TestCase):
                 pbr = material["pbrMetallicRoughness"]
                 self.assertNotIn("normalTexture", material)
                 self.assertIn("metallicRoughnessTexture", pbr)
+                self.assertEqual(
+                    material["occlusionTexture"]["index"],
+                    pbr["metallicRoughnessTexture"]["index"],
+                )
                 self.assertEqual(
                     pbr.get("metallicFactor", 1.0),
                     expected_metallic_factor,
@@ -513,6 +551,13 @@ class TextureAtlasExportTests(unittest.TestCase):
             for index, material in enumerate(document["materials"])
             if material["name"] == atlas.name
         )
+        atlas_material = document["materials"][atlas_material_index]
+        self.assertNotIn("occlusionTexture", atlas_material)
+        exported_orm = np.asarray(
+            atlas_meshes[0].visual.material.metallicRoughnessTexture.convert("RGBA"),
+            dtype=np.uint8,
+        )
+        self.assertTrue(np.all(exported_orm[:, :, 0] == 255))
         self.assertEqual(
             sum(
                 primitive.get("material") == atlas_material_index
@@ -678,6 +723,201 @@ class TextureAtlasExportTests(unittest.TestCase):
             for primitive in mesh["primitives"]
         )
         self.assertEqual(atlas_primitive_count, 1)
+
+    def test_object_ao_does_not_modify_surface_or_persisted_atlas_pixels(
+        self,
+    ) -> None:
+        resolution = 2048
+        object_id = "placed-object"
+        surface_source_id = "surface-texture:wall"
+        placements = [
+            TextureAtlasPlacement(
+                object_id=object_id,
+                texture_path="object.png",
+                texture_resolution=512,
+                x=0,
+                y=0,
+                size=512,
+            ),
+            TextureAtlasPlacement(
+                object_id=surface_source_id,
+                texture_path="surface.png",
+                texture_resolution=512,
+                x=512,
+                y=0,
+                size=512,
+            ),
+            TextureAtlasPlacement(
+                object_id="unused-object",
+                texture_path="unused.png",
+                texture_resolution=512,
+                x=1024,
+                y=0,
+                size=512,
+            ),
+        ]
+        atlas = TextureAtlasRecord(
+            atlas_id="object-ao",
+            name="Object AO",
+            resolution=resolution,
+            placements=placements,
+        )
+        object_mesh = _textured_triangle(
+            name="Object",
+            metadata={"housemaker_object_id": object_id},
+        )
+        surface_mesh = _textured_triangle(
+            name="Surface",
+            metadata={"housemaker_surface_id": "wall-1"},
+            x_offset=2.0,
+        )
+        marker_collision_name = "__housemaker_packed_orm__:object-ao"
+        passthrough_mesh = _textured_triangle(
+            name=marker_collision_name,
+            metadata={},
+            x_offset=4.0,
+        )
+        glass_mesh = _textured_triangle(
+            name="Glass",
+            metadata={},
+            glass=True,
+            x_offset=6.0,
+        )
+        scene = trimesh.Scene()
+        scene.add_geometry(object_mesh, node_name="object")
+        scene.add_geometry(surface_mesh, node_name="surface")
+        scene.add_geometry(passthrough_mesh, node_name="passthrough")
+        scene.add_geometry(glass_mesh, node_name="glass")
+        model = GeneratedModel(
+            mesh=trimesh.util.concatenate(
+                (
+                    object_mesh,
+                    surface_mesh,
+                    passthrough_mesh,
+                    glass_mesh,
+                )
+            ),
+            scene=scene,
+            glb_bytes=b"",
+        )
+
+        captured_targets: dict[str, tuple[object, ...]] = {}
+
+        def fake_bake(
+            targets_by_atlas: dict[str, tuple[object, ...]],
+            _atlas_resolutions: dict[str, int],
+            occluders: tuple[trimesh.Trimesh, ...],
+        ) -> dict[str, np.ndarray]:
+            captured_targets.update(targets_by_atlas)
+            self.assertEqual(len(occluders), 3)
+            ambient_occlusion = np.full(
+                (resolution, resolution),
+                255,
+                dtype=np.uint8,
+            )
+            ambient_occlusion[0:512, 0:512] = 64
+            return {atlas.atlas_id: ambient_occlusion}
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            map_paths = _write_atlas_maps(
+                Path(temporary_directory),
+                resolution,
+            )
+            with patch(
+                "housemaker.atlas_export.bake_placed_object_ambient_occlusion",
+                side_effect=fake_bake,
+            ):
+                result = apply_texture_atlases_to_export(
+                    model,
+                    (MaterializedTextureAtlas(atlas, map_paths),),
+                    surface_source_ids={"wall-1": surface_source_id},
+                )
+            with Image.open(map_paths[PBR_MAP_ROUGHNESS]) as source_roughness:
+                persisted_roughness = np.asarray(
+                    source_roughness.convert("RGBA"),
+                    dtype=np.uint8,
+                )
+
+        self.assertEqual(set(captured_targets), {atlas.atlas_id})
+        self.assertEqual(len(captured_targets[atlas.atlas_id]), 1)
+        captured_target = captured_targets[atlas.atlas_id][0]
+        self.assertEqual(
+            captured_target.mesh.metadata["housemaker_object_id"],
+            object_id,
+        )
+        self.assertEqual(captured_target.atlas_pixel_bounds, (0, 0, 512, 512))
+        self.assertTrue(np.all(persisted_roughness[:, :, 0] == 170))
+        exported_geometry = next(
+            geometry
+            for geometry in result.scene.geometry.values()
+            if getattr(geometry.visual.material, "name", None) == atlas.name
+        )
+        exported_orm = np.asarray(
+            exported_geometry.visual.material.metallicRoughnessTexture.convert("RGBA"),
+            dtype=np.uint8,
+        )
+        self.assertEqual(int(exported_orm[10, 10, 0]), 64)
+        self.assertEqual(int(exported_orm[10, 522, 0]), 255)
+        self.assertEqual(int(exported_orm[10, 1034, 0]), 255)
+        self.assertTrue(np.all(exported_orm[:, :, 1] == 170))
+        self.assertTrue(np.all(exported_orm[:, :, 2] == 20))
+        self.assertTrue(np.all(exported_orm[:, :, 3] == 255))
+        self.assertIs(
+            exported_geometry.visual.material.occlusionTexture,
+            exported_geometry.visual.material.metallicRoughnessTexture,
+        )
+
+        document = _read_glb_json(result.glb_bytes)
+        exported_material = next(
+            material
+            for material in document["materials"]
+            if material["name"] == atlas.name
+        )
+        self.assertEqual(
+            exported_material["occlusionTexture"]["index"],
+            exported_material["pbrMetallicRoughness"]["metallicRoughnessTexture"][
+                "index"
+            ],
+        )
+        embedded_orm = _read_glb_texture_rgba(
+            result.glb_bytes,
+            document,
+            exported_material["occlusionTexture"]["index"],
+        )
+        self.assertEqual(int(embedded_orm[10, 10, 0]), 64)
+        self.assertEqual(int(embedded_orm[10, 522, 0]), 255)
+        self.assertEqual(int(embedded_orm[10, 1034, 0]), 255)
+        self.assertTrue(np.all(embedded_orm[:, :, 1] == 170))
+        self.assertTrue(np.all(embedded_orm[:, :, 2] == 20))
+        self.assertTrue(np.all(embedded_orm[:, :, 3] == 255))
+        passthrough_material = next(
+            material
+            for material in document["materials"]
+            if material.get("name") == marker_collision_name
+        )
+        self.assertNotIn("occlusionTexture", passthrough_material)
+        self.assertFalse(
+            any(
+                material.get("name") == f"{marker_collision_name}_2"
+                for material in document["materials"]
+            )
+        )
+        reloaded_scene = trimesh.load(
+            BytesIO(result.glb_bytes),
+            file_type="glb",
+            force="scene",
+        )
+        reloaded_material = next(
+            geometry.visual.material
+            for geometry in reloaded_scene.geometry.values()
+            if getattr(geometry.visual.material, "name", None) == atlas.name
+        )
+        np.testing.assert_array_equal(
+            np.asarray(reloaded_material.occlusionTexture.convert("RGBA")),
+            np.asarray(
+                reloaded_material.metallicRoughnessTexture.convert("RGBA")
+            ),
+        )
 
     def test_half_model_mesh_nodes_remain_separate_through_atlas_export(
         self,
@@ -951,6 +1191,11 @@ class TextureAtlasExportTests(unittest.TestCase):
             index
             for index, material in enumerate(document["materials"])
             if material["name"] == atlas.name
+        )
+        atlas_material = document["materials"][atlas_material_index]
+        self.assertEqual(
+            atlas_material["occlusionTexture"]["index"],
+            atlas_material["pbrMetallicRoughness"]["metallicRoughnessTexture"]["index"],
         )
         self.assertEqual(
             sum(
