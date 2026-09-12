@@ -19,11 +19,11 @@ from housemaker.texture_atlas_state import (
     ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
     ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
     ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
-    ATLAS_STATE_SCHEMA_VERSION,
     ATLAS_SLOT_HALF_LEFT,
     ATLAS_SLOT_HALF_RIGHT,
     ATLAS_SLOT_QUADRANT_ORDER,
     ATLAS_SLOT_QUADRANT_TOP_LEFT,
+    ATLAS_STATE_SCHEMA_VERSION,
     TextureAtlasData,
     write_texture_atlas_metadata,
     write_texture_atlas_png,
@@ -190,7 +190,10 @@ class TextureAtlasStateTests(unittest.TestCase):
         restored = TextureAtlasData.from_dict(payload)
         placement = restored.atlases[0].placements[0]
 
-        self.assertEqual(restored.to_dict()["schema_version"], 5)
+        self.assertEqual(
+            restored.to_dict()["schema_version"],
+            ATLAS_STATE_SCHEMA_VERSION,
+        )
         self.assertEqual(
             placement.packing_mode,
             ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
@@ -232,6 +235,144 @@ class TextureAtlasStateTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "schema version 5"):
             TextureAtlasData.from_dict(payload)
+
+    def test_schema_v5_migrates_without_claiming_surface_ao_state(self) -> None:
+        payload = {
+            "schema_version": 5,
+            "selected_atlas_id": "atlas-a",
+            "atlases": [
+                {
+                    "atlas_id": "atlas-a",
+                    "name": "Version five",
+                    "resolution": 2048,
+                    "image_path": None,
+                    "surface_ao_image_path": "../forged.jpg",
+                    "surface_ao_geometry_signature": "forged\u0000",
+                    "surface_ao_intensity": -5.0,
+                    "placements": [],
+                }
+            ],
+        }
+
+        restored = TextureAtlasData.from_dict(payload)
+        atlas = restored.atlases[0]
+
+        self.assertEqual(
+            restored.to_dict()["schema_version"],
+            ATLAS_STATE_SCHEMA_VERSION,
+        )
+        self.assertIsNone(atlas.surface_ao_image_path)
+        self.assertIsNone(atlas.surface_ao_geometry_signature)
+        self.assertEqual(atlas.surface_ao_intensity, 1.0)
+
+    def test_surface_ao_fields_round_trip_in_schema_v6(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("AO", 2048, atlas_id="atlas-a")
+        atlas.set_surface_ambient_occlusion_intensity(0.42)
+        atlas.set_surface_ambient_occlusion(
+            "pbr_maps/atlas-a.ambient_occlusion.png",
+            "geometry-revision:42",
+        )
+
+        restored = TextureAtlasData.from_dict(data.to_dict())
+        restored_atlas = restored.atlases[0]
+
+        self.assertEqual(
+            restored_atlas.surface_ao_image_path,
+            "pbr_maps/atlas-a.ambient_occlusion.png",
+        )
+        self.assertEqual(
+            restored_atlas.surface_ao_geometry_signature,
+            "geometry-revision:42",
+        )
+        self.assertEqual(restored_atlas.surface_ao_intensity, 0.42)
+
+    def test_surface_ao_fields_reject_incomplete_or_unsafe_values(self) -> None:
+        base_payload = {
+            "schema_version": ATLAS_STATE_SCHEMA_VERSION,
+            "selected_atlas_id": "atlas-a",
+            "atlases": [
+                {
+                    "atlas_id": "atlas-a",
+                    "name": "AO",
+                    "resolution": 2048,
+                    "image_path": None,
+                    "placements": [],
+                }
+            ],
+        }
+        invalid_fields = (
+            ({"surface_ao_image_path": "ao.png"}, "set together"),
+            (
+                {
+                    "surface_ao_image_path": "../ao.png",
+                    "surface_ao_geometry_signature": "geometry",
+                },
+                "project-relative",
+            ),
+            (
+                {
+                    "surface_ao_image_path": "ao.jpg",
+                    "surface_ao_geometry_signature": "geometry",
+                },
+                "PNG",
+            ),
+            (
+                {
+                    "surface_ao_image_path": "ao.png",
+                    "surface_ao_geometry_signature": " ",
+                },
+                "cannot be empty",
+            ),
+            ({"surface_ao_intensity": -0.01}, "between 0 and 1"),
+            ({"surface_ao_intensity": float("inf")}, "finite"),
+            ({"surface_ao_intensity": True}, "finite"),
+        )
+        for fields, message in invalid_fields:
+            with self.subTest(fields=fields), self.assertRaisesRegex(
+                ValueError,
+                message,
+            ):
+                payload = json.loads(json.dumps(base_payload))
+                payload["atlases"][0].update(fields)
+                TextureAtlasData.from_dict(payload)
+
+    def test_membership_changes_clear_surface_ao_but_keep_intensity(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("AO", 2048, atlas_id="atlas-a")
+        atlas.set_surface_ambient_occlusion_intensity(0.35)
+        atlas.set_surface_ambient_occlusion("ao.png", "first")
+
+        data.assign_object(
+            atlas.atlas_id,
+            "surface-a",
+            "textures/surface-a.png",
+            512,
+        )
+
+        self.assertIsNone(atlas.surface_ao_image_path)
+        self.assertIsNone(atlas.surface_ao_geometry_signature)
+        self.assertEqual(atlas.surface_ao_intensity, 0.35)
+
+        atlas.set_surface_ambient_occlusion("ao.png", "second")
+        data.place_object_at(
+            atlas.atlas_id,
+            "surface-a",
+            "textures/surface-a.png",
+            512,
+            512,
+            0,
+        )
+        data.repack_atlas(atlas.atlas_id)
+
+        self.assertEqual(atlas.surface_ao_image_path, "ao.png")
+        self.assertEqual(atlas.surface_ao_geometry_signature, "second")
+
+        data.unassign_object(atlas.atlas_id, "surface-a")
+
+        self.assertIsNone(atlas.surface_ao_image_path)
+        self.assertIsNone(atlas.surface_ao_geometry_signature)
+        self.assertEqual(atlas.surface_ao_intensity, 0.35)
 
     def test_loaded_orphan_right_half_is_rejected(self) -> None:
         payload = {

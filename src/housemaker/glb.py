@@ -5,9 +5,9 @@ import copy
 import json
 import math
 import os
-from io import BytesIO
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from io import BytesIO
 from itertools import permutations
 from pathlib import Path
 
@@ -15,9 +15,7 @@ import numpy as np
 import shapely
 import trimesh
 from PIL import Image
-from shapely import Point, Polygon
-from shapely.geometry.base import BaseGeometry
-from PySide6.QtCore import QByteArray, QBuffer, QIODevice, QRectF, Qt
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QRectF, Qt
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -27,6 +25,8 @@ from PySide6.QtGui import (
     QPainterPath,
     QPen,
 )
+from shapely import Point, Polygon
+from shapely.geometry.base import BaseGeometry
 from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
@@ -44,12 +44,12 @@ from housemaker.models import (
     DEFAULT_DOORWAY_BOTTOM_HEIGHT_METERS,
     DEFAULT_DOORWAY_SHAPE,
     DEFAULT_LEVEL_HEIGHT_METERS,
+    PIXEL_TO_METER,
     STAIR_STYLE_FLOATING,
     STAIR_STYLE_FLOATING_WITH_RISER,
     STAIR_STYLE_SUPPORTED,
     Edge,
     LevelData,
-    PIXEL_TO_METER,
     RoomData,
     StairData,
     StairSectionData,
@@ -108,6 +108,7 @@ SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION = {
 HALF_NODE_NAME_PREFIX = "[HALF] "
 HALF_MESH_EXTRAS_KEY = "halfMesh"
 HALF_MESH_UV_MODE = "reuse"
+PACKED_ORM_AO_UV_ATTRIBUTE = "_HOUSEMAKER_AO_UV"
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
 GLB_HEADER_BYTE_COUNT = 12
@@ -121,6 +122,39 @@ NAMED_MESH_ROLE_STAIR = "stair"
 _fallback_qt_application: QGuiApplication | None = None
 
 # ### Data models ###
+@dataclass(frozen=True)
+class PackedOrmMaterialSpec:
+    """Final glTF settings for one transiently marked ORM material."""
+
+    final_name: str
+    ao_tex_coord: int = 0
+    ao_strength: float = 1.0
+
+    def __post_init__(self) -> None:
+        final_name = str(self.final_name)
+        if not final_name:
+            raise ValueError("A packed ORM material name cannot be empty.")
+        if (
+            isinstance(self.ao_tex_coord, bool)
+            or not isinstance(self.ao_tex_coord, (int, np.integer))
+            or int(self.ao_tex_coord) not in {0, 1}
+        ):
+            raise ValueError("A packed ORM AO texture coordinate must be 0 or 1.")
+        if isinstance(self.ao_strength, bool):
+            raise ValueError("Packed ORM AO strength must be between 0 and 1.")
+        try:
+            ao_strength = float(self.ao_strength)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(
+                "Packed ORM AO strength must be between 0 and 1."
+            ) from error
+        if not math.isfinite(ao_strength) or not 0.0 <= ao_strength <= 1.0:
+            raise ValueError("Packed ORM AO strength must be between 0 and 1.")
+        object.__setattr__(self, "final_name", final_name)
+        object.__setattr__(self, "ao_tex_coord", int(self.ao_tex_coord))
+        object.__setattr__(self, "ao_strength", ao_strength)
+
+
 @dataclass
 class GeneratedModel:
     mesh: trimesh.Trimesh
@@ -528,6 +562,30 @@ def convert_to_glb(
         stairs=stairs,
         serialize_glb=True,
         export_untextured_surfaces=export_untextured_surfaces,
+    )
+
+
+def convert_to_export_scene_model(
+    level_source: VertexData | Sequence[LevelData],
+    wall_height_meters: float = DEFAULT_WALL_HEIGHT_METERS,
+    blueprint_size_pixels: tuple[float, float] | None = None,
+    surface_materials: Mapping[str, object] | None = None,
+    surface_texture_world_size_meters: float = 2.0,
+    stairs: Sequence[StairData] = (),
+) -> GeneratedModel:
+    """Build the filtered export scene without serializing an intermediate GLB."""
+
+    return _build_blueprint_model(
+        level_source=level_source,
+        wall_height_meters=wall_height_meters,
+        blueprint_size_pixels=blueprint_size_pixels,
+        surface_materials=(surface_materials or {}),
+        surface_texture_world_size_meters=(
+            surface_texture_world_size_meters
+        ),
+        stairs=stairs,
+        serialize_glb=False,
+        export_untextured_surfaces=False,
     )
 
 
@@ -3121,7 +3179,11 @@ def _serialize_scene_glb_with_half_mesh_extras(
     scene: trimesh.Scene,
     *,
     failure_message: str,
-    packed_orm_material_names: Mapping[str, str] | None = None,
+    packed_orm_material_names: Mapping[
+        str,
+        str | PackedOrmMaterialSpec,
+    ]
+    | None = None,
 ) -> bytes:
     """Serialize a scene while preserving HouseMaker glTF metadata."""
 
@@ -3144,7 +3206,11 @@ def _rewrite_serialized_glb_half_mesh_extras(
     half_mesh_by_node_name: Mapping[str, Mapping[str, object]],
     *,
     failure_message: str,
-    packed_orm_material_names: Mapping[str, str] | None = None,
+    packed_orm_material_names: Mapping[
+        str,
+        str | PackedOrmMaterialSpec,
+    ]
+    | None = None,
 ) -> bytes:
     """Inject HouseMaker fields into the literal final GLB JSON chunk."""
 
@@ -3214,33 +3280,41 @@ def _rewrite_serialized_glb_half_mesh_extras(
 
 def _inject_packed_orm_occlusion_textures(
     document: dict[str, object],
-    packed_orm_material_names: Mapping[str, str],
+    packed_orm_material_names: Mapping[
+        str,
+        str | PackedOrmMaterialSpec,
+    ],
 ) -> None:
     """Point marked glTF AO and metallic-roughness slots at one texture."""
 
     if not packed_orm_material_names:
         return
-    normalized_names: dict[str, str] = {}
-    for raw_marker_name, raw_final_name in packed_orm_material_names.items():
+    normalized_specs: dict[str, PackedOrmMaterialSpec] = {}
+    for raw_marker_name, raw_spec in packed_orm_material_names.items():
         marker_name = str(raw_marker_name)
-        final_name = str(raw_final_name)
-        if not marker_name or not final_name:
+        if not marker_name:
             raise ValueError("Packed ORM material names cannot be empty.")
-        normalized_names[marker_name] = final_name
+        normalized_specs[marker_name] = (
+            raw_spec
+            if isinstance(raw_spec, PackedOrmMaterialSpec)
+            else PackedOrmMaterialSpec(final_name=str(raw_spec))
+        )
 
     materials = document.get("materials")
     textures = document.get("textures")
     if not isinstance(materials, list) or not isinstance(textures, list):
         raise ValueError("The packed ORM GLB material data is missing.")
     found_marker_names: set[str] = set()
-    for material in materials:
+    uv1_material_indices: set[int] = set()
+    for material_index, material in enumerate(materials):
         if not isinstance(material, dict):
             continue
         marker_name = material.get("name")
-        if not isinstance(marker_name, str) or marker_name not in normalized_names:
+        if not isinstance(marker_name, str) or marker_name not in normalized_specs:
             continue
         if marker_name in found_marker_names:
             raise ValueError("Packed ORM material markers must be unique.")
+        spec = normalized_specs[marker_name]
         pbr = material.get("pbrMetallicRoughness")
         metallic_roughness = (
             pbr.get("metallicRoughnessTexture")
@@ -3261,12 +3335,109 @@ def _inject_packed_orm_occlusion_textures(
             raise ValueError(
                 "A packed ORM material has no metallic-roughness texture."
             )
-        material["occlusionTexture"] = copy.deepcopy(metallic_roughness)
-        material["name"] = normalized_names[marker_name]
+        metallic_roughness.pop("texCoord", None)
+        occlusion_texture = copy.deepcopy(metallic_roughness)
+        if spec.ao_tex_coord == 1:
+            occlusion_texture["texCoord"] = 1
+            uv1_material_indices.add(material_index)
+        else:
+            occlusion_texture.pop("texCoord", None)
+        occlusion_texture["strength"] = spec.ao_strength
+        material["occlusionTexture"] = occlusion_texture
+        material["name"] = spec.final_name
         found_marker_names.add(marker_name)
 
-    if found_marker_names != set(normalized_names):
+    if found_marker_names != set(normalized_specs):
         raise ValueError("A packed ORM material was not exported.")
+    _promote_packed_orm_ao_uv_attributes(
+        document,
+        uv1_material_indices,
+    )
+
+
+def _promote_packed_orm_ao_uv_attributes(
+    document: dict[str, object],
+    uv1_material_indices: set[int],
+) -> None:
+    """Promote trimesh's private AO attribute to glTF ``TEXCOORD_1``."""
+
+    if not uv1_material_indices:
+        return
+    meshes = document.get("meshes")
+    accessors = document.get("accessors")
+    if not isinstance(meshes, list) or not isinstance(accessors, list):
+        raise ValueError("The packed ORM GLB UV data is missing.")
+
+    for mesh in meshes:
+        if not isinstance(mesh, dict):
+            raise ValueError("The packed ORM GLB mesh data is invalid.")
+        primitives = mesh.get("primitives")
+        if not isinstance(primitives, list):
+            raise ValueError("The packed ORM GLB primitive data is invalid.")
+        for primitive in primitives:
+            if not isinstance(primitive, dict):
+                raise ValueError("The packed ORM GLB primitive data is invalid.")
+            material_index = primitive.get("material")
+            uses_uv1 = (
+                not isinstance(material_index, bool)
+                and isinstance(material_index, int)
+                and material_index in uv1_material_indices
+            )
+            if not uses_uv1:
+                continue
+            attributes = primitive.get("attributes")
+            if not isinstance(attributes, dict):
+                raise ValueError("A packed ORM UV1 primitive has no attributes.")
+            if PACKED_ORM_AO_UV_ATTRIBUTE in attributes:
+                if "TEXCOORD_1" in attributes:
+                    raise ValueError(
+                        "A packed ORM primitive has conflicting AO UV attributes."
+                    )
+                attributes["TEXCOORD_1"] = attributes.pop(
+                    PACKED_ORM_AO_UV_ATTRIBUTE
+                )
+            if "TEXCOORD_1" not in attributes:
+                raise ValueError("A packed ORM UV1 primitive has no AO UV attribute.")
+            _validate_packed_orm_uv_accessor_counts(attributes, accessors)
+
+
+def _validate_packed_orm_uv_accessor_counts(
+    attributes: Mapping[str, object],
+    accessors: Sequence[object],
+) -> None:
+    """Require UV1 and position accessors to describe the same vertices."""
+
+    position_index = attributes.get("POSITION")
+    ao_uv_index = attributes.get("TEXCOORD_1")
+    if any(
+        isinstance(index, bool)
+        or not isinstance(index, int)
+        or index < 0
+        or index >= len(accessors)
+        for index in (position_index, ao_uv_index)
+    ):
+        raise ValueError("A packed ORM UV1 primitive has invalid accessors.")
+    assert isinstance(position_index, int)
+    assert isinstance(ao_uv_index, int)
+    position_accessor = accessors[position_index]
+    ao_uv_accessor = accessors[ao_uv_index]
+    if not isinstance(position_accessor, dict) or not isinstance(ao_uv_accessor, dict):
+        raise ValueError("A packed ORM UV1 primitive has invalid accessors.")
+    position_count = position_accessor.get("count")
+    ao_uv_count = ao_uv_accessor.get("count")
+    if (
+        isinstance(position_count, bool)
+        or not isinstance(position_count, int)
+        or position_count < 0
+        or isinstance(ao_uv_count, bool)
+        or not isinstance(ao_uv_count, int)
+        or ao_uv_count < 0
+    ):
+        raise ValueError("A packed ORM UV1 primitive has invalid accessor counts.")
+    if position_count != ao_uv_count:
+        raise ValueError(
+            "A packed ORM UV1 accessor count does not match its positions."
+        )
 
 
 def _collect_half_mesh_extras_by_node_name(
@@ -6378,7 +6549,10 @@ def _get_room_object_name(
     room: RoomData,
     room_index: int,
 ) -> str:
-    return f"{_get_level_object_name(level)}_{_slugify_name(room.name)}_{room_index + 1}"
+    return (
+        f"{_get_level_object_name(level)}_"
+        f"{_slugify_name(room.name)}_{room_index + 1}"
+    )
 
 
 def _get_room_material_name(

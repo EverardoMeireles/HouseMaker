@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import tempfile
@@ -14,7 +15,6 @@ from typing import Callable
 import cv2
 import numpy as np
 
-
 # ### Constants ###
 ATLAS_RESOLUTIONS = frozenset({2048, 4096})
 OBJECT_TEXTURE_RESOLUTIONS = frozenset({512, 1024, 2048})
@@ -24,11 +24,12 @@ MAX_ATLAS_NAME_LENGTH = 200
 MAX_ATLAS_OBJECT_COUNT = 4_096
 MAX_ATLAS_ID_LENGTH = 128
 MAX_TEXTURE_PATH_LENGTH = 32_768
-ATLAS_STATE_SCHEMA_VERSION = 5
+ATLAS_STATE_SCHEMA_VERSION = 6
 LEGACY_ATLAS_STATE_SCHEMA_VERSION = 1
 SYMMETRIC_HALF_ATLAS_STATE_SCHEMA_VERSION = 2
 SYMMETRIC_QUARTER_ATLAS_STATE_SCHEMA_VERSION = 3
 SYMMETRIC_PAIR_ATLAS_STATE_SCHEMA_VERSION = 4
+SYMMETRIC_SQUARE_PAIR_ATLAS_STATE_SCHEMA_VERSION = 5
 ATLAS_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 ATLAS_PACKING_MODE_FULL = "full"
 # Schemas v2-v4 persist these legacy modes and must retain their old geometry.
@@ -81,6 +82,9 @@ ATLAS_HALF_SLOT_PACKING_MODES = frozenset(
         ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
     }
 )
+MAX_SURFACE_AO_GEOMETRY_SIGNATURE_LENGTH = 256
+MIN_SURFACE_AO_INTENSITY = 0.0
+MAX_SURFACE_AO_INTENSITY = 1.0
 
 
 # ### Public data models ###
@@ -230,6 +234,9 @@ class TextureAtlasRecord:
     resolution: int
     placements: list[TextureAtlasPlacement] = field(default_factory=list)
     image_path: str | None = None
+    surface_ao_image_path: str | None = None
+    surface_ao_geometry_signature: str | None = None
+    surface_ao_intensity: float = 1.0
 
     def __post_init__(self) -> None:
         _validate_atlas_id(self.atlas_id)
@@ -253,6 +260,27 @@ class TextureAtlasRecord:
         _validate_placements_fit(self.resolution, self.placements)
         if self.image_path is not None:
             self.image_path = _normalize_project_relative_path(self.image_path)
+        self.surface_ao_intensity = _normalize_surface_ao_intensity(
+            self.surface_ao_intensity
+        )
+        has_surface_ao_path = self.surface_ao_image_path is not None
+        has_surface_ao_signature = self.surface_ao_geometry_signature is not None
+        if has_surface_ao_path != has_surface_ao_signature:
+            raise ValueError(
+                "Surface AO image path and geometry signature must be set together."
+            )
+        if has_surface_ao_path:
+            normalized_path = _normalize_project_relative_path(
+                self.surface_ao_image_path
+            )
+            if PurePosixPath(normalized_path).suffix.lower() != ".png":
+                raise ValueError("Surface AO image path must reference a PNG file.")
+            self.surface_ao_image_path = normalized_path
+            self.surface_ao_geometry_signature = (
+                _normalize_surface_ao_geometry_signature(
+                    self.surface_ao_geometry_signature
+                )
+            )
 
     def placement_for_object(
         self,
@@ -274,6 +302,11 @@ class TextureAtlasRecord:
             "name": self.name,
             "resolution": int(self.resolution),
             "image_path": self.image_path,
+            "surface_ao_image_path": self.surface_ao_image_path,
+            "surface_ao_geometry_signature": (
+                self.surface_ao_geometry_signature
+            ),
+            "surface_ao_intensity": float(self.surface_ao_intensity),
             "placements": [
                 placement.to_dict() for placement in self.placements
             ],
@@ -299,7 +332,60 @@ class TextureAtlasRecord:
                 if payload.get("image_path") is None
                 else str(payload["image_path"])
             ),
+            surface_ao_image_path=(
+                None
+                if payload.get("surface_ao_image_path") is None
+                else str(payload["surface_ao_image_path"])
+            ),
+            surface_ao_geometry_signature=(
+                None
+                if payload.get("surface_ao_geometry_signature") is None
+                else str(payload["surface_ao_geometry_signature"])
+            ),
+            surface_ao_intensity=payload.get("surface_ao_intensity", 1.0),
         )
+
+    def clear_surface_ambient_occlusion(self) -> bool:
+        """Detach a stale surface-AO bake while preserving its intensity."""
+
+        if (
+            self.surface_ao_image_path is None
+            and self.surface_ao_geometry_signature is None
+        ):
+            return False
+        self.surface_ao_image_path = None
+        self.surface_ao_geometry_signature = None
+        return True
+
+    def set_surface_ambient_occlusion(
+        self,
+        image_path: str | Path,
+        geometry_signature: str,
+    ) -> None:
+        """Attach one validated AO image and its scene-geometry signature."""
+
+        normalized_path = _normalize_project_relative_path(image_path)
+        if PurePosixPath(normalized_path).suffix.lower() != ".png":
+            raise ValueError("Surface AO image path must reference a PNG file.")
+        normalized_signature = _normalize_surface_ao_geometry_signature(
+            geometry_signature
+        )
+        self.surface_ao_image_path = normalized_path
+        self.surface_ao_geometry_signature = normalized_signature
+
+    def set_surface_ambient_occlusion_intensity(self, intensity: float) -> bool:
+        """Update only runtime AO strength without invalidating baked pixels."""
+
+        normalized_intensity = _normalize_surface_ao_intensity(intensity)
+        if math.isclose(
+            self.surface_ao_intensity,
+            normalized_intensity,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            return False
+        self.surface_ao_intensity = normalized_intensity
+        return True
 
 
 @dataclass
@@ -518,6 +604,8 @@ class TextureAtlasData:
             ]
         else:
             atlas.placements = [*unaffected, placement]
+        if existing is None:
+            atlas.clear_surface_ambient_occlusion()
         atlas.image_path = None
         return placement
 
@@ -664,6 +752,8 @@ class TextureAtlasData:
         placements.append(placement)
         _validate_placements_fit(atlas.resolution, placements)
         atlas.placements = placements
+        if existing is None:
+            atlas.clear_surface_ambient_occlusion()
         atlas.image_path = None
         return placement
 
@@ -678,6 +768,7 @@ class TextureAtlasData:
         if len(placements) == len(atlas.placements):
             return False
         atlas.placements = _normalize_partial_slot_placements(placements)
+        atlas.clear_surface_ambient_occlusion()
         atlas.image_path = None
         return True
 
@@ -709,6 +800,7 @@ class TextureAtlasData:
             SYMMETRIC_HALF_ATLAS_STATE_SCHEMA_VERSION,
             SYMMETRIC_QUARTER_ATLAS_STATE_SCHEMA_VERSION,
             SYMMETRIC_PAIR_ATLAS_STATE_SCHEMA_VERSION,
+            SYMMETRIC_SQUARE_PAIR_ATLAS_STATE_SCHEMA_VERSION,
             ATLAS_STATE_SCHEMA_VERSION,
         }:
             raise ValueError(
@@ -717,15 +809,34 @@ class TextureAtlasData:
         raw_atlases = payload.get("atlases", [])
         if not isinstance(raw_atlases, list):
             raise ValueError("Texture atlases must contain a list.")
+        if schema_version < ATLAS_STATE_SCHEMA_VERSION:
+            raw_atlases = [
+                {
+                    key: value
+                    for key, value in raw_atlas.items()
+                    if key
+                    not in {
+                        "surface_ao_image_path",
+                        "surface_ao_geometry_signature",
+                        "surface_ao_intensity",
+                    }
+                }
+                if isinstance(raw_atlas, dict)
+                else raw_atlas
+                for raw_atlas in raw_atlases
+            ]
         atlases = [
             TextureAtlasRecord.from_dict(raw_atlas)
             for raw_atlas in raw_atlases
         ]
-        if schema_version < ATLAS_STATE_SCHEMA_VERSION and any(
-            placement.packing_mode
-            == ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR
-            for atlas in atlases
-            for placement in atlas.placements
+        if (
+            schema_version < SYMMETRIC_SQUARE_PAIR_ATLAS_STATE_SCHEMA_VERSION
+            and any(
+                placement.packing_mode
+                == ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR
+                for atlas in atlases
+                for placement in atlas.placements
+            )
         ):
             raise ValueError(
                 "Symmetric square-pair placements require texture atlas "
@@ -1357,6 +1468,34 @@ def _validate_nonempty_text(value: object, label: str) -> None:
         raise ValueError(f"{label} cannot be empty.")
 
 
+def _normalize_surface_ao_intensity(value: object) -> float:
+    if isinstance(value, bool):
+        raise ValueError("AO intensity must be a finite number.")
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("AO intensity must be a finite number.") from error
+    if not math.isfinite(normalized):
+        raise ValueError("AO intensity must be a finite number.")
+    if not MIN_SURFACE_AO_INTENSITY <= normalized <= MAX_SURFACE_AO_INTENSITY:
+        raise ValueError("AO intensity must be between 0 and 1.")
+    return normalized
+
+
+def _normalize_surface_ao_geometry_signature(value: object) -> str:
+    signature = str(value).strip()
+    if not signature:
+        raise ValueError("Surface AO geometry signature cannot be empty.")
+    if len(signature) > MAX_SURFACE_AO_GEOMETRY_SIGNATURE_LENGTH:
+        raise ValueError("Surface AO geometry signature is too long.")
+    if any(
+        ord(character) < 32 or ord(character) == 127
+        for character in signature
+    ):
+        raise ValueError("Surface AO geometry signature contains control characters.")
+    return signature
+
+
 def _normalize_atlas_coordinate(value: object, label: str) -> int:
     if isinstance(value, bool):
         raise ValueError(f"{label} must be an integer.")
@@ -1531,4 +1670,6 @@ def _write_bytes_atomically(destination: Path, payload: bytes) -> None:
                 temporary_path.unlink(missing_ok=True)
             except OSError:
                 pass
-        raise ValueError(f"Unable to write texture atlas file: {destination}") from error
+        raise ValueError(
+            f"Unable to write texture atlas file: {destination}"
+        ) from error

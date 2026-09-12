@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -22,8 +22,15 @@ OBJECT_AO_ADAPTIVE_SAMPLE_SPACING_METERS = OBJECT_AO_MAX_DISTANCE_METERS * 0.25
 OBJECT_AO_MAX_ADAPTIVE_SUBDIVISIONS = 96
 OBJECT_AO_MAX_EXTRA_ADAPTIVE_SAMPLES_PER_TARGET = 32_768
 OBJECT_AO_COVERAGE_PADDING_PIXELS = 2
+OBJECT_AO_GEOMETRY_BATCH_SIZE = 65_536
+OBJECT_AO_CANCELLATION_POLL_INTERVAL = 64
 GEOMETRY_EPSILON = 1e-12
 RASTER_EPSILON = 1e-8
+
+
+# ### Public exceptions ###
+class ObjectAmbientOcclusionBakeCancelled(RuntimeError):
+    """Raised when ambient-occlusion work is cancelled cooperatively."""
 
 
 # ### Public data models ###
@@ -106,6 +113,8 @@ def bake_placed_object_ambient_occlusion(
     ],
     atlas_resolutions: Mapping[str, int],
     occluder_meshes: Sequence[trimesh.Trimesh],
+    *,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> dict[str, np.ndarray]:
     """Bake deterministic object AO into top-origin grayscale Atlas planes.
 
@@ -116,6 +125,7 @@ def bake_placed_object_ambient_occlusion(
     since a shared Atlas cannot store a different bake for each instance.
     """
 
+    _check_cancelled(cancellation_check)
     normalized_targets = _normalize_targets(
         targets_by_atlas,
         atlas_resolutions,
@@ -123,7 +133,10 @@ def bake_placed_object_ambient_occlusion(
     if not normalized_targets:
         return {}
 
-    occluder = _build_occluder_mesh(occluder_meshes)
+    occluder = _build_occluder_mesh(
+        occluder_meshes,
+        cancellation_check=cancellation_check,
+    )
     if occluder is None:
         return {
             atlas_id: np.full((resolution, resolution), 255, dtype=np.uint8)
@@ -131,13 +144,18 @@ def bake_placed_object_ambient_occlusion(
         }
 
     try:
+        _check_cancelled(cancellation_check)
         intersector = _build_ray_intersector(occluder)
+        _check_cancelled(cancellation_check)
+    except ObjectAmbientOcclusionBakeCancelled:
+        raise
     except RuntimeError as error:
         raise ValueError(str(error)) from error
     ray_bias = _build_scale_aware_ray_bias(occluder)
     results: dict[str, np.ndarray] = {}
     try:
         for atlas_id, (resolution, targets) in normalized_targets.items():
+            _check_cancelled(cancellation_check)
             ambient_occlusion = np.full(
                 (resolution, resolution),
                 255,
@@ -148,22 +166,35 @@ def bake_placed_object_ambient_occlusion(
                 list[ObjectAmbientOcclusionTarget],
             ] = {}
             for target in targets:
+                _check_cancelled(cancellation_check)
                 targets_by_bounds.setdefault(
                     target.atlas_pixel_bounds,
                     [],
                 ).append(target)
             for shared_targets in targets_by_bounds.values():
-                _bake_shared_target_region(
-                    tuple(shared_targets),
-                    ambient_occlusion,
-                    intersector,
-                    ray_bias,
-                )
+                if cancellation_check is None:
+                    _bake_shared_target_region(
+                        tuple(shared_targets),
+                        ambient_occlusion,
+                        intersector,
+                        ray_bias,
+                    )
+                else:
+                    _bake_shared_target_region(
+                        tuple(shared_targets),
+                        ambient_occlusion,
+                        intersector,
+                        ray_bias,
+                        cancellation_check=cancellation_check,
+                    )
             results[atlas_id] = ambient_occlusion
+    except ObjectAmbientOcclusionBakeCancelled:
+        raise
     except (MemoryError, RuntimeError, ValueError) as error:
         raise ValueError(
             "Placed-object ambient occlusion could not be baked."
         ) from error
+    _check_cancelled(cancellation_check)
     return results
 
 
@@ -295,6 +326,8 @@ def _build_ray_intersector(occluder: trimesh.Trimesh) -> _RayIntersector:
 
 def _build_occluder_mesh(
     meshes: Sequence[trimesh.Trimesh],
+    *,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> trimesh.Trimesh | None:
     if isinstance(meshes, (str, bytes, bytearray)) or not isinstance(
         meshes,
@@ -302,8 +335,10 @@ def _build_occluder_mesh(
     ):
         raise TypeError("Object AO occluders must be a mesh sequence.")
 
+    _check_cancelled(cancellation_check)
     triangles: list[np.ndarray] = []
     for mesh in meshes:
+        _check_cancelled(cancellation_check)
         if not isinstance(mesh, trimesh.Trimesh):
             raise TypeError("Object AO occluders must be triangle meshes.")
         vertices = np.asarray(mesh.vertices, dtype=float)
@@ -320,27 +355,41 @@ def _build_occluder_mesh(
             or np.any(faces >= len(vertices))
         ):
             continue
-        mesh_triangles = vertices[faces]
-        cross_products = np.cross(
-            mesh_triangles[:, 1] - mesh_triangles[:, 0],
-            mesh_triangles[:, 2] - mesh_triangles[:, 0],
-        )
-        usable = np.all(np.isfinite(mesh_triangles), axis=(1, 2)) & (
-            np.linalg.norm(cross_products, axis=1) > GEOMETRY_EPSILON
-        )
-        if np.any(usable):
-            triangles.append(mesh_triangles[usable])
+        for face_start in range(
+            0,
+            len(faces),
+            OBJECT_AO_GEOMETRY_BATCH_SIZE,
+        ):
+            _check_cancelled(cancellation_check)
+            face_end = min(
+                face_start + OBJECT_AO_GEOMETRY_BATCH_SIZE,
+                len(faces),
+            )
+            mesh_triangles = vertices[faces[face_start:face_end]]
+            cross_products = np.cross(
+                mesh_triangles[:, 1] - mesh_triangles[:, 0],
+                mesh_triangles[:, 2] - mesh_triangles[:, 0],
+            )
+            usable = np.all(np.isfinite(mesh_triangles), axis=(1, 2)) & (
+                np.linalg.norm(cross_products, axis=1) > GEOMETRY_EPSILON
+            )
+            if np.any(usable):
+                triangles.append(mesh_triangles[usable])
     if not triangles:
+        _check_cancelled(cancellation_check)
         return None
 
+    _check_cancelled(cancellation_check)
     triangle_array = np.ascontiguousarray(np.concatenate(triangles), dtype=float)
     vertices = triangle_array.reshape((-1, 3))
     faces = np.arange(len(vertices), dtype=np.int64).reshape((-1, 3))
-    return trimesh.Trimesh(
+    result = trimesh.Trimesh(
         vertices=vertices,
         faces=faces,
         process=False,
     )
+    _check_cancelled(cancellation_check)
+    return result
 
 
 def _build_scale_aware_ray_bias(occluder: trimesh.Trimesh) -> float:
@@ -363,7 +412,10 @@ def _bake_target_mesh(
     intersector: _RayIntersector,
     ray_bias: float,
     resolution: int,
+    *,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> tuple[np.ndarray, np.ndarray] | None:
+    _check_cancelled(cancellation_check)
     mesh = target.mesh
     vertices = np.asarray(mesh.vertices, dtype=float)
     faces = np.asarray(mesh.faces, dtype=np.int64)
@@ -376,6 +428,7 @@ def _bake_target_mesh(
         uv,
         resolution,
         target.atlas_pixel_bounds,
+        cancellation_check=cancellation_check,
     )
     if not patches:
         return None
@@ -390,11 +443,12 @@ def _bake_target_mesh(
         ),
         axis=0,
     )
-    sample_values = _sample_ambient_occlusion(
+    sample_values = _call_sample_ambient_occlusion(
         sample_positions,
         sample_normals,
         intersector,
         ray_bias,
+        cancellation_check,
     )
     if target.mirror_plane_point is not None:
         mirrored_positions, mirrored_normals = _reflect_receiver_samples(
@@ -402,11 +456,12 @@ def _bake_target_mesh(
             sample_normals,
             target,
         )
-        mirrored_values = _sample_ambient_occlusion(
+        mirrored_values = _call_sample_ambient_occlusion(
             mirrored_positions,
             mirrored_normals,
             intersector,
             ray_bias,
+            cancellation_check,
         )
         sample_values = (sample_values + mirrored_values) * 0.5
 
@@ -421,13 +476,16 @@ def _bake_target_mesh(
             coverage,
             patch,
             sample_values[sample_offset:sample_end],
+            cancellation_check=cancellation_check,
         )
         sample_offset = sample_end
     _pad_ambient_occlusion_coverage(
         target_output,
         coverage,
         OBJECT_AO_COVERAGE_PADDING_PIXELS,
+        cancellation_check=cancellation_check,
     )
+    _check_cancelled(cancellation_check)
     return target_output, coverage
 
 
@@ -436,6 +494,8 @@ def _bake_shared_target_region(
     output: np.ndarray,
     intersector: _RayIntersector,
     ray_bias: float,
+    *,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> None:
     """Average scene AO for instances which reuse one Atlas region."""
 
@@ -446,12 +506,22 @@ def _bake_shared_target_region(
     value_sums = np.zeros(shape, dtype=np.uint32)
     sample_counts = np.zeros(shape, dtype=np.uint32)
     for target in targets:
-        baked = _bake_target_mesh(
-            target,
-            intersector,
-            ray_bias,
-            int(output.shape[0]),
-        )
+        _check_cancelled(cancellation_check)
+        if cancellation_check is None:
+            baked = _bake_target_mesh(
+                target,
+                intersector,
+                ray_bias,
+                int(output.shape[0]),
+            )
+        else:
+            baked = _bake_target_mesh(
+                target,
+                intersector,
+                ray_bias,
+                int(output.shape[0]),
+                cancellation_check=cancellation_check,
+            )
         if baked is None:
             continue
         target_values, coverage = baked
@@ -465,6 +535,7 @@ def _bake_shared_target_region(
     ]
     output_region = output[top:bottom, left:right]
     output_region[covered] = np.asarray(averaged, dtype=np.uint8)
+    _check_cancelled(cancellation_check)
 
 
 def _build_face_sampling_patches(
@@ -473,7 +544,10 @@ def _build_face_sampling_patches(
     uv: np.ndarray,
     resolution: int,
     atlas_pixel_bounds: tuple[int, int, int, int],
+    *,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> tuple[_FaceSamplingPatch, ...]:
+    _check_cancelled(cancellation_check)
     left, top, _right, _bottom = atlas_pixel_bounds
     pixel_coordinates = _uv_to_top_origin_pixels(uv, resolution)
     pixel_coordinates -= np.asarray((left, top), dtype=float)
@@ -482,9 +556,12 @@ def _build_face_sampling_patches(
     subdivisions = _allocate_adaptive_face_subdivisions(
         pixel_triangles,
         world_triangles,
+        cancellation_check=cancellation_check,
     )
     patches: list[_FaceSamplingPatch] = []
     for face_index, face in enumerate(faces):
+        if face_index % OBJECT_AO_CANCELLATION_POLL_INTERVAL == 0:
+            _check_cancelled(cancellation_check)
         world_triangle = world_triangles[face_index]
         cross_product = np.cross(
             world_triangle[1] - world_triangle[0],
@@ -501,6 +578,7 @@ def _build_face_sampling_patches(
                 pixel_triangles[face_index],
                 normal,
                 subdivision,
+                cancellation_check=cancellation_check,
             )
         else:
             patch = _build_centroid_face_patch(
@@ -509,13 +587,17 @@ def _build_face_sampling_patches(
                 normal,
             )
         patches.append(patch)
+    _check_cancelled(cancellation_check)
     return tuple(patches)
 
 
 def _allocate_adaptive_face_subdivisions(
     pixel_triangles: np.ndarray,
     world_triangles: np.ndarray,
+    *,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> np.ndarray:
+    _check_cancelled(cancellation_check)
     pixel_edge_lengths = np.stack(
         (
             np.linalg.norm(pixel_triangles[:, 1] - pixel_triangles[:, 0], axis=1),
@@ -576,11 +658,14 @@ def _allocate_adaptive_face_subdivisions(
         dtype=np.int64,
     )
 
+    _check_cancelled(cancellation_check)
     allocated = np.zeros(len(pixel_triangles), dtype=np.int64)
     remaining_samples = OBJECT_AO_MAX_EXTRA_ADAPTIVE_SAMPLES_PER_TARGET
     while remaining_samples >= 6:
         allocation_changed = False
-        for face_index in candidate_indices:
+        for candidate_index, face_index in enumerate(candidate_indices):
+            if candidate_index % OBJECT_AO_CANCELLATION_POLL_INTERVAL == 0:
+                _check_cancelled(cancellation_check)
             current_subdivision = int(allocated[face_index])
             next_subdivision = (
                 3 if current_subdivision == 0 else (current_subdivision + 3)
@@ -601,6 +686,7 @@ def _allocate_adaptive_face_subdivisions(
             allocation_changed = True
         if not allocation_changed:
             break
+    _check_cancelled(cancellation_check)
     return allocated
 
 
@@ -627,11 +713,14 @@ def _build_subdivided_face_patch(
     pixel_triangle: np.ndarray,
     normal: np.ndarray,
     subdivision: int,
+    *,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> _FaceSamplingPatch:
     sample_indices: dict[tuple[int, int], int] = {}
     barycentric_coordinates: list[tuple[float, float, float]] = []
     denominator = float(subdivision)
     for first_index in range(subdivision + 1):
+        _check_cancelled(cancellation_check)
         for second_index in range(subdivision - first_index + 1):
             sample_indices[(first_index, second_index)] = len(barycentric_coordinates)
             first_weight = first_index / denominator
@@ -643,6 +732,7 @@ def _build_subdivided_face_patch(
 
     raster_triangles: list[tuple[int, int, int]] = []
     for first_index in range(subdivision):
+        _check_cancelled(cancellation_check)
         for second_index in range(subdivision - first_index):
             first = sample_indices[(first_index, second_index)]
             second = sample_indices[(first_index + 1, second_index)]
@@ -652,12 +742,14 @@ def _build_subdivided_face_patch(
                 fourth = sample_indices[(first_index + 1, second_index + 1)]
                 raster_triangles.append((second, fourth, third))
 
-    return _FaceSamplingPatch(
+    result = _FaceSamplingPatch(
         pixel_coordinates=np.ascontiguousarray(barycentric @ pixel_triangle),
         world_positions=np.ascontiguousarray(barycentric @ world_triangle),
         raster_triangles=np.asarray(raster_triangles, dtype=np.int64),
         normal=normal,
     )
+    _check_cancelled(cancellation_check)
+    return result
 
 
 def _reflect_receiver_samples(
@@ -684,10 +776,14 @@ def _sample_ambient_occlusion(
     normals: np.ndarray,
     intersector: _RayIntersector,
     ray_bias: float,
+    *,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> np.ndarray:
+    _check_cancelled(cancellation_check)
     local_directions = _build_cosine_weighted_hemisphere_directions(OBJECT_AO_RAY_COUNT)
     ambient_occlusion = np.ones(len(positions), dtype=float)
     for start in range(0, len(positions), OBJECT_AO_SAMPLE_BATCH_SIZE):
+        _check_cancelled(cancellation_check)
         end = min(start + OBJECT_AO_SAMPLE_BATCH_SIZE, len(positions))
         batch_positions = positions[start:end]
         batch_normals = normals[start:end]
@@ -721,7 +817,33 @@ def _sample_ambient_occlusion(
             occluded.reshape((-1, OBJECT_AO_RAY_COUNT)),
             axis=1,
         )
+    _check_cancelled(cancellation_check)
     return np.ascontiguousarray(np.clip(ambient_occlusion, 0.0, 1.0))
+
+
+def _call_sample_ambient_occlusion(
+    positions: np.ndarray,
+    normals: np.ndarray,
+    intersector: _RayIntersector,
+    ray_bias: float,
+    cancellation_check: Callable[[], bool] | None,
+) -> np.ndarray:
+    """Preserve the legacy internal call shape when cancellation is unused."""
+
+    if cancellation_check is None:
+        return _sample_ambient_occlusion(
+            positions,
+            normals,
+            intersector,
+            ray_bias,
+        )
+    return _sample_ambient_occlusion(
+        positions,
+        normals,
+        intersector,
+        ray_bias,
+        cancellation_check=cancellation_check,
+    )
 
 
 def _build_cosine_weighted_hemisphere_directions(count: int) -> np.ndarray:
@@ -788,14 +910,20 @@ def _rasterize_sampling_patch(
     coverage: np.ndarray,
     patch: _FaceSamplingPatch,
     sample_values: np.ndarray,
+    *,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> None:
-    for triangle in patch.raster_triangles:
+    for triangle_index, triangle in enumerate(patch.raster_triangles):
+        if triangle_index % OBJECT_AO_CANCELLATION_POLL_INTERVAL == 0:
+            _check_cancelled(cancellation_check)
         _rasterize_scalar_triangle(
             output,
             coverage,
             patch.pixel_coordinates[triangle],
             sample_values[triangle],
+            cancellation_check=cancellation_check,
         )
+    _check_cancelled(cancellation_check)
 
 
 def _rasterize_scalar_triangle(
@@ -803,7 +931,10 @@ def _rasterize_scalar_triangle(
     coverage: np.ndarray,
     coordinates: np.ndarray,
     values: np.ndarray,
+    *,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> None:
+    _check_cancelled(cancellation_check)
     height, width = output.shape
     minimum_x = max(0, math.floor(float(np.min(coordinates[:, 0]))))
     maximum_x = min(
@@ -831,6 +962,7 @@ def _rasterize_scalar_triangle(
         maximum_y + 1,
         OBJECT_AO_RASTER_ROW_BATCH_SIZE,
     ):
+        _check_cancelled(cancellation_check)
         row_end = min(
             row_start + OBJECT_AO_RASTER_ROW_BATCH_SIZE,
             maximum_y + 1,
@@ -860,13 +992,17 @@ def _rasterize_scalar_triangle(
             minimum_x : maximum_x + 1,
         ]
         coverage_region[inside] = True
+    _check_cancelled(cancellation_check)
 
 
 def _pad_ambient_occlusion_coverage(
     values: np.ndarray,
     coverage: np.ndarray,
     padding_pixels: int,
+    *,
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> None:
+    _check_cancelled(cancellation_check)
     if padding_pixels <= 0 or not np.any(coverage):
         return
     height, width = coverage.shape
@@ -877,6 +1013,7 @@ def _pad_ambient_occlusion_coverage(
         if row_offset or column_offset
     )
     for _step in range(padding_pixels):
+        _check_cancelled(cancellation_check)
         neighbor_coverage = np.zeros_like(coverage)
         neighbor_values = np.full_like(values, 255)
         for row_offset, column_offset in neighbor_offsets:
@@ -916,8 +1053,20 @@ def _pad_ambient_occlusion_coverage(
             break
         values[added] = neighbor_values[added]
         coverage[added] = True
+    _check_cancelled(cancellation_check)
 
 
+# ### Cancellation helpers ###
+def _check_cancelled(
+    cancellation_check: Callable[[], bool] | None,
+) -> None:
+    if cancellation_check is not None and bool(cancellation_check()):
+        raise ObjectAmbientOcclusionBakeCancelled(
+            "Ambient-occlusion baking was cancelled."
+        )
+
+
+# ### Mesh attribute helpers ###
 def _get_valid_uv(mesh: trimesh.Trimesh) -> np.ndarray | None:
     raw_uv = getattr(getattr(mesh, "visual", None), "uv", None)
     if raw_uv is None:
@@ -931,6 +1080,7 @@ def _get_valid_uv(mesh: trimesh.Trimesh) -> np.ndarray | None:
 __all__ = [
     "OBJECT_AO_MAX_DISTANCE_METERS",
     "OBJECT_AO_RAY_COUNT",
+    "ObjectAmbientOcclusionBakeCancelled",
     "ObjectAmbientOcclusionTarget",
     "bake_placed_object_ambient_occlusion",
 ]

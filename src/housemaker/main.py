@@ -4,11 +4,12 @@ from __future__ import annotations
 import copy
 import math
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 
+import trimesh
 from PIL import Image
 from PySide6.QtCore import (
     QEvent,
@@ -16,7 +17,9 @@ from PySide6.QtCore import (
     QPointF,
     QSignalBlocker,
     Qt,
+    QThread,
     QTimer,
+    Signal,
 )
 from PySide6.QtGui import QColor, QKeySequence, QPalette, QShortcut, QWheelEvent
 from PySide6.QtWidgets import (
@@ -57,7 +60,15 @@ from housemaker.architectural_surface_edits import (
     extrude_surface_faces,
     place_surface_vertex,
 )
-from housemaker.atlas_export import apply_texture_atlases_to_export
+from housemaker.atlas_export import (
+    AtlasDrawCallEstimate,
+    SurfaceAmbientOcclusionAtlasContext,
+    SurfaceAmbientOcclusionBakeResult,
+    apply_texture_atlases_to_export,
+    bake_surface_ambient_occlusion_for_atlas,
+    estimate_texture_atlas_draw_calls,
+    prepare_surface_ambient_occlusion_preview_for_atlas,
+)
 from housemaker.blueprint_canvas import (
     CANVAS_SNAPSHOT_ACTION_OPEN_SPACE,
     CANVAS_SNAPSHOT_ACTION_VERTEX_DELETION,
@@ -110,6 +121,7 @@ from housemaker.glb import (
     build_texture_preview_plane_model,
     compose_placed_generated_models,
     compose_placed_generated_models_preview,
+    convert_to_export_scene_model,
     convert_to_glb,
     convert_to_preview_model,
     export_glb_file,
@@ -193,6 +205,7 @@ from housemaker.texture_atlas_state import (
     OBJECT_TEXTURE_RESOLUTIONS,
     TextureAtlasData,
     TextureAtlasPlacement,
+    TextureAtlasRecord,
 )
 from housemaker.texture_atlas_workspace import (
     AtlasObjectTextureSource,
@@ -229,9 +242,7 @@ PROJECT_LOAD_FAILURES = (
     TypeError,
     ValueError,
 )
-SURFACE_ATLAS_ROUGHNESS_BYTE = round(
-    LEGACY_SURFACE_ROUGHNESS_FACTOR * 255.0
-)
+SURFACE_ATLAS_ROUGHNESS_BYTE = round(LEGACY_SURFACE_ROUGHNESS_FACTOR * 255.0)
 DELAYED_CANVAS_SURFACE_EDIT_KINDS = frozenset(
     (
         *CANVAS_SURFACE_EDIT_WALL_KINDS,
@@ -248,6 +259,365 @@ CANVAS_LEVEL_SCALE_SLIDER_FACTOR = 100
 CANVAS_OFFSET_SLIDER_FACTOR = 100
 CANVAS_OFFSET_SLIDER_MIN_PIXELS = -2000.0
 CANVAS_OFFSET_SLIDER_MAX_PIXELS = 2000.0
+SURFACE_AO_SHUTDOWN_WAIT_MILLISECONDS = 100
+SURFACE_AO_PREVIEW_REFRESH_DELAY_MILLISECONDS = 150
+ATLAS_DRAW_CALL_ESTIMATE_REFRESH_DELAY_MILLISECONDS = 200
+
+
+# ### Atlas ambient-occlusion jobs ###
+@dataclass(frozen=True)
+class _PreAtlasExportScene:
+    """The shared scene and source bindings before Atlas UV remapping."""
+
+    model: GeneratedModel
+    placed_models: tuple[PlacedGeneratedModel, ...]
+    surface_source_ids: dict[str, str]
+
+    @property
+    def required_source_ids(self) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                (
+                    *(placement.object_id for placement in self.placed_models),
+                    *self.surface_source_ids.values(),
+                )
+            )
+        )
+
+
+@dataclass(frozen=True)
+class _PlacedGeneratedModelFileSnapshot:
+    """One placed object whose GLB is loaded only by the AO worker."""
+
+    object_id: str
+    object_name: str
+    asset_path: Path
+    asset_revision: tuple[str, int, int, int]
+    world_position: tuple[float, float, float]
+    rotation_degrees: tuple[float, float, float]
+    symmetric_preview_orientation: str | None = None
+    symmetric_preview_plane_coordinate: float | None = None
+
+
+@dataclass(frozen=True)
+class _SurfaceAmbientOcclusionSceneSnapshot:
+    """GUI-captured plain data needed to build the pre-Atlas AO scene."""
+
+    levels: tuple[LevelData, ...]
+    stairs: tuple[StairData, ...]
+    surface_materials: tuple[tuple[str, object], ...]
+    placed_models: tuple[_PlacedGeneratedModelFileSnapshot, ...]
+    surface_source_ids: tuple[tuple[str, str], ...]
+
+    @property
+    def required_source_ids(self) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                (
+                    *(placement.object_id for placement in self.placed_models),
+                    *(source_id for _surface_id, source_id in self.surface_source_ids),
+                )
+            )
+        )
+
+
+@dataclass(frozen=True)
+class _SurfaceAmbientOcclusionBakeSnapshot:
+    """Inputs which must remain current before an asynchronous bake commits."""
+
+    viewer_revision: int
+    dependency_signature: tuple[object, ...]
+    atlas_context_signature: tuple[tuple[object, ...], ...]
+    required_source_ids: tuple[str, ...]
+    surface_source_signature: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
+class _AmbientOcclusionBakePreparation:
+    """One GUI-thread snapshot shared by one or many Atlas AO jobs."""
+
+    scene_snapshot: _SurfaceAmbientOcclusionSceneSnapshot
+    atlas_context: tuple[SurfaceAmbientOcclusionAtlasContext, ...]
+    snapshot: _SurfaceAmbientOcclusionBakeSnapshot
+
+
+class _SurfaceAmbientOcclusionBakeThread(QThread):
+    """Bake one immutable Atlas/scene snapshot outside the GUI thread."""
+
+    progress = Signal(str)
+
+    def __init__(
+        self,
+        scene_snapshot: _SurfaceAmbientOcclusionSceneSnapshot,
+        atlas: SurfaceAmbientOcclusionAtlasContext,
+        atlas_context: Sequence[SurfaceAmbientOcclusionAtlasContext],
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._scene_snapshot = scene_snapshot
+        self._atlas = atlas
+        self._atlas_context = tuple(atlas_context)
+        self.result: SurfaceAmbientOcclusionBakeResult | None = None
+        self.error_message: str | None = None
+        self.was_cancelled = False
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            self.progress.emit("Building ambient-occlusion scene (2%)")
+            pre_atlas_scene = _build_surface_ao_pre_atlas_scene(
+                self._scene_snapshot,
+                self.isInterruptionRequested,
+                allow_empty_base=True,
+            )
+            result = bake_surface_ambient_occlusion_for_atlas(
+                pre_atlas_scene.model,
+                self._atlas,
+                atlas_context=self._atlas_context,
+                surface_source_ids=pre_atlas_scene.surface_source_ids,
+                cancellation_check=self.isInterruptionRequested,
+                progress_callback=lambda message: self.progress.emit(str(message)),
+            )
+        except Exception as error:  # noqa: BLE001 - worker failures cross Qt safely.
+            if self.isInterruptionRequested():
+                self.was_cancelled = True
+            else:
+                self.error_message = str(error) or type(error).__name__
+            return
+        if self.isInterruptionRequested():
+            self.was_cancelled = True
+            return
+        self.result = result
+
+
+class _SurfaceAmbientOcclusionPreviewThread(QThread):
+    """Prepare one immutable cached-AO preview outside the GUI thread."""
+
+    progress = Signal(str)
+
+    def __init__(
+        self,
+        scene_snapshot: _SurfaceAmbientOcclusionSceneSnapshot,
+        atlas: SurfaceAmbientOcclusionAtlasContext,
+        atlas_context: Sequence[SurfaceAmbientOcclusionAtlasContext],
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._scene_snapshot = scene_snapshot
+        self._atlas = atlas
+        self._atlas_context = tuple(atlas_context)
+        self.result: GeneratedModel | None = None
+        self.error_message: str | None = None
+        self.was_cancelled = False
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            self.progress.emit("Building ambient-occlusion preview scene")
+            pre_atlas_scene = _build_surface_ao_pre_atlas_scene(
+                self._scene_snapshot,
+                self.isInterruptionRequested,
+                allow_empty_base=True,
+            )
+            result = prepare_surface_ambient_occlusion_preview_for_atlas(
+                pre_atlas_scene.model,
+                self._atlas,
+                atlas_context=self._atlas_context,
+                surface_source_ids=pre_atlas_scene.surface_source_ids,
+                cancellation_check=self.isInterruptionRequested,
+                progress_callback=lambda message: self.progress.emit(str(message)),
+            )
+        except Exception as error:  # noqa: BLE001 - worker failures cross Qt safely.
+            if self.isInterruptionRequested():
+                self.was_cancelled = True
+            else:
+                self.error_message = str(error) or type(error).__name__
+            return
+        if self.isInterruptionRequested():
+            self.was_cancelled = True
+            return
+        self.result = result
+
+
+# ### Atlas draw-call estimation ###
+class _AtlasDrawCallEstimateThread(QThread):
+    """Estimate exact exported primitives from an immutable scene snapshot."""
+
+    def __init__(
+        self,
+        scene_snapshot: _SurfaceAmbientOcclusionSceneSnapshot,
+        atlases: Sequence[TextureAtlasRecord],
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._scene_snapshot = scene_snapshot
+        self._atlases = tuple(copy.deepcopy(tuple(atlases)))
+        self.result: AtlasDrawCallEstimate | None = None
+        self.error_message: str | None = None
+        self.was_cancelled = False
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            pre_atlas_scene = _build_surface_ao_pre_atlas_scene(
+                self._scene_snapshot,
+                self.isInterruptionRequested,
+                allow_empty_base=True,
+            )
+            result = estimate_texture_atlas_draw_calls(
+                pre_atlas_scene.model,
+                self._atlases,
+                surface_source_ids=pre_atlas_scene.surface_source_ids,
+            )
+        except Exception as error:  # noqa: BLE001 - worker failures cross Qt safely.
+            if self.isInterruptionRequested():
+                self.was_cancelled = True
+            else:
+                self.error_message = str(error) or type(error).__name__
+            return
+        if self.isInterruptionRequested():
+            self.was_cancelled = True
+            return
+        self.result = result
+
+
+def _build_surface_ao_pre_atlas_scene(
+    snapshot: _SurfaceAmbientOcclusionSceneSnapshot,
+    cancellation_check: Callable[[], bool],
+    *,
+    allow_empty_base: bool = False,
+) -> _PreAtlasExportScene:
+    """Build AO geometry and load placed GLBs without touching Qt widgets."""
+
+    if cancellation_check():
+        raise RuntimeError("Ambient-occlusion bake cancelled.")
+    surface_materials: dict[str, object] = {}
+    for surface_id, source in snapshot.surface_materials:
+        if isinstance(source, tuple):
+            surface_materials[surface_id] = dict(source)
+        else:
+            surface_materials[surface_id] = source
+    try:
+        base_model = convert_to_export_scene_model(
+            snapshot.levels,
+            stairs=snapshot.stairs,
+            surface_materials=surface_materials,
+        )
+    except ValueError as error:
+        if not allow_empty_base or "does not contain usable edges" not in str(error):
+            raise
+        empty_mesh = trimesh.Trimesh(process=False)
+        base_model = GeneratedModel(
+            mesh=empty_mesh,
+            scene=trimesh.Scene(),
+            glb_bytes=b"",
+        )
+    placements: list[PlacedGeneratedModel] = []
+    for placed in snapshot.placed_models:
+        if cancellation_check():
+            raise RuntimeError("Ambient-occlusion bake cancelled.")
+        try:
+            revision_before = _build_surface_ao_file_revision(placed.asset_path)
+            if revision_before != placed.asset_revision:
+                raise OSError("The placed GLB changed before it could be loaded.")
+            payload = placed.asset_path.read_bytes()
+            if _build_surface_ao_file_revision(placed.asset_path) != revision_before:
+                raise OSError("The placed GLB changed while it was being loaded.")
+            model = import_generated_glb(payload)
+        except Exception as error:
+            raise ValueError(
+                f"Placed object {placed.object_name!r} is temporarily unavailable."
+            ) from error
+        placements.append(
+            PlacedGeneratedModel(
+                object_id=placed.object_id,
+                object_name=placed.object_name,
+                model=model,
+                world_position=placed.world_position,
+                symmetric_preview_orientation=(placed.symmetric_preview_orientation),
+                symmetric_preview_plane_coordinate=(
+                    placed.symmetric_preview_plane_coordinate
+                ),
+                rotation_degrees=placed.rotation_degrees,
+            )
+        )
+    if cancellation_check():
+        raise RuntimeError("Ambient-occlusion bake cancelled.")
+    generated_model = (
+        base_model
+        if not placements
+        else compose_placed_generated_models_preview(base_model, placements)
+    )
+    return _PreAtlasExportScene(
+        model=generated_model,
+        placed_models=tuple(placements),
+        surface_source_ids=dict(snapshot.surface_source_ids),
+    )
+
+
+def _build_surface_ao_file_revision(path: Path) -> tuple[str, int, int, int]:
+    """Return the same stable local-file identity captured by Generation."""
+
+    resolved_path = Path(path).resolve()
+    file_stat = resolved_path.stat()
+    return (
+        str(resolved_path),
+        int(file_stat.st_size),
+        int(file_stat.st_mtime_ns),
+        int(file_stat.st_ctime_ns),
+    )
+
+
+@dataclass
+class _SurfaceAmbientOcclusionBakeRuntime:
+    """GUI-owned lifecycle for one independently cancellable Atlas bake."""
+
+    atlas_id: str
+    job_id: str
+    thread: _SurfaceAmbientOcclusionBakeThread
+    snapshot: _SurfaceAmbientOcclusionBakeSnapshot
+    cancel_requested: bool = False
+
+
+@dataclass(frozen=True)
+class _SurfaceAmbientOcclusionPreviewCacheEntry:
+    """One AO-only model tied to exact scene, Atlas, and PNG revisions."""
+
+    snapshot: _SurfaceAmbientOcclusionBakeSnapshot
+    geometry_signature: str
+    image_revision: tuple[str, int, int, int]
+    model: GeneratedModel
+
+
+@dataclass
+class _SurfaceAmbientOcclusionPreviewRuntime:
+    """GUI-owned lifecycle for one cancellable AO-only preview build."""
+
+    request_id: int
+    atlas_id: str
+    thread: _SurfaceAmbientOcclusionPreviewThread
+    snapshot: _SurfaceAmbientOcclusionBakeSnapshot
+    image_revision: tuple[str, int, int, int]
+    cancel_requested: bool = False
+
+
+# ### Atlas draw-call estimator lifecycle ###
+@dataclass(frozen=True)
+class _AtlasDrawCallEstimateSnapshot:
+    """Inputs that must remain current before an estimate is displayed."""
+
+    scene_revision: int
+    dependency_signature: tuple[object, ...]
+    atlas_layout_signature: tuple[tuple[object, ...], ...]
+    required_source_ids: tuple[str, ...]
+    surface_source_signature: tuple[tuple[str, str], ...]
+
+
+@dataclass
+class _AtlasDrawCallEstimateRuntime:
+    """GUI-owned lifecycle for one cancellable estimate worker."""
+
+    request_id: int
+    thread: _AtlasDrawCallEstimateThread
+    snapshot: _AtlasDrawCallEstimateSnapshot
+    cancel_requested: bool = False
 
 
 # ### Canvas undo models ###
@@ -409,9 +779,7 @@ class RightPanelValueInputWheelFilter(QObject):
 
     def _forward_wheel_event_to_scroll_area(self, event: QWheelEvent) -> None:
         viewport = self._scroll_area.viewport()
-        viewport_position = viewport.mapFromGlobal(
-            event.globalPosition().toPoint()
-        )
+        viewport_position = viewport.mapFromGlobal(event.globalPosition().toPoint())
         forwarded_event = QWheelEvent(
             QPointF(viewport_position),
             event.globalPosition(),
@@ -442,9 +810,7 @@ class BlueprintWorkspace(QWidget):
         self.levels: list[LevelData] = create_default_levels()
         self.wall_mirror_links: tuple[WallMirrorVertexLink, ...] = ()
         self.image_library_paths: list[str] = []
-        self.doorway_presets: list[DoorwayPreset] = (
-            create_default_doorway_presets()
-        )
+        self.doorway_presets: list[DoorwayPreset] = create_default_doorway_presets()
         self.stairs: list[StairData] = []
         self.current_level_index = GROUND_LEVEL_INDEX
         self._is_syncing_level_controls = False
@@ -462,9 +828,7 @@ class BlueprintWorkspace(QWidget):
         self._canvas_viewer_preview_revision = -1
         self._surface_viewer_preview_revision = -1
         self._viewer_preview_model: GeneratedModel | None = None
-        self._viewer_preview_dependency_signature: tuple[object, ...] | None = (
-            None
-        )
+        self._viewer_preview_dependency_signature: tuple[object, ...] | None = None
         self._viewer_preview_dependency_signature_revision = -1
         # Structural edits remain live in project data while these separate
         # snapshots control which edits have reached the expensive 3D mesh.
@@ -478,9 +842,7 @@ class BlueprintWorkspace(QWidget):
         ] = {}
         self._viewer_floor_thickness_by_level_index: dict[int, float] = {}
         self._reset_viewer_doorway_snapshots()
-        self._mesh_edit_update_delay_seconds = (
-            DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS
-        )
+        self._mesh_edit_update_delay_seconds = DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS
         self._wall_vertex_update_delay_seconds = (
             DEFAULT_WALL_VERTEX_UPDATE_DELAY_SECONDS
         )
@@ -488,9 +850,7 @@ class BlueprintWorkspace(QWidget):
         self._is_canvas_wall_vertex_interaction_active = False
         self._is_doorway_move_drag_active = False
         self._is_canvas_opening_drag_active = False
-        self._active_canvas_opening_reference: (
-            CanvasOpeningReference | None
-        ) = None
+        self._active_canvas_opening_reference: CanvasOpeningReference | None = None
         self._active_canvas_opening_start_edit: CanvasOpeningEdit | None = None
         self._canvas_opening_targets_by_key: dict[
             str,
@@ -575,9 +935,7 @@ class BlueprintWorkspace(QWidget):
         self._desired_canvas_object_id: str | None = None
         self._desired_canvas_surface_ids: tuple[str, ...] = ()
         self._active_canvas_surface_drawing_vertex_id: str | None = None
-        self._last_automatic_atlas_assignment_key: tuple[object, ...] | None = (
-            None
-        )
+        self._last_automatic_atlas_assignment_key: tuple[object, ...] | None = None
         self._atlas_preview_variant_key: tuple[object, ...] | None = None
         self._level_blueprint_image_revisions: dict[
             int,
@@ -588,6 +946,52 @@ class BlueprintWorkspace(QWidget):
         self._is_restoring_canvas_undo = False
         self._object_placement_dialog: ObjectPlacementDialog | None = None
         self._object_placement_operation_id: str | None = None
+        self._surface_ao_bake_runtimes: dict[
+            str,
+            _SurfaceAmbientOcclusionBakeRuntime,
+        ] = {}
+        self._surface_ao_preview_runtimes: dict[
+            int,
+            _SurfaceAmbientOcclusionPreviewRuntime,
+        ] = {}
+        self._surface_ao_preview_cache: dict[
+            str,
+            _SurfaceAmbientOcclusionPreviewCacheEntry,
+        ] = {}
+        self._surface_ao_preview_request_id = 0
+        self._surface_ao_preview_refresh_timer = QTimer(self)
+        self._surface_ao_preview_refresh_timer.setSingleShot(True)
+        self._surface_ao_preview_refresh_timer.setInterval(
+            SURFACE_AO_PREVIEW_REFRESH_DELAY_MILLISECONDS
+        )
+        self._surface_ao_preview_refresh_timer.timeout.connect(
+            self._refresh_surface_ambient_occlusion_preview
+        )
+        self._atlas_draw_call_estimate_runtimes: dict[
+            int,
+            _AtlasDrawCallEstimateRuntime,
+        ] = {}
+        self._atlas_draw_call_estimate_request_id = 0
+        self._atlas_draw_call_scene_revision = 0
+        self._atlas_draw_call_estimate_cache_signature: (
+            _AtlasDrawCallEstimateSnapshot | None
+        ) = None
+        self._atlas_draw_call_estimate_cache_result: AtlasDrawCallEstimate | None = None
+        self._atlas_draw_call_estimate_refresh_timer = QTimer(self)
+        self._atlas_draw_call_estimate_refresh_timer.setSingleShot(True)
+        self._atlas_draw_call_estimate_refresh_timer.setInterval(
+            ATLAS_DRAW_CALL_ESTIMATE_REFRESH_DELAY_MILLISECONDS
+        )
+        self._atlas_draw_call_estimate_refresh_timer.timeout.connect(
+            self._refresh_atlas_draw_call_estimate
+        )
+        self._atlas_preview_display_state: (
+            tuple[bool, bool, bool, dict[str, bool]] | None
+        ) = None
+        self._canvas_ao_preview_display_state: (
+            tuple[bool, bool, bool, dict[str, bool], float] | None
+        ) = None
+        self._surface_ao_canvas_preview_key: tuple[object, ...] | None = None
         self._is_shutdown = False
         self._build_ui()
 
@@ -606,6 +1010,8 @@ class BlueprintWorkspace(QWidget):
             return
         self._is_shutdown = True
         self._is_viewer_refresh_scheduled = False
+        self._surface_ao_preview_refresh_timer.stop()
+        self._atlas_draw_call_estimate_refresh_timer.stop()
         self._cancel_pending_level_transform(
             sync_controls=False,
             restore_canvas_tools=False,
@@ -614,6 +1020,9 @@ class BlueprintWorkspace(QWidget):
         self._cancel_pending_canvas_surface_mesh_update()
         self._cancel_pending_wall_vertex_update()
         self._cancel_pending_doorway_mesh_update(clear_outline=True)
+        self._cancel_and_join_atlas_draw_call_estimates()
+        self._cancel_and_join_surface_ambient_occlusion_previews()
+        self._cancel_and_join_surface_ambient_occlusion_bakes()
         try:
             self.settings_widget.settings_changed.disconnect(
                 self._handle_generation_settings_changed
@@ -711,12 +1120,8 @@ class BlueprintWorkspace(QWidget):
         increase_button.setToolTip(
             f"Increase {control_name} once. Hold to compare levels."
         )
-        decrease_button.pressed.connect(
-            partial(pressed_handler, slider, -1)
-        )
-        increase_button.pressed.connect(
-            partial(pressed_handler, slider, 1)
-        )
+        decrease_button.pressed.connect(partial(pressed_handler, slider, -1))
+        increase_button.pressed.connect(partial(pressed_handler, slider, 1))
         decrease_button.released.connect(released_handler)
         increase_button.released.connect(released_handler)
         layout.insertWidget(0, decrease_button)
@@ -809,9 +1214,7 @@ class BlueprintWorkspace(QWidget):
         self.job_manager = GenerationJobManager(self)
         self.jobs_window = JobsWindow(self.job_manager, self)
         self.generation = GenerationWorkspace(
-            asset_directory=(
-                self._application_settings.path.parent / "generated"
-            ),
+            asset_directory=(self._application_settings.path.parent / "generated"),
             job_manager=self.job_manager,
         )
         self.generation.set_texture_resolution_change_handler(
@@ -821,9 +1224,7 @@ class BlueprintWorkspace(QWidget):
             self._handle_generation_object_packing_change_requested
         )
         self.texture_atlas_workspace = TextureAtlasWorkspace(
-            asset_directory=(
-                self._application_settings.path.parent / "texture_atlases"
-            )
+            asset_directory=(self._application_settings.path.parent / "texture_atlases")
         )
         self._external_atlas_host = ExternalFullscreenViewerHost(
             self,
@@ -836,9 +1237,7 @@ class BlueprintWorkspace(QWidget):
         self._external_atlas_host.viewer_restored.connect(
             self._handle_external_atlas_viewer_restored
         )
-        self.atlas_object_preview_viewer = GlbViewerWidget(
-            self.texture_atlas_workspace
-        )
+        self.atlas_object_preview_viewer = GlbViewerWidget(self.texture_atlas_workspace)
         self.atlas_object_preview_viewer.setObjectName(
             "texture_atlas_object_preview_viewer"
         )
@@ -876,6 +1275,18 @@ class BlueprintWorkspace(QWidget):
         self.texture_atlas_workspace.source_remove_requested.connect(
             self._handle_atlas_source_remove_requested
         )
+        self.texture_atlas_workspace.ambient_occlusion_bake_requested.connect(
+            self._handle_ambient_occlusion_bake_requested
+        )
+        self.texture_atlas_workspace.ambient_occlusion_bake_all_requested.connect(
+            self._handle_all_ambient_occlusion_bakes_requested
+        )
+        self.texture_atlas_workspace.active_preview_map_changed.connect(
+            self._handle_atlas_preview_map_changed
+        )
+        self.texture_atlas_workspace.data_changed.connect(
+            self._handle_texture_atlas_data_changed_for_ao_preview
+        )
         self.surface_texture_generation = SurfaceTextureGenerationWorkspace(
             asset_directory=(
                 self._application_settings.path.parent / "surface_textures"
@@ -910,9 +1321,7 @@ class BlueprintWorkspace(QWidget):
             generation_settings.snap_middle_equal_angle_only
         )
         self.generation.set_runtime_settings(generation_settings)
-        self.surface_texture_generation.set_runtime_settings(
-            generation_settings
-        )
+        self.surface_texture_generation.set_runtime_settings(generation_settings)
         self.surface_texture_generation.generation_completed.connect(
             self._handle_surface_texture_generation_completed
         )
@@ -970,9 +1379,7 @@ class BlueprintWorkspace(QWidget):
         )
         self.workspace_tabs.addTab(self.generation, "Object generation")
         self.workspace_tabs.addTab(self.settings_widget, "Settings")
-        self.workspace_tabs.currentChanged.connect(
-            self._handle_workspace_tab_changed
-        )
+        self.workspace_tabs.currentChanged.connect(self._handle_workspace_tab_changed)
         self.viewer.window_placement_requested.connect(
             self._handle_canvas_window_placement_requested
         )
@@ -1069,9 +1476,7 @@ class BlueprintWorkspace(QWidget):
 
         generals_tab = QScrollArea()
         generals_tab.setWidgetResizable(True)
-        generals_tab.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
+        generals_tab.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         generals_content = QWidget()
         generals_layout = QVBoxLayout(generals_content)
@@ -1094,7 +1499,9 @@ class BlueprintWorkspace(QWidget):
         self.height_level_spinbox.setValue(DEFAULT_WALL_HEIGHT_METERS)
         self.height_level_spinbox.setSuffix(" m")
         self.height_level_spinbox.setMinimumHeight(40)
-        self.height_level_spinbox.valueChanged.connect(self._handle_height_level_changed)
+        self.height_level_spinbox.valueChanged.connect(
+            self._handle_height_level_changed
+        )
         level_dimensions_layout.addRow(
             "Height level",
             self.height_level_spinbox,
@@ -1133,9 +1540,7 @@ class BlueprintWorkspace(QWidget):
             "Drag a rectangle on the 2D Canvas to remove this level's floor "
             "and the level below's ceiling."
         )
-        self.add_open_space_button.clicked.connect(
-            self._handle_add_open_space_clicked
-        )
+        self.add_open_space_button.clicked.connect(self._handle_add_open_space_clicked)
         open_spaces_layout.addWidget(self.add_open_space_button)
         side_layout.addWidget(self.open_spaces_group)
 
@@ -1180,15 +1585,9 @@ class BlueprintWorkspace(QWidget):
             self.level_x_offset_slider,
             self.level_x_offset_value_label,
         ) = self._build_transform_slider_field(
-            minimum=round(
-                LEVEL_OFFSET_SLIDER_MIN_METERS * LEVEL_OFFSET_SLIDER_FACTOR
-            ),
-            maximum=round(
-                LEVEL_OFFSET_SLIDER_MAX_METERS * LEVEL_OFFSET_SLIDER_FACTOR
-            ),
-            value=round(
-                DEFAULT_LEVEL_OFFSET_METERS * LEVEL_OFFSET_SLIDER_FACTOR
-            ),
+            minimum=round(LEVEL_OFFSET_SLIDER_MIN_METERS * LEVEL_OFFSET_SLIDER_FACTOR),
+            maximum=round(LEVEL_OFFSET_SLIDER_MAX_METERS * LEVEL_OFFSET_SLIDER_FACTOR),
+            value=round(DEFAULT_LEVEL_OFFSET_METERS * LEVEL_OFFSET_SLIDER_FACTOR),
             single_step=1,
             page_step=10,
             tick_interval=1000,
@@ -1216,15 +1615,9 @@ class BlueprintWorkspace(QWidget):
             self.level_y_offset_slider,
             self.level_y_offset_value_label,
         ) = self._build_transform_slider_field(
-            minimum=round(
-                LEVEL_OFFSET_SLIDER_MIN_METERS * LEVEL_OFFSET_SLIDER_FACTOR
-            ),
-            maximum=round(
-                LEVEL_OFFSET_SLIDER_MAX_METERS * LEVEL_OFFSET_SLIDER_FACTOR
-            ),
-            value=round(
-                DEFAULT_LEVEL_OFFSET_METERS * LEVEL_OFFSET_SLIDER_FACTOR
-            ),
+            minimum=round(LEVEL_OFFSET_SLIDER_MIN_METERS * LEVEL_OFFSET_SLIDER_FACTOR),
+            maximum=round(LEVEL_OFFSET_SLIDER_MAX_METERS * LEVEL_OFFSET_SLIDER_FACTOR),
+            value=round(DEFAULT_LEVEL_OFFSET_METERS * LEVEL_OFFSET_SLIDER_FACTOR),
             single_step=1,
             page_step=10,
             tick_interval=1000,
@@ -1253,12 +1646,8 @@ class BlueprintWorkspace(QWidget):
             self.level_x_offset_slider,
             self.level_y_offset_slider,
         ):
-            slider.sliderPressed.connect(
-                self._handle_level_transform_drag_started
-            )
-            slider.sliderReleased.connect(
-                self._handle_level_transform_drag_finished
-            )
+            slider.sliderPressed.connect(self._handle_level_transform_drag_started)
+            slider.sliderReleased.connect(self._handle_level_transform_drag_finished)
         self.level_scale_slider.sliderMoved.connect(
             self._preview_level_scale_slider_value
         )
@@ -1289,16 +1678,9 @@ class BlueprintWorkspace(QWidget):
             self.canvas_level_scale_slider,
             self.canvas_level_scale_value_label,
         ) = self._build_transform_slider_field(
-            minimum=round(
-                MIN_CANVAS_LEVEL_SCALE * CANVAS_LEVEL_SCALE_SLIDER_FACTOR
-            ),
-            maximum=round(
-                MAX_CANVAS_LEVEL_SCALE * CANVAS_LEVEL_SCALE_SLIDER_FACTOR
-            ),
-            value=round(
-                DEFAULT_CANVAS_LEVEL_SCALE
-                * CANVAS_LEVEL_SCALE_SLIDER_FACTOR
-            ),
+            minimum=round(MIN_CANVAS_LEVEL_SCALE * CANVAS_LEVEL_SCALE_SLIDER_FACTOR),
+            maximum=round(MAX_CANVAS_LEVEL_SCALE * CANVAS_LEVEL_SCALE_SLIDER_FACTOR),
+            value=round(DEFAULT_CANVAS_LEVEL_SCALE * CANVAS_LEVEL_SCALE_SLIDER_FACTOR),
             single_step=1,
             page_step=10,
             tick_interval=50,
@@ -1335,9 +1717,7 @@ class BlueprintWorkspace(QWidget):
             maximum=round(
                 CANVAS_OFFSET_SLIDER_MAX_PIXELS * CANVAS_OFFSET_SLIDER_FACTOR
             ),
-            value=round(
-                DEFAULT_CANVAS_OFFSET_PIXELS * CANVAS_OFFSET_SLIDER_FACTOR
-            ),
+            value=round(DEFAULT_CANVAS_OFFSET_PIXELS * CANVAS_OFFSET_SLIDER_FACTOR),
             single_step=CANVAS_OFFSET_SLIDER_FACTOR,
             page_step=10 * CANVAS_OFFSET_SLIDER_FACTOR,
             tick_interval=100 * CANVAS_OFFSET_SLIDER_FACTOR,
@@ -1374,9 +1754,7 @@ class BlueprintWorkspace(QWidget):
             maximum=round(
                 CANVAS_OFFSET_SLIDER_MAX_PIXELS * CANVAS_OFFSET_SLIDER_FACTOR
             ),
-            value=round(
-                DEFAULT_CANVAS_OFFSET_PIXELS * CANVAS_OFFSET_SLIDER_FACTOR
-            ),
+            value=round(DEFAULT_CANVAS_OFFSET_PIXELS * CANVAS_OFFSET_SLIDER_FACTOR),
             single_step=CANVAS_OFFSET_SLIDER_FACTOR,
             page_step=10 * CANVAS_OFFSET_SLIDER_FACTOR,
             tick_interval=100 * CANVAS_OFFSET_SLIDER_FACTOR,
@@ -1408,12 +1786,8 @@ class BlueprintWorkspace(QWidget):
             self.canvas_x_offset_slider,
             self.canvas_y_offset_slider,
         ):
-            slider.sliderPressed.connect(
-                self._handle_canvas_transform_drag_started
-            )
-            slider.sliderReleased.connect(
-                self._handle_canvas_transform_drag_finished
-            )
+            slider.sliderPressed.connect(self._handle_canvas_transform_drag_started)
+            slider.sliderReleased.connect(self._handle_canvas_transform_drag_finished)
         self.canvas_level_scale_slider.valueChanged.connect(
             self._handle_canvas_level_scale_changed
         )
@@ -1454,9 +1828,7 @@ class BlueprintWorkspace(QWidget):
         self.doorways_group = QGroupBox("Doorways")
         doorways_layout = QVBoxLayout(self.doorways_group)
 
-        self.selected_doorway_arch_checkbox = QCheckBox(
-            "Arch selected doorway"
-        )
+        self.selected_doorway_arch_checkbox = QCheckBox("Arch selected doorway")
         self.selected_doorway_arch_checkbox.setEnabled(False)
         self.selected_doorway_arch_checkbox.setToolTip(
             "Select a placed doorway on the Canvas, then enable this to "
@@ -1505,9 +1877,7 @@ class BlueprintWorkspace(QWidget):
         )
         doorways_layout.addWidget(self.doorway_preset_list)
 
-        self.save_doorway_template_button = QPushButton(
-            "Save doorway template"
-        )
+        self.save_doorway_template_button = QPushButton("Save doorway template")
         self.save_doorway_template_button.setMinimumHeight(40)
         self.save_doorway_template_button.setEnabled(False)
         self.save_doorway_template_button.clicked.connect(
@@ -1545,15 +1915,11 @@ class BlueprintWorkspace(QWidget):
             "Copy the selected wall vertices and their shared edges to the "
             "next level above."
         )
-        self.wall_mirror_up_button.clicked.connect(
-            self._handle_wall_mirror_up_clicked
-        )
+        self.wall_mirror_up_button.clicked.connect(self._handle_wall_mirror_up_clicked)
         wall_mirrors_layout.addWidget(self.wall_mirror_up_button)
 
         self.wall_mirror_undo_button = QPushButton("Undo")
-        self.wall_mirror_undo_button.setObjectName(
-            "canvas-wall-mirror-undo-button"
-        )
+        self.wall_mirror_undo_button.setObjectName("canvas-wall-mirror-undo-button")
         self.wall_mirror_undo_button.setMinimumHeight(40)
         self.wall_mirror_undo_button.setToolTip(
             "Remove mirrors owned by or represented by the selected vertices."
@@ -1564,9 +1930,7 @@ class BlueprintWorkspace(QWidget):
         wall_mirrors_layout.addWidget(self.wall_mirror_undo_button)
 
         self.wall_mirror_down_button = QPushButton("Down")
-        self.wall_mirror_down_button.setObjectName(
-            "canvas-wall-mirror-down-button"
-        )
+        self.wall_mirror_down_button.setObjectName("canvas-wall-mirror-down-button")
         self.wall_mirror_down_button.setMinimumHeight(40)
         self.wall_mirror_down_button.setToolTip(
             "Copy the selected wall vertices and their shared edges to the "
@@ -1591,9 +1955,7 @@ class BlueprintWorkspace(QWidget):
         levels_layout.addWidget(self.blueprint_name_label)
 
         self.levels_list = QListWidget()
-        self.levels_list.currentRowChanged.connect(
-            self._handle_level_list_row_changed
-        )
+        self.levels_list.currentRowChanged.connect(self._handle_level_list_row_changed)
         levels_layout.addWidget(self.levels_list, 1)
 
         level_options_layout = QFormLayout()
@@ -1645,9 +2007,7 @@ class BlueprintWorkspace(QWidget):
             generals_tab
         )
         for spinbox in generals_content.findChildren(QAbstractSpinBox):
-            spinbox.installEventFilter(
-                self._generals_value_input_wheel_filter
-            )
+            spinbox.installEventFilter(self._generals_value_input_wheel_filter)
             spinbox.lineEdit().installEventFilter(
                 self._generals_value_input_wheel_filter
             )
@@ -1662,9 +2022,7 @@ class BlueprintWorkspace(QWidget):
             self.canvas_x_offset_slider,
             self.canvas_y_offset_slider,
         ):
-            slider.installEventFilter(
-                self._generals_value_input_wheel_filter
-            )
+            slider.installEventFilter(self._generals_value_input_wheel_filter)
 
         self.workspace_splitter.addWidget(self.side_panel)
         self.workspace_splitter.setStretchFactor(0, 9)
@@ -1674,9 +2032,7 @@ class BlueprintWorkspace(QWidget):
         self.canvas.geometry_changed.connect(
             self._handle_canvas_surface_geometry_changed
         )
-        self.canvas.wall_vertex_added.connect(
-            self._handle_canvas_wall_vertex_added
-        )
+        self.canvas.wall_vertex_added.connect(self._handle_canvas_wall_vertex_added)
         self.canvas.wall_vertex_interaction_changed.connect(
             self._handle_canvas_wall_vertex_interaction_changed
         )
@@ -1684,9 +2040,7 @@ class BlueprintWorkspace(QWidget):
             self._handle_canvas_selected_vertex_changed
         )
         self.canvas.doorways_changed.connect(self._handle_doorways_changed)
-        self.canvas.open_spaces_changed.connect(
-            self._handle_open_spaces_changed
-        )
+        self.canvas.open_spaces_changed.connect(self._handle_open_spaces_changed)
         self.canvas.open_space_placement_changed.connect(
             self._handle_open_space_placement_changed
         )
@@ -1702,12 +2056,8 @@ class BlueprintWorkspace(QWidget):
         self.canvas.selected_doorway_changed.connect(
             self._handle_canvas_doorway_selection_changed
         )
-        self.canvas.stair_start_placed.connect(
-            self._handle_stair_start_placed
-        )
-        self.canvas.stair_placement_ready.connect(
-            self._handle_stair_placement_ready
-        )
+        self.canvas.stair_start_placed.connect(self._handle_stair_start_placed)
+        self.canvas.stair_placement_ready.connect(self._handle_stair_placement_ready)
         self.canvas.stair_placement_completed.connect(
             self._handle_stair_placement_completed
         )
@@ -1717,9 +2067,7 @@ class BlueprintWorkspace(QWidget):
         self.canvas.stair_placement_invalid_endpoint.connect(
             self._handle_stair_placement_invalid_endpoint
         )
-        self.canvas.stair_delete_requested.connect(
-            self._handle_stair_delete_requested
-        )
+        self.canvas.stair_delete_requested.connect(self._handle_stair_delete_requested)
         self._update_wall_mirror_button_state()
         self._refresh_levels_list()
         self._update_stair_button_state()
@@ -1730,12 +2078,8 @@ class BlueprintWorkspace(QWidget):
         self._apply_fullscreen_3d_viewer_screen(
             generation_settings.fullscreen_3d_viewer_screen_id
         )
-        self._apply_jobs_window_screen(
-            generation_settings.jobs_window_screen_id
-        )
-        self._apply_atlas_display_screen(
-            generation_settings.atlas_display_screen_id
-        )
+        self._apply_jobs_window_screen(generation_settings.jobs_window_screen_id)
+        self._apply_atlas_display_screen(generation_settings.atlas_display_screen_id)
 
     def _build_canvas_viewer_workspace(self) -> QWidget:
         """Place the editable blueprint and its 3D preview in local tabs."""
@@ -1772,9 +2116,7 @@ class BlueprintWorkspace(QWidget):
             return
         self._canvas_3d_viewer_is_external = is_active
         if is_active:
-            self.canvas_viewer_tabs.setCurrentIndex(
-                self.canvas_2d_view_tab_index
-            )
+            self.canvas_viewer_tabs.setCurrentIndex(self.canvas_2d_view_tab_index)
             self.canvas_viewer_tabs.setTabEnabled(
                 self.canvas_3d_view_tab_index,
                 False,
@@ -1926,9 +2268,7 @@ class BlueprintWorkspace(QWidget):
             self._sync_viewer_window_snapshot(level)
             self._refresh_canvas_windows_for_level(level)
             self._sync_canvas_window_undo_availability()
-            self.viewer.set_window_tools_status(
-                f"Window could not be undone: {error}"
-            )
+            self.viewer.set_window_tools_status(f"Window could not be undone: {error}")
             return
         if validated_build is None:
             level.windows.insert(window_index, window)
@@ -1952,9 +2292,7 @@ class BlueprintWorkspace(QWidget):
             self._refresh_canvas_windows_for_level(level)
             self._restore_canvas_window_preview_after_rollback()
             self._sync_canvas_window_undo_availability()
-            self.viewer.set_window_tools_status(
-                f"Window could not be undone: {error}"
-            )
+            self.viewer.set_window_tools_status(f"Window could not be undone: {error}")
             return
 
         self._canvas_window_undo_ids.pop()
@@ -1977,10 +2315,8 @@ class BlueprintWorkspace(QWidget):
                 )
                 or (
                     isinstance(state, _CanvasOpeningEditUndoState)
-                    and state.start_edit.reference.kind
-                    == CANVAS_OPENING_WINDOW
-                    and state.start_edit.reference.stable_id
-                    == normalized_window_id
+                    and state.start_edit.reference.kind == CANVAS_OPENING_WINDOW
+                    and state.start_edit.reference.stable_id == normalized_window_id
                 )
             )
         ]
@@ -1993,9 +2329,7 @@ class BlueprintWorkspace(QWidget):
         """Keep doorway controls aligned with selection in the 3D viewer."""
 
         reference = (
-            raw_reference
-            if isinstance(raw_reference, CanvasOpeningReference)
-            else None
+            raw_reference if isinstance(raw_reference, CanvasOpeningReference) else None
         )
         if reference is not None:
             self._desired_canvas_object_id = None
@@ -2037,9 +2371,7 @@ class BlueprintWorkspace(QWidget):
 
         if not isinstance(raw_edit, CanvasOpeningEdit):
             return
-        target = self._canvas_opening_targets_by_key.get(
-            raw_edit.reference.key
-        )
+        target = self._canvas_opening_targets_by_key.get(raw_edit.reference.key)
         if target is None:
             self.viewer.set_window_tools_status(
                 "Opening edit stopped because its wall is no longer available."
@@ -2082,11 +2414,7 @@ class BlueprintWorkspace(QWidget):
         ):
             return
         start_edit = self._active_canvas_opening_start_edit
-        if (
-            changed
-            and start_edit is not None
-            and raw_edit.bounds != start_edit.bounds
-        ):
+        if changed and start_edit is not None and raw_edit.bounds != start_edit.bounds:
             self._record_canvas_undo_state(
                 _CanvasOpeningEditUndoState(start_edit=start_edit),
                 commit_pending_surface_edit=False,
@@ -2156,15 +2484,11 @@ class BlueprintWorkspace(QWidget):
         if reference.kind == CANVAS_OPENING_DOORWAY:
             committed = self._viewer_doorways_by_level_index.get(level.index)
             is_pending = self._copy_doorways(level.doorways) != committed
-            self._pending_doorway_mesh_level_index = (
-                level.index if is_pending else None
-            )
+            self._pending_doorway_mesh_level_index = level.index if is_pending else None
         else:
             committed = self._viewer_windows_by_level_index.get(level.index)
             is_pending = self._copy_windows(level.windows) != committed
-            self._pending_window_mesh_level_index = (
-                level.index if is_pending else None
-            )
+            self._pending_window_mesh_level_index = level.index if is_pending else None
         if is_pending:
             self._pending_canvas_opening_key = reference.key
         elif self._pending_canvas_opening_key == reference.key:
@@ -2178,16 +2502,15 @@ class BlueprintWorkspace(QWidget):
     ) -> bool:
         """Commit one validated window model to the active Canvas consumer."""
 
-        wall_targets = tuple(
-            build_fixed_surfaces(self._build_viewer_preview_levels())
-        )
-        self._set_canvas_viewer_targets(wall_targets)
-        self._is_syncing_canvas_scene_selection = True
-        try:
-            self.viewer.set_model(generated_model, preserve_camera=True)
-            self._restore_desired_canvas_scene_selection()
-        finally:
-            self._is_syncing_canvas_scene_selection = False
+        wall_targets = tuple(build_fixed_surfaces(self._build_viewer_preview_levels()))
+        if not self.texture_atlas_workspace.is_ambient_occlusion_preview_active:
+            self._set_canvas_viewer_targets(wall_targets)
+            self._is_syncing_canvas_scene_selection = True
+            try:
+                self.viewer.set_model(generated_model, preserve_camera=True)
+                self._restore_desired_canvas_scene_selection()
+            finally:
+                self._is_syncing_canvas_scene_selection = False
         self._mark_viewer_preview_dirty(preserve_camera=True)
         if self._remember_current_canvas_preview_model(
             generated_model,
@@ -2204,13 +2527,9 @@ class BlueprintWorkspace(QWidget):
         """Install semantic surfaces and their selectable opening overlays."""
 
         surface_targets = tuple(
-            surface
-            for surface in surfaces
-            if isinstance(surface, FixedSurface)
+            surface for surface in surfaces if isinstance(surface, FixedSurface)
         )
-        installed_surface_ids = {
-            surface.surface_id for surface in surface_targets
-        }
+        installed_surface_ids = {surface.surface_id for surface in surface_targets}
         self._canvas_surface_targets_by_id = {
             surface.surface_id: surface for surface in surface_targets
         }
@@ -2248,9 +2567,7 @@ class BlueprintWorkspace(QWidget):
             self._is_syncing_canvas_scene_selection = False
         selected_surface_source_id = self._selected_atlas_surface_source_id
         if selected_surface_source_id is not None:
-            self._handle_atlas_surface_texture_selected(
-                selected_surface_source_id
-            )
+            self._handle_atlas_surface_texture_selected(selected_surface_source_id)
         else:
             self.viewer.set_highlighted_canvas_surface_ids(())
             self._sync_atlas_green_outline_to_canvas_highlight(None)
@@ -2307,7 +2624,8 @@ class BlueprintWorkspace(QWidget):
             return
         try:
             normalized_surface_ids = (
-                str(value) for value in raw_surface_ids  # type: ignore[arg-type]
+                str(value)
+                for value in raw_surface_ids  # type: ignore[arg-type]
             )
             surface_ids = tuple(dict.fromkeys(normalized_surface_ids))
         except TypeError:
@@ -2317,9 +2635,7 @@ class BlueprintWorkspace(QWidget):
         if surface_ids:
             self._desired_canvas_object_id = None
         active_surface_id = surface_ids[-1] if surface_ids else None
-        self._sync_selected_canvas_wall_highlight(
-            active_surface_id
-        )
+        self._sync_selected_canvas_wall_highlight(active_surface_id)
         self._commit_pending_wall_vertex_update()
         pending_baseline = self._pending_canvas_surface_mesh_baseline
         if self._pending_canvas_surface_mesh_update:
@@ -2412,9 +2728,7 @@ class BlueprintWorkspace(QWidget):
                 level_index=self.current_level.index,
                 snapshot=raw_snapshot,
                 assignments=assignments,
-                assignment_targets_after=(
-                    None if tracks_surface_bindings else ()
-                ),
+                assignment_targets_after=(None if tracks_surface_bindings else ()),
                 atlas_placements=tuple(
                     (atlas.atlas_id, placement)
                     for atlas in self.texture_atlas_workspace.get_data().atlases
@@ -2526,8 +2840,7 @@ class BlueprintWorkspace(QWidget):
         )
         return _CanvasTopologyUndoState(
             editable_surfaces_by_level=tuple(
-                (level.index, tuple(level.editable_surfaces))
-                for level in self.levels
+                (level.index, tuple(level.editable_surfaces)) for level in self.levels
             ),
             assignments=assignments,
             assignment_targets_after=(),
@@ -2617,8 +2930,8 @@ class BlueprintWorkspace(QWidget):
             self._cancel_pending_wall_vertex_update()
             self._cancel_pending_doorway_mesh_update(clear_outline=True)
             if isinstance(state, _CanvasTopologyUndoState):
-                skipped_texture_bindings = (
-                    self._restore_canvas_topology_undo_state(state)
+                skipped_texture_bindings = self._restore_canvas_topology_undo_state(
+                    state
                 )
             elif isinstance(state, _CanvasSurfaceEditUndoState):
                 self._restore_canvas_surface_edit_undo_state(state)
@@ -2637,9 +2950,7 @@ class BlueprintWorkspace(QWidget):
             elif isinstance(state, _CanvasStairsUndoState):
                 self._restore_canvas_stairs_undo_state(state)
             else:
-                skipped_texture_bindings = self._restore_blueprint_undo_state(
-                    state
-                )
+                skipped_texture_bindings = self._restore_blueprint_undo_state(state)
         except (RuntimeError, TypeError, ValueError) as error:
             self.viewer.set_surface_tools_status(f"Canvas undo stopped: {error}")
             return
@@ -2697,9 +3008,7 @@ class BlueprintWorkspace(QWidget):
             )
             self.canvas.update()
         self._sync_canvas_wall_mirror_state()
-        self.surface_texture_generation.reconcile_assignments_with_levels(
-            self.levels
-        )
+        self.surface_texture_generation.reconcile_assignments_with_levels(self.levels)
         self._refresh_scene_atlas_texture_requirements()
         self._schedule_viewer_preview_refresh(preserve_camera=True)
 
@@ -2733,9 +3042,7 @@ class BlueprintWorkspace(QWidget):
     ) -> None:
         """Restore one doorway or window edit and resume its mesh debounce."""
 
-        target = self._canvas_opening_targets_by_key.get(
-            state.start_edit.reference.key
-        )
+        target = self._canvas_opening_targets_by_key.get(state.start_edit.reference.key)
         if target is None:
             raise ValueError("The Canvas opening in this undo step no longer exists.")
         applied = apply_canvas_opening_edit(
@@ -2870,8 +3177,7 @@ class BlueprintWorkspace(QWidget):
         if not state.assignments:
             return 0
         expected_by_id = {
-            assignment.assignment_id: assignment
-            for assignment in expected_after
+            assignment.assignment_id: assignment for assignment in expected_after
         }
         current_by_id = {
             assignment.assignment_id: assignment
@@ -2920,9 +3226,7 @@ class BlueprintWorkspace(QWidget):
         for assignment_id, assignment in restored_assignments_by_id.items():
             source = self._build_atlas_wall_texture_source(assignment)
             if source is not None:
-                live_sources[
-                    build_atlas_wall_texture_source_id(assignment_id)
-                ] = source
+                live_sources[build_atlas_wall_texture_source_id(assignment_id)] = source
         unresolved_placement_source_ids = {
             placement.object_id
             for _atlas_id, placement in restorable_atlas_placements
@@ -2939,13 +3243,10 @@ class BlueprintWorkspace(QWidget):
         )
         affected_source_ids = tuple(
             dict.fromkeys(
-                placement.object_id
-                for _atlas_id, placement in live_atlas_placements
+                placement.object_id for _atlas_id, placement in live_atlas_placements
             )
         )
-        self.texture_atlas_workspace.refresh_texture_source_content(
-            affected_source_ids
-        )
+        self.texture_atlas_workspace.refresh_texture_source_content(affected_source_ids)
         self._sync_canvas_surface_drawing_overlay()
         self._schedule_viewer_preview_refresh(preserve_camera=True)
         return (
@@ -2968,9 +3269,7 @@ class BlueprintWorkspace(QWidget):
         for level_index, editable_surfaces in state.editable_surfaces_by_level:
             level = levels_by_index.get(level_index)
             if level is None:
-                raise ValueError(
-                    "The Canvas level in this undo step no longer exists."
-                )
+                raise ValueError("The Canvas level in this undo step no longer exists.")
             restoration_targets.append((level, editable_surfaces))
         for level, editable_surfaces in restoration_targets:
             level.editable_surfaces = list(editable_surfaces)
@@ -3028,9 +3327,7 @@ class BlueprintWorkspace(QWidget):
                 for _atlas_id, placement in restorable_atlas_placements
             )
         )
-        self.texture_atlas_workspace.refresh_texture_source_content(
-            affected_source_ids
-        )
+        self.texture_atlas_workspace.refresh_texture_source_content(affected_source_ids)
         self._sync_canvas_surface_drawing_overlay()
         self._schedule_viewer_preview_refresh(preserve_camera=True)
         return (
@@ -3136,19 +3433,13 @@ class BlueprintWorkspace(QWidget):
     def _sync_canvas_surface_drawing_overlay(self) -> None:
         """Keep persistent drawn vertices and edges aligned with preview levels."""
 
-        overlay = build_surface_drawing_overlay(
-            self._build_viewer_preview_levels()
-        )
-        known_vertex_ids = {
-            vertex.vertex_id for vertex in overlay.vertices
-        }
+        overlay = build_surface_drawing_overlay(self._build_viewer_preview_levels())
+        known_vertex_ids = {vertex.vertex_id for vertex in overlay.vertices}
         if self._active_canvas_surface_drawing_vertex_id not in known_vertex_ids:
             self._active_canvas_surface_drawing_vertex_id = None
         self.viewer.set_canvas_surface_drawing_overlay(
             overlay,
-            active_vertex_id=(
-                self._active_canvas_surface_drawing_vertex_id
-            ),
+            active_vertex_id=(self._active_canvas_surface_drawing_vertex_id),
         )
 
     def _handle_canvas_surface_vertex_chain_reset_requested(self) -> None:
@@ -3217,9 +3508,7 @@ class BlueprintWorkspace(QWidget):
                 self.levels,
                 surface_ids,
             ),
-            success_message=(
-                "Selected face deleted. Press Ctrl+Z to restore it."
-            ),
+            success_message=("Selected face deleted. Press Ctrl+Z to restore it."),
         )
         if not deleted:
             return
@@ -3242,17 +3531,12 @@ class BlueprintWorkspace(QWidget):
         self._commit_pending_doorway_mesh_update()
         undo_state = BlueprintWorkspace._capture_canvas_topology_undo_state(self)
         previous_edits = [
-            (level, copy.deepcopy(level.editable_surfaces))
-            for level in self.levels
+            (level, copy.deepcopy(level.editable_surfaces)) for level in self.levels
         ]
         previous_surface_ids = self._desired_canvas_surface_ids
-        previous_assignment_target_ids = (
-            self._atlas_surface_assignment_target_ids
-        )
+        previous_assignment_target_ids = self._atlas_surface_assignment_target_ids
         previous_object_id = self._desired_canvas_object_id
-        previous_active_vertex_id = (
-            self._active_canvas_surface_drawing_vertex_id
-        )
+        previous_active_vertex_id = self._active_canvas_surface_drawing_vertex_id
         result: SurfaceTopologyEditResult | None = None
         try:
             result = operation()
@@ -3262,9 +3546,7 @@ class BlueprintWorkspace(QWidget):
             self._atlas_surface_assignment_target_ids = selected_surface_ids
             if selected_surface_ids:
                 self._desired_canvas_object_id = None
-            self._active_canvas_surface_drawing_vertex_id = (
-                result.active_vertex_id
-            )
+            self._active_canvas_surface_drawing_vertex_id = result.active_vertex_id
             if result.requires_mesh_refresh:
                 self.surface_texture_generation.remap_assignments_with_surface_lineage(
                     self.levels,
@@ -3274,17 +3556,11 @@ class BlueprintWorkspace(QWidget):
             for level, editable_surfaces in previous_edits:
                 level.editable_surfaces = editable_surfaces
             self._desired_canvas_surface_ids = previous_surface_ids
-            self._atlas_surface_assignment_target_ids = (
-                previous_assignment_target_ids
-            )
+            self._atlas_surface_assignment_target_ids = previous_assignment_target_ids
             self._desired_canvas_object_id = previous_object_id
-            self._active_canvas_surface_drawing_vertex_id = (
-                previous_active_vertex_id
-            )
+            self._active_canvas_surface_drawing_vertex_id = previous_active_vertex_id
             self._sync_canvas_surface_drawing_overlay()
-            self.viewer.set_surface_tools_status(
-                f"Surface edit stopped: {error}"
-            )
+            self.viewer.set_surface_tools_status(f"Surface edit stopped: {error}")
             if result is not None and result.requires_mesh_refresh:
                 self._schedule_viewer_preview_refresh(preserve_camera=True)
             return False
@@ -3328,10 +3604,8 @@ class BlueprintWorkspace(QWidget):
                 for target in self._canvas_surface_edit_targets_by_key.values()
                 if (
                     target.surface_id in selected_wall_ids
-                    and target.reference.kind
-                    == CANVAS_SURFACE_EDIT_WALL_TRANSLATION
-                    and target.reference.axis_index
-                    == primary.reference.axis_index
+                    and target.reference.kind == CANVAS_SURFACE_EDIT_WALL_TRANSLATION
+                    and target.reference.axis_index == primary.reference.axis_index
                 )
             )
         else:
@@ -3343,9 +3617,7 @@ class BlueprintWorkspace(QWidget):
                     and target.reference == primary.reference
                 )
             )
-        return tuple(
-            dict.fromkeys((primary, *related))
-        )
+        return tuple(dict.fromkeys((primary, *related)))
 
     def _get_selected_canvas_wall_baselines(
         self,
@@ -3368,8 +3640,7 @@ class BlueprintWorkspace(QWidget):
                         target.surface_id == surface_id
                         and target.reference.kind
                         == CANVAS_SURFACE_EDIT_WALL_TRANSLATION
-                        and target.reference.axis_index
-                        == primary.reference.axis_index
+                        and target.reference.axis_index == primary.reference.axis_index
                     )
                 ),
                 None,
@@ -3439,8 +3710,7 @@ class BlueprintWorkspace(QWidget):
         if previous_target is not None and previous_target != target:
             try:
                 applied_edits = self._restore_canvas_surface_edit_targets(
-                    self._active_canvas_surface_edit_targets
-                    or (previous_target,)
+                    self._active_canvas_surface_edit_targets or (previous_target,)
                 )
             except (TypeError, ValueError):
                 pass
@@ -3475,12 +3745,8 @@ class BlueprintWorkspace(QWidget):
         if target is None or not isinstance(raw_edit, CanvasSurfaceEdit):
             return
         active_targets = self._active_canvas_surface_edit_targets or (target,)
-        is_floor_edit = (
-            target.reference.kind == CANVAS_SURFACE_EDIT_FLOOR_THICKNESS
-        )
-        uses_mesh_delay = (
-            target.reference.kind in DELAYED_CANVAS_SURFACE_EDIT_KINDS
-        )
+        is_floor_edit = target.reference.kind == CANVAS_SURFACE_EDIT_FLOOR_THICKNESS
+        uses_mesh_delay = target.reference.kind in DELAYED_CANVAS_SURFACE_EDIT_KINDS
         if changed and not self._apply_active_canvas_surface_edit(
             raw_edit,
             validate_project_geometry=not uses_mesh_delay,
@@ -3522,9 +3788,7 @@ class BlueprintWorkspace(QWidget):
                 )
             self._pending_canvas_surface_mesh_update = True
             if is_floor_edit:
-                self._pending_floor_thickness_level_index = (
-                    target.reference.level_index
-                )
+                self._pending_floor_thickness_level_index = target.reference.level_index
                 current_targets = (target,)
             else:
                 selected_wall_ids = set(
@@ -3535,12 +3799,9 @@ class BlueprintWorkspace(QWidget):
                 selected_wall_ids.add(target.surface_id)
                 current_targets = tuple(
                     candidate
-                    for candidate in (
-                        self._canvas_surface_edit_targets_by_key.values()
-                    )
+                    for candidate in (self._canvas_surface_edit_targets_by_key.values())
                     if candidate.surface_id in selected_wall_ids
-                    and candidate.reference.kind
-                    in CANVAS_SURFACE_EDIT_WALL_KINDS
+                    and candidate.reference.kind in CANVAS_SURFACE_EDIT_WALL_KINDS
                 )
             try:
                 rebased_targets = (
@@ -3617,12 +3878,9 @@ class BlueprintWorkspace(QWidget):
                 self._reject_pending_canvas_surface_mesh_update(error)
                 return
 
-        if (
-            baselines
-            and not canvas_surface_edit_targets_are_at_baseline(
-                self.levels,
-                baselines,
-            )
+        if baselines and not canvas_surface_edit_targets_are_at_baseline(
+            self.levels,
+            baselines,
         ):
             self._record_canvas_undo_state(
                 _CanvasSurfaceEditUndoState(targets=tuple(baselines)),
@@ -3688,16 +3946,12 @@ class BlueprintWorkspace(QWidget):
         self._pending_floor_thickness_level_index = None
         if baselines:
             try:
-                restored_edits = self._restore_canvas_surface_edit_targets(
-                    baselines
-                )
+                restored_edits = self._restore_canvas_surface_edit_targets(baselines)
             except (TypeError, ValueError):
                 pass
             else:
                 self._sync_live_canvas_surface_edits(restored_edits)
-        self.viewer.set_window_tools_status(
-            f"Surface edit stopped: {error}"
-        )
+        self.viewer.set_window_tools_status(f"Surface edit stopped: {error}")
         self.viewer.clear_canvas_surface_edit_pending_outline()
         self._restore_canvas_surface_edit_targets_after_rejection()
         self._queue_viewer_preview_refresh()
@@ -3713,8 +3967,7 @@ class BlueprintWorkspace(QWidget):
         except (TypeError, ValueError):
             edit_targets = ()
         self._canvas_surface_edit_targets_by_key = {
-            (target.surface_id, target.reference.key): target
-            for target in edit_targets
+            (target.surface_id, target.reference.key): target for target in edit_targets
         }
         self.viewer.set_canvas_surface_edit_targets(edit_targets)
 
@@ -3725,18 +3978,13 @@ class BlueprintWorkspace(QWidget):
         if target is None:
             return
         active_targets = self._active_canvas_surface_edit_targets or (target,)
-        if (
-            isinstance(raw_edit, CanvasSurfaceEdit)
-            and (
-                raw_edit.reference != target.reference
-                or raw_edit.surface_id != target.surface_id
-            )
+        if isinstance(raw_edit, CanvasSurfaceEdit) and (
+            raw_edit.reference != target.reference
+            or raw_edit.surface_id != target.surface_id
         ):
             return
         try:
-            applied_edits = self._restore_canvas_surface_edit_targets(
-                active_targets
-            )
+            applied_edits = self._restore_canvas_surface_edit_targets(active_targets)
         except (TypeError, ValueError):
             pass
         else:
@@ -3797,8 +4045,7 @@ class BlueprintWorkspace(QWidget):
         except (TypeError, ValueError) as error:
             resume_pending_surface_update = bool(
                 self._pending_canvas_surface_mesh_update
-                and target.reference.kind
-                in DELAYED_CANVAS_SURFACE_EDIT_KINDS
+                and target.reference.kind in DELAYED_CANVAS_SURFACE_EDIT_KINDS
             )
             try:
                 restored_edits = self._restore_canvas_surface_edit_targets(
@@ -3810,9 +4057,7 @@ class BlueprintWorkspace(QWidget):
                 self._sync_live_canvas_surface_edits(restored_edits)
             self._active_canvas_surface_edit_target = None
             self._active_canvas_surface_edit_targets = ()
-            self.viewer.set_window_tools_status(
-                f"Surface edit stopped: {error}"
-            )
+            self.viewer.set_window_tools_status(f"Surface edit stopped: {error}")
             if not resume_pending_surface_update:
                 self.viewer.clear_canvas_surface_edit_pending_outline()
             self.viewer.cancel_canvas_surface_edit()
@@ -3837,9 +4082,7 @@ class BlueprintWorkspace(QWidget):
         self._is_syncing_level_controls = True
         try:
             self.height_level_spinbox.setValue(level.height_meters)
-            self.floor_thickness_spinbox.setValue(
-                level.floor_thickness_meters
-            )
+            self.floor_thickness_spinbox.setValue(level.floor_thickness_meters)
             level_x_slider_value = round(
                 level.offset_x_meters * LEVEL_OFFSET_SLIDER_FACTOR
             )
@@ -3871,18 +4114,13 @@ class BlueprintWorkspace(QWidget):
             target
             for target in self._canvas_surface_edit_targets_by_key.values()
             if (
-                target.reference.kind
-                == CANVAS_SURFACE_EDIT_FLOOR_THICKNESS
+                target.reference.kind == CANVAS_SURFACE_EDIT_FLOOR_THICKNESS
                 and target.reference.level_index == level_index
             )
         )
         active_surface_id = self.viewer.get_active_canvas_surface_id()
         return next(
-            (
-                target
-                for target in candidates
-                if target.surface_id == active_surface_id
-            ),
+            (target for target in candidates if target.surface_id == active_surface_id),
             candidates[0] if candidates else None,
         )
 
@@ -3909,9 +4147,7 @@ class BlueprintWorkspace(QWidget):
         )
 
         target = self._get_canvas_floor_edit_target(level.index)
-        if target is not None and (
-            target.baseline_value_meters != previous_thickness
-        ):
+        if target is not None and (target.baseline_value_meters != previous_thickness):
             try:
                 target = rebase_canvas_floor_edit_target(
                     self.levels,
@@ -3919,10 +4155,7 @@ class BlueprintWorkspace(QWidget):
                 )
             except (TypeError, ValueError):
                 target = None
-        if (
-            self._pending_canvas_surface_mesh_baseline is None
-            and target is not None
-        ):
+        if self._pending_canvas_surface_mesh_baseline is None and target is not None:
             self._pending_canvas_surface_mesh_baseline = target
             self._pending_canvas_surface_mesh_baselines = (target,)
             self._pending_canvas_wall_surface_ids = ()
@@ -3966,9 +4199,7 @@ class BlueprintWorkspace(QWidget):
         if self._is_syncing_canvas_scene_selection:
             return
         object_id = (
-            None
-            if raw_object_id is None
-            else str(raw_object_id).strip() or None
+            None if raw_object_id is None else str(raw_object_id).strip() or None
         )
         self._desired_canvas_object_id = object_id
         if object_id is not None:
@@ -4030,9 +4261,7 @@ class BlueprintWorkspace(QWidget):
             if self._find_canvas_window(window_id) is not None:
                 break
             self._canvas_window_undo_ids.pop()
-        self.viewer.set_window_undo_available(
-            bool(self._canvas_window_undo_ids)
-        )
+        self.viewer.set_window_undo_available(bool(self._canvas_window_undo_ids))
 
     def _find_canvas_window(
         self,
@@ -4078,6 +4307,1367 @@ class BlueprintWorkspace(QWidget):
     def load_blueprint(self, file_path: str) -> None:
         self._set_current_level_image(file_path)
 
+    # ### Atlas draw-call estimation ###
+    def _atlas_workspace_is_active(self) -> bool:
+        """Return whether the embedded or detached Atlas workspace is visible."""
+
+        external_host = getattr(self, "_external_atlas_host", None)
+        return bool(
+            self.workspace_tabs.currentWidget() is self.texture_atlas_workspace
+            or (external_host is not None and external_host.is_active)
+        )
+
+    @staticmethod
+    def _build_atlas_draw_call_layout_signature(
+        atlases: Sequence[TextureAtlasRecord],
+        required_source_ids: Sequence[str],
+    ) -> tuple[tuple[object, ...], ...]:
+        """Identify Atlas bindings that can change the exported primitive count."""
+
+        required_ids = {
+            str(source_id).strip()
+            for source_id in required_source_ids
+            if str(source_id).strip()
+        }
+        return tuple(
+            (
+                atlas.atlas_id,
+                tuple(
+                    placement.object_id
+                    for placement in atlas.placements
+                    if placement.object_id in required_ids
+                ),
+            )
+            for atlas in atlases
+            if any(
+                placement.object_id in required_ids for placement in atlas.placements
+            )
+        )
+
+    def _build_atlas_draw_call_dependency_signature(
+        self,
+    ) -> tuple[tuple[object, ...], ...]:
+        """Track placed assets and level membership while ignoring transforms."""
+
+        signature: list[tuple[object, ...]] = []
+        for item in self.generation.get_placed_preview_dependency_signature():
+            if not isinstance(item, tuple) or len(item) < 5:
+                signature.append(tuple(item) if isinstance(item, tuple) else (item,))
+                continue
+            placement = item[1]
+            signature.append(
+                (
+                    item[0],
+                    (
+                        placement.level_index
+                        if isinstance(placement, GeneratedObjectPlacement)
+                        else None
+                    ),
+                    item[2],
+                    item[4],
+                )
+            )
+        return tuple(signature)
+
+    def _capture_atlas_draw_call_estimate_request(
+        self,
+    ) -> tuple[
+        _SurfaceAmbientOcclusionSceneSnapshot,
+        tuple[TextureAtlasRecord, ...],
+        _AtlasDrawCallEstimateSnapshot,
+    ]:
+        """Capture one stable, serializable estimator request on the GUI thread."""
+
+        scene_revision = self._atlas_draw_call_scene_revision
+        dependency_signature_before = self._build_viewer_preview_dependency_signature()
+        draw_call_dependency_before = self._build_atlas_draw_call_dependency_signature()
+        scene_snapshot = self._capture_surface_ao_scene_snapshot(
+            dependency_signature_before
+        )
+        atlases = tuple(self.texture_atlas_workspace.get_data().atlases)
+        atlas_layout_signature = self._build_atlas_draw_call_layout_signature(
+            atlases,
+            scene_snapshot.required_source_ids,
+        )
+        dependency_signature_after = self._build_viewer_preview_dependency_signature()
+        draw_call_dependency_after = self._build_atlas_draw_call_dependency_signature()
+        if (
+            scene_revision != self._atlas_draw_call_scene_revision
+            or dependency_signature_before != dependency_signature_after
+            or draw_call_dependency_before != draw_call_dependency_after
+            or atlas_layout_signature
+            != self._build_atlas_draw_call_layout_signature(
+                self.texture_atlas_workspace.get_data().atlases,
+                scene_snapshot.required_source_ids,
+            )
+            or scene_snapshot.surface_source_ids
+            != tuple(sorted(self._build_atlas_surface_source_ids().items()))
+        ):
+            raise RuntimeError(
+                "Scene inputs changed while the draw-call estimate was prepared."
+            )
+        snapshot = _AtlasDrawCallEstimateSnapshot(
+            scene_revision=scene_revision,
+            dependency_signature=draw_call_dependency_after,
+            atlas_layout_signature=atlas_layout_signature,
+            required_source_ids=scene_snapshot.required_source_ids,
+            surface_source_signature=scene_snapshot.surface_source_ids,
+        )
+        return scene_snapshot, atlases, snapshot
+
+    def _atlas_draw_call_estimate_snapshot_is_current(
+        self,
+        snapshot: _AtlasDrawCallEstimateSnapshot,
+    ) -> bool:
+        """Reject an estimate built from superseded geometry or bindings."""
+
+        if self._atlas_draw_call_scene_revision != snapshot.scene_revision:
+            return False
+        if (
+            self._build_atlas_draw_call_dependency_signature()
+            != snapshot.dependency_signature
+        ):
+            return False
+        if (
+            tuple(sorted(self._build_atlas_surface_source_ids().items()))
+            != snapshot.surface_source_signature
+        ):
+            return False
+        return (
+            self._build_atlas_draw_call_layout_signature(
+                self.texture_atlas_workspace.get_data().atlases,
+                snapshot.required_source_ids,
+            )
+            == snapshot.atlas_layout_signature
+        )
+
+    def _schedule_atlas_draw_call_estimate(self) -> None:
+        """Debounce scene mutations and cancel any superseded estimator."""
+
+        if self._is_shutdown:
+            return
+        self._cancel_atlas_draw_call_estimate_preparations()
+        self.texture_atlas_workspace.set_draw_call_estimate_pending()
+        if self._atlas_workspace_is_active():
+            self._atlas_draw_call_estimate_refresh_timer.start()
+
+    def _refresh_atlas_draw_call_estimate(self) -> None:
+        """Start a non-blocking exact estimate for the current export scene."""
+
+        self._atlas_draw_call_estimate_refresh_timer.stop()
+        if self._is_shutdown or not self._atlas_workspace_is_active():
+            return
+        if any(
+            runtime.thread.isRunning()
+            for runtime in self._atlas_draw_call_estimate_runtimes.values()
+        ):
+            self._atlas_draw_call_estimate_refresh_timer.start()
+            return
+        try:
+            scene_snapshot, atlases, snapshot = (
+                self._capture_atlas_draw_call_estimate_request()
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            self.texture_atlas_workspace.set_draw_call_estimate_unavailable(str(error))
+            return
+        if (
+            snapshot == self._atlas_draw_call_estimate_cache_signature
+            and self._atlas_draw_call_estimate_cache_result is not None
+        ):
+            self.texture_atlas_workspace.set_draw_call_estimate(
+                self._atlas_draw_call_estimate_cache_result
+            )
+            return
+
+        request_id = self._cancel_atlas_draw_call_estimate_preparations()
+        thread = _AtlasDrawCallEstimateThread(scene_snapshot, atlases, parent=self)
+        runtime = _AtlasDrawCallEstimateRuntime(
+            request_id=request_id,
+            thread=thread,
+            snapshot=snapshot,
+        )
+        self._atlas_draw_call_estimate_runtimes[request_id] = runtime
+        thread.finished.connect(
+            partial(
+                self._handle_atlas_draw_call_estimate_finished,
+                request_id,
+                thread,
+            )
+        )
+        self.texture_atlas_workspace.set_draw_call_estimate_pending()
+        thread.start()
+
+    def _handle_atlas_draw_call_estimate_finished(
+        self,
+        request_id: int,
+        thread: _AtlasDrawCallEstimateThread,
+    ) -> None:
+        """Commit one estimator result only while every input remains current."""
+
+        runtime = self._atlas_draw_call_estimate_runtimes.pop(request_id, None)
+        try:
+            if runtime is None or runtime.thread is not thread:
+                return
+            if (
+                self._is_shutdown
+                or runtime.cancel_requested
+                or thread.was_cancelled
+                or request_id != self._atlas_draw_call_estimate_request_id
+            ):
+                return
+            if not self._atlas_draw_call_estimate_snapshot_is_current(runtime.snapshot):
+                self._schedule_atlas_draw_call_estimate()
+                return
+            if thread.error_message is not None or thread.result is None:
+                self.texture_atlas_workspace.set_draw_call_estimate_unavailable(
+                    thread.error_message
+                    or "The estimator finished without returning a result."
+                )
+                return
+            self._atlas_draw_call_estimate_cache_signature = runtime.snapshot
+            self._atlas_draw_call_estimate_cache_result = thread.result
+            self.texture_atlas_workspace.set_draw_call_estimate(thread.result)
+        finally:
+            thread.deleteLater()
+
+    def _cancel_atlas_draw_call_estimate_preparations(self) -> int:
+        """Invalidate current estimator work without blocking the GUI."""
+
+        self._atlas_draw_call_estimate_request_id += 1
+        for runtime in self._atlas_draw_call_estimate_runtimes.values():
+            runtime.cancel_requested = True
+            runtime.thread.requestInterruption()
+        return self._atlas_draw_call_estimate_request_id
+
+    def _cancel_and_join_atlas_draw_call_estimates(self) -> None:
+        """Join every estimator worker before replacing its project state."""
+
+        self._atlas_draw_call_estimate_refresh_timer.stop()
+        self._cancel_atlas_draw_call_estimate_preparations()
+        runtimes = tuple(self._atlas_draw_call_estimate_runtimes.values())
+        for runtime in runtimes:
+            while runtime.thread.isRunning():
+                runtime.thread.wait(SURFACE_AO_SHUTDOWN_WAIT_MILLISECONDS)
+            runtime.thread.deleteLater()
+        self._atlas_draw_call_estimate_runtimes.clear()
+        self._atlas_draw_call_estimate_cache_signature = None
+        self._atlas_draw_call_estimate_cache_result = None
+        if hasattr(self, "texture_atlas_workspace"):
+            self.texture_atlas_workspace.set_draw_call_estimate(None)
+
+    # ### Atlas ambient-occlusion jobs ###
+    def _handle_all_ambient_occlusion_bakes_requested(self) -> None:
+        """Start one isolated AO job for every Atlas used by the scene."""
+
+        if self._is_shutdown:
+            return
+        self._commit_pending_ambient_occlusion_scene_edits()
+        try:
+            preparation = self._capture_ambient_occlusion_bake_preparation()
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            message = str(error) or type(error).__name__
+            self.texture_atlas_workspace.status_label.setText(
+                f"Ambient-occlusion bake failed: {message}"
+            )
+            QMessageBox.warning(self, "Ambient-occlusion bake failed", message)
+            return
+
+        required_source_ids = set(preparation.scene_snapshot.required_source_ids)
+        claimed_source_ids: set[str] = set()
+        targets: list[tuple[str, float]] = []
+        for context in preparation.atlas_context:
+            atlas = context.atlas
+            placement_source_ids = {
+                placement.object_id for placement in atlas.placements
+            }
+            if any(
+                source_id in required_source_ids
+                and source_id not in claimed_source_ids
+                for source_id in placement_source_ids
+            ):
+                targets.append((atlas.atlas_id, atlas.surface_ao_intensity))
+            claimed_source_ids.update(placement_source_ids)
+        if not targets:
+            self.texture_atlas_workspace.status_label.setText(
+                "No Atlas contains geometry used by the current exported scene."
+            )
+            return
+        for atlas_id, intensity in targets:
+            self._start_ambient_occlusion_bake(
+                atlas_id,
+                intensity,
+                preparation=preparation,
+            )
+
+    def _capture_surface_ao_scene_snapshot(
+        self,
+        dependency_signature: tuple[object, ...],
+    ) -> _SurfaceAmbientOcclusionSceneSnapshot:
+        """Copy only plain scene state and placed-asset paths on the GUI thread."""
+
+        if len(dependency_signature) != 3 or not isinstance(
+            dependency_signature[1],
+            tuple,
+        ):
+            raise RuntimeError("The surface AO scene dependencies are invalid.")
+        levels = tuple(copy.deepcopy(self.levels))
+        stairs = tuple(copy.deepcopy(self.stairs))
+        visible_level_by_index = {
+            level.index: level for level in levels if level.include_in_export
+        }
+        base_z_by_level_index = build_level_base_z_lookup(levels)
+        object_names = self.generation.get_generated_object_names_by_id()
+        placed_models: list[_PlacedGeneratedModelFileSnapshot] = []
+        for raw_item in dependency_signature[1]:
+            if not isinstance(raw_item, tuple) or len(raw_item) < 5:
+                raise RuntimeError("A placed-object AO dependency is invalid.")
+            object_id = str(raw_item[0])
+            placement = raw_item[1]
+            asset_revision = raw_item[2]
+            symmetry = raw_item[4]
+            if not isinstance(placement, GeneratedObjectPlacement):
+                raise RuntimeError("A placed-object AO transform is invalid.")
+            level = visible_level_by_index.get(placement.level_index)
+            base_z = base_z_by_level_index.get(placement.level_index)
+            if level is None or base_z is None:
+                continue
+            if (
+                not isinstance(asset_revision, tuple)
+                or len(asset_revision) != 4
+                or any(value is None for value in asset_revision)
+            ):
+                continue
+            world_x, world_y = level_image_to_world_xy(
+                level,
+                placement.image_x,
+                placement.image_y,
+            )
+            raw_orientation = getattr(symmetry, "orientation", None)
+            raw_plane_coordinate = getattr(
+                symmetry,
+                "plane_coordinate",
+                None,
+            )
+            placed_models.append(
+                _PlacedGeneratedModelFileSnapshot(
+                    object_id=object_id,
+                    object_name=object_names.get(object_id, object_id),
+                    asset_path=Path(str(asset_revision[0])),
+                    asset_revision=(
+                        str(asset_revision[0]),
+                        int(asset_revision[1]),
+                        int(asset_revision[2]),
+                        int(asset_revision[3]),
+                    ),
+                    world_position=(
+                        world_x,
+                        world_y,
+                        base_z + placement.height_offset_meters,
+                    ),
+                    rotation_degrees=placement.rotation_degrees,
+                    symmetric_preview_orientation=(
+                        None if raw_orientation is None else str(raw_orientation)
+                    ),
+                    symmetric_preview_plane_coordinate=(
+                        None
+                        if raw_plane_coordinate is None
+                        else float(raw_plane_coordinate)
+                    ),
+                )
+            )
+
+        material_items: list[tuple[str, object]] = []
+        for surface_id, source in sorted(
+            self.surface_texture_generation.get_surface_material_sources().items()
+        ):
+            frozen_source: object = (
+                tuple(
+                    sorted(
+                        (str(map_type), Path(map_path))
+                        for map_type, map_path in source.items()
+                    )
+                )
+                if isinstance(source, Mapping)
+                else Path(source)
+            )
+            material_items.append((str(surface_id), frozen_source))
+        return _SurfaceAmbientOcclusionSceneSnapshot(
+            levels=levels,
+            stairs=stairs,
+            surface_materials=tuple(material_items),
+            placed_models=tuple(placed_models),
+            surface_source_ids=tuple(
+                sorted(self._build_atlas_surface_source_ids().items())
+            ),
+        )
+
+    def _handle_atlas_preview_map_changed(
+        self,
+        _map_type: str,
+        is_ambient_occlusion: bool,
+    ) -> None:
+        """Enter or leave the Atlas viewer's AO-only material mode."""
+
+        if self._is_shutdown:
+            return
+        if is_ambient_occlusion:
+            self._surface_ao_preview_refresh_timer.stop()
+            if self._atlas_preview_display_state is None:
+                self._atlas_preview_display_state = (
+                    self.atlas_object_preview_viewer.get_textures_enabled(),
+                    self.atlas_object_preview_viewer.get_wireframe_enabled(),
+                    self.atlas_object_preview_viewer.get_wireframe_only(),
+                    self.atlas_object_preview_viewer.get_pbr_maps_enabled(),
+                )
+            if self._canvas_ao_preview_display_state is None:
+                self._canvas_ao_preview_display_state = (
+                    self.viewer.get_textures_enabled(),
+                    self.viewer.get_wireframe_enabled(),
+                    self.viewer.get_wireframe_only(),
+                    self.viewer.get_pbr_maps_enabled(),
+                    self.viewer.get_ambient_light_intensity(),
+                )
+            self.atlas_object_preview_viewer.set_textures_enabled(True)
+            self.atlas_object_preview_viewer.set_wireframe_enabled(False)
+            self.atlas_object_preview_viewer.set_wireframe_only(False)
+            self.atlas_object_preview_viewer.set_pbr_maps_enabled(())
+            self._set_canvas_ambient_occlusion_preview_pending()
+            self._refresh_surface_ambient_occlusion_preview()
+            return
+
+        previous_atlas_state = self._atlas_preview_display_state
+        previous_canvas_state = self._canvas_ao_preview_display_state
+        if previous_atlas_state is None and previous_canvas_state is None:
+            return
+        self._atlas_preview_display_state = None
+        self._canvas_ao_preview_display_state = None
+        self._surface_ao_canvas_preview_key = None
+        self._surface_ao_preview_refresh_timer.stop()
+        self._cancel_surface_ambient_occlusion_preview_preparations()
+        if previous_atlas_state is not None:
+            (
+                textures_enabled,
+                wireframe_enabled,
+                wireframe_only,
+                pbr_maps_enabled,
+            ) = previous_atlas_state
+            self.atlas_object_preview_viewer.set_textures_enabled(textures_enabled)
+            self.atlas_object_preview_viewer.set_wireframe_enabled(wireframe_enabled)
+            self.atlas_object_preview_viewer.set_wireframe_only(wireframe_only)
+            self.atlas_object_preview_viewer.set_pbr_maps_enabled(pbr_maps_enabled)
+        if previous_canvas_state is not None:
+            (
+                textures_enabled,
+                wireframe_enabled,
+                wireframe_only,
+                pbr_maps_enabled,
+                ambient_light_intensity,
+            ) = previous_canvas_state
+            self.viewer.set_textures_enabled(textures_enabled)
+            self.viewer.set_wireframe_enabled(wireframe_enabled)
+            self.viewer.set_wireframe_only(wireframe_only)
+            self.viewer.set_pbr_maps_enabled(pbr_maps_enabled)
+            self.viewer.set_ambient_light_intensity(ambient_light_intensity)
+        self._clear_atlas_object_preview()
+        self.texture_atlas_workspace.request_selected_object_preview()
+        self._restore_canvas_preview_after_ambient_occlusion()
+
+    def _set_canvas_ambient_occlusion_preview_pending(self) -> None:
+        """Keep the Canvas scene visible but hide stale textures during prep."""
+
+        self._surface_ao_canvas_preview_key = None
+        self._canvas_viewer_preview_revision = -1
+        self.viewer.set_textures_enabled(False)
+        self.viewer.set_wireframe_enabled(False)
+        self.viewer.set_wireframe_only(False)
+        self.viewer.set_pbr_maps_enabled(())
+        self.viewer.set_ambient_light_intensity(1.0)
+
+    def _canvas_interaction_blocks_ambient_occlusion_preview(self) -> bool:
+        """Avoid replacing the Canvas model during an edit or pointer drag."""
+
+        return bool(
+            self._active_canvas_surface_edit_target is not None
+            or self._pending_canvas_surface_mesh_update
+            or self._pending_wall_vertex_mesh_update
+            or self._is_canvas_wall_vertex_interaction_active
+            or self._is_canvas_opening_drag_active
+            or self._is_doorway_move_drag_active
+            or self._pending_doorway_mesh_level_index is not None
+            or self._pending_window_mesh_level_index is not None
+            or self._level_transform_drag_active
+            or self._pending_level_transform is not None
+            or self.viewer.view.is_primary_pointer_drag_reserved
+            or self.viewer.view.is_middle_navigation_active
+            or self.viewer.view.is_face_selection_gesture_active
+            or self.viewer.is_window_placement_active()
+            or self.viewer.is_surface_vertex_placement_active()
+        )
+
+    def _restore_canvas_preview_after_ambient_occlusion(self) -> None:
+        """Reinstall the cached normal scene without disturbing its camera."""
+
+        self._canvas_viewer_preview_revision = -1
+        revision = self._viewer_preview_revision
+        cached_model = self._viewer_preview_model
+        cache_is_current = bool(
+            cached_model is not None
+            and self._viewer_preview_model_revision == revision
+            and self._viewer_preview_dependency_signature_revision == revision
+            and self._viewer_preview_dependency_signature
+            == self._build_viewer_preview_dependency_signature()
+        )
+        if cache_is_current:
+            assert cached_model is not None
+            self._set_canvas_viewer_targets(
+                tuple(build_fixed_surfaces(self._build_viewer_preview_levels()))
+            )
+            self._is_syncing_canvas_scene_selection = True
+            try:
+                self.viewer.set_model(cached_model, preserve_camera=True)
+                self._restore_desired_canvas_scene_selection()
+            finally:
+                self._is_syncing_canvas_scene_selection = False
+            self._canvas_viewer_preview_revision = revision
+            return
+        self._ensure_viewer_preview_current(preserve_camera=True)
+
+    def _handle_texture_atlas_data_changed_for_ao_preview(
+        self,
+        _data: object,
+    ) -> None:
+        """Debounce Atlas-derived views after membership changes."""
+
+        self._schedule_surface_ambient_occlusion_preview_refresh()
+        self._schedule_atlas_draw_call_estimate()
+
+    def _schedule_surface_ambient_occlusion_preview_refresh(self) -> None:
+        """Coalesce scene and Atlas mutations into one AO-only rebuild."""
+
+        if (
+            self._is_shutdown
+            or not self.texture_atlas_workspace.is_ambient_occlusion_preview_active
+        ):
+            return
+        self._surface_ao_preview_refresh_timer.start()
+
+    def _refresh_surface_ambient_occlusion_preview(self) -> None:
+        """Show or asynchronously prepare the selected Atlas's AO receivers."""
+
+        self._surface_ao_preview_refresh_timer.stop()
+        if (
+            self._is_shutdown
+            or not self.texture_atlas_workspace.is_ambient_occlusion_preview_active
+        ):
+            return
+        if self._canvas_interaction_blocks_ambient_occlusion_preview():
+            self._cancel_surface_ambient_occlusion_preview_preparations()
+            self._surface_ao_preview_refresh_timer.start()
+            self.texture_atlas_workspace.status_label.setText(
+                "Ambient-occlusion preview is waiting for the active Canvas "
+                "edit to finish."
+            )
+            return
+        self._set_canvas_ambient_occlusion_preview_pending()
+        atlas = self.texture_atlas_workspace.selected_atlas
+        if atlas is None:
+            self._cancel_surface_ambient_occlusion_preview_preparations()
+            self._clear_atlas_object_preview()
+            self.texture_atlas_workspace.status_label.setText(
+                "Select an Atlas to preview ambient occlusion."
+            )
+            return
+        atlas_id = atlas.atlas_id
+        if (
+            atlas.surface_ao_image_path is None
+            or atlas.surface_ao_geometry_signature is None
+        ):
+            self._surface_ao_preview_cache.pop(atlas_id, None)
+            self._cancel_surface_ambient_occlusion_preview_preparations()
+            self._clear_atlas_object_preview()
+            self.texture_atlas_workspace.status_label.setText(
+                "No ambient-occlusion bake exists for this Atlas. Use "
+                "Bake ambient occlusion first."
+            )
+            return
+
+        cached = self._surface_ao_preview_cache.get(atlas_id)
+        if cached is not None and self._surface_ao_preview_cache_is_current(
+            atlas_id,
+            cached,
+        ):
+            self._cancel_surface_ambient_occlusion_preview_preparations()
+            self._show_surface_ambient_occlusion_preview(
+                atlas_id,
+                atlas.name,
+                cached,
+            )
+            return
+        self._surface_ao_preview_cache.pop(atlas_id, None)
+
+        request_id = self._cancel_surface_ambient_occlusion_preview_preparations()
+        try:
+            (
+                scene_snapshot,
+                target_context,
+                atlas_context,
+                snapshot,
+                image_revision,
+            ) = self._capture_surface_ambient_occlusion_preview_request(atlas_id)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            self._clear_atlas_object_preview()
+            self.texture_atlas_workspace.status_label.setText(
+                "Ambient-occlusion preview unavailable: "
+                f"{str(error) or type(error).__name__}"
+            )
+            return
+
+        thread = _SurfaceAmbientOcclusionPreviewThread(
+            scene_snapshot,
+            target_context,
+            atlas_context,
+            self,
+        )
+        runtime = _SurfaceAmbientOcclusionPreviewRuntime(
+            request_id=request_id,
+            atlas_id=atlas_id,
+            thread=thread,
+            snapshot=snapshot,
+            image_revision=image_revision,
+        )
+        self._surface_ao_preview_runtimes[request_id] = runtime
+        thread.progress.connect(
+            partial(
+                self._handle_surface_ambient_occlusion_preview_progress,
+                request_id,
+                thread,
+            )
+        )
+        thread.finished.connect(
+            partial(
+                self._handle_surface_ambient_occlusion_preview_finished,
+                request_id,
+                thread,
+            )
+        )
+        self._clear_atlas_object_preview()
+        self.texture_atlas_workspace.status_label.setText(
+            f"Preparing ambient-occlusion-only preview for {atlas.name}."
+        )
+        thread.start()
+
+    def _capture_surface_ambient_occlusion_preview_request(
+        self,
+        atlas_id: str,
+    ) -> tuple[
+        _SurfaceAmbientOcclusionSceneSnapshot,
+        SurfaceAmbientOcclusionAtlasContext,
+        tuple[SurfaceAmbientOcclusionAtlasContext, ...],
+        _SurfaceAmbientOcclusionBakeSnapshot,
+        tuple[str, int, int, int],
+    ]:
+        """Capture one stable cached-AO preview request on the GUI thread."""
+
+        viewer_revision = self._viewer_preview_revision
+        dependency_signature_before = self._build_viewer_preview_dependency_signature()
+        scene_snapshot = self._capture_surface_ao_scene_snapshot(
+            dependency_signature_before
+        )
+        required_source_ids = scene_snapshot.required_source_ids
+        atlas_context_signature_before = self._build_surface_ao_atlas_context_signature(
+            required_source_ids
+        )
+        atlas_context = (
+            self.texture_atlas_workspace.prepare_surface_ao_preview_atlas_context(
+                required_source_ids,
+                atlas_id,
+            )
+        )
+        dependency_signature_after = self._build_viewer_preview_dependency_signature()
+        atlas_context_signature_after = self._build_surface_ao_atlas_context_signature(
+            required_source_ids
+        )
+        if (
+            viewer_revision != self._viewer_preview_revision
+            or dependency_signature_before != dependency_signature_after
+            or atlas_context_signature_before != atlas_context_signature_after
+        ):
+            raise RuntimeError(
+                "Scene inputs changed while the AO preview was prepared."
+            )
+        target_context = next(
+            (item for item in atlas_context if item.atlas.atlas_id == atlas_id),
+            None,
+        )
+        if (
+            target_context is None
+            or target_context.surface_ao_image_path is None
+            or target_context.surface_ao_geometry_signature is None
+        ):
+            raise ValueError("The selected Atlas has no ambient-occlusion bake.")
+        image_revision = _build_surface_ao_file_revision(
+            target_context.surface_ao_image_path
+        )
+        snapshot = _SurfaceAmbientOcclusionBakeSnapshot(
+            viewer_revision=viewer_revision,
+            dependency_signature=dependency_signature_after,
+            atlas_context_signature=atlas_context_signature_after,
+            required_source_ids=required_source_ids,
+            surface_source_signature=scene_snapshot.surface_source_ids,
+        )
+        return (
+            scene_snapshot,
+            target_context,
+            atlas_context,
+            snapshot,
+            image_revision,
+        )
+
+    def _surface_ao_preview_cache_is_current(
+        self,
+        atlas_id: str,
+        cached: _SurfaceAmbientOcclusionPreviewCacheEntry,
+    ) -> bool:
+        """Validate cached geometry and AO pixels without rebuilding UV1."""
+
+        atlas = self.texture_atlas_workspace.selected_atlas
+        if (
+            atlas is None
+            or atlas.atlas_id != atlas_id
+            or atlas.surface_ao_geometry_signature != cached.geometry_signature
+            or not self._surface_ambient_occlusion_snapshot_is_current(
+                cached.snapshot,
+                atlas_id,
+            )
+        ):
+            return False
+        try:
+            return (
+                _build_surface_ao_file_revision(Path(cached.image_revision[0]))
+                == cached.image_revision
+            )
+        except OSError:
+            return False
+
+    def _show_surface_ambient_occlusion_preview(
+        self,
+        atlas_id: str,
+        atlas_name: str,
+        cached: _SurfaceAmbientOcclusionPreviewCacheEntry,
+    ) -> None:
+        """Display raw grayscale AO with no lighting or wireframe modulation."""
+
+        if self._canvas_interaction_blocks_ambient_occlusion_preview():
+            self._surface_ao_preview_refresh_timer.start()
+            self.texture_atlas_workspace.status_label.setText(
+                "Ambient-occlusion preview is waiting for the active Canvas "
+                "edit to finish."
+            )
+            return
+
+        preview_key = (
+            "surface_ao_only",
+            atlas_id,
+            cached.geometry_signature,
+            cached.image_revision,
+            cached.snapshot.viewer_revision,
+        )
+        atlas_preview_is_current = bool(
+            self._atlas_preview_variant_key == preview_key
+            and self.atlas_object_preview_viewer.model is cached.model
+        )
+        canvas_preview_is_current = bool(
+            self._surface_ao_canvas_preview_key == preview_key
+            and self.viewer.model is cached.model
+        )
+        if atlas_preview_is_current and canvas_preview_is_current:
+            return
+        if not atlas_preview_is_current:
+            preserve_camera = self.atlas_object_preview_viewer.model is not None
+            self.atlas_object_preview_viewer.set_model(
+                cached.model,
+                preserve_camera=preserve_camera,
+            )
+        if not canvas_preview_is_current:
+            preserve_camera = self.viewer.model is not None
+            self._is_syncing_canvas_scene_selection = True
+            try:
+                self.viewer.set_model(
+                    cached.model,
+                    preserve_camera=preserve_camera,
+                )
+                self.viewer.set_wall_targets(())
+                self.viewer.set_canvas_surface_edit_targets(())
+                self.viewer.set_canvas_opening_targets(())
+            finally:
+                self._is_syncing_canvas_scene_selection = False
+        self.atlas_object_preview_viewer.set_ambient_light_intensity(1.0)
+        self.atlas_object_preview_viewer.set_textures_enabled(True)
+        self.atlas_object_preview_viewer.set_wireframe_enabled(False)
+        self.atlas_object_preview_viewer.set_wireframe_only(False)
+        self.atlas_object_preview_viewer.set_pbr_maps_enabled(())
+        self.viewer.set_ambient_light_intensity(1.0)
+        self.viewer.set_textures_enabled(True)
+        self.viewer.set_wireframe_enabled(False)
+        self.viewer.set_wireframe_only(False)
+        self.viewer.set_pbr_maps_enabled(())
+        self._atlas_preview_variant_key = preview_key
+        self._surface_ao_canvas_preview_key = preview_key
+        self._canvas_viewer_preview_revision = -1
+        self.texture_atlas_workspace.status_label.setText(
+            f"Ambient-occlusion-only preview: {atlas_name}."
+        )
+
+    def _handle_surface_ambient_occlusion_preview_progress(
+        self,
+        request_id: int,
+        thread: _SurfaceAmbientOcclusionPreviewThread,
+        message: str,
+    ) -> None:
+        """Publish progress only for the currently requested AO-only view."""
+
+        runtime = self._surface_ao_preview_runtimes.get(request_id)
+        stage = str(message).strip()
+        if (
+            self._is_shutdown
+            or runtime is None
+            or runtime.thread is not thread
+            or runtime.cancel_requested
+            or request_id != self._surface_ao_preview_request_id
+            or not self.texture_atlas_workspace.is_ambient_occlusion_preview_active
+            or not stage
+        ):
+            return
+        self.texture_atlas_workspace.status_label.setText(stage)
+
+    def _handle_surface_ambient_occlusion_preview_finished(
+        self,
+        request_id: int,
+        thread: _SurfaceAmbientOcclusionPreviewThread,
+    ) -> None:
+        """Accept only the latest still-current AO-only preview result."""
+
+        runtime = self._surface_ao_preview_runtimes.pop(request_id, None)
+        try:
+            if runtime is None or runtime.thread is not thread:
+                return
+            if (
+                self._is_shutdown
+                or runtime.cancel_requested
+                or thread.was_cancelled
+                or request_id != self._surface_ao_preview_request_id
+                or not self.texture_atlas_workspace.is_ambient_occlusion_preview_active
+            ):
+                return
+            selected_atlas = self.texture_atlas_workspace.selected_atlas
+            if selected_atlas is None or selected_atlas.atlas_id != runtime.atlas_id:
+                return
+            if thread.error_message is not None:
+                self._clear_atlas_object_preview()
+                self.texture_atlas_workspace.status_label.setText(
+                    f"Ambient-occlusion preview unavailable: {thread.error_message}"
+                )
+                return
+            result = thread.result
+            if result is None:
+                self._clear_atlas_object_preview()
+                self.texture_atlas_workspace.status_label.setText(
+                    "Ambient-occlusion preview finished without a model."
+                )
+                return
+            if not self._surface_ambient_occlusion_snapshot_is_current(
+                runtime.snapshot,
+                runtime.atlas_id,
+            ):
+                self._refresh_surface_ambient_occlusion_preview()
+                return
+            try:
+                if (
+                    _build_surface_ao_file_revision(Path(runtime.image_revision[0]))
+                    != runtime.image_revision
+                ):
+                    self._refresh_surface_ambient_occlusion_preview()
+                    return
+            except OSError:
+                self._refresh_surface_ambient_occlusion_preview()
+                return
+            atlas = self.texture_atlas_workspace.selected_atlas
+            geometry_signature = (
+                None
+                if atlas is None or atlas.atlas_id != runtime.atlas_id
+                else atlas.surface_ao_geometry_signature
+            )
+            if geometry_signature is None:
+                self._refresh_surface_ambient_occlusion_preview()
+                return
+            cached = _SurfaceAmbientOcclusionPreviewCacheEntry(
+                snapshot=runtime.snapshot,
+                geometry_signature=geometry_signature,
+                image_revision=runtime.image_revision,
+                model=result,
+            )
+            self._surface_ao_preview_cache[runtime.atlas_id] = cached
+            self._show_surface_ambient_occlusion_preview(
+                runtime.atlas_id,
+                selected_atlas.name,
+                cached,
+            )
+        finally:
+            thread.deleteLater()
+
+    def _cancel_surface_ambient_occlusion_preview_preparations(self) -> int:
+        """Invalidate current AO preview work without blocking the GUI."""
+
+        self._surface_ao_preview_request_id += 1
+        for runtime in self._surface_ao_preview_runtimes.values():
+            runtime.cancel_requested = True
+            runtime.thread.requestInterruption()
+        return self._surface_ao_preview_request_id
+
+    def _cancel_and_join_surface_ambient_occlusion_previews(self) -> None:
+        """Join every AO preview worker before replacing its project state."""
+
+        self._cancel_surface_ambient_occlusion_preview_preparations()
+        runtimes = tuple(self._surface_ao_preview_runtimes.values())
+        for runtime in runtimes:
+            while runtime.thread.isRunning():
+                runtime.thread.wait(SURFACE_AO_SHUTDOWN_WAIT_MILLISECONDS)
+            runtime.thread.deleteLater()
+        self._surface_ao_preview_runtimes.clear()
+        self._surface_ao_preview_cache.clear()
+
+    def _commit_pending_ambient_occlusion_scene_edits(self) -> None:
+        """Finish preview edits before an AO snapshot reads scene geometry."""
+
+        self._cancel_active_canvas_surface_edit()
+        self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_wall_vertex_update()
+        self._finish_level_transform_drag()
+        self._commit_pending_level_transform_update()
+        self._commit_pending_doorway_mesh_update()
+
+    def _capture_ambient_occlusion_bake_preparation(
+        self,
+    ) -> _AmbientOcclusionBakePreparation:
+        """Capture one immutable AO input set on the GUI thread."""
+
+        viewer_revision = self._viewer_preview_revision
+        dependency_signature_before = self._build_viewer_preview_dependency_signature()
+        scene_snapshot = self._capture_surface_ao_scene_snapshot(
+            dependency_signature_before
+        )
+        required_source_ids = scene_snapshot.required_source_ids
+        atlas_context_signature_before = (
+            self._build_surface_ao_atlas_context_signature(required_source_ids)
+        )
+        atlas_context = self.texture_atlas_workspace.prepare_surface_ao_atlas_context(
+            required_source_ids
+        )
+        dependency_signature_after = self._build_viewer_preview_dependency_signature()
+        atlas_context_signature_after = (
+            self._build_surface_ao_atlas_context_signature(required_source_ids)
+        )
+        if (
+            viewer_revision != self._viewer_preview_revision
+            or dependency_signature_before != dependency_signature_after
+            or atlas_context_signature_before != atlas_context_signature_after
+        ):
+            raise RuntimeError(
+                "Scene inputs changed while the AO snapshot was being built. "
+                "Try the operation again."
+            )
+        snapshot = _SurfaceAmbientOcclusionBakeSnapshot(
+            viewer_revision=viewer_revision,
+            dependency_signature=dependency_signature_after,
+            atlas_context_signature=atlas_context_signature_after,
+            required_source_ids=required_source_ids,
+            surface_source_signature=scene_snapshot.surface_source_ids,
+        )
+        return _AmbientOcclusionBakePreparation(
+            scene_snapshot=scene_snapshot,
+            atlas_context=atlas_context,
+            snapshot=snapshot,
+        )
+
+    def _handle_ambient_occlusion_bake_requested(
+        self,
+        atlas_id: str,
+        intensity: float,
+    ) -> None:
+        """Prepare one stable scene snapshot and start its Atlas AO bake."""
+
+        normalized_atlas_id = str(atlas_id).strip()
+        if self._is_shutdown or not normalized_atlas_id:
+            return
+        if normalized_atlas_id in self._surface_ao_bake_runtimes:
+            self.texture_atlas_workspace.status_label.setText(
+                "Ambient occlusion is already being baked for this Atlas."
+            )
+            return
+        self._commit_pending_ambient_occlusion_scene_edits()
+        self._start_ambient_occlusion_bake(normalized_atlas_id, intensity)
+
+    def _start_ambient_occlusion_bake(
+        self,
+        atlas_id: str,
+        intensity: float,
+        *,
+        preparation: _AmbientOcclusionBakePreparation | None = None,
+    ) -> None:
+        """Launch one Atlas AO worker from fresh or shared immutable inputs."""
+
+        normalized_atlas_id = str(atlas_id).strip()
+        if self._is_shutdown or not normalized_atlas_id:
+            return
+        if normalized_atlas_id in self._surface_ao_bake_runtimes:
+            self.texture_atlas_workspace.status_label.setText(
+                "Ambient occlusion is already being baked for this Atlas."
+            )
+            return
+
+        atlas_record = self.texture_atlas_workspace.get_data().atlas_by_id(
+            normalized_atlas_id
+        )
+        atlas_name = normalized_atlas_id if atlas_record is None else atlas_record.name
+        job = self.job_manager.create_job(
+            kind="Ambient occlusion",
+            requested_name="",
+            default_name=f"{atlas_name} ambient occlusion",
+            stage="Preparing scene snapshot (1%)",
+        )
+        try:
+            requested_intensity = float(intensity)
+            if (
+                not math.isfinite(requested_intensity)
+                or not 0.0 <= requested_intensity <= 1.0
+            ):
+                raise ValueError("AO intensity must be between 0 and 1.")
+            if atlas_record is None:
+                raise ValueError(
+                    "The ambient-occlusion target Atlas no longer exists."
+                )
+            if preparation is None:
+                preparation = self._capture_ambient_occlusion_bake_preparation()
+            scene_snapshot = preparation.scene_snapshot
+            atlas_context = preparation.atlas_context
+            snapshot = preparation.snapshot
+            target_atlas_context = next(
+                (
+                    item
+                    for item in atlas_context
+                    if item.atlas.atlas_id == normalized_atlas_id
+                ),
+                None,
+            )
+            if target_atlas_context is None:
+                raise ValueError(
+                    "The ambient-occlusion target Atlas has no source used by "
+                    "the current scene."
+                )
+            target_atlas_context = replace(
+                target_atlas_context,
+                surface_ao_intensity=requested_intensity,
+            )
+            atlas_context = tuple(
+                target_atlas_context
+                if item.atlas.atlas_id == normalized_atlas_id
+                else item
+                for item in atlas_context
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            message = str(error) or type(error).__name__
+            self.job_manager.fail_job(job.job_id, f"Failed: {message}")
+            self.texture_atlas_workspace.status_label.setText(
+                f"Ambient-occlusion bake failed: {message}"
+            )
+            QMessageBox.warning(self, "Ambient-occlusion bake failed", message)
+            return
+
+        thread = _SurfaceAmbientOcclusionBakeThread(
+            scene_snapshot,
+            target_atlas_context,
+            atlas_context,
+            self,
+        )
+        runtime = _SurfaceAmbientOcclusionBakeRuntime(
+            atlas_id=normalized_atlas_id,
+            job_id=job.job_id,
+            thread=thread,
+            snapshot=snapshot,
+        )
+        self._surface_ao_bake_runtimes[normalized_atlas_id] = runtime
+        self.job_manager.set_cancel_callback(
+            job.job_id,
+            lambda target_atlas_id=normalized_atlas_id: (
+                self._cancel_surface_ambient_occlusion_bake(target_atlas_id)
+            ),
+        )
+        thread.progress.connect(
+            partial(
+                self._handle_surface_ambient_occlusion_bake_progress,
+                normalized_atlas_id,
+                job.job_id,
+                thread,
+            )
+        )
+        thread.finished.connect(
+            partial(
+                self._handle_surface_ambient_occlusion_bake_finished,
+                normalized_atlas_id,
+                job.job_id,
+                thread,
+            )
+        )
+        self.job_manager.update_job(
+            job.job_id,
+            stage="Preparing ambient occlusion (1%)",
+        )
+        self.texture_atlas_workspace.status_label.setText(
+            f"Preparing ambient occlusion for {atlas_name}."
+        )
+        thread.start()
+
+    @staticmethod
+    def _build_surface_ao_atlas_layout_signature(
+        atlas: TextureAtlasRecord,
+    ) -> tuple[object, ...]:
+        """Identify only Atlas fields which affect a surface AO layout."""
+
+        return (
+            atlas.atlas_id,
+            int(atlas.resolution),
+            tuple(
+                (
+                    placement.object_id,
+                    placement.texture_path,
+                    int(placement.texture_resolution),
+                    int(placement.x),
+                    int(placement.y),
+                    int(placement.size),
+                    placement.packing_mode,
+                    placement.slot_half,
+                    placement.slot_quadrant,
+                )
+                for placement in atlas.placements
+            ),
+        )
+
+    def _build_surface_ao_atlas_context_signature(
+        self,
+        required_source_ids: Sequence[str],
+    ) -> tuple[tuple[object, ...], ...]:
+        """Identify stable export-binding order and relevant Atlas layouts."""
+
+        required_ids = {
+            str(source_id).strip()
+            for source_id in required_source_ids
+            if str(source_id).strip()
+        }
+        return tuple(
+            self._build_surface_ao_atlas_layout_signature(atlas)
+            for atlas in self.texture_atlas_workspace.get_data().atlases
+            if atlas.placements
+            and any(
+                placement.object_id in required_ids for placement in atlas.placements
+            )
+        )
+
+    def _surface_ambient_occlusion_snapshot_is_current(
+        self,
+        snapshot: _SurfaceAmbientOcclusionBakeSnapshot,
+        atlas_id: str,
+    ) -> bool:
+        """Reject results built from a superseded scene or Atlas layout."""
+
+        if self._viewer_preview_revision != snapshot.viewer_revision:
+            return False
+        if (
+            self._build_viewer_preview_dependency_signature()
+            != snapshot.dependency_signature
+        ):
+            return False
+        if (
+            tuple(sorted(self._build_atlas_surface_source_ids().items()))
+            != snapshot.surface_source_signature
+        ):
+            return False
+        current_atlas_context = self._build_surface_ao_atlas_context_signature(
+            snapshot.required_source_ids
+        )
+        return bool(
+            any(
+                signature and signature[0] == atlas_id
+                for signature in current_atlas_context
+            )
+            and current_atlas_context == snapshot.atlas_context_signature
+        )
+
+    def _handle_surface_ambient_occlusion_bake_progress(
+        self,
+        atlas_id: str,
+        job_id: str,
+        thread: _SurfaceAmbientOcclusionBakeThread,
+        message: str,
+    ) -> None:
+        """Forward one current worker update into the shared Jobs window."""
+
+        runtime = self._surface_ao_bake_runtimes.get(atlas_id)
+        stage = str(message).strip()
+        if (
+            self._is_shutdown
+            or runtime is None
+            or runtime.job_id != job_id
+            or runtime.thread is not thread
+            or runtime.cancel_requested
+            or not stage
+        ):
+            return
+        self.job_manager.update_job(job_id, stage=stage)
+        self.texture_atlas_workspace.status_label.setText(stage)
+
+    def _handle_surface_ambient_occlusion_bake_finished(
+        self,
+        atlas_id: str,
+        job_id: str,
+        thread: _SurfaceAmbientOcclusionBakeThread,
+    ) -> None:
+        """Commit one successful current snapshot and finalize its job row."""
+
+        runtime = self._surface_ao_bake_runtimes.get(atlas_id)
+        if runtime is None or runtime.job_id != job_id or runtime.thread is not thread:
+            thread.deleteLater()
+            return
+        self._surface_ao_bake_runtimes.pop(atlas_id, None)
+        self.job_manager.set_cancel_callback(job_id, None)
+        try:
+            if self._is_shutdown or runtime.cancel_requested or thread.was_cancelled:
+                self.job_manager.mark_cancelled(job_id)
+                if not self._is_shutdown:
+                    self.texture_atlas_workspace.status_label.setText(
+                        "Ambient-occlusion bake cancelled."
+                    )
+                return
+            if thread.error_message is not None:
+                self._report_surface_ambient_occlusion_bake_failure(
+                    job_id,
+                    thread.error_message,
+                )
+                return
+            result = thread.result
+            if result is None:
+                self._report_surface_ambient_occlusion_bake_failure(
+                    job_id,
+                    "The AO worker finished without a result.",
+                )
+                return
+            if result.atlas_id != atlas_id:
+                self._report_surface_ambient_occlusion_bake_failure(
+                    job_id,
+                    "The AO worker returned a result for a different Atlas.",
+                )
+                return
+            if not self._surface_ambient_occlusion_snapshot_is_current(
+                runtime.snapshot,
+                atlas_id,
+            ):
+                self._report_surface_ambient_occlusion_bake_failure(
+                    job_id,
+                    "The scene or Atlas changed during the bake; the stale "
+                    "result was discarded.",
+                )
+                return
+            self.job_manager.update_job(
+                job_id,
+                stage="Saving ambient occlusion (99%)",
+            )
+            try:
+                image_path = (
+                    self.texture_atlas_workspace.commit_surface_ambient_occlusion_bake(
+                        atlas_id,
+                        result.ambient_occlusion,
+                        result.geometry_signature,
+                    )
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                self._report_surface_ambient_occlusion_bake_failure(
+                    job_id,
+                    str(error) or type(error).__name__,
+                )
+                return
+            if result.preview_model is not None:
+                try:
+                    image_revision = _build_surface_ao_file_revision(image_path)
+                except OSError:
+                    self._surface_ao_preview_cache.pop(atlas_id, None)
+                else:
+                    cached = _SurfaceAmbientOcclusionPreviewCacheEntry(
+                        snapshot=runtime.snapshot,
+                        geometry_signature=result.geometry_signature,
+                        image_revision=image_revision,
+                        model=result.preview_model,
+                    )
+                    self._surface_ao_preview_cache[atlas_id] = cached
+                    selected_atlas = self.texture_atlas_workspace.selected_atlas
+                    if (
+                        self.texture_atlas_workspace.is_ambient_occlusion_preview_active
+                        and selected_atlas is not None
+                        and selected_atlas.atlas_id == atlas_id
+                    ):
+                        self._cancel_surface_ambient_occlusion_preview_preparations()
+                        self._show_surface_ambient_occlusion_preview(
+                            atlas_id,
+                            selected_atlas.name,
+                            cached,
+                        )
+            self.job_manager.complete_job(job_id, "Ambient occlusion baked")
+        finally:
+            thread.deleteLater()
+
+    def _report_surface_ambient_occlusion_bake_failure(
+        self,
+        job_id: str,
+        message: str,
+    ) -> None:
+        """Show one asynchronous AO failure and preserve existing bake data."""
+
+        normalized_message = str(message).strip() or "Unknown AO bake error."
+        self.job_manager.fail_job(job_id, f"Failed: {normalized_message}")
+        self.texture_atlas_workspace.status_label.setText(
+            f"Ambient-occlusion bake failed: {normalized_message}"
+        )
+        QMessageBox.warning(
+            self,
+            "Ambient-occlusion bake failed",
+            normalized_message,
+        )
+
+    def _cancel_surface_ambient_occlusion_bake(self, atlas_id: str) -> bool:
+        """Request cancellation of one Atlas bake without touching siblings."""
+
+        runtime = self._surface_ao_bake_runtimes.get(str(atlas_id))
+        if runtime is None or runtime.cancel_requested:
+            return runtime is not None
+        runtime.cancel_requested = True
+        runtime.thread.requestInterruption()
+        self.texture_atlas_workspace.status_label.setText(
+            "Cancelling ambient-occlusion bake..."
+        )
+        return True
+
+    def _cancel_and_join_surface_ambient_occlusion_bakes(self) -> None:
+        """Interrupt and join every AO thread before retiring its project."""
+
+        runtimes = tuple(self._surface_ao_bake_runtimes.values())
+        for runtime in runtimes:
+            runtime.cancel_requested = True
+            self.job_manager.mark_cancelled(runtime.job_id)
+            runtime.thread.requestInterruption()
+        for runtime in runtimes:
+            while runtime.thread.isRunning():
+                runtime.thread.wait(SURFACE_AO_SHUTDOWN_WAIT_MILLISECONDS)
+        self._surface_ao_bake_runtimes.clear()
+
+    # ### GLB export ###
     def _handle_glb_export_clicked(self) -> None:
         self._cancel_active_canvas_surface_edit()
         self._commit_pending_canvas_surface_mesh_update()
@@ -4126,15 +5716,16 @@ class BlueprintWorkspace(QWidget):
             return
 
         self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
-        self._set_canvas_viewer_targets(
-            tuple(build_fixed_surfaces(self._build_viewer_preview_levels()))
-        )
-        self._is_syncing_canvas_scene_selection = True
-        try:
-            self.viewer.set_model(generated_model)
-            self._restore_desired_canvas_scene_selection()
-        finally:
-            self._is_syncing_canvas_scene_selection = False
+        if not self.texture_atlas_workspace.is_ambient_occlusion_preview_active:
+            self._set_canvas_viewer_targets(
+                tuple(build_fixed_surfaces(self._build_viewer_preview_levels()))
+            )
+            self._is_syncing_canvas_scene_selection = True
+            try:
+                self.viewer.set_model(generated_model)
+                self._restore_desired_canvas_scene_selection()
+            finally:
+                self._is_syncing_canvas_scene_selection = False
         if not self._remember_current_canvas_preview_model(
             generated_model,
             validated_dependency_signature=dependency_signature,
@@ -4161,24 +5752,21 @@ class BlueprintWorkspace(QWidget):
             else None
         )
         if current_level is not None:
-            current_image_changed = (
-                self.canvas.refresh_blueprint_image_if_stale()
-            )
+            current_image_changed = self.canvas.refresh_blueprint_image_if_stale()
             current_revision = self.canvas.get_blueprint_image_revision()
             if current_image_changed:
                 refreshed_image_size = self.canvas.get_image_size_pixels()
                 if (
                     refreshed_image_size is not None
-                    and refreshed_image_size
-                    != current_level.image_size_pixels
+                    and refreshed_image_size != current_level.image_size_pixels
                 ):
                     current_level.image_size_pixels = refreshed_image_size
                     geometry_dimensions_changed = True
                 self._update_blueprint_name_label()
             if current_revision is not None:
-                self._level_blueprint_image_revisions[
-                    current_level.index
-                ] = current_revision
+                self._level_blueprint_image_revisions[current_level.index] = (
+                    current_revision
+                )
 
         if include_exported_levels:
             exported_level_indices = {
@@ -4186,16 +5774,16 @@ class BlueprintWorkspace(QWidget):
             }
             self._level_blueprint_image_revisions = {
                 level_index: revision
-                for level_index, revision
-                in self._level_blueprint_image_revisions.items()
+                for level_index, revision in (
+                    self._level_blueprint_image_revisions.items()
+                )
                 if level_index in exported_level_indices
             }
             for level in self.levels:
                 if (
                     not level.include_in_export
                     or (
-                        current_level is not None
-                        and level.index == current_level.index
+                        current_level is not None and level.index == current_level.index
                     )
                     or level.image_path is None
                 ):
@@ -4207,9 +5795,7 @@ class BlueprintWorkspace(QWidget):
                 ):
                     continue
                 if not _local_file_revision_has_file(revision_before):
-                    self._level_blueprint_image_revisions[
-                        level.index
-                    ] = revision_before
+                    self._level_blueprint_image_revisions[level.index] = revision_before
                     continue
                 try:
                     with Image.open(level.image_path) as blueprint_image:
@@ -4222,9 +5808,7 @@ class BlueprintWorkspace(QWidget):
                 revision_after = _build_local_file_revision(level.image_path)
                 if revision_before != revision_after:
                     continue
-                self._level_blueprint_image_revisions[
-                    level.index
-                ] = revision_after
+                self._level_blueprint_image_revisions[level.index] = revision_after
                 if image_size != level.image_size_pixels:
                     level.image_size_pixels = image_size
                     geometry_dimensions_changed = True
@@ -4255,6 +5839,7 @@ class BlueprintWorkspace(QWidget):
             self._ensure_viewer_preview_current(preserve_camera=True)
         elif is_atlas_workspace:
             self._sync_atlas_object_texture_sources()
+            self._schedule_atlas_draw_call_estimate()
         elif selected_widget is self.generation:
             self.generation.refresh_file_backed_previews()
 
@@ -4268,9 +5853,7 @@ class BlueprintWorkspace(QWidget):
             return
 
         if not self._viewer_preview_is_active():
-            self._refresh_blueprint_file_dependencies(
-                include_exported_levels=False
-            )
+            self._refresh_blueprint_file_dependencies(include_exported_levels=False)
         self._ensure_viewer_preview_current(preserve_camera=False)
 
     def _handle_generation_data_changed_for_atlases(
@@ -4295,8 +5878,7 @@ class BlueprintWorkspace(QWidget):
         self._handle_generation_data_changed_for_atlases(_placeable_objects)
         if (
             selected_source_id is not None
-            and self.texture_atlas_workspace.selected_object_id
-            != selected_source_id
+            and self.texture_atlas_workspace.selected_object_id != selected_source_id
         ):
             self._sync_canvas_selection_to_current_atlas_source()
 
@@ -4366,10 +5948,8 @@ class BlueprintWorkspace(QWidget):
             or not isinstance(raw_placement, GeneratedObjectPlacement)
         ):
             return
-        previous_state = (
-            self.generation.get_existing_object_placement_request_state(
-                operation_id
-            )
+        previous_state = self.generation.get_existing_object_placement_request_state(
+            operation_id
         )
         previous_atlas_placements = (
             self._capture_canvas_atlas_placements(previous_state[0])
@@ -4385,9 +5965,7 @@ class BlueprintWorkspace(QWidget):
         if previous_state is None or self._is_restoring_canvas_undo:
             return
         object_id, previous_placement = previous_state
-        current_placement = self.generation.get_generated_object_placement(
-            object_id
-        )
+        current_placement = self.generation.get_generated_object_placement(object_id)
         if current_placement == previous_placement:
             return
         self._record_canvas_undo_state(
@@ -4546,12 +6124,8 @@ class BlueprintWorkspace(QWidget):
         existing_placement = self.generation.get_generated_object_placement(
             normalized_object_id
         )
-        atlas_placements = self._capture_canvas_atlas_placements(
-            normalized_object_id
-        )
-        if self.generation.remove_generated_object_placement(
-            normalized_object_id
-        ):
+        atlas_placements = self._capture_canvas_atlas_placements(normalized_object_id)
+        if self.generation.remove_generated_object_placement(normalized_object_id):
             if existing_placement is not None:
                 self._record_canvas_undo_state(
                     _CanvasPlacedObjectUndoState(
@@ -4619,8 +6193,7 @@ class BlueprintWorkspace(QWidget):
         # ordinary placement signals here would serialize and rebuild both 3D
         # previews, even though only this retained transform changed.
         canvas_was_current = (
-            self._canvas_viewer_preview_revision
-            == self._viewer_preview_revision
+            self._canvas_viewer_preview_revision == self._viewer_preview_revision
         )
         dependency_signature_before: tuple[object, ...] | None = None
         if canvas_was_current:
@@ -4651,7 +6224,10 @@ class BlueprintWorkspace(QWidget):
                 )
             )
 
-        revision = self._mark_viewer_preview_dirty(preserve_camera=True)
+        revision = self._mark_viewer_preview_dirty(
+            preserve_camera=True,
+            affects_draw_call_estimate=False,
+        )
         dependency_signature_after = (
             self._build_viewer_preview_dependency_signature()
             if canvas_was_current
@@ -4668,9 +6244,7 @@ class BlueprintWorkspace(QWidget):
             )
         ):
             self._canvas_viewer_preview_revision = revision
-            self._viewer_preview_dependency_signature = (
-                dependency_signature_after
-            )
+            self._viewer_preview_dependency_signature = dependency_signature_after
             self._viewer_preview_dependency_signature_revision = revision
             return
         self._queue_viewer_preview_refresh()
@@ -4704,8 +6278,7 @@ class BlueprintWorkspace(QWidget):
         if not normalized_object_id:
             return
         if any(
-            record.object_id == normalized_object_id
-            and record.placement is not None
+            record.object_id == normalized_object_id and record.placement is not None
             for record in self.generation.get_data().generated_objects
         ):
             self._schedule_viewer_preview_refresh(preserve_camera=True)
@@ -4717,8 +6290,7 @@ class BlueprintWorkspace(QWidget):
         normalized_id = str(source_id).strip()
         return bool(
             is_atlas_wall_texture_source_id(normalized_id)
-            and normalized_id
-            not in self.generation.get_placeable_object_names_by_id()
+            and normalized_id not in self.generation.get_placeable_object_names_by_id()
         )
 
     def _handle_surface_texture_data_changed_for_atlases(
@@ -4739,9 +6311,10 @@ class BlueprintWorkspace(QWidget):
         self,
         _selected_atlas: object,
     ) -> None:
-        """Retry pending scene textures when the user chooses an Atlas."""
+        """Retry pending textures and refresh an active AO-only preview."""
 
         self._refresh_scene_atlas_texture_requirements()
+        self._schedule_surface_ambient_occlusion_preview_refresh()
 
     def _handle_surface_texture_assignments_removed_for_atlases(
         self,
@@ -4753,9 +6326,7 @@ class BlueprintWorkspace(QWidget):
             return
         assignment_ids = tuple(
             assignment_id
-            for assignment_id in (
-                str(value).strip() for value in raw_assignment_ids
-            )
+            for assignment_id in (str(value).strip() for value in raw_assignment_ids)
             if assignment_id
         )
         if not assignment_ids:
@@ -4792,9 +6363,7 @@ class BlueprintWorkspace(QWidget):
     def _sync_canvas_selection_to_current_atlas_source(self) -> None:
         """Reconcile Canvas selection after an Atlas source disappears."""
 
-        surface_source_id = (
-            self.texture_atlas_workspace.selected_surface_texture_id
-        )
+        surface_source_id = self.texture_atlas_workspace.selected_surface_texture_id
         if surface_source_id is not None:
             self._handle_atlas_surface_texture_selected(surface_source_id)
             return
@@ -4842,9 +6411,7 @@ class BlueprintWorkspace(QWidget):
             self.viewer.set_highlighted_canvas_surface_ids(())
             self._sync_atlas_green_outline_to_canvas_highlight(None)
             return
-        assignment = self.surface_texture_generation.get_assignment(
-            assignment_id
-        )
+        assignment = self.surface_texture_generation.get_assignment(assignment_id)
         if assignment is None:
             self._selected_atlas_surface_source_id = None
             self.viewer.set_highlighted_canvas_surface_ids(())
@@ -4869,9 +6436,7 @@ class BlueprintWorkspace(QWidget):
             and self.viewer.get_highlighted_canvas_surface_ids()
             else ()
         )
-        self.texture_atlas_workspace.set_green_outline_source_ids(
-            outlined_source_ids
-        )
+        self.texture_atlas_workspace.set_green_outline_source_ids(outlined_source_ids)
 
     def _handle_atlas_object_place_requested(self, object_id: str) -> None:
         """Open the existing Canvas placement picker for one Atlas object."""
@@ -4893,27 +6458,21 @@ class BlueprintWorkspace(QWidget):
         if not normalized_source_id:
             return
         if source_kind == "object":
-            previous_state = (
-                self.generation.get_placeable_object_placement_state(
-                    normalized_source_id
-                )
+            previous_state = self.generation.get_placeable_object_placement_state(
+                normalized_source_id
             )
             previous_atlas_placements = self._capture_canvas_atlas_placements(
                 normalized_source_id
             )
-            removed_from_canvas = (
-                self.generation.remove_placeable_object_placement(
+            removed_from_canvas = self.generation.remove_placeable_object_placement(
+                normalized_source_id
+            )
+            removed_from_atlases = (
+                self.texture_atlas_workspace.remove_scene_texture_from_atlases(
                     normalized_source_id
                 )
             )
-            removed_from_atlases = (
-                self.texture_atlas_workspace
-                .remove_scene_texture_from_atlases(normalized_source_id)
-            )
-            if (
-                removed_from_canvas
-                and previous_state is not None
-            ):
+            if removed_from_canvas and previous_state is not None:
                 stable_id, previous_placement = previous_state
                 self._record_canvas_undo_state(
                     _CanvasPlacedObjectUndoState(
@@ -4940,17 +6499,13 @@ class BlueprintWorkspace(QWidget):
         if source_kind != "surface":
             return
 
-        assignment_id = get_atlas_wall_texture_assignment_id(
-            normalized_source_id
-        )
+        assignment_id = get_atlas_wall_texture_assignment_id(normalized_source_id)
         if assignment_id is None:
             return
         self._is_assigning_surface_texture_from_atlas = True
         try:
             removed_from_canvas = (
-                self.surface_texture_generation.clear_assignment_surfaces(
-                    assignment_id
-                )
+                self.surface_texture_generation.clear_assignment_surfaces(assignment_id)
             )
         finally:
             self._is_assigning_surface_texture_from_atlas = False
@@ -4977,9 +6532,7 @@ class BlueprintWorkspace(QWidget):
         assignment_id = get_atlas_wall_texture_assignment_id(source_id)
         if assignment_id is None:
             return
-        assignment = self.surface_texture_generation.get_assignment(
-            assignment_id
-        )
+        assignment = self.surface_texture_generation.get_assignment(assignment_id)
         if assignment is None:
             return
         target_surface_ids = self._atlas_surface_assignment_targets(assignment)
@@ -5012,20 +6565,16 @@ class BlueprintWorkspace(QWidget):
             finally:
                 self._is_assigning_surface_texture_from_atlas = False
 
-        if self.texture_atlas_workspace.is_source_assigned_to_any_atlas(
-            source_id
-        ):
+        if self.texture_atlas_workspace.is_source_assigned_to_any_atlas(source_id):
             assigned = commit_surface_assignment()
         elif self.texture_atlas_workspace.can_assign_source_to_selected_atlas(
             source_id,
             source_ids_to_remove=source_ids_to_remove,
         ):
-            assigned = (
-                self.texture_atlas_workspace.assign_source_to_selected_atlas(
-                    source_id,
-                    commit_callback=commit_surface_assignment,
-                    source_ids_to_remove=source_ids_to_remove,
-                )
+            assigned = self.texture_atlas_workspace.assign_source_to_selected_atlas(
+                source_id,
+                commit_callback=commit_surface_assignment,
+                source_ids_to_remove=source_ids_to_remove,
             )
         else:
             if self.texture_atlas_workspace.selected_atlas is None:
@@ -5042,18 +6591,15 @@ class BlueprintWorkspace(QWidget):
                 dialog_parent,
                 "Atlas full",
                 "not space in atlas for the texture, create a new atlas?",
-                QMessageBox.StandardButton.Yes
-                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
-            assigned = (
-                self.texture_atlas_workspace.create_atlas_and_assign_source(
-                    source_id,
-                    commit_callback=commit_surface_assignment,
-                    source_ids_to_remove=source_ids_to_remove,
-                )
+            assigned = self.texture_atlas_workspace.create_atlas_and_assign_source(
+                source_id,
+                commit_callback=commit_surface_assignment,
+                source_ids_to_remove=source_ids_to_remove,
             )
 
         if not assigned:
@@ -5081,9 +6627,7 @@ class BlueprintWorkspace(QWidget):
                 or not set(assignment.surface_ids).issubset(target_ids)
             ):
                 continue
-            source_id = build_atlas_wall_texture_source_id(
-                assignment.assignment_id
-            )
+            source_id = build_atlas_wall_texture_source_id(assignment.assignment_id)
             if self._is_atlas_surface_texture_source_id(source_id):
                 displaced_source_ids.append(source_id)
         return tuple(displaced_source_ids)
@@ -5121,9 +6665,7 @@ class BlueprintWorkspace(QWidget):
         if not isinstance(object_id, str) or not object_id:
             return
         self._sync_atlas_object_texture_sources()
-        self.texture_atlas_workspace.refresh_regenerated_object_texture(
-            object_id
-        )
+        self.texture_atlas_workspace.refresh_regenerated_object_texture(object_id)
 
     def _handle_generated_object_deleted_for_atlases(
         self,
@@ -5145,6 +6687,8 @@ class BlueprintWorkspace(QWidget):
     ) -> None:
         """Display the exact selected Atlas texture variant in 3D."""
 
+        if self.texture_atlas_workspace.is_ambient_occlusion_preview_active:
+            return
         if self._is_atlas_surface_texture_source_id(object_id):
             self._show_atlas_surface_texture_preview(
                 object_id,
@@ -5172,11 +6716,7 @@ class BlueprintWorkspace(QWidget):
                 None if symmetry is None else symmetry.orientation,
                 None if symmetry is None else symmetry.plane_coordinate,
                 None if symmetry is None else getattr(symmetry, "version", None),
-                (
-                    None
-                    if symmetry is None
-                    else getattr(symmetry, "packing_mode", None)
-                ),
+                (None if symmetry is None else getattr(symmetry, "packing_mode", None)),
                 (
                     None
                     if symmetry is None
@@ -5197,8 +6737,7 @@ class BlueprintWorkspace(QWidget):
         except Exception as error:
             self._clear_atlas_object_preview()
             self._append_atlas_preview_status(
-                "The selected object's 3D preview could not be loaded: "
-                f"{error}"
+                f"The selected object's 3D preview could not be loaded: {error}"
             )
             return
 
@@ -5222,6 +6761,8 @@ class BlueprintWorkspace(QWidget):
     ) -> None:
         """Preview generated geometry that does not yet have a texture."""
 
+        if self.texture_atlas_workspace.is_ambient_occlusion_preview_active:
+            return
         generated_model = self.generation.get_generated_object_model(object_id)
         if generated_model is None:
             self._clear_atlas_object_preview()
@@ -5271,9 +6812,7 @@ class BlueprintWorkspace(QWidget):
         assignment = (
             None
             if assignment_id is None
-            else self.surface_texture_generation.get_assignment(
-                assignment_id
-            )
+            else self.surface_texture_generation.get_assignment(assignment_id)
         )
         requested_resolution = (
             normalized_resolution
@@ -5288,11 +6827,7 @@ class BlueprintWorkspace(QWidget):
                 requested_resolution,
             )
         )
-        if (
-            assignment is None
-            or asset_path is None
-            or normalized_resolution <= 0
-        ):
+        if assignment is None or asset_path is None or normalized_resolution <= 0:
             self._clear_atlas_object_preview()
             self._append_atlas_preview_status(
                 "The selected surface texture preview is unavailable."
@@ -5317,14 +6852,11 @@ class BlueprintWorkspace(QWidget):
             )
             if source is None:
                 raise ValueError("The surface texture source is unavailable.")
-            model = build_texture_preview_plane_model(
-                source.load_texture_rgba()
-            )
+            model = build_texture_preview_plane_model(source.load_texture_rgba())
         except (OSError, TypeError, ValueError) as error:
             self._clear_atlas_object_preview()
             self._append_atlas_preview_status(
-                "The selected surface texture preview could not be loaded: "
-                f"{error}"
+                f"The selected surface texture preview could not be loaded: {error}"
             )
             return
 
@@ -5380,9 +6912,7 @@ class BlueprintWorkspace(QWidget):
     ) -> bool:
         """Commit a Surface-tab choice together with every Atlas placement."""
 
-        assignment = self.surface_texture_generation.get_assignment(
-            assignment_id
-        )
+        assignment = self.surface_texture_generation.get_assignment(assignment_id)
         if assignment is None:
             return False
         try:
@@ -5392,33 +6922,26 @@ class BlueprintWorkspace(QWidget):
         if assignment.selected_texture_resolution == target_resolution:
             return True
         if not (
-            self.surface_texture_generation
-            .can_select_assignment_texture_resolution(
+            self.surface_texture_generation.can_select_assignment_texture_resolution(
                 assignment.assignment_id,
                 target_resolution,
             )
         ):
             return False
 
-        source_id = build_atlas_wall_texture_source_id(
-            assignment.assignment_id
-        )
+        source_id = build_atlas_wall_texture_source_id(assignment.assignment_id)
         self._sync_atlas_object_texture_sources()
         if source_id not in self._atlas_wall_texture_source_ids:
-            return (
-                self.surface_texture_generation
-                .select_assignment_texture_resolution(
-                    assignment.assignment_id,
-                    target_resolution,
-                )
+            return self.surface_texture_generation.select_assignment_texture_resolution(
+                assignment.assignment_id,
+                target_resolution,
             )
 
         return self.texture_atlas_workspace.set_object_texture_resolution(
             source_id,
             target_resolution,
             commit_callback=lambda: (
-                self.surface_texture_generation
-                .select_assignment_texture_resolution(
+                self.surface_texture_generation.select_assignment_texture_resolution(
                     assignment.assignment_id,
                     target_resolution,
                 )
@@ -5444,24 +6967,23 @@ class BlueprintWorkspace(QWidget):
             return False
         if current_variant.resolution == target_resolution:
             return True
-        if self.generation.get_texture_variant(
-            normalized_id,
-            target_resolution,
-        ) is None:
+        if (
+            self.generation.get_texture_variant(
+                normalized_id,
+                target_resolution,
+            )
+            is None
+        ):
             return False
 
         self._sync_atlas_object_texture_sources()
-        resolution_changed = (
-            self.texture_atlas_workspace.set_object_texture_resolution(
+        resolution_changed = self.texture_atlas_workspace.set_object_texture_resolution(
+            normalized_id,
+            target_resolution,
+            commit_callback=lambda: self.generation.select_object_texture_resolution(
                 normalized_id,
                 target_resolution,
-                commit_callback=lambda: (
-                    self.generation.select_object_texture_resolution(
-                        normalized_id,
-                        target_resolution,
-                    )
-                ),
-            )
+            ),
         )
         if resolution_changed:
             self._refresh_placed_object_texture_if_needed(normalized_id)
@@ -5486,9 +7008,7 @@ class BlueprintWorkspace(QWidget):
         symmetry = self.generation.resolve_symmetric_division_for_record(
             replacement_record
         )
-        resolve_variant = (
-            self.generation.resolve_atlas_texture_image_variant_for_record
-        )
+        resolve_variant = self.generation.resolve_atlas_texture_image_variant_for_record
         candidate_sources: list[AtlasObjectTextureSource] = []
         for resolution in sorted(OBJECT_TEXTURE_RESOLUTIONS):
             variant = resolve_variant(
@@ -5506,9 +7026,7 @@ class BlueprintWorkspace(QWidget):
             candidate_sources.append(source)
         if not candidate_sources:
             if (
-                replacement_record.pipeline.get(
-                    FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY
-                )
+                replacement_record.pipeline.get(FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY)
                 is True
             ):
                 return False
@@ -5553,13 +7071,8 @@ class BlueprintWorkspace(QWidget):
         """Mark exported scene textures and optionally pack missing ones."""
 
         required_source_ids = self._build_required_scene_atlas_source_ids()
-        self.texture_atlas_workspace.set_scene_texture_source_ids(
-            required_source_ids
-        )
-        if (
-            not automatically_assign
-            or self._is_automatically_assigning_atlas_textures
-        ):
+        self.texture_atlas_workspace.set_scene_texture_source_ids(required_source_ids)
+        if not automatically_assign or self._is_automatically_assigning_atlas_textures:
             return
         self._automatically_assign_scene_textures()
 
@@ -5571,17 +7084,13 @@ class BlueprintWorkspace(QWidget):
         }
         required_ids: list[str] = []
         for object_id in self.generation.get_generated_object_ids():
-            placement = self.generation.get_generated_object_placement(
-                object_id
-            )
+            placement = self.generation.get_generated_object_placement(object_id)
             if (
                 placement is not None
                 and placement.level_index in included_level_indices
                 and (
                     object_id in self._atlas_available_source_ids
-                    or self.generation.has_generated_object_texture_variants(
-                        object_id
-                    )
+                    or self.generation.has_generated_object_texture_variants(object_id)
                 )
             ):
                 required_ids.append(object_id)
@@ -5605,9 +7114,7 @@ class BlueprintWorkspace(QWidget):
         settings = self._generation_settings
         target_resolution = settings.automatic_atlas_texture_resolution
         sort_by_pbr = settings.automatic_atlas_texture_sort_by_pbr
-        use_half_mesh_texture_prefix = (
-            settings.use_half_mesh_texture_prefix
-        )
+        use_half_mesh_texture_prefix = settings.use_half_mesh_texture_prefix
         attempt_key = self._build_automatic_atlas_assignment_key(
             target_resolution,
             sort_by_pbr,
@@ -5628,9 +7135,7 @@ class BlueprintWorkspace(QWidget):
                         )
                     ),
                     sort_by_pbr=sort_by_pbr,
-                    use_half_mesh_texture_prefix=(
-                        use_half_mesh_texture_prefix
-                    ),
+                    use_half_mesh_texture_prefix=(use_half_mesh_texture_prefix),
                 )
             )
             if not assigned_source_ids:
@@ -5709,40 +7214,31 @@ class BlueprintWorkspace(QWidget):
                     assignment_id
                 )
                 if assignment is None:
-                    self._rollback_automatic_atlas_texture_resolutions(
-                        applied_changes
-                    )
+                    self._rollback_automatic_atlas_texture_resolutions(applied_changes)
                     return False
                 if not assignment.texture_variants:
                     continue
                 previous_resolution = assignment.selected_texture_resolution
                 if previous_resolution is None:
-                    self._rollback_automatic_atlas_texture_resolutions(
-                        applied_changes
-                    )
+                    self._rollback_automatic_atlas_texture_resolutions(applied_changes)
                     return False
                 if previous_resolution == target_resolution:
                     continue
-                if not self.surface_texture_generation.select_assignment_texture_resolution(
+                select_resolution = (
+                    self.surface_texture_generation.select_assignment_texture_resolution
+                )
+                if not select_resolution(
                     assignment_id,
                     target_resolution,
                 ):
-                    self._rollback_automatic_atlas_texture_resolutions(
-                        applied_changes
-                    )
+                    self._rollback_automatic_atlas_texture_resolutions(applied_changes)
                     return False
-                applied_changes.append(
-                    ("surface", assignment_id, previous_resolution)
-                )
+                applied_changes.append(("surface", assignment_id, previous_resolution))
                 continue
 
-            active_variant = self.generation.get_active_texture_variant(
-                source_id
-            )
+            active_variant = self.generation.get_active_texture_variant(source_id)
             if active_variant is None:
-                self._rollback_automatic_atlas_texture_resolutions(
-                    applied_changes
-                )
+                self._rollback_automatic_atlas_texture_resolutions(applied_changes)
                 return False
             previous_resolution = active_variant.resolution
             if previous_resolution == target_resolution:
@@ -5751,13 +7247,9 @@ class BlueprintWorkspace(QWidget):
                 source_id,
                 target_resolution,
             ):
-                self._rollback_automatic_atlas_texture_resolutions(
-                    applied_changes
-                )
+                self._rollback_automatic_atlas_texture_resolutions(applied_changes)
                 return False
-            applied_changes.append(
-                ("object", source_id, previous_resolution)
-            )
+            applied_changes.append(("object", source_id, previous_resolution))
         return True
 
     def _rollback_automatic_atlas_texture_resolutions(
@@ -5766,9 +7258,7 @@ class BlueprintWorkspace(QWidget):
     ) -> None:
         """Best-effort restore owning workspaces after a rejected batch."""
 
-        for source_kind, source_id, previous_resolution in reversed(
-            applied_changes
-        ):
+        for source_kind, source_id, previous_resolution in reversed(applied_changes):
             if source_kind == "surface":
                 self.surface_texture_generation.select_assignment_texture_resolution(
                     source_id,
@@ -5802,8 +7292,7 @@ class BlueprintWorkspace(QWidget):
             "Export blocked",
             "Every texture used by the exported scene must be assigned to "
             "an Atlas before GLB export. Review these unpacked textures in "
-            "the Atlas tab:\n\n"
-            + "\n".join(detail_lines),
+            "the Atlas tab:\n\n" + "\n".join(detail_lines),
         )
         return True
 
@@ -5819,9 +7308,7 @@ class BlueprintWorkspace(QWidget):
             else None
         )
         if assignment_id is not None:
-            assignment = self.surface_texture_generation.get_assignment(
-                assignment_id
-            )
+            assignment = self.surface_texture_generation.get_assignment(assignment_id)
             if assignment is not None:
                 return assignment.display_name or (
                     f"{assignment.surface_type.title()} texture"
@@ -5860,16 +7347,10 @@ class BlueprintWorkspace(QWidget):
             )
         )
         for object_id in generated_object_ids:
-            variant = self.generation.get_active_texture_variant(
-                object_id
-            )
-            symmetry = self.generation.get_object_symmetric_division(
-                object_id
-            )
+            variant = self.generation.get_active_texture_variant(object_id)
+            symmetry = self.generation.get_object_symmetric_division(object_id)
             texture_variant_signature = (
-                self.generation.get_texture_variant_dependency_signature(
-                    object_id
-                )
+                self.generation.get_texture_variant_dependency_signature(object_id)
             )
             texture_source_signature = tuple(
                 (
@@ -5977,9 +7458,7 @@ class BlueprintWorkspace(QWidget):
                 )
             )
 
-        surface_assignments = list(
-            self.surface_texture_generation.get_assignments()
-        )
+        surface_assignments = list(self.surface_texture_generation.get_assignments())
         surface_texture_entries: list[AtlasSurfaceTextureEntry] = []
         for assignment in surface_assignments:
             variant_signature: list[tuple[object, ...]] = []
@@ -5990,9 +7469,7 @@ class BlueprintWorkspace(QWidget):
             )
             for texture_variant in candidate_variants:
                 resolution = (
-                    None
-                    if texture_variant is None
-                    else texture_variant.resolution
+                    None if texture_variant is None else texture_variant.resolution
                 )
                 logical_path = (
                     assignment.asset_path
@@ -6000,15 +7477,12 @@ class BlueprintWorkspace(QWidget):
                     else texture_variant.asset_path
                 )
                 physical_map_paths = (
-                    self.surface_texture_generation
-                    .get_assignment_map_asset_paths(
+                    self.surface_texture_generation.get_assignment_map_asset_paths(
                         assignment.assignment_id,
                         resolution,
                     )
                 )
-                physical_path = physical_map_paths.get(
-                    ATLAS_MAP_BASE_COLOR
-                )
+                physical_path = physical_map_paths.get(ATLAS_MAP_BASE_COLOR)
                 logical_map_paths = (
                     {ATLAS_MAP_BASE_COLOR: logical_path}
                     if texture_variant is None
@@ -6018,13 +7492,9 @@ class BlueprintWorkspace(QWidget):
                     (
                         map_type,
                         map_asset_path,
-                        _build_local_file_revision(
-                            physical_map_paths.get(map_type)
-                        ),
+                        _build_local_file_revision(physical_map_paths.get(map_type)),
                     )
-                    for map_type, map_asset_path in (
-                        logical_map_paths.items()
-                    )
+                    for map_type, map_asset_path in (logical_map_paths.items())
                 )
                 variant_signature.append(
                     (
@@ -6038,6 +7508,8 @@ class BlueprintWorkspace(QWidget):
                 (
                     "surface",
                     assignment.assignment_id,
+                    assignment.surface_type,
+                    assignment.display_name,
                     assignment.asset_path,
                     assignment.selected_texture_resolution,
                     assignment.texture_width,
@@ -6058,6 +7530,7 @@ class BlueprintWorkspace(QWidget):
                             or f"{assignment.surface_type.title()} texture"
                         ),
                         surface_usage_count=len(assignment.surface_ids),
+                        surface_type=assignment.surface_type,
                     )
                 )
                 if assignment.surface_ids:
@@ -6066,10 +7539,7 @@ class BlueprintWorkspace(QWidget):
                     (
                         item[0],
                         item[1],
-                        tuple(
-                            (map_item[0], map_item[1])
-                            for map_item in item[3]
-                        ),
+                        tuple((map_item[0], map_item[1]) for map_item in item[3]),
                     )
                     for item in variant_signature
                 )
@@ -6077,16 +7547,11 @@ class BlueprintWorkspace(QWidget):
                     (
                         item[0],
                         item[2],
-                        tuple(
-                            (map_item[0], map_item[2])
-                            for map_item in item[3]
-                        ),
+                        tuple((map_item[0], map_item[2]) for map_item in item[3]),
                     )
                     for item in variant_signature
                 )
-        normalized_scene_bound_source_ids = tuple(
-            dict.fromkeys(scene_bound_source_ids)
-        )
+        normalized_scene_bound_source_ids = tuple(dict.fromkeys(scene_bound_source_ids))
         signature_items.append(
             ("scene_bound_sources", normalized_scene_bound_source_ids)
         )
@@ -6110,10 +7575,9 @@ class BlueprintWorkspace(QWidget):
                     continue
                 previous_paths = self._atlas_source_content_paths.get(source_id)
                 current_paths = source_content_paths.get(source_id)
-                if (
-                    _build_atlas_source_base_path_signature(previous_paths)
-                    != _build_atlas_source_base_path_signature(current_paths)
-                ):
+                if _build_atlas_source_base_path_signature(
+                    previous_paths
+                ) != _build_atlas_source_base_path_signature(current_paths):
                     continue
                 if (
                     previous_paths != current_paths
@@ -6173,9 +7637,7 @@ class BlueprintWorkspace(QWidget):
             surface_sources[source.object_id] = source
             surface_assignments_by_source_id[source.object_id] = assignment
 
-        self._atlas_pending_source_content_refresh_ids.update(
-            failed_source_ids
-        )
+        self._atlas_pending_source_content_refresh_ids.update(failed_source_ids)
         refreshable_source_ids = tuple(
             source_id
             for source_id in dict.fromkeys(
@@ -6250,27 +7712,21 @@ class BlueprintWorkspace(QWidget):
         )
         if (
             selected_surface_source_id is not None
-            and selected_surface_source_id
-            == self._selected_atlas_surface_source_id
+            and selected_surface_source_id == self._selected_atlas_surface_source_id
         ):
-            self._handle_atlas_surface_texture_selected(
-                selected_surface_source_id
-            )
+            self._handle_atlas_surface_texture_selected(selected_surface_source_id)
         zero_usage_cleanup_failed = False
         for assignment in surface_assignments:
             if assignment.surface_ids:
                 continue
-            source_id = build_atlas_wall_texture_source_id(
-                assignment.assignment_id
-            )
+            source_id = build_atlas_wall_texture_source_id(assignment.assignment_id)
             if not self._is_atlas_surface_texture_source_id(source_id):
                 continue
-            if self.texture_atlas_workspace.is_source_assigned_to_any_atlas(
-                source_id
-            ):
+            if self.texture_atlas_workspace.is_source_assigned_to_any_atlas(source_id):
                 removed_count = (
-                    self.texture_atlas_workspace
-                    .remove_scene_texture_from_atlases(source_id)
+                    self.texture_atlas_workspace.remove_scene_texture_from_atlases(
+                        source_id
+                    )
                 )
                 zero_usage_cleanup_failed = bool(
                     zero_usage_cleanup_failed or removed_count <= 0
@@ -6288,9 +7744,7 @@ class BlueprintWorkspace(QWidget):
         )
         self._atlas_available_source_ids = set(available_source_ids)
         self._atlas_generation_signature = (
-            None
-            if source_build_failed or zero_usage_cleanup_failed
-            else signature
+            None if source_build_failed or zero_usage_cleanup_failed else signature
         )
         self._atlas_source_content_paths = source_content_paths
         self._atlas_source_content_revisions = source_content_revisions
@@ -6360,9 +7814,7 @@ class BlueprintWorkspace(QWidget):
             return load_atlas_object_texture_source(
                 object_id=str(getattr(variant, "object_id")),
                 object_name=str(getattr(variant, "object_name")),
-                texture_path=str(
-                    getattr(variant, "texture_asset_relative_path")
-                ),
+                texture_path=str(getattr(variant, "texture_asset_relative_path")),
                 texture_resolution=int(getattr(variant, "resolution")),
                 physical_texture_path=getattr(
                     variant,
@@ -6380,9 +7832,7 @@ class BlueprintWorkspace(QWidget):
                 ),
                 packing_mode=packing_mode,
                 symmetric_preview_orientation=(
-                    None
-                    if symmetry is None
-                    else str(getattr(symmetry, "orientation"))
+                    None if symmetry is None else str(getattr(symmetry, "orientation"))
                 ),
                 symmetric_preview_plane_coordinate=(
                     None
@@ -6419,9 +7869,7 @@ class BlueprintWorkspace(QWidget):
         physical_path = physical_map_paths.get(ATLAS_MAP_BASE_COLOR)
         if physical_path is None:
             return None
-        legacy_logical_map_paths = {
-            ATLAS_MAP_BASE_COLOR: assignment.asset_path
-        }
+        legacy_logical_map_paths = {ATLAS_MAP_BASE_COLOR: assignment.asset_path}
         logical_map_paths = legacy_logical_map_paths
         if supports_resolution_changes:
             selected_variant = assignment.texture_variant_for_resolution(
@@ -6433,24 +7881,20 @@ class BlueprintWorkspace(QWidget):
         live_map_types = tuple(
             map_type
             for map_type in ATLAS_MAP_TYPES
-            if map_type in logical_map_paths
-            and map_type in physical_map_paths
+            if map_type in logical_map_paths and map_type in physical_map_paths
         )
         atlas_logical_map_paths = {
             map_type: f"surface_textures/{logical_map_paths[map_type]}"
             for map_type in live_map_types
         }
         atlas_physical_map_paths = {
-            map_type: physical_map_paths[map_type]
-            for map_type in live_map_types
+            map_type: physical_map_paths[map_type] for map_type in live_map_types
         }
         try:
             if supports_resolution_changes:
                 texture_resolution = int(requested_resolution)
                 fit_to_square = False
-                variant = assignment.texture_variant_for_resolution(
-                    texture_resolution
-                )
+                variant = assignment.texture_variant_for_resolution(texture_resolution)
                 if variant is None:
                     return None
                 asset_path = variant.asset_path
@@ -6460,17 +7904,13 @@ class BlueprintWorkspace(QWidget):
                         image.width, image.height
                     )
                 texture_resolution = (
-                    natural_resolution
-                    if resolution is None
-                    else int(resolution)
+                    natural_resolution if resolution is None else int(resolution)
                 )
                 fit_to_square = True
                 asset_path = assignment.asset_path
             surface_count = len(assignment.surface_ids)
             return load_atlas_object_texture_source(
-                object_id=build_atlas_wall_texture_source_id(
-                    assignment.assignment_id
-                ),
+                object_id=build_atlas_wall_texture_source_id(assignment.assignment_id),
                 object_name=(
                     assignment.display_name
                     or f"{assignment.surface_type.title()} texture"
@@ -6519,10 +7959,7 @@ class BlueprintWorkspace(QWidget):
     ) -> None:
         """Restore the Atlas tab whenever its external host releases it."""
 
-        if (
-            restored_viewer is self.texture_atlas_workspace
-            and not self._is_shutdown
-        ):
+        if restored_viewer is self.texture_atlas_workspace and not self._is_shutdown:
             self._restore_atlas_workspace_tab()
 
     def _apply_fullscreen_3d_viewer_screen(
@@ -6575,17 +8012,15 @@ class BlueprintWorkspace(QWidget):
         )
         self._remove_detached_atlas_workspace_tab(atlas_tab_index)
         self._sync_atlas_object_texture_sources()
+        self._schedule_atlas_draw_call_estimate()
 
     def _prepare_atlas_workspace_for_detachment(self) -> int:
         """Return the Atlas tab slot and move local focus away if necessary."""
 
-        atlas_tab_index = self.workspace_tabs.indexOf(
-            self.texture_atlas_workspace
-        )
+        atlas_tab_index = self.workspace_tabs.indexOf(self.texture_atlas_workspace)
         if (
             atlas_tab_index >= 0
-            and self.workspace_tabs.currentWidget()
-            is self.texture_atlas_workspace
+            and self.workspace_tabs.currentWidget() is self.texture_atlas_workspace
         ):
             self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
         return atlas_tab_index
@@ -6605,9 +8040,7 @@ class BlueprintWorkspace(QWidget):
     def _restore_atlas_workspace_tab(self) -> None:
         """Insert Atlas at its canonical slot without changing local focus."""
 
-        existing_index = self.workspace_tabs.indexOf(
-            self.texture_atlas_workspace
-        )
+        existing_index = self.workspace_tabs.indexOf(self.texture_atlas_workspace)
         if (
             0 <= existing_index < self.workspace_tabs.count()
             and self.workspace_tabs.widget(existing_index)
@@ -6617,9 +8050,7 @@ class BlueprintWorkspace(QWidget):
             return
 
         current_widget = self.workspace_tabs.currentWidget()
-        canvas_index = self.workspace_tabs.indexOf(
-            self.canvas_viewer_workspace
-        )
+        canvas_index = self.workspace_tabs.indexOf(self.canvas_viewer_workspace)
         canonical_index = (
             canvas_index + 1
             if canvas_index >= 0
@@ -6641,9 +8072,7 @@ class BlueprintWorkspace(QWidget):
         """Show each workspace's local replacement for its detached 3D view."""
 
         hosted_viewer = self._external_viewer_host.viewer
-        self.set_canvas_3d_viewer_external_display_active(
-            hosted_viewer is self.viewer
-        )
+        self.set_canvas_3d_viewer_external_display_active(hosted_viewer is self.viewer)
         self.surface_texture_generation.set_external_3d_viewer_active(
             hosted_viewer is self.surface_texture_generation.surface_view
         )
@@ -6668,8 +8097,7 @@ class BlueprintWorkspace(QWidget):
 
         if (
             self._external_atlas_host.is_active
-            or self.workspace_tabs.currentWidget()
-            is self.texture_atlas_workspace
+            or self.workspace_tabs.currentWidget() is self.texture_atlas_workspace
         ):
             self.texture_atlas_workspace.request_selected_object_preview()
 
@@ -6677,8 +8105,7 @@ class BlueprintWorkspace(QWidget):
     def _canvas_viewer_preview_is_active(self) -> bool:
         return bool(
             (
-                self.workspace_tabs.currentWidget()
-                is self.canvas_viewer_workspace
+                self.workspace_tabs.currentWidget() is self.canvas_viewer_workspace
                 and self.canvas_viewer_tabs.currentIndex()
                 == self.canvas_3d_view_tab_index
             )
@@ -6690,8 +8117,7 @@ class BlueprintWorkspace(QWidget):
 
     def _surface_viewer_preview_is_active(self) -> bool:
         return bool(
-            self.workspace_tabs.currentWidget()
-            is self.surface_texture_generation
+            self.workspace_tabs.currentWidget() is self.surface_texture_generation
             or (
                 self._external_viewer_host.is_active
                 and self._external_viewer_host.viewer
@@ -6707,9 +8133,13 @@ class BlueprintWorkspace(QWidget):
 
     def _active_viewer_preview_needs_refresh(self) -> bool:
         revision = self._viewer_preview_revision
+        ambient_occlusion_override_active = (
+            self.texture_atlas_workspace.is_ambient_occlusion_preview_active
+        )
         return bool(
             (
                 self._canvas_viewer_preview_is_active()
+                and not ambient_occlusion_override_active
                 and self._canvas_viewer_preview_revision != revision
             )
             or (
@@ -6728,9 +8158,7 @@ class BlueprintWorkspace(QWidget):
 
         if not isinstance(generated_model, GeneratedModel):
             raise TypeError("Canvas previews require a GeneratedModel.")
-        current_dependency_signature = (
-            self._build_viewer_preview_dependency_signature()
-        )
+        current_dependency_signature = self._build_viewer_preview_dependency_signature()
         if current_dependency_signature != validated_dependency_signature:
             return False
         revision = self._viewer_preview_revision
@@ -6738,7 +8166,11 @@ class BlueprintWorkspace(QWidget):
         self._viewer_preview_model_revision = revision
         self._viewer_preview_dependency_signature = current_dependency_signature
         self._viewer_preview_dependency_signature_revision = revision
-        self._canvas_viewer_preview_revision = revision
+        self._canvas_viewer_preview_revision = (
+            -1
+            if self.texture_atlas_workspace.is_ambient_occlusion_preview_active
+            else revision
+        )
         self._scheduled_viewer_refresh_preserve_camera = True
         if self._pending_level_transform is not None:
             self._refresh_pending_level_transform_outline()
@@ -6822,10 +8254,7 @@ class BlueprintWorkspace(QWidget):
             target_count += 1
             if item_after[1] != placement:
                 return False
-            if (
-                item_before[:1] + item_before[2:]
-                != item_after[:1] + item_after[2:]
-            ):
+            if item_before[:1] + item_before[2:] != item_after[:1] + item_after[2:]:
                 return False
         return target_count == 1
 
@@ -6835,15 +8264,11 @@ class BlueprintWorkspace(QWidget):
     ) -> tuple[GeneratedModel, tuple[object, ...]] | None:
         """Build once and reject a model assembled across file revisions."""
 
-        dependency_signature_before = (
-            self._build_viewer_preview_dependency_signature()
-        )
+        dependency_signature_before = self._build_viewer_preview_dependency_signature()
         generated_model = builder()
         if generated_model is None:
             return None
-        dependency_signature_after = (
-            self._build_viewer_preview_dependency_signature()
-        )
+        dependency_signature_after = self._build_viewer_preview_dependency_signature()
         if dependency_signature_before != dependency_signature_after:
             raise RuntimeError(
                 "Preview inputs changed while the model was being built. "
@@ -6862,9 +8287,7 @@ class BlueprintWorkspace(QWidget):
             != self._viewer_preview_revision
         ):
             return
-        dependency_signature = (
-            self._build_viewer_preview_dependency_signature()
-        )
+        dependency_signature = self._build_viewer_preview_dependency_signature()
         if dependency_signature == self._viewer_preview_dependency_signature:
             return
         self._mark_viewer_preview_dirty(preserve_camera=preserve_camera)
@@ -6890,8 +8313,7 @@ class BlueprintWorkspace(QWidget):
         """Make every rendered structural snapshot match the project."""
 
         self._viewer_doorways_by_level_index = {
-            level.index: self._copy_doorways(level.doorways)
-            for level in self.levels
+            level.index: self._copy_doorways(level.doorways) for level in self.levels
         }
         self._reset_viewer_window_snapshots()
         self._reset_viewer_floor_thickness_snapshots()
@@ -6900,16 +8322,14 @@ class BlueprintWorkspace(QWidget):
         """Make every rendered window snapshot match the loaded project."""
 
         self._viewer_windows_by_level_index = {
-            level.index: self._copy_windows(level.windows)
-            for level in self.levels
+            level.index: self._copy_windows(level.windows) for level in self.levels
         }
 
     def _reset_viewer_floor_thickness_snapshots(self) -> None:
         """Make rendered floor thicknesses match authoritative level data."""
 
         self._viewer_floor_thickness_by_level_index = {
-            level.index: float(level.floor_thickness_meters)
-            for level in self.levels
+            level.index: float(level.floor_thickness_meters) for level in self.levels
         }
 
     def _commit_viewer_floor_thickness_snapshot(self) -> None:
@@ -6920,11 +8340,7 @@ class BlueprintWorkspace(QWidget):
         if level_index is None:
             return
         level = next(
-            (
-                candidate
-                for candidate in self.levels
-                if candidate.index == level_index
-            ),
+            (candidate for candidate in self.levels if candidate.index == level_index),
             None,
         )
         if level is None:
@@ -6958,24 +8374,16 @@ class BlueprintWorkspace(QWidget):
 
         preview_levels: list[LevelData] = []
         for level in self.levels:
-            doorway_snapshot = self._viewer_doorways_by_level_index.get(
-                level.index
-            )
+            doorway_snapshot = self._viewer_doorways_by_level_index.get(level.index)
             if doorway_snapshot is None:
                 doorway_snapshot = self._copy_doorways(level.doorways)
-                self._viewer_doorways_by_level_index[level.index] = (
-                    doorway_snapshot
-                )
-            window_snapshot = self._viewer_windows_by_level_index.get(
-                level.index
-            )
+                self._viewer_doorways_by_level_index[level.index] = doorway_snapshot
+            window_snapshot = self._viewer_windows_by_level_index.get(level.index)
             if window_snapshot is None:
                 window_snapshot = self._copy_windows(level.windows)
-                self._viewer_windows_by_level_index[level.index] = (
-                    window_snapshot
-                )
-            floor_thickness = (
-                self._viewer_floor_thickness_by_level_index.get(level.index)
+                self._viewer_windows_by_level_index[level.index] = window_snapshot
+            floor_thickness = self._viewer_floor_thickness_by_level_index.get(
+                level.index
             )
             if floor_thickness is None:
                 floor_thickness = float(level.floor_thickness_meters)
@@ -7050,20 +8458,13 @@ class BlueprintWorkspace(QWidget):
                     self._viewer_doorways_by_level_index.get(level.index)
                     != next_doorways
                 ):
-                    self._viewer_doorways_by_level_index[level.index] = (
-                        next_doorways
-                    )
+                    self._viewer_doorways_by_level_index[level.index] = next_doorways
                     self._staged_canvas_opening_mesh_update = True
                     self._staged_doorway_mesh_update = True
             if level.index == window_level_index:
                 next_windows = self._copy_windows(level.windows)
-                if (
-                    self._viewer_windows_by_level_index.get(level.index)
-                    != next_windows
-                ):
-                    self._viewer_windows_by_level_index[level.index] = (
-                        next_windows
-                    )
+                if self._viewer_windows_by_level_index.get(level.index) != next_windows:
+                    self._viewer_windows_by_level_index[level.index] = next_windows
                     self._staged_canvas_opening_mesh_update = True
 
     def _cancel_pending_doorway_mesh_update(
@@ -7122,48 +8523,47 @@ class BlueprintWorkspace(QWidget):
         failure_title: str | None,
     ) -> GeneratedModel | None:
         try:
-            base_model = convert_to_glb(
-                self.levels,
-                stairs=self.stairs,
-                surface_materials=(
-                    self.surface_texture_generation.get_surface_material_sources()
-                ),
-                export_untextured_surfaces=False,
-            )
-            placed_models = self._build_placed_generated_models()
-            generated_model = (
-                base_model
-                if not placed_models
-                else compose_placed_generated_models(
-                    base_model,
-                    placed_models,
-                )
-            )
-            surface_source_ids = self._build_atlas_surface_source_ids()
-            required_source_ids = tuple(
-                dict.fromkeys(
-                    (
-                        *(placement.object_id for placement in placed_models),
-                        *surface_source_ids.values(),
-                    )
-                )
-            )
-            materialized_atlases = (
-                self.texture_atlas_workspace.prepare_export_atlases(
-                    required_source_ids
-                )
+            pre_atlas_scene = self._build_pre_atlas_export_scene()
+            materialized_atlases = self.texture_atlas_workspace.prepare_export_atlases(
+                pre_atlas_scene.required_source_ids
             )
             if not materialized_atlases:
-                return generated_model
+                return pre_atlas_scene.model
             return apply_texture_atlases_to_export(
-                generated_model,
+                pre_atlas_scene.model,
                 materialized_atlases,
-                surface_source_ids=surface_source_ids,
+                surface_source_ids=pre_atlas_scene.surface_source_ids,
             )
         except (OSError, TypeError, ValueError) as error:
             if failure_title is not None:
                 QMessageBox.warning(self, failure_title, str(error))
             return None
+
+    def _build_pre_atlas_export_scene(self) -> _PreAtlasExportScene:
+        """Build the exact shared geometry snapshot used by Atlas export."""
+
+        base_model = convert_to_glb(
+            self.levels,
+            stairs=self.stairs,
+            surface_materials=(
+                self.surface_texture_generation.get_surface_material_sources()
+            ),
+            export_untextured_surfaces=False,
+        )
+        placed_models = self._build_placed_generated_models()
+        generated_model = (
+            base_model
+            if not placed_models
+            else compose_placed_generated_models(
+                base_model,
+                placed_models,
+            )
+        )
+        return _PreAtlasExportScene(
+            model=generated_model,
+            placed_models=placed_models,
+            surface_source_ids=self._build_atlas_surface_source_ids(),
+        )
 
     def _build_atlas_surface_source_ids(self) -> dict[str, str]:
         """Map each assigned architectural surface to its Atlas source ID."""
@@ -7171,9 +8571,7 @@ class BlueprintWorkspace(QWidget):
         source_ids: dict[str, str] = {}
         generated_object_ids = set(self.generation.get_generated_object_ids())
         for assignment in self.surface_texture_generation.get_assignments():
-            source_id = build_atlas_wall_texture_source_id(
-                assignment.assignment_id
-            )
+            source_id = build_atlas_wall_texture_source_id(assignment.assignment_id)
             if source_id in generated_object_ids:
                 continue
             for surface_id in assignment.surface_ids:
@@ -7212,9 +8610,7 @@ class BlueprintWorkspace(QWidget):
         """Resolve persisted Canvas clicks into current world positions."""
 
         visible_level_by_index = {
-            level.index: level
-            for level in self.levels
-            if level.include_in_export
+            level.index: level for level in self.levels if level.include_in_export
         }
         if not visible_level_by_index:
             return ()
@@ -7236,14 +8632,15 @@ class BlueprintWorkspace(QWidget):
                     record.object_id
                 ):
                     continue
-                raise ValueError(
-                    f"Placed object '{getattr(record, 'object_name', record.object_id)}' "
-                    "is temporarily "
-                    "unavailable."
+                object_name = getattr(
+                    record,
+                    "object_name",
+                    record.object_id,
                 )
-            symmetry = self.generation.resolve_symmetric_division_for_record(
-                record
-            )
+                raise ValueError(
+                    f"Placed object '{object_name}' is temporarily unavailable."
+                )
+            symmetry = self.generation.resolve_symmetric_division_for_record(record)
             world_x, world_y = level_image_to_world_xy(
                 level,
                 placement.image_x,
@@ -7287,8 +8684,12 @@ class BlueprintWorkspace(QWidget):
         ):
             return
         revision = self._viewer_preview_revision
+        ambient_occlusion_override_active = (
+            self.texture_atlas_workspace.is_ambient_occlusion_preview_active
+        )
         canvas_is_stale = bool(
             self._canvas_viewer_preview_is_active()
+            and not ambient_occlusion_override_active
             and self._canvas_viewer_preview_revision != revision
         )
         surface_is_stale = bool(
@@ -7313,9 +8714,7 @@ class BlueprintWorkspace(QWidget):
                 return
             self._viewer_preview_model = next_model
             self._viewer_preview_model_revision = revision
-            self._viewer_preview_dependency_signature = (
-                dependency_signature_after
-            )
+            self._viewer_preview_dependency_signature = dependency_signature_after
             self._viewer_preview_dependency_signature_revision = revision
         generated_model = self._viewer_preview_model
 
@@ -7358,14 +8757,20 @@ class BlueprintWorkspace(QWidget):
     def _mark_viewer_preview_dirty(
         self,
         preserve_camera: bool = True,
+        *,
+        affects_draw_call_estimate: bool = True,
     ) -> int:
         """Invalidate shared preview data and retain future camera intent."""
 
         self._viewer_preview_revision += 1
         self._scheduled_viewer_refresh_preserve_camera = bool(
-            self._scheduled_viewer_refresh_preserve_camera
-            and preserve_camera
+            self._scheduled_viewer_refresh_preserve_camera and preserve_camera
         )
+        if hasattr(self, "texture_atlas_workspace"):
+            self._schedule_surface_ambient_occlusion_preview_refresh()
+            if affects_draw_call_estimate:
+                self._atlas_draw_call_scene_revision += 1
+                self._schedule_atlas_draw_call_estimate()
         return self._viewer_preview_revision
 
     def _queue_viewer_preview_refresh(self) -> None:
@@ -7398,20 +8803,16 @@ class BlueprintWorkspace(QWidget):
 
         if not self._viewer_preview_is_active():
             return
-        self._refresh_blueprint_file_dependencies(
-            include_exported_levels=True
-        )
+        self._refresh_blueprint_file_dependencies(include_exported_levels=True)
         self._invalidate_viewer_preview_for_dependency_changes(
             preserve_camera=preserve_camera
         )
         if (
             self._canvas_viewer_preview_is_active()
-            and self._canvas_viewer_preview_revision
-            != self._viewer_preview_revision
+            and self._canvas_viewer_preview_revision != self._viewer_preview_revision
         ):
             self._scheduled_viewer_refresh_preserve_camera = bool(
-                self._scheduled_viewer_refresh_preserve_camera
-                and preserve_camera
+                self._scheduled_viewer_refresh_preserve_camera and preserve_camera
             )
         self._queue_viewer_preview_refresh()
 
@@ -7460,9 +8861,7 @@ class BlueprintWorkspace(QWidget):
                 image_library_paths=self.image_library_paths,
                 doorway_presets=self.doorway_presets,
                 generation=self.generation.get_data(),
-                surface_texture_generation=(
-                    self.surface_texture_generation.get_data()
-                ),
+                surface_texture_generation=(self.surface_texture_generation.get_data()),
                 texture_atlases=self.texture_atlas_workspace.get_data(),
                 stairs=self.stairs,
                 wall_mirror_links=self.wall_mirror_links,
@@ -7472,7 +8871,11 @@ class BlueprintWorkspace(QWidget):
             return
 
         self._remember_project_path(file_path)
-        QMessageBox.information(self, "Project saved", f"Saved project to:\n{file_path}")
+        QMessageBox.information(
+            self,
+            "Project saved",
+            f"Saved project to:\n{file_path}",
+        )
 
     def _handle_load_clicked(self) -> None:
         if (
@@ -7569,9 +8972,7 @@ class BlueprintWorkspace(QWidget):
         )
         for level_position in ordered_positions:
             level = self.levels[level_position]
-            self.levels_list.addItem(
-                self._build_level_item(level, level_position)
-            )
+            self.levels_list.addItem(self._build_level_item(level, level_position))
         self.levels_list.setCurrentRow(
             self._level_list_row_for_position(self.current_level_index)
         )
@@ -7586,9 +8987,7 @@ class BlueprintWorkspace(QWidget):
         item.setData(LEVEL_POSITION_ITEM_ROLE, level_position)
         if level.index == GROUND_LEVEL_INDEX:
             item.setBackground(
-                _build_ground_level_background_color(
-                    self.levels_list.palette()
-                )
+                _build_ground_level_background_color(self.levels_list.palette())
             )
         return item
 
@@ -7609,9 +9008,7 @@ class BlueprintWorkspace(QWidget):
         self.doorway_preset_list.blockSignals(True)
         self.doorway_preset_list.clear()
         for preset in self.doorway_presets:
-            self.doorway_preset_list.addItem(
-                _format_doorway_preset_label(preset)
-            )
+            self.doorway_preset_list.addItem(_format_doorway_preset_label(preset))
 
         if 0 <= selected_index < self.doorway_preset_list.count():
             self.doorway_preset_list.setCurrentRow(selected_index)
@@ -7620,9 +9017,7 @@ class BlueprintWorkspace(QWidget):
 
     def _update_stair_button_state(self) -> None:
         placement_active = self.canvas.is_stair_placement_active()
-        has_complete_endpoints = (
-            self.canvas.get_stair_placement_draft() is not None
-        )
+        has_complete_endpoints = self.canvas.get_stair_placement_draft() is not None
         self.add_stairs_button.setText(
             "Confirm stairs" if has_complete_endpoints else "Add stairs"
         )
@@ -7677,34 +9072,25 @@ class BlueprintWorkspace(QWidget):
         )
         self._is_syncing_level_controls = True
         self.height_level_spinbox.setValue(self.current_level.height_meters)
-        self.floor_thickness_spinbox.setValue(
-            self.current_level.floor_thickness_meters
-        )
-        self.level_scale_slider.setValue(
-            round(level_scale * LEVEL_SCALE_SLIDER_FACTOR)
-        )
+        self.floor_thickness_spinbox.setValue(self.current_level.floor_thickness_meters)
+        self.level_scale_slider.setValue(round(level_scale * LEVEL_SCALE_SLIDER_FACTOR))
         self._update_level_scale_value_label(level_scale)
         self.canvas_level_scale_slider.setValue(
             round(
-                self.current_level.canvas_level_scale
-                * CANVAS_LEVEL_SCALE_SLIDER_FACTOR
+                self.current_level.canvas_level_scale * CANVAS_LEVEL_SCALE_SLIDER_FACTOR
             )
         )
         self._update_canvas_level_scale_value_label(
             self.current_level.canvas_level_scale
         )
-        level_x_slider_value = round(
-            level_offset_x * LEVEL_OFFSET_SLIDER_FACTOR
-        )
+        level_x_slider_value = round(level_offset_x * LEVEL_OFFSET_SLIDER_FACTOR)
         self._fit_slider_range_to_value(
             self.level_x_offset_slider,
             level_x_slider_value,
         )
         self.level_x_offset_slider.setValue(level_x_slider_value)
         self._update_level_x_offset_value_label(level_offset_x)
-        level_y_slider_value = round(
-            level_offset_y * LEVEL_OFFSET_SLIDER_FACTOR
-        )
+        level_y_slider_value = round(level_offset_y * LEVEL_OFFSET_SLIDER_FACTOR)
         self._fit_slider_range_to_value(
             self.level_y_offset_slider,
             level_y_slider_value,
@@ -7712,8 +9098,7 @@ class BlueprintWorkspace(QWidget):
         self.level_y_offset_slider.setValue(level_y_slider_value)
         self._update_level_y_offset_value_label(level_offset_y)
         canvas_x_slider_value = round(
-            self.current_level.canvas_offset_x_pixels
-            * CANVAS_OFFSET_SLIDER_FACTOR
+            self.current_level.canvas_offset_x_pixels * CANVAS_OFFSET_SLIDER_FACTOR
         )
         self._fit_slider_range_to_value(
             self.canvas_x_offset_slider,
@@ -7724,8 +9109,7 @@ class BlueprintWorkspace(QWidget):
             self.current_level.canvas_offset_x_pixels
         )
         canvas_y_slider_value = round(
-            self.current_level.canvas_offset_y_pixels
-            * CANVAS_OFFSET_SLIDER_FACTOR
+            self.current_level.canvas_offset_y_pixels * CANVAS_OFFSET_SLIDER_FACTOR
         )
         self._fit_slider_range_to_value(
             self.canvas_y_offset_slider,
@@ -7737,9 +9121,7 @@ class BlueprintWorkspace(QWidget):
         )
         self.include_yes_radio.setChecked(self.current_level.include_in_export)
         self.include_no_radio.setChecked(not self.current_level.include_in_export)
-        current_level_row = self._level_list_row_for_position(
-            self.current_level_index
-        )
+        current_level_row = self._level_list_row_for_position(self.current_level_index)
         if self.levels_list.currentRow() != current_level_row:
             self.levels_list.setCurrentRow(current_level_row)
         self._update_blueprint_name_label()
@@ -7790,9 +9172,7 @@ class BlueprintWorkspace(QWidget):
         if next_value == self.current_level.height_meters:
             return
         self._record_canvas_undo_state(
-            self._capture_canvas_level_properties_undo_state(
-                self.current_level
-            )
+            self._capture_canvas_level_properties_undo_state(self.current_level)
         )
         self.current_level.height_meters = next_value
         self._schedule_viewer_preview_refresh()
@@ -7948,10 +9328,7 @@ class BlueprintWorkspace(QWidget):
         needs_comparison = not self._level_transform_drag_active
         self._handle_level_transform_drag_started()
         slider.setValue(slider.value() + direction * slider.singleStep())
-        if (
-            needs_comparison
-            or self.canvas.get_level_comparison_overlay() is None
-        ):
+        if needs_comparison or self.canvas.get_level_comparison_overlay() is None:
             self.canvas.set_level_comparison_overlay(
                 self._get_canvas_transform_comparison_level()
             )
@@ -8165,9 +9542,7 @@ class BlueprintWorkspace(QWidget):
             self.canvas.update()
         self._sync_canvas_wall_mirror_state()
         self._schedule_viewer_preview_refresh(preserve_camera=True)
-        self._level_transform_outline_commit_revision = (
-            self._viewer_preview_revision
-        )
+        self._level_transform_outline_commit_revision = self._viewer_preview_revision
         return True
 
     def _clear_committed_level_transform_outline_if_displayed(self) -> None:
@@ -8203,9 +9578,7 @@ class BlueprintWorkspace(QWidget):
         self._commit_pending_canvas_surface_mesh_update()
         self._canvas_transform_drag_active = True
         self._canvas_transform_drag_undo_state = (
-            self._capture_canvas_level_properties_undo_state(
-                self.current_level
-            )
+            self._capture_canvas_level_properties_undo_state(self.current_level)
         )
         self.canvas.set_level_comparison_overlay(
             self._get_canvas_transform_comparison_level()
@@ -8254,9 +9627,7 @@ class BlueprintWorkspace(QWidget):
             return
         if not self._canvas_transform_drag_active:
             self._record_canvas_undo_state(
-                self._capture_canvas_level_properties_undo_state(
-                    self.current_level
-                )
+                self._capture_canvas_level_properties_undo_state(self.current_level)
             )
         self.current_level.canvas_level_scale = next_value
         self.canvas.set_canvas_level_scale(next_value)
@@ -8274,9 +9645,7 @@ class BlueprintWorkspace(QWidget):
             return
         if not self._canvas_transform_drag_active:
             self._record_canvas_undo_state(
-                self._capture_canvas_level_properties_undo_state(
-                    self.current_level
-                )
+                self._capture_canvas_level_properties_undo_state(self.current_level)
             )
         self.current_level.canvas_offset_x_pixels = next_value
         self.canvas.set_canvas_level_offsets(
@@ -8297,9 +9666,7 @@ class BlueprintWorkspace(QWidget):
             return
         if not self._canvas_transform_drag_active:
             self._record_canvas_undo_state(
-                self._capture_canvas_level_properties_undo_state(
-                    self.current_level
-                )
+                self._capture_canvas_level_properties_undo_state(self.current_level)
             )
         self.current_level.canvas_offset_y_pixels = next_value
         self.canvas.set_canvas_level_offsets(
@@ -8354,11 +9721,7 @@ class BlueprintWorkspace(QWidget):
             else current_index - 1
         )
         return next(
-            (
-                level
-                for level in self.levels
-                if level.index == comparison_index
-            ),
+            (level for level in self.levels if level.index == comparison_index),
             None,
         )
 
@@ -8404,9 +9767,7 @@ class BlueprintWorkspace(QWidget):
                 arch_amount=doorway.arch_amount,
             )
         )
-        self._refresh_doorway_preset_list(
-            selected_index=len(self.doorway_presets) - 1
-        )
+        self._refresh_doorway_preset_list(selected_index=len(self.doorway_presets) - 1)
 
     def _handle_remove_doorway_preset_clicked(self) -> None:
         selected_index = self.doorway_preset_list.currentRow()
@@ -8419,9 +9780,7 @@ class BlueprintWorkspace(QWidget):
 
         del self.doorway_presets[selected_index]
         next_selected_index = min(selected_index, len(self.doorway_presets) - 1)
-        self._refresh_doorway_preset_list(
-            selected_index=next_selected_index
-        )
+        self._refresh_doorway_preset_list(selected_index=next_selected_index)
 
     def _handle_place_selected_doorway_clicked(self) -> None:
         doorway_preset = self._get_selected_doorway_preset()
@@ -8520,8 +9879,7 @@ class BlueprintWorkspace(QWidget):
 
         return _CanvasWallMirrorUndoState(
             vertex_data_by_level=tuple(
-                (level.index, level.vertex_data.clone())
-                for level in self.levels
+                (level.index, level.vertex_data.clone()) for level in self.levels
             ),
             wall_mirror_links=self.wall_mirror_links,
             selected_level_index=self.current_level.index,
@@ -8588,8 +9946,7 @@ class BlueprintWorkspace(QWidget):
 
         vertex_data = self.current_level.vertex_data
         room_center_vertex_ids = {
-            room.center_vertex_id
-            for room in self.current_level.rooms
+            room.center_vertex_id for room in self.current_level.rooms
         }
         wall_vertex_ids = {
             vertex_id
@@ -8634,11 +9991,7 @@ class BlueprintWorkspace(QWidget):
         """Resolve a persistent level by elevation index, never list row."""
 
         return next(
-            (
-                level
-                for level in self.levels
-                if level.index == level_index
-            ),
+            (level for level in self.levels if level.index == level_index),
             None,
         )
 
@@ -8672,9 +10025,7 @@ class BlueprintWorkspace(QWidget):
             else None
         )
         blocker = QSignalBlocker(self.selected_doorway_arch_checkbox)
-        amount_blocker = QSignalBlocker(
-            self.selected_doorway_arch_amount_spinbox
-        )
+        amount_blocker = QSignalBlocker(self.selected_doorway_arch_amount_spinbox)
         arch_is_selected = bool(
             doorway is not None and doorway.shape == DOORWAY_SHAPE_ARCH
         )
@@ -8696,11 +10047,7 @@ class BlueprintWorkspace(QWidget):
     def _handle_selected_doorway_arch_toggled(self, enabled: bool) -> None:
         """Turn the selected doorway arch profile on or off."""
 
-        shape = (
-            DOORWAY_SHAPE_ARCH
-            if enabled
-            else DOORWAY_SHAPE_RECTANGULAR
-        )
+        shape = DOORWAY_SHAPE_ARCH if enabled else DOORWAY_SHAPE_RECTANGULAR
         self.canvas.set_selected_doorway_shape(shape)
         self._handle_canvas_doorway_selection_changed(
             -1
@@ -8714,9 +10061,7 @@ class BlueprintWorkspace(QWidget):
     ) -> None:
         """Preview a normalized arch amount for the selected doorway."""
 
-        if self.canvas.set_selected_doorway_arch_amount(
-            arch_amount_percent / 100.0
-        ):
+        if self.canvas.set_selected_doorway_arch_amount(arch_amount_percent / 100.0):
             return
         self._handle_canvas_doorway_selection_changed(
             -1
@@ -8731,17 +10076,13 @@ class BlueprintWorkspace(QWidget):
         self.current_level.doorways = self.canvas.doorways
         next_snapshot = self._copy_doorways(self.current_level.doorways)
         snapshot_changed = bool(
-            self._viewer_doorways_by_level_index.get(
-                self.current_level.index
-            )
+            self._viewer_doorways_by_level_index.get(self.current_level.index)
             != next_snapshot
         )
         self._cancel_pending_doorway_mesh_update(clear_outline=True)
         if not snapshot_changed:
             return
-        self._viewer_doorways_by_level_index[self.current_level.index] = (
-            next_snapshot
-        )
+        self._viewer_doorways_by_level_index[self.current_level.index] = next_snapshot
         self._schedule_viewer_preview_refresh()
 
     def _handle_doorway_move_drag_started(self) -> None:
@@ -8767,14 +10108,10 @@ class BlueprintWorkspace(QWidget):
 
         self.current_level.doorways = self.canvas.doorways
         level = self.current_level
-        committed_doorways = self._viewer_doorways_by_level_index.get(
-            level.index
-        )
+        committed_doorways = self._viewer_doorways_by_level_index.get(level.index)
         if committed_doorways is None:
             committed_doorways = self._copy_doorways(level.doorways)
-            self._viewer_doorways_by_level_index[level.index] = (
-                committed_doorways
-            )
+            self._viewer_doorways_by_level_index[level.index] = committed_doorways
 
         if self._copy_doorways(level.doorways) == committed_doorways:
             self._doorway_mesh_update_timer.stop()
@@ -8782,9 +10119,7 @@ class BlueprintWorkspace(QWidget):
             doorway_key_prefix = f"doorway:{level.index}:"
             if (
                 self._pending_canvas_opening_key is not None
-                and self._pending_canvas_opening_key.startswith(
-                    doorway_key_prefix
-                )
+                and self._pending_canvas_opening_key.startswith(doorway_key_prefix)
             ):
                 self._pending_canvas_opening_key = None
             self._clear_committed_doorway_outline_if_displayed()
@@ -8802,10 +10137,7 @@ class BlueprintWorkspace(QWidget):
             return
 
         pending_level_index = self._pending_doorway_mesh_level_index
-        if (
-            pending_level_index is not None
-            and pending_level_index != level.index
-        ):
+        if pending_level_index is not None and pending_level_index != level.index:
             self._commit_pending_doorway_mesh_update()
 
         doorway = level.doorways[selected_index]
@@ -8821,9 +10153,7 @@ class BlueprintWorkspace(QWidget):
             self.viewer.set_doorway_preview_outline(outline_positions)
 
         self._pending_doorway_mesh_level_index = level.index
-        self._pending_canvas_opening_key = (
-            f"doorway:{level.index}:{selected_index}"
-        )
+        self._pending_canvas_opening_key = f"doorway:{level.index}:{selected_index}"
         if self._is_doorway_move_drag_active:
             self._doorway_mesh_update_timer.stop()
         else:
@@ -8837,9 +10167,7 @@ class BlueprintWorkspace(QWidget):
                     stair = _build_stair_data_from_placement(draft)
                     build_stair_meshes(self.levels, [stair])
                 except (TypeError, ValueError) as error:
-                    self.stair_status_label.setText(
-                        f"Stair not added: {error}"
-                    )
+                    self.stair_status_label.setText(f"Stair not added: {error}")
                     return
             self.canvas.confirm_stair_placement()
             return
@@ -8892,9 +10220,7 @@ class BlueprintWorkspace(QWidget):
         self._update_stair_button_state()
 
     def _handle_stair_placement_ready(self, placement: object) -> None:
-        intermediate_count = len(
-            _get_stair_intermediate_section_payloads(placement)
-        )
+        intermediate_count = len(_get_stair_intermediate_section_payloads(placement))
         guide_text = (
             "No curve guides added yet."
             if intermediate_count == 0
@@ -9004,8 +10330,7 @@ class BlueprintWorkspace(QWidget):
 
         if self.canvas.blueprint_image is None:
             self.stair_status_label.setText(
-                "Load a blueprint image on this level before placing the "
-                "stair end."
+                "Load a blueprint image on this level before placing the stair end."
             )
             return
 
@@ -9050,9 +10375,7 @@ class BlueprintWorkspace(QWidget):
         )
         self.generation.set_runtime_settings(settings)
         self.surface_texture_generation.set_runtime_settings(settings)
-        self._apply_fullscreen_3d_viewer_screen(
-            settings.fullscreen_3d_viewer_screen_id
-        )
+        self._apply_fullscreen_3d_viewer_screen(settings.fullscreen_3d_viewer_screen_id)
         self._apply_jobs_window_screen(settings.jobs_window_screen_id)
         self._apply_atlas_display_screen(settings.atlas_display_screen_id)
         self._refresh_scene_atlas_texture_requirements()
@@ -9126,9 +10449,7 @@ class BlueprintWorkspace(QWidget):
         if next_value == self.current_level.include_in_export:
             return
         self._record_canvas_undo_state(
-            self._capture_canvas_level_properties_undo_state(
-                self.current_level
-            )
+            self._capture_canvas_level_properties_undo_state(self.current_level)
         )
         self.current_level.include_in_export = next_value
         self._refresh_scene_atlas_texture_requirements()
@@ -9141,9 +10462,7 @@ class BlueprintWorkspace(QWidget):
             image_library_paths=project_data.image_library_paths,
             doorway_presets=project_data.doorway_presets,
             generation=project_data.generation,
-            surface_texture_generation=(
-                project_data.surface_texture_generation
-            ),
+            surface_texture_generation=(project_data.surface_texture_generation),
             texture_atlases=project_data.texture_atlases,
             stairs=project_data.stairs,
             wall_mirror_links=project_data.wall_mirror_links,
@@ -9169,6 +10488,14 @@ class BlueprintWorkspace(QWidget):
                 "Wait for the current generation request to finish before "
                 "loading another project."
             )
+
+        # Manual loading and startup restoration both reach this shared state
+        # boundary. Finish retiring workers while the old scene and Atlas data
+        # are still intact, so a queued completion cannot commit into the
+        # incoming project.
+        self._cancel_and_join_atlas_draw_call_estimates()
+        self._cancel_and_join_surface_ambient_occlusion_previews()
+        self._cancel_and_join_surface_ambient_occlusion_bakes()
 
         self._is_doorway_move_drag_active = False
         self._level_transform_drag_active = False
@@ -9211,16 +10538,17 @@ class BlueprintWorkspace(QWidget):
             self.doorway_presets = (
                 list(doorway_presets) or create_default_doorway_presets()
             )
-        self.current_level_index = min(max(current_level_index, 0), len(self.levels) - 1)
+        self.current_level_index = min(
+            max(current_level_index, 0),
+            len(self.levels) - 1,
+        )
         self._refresh_doorway_preset_list(
             selected_index=0 if self.doorway_presets else -1
         )
         self._refresh_levels_list()
         self._update_stair_button_state()
         self.stair_status_label.setText(
-            "Stairs: none"
-            if not self.stairs
-            else f"Stairs: {len(self.stairs)} loaded."
+            "Stairs: none" if not self.stairs else f"Stairs: {len(self.stairs)} loaded."
         )
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
@@ -9235,9 +10563,7 @@ class BlueprintWorkspace(QWidget):
         self.generation.set_data(generation)
         self.texture_atlas_workspace.set_data(texture_atlases)
         self.surface_texture_generation.set_levels(self.levels)
-        self.surface_texture_generation.set_data(
-            surface_texture_generation
-        )
+        self.surface_texture_generation.set_data(surface_texture_generation)
         self.surface_texture_generation.reconcile_assignments_with_levels(
             self.levels,
             emit_signals=False,
@@ -9252,6 +10578,8 @@ class BlueprintWorkspace(QWidget):
         self._sync_atlas_object_texture_sources()
         self.texture_atlas_workspace.materialize_missing_atlases()
         self._schedule_viewer_preview_refresh()
+        if self.texture_atlas_workspace.is_ambient_occlusion_preview_active:
+            self._refresh_surface_ambient_occlusion_preview()
 
     def _set_current_level_image(self, file_path: str) -> None:
         self._finish_level_transform_drag()
@@ -9269,12 +10597,8 @@ class BlueprintWorkspace(QWidget):
             windows=self.current_level.windows,
             open_spaces=self.current_level.open_spaces,
             canvas_level_scale=self.current_level.canvas_level_scale,
-            canvas_offset_x_pixels=(
-                self.current_level.canvas_offset_x_pixels
-            ),
-            canvas_offset_y_pixels=(
-                self.current_level.canvas_offset_y_pixels
-            ),
+            canvas_offset_x_pixels=(self.current_level.canvas_offset_x_pixels),
+            canvas_offset_y_pixels=(self.current_level.canvas_offset_y_pixels),
         )
         self._clear_canvas_undo_history()
         self.current_level.image_path = normalized_path
@@ -9303,12 +10627,8 @@ class BlueprintWorkspace(QWidget):
             open_spaces=self.current_level.open_spaces,
             image_path=self.current_level.image_path,
             canvas_level_scale=self.current_level.canvas_level_scale,
-            canvas_offset_x_pixels=(
-                self.current_level.canvas_offset_x_pixels
-            ),
-            canvas_offset_y_pixels=(
-                self.current_level.canvas_offset_y_pixels
-            ),
+            canvas_offset_x_pixels=(self.current_level.canvas_offset_x_pixels),
+            canvas_offset_y_pixels=(self.current_level.canvas_offset_y_pixels),
         )
         if self.canvas.blueprint_image is not None:
             self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
@@ -9444,9 +10764,7 @@ def _get_stair_intermediate_section_payloads(
     try:
         return tuple(value)
     except TypeError as error:
-        raise ValueError(
-            "Stair intermediate sections must be a sequence."
-        ) from error
+        raise ValueError("Stair intermediate sections must be a sequence.") from error
 
 
 def _build_stair_section_data(section: object) -> StairSectionData:
@@ -9470,9 +10788,7 @@ def _build_stair_data_from_placement(placement: object) -> StairData:
         start_level_index=int(
             _get_stair_placement_value(placement, "start_level_index")
         ),
-        end_level_index=int(
-            _get_stair_placement_value(placement, "end_level_index")
-        ),
+        end_level_index=int(_get_stair_placement_value(placement, "end_level_index")),
         start_a_x=float(_get_stair_placement_value(placement, "start_a_x")),
         start_a_y=float(_get_stair_placement_value(placement, "start_a_y")),
         start_b_x=float(_get_stair_placement_value(placement, "start_b_x")),
@@ -9507,8 +10823,7 @@ def _build_stair_data_from_placement(placement: object) -> StairData:
 
 def _format_doorway_preset_label(doorway_preset: DoorwayPreset) -> str:
     dimension_text = (
-        f"{doorway_preset.width_meters:.2f} m × "
-        f"{doorway_preset.height_meters:.2f} m"
+        f"{doorway_preset.width_meters:.2f} m × {doorway_preset.height_meters:.2f} m"
     )
     if doorway_preset.shape != DOORWAY_SHAPE_ARCH:
         return dimension_text

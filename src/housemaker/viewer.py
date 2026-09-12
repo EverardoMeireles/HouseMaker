@@ -4796,11 +4796,24 @@ class GlbViewerWidget(QWidget):
         self._clear_symmetric_preview()
         self._last_set_model_preserved_camera = bool(preserve_camera)
         camera_state = self._capture_camera_state() if preserve_camera else None
+        first_person_pose = (
+            self.get_first_person_camera_pose() if preserve_camera else None
+        )
+        first_person_pose_was_custom = bool(
+            preserve_camera and self.view.has_custom_first_person_camera_pose
+        )
         self._texture_edit_mask = None
         self.model = model
         self._populate_scene()
         if camera_state is not None:
             self._restore_camera_state(camera_state)
+            assert first_person_pose is not None
+            if first_person_pose_was_custom:
+                self.set_first_person_camera_pose(first_person_pose)
+            else:
+                self.view.set_default_first_person_camera_pose(
+                    first_person_pose
+                )
             self._refresh_canvas_surface_edit_gizmo_items()
             self._refresh_canvas_face_extrusion_gizmo_items()
         if self._window_editing_enabled:

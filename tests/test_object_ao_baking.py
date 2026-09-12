@@ -10,6 +10,7 @@ from trimesh.visual.texture import TextureVisuals
 
 from housemaker import object_ao_baking
 from housemaker.object_ao_baking import (
+    ObjectAmbientOcclusionBakeCancelled,
     ObjectAmbientOcclusionTarget,
     bake_placed_object_ambient_occlusion,
 )
@@ -106,6 +107,50 @@ def _uv_mapped_box() -> trimesh.Trimesh:
 
 # ### Baking tests ###
 class ObjectAmbientOcclusionBakingTests(unittest.TestCase):
+    def test_cancellation_is_polled_after_each_ray_batch(self) -> None:
+        target = _horizontal_quad(
+            minimum=0.0,
+            maximum=1.0,
+            height=0.0,
+            with_uv=True,
+        )
+        ray_batch_finished = False
+
+        class _Intersector:
+            def intersects_location(
+                self,
+                origins: np.ndarray,
+                _directions: np.ndarray,
+                *,
+                multiple_hits: bool,
+            ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+                nonlocal ray_batch_finished
+                self.assertions = (len(origins) > 0, not multiple_hits)
+                ray_batch_finished = True
+                return (
+                    np.empty((0, 3), dtype=float),
+                    np.empty(0, dtype=np.int64),
+                    np.empty(0, dtype=np.int64),
+                )
+
+        intersector = _Intersector()
+        with (
+            patch.object(
+                object_ao_baking,
+                "_build_ray_intersector",
+                return_value=intersector,
+            ),
+            self.assertRaises(ObjectAmbientOcclusionBakeCancelled),
+        ):
+            bake_placed_object_ambient_occlusion(
+                {"objects": (target,)},
+                {"objects": 32},
+                (target,),
+                cancellation_check=lambda: ray_batch_finished,
+            )
+
+        self.assertEqual(intersector.assertions, (True, True))
+
     def test_isolated_target_stays_white(self) -> None:
         target = _horizontal_quad(
             minimum=0.0,

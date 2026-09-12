@@ -936,6 +936,79 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             frozenset(),
         )
 
+    def test_delete_surface_texture_clears_binding_before_atlas_resync(
+        self,
+    ) -> None:
+        _add_square_room_to_level(self.workspace.current_level)
+        surfaces = tuple(build_fixed_surfaces(self.workspace.levels))
+        wall_id = next(
+            surface.surface_id
+            for surface in surfaces
+            if surface.surface_type == SURFACE_TYPE_WALL
+        )
+        self.workspace.surface_texture_generation.set_levels(
+            self.workspace.levels
+        )
+        self.workspace._set_canvas_viewer_targets(surfaces)
+        assignment = _wall_texture_assignment(
+            self.settings.path.parent / "surface_textures",
+            assignment_id="delete-key-surface-texture",
+            surface_ids=(wall_id,),
+        )
+        self.workspace.surface_texture_generation.set_data(
+            SurfaceTextureData(assignments=[assignment])
+        )
+        atlas_data = TextureAtlasData()
+        first_atlas = atlas_data.create_atlas(
+            "First",
+            2048,
+            atlas_id="first",
+        )
+        atlas_data.create_atlas("Second", 2048, atlas_id="second")
+        atlas_data.select_atlas(first_atlas.atlas_id)
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        atlas_workspace.set_data(atlas_data)
+        self.workspace._atlas_generation_signature = None
+        self.workspace._sync_atlas_object_texture_sources(
+            automatically_assign_scene_textures=False
+        )
+        source_id = build_atlas_wall_texture_source_id(
+            assignment.assignment_id
+        )
+        self.assertTrue(
+            atlas_workspace.assign_source_to_selected_atlas(source_id)
+        )
+        atlas_workspace.surface_list.object_clicked.emit(
+            source_id,
+            Qt.MouseButton.LeftButton,
+        )
+
+        atlas_workspace.remove_selected_texture_from_atlas()
+
+        retained_assignment = (
+            self.workspace.surface_texture_generation.get_assignment(
+                assignment.assignment_id
+            )
+        )
+        assert retained_assignment is not None
+        self.assertEqual(retained_assignment.surface_ids, ())
+        removed_atlas = atlas_workspace.get_data().atlas_by_id(
+            first_atlas.atlas_id
+        )
+        assert removed_atlas is not None
+        self.assertIsNone(removed_atlas.placement_for_object(source_id))
+
+        atlas_workspace.atlas_list.setCurrentRow(1)
+        atlas_workspace.atlas_list.setCurrentRow(0)
+
+        resynchronized_atlas = atlas_workspace.get_data().atlas_by_id(
+            first_atlas.atlas_id
+        )
+        assert resynchronized_atlas is not None
+        self.assertIsNone(
+            resynchronized_atlas.placement_for_object(source_id)
+        )
+
     def test_surface_replacement_reclaims_displaced_full_atlas_slot(
         self,
     ) -> None:
@@ -2296,6 +2369,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             if item.data(Qt.ItemDataRole.UserRole) == source_id
         )
 
+        self.assertTrue(source_item.text().startswith("[FLOOR] "))
         self.assertIn("Floor texture", source_item.text())
         source = (
             self.workspace.texture_atlas_workspace

@@ -33,6 +33,7 @@ from housemaker.pbr_maps import (
     PBR_MAP_NORMAL,
     PBR_MAP_ROUGHNESS,
 )
+from housemaker.surface_geometry import build_fixed_surfaces
 from housemaker.texture_atlas_state import (
     ATLAS_PACKING_MODE_FULL,
     ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
@@ -43,7 +44,6 @@ from housemaker.texture_atlas_state import (
     TextureAtlasPlacement,
     TextureAtlasRecord,
 )
-from housemaker.surface_geometry import build_fixed_surfaces
 
 
 # ### Fixture helpers ###
@@ -346,7 +346,9 @@ def _architectural_surface_model() -> tuple[GeneratedModel, tuple[str, ...]]:
 
 # ### Export tests ###
 class TextureAtlasExportTests(unittest.TestCase):
-    def test_base_only_atlas_omits_all_pbr_images(self) -> None:
+    def test_base_only_object_atlas_exports_ao_without_metallic_roughness(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             document, material = _export_selective_atlas_document(
                 Path(temporary_directory),
@@ -356,13 +358,15 @@ class TextureAtlasExportTests(unittest.TestCase):
         pbr = material["pbrMetallicRoughness"]
         self.assertIn("baseColorTexture", pbr)
         self.assertNotIn("normalTexture", material)
-        self.assertNotIn("occlusionTexture", material)
+        self.assertIn("occlusionTexture", material)
+        self.assertNotIn("texCoord", material["occlusionTexture"])
+        self.assertEqual(material["occlusionTexture"]["strength"], 1.0)
         self.assertNotIn("metallicRoughnessTexture", pbr)
         self.assertEqual(pbr.get("metallicFactor", 1.0), 0.0)
         self.assertEqual(pbr.get("roughnessFactor", 1.0), 1.0)
-        self.assertEqual(len(document["images"]), 1)
+        self.assertEqual(len(document["images"]), 2)
 
-    def test_normal_only_atlas_exports_no_metallic_roughness_image(self) -> None:
+    def test_normal_only_object_atlas_exports_separate_ao_image(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             document, material = _export_selective_atlas_document(
                 Path(temporary_directory),
@@ -371,11 +375,15 @@ class TextureAtlasExportTests(unittest.TestCase):
 
         pbr = material["pbrMetallicRoughness"]
         self.assertIn("normalTexture", material)
-        self.assertNotIn("occlusionTexture", material)
+        self.assertIn("occlusionTexture", material)
+        self.assertNotEqual(
+            material["normalTexture"]["index"],
+            material["occlusionTexture"]["index"],
+        )
         self.assertNotIn("metallicRoughnessTexture", pbr)
         self.assertEqual(pbr.get("metallicFactor", 1.0), 0.0)
         self.assertEqual(pbr.get("roughnessFactor", 1.0), 1.0)
-        self.assertEqual(len(document["images"]), 2)
+        self.assertEqual(len(document["images"]), 3)
 
     def test_partial_metallic_roughness_atlases_export_one_packed_image(
         self,

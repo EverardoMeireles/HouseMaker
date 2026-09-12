@@ -860,6 +860,27 @@ class GlbViewerRenderingTests(unittest.TestCase):
         self.assertEqual(viewer.get_first_person_camera_pose(), pose)
         self.assertAlmostEqual(float(viewer.view.opts["distance"]), 1.0)
 
+    def test_preserved_model_refresh_retains_default_first_person_pose(
+        self,
+    ) -> None:
+        viewer = self._build_viewer()
+        viewer.set_model(_build_generated_model())
+        pose = CameraPose(x=4.0, y=-3.0, z=2.1, yaw_degrees=67.0)
+        viewer.view.set_default_first_person_camera_pose(pose)
+        viewer.enter_first_person_mode()
+
+        viewer.set_model(
+            _build_generated_model(),
+            preserve_camera=True,
+        )
+
+        self.assertEqual(
+            viewer.get_navigation_mode(),
+            NAVIGATION_MODE_FIRST_PERSON,
+        )
+        self.assertEqual(viewer.get_first_person_camera_pose(), pose)
+        self.assertFalse(viewer.view.has_custom_first_person_camera_pose)
+
     def test_projection_camera_indicators_are_opt_in(self) -> None:
         viewer = self._build_viewer()
 
