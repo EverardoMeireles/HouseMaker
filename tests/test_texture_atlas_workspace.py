@@ -44,6 +44,7 @@ from housemaker.texture_atlas_state import (
     ATLAS_SLOT_QUADRANT_TOP_LEFT,
     ATLAS_SLOT_QUADRANT_TOP_RIGHT,
     TextureAtlasData,
+    TextureAtlasRecord,
 )
 from housemaker.texture_atlas_workspace import (
     ATLAS_MAP_AMBIENT_OCCLUSION,
@@ -56,6 +57,7 @@ from housemaker.texture_atlas_workspace import (
     AtlasSurfaceTextureEntry,
     TextureAtlasWorkspace,
     _build_texture_source_mime_data,
+    _format_atlas_storage_size,
     build_atlas_wall_texture_source_id,
     build_surface_ao_image_relative_path,
     build_texture_atlas_map_image_relative_path,
@@ -165,6 +167,18 @@ def _materialize_placeholder_maps(
     ).values():
         output_path.parent.mkdir(parents=True, exist_ok=True)
         Image.new("RGBA", (1, 1), (0, 0, 0, 255)).save(output_path)
+
+
+def _write_sized_png(path: Path, byte_count: int) -> None:
+    """Write a valid tiny PNG padded to one deterministic test size."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGBA", (1, 1), (0, 0, 0, 255)).save(path)
+    current_size = path.stat().st_size
+    if current_size > byte_count:
+        raise ValueError("The requested PNG fixture size is too small.")
+    with path.open("ab") as handle:
+        handle.write(b"\0" * (byte_count - current_size))
 
 
 def _wall_source(
@@ -378,6 +392,217 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.assertIn(
             "missing object GLB",
             self.workspace.draw_call_estimate_value_label.toolTip(),
+        )
+
+    def test_atlas_storage_sizes_show_selected_and_all_png_footprints(self) -> None:
+        self.assertEqual(self.workspace.selected_atlas_size_value_label.text(), "0 KB")
+        self.assertEqual(self.workspace.all_atlases_size_value_label.text(), "0 KB")
+        data = TextureAtlasData()
+        first = data.create_atlas("First", 2048)
+        second = data.create_atlas("Second", 2048)
+        first_map_sizes = {
+            ATLAS_MAP_BASE_COLOR: 1_000,
+            ATLAS_MAP_NORMAL: 2_000,
+            ATLAS_MAP_ROUGHNESS: 3_000,
+            ATLAS_MAP_METALLIC: 4_000,
+        }
+        for map_type, byte_count in first_map_sizes.items():
+            relative_path = build_texture_atlas_map_image_relative_path(
+                first.atlas_id,
+                map_type,
+            )
+            _write_sized_png(
+                Path(self._temporary_directory.name) / relative_path,
+                byte_count,
+            )
+            if map_type == ATLAS_MAP_BASE_COLOR:
+                first.image_path = relative_path
+        first_ao_path = build_surface_ao_image_relative_path(first.atlas_id)
+        _write_sized_png(
+            Path(self._temporary_directory.name) / first_ao_path,
+            5_000,
+        )
+        first.set_surface_ambient_occlusion(first_ao_path, "a" * 64)
+        second_base_path = build_texture_atlas_map_image_relative_path(
+            second.atlas_id,
+            ATLAS_MAP_BASE_COLOR,
+        )
+        _write_sized_png(
+            Path(self._temporary_directory.name) / second_base_path,
+            20_000,
+        )
+        second.image_path = second_base_path
+        data.select_atlas(first.atlas_id)
+
+        self.workspace.set_data(data)
+
+        self.assertEqual(self.workspace.selected_atlas_storage_size_bytes, 15_000)
+        self.assertEqual(self.workspace.all_atlases_storage_size_bytes, 35_000)
+        self.assertEqual(
+            self.workspace.selected_atlas_size_value_label.text(),
+            "15 KB",
+        )
+        self.assertEqual(
+            self.workspace.all_atlases_size_value_label.text(),
+            "35 KB",
+        )
+        self.assertIn(
+            "15,000 bytes",
+            self.workspace.selected_atlas_size_value_label.toolTip(),
+        )
+
+        self.workspace.atlas_list.setCurrentRow(1)
+        _qt_application.processEvents()
+
+        self.assertEqual(self.workspace.selected_atlas_storage_size_bytes, 20_000)
+        self.assertEqual(
+            self.workspace.selected_atlas_size_value_label.text(),
+            "20 KB",
+        )
+        self.assertEqual(
+            self.workspace.all_atlases_size_value_label.text(),
+            "35 KB",
+        )
+
+    def test_atlas_storage_size_switches_to_mb_after_999_kb(self) -> None:
+        self.assertEqual(_format_atlas_storage_size(999_000), "999 KB")
+        self.assertEqual(_format_atlas_storage_size(999_001), "1.00 MB")
+
+    def test_atlas_storage_sizes_are_cached_until_one_atlas_is_invalidated(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        first = data.create_atlas("First", 2048, atlas_id="first-atlas")
+        second = data.create_atlas("Second", 2048, atlas_id="second-atlas")
+        for atlas, size in ((first, 1_000), (second, 2_000)):
+            relative_path = build_texture_atlas_map_image_relative_path(
+                atlas.atlas_id,
+                ATLAS_MAP_BASE_COLOR,
+            )
+            _write_sized_png(
+                Path(self._temporary_directory.name) / relative_path,
+                size,
+            )
+            atlas.image_path = relative_path
+        data.select_atlas(first.atlas_id)
+        self.workspace.set_data(data)
+
+        with patch.object(
+            texture_atlas_workspace_module,
+            "_existing_file_sizes",
+            wraps=texture_atlas_workspace_module._existing_file_sizes,
+        ) as inspect_files:
+            self.workspace._refresh_preview()
+            self.workspace.atlas_list.setCurrentRow(1)
+            _qt_application.processEvents()
+
+            inspect_files.assert_not_called()
+
+            self.workspace._invalidate_atlas_storage_size_cache((first.atlas_id,))
+            self.workspace._refresh_preview()
+
+        self.assertEqual(inspect_files.call_count, 1)
+        self.assertEqual(
+            self.workspace.selected_atlas_size_value_label.text(),
+            "2 KB",
+        )
+        self.assertEqual(
+            self.workspace.all_atlases_size_value_label.text(),
+            "3 KB",
+        )
+
+    def test_export_materialization_refreshes_non_selected_atlas_size(self) -> None:
+        source = _source("exported", directory=self._temporary_directory.name)
+        data = TextureAtlasData()
+        selected = data.create_atlas("Selected", 2048, atlas_id="selected-atlas")
+        exported = data.create_atlas("Exported", 2048, atlas_id="exported-atlas")
+        data.assign_object(
+            exported.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+        )
+        data.select_atlas(selected.atlas_id)
+        self.workspace.set_object_texture_sources((source,))
+        self.workspace.set_data(data)
+        self.assertEqual(self.workspace.all_atlases_size_value_label.text(), "0 KB")
+
+        prepared = self.workspace.prepare_export_atlases((source.object_id,))
+
+        self.assertEqual(len(prepared), 1)
+        self.assertEqual(prepared[0].atlas.atlas_id, exported.atlas_id)
+        materialized = self.workspace.get_data().atlas_by_id(exported.atlas_id)
+        assert materialized is not None
+        self.assertIsNotNone(materialized.image_path)
+        self.assertEqual(self.workspace.selected_atlas_storage_size_bytes, 0)
+        self.assertGreater(self.workspace.all_atlases_storage_size_bytes, 0)
+        self.assertEqual(
+            self.workspace.selected_atlas_size_value_label.text(),
+            "0 KB",
+        )
+        self.assertEqual(
+            self.workspace.all_atlases_size_value_label.text(),
+            _format_atlas_storage_size(
+                self.workspace.all_atlases_storage_size_bytes
+            ),
+        )
+
+    def test_failed_export_materialization_refreshes_partial_file_size(self) -> None:
+        source = _source("partial", directory=self._temporary_directory.name)
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Partial", 2048, atlas_id="partial-atlas")
+        data.assign_object(
+            atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+        )
+        self.workspace.set_object_texture_sources((source,))
+        self.workspace.set_data(data)
+        self.workspace.prepare_export_atlas(atlas.atlas_id)
+        previous_size = self.workspace.selected_atlas_storage_size_bytes
+
+        partial_size = 200_000
+
+        def fail_after_partial_write(
+            _atlas: TextureAtlasRecord,
+            output_path: str | Path,
+            **_kwargs,
+        ) -> None:
+            Path(output_path).write_bytes(b"x" * partial_size)
+            raise OSError("partial export write")
+
+        with (
+            patch.object(
+                texture_atlas_workspace_module,
+                "write_texture_atlas_png",
+                side_effect=fail_after_partial_write,
+            ),
+            patch.object(
+                texture_atlas_workspace_module,
+                "_restore_atlas_png_snapshots",
+                return_value=1,
+            ),
+            self.assertRaisesRegex(OSError, "partial export write"),
+        ):
+            self.workspace.prepare_export_atlas(atlas.atlas_id)
+
+        output_paths = self.workspace._resolve_atlas_map_output_paths(atlas.atlas_id)
+        actual_size = sum(
+            path.stat().st_size for path in output_paths.values() if path.is_file()
+        )
+        self.assertNotEqual(actual_size, previous_size)
+        self.assertEqual(
+            self.workspace.selected_atlas_storage_size_bytes,
+            actual_size,
+        )
+        self.assertEqual(
+            self.workspace.selected_atlas_size_value_label.text(),
+            _format_atlas_storage_size(actual_size),
+        )
+        self.assertEqual(
+            self.workspace.all_atlases_size_value_label.text(),
+            _format_atlas_storage_size(actual_size),
         )
 
     def test_replacing_atlas_data_clears_draw_call_estimate(self) -> None:

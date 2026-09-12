@@ -153,6 +153,14 @@ DRAW_CALL_ESTIMATE_TOOLTIP = (
     "Estimated glTF mesh-primitives rendered for the included scene after "
     "Atlas batching. Each primitive normally produces one draw call."
 )
+ATLAS_STORAGE_SIZE_TOOLTIP = (
+    "Combined compressed size of the Atlas PNG files currently stored on "
+    "disk, including base color, companion PBR maps, and baked ambient "
+    "occlusion. Source textures, GLBs, and unreferenced files are excluded."
+)
+BYTES_PER_KILOBYTE = 1_000
+BYTES_PER_MEGABYTE = 1_000_000
+MAXIMUM_DISPLAYED_KILOBYTES = 999.0
 
 
 # ### Public texture-source model ###
@@ -1813,6 +1821,21 @@ class TextureAtlasPreview(QWidget):
             )
 
 
+# ### Atlas storage-size cache ###
+@dataclass(frozen=True)
+class _AtlasStorageSizeCacheEntry:
+    """One Atlas's resolved file sizes tied to its persisted path metadata."""
+
+    path_signature: tuple[str | None, str | None]
+    file_sizes: tuple[tuple[Path, int], ...]
+
+    @property
+    def total_bytes(self) -> int:
+        """Return the compressed size of every unique file in this entry."""
+
+        return sum(size for _path, size in self.file_sizes)
+
+
 # ### Atlas workspace ###
 class TextureAtlasWorkspace(QWidget):
     """Create atlases and manage generated object and surface textures."""
@@ -1869,6 +1892,10 @@ class TextureAtlasWorkspace(QWidget):
         self._previewed_atlas_id: str | None = None
         self._surface_ao_preview_revision = 0
         self._draw_call_estimate: AtlasDrawCallEstimate | None = None
+        self._atlas_storage_size_cache: dict[
+            str,
+            _AtlasStorageSizeCacheEntry,
+        ] = {}
         self._active_source_kind: str | None = None
         self._object_preview_widget: QWidget | None = None
         self._build_ui()
@@ -1882,6 +1909,25 @@ class TextureAtlasWorkspace(QWidget):
         """Return the latest scene estimate displayed by the Atlas tab."""
 
         return self._draw_call_estimate
+
+    @property
+    def selected_atlas_storage_size_bytes(self) -> int:
+        """Return the compressed PNG footprint of the selected Atlas."""
+
+        atlas = self.selected_atlas
+        if atlas is None:
+            return 0
+        return self._atlas_storage_size_cache_entry(atlas).total_bytes
+
+    @property
+    def all_atlases_storage_size_bytes(self) -> int:
+        """Return the deduplicated compressed PNG footprint of all Atlases."""
+
+        sizes_by_path: dict[Path, int] = {}
+        for atlas in self._data.atlases:
+            entry = self._atlas_storage_size_cache_entry(atlas)
+            sizes_by_path.update(entry.file_sizes)
+        return sum(sizes_by_path.values())
 
     def set_draw_call_estimate(
         self,
@@ -1960,6 +2006,7 @@ class TextureAtlasWorkspace(QWidget):
         if data is not None and not isinstance(data, TextureAtlasData):
             raise TypeError("Texture atlas data has an invalid type.")
         self._data = copy.deepcopy(data or TextureAtlasData())
+        self._invalidate_atlas_storage_size_cache()
         self.set_draw_call_estimate_unavailable()
         self._lazy_materialization_error = None
         self._surface_ao_preview_revision += 1
@@ -1995,6 +2042,7 @@ class TextureAtlasWorkspace(QWidget):
                 "The ambient-occlusion output path escapes its asset directory."
             )
 
+        self._invalidate_atlas_storage_size_cache((normalized_atlas_id,))
         _write_grayscale_png_atomically(output_path, pixels)
         self._data = next_data
         self._surface_ao_preview_revision += 1
@@ -2028,6 +2076,8 @@ class TextureAtlasWorkspace(QWidget):
         )
         if not affected:
             return 0
+        affected_ids = tuple(atlas.atlas_id for atlas in affected)
+        self._invalidate_atlas_storage_size_cache(affected_ids)
         snapshots = {
             path: path.read_bytes() if path.is_file() else None
             for path in (
@@ -2620,15 +2670,21 @@ class TextureAtlasWorkspace(QWidget):
             }
         )
         prepared: list[MaterializedTextureAtlas] = []
-        for atlas in self._data.atlases:
-            if not atlas.placements:
-                continue
-            if required_ids is not None and not any(
-                placement.object_id in required_ids for placement in atlas.placements
-            ):
-                continue
-            prepared.append(self._prepare_materialized_atlas(atlas))
-        return tuple(prepared)
+        try:
+            for atlas in self._data.atlases:
+                if not atlas.placements:
+                    continue
+                if required_ids is not None and not any(
+                    placement.object_id in required_ids
+                    for placement in atlas.placements
+                ):
+                    continue
+                prepared.append(self._prepare_materialized_atlas(atlas))
+            return tuple(prepared)
+        finally:
+            # Export rebuilds are authoritative writes, including when a later
+            # Atlas fails after earlier files were already materialized.
+            self._refresh_atlas_storage_sizes()
 
     def prepare_surface_ao_atlas_context(
         self,
@@ -2702,7 +2758,10 @@ class TextureAtlasWorkspace(QWidget):
             raise ValueError("The requested texture Atlas no longer exists.")
         if not atlas.placements:
             raise ValueError("The requested texture Atlas is empty.")
-        return self._prepare_materialized_atlas(atlas)
+        try:
+            return self._prepare_materialized_atlas(atlas)
+        finally:
+            self._refresh_atlas_storage_sizes()
 
     def _prepare_materialized_atlas(
         self,
@@ -3589,7 +3648,9 @@ class TextureAtlasWorkspace(QWidget):
     ) -> None:
         """Delete AO files detached by one already-snapshotted transaction."""
 
-        for atlas_id in dict.fromkeys(str(value) for value in atlas_ids):
+        normalized_atlas_ids = tuple(dict.fromkeys(str(value) for value in atlas_ids))
+        self._invalidate_atlas_storage_size_cache(normalized_atlas_ids)
+        for atlas_id in normalized_atlas_ids:
             previous_atlas = previous_data.atlas_by_id(atlas_id)
             if previous_atlas is None:
                 continue
@@ -3666,15 +3727,36 @@ class TextureAtlasWorkspace(QWidget):
         self.create_atlas_button.setObjectName("create_texture_atlas_button")
         self.create_atlas_button.clicked.connect(self._create_atlas)
         creation_layout.addRow("", self.create_atlas_button)
+
+        atlas_metrics_widget = QWidget()
+        atlas_metrics_layout = QHBoxLayout(atlas_metrics_widget)
+        atlas_metrics_layout.setContentsMargins(0, 0, 0, 0)
+        atlas_metrics_layout.setSpacing(8)
+        atlas_metrics_layout.addWidget(QLabel("Estimated scene draw calls"))
         self.draw_call_estimate_value_label = QLabel("Unavailable")
         self.draw_call_estimate_value_label.setObjectName(
             "texture_atlas_draw_call_estimate_label"
         )
         self.draw_call_estimate_value_label.setToolTip(DRAW_CALL_ESTIMATE_TOOLTIP)
-        creation_layout.addRow(
-            "Estimated scene draw calls",
-            self.draw_call_estimate_value_label,
+        atlas_metrics_layout.addWidget(self.draw_call_estimate_value_label)
+        atlas_metrics_layout.addSpacing(12)
+        atlas_metrics_layout.addWidget(QLabel("Selected atlas size"))
+        self.selected_atlas_size_value_label = QLabel("0 KB")
+        self.selected_atlas_size_value_label.setObjectName(
+            "texture_atlas_selected_size_label"
         )
+        self.selected_atlas_size_value_label.setToolTip(ATLAS_STORAGE_SIZE_TOOLTIP)
+        atlas_metrics_layout.addWidget(self.selected_atlas_size_value_label)
+        atlas_metrics_layout.addSpacing(12)
+        atlas_metrics_layout.addWidget(QLabel("All atlases size"))
+        self.all_atlases_size_value_label = QLabel("0 KB")
+        self.all_atlases_size_value_label.setObjectName(
+            "texture_atlas_all_size_label"
+        )
+        self.all_atlases_size_value_label.setToolTip(ATLAS_STORAGE_SIZE_TOOLTIP)
+        atlas_metrics_layout.addWidget(self.all_atlases_size_value_label)
+        atlas_metrics_layout.addStretch(1)
+        creation_layout.addRow(atlas_metrics_widget)
         root_layout.addWidget(creation_widget)
 
         content_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -4223,6 +4305,7 @@ class TextureAtlasWorkspace(QWidget):
         image_path = atlas.image_path
         if not self._data.remove_atlas(atlas_id):
             return
+        self._invalidate_atlas_storage_size_cache((atlas_id,))
         cleanup_errors: list[OSError] = []
         owned_image_paths = set(self._resolve_atlas_map_output_paths(atlas_id).values())
         owned_image_path = self._resolve_owned_atlas_path(image_path)
@@ -4541,6 +4624,7 @@ class TextureAtlasWorkspace(QWidget):
     ) -> None:
         """Write a populated candidate or remove an empty Atlas's PNGs."""
 
+        self._invalidate_atlas_storage_size_cache((candidate_atlas.atlas_id,))
         original_atlas = self._data.atlas_by_id(candidate_atlas.atlas_id)
         original_image_path = self._resolve_owned_atlas_path(
             None if original_atlas is None else original_atlas.image_path
@@ -5160,6 +5244,7 @@ class TextureAtlasWorkspace(QWidget):
             item.setForeground(SCENE_BOUND_SOURCE_COLOR)
 
     def _refresh_preview(self) -> None:
+        self._refresh_atlas_storage_sizes()
         atlas = self.selected_atlas
         atlas_id = None if atlas is None else atlas.atlas_id
         if atlas_id != self._previewed_atlas_id:
@@ -5249,6 +5334,74 @@ class TextureAtlasWorkspace(QWidget):
         self.remove_source_button.setEnabled(
             object_id is not None and self._active_source_kind in {"object", "surface"}
         )
+
+    def _refresh_atlas_storage_sizes(self) -> None:
+        """Refresh selected and project-wide Atlas PNG disk footprints."""
+
+        selected_size = self.selected_atlas_storage_size_bytes
+        all_size = self.all_atlases_storage_size_bytes
+        self.selected_atlas_size_value_label.setText(
+            _format_atlas_storage_size(selected_size)
+        )
+        self.all_atlases_size_value_label.setText(
+            _format_atlas_storage_size(all_size)
+        )
+        self.selected_atlas_size_value_label.setToolTip(
+            f"{ATLAS_STORAGE_SIZE_TOOLTIP} Selected Atlas: "
+            f"{selected_size:,} bytes."
+        )
+        self.all_atlases_size_value_label.setToolTip(
+            f"{ATLAS_STORAGE_SIZE_TOOLTIP} All Atlases: {all_size:,} bytes."
+        )
+
+    def _atlas_storage_size_cache_entry(
+        self,
+        atlas: TextureAtlasRecord,
+    ) -> _AtlasStorageSizeCacheEntry:
+        """Return one cached total, rebuilding it only after relevant changes."""
+
+        path_signature = (atlas.image_path, atlas.surface_ao_image_path)
+        cached = self._atlas_storage_size_cache.get(atlas.atlas_id)
+        if cached is not None and cached.path_signature == path_signature:
+            return cached
+        entry = _AtlasStorageSizeCacheEntry(
+            path_signature=path_signature,
+            file_sizes=_existing_file_sizes(self._atlas_storage_paths(atlas)),
+        )
+        self._atlas_storage_size_cache[atlas.atlas_id] = entry
+        return entry
+
+    def _invalidate_atlas_storage_size_cache(
+        self,
+        atlas_ids: Sequence[str] | None = None,
+    ) -> None:
+        """Forget all totals, or only totals for Atlas files being mutated."""
+
+        if atlas_ids is None:
+            self._atlas_storage_size_cache.clear()
+            return
+        for atlas_id in atlas_ids:
+            self._atlas_storage_size_cache.pop(str(atlas_id), None)
+
+    def _atlas_storage_paths(self, atlas: TextureAtlasRecord) -> frozenset[Path]:
+        """Return referenced and implicit companion PNG paths for one Atlas."""
+
+        paths: set[Path] = set()
+        base_color_path = self._resolve_owned_atlas_path(atlas.image_path)
+        if base_color_path is not None:
+            paths.add(base_color_path)
+            companion_paths = self._resolve_atlas_map_output_paths(atlas.atlas_id)
+            paths.update(
+                companion_paths[map_type]
+                for map_type in ATLAS_MAP_TYPES
+                if map_type != ATLAS_MAP_BASE_COLOR
+            )
+        ambient_occlusion_path = self._resolve_owned_atlas_path(
+            atlas.surface_ao_image_path
+        )
+        if ambient_occlusion_path is not None:
+            paths.add(ambient_occlusion_path)
+        return frozenset(paths)
 
     def _sync_selected_atlas_editor(self) -> None:
         """Show the selected Atlas metadata in its inline editor."""
@@ -5460,6 +5613,7 @@ class TextureAtlasWorkspace(QWidget):
     ) -> None:
         """Atomically materialize base-color and PBR companion Atlas PNGs."""
 
+        self._invalidate_atlas_storage_size_cache((atlas.atlas_id,))
         self._asset_directory.mkdir(parents=True, exist_ok=True)
         relative_paths = {
             map_type: build_texture_atlas_map_image_relative_path(
@@ -5548,6 +5702,7 @@ class TextureAtlasWorkspace(QWidget):
     ) -> tuple[bool, bool]:
         """Rebuild complete output or detach every stale reference safely."""
 
+        self._invalidate_atlas_storage_size_cache((atlas.atlas_id,))
         can_rebuild = bool(atlas.placements) and all(
             self._resolve_placement_source(placement) is not None
             for placement in atlas.placements
@@ -5786,6 +5941,35 @@ def _build_atlas_preview_content_signature(
         sorted((str(object_id), id(source)) for object_id, source in sources.items())
     )
     return atlas_signature, source_signature
+
+
+# ### Atlas storage-size helpers ###
+def _format_atlas_storage_size(byte_count: int) -> str:
+    """Format a non-negative byte count as compact decimal KB or MB."""
+
+    normalized_byte_count = max(0, int(byte_count))
+    kilobytes = normalized_byte_count / BYTES_PER_KILOBYTE
+    if kilobytes > MAXIMUM_DISPLAYED_KILOBYTES:
+        return f"{normalized_byte_count / BYTES_PER_MEGABYTE:.2f} MB"
+    if normalized_byte_count == 0:
+        return "0 KB"
+    formatted_kilobytes = f"{kilobytes:.1f}".rstrip("0").rstrip(".")
+    return f"{formatted_kilobytes} KB"
+
+
+def _existing_file_sizes(
+    paths: Sequence[Path] | set[Path] | frozenset[Path],
+) -> tuple[tuple[Path, int], ...]:
+    """Inspect unique files while tolerating concurrent file replacement."""
+
+    file_sizes: list[tuple[Path, int]] = []
+    for path in set(paths):
+        try:
+            if path.is_file():
+                file_sizes.append((path, int(path.stat().st_size)))
+        except OSError:
+            continue
+    return tuple(file_sizes)
 
 
 # ### Atlas PNG transaction helpers ###
