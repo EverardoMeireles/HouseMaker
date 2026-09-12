@@ -1056,9 +1056,11 @@ class BlueprintWorkspace(QWidget):
         self.side_tabs.addTab(generals_tab, "Generals")
         side_layout = generals_layout
 
-        height_label = QLabel("Height level")
-        height_label.setStyleSheet("font-size: 18px; font-weight: 600;")
-        side_layout.addWidget(height_label)
+        self.level_dimensions_group = QGroupBox("Level dimensions")
+        level_dimensions_layout = QFormLayout(self.level_dimensions_group)
+        level_dimensions_layout.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+        )
 
         self.height_level_spinbox = QDoubleSpinBox()
         self.height_level_spinbox.setRange(0.1, 100.0)
@@ -1068,13 +1070,10 @@ class BlueprintWorkspace(QWidget):
         self.height_level_spinbox.setSuffix(" m")
         self.height_level_spinbox.setMinimumHeight(40)
         self.height_level_spinbox.valueChanged.connect(self._handle_height_level_changed)
-        side_layout.addWidget(self.height_level_spinbox)
-
-        floor_thickness_label = QLabel("Floor thickness")
-        floor_thickness_label.setStyleSheet(
-            "font-size: 18px; font-weight: 600;"
+        level_dimensions_layout.addRow(
+            "Height level",
+            self.height_level_spinbox,
         )
-        side_layout.addWidget(floor_thickness_label)
 
         self.floor_thickness_spinbox = QDoubleSpinBox()
         self.floor_thickness_spinbox.setRange(
@@ -1089,17 +1088,18 @@ class BlueprintWorkspace(QWidget):
         self.floor_thickness_spinbox.valueChanged.connect(
             self._handle_floor_thickness_changed
         )
-        side_layout.addWidget(self.floor_thickness_spinbox)
-
-        open_spaces_label = QLabel("Open spaces")
-        open_spaces_label.setStyleSheet(
-            "font-size: 18px; font-weight: 600;"
+        level_dimensions_layout.addRow(
+            "Floor thickness",
+            self.floor_thickness_spinbox,
         )
-        side_layout.addWidget(open_spaces_label)
+        side_layout.addWidget(self.level_dimensions_group)
+
+        self.open_spaces_group = QGroupBox("Open spaces")
+        open_spaces_layout = QVBoxLayout(self.open_spaces_group)
 
         self.open_space_status_label = QLabel("Open spaces: none")
         self.open_space_status_label.setWordWrap(True)
-        side_layout.addWidget(self.open_space_status_label)
+        open_spaces_layout.addWidget(self.open_space_status_label)
 
         self.add_open_space_button = QPushButton("Add open space")
         self.add_open_space_button.setCheckable(True)
@@ -1111,7 +1111,8 @@ class BlueprintWorkspace(QWidget):
         self.add_open_space_button.clicked.connect(
             self._handle_add_open_space_clicked
         )
-        side_layout.addWidget(self.add_open_space_button)
+        open_spaces_layout.addWidget(self.add_open_space_button)
+        side_layout.addWidget(self.open_spaces_group)
 
         self.level_transform_group = QGroupBox("Level transform")
         level_transform_layout = QFormLayout(self.level_transform_group)
@@ -1398,9 +1399,8 @@ class BlueprintWorkspace(QWidget):
             self._handle_canvas_y_offset_changed
         )
 
-        stairs_label = QLabel("Stairs")
-        stairs_label.setStyleSheet("font-size: 18px; font-weight: 600;")
-        side_layout.addWidget(stairs_label)
+        self.stairs_group = QGroupBox("Stairs")
+        stairs_layout = QVBoxLayout(self.stairs_group)
 
         self.stair_style_combo = QComboBox()
         self.stair_style_combo.addItem("Supported", STAIR_STYLE_SUPPORTED)
@@ -1414,20 +1414,20 @@ class BlueprintWorkspace(QWidget):
         stair_style_layout = QFormLayout()
         stair_style_layout.setContentsMargins(0, 0, 0, 0)
         stair_style_layout.addRow("Stair type", self.stair_style_combo)
-        side_layout.addLayout(stair_style_layout)
+        stairs_layout.addLayout(stair_style_layout)
 
         self.stair_status_label = QLabel("Stairs: none")
         self.stair_status_label.setWordWrap(True)
-        side_layout.addWidget(self.stair_status_label)
+        stairs_layout.addWidget(self.stair_status_label)
 
         self.add_stairs_button = QPushButton("Add stairs")
         self.add_stairs_button.setMinimumHeight(40)
         self.add_stairs_button.clicked.connect(self._handle_add_stairs_clicked)
-        side_layout.addWidget(self.add_stairs_button)
+        stairs_layout.addWidget(self.add_stairs_button)
+        side_layout.addWidget(self.stairs_group)
 
-        doorway_label = QLabel("Doorways")
-        doorway_label.setStyleSheet("font-size: 18px; font-weight: 600;")
-        side_layout.addWidget(doorway_label)
+        self.doorways_group = QGroupBox("Doorways")
+        doorways_layout = QVBoxLayout(self.doorways_group)
 
         self.selected_doorway_arch_checkbox = QCheckBox(
             "Arch selected doorway"
@@ -1440,7 +1440,7 @@ class BlueprintWorkspace(QWidget):
         self.selected_doorway_arch_checkbox.toggled.connect(
             self._handle_selected_doorway_arch_toggled
         )
-        side_layout.addWidget(self.selected_doorway_arch_checkbox)
+        doorways_layout.addWidget(self.selected_doorway_arch_checkbox)
 
         self.selected_doorway_arch_amount_spinbox = QDoubleSpinBox()
         self.selected_doorway_arch_amount_spinbox.setRange(
@@ -1468,7 +1468,7 @@ class BlueprintWorkspace(QWidget):
             "Arch amount",
             self.selected_doorway_arch_amount_spinbox,
         )
-        side_layout.addLayout(doorway_arch_form)
+        doorways_layout.addLayout(doorway_arch_form)
 
         self.doorway_preset_list = QListWidget()
         self.doorway_preset_list.setSelectionMode(
@@ -1478,7 +1478,7 @@ class BlueprintWorkspace(QWidget):
         self.doorway_preset_list.currentRowChanged.connect(
             self._handle_doorway_preset_selection_changed
         )
-        side_layout.addWidget(self.doorway_preset_list)
+        doorways_layout.addWidget(self.doorway_preset_list)
 
         self.save_doorway_template_button = QPushButton(
             "Save doorway template"
@@ -1488,7 +1488,7 @@ class BlueprintWorkspace(QWidget):
         self.save_doorway_template_button.clicked.connect(
             self._handle_save_doorway_template_clicked
         )
-        side_layout.addWidget(self.save_doorway_template_button)
+        doorways_layout.addWidget(self.save_doorway_template_button)
 
         doorway_buttons_layout = QHBoxLayout()
         doorway_buttons_layout.setSpacing(10)
@@ -1506,26 +1506,26 @@ class BlueprintWorkspace(QWidget):
             self._handle_place_selected_doorway_clicked
         )
         doorway_buttons_layout.addWidget(self.place_doorway_button)
-        side_layout.addLayout(doorway_buttons_layout)
+        doorways_layout.addLayout(doorway_buttons_layout)
+        side_layout.addWidget(self.doorways_group)
+
+        self.levels_group = QGroupBox("Levels")
+        levels_layout = QVBoxLayout(self.levels_group)
 
         self.load_image_button = QPushButton("Load image")
         self.load_image_button.setMinimumHeight(44)
         self.load_image_button.clicked.connect(self._handle_load_image_clicked)
-        side_layout.addWidget(self.load_image_button)
+        levels_layout.addWidget(self.load_image_button)
 
         self.blueprint_name_label = QLabel("Image: none for this level")
         self.blueprint_name_label.setWordWrap(True)
-        side_layout.addWidget(self.blueprint_name_label)
-
-        levels_label = QLabel("Levels")
-        levels_label.setStyleSheet("font-size: 18px; font-weight: 600;")
-        side_layout.addWidget(levels_label)
+        levels_layout.addWidget(self.blueprint_name_label)
 
         self.levels_list = QListWidget()
         self.levels_list.currentRowChanged.connect(
             self._handle_level_list_row_changed
         )
-        side_layout.addWidget(self.levels_list, 1)
+        levels_layout.addWidget(self.levels_list, 1)
 
         level_options_layout = QFormLayout()
         level_options_layout.setContentsMargins(0, 0, 0, 0)
@@ -1546,7 +1546,8 @@ class BlueprintWorkspace(QWidget):
         include_layout.addWidget(self.include_no_radio)
         include_layout.addStretch(1)
         level_options_layout.addRow("Include", include_widget)
-        side_layout.addLayout(level_options_layout)
+        levels_layout.addLayout(level_options_layout)
+        side_layout.addWidget(self.levels_group, 1)
 
         buttons_layout = QHBoxLayout()
         buttons_layout.setSpacing(10)

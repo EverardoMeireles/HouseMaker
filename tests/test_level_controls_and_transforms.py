@@ -17,7 +17,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # ### Imports ###
 from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtGui import QWheelEvent
-from PySide6.QtWidgets import QApplication, QLabel, QScrollArea, QWidget
+from PySide6.QtWidgets import QApplication, QScrollArea, QWidget
 
 from housemaker.glb import convert_to_glb
 from housemaker.models import (
@@ -644,16 +644,11 @@ class LevelControlsTests(unittest.TestCase):
         workspace.show()
         _qt_application.processEvents()
 
-        levels_label = next(
-            label
-            for label in workspace.findChildren(QLabel)
-            if label.text() == "Levels"
-        )
         controls = (
-            levels_label,
+            workspace.load_image_button,
+            workspace.blueprint_name_label,
             workspace.levels_list,
             workspace.include_yes_radio,
-            workspace.save_button,
         )
         top_positions = [
             control.mapTo(workspace, QPoint()).y()
@@ -664,6 +659,10 @@ class LevelControlsTests(unittest.TestCase):
         self.assertIs(
             workspace.include_yes_radio.parentWidget(),
             workspace.include_no_radio.parentWidget(),
+        )
+        self.assertLess(
+            workspace.levels_group.mapTo(workspace, QPoint()).y(),
+            workspace.save_button.mapTo(workspace, QPoint()).y(),
         )
 
         workspace.close()
