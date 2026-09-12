@@ -135,6 +135,8 @@ MAX_FIRST_PERSON_PITCH_DEGREES = 89.0
 WINDOW_EDITOR_PANEL_WIDTH = 190
 WINDOW_PREVIEW_OFFSET_METERS = 0.006
 CANVAS_SURFACE_SELECTION_COLOR = (1.0, 0.72, 0.18, 1.0)
+CANVAS_SURFACE_SELECTION_VERTEX_COLOR = (0.78, 0.56, 0.14, 1.0)
+CANVAS_SURFACE_SELECTION_VERTEX_SIZE_PIXELS = 9.0
 ATLAS_SURFACE_HIGHLIGHT_COLOR = (0.20, 0.86, 0.38, 1.0)
 WINDOW_VALID_PREVIEW_COLOR = (0.20, 0.86, 0.38, 0.34)
 WINDOW_INVALID_PREVIEW_COLOR = (1.0, 0.24, 0.20, 0.34)
@@ -2367,6 +2369,18 @@ class _DepthTestedOverlayLineItem(gl.GLLinePlotItem):
             GL.glDepthFunc(previous_depth_function)
 
 
+class _DepthTestedOverlayScatterItem(gl.GLScatterPlotItem):
+    """Keep coplanar point markers visible while solid meshes still occlude them."""
+
+    def paint(self) -> None:
+        previous_depth_function = int(GL.glGetIntegerv(GL.GL_DEPTH_FUNC))
+        GL.glDepthFunc(GL.GL_LEQUAL)
+        try:
+            super().paint()
+        finally:
+            GL.glDepthFunc(previous_depth_function)
+
+
 @dataclass
 class _SymmetricPreviewRenderGroup:
     """The textured and fallback draw items for one mirrored retained mesh."""
@@ -2596,6 +2610,9 @@ class GlbViewerWidget(QWidget):
         self._canvas_surface_targets: dict[str, FixedSurface] = {}
         self._selected_canvas_surface_ids: tuple[str, ...] = ()
         self._canvas_surface_selection_items: list[gl.GLLinePlotItem] = []
+        self._canvas_surface_selection_vertex_item: (
+            gl.GLScatterPlotItem | None
+        ) = None
         self._canvas_extrudable_face_outline_items: list[
             gl.GLLinePlotItem
         ] = []
@@ -2866,7 +2883,7 @@ class GlbViewerWidget(QWidget):
         surface_title_label.setObjectName("canvas-surface-tools-title")
         panel_layout.addWidget(surface_title_label)
 
-        self.add_surface_vertex_button = QPushButton("Add vertex")
+        self.add_surface_vertex_button = QPushButton("Add vertices")
         self.add_surface_vertex_button.setObjectName(
             "canvas-add-surface-vertex-button"
         )
@@ -3559,7 +3576,7 @@ class GlbViewerWidget(QWidget):
                 self.canvas_surface_face_deletion_requested.emit(surface_ids)
             else:
                 self.set_surface_tools_status(
-                    "Only faces created by Add vertex can be deleted."
+                    "Only faces created with Add vertices can be deleted."
                 )
             return
         selected_id = self._selected_placed_object_id
@@ -4283,11 +4300,12 @@ class GlbViewerWidget(QWidget):
 
     # ### Canvas surface outline rendering ###
     def _refresh_canvas_surface_selection_outlines(self) -> None:
-        """Render one exact yellow boundary for every selected Canvas surface."""
+        """Render exact yellow boundaries and vertices for selected surfaces."""
 
         self._remove_canvas_surface_selection_items()
         if self.model is None:
             return
+        selected_boundaries: list[np.ndarray] = []
         for surface_id in self._selected_canvas_surface_ids:
             surface = self._canvas_surface_targets.get(surface_id)
             if surface is None:
@@ -4295,6 +4313,7 @@ class GlbViewerWidget(QWidget):
             positions = _build_fixed_surface_boundary_line_positions(surface)
             if positions is None:
                 continue
+            selected_boundaries.append(positions)
             item = gl.GLLinePlotItem(
                 pos=np.asarray(positions, dtype=float),
                 color=CANVAS_SURFACE_SELECTION_COLOR,
@@ -4306,6 +4325,21 @@ class GlbViewerWidget(QWidget):
             item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE)
             self.view.addItem(item)
             self._canvas_surface_selection_items.append(item)
+
+        vertex_positions = _build_boundary_vertex_positions(
+            selected_boundaries
+        )
+        if vertex_positions is not None:
+            vertex_item = _DepthTestedOverlayScatterItem(
+                pos=vertex_positions,
+                color=CANVAS_SURFACE_SELECTION_VERTEX_COLOR,
+                size=CANVAS_SURFACE_SELECTION_VERTEX_SIZE_PIXELS,
+                pxMode=True,
+            )
+            vertex_item.setGLOptions("translucent")
+            vertex_item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE)
+            self.view.addItem(vertex_item)
+            self._canvas_surface_selection_vertex_item = vertex_item
         self.view.update()
 
     def _remove_canvas_surface_selection_items(self) -> None:
@@ -4315,6 +4349,10 @@ class GlbViewerWidget(QWidget):
             if item in self.view.items:
                 self.view.removeItem(item)
         self._canvas_surface_selection_items = []
+        vertex_item = self._canvas_surface_selection_vertex_item
+        if vertex_item is not None and vertex_item in self.view.items:
+            self.view.removeItem(vertex_item)
+        self._canvas_surface_selection_vertex_item = None
 
     # ### Level transform preview rendering ###
     def _rebuild_level_transform_preview_source_positions(self) -> None:
@@ -4653,7 +4691,7 @@ class GlbViewerWidget(QWidget):
             )
         elif selected:
             self._set_surface_tools_status(
-                "Click Add vertex to draw vertices, split a surface between "
+                "Click Add vertices to draw vertices, split a surface between "
                 "two edges, or close a face."
             )
         else:
@@ -7090,13 +7128,16 @@ class GlbViewerWidget(QWidget):
             )
         )
         if inactive_vertices:
-            vertex_item = gl.GLScatterPlotItem(
+            vertex_item = _DepthTestedOverlayScatterItem(
                 pos=np.asarray(inactive_vertices, dtype=float),
                 color=CANVAS_SURFACE_DRAWING_VERTEX_COLOR,
                 size=CANVAS_SURFACE_DRAWING_VERTEX_SIZE_PIXELS,
                 pxMode=True,
             )
-            self._add_canvas_surface_drawing_item(vertex_item)
+            self._add_canvas_surface_drawing_item(
+                vertex_item,
+                depth_tested=True,
+            )
 
         active = self._canvas_surface_drawing_vertices.get(
             active_vertex_id or ""
@@ -7111,10 +7152,19 @@ class GlbViewerWidget(QWidget):
             self._add_canvas_surface_drawing_item(active_item)
         self.view.update()
 
-    def _add_canvas_surface_drawing_item(self, item: GLGraphicsItem) -> None:
-        """Render authored topology targets above solid surface depth."""
+    def _add_canvas_surface_drawing_item(
+        self,
+        item: GLGraphicsItem,
+        *,
+        depth_tested: bool = False,
+    ) -> None:
+        """Render one authored-topology target with its intended occlusion."""
 
-        item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+        item.setGLOptions(
+            "translucent"
+            if depth_tested
+            else CANVAS_OPENING_OVERLAY_GL_OPTIONS
+        )
         item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE)
         self.view.addItem(item)
         self._canvas_surface_drawing_items.append(item)
@@ -7975,6 +8025,7 @@ class GlbViewerWidget(QWidget):
         self.projection_camera_indicator_geometries = {}
         self._sync_projection_camera_input_state()
         self._canvas_surface_selection_items = []
+        self._canvas_surface_selection_vertex_item = None
         self._canvas_extrudable_face_outline_items = []
         self._atlas_surface_highlight_items = []
         self._window_preview_item = None
@@ -10056,6 +10107,24 @@ def _build_fixed_surface_boundary_line_positions(
     if len(boundary_edges) == 0:
         boundary_edges = unique_edges
     return np.asarray(vertices[boundary_edges].reshape(-1, 3), dtype=float)
+
+
+def _build_boundary_vertex_positions(
+    boundaries: Sequence[np.ndarray],
+) -> np.ndarray | None:
+    """Return unique world-space vertices from selected surface boundaries."""
+
+    unique_vertices: dict[tuple[int, ...], np.ndarray] = {}
+    scale = 1.0 / CANVAS_FACE_SHARED_EDGE_TOLERANCE_METERS
+    for boundary in boundaries:
+        for vertex in boundary:
+            if not np.isfinite(vertex).all():
+                continue
+            key = tuple(round(float(value) * scale) for value in vertex)
+            unique_vertices.setdefault(key, vertex)
+    if not unique_vertices:
+        return None
+    return np.ascontiguousarray(tuple(unique_vertices.values()), dtype=float)
 
 
 def _offset_points_toward_camera(

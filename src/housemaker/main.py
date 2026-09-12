@@ -2857,7 +2857,7 @@ class BlueprintWorkspace(QWidget):
         self,
         state: _CanvasTopologyUndoState,
     ) -> int:
-        """Restore one Add vertex transaction and its texture bindings."""
+        """Restore one Add vertices transaction and its texture bindings."""
 
         levels_by_index = {level.index: level for level in self.levels}
         restoration_targets: list[
@@ -3100,7 +3100,7 @@ class BlueprintWorkspace(QWidget):
         self,
         raw_surface_ids: object,
     ) -> None:
-        """Delete selected Add vertex faces through the topology transaction."""
+        """Delete selected Add vertices faces through the topology transaction."""
 
         try:
             surface_ids = tuple(
@@ -3116,7 +3116,7 @@ class BlueprintWorkspace(QWidget):
                 surface_ids,
             ),
             success_message=(
-                "Selected Add vertex face deleted. Press Ctrl+Z to restore it."
+                "Selected face deleted. Press Ctrl+Z to restore it."
             ),
         )
         if not deleted:

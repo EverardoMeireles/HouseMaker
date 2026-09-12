@@ -1353,7 +1353,7 @@ class SurfaceVertexDrawingTests(unittest.TestCase):
         )
         previous_meshes = tuple(level.editable_surfaces)
 
-        with self.assertRaisesRegex(ValueError, "created by Add vertex"):
+        with self.assertRaisesRegex(ValueError, "created with Add vertices"):
             delete_directly_drawn_surface_faces(
                 [level],
                 (automatic_surface_id,),

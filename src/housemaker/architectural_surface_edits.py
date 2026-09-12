@@ -599,7 +599,7 @@ def delete_directly_drawn_surface_faces(
     levels: Sequence[LevelData],
     surface_ids: Sequence[str],
 ) -> SurfaceTopologyEditResult:
-    """Delete selected faces authored by the Add vertex tool.
+    """Delete selected faces authored by the Add vertices tool.
 
     Automatically generated remainder and extrusion-side faces are deliberately
     retained. Boundary edges owned only by deleted faces are removed so their
@@ -614,7 +614,9 @@ def delete_directly_drawn_surface_faces(
     except TypeError as error:
         raise ValueError("Surface deletion IDs must contain a sequence.") from error
     if not normalized_ids:
-        raise ValueError("Select at least one Add vertex face to delete.")
+        raise ValueError(
+            "Select at least one face created with Add vertices to delete."
+        )
 
     levels_by_index = {level.index: level for level in level_sequence}
     selected_by_mesh: dict[
@@ -631,14 +633,14 @@ def delete_directly_drawn_surface_faces(
     for surface_id in normalized_ids:
         parsed = parse_editable_surface_id(surface_id)
         if parsed is None:
-            raise ValueError("Only faces created by Add vertex can be deleted.")
+            raise ValueError("Only faces created with Add vertices can be deleted.")
         level_index, face_id, surface_type = parsed
         level = levels_by_index.get(level_index)
         if level is None:
             raise ValueError("The selected editable surface level no longer exists.")
         editable_mesh, face = _find_editable_face(level, face_id)
         if face.surface_type != surface_type or not face.is_directly_drawn:
-            raise ValueError("Only faces created by Add vertex can be deleted.")
+            raise ValueError("Only faces created with Add vertices can be deleted.")
         source_surface = base_surfaces_by_id.get(editable_mesh.source_surface_id)
         if source_surface is None:
             raise ValueError("The edited source surface no longer exists.")

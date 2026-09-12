@@ -10,11 +10,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # ### Imports ###
 import numpy as np
+import trimesh
 from OpenGL import GL
+from pyqtgraph import opengl as gl
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QApplication
-import trimesh
 
 from housemaker.architectural_surface_edits import (
     SurfaceDrawingEdgeTarget,
@@ -30,10 +31,10 @@ from housemaker.canvas_surface_edits import (
 )
 from housemaker.glb import GeneratedModel
 from housemaker.surface_geometry import (
-    FixedSurface,
     SURFACE_TYPE_CEILING,
     SURFACE_TYPE_FLOOR,
     SURFACE_TYPE_WALL,
+    FixedSurface,
 )
 from housemaker.viewer import (
     CANVAS_EXTRUDABLE_FACE_OUTLINE_COLOR,
@@ -41,12 +42,14 @@ from housemaker.viewer import (
     CANVAS_SURFACE_DRAWING_EDGE_COLOR,
     CANVAS_SURFACE_DRAWING_VERTEX_COLOR,
     CANVAS_SURFACE_SELECTION_COLOR,
+    CANVAS_SURFACE_SELECTION_VERTEX_COLOR,
+    CANVAS_SURFACE_SELECTION_VERTEX_SIZE_PIXELS,
     GlbViewerWidget,
+    _DepthTestedOverlayScatterItem,
     _get_nearest_fixed_surface_ray_hit,
     _resolve_canvas_surface_vertex_preview,
     _snap_surface_point_from_active_vertex,
 )
-
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -194,7 +197,7 @@ def _scatter_items_with_color(
 
     matching: list[object] = []
     for item in viewer.view.items:
-        if type(item).__name__ != "GLScatterPlotItem":
+        if not isinstance(item, gl.GLScatterPlotItem):
             continue
         item_color = getattr(item, "color", None)
         if item_color is None:
@@ -319,6 +322,12 @@ class CanvasSurfaceTopologyViewerTests(unittest.TestCase):
         assert viewer.add_window_button is not None
         self.assertFalse(viewer.add_window_button.isEnabled())
 
+    def test_add_vertices_button_uses_plural_label(self) -> None:
+        viewer = self._build_viewer((_build_wall(),))
+
+        assert viewer.add_surface_vertex_button is not None
+        self.assertEqual(viewer.add_surface_vertex_button.text(), "Add vertices")
+
     def test_only_directly_drawn_unselected_face_has_a_blue_boundary(
         self,
     ) -> None:
@@ -405,7 +414,7 @@ class CanvasSurfaceTopologyViewerTests(unittest.TestCase):
         self.assertEqual(generic_deletions, [])
         assert viewer.surface_tools_status_label is not None
         self.assertIn(
-            "created by Add vertex",
+            "created with Add vertices",
             viewer.surface_tools_status_label.text(),
         )
 
@@ -562,6 +571,81 @@ class CanvasSurfaceTopologyViewerTests(unittest.TestCase):
         np.testing.assert_allclose(
             np.asarray(getattr(blue_markers[0], "pos"), dtype=float),
             np.asarray((unowned_point,), dtype=float),
+        )
+
+    def test_blue_authored_vertex_markers_respect_scene_depth(self) -> None:
+        wall = _build_wall()
+        viewer = self._build_viewer((wall,))
+        viewer.set_canvas_surface_drawing_overlay(
+            SurfaceDrawingOverlay(
+                vertices=(
+                    SurfaceDrawingVertexTarget(
+                        vertex_id="1" * 32,
+                        source_surface_id=wall.surface_id,
+                        world_point=(1.0, 0.0, 1.0),
+                        show_marker=True,
+                    ),
+                ),
+                edges=(),
+            )
+        )
+
+        markers = _scatter_items_with_color(
+            viewer,
+            CANVAS_SURFACE_DRAWING_VERTEX_COLOR,
+        )
+        self.assertEqual(len(markers), 1)
+        self.assertIsInstance(markers[0], _DepthTestedOverlayScatterItem)
+        gl_options = markers[0]._GLGraphicsItem__glOpts
+        self.assertTrue(gl_options[GL.GL_DEPTH_TEST])
+
+    def test_selected_surfaces_show_deduplicated_darker_yellow_vertices(
+        self,
+    ) -> None:
+        first = _build_wall("level:0/wall:first")
+        second = _build_wall("level:0/wall:second")
+        viewer = self._build_viewer((first, second))
+
+        viewer.set_selected_canvas_surface_ids(
+            (first.surface_id, second.surface_id)
+        )
+
+        markers = _scatter_items_with_color(
+            viewer,
+            CANVAS_SURFACE_SELECTION_VERTEX_COLOR,
+        )
+        self.assertEqual(len(markers), 1)
+        self.assertIsInstance(markers[0], _DepthTestedOverlayScatterItem)
+        positions = np.asarray(markers[0].pos, dtype=float)
+        self.assertEqual(positions.shape, (4, 3))
+        self.assertEqual(
+            len({tuple(np.round(position, 9)) for position in positions}),
+            4,
+        )
+        self.assertEqual(
+            float(markers[0].size),
+            CANVAS_SURFACE_SELECTION_VERTEX_SIZE_PIXELS,
+        )
+        self.assertTrue(bool(markers[0].pxMode))
+        self.assertLess(
+            sum(CANVAS_SURFACE_SELECTION_VERTEX_COLOR[:3]),
+            sum(CANVAS_SURFACE_SELECTION_COLOR[:3]),
+        )
+        self.assertNotEqual(
+            CANVAS_SURFACE_SELECTION_VERTEX_COLOR,
+            CANVAS_SURFACE_SELECTION_COLOR,
+        )
+        gl_options = markers[0]._GLGraphicsItem__glOpts
+        self.assertTrue(gl_options[GL.GL_DEPTH_TEST])
+
+        viewer.set_selected_canvas_surface_ids(())
+
+        self.assertEqual(
+            _scatter_items_with_color(
+                viewer,
+                CANVAS_SURFACE_SELECTION_VERTEX_COLOR,
+            ),
+            (),
         )
 
     def test_non_extrudable_base_surfaces_have_no_blue_boundaries(self) -> None:
@@ -1492,7 +1576,7 @@ class CanvasSurfaceTopologyViewerTests(unittest.TestCase):
 
         self.assertEqual(
             viewer.surface_tools_status_label.text(),
-            "Click Add vertex to draw vertices, split a surface between "
+            "Click Add vertices to draw vertices, split a surface between "
             "two edges, or close a face.",
         )
 
