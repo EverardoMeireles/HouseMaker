@@ -60,6 +60,7 @@ from housemaker.architectural_surface_edits import (
 from housemaker.atlas_export import apply_texture_atlases_to_export
 from housemaker.blueprint_canvas import (
     CANVAS_SNAPSHOT_ACTION_OPEN_SPACE,
+    CANVAS_SNAPSHOT_ACTION_VERTEX_DELETION,
     BlueprintCanvas,
     CanvasSnapshot,
 )
@@ -149,6 +150,7 @@ from housemaker.models import (
     LevelData,
     StairData,
     StairSectionData,
+    VertexData,
     WindowData,
     create_default_doorway_presets,
     create_default_levels,
@@ -206,6 +208,15 @@ from housemaker.viewer import (
     NAVIGATION_MODE_FIRST_PERSON,
     GlbViewerWidget,
 )
+from housemaker.wall_mirroring import (
+    WallMirrorTopologyResult,
+    WallMirrorVertexLink,
+    find_next_wall_mirror_target_level_index,
+    get_wall_mirror_vertex_ids,
+    mirror_wall_vertex_group,
+    reconcile_wall_mirror_topology,
+    remove_wall_vertex_mirrors,
+)
 
 # ### Constants ###
 LAST_PROJECT_PATH_SETTING_KEY = "last_project_path"
@@ -249,6 +260,8 @@ class _CanvasBlueprintUndoState:
     assignments: tuple[SurfaceTextureAssignment, ...] = ()
     assignment_targets_after: tuple[SurfaceTextureAssignment, ...] | None = ()
     atlas_placements: tuple[tuple[str, TextureAtlasPlacement], ...] = ()
+    wall_mirror_links: tuple[WallMirrorVertexLink, ...] = ()
+    other_level_vertex_data: tuple[tuple[int, VertexData], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -288,6 +301,16 @@ class _CanvasLevelPropertiesUndoState:
     offset_x_meters: float
     offset_y_meters: float
     include_in_export: bool
+
+
+@dataclass(frozen=True)
+class _CanvasWallMirrorUndoState:
+    """Cross-level wall topology before one mirror side-panel action."""
+
+    vertex_data_by_level: tuple[tuple[int, VertexData], ...]
+    wall_mirror_links: tuple[WallMirrorVertexLink, ...]
+    selected_level_index: int
+    selected_vertex_ids: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -340,6 +363,7 @@ _CanvasUndoState = (
     | _CanvasTopologyUndoState
     | _CanvasSurfaceEditUndoState
     | _CanvasLevelPropertiesUndoState
+    | _CanvasWallMirrorUndoState
     | _CanvasOpeningEditUndoState
     | _CanvasWindowAdditionUndoState
     | _CanvasPlacedObjectUndoState
@@ -416,6 +440,7 @@ class BlueprintWorkspace(QWidget):
         )
         self.current_project_path: str | None = None
         self.levels: list[LevelData] = create_default_levels()
+        self.wall_mirror_links: tuple[WallMirrorVertexLink, ...] = ()
         self.image_library_paths: list[str] = []
         self.doorway_presets: list[DoorwayPreset] = (
             create_default_doorway_presets()
@@ -1509,6 +1534,50 @@ class BlueprintWorkspace(QWidget):
         doorways_layout.addLayout(doorway_buttons_layout)
         side_layout.addWidget(self.doorways_group)
 
+        self.wall_mirrors_group = QGroupBox("Wall mirrors")
+        wall_mirrors_layout = QHBoxLayout(self.wall_mirrors_group)
+        wall_mirrors_layout.setSpacing(10)
+
+        self.wall_mirror_up_button = QPushButton("Up")
+        self.wall_mirror_up_button.setObjectName("canvas-wall-mirror-up-button")
+        self.wall_mirror_up_button.setMinimumHeight(40)
+        self.wall_mirror_up_button.setToolTip(
+            "Copy the selected wall vertices and their shared edges to the "
+            "next level above."
+        )
+        self.wall_mirror_up_button.clicked.connect(
+            self._handle_wall_mirror_up_clicked
+        )
+        wall_mirrors_layout.addWidget(self.wall_mirror_up_button)
+
+        self.wall_mirror_undo_button = QPushButton("Undo")
+        self.wall_mirror_undo_button.setObjectName(
+            "canvas-wall-mirror-undo-button"
+        )
+        self.wall_mirror_undo_button.setMinimumHeight(40)
+        self.wall_mirror_undo_button.setToolTip(
+            "Remove mirrors owned by or represented by the selected vertices."
+        )
+        self.wall_mirror_undo_button.clicked.connect(
+            self._handle_wall_mirror_undo_clicked
+        )
+        wall_mirrors_layout.addWidget(self.wall_mirror_undo_button)
+
+        self.wall_mirror_down_button = QPushButton("Down")
+        self.wall_mirror_down_button.setObjectName(
+            "canvas-wall-mirror-down-button"
+        )
+        self.wall_mirror_down_button.setMinimumHeight(40)
+        self.wall_mirror_down_button.setToolTip(
+            "Copy the selected wall vertices and their shared edges to the "
+            "next level below."
+        )
+        self.wall_mirror_down_button.clicked.connect(
+            self._handle_wall_mirror_down_clicked
+        )
+        wall_mirrors_layout.addWidget(self.wall_mirror_down_button)
+        side_layout.addWidget(self.wall_mirrors_group)
+
         self.levels_group = QGroupBox("Levels")
         levels_layout = QVBoxLayout(self.levels_group)
 
@@ -1611,6 +1680,9 @@ class BlueprintWorkspace(QWidget):
         self.canvas.wall_vertex_interaction_changed.connect(
             self._handle_canvas_wall_vertex_interaction_changed
         )
+        self.canvas.selected_vertices_changed.connect(
+            self._handle_canvas_selected_vertex_changed
+        )
         self.canvas.doorways_changed.connect(self._handle_doorways_changed)
         self.canvas.open_spaces_changed.connect(
             self._handle_open_spaces_changed
@@ -1648,6 +1720,7 @@ class BlueprintWorkspace(QWidget):
         self.canvas.stair_delete_requested.connect(
             self._handle_stair_delete_requested
         )
+        self._update_wall_mirror_button_state()
         self._refresh_levels_list()
         self._update_stair_button_state()
         self._update_open_space_controls()
@@ -2321,9 +2394,10 @@ class BlueprintWorkspace(QWidget):
             CanvasSnapshot,
         ):
             return
-        tracks_surface_bindings = (
-            raw_snapshot.action_kind == CANVAS_SNAPSHOT_ACTION_OPEN_SPACE
-        )
+        tracks_surface_bindings = raw_snapshot.action_kind in {
+            CANVAS_SNAPSHOT_ACTION_OPEN_SPACE,
+            CANVAS_SNAPSHOT_ACTION_VERTEX_DELETION,
+        }
         assignments = (
             self.surface_texture_generation.snapshot_assignments()
             if tracks_surface_bindings
@@ -2347,11 +2421,17 @@ class BlueprintWorkspace(QWidget):
                     for placement in atlas.placements
                     if placement.object_id in assignment_source_ids
                 ),
+                wall_mirror_links=self.wall_mirror_links,
+                other_level_vertex_data=tuple(
+                    (level.index, level.vertex_data.clone())
+                    for level in self.levels
+                    if level.index != self.current_level.index
+                ),
             )
         )
 
-    def _finalize_open_space_blueprint_undo_state(self) -> None:
-        """Record only surface bindings changed by the newest hole edit."""
+    def _finalize_blueprint_surface_binding_undo_state(self) -> None:
+        """Record only bindings changed by the newest topology edit."""
 
         if self._is_restoring_canvas_undo or not self._canvas_undo_stack:
             return
@@ -2544,6 +2624,8 @@ class BlueprintWorkspace(QWidget):
                 self._restore_canvas_surface_edit_undo_state(state)
             elif isinstance(state, _CanvasLevelPropertiesUndoState):
                 self._restore_canvas_level_properties_undo_state(state)
+            elif isinstance(state, _CanvasWallMirrorUndoState):
+                self._restore_canvas_wall_mirror_undo_state(state)
             elif isinstance(state, _CanvasOpeningEditUndoState):
                 self._restore_canvas_opening_edit_undo_state(state)
             elif isinstance(state, _CanvasWindowAdditionUndoState):
@@ -2595,14 +2677,7 @@ class BlueprintWorkspace(QWidget):
         """Restore one direct Canvas level-control change."""
 
         self._cancel_pending_level_transform(sync_controls=False)
-        level = next(
-            (
-                candidate
-                for candidate in self.levels
-                if candidate.index == state.level_index
-            ),
-            None,
-        )
+        level = self._get_level_by_index(state.level_index)
         if level is None:
             raise ValueError("The Canvas level in this undo step no longer exists.")
         level.height_meters = state.height_meters
@@ -2621,11 +2696,36 @@ class BlueprintWorkspace(QWidget):
                 level.canvas_offset_y_pixels,
             )
             self.canvas.update()
+        self._sync_canvas_wall_mirror_state()
         self.surface_texture_generation.reconcile_assignments_with_levels(
             self.levels
         )
         self._refresh_scene_atlas_texture_requirements()
         self._schedule_viewer_preview_refresh(preserve_camera=True)
+
+    def _restore_canvas_wall_mirror_undo_state(
+        self,
+        state: _CanvasWallMirrorUndoState,
+    ) -> None:
+        """Restore every level touched by one atomic wall-mirror action."""
+
+        restored_level_indices: set[int] = set()
+        for level_index, vertex_data in state.vertex_data_by_level:
+            level = self._get_level_by_index(level_index)
+            if level is None:
+                raise ValueError(
+                    "A wall-mirror level in this undo step no longer exists."
+                )
+            level.vertex_data.copy_from(vertex_data)
+            restored_level_indices.add(level_index)
+
+        self.wall_mirror_links = state.wall_mirror_links
+        if self.current_level.index == state.selected_level_index:
+            self.canvas.set_selected_vertex_ids(state.selected_vertex_ids)
+        self._sync_canvas_wall_mirror_state()
+        self._update_wall_mirror_button_state()
+        if restored_level_indices:
+            self._reconcile_canvas_surface_edit_and_refresh()
 
     def _restore_canvas_opening_edit_undo_state(
         self,
@@ -2728,14 +2828,7 @@ class BlueprintWorkspace(QWidget):
     ) -> int:
         """Restore one 2D snapshot plus conservatively affected bindings."""
 
-        level = next(
-            (
-                candidate
-                for candidate in self.levels
-                if candidate.index == state.level_index
-            ),
-            None,
-        )
+        level = self._get_level_by_index(state.level_index)
         if level is None:
             raise ValueError("The Canvas level in this undo step no longer exists.")
         if level is self.current_level:
@@ -2754,6 +2847,15 @@ class BlueprintWorkspace(QWidget):
                 self.levels
             )
             self._schedule_viewer_preview_refresh(preserve_camera=True)
+        for other_level_index, vertex_data in state.other_level_vertex_data:
+            other_level = self._get_level_by_index(other_level_index)
+            if other_level is None:
+                raise ValueError(
+                    "A wall-mirror level in this undo step no longer exists."
+                )
+            other_level.vertex_data.copy_from(vertex_data)
+        self.wall_mirror_links = state.wall_mirror_links
+        self._sync_canvas_wall_mirror_state()
         return self._restore_blueprint_surface_bindings(state)
 
     def _restore_blueprint_surface_bindings(
@@ -3311,6 +3413,8 @@ class BlueprintWorkspace(QWidget):
                 continue
             synced_level_ids.add(level_identity)
             self._sync_live_canvas_surface_edit(applied)
+        if synced_level_ids:
+            self._sync_canvas_wall_mirror_state()
 
     def _handle_canvas_surface_edit_started(self, raw_edit: object) -> None:
         """Remember the immutable baseline for one live structural drag."""
@@ -3483,7 +3587,7 @@ class BlueprintWorkspace(QWidget):
                 self.levels
             )
         )
-        self._finalize_open_space_blueprint_undo_state()
+        self._finalize_blueprint_surface_binding_undo_state()
         if not assignments_changed:
             self._schedule_viewer_preview_refresh(preserve_camera=True)
 
@@ -4130,6 +4234,7 @@ class BlueprintWorkspace(QWidget):
             self._cancel_pending_wall_vertex_update()
             self._cancel_pending_doorway_mesh_update(clear_outline=True)
             self._clear_canvas_undo_history()
+            self._sync_canvas_wall_mirror_state()
             self._mark_viewer_preview_dirty(preserve_camera=False)
 
     def _handle_workspace_tab_changed(self, tab_index: int) -> None:
@@ -7360,6 +7465,7 @@ class BlueprintWorkspace(QWidget):
                 ),
                 texture_atlases=self.texture_atlas_workspace.get_data(),
                 stairs=self.stairs,
+                wall_mirror_links=self.wall_mirror_links,
             )
         except ValueError as error:
             QMessageBox.critical(self, "Save failed", str(error))
@@ -8057,6 +8163,7 @@ class BlueprintWorkspace(QWidget):
         )
         if level is self.current_level:
             self.canvas.update()
+        self._sync_canvas_wall_mirror_state()
         self._schedule_viewer_preview_refresh(preserve_camera=True)
         self._level_transform_outline_commit_revision = (
             self._viewer_preview_revision
@@ -8323,6 +8430,235 @@ class BlueprintWorkspace(QWidget):
 
         self.canvas.start_doorway_placement(doorway_preset)
         self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
+
+    # ### Wall level mirror controls ###
+    def _handle_wall_mirror_up_clicked(self) -> None:
+        """Mirror the selected wall-vertex group onto the next upper level."""
+
+        self._mirror_selected_wall_vertices(1)
+
+    def _handle_wall_mirror_down_clicked(self) -> None:
+        """Mirror the selected wall-vertex group onto the next lower level."""
+
+        self._mirror_selected_wall_vertices(-1)
+
+    def _handle_wall_mirror_undo_clicked(self) -> None:
+        """Remove mirrors owned by, or materialized as, selected vertices."""
+
+        selected_vertex_ids = self._get_selected_canvas_wall_vertex_ids()
+        if not self._selected_vertices_have_wall_mirrors(selected_vertex_ids):
+            self._update_wall_mirror_button_state()
+            return
+
+        self._commit_pending_wall_mirror_prerequisites()
+        undo_state = self._capture_canvas_wall_mirror_undo_state()
+        result = remove_wall_vertex_mirrors(
+            self.levels,
+            self.wall_mirror_links,
+            self.current_level.index,
+            selected_vertex_ids,
+        )
+        if not result.changed:
+            self._update_wall_mirror_button_state()
+            return
+        self._record_canvas_undo_state(
+            undo_state,
+            commit_pending_surface_edit=False,
+        )
+        self.wall_mirror_links = result.links
+        self._finalize_wall_mirror_topology_change(result)
+
+    def _mirror_selected_wall_vertices(self, direction: int) -> None:
+        """Copy one selected group and its internal edges to another level."""
+
+        selected_vertex_ids = self._get_selected_canvas_wall_vertex_ids()
+        if not selected_vertex_ids:
+            self._update_wall_mirror_button_state()
+            return
+        target_level_index = find_next_wall_mirror_target_level_index(
+            self.levels,
+            self.wall_mirror_links,
+            self.current_level.index,
+            selected_vertex_ids,
+            direction,
+        )
+        if target_level_index is None:
+            self._update_wall_mirror_button_state()
+            return
+
+        self._commit_pending_wall_mirror_prerequisites()
+        undo_state = self._capture_canvas_wall_mirror_undo_state()
+        result = mirror_wall_vertex_group(
+            self.levels,
+            self.wall_mirror_links,
+            self.current_level.index,
+            selected_vertex_ids,
+            target_level_index,
+        )
+        if not result.changed:
+            self._update_wall_mirror_button_state()
+            return
+        self._record_canvas_undo_state(
+            undo_state,
+            commit_pending_surface_edit=False,
+        )
+        self.wall_mirror_links = result.links
+        self._finalize_wall_mirror_topology_change(result)
+
+    def _commit_pending_wall_mirror_prerequisites(self) -> None:
+        """Commit older delayed edits before a cross-level topology action."""
+
+        self._finish_level_transform_drag()
+        self._commit_pending_level_transform_update()
+        self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_wall_vertex_update()
+
+    def _capture_canvas_wall_mirror_undo_state(
+        self,
+    ) -> _CanvasWallMirrorUndoState:
+        """Snapshot cross-level wall topology and its current selection."""
+
+        return _CanvasWallMirrorUndoState(
+            vertex_data_by_level=tuple(
+                (level.index, level.vertex_data.clone())
+                for level in self.levels
+            ),
+            wall_mirror_links=self.wall_mirror_links,
+            selected_level_index=self.current_level.index,
+            selected_vertex_ids=self.canvas.selected_vertex_ids,
+        )
+
+    def _finalize_wall_mirror_topology_change(
+        self,
+        result: WallMirrorTopologyResult,
+    ) -> None:
+        """Refresh mirror markers and debounce one resulting mesh rebuild."""
+
+        self._sync_canvas_wall_mirror_state()
+        self._update_wall_mirror_button_state()
+        if result.changed_level_indices:
+            self._pending_wall_vertex_mesh_update = True
+            self._restart_pending_wall_vertex_update_if_idle()
+
+    def _handle_canvas_selected_vertex_changed(
+        self,
+        _vertex_ids: object,
+    ) -> None:
+        """Keep Wall mirrors availability aligned with Canvas selection."""
+
+        self._update_wall_mirror_button_state()
+
+    def _update_wall_mirror_button_state(self) -> None:
+        """Enable only mirror operations valid for the selected vertex group."""
+
+        if not hasattr(self, "wall_mirror_up_button"):
+            return
+        selected_vertex_ids = self._get_selected_canvas_wall_vertex_ids()
+        has_selection = bool(selected_vertex_ids)
+        upper_target_index = (
+            find_next_wall_mirror_target_level_index(
+                self.levels,
+                self.wall_mirror_links,
+                self.current_level.index,
+                selected_vertex_ids,
+                1,
+            )
+            if has_selection
+            else None
+        )
+        lower_target_index = (
+            find_next_wall_mirror_target_level_index(
+                self.levels,
+                self.wall_mirror_links,
+                self.current_level.index,
+                selected_vertex_ids,
+                -1,
+            )
+            if has_selection
+            else None
+        )
+        self.wall_mirror_up_button.setEnabled(upper_target_index is not None)
+        self.wall_mirror_undo_button.setEnabled(
+            self._selected_vertices_have_wall_mirrors(selected_vertex_ids)
+        )
+        self.wall_mirror_down_button.setEnabled(lower_target_index is not None)
+
+    def _get_selected_canvas_wall_vertex_ids(self) -> tuple[int, ...]:
+        """Return valid selected vertices, excluding room-center helpers."""
+
+        vertex_data = self.current_level.vertex_data
+        room_center_vertex_ids = {
+            room.center_vertex_id
+            for room in self.current_level.rooms
+        }
+        wall_vertex_ids = {
+            vertex_id
+            for edge in vertex_data.edges
+            for vertex_id in (edge.start_vertex_id, edge.end_vertex_id)
+        }
+        wall_vertex_ids.update(
+            get_wall_mirror_vertex_ids(
+                self.wall_mirror_links,
+                self.current_level.index,
+            )
+        )
+        return tuple(
+            vertex_id
+            for vertex_id in self.canvas.selected_vertex_ids
+            if vertex_data.get_vertex(vertex_id) is not None
+            and vertex_id not in room_center_vertex_ids
+            and vertex_id in wall_vertex_ids
+        )
+
+    def _selected_vertices_have_wall_mirrors(
+        self,
+        selected_vertex_ids: Sequence[int],
+    ) -> bool:
+        """Return whether selected vertices own or are owned mirror copies."""
+
+        selected_ids = set(selected_vertex_ids)
+        level_index = self.current_level.index
+        return any(
+            (
+                link.source_level_index == level_index
+                and link.source_vertex_id in selected_ids
+            )
+            or (
+                link.target_level_index == level_index
+                and link.target_vertex_id in selected_ids
+            )
+            for link in self.wall_mirror_links
+        )
+
+    def _get_level_by_index(self, level_index: int) -> LevelData | None:
+        """Resolve a persistent level by elevation index, never list row."""
+
+        return next(
+            (
+                level
+                for level in self.levels
+                if level.index == level_index
+            ),
+            None,
+        )
+
+    def _sync_canvas_wall_mirror_state(self) -> WallMirrorTopologyResult:
+        """Reconcile owned copies and mark local mirror endpoints in green."""
+
+        result = reconcile_wall_mirror_topology(
+            self.levels,
+            self.wall_mirror_links,
+        )
+        self.wall_mirror_links = result.links
+        self.canvas.set_wall_mirror_vertex_ids(
+            get_wall_mirror_vertex_ids(
+                self.wall_mirror_links,
+                self.current_level.index,
+            )
+        )
+        self.canvas.prune_missing_vertex_references()
+        self.canvas.update()
+        return result
 
     def _handle_canvas_doorway_selection_changed(
         self,
@@ -8725,6 +9061,7 @@ class BlueprintWorkspace(QWidget):
     def _handle_canvas_surface_geometry_changed(self) -> None:
         """Reconcile changed surfaces before refreshing Canvas geometry."""
 
+        self._sync_canvas_wall_mirror_state()
         if self._pending_wall_vertex_mesh_update:
             self._restart_pending_wall_vertex_update_if_idle()
             return
@@ -8733,7 +9070,7 @@ class BlueprintWorkspace(QWidget):
                 self.levels
             )
         )
-        self._finalize_open_space_blueprint_undo_state()
+        self._finalize_blueprint_surface_binding_undo_state()
         if not assignments_changed:
             self._schedule_viewer_preview_refresh()
 
@@ -8809,6 +9146,7 @@ class BlueprintWorkspace(QWidget):
             ),
             texture_atlases=project_data.texture_atlases,
             stairs=project_data.stairs,
+            wall_mirror_links=project_data.wall_mirror_links,
         )
 
     def _apply_project_state(
@@ -8821,6 +9159,7 @@ class BlueprintWorkspace(QWidget):
         surface_texture_generation: SurfaceTextureData | None = None,
         texture_atlases: TextureAtlasData | None = None,
         stairs: list[StairData] | None = None,
+        wall_mirror_links: Sequence[WallMirrorVertexLink] | None = None,
     ) -> None:
         if (
             self.generation.is_generating
@@ -8857,6 +9196,11 @@ class BlueprintWorkspace(QWidget):
         self._clear_canvas_undo_history()
         self.viewer.set_window_undo_available(False)
         self.levels = levels
+        wall_mirror_result = reconcile_wall_mirror_topology(
+            self.levels,
+            wall_mirror_links or (),
+        )
+        self.wall_mirror_links = wall_mirror_result.links
         self._reset_viewer_doorway_snapshots()
         self._level_blueprint_image_revisions.clear()
         self.stairs = list(stairs or [])
@@ -8936,6 +9280,7 @@ class BlueprintWorkspace(QWidget):
         self.current_level.image_path = normalized_path
         self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
         self.canvas.set_stair_context(self.stairs, self.current_level)
+        self._sync_canvas_wall_mirror_state()
         self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
         self._update_blueprint_name_label()
         self._update_open_space_controls()
@@ -8968,6 +9313,8 @@ class BlueprintWorkspace(QWidget):
         if self.canvas.blueprint_image is not None:
             self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
         self.canvas.set_stair_context(self.stairs, self.current_level)
+        self._sync_canvas_wall_mirror_state()
+        self._update_wall_mirror_button_state()
         self._sync_selected_canvas_wall_highlight(
             self.viewer.get_active_canvas_surface_id()
         )

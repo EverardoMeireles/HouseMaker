@@ -16,13 +16,13 @@ from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
     QSplitter,
+    QStackedWidget,
     QTabWidget,
     QWidget,
 )
 
 from housemaker.external_viewer_host import ExternalFullscreenViewerHost
 from housemaker.viewer import GlbViewerWidget
-
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -173,6 +173,24 @@ class ExternalFullscreenViewerHostTests(unittest.TestCase):
         self.assertTrue(host.is_active)
         self.assertTrue(viewer.isVisible())
         self.assertFalse(viewer.isHidden())
+        placeholder = tabs.findChild(
+            QWidget,
+            "external-viewer-placeholder",
+        )
+        self.assertIsNotNone(placeholder)
+        assert placeholder is not None
+        self.assertTrue(placeholder.isHidden())
+        self.assertTrue(
+            placeholder.testAttribute(
+                Qt.WidgetAttribute.WA_TransparentForMouseEvents
+            )
+        )
+        stack = placeholder.parentWidget()
+        self.assertIsInstance(stack, QStackedWidget)
+        assert isinstance(stack, QStackedWidget)
+        for position in (QPoint(1, 1), QPoint(639, 479)):
+            with self.subTest(position=position):
+                self.assertIs(stack.childAt(position), canvas_view)
 
         host.restore()
         _qt_application.processEvents()

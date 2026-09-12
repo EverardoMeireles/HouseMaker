@@ -5,6 +5,7 @@ import json
 import math
 import os
 import tempfile
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from housemaker.models import (
     MAX_DOORWAY_HEIGHT_METERS,
     MAX_DOORWAY_WIDTH_METERS,
     MAX_FLOOR_THICKNESS_METERS,
+    MAX_LEVEL_INDEX,
     MAX_LEVEL_OFFSET_METERS,
     MAX_LEVEL_SCALE,
     MIN_CANVAS_LEVEL_SCALE,
@@ -42,6 +44,7 @@ from housemaker.models import (
     MIN_DOORWAY_HEIGHT_METERS,
     MIN_DOORWAY_WIDTH_METERS,
     MIN_FLOOR_THICKNESS_METERS,
+    MIN_LEVEL_INDEX,
     MIN_LEVEL_OFFSET_METERS,
     MIN_LEVEL_SCALE,
     DoorwayData,
@@ -64,6 +67,13 @@ from housemaker.models import (
 )
 from housemaker.surface_texture_state import SurfaceTextureData
 from housemaker.texture_atlas_state import TextureAtlasData
+from housemaker.wall_mirroring import (
+    WallMirrorVertexLink,
+    materialize_legacy_wall_mirrors,
+    reconcile_wall_mirror_topology,
+    wall_mirror_links_from_payload,
+    wall_mirror_links_to_dicts,
+)
 
 # ### Constants ###
 PROJECT_FILE_VERSION = 1
@@ -85,6 +95,7 @@ class ProjectData:
     )
     stairs: list[StairData] = field(default_factory=list)
     texture_atlases: TextureAtlasData = field(default_factory=TextureAtlasData)
+    wall_mirror_links: tuple[WallMirrorVertexLink, ...] = ()
 
 
 # ### Public helpers ###
@@ -98,6 +109,7 @@ def save_project(
     surface_texture_generation: SurfaceTextureData | None = None,
     stairs: list[StairData] | None = None,
     texture_atlases: TextureAtlasData | None = None,
+    wall_mirror_links: Iterable[WallMirrorVertexLink] | None = None,
 ) -> Path:
     export_path = Path(path)
     payload = {
@@ -128,6 +140,9 @@ def save_project(
             else TextureAtlasData().to_dict()
         ),
         "stairs": _serialize_stairs(stairs or []),
+        "wall_mirror_links": wall_mirror_links_to_dicts(
+            wall_mirror_links or ()
+        ),
         "levels": [
             {
                 "index": level.index,
@@ -189,6 +204,10 @@ def load_project(path: str | Path) -> ProjectData:
 
     levels = create_default_levels()
     level_lookup = {level.index: level for level in levels}
+    legacy_wall_mirror_targets: dict[
+        tuple[int, int],
+        tuple[int, ...],
+    ] = {}
 
     for raw_level in payload.get("levels", []):
         level_index = int(raw_level.get("index", -1))
@@ -240,7 +259,17 @@ def load_project(path: str | Path) -> ProjectData:
         level.include_in_export = bool(
             raw_level.get("include_in_export", DEFAULT_INCLUDE_IN_EXPORT)
         )
-        level.vertex_data = VertexData.from_dict(raw_level.get("vertex_data", {}))
+        raw_vertex_data = raw_level.get("vertex_data", {})
+        level.vertex_data = VertexData.from_dict(raw_vertex_data)
+        legacy_wall_mirror_targets.update(
+            _deserialize_legacy_wall_mirror_targets(
+                raw_vertex_data,
+                source_level_index=level.index,
+                known_vertex_ids={
+                    vertex.id for vertex in level.vertex_data.vertices
+                },
+            )
+        )
         level.rooms = _deserialize_rooms(
             raw_level.get("rooms", []),
             default_height_meters=level.height_meters,
@@ -278,6 +307,19 @@ def load_project(path: str | Path) -> ProjectData:
         payload.get("stairs"),
         valid_level_indices=set(level_lookup),
     )
+    loaded_wall_mirror_links = wall_mirror_links_from_payload(
+        payload.get("wall_mirror_links"),
+        levels=levels,
+    )
+    reconciled_wall_mirrors = reconcile_wall_mirror_topology(
+        levels,
+        loaded_wall_mirror_links,
+    )
+    materialized_wall_mirrors = materialize_legacy_wall_mirrors(
+        levels,
+        legacy_wall_mirror_targets,
+        reconciled_wall_mirrors.links,
+    )
     _clear_image_library_paths_from_levels(levels, image_library_paths)
 
     current_level_index = int(payload.get("current_level_index", GROUND_LEVEL_INDEX))
@@ -294,6 +336,7 @@ def load_project(path: str | Path) -> ProjectData:
         surface_texture_generation=surface_texture_generation,
         texture_atlases=texture_atlases,
         stairs=stairs,
+        wall_mirror_links=materialized_wall_mirrors.links,
     )
 
 
@@ -883,6 +926,52 @@ def _deserialize_editable_surface(
         faces=faces,
         edges=edges,
     )
+
+
+# ### Legacy wall-mirror migration helpers ###
+def _deserialize_legacy_wall_mirror_targets(
+    raw_vertex_data: object,
+    *,
+    source_level_index: int,
+    known_vertex_ids: set[int],
+) -> dict[tuple[int, int], tuple[int, ...]]:
+    """Read the former per-vertex flags without retaining them in VertexData."""
+
+    if not isinstance(raw_vertex_data, dict):
+        return {}
+    raw_levels_by_vertex_id = raw_vertex_data.get("wall_mirror_levels")
+    if not isinstance(raw_levels_by_vertex_id, dict):
+        return {}
+
+    targets_by_source: dict[tuple[int, int], tuple[int, ...]] = {}
+    for raw_vertex_id, raw_target_indices in raw_levels_by_vertex_id.items():
+        if isinstance(raw_vertex_id, bool):
+            continue
+        try:
+            vertex_id = int(raw_vertex_id)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if vertex_id <= 0 or vertex_id not in known_vertex_ids:
+            continue
+        if not isinstance(raw_target_indices, list | tuple):
+            continue
+        target_indices = tuple(
+            sorted(
+                {
+                    target_index
+                    for target_index in raw_target_indices
+                    if isinstance(target_index, int)
+                    and not isinstance(target_index, bool)
+                    and MIN_LEVEL_INDEX <= target_index <= MAX_LEVEL_INDEX
+                    and target_index != source_level_index
+                }
+            )
+        )
+        if target_indices:
+            targets_by_source[(source_level_index, vertex_id)] = (
+                target_indices
+            )
+    return targets_by_source
 
 
 # ### Room serialization helpers ###

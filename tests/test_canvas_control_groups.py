@@ -10,6 +10,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 # ### Imports ###
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtGui import QImage
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QGroupBox, QLabel, QWidget
 
 from housemaker.app_settings import ApplicationSettingsStore
@@ -102,6 +105,39 @@ class CanvasControlGroupingTests(unittest.TestCase):
             labels={"Arch amount"},
         )
 
+    def test_wall_mirrors_group_follows_doorways_with_three_actions(self) -> None:
+        self._assert_group_contains(
+            "Wall mirrors",
+            self.workspace.wall_mirror_up_button,
+            self.workspace.wall_mirror_undo_button,
+            self.workspace.wall_mirror_down_button,
+        )
+        self.assertEqual(self.workspace.wall_mirror_up_button.text(), "Up")
+        self.assertEqual(self.workspace.wall_mirror_undo_button.text(), "Undo")
+        self.assertEqual(self.workspace.wall_mirror_down_button.text(), "Down")
+
+        mirrors_layout = self.workspace.wall_mirrors_group.layout()
+        assert mirrors_layout is not None
+        self.assertIs(
+            mirrors_layout.itemAt(0).widget(),
+            self.workspace.wall_mirror_up_button,
+        )
+        self.assertIs(
+            mirrors_layout.itemAt(1).widget(),
+            self.workspace.wall_mirror_undo_button,
+        )
+        self.assertIs(
+            mirrors_layout.itemAt(2).widget(),
+            self.workspace.wall_mirror_down_button,
+        )
+
+        side_layout = self.workspace.doorways_group.parentWidget().layout()
+        assert side_layout is not None
+        self.assertEqual(
+            side_layout.indexOf(self.workspace.wall_mirrors_group),
+            side_layout.indexOf(self.workspace.doorways_group) + 1,
+        )
+
     def test_stairs_group_contains_type_status_and_add_controls(self) -> None:
         self._assert_group_contains(
             "Stairs",
@@ -125,6 +161,39 @@ class CanvasControlGroupingTests(unittest.TestCase):
             self.workspace.floor_thickness_spinbox,
             labels={"Height level", "Floor thickness"},
         )
+
+    def test_narrow_workspace_keeps_the_full_canvas_interactive(self) -> None:
+        self.workspace.resize(760, 700)
+        _qt_application.processEvents()
+        canvas = self.workspace.canvas
+        visible_bounds = canvas.visibleRegion().boundingRect()
+
+        self.assertEqual(visible_bounds, canvas.rect())
+        top_right = QPoint(canvas.width() - 4, 12)
+        self.assertIs(
+            QApplication.widgetAt(canvas.mapToGlobal(top_right)),
+            canvas,
+        )
+
+        canvas.blueprint_image = QImage(
+            100,
+            100,
+            QImage.Format.Format_RGB32,
+        )
+        existing_vertex = canvas.vertex_data.add_vertex(90.0, 10.0)
+        QTest.mouseClick(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            pos=canvas._image_to_widget(90.0, 10.0).toPoint(),
+        )
+        self.assertEqual(canvas.selected_vertex_id, existing_vertex.id)
+
+        QTest.mouseClick(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            pos=canvas._image_to_widget(90.0, 70.0).toPoint(),
+        )
+        self.assertEqual(len(canvas.vertex_data.vertices), 2)
 
 
 if __name__ == "__main__":

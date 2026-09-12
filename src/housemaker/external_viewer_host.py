@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QCloseEvent, QScreen
 from PySide6.QtWidgets import (
     QLayout,
@@ -194,6 +194,7 @@ def _replace_viewer_with_placeholder(viewer: QWidget) -> _ViewerPlacement:
         index = parent.indexOf(viewer)
         if index >= 0:
             parent.replaceWidget(index, placeholder)
+            placeholder.setVisible(was_visible)
             viewer.setParent(None)
             return _ViewerPlacement(
                 parent=parent,
@@ -209,6 +210,10 @@ def _replace_viewer_with_placeholder(viewer: QWidget) -> _ViewerPlacement:
         if index >= 0:
             replaced_item = layout.replaceWidget(viewer, placeholder)
             del replaced_item
+            if isinstance(layout, QStackedLayout):
+                placeholder.setVisible(layout.currentWidget() is placeholder)
+            else:
+                placeholder.setVisible(was_visible)
             viewer.setParent(None)
             return _ViewerPlacement(
                 parent=parent,
@@ -254,6 +259,11 @@ def _restore_viewer_placement(viewer: QWidget, placement: _ViewerPlacement) -> N
 def _create_viewer_placeholder(viewer: QWidget) -> QWidget:
     placeholder = QWidget()
     placeholder.setObjectName("external-viewer-placeholder")
+    placeholder.setAttribute(
+        Qt.WidgetAttribute.WA_TransparentForMouseEvents,
+        True,
+    )
+    placeholder.setFocusPolicy(Qt.FocusPolicy.NoFocus)
     placeholder.setMinimumSize(viewer.minimumSize())
     placeholder.setMaximumSize(viewer.maximumSize())
     placeholder.setSizePolicy(viewer.sizePolicy())

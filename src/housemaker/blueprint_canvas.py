@@ -6,7 +6,7 @@ import math
 import uuid
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
-from itertools import combinations
+from itertools import combinations, pairwise
 from pathlib import Path
 
 import cv2
@@ -67,6 +67,7 @@ GUIDE_COLOR = QColor("#39d98a")
 VERTEX_FILL_COLOR = QColor("#ffffff")
 ACTIVE_VERTEX_FILL_COLOR = QColor("#ff7f50")
 SELECTED_VERTEX_FILL_COLOR = QColor("#90cdf4")
+WALL_MIRROR_VERTEX_FILL_COLOR = QColor("#39d98a")
 VERTEX_OUTLINE_COLOR = QColor("#20242a")
 TEXT_COLOR = QColor("#f5f7fa")
 DOORWAY_FILL_COLOR = QColor(97, 196, 255, 115)
@@ -118,6 +119,7 @@ PENDING_OPEN_SPACE_FILL_COLOR = QColor(255, 209, 102, 64)
 PENDING_OPEN_SPACE_EDGE_COLOR = QColor("#ffd166")
 OPEN_SPACE_HIT_TOLERANCE_SCREEN = 8.0
 CANVAS_SNAPSHOT_ACTION_OPEN_SPACE = "open_space"
+CANVAS_SNAPSHOT_ACTION_VERTEX_DELETION = "vertex_deletion"
 
 # ### Snapshot models ###
 @dataclass
@@ -131,6 +133,7 @@ class CanvasSnapshot:
     selected_open_space_id: str | None
     preview_point: tuple[float, float] | None
     action_kind: str | None = None
+    selected_vertex_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -345,6 +348,8 @@ class BlueprintCanvas(QWidget):
     stair_placement_cancelled = Signal()
     stair_placement_invalid_endpoint = Signal(str)
     stair_delete_requested = Signal(int)
+    selected_vertex_changed = Signal(object)
+    selected_vertices_changed = Signal(object)
     undo_snapshot_created = Signal(object)
     undo_snapshot_discarded = Signal(object)
     undo_requested = Signal()
@@ -370,7 +375,8 @@ class BlueprintCanvas(QWidget):
             _BlueprintImageCacheEntry | None
         ) = None
         self.active_vertex_id: int | None = None
-        self.selected_vertex_id: int | None = None
+        self._selected_vertex_ids: tuple[int, ...] = ()
+        self._wall_mirror_vertex_ids: frozenset[int] = frozenset()
         self.preview_point: tuple[float, float] | None = None
         self.preview_guides: list[SnapGuide] = []
         self.undo_stack: list[CanvasSnapshot] = []
@@ -414,11 +420,114 @@ class BlueprintCanvas(QWidget):
 
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setMinimumSize(640, 480)
+        # The tab viewport can be narrower than 640 px when the Canvas side
+        # panel is visible.  A hard minimum leaves the right side painted but
+        # clipped outside the widget's interactive region.
+        self.setMinimumSize(0, 0)
 
         self.undo_shortcut = QShortcut(QKeySequence.StandardKey.Undo, self)
         self.undo_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self.undo_shortcut.activated.connect(self.undo_last_step)
+
+    @property
+    def selected_vertex_id(self) -> int | None:
+        """Return the most recently selected vertex for compatibility."""
+
+        if not self._selected_vertex_ids:
+            return None
+        return self._selected_vertex_ids[-1]
+
+    @selected_vertex_id.setter
+    def selected_vertex_id(self, vertex_id: int | None) -> None:
+        """Replace the selection with one vertex, or clear it."""
+
+        self.set_selected_vertex_ids(
+            () if vertex_id is None else (vertex_id,)
+        )
+
+    @property
+    def selected_vertex_ids(self) -> tuple[int, ...]:
+        """Return selected vertex IDs in selection order."""
+
+        return self._selected_vertex_ids
+
+    def set_selected_vertex_ids(self, vertex_ids: Iterable[int]) -> bool:
+        """Replace the ordered vertex selection and report whether it changed."""
+
+        normalized_ids = tuple(dict.fromkeys(vertex_ids))
+        if normalized_ids == self._selected_vertex_ids:
+            return False
+
+        previous_primary_id = self.selected_vertex_id
+        self._selected_vertex_ids = normalized_ids
+        primary_id = self.selected_vertex_id
+        self.selected_vertices_changed.emit(normalized_ids)
+        if primary_id != previous_primary_id:
+            self.selected_vertex_changed.emit(primary_id)
+        self.update()
+        return True
+
+    def select_vertex(self, vertex_id: int, *, additive: bool = False) -> bool:
+        """Select one local vertex, optionally toggling it in the current group."""
+
+        if self.vertex_data.get_vertex(vertex_id) is None:
+            return False
+        if not additive:
+            return self.set_selected_vertex_ids((vertex_id,))
+
+        selected_ids = list(self._selected_vertex_ids)
+        if vertex_id in selected_ids:
+            selected_ids.remove(vertex_id)
+        else:
+            selected_ids.append(vertex_id)
+        return self.set_selected_vertex_ids(selected_ids)
+
+    def set_wall_mirror_vertex_ids(self, vertex_ids: Iterable[int]) -> bool:
+        """Set the local vertices drawn as mirrored wall references."""
+
+        normalized_ids = frozenset(int(vertex_id) for vertex_id in vertex_ids)
+        if normalized_ids == self._wall_mirror_vertex_ids:
+            return False
+        self._wall_mirror_vertex_ids = normalized_ids
+        self.update()
+        return True
+
+    def get_wall_mirror_vertex_ids(self) -> frozenset[int]:
+        """Return the local vertex IDs currently marked as wall mirrors."""
+
+        return self._wall_mirror_vertex_ids
+
+    def prune_missing_vertex_references(self) -> bool:
+        """Clear interaction state that refers to deleted local vertices."""
+
+        known_vertex_ids = {
+            vertex.id for vertex in self.vertex_data.vertices
+        }
+        changed = self.set_selected_vertex_ids(
+            vertex_id
+            for vertex_id in self._selected_vertex_ids
+            if vertex_id in known_vertex_ids
+        )
+        if (
+            self.active_vertex_id is not None
+            and self.active_vertex_id not in known_vertex_ids
+        ):
+            self.active_vertex_id = None
+            self.preview_point = None
+            self.preview_guides = []
+            changed = True
+        if (
+            self.pressed_vertex_id is not None
+            and self.pressed_vertex_id not in known_vertex_ids
+        ) or (
+            self.drag_vertex_id is not None
+            and self.drag_vertex_id not in known_vertex_ids
+        ):
+            self._reset_pointer_state()
+            changed = True
+        if changed:
+            self.update()
+        return changed
 
     def set_external_undo_history_enabled(self, enabled: bool) -> None:
         """Route snapshots and Ctrl+Z to the owning workspace when enabled."""
@@ -1001,6 +1110,7 @@ class BlueprintCanvas(QWidget):
             canvas_offset_y_pixels
         )
         self._level_comparison_overlay = None
+        self._wall_mirror_vertex_ids = frozenset()
         self.active_vertex_id = None
         self.selected_vertex_id = None
         self.selected_open_space_id = None
@@ -1049,7 +1159,10 @@ class BlueprintCanvas(QWidget):
         self.open_spaces.clear()
         self.open_spaces.extend(snapshot.open_spaces)
         self.active_vertex_id = snapshot.active_vertex_id
-        self.selected_vertex_id = snapshot.selected_vertex_id
+        selected_vertex_ids = snapshot.selected_vertex_ids
+        if not selected_vertex_ids and snapshot.selected_vertex_id is not None:
+            selected_vertex_ids = (snapshot.selected_vertex_id,)
+        self.set_selected_vertex_ids(selected_vertex_ids)
         self.selected_open_space_id = snapshot.selected_open_space_id
         self.preview_point = snapshot.preview_point
         self.preview_guides = []
@@ -1138,7 +1251,7 @@ class BlueprintCanvas(QWidget):
             return
 
         if event.key() == Qt.Key.Key_Delete:
-            self._delete_selected_vertex()
+            self._delete_selected_vertices()
             event.accept()
             return
 
@@ -1275,6 +1388,14 @@ class BlueprintCanvas(QWidget):
 
         self._set_selected_doorway_index(None)
         hit_vertex = self._find_vertex_at(event.position())
+        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            self._clear_active_vertex_chain_for_selection()
+            if hit_vertex is not None:
+                self.select_vertex(hit_vertex.id, additive=True)
+            self.update()
+            event.accept()
+            return
+
         if hit_vertex is not None:
             self._begin_wall_vertex_interaction()
             self.selected_vertex_id = hit_vertex.id
@@ -1533,7 +1654,6 @@ class BlueprintCanvas(QWidget):
         self._paint_pending_open_space(painter)
         self._paint_camera_indicator(painter)
         self._paint_level_comparison_overlay(painter)
-        self._paint_overlay_text(painter)
 
     # ### Open-space editing and painting ###
     def _finish_open_space_drag(self, widget_point: QPointF) -> bool:
@@ -1771,6 +1891,14 @@ class BlueprintCanvas(QWidget):
         self._reset_pointer_state()
         self.update()
 
+    def _clear_active_vertex_chain_for_selection(self) -> None:
+        """Leave drawing mode before Shift changes the vertex selection."""
+
+        self.active_vertex_id = None
+        self.preview_point = None
+        self.preview_guides = []
+        self._reset_pointer_state()
+
     def _handle_existing_vertex_click(self, vertex: Vertex) -> None:
         self.selected_vertex_id = vertex.id
 
@@ -1781,6 +1909,12 @@ class BlueprintCanvas(QWidget):
             return
 
         if vertex.id == self.active_vertex_id:
+            return
+
+        if self.vertex_data.has_edge(self.active_vertex_id, vertex.id):
+            self.active_vertex_id = vertex.id
+            self.preview_point = (vertex.x, vertex.y)
+            self.preview_guides = []
             return
 
         self._push_undo_state()
@@ -2143,6 +2277,8 @@ class BlueprintCanvas(QWidget):
     def _find_window_at(self, widget_point: QPointF) -> int | None:
         """Return the topmost visible window strip under the pointer."""
 
+        if not self.windows:
+            return None
         point = (widget_point.x(), widget_point.y())
         wall_frames = self._build_window_wall_frames()
         for window_index in range(len(self.windows) - 1, -1, -1):
@@ -2212,6 +2348,9 @@ class BlueprintCanvas(QWidget):
         frames: dict[str, WindowWallFrame] = {}
         room_vertex_sets = [set(room.vertex_ids) for room in level.rooms]
         ignored_vertex_ids = {room.center_vertex_id for room in level.rooms}
+        vertex_by_id = {
+            vertex.id: vertex for vertex in level.vertex_data.vertices
+        }
         for room in level.rooms:
             for wall in build_room_walls(room, level.vertex_data):
                 surface_id = build_wall_surface_id(
@@ -2235,8 +2374,8 @@ class BlueprintCanvas(QWidget):
                 )
             ):
                 continue
-            start_vertex = level.vertex_data.get_vertex(edge.start_vertex_id)
-            end_vertex = level.vertex_data.get_vertex(edge.end_vertex_id)
+            start_vertex = vertex_by_id.get(edge.start_vertex_id)
+            end_vertex = vertex_by_id.get(edge.end_vertex_id)
             if start_vertex is None or end_vertex is None:
                 continue
             wall_key = (
@@ -2794,6 +2933,7 @@ class BlueprintCanvas(QWidget):
             selected_open_space_id=self.selected_open_space_id,
             preview_point=self.preview_point,
             action_kind=action_kind,
+            selected_vertex_ids=self.selected_vertex_ids,
         )
         self.undo_stack.append(snapshot)
         if self._uses_external_undo_history:
@@ -2812,41 +2952,55 @@ class BlueprintCanvas(QWidget):
         self.update()
         return True
 
-    def _delete_selected_vertex(self) -> None:
-        if self.selected_vertex_id is None:
+    def _delete_selected_vertices(self) -> None:
+        """Delete every selected vertex as one undoable topology change."""
+
+        existing_vertex_ids = {
+            vertex.id for vertex in self.vertex_data.vertices
+        }
+        deleted_vertex_ids = tuple(
+            vertex_id
+            for vertex_id in self.selected_vertex_ids
+            if vertex_id in existing_vertex_ids
+        )
+        if not deleted_vertex_ids:
+            self.prune_missing_vertex_references()
             return
 
-        if self.vertex_data.get_vertex(self.selected_vertex_id) is None:
-            self.selected_vertex_id = None
-            self.update()
-            return
+        self._push_undo_state(CANVAS_SNAPSHOT_ACTION_VERTEX_DELETION)
+        deleted_vertex_id_set = set(deleted_vertex_ids)
+        self.vertex_data.delete_vertices(deleted_vertex_id_set)
+        self._remove_vertices_from_rooms(deleted_vertex_id_set)
 
-        self._push_undo_state()
-        deleted_vertex_id = self.selected_vertex_id
-        self.vertex_data.delete_vertex(deleted_vertex_id)
-        self._remove_vertex_from_rooms(deleted_vertex_id)
-
-        if self.active_vertex_id == deleted_vertex_id:
+        if (
+            self.active_vertex_id is not None
+            and self.vertex_data.get_vertex(self.active_vertex_id) is None
+        ):
             self.active_vertex_id = None
             self.preview_point = None
 
-        self.selected_vertex_id = None
+        self.set_selected_vertex_ids(())
         self.preview_guides = []
         self._reset_pointer_state()
         self.update()
         self.geometry_changed.emit()
 
-    def _remove_vertex_from_rooms(self, deleted_vertex_id: int) -> None:
+    def _remove_vertices_from_rooms(
+        self,
+        deleted_vertex_ids: set[int],
+    ) -> None:
+        """Remove a deleted vertex group from room boundaries once."""
+
         original_rooms = list(self.rooms)
         updated_rooms: list[RoomData] = []
         for room in self.rooms:
-            if room.center_vertex_id == deleted_vertex_id:
+            if room.center_vertex_id in deleted_vertex_ids:
                 continue
 
             remaining_vertex_ids = tuple(
                 vertex_id
                 for vertex_id in room.vertex_ids
-                if vertex_id != deleted_vertex_id
+                if vertex_id not in deleted_vertex_ids
             )
             if len(remaining_vertex_ids) < 3:
                 continue
@@ -2962,9 +3116,14 @@ class BlueprintCanvas(QWidget):
     def _find_vertex_at(self, widget_point: QPointF) -> Vertex | None:
         closest_vertex: Vertex | None = None
         closest_distance = VERTEX_HIT_RADIUS_SCREEN
+        display_rect = self._image_display_rect()
 
         for vertex in self.vertex_data.vertices:
-            vertex_point = self._image_to_widget(vertex.x, vertex.y)
+            vertex_point = self._image_to_widget_in_rect(
+                vertex.x,
+                vertex.y,
+                display_rect,
+            )
             distance = math.hypot(
                 widget_point.x() - vertex_point.x(),
                 widget_point.y() - vertex_point.y(),
@@ -2983,6 +3142,10 @@ class BlueprintCanvas(QWidget):
         excluded_ids = excluded_vertex_ids or set()
         closest_hit: EdgeHit | None = None
         closest_distance = EDGE_HIT_TOLERANCE_SCREEN
+        vertex_by_id = {
+            vertex.id: vertex for vertex in self.vertex_data.vertices
+        }
+        display_rect = self._image_display_rect()
 
         for edge in self.vertex_data.edges:
             if edge.start_vertex_id in excluded_ids:
@@ -2990,15 +3153,23 @@ class BlueprintCanvas(QWidget):
             if edge.end_vertex_id in excluded_ids:
                 continue
 
-            start_vertex = self.vertex_data.get_vertex(edge.start_vertex_id)
-            end_vertex = self.vertex_data.get_vertex(edge.end_vertex_id)
+            start_vertex = vertex_by_id.get(edge.start_vertex_id)
+            end_vertex = vertex_by_id.get(edge.end_vertex_id)
             if start_vertex is None or end_vertex is None:
                 continue
 
             projection = _project_point_onto_widget_segment(
                 point=widget_point,
-                segment_start=self._image_to_widget(start_vertex.x, start_vertex.y),
-                segment_end=self._image_to_widget(end_vertex.x, end_vertex.y),
+                segment_start=self._image_to_widget_in_rect(
+                    start_vertex.x,
+                    start_vertex.y,
+                    display_rect,
+                ),
+                segment_end=self._image_to_widget_in_rect(
+                    end_vertex.x,
+                    end_vertex.y,
+                    display_rect,
+                ),
             )
             if projection is None:
                 continue
@@ -3551,7 +3722,22 @@ class BlueprintCanvas(QWidget):
         if self.blueprint_image is None:
             return QPointF()
 
-        display_rect = self._image_display_rect()
+        return self._image_to_widget_in_rect(
+            image_x,
+            image_y,
+            self._image_display_rect(),
+        )
+
+    def _image_to_widget_in_rect(
+        self,
+        image_x: float,
+        image_y: float,
+        display_rect: QRectF,
+    ) -> QPointF:
+        """Map a point with a precomputed display rectangle for hot loops."""
+
+        if self.blueprint_image is None:
+            return QPointF()
         widget_x = display_rect.left() + (
             image_x / float(self.blueprint_image.width())
         ) * display_rect.width()
@@ -3698,6 +3884,9 @@ class BlueprintCanvas(QWidget):
         frames: dict[str, WindowWallFrame] = {}
         room_vertex_sets = [set(room.vertex_ids) for room in overlay.rooms]
         ignored_vertex_ids = {room.center_vertex_id for room in overlay.rooms}
+        vertex_by_id = {
+            vertex.id: vertex for vertex in overlay.vertex_data.vertices
+        }
         for room in overlay.rooms:
             for wall in build_room_walls(room, overlay.vertex_data):
                 surface_id = build_wall_surface_id(
@@ -3721,8 +3910,8 @@ class BlueprintCanvas(QWidget):
                 )
             ):
                 continue
-            start_vertex = overlay.vertex_data.get_vertex(edge.start_vertex_id)
-            end_vertex = overlay.vertex_data.get_vertex(edge.end_vertex_id)
+            start_vertex = vertex_by_id.get(edge.start_vertex_id)
+            end_vertex = vertex_by_id.get(edge.end_vertex_id)
             if start_vertex is None or end_vertex is None:
                 continue
             wall_key = (
@@ -3755,16 +3944,28 @@ class BlueprintCanvas(QWidget):
     def _paint_edges(self, painter: QPainter) -> None:
         edge_pen = QPen(EDGE_COLOR, 2.0)
         painter.setPen(edge_pen)
+        vertex_by_id = {
+            vertex.id: vertex for vertex in self.vertex_data.vertices
+        }
+        display_rect = self._image_display_rect()
 
         for edge in self.vertex_data.edges:
-            start_vertex = self.vertex_data.get_vertex(edge.start_vertex_id)
-            end_vertex = self.vertex_data.get_vertex(edge.end_vertex_id)
+            start_vertex = vertex_by_id.get(edge.start_vertex_id)
+            end_vertex = vertex_by_id.get(edge.end_vertex_id)
             if start_vertex is None or end_vertex is None:
                 continue
 
             painter.drawLine(
-                self._image_to_widget(start_vertex.x, start_vertex.y),
-                self._image_to_widget(end_vertex.x, end_vertex.y),
+                self._image_to_widget_in_rect(
+                    start_vertex.x,
+                    start_vertex.y,
+                    display_rect,
+                ),
+                self._image_to_widget_in_rect(
+                    end_vertex.x,
+                    end_vertex.y,
+                    display_rect,
+                ),
             )
 
     # ### Selected wall highlight painting ###
@@ -3796,6 +3997,8 @@ class BlueprintCanvas(QWidget):
     def _paint_windows(self, painter: QPainter) -> None:
         """Draw inert plan-view strips for the level's wall windows."""
 
+        if not self.windows:
+            return
         wall_frames = self._build_window_wall_frames()
         for window in self.windows:
             segment = self._get_window_widget_segment(
@@ -4070,7 +4273,7 @@ class BlueprintCanvas(QWidget):
         ), (
             next_name,
             next_section,
-        ) in zip(named_sections, named_sections[1:]):
+        ) in pairwise(named_sections):
             # A straight stair already paints its start/end transition arrow
             # with the segment itself.  The continuity marker is useful only
             # once an intermediate route control exists.
@@ -4499,20 +4702,27 @@ class BlueprintCanvas(QWidget):
     def _paint_vertices(self, painter: QPainter) -> None:
         label_font = QFont("Segoe UI", 9)
         painter.setFont(label_font)
+        display_rect = self._image_display_rect()
 
         for vertex in self.vertex_data.vertices:
-            center = self._image_to_widget(vertex.x, vertex.y)
+            center = self._image_to_widget_in_rect(
+                vertex.x,
+                vertex.y,
+                display_rect,
+            )
             is_active = vertex.id == self.active_vertex_id
-            is_selected = vertex.id == self.selected_vertex_id
+            is_selected = vertex.id in self.selected_vertex_ids
+            is_wall_mirror = vertex.id in self._wall_mirror_vertex_ids
 
-            painter.setPen(QPen(VERTEX_OUTLINE_COLOR, 1.5))
-            if is_active:
-                painter.setBrush(ACTIVE_VERTEX_FILL_COLOR)
+            if is_wall_mirror:
+                fill_color = WALL_MIRROR_VERTEX_FILL_COLOR
+            elif is_active:
+                fill_color = ACTIVE_VERTEX_FILL_COLOR
             elif is_selected:
-                painter.setBrush(SELECTED_VERTEX_FILL_COLOR)
+                fill_color = SELECTED_VERTEX_FILL_COLOR
             else:
-                painter.setBrush(VERTEX_FILL_COLOR)
-            painter.drawEllipse(center, VERTEX_RADIUS_SCREEN, VERTEX_RADIUS_SCREEN)
+                fill_color = VERTEX_FILL_COLOR
+            self._paint_vertex_marker(painter, center, fill_color)
 
             painter.setPen(QPen(TEXT_COLOR))
             painter.drawText(
@@ -4520,86 +4730,17 @@ class BlueprintCanvas(QWidget):
                 str(vertex.id),
             )
 
-    def _paint_overlay_text(self, painter: QPainter) -> None:
-        if self.blueprint_path is None:
-            return
+    @staticmethod
+    def _paint_vertex_marker(
+        painter: QPainter,
+        center: QPointF,
+        fill_color: QColor,
+    ) -> None:
+        """Paint one local vertex marker."""
 
-        overlay_lines = [
-            f"Blueprint: {Path(self.blueprint_path).name}",
-            "Left click: add/connect/select/drag",
-            "Mouse wheel: zoom | Delete: remove selection | Ctrl+Z: undo | Hold Ctrl: free placement",
-        ]
-        comparison = self._level_comparison_overlay
-        if comparison is not None:
-            overlay_lines.append(
-                f"Comparing with L{comparison.level_index} "
-                f"{comparison.level_name}"
-            )
-        if self._is_stair_placement_active():
-            pending_point = self.pending_stair_point
-            pending_stair = self.pending_stair_placement
-            pending_draft = self.pending_stair_draft
-            if pending_draft is not None and pending_point is None:
-                overlay_lines.append(
-                    "Stairs: add optional two-point curve sections, or click "
-                    "Confirm stairs | Backspace: remove last curve section."
-                )
-            elif pending_draft is not None:
-                overlay_lines.append(
-                    f"Stairs: place curve point B on level "
-                    f"{pending_point.level_index} | Backspace: discard point A."
-                )
-            elif pending_stair is None and pending_point is None:
-                overlay_lines.append(
-                    "Stairs: click start point A anywhere; existing vertices "
-                    "and wall edges snap | Right click or Escape: cancel."
-                )
-            elif pending_stair is None:
-                overlay_lines.append(
-                    f"Stairs: place start point B on level "
-                    f"{pending_point.level_index}."
-                )
-            elif pending_point is None:
-                overlay_lines.append(
-                    "Stairs: select a different level, then place end point A."
-                )
-            else:
-                overlay_lines.append(
-                    f"Stairs: place end point B on level "
-                    f"{pending_point.level_index}."
-                )
-        if self.pending_doorway_preset is not None:
-            overlay_lines.append(
-                "Doorway: click to place | Mouse wheel: zoom | Right click or Escape: cancel."
-            )
-        elif self.doorways:
-            overlay_lines.append(
-                "Doorway: select and drag it to move it along its wall."
-            )
-        if self._open_space_placement_active:
-            overlay_lines.append(
-                "Open space: drag a rectangle | Right click or Escape: cancel."
-            )
-        elif self.open_spaces:
-            overlay_lines.append(
-                "Open space: click a rectangle to select; Delete removes it."
-            )
-        if self.stairs:
-            overlay_lines.append(
-                "Stairs: Alt+click any A/B point to select; Delete removes the selected stair."
-            )
-        overlay_rect = QRectF(24.0, 24.0, 680.0, 20.0 + len(overlay_lines) * 22.0)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(10, 12, 16, 180))
-        painter.drawRoundedRect(overlay_rect, 10.0, 10.0)
-
-        painter.setPen(QPen(TEXT_COLOR))
-        painter.setFont(QFont("Segoe UI", 9))
-        line_y = overlay_rect.top() + 24.0
-        for line in overlay_lines:
-            painter.drawText(QPointF(overlay_rect.left() + 14.0, line_y), line)
-            line_y += 22.0
-
+        painter.setPen(QPen(VERTEX_OUTLINE_COLOR, 1.5))
+        painter.setBrush(fill_color)
+        painter.drawEllipse(center, VERTEX_RADIUS_SCREEN, VERTEX_RADIUS_SCREEN)
 
 # ### Numeric helpers ###
 def _normalize_stair_style(style: object) -> str:

@@ -1411,7 +1411,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         )
 
         self.workspace.canvas.selected_vertex_id = start.id
-        self.workspace.canvas._delete_selected_vertex()
+        self.workspace.canvas._delete_selected_vertices()
 
         retained = surface_workspace.get_assignment(assignment.assignment_id)
         assert retained is not None
@@ -1419,6 +1419,15 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         updated_atlas = atlas_workspace.get_data().atlas_by_id(atlas.atlas_id)
         assert updated_atlas is not None
         self.assertIsNone(updated_atlas.placement_for_object(source_id))
+
+        self.workspace._handle_canvas_undo_requested()
+
+        restored = surface_workspace.get_assignment(assignment.assignment_id)
+        assert restored is not None
+        self.assertEqual(restored.surface_ids, (wall_id,))
+        restored_atlas = atlas_workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert restored_atlas is not None
+        self.assertIsNotNone(restored_atlas.placement_for_object(source_id))
 
     def test_project_load_reconciles_stale_surface_assignments(self) -> None:
         assignment = _wall_texture_assignment(

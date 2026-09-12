@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import math
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 # ### Constants ###
@@ -850,6 +851,9 @@ class VertexData:
     edges: list[Edge] = field(default_factory=list)
     _next_vertex_id: int = 1
 
+    def __post_init__(self) -> None:
+        self.normalize_next_vertex_id()
+
     def reset(self) -> None:
         self.vertices.clear()
         self.edges.clear()
@@ -863,6 +867,19 @@ class VertexData:
         self.vertices = snapshot.vertices
         self.edges = snapshot.edges
         self._next_vertex_id = snapshot._next_vertex_id
+
+    def normalize_next_vertex_id(self) -> None:
+        """Advance a stale allocator beyond every occupied vertex ID."""
+
+        minimum_next_id = max(
+            (vertex.id for vertex in self.vertices),
+            default=0,
+        ) + 1
+        self._next_vertex_id = max(
+            1,
+            int(self._next_vertex_id),
+            minimum_next_id,
+        )
 
     def add_vertex(self, x: float, y: float) -> Vertex:
         vertex = Vertex(id=self._next_vertex_id, x=float(x), y=float(y))
@@ -888,19 +905,30 @@ class VertexData:
         return None
 
     def delete_vertex(self, vertex_id: int) -> bool:
-        vertex_to_delete = self.get_vertex(vertex_id)
-        if vertex_to_delete is None:
+        return self.delete_vertices((vertex_id,))
+
+    def delete_vertices(self, vertex_ids: Iterable[int]) -> bool:
+        """Delete a vertex group and all incident edges in one pass."""
+
+        requested_ids = set(vertex_ids)
+        deleted_ids = {
+            vertex.id
+            for vertex in self.vertices
+            if vertex.id in requested_ids
+        }
+        if not deleted_ids:
             return False
 
         self.vertices = [
             vertex
             for vertex in self.vertices
-            if vertex.id != vertex_id
+            if vertex.id not in deleted_ids
         ]
         self.edges = [
             edge
             for edge in self.edges
-            if edge.start_vertex_id != vertex_id and edge.end_vertex_id != vertex_id
+            if edge.start_vertex_id not in deleted_ids
+            and edge.end_vertex_id not in deleted_ids
         ]
         return True
 
@@ -992,8 +1020,9 @@ class VertexData:
             [vertex.id for vertex in vertex_data.vertices],
             default=0,
         ) + 1
-        vertex_data._next_vertex_id = int(
-            payload.get("next_vertex_id", default_next_vertex_id)
+        vertex_data._next_vertex_id = max(
+            default_next_vertex_id,
+            int(payload.get("next_vertex_id", default_next_vertex_id)),
         )
         return vertex_data
 
