@@ -6,7 +6,13 @@ import unittest
 import numpy as np
 from shapely import Polygon
 
-from housemaker.models import DoorwayData, LevelData, RoomData, VertexData
+from housemaker.models import (
+    DoorwayData,
+    LevelData,
+    OpenSpaceData,
+    RoomData,
+    VertexData,
+)
 from housemaker.surface_geometry import (
     SURFACE_GEOMETRY_EPSILON,
     SURFACE_TYPE_CEILING,
@@ -140,6 +146,44 @@ def _build_partially_room_owned_square_level() -> LevelData:
         name="Ground",
         vertex_data=vertex_data,
         rooms=[legacy_room],
+    )
+
+
+def _build_nested_plain_wall_level() -> LevelData:
+    """Build mixed-direction inner and outer wall contours without rooms."""
+
+    vertex_data = VertexData()
+    boundary_loops = (
+        ((0.0, 0.0), (500.0, 0.0), (500.0, 500.0), (0.0, 500.0)),
+        ((20.0, 20.0), (480.0, 20.0), (480.0, 480.0), (20.0, 480.0)),
+    )
+    for loop_index, points in enumerate(boundary_loops):
+        vertex_ids = tuple(vertex_data.add_vertex(*point).id for point in points)
+        for edge_index, (start_id, end_id) in enumerate(
+            zip(vertex_ids, (*vertex_ids[1:], vertex_ids[0]))
+        ):
+            if loop_index == 1 and edge_index % 2 == 1:
+                start_id, end_id = end_id, start_id
+            vertex_data.add_edge(start_id, end_id)
+    return LevelData(index=2, name="Ground", vertex_data=vertex_data)
+
+
+def _build_gapped_nested_plain_wall_level() -> LevelData:
+    """Build nested contours whose collinear top edges both have one gap."""
+
+    return _build_level_from_segments(
+        (
+            ((0.0, 0.0), (240.0, 0.0)),
+            ((500.0, 0.0), (260.0, 0.0)),
+            ((500.0, 0.0), (500.0, 500.0)),
+            ((0.0, 500.0), (500.0, 500.0)),
+            ((0.0, 500.0), (0.0, 0.0)),
+            ((20.0, 20.0), (240.0, 20.0)),
+            ((480.0, 20.0), (260.0, 20.0)),
+            ((480.0, 480.0), (480.0, 20.0)),
+            ((20.0, 480.0), (480.0, 480.0)),
+            ((20.0, 20.0), (20.0, 480.0)),
+        )
     )
 
 
@@ -439,6 +483,132 @@ class FixedSurfaceGeometryTests(unittest.TestCase):
                 np.tile(expected_normal, (2, 1)),
                 atol=1e-7,
             )
+
+    def test_nested_plain_wall_normals_face_the_open_interior(self) -> None:
+        surfaces = _surface_by_id(_build_nested_plain_wall_level())
+        expected_inner_normals = {
+            "level:2/wall:5:6": (0.0, -1.0, 0.0),
+            "level:2/wall:6:7": (-1.0, 0.0, 0.0),
+            "level:2/wall:7:8": (0.0, 1.0, 0.0),
+            "level:2/wall:5:8": (1.0, 0.0, 0.0),
+        }
+
+        for surface_id, expected_normal in expected_inner_normals.items():
+            np.testing.assert_allclose(
+                surfaces[surface_id].mesh.face_normals,  # type: ignore[attr-defined]
+                np.tile(expected_normal, (2, 1)),
+                atol=1e-7,
+            )
+
+    def test_nested_plain_outer_walls_face_away_from_the_wall_cavity(self) -> None:
+        surfaces = _surface_by_id(_build_nested_plain_wall_level())
+        expected_outer_normals = {
+            "level:2/wall:1:2": (0.0, 1.0, 0.0),
+            "level:2/wall:2:3": (1.0, 0.0, 0.0),
+            "level:2/wall:3:4": (0.0, -1.0, 0.0),
+            "level:2/wall:1:4": (-1.0, 0.0, 0.0),
+        }
+
+        for surface_id, expected_normal in expected_outer_normals.items():
+            np.testing.assert_allclose(
+                surfaces[surface_id].mesh.face_normals,  # type: ignore[attr-defined]
+                np.tile(expected_normal, (2, 1)),
+                atol=1e-7,
+            )
+
+    def test_gapped_nested_plain_walls_preserve_the_wall_cavity(self) -> None:
+        surfaces = _surface_by_id(_build_gapped_nested_plain_wall_level())
+        expected_normals = {
+            "level:2/wall:1:2": (0.0, 1.0, 0.0),
+            "level:2/wall:3:4": (0.0, 1.0, 0.0),
+            "level:2/wall:3:5": (1.0, 0.0, 0.0),
+            "level:2/wall:5:6": (0.0, -1.0, 0.0),
+            "level:2/wall:1:6": (-1.0, 0.0, 0.0),
+            "level:2/wall:7:8": (0.0, -1.0, 0.0),
+            "level:2/wall:9:10": (0.0, -1.0, 0.0),
+            "level:2/wall:9:11": (-1.0, 0.0, 0.0),
+            "level:2/wall:11:12": (0.0, 1.0, 0.0),
+            "level:2/wall:7:12": (1.0, 0.0, 0.0),
+        }
+
+        self.assertEqual(
+            set(surfaces), {*expected_normals, "level:2/floor", "level:2/ceiling"}
+        )
+        for surface_id, expected_normal in expected_normals.items():
+            np.testing.assert_allclose(
+                surfaces[surface_id].mesh.face_normals,  # type: ignore[attr-defined]
+                np.tile(expected_normal, (2, 1)),
+                atol=1e-7,
+            )
+
+    def test_matching_open_space_marks_a_nested_annulus_as_exposed(self) -> None:
+        level = _build_nested_plain_wall_level()
+        level.open_spaces.append(OpenSpaceData("courtyard", 20.0, 20.0, 480.0, 480.0))
+        surfaces = _surface_by_id(level)
+        expected_normals = {
+            "level:2/wall:1:2": (0.0, -1.0, 0.0),
+            "level:2/wall:2:3": (-1.0, 0.0, 0.0),
+            "level:2/wall:3:4": (0.0, 1.0, 0.0),
+            "level:2/wall:1:4": (1.0, 0.0, 0.0),
+            "level:2/wall:5:6": (0.0, 1.0, 0.0),
+            "level:2/wall:6:7": (1.0, 0.0, 0.0),
+            "level:2/wall:7:8": (0.0, -1.0, 0.0),
+            "level:2/wall:5:8": (-1.0, 0.0, 0.0),
+        }
+
+        for surface_id, expected_normal in expected_normals.items():
+            np.testing.assert_allclose(
+                surfaces[surface_id].mesh.face_normals,  # type: ignore[attr-defined]
+                np.tile(expected_normal, (2, 1)),
+                atol=1e-7,
+            )
+
+    def test_small_open_space_does_not_flip_an_ordinary_room(self) -> None:
+        level = _build_square_level(with_room=False)
+        level.open_spaces.append(OpenSpaceData("small opening", 40.0, 40.0, 60.0, 60.0))
+
+        wall = _surface_by_id(level)["level:2/wall:1:2"]
+
+        np.testing.assert_allclose(
+            wall.mesh.face_normals,  # type: ignore[attr-defined]
+            np.tile((0.0, -1.0, 0.0), (2, 1)),
+            atol=1e-7,
+        )
+
+    def test_gapped_plain_wall_normals_ignore_mixed_edge_directions(self) -> None:
+        level = _build_level_from_segments(
+            (
+                ((0.0, 0.0), (210.0, 0.0)),
+                ((500.0, 0.0), (250.0, 0.0)),
+                ((500.0, 0.0), (500.0, 170.0)),
+                ((500.0, 400.0), (500.0, 200.0)),
+                ((500.0, 400.0), (320.0, 400.0)),
+                ((0.0, 400.0), (270.0, 400.0)),
+                ((0.0, 400.0), (0.0, 260.0)),
+                ((0.0, 0.0), (0.0, 220.0)),
+            )
+        )
+        wall_surfaces = [
+            surface
+            for surface in build_fixed_surfaces([level])
+            if surface.surface_type == SURFACE_TYPE_WALL
+        ]
+        level_center = np.asarray((5.0, -4.0), dtype=float)
+
+        self.assertEqual(len(wall_surfaces), 8)
+        for surface in wall_surfaces:
+            wall_midpoint = np.mean(
+                np.asarray(surface.mesh.vertices, dtype=float)[:, :2],
+                axis=0,
+            )
+            direction_to_center = level_center - wall_midpoint
+            direction_to_center /= np.linalg.norm(direction_to_center)
+            facing_alignment = np.dot(
+                np.asarray(surface.mesh.face_normals, dtype=float)[:, :2],
+                direction_to_center,
+            )
+            self.assertTrue(np.all(facing_alignment > 0.5))
+
 
 if __name__ == "__main__":
     unittest.main()

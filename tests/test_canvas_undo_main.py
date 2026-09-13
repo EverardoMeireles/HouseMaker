@@ -14,11 +14,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from PIL import Image
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
-from PIL import Image
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.architectural_surface_edits import SurfaceVertexInsertionRequest
@@ -192,6 +192,17 @@ class CanvasUndoMainTests(unittest.TestCase):
                 expected_state,
             )
         self.assertEqual(self.workspace._canvas_undo_stack, [])
+
+    def test_topology_undo_restores_manual_surface_orientation_flips(self) -> None:
+        original_flips = {"level:2/wall:1:2"}
+        self.level.flipped_surface_ids = set(original_flips)
+        undo_state = self.workspace._capture_canvas_topology_undo_state()
+        self.level.flipped_surface_ids = {"level:2/wall:2:3"}
+        self.workspace._record_canvas_undo_state(undo_state)
+
+        _send_undo_to_viewer(self.workspace)
+
+        self.assertEqual(self.level.flipped_surface_ids, original_flips)
 
     def test_deleted_direct_face_is_restored_by_ctrl_z(self) -> None:
         points = (

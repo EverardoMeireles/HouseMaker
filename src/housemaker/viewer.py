@@ -139,6 +139,9 @@ WINDOW_PREVIEW_OFFSET_METERS = 0.006
 CANVAS_SURFACE_SELECTION_COLOR = (1.0, 0.72, 0.18, 1.0)
 CANVAS_SURFACE_SELECTION_VERTEX_COLOR = (0.78, 0.56, 0.14, 1.0)
 CANVAS_SURFACE_SELECTION_VERTEX_SIZE_PIXELS = 9.0
+CANVAS_FACE_ORIENTATION_FRONT_COLOR = (0.12, 0.36, 1.0, 0.52)
+CANVAS_FACE_ORIENTATION_BACK_COLOR = (1.0, 0.12, 0.12, 0.68)
+CANVAS_FACE_ORIENTATION_DEPTH_VALUE = 9_990.0
 CANVAS_SCENE_FOCUS_TYPES = frozenset(
     (SURFACE_TYPE_FLOOR, SURFACE_TYPE_CEILING)
 )
@@ -2476,6 +2479,38 @@ class _DepthTestedOverlayScatterItem(gl.GLScatterPlotItem):
             GL.glDepthFunc(previous_depth_function)
 
 
+class _FaceOrientationOverlayMeshItem(gl.GLMeshItem):
+    """Tint one winding side while respecting nearer scene geometry."""
+
+    def __init__(self, *args, culled_face: int, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.setGLOptions(
+            {
+                GL.GL_DEPTH_TEST: True,
+                GL.GL_BLEND: True,
+                GL.GL_CULL_FACE: True,
+                "glCullFace": (culled_face,),
+                "glBlendFuncSeparate": (
+                    GL.GL_SRC_ALPHA,
+                    GL.GL_ONE_MINUS_SRC_ALPHA,
+                    GL.GL_ONE,
+                    GL.GL_ONE_MINUS_SRC_ALPHA,
+                ),
+                # Wrongly culled source faces may not have populated depth.
+                # Let this diagnostic layer occlude farther diagnostics.
+                "glDepthMask": (True,),
+            }
+        )
+
+    def paint(self) -> None:
+        previous_depth_function = int(GL.glGetIntegerv(GL.GL_DEPTH_FUNC))
+        GL.glDepthFunc(GL.GL_LEQUAL)
+        try:
+            super().paint()
+        finally:
+            GL.glDepthFunc(previous_depth_function)
+
+
 @dataclass
 class _SymmetricPreviewRenderGroup:
     """The textured and fallback draw items for one mirrored retained mesh."""
@@ -2613,6 +2648,7 @@ class GlbViewerWidget(QWidget):
     placed_object_selection_changed = Signal(object)
     placed_object_selection_set_changed = Signal(object)
     canvas_surface_selection_changed = Signal(object)
+    canvas_surface_orientation_flip_requested = Signal(str)
     face_selection_changed = Signal(object)
     projection_camera_selection_changed = Signal(object)
     projection_camera_percentage_step_requested = Signal(str, int)
@@ -2754,6 +2790,10 @@ class GlbViewerWidget(QWidget):
         self._canvas_surface_selection_vertex_item: (
             gl.GLScatterPlotItem | None
         ) = None
+        self._canvas_face_orientation_visible = False
+        self._canvas_face_orientation_items: list[
+            _FaceOrientationOverlayMeshItem
+        ] = []
         self._canvas_extrudable_face_outline_items: list[
             gl.GLLinePlotItem
         ] = []
@@ -3185,6 +3225,34 @@ class GlbViewerWidget(QWidget):
             )
         )
 
+    # ### Canvas face-orientation API ###
+    def get_canvas_face_orientation_visible(self) -> bool:
+        """Return whether semantic surface normals are currently displayed."""
+
+        return self._canvas_face_orientation_visible
+
+    def set_canvas_face_orientation_visible(self, visible: bool) -> bool:
+        """Show orientation colors and reserve short clicks for face flipping."""
+
+        normalized_visible = bool(visible)
+        if normalized_visible == self._canvas_face_orientation_visible:
+            return False
+        self._cancel_canvas_face_orientation_click()
+        if normalized_visible:
+            if self.is_window_placement_active():
+                self.cancel_window_placement(status_message=None)
+            if self.is_surface_vertex_placement_active():
+                self.cancel_surface_vertex_placement()
+            self._cancel_canvas_opening_edit_drag()
+            self._cancel_canvas_surface_edit_drag()
+            self._cancel_canvas_face_extrusion_drag()
+            self._cancel_placed_object_gizmo_drag()
+        self._canvas_face_orientation_visible = normalized_visible
+        self._refresh_canvas_face_orientation_item()
+        self._sync_window_tools_controls()
+        self._sync_surface_tools_controls()
+        return True
+
     def _handle_highlight_floor_toggled(self, checked: bool) -> None:
         next_type = (
             SURFACE_TYPE_FLOOR
@@ -3334,6 +3402,7 @@ class GlbViewerWidget(QWidget):
         if not isinstance(surfaces, tuple):
             raise TypeError("Canvas surface targets must be supplied as a tuple.")
         self._cancel_canvas_rectangle_selection()
+        self._cancel_canvas_face_orientation_click()
 
         all_targets: dict[str, FixedSurface] = {}
         targets: dict[str, FixedSurface] = {}
@@ -3385,6 +3454,7 @@ class GlbViewerWidget(QWidget):
         self._set_active_canvas_surface_id(next_active_surface_id)
         self.cancel_window_placement(status_message=None)
         self._refresh_canvas_surface_selection_outlines()
+        self._refresh_canvas_face_orientation_item()
         self._refresh_canvas_extrudable_face_outlines()
         self._refresh_atlas_surface_highlight_outlines()
         self._refresh_canvas_surface_drawing_items()
@@ -3799,6 +3869,11 @@ class GlbViewerWidget(QWidget):
 
         if self.is_window_placement_active():
             self.cancel_window_placement(status_message=None)
+            return True
+        if (
+            self._canvas_face_orientation_visible
+            and self._cancel_canvas_rectangle_selection()
+        ):
             return True
         if self._surface_vertex_click_ack_pending:
             # Vertex placement commits on pointer press, so only release the
@@ -4243,6 +4318,9 @@ class GlbViewerWidget(QWidget):
         *,
         additive: bool | None = None,
     ) -> None:
+        if self._canvas_face_orientation_visible:
+            self._handle_canvas_face_orientation_pick_requested(position)
+            return
         if (
             not self._window_editing_enabled
             or self.is_window_placement_active()
@@ -4341,6 +4419,81 @@ class GlbViewerWidget(QWidget):
             additive=additive,
         )
 
+    # ### Canvas face-orientation input ###
+    def _cancel_canvas_face_orientation_click(self) -> None:
+        """Release any pending orientation click without changing geometry."""
+
+        if (
+            self._canvas_rectangle_selection_press_position is not None
+            or self._canvas_rectangle_selection_cancel_event is not None
+        ):
+            self._cancel_canvas_rectangle_selection()
+
+    def _handle_canvas_face_orientation_pick_requested(
+        self,
+        position: QPointF,
+    ) -> None:
+        """Flip the closest visible semantic surface unless an object covers it."""
+
+        if (
+            not self._window_editing_enabled
+            or not self._canvas_face_orientation_visible
+            or self.model is None
+        ):
+            return
+        camera_ray = self.view.build_camera_ray(position)
+        if camera_ray is None:
+            return
+        ray_origin, ray_direction = camera_ray
+        surface_hit = _get_nearest_fixed_surface_ray_hit(
+            tuple(
+                surface
+                for surface in self._canvas_surface_targets.values()
+                if self._canvas_surface_is_visible(surface)
+            ),
+            ray_origin,
+            ray_direction,
+        )
+        object_hit = _get_nearest_preview_placed_object_ray_hit(
+            tuple(
+                replace(
+                    group.preview,
+                    placement_transform=group.current_transform,
+                )
+                for group in self._placed_object_render_groups.values()
+                if self._canvas_objects_are_visible()
+            ),
+            ray_origin,
+            ray_direction,
+        )
+        display_mesh = self._get_display_mesh()
+        scene_hit = (
+            None
+            if display_mesh is None
+            else _get_nearest_triangle_ray_hit(
+                display_mesh,
+                np.asarray(ray_origin, dtype=float),
+                np.asarray(ray_direction, dtype=float),
+            )
+        )
+        if surface_hit is None or (
+            object_hit is not None
+            and object_hit[2] <= surface_hit[2] + 1e-9
+        ) or (
+            scene_hit is not None
+            and scene_hit[1] < surface_hit[2] - 1e-9
+        ):
+            self.set_surface_tools_status(
+                "Click a visible architectural surface to flip its orientation."
+            )
+            return
+
+        surface_id = surface_hit[0].surface_id
+        self._set_selected_canvas_opening_key(None)
+        self._set_selected_placed_object(None)
+        self.select_canvas_surface_target(surface_id, additive=False)
+        self.canvas_surface_orientation_flip_requested.emit(surface_id)
+
     # ### Placed-object gizmo input ###
     def _handle_placed_object_pointer_pressed(self, position: QPointF) -> None:
         if (
@@ -4350,6 +4503,9 @@ class GlbViewerWidget(QWidget):
         ):
             return
         self._invalidate_canvas_rectangle_selection_requests()
+        if self._canvas_face_orientation_visible:
+            self._begin_canvas_rectangle_selection(position)
+            return
         camera_ray = self.view.build_camera_ray(position)
         if camera_ray is None:
             return
@@ -4467,6 +4623,9 @@ class GlbViewerWidget(QWidget):
         start = self._canvas_rectangle_selection_press_position
         if start is None:
             return
+        if self._canvas_face_orientation_visible:
+            self._hide_canvas_rectangle_selection_rubber_band()
+            return
         current = QPointF(position)
         if _get_point_distance(start, current) <= CLICK_SELECTION_TOLERANCE:
             self._hide_canvas_rectangle_selection_rubber_band()
@@ -4489,6 +4648,10 @@ class GlbViewerWidget(QWidget):
         if start is None:
             return False
         end = QPointF(position)
+        if self._canvas_face_orientation_visible:
+            if _get_point_distance(start, end) <= CLICK_SELECTION_TOLERANCE:
+                self._handle_canvas_face_orientation_pick_requested(end)
+            return True
         if _get_point_distance(start, end) <= CLICK_SELECTION_TOLERANCE:
             self._handle_window_wall_pick_requested(
                 end,
@@ -5268,6 +5431,52 @@ class GlbViewerWidget(QWidget):
             self.view.removeItem(vertex_item)
         self._canvas_surface_selection_vertex_item = None
 
+    # ### Canvas face-orientation rendering ###
+    def _refresh_canvas_face_orientation_item(self) -> None:
+        """Tint front faces blue and back faces red for every visible surface."""
+
+        self._remove_canvas_face_orientation_items()
+        if not self._canvas_face_orientation_visible or self.model is None:
+            return
+        geometry = _build_canvas_face_orientation_geometry(
+            tuple(
+                surface
+                for surface in self._canvas_surface_targets.values()
+                if self._canvas_surface_is_visible(surface)
+            )
+        )
+        if geometry is None:
+            return
+        vertices, faces = geometry
+        for color, culled_face in (
+            (CANVAS_FACE_ORIENTATION_FRONT_COLOR, GL.GL_BACK),
+            (CANVAS_FACE_ORIENTATION_BACK_COLOR, GL.GL_FRONT),
+        ):
+            item = _FaceOrientationOverlayMeshItem(
+                vertexes=vertices,
+                faces=faces,
+                faceColors=np.tile(
+                    np.asarray(color, dtype=float),
+                    (len(faces), 1),
+                ),
+                smooth=False,
+                drawFaces=True,
+                drawEdges=False,
+                culled_face=culled_face,
+            )
+            item.setDepthValue(CANVAS_FACE_ORIENTATION_DEPTH_VALUE)
+            self.view.addItem(item)
+            self._canvas_face_orientation_items.append(item)
+        self.view.update()
+
+    def _remove_canvas_face_orientation_items(self) -> None:
+        """Remove both winding-side overlay passes from the live viewport."""
+
+        for item in self._canvas_face_orientation_items:
+            if item in self.view.items:
+                self.view.removeItem(item)
+        self._canvas_face_orientation_items = []
+
     # ### Level transform preview rendering ###
     def _rebuild_level_transform_preview_source_positions(self) -> None:
         """Rebuild cached source boundaries after Canvas targets change."""
@@ -5524,9 +5733,16 @@ class GlbViewerWidget(QWidget):
             return
         selected = self._get_selected_window_wall() is not None
         if self.add_window_button is not None:
-            self.add_window_button.setEnabled(selected)
+            self.add_window_button.setEnabled(
+                selected and not self._canvas_face_orientation_visible
+            )
         self._sync_window_undo_button()
         if self.is_window_placement_active():
+            return
+        if self._canvas_face_orientation_visible:
+            self._set_window_tools_status(
+                "Face-orientation mode is active. Click a surface to flip it."
+            )
             return
         self._set_window_tools_status(
             "Wall selected. Click Add window."
@@ -5569,7 +5785,15 @@ class GlbViewerWidget(QWidget):
             for surface in self._canvas_surface_targets.values()
         )
         if self.add_surface_vertex_button is not None:
-            self.add_surface_vertex_button.setEnabled(has_surfaces)
+            self.add_surface_vertex_button.setEnabled(
+                has_surfaces and not self._canvas_face_orientation_visible
+            )
+        if self._canvas_face_orientation_visible:
+            self._set_surface_tools_status(
+                "Blue is front-facing and red is back-facing. Click a surface "
+                "to flip its orientation."
+            )
+            return
         if self._surface_tools_status_override is not None:
             self._set_surface_tools_status(
                 self._surface_tools_status_override
@@ -6958,6 +7182,7 @@ class GlbViewerWidget(QWidget):
         if self.model is None:
             self._set_default_camera()
             self._refresh_canvas_surface_selection_outlines()
+            self._refresh_canvas_face_orientation_item()
             self._refresh_canvas_extrudable_face_outlines()
             self._refresh_atlas_surface_highlight_outlines()
             self._refresh_canvas_opening_gizmo_items()
@@ -7053,6 +7278,7 @@ class GlbViewerWidget(QWidget):
         self._set_default_first_person_camera_pose_from_bounding_box(bounding_box)
         self.view.apply_navigation_camera()
         self._refresh_canvas_surface_selection_outlines()
+        self._refresh_canvas_face_orientation_item()
         self._refresh_canvas_extrudable_face_outlines()
         self._refresh_atlas_surface_highlight_outlines()
         self._refresh_canvas_opening_gizmo_items()
@@ -9062,6 +9288,7 @@ class GlbViewerWidget(QWidget):
         self._sync_projection_camera_input_state()
         self._canvas_surface_selection_items = []
         self._canvas_surface_selection_vertex_item = None
+        self._canvas_face_orientation_items = []
         self._canvas_extrudable_face_outline_items = []
         self._atlas_surface_highlight_items = []
         self._window_preview_item = None
@@ -11970,6 +12197,40 @@ def _build_fixed_surface_boundary_line_positions(
     if len(boundary_edges) == 0:
         boundary_edges = unique_edges
     return np.asarray(vertices[boundary_edges].reshape(-1, 3), dtype=float)
+
+
+def _build_canvas_face_orientation_geometry(
+    surfaces: Sequence[FixedSurface],
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Combine semantic triangles without changing their authored winding."""
+
+    vertex_parts: list[np.ndarray] = []
+    face_parts: list[np.ndarray] = []
+    vertex_offset = 0
+    for surface in surfaces:
+        vertices = np.asarray(surface.mesh.vertices, dtype=np.float32)
+        faces = np.asarray(surface.mesh.faces, dtype=np.int32)
+        if (
+            vertices.ndim != 2
+            or vertices.shape[1:] != (3,)
+            or faces.ndim != 2
+            or faces.shape[1:] != (3,)
+            or not len(vertices)
+            or not len(faces)
+            or not np.all(np.isfinite(vertices))
+            or np.any(faces < 0)
+            or np.any(faces >= len(vertices))
+        ):
+            continue
+        vertex_parts.append(vertices)
+        face_parts.append(faces + vertex_offset)
+        vertex_offset += len(vertices)
+    if not vertex_parts:
+        return None
+    return (
+        np.ascontiguousarray(np.vstack(vertex_parts), dtype=np.float32),
+        np.ascontiguousarray(np.vstack(face_parts), dtype=np.int32),
+    )
 
 
 def _build_boundary_vertex_positions(

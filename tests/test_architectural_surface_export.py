@@ -11,7 +11,7 @@ from housemaker.architectural_surface_edits import (
     extrude_surface_faces,
     insert_surface_vertex,
 )
-from housemaker.glb import convert_to_preview_model
+from housemaker.glb import convert_to_glb, convert_to_preview_model
 from housemaker.models import LevelData, VertexData
 from housemaker.surface_geometry import (
     SURFACE_TYPE_FLOOR,
@@ -19,6 +19,7 @@ from housemaker.surface_geometry import (
     FixedSurface,
     build_fixed_surfaces,
 )
+from housemaker.surface_orientation_edits import flip_surface_orientation
 
 
 # ### Fixture helpers ###
@@ -59,6 +60,20 @@ def _floor_surface(level: LevelData) -> FixedSurface:
 def _triangle_key(triangle: object) -> tuple[tuple[float, ...], ...]:
     points = np.round(np.asarray(triangle, dtype=float), 8)
     return tuple(sorted(tuple(float(value) for value in point) for point in points))
+
+
+def _oriented_triangle_key(
+    triangle: object,
+) -> tuple[tuple[float, ...], ...]:
+    points = tuple(
+        tuple(float(value) for value in point)
+        for point in np.round(np.asarray(triangle, dtype=float), 8)
+    )
+    return min(
+        points,
+        (points[1], points[2], points[0]),
+        (points[2], points[0], points[1]),
+    )
 
 
 def _solid_png() -> bytes:
@@ -161,6 +176,60 @@ class ArchitecturalSurfaceExportTests(unittest.TestCase):
                 for triangle in side.mesh.triangles
             )
         )
+
+    def test_extruded_face_flips_survive_untextured_and_textured_export(
+        self,
+    ) -> None:
+        level = _build_square_level()
+        source, cap_ids = _build_extruded_floor(level)
+        edited_surfaces = tuple(
+            surface
+            for surface in build_fixed_surfaces((level,))
+            if surface.source_surface_id == source.surface_id
+        )
+        side = next(
+            surface
+            for surface in edited_surfaces
+            if surface.surface_type == SURFACE_TYPE_WALL
+        )
+        flipped_ids = (cap_ids[0], side.surface_id)
+        for surface_id in flipped_ids:
+            flip_surface_orientation((level,), surface_id)
+
+        flipped_surfaces = {
+            surface.surface_id: surface
+            for surface in build_fixed_surfaces((level,))
+            if surface.surface_id in flipped_ids
+        }
+        untextured = convert_to_glb((level,))
+        untextured_keys = {
+            _oriented_triangle_key(triangle)
+            for triangle in untextured.mesh.triangles
+        }
+        for surface in flipped_surfaces.values():
+            self.assertTrue(
+                all(
+                    _oriented_triangle_key(triangle) in untextured_keys
+                    for triangle in surface.mesh.triangles
+                )
+            )
+
+        textured = convert_to_glb(
+            (level,),
+            surface_materials={surface_id: _solid_png() for surface_id in flipped_ids},
+        )
+        previews = {
+            surface.surface_id: surface
+            for surface in textured.preview_textured_surfaces
+        }
+        self.assertEqual(set(previews), set(flipped_ids))
+        for surface_id, surface in flipped_surfaces.items():
+            self.assertFalse(previews[surface_id].double_sided)
+            np.testing.assert_allclose(
+                previews[surface_id].mesh.face_normals,
+                surface.mesh.face_normals,
+                atol=1e-9,
+            )
 
 
 # ### Direct execution ###

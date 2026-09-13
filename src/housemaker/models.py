@@ -1107,6 +1107,7 @@ class LevelData:
     windows: list[WindowData] = field(default_factory=list)
     open_spaces: list[OpenSpaceData] = field(default_factory=list)
     editable_surfaces: list[EditableSurfaceMeshData] = field(default_factory=list)
+    flipped_surface_ids: set[str] = field(default_factory=set)
 
     @property
     def display_name(self) -> str:

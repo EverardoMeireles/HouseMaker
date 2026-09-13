@@ -65,6 +65,25 @@ def _build_square_level() -> LevelData:
     return LevelData(index=2, name="Ground", vertex_data=vertex_data)
 
 
+def _build_nested_plain_wall_level() -> LevelData:
+    """Build mixed-direction nested wall contours without room metadata."""
+
+    vertex_data = VertexData()
+    boundary_loops = (
+        ((0.0, 0.0), (500.0, 0.0), (500.0, 500.0), (0.0, 500.0)),
+        ((50.0, 50.0), (450.0, 50.0), (450.0, 450.0), (50.0, 450.0)),
+    )
+    for loop_index, points in enumerate(boundary_loops):
+        vertex_ids = tuple(vertex_data.add_vertex(*point).id for point in points)
+        for edge_index, (start_id, end_id) in enumerate(
+            zip(vertex_ids, (*vertex_ids[1:], vertex_ids[0]))
+        ):
+            if loop_index == 1 and edge_index % 2 == 1:
+                start_id, end_id = end_id, start_id
+            vertex_data.add_edge(start_id, end_id)
+    return LevelData(index=2, name="Ground", vertex_data=vertex_data)
+
+
 def _get_wall(level: LevelData, wall_key: str = "1:2") -> FixedSurface:
     return next(
         surface
@@ -657,6 +676,110 @@ class SurfaceVertexDrawingTests(unittest.TestCase):
                 not vertex.direct_face_surface_ids
                 for vertex in marked_vertices.values()
             )
+        )
+
+    def test_nested_plain_wall_subdivision_preserves_inward_winding(self) -> None:
+        level = _build_nested_plain_wall_level()
+        wall = _get_wall(level, "5:6")
+        source_normal = np.asarray(wall.mesh.face_normals[0], dtype=float)
+
+        first = place_surface_vertex(
+            [level],
+            wall.surface_id,
+            (1.0, -1.0, 1.5),
+        )
+        result = place_surface_vertex(
+            [level],
+            wall.surface_id,
+            (9.0, -1.0, 1.5),
+            first.active_vertex_id,
+        )
+
+        self.assertTrue(result.requires_mesh_refresh)
+        child_surfaces = tuple(
+            surface
+            for surface in build_fixed_surfaces([level])
+            if surface.source_surface_id == wall.surface_id
+        )
+        self.assertEqual(len(child_surfaces), 2)
+        for child in child_surfaces:
+            normal_alignment = np.asarray(child.mesh.face_normals) @ source_normal
+            self.assertTrue(np.all(normal_alignment > 0.999999))
+
+    def test_persisted_reversed_wall_subdivision_realigns_and_extrudes(
+        self,
+    ) -> None:
+        level = _build_nested_plain_wall_level()
+        wall = _get_wall(level, "5:6")
+        source_normal = np.asarray(wall.mesh.face_normals[0], dtype=float)
+
+        first = place_surface_vertex(
+            [level],
+            wall.surface_id,
+            (1.0, -1.0, 1.5),
+        )
+        result = place_surface_vertex(
+            [level],
+            wall.surface_id,
+            (9.0, -1.0, 1.5),
+            first.active_vertex_id,
+        )
+        self.assertTrue(result.requires_mesh_refresh)
+
+        editable_mesh = level.editable_surfaces[0]
+        self.assertTrue(
+            all(
+                abs(vertex.normal_offset_meters) <= 1e-12
+                for vertex in editable_mesh.vertices
+            )
+        )
+        level.editable_surfaces = [
+            replace(
+                editable_mesh,
+                frame_normal_sign=-editable_mesh.frame_normal_sign,
+                faces=tuple(
+                    replace(face, vertex_ids=tuple(reversed(face.vertex_ids)))
+                    for face in editable_mesh.faces
+                ),
+            )
+        ]
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project_path = Path(temporary_directory) / "reversed-wall.housemaker"
+            save_project(project_path, level.index, [level])
+            loaded = load_project(project_path)
+
+        loaded_level = next(item for item in loaded.levels if item.index == level.index)
+        self.assertEqual(loaded_level.editable_surfaces, level.editable_surfaces)
+
+        child_surfaces = tuple(
+            surface
+            for surface in build_fixed_surfaces([loaded_level])
+            if surface.source_surface_id == wall.surface_id
+        )
+        self.assertEqual(len(child_surfaces), 2)
+        for child in child_surfaces:
+            normal_alignment = np.asarray(child.mesh.face_normals) @ source_normal
+            self.assertTrue(np.all(normal_alignment > 0.999999))
+
+        selected_child = child_surfaces[0]
+        centroid_before = np.asarray(selected_child.mesh.centroid, dtype=float)
+        extrusion_distance = 0.2
+        extrude_surface_faces(
+            [loaded_level],
+            (selected_child.surface_id,),
+            extrusion_distance,
+        )
+        extruded_child = next(
+            surface
+            for surface in build_fixed_surfaces([loaded_level])
+            if surface.surface_id == selected_child.surface_id
+        )
+        np.testing.assert_allclose(
+            np.asarray(extruded_child.mesh.centroid, dtype=float),
+            centroid_before + source_normal * extrusion_distance,
+            atol=1e-7,
+            rtol=0.0,
         )
 
     def test_open_edge_to_edge_path_subdivides_floor_and_ceiling(self) -> None:
@@ -1861,6 +1984,96 @@ class SurfaceVertexDrawingTests(unittest.TestCase):
 
 # ### Extrusion tests ###
 class SurfaceFaceExtrusionTests(unittest.TestCase):
+    def test_legacy_extruded_wall_keeps_geometry_and_corrects_a_new_extrusion(
+        self,
+    ) -> None:
+        level = _build_square_level()
+        source_surface = _get_wall(level)
+        source_id, selected_children = _insert_into_first_wall_triangle(level)
+        self.assertEqual(source_surface.surface_id, source_id)
+        source_normal = np.asarray(source_surface.mesh.face_normals[0], dtype=float)
+        extrude_surface_faces([level], (selected_children[0],), 0.2)
+        authored_surfaces = {
+            surface.surface_id: np.asarray(surface.mesh.vertices, dtype=float)
+            for surface in build_fixed_surfaces([level])
+            if surface.source_surface_id == source_id
+        }
+
+        editable_mesh = level.editable_surfaces[0]
+        level.editable_surfaces = [
+            replace(
+                editable_mesh,
+                frame_normal_sign=-editable_mesh.frame_normal_sign,
+                vertices=tuple(
+                    replace(
+                        vertex,
+                        normal_offset_meters=-vertex.normal_offset_meters,
+                    )
+                    for vertex in editable_mesh.vertices
+                ),
+                faces=tuple(
+                    replace(face, vertex_ids=tuple(reversed(face.vertex_ids)))
+                    for face in editable_mesh.faces
+                ),
+            )
+        ]
+        legacy_mesh = level.editable_surfaces[0]
+        vertex_by_id = {
+            vertex.vertex_id: vertex for vertex in legacy_mesh.vertices
+        }
+        coplanar_face = next(
+            face
+            for face in legacy_mesh.faces
+            if all(
+                abs(vertex_by_id[vertex_id].normal_offset_meters) <= 1e-12
+                for vertex_id in face.vertex_ids
+            )
+        )
+        coplanar_surface_id = build_editable_surface_id(
+            level.index,
+            coplanar_face.face_id,
+            coplanar_face.surface_type,
+        )
+        legacy_surfaces = {
+            surface.surface_id: surface
+            for surface in build_fixed_surfaces([level])
+            if surface.source_surface_id == source_id
+        }
+        self.assertEqual(set(legacy_surfaces), set(authored_surfaces))
+        for surface_id, vertices in authored_surfaces.items():
+            self.assertEqual(
+                {
+                    tuple(round(float(value), 9) for value in vertex)
+                    for vertex in legacy_surfaces[surface_id].mesh.vertices
+                },
+                {
+                    tuple(round(float(value), 9) for value in vertex)
+                    for vertex in vertices
+                },
+            )
+        coplanar_before = legacy_surfaces[coplanar_surface_id]
+        self.assertTrue(
+            np.all(
+                np.asarray(coplanar_before.mesh.face_normals) @ source_normal
+                > 0.999999
+            )
+        )
+        centroid_before = np.asarray(coplanar_before.mesh.centroid, dtype=float)
+
+        extrude_surface_faces([level], (coplanar_surface_id,), 0.1)
+
+        coplanar_after = next(
+            surface
+            for surface in build_fixed_surfaces([level])
+            if surface.surface_id == coplanar_surface_id
+        )
+        np.testing.assert_allclose(
+            np.asarray(coplanar_after.mesh.centroid, dtype=float),
+            centroid_before + source_normal * 0.1,
+            atol=1e-7,
+            rtol=0.0,
+        )
+
     def test_connected_face_extrusion_keeps_caps_and_adds_boundary_sides(self) -> None:
         level = _build_square_level()
         source_id, _selected_children = _insert_into_first_wall_triangle(level)

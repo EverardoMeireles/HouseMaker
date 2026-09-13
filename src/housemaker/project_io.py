@@ -177,6 +177,7 @@ def save_project(
                     _serialize_editable_surface(editable_surface)
                     for editable_surface in level.editable_surfaces
                 ],
+                "flipped_surface_ids": sorted(level.flipped_surface_ids),
             }
             for level in levels
         ],
@@ -284,6 +285,10 @@ def load_project(path: str | Path) -> ProjectData:
         )
         level.editable_surfaces = _deserialize_editable_surfaces(
             raw_level.get("editable_surfaces", []),
+            level_index=level.index,
+        )
+        level.flipped_surface_ids = _deserialize_flipped_surface_ids(
+            raw_level.get("flipped_surface_ids", []),
             level_index=level.index,
         )
 
@@ -926,6 +931,31 @@ def _deserialize_editable_surface(
         faces=faces,
         edges=edges,
     )
+
+
+# ### Surface orientation serialization helpers ###
+def _deserialize_flipped_surface_ids(
+    raw_surface_ids: object,
+    *,
+    level_index: int,
+) -> set[str]:
+    """Load valid level-local semantic IDs while isolating bad records."""
+
+    if not isinstance(raw_surface_ids, list | tuple | set | frozenset):
+        return set()
+    level_prefix = f"level:{int(level_index)}/"
+    flipped_surface_ids: set[str] = set()
+    for raw_surface_id in raw_surface_ids:
+        if not isinstance(raw_surface_id, str):
+            continue
+        surface_id = raw_surface_id.strip().lower()
+        if (
+            surface_id.startswith(level_prefix)
+            and len(surface_id) > len(level_prefix)
+            and len(surface_id) <= 512
+        ):
+            flipped_surface_ids.add(surface_id)
+    return flipped_surface_ids
 
 
 # ### Legacy wall-mirror migration helpers ###

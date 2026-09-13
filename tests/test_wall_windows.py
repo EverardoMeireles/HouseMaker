@@ -11,7 +11,7 @@ import numpy as np
 import trimesh
 from PIL import Image
 
-from housemaker.glb import convert_to_glb
+from housemaker.glb import _build_window_openings, convert_to_glb
 from housemaker.models import (
     DoorwayData,
     LevelData,
@@ -195,6 +195,67 @@ def _build_plain_closed_window_depth_level(
     )
 
 
+def _build_paired_room_window_level() -> tuple[LevelData, str]:
+    vertex_data = VertexData()
+    loops = (
+        ((0.0, 0.0), (500.0, 0.0), (500.0, 500.0), (0.0, 500.0)),
+        ((20.0, 20.0), (480.0, 20.0), (480.0, 480.0), (20.0, 480.0)),
+    )
+    loop_vertex_ids = []
+    for points in loops:
+        vertex_ids = tuple(vertex_data.add_vertex(*point).id for point in points)
+        loop_vertex_ids.append(vertex_ids)
+        for start_id, end_id in zip(
+            vertex_ids,
+            (*vertex_ids[1:], vertex_ids[0]),
+            strict=True,
+        ):
+            vertex_data.add_edge(start_id, end_id)
+    center = vertex_data.add_vertex(250.0, 250.0)
+    outer_ids = loop_vertex_ids[0]
+    level = LevelData(
+        index=2,
+        name="Paired room walls",
+        vertex_data=vertex_data,
+        rooms=[
+            RoomData(
+                name="Outer contour",
+                vertex_ids=outer_ids,
+                center_vertex_id=center.id,
+                color_rgb=(120, 140, 160),
+            )
+        ],
+    )
+    surface_id = (
+        f"level:2/room:{center.id}/wall:"
+        f"{min(outer_ids[0], outer_ids[1])}:"
+        f"{max(outer_ids[0], outer_ids[1])}"
+    )
+    return level, surface_id
+
+
+def _get_window_depth_direction(
+    level: LevelData,
+    surface_id: str,
+) -> tuple[float, float]:
+    level.windows = [
+        WindowData(
+            window_id="orientation-window",
+            wall_surface_id=surface_id,
+            start_ratio=0.25,
+            end_ratio=0.75,
+            bottom_ratio=0.25,
+            top_ratio=0.75,
+        )
+    ]
+    opening = next(
+        candidate
+        for candidate in _build_window_openings(level)
+        if candidate.target_surface_id == surface_id
+    )
+    return opening.depth_direction_x, opening.depth_direction_y
+
+
 def _build_mixed_room_plain_window_depth_level(
 ) -> tuple[LevelData, tuple[str, str]]:
     """Build a legacy partial room inside one complete structural loop."""
@@ -240,6 +301,86 @@ def _build_mixed_room_plain_window_depth_level(
             rooms=[legacy_room],
         ),
         tuple(parallel_wall_ids),
+    )
+
+
+def _build_nested_plain_window_depth_level() -> tuple[
+    LevelData,
+    tuple[tuple[str, str, str, int, tuple[float, float, float]], ...],
+]:
+    """Build mixed-direction inner walls with outer and room-side probes."""
+
+    vertex_data = VertexData()
+    boundary_loops = (
+        ((0.0, 0.0), (500.0, 0.0), (500.0, 500.0), (0.0, 500.0)),
+        ((20.0, 20.0), (480.0, 20.0), (480.0, 480.0), (20.0, 480.0)),
+    )
+    loop_vertex_ids: list[tuple[int, ...]] = []
+    for loop_index, points in enumerate(boundary_loops):
+        vertex_ids = tuple(vertex_data.add_vertex(*point).id for point in points)
+        loop_vertex_ids.append(vertex_ids)
+        for edge_index, (start_id, end_id) in enumerate(
+            zip(vertex_ids, (*vertex_ids[1:], vertex_ids[0]), strict=True)
+        ):
+            if loop_index == 1 and edge_index % 2 == 1:
+                start_id, end_id = end_id, start_id
+            vertex_data.add_edge(start_id, end_id)
+
+    sentinel_segments = (
+        ((150.0, 30.0), (350.0, 30.0)),
+        ((470.0, 150.0), (470.0, 350.0)),
+        ((350.0, 470.0), (150.0, 470.0)),
+        ((30.0, 350.0), (30.0, 150.0)),
+    )
+    sentinel_surface_ids: list[str] = []
+    for start_point, end_point in sentinel_segments:
+        start = vertex_data.add_vertex(*start_point)
+        end = vertex_data.add_vertex(*end_point)
+        vertex_data.add_edge(start.id, end.id)
+        sentinel_surface_ids.append(
+            f"level:2/wall:{min(start.id, end.id)}:{max(start.id, end.id)}"
+        )
+
+    outer_ids, inner_ids = loop_vertex_ids
+    wall_cases = tuple(
+        (
+            (
+                f"level:2/wall:{min(inner_start, inner_end)}:"
+                f"{max(inner_start, inner_end)}"
+            ),
+            (
+                f"level:2/wall:{min(outer_start, outer_end)}:"
+                f"{max(outer_start, outer_end)}"
+            ),
+            sentinel_surface_ids[edge_index],
+            1 if edge_index % 2 == 0 else 0,
+            expected_normal,
+        )
+        for edge_index, (
+            inner_start,
+            inner_end,
+            outer_start,
+            outer_end,
+            expected_normal,
+        ) in enumerate(
+            zip(
+                inner_ids,
+                (*inner_ids[1:], inner_ids[0]),
+                outer_ids,
+                (*outer_ids[1:], outer_ids[0]),
+                (
+                    (0.0, -1.0, 0.0),
+                    (-1.0, 0.0, 0.0),
+                    (0.0, 1.0, 0.0),
+                    (1.0, 0.0, 0.0),
+                ),
+                strict=True,
+            )
+        )
+    )
+    return (
+        LevelData(index=2, name="Nested plain walls", vertex_data=vertex_data),
+        wall_cases,
     )
 
 
@@ -427,6 +568,38 @@ class WallWindowStateTests(unittest.TestCase):
 
 # ### Window geometry and export tests ###
 class WallWindowGeometryTests(unittest.TestCase):
+    def test_room_window_depth_follows_paired_wall_orientation(self) -> None:
+        level, surface_id = _build_paired_room_window_level()
+
+        direction = _get_window_depth_direction(level, surface_id)
+
+        np.testing.assert_allclose(direction, (0.0, 1.0), atol=1e-9)
+
+    def test_manual_flip_reverses_room_window_depth_direction(self) -> None:
+        level, surface_id = _build_paired_room_window_level()
+        level.flipped_surface_ids.add(surface_id)
+
+        direction = _get_window_depth_direction(level, surface_id)
+
+        np.testing.assert_allclose(direction, (0.0, -1.0), atol=1e-9)
+
+    def test_manual_flip_reverses_plain_window_depth_direction(self) -> None:
+        level, surface_ids = _build_plain_window_depth_level()
+        target_surface_id = surface_ids[0]
+        automatic_direction = _get_window_depth_direction(
+            level,
+            target_surface_id,
+        )
+        level.flipped_surface_ids.add(target_surface_id)
+
+        direction = _get_window_depth_direction(level, target_surface_id)
+
+        np.testing.assert_allclose(
+            direction,
+            -np.asarray(automatic_direction, dtype=float),
+            atol=1e-9,
+        )
+
     def test_dragged_rectangle_commits_a_true_wall_hole(self) -> None:
         level = _build_square_level()
         wall = _get_window_wall(level)
@@ -791,7 +964,7 @@ class WallWindowGeometryTests(unittest.TestCase):
             )
         )
 
-    def test_plain_wall_without_contour_uses_bounded_right_side_depth(
+    def test_plain_wall_without_contour_cuts_behind_resolved_front(
         self,
     ) -> None:
         level, wall_ids = _build_plain_window_depth_level()
@@ -800,6 +973,11 @@ class WallWindowGeometryTests(unittest.TestCase):
             for surface in build_fixed_surfaces([level])
         }
         target = original_surfaces[wall_ids[0]]
+        np.testing.assert_allclose(
+            target.mesh.face_normals,
+            np.tile((0.0, 1.0, 0.0), (len(target.mesh.faces), 1)),
+            atol=1e-7,
+        )
         wall_start = np.asarray(target.wall_start_world, dtype=float)
         wall_end = np.asarray(target.wall_end_world, dtype=float)
         first = wall_start + (wall_end - wall_start) * 0.25
@@ -817,7 +995,7 @@ class WallWindowGeometryTests(unittest.TestCase):
             for surface in build_fixed_surfaces([level])
         }
 
-        for cut_wall_id in wall_ids[:2]:
+        for cut_wall_id in (wall_ids[0], wall_ids[2]):
             cut_surface = surfaces[cut_wall_id]
             self.assertFalse(
                 _mesh_covers_point_on_plane(
@@ -826,11 +1004,11 @@ class WallWindowGeometryTests(unittest.TestCase):
                     fixed_axis=1,
                 )
             )
-        inward_surface = surfaces[wall_ids[2]]
+        front_side_surface = surfaces[wall_ids[1]]
         self.assertTrue(
             _mesh_covers_point_on_plane(
-                inward_surface.mesh,
-                _get_wall_midpoint(inward_surface),
+                front_side_surface.mesh,
+                _get_wall_midpoint(front_side_surface),
                 fixed_axis=1,
             )
         )
@@ -889,6 +1067,68 @@ class WallWindowGeometryTests(unittest.TestCase):
                 fixed_axis=1,
             )
         )
+
+    def test_nested_mixed_direction_windows_cut_only_behind_inner_walls(
+        self,
+    ) -> None:
+        level, wall_cases = _build_nested_plain_window_depth_level()
+
+        for case_index, (
+            target_id,
+            _outer_id,
+            _sentinel_id,
+            _fixed_axis,
+            expected_normal,
+        ) in enumerate(wall_cases):
+            surfaces = {
+                surface.surface_id: surface for surface in build_fixed_surfaces([level])
+            }
+            target = surfaces[target_id]
+            np.testing.assert_allclose(
+                target.mesh.face_normals,
+                np.tile(expected_normal, (len(target.mesh.faces), 1)),
+                atol=1e-7,
+            )
+            add_wall_window(
+                [level],
+                build_wall_window_placement(
+                    target,
+                    _get_wall_ratio_point(target, 0.45, 0.75),
+                    _get_wall_ratio_point(target, 0.55, 2.25),
+                ),
+                window_id=f"nested-window-{case_index}",
+            )
+
+        updated_surfaces = {
+            surface.surface_id: surface for surface in build_fixed_surfaces([level])
+        }
+        for (
+            target_id,
+            outer_id,
+            sentinel_id,
+            fixed_axis,
+            _expected_normal,
+        ) in wall_cases:
+            with self.subTest(target_id=target_id):
+                for cut_surface_id in (target_id, outer_id):
+                    cut_surface = updated_surfaces[cut_surface_id]
+                    self.assertFalse(
+                        _mesh_covers_point_on_plane(
+                            cut_surface.mesh,
+                            _get_wall_midpoint(cut_surface),
+                            fixed_axis=fixed_axis,
+                        ),
+                        f"Expected a window hole in {cut_surface_id}.",
+                    )
+                sentinel = updated_surfaces[sentinel_id]
+                self.assertTrue(
+                    _mesh_covers_point_on_plane(
+                        sentinel.mesh,
+                        _get_wall_midpoint(sentinel),
+                        fixed_axis=fixed_axis,
+                    ),
+                    f"The window must not cut room-side wall {sentinel_id}.",
+                )
 
     def test_mixed_room_plain_loop_keeps_window_depth_outward(self) -> None:
         level, parallel_wall_ids = _build_mixed_room_plain_window_depth_level()

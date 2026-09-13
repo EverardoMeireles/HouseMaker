@@ -724,7 +724,7 @@ class SurfaceMaterialGlbTests(unittest.TestCase):
         )
         self.assertEqual(len(model.mesh.faces), 2)
         self.assertEqual(len(model.preview_untextured_mesh.faces), 0)
-        self.assertTrue(model.preview_textured_surfaces[0].double_sided)
+        self.assertFalse(model.preview_textured_surfaces[0].double_sided)
 
         exported_scene = trimesh.load(
             BytesIO(model.glb_bytes),
@@ -740,7 +740,7 @@ class SurfaceMaterialGlbTests(unittest.TestCase):
             == f"Surface {surface_id}"
         ]
         self.assertEqual(len(exported_sides), 1)
-        self.assertTrue(exported_sides[0].visual.material.doubleSided)
+        self.assertFalse(exported_sides[0].visual.material.doubleSided)
         for mesh in exported_sides:
             mesh.apply_transform(GLTF_Y_UP_TO_Z_UP_TRANSFORM)
         np.testing.assert_allclose(
@@ -750,6 +750,85 @@ class SurfaceMaterialGlbTests(unittest.TestCase):
         np.testing.assert_allclose(
             [float(mesh.face_normals[:, 1].mean()) for mesh in exported_sides],
             (1.0,),
+        )
+
+    def test_plain_wall_texture_preserves_a_manual_orientation_flip(self) -> None:
+        level = _build_reversed_plain_wall_level()
+        surface_id = "level:2/wall:1:2"
+        level.flipped_surface_ids.add(surface_id)
+
+        model = convert_to_glb(
+            [level],
+            surface_materials={surface_id: _solid_png((180, 70, 40, 255))},
+        )
+
+        preview = next(
+            surface
+            for surface in model.preview_textured_surfaces
+            if surface.surface_id == surface_id
+        )
+        self.assertFalse(preview.double_sided)
+        np.testing.assert_allclose(
+            preview.mesh.face_normals,
+            np.tile((0.0, -1.0, 0.0), (len(preview.mesh.faces), 1)),
+            atol=1e-9,
+        )
+
+        exported_scene = trimesh.load(
+            BytesIO(model.glb_bytes),
+            file_type="glb",
+            force="scene",
+            process=False,
+        )
+        exported = next(
+            mesh.copy()
+            for mesh in exported_scene.geometry.values()
+            if getattr(getattr(mesh.visual, "material", None), "name", "")
+            == f"Surface {surface_id}"
+        )
+        self.assertFalse(exported.visual.material.doubleSided)
+        exported.apply_transform(GLTF_Y_UP_TO_Z_UP_TRANSFORM)
+        np.testing.assert_allclose(
+            exported.face_normals,
+            np.tile((0.0, -1.0, 0.0), (len(exported.faces), 1)),
+            atol=1e-7,
+        )
+
+    def test_floor_texture_replaces_a_manually_flipped_slab_top(self) -> None:
+        level, room = _build_one_room_level()
+        surface_id = f"level:2/room:{room.center_vertex_id}/floor"
+        level.flipped_surface_ids.add(surface_id)
+
+        model = convert_to_glb(
+            [level],
+            surface_materials={surface_id: _solid_png((180, 70, 40, 255))},
+        )
+
+        preview = next(
+            surface
+            for surface in model.preview_textured_surfaces
+            if surface.surface_id == surface_id
+        )
+        np.testing.assert_allclose(
+            preview.mesh.face_normals,
+            np.tile((0.0, 0.0, -1.0), (len(preview.mesh.faces), 1)),
+            atol=1e-9,
+        )
+        triangles = np.asarray(model.mesh.triangles, dtype=float)
+        normals = np.asarray(model.mesh.face_normals, dtype=float)
+        top_faces = np.all(
+            np.isclose(
+                triangles[:, :, 2],
+                level.floor_thickness_meters,
+                atol=1e-9,
+            ),
+            axis=1,
+        ) & (np.abs(normals[:, 2]) > 0.9)
+        self.assertEqual(int(np.count_nonzero(top_faces)), len(preview.mesh.faces))
+        np.testing.assert_allclose(
+            normals[top_faces],
+            np.tile((0.0, 0.0, -1.0), (int(np.count_nonzero(top_faces)), 1)),
+            atol=1e-9,
         )
 
     def test_two_textured_sides_replace_the_shared_wall_at_its_real_plane(
@@ -1006,7 +1085,7 @@ class SurfaceMaterialWorkspaceTests(unittest.TestCase):
 
 # ### Ordinary viewer tests ###
 class SurfaceMaterialOrdinaryViewerTests(unittest.TestCase):
-    def test_plain_wall_texture_uses_one_double_sided_canvas_primitive(self) -> None:
+    def test_plain_wall_texture_uses_one_oriented_canvas_primitive(self) -> None:
         level = _build_reversed_plain_wall_level()
         surface_id = "level:2/wall:1:2"
         model = convert_to_glb(
@@ -1022,7 +1101,7 @@ class SurfaceMaterialOrdinaryViewerTests(unittest.TestCase):
             self.assertTrue(
                 all(item.visible() for item in viewer.textured_surface_items)
             )
-            self.assertTrue(viewer.textured_surface_items[0]._double_sided)
+            self.assertFalse(viewer.textured_surface_items[0]._double_sided)
         finally:
             viewer.close()
             viewer.deleteLater()

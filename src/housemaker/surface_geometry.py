@@ -12,11 +12,7 @@ import trimesh
 from shapely import LineString, Point, Polygon
 from shapely.geometry.base import BaseGeometry
 
-from housemaker.floor_geometry import (
-    OUTER_ENVELOPE_CLOSING_RADIUS_METERS,
-    build_level_floor_footprint,
-    build_level_open_space_geometry,
-)
+from housemaker.floor_geometry import build_level_open_space_geometry
 from housemaker.glb import (
     WALL_OPENING_EPSILON,
     DoorwayReveal,
@@ -30,12 +26,15 @@ from housemaker.glb import (
     _interpolate_2d_point,
 )
 from housemaker.level_coordinates import (
-    _get_valid_level_scale,
     build_level_base_z_lookup,
     level_image_to_world_xy,
 )
 from housemaker.models import Edge, LevelData, RoomData, WindowData
 from housemaker.uv_layout import build_room_walls
+from housemaker.wall_orientation import (
+    WallOrientationResolver,
+    build_level_wall_orientation_resolver,
+)
 
 # ### Constants ###
 SURFACE_TYPE_WALL = "wall"
@@ -133,15 +132,106 @@ def build_fixed_surfaces(levels: Sequence[LevelData]) -> list[FixedSurface]:
         clip_open_spaces=False,
     )
     edited_surfaces = apply_editable_surfaces(levels, base_surfaces)
+    clipped_surfaces = _clip_horizontal_surfaces_for_open_spaces(
+        levels,
+        edited_surfaces,
+    )
     return sorted(
-        _clip_horizontal_surfaces_for_open_spaces(
+        _apply_manual_surface_orientation_overrides(
             levels,
-            edited_surfaces,
+            clipped_surfaces,
+            edited_surfaces_only=True,
         ),
         key=_get_surface_sort_key,
     )
 
 
+# ### Manual orientation overrides ###
+def _apply_manual_surface_orientation_overrides(
+    levels: Sequence[LevelData],
+    surfaces: Sequence[FixedSurface],
+    *,
+    edited_surfaces_only: bool,
+) -> list[FixedSurface]:
+    """Apply persistent XOR winding overrides at the correct topology stage."""
+
+    flipped_ids_by_level = {
+        level.index: level.flipped_surface_ids for level in levels
+    }
+    resolved: list[FixedSurface] = []
+    for surface in surfaces:
+        is_edited_surface = surface.source_surface_id is not None
+        should_flip = (
+            is_edited_surface == edited_surfaces_only
+            and surface.surface_id
+            in flipped_ids_by_level.get(surface.level_index, set())
+        )
+        if not should_flip:
+            resolved.append(surface)
+            continue
+        flipped_mesh = surface.mesh.copy()
+        faces = np.asarray(flipped_mesh.faces, dtype=np.int64).copy()
+        face_mask = _get_manual_orientation_flip_face_mask(surface, faces)
+        faces[face_mask] = faces[face_mask, ::-1]
+        flipped_mesh.faces = np.ascontiguousarray(faces)
+        resolved.append(replace(surface, mesh=flipped_mesh))
+    return resolved
+
+
+def _get_manual_orientation_flip_face_mask(
+    surface: FixedSurface,
+    faces: np.ndarray,
+) -> np.ndarray:
+    """Keep wall-opening reveal winding independent from its owning wall."""
+
+    if (
+        surface.surface_type != SURFACE_TYPE_WALL
+        or surface.wall_start_world is None
+        or surface.wall_end_world is None
+    ):
+        return np.ones(len(faces), dtype=bool)
+
+    wall_start = np.asarray(surface.wall_start_world, dtype=float)
+    wall_end = np.asarray(surface.wall_end_world, dtype=float)
+    vertices = np.asarray(surface.mesh.vertices, dtype=float)
+    if (
+        wall_start.shape != (3,)
+        or wall_end.shape != (3,)
+        or not np.all(np.isfinite((wall_start, wall_end)))
+        or faces.ndim != 2
+        or faces.shape[1:] != (3,)
+        or vertices.ndim != 2
+        or vertices.shape[1:] != (3,)
+    ):
+        return np.ones(len(faces), dtype=bool)
+    wall_axis = wall_end - wall_start
+    wall_axis[2] = 0.0
+    wall_normal = np.cross(wall_axis, np.asarray((0.0, 0.0, 1.0)))
+    normal_length = float(np.linalg.norm(wall_normal))
+    if normal_length <= SURFACE_GEOMETRY_EPSILON:
+        return np.ones(len(faces), dtype=bool)
+
+    wall_normal /= normal_length
+    coordinate_scale = max(
+        1.0,
+        float(np.linalg.norm(wall_start)),
+        float(np.linalg.norm(wall_end)),
+    )
+    plane_tolerance = max(
+        SURFACE_GEOMETRY_EPSILON * 10.0,
+        coordinate_scale * np.finfo(float).eps * 64.0,
+    )
+    signed_distances = (
+        vertices[faces] - wall_start[np.newaxis, np.newaxis, :]
+    ) @ wall_normal
+    coplanar_faces = np.all(
+        np.abs(signed_distances) <= plane_tolerance,
+        axis=1,
+    )
+    return coplanar_faces
+
+
+# ### Open-space clipping ###
 def _clip_horizontal_surfaces_for_open_spaces(
     levels: Sequence[LevelData],
     surfaces: Sequence[FixedSurface],
@@ -246,6 +336,7 @@ def build_base_fixed_surfaces(
         if not level.include_in_export:
             continue
         base_z_meters = level_base_z.get(level.index, 0.0)
+        wall_orientation = build_level_wall_orientation_resolver(level)
         doorway_reveals_by_surface_id = _group_doorway_reveals_by_surface_id(
             _build_level_doorway_reveals(
                 level,
@@ -253,7 +344,7 @@ def build_base_fixed_surfaces(
             )
         )
         window_reveals_by_surface_id = _group_window_reveals_by_surface_id(
-            _build_level_window_reveals(level)
+            _build_level_window_reveals(level, wall_orientation)
         )
         floor_open_spaces = (
             _build_level_world_open_space_geometry(level)
@@ -270,12 +361,14 @@ def build_base_fixed_surfaces(
             )
             else _build_level_world_open_space_geometry(upper_level)
         )
+        level_floor_footprint = wall_orientation.floor_footprint
         surfaces.extend(
             _build_plain_level_wall_surfaces(
                 level,
                 base_z_meters,
                 doorway_reveals_by_surface_id,
                 window_reveals_by_surface_id,
+                wall_orientation,
             )
         )
         for room_index, room in enumerate(level.rooms):
@@ -293,6 +386,7 @@ def build_base_fixed_surfaces(
                     ),
                     floor_open_spaces=floor_open_spaces,
                     ceiling_open_spaces=ceiling_open_spaces,
+                    wall_orientation=wall_orientation,
                 )
             )
 
@@ -302,10 +396,18 @@ def build_base_fixed_surfaces(
                 base_z_meters,
                 floor_open_spaces,
                 ceiling_open_spaces,
+                level_floor_footprint,
             )
         )
 
-    return sorted(surfaces, key=_get_surface_sort_key)
+    return sorted(
+        _apply_manual_surface_orientation_overrides(
+            levels,
+            surfaces,
+            edited_surfaces_only=False,
+        ),
+        key=_get_surface_sort_key,
+    )
 
 
 def get_combined_surface_area(
@@ -527,10 +629,11 @@ def _build_room_surfaces(
     window_reveals_by_surface_id: Mapping[str, Sequence[WindowReveal]],
     floor_open_spaces: BaseGeometry | None,
     ceiling_open_spaces: BaseGeometry | None,
+    wall_orientation: WallOrientationResolver,
 ) -> list[FixedSurface]:
     surfaces: list[FixedSurface] = []
     room_identity = room.center_vertex_id
-    wall_openings = _build_level_wall_openings(level)
+    wall_openings = _build_level_wall_openings(level, wall_orientation)
     room_polygon = _build_room_world_polygon(level, room)
     for wall in build_room_walls(room, level.vertex_data):
         wall_surface = _build_wall_surface(
@@ -545,6 +648,12 @@ def _build_room_surfaces(
             room_identity=room_identity,
             doorway_reveals_by_surface_id=doorway_reveals_by_surface_id,
             interior_polygon=room_polygon,
+            preferred_facing_normal_xy=(
+                wall_orientation.resolve_image_paired_wall_facing_normal(
+                    wall.start_point,
+                    wall.end_point,
+                )
+            ),
             window_reveals_by_surface_id=window_reveals_by_surface_id,
         )
         if wall_surface is not None:
@@ -605,10 +714,11 @@ def _build_plain_level_wall_surfaces(
         Sequence[DoorwayReveal],
     ],
     window_reveals_by_surface_id: Mapping[str, Sequence[WindowReveal]],
+    wall_orientation: WallOrientationResolver,
 ) -> list[FixedSurface]:
     room_vertex_sets = [set(room.vertex_ids) for room in level.rooms]
     ignored_vertex_ids = {room.center_vertex_id for room in level.rooms}
-    wall_openings = _build_level_wall_openings(level)
+    wall_openings = _build_level_wall_openings(level, wall_orientation)
     vertex_lookup = {vertex.id: vertex for vertex in level.vertex_data.vertices}
     structural_edges = [
         edge
@@ -625,10 +735,6 @@ def _build_plain_level_wall_surfaces(
             for vertex_ids in room_vertex_sets
         )
     ]
-    interior_geometry = _build_closed_wall_interior_geometry(
-        level,
-        structural_edges,
-    )
     surfaces: list[FixedSurface] = []
     for edge in plain_edges:
         start_vertex = vertex_lookup.get(edge.start_vertex_id)
@@ -650,7 +756,13 @@ def _build_plain_level_wall_surfaces(
             room_index=None,
             room_identity=None,
             doorway_reveals_by_surface_id=doorway_reveals_by_surface_id,
-            interior_polygon=interior_geometry,
+            interior_polygon=None,
+            preferred_facing_normal_xy=(
+                wall_orientation.resolve_image_wall_facing_normal(
+                    (start_vertex.x, start_vertex.y),
+                    (end_vertex.x, end_vertex.y),
+                )
+            ),
             window_reveals_by_surface_id=window_reveals_by_surface_id,
         )
         if surface is not None:
@@ -829,6 +941,7 @@ def _build_wall_surface(
     ],
     interior_polygon: BaseGeometry | None,
     window_reveals_by_surface_id: Mapping[str, Sequence[WindowReveal]],
+    preferred_facing_normal_xy: tuple[float, float] | None = None,
 ) -> FixedSurface | None:
     if (
         not math.isfinite(float(wall_height_meters))
@@ -865,9 +978,10 @@ def _build_wall_surface(
             faces,
             corners,
             reverse_winding=(
-                _quad_front_points_outside_polygon(
+                _wall_polygon_requires_winding_flip(
                     corners,
                     interior_polygon,
+                    preferred_facing_normal_xy,
                 )
             ),
         )
@@ -1025,10 +1139,10 @@ def _build_level_residual_horizontal_surfaces(
     base_z_meters: float,
     floor_open_spaces: BaseGeometry | None,
     ceiling_open_spaces: BaseGeometry | None,
+    level_interior: BaseGeometry | None,
 ) -> tuple[FixedSurface, ...]:
     """Build automatic non-room floor and ceiling surfaces from closed walls."""
 
-    level_interior = _build_level_world_floor_footprint(level)
     if level_interior is None:
         return ()
 
@@ -1203,71 +1317,7 @@ def _build_room_world_polygon(
     return _build_polygon_from_vertices(level, room.vertex_ids, room.center_vertex_id)
 
 
-def _build_level_world_floor_footprint(
-    level: LevelData,
-) -> BaseGeometry | None:
-    """Build the shared floor footprint in transformed level coordinates."""
-
-    def point_to_world(
-        image_point: tuple[float, float],
-        _blueprint_size_pixels: tuple[float, float] | None,
-    ) -> np.ndarray:
-        return np.asarray(
-            level_image_to_world_xy(level, *image_point),
-            dtype=float,
-        )
-
-    return build_level_floor_footprint(
-        level=level,
-        blueprint_size_pixels=level.image_size_pixels,
-        point_to_world_xy=point_to_world,
-        closing_radius_meters=(
-            OUTER_ENVELOPE_CLOSING_RADIUS_METERS
-            * _get_valid_level_scale(level)
-        ),
-    )
-
-
-def _build_closed_wall_interior_geometry(
-    level: LevelData,
-    edges: Sequence[Edge],
-) -> BaseGeometry | None:
-    """Infer wall-facing interiors from exact closed structural loops."""
-
-    lines: list[LineString] = []
-    for edge in edges:
-        start_vertex = level.vertex_data.get_vertex(edge.start_vertex_id)
-        end_vertex = level.vertex_data.get_vertex(edge.end_vertex_id)
-        if start_vertex is None or end_vertex is None:
-            continue
-        lines.append(
-            LineString(
-                (
-                    level_image_to_world_xy(
-                        level,
-                        start_vertex.x,
-                        start_vertex.y,
-                    ),
-                    level_image_to_world_xy(
-                        level,
-                        end_vertex.x,
-                        end_vertex.y,
-                    ),
-                )
-            )
-        )
-
-    polygons = [
-        candidate
-        for candidate in shapely.get_parts(shapely.polygonize(lines))
-        if isinstance(candidate, Polygon)
-        and candidate.area > SURFACE_GEOMETRY_EPSILON
-    ]
-    if not polygons:
-        return None
-    return shapely.union_all(polygons)
-
-
+# ### Polygon helpers ###
 def _build_polygon_from_vertices(
     level: LevelData,
     vertex_ids: Sequence[int],
@@ -1378,13 +1428,14 @@ def _append_quad(
     )
 
 
-def _quad_front_points_outside_polygon(
+def _wall_polygon_requires_winding_flip(
     corners: Sequence[tuple[float, float, float]],
     interior_polygon: BaseGeometry | None,
+    preferred_facing_normal_xy: tuple[float, float] | None,
 ) -> bool:
-    """Return whether one planar quad must flip to face its local interior."""
+    """Return whether one wall patch must flip toward its exposed side."""
 
-    if interior_polygon is None or interior_polygon.is_empty or len(corners) < 3:
+    if len(corners) < 3:
         return False
     corner_array = np.asarray(corners, dtype=float)
     face_normal = np.cross(
@@ -1409,6 +1460,21 @@ def _quad_front_points_outside_polygon(
     ):
         return False
     normal_xy /= normal_length
+    if preferred_facing_normal_xy is not None:
+        preferred_normal = np.asarray(
+            preferred_facing_normal_xy,
+            dtype=float,
+        )
+        preferred_length = float(np.linalg.norm(preferred_normal))
+        if (
+            preferred_normal.shape == (2,)
+            and np.all(np.isfinite(preferred_normal))
+            and preferred_length > SURFACE_GEOMETRY_EPSILON
+        ):
+            preferred_normal /= preferred_length
+            return float(np.dot(normal_xy, preferred_normal)) < 0.0
+    if interior_polygon is None or interior_polygon.is_empty:
+        return False
     midpoint_xy = np.mean(corner_array[:, :2], axis=0)
     for probe_ratio in SURFACE_INTERIOR_PROBE_RATIOS:
         probe_distance = max(

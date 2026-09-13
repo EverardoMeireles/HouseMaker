@@ -1854,6 +1854,7 @@ class TextureAtlasWorkspace(QWidget):
     ambient_occlusion_bake_requested = Signal(str, float)
     ambient_occlusion_bake_all_requested = Signal()
     active_preview_map_changed = Signal(str, bool)
+    face_orientation_mode_changed = Signal(bool)
 
     def __init__(
         self,
@@ -3953,6 +3954,21 @@ class TextureAtlasWorkspace(QWidget):
         preview_layout.setSpacing(6)
         zoom_controls = QHBoxLayout()
         zoom_controls.addStretch(1)
+        self.face_orientation_toggle_button = QPushButton(
+            "Toggle face orientation"
+        )
+        self.face_orientation_toggle_button.setObjectName(
+            "texture_atlas_face_orientation_toggle_button"
+        )
+        self.face_orientation_toggle_button.setCheckable(True)
+        self.face_orientation_toggle_button.setToolTip(
+            "Show surface face orientations in the Canvas 3D view (blue front, "
+            "red back) and click a surface to flip it."
+        )
+        self.face_orientation_toggle_button.toggled.connect(
+            self.face_orientation_mode_changed.emit
+        )
+        zoom_controls.addWidget(self.face_orientation_toggle_button)
         self.zoom_out_button = QPushButton("Zoom out")
         self.zoom_out_button.setObjectName("texture_atlas_zoom_out_button")
         self.zoom_out_button.setToolTip(

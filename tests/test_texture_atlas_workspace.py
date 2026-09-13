@@ -2909,6 +2909,35 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.assertIn("1024 x 1024", self.workspace.surface_list.item(0).text())
 
     # ### Atlas zoom tests ###
+    def test_face_orientation_toggle_precedes_zoom_out_and_emits_mode(self) -> None:
+        emitted_modes: list[bool] = []
+        self.workspace.face_orientation_mode_changed.connect(
+            emitted_modes.append
+        )
+        button = self.workspace.face_orientation_toggle_button
+        zoom_controls = self.workspace.zoom_out_button.parentWidget().layout().itemAt(
+            0
+        ).layout()
+
+        self.assertEqual(button.text(), "Toggle face orientation")
+        self.assertEqual(
+            button.objectName(),
+            "texture_atlas_face_orientation_toggle_button",
+        )
+        self.assertTrue(button.isCheckable())
+        self.assertFalse(button.isChecked())
+        self.assertIsNotNone(zoom_controls)
+        assert zoom_controls is not None
+        self.assertEqual(
+            zoom_controls.indexOf(button) + 1,
+            zoom_controls.indexOf(self.workspace.zoom_out_button),
+        )
+
+        button.click()
+        button.click()
+
+        self.assertEqual(emitted_modes, [True, False])
+
     def test_ctrl_wheel_zoom_is_cursor_anchored_without_resizing(self) -> None:
         data = TextureAtlasData()
         atlas = data.create_atlas("Zoom", 2048, atlas_id="atlas-a")

@@ -25,8 +25,7 @@ from PySide6.QtGui import (
     QPainterPath,
     QPen,
 )
-from shapely import Point, Polygon
-from shapely.geometry.base import BaseGeometry
+from shapely import Polygon
 from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
@@ -65,6 +64,10 @@ from housemaker.uv_layout import (
     build_room_walls,
     build_uv_wall_layout,
     get_rotated_uv_corners,
+)
+from housemaker.wall_orientation import (
+    WallOrientationResolver,
+    build_level_wall_orientation_resolver,
 )
 
 # ### Constants ###
@@ -694,6 +697,12 @@ def _build_blueprint_model(
             base_fixed_surfaces,
             fixed_surfaces,
         )
+        named_meshes = _apply_manual_floor_orientation_geometry(
+            named_meshes,
+            level_source,
+            base_fixed_surfaces,
+            fixed_surfaces,
+        )
         preview_textured_walls = _build_preview_textured_walls(
             level_source,
             blueprint_size_pixels=blueprint_size_pixels,
@@ -843,6 +852,67 @@ def _build_untextured_editable_surface_mesh(
     """Copy one logical face without duplicating render triangles."""
 
     return getattr(surface, "mesh").copy()
+
+
+def _apply_manual_floor_orientation_geometry(
+    named_meshes: Sequence[NamedMesh],
+    levels: Sequence[LevelData],
+    base_surfaces: Sequence[object],
+    current_surfaces: Sequence[object],
+) -> list[NamedMesh]:
+    """Replace flipped slab tops with their authoritative semantic winding."""
+
+    flipped_ids_by_level = {
+        level.index: set(level.flipped_surface_ids) for level in levels
+    }
+    current_surface_ids = {
+        str(getattr(surface, "surface_id")) for surface in current_surfaces
+    }
+    flipped_floor_surfaces = [
+        surface
+        for surface in base_surfaces
+        if getattr(surface, "surface_type", None) == "floor"
+        and str(getattr(surface, "surface_id")) in current_surface_ids
+        and str(getattr(surface, "surface_id"))
+        in flipped_ids_by_level.get(int(getattr(surface, "level_index")), set())
+    ]
+    if not flipped_floor_surfaces:
+        return list(named_meshes)
+
+    original_floor_surfaces = [
+        replace(
+            surface,
+            mesh=_copy_mesh_with_reversed_winding(getattr(surface, "mesh")),
+        )
+        for surface in flipped_floor_surfaces
+    ]
+    retained_named_meshes = _remove_named_mesh_surface_faces(
+        named_meshes,
+        _build_oriented_surface_face_keys(original_floor_surfaces),
+        _build_surface_plane_coverage(original_floor_surfaces),
+    )
+    retained_named_meshes.extend(
+        NamedMesh(
+            name=(
+                f"{_get_surface_object_name(str(getattr(surface, 'surface_id')))}"
+                "_orientation"
+            ),
+            mesh=getattr(surface, "mesh").copy(),
+        )
+        for surface in flipped_floor_surfaces
+    )
+    return retained_named_meshes
+
+
+def _copy_mesh_with_reversed_winding(
+    mesh: trimesh.Trimesh,
+) -> trimesh.Trimesh:
+    """Return a geometry-preserving copy with every triangle reversed."""
+
+    reversed_mesh = mesh.copy()
+    faces = np.asarray(reversed_mesh.faces, dtype=np.int64).copy()
+    reversed_mesh.faces = np.ascontiguousarray(faces[:, ::-1])
+    return reversed_mesh
 
 
 # ### Placed generated-model composition ###
@@ -2893,10 +2963,9 @@ def _build_surface_named_meshes(
         if material is None:
             continue
 
-        double_sided = (
-            surface_type == "wall"
-            and getattr(surface, "room_index", None) is None
-        )
+        # Every semantic surface has authoritative winding. Keeping plain walls
+        # one-sided makes a manual orientation flip visible in Canvas and glTF.
+        double_sided = False
 
         object_name = _get_surface_object_name(surface_id)
         mesh = build_textured_mesh(
@@ -3930,6 +3999,7 @@ def _build_named_meshes_for_level(
         level_blueprint_size,
     )
     room_vertex_sets = _get_room_vertex_sets(level.rooms)
+    wall_orientation = build_level_wall_orientation_resolver(level)
     named_meshes: list[NamedMesh] = []
     floor_mesh = build_level_floor_mesh(
         level=level,
@@ -3951,9 +4021,11 @@ def _build_named_meshes_for_level(
         base_z_meters=base_z_meters,
         blueprint_size_pixels=level_blueprint_size,
         doorways=level.doorways,
-        window_openings=_build_window_openings(level),
+        window_openings=_build_window_openings(level, wall_orientation),
         ignored_vertex_ids=_get_room_center_vertex_ids(level.rooms),
         ignored_room_vertex_sets=room_vertex_sets,
+        level=level,
+        wall_orientation=wall_orientation,
     )
 
     if regular_wall_meshes:
@@ -3969,6 +4041,7 @@ def _build_named_meshes_for_level(
             level=level,
             base_z_meters=base_z_meters,
             blueprint_size_pixels=level_blueprint_size,
+            wall_orientation=wall_orientation,
         )
     )
 
@@ -3991,6 +4064,7 @@ def _build_named_meshes_for_level(
         level=level,
         base_z_meters=base_z_meters,
         blueprint_size_pixels=level_blueprint_size,
+        wall_orientation=wall_orientation,
     )
     if window_reveal_mesh is not None:
         named_meshes.append(
@@ -4011,6 +4085,7 @@ def _build_room_named_meshes(
     level: LevelData,
     base_z_meters: float,
     blueprint_size_pixels: tuple[float, float] | None,
+    wall_orientation: WallOrientationResolver | None = None,
 ) -> list[NamedMesh]:
     named_meshes: list[NamedMesh] = []
     for room_index, room in enumerate(level.rooms):
@@ -4026,6 +4101,7 @@ def _build_room_named_meshes(
             room_index=room_index,
             base_z_meters=base_z_meters,
             blueprint_size_pixels=blueprint_size_pixels,
+            wall_orientation=wall_orientation,
         )
         if room_mesh is None:
             continue
@@ -4049,6 +4125,8 @@ def _build_level_meshes(
     window_openings: Sequence[WallOpening] = (),
     ignored_vertex_ids: set[int] | None = None,
     ignored_room_vertex_sets: list[set[int]] | None = None,
+    level: LevelData | None = None,
+    wall_orientation: WallOrientationResolver | None = None,
 ) -> list[trimesh.Trimesh]:
     if wall_height_meters <= 0.0:
         raise ValueError("Height level must be greater than zero.")
@@ -4056,30 +4134,55 @@ def _build_level_meshes(
     ignored_ids = ignored_vertex_ids or set()
     room_vertex_sets = ignored_room_vertex_sets or []
     vertex_lookup = {vertex.id: vertex for vertex in vertex_data.vertices}
+    authoritative_orientation = level is not None
+    if authoritative_orientation and wall_orientation is None:
+        wall_orientation = build_level_wall_orientation_resolver(level)
     doorway_openings = [
         *_build_wall_openings(doorways),
         *window_openings,
     ]
-    return [
-        wall_mesh
-        for edge in vertex_data.edges
+    wall_meshes: list[trimesh.Trimesh] = []
+    for edge in vertex_data.edges:
         if (
-            edge.start_vertex_id not in ignored_ids
-            and edge.end_vertex_id not in ignored_ids
-            and not _is_edge_inside_any_room(edge, room_vertex_sets)
-        )
-        if (
-            wall_mesh := _build_wall_mesh(
-                edge=edge,
-                vertex_lookup=vertex_lookup,
-                wall_height_meters=wall_height_meters,
-                base_z_meters=base_z_meters,
-                blueprint_size_pixels=blueprint_size_pixels,
-                doorway_openings=doorway_openings,
+            edge.start_vertex_id in ignored_ids
+            or edge.end_vertex_id in ignored_ids
+            or _is_edge_inside_any_room(edge, room_vertex_sets)
+        ):
+            continue
+        start_vertex = vertex_lookup.get(edge.start_vertex_id)
+        end_vertex = vertex_lookup.get(edge.end_vertex_id)
+        preferred_facing_normal_xy = (
+            None
+            if wall_orientation is None
+            or start_vertex is None
+            or end_vertex is None
+            else wall_orientation.resolve_image_wall_facing_normal(
+                (start_vertex.x, start_vertex.y),
+                (end_vertex.x, end_vertex.y),
             )
         )
-        is not None
-    ]
+        surface_id = (
+            None
+            if level is None
+            else _build_plain_wall_surface_id(level, edge)
+        )
+        wall_mesh = _build_wall_mesh(
+            edge=edge,
+            vertex_lookup=vertex_lookup,
+            wall_height_meters=wall_height_meters,
+            base_z_meters=base_z_meters,
+            blueprint_size_pixels=blueprint_size_pixels,
+            doorway_openings=doorway_openings,
+            preferred_facing_normal_xy=preferred_facing_normal_xy,
+            manual_orientation_flip=(
+                surface_id is not None
+                and surface_id in level.flipped_surface_ids
+            ),
+            double_sided=not authoritative_orientation,
+        )
+        if wall_mesh is not None:
+            wall_meshes.append(wall_mesh)
+    return wall_meshes
 
 
 def _build_room_mesh(
@@ -4088,6 +4191,7 @@ def _build_room_mesh(
     room_index: int,
     base_z_meters: float,
     blueprint_size_pixels: tuple[float, float] | None,
+    wall_orientation: WallOrientationResolver | None = None,
 ) -> trimesh.Trimesh | None:
     room_walls = build_room_walls(room, level.vertex_data)
     if not room_walls:
@@ -4099,13 +4203,30 @@ def _build_room_mesh(
         wall_height_meters=room.height_meters,
     )
     placements_by_key = _group_wall_placements_by_key(layout.placements)
-    doorway_openings = _build_level_wall_openings(level)
+    doorway_openings = _build_level_wall_openings(level, wall_orientation)
     material = _build_room_material(level, room, room_index, layout)
     vertices: list[list[float]] = []
     faces: list[list[int]] = []
     uv_coordinates: list[tuple[float, float]] = []
 
     for wall in room_walls:
+        surface_id = _build_room_wall_surface_id(level, room, wall)
+        reverse_wall_winding = _wall_faces_require_winding_flip(
+            start_point=wall.start_point,
+            end_point=wall.end_point,
+            blueprint_size_pixels=blueprint_size_pixels,
+            preferred_facing_normal_xy=(
+                None
+                if wall_orientation is None
+                else wall_orientation.resolve_image_paired_wall_facing_normal(
+                    wall.start_point,
+                    wall.end_point,
+                )
+            ),
+            manual_orientation_flip=(
+                surface_id in level.flipped_surface_ids
+            ),
+        )
         wall_placements = placements_by_key.get(wall.key, [])
         if not wall_placements:
             for wall_piece in _build_visible_wall_pieces(
@@ -4132,6 +4253,7 @@ def _build_room_mesh(
                         vertex_offset,
                         len(wall_vertices),
                         double_sided=False,
+                        reverse_winding=reverse_wall_winding,
                     )
                 )
                 uv_coordinates.extend(
@@ -4168,6 +4290,7 @@ def _build_room_mesh(
                         vertex_offset,
                         len(wall_vertices),
                         double_sided=False,
+                        reverse_winding=reverse_wall_winding,
                     )
                 )
                 uv_coordinates.extend(
@@ -4620,18 +4743,26 @@ def _build_wall_openings(doorways: Sequence[object]) -> list[WallOpening]:
     return wall_openings
 
 
-def _build_level_wall_openings(level: LevelData) -> list[WallOpening]:
+def _build_level_wall_openings(
+    level: LevelData,
+    wall_orientation: WallOrientationResolver | None = None,
+) -> list[WallOpening]:
     """Build doorway and stable wall-attached window cuts for one level."""
 
     return [
         *_build_wall_openings(level.doorways),
-        *_build_window_openings(level),
+        *_build_window_openings(level, wall_orientation),
     ]
 
 
-def _build_window_openings(level: LevelData) -> list[WallOpening]:
+def _build_window_openings(
+    level: LevelData,
+    wall_orientation: WallOrientationResolver | None = None,
+) -> list[WallOpening]:
+    if not getattr(level, "windows", ()):
+        return []
     openings: list[WallOpening] = []
-    targets = _build_window_wall_target_lookup(level)
+    targets = _build_window_wall_target_lookup(level, wall_orientation)
     for window in getattr(level, "windows", ()):
         wall_surface_id = str(getattr(window, "wall_surface_id", "")).strip()
         target = targets.get(wall_surface_id)
@@ -4699,17 +4830,27 @@ def _build_window_openings(level: LevelData) -> list[WallOpening]:
 
 def _build_window_wall_target_lookup(
     level: LevelData,
+    wall_orientation: WallOrientationResolver | None = None,
 ) -> dict[str, WallSource]:
     targets: dict[str, WallSource] = {}
+    if wall_orientation is None:
+        wall_orientation = build_level_wall_orientation_resolver(level)
     for room in level.rooms:
         for wall in build_room_walls(room, level.vertex_data):
-            exterior_direction = _get_wall_right_normal(
-                wall.start_point,
-                wall.end_point,
+            surface_id = _build_room_wall_surface_id(level, room, wall)
+            exterior_direction = (
+                wall_orientation.resolve_image_paired_wall_exterior_direction(
+                    wall.start_point,
+                    wall.end_point,
+                )
+                or _get_wall_right_normal(
+                    wall.start_point,
+                    wall.end_point,
+                )
             )
-            surface_id = (
-                f"level:{level.index}/room:{room.center_vertex_id}/"
-                f"wall:{wall.key}"
+            exterior_direction = _apply_manual_wall_direction_flip(
+                exterior_direction,
+                surface_id in level.flipped_surface_ids,
             )
             targets[surface_id] = WallSource(
                 key=wall.key,
@@ -4735,10 +4876,6 @@ def _build_window_wall_target_lookup(
         for edge in structural_edges
         if not _is_edge_inside_any_room(edge, room_vertex_sets)
     ]
-    level_interior = _build_closed_wall_image_interior(
-        level,
-        structural_edges,
-    )
     for edge in plain_edges:
         start_vertex = vertex_lookup.get(edge.start_vertex_id)
         end_vertex = vertex_lookup.get(edge.end_vertex_id)
@@ -4748,7 +4885,17 @@ def _build_window_wall_target_lookup(
             f"{min(edge.start_vertex_id, edge.end_vertex_id)}:"
             f"{max(edge.start_vertex_id, edge.end_vertex_id)}"
         )
-        surface_id = f"level:{level.index}/wall:{wall_key}"
+        surface_id = _build_plain_wall_surface_id(level, edge)
+        exterior_direction = (
+            wall_orientation.resolve_image_wall_exterior_direction(
+                (start_vertex.x, start_vertex.y),
+                (end_vertex.x, end_vertex.y),
+            )
+            or _get_wall_right_normal(
+                (start_vertex.x, start_vertex.y),
+                (end_vertex.x, end_vertex.y),
+            )
+        )
         targets[surface_id] = WallSource(
             key=wall_key,
             start_point=(start_vertex.x, start_vertex.y),
@@ -4756,10 +4903,9 @@ def _build_window_wall_target_lookup(
             height_meters=level.height_meters,
             wall_key=wall_key,
             surface_id=surface_id,
-            exterior_direction=_get_wall_exterior_from_interior(
-                (start_vertex.x, start_vertex.y),
-                (end_vertex.x, end_vertex.y),
-                level_interior,
+            exterior_direction=_apply_manual_wall_direction_flip(
+                exterior_direction,
+                surface_id in level.flipped_surface_ids,
             ),
         )
     return targets
@@ -4811,74 +4957,15 @@ def _get_wall_right_normal(
     return delta_y / length, -delta_x / length
 
 
-def _build_closed_wall_image_interior(
-    level: LevelData,
-    edges: Sequence[Edge],
-) -> BaseGeometry | None:
-    """Infer the interior of every closed structural wall loop."""
-
-    lines = []
-    for edge in edges:
-        start_vertex = level.vertex_data.get_vertex(edge.start_vertex_id)
-        end_vertex = level.vertex_data.get_vertex(edge.end_vertex_id)
-        if start_vertex is None or end_vertex is None:
-            continue
-        lines.append(
-            shapely.LineString(
-                (
-                    (start_vertex.x, start_vertex.y),
-                    (end_vertex.x, end_vertex.y),
-                )
-            )
-        )
-
-    polygons = [
-        candidate
-        for candidate in shapely.get_parts(shapely.polygonize(lines))
-        if isinstance(candidate, Polygon)
-        and candidate.area > WALL_OPENING_EPSILON
-    ]
-    if not polygons:
-        return None
-    return shapely.union_all(polygons)
-
-
-def _get_wall_exterior_from_interior(
-    start_point: tuple[float, float],
-    end_point: tuple[float, float],
-    interior: BaseGeometry | None,
+def _apply_manual_wall_direction_flip(
+    direction: tuple[float, float] | None,
+    flipped: bool,
 ) -> tuple[float, float] | None:
-    if interior is None or interior.is_empty:
-        return None
-    right_normal = _get_wall_right_normal(start_point, end_point)
-    if right_normal is None:
-        return None
-    left_normal = (-right_normal[0], -right_normal[1])
-    midpoint = (
-        (start_point[0] + end_point[0]) / 2.0,
-        (start_point[1] + end_point[1]) / 2.0,
-    )
-    wall_length = _get_2d_point_distance(start_point, end_point)
-    for probe_ratio in (1e-7, 1e-6, 1e-5, 1e-4, 1e-3):
-        probe_distance = max(
-            WALL_OPENING_EPSILON * 10.0,
-            wall_length * probe_ratio,
-        )
-        right_is_inside = interior.contains(
-            Point(
-                midpoint[0] + right_normal[0] * probe_distance,
-                midpoint[1] + right_normal[1] * probe_distance,
-            )
-        )
-        left_is_inside = interior.contains(
-            Point(
-                midpoint[0] + left_normal[0] * probe_distance,
-                midpoint[1] + left_normal[1] * probe_distance,
-            )
-        )
-        if right_is_inside != left_is_inside:
-            return left_normal if right_is_inside else right_normal
-    return None
+    """Keep window cut depth behind the wall's effective visible front."""
+
+    if direction is None or not flipped:
+        return direction
+    return -direction[0], -direction[1]
 
 
 def _build_visible_wall_pieces(
@@ -5341,10 +5428,11 @@ def _build_level_window_reveal_mesh(
     level: LevelData,
     base_z_meters: float,
     blueprint_size_pixels: tuple[float, float] | None,
+    wall_orientation: WallOrientationResolver | None = None,
 ) -> trimesh.Trimesh | None:
     """Build untextured jamb, sill, and head faces for window tunnels."""
 
-    reveals = _build_level_window_reveals(level)
+    reveals = _build_level_window_reveals(level, wall_orientation)
     if not reveals:
         return None
     vertices: list[list[float]] = []
@@ -5746,10 +5834,13 @@ def _get_doorway_reveal_pair(
     return best_pair
 
 
-def _build_level_window_reveals(level: LevelData) -> list[WindowReveal]:
+def _build_level_window_reveals(
+    level: LevelData,
+    wall_orientation: WallOrientationResolver | None = None,
+) -> list[WindowReveal]:
     """Pair each selected wall with its nearest cut outward wall."""
 
-    openings = _build_window_openings(level)
+    openings = _build_window_openings(level, wall_orientation)
     if not openings:
         return []
     wall_sources = _build_level_wall_sources(
@@ -6341,16 +6432,64 @@ def _get_2d_point_distance(
     )
 
 
+# ### Wall orientation helpers ###
+def _build_plain_wall_surface_id(level: LevelData, edge: Edge) -> str:
+    wall_key = (
+        f"{min(edge.start_vertex_id, edge.end_vertex_id)}:"
+        f"{max(edge.start_vertex_id, edge.end_vertex_id)}"
+    )
+    return f"level:{level.index}/wall:{wall_key}"
+
+
+def _build_room_wall_surface_id(
+    level: LevelData,
+    room: RoomData,
+    wall: RoomWall,
+) -> str:
+    return (
+        f"level:{level.index}/room:{room.center_vertex_id}/"
+        f"wall:{wall.key}"
+    )
+
+
+def _wall_faces_require_winding_flip(
+    *,
+    start_point: tuple[float, float],
+    end_point: tuple[float, float],
+    blueprint_size_pixels: tuple[float, float] | None,
+    preferred_facing_normal_xy: tuple[float, float] | None,
+    manual_orientation_flip: bool,
+) -> bool:
+    """Resolve automatic winding, then apply the persisted manual XOR."""
+
+    automatic_flip = False
+    if preferred_facing_normal_xy is not None:
+        start_xy = _point_to_world_xy(start_point, blueprint_size_pixels)
+        end_xy = _point_to_world_xy(end_point, blueprint_size_pixels)
+        wall_delta = end_xy - start_xy
+        current_normal = np.asarray(
+            (wall_delta[1], -wall_delta[0]),
+            dtype=float,
+        )
+        preferred_normal = np.asarray(preferred_facing_normal_xy, dtype=float)
+        automatic_flip = float(np.dot(current_normal, preferred_normal)) < 0.0
+    return automatic_flip != bool(manual_orientation_flip)
+
+
+# ### Wall face helpers ###
 def _build_wall_faces(
     vertex_offset: int,
     vertex_count: int = 4,
     *,
     double_sided: bool = True,
+    reverse_winding: bool = False,
 ) -> list[list[int]]:
     faces = [
         [vertex_offset, vertex_offset + point_index, vertex_offset + point_index + 1]
         for point_index in range(1, vertex_count - 1)
     ]
+    if reverse_winding:
+        faces = [list(reversed(face)) for face in faces]
     if double_sided:
         faces.extend(list(reversed(face)) for face in tuple(faces))
     return faces
@@ -6761,6 +6900,9 @@ def _build_wall_mesh(
     base_z_meters: float,
     blueprint_size_pixels: tuple[float, float] | None,
     doorway_openings: Sequence[WallOpening] = (),
+    preferred_facing_normal_xy: tuple[float, float] | None = None,
+    manual_orientation_flip: bool = False,
+    double_sided: bool = True,
 ) -> trimesh.Trimesh | None:
     start_vertex = vertex_lookup.get(edge.start_vertex_id)
     end_vertex = vertex_lookup.get(edge.end_vertex_id)
@@ -6783,6 +6925,13 @@ def _build_wall_mesh(
     if not wall_pieces:
         return None
 
+    reverse_winding = _wall_faces_require_winding_flip(
+        start_point=start_point,
+        end_point=end_point,
+        blueprint_size_pixels=blueprint_size_pixels,
+        preferred_facing_normal_xy=preferred_facing_normal_xy,
+        manual_orientation_flip=manual_orientation_flip,
+    )
     vertices: list[list[float]] = []
     faces: list[list[int]] = []
     for wall_piece in wall_pieces:
@@ -6798,7 +6947,14 @@ def _build_wall_mesh(
 
         vertex_offset = len(vertices)
         vertices.extend(wall_vertices)
-        faces.extend(_build_wall_faces(vertex_offset, len(wall_vertices)))
+        faces.extend(
+            _build_wall_faces(
+                vertex_offset,
+                len(wall_vertices),
+                double_sided=double_sided,
+                reverse_winding=reverse_winding,
+            )
+        )
 
     if not vertices or not faces:
         return None

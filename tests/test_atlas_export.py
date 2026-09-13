@@ -25,7 +25,11 @@ from housemaker.glass_material import (
     HOUSEMAKER_GLASS_MATERIAL_NAME,
     build_housemaker_glass_material,
 )
-from housemaker.glb import GeneratedModel, convert_to_glb
+from housemaker.glb import (
+    GLTF_Y_UP_TO_Z_UP_TRANSFORM,
+    GeneratedModel,
+    convert_to_glb,
+)
 from housemaker.models import LevelData, RoomData, VertexData
 from housemaker.pbr_maps import (
     ATLAS_MAP_BASE_COLOR,
@@ -348,6 +352,73 @@ def _architectural_surface_model() -> tuple[GeneratedModel, tuple[str, ...]]:
     )
 
 
+def _nested_plain_wall_model() -> tuple[
+    GeneratedModel,
+    dict[str, tuple[tuple[float, float, float], int, float]],
+]:
+    """Build textured inner walls whose source edges have mixed directions."""
+
+    vertex_data = VertexData()
+    boundary_loops = (
+        ((0.0, 0.0), (500.0, 0.0), (500.0, 500.0), (0.0, 500.0)),
+        ((50.0, 50.0), (450.0, 50.0), (450.0, 450.0), (50.0, 450.0)),
+    )
+    for loop_index, points in enumerate(boundary_loops):
+        vertex_ids = tuple(vertex_data.add_vertex(*point).id for point in points)
+        for edge_index, (start_id, end_id) in enumerate(
+            zip(vertex_ids, (*vertex_ids[1:], vertex_ids[0]), strict=True)
+        ):
+            if loop_index == 1 and edge_index % 2 == 1:
+                start_id, end_id = end_id, start_id
+            vertex_data.add_edge(start_id, end_id)
+    level = LevelData(index=2, name="Ground", vertex_data=vertex_data)
+    expected = {
+        "level:2/wall:5:6": ((0.0, -1.0, 0.0), 1, -1.0),
+        "level:2/wall:6:7": ((-1.0, 0.0, 0.0), 0, 9.0),
+        "level:2/wall:7:8": ((0.0, 1.0, 0.0), 1, -9.0),
+        "level:2/wall:5:8": ((1.0, 0.0, 0.0), 0, 1.0),
+    }
+    texture_png = _solid_texture_png((70, 100, 130, 255))
+    return (
+        convert_to_glb(
+            [level],
+            surface_materials={surface_id: texture_png for surface_id in expected},
+            export_untextured_surfaces=False,
+        ),
+        expected,
+    )
+
+
+def _solid_texture_png(color: tuple[int, int, int, int]) -> bytes:
+    output = BytesIO()
+    Image.new("RGBA", (8, 8), color).save(output, format="PNG")
+    return output.getvalue()
+
+
+def _load_glb_z_up_meshes(payload: bytes) -> tuple[trimesh.Trimesh, ...]:
+    """Load every serialized glTF node into HouseMaker world coordinates."""
+
+    scene = trimesh.load(
+        BytesIO(payload),
+        file_type="glb",
+        force="scene",
+        process=False,
+    )
+    if not isinstance(scene, trimesh.Scene):
+        raise TypeError("The exported GLB did not reload as a scene.")
+    meshes: list[trimesh.Trimesh] = []
+    for node_name in scene.graph.nodes_geometry:
+        transform, geometry_name = scene.graph.get(node_name)
+        geometry = scene.geometry.get(geometry_name)
+        if not isinstance(geometry, trimesh.Trimesh):
+            continue
+        mesh = geometry.copy()
+        mesh.apply_transform(transform)
+        mesh.apply_transform(GLTF_Y_UP_TO_Z_UP_TRANSFORM)
+        meshes.append(mesh)
+    return tuple(meshes)
+
+
 # ### Export tests ###
 class TextureAtlasExportTests(unittest.TestCase):
     def test_atlas_maps_share_an_explicit_trilinear_clamped_sampler(
@@ -643,6 +714,87 @@ class TextureAtlasExportTests(unittest.TestCase):
             1,
         )
 
+    def test_nested_plain_wall_winding_survives_direct_and_atlas_export(
+        self,
+    ) -> None:
+        model, expected = _nested_plain_wall_model()
+        direct_meshes = _load_glb_z_up_meshes(model.glb_bytes)
+        for surface_id, (expected_normal, _axis, _coordinate) in expected.items():
+            matches = [
+                mesh
+                for mesh in direct_meshes
+                if getattr(mesh.visual.material, "name", None)
+                == f"Surface {surface_id}"
+            ]
+            self.assertEqual(len(matches), 1)
+            np.testing.assert_allclose(
+                matches[0].face_normals,
+                np.tile(expected_normal, (len(matches[0].faces), 1)),
+                atol=1e-7,
+            )
+
+        resolution = 2048
+        source_id = "surface-texture:nested-walls"
+        atlas = TextureAtlasRecord(
+            atlas_id="nested-walls",
+            name="Nested walls",
+            resolution=resolution,
+            placements=[
+                TextureAtlasPlacement(
+                    object_id=source_id,
+                    texture_path="nested-walls.png",
+                    texture_resolution=512,
+                    x=0,
+                    y=0,
+                    size=512,
+                )
+            ],
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            result = apply_texture_atlases_to_export(
+                model,
+                (
+                    MaterializedTextureAtlas(
+                        atlas,
+                        _write_atlas_maps(
+                            Path(temporary_directory),
+                            resolution,
+                        ),
+                        active_map_types=frozenset({ATLAS_MAP_BASE_COLOR}),
+                    ),
+                ),
+                surface_source_ids={surface_id: source_id for surface_id in expected},
+            )
+
+        document = _read_glb_json(result.glb_bytes)
+        atlas_material = next(
+            material
+            for material in document["materials"]
+            if material["name"] == atlas.name
+        )
+        self.assertIs(atlas_material.get("doubleSided"), True)
+
+        atlas_meshes = [
+            mesh
+            for mesh in _load_glb_z_up_meshes(result.glb_bytes)
+            if getattr(mesh.visual.material, "name", None) == atlas.name
+        ]
+        self.assertEqual(len(atlas_meshes), 1)
+        atlas_mesh = atlas_meshes[0]
+        triangles = np.asarray(atlas_mesh.triangles, dtype=float)
+        normals = np.asarray(atlas_mesh.face_normals, dtype=float)
+        for expected_normal, axis, coordinate in expected.values():
+            wall_faces = np.all(
+                np.isclose(triangles[:, :, axis], coordinate, atol=1e-7),
+                axis=1,
+            )
+            self.assertTrue(np.any(wall_faces))
+            np.testing.assert_allclose(
+                normals[wall_faces],
+                np.tile(expected_normal, (int(np.count_nonzero(wall_faces)), 1)),
+                atol=1e-7,
+            )
+
     def test_opaque_objects_and_surfaces_share_one_batched_atlas_material(
         self,
     ) -> None:
@@ -783,6 +935,7 @@ class TextureAtlasExportTests(unittest.TestCase):
             if material["name"] == atlas.name
         )
         atlas_material = document["materials"][atlas_material_index]
+        self.assertIs(atlas_material.get("doubleSided"), True)
         self.assertIn("normalTexture", atlas_material)
         self.assertIn(
             "baseColorTexture",

@@ -188,6 +188,10 @@ from housemaker.surface_geometry import (
     build_fixed_surfaces,
 )
 from housemaker.surface_materials import LEGACY_SURFACE_ROUGHNESS_FACTOR
+from housemaker.surface_orientation_edits import (
+    flip_surface_orientation,
+    remap_flipped_surface_ids_with_lineage,
+)
 from housemaker.surface_texture_state import (
     SurfaceTextureAssignment,
     SurfaceTextureData,
@@ -642,6 +646,7 @@ class _CanvasTopologyUndoState:
         tuple[int, tuple[EditableSurfaceMeshData, ...]],
         ...,
     ]
+    flipped_surface_ids_by_level: tuple[tuple[int, tuple[str, ...]], ...]
     assignments: tuple[SurfaceTextureAssignment, ...]
     assignment_targets_after: tuple[SurfaceTextureAssignment, ...]
     atlas_placements: tuple[tuple[str, TextureAtlasPlacement], ...]
@@ -1288,6 +1293,9 @@ class BlueprintWorkspace(QWidget):
         self.texture_atlas_workspace.active_preview_map_changed.connect(
             self._handle_atlas_preview_map_changed
         )
+        self.texture_atlas_workspace.face_orientation_mode_changed.connect(
+            self.viewer.set_canvas_face_orientation_visible
+        )
         self.texture_atlas_workspace.data_changed.connect(
             self._handle_texture_atlas_data_changed_for_ao_preview
         )
@@ -1416,6 +1424,9 @@ class BlueprintWorkspace(QWidget):
         )
         self.viewer.canvas_surface_selection_changed.connect(
             self._handle_canvas_surface_selection_changed
+        )
+        self.viewer.canvas_surface_orientation_flip_requested.connect(
+            self._handle_canvas_surface_orientation_flip_requested
         )
         self.viewer.canvas_surface_vertex_insertion_requested.connect(
             self._handle_canvas_surface_vertex_insertion_requested
@@ -2663,6 +2674,20 @@ class BlueprintWorkspace(QWidget):
             if wall_group_changed or active_owner_changed:
                 self._commit_pending_canvas_surface_mesh_update()
 
+    def _handle_canvas_surface_orientation_flip_requested(
+        self,
+        surface_id: str,
+    ) -> None:
+        """Persist one clicked surface winding change through normal history."""
+
+        self._apply_canvas_surface_topology_edit(
+            lambda: flip_surface_orientation(self.levels, surface_id),
+            success_message=(
+                "Surface orientation flipped. Click it again to restore the "
+                "automatic orientation."
+            ),
+        )
+
     def _sync_selected_canvas_wall_highlight(
         self,
         surface_id: str | None,
@@ -2850,6 +2875,10 @@ class BlueprintWorkspace(QWidget):
         return _CanvasTopologyUndoState(
             editable_surfaces_by_level=tuple(
                 (level.index, tuple(level.editable_surfaces)) for level in self.levels
+            ),
+            flipped_surface_ids_by_level=tuple(
+                (level.index, tuple(sorted(level.flipped_surface_ids)))
+                for level in self.levels
             ),
             assignments=assignments,
             assignment_targets_after=(),
@@ -3298,7 +3327,7 @@ class BlueprintWorkspace(QWidget):
         self,
         state: _CanvasTopologyUndoState,
     ) -> int:
-        """Restore one Add vertices transaction and its texture bindings."""
+        """Restore one Canvas topology transaction and its texture bindings."""
 
         levels_by_index = {level.index: level for level in self.levels}
         restoration_targets: list[
@@ -3307,10 +3336,19 @@ class BlueprintWorkspace(QWidget):
         for level_index, editable_surfaces in state.editable_surfaces_by_level:
             level = levels_by_index.get(level_index)
             if level is None:
-                raise ValueError("The Canvas level in this undo step no longer exists.")
+                raise ValueError(
+                    "The Canvas level in this undo step no longer exists."
+                )
             restoration_targets.append((level, editable_surfaces))
         for level, editable_surfaces in restoration_targets:
             level.editable_surfaces = list(editable_surfaces)
+        for level_index, flipped_surface_ids in state.flipped_surface_ids_by_level:
+            level = levels_by_index.get(level_index)
+            if level is None:
+                raise ValueError(
+                    "The Canvas level in this undo step no longer exists."
+                )
+            level.flipped_surface_ids = set(flipped_surface_ids)
         self._desired_canvas_surface_ids = state.selected_surface_ids
         self._atlas_surface_assignment_target_ids = state.assignment_target_ids
         self._desired_canvas_object_id = state.selected_object_id
@@ -3579,6 +3617,9 @@ class BlueprintWorkspace(QWidget):
         previous_edits = [
             (level, copy.deepcopy(level.editable_surfaces)) for level in self.levels
         ]
+        previous_flipped_surface_ids = [
+            (level, set(level.flipped_surface_ids)) for level in self.levels
+        ]
         previous_surface_ids = self._desired_canvas_surface_ids
         previous_assignment_target_ids = self._atlas_surface_assignment_target_ids
         previous_object_id = self._desired_canvas_object_id
@@ -3592,6 +3633,10 @@ class BlueprintWorkspace(QWidget):
         try:
             result = operation()
             replacements = result.replacements
+            remap_flipped_surface_ids_with_lineage(
+                self.levels,
+                replacements,
+            )
             selected_surface_ids = result.selected_surface_ids
             self._desired_canvas_surface_ids = selected_surface_ids
             self._atlas_surface_assignment_target_ids = selected_surface_ids
@@ -3607,6 +3652,8 @@ class BlueprintWorkspace(QWidget):
         except (RuntimeError, TypeError, ValueError) as error:
             for level, editable_surfaces in previous_edits:
                 level.editable_surfaces = editable_surfaces
+            for level, flipped_surface_ids in previous_flipped_surface_ids:
+                level.flipped_surface_ids = flipped_surface_ids
             self._desired_canvas_surface_ids = previous_surface_ids
             self._atlas_surface_assignment_target_ids = previous_assignment_target_ids
             self._desired_canvas_object_id = previous_object_id

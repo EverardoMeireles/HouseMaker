@@ -945,6 +945,11 @@ def apply_editable_surfaces(
         if not editable_mesh.replaces_source_surface:
             surfaces.append(source_surface)
             continue
+        editable_mesh = _normalize_coplanar_editable_mesh_orientation(
+            level,
+            source_surface,
+            editable_mesh,
+        )
         frame = _build_surface_frame(
             level,
             source_surface,
@@ -1014,6 +1019,11 @@ def _build_insertion_context(
             source_surface,
             replaces_source_surface=not draft_mode,
         )
+        editable_mesh = _normalize_coplanar_editable_mesh_orientation(
+            level,
+            source_surface,
+            editable_mesh,
+        )
         frame = _build_surface_frame(
             level,
             source_surface,
@@ -1047,6 +1057,14 @@ def _build_insertion_context(
     source_surface = base_by_id.get(editable_mesh.source_surface_id)
     if source_surface is None:
         raise ValueError("The editable source surface no longer exists.")
+    editable_mesh = _normalize_coplanar_editable_mesh_orientation(
+        level,
+        source_surface,
+        editable_mesh,
+    )
+    target_face = next(
+        face for face in editable_mesh.faces if face.face_id == face_id
+    )
     frame = _build_surface_frame(
         level,
         source_surface,
@@ -2582,6 +2600,13 @@ def _find_extrusion_context(
     )
     if source_surface is None:
         raise ValueError("The editable source surface no longer exists.")
+    editable_mesh = _normalize_coplanar_editable_mesh_orientation(
+        level,
+        source_surface,
+        editable_mesh,
+    )
+    face_by_id = {face.face_id: face for face in editable_mesh.faces}
+    selected_faces = tuple(face_by_id[face_id] for face_id in face_ids)
     frame = _build_surface_frame(
         level,
         source_surface,
@@ -3727,18 +3752,97 @@ def _snap_point_in_polygon(
 
 
 # ### Surface frame conversion ###
+def _normalize_coplanar_editable_mesh_orientation(
+    level: LevelData,
+    source_surface: FixedSurface,
+    editable_mesh: EditableSurfaceMeshData,
+) -> EditableSurfaceMeshData:
+    """Migrate legacy coplanar wall faces to the source's current front side."""
+
+    if (
+        source_surface.surface_type != SURFACE_TYPE_WALL
+        or editable_mesh.frame_kind != EDITABLE_SURFACE_FRAME_WALL_RATIO
+    ):
+        return editable_mesh
+
+    current_normal_sign = _get_source_frame_normal_sign(
+        level,
+        source_surface,
+        editable_mesh.frame_kind,
+    )
+    has_extruded_vertices = any(
+        abs(vertex.normal_offset_meters) > SURFACE_EDIT_EPSILON_METERS
+        for vertex in editable_mesh.vertices
+    )
+    frame_normal_sign = (
+        editable_mesh.frame_normal_sign
+        if has_extruded_vertices
+        else current_normal_sign
+    )
+    current_frame = _build_surface_frame(
+        level,
+        source_surface,
+        editable_mesh.frame_kind,
+        frame_normal_sign,
+    )
+    world_vertices = _build_world_vertex_lookup(
+        level,
+        source_surface,
+        editable_mesh,
+        current_frame,
+    )
+    source_normal = _get_source_surface_normal(source_surface)
+    editable_vertex_by_id = {
+        vertex.vertex_id: vertex for vertex in editable_mesh.vertices
+    }
+    normalized_faces: list[EditableSurfaceFaceData] = []
+    for face in editable_mesh.faces:
+        if any(
+            abs(editable_vertex_by_id[vertex_id].normal_offset_meters)
+            > SURFACE_EDIT_EPSILON_METERS
+            for vertex_id in face.vertex_ids
+        ):
+            normalized_faces.append(face)
+            continue
+        face_points = np.asarray(
+            [world_vertices[vertex_id] for vertex_id in face.vertex_ids],
+            dtype=float,
+        )
+        if float(np.dot(_get_polygon_normal(face_points), source_normal)) < 0.0:
+            face = replace(face, vertex_ids=tuple(reversed(face.vertex_ids)))
+        normalized_faces.append(face)
+    normalized_face_tuple = tuple(normalized_faces)
+    if (
+        frame_normal_sign == editable_mesh.frame_normal_sign
+        and normalized_face_tuple == editable_mesh.faces
+    ):
+        return editable_mesh
+    return replace(
+        editable_mesh,
+        frame_normal_sign=frame_normal_sign,
+        faces=normalized_face_tuple,
+    )
+
+
 def _get_source_frame_normal_sign(
     level: LevelData,
     source_surface: FixedSurface,
     frame_kind: str,
 ) -> int:
     provisional = _build_surface_frame(level, source_surface, frame_kind, 1)
+    weighted = _get_source_surface_normal(source_surface)
+    return 1 if float(np.dot(weighted, provisional.normal_world)) >= 0.0 else -1
+
+
+def _get_source_surface_normal(source_surface: FixedSurface) -> np.ndarray:
+    """Return the current area-weighted normal of one semantic source."""
+
     normals = np.asarray(source_surface.mesh.face_normals, dtype=float)
     areas = np.asarray(source_surface.mesh.area_faces, dtype=float)
     weighted = np.sum(normals * areas[:, np.newaxis], axis=0)
     if float(np.linalg.norm(weighted)) <= SURFACE_EDIT_EPSILON_METERS:
         weighted = normals[0]
-    return 1 if float(np.dot(weighted, provisional.normal_world)) >= 0.0 else -1
+    return weighted / np.linalg.norm(weighted)
 
 
 def _build_surface_frame(
