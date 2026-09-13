@@ -1,6 +1,7 @@
 # ### Environment setup ###
 from __future__ import annotations
 
+import math
 import os
 import unittest
 from unittest.mock import patch
@@ -14,7 +15,7 @@ import trimesh
 from OpenGL import GL
 from pyqtgraph import opengl as gl
 from PySide6.QtCore import QPointF, Qt
-from PySide6.QtGui import QKeyEvent
+from PySide6.QtGui import QKeyEvent, QVector3D
 from PySide6.QtWidgets import QApplication
 
 from housemaker.architectural_surface_edits import (
@@ -39,13 +40,16 @@ from housemaker.surface_geometry import (
 from housemaker.viewer import (
     CANVAS_EXTRUDABLE_FACE_OUTLINE_COLOR,
     CANVAS_OPENING_OVERLAY_DEPTH_VALUE,
+    CANVAS_SURFACE_CTRL_SNAP_SENSITIVITY_MULTIPLIER,
     CANVAS_SURFACE_DRAWING_EDGE_COLOR,
     CANVAS_SURFACE_DRAWING_VERTEX_COLOR,
     CANVAS_SURFACE_SELECTION_COLOR,
     CANVAS_SURFACE_SELECTION_VERTEX_COLOR,
     CANVAS_SURFACE_SELECTION_VERTEX_SIZE_PIXELS,
     GlbViewerWidget,
+    _CanvasSurfaceDrawingEdge,
     _DepthTestedOverlayScatterItem,
+    _calculate_canvas_surface_ctrl_snap_sensitivity_multiplier,
     _get_nearest_fixed_surface_ray_hit,
     _resolve_canvas_surface_vertex_preview,
     _snap_surface_point_from_active_vertex,
@@ -300,6 +304,27 @@ class CanvasSurfaceTopologyViewerTests(unittest.TestCase):
         viewer.set_model(_build_model())
         self.widgets.append(viewer)
         return viewer
+
+    def test_ctrl_snap_distance_curve_is_bounded_and_preserves_reference(
+        self,
+    ) -> None:
+        expected_multipliers = (
+            (0.0, 3.0),
+            (0.2, 3.0),
+            (0.5, 5.0),
+            (3.0, 30.0),
+            (12.0, 120.0),
+            (100.0, 120.0),
+        )
+
+        for camera_distance, expected in expected_multipliers:
+            with self.subTest(camera_distance=camera_distance):
+                self.assertAlmostEqual(
+                    _calculate_canvas_surface_ctrl_snap_sensitivity_multiplier(
+                        camera_distance
+                    ),
+                    expected,
+                )
 
     def test_child_faces_are_not_window_or_structural_targets(
         self,
@@ -788,14 +813,15 @@ class CanvasSurfaceTopologyViewerTests(unittest.TestCase):
         preview = viewer._surface_vertex_hover_preview
         self.assertIsNotNone(preview)
         assert preview is not None
+        self.assertEqual(preview.snap_kind, "angle")
         self.assertEqual(preview.snapped_vertex_id, second_id)
         np.testing.assert_allclose(preview.world_point, (2.0, 0.0, 1.0))
         self.assertIsNotNone(viewer._surface_vertex_preview_item)
         self.assertIsNotNone(viewer._surface_vertex_preview_edge_item)
         assert viewer._surface_vertex_preview_edge_item is not None
-        np.testing.assert_allclose(
-            viewer._surface_vertex_preview_edge_item.pos,
-            np.asarray(((0.5, 0.0, 1.0), (2.0, 0.0, 1.0))),
+        self.assertGreater(
+            len(viewer._surface_vertex_preview_edge_item.pos),
+            2,
         )
         self.assertFalse(viewer.view.is_primary_pointer_drag_reserved)
 
@@ -823,7 +849,7 @@ class CanvasSurfaceTopologyViewerTests(unittest.TestCase):
             patch.object(
                 viewer.view,
                 "build_camera_ray",
-                return_value=_ray_at(1.505, 2.0),
+                return_value=_ray_at(1.521, 2.0),
             ),
             patch.object(viewer.view, "pixelSize", return_value=0.01),
         ):
@@ -857,7 +883,634 @@ class CanvasSurfaceTopologyViewerTests(unittest.TestCase):
             )
         )
 
-    def test_add_vertex_does_not_snap_to_a_vertex_over_one_centimeter_away(
+    def test_active_angle_outranks_a_nearby_off_angle_vertex(self) -> None:
+        wall = _build_wall()
+        active_id = "1" * 32
+        off_angle_id = "2" * 32
+        active_point = (0.5, 0.0, 0.5)
+        requested = (0.7, 0.0, 0.7)
+
+        preview = _resolve_canvas_surface_vertex_preview(
+            wall,
+            requested,
+            (wall,),
+            (
+                SurfaceDrawingVertexTarget(
+                    vertex_id=active_id,
+                    source_surface_id=wall.surface_id,
+                    world_point=active_point,
+                ),
+                SurfaceDrawingVertexTarget(
+                    vertex_id=off_angle_id,
+                    source_surface_id=wall.surface_id,
+                    world_point=(0.7, 0.0, 0.712),
+                ),
+            ),
+            (),
+            active_id,
+        )
+
+        self.assertEqual(preview.snap_kind, "angle")
+        self.assertIsNone(preview.snapped_vertex_id)
+        np.testing.assert_allclose(preview.world_point, requested)
+
+    def test_active_angle_keeps_an_exact_compatible_vertex_identity(self) -> None:
+        wall = _build_wall()
+        active_id = "1" * 32
+        compatible_id = "2" * 32
+
+        preview = _resolve_canvas_surface_vertex_preview(
+            wall,
+            (1.51, 0.0, 1.5),
+            (wall,),
+            (
+                SurfaceDrawingVertexTarget(
+                    vertex_id=active_id,
+                    source_surface_id=wall.surface_id,
+                    world_point=(0.5, 0.0, 0.5),
+                ),
+                SurfaceDrawingVertexTarget(
+                    vertex_id=compatible_id,
+                    source_surface_id=wall.surface_id,
+                    world_point=(1.5, 0.0, 1.5),
+                ),
+            ),
+            (),
+            active_id,
+        )
+
+        self.assertEqual(preview.snap_kind, "angle")
+        self.assertEqual(preview.snapped_vertex_id, compatible_id)
+        np.testing.assert_allclose(preview.world_point, (1.5, 0.0, 1.5))
+
+    def test_active_angle_can_snap_to_a_compatible_edge_intersection(
+        self,
+    ) -> None:
+        wall = _build_wall()
+        active_id = "1" * 32
+        first_edge_id = "2" * 32
+        second_edge_id = "3" * 32
+
+        preview = _resolve_canvas_surface_vertex_preview(
+            wall,
+            (1.507, 0.0, 1.5),
+            (wall,),
+            (
+                SurfaceDrawingVertexTarget(
+                    vertex_id=active_id,
+                    source_surface_id=wall.surface_id,
+                    world_point=(0.5, 0.0, 0.5),
+                ),
+                SurfaceDrawingVertexTarget(
+                    vertex_id=first_edge_id,
+                    source_surface_id=wall.surface_id,
+                    world_point=(1.0, 0.0, 1.5),
+                ),
+                SurfaceDrawingVertexTarget(
+                    vertex_id=second_edge_id,
+                    source_surface_id=wall.surface_id,
+                    world_point=(2.0, 0.0, 1.5),
+                ),
+            ),
+            (
+                _CanvasSurfaceDrawingEdge(
+                    source_surface_id=wall.surface_id,
+                    start_vertex_id=first_edge_id,
+                    end_vertex_id=second_edge_id,
+                    start_world_point=(1.0, 0.0, 1.5),
+                    end_world_point=(2.0, 0.0, 1.5),
+                ),
+            ),
+            active_id,
+        )
+
+        self.assertEqual(preview.snap_kind, "angle")
+        self.assertEqual(
+            preview.snapped_edge_vertex_ids,
+            (first_edge_id, second_edge_id),
+        )
+        np.testing.assert_allclose(preview.world_point, (1.5, 0.0, 1.5))
+
+    def test_active_angle_uses_the_nearest_compatible_feature(self) -> None:
+        wall = _build_wall()
+        active_id = "1" * 32
+        compatible_vertex_id = "2" * 32
+        first_edge_id = "3" * 32
+        second_edge_id = "4" * 32
+        active_vertex = SurfaceDrawingVertexTarget(
+            vertex_id=active_id,
+            source_surface_id=wall.surface_id,
+            world_point=(0.5, 0.0, 0.5),
+        )
+
+        cases = (
+            (
+                "edge",
+                (1.55, 0.0, 1.55),
+                1.505,
+                (1.505, 0.0, 1.505),
+            ),
+            (
+                "vertex",
+                (1.505, 0.0, 1.505),
+                1.55,
+                (1.505, 0.0, 1.505),
+            ),
+        )
+        for expected_kind, vertex_point, edge_height, expected_point in cases:
+            with self.subTest(expected_kind=expected_kind):
+                preview = _resolve_canvas_surface_vertex_preview(
+                    wall,
+                    (1.515, 0.0, 1.5),
+                    (wall,),
+                    (
+                        active_vertex,
+                        SurfaceDrawingVertexTarget(
+                            vertex_id=compatible_vertex_id,
+                            source_surface_id=wall.surface_id,
+                            world_point=vertex_point,
+                        ),
+                        SurfaceDrawingVertexTarget(
+                            vertex_id=first_edge_id,
+                            source_surface_id=wall.surface_id,
+                            world_point=(1.0, 0.0, edge_height),
+                        ),
+                        SurfaceDrawingVertexTarget(
+                            vertex_id=second_edge_id,
+                            source_surface_id=wall.surface_id,
+                            world_point=(2.0, 0.0, edge_height),
+                        ),
+                    ),
+                    (
+                        _CanvasSurfaceDrawingEdge(
+                            source_surface_id=wall.surface_id,
+                            start_vertex_id=first_edge_id,
+                            end_vertex_id=second_edge_id,
+                            start_world_point=(1.0, 0.0, edge_height),
+                            end_world_point=(2.0, 0.0, edge_height),
+                        ),
+                    ),
+                    active_id,
+                    snap_sensitivity_multiplier=(
+                        CANVAS_SURFACE_CTRL_SNAP_SENSITIVITY_MULTIPLIER
+                    ),
+                )
+
+                self.assertEqual(preview.snap_kind, "angle")
+                np.testing.assert_allclose(preview.world_point, expected_point)
+                if expected_kind == "vertex":
+                    self.assertEqual(
+                        preview.snapped_vertex_id,
+                        compatible_vertex_id,
+                    )
+                else:
+                    self.assertEqual(
+                        preview.snapped_edge_vertex_ids,
+                        (first_edge_id, second_edge_id),
+                    )
+
+    def test_vertex_has_priority_over_edge_without_an_active_angle(self) -> None:
+        wall = _build_wall()
+        first_edge_id = "1" * 32
+        second_edge_id = "2" * 32
+
+        preview = _resolve_canvas_surface_vertex_preview(
+            wall,
+            (1.012, 0.0, 1.006),
+            (wall,),
+            (
+                SurfaceDrawingVertexTarget(
+                    vertex_id=first_edge_id,
+                    source_surface_id=wall.surface_id,
+                    world_point=(1.0, 0.0, 1.0),
+                ),
+                SurfaceDrawingVertexTarget(
+                    vertex_id=second_edge_id,
+                    source_surface_id=wall.surface_id,
+                    world_point=(3.0, 0.0, 1.0),
+                ),
+            ),
+            (
+                _CanvasSurfaceDrawingEdge(
+                    source_surface_id=wall.surface_id,
+                    start_vertex_id=first_edge_id,
+                    end_vertex_id=second_edge_id,
+                    start_world_point=(1.0, 0.0, 1.0),
+                    end_world_point=(3.0, 0.0, 1.0),
+                ),
+            ),
+            None,
+        )
+
+        self.assertEqual(preview.snap_kind, "vertex")
+        self.assertEqual(preview.snapped_vertex_id, first_edge_id)
+        np.testing.assert_allclose(preview.world_point, (1.0, 0.0, 1.0))
+
+    def test_angle_edge_preview_and_click_commit_the_same_intersection(
+        self,
+    ) -> None:
+        wall = _build_wall()
+        viewer = self._build_viewer((wall,))
+        active_id = "1" * 32
+        first_edge_id = "2" * 32
+        second_edge_id = "3" * 32
+        viewer.set_canvas_surface_drawing_overlay(
+            SurfaceDrawingOverlay(
+                vertices=(
+                    SurfaceDrawingVertexTarget(
+                        vertex_id=active_id,
+                        source_surface_id=wall.surface_id,
+                        world_point=(0.5, 0.0, 0.5),
+                    ),
+                    SurfaceDrawingVertexTarget(
+                        vertex_id=first_edge_id,
+                        source_surface_id=wall.surface_id,
+                        world_point=(1.0, 0.0, 1.5),
+                    ),
+                    SurfaceDrawingVertexTarget(
+                        vertex_id=second_edge_id,
+                        source_surface_id=wall.surface_id,
+                        world_point=(2.0, 0.0, 1.5),
+                    ),
+                ),
+                edges=(
+                    SurfaceDrawingEdgeTarget(
+                        source_surface_id=wall.surface_id,
+                        vertex_ids=(first_edge_id, second_edge_id),
+                        world_points=((1.0, 0.0, 1.5), (2.0, 0.0, 1.5)),
+                    ),
+                ),
+            ),
+            active_vertex_id=active_id,
+        )
+        emitted: list[object] = []
+        viewer.canvas_surface_vertex_insertion_requested.connect(emitted.append)
+        self.assertTrue(viewer.begin_surface_vertex_placement())
+
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_ray_at(1.507, 1.5),
+        ):
+            viewer._handle_surface_vertex_pointer_hovered(QPointF())
+            preview = viewer._surface_vertex_hover_preview
+            self.assertIsNotNone(preview)
+            assert preview is not None
+            self.assertEqual(preview.snap_kind, "angle")
+            self.assertEqual(
+                preview.snapped_edge_vertex_ids,
+                (first_edge_id, second_edge_id),
+            )
+            np.testing.assert_allclose(
+                preview.world_point,
+                (1.5, 0.0, 1.5),
+            )
+            self.assertTrue(
+                viewer._begin_surface_vertex_pointer_interaction(QPointF())
+            )
+
+        self.assertEqual(len(emitted), 1)
+        request = emitted[0]
+        self.assertIsInstance(request, SurfaceVertexInsertionRequest)
+        assert isinstance(request, SurfaceVertexInsertionRequest)
+        self.assertEqual(request.active_vertex_id, active_id)
+        np.testing.assert_allclose(request.world_point, preview.world_point)
+        self.assertTrue(
+            viewer._finish_surface_vertex_pointer_interaction(QPointF())
+        )
+
+    def test_ctrl_rejects_large_general_angle_error_without_an_active_vertex(
+        self,
+    ) -> None:
+        wall = _build_wall()
+        requested = (3.0, 0.0, 1.45)
+
+        ordinary = _resolve_canvas_surface_vertex_preview(
+            wall,
+            requested,
+            (wall,),
+            (),
+            (),
+            None,
+        )
+        expanded = _resolve_canvas_surface_vertex_preview(
+            wall,
+            requested,
+            (wall,),
+            (),
+            (),
+            None,
+            snap_sensitivity_multiplier=(
+                CANVAS_SURFACE_CTRL_SNAP_SENSITIVITY_MULTIPLIER
+            ),
+        )
+
+        self.assertEqual(ordinary.snap_kind, "surface")
+        self.assertEqual(expanded.snap_kind, "surface")
+        np.testing.assert_allclose(
+            expanded.world_point,
+            requested,
+        )
+
+    def test_far_active_angle_snap_keeps_a_narrow_angular_window(self) -> None:
+        wall = _build_wall()
+        active_id = "1" * 32
+        active_point = (0.5, 0.0, 0.5)
+        active_vertex = SurfaceDrawingVertexTarget(
+            vertex_id=active_id,
+            source_surface_id=wall.surface_id,
+            world_point=active_point,
+        )
+
+        def point_at_angle(angle_degrees: float) -> tuple[float, float, float]:
+            distance = 1.8
+            radians = math.radians(angle_degrees)
+            return (
+                active_point[0] + distance * math.cos(radians),
+                0.0,
+                active_point[2] + distance * math.sin(radians),
+            )
+
+        for multiplier in (
+            1.0,
+            CANVAS_SURFACE_CTRL_SNAP_SENSITIVITY_MULTIPLIER,
+        ):
+            for angle_degrees in (45.0, 45.25):
+                with self.subTest(
+                    multiplier=multiplier,
+                    angle_degrees=angle_degrees,
+                ):
+                    near_point = point_at_angle(angle_degrees)
+                    near_preview = _resolve_canvas_surface_vertex_preview(
+                        wall,
+                        near_point,
+                        (wall,),
+                        (active_vertex,),
+                        (),
+                        active_id,
+                        snap_sensitivity_multiplier=multiplier,
+                    )
+
+                    self.assertEqual(near_preview.snap_kind, "angle")
+                    self.assertAlmostEqual(
+                        near_preview.world_point[0] - active_point[0],
+                        near_preview.world_point[2] - active_point[2],
+                    )
+
+            for angle_degrees in (42.0, 48.0):
+                with self.subTest(
+                    multiplier=multiplier,
+                    angle_degrees=angle_degrees,
+                ):
+                    off_angle_point = point_at_angle(angle_degrees)
+                    off_angle_preview = _resolve_canvas_surface_vertex_preview(
+                        wall,
+                        off_angle_point,
+                        (wall,),
+                        (active_vertex,),
+                        (),
+                        active_id,
+                        snap_sensitivity_multiplier=multiplier,
+                    )
+
+                    self.assertEqual(off_angle_preview.snap_kind, "surface")
+                    np.testing.assert_allclose(
+                        off_angle_preview.world_point,
+                        off_angle_point,
+                    )
+
+    def test_exact_active_45_degree_snap_is_not_limited_to_two_meters(
+        self,
+    ) -> None:
+        wall = _build_wall()
+        active_id = "1" * 32
+        active_point = (0.25, 0.0, 0.25)
+        distance = 2.5
+        component = distance / math.sqrt(2.0)
+        requested = (
+            active_point[0] + component,
+            0.0,
+            active_point[2] + component,
+        )
+
+        preview = _resolve_canvas_surface_vertex_preview(
+            wall,
+            requested,
+            (wall,),
+            (
+                SurfaceDrawingVertexTarget(
+                    vertex_id=active_id,
+                    source_surface_id=wall.surface_id,
+                    world_point=active_point,
+                ),
+            ),
+            (),
+            active_id,
+        )
+
+        self.assertGreater(
+            float(
+                np.linalg.norm(
+                    np.asarray(preview.world_point) - np.asarray(active_point)
+                )
+            ),
+            2.0,
+        )
+        self.assertEqual(preview.snap_kind, "angle")
+        np.testing.assert_allclose(preview.world_point, requested)
+
+    def test_ctrl_expands_angle_capture_without_widening_past_one_degree(
+        self,
+    ) -> None:
+        wall = _build_wall()
+        active_id = "1" * 32
+        active_point = (0.25, 0.0, 0.25)
+        distance = 2.5
+        radians = math.radians(45.75)
+        requested = (
+            active_point[0] + distance * math.cos(radians),
+            0.0,
+            active_point[2] + distance * math.sin(radians),
+        )
+        active_vertex = SurfaceDrawingVertexTarget(
+            vertex_id=active_id,
+            source_surface_id=wall.surface_id,
+            world_point=active_point,
+        )
+
+        ordinary = _resolve_canvas_surface_vertex_preview(
+            wall,
+            requested,
+            (wall,),
+            (active_vertex,),
+            (),
+            active_id,
+        )
+        expanded = _resolve_canvas_surface_vertex_preview(
+            wall,
+            requested,
+            (wall,),
+            (active_vertex,),
+            (),
+            active_id,
+            snap_sensitivity_multiplier=(
+                CANVAS_SURFACE_CTRL_SNAP_SENSITIVITY_MULTIPLIER
+            ),
+        )
+
+        self.assertEqual(ordinary.snap_kind, "surface")
+        self.assertEqual(expanded.snap_kind, "angle")
+        self.assertAlmostEqual(
+            expanded.world_point[0] - active_point[0],
+            expanded.world_point[2] - active_point[2],
+        )
+
+    def test_held_ctrl_keeps_near_45_degree_guide_for_preview_and_click(
+        self,
+    ) -> None:
+        wall = _build_wall()
+        viewer = self._build_viewer((wall,))
+        active_id = "1" * 32
+        active_point = (0.5, 0.0, 1.0)
+        requested = (1.767226504020743, 0.0, 2.2783336761219137)
+        viewer.set_canvas_surface_drawing_overlay(
+            SurfaceDrawingOverlay(
+                vertices=(
+                    SurfaceDrawingVertexTarget(
+                        vertex_id=active_id,
+                        source_surface_id=wall.surface_id,
+                        world_point=active_point,
+                    ),
+                ),
+                edges=(),
+            ),
+            active_vertex_id=active_id,
+        )
+        emitted: list[object] = []
+        viewer.canvas_surface_vertex_insertion_requested.connect(emitted.append)
+        self.assertTrue(viewer.begin_surface_vertex_placement())
+        viewer.view.enter_first_person_mode()
+
+        with (
+            patch.object(
+                viewer.view,
+                "build_camera_ray",
+                return_value=_ray_at(requested[0], requested[2]),
+            ),
+            patch.object(viewer.view, "pixelSize", return_value=0.01),
+        ):
+            ordinary, _is_occluded = (
+                viewer._resolve_surface_vertex_pointer_preview(QPointF())
+            )
+            self.assertIsNotNone(ordinary)
+            assert ordinary is not None
+            self.assertEqual(ordinary.snap_kind, "angle")
+
+            viewer.view.keyPressEvent(
+                QKeyEvent(
+                    QKeyEvent.Type.KeyPress,
+                    Qt.Key.Key_Control,
+                    Qt.KeyboardModifier.ControlModifier,
+                )
+            )
+            viewer._handle_surface_vertex_pointer_hovered(QPointF())
+            snapped_preview = viewer._surface_vertex_hover_preview
+            self.assertIsNotNone(snapped_preview)
+            assert snapped_preview is not None
+            self.assertEqual(snapped_preview.snap_kind, "angle")
+            self.assertIsNotNone(viewer._surface_vertex_preview_edge_item)
+            assert viewer._surface_vertex_preview_edge_item is not None
+            self.assertGreater(
+                len(viewer._surface_vertex_preview_edge_item.pos),
+                2,
+            )
+
+            self.assertTrue(
+                viewer._begin_surface_vertex_pointer_interaction(QPointF())
+            )
+
+        self.assertEqual(len(emitted), 1)
+        request = emitted[0]
+        self.assertIsInstance(request, SurfaceVertexInsertionRequest)
+        assert isinstance(request, SurfaceVertexInsertionRequest)
+        np.testing.assert_allclose(
+            request.world_point,
+            snapped_preview.world_point,
+        )
+        self.assertTrue(
+            viewer._finish_surface_vertex_pointer_interaction(QPointF())
+        )
+        viewer.view.keyReleaseEvent(
+            QKeyEvent(
+                QKeyEvent.Type.KeyRelease,
+                Qt.Key.Key_Control,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+
+    def test_ctrl_far_off_angle_hover_does_not_show_a_dotted_guide(self) -> None:
+        wall = _build_wall()
+        viewer = self._build_viewer((wall,))
+        active_id = "1" * 32
+        active_point = (0.5, 0.0, 0.5)
+        viewer.set_canvas_surface_drawing_overlay(
+            SurfaceDrawingOverlay(
+                vertices=(
+                    SurfaceDrawingVertexTarget(
+                        vertex_id=active_id,
+                        source_surface_id=wall.surface_id,
+                        world_point=active_point,
+                    ),
+                ),
+                edges=(),
+            ),
+            active_vertex_id=active_id,
+        )
+        self.assertTrue(viewer.begin_surface_vertex_placement())
+        viewer.view.enter_first_person_mode()
+        viewer.view.keyPressEvent(
+            QKeyEvent(
+                QKeyEvent.Type.KeyPress,
+                Qt.Key.Key_Control,
+                Qt.KeyboardModifier.ControlModifier,
+            )
+        )
+
+        for angle_degrees in (42.0, 48.0):
+            radians = math.radians(angle_degrees)
+            requested = (
+                active_point[0] + 1.8 * math.cos(radians),
+                0.0,
+                active_point[2] + 1.8 * math.sin(radians),
+            )
+            with (
+                self.subTest(angle_degrees=angle_degrees),
+                patch.object(
+                    viewer.view,
+                    "build_camera_ray",
+                    return_value=_ray_at(requested[0], requested[2]),
+                ),
+                patch.object(viewer.view, "pixelSize", return_value=0.01),
+            ):
+                viewer._handle_surface_vertex_pointer_hovered(QPointF())
+                preview = viewer._surface_vertex_hover_preview
+                self.assertIsNotNone(preview)
+                assert preview is not None
+                self.assertEqual(preview.snap_kind, "surface")
+                edge_item = viewer._surface_vertex_preview_edge_item
+                self.assertIsNotNone(edge_item)
+                assert edge_item is not None
+                self.assertEqual(len(edge_item.pos), 2)
+
+        viewer.view.keyReleaseEvent(
+            QKeyEvent(
+                QKeyEvent.Type.KeyRelease,
+                Qt.Key.Key_Control,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+
+    def test_add_vertex_does_not_snap_to_a_vertex_over_fifteen_millimeters(
         self,
     ) -> None:
         wall = _build_wall()
@@ -865,7 +1518,7 @@ class CanvasSurfaceTopologyViewerTests(unittest.TestCase):
 
         preview = _resolve_canvas_surface_vertex_preview(
             wall,
-            (2.015, 0.0, 1.0),
+            (2.016, 0.0, 1.0),
             (wall,),
             (
                 SurfaceDrawingVertexTarget(
@@ -880,7 +1533,97 @@ class CanvasSurfaceTopologyViewerTests(unittest.TestCase):
 
         self.assertIsNone(preview.snapped_vertex_id)
         self.assertEqual(preview.snap_kind, "surface")
-        np.testing.assert_allclose(preview.world_point, (2.015, 0.0, 1.0))
+        np.testing.assert_allclose(preview.world_point, (2.016, 0.0, 1.0))
+
+    def test_vertex_capture_range_is_larger_than_edge_capture_range(self) -> None:
+        wall = _build_wall()
+        first_edge_id = "1" * 32
+        second_edge_id = "2" * 32
+        viewer = self._build_viewer((wall,))
+        viewer.set_canvas_surface_drawing_overlay(
+            SurfaceDrawingOverlay(
+                vertices=(
+                    SurfaceDrawingVertexTarget(
+                        vertex_id=first_edge_id,
+                        source_surface_id=wall.surface_id,
+                        world_point=(1.0, 0.0, 1.0),
+                    ),
+                    SurfaceDrawingVertexTarget(
+                        vertex_id=second_edge_id,
+                        source_surface_id=wall.surface_id,
+                        world_point=(3.0, 0.0, 1.0),
+                    ),
+                ),
+                edges=(
+                    SurfaceDrawingEdgeTarget(
+                        source_surface_id=wall.surface_id,
+                        vertex_ids=(first_edge_id, second_edge_id),
+                        world_points=((1.0, 0.0, 1.0), (3.0, 0.0, 1.0)),
+                    ),
+                ),
+            )
+        )
+        vertices = tuple(viewer._canvas_surface_drawing_vertices.values())
+        edges = viewer._canvas_surface_drawing_edges
+        vertex_preview = _resolve_canvas_surface_vertex_preview(
+            wall,
+            (1.0, 0.0, 1.012),
+            (wall,),
+            vertices,
+            edges,
+            None,
+        )
+        near_edge_preview = _resolve_canvas_surface_vertex_preview(
+            wall,
+            (2.0, 0.0, 1.009),
+            (wall,),
+            vertices,
+            edges,
+            None,
+        )
+        far_edge_preview = _resolve_canvas_surface_vertex_preview(
+            wall,
+            (2.0, 0.0, 1.012),
+            (wall,),
+            vertices,
+            edges,
+            None,
+        )
+        ctrl_vertex_preview = _resolve_canvas_surface_vertex_preview(
+            wall,
+            (1.0, 0.0, 1.36),
+            (wall,),
+            vertices,
+            edges,
+            None,
+            snap_sensitivity_multiplier=(
+                CANVAS_SURFACE_CTRL_SNAP_SENSITIVITY_MULTIPLIER
+            ),
+        )
+        ctrl_far_edge_preview = _resolve_canvas_surface_vertex_preview(
+            wall,
+            (2.0, 0.0, 1.36),
+            (wall,),
+            vertices,
+            edges,
+            None,
+            snap_sensitivity_multiplier=(
+                CANVAS_SURFACE_CTRL_SNAP_SENSITIVITY_MULTIPLIER
+            ),
+        )
+
+        self.assertEqual(vertex_preview.snap_kind, "vertex")
+        self.assertEqual(vertex_preview.snapped_vertex_id, first_edge_id)
+        self.assertEqual(near_edge_preview.snap_kind, "edge")
+        self.assertNotEqual(far_edge_preview.snap_kind, "edge")
+        self.assertIsNone(far_edge_preview.snapped_edge_vertex_ids)
+        self.assertEqual(ctrl_vertex_preview.snap_kind, "vertex")
+        self.assertEqual(
+            ctrl_vertex_preview.snapped_vertex_id,
+            first_edge_id,
+        )
+        self.assertNotEqual(ctrl_far_edge_preview.snap_kind, "edge")
+        self.assertIsNone(ctrl_far_edge_preview.snapped_edge_vertex_ids)
 
     def test_click_commits_once_with_active_vertex_and_owns_only_that_click(
         self,
@@ -1006,6 +1749,448 @@ class CanvasSurfaceTopologyViewerTests(unittest.TestCase):
         np.testing.assert_allclose(
             distant_preview.world_point,
             (2.0, 0.0, 1.015),
+        )
+
+    def test_held_ctrl_expands_vertex_snap_for_hover_and_click(self) -> None:
+        wall = _build_wall()
+        viewer = self._build_viewer((wall,))
+        vertex_id = "1" * 32
+        viewer.set_canvas_surface_drawing_overlay(
+            SurfaceDrawingOverlay(
+                vertices=(
+                    SurfaceDrawingVertexTarget(
+                        vertex_id=vertex_id,
+                        source_surface_id=wall.surface_id,
+                        world_point=(2.0, 0.0, 1.0),
+                    ),
+                ),
+                edges=(),
+            )
+        )
+        emitted: list[object] = []
+        viewer.canvas_surface_vertex_insertion_requested.connect(emitted.append)
+        self.assertTrue(viewer.begin_surface_vertex_placement())
+        viewer.view.enter_first_person_mode()
+
+        with (
+            patch.object(
+                viewer.view,
+                "build_camera_ray",
+                return_value=_ray_at(2.4, 1.0),
+            ),
+            patch.object(
+                viewer.view,
+                "cameraPosition",
+                return_value=QVector3D(2.0, -3.0, 1.0),
+            ),
+        ):
+            ordinary, _is_occluded = (
+                viewer._resolve_surface_vertex_pointer_preview(QPointF())
+            )
+            self.assertIsNotNone(ordinary)
+            assert ordinary is not None
+            self.assertEqual(ordinary.snap_kind, "surface")
+            np.testing.assert_allclose(ordinary.world_point, (2.4, 0.0, 1.0))
+
+            viewer.view.keyPressEvent(
+                QKeyEvent(
+                    QKeyEvent.Type.KeyPress,
+                    Qt.Key.Key_Control,
+                    Qt.KeyboardModifier.ControlModifier,
+                )
+            )
+            self.assertTrue(viewer.view.is_first_person_ctrl_interaction_active)
+            viewer._handle_surface_vertex_pointer_hovered(QPointF())
+            snapped_preview = viewer._surface_vertex_hover_preview
+            self.assertIsNotNone(snapped_preview)
+            assert snapped_preview is not None
+            self.assertEqual(snapped_preview.snap_kind, "vertex")
+            self.assertEqual(snapped_preview.snapped_vertex_id, vertex_id)
+            np.testing.assert_allclose(
+                snapped_preview.world_point,
+                (2.0, 0.0, 1.0),
+            )
+
+            self.assertTrue(
+                viewer._begin_surface_vertex_pointer_interaction(QPointF())
+            )
+
+        self.assertEqual(len(emitted), 1)
+        request = emitted[0]
+        self.assertIsInstance(request, SurfaceVertexInsertionRequest)
+        assert isinstance(request, SurfaceVertexInsertionRequest)
+        np.testing.assert_allclose(
+            request.world_point,
+            snapped_preview.world_point,
+        )
+        self.assertTrue(
+            viewer._finish_surface_vertex_pointer_interaction(QPointF())
+        )
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_ray_at(2.4, 1.0),
+        ):
+            viewer.view.keyReleaseEvent(
+                QKeyEvent(
+                    QKeyEvent.Type.KeyRelease,
+                    Qt.Key.Key_Control,
+                    Qt.KeyboardModifier.NoModifier,
+                )
+            )
+            released, _is_occluded = (
+                viewer._resolve_surface_vertex_pointer_preview(QPointF())
+            )
+
+        self.assertFalse(viewer.view.is_control_modifier_pressed)
+        self.assertIsNotNone(released)
+        assert released is not None
+        self.assertEqual(released.snap_kind, "surface")
+        np.testing.assert_allclose(released.world_point, (2.4, 0.0, 1.0))
+
+    def test_ctrl_vertex_sensitivity_grows_with_camera_distance(self) -> None:
+        wall = _build_wall()
+        viewer = self._build_viewer((wall,))
+        vertex_id = "1" * 32
+        vertex_point = (2.0, 0.0, 1.0)
+        requested = (2.2, 0.0, 1.0)
+        viewer.set_canvas_surface_drawing_overlay(
+            SurfaceDrawingOverlay(
+                vertices=(
+                    SurfaceDrawingVertexTarget(
+                        vertex_id=vertex_id,
+                        source_surface_id=wall.surface_id,
+                        world_point=vertex_point,
+                    ),
+                ),
+                edges=(),
+            )
+        )
+        emitted: list[object] = []
+        viewer.canvas_surface_vertex_insertion_requested.connect(emitted.append)
+        self.assertTrue(viewer.begin_surface_vertex_placement())
+        viewer.view.keyPressEvent(
+            QKeyEvent(
+                QKeyEvent.Type.KeyPress,
+                Qt.Key.Key_Control,
+                Qt.KeyboardModifier.ControlModifier,
+            )
+        )
+
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_ray_at(requested[0], requested[2]),
+        ):
+            with patch.object(
+                viewer.view,
+                "cameraPosition",
+                return_value=QVector3D(2.0, -0.5, 1.0),
+            ):
+                near_preview, _is_occluded = (
+                    viewer._resolve_surface_vertex_pointer_preview(QPointF())
+                )
+
+            with patch.object(
+                viewer.view,
+                "cameraPosition",
+                return_value=QVector3D(2.0, -6.0, 1.0),
+            ):
+                viewer._handle_surface_vertex_pointer_hovered(QPointF())
+                far_preview = viewer._surface_vertex_hover_preview
+                self.assertTrue(
+                    viewer._begin_surface_vertex_pointer_interaction(QPointF())
+                )
+
+        self.assertIsNotNone(near_preview)
+        assert near_preview is not None
+        self.assertEqual(near_preview.snap_kind, "surface")
+        np.testing.assert_allclose(near_preview.world_point, requested)
+        self.assertIsNotNone(far_preview)
+        assert far_preview is not None
+        self.assertEqual(far_preview.snap_kind, "vertex")
+        self.assertEqual(far_preview.snapped_vertex_id, vertex_id)
+        np.testing.assert_allclose(far_preview.world_point, vertex_point)
+        self.assertEqual(len(emitted), 1)
+        request = emitted[0]
+        self.assertIsInstance(request, SurfaceVertexInsertionRequest)
+        assert isinstance(request, SurfaceVertexInsertionRequest)
+        np.testing.assert_allclose(request.world_point, far_preview.world_point)
+        viewer.view.keyReleaseEvent(
+            QKeyEvent(
+                QKeyEvent.Type.KeyRelease,
+                Qt.Key.Key_Control,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+
+    def test_camera_distance_does_not_change_snap_sensitivity_without_ctrl(
+        self,
+    ) -> None:
+        wall = _build_wall()
+        viewer = self._build_viewer((wall,))
+        vertex_id = "1" * 32
+        requested = (2.2, 0.0, 1.0)
+        viewer.set_canvas_surface_drawing_overlay(
+            SurfaceDrawingOverlay(
+                vertices=(
+                    SurfaceDrawingVertexTarget(
+                        vertex_id=vertex_id,
+                        source_surface_id=wall.surface_id,
+                        world_point=(2.0, 0.0, 1.0),
+                    ),
+                ),
+                edges=(),
+            )
+        )
+        self.assertTrue(viewer.begin_surface_vertex_placement())
+
+        previews = []
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_ray_at(requested[0], requested[2]),
+        ):
+            for camera_y in (-0.5, -6.0):
+                with patch.object(
+                    viewer.view,
+                    "cameraPosition",
+                    return_value=QVector3D(2.0, camera_y, 1.0),
+                ):
+                    preview, _is_occluded = (
+                        viewer._resolve_surface_vertex_pointer_preview(QPointF())
+                    )
+                    previews.append(preview)
+
+        self.assertEqual(len(previews), 2)
+        for preview in previews:
+            self.assertIsNotNone(preview)
+            assert preview is not None
+            self.assertEqual(preview.snap_kind, "surface")
+            np.testing.assert_allclose(preview.world_point, requested)
+
+    def test_ctrl_distance_uses_the_vertex_nearest_the_hover_point(self) -> None:
+        wall = _build_wall()
+        viewer = self._build_viewer((wall,))
+        near_vertex_id = "1" * 32
+        far_vertex_id = "2" * 32
+        requested = (1.2, 0.0, 1.0)
+        viewer.set_canvas_surface_drawing_overlay(
+            SurfaceDrawingOverlay(
+                vertices=(
+                    SurfaceDrawingVertexTarget(
+                        vertex_id=near_vertex_id,
+                        source_surface_id=wall.surface_id,
+                        world_point=(1.0, 0.0, 1.0),
+                    ),
+                    SurfaceDrawingVertexTarget(
+                        vertex_id=far_vertex_id,
+                        source_surface_id=wall.surface_id,
+                        world_point=(4.0, 0.0, 3.0),
+                    ),
+                ),
+                edges=(),
+            )
+        )
+        self.assertTrue(viewer.begin_surface_vertex_placement())
+        viewer.view.keyPressEvent(
+            QKeyEvent(
+                QKeyEvent.Type.KeyPress,
+                Qt.Key.Key_Control,
+                Qt.KeyboardModifier.ControlModifier,
+            )
+        )
+
+        with (
+            patch.object(
+                viewer.view,
+                "build_camera_ray",
+                return_value=_ray_at(requested[0], requested[2]),
+            ),
+            patch.object(
+                viewer.view,
+                "cameraPosition",
+                return_value=QVector3D(1.0, -0.5, 1.0),
+            ),
+        ):
+            preview, _is_occluded = (
+                viewer._resolve_surface_vertex_pointer_preview(QPointF())
+            )
+
+        self.assertIsNotNone(preview)
+        assert preview is not None
+        self.assertEqual(preview.snap_kind, "surface")
+        self.assertIsNone(preview.snapped_vertex_id)
+        np.testing.assert_allclose(preview.world_point, requested)
+        viewer.view.keyReleaseEvent(
+            QKeyEvent(
+                QKeyEvent.Type.KeyRelease,
+                Qt.Key.Key_Control,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+
+    def test_far_camera_ctrl_sensitivity_keeps_the_one_degree_angle_cap(
+        self,
+    ) -> None:
+        wall = _build_wall()
+        viewer = self._build_viewer((wall,))
+        active_id = "1" * 32
+        active_point = (0.5, 0.0, 0.1)
+        angle_radians = math.radians(46.5)
+        requested = (
+            active_point[0] + 2.0 * math.cos(angle_radians),
+            0.0,
+            active_point[2] + 2.0 * math.sin(angle_radians),
+        )
+        viewer.set_canvas_surface_drawing_overlay(
+            SurfaceDrawingOverlay(
+                vertices=(
+                    SurfaceDrawingVertexTarget(
+                        vertex_id=active_id,
+                        source_surface_id=wall.surface_id,
+                        world_point=active_point,
+                    ),
+                ),
+                edges=(),
+            ),
+            active_vertex_id=active_id,
+        )
+        self.assertTrue(viewer.begin_surface_vertex_placement())
+        viewer.view.keyPressEvent(
+            QKeyEvent(
+                QKeyEvent.Type.KeyPress,
+                Qt.Key.Key_Control,
+                Qt.KeyboardModifier.ControlModifier,
+            )
+        )
+
+        with (
+            patch.object(
+                viewer.view,
+                "build_camera_ray",
+                return_value=_ray_at(requested[0], requested[2]),
+            ),
+            patch.object(
+                viewer.view,
+                "cameraPosition",
+                return_value=QVector3D(0.5, -20.0, 0.1),
+            ),
+        ):
+            viewer._handle_surface_vertex_pointer_hovered(QPointF())
+
+        preview = viewer._surface_vertex_hover_preview
+        self.assertIsNotNone(preview)
+        assert preview is not None
+        self.assertEqual(preview.snap_kind, "surface")
+        np.testing.assert_allclose(preview.world_point, requested)
+        edge_item = viewer._surface_vertex_preview_edge_item
+        self.assertIsNotNone(edge_item)
+        assert edge_item is not None
+        self.assertEqual(len(edge_item.pos), 2)
+        viewer.view.keyReleaseEvent(
+            QKeyEvent(
+                QKeyEvent.Type.KeyRelease,
+                Qt.Key.Key_Control,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+
+    def test_held_ctrl_expands_edge_snap_for_hover_and_click(self) -> None:
+        wall = _build_wall()
+        viewer = self._build_viewer((wall,))
+        first_id = "1" * 32
+        second_id = "2" * 32
+        viewer.set_canvas_surface_drawing_overlay(
+            SurfaceDrawingOverlay(
+                vertices=(
+                    SurfaceDrawingVertexTarget(
+                        vertex_id=first_id,
+                        source_surface_id=wall.surface_id,
+                        world_point=(1.0, 0.0, 1.0),
+                    ),
+                    SurfaceDrawingVertexTarget(
+                        vertex_id=second_id,
+                        source_surface_id=wall.surface_id,
+                        world_point=(3.0, 0.0, 1.0),
+                    ),
+                ),
+                edges=(
+                    SurfaceDrawingEdgeTarget(
+                        source_surface_id=wall.surface_id,
+                        vertex_ids=(first_id, second_id),
+                        world_points=((1.0, 0.0, 1.0), (3.0, 0.0, 1.0)),
+                    ),
+                ),
+            )
+        )
+        emitted: list[object] = []
+        viewer.canvas_surface_vertex_insertion_requested.connect(emitted.append)
+        self.assertTrue(viewer.begin_surface_vertex_placement())
+        viewer.view.enter_first_person_mode()
+
+        with (
+            patch.object(
+                viewer.view,
+                "build_camera_ray",
+                return_value=_ray_at(2.0, 1.25),
+            ),
+            patch.object(
+                viewer.view,
+                "cameraPosition",
+                return_value=QVector3D(1.0, -3.0, 1.0),
+            ),
+        ):
+            ordinary, _is_occluded = (
+                viewer._resolve_surface_vertex_pointer_preview(QPointF())
+            )
+            self.assertIsNotNone(ordinary)
+            assert ordinary is not None
+            self.assertEqual(ordinary.snap_kind, "surface")
+            np.testing.assert_allclose(ordinary.world_point, (2.0, 0.0, 1.25))
+
+            viewer.view.keyPressEvent(
+                QKeyEvent(
+                    QKeyEvent.Type.KeyPress,
+                    Qt.Key.Key_Control,
+                    Qt.KeyboardModifier.ControlModifier,
+                )
+            )
+            viewer._handle_surface_vertex_pointer_hovered(QPointF())
+            snapped_preview = viewer._surface_vertex_hover_preview
+            self.assertIsNotNone(snapped_preview)
+            assert snapped_preview is not None
+            self.assertEqual(snapped_preview.snap_kind, "edge")
+            self.assertEqual(
+                snapped_preview.snapped_edge_vertex_ids,
+                (first_id, second_id),
+            )
+            np.testing.assert_allclose(
+                snapped_preview.world_point,
+                (2.0, 0.0, 1.0),
+            )
+
+            self.assertTrue(
+                viewer._begin_surface_vertex_pointer_interaction(QPointF())
+            )
+
+        self.assertEqual(len(emitted), 1)
+        request = emitted[0]
+        self.assertIsInstance(request, SurfaceVertexInsertionRequest)
+        assert isinstance(request, SurfaceVertexInsertionRequest)
+        np.testing.assert_allclose(
+            request.world_point,
+            snapped_preview.world_point,
+        )
+        self.assertTrue(
+            viewer._finish_surface_vertex_pointer_interaction(QPointF())
+        )
+        viewer.view.keyReleaseEvent(
+            QKeyEvent(
+                QKeyEvent.Type.KeyRelease,
+                Qt.Key.Key_Control,
+                Qt.KeyboardModifier.NoModifier,
+            )
         )
 
     def test_authored_subedge_wins_over_its_coincident_face_boundary(
@@ -1288,7 +2473,7 @@ class CanvasSurfaceTopologyViewerTests(unittest.TestCase):
 
         snapped = _snap_surface_point_from_active_vertex(
             wall,
-            np.asarray((0.011, 0.0, 0.06), dtype=float),
+            np.asarray((0.0195, 0.0, 0.06), dtype=float),
             np.asarray((0.02, 0.0, 0.02), dtype=float),
             (wall,),
         )
@@ -1298,20 +2483,20 @@ class CanvasSurfaceTopologyViewerTests(unittest.TestCase):
         self.assertGreaterEqual(float(snapped[0]), 0.0)
         self.assertGreaterEqual(float(snapped[2]), 0.0)
 
-    def test_active_angle_snap_rejects_over_one_centimeter_displacement(
+    def test_active_angle_snap_accepts_under_and_rejects_over_two_centimeters(
         self,
     ) -> None:
         wall = _build_wall()
 
         close = _snap_surface_point_from_active_vertex(
             wall,
-            np.asarray((1.005, 0.0, 2.0), dtype=float),
+            np.asarray((1.015, 0.0, 2.0), dtype=float),
             np.asarray((1.0, 0.0, 1.0), dtype=float),
             (wall,),
         )
         distant = _snap_surface_point_from_active_vertex(
             wall,
-            np.asarray((1.015, 0.0, 2.0), dtype=float),
+            np.asarray((1.021, 0.0, 2.0), dtype=float),
             np.asarray((1.0, 0.0, 1.0), dtype=float),
             (wall,),
         )

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,7 +16,9 @@ from shapely.ops import unary_union
 
 from housemaker.architectural_surface_edits import (
     EDITABLE_SURFACE_ID_PATTERN,
+    SURFACE_VERTEX_SNAP_KIND_ANGLE,
     SURFACE_VERTEX_SNAP_KIND_EDGE,
+    SURFACE_VERTEX_SNAP_KIND_VERTEX,
     SurfaceDrawingVertexTarget,
     build_editable_surface_id,
     build_surface_drawing_overlay,
@@ -511,7 +514,7 @@ class SurfaceVertexInsertionTests(unittest.TestCase):
             )
         )
 
-    def test_snap_helper_accepts_close_angle_but_rejects_over_one_centimeter(
+    def test_snap_helper_accepts_close_angle_but_rejects_over_two_centimeters(
         self,
     ) -> None:
         surface = _build_snap_surface()
@@ -519,19 +522,19 @@ class SurfaceVertexInsertionTests(unittest.TestCase):
         close_point = snap_surface_vertex_world_point(
             [surface],
             surface.surface_id,
-            (0.8, 0.807, 0.02),
+            (0.8, 0.827, 0.02),
         )
         distant_point = snap_surface_vertex_world_point(
             [surface],
             surface.surface_id,
-            (0.8, 0.822, 0.02),
+            (0.8, 0.83, 0.02),
         )
 
         self.assertAlmostEqual(close_point[0], close_point[1])
         self.assertAlmostEqual(close_point[2], 0.0)
         np.testing.assert_allclose(
             distant_point,
-            (0.8, 0.822, 0.0),
+            (0.8, 0.83, 0.0),
             atol=1e-9,
         )
 
@@ -1147,6 +1150,370 @@ class SurfaceVertexDrawingTests(unittest.TestCase):
         self.assertFalse(selected.state_changed)
         self.assertFalse(selected.requires_mesh_refresh)
         self.assertEqual(len(level.editable_surfaces[0].vertices), vertex_count)
+
+    def test_vertex_capture_exceeds_edge_capture_and_commit_reuses_vertex(
+        self,
+    ) -> None:
+        level = _build_square_level()
+        wall = _get_wall(level)
+        first = place_surface_vertex(
+            [level],
+            wall.surface_id,
+            (0.4, 0.0, 0.8),
+        )
+        place_surface_vertex(
+            [level],
+            wall.surface_id,
+            (1.6, 0.0, 0.8),
+            first.active_vertex_id,
+        )
+
+        near_vertex = resolve_surface_vertex_preview(
+            [level],
+            wall.surface_id,
+            (0.4, 0.0, 0.812),
+        )
+        near_edge = resolve_surface_vertex_preview(
+            [level],
+            wall.surface_id,
+            (1.0, 0.0, 0.809),
+        )
+        equally_distant_from_edge = resolve_surface_vertex_preview(
+            [level],
+            wall.surface_id,
+            (1.0, 0.0, 0.812),
+        )
+
+        self.assertEqual(near_vertex.snap_kind, SURFACE_VERTEX_SNAP_KIND_VERTEX)
+        self.assertEqual(near_vertex.snapped_vertex_id, first.active_vertex_id)
+        self.assertEqual(near_edge.snap_kind, SURFACE_VERTEX_SNAP_KIND_EDGE)
+        self.assertNotEqual(
+            equally_distant_from_edge.snap_kind,
+            SURFACE_VERTEX_SNAP_KIND_EDGE,
+        )
+        vertex_count = len(level.editable_surfaces[0].vertices)
+        edge_count = len(level.editable_surfaces[0].edges)
+
+        selected = place_surface_vertex(
+            [level],
+            wall.surface_id,
+            (0.4, 0.0, 0.812),
+        )
+
+        self.assertEqual(selected.active_vertex_id, first.active_vertex_id)
+        self.assertFalse(selected.state_changed)
+        self.assertEqual(len(level.editable_surfaces[0].vertices), vertex_count)
+        self.assertEqual(len(level.editable_surfaces[0].edges), edge_count)
+
+    def test_vertex_wins_over_edge_near_endpoint_for_preview_and_commit(
+        self,
+    ) -> None:
+        level = _build_square_level()
+        wall = _get_wall(level)
+        first = place_surface_vertex(
+            [level],
+            wall.surface_id,
+            (0.4, 0.0, 0.8),
+        )
+        place_surface_vertex(
+            [level],
+            wall.surface_id,
+            (1.6, 0.0, 0.8),
+            first.active_vertex_id,
+        )
+        requested = (0.414, 0.0, 0.8)
+
+        preview = resolve_surface_vertex_preview(
+            [level],
+            wall.surface_id,
+            requested,
+        )
+
+        self.assertEqual(preview.snap_kind, SURFACE_VERTEX_SNAP_KIND_VERTEX)
+        self.assertEqual(preview.snapped_vertex_id, first.active_vertex_id)
+        np.testing.assert_allclose(preview.world_point, (0.4, 0.0, 0.8))
+        vertex_count = len(level.editable_surfaces[0].vertices)
+        edge_count = len(level.editable_surfaces[0].edges)
+        placed = place_surface_vertex(
+            [level],
+            wall.surface_id,
+            requested,
+        )
+
+        self.assertFalse(placed.state_changed)
+        self.assertFalse(placed.requires_mesh_refresh)
+        self.assertEqual(placed.active_vertex_id, first.active_vertex_id)
+        self.assertEqual(len(level.editable_surfaces[0].vertices), vertex_count)
+        self.assertEqual(len(level.editable_surfaces[0].edges), edge_count)
+
+    def test_active_angle_outranks_a_nearby_off_angle_vertex_on_commit(
+        self,
+    ) -> None:
+        level = _build_square_level()
+        wall = _get_wall(level)
+        off_angle = place_surface_vertex(
+            [level],
+            wall.surface_id,
+            (0.7, 0.0, 0.712),
+        )
+        active = place_surface_vertex(
+            [level],
+            wall.surface_id,
+            (0.5, 0.0, 0.5),
+        )
+        requested = (0.7, 0.0, 0.7)
+
+        preview = resolve_surface_vertex_preview(
+            [level],
+            wall.surface_id,
+            requested,
+            active.active_vertex_id,
+        )
+
+        self.assertEqual(preview.snap_kind, SURFACE_VERTEX_SNAP_KIND_ANGLE)
+        self.assertIsNone(preview.snapped_vertex_id)
+        np.testing.assert_allclose(preview.world_point, requested)
+        vertex_count = len(level.editable_surfaces[0].vertices)
+        placed = place_surface_vertex(
+            [level],
+            wall.surface_id,
+            requested,
+            active.active_vertex_id,
+        )
+
+        self.assertNotEqual(placed.active_vertex_id, off_angle.active_vertex_id)
+        self.assertEqual(
+            len(level.editable_surfaces[0].vertices),
+            vertex_count + 1,
+        )
+        placed_vertex = next(
+            vertex
+            for vertex in build_surface_drawing_overlay([level]).vertices
+            if vertex.vertex_id == placed.active_vertex_id
+        )
+        np.testing.assert_allclose(placed_vertex.world_point, preview.world_point)
+
+    def test_active_angle_keeps_an_exact_compatible_vertex_identity(
+        self,
+    ) -> None:
+        level = _build_square_level()
+        wall = _get_wall(level)
+        compatible = place_surface_vertex(
+            [level],
+            wall.surface_id,
+            (1.5, 0.0, 1.5),
+        )
+        active = place_surface_vertex(
+            [level],
+            wall.surface_id,
+            (0.5, 0.0, 0.5),
+        )
+
+        preview = resolve_surface_vertex_preview(
+            [level],
+            wall.surface_id,
+            (1.51, 0.0, 1.5),
+            active.active_vertex_id,
+        )
+
+        self.assertEqual(preview.snap_kind, SURFACE_VERTEX_SNAP_KIND_ANGLE)
+        self.assertEqual(preview.snapped_vertex_id, compatible.active_vertex_id)
+        np.testing.assert_allclose(preview.world_point, (1.5, 0.0, 1.5))
+
+    def test_active_angle_can_snap_to_a_compatible_edge_intersection(
+        self,
+    ) -> None:
+        level = _build_square_level()
+        wall = _get_wall(level)
+        first_edge = place_surface_vertex(
+            [level],
+            wall.surface_id,
+            (1.0, 0.0, 1.5),
+        )
+        second_edge = place_surface_vertex(
+            [level],
+            wall.surface_id,
+            (2.0, 0.0, 1.5),
+            first_edge.active_vertex_id,
+        )
+        active = place_surface_vertex(
+            [level],
+            wall.surface_id,
+            (0.5, 0.0, 0.5),
+        )
+
+        preview = resolve_surface_vertex_preview(
+            [level],
+            wall.surface_id,
+            (1.507, 0.0, 1.5),
+            active.active_vertex_id,
+        )
+
+        self.assertEqual(preview.snap_kind, SURFACE_VERTEX_SNAP_KIND_ANGLE)
+        self.assertEqual(
+            set(preview.snapped_edge_vertex_ids or ()),
+            {first_edge.active_vertex_id, second_edge.active_vertex_id},
+        )
+        np.testing.assert_allclose(preview.world_point, (1.5, 0.0, 1.5))
+        vertex_count = len(level.editable_surfaces[0].vertices)
+        placed = place_surface_vertex(
+            [level],
+            wall.surface_id,
+            (1.507, 0.0, 1.5),
+            active.active_vertex_id,
+        )
+
+        self.assertEqual(
+            len(level.editable_surfaces[0].vertices),
+            vertex_count + 1,
+        )
+        placed_vertex = next(
+            vertex
+            for vertex in build_surface_drawing_overlay([level]).vertices
+            if vertex.vertex_id == placed.active_vertex_id
+        )
+        np.testing.assert_allclose(placed_vertex.world_point, preview.world_point)
+
+    def test_increased_angle_capture_is_shared_by_preview_and_commit(
+        self,
+    ) -> None:
+        level = _build_square_level()
+        wall = _get_wall(level)
+        first = place_surface_vertex(
+            [level],
+            wall.surface_id,
+            (0.4, 0.0, 0.8),
+        )
+        requested = (1.4, 0.0, 1.824)
+
+        preview = resolve_surface_vertex_preview(
+            [level],
+            wall.surface_id,
+            requested,
+            first.active_vertex_id,
+        )
+
+        self.assertEqual(preview.snap_kind, SURFACE_VERTEX_SNAP_KIND_ANGLE)
+        self.assertGreater(
+            float(np.linalg.norm(np.asarray(preview.world_point) - requested)),
+            0.01,
+        )
+        placed = place_surface_vertex(
+            [level],
+            wall.surface_id,
+            requested,
+            first.active_vertex_id,
+        )
+        placed_vertex = next(
+            vertex
+            for vertex in build_surface_drawing_overlay([level]).vertices
+            if vertex.vertex_id == placed.active_vertex_id
+        )
+
+        np.testing.assert_allclose(
+            placed_vertex.world_point,
+            preview.world_point,
+            atol=1e-9,
+        )
+
+    def test_active_angle_beyond_two_meters_matches_preview_and_commit(
+        self,
+    ) -> None:
+        level = _build_square_level()
+        wall = _get_wall(level)
+        first_point = np.asarray((0.1, 0.0, 0.5), dtype=float)
+        first = place_surface_vertex(
+            [level],
+            wall.surface_id,
+            first_point,
+        )
+        component = 2.4 / math.sqrt(2.0)
+        requested = tuple(
+            float(value)
+            for value in first_point + np.asarray((component, 0.0, component))
+        )
+
+        preview = resolve_surface_vertex_preview(
+            [level],
+            wall.surface_id,
+            requested,
+            first.active_vertex_id,
+        )
+
+        self.assertEqual(preview.snap_kind, SURFACE_VERTEX_SNAP_KIND_ANGLE)
+        self.assertGreater(
+            float(np.linalg.norm(np.asarray(preview.world_point) - first_point)),
+            2.0,
+        )
+        self.assertAlmostEqual(
+            preview.world_point[0] - first_point[0],
+            preview.world_point[2] - first_point[2],
+        )
+        placed = place_surface_vertex(
+            [level],
+            wall.surface_id,
+            requested,
+            first.active_vertex_id,
+        )
+        placed_vertex = next(
+            vertex
+            for vertex in build_surface_drawing_overlay([level]).vertices
+            if vertex.vertex_id == placed.active_vertex_id
+        )
+
+        np.testing.assert_allclose(
+            placed_vertex.world_point,
+            preview.world_point,
+            atol=1e-9,
+        )
+
+    def test_active_off_angle_does_not_fall_back_to_nearby_vertex_angle(
+        self,
+    ) -> None:
+        level = _build_square_level()
+        wall = _get_wall(level)
+        first = place_surface_vertex(
+            [level],
+            wall.surface_id,
+            (0.1, 0.0, 0.5),
+        )
+        requested = (1.69, 0.0, 3.0)
+
+        general_preview = resolve_surface_vertex_preview(
+            [level],
+            wall.surface_id,
+            requested,
+        )
+        active_preview = resolve_surface_vertex_preview(
+            [level],
+            wall.surface_id,
+            requested,
+            first.active_vertex_id,
+        )
+
+        self.assertEqual(
+            general_preview.snap_kind,
+            SURFACE_VERTEX_SNAP_KIND_ANGLE,
+        )
+        self.assertEqual(active_preview.snap_kind, "surface")
+        np.testing.assert_allclose(active_preview.world_point, requested)
+        placed = place_surface_vertex(
+            [level],
+            wall.surface_id,
+            requested,
+            first.active_vertex_id,
+        )
+        placed_vertex = next(
+            vertex
+            for vertex in build_surface_drawing_overlay([level]).vertices
+            if vertex.vertex_id == placed.active_vertex_id
+        )
+
+        np.testing.assert_allclose(
+            placed_vertex.world_point,
+            requested,
+            atol=1e-9,
+        )
 
     def test_preview_snaps_to_boundary_and_authored_edges_but_not_hidden_diagonal(
         self,

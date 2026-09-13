@@ -220,7 +220,15 @@ CANVAS_SURFACE_ACTIVE_VERTEX_SIZE_PIXELS = 22.0
 CANVAS_SURFACE_VERTEX_PREVIEW_COLOR = (1.0, 0.76, 0.16, 1.0)
 CANVAS_SURFACE_VERTEX_SNAP_PREVIEW_COLOR = (0.20, 0.94, 0.42, 1.0)
 CANVAS_SURFACE_VERTEX_PREVIEW_SIZE_PIXELS = 18.0
-CANVAS_SURFACE_VERTEX_SNAP_DISTANCE_METERS = 0.01
+CANVAS_SURFACE_VERTEX_TARGET_SNAP_DISTANCE_METERS = 0.015
+CANVAS_SURFACE_EDGE_SNAP_DISTANCE_METERS = 0.01
+CANVAS_SURFACE_ANGLE_SNAP_DISTANCE_METERS = 0.02
+CANVAS_SURFACE_ANGLE_SNAP_MAX_DEVIATION_DEGREES = 1.0
+CANVAS_SURFACE_ANGLE_FEATURE_TOLERANCE_METERS = 1e-6
+CANVAS_SURFACE_CTRL_SNAP_SENSITIVITY_MULTIPLIER = 30.0
+CANVAS_SURFACE_CTRL_SNAP_REFERENCE_DISTANCE_METERS = 3.0
+CANVAS_SURFACE_CTRL_SNAP_MIN_SENSITIVITY_MULTIPLIER = 3.0
+CANVAS_SURFACE_CTRL_SNAP_MAX_SENSITIVITY_MULTIPLIER = 120.0
 CANVAS_SURFACE_ANGLE_GUIDE_DOT_LENGTH_PIXELS = 2.0
 CANVAS_SURFACE_ANGLE_GUIDE_SPACING_PIXELS = 12.0
 CANVAS_SURFACE_ANGLE_GUIDE_FALLBACK_DOT_COUNT = 16
@@ -553,6 +561,16 @@ class _CanvasSurfaceVertexPreview:
 
 
 @dataclass(frozen=True)
+class _CanvasSurfaceVertexSnapCandidate:
+    """One existing vertex ranked for a Canvas surface snap."""
+
+    distance_meters: float
+    authored_priority: int
+    world_point: tuple[float, float, float]
+    snapped_vertex_id: str | None
+
+
+@dataclass(frozen=True)
 class _CanvasSurfaceEdgeSnapCandidate:
     """One edge snap ranked with the same rules as domain placement."""
 
@@ -581,6 +599,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
     primary_pointer_moved = Signal(object)
     primary_pointer_released = Signal(object)
     primary_pointer_cancel_requested = Signal()
+    control_modifier_changed = Signal(bool)
     face_selection_pointer_pressed = Signal(object)
     face_selection_pointer_moved = Signal(object)
     face_selection_pointer_released = Signal(object)
@@ -612,6 +631,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self._first_person_pointer_captured = False
         self._first_person_ctrl_interaction_enabled = False
         self._first_person_ctrl_interaction_active = False
+        self._control_modifier_pressed = False
         self._first_person_pointer_release_latched = False
         self._first_person_application_deactivated = False
         self._application_event_filter_installed = False
@@ -697,17 +717,18 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             return
         self._first_person_ctrl_interaction_enabled = normalized_enabled
         if normalized_enabled:
-            if self.is_first_person_active:
-                self._install_first_person_ctrl_event_filter()
-            if (
-                self.is_first_person_active
-                and QApplication.keyboardModifiers()
+            self._install_first_person_ctrl_event_filter()
+            control_pressed = bool(
+                QApplication.keyboardModifiers()
                 & Qt.KeyboardModifier.ControlModifier
-            ):
+            )
+            self._set_control_modifier_pressed(control_pressed)
+            if control_pressed and self.is_first_person_active:
                 self._begin_first_person_ctrl_interaction()
             return
 
         self._remove_first_person_ctrl_event_filter()
+        self._set_control_modifier_pressed(False)
         should_restore_capture = bool(
             self._first_person_ctrl_interaction_active
             or self._first_person_pointer_release_latched
@@ -732,18 +753,41 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             and self._first_person_ctrl_interaction_active
         )
 
+    @property
+    def is_control_modifier_pressed(self) -> bool:
+        """Whether Ctrl is currently held for a modifier-aware Canvas tool."""
+
+        return bool(
+            self._control_modifier_pressed
+            or QApplication.keyboardModifiers()
+            & Qt.KeyboardModifier.ControlModifier
+        )
+
+    def _set_control_modifier_pressed(self, pressed: bool) -> bool:
+        """Track Ctrl independently from its first-person pointer behavior."""
+
+        normalized_pressed = bool(pressed)
+        if normalized_pressed == self._control_modifier_pressed:
+            return False
+        self._control_modifier_pressed = normalized_pressed
+        self.control_modifier_changed.emit(normalized_pressed)
+        return True
+
     def eventFilter(self, watched, event) -> bool:  # type: ignore[override]
-        """Observe Canvas Ctrl release after a side-panel button gains focus."""
+        """Track Canvas Ctrl changes even when a side-panel control has focus."""
 
         if event.type() == QEvent.Type.ApplicationDeactivate:
             self._first_person_application_deactivated = True
+            self._set_control_modifier_pressed(False)
             return super().eventFilter(watched, event)
         if event.type() == QEvent.Type.ApplicationActivate:
             self._first_person_application_deactivated = False
-            if (
+            control_pressed = bool(
                 QApplication.keyboardModifiers()
                 & Qt.KeyboardModifier.ControlModifier
-            ):
+            )
+            self._set_control_modifier_pressed(control_pressed)
+            if control_pressed:
                 self._begin_first_person_ctrl_interaction()
             else:
                 self._first_person_ctrl_interaction_active = False
@@ -751,17 +795,21 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             return super().eventFilter(watched, event)
         if (
             self._first_person_ctrl_interaction_enabled
-            and self.is_first_person_active
             and self._event_belongs_to_viewer_window(watched)
             and event.type() in {QEvent.Type.KeyPress, QEvent.Type.KeyRelease}
             and event.key() == Qt.Key.Key_Control
         ):
             if event.type() == QEvent.Type.KeyPress:
-                self._begin_first_person_ctrl_interaction()
+                self._set_control_modifier_pressed(True)
+                if self.is_first_person_active:
+                    self._begin_first_person_ctrl_interaction()
             else:
-                self._end_first_person_ctrl_interaction()
-            event.accept()
-            return True
+                if self.is_first_person_active:
+                    self._end_first_person_ctrl_interaction()
+                self._set_control_modifier_pressed(False)
+            if self.is_first_person_active:
+                event.accept()
+                return True
         return super().eventFilter(watched, event)
 
     def set_overlay_selection_enabled(self, enabled: bool) -> None:
@@ -918,7 +966,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         return isinstance(watched, QWidget) and watched.window() is self.window()
 
     def _install_first_person_ctrl_event_filter(self) -> None:
-        """Observe Ctrl only while this Canvas first-person view is in use."""
+        """Observe Ctrl throughout the Canvas window for modifier tools."""
 
         if self._application_event_filter_installed:
             return
@@ -1431,18 +1479,20 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         if delta != 0:
             self.opts["distance"] *= 0.999**delta
             self.update()
+            position_getter = getattr(event, "position", None)
+            if callable(position_getter):
+                self.primary_pointer_hovered.emit(position_getter())
             event.accept()
             return
 
         super().wheelEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
-        if (
-            event.key() == Qt.Key.Key_Control
-            and self._begin_first_person_ctrl_interaction()
-        ):
-            event.accept()
-            return
+        if event.key() == Qt.Key.Key_Control:
+            self._set_control_modifier_pressed(True)
+            if self._begin_first_person_ctrl_interaction():
+                event.accept()
+                return
         if event.matches(QKeySequence.StandardKey.Undo):
             self.undo_requested.emit()
             event.accept()
@@ -1484,12 +1534,12 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
-        if (
-            event.key() == Qt.Key.Key_Control
-            and self._end_first_person_ctrl_interaction()
-        ):
-            event.accept()
-            return
+        if event.key() == Qt.Key.Key_Control:
+            interaction_ended = self._end_first_person_ctrl_interaction()
+            self._set_control_modifier_pressed(False)
+            if interaction_ended:
+                event.accept()
+                return
         if event.key() in _first_person_movement_keys():
             self._pressed_movement_keys.discard(event.key())
             event.accept()
@@ -1507,6 +1557,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         """Remove the application filter before the OpenGL widget closes."""
 
         self._remove_first_person_ctrl_event_filter()
+        self._set_control_modifier_pressed(False)
         self._first_person_ctrl_interaction_active = False
         self.release_first_person_pointer_capture()
         super().closeEvent(event)
@@ -1516,10 +1567,12 @@ class SelectableGLViewWidget(gl.GLViewWidget):
 
         if event.type() == QEvent.Type.DeferredDelete:
             self._remove_first_person_ctrl_event_filter()
+            self._set_control_modifier_pressed(False)
         return super().event(event)
 
     def hideEvent(self, event) -> None:  # type: ignore[override]
         self._remove_first_person_ctrl_event_filter()
+        self._set_control_modifier_pressed(False)
         self._first_person_ctrl_interaction_active = False
         self.cancel_transient_pointer_interactions()
         self.release_first_person_pointer_capture()
@@ -1528,17 +1581,16 @@ class SelectableGLViewWidget(gl.GLViewWidget):
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
         self._first_person_application_deactivated = False
-        if (
-            self._first_person_ctrl_interaction_enabled
-            and self.is_first_person_active
-        ):
+        if self._first_person_ctrl_interaction_enabled:
             self._install_first_person_ctrl_event_filter()
-            if (
+            control_pressed = bool(
                 QApplication.keyboardModifiers()
                 & Qt.KeyboardModifier.ControlModifier
-            ):
+            )
+            self._set_control_modifier_pressed(control_pressed)
+            if control_pressed and self.is_first_person_active:
                 self._begin_first_person_ctrl_interaction()
-            else:
+            elif self.is_first_person_active:
                 self._resume_first_person_pointer_capture_if_ready()
 
     def _cancel_face_selection_gesture(self) -> None:
@@ -1557,11 +1609,13 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self._first_person_pointer_release_latched = False
         if self._first_person_ctrl_interaction_enabled:
             self._install_first_person_ctrl_event_filter()
-        self._first_person_ctrl_interaction_active = bool(
+        control_pressed = bool(
             self._first_person_ctrl_interaction_enabled
             and QApplication.keyboardModifiers()
             & Qt.KeyboardModifier.ControlModifier
         )
+        self._set_control_modifier_pressed(control_pressed)
+        self._first_person_ctrl_interaction_active = control_pressed
         self.setFocus(Qt.FocusReason.OtherFocusReason)
         self._sync_view_to_first_person_camera_pose()
         if not self._first_person_ctrl_interaction_active:
@@ -1576,6 +1630,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
 
         if not self.is_first_person_active or self._first_person_pointer_captured:
             return
+        self.primary_pointer_left.emit()
         self._first_person_pointer_release_latched = False
         self._first_person_pointer_captured = True
         self.setFocus(Qt.FocusReason.OtherFocusReason)
@@ -1591,7 +1646,6 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         if not was_first_person_active:
             return
         self.release_first_person_pointer_capture()
-        self._remove_first_person_ctrl_event_filter()
         self._first_person_ctrl_interaction_active = False
         self._first_person_pointer_release_latched = False
         self._navigation_mode = NAVIGATION_MODE_ORBIT
@@ -3606,7 +3660,8 @@ class GlbViewerWidget(QWidget):
         self._refresh_canvas_face_extrusion_gizmo_items()
         self._set_surface_tools_status(
             "Hover to preview a snapped vertex. Click to select or place it; "
-            "each following vertex is connected by an edge."
+            "each following vertex is connected by an edge. Hold Ctrl for "
+            "snapping that grows with camera distance."
         )
         return True
 
@@ -4141,6 +4196,9 @@ class GlbViewerWidget(QWidget):
         )
         self.view.primary_pointer_left.connect(
             self._handle_surface_vertex_pointer_left
+        )
+        self.view.control_modifier_changed.connect(
+            self._handle_surface_vertex_snap_modifier_changed
         )
         self.view.primary_pointer_moved.connect(
             self._handle_canvas_gizmo_pointer_moved
@@ -4813,6 +4871,20 @@ class GlbViewerWidget(QWidget):
         self._surface_vertex_hover_preview = None
         self._remove_surface_vertex_preview_items()
 
+    @Slot(bool)
+    def _handle_surface_vertex_snap_modifier_changed(
+        self,
+        _pressed: bool,
+    ) -> None:
+        """Refresh a stationary Add-vertices preview when Ctrl changes."""
+
+        if not self.is_surface_vertex_placement_active():
+            return
+        local_position = self.view.mapFromGlobal(QCursor.pos())
+        if not self.view.rect().contains(local_position):
+            return
+        self._handle_surface_vertex_pointer_hovered(QPointF(local_position))
+
     def _resolve_surface_vertex_pointer_preview(
         self,
         position: QPointF,
@@ -4846,6 +4918,17 @@ class GlbViewerWidget(QWidget):
         )
         if object_hit is not None and object_hit[2] < hit_distance - 1e-9:
             return None, True
+        snap_sensitivity_multiplier = 1.0
+        if self.view.is_control_modifier_pressed:
+            snap_sensitivity_multiplier = (
+                _get_canvas_surface_ctrl_snap_sensitivity_multiplier(
+                    surface,
+                    hit_point,
+                    visible_surfaces,
+                    tuple(self._canvas_surface_drawing_vertices.values()),
+                    self.view.cameraPosition(),
+                )
+            )
         return (
             _resolve_canvas_surface_vertex_preview(
                 surface,
@@ -4854,6 +4937,7 @@ class GlbViewerWidget(QWidget):
                 tuple(self._canvas_surface_drawing_vertices.values()),
                 self._canvas_surface_drawing_edges,
                 self._active_surface_vertex_id,
+                snap_sensitivity_multiplier=snap_sensitivity_multiplier,
             ),
             False,
         )
@@ -10478,9 +10562,23 @@ def _resolve_canvas_surface_vertex_preview(
     vertices: Sequence[_CanvasSurfaceDrawingVertex],
     edges: Sequence[_CanvasSurfaceDrawingEdge],
     active_vertex_id: str | None,
+    *,
+    snap_sensitivity_multiplier: float = 1.0,
 ) -> _CanvasSurfaceVertexPreview:
     """Resolve direct vertex, edge, and architectural-angle hover snapping."""
 
+    multiplier = float(snap_sensitivity_multiplier)
+    if not math.isfinite(multiplier) or multiplier <= 0.0:
+        raise ValueError(
+            "Snap sensitivity multiplier must be positive and finite."
+        )
+    vertex_snap_distance = (
+        CANVAS_SURFACE_VERTEX_TARGET_SNAP_DISTANCE_METERS * multiplier
+    )
+    edge_snap_distance = CANVAS_SURFACE_EDGE_SNAP_DISTANCE_METERS * multiplier
+    angle_snap_distance = (
+        CANVAS_SURFACE_ANGLE_SNAP_DISTANCE_METERS * multiplier
+    )
     requested = np.asarray(_world_point_tuple(world_point), dtype=float)
     source_surface_id = surface.source_surface_id or surface.surface_id
     plane_normal = _get_fixed_surface_plane_normal(surface)
@@ -10518,68 +10616,168 @@ def _resolve_canvas_surface_vertex_preview(
             plane_normal,
         )
     )
+    source_edges = tuple(
+        edge
+        for edge in edges
+        if edge.source_surface_id == source_surface_id
+        and all(
+            abs(
+                float(
+                    np.dot(
+                        np.asarray(point, dtype=float) - requested,
+                        plane_normal,
+                    )
+                )
+            )
+            <= CANVAS_FACE_COPLANAR_DISTANCE_TOLERANCE_METERS
+            for point in (edge.start_world_point, edge.end_world_point)
+        )
+    )
+    if active is not None:
+        active_point = np.asarray(active.world_point, dtype=float)
+        angle_candidate = _snap_surface_point_from_active_vertex(
+            surface,
+            requested,
+            active_point,
+            coplanar_surfaces,
+            maximum_displacement_meters=angle_snap_distance,
+        )
+        if angle_candidate is not None:
+            direction = angle_candidate - active_point
+            direction /= float(np.linalg.norm(direction))
+            compatible_vertex = (
+                _get_nearest_angle_compatible_surface_vertex_candidate(
+                    requested,
+                    active_point,
+                    direction,
+                    source_vertices,
+                    coplanar_surfaces,
+                    maximum_distance_meters=vertex_snap_distance,
+                )
+            )
+            compatible_edge = (
+                _get_nearest_angle_compatible_surface_edge_candidate(
+                    requested,
+                    angle_candidate,
+                    active_point,
+                    direction,
+                    plane_normal,
+                    source_edges,
+                    coplanar_surfaces,
+                    source_vertices,
+                    maximum_distance_meters=edge_snap_distance,
+                )
+            )
+            if (
+                compatible_vertex is not None
+                and (
+                    compatible_edge is None
+                    or compatible_vertex.distance_meters
+                    <= compatible_edge.distance_meters + 1e-12
+                )
+            ):
+                return _CanvasSurfaceVertexPreview(
+                    surface_id=surface.surface_id,
+                    source_surface_id=source_surface_id,
+                    world_point=compatible_vertex.world_point,
+                    snapped_vertex_id=compatible_vertex.snapped_vertex_id,
+                    snap_kind="angle",
+                    active_vertex_id=connected_vertex_id,
+                )
+            if compatible_edge is not None:
+                return _CanvasSurfaceVertexPreview(
+                    surface_id=surface.surface_id,
+                    source_surface_id=source_surface_id,
+                    world_point=compatible_edge.world_point,
+                    snapped_edge_vertex_ids=(
+                        compatible_edge.snapped_edge_vertex_ids
+                    ),
+                    snap_kind="angle",
+                    active_vertex_id=connected_vertex_id,
+                )
+            return _CanvasSurfaceVertexPreview(
+                surface_id=surface.surface_id,
+                source_surface_id=source_surface_id,
+                world_point=_world_point_tuple(angle_candidate),
+                snap_kind="angle",
+                active_vertex_id=connected_vertex_id,
+            )
+
     direct_vertex = _get_nearest_surface_drawing_vertex(
         requested,
         source_vertices,
+        maximum_distance_meters=vertex_snap_distance,
     )
-    if direct_vertex is not None:
-        return _CanvasSurfaceVertexPreview(
-            surface_id=surface.surface_id,
-            source_surface_id=source_surface_id,
-            world_point=direct_vertex.world_point,
-            snapped_vertex_id=direct_vertex.vertex_id,
-            snap_kind="vertex",
-            active_vertex_id=connected_vertex_id,
-        )
-
     surface_vertex = _get_nearest_fixed_surface_vertex_point(
         requested,
         coplanar_surfaces,
+        maximum_distance_meters=vertex_snap_distance,
     )
+    vertex_candidates: list[
+        tuple[float, int, tuple[float, float, float], str | None]
+    ] = []
+    if direct_vertex is not None:
+        direct_world_point = np.asarray(direct_vertex.world_point, dtype=float)
+        vertex_candidates.append((
+            float(np.linalg.norm(direct_world_point - requested)),
+            0,
+            direct_vertex.world_point,
+            direct_vertex.vertex_id,
+        ))
     if surface_vertex is not None:
-        return _CanvasSurfaceVertexPreview(
-            surface_id=surface.surface_id,
-            source_surface_id=source_surface_id,
-            world_point=_world_point_tuple(surface_vertex),
-            snap_kind="vertex",
-            active_vertex_id=connected_vertex_id,
+        vertex_candidates.append((
+            float(np.linalg.norm(surface_vertex - requested)),
+            1,
+            _world_point_tuple(surface_vertex),
+            None,
+        ))
+    vertex_candidate = (
+        min(
+            vertex_candidates,
+            key=lambda candidate: (
+                round(candidate[0], 12),
+                candidate[1],
+                candidate[2],
+            ),
         )
+        if vertex_candidates
+        else None
+    )
 
     direct_edge = _get_nearest_surface_drawing_edge_point(
         requested,
-        tuple(
-            edge
-            for edge in edges
-            if edge.source_surface_id == source_surface_id
-            and all(
-                abs(
-                    float(
-                        np.dot(
-                            np.asarray(point, dtype=float) - requested,
-                            plane_normal,
-                        )
-                    )
-                )
-                <= CANVAS_FACE_COPLANAR_DISTANCE_TOLERANCE_METERS
-                for point in (edge.start_world_point, edge.end_world_point)
-            )
-        ),
+        source_edges,
+        maximum_distance_meters=edge_snap_distance,
     )
     surface_edge = _get_nearest_fixed_surface_edge_point(
         requested,
         coplanar_surfaces,
         source_vertices,
+        maximum_distance_meters=edge_snap_distance,
     )
     edge_candidates = tuple(
         candidate
         for candidate in (direct_edge, surface_edge)
         if candidate is not None
     )
-    if edge_candidates:
-        edge_candidate = min(
+    edge_candidate = (
+        min(
             edge_candidates,
             key=_surface_edge_snap_sort_key,
         )
+        if edge_candidates
+        else None
+    )
+    if vertex_candidate is not None:
+        return _CanvasSurfaceVertexPreview(
+            surface_id=surface.surface_id,
+            source_surface_id=source_surface_id,
+            world_point=vertex_candidate[2],
+            snapped_vertex_id=vertex_candidate[3],
+            snap_kind="vertex",
+            active_vertex_id=connected_vertex_id,
+        )
+    if edge_candidate is not None:
         return _CanvasSurfaceVertexPreview(
             surface_id=surface.surface_id,
             source_surface_id=source_surface_id,
@@ -10596,6 +10794,7 @@ def _resolve_canvas_surface_vertex_preview(
             surface,
             requested,
             surfaces,
+            maximum_displacement_meters=angle_snap_distance,
         ),
         dtype=float,
     )
@@ -10604,16 +10803,6 @@ def _resolve_canvas_surface_vertex_preview(
         if not np.allclose(resolved, requested, atol=1e-10, rtol=0.0)
         else "surface"
     )
-    if active is not None:
-        angle_candidate = _snap_surface_point_from_active_vertex(
-            surface,
-            requested,
-            np.asarray(active.world_point, dtype=float),
-            coplanar_surfaces,
-        )
-        if angle_candidate is not None:
-            resolved = angle_candidate
-            snap_kind = "angle"
     return _CanvasSurfaceVertexPreview(
         surface_id=surface.surface_id,
         source_surface_id=source_surface_id,
@@ -10623,11 +10812,364 @@ def _resolve_canvas_surface_vertex_preview(
     )
 
 
+def _get_nearest_angle_compatible_surface_vertex_candidate(
+    requested: np.ndarray,
+    ray_origin: np.ndarray,
+    ray_direction: np.ndarray,
+    vertices: Sequence[_CanvasSurfaceDrawingVertex],
+    surfaces: Sequence[FixedSurface],
+    *,
+    maximum_distance_meters: float,
+) -> _CanvasSurfaceVertexSnapCandidate | None:
+    """Return the nearest vertex lying exactly on an active angle guide."""
+
+    candidates: list[_CanvasSurfaceVertexSnapCandidate] = []
+    for vertex in vertices:
+        world_point = np.asarray(vertex.world_point, dtype=float)
+        distance = float(np.linalg.norm(world_point - requested))
+        if (
+            distance > maximum_distance_meters
+            or not _point_is_on_forward_ray(
+                world_point,
+                ray_origin,
+                ray_direction,
+            )
+        ):
+            continue
+        candidates.append(
+            _CanvasSurfaceVertexSnapCandidate(
+                distance_meters=distance,
+                authored_priority=0,
+                world_point=vertex.world_point,
+                snapped_vertex_id=vertex.vertex_id,
+            )
+        )
+    for surface in surfaces:
+        mesh_vertices = np.asarray(surface.mesh.vertices, dtype=float)
+        for vertex_index in np.unique(_get_fixed_surface_snap_edges(surface)):
+            world_point = mesh_vertices[int(vertex_index)]
+            distance = float(np.linalg.norm(world_point - requested))
+            if (
+                distance > maximum_distance_meters
+                or not _point_is_on_forward_ray(
+                    world_point,
+                    ray_origin,
+                    ray_direction,
+                )
+            ):
+                continue
+            candidates.append(
+                _CanvasSurfaceVertexSnapCandidate(
+                    distance_meters=distance,
+                    authored_priority=1,
+                    world_point=_world_point_tuple(world_point),
+                    snapped_vertex_id=None,
+                )
+            )
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda candidate: (
+            round(candidate.distance_meters, 12),
+            candidate.authored_priority,
+            candidate.world_point,
+            candidate.snapped_vertex_id or "",
+        ),
+    )
+
+
+def _get_nearest_angle_compatible_surface_edge_candidate(
+    requested: np.ndarray,
+    angle_point: np.ndarray,
+    ray_origin: np.ndarray,
+    ray_direction: np.ndarray,
+    plane_normal: np.ndarray,
+    edges: Sequence[_CanvasSurfaceDrawingEdge],
+    surfaces: Sequence[FixedSurface],
+    vertices: Sequence[_CanvasSurfaceDrawingVertex],
+    *,
+    maximum_distance_meters: float,
+) -> _CanvasSurfaceEdgeSnapCandidate | None:
+    """Return the nearest edge intersection on an active angle guide."""
+
+    candidates: list[_CanvasSurfaceEdgeSnapCandidate] = []
+    for edge in edges:
+        edge_key = tuple(sorted((edge.start_vertex_id, edge.end_vertex_id)))
+        candidate = _build_angle_compatible_surface_edge_candidate(
+            requested,
+            angle_point,
+            ray_origin,
+            ray_direction,
+            plane_normal,
+            np.asarray(edge.start_world_point, dtype=float),
+            np.asarray(edge.end_world_point, dtype=float),
+            authored_priority=0,
+            edge_key=edge_key,
+            snapped_edge_vertex_ids=edge_key,
+            maximum_distance_meters=maximum_distance_meters,
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+    for surface in surfaces:
+        mesh_vertices = np.asarray(surface.mesh.vertices, dtype=float)
+        for first_index, second_index in _get_fixed_surface_snap_edges(surface):
+            start = mesh_vertices[int(first_index)]
+            end = mesh_vertices[int(second_index)]
+            vertex_ids = _find_surface_drawing_edge_vertex_ids(
+                start,
+                end,
+                vertices,
+            )
+            normalized_vertex_ids = (
+                None if vertex_ids is None else tuple(sorted(vertex_ids))
+            )
+            edge_key = (
+                normalized_vertex_ids
+                if normalized_vertex_ids is not None
+                else _build_world_surface_edge_sort_key(start, end)
+            )
+            candidate = _build_angle_compatible_surface_edge_candidate(
+                requested,
+                angle_point,
+                ray_origin,
+                ray_direction,
+                plane_normal,
+                start,
+                end,
+                authored_priority=1,
+                edge_key=edge_key,
+                snapped_edge_vertex_ids=normalized_vertex_ids,
+                maximum_distance_meters=maximum_distance_meters,
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+    if not candidates:
+        return None
+    return min(candidates, key=_surface_edge_snap_sort_key)
+
+
+def _build_angle_compatible_surface_edge_candidate(
+    requested: np.ndarray,
+    angle_point: np.ndarray,
+    ray_origin: np.ndarray,
+    ray_direction: np.ndarray,
+    plane_normal: np.ndarray,
+    segment_start: np.ndarray,
+    segment_end: np.ndarray,
+    *,
+    authored_priority: int,
+    edge_key: tuple[str, str],
+    snapped_edge_vertex_ids: tuple[str, str] | None,
+    maximum_distance_meters: float,
+) -> _CanvasSurfaceEdgeSnapCandidate | None:
+    """Build one exact ray-edge intersection inside its capture radius."""
+
+    intersection = _intersect_forward_surface_ray_with_segment(
+        ray_origin,
+        ray_direction,
+        plane_normal,
+        segment_start,
+        segment_end,
+        angle_point,
+    )
+    if intersection is None:
+        return None
+    distance = float(np.linalg.norm(intersection - requested))
+    if distance > maximum_distance_meters:
+        return None
+    return _CanvasSurfaceEdgeSnapCandidate(
+        distance_meters=distance,
+        authored_priority=authored_priority,
+        edge_length_meters=float(np.linalg.norm(segment_end - segment_start)),
+        edge_key=edge_key,
+        world_point=_world_point_tuple(intersection),
+        snapped_edge_vertex_ids=snapped_edge_vertex_ids,
+    )
+
+
+def _point_is_on_forward_ray(
+    point: np.ndarray,
+    ray_origin: np.ndarray,
+    ray_direction: np.ndarray,
+) -> bool:
+    """Return whether one point lies exactly on a forward 3D snap ray."""
+
+    delta = point - ray_origin
+    forward_distance = float(np.dot(delta, ray_direction))
+    perpendicular = delta - ray_direction * forward_distance
+    return bool(
+        forward_distance > CANVAS_SURFACE_ANGLE_FEATURE_TOLERANCE_METERS
+        and float(np.linalg.norm(perpendicular))
+        <= CANVAS_SURFACE_ANGLE_FEATURE_TOLERANCE_METERS
+    )
+
+
+def _intersect_forward_surface_ray_with_segment(
+    ray_origin: np.ndarray,
+    ray_direction: np.ndarray,
+    plane_normal: np.ndarray,
+    segment_start: np.ndarray,
+    segment_end: np.ndarray,
+    preferred_point: np.ndarray,
+) -> np.ndarray | None:
+    """Intersect a coplanar forward ray with one finite 3D edge."""
+
+    perpendicular = np.cross(plane_normal, ray_direction)
+    perpendicular_length = float(np.linalg.norm(perpendicular))
+    if perpendicular_length <= 1e-12:
+        return None
+    perpendicular /= perpendicular_length
+    start_delta = segment_start - ray_origin
+    end_delta = segment_end - ray_origin
+    start_along = float(np.dot(start_delta, ray_direction))
+    end_along = float(np.dot(end_delta, ray_direction))
+    start_across = float(np.dot(start_delta, perpendicular))
+    end_across = float(np.dot(end_delta, perpendicular))
+    across_delta = end_across - start_across
+    tolerance = CANVAS_SURFACE_ANGLE_FEATURE_TOLERANCE_METERS
+    if abs(across_delta) > tolerance:
+        ratio = -start_across / across_delta
+        if ratio < -tolerance or ratio > 1.0 + tolerance:
+            return None
+        ratio = float(np.clip(ratio, 0.0, 1.0))
+        forward_distance = start_along + ratio * (end_along - start_along)
+        if forward_distance <= tolerance:
+            return None
+        return ray_origin + ray_direction * forward_distance
+    if abs(start_across) > tolerance or abs(end_across) > tolerance:
+        return None
+    minimum_distance = max(min(start_along, end_along), tolerance)
+    maximum_distance = max(start_along, end_along)
+    if maximum_distance <= tolerance:
+        return None
+    preferred_distance = float(
+        np.dot(preferred_point - ray_origin, ray_direction)
+    )
+    forward_distance = float(
+        np.clip(preferred_distance, minimum_distance, maximum_distance)
+    )
+    return ray_origin + ray_direction * forward_distance
+
+
+def _calculate_canvas_surface_ctrl_snap_sensitivity_multiplier(
+    camera_distance_meters: float,
+) -> float:
+    """Scale held-Ctrl snapping with camera distance, within safe limits."""
+
+    distance = float(camera_distance_meters)
+    if not math.isfinite(distance) or distance < 0.0:
+        raise ValueError("Camera distance must be finite and non-negative.")
+    scaled = (
+        CANVAS_SURFACE_CTRL_SNAP_SENSITIVITY_MULTIPLIER
+        * distance
+        / CANVAS_SURFACE_CTRL_SNAP_REFERENCE_DISTANCE_METERS
+    )
+    return min(
+        CANVAS_SURFACE_CTRL_SNAP_MAX_SENSITIVITY_MULTIPLIER,
+        max(
+            CANVAS_SURFACE_CTRL_SNAP_MIN_SENSITIVITY_MULTIPLIER,
+            scaled,
+        ),
+    )
+
+
+def _get_canvas_surface_ctrl_snap_sensitivity_multiplier(
+    surface: FixedSurface,
+    world_point: object,
+    surfaces: Sequence[FixedSurface],
+    vertices: Sequence[_CanvasSurfaceDrawingVertex],
+    camera_position: object,
+) -> float:
+    """Use the camera distance to the eligible vertex nearest the cursor."""
+
+    requested = np.asarray(_world_point_tuple(world_point), dtype=float)
+    if isinstance(camera_position, QVector3D):
+        camera = np.asarray(
+            (
+                camera_position.x(),
+                camera_position.y(),
+                camera_position.z(),
+            ),
+            dtype=float,
+        )
+    else:
+        camera = np.asarray(camera_position, dtype=float)
+    if camera.shape != (3,) or not np.isfinite(camera).all():
+        return CANVAS_SURFACE_CTRL_SNAP_SENSITIVITY_MULTIPLIER
+
+    source_surface_id = surface.source_surface_id or surface.surface_id
+    plane_normal = _get_fixed_surface_plane_normal(surface)
+    source_vertices = tuple(
+        vertex
+        for vertex in vertices
+        if vertex.source_surface_id == source_surface_id
+        and abs(
+            float(
+                np.dot(
+                    np.asarray(vertex.world_point, dtype=float) - requested,
+                    plane_normal,
+                )
+            )
+        )
+        <= CANVAS_FACE_COPLANAR_DISTANCE_TOLERANCE_METERS
+    )
+    coplanar_surfaces = tuple(
+        candidate
+        for candidate in surfaces
+        if (candidate.source_surface_id or candidate.surface_id)
+        == source_surface_id
+        and _fixed_surface_is_coplanar_with_point(
+            candidate,
+            requested,
+            plane_normal,
+        )
+    )
+    nearest_drawing_vertex = _get_nearest_surface_drawing_vertex(
+        requested,
+        source_vertices,
+        maximum_distance_meters=math.inf,
+    )
+    nearest_fixed_vertex = _get_nearest_fixed_surface_vertex_point(
+        requested,
+        coplanar_surfaces,
+        maximum_distance_meters=math.inf,
+    )
+    candidate_points: list[np.ndarray] = []
+    if nearest_drawing_vertex is not None:
+        candidate_points.append(
+            np.asarray(nearest_drawing_vertex.world_point, dtype=float)
+        )
+    if nearest_fixed_vertex is not None:
+        candidate_points.append(nearest_fixed_vertex)
+    nearest_point = (
+        min(
+            candidate_points,
+            key=lambda point: (
+                round(float(np.linalg.norm(point - requested)), 12),
+                _world_point_tuple(point),
+            ),
+        )
+        if candidate_points
+        else requested
+    )
+    camera_distance = float(np.linalg.norm(nearest_point - camera))
+    if not math.isfinite(camera_distance):
+        return CANVAS_SURFACE_CTRL_SNAP_SENSITIVITY_MULTIPLIER
+    return _calculate_canvas_surface_ctrl_snap_sensitivity_multiplier(
+        camera_distance
+    )
+
+
 def _get_nearest_surface_drawing_vertex(
     point: np.ndarray,
     vertices: Sequence[_CanvasSurfaceDrawingVertex],
+    *,
+    maximum_distance_meters: float = (
+        CANVAS_SURFACE_VERTEX_TARGET_SNAP_DISTANCE_METERS
+    ),
 ) -> _CanvasSurfaceDrawingVertex | None:
-    """Return a vertex within the shared one-centimeter capture tolerance."""
+    """Return a vertex within its slightly wider capture tolerance."""
 
     if not vertices:
         return None
@@ -10641,7 +11183,10 @@ def _get_nearest_surface_drawing_vertex(
         dtype=float,
     )
     nearest_index = int(np.argmin(distances))
-    if distances[nearest_index] > CANVAS_SURFACE_VERTEX_SNAP_DISTANCE_METERS:
+    if (
+        distances[nearest_index]
+        > maximum_distance_meters
+    ):
         return None
     return vertices[nearest_index]
 
@@ -10649,6 +11194,8 @@ def _get_nearest_surface_drawing_vertex(
 def _get_nearest_surface_drawing_edge_point(
     point: np.ndarray,
     edges: Sequence[_CanvasSurfaceDrawingEdge],
+    *,
+    maximum_distance_meters: float = CANVAS_SURFACE_EDGE_SNAP_DISTANCE_METERS,
 ) -> _CanvasSurfaceEdgeSnapCandidate | None:
     """Return the closest point on an authored edge within snap tolerance."""
 
@@ -10669,7 +11216,7 @@ def _get_nearest_surface_drawing_edge_point(
         )
         candidate = start + direction * ratio
         distance = float(np.linalg.norm(candidate - point))
-        if distance > CANVAS_SURFACE_VERTEX_SNAP_DISTANCE_METERS:
+        if distance > maximum_distance_meters:
             continue
         edge_key = tuple(sorted(
             (edge.start_vertex_id, edge.end_vertex_id)
@@ -10692,6 +11239,10 @@ def _get_nearest_surface_drawing_edge_point(
 def _get_nearest_fixed_surface_vertex_point(
     point: np.ndarray,
     surfaces: Sequence[FixedSurface],
+    *,
+    maximum_distance_meters: float = (
+        CANVAS_SURFACE_VERTEX_TARGET_SNAP_DISTANCE_METERS
+    ),
 ) -> np.ndarray | None:
     """Snap to source geometry vertices before persistent IDs exist."""
 
@@ -10708,7 +11259,10 @@ def _get_nearest_fixed_surface_vertex_point(
         dtype=float,
     )
     nearest_index = int(np.argmin(distances))
-    if distances[nearest_index] > CANVAS_SURFACE_VERTEX_SNAP_DISTANCE_METERS:
+    if (
+        distances[nearest_index]
+        > maximum_distance_meters
+    ):
         return None
     return candidates[nearest_index]
 
@@ -10734,6 +11288,8 @@ def _get_nearest_fixed_surface_edge_point(
     point: np.ndarray,
     surfaces: Sequence[FixedSurface],
     vertices: Sequence[_CanvasSurfaceDrawingVertex],
+    *,
+    maximum_distance_meters: float = CANVAS_SURFACE_EDGE_SNAP_DISTANCE_METERS,
 ) -> _CanvasSurfaceEdgeSnapCandidate | None:
     """Snap to current logical-face edges, including undeclared boundaries."""
 
@@ -10756,7 +11312,7 @@ def _get_nearest_fixed_surface_edge_point(
                 start,
                 end,
             )
-            if distance > CANVAS_SURFACE_VERTEX_SNAP_DISTANCE_METERS:
+            if distance > maximum_distance_meters:
                 continue
             vertex_ids = _find_surface_drawing_edge_vertex_ids(
                 start,
@@ -10889,6 +11445,10 @@ def _snap_surface_point_from_active_vertex(
     point: np.ndarray,
     active_point: np.ndarray,
     coplanar_surfaces: Sequence[FixedSurface],
+    *,
+    maximum_displacement_meters: float = (
+        CANVAS_SURFACE_ANGLE_SNAP_DISTANCE_METERS
+    ),
 ) -> np.ndarray | None:
     """Snap a prospective edge to 45-degree increments from its active end."""
 
@@ -10896,7 +11456,7 @@ def _snap_surface_point_from_active_vertex(
     projected_delta = point - active_point
     projected_delta -= normal * float(np.dot(projected_delta, normal))
     distance = float(np.linalg.norm(projected_delta))
-    if distance <= 1e-12 or distance > 2.0:
+    if distance <= 1e-12:
         return None
     vertical = np.asarray((0.0, 0.0, 1.0), dtype=float)
     if abs(float(np.dot(normal, vertical))) < 0.5:
@@ -10923,11 +11483,20 @@ def _snap_surface_point_from_active_vertex(
         angle = math.radians(angle_index * 45.0)
         ray = np.asarray((math.cos(angle), math.sin(angle)), dtype=float)
         ray_distance = float(np.dot(local_delta, ray))
+        if ray_distance <= 1e-12:
+            continue
+        cosine = float(np.clip(ray_distance / distance, -1.0, 1.0))
+        angle_deviation_degrees = math.degrees(math.acos(cosine))
+        if (
+            angle_deviation_degrees
+            > CANVAS_SURFACE_ANGLE_SNAP_MAX_DEVIATION_DEGREES
+        ):
+            continue
         candidate = active_point + ray_distance * (
             ray[0] * u_axis + ray[1] * v_axis
         )
         displacement = float(np.linalg.norm(candidate - point))
-        if displacement > CANVAS_SURFACE_VERTEX_SNAP_DISTANCE_METERS:
+        if displacement > maximum_displacement_meters:
             continue
         if not _point_is_covered_by_fixed_surfaces(
             candidate,
@@ -11004,6 +11573,10 @@ def _resolve_surface_vertex_preview_world_point(
     surface: FixedSurface,
     world_point: object,
     surfaces: Sequence[FixedSurface],
+    *,
+    maximum_displacement_meters: float = (
+        CANVAS_SURFACE_ANGLE_SNAP_DISTANCE_METERS
+    ),
 ) -> tuple[float, float, float]:
     """Resolve optional domain snapping for the insertion hover marker."""
 
@@ -11017,6 +11590,7 @@ def _resolve_surface_vertex_preview_world_point(
                 tuple(surfaces),
                 surface.surface_id,
                 _world_point_tuple(world_point),
+                maximum_displacement_meters=maximum_displacement_meters,
             )
         )
     except (ImportError, TypeError, ValueError):

@@ -1455,6 +1455,73 @@ class FirstPersonNavigationTests(unittest.TestCase):
         self.assertFalse(self.view.is_first_person_ctrl_interaction_active)
         self.assertTrue(self.view.is_first_person_pointer_captured)
 
+    def test_canvas_ctrl_filter_tracks_orbit_child_events_without_consuming(
+        self,
+    ) -> None:
+        panel_button = QPushButton(self.view)
+        self.view.set_first_person_ctrl_interaction_enabled(True)
+        changed = QSignalSpy(self.view.control_modifier_changed)
+        press = QKeyEvent(
+            QKeyEvent.Type.KeyPress,
+            Qt.Key.Key_Control,
+            Qt.KeyboardModifier.ControlModifier,
+        )
+        press.ignore()
+
+        self.assertFalse(self.view.eventFilter(panel_button, press))
+
+        self.assertTrue(self.view.is_control_modifier_pressed)
+        self.assertFalse(self.view.is_first_person_ctrl_interaction_active)
+        self.assertFalse(press.isAccepted())
+        self.assertEqual(changed.count(), 1)
+        self.assertEqual(changed.at(0), [True])
+
+        release = QKeyEvent(
+            QKeyEvent.Type.KeyRelease,
+            Qt.Key.Key_Control,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        release.ignore()
+
+        self.assertFalse(self.view.eventFilter(panel_button, release))
+
+        self.assertFalse(self.view.is_control_modifier_pressed)
+        self.assertFalse(release.isAccepted())
+        self.assertEqual(changed.count(), 2)
+        self.assertEqual(changed.at(1), [False])
+
+    def test_canvas_ctrl_filter_consumes_first_person_child_events(self) -> None:
+        panel_button = QPushButton(self.view)
+        self.view.set_first_person_ctrl_interaction_enabled(True)
+        self.view.enter_first_person_mode()
+        press = QKeyEvent(
+            QKeyEvent.Type.KeyPress,
+            Qt.Key.Key_Control,
+            Qt.KeyboardModifier.ControlModifier,
+        )
+        press.ignore()
+
+        self.assertTrue(self.view.eventFilter(panel_button, press))
+
+        self.assertTrue(press.isAccepted())
+        self.assertTrue(self.view.is_control_modifier_pressed)
+        self.assertTrue(self.view.is_first_person_ctrl_interaction_active)
+        self.assertFalse(self.view.is_first_person_pointer_captured)
+
+        release = QKeyEvent(
+            QKeyEvent.Type.KeyRelease,
+            Qt.Key.Key_Control,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        release.ignore()
+
+        self.assertTrue(self.view.eventFilter(panel_button, release))
+
+        self.assertTrue(release.isAccepted())
+        self.assertFalse(self.view.is_control_modifier_pressed)
+        self.assertFalse(self.view.is_first_person_ctrl_interaction_active)
+        self.assertTrue(self.view.is_first_person_pointer_captured)
+
     def test_canvas_right_click_persistently_frees_the_pointer(self) -> None:
         panel_button = QPushButton(self.view)
         self.view.set_first_person_ctrl_interaction_enabled(True)

@@ -49,10 +49,13 @@ SURFACE_EDIT_EPSILON_METERS = 1e-7
 SURFACE_EDIT_PLANAR_TOLERANCE_METERS = 1e-5
 SURFACE_EDIT_NORMAL_DOT_TOLERANCE = 1.0 - 1e-6
 # Candidate rays use architectural 45-degree increments. Nearby vertices only
-# influence a point within 2 m, and every snap type uses the same 1 cm capture
-# tolerance.
+# influence a point within 2 m. Vertices have a slightly wider capture range
+# than edges, and angle guides use the widest range.
 SURFACE_VERTEX_SNAP_ANGLE_DEGREES = 45.0
-SURFACE_VERTEX_SNAP_MAX_DISPLACEMENT_METERS = 0.01
+SURFACE_VERTEX_SNAP_VERTEX_MAX_DISPLACEMENT_METERS = 0.015
+SURFACE_VERTEX_SNAP_EDGE_MAX_DISPLACEMENT_METERS = 0.01
+SURFACE_VERTEX_SNAP_ANGLE_MAX_DISPLACEMENT_METERS = 0.02
+SURFACE_VERTEX_SNAP_MAX_ANGLE_DEVIATION_DEGREES = 1.0
 SURFACE_VERTEX_SNAP_NEARBY_RADIUS_METERS = 2.0
 SURFACE_SIDE_HORIZONTAL_NORMAL_THRESHOLD = math.sqrt(0.5)
 LOCAL_COORDINATE_KEY_DECIMALS = 10
@@ -260,6 +263,17 @@ class _InsertionContext:
         )
 
 
+@dataclass(frozen=True)
+class _SurfaceAngleSnapCandidate:
+    """One exact architectural ray selected from a raw surface point."""
+
+    sort_key: tuple[object, ...]
+    reference_point_2d: np.ndarray
+    ray_direction_2d: np.ndarray
+    point_2d: np.ndarray
+    world_point: np.ndarray
+
+
 # ### Stable surface identity helpers ###
 def build_editable_surface_id(
     level_index: int,
@@ -295,9 +309,21 @@ def snap_surface_vertex_world_point(
     surfaces: Sequence[FixedSurface],
     surface_id: str,
     world_point: Sequence[float],
+    *,
+    maximum_displacement_meters: float = (
+        SURFACE_VERTEX_SNAP_ANGLE_MAX_DISPLACEMENT_METERS
+    ),
 ) -> tuple[float, float, float]:
     """Apply insertion projection and 45-degree snapping to current surfaces."""
 
+    normalized_maximum_displacement = float(maximum_displacement_meters)
+    if (
+        not math.isfinite(normalized_maximum_displacement)
+        or normalized_maximum_displacement <= 0.0
+    ):
+        raise ValueError(
+            "Surface angle snap displacement must be positive and finite."
+        )
     surface_sequence = tuple(surfaces)
     if not all(isinstance(surface, FixedSurface) for surface in surface_sequence):
         raise TypeError("Surface vertex snapping requires FixedSurface values.")
@@ -330,6 +356,7 @@ def snap_surface_vertex_world_point(
         target_points,
         nearby_points,
         frame,
+        maximum_displacement_meters=normalized_maximum_displacement,
     )
     return tuple(float(value) for value in resolved)
 
@@ -1167,26 +1194,23 @@ def _resolve_context_vertex_preview(
         if abs(float(np.dot(vertex_world - origin, normal)))
         <= SURFACE_EDIT_PLANAR_TOLERANCE_METERS
     )
-    direct_vertex_candidates = sorted(
+    direct_vertex_candidates = tuple(
         (
-            round(float(np.linalg.norm(world_vertices[vertex_id] - projected)), 12),
+            float(np.linalg.norm(world_vertices[vertex_id] - projected)),
             vertex_id,
         )
         for vertex_id in coplanar_vertex_ids
         if float(np.linalg.norm(world_vertices[vertex_id] - projected))
-        <= SURFACE_VERTEX_SNAP_MAX_DISPLACEMENT_METERS
+        <= SURFACE_VERTEX_SNAP_VERTEX_MAX_DISPLACEMENT_METERS
     )
-    if direct_vertex_candidates:
-        _distance, vertex_id = direct_vertex_candidates[0]
-        return SurfaceVertexPreview(
-            surface_id=context.target_face_surface_id,
-            source_surface_id=context.source_surface.surface_id,
-            world_point=tuple(
-                float(component) for component in world_vertices[vertex_id]
-            ),
-            snapped_vertex_id=vertex_id,
-            snap_kind=SURFACE_VERTEX_SNAP_KIND_VERTEX,
+    vertex_candidate = (
+        min(
+            direct_vertex_candidates,
+            key=lambda candidate: (round(candidate[0], 12), candidate[1]),
         )
+        if direct_vertex_candidates
+        else None
+    )
 
     face_edge_counts: dict[tuple[str, str], int] = defaultdict(int)
     for face, _polygon in face_entries:
@@ -1204,6 +1228,9 @@ def _resolve_context_vertex_preview(
         and edge.end_vertex_id in coplanar_vertex_ids
     }
     edge_keys.update(authored_edge_keys)
+    edge_entries: list[
+        tuple[tuple[str, str], np.ndarray, np.ndarray, int, float]
+    ] = []
     edge_candidates: list[
         tuple[float, int, float, tuple[str, str], np.ndarray]
     ] = []
@@ -1223,29 +1250,31 @@ def _resolve_context_vertex_preview(
         line = LineString((first_2d, second_2d))
         if line.length <= SURFACE_EDIT_EPSILON_METERS:
             continue
+        authored_priority = 0 if edge_key in authored_edge_keys else 1
+        edge_entries.append((
+            edge_key,
+            first_2d,
+            second_2d,
+            authored_priority,
+            float(line.length),
+        ))
         snapped_2d = np.asarray(
             line.interpolate(line.project(requested_point)).coords[0],
             dtype=float,
         )
         displacement = float(np.linalg.norm(snapped_2d - projected_2d))
-        if displacement > SURFACE_VERTEX_SNAP_MAX_DISPLACEMENT_METERS:
+        if displacement > SURFACE_VERTEX_SNAP_EDGE_MAX_DISPLACEMENT_METERS:
             continue
         snapped_world = origin + basis_u * snapped_2d[0] + basis_v * snapped_2d[1]
         edge_candidates.append((
             displacement,
-            0 if edge_key in authored_edge_keys else 1,
+            authored_priority,
             float(line.length),
             edge_key,
             snapped_world,
         ))
-    if edge_candidates:
-        (
-            _distance,
-            _authored_priority,
-            _edge_length,
-            edge_key,
-            snapped_world,
-        ) = min(
+    edge_candidate = (
+        min(
             edge_candidates,
             key=lambda candidate: (
                 round(candidate[0], 12),
@@ -1254,23 +1283,19 @@ def _resolve_context_vertex_preview(
                 candidate[3],
             ),
         )
-        return SurfaceVertexPreview(
-            surface_id=context.target_face_surface_id,
-            source_surface_id=context.source_surface.surface_id,
-            world_point=tuple(float(component) for component in snapped_world),
-            snapped_edge_vertex_ids=edge_key,
-            snap_kind=SURFACE_VERTEX_SNAP_KIND_EDGE,
-        )
+        if edge_candidates
+        else None
+    )
 
     reference_ids = list(coplanar_vertex_ids)
     if active_vertex_id in reference_ids:
-        reference_ids.remove(active_vertex_id)
-        reference_ids.insert(0, active_vertex_id)
-    angle_candidates: list[tuple[tuple[object, ...], np.ndarray]] = []
+        reference_ids = [active_vertex_id]
+    angle_candidates: list[_SurfaceAngleSnapCandidate] = []
     for reference_index, vertex_id in enumerate(reference_ids):
         vertex_world = world_vertices[vertex_id]
         if (
-            float(np.linalg.norm(vertex_world - projected))
+            vertex_id != active_vertex_id
+            and float(np.linalg.norm(vertex_world - projected))
             > SURFACE_VERTEX_SNAP_NEARBY_RADIUS_METERS
         ):
             continue
@@ -1284,10 +1309,18 @@ def _resolve_context_vertex_preview(
         for angle_index in range(8):
             angle = math.radians(angle_index * SURFACE_VERTEX_SNAP_ANGLE_DEGREES)
             ray = np.asarray((math.cos(angle), math.sin(angle)), dtype=float)
-            ray_distance = float(np.dot(raw_delta, ray))
+            ray_projection = _get_forward_snap_ray_projection(raw_delta, ray)
+            if ray_projection is None:
+                continue
+            ray_distance, angle_deviation_degrees = ray_projection
+            if (
+                angle_deviation_degrees
+                > SURFACE_VERTEX_SNAP_MAX_ANGLE_DEVIATION_DEGREES
+            ):
+                continue
             candidate_2d = vertex_2d + ray * ray_distance
             displacement = float(np.linalg.norm(candidate_2d - projected_2d))
-            if displacement > SURFACE_VERTEX_SNAP_MAX_DISPLACEMENT_METERS:
+            if displacement > SURFACE_VERTEX_SNAP_ANGLE_MAX_DISPLACEMENT_METERS:
                 continue
             candidate_point = Point(
                 float(candidate_2d[0]),
@@ -1299,31 +1332,251 @@ def _resolve_context_vertex_preview(
                 origin + basis_u * candidate_2d[0] + basis_v * candidate_2d[1]
             )
             angle_candidates.append(
-                (
-                    (
+                _SurfaceAngleSnapCandidate(
+                    sort_key=(
                         0 if vertex_id == active_vertex_id else 1,
                         round(displacement, 12),
                         reference_index,
                         angle_index,
                         vertex_id,
                     ),
-                    candidate_world,
+                    reference_point_2d=vertex_2d,
+                    ray_direction_2d=ray,
+                    point_2d=candidate_2d,
+                    world_point=candidate_world,
                 )
             )
-    resolved_world = projected
-    snap_kind = SURFACE_VERTEX_SNAP_KIND_SURFACE
-    if angle_candidates:
-        _key, resolved_world = min(
+
+    active_angle_is_available = bool(
+        active_vertex_id in coplanar_vertex_ids and angle_candidates
+    )
+    if active_angle_is_available:
+        angle_candidate = min(
             angle_candidates,
-            key=lambda candidate: candidate[0],
+            key=lambda candidate: candidate.sort_key,
         )
-        snap_kind = SURFACE_VERTEX_SNAP_KIND_ANGLE
+        compatible_targets: list[
+            tuple[tuple[object, ...], SurfaceVertexPreview]
+        ] = []
+        for distance, vertex_id in direct_vertex_candidates:
+            vertex_2d = _project_point_to_basis(
+                world_vertices[vertex_id],
+                origin,
+                basis_u,
+                basis_v,
+            )
+            if not _point_is_on_forward_snap_ray(
+                vertex_2d,
+                angle_candidate.reference_point_2d,
+                angle_candidate.ray_direction_2d,
+            ):
+                continue
+            compatible_targets.append((
+                (round(distance, 12), 0, vertex_id),
+                SurfaceVertexPreview(
+                    surface_id=context.target_face_surface_id,
+                    source_surface_id=context.source_surface.surface_id,
+                    world_point=tuple(
+                        float(component)
+                        for component in world_vertices[vertex_id]
+                    ),
+                    snapped_vertex_id=vertex_id,
+                    snap_kind=SURFACE_VERTEX_SNAP_KIND_ANGLE,
+                ),
+            ))
+        for (
+            edge_key,
+            first_2d,
+            second_2d,
+            authored_priority,
+            edge_length,
+        ) in edge_entries:
+            intersection_2d = _intersect_forward_snap_ray_with_segment(
+                angle_candidate.reference_point_2d,
+                angle_candidate.ray_direction_2d,
+                first_2d,
+                second_2d,
+                angle_candidate.point_2d,
+            )
+            if intersection_2d is None:
+                continue
+            distance = float(np.linalg.norm(intersection_2d - projected_2d))
+            if distance > SURFACE_VERTEX_SNAP_EDGE_MAX_DISPLACEMENT_METERS:
+                continue
+            intersection_point = Point(
+                float(intersection_2d[0]),
+                float(intersection_2d[1]),
+            )
+            if not region.buffer(SURFACE_EDIT_EPSILON_METERS).covers(
+                intersection_point
+            ):
+                continue
+            intersection_world = (
+                origin
+                + basis_u * intersection_2d[0]
+                + basis_v * intersection_2d[1]
+            )
+            compatible_targets.append((
+                (
+                    round(distance, 12),
+                    1,
+                    authored_priority,
+                    round(edge_length, 12),
+                    edge_key,
+                ),
+                SurfaceVertexPreview(
+                    surface_id=context.target_face_surface_id,
+                    source_surface_id=context.source_surface.surface_id,
+                    world_point=tuple(
+                        float(component) for component in intersection_world
+                    ),
+                    snapped_edge_vertex_ids=edge_key,
+                    snap_kind=SURFACE_VERTEX_SNAP_KIND_ANGLE,
+                ),
+            ))
+        if compatible_targets:
+            return min(
+                compatible_targets,
+                key=lambda candidate: candidate[0],
+            )[1]
+        return SurfaceVertexPreview(
+            surface_id=context.target_face_surface_id,
+            source_surface_id=context.source_surface.surface_id,
+            world_point=tuple(
+                float(component) for component in angle_candidate.world_point
+            ),
+            snap_kind=SURFACE_VERTEX_SNAP_KIND_ANGLE,
+        )
+
+    if vertex_candidate is not None:
+        _distance, vertex_id = vertex_candidate
+        return SurfaceVertexPreview(
+            surface_id=context.target_face_surface_id,
+            source_surface_id=context.source_surface.surface_id,
+            world_point=tuple(
+                float(component) for component in world_vertices[vertex_id]
+            ),
+            snapped_vertex_id=vertex_id,
+            snap_kind=SURFACE_VERTEX_SNAP_KIND_VERTEX,
+        )
+    if edge_candidate is not None:
+        (
+            _distance,
+            _authored_priority,
+            _edge_length,
+            edge_key,
+            snapped_world,
+        ) = edge_candidate
+        return SurfaceVertexPreview(
+            surface_id=context.target_face_surface_id,
+            source_surface_id=context.source_surface.surface_id,
+            world_point=tuple(float(component) for component in snapped_world),
+            snapped_edge_vertex_ids=edge_key,
+            snap_kind=SURFACE_VERTEX_SNAP_KIND_EDGE,
+        )
+
+    if angle_candidates:
+        angle_candidate = min(
+            angle_candidates,
+            key=lambda candidate: candidate.sort_key,
+        )
+        return SurfaceVertexPreview(
+            surface_id=context.target_face_surface_id,
+            source_surface_id=context.source_surface.surface_id,
+            world_point=tuple(
+                float(component) for component in angle_candidate.world_point
+            ),
+            snap_kind=SURFACE_VERTEX_SNAP_KIND_ANGLE,
+        )
+
     return SurfaceVertexPreview(
         surface_id=context.target_face_surface_id,
         source_surface_id=context.source_surface.surface_id,
-        world_point=tuple(float(component) for component in resolved_world),
-        snap_kind=snap_kind,
+        world_point=tuple(float(component) for component in projected),
+        snap_kind=SURFACE_VERTEX_SNAP_KIND_SURFACE,
     )
+
+
+def _point_is_on_forward_snap_ray(
+    point: np.ndarray,
+    ray_origin: np.ndarray,
+    ray_direction: np.ndarray,
+) -> bool:
+    """Return whether a point lies numerically on one forward snap ray."""
+
+    delta = point - ray_origin
+    forward_distance = float(np.dot(delta, ray_direction))
+    perpendicular_distance = abs(_cross_2d(delta, ray_direction))
+    return bool(
+        forward_distance > SURFACE_EDIT_EPSILON_METERS
+        and perpendicular_distance <= SURFACE_EDIT_PLANAR_TOLERANCE_METERS
+    )
+
+
+def _intersect_forward_snap_ray_with_segment(
+    ray_origin: np.ndarray,
+    ray_direction: np.ndarray,
+    segment_start: np.ndarray,
+    segment_end: np.ndarray,
+    preferred_point: np.ndarray,
+) -> np.ndarray | None:
+    """Intersect one exact forward snap ray with a finite surface edge."""
+
+    edge_direction = segment_end - segment_start
+    edge_length = float(np.linalg.norm(edge_direction))
+    if edge_length <= SURFACE_EDIT_EPSILON_METERS:
+        return None
+    offset = segment_start - ray_origin
+    denominator = _cross_2d(ray_direction, edge_direction)
+    parallel_tolerance = SURFACE_EDIT_EPSILON_METERS * max(1.0, edge_length)
+    if abs(denominator) > parallel_tolerance:
+        ray_distance = _cross_2d(offset, edge_direction) / denominator
+        edge_ratio = _cross_2d(offset, ray_direction) / denominator
+        if (
+            ray_distance <= SURFACE_EDIT_EPSILON_METERS
+            or edge_ratio < -SURFACE_EDIT_EPSILON_METERS
+            or edge_ratio > 1.0 + SURFACE_EDIT_EPSILON_METERS
+        ):
+            return None
+        clamped_ratio = float(np.clip(edge_ratio, 0.0, 1.0))
+        ray_point = ray_origin + ray_direction * ray_distance
+        edge_point = segment_start + edge_direction * clamped_ratio
+        if (
+            float(np.linalg.norm(ray_point - edge_point))
+            > SURFACE_EDIT_PLANAR_TOLERANCE_METERS
+        ):
+            return None
+        return ray_point
+
+    if (
+        abs(_cross_2d(offset, ray_direction))
+        > SURFACE_EDIT_PLANAR_TOLERANCE_METERS
+    ):
+        return None
+    endpoint_distances = (
+        float(np.dot(segment_start - ray_origin, ray_direction)),
+        float(np.dot(segment_end - ray_origin, ray_direction)),
+    )
+    minimum_distance = max(
+        min(endpoint_distances),
+        SURFACE_EDIT_EPSILON_METERS,
+    )
+    maximum_distance = max(endpoint_distances)
+    if maximum_distance <= SURFACE_EDIT_EPSILON_METERS:
+        return None
+    preferred_distance = float(
+        np.dot(preferred_point - ray_origin, ray_direction)
+    )
+    ray_distance = float(
+        np.clip(preferred_distance, minimum_distance, maximum_distance)
+    )
+    return ray_origin + ray_direction * ray_distance
+
+
+def _cross_2d(first: np.ndarray, second: np.ndarray) -> float:
+    """Return the scalar cross product of two 2D vectors."""
+
+    return float(first[0] * second[1] - first[1] * second[0])
 
 
 def _place_preview_vertex(
@@ -3352,11 +3605,31 @@ def _validate_resolved_insertion_point(
         raise ValueError("A new surface vertex must be strictly inside one face.")
 
 
+def _get_forward_snap_ray_projection(
+    delta: np.ndarray,
+    ray: np.ndarray,
+) -> tuple[float, float] | None:
+    """Return forward distance and angular error for one snap ray."""
+
+    delta_length = float(np.linalg.norm(delta))
+    if delta_length <= SURFACE_EDIT_EPSILON_METERS:
+        return None
+    ray_distance = float(np.dot(delta, ray))
+    if ray_distance <= SURFACE_EDIT_EPSILON_METERS:
+        return None
+    cosine = float(np.clip(ray_distance / delta_length, -1.0, 1.0))
+    return ray_distance, math.degrees(math.acos(cosine))
+
+
 def _snap_point_in_polygon(
     world_point: Sequence[float],
     face_points: np.ndarray,
     nearby_world_points: np.ndarray,
     frame: _SurfaceFrame,
+    *,
+    maximum_displacement_meters: float = (
+        SURFACE_VERTEX_SNAP_ANGLE_MAX_DISPLACEMENT_METERS
+    ),
 ) -> np.ndarray:
     normal = _get_polygon_normal(face_points)
     requested = np.asarray(world_point, dtype=float)
@@ -3403,10 +3676,18 @@ def _snap_point_in_polygon(
         for angle_index in range(8):
             angle = math.radians(angle_index * SURFACE_VERTEX_SNAP_ANGLE_DEGREES)
             ray = np.asarray((math.cos(angle), math.sin(angle)), dtype=float)
-            ray_distance = float(np.dot(raw_delta, ray))
+            ray_projection = _get_forward_snap_ray_projection(raw_delta, ray)
+            if ray_projection is None:
+                continue
+            ray_distance, angle_deviation_degrees = ray_projection
+            if (
+                angle_deviation_degrees
+                > SURFACE_VERTEX_SNAP_MAX_ANGLE_DEVIATION_DEGREES
+            ):
+                continue
             candidate_2d = vertex_2d + ray * ray_distance
             displacement = float(np.linalg.norm(candidate_2d - raw_2d))
-            if displacement > SURFACE_VERTEX_SNAP_MAX_DISPLACEMENT_METERS:
+            if displacement > maximum_displacement_meters:
                 continue
             if (
                 float(np.linalg.norm(candidate_2d - vertex_2d))
