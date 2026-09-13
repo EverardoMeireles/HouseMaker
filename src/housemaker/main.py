@@ -649,6 +649,7 @@ class _CanvasTopologyUndoState:
     assignment_target_ids: tuple[str, ...]
     selected_object_id: str | None
     active_vertex_id: str | None
+    selected_object_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -719,6 +720,8 @@ class _CanvasPlacedObjectUndoState:
     placement: GeneratedObjectPlacement | None
     atlas_placements: tuple[tuple[str, TextureAtlasPlacement], ...] = ()
     restore_atlas_bindings: bool = False
+    selected_object_ids: tuple[str, ...] | None = None
+    active_object_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -933,6 +936,7 @@ class BlueprintWorkspace(QWidget):
         self._selected_atlas_surface_source_id: str | None = None
         self._is_syncing_canvas_scene_selection = False
         self._desired_canvas_object_id: str | None = None
+        self._desired_canvas_object_ids: tuple[str, ...] = ()
         self._desired_canvas_surface_ids: tuple[str, ...] = ()
         self._active_canvas_surface_drawing_vertex_id: str | None = None
         self._last_automatic_atlas_assignment_key: tuple[object, ...] | None = None
@@ -1406,6 +1410,9 @@ class BlueprintWorkspace(QWidget):
         )
         self.viewer.placed_object_selection_changed.connect(
             self._handle_canvas_placed_object_selection_changed
+        )
+        self.viewer.placed_object_selection_set_changed.connect(
+            self._handle_canvas_placed_object_selection_set_changed
         )
         self.viewer.canvas_surface_selection_changed.connect(
             self._handle_canvas_surface_selection_changed
@@ -2333,6 +2340,7 @@ class BlueprintWorkspace(QWidget):
         )
         if reference is not None:
             self._desired_canvas_object_id = None
+            self._desired_canvas_object_ids = ()
             self._desired_canvas_surface_ids = ()
             self._atlas_surface_assignment_target_ids = ()
         doorway_index: int | None = None
@@ -2634,6 +2642,7 @@ class BlueprintWorkspace(QWidget):
         self._atlas_surface_assignment_target_ids = surface_ids
         if surface_ids:
             self._desired_canvas_object_id = None
+            self._desired_canvas_object_ids = ()
         active_surface_id = surface_ids[-1] if surface_ids else None
         self._sync_selected_canvas_wall_highlight(active_surface_id)
         self._commit_pending_wall_vertex_update()
@@ -2849,6 +2858,15 @@ class BlueprintWorkspace(QWidget):
             assignment_target_ids=self._atlas_surface_assignment_target_ids,
             selected_object_id=self._desired_canvas_object_id,
             active_vertex_id=self._active_canvas_surface_drawing_vertex_id,
+            selected_object_ids=getattr(
+                self,
+                "_desired_canvas_object_ids",
+                (
+                    (self._desired_canvas_object_id,)
+                    if self._desired_canvas_object_id is not None
+                    else ()
+                ),
+            ),
         )
 
     def _finalize_canvas_topology_undo_state(
@@ -3111,9 +3129,29 @@ class BlueprintWorkspace(QWidget):
                     )
                 )
             )
-        self._desired_canvas_object_id = (
-            state.object_id if state.placement is not None else None
-        )
+        if state.selected_object_ids is None:
+            selected_object_ids = (
+                (state.object_id,) if state.placement is not None else ()
+            )
+            active_object_id = state.object_id if selected_object_ids else None
+        else:
+            selected_object_ids = tuple(
+                dict.fromkeys(
+                    object_id
+                    for object_id in state.selected_object_ids
+                    if self.generation.get_generated_object_placement(object_id)
+                    is not None
+                )
+            )
+            active_object_id = (
+                state.active_object_id
+                if state.active_object_id in selected_object_ids
+                else (
+                    selected_object_ids[-1] if selected_object_ids else None
+                )
+            )
+        self._desired_canvas_object_ids = selected_object_ids
+        self._desired_canvas_object_id = active_object_id
         self._desired_canvas_surface_ids = ()
         self._schedule_viewer_preview_refresh(preserve_camera=True)
         return skipped_atlas_placements
@@ -3276,6 +3314,14 @@ class BlueprintWorkspace(QWidget):
         self._desired_canvas_surface_ids = state.selected_surface_ids
         self._atlas_surface_assignment_target_ids = state.assignment_target_ids
         self._desired_canvas_object_id = state.selected_object_id
+        self._desired_canvas_object_ids = (
+            state.selected_object_ids
+            or (
+                (state.selected_object_id,)
+                if state.selected_object_id is not None
+                else ()
+            )
+        )
         self._active_canvas_surface_drawing_vertex_id = state.active_vertex_id
         expected_by_id = {
             assignment.assignment_id: assignment
@@ -3536,6 +3582,11 @@ class BlueprintWorkspace(QWidget):
         previous_surface_ids = self._desired_canvas_surface_ids
         previous_assignment_target_ids = self._atlas_surface_assignment_target_ids
         previous_object_id = self._desired_canvas_object_id
+        previous_object_ids = getattr(
+            self,
+            "_desired_canvas_object_ids",
+            ((previous_object_id,) if previous_object_id is not None else ()),
+        )
         previous_active_vertex_id = self._active_canvas_surface_drawing_vertex_id
         result: SurfaceTopologyEditResult | None = None
         try:
@@ -3546,6 +3597,7 @@ class BlueprintWorkspace(QWidget):
             self._atlas_surface_assignment_target_ids = selected_surface_ids
             if selected_surface_ids:
                 self._desired_canvas_object_id = None
+                self._desired_canvas_object_ids = ()
             self._active_canvas_surface_drawing_vertex_id = result.active_vertex_id
             if result.requires_mesh_refresh:
                 self.surface_texture_generation.remap_assignments_with_surface_lineage(
@@ -3558,6 +3610,7 @@ class BlueprintWorkspace(QWidget):
             self._desired_canvas_surface_ids = previous_surface_ids
             self._atlas_surface_assignment_target_ids = previous_assignment_target_ids
             self._desired_canvas_object_id = previous_object_id
+            self._desired_canvas_object_ids = previous_object_ids
             self._active_canvas_surface_drawing_vertex_id = previous_active_vertex_id
             self._sync_canvas_surface_drawing_overlay()
             self.viewer.set_surface_tools_status(f"Surface edit stopped: {error}")
@@ -4190,31 +4243,145 @@ class BlueprintWorkspace(QWidget):
             )
         self._canvas_surface_mesh_update_timer.start()
 
+    # ### Canvas scene selection synchronization ###
     def _handle_canvas_placed_object_selection_changed(
         self,
         raw_object_id: object,
     ) -> None:
-        """Remember manual Canvas object selection across preview rebuilds."""
+        """Remember the active object while retaining a multi-object selection."""
 
         if self._is_syncing_canvas_scene_selection:
             return
         object_id = (
             None if raw_object_id is None else str(raw_object_id).strip() or None
         )
-        self._desired_canvas_object_id = object_id
-        if object_id is not None:
+        try:
+            viewer_object_ids = self.viewer.get_selected_placed_object_ids()
+        except (AttributeError, TypeError):
+            viewer_object_ids = (object_id,) if object_id is not None else ()
+        if not isinstance(viewer_object_ids, tuple | list):
+            viewer_object_ids = (object_id,) if object_id is not None else ()
+        self._remember_desired_canvas_object_selection(
+            viewer_object_ids,
+            active_object_id=object_id,
+        )
+
+    def _handle_canvas_placed_object_selection_set_changed(
+        self,
+        raw_object_ids: object,
+    ) -> None:
+        """Remember every selected Canvas object across preview rebuilds."""
+
+        if self._is_syncing_canvas_scene_selection:
+            return
+        try:
+            object_ids = (
+                (raw_object_ids,)
+                if isinstance(raw_object_ids, str)
+                else tuple(raw_object_ids)  # type: ignore[arg-type]
+            )
+        except TypeError:
+            return
+        try:
+            active_object_id = self.viewer.get_selected_placed_object_id()
+        except (AttributeError, TypeError):
+            active_object_id = self._desired_canvas_object_id
+        self._remember_desired_canvas_object_selection(
+            object_ids,
+            active_object_id=active_object_id,
+        )
+
+    def _remember_desired_canvas_object_selection(
+        self,
+        object_ids: Sequence[object],
+        *,
+        active_object_id: object | None,
+    ) -> None:
+        """Normalize and persist one semantic Canvas object selection set."""
+
+        normalized_object_ids = tuple(
+            dict.fromkeys(
+                object_id
+                for object_id in (str(value).strip() for value in object_ids)
+                if object_id
+            )
+        )
+        normalized_active_id = (
+            None
+            if active_object_id is None
+            else str(active_object_id).strip() or None
+        )
+        if normalized_active_id not in normalized_object_ids:
+            normalized_active_id = (
+                normalized_object_ids[-1] if normalized_object_ids else None
+            )
+        self._desired_canvas_object_ids = normalized_object_ids
+        self._desired_canvas_object_id = normalized_active_id
+        if normalized_object_ids:
             self._desired_canvas_surface_ids = ()
             self._atlas_surface_assignment_target_ids = ()
+
+    def _discard_desired_canvas_object(self, object_id: str) -> None:
+        """Forget one vanished object without dropping other selected objects."""
+
+        normalized_object_id = str(object_id).strip()
+        selected_object_ids = getattr(
+            self,
+            "_desired_canvas_object_ids",
+            (
+                (self._desired_canvas_object_id,)
+                if self._desired_canvas_object_id is not None
+                else ()
+            ),
+        )
+        remaining_object_ids = tuple(
+            candidate
+            for candidate in selected_object_ids
+            if candidate != normalized_object_id
+        )
+        active_object_id = self._desired_canvas_object_id
+        if active_object_id == normalized_object_id:
+            active_object_id = (
+                remaining_object_ids[-1] if remaining_object_ids else None
+            )
+        self._remember_desired_canvas_object_selection(
+            remaining_object_ids,
+            active_object_id=active_object_id,
+        )
 
     def _restore_desired_canvas_scene_selection(self) -> None:
         """Reapply the last semantic Canvas selection after a model refresh."""
 
-        if self._desired_canvas_object_id is not None:
-            self.viewer.select_placed_object(self._desired_canvas_object_id)
+        desired_object_ids = getattr(
+            self,
+            "_desired_canvas_object_ids",
+            (
+                (self._desired_canvas_object_id,)
+                if self._desired_canvas_object_id is not None
+                else ()
+            ),
+        )
+        if desired_object_ids:
+            was_syncing_selection = self._is_syncing_canvas_scene_selection
+            self._is_syncing_canvas_scene_selection = True
+            try:
+                self.viewer.set_selected_placed_object_ids(
+                    desired_object_ids,
+                    active_object_id=self._desired_canvas_object_id,
+                )
+                restored_object_ids = self.viewer.get_selected_placed_object_ids()
+                restored_active_id = self.viewer.get_selected_placed_object_id()
+            finally:
+                self._is_syncing_canvas_scene_selection = was_syncing_selection
+            self._remember_desired_canvas_object_selection(
+                restored_object_ids,
+                active_object_id=restored_active_id,
+            )
+        if self._desired_canvas_object_ids:
             self._sync_selected_canvas_wall_highlight(None)
             return
         if self._desired_canvas_surface_ids:
-            self.viewer.select_placed_object(None)
+            self.viewer.set_selected_placed_object_ids(())
             self.viewer.select_canvas_opening(None)
             selected_surface = (
                 self._canvas_surface_targets_by_id.get(
@@ -6135,8 +6302,7 @@ class BlueprintWorkspace(QWidget):
                         restore_atlas_bindings=True,
                     )
                 )
-            if self._desired_canvas_object_id == normalized_object_id:
-                self._desired_canvas_object_id = None
+            self._discard_desired_canvas_object(normalized_object_id)
             self.texture_atlas_workspace.remove_scene_texture_from_atlases(
                 normalized_object_id
             )
@@ -6221,6 +6387,8 @@ class BlueprintWorkspace(QWidget):
                 _CanvasPlacedObjectUndoState(
                     object_id=normalized_object_id,
                     placement=existing_placement,
+                    selected_object_ids=self._desired_canvas_object_ids,
+                    active_object_id=self._desired_canvas_object_id,
                 )
             )
 
@@ -6264,8 +6432,7 @@ class BlueprintWorkspace(QWidget):
                 and state.object_id == normalized_object_id
             )
         ]
-        if self._desired_canvas_object_id == normalized_object_id:
-            self._desired_canvas_object_id = None
+        self._discard_desired_canvas_object(normalized_object_id)
         self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     def _refresh_placed_object_texture_if_needed(
@@ -6373,6 +6540,7 @@ class BlueprintWorkspace(QWidget):
             return
         self._selected_atlas_surface_source_id = None
         self._desired_canvas_object_id = None
+        self._desired_canvas_object_ids = ()
         self.viewer.set_highlighted_canvas_surface_ids(())
         self._sync_atlas_green_outline_to_canvas_highlight(None)
         self._is_syncing_canvas_scene_selection = True
@@ -6390,6 +6558,7 @@ class BlueprintWorkspace(QWidget):
         self._selected_atlas_surface_source_id = None
         self._atlas_surface_assignment_target_ids = ()
         self._desired_canvas_object_id = normalized_id
+        self._desired_canvas_object_ids = (normalized_id,)
         self._desired_canvas_surface_ids = ()
         self.viewer.set_highlighted_canvas_surface_ids(())
         self._sync_atlas_green_outline_to_canvas_highlight(None)
@@ -6482,8 +6651,7 @@ class BlueprintWorkspace(QWidget):
                         restore_atlas_bindings=True,
                     )
                 )
-            if self._desired_canvas_object_id == normalized_source_id:
-                self._desired_canvas_object_id = None
+            self._discard_desired_canvas_object(normalized_source_id)
             self._atlas_generation_signature = None
             self._sync_atlas_object_texture_sources()
             if removed_from_canvas or removed_from_atlases:
@@ -10513,6 +10681,7 @@ class BlueprintWorkspace(QWidget):
         self.canvas.cancel_open_space_placement()
         self.canvas.cancel_stair_placement()
         self._desired_canvas_object_id = None
+        self._desired_canvas_object_ids = ()
         self._desired_canvas_surface_ids = ()
         self._active_canvas_surface_drawing_vertex_id = None
         self._atlas_surface_assignment_target_ids = ()

@@ -616,6 +616,35 @@ def convert_to_preview_model(
     )
 
 
+def remove_covered_surface_faces(
+    mesh: trimesh.Trimesh,
+    surfaces: Iterable[object],
+) -> trimesh.Trimesh:
+    """Copy ``mesh`` without triangles covered by oriented world surfaces.
+
+    Surface meshes may use different coplanar triangulation from ``mesh``.
+    Coverage remains winding-sensitive so an opposite-facing surface does not
+    remove the back side of otherwise coincident geometry.
+    """
+
+    if not isinstance(mesh, trimesh.Trimesh):
+        raise TypeError("Surface face removal requires a trimesh.Trimesh.")
+    surface_items = tuple(surfaces)
+    replacement_face_keys = _build_oriented_surface_face_keys(surface_items)
+    replacement_plane_coverage = _build_surface_plane_coverage(surface_items)
+    keep_faces = _build_surface_face_keep_mask(
+        mesh,
+        replacement_face_keys,
+        replacement_plane_coverage,
+    )
+    filtered_mesh = mesh.copy()
+    if np.all(keep_faces):
+        return filtered_mesh
+    filtered_mesh.update_faces(keep_faces)
+    filtered_mesh.remove_unreferenced_vertices()
+    return filtered_mesh
+
+
 # ### Blueprint model construction ###
 def _build_blueprint_model(
     *,
@@ -2946,20 +2975,10 @@ def _remove_named_mesh_surface_faces(
     retained: list[NamedMesh] = []
     for named_mesh in named_meshes:
         world_mesh = _build_transformed_named_mesh_copy(named_mesh)
-        keep_faces = np.asarray(
-            [
-                not _triangle_is_replaced(
-                    triangle,
-                    normal,
-                    replacement_face_keys,
-                    replacement_plane_coverage,
-                )
-                for triangle, normal in zip(
-                    world_mesh.triangles,
-                    world_mesh.face_normals,
-                )
-            ],
-            dtype=bool,
+        keep_faces = _build_surface_face_keep_mask(
+            world_mesh,
+            replacement_face_keys,
+            replacement_plane_coverage,
         )
         if not np.any(keep_faces):
             continue
@@ -2978,6 +2997,27 @@ def _remove_named_mesh_surface_faces(
             )
         )
     return retained
+
+
+def _build_surface_face_keep_mask(
+    mesh: trimesh.Trimesh,
+    replacement_face_keys: set[tuple[tuple[float, float, float], ...]],
+    replacement_plane_coverage: Mapping[tuple[float, ...], object],
+) -> np.ndarray:
+    """Return faces not replaced by the supplied oriented surface coverage."""
+
+    return np.asarray(
+        [
+            not _triangle_is_replaced(
+                triangle,
+                normal,
+                replacement_face_keys,
+                replacement_plane_coverage,
+            )
+            for triangle, normal in zip(mesh.triangles, mesh.face_normals)
+        ],
+        dtype=bool,
+    )
 
 
 def _build_surface_plane_coverage(

@@ -516,6 +516,47 @@ class CanvasUndoMainTests(unittest.TestCase):
         )
         self.assertEqual(self.workspace._canvas_undo_stack, [])
 
+    def test_transform_undo_restores_the_multi_object_selection(self) -> None:
+        chair_placement = GeneratedObjectPlacement(
+            level_index=self.level.index,
+            image_x=20.0,
+            image_y=30.0,
+        )
+        table_placement = GeneratedObjectPlacement(
+            level_index=self.level.index,
+            image_x=40.0,
+            image_y=50.0,
+        )
+        self.workspace.generation.set_data(
+            GenerationData(
+                generated_objects=[
+                    _generated_object_record("chair", chair_placement),
+                    _generated_object_record("table", table_placement),
+                ]
+            )
+        )
+        self.workspace._desired_canvas_object_ids = ("chair", "table")
+        self.workspace._desired_canvas_object_id = "table"
+        world_x, world_y = level_image_to_world_xy(
+            self.level,
+            70.0,
+            60.0,
+        )
+        base_z = build_level_base_z_lookup((self.level,))[self.level.index]
+
+        self.workspace._handle_placed_object_transform_changed(
+            "table",
+            (world_x, world_y, base_z),
+            (0.0, 0.0, 20.0),
+        )
+        _send_undo_to_viewer(self.workspace)
+
+        self.assertEqual(
+            self.workspace._desired_canvas_object_ids,
+            ("chair", "table"),
+        )
+        self.assertEqual(self.workspace._desired_canvas_object_id, "table")
+
     def test_ctrl_z_removes_a_newly_added_window(self) -> None:
         wall = next(
             surface

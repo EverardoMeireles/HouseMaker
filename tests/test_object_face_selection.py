@@ -277,6 +277,105 @@ class ObjectFaceSelectionGeometryTests(unittest.TestCase):
 
         self.assertEqual(selected, {0})
 
+    def test_rectangle_selection_clips_faces_crossing_the_camera_plane(
+        self,
+    ) -> None:
+        class PerspectiveView:
+            def width(self) -> int:
+                return 100
+
+            def height(self) -> int:
+                return 100
+
+            def projectionMatrix(self, *_args: object) -> QMatrix4x4:
+                projection = QMatrix4x4()
+                projection.perspective(90.0, 1.0, 1.0, 10.0)
+                return projection
+
+            def viewMatrix(self) -> QMatrix4x4:
+                return QMatrix4x4()
+
+        vertices = np.asarray(
+            (
+                (0.0, 0.0, 1.0),
+                (-1.0, -1.0, -2.0),
+                (1.0, -1.0, -2.0),
+            ),
+            dtype=float,
+        )
+        faces = np.asarray(((0, 1, 2),), dtype=np.int64)
+
+        captured = _capture_face_selection_raster_input(
+            PerspectiveView(),  # type: ignore[arg-type]
+            ((vertices, faces),),
+            QRect(0, 0, 100, 100),
+        )
+
+        self.assertIsNotNone(captured)
+        assert captured is not None
+        projected_geometry, rectangle = captured
+        self.assertGreater(len(projected_geometry[0][1]), 1)
+        self.assertEqual(
+            _rasterize_face_selection(
+                projected_geometry,
+                QRect(*rectangle),
+            ),
+            {0},
+        )
+
+    def test_clipped_source_and_mirror_keep_the_original_logical_face_id(
+        self,
+    ) -> None:
+        class PerspectiveView:
+            def width(self) -> int:
+                return 100
+
+            def height(self) -> int:
+                return 100
+
+            def projectionMatrix(self, *_args: object) -> QMatrix4x4:
+                projection = QMatrix4x4()
+                projection.perspective(90.0, 1.0, 1.0, 10.0)
+                return projection
+
+            def viewMatrix(self) -> QMatrix4x4:
+                return QMatrix4x4()
+
+        vertices = np.asarray(
+            (
+                (-0.5, -0.5, 1.0),
+                (0.0, 0.5, 1.0),
+                (0.5, -0.5, 1.0),
+                (-1.5, 0.0, 1.0),
+                (-1.0, -1.0, -2.0),
+                (0.0, -1.0, -2.0),
+            ),
+            dtype=float,
+        )
+        faces = np.asarray(((0, 1, 2), (3, 4, 5)), dtype=np.int64)
+        mirrored_vertices = vertices.copy()
+        mirrored_vertices[:, 0] *= -1.0
+
+        captured = _capture_face_selection_raster_input(
+            PerspectiveView(),  # type: ignore[arg-type]
+            (
+                (vertices, faces),
+                (mirrored_vertices, faces[:, (0, 2, 1)]),
+            ),
+            QRect(0, 0, 100, 100),
+        )
+
+        self.assertIsNotNone(captured)
+        assert captured is not None
+        projected_geometry, rectangle = captured
+        self.assertEqual(
+            _rasterize_face_selection(
+                projected_geometry,
+                QRect(*rectangle),
+            ),
+            {1},
+        )
+
     def test_ray_returns_the_nearest_logical_face_without_uvs(self) -> None:
         vertices = np.asarray(
             (

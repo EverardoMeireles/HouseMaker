@@ -73,6 +73,7 @@ from housemaker.glb import (
     GeneratedModel,
     PreviewPlacedObject,
     PreviewTexturedWall,
+    remove_covered_surface_faces,
 )
 from housemaker.glass_material import (
     get_housemaker_glass_double_sided,
@@ -138,6 +139,13 @@ WINDOW_PREVIEW_OFFSET_METERS = 0.006
 CANVAS_SURFACE_SELECTION_COLOR = (1.0, 0.72, 0.18, 1.0)
 CANVAS_SURFACE_SELECTION_VERTEX_COLOR = (0.78, 0.56, 0.14, 1.0)
 CANVAS_SURFACE_SELECTION_VERTEX_SIZE_PIXELS = 9.0
+CANVAS_SCENE_FOCUS_TYPES = frozenset(
+    (SURFACE_TYPE_FLOOR, SURFACE_TYPE_CEILING)
+)
+CANVAS_SELECTION_TARGET_SURFACE = "surface"
+CANVAS_SELECTION_TARGET_OBJECT = "object"
+CANVAS_SELECTION_TARGET_OCCLUDER = "occluder"
+CANVAS_SELECTION_DEPTH_TIE_EPSILON = 1e-6
 ATLAS_SURFACE_HIGHLIGHT_COLOR = (0.20, 0.86, 0.38, 1.0)
 WINDOW_VALID_PREVIEW_COLOR = (0.20, 0.86, 0.38, 0.34)
 WINDOW_INVALID_PREVIEW_COLOR = (1.0, 0.24, 0.20, 0.34)
@@ -234,6 +242,15 @@ CANVAS_FACE_SHARED_EDGE_TOLERANCE_METERS = 1e-6
 FACE_SELECTION_COLOR = (1.0, 0.36, 0.08, 0.72)
 FACE_SELECTION_EDGE_COLOR = (1.0, 0.78, 0.18, 1.0)
 FACE_SELECTION_MAX_RASTER_DIMENSION = 768
+SELECTION_CLIP_PLANE_EPSILON = 1e-7
+SELECTION_HOMOGENEOUS_CLIP_PLANES = (
+    (1.0, 0.0, 0.0, 1.0),
+    (-1.0, 0.0, 0.0, 1.0),
+    (0.0, 1.0, 0.0, 1.0),
+    (0.0, -1.0, 0.0, 1.0),
+    (0.0, 0.0, 1.0, 1.0),
+    (0.0, 0.0, -1.0, 1.0),
+)
 FACE_SELECTION_REPLACE = "replace"
 FACE_SELECTION_TOGGLE = "toggle"
 FACE_SELECTION_ADD = "add"
@@ -582,6 +599,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self._is_middle_navigation_active = False
         self._rectangle_drawing_enabled = False
         self._primary_pointer_drag_reserved = False
+        self._primary_pointer_release_suppressed = False
         self._item_click_selection_enabled = True
         self._viewport_click_selection_enabled = True
         self._overlay_selection_enabled = False
@@ -645,6 +663,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
     def reserve_primary_pointer_drag(self) -> None:
         """Prevent navigation and click selection until the drag finishes."""
 
+        self._primary_pointer_release_suppressed = False
         self._primary_pointer_drag_reserved = True
 
     def release_primary_pointer_drag(self) -> None:
@@ -652,6 +671,13 @@ class SelectableGLViewWidget(gl.GLViewWidget):
 
         self._primary_pointer_drag_reserved = False
         self._resume_first_person_pointer_capture_if_ready()
+
+    def cancel_primary_pointer_drag(self) -> None:
+        """Release primary input without treating its later release as a click."""
+
+        if self._primary_pointer_drag_reserved:
+            self._primary_pointer_release_suppressed = True
+        self.release_primary_pointer_drag()
 
     def set_item_click_selection_enabled(self, enabled: bool) -> None:
         """Enable the legacy item-pick pass only for viewers that use it."""
@@ -773,6 +799,11 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         """Release selection/navigation ownership that cannot cross contexts."""
 
         self._cancel_face_selection_gesture()
+        if self._primary_pointer_drag_reserved:
+            self._primary_pointer_release_suppressed = True
+            self.primary_pointer_cancel_requested.emit()
+            if self._primary_pointer_drag_reserved:
+                self.cancel_primary_pointer_drag()
         self._is_middle_navigation_active = False
         if QWidget.mouseGrabber() is self:
             self.releaseMouse()
@@ -1095,6 +1126,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.MouseButton.LeftButton:
             self._face_selection_release_suppressed = False
+            self._primary_pointer_release_suppressed = False
         if self._rectangle_drawing_enabled:
             if event.button() == Qt.MouseButton.LeftButton:
                 self.click_press_position = event.position()
@@ -1208,6 +1240,14 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             and self._face_selection_release_suppressed
         ):
             self._face_selection_release_suppressed = False
+            event.accept()
+            return
+
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._primary_pointer_release_suppressed
+        ):
+            self._primary_pointer_release_suppressed = False
             event.accept()
             return
 
@@ -2434,6 +2474,23 @@ class _PlacedObjectTransformDrag:
 
 
 # ### Face-selection background models ###
+class _ProjectedSelectionGeometry(tuple):
+    """Tuple-compatible projected meshes carrying original logical face IDs."""
+
+    logical_face_indices_by_geometry: tuple[np.ndarray, ...]
+
+    def __new__(
+        cls,
+        geometry: tuple[tuple[np.ndarray, np.ndarray], ...],
+        logical_face_indices_by_geometry: tuple[np.ndarray, ...],
+    ) -> "_ProjectedSelectionGeometry":
+        instance = super().__new__(cls, geometry)
+        instance.logical_face_indices_by_geometry = (
+            logical_face_indices_by_geometry
+        )
+        return instance
+
+
 @dataclass(frozen=True)
 class _FaceRectangleSelectionTask:
     """Immutable projected input owned by one background raster pass."""
@@ -2451,6 +2508,32 @@ class _FaceRectangleSelectionResult:
     request_revision: int
     geometry_revision: int
     face_indices: frozenset[int]
+
+
+# ### Canvas rectangle-selection background models ###
+@dataclass(frozen=True)
+class _CanvasRectangleSelectionTask:
+    """Immutable visible-target input for one Canvas box selection."""
+
+    request_revision: int
+    geometry_revision: int
+    projected_targets: tuple[
+        tuple[str, str, np.ndarray, np.ndarray],
+        ...,
+    ]
+    rectangle: tuple[int, int, int, int]
+    additive: bool
+
+
+@dataclass(frozen=True)
+class _CanvasRectangleSelectionResult:
+    """Visible Canvas object and surface IDs from one current drag."""
+
+    request_revision: int
+    geometry_revision: int
+    surface_ids: tuple[str, ...]
+    object_ids: tuple[str, ...]
+    additive: bool
 
 
 class GlbViewerWidget(QWidget):
@@ -2474,11 +2557,13 @@ class GlbViewerWidget(QWidget):
     placed_object_removal_requested = Signal(str)
     placed_object_transform_changed = Signal(str, object, object)
     placed_object_selection_changed = Signal(object)
+    placed_object_selection_set_changed = Signal(object)
     canvas_surface_selection_changed = Signal(object)
     face_selection_changed = Signal(object)
     projection_camera_selection_changed = Signal(object)
     projection_camera_percentage_step_requested = Signal(str, int)
     _face_rectangle_selection_completed = Signal(object)
+    _canvas_rectangle_selection_completed = Signal(object)
     delete_requested = Signal()
     undo_requested = Signal()
     navigation_mode_changed = Signal(str)
@@ -2553,6 +2638,7 @@ class GlbViewerWidget(QWidget):
             str,
             _PlacedObjectRenderGroup,
         ] = {}
+        self._selected_placed_object_ids: tuple[str, ...] = ()
         self._selected_placed_object_id: str | None = None
         self._placed_object_transform_drag: (
             _PlacedObjectTransformDrag | None
@@ -2617,6 +2703,17 @@ class GlbViewerWidget(QWidget):
         self._canvas_extrudable_face_outline_items: list[
             gl.GLLinePlotItem
         ] = []
+        self._canvas_surface_focus_type: str | None = None
+        self._canvas_ceiling_hidden = False
+        self._canvas_rectangle_selection_press_position: QPointF | None = None
+        self._canvas_rectangle_selection_additive = False
+        self._canvas_rectangle_selection_rubber_band: QRubberBand | None = None
+        self._canvas_selection_geometry_revision = 0
+        self._canvas_rectangle_selection_request_revision = 0
+        self._canvas_rectangle_selection_cancel_event: (
+            threading.Event | None
+        ) = None
+        self._applying_canvas_rectangle_selection_result = False
         self._highlighted_canvas_surface_ids: tuple[str, ...] = ()
         self._atlas_surface_highlight_items: list[gl.GLLinePlotItem] = []
         self._selected_window_wall_surface_id: str | None = None
@@ -2630,6 +2727,9 @@ class GlbViewerWidget(QWidget):
         self.add_window_button: QPushButton | None = None
         self.undo_window_button: QPushButton | None = None
         self.add_surface_vertex_button: QPushButton | None = None
+        self.highlight_floor_button: QPushButton | None = None
+        self.highlight_ceiling_button: QPushButton | None = None
+        self.hide_ceiling_button: QPushButton | None = None
         self._texture_edit_mask: np.ndarray | None = None
         self._symmetric_preview_orientation: str | None = None
         self._symmetric_preview_plane_coordinate: float | None = None
@@ -2675,6 +2775,10 @@ class GlbViewerWidget(QWidget):
         if self._placed_object_editing_enabled:
             self._connect_placed_object_editor_input()
         self._connect_face_editor_input()
+        self._canvas_rectangle_selection_completed.connect(
+            self._apply_canvas_rectangle_selection_result,
+            Qt.ConnectionType.QueuedConnection,
+        )
         self._populate_scene()
 
     # ### Doorway preview outline API ###
@@ -2840,6 +2944,7 @@ class GlbViewerWidget(QWidget):
         """Invalidate daemon work before this viewer closes or is destroyed."""
 
         self._invalidate_face_rectangle_selection_requests()
+        self._cancel_canvas_rectangle_selection()
         super().closeEvent(event)
 
     def _build_window_tools_panel(self) -> QWidget:
@@ -2879,6 +2984,47 @@ class GlbViewerWidget(QWidget):
         )
         self.window_tools_status_label.setWordWrap(True)
         panel_layout.addWidget(self.window_tools_status_label)
+
+        visibility_title_label = QLabel("Scene visibility")
+        visibility_title_label.setObjectName("canvas-scene-visibility-title")
+        panel_layout.addWidget(visibility_title_label)
+
+        self.highlight_floor_button = QPushButton("Highlight floor")
+        self.highlight_floor_button.setObjectName(
+            "canvas-highlight-floor-button"
+        )
+        self.highlight_floor_button.setCheckable(True)
+        self.highlight_floor_button.setToolTip(
+            "Show only floor surfaces in the 3D view."
+        )
+        self.highlight_floor_button.toggled.connect(
+            self._handle_highlight_floor_toggled
+        )
+        panel_layout.addWidget(self.highlight_floor_button)
+
+        self.highlight_ceiling_button = QPushButton("Highlight ceiling")
+        self.highlight_ceiling_button.setObjectName(
+            "canvas-highlight-ceiling-button"
+        )
+        self.highlight_ceiling_button.setCheckable(True)
+        self.highlight_ceiling_button.setToolTip(
+            "Show only ceiling surfaces in the 3D view."
+        )
+        self.highlight_ceiling_button.toggled.connect(
+            self._handle_highlight_ceiling_toggled
+        )
+        panel_layout.addWidget(self.highlight_ceiling_button)
+
+        self.hide_ceiling_button = QPushButton("Hide ceiling")
+        self.hide_ceiling_button.setObjectName("canvas-hide-ceiling-button")
+        self.hide_ceiling_button.setCheckable(True)
+        self.hide_ceiling_button.setToolTip(
+            "Hide ceilings so top-down picks can reach objects and surfaces below."
+        )
+        self.hide_ceiling_button.toggled.connect(
+            self._handle_hide_ceiling_toggled
+        )
+        panel_layout.addWidget(self.hide_ceiling_button)
 
         surface_title_label = QLabel("Surface tools")
         surface_title_label.setObjectName("canvas-surface-tools-title")
@@ -2920,6 +3066,205 @@ class GlbViewerWidget(QWidget):
         self.window_tools_panel = panel
         return panel
 
+    # ### Canvas scene visibility API ###
+    def get_canvas_surface_focus_type(self) -> str | None:
+        """Return the isolated floor/ceiling type, or ``None``."""
+
+        return self._canvas_surface_focus_type
+
+    def set_canvas_surface_focus_type(self, surface_type: str | None) -> bool:
+        """Isolate one horizontal surface type without changing project data."""
+
+        normalized_type = (
+            None if surface_type is None else str(surface_type).strip().lower()
+        )
+        if normalized_type not in {None, *CANVAS_SCENE_FOCUS_TYPES}:
+            raise ValueError("Canvas focus must be floor, ceiling, or None.")
+        if normalized_type == self._canvas_surface_focus_type:
+            self._sync_canvas_scene_visibility_controls()
+            return False
+        self._prepare_canvas_scene_visibility_change()
+        self._canvas_surface_focus_type = normalized_type
+        self._sync_canvas_scene_visibility_controls()
+        self._clear_hidden_canvas_scene_selection()
+        self._rebuild_level_transform_preview_source_positions()
+        self._repopulate_canvas_scene_preserving_camera()
+        return True
+
+    def get_canvas_ceiling_hidden(self) -> bool:
+        """Return whether ceilings are hidden outside ceiling focus mode."""
+
+        return self._canvas_ceiling_hidden
+
+    def set_canvas_ceiling_hidden(self, hidden: bool) -> bool:
+        """Hide or restore ceiling surfaces while retaining the focus state."""
+
+        normalized_hidden = bool(hidden)
+        if normalized_hidden == self._canvas_ceiling_hidden:
+            self._sync_canvas_scene_visibility_controls()
+            return False
+        self._prepare_canvas_scene_visibility_change()
+        self._canvas_ceiling_hidden = normalized_hidden
+        self._sync_canvas_scene_visibility_controls()
+        self._clear_hidden_canvas_scene_selection()
+        self._rebuild_level_transform_preview_source_positions()
+        self._repopulate_canvas_scene_preserving_camera()
+        return True
+
+    def get_visible_canvas_surface_ids(self) -> tuple[str, ...]:
+        """Return semantic surfaces eligible for rendering and selection."""
+
+        return tuple(
+            surface_id
+            for surface_id, surface in self._canvas_surface_targets.items()
+            if self._canvas_surface_is_visible(surface)
+        )
+
+    def get_visible_placed_object_ids(self) -> tuple[str, ...]:
+        """Return placed objects visible under the current focus mode."""
+
+        if not self._canvas_objects_are_visible() or self.model is None:
+            return ()
+        return tuple(
+            dict.fromkeys(
+                preview.object_id for preview in self.model.preview_placed_objects
+            )
+        )
+
+    def _handle_highlight_floor_toggled(self, checked: bool) -> None:
+        next_type = (
+            SURFACE_TYPE_FLOOR
+            if checked
+            else (
+                None
+                if self._canvas_surface_focus_type == SURFACE_TYPE_FLOOR
+                else self._canvas_surface_focus_type
+            )
+        )
+        self.set_canvas_surface_focus_type(next_type)
+
+    def _handle_highlight_ceiling_toggled(self, checked: bool) -> None:
+        next_type = (
+            SURFACE_TYPE_CEILING
+            if checked
+            else (
+                None
+                if self._canvas_surface_focus_type == SURFACE_TYPE_CEILING
+                else self._canvas_surface_focus_type
+            )
+        )
+        self.set_canvas_surface_focus_type(next_type)
+
+    def _handle_hide_ceiling_toggled(self, checked: bool) -> None:
+        self.set_canvas_ceiling_hidden(checked)
+
+    def _sync_canvas_scene_visibility_controls(self) -> None:
+        """Reflect viewer-local filtering state without recursive toggles."""
+
+        button_states = (
+            (
+                self.highlight_floor_button,
+                self._canvas_surface_focus_type == SURFACE_TYPE_FLOOR,
+            ),
+            (
+                self.highlight_ceiling_button,
+                self._canvas_surface_focus_type == SURFACE_TYPE_CEILING,
+            ),
+            (self.hide_ceiling_button, self._canvas_ceiling_hidden),
+        )
+        for button, checked in button_states:
+            if button is None:
+                continue
+            previous_blocked = button.blockSignals(True)
+            button.setChecked(checked)
+            button.blockSignals(previous_blocked)
+
+    def _canvas_surface_is_visible(self, surface: FixedSurface) -> bool:
+        return self._canvas_surface_type_is_visible(surface.surface_type)
+
+    def _canvas_surface_type_is_visible(self, surface_type: str) -> bool:
+        """Apply focus-first precedence to one semantic surface type."""
+
+        normalized_type = str(surface_type).strip().lower()
+        focus_type = self._canvas_surface_focus_type
+        if focus_type is not None:
+            return normalized_type == focus_type
+        return not (
+            self._canvas_ceiling_hidden
+            and normalized_type == SURFACE_TYPE_CEILING
+        )
+
+    def _canvas_source_surface_id_is_visible(self, surface_id: str) -> bool:
+        """Resolve authored drawing overlays through their source surface."""
+
+        normalized_id = str(surface_id)
+        direct = self._canvas_surface_targets.get(normalized_id)
+        if direct is not None:
+            return self._canvas_surface_is_visible(direct)
+        descendants = (
+            surface
+            for surface in self._canvas_surface_targets.values()
+            if _get_fixed_surface_source_id(surface) == normalized_id
+        )
+        return any(self._canvas_surface_is_visible(surface) for surface in descendants)
+
+    def _canvas_objects_are_visible(self) -> bool:
+        return self._canvas_surface_focus_type is None
+
+    def _prepare_canvas_scene_visibility_change(self) -> None:
+        """Cancel pointer-owned edits before their geometry becomes hidden."""
+
+        self._cancel_canvas_rectangle_selection()
+        if self.is_window_placement_active():
+            self.cancel_window_placement(status_message=None)
+        if self.is_surface_vertex_placement_active():
+            self.cancel_surface_vertex_placement()
+        self._cancel_canvas_gizmo_drag()
+
+    def _clear_hidden_canvas_scene_selection(self) -> None:
+        """Keep Main and the viewer synchronized after a visibility change."""
+
+        visible_surface_ids = set(self.get_visible_canvas_surface_ids())
+        selected_surface_ids = tuple(
+            surface_id
+            for surface_id in self._selected_canvas_surface_ids
+            if surface_id in visible_surface_ids
+        )
+        self.set_selected_canvas_surface_ids(selected_surface_ids)
+        selected_wall_id = self._selected_window_wall_surface_id
+        if selected_wall_id not in visible_surface_ids:
+            self._set_window_wall_selection(
+                next(
+                    (
+                        surface_id
+                        for surface_id in reversed(selected_surface_ids)
+                        if surface_id in self._window_wall_targets
+                    ),
+                    None,
+                )
+            )
+        opening = self._get_selected_canvas_opening_target()
+        if (
+            opening is not None
+            and opening.wall_surface_id not in visible_surface_ids
+        ):
+            self._set_selected_canvas_opening_key(None)
+        visible_object_ids = set(self.get_visible_placed_object_ids())
+        self.set_selected_placed_object_ids(
+            object_id
+            for object_id in self._selected_placed_object_ids
+            if object_id in visible_object_ids
+        )
+
+    def _repopulate_canvas_scene_preserving_camera(self) -> None:
+        """Rebuild filtered render items without resetting the current view."""
+
+        if not hasattr(self, "view"):
+            return
+        camera_state = self._capture_camera_state()
+        self._populate_scene()
+        self._restore_camera_state(camera_state)
+
     # ### Canvas window editor API ###
     @property
     def window_editing_enabled(self) -> bool:
@@ -2934,6 +3279,7 @@ class GlbViewerWidget(QWidget):
             return
         if not isinstance(surfaces, tuple):
             raise TypeError("Canvas surface targets must be supplied as a tuple.")
+        self._cancel_canvas_rectangle_selection()
 
         all_targets: dict[str, FixedSurface] = {}
         targets: dict[str, FixedSurface] = {}
@@ -2964,6 +3310,7 @@ class GlbViewerWidget(QWidget):
             surface_id
             for surface_id in self._selected_canvas_surface_ids
             if surface_id in all_targets
+            and self._canvas_surface_is_visible(all_targets[surface_id])
         )
         self._highlighted_canvas_surface_ids = tuple(
             surface_id
@@ -2996,6 +3343,14 @@ class GlbViewerWidget(QWidget):
             )
         self._sync_window_tools_controls()
         self._sync_surface_tools_controls()
+        if (
+            self.model is not None
+            and (
+                self._canvas_surface_focus_type is not None
+                or self._canvas_ceiling_hidden
+            )
+        ):
+            self._repopulate_canvas_scene_preserving_camera()
 
     def get_selected_wall_surface_id(self) -> str | None:
         """Return the one selected semantic wall, if any."""
@@ -3010,6 +3365,7 @@ class GlbViewerWidget(QWidget):
     def set_selected_canvas_surface_ids(self, surface_ids: object) -> bool:
         """Select known semantic surfaces without changing window editing."""
 
+        self._invalidate_external_canvas_rectangle_selection()
         try:
             requested_ids = tuple(
                 str(value).strip() for value in surface_ids  # type: ignore[arg-type]
@@ -3020,7 +3376,11 @@ class GlbViewerWidget(QWidget):
             dict.fromkeys(
                 surface_id
                 for surface_id in requested_ids
-                if surface_id in self._canvas_surface_targets
+                if (
+                    (surface := self._canvas_surface_targets.get(surface_id))
+                    is not None
+                    and self._canvas_surface_is_visible(surface)
+                )
             )
         )
         selection_changed = normalized_ids != self._selected_canvas_surface_ids
@@ -3087,7 +3447,13 @@ class GlbViewerWidget(QWidget):
             if normalized_id is None
             else self._canvas_surface_targets.get(normalized_id)
         )
-        if normalized_id is not None and surface is None:
+        if (
+            normalized_id is not None
+            and (
+                surface is None
+                or not self._canvas_surface_is_visible(surface)
+            )
+        ):
             return False
         if normalized_id is None and additive:
             return False
@@ -3160,8 +3526,10 @@ class GlbViewerWidget(QWidget):
         if not self._window_editing_enabled:
             return False
         normalized_id = None if surface_id is None else str(surface_id).strip()
-        if normalized_id is not None and normalized_id not in self._window_wall_targets:
-            return False
+        if normalized_id is not None:
+            surface = self._window_wall_targets.get(normalized_id)
+            if surface is None or not self._canvas_surface_is_visible(surface):
+                return False
         if normalized_id is not None:
             self._set_selected_canvas_opening_key(None)
             self._set_selected_placed_object(None)
@@ -3174,6 +3542,10 @@ class GlbViewerWidget(QWidget):
     def _set_window_wall_selection(self, surface_id: str | None) -> bool:
         """Update only the singular wall used by the window-placement tools."""
 
+        if surface_id is not None:
+            surface = self._window_wall_targets.get(surface_id)
+            if surface is None or not self._canvas_surface_is_visible(surface):
+                surface_id = None
         if surface_id == self._selected_window_wall_surface_id:
             return False
         self.cancel_window_placement(status_message=None)
@@ -3215,7 +3587,11 @@ class GlbViewerWidget(QWidget):
         """Arm continuous vertex-and-edge drawing on Canvas surfaces."""
 
         self._surface_tools_status_override = None
-        if not self._window_editing_enabled or not self._canvas_surface_targets:
+        has_visible_surfaces = any(
+            self._canvas_surface_is_visible(surface)
+            for surface in self._canvas_surface_targets.values()
+        )
+        if not self._window_editing_enabled or not has_visible_surfaces:
             self._set_surface_tools_status(
                 "Select a surface to add vertices."
             )
@@ -3503,12 +3879,17 @@ class GlbViewerWidget(QWidget):
 
         if not self._window_editing_enabled:
             return False
+        self._invalidate_external_canvas_rectangle_selection()
         if reference is None:
             return self._set_selected_canvas_opening_key(None)
         if not isinstance(reference, CanvasOpeningReference):
             raise TypeError("Canvas opening selection requires an opening reference.")
         target = self._canvas_opening_targets.get(reference.key)
-        if target is None:
+        if (
+            target is None
+            or target.wall_surface_id
+            not in self.get_visible_canvas_surface_ids()
+        ):
             return False
         return self._set_selected_canvas_opening_key(target.key)
 
@@ -3518,7 +3899,12 @@ class GlbViewerWidget(QWidget):
         target = self._canvas_opening_targets.get(
             self._selected_canvas_opening_key or ""
         )
-        return target if isinstance(target, CanvasOpeningTarget) else None
+        if not isinstance(target, CanvasOpeningTarget):
+            return None
+        wall = self._canvas_surface_targets.get(target.wall_surface_id)
+        if wall is None or not self._canvas_surface_is_visible(wall):
+            return None
+        return target
 
     def _set_selected_canvas_opening_key(self, key: str | None) -> bool:
         normalized_key = None if key is None else str(key)
@@ -3555,9 +3941,15 @@ class GlbViewerWidget(QWidget):
 
         return self._selected_placed_object_id
 
+    def get_selected_placed_object_ids(self) -> tuple[str, ...]:
+        """Return every selected Canvas object in stable selection order."""
+
+        return self._selected_placed_object_ids
+
     def _handle_view_delete_requested(self) -> None:
         """Route Delete to Canvas placement removal or the generic consumer."""
 
+        self._invalidate_external_canvas_rectangle_selection()
         if self._get_selected_canvas_opening_target() is not None:
             # Openings are structural edits. Delete must never fall through to
             # an unrelated face/object consumer merely because one is selected.
@@ -3580,13 +3972,15 @@ class GlbViewerWidget(QWidget):
                     "Only faces created with Add vertices can be deleted."
                 )
             return
-        selected_id = self._selected_placed_object_id
-        if (
-            self._placed_object_editing_enabled
-            and selected_id in self._placed_object_render_groups
-        ):
-            self._set_selected_placed_object(None)
-            self.placed_object_removal_requested.emit(selected_id)
+        selected_ids = tuple(
+            object_id
+            for object_id in self._selected_placed_object_ids
+            if object_id in self._placed_object_render_groups
+        )
+        if self._placed_object_editing_enabled and selected_ids:
+            self.set_selected_placed_object_ids(())
+            for object_id in selected_ids:
+                self.placed_object_removal_requested.emit(object_id)
             return
         self.delete_requested.emit()
 
@@ -3595,6 +3989,7 @@ class GlbViewerWidget(QWidget):
 
         if not self._placed_object_editing_enabled:
             return False
+        self._invalidate_external_canvas_rectangle_selection()
         normalized_id = None if object_id is None else str(object_id).strip()
         if normalized_id is not None and normalized_id not in (
             self._placed_object_render_groups
@@ -3603,16 +3998,69 @@ class GlbViewerWidget(QWidget):
         if normalized_id is not None:
             self._set_selected_canvas_opening_key(None)
             self.select_wall_target(None)
-        return self._set_selected_placed_object(normalized_id)
+        return self.set_selected_placed_object_ids(
+            () if normalized_id is None else (normalized_id,),
+            active_object_id=normalized_id,
+        )
 
-    def _set_selected_placed_object(self, object_id: str | None) -> bool:
-        if object_id == self._selected_placed_object_id:
+    def set_selected_placed_object_ids(
+        self,
+        object_ids: object,
+        *,
+        active_object_id: str | None = None,
+    ) -> bool:
+        """Select known placed objects and choose one active gizmo owner."""
+
+        if not self._placed_object_editing_enabled:
+            return False
+        self._invalidate_external_canvas_rectangle_selection()
+        try:
+            requested_ids = tuple(
+                str(value).strip() for value in object_ids  # type: ignore[arg-type]
+            )
+        except TypeError:
+            return False
+        normalized_ids = tuple(
+            dict.fromkeys(
+                object_id
+                for object_id in requested_ids
+                if object_id in self._placed_object_render_groups
+            )
+        )
+        normalized_active_id = (
+            None
+            if active_object_id is None
+            else str(active_object_id).strip()
+        )
+        if normalized_active_id not in normalized_ids:
+            current_active_id = self._selected_placed_object_id
+            normalized_active_id = (
+                current_active_id
+                if current_active_id in normalized_ids
+                else (normalized_ids[-1] if normalized_ids else None)
+            )
+
+        selection_changed = normalized_ids != self._selected_placed_object_ids
+        active_changed = normalized_active_id != self._selected_placed_object_id
+        if not selection_changed and not active_changed:
             return False
         self._cancel_placed_object_gizmo_drag()
-        self._selected_placed_object_id = object_id
+        self._selected_placed_object_ids = normalized_ids
+        self._selected_placed_object_id = normalized_active_id
         self._sync_placed_object_selection_rendering()
-        self.placed_object_selection_changed.emit(object_id)
+        if selection_changed:
+            self.placed_object_selection_set_changed.emit(normalized_ids)
+        if active_changed:
+            self.placed_object_selection_changed.emit(normalized_active_id)
         return True
+
+    def _set_selected_placed_object(self, object_id: str | None) -> bool:
+        """Compatibility wrapper for callers that require one active object."""
+
+        return self.set_selected_placed_object_ids(
+            () if object_id is None else (object_id,),
+            active_object_id=object_id,
+        )
 
     def begin_window_placement(self) -> bool:
         """Arm rectangle drawing when exactly one wall is selected."""
@@ -3731,16 +4179,23 @@ class GlbViewerWidget(QWidget):
         if self.is_window_placement_active():
             self.cancel_window_placement()
 
-    def _handle_window_wall_pick_requested(self, position: QPointF) -> None:
+    def _handle_window_wall_pick_requested(
+        self,
+        position: QPointF,
+        *,
+        additive: bool | None = None,
+    ) -> None:
         if (
             not self._window_editing_enabled
             or self.is_window_placement_active()
             or self.is_surface_vertex_placement_active()
         ):
             return
-        additive = bool(
-            QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier
-        )
+        if additive is None:
+            additive = bool(
+                QApplication.keyboardModifiers()
+                & Qt.KeyboardModifier.ShiftModifier
+            )
         camera_ray = self.view.build_camera_ray(position)
         if camera_ray is None:
             if additive:
@@ -3751,20 +4206,33 @@ class GlbViewerWidget(QWidget):
             return
         ray_origin, ray_direction = camera_ray
         opening_hit = _get_nearest_canvas_opening_ray_hit(
-            tuple(self._canvas_opening_targets.values()),
+            tuple(
+                target
+                for target in self._canvas_opening_targets.values()
+                if target.wall_surface_id
+                in self.get_visible_canvas_surface_ids()
+            ),
             ray_origin,
             ray_direction,
         )
         object_hit = _get_nearest_preview_placed_object_ray_hit(
             tuple(
-                group.preview
+                replace(
+                    group.preview,
+                    placement_transform=group.current_transform,
+                )
                 for group in self._placed_object_render_groups.values()
+                if self._canvas_objects_are_visible()
             ),
             ray_origin,
             ray_direction,
         )
         surface_hit = _get_nearest_fixed_surface_ray_hit(
-            tuple(self._canvas_surface_targets.values()),
+            tuple(
+                surface
+                for surface in self._canvas_surface_targets.values()
+                if self._canvas_surface_is_visible(surface)
+            ),
             ray_origin,
             ray_direction,
         )
@@ -3785,7 +4253,28 @@ class GlbViewerWidget(QWidget):
             self.select_canvas_opening(opening_hit[0].reference)
             return
         if visible_object_hit is not None:
-            self.select_placed_object(visible_object_hit[0].object_id)
+            object_id = visible_object_hit[0].object_id
+            self._set_selected_canvas_opening_key(None)
+            self.select_wall_target(None)
+            if additive and object_id in self._selected_placed_object_ids:
+                next_ids = tuple(
+                    selected_id
+                    for selected_id in self._selected_placed_object_ids
+                    if selected_id != object_id
+                )
+                self.set_selected_placed_object_ids(next_ids)
+            elif additive:
+                self.set_selected_placed_object_ids(
+                    (*self._selected_placed_object_ids, object_id),
+                    active_object_id=object_id,
+                )
+            else:
+                self.set_selected_placed_object_ids(
+                    (object_id,),
+                    active_object_id=object_id,
+                )
+            return
+        if surface_hit is None and additive:
             return
         self._set_selected_canvas_opening_key(None)
         self._set_selected_placed_object(None)
@@ -3802,6 +4291,7 @@ class GlbViewerWidget(QWidget):
             or self.view.is_first_person_pointer_captured
         ):
             return
+        self._invalidate_canvas_rectangle_selection_requests()
         camera_ray = self.view.build_camera_ray(position)
         if camera_ray is None:
             return
@@ -3827,9 +4317,10 @@ class GlbViewerWidget(QWidget):
             self._begin_canvas_surface_edit_drag(surface_edit_target, position)
             return
         handle = self._pick_transform_gizmo_handle(*camera_ray)
-        if handle is None:
+        if handle is not None:
+            self._begin_placed_object_gizmo_drag(handle, position)
             return
-        self._begin_placed_object_gizmo_drag(handle, position)
+        self._begin_canvas_rectangle_selection(position)
 
     def _handle_canvas_gizmo_pointer_moved(self, position: QPointF) -> None:
         """Update the one Canvas gizmo that currently owns the pointer."""
@@ -3845,6 +4336,9 @@ class GlbViewerWidget(QWidget):
             return
         if self._canvas_face_extrusion_drag is not None:
             self._update_canvas_face_extrusion_drag(position)
+            return
+        if self._canvas_rectangle_selection_press_position is not None:
+            self._update_canvas_rectangle_selection(position)
             return
         self._update_placed_object_gizmo_drag(position)
 
@@ -3863,6 +4357,9 @@ class GlbViewerWidget(QWidget):
         if self._canvas_face_extrusion_drag is not None:
             self._finish_canvas_face_extrusion_drag(position)
             return
+        if self._canvas_rectangle_selection_press_position is not None:
+            self._finish_canvas_rectangle_selection(position)
+            return
         self._finish_placed_object_gizmo_drag(position)
 
     def _cancel_canvas_gizmo_drag(self, *_args: object) -> None:
@@ -3880,7 +4377,331 @@ class GlbViewerWidget(QWidget):
         if self._canvas_face_extrusion_drag is not None:
             self._cancel_canvas_face_extrusion_drag()
             return
+        if (
+            self._canvas_rectangle_selection_press_position is not None
+            or self._canvas_rectangle_selection_cancel_event is not None
+        ):
+            self._cancel_canvas_rectangle_selection()
+            return
         self._cancel_placed_object_gizmo_drag()
+
+    # ### Canvas rectangle-selection input ###
+    def _begin_canvas_rectangle_selection(self, position: QPointF) -> bool:
+        """Reserve one possible click or Canvas rubber-band gesture."""
+
+        if (
+            not self._window_editing_enabled
+            or self.model is None
+            or self.view.is_first_person_pointer_captured
+        ):
+            return False
+        self._invalidate_canvas_rectangle_selection_requests()
+        self._canvas_rectangle_selection_press_position = QPointF(position)
+        self._canvas_rectangle_selection_additive = bool(
+            QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier
+        )
+        self.view.reserve_primary_pointer_drag()
+        return True
+
+    def _update_canvas_rectangle_selection(self, position: QPointF) -> None:
+        """Show a normalized rubber band after the click tolerance is crossed."""
+
+        start = self._canvas_rectangle_selection_press_position
+        if start is None:
+            return
+        current = QPointF(position)
+        if _get_point_distance(start, current) <= CLICK_SELECTION_TOLERANCE:
+            self._hide_canvas_rectangle_selection_rubber_band()
+            return
+        rubber_band = self._ensure_canvas_rectangle_selection_rubber_band()
+        rubber_band.setGeometry(
+            QRect(start.toPoint(), current.toPoint()).normalized()
+        )
+        rubber_band.show()
+
+    def _finish_canvas_rectangle_selection(self, position: QPointF) -> bool:
+        """Resolve a short gesture as a click or launch a box raster pass."""
+
+        start = self._canvas_rectangle_selection_press_position
+        additive = self._canvas_rectangle_selection_additive
+        self._canvas_rectangle_selection_press_position = None
+        self._canvas_rectangle_selection_additive = False
+        self._hide_canvas_rectangle_selection_rubber_band()
+        self.view.release_primary_pointer_drag()
+        if start is None:
+            return False
+        end = QPointF(position)
+        if _get_point_distance(start, end) <= CLICK_SELECTION_TOLERANCE:
+            self._handle_window_wall_pick_requested(
+                end,
+                additive=additive,
+            )
+            return True
+        return self._start_canvas_rectangle_selection(
+            start,
+            end,
+            additive=additive,
+        )
+
+    def _cancel_canvas_rectangle_selection(self, *_args: object) -> bool:
+        """Cancel both pending pointer input and an obsolete raster result."""
+
+        had_pointer_interaction = (
+            self._canvas_rectangle_selection_press_position is not None
+        )
+        had_interaction = bool(
+            had_pointer_interaction
+            or self._canvas_rectangle_selection_cancel_event is not None
+        )
+        self._canvas_rectangle_selection_press_position = None
+        self._canvas_rectangle_selection_additive = False
+        self._hide_canvas_rectangle_selection_rubber_band()
+        self._invalidate_canvas_rectangle_selection_requests()
+        if had_pointer_interaction and hasattr(self, "view"):
+            self.view.cancel_primary_pointer_drag()
+        return had_interaction
+
+    def _ensure_canvas_rectangle_selection_rubber_band(self) -> QRubberBand:
+        if self._canvas_rectangle_selection_rubber_band is None:
+            self._canvas_rectangle_selection_rubber_band = QRubberBand(
+                QRubberBand.Shape.Rectangle,
+                self.view,
+            )
+        return self._canvas_rectangle_selection_rubber_band
+
+    def _hide_canvas_rectangle_selection_rubber_band(self) -> None:
+        rubber_band = self._canvas_rectangle_selection_rubber_band
+        if rubber_band is not None:
+            rubber_band.hide()
+
+    def _start_canvas_rectangle_selection(
+        self,
+        start: QPointF,
+        end: QPointF,
+        *,
+        additive: bool = False,
+    ) -> bool:
+        """Capture visible scene targets and start one daemon raster pass."""
+
+        projected_targets = self._capture_canvas_rectangle_selection_targets(
+            start,
+            end,
+        )
+        if projected_targets is None:
+            return False
+        targets, rectangle = projected_targets
+        self._invalidate_canvas_rectangle_selection_requests()
+        cancel_event = threading.Event()
+        self._canvas_rectangle_selection_cancel_event = cancel_event
+        task = _CanvasRectangleSelectionTask(
+            request_revision=self._canvas_rectangle_selection_request_revision,
+            geometry_revision=self._canvas_selection_geometry_revision,
+            projected_targets=targets,
+            rectangle=rectangle,
+            additive=bool(additive),
+        )
+        worker = threading.Thread(
+            target=_run_canvas_rectangle_selection_task,
+            args=(task, cancel_event, weakref.ref(self)),
+            name=f"housemaker-canvas-selection-{task.request_revision}",
+            daemon=True,
+        )
+        worker.start()
+        return True
+
+    def _capture_canvas_rectangle_selection_targets(
+        self,
+        start: QPointF,
+        end: QPointF,
+    ) -> tuple[
+        tuple[tuple[str, str, np.ndarray, np.ndarray], ...],
+        tuple[int, int, int, int],
+    ] | None:
+        """Own current-camera geometry for visible objects and surfaces."""
+
+        target_geometry: list[
+            tuple[str, str, np.ndarray, np.ndarray]
+        ] = []
+        if self._canvas_objects_are_visible():
+            for object_id, group in self._placed_object_render_groups.items():
+                for mesh in group.pick_meshes:
+                    local_vertices = np.asarray(mesh.vertices, dtype=float)
+                    faces = np.asarray(mesh.faces, dtype=np.int64)
+                    if not len(local_vertices) or not len(faces):
+                        continue
+                    target_geometry.append(
+                        (
+                            CANVAS_SELECTION_TARGET_OBJECT,
+                            object_id,
+                            trimesh.transform_points(
+                                local_vertices,
+                                group.current_transform,
+                            ),
+                            faces,
+                        )
+                    )
+        for surface_id, surface in self._canvas_surface_targets.items():
+            if not self._canvas_surface_is_visible(surface):
+                continue
+            vertices = np.asarray(surface.mesh.vertices, dtype=float)
+            faces = np.asarray(surface.mesh.faces, dtype=np.int64)
+            if not len(vertices) or not len(faces):
+                continue
+            target_geometry.append(
+                (
+                    CANVAS_SELECTION_TARGET_SURFACE,
+                    surface_id,
+                    vertices,
+                    faces,
+                )
+            )
+        display_mesh = self._get_display_mesh()
+        if display_mesh is not None:
+            occluder_vertices = np.asarray(display_mesh.vertices, dtype=float)
+            occluder_faces = np.asarray(display_mesh.faces, dtype=np.int64)
+            if len(occluder_vertices) and len(occluder_faces):
+                target_geometry.append(
+                    (
+                        CANVAS_SELECTION_TARGET_OCCLUDER,
+                        "scene",
+                        occluder_vertices,
+                        occluder_faces,
+                    )
+                )
+        if not target_geometry:
+            return None
+        captured = _capture_face_selection_raster_input(
+            self.view,
+            tuple((vertices, faces) for _, _, vertices, faces in target_geometry),
+            QRect(start.toPoint(), end.toPoint()).normalized(),
+        )
+        if captured is None:
+            return None
+        projected_geometry, rectangle = captured
+        return (
+            tuple(
+                (target_type, target_id, projected_vertices, faces)
+                for (
+                    target_type,
+                    target_id,
+                    _vertices,
+                    _faces,
+                ), (projected_vertices, faces) in zip(
+                    target_geometry,
+                    projected_geometry,
+                    strict=True,
+                )
+            ),
+            rectangle,
+        )
+
+    def _invalidate_canvas_rectangle_selection_requests(self) -> None:
+        """Cancel delivery from the active Canvas raster and advance its ID."""
+
+        cancel_event = self._canvas_rectangle_selection_cancel_event
+        if cancel_event is not None:
+            cancel_event.set()
+        self._canvas_rectangle_selection_cancel_event = None
+        self._canvas_rectangle_selection_request_revision += 1
+
+    def _invalidate_external_canvas_rectangle_selection(self) -> None:
+        """Prevent an older box result from replacing a newer selection."""
+
+        if not self._applying_canvas_rectangle_selection_result:
+            self._invalidate_canvas_rectangle_selection_requests()
+
+    @Slot(object)
+    def _apply_canvas_rectangle_selection_result(
+        self,
+        raw_result: object,
+    ) -> None:
+        """Apply one current visible-target result on the Qt GUI thread."""
+
+        if not isinstance(raw_result, _CanvasRectangleSelectionResult):
+            return
+        if (
+            raw_result.request_revision
+            != self._canvas_rectangle_selection_request_revision
+            or raw_result.geometry_revision
+            != self._canvas_selection_geometry_revision
+            or not self._window_editing_enabled
+            or self.model is None
+        ):
+            return
+        self._canvas_rectangle_selection_cancel_event = None
+        self._applying_canvas_rectangle_selection_result = True
+        try:
+            self._apply_canvas_rectangle_selection_targets(raw_result)
+        finally:
+            self._applying_canvas_rectangle_selection_result = False
+
+    def _apply_canvas_rectangle_selection_targets(
+        self,
+        result: _CanvasRectangleSelectionResult,
+    ) -> None:
+        """Apply normalized box targets while external invalidation is paused."""
+
+        visible_object_ids = set(self.get_visible_placed_object_ids())
+        object_ids = tuple(
+            dict.fromkeys(
+                object_id
+                for object_id in result.object_ids
+                if object_id in visible_object_ids
+                and object_id in self._placed_object_render_groups
+            )
+        )
+        visible_surface_ids = set(self.get_visible_canvas_surface_ids())
+        surface_ids = tuple(
+            dict.fromkeys(
+                surface_id
+                for surface_id in result.surface_ids
+                if surface_id in visible_surface_ids
+            )
+        )
+        if object_ids:
+            self._set_selected_canvas_opening_key(None)
+            self.select_wall_target(None)
+            next_object_ids = (
+                tuple(
+                    dict.fromkeys(
+                        (*self._selected_placed_object_ids, *object_ids)
+                    )
+                )
+                if result.additive
+                else object_ids
+            )
+            self.set_selected_placed_object_ids(
+                next_object_ids,
+                active_object_id=object_ids[-1],
+            )
+            return
+        if surface_ids:
+            self._set_selected_canvas_opening_key(None)
+            self._set_selected_placed_object(None)
+            current_surface_ids = (
+                self._selected_canvas_surface_ids
+                if result.additive
+                else ()
+            )
+            next_surface_ids = tuple(
+                dict.fromkeys((*current_surface_ids, *surface_ids))
+            )
+            self.set_selected_canvas_surface_ids(next_surface_ids)
+            self._set_window_wall_selection(
+                next(
+                    (
+                        surface_id
+                        for surface_id in reversed(next_surface_ids)
+                        if surface_id in self._window_wall_targets
+                    ),
+                    None,
+                )
+            )
+            return
+        if not result.additive:
+            self._set_selected_canvas_opening_key(None)
+            self._set_selected_placed_object(None)
+            self.select_canvas_surface_target(None)
 
     # ### Canvas surface vertex input ###
     def _begin_surface_vertex_pointer_interaction(
@@ -3961,7 +4782,7 @@ class GlbViewerWidget(QWidget):
         self._surface_vertex_click_ack_pending = False
         self._remove_surface_vertex_preview_items()
         if self.view.is_primary_pointer_drag_reserved:
-            self.view.release_primary_pointer_drag()
+            self.view.cancel_primary_pointer_drag()
         return had_preview
 
     def _handle_surface_vertex_pointer_hovered(
@@ -4002,8 +4823,13 @@ class GlbViewerWidget(QWidget):
         ray = camera_ray or self.view.build_camera_ray(position)
         if ray is None:
             return None, False
+        visible_surfaces = tuple(
+            surface
+            for surface in self._canvas_surface_targets.values()
+            if self._canvas_surface_is_visible(surface)
+        )
         hit = _get_nearest_fixed_surface_ray_hit(
-            tuple(self._canvas_surface_targets.values()),
+            visible_surfaces,
             *ray,
             front_facing_horizontal_only=True,
         )
@@ -4014,6 +4840,7 @@ class GlbViewerWidget(QWidget):
             tuple(
                 group.preview
                 for group in self._placed_object_render_groups.values()
+                if self._canvas_objects_are_visible()
             ),
             *ray,
         )
@@ -4023,7 +4850,7 @@ class GlbViewerWidget(QWidget):
             _resolve_canvas_surface_vertex_preview(
                 surface,
                 hit_point,
-                tuple(self._canvas_surface_targets.values()),
+                visible_surfaces,
                 tuple(self._canvas_surface_drawing_vertices.values()),
                 self._canvas_surface_drawing_edges,
                 self._active_surface_vertex_id,
@@ -4297,7 +5124,9 @@ class GlbViewerWidget(QWidget):
         surface = self._window_wall_targets.get(
             self._selected_window_wall_surface_id or ""
         )
-        return surface if isinstance(surface, FixedSurface) else None
+        if not isinstance(surface, FixedSurface):
+            return None
+        return surface if self._canvas_surface_is_visible(surface) else None
 
     # ### Canvas surface outline rendering ###
     def _refresh_canvas_surface_selection_outlines(self) -> None:
@@ -4309,7 +5138,7 @@ class GlbViewerWidget(QWidget):
         selected_boundaries: list[np.ndarray] = []
         for surface_id in self._selected_canvas_surface_ids:
             surface = self._canvas_surface_targets.get(surface_id)
-            if surface is None:
+            if surface is None or not self._canvas_surface_is_visible(surface):
                 continue
             positions = _build_fixed_surface_boundary_line_positions(surface)
             if positions is None:
@@ -4366,6 +5195,7 @@ class GlbViewerWidget(QWidget):
             positions
             for surface in self._canvas_surface_targets.values()
             if surface.level_index == level_index
+            and self._canvas_surface_is_visible(surface)
             if (
                 positions := _build_fixed_surface_boundary_line_positions(
                     surface
@@ -4403,7 +5233,7 @@ class GlbViewerWidget(QWidget):
         """Render one depth-tested yellow outline for the pending transform."""
 
         positions = self._level_transform_preview_outline_positions
-        if positions is None:
+        if positions is None or self._canvas_surface_focus_type is not None:
             self._remove_level_transform_preview_outline_item()
             return
 
@@ -4448,6 +5278,7 @@ class GlbViewerWidget(QWidget):
             if (
                 surface_id in selected_surface_ids
                 or not surface.is_directly_drawn
+                or not self._canvas_surface_is_visible(surface)
             ):
                 continue
             target = _build_canvas_face_extrusion_target(
@@ -4485,7 +5316,7 @@ class GlbViewerWidget(QWidget):
             return
         for surface_id in self._highlighted_canvas_surface_ids:
             surface = self._canvas_surface_targets.get(surface_id)
-            if surface is None:
+            if surface is None or not self._canvas_surface_is_visible(surface):
                 continue
             positions = _build_fixed_surface_boundary_line_positions(surface)
             if positions is None:
@@ -4566,7 +5397,7 @@ class GlbViewerWidget(QWidget):
     # ### Doorway preview outline rendering ###
     def _refresh_doorway_preview_outline_item(self) -> None:
         positions = self._doorway_preview_outline_positions
-        if positions is None:
+        if positions is None or self._canvas_surface_focus_type is not None:
             self._remove_doorway_preview_outline_item()
             return
 
@@ -4649,7 +5480,10 @@ class GlbViewerWidget(QWidget):
                 "Surface editing resumes after the level transform is applied."
             )
             return
-        has_surfaces = bool(self._canvas_surface_targets)
+        has_surfaces = any(
+            self._canvas_surface_is_visible(surface)
+            for surface in self._canvas_surface_targets.values()
+        )
         if self.add_surface_vertex_button is not None:
             self.add_surface_vertex_button.setEnabled(has_surfaces)
         if self._surface_tools_status_override is not None:
@@ -4786,6 +5620,7 @@ class GlbViewerWidget(QWidget):
 
     def set_model(self, model: GeneratedModel, preserve_camera: bool = False) -> None:
         self.view.cancel_transient_pointer_interactions()
+        self._cancel_canvas_rectangle_selection()
         self._cancel_canvas_opening_edit_drag()
         self._cancel_canvas_surface_edit_drag()
         self._cancel_canvas_face_extrusion_drag()
@@ -4823,16 +5658,14 @@ class GlbViewerWidget(QWidget):
 
     def clear_model(self) -> None:
         self.view.cancel_transient_pointer_interactions()
+        self._cancel_canvas_rectangle_selection()
         self._cancel_canvas_opening_edit_drag()
         self._cancel_canvas_surface_edit_drag()
         self._cancel_canvas_face_extrusion_drag()
         self.cancel_surface_vertex_placement()
         self._cancel_placed_object_gizmo_drag()
         self.clear_face_edit_geometry()
-        had_selected_placed_object = self._selected_placed_object_id is not None
-        self._selected_placed_object_id = None
-        if had_selected_placed_object:
-            self.placed_object_selection_changed.emit(None)
+        self.set_selected_placed_object_ids(())
         self._set_selected_canvas_opening_key(None)
         if self._window_editing_enabled:
             self.cancel_window_placement(status_message=None)
@@ -4913,6 +5746,7 @@ class GlbViewerWidget(QWidget):
 
         self.view.cancel_transient_pointer_interactions()
         self._cancel_face_selection_gesture()
+        self._cancel_canvas_rectangle_selection()
 
     def get_selected_face_indices(self) -> tuple[int, ...]:
         """Return stable global face indices in ascending order."""
@@ -5958,6 +6792,10 @@ class GlbViewerWidget(QWidget):
         if (
             not self._projection_camera_indicators_visible
             or self.projection_camera_indicator_items
+            or (
+                self._window_editing_enabled
+                and self._canvas_surface_focus_type is not None
+            )
         ):
             return
         bounds = self._get_projection_camera_indicator_bounds()
@@ -6029,6 +6867,8 @@ class GlbViewerWidget(QWidget):
         )
 
     def _populate_scene(self) -> None:
+        self._canvas_selection_geometry_revision += 1
+        self._invalidate_canvas_rectangle_selection_requests()
         self._clear_scene()
         self._add_grid()
         if self.model is None:
@@ -6141,7 +6981,46 @@ class GlbViewerWidget(QWidget):
         self.view.update()
 
     def _get_display_mesh(self):
-        """Return the mesh shared by the retained and mirrored previews."""
+        """Return the base mesh after Canvas visibility filtering."""
+
+        display_mesh = self._get_unfiltered_display_mesh()
+        if display_mesh is None or not self._window_editing_enabled:
+            return display_mesh
+        focus_type = self._canvas_surface_focus_type
+        if focus_type is not None:
+            # AO-only Canvas previews intentionally have no semantic targets.
+            # Keep the latent focus choice for the next regular house model.
+            if not self._canvas_surface_targets:
+                return display_mesh
+            textured_surface_ids = {
+                surface.surface_id
+                for surface in self.model.preview_textured_surfaces
+                if surface.surface_type == focus_type
+            }
+            focused_meshes = [
+                surface.mesh.copy()
+                for surface in self._canvas_surface_targets.values()
+                if surface.surface_type == focus_type
+                and surface.surface_id not in textured_surface_ids
+            ]
+            if not focused_meshes:
+                return trimesh.Trimesh(
+                    vertices=np.empty((0, 3), dtype=float),
+                    faces=np.empty((0, 3), dtype=np.int64),
+                    process=False,
+                )
+            return trimesh.util.concatenate(focused_meshes)
+        if self._canvas_ceiling_hidden:
+            hidden_surfaces = (
+                surface
+                for surface in self._canvas_surface_targets.values()
+                if surface.surface_type == SURFACE_TYPE_CEILING
+            )
+            return remove_covered_surface_faces(display_mesh, hidden_surfaces)
+        return display_mesh
+
+    def _get_unfiltered_display_mesh(self):
+        """Return the ordinary generated-model mesh used by this viewer."""
 
         if self.model is None:
             return None
@@ -6169,10 +7048,18 @@ class GlbViewerWidget(QWidget):
         )
         if grid_height:
             self.grid_item.translate(0.0, 0.0, grid_height)
+        if self._window_editing_enabled:
+            self.grid_item.setVisible(self._canvas_surface_focus_type is None)
         self.view.addItem(self.grid_item)
 
     def _add_textured_wall_items(self) -> None:
-        if self.model is None:
+        if (
+            self.model is None
+            or (
+                self._window_editing_enabled
+                and self._canvas_surface_focus_type is not None
+            )
+        ):
             return
 
         assigned_wall_keys = {
@@ -6205,6 +7092,13 @@ class GlbViewerWidget(QWidget):
             return
         for textured_surface in self.model.preview_textured_surfaces:
             if (
+                self._window_editing_enabled
+                and not self._canvas_surface_type_is_visible(
+                    textured_surface.surface_type
+                )
+            ):
+                continue
+            if (
                 self._placed_object_editing_enabled
                 and self.model.preview_placed_objects
                 and textured_surface.surface_type == "generated_object"
@@ -6227,7 +7121,7 @@ class GlbViewerWidget(QWidget):
     def _add_placed_object_items(self) -> None:
         """Render each Canvas object below one independently movable root."""
 
-        if self.model is None:
+        if self.model is None or not self._canvas_objects_are_visible():
             return
         has_symmetric_preview = False
         for preview in self.model.preview_placed_objects:
@@ -6631,7 +7525,7 @@ class GlbViewerWidget(QWidget):
             return False
         self._canvas_opening_edit_drag = None
         self._canvas_opening_targets[drag.start_target.key] = drag.start_target
-        self.view.release_primary_pointer_drag()
+        self.view.cancel_primary_pointer_drag()
         self._refresh_canvas_opening_gizmo_items()
         self.canvas_opening_edit_cancelled.emit(
             _build_canvas_opening_edit(drag.start_target)
@@ -6650,6 +7544,7 @@ class GlbViewerWidget(QWidget):
             if (
                 (surface := self._canvas_surface_targets.get(surface_id))
                 is not None
+                and self._canvas_surface_is_visible(surface)
                 and surface.surface_type == SURFACE_TYPE_WALL
                 and _get_fixed_surface_source_id(surface) is None
             )
@@ -6661,6 +7556,7 @@ class GlbViewerWidget(QWidget):
         if (
             active_surface_id is not None
             and active_surface is not None
+            and self._canvas_surface_is_visible(active_surface)
             and active_surface.surface_type != SURFACE_TYPE_WALL
         ):
             visible_surface_ids.add(active_surface_id)
@@ -7097,7 +7993,7 @@ class GlbViewerWidget(QWidget):
         if drag is None:
             return False
         self._canvas_surface_edit_drag = None
-        self.view.release_primary_pointer_drag()
+        self.view.cancel_primary_pointer_drag()
         self._refresh_canvas_surface_edit_gizmo_items()
         self.canvas_surface_edit_cancelled.emit(
             _build_canvas_surface_edit(drag.target, 0.0)
@@ -7113,11 +8009,18 @@ class GlbViewerWidget(QWidget):
             return
 
         placement_active = self.is_surface_vertex_placement_active()
-        if placement_active and self._canvas_surface_drawing_edges:
+        visible_edges = tuple(
+            edge
+            for edge in self._canvas_surface_drawing_edges
+            if self._canvas_source_surface_id_is_visible(
+                edge.source_surface_id
+            )
+        )
+        if placement_active and visible_edges:
             edge_positions = np.asarray(
                 tuple(
                     point
-                    for edge in self._canvas_surface_drawing_edges
+                    for edge in visible_edges
                     for point in (
                         edge.start_world_point,
                         edge.end_world_point,
@@ -7142,6 +8045,9 @@ class GlbViewerWidget(QWidget):
             vertex.world_point
             for vertex in self._canvas_surface_drawing_vertices.values()
             if vertex.show_marker
+            and self._canvas_source_surface_id_is_visible(
+                vertex.source_surface_id
+            )
             and vertex.vertex_id != active_vertex_id
             and not any(
                 surface_id in selected_surface_ids
@@ -7163,7 +8069,13 @@ class GlbViewerWidget(QWidget):
         active = self._canvas_surface_drawing_vertices.get(
             active_vertex_id or ""
         )
-        if placement_active and active is not None:
+        if (
+            placement_active
+            and active is not None
+            and self._canvas_source_surface_id_is_visible(
+                active.source_surface_id
+            )
+        ):
             active_item = gl.GLScatterPlotItem(
                 pos=np.asarray((active.world_point,), dtype=float),
                 color=CANVAS_SURFACE_ACTIVE_VERTEX_COLOR,
@@ -7229,6 +8141,14 @@ class GlbViewerWidget(QWidget):
                 self._selected_canvas_surface_ids,
             )
         )
+        if target is not None and any(
+            (
+                surface := self._canvas_surface_targets.get(surface_id)
+            ) is None
+            or not self._canvas_surface_is_visible(surface)
+            for surface_id in target.surface_ids
+        ):
+            target = None
         self._canvas_face_extrusion_target = target
         if target is None or self.model is None:
             self._sync_surface_tools_controls()
@@ -7464,21 +8384,32 @@ class GlbViewerWidget(QWidget):
         if self._canvas_face_extrusion_drag is None:
             return False
         self._canvas_face_extrusion_drag = None
-        self.view.release_primary_pointer_drag()
+        self.view.cancel_primary_pointer_drag()
         self._refresh_canvas_face_extrusion_gizmo_items()
         return True
 
     # ### Placed-object selection and gizmo rendering ###
     def _sync_placed_object_selection_rendering(self) -> None:
+        available_ids = self._placed_object_render_groups.keys()
+        selected_ids = tuple(
+            object_id
+            for object_id in self._selected_placed_object_ids
+            if object_id in available_ids
+        )
+        selection_changed = selected_ids != self._selected_placed_object_ids
+        self._selected_placed_object_ids = selected_ids
         selected_id = self._selected_placed_object_id
-        if selected_id not in self._placed_object_render_groups:
-            selection_changed = selected_id is not None
-            selected_id = None
-            self._selected_placed_object_id = None
-            if selection_changed:
-                self.placed_object_selection_changed.emit(None)
+        if selected_id not in selected_ids:
+            selected_id = selected_ids[-1] if selected_ids else None
+        active_changed = selected_id != self._selected_placed_object_id
+        self._selected_placed_object_id = selected_id
+        if selection_changed:
+            self.placed_object_selection_set_changed.emit(selected_ids)
+        if active_changed:
+            self.placed_object_selection_changed.emit(selected_id)
+        selected_id_set = set(selected_ids)
         for object_id, group in self._placed_object_render_groups.items():
-            group.selection_item.setVisible(object_id == selected_id)
+            group.selection_item.setVisible(object_id in selected_id_set)
         self._remove_transform_gizmo_items()
         if (
             selected_id is not None
@@ -7883,7 +8814,7 @@ class GlbViewerWidget(QWidget):
     def _cancel_placed_object_gizmo_drag(self, *_args: object) -> None:
         drag = self._placed_object_transform_drag
         self._placed_object_transform_drag = None
-        self.view.release_primary_pointer_drag()
+        self.view.cancel_primary_pointer_drag()
         if drag is not None:
             group = self._placed_object_render_groups.get(drag.object_id)
             if group is not None:
@@ -8110,7 +9041,7 @@ class GlbViewerWidget(QWidget):
         self.view.update()
 
 
-# ### Face selection helpers ###
+# ### Selection geometry and raster helpers ###
 def _build_face_selection_item(
     vertices: np.ndarray,
     faces: np.ndarray,
@@ -8225,25 +9156,35 @@ def _capture_face_selection_raster_input(
     view_projection = (
         view.projectionMatrix(viewport, viewport) * view.viewMatrix()
     )
+    projection_matrix = _get_view_projection_matrix(view_projection)
     projected_geometry: list[tuple[np.ndarray, np.ndarray]] = []
+    logical_indices_by_geometry: list[np.ndarray] = []
     for vertices, faces in geometry:
-        projected_vertices = np.ascontiguousarray(
-            _project_vertices_to_view(
-                vertices,
-                view_projection,
+        clip_vertices = _transform_vertices_to_clip_space(
+            vertices,
+            projection_matrix,
+        )
+        projected_vertices, owned_faces, logical_indices = (
+            _clip_selection_geometry_to_view(
+                clip_vertices,
+                faces,
                 viewport_width,
                 viewport_height,
-            ),
-            dtype=float,
+            )
         )
-        owned_faces = np.ascontiguousarray(
-            np.asarray(faces, dtype=np.int64)
-        ).copy()
+        projected_vertices = np.ascontiguousarray(projected_vertices, dtype=float)
+        owned_faces = np.ascontiguousarray(owned_faces, dtype=np.int64)
+        logical_indices = np.ascontiguousarray(logical_indices, dtype=np.int64)
         projected_vertices.setflags(write=False)
         owned_faces.setflags(write=False)
+        logical_indices.setflags(write=False)
         projected_geometry.append((projected_vertices, owned_faces))
+        logical_indices_by_geometry.append(logical_indices)
     return (
-        tuple(projected_geometry),
+        _ProjectedSelectionGeometry(
+            tuple(projected_geometry),
+            tuple(logical_indices_by_geometry),
+        ),
         (
             int(clipped.x()),
             int(clipped.y()),
@@ -8261,25 +9202,59 @@ def _project_vertices_to_view(
 ) -> np.ndarray:
     """Project every XYZ vertex with one captured Qt matrix."""
 
-    normalized_vertices = np.asarray(vertices, dtype=np.float32)
-    projected = np.full((len(normalized_vertices), 4), np.nan, dtype=float)
-    if len(normalized_vertices) == 0:
-        return projected
+    projection_matrix = _get_view_projection_matrix(view_projection)
+    clip_vertices = _transform_vertices_to_clip_space(
+        vertices,
+        projection_matrix,
+    )
+    return _project_clip_vertices_to_view(
+        clip_vertices,
+        viewport_width,
+        viewport_height,
+    )
+
+
+def _get_view_projection_matrix(view_projection: object) -> np.ndarray:
+    """Copy one Qt-compatible 4x4 matrix into NumPy column-major order."""
 
     matrix_data = np.asarray(view_projection.data(), dtype=np.float32)
     if matrix_data.shape != (16,):
         raise ValueError("Face selection requires a 4x4 view-projection matrix.")
-    matrix = matrix_data.reshape((4, 4), order="F")
+    return matrix_data.reshape((4, 4), order="F")
+
+
+def _transform_vertices_to_clip_space(
+    vertices: np.ndarray,
+    projection_matrix: np.ndarray,
+) -> np.ndarray:
+    """Transform XYZ vertices once while retaining homogeneous clip values."""
+
+    normalized_vertices = np.asarray(vertices, dtype=np.float32)
+    if len(normalized_vertices) == 0:
+        return np.empty((0, 4), dtype=np.float32)
     clip_vertices = np.empty((len(normalized_vertices), 4), dtype=np.float32)
     with np.errstate(invalid="ignore", over="ignore"):
-        for component_index, row in enumerate(matrix):
+        for component_index, row in enumerate(projection_matrix):
             clip_vertices[:, component_index] = (
                 row[0] * normalized_vertices[:, 0]
                 + row[1] * normalized_vertices[:, 1]
                 + row[2] * normalized_vertices[:, 2]
                 + row[3]
             )
+    return clip_vertices
 
+
+def _project_clip_vertices_to_view(
+    clip_vertices: np.ndarray,
+    viewport_width: int,
+    viewport_height: int,
+) -> np.ndarray:
+    """Perspective-divide homogeneous vertices using logical viewport pixels."""
+
+    normalized_vertices = np.asarray(clip_vertices, dtype=float)
+    projected = np.full((len(normalized_vertices), 4), np.nan, dtype=float)
+    if len(normalized_vertices) == 0:
+        return projected
     clip_w = clip_vertices[:, 3]
     usable = np.isfinite(clip_w) & (clip_w > 1e-10)
     normalized_clip = np.full(
@@ -8304,6 +9279,175 @@ def _project_vertices_to_view(
     projected[usable, 2] = normalized_clip[usable, 2]
     projected[usable, 3] = 1.0
     return projected
+
+
+def _clip_selection_geometry_to_view(
+    clip_vertices: np.ndarray,
+    faces: object,
+    viewport_width: int,
+    viewport_height: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Clip triangles to the homogeneous frustum and retain logical face IDs."""
+
+    normalized_clip_vertices = np.asarray(clip_vertices, dtype=float)
+    normalized_faces = np.asarray(faces, dtype=np.int64)
+    if (
+        normalized_clip_vertices.ndim != 2
+        or normalized_clip_vertices.shape[1:] != (4,)
+        or normalized_faces.ndim != 2
+        or normalized_faces.shape[1:] != (3,)
+        or np.any(normalized_faces < 0)
+        or (
+            normalized_faces.size
+            and np.any(normalized_faces >= len(normalized_clip_vertices))
+        )
+    ):
+        raise ValueError("Selection clipping requires homogeneous triangle geometry.")
+
+    projected_vertices = _project_clip_vertices_to_view(
+        normalized_clip_vertices,
+        viewport_width,
+        viewport_height,
+    )
+    clip_planes = np.asarray(
+        SELECTION_HOMOGENEOUS_CLIP_PLANES,
+        dtype=float,
+    )
+    clipped_faces: list[tuple[int, int, int]] = []
+    clipped_logical_indices: list[int] = []
+    appended_projected_vertices: list[np.ndarray] = []
+    next_vertex_index = len(projected_vertices)
+    triangles = normalized_clip_vertices[normalized_faces]
+    finite_faces = np.all(np.isfinite(triangles), axis=(1, 2))
+    plane_distances = np.einsum(
+        "fvc,pc->fvp",
+        triangles,
+        clip_planes,
+    )
+    fully_inside = finite_faces & np.all(
+        plane_distances >= -SELECTION_CLIP_PLANE_EPSILON,
+        axis=(1, 2),
+    )
+    trivially_outside = (~finite_faces) | np.any(
+        np.all(
+            plane_distances < -SELECTION_CLIP_PLANE_EPSILON,
+            axis=1,
+        ),
+        axis=1,
+    )
+    inside_faces = normalized_faces[fully_inside]
+    inside_logical_indices = np.flatnonzero(fully_inside).astype(
+        np.int64,
+        copy=False,
+    )
+    crossing_face_indices = np.flatnonzero(
+        ~(fully_inside | trivially_outside)
+    )
+    for logical_face_index in crossing_face_indices:
+        clipped_polygon = triangles[int(logical_face_index)]
+        for clip_plane in clip_planes:
+            clipped_polygon = _clip_homogeneous_polygon_against_plane(
+                clipped_polygon,
+                clip_plane,
+            )
+            if len(clipped_polygon) < 3:
+                break
+        clipped_polygon = _remove_duplicate_polygon_vertices(clipped_polygon)
+        if len(clipped_polygon) < 3:
+            continue
+        projected_polygon = _project_clip_vertices_to_view(
+            clipped_polygon,
+            viewport_width,
+            viewport_height,
+        )
+        if not np.all(np.isfinite(projected_polygon)):
+            continue
+        appended_projected_vertices.extend(projected_polygon)
+        for polygon_index in range(1, len(projected_polygon) - 1):
+            clipped_faces.append(
+                (
+                    next_vertex_index,
+                    next_vertex_index + polygon_index,
+                    next_vertex_index + polygon_index + 1,
+                )
+            )
+            clipped_logical_indices.append(int(logical_face_index))
+        next_vertex_index += len(projected_polygon)
+
+    if appended_projected_vertices:
+        projected_vertices = np.vstack(
+            (projected_vertices, appended_projected_vertices)
+        )
+    output_faces = inside_faces
+    output_logical_indices = inside_logical_indices
+    if clipped_faces:
+        output_faces = np.vstack(
+            (
+                output_faces,
+                np.asarray(clipped_faces, dtype=np.int64).reshape((-1, 3)),
+            )
+        )
+        output_logical_indices = np.concatenate(
+            (
+                output_logical_indices,
+                np.asarray(clipped_logical_indices, dtype=np.int64),
+            )
+        )
+    return (
+        projected_vertices,
+        np.asarray(output_faces, dtype=np.int64).reshape((-1, 3)),
+        np.asarray(output_logical_indices, dtype=np.int64),
+    )
+
+
+def _clip_homogeneous_polygon_against_plane(
+    polygon: np.ndarray,
+    clip_plane: np.ndarray,
+) -> np.ndarray:
+    """Clip one convex homogeneous polygon against one inclusive half-space."""
+
+    if len(polygon) == 0:
+        return np.empty((0, 4), dtype=float)
+    clipped: list[np.ndarray] = []
+    previous = polygon[-1]
+    previous_distance = float(np.dot(previous, clip_plane))
+    previous_inside = previous_distance >= -SELECTION_CLIP_PLANE_EPSILON
+    for current in polygon:
+        current_distance = float(np.dot(current, clip_plane))
+        current_inside = current_distance >= -SELECTION_CLIP_PLANE_EPSILON
+        if current_inside != previous_inside:
+            denominator = previous_distance - current_distance
+            if abs(denominator) > 1e-15:
+                ratio = previous_distance / denominator
+                clipped.append(previous + (current - previous) * ratio)
+        if current_inside:
+            clipped.append(current)
+        previous = current
+        previous_distance = current_distance
+        previous_inside = current_inside
+    return np.asarray(clipped, dtype=float).reshape((-1, 4))
+
+
+def _remove_duplicate_polygon_vertices(polygon: np.ndarray) -> np.ndarray:
+    """Remove adjacent clip intersections that would create zero-area fans."""
+
+    if len(polygon) < 2:
+        return np.asarray(polygon, dtype=float).reshape((-1, 4))
+    unique_vertices = [polygon[0]]
+    for vertex in polygon[1:]:
+        if not np.allclose(vertex, unique_vertices[-1], atol=1e-10, rtol=0.0):
+            unique_vertices.append(vertex)
+    if (
+        len(unique_vertices) > 1
+        and np.allclose(
+            unique_vertices[0],
+            unique_vertices[-1],
+            atol=1e-10,
+            rtol=0.0,
+        )
+    ):
+        unique_vertices.pop()
+    return np.asarray(unique_vertices, dtype=float).reshape((-1, 4))
 
 
 def _get_nearest_projected_line_hit(
@@ -8366,6 +9510,8 @@ def _rasterize_face_selection(
     rectangle: QRect,
     *,
     cancel_event: threading.Event | None = None,
+    logical_face_indices_by_geometry: Sequence[np.ndarray] | None = None,
+    depth_tie_epsilon: float = 0.0,
 ) -> set[int]:
     """Depth-test current-camera faces in a bounded logical-ID buffer.
 
@@ -8375,6 +9521,14 @@ def _rasterize_face_selection(
     excluded without rounding the projected triangle boundary.
     """
 
+    normalized_depth_tie_epsilon = float(depth_tie_epsilon)
+    if (
+        not math.isfinite(normalized_depth_tie_epsilon)
+        or normalized_depth_tie_epsilon < 0.0
+    ):
+        raise ValueError(
+            "Face-selection depth epsilon must be finite and nonnegative."
+        )
     left = float(rectangle.left())
     top = float(rectangle.top())
     width = max(int(rectangle.width()), 1)
@@ -8384,7 +9538,24 @@ def _rasterize_face_selection(
     candidate_triangles: list[np.ndarray] = []
     candidate_face_indices: list[np.ndarray] = []
 
-    for projected_vertices, faces in projected_geometry:
+    if logical_face_indices_by_geometry is None:
+        embedded_logical_indices = getattr(
+            projected_geometry,
+            "logical_face_indices_by_geometry",
+            None,
+        )
+        if embedded_logical_indices is not None:
+            logical_face_indices_by_geometry = embedded_logical_indices
+    if (
+        logical_face_indices_by_geometry is not None
+        and len(logical_face_indices_by_geometry) != len(projected_geometry)
+    ):
+        raise ValueError(
+            "Logical face-index arrays must match projected geometry."
+        )
+    for geometry_index, (projected_vertices, faces) in enumerate(
+        projected_geometry
+    ):
         if cancel_event is not None and cancel_event.is_set():
             return set()
         normalized_faces = np.asarray(faces, dtype=np.int64)
@@ -8412,9 +9583,21 @@ def _rasterize_face_selection(
         if not np.any(candidates):
             continue
         candidate_triangles.append(triangles[candidates])
-        candidate_face_indices.append(
-            np.flatnonzero(candidates).astype(np.int64)
-        )
+        if logical_face_indices_by_geometry is None:
+            geometry_logical_indices = np.arange(
+                len(normalized_faces),
+                dtype=np.int64,
+            )
+        else:
+            geometry_logical_indices = np.asarray(
+                logical_face_indices_by_geometry[geometry_index],
+                dtype=np.int64,
+            )
+            if geometry_logical_indices.shape != (len(normalized_faces),):
+                raise ValueError(
+                    "Each logical face-index array must match its face count."
+                )
+        candidate_face_indices.append(geometry_logical_indices[candidates])
 
     if not candidate_triangles:
         return set()
@@ -8505,7 +9688,10 @@ def _rasterize_face_selection(
             & (interpolated_depth <= 1.0 + 1e-6)
         )
         current_depth = depth_buffer[local_y, local_x]
-        nearer = inside & (interpolated_depth < current_depth)
+        nearer = inside & (
+            interpolated_depth
+            < current_depth - normalized_depth_tie_epsilon
+        )
         if not np.any(nearer):
             continue
         current_depth[nearer] = interpolated_depth[nearer]
@@ -8517,6 +9703,88 @@ def _rasterize_face_selection(
         for face_index in np.unique(face_buffer)
         if face_index >= 0
     }
+
+
+def _rasterize_canvas_target_selection(
+    projected_targets: Sequence[
+        tuple[str, str, np.ndarray, np.ndarray]
+    ],
+    rectangle: QRect,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Depth-test a box and return visible surface and object target IDs."""
+
+    projected_geometry = tuple(
+        (projected_vertices, faces)
+        for _target_type, _target_id, projected_vertices, faces
+        in projected_targets
+    )
+    logical_target_indices = tuple(
+        np.full(len(faces), target_index, dtype=np.int64)
+        for target_index, (
+            _target_type,
+            _target_id,
+            _projected_vertices,
+            faces,
+        ) in enumerate(projected_targets)
+    )
+    selected_target_indices = _rasterize_face_selection(
+        projected_geometry,
+        rectangle,
+        cancel_event=cancel_event,
+        logical_face_indices_by_geometry=logical_target_indices,
+        depth_tie_epsilon=CANVAS_SELECTION_DEPTH_TIE_EPSILON,
+    )
+    surface_ids: list[str] = []
+    object_ids: list[str] = []
+    for target_index, (target_type, target_id, _vertices, _faces) in enumerate(
+        projected_targets
+    ):
+        if target_index not in selected_target_indices:
+            continue
+        if target_type == CANVAS_SELECTION_TARGET_OBJECT:
+            if target_id not in object_ids:
+                object_ids.append(target_id)
+        elif target_type == CANVAS_SELECTION_TARGET_SURFACE:
+            if target_id not in surface_ids:
+                surface_ids.append(target_id)
+    return tuple(surface_ids), tuple(object_ids)
+
+
+def _run_canvas_rectangle_selection_task(
+    task: _CanvasRectangleSelectionTask,
+    cancel_event: threading.Event,
+    viewer_reference: weakref.ReferenceType[GlbViewerWidget],
+) -> None:
+    """Rasterize immutable Canvas targets and queue a current result."""
+
+    if cancel_event.is_set():
+        return
+    try:
+        surface_ids, object_ids = _rasterize_canvas_target_selection(
+            task.projected_targets,
+            QRect(*task.rectangle),
+            cancel_event=cancel_event,
+        )
+    except Exception:
+        return
+    if cancel_event.is_set():
+        return
+    viewer = viewer_reference()
+    if viewer is None:
+        return
+    result = _CanvasRectangleSelectionResult(
+        request_revision=task.request_revision,
+        geometry_revision=task.geometry_revision,
+        surface_ids=surface_ids,
+        object_ids=object_ids,
+        additive=task.additive,
+    )
+    try:
+        viewer._canvas_rectangle_selection_completed.emit(result)
+    except RuntimeError:
+        return
 
 
 def _run_face_rectangle_selection_task(
