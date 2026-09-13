@@ -675,6 +675,20 @@ class GlbViewerRenderingTests(unittest.TestCase):
         self.assertTrue(viewer.get_wireframe_enabled())
         self.assertTrue(viewer.mesh_item.opts["drawEdges"])
 
+    def test_reference_grid_stays_below_loaded_model_geometry(self) -> None:
+        viewer = self._build_viewer(wireframe_enabled=False)
+        model = _build_generated_model(textured=True)
+        model.mesh.apply_translation((0.0, 0.0, 4.0))
+
+        viewer.set_model(model)
+
+        self.assertIsNotNone(viewer.grid_item)
+        assert viewer.grid_item is not None
+        grid_height = float(viewer.grid_item.transform().matrix()[2, 3])
+        model_minimum_z = float(np.min(model.mesh.vertices[:, 2]))
+        self.assertLess(grid_height, model_minimum_z)
+        self.assertAlmostEqual(grid_height, model_minimum_z - 0.01)
+
     def test_hidden_initial_wireframe_prepares_edges_for_later_toggle(
         self,
     ) -> None:

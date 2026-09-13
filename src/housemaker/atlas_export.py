@@ -58,12 +58,9 @@ from housemaker.texture_atlas_state import (
     ATLAS_HALF_SLOT_PACKING_MODES,
     ATLAS_PACKING_MODE_FULL,
     ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
-    ATLAS_SLOT_HALF_RIGHT,
-    ATLAS_SLOT_QUADRANT_BOTTOM_LEFT,
-    ATLAS_SLOT_QUADRANT_BOTTOM_RIGHT,
-    ATLAS_SLOT_QUADRANT_TOP_RIGHT,
     TextureAtlasPlacement,
     TextureAtlasRecord,
+    atlas_placement_pixel_regions,
 )
 
 # ### Constants ###
@@ -75,6 +72,7 @@ GEOMETRY_EPSILON = 1e-12
 MAX_TILED_SURFACE_TRIANGLES = 2_000_000
 PACKED_ORM_MATERIAL_MARKER_PREFIX = "__housemaker_packed_orm__:"
 AO_ONLY_MATERIAL_MARKER_PREFIX = "__housemaker_ao_only__:"
+ATLAS_SAMPLER_MATERIAL_MARKER_PREFIX = "__housemaker_atlas_sampler__:"
 
 
 # ### Public data models ###
@@ -925,16 +923,21 @@ def _apply_texture_atlases_to_export(
     if batched_count == 0 and half_model_count == 0:
         return model, surface_ao_bakes
     packed_orm_material_names: dict[str, str | PackedOrmMaterialSpec] = {}
+    atlas_texture_material_names: dict[str, str] = {}
     ao_only_material_names: dict[str, str] = {}
-    renamed_materials: list[tuple[PBRMaterial, str, bool]] = []
+    renamed_materials: list[tuple[PBRMaterial, str]] = []
+    ambient_occlusion_materials: list[tuple[PBRMaterial, bool]] = []
     occupied_material_names = _collect_scene_material_names(output_scene)
-    for atlas_id in sorted(ambient_occlusion_by_atlas):
-        material = atlas_materials.get(atlas_id)
-        if material is None:
-            continue
+    for atlas_id in sorted(atlas_materials):
+        material = atlas_materials[atlas_id]
         final_name = materialized_by_id[atlas_id].atlas.name
+        has_ambient_occlusion = atlas_id in ambient_occlusion_by_atlas
         marker_name = _reserve_name(
-            f"{PACKED_ORM_MATERIAL_MARKER_PREFIX}{atlas_id}",
+            (
+                f"{PACKED_ORM_MATERIAL_MARKER_PREFIX}{atlas_id}"
+                if has_ambient_occlusion
+                else f"{ATLAS_SAMPLER_MATERIAL_MARKER_PREFIX}{atlas_id}"
+            ),
             occupied_material_names,
         )
         material.name = marker_name
@@ -942,34 +945,40 @@ def _apply_texture_atlases_to_export(
         has_metallic_roughness = bool(
             atlas_item.active_map_types & {PBR_MAP_ROUGHNESS, PBR_MAP_METALLIC}
         )
-        renamed_materials.append((material, final_name, has_metallic_roughness))
+        renamed_materials.append((material, final_name))
         serialized_name = final_name
-        if not has_metallic_roughness:
+        if has_ambient_occlusion and not has_metallic_roughness:
             serialized_name = _reserve_name(
                 f"{AO_ONLY_MATERIAL_MARKER_PREFIX}{atlas_id}",
                 occupied_material_names,
             )
             ao_only_material_names[serialized_name] = final_name
-        uses_surface_ao = atlas_id in surface_ao_atlas_ids
-        packed_orm_material_names[marker_name] = PackedOrmMaterialSpec(
-            final_name=serialized_name,
-            ao_tex_coord=1 if uses_surface_ao else 0,
-            ao_strength=(atlas_item.surface_ao_intensity if uses_surface_ao else 1.0),
-        )
+        atlas_texture_material_names[marker_name] = serialized_name
+        if has_ambient_occlusion:
+            uses_surface_ao = atlas_id in surface_ao_atlas_ids
+            packed_orm_material_names[marker_name] = PackedOrmMaterialSpec(
+                final_name=serialized_name,
+                ao_tex_coord=1 if uses_surface_ao else 0,
+                ao_strength=(
+                    atlas_item.surface_ao_intensity if uses_surface_ao else 1.0
+                ),
+            )
+            ambient_occlusion_materials.append((material, has_metallic_roughness))
     try:
         exported = _serialize_scene_glb_with_half_mesh_extras(
             output_scene,
             failure_message="The texture Atlas scene could not be exported.",
             packed_orm_material_names=packed_orm_material_names,
+            atlas_texture_material_names=atlas_texture_material_names,
         )
         exported = _finalize_ao_only_glb_materials(
             exported,
             ao_only_material_names,
         )
     finally:
-        for material, final_name, _has_metallic_roughness in renamed_materials:
+        for material, final_name in renamed_materials:
             material.name = final_name
-    for material, _final_name, has_metallic_roughness in renamed_materials:
+    for material, has_metallic_roughness in ambient_occlusion_materials:
         material.occlusionTexture = material.metallicRoughnessTexture
         if not has_metallic_roughness:
             material.metallicRoughnessTexture = None
@@ -1944,6 +1953,7 @@ def _remap_fragment_to_atlas(
         uv,
         placement,
         atlas_resolution,
+        repeat_source_uvs=repeat_source_uvs,
     )
     fragment.visual = TextureVisuals(uv=mapped_uv, material=None)
     return fragment
@@ -1974,7 +1984,16 @@ def _map_uv_to_placement(
     uv: np.ndarray,
     placement: TextureAtlasPlacement,
     atlas_resolution: int,
+    *,
+    repeat_source_uvs: bool = False,
 ) -> np.ndarray:
+    """Map authored UVs into one placement's guarded inner rectangle.
+
+    Repeating surfaces land on the inner pixel boundaries so their opposite
+    wrapped guards meet continuously. Non-repeating objects remain inset to
+    texel centers so their dilated edge colors behave like ordinary clamping.
+    """
+
     (
         source_lower,
         source_upper,
@@ -1998,14 +2017,25 @@ def _map_uv_to_placement(
     normalized_y_from_top = np.clip(normalized_y_from_top, 0.0, 1.0)
     resolution = float(atlas_resolution)
     mapped = np.empty_like(uv, dtype=float)
-    mapped[:, 0] = (
-        content_x + 0.5 + normalized_u * max(content_width - 1.0, 0.0)
-    ) / resolution
-    mapped[:, 1] = (
-        1.0
-        - (content_y + 0.5 + normalized_y_from_top * max(content_height - 1.0, 0.0))
-        / resolution
-    )
+    if repeat_source_uvs:
+        mapped[:, 0] = (content_x + normalized_u * content_width) / resolution
+        mapped[:, 1] = (
+            1.0
+            - (content_y + normalized_y_from_top * content_height) / resolution
+        )
+    else:
+        mapped[:, 0] = (
+            content_x + 0.5 + normalized_u * max(content_width - 1.0, 0.0)
+        ) / resolution
+        mapped[:, 1] = (
+            1.0
+            - (
+                content_y
+                + 0.5
+                + normalized_y_from_top * max(content_height - 1.0, 0.0)
+            )
+            / resolution
+        )
     if np.any(mapped < -UV_TOLERANCE) or np.any(mapped > 1.0 + UV_TOLERANCE):
         raise ValueError("Remapped texture Atlas UVs leave the Atlas bounds.")
     return np.ascontiguousarray(np.clip(mapped, 0.0, 1.0))
@@ -2014,41 +2044,26 @@ def _map_uv_to_placement(
 def _placement_content_region(
     placement: TextureAtlasPlacement,
 ) -> tuple[np.ndarray, np.ndarray, float, float, float, float]:
-    """Return source UV bounds and destination pixel bounds for one slot."""
+    """Return source UV bounds and guarded destination content bounds."""
 
     source_lower = np.asarray((0.0, 0.0), dtype=float)
     source_upper = np.asarray((1.0, 1.0), dtype=float)
-    content_x = float(placement.x)
-    content_y = float(placement.y)
-    content_width = float(placement.size)
-    content_height = float(placement.size)
     if placement.packing_mode in ATLAS_HALF_SLOT_PACKING_MODES:
         source_upper[0] = 0.5
-        content_width /= 2.0
-        if placement.slot_half == ATLAS_SLOT_HALF_RIGHT:
-            content_x += content_width
     elif placement.packing_mode == ATLAS_PACKING_MODE_SYMMETRIC_QUARTER:
         source_upper[0] = 0.5
         source_lower[1] = 0.5
-        content_width = float(placement.texture_resolution)
-        content_height = float(placement.texture_resolution)
-        if placement.slot_quadrant in {
-            ATLAS_SLOT_QUADRANT_TOP_RIGHT,
-            ATLAS_SLOT_QUADRANT_BOTTOM_RIGHT,
-        }:
-            content_x += content_width
-        if placement.slot_quadrant in {
-            ATLAS_SLOT_QUADRANT_BOTTOM_LEFT,
-            ATLAS_SLOT_QUADRANT_BOTTOM_RIGHT,
-        }:
-            content_y += content_height
+    _outer_bounds, inner_bounds = atlas_placement_pixel_regions(placement)
+    content_x, content_y, content_right, content_bottom = (
+        float(value) for value in inner_bounds
+    )
     return (
         source_lower,
         source_upper,
         content_x,
         content_y,
-        content_width,
-        content_height,
+        content_right - content_x,
+        content_bottom - content_y,
     )
 
 
@@ -2057,20 +2072,8 @@ def _placement_pixel_bounds(
 ) -> tuple[int, int, int, int]:
     """Return the exclusive Atlas-pixel bounds owned by one placement."""
 
-    (
-        _source_lower,
-        _source_upper,
-        content_x,
-        content_y,
-        content_width,
-        content_height,
-    ) = _placement_content_region(placement)
-    return (
-        round(content_x),
-        round(content_y),
-        round(content_x + content_width),
-        round(content_y + content_height),
-    )
+    outer_bounds, _inner_bounds = atlas_placement_pixel_regions(placement)
+    return outer_bounds
 
 
 # ### Repeating-surface helpers ###

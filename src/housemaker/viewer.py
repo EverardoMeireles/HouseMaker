@@ -99,6 +99,7 @@ from housemaker.unused_face_removal import ALL_CAMERA_IDS
 EDGE_COLOR = (0.12, 0.12, 0.16, 1.0)
 FACE_COLOR = np.array([0.78, 0.80, 0.84, 1.0], dtype=float)
 TEXTURE_PREVIEW_OFFSET_METERS = 0.01
+GRID_MODEL_CLEARANCE_METERS = 0.01
 CAMERA_STATE_KEYS = ("center", "distance", "elevation", "azimuth", "fov")
 CLICK_SELECTION_TOLERANCE = 4.0
 PROJECTION_CAMERA_SELECTION_TOLERANCE_PIXELS = 10.0
@@ -6158,9 +6159,16 @@ class GlbViewerWidget(QWidget):
         return self.model.mesh
 
     def _add_grid(self) -> None:
+        """Keep the reference grid below loaded geometry to avoid z-fighting."""
+
         self.grid_item = gl.GLGridItem()
         self.grid_item.setSize(x=20.0, y=20.0)
         self.grid_item.setSpacing(x=1.0, y=1.0)
+        grid_height = _get_reference_grid_height(
+            None if self.model is None else self.model.mesh
+        )
+        if grid_height:
+            self.grid_item.translate(0.0, 0.0, grid_height)
         self.view.addItem(self.grid_item)
 
     def _add_textured_wall_items(self) -> None:
@@ -10566,6 +10574,21 @@ def _build_textured_wall_transform(
 def _get_point_distance(first_point: QPointF, second_point: QPointF) -> float:
     delta = first_point - second_point
     return float((delta.x() ** 2 + delta.y() ** 2) ** 0.5)
+
+
+# ### Scene background helpers ###
+def _get_reference_grid_height(mesh: object | None) -> float:
+    """Return zero without geometry or a plane below its finite Z bounds."""
+
+    vertices = np.asarray(getattr(mesh, "vertices", ()), dtype=float)
+    if (
+        vertices.ndim != 2
+        or vertices.shape[1:] != (3,)
+        or not len(vertices)
+        or not np.all(np.isfinite(vertices))
+    ):
+        return 0.0
+    return float(np.min(vertices[:, 2])) - GRID_MODEL_CLEARANCE_METERS
 
 
 # ### Navigation helpers ###

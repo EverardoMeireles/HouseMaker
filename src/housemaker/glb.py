@@ -114,6 +114,9 @@ GLB_VERSION = 2
 GLB_HEADER_BYTE_COUNT = 12
 GLB_CHUNK_HEADER_BYTE_COUNT = 8
 GLB_JSON_CHUNK_TYPE = b"JSON"
+GLTF_LINEAR_FILTER = 9729
+GLTF_LINEAR_MIPMAP_LINEAR_FILTER = 9987
+GLTF_CLAMP_TO_EDGE_WRAP = 33071
 NAMED_MESH_ROLE_SURFACE = "surface"
 NAMED_MESH_ROLE_OPENING_REVEAL = "opening_reveal"
 NAMED_MESH_ROLE_STAIR = "stair"
@@ -3184,6 +3187,7 @@ def _serialize_scene_glb_with_half_mesh_extras(
         str | PackedOrmMaterialSpec,
     ]
     | None = None,
+    atlas_texture_material_names: Mapping[str, str] | None = None,
 ) -> bytes:
     """Serialize a scene while preserving HouseMaker glTF metadata."""
 
@@ -3198,6 +3202,7 @@ def _serialize_scene_glb_with_half_mesh_extras(
         half_mesh_by_node_name,
         failure_message=failure_message,
         packed_orm_material_names=packed_orm_material_names,
+        atlas_texture_material_names=atlas_texture_material_names,
     )
 
 
@@ -3211,6 +3216,7 @@ def _rewrite_serialized_glb_half_mesh_extras(
         str | PackedOrmMaterialSpec,
     ]
     | None = None,
+    atlas_texture_material_names: Mapping[str, str] | None = None,
 ) -> bytes:
     """Inject HouseMaker fields into the literal final GLB JSON chunk."""
 
@@ -3240,6 +3246,11 @@ def _rewrite_serialized_glb_half_mesh_extras(
     except (TypeError, UnicodeError, ValueError) as error:
         raise ValueError(failure_message) from error
 
+    _inject_atlas_texture_samplers(
+        document,
+        atlas_texture_material_names or {},
+        deferred_material_names=(packed_orm_material_names or {}).keys(),
+    )
     _inject_packed_orm_occlusion_textures(
         document,
         packed_orm_material_names or {},
@@ -3278,6 +3289,145 @@ def _rewrite_serialized_glb_half_mesh_extras(
     )
 
 
+# ### Atlas sampler serialization helpers ###
+def _inject_atlas_texture_samplers(
+    document: dict[str, object],
+    atlas_material_names: Mapping[str, str],
+    *,
+    deferred_material_names: Iterable[str] = (),
+) -> None:
+    """Bind guarded Atlas maps to trilinear, clamped sampling."""
+
+    if not atlas_material_names:
+        return
+    normalized_names = {
+        str(marker_name): str(final_name)
+        for marker_name, final_name in atlas_material_names.items()
+    }
+    if any(not marker or not final for marker, final in normalized_names.items()):
+        raise ValueError("Atlas material names cannot be empty.")
+    deferred_names = {str(name) for name in deferred_material_names}
+    unknown_deferred_names = deferred_names - set(normalized_names)
+    if unknown_deferred_names:
+        raise ValueError("A deferred Atlas material marker is unknown.")
+
+    materials = document.get("materials")
+    textures = document.get("textures")
+    if not isinstance(materials, list) or not isinstance(textures, list):
+        raise ValueError("The Atlas GLB texture data is missing.")
+
+    target_material_indices: set[int] = set()
+    found_marker_names: set[str] = set()
+    for material_index, material in enumerate(materials):
+        if not isinstance(material, dict):
+            continue
+        marker_name = material.get("name")
+        if not isinstance(marker_name, str) or marker_name not in normalized_names:
+            continue
+        if marker_name in found_marker_names:
+            raise ValueError("Atlas material markers must be unique.")
+        target_material_indices.add(material_index)
+        found_marker_names.add(marker_name)
+    if found_marker_names != set(normalized_names):
+        raise ValueError("An Atlas material was not exported.")
+
+    target_references: dict[int, list[dict[str, object]]] = {}
+    non_target_texture_indices: set[int] = set()
+    for material_index, material in enumerate(materials):
+        if not isinstance(material, dict):
+            continue
+        if material_index in target_material_indices:
+            for texture_info in _iter_gltf_material_texture_infos(material):
+                texture_index = _require_gltf_texture_index(texture_info, textures)
+                target_references.setdefault(texture_index, []).append(texture_info)
+        else:
+            for texture_info in _iter_gltf_material_texture_infos(material):
+                non_target_texture_indices.add(
+                    _require_gltf_texture_index(texture_info, textures)
+                )
+    if not target_references:
+        raise ValueError("An Atlas material has no supported texture maps.")
+
+    sampler_index = _get_or_add_atlas_texture_sampler(document)
+    for texture_index, references in target_references.items():
+        texture = textures[texture_index]
+        if not isinstance(texture, dict):
+            raise ValueError("An Atlas GLB texture is invalid.")
+        if texture_index in non_target_texture_indices:
+            texture = copy.deepcopy(texture)
+            textures.append(texture)
+            replacement_index = len(textures) - 1
+            for texture_info in references:
+                texture_info["index"] = replacement_index
+        texture["sampler"] = sampler_index
+
+    for material in materials:
+        if not isinstance(material, dict):
+            continue
+        marker_name = material.get("name")
+        if (
+            isinstance(marker_name, str)
+            and marker_name in normalized_names
+            and marker_name not in deferred_names
+        ):
+            material["name"] = normalized_names[marker_name]
+
+
+def _iter_gltf_material_texture_infos(
+    value: object,
+) -> Iterable[dict[str, object]]:
+    """Yield standard and extension texture-info objects recursively."""
+
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if isinstance(child, dict) and str(key).endswith("Texture"):
+                yield child
+            yield from _iter_gltf_material_texture_infos(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_gltf_material_texture_infos(child)
+
+
+def _require_gltf_texture_index(
+    texture_info: dict[str, object],
+    textures: list[object],
+) -> int:
+    texture_index = texture_info.get("index")
+    if (
+        isinstance(texture_index, bool)
+        or not isinstance(texture_index, int)
+        or texture_index < 0
+        or texture_index >= len(textures)
+    ):
+        raise ValueError("An Atlas GLB material has an invalid texture reference.")
+    return texture_index
+
+
+def _get_or_add_atlas_texture_sampler(document: dict[str, object]) -> int:
+    """Reuse one exact Atlas sampler or append it to the glTF document."""
+
+    sampler = {
+        "magFilter": GLTF_LINEAR_FILTER,
+        "minFilter": GLTF_LINEAR_MIPMAP_LINEAR_FILTER,
+        "wrapS": GLTF_CLAMP_TO_EDGE_WRAP,
+        "wrapT": GLTF_CLAMP_TO_EDGE_WRAP,
+    }
+    samplers = document.get("samplers")
+    if samplers is None:
+        samplers = []
+        document["samplers"] = samplers
+    if not isinstance(samplers, list):
+        raise ValueError("The Atlas GLB sampler data is invalid.")
+    for index, existing in enumerate(samplers):
+        if isinstance(existing, dict) and all(
+            existing.get(key) == value for key, value in sampler.items()
+        ):
+            return index
+    samplers.append(sampler)
+    return len(samplers) - 1
+
+
+# ### Packed ORM serialization helpers ###
 def _inject_packed_orm_occlusion_textures(
     document: dict[str, object],
     packed_orm_material_names: Mapping[

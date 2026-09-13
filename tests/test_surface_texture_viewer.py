@@ -530,6 +530,24 @@ class SurfaceTextureViewerCanvasParityTests(unittest.TestCase):
             0.5,
         )
 
+    def test_canvas_and_surface_viewers_keep_grid_below_the_same_model(self) -> None:
+        floor = _build_quad_surface("floor-one", SURFACE_TYPE_FLOOR)
+        floor_model = _build_canvas_model_with_surface(floor, self.texture_rgba)
+        self.surface_viewer.set_scene_model(floor_model)
+        self.canvas_viewer.set_model(floor_model)
+
+        surface_grid = self.surface_viewer._canvas_scene_render_items.grid_item
+        canvas_grid = self.canvas_viewer.grid_item
+        self.assertIsNotNone(surface_grid)
+        self.assertIsNotNone(canvas_grid)
+        assert surface_grid is not None
+        assert canvas_grid is not None
+        surface_grid_height = float(surface_grid.transform().matrix()[2, 3])
+        canvas_grid_height = float(canvas_grid.transform().matrix()[2, 3])
+        model_minimum_z = float(np.min(floor_model.mesh.vertices[:, 2]))
+        self.assertLess(surface_grid_height, model_minimum_z)
+        self.assertAlmostEqual(surface_grid_height, canvas_grid_height)
+
     def test_canvas_model_supplies_identical_base_and_texture_geometry(self) -> None:
         self.surface_viewer.set_surfaces((self.surface,))
         self.surface_viewer.set_surface_texture(

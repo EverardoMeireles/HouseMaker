@@ -5675,10 +5675,24 @@ class TextureAtlasWorkspace(QWidget):
                     rgba = source.load_texture_rgba(selected_map_type)
                     return np.ascontiguousarray(rgba[:, :, (2, 1, 0, 3)])
 
+                neutral_rgba = ATLAS_MAP_NEUTRAL_RGBA.get(map_type)
                 write_texture_atlas_png(
                     output_atlas,
                     output_paths[map_type],
                     source_loader=load_source,
+                    wrap_source_resolver=lambda placement: (
+                        self._is_surface_texture_source_id(placement.object_id)
+                    ),
+                    background_bgra=(
+                        None
+                        if neutral_rgba is None
+                        else (
+                            neutral_rgba[2],
+                            neutral_rgba[1],
+                            neutral_rgba[0],
+                            neutral_rgba[3],
+                        )
+                    ),
                     project_relative_image_path=(
                         relative_paths[map_type]
                         if map_type == ATLAS_MAP_BASE_COLOR

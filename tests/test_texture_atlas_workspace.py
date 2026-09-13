@@ -45,6 +45,7 @@ from housemaker.texture_atlas_state import (
     ATLAS_SLOT_QUADRANT_TOP_RIGHT,
     TextureAtlasData,
     TextureAtlasRecord,
+    atlas_placement_pixel_regions,
 )
 from housemaker.texture_atlas_workspace import (
     ATLAS_MAP_AMBIENT_OCCLUSION,
@@ -1288,6 +1289,12 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             ATLAS_MAP_ROUGHNESS: (255, 255, 255, 255),
             ATLAS_MAP_METALLIC: (80, 80, 80, 255),
         }
+        expected_backgrounds = {
+            ATLAS_MAP_BASE_COLOR: (0, 0, 0, 0),
+            ATLAS_MAP_NORMAL: (128, 128, 255, 255),
+            ATLAS_MAP_ROUGHNESS: (255, 255, 255, 255),
+            ATLAS_MAP_METALLIC: (0, 0, 0, 255),
+        }
         for map_type, expected_color in expected_colors.items():
             relative_path = build_texture_atlas_map_image_relative_path(
                 atlas.atlas_id,
@@ -1296,6 +1303,10 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             output_path = Path(self._temporary_directory.name) / relative_path
             with self.subTest(map_type=map_type), Image.open(output_path) as image:
                 self.assertEqual(image.getpixel((10, 10)), expected_color)
+                self.assertEqual(
+                    image.getpixel((1500, 1500)),
+                    expected_backgrounds[map_type],
+                )
         self.assertEqual(
             set(materialized.to_dict()),
             {
@@ -1309,6 +1320,67 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
                 "placements",
             },
         )
+
+    def test_materializer_wraps_surface_guards_and_writes_neutral_pbr_space(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Surface", 2048, atlas_id="atlas-surface")
+        surface_id = build_atlas_wall_texture_source_id("brick")
+        texture_path = Path(self._temporary_directory.name) / "brick.png"
+        pixels = np.empty((512, 512, 4), dtype=np.uint8)
+        pixels[:256, :256] = (10, 20, 30, 255)
+        pixels[:256, 256:] = (40, 50, 60, 255)
+        pixels[256:, :256] = (70, 80, 90, 255)
+        pixels[256:, 256:] = (100, 110, 120, 255)
+        Image.fromarray(pixels, mode="RGBA").save(texture_path)
+        source = load_atlas_object_texture_source(
+            object_id=surface_id,
+            object_name="Brick",
+            texture_path="surface_textures/brick.png",
+            texture_resolution=512,
+            physical_texture_path=texture_path,
+            supports_resolution_changes=False,
+            supports_3d_preview=False,
+        )
+        placement = data.assign_object(
+            atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([source])
+
+        selected_atlas = self.workspace.selected_atlas
+        assert selected_atlas is not None
+        self.workspace._materialize_atlas(selected_atlas)
+
+        _outer, inner = atlas_placement_pixel_regions(placement)
+        base_path = Path(self._temporary_directory.name) / "atlas-surface.png"
+        normal_path = (
+            Path(self._temporary_directory.name)
+            / "pbr_maps"
+            / "atlas-surface.normal.png"
+        )
+        with Image.open(base_path) as base_image:
+            self.assertEqual(
+                base_image.getpixel((0, inner[1] + 20)),
+                (40, 50, 60, 255),
+            )
+            self.assertEqual(
+                base_image.getpixel((inner[0] + 20, 0)),
+                (70, 80, 90, 255),
+            )
+            self.assertEqual(
+                base_image.getpixel((0, 0)),
+                (100, 110, 120, 255),
+            )
+        with Image.open(normal_path) as normal_image:
+            self.assertEqual(
+                normal_image.getpixel((1500, 1500)),
+                (128, 128, 255, 255),
+            )
 
     def test_ambient_occlusion_controls_include_objects_and_all_atlases(
         self,

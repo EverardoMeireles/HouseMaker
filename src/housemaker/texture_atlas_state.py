@@ -24,12 +24,14 @@ MAX_ATLAS_NAME_LENGTH = 200
 MAX_ATLAS_OBJECT_COUNT = 4_096
 MAX_ATLAS_ID_LENGTH = 128
 MAX_TEXTURE_PATH_LENGTH = 32_768
-ATLAS_STATE_SCHEMA_VERSION = 6
 LEGACY_ATLAS_STATE_SCHEMA_VERSION = 1
 SYMMETRIC_HALF_ATLAS_STATE_SCHEMA_VERSION = 2
 SYMMETRIC_QUARTER_ATLAS_STATE_SCHEMA_VERSION = 3
 SYMMETRIC_PAIR_ATLAS_STATE_SCHEMA_VERSION = 4
 SYMMETRIC_SQUARE_PAIR_ATLAS_STATE_SCHEMA_VERSION = 5
+SURFACE_AO_ATLAS_STATE_SCHEMA_VERSION = 6
+GUARDED_TEXTURE_ATLAS_STATE_SCHEMA_VERSION = 7
+ATLAS_STATE_SCHEMA_VERSION = GUARDED_TEXTURE_ATLAS_STATE_SCHEMA_VERSION
 ATLAS_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 ATLAS_PACKING_MODE_FULL = "full"
 # Schemas v2-v4 persist these legacy modes and must retain their old geometry.
@@ -85,6 +87,7 @@ ATLAS_HALF_SLOT_PACKING_MODES = frozenset(
 MAX_SURFACE_AO_GEOMETRY_SIGNATURE_LENGTH = 256
 MIN_SURFACE_AO_INTENSITY = 0.0
 MAX_SURFACE_AO_INTENSITY = 1.0
+ATLAS_TEXTURE_GUARD_DIVISOR = 64
 
 
 # ### Public data models ###
@@ -801,6 +804,8 @@ class TextureAtlasData:
             SYMMETRIC_QUARTER_ATLAS_STATE_SCHEMA_VERSION,
             SYMMETRIC_PAIR_ATLAS_STATE_SCHEMA_VERSION,
             SYMMETRIC_SQUARE_PAIR_ATLAS_STATE_SCHEMA_VERSION,
+            SURFACE_AO_ATLAS_STATE_SCHEMA_VERSION,
+            GUARDED_TEXTURE_ATLAS_STATE_SCHEMA_VERSION,
             ATLAS_STATE_SCHEMA_VERSION,
         }:
             raise ValueError(
@@ -809,7 +814,7 @@ class TextureAtlasData:
         raw_atlases = payload.get("atlases", [])
         if not isinstance(raw_atlases, list):
             raise ValueError("Texture atlases must contain a list.")
-        if schema_version < ATLAS_STATE_SCHEMA_VERSION:
+        if schema_version < SURFACE_AO_ATLAS_STATE_SCHEMA_VERSION:
             raw_atlases = [
                 {
                     key: value
@@ -820,6 +825,16 @@ class TextureAtlasData:
                         "surface_ao_geometry_signature",
                         "surface_ao_intensity",
                     }
+                }
+                if isinstance(raw_atlas, dict)
+                else raw_atlas
+                for raw_atlas in raw_atlases
+            ]
+        if schema_version < GUARDED_TEXTURE_ATLAS_STATE_SCHEMA_VERSION:
+            raw_atlases = [
+                {
+                    **raw_atlas,
+                    "image_path": None,
                 }
                 if isinstance(raw_atlas, dict)
                 else raw_atlas
@@ -860,6 +875,53 @@ class TextureAtlasData:
 
 # ### Atlas output ###
 TextureSourceLoader = Callable[[TextureAtlasPlacement], np.ndarray]
+TextureSourceWrapResolver = Callable[[TextureAtlasPlacement], bool]
+
+
+def atlas_placement_pixel_regions(
+    placement: TextureAtlasPlacement,
+) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
+    """Return absolute outer and guarded inner pixel bounds for one source.
+
+    Bounds use the exclusive ``(left, top, right, bottom)`` convention. The
+    guard consumes one sixty-fourth of each owned dimension on each side, so a
+    512-pixel dimension receives eight guard pixels without changing its Atlas
+    allocation.
+    """
+
+    if not isinstance(placement, TextureAtlasPlacement):
+        raise TypeError("Placement must be a TextureAtlasPlacement value.")
+    left = int(placement.x)
+    top = int(placement.y)
+    width = int(placement.size)
+    height = int(placement.size)
+    if placement.packing_mode in ATLAS_HALF_SLOT_PACKING_MODES:
+        width //= 2
+        if placement.slot_half == ATLAS_SLOT_HALF_RIGHT:
+            left += width
+    elif placement.packing_mode == ATLAS_PACKING_MODE_SYMMETRIC_QUARTER:
+        width = int(placement.texture_resolution)
+        height = int(placement.texture_resolution)
+        offset_x, offset_y = _quadrant_pixel_offset(
+            placement.slot_quadrant,
+            placement.texture_resolution,
+        )
+        left += offset_x
+        top += offset_y
+
+    right = left + width
+    bottom = top + height
+    horizontal_guard = _atlas_texture_guard_size(width)
+    vertical_guard = _atlas_texture_guard_size(height)
+    return (
+        (left, top, right, bottom),
+        (
+            left + horizontal_guard,
+            top + vertical_guard,
+            right - horizontal_guard,
+            bottom - vertical_guard,
+        ),
+    )
 
 
 def write_texture_atlas_png(
@@ -868,6 +930,8 @@ def write_texture_atlas_png(
     *,
     asset_root: str | Path | None = None,
     source_loader: TextureSourceLoader | None = None,
+    wrap_source_resolver: TextureSourceWrapResolver | None = None,
+    background_bgra: tuple[int, int, int, int] | None = None,
     project_relative_image_path: str | Path | None = None,
 ) -> Path:
     """Composite the atlas and atomically write an RGBA PNG.
@@ -890,45 +954,39 @@ def write_texture_atlas_png(
             return _load_texture_from_path(normalized_asset_root, placement)
     else:
         loader = source_loader
+    normalized_background = _normalize_background_bgra(background_bgra)
     canvas = np.zeros((atlas.resolution, atlas.resolution, 4), dtype=np.uint8)
+    if normalized_background is not None:
+        canvas[:, :] = normalized_background
     for placements in _group_placements_by_slot(atlas.placements):
         first = placements[0]
         y_end = first.y + first.size
         x_end = first.x + first.size
-        if first.packing_mode == ATLAS_PACKING_MODE_FULL:
-            source = _normalize_texture_pixels(loader(first), first)
-            canvas[first.y:y_end, first.x:x_end] = source
-            continue
-
-        canvas[first.y:y_end, first.x:x_end] = (0, 0, 0, 255)
-        if first.packing_mode == ATLAS_PACKING_MODE_SYMMETRIC_QUARTER:
-            for placement in placements:
-                source = _normalize_texture_pixels(loader(placement), placement)
-                content_size = placement.texture_resolution
-                offset_x, offset_y = _quadrant_pixel_offset(
-                    placement.slot_quadrant,
-                    content_size,
-                )
-                destination_x = placement.x + offset_x
-                destination_y = placement.y + offset_y
-                canvas[
-                    destination_y : destination_y + content_size,
-                    destination_x : destination_x + content_size,
-                ] = source[:content_size, :content_size]
-            continue
-
-        content_width = first.size // 2
+        if first.packing_mode != ATLAS_PACKING_MODE_FULL:
+            canvas[first.y:y_end, first.x:x_end] = (
+                (0, 0, 0, 255)
+                if normalized_background is None
+                else normalized_background
+            )
         for placement in placements:
             source = _normalize_texture_pixels(loader(placement), placement)
-            destination_x = placement.x + (
-                content_width
-                if placement.slot_half == ATLAS_SLOT_HALF_RIGHT
-                else 0
+            source_content = _placement_source_content_pixels(
+                source,
+                placement,
             )
-            canvas[
-                placement.y:y_end,
-                destination_x : destination_x + content_width,
-            ] = source[:, :content_width]
+            outer_bounds, inner_bounds = atlas_placement_pixel_regions(placement)
+            guarded_pixels = _build_guarded_texture_pixels(
+                source_content,
+                outer_bounds,
+                inner_bounds,
+                wrap_edges=(
+                    False
+                    if wrap_source_resolver is None
+                    else bool(wrap_source_resolver(placement))
+                ),
+            )
+            left, top, right, bottom = outer_bounds
+            canvas[top:bottom, left:right] = guarded_pixels
 
     success, encoded = cv2.imencode(".png", canvas)
     if not success:
@@ -1606,6 +1664,85 @@ def _validate_placements_fit(
 
 
 # ### Image helpers ###
+def _atlas_texture_guard_size(dimension: int) -> int:
+    """Return proportional per-side padding for one owned pixel dimension."""
+
+    normalized_dimension = int(dimension)
+    guard = max(
+        1,
+        round(normalized_dimension / ATLAS_TEXTURE_GUARD_DIVISOR),
+    )
+    if guard * 2 >= normalized_dimension:
+        raise ValueError("Atlas texture region is too small for guard pixels.")
+    return guard
+
+
+def _normalize_background_bgra(
+    background_bgra: tuple[int, int, int, int] | None,
+) -> tuple[int, int, int, int] | None:
+    if background_bgra is None:
+        return None
+    if (
+        not isinstance(background_bgra, tuple)
+        or len(background_bgra) != 4
+        or any(
+            isinstance(channel, bool)
+            or not isinstance(channel, int)
+            or not 0 <= channel <= 255
+            for channel in background_bgra
+        )
+    ):
+        raise ValueError("Atlas background must contain four uint8 BGRA values.")
+    return background_bgra
+
+
+def _placement_source_content_pixels(
+    source: np.ndarray,
+    placement: TextureAtlasPlacement,
+) -> np.ndarray:
+    """Crop the authored UV region used by one packed placement."""
+
+    if placement.packing_mode == ATLAS_PACKING_MODE_FULL:
+        return source
+    if placement.packing_mode == ATLAS_PACKING_MODE_SYMMETRIC_QUARTER:
+        content_size = int(placement.texture_resolution)
+        return source[:content_size, :content_size]
+    return source[:, : int(placement.size) // 2]
+
+
+def _build_guarded_texture_pixels(
+    source_content: np.ndarray,
+    outer_bounds: tuple[int, int, int, int],
+    inner_bounds: tuple[int, int, int, int],
+    *,
+    wrap_edges: bool,
+) -> np.ndarray:
+    """Resize content into its inset and synthesize the surrounding guard."""
+
+    outer_left, outer_top, outer_right, outer_bottom = outer_bounds
+    inner_left, inner_top, inner_right, inner_bottom = inner_bounds
+    outer_width = outer_right - outer_left
+    outer_height = outer_bottom - outer_top
+    inner_width = inner_right - inner_left
+    inner_height = inner_bottom - inner_top
+    resized = cv2.resize(
+        source_content,
+        (inner_width, inner_height),
+        interpolation=cv2.INTER_AREA,
+    )
+    guarded = cv2.copyMakeBorder(
+        resized,
+        inner_top - outer_top,
+        outer_bottom - inner_bottom,
+        inner_left - outer_left,
+        outer_right - inner_right,
+        cv2.BORDER_WRAP if wrap_edges else cv2.BORDER_REPLICATE,
+    )
+    if guarded.shape[:2] != (outer_height, outer_width):
+        raise ValueError("Atlas guard pixels do not match their owned region.")
+    return np.ascontiguousarray(guarded)
+
+
 def _load_texture_from_path(
     asset_root: Path,
     placement: TextureAtlasPlacement,

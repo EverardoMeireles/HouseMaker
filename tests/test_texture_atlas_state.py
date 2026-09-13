@@ -21,10 +21,14 @@ from housemaker.texture_atlas_state import (
     ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
     ATLAS_SLOT_HALF_LEFT,
     ATLAS_SLOT_HALF_RIGHT,
+    ATLAS_SLOT_QUADRANT_BOTTOM_LEFT,
+    ATLAS_SLOT_QUADRANT_BOTTOM_RIGHT,
     ATLAS_SLOT_QUADRANT_ORDER,
     ATLAS_SLOT_QUADRANT_TOP_LEFT,
+    ATLAS_SLOT_QUADRANT_TOP_RIGHT,
     ATLAS_STATE_SCHEMA_VERSION,
     TextureAtlasData,
+    atlas_placement_pixel_regions,
     write_texture_atlas_metadata,
     write_texture_atlas_png,
 )
@@ -265,7 +269,7 @@ class TextureAtlasStateTests(unittest.TestCase):
         self.assertIsNone(atlas.surface_ao_geometry_signature)
         self.assertEqual(atlas.surface_ao_intensity, 1.0)
 
-    def test_surface_ao_fields_round_trip_in_schema_v6(self) -> None:
+    def test_surface_ao_fields_round_trip_in_current_schema(self) -> None:
         data = TextureAtlasData()
         atlas = data.create_atlas("AO", 2048, atlas_id="atlas-a")
         atlas.set_surface_ambient_occlusion_intensity(0.42)
@@ -277,6 +281,46 @@ class TextureAtlasStateTests(unittest.TestCase):
         restored = TextureAtlasData.from_dict(data.to_dict())
         restored_atlas = restored.atlases[0]
 
+        self.assertEqual(
+            restored_atlas.surface_ao_image_path,
+            "pbr_maps/atlas-a.ambient_occlusion.png",
+        )
+        self.assertEqual(
+            restored_atlas.surface_ao_geometry_signature,
+            "geometry-revision:42",
+        )
+        self.assertEqual(restored_atlas.surface_ao_intensity, 0.42)
+
+    def test_schema_v6_keeps_surface_ao_but_invalidates_unguarded_atlas_png(
+        self,
+    ) -> None:
+        payload = {
+            "schema_version": 6,
+            "selected_atlas_id": "atlas-a",
+            "atlases": [
+                {
+                    "atlas_id": "atlas-a",
+                    "name": "Legacy pixels",
+                    "resolution": 2048,
+                    "image_path": "atlas-a.png",
+                    "surface_ao_image_path": (
+                        "pbr_maps/atlas-a.ambient_occlusion.png"
+                    ),
+                    "surface_ao_geometry_signature": "geometry-revision:42",
+                    "surface_ao_intensity": 0.42,
+                    "placements": [],
+                }
+            ],
+        }
+
+        restored = TextureAtlasData.from_dict(payload)
+        restored_atlas = restored.atlases[0]
+
+        self.assertEqual(
+            restored.to_dict()["schema_version"],
+            ATLAS_STATE_SCHEMA_VERSION,
+        )
+        self.assertIsNone(restored_atlas.image_path)
         self.assertEqual(
             restored_atlas.surface_ao_image_path,
             "pbr_maps/atlas-a.ambient_occlusion.png",
@@ -491,6 +535,264 @@ class TextureAtlasStateTests(unittest.TestCase):
         self.assertIsNotNone(survivor)
         assert survivor is not None
         self.assertEqual(survivor.slot_half, ATLAS_SLOT_HALF_LEFT)
+
+    def test_guarded_pixel_regions_preserve_each_logical_allocation(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Regions", 4096, atlas_id="atlas-a")
+        full = data.place_object_at(
+            atlas.atlas_id,
+            "full",
+            "textures/full.png",
+            512,
+            512,
+            512,
+        )
+        half_left = data.place_object_at(
+            atlas.atlas_id,
+            "half-left",
+            "textures/half-left.png",
+            512,
+            0,
+            0,
+            ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+            ATLAS_SLOT_HALF_LEFT,
+        )
+        half_right = data.place_object_at(
+            atlas.atlas_id,
+            "half-right",
+            "textures/half-right.png",
+            512,
+            0,
+            0,
+            ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+            ATLAS_SLOT_HALF_RIGHT,
+        )
+        quarter = data.place_object_at(
+            atlas.atlas_id,
+            "quarter",
+            "textures/quarter.png",
+            512,
+            1024,
+            0,
+            ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+            slot_quadrant=ATLAS_SLOT_QUADRANT_TOP_LEFT,
+        )
+        quarter_top_right = data.place_object_at(
+            atlas.atlas_id,
+            "quarter-top-right",
+            "textures/quarter-top-right.png",
+            512,
+            1024,
+            0,
+            ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+            slot_quadrant=ATLAS_SLOT_QUADRANT_TOP_RIGHT,
+        )
+        quarter_bottom_left = data.place_object_at(
+            atlas.atlas_id,
+            "quarter-bottom-left",
+            "textures/quarter-bottom-left.png",
+            512,
+            1024,
+            0,
+            ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+            slot_quadrant=ATLAS_SLOT_QUADRANT_BOTTOM_LEFT,
+        )
+        quarter_bottom_right = data.place_object_at(
+            atlas.atlas_id,
+            "quarter-bottom-right",
+            "textures/quarter-bottom-right.png",
+            512,
+            1024,
+            0,
+            ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+            slot_quadrant=ATLAS_SLOT_QUADRANT_BOTTOM_RIGHT,
+        )
+        legacy_pair_left = data.place_object_at(
+            atlas.atlas_id,
+            "legacy-pair-left",
+            "textures/legacy-pair-left.png",
+            512,
+            2048,
+            0,
+            ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+            ATLAS_SLOT_HALF_LEFT,
+        )
+        legacy_pair_right = data.place_object_at(
+            atlas.atlas_id,
+            "legacy-pair-right",
+            "textures/legacy-pair-right.png",
+            512,
+            2048,
+            0,
+            ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+            ATLAS_SLOT_HALF_RIGHT,
+        )
+
+        self.assertEqual(
+            atlas_placement_pixel_regions(full),
+            ((512, 512, 1024, 1024), (520, 520, 1016, 1016)),
+        )
+        self.assertEqual(
+            atlas_placement_pixel_regions(half_left),
+            ((0, 0, 256, 512), (4, 8, 252, 504)),
+        )
+        self.assertEqual(
+            atlas_placement_pixel_regions(half_right),
+            ((256, 0, 512, 512), (260, 8, 508, 504)),
+        )
+        self.assertEqual(
+            atlas_placement_pixel_regions(quarter),
+            ((1024, 0, 1536, 512), (1032, 8, 1528, 504)),
+        )
+        self.assertEqual(
+            atlas_placement_pixel_regions(quarter_top_right),
+            ((1536, 0, 2048, 512), (1544, 8, 2040, 504)),
+        )
+        self.assertEqual(
+            atlas_placement_pixel_regions(quarter_bottom_left),
+            ((1024, 512, 1536, 1024), (1032, 520, 1528, 1016)),
+        )
+        self.assertEqual(
+            atlas_placement_pixel_regions(quarter_bottom_right),
+            ((1536, 512, 2048, 1024), (1544, 520, 2040, 1016)),
+        )
+        self.assertEqual(
+            atlas_placement_pixel_regions(legacy_pair_left),
+            ((2048, 0, 2560, 1024), (2056, 16, 2552, 1008)),
+        )
+        self.assertEqual(
+            atlas_placement_pixel_regions(legacy_pair_right),
+            ((2560, 0, 3072, 1024), (2568, 16, 3064, 1008)),
+        )
+
+    def test_compositor_wraps_surface_guards_and_dilates_object_guards(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Guards", 2048, atlas_id="atlas-a")
+        surface = data.place_object_at(
+            atlas.atlas_id,
+            "surface",
+            "textures/surface.png",
+            512,
+            0,
+            0,
+        )
+        regular_object = data.place_object_at(
+            atlas.atlas_id,
+            "object",
+            "textures/object.png",
+            512,
+            512,
+            0,
+        )
+
+        source = np.empty((512, 512, 4), dtype=np.uint8)
+        source[:256, :256] = (10, 20, 30, 255)
+        source[:256, 256:] = (40, 50, 60, 255)
+        source[256:, :256] = (70, 80, 90, 255)
+        source[256:, 256:] = (100, 110, 120, 255)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "guards.png"
+            write_texture_atlas_png(
+                atlas,
+                output_path,
+                source_loader=lambda _placement: source,
+                wrap_source_resolver=(
+                    lambda placement: placement.object_id == surface.object_id
+                ),
+            )
+            image = cv2.imread(str(output_path), cv2.IMREAD_UNCHANGED)
+
+        _surface_outer, surface_inner = atlas_placement_pixel_regions(surface)
+        _object_outer, object_inner = atlas_placement_pixel_regions(regular_object)
+        surface_top_y = surface_inner[1] + 20
+        surface_bottom_y = surface_inner[3] - 20
+        surface_left_x = surface_inner[0] + 20
+        surface_right_x = surface_inner[2] - 20
+        object_top_y = object_inner[1] + 20
+        object_bottom_y = object_inner[3] - 20
+        object_left_x = object_inner[0] + 20
+        object_right_x = object_inner[2] - 20
+        self.assertEqual(
+            tuple(image[surface_top_y, surface.x]),
+            (40, 50, 60, 255),
+        )
+        self.assertEqual(
+            tuple(image[surface_top_y, surface.x + 511]),
+            (10, 20, 30, 255),
+        )
+        self.assertEqual(
+            tuple(image[surface.y, surface_left_x]),
+            (70, 80, 90, 255),
+        )
+        self.assertEqual(
+            tuple(image[surface.y + 511, surface_left_x]),
+            (10, 20, 30, 255),
+        )
+        self.assertEqual(
+            tuple(image[surface.y, surface.x]),
+            (100, 110, 120, 255),
+        )
+        self.assertEqual(
+            tuple(image[surface_bottom_y, surface_right_x]),
+            (100, 110, 120, 255),
+        )
+        self.assertEqual(
+            tuple(image[object_top_y, regular_object.x]),
+            (10, 20, 30, 255),
+        )
+        self.assertEqual(
+            tuple(image[object_top_y, regular_object.x + 511]),
+            (40, 50, 60, 255),
+        )
+        self.assertEqual(
+            tuple(image[regular_object.y, object_left_x]),
+            (10, 20, 30, 255),
+        )
+        self.assertEqual(
+            tuple(image[regular_object.y + 511, object_left_x]),
+            (70, 80, 90, 255),
+        )
+        self.assertEqual(
+            tuple(image[regular_object.y, regular_object.x]),
+            (10, 20, 30, 255),
+        )
+        self.assertEqual(
+            tuple(image[object_bottom_y, object_right_x]),
+            (100, 110, 120, 255),
+        )
+
+    def test_compositor_uses_semantic_background_for_unoccupied_regions(
+        self,
+    ) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Normal map", 2048, atlas_id="atlas-a")
+        placement = data.assign_object(
+            atlas.atlas_id,
+            "half",
+            "textures/half.png",
+            512,
+            ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
+        )
+        source = np.full((512, 512, 4), (255, 128, 128, 255), dtype=np.uint8)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "normal.png"
+            write_texture_atlas_png(
+                atlas,
+                output_path,
+                source_loader=lambda _placement: source,
+                background_bgra=(255, 128, 128, 255),
+            )
+            image = cv2.imread(str(output_path), cv2.IMREAD_UNCHANGED)
+
+        self.assertEqual(
+            tuple(image[placement.y + 10, placement.x + 300]),
+            (255, 128, 128, 255),
+        )
+        self.assertEqual(tuple(image[-1, -1]), (255, 128, 128, 255))
 
     def test_half_compositor_uses_only_left_source_pixels_and_opaque_black_gap(
         self,

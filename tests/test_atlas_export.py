@@ -37,10 +37,14 @@ from housemaker.surface_geometry import build_fixed_surfaces
 from housemaker.texture_atlas_state import (
     ATLAS_PACKING_MODE_FULL,
     ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+    ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
     ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
     ATLAS_SLOT_HALF_LEFT,
     ATLAS_SLOT_HALF_RIGHT,
+    ATLAS_SLOT_QUADRANT_BOTTOM_LEFT,
     ATLAS_SLOT_QUADRANT_BOTTOM_RIGHT,
+    ATLAS_SLOT_QUADRANT_TOP_LEFT,
+    ATLAS_SLOT_QUADRANT_TOP_RIGHT,
     TextureAtlasPlacement,
     TextureAtlasRecord,
 )
@@ -346,6 +350,49 @@ def _architectural_surface_model() -> tuple[GeneratedModel, tuple[str, ...]]:
 
 # ### Export tests ###
 class TextureAtlasExportTests(unittest.TestCase):
+    def test_atlas_maps_share_an_explicit_trilinear_clamped_sampler(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            document, material = _export_selective_atlas_document(
+                Path(temporary_directory),
+                frozenset(
+                    {
+                        ATLAS_MAP_BASE_COLOR,
+                        PBR_MAP_NORMAL,
+                        PBR_MAP_ROUGHNESS,
+                        PBR_MAP_METALLIC,
+                    }
+                ),
+            )
+
+        pbr = material["pbrMetallicRoughness"]
+        texture_indices = {
+            pbr["baseColorTexture"]["index"],
+            material["normalTexture"]["index"],
+            pbr["metallicRoughnessTexture"]["index"],
+            material["occlusionTexture"]["index"],
+        }
+        sampler_indices = {
+            document["textures"][texture_index]["sampler"]
+            for texture_index in texture_indices
+        }
+        self.assertEqual(len(sampler_indices), 1)
+        sampler_index = next(iter(sampler_indices))
+        self.assertEqual(
+            document["samplers"][sampler_index],
+            {
+                "magFilter": 9729,
+                "minFilter": 9987,
+                "wrapS": 33071,
+                "wrapT": 33071,
+            },
+        )
+        self.assertEqual(
+            material["occlusionTexture"]["index"],
+            pbr["metallicRoughnessTexture"]["index"],
+        )
+
     def test_base_only_object_atlas_exports_ao_without_metallic_roughness(
         self,
     ) -> None:
@@ -561,6 +608,27 @@ class TextureAtlasExportTests(unittest.TestCase):
         )
         atlas_material = document["materials"][atlas_material_index]
         self.assertNotIn("occlusionTexture", atlas_material)
+        atlas_pbr = atlas_material["pbrMetallicRoughness"]
+        atlas_texture_indices = {
+            atlas_pbr["baseColorTexture"]["index"],
+            atlas_material["normalTexture"]["index"],
+            atlas_pbr["metallicRoughnessTexture"]["index"],
+        }
+        sampler_indices = {
+            document["textures"][texture_index]["sampler"]
+            for texture_index in atlas_texture_indices
+        }
+        self.assertEqual(len(sampler_indices), 1)
+        sampler_index = next(iter(sampler_indices))
+        self.assertEqual(
+            document["samplers"][sampler_index],
+            {
+                "magFilter": 9729,
+                "minFilter": 9987,
+                "wrapS": 33071,
+                "wrapT": 33071,
+            },
+        )
         exported_orm = np.asarray(
             atlas_meshes[0].visual.material.metallicRoughnessTexture.convert("RGBA"),
             dtype=np.uint8,
@@ -904,6 +972,10 @@ class TextureAtlasExportTests(unittest.TestCase):
             if material.get("name") == marker_collision_name
         )
         self.assertNotIn("occlusionTexture", passthrough_material)
+        passthrough_texture_index = passthrough_material["pbrMetallicRoughness"][
+            "baseColorTexture"
+        ]["index"]
+        self.assertNotIn("sampler", document["textures"][passthrough_texture_index])
         self.assertFalse(
             any(
                 material.get("name") == f"{marker_collision_name}_2"
@@ -1283,8 +1355,8 @@ class TextureAtlasExportTests(unittest.TestCase):
             ),
             np.asarray(
                 (
-                    (512.5 / 2048.0, 1.0 - 1024.5 / 2048.0),
-                    (1023.5 / 2048.0, 1.0 - 1535.5 / 2048.0),
+                    (520.5 / 2048.0, 1.0 - 1032.5 / 2048.0),
+                    (1015.5 / 2048.0, 1.0 - 1527.5 / 2048.0),
                 )
             ),
         )
@@ -1296,8 +1368,8 @@ class TextureAtlasExportTests(unittest.TestCase):
             ),
             np.asarray(
                 (
-                    (256.5 / 2048.0, 1.0 - 0.5 / 2048.0),
-                    (511.5 / 2048.0, 1.0 - 511.5 / 2048.0),
+                    (260.5 / 2048.0, 1.0 - 8.5 / 2048.0),
+                    (507.5 / 2048.0, 1.0 - 503.5 / 2048.0),
                 )
             ),
         )
@@ -1309,11 +1381,103 @@ class TextureAtlasExportTests(unittest.TestCase):
             ),
             np.asarray(
                 (
-                    (1536.5 / 2048.0, 1.0 - 1536.5 / 2048.0),
-                    (2047.5 / 2048.0, 1.0 - 2047.5 / 2048.0),
+                    (1544.5 / 2048.0, 1.0 - 1544.5 / 2048.0),
+                    (2039.5 / 2048.0, 1.0 - 2039.5 / 2048.0),
                 )
             ),
         )
+
+    def test_repeating_surface_uvs_map_to_wrapped_inner_boundaries(self) -> None:
+        placement = TextureAtlasPlacement(
+            object_id="surface-texture:wall",
+            texture_path="wall.png",
+            texture_resolution=512,
+            x=512,
+            y=1024,
+            size=512,
+            packing_mode=ATLAS_PACKING_MODE_FULL,
+        )
+
+        mapped = _map_uv_to_placement(
+            np.asarray(((0.0, 1.0), (1.0, 0.0))),
+            placement,
+            2048,
+            repeat_source_uvs=True,
+        )
+
+        np.testing.assert_allclose(
+            mapped,
+            np.asarray(
+                (
+                    (520.0 / 2048.0, 1.0 - 1032.0 / 2048.0),
+                    (1016.0 / 2048.0, 1.0 - 1528.0 / 2048.0),
+                )
+            ),
+        )
+
+    def test_legacy_symmetric_pair_uses_rectangular_guarded_region(self) -> None:
+        placement = TextureAtlasPlacement(
+            object_id="legacy-pair-right",
+            texture_path="legacy-pair.png",
+            texture_resolution=512,
+            x=0,
+            y=0,
+            size=1024,
+            packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+            slot_half=ATLAS_SLOT_HALF_RIGHT,
+        )
+
+        mapped = _map_uv_to_placement(
+            np.asarray(((0.0, 1.0), (0.5, 0.0))),
+            placement,
+            2048,
+        )
+
+        np.testing.assert_allclose(
+            mapped,
+            np.asarray(
+                (
+                    (520.5 / 2048.0, 1.0 - 16.5 / 2048.0),
+                    (1015.5 / 2048.0, 1.0 - 1007.5 / 2048.0),
+                )
+            ),
+        )
+
+    def test_all_quadrants_use_their_guarded_pixel_offsets(self) -> None:
+        expected_pixel_bounds = {
+            ATLAS_SLOT_QUADRANT_TOP_LEFT: (1032.5, 1032.5, 1527.5, 1527.5),
+            ATLAS_SLOT_QUADRANT_TOP_RIGHT: (1544.5, 1032.5, 2039.5, 1527.5),
+            ATLAS_SLOT_QUADRANT_BOTTOM_LEFT: (1032.5, 1544.5, 1527.5, 2039.5),
+            ATLAS_SLOT_QUADRANT_BOTTOM_RIGHT: (1544.5, 1544.5, 2039.5, 2039.5),
+        }
+        for quadrant, (left, top, right, bottom) in expected_pixel_bounds.items():
+            with self.subTest(quadrant=quadrant):
+                placement = TextureAtlasPlacement(
+                    object_id=f"quarter-{quadrant}",
+                    texture_path=f"quarter-{quadrant}.png",
+                    texture_resolution=512,
+                    x=1024,
+                    y=1024,
+                    size=1024,
+                    packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
+                    slot_quadrant=quadrant,
+                )
+
+                mapped = _map_uv_to_placement(
+                    np.asarray(((0.0, 1.0), (0.5, 0.5))),
+                    placement,
+                    4096,
+                )
+
+                np.testing.assert_allclose(
+                    mapped,
+                    np.asarray(
+                        (
+                            (left / 4096.0, 1.0 - top / 4096.0),
+                            (right / 4096.0, 1.0 - bottom / 4096.0),
+                        )
+                    ),
+                )
 
     def test_nested_object_transform_is_baked_into_shared_atlas_batch(
         self,

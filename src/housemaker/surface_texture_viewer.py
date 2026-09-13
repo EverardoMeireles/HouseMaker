@@ -48,6 +48,7 @@ from housemaker.viewer import (
     _build_ambient_shader,
     _build_texture_mesh_data,
     _build_textured_wall_transform,
+    _get_reference_grid_height,
     _get_mesh_face_colors,
     _limit_optional_texture_preview_size,
     _limit_texture_preview_size,
@@ -868,6 +869,9 @@ class SurfaceTextureViewer(QWidget):
         grid_item = gl.GLGridItem()
         grid_item.setSize(x=20.0, y=20.0)
         grid_item.setSpacing(x=1.0, y=1.0)
+        grid_height = _get_reference_grid_height(model.mesh)
+        if grid_height:
+            grid_item.translate(0.0, 0.0, grid_height)
         self.view.addItem(grid_item)
 
         display_mesh = (
