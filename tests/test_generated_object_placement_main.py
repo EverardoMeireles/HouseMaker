@@ -13,13 +13,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 import trimesh
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QImage
 from PySide6.QtWidgets import QApplication
-from shiboken6 import isValid as is_valid_qt_object
 
 from housemaker.app_settings import ApplicationSettingsStore
-from housemaker.camera_models import CameraPose
 from housemaker.generation_state import (
     GeneratedObjectPlacement,
     GeneratedObjectRecord,
@@ -33,6 +29,7 @@ from housemaker.level_coordinates import (
 )
 from housemaker.main import BlueprintWorkspace
 from housemaker.models import LevelData, VertexData
+from housemaker.viewer import SceneObjectPlacementCandidate
 
 
 # ### Module state ###
@@ -79,17 +76,6 @@ def _level(
     )
 
 
-def _write_blueprint(directory: Path, name: str) -> str:
-    """Create one readable image used by the modeless placement picker."""
-
-    path = directory / name
-    image = QImage(64, 48, QImage.Format.Format_RGB32)
-    image.fill(QColor("#334155"))
-    if not image.save(str(path), "PNG"):
-        raise RuntimeError("The placement test blueprint could not be saved.")
-    return str(path)
-
-
 def _record(
     object_id: str,
     placement: GeneratedObjectPlacement | None,
@@ -126,175 +112,432 @@ class GeneratedObjectPlacementMainTests(unittest.TestCase):
         _qt_application.processEvents()
         self.temporary_directory.cleanup()
 
-    def test_modeless_dialog_is_unique_and_bound_to_operation_token(self) -> None:
+    def test_direct_picker_is_unique_and_bound_to_operation_token(self) -> None:
         self.workspace.generation.placement_requested.emit("operation-one")
         _qt_application.processEvents()
-        first_dialog = self.workspace._object_placement_dialog
-        self.assertIsNotNone(first_dialog)
-        assert first_dialog is not None
-        self.assertFalse(first_dialog.isModal())
+        first_session = self.workspace._direct_object_placement_session
+        self.assertIsNotNone(first_session)
+        assert first_session is not None
         self.assertEqual(
-            self.workspace._object_placement_operation_id,
+            first_session.request_id,
             "operation-one",
+        )
+        self.assertTrue(self.workspace.viewer.is_object_placement_active)
+        self.assertIs(
+            self.workspace.workspace_tabs.currentWidget(),
+            self.workspace.scene_3d_workspace,
         )
 
         self.workspace.generation.placement_requested.emit("operation-two")
-        second_dialog = self.workspace._object_placement_dialog
-        self.assertIsNotNone(second_dialog)
-        self.assertIsNot(second_dialog, first_dialog)
+        second_session = self.workspace._direct_object_placement_session
+        self.assertIsNotNone(second_session)
+        self.assertIsNot(second_session, first_session)
+        assert second_session is not None
         self.assertEqual(
-            self.workspace._object_placement_operation_id,
+            second_session.request_id,
             "operation-two",
         )
-        if is_valid_qt_object(first_dialog):
-            self.assertFalse(first_dialog.isVisible())
 
         self.workspace.generation.operation_finished.emit("operation-one")
         self.assertIs(
-            self.workspace._object_placement_dialog,
-            second_dialog,
+            self.workspace._direct_object_placement_session,
+            second_session,
         )
 
         self.workspace.generation.operation_finished.emit("operation-two")
-        self.assertIsNone(self.workspace._object_placement_dialog)
-        self.assertIsNone(self.workspace._object_placement_operation_id)
-        if second_dialog is not None and is_valid_qt_object(second_dialog):
-            self.assertFalse(second_dialog.isVisible())
+        self.assertIsNone(self.workspace._direct_object_placement_session)
+        self.assertFalse(self.workspace.viewer.is_object_placement_active)
 
-    def test_place_dialog_preselects_level_containing_canvas_camera(self) -> None:
-        directory = Path(self.temporary_directory.name)
-        underground = _level(1, height_meters=2.0)
-        ground = _level(2, height_meters=4.25)
-        story = _level(3, height_meters=2.75)
-        underground.image_path = _write_blueprint(directory, "underground.png")
-        ground.image_path = _write_blueprint(directory, "ground.png")
-        story.image_path = _write_blueprint(directory, "story.png")
-        self.workspace.levels = [underground, ground, story]
-        self.workspace.viewer.set_first_person_camera_pose(
-            CameraPose(z=5.0)
+    def test_completed_atlas_request_uses_actual_model_preview(self) -> None:
+        model = _generated_model()
+        self.workspace.generation.set_data(
+            GenerationData(generated_objects=[_record("chair", None)])
+        )
+        with (
+            patch.object(
+                self.workspace.generation,
+                "get_generated_object_model",
+                return_value=model,
+            ),
+            patch.object(
+                self.workspace.viewer,
+                "begin_object_placement",
+                return_value=True,
+            ) as begin_placement,
+        ):
+            self.workspace._handle_atlas_object_place_requested("chair")
+
+        begin_placement.assert_called_once()
+        session = self.workspace._direct_object_placement_session
+        assert session is not None
+        self.assertEqual(begin_placement.call_args.args, (session.request_id,))
+        self.assertIs(
+            begin_placement.call_args.kwargs["preview_meshes"][0],
+            model.mesh,
         )
 
-        self.workspace.generation.placement_requested.emit("camera-level")
-        _qt_application.processEvents()
-
-        dialog = self.workspace._object_placement_dialog
-        self.assertIsNotNone(dialog)
-        assert dialog is not None
-        current_item = dialog.level_list.currentItem()
-        self.assertIsNotNone(current_item)
-        assert current_item is not None
-        self.assertEqual(current_item.data(Qt.ItemDataRole.UserRole), story.index)
-
-    def test_place_dialog_shared_floor_elevation_selects_upper_level(self) -> None:
-        directory = Path(self.temporary_directory.name)
-        ground = _level(2, height_meters=4.25)
-        story = _level(3, height_meters=2.75)
-        ground.image_path = _write_blueprint(directory, "ground-boundary.png")
-        story.image_path = _write_blueprint(directory, "story-boundary.png")
-        self.workspace.levels = [ground, story]
-        story_floor_top = build_level_base_z_lookup(self.workspace.levels)[
-            story.index
-        ]
-        self.assertAlmostEqual(
-            story_floor_top,
-            ground.floor_thickness_meters
-            + ground.height_meters
-            + story.floor_thickness_meters,
-        )
-        self.workspace.viewer.set_first_person_camera_pose(
-            CameraPose(z=story_floor_top)
-        )
-
-        self.workspace.generation.placement_requested.emit("floor-boundary")
-        _qt_application.processEvents()
-
-        dialog = self.workspace._object_placement_dialog
-        self.assertIsNotNone(dialog)
-        assert dialog is not None
-        current_item = dialog.level_list.currentItem()
-        self.assertIsNotNone(current_item)
-        assert current_item is not None
-        self.assertEqual(current_item.data(Qt.ItemDataRole.UserRole), story.index)
-
-    def test_stale_dialog_or_token_cannot_place_the_active_operation(self) -> None:
-        self.workspace.generation.placement_requested.emit("old-token")
-        old_dialog = self.workspace._object_placement_dialog
-        assert old_dialog is not None
+    def test_stale_direct_candidate_cannot_place_the_active_request(self) -> None:
+        level = _level(2)
+        self.workspace.levels = [level]
         self.workspace.generation.placement_requested.emit("current-token")
-        current_dialog = self.workspace._object_placement_dialog
-        assert current_dialog is not None
-        placement = GeneratedObjectPlacement(2, 80.0, 40.0)
+        candidate = SceneObjectPlacementCandidate(
+            level_index=2,
+            world_positions=((1.0, 0.5, 0.25),),
+        )
 
         with patch.object(
             self.workspace.generation,
             "set_active_object_placement",
             return_value=True,
         ) as setter:
-            self.workspace._handle_object_placement_selected(
-                old_dialog,
-                "old-token",
-                placement,
-            )
-            self.workspace._handle_object_placement_selected(
-                current_dialog,
+            self.workspace._handle_direct_object_placement_selected(
                 "wrong-token",
-                placement,
+                candidate,
             )
             setter.assert_not_called()
 
-            self.workspace._handle_object_placement_selected(
-                current_dialog,
+            self.workspace._handle_direct_object_placement_selected(
                 "current-token",
-                placement,
+                candidate,
             )
 
-        setter.assert_called_once_with("current-token", placement)
+        setter.assert_called_once()
+        request_id, placement = setter.call_args.args
+        self.assertEqual(request_id, "current-token")
+        self.assertEqual(placement.level_index, level.index)
+        self.assertAlmostEqual(
+            placement.height_offset_meters,
+            0.25 - build_level_base_z_lookup((level,))[level.index],
+        )
 
-    def test_shutdown_closes_the_active_placement_dialog(self) -> None:
+    def test_shutdown_cancels_the_active_direct_picker(self) -> None:
         self.workspace.generation.placement_requested.emit("operation")
-        dialog = self.workspace._object_placement_dialog
-        assert dialog is not None
+        self.assertTrue(self.workspace.viewer.is_object_placement_active)
 
         self.workspace.shutdown()
 
-        self.assertIsNone(self.workspace._object_placement_dialog)
-        self.assertIsNone(self.workspace._object_placement_operation_id)
-        if is_valid_qt_object(dialog):
-            self.assertFalse(dialog.isVisible())
+        self.assertIsNone(self.workspace._direct_object_placement_session)
+        self.assertFalse(self.workspace.viewer.is_object_placement_active)
 
-    def test_completed_object_request_finish_closes_only_its_dialog(self) -> None:
+    def test_completed_object_request_finish_closes_only_its_picker(self) -> None:
         self.workspace.generation.placement_requested.emit("completed-token")
-        dialog = self.workspace._object_placement_dialog
-        assert dialog is not None
+        session = self.workspace._direct_object_placement_session
+        assert session is not None
 
         self.workspace.generation.placement_request_finished.emit(
             "stale-token"
         )
-        self.assertIs(self.workspace._object_placement_dialog, dialog)
+        self.assertIs(self.workspace._direct_object_placement_session, session)
         self.workspace.generation.placement_request_finished.emit(
             "completed-token"
         )
 
-        self.assertIsNone(self.workspace._object_placement_dialog)
-        self.assertIsNone(self.workspace._object_placement_operation_id)
-        if is_valid_qt_object(dialog):
-            self.assertFalse(dialog.isVisible())
+        self.assertIsNone(self.workspace._direct_object_placement_session)
+        self.assertFalse(self.workspace.viewer.is_object_placement_active)
 
-    def test_closing_dialog_cancels_its_completed_object_request(self) -> None:
+    def test_cancelling_picker_cancels_completed_object_request(self) -> None:
         self.workspace.generation.placement_requested.emit("completed-token")
-        dialog = self.workspace._object_placement_dialog
-        assert dialog is not None
 
         with patch.object(
             self.workspace.generation,
             "cancel_object_placement_request",
             return_value=True,
         ) as cancel_request:
-            dialog.reject()
-            _qt_application.processEvents()
+            self.workspace.viewer.cancel_object_placement()
 
         cancel_request.assert_called_once_with("completed-token")
-        self.assertIsNone(self.workspace._object_placement_dialog)
+        self.assertIsNone(self.workspace._direct_object_placement_session)
+
+    def test_generation_place_before_start_applies_anchor_to_whole_batch(self) -> None:
+        level = _level(2)
+        self.workspace.levels = [level]
+        with patch.object(
+            self.workspace.generation,
+            "get_latest_generation_batch_placeable_ids",
+            return_value=(),
+        ):
+            self.workspace._handle_generation_object_place_requested()
+        session = self.workspace._direct_object_placement_session
+        assert session is not None
+        candidate = SceneObjectPlacementCandidate(
+            level_index=2,
+            world_positions=((0.0, 0.0, 0.1),),
+        )
+        self.workspace._handle_direct_object_placement_selected(
+            session.request_id,
+            candidate,
+        )
+
+        with patch.object(
+            self.workspace.generation,
+            "restore_placeable_object_placement",
+            return_value=True,
+        ) as restore:
+            self.workspace._handle_generation_batch_started_for_placement(
+                ("blob-a", "blob-b"),
+            )
+
+        self.assertEqual(restore.call_count, 2)
+        first = restore.call_args_list[0].args[1]
+        second = restore.call_args_list[1].args[1]
+        self.assertNotEqual((first.image_x, first.image_y), (second.image_x, second.image_y))
+
+    def test_generation_place_with_a_new_mask_stages_the_next_batch(self) -> None:
+        stale_anchor = SceneObjectPlacementCandidate(
+            level_index=2,
+            world_positions=((9.0, 9.0, 0.0),),
+        )
+        self.workspace._pending_generation_placement_anchor = stale_anchor
+        with (
+            patch.object(
+                self.workspace.generation,
+                "get_latest_generation_batch_placeable_ids",
+                return_value=("previous-object",),
+            ),
+            patch.object(
+                self.workspace.generation,
+                "has_unsubmitted_generation_mask",
+                return_value=True,
+            ),
+            patch.object(
+                self.workspace.viewer,
+                "begin_object_placement",
+                return_value=True,
+            ),
+        ):
+            self.workspace._handle_generation_object_place_requested()
+
+        session = self.workspace._direct_object_placement_session
+        assert session is not None
+        self.assertEqual(session.placeable_ids, ())
+        self.assertTrue(session.accepts_next_generation_batch)
+        self.assertIsNone(self.workspace._pending_generation_placement_anchor)
+
+    def test_generation_place_prefers_the_active_batch_over_a_new_mask(self) -> None:
+        with (
+            patch.object(
+                self.workspace.generation,
+                "get_latest_generation_batch_placeable_ids",
+                return_value=("active-a", "active-b"),
+            ),
+            patch.object(
+                self.workspace.generation,
+                "latest_generation_batch_has_active_members",
+                return_value=True,
+            ),
+            patch.object(
+                self.workspace.generation,
+                "has_unsubmitted_generation_mask",
+                return_value=True,
+            ),
+        ):
+            self.workspace._handle_generation_object_place_requested()
+
+        session = self.workspace._direct_object_placement_session
+        assert session is not None
+        self.assertEqual(session.placeable_ids, ("active-a", "active-b"))
+        self.assertFalse(session.accepts_next_generation_batch)
+
+    def test_generation_place_after_fully_placed_batch_stages_next(self) -> None:
+        with (
+            patch.object(
+                self.workspace.generation,
+                "get_latest_generation_batch_placeable_ids",
+                return_value=("placed-a", "placed-b"),
+            ),
+            patch.object(
+                self.workspace.generation,
+                "latest_generation_batch_has_active_members",
+                return_value=False,
+            ),
+            patch.object(
+                self.workspace.generation,
+                "has_unsubmitted_generation_mask",
+                return_value=False,
+            ),
+            patch.object(
+                self.workspace.generation,
+                "latest_generation_batch_is_fully_placed",
+                return_value=True,
+            ),
+        ):
+            self.workspace._handle_generation_object_place_requested()
+
+        session = self.workspace._direct_object_placement_session
+        assert session is not None
+        self.assertEqual(session.placeable_ids, ())
+        self.assertTrue(session.accepts_next_generation_batch)
+
+    def test_generation_place_after_start_targets_every_batch_member(self) -> None:
+        level = _level(2)
+        self.workspace.levels = [level]
+        with patch.object(
+            self.workspace.generation,
+            "get_latest_generation_batch_placeable_ids",
+            return_value=("blob-a", "blob-b"),
+        ):
+            self.workspace._handle_generation_object_place_requested()
+        session = self.workspace._direct_object_placement_session
+        assert session is not None
+        self.assertEqual(session.placeable_ids, ("blob-a", "blob-b"))
+        candidate = SceneObjectPlacementCandidate(
+            level_index=2,
+            world_positions=((-0.625, 0.0, 0.1), (0.625, 0.0, 0.1)),
+        )
+        with patch.object(
+            self.workspace.generation,
+            "restore_placeable_object_placement",
+            return_value=True,
+        ) as restore:
+            self.workspace._handle_direct_object_placement_selected(
+                session.request_id,
+                candidate,
+            )
+
+        self.assertEqual(restore.call_count, 2)
+
+    def test_failed_batch_member_reduces_the_armed_cube_preview(self) -> None:
+        with patch.object(
+            self.workspace.generation,
+            "get_latest_generation_batch_placeable_ids",
+            return_value=("blob-a", "blob-b"),
+        ):
+            self.workspace._handle_generation_object_place_requested()
+
+        with (
+            patch.object(
+                self.workspace.generation,
+                "get_latest_generation_batch_placeable_ids",
+                return_value=("completed-b",),
+            ),
+            patch.object(
+                self.workspace.viewer,
+                "update_object_placement_preview_count",
+                return_value=True,
+            ) as update_preview,
+        ):
+            self.workspace._handle_object_placement_operation_finished("blob-a")
+
+        session = self.workspace._direct_object_placement_session
+        assert session is not None
+        self.assertEqual(session.placeable_ids, ("completed-b",))
+        update_preview.assert_called_once_with(1)
+
+    def test_finished_batch_member_retargets_operation_id_to_object_id(self) -> None:
+        with patch.object(
+            self.workspace.generation,
+            "get_latest_generation_batch_placeable_ids",
+            return_value=("operation-a", "operation-b"),
+        ):
+            self.workspace._handle_generation_object_place_requested()
+
+        with (
+            patch.object(
+                self.workspace.generation,
+                "get_latest_generation_batch_placeable_ids",
+                return_value=("object-a", "operation-b"),
+            ),
+            patch.object(
+                self.workspace.viewer,
+                "update_object_placement_preview_count",
+            ) as update_preview,
+        ):
+            self.workspace._handle_object_placement_operation_finished(
+                "operation-a"
+            )
+
+        session = self.workspace._direct_object_placement_session
+        assert session is not None
+        self.assertEqual(session.placeable_ids, ("object-a", "operation-b"))
+        update_preview.assert_not_called()
+
+    def test_failed_group_placement_rolls_back_every_changed_member(self) -> None:
+        level = _level(2)
+        self.workspace.levels = [level]
+        original = GeneratedObjectPlacement(2, 10.0, 20.0)
+        candidate = SceneObjectPlacementCandidate(
+            level_index=2,
+            world_positions=((-0.5, 0.0, 0.1), (0.5, 0.0, 0.1)),
+        )
+        with (
+            patch.object(
+                self.workspace.generation,
+                "get_generated_object_ids",
+                return_value=("object-a", "object-b"),
+            ),
+            patch.object(
+                self.workspace.generation,
+                "get_placeable_object_placement_state",
+                side_effect=(("object-a", original), None),
+            ),
+            patch.object(
+                self.workspace,
+                "_capture_canvas_atlas_placements",
+                side_effect=((), ()),
+            ) as capture_atlas,
+            patch.object(
+                self.workspace.generation,
+                "restore_placeable_object_placement",
+                side_effect=(True, False, True),
+            ) as restore,
+            patch.object(
+                self.workspace,
+                "_record_canvas_undo_state",
+            ) as record_undo,
+        ):
+            placed = self.workspace._commit_placeable_object_group(
+                ("object-a", "object-b"),
+                candidate,
+            )
+
+        self.assertFalse(placed)
+        self.assertEqual(capture_atlas.call_count, 2)
+        self.assertEqual(restore.call_count, 3)
+        self.assertEqual(restore.call_args_list[-1].args, ("object-a", original))
+        record_undo.assert_not_called()
+
+    def test_group_placement_is_one_undoable_canvas_action(self) -> None:
+        level = _level(2)
+        self.workspace.levels = [level]
+        self.workspace.generation.set_data(
+            GenerationData(
+                generated_objects=[
+                    _record("object-a", None),
+                    _record("object-b", None),
+                ]
+            )
+        )
+        candidate = SceneObjectPlacementCandidate(
+            level_index=2,
+            world_positions=((-0.5, 0.0, 0.1), (0.5, 0.0, 0.1)),
+        )
+        undo_count = len(self.workspace._canvas_undo_stack)
+
+        self.assertTrue(
+            self.workspace._commit_placeable_object_group(
+                ("object-a", "object-b"),
+                candidate,
+            )
+        )
+        self.assertEqual(len(self.workspace._canvas_undo_stack), undo_count + 1)
+        self.assertTrue(
+            all(
+                self.workspace.generation.get_generated_object_placement(object_id)
+                is not None
+                for object_id in ("object-a", "object-b")
+            )
+        )
+
+        self.workspace._handle_canvas_undo_requested()
+
+        self.assertEqual(len(self.workspace._canvas_undo_stack), undo_count)
+        self.assertTrue(
+            all(
+                self.workspace.generation.get_generated_object_placement(object_id)
+                is None
+                for object_id in ("object-a", "object-b")
+            )
+        )
 
     def test_completed_object_placement_change_refreshes_canvas_preview(
         self,

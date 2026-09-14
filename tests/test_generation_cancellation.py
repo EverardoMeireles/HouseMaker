@@ -147,6 +147,11 @@ class _BlockingPlanner(_ImmediatePlanner):
         return super().plan(request)
 
 
+class _FailingPlanner:
+    def plan(self, _request: GenerationRequest) -> MeshyGenerationResult:
+        raise RuntimeError("Expected generation failure.")
+
+
 class _ImmediateTextureRegenerator:
     def __init__(self, result: MeshyGenerationResult) -> None:
         self.result = result
@@ -669,6 +674,105 @@ class GenerationCancellationTests(unittest.TestCase):
                 request_id,
                 GeneratedObjectPlacement(1, 10.0, 20.0),
             )
+        )
+
+    def test_mask_blob_batch_exposes_ordered_active_placeable_ids(self) -> None:
+        result = MeshyGenerationResult("batch-task", _box_glb(), "Provider object")
+        planner = _BlockingPlanner(result)
+        self.workspace.set_meshy_planner(planner)
+        self.workspace.set_meshy_executor(_ImmediateExecutor(_plain_model()))
+        started_spy = QSignalSpy(self.workspace.generation_batch_started)
+        requests = (self._generation_request(), self._generation_request())
+
+        self.workspace._start_mask_blob_generations(requests)
+
+        self.assertEqual(started_spy.count(), 1)
+        ordered_ids = tuple(started_spy.at(0)[0])
+        self.assertEqual(
+            self.workspace.get_latest_generation_batch_placeable_ids(),
+            ordered_ids,
+        )
+        self.assertEqual(len(ordered_ids), 2)
+        self.assertEqual(
+            tuple(
+                self.workspace._latest_generation_batch_member_ids.values()
+            ),
+            ordered_ids,
+        )
+        operations = tuple(
+            self.workspace._object_job_runtimes[operation_id].operation
+            for operation_id in ordered_ids
+        )
+        self.assertEqual(tuple(item.blob_index for item in operations), (1, 2))
+        self.assertTrue(all(item.blob_count == 2 for item in operations))
+        self.assertEqual(len({item.batch_id for item in operations}), 1)
+        self.assertEqual(
+            tuple(
+                self.workspace.get_placeable_object_names_by_id()[operation_id]
+                for operation_id in ordered_ids
+            ),
+            (
+                "Object from frame 1 - Blob 1",
+                "Object from frame 1 - Blob 2",
+            ),
+        )
+
+        planner.release.set()
+        self._wait_until_idle()
+
+        records = self.workspace.get_data().generated_objects
+        self.assertEqual(
+            {record.object_name for record in records},
+            {
+                "Object from frame 1 - Blob 1",
+                "Object from frame 1 - Blob 2",
+            },
+        )
+        records_by_blob_index = {
+            int(record.pipeline["generation_batch"]["blob_index"]): record
+            for record in records
+        }
+        self.assertEqual(
+            self.workspace.get_latest_generation_batch_placeable_ids(),
+            tuple(
+                records_by_blob_index[index].object_id
+                for index in (1, 2)
+            ),
+        )
+        self.assertEqual(
+            self.workspace._latest_generation_batch_member_ids,
+            {
+                index: records_by_blob_index[index].object_id
+                for index in (1, 2)
+            },
+        )
+        self.assertTrue(
+            all(
+                record.pipeline["generation_batch"]["blob_count"] == 2
+                for record in records
+            )
+        )
+
+    def test_failed_batch_member_is_retired_before_finished_signal(self) -> None:
+        self.workspace.set_meshy_planner(_FailingPlanner())
+        snapshots: list[tuple[str, tuple[str, ...]]] = []
+        self.workspace.operation_finished.connect(
+            lambda operation_id: snapshots.append(
+                (
+                    str(operation_id),
+                    self.workspace.get_latest_generation_batch_placeable_ids(),
+                )
+            )
+        )
+
+        self.workspace._start_mask_blob_generations(
+            (self._generation_request(), self._generation_request())
+        )
+        self._wait_until_idle()
+
+        self.assertEqual(len(snapshots), 2)
+        self.assertTrue(
+            all(operation_id not in ids for operation_id, ids in snapshots)
         )
 
     def test_completed_object_can_be_repositioned_with_a_fresh_bound_token(

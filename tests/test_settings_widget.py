@@ -29,10 +29,12 @@ from housemaker.first_person_navigation import (
 )
 from housemaker.settings_widget import (
     ATLAS_DISPLAY_SCREEN_SETTING_KEY,
+    AUTOMATIC_ATLAS_CREATION_SETTING_KEY,
     AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR_SETTING_KEY,
     AUTOMATIC_ATLAS_TEXTURE_RESOLUTION_SETTING_KEY,
     AUTOMATIC_ATLAS_TEXTURE_RESOLUTIONS,
     CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY_SETTING_KEY,
+    DEFAULT_AUTOMATIC_ATLAS_CREATION,
     DEFAULT_AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR,
     DEFAULT_AUTOMATIC_ATLAS_TEXTURE_RESOLUTION,
     DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY,
@@ -72,6 +74,7 @@ from housemaker.settings_widget import (
     SettingsWidget,
     fullscreen_3d_viewer_screen_id,
     read_atlas_display_screen_id,
+    read_automatic_atlas_creation,
     read_automatic_atlas_texture_sort_by_pbr,
     read_automatic_atlas_texture_resolution,
     read_canvas_3d_navigation_toggle_hotkey,
@@ -158,6 +161,7 @@ class SettingsWidgetTests(unittest.TestCase):
                     widget.atlas_automation_settings_group,
                     "Atlas automation",
                     (
+                        widget.automatic_atlas_creation_checkbox,
                         widget.automatic_atlas_texture_sort_by_pbr_checkbox,
                         widget.use_half_mesh_texture_prefix_checkbox,
                         widget.automatic_atlas_texture_resolution_combo,
@@ -406,6 +410,61 @@ class SettingsWidgetTests(unittest.TestCase):
                         GenerationServiceSettings(
                             **{field_name: value}  # type: ignore[arg-type]
                         )
+
+    def test_automatic_atlas_creation_defaults_persists_and_restores(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            widget = SettingsWidget(
+                application_settings=application_settings,
+                environment={},
+            )
+            checkbox = widget.automatic_atlas_creation_checkbox
+            emitted_changes: list[bool] = []
+            widget.settings_changed.connect(
+                lambda: emitted_changes.append(True)
+            )
+
+            self.assertFalse(DEFAULT_AUTOMATIC_ATLAS_CREATION)
+            self.assertFalse(checkbox.isChecked())
+            self.assertFalse(widget.get_settings().automatic_atlas_creation)
+
+            checkbox.setChecked(True)
+
+            self.assertTrue(
+                application_settings.get(AUTOMATIC_ATLAS_CREATION_SETTING_KEY)
+            )
+            self.assertTrue(widget.get_settings().automatic_atlas_creation)
+            self.assertEqual(emitted_changes, [True])
+            restored = SettingsWidget(
+                application_settings=_build_test_settings(temporary_directory),
+                environment={},
+            )
+            self.assertTrue(restored.get_settings().automatic_atlas_creation)
+
+    def test_automatic_atlas_creation_rejects_malformed_values(self) -> None:
+        for value in (0, 1, "true", None):
+            with self.subTest(model_value=value):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "Automatic atlas creation",
+                ):
+                    GenerationServiceSettings(
+                        automatic_atlas_creation=value  # type: ignore[arg-type]
+                    )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            for value in (0, 1, "true", None):
+                with self.subTest(persisted_value=value):
+                    application_settings.set(
+                        AUTOMATIC_ATLAS_CREATION_SETTING_KEY,
+                        value,
+                    )
+                    self.assertFalse(
+                        read_automatic_atlas_creation(application_settings)
+                    )
 
     def test_automatic_atlas_resolution_defaults_persists_and_emits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

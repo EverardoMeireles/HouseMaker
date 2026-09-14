@@ -44,6 +44,7 @@ SCENE_3D_DISPLAY_SCREEN_SETTING_KEY = "display/scene_3d_screen_id"
 GENERATION_DISPLAY_SCREEN_SETTING_KEY = "display/generation_screen_id"
 JOBS_WINDOW_SCREEN_SETTING_KEY = "display/jobs_window_screen_id"
 ATLAS_DISPLAY_SCREEN_SETTING_KEY = "display/atlas_screen_id"
+AUTOMATIC_ATLAS_CREATION_SETTING_KEY = "atlas/automatic_creation"
 AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR_SETTING_KEY = (
     "atlas/automatic_texture_sort_by_pbr"
 )
@@ -81,6 +82,7 @@ DEFAULT_UNUSED_FACE_REMOVAL = False
 DEFAULT_USE_UV_RAYCAST_FOR_OBJECT_GENERATION = False
 DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE = 5
 AUTOMATIC_ATLAS_TEXTURE_RESOLUTIONS = (512, 1024)
+DEFAULT_AUTOMATIC_ATLAS_CREATION = False
 DEFAULT_AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR = False
 DEFAULT_USE_HALF_MESH_TEXTURE_PREFIX = False
 DEFAULT_AUTOMATIC_ATLAS_TEXTURE_RESOLUTION = 512
@@ -187,6 +189,7 @@ class GenerationServiceSettings:
         DEFAULT_WALL_VERTEX_UPDATE_DELAY_SECONDS
     )
     generation_display_screen_id: str | None = None
+    automatic_atlas_creation: bool = DEFAULT_AUTOMATIC_ATLAS_CREATION
 
     def __post_init__(self) -> None:
         try:
@@ -208,6 +211,10 @@ class GenerationServiceSettings:
             raise ValueError(
                 "Snap-to-middle equal-angle filtering must be enabled or "
                 "disabled."
+            )
+        if not isinstance(self.automatic_atlas_creation, bool):
+            raise ValueError(
+                "Automatic atlas creation must be enabled or disabled."
             )
         if not isinstance(self.use_half_mesh_texture_prefix, bool):
             raise ValueError(
@@ -440,6 +447,9 @@ class SettingsWidget(QWidget):
             ),
             jobs_window_screen_id=self._selected_jobs_window_screen_id(),
             atlas_display_screen_id=self._selected_atlas_display_screen_id(),
+            automatic_atlas_creation=(
+                self.automatic_atlas_creation_checkbox.isChecked()
+            ),
             automatic_atlas_texture_sort_by_pbr=(
                 self.automatic_atlas_texture_sort_by_pbr_checkbox.isChecked()
             ),
@@ -673,6 +683,22 @@ class SettingsWidget(QWidget):
         display_form.addRow(
             "Atlas display",
             self.atlas_display_screen_combo,
+        )
+
+        self.automatic_atlas_creation_checkbox = QCheckBox()
+        self.automatic_atlas_creation_checkbox.setObjectName(
+            "automatic_atlas_creation_checkbox"
+        )
+        self.automatic_atlas_creation_checkbox.setToolTip(
+            "Create another Atlas automatically when scene textures do not "
+            "fit in the currently selected Atlas."
+        )
+        self.automatic_atlas_creation_checkbox.toggled.connect(
+            self._handle_automatic_atlas_creation_changed
+        )
+        atlas_automation_form.addRow(
+            "Automatic atlas creation",
+            self.automatic_atlas_creation_checkbox,
         )
 
         self.automatic_atlas_texture_sort_by_pbr_checkbox = QCheckBox()
@@ -970,6 +996,9 @@ class SettingsWidget(QWidget):
         self._refresh_generation_display_screen_options()
         self._refresh_jobs_window_screen_options()
         self._refresh_atlas_display_screen_options()
+        self.automatic_atlas_creation_checkbox.setChecked(
+            read_automatic_atlas_creation(self._application_settings)
+        )
         self.automatic_atlas_texture_sort_by_pbr_checkbox.setChecked(
             read_automatic_atlas_texture_sort_by_pbr(
                 self._application_settings
@@ -1235,6 +1264,17 @@ class SettingsWidget(QWidget):
         self._application_settings.set(
             AUTOMATIC_ATLAS_TEXTURE_RESOLUTION_SETTING_KEY,
             int(self.automatic_atlas_texture_resolution_combo.currentData()),
+        )
+        self.settings_changed.emit()
+
+    def _handle_automatic_atlas_creation_changed(self, checked: bool) -> None:
+        """Persist whether full automatic Atlas destinations may overflow."""
+
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            AUTOMATIC_ATLAS_CREATION_SETTING_KEY,
+            bool(checked),
         )
         self.settings_changed.emit()
 
@@ -1504,6 +1544,20 @@ def read_atlas_display_screen_id(
 
 
 # ### Atlas setting helpers ###
+def read_automatic_atlas_creation(
+    application_settings: ApplicationSettingsStore,
+) -> bool:
+    """Read the persisted automatic Atlas-creation policy safely."""
+
+    value = application_settings.get(
+        AUTOMATIC_ATLAS_CREATION_SETTING_KEY,
+        DEFAULT_AUTOMATIC_ATLAS_CREATION,
+    )
+    if isinstance(value, bool):
+        return value
+    return DEFAULT_AUTOMATIC_ATLAS_CREATION
+
+
 def read_automatic_atlas_texture_sort_by_pbr(
     application_settings: ApplicationSettingsStore,
 ) -> bool:

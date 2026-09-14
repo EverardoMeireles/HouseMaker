@@ -471,6 +471,41 @@ class GenerationMaskViewTests(unittest.TestCase):
         self.view.clear_mask()
         self.assertFalse(self.view.has_selection())
 
+    def test_disconnected_mask_blobs_build_independent_ordered_crops(self) -> None:
+        frame = np.zeros((100, 200, 3), dtype=np.uint8)
+        frame[:, :100] = (10, 20, 30)
+        frame[:, 100:] = (100, 150, 200)
+        self.view.set_frame(
+            frame,
+            [
+                MaskStroke(
+                    MASK_MODE_PAINT,
+                    0.04,
+                    (MaskPoint(0.2, 0.25),),
+                ),
+                MaskStroke(
+                    MASK_MODE_PAINT,
+                    0.04,
+                    (MaskPoint(0.8, 0.75),),
+                ),
+            ],
+        )
+
+        crops = self.view.build_selected_object_crops(padding_ratio=0.0)
+
+        self.assertEqual(len(crops), 2)
+        self.assertTrue(all(crop.shape[2] == 4 for crop in crops))
+        first_selected = crops[0][crops[0][:, :, 3] > 0, :3]
+        second_selected = crops[1][crops[1][:, :, 3] > 0, :3]
+        self.assertTrue(np.all(first_selected == (10, 20, 30)))
+        self.assertTrue(np.all(second_selected == (100, 150, 200)))
+        self.assertTrue(
+            all(
+                np.all(crop[crop[:, :, 3] == 0, :3] == 0)
+                for crop in crops
+            )
+        )
+
     def test_normalized_strokes_rasterize_consistently_at_new_resolution(self) -> None:
         paint = MaskStroke(
             mode=MASK_MODE_PAINT,
@@ -1615,6 +1650,134 @@ class GenerationWorkspaceTests(unittest.TestCase):
         self.workspace.shutdown()
         self.workspace.close()
         _qt_application.processEvents()
+
+    def test_generate_actions_start_one_named_job_per_disconnected_blob(
+        self,
+    ) -> None:
+        self.workspace.video_view.set_frame(
+            np.full((100, 200, 3), 120, dtype=np.uint8),
+            [
+                MaskStroke(
+                    MASK_MODE_PAINT,
+                    0.04,
+                    (MaskPoint(0.2, 0.25),),
+                ),
+                MaskStroke(
+                    MASK_MODE_PAINT,
+                    0.04,
+                    (MaskPoint(0.8, 0.75),),
+                ),
+            ],
+        )
+
+        for action_name, expected_geometry_only in (
+            ("generate", False),
+            ("generate_geometry", True),
+        ):
+            with self.subTest(action=action_name), patch.object(
+                self.workspace,
+                "_start_generation",
+                side_effect=("operation-1", "operation-2"),
+            ) as start_generation:
+                getattr(self.workspace, action_name)()
+
+            self.assertEqual(start_generation.call_count, 2)
+            calls = start_generation.call_args_list
+            requests = tuple(call.args[0] for call in calls)
+            self.assertTrue(
+                all(
+                    request.geometry_only is expected_geometry_only
+                    for request in requests
+                )
+            )
+            self.assertIs(requests[0].settings, requests[1].settings)
+            self.assertEqual(
+                tuple(call.kwargs["requested_name"] for call in calls),
+                (
+                    "Object from frame 1 - Blob 1",
+                    "Object from frame 1 - Blob 2",
+                ),
+            )
+            self.assertEqual(
+                tuple(call.kwargs["blob_index"] for call in calls),
+                (1, 2),
+            )
+            self.assertTrue(
+                all(call.kwargs["blob_count"] == 2 for call in calls)
+            )
+            self.assertEqual(
+                len({call.kwargs["batch_id"] for call in calls}),
+                1,
+            )
+            self.assertTrue(
+                all(
+                    np.count_nonzero(
+                        request.selected_object_bgra[:, :, 3]
+                    )
+                    > 0
+                    for request in requests
+                )
+            )
+
+    def test_started_generation_batch_emits_ordered_placeable_ids(self) -> None:
+        first_request = GenerationRequest(
+            frame_index=0,
+            selected_object_bgra=np.full((4, 4, 4), 255, dtype=np.uint8),
+            settings=GenerationServiceSettings(),
+        )
+        second_request = GenerationRequest(
+            frame_index=0,
+            selected_object_bgra=np.full((4, 4, 4), 255, dtype=np.uint8),
+            settings=first_request.settings,
+        )
+        started_spy = QSignalSpy(self.workspace.generation_batch_started)
+
+        with patch.object(
+            self.workspace,
+            "_start_generation",
+            side_effect=("first-operation", "second-operation"),
+        ):
+            self.workspace._start_mask_blob_generations(
+                (first_request, second_request)
+            )
+
+        self.assertEqual(started_spy.count(), 1)
+        self.assertEqual(
+            tuple(started_spy.at(0)[0]),
+            ("first-operation", "second-operation"),
+        )
+
+    def test_generation_mask_signature_tracks_submission_changes_and_reset(
+        self,
+    ) -> None:
+        self.workspace.video_view.set_frame(
+            np.full((100, 200, 3), 120, dtype=np.uint8),
+            [_test_stroke(x=0.25, y=0.5)],
+        )
+        request = GenerationRequest(
+            frame_index=0,
+            selected_object_bgra=np.full((4, 4, 4), 255, dtype=np.uint8),
+            settings=GenerationServiceSettings(),
+        )
+        with patch.object(
+            self.workspace,
+            "_start_generation",
+            return_value="operation",
+        ):
+            self.workspace._start_mask_blob_generations((request,))
+
+        self.assertFalse(self.workspace.has_unsubmitted_generation_mask())
+        self.workspace.video_view.set_strokes([_test_stroke(x=0.75, y=0.5)])
+        self.assertTrue(self.workspace.has_unsubmitted_generation_mask())
+
+        self.workspace.video_view.set_strokes([_test_stroke(x=0.25, y=0.5)])
+        self.workspace._data.current_frame_index = 1
+        self.assertTrue(self.workspace.has_unsubmitted_generation_mask())
+
+        self.workspace.set_data(GenerationData())
+        self.assertFalse(self.workspace.has_unsubmitted_generation_mask())
+        self.assertIsNone(self.workspace._latest_generation_batch_id)
+        self.assertEqual(self.workspace._latest_generation_batch_member_ids, {})
 
     def test_layout_controls_and_video_seek_keep_masks_per_frame(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

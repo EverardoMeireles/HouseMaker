@@ -2261,6 +2261,7 @@ class TextureAtlasWorkspace(QWidget):
         *,
         sort_by_pbr: bool = False,
         use_half_mesh_texture_prefix: bool = False,
+        allow_atlas_creation: bool = False,
     ) -> tuple[str, ...]:
         """Pack every currently-unpacked source into an appropriate Atlas.
 
@@ -2268,8 +2269,9 @@ class TextureAtlasWorkspace(QWidget):
         takes precedence over PBR sorting and sends symmetric sources to a
         ``[HALF]`` Atlas. PBR sorting sends other base-color-only sources to an
         Atlas whose exact sources own no PBR maps. Missing auxiliary Atlases
-        are created as needed. The successful subset is published as one
-        Atlas/PNG transaction.
+        are created as needed. When generic Atlas creation is enabled, a full
+        selected Atlas overflows into uniquely named Atlases of the same size.
+        The successful subset is published as one Atlas/PNG transaction.
         """
 
         selected_atlas = self.selected_atlas
@@ -2277,6 +2279,7 @@ class TextureAtlasWorkspace(QWidget):
             selected_atlas is None
             and not bool(sort_by_pbr)
             and not bool(use_half_mesh_texture_prefix)
+            and not bool(allow_atlas_creation)
         ):
             self._refresh_object_list(self._selected_object_id())
             return ()
@@ -2330,6 +2333,7 @@ class TextureAtlasWorkspace(QWidget):
                 ),
                 sort_by_pbr=bool(sort_by_pbr),
                 use_half_mesh_texture_prefix=bool(use_half_mesh_texture_prefix),
+                allow_atlas_creation=bool(allow_atlas_creation),
                 source_overrides=source_overrides,
             )
             if assigned_atlas_id is None:
@@ -2417,6 +2421,7 @@ class TextureAtlasWorkspace(QWidget):
         selected_atlas_id: str | None,
         sort_by_pbr: bool,
         use_half_mesh_texture_prefix: bool,
+        allow_atlas_creation: bool,
         source_overrides: dict[tuple[str, int], AtlasObjectTextureSource],
     ) -> str | None:
         """Assign one prepared source and return its destination Atlas ID."""
@@ -2432,7 +2437,16 @@ class TextureAtlasWorkspace(QWidget):
             )
 
         if not sort_by_pbr or self._source_has_pbr_maps(source):
-            candidate_ids = () if selected_atlas_id is None else (selected_atlas_id,)
+            candidate_ids = tuple(
+                dict.fromkeys(
+                    atlas_id
+                    for atlas_id in (
+                        data.selected_atlas_id if allow_atlas_creation else None,
+                        selected_atlas_id,
+                    )
+                    if atlas_id is not None
+                )
+            )
         else:
             candidate_ids = tuple(
                 atlas.atlas_id
@@ -2458,12 +2472,59 @@ class TextureAtlasWorkspace(QWidget):
             return atlas_id
 
         if not sort_by_pbr or self._source_has_pbr_maps(source):
-            return None
+            if not allow_atlas_creation:
+                return None
+            return self._create_generic_atlas_for_source(
+                data,
+                source,
+                selected_atlas_id=selected_atlas_id,
+            )
         return self._create_non_pbr_atlas_for_source(
             data,
             source,
             selected_atlas_id=selected_atlas_id,
         )
+
+    def _create_generic_atlas_for_source(
+        self,
+        data: TextureAtlasData,
+        source: AtlasObjectTextureSource,
+        *,
+        selected_atlas_id: str | None,
+    ) -> str | None:
+        """Create one generic overflow Atlas matching the selected Atlas size."""
+
+        selected_atlas = (
+            None if selected_atlas_id is None else data.atlas_by_id(selected_atlas_id)
+        )
+        atlas_resolution = (
+            DEFAULT_AUTOMATIC_ATLAS_RESOLUTION
+            if selected_atlas is None
+            else selected_atlas.resolution
+        )
+        previous_selected_atlas_id = data.selected_atlas_id
+        created_atlas_id: str | None = None
+        try:
+            atlas = data.create_atlas(
+                self._next_generic_atlas_name(data),
+                atlas_resolution,
+            )
+            created_atlas_id = atlas.atlas_id
+            data.select_atlas(atlas.atlas_id)
+            data.assign_object(
+                atlas.atlas_id,
+                source.object_id,
+                source.texture_path,
+                source.texture_resolution,
+                source.packing_mode,
+                allow_pairing=True,
+            )
+        except (OSError, TypeError, ValueError):
+            if created_atlas_id is not None:
+                data.remove_atlas(created_atlas_id)
+                data.select_atlas(previous_selected_atlas_id)
+            return None
+        return atlas.atlas_id
 
     def _assign_half_mesh_source(
         self,

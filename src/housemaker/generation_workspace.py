@@ -226,6 +226,7 @@ LAST_TEXTURE_FACE_REMOVAL_DETAIL_PIPELINE_KEYS = (
 GENERATION_JOB_KIND_MODEL = "Object generation"
 GENERATION_JOB_KIND_TEXTURE = "Object texture generation"
 GENERATION_JOB_KIND_FACE_EDIT = "Object face editing"
+GENERATION_BATCH_PIPELINE_KEY = "generation_batch"
 SYMMETRIC_DIVISION_PIPELINE_KEY = "symmetric_division"
 SYMMETRIC_DIVISION_TEXTURE_CONTENT_HALF = "left"
 SYMMETRIC_TEXTURE_RESOLUTIONS = SYMMETRIC_SQUARE_PAIR_CONTENT_RESOLUTIONS
@@ -375,6 +376,9 @@ class _ActiveObjectOperation:
 
     kind: str
     target_object_id: str | None = None
+    batch_id: str | None = None
+    blob_index: int = 1
+    blob_count: int = 1
     cancel_requested: bool = False
     committed_object_id: str | None = None
     pending_placement: GeneratedObjectPlacement | None = None
@@ -445,6 +449,25 @@ class _ObjectJobRuntime:
     @property
     def operation_id(self) -> str:
         return self.operation.operation_id
+
+
+def _apply_generation_batch_pipeline_metadata(
+    pipeline: dict[str, object],
+    operation: _ActiveObjectOperation | None,
+) -> None:
+    """Persist multi-blob provenance without changing ordinary object records."""
+
+    if (
+        operation is None
+        or operation.batch_id is None
+        or operation.blob_count <= 1
+    ):
+        return
+    pipeline[GENERATION_BATCH_PIPELINE_KEY] = {
+        "batch_id": operation.batch_id,
+        "blob_index": operation.blob_index,
+        "blob_count": operation.blob_count,
+    }
 
 
 # ### Symmetric-division metadata ###
@@ -2927,7 +2950,9 @@ class GenerationWorkspace(QWidget):
     operation_cancelled = Signal(str, object)
     placement_requested = Signal(str)
     placement_request_finished = Signal(str)
+    new_object_placement_requested = Signal()
     operation_finished = Signal(str)
+    generation_batch_started = Signal(object)
 
     def __init__(
         self,
@@ -2967,6 +2992,11 @@ class GenerationWorkspace(QWidget):
         self._is_syncing_seekbar = False
         self._job_manager = job_manager
         self._object_job_runtimes: dict[str, _ObjectJobRuntime] = {}
+        self._latest_generation_batch_id: str | None = None
+        self._latest_generation_batch_member_ids: dict[int, str] = {}
+        self._latest_generation_batch_mask_signature: (
+            tuple[int, tuple[int, ...], str] | None
+        ) = None
         self._generation_thread: QThread | None = None
         self._generation_worker: (
             GenerationWorker
@@ -3066,6 +3096,103 @@ class GenerationWorkspace(QWidget):
             )
         return placeable_objects
 
+    def get_latest_generation_batch_placeable_ids(self) -> tuple[str, ...]:
+        """Return the newest batch's active or committed IDs in blob order."""
+
+        batch_id = self._latest_generation_batch_id
+        if batch_id is None:
+            return ()
+        placeable_ids_by_index: dict[int, str] = {}
+        completed_object_ids = {
+            record.object_id for record in self._data.generated_objects
+        }
+        for blob_index, placeable_id in (
+            self._latest_generation_batch_member_ids.items()
+        ):
+            runtime = self._object_job_runtimes.get(placeable_id)
+            is_active = (
+                runtime is not None
+                and self._can_place_active_operation(runtime.operation)
+            )
+            if is_active or placeable_id in completed_object_ids:
+                placeable_ids_by_index[blob_index] = placeable_id
+        for record in self._data.generated_objects:
+            raw_metadata = record.pipeline.get(GENERATION_BATCH_PIPELINE_KEY)
+            if not isinstance(raw_metadata, Mapping):
+                continue
+            if str(raw_metadata.get("batch_id", "")) != batch_id:
+                continue
+            try:
+                blob_index = int(raw_metadata["blob_index"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            placeable_ids_by_index[blob_index] = record.object_id
+        for runtime in self._object_job_runtimes.values():
+            operation = runtime.operation
+            if operation.batch_id != batch_id:
+                continue
+            if operation.committed_object_id is not None:
+                placeable_ids_by_index[operation.blob_index] = (
+                    operation.committed_object_id
+                )
+            elif self._can_place_active_operation(operation):
+                placeable_ids_by_index[operation.blob_index] = (
+                    operation.operation_id
+                )
+        return tuple(
+            placeable_ids_by_index[index]
+            for index in sorted(placeable_ids_by_index)
+        )
+
+    def has_unsubmitted_generation_mask(self) -> bool:
+        """Return whether the current painted mask differs from the latest batch."""
+
+        signature = self._build_current_generation_mask_signature()
+        return bool(
+            signature is not None
+            and signature != self._latest_generation_batch_mask_signature
+        )
+
+    def latest_generation_batch_has_active_members(self) -> bool:
+        """Return whether any member of the newest batch is still placeable."""
+
+        batch_id = self._latest_generation_batch_id
+        return bool(
+            batch_id is not None
+            and any(
+                runtime.operation.batch_id == batch_id
+                and self._can_place_active_operation(runtime.operation)
+                for runtime in self._object_job_runtimes.values()
+            )
+        )
+
+    def latest_generation_batch_is_fully_placed(self) -> bool:
+        """Return whether every surviving member of the newest batch is placed."""
+
+        placeable_ids = self.get_latest_generation_batch_placeable_ids()
+        return bool(
+            placeable_ids
+            and all(
+                self.get_placeable_object_placement_state(placeable_id)
+                is not None
+                for placeable_id in placeable_ids
+            )
+        )
+
+    def _build_current_generation_mask_signature(
+        self,
+    ) -> tuple[int, tuple[int, ...], str] | None:
+        """Fingerprint the exact current mask without retaining its pixel buffer."""
+
+        mask = np.ascontiguousarray(self.video_view.get_mask())
+        if mask.size == 0 or not np.any(mask > 0):
+            return None
+        return (
+            int(self._data.current_frame_index),
+            tuple(int(value) for value in mask.shape),
+            hashlib.sha256(mask.tobytes()).hexdigest(),
+        )
+
     def get_scene_bound_placeable_object_ids(self) -> tuple[str, ...]:
         """Return completed and in-flight objects with a Canvas placement."""
 
@@ -3163,6 +3290,9 @@ class GenerationWorkspace(QWidget):
         if self.is_generating:
             raise RuntimeError("Cannot replace Generation data while generating.")
         self._finish_existing_object_placement_request()
+        self._latest_generation_batch_id = None
+        self._latest_generation_batch_member_ids.clear()
+        self._latest_generation_batch_mask_signature = None
         self._close_video_source()
         self._displayed_frame_index = None
         self._data = GenerationData() if data is None else data.clone()
@@ -3809,6 +3939,35 @@ class GenerationWorkspace(QWidget):
             emit_change_signals=emit_change_signals,
         )
 
+    def publish_placeable_object_placement_changes(
+        self,
+        placeable_ids: Sequence[str],
+    ) -> None:
+        """Publish one atomically prepared placement group with one data pass."""
+
+        changed_records: list[GeneratedObjectRecord] = []
+        seen_object_ids: set[str] = set()
+        for raw_placeable_id in placeable_ids:
+            placeable_id = str(raw_placeable_id).strip()
+            runtime = self._object_job_runtimes.get(placeable_id)
+            object_id = (
+                runtime.operation.committed_object_id
+                if runtime is not None
+                else placeable_id
+            )
+            if object_id is None or object_id in seen_object_ids:
+                continue
+            record = self._find_generated_object_record(object_id)
+            if record is None:
+                continue
+            seen_object_ids.add(object_id)
+            changed_records.append(record)
+        if changed_records:
+            self._emit_data_changed()
+            for record in changed_records:
+                self.generated_object_placement_changed.emit(record)
+        self._emit_placeable_objects_changed()
+
     def _set_generated_object_placement(
         self,
         object_id: str,
@@ -4243,10 +4402,10 @@ class GenerationWorkspace(QWidget):
         self._sync_controls()
 
     def generate(self) -> None:
-        request = self._build_generation_request()
-        if request is None:
+        requests = self._build_generation_requests()
+        if not requests:
             return
-        self._start_generation(request)
+        self._start_mask_blob_generations(requests)
 
     def generate_geometry(self) -> None:
         """Generate and locally process geometry without submitting Retexture."""
@@ -4257,22 +4416,86 @@ class GenerationWorkspace(QWidget):
                 "Clear the option to generate geometry only."
             )
             return
-        request = self._build_generation_request(geometry_only=True)
-        if request is None:
+        requests = self._build_generation_requests(geometry_only=True)
+        if not requests:
             return
-        self._start_generation(request)
+        self._start_mask_blob_generations(requests)
+
+    def _start_mask_blob_generations(
+        self,
+        requests: Sequence[GenerationRequest],
+    ) -> None:
+        """Start one independent job for every disconnected painted blob."""
+
+        request_count = len(requests)
+        batch_id = uuid.uuid4().hex
+        operation_ids: list[str] = []
+        for request_index, request in enumerate(requests, start=1):
+            requested_name = None
+            if request_count > 1:
+                requested_name = self._build_unique_generated_object_name(
+                    "Object from frame "
+                    f"{request.frame_index + 1} - Blob {request_index}"
+                )
+            operation_ids.append(
+                self._start_generation(
+                    request,
+                    requested_name=requested_name,
+                    batch_id=batch_id,
+                    blob_index=request_index,
+                    blob_count=request_count,
+                )
+            )
+        self._latest_generation_batch_id = batch_id
+        self._latest_generation_batch_member_ids = {
+            index: operation_id
+            for index, operation_id in enumerate(operation_ids, start=1)
+        }
+        self._latest_generation_batch_mask_signature = (
+            self._build_current_generation_mask_signature()
+        )
+        self.generation_batch_started.emit(tuple(operation_ids))
+
+    def _build_unique_generated_object_name(self, base_name: str) -> str:
+        """Keep automatically named jobs and objects distinguishable."""
+
+        normalized_base_name = str(base_name).strip() or "Generated object"
+        existing_names = {
+            record.object_name.strip()
+            for record in self._data.generated_objects
+            if record.object_name.strip()
+        }
+        existing_names.update(
+            self._active_placeable_object_name(runtime)
+            for runtime in self._object_job_runtimes.values()
+        )
+        manager = self._job_manager
+        if manager is not None:
+            existing_names.update(job.name.strip() for job in manager.jobs())
+        if normalized_base_name not in existing_names:
+            return normalized_base_name
+        suffix = 2
+        while f"{normalized_base_name} ({suffix})" in existing_names:
+            suffix += 1
+        return f"{normalized_base_name} ({suffix})"
 
     def _start_generation(
         self,
         request: GenerationRequest,
         *,
         requested_name: str | None = None,
-    ) -> None:
+        batch_id: str | None = None,
+        blob_index: int = 1,
+        blob_count: int = 1,
+    ) -> str:
         """Start one independently owned model-generation request."""
 
         object_id = uuid.uuid4().hex
         operation = _ActiveObjectOperation(
             kind=OBJECT_OPERATION_GENERATE_MODEL,
+            batch_id=None if batch_id is None else str(batch_id),
+            blob_index=int(blob_index),
+            blob_count=int(blob_count),
         )
         thread = QThread(self)
         worker = GenerationWorker(
@@ -4322,6 +4545,7 @@ class GenerationWorkspace(QWidget):
         )
         thread.start()
         self._sync_controls()
+        return operation.operation_id
 
     def _start_texture_regeneration(
         self,
@@ -4932,6 +5156,16 @@ class GenerationWorkspace(QWidget):
         buttons_layout.addWidget(self.generate_texture_button)
         self.regenerate_texture_button = self.generate_texture_button
 
+        self.place_button = QPushButton("Place")
+        self.place_button.setObjectName("place_generated_objects_button")
+        self.place_button.setMinimumHeight(38)
+        self.place_button.setToolTip(
+            "Choose a floor position in the shared 3D scene for the newest "
+            "object batch, including one that has not started yet."
+        )
+        self.place_button.clicked.connect(self.new_object_placement_requested.emit)
+        buttons_layout.addWidget(self.place_button)
+
         self.cancel_operation_button = QPushButton("Cancel")
         self.cancel_operation_button.setObjectName(
             "cancel_object_operation_button"
@@ -5128,6 +5362,10 @@ class GenerationWorkspace(QWidget):
             return
         was_placeable = self._can_place_active_operation(operation)
         operation.committed_object_id = object_id
+        if operation.batch_id == self._latest_generation_batch_id:
+            self._latest_generation_batch_member_ids[
+                operation.blob_index
+            ] = object_id
         if was_placeable:
             self._emit_placeable_objects_changed()
         self._sync_controls()
@@ -5585,6 +5823,7 @@ class GenerationWorkspace(QWidget):
             and active_operation.kind == OBJECT_OPERATION_GENERATE_MODEL
             else None
         )
+        _apply_generation_batch_pipeline_metadata(pipeline, active_operation)
         record = GeneratedObjectRecord(
             object_id=object_id,
             frame_index=(
@@ -5682,6 +5921,8 @@ class GenerationWorkspace(QWidget):
             and active_operation.kind == OBJECT_OPERATION_GENERATE_MODEL
             else None
         )
+        pipeline = copy.deepcopy(saved.pipeline)
+        _apply_generation_batch_pipeline_metadata(pipeline, active_operation)
         record = GeneratedObjectRecord(
             object_id=saved.object_id,
             frame_index=(
@@ -5690,7 +5931,7 @@ class GenerationWorkspace(QWidget):
                 else generation_request.frame_index
             ),
             object_name=object_name,
-            pipeline=copy.deepcopy(saved.pipeline),
+            pipeline=pipeline,
             provider=GENERATION_BACKEND_MESHY,
             provider_task_id=result.task_id,
             asset_path=saved.asset_path,
@@ -6242,6 +6483,9 @@ class GenerationWorkspace(QWidget):
             )
         if operation is not None:
             operation.pending_placement = None
+        was_placeable = self._can_place_active_operation(operation)
+        self._object_job_runtimes.pop(runtime.operation_id, None)
+        if operation is not None:
             self.operation_finished.emit(operation.operation_id)
         manager = self._job_manager
         if (
@@ -6255,8 +6499,6 @@ class GenerationWorkspace(QWidget):
                     runtime,
                     "The job ended before its result could be committed.",
                 )
-        was_placeable = self._can_place_active_operation(operation)
-        self._object_job_runtimes.pop(runtime.operation_id, None)
         if was_placeable:
             self._emit_placeable_objects_changed()
         runtime.relay.deleteLater()
@@ -6322,6 +6564,41 @@ class GenerationWorkspace(QWidget):
             ),
             enabled_pbr_maps=self._get_enabled_pbr_maps(),
             ai_prompt=self.ai_prompt_edit.text(),
+        )
+
+    def _build_generation_requests(
+        self,
+        *,
+        geometry_only: bool = False,
+    ) -> tuple[GenerationRequest, ...]:
+        """Snapshot shared settings into one request per disconnected mask blob."""
+
+        template = self._build_generation_request(geometry_only=geometry_only)
+        if template is None:
+            return ()
+        selected_crops = self.video_view.build_selected_object_crops()
+        if not selected_crops:
+            self.status_label.setText("The selected object mask is empty.")
+            return ()
+        return tuple(
+            GenerationRequest(
+                frame_index=template.frame_index,
+                selected_object_bgra=selected_crop,
+                settings=template.settings,
+                geometry_only=template.geometry_only,
+                symmetric_division_enabled=(
+                    template.symmetric_division_enabled
+                ),
+                symmetric_division_orientation=(
+                    template.symmetric_division_orientation
+                ),
+                projection_camera_percentages=(
+                    template.projection_camera_percentages
+                ),
+                enabled_pbr_maps=template.enabled_pbr_maps,
+                ai_prompt=template.ai_prompt,
+            )
+            for selected_crop in selected_crops
         )
 
     def _build_texture_regeneration_request(

@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import math
 import sys
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
@@ -168,7 +169,6 @@ from housemaker.models import (
     create_default_doorway_presets,
     create_default_levels,
 )
-from housemaker.object_placement_dialog import ObjectPlacementDialog
 from housemaker.pbr_maps import (
     ATLAS_MAP_BASE_COLOR,
     ATLAS_MAP_TYPES,
@@ -222,7 +222,11 @@ from housemaker.texture_atlas_workspace import (
     is_atlas_wall_texture_source_id,
     load_atlas_object_texture_source,
 )
-from housemaker.viewer import GlbViewerWidget
+from housemaker.viewer import (
+    GlbViewerWidget,
+    SceneObjectPlacementCandidate,
+    build_scene_object_placement_group_candidate,
+)
 from housemaker.wall_mirroring import (
     WallMirrorTopologyResult,
     WallMirrorVertexLink,
@@ -728,6 +732,23 @@ class _CanvasPlacedObjectUndoState:
 
 
 @dataclass(frozen=True)
+class _CanvasPlacedObjectGroupUndoState:
+    """One direct placement click that moved an ordered object batch."""
+
+    members: tuple[_CanvasPlacedObjectUndoState, ...]
+
+
+@dataclass(frozen=True)
+class _DirectObjectPlacementSession:
+    """Bind one shared-scene picker to existing requests or a generated batch."""
+
+    request_id: str
+    placeable_ids: tuple[str, ...] = ()
+    generation_request_token: str | None = None
+    accepts_next_generation_batch: bool = False
+
+
+@dataclass(frozen=True)
 class _CanvasStairsUndoState:
     """The ordered stairs collection before one add or delete action."""
 
@@ -743,6 +764,7 @@ _CanvasUndoState = (
     | _CanvasOpeningEditUndoState
     | _CanvasWindowAdditionUndoState
     | _CanvasPlacedObjectUndoState
+    | _CanvasPlacedObjectGroupUndoState
     | _CanvasStairsUndoState
 )
 
@@ -949,8 +971,12 @@ class BlueprintWorkspace(QWidget):
         self._canvas_window_undo_ids: list[str] = []
         self._canvas_undo_stack: list[_CanvasUndoState] = []
         self._is_restoring_canvas_undo = False
-        self._object_placement_dialog: ObjectPlacementDialog | None = None
-        self._object_placement_operation_id: str | None = None
+        self._direct_object_placement_session: (
+            _DirectObjectPlacementSession | None
+        ) = None
+        self._pending_generation_placement_anchor: (
+            SceneObjectPlacementCandidate | None
+        ) = None
         self._surface_ao_bake_runtimes: dict[
             str,
             _SurfaceAmbientOcclusionBakeRuntime,
@@ -1035,7 +1061,7 @@ class BlueprintWorkspace(QWidget):
         except (RuntimeError, TypeError):
             pass
         self.settings_widget.dispose()
-        self._close_object_placement_dialog()
+        self._cancel_direct_object_placement()
         self._external_atlas_host.dispose()
         self._external_generation_host.dispose()
         self._external_scene_3d_host.dispose()
@@ -1398,6 +1424,18 @@ class BlueprintWorkspace(QWidget):
         )
         self.generation.placement_requested.connect(
             self._handle_object_placement_requested
+        )
+        self.generation.generation_batch_started.connect(
+            self._handle_generation_batch_started_for_placement
+        )
+        self.generation.new_object_placement_requested.connect(
+            self._handle_generation_object_place_requested
+        )
+        self.viewer.object_placement_selected.connect(
+            self._handle_direct_object_placement_selected
+        )
+        self.viewer.object_placement_cancelled.connect(
+            self._handle_direct_object_placement_cancelled
         )
         self.generation.operation_finished.connect(
             self._handle_object_placement_operation_finished
@@ -3009,6 +3047,11 @@ class BlueprintWorkspace(QWidget):
             elif isinstance(state, _CanvasPlacedObjectUndoState):
                 skipped_texture_bindings = (
                     self._restore_canvas_placed_object_undo_state(state)
+                )
+            elif isinstance(state, _CanvasPlacedObjectGroupUndoState):
+                skipped_texture_bindings = sum(
+                    self._restore_canvas_placed_object_undo_state(member)
+                    for member in reversed(state.members)
                 )
             elif isinstance(state, _CanvasStairsUndoState):
                 self._restore_canvas_stairs_undo_state(state)
@@ -6117,143 +6160,399 @@ class BlueprintWorkspace(QWidget):
         self,
         operation_id: str,
     ) -> None:
-        """Open exactly one modeless Canvas picker for an operation token."""
+        """Arm the shared 3D scene for one Generation-owned request token."""
 
         exact_operation_id = str(operation_id)
         if self._is_shutdown or not exact_operation_id.strip():
             return
-
-        self._close_object_placement_dialog()
-        dialog = ObjectPlacementDialog(self.levels, self)
-        camera_level_index = self._get_canvas_camera_level_index()
-        if camera_level_index is not None:
-            dialog.select_level(camera_level_index)
-        self._object_placement_dialog = dialog
-        self._object_placement_operation_id = exact_operation_id
-        dialog.placement_selected.connect(
-            partial(
-                self._handle_object_placement_selected,
-                dialog,
-                exact_operation_id,
-            )
+        previous_state = self.generation.get_existing_object_placement_request_state(
+            exact_operation_id
         )
-        dialog.finished.connect(
-            partial(
-                self._handle_object_placement_dialog_finished,
-                dialog,
-            )
+        preview_model = (
+            None
+            if previous_state is None
+            else self.generation.get_generated_object_model(previous_state[0])
         )
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
-
-    def _get_canvas_camera_level_index(self) -> int | None:
-        """Return the level volume containing the Canvas first-person camera."""
-
-        camera_z = float(self.viewer.get_first_person_camera_pose().z)
-        base_z_by_level_index = build_level_base_z_lookup(self.levels)
-        levels_by_descending_elevation = sorted(
-            self.levels,
-            key=lambda level: base_z_by_level_index[level.index],
-            reverse=True,
+        self._begin_direct_object_placement(
+            _DirectObjectPlacementSession(
+                request_id=exact_operation_id,
+                generation_request_token=exact_operation_id,
+            ),
+            preview_model=preview_model,
         )
-        for level in levels_by_descending_elevation:
-            base_z = base_z_by_level_index[level.index]
-            top_z = base_z + float(level.height_meters)
-            if base_z <= camera_z < top_z:
-                return level.index
-        return None
 
-    def _handle_object_placement_selected(
+    def _handle_generation_object_place_requested(self) -> None:
+        """Place the newest generated batch or stage the next batch's anchor."""
+
+        placeable_ids = self.generation.get_latest_generation_batch_placeable_ids()
+        latest_batch_is_active = (
+            self.generation.latest_generation_batch_has_active_members()
+        )
+        if not latest_batch_is_active and (
+            self.generation.has_unsubmitted_generation_mask()
+            or self.generation.latest_generation_batch_is_fully_placed()
+        ):
+            placeable_ids = ()
+        self._pending_generation_placement_anchor = None
+        request_id = f"generation-placement-{uuid.uuid4().hex}"
+        self._begin_direct_object_placement(
+            _DirectObjectPlacementSession(
+                request_id=request_id,
+                placeable_ids=placeable_ids,
+                accepts_next_generation_batch=not bool(placeable_ids),
+            ),
+            preview_count=max(1, len(placeable_ids)),
+        )
+
+    def _begin_direct_object_placement(
         self,
-        dialog: ObjectPlacementDialog,
-        operation_id: str,
-        raw_placement: object,
+        session: _DirectObjectPlacementSession,
+        *,
+        preview_model: GeneratedModel | None = None,
+        preview_count: int = 1,
     ) -> None:
-        """Commit a click only when both its dialog and operation are current."""
+        """Activate the existing local or detached scene and arm its floor picker."""
 
+        self._cancel_direct_object_placement()
+        self._direct_object_placement_session = session
+        if self._external_scene_3d_host.is_active:
+            scene_window = self._external_scene_3d_host.window
+            scene_window.show()
+            scene_window.raise_()
+            scene_window.activateWindow()
+        else:
+            scene_index = self.workspace_tabs.indexOf(self.scene_3d_workspace)
+            if scene_index >= 0:
+                self.workspace_tabs.setCurrentIndex(scene_index)
+        self._ensure_viewer_preview_current(preserve_camera=True)
+        preview_meshes = (
+            None
+            if preview_model is None
+            else (preview_model.mesh,)
+        )
+        if self.viewer.begin_object_placement(
+            session.request_id,
+            preview_meshes=preview_meshes,
+            preview_count=preview_count,
+        ):
+            self.viewer.focus_navigation()
+            return
+        self._direct_object_placement_session = None
+        if session.generation_request_token is not None:
+            self.generation.cancel_object_placement_request(
+                session.generation_request_token
+            )
+
+    def _handle_direct_object_placement_selected(
+        self,
+        request_id: str,
+        raw_candidate: object,
+    ) -> None:
+        """Commit one floor hover to an existing object, a batch, or the next batch."""
+
+        session = self._direct_object_placement_session
         if (
-            dialog is not self._object_placement_dialog
-            or operation_id != self._object_placement_operation_id
-            or not isinstance(raw_placement, GeneratedObjectPlacement)
+            session is None
+            or session.request_id != str(request_id)
+            or not isinstance(raw_candidate, SceneObjectPlacementCandidate)
         ):
             return
+        self._direct_object_placement_session = None
+        if session.accepts_next_generation_batch and not session.placeable_ids:
+            anchor = raw_candidate.world_positions[0]
+            self._pending_generation_placement_anchor = (
+                SceneObjectPlacementCandidate(
+                    level_index=raw_candidate.level_index,
+                    world_positions=(anchor,),
+                )
+            )
+            self.generation.status_label.setText(
+                "Placement selected. The next generated object batch will appear there."
+            )
+            return
+
+        if session.generation_request_token is not None:
+            placement = self._build_generated_object_placement_from_world(
+                raw_candidate.level_index,
+                raw_candidate.world_positions[0],
+            )
+            if placement is not None:
+                self._commit_generation_owned_placement_request(
+                    session.generation_request_token,
+                    placement,
+                )
+            return
+
+        self._commit_placeable_object_group(
+            session.placeable_ids,
+            raw_candidate,
+        )
+
+    def _commit_generation_owned_placement_request(
+        self,
+        request_id: str,
+        placement: GeneratedObjectPlacement,
+    ) -> bool:
+        """Preserve the historical undo semantics for one Atlas Place request."""
+
         previous_state = self.generation.get_existing_object_placement_request_state(
-            operation_id
+            request_id
         )
         previous_atlas_placements = (
             self._capture_canvas_atlas_placements(previous_state[0])
             if previous_state is not None
             else ()
         )
-        if not self.generation.set_active_object_placement(
-            operation_id,
-            raw_placement,
-        ):
-            self._close_object_placement_dialog()
-            return
+        if not self.generation.set_active_object_placement(request_id, placement):
+            self.generation.cancel_object_placement_request(request_id)
+            return False
         if previous_state is None or self._is_restoring_canvas_undo:
-            return
+            return True
         object_id, previous_placement = previous_state
         current_placement = self.generation.get_generated_object_placement(object_id)
-        if current_placement == previous_placement:
-            return
-        self._record_canvas_undo_state(
-            _CanvasPlacedObjectUndoState(
-                object_id=object_id,
-                placement=previous_placement,
-                atlas_placements=previous_atlas_placements,
-                restore_atlas_bindings=True,
+        if current_placement != previous_placement:
+            self._record_canvas_undo_state(
+                _CanvasPlacedObjectUndoState(
+                    object_id=object_id,
+                    placement=previous_placement,
+                    atlas_placements=previous_atlas_placements,
+                    restore_atlas_bindings=True,
+                )
             )
-        )
+        return True
 
-    def _handle_object_placement_dialog_finished(
+    def _commit_placeable_object_group(
         self,
-        dialog: ObjectPlacementDialog,
-        _result: int,
-    ) -> None:
-        """Release the current picker without touching a replacement dialog."""
+        placeable_ids: Sequence[str],
+        candidate: SceneObjectPlacementCandidate,
+    ) -> bool:
+        """Apply ordered preview positions to active jobs or completed objects."""
 
-        if dialog is not self._object_placement_dialog:
+        normalized_ids = tuple(str(value).strip() for value in placeable_ids)
+        if (
+            not normalized_ids
+            or len(normalized_ids) != len(candidate.world_positions)
+            or any(not value for value in normalized_ids)
+        ):
+            return False
+        placements = tuple(
+            self._build_generated_object_placement_from_world(
+                candidate.level_index,
+                position,
+            )
+            for position in candidate.world_positions
+        )
+        if any(placement is None for placement in placements):
+            return False
+
+        completed_object_ids = set(self.generation.get_generated_object_ids())
+        previous_states: list[
+            tuple[
+                str,
+                GeneratedObjectPlacement | None,
+                tuple[tuple[str, TextureAtlasPlacement], ...],
+            ]
+        ] = []
+        next_placements: list[GeneratedObjectPlacement] = []
+        for placeable_id, raw_placement in zip(
+            normalized_ids,
+            placements,
+            strict=True,
+        ):
+            assert raw_placement is not None
+            previous_state = self.generation.get_placeable_object_placement_state(
+                placeable_id
+            )
+            previous_placement = (
+                None if previous_state is None else previous_state[1]
+            )
+            placement = raw_placement
+            if previous_placement is not None:
+                placement = replace(
+                    placement,
+                    rotation_degrees=previous_placement.rotation_degrees,
+                )
+            previous_states.append(
+                (
+                    placeable_id,
+                    previous_placement,
+                    (
+                        self._capture_canvas_atlas_placements(placeable_id)
+                        if placeable_id in completed_object_ids
+                        else ()
+                    ),
+                )
+            )
+            next_placements.append(placement)
+
+        changed_ids: list[str] = []
+        for (placeable_id, _previous_placement, _atlas), placement in zip(
+            previous_states,
+            next_placements,
+            strict=True,
+        ):
+            if not self.generation.restore_placeable_object_placement(
+                placeable_id,
+                placement,
+                emit_change_signals=False,
+            ):
+                for (
+                    changed_id,
+                    changed_previous_placement,
+                    _changed_atlas,
+                ) in reversed(previous_states[: len(changed_ids)]):
+                    self.generation.restore_placeable_object_placement(
+                        changed_id,
+                        changed_previous_placement,
+                        emit_change_signals=False,
+                    )
+                self.generation.status_label.setText(
+                    "The object group could not be placed; its previous "
+                    "positions were restored."
+                )
+                return False
+            changed_ids.append(placeable_id)
+
+        self.generation.publish_placeable_object_placement_changes(changed_ids)
+        undo_states: list[_CanvasPlacedObjectUndoState] = []
+        for (
+            placeable_id,
+            previous_placement,
+            previous_atlas_placements,
+        ), placement in zip(
+            previous_states,
+            next_placements,
+            strict=True,
+        ):
+            if placement != previous_placement and not self._is_restoring_canvas_undo:
+                undo_states.append(
+                    _CanvasPlacedObjectUndoState(
+                        object_id=placeable_id,
+                        placement=previous_placement,
+                        atlas_placements=previous_atlas_placements,
+                        restore_atlas_bindings=True,
+                    )
+                )
+        if undo_states:
+            self._record_canvas_undo_state(
+                undo_states[0]
+                if len(undo_states) == 1
+                else _CanvasPlacedObjectGroupUndoState(tuple(undo_states))
+            )
+        changed_count = len(changed_ids)
+        self.generation.status_label.setText(
+            f"Placed {changed_count} generated object"
+            + ("s." if changed_count != 1 else ".")
+        )
+        return True
+
+    def _build_generated_object_placement_from_world(
+        self,
+        level_index: int,
+        world_position: Sequence[float],
+    ) -> GeneratedObjectPlacement | None:
+        """Convert one exact world floor hit to persistent level-relative state."""
+
+        level = next(
+            (candidate for candidate in self.levels if candidate.index == level_index),
+            None,
+        )
+        base_z = build_level_base_z_lookup(self.levels).get(level_index)
+        if level is None or base_z is None:
+            return None
+        try:
+            world_x, world_y, world_z = tuple(float(value) for value in world_position)
+            image_x, image_y = level_world_to_image_xy(level, world_x, world_y)
+            return GeneratedObjectPlacement(
+                level_index=level_index,
+                image_x=image_x,
+                image_y=image_y,
+                height_offset_meters=world_z - float(base_z),
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def _handle_generation_batch_started_for_placement(
+        self,
+        raw_placeable_ids: object,
+    ) -> None:
+        """Bind an armed or already-picked future placement to a new batch."""
+
+        if not isinstance(raw_placeable_ids, tuple):
             return
-        operation_id = self._object_placement_operation_id
-        self._object_placement_dialog = None
-        self._object_placement_operation_id = None
-        if operation_id is not None:
-            self.generation.cancel_object_placement_request(operation_id)
-        dialog.deleteLater()
+        placeable_ids = tuple(str(value).strip() for value in raw_placeable_ids)
+        if not placeable_ids or any(not value for value in placeable_ids):
+            return
+        pending_anchor = self._pending_generation_placement_anchor
+        if pending_anchor is not None:
+            self._pending_generation_placement_anchor = None
+            candidate = build_scene_object_placement_group_candidate(
+                pending_anchor.level_index,
+                pending_anchor.world_positions[0],
+                len(placeable_ids),
+            )
+            self._commit_placeable_object_group(placeable_ids, candidate)
+            return
+
+        session = self._direct_object_placement_session
+        if session is None or not session.accepts_next_generation_batch:
+            return
+        self._direct_object_placement_session = replace(
+            session,
+            placeable_ids=placeable_ids,
+            accepts_next_generation_batch=False,
+        )
+        self.viewer.update_object_placement_preview_count(len(placeable_ids))
+
+    def _handle_direct_object_placement_cancelled(self, request_id: str) -> None:
+        """Forget only the current picker and its Generation-owned request."""
+
+        session = self._direct_object_placement_session
+        if session is None or session.request_id != str(request_id):
+            return
+        self._direct_object_placement_session = None
+        if session.generation_request_token is not None:
+            self.generation.cancel_object_placement_request(
+                session.generation_request_token
+            )
 
     def _handle_object_placement_operation_finished(
         self,
         operation_id: str,
     ) -> None:
-        """Close only the picker owned by the completed operation token."""
+        """Retarget a batch picker, or close one exact finished request."""
 
-        self._canvas_undo_stack = [
-            state
-            for state in self._canvas_undo_stack
-            if not (
-                isinstance(state, _CanvasPlacedObjectUndoState)
-                and state.object_id == str(operation_id)
+        self._discard_canvas_placement_undo_object_id(operation_id)
+        session = self._direct_object_placement_session
+        if session is None:
+            return
+        normalized_operation_id = str(operation_id)
+        if session.generation_request_token == normalized_operation_id:
+            self._cancel_direct_object_placement()
+            return
+        if normalized_operation_id not in session.placeable_ids:
+            return
+        next_ids = self.generation.get_latest_generation_batch_placeable_ids()
+        if not next_ids:
+            self._cancel_direct_object_placement()
+            return
+        if len(next_ids) != len(session.placeable_ids):
+            self.viewer.update_object_placement_preview_count(len(next_ids))
+        self._direct_object_placement_session = replace(
+            session,
+            placeable_ids=next_ids,
+        )
+
+    def _cancel_direct_object_placement(self) -> None:
+        """Disarm the scene picker without allowing stale request callbacks."""
+
+        session = self._direct_object_placement_session
+        self._direct_object_placement_session = None
+        self.viewer.cancel_object_placement(notify=False)
+        if session is not None and session.generation_request_token is not None:
+            self.generation.cancel_object_placement_request(
+                session.generation_request_token
             )
-        ]
-        if str(operation_id) != self._object_placement_operation_id:
-            return
-        self._close_object_placement_dialog()
-
-    def _close_object_placement_dialog(self) -> None:
-        """Close and forget the one modeless object-placement picker."""
-
-        dialog = self._object_placement_dialog
-        operation_id = self._object_placement_operation_id
-        self._object_placement_dialog = None
-        self._object_placement_operation_id = None
-        if operation_id is not None:
-            self.generation.cancel_object_placement_request(operation_id)
-        if dialog is None:
-            return
-        dialog.close()
-        dialog.deleteLater()
 
     def _handle_generated_object_completed_for_canvas(
         self,
@@ -6267,20 +6566,23 @@ class BlueprintWorkspace(QWidget):
         operation_id = self.generation.get_generation_operation_id_for_object(
             raw_record.object_id
         )
-        if operation_id is not None:
-            self._migrate_canvas_placement_undo_operation(
+        placement_undo_was_migrated = bool(
+            operation_id is not None
+            and self._migrate_canvas_placement_undo_operation(
                 operation_id,
                 raw_record.object_id,
             )
+        )
         if raw_record.placement is None:
             return
-        self._record_canvas_undo_state(
-            _CanvasPlacedObjectUndoState(
-                object_id=raw_record.object_id,
-                placement=None,
-                restore_atlas_bindings=True,
+        if not placement_undo_was_migrated:
+            self._record_canvas_undo_state(
+                _CanvasPlacedObjectUndoState(
+                    object_id=raw_record.object_id,
+                    placement=None,
+                    restore_atlas_bindings=True,
+                )
             )
-        )
         self._schedule_viewer_preview_refresh(preserve_camera=False)
 
     def _handle_generated_object_changed_for_canvas(
@@ -6319,33 +6621,93 @@ class BlueprintWorkspace(QWidget):
             if placement.object_id == normalized_source_id
         )
 
+    def _discard_canvas_placement_undo_object_id(
+        self,
+        object_id: str,
+    ) -> None:
+        """Remove one retired object from single and grouped placement history."""
+
+        normalized_object_id = str(object_id).strip()
+        retained_states: list[_CanvasUndoState] = []
+        for state in self._canvas_undo_stack:
+            if isinstance(state, _CanvasPlacedObjectUndoState):
+                if state.object_id != normalized_object_id:
+                    retained_states.append(state)
+                continue
+            if isinstance(state, _CanvasPlacedObjectGroupUndoState):
+                members = tuple(
+                    member
+                    for member in state.members
+                    if member.object_id != normalized_object_id
+                )
+                if members:
+                    retained_states.append(
+                        members[0]
+                        if len(members) == 1
+                        else replace(state, members=members)
+                    )
+                continue
+            retained_states.append(state)
+        self._canvas_undo_stack = retained_states
+
     def _migrate_canvas_placement_undo_operation(
         self,
         operation_id: str,
         object_id: str,
-    ) -> None:
+    ) -> bool:
         """Move in-flight placement history onto its committed object ID."""
 
         normalized_operation_id = str(operation_id).strip()
         normalized_object_id = str(object_id).strip()
+        migrated = False
         for index, state in enumerate(self._canvas_undo_stack):
-            if not (
-                isinstance(state, _CanvasPlacedObjectUndoState)
-                and state.object_id == normalized_operation_id
-            ):
+            if isinstance(state, _CanvasPlacedObjectUndoState):
+                if state.object_id != normalized_operation_id:
+                    continue
+                self._canvas_undo_stack[index] = (
+                    self._migrate_canvas_placed_object_undo_state(
+                        state,
+                        normalized_object_id,
+                    )
+                )
+                migrated = True
                 continue
-            migrated_atlas_placements = tuple(
+            if isinstance(state, _CanvasPlacedObjectGroupUndoState):
+                members = tuple(
+                    self._migrate_canvas_placed_object_undo_state(
+                        member,
+                        normalized_object_id,
+                    )
+                    if member.object_id == normalized_operation_id
+                    else member
+                    for member in state.members
+                )
+                if members != state.members:
+                    self._canvas_undo_stack[index] = replace(
+                        state,
+                        members=members,
+                    )
+                    migrated = True
+        return migrated
+
+    @staticmethod
+    def _migrate_canvas_placed_object_undo_state(
+        state: _CanvasPlacedObjectUndoState,
+        object_id: str,
+    ) -> _CanvasPlacedObjectUndoState:
+        """Retarget one pending-operation undo member to its stable object ID."""
+
+        return replace(
+            state,
+            object_id=object_id,
+            atlas_placements=tuple(
                 (
                     atlas_id,
-                    replace(placement, object_id=normalized_object_id),
+                    replace(placement, object_id=object_id),
                 )
                 for atlas_id, placement in state.atlas_placements
-            )
-            self._canvas_undo_stack[index] = replace(
-                state,
-                object_id=normalized_object_id,
-                atlas_placements=migrated_atlas_placements,
-            )
+            ),
+        )
 
     def _handle_placed_object_removal_requested(self, object_id: str) -> None:
         """Remove a Canvas placement and unassign its texture from Atlases."""
@@ -6487,14 +6849,7 @@ class BlueprintWorkspace(QWidget):
         """Remove any deleted placed object from the Canvas preview."""
 
         normalized_object_id = str(object_id).strip()
-        self._canvas_undo_stack = [
-            state
-            for state in self._canvas_undo_stack
-            if not (
-                isinstance(state, _CanvasPlacedObjectUndoState)
-                and state.object_id == normalized_object_id
-            )
-        ]
+        self._discard_canvas_placement_undo_object_id(normalized_object_id)
         self._discard_desired_canvas_object(normalized_object_id)
         self._schedule_viewer_preview_refresh(preserve_camera=True)
 
@@ -6673,7 +7028,7 @@ class BlueprintWorkspace(QWidget):
         self.texture_atlas_workspace.set_green_outline_source_ids(outlined_source_ids)
 
     def _handle_atlas_object_place_requested(self, object_id: str) -> None:
-        """Open the existing Canvas placement picker for one Atlas object."""
+        """Arm the shared 3D scene picker for one Atlas object."""
 
         if self.generation.request_placeable_object_placement(object_id):
             return
@@ -7361,10 +7716,12 @@ class BlueprintWorkspace(QWidget):
             return
         settings = self._generation_settings
         target_resolution = settings.automatic_atlas_texture_resolution
+        allow_atlas_creation = settings.automatic_atlas_creation
         sort_by_pbr = settings.automatic_atlas_texture_sort_by_pbr
         use_half_mesh_texture_prefix = settings.use_half_mesh_texture_prefix
         attempt_key = self._build_automatic_atlas_assignment_key(
             target_resolution,
+            allow_atlas_creation,
             sort_by_pbr,
             use_half_mesh_texture_prefix,
         )
@@ -7384,6 +7741,7 @@ class BlueprintWorkspace(QWidget):
                     ),
                     sort_by_pbr=sort_by_pbr,
                     use_half_mesh_texture_prefix=(use_half_mesh_texture_prefix),
+                    allow_atlas_creation=allow_atlas_creation,
                 )
             )
             if not assigned_source_ids:
@@ -7398,6 +7756,7 @@ class BlueprintWorkspace(QWidget):
             self._last_automatic_atlas_assignment_key = (
                 self._build_automatic_atlas_assignment_key(
                     target_resolution,
+                    allow_atlas_creation,
                     sort_by_pbr,
                     use_half_mesh_texture_prefix,
                 )
@@ -7406,6 +7765,7 @@ class BlueprintWorkspace(QWidget):
     def _build_automatic_atlas_assignment_key(
         self,
         target_resolution: int,
+        allow_atlas_creation: bool,
         sort_by_pbr: bool,
         use_half_mesh_texture_prefix: bool,
     ) -> tuple[object, ...]:
@@ -7436,6 +7796,7 @@ class BlueprintWorkspace(QWidget):
         return (
             atlas_data.selected_atlas_id,
             int(target_resolution),
+            bool(allow_atlas_creation),
             bool(sort_by_pbr),
             bool(use_half_mesh_texture_prefix),
             self.texture_atlas_workspace.get_unpacked_scene_texture_source_ids(),
@@ -10830,6 +11191,8 @@ class BlueprintWorkspace(QWidget):
         self._cancel_and_join_atlas_draw_call_estimates()
         self._cancel_and_join_surface_ambient_occlusion_previews()
         self._cancel_and_join_surface_ambient_occlusion_bakes()
+        self._pending_generation_placement_anchor = None
+        self._cancel_direct_object_placement()
 
         self._is_doorway_move_drag_active = False
         self._level_transform_drag_active = False

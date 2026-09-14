@@ -23,12 +23,12 @@ from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
 from housemaker.app_settings import ApplicationSettingsStore
-from housemaker.glb import GeneratedModel
 from housemaker.generation_state import (
     GeneratedObjectPlacement,
     GeneratedObjectRecord,
     GenerationData,
 )
+from housemaker.glb import GeneratedModel
 from housemaker.main import BlueprintWorkspace
 from housemaker.models import (
     GROUND_LEVEL_INDEX,
@@ -44,15 +44,15 @@ from housemaker.pbr_maps import (
     PBR_MAP_ROUGHNESS,
 )
 from housemaker.project_io import ProjectData
+from housemaker.surface_geometry import build_fixed_surfaces
 from housemaker.surface_texture_state import (
+    SURFACE_TEXTURE_RESOLUTIONS,
     SURFACE_TYPE_FLOOR,
     SURFACE_TYPE_WALL,
-    SURFACE_TEXTURE_RESOLUTIONS,
     SurfaceTextureAssignment,
     SurfaceTextureData,
     SurfaceTextureVariant,
 )
-from housemaker.surface_geometry import build_fixed_surfaces
 from housemaker.texture_atlas_state import (
     ATLAS_PACKING_MODE_SYMMETRIC_HALF,
     ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
@@ -65,7 +65,6 @@ from housemaker.texture_atlas_workspace import (
     build_atlas_wall_texture_source_id,
     build_texture_atlas_map_image_relative_path,
 )
-
 
 # ### Test application ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -1705,6 +1704,81 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             (),
         )
 
+    def test_placed_object_creates_overflow_atlas_when_enabled(self) -> None:
+        asset_directory = self.settings.path.parent / "generated"
+        filler_records = tuple(
+            _generated_object_record_with_variants(
+                asset_directory,
+                object_id=f"filler-{index}",
+                object_name=f"Filler {index}",
+                resolutions=(1024,),
+                selected_resolution=1024,
+            )
+            for index in range(4)
+        )
+        pending_record = _generated_object_record_with_variants(
+            asset_directory,
+            object_id="overflow-chair",
+            object_name="Overflow chair",
+            resolutions=(512,),
+            selected_resolution=512,
+        )
+        initial_generation_data = GenerationData(
+            generated_objects=[*filler_records, pending_record]
+        )
+        self.workspace.generation.set_data(initial_generation_data)
+        self.workspace.generation.data_changed.emit(initial_generation_data)
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        atlas_data = TextureAtlasData()
+        selected_atlas = atlas_data.create_atlas(
+            "Full Atlas",
+            2048,
+            atlas_id="full-atlas",
+        )
+        for record in filler_records:
+            source = atlas_workspace._sources_by_object_id[record.object_id]
+            atlas_data.assign_object(
+                selected_atlas.atlas_id,
+                source.object_id,
+                source.texture_path,
+                source.texture_resolution,
+            )
+        atlas_workspace.set_data(atlas_data)
+        self.workspace.settings_widget \
+            .automatic_atlas_creation_checkbox.setChecked(True)
+        placed_record = replace(
+            pending_record,
+            placement=GeneratedObjectPlacement(
+                level_index=self.workspace.current_level.index,
+                image_x=50.0,
+                image_y=60.0,
+            ),
+        )
+        placed_data = GenerationData(
+            generated_objects=[*filler_records, placed_record]
+        )
+
+        with patch.object(atlas_workspace, "_materialize_atlas"):
+            self.workspace.generation.set_data(placed_data)
+            self.workspace.generation.data_changed.emit(placed_data)
+
+        packed_data = atlas_workspace.get_data()
+        self.assertEqual(len(packed_data.atlases), 2)
+        packed_selected = packed_data.atlas_by_id(selected_atlas.atlas_id)
+        assert packed_selected is not None
+        self.assertIsNone(
+            packed_selected.placement_for_object(placed_record.object_id)
+        )
+        overflow_atlas = next(
+            atlas
+            for atlas in packed_data.atlases
+            if atlas.atlas_id != selected_atlas.atlas_id
+        )
+        self.assertEqual(overflow_atlas.resolution, selected_atlas.resolution)
+        self.assertIsNotNone(
+            overflow_atlas.placement_for_object(placed_record.object_id)
+        )
+
     def test_main_passes_half_mesh_prefix_setting_to_auto_assignment(
         self,
     ) -> None:
@@ -1725,6 +1799,31 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         auto_assign.assert_called_once()
         self.assertTrue(
             auto_assign.call_args.kwargs["use_half_mesh_texture_prefix"]
+        )
+
+    def test_main_passes_automatic_atlas_creation_setting_and_retries(
+        self,
+    ) -> None:
+        checkbox = self.workspace.settings_widget.automatic_atlas_creation_checkbox
+        self.workspace._last_automatic_atlas_assignment_key = None
+
+        with patch.object(
+            self.workspace.texture_atlas_workspace,
+            "auto_assign_scene_texture_sources",
+            return_value=(),
+        ) as auto_assign:
+            self.workspace._automatically_assign_scene_textures()
+            self.workspace._automatically_assign_scene_textures()
+            self.assertEqual(auto_assign.call_count, 1)
+
+            checkbox.setChecked(True)
+
+        self.assertEqual(auto_assign.call_count, 2)
+        self.assertFalse(
+            auto_assign.call_args_list[0].kwargs["allow_atlas_creation"]
+        )
+        self.assertTrue(
+            auto_assign.call_args_list[1].kwargs["allow_atlas_creation"]
         )
 
     def test_half_mesh_prefix_setting_change_retries_cached_assignment(
@@ -2136,6 +2235,79 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             .get_unpacked_scene_texture_source_ids(),
             (),
         )
+
+    def test_selected_surface_texture_creates_overflow_atlas_when_enabled(
+        self,
+    ) -> None:
+        asset_directory = self.settings.path.parent / "generated"
+        filler_records = tuple(
+            _generated_object_record_with_variants(
+                asset_directory,
+                object_id=f"surface-filler-{index}",
+                object_name=f"Surface filler {index}",
+                resolutions=(1024,),
+                selected_resolution=1024,
+            )
+            for index in range(4)
+        )
+        generation_data = GenerationData(generated_objects=list(filler_records))
+        self.workspace.generation.set_data(generation_data)
+        self.workspace.generation.data_changed.emit(generation_data)
+        wall_surface_id = _add_square_room_to_level(self.workspace.current_level)
+        self.workspace.surface_texture_generation.set_levels(self.workspace.levels)
+        assignment = _wall_texture_assignment_with_variants(
+            self.settings.path.parent / "surface_textures",
+            assignment_id="overflow-wall",
+            surface_ids=(),
+            selected_resolution=512,
+        )
+        empty_surface_data = SurfaceTextureData(assignments=[assignment])
+        self.workspace.surface_texture_generation.set_data(empty_surface_data)
+        self.workspace.surface_texture_generation.data_changed.emit(
+            empty_surface_data
+        )
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        atlas_data = TextureAtlasData()
+        selected_atlas = atlas_data.create_atlas(
+            "Full Surface Atlas",
+            2048,
+            atlas_id="full-surface-atlas",
+        )
+        for record in filler_records:
+            source = atlas_workspace._sources_by_object_id[record.object_id]
+            atlas_data.assign_object(
+                selected_atlas.atlas_id,
+                source.object_id,
+                source.texture_path,
+                source.texture_resolution,
+            )
+        atlas_workspace.set_data(atlas_data)
+        self.workspace.settings_widget \
+            .automatic_atlas_creation_checkbox.setChecked(True)
+        assigned_surface_data = SurfaceTextureData(
+            assignments=[replace(assignment, surface_ids=(wall_surface_id,))]
+        )
+
+        with patch.object(atlas_workspace, "_materialize_atlas"):
+            self.workspace.surface_texture_generation.set_data(
+                assigned_surface_data
+            )
+            self.workspace.surface_texture_generation.data_changed.emit(
+                assigned_surface_data
+            )
+
+        source_id = build_atlas_wall_texture_source_id(assignment.assignment_id)
+        packed_data = atlas_workspace.get_data()
+        self.assertEqual(len(packed_data.atlases), 2)
+        packed_selected = packed_data.atlas_by_id(selected_atlas.atlas_id)
+        assert packed_selected is not None
+        self.assertIsNone(packed_selected.placement_for_object(source_id))
+        overflow_atlas = next(
+            atlas
+            for atlas in packed_data.atlases
+            if atlas.atlas_id != selected_atlas.atlas_id
+        )
+        self.assertIsNotNone(overflow_atlas.placement_for_object(source_id))
 
     def test_missing_active_surface_variant_can_switch_to_valid_resolution(
         self,

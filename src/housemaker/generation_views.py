@@ -202,24 +202,46 @@ class VideoInpaintView(QWidget):
 
         if self._frame_bgr is None or not self.has_selection():
             return np.empty((0, 0, 4), dtype=np.uint8)
-        mask_rows, mask_columns = np.nonzero(self._mask > 0)
-        frame_height, frame_width = self._mask.shape
-        selection_width = int(mask_columns.max() - mask_columns.min() + 1)
-        selection_height = int(mask_rows.max() - mask_rows.min() + 1)
-        padding = int(
-            round(max(selection_width, selection_height) * max(0.0, padding_ratio))
+        return _build_masked_frame_crop(
+            self._frame_bgr,
+            self._mask,
+            padding_ratio,
         )
-        left = max(0, int(mask_columns.min()) - padding)
-        right = min(frame_width, int(mask_columns.max()) + padding + 1)
-        top = max(0, int(mask_rows.min()) - padding)
-        bottom = min(frame_height, int(mask_rows.max()) + padding + 1)
 
-        crop_bgr = self._frame_bgr[top:bottom, left:right]
-        crop_alpha = self._mask[top:bottom, left:right]
-        crop_bgra = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2BGRA)
-        crop_bgra[crop_alpha == 0, :3] = 0
-        crop_bgra[:, :, 3] = crop_alpha
-        return np.ascontiguousarray(crop_bgra)
+    def build_selected_object_crops(
+        self,
+        padding_ratio: float = 0.08,
+    ) -> tuple[np.ndarray, ...]:
+        """Return one independently masked BGRA crop per disconnected blob."""
+
+        if self._frame_bgr is None or not self.has_selection():
+            return ()
+        selected_mask = np.where(self._mask > 0, 255, 0).astype(np.uint8)
+        component_count, labels, stats, _centroids = (
+            cv2.connectedComponentsWithStats(selected_mask, connectivity=8)
+        )
+        component_indices = sorted(
+            range(1, component_count),
+            key=lambda index: (
+                int(stats[index, cv2.CC_STAT_TOP]),
+                int(stats[index, cv2.CC_STAT_LEFT]),
+            ),
+        )
+        crops: list[np.ndarray] = []
+        for component_index in component_indices:
+            component_mask = np.where(
+                labels == component_index,
+                self._mask,
+                0,
+            ).astype(np.uint8)
+            crop = _build_masked_frame_crop(
+                self._frame_bgr,
+                component_mask,
+                padding_ratio,
+            )
+            if crop.size:
+                crops.append(crop)
+        return tuple(crops)
 
     def build_context_overlay(self) -> np.ndarray:
         """Return the full frame with a translucent colored selection overlay."""
@@ -447,6 +469,36 @@ class VideoInpaintView(QWidget):
             return
         self._active_points = []
         self._rebuild_mask()
+
+
+# ### Mask crop helpers ###
+def _build_masked_frame_crop(
+    frame_bgr: np.ndarray,
+    mask: np.ndarray,
+    padding_ratio: float,
+) -> np.ndarray:
+    """Crop one frame around the nonzero mask while preserving transparency."""
+
+    mask_rows, mask_columns = np.nonzero(mask > 0)
+    if mask_rows.size == 0:
+        return np.empty((0, 0, 4), dtype=np.uint8)
+    frame_height, frame_width = mask.shape
+    selection_width = int(mask_columns.max() - mask_columns.min() + 1)
+    selection_height = int(mask_rows.max() - mask_rows.min() + 1)
+    padding = round(
+        max(selection_width, selection_height) * max(0.0, padding_ratio)
+    )
+    left = max(0, int(mask_columns.min()) - padding)
+    right = min(frame_width, int(mask_columns.max()) + padding + 1)
+    top = max(0, int(mask_rows.min()) - padding)
+    bottom = min(frame_height, int(mask_rows.max()) + padding + 1)
+
+    crop_bgr = frame_bgr[top:bottom, left:right]
+    crop_alpha = mask[top:bottom, left:right]
+    crop_bgra = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2BGRA)
+    crop_bgra[crop_alpha == 0, :3] = 0
+    crop_bgra[:, :, 3] = crop_alpha
+    return np.ascontiguousarray(crop_bgra)
 
 
 # ### Mask rasterization helpers ###

@@ -828,19 +828,17 @@ class CanvasUndoMainTests(unittest.TestCase):
                 "chair"
             )
         )
-        dialog = self.workspace._object_placement_dialog
-        request_id = self.workspace._object_placement_operation_id
-        self.assertIsNotNone(dialog)
-        self.assertIsNotNone(request_id)
+        session = self.workspace._direct_object_placement_session
+        self.assertIsNotNone(session)
+        assert session is not None
         placement = GeneratedObjectPlacement(
             level_index=self.level.index,
             image_x=25.0,
             image_y=35.0,
         )
 
-        self.workspace._handle_object_placement_selected(
-            dialog,  # type: ignore[arg-type]
-            request_id,  # type: ignore[arg-type]
+        self.workspace._commit_generation_owned_placement_request(
+            session.request_id,
             placement,
         )
         self.assertEqual(
@@ -874,14 +872,12 @@ class CanvasUndoMainTests(unittest.TestCase):
                 "chair"
             )
         )
-        dialog = self.workspace._object_placement_dialog
-        request_id = self.workspace._object_placement_operation_id
-        self.assertIsNotNone(dialog)
-        self.assertIsNotNone(request_id)
+        session = self.workspace._direct_object_placement_session
+        self.assertIsNotNone(session)
+        assert session is not None
 
-        self.workspace._handle_object_placement_selected(
-            dialog,  # type: ignore[arg-type]
-            request_id,  # type: ignore[arg-type]
+        self.workspace._commit_generation_owned_placement_request(
+            session.request_id,
             GeneratedObjectPlacement(
                 level_index=self.level.index,
                 image_x=80.0,

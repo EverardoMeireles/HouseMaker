@@ -7454,6 +7454,164 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.assertEqual(changes.call_count, 1)
         self.assertIn("1 source could not be added", self.workspace.status_label.text())
 
+    def test_auto_assignment_creates_one_overflow_atlas_when_enabled(
+        self,
+    ) -> None:
+        existing = tuple(
+            _source(
+                f"existing-{index}",
+                directory=self._temporary_directory.name,
+                resolution=1024,
+            )
+            for index in range(3)
+        )
+        pending = tuple(
+            _source(
+                f"pending-{index}",
+                directory=self._temporary_directory.name,
+                resolution=1024,
+            )
+            for index in range(2)
+        )
+        data = TextureAtlasData()
+        selected_atlas = data.create_atlas(
+            "Selected",
+            2048,
+            atlas_id="selected",
+        )
+        for source in existing:
+            data.assign_object(
+                selected_atlas.atlas_id,
+                source.object_id,
+                source.texture_path,
+                source.texture_resolution,
+            )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources(
+            existing + pending,
+            selectability_resolver=lambda _source_id, _resolution: True,
+        )
+        self.workspace.set_scene_texture_source_ids(
+            tuple(source.object_id for source in pending)
+        )
+
+        assigned = self.workspace.auto_assign_scene_texture_sources(
+            1024,
+            allow_atlas_creation=True,
+        )
+
+        self.assertEqual(assigned, ("pending-0", "pending-1"))
+        packed_data = self.workspace.get_data()
+        self.assertEqual(len(packed_data.atlases), 2)
+        packed_selected = packed_data.atlas_by_id(selected_atlas.atlas_id)
+        assert packed_selected is not None
+        self.assertIsNotNone(packed_selected.placement_for_object("pending-0"))
+        overflow_atlas = next(
+            atlas
+            for atlas in packed_data.atlases
+            if atlas.atlas_id != selected_atlas.atlas_id
+        )
+        self.assertEqual(overflow_atlas.name, "Atlas")
+        self.assertEqual(overflow_atlas.resolution, selected_atlas.resolution)
+        self.assertIsNotNone(overflow_atlas.placement_for_object("pending-1"))
+        self.assertEqual(packed_data.selected_atlas_id, overflow_atlas.atlas_id)
+
+    def test_auto_assignment_pairs_symmetric_sources_in_overflow_atlas(
+        self,
+    ) -> None:
+        existing = tuple(
+            _source(
+                f"existing-{index}",
+                directory=self._temporary_directory.name,
+                resolution=1024,
+            )
+            for index in range(4)
+        )
+        symmetric_sources = tuple(
+            _source(
+                object_id,
+                directory=self._temporary_directory.name,
+                resolution=1024,
+                packing_mode=ATLAS_PACKING_MODE_SYMMETRIC_HALF,
+                symmetric_orientation="vertical",
+                symmetric_plane_coordinate=0.0,
+            )
+            for object_id in ("pending-left", "pending-right")
+        )
+        data = TextureAtlasData()
+        selected_atlas = data.create_atlas(
+            "Full selected Atlas",
+            2048,
+            atlas_id="full-selected-atlas",
+        )
+        for source in existing:
+            data.assign_object(
+                selected_atlas.atlas_id,
+                source.object_id,
+                source.texture_path,
+                source.texture_resolution,
+            )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources(
+            (*existing, *symmetric_sources),
+            selectability_resolver=lambda _source_id, _resolution: True,
+        )
+        self.workspace.set_scene_texture_source_ids(
+            tuple(source.object_id for source in symmetric_sources)
+        )
+
+        assigned = self.workspace.auto_assign_scene_texture_sources(
+            1024,
+            allow_atlas_creation=True,
+        )
+
+        self.assertEqual(
+            assigned,
+            tuple(source.object_id for source in symmetric_sources),
+        )
+        packed_data = self.workspace.get_data()
+        self.assertEqual(len(packed_data.atlases), 2)
+        overflow_atlas = next(
+            atlas
+            for atlas in packed_data.atlases
+            if atlas.atlas_id != selected_atlas.atlas_id
+        )
+        placements = tuple(
+            overflow_atlas.placement_for_object(source.object_id)
+            for source in symmetric_sources
+        )
+        self.assertTrue(all(placement is not None for placement in placements))
+        self.assertEqual(
+            {(placement.x, placement.y) for placement in placements},
+            {(0, 0)},
+        )
+        self.assertEqual(
+            {placement.slot_half for placement in placements},
+            {ATLAS_SLOT_HALF_LEFT, ATLAS_SLOT_HALF_RIGHT},
+        )
+        self.assertEqual(packed_data.selected_atlas_id, overflow_atlas.atlas_id)
+
+    def test_auto_assignment_can_create_first_atlas_when_enabled(self) -> None:
+        source = _source("required", directory=self._temporary_directory.name)
+        self.workspace.set_object_texture_sources(
+            (source,),
+            selectability_resolver=lambda _source_id, _resolution: True,
+        )
+        self.workspace.set_scene_texture_source_ids((source.object_id,))
+
+        assigned = self.workspace.auto_assign_scene_texture_sources(
+            512,
+            allow_atlas_creation=True,
+        )
+
+        self.assertEqual(assigned, (source.object_id,))
+        self.assertEqual(len(self.workspace.get_data().atlases), 1)
+        self.assertEqual(self.workspace.selected_atlas.name, "Atlas")
+        self.assertEqual(self.workspace.selected_atlas.resolution, 2048)
+        self.assertIsNotNone(
+            self.workspace.selected_atlas.placement_for_object(source.object_id)
+        )
+
     def test_auto_assignment_without_selected_atlas_is_a_no_op(self) -> None:
         source = _source("required", directory=self._temporary_directory.name)
         self.workspace.set_object_texture_sources((source,))

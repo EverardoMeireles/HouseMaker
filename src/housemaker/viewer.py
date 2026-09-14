@@ -166,6 +166,10 @@ TRANSFORM_GIZMO_AXIS_COLORS = (
 TRANSFORM_GIZMO_RING_POINT_COUNT = 72
 TRANSFORM_GIZMO_SCREEN_SIZE_PIXELS = 92.0
 TRANSFORM_GIZMO_MIN_SIZE_METERS = 0.35
+OBJECT_PLACEMENT_PREVIEW_CUBE_SIZE_METERS = 0.75
+OBJECT_PLACEMENT_PREVIEW_SPACING_METERS = 1.25
+OBJECT_PLACEMENT_PREVIEW_COLOR = (0.20, 0.85, 0.45, 0.42)
+OBJECT_PLACEMENT_PREVIEW_EDGE_COLOR = (0.12, 1.0, 0.55, 0.95)
 TRANSFORM_GIZMO_AXIS_HIT_RATIO = 0.09
 TRANSFORM_GIZMO_RING_RADIUS_RATIO = 0.72
 TRANSFORM_GIZMO_RING_HIT_RATIO = 0.085
@@ -620,6 +624,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self.click_press_position = QPointF()
         self._is_middle_navigation_active = False
         self._rectangle_drawing_enabled = False
+        self._primary_pointer_tool_active = False
         self._primary_pointer_drag_reserved = False
         self._primary_pointer_release_suppressed = False
         self._item_click_selection_enabled = True
@@ -673,6 +678,20 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             self.release_first_person_pointer_capture()
         self._rectangle_drawing_enabled = normalized_enabled
         if normalized_enabled:
+            self.focus_navigation()
+            return
+        self._resume_first_person_pointer_capture_if_ready()
+
+    def set_primary_pointer_tool_active(self, active: bool) -> None:
+        """Keep the cursor available for a hover-driven viewport tool."""
+
+        normalized_active = bool(active)
+        if normalized_active == self._primary_pointer_tool_active:
+            return
+        if normalized_active:
+            self.release_first_person_pointer_capture()
+        self._primary_pointer_tool_active = normalized_active
+        if normalized_active:
             self.focus_navigation()
             return
         self._resume_first_person_pointer_capture_if_ready()
@@ -953,6 +972,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             or self._first_person_ctrl_interaction_active
             or self._first_person_pointer_release_latched
             or self._rectangle_drawing_enabled
+            or self._primary_pointer_tool_active
             or self._primary_pointer_drag_reserved
             or self._face_selection_gesture_active
             or self.is_first_person_pointer_captured
@@ -996,6 +1016,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             not self.is_first_person_active
             or not self._first_person_ctrl_interaction_enabled
             or self._first_person_ctrl_interaction_active
+            or self._primary_pointer_tool_active
         )
 
     def build_camera_ray(
@@ -1184,6 +1205,14 @@ class SelectableGLViewWidget(gl.GLViewWidget):
                 self.rectangle_pointer_pressed.emit(event.position())
             elif event.button() == Qt.MouseButton.RightButton:
                 self.rectangle_drawing_cancel_requested.emit()
+            event.accept()
+            return
+
+        if (
+            self._primary_pointer_tool_active
+            and event.button() == Qt.MouseButton.RightButton
+        ):
+            self.primary_pointer_cancel_requested.emit()
             event.accept()
             return
 
@@ -1512,7 +1541,10 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             event.accept()
             return
         if (
-            self._primary_pointer_drag_reserved
+            (
+                self._primary_pointer_drag_reserved
+                or self._primary_pointer_tool_active
+            )
             and event.key() == Qt.Key.Key_Escape
         ):
             self.primary_pointer_cancel_requested.emit()
@@ -2625,6 +2657,54 @@ class _CanvasRectangleSelectionResult:
     additive: bool
 
 
+# ### Direct object-placement models ###
+@dataclass(frozen=True)
+class SceneObjectPlacementCandidate:
+    """One floor hit expanded to the ordered positions of a placement group."""
+
+    level_index: int
+    world_positions: tuple[tuple[float, float, float], ...]
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.level_index, bool)
+            or not isinstance(self.level_index, int)
+            or self.level_index < 0
+        ):
+            raise ValueError("A scene placement requires a valid level index.")
+        positions = tuple(
+            tuple(float(component) for component in position)
+            for position in self.world_positions
+        )
+        if not positions or any(
+            len(position) != 3
+            or not all(math.isfinite(component) for component in position)
+            for position in positions
+        ):
+            raise ValueError("Scene placement positions must be finite XYZ points.")
+        object.__setattr__(self, "world_positions", positions)
+
+
+def build_scene_object_placement_group_candidate(
+    level_index: int,
+    anchor_world_position: Sequence[float],
+    count: int,
+) -> SceneObjectPlacementCandidate:
+    """Expand one floor anchor into the same centered grid shown in preview."""
+
+    anchor = np.asarray(anchor_world_position, dtype=float)
+    if anchor.shape != (3,) or not np.all(np.isfinite(anchor)):
+        raise ValueError("A placement anchor must be one finite XYZ point.")
+    offsets = _build_object_placement_group_offsets(count)
+    return SceneObjectPlacementCandidate(
+        level_index=level_index,
+        world_positions=tuple(
+            tuple(float(value) for value in anchor + offset)
+            for offset in offsets
+        ),
+    )
+
+
 class GlbViewerWidget(QWidget):
     """Generated-model viewer with Blender orbit and first-person navigation."""
 
@@ -2647,6 +2727,8 @@ class GlbViewerWidget(QWidget):
     placed_object_transform_changed = Signal(str, object, object)
     placed_object_selection_changed = Signal(object)
     placed_object_selection_set_changed = Signal(object)
+    object_placement_selected = Signal(str, object)
+    object_placement_cancelled = Signal(str)
     canvas_surface_selection_changed = Signal(object)
     canvas_surface_orientation_flip_requested = Signal(str)
     face_selection_changed = Signal(object)
@@ -2735,6 +2817,13 @@ class GlbViewerWidget(QWidget):
         ) = None
         self._transform_gizmo_items: list[GLGraphicsItem] = []
         self._transform_gizmo_size = TRANSFORM_GIZMO_MIN_SIZE_METERS
+        self._object_placement_request_id: str | None = None
+        self._object_placement_preview_meshes: tuple[trimesh.Trimesh, ...] = ()
+        self._object_placement_preview_offsets: tuple[np.ndarray, ...] = ()
+        self._object_placement_candidate: SceneObjectPlacementCandidate | None = None
+        self._object_placement_pointer_pressed = False
+        self._object_placement_preview_root: GLGraphicsItem | None = None
+        self._object_placement_preview_items: list[gl.GLMeshItem] = []
         self._canvas_opening_targets: dict[str, CanvasOpeningTarget] = {}
         self._selected_canvas_opening_key: str | None = None
         self._canvas_opening_edit_drag: _CanvasOpeningEditDrag | None = None
@@ -4192,6 +4281,216 @@ class GlbViewerWidget(QWidget):
             active_object_id=object_id,
         )
 
+    # ### Direct object-placement API ###
+    @property
+    def is_object_placement_active(self) -> bool:
+        """Whether the shared scene currently owns a direct placement request."""
+
+        return self._object_placement_request_id is not None
+
+    def begin_object_placement(
+        self,
+        request_id: str,
+        *,
+        preview_meshes: Sequence[trimesh.Trimesh] | None = None,
+        preview_count: int = 1,
+    ) -> bool:
+        """Arm floor-hover placement with actual meshes or cube placeholders."""
+
+        normalized_request_id = str(request_id).strip()
+        if not self._window_editing_enabled or not normalized_request_id:
+            return False
+        try:
+            meshes, offsets = _build_object_placement_preview_geometry(
+                preview_meshes,
+                preview_count,
+            )
+        except (TypeError, ValueError):
+            return False
+
+        self.cancel_object_placement(notify=False)
+        if self.is_window_placement_active():
+            self.cancel_window_placement(status_message=None)
+        if self.is_surface_vertex_placement_active():
+            self.cancel_surface_vertex_placement()
+        self._cancel_canvas_rectangle_selection()
+        self._cancel_canvas_opening_edit_drag()
+        self._cancel_canvas_surface_edit_drag()
+        self._cancel_canvas_face_extrusion_drag()
+        self._cancel_placed_object_gizmo_drag()
+        self._set_selected_placed_object(None)
+        self._set_selected_canvas_opening_key(None)
+
+        self._object_placement_request_id = normalized_request_id
+        self._object_placement_preview_meshes = meshes
+        self._object_placement_preview_offsets = offsets
+        self._object_placement_candidate = None
+        self._object_placement_pointer_pressed = False
+        self.view.set_primary_pointer_tool_active(True)
+        self.view.setCursor(Qt.CursorShape.CrossCursor)
+        self._refresh_object_placement_preview_items()
+        return True
+
+    def update_object_placement_preview_count(self, preview_count: int) -> bool:
+        """Replace an armed placeholder with an ordered cube group."""
+
+        if not self.is_object_placement_active:
+            return False
+        try:
+            meshes, offsets = _build_object_placement_preview_geometry(
+                None,
+                preview_count,
+            )
+        except (TypeError, ValueError):
+            return False
+        self._object_placement_preview_meshes = meshes
+        self._object_placement_preview_offsets = offsets
+        self._object_placement_candidate = None
+        self._refresh_object_placement_preview_items()
+        return True
+
+    def cancel_object_placement(self, *, notify: bool = True) -> bool:
+        """Cancel the active direct picker and remove every transient item."""
+
+        request_id = self._object_placement_request_id
+        if request_id is None:
+            return False
+        self._object_placement_request_id = None
+        self._object_placement_preview_meshes = ()
+        self._object_placement_preview_offsets = ()
+        self._object_placement_candidate = None
+        self._object_placement_pointer_pressed = False
+        if self.view.is_primary_pointer_drag_reserved:
+            self.view.release_primary_pointer_drag()
+        self.view.set_primary_pointer_tool_active(False)
+        self.view.unsetCursor()
+        self._remove_object_placement_preview_items()
+        if notify:
+            self.object_placement_cancelled.emit(request_id)
+        return True
+
+    def _update_object_placement_hover(self, position: QPointF) -> None:
+        """Resolve a visible floor hit and move the retained preview root."""
+
+        if not self.is_object_placement_active:
+            return
+        camera_ray = self.view.build_camera_ray(position)
+        hit = None
+        object_hit = None
+        if camera_ray is not None:
+            hit = _get_nearest_fixed_surface_ray_hit(
+                tuple(
+                    surface
+                    for surface in self._canvas_surface_targets.values()
+                    if self._canvas_surface_is_visible(surface)
+                ),
+                *camera_ray,
+            )
+            object_hit = _get_nearest_preview_placed_object_ray_hit(
+                tuple(
+                    replace(
+                        group.preview,
+                        placement_transform=group.current_transform,
+                    )
+                    for group in self._placed_object_render_groups.values()
+                    if self._canvas_objects_are_visible()
+                ),
+                *camera_ray,
+            )
+        if (
+            hit is None
+            or hit[0].surface_type != SURFACE_TYPE_FLOOR
+            or (
+                object_hit is not None
+                and object_hit[2] <= hit[2] + 1e-9
+            )
+        ):
+            self._object_placement_candidate = None
+            if self._object_placement_preview_root is not None:
+                self._object_placement_preview_root.setVisible(False)
+            self.view.update()
+            return
+
+        surface, hit_point, _distance = hit
+        anchor = np.asarray(hit_point, dtype=float)
+        self._object_placement_candidate = build_scene_object_placement_group_candidate(
+            surface.level_index,
+            anchor,
+            len(self._object_placement_preview_offsets),
+        )
+        root = self._object_placement_preview_root
+        if root is None:
+            self._refresh_object_placement_preview_items()
+            root = self._object_placement_preview_root
+        if root is not None:
+            transform = Transform3D()
+            transform.translate(
+                float(anchor[0]),
+                float(anchor[1]),
+                float(anchor[2]),
+            )
+            root.setTransform(transform)
+            root.setVisible(True)
+        self.view.update()
+
+    def _commit_object_placement(self) -> bool:
+        """Emit the current candidate and disarm before client callbacks run."""
+
+        request_id = self._object_placement_request_id
+        candidate = self._object_placement_candidate
+        if request_id is None or candidate is None:
+            return False
+        self.cancel_object_placement(notify=False)
+        self.object_placement_selected.emit(request_id, candidate)
+        return True
+
+    def _refresh_object_placement_preview_items(self) -> None:
+        """Recreate direct-placement render items after a scene repopulation."""
+
+        self._remove_object_placement_preview_items()
+        if not self.is_object_placement_active or not hasattr(self, "view"):
+            return
+        root = GLGraphicsItem()
+        root.setVisible(False)
+        self.view.addItem(root)
+        self._object_placement_preview_root = root
+        for mesh in self._object_placement_preview_meshes:
+            vertices = np.asarray(mesh.vertices, dtype=np.float32)
+            faces = np.asarray(mesh.faces, dtype=np.int32)
+            if not len(vertices) or not len(faces):
+                continue
+            item = gl.GLMeshItem(
+                vertexes=vertices,
+                faces=faces,
+                color=OBJECT_PLACEMENT_PREVIEW_COLOR,
+                smooth=False,
+                drawFaces=True,
+                drawEdges=True,
+                edgeColor=OBJECT_PLACEMENT_PREVIEW_EDGE_COLOR,
+                shader="shaded",
+            )
+            item.setGLOptions("translucent")
+            item.setParentItem(root)
+            self._object_placement_preview_items.append(item)
+        if self._object_placement_candidate is not None:
+            first_world = np.asarray(
+                self._object_placement_candidate.world_positions[0],
+                dtype=float,
+            )
+            first_offset = self._object_placement_preview_offsets[0]
+            anchor = first_world - first_offset
+            transform = Transform3D()
+            transform.translate(*[float(value) for value in anchor])
+            root.setTransform(transform)
+            root.setVisible(True)
+
+    def _remove_object_placement_preview_items(self) -> None:
+        root = self._object_placement_preview_root
+        if root is not None and hasattr(self, "view") and root in self.view.items:
+            self.view.removeItem(root)
+        self._object_placement_preview_root = None
+        self._object_placement_preview_items = []
+
     def begin_window_placement(self) -> bool:
         """Arm rectangle drawing when exactly one wall is selected."""
 
@@ -4496,6 +4795,11 @@ class GlbViewerWidget(QWidget):
 
     # ### Placed-object gizmo input ###
     def _handle_placed_object_pointer_pressed(self, position: QPointF) -> None:
+        if self.is_object_placement_active:
+            self._update_object_placement_hover(position)
+            self._object_placement_pointer_pressed = True
+            self.view.reserve_primary_pointer_drag()
+            return
         if (
             not self._placed_object_editing_enabled
             or self.is_window_placement_active()
@@ -4539,6 +4843,9 @@ class GlbViewerWidget(QWidget):
     def _handle_canvas_gizmo_pointer_moved(self, position: QPointF) -> None:
         """Update the one Canvas gizmo that currently owns the pointer."""
 
+        if self._object_placement_pointer_pressed:
+            self._update_object_placement_hover(position)
+            return
         if self._surface_vertex_click_ack_pending:
             self._update_surface_vertex_pointer_interaction(position)
             return
@@ -4559,6 +4866,11 @@ class GlbViewerWidget(QWidget):
     def _handle_canvas_gizmo_pointer_released(self, position: QPointF) -> None:
         """Finish the one Canvas gizmo that currently owns the pointer."""
 
+        if self._object_placement_pointer_pressed:
+            self._object_placement_pointer_pressed = False
+            self._update_object_placement_hover(position)
+            self._commit_object_placement()
+            return
         if self._surface_vertex_click_ack_pending:
             self._finish_surface_vertex_pointer_interaction(position)
             return
@@ -4579,6 +4891,9 @@ class GlbViewerWidget(QWidget):
     def _cancel_canvas_gizmo_drag(self, *_args: object) -> None:
         """Cancel the Canvas gizmo that owns the pointer before navigation."""
 
+        if self.is_object_placement_active:
+            self.cancel_object_placement()
+            return
         if self._surface_vertex_click_ack_pending:
             self._cancel_surface_vertex_pointer_interaction()
             return
@@ -5012,6 +5327,9 @@ class GlbViewerWidget(QWidget):
     ) -> bool:
         """Show the exact snapped candidate whenever the drawing tool is armed."""
 
+        if self.is_object_placement_active:
+            self._update_object_placement_hover(position)
+            return True
         if not self.is_surface_vertex_placement_active():
             return False
         preview, _is_occluded = self._resolve_surface_vertex_pointer_preview(
@@ -5031,6 +5349,11 @@ class GlbViewerWidget(QWidget):
     def _handle_surface_vertex_pointer_left(self) -> None:
         """Hide only the transient hover candidate outside the viewport."""
 
+        if self.is_object_placement_active:
+            self._object_placement_candidate = None
+            if self._object_placement_preview_root is not None:
+                self._object_placement_preview_root.setVisible(False)
+            self.view.update()
         self._surface_vertex_hover_preview = None
         self._remove_surface_vertex_preview_items()
 
@@ -7191,6 +7514,7 @@ class GlbViewerWidget(QWidget):
             self._refresh_canvas_face_extrusion_gizmo_items()
             self._refresh_level_transform_preview_outline_item()
             self._refresh_doorway_preview_outline_item()
+            self._refresh_object_placement_preview_items()
             return
 
         display_mesh = self._get_display_mesh()
@@ -7288,6 +7612,7 @@ class GlbViewerWidget(QWidget):
         self._sync_placed_object_selection_rendering()
         self._refresh_level_transform_preview_outline_item()
         self._refresh_doorway_preview_outline_item()
+        self._refresh_object_placement_preview_items()
         self.view.update()
 
     def _get_display_mesh(self):
@@ -9294,6 +9619,8 @@ class GlbViewerWidget(QWidget):
         self._window_preview_item = None
         self._level_transform_preview_outline_item = None
         self._doorway_preview_outline_item = None
+        self._object_placement_preview_root = None
+        self._object_placement_preview_items = []
 
     def _release_textured_mesh_gl_resources(self) -> None:
         """Delete all textured-item GL names before detaching scene parents."""
@@ -12672,6 +12999,94 @@ def _build_textured_wall_transform(
             [0.0, 0.0, 0.0, 1.0],
         ]
     )
+
+
+# ### Direct object-placement helpers ###
+def _build_object_placement_preview_geometry(
+    preview_meshes: Sequence[trimesh.Trimesh] | None,
+    preview_count: int,
+) -> tuple[tuple[trimesh.Trimesh, ...], tuple[np.ndarray, ...]]:
+    """Return independent local preview meshes and their ordered XY offsets."""
+
+    if preview_meshes is None:
+        if (
+            isinstance(preview_count, bool)
+            or not isinstance(preview_count, int)
+            or preview_count < 1
+        ):
+            raise ValueError("A placement preview requires at least one object.")
+        source_meshes = tuple(
+            trimesh.creation.box(
+                extents=(
+                    OBJECT_PLACEMENT_PREVIEW_CUBE_SIZE_METERS,
+                    OBJECT_PLACEMENT_PREVIEW_CUBE_SIZE_METERS,
+                    OBJECT_PLACEMENT_PREVIEW_CUBE_SIZE_METERS,
+                )
+            )
+            for _index in range(preview_count)
+        )
+        for mesh in source_meshes:
+            mesh.apply_translation(
+                (0.0, 0.0, OBJECT_PLACEMENT_PREVIEW_CUBE_SIZE_METERS / 2.0)
+            )
+    else:
+        source_meshes = tuple(preview_meshes)
+        if not source_meshes or any(
+            not isinstance(mesh, trimesh.Trimesh) for mesh in source_meshes
+        ):
+            raise TypeError("Placement preview meshes must be Trimesh values.")
+
+    offsets = _build_object_placement_group_offsets(len(source_meshes))
+    meshes: list[trimesh.Trimesh] = []
+    for source_mesh, offset in zip(source_meshes, offsets, strict=True):
+        mesh = source_mesh.copy()
+        vertices = np.asarray(mesh.vertices, dtype=float)
+        if (
+            vertices.ndim != 2
+            or vertices.shape[1:] != (3,)
+            or np.asarray(mesh.faces).ndim != 2
+            or np.asarray(mesh.faces).shape[1:] != (3,)
+            or not len(vertices)
+            or not len(mesh.faces)
+            or not np.all(np.isfinite(vertices))
+        ):
+            raise ValueError(
+                "Placement preview meshes must contain finite triangles."
+            )
+        minimum = np.min(vertices, axis=0)
+        maximum = np.max(vertices, axis=0)
+        bottom_center = np.asarray(
+            (
+                (minimum[0] + maximum[0]) / 2.0,
+                (minimum[1] + maximum[1]) / 2.0,
+                minimum[2],
+            ),
+            dtype=float,
+        )
+        mesh.apply_translation(offset - bottom_center)
+        meshes.append(mesh)
+    return tuple(meshes), offsets
+
+
+def _build_object_placement_group_offsets(count: int) -> tuple[np.ndarray, ...]:
+    """Arrange a batch around one anchor without overlapping its previews."""
+
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise ValueError("A placement group requires at least one object.")
+    column_count = max(1, math.ceil(math.sqrt(count)))
+    row_count = math.ceil(count / column_count)
+    offsets: list[np.ndarray] = []
+    for index in range(count):
+        row, column = divmod(index, column_count)
+        populated_columns = min(column_count, count - row * column_count)
+        x = (
+            float(column) - (float(populated_columns) - 1.0) / 2.0
+        ) * OBJECT_PLACEMENT_PREVIEW_SPACING_METERS
+        y = (
+            (float(row_count) - 1.0) / 2.0 - float(row)
+        ) * OBJECT_PLACEMENT_PREVIEW_SPACING_METERS
+        offsets.append(np.asarray((x, y, 0.0), dtype=float))
+    return tuple(offsets)
 
 
 def _get_point_distance(first_point: QPointF, second_point: QPointF) -> float:

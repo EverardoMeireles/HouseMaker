@@ -400,6 +400,8 @@ class MergedGenerationWorkspace(QWidget):
         primary_actions_layout.addWidget(objects.generate_texture_button)
         primary_layout.addWidget(primary_actions)
         primary_layout.addWidget(objects.generate_button)
+        self.place_object_button = objects.place_button
+        primary_layout.addWidget(self.place_object_button)
         primary_layout.addWidget(objects.model_statistics_label)
         primary_layout.addStretch(1)
 
