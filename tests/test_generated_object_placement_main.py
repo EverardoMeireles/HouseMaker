@@ -31,7 +31,6 @@ from housemaker.main import BlueprintWorkspace
 from housemaker.models import LevelData, VertexData
 from housemaker.viewer import SceneObjectPlacementCandidate
 
-
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
 _qt_application.setQuitOnLastWindowClosed(False)
@@ -607,6 +606,7 @@ class GeneratedObjectPlacementMainTests(unittest.TestCase):
             25.0,
             height_offset_meters=1.75,
             rotation_degrees=(12.0, -25.0, 70.0),
+            scale=1.4,
         )
         generation_data = GenerationData(
             generated_objects=[
@@ -688,6 +688,7 @@ class GeneratedObjectPlacementMainTests(unittest.TestCase):
             placed_model.rotation_degrees,
             visible_placement.rotation_degrees,
         )
+        self.assertEqual(placed_model.scale, visible_placement.scale)
         self.assertEqual(
             placed_model.symmetric_preview_orientation,
             "vertical",
@@ -708,7 +709,7 @@ class GeneratedObjectPlacementMainTests(unittest.TestCase):
             offset_y_meters=-3.0,
         )
         self.workspace.levels = [ground, target_level]
-        original = GeneratedObjectPlacement(3, 40.0, 60.0)
+        original = GeneratedObjectPlacement(3, 40.0, 60.0, scale=1.75)
         world_position = (8.25, -4.5, 6.0)
         rotation_degrees = (15.0, 35.0, -80.0)
         expected_image_x, expected_image_y = level_world_to_image_xy(
@@ -765,6 +766,7 @@ class GeneratedObjectPlacementMainTests(unittest.TestCase):
             expected_height_offset,
         )
         self.assertEqual(placement.rotation_degrees, rotation_degrees)
+        self.assertEqual(placement.scale, original.scale)
 
     def test_failed_gizmo_transform_restores_the_persisted_preview(self) -> None:
         level = _level(2)

@@ -30,7 +30,6 @@ from housemaker.first_person_navigation import (
     normalize_first_person_navigation_mode,
 )
 
-
 # ### Constants ###
 MESHY_API_KEY_ENVIRONMENT_VARIABLE = "MESHY_API_KEY"
 MESHY_API_KEY_SETTING_KEY = "generation/meshy_api_key"
@@ -60,6 +59,7 @@ CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY_SETTING_KEY = (
 FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY = (
     "navigation/first_person_navigation_mode"
 )
+IGNORE_TOP_DOWN_CEILING_SETTING_KEY = "navigation/ignore_top_down_ceiling"
 UNUSED_FACE_REMOVAL_SETTING_KEY = "generation/unused_face_removal"
 USE_UV_RAYCAST_FOR_OBJECT_GENERATION_SETTING_KEY = (
     "generation/use_uv_raycast_for_object_generation"
@@ -91,6 +91,7 @@ MAXIMUM_FACE_VISIBILITY_PERCENTAGE = 100
 DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS = 1.0
 DEFAULT_WALL_VERTEX_UPDATE_DELAY_SECONDS = 15.0
 DEFAULT_SNAP_MIDDLE_EQUAL_ANGLE_ONLY = True
+DEFAULT_IGNORE_TOP_DOWN_CEILING = True
 MIN_MESH_EDIT_UPDATE_DELAY_SECONDS = 0.1
 MAX_MESH_EDIT_UPDATE_DELAY_SECONDS = 10.0
 MESH_EDIT_UPDATE_DELAY_STEP_SECONDS = 0.1
@@ -190,6 +191,7 @@ class GenerationServiceSettings:
     )
     generation_display_screen_id: str | None = None
     automatic_atlas_creation: bool = DEFAULT_AUTOMATIC_ATLAS_CREATION
+    ignore_top_down_ceiling: bool = DEFAULT_IGNORE_TOP_DOWN_CEILING
 
     def __post_init__(self) -> None:
         try:
@@ -211,6 +213,10 @@ class GenerationServiceSettings:
             raise ValueError(
                 "Snap-to-middle equal-angle filtering must be enabled or "
                 "disabled."
+            )
+        if not isinstance(self.ignore_top_down_ceiling, bool):
+            raise ValueError(
+                "Top-down ceiling suppression must be enabled or disabled."
             )
         if not isinstance(self.automatic_atlas_creation, bool):
             raise ValueError(
@@ -480,6 +486,9 @@ class SettingsWidget(QWidget):
             ),
             first_person_navigation_mode=str(
                 self.first_person_navigation_combo.currentData()
+            ),
+            ignore_top_down_ceiling=(
+                self.ignore_top_down_ceiling_checkbox.isChecked()
             ),
         )
 
@@ -793,6 +802,22 @@ class SettingsWidget(QWidget):
             self.first_person_navigation_combo,
         )
 
+        self.ignore_top_down_ceiling_checkbox = QCheckBox()
+        self.ignore_top_down_ceiling_checkbox.setObjectName(
+            "ignore_top_down_ceiling_checkbox"
+        )
+        self.ignore_top_down_ceiling_checkbox.setToolTip(
+            "Hide level ceilings and exclude them from selection while the "
+            "shared 3D Scene uses top-down orbit navigation."
+        )
+        self.ignore_top_down_ceiling_checkbox.toggled.connect(
+            self._handle_ignore_top_down_ceiling_changed
+        )
+        canvas_form.addRow(
+            "Ignore top-down ceiling",
+            self.ignore_top_down_ceiling_checkbox,
+        )
+
         self.snap_middle_equal_angle_only_checkbox = QCheckBox()
         self.snap_middle_equal_angle_only_checkbox.setObjectName(
             "snap_middle_equal_angle_only_checkbox"
@@ -1036,6 +1061,9 @@ class SettingsWidget(QWidget):
         )
         self.first_person_navigation_combo.setCurrentIndex(
             max(0, first_person_navigation_index)
+        )
+        self.ignore_top_down_ceiling_checkbox.setChecked(
+            read_ignore_top_down_ceiling(self._application_settings)
         )
         self.snap_middle_equal_angle_only_checkbox.setChecked(
             read_snap_middle_equal_angle_only(self._application_settings)
@@ -1348,6 +1376,17 @@ class SettingsWidget(QWidget):
         self._application_settings.set(
             FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY,
             str(self.first_person_navigation_combo.currentData()),
+        )
+        self.settings_changed.emit()
+
+    def _handle_ignore_top_down_ceiling_changed(self, enabled: bool) -> None:
+        """Persist whether orbit navigation suppresses Canvas ceilings."""
+
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            IGNORE_TOP_DOWN_CEILING_SETTING_KEY,
+            bool(enabled),
         )
         self.settings_changed.emit()
 
@@ -1750,6 +1789,20 @@ def read_first_person_navigation_mode(
         return normalize_first_person_navigation_mode(value)
     except ValueError:
         return DEFAULT_FIRST_PERSON_NAVIGATION_MODE
+
+
+def read_ignore_top_down_ceiling(
+    application_settings: ApplicationSettingsStore,
+) -> bool:
+    """Read the persisted orbit-mode ceiling suppression safely."""
+
+    value = application_settings.get(
+        IGNORE_TOP_DOWN_CEILING_SETTING_KEY,
+        DEFAULT_IGNORE_TOP_DOWN_CEILING,
+    )
+    if isinstance(value, bool):
+        return value
+    return DEFAULT_IGNORE_TOP_DOWN_CEILING
 
 
 def read_canvas_3d_navigation_toggle_hotkey(

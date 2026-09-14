@@ -30,56 +30,59 @@ from housemaker.first_person_navigation import (
 from housemaker.settings_widget import (
     ATLAS_DISPLAY_SCREEN_SETTING_KEY,
     AUTOMATIC_ATLAS_CREATION_SETTING_KEY,
-    AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR_SETTING_KEY,
     AUTOMATIC_ATLAS_TEXTURE_RESOLUTION_SETTING_KEY,
     AUTOMATIC_ATLAS_TEXTURE_RESOLUTIONS,
+    AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR_SETTING_KEY,
     CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY_SETTING_KEY,
     DEFAULT_AUTOMATIC_ATLAS_CREATION,
-    DEFAULT_AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR,
     DEFAULT_AUTOMATIC_ATLAS_TEXTURE_RESOLUTION,
+    DEFAULT_AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR,
     DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY,
-    DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE,
+    DEFAULT_IGNORE_TOP_DOWN_CEILING,
     DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS,
     DEFAULT_MESHY_TARGET_POLYCOUNT,
+    DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE,
     DEFAULT_SNAP_MIDDLE_EQUAL_ANGLE_ONLY,
     DEFAULT_USE_HALF_MESH_TEXTURE_PREFIX,
     DEFAULT_WALL_VERTEX_UPDATE_DELAY_SECONDS,
-    FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY,
     FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY,
+    FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY,
     GENERATION_DISPLAY_SCREEN_SETTING_KEY,
-    MAXIMUM_FACE_VISIBILITY_PERCENTAGE,
+    IGNORE_TOP_DOWN_CEILING_SETTING_KEY,
     MAX_MESH_EDIT_UPDATE_DELAY_SECONDS,
     MAX_WALL_VERTEX_UPDATE_DELAY_SECONDS,
+    MAXIMUM_FACE_VISIBILITY_PERCENTAGE,
     MESH_EDIT_UPDATE_DELAY_SECONDS_SETTING_KEY,
     MESH_EDIT_UPDATE_DELAY_STEP_SECONDS,
     MESHY_API_KEY_ENVIRONMENT_VARIABLE,
     MESHY_API_KEY_SETTING_KEY,
-    MINIMUM_FACE_VISIBILITY_PERCENTAGE,
-    MINIMUM_FACE_VISIBILITY_PERCENTAGE_SETTING_KEY,
     MIN_MESH_EDIT_UPDATE_DELAY_SECONDS,
     MIN_WALL_VERTEX_UPDATE_DELAY_SECONDS,
+    MINIMUM_FACE_VISIBILITY_PERCENTAGE,
+    MINIMUM_FACE_VISIBILITY_PERCENTAGE_SETTING_KEY,
     OPENAI_API_KEY_ENVIRONMENT_VARIABLE,
     OPENAI_API_KEY_SETTING_KEY,
     SCENE_3D_DISPLAY_SCREEN_SETTING_KEY,
     SNAP_MIDDLE_EQUAL_ANGLE_ONLY_SETTING_KEY,
+    SURFACE_TEXTURE_PROVIDER_GPT_5_6_TERRA,
+    SURFACE_TEXTURE_PROVIDER_SETTING_KEY,
     UNUSED_FACE_REMOVAL_SETTING_KEY,
     USE_HALF_MESH_TEXTURE_PREFIX_SETTING_KEY,
     USE_UV_RAYCAST_FOR_OBJECT_GENERATION_SETTING_KEY,
     WALL_VERTEX_UPDATE_DELAY_SECONDS_SETTING_KEY,
     WALL_VERTEX_UPDATE_DELAY_STEP_SECONDS,
     Fullscreen3DViewerScreenOption,
-    SURFACE_TEXTURE_PROVIDER_GPT_5_6_TERRA,
-    SURFACE_TEXTURE_PROVIDER_SETTING_KEY,
     GenerationServiceSettings,
     SettingsWidget,
     fullscreen_3d_viewer_screen_id,
     read_atlas_display_screen_id,
     read_automatic_atlas_creation,
-    read_automatic_atlas_texture_sort_by_pbr,
     read_automatic_atlas_texture_resolution,
+    read_automatic_atlas_texture_sort_by_pbr,
     read_canvas_3d_navigation_toggle_hotkey,
     read_first_person_navigation_mode,
     read_generation_display_screen_id,
+    read_ignore_top_down_ceiling,
     read_mesh_edit_update_delay_seconds,
     read_minimum_face_visibility_percentage,
     read_scene_3d_display_screen_id,
@@ -89,7 +92,6 @@ from housemaker.settings_widget import (
     read_use_uv_raycast_for_object_generation,
     read_wall_vertex_update_delay_seconds,
 )
-
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -143,6 +145,7 @@ class SettingsWidgetTests(unittest.TestCase):
                     (
                         widget.canvas_3d_navigation_toggle_hotkey_edit,
                         widget.first_person_navigation_combo,
+                        widget.ignore_top_down_ceiling_checkbox,
                         widget.snap_middle_equal_angle_only_checkbox,
                         widget.mesh_edit_update_delay_spinbox,
                         widget.wall_vertex_update_delay_spinbox,
@@ -198,6 +201,12 @@ class SettingsWidgetTests(unittest.TestCase):
                     widget.first_person_navigation_combo
                 ).text(),
                 "First person navigation",
+            )
+            self.assertEqual(
+                canvas_form.labelForField(
+                    widget.ignore_top_down_ceiling_checkbox
+                ).text(),
+                "Ignore top-down ceiling",
             )
             widget.dispose()
 
@@ -260,6 +269,66 @@ class SettingsWidgetTests(unittest.TestCase):
             )
             widget.dispose()
             restored.dispose()
+
+    def test_ignore_top_down_ceiling_defaults_persists_and_emits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            widget = SettingsWidget(
+                application_settings=application_settings,
+                environment={},
+            )
+            checkbox = widget.ignore_top_down_ceiling_checkbox
+            emitted_changes: list[bool] = []
+            widget.settings_changed.connect(
+                lambda: emitted_changes.append(True)
+            )
+
+            self.assertTrue(DEFAULT_IGNORE_TOP_DOWN_CEILING)
+            self.assertTrue(checkbox.isChecked())
+            self.assertTrue(widget.get_settings().ignore_top_down_ceiling)
+
+            checkbox.setChecked(False)
+
+            self.assertFalse(
+                application_settings.get(
+                    IGNORE_TOP_DOWN_CEILING_SETTING_KEY
+                )
+            )
+            self.assertFalse(widget.get_settings().ignore_top_down_ceiling)
+            self.assertEqual(emitted_changes, [True])
+
+            restored = SettingsWidget(
+                application_settings=_build_test_settings(temporary_directory),
+                environment={},
+            )
+            self.assertFalse(
+                restored.get_settings().ignore_top_down_ceiling
+            )
+            widget.dispose()
+            restored.dispose()
+
+    def test_ignore_top_down_ceiling_rejects_malformed_values(self) -> None:
+        for value in (0, 1, "true", None):
+            with self.subTest(model_value=value):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "Top-down ceiling suppression",
+                ):
+                    GenerationServiceSettings(
+                        ignore_top_down_ceiling=value  # type: ignore[arg-type]
+                    )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            for value in (0, 1, "true", None):
+                with self.subTest(persisted_value=value):
+                    application_settings.set(
+                        IGNORE_TOP_DOWN_CEILING_SETTING_KEY,
+                        value,
+                    )
+                    self.assertTrue(
+                        read_ignore_top_down_ceiling(application_settings)
+                    )
 
     def test_first_person_navigation_mode_rejects_malformed_values(
         self,

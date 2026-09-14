@@ -4830,6 +4830,44 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
 
         refresh_regenerated.assert_called_once_with("chair")
 
+    def test_generated_objects_and_textures_start_atlas_list_highlights(self) -> None:
+        generated_record = SimpleNamespace(object_id="chair")
+
+        with patch.object(
+            self.workspace.texture_atlas_workspace,
+            "mark_sources_new",
+        ) as mark_sources_new:
+            self.workspace.generation.generation_completed.emit(
+                generated_record,
+                _generated_box_model(),
+            )
+            self.workspace.generation.texture_regeneration_completed.emit(
+                generated_record,
+                _generated_box_model(),
+            )
+            _qt_application.processEvents()
+
+        self.assertEqual(
+            mark_sources_new.call_args_list,
+            [call(("chair",)), call(("chair",))],
+        )
+
+    def test_generated_surface_texture_starts_atlas_list_highlight(self) -> None:
+        assignment = SimpleNamespace(assignment_id="brick-wall")
+
+        with patch.object(
+            self.workspace.texture_atlas_workspace,
+            "mark_sources_new",
+        ) as mark_sources_new:
+            self.workspace.surface_texture_generation.generation_completed.emit(
+                assignment
+            )
+            _qt_application.processEvents()
+
+        mark_sources_new.assert_called_once_with(
+            (build_atlas_wall_texture_source_id("brick-wall"),)
+        )
+
     def test_object_generation_exposes_no_texture_inpaint_signal(self) -> None:
         self.assertFalse(
             hasattr(self.workspace.generation, "texture_inpaint_completed")

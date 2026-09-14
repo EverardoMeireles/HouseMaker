@@ -8,8 +8,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # ### Imports ###
 import copy
-import threading
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -31,7 +31,6 @@ from housemaker.main import BlueprintWorkspace
 from housemaker.models import GROUND_LEVEL_INDEX, create_default_levels
 from housemaker.project_io import ProjectData
 from housemaker.settings_widget import GenerationServiceSettings
-
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -206,26 +205,59 @@ class GenerationMainIntegrationTests(unittest.TestCase):
         merged = self.workspace.merged_generation_workspace
         generation = self.workspace.generation
         object_panel = generation.object_3d_panel
-        primary_column = generation.symmetric_division_checkbox.parentWidget()
+        primary_column = merged.findChild(
+            QWidget,
+            "merged_generation_object_primary_column",
+        )
+        self.assertIsNotNone(primary_column)
+        assert primary_column is not None
         primary_layout = primary_column.layout()
         assert primary_layout is not None
 
+        editing_section = merged.object_editing_section
+        creation_section = merged.object_creation_section
         self.assertLess(
-            primary_layout.indexOf(generation.symmetric_division_checkbox),
-            primary_layout.indexOf(generation.delete_selected_faces_button),
+            primary_layout.indexOf(editing_section),
+            primary_layout.indexOf(creation_section),
         )
         self.assertLess(
-            primary_layout.indexOf(generation.delete_selected_faces_button),
-            primary_layout.indexOf(generation.convert_faces_to_glass_button),
-        )
-        self.assertLess(
-            primary_layout.indexOf(generation.generate_button),
+            primary_layout.indexOf(creation_section),
             primary_layout.indexOf(generation.model_statistics_label),
         )
+        for editing_control in (
+            generation.textures_checkbox,
+            generation.wireframe_checkbox,
+            generation.delete_selected_faces_button,
+            generation.convert_faces_to_glass_button,
+        ):
+            self.assertTrue(editing_section.isAncestorOf(editing_control))
+        for creation_control in (
+            generation.symmetric_division_checkbox,
+            generation.meshy_target_polycount_control,
+            generation.generate_geometry_button,
+            generation.generate_texture_button,
+            generation.generate_button,
+            generation.place_button,
+        ):
+            self.assertTrue(creation_section.isAncestorOf(creation_control))
         self.assertTrue(
             merged.object_controls.isAncestorOf(
                 object_panel.projection_camera_controls
             )
+        )
+
+        self.assertTrue(
+            merged.shared_material_section.isAncestorOf(
+                merged.pbr_map_control
+            )
+        )
+        self.assertTrue(
+            merged.shared_material_section.isAncestorOf(
+                merged.ai_prompt_edit
+            )
+        )
+        self.assertTrue(
+            merged.shared_material_section.isAncestorOf(merged.cancel_button)
         )
 
         shared_fields = merged.shared_controls.findChild(
@@ -398,6 +430,71 @@ class GenerationMainIntegrationTests(unittest.TestCase):
             pointer_was_captured,
         )
         self.assertIsNone(self.workspace.surface_texture_generation.surface_view)
+
+    def test_ignore_top_down_ceiling_setting_updates_shared_scene(self) -> None:
+        checkbox = (
+            self.workspace.settings_widget.ignore_top_down_ceiling_checkbox
+        )
+        self.assertTrue(checkbox.isChecked())
+
+        with patch.object(
+            self.workspace.viewer,
+            "set_ignore_top_down_ceiling",
+        ) as setter:
+            checkbox.setChecked(False)
+            _qt_application.processEvents()
+
+        setter.assert_called_once_with(False)
+        self.assertFalse(
+            self.workspace._generation_settings.ignore_top_down_ceiling
+        )
+
+    def test_include_control_is_export_only_for_scene_preview(self) -> None:
+        level = self.workspace.current_level
+        self.assertTrue(level.include_in_export)
+
+        with patch.object(
+            self.workspace,
+            "_schedule_viewer_preview_refresh",
+        ) as schedule_refresh:
+            self.workspace.include_no_radio.setChecked(True)
+            _qt_application.processEvents()
+
+        self.assertFalse(level.include_in_export)
+        schedule_refresh.assert_not_called()
+        preview_level = next(
+            candidate
+            for candidate in self.workspace._build_viewer_preview_levels()
+            if candidate.index == level.index
+        )
+        self.assertTrue(preview_level.include_in_export)
+
+    def test_scene_level_selector_receives_only_levels_with_vertices(self) -> None:
+        lowest_level = min(
+            self.workspace.levels,
+            key=lambda candidate: candidate.index,
+        )
+        highest_level = max(
+            self.workspace.levels,
+            key=lambda candidate: candidate.index,
+        )
+        lowest_level.vertex_data.add_vertex(10.0, 20.0)
+        highest_level.vertex_data.add_vertex(30.0, 40.0)
+
+        with patch.object(
+            self.workspace.viewer,
+            "set_canvas_scene_levels",
+        ) as setter:
+            self.workspace._sync_viewer_scene_levels()
+
+        setter.assert_called_once_with(
+            (
+                (highest_level.index, highest_level.display_name),
+                (lowest_level.index, lowest_level.display_name),
+            ),
+            placed_object_levels={},
+            reset_visibility=False,
+        )
 
     def test_canvas_snap_filter_is_controlled_from_settings(self) -> None:
         self.assertFalse(

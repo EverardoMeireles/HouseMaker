@@ -568,6 +568,59 @@ class CanvasUndoMainTests(unittest.TestCase):
         )
         self.assertEqual(self.workspace._desired_canvas_object_id, "table")
 
+    def test_ctrl_z_restores_one_multi_object_wheel_scale_gesture(self) -> None:
+        chair_placement = GeneratedObjectPlacement(
+            level_index=self.level.index,
+            image_x=20.0,
+            image_y=30.0,
+        )
+        table_placement = GeneratedObjectPlacement(
+            level_index=self.level.index,
+            image_x=40.0,
+            image_y=50.0,
+            scale=1.5,
+        )
+        self.workspace.generation.set_data(
+            GenerationData(
+                generated_objects=[
+                    _generated_object_record("chair", chair_placement),
+                    _generated_object_record("table", table_placement),
+                ]
+            )
+        )
+        self.workspace._desired_canvas_object_ids = ("chair", "table")
+        self.workspace._desired_canvas_object_id = "table"
+
+        self.workspace._handle_placed_object_scales_changed(
+            (("chair", 1.1), ("table", 1.65))
+        )
+
+        self.assertAlmostEqual(
+            self.workspace.generation.get_generated_object_placement(
+                "chair"
+            ).scale,
+            1.1,
+        )
+        self.assertAlmostEqual(
+            self.workspace.generation.get_generated_object_placement(
+                "table"
+            ).scale,
+            1.65,
+        )
+        self.assertEqual(len(self.workspace._canvas_undo_stack), 1)
+
+        _send_undo_to_viewer(self.workspace)
+
+        self.assertEqual(
+            self.workspace.generation.get_generated_object_placement("chair"),
+            chair_placement,
+        )
+        self.assertEqual(
+            self.workspace.generation.get_generated_object_placement("table"),
+            table_placement,
+        )
+        self.assertEqual(self.workspace._canvas_undo_stack, [])
+
     def test_ctrl_z_removes_a_newly_added_window(self) -> None:
         wall = next(
             surface
@@ -859,6 +912,7 @@ class CanvasUndoMainTests(unittest.TestCase):
             image_y=30.0,
             height_offset_meters=0.75,
             rotation_degrees=(5.0, 10.0, 15.0),
+            scale=1.6,
         )
         self.workspace.generation.set_data(
             GenerationData(
@@ -884,10 +938,12 @@ class CanvasUndoMainTests(unittest.TestCase):
                 image_y=70.0,
             ),
         )
-        self.assertNotEqual(
-            self.workspace.generation.get_generated_object_placement("chair"),
-            original,
+        replacement = self.workspace.generation.get_generated_object_placement(
+            "chair"
         )
+        self.assertNotEqual(replacement, original)
+        assert replacement is not None
+        self.assertEqual(replacement.scale, original.scale)
 
         _send_undo_to_viewer(self.workspace)
 

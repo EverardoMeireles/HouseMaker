@@ -2,22 +2,23 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace
-from io import BytesIO
 import math
 import threading
 import weakref
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from io import BytesIO
 
 import numpy as np
+import pyqtgraph.opengl as gl
 import trimesh
 from OpenGL import GL
 from OpenGL.GL import shaders as opengl_shaders
+from PIL import Image
 from pyqtgraph import Transform3D
-import pyqtgraph.opengl as gl
 from pyqtgraph.opengl import shaders as gl_shaders
 from pyqtgraph.opengl.GLGraphicsItem import GLGraphicsItem
-from PySide6.QtCore import QEvent, QPointF, QRect, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QEvent, QPointF, QRect, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import (
     QCursor,
     QKeyEvent,
@@ -28,16 +29,18 @@ from PySide6.QtGui import (
     QVector3D,
 )
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QPushButton,
     QRubberBand,
     QStackedLayout,
     QVBoxLayout,
     QWidget,
 )
-from PIL import Image
 
 from housemaker.camera_indicators import (
     DEFAULT_CAMERA_INDICATOR_PERCENTAGES,
@@ -67,6 +70,10 @@ from housemaker.first_person_navigation import (
     build_first_person_forward_vector,
     normalize_first_person_navigation_mode,
 )
+from housemaker.glass_material import (
+    get_housemaker_glass_double_sided,
+    is_housemaker_glass_material,
+)
 from housemaker.glb import (
     GLTF_Y_UP_TO_Z_UP_TRANSFORM,
     SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION,
@@ -75,10 +82,6 @@ from housemaker.glb import (
     PreviewTexturedWall,
     remove_covered_surface_faces,
 )
-from housemaker.glass_material import (
-    get_housemaker_glass_double_sided,
-    is_housemaker_glass_material,
-)
 from housemaker.object_texture_variants import (
     PBR_MAP_METALLIC,
     PBR_MAP_NORMAL,
@@ -86,10 +89,10 @@ from housemaker.object_texture_variants import (
     PBR_MAP_TYPES,
 )
 from housemaker.surface_geometry import (
-    FixedSurface,
     SURFACE_TYPE_CEILING,
     SURFACE_TYPE_FLOOR,
     SURFACE_TYPE_WALL,
+    FixedSurface,
     WallWindowPlacement,
     build_wall_window_placement,
     get_wall_window_world_corners,
@@ -143,7 +146,7 @@ CANVAS_FACE_ORIENTATION_FRONT_COLOR = (0.12, 0.36, 1.0, 0.52)
 CANVAS_FACE_ORIENTATION_BACK_COLOR = (1.0, 0.12, 0.12, 0.68)
 CANVAS_FACE_ORIENTATION_DEPTH_VALUE = 9_990.0
 CANVAS_SCENE_FOCUS_TYPES = frozenset(
-    (SURFACE_TYPE_FLOOR, SURFACE_TYPE_CEILING)
+    (SURFACE_TYPE_FLOOR,)
 )
 CANVAS_SELECTION_TARGET_SURFACE = "surface"
 CANVAS_SELECTION_TARGET_OBJECT = "object"
@@ -176,6 +179,9 @@ TRANSFORM_GIZMO_RING_HIT_RATIO = 0.085
 TRANSFORM_GIZMO_SELECTION_COLOR = (1.0, 0.72, 0.18, 0.95)
 TRANSFORM_GIZMO_TRANSLATE = "translate"
 TRANSFORM_GIZMO_ROTATE = "rotate"
+PLACED_OBJECT_SCALE_FACTOR_PER_WHEEL_STEP = 1.1
+PLACED_OBJECT_MIN_SCALE = 0.05
+PLACED_OBJECT_MAX_SCALE = 20.0
 CANVAS_OPENING_GIZMO_SIDE = "side"
 CANVAS_OPENING_GIZMO_ANCHOR = "anchor"
 CANVAS_OPENING_SIDE_LEFT = "left"
@@ -445,6 +451,13 @@ class TextureMeshData:
 
 
 @dataclass(frozen=True)
+class _CanvasSceneLevelMesh:
+    """One complete named level primitive adapted for face filtering."""
+
+    mesh: trimesh.Trimesh
+
+
+@dataclass(frozen=True)
 class _TransformGizmoHandle:
     """One global-axis translation arrow or rotation ring."""
 
@@ -613,6 +626,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
     face_selection_pointer_cancel_requested = Signal()
     overlay_selection_requested = Signal(object)
     overlay_wheel_steps_requested = Signal(int)
+    object_scale_wheel_steps_requested = Signal(int)
     delete_requested = Signal()
     undo_requested = Signal()
     navigation_mode_changed = Signal(str)
@@ -632,6 +646,8 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self._overlay_selection_enabled = False
         self._overlay_wheel_steps_enabled = False
         self._overlay_wheel_delta_remainder = 0
+        self._object_scale_wheel_steps_enabled = False
+        self._object_scale_wheel_delta_remainder = 0
         self._face_selection_gestures_enabled = False
         self._face_selection_gesture_active = False
         self._face_selection_release_suppressed = False
@@ -847,6 +863,15 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             return
         self._overlay_wheel_steps_enabled = normalized_enabled
         self._overlay_wheel_delta_remainder = 0
+
+    def set_object_scale_wheel_steps_enabled(self, enabled: bool) -> None:
+        """Route wheel ticks to selected placed objects instead of navigation."""
+
+        normalized_enabled = bool(enabled)
+        if normalized_enabled == self._object_scale_wheel_steps_enabled:
+            return
+        self._object_scale_wheel_steps_enabled = normalized_enabled
+        self._object_scale_wheel_delta_remainder = 0
 
     @property
     def is_face_selection_gesture_active(self) -> bool:
@@ -1498,6 +1523,23 @@ class SelectableGLViewWidget(gl.GLViewWidget):
                     wheel_steps * MOUSE_WHEEL_DELTA_PER_STEP
                 )
                 self.overlay_wheel_steps_requested.emit(wheel_steps)
+            event.accept()
+            return
+
+        if self._object_scale_wheel_steps_enabled:
+            delta = event.angleDelta().y()
+            if delta == 0:
+                delta = event.angleDelta().x()
+            self._object_scale_wheel_delta_remainder += int(delta)
+            wheel_steps = math.trunc(
+                self._object_scale_wheel_delta_remainder
+                / MOUSE_WHEEL_DELTA_PER_STEP
+            )
+            if wheel_steps:
+                self._object_scale_wheel_delta_remainder -= (
+                    wheel_steps * MOUSE_WHEEL_DELTA_PER_STEP
+                )
+                self.object_scale_wheel_steps_requested.emit(wheel_steps)
             event.accept()
             return
 
@@ -2725,6 +2767,7 @@ class GlbViewerWidget(QWidget):
     canvas_surface_face_deletion_requested = Signal(object)
     placed_object_removal_requested = Signal(str)
     placed_object_transform_changed = Signal(str, object, object)
+    placed_object_scales_changed = Signal(object)
     placed_object_selection_changed = Signal(object)
     placed_object_selection_set_changed = Signal(object)
     object_placement_selected = Signal(str, object)
@@ -2888,6 +2931,15 @@ class GlbViewerWidget(QWidget):
         ] = []
         self._canvas_surface_focus_type: str | None = None
         self._canvas_ceiling_hidden = False
+        self._ignore_top_down_ceiling = False
+        self._canvas_scene_levels: tuple[tuple[int, str], ...] = ()
+        self._canvas_scene_level_indices: frozenset[int] = frozenset()
+        self._visible_canvas_level_indices: frozenset[int] = frozenset()
+        self._placed_object_level_indices: dict[str, int] = {}
+        self._canvas_scene_level_meshes: dict[
+            int,
+            tuple[_CanvasSceneLevelMesh, ...],
+        ] = {}
         self._canvas_rectangle_selection_press_position: QPointF | None = None
         self._canvas_rectangle_selection_additive = False
         self._canvas_rectangle_selection_rubber_band: QRubberBand | None = None
@@ -2910,8 +2962,8 @@ class GlbViewerWidget(QWidget):
         self.add_window_button: QPushButton | None = None
         self.undo_window_button: QPushButton | None = None
         self.add_surface_vertex_button: QPushButton | None = None
+        self.canvas_level_visibility_list: QListWidget | None = None
         self.highlight_floor_button: QPushButton | None = None
-        self.highlight_ceiling_button: QPushButton | None = None
         self.hide_ceiling_button: QPushButton | None = None
         self._texture_edit_mask: np.ndarray | None = None
         self._symmetric_preview_orientation: str | None = None
@@ -3077,7 +3129,9 @@ class GlbViewerWidget(QWidget):
         )
         self.view.delete_requested.connect(self._handle_view_delete_requested)
         self.view.undo_requested.connect(self._forward_undo_request)
-        self.view.navigation_mode_changed.connect(self.navigation_mode_changed.emit)
+        self.view.navigation_mode_changed.connect(
+            self._handle_view_navigation_mode_changed
+        )
         self.view.first_person_active_changed.connect(
             self.first_person_active_changed.emit
         )
@@ -3092,6 +3146,9 @@ class GlbViewerWidget(QWidget):
         )
         self.view.overlay_wheel_steps_requested.connect(
             self._handle_projection_camera_wheel_steps_requested
+        )
+        self.view.object_scale_wheel_steps_requested.connect(
+            self._handle_placed_object_scale_wheel_steps_requested
         )
         layout.addWidget(self.view)
 
@@ -3172,6 +3229,23 @@ class GlbViewerWidget(QWidget):
         visibility_title_label.setObjectName("canvas-scene-visibility-title")
         panel_layout.addWidget(visibility_title_label)
 
+        self.canvas_level_visibility_list = QListWidget()
+        self.canvas_level_visibility_list.setObjectName(
+            "canvas-level-visibility-list"
+        )
+        self.canvas_level_visibility_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self.canvas_level_visibility_list.setMinimumHeight(72)
+        self.canvas_level_visibility_list.setMaximumHeight(132)
+        self.canvas_level_visibility_list.setToolTip(
+            "Selected levels are visible. Hold Shift to select multiple levels."
+        )
+        self.canvas_level_visibility_list.itemSelectionChanged.connect(
+            self._handle_canvas_level_visibility_selection_changed
+        )
+        panel_layout.addWidget(self.canvas_level_visibility_list)
+
         self.highlight_floor_button = QPushButton("Highlight floor")
         self.highlight_floor_button.setObjectName(
             "canvas-highlight-floor-button"
@@ -3184,19 +3258,6 @@ class GlbViewerWidget(QWidget):
             self._handle_highlight_floor_toggled
         )
         panel_layout.addWidget(self.highlight_floor_button)
-
-        self.highlight_ceiling_button = QPushButton("Highlight ceiling")
-        self.highlight_ceiling_button.setObjectName(
-            "canvas-highlight-ceiling-button"
-        )
-        self.highlight_ceiling_button.setCheckable(True)
-        self.highlight_ceiling_button.setToolTip(
-            "Show only ceiling surfaces in the 3D view."
-        )
-        self.highlight_ceiling_button.toggled.connect(
-            self._handle_highlight_ceiling_toggled
-        )
-        panel_layout.addWidget(self.highlight_ceiling_button)
 
         self.hide_ceiling_button = QPushButton("Hide ceiling")
         self.hide_ceiling_button.setObjectName("canvas-hide-ceiling-button")
@@ -3250,8 +3311,149 @@ class GlbViewerWidget(QWidget):
         return panel
 
     # ### Canvas scene visibility API ###
+    def set_canvas_scene_levels(
+        self,
+        levels: Sequence[tuple[int, str]],
+        *,
+        placed_object_levels: Mapping[str, int] | None = None,
+        reset_visibility: bool = False,
+    ) -> bool:
+        """Install the level selector without coupling it to GLB inclusion."""
+
+        if isinstance(levels, (str, bytes, bytearray)) or not isinstance(
+            levels,
+            Sequence,
+        ):
+            raise TypeError("Canvas scene levels must be supplied as a sequence.")
+        normalized_levels: list[tuple[int, str]] = []
+        occupied_indices: set[int] = set()
+        for raw_level in levels:
+            if not isinstance(raw_level, tuple) or len(raw_level) != 2:
+                raise TypeError(
+                    "Each Canvas scene level must contain an index and name."
+                )
+            raw_index, raw_name = raw_level
+            if (
+                isinstance(raw_index, bool)
+                or not isinstance(raw_index, int)
+                or raw_index < 0
+            ):
+                raise ValueError(
+                    "Canvas scene level indices must be non-negative integers."
+                )
+            name = str(raw_name).strip()
+            if not name:
+                raise ValueError("Canvas scene level names cannot be empty.")
+            if raw_index in occupied_indices:
+                raise ValueError(
+                    f"Duplicate Canvas scene level index: {raw_index}."
+                )
+            occupied_indices.add(raw_index)
+            normalized_levels.append((raw_index, name))
+
+        normalized_object_levels: dict[str, int] = {}
+        if placed_object_levels is not None:
+            if not isinstance(placed_object_levels, Mapping):
+                raise TypeError(
+                    "Placed-object levels must be supplied as a mapping."
+                )
+            for raw_object_id, raw_index in placed_object_levels.items():
+                object_id = str(raw_object_id).strip()
+                if not object_id:
+                    raise ValueError("Placed-object IDs cannot be empty.")
+                if (
+                    isinstance(raw_index, bool)
+                    or not isinstance(raw_index, int)
+                    or raw_index < 0
+                ):
+                    raise ValueError(
+                        "Placed-object level indices must be non-negative integers."
+                    )
+                normalized_object_levels[object_id] = raw_index
+
+        next_levels = tuple(normalized_levels)
+        previous_level_indices = {
+            index for index, _name in self._canvas_scene_levels
+        }
+        previous_hidden_indices = (
+            previous_level_indices - set(self._visible_canvas_level_indices)
+        )
+        next_level_indices = {index for index, _name in next_levels}
+        if reset_visibility or not self._canvas_scene_levels:
+            next_visible_indices = frozenset(next_level_indices)
+        else:
+            next_visible_indices = frozenset(
+                (
+                    set(self._visible_canvas_level_indices)
+                    & next_level_indices
+                )
+                | (next_level_indices - previous_level_indices)
+            )
+
+        levels_changed = next_levels != self._canvas_scene_levels
+        visibility_changed = (
+            next_visible_indices != self._visible_canvas_level_indices
+        )
+        visibility_filter_changed = previous_hidden_indices != (
+            next_level_indices - set(next_visible_indices)
+        )
+        object_levels_changed = (
+            normalized_object_levels != self._placed_object_level_indices
+        )
+        self._canvas_scene_levels = next_levels
+        self._canvas_scene_level_indices = frozenset(next_level_indices)
+        self._visible_canvas_level_indices = next_visible_indices
+        self._placed_object_level_indices = normalized_object_levels
+        self._rebuild_canvas_scene_level_mesh_cache()
+        self._sync_canvas_level_visibility_list()
+        if not visibility_filter_changed and not object_levels_changed:
+            return levels_changed or visibility_changed
+        self._apply_canvas_scene_visibility_change()
+        return True
+
+    def get_visible_canvas_level_indices(self) -> tuple[int, ...]:
+        """Return visible level indices in their displayed list order."""
+
+        return tuple(
+            level_index
+            for level_index, _name in self._canvas_scene_levels
+            if level_index in self._visible_canvas_level_indices
+        )
+
+    def set_visible_canvas_level_indices(
+        self,
+        level_indices: Sequence[int],
+    ) -> bool:
+        """Show only the supplied entries from the Canvas level list."""
+
+        if isinstance(level_indices, (str, bytes, bytearray)) or not isinstance(
+            level_indices,
+            Sequence,
+        ):
+            raise TypeError("Visible Canvas levels must be supplied as a sequence.")
+        normalized_indices: set[int] = set()
+        for raw_index in level_indices:
+            if isinstance(raw_index, bool) or not isinstance(raw_index, int):
+                raise TypeError("Visible Canvas level indices must be integers.")
+            normalized_indices.add(raw_index)
+        unknown_indices = normalized_indices - self._canvas_scene_level_indices
+        if unknown_indices:
+            raise ValueError(
+                "Unknown Canvas scene level indices: "
+                + ", ".join(str(index) for index in sorted(unknown_indices))
+                + "."
+            )
+        next_indices = frozenset(normalized_indices)
+        if next_indices == self._visible_canvas_level_indices:
+            self._sync_canvas_level_visibility_list()
+            return False
+        self._visible_canvas_level_indices = next_indices
+        self._sync_canvas_level_visibility_list()
+        self._apply_canvas_scene_visibility_change()
+        return True
+
     def get_canvas_surface_focus_type(self) -> str | None:
-        """Return the isolated floor/ceiling type, or ``None``."""
+        """Return whether floor-only focus is active."""
 
         return self._canvas_surface_focus_type
 
@@ -3262,7 +3464,7 @@ class GlbViewerWidget(QWidget):
             None if surface_type is None else str(surface_type).strip().lower()
         )
         if normalized_type not in {None, *CANVAS_SCENE_FOCUS_TYPES}:
-            raise ValueError("Canvas focus must be floor, ceiling, or None.")
+            raise ValueError("Canvas focus must be floor or None.")
         if normalized_type == self._canvas_surface_focus_type:
             self._sync_canvas_scene_visibility_controls()
             return False
@@ -3275,7 +3477,7 @@ class GlbViewerWidget(QWidget):
         return True
 
     def get_canvas_ceiling_hidden(self) -> bool:
-        """Return whether ceilings are hidden outside ceiling focus mode."""
+        """Return whether the manual Hide ceiling control is active."""
 
         return self._canvas_ceiling_hidden
 
@@ -3294,6 +3496,21 @@ class GlbViewerWidget(QWidget):
         self._repopulate_canvas_scene_preserving_camera()
         return True
 
+    def get_ignore_top_down_ceiling(self) -> bool:
+        """Return whether orbit navigation automatically ignores ceilings."""
+
+        return self._ignore_top_down_ceiling
+
+    def set_ignore_top_down_ceiling(self, enabled: bool) -> bool:
+        """Hide and exclude ceilings while orbit navigation is active."""
+
+        normalized_enabled = bool(enabled)
+        if normalized_enabled == self._ignore_top_down_ceiling:
+            return False
+        self._ignore_top_down_ceiling = normalized_enabled
+        self._apply_canvas_scene_visibility_change()
+        return True
+
     def get_visible_canvas_surface_ids(self) -> tuple[str, ...]:
         """Return semantic surfaces eligible for rendering and selection."""
 
@@ -3310,7 +3527,9 @@ class GlbViewerWidget(QWidget):
             return ()
         return tuple(
             dict.fromkeys(
-                preview.object_id for preview in self.model.preview_placed_objects
+                preview.object_id
+                for preview in self.model.preview_placed_objects
+                if self._canvas_placed_object_is_visible(preview.object_id)
             )
         )
 
@@ -3354,20 +3573,44 @@ class GlbViewerWidget(QWidget):
         )
         self.set_canvas_surface_focus_type(next_type)
 
-    def _handle_highlight_ceiling_toggled(self, checked: bool) -> None:
-        next_type = (
-            SURFACE_TYPE_CEILING
-            if checked
-            else (
-                None
-                if self._canvas_surface_focus_type == SURFACE_TYPE_CEILING
-                else self._canvas_surface_focus_type
-            )
-        )
-        self.set_canvas_surface_focus_type(next_type)
-
     def _handle_hide_ceiling_toggled(self, checked: bool) -> None:
         self.set_canvas_ceiling_hidden(checked)
+
+    def _handle_canvas_level_visibility_selection_changed(self) -> None:
+        level_list = self.canvas_level_visibility_list
+        if level_list is None:
+            return
+        selected_indices = tuple(
+            int(item.data(Qt.ItemDataRole.UserRole))
+            for item in level_list.selectedItems()
+        )
+        self.set_visible_canvas_level_indices(selected_indices)
+
+    def _handle_view_navigation_mode_changed(self, mode: str) -> None:
+        """Reevaluate orbit-only ceiling filtering before forwarding the mode."""
+
+        if self._window_editing_enabled and self._ignore_top_down_ceiling:
+            self._apply_canvas_scene_visibility_change()
+        self.navigation_mode_changed.emit(mode)
+
+    def _sync_canvas_level_visibility_list(self) -> None:
+        """Reflect retained level visibility without recursive selection events."""
+
+        level_list = self.canvas_level_visibility_list
+        if level_list is None:
+            return
+        previous_blocked = level_list.blockSignals(True)
+        try:
+            level_list.clear()
+            for level_index, level_name in self._canvas_scene_levels:
+                item = QListWidgetItem(level_name)
+                item.setData(Qt.ItemDataRole.UserRole, level_index)
+                level_list.addItem(item)
+                item.setSelected(
+                    level_index in self._visible_canvas_level_indices
+                )
+        finally:
+            level_list.blockSignals(previous_blocked)
 
     def _sync_canvas_scene_visibility_controls(self) -> None:
         """Reflect viewer-local filtering state without recursive toggles."""
@@ -3376,10 +3619,6 @@ class GlbViewerWidget(QWidget):
             (
                 self.highlight_floor_button,
                 self._canvas_surface_focus_type == SURFACE_TYPE_FLOOR,
-            ),
-            (
-                self.highlight_ceiling_button,
-                self._canvas_surface_focus_type == SURFACE_TYPE_CEILING,
             ),
             (self.hide_ceiling_button, self._canvas_ceiling_hidden),
         )
@@ -3391,7 +3630,9 @@ class GlbViewerWidget(QWidget):
             button.blockSignals(previous_blocked)
 
     def _canvas_surface_is_visible(self, surface: FixedSurface) -> bool:
-        return self._canvas_surface_type_is_visible(surface.surface_type)
+        return self._canvas_level_is_visible(
+            surface.level_index
+        ) and self._canvas_surface_type_is_visible(surface.surface_type)
 
     def _canvas_surface_type_is_visible(self, surface_type: str) -> bool:
         """Apply focus-first precedence to one semantic surface type."""
@@ -3401,9 +3642,74 @@ class GlbViewerWidget(QWidget):
         if focus_type is not None:
             return normalized_type == focus_type
         return not (
-            self._canvas_ceiling_hidden
+            self._canvas_ceiling_is_effectively_hidden()
             and normalized_type == SURFACE_TYPE_CEILING
         )
+
+    def _canvas_ceiling_is_effectively_hidden(self) -> bool:
+        return bool(
+            self._canvas_ceiling_hidden
+            or (
+                self._ignore_top_down_ceiling
+                and not self.is_first_person_active
+            )
+        )
+
+    def _canvas_level_is_visible(self, level_index: int | None) -> bool:
+        if level_index is None or not self._canvas_scene_level_indices:
+            return True
+        return bool(
+            level_index not in self._canvas_scene_level_indices
+            or level_index in self._visible_canvas_level_indices
+        )
+
+    def _rebuild_canvas_scene_level_mesh_cache(self) -> None:
+        """Group complete static scene primitives by their stable level prefix."""
+
+        self._canvas_scene_level_meshes = {}
+        if self.model is None or not isinstance(self.model.scene, trimesh.Scene):
+            return
+        prefixes = sorted(
+            (
+                (
+                    level_index,
+                    level_name.casefold().replace(" ", "_"),
+                )
+                for level_index, level_name in self._canvas_scene_levels
+            ),
+            key=lambda entry: len(entry[1]),
+            reverse=True,
+        )
+        meshes_by_level: dict[int, list[_CanvasSceneLevelMesh]] = {}
+        for node_name in self.model.scene.graph.nodes_geometry:
+            normalized_node_name = str(node_name).casefold()
+            level_index = next(
+                (
+                    candidate_index
+                    for candidate_index, prefix in prefixes
+                    if normalized_node_name == prefix
+                    or normalized_node_name.startswith(f"{prefix}_")
+                ),
+                None,
+            )
+            if level_index is None:
+                continue
+            node_transform, geometry_name = self.model.scene.graph.get(node_name)
+            source_mesh = self.model.scene.geometry.get(geometry_name)
+            if not isinstance(source_mesh, trimesh.Trimesh):
+                continue
+            mesh = source_mesh.copy()
+            mesh.apply_transform(
+                GLTF_Y_UP_TO_Z_UP_TRANSFORM
+                @ np.asarray(node_transform, dtype=float)
+            )
+            meshes_by_level.setdefault(level_index, []).append(
+                _CanvasSceneLevelMesh(mesh=mesh)
+            )
+        self._canvas_scene_level_meshes = {
+            level_index: tuple(meshes)
+            for level_index, meshes in meshes_by_level.items()
+        }
 
     def _canvas_source_surface_id_is_visible(self, surface_id: str) -> bool:
         """Resolve authored drawing overlays through their source surface."""
@@ -3421,6 +3727,21 @@ class GlbViewerWidget(QWidget):
 
     def _canvas_objects_are_visible(self) -> bool:
         return self._canvas_surface_focus_type is None
+
+    def _canvas_placed_object_is_visible(self, object_id: str) -> bool:
+        if not self._canvas_objects_are_visible():
+            return False
+        return self._canvas_level_is_visible(
+            self._placed_object_level_indices.get(str(object_id))
+        )
+
+    def _apply_canvas_scene_visibility_change(self) -> None:
+        """Cancel hidden edits, clear stale selection, and rebuild once."""
+
+        self._prepare_canvas_scene_visibility_change()
+        self._clear_hidden_canvas_scene_selection()
+        self._rebuild_level_transform_preview_source_positions()
+        self._repopulate_canvas_scene_preserving_camera()
 
     def _prepare_canvas_scene_visibility_change(self) -> None:
         """Cancel pointer-owned edits before their geometry becomes hidden."""
@@ -4246,6 +4567,8 @@ class GlbViewerWidget(QWidget):
                 if object_id in self._placed_object_render_groups
             )
         )
+        if normalized_ids:
+            self.set_selected_projection_camera_id(None)
         normalized_active_id = (
             None
             if active_object_id is None
@@ -4264,6 +4587,7 @@ class GlbViewerWidget(QWidget):
         if not selection_changed and not active_changed:
             return False
         self._cancel_placed_object_gizmo_drag()
+        self.view.set_object_scale_wheel_steps_enabled(False)
         self._selected_placed_object_ids = normalized_ids
         self._selected_placed_object_id = normalized_active_id
         self._sync_placed_object_selection_rendering()
@@ -6271,6 +6595,7 @@ class GlbViewerWidget(QWidget):
         )
         self._texture_edit_mask = None
         self.model = model
+        self._rebuild_canvas_scene_level_mesh_cache()
         self._populate_scene()
         if camera_state is not None:
             self._restore_camera_state(camera_state)
@@ -6307,6 +6632,7 @@ class GlbViewerWidget(QWidget):
         self._clear_symmetric_preview()
         self._last_set_model_preserved_camera = False
         self.model = None
+        self._canvas_scene_level_meshes = {}
         self._populate_scene()
         if self._window_editing_enabled:
             self._sync_window_tools_controls()
@@ -7292,6 +7618,8 @@ class GlbViewerWidget(QWidget):
                 raise ValueError("Unknown projection camera ID.")
         if normalized_id == self._selected_projection_camera_id:
             return False
+        if normalized_id is not None and self._placed_object_editing_enabled:
+            self._set_selected_placed_object(None)
         # A partial high-resolution wheel gesture belongs to the camera that
         # was selected when it began.  Disable routing before changing IDs so
         # that its sub-tick remainder cannot leak into the next camera.
@@ -7635,7 +7963,7 @@ class GlbViewerWidget(QWidget):
             focused_meshes = [
                 surface.mesh.copy()
                 for surface in self._canvas_surface_targets.values()
-                if surface.surface_type == focus_type
+                if self._canvas_surface_is_visible(surface)
                 and surface.surface_id not in textured_surface_ids
             ]
             if not focused_meshes:
@@ -7645,13 +7973,22 @@ class GlbViewerWidget(QWidget):
                     process=False,
                 )
             return trimesh.util.concatenate(focused_meshes)
-        if self._canvas_ceiling_hidden:
-            hidden_surfaces = (
-                surface
-                for surface in self._canvas_surface_targets.values()
-                if surface.surface_type == SURFACE_TYPE_CEILING
+        hidden_surfaces = tuple(
+            surface
+            for surface in self._canvas_surface_targets.values()
+            if not self._canvas_surface_is_visible(surface)
+        )
+        hidden_level_meshes = tuple(
+            mesh
+            for level_index in (
+                self._canvas_scene_level_indices
+                - self._visible_canvas_level_indices
             )
-            return remove_covered_surface_faces(display_mesh, hidden_surfaces)
+            for mesh in self._canvas_scene_level_meshes.get(level_index, ())
+        )
+        hidden_geometry = (*hidden_surfaces, *hidden_level_meshes)
+        if hidden_geometry:
+            return remove_covered_surface_faces(display_mesh, hidden_geometry)
         return display_mesh
 
     def _get_unfiltered_display_mesh(self):
@@ -7711,6 +8048,11 @@ class GlbViewerWidget(QWidget):
         }
         for textured_wall in self.model.preview_textured_walls:
             if (
+                self._window_editing_enabled
+                and not self._canvas_level_is_visible(textured_wall.level_index)
+            ):
+                continue
+            if (
                 textured_wall.level_index,
                 textured_wall.room_index,
                 textured_wall.wall_key,
@@ -7728,8 +8070,13 @@ class GlbViewerWidget(QWidget):
         for textured_surface in self.model.preview_textured_surfaces:
             if (
                 self._window_editing_enabled
-                and not self._canvas_surface_type_is_visible(
-                    textured_surface.surface_type
+                and (
+                    not self._canvas_level_is_visible(
+                        textured_surface.level_index
+                    )
+                    or not self._canvas_surface_type_is_visible(
+                        textured_surface.surface_type
+                    )
                 )
             ):
                 continue
@@ -7760,6 +8107,8 @@ class GlbViewerWidget(QWidget):
             return
         has_symmetric_preview = False
         for preview in self.model.preview_placed_objects:
+            if not self._canvas_placed_object_is_visible(preview.object_id):
+                continue
             if preview.object_id in self._placed_object_render_groups:
                 continue
             root_item = GLGraphicsItem()
@@ -9046,6 +9395,7 @@ class GlbViewerWidget(QWidget):
         for object_id, group in self._placed_object_render_groups.items():
             group.selection_item.setVisible(object_id in selected_id_set)
         self._remove_transform_gizmo_items()
+        self._sync_placed_object_scale_input_state()
         if (
             selected_id is not None
             and self._level_transform_preview_level_index is not None
@@ -9070,9 +9420,81 @@ class GlbViewerWidget(QWidget):
         )
         if self.object_transform_status_label is not None:
             self.object_transform_status_label.setText(
-                "Drag an RGB arrow to move, or an RGB ring to rotate."
+                "Drag an RGB arrow to move, an RGB ring to rotate, or use "
+                "the wheel to scale."
             )
         self.view.update()
+
+    def _sync_placed_object_scale_input_state(self) -> None:
+        """Reserve wheel navigation only while selected objects can be scaled."""
+
+        self.view.set_object_scale_wheel_steps_enabled(
+            bool(
+                self._placed_object_editing_enabled
+                and self._selected_placed_object_ids
+                and self._level_transform_preview_level_index is None
+                and self._placed_object_transform_drag is None
+                and not self.is_object_placement_active
+            )
+        )
+
+    @Slot(int)
+    def _handle_placed_object_scale_wheel_steps_requested(
+        self,
+        steps: int,
+    ) -> None:
+        """Uniformly scale every selected placed object around its floor anchor."""
+
+        normalized_steps = int(steps)
+        if normalized_steps == 0 or self._placed_object_transform_drag is not None:
+            return
+        requested_factor = PLACED_OBJECT_SCALE_FACTOR_PER_WHEEL_STEP ** (
+            normalized_steps
+        )
+        updated_scales: list[tuple[str, float]] = []
+        updated_previews: dict[str, PreviewPlacedObject] = {}
+        for object_id in self._selected_placed_object_ids:
+            group = self._placed_object_render_groups.get(object_id)
+            if group is None:
+                continue
+            previous_scale = float(group.preview.scale)
+            next_scale = min(
+                PLACED_OBJECT_MAX_SCALE,
+                max(PLACED_OBJECT_MIN_SCALE, previous_scale * requested_factor),
+            )
+            if math.isclose(next_scale, previous_scale, rel_tol=1e-12, abs_tol=0.0):
+                continue
+            scale_ratio = next_scale / previous_scale
+            next_transform = _build_uniform_scale_about_point(
+                group.current_transform,
+                group.preview.world_position,
+                scale_ratio,
+            )
+            next_preview = replace(
+                group.preview,
+                placement_transform=next_transform,
+                scale=next_scale,
+            )
+            group.preview = next_preview
+            group.current_transform = np.asarray(
+                next_preview.placement_transform,
+                dtype=float,
+            ).copy()
+            group.root_item.setTransform(
+                _numpy_transform_to_qt(group.current_transform)
+            )
+            updated_scales.append((object_id, next_scale))
+            updated_previews[object_id] = next_preview
+
+        if not updated_scales:
+            return
+        if self.model is not None:
+            self.model.preview_placed_objects = [
+                updated_previews.get(candidate.object_id, candidate)
+                for candidate in self.model.preview_placed_objects
+            ]
+        self._sync_placed_object_selection_rendering()
+        self.placed_object_scales_changed.emit(tuple(updated_scales))
 
     def _build_transform_gizmo_items(
         self,
@@ -9294,6 +9716,7 @@ class GlbViewerWidget(QWidget):
             preview_world_position=group.preview.world_position,
             preview_rotation_degrees=group.preview.rotation_degrees,
         )
+        self._sync_placed_object_scale_input_state()
         self.view.reserve_primary_pointer_drag()
         if self.object_transform_status_label is not None:
             action = (
@@ -9350,12 +9773,15 @@ class GlbViewerWidget(QWidget):
                 math.radians(drag.accumulated_rotation_degrees),
                 drag.axis,
             )[:3, :3]
-            world_rotation = delta_rotation @ drag.start_transform[:3, :3]
-            rotation_degrees = _rotation_matrix_to_degrees(world_rotation)
+            scale = float(group.preview.scale)
+            world_orientation = (
+                delta_rotation @ drag.start_transform[:3, :3] / scale
+            )
+            rotation_degrees = _rotation_matrix_to_degrees(world_orientation)
             world_position = drag.start_world_position
             transform = _build_pivoted_world_transform(
                 world_position,
-                world_rotation,
+                world_orientation * scale,
                 drag.local_pivot,
             )
 
@@ -12624,6 +13050,34 @@ def _transform_point(transform: object, point: object) -> np.ndarray:
     if abs(float(transformed[3])) <= 1e-12:
         raise ValueError("A transformed point cannot have a zero homogeneous W.")
     return np.asarray(transformed[:3] / transformed[3], dtype=float)
+
+
+def _build_uniform_scale_about_point(
+    transform: object,
+    world_point: object,
+    scale_ratio: float,
+) -> np.ndarray:
+    """Scale one existing world transform around a stable world-space point."""
+
+    matrix = np.asarray(transform, dtype=float)
+    point = np.asarray(world_point, dtype=float)
+    ratio = float(scale_ratio)
+    if (
+        matrix.shape != (4, 4)
+        or point.shape != (3,)
+        or not np.all(np.isfinite(matrix))
+        or not np.all(np.isfinite(point))
+        or not math.isfinite(ratio)
+        or ratio <= 0.0
+    ):
+        raise ValueError("Uniform object scaling requires finite positive values.")
+    move_to_origin = np.eye(4, dtype=float)
+    move_to_origin[:3, 3] = -point
+    scale = np.eye(4, dtype=float)
+    scale[:3, :3] *= ratio
+    move_back = np.eye(4, dtype=float)
+    move_back[:3, 3] = point
+    return move_back @ scale @ move_to_origin @ matrix
 
 
 def _get_render_group_world_pivot(

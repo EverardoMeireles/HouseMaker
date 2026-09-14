@@ -196,6 +196,7 @@ class PlacedGeneratedModel:
     symmetric_preview_plane_coordinate: float | None = None
     rotation_degrees: tuple[float, float, float] = (0.0, 0.0, 0.0)
     object_name: str | None = None
+    scale: float = 1.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.object_id, str):
@@ -226,6 +227,7 @@ class PlacedGeneratedModel:
         object.__setattr__(self, "object_name", normalized_object_name)
         object.__setattr__(self, "world_position", normalized_position)
         object.__setattr__(self, "rotation_degrees", normalized_rotation)
+        object.__setattr__(self, "scale", _normalize_placed_scale(self.scale))
         object.__setattr__(self, "symmetric_preview_orientation", orientation)
         object.__setattr__(
             self,
@@ -236,7 +238,7 @@ class PlacedGeneratedModel:
 
 @dataclass(frozen=True)
 class PreviewPlacedObject:
-    """Local preview meshes and the rigid transform for one Canvas object."""
+    """Local preview meshes and transform for one Canvas object."""
 
     object_id: str
     meshes: tuple[trimesh.Trimesh, ...]
@@ -245,6 +247,7 @@ class PreviewPlacedObject:
     rotation_degrees: tuple[float, float, float]
     symmetric_preview_orientation: str | None = None
     symmetric_preview_plane_coordinate: float | None = None
+    scale: float = 1.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.object_id, str) or not self.object_id.strip():
@@ -271,6 +274,7 @@ class PreviewPlacedObject:
             "rotation_degrees",
             _normalize_placed_rotation(self.rotation_degrees),
         )
+        object.__setattr__(self, "scale", _normalize_placed_scale(self.scale))
         object.__setattr__(self, "symmetric_preview_orientation", orientation)
         object.__setattr__(
             self,
@@ -1025,6 +1029,7 @@ def _compose_placed_generated_models(
                 placement_transform=placement_transform,
                 world_position=placement.world_position,
                 rotation_degrees=placement.rotation_degrees,
+                scale=placement.scale,
                 symmetric_preview_orientation=(
                     placement.symmetric_preview_orientation
                 ),
@@ -1130,6 +1135,22 @@ def _normalize_placed_world_position(
     return coordinates[0], coordinates[1], coordinates[2]
 
 
+def _normalize_placed_scale(raw_scale: object) -> float:
+    """Return one finite positive uniform placed-object scale."""
+
+    if isinstance(raw_scale, bool):
+        raise TypeError("Placed generated-object scales must be numbers.")
+    try:
+        scale = float(raw_scale)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise TypeError("Placed generated-object scales must be numbers.") from error
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError(
+            "Placed generated-object scales must be finite and greater than zero."
+        )
+    return scale
+
+
 def _normalize_symmetric_preview(
     raw_orientation: object,
     raw_plane_coordinate: object,
@@ -1226,12 +1247,14 @@ def _build_placed_model_transform(
     )
     move_pivot_to_origin = np.eye(4, dtype=float)
     move_pivot_to_origin[:3, 3] = -bottom_center
+    uniform_scale = np.eye(4, dtype=float)
+    uniform_scale[:3, :3] *= placement.scale
     move_to_world = np.eye(4, dtype=float)
     move_to_world[:3, 3] = np.asarray(
         placement.world_position,
         dtype=float,
     )
-    return move_to_world @ rotation @ move_pivot_to_origin
+    return move_to_world @ rotation @ uniform_scale @ move_pivot_to_origin
 
 
 def _build_half_mesh_node_metadata(

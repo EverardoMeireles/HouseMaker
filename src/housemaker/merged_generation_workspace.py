@@ -11,6 +11,7 @@ from PySide6.QtGui import QColor, QPainter, QPaintEvent, QPen
 from PySide6.QtWidgets import (
     QFileDialog,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QMessageBox,
@@ -263,9 +264,9 @@ class MergedGenerationWorkspace(QWidget):
             )
         )
         self.views_splitter.addWidget(self.object_workspace.object_3d_page)
-        self.views_splitter.setStretchFactor(0, 4)
+        self.views_splitter.setStretchFactor(0, 1)
         self.views_splitter.setStretchFactor(1, 1)
-        self.views_splitter.setSizes([4_000, 1_000])
+        self.views_splitter.setSizes([1_000, 1_000])
         root_layout.addWidget(self.views_splitter, 1)
         root_layout.addWidget(self.seekbar)
 
@@ -326,9 +327,14 @@ class MergedGenerationWorkspace(QWidget):
             "merged_generation_shared_primary_column"
         )
         shared_layout.addWidget(self.load_video_button)
-        shared_layout.addWidget(self.pbr_map_control)
         self.clear_mask_button.setText("Clear mask")
         shared_layout.addWidget(self.mask_mode_control)
+
+        self.shared_material_section, material_layout = _build_boxed_section(
+            "Material generation",
+            "merged_generation_shared_material_section",
+        )
+        material_layout.addWidget(self.pbr_map_control)
 
         self.ai_prompt_edit.setObjectName("generation_ai_prompt_edit")
         self.ai_prompt_edit.setPlaceholderText("AI prompt (optional)")
@@ -339,7 +345,7 @@ class MergedGenerationWorkspace(QWidget):
             "texturing. Staged unused-face removal and later Object "
             "Retexture jobs keep the painted image as their sole style source."
         )
-        shared_layout.addWidget(
+        material_layout.addWidget(
             _build_labeled_inline_control("AI prompt", self.ai_prompt_edit)
         )
 
@@ -348,7 +354,8 @@ class MergedGenerationWorkspace(QWidget):
         self.cancel_button.setToolTip(
             "Cancel the newest active Surface or Object generation job."
         )
-        shared_layout.addWidget(self.cancel_button)
+        material_layout.addWidget(self.cancel_button)
+        shared_layout.addWidget(self.shared_material_section)
         shared_layout.addStretch(1)
 
         layout.addWidget(shared_column, 0, 0)
@@ -365,7 +372,6 @@ class MergedGenerationWorkspace(QWidget):
         primary_column, primary_layout = _build_controls_column(
             "merged_generation_object_primary_column"
         )
-        primary_layout.addWidget(objects.meshy_target_polycount_control)
 
         preview_options = QWidget()
         preview_options.setObjectName("merged_generation_object_preview_options")
@@ -375,8 +381,6 @@ class MergedGenerationWorkspace(QWidget):
         preview_options_layout.addWidget(objects.textures_checkbox)
         preview_options_layout.addWidget(objects.wireframe_checkbox)
         preview_options_layout.addStretch(1)
-        primary_layout.addWidget(preview_options)
-        primary_layout.addWidget(objects.symmetric_division_checkbox)
 
         details_layout = objects.object_3d_panel.details_panel.layout()
         relocated_detail_widgets = (
@@ -388,8 +392,39 @@ class MergedGenerationWorkspace(QWidget):
         if details_layout is not None:
             for widget in relocated_detail_widgets:
                 details_layout.removeWidget(widget)
-        primary_layout.addWidget(objects.delete_selected_faces_button)
-        primary_layout.addWidget(objects.convert_faces_to_glass_button)
+
+        self.object_editing_section, editing_layout = _build_boxed_section(
+            "Object editing",
+            "merged_generation_object_editing_section",
+        )
+        editing_layout.addWidget(preview_options)
+
+        face_actions = QWidget()
+        face_actions.setObjectName("merged_generation_object_face_actions")
+        face_actions_layout = QHBoxLayout(face_actions)
+        face_actions_layout.setContentsMargins(0, 0, 0, 0)
+        face_actions_layout.setSpacing(6)
+        face_actions_layout.addWidget(objects.delete_selected_faces_button, 1)
+        face_actions_layout.addWidget(objects.convert_faces_to_glass_button, 1)
+        editing_layout.addWidget(face_actions)
+        primary_layout.addWidget(self.object_editing_section)
+
+        self.object_creation_section, creation_layout = _build_boxed_section(
+            "Generation",
+            "merged_generation_object_creation_section",
+        )
+
+        generation_settings = QWidget()
+        generation_settings.setObjectName(
+            "merged_generation_object_generation_settings"
+        )
+        generation_settings_layout = QHBoxLayout(generation_settings)
+        generation_settings_layout.setContentsMargins(0, 0, 0, 0)
+        generation_settings_layout.setSpacing(6)
+        generation_settings_layout.addWidget(objects.symmetric_division_checkbox)
+        generation_settings_layout.addStretch(1)
+        generation_settings_layout.addWidget(objects.meshy_target_polycount_control)
+        creation_layout.addWidget(generation_settings)
 
         primary_actions = QWidget()
         primary_actions.setObjectName("merged_generation_primary_object_actions")
@@ -398,16 +433,22 @@ class MergedGenerationWorkspace(QWidget):
         primary_actions_layout.setSpacing(0)
         primary_actions_layout.addWidget(objects.generate_geometry_button)
         primary_actions_layout.addWidget(objects.generate_texture_button)
-        primary_layout.addWidget(primary_actions)
-        primary_layout.addWidget(objects.generate_button)
+        creation_layout.addWidget(primary_actions)
+
+        generation_actions = QWidget()
+        generation_actions.setObjectName("merged_generation_object_generation_actions")
+        generation_actions_layout = QHBoxLayout(generation_actions)
+        generation_actions_layout.setContentsMargins(0, 0, 0, 0)
+        generation_actions_layout.setSpacing(6)
+        generation_actions_layout.addWidget(objects.generate_button, 1)
         self.place_object_button = objects.place_button
-        primary_layout.addWidget(self.place_object_button)
+        generation_actions_layout.addWidget(self.place_object_button, 1)
+        creation_layout.addWidget(generation_actions)
+        primary_layout.addWidget(self.object_creation_section)
         primary_layout.addWidget(objects.model_statistics_label)
         primary_layout.addStretch(1)
 
-        projection_controls = (
-            objects.object_3d_panel.projection_camera_controls
-        )
+        projection_controls = objects.object_3d_panel.projection_camera_controls
         projection_controls.setMinimumWidth(0)
         projection_controls.setSizePolicy(
             QSizePolicy.Policy.Expanding,
@@ -611,6 +652,18 @@ def _build_controls_column(object_name: str) -> tuple[QWidget, QVBoxLayout]:
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(5)
     return column, layout
+
+
+def _build_boxed_section(
+    title: str,
+    object_name: str,
+) -> tuple[QGroupBox, QVBoxLayout]:
+    section = QGroupBox(title)
+    section.setObjectName(object_name)
+    layout = QVBoxLayout(section)
+    layout.setContentsMargins(7, 7, 7, 7)
+    layout.setSpacing(5)
+    return section, layout
 
 
 def _build_labeled_inline_control(label: str, control: QWidget) -> QWidget:

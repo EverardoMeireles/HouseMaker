@@ -520,6 +520,37 @@ class PlacedGeneratedModelCompositionTests(unittest.TestCase):
             atol=1e-7,
         )
 
+    def test_uniform_scale_keeps_the_source_bottom_center_on_the_world_anchor(
+        self,
+    ) -> None:
+        base_model = _base_box_model()
+        object_mesh = trimesh.creation.box(extents=(2.0, 4.0, 2.0))
+        object_mesh.apply_translation((4.0, -2.0, 1.0))
+        object_model = _single_mesh_model(object_mesh)
+
+        composed = compose_placed_generated_models(
+            base_model,
+            [
+                PlacedGeneratedModel(
+                    object_id="scaled-chair",
+                    model=object_model,
+                    world_position=(10.0, 20.0, 30.0),
+                    rotation_degrees=(0.0, 0.0, 90.0),
+                    scale=2.0,
+                )
+            ],
+        )
+
+        placed_mesh = _placed_world_mesh(composed.scene)
+        np.testing.assert_allclose(
+            placed_mesh.bounds,
+            ((6.0, 18.0, 30.0), (14.0, 22.0, 34.0)),
+            atol=1e-7,
+        )
+        preview = composed.preview_placed_objects[0]
+        self.assertEqual(preview.scale, 2.0)
+        np.testing.assert_allclose(preview.world_position, (10.0, 20.0, 30.0))
+
     def test_symmetric_placement_adds_only_a_world_space_preview_mirror(
         self,
     ) -> None:
@@ -1126,6 +1157,18 @@ class PlacedGeneratedModelCompositionTests(unittest.TestCase):
                     object_model,
                     (0.0, 0.0, 0.0),
                     rotation_degrees=invalid_rotation,
+                )
+
+        for invalid_scale in (True, "large", 0.0, -1.0, math.nan, math.inf):
+            with (
+                self.subTest(invalid_scale=invalid_scale),
+                self.assertRaises((TypeError, ValueError)),
+            ):
+                PlacedGeneratedModel(
+                    "id",
+                    object_model,
+                    (0.0, 0.0, 0.0),
+                    scale=invalid_scale,
                 )
 
         with self.assertRaises(ValueError):

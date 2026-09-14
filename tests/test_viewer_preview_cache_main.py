@@ -636,6 +636,40 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
         show_warning.assert_called_once()
         self.assertFalse(export_path.exists())
 
+    def test_export_model_does_not_replace_independently_filtered_preview(
+        self,
+    ) -> None:
+        export_model = _preview_model("export-only-levels")
+        export_path = Path(self._temporary_directory.name) / "scene.glb"
+
+        with (
+            patch.object(
+                self.workspace,
+                "_show_unpacked_scene_texture_export_error",
+                return_value=False,
+            ),
+            patch(
+                "housemaker.main.QFileDialog.getSaveFileName",
+                return_value=(str(export_path), "GLB Files (*.glb)"),
+            ),
+            patch.object(
+                self.workspace,
+                "_build_model_with_stable_dependencies",
+                return_value=(export_model, (("stable",),)),
+            ),
+            patch("housemaker.main.export_glb_file", return_value=export_path),
+            patch.object(
+                self.workspace,
+                "_ensure_viewer_preview_current",
+            ) as ensure_preview,
+            patch.object(self.workspace.viewer, "set_model") as set_model,
+            patch("housemaker.main.QMessageBox.information"),
+        ):
+            self.workspace._handle_glb_export_clicked()
+
+        set_model.assert_not_called()
+        ensure_preview.assert_called_once_with(preserve_camera=True)
+
     def test_reopening_detects_out_of_band_preview_asset_changes(self) -> None:
         first_model = _preview_model("dependency-before")
         second_model = _preview_model("dependency-after")

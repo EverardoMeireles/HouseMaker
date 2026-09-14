@@ -15,7 +15,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 # ### Imports ###
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt
+from PySide6.QtCore import QAbstractAnimation, QEvent, QPoint, QPointF, QRectF, Qt
 from PySide6.QtGui import (
     QColor,
     QDragEnterEvent,
@@ -54,6 +54,7 @@ from housemaker.texture_atlas_workspace import (
     ATLAS_MAP_NORMAL,
     ATLAS_MAP_ROUGHNESS,
     ATLAS_MAP_TYPES,
+    NEW_SOURCE_ATTENTION_COLOR,
     AtlasObjectTextureSource,
     AtlasSurfaceTextureEntry,
     TextureAtlasWorkspace,
@@ -645,6 +646,146 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             self.workspace.surface_list.item(0).text().startswith("[SURFACE] ")
         )
         self.assertIn("3 surfaces", self.workspace.surface_list.item(0).text())
+
+    def test_new_object_and_surface_sources_breathe_until_each_is_clicked(
+        self,
+    ) -> None:
+        object_source = _source(
+            "chair",
+            directory=self._temporary_directory.name,
+        )
+        surface_source = _wall_source(
+            "plaster",
+            directory=self._temporary_directory.name,
+        )
+        self.workspace.set_object_texture_sources((object_source, surface_source))
+        self.workspace.set_scene_bound_source_ids((object_source.object_id,))
+
+        self.workspace.mark_sources_new(
+            (object_source.object_id, surface_source.object_id)
+        )
+        self.workspace._apply_new_source_attention_strength(1.0)
+
+        object_item = self.workspace.object_list.item(0)
+        surface_item = self.workspace.surface_list.item(0)
+        self.assertEqual(object_item.background().color(), NEW_SOURCE_ATTENTION_COLOR)
+        self.assertEqual(surface_item.background().color(), NEW_SOURCE_ATTENTION_COLOR)
+        self.assertEqual(
+            object_item.foreground().color(),
+            texture_atlas_workspace_module.SCENE_BOUND_SOURCE_COLOR,
+        )
+        self.assertEqual(
+            self.workspace._new_source_attention_animation.state(),
+            QAbstractAnimation.State.Running,
+        )
+
+        self.workspace.object_list.setCurrentRow(0)
+        self.assertIn(
+            object_source.object_id,
+            self.workspace._new_source_attention_ids,
+        )
+
+        object_position = self.workspace.object_list.visualItemRect(
+            object_item
+        ).center()
+        QTest.mouseClick(
+            self.workspace.object_list.viewport(),
+            Qt.MouseButton.LeftButton,
+            pos=object_position,
+        )
+
+        self.assertNotIn(
+            object_source.object_id,
+            self.workspace._new_source_attention_ids,
+        )
+        self.assertEqual(
+            object_item.background().style(),
+            Qt.BrushStyle.NoBrush,
+        )
+        self.assertIn(
+            surface_source.object_id,
+            self.workspace._new_source_attention_ids,
+        )
+        self.assertNotEqual(
+            surface_item.background().style(),
+            Qt.BrushStyle.NoBrush,
+        )
+
+        surface_position = self.workspace.surface_list.visualItemRect(
+            surface_item
+        ).center()
+        QTest.mouseClick(
+            self.workspace.surface_list.viewport(),
+            Qt.MouseButton.RightButton,
+            pos=surface_position,
+        )
+
+        self.assertEqual(self.workspace._new_source_attention_ids, set())
+        self.assertEqual(
+            self.workspace._new_source_attention_animation.state(),
+            QAbstractAnimation.State.Stopped,
+        )
+        self.assertEqual(
+            surface_item.background().style(),
+            Qt.BrushStyle.NoBrush,
+        )
+
+    def test_new_source_attention_survives_refresh_and_pending_source_arrival(
+        self,
+    ) -> None:
+        source = _source(
+            "future-chair",
+            directory=self._temporary_directory.name,
+        )
+
+        self.workspace.mark_sources_new(("", source.object_id, source.object_id))
+
+        self.assertEqual(
+            self.workspace._new_source_attention_animation.state(),
+            QAbstractAnimation.State.Stopped,
+        )
+        self.workspace.set_object_texture_sources((source,))
+        self.workspace._apply_new_source_attention_strength(1.0)
+
+        self.assertEqual(
+            self.workspace.object_list.item(0).background().color(),
+            NEW_SOURCE_ATTENTION_COLOR,
+        )
+        self.workspace.set_scene_bound_source_ids((source.object_id,))
+
+        refreshed_item = self.workspace.object_list.item(0)
+        self.assertEqual(
+            refreshed_item.background().color(), NEW_SOURCE_ATTENTION_COLOR
+        )
+        self.assertIn(source.object_id, self.workspace._new_source_attention_ids)
+
+        self.workspace.set_object_texture_sources(())
+
+        self.assertEqual(self.workspace._new_source_attention_ids, set())
+        self.assertEqual(
+            self.workspace._new_source_attention_animation.state(),
+            QAbstractAnimation.State.Stopped,
+        )
+
+    def test_replacing_atlas_data_clears_new_source_attention(self) -> None:
+        source = _source(
+            "chair",
+            directory=self._temporary_directory.name,
+        )
+        self.workspace.set_object_texture_sources((source,))
+        self.workspace.mark_sources_new((source.object_id,))
+
+        self.workspace.set_data(TextureAtlasData())
+
+        self.assertEqual(self.workspace._new_source_attention_ids, set())
+        self.assertEqual(
+            self.workspace.object_list.item(0).background().style(),
+            Qt.BrushStyle.NoBrush,
+        )
+        self.assertEqual(
+            self.workspace._new_source_attention_animation.state(),
+            QAbstractAnimation.State.Stopped,
+        )
 
     def test_delete_object_button_sits_between_object_and_surface_lists(
         self,

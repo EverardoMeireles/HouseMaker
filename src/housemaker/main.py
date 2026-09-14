@@ -301,6 +301,7 @@ class _PlacedGeneratedModelFileSnapshot:
     asset_revision: tuple[str, int, int, int]
     world_position: tuple[float, float, float]
     rotation_degrees: tuple[float, float, float]
+    scale: float
     symmetric_preview_orientation: str | None = None
     symmetric_preview_plane_coordinate: float | None = None
 
@@ -542,6 +543,7 @@ def _build_surface_ao_pre_atlas_scene(
                     placed.symmetric_preview_plane_coordinate
                 ),
                 rotation_degrees=placed.rotation_degrees,
+                scale=placed.scale,
             )
         )
     if cancellation_check():
@@ -1381,6 +1383,9 @@ class BlueprintWorkspace(QWidget):
         self.viewer.set_first_person_movement_mode(
             generation_settings.first_person_navigation_mode
         )
+        self.viewer.set_ignore_top_down_ceiling(
+            generation_settings.ignore_top_down_ceiling
+        )
         self.canvas.set_snap_middle_equal_angle_only(
             generation_settings.snap_middle_equal_angle_only
         )
@@ -1409,6 +1414,12 @@ class BlueprintWorkspace(QWidget):
         )
         self.generation.generated_object_deleted.connect(
             self._handle_generated_object_deleted_for_atlases
+        )
+        self.generation.generation_completed.connect(
+            self._handle_generated_object_generated_for_atlases
+        )
+        self.generation.texture_regeneration_completed.connect(
+            self._handle_generated_object_generated_for_atlases
         )
         self.generation.generation_completed.connect(
             self._handle_generated_object_completed_for_canvas
@@ -1488,6 +1499,9 @@ class BlueprintWorkspace(QWidget):
         )
         self.viewer.placed_object_transform_changed.connect(
             self._handle_placed_object_transform_changed
+        )
+        self.viewer.placed_object_scales_changed.connect(
+            self._handle_placed_object_scales_changed
         )
         self.viewer.placed_object_selection_changed.connect(
             self._handle_canvas_placed_object_selection_changed
@@ -4941,6 +4955,7 @@ class BlueprintWorkspace(QWidget):
                         base_z + placement.height_offset_meters,
                     ),
                     rotation_degrees=placement.rotation_degrees,
+                    scale=placement.scale,
                     symmetric_preview_orientation=(
                         None if raw_orientation is None else str(raw_orientation)
                     ),
@@ -5983,7 +5998,7 @@ class BlueprintWorkspace(QWidget):
             return
         if validated_build is None:
             return
-        generated_model, dependency_signature = validated_build
+        generated_model, _dependency_signature = validated_build
 
         try:
             exported_path = export_glb_file(generated_model, export_path)
@@ -5993,21 +6008,10 @@ class BlueprintWorkspace(QWidget):
 
         self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
         if not self.texture_atlas_workspace.is_ambient_occlusion_preview_active:
-            self._set_canvas_viewer_targets(
-                tuple(build_fixed_surfaces(self._build_viewer_preview_levels()))
-            )
-            self._is_syncing_canvas_scene_selection = True
-            try:
-                self.viewer.set_model(generated_model)
-                self._restore_desired_canvas_scene_selection()
-            finally:
-                self._is_syncing_canvas_scene_selection = False
-        if not self._remember_current_canvas_preview_model(
-            generated_model,
-            validated_dependency_signature=dependency_signature,
-        ):
-            self._mark_viewer_preview_dirty(preserve_camera=False)
-            self._queue_viewer_preview_refresh()
+            # The export model intentionally excludes levels whose Include
+            # option is off. Keep that model out of the interactive viewer,
+            # whose independent level list controls visibility instead.
+            self._ensure_viewer_preview_current(preserve_camera=True)
         QMessageBox.information(
             self,
             "GLB exported",
@@ -6045,21 +6049,19 @@ class BlueprintWorkspace(QWidget):
                 )
 
         if include_exported_levels:
-            exported_level_indices = {
-                level.index for level in self.levels if level.include_in_export
-            }
+            known_level_indices = {level.index for level in self.levels}
             self._level_blueprint_image_revisions = {
                 level_index: revision
                 for level_index, revision in (
                     self._level_blueprint_image_revisions.items()
                 )
-                if level_index in exported_level_indices
+                if level_index in known_level_indices
             }
             for level in self.levels:
                 if (
-                    not level.include_in_export
-                    or (
-                        current_level is not None and level.index == current_level.index
+                    (
+                        current_level is not None
+                        and level.index == current_level.index
                     )
                     or level.image_path is None
                 ):
@@ -6371,6 +6373,7 @@ class BlueprintWorkspace(QWidget):
                 placement = replace(
                     placement,
                     rotation_degrees=previous_placement.rotation_degrees,
+                    scale=previous_placement.scale,
                 )
             previous_states.append(
                 (
@@ -6776,6 +6779,7 @@ class BlueprintWorkspace(QWidget):
                 image_y=image_y,
                 height_offset_meters=float(world_z) - float(base_z),
                 rotation_degrees=rotation_degrees,
+                scale=existing_placement.scale,
             )
         except (TypeError, ValueError, OverflowError):
             self._schedule_viewer_preview_refresh(preserve_camera=True)
@@ -6834,6 +6838,124 @@ class BlueprintWorkspace(QWidget):
                 dependency_signature_after,
                 normalized_object_id,
                 placement,
+            )
+        ):
+            self._canvas_viewer_preview_revision = revision
+            self._viewer_preview_dependency_signature = dependency_signature_after
+            self._viewer_preview_dependency_signature_revision = revision
+            return
+        self._queue_viewer_preview_refresh()
+
+    def _handle_placed_object_scales_changed(self, raw_updates: object) -> None:
+        """Persist one wheel gesture for every selected placed object."""
+
+        try:
+            updates = tuple(raw_updates)  # type: ignore[arg-type]
+        except TypeError:
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+            return
+        normalized_updates: list[
+            tuple[str, GeneratedObjectPlacement, GeneratedObjectPlacement]
+        ] = []
+        seen_object_ids: set[str] = set()
+        try:
+            for raw_update in updates:
+                object_id, raw_scale = tuple(raw_update)
+                normalized_object_id = str(object_id).strip()
+                if (
+                    not normalized_object_id
+                    or normalized_object_id in seen_object_ids
+                ):
+                    raise ValueError("Placed-object scale IDs must be unique.")
+                existing = self.generation.get_generated_object_placement(
+                    normalized_object_id
+                )
+                if existing is None:
+                    raise ValueError("A scaled object is no longer placed.")
+                replacement = replace(existing, scale=raw_scale)
+                seen_object_ids.add(normalized_object_id)
+                if replacement != existing:
+                    normalized_updates.append(
+                        (normalized_object_id, existing, replacement)
+                    )
+        except (TypeError, ValueError, OverflowError):
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+            return
+        if not normalized_updates:
+            return
+
+        canvas_was_current = (
+            self._canvas_viewer_preview_revision == self._viewer_preview_revision
+        )
+        dependency_signature_before: tuple[object, ...] | None = None
+        if canvas_was_current:
+            current_dependency_signature = (
+                self._build_viewer_preview_dependency_signature()
+            )
+            canvas_was_current = bool(
+                self._viewer_preview_dependency_signature_revision
+                == self._viewer_preview_revision
+                and current_dependency_signature
+                == self._viewer_preview_dependency_signature
+            )
+            if canvas_was_current:
+                dependency_signature_before = current_dependency_signature
+
+        committed_updates: list[
+            tuple[str, GeneratedObjectPlacement, GeneratedObjectPlacement]
+        ] = []
+        for object_id, existing, replacement in normalized_updates:
+            if not self.generation.update_generated_object_placement(
+                object_id,
+                replacement,
+                emit_change_signals=False,
+            ):
+                for committed_id, previous, _next in reversed(committed_updates):
+                    self.generation.update_generated_object_placement(
+                        committed_id,
+                        previous,
+                        emit_change_signals=False,
+                    )
+                self._schedule_viewer_preview_refresh(preserve_camera=True)
+                return
+            committed_updates.append((object_id, existing, replacement))
+
+        if not self._is_restoring_canvas_undo:
+            undo_members = tuple(
+                _CanvasPlacedObjectUndoState(
+                    object_id=object_id,
+                    placement=existing,
+                    selected_object_ids=self._desired_canvas_object_ids,
+                    active_object_id=self._desired_canvas_object_id,
+                )
+                for object_id, existing, _replacement in committed_updates
+            )
+            self._record_canvas_undo_state(
+                undo_members[0]
+                if len(undo_members) == 1
+                else _CanvasPlacedObjectGroupUndoState(undo_members)
+            )
+
+        revision = self._mark_viewer_preview_dirty(
+            preserve_camera=True,
+            affects_draw_call_estimate=False,
+        )
+        dependency_signature_after = (
+            self._build_viewer_preview_dependency_signature()
+            if canvas_was_current
+            else None
+        )
+        expected_placements = {
+            object_id: replacement
+            for object_id, _existing, replacement in committed_updates
+        }
+        if (
+            dependency_signature_before is not None
+            and dependency_signature_after is not None
+            and self._dependency_change_is_only_target_placements(
+                dependency_signature_before,
+                dependency_signature_after,
+                expected_placements,
             )
         ):
             self._canvas_viewer_preview_revision = revision
@@ -7353,6 +7475,18 @@ class BlueprintWorkspace(QWidget):
             return
         self._sync_atlas_object_texture_sources()
         self.texture_atlas_workspace.refresh_regenerated_object_texture(object_id)
+
+    def _handle_generated_object_generated_for_atlases(
+        self,
+        raw_record: object,
+        _generated_model: object,
+    ) -> None:
+        """Pulse one newly generated object or texture until it is clicked."""
+
+        object_id = getattr(raw_record, "object_id", None)
+        if not isinstance(object_id, str) or not object_id.strip():
+            return
+        self.texture_atlas_workspace.mark_sources_new((object_id,))
 
     def _handle_generated_object_deleted_for_atlases(
         self,
@@ -8905,8 +9039,25 @@ class BlueprintWorkspace(QWidget):
     ) -> bool:
         """Accept a gizmo fast path only when no unrelated input changed."""
 
+        return BlueprintWorkspace._dependency_change_is_only_target_placements(
+            signature_before,
+            signature_after,
+            {object_id: placement},
+        )
+
+    @staticmethod
+    def _dependency_change_is_only_target_placements(
+        signature_before: tuple[object, ...],
+        signature_after: tuple[object, ...],
+        placements_by_object_id: Mapping[str, GeneratedObjectPlacement],
+    ) -> bool:
+        """Accept a retained-preview fast path for one exact object group."""
+
         if signature_before == signature_after:
             return True
+        expected_placements = dict(placements_by_object_id)
+        if not expected_placements:
+            return False
         if len(signature_before) != 3 or len(signature_after) != 3:
             return False
         if (
@@ -8924,7 +9075,7 @@ class BlueprintWorkspace(QWidget):
         if len(placed_before) != len(placed_after):
             return False
 
-        target_count = 0
+        matched_object_ids: set[str] = set()
         for item_before, item_after in zip(
             placed_before,
             placed_after,
@@ -8938,16 +9089,18 @@ class BlueprintWorkspace(QWidget):
                 or item_before[0] != item_after[0]
             ):
                 return False
-            if item_before[0] != object_id:
+            object_id = str(item_before[0])
+            expected_placement = expected_placements.get(object_id)
+            if expected_placement is None:
                 if item_before != item_after:
                     return False
                 continue
-            target_count += 1
-            if item_after[1] != placement:
+            matched_object_ids.add(object_id)
+            if item_after[1] != expected_placement:
                 return False
             if item_before[:1] + item_before[2:] != item_after[:1] + item_after[2:]:
                 return False
-        return target_count == 1
+        return matched_object_ids == expected_placements.keys()
 
     def _build_model_with_stable_dependencies(
         self,
@@ -9061,7 +9214,7 @@ class BlueprintWorkspace(QWidget):
             self._doorway_mesh_update_timer.stop()
 
     def _build_viewer_preview_levels(self) -> list[LevelData]:
-        """Copy levels while substituting committed structural values."""
+        """Copy every level for display while substituting committed values."""
 
         preview_levels: list[LevelData] = []
         for level in self.levels:
@@ -9082,11 +9235,41 @@ class BlueprintWorkspace(QWidget):
                     floor_thickness
                 )
             preview_level = copy.copy(level)
+            # Canvas Include controls govern GLB export only. The scene's own
+            # level list independently controls interactive visibility.
+            preview_level.include_in_export = True
             preview_level.doorways = list(copy.deepcopy(doorway_snapshot))
             preview_level.windows = list(copy.deepcopy(window_snapshot))
             preview_level.floor_thickness_meters = floor_thickness
             preview_levels.append(preview_level)
         return preview_levels
+
+    def _sync_viewer_scene_levels(
+        self,
+        *,
+        reset_visibility: bool = False,
+    ) -> None:
+        """Publish independently visible scene levels and object ownership."""
+
+        level_items = tuple(
+            (level.index, level.display_name)
+            for level in sorted(
+                self.levels,
+                key=lambda candidate: candidate.index,
+                reverse=True,
+            )
+            if level.vertex_data.vertices
+        )
+        placed_object_levels = {
+            record.object_id: record.placement.level_index
+            for record in self.generation.get_data().generated_objects
+            if record.placement is not None
+        }
+        self.viewer.set_canvas_scene_levels(
+            level_items,
+            placed_object_levels=placed_object_levels,
+            reset_visibility=reset_visibility,
+        )
 
     def _set_mesh_edit_update_delay_seconds(
         self,
@@ -9283,7 +9466,9 @@ class BlueprintWorkspace(QWidget):
                     self.surface_texture_generation.get_surface_material_sources()
                 ),
             )
-            placed_models = self._build_placed_generated_models()
+            placed_models = self._build_placed_generated_models(
+                include_excluded_levels=True
+            )
             if not placed_models:
                 return base_model
             return compose_placed_generated_models_preview(
@@ -9297,11 +9482,15 @@ class BlueprintWorkspace(QWidget):
 
     def _build_placed_generated_models(
         self,
+        *,
+        include_excluded_levels: bool = False,
     ) -> tuple[PlacedGeneratedModel, ...]:
         """Resolve persisted Canvas clicks into current world positions."""
 
         visible_level_by_index = {
-            level.index: level for level in self.levels if level.include_in_export
+            level.index: level
+            for level in self.levels
+            if include_excluded_levels or level.include_in_export
         }
         if not visible_level_by_index:
             return ()
@@ -9354,14 +9543,20 @@ class BlueprintWorkspace(QWidget):
                         None if symmetry is None else symmetry.plane_coordinate
                     ),
                     rotation_degrees=placement.rotation_degrees,
+                    scale=placement.scale,
                 )
             )
         return tuple(placed_models)
 
     def _handle_surface_texture_generation_completed(
         self,
-        _assignment: object,
+        assignment: object,
     ) -> None:
+        assignment_id = getattr(assignment, "assignment_id", None)
+        if isinstance(assignment_id, str) and assignment_id.strip():
+            self.texture_atlas_workspace.mark_sources_new(
+                (build_atlas_wall_texture_source_id(assignment_id),)
+            )
         self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     def _handle_surface_texture_content_changed(self) -> None:
@@ -9401,6 +9596,7 @@ class BlueprintWorkspace(QWidget):
             return
 
         preview_levels = self._build_viewer_preview_levels()
+        self._sync_viewer_scene_levels()
         if self._viewer_preview_model_revision != revision:
             dependency_signature_before = (
                 self._build_viewer_preview_dependency_signature()
@@ -11062,6 +11258,9 @@ class BlueprintWorkspace(QWidget):
         self.viewer.set_first_person_movement_mode(
             settings.first_person_navigation_mode
         )
+        self.viewer.set_ignore_top_down_ceiling(
+            settings.ignore_top_down_ceiling
+        )
         self.canvas.set_snap_middle_equal_angle_only(
             settings.snap_middle_equal_angle_only
         )
@@ -11148,7 +11347,6 @@ class BlueprintWorkspace(QWidget):
         )
         self.current_level.include_in_export = next_value
         self._refresh_scene_atlas_texture_requirements()
-        self._schedule_viewer_preview_refresh()
 
     def _apply_loaded_project(self, project_data: ProjectData) -> None:
         self._apply_project_state(
@@ -11265,6 +11463,7 @@ class BlueprintWorkspace(QWidget):
             )
         )
         self.generation.set_data(generation)
+        self._sync_viewer_scene_levels(reset_visibility=True)
         self.texture_atlas_workspace.set_data(texture_atlases)
         self.surface_texture_generation.set_levels(self.levels)
         self.surface_texture_generation.set_data(surface_texture_generation)

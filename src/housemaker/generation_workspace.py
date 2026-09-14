@@ -3855,6 +3855,7 @@ class GenerationWorkspace(QWidget):
                     record.placement.height_offset_meters
                 ),
                 rotation_degrees=record.placement.rotation_degrees,
+                scale=record.placement.scale,
             )
         replacement = replace(record, placement=placement)
         self._existing_object_placement_request = None

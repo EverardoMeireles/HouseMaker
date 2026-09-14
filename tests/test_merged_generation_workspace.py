@@ -156,7 +156,7 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         assert primary_actions is not None
         self.assertEqual(primary_actions.layout().spacing(), 0)
 
-    def test_default_window_uses_compact_preview_and_one_shared_column(
+    def test_default_window_splits_views_evenly_and_uses_one_shared_column(
         self,
     ) -> None:
         self.workspace.resize(1_600, 900)
@@ -165,7 +165,11 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
 
         video_width = self.workspace.views_splitter.widget(0).width()
         object_width = self.workspace.views_splitter.widget(1).width()
-        self.assertGreater(video_width, object_width * 3)
+        combined_width = video_width + object_width
+        self.assertLessEqual(
+            abs(video_width - object_width),
+            max(20, round(combined_width * 0.05)),
+        )
         self.assertGreater(object_width, 0)
         self.assertFalse(
             self.objects.object_3d_panel.details_panel.isVisibleTo(
@@ -240,7 +244,7 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
             controls_layout.stretch(0),
         )
 
-    def test_object_generation_actions_use_geometry_then_texture_order(
+    def test_object_controls_are_boxed_in_editing_and_generation_sections(
         self,
     ) -> None:
         primary_actions = self.workspace.findChild(
@@ -251,10 +255,40 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
             QWidget,
             "merged_generation_object_primary_column",
         )
+        generation_settings = self.workspace.findChild(
+            QWidget,
+            "merged_generation_object_generation_settings",
+        )
+        generation_actions = self.workspace.findChild(
+            QWidget,
+            "merged_generation_object_generation_actions",
+        )
+        face_actions = self.workspace.findChild(
+            QWidget,
+            "merged_generation_object_face_actions",
+        )
+        editing_section = self.workspace.findChild(
+            QWidget,
+            "merged_generation_object_editing_section",
+        )
+        creation_section = self.workspace.findChild(
+            QWidget,
+            "merged_generation_object_creation_section",
+        )
         self.assertIsNotNone(primary_actions)
         self.assertIsNotNone(primary_column)
+        self.assertIsNotNone(generation_settings)
+        self.assertIsNotNone(generation_actions)
+        self.assertIsNotNone(face_actions)
+        self.assertIsNotNone(editing_section)
+        self.assertIsNotNone(creation_section)
         assert primary_actions is not None
         assert primary_column is not None
+        assert generation_settings is not None
+        assert generation_actions is not None
+        assert face_actions is not None
+        assert editing_section is not None
+        assert creation_section is not None
 
         actions_layout = primary_actions.layout()
         self.assertIs(
@@ -265,38 +299,95 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
             actions_layout.itemAt(1).widget(),
             self.objects.generate_texture_button,
         )
-        self.assertFalse(
-            primary_actions.isAncestorOf(self.objects.generate_button)
+        settings_layout = generation_settings.layout()
+        self.assertIs(
+            settings_layout.itemAt(0).widget(),
+            self.objects.symmetric_division_checkbox,
         )
-        self.assertTrue(primary_column.isAncestorOf(self.objects.generate_button))
+        self.assertIs(
+            settings_layout.itemAt(2).widget(),
+            self.objects.meshy_target_polycount_control,
+        )
+        generation_actions_layout = generation_actions.layout()
+        self.assertIs(
+            generation_actions_layout.itemAt(0).widget(),
+            self.objects.generate_button,
+        )
+        self.assertIs(
+            generation_actions_layout.itemAt(1).widget(),
+            self.objects.place_button,
+        )
+        face_actions_layout = face_actions.layout()
+        self.assertIs(
+            face_actions_layout.itemAt(0).widget(),
+            self.objects.delete_selected_faces_button,
+        )
+        self.assertIs(
+            face_actions_layout.itemAt(1).widget(),
+            self.objects.convert_faces_to_glass_button,
+        )
+
         self.assertTrue(
-            primary_column.isAncestorOf(
+            editing_section.isAncestorOf(self.objects.textures_checkbox)
+        )
+        self.assertTrue(
+            editing_section.isAncestorOf(self.objects.wireframe_checkbox)
+        )
+        self.assertTrue(
+            editing_section.isAncestorOf(
                 self.objects.delete_selected_faces_button
             )
         )
         self.assertTrue(
-            primary_column.isAncestorOf(
+            editing_section.isAncestorOf(
                 self.objects.convert_faces_to_glass_button
             )
         )
+        for generation_control in (
+            self.objects.symmetric_division_checkbox,
+            self.objects.meshy_target_polycount_control,
+            self.objects.generate_geometry_button,
+            self.objects.generate_texture_button,
+            self.objects.generate_button,
+            self.objects.place_button,
+        ):
+            self.assertTrue(creation_section.isAncestorOf(generation_control))
 
         primary_layout = primary_column.layout()
-        symmetric_index = primary_layout.indexOf(
-            self.objects.symmetric_division_checkbox
-        )
-        delete_faces_index = primary_layout.indexOf(
-            self.objects.delete_selected_faces_button
-        )
-        convert_glass_index = primary_layout.indexOf(
-            self.objects.convert_faces_to_glass_button
-        )
-        generate_index = primary_layout.indexOf(self.objects.generate_button)
+        editing_index = primary_layout.indexOf(editing_section)
+        creation_index = primary_layout.indexOf(creation_section)
         statistics_index = primary_layout.indexOf(
             self.objects.model_statistics_label
         )
-        self.assertLess(symmetric_index, delete_faces_index)
-        self.assertLess(delete_faces_index, convert_glass_index)
-        self.assertLess(generate_index, statistics_index)
+        self.assertLess(editing_index, creation_index)
+        self.assertLess(creation_index, statistics_index)
+
+        creation_layout = creation_section.layout()
+        self.assertIs(creation_layout.itemAt(0).widget(), generation_settings)
+        self.assertIs(creation_layout.itemAt(1).widget(), primary_actions)
+        self.assertIs(creation_layout.itemAt(2).widget(), generation_actions)
+
+    def test_material_controls_are_boxed_in_requested_order(self) -> None:
+        material_section = self.workspace.findChild(
+            QWidget,
+            "merged_generation_shared_material_section",
+        )
+        self.assertIsNotNone(material_section)
+        assert material_section is not None
+
+        material_layout = material_section.layout()
+        self.assertIs(
+            material_layout.itemAt(0).widget(),
+            self.objects.pbr_map_control,
+        )
+        prompt_wrapper = material_layout.itemAt(1).widget()
+        self.assertIsNotNone(prompt_wrapper)
+        assert prompt_wrapper is not None
+        self.assertTrue(prompt_wrapper.isAncestorOf(self.objects.ai_prompt_edit))
+        self.assertIs(
+            material_layout.itemAt(2).widget(),
+            self.workspace.cancel_button,
+        )
 
     def test_object_outline_has_five_pixel_inner_padding(self) -> None:
         self.assertEqual(OBJECT_WORKFLOW_OUTLINE_PADDING, 5)

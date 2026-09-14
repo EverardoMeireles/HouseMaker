@@ -5,7 +5,7 @@ import copy
 import math
 import os
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
@@ -14,6 +14,7 @@ from typing import Callable
 import numpy as np
 from PIL import Image
 from PySide6.QtCore import (
+    QAbstractAnimation,
     QByteArray,
     QLineF,
     QMimeData,
@@ -21,9 +22,11 @@ from PySide6.QtCore import (
     QRectF,
     QStandardPaths,
     Qt,
+    QVariantAnimation,
     Signal,
 )
 from PySide6.QtGui import (
+    QBrush,
     QColor,
     QDrag,
     QDragEnterEvent,
@@ -35,6 +38,7 @@ from PySide6.QtGui import (
     QMouseEvent,
     QPainter,
     QPaintEvent,
+    QPalette,
     QPen,
     QShortcut,
     QWheelEvent,
@@ -52,6 +56,9 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSlider,
     QSplitter,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -105,6 +112,7 @@ from housemaker.texture_atlas_state import (
 ATLAS_ID_ROLE = Qt.ItemDataRole.UserRole
 OBJECT_ID_ROLE = Qt.ItemDataRole.UserRole
 OBJECT_MISSING_ROLE = Qt.ItemDataRole.UserRole + 1
+NEW_SOURCE_ATTENTION_ROLE = Qt.ItemDataRole.UserRole + 2
 PREVIEW_MARGIN_PIXELS = 16.0
 PREVIEW_BACKGROUND_COLOR = QColor(31, 34, 39)
 PREVIEW_EMPTY_COLOR = QColor(50, 54, 61)
@@ -113,6 +121,8 @@ PREVIEW_MISSING_COLOR = QColor(105, 59, 52)
 PREVIEW_BORDER_COLOR = QColor(220, 224, 230)
 PREVIEW_SELECTED_BORDER_COLOR = QColor(255, 139, 31)
 SCENE_BOUND_SOURCE_COLOR = QColor(77, 255, 142)
+NEW_SOURCE_ATTENTION_COLOR = QColor(Qt.GlobalColor.yellow)
+NEW_SOURCE_ATTENTION_ANIMATION_MS = 1_600
 PREVIEW_LABEL_COLOR = QColor(245, 247, 250)
 PREVIEW_DRAG_VALID_FILL_COLOR = QColor(38, 190, 95, 72)
 PREVIEW_DRAG_VALID_BORDER_COLOR = QColor(77, 255, 142, 235)
@@ -768,10 +778,60 @@ def get_atlas_wall_texture_assignment_id(source_id: object) -> str | None:
 
 
 # ### Interactive object list ###
+class _NewSourceAttentionDelegate(QStyledItemDelegate):
+    """Keep the breathing background visible on selected source rows."""
+
+    def paint(self, painter, option, index) -> None:  # type: ignore[override]
+        raw_strength = index.data(NEW_SOURCE_ATTENTION_ROLE)
+        try:
+            strength = float(raw_strength)
+        except (TypeError, ValueError):
+            super().paint(painter, option, index)
+            return
+        if not option.state & QStyle.StateFlag.State_Selected:
+            super().paint(painter, option, index)
+            return
+        styled_option = QStyleOptionViewItem(option)
+        self.initStyleOption(styled_option, index)
+        selected_color = styled_option.palette.color(QPalette.ColorRole.Highlight)
+        styled_option.palette.setColor(
+            QPalette.ColorRole.Highlight,
+            _interpolate_color(
+                selected_color,
+                NEW_SOURCE_ATTENTION_COLOR,
+                strength,
+            ),
+        )
+        foreground = index.data(Qt.ItemDataRole.ForegroundRole)
+        if (
+            isinstance(foreground, QBrush)
+            and foreground.style() != Qt.BrushStyle.NoBrush
+        ):
+            styled_option.palette.setBrush(
+                QPalette.ColorRole.HighlightedText,
+                foreground,
+            )
+        style = (
+            styled_option.widget.style()
+            if styled_option.widget is not None
+            else QApplication.style()
+        )
+        style.drawControl(
+            QStyle.ControlElement.CE_ItemViewItem,
+            styled_option,
+            painter,
+            styled_option.widget,
+        )
+
+
 class TextureAtlasObjectList(QListWidget):
     """Selectable and draggable texture sources."""
 
     object_clicked = Signal(str, object)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setItemDelegate(_NewSourceAttentionDelegate(self))
 
     def startDrag(self, supported_actions: Qt.DropAction) -> None:  # type: ignore[override]
         del supported_actions
@@ -1880,6 +1940,20 @@ class TextureAtlasWorkspace(QWidget):
         self._scene_texture_source_ids: tuple[str, ...] = ()
         self._scene_bound_source_ids: frozenset[str] = frozenset()
         self._green_outline_source_ids: frozenset[str] = frozenset()
+        self._new_source_attention_ids: set[str] = set()
+        self._seen_new_source_attention_ids: set[str] = set()
+        self._new_source_attention_strength = 0.0
+        self._new_source_attention_animation = QVariantAnimation(self)
+        self._new_source_attention_animation.setDuration(
+            NEW_SOURCE_ATTENTION_ANIMATION_MS
+        )
+        self._new_source_attention_animation.setStartValue(0.0)
+        self._new_source_attention_animation.setKeyValueAt(0.5, 1.0)
+        self._new_source_attention_animation.setEndValue(0.0)
+        self._new_source_attention_animation.setLoopCount(-1)
+        self._new_source_attention_animation.valueChanged.connect(
+            self._apply_new_source_attention_strength
+        )
         self._texture_variant_resolver: TextureVariantResolver | None = None
         self._texture_variant_selectability_resolver: (
             TextureVariantSelectabilityResolver | None
@@ -2009,6 +2083,7 @@ class TextureAtlasWorkspace(QWidget):
     def set_data(self, data: TextureAtlasData | None) -> None:
         if data is not None and not isinstance(data, TextureAtlasData):
             raise TypeError("Texture atlas data has an invalid type.")
+        self._clear_new_source_attention()
         self._data = copy.deepcopy(data or TextureAtlasData())
         self._invalidate_atlas_storage_size_cache()
         self.set_draw_call_estimate_unavailable()
@@ -2231,6 +2306,29 @@ class TextureAtlasWorkspace(QWidget):
         self._green_outline_source_ids = normalized_ids
         for preview in self.map_previews.values():
             preview.set_green_outline_source_ids(normalized_ids)
+
+    def mark_sources_new(self, source_ids: Iterable[str]) -> None:
+        """Animate generated source rows until each row is clicked.
+
+        IDs may be registered before their corresponding list rows exist. The
+        pending attention state survives subsequent source and Atlas refreshes
+        so asynchronous generation completion cannot lose the notification.
+        """
+
+        if isinstance(source_ids, str):
+            raw_source_ids: Iterable[str] = (source_ids,)
+        else:
+            raw_source_ids = source_ids
+        normalized_ids = {
+            source_id
+            for source_id in (str(value).strip() for value in raw_source_ids)
+            if source_id
+        }
+        if not normalized_ids:
+            return
+        self._new_source_attention_ids.update(normalized_ids)
+        self._apply_new_source_attention_backgrounds()
+        self._sync_new_source_attention_animation()
 
     def get_unpacked_scene_texture_source_ids(self) -> tuple[str, ...]:
         """Return required source IDs which are absent from every atlas."""
@@ -4895,6 +4993,7 @@ class TextureAtlasWorkspace(QWidget):
             Qt.MouseButton.RightButton,
         }:
             return
+        self._dismiss_new_source_attention(object_id)
         self._is_handling_object_click = True
         try:
             self._select_object_row(object_id)
@@ -5363,6 +5462,8 @@ class TextureAtlasWorkspace(QWidget):
         }
         for preview in self.map_previews.values():
             preview.set_wheel_resize_object_ids(wheel_resize_object_ids)
+        self._apply_new_source_attention_backgrounds()
+        self._sync_new_source_attention_animation()
         self._sync_controls()
 
     def _surface_texture_type_prefix(self, source_id: str) -> str:
@@ -5381,6 +5482,85 @@ class TextureAtlasWorkspace(QWidget):
 
         if str(source_id) in self._scene_bound_source_ids:
             item.setForeground(SCENE_BOUND_SOURCE_COLOR)
+
+    def _apply_new_source_attention_strength(self, value: object) -> None:
+        """Apply one animation frame to every pending generated source row."""
+
+        try:
+            strength = float(value)
+        except (TypeError, ValueError):
+            strength = 0.0
+        self._new_source_attention_strength = max(0.0, min(1.0, strength))
+        self._apply_new_source_attention_backgrounds()
+
+    def _apply_new_source_attention_backgrounds(self) -> None:
+        """Blend visible pending rows from their list color toward yellow."""
+
+        strength = self._new_source_attention_strength
+        for source_list in (self.object_list, self.surface_list):
+            normal_color = source_list.palette().color(QPalette.ColorRole.Base)
+            attention_color = _interpolate_color(
+                normal_color,
+                NEW_SOURCE_ATTENTION_COLOR,
+                strength,
+            )
+            for row in range(source_list.count()):
+                item = source_list.item(row)
+                source_id = str(item.data(OBJECT_ID_ROLE))
+                if source_id in self._new_source_attention_ids:
+                    item.setBackground(attention_color)
+                    item.setData(NEW_SOURCE_ATTENTION_ROLE, strength)
+                else:
+                    item.setBackground(QBrush())
+                    item.setData(NEW_SOURCE_ATTENTION_ROLE, None)
+
+    def _dismiss_new_source_attention(self, source_id: str) -> None:
+        """Clear one notification only after its row receives a mouse click."""
+
+        normalized_id = str(source_id).strip()
+        if normalized_id not in self._new_source_attention_ids:
+            return
+        self._new_source_attention_ids.remove(normalized_id)
+        self._seen_new_source_attention_ids.discard(normalized_id)
+        self._apply_new_source_attention_backgrounds()
+        self._sync_new_source_attention_animation()
+
+    def _clear_new_source_attention(self) -> None:
+        """Reset transient generation notifications for replacement data."""
+
+        self._new_source_attention_ids.clear()
+        self._seen_new_source_attention_ids.clear()
+        self._new_source_attention_animation.stop()
+        self._new_source_attention_strength = 0.0
+        self._apply_new_source_attention_backgrounds()
+
+    def _sync_new_source_attention_animation(self) -> None:
+        """Run the breathing animation only while a pending row is visible."""
+
+        visible_source_ids = {
+            str(source_list.item(row).data(OBJECT_ID_ROLE))
+            for source_list in (self.object_list, self.surface_list)
+            for row in range(source_list.count())
+        }
+        visible_attention_ids = self._new_source_attention_ids.intersection(
+            visible_source_ids
+        )
+        stale_attention_ids = self._seen_new_source_attention_ids.difference(
+            visible_source_ids
+        )
+        if stale_attention_ids:
+            self._new_source_attention_ids.difference_update(stale_attention_ids)
+            self._seen_new_source_attention_ids.difference_update(stale_attention_ids)
+        self._seen_new_source_attention_ids.update(visible_attention_ids)
+        if visible_attention_ids:
+            if (
+                self._new_source_attention_animation.state()
+                != QAbstractAnimation.State.Running
+            ):
+                self._new_source_attention_animation.start()
+            return
+        self._new_source_attention_animation.stop()
+        self._new_source_attention_strength = 0.0
 
     def _refresh_preview(self) -> None:
         self._refresh_atlas_storage_sizes()
@@ -6237,6 +6417,19 @@ def _read_texture_source_mime_data(mime_data: QMimeData) -> str | None:
 
 
 # ### Preview helpers ###
+def _interpolate_color(start: QColor, end: QColor, amount: float) -> QColor:
+    """Return a channel-wise interpolation between two opaque UI colors."""
+
+    weight = max(0.0, min(1.0, float(amount)))
+    inverse_weight = 1.0 - weight
+    return QColor(
+        round(start.red() * inverse_weight + end.red() * weight),
+        round(start.green() * inverse_weight + end.green() * weight),
+        round(start.blue() * inverse_weight + end.blue() * weight),
+        round(start.alpha() * inverse_weight + end.alpha() * weight),
+    )
+
+
 def _physical_texture_resolution(packing_mode: str, resolution: int) -> int:
     """Return the source PNG and logical Atlas slot side length."""
 

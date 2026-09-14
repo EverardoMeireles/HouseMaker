@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from housemaker.generation_state import (
+    GeneratedObjectPlacement,
     GeneratedObjectRecord,
     GenerationData,
     MaskPoint,
@@ -80,6 +81,12 @@ class GenerationStatePersistenceTests(unittest.TestCase):
                     pipeline={},
                     provider_task_id="task-meshy-123",
                     asset_path="generation_assets/task-meshy-123.glb",
+                    placement=GeneratedObjectPlacement(
+                        level_index=2,
+                        image_x=120.0,
+                        image_y=240.0,
+                        scale=1.75,
+                    ),
                 ),
             ],
         )
@@ -102,6 +109,17 @@ class GenerationStatePersistenceTests(unittest.TestCase):
 
         self.assertEqual(raw_payload["generation"], generation.to_dict())
         self.assertEqual(loaded_generation, generation)
+
+    def test_legacy_placement_without_scale_defaults_to_one(self) -> None:
+        placement = GeneratedObjectPlacement.from_dict(
+            {
+                "level_index": 2,
+                "image_x": 20.0,
+                "image_y": 30.0,
+            }
+        )
+
+        self.assertEqual(placement.scale, 1.0)
 
     def test_legacy_procedural_records_are_dropped_without_rejecting_project(
         self,

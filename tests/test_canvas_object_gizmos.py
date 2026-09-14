@@ -10,26 +10,26 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # ### Imports ###
 import numpy as np
-from PySide6.QtCore import QPointF, Qt
+import trimesh
+from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
-import trimesh
 from trimesh.visual.texture import TextureVisuals
 
-from housemaker.glb import GeneratedModel, PreviewPlacedObject
 from housemaker.glass_material import build_housemaker_glass_material
-from housemaker.surface_geometry import FixedSurface, SURFACE_TYPE_WALL
+from housemaker.glb import GeneratedModel, PreviewPlacedObject
+from housemaker.surface_geometry import SURFACE_TYPE_WALL, FixedSurface
 from housemaker.viewer import (
     NAVIGATION_MODE_FIRST_PERSON,
     GlbViewerWidget,
-    _TransformGizmoHandle,
     _build_axis_drag_plane_normal,
     _get_nearest_preview_placed_object_ray_hit,
     _get_signed_rotation_degrees,
     _intersect_ray_with_plane,
+    _transform_point,
+    _TransformGizmoHandle,
 )
-
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -53,6 +53,20 @@ class _MouseButtonEvent:
 
     def position(self) -> QPointF:
         return self._position
+
+    def accept(self) -> None:
+        self.was_accepted = True
+
+
+class _WheelEvent:
+    """Minimal wheel event used by retained Canvas viewer tests."""
+
+    def __init__(self, delta: int) -> None:
+        self._delta = int(delta)
+        self.was_accepted = False
+
+    def angleDelta(self) -> QPoint:
+        return QPoint(0, self._delta)
 
     def accept(self) -> None:
         self.was_accepted = True
@@ -84,6 +98,7 @@ def _build_placed_object(
     *,
     world_position: tuple[float, float, float] = (0.0, 0.0, 0.0),
     rotation_degrees: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    scale: float = 1.0,
     symmetric: bool = False,
 ) -> PreviewPlacedObject:
     local_mesh = (
@@ -91,12 +106,15 @@ def _build_placed_object(
         if symmetric
         else _build_local_box()
     )
+    placement_transform = _translation_transform(*world_position)
+    placement_transform[:3, :3] *= scale
     return PreviewPlacedObject(
         object_id=object_id,
         meshes=(local_mesh,),
-        placement_transform=_translation_transform(*world_position),
+        placement_transform=placement_transform,
         world_position=world_position,
         rotation_degrees=rotation_degrees,
+        scale=scale,
         symmetric_preview_orientation="vertical" if symmetric else None,
         symmetric_preview_plane_coordinate=0.0 if symmetric else None,
     )
@@ -395,6 +413,49 @@ class CanvasObjectGizmoTests(unittest.TestCase):
         self.assertEqual(viewer.get_navigation_mode(), NAVIGATION_MODE_FIRST_PERSON)
         self.assertTrue(viewer.is_first_person_pointer_captured)
 
+    def test_wheel_uniformly_scales_every_selected_object_without_zooming(
+        self,
+    ) -> None:
+        chair = _build_placed_object("chair", world_position=(2.0, 3.0, 0.0))
+        table = _build_placed_object("table", world_position=(-4.0, 1.0, 0.0))
+        viewer = self._build_viewer(chair, table)
+        viewer.set_selected_placed_object_ids(
+            ("chair", "table"),
+            active_object_id="table",
+        )
+        emitted: list[object] = []
+        viewer.placed_object_scales_changed.connect(emitted.append)
+        original_distance = float(viewer.view.opts["distance"])
+        event = _WheelEvent(120)
+
+        viewer.view.wheelEvent(event)
+
+        self.assertTrue(event.was_accepted)
+        self.assertEqual(float(viewer.view.opts["distance"]), original_distance)
+        self.assertEqual(
+            emitted,
+            [(("chair", 1.1), ("table", 1.1))],
+        )
+        for object_id, anchor in (
+            ("chair", chair.world_position),
+            ("table", table.world_position),
+        ):
+            group = viewer._placed_object_render_groups[object_id]
+            self.assertAlmostEqual(group.preview.scale, 1.1)
+            np.testing.assert_allclose(
+                _transform_point(
+                    group.current_transform,
+                    (0.0, 0.0, 0.0),
+                ),
+                anchor,
+                atol=1e-7,
+            )
+
+        viewer.set_selected_placed_object_ids(())
+        viewer.view.wheelEvent(_WheelEvent(120))
+
+        self.assertLess(float(viewer.view.opts["distance"]), original_distance)
+
     def test_translation_drag_emits_one_world_transform_on_release(self) -> None:
         viewer = self._build_viewer(_build_placed_object("chair"))
         viewer.select_placed_object("chair")
@@ -490,6 +551,46 @@ class CanvasObjectGizmoTests(unittest.TestCase):
         self.assertEqual(object_id, "chair")
         np.testing.assert_allclose(position, (0.0, 0.0, 0.0), atol=1e-7)
         np.testing.assert_allclose(rotation, (0.0, 0.0, 90.0), atol=1e-7)
+
+    def test_rotation_drag_preserves_an_existing_uniform_scale(self) -> None:
+        viewer = self._build_viewer(
+            _build_placed_object("chair", scale=2.0)
+        )
+        viewer.select_placed_object("chair")
+        emitted: list[tuple[str, object, object]] = []
+        viewer.placed_object_transform_changed.connect(
+            lambda object_id, position, rotation: emitted.append(
+                (object_id, position, rotation)
+            )
+        )
+        handle = _TransformGizmoHandle(kind="rotate", axis_index=2)
+
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_downward_ray(1.0, 0.0),
+        ):
+            self.assertTrue(
+                viewer._begin_placed_object_gizmo_drag(handle, QPointF())
+            )
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_downward_ray(0.0, 1.0),
+        ):
+            self.assertTrue(
+                viewer._finish_placed_object_gizmo_drag(QPointF(20.0, 20.0))
+            )
+
+        self.assertEqual(len(emitted), 1)
+        np.testing.assert_allclose(emitted[0][2], (0.0, 0.0, 90.0), atol=1e-7)
+        group = viewer._placed_object_render_groups["chair"]
+        np.testing.assert_allclose(
+            np.linalg.norm(group.current_transform[:3, :3], axis=0),
+            (2.0, 2.0, 2.0),
+            atol=1e-7,
+        )
+        self.assertEqual(group.preview.scale, 2.0)
 
     def test_cancelled_drag_restores_preview_and_emits_nothing(self) -> None:
         viewer = self._build_viewer(_build_placed_object("chair"))

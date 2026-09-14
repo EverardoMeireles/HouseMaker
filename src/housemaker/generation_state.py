@@ -9,7 +9,6 @@ from typing import Any
 
 from housemaker.video_source import VideoMetadata
 
-
 # ### Constants ###
 MASK_MODE_PAINT = "paint"
 MASK_MODE_ERASE = "erase"
@@ -112,6 +111,7 @@ class GeneratedObjectPlacement:
     image_y: float
     height_offset_meters: float = 0.0
     rotation_degrees: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    scale: float = 1.0
 
     def __post_init__(self) -> None:
         if (
@@ -147,6 +147,12 @@ class GeneratedObjectPlacement:
             "rotation_degrees",
             _normalize_placement_rotation(self.rotation_degrees),
         )
+        if not _is_strict_finite_number(self.scale) or float(self.scale) <= 0.0:
+            raise ValueError(
+                "Generated-object placement scale must be finite and greater "
+                "than zero."
+            )
+        object.__setattr__(self, "scale", float(self.scale))
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -155,6 +161,7 @@ class GeneratedObjectPlacement:
             "image_y": self.image_y,
             "height_offset_meters": self.height_offset_meters,
             "rotation_degrees": list(self.rotation_degrees),
+            "scale": self.scale,
         }
 
     @classmethod
@@ -172,6 +179,7 @@ class GeneratedObjectPlacement:
                 "rotation_degrees",
                 (0.0, 0.0, 0.0),
             ),
+            scale=payload.get("scale", 1.0),
         )
 
 
