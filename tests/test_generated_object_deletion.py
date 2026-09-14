@@ -219,7 +219,7 @@ class GeneratedObjectAssetDeletionTests(unittest.TestCase):
         self.assertTrue(outside_path.exists())
         self.assertTrue(non_glb_path.exists())
         self.assertEqual(self.workspace.get_data().generated_objects, [])
-        self.assertEqual(self.workspace.generated_objects_list.count(), 0)
+        self.assertEqual(self.workspace.get_generated_object_ids(), ())
 
     def test_asset_unlink_error_does_not_restore_deleted_record(self) -> None:
         asset_path = _write_asset(
@@ -270,7 +270,7 @@ class ExternalGeneratedObjectDeletionTests(unittest.TestCase):
         _qt_application.processEvents()
         self._temporary_directory.cleanup()
 
-    def test_delete_clears_the_detached_object_panel_in_place(self) -> None:
+    def test_delete_clears_the_detached_generation_preview_in_place(self) -> None:
         asset_path = _write_asset(
             self.asset_directory,
             "external.glb",
@@ -283,7 +283,7 @@ class ExternalGeneratedObjectDeletionTests(unittest.TestCase):
             )
         )
         screen_id = "screen:external-deletion-test"
-        combo = self.workspace.settings_widget.fullscreen_3d_viewer_screen_combo
+        combo = self.workspace.settings_widget.generation_display_screen_combo
         combo.addItem("External deletion display", screen_id)
 
         with patch(
@@ -291,21 +291,32 @@ class ExternalGeneratedObjectDeletionTests(unittest.TestCase):
             return_value=_primary_screen(),
         ):
             combo.setCurrentIndex(combo.findData(screen_id))
-            self.workspace.workspace_tabs.setCurrentWidget(generation)
             _qt_application.processEvents()
 
         panel = generation.object_3d_panel
-        self.assertIs(self.workspace._external_viewer_host.viewer, panel)
+        merged_workspace = self.workspace.merged_generation_workspace
+        self.assertIs(
+            self.workspace._external_generation_host.viewer,
+            merged_workspace,
+        )
         self.assertIsNotNone(panel.viewer.model)
 
         self.assertTrue(generation.delete_generated_object("external"))
         _qt_application.processEvents()
 
-        self.assertTrue(self.workspace._external_viewer_host.is_active)
-        self.assertIs(self.workspace._external_viewer_host.viewer, panel)
+        self.assertTrue(self.workspace._external_generation_host.is_active)
+        self.assertIs(
+            self.workspace._external_generation_host.viewer,
+            merged_workspace,
+        )
         self.assertIsNone(panel.viewer.model)
-        self.assertEqual(generation.texture_view.entries, ())
-        self.assertFalse(generation.delete_generated_object_button.isEnabled())
+        self.assertFalse(
+            hasattr(generation, "delete_generated_object_button")
+        )
+        self.assertFalse(
+            self.workspace.texture_atlas_workspace.delete_object_button
+            .isEnabled()
+        )
         self.assertFalse(asset_path.exists())
 
 

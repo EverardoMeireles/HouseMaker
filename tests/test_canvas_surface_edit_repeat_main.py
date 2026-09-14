@@ -80,10 +80,7 @@ class RepeatedCanvasSurfaceEditMainTests(unittest.TestCase):
         self.workspace.resize(1400, 850)
         self.workspace.show()
         self.workspace.workspace_tabs.setCurrentWidget(
-            self.workspace.canvas_viewer_workspace
-        )
-        self.workspace.canvas_viewer_tabs.setCurrentIndex(
-            self.workspace.canvas_3d_view_tab_index
+            self.workspace.scene_3d_workspace
         )
         self.workspace._set_mesh_edit_update_delay_seconds(60.0)
         _qt_application.processEvents()

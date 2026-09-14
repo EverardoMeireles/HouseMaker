@@ -590,22 +590,6 @@ class SurfaceTextureMultiJobTests(unittest.TestCase):
             {"", "Kitchen stone"},
         )
 
-        self.workspace.surface_view.set_selected_surface_ids((_FIRST_WALL,))
-        self.workspace._refresh_texture_atlases()
-        self.assertTrue(
-            all(
-                entry.display_name.startswith("Kitchen stone - ")
-                for entry in self.workspace.texture_view.entries
-            )
-        )
-        blank_item = next(
-            self.workspace.other_texture_list.item(index)
-            for index in range(self.workspace.other_texture_list.count())
-            if "Wall texture - "
-            in self.workspace.other_texture_list.item(index).text()
-        )
-        self.assertIn("Wall texture - ", blank_item.text())
-
 
 if __name__ == "__main__":
     unittest.main()

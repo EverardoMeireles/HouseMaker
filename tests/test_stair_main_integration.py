@@ -180,8 +180,8 @@ class StairMainIntegrationTests(unittest.TestCase):
         self.assertFalse(hasattr(self.workspace, "stairs_list"))
         self.assertIn("Added floating stairs", self.workspace.stair_status_label.text())
 
-        self.workspace.canvas_viewer_tabs.setCurrentIndex(
-            self.workspace.canvas_3d_view_tab_index
+        self.workspace.workspace_tabs.setCurrentWidget(
+            self.workspace.scene_3d_workspace
         )
         _qt_application.processEvents()
         viewer_model = self.workspace.viewer.model
@@ -475,17 +475,22 @@ class StairMainIntegrationTests(unittest.TestCase):
             "Confirm stairs",
         )
 
-    def test_add_stairs_switches_the_canvas_workspace_to_its_2d_view(self) -> None:
+    def test_add_stairs_switches_from_3d_scene_to_canvas_workspace(self) -> None:
         _make_current_canvas_clickable(self.workspace)
-        self.workspace.canvas_viewer_tabs.setCurrentWidget(self.workspace.viewer)
-        self.assertIs(self.workspace.canvas_viewer_tabs.currentWidget(), self.workspace.viewer)
+        self.workspace.workspace_tabs.setCurrentWidget(
+            self.workspace.scene_3d_workspace
+        )
+        self.assertIs(
+            self.workspace.workspace_tabs.currentWidget(),
+            self.workspace.scene_3d_workspace,
+        )
 
         with patch("housemaker.main.QMessageBox.information"):
             self.workspace.add_stairs_button.click()
 
         self.assertIs(
-            self.workspace.canvas_viewer_tabs.currentWidget(),
-            self.workspace.canvas,
+            self.workspace.workspace_tabs.currentWidget(),
+            self.workspace.canvas_viewer_workspace,
         )
         self.assertTrue(self.workspace.canvas.is_stair_placement_active())
 

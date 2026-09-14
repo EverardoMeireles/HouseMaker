@@ -40,6 +40,8 @@ SURFACE_TEXTURE_PROVIDER_SETTING_KEY = "generation/surface_texture_provider"
 FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY = (
     "display/fullscreen_3d_viewer_screen_id"
 )
+SCENE_3D_DISPLAY_SCREEN_SETTING_KEY = "display/scene_3d_screen_id"
+GENERATION_DISPLAY_SCREEN_SETTING_KEY = "display/generation_screen_id"
 JOBS_WINDOW_SCREEN_SETTING_KEY = "display/jobs_window_screen_id"
 ATLAS_DISPLAY_SCREEN_SETTING_KEY = "display/atlas_screen_id"
 AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR_SETTING_KEY = (
@@ -149,7 +151,7 @@ class GenerationServiceSettings:
     meshy_target_polycount: int = DEFAULT_MESHY_TARGET_POLYCOUNT
     openai_api_key: str = field(default="", repr=False)
     surface_texture_provider: str = SURFACE_TEXTURE_PROVIDER_MESHY
-    fullscreen_3d_viewer_screen_id: str | None = None
+    scene_3d_display_screen_id: str | None = None
     canvas_3d_navigation_toggle_hotkey: str = (
         DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY
     )
@@ -184,6 +186,7 @@ class GenerationServiceSettings:
     wall_vertex_update_delay_seconds: float = (
         DEFAULT_WALL_VERTEX_UPDATE_DELAY_SECONDS
     )
+    generation_display_screen_id: str | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -264,17 +267,31 @@ class GenerationServiceSettings:
                 f"{self.surface_texture_provider!r}."
             )
         if (
-            self.fullscreen_3d_viewer_screen_id is not None
-            and not isinstance(self.fullscreen_3d_viewer_screen_id, str)
+            self.scene_3d_display_screen_id is not None
+            and not isinstance(self.scene_3d_display_screen_id, str)
         ):
             raise ValueError(
-                "Fullscreen 3D viewer screen ID must be a string or None."
+                "3D scene display screen ID must be a string or None."
             )
         object.__setattr__(
             self,
-            "fullscreen_3d_viewer_screen_id",
+            "scene_3d_display_screen_id",
             _normalize_fullscreen_3d_viewer_screen_id(
-                self.fullscreen_3d_viewer_screen_id
+                self.scene_3d_display_screen_id
+            ),
+        )
+        if (
+            self.generation_display_screen_id is not None
+            and not isinstance(self.generation_display_screen_id, str)
+        ):
+            raise ValueError(
+                "Generation display screen ID must be a string or None."
+            )
+        object.__setattr__(
+            self,
+            "generation_display_screen_id",
+            _normalize_fullscreen_3d_viewer_screen_id(
+                self.generation_display_screen_id
             ),
         )
         if (
@@ -415,8 +432,11 @@ class SettingsWidget(QWidget):
             surface_texture_provider=read_surface_texture_provider(
                 self._application_settings
             ),
-            fullscreen_3d_viewer_screen_id=(
-                self._selected_fullscreen_3d_viewer_screen_id()
+            scene_3d_display_screen_id=(
+                self._selected_scene_3d_display_screen_id()
+            ),
+            generation_display_screen_id=(
+                self._selected_generation_display_screen_id()
             ),
             jobs_window_screen_id=self._selected_jobs_window_screen_id(),
             atlas_display_screen_id=self._selected_atlas_display_screen_id(),
@@ -453,10 +473,15 @@ class SettingsWidget(QWidget):
             ),
         )
 
-    def get_fullscreen_3d_viewer_screen_id(self) -> str | None:
-        """Return the selected display without rereading the settings file."""
+    def get_scene_3d_display_screen_id(self) -> str | None:
+        """Return the selected 3D-scene display without rereading disk."""
 
-        return self._selected_fullscreen_3d_viewer_screen_id()
+        return self._selected_scene_3d_display_screen_id()
+
+    def get_generation_display_screen_id(self) -> str | None:
+        """Return the selected Generation display without rereading disk."""
+
+        return self._selected_generation_display_screen_id()
 
     def get_jobs_window_screen_id(self) -> str | None:
         """Return the selected Jobs-window display without rereading disk."""
@@ -587,16 +612,36 @@ class SettingsWidget(QWidget):
         self.openai_key_status_label.setObjectName("openai_key_status_label")
         api_credentials_form.addRow("", self.openai_key_status_label)
 
-        self.fullscreen_3d_viewer_screen_combo = QComboBox()
-        self.fullscreen_3d_viewer_screen_combo.setObjectName(
-            "fullscreen_3d_viewer_screen_combo"
+        self.scene_3d_display_screen_combo = QComboBox()
+        self.scene_3d_display_screen_combo.setObjectName(
+            "scene_3d_display_screen_combo"
         )
-        self.fullscreen_3d_viewer_screen_combo.currentIndexChanged.connect(
-            self._handle_fullscreen_3d_viewer_screen_changed
+        self.scene_3d_display_screen_combo.setToolTip(
+            "Choose a display for the shared 3D scene, or None to keep its "
+            "tab in the main window."
+        )
+        self.scene_3d_display_screen_combo.currentIndexChanged.connect(
+            self._handle_scene_3d_display_screen_changed
         )
         display_form.addRow(
-            "Fullscreen 3D viewer display",
-            self.fullscreen_3d_viewer_screen_combo,
+            "3D scene display",
+            self.scene_3d_display_screen_combo,
+        )
+
+        self.generation_display_screen_combo = QComboBox()
+        self.generation_display_screen_combo.setObjectName(
+            "generation_display_screen_combo"
+        )
+        self.generation_display_screen_combo.setToolTip(
+            "Choose a display for the Generation workspace, or None to keep "
+            "its tab in the main window."
+        )
+        self.generation_display_screen_combo.currentIndexChanged.connect(
+            self._handle_generation_display_screen_changed
+        )
+        display_form.addRow(
+            "Generation display",
+            self.generation_display_screen_combo,
         )
 
         self.jobs_window_screen_combo = QComboBox()
@@ -867,7 +912,7 @@ class SettingsWidget(QWidget):
         meshy_note = QLabel(
             "Object generation uses Meshy Image-to-3D. Surface texture "
             "generation can use Meshy or an OpenAI vision model; choose its "
-            "provider in the Surface texture generation tab. GPT-4o-mini "
+            "provider in the Surface controls of the Generation tab. GPT-4o-mini "
             "first analyzes the references, then GPT Image 2 renders the "
             "texture, so that choice makes two OpenAI requests. Provider "
             "requests may consume account credits."
@@ -921,7 +966,8 @@ class SettingsWidget(QWidget):
                 or ""
             )
         )
-        self._refresh_fullscreen_3d_viewer_screen_options()
+        self._refresh_scene_3d_display_screen_options()
+        self._refresh_generation_display_screen_options()
         self._refresh_jobs_window_screen_options()
         self._refresh_atlas_display_screen_options()
         self.automatic_atlas_texture_sort_by_pbr_checkbox.setChecked(
@@ -1027,7 +1073,8 @@ class SettingsWidget(QWidget):
     ) -> None:
         if self._is_disposed:
             return
-        self._refresh_fullscreen_3d_viewer_screen_options()
+        self._refresh_scene_3d_display_screen_options()
+        self._refresh_generation_display_screen_options()
         self._refresh_jobs_window_screen_options()
         self._refresh_atlas_display_screen_options()
         if not self._is_loading_settings:
@@ -1035,29 +1082,54 @@ class SettingsWidget(QWidget):
             # primary screen itself may have changed or been disconnected.
             self.settings_changed.emit()
 
-    def _refresh_fullscreen_3d_viewer_screen_options(self) -> None:
-        selected_screen_id = read_fullscreen_3d_viewer_screen_id(
+    def _refresh_scene_3d_display_screen_options(self) -> None:
+        selected_screen_id = read_scene_3d_display_screen_id(
             self._application_settings
         )
-        blocker = QSignalBlocker(self.fullscreen_3d_viewer_screen_combo)
-        self.fullscreen_3d_viewer_screen_combo.clear()
-        self.fullscreen_3d_viewer_screen_combo.addItem("None", None)
+        blocker = QSignalBlocker(self.scene_3d_display_screen_combo)
+        self.scene_3d_display_screen_combo.clear()
+        self.scene_3d_display_screen_combo.addItem("None", None)
         for option in connected_fullscreen_3d_viewer_display_options():
-            self.fullscreen_3d_viewer_screen_combo.addItem(
+            self.scene_3d_display_screen_combo.addItem(
                 option.label,
                 option.screen_id,
             )
-        selected_index = self.fullscreen_3d_viewer_screen_combo.findData(
+        selected_index = self.scene_3d_display_screen_combo.findData(
             selected_screen_id
         )
-        self.fullscreen_3d_viewer_screen_combo.setCurrentIndex(
+        self.scene_3d_display_screen_combo.setCurrentIndex(
             selected_index if selected_index >= 0 else 0
         )
         del blocker
 
-    def _selected_fullscreen_3d_viewer_screen_id(self) -> str | None:
+    def _selected_scene_3d_display_screen_id(self) -> str | None:
         return _normalize_fullscreen_3d_viewer_screen_id(
-            self.fullscreen_3d_viewer_screen_combo.currentData()
+            self.scene_3d_display_screen_combo.currentData()
+        )
+
+    def _refresh_generation_display_screen_options(self) -> None:
+        selected_screen_id = read_generation_display_screen_id(
+            self._application_settings
+        )
+        blocker = QSignalBlocker(self.generation_display_screen_combo)
+        self.generation_display_screen_combo.clear()
+        self.generation_display_screen_combo.addItem("None", None)
+        for option in connected_fullscreen_3d_viewer_display_options():
+            self.generation_display_screen_combo.addItem(
+                option.label,
+                option.screen_id,
+            )
+        selected_index = self.generation_display_screen_combo.findData(
+            selected_screen_id
+        )
+        self.generation_display_screen_combo.setCurrentIndex(
+            selected_index if selected_index >= 0 else 0
+        )
+        del blocker
+
+    def _selected_generation_display_screen_id(self) -> str | None:
+        return _normalize_fullscreen_3d_viewer_screen_id(
+            self.generation_display_screen_combo.currentData()
         )
 
     def _refresh_jobs_window_screen_options(self) -> None:
@@ -1110,15 +1182,27 @@ class SettingsWidget(QWidget):
             self.atlas_display_screen_combo.currentData()
         )
 
-    def _handle_fullscreen_3d_viewer_screen_changed(
+    def _handle_scene_3d_display_screen_changed(
         self,
         _index: int,
     ) -> None:
         if self._is_loading_settings:
             return
         self._application_settings.set(
-            FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY,
-            self._selected_fullscreen_3d_viewer_screen_id(),
+            SCENE_3D_DISPLAY_SCREEN_SETTING_KEY,
+            self._selected_scene_3d_display_screen_id(),
+        )
+        self.settings_changed.emit()
+
+    def _handle_generation_display_screen_changed(
+        self,
+        _index: int,
+    ) -> None:
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            GENERATION_DISPLAY_SCREEN_SETTING_KEY,
+            self._selected_generation_display_screen_id(),
         )
         self.settings_changed.emit()
 
@@ -1365,10 +1449,37 @@ def fullscreen_3d_viewer_screen_id(screen: QScreen) -> str | None:
 def read_fullscreen_3d_viewer_screen_id(
     application_settings: ApplicationSettingsStore,
 ) -> str | None:
-    """Read a saved display identity while safely ignoring malformed values."""
+    """Read the legacy shared-viewer display identity."""
 
     return _normalize_fullscreen_3d_viewer_screen_id(
         application_settings.get(FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY)
+    )
+
+
+def read_scene_3d_display_screen_id(
+    application_settings: ApplicationSettingsStore,
+) -> str | None:
+    """Read the 3D-scene display, falling back to the legacy setting."""
+
+    missing_value = object()
+    saved_value = application_settings.get(
+        SCENE_3D_DISPLAY_SCREEN_SETTING_KEY,
+        missing_value,
+    )
+    if saved_value is missing_value:
+        saved_value = application_settings.get(
+            FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY
+        )
+    return _normalize_fullscreen_3d_viewer_screen_id(saved_value)
+
+
+def read_generation_display_screen_id(
+    application_settings: ApplicationSettingsStore,
+) -> str | None:
+    """Read the persisted detached Generation display identity."""
+
+    return _normalize_fullscreen_3d_viewer_screen_id(
+        application_settings.get(GENERATION_DISPLAY_SCREEN_SETTING_KEY)
     )
 
 

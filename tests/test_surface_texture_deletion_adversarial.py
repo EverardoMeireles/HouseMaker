@@ -5,13 +5,15 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 # ### Imports ###
 from PIL import Image
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.main import BlueprintWorkspace
@@ -231,6 +233,52 @@ class SurfaceTextureDeletionAtlasIntegrationTests(unittest.TestCase):
         updated_atlas = atlas_workspace.get_data().atlas_by_id(atlas.atlas_id)
         assert updated_atlas is not None
         self.assertIsNone(updated_atlas.placement_for_object(source_id))
+        self.assertNotIn(source_id, atlas_workspace._sources_by_object_id)
+
+    def test_atlas_delete_texture_button_permanently_deletes_surface_family(
+        self,
+    ) -> None:
+        surface_workspace = self.workspace.surface_texture_generation
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        texture_path = self._temporary_path / "surface_textures" / "delete.png"
+        assignment = _assignment(
+            "delete-from-atlas",
+            ("level:2/wall:1:2",),
+            _write_texture(
+                texture_path.parent,
+                texture_path.name,
+                (40, 120, 190, 255),
+            ),
+        )
+        surface_workspace.set_data(
+            SurfaceTextureData(assignments=[assignment])
+        )
+        surface_workspace.data_changed.emit(surface_workspace.get_data())
+        _qt_application.processEvents()
+        source_id = build_atlas_wall_texture_source_id(
+            assignment.assignment_id
+        )
+        source_row = next(
+            row
+            for row in range(atlas_workspace.surface_list.count())
+            if atlas_workspace.surface_list.item(row).data(
+                Qt.ItemDataRole.UserRole
+            )
+            == source_id
+        )
+        atlas_workspace.surface_list.setCurrentRow(source_row)
+
+        with patch(
+            "housemaker.main.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            atlas_workspace.delete_surface_texture_button.click()
+        _qt_application.processEvents()
+
+        self.assertIsNone(
+            surface_workspace.get_assignment(assignment.assignment_id)
+        )
+        self.assertFalse(texture_path.exists())
         self.assertNotIn(source_id, atlas_workspace._sources_by_object_id)
 
 

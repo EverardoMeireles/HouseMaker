@@ -21,7 +21,7 @@ import trimesh
 from PIL import Image
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QSignalSpy, QTest
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication
 
 from housemaker.generation_state import (
     MASK_MODE_ERASE,
@@ -54,10 +54,8 @@ from housemaker.generation_workspace import (
     _build_geometry_fingerprint,
     _build_safe_duplicate_removal_pipeline_metadata,
     _build_staged_generation_pipeline_metadata,
-    _build_texture_resolution_entries,
     _collect_scene_glass_face_indices,
     _format_model_statistics,
-    _collect_model_uv_triangles,
     _remap_faces_by_world_geometry,
     _resolve_staged_postprocessed_asset_path,
     _staged_generation_mode,
@@ -89,7 +87,6 @@ from housemaker.settings_widget import (
     DEFAULT_MESHY_TARGET_POLYCOUNT,
     GenerationServiceSettings,
 )
-from housemaker.texture_atlas_view import TextureAtlasEntry
 from housemaker.unused_face_removal import (
     ALL_CAMERA_IDS,
     UnusedFaceRemovalCancelled,
@@ -1626,7 +1623,7 @@ class GenerationWorkspaceTests(unittest.TestCase):
             self.workspace.load_video(str(video_path))
 
             self.assertEqual(self.workspace.seekbar.maximum(), 2)
-            self.assertEqual(self.workspace.frame_label.text(), "Frame 1 / 3")
+            self.assertFalse(hasattr(self.workspace, "frame_label"))
             self.assertTrue(self.workspace.load_video_button.isEnabled())
             self.assertFalse(self.workspace.generate_button.isEnabled())
 
@@ -2054,29 +2051,26 @@ class GenerationWorkspaceTests(unittest.TestCase):
         self.assertFalse(self.workspace.wireframe_checkbox.isChecked())
         self.assertTrue(self.workspace.result_view.get_textures_enabled())
         self.assertFalse(self.workspace.result_view.get_wireframe_enabled())
-        self.assertFalse(self.workspace.texture_view.uv_overlay_enabled)
-        self.assertIn("UV", self.workspace.wireframe_checkbox.toolTip())
 
         self.workspace.textures_checkbox.setChecked(False)
         self.workspace.wireframe_checkbox.setChecked(True)
 
         self.assertFalse(self.workspace.result_view.get_textures_enabled())
         self.assertTrue(self.workspace.result_view.get_wireframe_enabled())
-        self.assertTrue(self.workspace.texture_view.uv_overlay_enabled)
 
-    def test_pbr_map_checkboxes_use_three_rows_in_stable_map_order(self) -> None:
+    def test_pbr_map_checkboxes_share_one_row_in_stable_map_order(self) -> None:
         layout = self.workspace.pbr_map_control.layout()
 
         self.assertIsNotNone(layout)
-        self.assertEqual(layout.rowCount(), 3)
-        self.assertEqual(layout.columnCount(), 1)
+        self.assertEqual(layout.rowCount(), 1)
+        self.assertEqual(layout.columnCount(), 3)
         self.assertEqual(tuple(self.workspace.pbr_map_checkboxes), PBR_MAP_TYPES)
         expected_labels = ("Normal", "Roughness", "Metallic")
-        for row, (map_type, expected_label) in enumerate(
+        for column, (map_type, expected_label) in enumerate(
             zip(PBR_MAP_TYPES, expected_labels, strict=True)
         ):
             checkbox = self.workspace.pbr_map_checkboxes[map_type]
-            item = layout.itemAtPosition(row, 0)
+            item = layout.itemAtPosition(0, column)
             self.assertIsNotNone(item)
             assert item is not None
             self.assertIs(item.widget(), checkbox)
@@ -2163,9 +2157,9 @@ class GenerationWorkspaceTests(unittest.TestCase):
         self,
     ) -> None:
         button = self.workspace.convert_faces_to_glass_button
-        double_sided_checkbox = self.workspace.glass_double_sided_checkbox
-        self.assertIs(button.parent(), double_sided_checkbox.parent())
-        self.assertFalse(double_sided_checkbox.isChecked())
+        self.assertFalse(
+            hasattr(self.workspace, "glass_double_sided_checkbox")
+        )
         self.assertFalse(button.isEnabled())
 
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -2215,7 +2209,6 @@ class GenerationWorkspaceTests(unittest.TestCase):
                     GenerationServiceSettings(meshy_api_key="meshy-key")
                 )
                 self.assertTrue(button.isEnabled())
-                double_sided_checkbox.setChecked(False)
 
                 with patch.object(
                     self.workspace,
@@ -2233,7 +2226,7 @@ class GenerationWorkspaceTests(unittest.TestCase):
         self.assertTrue(request.enable_original_uv)
         self.assertEqual(
             start_regeneration.call_args.kwargs,
-            {"requested_name": ""},
+            {},
         )
         self.assertTrue(
             all(
@@ -2245,7 +2238,6 @@ class GenerationWorkspaceTests(unittest.TestCase):
             self.workspace.result_view.get_pbr_maps_enabled(),
             {map_type: True for map_type in PBR_MAP_TYPES},
         )
-        double_sided_checkbox.setChecked(True)
         self.assertFalse(request.glass_double_sided)
 
     def test_glass_conversion_rejects_faces_covering_the_whole_object(
@@ -2427,52 +2419,6 @@ class GenerationWorkspaceTests(unittest.TestCase):
             ),
         )
 
-    def test_model_uv_triangles_are_collected_per_face_for_texture_preview(
-        self,
-    ) -> None:
-        model = import_generated_glb(_test_uv_glb())
-
-        triangles = _collect_model_uv_triangles(model)
-
-        np.testing.assert_allclose(
-            np.asarray(triangles),
-            np.asarray(
-                (
-                    ((0.1, 0.1), (0.9, 0.1), (0.9, 0.9)),
-                    ((0.1, 0.1), (0.9, 0.9), (0.1, 0.9)),
-                )
-            ),
-            rtol=0.0,
-            atol=1e-7,
-        )
-
-    def test_failed_object_load_clears_stale_uv_geometry_but_keeps_toggle(
-        self,
-    ) -> None:
-        self.workspace.wireframe_checkbox.setChecked(True)
-        self.workspace.texture_view.set_uv_overlay_triangles(
-            (((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)),)
-        )
-        missing_record = GeneratedObjectRecord(
-            object_id="missing-object",
-            frame_index=0,
-            object_name="Missing",
-            pipeline={},
-            provider=GENERATION_BACKEND_MESHY,
-            provider_task_id="missing-task",
-            asset_path="missing.glb",
-        )
-        self.workspace._data.generated_objects = [missing_record]
-
-        self.workspace._display_generated_object(missing_record)
-
-        self.assertEqual(self.workspace.texture_view.uv_overlay_triangles, ())
-        self.assertTrue(self.workspace.texture_view.uv_overlay_enabled)
-        self.assertIn(
-            "could not be rebuilt",
-            self.workspace.status_label.text(),
-        )
-
     def test_generated_model_statistics_are_displayed_and_reset(self) -> None:
         model = _test_model()
         self.workspace._handle_generation_succeeded(_test_meshy_result(), model)
@@ -2546,7 +2492,7 @@ class GenerationWorkspaceTests(unittest.TestCase):
             any(path.name.endswith(".postprocessed.glb") for path in saved_glbs)
         )
 
-    def test_object_list_selects_saved_models_and_current_texture_preview(
+    def test_direct_selection_loads_saved_models_without_an_object_list(
         self,
     ) -> None:
         self.workspace.shutdown()
@@ -2587,34 +2533,32 @@ class GenerationWorkspaceTests(unittest.TestCase):
             )
             self.workspace.set_data(data)
 
-            self.assertEqual(self.workspace.generated_objects_list.count(), 2)
             self.assertEqual(
-                self.workspace.generated_objects_list.currentRow(),
-                1,
+                self.workspace.get_generated_object_ids(),
+                ("first-object", "second-object"),
             )
+            self.assertFalse(hasattr(self.workspace, "generated_objects_list"))
             self.assertIsNotNone(self.workspace.result_view.model)
-            self.assertEqual(self.workspace.texture_view.entries, ())
-            self.assertIsNone(self.workspace.texture_view.selected_entry)
-            self.assertEqual(
-                self.workspace.texture_view.preview_label.text(),
-                "No texture resolutions available",
-            )
+            self.assertEqual(self.workspace._selected_object_id, "second-object")
 
-            self.workspace.generated_objects_list.setCurrentRow(0)
+            self.assertTrue(
+                self.workspace.select_generated_object("first-object")
+            )
             _qt_application.processEvents()
 
-            self.assertEqual(self.workspace.texture_view.entries, ())
-            self.assertIsNone(self.workspace.texture_view.selected_entry)
-
-            self.workspace.set_external_3d_viewer_active(True)
-            self.assertIs(
-                self.workspace.right_view_stack.currentWidget(),
-                self.workspace.texture_view_page,
+            self.assertEqual(self.workspace._selected_object_id, "first-object")
+            self.assertIsNotNone(self.workspace.result_view.model)
+            assert self.workspace.result_view.model is not None
+            self.assertEqual(
+                self.workspace.result_view.model.glb_bytes,
+                first_model.glb_bytes,
             )
-            self.workspace.set_external_3d_viewer_active(False)
-            self.assertIs(
-                self.workspace.right_view_stack.currentWidget(),
-                self.workspace.object_3d_page,
+
+            self.assertFalse(
+                hasattr(
+                    self.workspace.object_3d_panel,
+                    "is_external_presentation_active",
+                )
             )
 
     def test_unchanged_object_preview_refresh_preserves_resources(
@@ -2625,30 +2569,14 @@ class GenerationWorkspaceTests(unittest.TestCase):
             _test_meshy_result(),
             model,
         )
-        record = self.workspace._data.generated_objects[-1]
-        original_item = self.workspace.generated_objects_list.item(0)
-
         with (
             patch.object(self.workspace.result_view, "clear_model") as clear,
             patch.object(self.workspace.result_view, "set_model") as set_model,
-            patch(
-                "housemaker.generation_workspace._collect_model_uv_triangles"
-            ) as collect_uvs,
-            patch(
-                "housemaker.generation_workspace."
-                "_build_texture_resolution_entries"
-            ) as build_texture_entries,
         ):
             self.workspace.refresh_file_backed_previews()
 
-        self.assertIs(
-            self.workspace.generated_objects_list.item(0),
-            original_item,
-        )
         clear.assert_not_called()
         set_model.assert_not_called()
-        collect_uvs.assert_not_called()
-        build_texture_entries.assert_not_called()
 
     def test_in_place_preview_record_change_invalidates_display_snapshot(
         self,
@@ -2664,16 +2592,11 @@ class GenerationWorkspaceTests(unittest.TestCase):
         with (
             patch.object(self.workspace.result_view, "clear_model") as clear,
             patch.object(self.workspace.result_view, "set_model") as set_model,
-            patch.object(
-                self.workspace,
-                "_refresh_object_texture_atlases",
-            ) as refresh_textures,
         ):
-            self.workspace._refresh_generated_objects_list(record.object_id)
+            self.workspace.select_generated_object(record.object_id)
 
         clear.assert_called_once_with()
         set_model.assert_called_once_with(model)
-        refresh_textures.assert_called_once_with(record.object_id)
 
     def test_same_path_glb_replacement_reloads_preview_and_signature(
         self,
@@ -2764,84 +2687,6 @@ class GenerationWorkspaceTests(unittest.TestCase):
             revision_after,
         )
 
-    def test_texture_resolution_entries_are_cached_by_content_revision(
-        self,
-    ) -> None:
-        model = _test_model()
-        self.workspace._handle_generation_succeeded(
-            _test_meshy_result(),
-            model,
-        )
-        record = self.workspace._data.generated_objects[-1]
-        self.workspace._texture_resolution_entry_cache.clear()
-
-        with patch(
-            "housemaker.generation_workspace._build_texture_resolution_entries",
-            wraps=_build_texture_resolution_entries,
-        ) as build_entries:
-            self.workspace._refresh_object_texture_atlases(record.object_id)
-            self.workspace._refresh_object_texture_atlases(record.object_id)
-            record.pipeline[TEXTURE_VARIANTS_PIPELINE_KEY] = {}
-            self.workspace._refresh_object_texture_atlases(record.object_id)
-
-        self.assertEqual(build_entries.call_count, 2)
-
-    def test_known_missing_texture_variant_is_cached_until_reappearance(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            asset_directory = Path(temporary_directory)
-            self.workspace._asset_directory = asset_directory
-            model = _test_model()
-            valid_glb = "cache-512.glb"
-            valid_png = "cache-512.png"
-            missing_glb = "cache-1024.glb"
-            missing_png = "cache-1024.png"
-            (asset_directory / valid_glb).write_bytes(model.glb_bytes)
-            Image.new("RGBA", (32, 32), (30, 70, 110, 255)).save(
-                asset_directory / valid_png
-            )
-            record = GeneratedObjectRecord(
-                object_id="partial-cache",
-                frame_index=0,
-                object_name="Partial cache",
-                pipeline={
-                    TEXTURE_VARIANTS_PIPELINE_KEY: {
-                        "512": {
-                            "glb_asset_path": valid_glb,
-                            "texture_asset_path": valid_png,
-                        },
-                        "1024": {
-                            "glb_asset_path": missing_glb,
-                            "texture_asset_path": missing_png,
-                        },
-                    },
-                    "selected_texture_resolution": 512,
-                },
-                provider_task_id="partial-cache-task",
-                asset_path=valid_glb,
-            )
-            self.workspace._data.generated_objects = [record]
-
-            with patch(
-                "housemaker.generation_workspace."
-                "_build_texture_resolution_entries",
-                wraps=_build_texture_resolution_entries,
-            ) as build_entries:
-                self.workspace._refresh_object_texture_atlases(record.object_id)
-                self.workspace._refresh_object_texture_atlases(record.object_id)
-                self.assertEqual(build_entries.call_count, 1)
-                self.assertEqual(len(self.workspace.texture_view.entries), 1)
-
-                (asset_directory / missing_glb).write_bytes(model.glb_bytes)
-                Image.new("RGBA", (32, 32), (110, 70, 30, 255)).save(
-                    asset_directory / missing_png
-                )
-                self.workspace._refresh_object_texture_atlases(record.object_id)
-
-            self.assertEqual(build_entries.call_count, 2)
-            self.assertEqual(len(self.workspace.texture_view.entries), 2)
-
     def test_activation_does_not_repair_a_temporarily_missing_selection(
         self,
     ) -> None:
@@ -2905,61 +2750,6 @@ class GenerationWorkspaceTests(unittest.TestCase):
             self.assertEqual(restored_record.asset_path, "selection-1024.glb")
             self.assertIsNotNone(self.workspace.result_view.model)
 
-    def test_failed_object_thumbnail_decode_retries_same_revision(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            asset_directory = Path(temporary_directory)
-            self.workspace._asset_directory = asset_directory
-            model = _test_model()
-            glb_path = "retry-thumbnail.glb"
-            png_path = "retry-thumbnail.png"
-            (asset_directory / glb_path).write_bytes(model.glb_bytes)
-            Image.new("RGBA", (32, 32), (30, 70, 110, 255)).save(
-                asset_directory / png_path
-            )
-            record = GeneratedObjectRecord(
-                object_id="retry-thumbnail",
-                frame_index=0,
-                object_name="Retry thumbnail",
-                pipeline={
-                    TEXTURE_VARIANTS_PIPELINE_KEY: {
-                        "512": {
-                            "glb_asset_path": glb_path,
-                            "texture_asset_path": png_path,
-                        },
-                    },
-                    "selected_texture_resolution": 512,
-                },
-                provider_task_id="retry-thumbnail-task",
-                asset_path=glb_path,
-            )
-            self.workspace._data.generated_objects = [record]
-            failed_once = False
-
-            def build_entry(*args, **kwargs):
-                nonlocal failed_once
-                if not failed_once:
-                    failed_once = True
-                    raise ValueError("temporary thumbnail decode failure")
-                return TextureAtlasEntry(*args, **kwargs)
-
-            with patch(
-                "housemaker.generation_workspace.TextureAtlasEntry",
-                side_effect=build_entry,
-            ) as entry_builder:
-                self.workspace._refresh_object_texture_atlases(record.object_id)
-                self.assertNotIn(
-                    record.object_id,
-                    self.workspace._texture_resolution_entry_cache,
-                )
-                self.workspace._refresh_object_texture_atlases(record.object_id)
-
-            self.assertEqual(entry_builder.call_count, 2)
-            self.assertEqual(len(self.workspace.texture_view.entries), 1)
-            self.assertIn(
-                record.object_id,
-                self.workspace._texture_resolution_entry_cache,
-            )
-
     def test_unvalidated_model_is_not_bound_to_a_newer_file_revision(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             asset_directory = Path(temporary_directory)
@@ -2997,15 +2787,41 @@ class GenerationWorkspaceTests(unittest.TestCase):
             1.0,
         )
 
-    def test_paint_and_erase_controls_are_stacked_vertically(self) -> None:
+    def test_mask_tools_use_compact_two_by_two_grid(self) -> None:
         layout = self.workspace.mask_mode_control.layout()
+        brush_control = self.workspace.mask_mode_control.findChild(
+            type(self.workspace.mask_mode_control),
+            "object_generation_brush_size_control",
+        )
 
         self.assertIsNotNone(layout)
+        self.assertIsNotNone(brush_control)
+        assert brush_control is not None
         self.assertEqual(layout.getContentsMargins(), (0, 0, 0, 0))
-        self.assertEqual(layout.spacing(), 0)
-        self.assertEqual(layout.count(), 2)
-        self.assertIs(layout.itemAt(0).widget(), self.workspace.paint_mask_button)
-        self.assertIs(layout.itemAt(1).widget(), self.workspace.erase_mask_button)
+        self.assertEqual(layout.count(), 4)
+        expected_positions = (
+            (self.workspace.paint_mask_button, (0, 0, 1, 1)),
+            (self.workspace.erase_mask_button, (1, 0, 1, 1)),
+            (brush_control, (0, 1, 1, 1)),
+            (self.workspace.clear_mask_button, (1, 1, 1, 1)),
+        )
+        for widget, expected_position in expected_positions:
+            with self.subTest(widget=widget.objectName() or widget.text()):
+                self.assertEqual(
+                    layout.getItemPosition(layout.indexOf(widget)),
+                    expected_position,
+                )
+
+        brush_layout = brush_control.layout()
+        self.assertIsNotNone(brush_layout)
+        assert brush_layout is not None
+        self.assertEqual(brush_layout.itemAt(0).widget().text(), "Brush size")
+        self.assertIs(
+            brush_layout.itemAt(1).widget(),
+            self.workspace.brush_size_spinbox,
+        )
+        self.assertEqual(self.workspace.brush_size_spinbox.maximumWidth(), 76)
+        self.assertEqual(self.workspace.clear_mask_button.maximumWidth(), 88)
 
     def test_shutdown_discards_an_in_flight_meshy_result(self) -> None:
         planner = _BlockingMeshyPlanner()
@@ -3076,29 +2892,6 @@ class GeneratedObjectDeletionTests(unittest.TestCase):
         _qt_application.processEvents()
         return records
 
-    def test_delete_button_is_visible_and_requires_a_selected_object(
-        self,
-    ) -> None:
-        button = self.workspace.delete_generated_object_button
-
-        self.assertIs(
-            button,
-            self.workspace.object_3d_panel.delete_object_button,
-        )
-        self.assertEqual(button.text(), "Delete object")
-        self.assertTrue(button.isVisible())
-        self.assertFalse(button.isEnabled())
-
-        self._set_generated_objects(
-            [("chair", "Chair", (180, 30, 20, 255))]
-        )
-        self.assertTrue(button.isEnabled())
-
-        self.workspace.generated_objects_list.setCurrentRow(-1)
-        _qt_application.processEvents()
-        self.assertFalse(button.isEnabled())
-        self.assertFalse(self.workspace.delete_selected_generated_object())
-
     def test_remove_placement_retains_generated_record_and_assets(self) -> None:
         records = self._set_generated_objects(
             [("chair", "Chair", (180, 30, 20, 255))]
@@ -3135,42 +2928,6 @@ class GeneratedObjectDeletionTests(unittest.TestCase):
             self.workspace.remove_generated_object_placement("chair")
         )
 
-    def test_delete_button_confirms_and_cancel_preserves_the_object(self) -> None:
-        self._set_generated_objects(
-            [("chair", "Chair", (180, 30, 20, 255))]
-        )
-        button = self.workspace.delete_generated_object_button
-
-        with patch(
-            "housemaker.generation_workspace.QMessageBox.question",
-            return_value=QMessageBox.StandardButton.No,
-        ) as question_mock:
-            QTest.mouseClick(button, Qt.MouseButton.LeftButton)
-            _qt_application.processEvents()
-
-        question_mock.assert_called_once()
-        self.assertEqual(
-            [
-                record.object_id
-                for record in self.workspace.get_data().generated_objects
-            ],
-            ["chair"],
-        )
-        self.assertTrue(button.isEnabled())
-
-        with patch(
-            "housemaker.generation_workspace.QMessageBox.question",
-            return_value=QMessageBox.StandardButton.Yes,
-        ) as question_mock:
-            QTest.mouseClick(button, Qt.MouseButton.LeftButton)
-            _qt_application.processEvents()
-
-        question_mock.assert_called_once()
-        self.assertEqual(self.workspace.get_data().generated_objects, [])
-        self.assertEqual(self.workspace.generated_objects_list.count(), 0)
-        self.assertFalse(button.isEnabled())
-        self.assertIsNone(self.workspace.result_view.model)
-
     def test_delete_selects_successor_then_previous_for_the_last_row(
         self,
     ) -> None:
@@ -3181,12 +2938,11 @@ class GeneratedObjectDeletionTests(unittest.TestCase):
                 ("third", "Third", (20, 30, 180, 255)),
             ]
         )
-        self.workspace.generated_objects_list.setCurrentRow(1)
+        self.assertTrue(self.workspace.select_generated_object("second"))
         _qt_application.processEvents()
 
         self.assertTrue(self.workspace.delete_selected_generated_object())
         self.assertEqual(self.workspace._selected_object_id, "third")
-        self.assertEqual(self.workspace.generated_objects_list.currentRow(), 1)
         self.assertEqual(
             [
                 record.object_id
@@ -3197,7 +2953,6 @@ class GeneratedObjectDeletionTests(unittest.TestCase):
 
         self.assertTrue(self.workspace.delete_generated_object("third"))
         self.assertEqual(self.workspace._selected_object_id, "first")
-        self.assertEqual(self.workspace.generated_objects_list.currentRow(), 0)
         self.assertEqual(
             [
                 record.object_id
@@ -3206,7 +2961,7 @@ class GeneratedObjectDeletionTests(unittest.TestCase):
             ["first"],
         )
 
-    def test_delete_removes_record_model_cache_and_texture_preview(
+    def test_delete_removes_record_and_model_cache_then_selects_successor(
         self,
     ) -> None:
         self._set_generated_objects(
@@ -3215,7 +2970,7 @@ class GeneratedObjectDeletionTests(unittest.TestCase):
                 ("second", "Second", (20, 180, 30, 255)),
             ]
         )
-        self.workspace.generated_objects_list.setCurrentRow(0)
+        self.assertTrue(self.workspace.select_generated_object("first"))
         _qt_application.processEvents()
         changed_spy = QSignalSpy(self.workspace.data_changed)
 
@@ -3224,7 +2979,6 @@ class GeneratedObjectDeletionTests(unittest.TestCase):
 
         self.assertEqual(changed_spy.count(), 1)
         self.assertNotIn("first", self.workspace._generated_model_cache)
-        self.assertEqual(self.workspace.texture_view.entries, ())
         self.assertEqual(self.workspace._selected_object_id, "second")
         self.assertIsNotNone(self.workspace.result_view.model)
 
@@ -3343,9 +3097,6 @@ class GeneratedObjectDeletionTests(unittest.TestCase):
 
         self.workspace._start_generation(request)
         self.assertTrue(planner.started.wait(timeout=1.0))
-        self.assertTrue(
-            self.workspace.delete_generated_object_button.isEnabled()
-        )
         self.assertTrue(self.workspace.delete_generated_object("chair"))
         self.assertEqual(
             [

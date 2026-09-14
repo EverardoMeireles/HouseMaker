@@ -362,10 +362,7 @@ class LevelControlsTests(unittest.TestCase):
         workspace.resize(1400, 850)
         workspace.show()
         workspace.workspace_tabs.setCurrentWidget(
-            workspace.canvas_viewer_workspace
-        )
-        workspace.canvas_viewer_tabs.setCurrentIndex(
-            workspace.canvas_3d_view_tab_index
+            workspace.scene_3d_workspace
         )
         _qt_application.processEvents()
         self.assertAlmostEqual(

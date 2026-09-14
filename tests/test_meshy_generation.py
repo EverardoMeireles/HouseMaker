@@ -20,6 +20,7 @@ except ImportError:
 from housemaker.glb import GeneratedModel, import_generated_glb
 from housemaker.meshy_generation import (
     DEFAULT_SMART_TOPOLOGY_TARGET_POLYCOUNT,
+    MAX_IMAGE_TO_3D_TEXTURE_PROMPT_CHARACTERS,
     MAX_SMART_TOPOLOGY_TARGET_POLYCOUNT,
     MESHY_IMAGE_TO_3D_ENDPOINT,
     MESHY_RETEXTURE_ENDPOINT,
@@ -175,6 +176,7 @@ class MeshyRequestConstructionTests(unittest.TestCase):
             "should_remesh",
             "topology",
             "image_enhancement",
+            "texture_prompt",
         ):
             self.assertNotIn(incompatible_option, body)
 
@@ -182,6 +184,7 @@ class MeshyRequestConstructionTests(unittest.TestCase):
         body = build_image_to_3d_request_body(
             b"png bytes",
             should_texture=False,
+            texture_prompt="polished walnut",
         )
 
         self.assertFalse(body["should_texture"])
@@ -189,6 +192,40 @@ class MeshyRequestConstructionTests(unittest.TestCase):
         self.assertEqual(body["target_formats"], ["glb"])
         self.assertNotIn("texture_resolution", body)
         self.assertNotIn("enable_pbr", body)
+        self.assertNotIn("texture_prompt", body)
+
+    def test_textured_request_normalizes_and_includes_optional_prompt(
+        self,
+    ) -> None:
+        body = build_image_to_3d_request_body(
+            b"png bytes",
+            texture_prompt="  weathered walnut with brass handles  ",
+        )
+
+        self.assertEqual(
+            body["texture_prompt"],
+            "weathered walnut with brass handles",
+        )
+
+    def test_image_to_3d_request_validates_optional_prompt(self) -> None:
+        blank_body = build_image_to_3d_request_body(
+            b"png bytes",
+            texture_prompt=" \n\t ",
+        )
+
+        self.assertNotIn("texture_prompt", blank_body)
+        with self.assertRaisesRegex(TypeError, "texture prompt"):
+            build_image_to_3d_request_body(
+                b"png bytes",
+                texture_prompt=None,  # type: ignore[arg-type]
+            )
+        with self.assertRaisesRegex(ValueError, "at most 800"):
+            build_image_to_3d_request_body(
+                b"png bytes",
+                texture_prompt=(
+                    "x" * (MAX_IMAGE_TO_3D_TEXTURE_PROMPT_CHARACTERS + 1)
+                ),
+            )
 
     def test_image_to_3d_request_can_enable_pbr_maps(self) -> None:
         body = build_image_to_3d_request_body(
@@ -247,6 +284,7 @@ class MeshyRequestConstructionTests(unittest.TestCase):
             "input_task_id",
             "multiview_image_urls",
             "moderation",
+            "texture_prompt",
         ):
             self.assertNotIn(forbidden_option, body)
 
@@ -339,6 +377,7 @@ class MeshyRequestConstructionTests(unittest.TestCase):
             opener=opener,
             target_polycount=6_789,
             enable_pbr=True,
+            texture_prompt="  blue ceramic  ",
         )
 
         self.assertEqual(task_id, "task-123")
@@ -356,6 +395,7 @@ class MeshyRequestConstructionTests(unittest.TestCase):
         self.assertIn("glb", sent_body["target_formats"])
         self.assertEqual(sent_body["target_polycount"], 6_789)
         self.assertTrue(sent_body["enable_pbr"])
+        self.assertEqual(sent_body["texture_prompt"], "blue ceramic")
 
     def test_get_task_uses_same_endpoint_and_bearer_auth(self) -> None:
         task_payload = {
@@ -683,6 +723,7 @@ class MeshyImageTo3DClientTests(unittest.TestCase):
             sleep=lambda _seconds: None,
             target_polycount=5_432,
             enable_pbr=True,
+            texture_prompt="aged oak",
         )
 
         self.assertEqual(result.task_id, "task-123")
@@ -691,6 +732,7 @@ class MeshyImageTo3DClientTests(unittest.TestCase):
         submitted_body = json.loads(opener.requests[0].data.decode("utf-8"))
         self.assertEqual(submitted_body["target_polycount"], 5_432)
         self.assertTrue(submitted_body["enable_pbr"])
+        self.assertEqual(submitted_body["texture_prompt"], "aged oak")
 
     def test_geometry_only_client_submits_without_texture_and_downloads_glb(
         self,

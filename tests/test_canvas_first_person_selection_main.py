@@ -113,10 +113,7 @@ class CanvasFirstPersonSelectionMainTests(unittest.TestCase):
         self.workspace.resize(1400, 850)
         self.workspace.show()
         self.workspace.workspace_tabs.setCurrentWidget(
-            self.workspace.canvas_viewer_workspace
-        )
-        self.workspace.canvas_viewer_tabs.setCurrentIndex(
-            self.workspace.canvas_3d_view_tab_index
+            self.workspace.scene_3d_workspace
         )
         _qt_application.processEvents()
 
@@ -164,13 +161,6 @@ class CanvasFirstPersonSelectionMainTests(unittest.TestCase):
             NAVIGATION_MODE_FIRST_PERSON,
         )
         self.assertEqual(_camera_state(viewer.view), first_person_state)
-        self.assertEqual(
-            self.workspace.canvas_viewer_tabs.tabText(
-                self.workspace.canvas_3d_view_tab_index
-            ),
-            "3D view (first person)",
-        )
-
         with patch.object(viewer.view, "build_camera_ray", return_value=ray):
             QTest.mouseClick(
                 viewer.view,
@@ -218,13 +208,6 @@ class CanvasFirstPersonSelectionMainTests(unittest.TestCase):
         self.assertEqual(viewer.get_navigation_mode(), NAVIGATION_MODE_ORBIT)
         self.assertFalse(viewer.is_window_placement_active())
         self.assertEqual(_camera_state(viewer.view), orbit_state)
-        self.assertEqual(
-            self.workspace.canvas_viewer_tabs.tabText(
-                self.workspace.canvas_3d_view_tab_index
-            ),
-            "3D view",
-        )
-
     def test_detached_viewer_keeps_first_person_selection_until_hotkey(
         self,
     ) -> None:
@@ -234,14 +217,14 @@ class CanvasFirstPersonSelectionMainTests(unittest.TestCase):
             "housemaker.main.resolve_fullscreen_3d_viewer_screen",
             return_value=_primary_screen(),
         ):
-            self.workspace._apply_fullscreen_3d_viewer_screen(
+            self.workspace._apply_scene_3d_display_screen(
                 "first-person-selection-screen"
             )
         _qt_application.processEvents()
 
-        host = self.workspace._external_viewer_host
+        host = self.workspace._external_scene_3d_host
         self.assertTrue(host.is_active)
-        self.assertIs(host.viewer, viewer)
+        self.assertIs(host.viewer, self.workspace.scene_3d_workspace)
 
         QTest.keyClick(viewer.view, Qt.Key.Key_N)
         _qt_application.processEvents()
@@ -261,7 +244,7 @@ class CanvasFirstPersonSelectionMainTests(unittest.TestCase):
             )
         QTest.keyRelease(viewer.view, Qt.Key.Key_Control)
 
-        self.assertIs(host.viewer, viewer)
+        self.assertIs(host.viewer, self.workspace.scene_3d_workspace)
         self.assertTrue(viewer.is_first_person_pointer_captured)
         self.assertEqual(
             viewer.get_navigation_mode(),
@@ -272,7 +255,7 @@ class CanvasFirstPersonSelectionMainTests(unittest.TestCase):
         QTest.keyClick(viewer.view, Qt.Key.Key_N)
         _qt_application.processEvents()
 
-        self.assertIs(host.viewer, viewer)
+        self.assertIs(host.viewer, self.workspace.scene_3d_workspace)
         self.assertEqual(viewer.get_navigation_mode(), NAVIGATION_MODE_ORBIT)
 
 

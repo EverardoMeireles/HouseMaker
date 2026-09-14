@@ -24,14 +24,16 @@ from PySide6.QtWidgets import QApplication
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.glb import GeneratedModel
 from housemaker.main import BlueprintWorkspace
-from housemaker.settings_widget import FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY
+from housemaker.settings_widget import (
+    GENERATION_DISPLAY_SCREEN_SETTING_KEY,
+    SCENE_3D_DISPLAY_SCREEN_SETTING_KEY,
+)
 from housemaker.surface_texture_state import (
     SURFACE_TYPE_WALL,
     SurfaceTextureAssignment,
     SurfaceTextureData,
 )
 from housemaker.texture_atlas_state import TextureAtlasData
-from housemaker.texture_atlas_view import TextureAtlasEntry
 from housemaker.texture_atlas_workspace import (
     build_atlas_wall_texture_source_id,
 )
@@ -61,7 +63,9 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
         _qt_application.processEvents()
         self._temporary_directory.cleanup()
 
-    def test_resolved_display_detaches_viewer_and_none_restores_it(self) -> None:
+    def test_scene_display_detaches_top_level_workspace_and_restores_it(
+        self,
+    ) -> None:
         screen = _primary_screen()
         screen_id = "screen:external-test"
 
@@ -69,38 +73,46 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
             "housemaker.main.resolve_fullscreen_3d_viewer_screen",
             return_value=screen,
         ) as resolve_mock:
-            self.workspace._apply_fullscreen_3d_viewer_screen(screen_id)
+            self.workspace._apply_scene_3d_display_screen(screen_id)
 
         resolve_mock.assert_called_once_with(screen_id)
-        self.assertTrue(self.workspace._external_viewer_host.is_active)
-        self.assertIs(self.workspace._external_viewer_host.viewer, self.workspace.viewer)
-        self.assertIs(self.workspace._external_viewer_host.screen, screen)
+        host = self.workspace._external_scene_3d_host
+        scene_workspace = self.workspace.scene_3d_workspace
+        self.assertTrue(host.is_active)
+        self.assertIs(host.viewer, scene_workspace)
+        self.assertIs(host.screen, screen)
+        self.assertIs(
+            scene_workspace.parentWidget(),
+            host.window,
+        )
         self.assertIs(
             self.workspace.viewer.parentWidget(),
-            self.workspace._external_viewer_host.window,
+            scene_workspace,
         )
-        self.assertIsNot(
-            self._canvas_3d_tab_widget(),
-            self.workspace.viewer,
-        )
+        self.assertTrue(host.window.isMaximized())
+        self.assertEqual(self.workspace.workspace_tabs.indexOf(scene_workspace), -1)
+        self.assertEqual(self.workspace.scene_3d_workspace_tab_index, -1)
 
-        self.workspace._apply_fullscreen_3d_viewer_screen(None)
+        self.workspace._apply_scene_3d_display_screen(None)
 
-        self.assertFalse(self.workspace._external_viewer_host.is_active)
+        self.assertFalse(host.is_active)
         self.assertIs(
-            self._canvas_3d_tab_widget(),
-            self.workspace.viewer,
+            self.workspace.workspace_tabs.widget(
+                self.workspace.scene_3d_workspace_tab_index
+            ),
+            scene_workspace,
+        )
+        self.assertEqual(
+            self.workspace.scene_3d_workspace_tab_index,
+            self.workspace.workspace_tabs.indexOf(
+                self.workspace.canvas_viewer_workspace
+            )
+            + 1,
         )
 
-    def test_canvas_model_is_visible_after_external_fullscreen_handoff(
+    def test_scene_model_is_visible_after_external_handoff(
         self,
     ) -> None:
-        """A hidden Canvas 3D subtab must become visible on its display."""
-
-        self.assertEqual(
-            self.workspace.canvas_viewer_tabs.currentIndex(),
-            self.workspace.canvas_2d_view_tab_index,
-        )
         model = _generated_box_model()
         self.workspace.viewer.set_model(model)
         self.workspace._remember_current_canvas_preview_model(
@@ -110,41 +122,71 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
             ),
         )
 
-        self._detach_viewer("screen:external-test")
+        self._detach_scene("screen:external-test")
         _qt_application.processEvents()
 
         viewer = self.workspace.viewer
+        host = self.workspace._external_scene_3d_host
         self.assertIs(viewer.model, model)
         self.assertIsNotNone(viewer.mesh_item)
         self.assertIn(viewer.mesh_item, viewer.view.items)
-        self.assertTrue(self.workspace._external_viewer_host.window.isVisible())
+        self.assertTrue(host.window.isVisible())
+        self.assertTrue(self.workspace.scene_3d_workspace.isVisible())
         self.assertTrue(viewer.isVisible())
         self.assertTrue(viewer.view.isVisible())
         self.assertGreater(viewer.view.width(), 0)
         self.assertGreater(viewer.view.height(), 0)
 
-    def test_external_display_routes_to_the_active_tab_3d_view(self) -> None:
-        screen_id = "screen:external-test"
-        combo = self.workspace.settings_widget.fullscreen_3d_viewer_screen_combo
-        combo.addItem("External test display", screen_id)
+    def test_scene_and_generation_displays_remain_hosted_independently(
+        self,
+    ) -> None:
+        scene_screen_id = "screen:external-scene-test"
+        generation_screen_id = "screen:external-generation-test"
+        scene_combo = self.workspace.settings_widget.scene_3d_display_screen_combo
+        generation_combo = (
+            self.workspace.settings_widget.generation_display_screen_combo
+        )
+        scene_combo.addItem("External scene display", scene_screen_id)
+        generation_combo.addItem(
+            "External Generation display",
+            generation_screen_id,
+        )
 
         with patch(
             "housemaker.main.resolve_fullscreen_3d_viewer_screen",
             return_value=_primary_screen(),
         ):
-            combo.setCurrentIndex(combo.findData(screen_id))
-            self._assert_externally_hosted_viewer_is(self.workspace.viewer)
-            self.assertTrue(self.workspace.canvas_viewer_tabs.tabBar().isHidden())
-            self.assertFalse(
-                self.workspace.canvas_viewer_tabs.isTabEnabled(
-                    self.workspace.canvas_3d_view_tab_index
-                )
+            scene_combo.setCurrentIndex(scene_combo.findData(scene_screen_id))
+            generation_combo.setCurrentIndex(
+                generation_combo.findData(generation_screen_id)
             )
+            _qt_application.processEvents()
 
+            self._assert_externally_hosted_workspace_is(
+                self.workspace._external_scene_3d_host,
+                self.workspace.scene_3d_workspace,
+            )
+            self._assert_externally_hosted_workspace_is(
+                self.workspace._external_generation_host,
+                self.workspace.merged_generation_workspace,
+            )
+            self.assertEqual(
+                self.workspace.workspace_tabs.indexOf(
+                    self.workspace.scene_3d_workspace
+                ),
+                -1,
+            )
+            self.assertEqual(
+                self.workspace.workspace_tabs.indexOf(
+                    self.workspace.merged_generation_workspace
+                ),
+                -1,
+            )
             self.workspace.workspace_tabs.setCurrentWidget(
                 self.workspace.texture_atlas_workspace
             )
-            self.assertFalse(self.workspace._external_viewer_host.is_active)
+            self.assertTrue(self.workspace._external_scene_3d_host.is_active)
+            self.assertTrue(self.workspace._external_generation_host.is_active)
             self.assertIs(
                 self.workspace.atlas_object_preview_viewer.parentWidget(),
                 self.workspace.texture_atlas_workspace.object_preview_container,
@@ -154,56 +196,28 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
             )
 
             self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.surface_texture_generation
-            )
-            self._assert_externally_hosted_viewer_is(
-                self.workspace.surface_texture_generation.surface_view
-            )
-            self.assertIs(
-                self.workspace.surface_texture_generation.right_view_stack.currentWidget(),
-                self.workspace.surface_texture_generation.texture_view_page,
-            )
-            self.assertFalse(
-                self.workspace.canvas_viewer_tabs.tabBar().isHidden()
-            )
-            self.assertTrue(
-                self.workspace.canvas_viewer_tabs.isTabEnabled(
-                    self.workspace.canvas_3d_view_tab_index
-                )
-            )
-
-            self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.generation
-            )
-            self._assert_externally_hosted_viewer_is(
-                self.workspace.generation.object_3d_panel
-            )
-            self.assertIs(
-                self.workspace.generation.right_view_stack.currentWidget(),
-                self.workspace.generation.texture_view_page,
-            )
-            self.assertIs(
-                self.workspace.generation.generated_objects_list.parentWidget(),
-                self.workspace.generation.object_3d_panel.details_panel,
-            )
-
-            self.workspace.workspace_tabs.setCurrentWidget(
                 self.workspace.settings_widget
             )
-            self.assertFalse(self.workspace._external_viewer_host.is_active)
-            self.assertIs(
-                self.workspace.surface_texture_generation.right_view_stack.currentWidget(),
-                self.workspace.surface_texture_generation.surface_3d_page,
-            )
-            self.assertIs(
-                self.workspace.generation.right_view_stack.currentWidget(),
-                self.workspace.generation.object_3d_page,
-            )
+            self.assertTrue(self.workspace._external_scene_3d_host.is_active)
+            self.assertTrue(self.workspace._external_generation_host.is_active)
 
-            self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.canvas_viewer_workspace
-            )
-            self._assert_externally_hosted_viewer_is(self.workspace.viewer)
+            scene_combo.setCurrentIndex(0)
+            _qt_application.processEvents()
+
+        self.assertFalse(self.workspace._external_scene_3d_host.is_active)
+        self.assertTrue(self.workspace._external_generation_host.is_active)
+        self.assertGreaterEqual(
+            self.workspace.workspace_tabs.indexOf(
+                self.workspace.scene_3d_workspace
+            ),
+            0,
+        )
+        self.assertEqual(
+            self.workspace.workspace_tabs.indexOf(
+                self.workspace.merged_generation_workspace
+            ),
+            -1,
+        )
 
     def test_atlas_click_loads_exact_variant_in_embedded_viewer(self) -> None:
         asset_path = Path(self._temporary_directory.name) / "chair-2048.glb"
@@ -389,7 +403,7 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
             )
 
             self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.generation
+                self.workspace.merged_generation_workspace
             )
             self.assertTrue(self.workspace._external_atlas_host.is_active)
 
@@ -403,7 +417,7 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
         self.assertEqual(
             restored_atlas_index,
             self.workspace.workspace_tabs.indexOf(
-                self.workspace.canvas_viewer_workspace
+                self.workspace.scene_3d_workspace
             )
             + 1,
         )
@@ -419,9 +433,9 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
         )
         self.assertIs(
             self.workspace.workspace_tabs.currentWidget(),
-            self.workspace.generation,
+            self.workspace.merged_generation_workspace,
         )
-        self.assertTrue(self.workspace.generation.isVisible())
+        self.assertTrue(self.workspace.merged_generation_workspace.isVisible())
         self.assertFalse(
             self.workspace.texture_atlas_workspace.isVisible()
         )
@@ -442,7 +456,7 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
         ):
             combo.setCurrentIndex(combo.findData(screen_id))
             self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.generation
+                self.workspace.merged_generation_workspace
             )
             self.workspace._external_atlas_host.window.close()
             _qt_application.processEvents()
@@ -451,14 +465,14 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
         self.assertIsNone(combo.currentData())
         self.assertIs(
             self.workspace.workspace_tabs.currentWidget(),
-            self.workspace.generation,
+            self.workspace.merged_generation_workspace,
         )
         self.assertEqual(
             self.workspace.workspace_tabs.indexOf(
                 self.workspace.texture_atlas_workspace
             ),
             self.workspace.workspace_tabs.indexOf(
-                self.workspace.canvas_viewer_workspace
+                self.workspace.scene_3d_workspace
             )
             + 1,
         )
@@ -516,18 +530,18 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
 
         clear_model.assert_called_once_with()
 
-    def test_complete_object_panel_is_visible_beside_external_viewer(
+    def test_generation_display_detaches_complete_workspace_and_restores_tab(
         self,
     ) -> None:
-        screen_id = "screen:external-object-panel-test"
-        combo = self.workspace.settings_widget.fullscreen_3d_viewer_screen_combo
-        combo.addItem("External object-panel display", screen_id)
+        screen_id = "screen:external-generation-test"
+        combo = self.workspace.settings_widget.generation_display_screen_combo
+        combo.addItem("External Generation display", screen_id)
+        merged = self.workspace.merged_generation_workspace
         generation = self.workspace.generation
         panel = generation.object_3d_panel
         model = _generated_box_model()
         panel.viewer.set_model(model)
         generation._sync_model_statistics(model)
-        generation.generated_objects_list.addItem("Generated test object")
 
         with (
             patch(
@@ -537,68 +551,69 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
             patch.object(generation, "refresh_file_backed_previews"),
         ):
             combo.setCurrentIndex(combo.findData(screen_id))
-            self.workspace.workspace_tabs.setCurrentWidget(generation)
             _qt_application.processEvents()
 
-        external_window = self.workspace._external_viewer_host.window
-        self._assert_externally_hosted_viewer_is(panel)
-        self.assertTrue(panel.is_external_presentation_active)
-        self.assertIs(
-            generation.right_view_stack.currentWidget(),
-            generation.texture_view_page,
-        )
-        self.assertGreaterEqual(
-            panel.details_panel.geometry().left(),
-            panel.viewer.geometry().right(),
-        )
+        host = self.workspace._external_generation_host
+        external_window = host.window
+        self._assert_externally_hosted_workspace_is(host, merged)
+        self.assertTrue(external_window.isMaximized())
+        self.assertEqual(self.workspace.workspace_tabs.indexOf(merged), -1)
+        self.assertEqual(self.workspace.generation_workspace_tab_index, -1)
         self.assertIn("12 triangles", panel.statistics_label.text())
-        self.assertEqual(panel.object_list.count(), 1)
 
         expected_external_widgets = (
             panel.viewer,
-            panel.details_panel,
-            panel.object_list,
-            panel.delete_object_button,
+            generation.symmetric_division_checkbox,
+            generation.delete_selected_faces_button,
+            generation.convert_faces_to_glass_button,
+            panel.projection_camera_controls,
             panel.statistics_label,
         )
         for widget in expected_external_widgets:
             with self.subTest(widget=widget.objectName() or type(widget).__name__):
-                self.assertTrue(panel.isAncestorOf(widget))
+                self.assertTrue(merged.isAncestorOf(widget))
                 self.assertTrue(widget.isVisibleTo(external_window))
                 self.assertGreater(widget.width(), 0)
                 self.assertGreater(widget.height(), 0)
 
-        self.workspace._apply_fullscreen_3d_viewer_screen(None)
+        for relocated_control in (
+            generation.delete_selected_faces_button,
+            generation.convert_faces_to_glass_button,
+            panel.projection_camera_controls,
+            panel.statistics_label,
+        ):
+            with self.subTest(
+                relocated_control=(
+                    relocated_control.objectName()
+                    or type(relocated_control).__name__
+                )
+            ):
+                self.assertTrue(
+                    merged.object_controls.isAncestorOf(relocated_control)
+                )
+        self.assertFalse(hasattr(panel, "delete_object_button"))
+
+        self.workspace._apply_generation_display_screen(None)
         _qt_application.processEvents()
 
-        self.assertFalse(panel.is_external_presentation_active)
-        self.assertIs(
-            generation.right_view_stack.currentWidget(),
-            generation.object_3d_page,
+        self.assertFalse(host.is_active)
+        self.assertEqual(
+            self.workspace.workspace_tabs.indexOf(merged),
+            self.workspace.workspace_tabs.indexOf(
+                self.workspace.texture_atlas_workspace
+            )
+            + 1,
         )
+        self.assertTrue(merged.isAncestorOf(panel))
 
-    def test_object_wireframe_syncs_external_3d_and_local_uv_preview(
+    def test_object_wireframe_syncs_through_detached_generation_workspace(
         self,
     ) -> None:
-        screen_id = "screen:external-object-uv-test"
-        combo = self.workspace.settings_widget.fullscreen_3d_viewer_screen_combo
-        combo.addItem("External object UV display", screen_id)
+        screen_id = "screen:external-object-wireframe-test"
+        combo = self.workspace.settings_widget.generation_display_screen_combo
+        combo.addItem("External object wireframe display", screen_id)
+        merged = self.workspace.merged_generation_workspace
         generation = self.workspace.generation
-        uv_triangles = (
-            ((0.1, 0.1), (0.9, 0.1), (0.9, 0.9)),
-            ((0.1, 0.1), (0.9, 0.9), (0.1, 0.9)),
-        )
-        generation.texture_view.set_atlases(
-            (
-                TextureAtlasEntry(
-                    "object:resolution:1024",
-                    "1024 x 1024",
-                    np.full((64, 64, 4), (30, 50, 70, 255), dtype=np.uint8),
-                    owner_id="object",
-                ),
-            )
-        )
-        generation.texture_view.set_uv_overlay_triangles(uv_triangles)
         generation.wireframe_checkbox.setChecked(True)
 
         with (
@@ -609,69 +624,89 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
             patch.object(generation, "refresh_file_backed_previews"),
         ):
             combo.setCurrentIndex(combo.findData(screen_id))
-            self.workspace.workspace_tabs.setCurrentWidget(generation)
             _qt_application.processEvents()
 
-        self._assert_externally_hosted_viewer_is(generation.object_3d_panel)
-        self.assertIs(
-            generation.right_view_stack.currentWidget(),
-            generation.texture_view_page,
+        self._assert_externally_hosted_workspace_is(
+            self.workspace._external_generation_host,
+            merged,
         )
-        self.assertTrue(generation.texture_view.isVisibleTo(self.workspace))
+        self.assertTrue(merged.isAncestorOf(generation.result_view))
         self.assertTrue(generation.result_view.get_wireframe_enabled())
-        self.assertTrue(generation.texture_view.uv_overlay_enabled)
-        self.assertEqual(
-            generation.texture_view.uv_overlay_triangles,
-            uv_triangles,
-        )
-        self.assertFalse(generation.texture_view.preview_label.pixmap().isNull())
 
         generation.wireframe_checkbox.setChecked(False)
 
         self.assertFalse(generation.result_view.get_wireframe_enabled())
-        self.assertFalse(generation.texture_view.uv_overlay_enabled)
         generation.wireframe_checkbox.setChecked(True)
-        self.workspace._apply_fullscreen_3d_viewer_screen(None)
+        self.workspace._apply_generation_display_screen(None)
         _qt_application.processEvents()
 
         self.assertTrue(generation.result_view.get_wireframe_enabled())
-        self.assertTrue(generation.texture_view.uv_overlay_enabled)
-        self.assertIs(
-            generation.right_view_stack.currentWidget(),
-            generation.object_3d_page,
-        )
-        self.assertFalse(
-            self.workspace.surface_texture_generation.texture_view.uv_overlay_enabled
+        self.assertGreaterEqual(
+            self.workspace.workspace_tabs.indexOf(merged),
+            0,
         )
 
-    def test_external_window_close_resets_display_dropdown_and_restores_viewer(
+    def test_external_window_close_resets_only_its_workspace_display(
         self,
     ) -> None:
-        screen_id = "screen:external-test"
-        combo = self.workspace.settings_widget.fullscreen_3d_viewer_screen_combo
-        combo.addItem("External test display", screen_id)
-        combo.setCurrentIndex(combo.findData(screen_id))
-        self._detach_viewer(screen_id)
+        scene_screen_id = "screen:external-scene-test"
+        generation_screen_id = "screen:external-generation-test"
+        scene_combo = self.workspace.settings_widget.scene_3d_display_screen_combo
+        generation_combo = (
+            self.workspace.settings_widget.generation_display_screen_combo
+        )
+        scene_combo.addItem("External scene display", scene_screen_id)
+        generation_combo.addItem(
+            "External Generation display",
+            generation_screen_id,
+        )
+        with patch(
+            "housemaker.main.resolve_fullscreen_3d_viewer_screen",
+            return_value=_primary_screen(),
+        ):
+            scene_combo.setCurrentIndex(scene_combo.findData(scene_screen_id))
+            generation_combo.setCurrentIndex(
+                generation_combo.findData(generation_screen_id)
+            )
+            _qt_application.processEvents()
+            self.workspace._external_scene_3d_host.window.close()
+            _qt_application.processEvents()
 
-        self.workspace._external_viewer_host.window.close()
-        _qt_application.processEvents()
-
-        self.assertEqual(combo.currentIndex(), 0)
-        self.assertIsNone(combo.currentData())
+        self.assertEqual(scene_combo.currentIndex(), 0)
+        self.assertIsNone(scene_combo.currentData())
         self.assertIsNone(
             self.workspace._application_settings.get(
-                FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY
+                SCENE_3D_DISPLAY_SCREEN_SETTING_KEY
             )
         )
-        self.assertFalse(self.workspace._external_viewer_host.is_active)
-        self.assertIs(
-            self._canvas_3d_tab_widget(),
-            self.workspace.viewer,
+        self.assertFalse(self.workspace._external_scene_3d_host.is_active)
+        self.assertTrue(self.workspace._external_generation_host.is_active)
+        self.assertEqual(
+            generation_combo.currentData(),
+            generation_screen_id,
+        )
+        self.assertEqual(
+            self.workspace._application_settings.get(
+                GENERATION_DISPLAY_SCREEN_SETTING_KEY
+            ),
+            generation_screen_id,
+        )
+        self.assertGreaterEqual(
+            self.workspace.workspace_tabs.indexOf(
+                self.workspace.scene_3d_workspace
+            ),
+            0,
+        )
+        self.assertEqual(
+            self.workspace.workspace_tabs.indexOf(
+                self.workspace.merged_generation_workspace
+            ),
+            -1,
         )
 
-    def test_canvas_preview_is_not_refreshed_from_another_3d_tab(self) -> None:
+    def test_scene_preview_is_refreshed_while_scene_is_external(self) -> None:
         screen_id = "screen:external-test"
-        combo = self.workspace.settings_widget.fullscreen_3d_viewer_screen_combo
+        combo = self.workspace.settings_widget.scene_3d_display_screen_combo
         combo.addItem("External test display", screen_id)
 
         with patch(
@@ -680,7 +715,7 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
         ):
             combo.setCurrentIndex(combo.findData(screen_id))
             self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.generation
+                self.workspace.settings_widget
             )
             _qt_application.processEvents()
 
@@ -693,7 +728,42 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
                 )
                 _qt_application.processEvents()
 
-        refresh_mock.assert_not_called()
+        refresh_mock.assert_called_once_with(preserve_camera=False)
+
+    def test_detached_workspaces_restore_in_canonical_order(self) -> None:
+        screen = _primary_screen()
+        with patch(
+            "housemaker.main.resolve_fullscreen_3d_viewer_screen",
+            return_value=screen,
+        ):
+            self.workspace._apply_scene_3d_display_screen("screen:scene")
+            self.workspace._apply_generation_display_screen(
+                "screen:generation"
+            )
+            self.workspace._apply_atlas_display_screen("screen:atlas")
+
+        self.assertEqual(self._top_level_tab_labels(), ["Canvas", "Settings"])
+
+        self.workspace._apply_generation_display_screen(None)
+        self.assertEqual(
+            self._top_level_tab_labels(),
+            ["Canvas", "Generation", "Settings"],
+        )
+        self.workspace._apply_atlas_display_screen(None)
+        self.assertEqual(
+            self._top_level_tab_labels(),
+            ["Canvas", "Atlas", "Generation", "Settings"],
+        )
+        self.workspace._apply_scene_3d_display_screen(None)
+        self.assertEqual(
+            self._top_level_tab_labels(),
+            ["Canvas", "3D scene", "Atlas", "Generation", "Settings"],
+        )
+        self.assertEqual(self.workspace.canvas_workspace_tab_index, 0)
+        self.assertEqual(self.workspace.scene_3d_workspace_tab_index, 1)
+        self.assertEqual(self.workspace.atlas_workspace_tab_index, 2)
+        self.assertEqual(self.workspace.generation_workspace_tab_index, 3)
+        self.assertEqual(self.workspace.settings_workspace_tab_index, 4)
 
     # ### Test helpers ###
     def _seed_packed_wall_texture(
@@ -723,27 +793,28 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
         )
         return assignment, source_id, atlas.atlas_id
 
-    def _detach_viewer(self, screen_id: str) -> None:
+    def _detach_scene(self, screen_id: str) -> None:
         with patch(
             "housemaker.main.resolve_fullscreen_3d_viewer_screen",
             return_value=_primary_screen(),
         ):
-            self.workspace._apply_fullscreen_3d_viewer_screen(screen_id)
+            self.workspace._apply_scene_3d_display_screen(screen_id)
 
-        self.assertTrue(self.workspace._external_viewer_host.is_active)
+        self.assertTrue(self.workspace._external_scene_3d_host.is_active)
 
-    def _assert_externally_hosted_viewer_is(self, viewer) -> None:
-        self.assertTrue(self.workspace._external_viewer_host.is_active)
-        self.assertIs(self.workspace._external_viewer_host.viewer, viewer)
+    def _assert_externally_hosted_workspace_is(self, host, workspace) -> None:
+        self.assertTrue(host.is_active)
+        self.assertIs(host.viewer, workspace)
         self.assertIs(
-            viewer.parentWidget(),
-            self.workspace._external_viewer_host.window,
+            workspace.parentWidget(),
+            host.window,
         )
 
-    def _canvas_3d_tab_widget(self):
-        return self.workspace.canvas_viewer_tabs.widget(
-            self.workspace.canvas_3d_view_tab_index
-        )
+    def _top_level_tab_labels(self) -> list[str]:
+        return [
+            self.workspace.workspace_tabs.tabText(index)
+            for index in range(self.workspace.workspace_tabs.count())
+        ]
 
 
 # ### Test helpers ###

@@ -646,6 +646,22 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         )
         self.assertIn("3 surfaces", self.workspace.surface_list.item(0).text())
 
+    def test_delete_object_button_sits_between_object_and_surface_lists(
+        self,
+    ) -> None:
+        texture_menu_layout = self.workspace.object_list.parentWidget().layout()
+        assert texture_menu_layout is not None
+
+        object_list_index = texture_menu_layout.indexOf(self.workspace.object_list)
+        delete_object_index = texture_menu_layout.indexOf(
+            self.workspace.delete_object_button
+        )
+        surface_list_index = texture_menu_layout.indexOf(self.workspace.surface_list)
+
+        self.assertEqual(self.workspace.delete_object_button.text(), "Delete object")
+        self.assertEqual(delete_object_index, object_list_index + 1)
+        self.assertLess(delete_object_index, surface_list_index)
+
     def test_missing_surface_texture_keeps_its_name_and_usage_count(self) -> None:
         source_id = build_atlas_wall_texture_source_id("missing-plaster")
 
@@ -810,7 +826,9 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             placeable_objects={"geometry-only": "Geometry only"},
         )
         removal_requests = Mock()
+        object_deletion_requests = Mock()
         self.workspace.source_remove_requested.connect(removal_requests)
+        self.workspace.object_delete_requested.connect(object_deletion_requests)
 
         self.assertGreater(
             self.workspace.remove_source_button.x(),
@@ -830,6 +848,119 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             "surface",
             surface_source.object_id,
         )
+        object_deletion_requests.assert_not_called()
+
+    def test_delete_object_button_tracks_only_exact_deletable_object_ids(
+        self,
+    ) -> None:
+        completed_source = _source(
+            "completed-chair",
+            directory=self._temporary_directory.name,
+        )
+        nondeletable_source = _source(
+            "draft-table",
+            directory=self._temporary_directory.name,
+        )
+        surface_source = _wall_source(
+            "plaster",
+            directory=self._temporary_directory.name,
+        )
+        self.workspace.set_object_texture_sources(
+            (completed_source, nondeletable_source, surface_source),
+            placeable_objects={"completed-geometry": "Completed geometry"},
+            deletable_object_ids=(
+                completed_source.object_id,
+                "completed-geometry",
+            ),
+        )
+
+        self.assertEqual(
+            self.workspace.selected_object_texture_id,
+            completed_source.object_id,
+        )
+        self.assertTrue(self.workspace.delete_object_button.isEnabled())
+
+        self.assertTrue(
+            self.workspace._select_object_row(nondeletable_source.object_id)
+        )
+        self.assertFalse(self.workspace.delete_object_button.isEnabled())
+
+        self.assertTrue(self.workspace._select_object_row("completed-geometry"))
+        self.assertTrue(self.workspace.delete_object_button.isEnabled())
+
+        self.assertTrue(self.workspace._select_object_row(surface_source.object_id))
+        self.assertFalse(self.workspace.delete_object_button.isEnabled())
+
+        self.assertTrue(self.workspace._select_object_row(completed_source.object_id))
+        self.workspace.set_object_texture_sources(
+            (completed_source, nondeletable_source, surface_source),
+            placeable_objects={"completed-geometry": "Completed geometry"},
+        )
+        self.assertFalse(self.workspace.delete_object_button.isEnabled())
+
+    def test_delete_object_button_emits_exact_id_without_removing_atlas_source(
+        self,
+    ) -> None:
+        source = _source(
+            "completed-chair",
+            directory=self._temporary_directory.name,
+        )
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Scene", 2048, atlas_id="scene")
+        data.assign_object(
+            atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources(
+            (source,),
+            deletable_object_ids=(source.object_id,),
+        )
+        deletion_requests = Mock()
+        removal_requests = Mock()
+        self.workspace.object_delete_requested.connect(deletion_requests)
+        self.workspace.source_remove_requested.connect(removal_requests)
+
+        self.workspace.delete_object_button.click()
+
+        deletion_requests.assert_called_once_with(source.object_id)
+        removal_requests.assert_not_called()
+        retained = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert retained is not None
+        self.assertIsNotNone(retained.placement_for_object(source.object_id))
+
+    def test_delete_texture_button_only_requests_permanent_surface_deletion(
+        self,
+    ) -> None:
+        object_source = _source(
+            "chair",
+            directory=self._temporary_directory.name,
+        )
+        surface_source = _wall_source(
+            "plaster",
+            directory=self._temporary_directory.name,
+        )
+        self.workspace.set_object_texture_sources(
+            (object_source, surface_source)
+        )
+        deletion_requests = Mock()
+        self.workspace.surface_texture_delete_requested.connect(
+            deletion_requests
+        )
+
+        self.assertFalse(
+            self.workspace.delete_surface_texture_button.isEnabled()
+        )
+        self.workspace.surface_list.setCurrentRow(0)
+        self.assertTrue(
+            self.workspace.delete_surface_texture_button.isEnabled()
+        )
+
+        self.workspace.delete_surface_texture_button.click()
+
+        deletion_requests.assert_called_once_with(surface_source.object_id)
 
     def test_scene_bound_sources_are_green_only_in_lists(
         self,
@@ -2795,10 +2926,17 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             )
         data.select_atlas(selected_atlas.atlas_id)
         self.workspace.set_data(data)
-        self.workspace.set_object_texture_sources([source])
+        self.workspace.set_object_texture_sources(
+            [source],
+            deletable_object_ids=(source.object_id,),
+        )
         self.workspace._select_object_row(source.object_id)
         changes: list[TextureAtlasData] = []
+        object_deletion_requests = Mock()
+        source_removal_requests = Mock()
         self.workspace.data_changed.connect(changes.append)
+        self.workspace.object_delete_requested.connect(object_deletion_requests)
+        self.workspace.source_remove_requested.connect(source_removal_requests)
 
         self.workspace.object_list.setFocus()
         QTest.keyClick(self.workspace.object_list, Qt.Key.Key_Delete)
@@ -2813,6 +2951,8 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.assertIsNotNone(other.placement_for_object(source.object_id))
         self.assertTrue(source.physical_texture_path.is_file())
         self.assertEqual(len(changes), 1)
+        object_deletion_requests.assert_not_called()
+        source_removal_requests.assert_not_called()
 
     def test_delete_key_on_atlas_preview_removes_selected_placement(self) -> None:
         data = TextureAtlasData()

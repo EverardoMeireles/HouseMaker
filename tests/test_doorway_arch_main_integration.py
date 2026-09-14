@@ -157,8 +157,8 @@ class DoorwayArchMainIntegrationTests(unittest.TestCase):
         doorway = _build_doorway(50.0, DOORWAY_SHAPE_RECTANGULAR)
         self._install_doorways([doorway])
         self._click_doorway(doorway)
-        self.workspace.canvas_viewer_tabs.setCurrentIndex(
-            self.workspace.canvas_3d_view_tab_index
+        self.workspace.workspace_tabs.setCurrentWidget(
+            self.workspace.scene_3d_workspace
         )
         _qt_application.processEvents()
         initial_revision = self.workspace._viewer_preview_revision

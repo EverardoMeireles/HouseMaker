@@ -45,7 +45,6 @@ from housemaker.object_symmetry import (
     LEGACY_SYMMETRIC_PAIR_METADATA_VERSION,
     SYMMETRIC_QUARTER_METADATA_VERSION,
     SYMMETRIC_DIVISION_METADATA_VERSION,
-    SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL,
     SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
     SYMMETRIC_DIVISION_SIDE_BOTTOM,
     SYMMETRIC_DIVISION_SIDE_LEFT,
@@ -315,7 +314,7 @@ class GenerationSymmetricDivisionTests(unittest.TestCase):
         record = self.workspace.get_data().generated_objects[0]
         return record, pair_variants
 
-    def test_ui_captures_checkbox_and_orientation_only_for_full_generate(
+    def test_ui_captures_checkbox_with_vertical_default_only_for_full_generate(
         self,
     ) -> None:
         self.assertEqual(
@@ -336,14 +335,6 @@ class GenerationSymmetricDivisionTests(unittest.TestCase):
         )
 
         self.workspace.symmetric_division_checkbox.setChecked(True)
-        horizontal_index = (
-            self.workspace.symmetric_division_orientation_combo.findData(
-                SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL
-            )
-        )
-        self.workspace.symmetric_division_orientation_combo.setCurrentIndex(
-            horizontal_index
-        )
         with (
             patch.object(
                 self.workspace.video_view,
@@ -370,7 +361,7 @@ class GenerationSymmetricDivisionTests(unittest.TestCase):
         self.assertTrue(request.symmetric_division_enabled)
         self.assertEqual(
             request.symmetric_division_orientation,
-            SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL,
+            SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
         )
         self.assertFalse(geometry_request.symmetric_division_enabled)
 
@@ -408,13 +399,8 @@ class GenerationSymmetricDivisionTests(unittest.TestCase):
         source_variants = _ordinary_variants(3)
         pair_variants = _square_pair_variants(4)
         generated_spy = QSignalSpy(self.workspace.generation_completed)
-        self.workspace._active_generation_request = self._request(
-            orientation=SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL
-        )
-        automatic_result = _automatic_result(
-            pair_variants,
-            orientation=SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL,
-        )
+        self.workspace._active_generation_request = self._request()
+        automatic_result = _automatic_result(pair_variants)
         with patch(
             "housemaker.generation_workspace."
             "build_automatic_symmetric_object_variants",
@@ -431,7 +417,7 @@ class GenerationSymmetricDivisionTests(unittest.TestCase):
 
         transform.assert_called_once_with(
             source_variants.glb_by_resolution[2048],
-            SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL,
+            SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
         )
         self.assertEqual(generated_spy.count(), 1)
         record = self.workspace.get_data().generated_objects[0]
@@ -486,9 +472,11 @@ class GenerationSymmetricDivisionTests(unittest.TestCase):
                 512,
             )
         )
-        self.assertEqual(
-            {entry.display_name for entry in self.workspace.texture_view.entries},
-            {"512 x 512", "1024 x 1024"},
+        self.assertIsNotNone(
+            self.workspace.get_texture_variant(record.object_id, 512)
+        )
+        self.assertIsNotNone(
+            self.workspace.get_texture_variant(record.object_id, 1024)
         )
 
     def test_symmetric_staged_generation_uses_weighted_left_half_scan(
@@ -565,11 +553,9 @@ class GenerationSymmetricDivisionTests(unittest.TestCase):
         scan_stats = _symmetric_scan_projection_stats()
         automatic_result = _automatic_result(
             pair_variants,
-            orientation=SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL,
             scan_projection_stats=scan_stats,
         )
         self.workspace._active_generation_request = self._request(
-            orientation=SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL,
             use_weighted_projection=True,
         )
         provider_result = MeshyGenerationResult(
@@ -590,7 +576,7 @@ class GenerationSymmetricDivisionTests(unittest.TestCase):
 
         divide_and_project.assert_called_once_with(
             source_variants.glb_by_resolution[2048],
-            SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL,
+            SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
             projection_camera_percentages=_TEST_CAMERA_PERCENTAGES,
             cancellation_check=None,
         )
@@ -797,7 +783,7 @@ class GenerationSymmetricDivisionTests(unittest.TestCase):
             asset_path=variant_metadata["1024"]["glb_asset_path"],
         )
         self.workspace._data.generated_objects.append(record)
-        self.workspace._refresh_generated_objects_list(record.object_id)
+        self.workspace.select_generated_object(record.object_id)
 
         provider_variants = _ordinary_variants(15)
         next_quarter_variants = _quarter_variants(16)
@@ -878,7 +864,7 @@ class GenerationSymmetricDivisionTests(unittest.TestCase):
             asset_path=variant_metadata["1024"]["glb_asset_path"],
         )
         self.workspace._data.generated_objects.append(record)
-        self.workspace._refresh_generated_objects_list(record.object_id)
+        self.workspace.select_generated_object(record.object_id)
 
         provider_variants = _ordinary_variants(19)
         next_pair_variants = _legacy_pair_variants(20)
@@ -954,16 +940,19 @@ class GenerationSymmetricDivisionTests(unittest.TestCase):
             asset_path=variant_metadata["2048"]["glb_asset_path"],
         )
         self.workspace._data.generated_objects.append(record)
-        self.workspace._refresh_generated_objects_list(record.object_id)
+        self.workspace.select_generated_object(record.object_id)
         metadata = self.workspace.get_object_symmetric_division(
             record.object_id
         )
         assert metadata is not None
         self.assertEqual(metadata.version, SYMMETRIC_DIVISION_METADATA_VERSION)
         self.assertEqual(metadata.texture_content_half, "left")
-        self.assertEqual(
-            {entry.display_name for entry in self.workspace.texture_view.entries},
-            {"512 x 512", "1024 x 1024", "2048 x 2048"},
+        self.assertTrue(
+            all(
+                self.workspace.get_texture_variant(record.object_id, resolution)
+                is not None
+                for resolution in (512, 1024, 2048)
+            )
         )
 
         provider_variants = _ordinary_variants(12)

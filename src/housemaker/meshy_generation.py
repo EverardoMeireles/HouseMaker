@@ -13,7 +13,6 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
-
 # ### Constants ###
 MESHY_IMAGE_TO_3D_ENDPOINT = "https://api.meshy.ai/openapi/v1/image-to-3d"
 MESHY_RETEXTURE_ENDPOINT = "https://api.meshy.ai/openapi/v1/retexture"
@@ -30,6 +29,7 @@ ACTIVE_TASK_STATUSES = frozenset({"PENDING", "IN_PROGRESS"})
 KNOWN_TASK_STATUSES = TERMINAL_TASK_STATUSES | ACTIVE_TASK_STATUSES
 RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 MAX_RETEXTURE_REFERENCE_IMAGES = 4
+MAX_IMAGE_TO_3D_TEXTURE_PROMPT_CHARACTERS = 800
 SINGLE_IMAGE_RETEXTURE_AI_MODEL = "meshy-6"
 MULTIVIEW_RETEXTURE_AI_MODEL = "meshy-7"
 
@@ -87,6 +87,7 @@ def build_image_to_3d_request_body(
     target_polycount: int = DEFAULT_SMART_TOPOLOGY_TARGET_POLYCOUNT,
     should_texture: bool = True,
     enable_pbr: bool = False,
+    texture_prompt: str = "",
 ) -> dict[str, Any]:
     """Build a Smart Topology Meshy Image-to-3D request."""
 
@@ -102,6 +103,9 @@ def build_image_to_3d_request_body(
         raise ValueError(
             "Meshy PBR maps require texture generation to be enabled."
         )
+    normalized_texture_prompt = normalize_image_to_3d_texture_prompt(
+        texture_prompt
+    )
     normalized_polycount = _normalize_smart_topology_target_polycount(
         target_polycount
     )
@@ -123,6 +127,8 @@ def build_image_to_3d_request_body(
                 "texture_resolution": "2k",
             }
         )
+        if normalized_texture_prompt:
+            body["texture_prompt"] = normalized_texture_prompt
     return body
 
 
@@ -213,6 +219,20 @@ def _normalize_smart_topology_target_polycount(target_polycount: int) -> int:
     return target_polycount
 
 
+def normalize_image_to_3d_texture_prompt(texture_prompt: str) -> str:
+    """Normalize an optional Meshy Image-to-3D texture prompt."""
+
+    if not isinstance(texture_prompt, str):
+        raise TypeError("Meshy texture prompt must be a string.")
+    normalized_prompt = texture_prompt.strip()
+    if len(normalized_prompt) > MAX_IMAGE_TO_3D_TEXTURE_PROMPT_CHARACTERS:
+        raise ValueError(
+            "Meshy texture prompt must be at most "
+            f"{MAX_IMAGE_TO_3D_TEXTURE_PROMPT_CHARACTERS} characters."
+        )
+    return normalized_prompt
+
+
 # ### Task API ###
 def create_image_to_3d_task(
     api_key: str,
@@ -222,6 +242,7 @@ def create_image_to_3d_task(
     target_polycount: int = DEFAULT_SMART_TOPOLOGY_TARGET_POLYCOUNT,
     should_texture: bool = True,
     enable_pbr: bool = False,
+    texture_prompt: str = "",
 ) -> str:
     normalized_key = _require_api_key(api_key)
     payload = build_image_to_3d_request_body(
@@ -229,6 +250,7 @@ def create_image_to_3d_task(
         target_polycount=target_polycount,
         should_texture=should_texture,
         enable_pbr=enable_pbr,
+        texture_prompt=texture_prompt,
     )
     response = _request_json(
         Request(
@@ -427,6 +449,7 @@ def request_image_to_3d_model(
     target_polycount: int = DEFAULT_SMART_TOPOLOGY_TARGET_POLYCOUNT,
     should_texture: bool = True,
     enable_pbr: bool = False,
+    texture_prompt: str = "",
 ) -> MeshyGenerationResult:
     task_id = create_image_to_3d_task(
         api_key=api_key,
@@ -435,6 +458,7 @@ def request_image_to_3d_model(
         target_polycount=target_polycount,
         should_texture=should_texture,
         enable_pbr=enable_pbr,
+        texture_prompt=texture_prompt,
     )
     task = wait_for_image_to_3d_task(
         api_key=api_key,

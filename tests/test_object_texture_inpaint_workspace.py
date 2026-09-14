@@ -112,7 +112,6 @@ class RetiredObjectTextureInpaintWorkspaceTests(unittest.TestCase):
         restored = self.workspace.get_data().generated_objects[0]
         self.assertEqual(restored.pipeline, legacy_pipeline)
         self.assertIsNone(self.workspace.result_view._texture_edit_mask)
-        self.assertFalse(self.workspace.texture_view.edit_mask_enabled)
         self.assertFalse(
             hasattr(self.workspace.result_view.view, "texture_inpaint_enabled")
         )
@@ -132,7 +131,6 @@ class RetiredObjectTextureInpaintWorkspaceTests(unittest.TestCase):
             self.workspace.generate_button,
             self.workspace.generate_geometry_button,
             self.workspace.generate_texture_button,
-            self.workspace.undo_object_change_button,
             self.workspace.cancel_operation_button,
         )
         action_indices = tuple(widgets.index(widget) for widget in action_widgets)

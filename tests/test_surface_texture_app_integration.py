@@ -17,7 +17,6 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 import trimesh
-from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from housemaker.app_settings import ApplicationSettingsStore
@@ -219,14 +218,14 @@ class SurfaceTextureMainIntegrationTests(unittest.TestCase):
             tab_names,
             [
                 "Canvas",
+                "3D scene",
                 "Atlas",
-                "Surface texture generation",
-                "Object generation",
+                "Generation",
                 "Settings",
             ],
         )
-        surface_index = tab_names.index("Surface texture generation")
-        self.workspace.workspace_tabs.setCurrentIndex(surface_index)
+        generation_index = tab_names.index("Generation")
+        self.workspace.workspace_tabs.setCurrentIndex(generation_index)
         _qt_application.processEvents()
         self.assertFalse(self.workspace.side_panel.isVisible())
 
@@ -318,7 +317,9 @@ class SurfaceTextureMainIntegrationTests(unittest.TestCase):
                 self.assertTrue(active_thread.wait(2_000))
             _qt_application.processEvents()
 
-    def test_surface_tab_uses_the_exact_canvas_preview_model(self) -> None:
+    def test_top_level_3d_scene_uses_the_exact_canvas_preview_model(
+        self,
+    ) -> None:
         surface_workspace = self.workspace.surface_texture_generation
         preview_mesh = trimesh.creation.box(extents=(2.0, 3.0, 2.5))
         expected_model = GeneratedModel(
@@ -331,27 +332,24 @@ class SurfaceTextureMainIntegrationTests(unittest.TestCase):
             "_build_viewer_preview_model",
             return_value=expected_model,
         ) as build_preview:
-            self.workspace.canvas_viewer_tabs.setCurrentIndex(
-                self.workspace.canvas_3d_view_tab_index
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.scene_3d_workspace
             )
             self.workspace._schedule_viewer_preview_refresh(
                 preserve_camera=False
             )
             _qt_application.processEvents()
-            self.workspace.workspace_tabs.setCurrentWidget(surface_workspace)
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.merged_generation_workspace
+            )
             _qt_application.processEvents()
             _qt_application.processEvents()
 
         build_preview.assert_called_once_with(None)
         canvas_model = self.workspace.viewer.model
         self.assertIs(canvas_model, expected_model)
-        self.assertIs(
-            surface_workspace.surface_view.get_scene_model(),
-            canvas_model,
-        )
-        self.assertIsNotNone(
-            surface_workspace.surface_view._canvas_scene_render_items.mesh_item
-        )
+        self.assertIsNone(surface_workspace.surface_view)
+        self.assertIsNotNone(self.workspace.viewer.mesh_item)
 
 
 # ### Test entry point ###

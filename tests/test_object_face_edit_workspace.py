@@ -247,10 +247,6 @@ class ObjectFaceEditWorkspaceTests(unittest.TestCase):
             self.workspace.result_view.get_selected_face_indices(),
             (),
         )
-        self.assertEqual(
-            self.workspace.texture_view.selected_uv_face_indices,
-            (),
-        )
         self.assertTrue(self.workspace.result_view._face_editing_enabled)
         undo_stack = _get_object_operation_undo_stack(edited_record)
         self.assertEqual(undo_stack[-1]["operation"], OBJECT_OPERATION_DELETE_FACES)
@@ -362,10 +358,6 @@ class ObjectFaceEditWorkspaceTests(unittest.TestCase):
         )
         self.assertEqual(
             self.workspace.result_view.get_selected_face_indices(),
-            (0, 1),
-        )
-        self.assertEqual(
-            self.workspace.texture_view.selected_uv_face_indices,
             (0, 1),
         )
         self.assertTrue(self.workspace.result_view._face_editing_enabled)

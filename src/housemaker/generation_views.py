@@ -9,14 +9,14 @@ from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
-from housemaker.video_source import normalize_video_frame
 from housemaker.generation_state import (
     MASK_MODE_ERASE,
     MASK_MODE_PAINT,
+    MAX_MASK_STROKES_PER_FRAME,
     MaskPoint,
     MaskStroke,
 )
-
+from housemaker.video_source import normalize_video_frame
 
 # ### Constants ###
 VIEW_BACKGROUND_COLOR = QColor("#15181d")
@@ -133,6 +133,66 @@ class VideoInpaintView(QWidget):
         self._rebuild_mask()
         self.strokes_changed.emit([])
         self.update()
+
+    def fill_enclosed_regions(self) -> int:
+        """Turn every closed painted outline into a replayable filled mask."""
+
+        self._cancel_active_stroke()
+        if self._mask.size == 0 or not self.has_selection():
+            return 0
+        frame_height, frame_width = self._mask.shape
+        remaining_stroke_capacity = max(
+            0,
+            MAX_MASK_STROKES_PER_FRAME - len(self._strokes),
+        )
+        if remaining_stroke_capacity == 0:
+            return 0
+        unselected = np.where(self._mask == 0, 1, 0).astype(np.uint8)
+        component_count, labels, stats, _centroids = (
+            cv2.connectedComponentsWithStats(unselected, connectivity=4)
+        )
+        fills: list[MaskStroke] = []
+        for component_index in range(1, component_count):
+            left = int(stats[component_index, cv2.CC_STAT_LEFT])
+            top = int(stats[component_index, cv2.CC_STAT_TOP])
+            width = int(stats[component_index, cv2.CC_STAT_WIDTH])
+            height = int(stats[component_index, cv2.CC_STAT_HEIGHT])
+            if (
+                left <= 0
+                or top <= 0
+                or left + width >= frame_width
+                or top + height >= frame_height
+            ):
+                continue
+            candidate_rows, candidate_columns = np.nonzero(
+                labels == component_index
+            )
+            if candidate_rows.size == 0:
+                continue
+            seed_x = int(candidate_columns[0])
+            seed_y = int(candidate_rows[0])
+            fills.append(
+                MaskStroke(
+                    mode=MASK_MODE_PAINT,
+                    radius_normalized=MIN_NORMALIZED_BRUSH_RADIUS,
+                    points=(
+                        MaskPoint(
+                            x=seed_x / max(frame_width - 1, 1),
+                            y=seed_y / max(frame_height - 1, 1),
+                        ),
+                    ),
+                    is_fill=True,
+                )
+            )
+            if len(fills) >= remaining_stroke_capacity:
+                break
+        if not fills:
+            return 0
+        self._strokes.extend(fills)
+        self._rebuild_mask()
+        self.strokes_changed.emit(self.get_strokes())
+        self.update()
+        return len(fills)
 
     def build_selected_object_crop(
         self,

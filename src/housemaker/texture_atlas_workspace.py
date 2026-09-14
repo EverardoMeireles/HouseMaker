@@ -1848,8 +1848,10 @@ class TextureAtlasWorkspace(QWidget):
     object_texture_selected = Signal(str)
     surface_texture_selected = Signal(str)
     object_place_requested = Signal(str)
+    object_delete_requested = Signal(str)
     surface_assign_requested = Signal(str)
     source_remove_requested = Signal(str, str)
+    surface_texture_delete_requested = Signal(str)
     selected_atlas_changed = Signal(object)
     ambient_occlusion_bake_requested = Signal(str, float)
     ambient_occlusion_bake_all_requested = Signal()
@@ -1870,6 +1872,7 @@ class TextureAtlasWorkspace(QWidget):
         self._data = TextureAtlasData()
         self._sources_by_object_id: dict[str, AtlasObjectTextureSource] = {}
         self._placeable_objects_by_id: dict[str, str] = {}
+        self._deletable_object_ids: frozenset[str] = frozenset()
         self._surface_texture_entries_by_id: dict[
             str,
             AtlasSurfaceTextureEntry,
@@ -2109,6 +2112,7 @@ class TextureAtlasWorkspace(QWidget):
         sources: list[AtlasObjectTextureSource] | tuple[AtlasObjectTextureSource, ...],
         *,
         placeable_objects: Mapping[str, str] | None = None,
+        deletable_object_ids: Sequence[str] = (),
         surface_texture_entries: Sequence[AtlasSurfaceTextureEntry] = (),
         variant_resolver: TextureVariantResolver | None = None,
         selectability_resolver: (TextureVariantSelectabilityResolver | None) = None,
@@ -2120,6 +2124,8 @@ class TextureAtlasWorkspace(QWidget):
         unless the application can also assign the matching 3D model variant.
         ``placeable_objects`` also exposes generated geometry which does not
         yet have a texture, without making it packable or draggable.
+        ``deletable_object_ids`` identifies exact generated-object records
+        which the Atlas may permanently delete.
         ``surface_texture_entries`` keeps names and usage counts visible when
         a surface texture file is temporarily unavailable.
         """
@@ -2149,6 +2155,14 @@ class TextureAtlasWorkspace(QWidget):
                     "Atlas placeable-object IDs and names cannot be empty."
                 )
             normalized_placeable_objects[object_id] = display_name
+        if not all(
+            isinstance(object_id, str) and bool(object_id.strip())
+            for object_id in deletable_object_ids
+        ):
+            raise ValueError("Atlas deletable-object IDs cannot be empty.")
+        normalized_deletable_object_ids = frozenset(
+            object_id.strip() for object_id in deletable_object_ids
+        )
         normalized_surface_entries = tuple(surface_texture_entries)
         if not all(
             isinstance(entry, AtlasSurfaceTextureEntry)
@@ -2169,6 +2183,7 @@ class TextureAtlasWorkspace(QWidget):
             source.object_id: source for source in normalized_sources
         }
         self._placeable_objects_by_id = normalized_placeable_objects
+        self._deletable_object_ids = normalized_deletable_object_ids
         self._surface_texture_entries_by_id = {
             entry.source_id: entry for entry in normalized_surface_entries
         }
@@ -3889,6 +3904,18 @@ class TextureAtlasWorkspace(QWidget):
         )
         self.object_list.object_clicked.connect(self._handle_object_mouse_click)
         texture_column_layout.addWidget(self.object_list, 1)
+        self.delete_object_button = QPushButton("Delete object")
+        self.delete_object_button.setObjectName(
+            "texture_atlas_delete_object_button"
+        )
+        self.delete_object_button.setToolTip(
+            "Permanently delete the selected generated object and its "
+            "unreferenced local assets."
+        )
+        self.delete_object_button.clicked.connect(
+            self._request_selected_object_deletion
+        )
+        texture_column_layout.addWidget(self.delete_object_button)
         self.delete_object_list_shortcut = QShortcut(
             QKeySequence.StandardKey.Delete,
             self.object_list,
@@ -3931,6 +3958,18 @@ class TextureAtlasWorkspace(QWidget):
         self.remove_source_button.setObjectName("texture_atlas_remove_source_button")
         self.remove_source_button.clicked.connect(self._request_selected_source_removal)
         source_action_buttons.addWidget(self.remove_source_button)
+        self.delete_surface_texture_button = QPushButton("Delete texture")
+        self.delete_surface_texture_button.setObjectName(
+            "texture_atlas_delete_surface_texture_button"
+        )
+        self.delete_surface_texture_button.setToolTip(
+            "Permanently delete the selected surface texture family and all "
+            "of its generated resolution files."
+        )
+        self.delete_surface_texture_button.clicked.connect(
+            self._request_selected_surface_texture_deletion
+        )
+        source_action_buttons.addWidget(self.delete_surface_texture_button)
         texture_column_layout.addLayout(source_action_buttons)
 
         texture_column_layout.addWidget(QLabel("3D preview"))
@@ -4852,6 +4891,29 @@ class TextureAtlasWorkspace(QWidget):
             return
         self.source_remove_requested.emit(source_kind, source_id)
 
+    def _request_selected_object_deletion(self) -> None:
+        """Request permanent deletion of the exact selected generated object."""
+
+        object_id = self.selected_object_texture_id
+        if object_id is None:
+            self.status_label.setText("Select an Object texture to delete its object.")
+            return
+        if object_id not in self._deletable_object_ids:
+            self.status_label.setText(
+                "The selected Object texture has no available generated object "
+                "to delete."
+            )
+            return
+        self.object_delete_requested.emit(object_id)
+
+    def _request_selected_surface_texture_deletion(self) -> None:
+        """Request permanent deletion for one selected Surface family."""
+
+        source_id = self.selected_surface_texture_id
+        if source_id is None:
+            return
+        self.surface_texture_delete_requested.emit(source_id)
+
     def _handle_object_drop(self, object_id: str, x: int, y: int) -> None:
         """Place one dragged exact source without moving other allocations."""
 
@@ -5347,8 +5409,16 @@ class TextureAtlasWorkspace(QWidget):
             self._active_source_kind == "surface" and source is not None
         )
         self.place_assign_button.setEnabled(can_place_object or can_assign_surface)
+        self.delete_object_button.setEnabled(
+            self._active_source_kind == "object"
+            and object_id is not None
+            and object_id in self._deletable_object_ids
+        )
         self.remove_source_button.setEnabled(
             object_id is not None and self._active_source_kind in {"object", "surface"}
+        )
+        self.delete_surface_texture_button.setEnabled(
+            self._active_source_kind == "surface" and object_id is not None
         )
 
     def _refresh_atlas_storage_sizes(self) -> None:

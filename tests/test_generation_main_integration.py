@@ -18,7 +18,7 @@ import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeySequence
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QPushButton
+from PySide6.QtWidgets import QApplication, QPushButton, QWidget
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.camera_models import CameraPose
@@ -118,18 +118,18 @@ class GenerationMainIntegrationTests(unittest.TestCase):
             tab_names,
             [
                 "Canvas",
+                "3D scene",
                 "Atlas",
-                "Surface texture generation",
-                "Object generation",
+                "Generation",
                 "Settings",
             ],
         )
 
         expected_side_panel_visibility = {
             "Canvas": True,
+            "3D scene": True,
             "Atlas": False,
-            "Surface texture generation": False,
-            "Object generation": False,
+            "Generation": False,
             "Settings": False,
         }
         for tab_name, should_be_visible in expected_side_panel_visibility.items():
@@ -151,8 +151,7 @@ class GenerationMainIntegrationTests(unittest.TestCase):
 
         for full_width_workspace in (
             self.workspace.texture_atlas_workspace,
-            self.workspace.surface_texture_generation,
-            self.workspace.generation,
+            self.workspace.merged_generation_workspace,
             self.workspace.settings_widget,
         ):
             with self.subTest(
@@ -188,32 +187,120 @@ class GenerationMainIntegrationTests(unittest.TestCase):
                     splitter_rect.right(),
                 )
 
-    def test_canvas_tab_uses_dedicated_2d_and_3d_subtabs(self) -> None:
+    def test_generation_uses_only_the_compact_generated_object_view(self) -> None:
+        merged = self.workspace.merged_generation_workspace
+
+        self.assertIs(
+            merged.views_splitter.widget(1),
+            merged.object_workspace.object_3d_page,
+        )
+        self.assertIsNone(merged.surface_workspace.surface_view)
+        self.assertFalse(
+            merged.isAncestorOf(self.workspace.viewer)
+        )
+        self.assertTrue(
+            merged.isAncestorOf(self.workspace.generation.object_3d_panel)
+        )
+
+    def test_generation_controls_follow_the_merged_workflow_layout(self) -> None:
+        merged = self.workspace.merged_generation_workspace
+        generation = self.workspace.generation
+        object_panel = generation.object_3d_panel
+        primary_column = generation.symmetric_division_checkbox.parentWidget()
+        primary_layout = primary_column.layout()
+        assert primary_layout is not None
+
+        self.assertLess(
+            primary_layout.indexOf(generation.symmetric_division_checkbox),
+            primary_layout.indexOf(generation.delete_selected_faces_button),
+        )
+        self.assertLess(
+            primary_layout.indexOf(generation.delete_selected_faces_button),
+            primary_layout.indexOf(generation.convert_faces_to_glass_button),
+        )
+        self.assertLess(
+            primary_layout.indexOf(generation.generate_button),
+            primary_layout.indexOf(generation.model_statistics_label),
+        )
+        self.assertTrue(
+            merged.object_controls.isAncestorOf(
+                object_panel.projection_camera_controls
+            )
+        )
+
+        shared_fields = merged.shared_controls.findChild(
+            QWidget,
+            "merged_generation_shared_fields",
+        )
+        self.assertIsNotNone(shared_fields)
+        shared_layout = shared_fields.layout()
+        assert shared_layout is not None
+        self.assertEqual(shared_layout.count(), 1)
+        shared_column = shared_layout.itemAt(0).widget()
+        self.assertIsNotNone(shared_column)
+        for shared_control in (
+            merged.load_video_button,
+            merged.pbr_map_control,
+            merged.mask_mode_control,
+            merged.clear_mask_button,
+            merged.ai_prompt_edit,
+            merged.cancel_button,
+        ):
+            with self.subTest(
+                shared_control=(
+                    shared_control.objectName()
+                    or type(shared_control).__name__
+                )
+            ):
+                self.assertTrue(shared_column.isAncestorOf(shared_control))
+
+        forbidden_attributes = (
+            "delete_generated_object_button",
+            "frame_label",
+            "glass_double_sided_checkbox",
+            "job_name_edit",
+        )
+        for attribute_name in forbidden_attributes:
+            with self.subTest(attribute=attribute_name):
+                self.assertFalse(hasattr(generation, attribute_name))
+
+        button_texts = {
+            button.text()
+            for button in merged.findChildren(QPushButton)
+        }
+        self.assertTrue(
+            {"Delete object", "Double-sided", "Generate mask"}.isdisjoint(
+                button_texts
+            )
+        )
+
+    def test_canvas_and_3d_scene_are_dedicated_top_level_tabs(self) -> None:
         canvas_tab_index = self.workspace.workspace_tabs.indexOf(
             self.workspace.canvas_viewer_workspace
         )
+        scene_tab_index = self.workspace.workspace_tabs.indexOf(
+            self.workspace.scene_3d_workspace
+        )
 
         self.assertGreaterEqual(canvas_tab_index, 0)
+        self.assertGreaterEqual(scene_tab_index, 0)
         self.assertEqual(
             self.workspace.workspace_tabs.tabText(canvas_tab_index),
             "Canvas",
         )
         self.assertEqual(
-            [
-                self.workspace.canvas_viewer_tabs.tabText(tab_index)
-                for tab_index in range(
-                    self.workspace.canvas_viewer_tabs.count()
-                )
-            ],
-            ["2D view", "3D view"],
+            self.workspace.workspace_tabs.tabText(scene_tab_index),
+            "3D scene",
         )
-        self.assertIs(
-            self.workspace.canvas_viewer_tabs.widget(0),
-            self.workspace.canvas,
+        self.assertTrue(
+            self.workspace.canvas_viewer_workspace.isAncestorOf(
+                self.workspace.canvas
+            )
         )
-        self.assertIs(
-            self.workspace.canvas_viewer_tabs.widget(1),
-            self.workspace.viewer,
+        self.assertTrue(
+            self.workspace.scene_3d_workspace.isAncestorOf(
+                self.workspace.viewer
+            )
         )
 
     def test_canvas_navigation_hotkey_toggles_first_person_from_current_pose(
@@ -228,8 +315,8 @@ class GenerationMainIntegrationTests(unittest.TestCase):
             fov_degrees=72.0,
         )
         self.workspace.viewer.set_first_person_camera_pose(camera_pose)
-        self.workspace.canvas_viewer_tabs.setCurrentIndex(
-            self.workspace.canvas_3d_view_tab_index
+        self.workspace.workspace_tabs.setCurrentWidget(
+            self.workspace.scene_3d_workspace
         )
         _qt_application.processEvents()
 
@@ -245,25 +332,12 @@ class GenerationMainIntegrationTests(unittest.TestCase):
             self.workspace.viewer.get_first_person_camera_pose(),
             camera_pose,
         )
-        self.assertEqual(
-            self.workspace.canvas_viewer_tabs.tabText(
-                self.workspace.canvas_3d_view_tab_index
-            ),
-            "3D view (first person)",
-        )
-
         QTest.keyClick(self.workspace.viewer.view, Qt.Key.Key_N)
         _qt_application.processEvents()
 
         self.assertEqual(
             self.workspace.viewer.get_navigation_mode(),
             "orbit",
-        )
-        self.assertEqual(
-            self.workspace.canvas_viewer_tabs.tabText(
-                self.workspace.canvas_3d_view_tab_index
-            ),
-            "3D view",
         )
 
     def test_canvas_navigation_hotkey_follows_settings_and_canvas_scope(
@@ -303,7 +377,6 @@ class GenerationMainIntegrationTests(unittest.TestCase):
             pitch_degrees=15.0,
         )
         viewer = self.workspace.viewer
-        surface_view = self.workspace.surface_texture_generation.surface_view
         viewer.set_first_person_camera_pose(camera_pose)
         viewer.enter_first_person_mode()
         pointer_was_captured = viewer.is_first_person_pointer_captured
@@ -324,10 +397,7 @@ class GenerationMainIntegrationTests(unittest.TestCase):
             viewer.is_first_person_pointer_captured,
             pointer_was_captured,
         )
-        self.assertEqual(
-            surface_view.get_first_person_movement_mode(),
-            FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
-        )
+        self.assertIsNone(self.workspace.surface_texture_generation.surface_view)
 
     def test_canvas_snap_filter_is_controlled_from_settings(self) -> None:
         self.assertFalse(
@@ -343,40 +413,16 @@ class GenerationMainIntegrationTests(unittest.TestCase):
 
         self.assertFalse(self.workspace.canvas.snap_middle_equal_angle_only)
 
-    def test_external_canvas_3d_viewer_hides_local_subtabs(self) -> None:
-        canvas_viewer_tabs = self.workspace.canvas_viewer_tabs
-        canvas_viewer_tabs.setCurrentIndex(
-            self.workspace.canvas_3d_view_tab_index
+    def test_canvas_has_no_nested_3d_viewer_tabs(self) -> None:
+        self.assertFalse(hasattr(self.workspace, "canvas_viewer_tabs"))
+        self.assertIs(
+            self.workspace.viewer.parentWidget(),
+            self.workspace.scene_3d_workspace,
         )
-
-        self.workspace.set_canvas_3d_viewer_external_display_active(True)
-
-        self.assertEqual(
-            canvas_viewer_tabs.currentIndex(),
-            self.workspace.canvas_2d_view_tab_index,
-        )
-        self.assertFalse(
-            canvas_viewer_tabs.isTabEnabled(
-                self.workspace.canvas_3d_view_tab_index
-            )
-        )
-        self.assertTrue(canvas_viewer_tabs.tabBar().isHidden())
-
-        self.workspace.set_canvas_3d_viewer_external_display_active(False)
-
-        self.assertTrue(
-            canvas_viewer_tabs.isTabEnabled(
-                self.workspace.canvas_3d_view_tab_index
-            )
-        )
-        self.assertFalse(canvas_viewer_tabs.tabBar().isHidden())
 
     def test_canvas_tab_refreshes_standard_viewer_preview(self) -> None:
         self.workspace.workspace_tabs.setCurrentWidget(
-            self.workspace.canvas_viewer_workspace
-        )
-        self.workspace.canvas_viewer_tabs.setCurrentIndex(
-            self.workspace.canvas_3d_view_tab_index
+            self.workspace.scene_3d_workspace
         )
         _qt_application.processEvents()
 

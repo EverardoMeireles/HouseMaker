@@ -535,10 +535,7 @@ class SurfaceAmbientOcclusionMainIntegrationTests(unittest.TestCase):
         ambient_occlusion_model = _generated_textured_box_model(40)
         self._install_canvas_preview(normal_model)
         self.workspace.workspace_tabs.setCurrentWidget(
-            self.workspace.canvas_viewer_workspace
-        )
-        self.workspace.canvas_viewer_tabs.setCurrentIndex(
-            self.workspace.canvas_3d_view_tab_index
+            self.workspace.scene_3d_workspace
         )
 
         with ExitStack() as stack:
@@ -661,20 +658,19 @@ class SurfaceAmbientOcclusionMainIntegrationTests(unittest.TestCase):
         ambient_occlusion_model = _generated_textured_box_model(30)
         self._install_canvas_preview(normal_model)
         self.workspace.workspace_tabs.setCurrentWidget(
-            self.workspace.canvas_viewer_workspace
-        )
-        self.workspace.canvas_viewer_tabs.setCurrentIndex(
-            self.workspace.canvas_3d_view_tab_index
+            self.workspace.scene_3d_workspace
         )
         with patch(
             "housemaker.main.resolve_fullscreen_3d_viewer_screen",
             return_value=_primary_screen(),
         ):
-            self.workspace._apply_fullscreen_3d_viewer_screen("screen:ao-preview-test")
-        self.assertTrue(self.workspace._external_viewer_host.is_active)
+            self.workspace._apply_scene_3d_display_screen(
+                "screen:ao-preview-test"
+            )
+        self.assertTrue(self.workspace._external_scene_3d_host.is_active)
         self.assertIs(
-            self.workspace._external_viewer_host.viewer,
-            self.workspace.viewer,
+            self.workspace._external_scene_3d_host.viewer,
+            self.workspace.scene_3d_workspace,
         )
 
         try:
@@ -704,23 +700,21 @@ class SurfaceAmbientOcclusionMainIntegrationTests(unittest.TestCase):
 
                 self._select_preview_map(ATLAS_MAP_AMBIENT_OCCLUSION)
                 _wait_until(
-                    lambda: (
-                        self.workspace._external_viewer_host.viewer.model
-                        is ambient_occlusion_model
-                    )
+                    lambda: self.workspace.viewer.model
+                    is ambient_occlusion_model
                 )
                 self.assertIs(
-                    self.workspace._external_viewer_host.viewer,
-                    self.workspace.viewer,
+                    self.workspace._external_scene_3d_host.viewer,
+                    self.workspace.scene_3d_workspace,
                 )
                 self._select_preview_map(ATLAS_MAP_BASE_COLOR)
 
             self.assertIs(
-                self.workspace._external_viewer_host.viewer.model,
+                self.workspace.viewer.model,
                 normal_model,
             )
         finally:
-            self.workspace._apply_fullscreen_3d_viewer_screen(None)
+            self.workspace._apply_scene_3d_display_screen(None)
 
     # ### Atlas AO bake integration ###
     def test_successful_bake_runs_in_background_and_commits_once(self) -> None:

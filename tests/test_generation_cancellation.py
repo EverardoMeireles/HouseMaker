@@ -837,14 +837,16 @@ class GenerationCancellationTests(unittest.TestCase):
         self.workspace.set_data(
             GenerationData(generated_objects=[chair, table])
         )
-        self.workspace.generated_objects_list.setCurrentRow(1)
+        self.assertTrue(self.workspace.select_generated_object("table"))
         requested = QSignalSpy(self.workspace.placement_requested)
 
         self.assertTrue(
             self.workspace.request_generated_object_placement(table.object_id)
         )
         request_id = str(requested.at(0)[0])
-        self.workspace.generated_objects_list.setCurrentRow(0)
+        self.assertTrue(
+            self.workspace.select_generated_object(chair.object_id)
+        )
         placement = GeneratedObjectPlacement(4, 31.0, 57.0)
         self.assertTrue(
             self.workspace.set_active_object_placement(

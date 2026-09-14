@@ -331,13 +331,16 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             for index in range(self.workspace.workspace_tabs.count())
         ]
 
-        self.assertEqual(names[:2], ["Canvas", "Atlas"])
+        self.assertEqual(names[:3], ["Canvas", "3D scene", "Atlas"])
         self.workspace.workspace_tabs.setCurrentWidget(
             self.workspace.texture_atlas_workspace
         )
         _qt_application.processEvents()
         self.assertFalse(self.workspace.side_panel.isVisible())
-        self.assertIsNone(self.workspace._active_workspace_3d_viewer())
+        self.assertIsNot(
+            self.workspace.workspace_tabs.currentWidget(),
+            self.workspace.scene_3d_workspace,
+        )
         self.assertEqual(
             self.workspace.atlas_object_preview_viewer
             .get_ambient_light_intensity(),
@@ -351,6 +354,21 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         self.assertIs(
             self.workspace.atlas_object_preview_viewer.parentWidget(),
             self.workspace.texture_atlas_workspace.object_preview_container,
+        )
+
+    def test_permanent_object_delete_control_is_below_object_texture_list(
+        self,
+    ) -> None:
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        texture_column_layout = atlas_workspace.object_list.parentWidget().layout()
+        assert texture_column_layout is not None
+
+        self.assertEqual(
+            texture_column_layout.indexOf(atlas_workspace.delete_object_button),
+            texture_column_layout.indexOf(atlas_workspace.object_list) + 1,
+        )
+        self.assertFalse(
+            hasattr(self.workspace.generation, "delete_generated_object_button")
         )
 
     def test_save_passes_detached_atlas_state_to_project_io(self) -> None:
@@ -1322,7 +1340,10 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         surface_data = SurfaceTextureData(assignments=[assignment])
         surface_workspace.set_data(surface_data)
         surface_workspace.data_changed.emit(surface_data)
-        surface_workspace.surface_view.set_selected_surface_ids((wall_id,))
+        stale_surface = next(
+            surface for surface in surfaces if surface.surface_id == wall_id
+        )
+        surface_workspace.set_scene_surface_selection((stale_surface,))
         source_id = build_atlas_wall_texture_source_id(
             assignment.assignment_id
         )
@@ -2150,7 +2171,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             self.workspace._atlas_wall_texture_source_ids,
         )
         self.assertTrue(
-            self.workspace._handle_surface_texture_resolution_change_requested(
+            surface_workspace.select_assignment_texture_resolution(
                 assignment.assignment_id,
                 1024,
             )
@@ -2676,15 +2697,15 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             "select_assignment_texture_resolution",
             wraps=surface_workspace.select_assignment_texture_resolution,
         ) as select_resolution:
-            changed = surface_workspace._request_global_texture_resolution_change(
-                assignment.assignment_id,
+            changed = atlas_workspace.set_object_texture_resolution(
+                source_id,
                 1024,
             )
         _qt_application.processEvents()
 
         self.assertTrue(changed)
         self.assertEqual(select_resolution.call_count, 1)
-        self.assertEqual(resolution_signals, [])
+        self.assertEqual(resolution_signals, [(source_id, 1024)])
         self.assertEqual(len(atlas_data_changes), 1)
         selected_assignment = surface_workspace.get_data().assignments[0]
         self.assertEqual(selected_assignment.selected_texture_resolution, 1024)
@@ -2759,8 +2780,8 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         atlas_workspace.set_data(atlas_data)
         previous_atlas_data = atlas_workspace.get_data()
 
-        changed = surface_workspace._request_global_texture_resolution_change(
-            assignment.assignment_id,
+        changed = atlas_workspace.set_object_texture_resolution(
+            source_id,
             2048,
         )
         _qt_application.processEvents()
@@ -3450,7 +3471,6 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         self,
     ) -> None:
         record = SimpleNamespace(object_id="chair")
-        generation_data = SimpleNamespace(generated_objects=[record])
         variant = SimpleNamespace(
             object_id="chair",
             object_name="Chair",
@@ -4303,7 +4323,6 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             SurfaceTextureData(assignments=[assignment])
         )
         record = SimpleNamespace(object_id=collision_id)
-        generation_data = SimpleNamespace(generated_objects=[record])
         variant = SimpleNamespace(
             object_id=collision_id,
             object_name="Reserved name object",
@@ -4420,7 +4439,6 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
 
     def test_pinned_atlas_resolution_uses_png_only_exact_resolver(self) -> None:
         record = SimpleNamespace(object_id="chair")
-        generation_data = SimpleNamespace(generated_objects=[record])
         active = SimpleNamespace(
             object_id="chair",
             object_name="Chair",
@@ -4561,6 +4579,65 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         self.assertIsNone(self.workspace.atlas_object_preview_viewer.model)
         self.assertIsNone(self.workspace._atlas_preview_variant_key)
 
+    def test_atlas_permanent_object_delete_can_be_cancelled_then_confirmed(
+        self,
+    ) -> None:
+        generation = self.workspace.generation
+        record = _generated_object_record_with_variants(
+            generation._asset_directory,
+            object_id="delete-chair",
+            object_name="Delete chair",
+            resolutions=(512,),
+            selected_resolution=512,
+        )
+        generation_data = GenerationData(generated_objects=[record])
+        generation.set_data(generation_data)
+        generation.data_changed.emit(generation_data)
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        self.workspace.workspace_tabs.setCurrentWidget(atlas_workspace)
+        _qt_application.processEvents()
+        atlas_workspace.object_list.object_clicked.emit(
+            record.object_id,
+            Qt.MouseButton.LeftButton,
+        )
+        _qt_application.processEvents()
+
+        self.assertTrue(atlas_workspace.delete_object_button.isEnabled())
+        with patch(
+            "housemaker.main.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Cancel,
+        ) as question:
+            atlas_workspace.delete_object_button.click()
+
+        question.assert_called_once()
+        self.assertIs(
+            question.call_args.args[0],
+            atlas_workspace,
+        )
+        self.assertEqual(generation.get_generated_object_ids(), (record.object_id,))
+        self.assertTrue(atlas_workspace.delete_object_button.isEnabled())
+
+        with patch(
+            "housemaker.main.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ) as question:
+            atlas_workspace.delete_object_button.click()
+            _qt_application.processEvents()
+
+        question.assert_called_once()
+        self.assertEqual(generation.get_generated_object_ids(), ())
+        self.assertFalse(atlas_workspace.delete_object_button.isEnabled())
+        self.assertEqual(
+            [
+                atlas_workspace.object_list.item(row).data(
+                    Qt.ItemDataRole.UserRole
+                )
+                for row in range(atlas_workspace.object_list.count())
+            ],
+            [],
+        )
+        self.assertIn("Deleted generated object", atlas_workspace.status_label.text())
+
     def test_changed_object_is_routed_to_atlas_path_refresh_once(self) -> None:
         changed_record = SimpleNamespace(object_id="chair")
 
@@ -4645,9 +4722,6 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         _write_texture_png(active_png, 512, (20, 40, 60, 255))
         _write_texture_png(target_png, 1024, (60, 40, 20, 255))
         corrupt_glb.write_bytes(b"not a GLB")
-        generation_data = SimpleNamespace(
-            generated_objects=[SimpleNamespace(object_id="chair")]
-        )
         active_variant = SimpleNamespace(
             object_id="chair",
             object_name="Chair",

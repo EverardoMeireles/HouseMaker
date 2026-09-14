@@ -134,6 +134,7 @@ from housemaker.level_coordinates import (
     level_image_to_world_xy,
     level_world_to_image_xy,
 )
+from housemaker.merged_generation_workspace import MergedGenerationWorkspace
 from housemaker.models import (
     DEFAULT_CANVAS_LEVEL_SCALE,
     DEFAULT_CANVAS_OFFSET_PIXELS,
@@ -221,10 +222,7 @@ from housemaker.texture_atlas_workspace import (
     is_atlas_wall_texture_source_id,
     load_atlas_object_texture_source,
 )
-from housemaker.viewer import (
-    NAVIGATION_MODE_FIRST_PERSON,
-    GlbViewerWidget,
-)
+from housemaker.viewer import GlbViewerWidget
 from housemaker.wall_mirroring import (
     WallMirrorTopologyResult,
     WallMirrorVertexLink,
@@ -834,7 +832,6 @@ class BlueprintWorkspace(QWidget):
         self._viewer_preview_revision = 0
         self._viewer_preview_model_revision = -1
         self._canvas_viewer_preview_revision = -1
-        self._surface_viewer_preview_revision = -1
         self._viewer_preview_model: GeneratedModel | None = None
         self._viewer_preview_dependency_signature: tuple[object, ...] | None = None
         self._viewer_preview_dependency_signature_revision = -1
@@ -924,7 +921,6 @@ class BlueprintWorkspace(QWidget):
         self._wall_vertex_update_timer.timeout.connect(
             self._commit_pending_wall_vertex_update
         )
-        self._canvas_3d_viewer_is_external = False
         self._atlas_generation_signature: tuple[tuple[object, ...], ...] | None = None
         self._atlas_source_content_paths: (
             dict[str, tuple[tuple[object, ...], ...]] | None
@@ -1041,7 +1037,8 @@ class BlueprintWorkspace(QWidget):
         self.settings_widget.dispose()
         self._close_object_placement_dialog()
         self._external_atlas_host.dispose()
-        self._external_viewer_host.dispose()
+        self._external_generation_host.dispose()
+        self._external_scene_3d_host.dispose()
         self.surface_texture_generation.shutdown()
         self.generation.shutdown()
         self.jobs_window.dispose()
@@ -1216,18 +1213,23 @@ class BlueprintWorkspace(QWidget):
             self._toggle_canvas_3d_navigation_mode
         )
         self.canvas_viewer_workspace = self._build_canvas_viewer_workspace()
-        self._external_viewer_host = ExternalFullscreenViewerHost(self)
-        self._external_viewer_host.close_requested.connect(
-            self._handle_external_viewer_window_closed
+        self.scene_3d_workspace = self._build_scene_3d_workspace()
+        self._external_scene_3d_host = ExternalFullscreenViewerHost(
+            self,
+            window_title="HouseMaker 3D Scene",
+            start_maximized=True,
+        )
+        self._external_scene_3d_host.close_requested.connect(
+            self._handle_external_scene_3d_window_closed
+        )
+        self._external_scene_3d_host.viewer_restored.connect(
+            self._handle_external_scene_3d_workspace_restored
         )
         self.job_manager = GenerationJobManager(self)
         self.jobs_window = JobsWindow(self.job_manager, self)
         self.generation = GenerationWorkspace(
             asset_directory=(self._application_settings.path.parent / "generated"),
             job_manager=self.job_manager,
-        )
-        self.generation.set_texture_resolution_change_handler(
-            self._handle_generation_texture_resolution_change_requested
         )
         self.generation.set_object_packing_change_handler(
             self._handle_generation_object_packing_change_requested
@@ -1278,11 +1280,17 @@ class BlueprintWorkspace(QWidget):
         self.texture_atlas_workspace.object_place_requested.connect(
             self._handle_atlas_object_place_requested
         )
+        self.texture_atlas_workspace.object_delete_requested.connect(
+            self._handle_atlas_object_delete_requested
+        )
         self.texture_atlas_workspace.surface_assign_requested.connect(
             self._handle_atlas_surface_assign_requested
         )
         self.texture_atlas_workspace.source_remove_requested.connect(
             self._handle_atlas_source_remove_requested
+        )
+        self.texture_atlas_workspace.surface_texture_delete_requested.connect(
+            self._handle_atlas_surface_texture_delete_requested
         )
         self.texture_atlas_workspace.ambient_occlusion_bake_requested.connect(
             self._handle_ambient_occlusion_bake_requested
@@ -1305,9 +1313,27 @@ class BlueprintWorkspace(QWidget):
             ),
             application_settings=self._application_settings,
             job_manager=self.job_manager,
+            shared_controls=self.generation.get_shared_controls(),
         )
-        self.surface_texture_generation.set_texture_resolution_change_handler(
-            self._handle_surface_texture_resolution_change_requested
+        self.merged_generation_workspace = MergedGenerationWorkspace(
+            self.surface_texture_generation,
+            self.generation,
+            self.job_manager,
+        )
+        for checkbox in self.merged_generation_workspace.pbr_map_checkboxes.values():
+            checkbox.toggled.connect(
+                self._handle_generation_scene_pbr_maps_changed
+            )
+        self._external_generation_host = ExternalFullscreenViewerHost(
+            self,
+            window_title="HouseMaker Generation",
+            start_maximized=True,
+        )
+        self._external_generation_host.close_requested.connect(
+            self._handle_external_generation_window_closed
+        )
+        self._external_generation_host.viewer_restored.connect(
+            self._handle_external_generation_workspace_restored
         )
         self.settings_widget = SettingsWidget(
             application_settings=self._application_settings
@@ -1380,17 +1406,26 @@ class BlueprintWorkspace(QWidget):
             self._handle_object_placement_operation_finished
         )
         self.surface_texture_generation.set_levels(self.levels)
-        self.workspace_tabs.addTab(self.canvas_viewer_workspace, "Canvas")
+        self.canvas_workspace_tab_index = self.workspace_tabs.addTab(
+            self.canvas_viewer_workspace,
+            "Canvas",
+        )
+        self.scene_3d_workspace_tab_index = self.workspace_tabs.addTab(
+            self.scene_3d_workspace,
+            "3D scene",
+        )
         self.atlas_workspace_tab_index = self.workspace_tabs.addTab(
             self.texture_atlas_workspace,
             "Atlas",
         )
-        self.workspace_tabs.addTab(
-            self.surface_texture_generation,
-            "Surface texture generation",
+        self.generation_workspace_tab_index = self.workspace_tabs.addTab(
+            self.merged_generation_workspace,
+            "Generation",
         )
-        self.workspace_tabs.addTab(self.generation, "Object generation")
-        self.workspace_tabs.addTab(self.settings_widget, "Settings")
+        self.settings_workspace_tab_index = self.workspace_tabs.addTab(
+            self.settings_widget,
+            "Settings",
+        )
         self.workspace_tabs.currentChanged.connect(self._handle_workspace_tab_changed)
         self.viewer.window_placement_requested.connect(
             self._handle_canvas_window_placement_requested
@@ -2093,67 +2128,34 @@ class BlueprintWorkspace(QWidget):
         self._sync_level_controls()
         self._sync_canvas_to_current_level()
         self._schedule_viewer_preview_refresh(preserve_camera=False)
-        self._apply_fullscreen_3d_viewer_screen(
-            generation_settings.fullscreen_3d_viewer_screen_id
+        self._apply_scene_3d_display_screen(
+            generation_settings.scene_3d_display_screen_id
+        )
+        self._apply_generation_display_screen(
+            generation_settings.generation_display_screen_id
         )
         self._apply_jobs_window_screen(generation_settings.jobs_window_screen_id)
         self._apply_atlas_display_screen(generation_settings.atlas_display_screen_id)
 
     def _build_canvas_viewer_workspace(self) -> QWidget:
-        """Place the editable blueprint and its 3D preview in local tabs."""
+        """Place only the editable 2D blueprint in the Canvas workspace."""
 
         workspace = QWidget()
         workspace.setObjectName("canvas-viewer-workspace")
         workspace_layout = QVBoxLayout(workspace)
         workspace_layout.setContentsMargins(0, 0, 0, 0)
-
-        self.canvas_viewer_tabs = QTabWidget()
-        self.canvas_viewer_tabs.setObjectName("canvas-viewer-tabs")
-        self.canvas_2d_view_tab_index = self.canvas_viewer_tabs.addTab(
-            self.canvas,
-            "2D view",
-        )
-        self.canvas_3d_view_tab_index = self.canvas_viewer_tabs.addTab(
-            self.viewer,
-            "3D view",
-        )
-        self.canvas_viewer_tabs.currentChanged.connect(
-            self._handle_canvas_viewer_subtab_changed
-        )
-        workspace_layout.addWidget(self.canvas_viewer_tabs)
+        workspace_layout.addWidget(self.canvas)
         return workspace
 
-    def set_canvas_3d_viewer_external_display_active(
-        self,
-        is_active: bool,
-    ) -> None:
-        """Keep the Canvas workspace focused on 2D while 3D is external."""
+    def _build_scene_3d_workspace(self) -> QWidget:
+        """Wrap the shared scene viewer as an independently hosted workspace."""
 
-        is_active = bool(is_active)
-        if is_active == self._canvas_3d_viewer_is_external:
-            return
-        self._canvas_3d_viewer_is_external = is_active
-        if is_active:
-            self.canvas_viewer_tabs.setCurrentIndex(self.canvas_2d_view_tab_index)
-            self.canvas_viewer_tabs.setTabEnabled(
-                self.canvas_3d_view_tab_index,
-                False,
-            )
-            self.canvas_viewer_tabs.tabBar().setVisible(False)
-            return
-
-        self.canvas_viewer_tabs.setTabEnabled(
-            self.canvas_3d_view_tab_index,
-            True,
-        )
-        self.canvas_viewer_tabs.tabBar().setVisible(True)
-
-    def _handle_canvas_viewer_subtab_changed(self, tab_index: int) -> None:
-        """Give the standard viewer keyboard focus when its tab opens."""
-
-        if tab_index == self.canvas_3d_view_tab_index:
-            self.viewer.focus_navigation()
-            self._ensure_viewer_preview_current(preserve_camera=False)
+        workspace = QWidget()
+        workspace.setObjectName("scene-3d-workspace")
+        workspace_layout = QVBoxLayout(workspace)
+        workspace_layout.setContentsMargins(0, 0, 0, 0)
+        workspace_layout.addWidget(self.viewer)
+        return workspace
 
     def _set_canvas_3d_navigation_shortcut(self, hotkey: str) -> None:
         """Apply the persisted Canvas-only navigation shortcut."""
@@ -2165,28 +2167,20 @@ class BlueprintWorkspace(QWidget):
     def _toggle_canvas_3d_navigation_mode(self) -> None:
         """Toggle the active Canvas viewer between orbit and first person."""
 
-        if self.workspace_tabs.currentWidget() is not self.canvas_viewer_workspace:
-            return
-        if (
-            self._external_viewer_host.is_active
-            and self._external_viewer_host.viewer is not self.viewer
-        ):
+        scene_is_local = (
+            self.workspace_tabs.currentWidget() is self.scene_3d_workspace
+        )
+        if not scene_is_local and not self._external_scene_3d_host.is_active:
             return
 
         self.viewer.toggle_navigation_mode()
 
     def _handle_canvas_3d_navigation_mode_changed(self, mode: str) -> None:
-        """Reflect the standard viewer's navigation mode in its local tab."""
+        """Keep the 2D camera indicator synchronized with scene navigation."""
 
-        tab_label = "3D view"
-        if mode == NAVIGATION_MODE_FIRST_PERSON:
-            tab_label = "3D view (first person)"
-            self.canvas.set_camera_indicator_pose(
-                self.viewer.get_first_person_camera_pose()
-            )
-        self.canvas_viewer_tabs.setTabText(
-            self.canvas_3d_view_tab_index,
-            tab_label,
+        del mode
+        self.canvas.set_camera_indicator_pose(
+            self.viewer.get_first_person_camera_pose()
         )
 
     def _handle_canvas_window_placement_requested(
@@ -2584,6 +2578,9 @@ class BlueprintWorkspace(QWidget):
                 )
         finally:
             self._is_syncing_canvas_scene_selection = False
+        self._sync_surface_generation_selection(
+            self._desired_canvas_surface_ids
+        )
         selected_surface_source_id = self._selected_atlas_surface_source_id
         if selected_surface_source_id is not None:
             self._handle_atlas_surface_texture_selected(selected_surface_source_id)
@@ -2654,6 +2651,7 @@ class BlueprintWorkspace(QWidget):
         if surface_ids:
             self._desired_canvas_object_id = None
             self._desired_canvas_object_ids = ()
+        self._sync_surface_generation_selection(surface_ids)
         active_surface_id = surface_ids[-1] if surface_ids else None
         self._sync_selected_canvas_wall_highlight(active_surface_id)
         self._commit_pending_wall_vertex_update()
@@ -2673,6 +2671,24 @@ class BlueprintWorkspace(QWidget):
             )
             if wall_group_changed or active_owner_changed:
                 self._commit_pending_canvas_surface_mesh_update()
+
+    def _sync_surface_generation_selection(
+        self,
+        surface_ids: Sequence[str],
+    ) -> None:
+        """Give Surface generation the shared scene's semantic selection."""
+
+        selected_surfaces = tuple(
+            surface
+            for surface_id in dict.fromkeys(str(value) for value in surface_ids)
+            if (
+                surface := self._canvas_surface_targets_by_id.get(surface_id)
+            )
+            is not None
+        )
+        self.surface_texture_generation.set_scene_surface_selection(
+            selected_surfaces
+        )
 
     def _handle_canvas_surface_orientation_flip_requested(
         self,
@@ -4367,6 +4383,9 @@ class BlueprintWorkspace(QWidget):
         if normalized_object_ids:
             self._desired_canvas_surface_ids = ()
             self._atlas_surface_assignment_target_ids = ()
+            self._sync_surface_generation_selection(())
+        if normalized_active_id is not None:
+            self.generation.select_generated_object(normalized_active_id)
 
     def _discard_desired_canvas_object(self, object_id: str) -> None:
         """Forget one vanished object without dropping other selected objects."""
@@ -6042,28 +6061,25 @@ class BlueprintWorkspace(QWidget):
             is_atlas_workspace
             or selected_widget
             in (
-                self.surface_texture_generation,
-                self.generation,
+                self.merged_generation_workspace,
                 self.settings_widget,
             )
         )
         self.side_panel.setVisible(not is_full_width_workspace)
-        if selected_widget is self.surface_texture_generation:
-            self.surface_texture_generation.refresh_file_backed_previews()
-            self._ensure_viewer_preview_current(preserve_camera=True)
+        if selected_widget is self.merged_generation_workspace:
+            self.merged_generation_workspace.refresh_file_backed_previews()
+        elif selected_widget is self.scene_3d_workspace:
+            self.viewer.focus_navigation()
         elif is_atlas_workspace:
             self._sync_atlas_object_texture_sources()
             self._schedule_atlas_draw_call_estimate()
-        elif selected_widget is self.generation:
-            self.generation.refresh_file_backed_previews()
-
-        self._apply_fullscreen_3d_viewer_screen(
-            self.settings_widget.get_fullscreen_3d_viewer_screen_id()
-        )
         if is_full_width_workspace:
             return
 
-        if selected_widget is not self.canvas_viewer_workspace:
+        if selected_widget not in (
+            self.canvas_viewer_workspace,
+            self.scene_3d_workspace,
+        ):
             return
 
         if not self._viewer_preview_is_active():
@@ -6607,6 +6623,8 @@ class BlueprintWorkspace(QWidget):
         self._desired_canvas_object_id = normalized_id
         self._desired_canvas_object_ids = (normalized_id,)
         self._desired_canvas_surface_ids = ()
+        self._sync_surface_generation_selection(())
+        self.generation.select_generated_object(normalized_id)
         self.viewer.set_highlighted_canvas_surface_ids(())
         self._sync_atlas_green_outline_to_canvas_highlight(None)
         self._is_syncing_canvas_scene_selection = True
@@ -6661,6 +6679,58 @@ class BlueprintWorkspace(QWidget):
             return
         self.texture_atlas_workspace.status_label.setText(
             "The selected object is not currently available for placement."
+        )
+
+    def _handle_atlas_object_delete_requested(self, object_id: str) -> None:
+        """Confirm and permanently delete one exact generated object."""
+
+        normalized_object_id = str(object_id).strip()
+        record = next(
+            (
+                candidate
+                for candidate in self.generation.get_data().generated_objects
+                if candidate.object_id == normalized_object_id
+            ),
+            None,
+        )
+        if record is None:
+            self.texture_atlas_workspace.status_label.setText(
+                "The selected generated object is no longer available."
+            )
+            return
+        dialog_parent = (
+            self._external_atlas_host.window
+            if self._external_atlas_host.is_active
+            else self.texture_atlas_workspace
+        )
+        answer = QMessageBox.question(
+            dialog_parent,
+            "Delete generated object",
+            (
+                f'Permanently delete "{record.object_name}", its embedded '
+                "textures, and its unreferenced local GLB revisions?"
+            ),
+            (
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.Cancel
+            ),
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if not self.generation.delete_generated_object(normalized_object_id):
+            generation_status = self.generation.status_label.text().strip()
+            detail = (
+                f" {generation_status}"
+                if generation_status
+                else " The object may be busy or unavailable."
+            )
+            self.texture_atlas_workspace.status_label.setText(
+                "The selected generated object could not be deleted." + detail
+            )
+            return
+        self.texture_atlas_workspace.status_label.setText(
+            f"Deleted generated object: {record.object_name}."
         )
 
     def _handle_atlas_source_remove_requested(
@@ -6739,6 +6809,53 @@ class BlueprintWorkspace(QWidget):
         self._sync_atlas_object_texture_sources()
         self.texture_atlas_workspace.status_label.setText(
             "Removed the selected texture from its surfaces and the Atlas."
+        )
+
+    def _handle_atlas_surface_texture_delete_requested(
+        self,
+        source_id: str,
+    ) -> None:
+        """Confirm and permanently delete one selected Surface texture family."""
+
+        assignment_id = get_atlas_wall_texture_assignment_id(source_id)
+        if assignment_id is None:
+            self.texture_atlas_workspace.status_label.setText(
+                "Select a Surface texture to delete."
+            )
+            return
+        assignment = self.surface_texture_generation.get_assignment(assignment_id)
+        if assignment is None:
+            self.texture_atlas_workspace.status_label.setText(
+                "The selected Surface texture no longer exists."
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "Delete surface texture",
+            (
+                f"Delete this {assignment.surface_type} texture from all "
+                f"{len(assignment.surface_ids)} assigned surface(s)?\n\n"
+                f"Texture ID: {assignment.assignment_id}\n\n"
+                "Every generated resolution in this texture family will be "
+                "deleted."
+            ),
+            (
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.Cancel
+            ),
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if self.surface_texture_generation.delete_assignment_texture(
+            assignment.assignment_id
+        ):
+            self.texture_atlas_workspace.status_label.setText(
+                self.surface_texture_generation.status_label.text()
+            )
+            return
+        self.texture_atlas_workspace.status_label.setText(
+            "The selected Surface texture is busy or could not be deleted."
         )
 
     def _handle_atlas_surface_assign_requested(self, source_id: str) -> None:
@@ -7120,90 +7237,6 @@ class BlueprintWorkspace(QWidget):
             "not be assigned to the generated object."
         )
 
-    def _handle_surface_texture_resolution_change_requested(
-        self,
-        assignment_id: str,
-        texture_resolution: int,
-    ) -> bool:
-        """Commit a Surface-tab choice together with every Atlas placement."""
-
-        assignment = self.surface_texture_generation.get_assignment(assignment_id)
-        if assignment is None:
-            return False
-        try:
-            target_resolution = int(texture_resolution)
-        except (TypeError, ValueError, OverflowError):
-            return False
-        if assignment.selected_texture_resolution == target_resolution:
-            return True
-        if not (
-            self.surface_texture_generation.can_select_assignment_texture_resolution(
-                assignment.assignment_id,
-                target_resolution,
-            )
-        ):
-            return False
-
-        source_id = build_atlas_wall_texture_source_id(assignment.assignment_id)
-        self._sync_atlas_object_texture_sources()
-        if source_id not in self._atlas_wall_texture_source_ids:
-            return self.surface_texture_generation.select_assignment_texture_resolution(
-                assignment.assignment_id,
-                target_resolution,
-            )
-
-        return self.texture_atlas_workspace.set_object_texture_resolution(
-            source_id,
-            target_resolution,
-            commit_callback=lambda: (
-                self.surface_texture_generation.select_assignment_texture_resolution(
-                    assignment.assignment_id,
-                    target_resolution,
-                )
-            ),
-        )
-
-    def _handle_generation_texture_resolution_change_requested(
-        self,
-        object_id: str,
-        texture_resolution: int,
-    ) -> bool:
-        """Commit an Object-tab resolution together with every Atlas slot."""
-
-        normalized_id = str(object_id).strip()
-        try:
-            target_resolution = int(texture_resolution)
-        except (TypeError, ValueError, OverflowError):
-            return False
-        if not normalized_id or target_resolution not in OBJECT_TEXTURE_RESOLUTIONS:
-            return False
-        current_variant = self.generation.get_active_texture_variant(normalized_id)
-        if current_variant is None:
-            return False
-        if current_variant.resolution == target_resolution:
-            return True
-        if (
-            self.generation.get_texture_variant(
-                normalized_id,
-                target_resolution,
-            )
-            is None
-        ):
-            return False
-
-        self._sync_atlas_object_texture_sources()
-        resolution_changed = self.texture_atlas_workspace.set_object_texture_resolution(
-            normalized_id,
-            target_resolution,
-            commit_callback=lambda: self.generation.select_object_texture_resolution(
-                normalized_id,
-                target_resolution,
-            ),
-        )
-        if resolution_changed:
-            self._refresh_placed_object_texture_if_needed(normalized_id)
-        return resolution_changed
-
     def _handle_generation_object_packing_change_requested(
         self,
         old_record: GeneratedObjectRecord,
@@ -7561,6 +7594,9 @@ class BlueprintWorkspace(QWidget):
                 tuple(placeable_object_names_by_id.items()),
             )
         )
+        signature_items.append(
+            ("deletable_objects", tuple(generated_object_ids))
+        )
         for object_id in generated_object_ids:
             variant = self.generation.get_active_texture_variant(object_id)
             symmetry = self.generation.get_object_symmetric_division(object_id)
@@ -7912,6 +7948,7 @@ class BlueprintWorkspace(QWidget):
         self.texture_atlas_workspace.set_object_texture_sources(
             active_sources,
             placeable_objects=placeable_object_names_by_id,
+            deletable_object_ids=generated_object_ids,
             surface_texture_entries=surface_texture_entries,
             variant_resolver=resolve_variant,
             selectability_resolver=is_variant_selectable,
@@ -8150,10 +8187,19 @@ class BlueprintWorkspace(QWidget):
         except (AttributeError, OSError, TypeError, ValueError):
             return None
 
-    def _handle_external_viewer_window_closed(self) -> None:
-        """Keep Settings in sync when the detached viewer window is closed."""
+    def _handle_external_scene_3d_window_closed(self) -> None:
+        """Return the shared scene to its tab and clear its display setting."""
 
-        combo = self.settings_widget.fullscreen_3d_viewer_screen_combo
+        combo = self.settings_widget.scene_3d_display_screen_combo
+        if combo.currentIndex() != 0:
+            combo.setCurrentIndex(0)
+            return
+        self._handle_generation_settings_changed()
+
+    def _handle_external_generation_window_closed(self) -> None:
+        """Return Generation to its tab and clear its display setting."""
+
+        combo = self.settings_widget.generation_display_screen_combo
         if combo.currentIndex() != 0:
             combo.setCurrentIndex(0)
             return
@@ -8177,30 +8223,83 @@ class BlueprintWorkspace(QWidget):
         if restored_viewer is self.texture_atlas_workspace and not self._is_shutdown:
             self._restore_atlas_workspace_tab()
 
-    def _apply_fullscreen_3d_viewer_screen(
+    def _handle_external_scene_3d_workspace_restored(
+        self,
+        restored_viewer: object,
+    ) -> None:
+        """Restore the 3D scene tab whenever its external host releases it."""
+
+        if restored_viewer is self.scene_3d_workspace and not self._is_shutdown:
+            self._restore_workspace_tab(self.scene_3d_workspace)
+
+    def _handle_external_generation_workspace_restored(
+        self,
+        restored_viewer: object,
+    ) -> None:
+        """Restore Generation whenever its external host releases it."""
+
+        if (
+            restored_viewer is self.merged_generation_workspace
+            and not self._is_shutdown
+        ):
+            self._restore_workspace_tab(self.merged_generation_workspace)
+
+    def _apply_scene_3d_display_screen(
         self,
         screen_id: str | None,
     ) -> None:
-        """Show the active workspace's 3D view on its chosen display."""
+        """Keep the shared scene maximized on its independently chosen display."""
 
-        if screen_id is None and not self._external_viewer_host.is_active:
+        if screen_id is None:
+            self._external_scene_3d_host.restore()
+            self._restore_workspace_tab(self.scene_3d_workspace)
             return
         screen = resolve_fullscreen_3d_viewer_screen(screen_id)
-        viewer = self._active_workspace_3d_viewer()
-        if screen is None or viewer is None:
-            if not self._external_viewer_host.is_active:
-                return
-            self._external_viewer_host.restore()
-            self._sync_external_3d_workspace_presentations()
+        if screen is None:
+            self._external_scene_3d_host.restore()
+            self._restore_workspace_tab(self.scene_3d_workspace)
             return
-        self._external_viewer_host.show_on_screen(viewer, screen)
-        self._sync_external_3d_workspace_presentations()
-        self._request_hosted_atlas_object_preview()
-        if (
-            viewer is self.viewer
-            or viewer is self.surface_texture_generation.surface_view
-        ):
-            self._ensure_viewer_preview_current(preserve_camera=True)
+        tab_index = self._prepare_workspace_for_detachment(
+            self.scene_3d_workspace
+        )
+        self._external_scene_3d_host.show_on_screen(
+            self.scene_3d_workspace,
+            screen,
+        )
+        self._remove_detached_workspace_tab(
+            self.scene_3d_workspace,
+            tab_index,
+        )
+        self.viewer.focus_navigation()
+        self._ensure_viewer_preview_current(preserve_camera=True)
+
+    def _apply_generation_display_screen(
+        self,
+        screen_id: str | None,
+    ) -> None:
+        """Keep Generation maximized on its independently chosen display."""
+
+        if screen_id is None:
+            self._external_generation_host.restore()
+            self._restore_workspace_tab(self.merged_generation_workspace)
+            return
+        screen = resolve_fullscreen_3d_viewer_screen(screen_id)
+        if screen is None:
+            self._external_generation_host.restore()
+            self._restore_workspace_tab(self.merged_generation_workspace)
+            return
+        tab_index = self._prepare_workspace_for_detachment(
+            self.merged_generation_workspace
+        )
+        self._external_generation_host.show_on_screen(
+            self.merged_generation_workspace,
+            screen,
+        )
+        self._remove_detached_workspace_tab(
+            self.merged_generation_workspace,
+            tab_index,
+        )
+        self.merged_generation_workspace.refresh_file_backed_previews()
 
     def _apply_jobs_window_screen(self, screen_id: str | None) -> None:
         """Move the persistent Jobs window to its selected display."""
@@ -8220,62 +8319,90 @@ class BlueprintWorkspace(QWidget):
             self._external_atlas_host.restore()
             self._restore_atlas_workspace_tab()
             return
-        atlas_tab_index = self._prepare_atlas_workspace_for_detachment()
+        atlas_tab_index = self._prepare_workspace_for_detachment(
+            self.texture_atlas_workspace
+        )
         self._external_atlas_host.show_on_screen(
             self.texture_atlas_workspace,
             screen,
         )
-        self._remove_detached_atlas_workspace_tab(atlas_tab_index)
+        self._remove_detached_workspace_tab(
+            self.texture_atlas_workspace,
+            atlas_tab_index,
+        )
         self._sync_atlas_object_texture_sources()
         self._schedule_atlas_draw_call_estimate()
 
-    def _prepare_atlas_workspace_for_detachment(self) -> int:
-        """Return the Atlas tab slot and move local focus away if necessary."""
+    def _prepare_workspace_for_detachment(self, workspace: QWidget) -> int:
+        """Return one tab slot and move local focus away before detaching it."""
 
-        atlas_tab_index = self.workspace_tabs.indexOf(self.texture_atlas_workspace)
+        tab_index = self.workspace_tabs.indexOf(workspace)
         if (
-            atlas_tab_index >= 0
-            and self.workspace_tabs.currentWidget() is self.texture_atlas_workspace
+            tab_index >= 0
+            and self.workspace_tabs.currentWidget() is workspace
         ):
             self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
-        return atlas_tab_index
+        return tab_index
 
-    def _remove_detached_atlas_workspace_tab(
+    def _remove_detached_workspace_tab(
         self,
-        atlas_tab_index: int,
+        workspace: QWidget,
+        tab_index: int,
     ) -> None:
-        """Remove the placeholder tab left by a successful Atlas handoff."""
+        """Remove the placeholder tab left by a successful workspace handoff."""
 
-        if atlas_tab_index < 0:
-            self.atlas_workspace_tab_index = -1
+        if tab_index < 0:
+            self._refresh_workspace_tab_indices()
             return
-        self.atlas_workspace_tab_index = -1
-        self.workspace_tabs.removeTab(atlas_tab_index)
+        self.workspace_tabs.removeTab(tab_index)
+        self._refresh_workspace_tab_indices()
 
     def _restore_atlas_workspace_tab(self) -> None:
-        """Insert Atlas at its canonical slot without changing local focus."""
+        """Restore Atlas at its canonical top-level position."""
 
-        existing_index = self.workspace_tabs.indexOf(self.texture_atlas_workspace)
+        self._restore_workspace_tab(self.texture_atlas_workspace)
+
+    def _restore_workspace_tab(self, workspace: QWidget) -> None:
+        """Insert a detached workspace in canonical order without focus theft."""
+
+        existing_index = self.workspace_tabs.indexOf(workspace)
         if (
             0 <= existing_index < self.workspace_tabs.count()
             and self.workspace_tabs.widget(existing_index)
-            is self.texture_atlas_workspace
+            is workspace
         ):
-            self.atlas_workspace_tab_index = existing_index
+            self._refresh_workspace_tab_indices()
             return
 
         current_widget = self.workspace_tabs.currentWidget()
-        canvas_index = self.workspace_tabs.indexOf(self.canvas_viewer_workspace)
-        canonical_index = (
-            canvas_index + 1
-            if canvas_index >= 0
-            else min(1, self.workspace_tabs.count())
+        canonical_entries = self._canonical_workspace_tabs()
+        target_position = next(
+            (
+                index
+                for index, (candidate, _label) in enumerate(canonical_entries)
+                if candidate is workspace
+            ),
+            len(canonical_entries),
         )
-        self.atlas_workspace_tab_index = self.workspace_tabs.insertTab(
-            canonical_index,
-            self.texture_atlas_workspace,
-            "Atlas",
+        insertion_index = sum(
+            1
+            for candidate, _label in canonical_entries[:target_position]
+            if self.workspace_tabs.indexOf(candidate) >= 0
         )
+        label = next(
+            (
+                candidate_label
+                for candidate, candidate_label in canonical_entries
+                if candidate is workspace
+            ),
+            "Workspace",
+        )
+        self.workspace_tabs.insertTab(
+            insertion_index,
+            workspace,
+            label,
+        )
+        self._refresh_workspace_tab_indices()
         if (
             current_widget is not None
             and self.workspace_tabs.indexOf(current_widget) >= 0
@@ -8283,29 +8410,39 @@ class BlueprintWorkspace(QWidget):
         ):
             self.workspace_tabs.setCurrentWidget(current_widget)
 
-    def _sync_external_3d_workspace_presentations(self) -> None:
-        """Show each workspace's local replacement for its detached 3D view."""
+    def _canonical_workspace_tabs(self) -> tuple[tuple[QWidget, str], ...]:
+        """Return the stable tab order shared by detach and restore paths."""
 
-        hosted_viewer = self._external_viewer_host.viewer
-        self.set_canvas_3d_viewer_external_display_active(hosted_viewer is self.viewer)
-        self.surface_texture_generation.set_external_3d_viewer_active(
-            hosted_viewer is self.surface_texture_generation.surface_view
+        return (
+            (self.canvas_viewer_workspace, "Canvas"),
+            (self.scene_3d_workspace, "3D scene"),
+            (self.texture_atlas_workspace, "Atlas"),
+            (self.merged_generation_workspace, "Generation"),
+            (self.settings_widget, "Settings"),
         )
-        self.generation.set_external_3d_viewer_active(
-            hosted_viewer is self.generation.object_3d_panel
-        )
 
-    def _active_workspace_3d_viewer(self) -> QWidget | None:
-        """Return the 3D widget belonging to the selected top-level tab."""
+    def _set_workspace_tab_index(self, workspace: QWidget, index: int) -> None:
+        """Keep compatibility index attributes synchronized after tab moves."""
 
-        selected_widget = self.workspace_tabs.currentWidget()
-        if selected_widget is self.canvas_viewer_workspace:
-            return self.viewer
-        if selected_widget is self.surface_texture_generation:
-            return self.surface_texture_generation.surface_view
-        if selected_widget is self.generation:
-            return self.generation.object_3d_panel
-        return None
+        if workspace is self.canvas_viewer_workspace:
+            self.canvas_workspace_tab_index = index
+        elif workspace is self.scene_3d_workspace:
+            self.scene_3d_workspace_tab_index = index
+        elif workspace is self.texture_atlas_workspace:
+            self.atlas_workspace_tab_index = index
+        elif workspace is self.merged_generation_workspace:
+            self.generation_workspace_tab_index = index
+        elif workspace is self.settings_widget:
+            self.settings_workspace_tab_index = index
+
+    def _refresh_workspace_tab_indices(self) -> None:
+        """Recompute every public tab index after one workspace moves."""
+
+        for workspace, _label in self._canonical_workspace_tabs():
+            self._set_workspace_tab_index(
+                workspace,
+                self.workspace_tabs.indexOf(workspace),
+            )
 
     def _request_hosted_atlas_object_preview(self) -> None:
         """Refresh the selected object in Atlas's embedded 3D preview."""
@@ -8319,32 +8456,16 @@ class BlueprintWorkspace(QWidget):
     # ### Shared 3D preview cache ###
     def _canvas_viewer_preview_is_active(self) -> bool:
         return bool(
-            (
-                self.workspace_tabs.currentWidget() is self.canvas_viewer_workspace
-                and self.canvas_viewer_tabs.currentIndex()
-                == self.canvas_3d_view_tab_index
-            )
+            self.workspace_tabs.currentWidget() is self.scene_3d_workspace
             or (
-                self._external_viewer_host.is_active
-                and self._external_viewer_host.viewer is self.viewer
-            )
-        )
-
-    def _surface_viewer_preview_is_active(self) -> bool:
-        return bool(
-            self.workspace_tabs.currentWidget() is self.surface_texture_generation
-            or (
-                self._external_viewer_host.is_active
-                and self._external_viewer_host.viewer
-                is self.surface_texture_generation.surface_view
+                self._external_scene_3d_host.is_active
+                and self._external_scene_3d_host.viewer
+                is self.scene_3d_workspace
             )
         )
 
     def _viewer_preview_is_active(self) -> bool:
-        return bool(
-            self._canvas_viewer_preview_is_active()
-            or self._surface_viewer_preview_is_active()
-        )
+        return self._canvas_viewer_preview_is_active()
 
     def _active_viewer_preview_needs_refresh(self) -> bool:
         revision = self._viewer_preview_revision
@@ -8352,15 +8473,9 @@ class BlueprintWorkspace(QWidget):
             self.texture_atlas_workspace.is_ambient_occlusion_preview_active
         )
         return bool(
-            (
-                self._canvas_viewer_preview_is_active()
-                and not ambient_occlusion_override_active
-                and self._canvas_viewer_preview_revision != revision
-            )
-            or (
-                self._surface_viewer_preview_is_active()
-                and self._surface_viewer_preview_revision != revision
-            )
+            self._canvas_viewer_preview_is_active()
+            and not ambient_occlusion_override_active
+            and self._canvas_viewer_preview_revision != revision
         )
 
     def _remember_current_canvas_preview_model(
@@ -8891,6 +9006,20 @@ class BlueprintWorkspace(QWidget):
     def _handle_surface_texture_content_changed(self) -> None:
         self._schedule_viewer_preview_refresh(preserve_camera=True)
 
+    def _handle_generation_scene_pbr_maps_changed(self, _checked: bool) -> None:
+        """Apply the shared Generation map toggles to the shared 3D scene."""
+
+        if self.texture_atlas_workspace.is_ambient_occlusion_preview_active:
+            return
+        enabled_maps = tuple(
+            map_type
+            for map_type, checkbox in (
+                self.merged_generation_workspace.pbr_map_checkboxes.items()
+            )
+            if checkbox.isChecked()
+        )
+        self.viewer.set_pbr_maps_enabled(enabled_maps)
+
     def _refresh_viewer_preview(self, preserve_camera: bool = False) -> None:
         if (
             self._active_canvas_surface_edit_target is not None
@@ -8907,11 +9036,7 @@ class BlueprintWorkspace(QWidget):
             and not ambient_occlusion_override_active
             and self._canvas_viewer_preview_revision != revision
         )
-        surface_is_stale = bool(
-            self._surface_viewer_preview_is_active()
-            and self._surface_viewer_preview_revision != revision
-        )
-        if not canvas_is_stale and not surface_is_stale:
+        if not canvas_is_stale:
             return
 
         preview_levels = self._build_viewer_preview_levels()
@@ -8961,13 +9086,6 @@ class BlueprintWorkspace(QWidget):
                 self._refresh_pending_level_transform_outline()
             self._clear_committed_doorway_outline_if_displayed()
             self._clear_committed_level_transform_outline_if_displayed()
-
-        if surface_is_stale:
-            self.surface_texture_generation.set_preview_context(
-                preview_levels,
-                generated_model,
-            )
-            self._surface_viewer_preview_revision = revision
 
     def _mark_viewer_preview_dirty(
         self,
@@ -9422,7 +9540,6 @@ class BlueprintWorkspace(QWidget):
         self._commit_pending_wall_vertex_update()
         self._commit_pending_doorway_mesh_update()
         self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
-        self.canvas_viewer_tabs.setCurrentWidget(self.canvas)
         self.canvas.start_open_space_placement()
 
     def _handle_open_spaces_changed(self) -> None:
@@ -10399,7 +10516,6 @@ class BlueprintWorkspace(QWidget):
 
         style = self.stair_style_combo.currentData()
         self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
-        self.canvas_viewer_tabs.setCurrentWidget(self.canvas)
         self.canvas.start_stair_placement(
             DEFAULT_STAIR_STYLE if style is None else str(style)
         )
@@ -10590,7 +10706,10 @@ class BlueprintWorkspace(QWidget):
         )
         self.generation.set_runtime_settings(settings)
         self.surface_texture_generation.set_runtime_settings(settings)
-        self._apply_fullscreen_3d_viewer_screen(settings.fullscreen_3d_viewer_screen_id)
+        self._apply_scene_3d_display_screen(settings.scene_3d_display_screen_id)
+        self._apply_generation_display_screen(
+            settings.generation_display_screen_id
+        )
         self._apply_jobs_window_screen(settings.jobs_window_screen_id)
         self._apply_atlas_display_screen(settings.atlas_display_screen_id)
         self._refresh_scene_atlas_texture_requirements()
@@ -10776,10 +10895,23 @@ class BlueprintWorkspace(QWidget):
         self._atlas_available_source_ids.clear()
         self._last_automatic_atlas_assignment_key = None
         self._clear_atlas_object_preview()
+        generation, surface_texture_generation = (
+            self.merged_generation_workspace.merge_project_video_state(
+                generation,
+                surface_texture_generation,
+            )
+        )
         self.generation.set_data(generation)
         self.texture_atlas_workspace.set_data(texture_atlases)
         self.surface_texture_generation.set_levels(self.levels)
         self.surface_texture_generation.set_data(surface_texture_generation)
+        self._desired_canvas_surface_ids = tuple(
+            surface_texture_generation.selected_surface_ids
+        )
+        self._atlas_surface_assignment_target_ids = (
+            self._desired_canvas_surface_ids
+        )
+        self.merged_generation_workspace.sync_shared_controls()
         self.surface_texture_generation.reconcile_assignments_with_levels(
             self.levels,
             emit_signals=False,

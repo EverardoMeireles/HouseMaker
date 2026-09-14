@@ -716,7 +716,6 @@ class ObjectTextureVariantWorkspaceTests(unittest.TestCase):
         self.workspace._handle_generation_succeeded(result, model)
         record = self.workspace.get_data().generated_objects[0]
 
-        self.assertEqual(len(self.workspace.texture_view.entries), 3)
         self.assertIsNone(
             self.workspace._generated_model_cache[
                 record.object_id
@@ -729,8 +728,11 @@ class ObjectTextureVariantWorkspaceTests(unittest.TestCase):
         self.assertEqual(exact_512.resolution, 512)
         self.assertTrue(exact_512.texture_asset_path.is_file())
 
-        self.workspace.texture_view.select_atlas(
-            f"{record.object_id}:resolution:2048"
+        self.assertTrue(
+            self.workspace.select_object_texture_resolution(
+                record.object_id,
+                2048,
+            )
         )
         selected_data = self.workspace.get_data()
         selected = selected_data.generated_objects[0]
@@ -743,10 +745,6 @@ class ObjectTextureVariantWorkspaceTests(unittest.TestCase):
         self.assertEqual(exact_512.resolution, 512)
 
         self.workspace.set_data(selected_data)
-        self.assertEqual(
-            self.workspace.texture_view.selected_atlas_id,
-            f"{record.object_id}:resolution:2048",
-        )
         self.assertEqual(
             self.workspace.get_active_texture_variant(record.object_id).resolution,
             2048,
@@ -779,92 +777,8 @@ class ObjectTextureVariantWorkspaceTests(unittest.TestCase):
         self.assertEqual(png_only_512.resolution, 512)
         self.assertTrue(png_only_512.texture_asset_path.is_file())
         self.workspace.set_data(selected_data)
-        self.assertEqual(len(self.workspace.texture_view.entries), 2)
         self.assertTrue(self.workspace.delete_generated_object(record.object_id))
         self.assertTrue(all(not path.exists() for path in all_paths))
-
-    def test_wireframe_uv_overlay_tracks_resolution_in_external_mode(self) -> None:
-        model = self._generated_model_with_variants()
-        result = MeshyGenerationResult("task", model.glb_bytes, "Table")
-        self.workspace._handle_generation_succeeded(result, model)
-        record = self.workspace.get_data().generated_objects[0]
-        initial_triangles = self.workspace.texture_view.uv_overlay_triangles
-        variant_2048 = self.workspace.get_texture_variant(
-            record.object_id,
-            2048,
-        )
-        self.assertIsNotNone(variant_2048)
-        assert variant_2048 is not None
-        modified_glb = _rewrite_uv_layout(
-            variant_2048.glb_asset_path.read_bytes()
-        )
-        variant_2048.glb_asset_path.write_bytes(modified_glb)
-
-        self.workspace.wireframe_checkbox.setChecked(True)
-        self.workspace.set_external_3d_viewer_active(True)
-        self.workspace.texture_view.select_atlas(
-            f"{record.object_id}:resolution:2048"
-        )
-        _qt_application.processEvents()
-
-        selected_triangles = self.workspace.texture_view.uv_overlay_triangles
-        self.assertTrue(initial_triangles)
-        self.assertTrue(selected_triangles)
-        self.assertNotEqual(selected_triangles, initial_triangles)
-        self.assertTrue(self.workspace.texture_view.uv_overlay_enabled)
-        self.assertTrue(self.workspace.result_view.get_wireframe_enabled())
-        self.assertIs(
-            self.workspace.right_view_stack.currentWidget(),
-            self.workspace.texture_view_page,
-        )
-        self.assertEqual(
-            self.workspace.get_data().generated_objects[0].pipeline[
-                "selected_texture_resolution"
-            ],
-            2048,
-        )
-        self.assertEqual(self.workspace.result_view.model.glb_bytes, modified_glb)
-
-        self.workspace.set_external_3d_viewer_active(False)
-
-        self.assertTrue(self.workspace.texture_view.uv_overlay_enabled)
-        self.assertEqual(
-            self.workspace.texture_view.uv_overlay_triangles,
-            selected_triangles,
-        )
-        self.assertIs(
-            self.workspace.right_view_stack.currentWidget(),
-            self.workspace.object_3d_page,
-        )
-
-    def test_wireframe_uv_overlay_follows_generated_object_selection(self) -> None:
-        first_model = self._generated_model_with_variants()
-        self.workspace._handle_generation_succeeded(
-            MeshyGenerationResult("first-task", first_model.glb_bytes, "First"),
-            first_model,
-        )
-        first_triangles = self.workspace.texture_view.uv_overlay_triangles
-
-        second_glb = _rewrite_uv_layout(_textured_glb(), scale=0.6, offset=0.15)
-        second_model = import_generated_glb(second_glb)
-        second_model.object_texture_variants = build_object_texture_variants(second_glb)
-        self.workspace.wireframe_checkbox.setChecked(True)
-        self.workspace._handle_generation_succeeded(
-            MeshyGenerationResult("second-task", second_glb, "Second"),
-            second_model,
-        )
-        second_triangles = self.workspace.texture_view.uv_overlay_triangles
-
-        self.assertNotEqual(second_triangles, first_triangles)
-        self.assertTrue(self.workspace.texture_view.uv_overlay_enabled)
-        self.workspace.generated_objects_list.setCurrentRow(0)
-        _qt_application.processEvents()
-
-        self.assertEqual(
-            self.workspace.texture_view.uv_overlay_triangles,
-            first_triangles,
-        )
-        self.assertTrue(self.workspace.texture_view.uv_overlay_enabled)
 
     def test_variant_persistence_rolls_back_after_an_injected_write_failure(
         self,
@@ -903,8 +817,11 @@ class ObjectTextureVariantWorkspaceTests(unittest.TestCase):
         result = MeshyGenerationResult("task", model.glb_bytes, "Table")
         self.workspace._handle_generation_succeeded(result, model)
         object_id = self.workspace.get_data().generated_objects[0].object_id
-        self.workspace.texture_view.select_atlas(
-            f"{object_id}:resolution:2048"
+        self.assertTrue(
+            self.workspace.select_object_texture_resolution(
+                object_id,
+                2048,
+            )
         )
         saved_data = self.workspace.get_data()
         active_2048 = self.workspace.get_active_texture_variant(object_id)
@@ -916,10 +833,6 @@ class ObjectTextureVariantWorkspaceTests(unittest.TestCase):
         repaired = self.workspace.get_data().generated_objects[0]
         self.assertEqual(repaired.pipeline["selected_texture_resolution"], 1024)
         self.assertTrue(str(repaired.asset_path).endswith("texture-1024.glb"))
-        self.assertEqual(
-            self.workspace.texture_view.selected_atlas_id,
-            f"{object_id}:resolution:1024",
-        )
         self.assertIsNotNone(self.workspace.result_view.model)
 
     def test_runtime_repair_emits_one_synchronized_data_change(self) -> None:
@@ -927,8 +840,11 @@ class ObjectTextureVariantWorkspaceTests(unittest.TestCase):
         result = MeshyGenerationResult("task", model.glb_bytes, "Table")
         self.workspace._handle_generation_succeeded(result, model)
         object_id = self.workspace.get_data().generated_objects[0].object_id
-        self.workspace.texture_view.select_atlas(
-            f"{object_id}:resolution:2048"
+        self.assertTrue(
+            self.workspace.select_object_texture_resolution(
+                object_id,
+                2048,
+            )
         )
         active = self.workspace.get_active_texture_variant(object_id)
         active.glb_asset_path.unlink()

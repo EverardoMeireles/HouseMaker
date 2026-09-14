@@ -80,20 +80,17 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
 
             build_preview.assert_not_called()
 
-            self.workspace.canvas_viewer_tabs.setCurrentIndex(
-                self.workspace.canvas_3d_view_tab_index
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.scene_3d_workspace
             )
             _qt_application.processEvents()
 
         build_preview.assert_called_once_with(None)
         self.assertIs(self.workspace.viewer.model, expected_model)
 
-    def test_canvas_3d_activation_checks_the_blueprint_once(self) -> None:
+    def test_scene_3d_activation_checks_the_blueprint_once(self) -> None:
         self.workspace.workspace_tabs.setCurrentWidget(
             self.workspace.settings_widget
-        )
-        self.workspace.canvas_viewer_tabs.setCurrentIndex(
-            self.workspace.canvas_3d_view_tab_index
         )
 
         with patch.object(
@@ -102,20 +99,20 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
             wraps=self.workspace.canvas.refresh_blueprint_image_if_stale,
         ) as refresh_blueprint:
             self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.canvas_viewer_workspace
+                self.workspace.scene_3d_workspace
             )
             _qt_application.processEvents()
 
         refresh_blueprint.assert_called_once_with()
 
-    def test_returning_to_canvas_reloads_same_path_blueprint_replacement(
+    def test_returning_to_scene_reloads_same_path_blueprint_replacement(
         self,
     ) -> None:
         image_path = Path(self._temporary_directory.name) / "blueprint.png"
         Image.new("RGB", (32, 24), (20, 40, 60)).save(image_path)
         self.workspace._set_current_level_image(str(image_path))
-        self.workspace.canvas_viewer_tabs.setCurrentIndex(
-            self.workspace.canvas_3d_view_tab_index
+        self.workspace.workspace_tabs.setCurrentWidget(
+            self.workspace.scene_3d_workspace
         )
         _qt_application.processEvents()
         self.workspace.workspace_tabs.setCurrentWidget(
@@ -141,11 +138,12 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
                 self.workspace.canvas_viewer_workspace
             )
             _qt_application.processEvents()
+            build_preview.assert_not_called()
             self.workspace.workspace_tabs.setCurrentWidget(
                 self.workspace.settings_widget
             )
             self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.canvas_viewer_workspace
+                self.workspace.scene_3d_workspace
             )
             _qt_application.processEvents()
 
@@ -160,7 +158,7 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
         build_preview.assert_called_once_with(None)
         self.assertIs(self.workspace.viewer.model, refreshed_model)
 
-    def test_opening_canvas_3d_refreshes_a_changed_blueprint(self) -> None:
+    def test_opening_scene_3d_refreshes_a_changed_blueprint(self) -> None:
         image_path = Path(self._temporary_directory.name) / "canvas-3d.png"
         Image.new("RGB", (32, 24), (20, 40, 60)).save(image_path)
         self.workspace._set_current_level_image(str(image_path))
@@ -174,14 +172,14 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
             ),
         )
 
-        refreshed_model = _preview_model("canvas-subtab-blueprint")
+        refreshed_model = _preview_model("scene-tab-blueprint")
         with patch.object(
             self.workspace,
             "_build_viewer_preview_model",
             return_value=refreshed_model,
         ) as build_preview:
-            self.workspace.canvas_viewer_tabs.setCurrentIndex(
-                self.workspace.canvas_3d_view_tab_index
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.scene_3d_workspace
             )
             _qt_application.processEvents()
 
@@ -192,7 +190,7 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
         build_preview.assert_called_once_with(None)
         self.assertIs(self.workspace.viewer.model, refreshed_model)
 
-    def test_opening_surface_refreshes_a_changed_blueprint(self) -> None:
+    def test_opening_generation_defers_changed_blueprint_until_scene(self) -> None:
         image_path = Path(self._temporary_directory.name) / "surface.png"
         Image.new("RGB", (32, 24), (20, 40, 60)).save(image_path)
         self.workspace._set_current_level_image(str(image_path))
@@ -213,7 +211,12 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
             return_value=refreshed_model,
         ) as build_preview:
             self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.surface_texture_generation
+                self.workspace.merged_generation_workspace
+            )
+            _qt_application.processEvents()
+            build_preview.assert_not_called()
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.scene_3d_workspace
             )
             _qt_application.processEvents()
 
@@ -222,42 +225,31 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
             (60.0, 36.0),
         )
         build_preview.assert_called_once_with(None)
-        self.assertIs(
-            self.workspace.surface_texture_generation.surface_view
-            .get_scene_model(),
-            refreshed_model,
-        )
+        self.assertIs(self.workspace.viewer.model, refreshed_model)
 
-    def test_surface_camera_navigation_does_not_rescan_atlas_sources(
+    def test_scene_camera_navigation_does_not_rescan_atlas_sources(
         self,
     ) -> None:
-        surface_workspace = self.workspace.surface_texture_generation
+        camera_pose = CameraPose(
+            x=2.0,
+            y=3.0,
+            z=1.7,
+            yaw_degrees=24.0,
+        )
 
         with patch.object(
             self.workspace,
             "_sync_atlas_object_texture_sources",
         ) as sync_atlas_sources:
-            surface_workspace.surface_view.set_camera_pose(
-                CameraPose(
-                    x=2.0,
-                    y=3.0,
-                    z=1.7,
-                    yaw_degrees=24.0,
-                )
-            )
+            self.workspace.viewer.set_first_person_camera_pose(camera_pose)
 
         sync_atlas_sources.assert_not_called()
         self.assertEqual(
-            surface_workspace.get_data().camera_pose,
-            CameraPose(
-                x=2.0,
-                y=3.0,
-                z=1.7,
-                yaw_degrees=24.0,
-            ),
+            self.workspace.viewer.get_first_person_camera_pose(),
+            camera_pose,
         )
 
-    def test_surface_refreshes_a_changed_non_current_blueprint(self) -> None:
+    def test_scene_refreshes_a_changed_non_current_blueprint(self) -> None:
         level = next(
             item
             for position, item in enumerate(self.workspace.levels)
@@ -287,7 +279,7 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
             return_value=refreshed_model,
         ) as build_preview:
             self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.surface_texture_generation
+                self.workspace.scene_3d_workspace
             )
             _qt_application.processEvents()
 
@@ -341,7 +333,7 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
             return_value=refreshed_model,
         ) as build_preview:
             self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.surface_texture_generation
+                self.workspace.scene_3d_workspace
             )
             _qt_application.processEvents()
 
@@ -357,8 +349,8 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
             "_build_viewer_preview_model",
             return_value=_preview_model("before-missing-blueprint"),
         ):
-            self.workspace.canvas_viewer_tabs.setCurrentIndex(
-                self.workspace.canvas_3d_view_tab_index
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.scene_3d_workspace
             )
             _qt_application.processEvents()
         self.workspace.workspace_tabs.setCurrentWidget(
@@ -391,7 +383,7 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
         )
         build_preview.assert_not_called()
 
-    def test_reopening_current_tabs_reuses_both_gl_scenes(self) -> None:
+    def test_reopening_scene_reuses_the_single_current_gl_scene(self) -> None:
         expected_model = _preview_model("shared-current")
         with (
             patch.object(
@@ -404,52 +396,32 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
                 "set_model",
                 wraps=self.workspace.viewer.set_model,
             ) as set_canvas_model,
-            patch.object(
-                self.workspace.surface_texture_generation,
-                "set_preview_context",
-                wraps=(
-                    self.workspace.surface_texture_generation.set_preview_context
-                ),
-            ) as set_surface_model,
-            patch.object(
-                self.workspace.surface_texture_generation.surface_view,
-                "set_levels",
-                wraps=(
-                    self.workspace.surface_texture_generation.surface_view
-                    .set_levels
-                ),
-            ) as set_surface_levels,
         ):
-            self.workspace.canvas_viewer_tabs.setCurrentIndex(
-                self.workspace.canvas_3d_view_tab_index
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.scene_3d_workspace
             )
             _qt_application.processEvents()
             self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.surface_texture_generation
-            )
-            _qt_application.processEvents()
-            self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.texture_atlas_workspace
-            )
-            self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.canvas_viewer_workspace
+                self.workspace.merged_generation_workspace
             )
             _qt_application.processEvents()
             self.workspace.workspace_tabs.setCurrentWidget(
                 self.workspace.texture_atlas_workspace
             )
             self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.surface_texture_generation
+                self.workspace.scene_3d_workspace
+            )
+            _qt_application.processEvents()
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.texture_atlas_workspace
+            )
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.scene_3d_workspace
             )
             _qt_application.processEvents()
 
         build_preview.assert_called_once_with(None)
         set_canvas_model.assert_called_once()
-        set_surface_model.assert_called_once_with(
-            self.workspace.levels,
-            expected_model,
-        )
-        set_surface_levels.assert_not_called()
 
     def test_reopening_every_workspace_skips_unchanged_heavy_work(self) -> None:
         expected_model = _preview_model("all-workspaces-current")
@@ -458,11 +430,11 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
             "_build_viewer_preview_model",
             return_value=expected_model,
         ):
-            self.workspace.canvas_viewer_tabs.setCurrentIndex(
-                self.workspace.canvas_3d_view_tab_index
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.scene_3d_workspace
             )
             self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.surface_texture_generation
+                self.workspace.merged_generation_workspace
             )
             self.workspace.workspace_tabs.setCurrentWidget(
                 self.workspace.settings_widget
@@ -484,10 +456,6 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
                 "set_model",
             ) as set_canvas_model,
             patch.object(
-                self.workspace.surface_texture_generation,
-                "set_preview_context",
-            ) as set_surface_context,
-            patch.object(
                 self.workspace.texture_atlas_workspace,
                 "_refresh_all",
             ) as refresh_atlas,
@@ -495,20 +463,12 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
                 self.workspace.generation,
                 "_display_generated_object",
             ) as display_generated_object,
-            patch.object(
-                self.workspace.generation.object_3d_panel,
-                "set_external_presentation_active",
-                wraps=(
-                    self.workspace.generation.object_3d_panel
-                    .set_external_presentation_active
-                ),
-            ) as arrange_object_panel,
         ):
             workspaces = (
                 self.workspace.canvas_viewer_workspace,
+                self.workspace.scene_3d_workspace,
                 self.workspace.texture_atlas_workspace,
-                self.workspace.surface_texture_generation,
-                self.workspace.generation,
+                self.workspace.merged_generation_workspace,
                 self.workspace.settings_widget,
             )
             for _pass_index in range(2):
@@ -519,12 +479,10 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
 
         build_preview.assert_not_called()
         set_canvas_model.assert_not_called()
-        set_surface_context.assert_not_called()
         refresh_atlas.assert_not_called()
         display_generated_object.assert_not_called()
-        arrange_object_panel.assert_not_called()
 
-    def test_inactive_change_builds_once_and_updates_only_stale_views(self) -> None:
+    def test_inactive_change_builds_once_when_shared_scene_reopens(self) -> None:
         first_model = _preview_model("first")
         second_model = _preview_model("second")
         with (
@@ -538,20 +496,13 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
                 "set_model",
                 wraps=self.workspace.viewer.set_model,
             ) as set_canvas_model,
-            patch.object(
-                self.workspace.surface_texture_generation,
-                "set_preview_context",
-                wraps=(
-                    self.workspace.surface_texture_generation.set_preview_context
-                ),
-            ) as set_surface_model,
         ):
-            self.workspace.canvas_viewer_tabs.setCurrentIndex(
-                self.workspace.canvas_3d_view_tab_index
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.scene_3d_workspace
             )
             _qt_application.processEvents()
             self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.surface_texture_generation
+                self.workspace.merged_generation_workspace
             )
             _qt_application.processEvents()
             self.workspace.workspace_tabs.setCurrentWidget(
@@ -563,20 +514,14 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
             self.assertEqual(build_preview.call_count, 1)
 
             self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.surface_texture_generation
+                self.workspace.merged_generation_workspace
             )
             _qt_application.processEvents()
-            self.assertEqual(build_preview.call_count, 2)
+            self.assertEqual(build_preview.call_count, 1)
             self.assertEqual(set_canvas_model.call_count, 1)
-            self.assertEqual(set_surface_model.call_count, 2)
-            self.assertIs(
-                self.workspace.surface_texture_generation.surface_view
-                .get_scene_model(),
-                second_model,
-            )
 
             self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.canvas_viewer_workspace
+                self.workspace.scene_3d_workspace
             )
             _qt_application.processEvents()
 
@@ -596,11 +541,8 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
             "_build_viewer_preview_model",
             side_effect=(None, expected_model),
         ) as build_preview:
-            self.workspace.canvas_viewer_tabs.setCurrentIndex(
-                self.workspace.canvas_3d_view_tab_index
-            )
             self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.canvas_viewer_workspace
+                self.workspace.scene_3d_workspace
             )
             _qt_application.processEvents()
 
@@ -617,7 +559,7 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
                 self.workspace.settings_widget
             )
             self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.canvas_viewer_workspace
+                self.workspace.scene_3d_workspace
             )
             _qt_application.processEvents()
 
@@ -714,8 +656,8 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
                 side_effect=(first_model, second_model),
             ) as build_preview,
         ):
-            self.workspace.canvas_viewer_tabs.setCurrentIndex(
-                self.workspace.canvas_3d_view_tab_index
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.scene_3d_workspace
             )
             _qt_application.processEvents()
             self.workspace.workspace_tabs.setCurrentWidget(
@@ -727,34 +669,29 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
                 self.workspace.canvas_viewer_workspace
             )
             _qt_application.processEvents()
-            self.assertIs(self.workspace.viewer.model, second_model)
+            self.assertIs(self.workspace.viewer.model, first_model)
 
             self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.surface_texture_generation
+                self.workspace.scene_3d_workspace
             )
             _qt_application.processEvents()
 
         self.assertEqual(build_preview.call_count, 2)
-        self.assertIs(
-            self.workspace.surface_texture_generation.surface_view
-            .get_scene_model(),
-            second_model,
-        )
+        self.assertIs(self.workspace.viewer.model, second_model)
 
-    def test_gizmo_commit_defers_only_the_surface_rebuild(self) -> None:
+    def test_gizmo_commit_keeps_the_shared_scene_cache_current(self) -> None:
         first_model = _preview_model("before-gizmo")
-        second_model = _preview_model("after-gizmo")
         with patch.object(
             self.workspace,
             "_build_viewer_preview_model",
             return_value=first_model,
         ):
-            self.workspace.canvas_viewer_tabs.setCurrentIndex(
-                self.workspace.canvas_3d_view_tab_index
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.scene_3d_workspace
             )
             _qt_application.processEvents()
             self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.surface_texture_generation
+                self.workspace.merged_generation_workspace
             )
             _qt_application.processEvents()
             self.workspace.workspace_tabs.setCurrentWidget(
@@ -787,7 +724,7 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
             patch.object(
                 self.workspace,
                 "_build_viewer_preview_model",
-                return_value=second_model,
+                return_value=_preview_model("unexpected-gizmo-rebuild"),
             ) as build_preview,
             patch.object(self.workspace.viewer, "set_model") as set_canvas_model,
         ):
@@ -806,25 +743,17 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
                 self.workspace._canvas_viewer_preview_revision,
                 self.workspace._viewer_preview_revision,
             )
-            self.assertNotEqual(
-                self.workspace._surface_viewer_preview_revision,
-                self.workspace._viewer_preview_revision,
-            )
             build_preview.assert_not_called()
             set_canvas_model.assert_not_called()
 
             self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.surface_texture_generation
+                self.workspace.scene_3d_workspace
             )
             _qt_application.processEvents()
 
-        build_preview.assert_called_once_with(None)
+        build_preview.assert_not_called()
         set_canvas_model.assert_not_called()
-        self.assertIs(
-            self.workspace.surface_texture_generation.surface_view
-            .get_scene_model(),
-            second_model,
-        )
+        self.assertIs(self.workspace.viewer.model, first_model)
 
     def test_canvas_reopen_detects_asset_change_after_gizmo_fast_path(
         self,
@@ -848,8 +777,8 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
                 side_effect=(first_model, second_model),
             ) as build_preview,
         ):
-            self.workspace.canvas_viewer_tabs.setCurrentIndex(
-                self.workspace.canvas_3d_view_tab_index
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.scene_3d_workspace
             )
             _qt_application.processEvents()
 
@@ -882,7 +811,7 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
             )
             dependency_signature = ("asset-after",)
             self.workspace.workspace_tabs.setCurrentWidget(
-                self.workspace.canvas_viewer_workspace
+                self.workspace.scene_3d_workspace
             )
             _qt_application.processEvents()
 
@@ -909,8 +838,8 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
                 side_effect=(first_model, second_model),
             ) as build_preview,
         ):
-            self.workspace.canvas_viewer_tabs.setCurrentIndex(
-                self.workspace.canvas_3d_view_tab_index
+            self.workspace.workspace_tabs.setCurrentWidget(
+                self.workspace.scene_3d_workspace
             )
             _qt_application.processEvents()
             dependency_signature = ("asset-after",)

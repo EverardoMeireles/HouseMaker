@@ -200,21 +200,16 @@ class SymmetricGenerationRequestSnapshotTests(unittest.TestCase):
         pair_variants = _pair_variants((211, 31, 67, 255))
         self.workspace._active_generation_request = _request(
             enabled=True,
-            orientation=SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL,
+            orientation=SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
         )
 
         self.workspace.symmetric_division_checkbox.setChecked(False)
-        self.workspace.symmetric_division_orientation_combo.setCurrentIndex(
-            self.workspace.symmetric_division_orientation_combo.findData(
-                SYMMETRIC_DIVISION_ORIENTATION_VERTICAL
-            )
-        )
         with patch(
             "housemaker.generation_workspace."
             "build_automatic_symmetric_object_variants",
             return_value=_automatic_result(
                 pair_variants,
-                SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL,
+                SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
             ),
         ) as automatic_transform:
             self.workspace._handle_generation_succeeded(
@@ -228,14 +223,14 @@ class SymmetricGenerationRequestSnapshotTests(unittest.TestCase):
 
         automatic_transform.assert_called_once_with(
             source_variants.glb_by_resolution[2048],
-            SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL,
+            SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
         )
         first_record = self.workspace.get_data().generated_objects[0]
         self.assertEqual(
             first_record.pipeline[SYMMETRIC_DIVISION_PIPELINE_KEY][
                 "orientation"
             ],
-            SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL,
+            SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
         )
 
         ordinary_source = _ordinary_variants(2)
@@ -244,11 +239,6 @@ class SymmetricGenerationRequestSnapshotTests(unittest.TestCase):
             orientation=SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
         )
         self.workspace.symmetric_division_checkbox.setChecked(True)
-        self.workspace.symmetric_division_orientation_combo.setCurrentIndex(
-            self.workspace.symmetric_division_orientation_combo.findData(
-                SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL
-            )
-        )
         with patch(
             "housemaker.generation_workspace."
             "build_automatic_symmetric_object_variants"

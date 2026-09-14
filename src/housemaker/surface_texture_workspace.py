@@ -14,10 +14,8 @@ from typing import Protocol
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QEvent, QObject, QSize, QThread, Qt, Signal, Slot
-from PySide6.QtGui import QIcon, QKeyEvent, QPixmap
+from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QButtonGroup,
     QCheckBox,
     QComboBox,
@@ -26,24 +24,21 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QListView,
-    QListWidget,
-    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QRadioButton,
     QSlider,
     QSpinBox,
     QSplitter,
-    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 from shiboken6 import isValid as is_valid_qt_object
 
 from housemaker.app_settings import ApplicationSettingsStore
+from housemaker.generation_jobs import JOB_STATUS_RUNNING, GenerationJobManager
+from housemaker.generation_shared_controls import GenerationSharedControls
 from housemaker.generation_state import MASK_MODE_ERASE, MASK_MODE_PAINT, MaskStroke
-from housemaker.generation_jobs import GenerationJobManager
 from housemaker.generation_views import VideoInpaintView, rasterize_mask_strokes
 from housemaker.glb import GeneratedModel
 from housemaker.models import LevelData
@@ -83,9 +78,7 @@ from housemaker.surface_texture_variants import (
     build_surface_texture_variants,
 )
 from housemaker.surface_texture_viewer import SurfaceTextureViewer
-from housemaker.texture_atlas_view import TextureAtlasEntry, TextureAtlasView
 from housemaker.video_source import VIDEO_FILE_FILTER, VideoFrameSource, probe_video
-
 
 # ### Constants ###
 DEFAULT_BRUSH_RADIUS_PIXELS = 24
@@ -97,8 +90,7 @@ MAX_REFERENCE_FRAMES = 100
 REFERENCE_PADDING_RATIO = 0.08
 INTERRUPT_POLL_SECONDS = 0.05
 SHUTDOWN_WAIT_MILLISECONDS = 250
-OTHER_TEXTURE_THUMBNAIL_SIZE = QSize(96, 96)
-OTHER_TEXTURE_GRID_SIZE = QSize(152, 128)
+SURFACE_TEXTURE_JOB_KIND = "Surface texture"
 _PROGRESS_PERCENT_PATTERN = re.compile(r"(?<!\d)(100|[1-9]?\d)\s*%")
 
 
@@ -339,6 +331,20 @@ class SurfaceTextureRequest:
 
 
 @dataclass(frozen=True)
+class _SurfaceSelectionSnapshot:
+    """One immutable selection resolved against current semantic surfaces."""
+
+    surface_ids: tuple[str, ...]
+    surface_type: str | None
+    combined_area_m2: float
+    has_mixed_types: bool = False
+
+    @property
+    def is_valid(self) -> bool:
+        return bool(self.surface_ids and self.surface_type is not None)
+
+
+@dataclass(frozen=True)
 class _PreparedSurfaceTextureOutput:
     """One CPU-prepared texture family ready for main-thread persistence."""
 
@@ -565,6 +571,8 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         application_settings: ApplicationSettingsStore | None = None,
         job_manager: GenerationJobManager | None = None,
         parent: QWidget | None = None,
+        *,
+        shared_controls: GenerationSharedControls | None = None,
     ) -> None:
         super().__init__(parent)
         self._provider = provider or DefaultSurfaceTextureProvider()
@@ -583,6 +591,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             if job_manager is not None
             else GenerationJobManager(self)
         )
+        self._shared_controls = shared_controls
         self._settings = GenerationServiceSettings(
             surface_texture_provider=read_surface_texture_provider(
                 self._application_settings
@@ -597,6 +606,9 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._level_sync_signature: tuple[object, ...] | None = None
         self._semantic_surface_cache_signature: tuple[object, ...] | None = None
         self._semantic_surfaces_by_id: dict[str, FixedSurface] = {}
+        self.surface_view: SurfaceTextureViewer | None = None
+        self._shared_scene_surfaces_by_id: dict[str, FixedSurface] = {}
+        self._shared_scene_selected_surface_ids: tuple[str, ...] = ()
         self._video_source: VideoFrameSource | None = None
         self._displayed_frame_index: int | None = None
         self._is_syncing_seekbar = False
@@ -606,39 +618,58 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._generation_surface_targets: dict[str, frozenset[str]] = {}
         self._cancelled_generation_job_ids: set[str] = set()
         self._is_shutting_down = False
-        self._texture_atlas_entry_cache: dict[
-            str,
-            tuple[tuple[object, ...], TextureAtlasEntry],
-        ] = {}
-        self._texture_variant_entry_targets: dict[str, tuple[str, int]] = {}
-        self._other_texture_entry_targets: dict[
-            str,
-            tuple[str, int | None],
-        ] = {}
         self._restored_assignment_texture_signature: (
             tuple[tuple[object, ...], ...] | None
         ) = None
-        self._texture_catalog_dependency_signature: (
-            tuple[tuple[object, ...], ...] | None
-        ) = None
-        self._other_texture_list_signature: (
-            tuple[tuple[object, ...], ...] | None
-        ) = None
-        self._texture_resolution_change_handler: (
-            Callable[[str, int], bool] | None
-        ) = None
-        self._is_refreshing_texture_atlases = False
-
         self._build_ui()
-        self.surface_view.set_first_person_movement_mode(
-            self._settings.first_person_navigation_mode
-        )
+        if self.surface_view is not None:
+            self.surface_view.set_first_person_movement_mode(
+                self._settings.first_person_navigation_mode
+            )
         self._sync_video_controls()
         self._sync_controls()
 
     @property
     def is_generating(self) -> bool:
         return bool(self._generation_threads)
+
+    def get_cancellable_generation_job_ids(self) -> tuple[str, ...]:
+        """Return active Surface jobs in their creation order."""
+
+        cancellable_ids: list[str] = []
+        for job_id in self._generation_threads:
+            worker = self._generation_workers.get(job_id)
+            job = self._job_manager.get_job(job_id)
+            if (
+                worker is not None
+                and not worker.is_cancelled
+                and job is not None
+                and job.status == JOB_STATUS_RUNNING
+            ):
+                cancellable_ids.append(job_id)
+        return tuple(cancellable_ids)
+
+    @property
+    def can_cancel_current_operation(self) -> bool:
+        """Report whether the merged generation controls can cancel a job."""
+
+        return bool(self.get_cancellable_generation_job_ids())
+
+    def cancel_generation_job(self, job_id: str) -> bool:
+        """Cancel one exact Surface job through its managed callback."""
+
+        normalized_job_id = str(job_id)
+        if normalized_job_id not in self.get_cancellable_generation_job_ids():
+            return False
+        return self._job_manager.cancel_job(normalized_job_id)
+
+    def cancel_current_operation(self) -> bool:
+        """Cancel the most recently created cancellable Surface job."""
+
+        cancellable_ids = self.get_cancellable_generation_job_ids()
+        if not cancellable_ids:
+            return False
+        return self.cancel_generation_job(cancellable_ids[-1])
 
     @property
     def _generation_thread(self) -> QThread | None:
@@ -656,6 +687,79 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._store_displayed_frame_strokes()
         self._store_viewer_state()
         return self._data.clone()
+
+    # ### Shared scene selection API ###
+    def set_scene_surface_selection(
+        self,
+        surfaces: Sequence[FixedSurface],
+    ) -> bool:
+        """Use the application's shared 3D scene as the Surface target source.
+
+        Main supplies the exact selected semantic surfaces, which preserves the
+        IDs, types, and physical areas used by the rendered scene. Mixed surface
+        types remain visible in the selection label but are deliberately invalid
+        for one Surface generation request.
+        """
+
+        if self._shared_controls is None:
+            raise RuntimeError(
+                "Shared scene selection is available only in merged generation mode."
+            )
+        previous_snapshot = self._get_surface_selection_snapshot()
+        previous_persisted_selection = (
+            self._data.selected_surface_type,
+            self._data.selected_surface_ids,
+        )
+        try:
+            normalized_surfaces = tuple(surfaces)
+        except TypeError as error:
+            raise TypeError(
+                "Shared scene surfaces must contain a sequence."
+            ) from error
+        if not all(
+            isinstance(surface, FixedSurface)
+            for surface in normalized_surfaces
+        ):
+            raise TypeError("Shared scene surfaces must contain FixedSurface values.")
+        selected_surface_ids = tuple(
+            surface.surface_id for surface in normalized_surfaces
+        )
+        if len(selected_surface_ids) != len(set(selected_surface_ids)):
+            raise ValueError("Shared scene surface IDs must be unique.")
+        self._shared_scene_surfaces_by_id = {
+            surface.surface_id: surface for surface in normalized_surfaces
+        }
+        self._shared_scene_selected_surface_ids = selected_surface_ids
+        next_snapshot = self._get_surface_selection_snapshot()
+        self._persist_surface_selection_snapshot(next_snapshot)
+        self._sync_selection_status()
+        self._sync_controls()
+        changed = bool(
+            next_snapshot != previous_snapshot
+            or previous_persisted_selection
+            != (
+                self._data.selected_surface_type,
+                self._data.selected_surface_ids,
+            )
+        )
+        if changed:
+            self._emit_data_changed()
+        return changed
+
+    def get_selected_surface_ids(self) -> tuple[str, ...]:
+        """Return the fixed-surface IDs driving the next Surface request."""
+
+        return self._get_surface_selection_snapshot().surface_ids
+
+    def get_selected_surface_type(self) -> str | None:
+        """Return the common selected type, or ``None`` for an invalid set."""
+
+        return self._get_surface_selection_snapshot().surface_type
+
+    def get_combined_selected_surface_area(self) -> float:
+        """Return the physical area of the current shared or local selection."""
+
+        return self._get_surface_selection_snapshot().combined_area_m2
 
     def get_surface_material_sources(
         self,
@@ -719,78 +823,9 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     def refresh_file_backed_previews(self) -> None:
         """Reload only Surface assets whose on-disk revisions changed."""
 
-        revision_cache: dict[str, tuple[object, ...]] = {}
         material_signature = self.get_preview_dependency_signature()
-        for signature_item in material_signature:
-            if len(signature_item) < 4:
-                continue
-            raw_map_revisions = signature_item[3]
-            if not isinstance(raw_map_revisions, tuple | list):
-                continue
-            for raw_map_revision in raw_map_revisions:
-                if (
-                    not isinstance(raw_map_revision, tuple | list)
-                    or len(raw_map_revision) < 3
-                    or not isinstance(raw_map_revision[1], str)
-                    or not isinstance(raw_map_revision[2], tuple)
-                ):
-                    continue
-                revision_cache[raw_map_revision[1]] = raw_map_revision[2]
         if material_signature != self._restored_assignment_texture_signature:
             self._restore_assignment_textures()
-
-        catalog_signature = self._build_texture_catalog_dependency_signature(
-            revision_cache
-        )
-        if catalog_signature != self._texture_catalog_dependency_signature:
-            self._refresh_texture_atlases()
-
-    def _build_texture_catalog_dependency_signature(
-        self,
-        revision_cache: dict[str, tuple[object, ...]] | None = None,
-    ) -> tuple[tuple[object, ...], ...]:
-        """Snapshot active and alternate PNGs shown by Surface controls."""
-
-        cached_revisions = {} if revision_cache is None else revision_cache
-        return tuple(
-            (
-                assignment.assignment_id,
-                assignment.surface_type,
-                assignment.display_name,
-                assignment.surface_ids,
-                float(assignment.combined_area_m2).hex(),
-                assignment.area_description,
-                assignment.selected_texture_resolution,
-                assignment.asset_path,
-                _get_cached_surface_asset_revision(
-                    cached_revisions,
-                    self._asset_directory,
-                    assignment.asset_path,
-                ),
-                tuple(
-                    (
-                        variant.resolution,
-                        variant.asset_path,
-                        tuple(
-                            (
-                                map_type,
-                                map_asset_path,
-                                _get_cached_surface_asset_revision(
-                                    cached_revisions,
-                                    self._asset_directory,
-                                    map_asset_path,
-                                ),
-                            )
-                            for map_type, map_asset_path in (
-                                variant.map_asset_paths.items()
-                            )
-                        ),
-                    )
-                    for variant in assignment.texture_variants
-                ),
-            )
-            for assignment in self._data.assignments
-        )
 
     def get_assignment_asset_path(
         self,
@@ -936,7 +971,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._data.assignments = restored
         self._invalidate_assignment_caches()
         self._restore_assignment_textures()
-        self._refresh_texture_atlases()
         self._sync_selection_status()
         self._sync_controls()
         if emit_signals:
@@ -997,7 +1031,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._data.assignments = restored
         self._invalidate_assignment_caches()
         self._restore_assignment_textures()
-        self._refresh_texture_atlases()
         self._sync_selection_status()
         self._sync_controls()
         if emit_signals:
@@ -1074,7 +1107,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         if not assignments_changed:
             return False
         self._restore_assignment_textures()
-        self._refresh_texture_atlases()
         self._sync_selection_status()
         self._sync_controls()
         if emit_signals:
@@ -1132,34 +1164,24 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             return False
 
         previous_assignments = list(self._data.assignments)
-        previous_atlas_entry_cache = dict(self._texture_atlas_entry_cache)
         previous_restored_signature = (
             self._restored_assignment_texture_signature
         )
-        previous_catalog_signature = self._texture_catalog_dependency_signature
-        previous_other_list_signature = self._other_texture_list_signature
         self._data.assignments = next_assignments
         self._invalidate_assignment_caches()
         try:
             self._restore_assignment_textures()
-            self._refresh_texture_atlases()
             self._sync_selection_status()
             self._sync_controls()
         except Exception as error:
             self._data.assignments = previous_assignments
             self._semantic_surface_cache_signature = previous_semantic_signature
             self._semantic_surfaces_by_id = previous_semantic_surfaces
-            self._texture_atlas_entry_cache = previous_atlas_entry_cache
             self._restored_assignment_texture_signature = (
                 previous_restored_signature
             )
-            self._texture_catalog_dependency_signature = (
-                previous_catalog_signature
-            )
-            self._other_texture_list_signature = previous_other_list_signature
             try:
                 self._restore_assignment_textures()
-                self._refresh_texture_atlases()
             except Exception:
                 pass
             self.status_label.setText(
@@ -1216,12 +1238,9 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         return True
 
     def _invalidate_assignment_caches(self) -> None:
-        """Retire every cache whose content depends on assignment targets."""
+        """Retire the preview cache whose content depends on assignments."""
 
         self._restored_assignment_texture_signature = None
-        self._texture_atlas_entry_cache.clear()
-        self._texture_catalog_dependency_signature = None
-        self._other_texture_list_signature = None
 
     def can_select_assignment_texture_resolution(
         self,
@@ -1247,16 +1266,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         except (OSError, ValueError):
             return False
         return texture.shape[:2] == (int(resolution), int(resolution))
-
-    def set_texture_resolution_change_handler(
-        self,
-        handler: Callable[[str, int], bool] | None,
-    ) -> None:
-        """Route UI resolution changes through an application-wide transaction."""
-
-        if handler is not None and not callable(handler):
-            raise TypeError("The texture resolution change handler must be callable.")
-        self._texture_resolution_change_handler = handler
 
     def select_assignment_texture_resolution(
         self,
@@ -1405,8 +1414,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             self._sync_controls()
             return False
 
-        self._texture_atlas_entry_cache.clear()
-        self._refresh_texture_atlases()
         self.status_label.setText(
             "Removed the selected texture from "
             f"{len(assignment.surface_ids)} surface(s)."
@@ -1419,8 +1426,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     def delete_assignment_texture(self, assignment_id: str) -> bool:
         """Delete one complete texture family from every assigned surface."""
 
-        if self.is_generating and not self._generation_threads:
-            return False
         assignment = self._assignment_by_id(assignment_id)
         if assignment is None:
             return False
@@ -1437,7 +1442,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._data.assignments = next_assignments
         try:
             self._restore_assignment_textures()
-        except (OSError, TypeError, ValueError):
+        except (OSError, RuntimeError, TypeError, ValueError):
             self._data.assignments = previous_assignments
             try:
                 self._restore_assignment_textures()
@@ -1450,8 +1455,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             return False
 
         removed_assignments = [assignment]
-        self._texture_atlas_entry_cache.clear()
-        self._refresh_texture_atlases()
         cleanup_failure_count = self._delete_orphaned_assignment_assets(
             removed_assignments
         )
@@ -1577,8 +1580,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             self._restore_assignment_textures()
             return False
 
-        self._texture_atlas_entry_cache.clear()
-        self._refresh_texture_atlases()
         texture_width, texture_height = texture_size
         self.status_label.setText(
             f"Applied the {texture_width} x {texture_height} texture "
@@ -1597,9 +1598,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             )
         self._close_video_source()
         self._displayed_frame_index = None
-        self._texture_atlas_entry_cache.clear()
-        self._texture_variant_entry_targets.clear()
-        self._other_texture_entry_targets.clear()
         self._data = SurfaceTextureData() if data is None else data.clone()
         migration_failure_count = self._migrate_legacy_meshy_pbr_alignment()
         metadata = self._data.video_metadata
@@ -1614,11 +1612,18 @@ class SurfaceTextureGenerationWorkspace(QWidget):
 
         self.video_view.clear_frame("Load a source video to paint references")
         saved_camera_pose = self._data.camera_pose
-        self.surface_view.set_levels(self._levels)
+        if self.surface_view is not None:
+            self.surface_view.set_levels(self._levels)
+        else:
+            self._shared_scene_selected_surface_ids = tuple(
+                self._data.selected_surface_ids
+            )
+            self._shared_scene_surfaces_by_id = dict(
+                self._all_existing_surfaces_by_id()
+            )
         self._data.camera_pose = saved_camera_pose
         self._restore_viewer_state()
         self._restore_assignment_textures()
-        self._refresh_texture_atlases()
         self._sync_video_controls()
         if self._video_source is not None:
             self.show_frame(self._data.current_frame_index)
@@ -1674,20 +1679,24 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         if self._levels:
             self._store_viewer_state()
         self._levels = normalized_levels
-        if replace_preview_model:
-            self.surface_view.set_scene_model(
-                preview_model,
-                repopulate=False,
+        if self.surface_view is not None:
+            if replace_preview_model:
+                self.surface_view.set_scene_model(
+                    preview_model,
+                    repopulate=False,
+                )
+                self.surface_view.clear_surface_textures()
+            self.surface_view.set_levels(self._levels)
+        else:
+            self._shared_scene_surfaces_by_id = dict(
+                self._all_existing_surfaces_by_id()
             )
-            self.surface_view.clear_surface_textures()
-        self.surface_view.set_levels(self._levels)
         assignments_changed = bool(
             replace_preview_model
             and self._reconcile_assignment_targets(self._levels)
         )
         self._restore_viewer_state()
         self._restore_assignment_textures()
-        self._refresh_texture_atlases()
         self._sync_selection_status()
         self._sync_controls()
         self._level_sync_signature = next_signature
@@ -1810,30 +1819,22 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     def set_preview_model(self, model: GeneratedModel | None) -> None:
         """Use the Canvas model while retaining semantic surface selection."""
 
-        self.surface_view.set_scene_model(model)
+        if self.surface_view is not None:
+            self.surface_view.set_scene_model(model)
 
     def set_runtime_settings(self, settings: GenerationServiceSettings) -> None:
         if not isinstance(settings, GenerationServiceSettings):
             raise TypeError("Generation settings have an invalid type.")
         self._settings = settings
-        self.surface_view.set_first_person_movement_mode(
-            settings.first_person_navigation_mode
-        )
+        if self.surface_view is not None:
+            self.surface_view.set_first_person_movement_mode(
+                settings.first_person_navigation_mode
+            )
         self._sync_provider_combo(settings.surface_texture_provider)
         self._sync_controls()
 
     def get_runtime_settings(self) -> GenerationServiceSettings:
         return self._settings
-
-    def set_external_3d_viewer_active(self, is_active: bool) -> None:
-        """Show the local atlas inspector while fixed surfaces are external."""
-
-        target_page = (
-            self.texture_view_page if bool(is_active) else self.surface_3d_page
-        )
-        if self.right_view_stack.currentWidget() is target_page:
-            return
-        self.right_view_stack.setCurrentWidget(target_page)
 
     def set_provider(
         self,
@@ -1877,12 +1878,10 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             self._data.strokes_for_frame(safe_index),
         )
         self._sync_seekbar_value(safe_index)
-        self._sync_frame_label()
         self._sync_controls()
 
     def generate(self) -> None:
         request = self._build_request(
-            display_name=self.job_name_edit.text(),
             defer_reference_preparation=True,
         )
         if request is None:
@@ -1890,8 +1889,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         reference_input = self._build_reference_input(request)
         if reference_input is None:
             return
-        if self._start_generation(request, reference_input=reference_input):
-            self.job_name_edit.clear()
+        self._start_generation(request, reference_input=reference_input)
 
     def shutdown(self) -> None:
         if self._is_shutting_down:
@@ -1945,132 +1943,46 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         root_layout.setContentsMargins(8, 8, 8, 8)
         root_layout.setSpacing(8)
 
-        self.views_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.views_splitter.setChildrenCollapsible(False)
-
-        self.video_view = VideoInpaintView()
-        self.video_view.strokes_changed.connect(
-            self._handle_video_strokes_changed
-        )
-        self.views_splitter.addWidget(
-            _build_labeled_view("Video material references", self.video_view)
-        )
-
-        self.surface_view = SurfaceTextureViewer()
-        self.surface_view.selection_changed.connect(
-            self._handle_surface_selection_changed
-        )
-        self.surface_view.camera_pose_changed.connect(
-            self._handle_camera_pose_changed
-        )
-        self.surface_3d_page = _build_labeled_view(
-            "Fixed surfaces",
-            self.surface_view,
-        )
-        self.texture_view = TextureAtlasView(
-            empty_preview_text="No texture resolutions available",
-            unselected_preview_text="Select a texture resolution",
-        )
-        self.texture_view.setObjectName("surface_texture_atlas_view")
-        self.texture_view.atlas_selected.connect(
-            self._handle_texture_variant_selected
-        )
-        self.texture_view.atlas_activated.connect(
-            self._handle_texture_variant_activated
-        )
-        self.texture_view.atlas_list.installEventFilter(self)
-        self.texture_view.atlas_list.itemPressed.connect(
-            self._handle_current_texture_item_pressed
-        )
-        self.other_texture_list = QListWidget()
-        self.other_texture_list.setObjectName(
-            "other_surface_texture_list"
-        )
-        self.other_texture_list.setViewMode(QListView.ViewMode.IconMode)
-        self.other_texture_list.setResizeMode(QListView.ResizeMode.Adjust)
-        self.other_texture_list.setMovement(QListView.Movement.Static)
-        self.other_texture_list.setWrapping(True)
-        self.other_texture_list.setWordWrap(True)
-        self.other_texture_list.setSelectionMode(
-            QAbstractItemView.SelectionMode.SingleSelection
-        )
-        self.other_texture_list.setIconSize(OTHER_TEXTURE_THUMBNAIL_SIZE)
-        self.other_texture_list.setGridSize(OTHER_TEXTURE_GRID_SIZE)
-        self.other_texture_list.setToolTip(
-            "Double-click a compatible texture to apply it to the selected "
-            "surfaces."
-        )
-        self.other_texture_list.itemDoubleClicked.connect(
-            self._handle_other_texture_activated
-        )
-        self.other_texture_list.currentItemChanged.connect(
-            self._handle_other_texture_selection_changed
-        )
-        self.other_texture_list.installEventFilter(self)
-        self.texture_views_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.texture_views_splitter.setObjectName(
-            "surface_texture_selection_splitter"
-        )
-        self.texture_views_splitter.setChildrenCollapsible(False)
-        self.texture_views_splitter.addWidget(
-            _build_labeled_view(
-                "Current texture resolutions",
-                self.texture_view,
+        if self._shared_controls is None:
+            self._build_standalone_shared_controls()
+            self.views_splitter = QSplitter(Qt.Orientation.Horizontal)
+            self.views_splitter.setChildrenCollapsible(False)
+            self.views_splitter.addWidget(
+                _build_labeled_view(
+                    "Video material references",
+                    self.video_view,
+                )
             )
-        )
-        self.texture_views_splitter.addWidget(
-            _build_labeled_view(
-                "Other surface textures",
-                self.other_texture_list,
+            self.surface_view = SurfaceTextureViewer()
+            self.surface_view.selection_changed.connect(
+                self._handle_surface_selection_changed
             )
-        )
-        self.texture_views_splitter.setStretchFactor(0, 1)
-        self.texture_views_splitter.setStretchFactor(1, 1)
-        self.texture_views_splitter.setSizes([1_000, 1_000])
-        self.texture_view_page = _build_labeled_view(
-            "Texture view",
-            self.texture_views_splitter,
-        )
-        self.right_view_stack = QStackedWidget()
-        self.right_view_stack.setObjectName("surface_texture_right_view_stack")
-        self.right_view_stack.addWidget(self.surface_3d_page)
-        self.right_view_stack.addWidget(self.texture_view_page)
-        self.right_view_stack.setCurrentWidget(self.surface_3d_page)
-        self.views_splitter.addWidget(self.right_view_stack)
-        self.views_splitter.setStretchFactor(0, 1)
-        self.views_splitter.setStretchFactor(1, 1)
-        self.views_splitter.setSizes([1_000, 1_000])
-        root_layout.addWidget(self.views_splitter, 1)
+            self.surface_view.camera_pose_changed.connect(
+                self._handle_camera_pose_changed
+            )
+            self.surface_3d_page = _build_labeled_view(
+                "Fixed surfaces",
+                self.surface_view,
+            )
+            self.views_splitter.addWidget(self.surface_3d_page)
+            self.views_splitter.setStretchFactor(0, 1)
+            self.views_splitter.setStretchFactor(1, 1)
+            self.views_splitter.setSizes([1_000, 1_000])
+            root_layout.addWidget(self.views_splitter, 1)
+        else:
+            self._install_shared_controls(self._shared_controls)
 
-        self.seekbar = QSlider(Qt.Orientation.Horizontal)
-        self.seekbar.setRange(0, 0)
-        self.seekbar.valueChanged.connect(self._handle_seekbar_changed)
-        root_layout.addWidget(self.seekbar)
+        if self._shared_controls is None:
+            root_layout.addWidget(self.seekbar)
 
         first_row = QHBoxLayout()
-        self.load_video_button = QPushButton("Load video")
-        self.load_video_button.clicked.connect(self._handle_load_video_clicked)
-        first_row.addWidget(self.load_video_button)
-        self.frame_label = QLabel("Frame 0 / 0")
-        first_row.addWidget(self.frame_label)
+        if self._shared_controls is None:
+            first_row.addWidget(self.load_video_button)
         self.painted_frames_label = QLabel("0 painted frames")
         first_row.addWidget(self.painted_frames_label)
         self.selection_label = QLabel("No surface selected")
         self.selection_label.setObjectName("surface_selection_label")
         first_row.addWidget(self.selection_label, 1)
-        self.delete_texture_button = QPushButton("Delete texture")
-        self.delete_texture_button.setObjectName(
-            "delete_surface_texture_button"
-        )
-        self.delete_texture_button.setToolTip(
-            "Delete the selected texture family and all of its resolution "
-            "files. Select an item in Other surface textures to delete that "
-            "family instead of the current surface texture."
-        )
-        self.delete_texture_button.clicked.connect(
-            self._handle_delete_texture_clicked
-        )
-        first_row.addWidget(self.delete_texture_button)
         first_row.addWidget(QLabel("Surface texture provider"))
         self.surface_texture_provider_combo = QComboBox()
         self.surface_texture_provider_combo.setObjectName(
@@ -2086,6 +1998,42 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         root_layout.addLayout(first_row)
 
         second_row = QHBoxLayout()
+        if self._shared_controls is None:
+            second_row.addWidget(self.mask_mode_control)
+            second_row.addWidget(QLabel("Brush"))
+            second_row.addWidget(self.brush_size_spinbox)
+            second_row.addWidget(self.clear_mask_button)
+            second_row.addWidget(self.ai_prompt_edit, 1)
+            second_row.addWidget(self.pbr_map_control)
+        self.generate_button = QPushButton("Generate texture")
+        self.generate_button.setMinimumHeight(38)
+        self.generate_button.clicked.connect(self.generate)
+        second_row.addWidget(self.generate_button)
+        root_layout.addLayout(second_row)
+
+        initial_status = (
+            "Left-click the 3D view to enter first-person mode. Move with Z/Q/S/D, "
+            "look with the mouse, select at the crosshair, and right-click to exit."
+            if self.surface_view is not None
+            else "Select one or more matching surfaces in the shared 3D scene."
+        )
+        self.status_label = QLabel(initial_status)
+        self.status_label.setWordWrap(True)
+        root_layout.addWidget(self.status_label)
+
+    def _build_standalone_shared_controls(self) -> None:
+        """Create shared widgets when this workspace is used on its own."""
+
+        self.video_view = VideoInpaintView()
+        self.video_view.strokes_changed.connect(
+            self._handle_video_strokes_changed
+        )
+        self.seekbar = QSlider(Qt.Orientation.Horizontal)
+        self.seekbar.setRange(0, 0)
+        self.seekbar.valueChanged.connect(self._handle_seekbar_changed)
+        self.load_video_button = QPushButton("Load video")
+        self.load_video_button.clicked.connect(self._handle_load_video_clicked)
+
         self.paint_mask_button = QRadioButton("Paint")
         self.erase_mask_button = QRadioButton("Erase")
         self.paint_mask_button.setChecked(True)
@@ -2102,8 +2050,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         mask_mode_layout.setSpacing(0)
         mask_mode_layout.addWidget(self.paint_mask_button)
         mask_mode_layout.addWidget(self.erase_mask_button)
-        second_row.addWidget(self.mask_mode_control)
-        second_row.addWidget(QLabel("Brush"))
         self.brush_size_spinbox = QSpinBox()
         self.brush_size_spinbox.setRange(
             MIN_BRUSH_RADIUS_PIXELS,
@@ -2114,21 +2060,12 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self.brush_size_spinbox.valueChanged.connect(
             self.video_view.set_brush_radius_pixels
         )
-        second_row.addWidget(self.brush_size_spinbox)
         self.clear_mask_button = QPushButton("Clear frame mask")
         self.clear_mask_button.clicked.connect(self.video_view.clear_mask)
-        second_row.addWidget(self.clear_mask_button)
-        self.material_notes_edit = QLineEdit()
-        self.material_notes_edit.setPlaceholderText(
-            "Optional material notes, e.g. pale oak or matte plaster"
+        self.ai_prompt_edit = QLineEdit()
+        self.ai_prompt_edit.setPlaceholderText(
+            "AI prompt (optional), e.g. pale oak or matte plaster"
         )
-        second_row.addWidget(self.material_notes_edit, 1)
-        second_row.addWidget(QLabel("Job name"))
-        self.job_name_edit = QLineEdit()
-        self.job_name_edit.setObjectName("surface_texture_job_name_edit")
-        self.job_name_edit.setPlaceholderText("Optional")
-        self.job_name_edit.setMaxLength(256)
-        second_row.addWidget(self.job_name_edit)
         self.pbr_map_control = QWidget()
         self.pbr_map_control.setObjectName(
             "surface_texture_pbr_map_control"
@@ -2151,35 +2088,26 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             checkbox.toggled.connect(self._handle_pbr_map_toggled)
             self.pbr_map_checkboxes[map_type] = checkbox
             pbr_map_layout.addWidget(checkbox, index % 3, index // 3)
-        second_row.addWidget(self.pbr_map_control)
-        self.generate_button = QPushButton("Generate texture")
-        self.generate_button.setMinimumHeight(38)
-        self.generate_button.clicked.connect(self.generate)
-        second_row.addWidget(self.generate_button)
-        root_layout.addLayout(second_row)
 
-        self.status_label = QLabel(
-            "Left-click the 3D view to enter first-person mode. Move with Z/Q/S/D, "
-            "look with the mouse, select at the crosshair, and right-click to exit."
-        )
-        self.status_label.setWordWrap(True)
-        root_layout.addWidget(self.status_label)
+    def _install_shared_controls(
+        self,
+        controls: GenerationSharedControls,
+    ) -> None:
+        """Use the Object workspace's widgets without constructing duplicates."""
 
-    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        """Route Delete from either texture selector to the same safe action."""
-
-        texture_view = getattr(self, "texture_view", None)
-        current_list = getattr(texture_view, "atlas_list", None)
-        other_list = getattr(self, "other_texture_list", None)
-        if (
-            (watched is current_list or watched is other_list)
-            and isinstance(event, QKeyEvent)
-            and event.type() == QEvent.Type.KeyPress
-            and event.key() == Qt.Key.Key_Delete
-        ):
-            self._handle_delete_texture_clicked()
-            return True
-        return super().eventFilter(watched, event)
+        self.video_view = controls.video_view
+        self.seekbar = controls.seekbar
+        self.load_video_button = controls.load_video_button
+        self.paint_mask_button = controls.paint_mask_button
+        self.erase_mask_button = controls.erase_mask_button
+        self._mask_mode_group = controls.mask_mode_button_group
+        self.mask_mode_control = controls.mask_mode_control
+        self.brush_size_spinbox = controls.brush_size_spinbox
+        self.clear_mask_button = controls.clear_mask_button
+        self.pbr_map_control = controls.pbr_map_control
+        self.pbr_map_checkboxes = controls.pbr_map_checkboxes
+        self.ai_prompt_edit = controls.ai_prompt_edit
+        self.cancel_operation_button = controls.cancel_button
 
     def _start_generation(
         self,
@@ -2198,7 +2126,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             self._sync_controls()
             return False
         job = self._job_manager.create_job(
-            kind="Surface texture",
+            kind=SURFACE_TEXTURE_JOB_KIND,
             requested_name=request.display_name,
             default_name=_default_surface_texture_name(request.surface_type),
             stage="Sending texture request",
@@ -2250,9 +2178,15 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         defer_reference_preparation: bool = False,
     ) -> SurfaceTextureRequest | None:
         self._store_displayed_frame_strokes()
-        selected_ids = tuple(self.surface_view.get_selected_surface_ids())
-        surface_type = self.surface_view.get_selected_surface_type()
-        if not selected_ids or not surface_type:
+        selection = self._get_surface_selection_snapshot()
+        selected_ids = selection.surface_ids
+        surface_type = selection.surface_type
+        if selection.has_mixed_types:
+            self.status_label.setText(
+                "Select surfaces of only one type before generating a texture."
+            )
+            return None
+        if not selection.is_valid or surface_type is None:
             self.status_label.setText("Select at least one fixed surface first.")
             return None
         frame_indices = tuple(sorted(self._data.frame_strokes))
@@ -2284,11 +2218,11 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                     "The painted reference masks are empty."
                 )
                 return None
-        area_m2 = self.surface_view.get_combined_selected_area()
+        area_m2 = selection.combined_area_m2
         prompt = _build_material_prompt(
             surface_type,
             area_m2,
-            self.material_notes_edit.text(),
+            self.ai_prompt_edit.text(),
         )
         return SurfaceTextureRequest(
             provider=self._settings.surface_texture_provider,
@@ -2358,19 +2292,12 @@ class SurfaceTextureGenerationWorkspace(QWidget):
 
     @Slot(object)
     def _handle_surface_selection_changed(self, raw_ids: object) -> None:
-        if not isinstance(raw_ids, tuple | list):
+        if self.surface_view is None or not isinstance(raw_ids, tuple | list):
             return
-        if hasattr(self, "other_texture_list"):
-            signals_were_blocked = self.other_texture_list.blockSignals(True)
-            try:
-                self.other_texture_list.setCurrentRow(-1)
-                self.other_texture_list.clearSelection()
-            finally:
-                self.other_texture_list.blockSignals(signals_were_blocked)
-        self._data.selected_surface_ids = tuple(str(value) for value in raw_ids)
-        self._data.selected_surface_type = self.surface_view.get_selected_surface_type()
+        self._persist_surface_selection_snapshot(
+            self._get_surface_selection_snapshot()
+        )
         self._sync_selection_status()
-        self._refresh_texture_atlases()
         self._emit_data_changed()
         self._sync_controls()
 
@@ -2547,8 +2474,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         # file-backed cache unvalidated so activation confirms the exact bytes
         # that were persisted, including a concurrent same-path replacement.
         self._restored_assignment_texture_signature = None
-        self._texture_atlas_entry_cache.clear()
-        self._refresh_texture_atlases()
         status = (
             f"Applied {request.display_name!r} to {len(request.surface_ids)} "
             f"{request.surface_type} surface(s)."
@@ -2905,9 +2830,10 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     def _handle_pbr_map_toggled(self, _enabled: bool) -> None:
         """Apply Surface PBR changes without rebuilding the preview model."""
 
-        self.surface_view.set_pbr_maps_enabled(
-            self._get_enabled_pbr_maps()
-        )
+        if self.surface_view is not None:
+            self.surface_view.set_pbr_maps_enabled(
+                self._get_enabled_pbr_maps()
+            )
         self._sync_controls()
 
     def _handle_surface_texture_provider_changed(self, _index: int) -> None:
@@ -2947,18 +2873,84 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             self.video_view.get_strokes(),
         )
 
-    def _store_viewer_state(self) -> None:
-        if not hasattr(self, "surface_view"):
-            return
-        self._data.camera_pose = self.surface_view.get_camera_pose()
-        self._data.selected_surface_ids = tuple(
-            self.surface_view.get_selected_surface_ids()
+    # ### Selection state helpers ###
+    def _get_surface_selection_snapshot(self) -> _SurfaceSelectionSnapshot:
+        """Resolve one selection from the local or application-owned scene."""
+
+        if self.surface_view is not None:
+            surface_ids = tuple(self.surface_view.get_selected_surface_ids())
+            surface_type = self.surface_view.get_selected_surface_type()
+            return _SurfaceSelectionSnapshot(
+                surface_ids=surface_ids,
+                surface_type=surface_type,
+                combined_area_m2=(
+                    self.surface_view.get_combined_selected_area()
+                    if surface_ids and surface_type is not None
+                    else 0.0
+                ),
+            )
+
+        surfaces_by_id = self._shared_scene_surfaces_by_id
+        surface_ids = tuple(
+            surface_id
+            for surface_id in self._shared_scene_selected_surface_ids
+            if surface_id in surfaces_by_id
         )
-        self._data.selected_surface_type = (
-            self.surface_view.get_selected_surface_type()
+        selected_surfaces = tuple(
+            surfaces_by_id[surface_id] for surface_id in surface_ids
+        )
+        selected_types = {
+            surface.surface_type for surface in selected_surfaces
+        }
+        has_mixed_types = len(selected_types) > 1
+        surface_type = (
+            next(iter(selected_types))
+            if len(selected_types) == 1
+            else None
+        )
+        return _SurfaceSelectionSnapshot(
+            surface_ids=surface_ids,
+            surface_type=surface_type,
+            combined_area_m2=float(
+                sum(
+                    surface.area_square_meters
+                    for surface in selected_surfaces
+                )
+            ),
+            has_mixed_types=has_mixed_types,
         )
 
+    def _persist_surface_selection_snapshot(
+        self,
+        selection: _SurfaceSelectionSnapshot,
+    ) -> None:
+        """Store only schema-valid homogeneous selections in project data."""
+
+        if selection.is_valid and selection.surface_type is not None:
+            self._data.set_selection(
+                selection.surface_type,
+                selection.surface_ids,
+            )
+            return
+        self._data.set_selection(None, ())
+
+    def _store_viewer_state(self) -> None:
+        self._persist_surface_selection_snapshot(
+            self._get_surface_selection_snapshot()
+        )
+        if self.surface_view is None:
+            return
+        self._data.camera_pose = self.surface_view.get_camera_pose()
+
     def _restore_viewer_state(self) -> None:
+        if self.surface_view is None:
+            self._shared_scene_selected_surface_ids = tuple(
+                self._data.selected_surface_ids
+            )
+            self._persist_surface_selection_snapshot(
+                self._get_surface_selection_snapshot()
+            )
+            return
         if self._data.camera_pose is not None:
             self.surface_view.set_camera_pose(
                 self._data.camera_pose,
@@ -2977,6 +2969,9 @@ class SurfaceTextureGenerationWorkspace(QWidget):
 
     def _restore_assignment_textures(self) -> None:
         signature_before = self.get_preview_dependency_signature()
+        if self.surface_view is None:
+            self._restored_assignment_texture_signature = signature_before
+            return
         restore_succeeded = True
         self.surface_view.clear_surface_textures()
         for assignment in self._data.assignments:
@@ -3015,6 +3010,8 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     ) -> None:
         """Preserve the legacy two-argument viewer call for base-only assets."""
 
+        if self.surface_view is None:
+            return
         if map_textures:
             self.surface_view.set_surface_texture(
                 surface_ids,
@@ -3026,469 +3023,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             surface_ids,
             texture,  # type: ignore[arg-type]
         )
-
-    def _refresh_texture_atlases(self) -> None:
-        signature_before = self._build_texture_catalog_dependency_signature()
-        assignment_id = self._latest_selected_surface_assignment_id()
-        assignment = next(
-            (
-                candidate
-                for candidate in self._data.assignments
-                if candidate.assignment_id == assignment_id
-            ),
-            None,
-        )
-        entries: list[TextureAtlasEntry] = []
-        other_entries: list[TextureAtlasEntry] = []
-        next_cache: dict[
-            str,
-            tuple[tuple[object, ...], TextureAtlasEntry],
-        ] = {}
-        next_targets: dict[str, tuple[str, int]] = {}
-        next_other_targets: dict[str, tuple[str, int | None]] = {}
-        next_other_tooltips: dict[str, str] = {}
-        catalog_succeeded = True
-        for variant in (() if assignment is None else assignment.texture_variants):
-            entry_id = (
-                f"{assignment.assignment_id}:resolution:{variant.resolution}"
-            )
-            display_name = (
-                f"{assignment.display_name} - "
-                f"{variant.resolution} x {variant.resolution}"
-                if assignment.display_name
-                else f"{variant.resolution} x {variant.resolution}"
-            )
-            try:
-                texture_path = self._resolve_asset_path(variant.asset_path)
-            except (OSError, TypeError, ValueError):
-                continue
-            if not texture_path.is_file():
-                continue
-            asset_revision = _build_surface_asset_revision(
-                self._asset_directory,
-                variant.asset_path,
-            )
-            try:
-                cached_entry = self._texture_atlas_entry_cache.get(entry_id)
-                if (
-                    cached_entry is not None
-                    and cached_entry[0] == asset_revision
-                    and cached_entry[1].display_name == display_name
-                ):
-                    entry = cached_entry[1]
-                else:
-                    entry = TextureAtlasEntry(
-                        atlas_id=entry_id,
-                        display_name=display_name,
-                        image=texture_path,
-                        owner_id=assignment.assignment_id,
-                    )
-            except (OSError, TypeError, ValueError):
-                catalog_succeeded = False
-                continue
-            entries.append(entry)
-            next_cache[entry_id] = (asset_revision, entry)
-            next_targets[entry_id] = (
-                assignment.assignment_id,
-                variant.resolution,
-            )
-
-        selected_surface_type = self.surface_view.get_selected_surface_type()
-        for candidate in self._data.assignments:
-            resolution = candidate.selected_texture_resolution
-            if (
-                selected_surface_type is None
-                or candidate.assignment_id == assignment_id
-                or candidate.surface_type != selected_surface_type
-            ):
-                continue
-            if candidate.texture_variants:
-                active_variant = (
-                    None
-                    if resolution is None
-                    else candidate.texture_variant_for_resolution(resolution)
-                )
-                if active_variant is None:
-                    continue
-                display_name = (
-                    f"{_surface_texture_display_name(candidate)} - "
-                    f"{resolution} x {resolution}"
-                )
-            else:
-                if resolution is not None:
-                    continue
-                display_name = (
-                    f"{_surface_texture_display_name(candidate)} - fixed image"
-                )
-            entry_id = f"{candidate.assignment_id}:other-texture"
-            try:
-                texture_path = self._resolve_asset_path(candidate.asset_path)
-            except (OSError, TypeError, ValueError):
-                continue
-            if not texture_path.is_file():
-                continue
-            asset_revision = _build_surface_asset_revision(
-                self._asset_directory,
-                candidate.asset_path,
-            )
-            try:
-                cached_entry = self._texture_atlas_entry_cache.get(entry_id)
-                if (
-                    cached_entry is not None
-                    and cached_entry[0] == asset_revision
-                    and cached_entry[1].display_name == display_name
-                ):
-                    entry = cached_entry[1]
-                else:
-                    entry = TextureAtlasEntry(
-                        atlas_id=entry_id,
-                        display_name=display_name,
-                        image=texture_path,
-                        owner_id=candidate.assignment_id,
-                    )
-                image = entry.get_image()
-                image_width = image.size().width()
-                image_height = image.size().height()
-                if (
-                    resolution is not None
-                    and (
-                        image_width != resolution
-                        or image_height != resolution
-                    )
-                ):
-                    continue
-            except (OSError, TypeError, ValueError):
-                catalog_succeeded = False
-                continue
-            other_entries.append(entry)
-            next_cache[entry_id] = (asset_revision, entry)
-            next_other_targets[entry_id] = (
-                candidate.assignment_id,
-                resolution,
-            )
-            surface_count = len(candidate.surface_ids)
-            surface_suffix = "surface" if surface_count == 1 else "surfaces"
-            resolution_description = (
-                f"Resolution: {resolution} x {resolution}"
-                if resolution is not None
-                else (
-                    f"Fixed image: {image_width} x {image_height} "
-                    "(no resolution variants)"
-                )
-            )
-            next_other_tooltips[entry_id] = (
-                f"{display_name}\n"
-                f"{resolution_description}\n"
-                f"Provider: {_get_provider_display_name(candidate.provider)}\n"
-                f"Currently assigned to: {surface_count} {surface_suffix}\n"
-                f"Texture ID: {candidate.assignment_id}\n"
-                f"Double-click to apply it to the selected "
-                f"{candidate.surface_type} surfaces."
-            )
-        self._texture_atlas_entry_cache = next_cache
-        self._texture_variant_entry_targets = next_targets
-        self._other_texture_entry_targets = next_other_targets
-
-        selected_atlas_id: str | None = None
-        if assignment is not None and entries:
-            preferred_resolution = (
-                assignment.selected_texture_resolution
-                or DEFAULT_SURFACE_TEXTURE_RESOLUTION
-            )
-            selected_atlas_id = min(
-                entries,
-                key=lambda entry: (
-                    abs(
-                        next_targets[entry.atlas_id][1]
-                        - preferred_resolution
-                    ),
-                    next_targets[entry.atlas_id][1],
-                ),
-            ).atlas_id
-        self._is_refreshing_texture_atlases = True
-        try:
-            if tuple(entries) != self.texture_view.entries:
-                self.texture_view.set_atlases(
-                    entries,
-                    selected_atlas_id=selected_atlas_id,
-                )
-            elif selected_atlas_id is not None:
-                self.texture_view.select_atlas(selected_atlas_id)
-            elif not entries:
-                self.texture_view.select_atlas(None)
-            self._rebuild_other_texture_list(
-                other_entries,
-                next_other_tooltips,
-            )
-        finally:
-            self._is_refreshing_texture_atlases = False
-        signature_after = self._build_texture_catalog_dependency_signature()
-        self._texture_catalog_dependency_signature = (
-            signature_after
-            if catalog_succeeded and signature_before == signature_after
-            else None
-        )
-
-    def _rebuild_other_texture_list(
-        self,
-        entries: Sequence[TextureAtlasEntry],
-        tooltips_by_entry_id: dict[str, str],
-    ) -> None:
-        """Replace the compact reusable-texture thumbnail library."""
-
-        content_signature = tuple(
-            (
-                id(entry),
-                entry.atlas_id,
-                entry.display_name,
-                tooltips_by_entry_id.get(entry.atlas_id, entry.display_name),
-            )
-            for entry in entries
-        )
-        if content_signature == self._other_texture_list_signature:
-            return
-
-        current_item = self.other_texture_list.currentItem()
-        current_entry_id = (
-            None
-            if current_item is None
-            else str(current_item.data(Qt.ItemDataRole.UserRole) or "")
-        )
-        signals_were_blocked = self.other_texture_list.blockSignals(True)
-        try:
-            self.other_texture_list.clear()
-            replacement_item: QListWidgetItem | None = None
-            for entry in entries:
-                item = QListWidgetItem(
-                    QIcon(
-                        QPixmap.fromImage(entry.get_image()).scaled(
-                            OTHER_TEXTURE_THUMBNAIL_SIZE,
-                            Qt.AspectRatioMode.KeepAspectRatio,
-                            Qt.TransformationMode.SmoothTransformation,
-                        )
-                    ),
-                    entry.display_name,
-                )
-                item.setData(Qt.ItemDataRole.UserRole, entry.atlas_id)
-                item.setToolTip(
-                    tooltips_by_entry_id.get(
-                        entry.atlas_id,
-                        entry.display_name,
-                    )
-                )
-                self.other_texture_list.addItem(item)
-                if entry.atlas_id == current_entry_id:
-                    replacement_item = item
-            if replacement_item is not None:
-                self.other_texture_list.setCurrentItem(replacement_item)
-        finally:
-            self.other_texture_list.blockSignals(signals_were_blocked)
-        self._other_texture_list_signature = content_signature
-
-    @Slot(object)
-    def _handle_texture_variant_selected(self, raw_entry: object) -> None:
-        """Make a single-clicked variant the assignment's global resolution."""
-
-        if self._is_refreshing_texture_atlases:
-            return
-        if not isinstance(raw_entry, TextureAtlasEntry):
-            return
-        target = self._texture_variant_entry_targets.get(raw_entry.atlas_id)
-        if target is None:
-            return
-        assignment_id, resolution = target
-        assignment = self._assignment_by_id(assignment_id)
-        if (
-            assignment is not None
-            and assignment.selected_texture_resolution == resolution
-        ):
-            return
-        if self._request_global_texture_resolution_change(
-            assignment_id,
-            resolution,
-        ):
-            return
-        self.status_label.setText(
-            "The selected surface texture resolution could not be applied "
-            "globally; the previous resolution was kept."
-        )
-        self._refresh_texture_atlases()
-
-    @Slot(object)
-    def _handle_current_texture_item_pressed(self, _raw_item: object) -> None:
-        """Make the current-family pane the unambiguous deletion target."""
-
-        signals_were_blocked = self.other_texture_list.blockSignals(True)
-        try:
-            self.other_texture_list.setCurrentRow(-1)
-            self.other_texture_list.clearSelection()
-        finally:
-            self.other_texture_list.blockSignals(signals_were_blocked)
-        self._sync_controls()
-
-    @Slot(object, object)
-    def _handle_other_texture_selection_changed(
-        self,
-        _current: object,
-        _previous: object,
-    ) -> None:
-        """Keep deletion availability synchronized with library selection."""
-
-        self._sync_controls()
-
-    @Slot(object)
-    def _handle_texture_variant_activated(self, raw_entry: object) -> None:
-        """Apply a double-clicked texture family variant to the selection."""
-
-        if not isinstance(raw_entry, TextureAtlasEntry):
-            return
-        target = self._texture_variant_entry_targets.get(raw_entry.atlas_id)
-        selected_surface_ids = self.surface_view.get_selected_surface_ids()
-        if target is None or not selected_surface_ids:
-            return
-        assignment_id, resolution = target
-        assignment = self._assignment_by_id(assignment_id)
-        if (
-            assignment is None
-            or (
-                assignment.selected_texture_resolution != resolution
-                and not self._request_global_texture_resolution_change(
-                    assignment_id,
-                    resolution,
-                )
-            )
-        ):
-            self.status_label.setText(
-                "The selected surface texture resolution could not be applied "
-                "globally; the previous resolution was kept."
-            )
-            self._refresh_texture_atlases()
-            return
-        if not self.select_assignment_texture_resolution(
-            assignment_id,
-            resolution,
-            selected_surface_ids,
-        ):
-            self.status_label.setText(
-                "The selected surface texture resolution could not be applied."
-            )
-
-    @Slot(object)
-    def _handle_other_texture_activated(self, raw_item: object) -> None:
-        """Apply another compatible texture family to selected surfaces."""
-
-        if (
-            self.is_generating and not self._generation_threads
-        ) or not isinstance(raw_item, QListWidgetItem):
-            return
-        entry_id = str(raw_item.data(Qt.ItemDataRole.UserRole) or "")
-        target = self._other_texture_entry_targets.get(entry_id)
-        selected_surface_ids = self.surface_view.get_selected_surface_ids()
-        selected_surface_type = self.surface_view.get_selected_surface_type()
-        if (
-            target is None
-            or not selected_surface_ids
-            or selected_surface_type is None
-        ):
-            return
-        assignment_id, _ = target
-        assignment = self._assignment_by_id(assignment_id)
-        if assignment is None or assignment.surface_type != selected_surface_type:
-            return
-        if self._surface_targets_are_reserved(
-            selected_surface_ids
-        ) or self._assignment_is_reserved(assignment):
-            self.status_label.setText(
-                "A running job is using one of these surface textures."
-            )
-            return
-        if self.apply_assignment_texture(
-            assignment_id,
-            selected_surface_ids,
-        ):
-            return
-        self.status_label.setText(
-            "The selected surface texture could not be applied."
-        )
-        self._refresh_texture_atlases()
-
-    def _selected_texture_assignment_id_for_deletion(self) -> str | None:
-        """Resolve an explicit library choice, then the current surface family."""
-
-        other_item = self.other_texture_list.currentItem()
-        if other_item is not None and other_item.isSelected():
-            entry_id = str(
-                other_item.data(Qt.ItemDataRole.UserRole) or ""
-            )
-            target = self._other_texture_entry_targets.get(entry_id)
-            if (
-                target is not None
-                and self._assignment_by_id(target[0]) is not None
-            ):
-                return target[0]
-        assignment_id = self._latest_selected_surface_assignment_id()
-        return (
-            assignment_id
-            if assignment_id is not None
-            and self._assignment_by_id(assignment_id) is not None
-            else None
-        )
-
-    def _handle_delete_texture_clicked(self) -> None:
-        """Confirm and delete the texture family selected in either pane."""
-
-        assignment_id = self._selected_texture_assignment_id_for_deletion()
-        assignment = (
-            None
-            if assignment_id is None
-            else self._assignment_by_id(assignment_id)
-        )
-        if assignment is None:
-            self.status_label.setText("Select a surface texture to delete.")
-            self._sync_controls()
-            return
-        if self._assignment_is_reserved(assignment):
-            self.status_label.setText(
-                "Wait for the job using this texture before deleting it."
-            )
-            return
-        answer = QMessageBox.question(
-            self,
-            "Delete surface texture",
-            (
-                f"Delete this {assignment.surface_type} texture from all "
-                f"{len(assignment.surface_ids)} assigned surface(s)?\n\n"
-                f"Texture ID: {assignment.assignment_id}\n\n"
-                "Every generated resolution in this texture family will be "
-                "deleted."
-            ),
-            (
-                QMessageBox.StandardButton.Yes
-                | QMessageBox.StandardButton.Cancel
-            ),
-            QMessageBox.StandardButton.Cancel,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        self.delete_assignment_texture(assignment.assignment_id)
-
-    def _request_global_texture_resolution_change(
-        self,
-        assignment_id: str,
-        resolution: int,
-    ) -> bool:
-        """Commit through the host transaction, or locally when standalone."""
-
-        handler = self._texture_resolution_change_handler
-        if handler is None:
-            return self.select_assignment_texture_resolution(
-                assignment_id,
-                resolution,
-            )
-        try:
-            return bool(handler(assignment_id, resolution))
-        except Exception:
-            return False
 
     def _assignment_by_id(
         self,
@@ -3506,25 +3040,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             None,
         )
 
-    def _latest_selected_surface_assignment_id(
-        self,
-        valid_assignment_ids: set[str] | None = None,
-    ) -> str | None:
-        selected_ids = self.surface_view.get_selected_surface_ids()
-        if not selected_ids:
-            return None
-        selected_surface_ids = set(selected_ids)
-        for assignment in reversed(self._data.assignments):
-            if (
-                selected_surface_ids.intersection(assignment.surface_ids)
-                and (
-                    valid_assignment_ids is None
-                    or assignment.assignment_id in valid_assignment_ids
-                )
-            ):
-                return assignment.assignment_id
-        return None
-
     def _persist_texture_variants(
         self,
         surface_ids: tuple[str, ...],
@@ -3538,17 +3053,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             surface_ids,
             assignment_id,
             texture_variants,
-        )
-
-    def _persist_texture_file(
-        self,
-        file_name: str,
-        texture_png: bytes,
-    ) -> str:
-        return _persist_surface_texture_file(
-            self._asset_directory,
-            file_name,
-            texture_png,
         )
 
     def _resolve_asset_path(self, raw_path: str) -> Path:
@@ -3571,14 +3075,12 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     def _sync_video_controls(self) -> None:
         if self._video_source is None:
             self.seekbar.setRange(0, 0)
-            self.frame_label.setText("Frame 0 / 0")
         else:
             self.seekbar.setRange(
                 0,
                 self._video_source.metadata.frame_count - 1,
             )
             self._sync_seekbar_value(self._data.current_frame_index)
-            self._sync_frame_label()
         self._sync_painted_frames_label()
 
     def _sync_seekbar_value(self, frame_index: int) -> None:
@@ -3586,29 +3088,24 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self.seekbar.setValue(int(frame_index))
         self._is_syncing_seekbar = False
 
-    def _sync_frame_label(self) -> None:
-        total = (
-            0
-            if self._video_source is None
-            else self._video_source.metadata.frame_count
-        )
-        current = 0 if total == 0 else self._data.current_frame_index + 1
-        self.frame_label.setText(f"Frame {current} / {total}")
-
     def _sync_painted_frames_label(self) -> None:
         count = len(self._data.frame_strokes)
         suffix = "frame" if count == 1 else "frames"
         self.painted_frames_label.setText(f"{count} painted {suffix}")
 
     def _sync_selection_status(self) -> None:
-        surface_ids = self.surface_view.get_selected_surface_ids()
-        surface_type = self.surface_view.get_selected_surface_type()
-        if not surface_ids or surface_type is None:
+        selection = self._get_surface_selection_snapshot()
+        if selection.has_mixed_types:
+            self.selection_label.setText(
+                f"{len(selection.surface_ids)} surfaces selected; choose one type"
+            )
+            return
+        if not selection.is_valid or selection.surface_type is None:
             self.selection_label.setText("No surface selected")
             return
-        area = self.surface_view.get_combined_selected_area()
         self.selection_label.setText(
-            f"{len(surface_ids)} {surface_type} surface(s), {area:.2f} m²"
+            f"{len(selection.surface_ids)} {selection.surface_type} surface(s), "
+            f"{selection.combined_area_m2:.2f} m²"
         )
 
     def _surface_targets_are_reserved(
@@ -3633,38 +3130,28 @@ class SurfaceTextureGenerationWorkspace(QWidget):
     def _sync_controls(self) -> None:
         has_video = self._video_source is not None
         has_mask = bool(self._data.frame_strokes) or self.video_view.has_selection()
-        selected_surface_ids = self.surface_view.get_selected_surface_ids()
-        has_surface = bool(selected_surface_ids)
+        selection = self._get_surface_selection_snapshot()
+        selected_surface_ids = selection.surface_ids
+        has_surface = selection.is_valid
         selection_is_reserved = self._surface_targets_are_reserved(
             selected_surface_ids
         )
         has_key = bool(self._settings.surface_texture_api_key)
-        self.load_video_button.setEnabled(True)
-        self.seekbar.setEnabled(has_video)
-        self.paint_mask_button.setEnabled(has_video)
-        self.erase_mask_button.setEnabled(has_video)
-        self.brush_size_spinbox.setEnabled(has_video)
-        self.clear_mask_button.setEnabled(
-            has_video and self.video_view.has_selection()
-        )
-        self.material_notes_edit.setEnabled(True)
-        self.job_name_edit.setEnabled(True)
+        if self._shared_controls is None:
+            self.load_video_button.setEnabled(True)
+            self.seekbar.setEnabled(has_video)
+            self.paint_mask_button.setEnabled(has_video)
+            self.erase_mask_button.setEnabled(has_video)
+            self.brush_size_spinbox.setEnabled(has_video)
+            self.clear_mask_button.setEnabled(
+                has_video and self.video_view.has_selection()
+            )
+            self.ai_prompt_edit.setEnabled(True)
+            self.pbr_map_control.setEnabled(
+                self._settings.surface_texture_provider == MESHY_PROVIDER
+            )
+            self.video_view.set_interaction_enabled(has_video)
         self.surface_texture_provider_combo.setEnabled(True)
-        self.pbr_map_control.setEnabled(
-            self._settings.surface_texture_provider == MESHY_PROVIDER
-        )
-        self.texture_view.setEnabled(True)
-        self.other_texture_list.setEnabled(True)
-        deletion_id = self._selected_texture_assignment_id_for_deletion()
-        deletion_assignment = (
-            None
-            if deletion_id is None
-            else self._assignment_by_id(deletion_id)
-        )
-        self.delete_texture_button.setEnabled(
-            deletion_assignment is not None
-            and not self._assignment_is_reserved(deletion_assignment)
-        )
         self.generate_button.setEnabled(
             has_video
             and has_mask
@@ -3672,7 +3159,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             and has_key
             and not selection_is_reserved
         )
-        self.video_view.set_interaction_enabled(has_video)
 
     def _emit_data_changed(self) -> None:
         self.data_changed.emit(self._data.clone())
@@ -4166,15 +3652,6 @@ def _default_surface_texture_name(surface_type: str) -> str:
     return f"{str(surface_type).strip().title() or 'Surface'} texture"
 
 
-def _surface_texture_display_name(
-    assignment: SurfaceTextureAssignment,
-) -> str:
-    return (
-        assignment.display_name
-        or _default_surface_texture_name(assignment.surface_type)
-    )
-
-
 def _build_surface_area_description(
     surface_type: str,
     surface_ids: Sequence[str],
@@ -4191,9 +3668,9 @@ def _build_surface_area_description(
 def _build_material_prompt(
     surface_type: str,
     area_m2: float,
-    notes: str,
+    ai_prompt: str,
 ) -> str:
-    normalized_notes = str(notes).strip()
+    normalized_ai_prompt = str(ai_prompt).strip()
     prompt = (
         f"Create one square, seamless, tileable base-color material texture for "
         f"a {surface_type}. The selected surfaces cover {area_m2:.2f} square "
@@ -4203,8 +3680,8 @@ def _build_material_prompt(
         "object silhouette, borders, text, shadows, or highlights. Make opposite "
         "edges tile without a seam."
     )
-    if normalized_notes:
-        prompt += f" Additional direction: {normalized_notes}."
+    if normalized_ai_prompt:
+        prompt += f" Additional direction: {normalized_ai_prompt}."
     return prompt
 
 

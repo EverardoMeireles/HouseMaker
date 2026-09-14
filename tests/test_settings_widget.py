@@ -44,6 +44,7 @@ from housemaker.settings_widget import (
     DEFAULT_WALL_VERTEX_UPDATE_DELAY_SECONDS,
     FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY,
     FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY,
+    GENERATION_DISPLAY_SCREEN_SETTING_KEY,
     MAXIMUM_FACE_VISIBILITY_PERCENTAGE,
     MAX_MESH_EDIT_UPDATE_DELAY_SECONDS,
     MAX_WALL_VERTEX_UPDATE_DELAY_SECONDS,
@@ -57,6 +58,7 @@ from housemaker.settings_widget import (
     MIN_WALL_VERTEX_UPDATE_DELAY_SECONDS,
     OPENAI_API_KEY_ENVIRONMENT_VARIABLE,
     OPENAI_API_KEY_SETTING_KEY,
+    SCENE_3D_DISPLAY_SCREEN_SETTING_KEY,
     SNAP_MIDDLE_EQUAL_ANGLE_ONLY_SETTING_KEY,
     UNUSED_FACE_REMOVAL_SETTING_KEY,
     USE_HALF_MESH_TEXTURE_PREFIX_SETTING_KEY,
@@ -74,8 +76,10 @@ from housemaker.settings_widget import (
     read_automatic_atlas_texture_resolution,
     read_canvas_3d_navigation_toggle_hotkey,
     read_first_person_navigation_mode,
+    read_generation_display_screen_id,
     read_mesh_edit_update_delay_seconds,
     read_minimum_face_visibility_percentage,
+    read_scene_3d_display_screen_id,
     read_snap_middle_equal_angle_only,
     read_unused_face_removal,
     read_use_half_mesh_texture_prefix,
@@ -124,7 +128,8 @@ class SettingsWidgetTests(unittest.TestCase):
                     widget.display_settings_group,
                     "Displays",
                     (
-                        widget.fullscreen_3d_viewer_screen_combo,
+                        widget.scene_3d_display_screen_combo,
+                        widget.generation_display_screen_combo,
                         widget.jobs_window_screen_combo,
                         widget.atlas_display_screen_combo,
                     ),
@@ -372,6 +377,36 @@ class SettingsWidgetTests(unittest.TestCase):
                         )
                     )
 
+    def test_scene_and_generation_display_models_normalize_and_validate(
+        self,
+    ) -> None:
+        defaults = GenerationServiceSettings()
+        self.assertIsNone(defaults.scene_3d_display_screen_id)
+        self.assertIsNone(defaults.generation_display_screen_id)
+        settings = GenerationServiceSettings(
+            scene_3d_display_screen_id="  screen:scene  ",
+            generation_display_screen_id="  screen:generation  ",
+        )
+        self.assertEqual(
+            settings.scene_3d_display_screen_id,
+            "screen:scene",
+        )
+        self.assertEqual(
+            settings.generation_display_screen_id,
+            "screen:generation",
+        )
+
+        for field_name, error_text in (
+            ("scene_3d_display_screen_id", "3D scene display"),
+            ("generation_display_screen_id", "Generation display"),
+        ):
+            for value in (False, 1, []):
+                with self.subTest(field=field_name, value=value):
+                    with self.assertRaisesRegex(ValueError, error_text):
+                        GenerationServiceSettings(
+                            **{field_name: value}  # type: ignore[arg-type]
+                        )
+
     def test_automatic_atlas_resolution_defaults_persists_and_emits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             application_settings = _build_test_settings(temporary_directory)
@@ -607,7 +642,7 @@ class SettingsWidgetTests(unittest.TestCase):
                         read_use_half_mesh_texture_prefix(application_settings)
                     )
 
-    def test_api_key_fields_and_fullscreen_display_selector_are_visible(
+    def test_api_key_fields_and_workspace_display_selectors_are_visible(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -619,9 +654,15 @@ class SettingsWidgetTests(unittest.TestCase):
             self.assertTrue(hasattr(widget, "meshy_api_key_edit"))
             self.assertTrue(hasattr(widget, "openai_api_key_edit"))
             self.assertTrue(
-                hasattr(widget, "fullscreen_3d_viewer_screen_combo")
+                hasattr(widget, "scene_3d_display_screen_combo")
+            )
+            self.assertTrue(
+                hasattr(widget, "generation_display_screen_combo")
             )
             self.assertTrue(hasattr(widget, "atlas_display_screen_combo"))
+            self.assertFalse(
+                hasattr(widget, "fullscreen_3d_viewer_screen_combo")
+            )
             self.assertTrue(
                 hasattr(
                     widget,
@@ -658,7 +699,7 @@ class SettingsWidgetTests(unittest.TestCase):
                 hasattr(widget, "simplification_pixel_tolerance_spinbox")
             )
 
-    def test_fullscreen_display_id_can_be_read_without_settings_file_io(
+    def test_workspace_display_ids_can_be_read_without_settings_file_io(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -667,24 +708,25 @@ class SettingsWidgetTests(unittest.TestCase):
                 application_settings=application_settings,
                 environment={},
             )
-            widget.fullscreen_3d_viewer_screen_combo.addItem(
-                "Cached display",
-                "screen:cached",
-            )
-            widget.fullscreen_3d_viewer_screen_combo.setCurrentIndex(
-                widget.fullscreen_3d_viewer_screen_combo.findData(
-                    "screen:cached"
-                )
-            )
+            for combo in (
+                widget.scene_3d_display_screen_combo,
+                widget.generation_display_screen_combo,
+            ):
+                combo.addItem("Cached display", "screen:cached")
+                combo.setCurrentIndex(combo.findData("screen:cached"))
 
             with patch.object(
                 application_settings,
                 "get",
                 side_effect=AssertionError("unexpected settings-file read"),
             ):
-                screen_id = widget.get_fullscreen_3d_viewer_screen_id()
+                scene_screen_id = widget.get_scene_3d_display_screen_id()
+                generation_screen_id = (
+                    widget.get_generation_display_screen_id()
+                )
 
-            self.assertEqual(screen_id, "screen:cached")
+            self.assertEqual(scene_screen_id, "screen:cached")
+            self.assertEqual(generation_screen_id, "screen:cached")
 
     def test_atlas_display_persists_restores_and_is_cached(self) -> None:
         options = (
@@ -905,6 +947,10 @@ class SettingsWidgetTests(unittest.TestCase):
             1.25,
         )
 
+        self.assertEqual(
+            settings.scene_3d_display_screen_id,
+            "viewer-screen",
+        )
         self.assertEqual(settings.jobs_window_screen_id, "jobs-screen")
         self.assertEqual(settings.mesh_edit_update_delay_seconds, 1.25)
         self.assertEqual(
@@ -1584,7 +1630,7 @@ class SettingsWidgetTests(unittest.TestCase):
                 DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY,
             )
 
-    def test_fullscreen_3d_viewer_display_persists_selected_screen_id(self) -> None:
+    def test_workspace_displays_persist_selected_screen_ids(self) -> None:
         options = (
             Fullscreen3DViewerScreenOption(
                 screen_id="monitor:Acme|Panel|001",
@@ -1606,25 +1652,51 @@ class SettingsWidgetTests(unittest.TestCase):
                     application_settings=application_settings,
                     environment={},
                 )
-                combo = widget.fullscreen_3d_viewer_screen_combo
+                scene_combo = widget.scene_3d_display_screen_combo
+                generation_combo = widget.generation_display_screen_combo
+                display_form = widget.display_settings_group.layout()
+                assert isinstance(display_form, QFormLayout)
 
-                self.assertEqual(combo.itemText(0), "None")
-                self.assertIsNone(combo.itemData(0))
                 self.assertEqual(
-                    [combo.itemData(index) for index in range(combo.count())],
-                    [None, options[0].screen_id, options[1].screen_id],
+                    display_form.labelForField(scene_combo).text(),
+                    "3D scene display",
                 )
+                self.assertEqual(
+                    display_form.labelForField(generation_combo).text(),
+                    "Generation display",
+                )
+                for combo in (scene_combo, generation_combo):
+                    self.assertEqual(combo.itemText(0), "None")
+                    self.assertIsNone(combo.itemData(0))
+                    self.assertEqual(
+                        [
+                            combo.itemData(index)
+                            for index in range(combo.count())
+                        ],
+                        [None, options[0].screen_id, options[1].screen_id],
+                    )
 
-                combo.setCurrentIndex(2)
+                scene_combo.setCurrentIndex(1)
+                generation_combo.setCurrentIndex(2)
 
                 self.assertEqual(
                     application_settings.get(
-                        FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY
+                        SCENE_3D_DISPLAY_SCREEN_SETTING_KEY
+                    ),
+                    options[0].screen_id,
+                )
+                self.assertEqual(
+                    application_settings.get(
+                        GENERATION_DISPLAY_SCREEN_SETTING_KEY
                     ),
                     options[1].screen_id,
                 )
                 self.assertEqual(
-                    widget.get_settings().fullscreen_3d_viewer_screen_id,
+                    widget.get_settings().scene_3d_display_screen_id,
+                    options[0].screen_id,
+                )
+                self.assertEqual(
+                    widget.get_settings().generation_display_screen_id,
                     options[1].screen_id,
                 )
 
@@ -1635,9 +1707,80 @@ class SettingsWidgetTests(unittest.TestCase):
                     environment={},
                 )
                 self.assertEqual(
-                    restored.fullscreen_3d_viewer_screen_combo.currentData(),
+                    restored.scene_3d_display_screen_combo.currentData(),
+                    options[0].screen_id,
+                )
+                self.assertEqual(
+                    restored.generation_display_screen_combo.currentData(),
                     options[1].screen_id,
                 )
+
+    def test_scene_display_uses_legacy_value_only_when_new_key_is_absent(
+        self,
+    ) -> None:
+        options = (
+            Fullscreen3DViewerScreenOption(
+                screen_id="screen:legacy",
+                label="Legacy display",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            application_settings.set(
+                FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY,
+                options[0].screen_id,
+            )
+            with patch(
+                "housemaker.settings_widget."
+                "connected_fullscreen_3d_viewer_display_options",
+                return_value=options,
+            ):
+                migrated = SettingsWidget(
+                    application_settings=application_settings,
+                    environment={},
+                )
+                self.assertEqual(
+                    migrated.scene_3d_display_screen_combo.currentData(),
+                    options[0].screen_id,
+                )
+                self.assertEqual(
+                    read_scene_3d_display_screen_id(application_settings),
+                    options[0].screen_id,
+                )
+
+                application_settings.set(
+                    SCENE_3D_DISPLAY_SCREEN_SETTING_KEY,
+                    None,
+                )
+                explicitly_embedded = SettingsWidget(
+                    application_settings=application_settings,
+                    environment={},
+                )
+
+            self.assertIsNone(
+                explicitly_embedded.scene_3d_display_screen_combo.currentData()
+            )
+            self.assertIsNone(
+                read_scene_3d_display_screen_id(application_settings)
+            )
+
+    def test_workspace_display_readers_ignore_malformed_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            for setting_key, reader in (
+                (
+                    SCENE_3D_DISPLAY_SCREEN_SETTING_KEY,
+                    read_scene_3d_display_screen_id,
+                ),
+                (
+                    GENERATION_DISPLAY_SCREEN_SETTING_KEY,
+                    read_generation_display_screen_id,
+                ),
+            ):
+                for value in (False, 1, []):
+                    with self.subTest(key=setting_key, value=value):
+                        application_settings.set(setting_key, value)
+                        self.assertIsNone(reader(application_settings))
 
     def test_fullscreen_3d_viewer_screen_id_prefers_monitor_serial(self) -> None:
         serial_screen = _FakeScreen(
@@ -1657,7 +1800,7 @@ class SettingsWidgetTests(unittest.TestCase):
             "screen:HDMI-1",
         )
 
-    def test_missing_saved_fullscreen_display_safely_uses_none(self) -> None:
+    def test_missing_saved_scene_display_safely_uses_none(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             application_settings = _build_test_settings(temporary_directory)
             application_settings.set(
@@ -1675,10 +1818,10 @@ class SettingsWidgetTests(unittest.TestCase):
                 )
 
             self.assertIsNone(
-                widget.fullscreen_3d_viewer_screen_combo.currentData()
+                widget.scene_3d_display_screen_combo.currentData()
             )
             self.assertIsNone(
-                widget.get_settings().fullscreen_3d_viewer_screen_id
+                widget.get_settings().scene_3d_display_screen_id
             )
             self.assertEqual(
                 application_settings.get(

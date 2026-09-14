@@ -19,48 +19,39 @@ import numpy as np
 from PySide6.QtCore import (
     QObject,
     QStandardPaths,
-    QThread,
     Qt,
+    QThread,
     Signal,
     Slot,
 )
 from PySide6.QtWidgets import (
-    QBoxLayout,
     QButtonGroup,
     QCheckBox,
-    QComboBox,
     QFileDialog,
     QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QRadioButton,
+    QSizePolicy,
     QSlider,
     QSpinBox,
-    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 from shiboken6 import isValid as is_valid_qt_object
 
-from housemaker.uv_integrity import (
-    UV_FINGERPRINT_VERSION,
-    UvFingerprint,
-    UvIntegrityError,
-    build_uv_fingerprint,
-)
+from housemaker.generation_jobs import GenerationJobManager
+from housemaker.generation_shared_controls import GenerationSharedControls
 from housemaker.generation_state import (
     MASK_MODE_ERASE,
     MASK_MODE_PAINT,
-    GeneratedObjectRecord,
     GeneratedObjectPlacement,
+    GeneratedObjectRecord,
     GenerationData,
 )
-from housemaker.generation_jobs import GenerationJobManager
 from housemaker.generation_views import VideoInpaintView
 from housemaker.glass_material import (
     DEFAULT_HOUSEMAKER_GLASS_DOUBLE_SIDED,
@@ -72,24 +63,11 @@ from housemaker.glass_material import (
 )
 from housemaker.glb import GeneratedModel, import_generated_glb
 from housemaker.meshy_generation import (
+    MAX_IMAGE_TO_3D_TEXTURE_PROMPT_CHARACTERS,
     MeshyGenerationResult,
+    normalize_image_to_3d_texture_prompt,
     request_image_to_3d_model,
     request_retextured_model,
-)
-from housemaker.object_texture_variants import (
-    ATLAS_MAP_BASE_COLOR,
-    ATLAS_MAP_TYPES,
-    DEFAULT_TEXTURE_RESOLUTION,
-    PBR_MAP_METALLIC,
-    PBR_MAP_NORMAL,
-    PBR_MAP_ROUGHNESS,
-    PBR_MAP_TYPES,
-    TEXTURE_RESOLUTION_1024,
-    TEXTURE_RESOLUTION_2048,
-    TEXTURE_RESOLUTIONS,
-    ObjectTextureVariants,
-    build_object_texture_variants,
-    replace_object_base_color_texture_from_glb,
 )
 from housemaker.object_face_edit import (
     ObjectFaceDeletionResult,
@@ -98,28 +76,12 @@ from housemaker.object_face_edit import (
     load_object_face_geometry,
     load_object_face_geometry_from_scene,
 )
-from housemaker.object_uv_scan_projection import (
-    DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
-    SCAN_PROJECTION_TARGET_FULL,
-    SCAN_PROJECTION_TARGET_LEFT_HALF,
-    SCAN_PROJECTION_TARGET_TOP_LEFT_QUARTER,
-    ScanProjectionCancelled,
-    ScanProjectionResult,
-    ScanProjectionStats,
-    normalize_projection_camera_percentages,
-    scan_project_textured_glb,
-)
-from housemaker.object_uv_raycast import (
-    VISIBILITY_UV_UNWRAP_VERSION,
-    VisibilityUvUnwrapStats,
-)
 from housemaker.object_symmetry import (
     AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
     LEGACY_SYMMETRIC_PAIR_METADATA_VERSION,
     SYMMETRIC_DIVISION_METADATA_VERSION,
-    SYMMETRIC_DIVISION_ORIENTATIONS,
-    SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL,
     SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
+    SYMMETRIC_DIVISION_ORIENTATIONS,
     SYMMETRIC_DIVISION_SIDE_ORDER_BY_ORIENTATION,
     SYMMETRIC_DIVISION_SIDES_BY_ORIENTATION,
     SYMMETRIC_QUARTER_METADATA_VERSION,
@@ -136,17 +98,46 @@ from housemaker.object_symmetry import (
     build_symmetric_retexture_proxy_glb,
     build_symmetric_square_pair_texture_variants,
 )
+from housemaker.object_texture_variants import (
+    ATLAS_MAP_BASE_COLOR,
+    ATLAS_MAP_TYPES,
+    DEFAULT_TEXTURE_RESOLUTION,
+    PBR_MAP_METALLIC,
+    PBR_MAP_NORMAL,
+    PBR_MAP_ROUGHNESS,
+    PBR_MAP_TYPES,
+    TEXTURE_RESOLUTION_1024,
+    TEXTURE_RESOLUTION_2048,
+    TEXTURE_RESOLUTIONS,
+    ObjectTextureVariants,
+    build_object_texture_variants,
+    replace_object_base_color_texture_from_glb,
+)
+from housemaker.object_uv_raycast import (
+    VISIBILITY_UV_UNWRAP_VERSION,
+    VisibilityUvUnwrapStats,
+)
+from housemaker.object_uv_scan_projection import (
+    DEFAULT_PROJECTION_CAMERA_PERCENTAGES,
+    SCAN_PROJECTION_TARGET_FULL,
+    SCAN_PROJECTION_TARGET_LEFT_HALF,
+    SCAN_PROJECTION_TARGET_TOP_LEFT_QUARTER,
+    ScanProjectionCancelled,
+    ScanProjectionResult,
+    ScanProjectionStats,
+    normalize_projection_camera_percentages,
+    scan_project_textured_glb,
+)
+from housemaker.safe_duplicate_face_removal import (
+    SafeDuplicateFaceRemovalCancelled,
+    SafeDuplicateFaceRemovalResult,
+    remove_safe_duplicate_faces_from_glb,
+)
 from housemaker.settings_widget import (
     DEFAULT_MESHY_TARGET_POLYCOUNT,
     MESHY_SMART_TOPOLOGY_MAX_TARGET_POLYCOUNT,
     MESHY_SMART_TOPOLOGY_MIN_TARGET_POLYCOUNT,
     GenerationServiceSettings,
-)
-from housemaker.texture_atlas_view import (
-    TextureAtlasEntry,
-    TextureAtlasView,
-    UvTriangle,
-    UvFaceSelectionRequest,
 )
 from housemaker.unused_face_removal import (
     ALL_CAMERA_IDS,
@@ -155,21 +146,18 @@ from housemaker.unused_face_removal import (
     UnusedFaceRemovalProgress,
     remove_unused_faces_from_glb,
 )
-from housemaker.safe_duplicate_face_removal import (
-    SafeDuplicateFaceRemovalCancelled,
-    SafeDuplicateFaceRemovalResult,
-    remove_safe_duplicate_faces_from_glb,
+from housemaker.uv_integrity import (
+    UV_FINGERPRINT_VERSION,
+    UvFingerprint,
+    UvIntegrityError,
+    build_uv_fingerprint,
 )
 from housemaker.video_source import (
     VIDEO_FILE_FILTER,
     VideoFrameSource,
     probe_video,
 )
-from housemaker.viewer import (
-    FACE_SELECTION_TOGGLE,
-    GlbViewerWidget,
-)
-
+from housemaker.viewer import GlbViewerWidget
 
 # ### Constants ###
 MIN_BRUSH_RADIUS_PIXELS = 2
@@ -181,11 +169,6 @@ CONTROL_STRETCH = 0
 INTERRUPT_POLL_SECONDS = 0.01
 SHUTDOWN_WAIT_MILLISECONDS = 250
 GENERATION_BACKEND_MESHY = "meshy"
-OBJECT_ID_ITEM_ROLE = Qt.ItemDataRole.UserRole
-OBJECT_LIST_MAXIMUM_HEIGHT = 124
-OBJECT_DETAILS_EXTERNAL_MINIMUM_WIDTH = 320
-OBJECT_DETAILS_EXTERNAL_MAXIMUM_WIDTH = 440
-QT_WIDGET_MAXIMUM_SIZE = 16_777_215
 OBJECT_FACE_GEOMETRY_CACHE_MAX_ENTRIES = 16
 GEOMETRY_FINGERPRINT_DECIMALS = 6
 MESHY_REVISION_GEOMETRY = "geometry"
@@ -613,6 +596,7 @@ class GenerationRequest:
             DEFAULT_PROJECTION_CAMERA_PERCENTAGES
         ),
         enabled_pbr_maps: Sequence[str] = (),
+        ai_prompt: str = "",
     ) -> None:
         self.frame_index = int(frame_index)
         self.selected_object_bgra = np.ascontiguousarray(
@@ -639,6 +623,7 @@ class GenerationRequest:
         self.enabled_pbr_maps = _normalize_enabled_pbr_maps(
             enabled_pbr_maps
         )
+        self.ai_prompt = normalize_image_to_3d_texture_prompt(ai_prompt)
 
 
 @dataclass(frozen=True)
@@ -1531,6 +1516,7 @@ class MeshyImagePlanner:
                 progress_callback=report_generation_progress,
                 cancel_event=cancel_event,
                 enable_pbr=bool(request.enabled_pbr_maps),
+                texture_prompt=request.ai_prompt,
             )
             provider_result, _duplicate_cleanup = (
                 _remove_safe_duplicates_from_meshy_result(
@@ -1838,14 +1824,18 @@ class MeshyModelExecutor:
 
 # ### Object viewer panel ###
 class ObjectGenerationViewerPanel(QWidget):
-    """Keep the generated-object selector with its detachable 3D viewer."""
+    """Show the generated object while staging its controls for the host UI."""
 
     projection_camera_percentages_changed = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._is_external_presentation_active = False
-        self._layout = QBoxLayout(QBoxLayout.Direction.TopToBottom, self)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Expanding,
+        )
+        self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(8)
 
@@ -1859,8 +1849,13 @@ class ObjectGenerationViewerPanel(QWidget):
         )
         self._layout.addWidget(self.viewer, 1)
 
-        self.details_panel = QWidget()
+        self.details_panel = QWidget(self)
         self.details_panel.setObjectName("object_generation_details_panel")
+        self.details_panel.setMinimumWidth(0)
+        self.details_panel.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
         details_layout = QVBoxLayout(self.details_panel)
         details_layout.setContentsMargins(0, 0, 0, 0)
         details_layout.setSpacing(4)
@@ -1873,11 +1868,12 @@ class ObjectGenerationViewerPanel(QWidget):
         camera_layout.setContentsMargins(4, 2, 4, 2)
         camera_layout.setSpacing(6)
         camera_title = QLabel("Projection texture allocation")
+        camera_title.setWordWrap(True)
         camera_title.setToolTip(
             "Allocate the available texture area between the six fixed "
             "projection cameras."
         )
-        camera_layout.addWidget(camera_title, 0, 0, 1, 4)
+        camera_layout.addWidget(camera_title, 0, 0, 1, 2)
         self.projection_camera_percentage_spinboxes: dict[str, QSpinBox] = {}
         for index, ((camera_id, label), default_percentage) in enumerate(
             zip(
@@ -1886,8 +1882,7 @@ class ObjectGenerationViewerPanel(QWidget):
                 strict=True,
             )
         ):
-            row = 1 + index // 2
-            column = (index % 2) * 2
+            row = 1 + index
             camera_label = QLabel(label)
             percentage_spinbox = QSpinBox()
             percentage_spinbox.setObjectName(
@@ -1916,18 +1911,18 @@ class ObjectGenerationViewerPanel(QWidget):
             self.projection_camera_percentage_spinboxes[camera_id] = (
                 percentage_spinbox
             )
-            camera_layout.addWidget(camera_label, row, column)
-            camera_layout.addWidget(percentage_spinbox, row, column + 1)
+            camera_layout.addWidget(camera_label, row, 0)
+            camera_layout.addWidget(percentage_spinbox, row, 1)
         self.projection_camera_total_label = QLabel()
         self.projection_camera_total_label.setObjectName(
             "projection_camera_percentage_total"
         )
         camera_layout.addWidget(
             self.projection_camera_total_label,
-            4,
+            7,
             0,
             1,
-            4,
+            2,
         )
         details_layout.addWidget(self.projection_camera_controls)
         self._projection_camera_percentages = tuple(
@@ -1937,32 +1932,6 @@ class ObjectGenerationViewerPanel(QWidget):
             self._projection_camera_percentages
         )
         self._sync_projection_camera_percentage_total()
-
-        self.object_list = QListWidget()
-        self.object_list.setObjectName("generated_objects_list")
-        self.object_list.setMaximumHeight(OBJECT_LIST_MAXIMUM_HEIGHT)
-        self.object_list.setAlternatingRowColors(True)
-        self.object_list.setToolTip(
-            "Select which generated Meshy object is shown in the 3D view."
-        )
-        details_layout.addWidget(self.object_list, 1)
-
-        self.face_selection_help_label = QLabel(
-            "Toggle faces with Shift+click in 3D or a click in Texture "
-            "resolution. Shift+drag adds faces in 3D. All methods share one "
-            "selection; deletion retains existing UVs and textures."
-        )
-        self.face_selection_help_label.setObjectName(
-            "object_face_selection_help"
-        )
-        self.face_selection_help_label.setWordWrap(True)
-        details_layout.addWidget(self.face_selection_help_label)
-
-        self.face_selection_count_label = QLabel("No faces selected")
-        self.face_selection_count_label.setObjectName(
-            "object_face_selection_count"
-        )
-        details_layout.addWidget(self.face_selection_count_label)
 
         self.delete_faces_button = QPushButton("Delete selected faces")
         self.delete_faces_button.setObjectName(
@@ -1987,44 +1956,11 @@ class ObjectGenerationViewerPanel(QWidget):
             "atlas-independent reflective glass material."
         )
         self.convert_faces_to_glass_button.setEnabled(False)
-        self.glass_double_sided_checkbox = QCheckBox("Double-sided")
-        self.glass_double_sided_checkbox.setObjectName(
-            "glass_double_sided_checkbox"
+        self.convert_faces_to_glass_button.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Fixed,
         )
-        self.glass_double_sided_checkbox.setChecked(
-            DEFAULT_HOUSEMAKER_GLASS_DOUBLE_SIDED
-        )
-        self.glass_double_sided_checkbox.setToolTip(
-            "Render converted glass from both sides. Uncheck this to cull "
-            "the panel's back face."
-        )
-        self.glass_conversion_controls = QWidget()
-        self.glass_conversion_controls.setObjectName(
-            "glass_conversion_controls"
-        )
-        glass_conversion_layout = QHBoxLayout(
-            self.glass_conversion_controls
-        )
-        glass_conversion_layout.setContentsMargins(0, 0, 0, 0)
-        glass_conversion_layout.setSpacing(6)
-        glass_conversion_layout.addWidget(
-            self.convert_faces_to_glass_button,
-            1,
-        )
-        glass_conversion_layout.addWidget(
-            self.glass_double_sided_checkbox,
-        )
-        details_layout.addWidget(self.glass_conversion_controls)
-
-        self.delete_object_button = QPushButton("Delete object")
-        self.delete_object_button.setObjectName(
-            "delete_generated_object_button"
-        )
-        self.delete_object_button.setToolTip(
-            "Permanently delete the selected generated object, its embedded "
-            "textures, and its unreferenced local GLB revisions."
-        )
-        details_layout.addWidget(self.delete_object_button)
+        details_layout.addWidget(self.convert_faces_to_glass_button)
 
         self.statistics_label = QLabel("No generated object")
         self.statistics_label.setObjectName("model_statistics_label")
@@ -2033,7 +1969,7 @@ class ObjectGenerationViewerPanel(QWidget):
             "color: #aeb7c5; padding: 2px 4px;"
         )
         details_layout.addWidget(self.statistics_label)
-        self._layout.addWidget(self.details_panel)
+        self.details_panel.hide()
 
     # ### Projection camera controls ###
     def get_projection_camera_percentages(self) -> tuple[int, ...]:
@@ -2110,42 +2046,9 @@ class ObjectGenerationViewerPanel(QWidget):
         )
 
     def focus_navigation(self) -> None:
-        """Forward external-window focus to the actual OpenGL viewer."""
+        """Forward focus to the actual OpenGL viewer."""
 
         self.viewer.focus_navigation()
-
-    @property
-    def is_external_presentation_active(self) -> bool:
-        """Whether controls are arranged beside the detached 3D viewport."""
-
-        return self._is_external_presentation_active
-
-    def set_external_presentation_active(self, is_active: bool) -> None:
-        """Keep all object controls visible beside an external 3D viewport."""
-
-        is_active = bool(is_active)
-        if is_active == self._is_external_presentation_active:
-            return
-        self._is_external_presentation_active = is_active
-        self._layout.setDirection(
-            QBoxLayout.Direction.LeftToRight
-            if is_active
-            else QBoxLayout.Direction.TopToBottom
-        )
-        self.details_panel.setMinimumWidth(
-            OBJECT_DETAILS_EXTERNAL_MINIMUM_WIDTH if is_active else 0
-        )
-        self.details_panel.setMaximumWidth(
-            OBJECT_DETAILS_EXTERNAL_MAXIMUM_WIDTH
-            if is_active
-            else QT_WIDGET_MAXIMUM_SIZE
-        )
-        self.object_list.setMaximumHeight(
-            QT_WIDGET_MAXIMUM_SIZE
-            if is_active
-            else OBJECT_LIST_MAXIMUM_HEIGHT
-        )
-        self._layout.invalidate()
 
 # ### Background progress mapping ###
 class _BoundedProgressMapper:
@@ -3082,19 +2985,12 @@ class GenerationWorkspace(QWidget):
             ObjectFaceGeometry,
         ] = {}
         self._displayed_object_snapshot: tuple[object, ...] | None = None
-        self._texture_resolution_entry_cache: dict[
-            str,
-            tuple[object, tuple[TextureAtlasEntry, ...]],
-        ] = {}
-        self._is_syncing_texture_resolution_view = False
-        self._texture_resolution_change_handler: (
-            Callable[[str, int], bool] | None
-        ) = None
         self._object_packing_change_handler: (
             ObjectPackingChangeHandler | None
         ) = None
         self._active_generation_request: GenerationRequest | None = None
         self._active_object_operation: _ActiveObjectOperation | None = None
+        self._shared_control_state_managed_externally = False
         self._existing_object_placement_request: (
             _ExistingObjectPlacementRequest | None
         ) = None
@@ -3109,10 +3005,37 @@ class GenerationWorkspace(QWidget):
         self._store_current_frame_strokes()
         return self._data.clone()
 
+    def get_shared_controls(self) -> GenerationSharedControls:
+        """Expose the canonical controls shared by both generation pipelines."""
+
+        return GenerationSharedControls(
+            video_view=self.video_view,
+            seekbar=self.seekbar,
+            load_video_button=self.load_video_button,
+            paint_mask_button=self.paint_mask_button,
+            erase_mask_button=self.erase_mask_button,
+            mask_mode_button_group=self._mask_mode_button_group,
+            mask_mode_control=self.mask_mode_control,
+            brush_size_spinbox=self.brush_size_spinbox,
+            clear_mask_button=self.clear_mask_button,
+            pbr_map_control=self.pbr_map_control,
+            pbr_map_checkboxes=self.pbr_map_checkboxes,
+            ai_prompt_edit=self.ai_prompt_edit,
+            cancel_button=self.cancel_operation_button,
+        )
+
     def get_generated_object_ids(self) -> tuple[str, ...]:
         """Return lightweight immutable IDs without cloning Generation data."""
 
         return tuple(record.object_id for record in self._data.generated_objects)
+
+    def select_generated_object(self, object_id: str | None) -> bool:
+        """Select one generated object for preview and editing without a list."""
+
+        return self._select_generated_object(
+            object_id,
+            repair_missing_variant=True,
+        )
 
     def get_generated_object_names_by_id(self) -> dict[str, str]:
         """Return lightweight display names for completed objects."""
@@ -3170,28 +3093,11 @@ class GenerationWorkspace(QWidget):
             record,
             self._asset_directory,
         )
-        texture_signature = _build_texture_resolution_entry_signature(
-            record,
-            self._asset_directory,
-        )
-        cached_entries = self._texture_resolution_entry_cache.get(
-            record.object_id
-        )
-        selection_context_token = (
-            _build_object_face_selection_context_token(
-                record,
-                self._asset_directory,
-            )
-        )
         if (
             display_snapshot == self._displayed_object_snapshot
             and self._generated_model is not None
             and self.result_view.model is self._generated_model
             and self.result_view.face_edit_face_count > 0
-            and self.texture_view.uv_face_selection_context_token
-            == selection_context_token
-            and cached_entries is not None
-            and cached_entries[0] == texture_signature
         ):
             return
         self._display_generated_object(record, repair_missing_variant=False)
@@ -3283,7 +3189,6 @@ class GenerationWorkspace(QWidget):
         self._generated_model_cache_revisions.clear()
         self._object_face_geometry_cache.clear()
         self._displayed_object_snapshot = None
-        self._texture_resolution_entry_cache.clear()
         self._is_rebuilding_generation_data = True
         try:
             self._rebuild_generated_objects()
@@ -3398,16 +3303,6 @@ class GenerationWorkspace(QWidget):
             )
         )
 
-    def set_texture_resolution_change_handler(
-        self,
-        handler: Callable[[str, int], bool] | None,
-    ) -> None:
-        """Route UI resolution clicks through an application transaction."""
-
-        if handler is not None and not callable(handler):
-            raise TypeError("The texture resolution change handler must be callable.")
-        self._texture_resolution_change_handler = handler
-
     def set_object_packing_change_handler(
         self,
         handler: ObjectPackingChangeHandler | None,
@@ -3417,6 +3312,12 @@ class GenerationWorkspace(QWidget):
         if handler is not None and not callable(handler):
             raise TypeError("The object packing change handler must be callable.")
         self._object_packing_change_handler = handler
+
+    def set_shared_control_state_managed_externally(self, enabled: bool) -> None:
+        """Delegate shared widget availability to a merged controller."""
+
+        self._shared_control_state_managed_externally = bool(enabled)
+        self._sync_controls()
 
     def get_object_symmetric_division(
         self,
@@ -3709,21 +3610,6 @@ class GenerationWorkspace(QWidget):
             )
         self._emit_data_changed()
         return True
-
-    def set_external_3d_viewer_active(self, is_active: bool) -> None:
-        """Show the local atlas inspector while the 3D panel is external."""
-
-        is_active = bool(is_active)
-        target_page = (
-            self.texture_view_page if is_active else self.object_3d_page
-        )
-        if (
-            self.object_3d_panel.is_external_presentation_active == is_active
-            and self.right_view_stack.currentWidget() is target_page
-        ):
-            return
-        self.object_3d_panel.set_external_presentation_active(is_active)
-        self.right_view_stack.setCurrentWidget(target_page)
 
     @property
     def is_generating(self) -> bool:
@@ -4104,14 +3990,7 @@ class GenerationWorkspace(QWidget):
         request = self._build_texture_regeneration_request()
         if request is None:
             return False
-        requested_name = self.job_name_edit.text().strip()
-        if not self._start_texture_regeneration(
-            request,
-            requested_name=requested_name,
-        ):
-            return False
-        self.job_name_edit.clear()
-        return True
+        return self._start_texture_regeneration(request)
 
     def convert_selected_faces_to_glass(self) -> bool:
         """Run a PBR texture job for the authoritative selected faces."""
@@ -4145,22 +4024,13 @@ class GenerationWorkspace(QWidget):
             return False
         request = self._build_texture_regeneration_request(
             glass_face_indices=selected_faces,
-            glass_double_sided=(
-                self.glass_double_sided_checkbox.isChecked()
-            ),
+            glass_double_sided=False,
         )
         if request is None:
             return False
         for checkbox in self.pbr_map_checkboxes.values():
             checkbox.setChecked(True)
-        requested_name = self.job_name_edit.text().strip()
-        if not self._start_texture_regeneration(
-            request,
-            requested_name=requested_name,
-        ):
-            return False
-        self.job_name_edit.clear()
-        return True
+        return self._start_texture_regeneration(request)
 
     def undo_selected_object_change(self) -> bool:
         """Undo the selected object's latest local or texture operation."""
@@ -4285,7 +4155,6 @@ class GenerationWorkspace(QWidget):
         self._generated_model_cache.pop(object_id, None)
         self._generated_model_cache_revisions.pop(object_id, None)
         self._discard_object_face_geometry_cache(object_id)
-        self._texture_resolution_entry_cache.pop(object_id, None)
         asset_cleanup_failed = self._delete_unreferenced_object_assets(
             deleted_record
         )
@@ -4299,7 +4168,7 @@ class GenerationWorkspace(QWidget):
                     min(record_index, len(self._data.generated_objects) - 1)
                 ].object_id
             )
-        self._refresh_generated_objects_list(preferred_object_id)
+        self._select_generated_object(preferred_object_id)
         if asset_cleanup_failed:
             self.status_label.setText(
                 f"Deleted: {deleted_record.object_name}. Some local GLB "
@@ -4371,17 +4240,13 @@ class GenerationWorkspace(QWidget):
             self._data.strokes_for_frame(safe_index),
         )
         self._sync_seekbar_value(safe_index)
-        self._sync_frame_label()
         self._sync_controls()
 
     def generate(self) -> None:
         request = self._build_generation_request()
         if request is None:
             return
-        self._start_generation(
-            request,
-            requested_name=self._take_requested_job_name(),
-        )
+        self._start_generation(request)
 
     def generate_geometry(self) -> None:
         """Generate and locally process geometry without submitting Retexture."""
@@ -4395,10 +4260,7 @@ class GenerationWorkspace(QWidget):
         request = self._build_generation_request(geometry_only=True)
         if request is None:
             return
-        self._start_generation(
-            request,
-            requested_name=self._take_requested_job_name(),
-        )
+        self._start_generation(request)
 
     def _start_generation(
         self,
@@ -4607,13 +4469,6 @@ class GenerationWorkspace(QWidget):
         return True
 
     # ### Multi-job runtime helpers ###
-    def _take_requested_job_name(self) -> str:
-        """Snapshot and clear the optional name for the next accepted job."""
-
-        requested_name = self.job_name_edit.text().strip()
-        self.job_name_edit.clear()
-        return requested_name
-
     def _create_managed_job(
         self,
         operation: _ActiveObjectOperation,
@@ -4830,34 +4685,21 @@ class GenerationWorkspace(QWidget):
         self.result_view.set_ambient_light_intensity(
             OBJECT_GENERATION_AMBIENT_LIGHT_INTENSITY
         )
-        self.generated_objects_list = self.object_3d_panel.object_list
-        self.face_selection_count_label = (
-            self.object_3d_panel.face_selection_count_label
-        )
         self.delete_selected_faces_button = (
             self.object_3d_panel.delete_faces_button
         )
         self.convert_faces_to_glass_button = (
             self.object_3d_panel.convert_faces_to_glass_button
         )
-        self.glass_double_sided_checkbox = (
-            self.object_3d_panel.glass_double_sided_checkbox
-        )
-        self.delete_generated_object_button = (
-            self.object_3d_panel.delete_object_button
-        )
         self.model_statistics_label = self.object_3d_panel.statistics_label
         self.object_3d_panel.projection_camera_percentages_changed.connect(
             self._sync_controls
         )
-        self.generated_objects_list.currentItemChanged.connect(
-            self._handle_generated_object_selection_changed
-        )
-        self.delete_generated_object_button.clicked.connect(
-            self._handle_delete_generated_object_clicked
-        )
         self.result_view.face_selection_changed.connect(
             self._handle_face_selection_changed
+        )
+        self.result_view.undo_requested.connect(
+            self.undo_selected_object_change
         )
         self.delete_selected_faces_button.clicked.connect(
             self._handle_delete_selected_faces_clicked
@@ -4873,27 +4715,12 @@ class GenerationWorkspace(QWidget):
             "Generated 3D objects",
             self.object_3d_panel,
         )
-        self.texture_view = TextureAtlasView(
-            empty_preview_text="No texture resolutions available",
-            unselected_preview_text="Select a texture resolution",
+        self.object_3d_page.setMinimumWidth(0)
+        self.object_3d_page.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Expanding,
         )
-        self.texture_view.setObjectName("object_texture_resolution_view")
-        self.texture_view.atlas_selected.connect(
-            self._handle_texture_resolution_selected
-        )
-        self.texture_view.uv_face_selection_requested.connect(
-            self._handle_texture_uv_face_selection_requested
-        )
-        self.texture_view_page = _build_labeled_view(
-            "Texture resolution",
-            self.texture_view,
-        )
-        self.right_view_stack = QStackedWidget()
-        self.right_view_stack.setObjectName("object_generation_right_view_stack")
-        self.right_view_stack.addWidget(self.object_3d_page)
-        self.right_view_stack.addWidget(self.texture_view_page)
-        self.right_view_stack.setCurrentWidget(self.object_3d_page)
-        views_layout.addWidget(self.right_view_stack, VIEW_STRETCH)
+        views_layout.addWidget(self.object_3d_page, VIEW_STRETCH)
         root_layout.addWidget(views_widget, 1)
 
         controls_widget = QWidget()
@@ -4912,10 +4739,6 @@ class GenerationWorkspace(QWidget):
         self.load_video_button = QPushButton("Load video")
         self.load_video_button.clicked.connect(self._handle_load_video_clicked)
         buttons_layout.addWidget(self.load_video_button)
-
-        self.frame_label = QLabel("Frame 0 / 0")
-        self.frame_label.setMinimumWidth(120)
-        buttons_layout.addWidget(self.frame_label)
 
         self.meshy_target_polycount_control = QWidget()
         self.meshy_target_polycount_control.setObjectName(
@@ -4980,15 +4803,14 @@ class GenerationWorkspace(QWidget):
             )
             checkbox.toggled.connect(self._handle_pbr_map_toggled)
             self.pbr_map_checkboxes[map_type] = checkbox
-            pbr_map_layout.addWidget(checkbox, index % 3, index // 3)
+            pbr_map_layout.addWidget(checkbox, 0, index)
         buttons_layout.addWidget(self.pbr_map_control)
 
         self.wireframe_checkbox = QCheckBox("Wireframe")
         self.wireframe_checkbox.setObjectName("wireframe_checkbox")
         self.wireframe_checkbox.setChecked(False)
         self.wireframe_checkbox.setToolTip(
-            "Overlay the generated model's triangle edges and show its UV "
-            "edges and vertices over the texture-resolution preview."
+            "Overlay the generated model's triangle edges in the 3D view."
         )
         self.wireframe_checkbox.toggled.connect(
             self._handle_wireframe_toggled
@@ -5006,29 +4828,63 @@ class GenerationWorkspace(QWidget):
         self.mask_mode_control.setObjectName(
             "object_generation_mask_mode_control"
         )
-        mask_mode_layout = QVBoxLayout(self.mask_mode_control)
+        mask_mode_layout = QGridLayout(self.mask_mode_control)
         mask_mode_layout.setContentsMargins(0, 0, 0, 0)
-        mask_mode_layout.setSpacing(0)
-        mask_mode_layout.addWidget(self.paint_mask_button)
-        mask_mode_layout.addWidget(self.erase_mask_button)
-        buttons_layout.addWidget(self.mask_mode_control)
+        mask_mode_layout.setHorizontalSpacing(6)
+        mask_mode_layout.setVerticalSpacing(2)
+        mask_mode_layout.addWidget(self.paint_mask_button, 0, 0)
+        mask_mode_layout.addWidget(self.erase_mask_button, 1, 0)
 
-        buttons_layout.addWidget(QLabel("Brush"))
+        self.brush_size_control = QWidget()
+        self.brush_size_control.setObjectName(
+            "object_generation_brush_size_control"
+        )
+        brush_size_layout = QHBoxLayout(self.brush_size_control)
+        brush_size_layout.setContentsMargins(0, 0, 0, 0)
+        brush_size_layout.setSpacing(4)
+        self.brush_size_label = QLabel("Brush size")
+        self.brush_size_label.setObjectName(
+            "object_generation_brush_size_label"
+        )
+        brush_size_layout.addWidget(self.brush_size_label)
         self.brush_size_spinbox = QSpinBox()
+        self.brush_size_spinbox.setObjectName("brush_size_spinbox")
         self.brush_size_spinbox.setRange(
             MIN_BRUSH_RADIUS_PIXELS,
             MAX_BRUSH_RADIUS_PIXELS,
         )
         self.brush_size_spinbox.setValue(DEFAULT_BRUSH_RADIUS_PIXELS)
         self.brush_size_spinbox.setSuffix(" px")
+        self.brush_size_spinbox.setMaximumWidth(76)
         self.brush_size_spinbox.valueChanged.connect(
             self.video_view.set_brush_radius_pixels
         )
-        buttons_layout.addWidget(self.brush_size_spinbox)
+        brush_size_layout.addWidget(self.brush_size_spinbox)
+        mask_mode_layout.addWidget(self.brush_size_control, 0, 1)
 
         self.clear_mask_button = QPushButton("Clear mask")
+        self.clear_mask_button.setObjectName("clear_mask_button")
+        self.clear_mask_button.setMaximumWidth(88)
         self.clear_mask_button.clicked.connect(self.video_view.clear_mask)
-        buttons_layout.addWidget(self.clear_mask_button)
+        mask_mode_layout.addWidget(self.clear_mask_button, 1, 1)
+        buttons_layout.addWidget(self.mask_mode_control)
+
+        self.ai_prompt_edit = QLineEdit()
+        self.ai_prompt_edit.setObjectName("object_generation_ai_prompt_edit")
+        self.ai_prompt_edit.setPlaceholderText("AI prompt (optional)")
+        self.ai_prompt_edit.setClearButtonEnabled(True)
+        self.ai_prompt_edit.setMaxLength(
+            MAX_IMAGE_TO_3D_TEXTURE_PROMPT_CHARACTERS
+        )
+        self.ai_prompt_edit.setMaximumWidth(240)
+        self.ai_prompt_edit.setToolTip(
+            "Optional texture direction for a direct, brand-new textured "
+            "Object Generate request. When staged unused-face removal is "
+            "enabled, the painted image must remain Meshy's sole Retexture "
+            "style source, so this prompt is not sent. It is also not sent "
+            "with Generate geometry or later image-reference Retexture jobs."
+        )
+        buttons_layout.addWidget(self.ai_prompt_edit)
 
         self.symmetric_division_checkbox = QCheckBox("Symmetric division")
         self.symmetric_division_checkbox.setObjectName(
@@ -5041,33 +4897,6 @@ class GenerationWorkspace(QWidget):
         )
         self.symmetric_division_checkbox.toggled.connect(self._sync_controls)
         buttons_layout.addWidget(self.symmetric_division_checkbox)
-
-        self.symmetric_division_orientation_combo = QComboBox()
-        self.symmetric_division_orientation_combo.setObjectName(
-            "symmetric_division_orientation_combo"
-        )
-        self.symmetric_division_orientation_combo.addItem(
-            "Vertical",
-            SYMMETRIC_DIVISION_ORIENTATION_VERTICAL,
-        )
-        self.symmetric_division_orientation_combo.addItem(
-            "Horizontal",
-            SYMMETRIC_DIVISION_ORIENTATION_HORIZONTAL,
-        )
-        self.symmetric_division_orientation_combo.setToolTip(
-            "Choose the axis of the automatic midpoint division."
-        )
-        buttons_layout.addWidget(self.symmetric_division_orientation_combo)
-
-        self.job_name_edit = QLineEdit()
-        self.job_name_edit.setObjectName("object_generation_job_name_edit")
-        self.job_name_edit.setPlaceholderText("Job name (optional)")
-        self.job_name_edit.setClearButtonEnabled(True)
-        self.job_name_edit.setMaximumWidth(190)
-        self.job_name_edit.setToolTip(
-            "Optionally name the next object or object-texture generation job."
-        )
-        buttons_layout.addWidget(self.job_name_edit)
 
         self.generate_button = QPushButton("Generate")
         self.generate_button.setMinimumHeight(38)
@@ -5102,20 +4931,6 @@ class GenerationWorkspace(QWidget):
         )
         buttons_layout.addWidget(self.generate_texture_button)
         self.regenerate_texture_button = self.generate_texture_button
-
-        self.undo_object_change_button = QPushButton("Undo")
-        self.undo_object_change_button.setObjectName(
-            "undo_object_change_button"
-        )
-        self.undo_object_change_button.setMinimumHeight(38)
-        self.undo_object_change_button.setToolTip(
-            "Restore the selected object to its state before the latest "
-            "texture generation or face deletion."
-        )
-        self.undo_object_change_button.clicked.connect(
-            self.undo_selected_object_change
-        )
-        buttons_layout.addWidget(self.undo_object_change_button)
 
         self.cancel_operation_button = QPushButton("Cancel")
         self.cancel_operation_button.setObjectName(
@@ -5161,88 +4976,13 @@ class GenerationWorkspace(QWidget):
         self._sync_face_selection_outputs()
 
     def _sync_face_selection_outputs(self) -> None:
-        """Synchronize the UV view, count, and deletion state from one source."""
+        """Synchronize face-dependent control state from the 3D view."""
 
-        selected_indices = self.result_view.get_selected_face_indices()
-        selected_count = len(selected_indices)
-        self.texture_view.set_selected_uv_face_indices(selected_indices)
-        self.face_selection_count_label.setText(
-            "No faces selected"
-            if selected_count == 0
-            else f"{selected_count:,} face"
-            + ("" if selected_count == 1 else "s")
-            + " selected"
-        )
         self._sync_controls()
-
-    @Slot(object)
-    def _handle_texture_uv_face_selection_requested(
-        self,
-        raw_request: object,
-    ) -> None:
-        """Apply a 2D UV hit through the authoritative 3D face selection."""
-
-        if not isinstance(raw_request, UvFaceSelectionRequest):
-            return
-        record = self._find_generated_object_record(self._selected_object_id)
-        expected_context_token = (
-            None
-            if record is None
-            else _build_object_face_selection_context_token(
-                record,
-                self._asset_directory,
-            )
-        )
-        if (
-            record is None
-            or self._object_has_active_mutation_job(record.object_id)
-            or not self.texture_view.uv_face_selection_enabled
-            or raw_request.context_token != expected_context_token
-            or self.texture_view.uv_face_selection_context_token
-            != expected_context_token
-        ):
-            self._sync_face_selection_outputs()
-            return
-        face_count = self.result_view.face_edit_face_count
-        hits = set(raw_request.face_indices)
-        if any(index < 0 or index >= face_count for index in hits):
-            self._sync_face_selection_outputs()
-            return
-        self.result_view.cancel_face_selection_interaction()
-        if not hits:
-            self._sync_face_selection_outputs()
-            return
-        self.result_view.update_face_selection(
-            hits,
-            mode=FACE_SELECTION_TOGGLE,
-        )
 
     @Slot()
     def _handle_delete_selected_faces_clicked(self) -> None:
         self.delete_selected_object_faces()
-
-    @Slot()
-    def _handle_delete_generated_object_clicked(self) -> None:
-        record = self._find_generated_object_record(self._selected_object_id)
-        if (
-            record is None
-            or self._object_has_active_mutation_job(record.object_id)
-        ):
-            return
-        response = QMessageBox.question(
-            self,
-            "Delete generated object",
-            f'Permanently delete "{record.object_name}", its embedded '
-            "textures, and its unreferenced local GLB revisions?",
-            (
-                QMessageBox.StandardButton.Yes
-                | QMessageBox.StandardButton.No
-            ),
-            QMessageBox.StandardButton.No,
-        )
-        if response != QMessageBox.StandardButton.Yes:
-            return
-        self.delete_generated_object(record.object_id)
 
     def _handle_seekbar_changed(self, frame_index: int) -> None:
         if self._is_syncing_seekbar:
@@ -5280,7 +5020,6 @@ class GenerationWorkspace(QWidget):
     @Slot(bool)
     def _handle_wireframe_toggled(self, enabled: bool) -> None:
         self.result_view.set_wireframe_enabled(enabled)
-        self.texture_view.set_uv_overlay_enabled(enabled)
 
     def _handle_video_strokes_changed(self, raw_strokes: object) -> None:
         if not isinstance(raw_strokes, list):
@@ -5322,18 +5061,6 @@ class GenerationWorkspace(QWidget):
             and is_valid_qt_object(runtime.thread)
             and isinstance(runtime.worker, GenerationWorker)
         )
-
-    @Slot(str)
-    def _handle_generation_progress(self, message: str) -> None:
-        """Compatibility handler for an explicitly connected legacy worker."""
-
-        operation = self._active_object_operation
-        sender = self.sender()
-        if sender is not None and sender is not self._generation_worker:
-            return
-        if operation is not None and operation.cancel_requested:
-            return
-        self.status_label.setText(str(message))
 
     @Slot(str, str)
     def _handle_job_generation_progress(
@@ -5876,7 +5603,7 @@ class GenerationWorkspace(QWidget):
         self._cache_generated_model(record, generated_model)
         self._selected_object_id = object_id
         self._generated_model = generated_model
-        self._refresh_generated_objects_list(object_id)
+        self._select_generated_object(object_id)
         self._record_operation_commit(
             OBJECT_OPERATION_GENERATE_MODEL,
             object_id,
@@ -5989,7 +5716,7 @@ class GenerationWorkspace(QWidget):
         )
         self._selected_object_id = saved.object_id
         self._generated_model = saved.preview_model
-        self._refresh_generated_objects_list(saved.object_id)
+        self._select_generated_object(saved.object_id)
         self._record_operation_commit(
             OBJECT_OPERATION_GENERATE_MODEL,
             saved.object_id,
@@ -6487,15 +6214,6 @@ class GenerationWorkspace(QWidget):
             return
         self.status_label.setText("Operation cancelled.")
 
-    @Slot()
-    def _handle_generation_thread_finished(self) -> None:
-        """Compatibility finish handler for a legacy single worker."""
-
-        runtime = self._legacy_active_job_runtime()
-        if runtime is None or self.sender() is not runtime.thread:
-            return
-        self._handle_object_job_thread_finished(runtime.operation_id)
-
     @Slot(str)
     def _handle_object_job_thread_finished(self, operation_id: str) -> None:
         runtime = self._object_job_runtimes.get(str(operation_id))
@@ -6571,10 +6289,6 @@ class GenerationWorkspace(QWidget):
             not geometry_only
             and self.symmetric_division_checkbox.isChecked()
         )
-        symmetric_division_orientation = str(
-            self.symmetric_division_orientation_combo.currentData()
-            or SYMMETRIC_DIVISION_ORIENTATION_VERTICAL
-        )
         projection_camera_percentages = (
             self.object_3d_panel.get_projection_camera_percentages()
         )
@@ -6601,12 +6315,13 @@ class GenerationWorkspace(QWidget):
             geometry_only=geometry_only,
             symmetric_division_enabled=symmetric_division_enabled,
             symmetric_division_orientation=(
-                symmetric_division_orientation
+                SYMMETRIC_DIVISION_ORIENTATION_VERTICAL
             ),
             projection_camera_percentages=(
                 projection_camera_percentages
             ),
             enabled_pbr_maps=self._get_enabled_pbr_maps(),
+            ai_prompt=self.ai_prompt_edit.text(),
         )
 
     def _build_texture_regeneration_request(
@@ -6709,19 +6424,6 @@ class GenerationWorkspace(QWidget):
         self._store_current_frame_strokes()
         return request
 
-    def _resolve_texture_regeneration_source_path(
-        self,
-        record: GeneratedObjectRecord,
-    ) -> Path:
-        """Resolve processed geometry, or a canonical existing textured GLB."""
-
-        source_path = self._resolve_meshy_asset_path(
-            _texture_regeneration_source_asset_path(record)
-        )
-        if not source_path.is_file():
-            raise ValueError("The model revision used for Retexture is missing.")
-        return source_path
-
     def _store_current_frame_strokes(self) -> None:
         self._store_displayed_frame_strokes()
 
@@ -6742,16 +6444,6 @@ class GenerationWorkspace(QWidget):
         metadata = self._data.video_metadata
         frame_count = 0 if metadata is None else metadata.frame_count
         self.seekbar.setRange(0, max(frame_count - 1, 0))
-        self._sync_frame_label()
-
-    def _sync_frame_label(self) -> None:
-        metadata = self._data.video_metadata
-        if metadata is None:
-            self.frame_label.setText("Frame 0 / 0")
-            return
-        self.frame_label.setText(
-            f"Frame {self._data.current_frame_index + 1} / {metadata.frame_count}"
-        )
 
     def _sync_seekbar_value(self, frame_index: int) -> None:
         self._is_syncing_seekbar = True
@@ -6774,15 +6466,16 @@ class GenerationWorkspace(QWidget):
                 selected_record.object_id
             )
         )
-        self.load_video_button.setEnabled(not has_untracked_legacy_job)
-        self.seekbar.setEnabled(has_video and not has_untracked_legacy_job)
         mask_tool_is_available = has_video and not has_untracked_legacy_job
-        self.paint_mask_button.setEnabled(mask_tool_is_available)
-        self.erase_mask_button.setEnabled(mask_tool_is_available)
-        self.brush_size_spinbox.setEnabled(mask_tool_is_available)
-        self.clear_mask_button.setEnabled(
-            has_video and has_mask and not has_untracked_legacy_job
-        )
+        if not self._shared_control_state_managed_externally:
+            self.load_video_button.setEnabled(not has_untracked_legacy_job)
+            self.seekbar.setEnabled(mask_tool_is_available)
+            self.paint_mask_button.setEnabled(mask_tool_is_available)
+            self.erase_mask_button.setEnabled(mask_tool_is_available)
+            self.brush_size_spinbox.setEnabled(mask_tool_is_available)
+            self.clear_mask_button.setEnabled(
+                mask_tool_is_available and has_mask
+            )
         required_key_is_available = bool(self._settings.meshy_api_key)
         projection_camera_percentages_are_valid = (
             not self._settings.use_uv_raycast_for_object_generation
@@ -6793,14 +6486,9 @@ class GenerationWorkspace(QWidget):
             not has_untracked_legacy_job
         )
         self.textures_checkbox.setEnabled(not has_untracked_legacy_job)
-        self.pbr_map_control.setEnabled(not has_untracked_legacy_job)
+        if not self._shared_control_state_managed_externally:
+            self.pbr_map_control.setEnabled(not has_untracked_legacy_job)
         self.wireframe_checkbox.setEnabled(not has_untracked_legacy_job)
-        self.generated_objects_list.setEnabled(not has_untracked_legacy_job)
-        self.texture_view.setEnabled(not has_untracked_legacy_job)
-        self.delete_generated_object_button.setEnabled(
-            selected_record is not None
-            and not selected_object_is_busy
-        )
         selected_face_count = len(
             self.result_view.get_selected_face_indices()
         )
@@ -6827,35 +6515,22 @@ class GenerationWorkspace(QWidget):
         self.result_view.set_face_editing_enabled(
             face_selection_is_available
         )
-        self.texture_view.set_uv_face_selection_enabled(
-            face_selection_is_available
-        )
         self.regenerate_texture_button.setEnabled(
             self._can_regenerate_object_texture(selected_record)
             and projection_camera_percentages_are_valid
         )
-        self.undo_object_change_button.setEnabled(
-            not selected_object_is_busy
-            and bool(
-                _get_object_operation_undo_stack(
-                    selected_record
-                )
-            )
-        )
 
-        self.cancel_operation_button.setEnabled(
-            self._active_object_operation is not None
-            and self._legacy_active_job_runtime() is not None
-            and not self._active_object_operation.cancel_requested
-        )
+        if not self._shared_control_state_managed_externally:
+            self.cancel_operation_button.setEnabled(
+                self._active_object_operation is not None
+                and self._legacy_active_job_runtime() is not None
+                and not self._active_object_operation.cancel_requested
+            )
         self.symmetric_division_checkbox.setEnabled(
             not has_untracked_legacy_job
         )
-        self.symmetric_division_orientation_combo.setEnabled(
-            not has_untracked_legacy_job
-            and self.symmetric_division_checkbox.isChecked()
-        )
-        self.job_name_edit.setEnabled(not has_untracked_legacy_job)
+        if not self._shared_control_state_managed_externally:
+            self.ai_prompt_edit.setEnabled(not has_untracked_legacy_job)
         self.generate_button.setEnabled(
             has_video
             and has_mask
@@ -6870,9 +6545,8 @@ class GenerationWorkspace(QWidget):
             and not self.symmetric_division_checkbox.isChecked()
             and not has_untracked_legacy_job
         )
-        self.video_view.set_interaction_enabled(
-            has_video and not has_untracked_legacy_job
-        )
+        if not self._shared_control_state_managed_externally:
+            self.video_view.set_interaction_enabled(mask_tool_is_available)
 
     def _selected_object_has_complete_texture_uvs(
         self,
@@ -6939,28 +6613,6 @@ class GenerationWorkspace(QWidget):
             return 0
         return min(max(int(frame_index), 0), metadata.frame_count - 1)
 
-    @Slot(QListWidgetItem, QListWidgetItem)
-    def _handle_generated_object_selection_changed(
-        self,
-        current_item: QListWidgetItem | None,
-        _previous_item: QListWidgetItem | None,
-    ) -> None:
-        if current_item is None:
-            self._selected_object_id = None
-            self._clear_generated_object_display()
-            self._sync_controls()
-            return
-        object_id = str(current_item.data(OBJECT_ID_ITEM_ROLE) or "")
-        record = self._find_generated_object_record(object_id)
-        if record is None:
-            self._selected_object_id = None
-            self._clear_generated_object_display()
-            self._sync_controls()
-            return
-        self._selected_object_id = object_id
-        self._display_generated_object(record)
-        self._sync_controls()
-
     def _rebuild_generated_objects(self) -> None:
         preferred_id = self._selected_object_id
         if self._find_generated_object_record(preferred_id) is None:
@@ -6969,81 +6621,35 @@ class GenerationWorkspace(QWidget):
                 if not self._data.generated_objects
                 else self._data.generated_objects[-1].object_id
             )
-        self._refresh_generated_objects_list(
+        self._select_generated_object(
             preferred_id,
             repair_missing_variant=True,
         )
 
-    def _refresh_generated_objects_list(
+    def _select_generated_object(
         self,
         selected_object_id: str | None,
         *,
         repair_missing_variant: bool = False,
-    ) -> None:
-        object_list = self.generated_objects_list
-        expected_rows = _build_generated_object_list_rows(
-            self._data.generated_objects
+    ) -> bool:
+        normalized_id = (
+            None
+            if selected_object_id is None
+            else str(selected_object_id).strip() or None
         )
-        current_rows = tuple(
-            (
-                str(
-                    object_list.item(row_index).data(
-                        OBJECT_ID_ITEM_ROLE
-                    )
-                    or ""
-                ),
-                object_list.item(row_index).text(),
-                object_list.item(row_index).toolTip(),
-            )
-            for row_index in range(object_list.count())
-        )
-        if current_rows != expected_rows:
-            was_blocked = object_list.blockSignals(True)
-            try:
-                object_list.clear()
-                for object_id, label, tooltip in expected_rows:
-                    item = QListWidgetItem(label)
-                    item.setData(OBJECT_ID_ITEM_ROLE, object_id)
-                    if tooltip:
-                        item.setToolTip(tooltip)
-                    object_list.addItem(item)
-            finally:
-                object_list.blockSignals(was_blocked)
-
-        selected_row = next(
-            (
-                row_index
-                for row_index in range(object_list.count())
-                if str(
-                    object_list.item(row_index).data(
-                        OBJECT_ID_ITEM_ROLE
-                    )
-                    or ""
-                )
-                == selected_object_id
-            ),
-            -1,
-        )
-        if object_list.currentRow() != selected_row:
-            was_blocked = object_list.blockSignals(True)
-            try:
-                object_list.setCurrentRow(selected_row)
-            finally:
-                object_list.blockSignals(was_blocked)
-
-        if selected_row < 0:
+        record = self._find_generated_object_record(normalized_id)
+        if record is None:
             self._selected_object_id = None
             self._clear_generated_object_display()
-            return
-        self._selected_object_id = selected_object_id
-        record = self._find_generated_object_record(selected_object_id)
-        if record is None:
-            self._clear_generated_object_display()
-            return
+            self._sync_controls()
+            return normalized_id is None
+        self._selected_object_id = record.object_id
         self._display_generated_object(
             record,
             repair_missing_variant=repair_missing_variant,
         )
+        self._sync_controls()
+        return True
 
     def _find_generated_object_record(
         self,
@@ -7068,28 +6674,16 @@ class GenerationWorkspace(QWidget):
     ) -> None:
         if repair_missing_variant:
             record = self._repair_missing_active_texture_variant(record)
-        self.glass_double_sided_checkbox.setChecked(
-            _resolve_glass_double_sided(record.pipeline, None)
-        )
         next_snapshot = _build_generated_object_display_snapshot(
             record,
             self._asset_directory,
-        )
-        selection_context_token = (
-            _build_object_face_selection_context_token(
-                record,
-                self._asset_directory,
-            )
         )
         if (
             next_snapshot == self._displayed_object_snapshot
             and self._generated_model is not None
             and self.result_view.model is self._generated_model
             and self.result_view.face_edit_face_count > 0
-            and self.texture_view.uv_face_selection_context_token
-            == selection_context_token
         ):
-            self._refresh_object_texture_atlases(record.object_id)
             self._sync_face_selection_outputs()
             return
         self._displayed_object_snapshot = None
@@ -7097,25 +6691,17 @@ class GenerationWorkspace(QWidget):
         self.result_view.cancel_transient_pointer_interactions()
         self.result_view.clear_model()
         self._sync_model_statistics(None)
-        self.texture_view.clear()
         try:
             generated_model = self._load_generated_object_model(record)
         except Exception as error:
             self.status_label.setText(
                 f"Saved generated object could not be rebuilt: {error}"
             )
-            self._refresh_object_texture_atlases(record.object_id)
             self._sync_face_selection_outputs()
             return
         next_snapshot = _build_generated_object_display_snapshot(
             record,
             self._asset_directory,
-        )
-        selection_context_token = (
-            _build_object_face_selection_context_token(
-                record,
-                self._asset_directory,
-            )
         )
         self._generated_model = generated_model
         self.result_view.set_model(generated_model)
@@ -7128,14 +6714,6 @@ class GenerationWorkspace(QWidget):
                 face_geometry.vertices,
                 face_geometry.faces,
             )
-            self.texture_view.set_uv_overlay_triangles(
-                face_geometry.uv_triangles
-            )
-            self.texture_view.set_uv_face_selection_geometry(
-                face_geometry.uv_triangles,
-                face_geometry.uv_face_indices,
-                context_token=selection_context_token,
-            )
         except Exception as error:
             self.status_label.setText(
                 f"This object's faces cannot be edited: {error}"
@@ -7146,9 +6724,6 @@ class GenerationWorkspace(QWidget):
             None if symmetry is None else symmetry.plane_coordinate,
         )
         self._sync_model_statistics(generated_model)
-        self._refresh_object_texture_atlases(
-            record.object_id,
-        )
         self._displayed_object_snapshot = next_snapshot
         self._sync_face_selection_outputs()
 
@@ -7212,7 +6787,6 @@ class GenerationWorkspace(QWidget):
             self._displayed_object_snapshot is None
             and self._generated_model is None
             and self.result_view.model is None
-            and not self.texture_view.entries
         ):
             self._sync_face_selection_outputs()
             return
@@ -7220,109 +6794,7 @@ class GenerationWorkspace(QWidget):
         self._generated_model = None
         self.result_view.clear_model()
         self._sync_model_statistics(None)
-        self.texture_view.clear()
         self._sync_face_selection_outputs()
-
-    def _refresh_object_texture_atlases(
-        self,
-        selected_object_id: str,
-    ) -> None:
-        record = self._find_generated_object_record(selected_object_id)
-        if record is None:
-            self.texture_view.clear()
-            return
-        entry_signature = _build_texture_resolution_entry_signature(
-            record,
-            self._asset_directory,
-        )
-        cached_entries = self._texture_resolution_entry_cache.get(
-            record.object_id
-        )
-        expected_entry_count = _count_available_texture_resolution_entries(
-            record,
-            self._asset_directory,
-        )
-        if (
-            cached_entries is not None
-            and cached_entries[0] == entry_signature
-            and len(cached_entries[1]) == expected_entry_count
-        ):
-            entries = list(cached_entries[1])
-        else:
-            entries = _build_texture_resolution_entries(
-                record,
-                self._asset_directory,
-            )
-            if len(entries) == expected_entry_count:
-                self._texture_resolution_entry_cache[record.object_id] = (
-                    entry_signature,
-                    tuple(entries),
-                )
-            else:
-                self._texture_resolution_entry_cache.pop(
-                    record.object_id,
-                    None,
-                )
-        selected_resolution = _get_selected_texture_resolution(record)
-        selected_entry_id = f"{record.object_id}:resolution:{selected_resolution}"
-        if not any(entry.atlas_id == selected_entry_id for entry in entries):
-            selected_entry_id = entries[0].atlas_id if entries else None
-
-        self._is_syncing_texture_resolution_view = True
-        try:
-            if tuple(entries) != self.texture_view.entries:
-                self.texture_view.set_atlases(
-                    entries,
-                    selected_atlas_id=selected_entry_id,
-                )
-            else:
-                self.texture_view.select_atlas(selected_entry_id)
-        finally:
-            self._is_syncing_texture_resolution_view = False
-
-    @Slot(object)
-    def _handle_texture_resolution_selected(self, raw_entry: object) -> None:
-        if self._is_syncing_texture_resolution_view:
-            return
-        if not isinstance(raw_entry, TextureAtlasEntry):
-            return
-        record = self._find_generated_object_record(raw_entry.owner_id)
-        if record is None:
-            return
-        resolution = _parse_texture_resolution_entry_id(
-            record.object_id,
-            raw_entry.atlas_id,
-        )
-        if _get_selected_texture_resolution(record) == resolution:
-            return
-        if self._request_global_texture_resolution_change(
-            record.object_id,
-            resolution,
-        ):
-            return
-        self.status_label.setText(
-            "The selected object texture resolution could not be applied "
-            "globally; the previous resolution was kept."
-        )
-        self._refresh_object_texture_atlases(record.object_id)
-
-    def _request_global_texture_resolution_change(
-        self,
-        object_id: str,
-        resolution: int,
-    ) -> bool:
-        """Commit through the host transaction, or locally when standalone."""
-
-        handler = self._texture_resolution_change_handler
-        if handler is None:
-            return self.select_object_texture_resolution(
-                object_id,
-                resolution,
-            )
-        try:
-            return bool(handler(object_id, resolution))
-        except Exception:
-            return False
 
     def _request_object_packing_change(
         self,
@@ -7361,7 +6833,7 @@ class GenerationWorkspace(QWidget):
                     )
             is_committed = False
             try:
-                self._refresh_generated_objects_list(selected_object_id)
+                self._select_generated_object(selected_object_id)
             except Exception:
                 return False
             return True
@@ -7395,7 +6867,7 @@ class GenerationWorkspace(QWidget):
                 )
             is_committed = True
             try:
-                self._refresh_generated_objects_list(selected_object_id)
+                self._select_generated_object(selected_object_id)
             except Exception:
                 restore_record()
                 return False
@@ -8710,23 +8182,6 @@ def _build_regenerated_texture_pipeline(
     return pipeline
 
 
-# ### UV preview helpers ###
-def _collect_model_uv_triangles(
-    model: GeneratedModel,
-) -> tuple[UvTriangle, ...]:
-    """Return UV triangles in the canonical editable-face traversal order."""
-
-    geometry = load_object_face_geometry(model.glb_bytes)
-    return tuple(
-        (
-            (float(triangle[0, 0]), float(triangle[0, 1])),
-            (float(triangle[1, 0]), float(triangle[1, 1])),
-            (float(triangle[2, 0]), float(triangle[2, 1])),
-        )
-        for triangle in geometry.uv_triangles
-    )
-
-
 # ### Generated-object asset helpers ###
 def _get_generated_object_asset_paths(
     record: GeneratedObjectRecord,
@@ -9472,22 +8927,6 @@ def _default_generation_asset_directory() -> Path:
 
 
 # ### Generated-object presentation helpers ###
-def _build_object_face_selection_context_token(
-    record: GeneratedObjectRecord,
-    asset_directory: Path,
-) -> tuple[object, ...]:
-    """Identify the exact object revision behind one selectable UV map."""
-
-    return (
-        record.object_id,
-        record.asset_path,
-        _build_generation_asset_revision(
-            asset_directory,
-            record.asset_path,
-        ),
-    )
-
-
 def _build_generated_object_display_snapshot(
     record: GeneratedObjectRecord,
     asset_directory: Path,
@@ -9527,90 +8966,7 @@ def _build_generation_asset_revision(
     )
 
 
-def _build_generated_object_list_rows(
-    records: Sequence[GeneratedObjectRecord],
-) -> tuple[tuple[str, str, str], ...]:
-    """Return the exact lightweight rows expected by the object selector."""
-
-    return tuple(
-        (
-            record.object_id,
-            f"#{object_index} {record.object_name} · "
-            f"frame {record.frame_index + 1}",
-            (
-                ""
-                if not record.provider_task_id
-                else f"Meshy task: {record.provider_task_id}"
-            ),
-        )
-        for object_index, record in enumerate(records, start=1)
-    )
-
-
-# ### Texture-atlas helpers ###
-def _build_texture_resolution_entry_signature(
-    record: GeneratedObjectRecord,
-    asset_directory: Path,
-) -> tuple[object, ...]:
-    """Snapshot variant metadata and cheap file revisions without decoding PNGs."""
-
-    raw_variants = record.pipeline.get(TEXTURE_VARIANTS_PIPELINE_KEY)
-    asset_root = asset_directory.resolve()
-    file_revisions: list[tuple[object, ...]] = []
-    for resolution in _selectable_texture_resolutions(record):
-        variant = _get_texture_variant_metadata(record, resolution)
-        if variant is None:
-            file_revisions.append((resolution, None))
-            continue
-        for path_key in (
-            TEXTURE_VARIANT_GLB_PATH_KEY,
-            TEXTURE_VARIANT_PNG_PATH_KEY,
-        ):
-            raw_path = variant[path_key]
-            try:
-                asset_path = (asset_directory / raw_path).resolve()
-                asset_path.relative_to(asset_root)
-                file_stat = asset_path.stat()
-                revision = (
-                    file_stat.st_size,
-                    file_stat.st_mtime_ns,
-                    file_stat.st_ctime_ns,
-                )
-            except (OSError, RuntimeError, ValueError):
-                revision = None
-            file_revisions.append(
-                (resolution, path_key, raw_path, revision)
-            )
-        raw_map_paths = variant[TEXTURE_VARIANT_MAP_PNG_PATHS_KEY]
-        assert isinstance(raw_map_paths, Mapping)
-        for map_type, raw_path in sorted(raw_map_paths.items()):
-            try:
-                map_asset_path = (asset_directory / str(raw_path)).resolve()
-                map_asset_path.relative_to(asset_root)
-                map_stat = map_asset_path.stat()
-                map_revision = (
-                    map_stat.st_size,
-                    map_stat.st_mtime_ns,
-                    map_stat.st_ctime_ns,
-                )
-            except (OSError, RuntimeError, ValueError):
-                map_revision = None
-            file_revisions.append(
-                (
-                    resolution,
-                    TEXTURE_VARIANT_MAP_PNG_PATHS_KEY,
-                    map_type,
-                    raw_path,
-                    map_revision,
-                )
-            )
-    return (
-        record.pipeline.get(FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY) is True,
-        copy.deepcopy(raw_variants),
-        tuple(file_revisions),
-    )
-
-
+# ### Texture-variant helpers ###
 def _get_selected_texture_resolution(record: GeneratedObjectRecord) -> int:
     raw_resolution = record.pipeline.get(
         SELECTED_TEXTURE_RESOLUTION_PIPELINE_KEY,
@@ -9655,99 +9011,6 @@ def _get_texture_variant_metadata(
         TEXTURE_VARIANT_PNG_PATH_KEY: png_path,
         TEXTURE_VARIANT_MAP_PNG_PATHS_KEY: map_paths,
     }
-
-
-def _build_texture_resolution_entries(
-    record: GeneratedObjectRecord,
-    asset_directory: Path,
-) -> list[TextureAtlasEntry]:
-    if record.pipeline.get(FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY) is True:
-        return []
-    entries: list[TextureAtlasEntry] = []
-    asset_root = asset_directory.resolve()
-    for resolution in _selectable_texture_resolutions(record):
-        variant = _get_texture_variant_metadata(record, resolution)
-        if variant is None:
-            continue
-        try:
-            image_path = (
-                asset_directory / variant[TEXTURE_VARIANT_PNG_PATH_KEY]
-            ).resolve()
-            glb_path = (
-                asset_directory / variant[TEXTURE_VARIANT_GLB_PATH_KEY]
-            ).resolve()
-            image_path.relative_to(asset_root)
-            glb_path.relative_to(asset_root)
-        except (OSError, RuntimeError, ValueError):
-            continue
-        if (
-            image_path.suffix.lower() != ".png"
-            or glb_path.suffix.lower() != ".glb"
-            or not image_path.is_file()
-            or not glb_path.is_file()
-        ):
-            continue
-        try:
-            entries.append(
-                TextureAtlasEntry(
-                    atlas_id=(
-                        f"{record.object_id}:resolution:{resolution}"
-                    ),
-                    display_name=f"{resolution} x {resolution}",
-                    image=image_path,
-                    owner_id=record.object_id,
-                )
-            )
-        except (OSError, TypeError, ValueError):
-            continue
-    return entries
-
-
-def _count_available_texture_resolution_entries(
-    record: GeneratedObjectRecord,
-    asset_directory: Path,
-) -> int:
-    """Count existing safe variant pairs without decoding their PNG pixels."""
-
-    entry_count = 0
-    asset_root = asset_directory.resolve()
-    for resolution in _selectable_texture_resolutions(record):
-        variant = _get_texture_variant_metadata(record, resolution)
-        if variant is None:
-            continue
-        try:
-            image_path = (
-                asset_directory / variant[TEXTURE_VARIANT_PNG_PATH_KEY]
-            ).resolve()
-            glb_path = (
-                asset_directory / variant[TEXTURE_VARIANT_GLB_PATH_KEY]
-            ).resolve()
-            image_path.relative_to(asset_root)
-            glb_path.relative_to(asset_root)
-        except (OSError, RuntimeError, ValueError):
-            continue
-        if (
-            image_path.suffix.lower() == ".png"
-            and glb_path.suffix.lower() == ".glb"
-            and image_path.is_file()
-            and glb_path.is_file()
-        ):
-            entry_count += 1
-    return entry_count
-
-
-def _parse_texture_resolution_entry_id(
-    object_id: str,
-    entry_id: str,
-) -> int:
-    prefix = f"{object_id}:resolution:"
-    if not str(entry_id).startswith(prefix):
-        return -1
-    try:
-        resolution = int(str(entry_id)[len(prefix):])
-    except ValueError:
-        return -1
-    return resolution if resolution in TEXTURE_RESOLUTIONS else -1
 
 
 # ### Model-statistics helpers ###

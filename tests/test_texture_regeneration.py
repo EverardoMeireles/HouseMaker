@@ -1862,7 +1862,7 @@ class TextureRegenerationUiTests(unittest.TestCase):
         self.assertTrue(self.workspace.regenerate_texture_button.isEnabled())
         self.assertEqual(self.workspace._selected_object_id, "second")
 
-        self.workspace.generated_objects_list.setCurrentRow(0)
+        self.assertTrue(self.workspace.select_generated_object("first"))
         self.assertEqual(self.workspace._selected_object_id, "first")
         self.assertTrue(self.workspace.regenerate_texture_button.isEnabled())
 
@@ -1883,10 +1883,10 @@ class TextureRegenerationUiTests(unittest.TestCase):
         self._paint_current_frame_mask()
         self.assertTrue(self.workspace.regenerate_texture_button.isEnabled())
 
-        self.workspace.generated_objects_list.setCurrentRow(-1)
+        self.assertTrue(self.workspace.select_generated_object(None))
         self.assertFalse(self.workspace.regenerate_texture_button.isEnabled())
 
-        self.workspace.generated_objects_list.setCurrentRow(0)
+        self.assertTrue(self.workspace.select_generated_object("valid"))
         self.assertTrue(self.workspace.regenerate_texture_button.isEnabled())
         self.workspace.video_view.clear_mask()
         self.assertFalse(self.workspace.regenerate_texture_button.isEnabled())
@@ -1924,7 +1924,9 @@ class TextureRegenerationUiTests(unittest.TestCase):
 
         self.assertTrue(self.workspace.regenerate_texture_button.isEnabled())
 
-    def test_external_mode_keeps_local_button_and_selected_id_current(self) -> None:
+    def test_object_tools_stay_below_preview_and_selection_remains_explicit(
+        self,
+    ) -> None:
         first = self._write_record("first")
         second = self._write_record("second")
         self._enable_meshy()
@@ -1940,15 +1942,14 @@ class TextureRegenerationUiTests(unittest.TestCase):
             1.0,
         )
 
-        self.workspace.set_external_3d_viewer_active(True)
         _qt_application.processEvents()
 
-        self.assertTrue(
-            self.workspace.object_3d_panel.is_external_presentation_active
+        self.assertFalse(
+            hasattr(self.workspace, "set_external_3d_viewer_active")
         )
-        self.assertIs(
-            self.workspace.right_view_stack.currentWidget(),
-            self.workspace.texture_view_page,
+        self.assertGreaterEqual(
+            self.workspace.object_3d_panel.details_panel.geometry().top(),
+            self.workspace.result_view.geometry().bottom(),
         )
         self.assertTrue(
             self.workspace.regenerate_texture_button.isVisibleTo(
@@ -1961,20 +1962,21 @@ class TextureRegenerationUiTests(unittest.TestCase):
             1.0,
         )
 
-        self.workspace.generated_objects_list.setCurrentRow(0)
+        self.assertTrue(self.workspace.select_generated_object("first"))
         self.assertEqual(self.workspace._selected_object_id, "first")
         self.assertTrue(self.workspace.regenerate_texture_button.isEnabled())
 
-        self.workspace.set_external_3d_viewer_active(False)
         _qt_application.processEvents()
 
         self.assertEqual(
             self.workspace.result_view.get_ambient_light_intensity(),
             1.0,
         )
-        self.assertIs(
-            self.workspace.right_view_stack.currentWidget(),
-            self.workspace.object_3d_page,
+        self.assertFalse(
+            hasattr(
+                self.workspace.object_3d_panel,
+                "is_external_presentation_active",
+            )
         )
 
 
@@ -2032,7 +2034,7 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
         record_index = self.workspace._data.generated_objects.index(record)
         self.workspace._data.generated_objects[record_index] = replacement
         selected_id = self.workspace._selected_object_id
-        self.workspace._refresh_generated_objects_list(selected_id)
+        self.workspace.select_generated_object(selected_id)
         return replacement
 
     def _load_reference(self, frame_index: int = 0) -> np.ndarray:
@@ -2141,7 +2143,7 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
         self.assertTrue(preflight.preserve_existing_glass)
         self.assertIsNone(preflight.glass_double_sided)
         self.assertFalse(
-            self.workspace.glass_double_sided_checkbox.isChecked()
+            hasattr(self.workspace, "glass_double_sided_checkbox")
         )
         materialized = _materialize_texture_regeneration_preflight(
             preflight,
@@ -2200,10 +2202,6 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
         self.assertEqual(
             self.workspace.result_view.model.glb_bytes,
             variants.glb_by_resolution[2048],
-        )
-        self.assertEqual(
-            self.workspace.texture_view.selected_atlas_id,
-            f"{record.object_id}:resolution:2048",
         )
         self.assertEqual(data_changed.count(), 1)
         self.assertEqual(content_changed.count(), 0)
@@ -2540,8 +2538,11 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
             ],
             retained_provenance={"geometry": "unchanged"},
         )
-        self.workspace.texture_view.select_atlas(
-            f"{original.object_id}:resolution:2048"
+        self.assertTrue(
+            self.workspace.select_object_texture_resolution(
+                original.object_id,
+                2048,
+            )
         )
         original = self.workspace.get_data().generated_objects[0]
         original_paths = _record_variant_paths(original)
@@ -2571,7 +2572,6 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
         self.workspace.set_texture_regenerator(regenerator)
         self.workspace.set_meshy_executor(executor)
         self.workspace.wireframe_checkbox.setChecked(True)
-        self.workspace.set_external_3d_viewer_active(True)
         changed = QSignalSpy(self.workspace.data_changed)
         completed = QSignalSpy(
             self.workspace.texture_regeneration_completed
@@ -2630,17 +2630,8 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
             self.workspace.result_view.model.glb_bytes,
             first_variants.glb_by_resolution[2048],
         )
-        self.assertEqual(len(self.workspace.texture_view.entries), 3)
-        self.assertEqual(
-            self.workspace.texture_view.selected_atlas_id,
-            f"{original.object_id}:resolution:2048",
-        )
-        self.assertTrue(self.workspace.texture_view.uv_overlay_enabled)
         self.assertTrue(self.workspace.result_view.get_wireframe_enabled())
-        self.assertIs(
-            self.workspace.right_view_stack.currentWidget(),
-            self.workspace.texture_view_page,
-        )
+        self.assertFalse(hasattr(self.workspace, "set_external_3d_viewer_active"))
 
         self.assertTrue(self.workspace.regenerate_selected_object_texture())
         self._wait_until_idle()
@@ -2688,8 +2679,11 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
             name="Chair",
             task_id="geometry-task",
         )
-        self.workspace.texture_view.select_atlas(
-            f"{original.object_id}:resolution:2048"
+        self.assertTrue(
+            self.workspace.select_object_texture_resolution(
+                original.object_id,
+                2048,
+            )
         )
         original = self.workspace.get_data().generated_objects[0]
         original_paths = _record_variant_paths(original)
@@ -2718,12 +2712,12 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
         generated = self.workspace.get_data().generated_objects[0]
         generated_paths = _record_variant_paths(generated)
         self.assertEqual(generated.provider_task_id, "texture-task")
-        self.assertTrue(self.workspace.undo_object_change_button.isEnabled())
         self.assertTrue(
             all(self.asset_directory.joinpath(path).is_file() for path in original_paths)
         )
 
-        self.assertTrue(self.workspace.undo_selected_object_change())
+        self.workspace.result_view.undo_requested.emit()
+        _qt_application.processEvents()
 
         restored = self.workspace.get_data().generated_objects[0]
         self.assertEqual(restored, original)
@@ -2737,7 +2731,7 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
         self.assertTrue(
             all(not self.asset_directory.joinpath(path).exists() for path in generated_paths)
         )
-        self.assertFalse(self.workspace.undo_object_change_button.isEnabled())
+        self.assertFalse(self.workspace.undo_selected_object_change())
         self.assertEqual(changed.count(), 2)
 
     def test_selection_change_during_task_updates_target_without_hijacking_view(
@@ -2753,7 +2747,9 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
             name="Second",
             task_id="second-task",
         )
-        self.workspace.generated_objects_list.setCurrentRow(0)
+        self.assertTrue(
+            self.workspace.select_generated_object(first.object_id)
+        )
         self.assertEqual(self.workspace._selected_object_id, first.object_id)
         first = self.workspace.get_data().generated_objects[0]
         second = self.workspace.get_data().generated_objects[1]
@@ -2772,14 +2768,15 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
         executor = _SequenceExecutor([_model_with_variants(new_variants)])
         self.workspace.set_texture_regenerator(regenerator)
         self.workspace.set_meshy_executor(executor)
-        self.workspace.set_external_3d_viewer_active(True)
         completed = QSignalSpy(
             self.workspace.texture_regeneration_completed
         )
 
         self.assertTrue(self.workspace.regenerate_selected_object_texture())
         self._wait_for_event(regenerator.started)
-        self.workspace.generated_objects_list.setCurrentRow(1)
+        self.assertTrue(
+            self.workspace.select_generated_object(second.object_id)
+        )
         self.assertEqual(self.workspace._selected_object_id, second.object_id)
         regenerator.release.set()
         self._wait_until_idle()

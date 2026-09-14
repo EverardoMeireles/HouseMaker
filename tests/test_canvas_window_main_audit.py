@@ -187,19 +187,9 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
         )
         assert self.workspace.viewer.undo_window_button is not None
         self.assertTrue(self.workspace.viewer.undo_window_button.isEnabled())
-        self.workspace.workspace_tabs.setCurrentWidget(
-            self.workspace.surface_texture_generation
-        )
-        _qt_application.processEvents()
-        self.assertIs(
-            self.workspace.surface_texture_generation.surface_view
-            .get_scene_model(),
-            model,
-        )
-        surface_wall = (
-            self.workspace.surface_texture_generation.surface_view.get_surface(
-                wall.surface_id
-            )
+        self.assertIsNone(self.workspace.surface_texture_generation.surface_view)
+        surface_wall = self.workspace.viewer._canvas_surface_targets.get(
+            wall.surface_id
         )
         self.assertIsNotNone(surface_wall)
         assert surface_wall is not None
@@ -214,14 +204,8 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
         self.assertEqual(level.windows, [])
         restored_wall = _get_target_wall(level)
         self.assertAlmostEqual(restored_wall.area_square_meters, 6.0)
-        self.workspace.workspace_tabs.setCurrentWidget(
-            self.workspace.surface_texture_generation
-        )
-        _qt_application.processEvents()
-        restored_surface_wall = (
-            self.workspace.surface_texture_generation.surface_view.get_surface(
-                wall.surface_id
-            )
+        restored_surface_wall = self.workspace.viewer._canvas_surface_targets.get(
+            wall.surface_id
         )
         self.assertIsNotNone(restored_surface_wall)
         assert restored_surface_wall is not None
@@ -554,13 +538,17 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
             "housemaker.main.resolve_fullscreen_3d_viewer_screen",
             return_value=screen,
         ):
-            self.workspace._apply_fullscreen_3d_viewer_screen("audit-screen")
+            self.workspace._apply_scene_3d_display_screen("audit-screen")
         _qt_application.processEvents()
 
-        host = self.workspace._external_viewer_host
+        host = self.workspace._external_scene_3d_host
         self.assertTrue(host.is_active)
-        self.assertIs(host.viewer, viewer)
-        self.assertIs(viewer.parentWidget(), host.window)
+        self.assertIs(host.viewer, self.workspace.scene_3d_workspace)
+        self.assertIs(
+            self.workspace.scene_3d_workspace.parentWidget(),
+            host.window,
+        )
+        self.assertIs(viewer.parentWidget(), self.workspace.scene_3d_workspace)
         self.assertTrue(viewer.isAncestorOf(panel))
         self.assertTrue(panel.isVisibleTo(host.window))
         self.assertGreaterEqual(panel.geometry().left(), viewer.view.width())
@@ -574,15 +562,15 @@ class CanvasWindowMainAuditTests(unittest.TestCase):
         viewer.cancel_window_placement(status_message=None)
         self.assertTrue(undo_button.isEnabled())
 
-        self.workspace._apply_fullscreen_3d_viewer_screen(None)
+        self.workspace._apply_scene_3d_display_screen(None)
         _qt_application.processEvents()
 
         self.assertFalse(host.is_active)
         self.assertIs(
-            self.workspace.canvas_viewer_tabs.widget(
-                self.workspace.canvas_3d_view_tab_index
+            self.workspace.workspace_tabs.widget(
+                self.workspace.scene_3d_workspace_tab_index
             ),
-            viewer,
+            self.workspace.scene_3d_workspace,
         )
         self.assertIs(viewer.window_tools_panel, panel)
         self.assertIs(viewer.undo_window_button, undo_button)
