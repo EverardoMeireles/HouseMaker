@@ -5,15 +5,40 @@ import json
 import math
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from housemaker.level_coordinates import level_image_to_world_xy
 from housemaker.models import (
+    DEFAULT_STAIR_NOSING_PLACEMENTS,
+    DEFAULT_STAIR_STARTING_STEP,
+    DEFAULT_STAIR_STARTING_STEP_EDGE_POINTS,
+    DEFAULT_STAIR_STARTING_STEP_EDGE_RADIUS_METERS,
+    DEFAULT_STAIR_TARGET_RISE_METERS,
+    DEFAULT_STAIR_TREAD_EDGE_PROFILE,
+    DEFAULT_STAIR_TREAD_EDGE_RADIUS_METERS,
+    DEFAULT_STAIR_TREAD_OVERHANG_METERS,
+    DEFAULT_STAIR_TREAD_THICKNESS_METERS,
+    STAIR_NOSING_FRONT,
+    STAIR_NOSING_LEFT,
+    STAIR_NOSING_RIGHT,
+    STAIR_STARTING_STEP_BULLNOSE,
+    STAIR_STARTING_STEP_CURTAIL,
+    STAIR_STARTING_STEP_NONE,
+    STAIR_STARTING_STEPS,
+    STAIR_STRINGER_BOTH,
+    STAIR_STRINGER_LEFT,
+    STAIR_STRINGER_NONE,
+    STAIR_STRINGER_PLACEMENTS,
     STAIR_STYLE_FLOATING,
     STAIR_STYLE_FLOATING_WITH_RISER,
     STAIR_STYLE_SUPPORTED,
+    STAIR_TREAD_EDGE_ROUNDED,
+    STAIR_TYPE_FLOATING,
+    STAIR_TYPE_SUPPORTED,
     StairData,
     StairSectionData,
+    calculate_stair_step_layout,
     create_default_levels,
 )
 from housemaker.project_io import load_project, save_project
@@ -105,6 +130,232 @@ def _curved_stair() -> StairData:
 
 # ### Stair model tests ###
 class StairDataTests(unittest.TestCase):
+    def test_parameterized_stair_round_trip_and_replace_preserve_identity(
+        self,
+    ) -> None:
+        stair = replace(
+            _supported_stair(),
+            stair_type=STAIR_TYPE_FLOATING,
+            target_rise_meters=0.19,
+            tread_thickness_meters=0.065,
+            tread_overhang_meters=0.04,
+            nosing_placements=(
+                STAIR_NOSING_LEFT,
+                STAIR_NOSING_RIGHT,
+                STAIR_NOSING_FRONT,
+            ),
+            tread_edge_profile=STAIR_TREAD_EDGE_ROUNDED,
+            tread_edge_radius_meters=0.025,
+            starting_step=STAIR_STARTING_STEP_CURTAIL,
+            starting_step_edge_radius_meters=0.18,
+            starting_step_edge_points=4,
+            stringer_placement=STAIR_STRINGER_LEFT,
+        )
+
+        restored = StairData.from_dict(stair.to_dict())
+
+        self.assertEqual(restored, stair)
+        self.assertEqual(stair.stair_type, STAIR_TYPE_FLOATING)
+        self.assertEqual(stair.style, STAIR_STYLE_FLOATING)
+        self.assertEqual(restored.stair_id, stair.stair_id)
+        self.assertEqual(len(stair.stair_id), 32)
+        self.assertEqual(stair.tread_edge_radius_meters, 0.025)
+        self.assertEqual(stair.starting_step, STAIR_STARTING_STEP_CURTAIL)
+        self.assertEqual(stair.starting_step_edge_radius_meters, 0.18)
+        self.assertEqual(stair.starting_step_edge_points, 4)
+        self.assertEqual(
+            stair.to_dict()["starting_step"],
+            STAIR_STARTING_STEP_CURTAIL,
+        )
+        self.assertEqual(
+            stair.to_dict()["nosing_placements"],
+            [STAIR_NOSING_LEFT, STAIR_NOSING_RIGHT, STAIR_NOSING_FRONT],
+        )
+
+    def test_nosing_placements_accept_empty_and_canonicalize_iterables(self) -> None:
+        without_nosing = replace(_supported_stair(), nosing_placements=[])
+        reordered = replace(
+            _supported_stair(),
+            nosing_placements=(
+                STAIR_NOSING_FRONT,
+                STAIR_NOSING_LEFT,
+                STAIR_NOSING_FRONT,
+            ),
+        )
+
+        self.assertEqual(without_nosing.nosing_placements, ())
+        self.assertEqual(
+            reordered.nosing_placements,
+            (STAIR_NOSING_LEFT, STAIR_NOSING_FRONT),
+        )
+
+    def test_starting_step_canonicalizes_and_enables_modern_layout(self) -> None:
+        stair = replace(
+            _supported_stair(),
+            starting_step="  BULLNOSE  ",
+        )
+
+        self.assertEqual(stair.starting_step, STAIR_STARTING_STEP_BULLNOSE)
+        self.assertFalse(stair.uses_legacy_part_layout)
+        self.assertEqual(
+            STAIR_STARTING_STEPS,
+            (
+                STAIR_STARTING_STEP_NONE,
+                STAIR_STARTING_STEP_BULLNOSE,
+                STAIR_STARTING_STEP_CURTAIL,
+            ),
+        )
+
+    def test_legacy_stair_defaults_keep_the_old_single_part_layout(self) -> None:
+        payload = _supported_stair().to_dict()
+        for field_name in (
+            "stair_id",
+            "stair_type",
+            "target_rise_meters",
+            "tread_thickness_meters",
+            "tread_overhang_meters",
+            "nosing_placements",
+            "tread_edge_profile",
+            "tread_edge_radius_meters",
+            "starting_step",
+            "starting_step_edge_radius_meters",
+            "starting_step_edge_points",
+            "stringer_placement",
+            "legacy_part_layout",
+        ):
+            payload.pop(field_name)
+
+        stair = StairData.from_dict(payload)
+
+        self.assertEqual(stair.stair_type, STAIR_TYPE_SUPPORTED)
+        self.assertEqual(stair.stringer_placement, STAIR_STRINGER_NONE)
+        self.assertEqual(
+            stair.target_rise_meters,
+            DEFAULT_STAIR_TARGET_RISE_METERS,
+        )
+        self.assertEqual(
+            stair.tread_thickness_meters,
+            DEFAULT_STAIR_TREAD_THICKNESS_METERS,
+        )
+        self.assertEqual(
+            stair.tread_overhang_meters,
+            DEFAULT_STAIR_TREAD_OVERHANG_METERS,
+        )
+        self.assertEqual(
+            stair.nosing_placements,
+            DEFAULT_STAIR_NOSING_PLACEMENTS,
+        )
+        self.assertEqual(
+            stair.tread_edge_profile,
+            DEFAULT_STAIR_TREAD_EDGE_PROFILE,
+        )
+        self.assertEqual(
+            stair.tread_edge_radius_meters,
+            DEFAULT_STAIR_TREAD_EDGE_RADIUS_METERS,
+        )
+        self.assertEqual(stair.starting_step, DEFAULT_STAIR_STARTING_STEP)
+        self.assertEqual(
+            stair.starting_step_edge_radius_meters,
+            DEFAULT_STAIR_STARTING_STEP_EDGE_RADIUS_METERS,
+        )
+        self.assertEqual(
+            stair.starting_step_edge_points,
+            DEFAULT_STAIR_STARTING_STEP_EDGE_POINTS,
+        )
+        self.assertTrue(stair.uses_legacy_part_layout)
+
+    def test_explicit_no_stringer_uses_modern_layout_and_round_trips(self) -> None:
+        modern_stair = StairData(
+            start_level_index=2,
+            start_x=0.0,
+            start_y=0.0,
+            end_level_index=3,
+            end_x=100.0,
+            end_y=0.0,
+            stringer_placement=STAIR_STRINGER_NONE,
+        )
+
+        restored = StairData.from_dict(modern_stair.to_dict())
+
+        self.assertIn(STAIR_STRINGER_NONE, STAIR_STRINGER_PLACEMENTS)
+        self.assertFalse(modern_stair.uses_legacy_part_layout)
+        self.assertFalse(restored.uses_legacy_part_layout)
+        self.assertFalse(restored.to_dict()["legacy_part_layout"])
+
+    def test_unmarked_no_stringer_payload_retains_legacy_layout(self) -> None:
+        payload = replace(
+            _supported_stair(),
+            stringer_placement=STAIR_STRINGER_NONE,
+            legacy_part_layout=False,
+        ).to_dict()
+        payload.pop("legacy_part_layout")
+
+        restored = StairData.from_dict(payload)
+
+        self.assertTrue(restored.uses_legacy_part_layout)
+
+    def test_step_layout_uses_nearest_count_and_an_even_actual_rise(self) -> None:
+        step_count, actual_rise = calculate_stair_step_layout(3.0, 0.19)
+
+        self.assertEqual(step_count, 16)
+        self.assertAlmostEqual(actual_rise, 0.1875)
+        self.assertAlmostEqual(step_count * actual_rise, 3.0)
+
+    def test_parameterized_stair_rejects_invalid_values(self) -> None:
+        valid_stair = _supported_stair()
+        invalid_changes = (
+            {"stair_type": "spiral"},
+            {"target_rise_meters": 0.0},
+            {"tread_thickness_meters": float("nan")},
+            {"tread_overhang_meters": -0.01},
+            {"nosing_placements": STAIR_NOSING_FRONT},
+            {"nosing_placements": (STAIR_NOSING_FRONT, "back")},
+            {"nosing_placements": (STAIR_NOSING_FRONT, 1)},
+            {"nosing_placements": None},
+            {"tread_edge_profile": "jagged"},
+            {"tread_edge_radius_meters": -0.01},
+            {"tread_edge_radius_meters": float("inf")},
+            {"starting_step": "winder"},
+            {"starting_step": None},
+            {"starting_step_edge_radius_meters": -0.01},
+            {"starting_step_edge_radius_meters": float("inf")},
+            {"starting_step_edge_points": 0},
+            {"starting_step_edge_points": 17},
+            {"starting_step_edge_points": 1.5},
+            {"starting_step_edge_points": True},
+            {"stringer_placement": "center"},
+            {"legacy_part_layout": "no"},
+            {"legacy_part_layout": None},
+            {"stair_id": "not-a-uuid"},
+        )
+
+        for changes in invalid_changes:
+            with self.subTest(changes=changes):
+                with self.assertRaises(ValueError):
+                    replace(valid_stair, **changes)
+
+    def test_new_stringer_configuration_removes_legacy_riser_variant(self) -> None:
+        legacy = _floating_with_riser_stair()
+
+        configured = replace(
+            legacy,
+            stringer_placement=STAIR_STRINGER_BOTH,
+        )
+        configured_without_stringer = replace(
+            legacy,
+            stringer_placement=STAIR_STRINGER_NONE,
+            legacy_part_layout=False,
+        )
+
+        self.assertEqual(configured.stair_type, STAIR_TYPE_FLOATING)
+        self.assertEqual(configured.style, STAIR_STYLE_FLOATING)
+        self.assertFalse(configured.has_legacy_riser_panels)
+        self.assertEqual(
+            configured_without_stringer.style,
+            STAIR_STYLE_FLOATING,
+        )
+        self.assertFalse(configured_without_stringer.has_legacy_riser_panels)
+
     def test_stair_round_trip_preserves_local_endpoints_and_style(self) -> None:
         stair = _supported_stair()
         legacy_payload = stair.to_dict()
@@ -222,6 +473,84 @@ class StairDataTests(unittest.TestCase):
 
 # ### Project persistence tests ###
 class StairProjectPersistenceTests(unittest.TestCase):
+    def test_duplicate_persisted_stair_ids_are_repaired_deterministically(self) -> None:
+        first = _supported_stair()
+        second = replace(
+            _floating_stair(),
+            stair_id=first.stair_id,
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project_path = Path(temporary_directory) / "duplicate-stair-ids.json"
+            save_project(
+                project_path,
+                current_level_index=2,
+                levels=create_default_levels(),
+                stairs=[first, second],
+            )
+
+            first_load = load_project(project_path)
+            second_load = load_project(project_path)
+
+        first_ids = tuple(stair.stair_id for stair in first_load.stairs)
+        second_ids = tuple(stair.stair_id for stair in second_load.stairs)
+        self.assertEqual(first_ids, second_ids)
+        self.assertEqual(len(first_ids), 2)
+        self.assertEqual(len(set(first_ids)), 2)
+        self.assertEqual(first_ids[0], first.stair_id)
+
+    def test_legacy_project_load_assigns_a_repeatable_stair_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            project_path = Path(temporary_directory) / "legacy-stairs.json"
+            save_project(
+                project_path,
+                current_level_index=2,
+                levels=create_default_levels(),
+                stairs=[_supported_stair()],
+            )
+            payload = json.loads(project_path.read_text(encoding="utf-8"))
+            for field_name in (
+                "stair_id",
+                "stair_type",
+                "target_rise_meters",
+                "tread_thickness_meters",
+                "tread_overhang_meters",
+                "nosing_placements",
+                "tread_edge_profile",
+                "tread_edge_radius_meters",
+                "starting_step",
+                "starting_step_edge_radius_meters",
+                "starting_step_edge_points",
+                "stringer_placement",
+                "legacy_part_layout",
+            ):
+                payload["stairs"][0].pop(field_name)
+            project_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            first_load = load_project(project_path)
+            second_load = load_project(project_path)
+
+        self.assertEqual(
+            first_load.stairs[0].stair_id,
+            second_load.stairs[0].stair_id,
+        )
+        self.assertEqual(len(first_load.stairs[0].stair_id), 32)
+        self.assertEqual(
+            first_load.stairs[0].nosing_placements,
+            DEFAULT_STAIR_NOSING_PLACEMENTS,
+        )
+        self.assertEqual(
+            first_load.stairs[0].starting_step,
+            DEFAULT_STAIR_STARTING_STEP,
+        )
+        self.assertEqual(
+            first_load.stairs[0].starting_step_edge_radius_meters,
+            DEFAULT_STAIR_STARTING_STEP_EDGE_RADIUS_METERS,
+        )
+        self.assertEqual(
+            first_load.stairs[0].starting_step_edge_points,
+            DEFAULT_STAIR_STARTING_STEP_EDGE_POINTS,
+        )
+
     def test_project_round_trip_preserves_supported_and_floating_stairs(
         self,
     ) -> None:
@@ -264,10 +593,7 @@ class StairProjectPersistenceTests(unittest.TestCase):
 
         self.assertEqual(
             payload["stairs"][0]["intermediate_sections"],
-            [
-                section.to_dict()
-                for section in stair.intermediate_sections
-            ],
+            [section.to_dict() for section in stair.intermediate_sections],
         )
         self.assertEqual(loaded_project.stairs, [stair])
 

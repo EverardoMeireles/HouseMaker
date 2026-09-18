@@ -38,6 +38,7 @@ from housemaker.settings_widget import (
     DEFAULT_AUTOMATIC_ATLAS_TEXTURE_RESOLUTION,
     DEFAULT_AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR,
     DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY,
+    DEFAULT_HIDE_STAIR_MESH_WHEN_PREVIEWING,
     DEFAULT_IGNORE_TOP_DOWN_CEILING,
     DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS,
     DEFAULT_MESHY_TARGET_POLYCOUNT,
@@ -48,6 +49,7 @@ from housemaker.settings_widget import (
     FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY,
     FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY,
     GENERATION_DISPLAY_SCREEN_SETTING_KEY,
+    HIDE_STAIR_MESH_WHEN_PREVIEWING_SETTING_KEY,
     IGNORE_TOP_DOWN_CEILING_SETTING_KEY,
     MAX_MESH_EDIT_UPDATE_DELAY_SECONDS,
     MAX_WALL_VERTEX_UPDATE_DELAY_SECONDS,
@@ -82,6 +84,7 @@ from housemaker.settings_widget import (
     read_canvas_3d_navigation_toggle_hotkey,
     read_first_person_navigation_mode,
     read_generation_display_screen_id,
+    read_hide_stair_mesh_when_previewing,
     read_ignore_top_down_ceiling,
     read_mesh_edit_update_delay_seconds,
     read_minimum_face_visibility_percentage,
@@ -329,6 +332,48 @@ class SettingsWidgetTests(unittest.TestCase):
                     self.assertTrue(
                         read_ignore_top_down_ceiling(application_settings)
                     )
+
+    def test_hide_stair_mesh_preview_defaults_persists_and_emits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = _build_test_settings(temporary_directory)
+            widget = SettingsWidget(application_settings=store, environment={})
+            checkbox = widget.hide_stair_mesh_when_previewing_checkbox
+            emitted: list[bool] = []
+            widget.settings_changed.connect(lambda: emitted.append(True))
+
+            self.assertTrue(DEFAULT_HIDE_STAIR_MESH_WHEN_PREVIEWING)
+            self.assertTrue(checkbox.isChecked())
+            self.assertTrue(widget.get_settings().hide_stair_mesh_when_previewing)
+            checkbox.setChecked(False)
+
+            self.assertFalse(store.get(HIDE_STAIR_MESH_WHEN_PREVIEWING_SETTING_KEY))
+            self.assertFalse(widget.get_settings().hide_stair_mesh_when_previewing)
+            self.assertEqual(emitted, [True])
+
+            restored = SettingsWidget(
+                application_settings=_build_test_settings(temporary_directory),
+                environment={},
+            )
+            self.assertFalse(
+                restored.get_settings().hide_stair_mesh_when_previewing
+            )
+            widget.dispose()
+            restored.dispose()
+
+    def test_hide_stair_mesh_preview_rejects_malformed_values(self) -> None:
+        for value in (0, 1, "true", None):
+            with self.subTest(model_value=value):
+                with self.assertRaisesRegex(ValueError, "Hide stair mesh"):
+                    GenerationServiceSettings(
+                        hide_stair_mesh_when_previewing=value  # type: ignore[arg-type]
+                    )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = _build_test_settings(temporary_directory)
+            for value in (0, 1, "true", None):
+                with self.subTest(persisted_value=value):
+                    store.set(HIDE_STAIR_MESH_WHEN_PREVIEWING_SETTING_KEY, value)
+                    self.assertTrue(read_hide_stair_mesh_when_previewing(store))
 
     def test_first_person_navigation_mode_rejects_malformed_values(
         self,

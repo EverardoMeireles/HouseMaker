@@ -11,20 +11,53 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 # ### Imports ###
+import trimesh
 from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtGui import QImage, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QWidget
 
 from housemaker.app_settings import ApplicationSettingsStore
+from housemaker.glb import (
+    STAIR_PART_SUPPORT,
+    STAIR_PART_TREADS,
+    GeneratedModel,
+    build_canvas_stair_part_targets,
+)
 from housemaker.main import BlueprintWorkspace
 from housemaker.models import (
+    DEFAULT_STAIR_NOSING_PLACEMENTS,
+    DEFAULT_STAIR_STARTING_STEP,
+    DEFAULT_STAIR_STARTING_STEP_EDGE_POINTS,
+    DEFAULT_STAIR_STARTING_STEP_EDGE_RADIUS_METERS,
+    DEFAULT_STAIR_TARGET_RISE_METERS,
+    DEFAULT_STAIR_TREAD_EDGE_RADIUS_METERS,
+    DEFAULT_STAIR_TREAD_OVERHANG_METERS,
+    DEFAULT_STAIR_TREAD_THICKNESS_METERS,
     GROUND_LEVEL_INDEX,
+    MAX_STAIR_STARTING_STEP_EDGE_POINTS,
+    MIN_STAIR_STARTING_STEP_EDGE_POINTS,
+    STAIR_NOSING_FRONT,
+    STAIR_NOSING_LEFT,
+    STAIR_NOSING_RIGHT,
+    STAIR_STARTING_STEP_BULLNOSE,
+    STAIR_STARTING_STEP_CURTAIL,
+    STAIR_STARTING_STEP_NONE,
+    STAIR_STRINGER_BOTH,
+    STAIR_STRINGER_LEFT,
+    STAIR_STRINGER_NONE,
+    STAIR_STRINGER_RIGHT,
     STAIR_STYLE_FLOATING,
-    STAIR_STYLE_FLOATING_WITH_RISER,
+    STAIR_TREAD_EDGE_ROUNDED,
+    STAIR_TREAD_EDGE_STRAIGHT,
+    STAIR_TYPE_FLOATING,
+    STAIR_TYPE_SUPPORTED,
     StairData,
 )
-
+from housemaker.surface_texture_state import (
+    SurfaceTextureAssignment,
+    SurfaceTextureData,
+)
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -71,6 +104,27 @@ def _add_wall_segment(
     )
 
 
+def _make_editable_stair(**changes: object) -> StairData:
+    """Return one modern stair with semantic parts for editor tests."""
+
+    values: dict[str, object] = {
+        "start_level_index": GROUND_LEVEL_INDEX,
+        "start_a_x": 20.0,
+        "start_a_y": 30.0,
+        "start_b_x": 50.0,
+        "start_b_y": 30.0,
+        "end_level_index": GROUND_LEVEL_INDEX + 1,
+        "end_a_x": 20.0,
+        "end_a_y": 70.0,
+        "end_b_x": 50.0,
+        "end_b_y": 70.0,
+        "stair_type": STAIR_TYPE_SUPPORTED,
+        "stringer_placement": STAIR_STRINGER_BOTH,
+    }
+    values.update(changes)
+    return StairData(**values)
+
+
 def _send_wheel_event(widget: QWidget, delta: int) -> QWheelEvent:
     """Send one vertical wheel step to a visible widget."""
 
@@ -109,11 +163,16 @@ class StairMainIntegrationTests(unittest.TestCase):
         _qt_application.processEvents()
         self._temporary_directory.cleanup()
 
-    def test_add_stairs_uses_two_levels_and_commits_the_selected_style(self) -> None:
+    def test_add_stairs_uses_two_levels_and_commits_the_selected_type(self) -> None:
         _add_wall_segment(self.workspace, (20.0, 35.0), (45.0, 35.0))
         _make_current_canvas_clickable(self.workspace)
-        self.workspace.stair_style_combo.setCurrentIndex(
-            self.workspace.stair_style_combo.findData(STAIR_STYLE_FLOATING)
+        self.workspace.stair_type_combo.setCurrentIndex(
+            self.workspace.stair_type_combo.findData(STAIR_TYPE_FLOATING)
+        )
+        self.workspace.stair_starting_step_combo.setCurrentIndex(
+            self.workspace.stair_starting_step_combo.findData(
+                STAIR_STARTING_STEP_CURTAIL
+            )
         )
 
         with patch("housemaker.main.QMessageBox.information"):
@@ -122,6 +181,7 @@ class StairMainIntegrationTests(unittest.TestCase):
         self.assertTrue(self.workspace.canvas.is_stair_placement_active())
         self.assertIsNone(self.workspace.canvas.get_pending_stair_placement())
         self.assertFalse(self.workspace.add_stairs_button.isEnabled())
+        self.assertFalse(self.workspace.stair_starting_step_combo.isEnabled())
 
         QTest.mouseClick(
             self.workspace.canvas,
@@ -172,9 +232,12 @@ class StairMainIntegrationTests(unittest.TestCase):
         _qt_application.processEvents()
 
         self.assertFalse(self.workspace.canvas.is_stair_placement_active())
+        self.assertTrue(self.workspace.stair_starting_step_combo.isEnabled())
         self.assertEqual(len(self.workspace.stairs), 1)
         stair = self.workspace.stairs[0]
+        self.assertEqual(stair.stair_type, STAIR_TYPE_FLOATING)
         self.assertEqual(stair.style, STAIR_STYLE_FLOATING)
+        self.assertEqual(stair.starting_step, STAIR_STARTING_STEP_CURTAIL)
         self.assertEqual(stair.start_level_index, GROUND_LEVEL_INDEX)
         self.assertEqual(stair.end_level_index, destination_level_index)
         self.assertFalse(hasattr(self.workspace, "stairs_list"))
@@ -191,19 +254,20 @@ class StairMainIntegrationTests(unittest.TestCase):
             viewer_model.scene.geometry,  # type: ignore[union-attr]
         )
 
-    def test_stair_style_combo_offers_floating_with_riser(self) -> None:
-        style_index = self.workspace.stair_style_combo.findData(
-            STAIR_STYLE_FLOATING_WITH_RISER
-        )
+    def test_stair_type_combo_offers_only_supported_and_floating(self) -> None:
+        combo = self.workspace.stair_type_combo
 
-        self.assertGreaterEqual(style_index, 0)
         self.assertEqual(
-            self.workspace.stair_style_combo.itemText(style_index),
-            "Floating with riser",
+            tuple(combo.itemData(index) for index in range(combo.count())),
+            (STAIR_TYPE_SUPPORTED, STAIR_TYPE_FLOATING),
+        )
+        self.assertEqual(
+            tuple(combo.itemText(index) for index in range(combo.count())),
+            ("Supported", "Floating"),
         )
 
-    def test_stair_style_combo_ignores_wheel_and_accepts_keyboard(self) -> None:
-        combo = self.workspace.stair_style_combo
+    def test_stair_type_combo_ignores_wheel_and_accepts_keyboard(self) -> None:
+        combo = self.workspace.stair_type_combo
         combo.setCurrentIndex(0)
 
         wheel_event = _send_wheel_event(combo, -120)
@@ -214,12 +278,21 @@ class StairMainIntegrationTests(unittest.TestCase):
         combo.setFocus(Qt.FocusReason.OtherFocusReason)
         QTest.keyClick(combo, Qt.Key.Key_Down)
 
-        self.assertEqual(combo.currentData(), STAIR_STYLE_FLOATING)
+        self.assertEqual(combo.currentData(), STAIR_TYPE_FLOATING)
 
-    def test_stair_style_combo_accepts_popup_clicks(self) -> None:
-        combo = self.workspace.stair_style_combo
+    def test_starting_step_combo_ignores_wheel_input(self) -> None:
+        combo = self.workspace.stair_starting_step_combo
+        combo.setCurrentIndex(combo.findData(STAIR_STARTING_STEP_NONE))
+
+        wheel_event = _send_wheel_event(combo, -120)
+
+        self.assertTrue(wheel_event.isAccepted())
+        self.assertEqual(combo.currentData(), STAIR_STARTING_STEP_NONE)
+
+    def test_stair_type_combo_accepts_popup_clicks(self) -> None:
+        combo = self.workspace.stair_type_combo
         combo.setCurrentIndex(0)
-        target_index = combo.model().index(2, 0)
+        target_index = combo.model().index(1, 0)
         combo.showPopup()
         _qt_application.processEvents()
 
@@ -232,7 +305,794 @@ class StairMainIntegrationTests(unittest.TestCase):
 
         self.assertEqual(
             combo.currentData(),
-            STAIR_STYLE_FLOATING_WITH_RISER,
+            STAIR_TYPE_FLOATING,
+        )
+
+    def test_stair_editor_uses_centimeters_and_constrained_choices(self) -> None:
+        self.assertEqual(
+            self.workspace.stair_step_rise_target_spinbox.value(),
+            DEFAULT_STAIR_TARGET_RISE_METERS * 100.0,
+        )
+        self.assertEqual(
+            self.workspace.stair_tread_thickness_spinbox.value(),
+            DEFAULT_STAIR_TREAD_THICKNESS_METERS * 100.0,
+        )
+        self.assertEqual(
+            self.workspace.stair_nosing_overhang_spinbox.value(),
+            DEFAULT_STAIR_TREAD_OVERHANG_METERS * 100.0,
+        )
+        self.assertEqual(
+            self.workspace.stair_tread_edge_radius_spinbox.value(),
+            DEFAULT_STAIR_TREAD_EDGE_RADIUS_METERS * 100.0,
+        )
+        self.assertFalse(
+            self.workspace.stair_tread_edge_radius_spinbox.isEnabled()
+        )
+        self.assertFalse(self.workspace.stair_tread_edge_radius_label.isEnabled())
+        self.assertFalse(self.workspace.stair_nosing_left_checkbox.isChecked())
+        self.assertFalse(self.workspace.stair_nosing_right_checkbox.isChecked())
+        self.assertTrue(self.workspace.stair_nosing_front_checkbox.isChecked())
+        self.assertEqual(
+            self.workspace._read_stair_editor_parameters().nosing_placements,
+            DEFAULT_STAIR_NOSING_PLACEMENTS,
+        )
+        self.assertEqual(
+            self.workspace.stair_starting_step_combo.currentData(),
+            DEFAULT_STAIR_STARTING_STEP,
+        )
+        self.assertEqual(
+            self.workspace.stair_starting_step_edge_radius_spinbox.value(),
+            DEFAULT_STAIR_STARTING_STEP_EDGE_RADIUS_METERS * 100.0,
+        )
+        self.assertEqual(
+            self.workspace.stair_starting_step_edge_points_spinbox.value(),
+            DEFAULT_STAIR_STARTING_STEP_EDGE_POINTS,
+        )
+        self.assertEqual(
+            self.workspace.stair_starting_step_edge_points_spinbox.minimum(),
+            MIN_STAIR_STARTING_STEP_EDGE_POINTS,
+        )
+        self.assertEqual(
+            self.workspace.stair_starting_step_edge_points_spinbox.maximum(),
+            MAX_STAIR_STARTING_STEP_EDGE_POINTS,
+        )
+        self.assertFalse(
+            self.workspace.stair_starting_step_edge_radius_spinbox.isEnabled()
+        )
+        self.assertFalse(
+            self.workspace.stair_starting_step_edge_radius_label.isEnabled()
+        )
+        self.assertFalse(
+            self.workspace.stair_starting_step_edge_points_spinbox.isEnabled()
+        )
+        self.assertFalse(
+            self.workspace.stair_starting_step_edge_points_label.isEnabled()
+        )
+        self.assertIn(
+            "clamped",
+            self.workspace.stair_starting_step_edge_radius_spinbox.toolTip(),
+        )
+        self.assertIn(
+            "clamped",
+            self.workspace.stair_tread_edge_radius_spinbox.toolTip(),
+        )
+        self.assertIn(
+            "matching point on each side",
+            self.workspace.stair_starting_step_edge_points_spinbox.toolTip(),
+        )
+        self.assertEqual(
+            self.workspace._stair_preview_update_timer.interval(),
+            35,
+        )
+        self.assertIn(
+            "actual rise is adjusted",
+            self.workspace.stair_step_rise_target_spinbox.toolTip(),
+        )
+        for spinbox in (
+            self.workspace.stair_step_rise_target_spinbox,
+            self.workspace.stair_tread_thickness_spinbox,
+            self.workspace.stair_nosing_overhang_spinbox,
+            self.workspace.stair_tread_edge_radius_spinbox,
+            self.workspace.stair_starting_step_edge_radius_spinbox,
+        ):
+            self.assertEqual(spinbox.suffix(), " cm")
+        self.assertEqual(
+            tuple(
+                self.workspace.stair_tread_edge_combo.itemData(index)
+                for index in range(self.workspace.stair_tread_edge_combo.count())
+            ),
+            (STAIR_TREAD_EDGE_STRAIGHT, STAIR_TREAD_EDGE_ROUNDED),
+        )
+        self.assertEqual(
+            tuple(
+                self.workspace.stair_stringer_placement_combo.itemData(index)
+                for index in range(
+                    self.workspace.stair_stringer_placement_combo.count()
+                )
+            ),
+            (
+                STAIR_STRINGER_NONE,
+                STAIR_STRINGER_LEFT,
+                STAIR_STRINGER_RIGHT,
+                STAIR_STRINGER_BOTH,
+            ),
+        )
+        self.assertEqual(
+            tuple(
+                self.workspace.stair_starting_step_combo.itemData(index)
+                for index in range(
+                    self.workspace.stair_starting_step_combo.count()
+                )
+            ),
+            (
+                STAIR_STARTING_STEP_NONE,
+                STAIR_STARTING_STEP_BULLNOSE,
+                STAIR_STARTING_STEP_CURTAIL,
+            ),
+        )
+        self.assertEqual(
+            tuple(
+                self.workspace.stair_starting_step_combo.itemText(index)
+                for index in range(
+                    self.workspace.stair_starting_step_combo.count()
+                )
+            ),
+            ("None", "Bullnose", "Curtail"),
+        )
+
+        rounded_index = self.workspace.stair_tread_edge_combo.findData(
+            STAIR_TREAD_EDGE_ROUNDED
+        )
+        self.workspace.stair_tread_edge_combo.setCurrentIndex(rounded_index)
+        self.assertTrue(
+            self.workspace.stair_tread_edge_radius_spinbox.isEnabled()
+        )
+        self.assertTrue(self.workspace.stair_tread_edge_radius_label.isEnabled())
+        self.workspace.stair_tread_edge_radius_spinbox.setValue(2.5)
+        self.assertAlmostEqual(
+            self.workspace._read_stair_editor_parameters().tread_edge_radius_meters,
+            0.025,
+        )
+
+        straight_index = self.workspace.stair_tread_edge_combo.findData(
+            STAIR_TREAD_EDGE_STRAIGHT
+        )
+        self.workspace.stair_tread_edge_combo.setCurrentIndex(straight_index)
+        self.assertFalse(
+            self.workspace.stair_tread_edge_radius_spinbox.isEnabled()
+        )
+        self.assertFalse(self.workspace.stair_tread_edge_radius_label.isEnabled())
+
+        bullnose_index = self.workspace.stair_starting_step_combo.findData(
+            STAIR_STARTING_STEP_BULLNOSE
+        )
+        self.workspace.stair_starting_step_combo.setCurrentIndex(bullnose_index)
+        self.assertTrue(
+            self.workspace.stair_starting_step_edge_radius_spinbox.isEnabled()
+        )
+        self.assertTrue(
+            self.workspace.stair_starting_step_edge_radius_label.isEnabled()
+        )
+        self.assertTrue(
+            self.workspace.stair_starting_step_edge_points_spinbox.isEnabled()
+        )
+        self.assertTrue(
+            self.workspace.stair_starting_step_edge_points_label.isEnabled()
+        )
+        self.workspace.stair_starting_step_edge_radius_spinbox.setValue(18.0)
+        self.workspace.stair_starting_step_edge_points_spinbox.setValue(4)
+        self.assertAlmostEqual(
+            self.workspace._read_stair_editor_parameters().starting_step_edge_radius_meters,
+            0.18,
+        )
+        self.assertEqual(
+            self.workspace._read_stair_editor_parameters().starting_step_edge_points,
+            4,
+        )
+
+        none_index = self.workspace.stair_starting_step_combo.findData(
+            STAIR_STARTING_STEP_NONE
+        )
+        self.workspace.stair_starting_step_combo.setCurrentIndex(none_index)
+        self.assertFalse(
+            self.workspace.stair_starting_step_edge_radius_spinbox.isEnabled()
+        )
+        self.assertFalse(
+            self.workspace.stair_starting_step_edge_radius_label.isEnabled()
+        )
+        self.assertFalse(
+            self.workspace.stair_starting_step_edge_points_spinbox.isEnabled()
+        )
+        self.assertFalse(
+            self.workspace.stair_starting_step_edge_points_label.isEnabled()
+        )
+
+    def test_selecting_any_stair_part_loads_owner_and_survives_refresh(self) -> None:
+        stair = _make_editable_stair(
+            stair_type=STAIR_TYPE_FLOATING,
+            target_rise_meters=0.2,
+            tread_thickness_meters=0.12,
+            tread_overhang_meters=0.04,
+            nosing_placements=(STAIR_NOSING_LEFT, STAIR_NOSING_RIGHT),
+            tread_edge_profile=STAIR_TREAD_EDGE_ROUNDED,
+            tread_edge_radius_meters=0.025,
+            starting_step=STAIR_STARTING_STEP_BULLNOSE,
+            starting_step_edge_radius_meters=0.18,
+            starting_step_edge_points=5,
+            stringer_placement=STAIR_STRINGER_NONE,
+        )
+        self.workspace.stairs = [stair]
+        self.workspace.canvas.set_stair_context(
+            self.workspace.stairs,
+            self.workspace.current_level,
+        )
+        self.workspace._set_canvas_viewer_targets(())
+        semantic_id = next(iter(self.workspace._canvas_stair_part_targets_by_id))
+
+        self.assertTrue(
+            self.workspace.viewer.select_canvas_stair_part_target(semantic_id)
+        )
+
+        self.assertEqual(self.workspace._editing_stair_index, 0)
+        self.assertEqual(
+            self.workspace.stair_type_combo.currentData(),
+            STAIR_TYPE_FLOATING,
+        )
+        self.assertEqual(
+            self.workspace.stair_tread_edge_combo.currentData(),
+            STAIR_TREAD_EDGE_ROUNDED,
+        )
+        self.assertEqual(
+            self.workspace.stair_starting_step_combo.currentData(),
+            STAIR_STARTING_STEP_BULLNOSE,
+        )
+        self.assertEqual(
+            self.workspace.stair_stringer_placement_combo.currentData(),
+            STAIR_STRINGER_NONE,
+        )
+        self.assertTrue(
+            self.workspace.stair_tread_edge_radius_spinbox.isEnabled()
+        )
+        self.assertAlmostEqual(
+            self.workspace.stair_tread_edge_radius_spinbox.value(),
+            2.5,
+        )
+        self.assertAlmostEqual(
+            self.workspace.stair_starting_step_edge_radius_spinbox.value(),
+            18.0,
+        )
+        self.assertEqual(
+            self.workspace.stair_starting_step_edge_points_spinbox.value(),
+            5,
+        )
+        self.assertTrue(self.workspace.stair_nosing_left_checkbox.isChecked())
+        self.assertTrue(self.workspace.stair_nosing_right_checkbox.isChecked())
+        self.assertFalse(self.workspace.stair_nosing_front_checkbox.isChecked())
+        self.assertEqual(
+            self.workspace.surface_texture_generation.get_selected_surface_ids(),
+            (semantic_id,),
+        )
+        self.assertEqual(
+            self.workspace._atlas_surface_assignment_target_ids,
+            (semantic_id,),
+        )
+        self.assertNotEqual(
+            self.workspace.stair_calculated_step_count_label.text(),
+            "—",
+        )
+        self.assertTrue(
+            self.workspace.stair_actual_rise_label.text().endswith(" cm")
+        )
+
+        self.workspace._set_canvas_viewer_targets(())
+
+        self.assertEqual(
+            self.workspace.viewer.get_selected_canvas_stair_part_ids(),
+            (semantic_id,),
+        )
+        self.assertEqual(
+            self.workspace._atlas_surface_assignment_target_ids,
+            (semantic_id,),
+        )
+        self.assertEqual(self.workspace._editing_stair_index, 0)
+
+        self.workspace._set_atlas_canvas_surface_highlights((semantic_id,))
+
+        self.assertEqual(
+            self.workspace.viewer.get_highlighted_canvas_stair_part_ids(),
+            (semantic_id,),
+        )
+        self.assertEqual(
+            self.workspace.viewer.get_highlighted_canvas_surface_ids(),
+            (),
+        )
+
+    def test_stair_changes_preview_then_apply_as_one_undo_action(self) -> None:
+        original = _make_editable_stair(tread_thickness_meters=0.08)
+        self.workspace.stairs = [original]
+        self.workspace._set_canvas_viewer_targets(())
+        semantic_id = next(iter(self.workspace._canvas_stair_part_targets_by_id))
+        self.workspace.viewer.select_canvas_stair_part_target(semantic_id)
+        self.assertEqual(
+            self.workspace.add_stairs_button.text(),
+            "Apply changes to stair",
+        )
+        self.assertFalse(self.workspace.add_stairs_button.isEnabled())
+
+        with patch("housemaker.main.build_stair_meshes") as redundant_build:
+            self.workspace.stair_tread_thickness_spinbox.setValue(12.0)
+            self.workspace.stair_nosing_left_checkbox.setChecked(True)
+            self.workspace.stair_nosing_front_checkbox.setChecked(False)
+            self.workspace.stair_tread_edge_combo.setCurrentIndex(
+                self.workspace.stair_tread_edge_combo.findData(
+                    STAIR_TREAD_EDGE_ROUNDED
+                )
+            )
+            self.workspace.stair_tread_edge_radius_spinbox.setValue(2.0)
+            self.workspace.stair_starting_step_combo.setCurrentIndex(
+                self.workspace.stair_starting_step_combo.findData(
+                    STAIR_STARTING_STEP_CURTAIL
+                )
+            )
+            self.workspace.stair_starting_step_edge_points_spinbox.setValue(6)
+            self.workspace.stair_stringer_placement_combo.setCurrentIndex(
+                self.workspace.stair_stringer_placement_combo.findData(
+                    STAIR_STRINGER_NONE
+                )
+            )
+
+            self.assertEqual(self.workspace.stairs, [original])
+            self.assertTrue(self.workspace._stair_preview_update_timer.isActive())
+            self.assertEqual(
+                self.workspace.add_stairs_button.text(),
+                "Apply changes to stair",
+            )
+
+            QTest.qWait(80)
+            _qt_application.processEvents()
+            redundant_build.assert_not_called()
+
+        self.assertIsNotNone(self.workspace._staged_stair)
+        self.assertEqual(
+            self.workspace.viewer._canvas_stair_preview_stair_index,
+            0,
+        )
+        self.workspace.add_stairs_button.click()
+
+        self.assertEqual(
+            self.workspace.stairs[0].tread_thickness_meters,
+            0.12,
+        )
+        self.assertEqual(
+            self.workspace.stairs[0].nosing_placements,
+            (STAIR_NOSING_LEFT,),
+        )
+        self.assertEqual(
+            self.workspace.stairs[0].tread_edge_profile,
+            STAIR_TREAD_EDGE_ROUNDED,
+        )
+        self.assertAlmostEqual(
+            self.workspace.stairs[0].tread_edge_radius_meters,
+            0.02,
+        )
+        self.assertEqual(
+            self.workspace.stairs[0].starting_step,
+            STAIR_STARTING_STEP_CURTAIL,
+        )
+        self.assertEqual(self.workspace.stairs[0].starting_step_edge_points, 6)
+        self.assertEqual(
+            self.workspace.stairs[0].stringer_placement,
+            STAIR_STRINGER_NONE,
+        )
+        self.assertFalse(self.workspace.stairs[0].legacy_part_layout)
+        self.assertIsNone(self.workspace._staged_stair)
+        self.assertEqual(
+            self.workspace.add_stairs_button.text(),
+            "Apply changes to stair",
+        )
+        self.assertFalse(self.workspace.add_stairs_button.isEnabled())
+
+        self.workspace._handle_canvas_undo_requested()
+
+        self.assertEqual(self.workspace.stairs, [original])
+        self.assertEqual(
+            self.workspace.stair_tread_thickness_spinbox.value(),
+            8.0,
+        )
+        self.assertEqual(
+            self.workspace._read_stair_editor_parameters().nosing_placements,
+            (STAIR_NOSING_FRONT,),
+        )
+        self.assertEqual(
+            self.workspace.stair_starting_step_combo.currentData(),
+            STAIR_STARTING_STEP_NONE,
+        )
+
+    def test_setting_restores_selected_stair_mesh_during_active_preview(
+        self,
+    ) -> None:
+        self.workspace.stairs = [_make_editable_stair()]
+        self.workspace._set_canvas_viewer_targets(())
+        parts = tuple(self.workspace._canvas_stair_part_targets_by_id.values())
+        mesh = trimesh.util.concatenate(part.mesh for part in parts)
+        self.workspace.viewer.set_model(
+            GeneratedModel(
+                mesh=mesh,
+                scene=trimesh.Scene(mesh),
+                glb_bytes=b"",
+                preview_stair_parts=list(parts),
+            )
+        )
+        semantic_id = next(iter(self.workspace._canvas_stair_part_targets_by_id))
+        self.workspace.viewer.select_canvas_stair_part_target(semantic_id)
+        original = self.workspace.viewer._get_display_mesh()
+        assert original is not None
+        original_face_count = len(original.faces)
+        self.assertTrue(
+            self.workspace.settings_widget.get_settings().hide_stair_mesh_when_previewing
+        )
+
+        self.workspace.stair_tread_thickness_spinbox.setValue(12.0)
+        QTest.qWait(80)
+        _qt_application.processEvents()
+        hidden = self.workspace.viewer._get_display_mesh()
+        assert hidden is not None
+        self.assertLess(len(hidden.faces), original_face_count)
+
+        checkbox = (
+            self.workspace.settings_widget.hide_stair_mesh_when_previewing_checkbox
+        )
+        checkbox.setChecked(False)
+        shown = self.workspace.viewer._get_display_mesh()
+        assert shown is not None
+        self.assertEqual(len(shown.faces), original_face_count)
+        checkbox.setChecked(True)
+        hidden_again = self.workspace.viewer._get_display_mesh()
+        assert hidden_again is not None
+        self.assertLess(len(hidden_again.faces), original_face_count)
+
+        self.workspace.viewer.clear_canvas_stair_preview()
+        restored = self.workspace.viewer._get_display_mesh()
+        assert restored is not None
+        self.assertEqual(len(restored.faces), original_face_count)
+
+    def test_reverting_stair_fields_before_preview_skips_geometry_build(self) -> None:
+        original = _make_editable_stair(tread_thickness_meters=0.08)
+        self.workspace.stairs = [original]
+        self.workspace._set_canvas_viewer_targets(())
+        semantic_id = next(iter(self.workspace._canvas_stair_part_targets_by_id))
+        self.workspace.viewer.select_canvas_stair_part_target(semantic_id)
+
+        self.workspace.stair_tread_thickness_spinbox.setValue(12.0)
+        self.workspace.stair_tread_thickness_spinbox.setValue(8.0)
+        with patch("housemaker.main.build_canvas_stair_part_targets") as build:
+            QTest.qWait(80)
+            _qt_application.processEvents()
+
+        build.assert_not_called()
+        self.assertIsNone(self.workspace._staged_stair)
+        self.assertIsNone(
+            self.workspace.viewer._canvas_stair_preview_stair_index
+        )
+
+    def test_reverting_starting_step_keeps_legacy_stair_layout(self) -> None:
+        original = _make_editable_stair(
+            stringer_placement=STAIR_STRINGER_NONE,
+            legacy_part_layout=True,
+        )
+        self.assertTrue(original.uses_legacy_part_layout)
+        self.workspace.stairs = [original]
+        self.workspace._set_canvas_viewer_targets(())
+        semantic_id = next(iter(self.workspace._canvas_stair_part_targets_by_id))
+        self.workspace.viewer.select_canvas_stair_part_target(semantic_id)
+
+        self.workspace.stair_starting_step_combo.setCurrentIndex(
+            self.workspace.stair_starting_step_combo.findData(
+                STAIR_STARTING_STEP_BULLNOSE
+            )
+        )
+        self.workspace.stair_starting_step_combo.setCurrentIndex(
+            self.workspace.stair_starting_step_combo.findData(
+                STAIR_STARTING_STEP_NONE
+            )
+        )
+        with patch("housemaker.main.build_canvas_stair_part_targets") as build:
+            QTest.qWait(80)
+            _qt_application.processEvents()
+
+        build.assert_not_called()
+        self.assertIsNone(self.workspace._staged_stair)
+        self.assertTrue(self.workspace.stairs[0].uses_legacy_part_layout)
+
+    def test_level_height_change_refreshes_selected_stair_measurements(self) -> None:
+        stair = _make_editable_stair(target_rise_meters=0.25)
+        self.workspace.stairs = [stair]
+        self.workspace._set_canvas_viewer_targets(())
+        semantic_id = next(iter(self.workspace._canvas_stair_part_targets_by_id))
+        self.workspace.viewer.select_canvas_stair_part_target(semantic_id)
+        step_count_before = self.workspace.stair_calculated_step_count_label.text()
+        actual_rise_before = self.workspace.stair_actual_rise_label.text()
+
+        self.workspace._handle_height_level_changed(
+            self.workspace.current_level.height_meters + 1.0
+        )
+
+        self.assertNotEqual(
+            self.workspace.stair_calculated_step_count_label.text(),
+            step_count_before,
+        )
+        self.assertNotEqual(
+            self.workspace.stair_actual_rise_label.text(),
+            actual_rise_before,
+        )
+
+    def test_level_height_change_rebuilds_a_staged_stair_preview(self) -> None:
+        stair = _make_editable_stair(tread_overhang_meters=0.03)
+        self.workspace.stairs = [stair]
+        self.workspace._set_canvas_viewer_targets(())
+        semantic_id = next(iter(self.workspace._canvas_stair_part_targets_by_id))
+        self.workspace.viewer.select_canvas_stair_part_target(semantic_id)
+        self.workspace.stair_nosing_overhang_spinbox.setValue(5.0)
+        QTest.qWait(160)
+        _qt_application.processEvents()
+        preview_before = tuple(
+            part.mesh.bounds.copy()
+            for part in self.workspace.viewer._canvas_stair_preview_parts
+        )
+
+        self.workspace._handle_height_level_changed(
+            self.workspace.current_level.height_meters + 1.0
+        )
+
+        preview_after = tuple(
+            part.mesh.bounds.copy()
+            for part in self.workspace.viewer._canvas_stair_preview_parts
+        )
+        self.assertTrue(preview_before)
+        self.assertEqual(len(preview_after), len(preview_before))
+        self.assertTrue(
+            any(
+                not (before == after).all()
+                for before, after in zip(preview_before, preview_after)
+            )
+        )
+
+    def test_escape_discards_a_stair_change_before_preview_debounce(self) -> None:
+        original = _make_editable_stair(tread_overhang_meters=0.03)
+        self.workspace.stairs = [original]
+        self.workspace._set_canvas_viewer_targets(())
+        semantic_id = next(iter(self.workspace._canvas_stair_part_targets_by_id))
+        self.workspace.viewer.select_canvas_stair_part_target(semantic_id)
+
+        self.workspace.stair_nosing_overhang_spinbox.setValue(8.0)
+        self.assertTrue(self.workspace._stair_preview_update_timer.isActive())
+
+        self.workspace.viewer.view.escape_requested.emit()
+
+        self.assertFalse(self.workspace._stair_preview_update_timer.isActive())
+        self.assertIsNone(self.workspace._pending_stair_parameters)
+        self.assertEqual(self.workspace.stairs, [original])
+        self.assertEqual(
+            self.workspace.stair_nosing_overhang_spinbox.value(),
+            3.0,
+        )
+
+    def test_project_load_preserves_stair_texture_targets_and_selection(self) -> None:
+        stair = _make_editable_stair(
+            tread_thickness_meters=0.13,
+            tread_edge_profile=STAIR_TREAD_EDGE_ROUNDED,
+            starting_step=STAIR_STARTING_STEP_BULLNOSE,
+            stringer_placement=STAIR_STRINGER_LEFT,
+        )
+        semantic_id = next(
+            part.semantic_id
+            for part in build_canvas_stair_part_targets(
+                self.workspace.levels,
+                (stair,),
+            )
+            if part.part_kind == STAIR_PART_SUPPORT
+        )
+        assignment = SurfaceTextureAssignment(
+            assignment_id="stair-support",
+            surface_type="wall",
+            surface_ids=(semantic_id,),
+            provider="meshy",
+            asset_path="missing.png",
+        )
+
+        self.workspace._apply_project_state(
+            levels=self.workspace.levels,
+            current_level_index=GROUND_LEVEL_INDEX,
+            stairs=[stair],
+            surface_texture_generation=SurfaceTextureData(
+                assignments=[assignment],
+                selected_surface_type="wall",
+                selected_surface_ids=(semantic_id,),
+            ),
+        )
+
+        restored = self.workspace.surface_texture_generation.get_assignment(
+            assignment.assignment_id
+        )
+        assert restored is not None
+        self.assertEqual(restored.surface_ids, (semantic_id,))
+        self.assertEqual(
+            self.workspace._desired_canvas_stair_part_ids,
+            (semantic_id,),
+        )
+        self.assertEqual(self.workspace._desired_canvas_surface_ids, ())
+        self.assertEqual(self.workspace._editing_stair_index, 0)
+        self.assertAlmostEqual(
+            self.workspace.stair_tread_thickness_spinbox.value(),
+            13.0,
+        )
+        self.assertEqual(
+            self.workspace.stair_tread_edge_combo.currentData(),
+            STAIR_TREAD_EDGE_ROUNDED,
+        )
+        self.assertEqual(
+            self.workspace.stair_starting_step_combo.currentData(),
+            STAIR_STARTING_STEP_BULLNOSE,
+        )
+        self.assertEqual(
+            self.workspace.stair_stringer_placement_combo.currentData(),
+            STAIR_STRINGER_LEFT,
+        )
+
+    def test_project_load_cancels_an_old_pending_stair_preview(self) -> None:
+        old_stair = _make_editable_stair(tread_thickness_meters=0.08)
+        self.workspace.stairs = [old_stair]
+        self.workspace._set_canvas_viewer_targets(())
+        old_target_id = next(
+            semantic_id
+            for semantic_id, target in (
+                self.workspace._canvas_stair_part_targets_by_id.items()
+            )
+            if target.part_kind == STAIR_PART_TREADS
+        )
+        self.workspace.viewer.select_canvas_stair_part_target(old_target_id)
+        self.workspace.stair_tread_thickness_spinbox.setValue(12.0)
+        self.assertTrue(self.workspace._stair_preview_update_timer.isActive())
+
+        loaded_stair = _make_editable_stair(tread_thickness_meters=0.09)
+        loaded_target_id = next(
+            part.semantic_id
+            for part in build_canvas_stair_part_targets(
+                self.workspace.levels,
+                (loaded_stair,),
+            )
+            if part.part_kind == STAIR_PART_TREADS
+        )
+        self.workspace._apply_project_state(
+            levels=self.workspace.levels,
+            current_level_index=GROUND_LEVEL_INDEX,
+            stairs=[loaded_stair],
+            surface_texture_generation=SurfaceTextureData(
+                selected_surface_type="floor",
+                selected_surface_ids=(loaded_target_id,),
+            ),
+        )
+        QTest.qWait(160)
+        _qt_application.processEvents()
+
+        self.assertFalse(self.workspace._stair_preview_update_timer.isActive())
+        self.assertIsNone(self.workspace._pending_stair_parameters)
+        self.assertIsNone(self.workspace._staged_stair)
+        self.assertIsNone(
+            self.workspace.viewer._canvas_stair_preview_stair_index
+        )
+        self.assertEqual(self.workspace.stairs, [loaded_stair])
+        self.assertAlmostEqual(
+            self.workspace.stair_tread_thickness_spinbox.value(),
+            9.0,
+        )
+
+    def test_stair_edit_undo_restores_removed_part_texture_target(self) -> None:
+        stair = _make_editable_stair()
+        self.workspace.stairs = [stair]
+        self.workspace._set_canvas_viewer_targets(())
+        support_id = next(
+            semantic_id
+            for semantic_id, part in (
+                self.workspace._canvas_stair_part_targets_by_id.items()
+            )
+            if part.part_kind == STAIR_PART_SUPPORT
+        )
+        assignment = SurfaceTextureAssignment(
+            assignment_id="stair-support",
+            surface_type="wall",
+            surface_ids=(support_id,),
+            provider="meshy",
+            asset_path="missing.png",
+        )
+        self.workspace.surface_texture_generation.set_data(
+            SurfaceTextureData(assignments=[assignment])
+        )
+        self.workspace.viewer.select_canvas_stair_part_target(support_id)
+
+        self.workspace.stair_type_combo.setCurrentIndex(
+            self.workspace.stair_type_combo.findData(STAIR_TYPE_FLOATING)
+        )
+        QTest.qWait(160)
+        _qt_application.processEvents()
+        self.workspace.add_stairs_button.click()
+
+        edited_assignment = (
+            self.workspace.surface_texture_generation.get_assignment(
+                assignment.assignment_id
+            )
+        )
+        assert edited_assignment is not None
+        self.assertEqual(edited_assignment.surface_ids, ())
+        self.assertTrue(self.workspace._desired_canvas_stair_part_ids)
+        selected_part = self.workspace._canvas_stair_part_targets_by_id[
+            self.workspace._desired_canvas_stair_part_ids[-1]
+        ]
+        self.assertEqual(selected_part.part_kind, "treads")
+
+        self.workspace._handle_canvas_undo_requested()
+
+        restored_assignment = (
+            self.workspace.surface_texture_generation.get_assignment(
+                assignment.assignment_id
+            )
+        )
+        assert restored_assignment is not None
+        self.assertEqual(restored_assignment.surface_ids, (support_id,))
+        self.assertEqual(self.workspace.stairs, [stair])
+
+    def test_invalid_stair_does_not_drop_other_stair_texture_targets(self) -> None:
+        broken_stair = _make_editable_stair(stair_id="1" * 32)
+        valid_stair = _make_editable_stair(
+            stair_id="2" * 32,
+            start_a_x=60.0,
+            start_b_x=90.0,
+            end_a_x=60.0,
+            end_b_x=90.0,
+        )
+        self.workspace.stairs = [broken_stair, valid_stair]
+        self.workspace._sync_canvas_stair_semantic_targets(self.workspace.levels)
+        valid_target_id = next(
+            semantic_id
+            for semantic_id, target in (
+                self.workspace._canvas_stair_part_targets_by_id.items()
+            )
+            if target.stair_id == valid_stair.stair_id
+        )
+        assignment = SurfaceTextureAssignment(
+            assignment_id="valid-stair-texture",
+            surface_type="floor",
+            surface_ids=(valid_target_id,),
+            provider="meshy",
+            asset_path="missing.png",
+        )
+        self.workspace.surface_texture_generation.set_data(
+            SurfaceTextureData(assignments=[assignment])
+        )
+
+        def _build_one_stair(levels, stairs, **kwargs):
+            if stairs[0].stair_id == broken_stair.stair_id:
+                raise ValueError("Broken bound stair route.")
+            return build_canvas_stair_part_targets(levels, stairs, **kwargs)
+
+        with patch(
+            "housemaker.main.build_canvas_stair_part_targets",
+            side_effect=_build_one_stair,
+        ):
+            self.workspace._reconcile_surface_assignments_with_scene()
+
+        restored_assignment = (
+            self.workspace.surface_texture_generation.get_assignment(
+                assignment.assignment_id
+            )
+        )
+        assert restored_assignment is not None
+        self.assertEqual(restored_assignment.surface_ids, (valid_target_id,))
+        self.assertTrue(
+            all(
+                target.stair_id == valid_stair.stair_id
+                for target in self.workspace._canvas_stair_part_targets_by_id.values()
+            )
         )
 
     def test_selected_canvas_stair_can_be_deleted_without_a_list(self) -> None:

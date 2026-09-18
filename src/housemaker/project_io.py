@@ -5,6 +5,7 @@ import json
 import math
 import os
 import tempfile
+import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -77,6 +78,7 @@ from housemaker.wall_mirroring import (
 
 # ### Constants ###
 PROJECT_FILE_VERSION = 1
+LEGACY_STAIR_ID_NAMESPACE = uuid.UUID("f630724a-0932-47ba-b363-aad661d86435")
 
 
 # ### Data models ###
@@ -140,9 +142,7 @@ def save_project(
             else TextureAtlasData().to_dict()
         ),
         "stairs": _serialize_stairs(stairs or []),
-        "wall_mirror_links": wall_mirror_links_to_dicts(
-            wall_mirror_links or ()
-        ),
+        "wall_mirror_links": wall_mirror_links_to_dicts(wall_mirror_links or ()),
         "levels": [
             {
                 "index": level.index,
@@ -150,12 +150,8 @@ def save_project(
                 "height_meters": level.height_meters,
                 "scale": float(level.scale),
                 "canvas_level_scale": float(level.canvas_level_scale),
-                "canvas_offset_x_pixels": float(
-                    level.canvas_offset_x_pixels
-                ),
-                "canvas_offset_y_pixels": float(
-                    level.canvas_offset_y_pixels
-                ),
+                "canvas_offset_x_pixels": float(level.canvas_offset_x_pixels),
+                "canvas_offset_y_pixels": float(level.canvas_offset_y_pixels),
                 "offset_x_meters": float(level.offset_x_meters),
                 "offset_y_meters": float(level.offset_y_meters),
                 "floor_thickness_meters": level.floor_thickness_meters,
@@ -164,14 +160,10 @@ def save_project(
                 "include_in_export": bool(level.include_in_export),
                 "vertex_data": level.vertex_data.to_dict(),
                 "rooms": [_serialize_room(room) for room in level.rooms],
-                "doorways": [
-                    _serialize_doorway(doorway)
-                    for doorway in level.doorways
-                ],
+                "doorways": [_serialize_doorway(doorway) for doorway in level.doorways],
                 "windows": [window.to_dict() for window in level.windows],
                 "open_spaces": [
-                    open_space.to_dict()
-                    for open_space in level.open_spaces
+                    open_space.to_dict() for open_space in level.open_spaces
                 ],
                 "editable_surfaces": [
                     _serialize_editable_surface(editable_surface)
@@ -266,9 +258,7 @@ def load_project(path: str | Path) -> ProjectData:
             _deserialize_legacy_wall_mirror_targets(
                 raw_vertex_data,
                 source_level_index=level.index,
-                known_vertex_ids={
-                    vertex.id for vertex in level.vertex_data.vertices
-                },
+                known_vertex_ids={vertex.id for vertex in level.vertex_data.vertices},
             )
         )
         level.rooms = _deserialize_rooms(
@@ -280,9 +270,7 @@ def load_project(path: str | Path) -> ProjectData:
             raw_level.get("windows", []),
             level_index=level.index,
         )
-        level.open_spaces = _deserialize_open_spaces(
-            raw_level.get("open_spaces", [])
-        )
+        level.open_spaces = _deserialize_open_spaces(raw_level.get("open_spaces", []))
         level.editable_surfaces = _deserialize_editable_surfaces(
             raw_level.get("editable_surfaces", []),
             level_index=level.index,
@@ -295,9 +283,7 @@ def load_project(path: str | Path) -> ProjectData:
     image_library_paths = _deserialize_image_library_paths(
         payload.get("image_library_paths", [])
     )
-    doorway_presets = _deserialize_doorway_presets(
-        payload.get("doorway_presets")
-    )
+    doorway_presets = _deserialize_doorway_presets(payload.get("doorway_presets"))
     generation = _deserialize_generation(
         payload.get("generation"),
         payload.get("dynamic_generation"),
@@ -305,9 +291,7 @@ def load_project(path: str | Path) -> ProjectData:
     surface_texture_generation = _deserialize_surface_texture_generation(
         payload.get("surface_texture_generation")
     )
-    texture_atlases = _deserialize_texture_atlases(
-        payload.get("texture_atlases")
-    )
+    texture_atlases = _deserialize_texture_atlases(payload.get("texture_atlases"))
     stairs = _deserialize_stairs(
         payload.get("stairs"),
         valid_level_indices=set(level_lookup),
@@ -392,9 +376,7 @@ def _deserialize_generation(
     if not isinstance(raw_video_metadata, dict):
         return GenerationData()
     try:
-        return GenerationData.from_dict(
-            {"video_metadata": raw_video_metadata}
-        )
+        return GenerationData.from_dict({"video_metadata": raw_video_metadata})
     except (KeyError, TypeError, ValueError, OverflowError):
         return GenerationData()
 
@@ -500,11 +482,33 @@ def _deserialize_stairs(
         return []
 
     stairs: list[StairData] = []
-    for raw_stair in raw_stairs:
+    occupied_stair_ids: set[str] = set()
+    for stair_position, raw_stair in enumerate(raw_stairs):
+        normalized_payload = _add_legacy_stair_id(
+            raw_stair,
+            stair_position,
+        )
         try:
-            stair = StairData.from_dict(raw_stair)
+            stair = StairData.from_dict(normalized_payload)
         except (TypeError, ValueError):
             continue
+
+        if stair.stair_id in occupied_stair_ids:
+            duplicate_payload = stair.to_dict()
+            duplicate_salt = 0
+            while True:
+                replacement_id = uuid.uuid5(
+                    LEGACY_STAIR_ID_NAMESPACE,
+                    (
+                        f"duplicate:{stair_position}:{duplicate_salt}:"
+                        f"{stair.stair_id}"
+                    ),
+                ).hex
+                if replacement_id not in occupied_stair_ids:
+                    break
+                duplicate_salt += 1
+            duplicate_payload["stair_id"] = replacement_id
+            stair = StairData.from_dict(duplicate_payload)
 
         if (
             stair.start_level_index not in valid_level_indices
@@ -515,9 +519,30 @@ def _deserialize_stairs(
             )
         ):
             continue
+        occupied_stair_ids.add(stair.stair_id)
         stairs.append(stair)
 
     return stairs
+
+
+def _add_legacy_stair_id(raw_stair: object, stair_position: int) -> object:
+    """Give old persisted stairs a repeatable identity without mutating JSON."""
+
+    if not isinstance(raw_stair, dict) or raw_stair.get("stair_id"):
+        return raw_stair
+    try:
+        canonical_payload = json.dumps(
+            raw_stair,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        return raw_stair
+    stair_id = uuid.uuid5(
+        LEGACY_STAIR_ID_NAMESPACE,
+        f"{stair_position}:{canonical_payload}",
+    ).hex
+    return dict(raw_stair) | {"stair_id": stair_id}
 
 
 # ### Doorway serialization helpers ###
@@ -852,9 +877,7 @@ def _deserialize_editable_surfaces(
             editable_surface = _deserialize_editable_surface(raw_editable_surface)
         except (TypeError, ValueError):
             continue
-        if not editable_surface.source_surface_id.startswith(
-            f"level:{level_index}/"
-        ):
+        if not editable_surface.source_surface_id.startswith(f"level:{level_index}/"):
             continue
         current_face_ids = {face.face_id for face in editable_surface.faces}
         if (
@@ -998,9 +1021,7 @@ def _deserialize_legacy_wall_mirror_targets(
             )
         )
         if target_indices:
-            targets_by_source[(source_level_index, vertex_id)] = (
-                target_indices
-            )
+            targets_by_source[(source_level_index, vertex_id)] = target_indices
     return targets_by_source
 
 
@@ -1060,8 +1081,7 @@ def _deserialize_rooms(
             RoomData(
                 name=str(raw_room.get("name", "Room")),
                 vertex_ids=tuple(
-                    int(vertex_id)
-                    for vertex_id in raw_room.get("vertex_ids", [])
+                    int(vertex_id) for vertex_id in raw_room.get("vertex_ids", [])
                 ),
                 center_vertex_id=int(raw_room.get("center_vertex_id", 0)),
                 color_rgb=(
@@ -1073,12 +1093,8 @@ def _deserialize_rooms(
                     raw_room.get("height_meters", default_height_meters),
                     default_height_meters,
                 ),
-                uv_map_width=int(
-                    raw_room.get("uv_map_width", DEFAULT_UV_MAP_WIDTH)
-                ),
-                uv_map_height=int(
-                    raw_room.get("uv_map_height", DEFAULT_UV_MAP_HEIGHT)
-                ),
+                uv_map_width=int(raw_room.get("uv_map_width", DEFAULT_UV_MAP_WIDTH)),
+                uv_map_height=int(raw_room.get("uv_map_height", DEFAULT_UV_MAP_HEIGHT)),
                 wall_uv_scales=_deserialize_wall_uv_scales(
                     raw_room.get("wall_uv_scales", {})
                 ),
@@ -1262,8 +1278,7 @@ def _serialize_wall_subdivision_positions(
 ) -> dict[str, list[list[float]]]:
     return {
         str(wall_key): [
-            [float(position[0]), float(position[1])]
-            for position in segment_positions
+            [float(position[0]), float(position[1])] for position in segment_positions
         ]
         for wall_key, segment_positions in wall_subdivision_positions.items()
     }
@@ -1285,9 +1300,7 @@ def _deserialize_wall_subdivision_positions(
             if not isinstance(raw_position, list | tuple) or len(raw_position) != 2:
                 continue
 
-            segment_positions.append(
-                (float(raw_position[0]), float(raw_position[1]))
-            )
+            segment_positions.append((float(raw_position[0]), float(raw_position[1])))
 
         if segment_positions:
             wall_subdivision_positions[str(wall_key)] = tuple(segment_positions)

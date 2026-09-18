@@ -169,6 +169,39 @@ def _build_all_existing_surfaces(
     }
 
 
+def _semantic_surface_catalogs_match(
+    first: Mapping[str, FixedSurface],
+    second: Mapping[str, FixedSurface],
+) -> bool:
+    """Compare semantic targets without invoking array-valued dataclass equality."""
+
+    if first.keys() != second.keys():
+        return False
+    for surface_id, first_surface in first.items():
+        second_surface = second[surface_id]
+        if (
+            first_surface.surface_type != second_surface.surface_type
+            or first_surface.level_index != second_surface.level_index
+            or first_surface.room_index != second_surface.room_index
+            or not math.isclose(
+                float(first_surface.area_square_meters),
+                float(second_surface.area_square_meters),
+                rel_tol=0.0,
+                abs_tol=1e-10,
+            )
+            or not np.array_equal(
+                np.asarray(first_surface.mesh.vertices),
+                np.asarray(second_surface.mesh.vertices),
+            )
+            or not np.array_equal(
+                np.asarray(first_surface.mesh.faces),
+                np.asarray(second_surface.mesh.faces),
+            )
+        ):
+            return False
+    return True
+
+
 # ### Surface lineage helpers ###
 def _normalize_surface_lineage_replacements(
     replacements: Mapping[str, Sequence[str]],
@@ -606,6 +639,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._level_sync_signature: tuple[object, ...] | None = None
         self._semantic_surface_cache_signature: tuple[object, ...] | None = None
         self._semantic_surfaces_by_id: dict[str, FixedSurface] = {}
+        self._external_semantic_surfaces_by_id: dict[str, FixedSurface] = {}
         self.surface_view: SurfaceTextureViewer | None = None
         self._shared_scene_surfaces_by_id: dict[str, FixedSurface] = {}
         self._shared_scene_selected_surface_ids: tuple[str, ...] = ()
@@ -750,6 +784,60 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         """Return the fixed-surface IDs driving the next Surface request."""
 
         return self._get_surface_selection_snapshot().surface_ids
+
+    def set_external_semantic_surfaces(
+        self,
+        surfaces: Sequence[FixedSurface],
+    ) -> bool:
+        """Install non-architectural surfaces owned by the shared 3D scene.
+
+        Procedural scene elements such as stairs are not derived from
+        ``LevelData`` by ``build_fixed_surfaces``.  Keeping their semantic
+        targets in this separate catalog lets texture assignment, area
+        accounting, and stale-target reconciliation use the same pipeline as
+        ordinary walls, floors, and ceilings.
+        """
+
+        try:
+            normalized_surfaces = tuple(surfaces)
+        except TypeError as error:
+            raise TypeError(
+                "External semantic surfaces must contain a sequence."
+            ) from error
+        if not all(
+            isinstance(surface, FixedSurface)
+            for surface in normalized_surfaces
+        ):
+            raise TypeError(
+                "External semantic surfaces must contain FixedSurface values."
+            )
+        surface_ids = tuple(
+            surface.surface_id for surface in normalized_surfaces
+        )
+        if len(surface_ids) != len(set(surface_ids)):
+            raise ValueError("External semantic surface IDs must be unique.")
+
+        architectural_ids = set(
+            _build_all_existing_surfaces(self._levels)
+        )
+        conflicting_ids = architectural_ids.intersection(surface_ids)
+        if conflicting_ids:
+            raise ValueError(
+                "External semantic surface IDs conflict with architectural "
+                "surfaces: " + ", ".join(sorted(conflicting_ids))
+            )
+
+        next_surfaces = {
+            surface.surface_id: surface for surface in normalized_surfaces
+        }
+        changed = not _semantic_surface_catalogs_match(
+            next_surfaces,
+            self._external_semantic_surfaces_by_id,
+        )
+        self._external_semantic_surfaces_by_id = next_surfaces
+        if changed:
+            self._restored_assignment_texture_signature = None
+        return changed
 
     def get_selected_surface_type(self) -> str | None:
         """Return the common selected type, or ``None`` for an invalid set."""
@@ -1067,7 +1155,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self,
         levels: Sequence[LevelData] | None = None,
     ) -> dict[str, FixedSurface]:
-        """Return a revision-cached semantic surface lookup."""
+        """Return architectural and shared-scene semantic surface targets."""
 
         normalized_levels = list(self._levels if levels is None else levels)
         signature = _build_level_sync_signature(normalized_levels)
@@ -1076,7 +1164,10 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 normalized_levels
             )
             self._semantic_surface_cache_signature = signature
-        return self._semantic_surfaces_by_id
+        return {
+            **self._semantic_surfaces_by_id,
+            **self._external_semantic_surfaces_by_id,
+        }
 
     def _all_existing_surface_areas(
         self,
@@ -2197,9 +2288,11 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             return None
         api_key = self._settings.surface_texture_api_key
         if not api_key:
+            provider_name = _get_provider_display_name(
+                self._settings.surface_texture_provider
+            )
             self.status_label.setText(
-                f"Configure the {_get_provider_display_name(self._settings.surface_texture_provider)} "
-                "API key in Settings."
+                f"Configure the {provider_name} API key in Settings."
             )
             return None
         if defer_reference_preparation:

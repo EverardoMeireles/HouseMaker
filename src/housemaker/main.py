@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -45,6 +46,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSlider,
+    QSpinBox,
     QSplitter,
     QTabWidget,
     QVBoxLayout,
@@ -116,8 +118,11 @@ from housemaker.generation_workspace import (
 )
 from housemaker.glb import (
     DEFAULT_WALL_HEIGHT_METERS,
+    STAIR_PART_TREADS,
     GeneratedModel,
     PlacedGeneratedModel,
+    PreviewStairPart,
+    build_canvas_stair_part_targets,
     build_stair_meshes,
     build_texture_preview_plane_model,
     compose_placed_generated_models,
@@ -143,7 +148,17 @@ from housemaker.models import (
     DEFAULT_FLOOR_THICKNESS_METERS,
     DEFAULT_LEVEL_OFFSET_METERS,
     DEFAULT_LEVEL_SCALE,
-    DEFAULT_STAIR_STYLE,
+    DEFAULT_STAIR_NOSING_PLACEMENTS,
+    DEFAULT_STAIR_STARTING_STEP,
+    DEFAULT_STAIR_STARTING_STEP_EDGE_POINTS,
+    DEFAULT_STAIR_STARTING_STEP_EDGE_RADIUS_METERS,
+    DEFAULT_STAIR_STRINGER_PLACEMENT,
+    DEFAULT_STAIR_TARGET_RISE_METERS,
+    DEFAULT_STAIR_TREAD_EDGE_PROFILE,
+    DEFAULT_STAIR_TREAD_EDGE_RADIUS_METERS,
+    DEFAULT_STAIR_TREAD_OVERHANG_METERS,
+    DEFAULT_STAIR_TREAD_THICKNESS_METERS,
+    DEFAULT_STAIR_TYPE,
     DOORWAY_SHAPE_ARCH,
     DOORWAY_SHAPE_RECTANGULAR,
     GROUND_LEVEL_INDEX,
@@ -151,13 +166,32 @@ from housemaker.models import (
     MAX_DOORWAY_ARCH_AMOUNT,
     MAX_FLOOR_THICKNESS_METERS,
     MAX_LEVEL_SCALE,
+    MAX_STAIR_STARTING_STEP_EDGE_POINTS,
+    MAX_STAIR_STARTING_STEP_EDGE_RADIUS_METERS,
+    MAX_STAIR_TREAD_EDGE_RADIUS_METERS,
     MIN_CANVAS_LEVEL_SCALE,
     MIN_DOORWAY_ARCH_AMOUNT,
     MIN_FLOOR_THICKNESS_METERS,
     MIN_LEVEL_SCALE,
+    MIN_STAIR_STARTING_STEP_EDGE_POINTS,
+    MIN_STAIR_STARTING_STEP_EDGE_RADIUS_METERS,
+    MIN_STAIR_TREAD_EDGE_RADIUS_METERS,
+    STAIR_NOSING_FRONT,
+    STAIR_NOSING_LEFT,
+    STAIR_NOSING_RIGHT,
+    STAIR_STARTING_STEP_BULLNOSE,
+    STAIR_STARTING_STEP_CURTAIL,
+    STAIR_STARTING_STEP_NONE,
+    STAIR_STRINGER_BOTH,
+    STAIR_STRINGER_LEFT,
+    STAIR_STRINGER_NONE,
+    STAIR_STRINGER_RIGHT,
     STAIR_STYLE_FLOATING,
     STAIR_STYLE_FLOATING_WITH_RISER,
-    STAIR_STYLE_SUPPORTED,
+    STAIR_TREAD_EDGE_ROUNDED,
+    STAIR_TREAD_EDGE_STRAIGHT,
+    STAIR_TYPE_FLOATING,
+    STAIR_TYPE_SUPPORTED,
     DoorwayData,
     DoorwayPreset,
     EditableSurfaceMeshData,
@@ -166,6 +200,7 @@ from housemaker.models import (
     StairSectionData,
     VertexData,
     WindowData,
+    calculate_stair_step_layout,
     create_default_doorway_presets,
     create_default_levels,
 )
@@ -268,6 +303,7 @@ CANVAS_OFFSET_SLIDER_MAX_PIXELS = 2000.0
 SURFACE_AO_SHUTDOWN_WAIT_MILLISECONDS = 100
 SURFACE_AO_PREVIEW_REFRESH_DELAY_MILLISECONDS = 150
 ATLAS_DRAW_CALL_ESTIMATE_REFRESH_DELAY_MILLISECONDS = 200
+STAIR_PREVIEW_UPDATE_DELAY_MILLISECONDS = 35
 
 
 # ### Atlas ambient-occlusion jobs ###
@@ -751,10 +787,35 @@ class _DirectObjectPlacementSession:
 
 
 @dataclass(frozen=True)
+class _StairEditorParameters:
+    """Editable geometry settings shared by new and selected stairs."""
+
+    stair_type: str = STAIR_TYPE_SUPPORTED
+    target_rise_meters: float = DEFAULT_STAIR_TARGET_RISE_METERS
+    tread_thickness_meters: float = DEFAULT_STAIR_TREAD_THICKNESS_METERS
+    tread_overhang_meters: float = DEFAULT_STAIR_TREAD_OVERHANG_METERS
+    nosing_placements: tuple[str, ...] = DEFAULT_STAIR_NOSING_PLACEMENTS
+    tread_edge_profile: str = STAIR_TREAD_EDGE_STRAIGHT
+    tread_edge_radius_meters: float = DEFAULT_STAIR_TREAD_EDGE_RADIUS_METERS
+    starting_step: str = DEFAULT_STAIR_STARTING_STEP
+    starting_step_edge_radius_meters: float = (
+        DEFAULT_STAIR_STARTING_STEP_EDGE_RADIUS_METERS
+    )
+    starting_step_edge_points: int = DEFAULT_STAIR_STARTING_STEP_EDGE_POINTS
+    stringer_placement: str = DEFAULT_STAIR_STRINGER_PLACEMENT
+
+
+@dataclass(frozen=True)
 class _CanvasStairsUndoState:
-    """The ordered stairs collection before one add or delete action."""
+    """Stairs and conservatively restorable texture bindings before an edit."""
 
     stairs: tuple[StairData, ...]
+    assignments: tuple[SurfaceTextureAssignment, ...] = ()
+    assignment_targets_after: tuple[SurfaceTextureAssignment, ...] = ()
+    atlas_placements: tuple[tuple[str, TextureAtlasPlacement], ...] = ()
+    selected_stair_part_ids: tuple[str, ...] = ()
+    assignment_target_ids: tuple[str, ...] = ()
+    editing_stair_id: str | None = None
 
 
 _CanvasUndoState = (
@@ -824,6 +885,72 @@ class RightPanelValueInputWheelFilter(QObject):
         QApplication.sendEvent(viewport, forwarded_event)
 
 
+class ViewportWidthRowFilter(QObject):
+    """Keep composite form rows within, and expanded across, a viewport."""
+
+    def __init__(
+        self,
+        viewport: QWidget,
+        rows: tuple[QWidget, ...],
+        *,
+        horizontal_inset: int,
+        on_width_changed: Callable[[int], None] | None = None,
+    ) -> None:
+        super().__init__(viewport)
+        self._viewport = viewport
+        self._rows = rows
+        self._horizontal_inset = horizontal_inset
+        self._on_width_changed = on_width_changed
+
+    def sync_widths(self) -> None:
+        """Use the complete visible form width without causing overflow."""
+
+        maximum_width = max(0, self._viewport.width() - self._horizontal_inset)
+        for row in self._rows:
+            row.setMaximumWidth(maximum_width)
+        if self._on_width_changed is not None:
+            self._on_width_changed(self._viewport.width())
+
+    def eventFilter(
+        self,
+        watched: QObject,
+        event: QEvent,
+    ) -> bool:  # type: ignore[override]
+        if watched is self._viewport and event.type() == QEvent.Type.Resize:
+            self.sync_widths()
+        return super().eventFilter(watched, event)
+
+
+# ### Responsive editor size observers ###
+class StairEditorHeightFilter(QObject):
+    """Refresh a horizontal-only scroll area's height after layout settles."""
+
+    def __init__(
+        self,
+        editor: QWidget,
+        layout_widgets: tuple[QWidget, ...],
+        sync_height: Callable[[], None],
+    ) -> None:
+        super().__init__(editor)
+        self._layout_widgets = layout_widgets
+        self._sync_height = sync_height
+        self._pending = False
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
+        if watched in self._layout_widgets and event.type() in (
+            QEvent.Type.LayoutRequest,
+            QEvent.Type.Resize,
+        ):
+            if not self._pending:
+                self._pending = True
+                QTimer.singleShot(0, self._run_sync)
+        return super().eventFilter(watched, event)
+
+    def _run_sync(self) -> None:
+        self._pending = False
+        self._sync_height()
+
+
 class BlueprintWorkspace(QWidget):
     def __init__(
         self,
@@ -842,6 +969,22 @@ class BlueprintWorkspace(QWidget):
         self.image_library_paths: list[str] = []
         self.doorway_presets: list[DoorwayPreset] = create_default_doorway_presets()
         self.stairs: list[StairData] = []
+        self._is_syncing_stair_controls = False
+        self._new_stair_parameters = _StairEditorParameters()
+        self._editing_stair_index: int | None = None
+        self._staged_stair: StairData | None = None
+        self._pending_stair_parameters: _StairEditorParameters | None = None
+        self._stair_preview_update_timer = QTimer(self)
+        self._stair_preview_update_timer.setSingleShot(True)
+        self._stair_preview_update_timer.setInterval(
+            STAIR_PREVIEW_UPDATE_DELAY_MILLISECONDS
+        )
+        self._stair_preview_update_timer.timeout.connect(
+            self._rebuild_staged_stair_preview
+        )
+        self._desired_canvas_stair_part_ids: tuple[str, ...] = ()
+        self._canvas_stair_part_targets_by_id: dict[str, PreviewStairPart] = {}
+        self._canvas_stair_semantic_surfaces_by_id: dict[str, FixedSurface] = {}
         self.current_level_index = GROUND_LEVEL_INDEX
         self._is_syncing_level_controls = False
         self._level_transform_drag_active = False
@@ -1386,6 +1529,9 @@ class BlueprintWorkspace(QWidget):
         self.viewer.set_ignore_top_down_ceiling(
             generation_settings.ignore_top_down_ceiling
         )
+        self.viewer.set_hide_stair_mesh_when_previewing(
+            generation_settings.hide_stair_mesh_when_previewing
+        )
         self.canvas.set_snap_middle_equal_angle_only(
             generation_settings.snap_middle_equal_angle_only
         )
@@ -1511,6 +1657,15 @@ class BlueprintWorkspace(QWidget):
         )
         self.viewer.canvas_surface_selection_changed.connect(
             self._handle_canvas_surface_selection_changed
+        )
+        self.viewer.canvas_stair_part_selection_changed.connect(
+            self._handle_canvas_stair_part_selection_changed
+        )
+        self.viewer.canvas_stair_preview_cancelled.connect(
+            self._handle_canvas_stair_preview_cancelled
+        )
+        self.viewer.view.escape_requested.connect(
+            self._handle_canvas_stair_escape_requested
         )
         self.viewer.canvas_surface_orientation_flip_requested.connect(
             self._handle_canvas_surface_orientation_flip_requested
@@ -1905,20 +2060,558 @@ class BlueprintWorkspace(QWidget):
 
         self.stairs_group = QGroupBox("Stairs")
         stairs_layout = QVBoxLayout(self.stairs_group)
+        stairs_layout.setContentsMargins(5, 18, 5, 6)
 
-        self.stair_style_combo = QComboBox()
-        self.stair_style_combo.addItem("Supported", STAIR_STYLE_SUPPORTED)
-        self.stair_style_combo.addItem("Floating", STAIR_STYLE_FLOATING)
-        self.stair_style_combo.addItem(
-            "Floating with riser",
-            STAIR_STYLE_FLOATING_WITH_RISER,
+        stair_parameters_layout = QFormLayout()
+        stair_parameters_layout.setContentsMargins(0, 0, 0, 0)
+        stair_parameters_layout.setRowWrapPolicy(
+            QFormLayout.RowWrapPolicy.DontWrapRows
         )
-        self.stair_style_combo.setCurrentIndex(0)
-        self.stair_style_combo.setMinimumHeight(34)
-        stair_style_layout = QFormLayout()
-        stair_style_layout.setContentsMargins(0, 0, 0, 0)
-        stair_style_layout.addRow("Stair type", self.stair_style_combo)
-        stairs_layout.addLayout(stair_style_layout)
+        stair_parameters_layout.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+        )
+
+        self.stair_type_combo = QComboBox()
+        self.stair_type_combo.setObjectName("stair_type_combo")
+        self.stair_type_combo.addItem("Supported", STAIR_TYPE_SUPPORTED)
+        self.stair_type_combo.addItem("Floating", STAIR_TYPE_FLOATING)
+        self.stair_type_combo.setMinimumHeight(34)
+        self.stair_type_combo.currentIndexChanged.connect(
+            self._handle_stair_parameter_changed
+        )
+        stair_parameters_layout.addRow("Type", self.stair_type_combo)
+
+        self.stair_step_rise_target_spinbox = QDoubleSpinBox()
+        self.stair_step_rise_target_spinbox.setObjectName(
+            "stair_step_rise_target_spinbox"
+        )
+        self.stair_step_rise_target_spinbox.setRange(5.0, 50.0)
+        self.stair_step_rise_target_spinbox.setDecimals(1)
+        self.stair_step_rise_target_spinbox.setSingleStep(0.5)
+        self.stair_step_rise_target_spinbox.setSuffix(" cm")
+        self.stair_step_rise_target_spinbox.setValue(
+            DEFAULT_STAIR_TARGET_RISE_METERS * 100.0
+        )
+        stair_step_rise_tooltip = (
+            "Desired vertical height per step. The step count is rounded to a "
+            "whole number and the actual rise is adjusted so the stair reaches "
+            "the next level exactly."
+        )
+        self.stair_step_rise_target_spinbox.setToolTip(stair_step_rise_tooltip)
+        self.stair_step_rise_target_spinbox.valueChanged.connect(
+            self._handle_stair_parameter_changed
+        )
+        self.stair_step_rise_target_label = QLabel("Step rise target")
+        self.stair_step_rise_target_label.setToolTip(stair_step_rise_tooltip)
+        stair_parameters_layout.addRow(
+            self.stair_step_rise_target_label,
+            self.stair_step_rise_target_spinbox,
+        )
+
+        self.stair_tread_thickness_spinbox = QDoubleSpinBox()
+        self.stair_tread_thickness_spinbox.setObjectName(
+            "stair_tread_thickness_spinbox"
+        )
+        self.stair_tread_thickness_spinbox.setRange(0.5, 100.0)
+        self.stair_tread_thickness_spinbox.setDecimals(1)
+        self.stair_tread_thickness_spinbox.setSingleStep(0.5)
+        self.stair_tread_thickness_spinbox.setSuffix(" cm")
+        self.stair_tread_thickness_spinbox.setValue(
+            DEFAULT_STAIR_TREAD_THICKNESS_METERS * 100.0
+        )
+        self.stair_tread_thickness_spinbox.valueChanged.connect(
+            self._handle_stair_parameter_changed
+        )
+        stair_parameters_layout.addRow(
+            "Tread thickness",
+            self.stair_tread_thickness_spinbox,
+        )
+
+        self.stair_nosing_overhang_spinbox = QDoubleSpinBox()
+        self.stair_nosing_overhang_spinbox.setObjectName(
+            "stair_nosing_overhang_spinbox"
+        )
+        self.stair_nosing_overhang_spinbox.setRange(0.0, 50.0)
+        self.stair_nosing_overhang_spinbox.setDecimals(1)
+        self.stair_nosing_overhang_spinbox.setSingleStep(0.5)
+        self.stair_nosing_overhang_spinbox.setSuffix(" cm")
+        self.stair_nosing_overhang_spinbox.setValue(
+            DEFAULT_STAIR_TREAD_OVERHANG_METERS * 100.0
+        )
+        self.stair_nosing_overhang_spinbox.valueChanged.connect(
+            self._handle_stair_parameter_changed
+        )
+
+        self.stair_nosing_row_widget = QWidget()
+        self.stair_nosing_row_widget.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        nosing_row_layout = QGridLayout(self.stair_nosing_row_widget)
+        nosing_row_layout.setContentsMargins(0, 0, 0, 0)
+        nosing_row_layout.setSpacing(4)
+        self.stair_nosing_overhang_label = QLabel("Nosing overhang")
+        self.stair_nosing_overhang_label.setWordWrap(False)
+        nosing_row_layout.addWidget(self.stair_nosing_overhang_label, 0, 0)
+        self.stair_nosing_overhang_spinbox.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        nosing_row_layout.addWidget(self.stair_nosing_overhang_spinbox, 0, 1)
+        self.stair_nosing_left_checkbox = QCheckBox("Left")
+        self.stair_nosing_left_checkbox.setObjectName(
+            "stair_nosing_left_checkbox"
+        )
+        self.stair_nosing_right_checkbox = QCheckBox("Right")
+        self.stair_nosing_right_checkbox.setObjectName(
+            "stair_nosing_right_checkbox"
+        )
+        self.stair_nosing_front_checkbox = QCheckBox("Front")
+        self.stair_nosing_front_checkbox.setObjectName(
+            "stair_nosing_front_checkbox"
+        )
+        self.stair_nosing_front_checkbox.setChecked(True)
+        nosing_placement_widget = QWidget()
+        nosing_placement_layout = QHBoxLayout(nosing_placement_widget)
+        nosing_placement_layout.setContentsMargins(0, 0, 0, 0)
+        nosing_placement_layout.setSpacing(1)
+        for checkbox in (
+            self.stair_nosing_left_checkbox,
+            self.stair_nosing_right_checkbox,
+            self.stair_nosing_front_checkbox,
+        ):
+            checkbox.toggled.connect(self._handle_stair_parameter_changed)
+            checkbox.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Fixed,
+            )
+            nosing_placement_layout.addWidget(checkbox, 1)
+        nosing_placement_widget.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        self.stair_nosing_placement_label = QLabel("Nosing placement")
+        self.stair_nosing_placement_label.setWordWrap(False)
+        nosing_row_layout.addWidget(self.stair_nosing_placement_label, 1, 0)
+        nosing_row_layout.addWidget(nosing_placement_widget, 1, 1)
+        nosing_row_layout.setColumnStretch(1, 1)
+        stair_parameters_layout.addRow(self.stair_nosing_row_widget)
+
+        self.stair_tread_edge_combo = QComboBox()
+        self.stair_tread_edge_combo.setObjectName("stair_tread_edge_combo")
+        self.stair_tread_edge_combo.addItem(
+            "Straight",
+            STAIR_TREAD_EDGE_STRAIGHT,
+        )
+        self.stair_tread_edge_combo.addItem(
+            "Rounded",
+            STAIR_TREAD_EDGE_ROUNDED,
+        )
+        self.stair_tread_edge_combo.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.stair_tread_edge_combo.currentIndexChanged.connect(
+            self._sync_stair_tread_edge_radius_enabled
+        )
+        self.stair_tread_edge_combo.currentIndexChanged.connect(
+            self._handle_stair_parameter_changed
+        )
+
+        self.stair_tread_edge_radius_spinbox = QDoubleSpinBox()
+        self.stair_tread_edge_radius_spinbox.setObjectName(
+            "stair_tread_edge_radius_spinbox"
+        )
+        self.stair_tread_edge_radius_spinbox.setRange(
+            MIN_STAIR_TREAD_EDGE_RADIUS_METERS * 100.0,
+            MAX_STAIR_TREAD_EDGE_RADIUS_METERS * 100.0,
+        )
+        self.stair_tread_edge_radius_spinbox.setDecimals(1)
+        self.stair_tread_edge_radius_spinbox.setSingleStep(0.5)
+        self.stair_tread_edge_radius_spinbox.setSuffix(" cm")
+        self.stair_tread_edge_radius_spinbox.setValue(
+            DEFAULT_STAIR_TREAD_EDGE_RADIUS_METERS * 100.0
+        )
+        stair_tread_edge_radius_tooltip = (
+            "Rounds each tread's exposed front and checked left/right edges. "
+            "The effective radius is clamped when the tread does not have "
+            "enough depth."
+        )
+        self.stair_tread_edge_radius_spinbox.setToolTip(
+            stair_tread_edge_radius_tooltip
+        )
+        self.stair_tread_edge_radius_spinbox.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.stair_tread_edge_radius_spinbox.valueChanged.connect(
+            self._handle_stair_parameter_changed
+        )
+
+        self.stair_tread_edge_row_widget = QWidget()
+        self.stair_tread_edge_row_widget.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        tread_edge_row_layout = QHBoxLayout(self.stair_tread_edge_row_widget)
+        tread_edge_row_layout.setContentsMargins(0, 0, 0, 0)
+        tread_edge_row_layout.setSpacing(6)
+        self.stair_tread_edge_label = QLabel("Tread edge")
+        self.stair_tread_edge_label.setWordWrap(False)
+        self.stair_tread_edge_radius_label = QLabel("Edge radius")
+        self.stair_tread_edge_radius_label.setWordWrap(False)
+        self.stair_tread_edge_radius_label.setToolTip(
+            stair_tread_edge_radius_tooltip
+        )
+        self.stair_tread_edge_field_widget = QWidget()
+        self.stair_tread_edge_radius_field_widget = QWidget()
+        tread_edge_fields = (
+            (
+                self.stair_tread_edge_field_widget,
+                self.stair_tread_edge_label,
+                self.stair_tread_edge_combo,
+            ),
+            (
+                self.stair_tread_edge_radius_field_widget,
+                self.stair_tread_edge_radius_label,
+                self.stair_tread_edge_radius_spinbox,
+            ),
+        )
+        for field_widget, field_label, field_control in tread_edge_fields:
+            field_widget.setSizePolicy(
+                QSizePolicy.Policy.Ignored,
+                QSizePolicy.Policy.Preferred,
+            )
+            field_label.setSizePolicy(
+                QSizePolicy.Policy.Fixed,
+                QSizePolicy.Policy.Preferred,
+            )
+            field_layout = QVBoxLayout(field_widget)
+            field_layout.setContentsMargins(0, 0, 0, 0)
+            field_layout.setSpacing(2)
+            field_layout.addWidget(field_label)
+            field_layout.addWidget(field_control)
+            tread_edge_row_layout.addWidget(field_widget, 1)
+        stair_parameters_layout.addRow(self.stair_tread_edge_row_widget)
+        self._sync_stair_tread_edge_radius_enabled()
+
+        self.stair_starting_step_combo = QComboBox()
+        self.stair_starting_step_combo.setObjectName(
+            "stair_starting_step_combo"
+        )
+        self.stair_starting_step_combo.addItem(
+            "None",
+            STAIR_STARTING_STEP_NONE,
+        )
+        self.stair_starting_step_combo.addItem(
+            "Bullnose",
+            STAIR_STARTING_STEP_BULLNOSE,
+        )
+        self.stair_starting_step_combo.addItem(
+            "Curtail",
+            STAIR_STARTING_STEP_CURTAIL,
+        )
+        self.stair_starting_step_combo.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.stair_starting_step_combo.currentIndexChanged.connect(
+            self._sync_stair_starting_step_edge_radius_enabled
+        )
+        self.stair_starting_step_combo.currentIndexChanged.connect(
+            self._handle_stair_parameter_changed
+        )
+
+        self.stair_starting_step_edge_radius_spinbox = QDoubleSpinBox()
+        self.stair_starting_step_edge_radius_spinbox.setObjectName(
+            "stair_starting_step_edge_radius_spinbox"
+        )
+        self.stair_starting_step_edge_radius_spinbox.setRange(
+            MIN_STAIR_STARTING_STEP_EDGE_RADIUS_METERS * 100.0,
+            MAX_STAIR_STARTING_STEP_EDGE_RADIUS_METERS * 100.0,
+        )
+        self.stair_starting_step_edge_radius_spinbox.setDecimals(1)
+        self.stair_starting_step_edge_radius_spinbox.setSingleStep(1.0)
+        self.stair_starting_step_edge_radius_spinbox.setSuffix(" cm")
+        self.stair_starting_step_edge_radius_spinbox.setValue(
+            DEFAULT_STAIR_STARTING_STEP_EDGE_RADIUS_METERS * 100.0
+        )
+        stair_starting_step_radius_tooltip = (
+            "Controls the Bullnose or Curtail curve in plan view. The effective "
+            "radius is clamped to the available tread width and depth."
+        )
+        self.stair_starting_step_edge_radius_spinbox.setToolTip(
+            stair_starting_step_radius_tooltip
+        )
+        self.stair_starting_step_edge_radius_spinbox.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.stair_starting_step_edge_radius_spinbox.valueChanged.connect(
+            self._handle_stair_parameter_changed
+        )
+
+        self.stair_starting_step_edge_points_spinbox = QSpinBox()
+        self.stair_starting_step_edge_points_spinbox.setObjectName(
+            "stair_starting_step_edge_points_spinbox"
+        )
+        self.stair_starting_step_edge_points_spinbox.setRange(
+            MIN_STAIR_STARTING_STEP_EDGE_POINTS,
+            MAX_STAIR_STARTING_STEP_EDGE_POINTS,
+        )
+        self.stair_starting_step_edge_points_spinbox.setSingleStep(1)
+        self.stair_starting_step_edge_points_spinbox.setValue(
+            DEFAULT_STAIR_STARTING_STEP_EDGE_POINTS
+        )
+        stair_starting_step_points_tooltip = (
+            "Controls the starting-step arch detail. One uses one midpoint; "
+            "each higher value adds one matching point on each side for a "
+            "rounder result."
+        )
+        self.stair_starting_step_edge_points_spinbox.setToolTip(
+            stair_starting_step_points_tooltip
+        )
+        self.stair_starting_step_edge_points_spinbox.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.stair_starting_step_edge_points_spinbox.valueChanged.connect(
+            self._handle_stair_parameter_changed
+        )
+
+        self.stair_starting_step_row_widget = QWidget()
+        self.stair_starting_step_row_widget.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        starting_step_row_layout = QVBoxLayout(
+            self.stair_starting_step_row_widget
+        )
+        starting_step_row_layout.setContentsMargins(0, 0, 0, 0)
+        starting_step_row_layout.setSpacing(6)
+        self.stair_starting_step_label = QLabel("Starting step")
+        self.stair_starting_step_label.setWordWrap(False)
+        self.stair_starting_step_edge_radius_label = QLabel("Edge radius")
+        self.stair_starting_step_edge_radius_label.setWordWrap(False)
+        self.stair_starting_step_edge_radius_label.setToolTip(
+            stair_starting_step_radius_tooltip
+        )
+        self.stair_starting_step_edge_points_label = QLabel("Points")
+        self.stair_starting_step_edge_points_label.setToolTip(
+            stair_starting_step_points_tooltip
+        )
+        self.stair_starting_step_field_widget = QWidget()
+        self.stair_starting_step_edge_radius_field_widget = QWidget()
+        self.stair_starting_step_edge_points_field_widget = QWidget()
+        self.stair_starting_step_field_widget.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        starting_step_field_layout = QHBoxLayout(
+            self.stair_starting_step_field_widget
+        )
+        starting_step_field_layout.setContentsMargins(0, 0, 0, 0)
+        starting_step_field_layout.setSpacing(6)
+        starting_step_field_layout.addWidget(self.stair_starting_step_label)
+        starting_step_field_layout.addWidget(self.stair_starting_step_combo, 1)
+        starting_step_row_layout.addWidget(self.stair_starting_step_field_widget)
+
+        self.stair_starting_step_detail_row_widget = QWidget()
+        detail_row_layout = QHBoxLayout(
+            self.stair_starting_step_detail_row_widget
+        )
+        detail_row_layout.setContentsMargins(0, 0, 0, 0)
+        detail_row_layout.setSpacing(6)
+        starting_step_detail_fields = (
+            (
+                self.stair_starting_step_edge_radius_field_widget,
+                self.stair_starting_step_edge_radius_label,
+                self.stair_starting_step_edge_radius_spinbox,
+            ),
+            (
+                self.stair_starting_step_edge_points_field_widget,
+                self.stair_starting_step_edge_points_label,
+                self.stair_starting_step_edge_points_spinbox,
+            ),
+        )
+        for field_widget, field_label, field_control in starting_step_detail_fields:
+            field_widget.setSizePolicy(
+                QSizePolicy.Policy.Ignored,
+                QSizePolicy.Policy.Preferred,
+            )
+            field_label.setSizePolicy(
+                QSizePolicy.Policy.Fixed,
+                QSizePolicy.Policy.Preferred,
+            )
+            field_control.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Fixed,
+            )
+            field_layout = QVBoxLayout(field_widget)
+            field_layout.setContentsMargins(0, 0, 0, 0)
+            field_layout.setSpacing(2)
+            field_layout.addWidget(field_label)
+            field_layout.addWidget(field_control)
+            detail_row_layout.addWidget(field_widget, 1)
+        starting_step_row_layout.addWidget(
+            self.stair_starting_step_detail_row_widget
+        )
+        stair_parameters_layout.addRow(self.stair_starting_step_row_widget)
+        self._sync_stair_starting_step_edge_radius_enabled()
+
+        self.stair_stringer_placement_combo = QComboBox()
+        self.stair_stringer_placement_combo.setObjectName(
+            "stair_stringer_placement_combo"
+        )
+        self.stair_stringer_placement_combo.addItem("None", STAIR_STRINGER_NONE)
+        self.stair_stringer_placement_combo.addItem("Left", STAIR_STRINGER_LEFT)
+        self.stair_stringer_placement_combo.addItem("Right", STAIR_STRINGER_RIGHT)
+        self.stair_stringer_placement_combo.addItem("Both", STAIR_STRINGER_BOTH)
+        self.stair_stringer_placement_combo.setCurrentIndex(
+            self.stair_stringer_placement_combo.findData(
+                DEFAULT_STAIR_STRINGER_PLACEMENT
+            )
+        )
+        self.stair_stringer_placement_combo.currentIndexChanged.connect(
+            self._handle_stair_parameter_changed
+        )
+        stair_parameters_layout.addRow(
+            "Stringer placement",
+            self.stair_stringer_placement_combo,
+        )
+
+        self.stair_calculated_step_count_label = QLabel("—")
+        self.stair_calculated_step_count_label.setObjectName(
+            "stair_calculated_step_count_label"
+        )
+        stair_parameters_layout.addRow(
+            "Calculated step count",
+            self.stair_calculated_step_count_label,
+        )
+
+        self.stair_actual_rise_label = QLabel("—")
+        self.stair_actual_rise_label.setObjectName("stair_actual_rise_label")
+        stair_parameters_layout.addRow(
+            "Actual rise",
+            self.stair_actual_rise_label,
+        )
+        stairs_layout.addLayout(stair_parameters_layout)
+
+        # ### Responsive Stairs row layout ###
+        nosing_inline_state = (True, True)
+        placement_checkbox_width = max(
+            checkbox.minimumSizeHint().width()
+            for checkbox in (
+                self.stair_nosing_left_checkbox,
+                self.stair_nosing_right_checkbox,
+                self.stair_nosing_front_checkbox,
+            )
+        )
+        for checkbox in (
+            self.stair_nosing_left_checkbox,
+            self.stair_nosing_right_checkbox,
+            self.stair_nosing_front_checkbox,
+        ):
+            checkbox.setMinimumWidth(placement_checkbox_width)
+
+        def sync_stair_rows_to_viewport(viewport_width: int) -> None:
+            nonlocal nosing_inline_state
+
+            # The group border and its layout margins consume 28 px.
+            usable_form_width = max(0, viewport_width - 28)
+            overhang_inline = usable_form_width >= (
+                self.stair_nosing_overhang_label.sizeHint().width()
+                + nosing_row_layout.horizontalSpacing()
+                + self.stair_nosing_overhang_spinbox.minimumSizeHint().width()
+            )
+            placement_inline = usable_form_width >= (
+                self.stair_nosing_placement_label.sizeHint().width()
+                + nosing_row_layout.horizontalSpacing()
+                + 3 * placement_checkbox_width
+                + 2 * nosing_placement_layout.spacing()
+            )
+            next_inline_state = (overhang_inline, placement_inline)
+            layout_changed = next_inline_state != nosing_inline_state
+            if layout_changed:
+                for widget in (
+                    self.stair_nosing_overhang_label,
+                    self.stair_nosing_overhang_spinbox,
+                    self.stair_nosing_placement_label,
+                    nosing_placement_widget,
+                ):
+                    nosing_row_layout.removeWidget(widget)
+                if overhang_inline:
+                    nosing_row_layout.addWidget(self.stair_nosing_overhang_label, 0, 0)
+                    nosing_row_layout.addWidget(
+                        self.stair_nosing_overhang_spinbox, 0, 1
+                    )
+                    placement_row = 1
+                else:
+                    nosing_row_layout.addWidget(
+                        self.stair_nosing_overhang_label, 0, 0, 1, 2
+                    )
+                    nosing_row_layout.addWidget(
+                        self.stair_nosing_overhang_spinbox, 1, 0, 1, 2
+                    )
+                    placement_row = 2
+                if placement_inline:
+                    nosing_row_layout.addWidget(
+                        self.stair_nosing_placement_label, placement_row, 0
+                    )
+                    nosing_row_layout.addWidget(
+                        nosing_placement_widget, placement_row, 1
+                    )
+                else:
+                    nosing_row_layout.addWidget(
+                        self.stair_nosing_placement_label,
+                        placement_row,
+                        0,
+                        1,
+                        2,
+                    )
+                    nosing_row_layout.addWidget(
+                        nosing_placement_widget,
+                        placement_row + 1,
+                        0,
+                        1,
+                        2,
+                    )
+                nosing_inline_state = next_inline_state
+
+            single_field_controls = (
+                self.stair_type_combo,
+                self.stair_step_rise_target_spinbox,
+                self.stair_tread_thickness_spinbox,
+                self.stair_stringer_placement_combo,
+                self.stair_calculated_step_count_label,
+                self.stair_actual_rise_label,
+            )
+            widest_label = max(
+                stair_parameters_layout.labelForField(control).sizeHint().width()
+                for control in single_field_controls
+            )
+            widest_control = max(
+                control.minimumSizeHint().width()
+                for control in single_field_controls
+            )
+            row_wrap_policy = (
+                QFormLayout.RowWrapPolicy.DontWrapRows
+                if usable_form_width
+                >= widest_label
+                + stair_parameters_layout.horizontalSpacing()
+                + widest_control
+                else QFormLayout.RowWrapPolicy.WrapLongRows
+            )
+            if stair_parameters_layout.rowWrapPolicy() != row_wrap_policy:
+                stair_parameters_layout.setRowWrapPolicy(row_wrap_policy)
+                layout_changed = True
+
+            if layout_changed:
+                stair_parameters_layout.invalidate()
+                stairs_layout.invalidate()
+                stairs_layout.activate()
+            sync_stairs_scroll_height()
+            QTimer.singleShot(0, sync_stairs_scroll_height)
 
         self.stair_status_label = QLabel("Stairs: none")
         self.stair_status_label.setWordWrap(True)
@@ -1928,7 +2621,71 @@ class BlueprintWorkspace(QWidget):
         self.add_stairs_button.setMinimumHeight(40)
         self.add_stairs_button.clicked.connect(self._handle_add_stairs_clicked)
         stairs_layout.addWidget(self.add_stairs_button)
-        side_layout.addWidget(self.stairs_group)
+        # The local scroll area protects readable field widths if the entire
+        # application is resized narrower than the editor can reflow.
+        minimum_stair_form_width = max(
+            self.stair_starting_step_label.sizeHint().width()
+            + starting_step_field_layout.spacing()
+            + self.stair_starting_step_combo.minimumSizeHint().width(),
+            2
+            * max(
+                self.stair_tread_edge_label.sizeHint().width(),
+                self.stair_tread_edge_combo.minimumSizeHint().width(),
+                self.stair_tread_edge_radius_label.sizeHint().width(),
+                self.stair_tread_edge_radius_spinbox.minimumSizeHint().width(),
+            )
+            + tread_edge_row_layout.spacing(),
+            3 * placement_checkbox_width
+            + 2 * nosing_placement_layout.spacing(),
+        )
+        self.stairs_group.setMinimumWidth(minimum_stair_form_width + 16)
+        self.stairs_scroll_area = QScrollArea()
+        self.stairs_scroll_area.setWidgetResizable(True)
+        self.stairs_scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.stairs_scroll_area.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.stairs_scroll_area.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
+        self.stairs_scroll_area.setWidget(self.stairs_group)
+        side_layout.addWidget(self.stairs_scroll_area)
+
+        def sync_stairs_scroll_height() -> None:
+            # Only the outer Generals page should scroll vertically. Refresh
+            # once more after Qt settles a responsive layout change.
+            editor_height = self.stairs_group.sizeHint().height()
+            if self.stairs_group.maximumHeight() != editor_height:
+                self.stairs_group.setMaximumHeight(editor_height)
+            scroll_height = (
+                editor_height
+                + 2
+                + self.stairs_scroll_area.horizontalScrollBar().sizeHint().height()
+            )
+            if self.stairs_scroll_area.minimumHeight() != scroll_height:
+                self.stairs_scroll_area.setMinimumHeight(scroll_height)
+
+        self._stair_editor_height_filter = StairEditorHeightFilter(
+            self.stairs_group,
+            (self.stairs_group, self.stair_nosing_row_widget),
+            sync_stairs_scroll_height,
+        )
+        self.stairs_group.installEventFilter(self._stair_editor_height_filter)
+        self.stair_nosing_row_widget.installEventFilter(
+            self._stair_editor_height_filter
+        )
+
+        self._stairs_scroll_width_filter = ViewportWidthRowFilter(
+            generals_tab.viewport(),
+            (self.stairs_scroll_area,),
+            horizontal_inset=10,
+            on_width_changed=sync_stair_rows_to_viewport,
+        )
+        generals_tab.viewport().installEventFilter(self._stairs_scroll_width_filter)
+        self._stairs_scroll_width_filter.sync_widths()
 
         self.doorways_group = QGroupBox("Doorways")
         doorways_layout = QVBoxLayout(self.doorways_group)
@@ -2116,9 +2873,13 @@ class BlueprintWorkspace(QWidget):
             spinbox.lineEdit().installEventFilter(
                 self._generals_value_input_wheel_filter
             )
-        self.stair_style_combo.installEventFilter(
-            self._generals_value_input_wheel_filter
-        )
+        for combo in (
+            self.stair_type_combo,
+            self.stair_tread_edge_combo,
+            self.stair_starting_step_combo,
+            self.stair_stringer_placement_combo,
+        ):
+            combo.installEventFilter(self._generals_value_input_wheel_filter)
         for slider in (
             self.level_scale_slider,
             self.level_x_offset_slider,
@@ -2132,7 +2893,7 @@ class BlueprintWorkspace(QWidget):
         self.workspace_splitter.addWidget(self.side_panel)
         self.workspace_splitter.setStretchFactor(0, 9)
         self.workspace_splitter.setStretchFactor(1, 1)
-        self.workspace_splitter.setSizes([1160, 440])
+        self.workspace_splitter.setSizes([1060, 540])
 
         self.canvas.geometry_changed.connect(
             self._handle_canvas_surface_geometry_changed
@@ -2396,6 +3157,7 @@ class BlueprintWorkspace(QWidget):
             raw_reference if isinstance(raw_reference, CanvasOpeningReference) else None
         )
         if reference is not None:
+            self._discard_staged_stair_edit(clear_selection=True)
             self._desired_canvas_object_id = None
             self._desired_canvas_object_ids = ()
             self._desired_canvas_surface_ids = ()
@@ -2603,11 +3365,6 @@ class BlueprintWorkspace(QWidget):
             for surface_id in self._desired_canvas_surface_ids
             if surface_id in installed_surface_ids
         )
-        self._atlas_surface_assignment_target_ids = tuple(
-            surface_id
-            for surface_id in self._atlas_surface_assignment_target_ids
-            if surface_id in installed_surface_ids
-        )
         self._is_syncing_canvas_scene_selection = True
         try:
             self.viewer.set_wall_targets(surface_targets)
@@ -2630,15 +3387,6 @@ class BlueprintWorkspace(QWidget):
                 )
         finally:
             self._is_syncing_canvas_scene_selection = False
-        self._sync_surface_generation_selection(
-            self._desired_canvas_surface_ids
-        )
-        selected_surface_source_id = self._selected_atlas_surface_source_id
-        if selected_surface_source_id is not None:
-            self._handle_atlas_surface_texture_selected(selected_surface_source_id)
-        else:
-            self.viewer.set_highlighted_canvas_surface_ids(())
-            self._sync_atlas_green_outline_to_canvas_highlight(None)
         try:
             opening_targets = build_canvas_opening_targets(
                 self.levels,
@@ -2660,9 +3408,208 @@ class BlueprintWorkspace(QWidget):
             target.key: target for target in opening_targets
         }
         self.viewer.set_canvas_opening_targets(opening_targets)
+        stair_part_targets = self._sync_canvas_stair_semantic_targets(
+            self._build_viewer_preview_levels()
+        )
+        assignable_surface_ids = (
+            installed_surface_ids
+            | self._canvas_stair_semantic_surfaces_by_id.keys()
+        )
+        self._atlas_surface_assignment_target_ids = tuple(
+            surface_id
+            for surface_id in self._atlas_surface_assignment_target_ids
+            if surface_id in assignable_surface_ids
+        )
+        self._desired_canvas_stair_part_ids = tuple(
+            semantic_id
+            for semantic_id in self._desired_canvas_stair_part_ids
+            if semantic_id in self._canvas_stair_part_targets_by_id
+        )
+        self._is_syncing_canvas_scene_selection = True
+        try:
+            self.viewer.set_canvas_stair_part_targets(stair_part_targets)
+            if self._desired_canvas_stair_part_ids:
+                self.viewer.set_selected_canvas_stair_part_ids(
+                    self._desired_canvas_stair_part_ids
+                )
+        finally:
+            self._is_syncing_canvas_scene_selection = False
+        self._sync_surface_generation_selection(
+            self._desired_canvas_stair_part_ids
+            or self._desired_canvas_surface_ids
+        )
+        selected_surface_source_id = self._selected_atlas_surface_source_id
+        if selected_surface_source_id is not None:
+            self._handle_atlas_surface_texture_selected(selected_surface_source_id)
+        else:
+            self._set_atlas_canvas_surface_highlights(())
+            self._sync_atlas_green_outline_to_canvas_highlight(None)
         self._sync_selected_canvas_wall_highlight(
             self.viewer.get_active_canvas_surface_id()
         )
+
+    # ### Canvas stair editor ###
+    def _sync_canvas_stair_semantic_targets(
+        self,
+        levels: Sequence[LevelData],
+    ) -> tuple[PreviewStairPart, ...]:
+        """Publish authoritative stair groups to selection and texture state."""
+
+        stair_part_targets_list: list[PreviewStairPart] = []
+        for stair_index, stair in enumerate(self.stairs):
+            try:
+                stair_part_targets_list.extend(
+                    build_canvas_stair_part_targets(
+                        levels,
+                        (stair,),
+                        stair_indices=(stair_index,),
+                    )
+                )
+            except (TypeError, ValueError):
+                continue
+        stair_part_targets = tuple(stair_part_targets_list)
+        self._canvas_stair_part_targets_by_id = {
+            target.semantic_id: target for target in stair_part_targets
+        }
+        stair_semantic_surfaces = tuple(
+            FixedSurface(
+                surface_id=target.semantic_id,
+                surface_type=target.surface_type,
+                level_index=target.level_indices[0],
+                room_index=None,
+                mesh=target.mesh,
+                area_square_meters=float(target.mesh.area),
+            )
+            for target in stair_part_targets
+            if target.level_indices and float(target.mesh.area) > 0.0
+        )
+        self._canvas_stair_semantic_surfaces_by_id = {
+            surface.surface_id: surface for surface in stair_semantic_surfaces
+        }
+        self.surface_texture_generation.set_external_semantic_surfaces(
+            stair_semantic_surfaces
+        )
+        return stair_part_targets
+
+    def _reconcile_surface_assignments_with_scene(
+        self,
+        *,
+        emit_signals: bool = True,
+    ) -> bool:
+        """Rebuild procedural targets before reconciling shared assignments."""
+
+        if hasattr(self, "stairs"):
+            BlueprintWorkspace._sync_canvas_stair_semantic_targets(
+                self,
+                self.levels,
+            )
+        if hasattr(self, "_stair_preview_update_timer"):
+            BlueprintWorkspace._refresh_stair_editor_geometry(self)
+        if emit_signals:
+            return self.surface_texture_generation.reconcile_assignments_with_levels(
+                self.levels
+            )
+        return self.surface_texture_generation.reconcile_assignments_with_levels(
+            self.levels,
+            emit_signals=False,
+        )
+
+    def _retarget_canvas_stair_selection_after_edit(
+        self,
+        edited_stair_id: str,
+    ) -> None:
+        """Keep an edited stair selected when its previous part disappears."""
+
+        retained_ids = [
+            semantic_id
+            for semantic_id in self._desired_canvas_stair_part_ids
+            if semantic_id in self._canvas_stair_part_targets_by_id
+        ]
+        retains_edited_stair = any(
+            self._canvas_stair_part_targets_by_id[semantic_id].stair_id
+            == edited_stair_id
+            for semantic_id in retained_ids
+        )
+        if not retains_edited_stair:
+            fallback = next(
+                (
+                    target.semantic_id
+                    for target in self._canvas_stair_part_targets_by_id.values()
+                    if target.stair_id == edited_stair_id
+                    and target.part_kind == STAIR_PART_TREADS
+                ),
+                None,
+            )
+            if fallback is not None:
+                retained_ids.append(fallback)
+        self._desired_canvas_stair_part_ids = tuple(dict.fromkeys(retained_ids))
+        self._atlas_surface_assignment_target_ids = (
+            self._desired_canvas_stair_part_ids
+        )
+        self._sync_surface_generation_selection(
+            self._desired_canvas_stair_part_ids
+        )
+
+    def _handle_canvas_stair_part_selection_changed(
+        self,
+        raw_semantic_ids: object,
+    ) -> None:
+        """Load the owner of any selected stair part into the editor."""
+
+        if self._is_syncing_canvas_scene_selection:
+            return
+        try:
+            semantic_ids = tuple(
+                dict.fromkeys(
+                    str(value)
+                    for value in raw_semantic_ids  # type: ignore[union-attr]
+                )
+            )
+        except TypeError:
+            return
+        semantic_ids = tuple(
+            semantic_id
+            for semantic_id in semantic_ids
+            if semantic_id in self._canvas_stair_part_targets_by_id
+        )
+        self._desired_canvas_stair_part_ids = semantic_ids
+        target = (
+            self._canvas_stair_part_targets_by_id.get(semantic_ids[-1])
+            if semantic_ids
+            else None
+        )
+        stair_index = None if target is None else int(target.stair_index)
+        if stair_index is None or not 0 <= stair_index < len(self.stairs):
+            self._discard_staged_stair_edit(clear_selection=True)
+            self._atlas_surface_assignment_target_ids = ()
+            self._sync_surface_generation_selection(())
+            return
+        self._desired_canvas_object_id = None
+        self._desired_canvas_object_ids = ()
+        self._desired_canvas_surface_ids = ()
+        self._atlas_surface_assignment_target_ids = semantic_ids
+        self._sync_surface_generation_selection(semantic_ids)
+        if self._editing_stair_index == stair_index:
+            return
+
+        if self._editing_stair_index is None:
+            self._new_stair_parameters = self._read_stair_editor_parameters()
+        self._discard_staged_stair_edit(clear_selection=False)
+        self._editing_stair_index = stair_index
+        self._load_stair_editor_from_stair(self.stairs[stair_index])
+        self._update_stair_button_state()
+
+    def _handle_canvas_stair_preview_cancelled(self) -> None:
+        """Restore persisted settings after Escape or transient undo."""
+
+        self._discard_staged_stair_edit(clear_selection=False)
+
+    def _handle_canvas_stair_escape_requested(self) -> None:
+        """Discard a field change even before its preview debounce expires."""
+
+        if self._pending_stair_parameters is None:
+            return
+        self._discard_staged_stair_edit(clear_selection=False)
 
     # ### Canvas surface selection synchronization ###
     def _get_canvas_wall_surface_ids(
@@ -2701,6 +3648,7 @@ class BlueprintWorkspace(QWidget):
         self._desired_canvas_surface_ids = surface_ids
         self._atlas_surface_assignment_target_ids = surface_ids
         if surface_ids:
+            self._discard_staged_stair_edit(clear_selection=True)
             self._desired_canvas_object_id = None
             self._desired_canvas_object_ids = ()
         self._sync_surface_generation_selection(surface_ids)
@@ -2734,7 +3682,10 @@ class BlueprintWorkspace(QWidget):
             surface
             for surface_id in dict.fromkeys(str(value) for value in surface_ids)
             if (
-                surface := self._canvas_surface_targets_by_id.get(surface_id)
+                surface := (
+                    self._canvas_surface_targets_by_id.get(surface_id)
+                    or self._canvas_stair_semantic_surfaces_by_id.get(surface_id)
+                )
             )
             is not None
         )
@@ -3003,9 +3954,86 @@ class BlueprintWorkspace(QWidget):
             ),
         )
 
+    def _capture_canvas_stairs_undo_state(self) -> _CanvasStairsUndoState:
+        """Capture stairs plus texture bindings that a stair edit may change."""
+
+        editing_stair_id = (
+            self.stairs[self._editing_stair_index].stair_id
+            if self._editing_stair_index is not None
+            and 0 <= self._editing_stair_index < len(self.stairs)
+            else None
+        )
+        assignments = self.surface_texture_generation.snapshot_assignments()
+        assignment_source_ids = {
+            build_atlas_wall_texture_source_id(assignment.assignment_id)
+            for assignment in assignments
+        }
+        atlas_placements = tuple(
+            (atlas.atlas_id, placement)
+            for atlas in self.texture_atlas_workspace.get_data().atlases
+            for placement in atlas.placements
+            if placement.object_id in assignment_source_ids
+        )
+        return _CanvasStairsUndoState(
+            stairs=tuple(self.stairs),
+            assignments=assignments,
+            atlas_placements=atlas_placements,
+            selected_stair_part_ids=self._desired_canvas_stair_part_ids,
+            assignment_target_ids=self._atlas_surface_assignment_target_ids,
+            editing_stair_id=editing_stair_id,
+        )
+
+    def _finalize_canvas_stairs_undo_state(
+        self,
+        state: _CanvasStairsUndoState,
+    ) -> None:
+        """Limit the newest stair history entry to bindings it changed."""
+
+        current_by_id = {
+            assignment.assignment_id: assignment
+            for assignment in self.surface_texture_generation.snapshot_assignments()
+        }
+        affected_assignments = tuple(
+            assignment
+            for assignment in state.assignments
+            if _surface_assignment_target_signature(assignment)
+            != _surface_assignment_target_signature(
+                current_by_id.get(assignment.assignment_id)
+            )
+        )
+        affected_source_ids = {
+            build_atlas_wall_texture_source_id(assignment.assignment_id)
+            for assignment in affected_assignments
+        }
+        finalized_state = replace(
+            state,
+            assignments=affected_assignments,
+            assignment_targets_after=tuple(
+                current_by_id[assignment.assignment_id]
+                for assignment in affected_assignments
+                if assignment.assignment_id in current_by_id
+            ),
+            atlas_placements=tuple(
+                (atlas_id, placement)
+                for atlas_id, placement in state.atlas_placements
+                if placement.object_id in affected_source_ids
+            ),
+        )
+        if self._canvas_undo_stack and self._canvas_undo_stack[-1] is state:
+            self._canvas_undo_stack[-1] = finalized_state
+
     def _handle_canvas_undo_requested(self) -> None:
         """Undo the latest committed Canvas action from either Canvas view."""
 
+        if (
+            self._pending_stair_parameters is not None
+            or self._staged_stair is not None
+        ):
+            self._discard_staged_stair_edit(clear_selection=False)
+            self.viewer.set_surface_tools_status(
+                "Current stair changes discarded."
+            )
+            return
         if self.canvas.cancel_open_space_placement():
             self.viewer.set_surface_tools_status(
                 "Current open-space placement cancelled."
@@ -3068,7 +4096,9 @@ class BlueprintWorkspace(QWidget):
                     for member in reversed(state.members)
                 )
             elif isinstance(state, _CanvasStairsUndoState):
-                self._restore_canvas_stairs_undo_state(state)
+                skipped_texture_bindings = (
+                    self._restore_canvas_stairs_undo_state(state)
+                )
             else:
                 skipped_texture_bindings = self._restore_blueprint_undo_state(state)
         except (RuntimeError, TypeError, ValueError) as error:
@@ -3128,7 +4158,7 @@ class BlueprintWorkspace(QWidget):
             )
             self.canvas.update()
         self._sync_canvas_wall_mirror_state()
-        self.surface_texture_generation.reconcile_assignments_with_levels(self.levels)
+        self._reconcile_surface_assignments_with_scene()
         self._refresh_scene_atlas_texture_requirements()
         self._schedule_viewer_preview_refresh(preserve_camera=True)
 
@@ -3261,13 +4291,117 @@ class BlueprintWorkspace(QWidget):
     def _restore_canvas_stairs_undo_state(
         self,
         state: _CanvasStairsUndoState,
-    ) -> None:
-        """Restore the stairs collection before one Canvas add or deletion."""
+    ) -> int:
+        """Restore one stair transaction and unchanged texture bindings."""
 
         self.stairs = list(state.stairs)
         self.canvas.set_stair_context(self.stairs, self.current_level)
+        self._staged_stair = None
+        self.viewer.clear_canvas_stair_preview()
+        self._sync_canvas_stair_semantic_targets(self.levels)
+
+        expected_by_id = {
+            assignment.assignment_id: assignment
+            for assignment in state.assignment_targets_after
+        }
+        current_by_id = {
+            assignment.assignment_id: assignment
+            for assignment in self.surface_texture_generation.snapshot_assignments()
+        }
+        restorable_assignments = tuple(
+            assignment
+            for assignment in state.assignments
+            if (
+                assignment.assignment_id in expected_by_id
+                and _surface_assignment_target_signature(
+                    current_by_id.get(assignment.assignment_id)
+                )
+                == _surface_assignment_target_signature(
+                    expected_by_id[assignment.assignment_id]
+                )
+            )
+        )
+        self.surface_texture_generation.restore_assignment_target_snapshot(
+            restorable_assignments,
+            emit_signals=False,
+        )
+        self.surface_texture_generation.reconcile_assignments_with_levels(
+            self.levels,
+            emit_signals=False,
+        )
+        restorable_assignment_ids = {
+            assignment.assignment_id for assignment in restorable_assignments
+        }
+        restorable_source_ids = {
+            build_atlas_wall_texture_source_id(assignment_id)
+            for assignment_id in restorable_assignment_ids
+        }
+        restorable_atlas_placements = tuple(
+            (atlas_id, placement)
+            for atlas_id, placement in state.atlas_placements
+            if placement.object_id in restorable_source_ids
+        )
+
+        self._atlas_generation_signature = None
+        self._sync_atlas_object_texture_sources(
+            automatically_assign_scene_textures=False
+        )
+        skipped_atlas_placements = self._restore_canvas_atlas_placements(
+            restorable_atlas_placements
+        )
+        self.texture_atlas_workspace.refresh_texture_source_content(
+            tuple(
+                dict.fromkeys(
+                    placement.object_id
+                    for _atlas_id, placement in restorable_atlas_placements
+                )
+            )
+        )
+
+        self._desired_canvas_stair_part_ids = tuple(
+            semantic_id
+            for semantic_id in state.selected_stair_part_ids
+            if semantic_id in self._canvas_stair_part_targets_by_id
+        )
+        assignable_surface_ids = (
+            self._canvas_surface_targets_by_id.keys()
+            | self._canvas_stair_semantic_surfaces_by_id.keys()
+        )
+        self._atlas_surface_assignment_target_ids = tuple(
+            surface_id
+            for surface_id in state.assignment_target_ids
+            if surface_id in assignable_surface_ids
+        )
+        self._editing_stair_index = next(
+            (
+                stair_index
+                for stair_index, stair in enumerate(self.stairs)
+                if stair.stair_id == state.editing_stair_id
+            ),
+            None,
+        )
+        if (
+            self._editing_stair_index is not None
+            and 0 <= self._editing_stair_index < len(self.stairs)
+        ):
+            self._load_stair_editor_from_stair(
+                self.stairs[self._editing_stair_index]
+            )
+        else:
+            self._editing_stair_index = None
+            self._desired_canvas_stair_part_ids = ()
+            self._set_stair_editor_parameters(self._new_stair_parameters)
+            self._sync_stair_calculated_values(None)
+        self._sync_surface_generation_selection(
+            self._desired_canvas_stair_part_ids
+        )
         self._update_stair_button_state()
         self._schedule_viewer_preview_refresh(preserve_camera=True)
+        return (
+            len(state.assignments)
+            - len(restorable_assignments)
+            + skipped_atlas_placements
+        )
 
     def _restore_blueprint_undo_state(
         self,
@@ -3290,9 +4424,7 @@ class BlueprintWorkspace(QWidget):
             level.open_spaces.clear()
             level.open_spaces.extend(state.snapshot.open_spaces)
             self._reset_viewer_doorway_snapshots()
-            self.surface_texture_generation.reconcile_assignments_with_levels(
-                self.levels
-            )
+            self._reconcile_surface_assignments_with_scene()
             self._schedule_viewer_preview_refresh(preserve_camera=True)
         for other_level_index, vertex_data in state.other_level_vertex_data:
             other_level = self._get_level_by_index(other_level_index)
@@ -3739,9 +4871,7 @@ class BlueprintWorkspace(QWidget):
             return False
 
         if result.requires_mesh_refresh:
-            self.surface_texture_generation.reconcile_assignments_with_levels(
-                self.levels
-            )
+            BlueprintWorkspace._reconcile_surface_assignments_with_scene(self)
         if result.state_changed:
             self._record_canvas_undo_state(
                 BlueprintWorkspace._finalize_canvas_topology_undo_state(
@@ -4017,9 +5147,7 @@ class BlueprintWorkspace(QWidget):
         """Reconcile semantic assignments before one structural mesh rebuild."""
 
         assignments_changed = (
-            self.surface_texture_generation.reconcile_assignments_with_levels(
-                self.levels
-            )
+            self._reconcile_surface_assignments_with_scene()
         )
         self._finalize_blueprint_surface_binding_undo_state()
         if not assignments_changed:
@@ -4438,6 +5566,7 @@ class BlueprintWorkspace(QWidget):
         self._desired_canvas_object_ids = normalized_object_ids
         self._desired_canvas_object_id = normalized_active_id
         if normalized_object_ids:
+            self._discard_staged_stair_edit(clear_selection=True)
             self._desired_canvas_surface_ids = ()
             self._atlas_surface_assignment_target_ids = ()
             self._sync_surface_generation_selection(())
@@ -4475,6 +5604,20 @@ class BlueprintWorkspace(QWidget):
     def _restore_desired_canvas_scene_selection(self) -> None:
         """Reapply the last semantic Canvas selection after a model refresh."""
 
+        if self._desired_canvas_stair_part_ids:
+            was_syncing_selection = self._is_syncing_canvas_scene_selection
+            self._is_syncing_canvas_scene_selection = True
+            try:
+                self.viewer.set_selected_placed_object_ids(())
+                self.viewer.select_canvas_opening(None)
+                self.viewer.set_selected_canvas_surface_ids(())
+                self.viewer.set_selected_canvas_stair_part_ids(
+                    self._desired_canvas_stair_part_ids
+                )
+            finally:
+                self._is_syncing_canvas_scene_selection = was_syncing_selection
+            self._sync_selected_canvas_wall_highlight(None)
+            return
         desired_object_ids = getattr(
             self,
             "_desired_canvas_object_ids",
@@ -7056,7 +8199,7 @@ class BlueprintWorkspace(QWidget):
             )
         if self._selected_atlas_surface_source_id in removed_source_ids:
             self._selected_atlas_surface_source_id = None
-            self.viewer.set_highlighted_canvas_surface_ids(())
+            self._set_atlas_canvas_surface_highlights(())
             self._sync_atlas_green_outline_to_canvas_highlight(None)
         for assignment_id in removable_assignment_ids:
             self._atlas_wall_texture_source_ids.discard(
@@ -7081,7 +8224,7 @@ class BlueprintWorkspace(QWidget):
         self._selected_atlas_surface_source_id = None
         self._desired_canvas_object_id = None
         self._desired_canvas_object_ids = ()
-        self.viewer.set_highlighted_canvas_surface_ids(())
+        self._set_atlas_canvas_surface_highlights(())
         self._sync_atlas_green_outline_to_canvas_highlight(None)
         self._is_syncing_canvas_scene_selection = True
         try:
@@ -7100,15 +8243,17 @@ class BlueprintWorkspace(QWidget):
         self._desired_canvas_object_id = normalized_id
         self._desired_canvas_object_ids = (normalized_id,)
         self._desired_canvas_surface_ids = ()
+        self._discard_staged_stair_edit(clear_selection=True)
         self._sync_surface_generation_selection(())
         self.generation.select_generated_object(normalized_id)
-        self.viewer.set_highlighted_canvas_surface_ids(())
+        self._set_atlas_canvas_surface_highlights(())
         self._sync_atlas_green_outline_to_canvas_highlight(None)
         self._is_syncing_canvas_scene_selection = True
         try:
             self.viewer.select_placed_object(None)
             self.viewer.select_canvas_opening(None)
             self.viewer.select_wall_target(None)
+            self.viewer.set_selected_canvas_stair_part_ids(())
             self.viewer.select_placed_object(normalized_id)
         finally:
             self._is_syncing_canvas_scene_selection = False
@@ -7119,18 +8264,40 @@ class BlueprintWorkspace(QWidget):
         assignment_id = get_atlas_wall_texture_assignment_id(source_id)
         if assignment_id is None:
             self._selected_atlas_surface_source_id = None
-            self.viewer.set_highlighted_canvas_surface_ids(())
+            self._set_atlas_canvas_surface_highlights(())
             self._sync_atlas_green_outline_to_canvas_highlight(None)
             return
         assignment = self.surface_texture_generation.get_assignment(assignment_id)
         if assignment is None:
             self._selected_atlas_surface_source_id = None
-            self.viewer.set_highlighted_canvas_surface_ids(())
+            self._set_atlas_canvas_surface_highlights(())
             self._sync_atlas_green_outline_to_canvas_highlight(None)
             return
         self._selected_atlas_surface_source_id = source_id
-        self.viewer.set_highlighted_canvas_surface_ids(assignment.surface_ids)
+        self._set_atlas_canvas_surface_highlights(assignment.surface_ids)
         self._sync_atlas_green_outline_to_canvas_highlight(source_id)
+
+    def _set_atlas_canvas_surface_highlights(
+        self,
+        surface_ids: Sequence[str],
+    ) -> None:
+        """Split Atlas highlighting between architecture and stair parts."""
+
+        normalized_ids = tuple(dict.fromkeys(str(value) for value in surface_ids))
+        self.viewer.set_highlighted_canvas_surface_ids(
+            tuple(
+                surface_id
+                for surface_id in normalized_ids
+                if surface_id in self._canvas_surface_targets_by_id
+            )
+        )
+        self.viewer.set_highlighted_canvas_stair_part_ids(
+            tuple(
+                surface_id
+                for surface_id in normalized_ids
+                if surface_id in self._canvas_stair_part_targets_by_id
+            )
+        )
 
     def _sync_atlas_green_outline_to_canvas_highlight(
         self,
@@ -7144,7 +8311,10 @@ class BlueprintWorkspace(QWidget):
         outlined_source_ids = (
             (normalized_source_id,)
             if normalized_source_id is not None
-            and self.viewer.get_highlighted_canvas_surface_ids()
+            and (
+                self.viewer.get_highlighted_canvas_surface_ids()
+                or self.viewer.get_highlighted_canvas_stair_part_ids()
+            )
             else ()
         )
         self.texture_atlas_workspace.set_green_outline_source_ids(outlined_source_ids)
@@ -7280,7 +8450,7 @@ class BlueprintWorkspace(QWidget):
             normalized_source_id
         )
         if self._selected_atlas_surface_source_id == normalized_source_id:
-            self.viewer.set_highlighted_canvas_surface_ids(())
+            self._set_atlas_canvas_surface_highlights(())
             self._sync_atlas_green_outline_to_canvas_highlight(None)
         self._atlas_generation_signature = None
         self._sync_atlas_object_texture_sources()
@@ -7449,7 +8619,10 @@ class BlueprintWorkspace(QWidget):
 
         if self._atlas_surface_assignment_target_ids:
             return self._atlas_surface_assignment_target_ids
-        return self.viewer.get_selected_canvas_surface_ids()
+        selected_surface_ids = self.viewer.get_selected_canvas_surface_ids()
+        if selected_surface_ids:
+            return selected_surface_ids
+        return self.viewer.get_selected_canvas_stair_part_ids()
 
     def _atlas_surface_targets_match_assignment(
         self,
@@ -7834,6 +9007,15 @@ class BlueprintWorkspace(QWidget):
         exported_surface_ids = {
             surface.surface_id for surface in build_fixed_surfaces(self.levels)
         }
+        exported_surface_ids.update(
+            semantic_id
+            for semantic_id, target in self._canvas_stair_part_targets_by_id.items()
+            if target.level_indices
+            and all(
+                level_index in included_level_indices
+                for level_index in target.level_indices
+            )
+        )
         required_ids.extend(
             source_id
             for surface_id, source_id in (
@@ -9905,16 +11087,457 @@ class BlueprintWorkspace(QWidget):
         self.doorway_preset_list.blockSignals(False)
         self._update_doorway_preset_button_state()
 
+    # ### Stair control helpers ###
+    def _sync_stair_tread_edge_radius_enabled(
+        self,
+        _index: int | None = None,
+    ) -> None:
+        """Enable edge-radius editing only for a rounded modern tread."""
+
+        has_rounded_edge = (
+            self.stair_tread_edge_combo.currentData()
+            == STAIR_TREAD_EDGE_ROUNDED
+        )
+        placement_active = self.canvas.is_stair_placement_active()
+        self.stair_tread_edge_radius_label.setEnabled(has_rounded_edge)
+        self.stair_tread_edge_radius_spinbox.setEnabled(
+            has_rounded_edge and not placement_active
+        )
+
+    def _sync_stair_starting_step_edge_radius_enabled(
+        self,
+        _index: int | None = None,
+    ) -> None:
+        """Enable starting-curve editing only when a profile is selected."""
+
+        has_starting_step = (
+            self.stair_starting_step_combo.currentData()
+            != STAIR_STARTING_STEP_NONE
+        )
+        placement_active = self.canvas.is_stair_placement_active()
+        self.stair_starting_step_edge_radius_label.setEnabled(has_starting_step)
+        self.stair_starting_step_edge_radius_spinbox.setEnabled(
+            has_starting_step and not placement_active
+        )
+        self.stair_starting_step_edge_points_label.setEnabled(has_starting_step)
+        self.stair_starting_step_edge_points_spinbox.setEnabled(
+            has_starting_step and not placement_active
+        )
+
+    def _stair_parameter_controls(self) -> tuple[QWidget, ...]:
+        """Return every control locked while a placement draft is active."""
+
+        return (
+            self.stair_type_combo,
+            self.stair_step_rise_target_spinbox,
+            self.stair_tread_thickness_spinbox,
+            self.stair_nosing_overhang_spinbox,
+            self.stair_nosing_left_checkbox,
+            self.stair_nosing_right_checkbox,
+            self.stair_nosing_front_checkbox,
+            self.stair_tread_edge_combo,
+            self.stair_tread_edge_radius_spinbox,
+            self.stair_starting_step_combo,
+            self.stair_starting_step_edge_radius_spinbox,
+            self.stair_starting_step_edge_points_spinbox,
+            self.stair_stringer_placement_combo,
+        )
+
+    def _read_stair_editor_parameters(self) -> _StairEditorParameters:
+        """Capture one normalized parameter set from the Canvas controls."""
+
+        return _StairEditorParameters(
+            stair_type=str(
+                self.stair_type_combo.currentData() or DEFAULT_STAIR_TYPE
+            ),
+            target_rise_meters=float(
+                self.stair_step_rise_target_spinbox.value()
+            ) / 100.0,
+            tread_thickness_meters=float(
+                self.stair_tread_thickness_spinbox.value()
+            ) / 100.0,
+            tread_overhang_meters=float(
+                self.stair_nosing_overhang_spinbox.value()
+            ) / 100.0,
+            nosing_placements=tuple(
+                placement
+                for placement, checkbox in (
+                    (STAIR_NOSING_LEFT, self.stair_nosing_left_checkbox),
+                    (STAIR_NOSING_RIGHT, self.stair_nosing_right_checkbox),
+                    (STAIR_NOSING_FRONT, self.stair_nosing_front_checkbox),
+                )
+                if checkbox.isChecked()
+            ),
+            tread_edge_profile=str(
+                self.stair_tread_edge_combo.currentData()
+                or DEFAULT_STAIR_TREAD_EDGE_PROFILE
+            ),
+            tread_edge_radius_meters=float(
+                self.stair_tread_edge_radius_spinbox.value()
+            )
+            / 100.0,
+            starting_step=str(
+                self.stair_starting_step_combo.currentData()
+                or DEFAULT_STAIR_STARTING_STEP
+            ),
+            starting_step_edge_radius_meters=float(
+                self.stair_starting_step_edge_radius_spinbox.value()
+            )
+            / 100.0,
+            starting_step_edge_points=int(
+                self.stair_starting_step_edge_points_spinbox.value()
+            ),
+            stringer_placement=str(
+                self.stair_stringer_placement_combo.currentData()
+                or DEFAULT_STAIR_STRINGER_PLACEMENT
+            ),
+        )
+
+    @staticmethod
+    def _stair_editor_parameters_for_stair(
+        stair: StairData,
+    ) -> _StairEditorParameters:
+        """Expose one persisted stair through the supported editor choices."""
+
+        stair_type = str(stair.stair_type)
+        if stair_type not in {STAIR_TYPE_SUPPORTED, STAIR_TYPE_FLOATING}:
+            stair_type = (
+                STAIR_TYPE_FLOATING
+                if stair.style in {
+                    STAIR_STYLE_FLOATING,
+                    STAIR_STYLE_FLOATING_WITH_RISER,
+                }
+                else STAIR_TYPE_SUPPORTED
+            )
+        tread_edge_profile = str(stair.tread_edge_profile)
+        if tread_edge_profile not in {
+            STAIR_TREAD_EDGE_STRAIGHT,
+            STAIR_TREAD_EDGE_ROUNDED,
+        }:
+            tread_edge_profile = DEFAULT_STAIR_TREAD_EDGE_PROFILE
+        starting_step = str(stair.starting_step)
+        if starting_step not in {
+            STAIR_STARTING_STEP_NONE,
+            STAIR_STARTING_STEP_BULLNOSE,
+            STAIR_STARTING_STEP_CURTAIL,
+        }:
+            starting_step = DEFAULT_STAIR_STARTING_STEP
+        stringer_placement = str(stair.stringer_placement)
+        if stringer_placement not in {
+            STAIR_STRINGER_NONE,
+            STAIR_STRINGER_LEFT,
+            STAIR_STRINGER_RIGHT,
+            STAIR_STRINGER_BOTH,
+        }:
+            stringer_placement = DEFAULT_STAIR_STRINGER_PLACEMENT
+        return _StairEditorParameters(
+            stair_type=stair_type,
+            target_rise_meters=float(stair.target_rise_meters),
+            tread_thickness_meters=float(stair.tread_thickness_meters),
+            tread_overhang_meters=float(stair.tread_overhang_meters),
+            nosing_placements=tuple(stair.nosing_placements),
+            tread_edge_profile=tread_edge_profile,
+            tread_edge_radius_meters=float(stair.tread_edge_radius_meters),
+            starting_step=starting_step,
+            starting_step_edge_radius_meters=float(
+                stair.starting_step_edge_radius_meters
+            ),
+            starting_step_edge_points=int(stair.starting_step_edge_points),
+            stringer_placement=stringer_placement,
+        )
+
+    def _set_stair_editor_parameters(
+        self,
+        parameters: _StairEditorParameters,
+    ) -> None:
+        """Load controls without recursively staging a stair preview."""
+
+        self._is_syncing_stair_controls = True
+        try:
+            for combo, value in (
+                (self.stair_type_combo, parameters.stair_type),
+                (self.stair_tread_edge_combo, parameters.tread_edge_profile),
+                (self.stair_starting_step_combo, parameters.starting_step),
+                (
+                    self.stair_stringer_placement_combo,
+                    parameters.stringer_placement,
+                ),
+            ):
+                index = combo.findData(value)
+                combo.setCurrentIndex(max(0, index))
+            self.stair_step_rise_target_spinbox.setValue(
+                parameters.target_rise_meters * 100.0
+            )
+            self.stair_tread_thickness_spinbox.setValue(
+                parameters.tread_thickness_meters * 100.0
+            )
+            self.stair_nosing_overhang_spinbox.setValue(
+                parameters.tread_overhang_meters * 100.0
+            )
+            self.stair_tread_edge_radius_spinbox.setValue(
+                parameters.tread_edge_radius_meters * 100.0
+            )
+            self.stair_starting_step_edge_radius_spinbox.setValue(
+                parameters.starting_step_edge_radius_meters * 100.0
+            )
+            self.stair_starting_step_edge_points_spinbox.setValue(
+                parameters.starting_step_edge_points
+            )
+            selected_nosing_placements = set(parameters.nosing_placements)
+            for checkbox, placement in (
+                (self.stair_nosing_left_checkbox, STAIR_NOSING_LEFT),
+                (self.stair_nosing_right_checkbox, STAIR_NOSING_RIGHT),
+                (self.stair_nosing_front_checkbox, STAIR_NOSING_FRONT),
+            ):
+                checkbox.setChecked(placement in selected_nosing_placements)
+        finally:
+            self._is_syncing_stair_controls = False
+        self._sync_stair_tread_edge_radius_enabled()
+        self._sync_stair_starting_step_edge_radius_enabled()
+
+    def _load_stair_editor_from_stair(self, stair: StairData) -> None:
+        """Load persisted settings and their derived step measurements."""
+
+        self._set_stair_editor_parameters(
+            self._stair_editor_parameters_for_stair(stair)
+        )
+        self._sync_stair_calculated_values(stair)
+
+    def _sync_stair_calculated_values(self, stair: StairData | None) -> None:
+        """Show exact step count and rise for a complete stair route."""
+
+        if stair is None:
+            self.stair_calculated_step_count_label.setText("—")
+            self.stair_actual_rise_label.setText("—")
+            return
+        try:
+            base_z_by_level = build_level_base_z_lookup(self.levels)
+            total_rise = abs(
+                float(base_z_by_level[stair.end_level_index])
+                - float(base_z_by_level[stair.start_level_index])
+            )
+            step_count, actual_rise = calculate_stair_step_layout(
+                total_rise,
+                stair.target_rise_meters,
+            )
+        except (KeyError, TypeError, ValueError):
+            self.stair_calculated_step_count_label.setText("—")
+            self.stair_actual_rise_label.setText("—")
+            return
+        self.stair_calculated_step_count_label.setText(str(step_count))
+        self.stair_actual_rise_label.setText(f"{actual_rise * 100.0:.1f} cm")
+
+    def _refresh_stair_editor_geometry(self) -> None:
+        """Rebuild selected-stair preview data after scene geometry changes."""
+
+        stair_index = self._editing_stair_index
+        if stair_index is not None and 0 <= stair_index < len(self.stairs):
+            if self._pending_stair_parameters is not None:
+                self._stair_preview_update_timer.stop()
+                self._rebuild_staged_stair_preview()
+                return
+            if self._staged_stair is not None:
+                self._pending_stair_parameters = (
+                    self._stair_editor_parameters_for_stair(self._staged_stair)
+                )
+                self._rebuild_staged_stair_preview()
+                return
+            self._sync_stair_calculated_values(self.stairs[stair_index])
+            return
+
+        draft = self.canvas.get_stair_placement_draft()
+        if draft is None:
+            self._sync_stair_calculated_values(None)
+            return
+        try:
+            stair = _build_stair_data_from_placement(
+                draft,
+                self._read_stair_editor_parameters(),
+            )
+        except (TypeError, ValueError):
+            self._sync_stair_calculated_values(None)
+        else:
+            self._sync_stair_calculated_values(stair)
+
+    @staticmethod
+    def _apply_stair_editor_parameters(
+        stair: StairData,
+        parameters: _StairEditorParameters,
+    ) -> StairData:
+        """Return a stair with only its editable geometry settings changed."""
+
+        if parameters == BlueprintWorkspace._stair_editor_parameters_for_stair(
+            stair
+        ):
+            return stair
+        return replace(
+            stair,
+            stair_type=parameters.stair_type,
+            target_rise_meters=parameters.target_rise_meters,
+            tread_thickness_meters=parameters.tread_thickness_meters,
+            tread_overhang_meters=parameters.tread_overhang_meters,
+            nosing_placements=parameters.nosing_placements,
+            tread_edge_profile=parameters.tread_edge_profile,
+            tread_edge_radius_meters=parameters.tread_edge_radius_meters,
+            starting_step=parameters.starting_step,
+            starting_step_edge_radius_meters=(
+                parameters.starting_step_edge_radius_meters
+            ),
+            starting_step_edge_points=parameters.starting_step_edge_points,
+            stringer_placement=parameters.stringer_placement,
+            legacy_part_layout=False,
+        )
+
+    def _handle_stair_parameter_changed(self, _value: object = None) -> None:
+        """Stage selected-stair geometry or remember settings for a new one."""
+
+        if self._is_syncing_stair_controls:
+            return
+        parameters = self._read_stair_editor_parameters()
+        stair_index = self._editing_stair_index
+        if stair_index is None or not 0 <= stair_index < len(self.stairs):
+            self._new_stair_parameters = parameters
+            draft = self.canvas.get_stair_placement_draft()
+            if draft is None:
+                self._sync_stair_calculated_values(None)
+                return
+            try:
+                stair = _build_stair_data_from_placement(draft, parameters)
+            except (TypeError, ValueError):
+                self._sync_stair_calculated_values(None)
+            else:
+                self._sync_stair_calculated_values(stair)
+            return
+
+        self._pending_stair_parameters = parameters
+        self._stair_preview_update_timer.start()
+        self._update_stair_button_state()
+
+    def _rebuild_staged_stair_preview(self) -> None:
+        """Build one coalesced geometry overlay after stair fields settle."""
+
+        parameters = self._pending_stair_parameters
+        self._pending_stair_parameters = None
+        stair_index = self._editing_stair_index
+        if (
+            parameters is None
+            or stair_index is None
+            or not 0 <= stair_index < len(self.stairs)
+        ):
+            self._update_stair_button_state()
+            return
+        persisted_stair = self.stairs[stair_index]
+        try:
+            candidate = self._apply_stair_editor_parameters(
+                persisted_stair,
+                parameters,
+            )
+            if candidate == persisted_stair:
+                self._staged_stair = None
+                self.viewer.clear_canvas_stair_preview()
+                self._sync_stair_calculated_values(candidate)
+                self._update_stair_button_state()
+                return
+            preview_parts = build_canvas_stair_part_targets(
+                self.levels,
+                (candidate,),
+                stair_indices=(stair_index,),
+            )
+        except (TypeError, ValueError) as error:
+            self._staged_stair = None
+            self.viewer.clear_canvas_stair_preview()
+            self.stair_status_label.setText(f"Stair preview unavailable: {error}")
+            self._sync_stair_calculated_values(None)
+            self._update_stair_button_state()
+            return
+
+        self._sync_stair_calculated_values(candidate)
+        self._staged_stair = candidate
+        self.viewer.set_canvas_stair_preview(stair_index, preview_parts)
+        self.stair_status_label.setText(
+            "Previewing stair changes. Apply them or press Escape to discard."
+        )
+        self._update_stair_button_state()
+
+    def _discard_staged_stair_edit(self, *, clear_selection: bool) -> None:
+        """Discard the overlay and restore either persisted or creation values."""
+
+        self._stair_preview_update_timer.stop()
+        self._pending_stair_parameters = None
+        self._staged_stair = None
+        self.viewer.clear_canvas_stair_preview()
+        stair_index = self._editing_stair_index
+        if clear_selection:
+            self._editing_stair_index = None
+            self._desired_canvas_stair_part_ids = ()
+            self._set_stair_editor_parameters(self._new_stair_parameters)
+            self._sync_stair_calculated_values(None)
+        elif stair_index is not None and 0 <= stair_index < len(self.stairs):
+            self._load_stair_editor_from_stair(self.stairs[stair_index])
+        self._update_stair_button_state()
+
+    def _apply_staged_stair_edit(self) -> bool:
+        """Commit one complete preview as a single Ctrl+Z undo action."""
+
+        if self._pending_stair_parameters is not None:
+            self._stair_preview_update_timer.stop()
+            self._rebuild_staged_stair_preview()
+        stair_index = self._editing_stair_index
+        stair = self._staged_stair
+        if (
+            stair is None
+            or stair_index is None
+            or not 0 <= stair_index < len(self.stairs)
+        ):
+            return False
+        try:
+            build_stair_meshes(self.levels, (stair,))
+        except (TypeError, ValueError) as error:
+            self.stair_status_label.setText(f"Stair changes not applied: {error}")
+            return False
+
+        undo_state = self._capture_canvas_stairs_undo_state()
+        self._record_canvas_undo_state(undo_state)
+        self.stairs[stair_index] = stair
+        self._staged_stair = None
+        self.viewer.clear_canvas_stair_preview()
+        self.canvas.set_stair_context(self.stairs, self.current_level)
+        self._load_stair_editor_from_stair(stair)
+        self._update_stair_button_state()
+        self.stair_status_label.setText("Applied changes to stair.")
+        assignments_changed = self._reconcile_surface_assignments_with_scene()
+        self._retarget_canvas_stair_selection_after_edit(stair.stair_id)
+        self._finalize_canvas_stairs_undo_state(undo_state)
+        if not assignments_changed:
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+        return True
+
     def _update_stair_button_state(self) -> None:
         placement_active = self.canvas.is_stair_placement_active()
         has_complete_endpoints = self.canvas.get_stair_placement_draft() is not None
-        self.add_stairs_button.setText(
-            "Confirm stairs" if has_complete_endpoints else "Add stairs"
+        editing_stair = (
+            self._editing_stair_index is not None
+            and 0 <= self._editing_stair_index < len(self.stairs)
         )
-        self.add_stairs_button.setEnabled(
-            not placement_active or has_complete_endpoints
+        has_staged_changes = (
+            self._staged_stair is not None
+            or self._pending_stair_parameters is not None
         )
-        self.stair_style_combo.setEnabled(not placement_active)
+        if editing_stair:
+            button_text = "Apply changes to stair"
+            button_enabled = has_staged_changes
+        elif has_complete_endpoints:
+            button_text = "Confirm stairs"
+            button_enabled = True
+        else:
+            button_text = "Add stairs"
+            button_enabled = not placement_active
+        self.add_stairs_button.setText(button_text)
+        self.add_stairs_button.setEnabled(button_enabled)
+        for control in self._stair_parameter_controls():
+            control.setEnabled(not placement_active)
+        self._sync_stair_tread_edge_radius_enabled()
+        self._sync_stair_starting_step_edge_radius_enabled()
 
     def _get_selected_doorway_preset(self) -> DoorwayPreset | None:
         selected_index = self.doorway_preset_list.currentRow()
@@ -10065,7 +11688,9 @@ class BlueprintWorkspace(QWidget):
             self._capture_canvas_level_properties_undo_state(self.current_level)
         )
         self.current_level.height_meters = next_value
-        self._schedule_viewer_preview_refresh()
+        assignments_changed = self._reconcile_surface_assignments_with_scene()
+        if not assignments_changed:
+            self._schedule_viewer_preview_refresh()
 
     def _handle_floor_thickness_changed(self, value: float) -> None:
         """Stage a floor thickness change for one delayed mesh rebuild."""
@@ -11049,11 +12674,20 @@ class BlueprintWorkspace(QWidget):
             self._doorway_mesh_update_timer.start()
 
     def _handle_add_stairs_clicked(self) -> None:
+        if (
+            self._staged_stair is not None
+            or self._pending_stair_parameters is not None
+        ):
+            self._apply_staged_stair_edit()
+            return
         draft = self.canvas.get_stair_placement_draft()
         if draft is not None:
             if self.canvas.is_stair_ready_for_confirmation():
                 try:
-                    stair = _build_stair_data_from_placement(draft)
+                    stair = _build_stair_data_from_placement(
+                        draft,
+                        self._read_stair_editor_parameters(),
+                    )
                     build_stair_meshes(self.levels, [stair])
                 except (TypeError, ValueError) as error:
                     self.stair_status_label.setText(f"Stair not added: {error}")
@@ -11071,10 +12705,14 @@ class BlueprintWorkspace(QWidget):
             )
             return
 
-        style = self.stair_style_combo.currentData()
+        if self._editing_stair_index is not None:
+            self.viewer.set_selected_canvas_stair_part_ids(())
+            self._discard_staged_stair_edit(clear_selection=True)
+        parameters = self._read_stair_editor_parameters()
+        self._new_stair_parameters = parameters
         self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
         self.canvas.start_stair_placement(
-            DEFAULT_STAIR_STYLE if style is None else str(style)
+            parameters.stair_type
         )
         self._update_stair_button_state()
         self.stair_status_label.setText(
@@ -11105,9 +12743,19 @@ class BlueprintWorkspace(QWidget):
             f"{_format_level_name(self.levels, start_level_index)}. "
             "Select a different level, then click two points for its opening."
         )
+        self._sync_stair_calculated_values(None)
         self._update_stair_button_state()
 
     def _handle_stair_placement_ready(self, placement: object) -> None:
+        try:
+            preview_stair = _build_stair_data_from_placement(
+                placement,
+                self._read_stair_editor_parameters(),
+            )
+        except (TypeError, ValueError):
+            self._sync_stair_calculated_values(None)
+        else:
+            self._sync_stair_calculated_values(preview_stair)
         intermediate_count = len(_get_stair_intermediate_section_payloads(placement))
         guide_text = (
             "No curve guides added yet."
@@ -11125,7 +12773,10 @@ class BlueprintWorkspace(QWidget):
 
     def _handle_stair_placement_completed(self, placement: object) -> None:
         try:
-            stair = _build_stair_data_from_placement(placement)
+            stair = _build_stair_data_from_placement(
+                placement,
+                self._read_stair_editor_parameters(),
+            )
         except (TypeError, ValueError) as error:
             self.stair_status_label.setText(f"Stair not added: {error}")
             self._update_stair_button_state()
@@ -11138,9 +12789,8 @@ class BlueprintWorkspace(QWidget):
             self._update_stair_button_state()
             return
 
-        self._record_canvas_undo_state(
-            _CanvasStairsUndoState(stairs=tuple(self.stairs))
-        )
+        undo_state = self._capture_canvas_stairs_undo_state()
+        self._record_canvas_undo_state(undo_state)
         self.stairs.append(stair)
         self.canvas.set_stair_context(self.stairs, self.current_level)
         self.stair_status_label.setText(
@@ -11149,13 +12799,18 @@ class BlueprintWorkspace(QWidget):
             f"{_format_level_name(self.levels, stair.start_level_index)} to "
             f"{_format_level_name(self.levels, stair.end_level_index)}."
         )
+        self._sync_stair_calculated_values(stair)
         self._update_stair_button_state()
+        assignments_changed = self._reconcile_surface_assignments_with_scene()
+        self._finalize_canvas_stairs_undo_state(undo_state)
         # A stair can extend beyond the previously framed house bounds. Refit
         # the Canvas 3D view so a successful placement is visible immediately.
-        self._schedule_viewer_preview_refresh(preserve_camera=False)
+        if not assignments_changed:
+            self._schedule_viewer_preview_refresh(preserve_camera=False)
 
     def _handle_stair_placement_cancelled(self) -> None:
         self.stair_status_label.setText("Stair placement cancelled.")
+        self._sync_stair_calculated_values(None)
         self._update_stair_button_state()
 
     def _handle_stair_placement_invalid_endpoint(self, message: str) -> None:
@@ -11234,14 +12889,22 @@ class BlueprintWorkspace(QWidget):
         if not 0 <= stair_index < len(self.stairs):
             return
 
-        self._record_canvas_undo_state(
-            _CanvasStairsUndoState(stairs=tuple(self.stairs))
-        )
+        undo_state = self._capture_canvas_stairs_undo_state()
+        self._record_canvas_undo_state(undo_state)
+        editing_index = self._editing_stair_index
+        if editing_index == stair_index:
+            self.viewer.set_selected_canvas_stair_part_ids(())
+            self._discard_staged_stair_edit(clear_selection=True)
+        elif editing_index is not None and editing_index > stair_index:
+            self._editing_stair_index = editing_index - 1
         del self.stairs[stair_index]
         self.canvas.set_stair_context(self.stairs, self.current_level)
         self._update_stair_button_state()
         self.stair_status_label.setText("Stair deleted.")
-        self._schedule_viewer_preview_refresh()
+        assignments_changed = self._reconcile_surface_assignments_with_scene()
+        self._finalize_canvas_stairs_undo_state(undo_state)
+        if not assignments_changed:
+            self._schedule_viewer_preview_refresh()
 
     def _handle_generation_settings_changed(self) -> None:
         settings = self.settings_widget.get_settings()
@@ -11260,6 +12923,9 @@ class BlueprintWorkspace(QWidget):
         )
         self.viewer.set_ignore_top_down_ceiling(
             settings.ignore_top_down_ceiling
+        )
+        self.viewer.set_hide_stair_mesh_when_previewing(
+            settings.hide_stair_mesh_when_previewing
         )
         self.canvas.set_snap_middle_equal_angle_only(
             settings.snap_middle_equal_angle_only
@@ -11283,9 +12949,7 @@ class BlueprintWorkspace(QWidget):
             self._restart_pending_wall_vertex_update_if_idle()
             return
         assignments_changed = (
-            self.surface_texture_generation.reconcile_assignments_with_levels(
-                self.levels
-            )
+            self._reconcile_surface_assignments_with_scene()
         )
         self._finalize_blueprint_surface_binding_undo_state()
         if not assignments_changed:
@@ -11405,6 +13069,8 @@ class BlueprintWorkspace(QWidget):
         self._cancel_pending_canvas_surface_mesh_update()
         self._cancel_pending_wall_vertex_update()
         self._cancel_pending_doorway_mesh_update(clear_outline=True)
+        self._stair_preview_update_timer.stop()
+        self._pending_stair_parameters = None
         self.canvas.cancel_open_space_placement()
         self.canvas.cancel_stair_placement()
         self._desired_canvas_object_id = None
@@ -11413,7 +13079,7 @@ class BlueprintWorkspace(QWidget):
         self._active_canvas_surface_drawing_vertex_id = None
         self._atlas_surface_assignment_target_ids = ()
         self._selected_atlas_surface_source_id = None
-        self.viewer.set_highlighted_canvas_surface_ids(())
+        self._set_atlas_canvas_surface_highlights(())
         self.texture_atlas_workspace.set_green_outline_source_ids(())
         self._canvas_window_undo_ids.clear()
         self._clear_canvas_undo_history()
@@ -11427,6 +13093,15 @@ class BlueprintWorkspace(QWidget):
         self._reset_viewer_doorway_snapshots()
         self._level_blueprint_image_revisions.clear()
         self.stairs = list(stairs or [])
+        self._editing_stair_index = None
+        self._staged_stair = None
+        self._desired_canvas_stair_part_ids = ()
+        self._canvas_stair_part_targets_by_id = {}
+        self._canvas_stair_semantic_surfaces_by_id = {}
+        self.surface_texture_generation.set_external_semantic_surfaces(())
+        self.viewer.clear_canvas_stair_preview()
+        self._set_stair_editor_parameters(self._new_stair_parameters)
+        self._sync_stair_calculated_values(None)
         self.image_library_paths = self._normalize_image_library_paths(
             image_library_paths or []
         )
@@ -11466,16 +13141,40 @@ class BlueprintWorkspace(QWidget):
         self._sync_viewer_scene_levels(reset_visibility=True)
         self.texture_atlas_workspace.set_data(texture_atlases)
         self.surface_texture_generation.set_levels(self.levels)
+        self._sync_canvas_stair_semantic_targets(self.levels)
         self.surface_texture_generation.set_data(surface_texture_generation)
-        self._desired_canvas_surface_ids = tuple(
+        restored_surface_ids = tuple(
             surface_texture_generation.selected_surface_ids
         )
-        self._atlas_surface_assignment_target_ids = (
-            self._desired_canvas_surface_ids
+        self._desired_canvas_stair_part_ids = tuple(
+            surface_id
+            for surface_id in restored_surface_ids
+            if surface_id in self._canvas_stair_part_targets_by_id
         )
+        self._desired_canvas_surface_ids = tuple(
+            surface_id
+            for surface_id in restored_surface_ids
+            if surface_id not in self._canvas_stair_part_targets_by_id
+        )
+        self._atlas_surface_assignment_target_ids = restored_surface_ids
+        selected_stair_target = (
+            self._canvas_stair_part_targets_by_id.get(
+                self._desired_canvas_stair_part_ids[-1]
+            )
+            if self._desired_canvas_stair_part_ids
+            else None
+        )
+        if (
+            selected_stair_target is not None
+            and 0 <= selected_stair_target.stair_index < len(self.stairs)
+        ):
+            self._editing_stair_index = selected_stair_target.stair_index
+            self._load_stair_editor_from_stair(
+                self.stairs[self._editing_stair_index]
+            )
+        self._update_stair_button_state()
         self.merged_generation_workspace.sync_shared_controls()
-        self.surface_texture_generation.reconcile_assignments_with_levels(
-            self.levels,
+        self._reconcile_surface_assignments_with_scene(
             emit_signals=False,
         )
         self._atlas_generation_signature = None
@@ -11691,10 +13390,13 @@ def _build_stair_section_data(section: object) -> StairSectionData:
     )
 
 
-def _build_stair_data_from_placement(placement: object) -> StairData:
+def _build_stair_data_from_placement(
+    placement: object,
+    parameters: _StairEditorParameters | None = None,
+) -> StairData:
     """Convert a complete Canvas draft into the persistent stair model."""
 
-    return StairData(
+    stair = StairData(
         start_level_index=int(
             _get_stair_placement_value(placement, "start_level_index")
         ),
@@ -11729,6 +13431,9 @@ def _build_stair_data_from_placement(placement: object) -> StairData:
             for section in _get_stair_intermediate_section_payloads(placement)
         ),
     )
+    if parameters is None:
+        return stair
+    return BlueprintWorkspace._apply_stair_editor_parameters(stair, parameters)
 
 
 def _format_doorway_preset_label(doorway_preset: DoorwayPreset) -> str:

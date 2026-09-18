@@ -5,6 +5,7 @@ import copy
 import math
 import threading
 import weakref
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from io import BytesIO
@@ -79,6 +80,7 @@ from housemaker.glb import (
     SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION,
     GeneratedModel,
     PreviewPlacedObject,
+    PreviewStairPart,
     PreviewTexturedWall,
     remove_covered_surface_faces,
 )
@@ -150,8 +152,15 @@ CANVAS_SCENE_FOCUS_TYPES = frozenset(
 )
 CANVAS_SELECTION_TARGET_SURFACE = "surface"
 CANVAS_SELECTION_TARGET_OBJECT = "object"
+CANVAS_SELECTION_TARGET_STAIR_PART = "stair_part"
 CANVAS_SELECTION_TARGET_OCCLUDER = "occluder"
 CANVAS_SELECTION_DEPTH_TIE_EPSILON = 1e-6
+CANVAS_STAIR_PREVIEW_COLOR = (0.20, 0.86, 0.48, 1.0)
+CANVAS_STAIR_PREVIEW_EDGE_COLOR = (0.30, 1.0, 0.58, 1.0)
+CANVAS_STAIR_PREVIEW_MIN_OPACITY = 0.16
+CANVAS_STAIR_PREVIEW_MAX_OPACITY = 0.68
+CANVAS_STAIR_PREVIEW_FADE_PERIOD_MILLISECONDS = 1_600
+CANVAS_STAIR_PREVIEW_UPDATE_INTERVAL_MILLISECONDS = 50
 ATLAS_SURFACE_HIGHLIGHT_COLOR = (0.20, 0.86, 0.38, 1.0)
 WINDOW_VALID_PREVIEW_COLOR = (0.20, 0.86, 0.38, 0.34)
 WINDOW_INVALID_PREVIEW_COLOR = (1.0, 0.24, 0.20, 0.34)
@@ -629,6 +638,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
     object_scale_wheel_steps_requested = Signal(int)
     delete_requested = Signal()
     undo_requested = Signal()
+    escape_requested = Signal()
     navigation_mode_changed = Signal(str)
     first_person_active_changed = Signal(bool)
     first_person_camera_pose_changed = Signal(object)
@@ -1599,6 +1609,10 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             self.rectangle_drawing_cancel_requested.emit()
             event.accept()
             return
+        if event.key() == Qt.Key.Key_Escape:
+            self.escape_requested.emit()
+            event.accept()
+            return
         if (
             self.is_first_person_active
             and not self._first_person_ctrl_interaction_active
@@ -1878,7 +1892,9 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             if key not in self.opts:
                 continue
             value = self.opts[key]
-            camera_state[key] = QVector3D(value) if isinstance(value, QVector3D) else value
+            camera_state[key] = (
+                QVector3D(value) if isinstance(value, QVector3D) else value
+            )
         return camera_state
 
     def _get_clicked_items(self, position: QPointF) -> list[object]:
@@ -2597,6 +2613,13 @@ class _SymmetricPreviewRenderGroup:
 
 
 @dataclass
+class _CanvasStairPreviewRenderGroup:
+    """One translucent semantic stair part in a staged edit preview."""
+
+    mesh_item: _WireframeOverlayMeshItem
+
+
+@dataclass
 class _PlacedObjectMeshRender:
     """Retained textured and fallback items for one local object mesh."""
 
@@ -2773,6 +2796,8 @@ class GlbViewerWidget(QWidget):
     object_placement_selected = Signal(str, object)
     object_placement_cancelled = Signal(str)
     canvas_surface_selection_changed = Signal(object)
+    canvas_stair_part_selection_changed = Signal(object)
+    canvas_stair_preview_cancelled = Signal()
     canvas_surface_orientation_flip_requested = Signal(str)
     face_selection_changed = Signal(object)
     projection_camera_selection_changed = Signal(object)
@@ -2806,6 +2831,7 @@ class GlbViewerWidget(QWidget):
         self.symmetric_preview_textured_mesh_item: TexturedMeshItem | None = None
         self.symmetric_preview_mesh_item: gl.GLMeshItem | None = None
         self.textured_surface_items: list[TexturedMeshItem] = []
+        self._textured_surface_item_ids: dict[TexturedMeshItem, str] = {}
         self.textured_wall_items: list[gl.GLImageItem] = []
         self.projection_camera_indicator_items: dict[
             str,
@@ -2951,6 +2977,22 @@ class GlbViewerWidget(QWidget):
         self._applying_canvas_rectangle_selection_result = False
         self._highlighted_canvas_surface_ids: tuple[str, ...] = ()
         self._atlas_surface_highlight_items: list[gl.GLLinePlotItem] = []
+        self._canvas_stair_part_targets: dict[str, PreviewStairPart] = {}
+        self._selected_canvas_stair_part_ids: tuple[str, ...] = ()
+        self._canvas_stair_part_selection_items: list[
+            gl.GLLinePlotItem
+        ] = []
+        self._highlighted_canvas_stair_part_ids: tuple[str, ...] = ()
+        self._atlas_stair_part_highlight_items: list[
+            gl.GLLinePlotItem
+        ] = []
+        self._canvas_stair_preview_stair_index: int | None = None
+        self._canvas_stair_preview_parts: tuple[PreviewStairPart, ...] = ()
+        self._hide_stair_mesh_when_previewing = True
+        self._canvas_stair_preview_groups: list[
+            _CanvasStairPreviewRenderGroup
+        ] = []
+        self._canvas_stair_preview_phase = 0.0
         self._selected_window_wall_surface_id: str | None = None
         self._window_drag_first_world: tuple[float, float, float] | None = None
         self._window_preview_placement: WallWindowPlacement | None = None
@@ -2988,6 +3030,13 @@ class GlbViewerWidget(QWidget):
         )
         self._symmetric_preview_timer.timeout.connect(
             self._advance_symmetric_preview_fade
+        )
+        self._canvas_stair_preview_timer = QTimer(self)
+        self._canvas_stair_preview_timer.setInterval(
+            CANVAS_STAIR_PREVIEW_UPDATE_INTERVAL_MILLISECONDS
+        )
+        self._canvas_stair_preview_timer.timeout.connect(
+            self._advance_canvas_stair_preview_fade
         )
         self._ambient_shader = _build_ambient_shader(
             self._ambient_light_intensity
@@ -3129,6 +3178,9 @@ class GlbViewerWidget(QWidget):
         )
         self.view.delete_requested.connect(self._handle_view_delete_requested)
         self.view.undo_requested.connect(self._forward_undo_request)
+        self.view.escape_requested.connect(
+            self._handle_view_escape_requested
+        )
         self.view.navigation_mode_changed.connect(
             self._handle_view_navigation_mode_changed
         )
@@ -3175,9 +3227,12 @@ class GlbViewerWidget(QWidget):
         super().showEvent(event)
         if self._get_symmetric_preview_groups():
             self._symmetric_preview_timer.start()
+        if self._canvas_stair_preview_groups:
+            self._canvas_stair_preview_timer.start()
 
     def hideEvent(self, event) -> None:  # type: ignore[override]
         self._symmetric_preview_timer.stop()
+        self._canvas_stair_preview_timer.stop()
         super().hideEvent(event)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
@@ -3735,6 +3790,17 @@ class GlbViewerWidget(QWidget):
             self._placed_object_level_indices.get(str(object_id))
         )
 
+    def _canvas_stair_part_is_visible(self, part: PreviewStairPart) -> bool:
+        """Keep a spanning stair visible while any owning level is visible."""
+
+        return bool(
+            self._canvas_objects_are_visible()
+            and any(
+                self._canvas_level_is_visible(level_index)
+                for level_index in part.level_indices
+            )
+        )
+
     def _apply_canvas_scene_visibility_change(self) -> None:
         """Cancel hidden edits, clear stale selection, and rebuild once."""
 
@@ -3787,6 +3853,15 @@ class GlbViewerWidget(QWidget):
             for object_id in self._selected_placed_object_ids
             if object_id in visible_object_ids
         )
+        self.set_selected_canvas_stair_part_ids(
+            semantic_id
+            for semantic_id in self._selected_canvas_stair_part_ids
+            if (
+                (part := self._canvas_stair_part_targets.get(semantic_id))
+                is not None
+                and self._canvas_stair_part_is_visible(part)
+            )
+        )
 
     def _repopulate_canvas_scene_preserving_camera(self) -> None:
         """Rebuild filtered render items without resetting the current view."""
@@ -3796,6 +3871,398 @@ class GlbViewerWidget(QWidget):
         camera_state = self._capture_camera_state()
         self._populate_scene()
         self._restore_camera_state(camera_state)
+
+    def _refresh_preview_hidden_stair_render_items(self) -> None:
+        """Update stair visibility without reloading unrelated scene textures."""
+
+        if self.model is None:
+            return
+        if self.textured_mesh_item is not None or self.model_material_items:
+            # Embedded/material-preview meshes require their own face buffers.
+            self._repopulate_canvas_scene_preserving_camera()
+            return
+        display_mesh = self._get_display_mesh()
+        if display_mesh is None:
+            self._repopulate_canvas_scene_preserving_camera()
+            return
+        vertices = np.asarray(display_mesh.vertices, dtype=np.float32)
+        faces = np.asarray(display_mesh.faces, dtype=np.int32)
+        if self.mesh_item is None and vertices.size and faces.size:
+            self._repopulate_canvas_scene_preserving_camera()
+            return
+        if self.mesh_item is not None:
+            self.mesh_item.setMeshData(
+                vertexes=vertices,
+                faces=faces,
+                faceColors=_get_mesh_face_colors(display_mesh, faces),
+            )
+            self.mesh_item.setVisible(bool(vertices.size and faces.size))
+        self._canvas_selection_geometry_revision += 1
+        self._invalidate_canvas_rectangle_selection_requests()
+        self._apply_render_display_options()
+        self._refresh_canvas_stair_part_selection_outlines()
+        self._refresh_atlas_stair_part_highlight_outlines()
+        self.view.update()
+
+    # ### Canvas stair-part API ###
+    def set_canvas_stair_part_targets(
+        self,
+        parts: Sequence[PreviewStairPart],
+    ) -> bool:
+        """Install whole semantic stair parts for click and box selection."""
+
+        if not self._window_editing_enabled:
+            return False
+        if isinstance(parts, (str, bytes, bytearray)) or not isinstance(
+            parts,
+            Sequence,
+        ):
+            raise TypeError("Canvas stair parts must be supplied as a sequence.")
+
+        normalized_targets: dict[str, PreviewStairPart] = {}
+        for part in parts:
+            if not isinstance(part, PreviewStairPart):
+                raise TypeError(
+                    "Canvas stair targets must contain PreviewStairPart values."
+                )
+            semantic_id = str(part.semantic_id).strip()
+            if not semantic_id:
+                raise ValueError("Canvas stair parts require a semantic ID.")
+            if semantic_id in normalized_targets:
+                raise ValueError(
+                    f"Duplicate Canvas stair-part target: {semantic_id!r}."
+                )
+            normalized_targets[semantic_id] = part
+
+        targets_changed = bool(
+            tuple(normalized_targets) != tuple(self._canvas_stair_part_targets)
+            or any(
+                normalized_targets[semantic_id]
+                is not self._canvas_stair_part_targets[semantic_id]
+                for semantic_id in normalized_targets.keys()
+                & self._canvas_stair_part_targets.keys()
+            )
+        )
+        if not targets_changed:
+            return False
+        previously_had_hidden_parts = any(
+            not self._canvas_stair_part_is_visible(part)
+            for part in self._canvas_stair_part_targets.values()
+        )
+        preview_hides_original = (
+            self._get_preview_hidden_stair_index() is not None
+        )
+        self._cancel_canvas_rectangle_selection()
+        self._canvas_stair_part_targets = normalized_targets
+        self.set_selected_canvas_stair_part_ids(
+            semantic_id
+            for semantic_id in self._selected_canvas_stair_part_ids
+            if semantic_id in normalized_targets
+        )
+        self._highlighted_canvas_stair_part_ids = tuple(
+            semantic_id
+            for semantic_id in self._highlighted_canvas_stair_part_ids
+            if semantic_id in normalized_targets
+        )
+        self._refresh_canvas_stair_part_selection_outlines()
+        self._refresh_atlas_stair_part_highlight_outlines()
+        self._refresh_canvas_stair_preview_items()
+        currently_has_hidden_parts = any(
+            not self._canvas_stair_part_is_visible(part)
+            for part in normalized_targets.values()
+        )
+        if (
+            self.model is not None
+            and (
+                previously_had_hidden_parts
+                or currently_has_hidden_parts
+                or preview_hides_original
+            )
+        ):
+            self._repopulate_canvas_scene_preserving_camera()
+        return True
+
+    def get_selected_canvas_stair_part_ids(self) -> tuple[str, ...]:
+        """Return selected stable semantic stair-part IDs in pick order."""
+
+        return self._selected_canvas_stair_part_ids
+
+    def get_canvas_stair_part_target(
+        self,
+        semantic_id: str,
+    ) -> PreviewStairPart | None:
+        """Resolve a stable semantic ID to its owning stair and part kind."""
+
+        return self._canvas_stair_part_targets.get(str(semantic_id).strip())
+
+    def get_highlighted_canvas_stair_part_ids(self) -> tuple[str, ...]:
+        """Return Atlas-driven stair highlights without selecting them."""
+
+        return self._highlighted_canvas_stair_part_ids
+
+    def set_highlighted_canvas_stair_part_ids(
+        self,
+        semantic_ids: object,
+    ) -> bool:
+        """Highlight known stair parts in green without changing selection."""
+
+        try:
+            requested_ids = tuple(
+                str(value).strip()
+                for value in semantic_ids  # type: ignore[arg-type]
+            )
+        except TypeError:
+            return False
+        normalized_ids = tuple(
+            dict.fromkeys(
+                semantic_id
+                for semantic_id in requested_ids
+                if semantic_id in self._canvas_stair_part_targets
+            )
+        )
+        if normalized_ids == self._highlighted_canvas_stair_part_ids:
+            return False
+        self._highlighted_canvas_stair_part_ids = normalized_ids
+        self._refresh_atlas_stair_part_highlight_outlines()
+        return True
+
+    def set_selected_canvas_stair_part_ids(self, semantic_ids: object) -> bool:
+        """Select known, visible semantic stair parts without per-step state."""
+
+        self._invalidate_external_canvas_rectangle_selection()
+        try:
+            requested_ids = tuple(
+                str(value).strip()
+                for value in semantic_ids  # type: ignore[arg-type]
+            )
+        except TypeError:
+            return False
+        normalized_ids = tuple(
+            dict.fromkeys(
+                semantic_id
+                for semantic_id in requested_ids
+                if (
+                    (
+                        part := self._canvas_stair_part_targets.get(
+                            semantic_id
+                        )
+                    )
+                    is not None
+                    and self._canvas_stair_part_is_visible(part)
+                )
+            )
+        )
+        if normalized_ids:
+            self._set_selected_canvas_opening_key(None)
+            self._set_selected_placed_object(None)
+            self.set_selected_canvas_surface_ids(())
+        preview_stair_index = self._canvas_stair_preview_stair_index
+        selected_stair_indices = {
+            part.stair_index
+            for semantic_id in normalized_ids
+            if (
+                part := self._canvas_stair_part_targets.get(semantic_id)
+            )
+            is not None
+        }
+        should_cancel_preview = bool(
+            preview_stair_index is not None
+            and preview_stair_index not in selected_stair_indices
+        )
+        if normalized_ids == self._selected_canvas_stair_part_ids:
+            return (
+                self._cancel_canvas_stair_preview()
+                if should_cancel_preview
+                else False
+            )
+        self._selected_canvas_stair_part_ids = normalized_ids
+        self._refresh_canvas_stair_part_selection_outlines()
+        self.canvas_stair_part_selection_changed.emit(normalized_ids)
+        if should_cancel_preview:
+            self._cancel_canvas_stair_preview()
+        return True
+
+    def select_canvas_stair_part_target(
+        self,
+        semantic_id: str | None,
+        *,
+        additive: bool = False,
+    ) -> bool:
+        """Select or Shift-toggle one complete logical stair part."""
+
+        if not self._window_editing_enabled:
+            return False
+        normalized_id = (
+            None if semantic_id is None else str(semantic_id).strip()
+        )
+        part = (
+            None
+            if normalized_id is None
+            else self._canvas_stair_part_targets.get(normalized_id)
+        )
+        if (
+            normalized_id is not None
+            and (
+                part is None or not self._canvas_stair_part_is_visible(part)
+            )
+        ):
+            return False
+        if normalized_id is None and additive:
+            return False
+
+        selected_ids = list(self._selected_canvas_stair_part_ids)
+        if normalized_id is None:
+            selected_ids = []
+        elif additive and normalized_id in selected_ids:
+            selected_ids.remove(normalized_id)
+        elif additive:
+            selected_ids.append(normalized_id)
+        else:
+            selected_ids = [normalized_id]
+
+        if normalized_id is not None:
+            self._set_selected_canvas_opening_key(None)
+            self._set_selected_placed_object(None)
+            self.select_canvas_surface_target(None)
+        return self.set_selected_canvas_stair_part_ids(selected_ids)
+
+    # ### Canvas stair preview API ###
+    def get_hide_stair_mesh_when_previewing(self) -> bool:
+        """Return whether the authored stair is hidden during staged edits."""
+
+        return self._hide_stair_mesh_when_previewing
+
+    def set_hide_stair_mesh_when_previewing(self, enabled: bool) -> bool:
+        """Apply a preview-visibility change immediately, including mid-edit."""
+
+        normalized = bool(enabled)
+        if normalized == self._hide_stair_mesh_when_previewing:
+            return False
+        was_hidden = self._get_preview_hidden_stair_index() is not None
+        self._hide_stair_mesh_when_previewing = normalized
+        is_hidden = self._get_preview_hidden_stair_index() is not None
+        if was_hidden != is_hidden:
+            self._refresh_preview_hidden_stair_render_items()
+        return True
+
+    def _get_preview_hidden_stair_index(self) -> int | None:
+        """Hide an original stair only when its staged overlay can be seen."""
+
+        stair_index = self._canvas_stair_preview_stair_index
+        if (
+            not self._hide_stair_mesh_when_previewing
+            or stair_index is None
+            or not any(
+                self._canvas_stair_part_is_visible(part)
+                for part in self._canvas_stair_preview_parts
+            )
+        ):
+            return None
+        return stair_index
+
+    def _get_preview_hidden_stair_parts(self) -> tuple[PreviewStairPart, ...]:
+        """Return only the selected stair's visible original semantic parts."""
+
+        stair_index = self._get_preview_hidden_stair_index()
+        if stair_index is None:
+            return ()
+        return tuple(
+            part
+            for part in self._canvas_stair_part_targets.values()
+            if part.stair_index == stair_index
+            and self._canvas_stair_part_is_visible(part)
+        )
+
+    def _canvas_stair_part_is_preview_hidden(
+        self, part: PreviewStairPart
+    ) -> bool:
+        """Exclude authored parts hidden behind a visible staged overlay."""
+
+        return part.stair_index == self._get_preview_hidden_stair_index()
+
+    def set_canvas_stair_preview(
+        self,
+        stair_index: int,
+        parts: Sequence[PreviewStairPart],
+    ) -> bool:
+        """Overlay a staged stair while leaving the current model untouched."""
+
+        if isinstance(stair_index, bool) or not isinstance(stair_index, int):
+            raise TypeError("A Canvas stair preview requires an integer index.")
+        if stair_index < 0:
+            raise ValueError("A Canvas stair preview index cannot be negative.")
+        if isinstance(parts, (str, bytes, bytearray)) or not isinstance(
+            parts,
+            Sequence,
+        ):
+            raise TypeError("Canvas stair preview parts require a sequence.")
+
+        normalized_parts: list[PreviewStairPart] = []
+        occupied_ids: set[str] = set()
+        for part in parts:
+            if not isinstance(part, PreviewStairPart):
+                raise TypeError(
+                    "Canvas stair previews require PreviewStairPart values."
+                )
+            if part.stair_index != stair_index:
+                raise ValueError(
+                    "Canvas stair preview parts must share the requested stair."
+                )
+            if part.semantic_id in occupied_ids:
+                raise ValueError(
+                    "Canvas stair preview semantic IDs must be unique."
+                )
+            occupied_ids.add(part.semantic_id)
+            normalized_parts.append(part)
+        if not normalized_parts:
+            return self.clear_canvas_stair_preview()
+
+        next_parts = tuple(normalized_parts)
+        changed = bool(
+            stair_index != self._canvas_stair_preview_stair_index
+            or not _canvas_stair_parts_match_geometry(
+                next_parts,
+                self._canvas_stair_preview_parts,
+            )
+        )
+        if not changed:
+            return False
+        previous_hidden_index = self._get_preview_hidden_stair_index()
+        self._canvas_stair_preview_stair_index = stair_index
+        self._canvas_stair_preview_parts = next_parts
+        self._refresh_canvas_stair_preview_items()
+        if previous_hidden_index != self._get_preview_hidden_stair_index():
+            self._refresh_preview_hidden_stair_render_items()
+        return True
+
+    def clear_canvas_stair_preview(self) -> bool:
+        """Remove staged stair geometry without changing the original model."""
+
+        had_preview = bool(
+            self._canvas_stair_preview_stair_index is not None
+            or self._canvas_stair_preview_parts
+            or self._canvas_stair_preview_groups
+        )
+        previously_hidden = self._get_preview_hidden_stair_index() is not None
+        self._canvas_stair_preview_stair_index = None
+        self._canvas_stair_preview_parts = ()
+        self._remove_canvas_stair_preview_items()
+        if previously_hidden:
+            self._refresh_preview_hidden_stair_render_items()
+        return had_preview
+
+    def _cancel_canvas_stair_preview(self) -> bool:
+        """Discard one staged stair edit and notify its controller."""
+
+        if not self.clear_canvas_stair_preview():
+            return False
+        self.canvas_stair_preview_cancelled.emit()
+        return True
+
+    def _handle_view_escape_requested(self) -> None:
+        """Let Escape discard a staged stair edit before doing nothing."""
+
+        self._cancel_canvas_stair_preview()
 
     # ### Canvas window editor API ###
     @property
@@ -3917,6 +4384,8 @@ class GlbViewerWidget(QWidget):
                 )
             )
         )
+        if normalized_ids:
+            self.set_selected_canvas_stair_part_ids(())
         selection_changed = normalized_ids != self._selected_canvas_surface_ids
         if selection_changed:
             self._cancel_canvas_surface_edit_drag()
@@ -4007,6 +4476,7 @@ class GlbViewerWidget(QWidget):
         if normalized_id is not None:
             self._set_selected_canvas_opening_key(None)
             self._set_selected_placed_object(None)
+            self.set_selected_canvas_stair_part_ids(())
         canvas_selection_changed = self.set_selected_canvas_surface_ids(
             selected_ids
         )
@@ -4277,6 +4747,8 @@ class GlbViewerWidget(QWidget):
     def cancel_uncommitted_canvas_interaction_for_undo(self) -> bool:
         """Cancel transient Canvas input that has not entered project history."""
 
+        if self._cancel_canvas_stair_preview():
+            return True
         if self.is_window_placement_active():
             self.cancel_window_placement(status_message=None)
             return True
@@ -4460,6 +4932,7 @@ class GlbViewerWidget(QWidget):
         if normalized_key is not None:
             if self.is_window_placement_active():
                 self.cancel_window_placement(status_message=None)
+            self.set_selected_canvas_stair_part_ids(())
             self._set_selected_placed_object(None)
             self._selected_window_wall_surface_id = None
             self.set_selected_canvas_surface_ids(())
@@ -4568,6 +5041,7 @@ class GlbViewerWidget(QWidget):
             )
         )
         if normalized_ids:
+            self.set_selected_canvas_stair_part_ids(())
             self.set_selected_projection_camera_id(None)
         normalized_active_id = (
             None
@@ -4644,6 +5118,7 @@ class GlbViewerWidget(QWidget):
         self._cancel_placed_object_gizmo_drag()
         self._set_selected_placed_object(None)
         self._set_selected_canvas_opening_key(None)
+        self.set_selected_canvas_stair_part_ids(())
 
         self._object_placement_request_id = normalized_request_id
         self._object_placement_preview_meshes = meshes
@@ -4962,6 +5437,7 @@ class GlbViewerWidget(QWidget):
             self._set_selected_canvas_opening_key(None)
             self._set_selected_placed_object(None)
             self.select_canvas_surface_target(None)
+            self.select_canvas_stair_part_target(None)
             return
         ray_origin, ray_direction = camera_ray
         opening_hit = _get_nearest_canvas_opening_ray_hit(
@@ -4995,24 +5471,57 @@ class GlbViewerWidget(QWidget):
             ray_origin,
             ray_direction,
         )
-        visible_object_hit = object_hit
-        if (
-            object_hit is not None
-            and surface_hit is not None
-            and object_hit[2] > surface_hit[2] + 1e-9
-        ):
-            visible_object_hit = None
+        stair_hit = _get_nearest_preview_stair_part_ray_hit(
+            tuple(
+                part
+                for part in self._canvas_stair_part_targets.values()
+                if self._canvas_stair_part_is_visible(part)
+                and not self._canvas_stair_part_is_preview_hidden(part)
+            ),
+            ray_origin,
+            ray_direction,
+        )
+        ordered_hits = tuple(
+            (kind, hit)
+            for kind, hit in (
+                ("object", object_hit),
+                ("stair_part", stair_hit),
+                ("surface", surface_hit),
+            )
+            if hit is not None
+        )
+        nearest_distance = (
+            None
+            if not ordered_hits
+            else min(float(hit[2]) for _kind, hit in ordered_hits)
+        )
+        winning_kind = next(
+            (
+                kind
+                for kind, hit in ordered_hits
+                if (
+                    nearest_distance is not None
+                    and float(hit[2]) <= nearest_distance + 1e-9
+                )
+            ),
+            None,
+        )
         if (
             opening_hit is not None
             and (
-                visible_object_hit is None
-                or opening_hit[2] <= visible_object_hit[2] + 1e-9
+                winning_kind in {None, "surface"}
+                or (
+                    nearest_distance is not None
+                    and opening_hit[2] <= nearest_distance + 1e-9
+                )
             )
         ):
+            assert opening_hit is not None
             self.select_canvas_opening(opening_hit[0].reference)
             return
-        if visible_object_hit is not None:
-            object_id = visible_object_hit[0].object_id
+        if winning_kind == "object":
+            assert object_hit is not None
+            object_id = object_hit[0].object_id
             self._set_selected_canvas_opening_key(None)
             self.select_wall_target(None)
             if additive and object_id in self._selected_placed_object_ids:
@@ -5033,12 +5542,22 @@ class GlbViewerWidget(QWidget):
                     active_object_id=object_id,
                 )
             return
-        if surface_hit is None and additive:
+        if winning_kind == "stair_part":
+            assert stair_hit is not None
+            self.select_canvas_stair_part_target(
+                stair_hit[0].semantic_id,
+                additive=additive,
+            )
+            return
+        if winning_kind is None and additive:
             return
         self._set_selected_canvas_opening_key(None)
         self._set_selected_placed_object(None)
+        self.select_canvas_stair_part_target(None)
         self.select_canvas_surface_target(
-            None if surface_hit is None else surface_hit[0].surface_id,
+            None
+            if winning_kind != "surface" or surface_hit is None
+            else surface_hit[0].surface_id,
             additive=additive,
         )
 
@@ -5400,6 +5919,24 @@ class GlbViewerWidget(QWidget):
                             faces,
                         )
                     )
+        for semantic_id, part in self._canvas_stair_part_targets.items():
+            if (
+                not self._canvas_stair_part_is_visible(part)
+                or self._canvas_stair_part_is_preview_hidden(part)
+            ):
+                continue
+            vertices = np.asarray(part.mesh.vertices, dtype=float)
+            faces = np.asarray(part.mesh.faces, dtype=np.int64)
+            if not len(vertices) or not len(faces):
+                continue
+            target_geometry.append(
+                (
+                    CANVAS_SELECTION_TARGET_STAIR_PART,
+                    semantic_id,
+                    vertices,
+                    faces,
+                )
+            )
         for surface_id, surface in self._canvas_surface_targets.items():
             if not self._canvas_surface_is_visible(surface):
                 continue
@@ -5511,11 +6048,26 @@ class GlbViewerWidget(QWidget):
             )
         )
         visible_surface_ids = set(self.get_visible_canvas_surface_ids())
+        visible_stair_part_ids = {
+            semantic_id
+            for semantic_id, part in self._canvas_stair_part_targets.items()
+            if self._canvas_stair_part_is_visible(part)
+        }
+        stair_part_ids = tuple(
+            dict.fromkeys(
+                semantic_id
+                for semantic_id in result.surface_ids
+                if semantic_id in visible_stair_part_ids
+            )
+        )
         surface_ids = tuple(
             dict.fromkeys(
                 surface_id
                 for surface_id in result.surface_ids
-                if surface_id in visible_surface_ids
+                if (
+                    surface_id in visible_surface_ids
+                    and surface_id not in visible_stair_part_ids
+                )
             )
         )
         if object_ids:
@@ -5533,6 +6085,23 @@ class GlbViewerWidget(QWidget):
             self.set_selected_placed_object_ids(
                 next_object_ids,
                 active_object_id=object_ids[-1],
+            )
+            return
+        if stair_part_ids:
+            self._set_selected_canvas_opening_key(None)
+            self._set_selected_placed_object(None)
+            self.select_canvas_surface_target(None)
+            current_stair_part_ids = (
+                self._selected_canvas_stair_part_ids
+                if result.additive
+                else ()
+            )
+            self.set_selected_canvas_stair_part_ids(
+                tuple(
+                    dict.fromkeys(
+                        (*current_stair_part_ids, *stair_part_ids)
+                    )
+                )
             )
             return
         if surface_ids:
@@ -5562,6 +6131,7 @@ class GlbViewerWidget(QWidget):
             self._set_selected_canvas_opening_key(None)
             self._set_selected_placed_object(None)
             self.select_canvas_surface_target(None)
+            self.select_canvas_stair_part_target(None)
 
     # ### Canvas surface vertex input ###
     def _begin_surface_vertex_pointer_interaction(
@@ -6021,6 +6591,176 @@ class GlbViewerWidget(QWidget):
         if not isinstance(surface, FixedSurface):
             return None
         return surface if self._canvas_surface_is_visible(surface) else None
+
+    # ### Canvas stair-part rendering ###
+    def _refresh_canvas_stair_part_selection_outlines(self) -> None:
+        """Outline each selected logical stair part as one semantic target."""
+
+        self._remove_canvas_stair_part_selection_outlines()
+        if self.model is None:
+            return
+        for semantic_id in self._selected_canvas_stair_part_ids:
+            part = self._canvas_stair_part_targets.get(semantic_id)
+            if (
+                part is None
+                or not self._canvas_stair_part_is_visible(part)
+                or self._canvas_stair_part_is_preview_hidden(part)
+            ):
+                continue
+            positions = _build_mesh_feature_line_positions(part.mesh)
+            if positions is None:
+                continue
+            item = _DepthTestedOverlayLineItem(
+                pos=positions,
+                color=CANVAS_SURFACE_SELECTION_COLOR,
+                width=4.0,
+                antialias=True,
+                mode="lines",
+            )
+            item.setGLOptions("translucent")
+            item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE)
+            self.view.addItem(item)
+            self._canvas_stair_part_selection_items.append(item)
+        self.view.update()
+
+    def _remove_canvas_stair_part_selection_outlines(self) -> None:
+        """Remove rendered stair-part selection without changing its IDs."""
+
+        for item in self._canvas_stair_part_selection_items:
+            if item in self.view.items:
+                self.view.removeItem(item)
+        self._canvas_stair_part_selection_items = []
+
+    def _refresh_atlas_stair_part_highlight_outlines(self) -> None:
+        """Render non-selecting green Atlas highlights for stair parts."""
+
+        self._remove_atlas_stair_part_highlight_outlines()
+        if self.model is None:
+            return
+        for semantic_id in self._highlighted_canvas_stair_part_ids:
+            part = self._canvas_stair_part_targets.get(semantic_id)
+            if (
+                part is None
+                or not self._canvas_stair_part_is_visible(part)
+                or self._canvas_stair_part_is_preview_hidden(part)
+            ):
+                continue
+            positions = _build_mesh_feature_line_positions(part.mesh)
+            if positions is None:
+                continue
+            item = _DepthTestedOverlayLineItem(
+                pos=positions,
+                color=ATLAS_SURFACE_HIGHLIGHT_COLOR,
+                width=4.0,
+                antialias=True,
+                mode="lines",
+            )
+            item.setGLOptions("translucent")
+            item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE)
+            self.view.addItem(item)
+            self._atlas_stair_part_highlight_items.append(item)
+        self.view.update()
+
+    def _remove_atlas_stair_part_highlight_outlines(self) -> None:
+        """Remove rendered stair-part highlights without changing their IDs."""
+
+        for item in self._atlas_stair_part_highlight_items:
+            if item in self.view.items:
+                self.view.removeItem(item)
+        self._atlas_stair_part_highlight_items = []
+
+    def _refresh_canvas_stair_preview_items(self) -> None:
+        """Rebuild the separate pulsing overlay for one staged stair edit."""
+
+        self._remove_canvas_stair_preview_items()
+        if self.model is None:
+            return
+        for part in self._canvas_stair_preview_parts:
+            if not self._canvas_stair_part_is_visible(part):
+                continue
+            vertices = np.asarray(part.mesh.vertices, dtype=np.float32)
+            faces = np.asarray(part.mesh.faces, dtype=np.int32)
+            if (
+                vertices.ndim != 2
+                or vertices.shape[1:] != (3,)
+                or faces.ndim != 2
+                or faces.shape[1:] != (3,)
+                or not len(vertices)
+                or not len(faces)
+                or not np.all(np.isfinite(vertices))
+                or np.any(faces < 0)
+                or np.any(faces >= len(vertices))
+            ):
+                continue
+            item = _WireframeOverlayMeshItem(
+                vertexes=vertices,
+                faces=faces,
+                color=(
+                    *CANVAS_STAIR_PREVIEW_COLOR[:3],
+                    CANVAS_STAIR_PREVIEW_MAX_OPACITY,
+                ),
+                smooth=False,
+                drawFaces=True,
+                drawEdges=True,
+                edgeColor=(
+                    *CANVAS_STAIR_PREVIEW_EDGE_COLOR[:3],
+                    CANVAS_STAIR_PREVIEW_MAX_OPACITY,
+                ),
+                shader=self._ambient_shader,
+            )
+            item.setGLOptions("translucent")
+            item.setDepthValue(CANVAS_FACE_ORIENTATION_DEPTH_VALUE)
+            self.view.addItem(item)
+            self._canvas_stair_preview_groups.append(
+                _CanvasStairPreviewRenderGroup(
+                    mesh_item=item,
+                )
+            )
+        if self._canvas_stair_preview_groups:
+            self._canvas_stair_preview_phase = math.pi / 2.0
+            if self.isVisible():
+                self._canvas_stair_preview_timer.start()
+        self.view.update()
+
+    def _remove_canvas_stair_preview_items(self) -> None:
+        """Remove staged render items while retaining preview source data."""
+
+        self._canvas_stair_preview_timer.stop()
+        for group in self._canvas_stair_preview_groups:
+            if group.mesh_item in self.view.items:
+                self.view.removeItem(group.mesh_item)
+        self._canvas_stair_preview_groups = []
+        if hasattr(self, "view"):
+            self.view.update()
+
+    def _advance_canvas_stair_preview_fade(self) -> None:
+        """Advance staged stair faces and edges through one pulse sample."""
+
+        if not self._canvas_stair_preview_groups:
+            self._canvas_stair_preview_timer.stop()
+            return
+        self._canvas_stair_preview_phase = (
+            self._canvas_stair_preview_phase
+            + 2.0
+            * math.pi
+            * CANVAS_STAIR_PREVIEW_UPDATE_INTERVAL_MILLISECONDS
+            / CANVAS_STAIR_PREVIEW_FADE_PERIOD_MILLISECONDS
+        ) % (2.0 * math.pi)
+        blend = (math.sin(self._canvas_stair_preview_phase) + 1.0) / 2.0
+        opacity = CANVAS_STAIR_PREVIEW_MIN_OPACITY + blend * (
+            CANVAS_STAIR_PREVIEW_MAX_OPACITY
+            - CANVAS_STAIR_PREVIEW_MIN_OPACITY
+        )
+        for group in self._canvas_stair_preview_groups:
+            group.mesh_item.setColor(
+                (*CANVAS_STAIR_PREVIEW_COLOR[:3], opacity)
+            )
+            group.mesh_item.opts["edgeColor"] = (
+                *CANVAS_STAIR_PREVIEW_EDGE_COLOR[:3],
+                opacity,
+            )
+            group.mesh_item.update()
+        self.view.update()
 
     # ### Canvas surface outline rendering ###
     def _refresh_canvas_surface_selection_outlines(self) -> None:
@@ -6623,6 +7363,8 @@ class GlbViewerWidget(QWidget):
         self.clear_face_edit_geometry()
         self.set_selected_placed_object_ids(())
         self._set_selected_canvas_opening_key(None)
+        self.set_selected_canvas_stair_part_ids(())
+        self.clear_canvas_stair_preview()
         if self._window_editing_enabled:
             self.cancel_window_placement(status_message=None)
         self._canvas_surface_drawing_vertices = {}
@@ -7833,9 +8575,11 @@ class GlbViewerWidget(QWidget):
         if self.model is None:
             self._set_default_camera()
             self._refresh_canvas_surface_selection_outlines()
+            self._refresh_canvas_stair_part_selection_outlines()
             self._refresh_canvas_face_orientation_item()
             self._refresh_canvas_extrudable_face_outlines()
             self._refresh_atlas_surface_highlight_outlines()
+            self._refresh_atlas_stair_part_highlight_outlines()
             self._refresh_canvas_opening_gizmo_items()
             self._refresh_canvas_surface_drawing_items()
             self._refresh_canvas_surface_edit_gizmo_items()
@@ -7843,6 +8587,7 @@ class GlbViewerWidget(QWidget):
             self._refresh_level_transform_preview_outline_item()
             self._refresh_doorway_preview_outline_item()
             self._refresh_object_placement_preview_items()
+            self._refresh_canvas_stair_preview_items()
             return
 
         display_mesh = self._get_display_mesh()
@@ -7853,6 +8598,12 @@ class GlbViewerWidget(QWidget):
             material_preview_meshes = _build_model_material_preview_meshes(
                 self.model
             )
+            preview_hidden_parts = self._get_preview_hidden_stair_parts()
+            if preview_hidden_parts:
+                material_preview_meshes = tuple(
+                    _remove_semantic_stair_faces(mesh, preview_hidden_parts)
+                    for mesh in material_preview_meshes
+                )
             self._model_material_preview_meshes = material_preview_meshes
             texture_mesh_data = (
                 None
@@ -7925,14 +8676,20 @@ class GlbViewerWidget(QWidget):
             float(center[1]),
             float(center[2]),
         )
-        self.view.setCameraPosition(distance=extent * 3.0, elevation=28.0, azimuth=-40.0)
+        self.view.setCameraPosition(
+            distance=extent * 3.0,
+            elevation=28.0,
+            azimuth=-40.0,
+        )
         self.view.remember_orbit_camera_state()
         self._set_default_first_person_camera_pose_from_bounding_box(bounding_box)
         self.view.apply_navigation_camera()
         self._refresh_canvas_surface_selection_outlines()
+        self._refresh_canvas_stair_part_selection_outlines()
         self._refresh_canvas_face_orientation_item()
         self._refresh_canvas_extrudable_face_outlines()
         self._refresh_atlas_surface_highlight_outlines()
+        self._refresh_atlas_stair_part_highlight_outlines()
         self._refresh_canvas_opening_gizmo_items()
         self._refresh_canvas_surface_drawing_items()
         self._refresh_canvas_surface_edit_gizmo_items()
@@ -7941,6 +8698,7 @@ class GlbViewerWidget(QWidget):
         self._refresh_level_transform_preview_outline_item()
         self._refresh_doorway_preview_outline_item()
         self._refresh_object_placement_preview_items()
+        self._refresh_canvas_stair_preview_items()
         self.view.update()
 
     def _get_display_mesh(self):
@@ -7986,7 +8744,21 @@ class GlbViewerWidget(QWidget):
             )
             for mesh in self._canvas_scene_level_meshes.get(level_index, ())
         )
-        hidden_geometry = (*hidden_surfaces, *hidden_level_meshes)
+        hidden_stair_parts = tuple(
+            part
+            for part in self._canvas_stair_part_targets.values()
+            if not self._canvas_stair_part_is_visible(part)
+        )
+        preview_hidden_parts = self._get_preview_hidden_stair_parts()
+        if preview_hidden_parts:
+            display_mesh = _remove_semantic_stair_faces(
+                display_mesh, preview_hidden_parts
+            )
+        hidden_geometry = (
+            *hidden_surfaces,
+            *hidden_level_meshes,
+            *hidden_stair_parts,
+        )
         if hidden_geometry:
             return remove_covered_surface_faces(display_mesh, hidden_geometry)
         return display_mesh
@@ -8068,14 +8840,26 @@ class GlbViewerWidget(QWidget):
         if self.model is None:
             return
         for textured_surface in self.model.preview_textured_surfaces:
+            stair_part = self._canvas_stair_part_targets.get(
+                textured_surface.surface_id
+            )
             if (
                 self._window_editing_enabled
                 and (
-                    not self._canvas_level_is_visible(
-                        textured_surface.level_index
+                    (
+                        stair_part is not None
+                        and not self._canvas_stair_part_is_visible(stair_part)
                     )
-                    or not self._canvas_surface_type_is_visible(
-                        textured_surface.surface_type
+                    or (
+                        stair_part is None
+                        and (
+                            not self._canvas_level_is_visible(
+                                textured_surface.level_index
+                            )
+                            or not self._canvas_surface_type_is_visible(
+                                textured_surface.surface_type
+                            )
+                        )
                     )
                 )
             ):
@@ -8098,6 +8882,9 @@ class GlbViewerWidget(QWidget):
             )
             self.view.addItem(texture_item)
             self.textured_surface_items.append(texture_item)
+            self._textured_surface_item_ids[texture_item] = (
+                textured_surface.surface_id
+            )
 
     # ### Placed-object rendering ###
     def _add_placed_object_items(self) -> None:
@@ -9922,7 +10709,19 @@ class GlbViewerWidget(QWidget):
             if group.textured_item is not None:
                 group.textured_item.setVisible(textures_visible)
         for textured_surface_item in self.textured_surface_items:
-            textured_surface_item.setVisible(textures_visible)
+            surface_id = self._textured_surface_item_ids.get(textured_surface_item)
+            stair_part = (
+                None
+                if surface_id is None
+                else self._canvas_stair_part_targets.get(surface_id)
+            )
+            textured_surface_item.setVisible(
+                textures_visible
+                and (
+                    stair_part is None
+                    or not self._canvas_stair_part_is_preview_hidden(stair_part)
+                )
+            )
         for textured_wall_item in self.textured_wall_items:
             textured_wall_item.setVisible(textures_visible)
 
@@ -9981,7 +10780,7 @@ class GlbViewerWidget(QWidget):
         self,
         bounding_box,
     ) -> None:
-        """Place an unset camera at a sensible indoor eye height near the model center."""
+        """Place an unset camera at a useful indoor height near model center."""
 
         if self.view.has_custom_first_person_camera_pose:
             return
@@ -10012,6 +10811,7 @@ class GlbViewerWidget(QWidget):
             return
 
         self._symmetric_preview_timer.stop()
+        self._canvas_stair_preview_timer.stop()
         self._release_textured_mesh_gl_resources()
         self.view.clear()
         self.grid_item = None
@@ -10033,15 +10833,19 @@ class GlbViewerWidget(QWidget):
         self._surface_vertex_preview_item = None
         self._surface_vertex_preview_edge_item = None
         self.textured_surface_items = []
+        self._textured_surface_item_ids = {}
         self.textured_wall_items = []
         self.projection_camera_indicator_items = {}
         self.projection_camera_indicator_geometries = {}
         self._sync_projection_camera_input_state()
         self._canvas_surface_selection_items = []
         self._canvas_surface_selection_vertex_item = None
+        self._canvas_stair_part_selection_items = []
         self._canvas_face_orientation_items = []
         self._canvas_extrudable_face_outline_items = []
         self._atlas_surface_highlight_items = []
+        self._atlas_stair_part_highlight_items = []
+        self._canvas_stair_preview_groups = []
         self._window_preview_item = None
         self._level_transform_preview_outline_item = None
         self._doorway_preview_outline_item = None
@@ -10810,9 +11614,11 @@ def _rasterize_canvas_target_selection(
         if target_type == CANVAS_SELECTION_TARGET_OBJECT:
             if target_id not in object_ids:
                 object_ids.append(target_id)
-        elif target_type == CANVAS_SELECTION_TARGET_SURFACE:
-            if target_id not in surface_ids:
-                surface_ids.append(target_id)
+        elif target_type in {
+            CANVAS_SELECTION_TARGET_SURFACE,
+            CANVAS_SELECTION_TARGET_STAIR_PART,
+        } and target_id not in surface_ids:
+            surface_ids.append(target_id)
     return tuple(surface_ids), tuple(object_ids)
 
 
@@ -12705,6 +13511,205 @@ def _build_dragged_canvas_opening_bounds(
     )
 
 
+# ### Canvas stair-part helpers ###
+def _remove_semantic_stair_faces(
+    mesh: trimesh.Trimesh,
+    parts: Sequence[PreviewStairPart],
+) -> trimesh.Trimesh:
+    """Remove authored stair faces by provenance, preserving overlaps."""
+
+    hidden_stair_ids = {part.stair_id for part in parts}
+    if not hidden_stair_ids:
+        return mesh
+    face_count = len(mesh.faces)
+    metadata = getattr(mesh, "metadata", {})
+    if "_housemaker_preview_stair_face_ranges" in metadata:
+        face_ranges = metadata["_housemaker_preview_stair_face_ranges"]
+        keep_faces = np.ones(face_count, dtype=bool)
+        for start, end, stair_id in face_ranges:
+            if (
+                stair_id in hidden_stair_ids
+                and 0 <= int(start) < int(end) <= face_count
+            ):
+                keep_faces[int(start) : int(end)] = False
+        if np.all(keep_faces):
+            return mesh
+        filtered = mesh.copy()
+        filtered.update_faces(keep_faces)
+        filtered.remove_unreferenced_vertices()
+        return filtered
+    if metadata.get("housemaker_stair_id") in hidden_stair_ids:
+        return trimesh.Trimesh(process=False)
+
+    # Compatibility for older or synthetic preview meshes without recorded
+    # face ranges. This geometric fallback cannot distinguish exact overlaps;
+    # all locally generated preview meshes use the provenance path above.
+
+    face_quota: Counter[tuple[tuple[float, float, float], ...]] = Counter()
+    for part in parts:
+        part_vertices = np.asarray(part.mesh.vertices, dtype=float)
+        part_faces = np.asarray(part.mesh.faces, dtype=np.int64)
+        face_quota.update(
+            _oriented_stair_face_key(part_vertices, face)
+            for face in part_faces
+        )
+    if not face_quota:
+        return mesh
+    vertices = np.asarray(mesh.vertices, dtype=float)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    keep_faces = np.ones(len(faces), dtype=bool)
+    for index, face in enumerate(faces):
+        key = _oriented_stair_face_key(vertices, face)
+        if face_quota[key] > 0:
+            face_quota[key] -= 1
+            keep_faces[index] = False
+    if np.all(keep_faces):
+        return mesh
+    filtered = mesh.copy()
+    filtered.update_faces(keep_faces)
+    filtered.remove_unreferenced_vertices()
+    return filtered
+
+
+def _oriented_stair_face_key(
+    vertices: np.ndarray,
+    face: np.ndarray,
+) -> tuple[tuple[float, float, float], ...]:
+    """Normalize a triangle's cyclic start without losing its winding."""
+
+    corners = tuple(
+        tuple(float(value) for value in np.round(vertices[index], 7))
+        for index in face
+    )
+    return min(
+        corners,
+        corners[1:] + corners[:1],
+        corners[2:] + corners[:2],
+    )
+
+
+def _canvas_stair_parts_match_geometry(
+    first_parts: Sequence[PreviewStairPart],
+    second_parts: Sequence[PreviewStairPart],
+) -> bool:
+    """Compare staged parts without invoking ndarray/dataclass equality."""
+
+    if len(first_parts) != len(second_parts):
+        return False
+    for first, second in zip(first_parts, second_parts, strict=True):
+        if (
+            first.semantic_id != second.semantic_id
+            or first.stair_id != second.stair_id
+            or first.stair_index != second.stair_index
+            or first.part_kind != second.part_kind
+            or first.level_indices != second.level_indices
+        ):
+            return False
+        first_vertices = np.asarray(first.mesh.vertices, dtype=float)
+        second_vertices = np.asarray(second.mesh.vertices, dtype=float)
+        first_faces = np.asarray(first.mesh.faces, dtype=np.int64)
+        second_faces = np.asarray(second.mesh.faces, dtype=np.int64)
+        if (
+            first_vertices.shape != second_vertices.shape
+            or first_faces.shape != second_faces.shape
+            or not np.array_equal(first_faces, second_faces)
+            or not np.allclose(first_vertices, second_vertices)
+        ):
+            return False
+    return True
+
+
+def _build_mesh_feature_line_positions(
+    source_mesh: trimesh.Trimesh,
+) -> np.ndarray | None:
+    """Return boundary and crease edges without coplanar triangulation lines."""
+
+    if not isinstance(source_mesh, trimesh.Trimesh):
+        return None
+    mesh = source_mesh.copy()
+    try:
+        mesh.merge_vertices()
+    except (AttributeError, TypeError, ValueError):
+        pass
+    vertices = np.asarray(mesh.vertices, dtype=float)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    if (
+        vertices.ndim != 2
+        or vertices.shape[1:] != (3,)
+        or faces.ndim != 2
+        or faces.shape[1:] != (3,)
+        or not len(vertices)
+        or not len(faces)
+        or np.any(faces < 0)
+        or np.any(faces >= len(vertices))
+    ):
+        return None
+
+    triangles = vertices[faces]
+    normals = np.cross(
+        triangles[:, 1] - triangles[:, 0],
+        triangles[:, 2] - triangles[:, 0],
+    )
+    normal_lengths = np.linalg.norm(normals, axis=1)
+    usable_normals = normal_lengths > 1e-12
+    normals[usable_normals] /= normal_lengths[usable_normals, np.newaxis]
+
+    face_indices_by_edge: dict[tuple[int, int], list[int]] = {}
+    for face_index, face in enumerate(faces):
+        for first_index, second_index in (
+            (face[0], face[1]),
+            (face[1], face[2]),
+            (face[2], face[0]),
+        ):
+            edge = tuple(sorted((int(first_index), int(second_index))))
+            face_indices_by_edge.setdefault(edge, []).append(face_index)
+
+    crease_cosine = math.cos(math.radians(4.0))
+    feature_edges: list[tuple[int, int]] = []
+    for edge, face_indices in face_indices_by_edge.items():
+        if len(face_indices) != 2:
+            feature_edges.append(edge)
+            continue
+        first_face, second_face = face_indices
+        if (
+            not usable_normals[first_face]
+            or not usable_normals[second_face]
+            or float(np.dot(normals[first_face], normals[second_face]))
+            < crease_cosine
+        ):
+            feature_edges.append(edge)
+    if not feature_edges:
+        return None
+    return np.ascontiguousarray(
+        vertices[np.asarray(feature_edges, dtype=np.int64)].reshape(-1, 3),
+        dtype=float,
+    )
+
+
+def _get_nearest_preview_stair_part_ray_hit(
+    targets: tuple[PreviewStairPart, ...],
+    ray_origin: object,
+    ray_direction: object,
+) -> tuple[PreviewStairPart, np.ndarray, float] | None:
+    """Return the nearest complete semantic stair part under one ray."""
+
+    origin, direction = _normalize_ray(ray_origin, ray_direction)
+    if origin is None or direction is None:
+        return None
+    nearest: tuple[PreviewStairPart, np.ndarray, float] | None = None
+    for target in targets:
+        if not isinstance(target, PreviewStairPart):
+            continue
+        hit = _get_nearest_triangle_ray_hit(target.mesh, origin, direction)
+        if hit is None:
+            continue
+        hit_point, hit_distance = hit
+        if nearest is None or hit_distance < nearest[2] - 1e-9:
+            nearest = (target, hit_point, hit_distance)
+    return nearest
+
+
+# ### Canvas fixed-surface helpers ###
 def _get_nearest_fixed_surface_ray_hit(
     surfaces: tuple[FixedSurface, ...],
     ray_origin: object,

@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import math
 import re
+import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
@@ -70,6 +71,66 @@ STAIR_STYLES = frozenset(
     }
 )
 DEFAULT_STAIR_STYLE = STAIR_STYLE_SUPPORTED
+STAIR_TYPE_SUPPORTED = "supported"
+STAIR_TYPE_FLOATING = "floating"
+STAIR_TYPES = frozenset({STAIR_TYPE_SUPPORTED, STAIR_TYPE_FLOATING})
+DEFAULT_STAIR_TYPE = STAIR_TYPE_SUPPORTED
+DEFAULT_STAIR_TARGET_RISE_METERS = 0.175
+MIN_STAIR_TARGET_RISE_METERS = 0.01
+MAX_STAIR_TARGET_RISE_METERS = 2.0
+DEFAULT_STAIR_TREAD_THICKNESS_METERS = 0.08
+MIN_STAIR_TREAD_THICKNESS_METERS = 0.005
+MAX_STAIR_TREAD_THICKNESS_METERS = 1.0
+DEFAULT_STAIR_TREAD_OVERHANG_METERS = 0.03
+MIN_STAIR_TREAD_OVERHANG_METERS = 0.0
+MAX_STAIR_TREAD_OVERHANG_METERS = 1.0
+STAIR_NOSING_LEFT = "left"
+STAIR_NOSING_RIGHT = "right"
+STAIR_NOSING_FRONT = "front"
+STAIR_NOSING_PLACEMENTS = (
+    STAIR_NOSING_LEFT,
+    STAIR_NOSING_RIGHT,
+    STAIR_NOSING_FRONT,
+)
+DEFAULT_STAIR_NOSING_PLACEMENTS = (STAIR_NOSING_FRONT,)
+STAIR_TREAD_EDGE_STRAIGHT = "straight"
+STAIR_TREAD_EDGE_ROUNDED = "rounded"
+STAIR_TREAD_EDGE_PROFILES = frozenset(
+    {STAIR_TREAD_EDGE_STRAIGHT, STAIR_TREAD_EDGE_ROUNDED}
+)
+DEFAULT_STAIR_TREAD_EDGE_PROFILE = STAIR_TREAD_EDGE_STRAIGHT
+DEFAULT_STAIR_TREAD_EDGE_RADIUS_METERS = 0.04
+MIN_STAIR_TREAD_EDGE_RADIUS_METERS = 0.0
+MAX_STAIR_TREAD_EDGE_RADIUS_METERS = 1.0
+STAIR_STARTING_STEP_NONE = "none"
+STAIR_STARTING_STEP_BULLNOSE = "bullnose"
+STAIR_STARTING_STEP_CURTAIL = "curtail"
+STAIR_STARTING_STEPS = (
+    STAIR_STARTING_STEP_NONE,
+    STAIR_STARTING_STEP_BULLNOSE,
+    STAIR_STARTING_STEP_CURTAIL,
+)
+DEFAULT_STAIR_STARTING_STEP = STAIR_STARTING_STEP_NONE
+DEFAULT_STAIR_STARTING_STEP_EDGE_RADIUS_METERS = 0.05
+MIN_STAIR_STARTING_STEP_EDGE_RADIUS_METERS = 0.0
+MAX_STAIR_STARTING_STEP_EDGE_RADIUS_METERS = 2.0
+DEFAULT_STAIR_STARTING_STEP_EDGE_POINTS = 1
+MIN_STAIR_STARTING_STEP_EDGE_POINTS = 1
+MAX_STAIR_STARTING_STEP_EDGE_POINTS = 16
+STAIR_STRINGER_LEFT = "left"
+STAIR_STRINGER_RIGHT = "right"
+STAIR_STRINGER_BOTH = "both"
+STAIR_STRINGER_NONE = "none"
+STAIR_STRINGER_PLACEMENTS = frozenset(
+    {
+        STAIR_STRINGER_LEFT,
+        STAIR_STRINGER_RIGHT,
+        STAIR_STRINGER_BOTH,
+        STAIR_STRINGER_NONE,
+    }
+)
+DEFAULT_STAIR_STRINGER_PLACEMENT = STAIR_STRINGER_BOTH
+_INFER_STAIR_LEGACY_PART_LAYOUT = object()
 LEGACY_STAIR_WIDTH_PIXELS = 50.0
 PIXEL_TO_METER = 0.02
 GROUND_LEVEL_INDEX = 2
@@ -92,6 +153,7 @@ EDITABLE_SURFACE_FRAME_KINDS = frozenset(
 )
 EDITABLE_SURFACE_TYPES = frozenset({"wall", "floor", "ceiling"})
 _EDITABLE_SURFACE_UUID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+
 
 # ### Data models ###
 @dataclass(frozen=True)
@@ -303,9 +365,7 @@ class EditableSurfaceFaceData:
             raise ValueError("Editable surface face vertices must be unique.")
         surface_type = str(self.surface_type).strip().lower()
         if surface_type not in EDITABLE_SURFACE_TYPES:
-            raise ValueError(
-                f"Unknown editable surface type: {self.surface_type!r}."
-            )
+            raise ValueError(f"Unknown editable surface type: {self.surface_type!r}.")
         if not isinstance(self.is_directly_drawn, bool):
             raise TypeError("Editable face drawing provenance must be boolean.")
         object.__setattr__(self, "face_id", face_id)
@@ -373,27 +433,19 @@ class EditableSurfaceMeshData:
                 "Editable surface vertices, faces, and edges must contain sequences."
             ) from error
         if not isinstance(self.replaces_source_surface, bool):
-            raise TypeError(
-                "Editable surface replacement state must be a boolean."
-            )
+            raise TypeError("Editable surface replacement state must be a boolean.")
         if not vertices or not all(
             isinstance(vertex, EditableSurfaceVertexData) for vertex in vertices
         ):
-            raise ValueError(
-                "Editable surfaces require persistent vertex records."
-            )
+            raise ValueError("Editable surfaces require persistent vertex records.")
         if not all(isinstance(face, EditableSurfaceFaceData) for face in faces):
             raise ValueError("Editable surfaces require persistent face records.")
         if not faces and not self.replaces_source_surface:
-            raise ValueError(
-                "Editable surface drafts require persistent face records."
-            )
+            raise ValueError("Editable surface drafts require persistent face records.")
         if not all(isinstance(edge, EditableSurfaceEdgeData) for edge in edges):
             raise ValueError("Editable surface edges must contain edge records.")
         if not faces and edges:
-            raise ValueError(
-                "Empty editable surface replacements cannot retain edges."
-            )
+            raise ValueError("Empty editable surface replacements cannot retain edges.")
         vertex_ids = tuple(vertex.vertex_id for vertex in vertices)
         face_ids = tuple(face.face_id for face in faces)
         if len(set(vertex_ids)) != len(vertex_ids):
@@ -406,17 +458,13 @@ class EditableSurfaceMeshData:
             for face in faces
             for vertex_id in face.vertex_ids
         ):
-            raise ValueError(
-                "Editable surface faces must reference existing vertices."
-            )
+            raise ValueError("Editable surface faces must reference existing vertices.")
         if any(
             vertex_id not in known_vertex_ids
             for edge in edges
             for vertex_id in (edge.start_vertex_id, edge.end_vertex_id)
         ):
-            raise ValueError(
-                "Editable surface edges must reference existing vertices."
-            )
+            raise ValueError("Editable surface edges must reference existing vertices.")
         edge_keys = [
             frozenset((edge.start_vertex_id, edge.end_vertex_id)) for edge in edges
         ]
@@ -537,7 +585,9 @@ class StairData:
     Intermediate sections bend the stair route in their stored order. The
     custom initializer accepts the old single-point ``start_x`` / ``end_x``
     representation and projects without intermediate sections, keeping both
-    earlier stair formats usable.
+    earlier stair formats usable. New construction fields define an evenly
+    distributed target rise, tread shape, and one semantic stringer group. The
+    UUID keeps part texture assignments stable when geometry is rebuilt.
     """
 
     start_level_index: int
@@ -550,7 +600,22 @@ class StairData:
     end_a_y: float
     end_b_x: float
     end_b_y: float
+    stair_id: str = ""
+    stair_type: str = DEFAULT_STAIR_TYPE
     style: str = DEFAULT_STAIR_STYLE
+    target_rise_meters: float = DEFAULT_STAIR_TARGET_RISE_METERS
+    tread_thickness_meters: float = DEFAULT_STAIR_TREAD_THICKNESS_METERS
+    tread_overhang_meters: float = DEFAULT_STAIR_TREAD_OVERHANG_METERS
+    nosing_placements: tuple[str, ...] = DEFAULT_STAIR_NOSING_PLACEMENTS
+    tread_edge_profile: str = DEFAULT_STAIR_TREAD_EDGE_PROFILE
+    tread_edge_radius_meters: float = DEFAULT_STAIR_TREAD_EDGE_RADIUS_METERS
+    starting_step: str = DEFAULT_STAIR_STARTING_STEP
+    starting_step_edge_radius_meters: float = (
+        DEFAULT_STAIR_STARTING_STEP_EDGE_RADIUS_METERS
+    )
+    starting_step_edge_points: int = DEFAULT_STAIR_STARTING_STEP_EDGE_POINTS
+    stringer_placement: str = STAIR_STRINGER_NONE
+    legacy_part_layout: bool = False
     start_a_vertex_id: int | None = None
     start_b_vertex_id: int | None = None
     end_a_vertex_id: int | None = None
@@ -565,7 +630,7 @@ class StairData:
         end_level_index: object = None,
         end_x: object = None,
         end_y: object = None,
-        style: object = DEFAULT_STAIR_STYLE,
+        style: object = None,
         *,
         start_a_x: object = None,
         start_a_y: object = None,
@@ -580,6 +645,23 @@ class StairData:
         end_a_vertex_id: object = None,
         end_b_vertex_id: object = None,
         intermediate_sections: object = (),
+        stair_id: object = None,
+        stair_type: object = None,
+        target_rise_meters: object = DEFAULT_STAIR_TARGET_RISE_METERS,
+        tread_thickness_meters: object = (DEFAULT_STAIR_TREAD_THICKNESS_METERS),
+        tread_overhang_meters: object = DEFAULT_STAIR_TREAD_OVERHANG_METERS,
+        nosing_placements: object = DEFAULT_STAIR_NOSING_PLACEMENTS,
+        tread_edge_profile: object = DEFAULT_STAIR_TREAD_EDGE_PROFILE,
+        tread_edge_radius_meters: object = DEFAULT_STAIR_TREAD_EDGE_RADIUS_METERS,
+        starting_step: object = DEFAULT_STAIR_STARTING_STEP,
+        starting_step_edge_radius_meters: object = (
+            DEFAULT_STAIR_STARTING_STEP_EDGE_RADIUS_METERS
+        ),
+        starting_step_edge_points: object = (
+            DEFAULT_STAIR_STARTING_STEP_EDGE_POINTS
+        ),
+        stringer_placement: object = None,
+        legacy_part_layout: object = _INFER_STAIR_LEGACY_PART_LAYOUT,
     ) -> None:
         _validate_stair_level_index(start_level_index, "start")
         _validate_stair_level_index(end_level_index, "end")
@@ -598,23 +680,15 @@ class StairData:
         )
         if any(value is not None for value in canonical_coordinates):
             if not all(value is not None for value in canonical_coordinates):
+                raise ValueError("A stair requires two complete points on each level.")
+            if any(value is not None for value in (start_x, start_y, end_x, end_y)):
                 raise ValueError(
-                    "A stair requires two complete points on each level."
-                )
-            if any(
-                value is not None
-                for value in (start_x, start_y, end_x, end_y)
-            ):
-                raise ValueError(
-                    "Do not mix legacy stair center points with four-point "
-                    "coordinates."
+                    "Do not mix legacy stair center points with four-point coordinates."
                 )
         else:
             legacy_coordinates = (start_x, start_y, end_x, end_y)
             if not all(value is not None for value in legacy_coordinates):
-                raise ValueError(
-                    "A stair requires two complete points on each level."
-                )
+                raise ValueError("A stair requires two complete points on each level.")
             (
                 start_a_x,
                 start_a_y,
@@ -663,7 +737,108 @@ class StairData:
         object.__setattr__(self, "end_level_index", end_level_index)
         for name, value in normalized_coordinates.items():
             object.__setattr__(self, name, value)
-        object.__setattr__(self, "style", normalize_stair_style(style))
+        normalized_stair_type, normalized_style = _normalize_stair_type_and_style(
+            stair_type,
+            style,
+        )
+        normalized_stringer_placement = _normalize_stair_stringer_placement(
+            stringer_placement
+        )
+        normalized_starting_step = normalize_stair_starting_step(starting_step)
+        normalized_legacy_part_layout = _normalize_stair_legacy_part_layout(
+            legacy_part_layout,
+            infer_legacy=stringer_placement is None,
+        )
+        if normalized_stringer_placement != STAIR_STRINGER_NONE:
+            normalized_legacy_part_layout = False
+        if normalized_starting_step != STAIR_STARTING_STEP_NONE:
+            normalized_legacy_part_layout = False
+        if not normalized_legacy_part_layout:
+            normalized_style = normalized_stair_type
+        object.__setattr__(self, "stair_id", _normalize_stair_id(stair_id))
+        object.__setattr__(self, "stair_type", normalized_stair_type)
+        object.__setattr__(self, "style", normalized_style)
+        object.__setattr__(
+            self,
+            "target_rise_meters",
+            _normalize_stair_length(
+                target_rise_meters,
+                "target step rise",
+                MIN_STAIR_TARGET_RISE_METERS,
+                MAX_STAIR_TARGET_RISE_METERS,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "tread_thickness_meters",
+            _normalize_stair_length(
+                tread_thickness_meters,
+                "tread thickness",
+                MIN_STAIR_TREAD_THICKNESS_METERS,
+                MAX_STAIR_TREAD_THICKNESS_METERS,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "tread_overhang_meters",
+            _normalize_stair_length(
+                tread_overhang_meters,
+                "tread overhang",
+                MIN_STAIR_TREAD_OVERHANG_METERS,
+                MAX_STAIR_TREAD_OVERHANG_METERS,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "tread_edge_profile",
+            normalize_stair_tread_edge_profile(tread_edge_profile),
+        )
+        object.__setattr__(
+            self,
+            "tread_edge_radius_meters",
+            _normalize_stair_length(
+                tread_edge_radius_meters,
+                "tread edge radius",
+                MIN_STAIR_TREAD_EDGE_RADIUS_METERS,
+                MAX_STAIR_TREAD_EDGE_RADIUS_METERS,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "nosing_placements",
+            normalize_stair_nosing_placements(nosing_placements),
+        )
+        object.__setattr__(self, "starting_step", normalized_starting_step)
+        object.__setattr__(
+            self,
+            "starting_step_edge_radius_meters",
+            _normalize_stair_length(
+                starting_step_edge_radius_meters,
+                "starting step edge radius",
+                MIN_STAIR_STARTING_STEP_EDGE_RADIUS_METERS,
+                MAX_STAIR_STARTING_STEP_EDGE_RADIUS_METERS,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "starting_step_edge_points",
+            _normalize_stair_integer(
+                starting_step_edge_points,
+                "starting step edge points",
+                MIN_STAIR_STARTING_STEP_EDGE_POINTS,
+                MAX_STAIR_STARTING_STEP_EDGE_POINTS,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "stringer_placement",
+            normalized_stringer_placement,
+        )
+        object.__setattr__(
+            self,
+            "legacy_part_layout",
+            normalized_legacy_part_layout,
+        )
         object.__setattr__(
             self,
             "start_a_vertex_id",
@@ -772,10 +947,30 @@ class StairData:
     def is_floating(self) -> bool:
         """Return whether this stair uses unsupported floating treads."""
 
-        return self.style in {
-            STAIR_STYLE_FLOATING,
-            STAIR_STYLE_FLOATING_WITH_RISER,
-        }
+        return self.stair_type == STAIR_TYPE_FLOATING
+
+    @property
+    def has_legacy_riser_panels(self) -> bool:
+        """Return whether an old floating-with-riser stair keeps its panels."""
+
+        return self.style == STAIR_STYLE_FLOATING_WITH_RISER
+
+    @property
+    def uses_legacy_part_layout(self) -> bool:
+        """Return whether old projects should retain their single stair mesh."""
+
+        return self.legacy_part_layout
+
+    def calculate_step_layout(
+        self,
+        total_rise_meters: object,
+    ) -> tuple[int, float]:
+        """Return an even step count and actual rise for a route height."""
+
+        return calculate_stair_step_layout(
+            total_rise_meters,
+            self.target_rise_meters,
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -789,7 +984,22 @@ class StairData:
             "end_a_y": float(self.end_a_y),
             "end_b_x": float(self.end_b_x),
             "end_b_y": float(self.end_b_y),
+            "stair_id": self.stair_id,
+            "stair_type": self.stair_type,
             "style": self.style,
+            "target_rise_meters": float(self.target_rise_meters),
+            "tread_thickness_meters": float(self.tread_thickness_meters),
+            "tread_overhang_meters": float(self.tread_overhang_meters),
+            "nosing_placements": list(self.nosing_placements),
+            "tread_edge_profile": self.tread_edge_profile,
+            "tread_edge_radius_meters": float(self.tread_edge_radius_meters),
+            "starting_step": self.starting_step,
+            "starting_step_edge_radius_meters": float(
+                self.starting_step_edge_radius_meters
+            ),
+            "starting_step_edge_points": int(self.starting_step_edge_points),
+            "stringer_placement": self.stringer_placement,
+            "legacy_part_layout": self.legacy_part_layout,
             "start_a_vertex_id": self.start_a_vertex_id,
             "start_b_vertex_id": self.start_b_vertex_id,
             "end_a_vertex_id": self.end_a_vertex_id,
@@ -807,7 +1017,54 @@ class StairData:
         common_values = {
             "start_level_index": payload.get("start_level_index"),
             "end_level_index": payload.get("end_level_index"),
-            "style": payload.get("style", DEFAULT_STAIR_STYLE),
+            "stair_id": payload.get("stair_id"),
+            "stair_type": payload.get("stair_type"),
+            "style": payload.get("style"),
+            "target_rise_meters": payload.get(
+                "target_rise_meters",
+                DEFAULT_STAIR_TARGET_RISE_METERS,
+            ),
+            "tread_thickness_meters": payload.get(
+                "tread_thickness_meters",
+                DEFAULT_STAIR_TREAD_THICKNESS_METERS,
+            ),
+            "tread_overhang_meters": payload.get(
+                "tread_overhang_meters",
+                DEFAULT_STAIR_TREAD_OVERHANG_METERS,
+            ),
+            "nosing_placements": payload.get(
+                "nosing_placements",
+                DEFAULT_STAIR_NOSING_PLACEMENTS,
+            ),
+            "tread_edge_profile": payload.get(
+                "tread_edge_profile",
+                DEFAULT_STAIR_TREAD_EDGE_PROFILE,
+            ),
+            "tread_edge_radius_meters": payload.get(
+                "tread_edge_radius_meters",
+                DEFAULT_STAIR_TREAD_EDGE_RADIUS_METERS,
+            ),
+            "starting_step": payload.get(
+                "starting_step",
+                DEFAULT_STAIR_STARTING_STEP,
+            ),
+            "starting_step_edge_radius_meters": payload.get(
+                "starting_step_edge_radius_meters",
+                DEFAULT_STAIR_STARTING_STEP_EDGE_RADIUS_METERS,
+            ),
+            "starting_step_edge_points": payload.get(
+                "starting_step_edge_points",
+                DEFAULT_STAIR_STARTING_STEP_EDGE_POINTS,
+            ),
+            "stringer_placement": payload.get("stringer_placement"),
+            "legacy_part_layout": payload.get(
+                "legacy_part_layout",
+                (
+                    "stringer_placement" not in payload
+                    or payload.get("stringer_placement") is None
+                    or payload.get("stringer_placement") == STAIR_STRINGER_NONE
+                ),
+            ),
             "start_a_vertex_id": payload.get("start_a_vertex_id"),
             "start_b_vertex_id": payload.get("start_b_vertex_id"),
             "end_a_vertex_id": payload.get("end_a_vertex_id"),
@@ -828,8 +1085,7 @@ class StairData:
             legacy_names = ("start_x", "start_y", "end_x", "end_y")
             if any(name in payload for name in legacy_names):
                 raise ValueError(
-                    "Do not mix legacy stair center points with four-point "
-                    "coordinates."
+                    "Do not mix legacy stair center points with four-point coordinates."
                 )
             return cls(
                 **common_values,
@@ -871,10 +1127,13 @@ class VertexData:
     def normalize_next_vertex_id(self) -> None:
         """Advance a stale allocator beyond every occupied vertex ID."""
 
-        minimum_next_id = max(
-            (vertex.id for vertex in self.vertices),
-            default=0,
-        ) + 1
+        minimum_next_id = (
+            max(
+                (vertex.id for vertex in self.vertices),
+                default=0,
+            )
+            + 1
+        )
         self._next_vertex_id = max(
             1,
             int(self._next_vertex_id),
@@ -912,17 +1171,13 @@ class VertexData:
 
         requested_ids = set(vertex_ids)
         deleted_ids = {
-            vertex.id
-            for vertex in self.vertices
-            if vertex.id in requested_ids
+            vertex.id for vertex in self.vertices if vertex.id in requested_ids
         }
         if not deleted_ids:
             return False
 
         self.vertices = [
-            vertex
-            for vertex in self.vertices
-            if vertex.id not in deleted_ids
+            vertex for vertex in self.vertices if vertex.id not in deleted_ids
         ]
         self.edges = [
             edge
@@ -948,8 +1203,7 @@ class VertexData:
         self.edges = [
             edge
             for edge in self.edges
-            if self._edge_key(edge.start_vertex_id, edge.end_vertex_id)
-            != expected_key
+            if self._edge_key(edge.start_vertex_id, edge.end_vertex_id) != expected_key
         ]
         return len(self.edges) != original_edge_count
 
@@ -1016,10 +1270,13 @@ class VertexData:
             for edge in payload.get("edges", [])
         ]
 
-        default_next_vertex_id = max(
-            [vertex.id for vertex in vertex_data.vertices],
-            default=0,
-        ) + 1
+        default_next_vertex_id = (
+            max(
+                [vertex.id for vertex in vertex_data.vertices],
+                default=0,
+            )
+            + 1
+        )
         vertex_data._next_vertex_id = max(
             default_next_vertex_id,
             int(payload.get("next_vertex_id", default_next_vertex_id)),
@@ -1124,9 +1381,7 @@ def normalize_doorway_shape(value: object) -> str:
     shape = value.strip().lower()
     if shape not in DOORWAY_SHAPES:
         supported_shapes = ", ".join(sorted(DOORWAY_SHAPES))
-        raise ValueError(
-            f"Doorway shape must be one of: {supported_shapes}."
-        )
+        raise ValueError(f"Doorway shape must be one of: {supported_shapes}.")
     return shape
 
 
@@ -1177,9 +1432,7 @@ def normalize_doorway_bottom_height_meters(value: object) -> float:
 def _normalize_editable_surface_uuid(value: object, field_name: str) -> str:
     normalized = str(value).strip().lower()
     if _EDITABLE_SURFACE_UUID_PATTERN.fullmatch(normalized) is None:
-        raise ValueError(
-            f"Editable surface {field_name} must be a 32-character UUID."
-        )
+        raise ValueError(f"Editable surface {field_name} must be a 32-character UUID.")
     return normalized
 
 
@@ -1189,9 +1442,7 @@ def _normalize_finite_float(value: object, field_name: str) -> float:
     try:
         normalized = float(value)
     except (TypeError, ValueError, OverflowError) as error:
-        raise ValueError(
-            f"Editable surface {field_name} must be a number."
-        ) from error
+        raise ValueError(f"Editable surface {field_name} must be a number.") from error
     if not math.isfinite(normalized):
         raise ValueError(f"Editable surface {field_name} must be finite.")
     return normalized
@@ -1221,13 +1472,9 @@ def _normalize_window_ratio(value: object, field_name: str) -> float:
     try:
         ratio = float(value)
     except (TypeError, ValueError, OverflowError) as error:
-        raise ValueError(
-            f"Window {field_name} ratio must be a number."
-        ) from error
+        raise ValueError(f"Window {field_name} ratio must be a number.") from error
     if not math.isfinite(ratio) or not 0.0 <= ratio <= 1.0:
-        raise ValueError(
-            f"Window {field_name} ratio must be between zero and one."
-        )
+        raise ValueError(f"Window {field_name} ratio must be between zero and one.")
     return ratio
 
 
@@ -1238,9 +1485,7 @@ def _normalize_open_space_coordinate(value: object, field_name: str) -> float:
     try:
         coordinate = float(value)
     except (TypeError, ValueError, OverflowError) as error:
-        raise ValueError(
-            f"Open-space {field_name} must be a number."
-        ) from error
+        raise ValueError(f"Open-space {field_name} must be a number.") from error
     if not math.isfinite(coordinate):
         raise ValueError(f"Open-space {field_name} must be finite.")
     return coordinate
@@ -1269,6 +1514,26 @@ def snap_point(
 
 
 # ### Stair validation helpers ###
+def calculate_stair_step_layout(
+    total_rise_meters: object,
+    target_rise_meters: object,
+) -> tuple[int, float]:
+    """Choose the nearest step count and distribute the full rise evenly."""
+
+    total_rise = _normalize_stair_positive_measurement(
+        total_rise_meters,
+        "total rise",
+    )
+    target_rise = _normalize_stair_length(
+        target_rise_meters,
+        "target step rise",
+        MIN_STAIR_TARGET_RISE_METERS,
+        MAX_STAIR_TARGET_RISE_METERS,
+    )
+    step_count = max(1, math.floor((total_rise / target_rise) + 0.5))
+    return step_count, total_rise / step_count
+
+
 def normalize_stair_style(value: object) -> str:
     """Return a supported stair style or raise a clear validation error."""
 
@@ -1278,17 +1543,197 @@ def normalize_stair_style(value: object) -> str:
     style = value.strip().lower()
     if style not in STAIR_STYLES:
         supported_styles = ", ".join(sorted(STAIR_STYLES))
-        raise ValueError(
-            f"Stair style must be one of: {supported_styles}."
-        )
+        raise ValueError(f"Stair style must be one of: {supported_styles}.")
     return style
+
+
+def normalize_stair_type(value: object) -> str:
+    """Return a supported two-state stair construction type."""
+
+    if not isinstance(value, str):
+        raise ValueError("Stair type must be a string.")
+    stair_type = value.strip().lower()
+    if stair_type not in STAIR_TYPES:
+        supported_types = ", ".join(sorted(STAIR_TYPES))
+        raise ValueError(f"Stair type must be one of: {supported_types}.")
+    return stair_type
+
+
+def normalize_stair_tread_edge_profile(value: object) -> str:
+    """Return a supported tread edge profile."""
+
+    if not isinstance(value, str):
+        raise ValueError("Stair tread edge profile must be a string.")
+    profile = value.strip().lower()
+    if profile not in STAIR_TREAD_EDGE_PROFILES:
+        supported_profiles = ", ".join(sorted(STAIR_TREAD_EDGE_PROFILES))
+        raise ValueError(
+            f"Stair tread edge profile must be one of: {supported_profiles}."
+        )
+    return profile
+
+
+def normalize_stair_nosing_placements(value: object) -> tuple[str, ...]:
+    """Return unique nosing placements in their canonical UI order."""
+
+    if isinstance(value, str) or not isinstance(value, Iterable):
+        raise ValueError("Stair nosing placements must be an iterable of strings.")
+    normalized_placements: set[str] = set()
+    for candidate in value:
+        if not isinstance(candidate, str):
+            raise ValueError("Stair nosing placements must contain only strings.")
+        placement = candidate.strip().lower()
+        if placement not in STAIR_NOSING_PLACEMENTS:
+            supported_placements = ", ".join(STAIR_NOSING_PLACEMENTS)
+            raise ValueError(
+                f"Stair nosing placement must be one of: {supported_placements}."
+            )
+        normalized_placements.add(placement)
+    return tuple(
+        placement
+        for placement in STAIR_NOSING_PLACEMENTS
+        if placement in normalized_placements
+    )
+
+
+def normalize_stair_starting_step(value: object) -> str:
+    """Return a supported first-tread treatment."""
+
+    if not isinstance(value, str):
+        raise ValueError("Stair starting step must be a string.")
+    starting_step = value.strip().lower()
+    if starting_step not in STAIR_STARTING_STEPS:
+        supported_starting_steps = ", ".join(STAIR_STARTING_STEPS)
+        raise ValueError(
+            "Stair starting step must be one of: "
+            f"{supported_starting_steps}."
+        )
+    return starting_step
+
+
+def _normalize_stair_type_and_style(
+    stair_type: object,
+    style: object,
+) -> tuple[str, str]:
+    """Resolve the new construction type while retaining old style input."""
+
+    normalized_style = (
+        DEFAULT_STAIR_STYLE if style is None else normalize_stair_style(style)
+    )
+    style_type = (
+        STAIR_TYPE_SUPPORTED
+        if normalized_style == STAIR_STYLE_SUPPORTED
+        else STAIR_TYPE_FLOATING
+    )
+    if stair_type is None:
+        return style_type, normalized_style
+
+    normalized_type = normalize_stair_type(stair_type)
+    if normalized_type == style_type:
+        return normalized_type, normalized_style
+    return normalized_type, normalized_type
+
+
+def _normalize_stair_id(value: object) -> str:
+    """Return a stable UUID-hex stair identity, creating one when absent."""
+
+    if value is None:
+        return uuid.uuid4().hex
+    if not isinstance(value, str):
+        raise ValueError("Stair ID must be a UUID string.")
+    try:
+        return uuid.UUID(value.strip()).hex
+    except (AttributeError, ValueError) as error:
+        raise ValueError("Stair ID must be a UUID string.") from error
+
+
+def _normalize_stair_stringer_placement(value: object) -> str:
+    """Normalize the optional left/right stringer placement."""
+
+    if value is None:
+        return STAIR_STRINGER_NONE
+    if not isinstance(value, str):
+        raise ValueError("Stair stringer placement must be a string.")
+    placement = value.strip().lower()
+    if placement not in STAIR_STRINGER_PLACEMENTS:
+        supported_placements = ", ".join(sorted(STAIR_STRINGER_PLACEMENTS))
+        raise ValueError(
+            f"Stair stringer placement must be one of: {supported_placements}."
+        )
+    return placement
+
+
+def _normalize_stair_legacy_part_layout(
+    value: object,
+    *,
+    infer_legacy: bool,
+) -> bool:
+    """Resolve the explicit compatibility marker for pre-parameter stairs."""
+
+    if value is _INFER_STAIR_LEGACY_PART_LAYOUT:
+        return infer_legacy
+    if not isinstance(value, bool):
+        raise ValueError("Stair legacy part layout marker must be a boolean.")
+    return value
+
+
+def _normalize_stair_positive_measurement(
+    value: object,
+    measurement_name: str,
+) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"Stair {measurement_name} must be a positive number.")
+    try:
+        measurement = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            f"Stair {measurement_name} must be a positive number."
+        ) from error
+    if not math.isfinite(measurement) or measurement <= 0.0:
+        raise ValueError(f"Stair {measurement_name} must be a positive number.")
+    return measurement
+
+
+def _normalize_stair_length(
+    value: object,
+    measurement_name: str,
+    minimum: float,
+    maximum: float,
+) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"Stair {measurement_name} must be a number.")
+    try:
+        measurement = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"Stair {measurement_name} must be a number.") from error
+    if not math.isfinite(measurement) or not minimum <= measurement <= maximum:
+        raise ValueError(
+            f"Stair {measurement_name} must be between {minimum:g} and "
+            f"{maximum:g} meters."
+        )
+    return measurement
+
+
+def _normalize_stair_integer(
+    value: object,
+    measurement_name: str,
+    minimum: int,
+    maximum: int,
+) -> int:
+    """Return a bounded integer stair parameter without coercing decimals."""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"Stair {measurement_name} must be an integer.")
+    if not minimum <= value <= maximum:
+        raise ValueError(
+            f"Stair {measurement_name} must be between {minimum} and {maximum}."
+        )
+    return value
 
 
 def _validate_stair_level_index(level_index: object, endpoint_name: str) -> None:
     if isinstance(level_index, bool) or not isinstance(level_index, int):
-        raise ValueError(
-            f"Stair {endpoint_name} level index must be an integer."
-        )
+        raise ValueError(f"Stair {endpoint_name} level index must be an integer.")
     if not MIN_LEVEL_INDEX <= level_index <= MAX_LEVEL_INDEX:
         raise ValueError(
             f"Stair {endpoint_name} level index must be between "
@@ -1306,9 +1751,7 @@ def _normalize_stair_coordinate(value: object, coordinate_name: str) -> float:
             f"Stair {coordinate_name} coordinate must be a number."
         ) from error
     if not math.isfinite(coordinate):
-        raise ValueError(
-            f"Stair {coordinate_name} coordinate must be finite."
-        )
+        raise ValueError(f"Stair {coordinate_name} coordinate must be finite.")
     return coordinate
 
 
@@ -1333,9 +1776,7 @@ def _validate_stair_segment_width(
     segment_name: str,
 ) -> None:
     if math.hypot(second_x - first_x, second_y - first_y) <= 1e-9:
-        raise ValueError(
-            f"Stair {segment_name} points must be separated."
-        )
+        raise ValueError(f"Stair {segment_name} points must be separated.")
 
 
 def _normalize_stair_intermediate_sections(

@@ -60,6 +60,9 @@ FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY = (
     "navigation/first_person_navigation_mode"
 )
 IGNORE_TOP_DOWN_CEILING_SETTING_KEY = "navigation/ignore_top_down_ceiling"
+HIDE_STAIR_MESH_WHEN_PREVIEWING_SETTING_KEY = (
+    "canvas/hide_stair_mesh_when_previewing"
+)
 UNUSED_FACE_REMOVAL_SETTING_KEY = "generation/unused_face_removal"
 USE_UV_RAYCAST_FOR_OBJECT_GENERATION_SETTING_KEY = (
     "generation/use_uv_raycast_for_object_generation"
@@ -92,6 +95,7 @@ DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS = 1.0
 DEFAULT_WALL_VERTEX_UPDATE_DELAY_SECONDS = 15.0
 DEFAULT_SNAP_MIDDLE_EQUAL_ANGLE_ONLY = True
 DEFAULT_IGNORE_TOP_DOWN_CEILING = True
+DEFAULT_HIDE_STAIR_MESH_WHEN_PREVIEWING = True
 MIN_MESH_EDIT_UPDATE_DELAY_SECONDS = 0.1
 MAX_MESH_EDIT_UPDATE_DELAY_SECONDS = 10.0
 MESH_EDIT_UPDATE_DELAY_STEP_SECONDS = 0.1
@@ -192,6 +196,9 @@ class GenerationServiceSettings:
     generation_display_screen_id: str | None = None
     automatic_atlas_creation: bool = DEFAULT_AUTOMATIC_ATLAS_CREATION
     ignore_top_down_ceiling: bool = DEFAULT_IGNORE_TOP_DOWN_CEILING
+    hide_stair_mesh_when_previewing: bool = (
+        DEFAULT_HIDE_STAIR_MESH_WHEN_PREVIEWING
+    )
 
     def __post_init__(self) -> None:
         try:
@@ -217,6 +224,10 @@ class GenerationServiceSettings:
         if not isinstance(self.ignore_top_down_ceiling, bool):
             raise ValueError(
                 "Top-down ceiling suppression must be enabled or disabled."
+            )
+        if not isinstance(self.hide_stair_mesh_when_previewing, bool):
+            raise ValueError(
+                "Hide stair mesh when previewing must be enabled or disabled."
             )
         if not isinstance(self.automatic_atlas_creation, bool):
             raise ValueError(
@@ -489,6 +500,9 @@ class SettingsWidget(QWidget):
             ),
             ignore_top_down_ceiling=(
                 self.ignore_top_down_ceiling_checkbox.isChecked()
+            ),
+            hide_stair_mesh_when_previewing=(
+                self.hide_stair_mesh_when_previewing_checkbox.isChecked()
             ),
         )
 
@@ -818,6 +832,22 @@ class SettingsWidget(QWidget):
             self.ignore_top_down_ceiling_checkbox,
         )
 
+        self.hide_stair_mesh_when_previewing_checkbox = QCheckBox()
+        self.hide_stair_mesh_when_previewing_checkbox.setObjectName(
+            "hide_stair_mesh_when_previewing_checkbox"
+        )
+        self.hide_stair_mesh_when_previewing_checkbox.setToolTip(
+            "Hide the selected stair's existing mesh while staged stair "
+            "changes are previewed. Restore it when the preview ends."
+        )
+        self.hide_stair_mesh_when_previewing_checkbox.toggled.connect(
+            self._handle_hide_stair_mesh_when_previewing_changed
+        )
+        canvas_form.addRow(
+            "Hide stair's mesh when previewing",
+            self.hide_stair_mesh_when_previewing_checkbox,
+        )
+
         self.snap_middle_equal_angle_only_checkbox = QCheckBox()
         self.snap_middle_equal_angle_only_checkbox.setObjectName(
             "snap_middle_equal_angle_only_checkbox"
@@ -1064,6 +1094,9 @@ class SettingsWidget(QWidget):
         )
         self.ignore_top_down_ceiling_checkbox.setChecked(
             read_ignore_top_down_ceiling(self._application_settings)
+        )
+        self.hide_stair_mesh_when_previewing_checkbox.setChecked(
+            read_hide_stair_mesh_when_previewing(self._application_settings)
         )
         self.snap_middle_equal_angle_only_checkbox.setChecked(
             read_snap_middle_equal_angle_only(self._application_settings)
@@ -1386,6 +1419,19 @@ class SettingsWidget(QWidget):
             return
         self._application_settings.set(
             IGNORE_TOP_DOWN_CEILING_SETTING_KEY,
+            bool(enabled),
+        )
+        self.settings_changed.emit()
+
+    def _handle_hide_stair_mesh_when_previewing_changed(
+        self, enabled: bool
+    ) -> None:
+        """Persist the visibility of a stair while its edit is previewed."""
+
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            HIDE_STAIR_MESH_WHEN_PREVIEWING_SETTING_KEY,
             bool(enabled),
         )
         self.settings_changed.emit()
@@ -1803,6 +1849,20 @@ def read_ignore_top_down_ceiling(
     if isinstance(value, bool):
         return value
     return DEFAULT_IGNORE_TOP_DOWN_CEILING
+
+
+def read_hide_stair_mesh_when_previewing(
+    application_settings: ApplicationSettingsStore,
+) -> bool:
+    """Read the stair-preview visibility preference with a safe default."""
+
+    value = application_settings.get(
+        HIDE_STAIR_MESH_WHEN_PREVIEWING_SETTING_KEY,
+        DEFAULT_HIDE_STAIR_MESH_WHEN_PREVIEWING,
+    )
+    if isinstance(value, bool):
+        return value
+    return DEFAULT_HIDE_STAIR_MESH_WHEN_PREVIEWING
 
 
 def read_canvas_3d_navigation_toggle_hotkey(

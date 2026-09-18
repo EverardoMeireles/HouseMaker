@@ -2187,7 +2187,9 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         self.assertEqual(request.api_key, "openai-test-key")
         self.assertEqual(request.reference_frame_indices, (0, 2))
         self.assertEqual(len(request.reference_pngs), 2)
-        self.assertTrue(all(image.startswith(b"\x89PNG") for image in request.reference_pngs))
+        self.assertTrue(
+            all(image.startswith(b"\x89PNG") for image in request.reference_pngs)
+        )
         self.assertEqual(request.surface_type, "floor")
         self.assertEqual(request.surface_ids, ("level:2/room:5/floor",))
         self.assertAlmostEqual(request.combined_area_m2, 4.0)
@@ -2767,6 +2769,58 @@ class SharedSceneSurfaceSelectionTests(unittest.TestCase):
         persisted = self.workspace.get_data()
         self.assertIsNone(persisted.selected_surface_type)
         self.assertEqual(persisted.selected_surface_ids, ())
+
+    def test_external_stair_parts_share_assignment_and_reconciliation_pipeline(
+        self,
+    ) -> None:
+        stair_surface_id = (
+            f"stair:{'a' * 32}/part:treads:floor"
+        )
+        mesh = trimesh.creation.box(extents=(1.0, 2.0, 0.1))
+        stair_part = FixedSurface(
+            surface_id=stair_surface_id,
+            surface_type="floor",
+            level_index=2,
+            room_index=None,
+            mesh=mesh,
+            area_square_meters=float(mesh.area),
+        )
+        assignment = SurfaceTextureAssignment(
+            assignment_id="stair-treads",
+            surface_type="floor",
+            surface_ids=(stair_surface_id,),
+            provider="meshy",
+            asset_path="stair-treads.png",
+            combined_area_m2=float(mesh.area),
+        )
+
+        self.assertTrue(
+            self.workspace.set_external_semantic_surfaces((stair_part,))
+        )
+        self.workspace.set_data(SurfaceTextureData(assignments=[assignment]))
+        self.assertTrue(
+            self.workspace.assignment_targets_are_valid(
+                assignment.assignment_id,
+                (stair_surface_id,),
+            )
+        )
+        self.assertTrue(
+            self.workspace.reconcile_assignments_with_levels([_test_level()])
+        )
+        retained = self.workspace.get_assignment(assignment.assignment_id)
+        assert retained is not None
+        self.assertEqual(retained.surface_ids, (stair_surface_id,))
+        self.assertFalse(
+            self.workspace.reconcile_assignments_with_levels([_test_level()])
+        )
+
+        self.assertTrue(self.workspace.set_external_semantic_surfaces(()))
+        self.assertTrue(
+            self.workspace.reconcile_assignments_with_levels([_test_level()])
+        )
+        reconciled = self.workspace.get_assignment(assignment.assignment_id)
+        assert reconciled is not None
+        self.assertEqual(reconciled.surface_ids, ())
 
 
 # ### Reference crop tests ###

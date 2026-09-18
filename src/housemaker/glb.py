@@ -5,8 +5,9 @@ import copy
 import json
 import math
 import os
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from io import BytesIO
 from itertools import permutations
 from pathlib import Path
@@ -43,10 +44,22 @@ from housemaker.models import (
     DEFAULT_DOORWAY_BOTTOM_HEIGHT_METERS,
     DEFAULT_DOORWAY_SHAPE,
     DEFAULT_LEVEL_HEIGHT_METERS,
+    DEFAULT_STAIR_TARGET_RISE_METERS,
+    DEFAULT_STAIR_TREAD_EDGE_RADIUS_METERS,
     PIXEL_TO_METER,
-    STAIR_STYLE_FLOATING,
-    STAIR_STYLE_FLOATING_WITH_RISER,
-    STAIR_STYLE_SUPPORTED,
+    STAIR_NOSING_FRONT,
+    STAIR_NOSING_LEFT,
+    STAIR_NOSING_RIGHT,
+    STAIR_STARTING_STEP_BULLNOSE,
+    STAIR_STARTING_STEP_CURTAIL,
+    STAIR_STARTING_STEP_NONE,
+    STAIR_STRINGER_BOTH,
+    STAIR_STRINGER_LEFT,
+    STAIR_STRINGER_NONE,
+    STAIR_STRINGER_RIGHT,
+    STAIR_TREAD_EDGE_ROUNDED,
+    STAIR_TYPE_FLOATING,
+    STAIR_TYPE_SUPPORTED,
     Edge,
     LevelData,
     RoomData,
@@ -97,12 +110,23 @@ WINDOW_COPLANAR_DEPTH_PIXELS = 1e-4
 WINDOW_CUT_DEPTH_METERS = 0.5
 WALL_REVEAL_PARALLEL_COSINE = math.cos(math.radians(10.0))
 MAX_IMPORTED_GENERATED_MODEL_FACES = 1_000_000
-DEFAULT_STAIR_RISER_HEIGHT_METERS = 0.175
+DEFAULT_STAIR_RISER_HEIGHT_METERS = DEFAULT_STAIR_TARGET_RISE_METERS
 DEFAULT_FLOATING_STAIR_TREAD_THICKNESS_METERS = 0.08
 STAIR_GEOMETRY_EPSILON = 1e-6
 STAIR_CURVE_SAMPLE_SPACING_METERS = 0.08
+STAIR_ROUNDED_EDGE_SEGMENTS = 12
+STAIR_ROUNDED_EDGE_PROTECTION_MARGIN_RATIO = 1.02
+STAIR_ROUNDED_EDGE_MINIMUM_BODY_DEPTH_RATIO = 0.01
+STAIR_BULLNOSE_GOING_EXTENSION_RATIO = 0.5
+STAIR_BULLNOSE_WIDTH_EXTENSION_RATIO = 0.2
+STAIR_CURTAIL_GOING_EXTENSION_RATIO = 1.0
+STAIR_CURTAIL_WIDTH_EXTENSION_RATIO = 0.35
+STAIR_CURTAIL_FRONT_EXTENSION_RATIO = 0.3
+DEFAULT_STAIR_STRINGER_WIDTH_METERS = 0.06
+DEFAULT_STAIR_STRINGER_DEPTH_METERS = 0.2
 MAX_EXACT_STAIR_GUIDE_ORDER_COUNT = 12
 MAX_TOPOLOGY_STAIR_GUIDE_ORDER_COUNT = 8
+STAIR_ROUTE_CACHE_MAX_ENTRIES = 64
 TEXTURE_PREVIEW_PLANE_SIZE_METERS = 2.0
 SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION = {
     "vertical": 0,
@@ -123,9 +147,20 @@ GLTF_CLAMP_TO_EDGE_WRAP = 33071
 NAMED_MESH_ROLE_SURFACE = "surface"
 NAMED_MESH_ROLE_OPENING_REVEAL = "opening_reveal"
 NAMED_MESH_ROLE_STAIR = "stair"
+STAIR_PART_TREADS = "treads"
+STAIR_PART_SUPPORT = "support"
+STAIR_PART_RISERS = "risers"
+STAIR_PART_STRINGERS = "stringers"
+STAIR_PART_SURFACE_TYPE = {
+    STAIR_PART_TREADS: "floor",
+    STAIR_PART_SUPPORT: "wall",
+    STAIR_PART_RISERS: "wall",
+    STAIR_PART_STRINGERS: "wall",
+}
 
 # ### Module state ###
 _fallback_qt_application: QGuiApplication | None = None
+
 
 # ### Data models ###
 @dataclass(frozen=True)
@@ -161,6 +196,76 @@ class PackedOrmMaterialSpec:
         object.__setattr__(self, "ao_strength", ao_strength)
 
 
+@dataclass(frozen=True)
+class PreviewStairPart:
+    """One selectable, textureable semantic part of a procedural stair."""
+
+    stair_id: str
+    stair_index: int
+    semantic_id: str
+    part_kind: str
+    surface_type: str
+    mesh: trimesh.Trimesh
+    level_indices: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.stair_id, str) or not self.stair_id.strip():
+            raise ValueError("Preview stair parts require a stair ID.")
+        if (
+            isinstance(self.stair_index, bool)
+            or not isinstance(self.stair_index, int)
+            or self.stair_index < 0
+        ):
+            raise ValueError("Preview stair indices must be non-negative.")
+        if self.part_kind not in STAIR_PART_SURFACE_TYPE:
+            raise ValueError("Preview stair parts require a known part kind.")
+        if self.surface_type != STAIR_PART_SURFACE_TYPE[self.part_kind]:
+            raise ValueError("Preview stair part surface type is inconsistent.")
+        expected_semantic_id = (
+            f"stair:{self.stair_id.strip()}/part:{self.part_kind}:"
+            f"{self.surface_type}"
+        )
+        if self.semantic_id != expected_semantic_id:
+            raise ValueError("Preview stair part semantic ID is inconsistent.")
+        if not isinstance(self.mesh, trimesh.Trimesh):
+            raise TypeError("Preview stair parts require triangle meshes.")
+        if any(
+            isinstance(level_index, bool) or not isinstance(level_index, int)
+            for level_index in self.level_indices
+        ):
+            raise ValueError("Preview stair part levels must be integer indices.")
+        normalized_levels = tuple(sorted(set(self.level_indices)))
+        if not normalized_levels:
+            raise ValueError("Preview stair parts require owning levels.")
+        object.__setattr__(self, "stair_id", self.stair_id.strip())
+        object.__setattr__(self, "level_indices", normalized_levels)
+
+    @property
+    def key(self) -> str:
+        """Return the persistent selection and texture-assignment key."""
+
+        return self.semantic_id
+
+    @property
+    def surface_id(self) -> str:
+        """Expose the semantic key through the standard surface interface."""
+
+        return self.semantic_id
+
+
+_ImmutableStairPoint = tuple[float, float]
+_ImmutableStairSection = tuple[_ImmutableStairPoint, _ImmutableStairPoint]
+_ImmutableStairRoute = tuple[_ImmutableStairSection, ...]
+
+
+@dataclass(frozen=True)
+class _CachedStairRouteGeometry:
+    """Immutable sampled route data safe to retain between preview rebuilds."""
+
+    route_sections: _ImmutableStairRoute
+    cumulative_distances: tuple[float, ...]
+
+
 @dataclass
 class GeneratedModel:
     mesh: trimesh.Trimesh
@@ -175,9 +280,8 @@ class GeneratedModel:
     preview_symmetric_objects: list["PreviewSymmetricObject"] = field(
         default_factory=list
     )
-    preview_placed_objects: list["PreviewPlacedObject"] = field(
-        default_factory=list
-    )
+    preview_placed_objects: list["PreviewPlacedObject"] = field(default_factory=list)
+    preview_stair_parts: list[PreviewStairPart] = field(default_factory=list)
     preview_base_mesh: trimesh.Trimesh | None = None
 
 
@@ -206,16 +310,12 @@ class PlacedGeneratedModel:
             raise ValueError("Placed generated-object IDs cannot be empty.")
         if not isinstance(self.model, GeneratedModel):
             raise TypeError("Placed generated objects require a GeneratedModel.")
-        normalized_position = _normalize_placed_world_position(
-            self.world_position
-        )
+        normalized_position = _normalize_placed_world_position(self.world_position)
         orientation, plane_coordinate = _normalize_symmetric_preview(
             self.symmetric_preview_orientation,
             self.symmetric_preview_plane_coordinate,
         )
-        normalized_rotation = _normalize_placed_rotation(
-            self.rotation_degrees
-        )
+        normalized_rotation = _normalize_placed_rotation(self.rotation_degrees)
         normalized_object_name = (
             normalized_object_id
             if self.object_name is None
@@ -301,15 +401,12 @@ class PreviewSymmetricObject:
         if not all(isinstance(mesh, trimesh.Trimesh) for mesh in self.meshes):
             raise TypeError("Symmetric preview meshes must be triangle meshes.")
         if not isinstance(self.mirrored_meshes, tuple) or not all(
-            isinstance(mesh, trimesh.Trimesh)
-            for mesh in self.mirrored_meshes
+            isinstance(mesh, trimesh.Trimesh) for mesh in self.mirrored_meshes
         ):
             raise TypeError(
                 "Mirrored symmetric preview meshes must be triangle meshes."
             )
-        if self.mirrored_meshes and len(self.mirrored_meshes) != len(
-            self.meshes
-        ):
+        if self.mirrored_meshes and len(self.mirrored_meshes) != len(self.meshes):
             raise ValueError(
                 "Symmetric retained and mirrored previews must have equal parts."
             )
@@ -327,9 +424,7 @@ class PreviewSymmetricObject:
 class NamedMesh:
     name: str
     mesh: trimesh.Trimesh
-    source_transform: np.ndarray = field(
-        default_factory=lambda: np.eye(4, dtype=float)
-    )
+    source_transform: np.ndarray = field(default_factory=lambda: np.eye(4, dtype=float))
     export_role: str = NAMED_MESH_ROLE_SURFACE
 
 
@@ -566,9 +661,7 @@ def convert_to_glb(
         wall_height_meters=wall_height_meters,
         blueprint_size_pixels=blueprint_size_pixels,
         surface_materials=(surface_materials or {}),
-        surface_texture_world_size_meters=(
-            surface_texture_world_size_meters
-        ),
+        surface_texture_world_size_meters=(surface_texture_world_size_meters),
         stairs=stairs,
         serialize_glb=True,
         export_untextured_surfaces=export_untextured_surfaces,
@@ -590,9 +683,7 @@ def convert_to_export_scene_model(
         wall_height_meters=wall_height_meters,
         blueprint_size_pixels=blueprint_size_pixels,
         surface_materials=(surface_materials or {}),
-        surface_texture_world_size_meters=(
-            surface_texture_world_size_meters
-        ),
+        surface_texture_world_size_meters=(surface_texture_world_size_meters),
         stairs=stairs,
         serialize_glb=False,
         export_untextured_surfaces=False,
@@ -614,9 +705,7 @@ def convert_to_preview_model(
         wall_height_meters=wall_height_meters,
         blueprint_size_pixels=blueprint_size_pixels,
         surface_materials=surface_materials,
-        surface_texture_world_size_meters=(
-            surface_texture_world_size_meters
-        ),
+        surface_texture_world_size_meters=(surface_texture_world_size_meters),
         stairs=stairs,
         serialize_glb=False,
         export_untextured_surfaces=True,
@@ -665,6 +754,7 @@ def _build_blueprint_model(
     export_untextured_surfaces: bool,
 ) -> GeneratedModel:
     fixed_surfaces: Sequence[object] | None = None
+    preview_stair_parts: list[PreviewStairPart] = []
     if isinstance(level_source, VertexData):
         if stairs:
             raise ValueError("Stairs require level data with endpoint levels.")
@@ -682,10 +772,16 @@ def _build_blueprint_model(
             build_fixed_surfaces,
         )
 
+        level_lookup = {level.index: level for level in level_source}
+        exportable_stairs = _filter_stairs_for_export(stairs, level_lookup)
         named_meshes = _build_multi_level_meshes(
             level_source,
             blueprint_size_pixels=blueprint_size_pixels,
-            stairs=stairs,
+            stairs=exportable_stairs,
+        )
+        preview_stair_parts = build_canvas_stair_part_targets(
+            level_source,
+            exportable_stairs,
         )
         base_fixed_surfaces = build_base_fixed_surfaces(level_source)
         fixed_surfaces = build_fixed_surfaces(level_source)
@@ -715,11 +811,8 @@ def _build_blueprint_model(
     if not named_meshes:
         raise ValueError("The current blueprint data does not contain usable edges.")
 
-    combined_mesh = _combine_mesh_geometry(
-        [
-            _build_transformed_named_mesh_copy(named_mesh)
-            for named_mesh in named_meshes
-        ]
+    combined_mesh = _combine_preview_mesh_geometry(
+        [_build_transformed_named_mesh_copy(named_mesh) for named_mesh in named_meshes]
     )
     scene = _build_export_scene(named_meshes)
     glb_bytes = scene.export(file_type="glb") if serialize_glb else b""
@@ -728,6 +821,7 @@ def _build_blueprint_model(
         scene=scene,
         glb_bytes=glb_bytes,
         preview_textured_walls=preview_textured_walls,
+        preview_stair_parts=preview_stair_parts,
     )
     if not surface_materials and export_untextured_surfaces:
         return model
@@ -736,9 +830,7 @@ def _build_blueprint_model(
         named_meshes=named_meshes,
         level_source=level_source,
         surface_materials=surface_materials,
-        surface_texture_world_size_meters=(
-            surface_texture_world_size_meters
-        ),
+        surface_texture_world_size_meters=(surface_texture_world_size_meters),
         serialize_glb=serialize_glb,
         export_untextured_surfaces=export_untextured_surfaces,
         fixed_surfaces=fixed_surfaces,
@@ -792,8 +884,7 @@ def _apply_editable_surface_geometry(
         return list(named_meshes)
 
     base_by_id = {
-        str(getattr(surface, "surface_id")): surface
-        for surface in base_surfaces
+        str(getattr(surface, "surface_id")): surface for surface in base_surfaces
     }
     live_edited_source_ids = edited_source_ids.intersection(base_by_id)
     if not live_edited_source_ids:
@@ -805,8 +896,7 @@ def _apply_editable_surface_geometry(
             str(getattr(base_by_id[source_id], "surface_type")),
         )
         for source_id in live_edited_source_ids
-        if str(getattr(base_by_id[source_id], "surface_type"))
-        in {"floor", "ceiling"}
+        if str(getattr(base_by_id[source_id], "surface_type")) in {"floor", "ceiling"}
     }
     removal_surfaces = [
         surface
@@ -827,10 +917,7 @@ def _apply_editable_surface_geometry(
     replacement_surfaces = [
         surface
         for surface in current_surfaces
-        if (
-            getattr(surface, "source_surface_id", None)
-            in live_edited_source_ids
-        )
+        if (getattr(surface, "source_surface_id", None) in live_edited_source_ids)
         or (
             int(getattr(surface, "level_index")),
             str(getattr(surface, "surface_type")),
@@ -971,9 +1058,7 @@ def _compose_placed_generated_models(
         isinstance(placement, PlacedGeneratedModel)
         for placement in normalized_placements
     ):
-        raise TypeError(
-            "Placed models must contain PlacedGeneratedModel values."
-        )
+        raise TypeError("Placed models must contain PlacedGeneratedModel values.")
     if not normalized_placements:
         return base_model
     if not isinstance(base_model.scene, trimesh.Scene):
@@ -1030,9 +1115,7 @@ def _compose_placed_generated_models(
                 world_position=placement.world_position,
                 rotation_degrees=placement.rotation_degrees,
                 scale=placement.scale,
-                symmetric_preview_orientation=(
-                    placement.symmetric_preview_orientation
-                ),
+                symmetric_preview_orientation=(placement.symmetric_preview_orientation),
                 symmetric_preview_plane_coordinate=(
                     placement.symmetric_preview_plane_coordinate
                 ),
@@ -1044,9 +1127,7 @@ def _compose_placed_generated_models(
             ]
             assert placement.symmetric_preview_plane_coordinate is not None
             plane_point = np.zeros(4, dtype=float)
-            plane_point[axis] = (
-                placement.symmetric_preview_plane_coordinate
-            )
+            plane_point[axis] = placement.symmetric_preview_plane_coordinate
             plane_point[3] = 1.0
             world_plane_point = placement_transform @ plane_point
             preview_symmetric_objects.append(
@@ -1066,7 +1147,7 @@ def _compose_placed_generated_models(
                 )
             )
 
-    combined_mesh = _combine_mesh_geometry(
+    combined_mesh = _combine_preview_mesh_geometry(
         [base_model.mesh, *placed_meshes]
     )
     preview_untextured_mesh = None
@@ -1077,7 +1158,7 @@ def _compose_placed_generated_models(
             and base_model.preview_untextured_mesh is not None
         ):
             base_preview_mesh = base_model.preview_untextured_mesh
-        preview_untextured_mesh = _combine_mesh_geometry(
+        preview_untextured_mesh = _combine_preview_mesh_geometry(
             [base_preview_mesh, *placed_untextured_meshes]
         )
 
@@ -1099,6 +1180,7 @@ def _compose_placed_generated_models(
         preview_symmetric_objects=preview_symmetric_objects,
         preview_placed_objects=preview_placed_objects,
         preview_base_mesh=preview_base_mesh,
+        preview_stair_parts=list(base_model.preview_stair_parts),
     )
 
 
@@ -1118,9 +1200,7 @@ def _normalize_placed_world_position(
     coordinates: list[float] = []
     for raw_coordinate in raw_position:
         if isinstance(raw_coordinate, bool):
-            raise TypeError(
-                "Placed generated-object coordinates must be numbers."
-            )
+            raise TypeError("Placed generated-object coordinates must be numbers.")
         try:
             coordinate = float(raw_coordinate)
         except (TypeError, ValueError, OverflowError) as error:
@@ -1128,9 +1208,7 @@ def _normalize_placed_world_position(
                 "Placed generated-object coordinates must be numbers."
             ) from error
         if not math.isfinite(coordinate):
-            raise ValueError(
-                "Placed generated-object coordinates must be finite."
-            )
+            raise ValueError("Placed generated-object coordinates must be finite.")
         coordinates.append(coordinate)
     return coordinates[0], coordinates[1], coordinates[2]
 
@@ -1157,14 +1235,10 @@ def _normalize_symmetric_preview(
 ) -> tuple[str | None, float | None]:
     if raw_orientation is None:
         if raw_plane_coordinate is not None:
-            raise ValueError(
-                "A symmetric preview plane requires an orientation."
-            )
+            raise ValueError("A symmetric preview plane requires an orientation.")
         return None, None
     if raw_plane_coordinate is None:
-        raise ValueError(
-            "A symmetric preview orientation requires a plane coordinate."
-        )
+        raise ValueError("A symmetric preview orientation requires a plane coordinate.")
     if not isinstance(raw_orientation, str):
         raise TypeError("Symmetric preview orientations must be strings.")
     orientation = raw_orientation.strip().lower()
@@ -1192,9 +1266,7 @@ def _normalize_placed_rotation(
     ):
         raise TypeError("Placed generated-object rotations must be XYZ sequences.")
     if len(raw_rotation) != 3:
-        raise ValueError(
-            "Placed generated-object rotations must contain three angles."
-        )
+        raise ValueError("Placed generated-object rotations must contain three angles.")
     angles: list[float] = []
     for raw_angle in raw_rotation:
         if isinstance(raw_angle, bool) or not isinstance(
@@ -1238,9 +1310,7 @@ def _build_placed_model_transform(
         ],
         dtype=float,
     )
-    rotation_radians = np.radians(
-        np.asarray(placement.rotation_degrees, dtype=float)
-    )
+    rotation_radians = np.radians(np.asarray(placement.rotation_degrees, dtype=float))
     rotation = trimesh.transformations.euler_matrix(
         *rotation_radians,
         axes="sxyz",
@@ -1286,12 +1356,8 @@ def _build_half_mesh_node_metadata(
         ) from error
     world_point_z_up = transform @ local_point
     world_normal_z_up = normal_transform @ local_normal
-    world_point_gltf = (
-        Z_UP_TO_GLTF_Y_UP_TRANSFORM @ world_point_z_up
-    )[:3]
-    world_normal_gltf = (
-        Z_UP_TO_GLTF_Y_UP_TRANSFORM[:3, :3] @ world_normal_z_up
-    )
+    world_point_gltf = (Z_UP_TO_GLTF_Y_UP_TRANSFORM @ world_point_z_up)[:3]
+    world_normal_gltf = Z_UP_TO_GLTF_Y_UP_TRANSFORM[:3, :3] @ world_normal_z_up
     normal_length = float(np.linalg.norm(world_normal_gltf))
     if not math.isfinite(normal_length) or normal_length <= 0.0:
         raise ValueError("A symmetric half-model has an invalid mirror normal.")
@@ -1310,10 +1376,7 @@ def _build_half_mesh_node_metadata(
 def _clean_export_vector(values: np.ndarray) -> list[float]:
     """Return stable JSON-safe coordinates without negative signed zero."""
 
-    return [
-        0.0 if abs(float(value)) <= 1e-12 else float(value)
-        for value in values
-    ]
+    return [0.0 if abs(float(value)) <= 1e-12 else float(value) for value in values]
 
 
 def _get_half_model_node_name(placement: PlacedGeneratedModel) -> str:
@@ -1378,9 +1441,7 @@ def _append_placed_half_model_meshes(
         output_scene.geometry[geometry_name] = copied_geometry
         geometry_names[source_name] = geometry_name
 
-    placement_transform_gltf = _source_to_gltf_y_up_transform(
-        placement_transform
-    )
+    placement_transform_gltf = _source_to_gltf_y_up_transform(placement_transform)
     base_node_name = _get_half_model_node_name(placement)
     raw_base_metadata = source_scene.graph.transforms.node_data.get(
         source_scene.graph.base_frame,
@@ -1404,26 +1465,21 @@ def _append_placed_half_model_meshes(
                 "A placed generated-object node references missing geometry."
             )
         preferred_name = (
-            base_node_name
-            if node_index == 1
-            else f"{base_node_name}_{node_index}"
+            base_node_name if node_index == 1 else f"{base_node_name}_{node_index}"
         )
         node_name = _reserve_unique_scene_name(
             preferred_name,
             occupied_node_names,
         )
         node_metadata = copy.deepcopy(source_base_metadata)
-        node_metadata.update(
-            _get_scene_node_metadata(source_scene, source_node_name)
-        )
+        node_metadata.update(_get_scene_node_metadata(source_scene, source_node_name))
         node_metadata["housemaker_object_id"] = placement.object_id
         node_metadata.update(half_metadata)
         output_scene.graph.update(
             frame_to=node_name,
             frame_from=output_scene.graph.base_frame,
             matrix=(
-                placement_transform_gltf
-                @ _get_valid_source_transform(source_transform)
+                placement_transform_gltf @ _get_valid_source_transform(source_transform)
             ),
             geometry=geometry_name,
             metadata=node_metadata,
@@ -1455,9 +1511,7 @@ def _append_placed_model_scene(
         )
         return
 
-    prefix = (
-        f"placed_{placement_index}_{_slugify_name(placement.object_id)}"
-    )
+    prefix = f"placed_{placement_index}_{_slugify_name(placement.object_id)}"
     root_name = _reserve_unique_scene_name(
         f"{prefix}_root",
         occupied_node_names,
@@ -1506,9 +1560,7 @@ def _append_placed_model_scene(
         **root_kwargs,
     )
 
-    for source_from, source_to, raw_attributes in (
-        source_scene.graph.to_edgelist()
-    ):
+    for source_from, source_to, raw_attributes in source_scene.graph.to_edgelist():
         attributes = dict(raw_attributes)
         edge_kwargs: dict[str, object] = {
             "matrix": _get_valid_source_transform(attributes.get("matrix")),
@@ -1521,9 +1573,7 @@ def _append_placed_model_scene(
                 )
             edge_kwargs["geometry"] = geometry_names[source_geometry_name]
         if attributes.get("metadata") is not None:
-            edge_kwargs["metadata"] = copy.deepcopy(
-                attributes["metadata"]
-            )
+            edge_kwargs["metadata"] = copy.deepcopy(attributes["metadata"])
         output_scene.graph.update(
             frame_to=node_names[source_to],
             frame_from=node_names[source_from],
@@ -1550,9 +1600,7 @@ def _build_placed_model_preview_parts(
         sorted(source_scene.graph.nodes_geometry, key=str),
         start=1,
     ):
-        node_transform, source_geometry_name = source_scene.graph.get(
-            source_node_name
-        )
+        node_transform, source_geometry_name = source_scene.graph.get(source_node_name)
         source_geometry = source_scene.geometry.get(source_geometry_name)
         if not isinstance(source_geometry, trimesh.Trimesh):
             raise ValueError(
@@ -1560,8 +1608,7 @@ def _build_placed_model_preview_parts(
             )
         local_mesh = copy.deepcopy(source_geometry)
         local_mesh.apply_transform(
-            GLTF_Y_UP_TO_Z_UP_TRANSFORM
-            @ _get_valid_source_transform(node_transform)
+            GLTF_Y_UP_TO_Z_UP_TRANSFORM @ _get_valid_source_transform(node_transform)
         )
         local_meshes.append(local_mesh)
         world_mesh = local_mesh.copy()
@@ -1571,8 +1618,7 @@ def _build_placed_model_preview_parts(
             textured_surfaces.append(
                 PreviewTexturedSurface(
                     surface_id=(
-                        f"placed:{placement.object_id}:"
-                        f"{placement_index}:{node_index}"
+                        f"placed:{placement.object_id}:{placement_index}:{node_index}"
                     ),
                     surface_type="generated_object",
                     mesh=world_mesh,
@@ -1654,38 +1700,129 @@ def _slugify_scene_name(raw_name: object) -> str:
 
 
 # ### Stair geometry helpers ###
+def clear_stair_route_geometry_cache() -> None:
+    """Discard retained stair-route topology and sampling calculations."""
+
+    _order_stair_route_sections_cached.cache_clear()
+    _build_smoothed_stair_route_geometry_cached.cache_clear()
+
+
 def build_stair_meshes(
     levels: Sequence[LevelData],
     stairs: Sequence[StairData],
 ) -> list[NamedMesh]:
-    """Build one world-space mesh per stairway.
+    """Build joined, ordinary primitives for each semantic stair part.
 
     Stair sections intentionally remain in each owning level's local image
     coordinate system. Resolving them here through ``level_image_to_world_xy``
     means level scale and offsets automatically carry every route section.
+    Repeated pieces are merged per logical part; no instancing is introduced.
+    Legacy stairs without a stringer setting retain their historical single
+    primitive and object name.
     """
 
     if not stairs:
         return []
 
-    level_lookup = {level.index: level for level in levels}
-    base_z_by_level_index = build_level_base_z_lookup(levels)
     named_meshes: list[NamedMesh] = []
     for stair_index, stair in enumerate(stairs, start=1):
-        mesh = _build_stair_mesh(
+        preview_parts = build_canvas_stair_part_targets(
+            levels,
+            (stair,),
+            stair_indices=(stair_index - 1,),
+        )
+        if stair.uses_legacy_part_layout:
+            legacy_mesh = _combine_mesh_geometry([part.mesh for part in preview_parts])
+            _attach_stair_part_metadata(
+                legacy_mesh,
+                stair,
+                stair_index - 1,
+                "legacy",
+                f"stair:{stair.stair_id}",
+            )
+            named_meshes.append(
+                NamedMesh(
+                    name=_get_stair_object_name(stair_index, stair),
+                    mesh=legacy_mesh,
+                    export_role=NAMED_MESH_ROLE_STAIR,
+                )
+            )
+            continue
+
+        for part in preview_parts:
+            named_meshes.append(
+                NamedMesh(
+                    name=_get_stair_part_object_name(
+                        stair_index,
+                        stair,
+                        part.part_kind,
+                    ),
+                    mesh=part.mesh.copy(),
+                    export_role=NAMED_MESH_ROLE_STAIR,
+                )
+            )
+
+    return named_meshes
+
+
+def build_canvas_stair_part_targets(
+    levels: Sequence[LevelData],
+    stairs: Sequence[StairData],
+    *,
+    stair_indices: Sequence[int] | None = None,
+) -> list[PreviewStairPart]:
+    """Build selectable per-part stair meshes in world coordinates."""
+
+    if not stairs:
+        return []
+    if stair_indices is None:
+        resolved_indices = tuple(range(len(stairs)))
+    else:
+        resolved_indices = tuple(stair_indices)
+        if len(resolved_indices) != len(stairs):
+            raise ValueError("Stair target indices must match the stair count.")
+        if any(
+            isinstance(index, bool) or not isinstance(index, int) or index < 0
+            for index in resolved_indices
+        ):
+            raise ValueError("Stair target indices must be non-negative integers.")
+
+    level_lookup = {level.index: level for level in levels}
+    base_z_by_level_index = build_level_base_z_lookup(levels)
+    targets: list[PreviewStairPart] = []
+    for stair, stair_index in zip(stairs, resolved_indices):
+        part_meshes = _build_stair_part_meshes(
             stair=stair,
             level_lookup=level_lookup,
             base_z_by_level_index=base_z_by_level_index,
         )
-        named_meshes.append(
-            NamedMesh(
-                name=_get_stair_object_name(stair_index, stair),
-                mesh=mesh,
-                export_role=NAMED_MESH_ROLE_STAIR,
+        level_indices = tuple(section.level_index for section in stair.sections)
+        for part_kind, part_mesh in part_meshes.items():
+            surface_type = STAIR_PART_SURFACE_TYPE[part_kind]
+            semantic_id = _get_stair_part_semantic_id(
+                stair,
+                part_kind,
+                surface_type,
             )
-        )
-
-    return named_meshes
+            _attach_stair_part_metadata(
+                part_mesh,
+                stair,
+                stair_index,
+                part_kind,
+                semantic_id,
+            )
+            targets.append(
+                PreviewStairPart(
+                    stair_id=stair.stair_id,
+                    stair_index=stair_index,
+                    semantic_id=semantic_id,
+                    part_kind=part_kind,
+                    surface_type=surface_type,
+                    mesh=part_mesh,
+                    level_indices=level_indices,
+                )
+            )
+    return targets
 
 
 def _build_stair_mesh(
@@ -1693,6 +1830,24 @@ def _build_stair_mesh(
     level_lookup: Mapping[int, LevelData],
     base_z_by_level_index: Mapping[int, float],
 ) -> trimesh.Trimesh:
+    """Return one compatibility mesh containing every generated stair part."""
+
+    return _combine_mesh_geometry(
+        list(
+            _build_stair_part_meshes(
+                stair,
+                level_lookup,
+                base_z_by_level_index,
+            ).values()
+        )
+    )
+
+
+def _build_stair_part_meshes(
+    stair: StairData,
+    level_lookup: Mapping[int, LevelData],
+    base_z_by_level_index: Mapping[int, float],
+) -> dict[str, trimesh.Trimesh]:
     route_sections = _resolve_stair_route_sections(stair, level_lookup)
     start_z_meters = _get_stair_endpoint_base_z(
         base_z_by_level_index,
@@ -1713,6 +1868,7 @@ def _build_stair_mesh(
         upper_elevation_meters = end_z_meters
     else:
         route_sections.reverse()
+        route_sections = _normalize_stair_rail_correspondence(route_sections)
         lower_elevation_meters = end_z_meters
         upper_elevation_meters = start_z_meters
 
@@ -1721,47 +1877,117 @@ def _build_stair_mesh(
     # treads.  Using the full route here is important: treating the control
     # pairs as isolated linear prisms makes later guides look like detached
     # stair systems whenever the route changes direction more than once.
-    route_sections = _build_smoothed_stair_route_sections(route_sections)
-    cumulative_distances = _build_stair_route_distances(route_sections)
+    route_sections, cumulative_distances = _get_smoothed_stair_route_geometry(
+        route_sections
+    )
     total_run_meters = cumulative_distances[-1]
     total_rise_meters = upper_elevation_meters - lower_elevation_meters
-    step_count = max(
-        1,
-        math.ceil(
-            total_rise_meters / DEFAULT_STAIR_RISER_HEIGHT_METERS
-        ),
+    if stair.uses_legacy_part_layout:
+        step_count = max(
+            1,
+            math.ceil(total_rise_meters / DEFAULT_STAIR_RISER_HEIGHT_METERS),
+        )
+        riser_height_meters = total_rise_meters / step_count
+        tread_thickness_meters = min(
+            stair.tread_thickness_meters,
+            riser_height_meters,
+        )
+    else:
+        step_count, riser_height_meters = stair.calculate_step_layout(
+            total_rise_meters
+        )
+        if (
+            stair.tread_thickness_meters
+            > riser_height_meters + STAIR_GEOMETRY_EPSILON
+        ):
+            raise ValueError(
+                "Stair tread thickness cannot exceed its calculated actual "
+                f"step rise of {riser_height_meters * 100.0:.1f} cm."
+            )
+        tread_thickness_meters = stair.tread_thickness_meters
+    tread_overhang_meters = (
+        0.0 if stair.uses_legacy_part_layout else stair.tread_overhang_meters
     )
-    riser_height_meters = total_rise_meters / step_count
-    tread_thickness_meters = min(
-        DEFAULT_FLOATING_STAIR_TREAD_THICKNESS_METERS,
-        riser_height_meters,
+    nosing_placements = (
+        frozenset() if stair.uses_legacy_part_layout else stair.nosing_placements
+    )
+    front_overhang_meters = (
+        tread_overhang_meters
+        if STAIR_NOSING_FRONT in nosing_placements
+        else 0.0
+    )
+    _validate_stair_lateral_nosing_route(
+        route_sections,
+        tread_overhang_meters,
+        nosing_placements,
     )
 
-    meshes: list[trimesh.Trimesh] = []
+    part_meshes: dict[str, list[trimesh.Trimesh]] = {
+        STAIR_PART_TREADS: [],
+        STAIR_PART_SUPPORT: [],
+        STAIR_PART_RISERS: [],
+        STAIR_PART_STRINGERS: [],
+    }
     for step_index in range(step_count):
-        step_start_distance = total_run_meters * step_index / step_count
+        nominal_step_start_distance = total_run_meters * step_index / step_count
         step_end_distance = total_run_meters * (step_index + 1) / step_count
+        step_start_distance = (
+            nominal_step_start_distance - front_overhang_meters
+        )
         step_top_z_meters = lower_elevation_meters + (
             riser_height_meters * (step_index + 1)
         )
-        if stair.style in {
-            STAIR_STYLE_FLOATING,
-            STAIR_STYLE_FLOATING_WITH_RISER,
-        }:
+        if stair.stair_type == STAIR_TYPE_FLOATING:
             step_bottom_z_meters = step_top_z_meters - tread_thickness_meters
-        elif stair.style == STAIR_STYLE_SUPPORTED:
+        elif stair.stair_type == STAIR_TYPE_SUPPORTED:
             step_bottom_z_meters = min(
                 lower_elevation_meters,
                 step_top_z_meters - tread_thickness_meters,
             )
         else:
-            raise ValueError(f"Unsupported stair style: {stair.style!r}.")
+            raise ValueError(f"Unsupported stair type: {stair.stair_type!r}.")
+
+        if (
+            stair.stair_type == STAIR_TYPE_SUPPORTED
+            and not stair.uses_legacy_part_layout
+        ):
+            step_bottom_z_meters = step_top_z_meters - tread_thickness_meters
 
         step_distances = _split_stair_step_at_route_sections(
             step_start_distance,
             step_end_distance,
             cumulative_distances,
         )
+        step_route_sections: list[tuple[np.ndarray, np.ndarray]] | None = None
+        if (
+            step_index == 0
+            and not stair.uses_legacy_part_layout
+            and stair.starting_step != STAIR_STARTING_STEP_NONE
+        ):
+            step_distances, step_route_sections = (
+                _build_starting_step_route_sections(
+                    route_sections,
+                    cumulative_distances,
+                    step_start_distance,
+                    step_end_distance,
+                    stair.starting_step,
+                    stair.starting_step_edge_radius_meters,
+                    stair.starting_step_edge_points,
+                    tread_overhang_meters,
+                    nosing_placements,
+                    stair.tread_edge_profile,
+                    stair.tread_edge_radius_meters,
+                )
+            )
+        elif stair.tread_edge_profile == STAIR_TREAD_EDGE_ROUNDED:
+            step_distances = _protect_rounded_stair_tread_route(
+                route_sections,
+                cumulative_distances,
+                step_distances,
+                stair.tread_edge_radius_meters,
+                tread_overhang_meters,
+                nosing_placements,
+            )
         step_segment_count = len(step_distances) - 1
         for segment_index, (segment_start, segment_end) in enumerate(
             zip(
@@ -1769,35 +1995,80 @@ def _build_stair_mesh(
                 step_distances[1:],
             )
         ):
-            step_start_a_xy, step_start_b_xy = _sample_stair_route(
-                route_sections,
-                cumulative_distances,
-                segment_start,
-            )
-            step_end_a_xy, step_end_b_xy = _sample_stair_route(
-                route_sections,
-                cumulative_distances,
-                segment_end,
-            )
-            meshes.append(
-                _build_stair_step_prism(
-                    start_a_xy=step_start_a_xy,
-                    start_b_xy=step_start_b_xy,
-                    end_a_xy=step_end_a_xy,
-                    end_b_xy=step_end_b_xy,
-                    bottom_z_meters=step_bottom_z_meters,
-                    top_z_meters=step_top_z_meters,
-                    include_start_cap=segment_index == 0,
-                    include_end_cap=(
-                        segment_index == step_segment_count - 1
-                    ),
+            if step_route_sections is None:
+                step_start_a_xy, step_start_b_xy = _sample_stair_route(
+                    route_sections,
+                    cumulative_distances,
+                    segment_start,
                 )
+                step_end_a_xy, step_end_b_xy = _sample_stair_route(
+                    route_sections,
+                    cumulative_distances,
+                    segment_end,
+                )
+                step_start_a_xy, step_start_b_xy = (
+                    _expand_stair_tread_cross_section_for_nosing(
+                        step_start_a_xy,
+                        step_start_b_xy,
+                        tread_overhang_meters,
+                        nosing_placements,
+                    )
+                )
+                step_end_a_xy, step_end_b_xy = (
+                    _expand_stair_tread_cross_section_for_nosing(
+                        step_end_a_xy,
+                        step_end_b_xy,
+                        tread_overhang_meters,
+                        nosing_placements,
+                    )
+                )
+            else:
+                step_start_a_xy, step_start_b_xy = step_route_sections[
+                    segment_index
+                ]
+                step_end_a_xy, step_end_b_xy = step_route_sections[
+                    segment_index + 1
+                ]
+            tread_segment = _build_stair_tread_segment(
+                start_a_xy=step_start_a_xy,
+                start_b_xy=step_start_b_xy,
+                end_a_xy=step_end_a_xy,
+                end_b_xy=step_end_b_xy,
+                bottom_z_meters=step_bottom_z_meters,
+                top_z_meters=step_top_z_meters,
+                edge_profile=stair.tread_edge_profile,
+                edge_radius_meters=stair.tread_edge_radius_meters,
+                nosing_placements=nosing_placements,
+                include_start_cap=segment_index == 0,
+                include_end_cap=(segment_index == step_segment_count - 1),
             )
+            if (
+                step_index == 0
+                and segment_index == 0
+                and stair.stair_type == STAIR_TYPE_SUPPORTED
+                and not stair.uses_legacy_part_layout
+                and stair.starting_step == STAIR_STARTING_STEP_NONE
+                and not (
+                    stair.tread_edge_profile == STAIR_TREAD_EDGE_ROUNDED
+                    and stair.tread_edge_radius_meters > STAIR_GEOMETRY_EPSILON
+                )
+                and not (
+                    tread_overhang_meters > STAIR_GEOMETRY_EPSILON
+                    and nosing_placements
+                )
+            ):
+                # An undecorated first tread has a flat exposed front cap.
+                # Rounded or overhanging noses belong to TREADS; the support
+                # face below their underside supplies the separate RISERS part.
+                tread_body, front_riser = _split_plain_stair_tread_front_riser(
+                    tread_segment
+                )
+                part_meshes[STAIR_PART_TREADS].append(tread_body)
+                part_meshes[STAIR_PART_RISERS].append(front_riser)
+            else:
+                part_meshes[STAIR_PART_TREADS].append(tread_segment)
 
-        if (
-            stair.style == STAIR_STYLE_FLOATING_WITH_RISER
-            and step_index > 0
-        ):
+        if stair.has_legacy_riser_panels and step_index > 0:
             previous_step_top_z_meters = lower_elevation_meters + (
                 riser_height_meters * step_index
             )
@@ -1805,7 +2076,7 @@ def _build_stair_mesh(
                 step_bottom_z_meters
                 > previous_step_top_z_meters + STAIR_GEOMETRY_EPSILON
             ):
-                meshes.append(
+                part_meshes[STAIR_PART_RISERS].append(
                     _build_stair_riser_prism(
                         route_sections=route_sections,
                         cumulative_distances=cumulative_distances,
@@ -1817,7 +2088,87 @@ def _build_stair_mesh(
                     )
                 )
 
-    return _combine_mesh_geometry(meshes)
+        if (
+            stair.stair_type == STAIR_TYPE_SUPPORTED
+            and not stair.uses_legacy_part_layout
+            and step_bottom_z_meters > lower_elevation_meters + STAIR_GEOMETRY_EPSILON
+        ):
+            support_distances = _split_stair_step_at_route_sections(
+                nominal_step_start_distance,
+                step_end_distance,
+                cumulative_distances,
+            )
+            support_segment_count = len(support_distances) - 1
+            for support_segment_index, (support_start, support_end) in enumerate(
+                zip(support_distances, support_distances[1:])
+            ):
+                support_start_a, support_start_b = _sample_stair_route(
+                    route_sections,
+                    cumulative_distances,
+                    support_start,
+                )
+                support_end_a, support_end_b = _sample_stair_route(
+                    route_sections,
+                    cumulative_distances,
+                    support_end,
+                )
+                (
+                    support_start_a,
+                    support_start_b,
+                    support_end_a,
+                    support_end_b,
+                ) = _inset_stair_support_for_stringers(
+                    support_start_a,
+                    support_start_b,
+                    support_end_a,
+                    support_end_b,
+                    stair.stringer_placement,
+                )
+                support_prism = _build_stair_step_prism(
+                    start_a_xy=support_start_a,
+                    start_b_xy=support_start_b,
+                    end_a_xy=support_end_a,
+                    end_b_xy=support_end_b,
+                    bottom_z_meters=lower_elevation_meters,
+                    top_z_meters=step_bottom_z_meters,
+                    include_start_cap=support_segment_index == 0,
+                    include_end_cap=(
+                        support_segment_index == support_segment_count - 1
+                    ),
+                )
+                if support_segment_index == 0:
+                    # Only the cap above the preceding tread is an exposed
+                    # riser. Earlier stair geometry hides the lower portion;
+                    # omitting it also keeps RISERS from extending to ground.
+                    visible_riser_bottom_z_meters = (
+                        lower_elevation_meters + riser_height_meters * step_index
+                    )
+                    support_body, riser_face = _split_stair_prism_start_cap(
+                        support_prism,
+                        visible_bottom_z_meters=visible_riser_bottom_z_meters,
+                    )
+                    part_meshes[STAIR_PART_SUPPORT].append(support_body)
+                    if riser_face is not None:
+                        part_meshes[STAIR_PART_RISERS].append(riser_face)
+                else:
+                    part_meshes[STAIR_PART_SUPPORT].append(support_prism)
+
+        _append_stair_stringer_step_meshes(
+            part_meshes,
+            stair,
+            route_sections,
+            cumulative_distances,
+            nominal_step_start_distance,
+            step_end_distance,
+            step_top_z_meters,
+            tread_thickness_meters,
+        )
+
+    return {
+        part_kind: _combine_mesh_geometry(meshes)
+        for part_kind, meshes in part_meshes.items()
+        if meshes
+    }
 
 
 def _resolve_stair_route_sections(
@@ -1847,8 +2198,82 @@ def _resolve_stair_route_sections(
         )
         resolved_sections.append((section_a_xy, section_b_xy))
 
-    ordered_sections = _order_stair_route_sections(resolved_sections)
-    return _normalize_stair_rail_correspondence(ordered_sections)
+    frozen_route_sections = _freeze_stair_route_sections(resolved_sections)
+    cached_route_sections = _order_stair_route_sections_cached(
+        frozen_route_sections
+    )
+    return _thaw_stair_route_sections(cached_route_sections)
+
+
+@lru_cache(maxsize=STAIR_ROUTE_CACHE_MAX_ENTRIES)
+def _order_stair_route_sections_cached(
+    route_sections: _ImmutableStairRoute,
+) -> _ImmutableStairRoute:
+    """Return an immutable ordered route for one world-space control path."""
+
+    mutable_route_sections = _thaw_stair_route_sections(route_sections)
+    ordered_sections = _order_stair_route_sections(mutable_route_sections)
+    normalized_sections = _normalize_stair_rail_correspondence(ordered_sections)
+    return _freeze_stair_route_sections(normalized_sections)
+
+
+def _get_smoothed_stair_route_geometry(
+    route_sections: Sequence[tuple[np.ndarray, np.ndarray]],
+) -> tuple[list[tuple[np.ndarray, np.ndarray]], list[float]]:
+    """Return fresh arrays backed by an immutable sampled-route cache."""
+
+    cached_geometry = _build_smoothed_stair_route_geometry_cached(
+        _freeze_stair_route_sections(route_sections)
+    )
+    return (
+        _thaw_stair_route_sections(cached_geometry.route_sections),
+        list(cached_geometry.cumulative_distances),
+    )
+
+
+@lru_cache(maxsize=STAIR_ROUTE_CACHE_MAX_ENTRIES)
+def _build_smoothed_stair_route_geometry_cached(
+    route_sections: _ImmutableStairRoute,
+) -> _CachedStairRouteGeometry:
+    """Sample and measure a route without retaining mutable numpy arrays."""
+
+    mutable_route_sections = _thaw_stair_route_sections(route_sections)
+    sampled_sections = _build_smoothed_stair_route_sections(
+        mutable_route_sections
+    )
+    cumulative_distances = _build_stair_route_distances(sampled_sections)
+    return _CachedStairRouteGeometry(
+        route_sections=_freeze_stair_route_sections(sampled_sections),
+        cumulative_distances=tuple(cumulative_distances),
+    )
+
+
+def _freeze_stair_route_sections(
+    route_sections: Sequence[tuple[np.ndarray, np.ndarray]],
+) -> _ImmutableStairRoute:
+    """Convert route arrays to an exact, hashable, immutable cache value."""
+
+    return tuple(
+        (
+            (float(section_a_xy[0]), float(section_a_xy[1])),
+            (float(section_b_xy[0]), float(section_b_xy[1])),
+        )
+        for section_a_xy, section_b_xy in route_sections
+    )
+
+
+def _thaw_stair_route_sections(
+    route_sections: Sequence[_ImmutableStairSection],
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Create caller-owned route arrays from an immutable cache value."""
+
+    return [
+        (
+            np.asarray(section_a_xy, dtype=float),
+            np.asarray(section_b_xy, dtype=float),
+        )
+        for section_a_xy, section_b_xy in route_sections
+    ]
 
 
 def _order_stair_route_sections(
@@ -1869,10 +2294,7 @@ def _order_stair_route_sections(
             guide_sections,
             route_sections[-1],
         )
-    if (
-        guide_order is None
-        and len(guide_sections) <= MAX_EXACT_STAIR_GUIDE_ORDER_COUNT
-    ):
+    if guide_order is None and len(guide_sections) <= MAX_EXACT_STAIR_GUIDE_ORDER_COUNT:
         guide_order = _find_shortest_stair_guide_order(
             route_sections[0],
             guide_sections,
@@ -1904,9 +2326,7 @@ def _find_shortest_topology_safe_stair_guide_order(
             *(guide_sections[index] for index in guide_order),
             end_section,
         ]
-        normalized_sections = _normalize_stair_rail_correspondence(
-            route_sections
-        )
+        normalized_sections = _normalize_stair_rail_correspondence(route_sections)
         if not _is_stair_route_topology_safe(normalized_sections):
             continue
         path_distance = _get_stair_route_center_distance(route_sections)
@@ -1922,9 +2342,7 @@ def _find_shortest_topology_safe_stair_guide_order(
 def _get_stair_route_center_distance(
     route_sections: Sequence[tuple[np.ndarray, np.ndarray]],
 ) -> float:
-    centers = [
-        _get_stair_section_center(section) for section in route_sections
-    ]
+    centers = [_get_stair_section_center(section) for section in route_sections]
     return sum(
         float(np.linalg.norm(end_center - start_center))
         for start_center, end_center in zip(centers, centers[1:])
@@ -1939,9 +2357,7 @@ def _find_shortest_stair_guide_order(
     """Solve the fixed-endpoint guide path exactly with dynamic programming."""
 
     start_center = _get_stair_section_center(start_section)
-    guide_centers = [
-        _get_stair_section_center(section) for section in guide_sections
-    ]
+    guide_centers = [_get_stair_section_center(section) for section in guide_sections]
     end_center = _get_stair_section_center(end_section)
     guide_count = len(guide_sections)
     states: dict[tuple[int, int], tuple[float, tuple[int, ...]]] = {}
@@ -1984,9 +2400,7 @@ def _find_shortest_stair_guide_order(
 
     best_path: tuple[float, tuple[int, ...]] | None = None
     for final_guide_index in range(guide_count):
-        path_distance, path_order = states[
-            (all_guides_mask, final_guide_index)
-        ]
+        path_distance, path_order = states[(all_guides_mask, final_guide_index)]
         total_distance = path_distance + float(
             np.linalg.norm(end_center - guide_centers[final_guide_index])
         )
@@ -2013,8 +2427,7 @@ def _is_better_stair_guide_path(
     if candidate_distance < current_distance - STAIR_GEOMETRY_EPSILON:
         return True
     return (
-        abs(candidate_distance - current_distance)
-        <= STAIR_GEOMETRY_EPSILON
+        abs(candidate_distance - current_distance) <= STAIR_GEOMETRY_EPSILON
         and candidate_order < current_order
     )
 
@@ -2025,9 +2438,7 @@ def _find_greedy_stair_guide_order(
 ) -> tuple[int, ...]:
     """Order unusually large guide sets with a deterministic nearest walk."""
 
-    guide_centers = [
-        _get_stair_section_center(section) for section in guide_sections
-    ]
+    guide_centers = [_get_stair_section_center(section) for section in guide_sections]
     current_center = _get_stair_section_center(start_section)
     remaining_indices = set(range(len(guide_sections)))
     guide_order: list[int] = []
@@ -2035,11 +2446,7 @@ def _find_greedy_stair_guide_order(
         next_guide_index = min(
             remaining_indices,
             key=lambda guide_index: (
-                float(
-                    np.linalg.norm(
-                        guide_centers[guide_index] - current_center
-                    )
-                ),
+                float(np.linalg.norm(guide_centers[guide_index] - current_center)),
                 guide_index,
             ),
         )
@@ -2088,12 +2495,9 @@ def _build_stair_route_distances(
         segment_length = float(np.linalg.norm(current_center - previous_center))
         if segment_length <= STAIR_GEOMETRY_EPSILON:
             raise ValueError(
-                "Consecutive stair section centers must be separated "
-                "horizontally."
+                "Consecutive stair section centers must be separated horizontally."
             )
-        cumulative_distances.append(
-            cumulative_distances[-1] + segment_length
-        )
+        cumulative_distances.append(cumulative_distances[-1] + segment_length)
     return cumulative_distances
 
 
@@ -2123,8 +2527,7 @@ def _build_smoothed_stair_route_sections(
         zip(control_sections, control_sections[1:])
     ):
         segment_length = (
-            control_distances[segment_index + 1]
-            - control_distances[segment_index]
+            control_distances[segment_index + 1] - control_distances[segment_index]
         )
         sample_count = max(
             1,
@@ -2229,9 +2632,7 @@ def _do_stair_sections_keep_handedness(
         if route_delta_length <= STAIR_GEOMETRY_EPSILON:
             return False
         segment_directions.append(route_delta / route_delta_length)
-    route_directions = _build_stair_section_route_directions(
-        segment_directions
-    )
+    route_directions = _build_stair_section_route_directions(segment_directions)
 
     reference_handedness = 0.0
     for (section_a_xy, section_b_xy), route_direction in zip(
@@ -2281,40 +2682,42 @@ def _do_stair_line_segments_intersect(
         second_end_xy - second_start_xy,
         first_end_xy - second_start_xy,
     )
-    if (
-        first_start_side * first_end_side
-        < -(STAIR_GEOMETRY_EPSILON**2)
-        and second_start_side * second_end_side
-        < -(STAIR_GEOMETRY_EPSILON**2)
-    ):
+    if first_start_side * first_end_side < -(
+        STAIR_GEOMETRY_EPSILON**2
+    ) and second_start_side * second_end_side < -(STAIR_GEOMETRY_EPSILON**2):
         return True
     return (
-        abs(first_start_side) <= STAIR_GEOMETRY_EPSILON
-        and _is_point_on_stair_segment(
-            second_start_xy,
-            first_start_xy,
-            first_end_xy,
+        (
+            abs(first_start_side) <= STAIR_GEOMETRY_EPSILON
+            and _is_point_on_stair_segment(
+                second_start_xy,
+                first_start_xy,
+                first_end_xy,
+            )
         )
-    ) or (
-        abs(first_end_side) <= STAIR_GEOMETRY_EPSILON
-        and _is_point_on_stair_segment(
-            second_end_xy,
-            first_start_xy,
-            first_end_xy,
+        or (
+            abs(first_end_side) <= STAIR_GEOMETRY_EPSILON
+            and _is_point_on_stair_segment(
+                second_end_xy,
+                first_start_xy,
+                first_end_xy,
+            )
         )
-    ) or (
-        abs(second_start_side) <= STAIR_GEOMETRY_EPSILON
-        and _is_point_on_stair_segment(
-            first_start_xy,
-            second_start_xy,
-            second_end_xy,
+        or (
+            abs(second_start_side) <= STAIR_GEOMETRY_EPSILON
+            and _is_point_on_stair_segment(
+                first_start_xy,
+                second_start_xy,
+                second_end_xy,
+            )
         )
-    ) or (
-        abs(second_end_side) <= STAIR_GEOMETRY_EPSILON
-        and _is_point_on_stair_segment(
-            first_end_xy,
-            second_start_xy,
-            second_end_xy,
+        or (
+            abs(second_end_side) <= STAIR_GEOMETRY_EPSILON
+            and _is_point_on_stair_segment(
+                first_end_xy,
+                second_start_xy,
+                second_end_xy,
+            )
         )
     )
 
@@ -2327,17 +2730,13 @@ def _do_stair_segment_bounds_overlap(
 ) -> bool:
     return not (
         max(first_start_xy[0], first_end_xy[0])
-        < min(second_start_xy[0], second_end_xy[0])
-        - STAIR_GEOMETRY_EPSILON
+        < min(second_start_xy[0], second_end_xy[0]) - STAIR_GEOMETRY_EPSILON
         or max(second_start_xy[0], second_end_xy[0])
-        < min(first_start_xy[0], first_end_xy[0])
-        - STAIR_GEOMETRY_EPSILON
+        < min(first_start_xy[0], first_end_xy[0]) - STAIR_GEOMETRY_EPSILON
         or max(first_start_xy[1], first_end_xy[1])
-        < min(second_start_xy[1], second_end_xy[1])
-        - STAIR_GEOMETRY_EPSILON
+        < min(second_start_xy[1], second_end_xy[1]) - STAIR_GEOMETRY_EPSILON
         or max(second_start_xy[1], second_end_xy[1])
-        < min(first_start_xy[1], first_end_xy[1])
-        - STAIR_GEOMETRY_EPSILON
+        < min(first_start_xy[1], first_end_xy[1]) - STAIR_GEOMETRY_EPSILON
     )
 
 
@@ -2349,13 +2748,11 @@ def _is_point_on_stair_segment(
     return bool(
         np.all(
             point_xy
-            >= np.minimum(segment_start_xy, segment_end_xy)
-            - STAIR_GEOMETRY_EPSILON
+            >= np.minimum(segment_start_xy, segment_end_xy) - STAIR_GEOMETRY_EPSILON
         )
         and np.all(
             point_xy
-            <= np.maximum(segment_start_xy, segment_end_xy)
-            + STAIR_GEOMETRY_EPSILON
+            <= np.maximum(segment_start_xy, segment_end_xy) + STAIR_GEOMETRY_EPSILON
         )
     )
 
@@ -2369,8 +2766,7 @@ def _sample_smoothed_stair_route_section(
     """Return one spline-interpolated cross-section inside a route interval."""
 
     interval_length = (
-        control_distances[segment_index + 1]
-        - control_distances[segment_index]
+        control_distances[segment_index + 1] - control_distances[segment_index]
     )
     start_a_xy, start_b_xy = control_sections[segment_index]
     end_a_xy, end_b_xy = control_sections[segment_index + 1]
@@ -2413,19 +2809,15 @@ def _get_stair_route_center_tangent(
     ]
     final_section_index = len(control_sections) - 1
     if section_index == 0:
-        return (
-            control_centers[1] - control_centers[0]
-        ) / (control_distances[1] - control_distances[0])
+        return (control_centers[1] - control_centers[0]) / (
+            control_distances[1] - control_distances[0]
+        )
     if section_index == final_section_index:
-        return (
-            control_centers[-1] - control_centers[-2]
-        ) / (control_distances[-1] - control_distances[-2])
-    return (
-        control_centers[section_index + 1]
-        - control_centers[section_index - 1]
-    ) / (
-        control_distances[section_index + 1]
-        - control_distances[section_index - 1]
+        return (control_centers[-1] - control_centers[-2]) / (
+            control_distances[-1] - control_distances[-2]
+        )
+    return (control_centers[section_index + 1] - control_centers[section_index - 1]) / (
+        control_distances[section_index + 1] - control_distances[section_index - 1]
     )
 
 
@@ -2438,10 +2830,7 @@ def _interpolate_stair_route_width(
 
     start_width = float(np.linalg.norm(start_width_xy))
     end_width = float(np.linalg.norm(end_width_xy))
-    if (
-        start_width <= STAIR_GEOMETRY_EPSILON
-        or end_width <= STAIR_GEOMETRY_EPSILON
-    ):
+    if start_width <= STAIR_GEOMETRY_EPSILON or end_width <= STAIR_GEOMETRY_EPSILON:
         raise ValueError("Stair route sections must have a positive width.")
 
     start_angle = math.atan2(start_width_xy[1], start_width_xy[0])
@@ -2451,9 +2840,7 @@ def _interpolate_stair_route_width(
         math.cos(end_angle - start_angle),
     )
     interpolated_angle = start_angle + (angle_delta * float(ratio))
-    interpolated_width = start_width + (
-        (end_width - start_width) * float(ratio)
-    )
+    interpolated_width = start_width + ((end_width - start_width) * float(ratio))
     return float(interpolated_width) * np.asarray(
         (math.cos(interpolated_angle), math.sin(interpolated_angle)),
         dtype=float,
@@ -2509,9 +2896,8 @@ def _sample_stair_route(
     segment_index = min(max(segment_index, 0), len(route_sections) - 2)
     segment_start_distance = cumulative_distances[segment_index]
     segment_end_distance = cumulative_distances[segment_index + 1]
-    segment_ratio = (
-        (distance - segment_start_distance)
-        / (segment_end_distance - segment_start_distance)
+    segment_ratio = (distance - segment_start_distance) / (
+        segment_end_distance - segment_start_distance
     )
     start_a_xy, start_b_xy = route_sections[segment_index]
     end_a_xy, end_b_xy = route_sections[segment_index + 1]
@@ -2530,6 +2916,1070 @@ def _get_stair_section_name(
     if section_index == final_section_index:
         return "end"
     return f"intermediate section {section_index}"
+
+
+def _expand_stair_tread_cross_section_for_nosing(
+    section_a_xy: np.ndarray,
+    section_b_xy: np.ndarray,
+    overhang_meters: float,
+    nosing_placements: Collection[str],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Expand one tread section on its selected physical side or sides."""
+
+    if overhang_meters <= STAIR_GEOMETRY_EPSILON:
+        return section_a_xy, section_b_xy
+
+    width_vector = section_b_xy - section_a_xy
+    width_meters = float(np.linalg.norm(width_vector))
+    if width_meters <= STAIR_GEOMETRY_EPSILON:
+        raise ValueError("Stair tread cross-sections must have a positive width.")
+    right_to_left_direction = width_vector / width_meters
+    expanded_a_xy = section_a_xy
+    expanded_b_xy = section_b_xy
+    if STAIR_NOSING_RIGHT in nosing_placements:
+        expanded_a_xy = section_a_xy - (
+            right_to_left_direction * overhang_meters
+        )
+    if STAIR_NOSING_LEFT in nosing_placements:
+        expanded_b_xy = section_b_xy + (
+            right_to_left_direction * overhang_meters
+        )
+    return expanded_a_xy, expanded_b_xy
+
+
+def _validate_stair_lateral_nosing_route(
+    route_sections: Sequence[tuple[np.ndarray, np.ndarray]],
+    overhang_meters: float,
+    nosing_placements: Collection[str],
+) -> None:
+    """Reject lateral tread expansion that overlaps around a tight route."""
+
+    has_lateral_nosing = bool(
+        {STAIR_NOSING_LEFT, STAIR_NOSING_RIGHT}.intersection(
+            nosing_placements
+        )
+    )
+    if not has_lateral_nosing or overhang_meters <= STAIR_GEOMETRY_EPSILON:
+        return
+
+    expanded_route_sections = [
+        _expand_stair_tread_cross_section_for_nosing(
+            section_a_xy,
+            section_b_xy,
+            overhang_meters,
+            nosing_placements,
+        )
+        for section_a_xy, section_b_xy in route_sections
+    ]
+    if not _is_stair_route_topology_safe(expanded_route_sections):
+        raise ValueError(
+            "Stair lateral nosing overhang makes the tread route "
+            "self-intersect or collapse. Reduce the nosing overhang or "
+            "increase the space around the turn."
+        )
+
+
+def _build_stair_tread_segment(
+    start_a_xy: np.ndarray,
+    start_b_xy: np.ndarray,
+    end_a_xy: np.ndarray,
+    end_b_xy: np.ndarray,
+    bottom_z_meters: float,
+    top_z_meters: float,
+    edge_profile: str,
+    edge_radius_meters: float,
+    nosing_placements: Collection[str],
+    *,
+    include_start_cap: bool,
+    include_end_cap: bool,
+) -> trimesh.Trimesh:
+    """Build one tread route piece, rounding its selected exposed edges."""
+
+    if edge_profile != STAIR_TREAD_EDGE_ROUNDED:
+        return _build_stair_step_prism(
+            start_a_xy=start_a_xy,
+            start_b_xy=start_b_xy,
+            end_a_xy=end_a_xy,
+            end_b_xy=end_b_xy,
+            bottom_z_meters=bottom_z_meters,
+            top_z_meters=top_z_meters,
+            include_start_cap=include_start_cap,
+            include_end_cap=include_end_cap,
+        )
+    if {STAIR_NOSING_LEFT, STAIR_NOSING_RIGHT}.intersection(nosing_placements):
+        return _build_laterally_rounded_stair_tread_prism(
+            start_a_xy=start_a_xy,
+            start_b_xy=start_b_xy,
+            end_a_xy=end_a_xy,
+            end_b_xy=end_b_xy,
+            bottom_z_meters=bottom_z_meters,
+            top_z_meters=top_z_meters,
+            edge_radius_meters=edge_radius_meters,
+            nosing_placements=nosing_placements,
+            include_start_cap=include_start_cap,
+            include_end_cap=include_end_cap,
+        )
+    if not include_start_cap:
+        return _build_stair_step_prism(
+            start_a_xy=start_a_xy,
+            start_b_xy=start_b_xy,
+            end_a_xy=end_a_xy,
+            end_b_xy=end_b_xy,
+            bottom_z_meters=bottom_z_meters,
+            top_z_meters=top_z_meters,
+            include_start_cap=False,
+            include_end_cap=include_end_cap,
+        )
+    return _build_rounded_stair_tread_prism(
+        start_a_xy=start_a_xy,
+        start_b_xy=start_b_xy,
+        end_a_xy=end_a_xy,
+        end_b_xy=end_b_xy,
+        bottom_z_meters=bottom_z_meters,
+        top_z_meters=top_z_meters,
+        edge_radius_meters=edge_radius_meters,
+        include_end_cap=include_end_cap,
+    )
+
+
+def _split_plain_stair_tread_front_riser(
+    tread: trimesh.Trimesh,
+) -> tuple[trimesh.Trimesh, trimesh.Trimesh]:
+    """Assign only an undecorated flat first-tread cap to RISERS.
+
+    The plain prism builder stores its leading cap as the last two triangles.
+    A sculpted or overhanging tread nose is never split by this helper.
+    """
+
+    if len(tread.vertices) != 8 or len(tread.faces) < 2:
+        raise ValueError("The first stair tread must have a flat front cap.")
+    faces = np.asarray(tread.faces, dtype=np.int64)
+    return (
+        _build_stair_face_subset(tread, faces[:-2]),
+        _build_stair_face_subset(tread, faces[-2:]),
+    )
+
+
+def _protect_rounded_stair_tread_route(
+    route_sections: Sequence[tuple[np.ndarray, np.ndarray]],
+    cumulative_distances: Sequence[float],
+    step_distances: Sequence[float],
+    edge_radius_meters: float,
+    tread_overhang_meters: float,
+    nosing_placements: Collection[str],
+) -> list[float]:
+    """Keep curve samples from silently shrinking a tread's nose radius."""
+
+    resolved_distances = [float(distance) for distance in step_distances]
+    if (
+        len(resolved_distances) <= 2
+        or edge_radius_meters <= STAIR_GEOMETRY_EPSILON
+    ):
+        return resolved_distances
+
+    step_start_distance = resolved_distances[0]
+    step_end_distance = resolved_distances[-1]
+    available_depth_meters = step_end_distance - step_start_distance
+    maximum_radius_meters = max(
+        0.0,
+        available_depth_meters
+        * (1.0 - STAIR_ROUNDED_EDGE_MINIMUM_BODY_DEPTH_RATIO),
+    )
+    requested_radius_meters = min(
+        edge_radius_meters,
+        maximum_radius_meters,
+    )
+    if requested_radius_meters <= STAIR_GEOMETRY_EPSILON:
+        return resolved_distances
+
+    protected_depth_meters = min(
+        available_depth_meters,
+        requested_radius_meters * STAIR_ROUNDED_EDGE_PROTECTION_MARGIN_RATIO,
+    )
+    if (
+        resolved_distances[1] - step_start_distance
+        >= protected_depth_meters - STAIR_GEOMETRY_EPSILON
+    ):
+        return resolved_distances
+
+    # Skipping closely spaced curve samples makes enough uninterrupted room
+    # for the requested half-ellipse. Tight bends may not safely support the
+    # full chord, so progressively shorten only this protected front span.
+    for protection_scale in (1.0, 0.75, 0.5, 0.25):
+        protected_end_distance = min(
+            step_end_distance,
+            step_start_distance
+            + (protected_depth_meters * protection_scale),
+        )
+        candidate_distances = _merge_stair_profile_distances(
+            (
+                step_start_distance,
+                *(
+                    distance
+                    for distance in resolved_distances[1:-1]
+                    if distance
+                    >= protected_end_distance - STAIR_GEOMETRY_EPSILON
+                ),
+                step_end_distance,
+            ),
+            (protected_end_distance,),
+        )
+        candidate_sections = [
+            _expand_stair_tread_cross_section_for_nosing(
+                *_sample_stair_route(
+                    route_sections,
+                    cumulative_distances,
+                    distance,
+                ),
+                tread_overhang_meters,
+                nosing_placements,
+            )
+            for distance in candidate_distances
+        ]
+        if _is_stair_route_topology_safe(candidate_sections):
+            return candidate_distances
+
+    return resolved_distances
+
+
+def _build_starting_step_route_sections(
+    route_sections: Sequence[tuple[np.ndarray, np.ndarray]],
+    cumulative_distances: Sequence[float],
+    step_start_distance: float,
+    step_end_distance: float,
+    starting_step: str,
+    starting_step_edge_radius_meters: float,
+    starting_step_edge_points: int,
+    tread_overhang_meters: float,
+    nosing_placements: Collection[str],
+    tread_edge_profile: str,
+    tread_edge_radius_meters: float,
+) -> tuple[list[float], list[tuple[np.ndarray, np.ndarray]]]:
+    """Sample a safe symmetric plan profile across the complete first tread.
+
+    Bullnose is represented by half-elliptical lateral lobes spanning one
+    going. Curtail is a deliberately broader double-curtail approximation
+    with an additional projection toward the foot of the stair. The profile
+    scale is clamped when a tight curved route would otherwise cross a rail.
+    """
+
+    if starting_step not in {
+        STAIR_STARTING_STEP_BULLNOSE,
+        STAIR_STARTING_STEP_CURTAIL,
+    }:
+        raise ValueError(f"Unsupported stair starting step: {starting_step!r}.")
+    going_meters = step_end_distance - step_start_distance
+    if going_meters <= STAIR_GEOMETRY_EPSILON:
+        raise ValueError("A stair starting step must have positive depth.")
+
+    start_a_xy, start_b_xy = _sample_stair_route(
+        route_sections,
+        cumulative_distances,
+        step_start_distance,
+    )
+    end_a_xy, end_b_xy = _sample_stair_route(
+        route_sections,
+        cumulative_distances,
+        step_end_distance,
+    )
+    minimum_width_meters = min(
+        float(np.linalg.norm(start_b_xy - start_a_xy)),
+        float(np.linalg.norm(end_b_xy - end_a_xy)),
+    )
+    front_extension_meters = (
+        min(
+            going_meters * STAIR_CURTAIL_FRONT_EXTENSION_RATIO,
+            minimum_width_meters * STAIR_CURTAIL_FRONT_EXTENSION_RATIO,
+        )
+        if starting_step == STAIR_STARTING_STEP_CURTAIL
+        else 0.0
+    )
+
+    for profile_scale in (1.0, 0.75, 0.5, 0.25):
+        profile_start_distance = step_start_distance - (
+            front_extension_meters * profile_scale
+        )
+        profile_length_meters = step_end_distance - profile_start_distance
+        protected_front_depth_meters = 0.0
+        if tread_edge_profile == STAIR_TREAD_EDGE_ROUNDED:
+            effective_edge_radius_meters = min(
+                tread_edge_radius_meters,
+                profile_length_meters
+                * (1.0 - STAIR_ROUNDED_EDGE_MINIMUM_BODY_DEPTH_RATIO),
+            )
+            protected_front_depth_meters = min(
+                profile_length_meters / 2.0,
+                effective_edge_radius_meters
+                * STAIR_ROUNDED_EDGE_PROTECTION_MARGIN_RATIO,
+            )
+        sampled_profile_distances = _build_starting_step_profile_distances(
+            profile_start_distance,
+            step_end_distance,
+            protected_front_depth_meters,
+            starting_step_edge_points,
+        )
+        route_split_distances = _split_stair_step_at_route_sections(
+            profile_start_distance,
+            step_end_distance,
+            cumulative_distances,
+        )
+        protected_front_end_distance = (
+            profile_start_distance + protected_front_depth_meters
+        )
+        if protected_front_depth_meters > STAIR_GEOMETRY_EPSILON:
+            route_split_distances = [
+                distance
+                for distance in route_split_distances
+                if (
+                    distance <= profile_start_distance + STAIR_GEOMETRY_EPSILON
+                    or distance
+                    >= protected_front_end_distance - STAIR_GEOMETRY_EPSILON
+                )
+            ]
+        profile_distances = _merge_stair_profile_distances(
+            route_split_distances,
+            sampled_profile_distances,
+        )
+        profile_sections = [
+            _build_starting_step_profile_section(
+                route_sections,
+                cumulative_distances,
+                distance,
+                profile_start_distance,
+                step_end_distance,
+                starting_step,
+                starting_step_edge_radius_meters,
+                starting_step_edge_points,
+                profile_scale,
+                tread_overhang_meters,
+                nosing_placements,
+            )
+            for distance in profile_distances
+        ]
+        if _is_stair_route_topology_safe(profile_sections):
+            return profile_distances, profile_sections
+
+    raise ValueError(
+        "The stair starting-step profile cannot fit around this tight route."
+    )
+
+
+def _build_starting_step_profile_distances(
+    profile_start_distance: float,
+    profile_end_distance: float,
+    protected_front_depth_meters: float,
+    starting_step_edge_points: int,
+) -> np.ndarray:
+    """Sample equal-angle points around the starting-step half-ellipse.
+
+    ``starting_step_edge_points`` counts the apex at one. Each subsequent
+    value adds one point to either side of that apex. Equal-angle samples
+    make every added pair part of the radius rather than merely subdividing
+    the straight chords of the one-point profile.
+    """
+
+    profile_distance_ratios, _ = _build_starting_step_profile_control_ratios(
+        starting_step_edge_points
+    )
+    base_distances = profile_start_distance + (
+        (profile_end_distance - profile_start_distance)
+        * profile_distance_ratios
+    )
+
+    if protected_front_depth_meters <= STAIR_GEOMETRY_EPSILON:
+        return base_distances
+    profile_midpoint_distance = (
+        profile_start_distance + profile_end_distance
+    ) / 2.0
+    protected_front_end_distance = min(
+        profile_midpoint_distance,
+        profile_start_distance + protected_front_depth_meters,
+    )
+    mirrored_protected_end_distance = (
+        profile_end_distance
+        - (protected_front_end_distance - profile_start_distance)
+    )
+    retained_base_distances = base_distances[
+        (
+            np.isclose(base_distances, profile_start_distance)
+            | np.isclose(base_distances, profile_end_distance)
+            | (
+                (
+                    base_distances
+                    >= protected_front_end_distance - STAIR_GEOMETRY_EPSILON
+                )
+                & (
+                    base_distances
+                    <= mirrored_protected_end_distance + STAIR_GEOMETRY_EPSILON
+                )
+            )
+        )
+    ]
+    return np.asarray(
+        _merge_stair_profile_distances(
+            retained_base_distances,
+            (
+                protected_front_end_distance,
+                mirrored_protected_end_distance,
+            ),
+        ),
+        dtype=float,
+    )
+
+
+def _build_starting_step_profile_control_ratios(
+    starting_step_edge_points: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the longitudinal and radial controls for one half-ellipse."""
+
+    profile_segment_count = 2 * starting_step_edge_points
+    profile_angles = np.linspace(
+        0.0,
+        math.pi,
+        profile_segment_count + 1,
+    )
+    return (
+        (1.0 - np.cos(profile_angles)) / 2.0,
+        np.sin(profile_angles),
+    )
+
+
+def _merge_stair_profile_distances(
+    route_distances: Sequence[float],
+    profile_distances: Iterable[float],
+) -> list[float]:
+    """Merge curve-guide and starting-profile distances without duplicates."""
+
+    merged_distances: list[float] = []
+    for distance in sorted((*route_distances, *profile_distances)):
+        normalized_distance = float(distance)
+        if (
+            not merged_distances
+            or normalized_distance - merged_distances[-1]
+            > STAIR_GEOMETRY_EPSILON
+        ):
+            merged_distances.append(normalized_distance)
+    return merged_distances
+
+
+def _build_starting_step_profile_section(
+    route_sections: Sequence[tuple[np.ndarray, np.ndarray]],
+    cumulative_distances: Sequence[float],
+    distance: float,
+    profile_start_distance: float,
+    profile_end_distance: float,
+    starting_step: str,
+    starting_step_edge_radius_meters: float,
+    starting_step_edge_points: int,
+    profile_scale: float,
+    tread_overhang_meters: float,
+    nosing_placements: Collection[str],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Expand one first-tread section according to its plan-profile ratio."""
+
+    section_a_xy, section_b_xy = _sample_stair_route(
+        route_sections,
+        cumulative_distances,
+        distance,
+    )
+    section_a_xy, section_b_xy = _expand_stair_tread_cross_section_for_nosing(
+        section_a_xy,
+        section_b_xy,
+        tread_overhang_meters,
+        nosing_placements,
+    )
+    profile_length_meters = profile_end_distance - profile_start_distance
+    profile_ratio = float(
+        np.clip(
+            (distance - profile_start_distance) / profile_length_meters,
+            0.0,
+            1.0,
+        )
+    )
+    section_width_meters = float(np.linalg.norm(section_b_xy - section_a_xy))
+    if starting_step == STAIR_STARTING_STEP_BULLNOSE:
+        maximum_extension_meters = min(
+            starting_step_edge_radius_meters,
+            profile_length_meters * STAIR_BULLNOSE_GOING_EXTENSION_RATIO,
+            section_width_meters * STAIR_BULLNOSE_WIDTH_EXTENSION_RATIO,
+        )
+    else:
+        maximum_extension_meters = min(
+            starting_step_edge_radius_meters,
+            profile_length_meters * STAIR_CURTAIL_GOING_EXTENSION_RATIO,
+            section_width_meters * STAIR_CURTAIL_WIDTH_EXTENSION_RATIO,
+        )
+    # Points defines a polygonal half-ellipse, not just its mesh subdivision.
+    # Structural route splits and rounded-nose protection boundaries must use
+    # this same polyline; otherwise those inserted sections could replace all
+    # added controls and make different Points values geometrically identical.
+    control_distance_ratios, control_radius_ratios = (
+        _build_starting_step_profile_control_ratios(
+            starting_step_edge_points
+        )
+    )
+    lateral_radius_ratio = float(
+        np.interp(
+            profile_ratio,
+            control_distance_ratios,
+            control_radius_ratios,
+        )
+    )
+    lateral_extension_meters = (
+        maximum_extension_meters * lateral_radius_ratio * profile_scale
+    )
+    return _expand_stair_tread_cross_section_for_nosing(
+        section_a_xy,
+        section_b_xy,
+        lateral_extension_meters,
+        (STAIR_NOSING_LEFT, STAIR_NOSING_RIGHT),
+    )
+
+
+def _build_rounded_stair_tread_prism(
+    start_a_xy: np.ndarray,
+    start_b_xy: np.ndarray,
+    end_a_xy: np.ndarray,
+    end_b_xy: np.ndarray,
+    bottom_z_meters: float,
+    top_z_meters: float,
+    *,
+    edge_radius_meters: float = DEFAULT_STAIR_TREAD_EDGE_RADIUS_METERS,
+    include_end_cap: bool,
+) -> trimesh.Trimesh:
+    """Round a tread's leading vertical edge with a smooth half ellipse."""
+
+    tread_height = top_z_meters - bottom_z_meters
+    start_center = (start_a_xy + start_b_xy) / 2.0
+    end_center = (end_a_xy + end_b_xy) / 2.0
+    tread_depth = float(np.linalg.norm(end_center - start_center))
+    horizontal_radius = min(
+        edge_radius_meters,
+        tread_depth * (1.0 - STAIR_ROUNDED_EDGE_MINIMUM_BODY_DEPTH_RATIO),
+    )
+    if horizontal_radius <= STAIR_GEOMETRY_EPSILON:
+        return _build_stair_step_prism(
+            start_a_xy=start_a_xy,
+            start_b_xy=start_b_xy,
+            end_a_xy=end_a_xy,
+            end_b_xy=end_b_xy,
+            bottom_z_meters=bottom_z_meters,
+            top_z_meters=top_z_meters,
+            include_end_cap=include_end_cap,
+        )
+
+    inset_ratio = horizontal_radius / tread_depth
+    inset_a_xy = _interpolate_stair_point(
+        start_a_xy,
+        end_a_xy,
+        inset_ratio,
+    )
+    inset_b_xy = _interpolate_stair_point(
+        start_b_xy,
+        end_b_xy,
+        inset_ratio,
+    )
+    body = _build_stair_step_prism(
+        start_a_xy=inset_a_xy,
+        start_b_xy=inset_b_xy,
+        end_a_xy=end_a_xy,
+        end_b_xy=end_b_xy,
+        bottom_z_meters=bottom_z_meters,
+        top_z_meters=top_z_meters,
+        include_start_cap=False,
+        include_end_cap=include_end_cap,
+    )
+
+    center_z = (top_z_meters + bottom_z_meters) / 2.0
+    vertical_radius = tread_height / 2.0
+    rings: list[tuple[np.ndarray, np.ndarray, float]] = []
+    for edge_index in range(STAIR_ROUNDED_EDGE_SEGMENTS + 1):
+        angle = (math.pi / 2.0) + (math.pi * edge_index / STAIR_ROUNDED_EDGE_SEGMENTS)
+        route_offset = horizontal_radius * (1.0 + math.cos(angle))
+        route_ratio = route_offset / tread_depth
+        rings.append(
+            (
+                _interpolate_stair_point(
+                    start_a_xy,
+                    end_a_xy,
+                    route_ratio,
+                ),
+                _interpolate_stair_point(
+                    start_b_xy,
+                    end_b_xy,
+                    route_ratio,
+                ),
+                center_z + (vertical_radius * math.sin(angle)),
+            )
+        )
+
+    nose_vertices = np.asarray(
+        [
+            (point[0], point[1], z)
+            for ring_a, ring_b, z in rings
+            for point in (ring_a, ring_b)
+        ],
+        dtype=float,
+    )
+    nose_faces: list[list[int]] = []
+    for ring_index in range(len(rings) - 1):
+        a_index = ring_index * 2
+        b_index = a_index + 1
+        next_a_index = a_index + 2
+        next_b_index = a_index + 3
+        nose_faces.extend(
+            (
+                [a_index, next_a_index, next_b_index],
+                [a_index, next_b_index, b_index],
+            )
+        )
+    for side_offset, reverse_winding in ((0, True), (1, False)):
+        side_indices = [
+            (ring_index * 2) + side_offset for ring_index in range(len(rings))
+        ]
+        for triangle_index in range(1, len(side_indices) - 1):
+            triangle = [
+                side_indices[0],
+                side_indices[triangle_index],
+                side_indices[triangle_index + 1],
+            ]
+            if reverse_winding:
+                triangle.reverse()
+            nose_faces.append(triangle)
+    # The ring order builds the rounded shell from its top edge toward its
+    # bottom edge. Reverse that isolated component so its curved face and side
+    # caps point out of the tread, matching the adjoining prism winding.
+    nose = trimesh.Trimesh(
+        vertices=nose_vertices,
+        faces=np.asarray(nose_faces, dtype=np.int64)[:, ::-1],
+        process=False,
+    )
+    return _combine_mesh_geometry((body, nose))
+
+
+# ### Rounded stair tread side geometry ###
+def _build_laterally_rounded_stair_tread_prism(
+    start_a_xy: np.ndarray,
+    start_b_xy: np.ndarray,
+    end_a_xy: np.ndarray,
+    end_b_xy: np.ndarray,
+    bottom_z_meters: float,
+    top_z_meters: float,
+    *,
+    edge_radius_meters: float,
+    nosing_placements: Collection[str],
+    include_start_cap: bool,
+    include_end_cap: bool,
+) -> trimesh.Trimesh:
+    """Join the selected side rounds to the tread's existing front nose."""
+
+    if edge_radius_meters <= STAIR_GEOMETRY_EPSILON:
+        return _build_stair_step_prism(
+            start_a_xy=start_a_xy,
+            start_b_xy=start_b_xy,
+            end_a_xy=end_a_xy,
+            end_b_xy=end_b_xy,
+            bottom_z_meters=bottom_z_meters,
+            top_z_meters=top_z_meters,
+            include_start_cap=include_start_cap,
+            include_end_cap=include_end_cap,
+        )
+
+    start_center = (start_a_xy + start_b_xy) / 2.0
+    end_center = (end_a_xy + end_b_xy) / 2.0
+    tread_depth = float(np.linalg.norm(end_center - start_center))
+    front_radius = (
+        min(
+            edge_radius_meters,
+            tread_depth * (1.0 - STAIR_ROUNDED_EDGE_MINIMUM_BODY_DEPTH_RATIO),
+        )
+        if include_start_cap
+        else 0.0
+    )
+    if front_radius <= STAIR_GEOMETRY_EPSILON:
+        return _build_stair_tread_profile_shell(
+            start_a_xy=start_a_xy,
+            start_b_xy=start_b_xy,
+            end_a_xy=end_a_xy,
+            end_b_xy=end_b_xy,
+            bottom_z_meters=bottom_z_meters,
+            top_z_meters=top_z_meters,
+            edge_radius_meters=edge_radius_meters,
+            nosing_placements=nosing_placements,
+            include_start_cap=include_start_cap,
+            include_end_cap=include_end_cap,
+            include_horizontal_caps=True,
+            round_front=False,
+        )
+
+    inset_ratio = front_radius / tread_depth
+    inset_a_xy = _interpolate_stair_point(
+        start_a_xy,
+        end_a_xy,
+        inset_ratio,
+    )
+    inset_b_xy = _interpolate_stair_point(
+        start_b_xy,
+        end_b_xy,
+        inset_ratio,
+    )
+    body = _build_stair_tread_profile_shell(
+        start_a_xy=inset_a_xy,
+        start_b_xy=inset_b_xy,
+        end_a_xy=end_a_xy,
+        end_b_xy=end_b_xy,
+        bottom_z_meters=bottom_z_meters,
+        top_z_meters=top_z_meters,
+        edge_radius_meters=edge_radius_meters,
+        nosing_placements=nosing_placements,
+        include_start_cap=False,
+        include_end_cap=include_end_cap,
+        include_horizontal_caps=True,
+        round_front=False,
+    )
+    nose = _build_stair_tread_profile_shell(
+        start_a_xy=start_a_xy,
+        start_b_xy=start_b_xy,
+        end_a_xy=inset_a_xy,
+        end_b_xy=inset_b_xy,
+        bottom_z_meters=bottom_z_meters,
+        top_z_meters=top_z_meters,
+        edge_radius_meters=edge_radius_meters,
+        nosing_placements=nosing_placements,
+        include_start_cap=True,
+        include_end_cap=False,
+        include_horizontal_caps=False,
+        round_front=True,
+    )
+    return _combine_mesh_geometry((body, nose))
+
+
+def _build_stair_tread_profile_shell(
+    start_a_xy: np.ndarray,
+    start_b_xy: np.ndarray,
+    end_a_xy: np.ndarray,
+    end_b_xy: np.ndarray,
+    bottom_z_meters: float,
+    top_z_meters: float,
+    *,
+    edge_radius_meters: float,
+    nosing_placements: Collection[str],
+    include_start_cap: bool,
+    include_end_cap: bool,
+    include_horizontal_caps: bool,
+    round_front: bool,
+) -> trimesh.Trimesh:
+    """Build one connected perimeter; shared route sections have no caps."""
+
+    center_z = (top_z_meters + bottom_z_meters) / 2.0
+    vertical_radius = (top_z_meters - bottom_z_meters) / 2.0
+    rings: list[np.ndarray] = []
+    for ring_index in range(STAIR_ROUNDED_EDGE_SEGMENTS + 1):
+        angle = (math.pi / 2.0) + (
+            math.pi * ring_index / STAIR_ROUNDED_EDGE_SEGMENTS
+        )
+        inset_scale = 1.0 + math.cos(angle)
+        if round_front:
+            front_a_xy = _interpolate_stair_point(
+                start_a_xy,
+                end_a_xy,
+                inset_scale,
+            )
+            front_b_xy = _interpolate_stair_point(
+                start_b_xy,
+                end_b_xy,
+                inset_scale,
+            )
+        else:
+            front_a_xy, front_b_xy = start_a_xy, start_b_xy
+        ring_start_a, ring_start_b = _inset_rounded_stair_tread_sides(
+            front_a_xy,
+            front_b_xy,
+            edge_radius_meters * inset_scale,
+            nosing_placements,
+        )
+        ring_end_a, ring_end_b = _inset_rounded_stair_tread_sides(
+            end_a_xy,
+            end_b_xy,
+            edge_radius_meters * inset_scale,
+            nosing_placements,
+        )
+        z = center_z + (vertical_radius * math.sin(angle))
+        rings.append(
+            np.asarray(
+                [
+                    (ring_start_a[0], ring_start_a[1], z),
+                    (ring_end_a[0], ring_end_a[1], z),
+                    (ring_end_b[0], ring_end_b[1], z),
+                    (ring_start_b[0], ring_start_b[1], z),
+                ],
+                dtype=float,
+            )
+        )
+
+    vertices = np.vstack(rings)
+    footprint = np.asarray(
+        (start_a_xy, end_a_xy, end_b_xy, start_b_xy),
+        dtype=float,
+    )
+    reverse_winding = _get_polygon_signed_area(footprint) < 0.0
+    faces: list[list[int]] = []
+    perimeter_edges = (0, 2)
+    if include_end_cap:
+        perimeter_edges += (1,)
+    if include_start_cap:
+        perimeter_edges += (3,)
+    for ring_index in range(len(rings) - 1):
+        upper_offset = ring_index * 4
+        lower_offset = (ring_index + 1) * 4
+        for edge_index in perimeter_edges:
+            next_edge_index = (edge_index + 1) % 4
+            faces.extend(
+                (
+                    [
+                        upper_offset + edge_index,
+                        lower_offset + edge_index,
+                        lower_offset + next_edge_index,
+                    ],
+                    [
+                        upper_offset + edge_index,
+                        lower_offset + next_edge_index,
+                        upper_offset + next_edge_index,
+                    ],
+                )
+            )
+    if include_horizontal_caps:
+        bottom_offset = (len(rings) - 1) * 4
+        faces.extend(
+            (
+                [0, 1, 2],
+                [0, 2, 3],
+                [bottom_offset, bottom_offset + 2, bottom_offset + 1],
+                [bottom_offset, bottom_offset + 3, bottom_offset + 2],
+            )
+        )
+    face_array = np.asarray(faces, dtype=np.int64)
+    if reverse_winding:
+        face_array = face_array[:, ::-1]
+    # At the nose's top and bottom the leading rail meets the body rail.
+    # Those zero-area corner triangles must not become spurious mesh faces.
+    triangle_vertices = vertices[face_array]
+    face_areas = np.linalg.norm(
+        np.cross(
+            triangle_vertices[:, 1] - triangle_vertices[:, 0],
+            triangle_vertices[:, 2] - triangle_vertices[:, 0],
+        ),
+        axis=1,
+    )
+    return trimesh.Trimesh(
+        vertices=vertices,
+        faces=face_array[face_areas > 1e-12],
+        process=False,
+    )
+
+
+def _inset_rounded_stair_tread_sides(
+    section_a_xy: np.ndarray,
+    section_b_xy: np.ndarray,
+    requested_inset_meters: float,
+    nosing_placements: Collection[str],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Use the section's width so both sides match at every route guide."""
+
+    width_vector = section_b_xy - section_a_xy
+    width_meters = float(np.linalg.norm(width_vector))
+    if width_meters <= STAIR_GEOMETRY_EPSILON:
+        raise ValueError("Stair tread cross-sections must have a positive width.")
+    side_inset_meters = min(requested_inset_meters, width_meters * 0.45)
+    inset_ratio = side_inset_meters / width_meters
+    inset_a_xy = (
+        _interpolate_stair_point(section_a_xy, section_b_xy, inset_ratio)
+        if STAIR_NOSING_RIGHT in nosing_placements
+        else section_a_xy
+    )
+    inset_b_xy = (
+        _interpolate_stair_point(section_b_xy, section_a_xy, inset_ratio)
+        if STAIR_NOSING_LEFT in nosing_placements
+        else section_b_xy
+    )
+    return inset_a_xy, inset_b_xy
+
+
+def _append_stair_stringer_step_meshes(
+    part_meshes: dict[str, list[trimesh.Trimesh]],
+    stair: StairData,
+    route_sections: Sequence[tuple[np.ndarray, np.ndarray]],
+    cumulative_distances: Sequence[float],
+    step_start_distance: float,
+    step_end_distance: float,
+    step_top_z_meters: float,
+    tread_thickness_meters: float,
+) -> None:
+    """Append stringer segments to the stair's single semantic group."""
+
+    if stair.stringer_placement == STAIR_STRINGER_NONE:
+        return
+    stringer_top = step_top_z_meters - tread_thickness_meters
+    stringer_bottom = stringer_top - DEFAULT_STAIR_STRINGER_DEPTH_METERS
+    step_distances = _split_stair_step_at_route_sections(
+        step_start_distance,
+        step_end_distance,
+        cumulative_distances,
+    )
+    for segment_start, segment_end in zip(
+        step_distances,
+        step_distances[1:],
+    ):
+        start_a, start_b = _sample_stair_route(
+            route_sections,
+            cumulative_distances,
+            segment_start,
+        )
+        end_a, end_b = _sample_stair_route(
+            route_sections,
+            cumulative_distances,
+            segment_end,
+        )
+        if stair.stringer_placement in {STAIR_STRINGER_RIGHT, STAIR_STRINGER_BOTH}:
+            part_meshes[STAIR_PART_STRINGERS].append(
+                _build_stair_side_stringer_prism(
+                    start_a,
+                    start_b,
+                    end_a,
+                    end_b,
+                    stringer_bottom,
+                    stringer_top,
+                    use_left_side=False,
+                )
+            )
+        if stair.stringer_placement in {STAIR_STRINGER_LEFT, STAIR_STRINGER_BOTH}:
+            part_meshes[STAIR_PART_STRINGERS].append(
+                _build_stair_side_stringer_prism(
+                    start_a,
+                    start_b,
+                    end_a,
+                    end_b,
+                    stringer_bottom,
+                    stringer_top,
+                    use_left_side=True,
+                )
+            )
+
+
+def _build_stair_side_stringer_prism(
+    start_a_xy: np.ndarray,
+    start_b_xy: np.ndarray,
+    end_a_xy: np.ndarray,
+    end_b_xy: np.ndarray,
+    bottom_z_meters: float,
+    top_z_meters: float,
+    *,
+    use_left_side: bool,
+) -> trimesh.Trimesh:
+    """Build a narrow route prism on the left or right stair edge."""
+
+    width_ratio = _get_stair_stringer_width_ratio(
+        start_a_xy,
+        start_b_xy,
+        end_a_xy,
+        end_b_xy,
+    )
+    if use_left_side:
+        prism_start_a = _interpolate_stair_point(
+            start_a_xy,
+            start_b_xy,
+            1.0 - width_ratio,
+        )
+        prism_start_b = start_b_xy
+        prism_end_a = _interpolate_stair_point(
+            end_a_xy,
+            end_b_xy,
+            1.0 - width_ratio,
+        )
+        prism_end_b = end_b_xy
+    else:
+        prism_start_a = start_a_xy
+        prism_start_b = _interpolate_stair_point(
+            start_a_xy,
+            start_b_xy,
+            width_ratio,
+        )
+        prism_end_a = end_a_xy
+        prism_end_b = _interpolate_stair_point(
+            end_a_xy,
+            end_b_xy,
+            width_ratio,
+        )
+    return _build_stair_step_prism(
+        start_a_xy=prism_start_a,
+        start_b_xy=prism_start_b,
+        end_a_xy=prism_end_a,
+        end_b_xy=prism_end_b,
+        bottom_z_meters=bottom_z_meters,
+        top_z_meters=top_z_meters,
+    )
+
+
+def _inset_stair_support_for_stringers(
+    start_a_xy: np.ndarray,
+    start_b_xy: np.ndarray,
+    end_a_xy: np.ndarray,
+    end_b_xy: np.ndarray,
+    stringer_placement: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Keep a supported stair body between its exposed side stringers."""
+
+    if stringer_placement == STAIR_STRINGER_NONE:
+        return start_a_xy, start_b_xy, end_a_xy, end_b_xy
+    width_ratio = _get_stair_stringer_width_ratio(
+        start_a_xy,
+        start_b_xy,
+        end_a_xy,
+        end_b_xy,
+    )
+    support_start_a = start_a_xy
+    support_start_b = start_b_xy
+    support_end_a = end_a_xy
+    support_end_b = end_b_xy
+    if stringer_placement in {STAIR_STRINGER_RIGHT, STAIR_STRINGER_BOTH}:
+        support_start_a = _interpolate_stair_point(
+            start_a_xy,
+            start_b_xy,
+            width_ratio,
+        )
+        support_end_a = _interpolate_stair_point(
+            end_a_xy,
+            end_b_xy,
+            width_ratio,
+        )
+    if stringer_placement in {STAIR_STRINGER_LEFT, STAIR_STRINGER_BOTH}:
+        support_start_b = _interpolate_stair_point(
+            start_a_xy,
+            start_b_xy,
+            1.0 - width_ratio,
+        )
+        support_end_b = _interpolate_stair_point(
+            end_a_xy,
+            end_b_xy,
+            1.0 - width_ratio,
+        )
+    return support_start_a, support_start_b, support_end_a, support_end_b
+
+
+def _get_stair_stringer_width_ratio(
+    start_a_xy: np.ndarray,
+    start_b_xy: np.ndarray,
+    end_a_xy: np.ndarray,
+    end_b_xy: np.ndarray,
+) -> float:
+    """Return one safe cross-section ratio for a fixed-width stringer."""
+
+    start_width = float(np.linalg.norm(start_b_xy - start_a_xy))
+    end_width = float(np.linalg.norm(end_b_xy - end_a_xy))
+    return min(
+        0.45,
+        DEFAULT_STAIR_STRINGER_WIDTH_METERS / min(start_width, end_width),
+    )
 
 
 def _build_stair_step_prism(
@@ -2559,12 +4009,8 @@ def _build_stair_step_prism(
 
     vertices = np.vstack(
         (
-            np.column_stack(
-                (footprint, np.full(4, bottom_z_meters, dtype=float))
-            ),
-            np.column_stack(
-                (footprint, np.full(4, top_z_meters, dtype=float))
-            ),
+            np.column_stack((footprint, np.full(4, bottom_z_meters, dtype=float))),
+            np.column_stack((footprint, np.full(4, top_z_meters, dtype=float))),
         )
     )
     faces: list[list[int]] = [
@@ -2598,6 +4044,61 @@ def _build_stair_step_prism(
     return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
 
 
+def _split_stair_prism_start_cap(
+    prism: trimesh.Trimesh,
+    *,
+    visible_bottom_z_meters: float,
+) -> tuple[trimesh.Trimesh, trimesh.Trimesh | None]:
+    """Expose only the visible upper band of a support's leading cap.
+
+    The previous step already covers the portion from ground to its tread top.
+    We remove that hidden cap portion instead of assigning it to SUPPORT, so
+    the selectable RISERS mesh contains just the visible vertical band.
+    """
+
+    faces = np.asarray(prism.faces, dtype=np.int64)
+    if len(faces) < 2:
+        raise ValueError("A supported stair prism must have a leading cap.")
+    support_body = _build_stair_face_subset(prism, faces[:-2])
+    vertices = np.asarray(prism.vertices, dtype=float)
+    top_z_meters = float(vertices[4, 2])
+    if visible_bottom_z_meters >= top_z_meters - STAIR_GEOMETRY_EPSILON:
+        return support_body, None
+    visible_bottom_z_meters = max(
+        visible_bottom_z_meters,
+        float(vertices[0, 2]),
+    )
+    # The prism's start cap winds bottom-B, bottom-A, top-A, top-B. Retain
+    # that winding when raising its lower edge to the previous tread's top.
+    cap_vertices = np.asarray(
+        [vertices[3], vertices[0], vertices[4], vertices[7]], dtype=float
+    )
+    cap_vertices[:2, 2] = visible_bottom_z_meters
+    riser_face = trimesh.Trimesh(
+        vertices=cap_vertices,
+        faces=np.asarray(((0, 1, 2), (0, 2, 3)), dtype=np.int64),
+        process=False,
+    )
+    return support_body, riser_face
+
+
+def _build_stair_face_subset(
+    mesh: trimesh.Trimesh,
+    selected_faces: np.ndarray,
+) -> trimesh.Trimesh:
+    """Keep only used vertices so semantic part bounds match their faces."""
+
+    vertices = np.asarray(mesh.vertices, dtype=float)
+    used_vertices, remapped_indices = np.unique(
+        selected_faces.reshape(-1), return_inverse=True
+    )
+    return trimesh.Trimesh(
+        vertices=vertices[used_vertices],
+        faces=remapped_indices.reshape(-1, 3),
+        process=False,
+    )
+
+
 def _build_stair_riser_prism(
     route_sections: Sequence[tuple[np.ndarray, np.ndarray]],
     cumulative_distances: Sequence[float],
@@ -2615,9 +4116,7 @@ def _build_stair_riser_prism(
     the space from that tread's top to this tread's underside.
     """
 
-    first_segment_length = (
-        first_step_segment_end_distance - step_start_distance
-    )
+    first_segment_length = first_step_segment_end_distance - step_start_distance
     riser_depth_meters = min(
         maximum_depth_meters,
         first_segment_length / 2.0,
@@ -2693,14 +4192,11 @@ def _normalize_stair_rail_correspondence(
         center_distance = float(np.linalg.norm(center_delta))
         if center_distance <= STAIR_GEOMETRY_EPSILON:
             raise ValueError(
-                "Consecutive stair section centers must be separated "
-                "horizontally."
+                "Consecutive stair section centers must be separated horizontally."
             )
         segment_directions.append(center_delta / center_distance)
 
-    route_directions = _build_stair_section_route_directions(
-        segment_directions
-    )
+    route_directions = _build_stair_section_route_directions(segment_directions)
     normalized_sections: list[tuple[np.ndarray, np.ndarray]] = []
     for (section_a_xy, section_b_xy), route_direction in zip(
         route_sections,
@@ -2734,9 +4230,7 @@ def _build_stair_section_route_directions(
         if route_direction_length <= STAIR_GEOMETRY_EPSILON:
             route_directions.append(outgoing_direction)
         else:
-            route_directions.append(
-                route_direction / route_direction_length
-            )
+            route_directions.append(route_direction / route_direction_length)
     route_directions.append(segment_directions[-1])
     return route_directions
 
@@ -2745,10 +4239,7 @@ def _get_stair_2d_cross_product(
     first_xy: np.ndarray,
     second_xy: np.ndarray,
 ) -> float:
-    return float(
-        (first_xy[0] * second_xy[1])
-        - (first_xy[1] * second_xy[0])
-    )
+    return float((first_xy[0] * second_xy[1]) - (first_xy[1] * second_xy[0]))
 
 
 def _validate_world_stair_segment(
@@ -2788,9 +4279,7 @@ def _get_stair_endpoint_level(
 ) -> LevelData:
     level = level_lookup.get(level_index)
     if level is None:
-        raise ValueError(
-            f"Stair {endpoint_name} level {level_index} does not exist."
-        )
+        raise ValueError(f"Stair {endpoint_name} level {level_index} does not exist.")
     return level
 
 
@@ -2801,19 +4290,53 @@ def _get_stair_endpoint_base_z(
 ) -> float:
     base_z_meters = base_z_by_level_index.get(level_index)
     if base_z_meters is None:
-        raise ValueError(
-            f"Stair {endpoint_name} level {level_index} has no elevation."
-        )
+        raise ValueError(f"Stair {endpoint_name} level {level_index} has no elevation.")
     if not math.isfinite(base_z_meters):
         raise ValueError(
-            f"Stair {endpoint_name} level {level_index} has an invalid "
-            "elevation."
+            f"Stair {endpoint_name} level {level_index} has an invalid elevation."
         )
     return float(base_z_meters)
 
 
 def _get_stair_object_name(stair_index: int, stair: StairData) -> str:
     return f"stair_{stair_index}_{stair.style}"
+
+
+def _get_stair_part_object_name(
+    stair_index: int,
+    stair: StairData,
+    part_kind: str,
+) -> str:
+    base_name = _get_stair_object_name(stair_index, stair)
+    if part_kind == STAIR_PART_TREADS:
+        return base_name
+    return f"{base_name}_{part_kind}"
+
+
+def _get_stair_part_semantic_id(
+    stair: StairData,
+    part_kind: str,
+    surface_type: str,
+) -> str:
+    return f"stair:{stair.stair_id}/part:{part_kind}:{surface_type}"
+
+
+def _attach_stair_part_metadata(
+    mesh: trimesh.Trimesh,
+    stair: StairData,
+    stair_index: int,
+    part_kind: str,
+    semantic_id: str,
+) -> None:
+    mesh.metadata = copy.deepcopy(dict(getattr(mesh, "metadata", {}) or {}))
+    mesh.metadata.update(
+        {
+            "housemaker_stair_id": stair.stair_id,
+            "housemaker_stair_index": stair_index,
+            "housemaker_stair_part": part_kind,
+            "housemaker_surface_id": semantic_id,
+        }
+    )
 
 
 def _apply_surface_materials(
@@ -2847,7 +4370,10 @@ def _apply_surface_materials(
 
         fixed_surfaces = build_fixed_surfaces(levels)
     base_surfaces = list(fixed_surfaces)
-    known_surface_ids = {surface.surface_id for surface in fixed_surfaces}
+    stair_parts = list(model.preview_stair_parts)
+    known_surface_ids = {surface.surface_id for surface in fixed_surfaces}.union(
+        part.semantic_id for part in stair_parts
+    )
     live_sources = {
         str(surface_id): source
         for surface_id, source in surface_materials.items()
@@ -2855,9 +4381,7 @@ def _apply_surface_materials(
     }
     if not live_sources and export_untextured_surfaces:
         return model
-    texture_world_size = normalize_texture_world_size(
-        surface_texture_world_size_meters
-    )
+    texture_world_size = normalize_texture_world_size(surface_texture_world_size_meters)
     resolved_materials = resolve_surface_materials(live_sources)
     (
         textured_named_meshes,
@@ -2868,6 +4392,17 @@ def _apply_surface_materials(
         texture_world_size_meters=texture_world_size,
         build_textured_mesh=build_world_planar_textured_mesh,
     )
+    (
+        textured_stair_named_meshes,
+        preview_textured_stair_surfaces,
+    ) = _build_textured_stair_part_meshes(
+        stair_parts,
+        resolved_materials,
+        texture_world_size,
+        build_world_planar_textured_mesh,
+    )
+    textured_named_meshes.extend(textured_stair_named_meshes)
+    preview_textured_surfaces.extend(preview_textured_stair_surfaces)
     if not textured_named_meshes and export_untextured_surfaces:
         return model
     if not textured_named_meshes:
@@ -2880,9 +4415,7 @@ def _apply_surface_materials(
         return replace(
             model,
             scene=export_scene,
-            glb_bytes=(
-                _serialize_export_scene(export_scene) if serialize_glb else b""
-            ),
+            glb_bytes=(_serialize_export_scene(export_scene) if serialize_glb else b""),
         )
     replacement_surface_ids = set(resolved_materials).intersection(
         surface.surface_id for surface in base_surfaces
@@ -2917,16 +4450,17 @@ def _apply_surface_materials(
         *replacement_surfaces,
         *untextured_partition_surfaces,
     ]
-    replacement_face_keys = _build_oriented_surface_face_keys(
-        removal_surfaces
-    )
-    replacement_plane_coverage = _build_surface_plane_coverage(
-        removal_surfaces
-    )
+    replacement_face_keys = _build_oriented_surface_face_keys(removal_surfaces)
+    replacement_plane_coverage = _build_surface_plane_coverage(removal_surfaces)
     retained_named_meshes = _remove_named_mesh_surface_faces(
         named_meshes,
         replacement_face_keys,
         replacement_plane_coverage,
+    )
+    retained_named_meshes = _replace_assigned_stair_part_meshes(
+        retained_named_meshes,
+        stair_parts,
+        set(resolved_materials),
     )
     retained_named_meshes.extend(
         NamedMesh(
@@ -2935,13 +4469,13 @@ def _apply_surface_materials(
         )
         for surface in untextured_partition_surfaces
     )
-    preview_base_mesh = _combine_mesh_geometry(
+    preview_base_mesh = _combine_preview_mesh_geometry(
         [
             _build_transformed_named_mesh_copy(named_mesh)
             for named_mesh in retained_named_meshes
         ]
     )
-    combined_mesh = _combine_mesh_geometry(
+    combined_mesh = _combine_preview_mesh_geometry(
         [
             preview_base_mesh,
             *[named_mesh.mesh for named_mesh in textured_named_meshes],
@@ -2955,18 +4489,27 @@ def _apply_surface_materials(
         export_named_meshes = _build_assigned_surface_export_named_meshes(
             named_meshes,
             base_surfaces,
-            textured_named_meshes,
+            [
+                named_mesh
+                for named_mesh in textured_named_meshes
+                if named_mesh.export_role != NAMED_MESH_ROLE_STAIR
+            ],
         )
+        export_named_meshes = _replace_assigned_stair_part_meshes(
+            export_named_meshes,
+            stair_parts,
+            set(resolved_materials),
+        )
+        export_named_meshes.extend(textured_stair_named_meshes)
     scene = _build_export_scene(export_named_meshes)
     return GeneratedModel(
         mesh=combined_mesh,
         scene=scene,
-        glb_bytes=(
-            scene.export(file_type="glb") if serialize_glb else b""
-        ),
+        glb_bytes=(scene.export(file_type="glb") if serialize_glb else b""),
         preview_textured_walls=model.preview_textured_walls,
         preview_textured_surfaces=preview_textured_surfaces,
         preview_untextured_mesh=preview_base_mesh,
+        preview_stair_parts=model.preview_stair_parts,
     )
 
 
@@ -2999,9 +4542,7 @@ def _build_surface_named_meshes(
             material_name=f"Surface {surface_id}",
             double_sided=double_sided,
         )
-        mesh.metadata = copy.deepcopy(
-            dict(getattr(mesh, "metadata", {}) or {})
-        )
+        mesh.metadata = copy.deepcopy(dict(getattr(mesh, "metadata", {}) or {}))
         mesh.metadata["housemaker_surface_id"] = surface_id
         preview_surfaces.append(
             PreviewTexturedSurface(
@@ -3021,6 +4562,87 @@ def _build_surface_named_meshes(
             )
         )
     return named_meshes, preview_surfaces
+
+
+def _build_textured_stair_part_meshes(
+    stair_parts: Sequence[PreviewStairPart],
+    resolved_materials: Mapping[str, object],
+    texture_world_size_meters: float,
+    build_textured_mesh: Callable[..., trimesh.Trimesh],
+) -> tuple[list[NamedMesh], list[PreviewTexturedSurface]]:
+    """Apply one assignment to an entire repeated semantic stair group."""
+
+    named_meshes: list[NamedMesh] = []
+    preview_surfaces: list[PreviewTexturedSurface] = []
+    for part in stair_parts:
+        material = resolved_materials.get(part.semantic_id)
+        if material is None:
+            continue
+        mesh = build_textured_mesh(
+            part.mesh.copy(),
+            part.surface_type,
+            material,
+            texture_world_size_meters=texture_world_size_meters,
+            material_name=f"Surface {part.semantic_id}",
+            double_sided=False,
+        )
+        mesh.metadata = copy.deepcopy(dict(getattr(part.mesh, "metadata", {}) or {}))
+        mesh.metadata["housemaker_surface_id"] = part.semantic_id
+        named_meshes.append(
+            NamedMesh(
+                name=_get_surface_object_name(part.semantic_id),
+                mesh=mesh,
+                export_role=NAMED_MESH_ROLE_STAIR,
+            )
+        )
+        preview_surfaces.append(
+            PreviewTexturedSurface(
+                surface_id=part.semantic_id,
+                surface_type=part.surface_type,
+                mesh=mesh.copy(),
+                double_sided=False,
+            )
+        )
+    return named_meshes, preview_surfaces
+
+
+def _replace_assigned_stair_part_meshes(
+    named_meshes: Sequence[NamedMesh],
+    stair_parts: Sequence[PreviewStairPart],
+    assigned_surface_ids: set[str],
+) -> list[NamedMesh]:
+    """Split targeted legacy stairs and retain every unassigned stair part."""
+
+    assigned_stair_ids = {
+        part.stair_id
+        for part in stair_parts
+        if part.semantic_id in assigned_surface_ids
+    }
+    if not assigned_stair_ids:
+        return list(named_meshes)
+
+    retained = [
+        named_mesh
+        for named_mesh in named_meshes
+        if str(
+            getattr(named_mesh.mesh, "metadata", {}).get(
+                "housemaker_stair_id",
+                "",
+            )
+        )
+        not in assigned_stair_ids
+    ]
+    retained.extend(
+        NamedMesh(
+            name=(f"stair_{part.stair_index + 1}_{part.part_kind}_untextured"),
+            mesh=part.mesh.copy(),
+            export_role=NAMED_MESH_ROLE_STAIR,
+        )
+        for part in stair_parts
+        if part.stair_id in assigned_stair_ids
+        and part.semantic_id not in assigned_surface_ids
+    )
+    return retained
 
 
 def _build_assigned_surface_export_named_meshes(
@@ -3123,9 +4745,7 @@ def _build_surface_plane_coverage(
             if polygon.area > 0.0:
                 polygons_by_plane.setdefault(plane_key, []).append(polygon)
     return {
-        plane_key: shapely.union_all(polygons).buffer(
-            SURFACE_FACE_COVERAGE_EPSILON
-        )
+        plane_key: shapely.union_all(polygons).buffer(SURFACE_FACE_COVERAGE_EPSILON)
         for plane_key, polygons in polygons_by_plane.items()
     }
 
@@ -3168,9 +4788,7 @@ def _build_oriented_plane_key(
     if length <= 1e-12:
         return ()
     normalized /= length
-    plane_offset = float(
-        np.dot(normalized, np.asarray(triangle, dtype=float)[0])
-    )
+    plane_offset = float(np.dot(normalized, np.asarray(triangle, dtype=float)[0]))
     return tuple(
         float(value)
         for value in np.round(
@@ -3210,8 +4828,7 @@ def _build_oriented_triangle_key(
 
 def _get_surface_object_name(surface_id: str) -> str:
     normalized = "".join(
-        character if character.isalnum() else "_"
-        for character in surface_id.lower()
+        character if character.isalnum() else "_" for character in surface_id.lower()
     ).strip("_")
     return f"surface_{normalized or 'unnamed'}"
 
@@ -3279,9 +4896,7 @@ def _build_export_scene(named_meshes: list[NamedMesh]) -> trimesh.Scene:
             _to_gltf_y_up_mesh(named_mesh.mesh),
             geom_name=named_mesh.name,
             node_name=named_mesh.name,
-            transform=_source_to_gltf_y_up_transform(
-                named_mesh.source_transform
-            ),
+            transform=_source_to_gltf_y_up_transform(named_mesh.source_transform),
         )
     return scene
 
@@ -3354,8 +4969,7 @@ def _rewrite_serialized_glb_half_mesh_extras(
 
     try:
         if (
-            len(payload)
-            < GLB_HEADER_BYTE_COUNT + GLB_CHUNK_HEADER_BYTE_COUNT
+            len(payload) < GLB_HEADER_BYTE_COUNT + GLB_CHUNK_HEADER_BYTE_COUNT
             or payload[:4] != GLB_MAGIC
             or int.from_bytes(payload[4:8], "little") != GLB_VERSION
             or int.from_bytes(payload[8:12], "little") != len(payload)
@@ -3364,11 +4978,7 @@ def _rewrite_serialized_glb_half_mesh_extras(
         json_byte_count = int.from_bytes(payload[12:16], "little")
         if payload[16:20] != GLB_JSON_CHUNK_TYPE:
             raise ValueError("The first GLB chunk is not JSON.")
-        json_end = (
-            GLB_HEADER_BYTE_COUNT
-            + GLB_CHUNK_HEADER_BYTE_COUNT
-            + json_byte_count
-        )
+        json_end = GLB_HEADER_BYTE_COUNT + GLB_CHUNK_HEADER_BYTE_COUNT + json_byte_count
         if json_byte_count <= 0 or json_end > len(payload):
             raise ValueError("The GLB JSON chunk is invalid.")
         raw_document = payload[20:json_end].rstrip(b" \t\r\n\0")
@@ -3599,9 +5209,7 @@ def _inject_packed_orm_occlusion_textures(
         spec = normalized_specs[marker_name]
         pbr = material.get("pbrMetallicRoughness")
         metallic_roughness = (
-            pbr.get("metallicRoughnessTexture")
-            if isinstance(pbr, dict)
-            else None
+            pbr.get("metallicRoughnessTexture") if isinstance(pbr, dict) else None
         )
         texture_index = (
             metallic_roughness.get("index")
@@ -3614,9 +5222,7 @@ def _inject_packed_orm_occlusion_textures(
             or texture_index < 0
             or texture_index >= len(textures)
         ):
-            raise ValueError(
-                "A packed ORM material has no metallic-roughness texture."
-            )
+            raise ValueError("A packed ORM material has no metallic-roughness texture.")
         metallic_roughness.pop("texCoord", None)
         occlusion_texture = copy.deepcopy(metallic_roughness)
         if spec.ao_tex_coord == 1:
@@ -3675,9 +5281,7 @@ def _promote_packed_orm_ao_uv_attributes(
                     raise ValueError(
                         "A packed ORM primitive has conflicting AO UV attributes."
                     )
-                attributes["TEXCOORD_1"] = attributes.pop(
-                    PACKED_ORM_AO_UV_ATTRIBUTE
-                )
+                attributes["TEXCOORD_1"] = attributes.pop(PACKED_ORM_AO_UV_ATTRIBUTE)
             if "TEXCOORD_1" not in attributes:
                 raise ValueError("A packed ORM UV1 primitive has no AO UV attribute.")
             _validate_packed_orm_uv_accessor_counts(attributes, accessors)
@@ -3795,14 +5399,10 @@ def _normalize_half_mesh_extras_vector(
             raw_value,
             (int, float, np.integer, np.floating),
         ):
-            raise ValueError(
-                f"Half-mesh mirror-plane {field_name} must be numeric."
-            )
+            raise ValueError(f"Half-mesh mirror-plane {field_name} must be numeric.")
         value = float(raw_value)
         if not math.isfinite(value):
-            raise ValueError(
-                f"Half-mesh mirror-plane {field_name} must be finite."
-            )
+            raise ValueError(f"Half-mesh mirror-plane {field_name} must be finite.")
         values.append(0.0 if abs(value) <= 1e-12 else value)
     return values
 
@@ -3829,9 +5429,7 @@ def _inject_half_mesh_extras_into_gltf_tree(
         and "mesh" in raw_node
         and str(raw_node.get("name", "")).startswith(HALF_NODE_NAME_PREFIX)
     }
-    undeclared_names = (
-        prefixed_mesh_node_names - set(half_mesh_by_node_name)
-    )
+    undeclared_names = prefixed_mesh_node_names - set(half_mesh_by_node_name)
     if undeclared_names:
         raise ValueError(
             "The exported glTF has [HALF] mesh nodes without mirror metadata: "
@@ -3873,9 +5471,7 @@ def _inject_half_mesh_extras_into_gltf_tree(
         raw_node["extras"] = extras
         raw_mesh_extras = raw_mesh.get("extras")
         mesh_extras = (
-            dict(raw_mesh_extras)
-            if isinstance(raw_mesh_extras, Mapping)
-            else {}
+            dict(raw_mesh_extras) if isinstance(raw_mesh_extras, Mapping) else {}
         )
         mesh_extras[HALF_MESH_EXTRAS_KEY] = copy.deepcopy(dict(half_mesh))
         raw_mesh["extras"] = mesh_extras
@@ -3949,9 +5545,7 @@ def _build_multi_level_meshes(
 
     sorted_levels = sorted(levels, key=lambda level: level.index)
     level_lookup = {level.index: level for level in sorted_levels}
-    floor_base_z_by_level_index = build_level_floor_base_z_lookup(
-        sorted_levels
-    )
+    floor_base_z_by_level_index = build_level_floor_base_z_lookup(sorted_levels)
     base_z_by_level_index = build_level_base_z_lookup(sorted_levels)
     named_meshes: list[NamedMesh] = []
 
@@ -3995,17 +5589,12 @@ def _filter_stairs_for_export(
     exportable_stairs: list[StairData] = []
     for stair in stairs:
         route_levels = [
-            level_lookup.get(section.level_index)
-            for section in stair.sections
+            level_lookup.get(section.level_index) for section in stair.sections
         ]
         if any(level is None for level in route_levels):
             exportable_stairs.append(stair)
             continue
-        if all(
-            level.include_in_export
-            for level in route_levels
-            if level is not None
-        ):
+        if all(level.include_in_export for level in route_levels if level is not None):
             exportable_stairs.append(stair)
     return exportable_stairs
 
@@ -4114,8 +5703,7 @@ def _build_room_named_meshes(
     for room_index, room in enumerate(level.rooms):
         if room.height_meters <= 0.0:
             raise ValueError(
-                f"Room {room.name or room_index + 1} height must be greater "
-                "than zero."
+                f"Room {room.name or room_index + 1} height must be greater than zero."
             )
 
         room_mesh = _build_room_mesh(
@@ -4176,18 +5764,14 @@ def _build_level_meshes(
         end_vertex = vertex_lookup.get(edge.end_vertex_id)
         preferred_facing_normal_xy = (
             None
-            if wall_orientation is None
-            or start_vertex is None
-            or end_vertex is None
+            if wall_orientation is None or start_vertex is None or end_vertex is None
             else wall_orientation.resolve_image_wall_facing_normal(
                 (start_vertex.x, start_vertex.y),
                 (end_vertex.x, end_vertex.y),
             )
         )
         surface_id = (
-            None
-            if level is None
-            else _build_plain_wall_surface_id(level, edge)
+            None if level is None else _build_plain_wall_surface_id(level, edge)
         )
         wall_mesh = _build_wall_mesh(
             edge=edge,
@@ -4198,8 +5782,7 @@ def _build_level_meshes(
             doorway_openings=doorway_openings,
             preferred_facing_normal_xy=preferred_facing_normal_xy,
             manual_orientation_flip=(
-                surface_id is not None
-                and surface_id in level.flipped_surface_ids
+                surface_id is not None and surface_id in level.flipped_surface_ids
             ),
             double_sided=not authoritative_orientation,
         )
@@ -4246,9 +5829,7 @@ def _build_room_mesh(
                     wall.end_point,
                 )
             ),
-            manual_orientation_flip=(
-                surface_id in level.flipped_surface_ids
-            ),
+            manual_orientation_flip=(surface_id in level.flipped_surface_ids),
         )
         wall_placements = placements_by_key.get(wall.key, [])
         if not wall_placements:
@@ -4428,15 +6009,12 @@ def _paint_room_texture_wall(
     painter.translate(uv_x + uv_width / 2.0, uv_y + uv_height / 2.0)
     painter.rotate(placement.rotation_degrees)
     texture_data = room.wall_textures.get(placement.wall.key)
-    did_paint_texture = (
-        texture_data is not None
-        and paint_wall_texture_crop(
-            painter,
-            texture_data,
-            texture_rect,
-            placement.source_start_ratio,
-            placement.source_end_ratio,
-        )
+    did_paint_texture = texture_data is not None and paint_wall_texture_crop(
+        painter,
+        texture_data,
+        texture_rect,
+        placement.source_start_ratio,
+        placement.source_end_ratio,
     )
 
     if not did_paint_texture:
@@ -4539,15 +6117,12 @@ def _build_wall_preview_texture(
         max(1.0, texture_height - 1.0),
     )
     texture_data = room.wall_textures.get(placement.wall.key)
-    did_paint_texture = (
-        texture_data is not None
-        and paint_wall_texture_crop(
-            painter,
-            texture_data,
-            texture_rect,
-            placement.source_start_ratio,
-            placement.source_end_ratio,
-        )
+    did_paint_texture = texture_data is not None and paint_wall_texture_crop(
+        painter,
+        texture_data,
+        texture_rect,
+        placement.source_start_ratio,
+        placement.source_end_ratio,
     )
     if not did_paint_texture:
         painter.setPen(Qt.PenStyle.NoPen)
@@ -4632,13 +6207,10 @@ def _mask_wall_preview_texture(
     visible_path.setFillRule(Qt.FillRule.WindingFill)
     for wall_piece in wall_pieces:
         path = QPainterPath()
-        for point_index, (wall_ratio, height_meters) in enumerate(
-            wall_piece.points
-        ):
+        for point_index, (wall_ratio, height_meters) in enumerate(wall_piece.points):
             point_x = min(max(wall_ratio, 0.0), 1.0) * texture_width
             point_y = (
-                1.0
-                - min(max(height_meters / wall_height_meters, 0.0), 1.0)
+                1.0 - min(max(height_meters / wall_height_meters, 0.0), 1.0)
             ) * texture_height
             if point_index == 0:
                 path.moveTo(point_x, point_y)
@@ -4651,9 +6223,7 @@ def _mask_wall_preview_texture(
     mask_alpha = _qimage_to_gl_rgba_array(mask_image)[:, :, 3]
     masked_texture = texture_rgba.copy()
     masked_texture[:, :, 3] = (
-        masked_texture[:, :, 3].astype(np.uint16)
-        * mask_alpha.astype(np.uint16)
-        // 255
+        masked_texture[:, :, 3].astype(np.uint16) * mask_alpha.astype(np.uint16) // 255
     ).astype(np.uint8)
     return masked_texture
 
@@ -4836,9 +6406,7 @@ def _build_window_openings(
                 width_direction_y=width_direction_y,
                 depth_direction_x=depth_direction[0],
                 depth_direction_y=depth_direction[1],
-                half_width_pixels=(
-                    segment_length * (end_ratio - start_ratio) / 2.0
-                ),
+                half_width_pixels=(segment_length * (end_ratio - start_ratio) / 2.0),
                 half_depth_pixels=half_depth_pixels,
                 height_meters=opening_height,
                 bottom_height_meters=bottom_ratio * target.height_meters,
@@ -4909,15 +6477,12 @@ def _build_window_wall_target_lookup(
             f"{max(edge.start_vertex_id, edge.end_vertex_id)}"
         )
         surface_id = _build_plain_wall_surface_id(level, edge)
-        exterior_direction = (
-            wall_orientation.resolve_image_wall_exterior_direction(
-                (start_vertex.x, start_vertex.y),
-                (end_vertex.x, end_vertex.y),
-            )
-            or _get_wall_right_normal(
-                (start_vertex.x, start_vertex.y),
-                (end_vertex.x, end_vertex.y),
-            )
+        exterior_direction = wall_orientation.resolve_image_wall_exterior_direction(
+            (start_vertex.x, start_vertex.y),
+            (end_vertex.x, end_vertex.y),
+        ) or _get_wall_right_normal(
+            (start_vertex.x, start_vertex.y),
+            (end_vertex.x, end_vertex.y),
         )
         targets[surface_id] = WallSource(
             key=wall_key,
@@ -5034,8 +6599,7 @@ def _build_visible_wall_pieces(
     if not applicable_openings:
         return [WallPiece(points=full_wall_points)]
     if all(
-        _wall_opening_profile_is_rectangular(opening)
-        for opening in applicable_openings
+        _wall_opening_profile_is_rectangular(opening) for opening in applicable_openings
     ):
         return _build_visible_rectangular_wall_pieces(
             start_point,
@@ -5105,9 +6669,7 @@ def _build_visible_rectangular_wall_pieces(
             (interval[0], interval[1], opening_bottom, opening_top)
         )
     if not opening_intervals:
-        return [
-            _build_rectangular_wall_piece(0.0, 1.0, 0.0, wall_height_meters)
-        ]
+        return [_build_rectangular_wall_piece(0.0, 1.0, 0.0, wall_height_meters)]
 
     breakpoints = _get_opening_interval_breakpoints(opening_intervals)
     wall_pieces: list[WallPiece] = []
@@ -5118,8 +6680,12 @@ def _build_visible_rectangular_wall_pieces(
         covered_vertical_intervals = _merge_wall_opening_vertical_intervals(
             [
                 (opening_bottom, opening_top)
-                for opening_start, opening_end, opening_bottom, opening_top
-                in opening_intervals
+                for (
+                    opening_start,
+                    opening_end,
+                    opening_bottom,
+                    opening_top,
+                ) in opening_intervals
                 if opening_start - WALL_OPENING_EPSILON
                 <= interval_midpoint
                 <= opening_end + WALL_OPENING_EPSILON
@@ -5208,11 +6774,7 @@ def _build_opening_polygon_on_wall(
     projected_profile = Polygon(
         [
             (
-                (
-                    width_meters / PIXEL_TO_METER
-                    - start_width_position
-                )
-                / width_delta,
+                (width_meters / PIXEL_TO_METER - start_width_position) / width_delta,
                 opening.bottom_height_meters + height_meters,
             )
             for width_meters, height_meters in profile_points
@@ -5294,10 +6856,9 @@ def _triangulate_visible_wall_geometry(visible_geometry: object) -> list[WallPie
         for triangle in shapely.get_parts(triangles):
             if not isinstance(triangle, Polygon) or triangle.is_empty:
                 continue
-            if (
-                triangle.area <= WALL_OPENING_EPSILON
-                or not polygon_part.buffer(WALL_OPENING_EPSILON).covers(triangle)
-            ):
+            if triangle.area <= WALL_OPENING_EPSILON or not polygon_part.buffer(
+                WALL_OPENING_EPSILON
+            ).covers(triangle):
                 continue
             points = tuple(
                 (float(point_x), float(point_y))
@@ -5338,10 +6899,7 @@ def _merge_wall_opening_vertical_intervals(
 ) -> list[tuple[float, float]]:
     merged: list[tuple[float, float]] = []
     for interval_start, interval_end in sorted(intervals):
-        if (
-            merged
-            and interval_start <= merged[-1][1] + WALL_OPENING_EPSILON
-        ):
+        if merged and interval_start <= merged[-1][1] + WALL_OPENING_EPSILON:
             merged[-1] = (
                 merged[-1][0],
                 max(merged[-1][1], interval_end),
@@ -5385,9 +6943,7 @@ def _clip_wall_segment_to_opening(
             doorway_opening.half_depth_pixels,
         ),
     ):
-        start_projection = (
-            relative_start_x * axis_x + relative_start_y * axis_y
-        )
+        start_projection = relative_start_x * axis_x + relative_start_y * axis_y
         delta_projection = segment_delta_x * axis_x + segment_delta_y * axis_y
         if abs(delta_projection) <= WALL_OPENING_EPSILON:
             if abs(start_projection) > half_extent + WALL_OPENING_EPSILON:
@@ -5527,8 +7083,7 @@ def _build_level_wall_sources(
 
         for wall in build_room_walls(room, level.vertex_data):
             surface_id = (
-                f"level:{level.index}/room:{room.center_vertex_id}/"
-                f"wall:{wall.key}"
+                f"level:{level.index}/room:{room.center_vertex_id}/wall:{wall.key}"
             )
             _add_level_wall_source(
                 wall_sources_by_key,
@@ -5634,9 +7189,7 @@ def _build_single_wall_doorway_reveal_pair(
             low_width_position=low_width,
             high_width_position=high_width,
             depth_position=depth_position,
-            opening_bottom_height_meters=(
-                contact.opening_bottom_height_meters
-            ),
+            opening_bottom_height_meters=(contact.opening_bottom_height_meters),
             opening_top_height_meters=contact.opening_top_height_meters,
             wall_key=contact.wall_key,
             surface_id=contact.surface_id,
@@ -5772,12 +7325,8 @@ def _is_wall_source_parallel_to_doorway_width(
         return False
 
     width_alignment = abs(
-        (
-            wall_delta_x / wall_length * doorway_opening.width_direction_x
-        )
-        + (
-            wall_delta_y / wall_length * doorway_opening.width_direction_y
-        )
+        (wall_delta_x / wall_length * doorway_opening.width_direction_x)
+        + (wall_delta_y / wall_length * doorway_opening.width_direction_y)
     )
     return width_alignment >= WALL_REVEAL_PARALLEL_COSINE
 
@@ -5786,24 +7335,18 @@ def _get_doorway_width_position(
     point: tuple[float, float],
     doorway_opening: WallOpening,
 ) -> float:
-    return (
-        (point[0] - doorway_opening.center_x)
-        * doorway_opening.width_direction_x
-        + (point[1] - doorway_opening.center_y)
-        * doorway_opening.width_direction_y
-    )
+    return (point[0] - doorway_opening.center_x) * doorway_opening.width_direction_x + (
+        point[1] - doorway_opening.center_y
+    ) * doorway_opening.width_direction_y
 
 
 def _get_doorway_depth_position(
     point: tuple[float, float],
     doorway_opening: WallOpening,
 ) -> float:
-    return (
-        (point[0] - doorway_opening.center_x)
-        * doorway_opening.depth_direction_x
-        + (point[1] - doorway_opening.center_y)
-        * doorway_opening.depth_direction_y
-    )
+    return (point[0] - doorway_opening.center_x) * doorway_opening.depth_direction_x + (
+        point[1] - doorway_opening.center_y
+    ) * doorway_opening.depth_direction_y
 
 
 def _get_doorway_reveal_pair(
@@ -5872,10 +7415,7 @@ def _build_level_window_reveals(
     )
     reveals: list[WindowReveal] = []
     for opening in openings:
-        if (
-            opening.target_wall_key is None
-            or opening.target_surface_id is None
-        ):
+        if opening.target_wall_key is None or opening.target_surface_id is None:
             continue
         contacts = _build_doorway_reveal_contacts(
             wall_sources,
@@ -5999,9 +7539,10 @@ def _merge_contiguous_opening_contacts(
             previous.opening_top_height_meters,
             contact.opening_top_height_meters,
         )
-        same_depth = abs(
-            previous.depth_position - contact.depth_position
-        ) <= WINDOW_COPLANAR_DEPTH_PIXELS
+        same_depth = (
+            abs(previous.depth_position - contact.depth_position)
+            <= WINDOW_COPLANAR_DEPTH_PIXELS
+        )
         contiguous_width = (
             contact.low_width_position
             <= previous.high_width_position + WALL_OPENING_EPSILON
@@ -6022,9 +7563,7 @@ def _merge_contiguous_opening_contacts(
             previous.high_width_position,
             contact.high_width_position,
         )
-        depth_position = (
-            previous.depth_position + contact.depth_position
-        ) / 2.0
+        depth_position = (previous.depth_position + contact.depth_position) / 2.0
         merged[-1] = WallOpeningContact(
             source_key=f"{previous.source_key}+{contact.source_key}",
             low_width_point=_wall_opening_local_to_image(
@@ -6043,9 +7582,7 @@ def _merge_contiguous_opening_contacts(
             opening_bottom_height_meters=vertical_bottom,
             opening_top_height_meters=vertical_top,
             wall_key=(
-                previous.wall_key
-                if previous.wall_key == contact.wall_key
-                else None
+                previous.wall_key if previous.wall_key == contact.wall_key else None
             ),
             surface_id=(
                 previous.surface_id
@@ -6086,9 +7623,7 @@ def _append_doorway_reveal_geometry(
         reveal_pair=reveal_pair,
         base_z_meters=base_z_meters,
         blueprint_size_pixels=blueprint_size_pixels,
-        include_sill=(
-            opening.bottom_height_meters > WALL_OPENING_EPSILON
-        ),
+        include_sill=(opening.bottom_height_meters > WALL_OPENING_EPSILON),
     )
 
 
@@ -6161,10 +7696,7 @@ def _build_wall_opening_reveal_quads(
         reveal_pair.first_contact.opening_top_height_meters,
         reveal_pair.second_contact.opening_top_height_meters,
     )
-    if (
-        contact_top_height - contact_bottom_height
-        <= WALL_OPENING_EPSILON
-    ):
+    if contact_top_height - contact_bottom_height <= WALL_OPENING_EPSILON:
         return ()
 
     clipped_profiles = _clip_opening_profiles_to_reveal(
@@ -6189,10 +7721,8 @@ def _build_wall_opening_reveal_quads(
             second_width, second_height = second_profile_point
             if (
                 not include_sill
-                and abs(first_height - opening_floor_height)
-                <= WALL_OPENING_EPSILON
-                and abs(second_height - opening_floor_height)
-                <= WALL_OPENING_EPSILON
+                and abs(first_height - opening_floor_height) <= WALL_OPENING_EPSILON
+                and abs(second_height - opening_floor_height) <= WALL_OPENING_EPSILON
             ):
                 continue
             first_contact_start = _interpolate_wall_opening_contact(
@@ -6326,10 +7856,7 @@ def _get_opening_interval_breakpoints(
 
     breakpoints: list[float] = []
     for breakpoint in sorted(raw_breakpoints):
-        if (
-            not breakpoints
-            or breakpoint - breakpoints[-1] > WALL_OPENING_EPSILON
-        ):
+        if not breakpoints or breakpoint - breakpoints[-1] > WALL_OPENING_EPSILON:
             breakpoints.append(breakpoint)
 
     return breakpoints
@@ -6469,10 +7996,7 @@ def _build_room_wall_surface_id(
     room: RoomData,
     wall: RoomWall,
 ) -> str:
-    return (
-        f"level:{level.index}/room:{room.center_vertex_id}/"
-        f"wall:{wall.key}"
-    )
+    return f"level:{level.index}/room:{room.center_vertex_id}/wall:{wall.key}"
 
 
 def _wall_faces_require_winding_flip(
@@ -6685,8 +8209,7 @@ def _build_level_preview_textured_walls(
                                 (
                                     float(piece_start_xy[0]),
                                     float(piece_start_xy[1]),
-                                    base_z_meters
-                                    + wall_piece.bottom_height_meters,
+                                    base_z_meters + wall_piece.bottom_height_meters,
                                 ),
                                 source_transform,
                             ),
@@ -6694,8 +8217,7 @@ def _build_level_preview_textured_walls(
                                 (
                                     float(piece_end_xy[0]),
                                     float(piece_end_xy[1]),
-                                    base_z_meters
-                                    + wall_piece.bottom_height_meters,
+                                    base_z_meters + wall_piece.bottom_height_meters,
                                 ),
                                 source_transform,
                             ),
@@ -6809,9 +8331,7 @@ def _get_valid_level_floor_thickness(level: LevelData) -> float:
 def _get_valid_level_offset(level: LevelData, axis: str) -> float:
     raw_offset = getattr(level, f"offset_{axis}_meters")
     if isinstance(raw_offset, bool):
-        raise ValueError(
-            f"Level {level.index} {axis} offset must be a finite number."
-        )
+        raise ValueError(f"Level {level.index} {axis} offset must be a finite number.")
 
     try:
         offset = float(raw_offset)
@@ -6821,9 +8341,7 @@ def _get_valid_level_offset(level: LevelData, axis: str) -> float:
         ) from error
 
     if not math.isfinite(offset):
-        raise ValueError(
-            f"Level {level.index} {axis} offset must be a finite number."
-        )
+        raise ValueError(f"Level {level.index} {axis} offset must be a finite number.")
 
     return offset
 
@@ -6902,8 +8420,7 @@ def _get_room_object_name(
     room_index: int,
 ) -> str:
     return (
-        f"{_get_level_object_name(level)}_"
-        f"{_slugify_name(room.name)}_{room_index + 1}"
+        f"{_get_level_object_name(level)}_{_slugify_name(room.name)}_{room_index + 1}"
     )
 
 
@@ -7020,6 +8537,38 @@ def _point_to_world_xy(
 
 
 # ### Mesh helpers ###
+def _combine_preview_mesh_geometry(
+    meshes: Sequence[trimesh.Trimesh],
+) -> trimesh.Trimesh:
+    """Join preview geometry with exact authored stair face ranges.
+
+    The ordinary join is also used for exported primitives, so this
+    preview-only wrapper avoids introducing new glTF node extras.
+    """
+
+    combined = _combine_mesh_geometry(meshes)
+    face_ranges: list[tuple[int, int, str]] = []
+    face_offset = 0
+    for mesh in meshes:
+        face_count = len(mesh.faces)
+        if not face_count or not len(mesh.vertices):
+            continue
+        metadata = getattr(mesh, "metadata", {})
+        nested_ranges = metadata.get("_housemaker_preview_stair_face_ranges", ())
+        if nested_ranges:
+            face_ranges.extend(
+                (face_offset + int(start), face_offset + int(end), str(stair_id))
+                for start, end, stair_id in nested_ranges
+            )
+        else:
+            stair_id = metadata.get("housemaker_stair_id")
+            if isinstance(stair_id, str) and stair_id:
+                face_ranges.append((face_offset, face_offset + face_count, stair_id))
+        face_offset += face_count
+    combined.metadata["_housemaker_preview_stair_face_ranges"] = tuple(face_ranges)
+    return combined
+
+
 def _combine_mesh_geometry(meshes: Sequence[trimesh.Trimesh]) -> trimesh.Trimesh:
     vertices: list[np.ndarray] = []
     faces: list[np.ndarray] = []
@@ -7047,7 +8596,6 @@ def _combine_mesh_geometry(meshes: Sequence[trimesh.Trimesh]) -> trimesh.Trimesh
 # ### Text helpers ###
 def _slugify_name(name: str) -> str:
     normalized_name = "".join(
-        character.lower() if character.isalnum() else "_"
-        for character in name.strip()
+        character.lower() if character.isalnum() else "_" for character in name.strip()
     ).strip("_")
     return normalized_name or "room"

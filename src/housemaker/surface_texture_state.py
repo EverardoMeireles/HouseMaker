@@ -21,7 +21,6 @@ from housemaker.pbr_maps import (
 )
 from housemaker.video_source import VideoMetadata
 
-
 # ### Constants ###
 SURFACE_TEXTURE_SCHEMA_VERSION = 9
 SURFACE_PBR_ALIGNMENT_VERSION = 1
@@ -35,6 +34,12 @@ SURFACE_TYPES = frozenset(
         SURFACE_TYPE_CEILING,
     }
 )
+STAIR_PART_SURFACE_TYPES = {
+    "treads": SURFACE_TYPE_FLOOR,
+    "support": SURFACE_TYPE_WALL,
+    "risers": SURFACE_TYPE_WALL,
+    "stringers": SURFACE_TYPE_WALL,
+}
 MAX_VIDEO_FRAME_INDEX = 2_147_483_647
 MAX_MASKED_FRAMES = 100_000
 MAX_SELECTED_SURFACES = 10_000
@@ -52,13 +57,18 @@ MAX_TEXTURE_DIMENSION_PIXELS = 16_384
 SURFACE_TEXTURE_RESOLUTIONS = (512, 1024, 2048)
 DEFAULT_SURFACE_TEXTURE_RESOLUTION = 1024
 _SURFACE_ID_PATTERN = re.compile(
-    r"^level:(?P<level_index>0|[1-9]\d*)/"
+    r"(?:"
+    r"level:(?P<level_index>0|[1-9]\d*)/"
     r"(?:"
     r"(?:room:(?P<room_identity>0|[1-9]\d*)/)?"
     r"(?:(?P<wall>wall):(?P<wall_key>[1-9]\d*:[1-9]\d*)|"
     r"(?P<plane>floor|ceiling))|"
     r"edit-face:(?P<edit_face_id>[0-9a-f]{32}):"
     r"(?P<edit_face_type>wall|floor|ceiling)"
+    r")|"
+    r"stair:(?P<stair_id>[0-9a-f]{32})/"
+    r"part:(?P<stair_part>treads|support|risers|stringers):"
+    r"(?P<stair_surface_type>wall|floor)"
     r")$"
 )
 _LEGACY_SURFACE_OVERLAY_ID_PATTERN = re.compile(r"/overlay:[1-9]\d*$")
@@ -429,7 +439,10 @@ class SurfaceTextureData:
             VideoMetadata,
         ):
             raise ValueError("Surface texture video metadata has an invalid type.")
-        if self.camera_pose is not None and not isinstance(self.camera_pose, CameraPose):
+        if self.camera_pose is not None and not isinstance(
+            self.camera_pose,
+            CameraPose,
+        ):
             raise ValueError("Surface texture camera pose has an invalid type.")
 
         current_frame_index = _normalize_frame_index(self.current_frame_index)
@@ -496,7 +509,9 @@ class SurfaceTextureData:
                 normalized_index not in self.frame_strokes
                 and len(self.frame_strokes) >= MAX_MASKED_FRAMES
             ):
-                raise ValueError("Surface texture data contains too many masked frames.")
+                raise ValueError(
+                    "Surface texture data contains too many masked frames."
+                )
             self.frame_strokes[normalized_index] = normalized_strokes
         else:
             self.frame_strokes.pop(normalized_index, None)
@@ -513,7 +528,10 @@ class SurfaceTextureData:
         self.selected_surface_type = normalized_type
         self.selected_surface_ids = normalized_ids
 
-    def assignments_for_surface(self, surface_id: str) -> list[SurfaceTextureAssignment]:
+    def assignments_for_surface(
+        self,
+        surface_id: str,
+    ) -> list[SurfaceTextureAssignment]:
         normalized_id = _normalize_surface_id(surface_id)
         return [
             assignment
@@ -740,7 +758,9 @@ def _normalize_frame_strokes(raw_strokes: object) -> list[MaskStroke]:
     try:
         strokes = list(raw_strokes)  # type: ignore[arg-type]
     except TypeError as error:
-        raise ValueError("Surface texture frame strokes must contain a list.") from error
+        raise ValueError(
+            "Surface texture frame strokes must contain a list."
+        ) from error
     if len(strokes) > MAX_MASK_STROKES_PER_FRAME:
         raise ValueError("A surface texture frame contains too many mask strokes.")
     if not all(isinstance(stroke, MaskStroke) for stroke in strokes):
@@ -812,7 +832,15 @@ def _normalize_surface_id(surface_id: object) -> str:
     normalized_id = str(surface_id).strip()
     if not normalized_id or len(normalized_id) > MAX_SURFACE_ID_LENGTH:
         raise ValueError("Surface ID is empty or too long.")
-    if _SURFACE_ID_PATTERN.fullmatch(normalized_id) is None:
+    match = _SURFACE_ID_PATTERN.fullmatch(normalized_id)
+    if match is None:
+        raise ValueError(f"Invalid fixed-surface ID: {normalized_id!r}.")
+    stair_part = match.group("stair_part")
+    if (
+        stair_part is not None
+        and match.group("stair_surface_type")
+        != STAIR_PART_SURFACE_TYPES[stair_part]
+    ):
         raise ValueError(f"Invalid fixed-surface ID: {normalized_id!r}.")
     return normalized_id
 
@@ -829,6 +857,9 @@ def _surface_type_for_id(surface_id: str) -> str:
     edit_face_type = match.group("edit_face_type")
     if edit_face_type is not None:
         return str(edit_face_type)
+    stair_surface_type = match.group("stair_surface_type")
+    if stair_surface_type is not None:
+        return str(stair_surface_type)
     return SURFACE_TYPE_WALL if match.group("wall") else str(match.group("plane"))
 
 
@@ -836,7 +867,9 @@ def _infer_surface_type(surface_ids: object) -> str:
     try:
         first_surface_id = next(iter(surface_ids))  # type: ignore[arg-type]
     except (StopIteration, TypeError) as error:
-        raise ValueError("A surface type cannot be inferred without surfaces.") from error
+        raise ValueError(
+            "A surface type cannot be inferred without surfaces."
+        ) from error
     return _surface_type_for_id(_normalize_surface_id(first_surface_id))
 
 

@@ -22,6 +22,7 @@ from housemaker.glb import (
     Z_UP_TO_GLTF_Y_UP_TRANSFORM,
     GeneratedModel,
     PlacedGeneratedModel,
+    PreviewStairPart,
     compose_placed_generated_models,
     compose_placed_generated_models_preview,
     convert_to_glb,
@@ -176,6 +177,29 @@ class GlbPreviewConversionTests(unittest.TestCase):
 
 # ### Preview composition tests ###
 class GlbPreviewCompositionTests(unittest.TestCase):
+    def test_placed_preview_preserves_base_stair_part_targets(self) -> None:
+        base = convert_to_preview_model([_build_room_level()])
+        stair_part = PreviewStairPart(
+            stair_id="a" * 32,
+            stair_index=0,
+            semantic_id=f"stair:{'a' * 32}/part:treads:floor",
+            part_kind="treads",
+            surface_type="floor",
+            mesh=trimesh.creation.box(extents=(1.0, 1.0, 0.1)),
+            level_indices=(2, 3),
+        )
+        base.preview_stair_parts = [stair_part]
+        placement = PlacedGeneratedModel(
+            object_id="chair",
+            model=_build_textured_object_model(),
+            world_position=(1.0, 2.0, 0.0),
+        )
+
+        preview = compose_placed_generated_models_preview(base, [placement])
+
+        self.assertEqual(len(preview.preview_stair_parts), 1)
+        self.assertIs(preview.preview_stair_parts[0], stair_part)
+
     def test_placed_preview_matches_export_without_serializing(self) -> None:
         level = _build_room_level()
         object_model = _build_textured_object_model()

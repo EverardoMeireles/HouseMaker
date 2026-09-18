@@ -118,7 +118,9 @@ class SurfaceTextureStateRoundTripTests(unittest.TestCase):
             [_assignment()],
         )
 
-    def test_multi_frame_strokes_are_isolated_and_empty_frames_are_removed(self) -> None:
+    def test_multi_frame_strokes_are_isolated_and_empty_frames_are_removed(
+        self,
+    ) -> None:
         state = SurfaceTextureData(video_metadata=_video(3))
 
         state.set_frame_strokes(0, [_stroke(0.2)])
@@ -134,7 +136,9 @@ class SurfaceTextureStateRoundTripTests(unittest.TestCase):
 
 # ### Selection tests ###
 class SurfaceTextureSelectionTests(unittest.TestCase):
-    def test_selection_accepts_exact_geometry_ids_and_deduplicates_in_order(self) -> None:
+    def test_selection_accepts_exact_geometry_ids_and_deduplicates_in_order(
+        self,
+    ) -> None:
         state = SurfaceTextureData()
 
         state.set_selection(
@@ -185,6 +189,45 @@ class SurfaceTextureSelectionTests(unittest.TestCase):
 
                 self.assertEqual(state.selected_surface_type, surface_type)
                 self.assertEqual(state.selected_surface_ids, (surface_id,))
+
+    def test_selection_accepts_stable_stair_part_ids(self) -> None:
+        stair_id = "0123456789abcdef" * 2
+        for surface_type, part_kind in (
+            (SURFACE_TYPE_FLOOR, "treads"),
+            (SURFACE_TYPE_WALL, "support"),
+            (SURFACE_TYPE_WALL, "risers"),
+            (SURFACE_TYPE_WALL, "stringers"),
+        ):
+            with self.subTest(part_kind=part_kind):
+                surface_id = (
+                    f"stair:{stair_id}/part:{part_kind}:{surface_type}"
+                )
+                state = SurfaceTextureData(
+                    selected_surface_type=None,
+                    selected_surface_ids=(surface_id,),
+                )
+
+                self.assertEqual(state.selected_surface_type, surface_type)
+                self.assertEqual(state.selected_surface_ids, (surface_id,))
+
+    def test_selection_rejects_malformed_stair_part_ids(self) -> None:
+        stair_id = "a" * 32
+        invalid_surface_ids = (
+            f"stair:{'a' * 31}/part:treads:floor",
+            f"stair:{'A' * 32}/part:treads:floor",
+            f"stair:{stair_id}/part:treads:wall",
+            f"stair:{stair_id}/part:unknown:wall",
+            f"stair:{stair_id}/part:left_stringer:wall",
+            f"stair:{stair_id}/part:right_stringer:wall",
+            f"stair:{stair_id}/part:left-stringer:wall",
+        )
+        for surface_id in invalid_surface_ids:
+            with self.subTest(surface_id=surface_id):
+                with self.assertRaises(ValueError):
+                    SurfaceTextureData(
+                        selected_surface_type=SURFACE_TYPE_WALL,
+                        selected_surface_ids=(surface_id,),
+                    )
 
     def test_selection_rejects_malformed_edited_face_ids(self) -> None:
         invalid_surface_ids = (
@@ -288,7 +331,10 @@ class SurfaceTextureAssignmentTests(unittest.TestCase):
         )
 
         self.assertEqual(assignment.asset_path, "textures/floor.png")
-        self.assertEqual((assignment.texture_width, assignment.texture_height), (512, 256))
+        self.assertEqual(
+            (assignment.texture_width, assignment.texture_height),
+            (512, 256),
+        )
         self.assertEqual(assignment.texture_variants, ())
         self.assertIsNone(assignment.selected_texture_resolution)
 
@@ -428,7 +474,10 @@ class SurfaceTextureAssignmentTests(unittest.TestCase):
         self.assertEqual(assignment.surface_type, SURFACE_TYPE_CEILING)
         self.assertEqual(assignment.asset_path, "textures/ceiling.png")
         self.assertEqual(assignment.reference_frame_indices, (4, 6))
-        self.assertEqual((assignment.texture_width, assignment.texture_height), (512, 256))
+        self.assertEqual(
+            (assignment.texture_width, assignment.texture_height),
+            (512, 256),
+        )
 
     def test_unused_assignment_round_trips_with_no_surface_ids(self) -> None:
         assignment = SurfaceTextureAssignment(
@@ -447,7 +496,9 @@ class SurfaceTextureAssignmentTests(unittest.TestCase):
         self.assertEqual(restored.assignments[0].assignment_id, "unused-stone")
         self.assertEqual(restored.assignments[0].surface_ids, ())
 
-    def test_assignment_rejects_unsafe_assets_invalid_area_and_partial_dimensions(self) -> None:
+    def test_assignment_rejects_unsafe_assets_invalid_area_and_partial_dimensions(
+        self,
+    ) -> None:
         base_arguments = {
             "assignment_id": "texture-1",
             "surface_type": SURFACE_TYPE_FLOOR,
@@ -548,7 +599,9 @@ class SurfaceTextureDefensiveLoadingTests(unittest.TestCase):
         self.assertEqual(loaded.selected_surface_type, SURFACE_TYPE_FLOOR)
         self.assertEqual(loaded.assignments, [_assignment()])
 
-    def test_malformed_optional_records_fall_back_without_losing_valid_records(self) -> None:
+    def test_malformed_optional_records_fall_back_without_losing_valid_records(
+        self,
+    ) -> None:
         valid_assignment = _assignment().to_dict()
         duplicate_assignment = _assignment().to_dict()
         malformed_assignment = _assignment().to_dict() | {
