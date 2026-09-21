@@ -66,6 +66,7 @@ from housemaker.surface_texture_providers import (
     request_surface_texture,
 )
 from housemaker.surface_texture_state import (
+    DEFAULT_TEXTURE_REPEAT_SIZE_M,
     SURFACE_PBR_ALIGNMENT_VERSION,
     SURFACE_TILING_MODE_EDGE_VARIANTS,
     SURFACE_TILING_MODE_NONE,
@@ -927,13 +928,23 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             if base_path is None:
                 continue
             source: Path | dict[str, Path] | SurfaceMaterialSourceSpec
-            if assignment.tiling_mode == SURFACE_TILING_MODE_NONE:
+            if (
+                assignment.tiling_mode == SURFACE_TILING_MODE_NONE
+                and assignment.texture_repeat_size_m
+                == DEFAULT_TEXTURE_REPEAT_SIZE_M
+            ):
                 source = base_path if len(map_paths) == 1 else map_paths
             else:
                 source = SurfaceMaterialSourceSpec(
                     map_sources=map_paths,
                     tiling_mode=assignment.tiling_mode,
                     tiling_seed=assignment.tiling_seed,
+                    texture_repeat_size_m=(
+                        None
+                        if assignment.texture_repeat_size_m
+                        == DEFAULT_TEXTURE_REPEAT_SIZE_M
+                        else assignment.texture_repeat_size_m
+                    ),
                 )
             for surface_id in assignment.surface_ids:
                 material_sources[surface_id] = source
@@ -975,6 +986,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                     assignment.surface_ids,
                     assignment.tiling_mode,
                     assignment.tiling_seed,
+                    assignment.texture_repeat_size_m,
                 )
             )
         return tuple(signature)
@@ -1412,6 +1424,30 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         """Return every immutable generated-surface assignment."""
 
         return tuple(self._data.assignments)
+
+    def set_assignment_texture_repeat_size(
+        self,
+        assignment_id: str,
+        repeat_size_m: float,
+    ) -> bool:
+        """Change one texture family's metres-per-repeat without editing its PNG."""
+
+        normalized_id = str(assignment_id).strip()
+        for index, assignment in enumerate(self._data.assignments):
+            if assignment.assignment_id != normalized_id:
+                continue
+            replacement = replace(
+                assignment,
+                texture_repeat_size_m=repeat_size_m,
+            )
+            if replacement == assignment:
+                return False
+            self._data.assignments[index] = replacement
+            self._invalidate_assignment_caches()
+            self._emit_data_changed()
+            self.surface_content_changed.emit()
+            return True
+        return False
 
     def snapshot_assignments(self) -> tuple[SurfaceTextureAssignment, ...]:
         """Return a lightweight immutable snapshot for Canvas undo history."""

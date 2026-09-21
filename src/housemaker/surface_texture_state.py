@@ -22,7 +22,7 @@ from housemaker.pbr_maps import (
 from housemaker.video_source import VideoMetadata
 
 # ### Constants ###
-SURFACE_TEXTURE_SCHEMA_VERSION = 9
+SURFACE_TEXTURE_SCHEMA_VERSION = 10
 SURFACE_PBR_ALIGNMENT_VERSION = 1
 SURFACE_TYPE_WALL = "wall"
 SURFACE_TYPE_FLOOR = "floor"
@@ -66,6 +66,7 @@ MAX_COMBINED_AREA_M2 = 1_000_000_000.0
 MAX_TEXTURE_DIMENSION_PIXELS = 16_384
 SURFACE_TEXTURE_RESOLUTIONS = (512, 1024, 2048)
 DEFAULT_SURFACE_TEXTURE_RESOLUTION = 1024
+DEFAULT_TEXTURE_REPEAT_SIZE_M = 2.0
 _SURFACE_ID_PATTERN = re.compile(
     r"(?:"
     r"level:(?P<level_index>0|[1-9]\d*)/"
@@ -176,6 +177,7 @@ class SurfaceTextureAssignment:
     pbr_alignment_version: int = 0
     tiling_mode: str = SURFACE_TILING_MODE_NONE
     tiling_seed: int = 0
+    texture_repeat_size_m: float = DEFAULT_TEXTURE_REPEAT_SIZE_M
 
     def __post_init__(self) -> None:
         assignment_id = _normalize_required_text(
@@ -256,6 +258,9 @@ class SurfaceTextureAssignment:
             raise ValueError(
                 "Surface texture tiling seed must be a nonnegative integer."
             )
+        texture_repeat_size_m = _normalize_texture_repeat_size_m(
+            self.texture_repeat_size_m
+        )
         selected_texture_resolution = _normalize_selected_texture_resolution(
             self.selected_texture_resolution,
             texture_variants,
@@ -318,6 +323,7 @@ class SurfaceTextureAssignment:
             "pbr_alignment_version",
             int(self.pbr_alignment_version),
         )
+        object.__setattr__(self, "texture_repeat_size_m", texture_repeat_size_m)
 
     def texture_variant_for_resolution(
         self,
@@ -364,6 +370,7 @@ class SurfaceTextureAssignment:
             "pbr_alignment_version": self.pbr_alignment_version,
             "tiling_mode": self.tiling_mode,
             "tiling_seed": self.tiling_seed,
+            "texture_repeat_size_m": self.texture_repeat_size_m,
         }
 
     @classmethod
@@ -446,6 +453,10 @@ class SurfaceTextureAssignment:
             pbr_alignment_version=payload.get("pbr_alignment_version", 0),
             tiling_mode=payload.get("tiling_mode", SURFACE_TILING_MODE_NONE),
             tiling_seed=payload.get("tiling_seed", 0),
+            texture_repeat_size_m=payload.get(
+                "texture_repeat_size_m",
+                DEFAULT_TEXTURE_REPEAT_SIZE_M,
+            ),
         )
 
 
@@ -951,6 +962,20 @@ def _normalize_combined_area(value: object) -> float:
     if not math.isfinite(area) or not 0.0 <= area <= MAX_COMBINED_AREA_M2:
         raise ValueError("Combined surface area is outside the supported range.")
     return area
+
+
+def _normalize_texture_repeat_size_m(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError("Texture repeat size must be a positive number of metres.")
+    try:
+        repeat_size = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            "Texture repeat size must be a positive number of metres."
+        ) from error
+    if not math.isfinite(repeat_size) or repeat_size <= 0.0:
+        raise ValueError("Texture repeat size must be a positive number of metres.")
+    return repeat_size
 
 
 def _normalize_texture_dimensions(

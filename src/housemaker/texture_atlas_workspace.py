@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QComboBox,
+    QDoubleSpinBox,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -171,6 +172,9 @@ ATLAS_STORAGE_SIZE_TOOLTIP = (
 BYTES_PER_KILOBYTE = 1_000
 BYTES_PER_MEGABYTE = 1_000_000
 MAXIMUM_DISPLAYED_KILOBYTES = 999.0
+DEFAULT_SURFACE_TEXTURE_REPEAT_SIZE_M = 2.0
+MIN_SURFACE_TEXTURE_REPEAT_SIZE_M = 0.25
+MAX_SURFACE_TEXTURE_REPEAT_SIZE_M = 20.0
 
 
 # ### Public texture-source model ###
@@ -182,6 +186,7 @@ class AtlasSurfaceTextureEntry:
     display_name: str
     surface_usage_count: int
     surface_type: str = "surface"
+    texture_repeat_size_m: float = DEFAULT_SURFACE_TEXTURE_REPEAT_SIZE_M
 
     def __post_init__(self) -> None:
         source_id = str(self.source_id).strip()
@@ -200,9 +205,18 @@ class AtlasSurfaceTextureEntry:
             or usage_count < 0
         ):
             raise ValueError("Atlas surface usage count cannot be negative.")
+        repeat_size = self.texture_repeat_size_m
+        if (
+            isinstance(repeat_size, bool)
+            or not isinstance(repeat_size, (int, float))
+            or not math.isfinite(repeat_size)
+            or repeat_size <= 0.0
+        ):
+            raise ValueError("Atlas surface texture repeat size must be positive.")
         object.__setattr__(self, "source_id", source_id)
         object.__setattr__(self, "display_name", display_name)
         object.__setattr__(self, "surface_type", surface_type)
+        object.__setattr__(self, "texture_repeat_size_m", float(repeat_size))
 
 
 @dataclass(frozen=True, eq=False)
@@ -1907,6 +1921,7 @@ class TextureAtlasWorkspace(QWidget):
     object_texture_resolution_changed = Signal(str, int)
     object_texture_selected = Signal(str)
     surface_texture_selected = Signal(str)
+    surface_texture_repeat_size_changed = Signal(str, float)
     object_place_requested = Signal(str)
     object_delete_requested = Signal(str)
     surface_assign_requested = Signal(str)
@@ -1938,6 +1953,7 @@ class TextureAtlasWorkspace(QWidget):
             str,
             AtlasSurfaceTextureEntry,
         ] = {}
+        self._repeat_size_editor_source_id: str | None = None
         self._scene_texture_source_ids: tuple[str, ...] = ()
         self._scene_bound_source_ids: frozenset[str] = frozenset()
         self._green_outline_source_ids: frozenset[str] = frozenset()
@@ -4109,6 +4125,34 @@ class TextureAtlasWorkspace(QWidget):
             self.remove_selected_texture_from_atlas
         )
 
+        repeat_size_row = QHBoxLayout()
+        self.surface_texture_repeat_size_label = QLabel("Texture repeat size")
+        self.surface_texture_repeat_size_label.setObjectName(
+            "texture_atlas_surface_repeat_size_label"
+        )
+        repeat_size_row.addWidget(self.surface_texture_repeat_size_label)
+        self.surface_texture_repeat_size_spin = QDoubleSpinBox()
+        self.surface_texture_repeat_size_spin.setObjectName(
+            "texture_atlas_surface_repeat_size_spin"
+        )
+        self.surface_texture_repeat_size_spin.setRange(
+            MIN_SURFACE_TEXTURE_REPEAT_SIZE_M,
+            MAX_SURFACE_TEXTURE_REPEAT_SIZE_M,
+        )
+        self.surface_texture_repeat_size_spin.setDecimals(2)
+        self.surface_texture_repeat_size_spin.setSingleStep(0.25)
+        self.surface_texture_repeat_size_spin.setSuffix(" m")
+        self.surface_texture_repeat_size_spin.setToolTip(
+            "World-space width and height of one texture repeat on all surfaces "
+            "using this texture. Smaller values make the pattern repeat more "
+            "often without resizing its image."
+        )
+        self.surface_texture_repeat_size_spin.editingFinished.connect(
+            self._apply_selected_surface_texture_repeat_size
+        )
+        repeat_size_row.addWidget(self.surface_texture_repeat_size_spin)
+        texture_column_layout.addLayout(repeat_size_row)
+
         self.fix_tiling_button = QPushButton("Fix tiling")
         self.fix_tiling_button.setObjectName("texture_atlas_fix_tiling_button")
         self.fix_tiling_button.setToolTip(
@@ -5096,6 +5140,24 @@ class TextureAtlasWorkspace(QWidget):
             return
         self.surface_texture_fix_tiling_requested.emit(source_id)
 
+    def _apply_selected_surface_texture_repeat_size(self) -> None:
+        """Publish one committed metre-per-repeat edit for the active texture."""
+
+        source_id = self.selected_surface_texture_id
+        if source_id is None or source_id != self._repeat_size_editor_source_id:
+            return
+        entry = self._surface_texture_entries_by_id.get(source_id)
+        if entry is None:
+            return
+        repeat_size_m = self.surface_texture_repeat_size_spin.value()
+        if math.isclose(repeat_size_m, entry.texture_repeat_size_m, abs_tol=0.005):
+            return
+        self._surface_texture_entries_by_id[source_id] = replace(
+            entry,
+            texture_repeat_size_m=repeat_size_m,
+        )
+        self.surface_texture_repeat_size_changed.emit(source_id, repeat_size_m)
+
     def _handle_object_drop(self, object_id: str, x: int, y: int) -> None:
         """Place one dragged exact source without moving other allocations."""
 
@@ -5686,6 +5748,27 @@ class TextureAtlasWorkspace(QWidget):
         self.fix_tiling_button.setEnabled(
             self._active_source_kind == "surface" and source is not None
         )
+        self._sync_surface_repeat_size_editor()
+
+    def _sync_surface_repeat_size_editor(self) -> None:
+        """Reflect the selected assignment without publishing programmatic edits."""
+
+        source_id = self.selected_surface_texture_id
+        entry = (
+            None
+            if source_id is None
+            else self._surface_texture_entries_by_id.get(source_id)
+        )
+        self.surface_texture_repeat_size_spin.setEnabled(entry is not None)
+        next_source_id = None if entry is None else source_id
+        selection_changed = next_source_id != self._repeat_size_editor_source_id
+        self._repeat_size_editor_source_id = next_source_id
+        if selection_changed or not self.surface_texture_repeat_size_spin.hasFocus():
+            self.surface_texture_repeat_size_spin.setValue(
+                DEFAULT_SURFACE_TEXTURE_REPEAT_SIZE_M
+                if entry is None
+                else entry.texture_repeat_size_m
+            )
 
     def _refresh_atlas_storage_sizes(self) -> None:
         """Refresh selected and project-wide Atlas PNG disk footprints."""

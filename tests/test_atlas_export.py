@@ -38,10 +38,11 @@ from housemaker.pbr_maps import (
     PBR_MAP_ROUGHNESS,
 )
 from housemaker.surface_geometry import build_fixed_surfaces
+from housemaker.surface_materials import SurfaceMaterialSourceSpec
 from housemaker.texture_atlas_state import (
     ATLAS_PACKING_MODE_FULL,
-    ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
     ATLAS_PACKING_MODE_SYMMETRIC_PAIR,
+    ATLAS_PACKING_MODE_SYMMETRIC_QUARTER,
     ATLAS_PACKING_MODE_SYMMETRIC_SQUARE_PAIR,
     ATLAS_SLOT_HALF_LEFT,
     ATLAS_SLOT_HALF_RIGHT,
@@ -296,7 +297,9 @@ def _assert_direct_half_mesh_nodes(
             raise AssertionError("The half-mesh mirror plane is invalid.")
 
 
-def _architectural_surface_model() -> tuple[GeneratedModel, tuple[str, ...]]:
+def _architectural_surface_model(
+    *, texture_repeat_size_m: float | None = None
+) -> tuple[GeneratedModel, tuple[str, ...]]:
     vertex_data = VertexData()
     boundary_ids = tuple(
         vertex_data.add_vertex(*point).id
@@ -341,11 +344,19 @@ def _architectural_surface_model() -> tuple[GeneratedModel, tuple[str, ...]]:
     )
     texture_buffer.seek(0)
     texture_png = texture_buffer.read()
+    material_source = (
+        texture_png
+        if texture_repeat_size_m is None
+        else SurfaceMaterialSourceSpec(
+            map_sources={ATLAS_MAP_BASE_COLOR: texture_png},
+            texture_repeat_size_m=texture_repeat_size_m,
+        )
+    )
     return (
         convert_to_glb(
             [level],
             surface_materials={
-                surface_id: texture_png for surface_id in selected_ids
+                surface_id: material_source for surface_id in selected_ids
             },
         ),
         selected_ids,
@@ -713,6 +724,71 @@ class TextureAtlasExportTests(unittest.TestCase):
             ),
             1,
         )
+
+    def test_surface_repeat_size_survives_atlas_uv_remapping(self) -> None:
+        source_id = "surface-texture:room"
+        atlas = TextureAtlasRecord(
+            atlas_id="architecture-repeat",
+            name="Architecture repeat",
+            resolution=2048,
+            placements=[
+                TextureAtlasPlacement(
+                    object_id=source_id,
+                    texture_path="room.png",
+                    texture_resolution=512,
+                    x=0,
+                    y=0,
+                    size=512,
+                )
+            ],
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            materialized = MaterializedTextureAtlas(
+                atlas,
+                _write_atlas_maps(Path(temporary_directory), 2048),
+                active_map_types=frozenset({ATLAS_MAP_BASE_COLOR}),
+            )
+            exported = {}
+            for repeat_size in (2.0, 0.5):
+                model, surface_ids = _architectural_surface_model(
+                    texture_repeat_size_m=repeat_size
+                )
+                exported[repeat_size] = apply_texture_atlases_to_export(
+                    model,
+                    (materialized,),
+                    surface_source_ids={
+                        surface_id: source_id for surface_id in surface_ids
+                    },
+                )
+
+        meshes = {}
+        for repeat_size, result in exported.items():
+            meshes[repeat_size] = next(
+                mesh
+                for mesh in result.scene.geometry.values()
+                if getattr(getattr(mesh.visual, "material", None), "name", None)
+                == atlas.name
+            )
+            uv = np.asarray(meshes[repeat_size].visual.uv)
+            self.assertTrue(np.all(uv[:, 0] >= -1e-8))
+            self.assertTrue(np.all(uv[:, 0] <= 512 / 2048 + 1e-8))
+            self.assertTrue(np.all(uv[:, 1] >= 1 - 512 / 2048 - 1e-8))
+            self.assertTrue(np.all(uv[:, 1] <= 1 + 1e-8))
+            self.assertEqual(
+                meshes[repeat_size].visual.material.baseColorTexture.size,
+                (2048, 2048),
+            )
+            loaded_meshes = _load_glb_z_up_meshes(result.glb_bytes)
+            loaded_atlas = next(
+                mesh
+                for mesh in loaded_meshes
+                if getattr(getattr(mesh.visual, "material", None), "name", None)
+                == atlas.name
+            )
+            self.assertEqual(len(loaded_atlas.faces), len(meshes[repeat_size].faces))
+
+        self.assertGreater(len(meshes[0.5].faces), len(meshes[2.0].faces))
+        self.assertAlmostEqual(meshes[0.5].area, meshes[2.0].area)
 
     def test_nested_plain_wall_winding_survives_direct_and_atlas_export(
         self,

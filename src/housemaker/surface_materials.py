@@ -42,11 +42,12 @@ SurfaceTextureSource = bytes | bytearray | memoryview | str | Path
 
 @dataclass(frozen=True)
 class SurfaceMaterialSourceSpec:
-    """One PBR source family plus its repeat-level UV tiling choice."""
+    """One PBR source family plus its world-scale UV repeat settings."""
 
     map_sources: Mapping[str, SurfaceTextureSource]
     tiling_mode: str | None = None
     tiling_seed: int = 0
+    texture_repeat_size_m: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.map_sources, Mapping):
@@ -60,6 +61,12 @@ class SurfaceMaterialSourceSpec:
         object.__setattr__(
             self, "tiling_seed", normalize_surface_tiling_seed(self.tiling_seed)
         )
+        if self.texture_repeat_size_m is not None:
+            object.__setattr__(
+                self,
+                "texture_repeat_size_m",
+                normalize_texture_world_size(self.texture_repeat_size_m),
+            )
 
 
 SurfaceMaterialSource = (
@@ -81,6 +88,7 @@ class ResolvedSurfaceMaterial:
     metallic_texture_rgba: np.ndarray | None = None
     tiling_mode: str | None = None
     tiling_seed: int = 0
+    texture_repeat_size_m: float | None = None
 
     def __post_init__(self) -> None:
         if not self.png_bytes:
@@ -91,6 +99,12 @@ class ResolvedSurfaceMaterial:
         object.__setattr__(
             self, "tiling_seed", normalize_surface_tiling_seed(self.tiling_seed)
         )
+        if self.texture_repeat_size_m is not None:
+            object.__setattr__(
+                self,
+                "texture_repeat_size_m",
+                normalize_texture_world_size(self.texture_repeat_size_m),
+            )
         rgba = np.asarray(self.texture_rgba, dtype=np.uint8)
         if rgba.ndim != 3 or rgba.shape[2] != 4:
             raise ValueError("A surface material must contain RGBA pixels.")
@@ -187,6 +201,7 @@ def resolve_surface_material(
             metallic_texture_rgba=resolved.metallic_texture_rgba,
             tiling_mode=source.tiling_mode,
             tiling_seed=source.tiling_seed,
+            texture_repeat_size_m=source.texture_repeat_size_m,
         )
     if isinstance(source, Mapping):
         unknown_map_types = {
@@ -288,7 +303,11 @@ def build_world_planar_textured_mesh(
 
     if surface_type not in SURFACE_TYPES:
         raise ValueError(f"Unknown fixed surface type: {surface_type!r}.")
-    tile_size = normalize_texture_world_size(texture_world_size_meters)
+    tile_size = normalize_texture_world_size(
+        texture_world_size_meters
+        if material.texture_repeat_size_m is None
+        else material.texture_repeat_size_m
+    )
     faces = np.asarray(mesh.faces, dtype=np.int64)
     vertices = np.asarray(mesh.vertices, dtype=float)
     if (

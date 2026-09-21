@@ -44,6 +44,7 @@ from housemaker.pbr_maps import (
 )
 from housemaker.surface_geometry import build_fixed_surfaces
 from housemaker.surface_materials import (
+    SurfaceMaterialSourceSpec,
     build_assignment_surface_material_source_map,
     build_world_planar_face_uvs,
 )
@@ -57,7 +58,6 @@ from housemaker.surface_texture_workspace import (
     SurfaceTextureGenerationWorkspace,
 )
 from housemaker.viewer import GlbViewerWidget
-
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -383,6 +383,54 @@ class StableRoomSurfaceIdentityTests(unittest.TestCase):
 
 # ### GLB material tests ###
 class SurfaceMaterialGlbTests(unittest.TestCase):
+    def test_repeat_size_reaches_preview_and_exported_surface_uvs(self) -> None:
+        level, room = _build_one_room_level()
+        surface_id = f"level:2/room:{room.center_vertex_id}/floor"
+        texture_png = _solid_png((80, 120, 190, 255))
+
+        def export_with_repeat_size(repeat_size: float):
+            return convert_to_glb(
+                [level],
+                surface_materials={
+                    surface_id: SurfaceMaterialSourceSpec(
+                        map_sources={ATLAS_MAP_BASE_COLOR: texture_png},
+                        texture_repeat_size_m=repeat_size,
+                    )
+                },
+                export_untextured_surfaces=False,
+            )
+
+        broad = export_with_repeat_size(2.0)
+        dense = export_with_repeat_size(0.5)
+        broad_preview_uv = np.asarray(broad.preview_textured_surfaces[0].mesh.visual.uv)
+        dense_preview_uv = np.asarray(dense.preview_textured_surfaces[0].mesh.visual.uv)
+        np.testing.assert_allclose(dense_preview_uv, broad_preview_uv * 4)
+
+        for model, preview_uv in (
+            (broad, broad_preview_uv),
+            (dense, dense_preview_uv),
+        ):
+            exported_scene = trimesh.load(
+                BytesIO(model.glb_bytes),
+                file_type="glb",
+                force="scene",
+                process=False,
+            )
+            self.assertIsInstance(exported_scene, trimesh.Scene)
+            exported_mesh = next(
+                mesh
+                for mesh in exported_scene.geometry.values()
+                if getattr(getattr(mesh.visual, "material", None), "name", "")
+                == f"Surface {surface_id}"
+            )
+            np.testing.assert_allclose(
+                np.ptp(np.asarray(exported_mesh.visual.uv), axis=0),
+                np.ptp(preview_uv, axis=0),
+            )
+            self.assertEqual(
+                exported_mesh.visual.material.baseColorTexture.size, (8, 8)
+            )
+
     def test_empty_surface_export_still_accepts_geometry_only_objects(
         self,
     ) -> None:

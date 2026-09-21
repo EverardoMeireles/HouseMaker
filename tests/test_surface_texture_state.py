@@ -15,6 +15,7 @@ from housemaker.pbr_maps import (
 )
 from housemaker.surface_texture_state import (
     DEFAULT_SURFACE_TEXTURE_RESOLUTION,
+    DEFAULT_TEXTURE_REPEAT_SIZE_M,
     SURFACE_PBR_ALIGNMENT_VERSION,
     SURFACE_TEXTURE_RESOLUTIONS,
     SURFACE_TEXTURE_SCHEMA_VERSION,
@@ -271,6 +272,38 @@ class SurfaceTextureSelectionTests(unittest.TestCase):
 
 # ### Assignment validation tests ###
 class SurfaceTextureAssignmentTests(unittest.TestCase):
+    def test_texture_repeat_size_round_trips_and_defaults_for_legacy_data(self) -> None:
+        assignment = replace(_assignment(), texture_repeat_size_m=0.75)
+
+        restored = SurfaceTextureAssignment.from_dict(assignment.to_dict())
+        legacy_payload = assignment.to_dict()
+        legacy_payload.pop("texture_repeat_size_m")
+        legacy = SurfaceTextureAssignment.from_dict(legacy_payload)
+
+        self.assertEqual(restored.texture_repeat_size_m, 0.75)
+        self.assertEqual(restored, assignment)
+        self.assertEqual(legacy.texture_repeat_size_m, DEFAULT_TEXTURE_REPEAT_SIZE_M)
+
+    def test_texture_repeat_size_requires_a_positive_finite_number(self) -> None:
+        invalid_values = (
+            0,
+            -0.01,
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            True,
+            None,
+            "1.0",
+        )
+        for value in invalid_values:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "repeat size"):
+                    replace(_assignment(), texture_repeat_size_m=value)
+                with self.assertRaisesRegex(ValueError, "repeat size"):
+                    SurfaceTextureAssignment.from_dict(
+                        _assignment().to_dict() | {"texture_repeat_size_m": value}
+                    )
+
     def test_tiling_mode_and_seed_round_trip(self) -> None:
         for mode in (
             SURFACE_TILING_MODE_NONE,
@@ -338,7 +371,7 @@ class SurfaceTextureAssignmentTests(unittest.TestCase):
 
         restored = SurfaceTextureAssignment.from_dict(assignment.to_dict())
 
-        self.assertEqual(SURFACE_TEXTURE_SCHEMA_VERSION, 9)
+        self.assertEqual(SURFACE_TEXTURE_SCHEMA_VERSION, 10)
         self.assertEqual(
             restored.selected_texture_resolution,
             DEFAULT_SURFACE_TEXTURE_RESOLUTION,

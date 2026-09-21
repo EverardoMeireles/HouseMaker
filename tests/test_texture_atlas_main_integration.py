@@ -557,6 +557,55 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             frozenset(),
         )
 
+    def test_atlas_repeat_size_editor_updates_selected_surface_assignment(
+        self,
+    ) -> None:
+        assignment = _wall_texture_assignment(
+            self.settings.path.parent / "surface_textures",
+            assignment_id="repeat-size-wall",
+        )
+        surface_workspace = self.workspace.surface_texture_generation
+        surface_workspace.set_data(SurfaceTextureData(assignments=[assignment]))
+        surface_workspace.data_changed.emit(surface_workspace.get_data())
+        signature_before = surface_workspace.get_preview_dependency_signature()
+        source_id = build_atlas_wall_texture_source_id(assignment.assignment_id)
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        source_item = next(
+            atlas_workspace.surface_list.item(index)
+            for index in range(atlas_workspace.surface_list.count())
+            if atlas_workspace.surface_list.item(index).data(
+                Qt.ItemDataRole.UserRole
+            ) == source_id
+        )
+        atlas_workspace.surface_list.setCurrentItem(source_item)
+        _qt_application.processEvents()
+        self.assertTrue(atlas_workspace.surface_texture_repeat_size_spin.isEnabled())
+        self.assertEqual(atlas_workspace.surface_texture_repeat_size_spin.value(), 2.0)
+
+        atlas_workspace.surface_texture_repeat_size_spin.setValue(1.25)
+        atlas_workspace.surface_texture_repeat_size_spin.editingFinished.emit()
+        _qt_application.processEvents()
+
+        updated = surface_workspace.get_assignment(assignment.assignment_id)
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        self.assertEqual(updated.texture_repeat_size_m, 1.25)
+        self.assertEqual(
+            atlas_workspace._surface_texture_entries_by_id[
+                source_id
+            ].texture_repeat_size_m,
+            1.25,
+        )
+        self.assertNotEqual(
+            surface_workspace.get_preview_dependency_signature(),
+            signature_before,
+        )
+        source = surface_workspace.get_surface_material_sources()[
+            assignment.surface_ids[0]
+        ]
+        self.assertIsInstance(source, SurfaceMaterialSourceSpec)
+        self.assertEqual(source.texture_repeat_size_m, 1.25)
+
     def test_generated_wall_texture_can_be_selected_and_added_to_atlas(
         self,
     ) -> None:
@@ -4172,6 +4221,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             ),
             tiling_mode=SURFACE_TILING_MODE_WHOLE_REPEATS,
             tiling_seed=73,
+            texture_repeat_size_m=1.5,
         )
         self.workspace.surface_texture_generation.set_data(
             SurfaceTextureData(assignments=[assignment])
@@ -4183,6 +4233,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         self.assertIsInstance(source, SurfaceMaterialSourceSpec)
         self.assertEqual(source.tiling_mode, SURFACE_TILING_MODE_WHOLE_REPEATS)
         self.assertEqual(source.tiling_seed, 73)
+        self.assertEqual(source.texture_repeat_size_m, 1.5)
 
         mesh = trimesh.creation.box()
         base_model = GeneratedModel(
@@ -4205,6 +4256,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         self.assertIsInstance(rebuilt, SurfaceMaterialSourceSpec)
         self.assertEqual(rebuilt.tiling_mode, SURFACE_TILING_MODE_WHOLE_REPEATS)
         self.assertEqual(rebuilt.tiling_seed, 73)
+        self.assertEqual(rebuilt.texture_repeat_size_m, 1.5)
 
     def test_surface_tiling_revision_updates_atlas_in_place_and_undoes(
         self,

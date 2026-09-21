@@ -827,6 +827,80 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.assertIn("4 surfaces", item.text())
         self.assertFalse(self.workspace.place_assign_button.isEnabled())
 
+    def test_surface_repeat_size_follows_selection_and_emits_one_committed_edit(
+        self,
+    ) -> None:
+        first = _wall_source("plaster", directory=self._temporary_directory.name)
+        second = _wall_source("brick", directory=self._temporary_directory.name)
+        object_source = _source(
+            "chair", directory=self._temporary_directory.name
+        )
+        entries = (
+            AtlasSurfaceTextureEntry(
+                source_id=first.object_id,
+                display_name="Plaster",
+                surface_usage_count=2,
+                texture_repeat_size_m=2.0,
+            ),
+            AtlasSurfaceTextureEntry(
+                source_id=second.object_id,
+                display_name="Brick",
+                surface_usage_count=1,
+                texture_repeat_size_m=3.75,
+            ),
+        )
+        changes = Mock()
+        self.workspace.surface_texture_repeat_size_changed.connect(changes)
+        self.workspace.set_object_texture_sources(
+            (first, second, object_source),
+            surface_texture_entries=entries,
+        )
+
+        self.workspace.surface_list.setCurrentRow(0)
+        self.assertTrue(self.workspace.surface_texture_repeat_size_spin.isEnabled())
+        self.assertEqual(self.workspace.surface_texture_repeat_size_spin.value(), 2.0)
+        changes.assert_not_called()
+
+        self.workspace.surface_texture_repeat_size_spin.setValue(1.25)
+        self.workspace.surface_texture_repeat_size_spin.editingFinished.emit()
+        changes.assert_called_once_with(first.object_id, 1.25)
+        self.workspace.surface_texture_repeat_size_spin.editingFinished.emit()
+        changes.assert_called_once()
+
+        self.workspace.surface_list.setCurrentRow(1)
+        self.assertEqual(self.workspace.surface_texture_repeat_size_spin.value(), 3.75)
+        changes.assert_called_once()
+        self.workspace.object_list.setCurrentRow(0)
+        self.assertFalse(self.workspace.surface_texture_repeat_size_spin.isEnabled())
+
+    def test_surface_repeat_size_refresh_uses_saved_assignment_value(self) -> None:
+        source = _wall_source("plaster", directory=self._temporary_directory.name)
+        self.workspace.set_object_texture_sources(
+            (source,),
+            surface_texture_entries=(
+                AtlasSurfaceTextureEntry(
+                    source_id=source.object_id,
+                    display_name="Plaster",
+                    surface_usage_count=1,
+                    texture_repeat_size_m=4.0,
+                ),
+            ),
+        )
+        self.assertEqual(self.workspace.surface_texture_repeat_size_spin.value(), 4.0)
+
+        self.workspace.set_object_texture_sources(
+            (source,),
+            surface_texture_entries=(
+                AtlasSurfaceTextureEntry(
+                    source_id=source.object_id,
+                    display_name="Plaster",
+                    surface_usage_count=1,
+                    texture_repeat_size_m=1.5,
+                ),
+            ),
+        )
+        self.assertEqual(self.workspace.surface_texture_repeat_size_spin.value(), 1.5)
+
     def test_delete_routes_surface_source_through_semantic_removal(self) -> None:
         data = TextureAtlasData()
         atlas = data.create_atlas("Scene", 2048, atlas_id="atlas-scene")

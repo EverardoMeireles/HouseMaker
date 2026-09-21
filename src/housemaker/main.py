@@ -1518,6 +1518,9 @@ class BlueprintWorkspace(QWidget):
         self.texture_atlas_workspace.surface_texture_selected.connect(
             self._handle_atlas_surface_texture_selected
         )
+        self.texture_atlas_workspace.surface_texture_repeat_size_changed.connect(
+            self._handle_atlas_surface_texture_repeat_size_changed
+        )
         self.texture_atlas_workspace.object_place_requested.connect(
             self._handle_atlas_object_place_requested
         )
@@ -6274,6 +6277,7 @@ class BlueprintWorkspace(QWidget):
                     },
                     tiling_mode=source.tiling_mode,
                     tiling_seed=source.tiling_seed,
+                    texture_repeat_size_m=source.texture_repeat_size_m,
                 )
             elif isinstance(source, Mapping):
                 frozen_source = tuple(
@@ -8448,6 +8452,33 @@ class BlueprintWorkspace(QWidget):
         self._set_atlas_canvas_surface_highlights(assignment.surface_ids)
         self._sync_atlas_green_outline_to_canvas_highlight(source_id)
 
+    def _handle_atlas_surface_texture_repeat_size_changed(
+        self,
+        source_id: str,
+        repeat_size_m: float,
+    ) -> None:
+        """Apply one metres-per-repeat value to the selected Surface family."""
+
+        assignment_id = get_atlas_wall_texture_assignment_id(source_id)
+        if assignment_id is None:
+            return
+        try:
+            changed = (
+                self.surface_texture_generation.set_assignment_texture_repeat_size(
+                    assignment_id,
+                    repeat_size_m,
+                )
+            )
+        except (TypeError, ValueError):
+            self.texture_atlas_workspace.status_label.setText(
+                "Texture repeat size must be a positive number."
+            )
+            return
+        if changed:
+            self.texture_atlas_workspace.status_label.setText(
+                f"Texture repeat size: {repeat_size_m:g} m."
+            )
+
     def _set_atlas_canvas_surface_highlights(
         self,
         surface_ids: Sequence[str],
@@ -9873,6 +9904,7 @@ class BlueprintWorkspace(QWidget):
                     assignment.texture_width,
                     assignment.texture_height,
                     assignment.surface_ids,
+                    assignment.texture_repeat_size_m,
                     tuple(variant_signature),
                 )
             )
@@ -9889,6 +9921,7 @@ class BlueprintWorkspace(QWidget):
                         ),
                         surface_usage_count=len(assignment.surface_ids),
                         surface_type=assignment.surface_type,
+                        texture_repeat_size_m=assignment.texture_repeat_size_m,
                     )
                 )
                 if assignment.surface_ids:

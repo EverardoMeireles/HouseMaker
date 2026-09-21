@@ -78,6 +78,58 @@ def test_source_spec_is_immutable_and_preserves_pbr_maps() -> None:
 
 
 # ### Repeat geometry tests ###
+def test_repeat_size_overrides_world_uv_scale_without_resizing_texture() -> None:
+    texture_png = _png(8, 8, (90, 120, 150, 255))
+    default_material = resolve_surface_material(texture_png)
+    repeated_material = resolve_surface_material(
+        SurfaceMaterialSourceSpec(
+            map_sources={ATLAS_MAP_BASE_COLOR: texture_png},
+            texture_repeat_size_m=0.5,
+        )
+    )
+    mesh = _floor_mesh(0, 1)
+    default_mesh = build_world_planar_textured_mesh(
+        mesh, "floor", default_material, texture_world_size_meters=2
+    )
+    repeated_mesh = build_world_planar_textured_mesh(
+        mesh, "floor", repeated_material, texture_world_size_meters=2
+    )
+
+    np.testing.assert_allclose(repeated_mesh.vertices, default_mesh.vertices)
+    np.testing.assert_allclose(
+        np.asarray(repeated_mesh.visual.uv),
+        np.asarray(default_mesh.visual.uv) * 4,
+    )
+    assert repeated_material.png_bytes == default_material.png_bytes == texture_png
+    assert repeated_material.texture_rgba.shape == default_material.texture_rgba.shape
+
+
+def test_repeat_size_reclips_edge_variant_tiles_at_new_world_spacing() -> None:
+    texture_png = _png(8, 8, (90, 120, 150, 255))
+    def material(repeat_size: float):
+        return resolve_surface_material(
+            SurfaceMaterialSourceSpec(
+                map_sources={ATLAS_MAP_BASE_COLOR: texture_png},
+                tiling_mode=SURFACE_TILING_MODE_EDGE_VARIANTS,
+                texture_repeat_size_m=repeat_size,
+            )
+        )
+
+    mesh = _floor_mesh(0, 2)
+    broad = build_world_planar_textured_mesh(
+        mesh, "floor", material(2), texture_world_size_meters=2
+    )
+    dense = build_world_planar_textured_mesh(
+        mesh, "floor", material(0.5), texture_world_size_meters=2
+    )
+
+    assert len(dense.faces) > len(broad.faces)
+    assert np.isclose(dense.area, mesh.area)
+    assert np.isclose(broad.area, mesh.area)
+    assert np.all(np.asarray(dense.visual.uv) >= -1e-8)
+    assert np.all(np.asarray(dense.visual.uv) <= 1 + 1e-8)
+
+
 def test_whole_repeats_rotate_each_clipped_tile_without_changing_geometry() -> None:
     material = resolve_surface_material(
         SurfaceMaterialSourceSpec(

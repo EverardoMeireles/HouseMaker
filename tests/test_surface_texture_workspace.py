@@ -53,6 +53,7 @@ from housemaker.settings_widget import (
     GenerationServiceSettings,
 )
 from housemaker.surface_geometry import FixedSurface, build_fixed_surfaces
+from housemaker.surface_materials import SurfaceMaterialSourceSpec
 from housemaker.surface_texture_providers import SurfaceTextureResult
 from housemaker.surface_texture_state import (
     SURFACE_PBR_ALIGNMENT_VERSION,
@@ -1547,6 +1548,60 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
             )
             self.assertIsNotNone(texture)
             self.assertEqual(texture.shape[:2], (2048, 2048))
+
+    def test_texture_repeat_size_updates_material_sources_and_preview_signature(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(parents=True, exist_ok=True)
+        (asset_directory / "repeat-wall.png").write_bytes(_texture_png())
+        surface_ids = (
+            "level:2/room:5/wall:1:2",
+            "level:2/room:5/wall:2:3",
+        )
+        assignment = _surface_assignment(
+            "repeat-wall",
+            surface_ids,
+            "repeat-wall.png",
+        )
+        self.workspace.set_data(SurfaceTextureData(assignments=[assignment]))
+        original_signature = self.workspace.get_preview_dependency_signature()
+        original_sources = self.workspace.get_surface_material_sources()
+        self.assertEqual(
+            original_sources[surface_ids[0]], asset_directory / "repeat-wall.png"
+        )
+
+        self.assertTrue(
+            self.workspace.set_assignment_texture_repeat_size("repeat-wall", 1.25)
+        )
+
+        updated = self.workspace.get_data().assignments[0]
+        self.assertEqual(updated.texture_repeat_size_m, 1.25)
+        self.assertNotEqual(
+            self.workspace.get_preview_dependency_signature(),
+            original_signature,
+        )
+        material_sources = self.workspace.get_surface_material_sources()
+        self.assertIs(
+            material_sources[surface_ids[0]], material_sources[surface_ids[1]]
+        )
+        source = material_sources[surface_ids[0]]
+        self.assertIsInstance(source, SurfaceMaterialSourceSpec)
+        assert isinstance(source, SurfaceMaterialSourceSpec)
+        self.assertEqual(source.texture_repeat_size_m, 1.25)
+        self.assertEqual(
+            source.map_sources[ATLAS_MAP_BASE_COLOR],
+            asset_directory / "repeat-wall.png",
+        )
+        self.assertEqual(
+            SurfaceTextureData.from_dict(self.workspace.get_data().to_dict())
+            .assignments[0]
+            .texture_repeat_size_m,
+            1.25,
+        )
+        self.assertFalse(
+            self.workspace.set_assignment_texture_repeat_size("repeat-wall", 1.25)
+        )
 
     def test_resolution_api_rejects_missing_unsupported_and_reserved_family(
         self,
