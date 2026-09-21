@@ -1912,6 +1912,8 @@ class TextureAtlasWorkspace(QWidget):
     surface_assign_requested = Signal(str)
     source_remove_requested = Signal(str, str)
     surface_texture_delete_requested = Signal(str)
+    surface_texture_fix_tiling_requested = Signal(str)
+    surface_texture_fix_tiling_2_requested = Signal(str)
     selected_atlas_changed = Signal(object)
     ambient_occlusion_bake_requested = Signal(str, float)
     ambient_occlusion_bake_all_requested = Signal()
@@ -4108,6 +4110,33 @@ class TextureAtlasWorkspace(QWidget):
             self.remove_selected_texture_from_atlas
         )
 
+        self.fix_tiling_button = QPushButton("Fix tiling")
+        self.fix_tiling_button.setObjectName(
+            "texture_atlas_fix_tiling_button"
+        )
+        self.fix_tiling_button.setToolTip(
+            "Randomly rotate whole repeats of the selected Surface texture "
+            "without changing its texture pixels or Atlas slot."
+        )
+        self.fix_tiling_button.clicked.connect(
+            self._request_selected_surface_texture_tiling_fix
+        )
+        texture_column_layout.addWidget(self.fix_tiling_button)
+
+        self.fix_tiling_2_button = QPushButton("Fix tiling 2")
+        self.fix_tiling_2_button.setObjectName(
+            "texture_atlas_fix_tiling_2_button"
+        )
+        self.fix_tiling_2_button.setToolTip(
+            "Create edge-compatible rotated variants of the selected Surface "
+            "texture and aligned PBR maps in the same Atlas slot. Each "
+            "variant has half the original linear resolution."
+        )
+        self.fix_tiling_2_button.clicked.connect(
+            self._request_selected_surface_texture_tiling_fix_2
+        )
+        texture_column_layout.addWidget(self.fix_tiling_2_button)
+
         source_action_buttons = QHBoxLayout()
         self.place_assign_button = QPushButton("Place")
         self.place_assign_button.setObjectName("texture_atlas_place_assign_button")
@@ -5074,6 +5103,22 @@ class TextureAtlasWorkspace(QWidget):
             return
         self.surface_texture_delete_requested.emit(source_id)
 
+    def _request_selected_surface_texture_tiling_fix(self) -> None:
+        """Request whole-repeat rotation for one loaded Surface texture family."""
+
+        source_id = self.selected_surface_texture_id
+        if source_id is None or source_id not in self._sources_by_object_id:
+            return
+        self.surface_texture_fix_tiling_requested.emit(source_id)
+
+    def _request_selected_surface_texture_tiling_fix_2(self) -> None:
+        """Request edge-compatible variants for a loaded Surface texture."""
+
+        source_id = self.selected_surface_texture_id
+        if source_id is None or source_id not in self._sources_by_object_id:
+            return
+        self.surface_texture_fix_tiling_2_requested.emit(source_id)
+
     def _handle_object_drop(self, object_id: str, x: int, y: int) -> None:
         """Place one dragged exact source without moving other allocations."""
 
@@ -5660,6 +5705,12 @@ class TextureAtlasWorkspace(QWidget):
         )
         self.delete_surface_texture_button.setEnabled(
             self._active_source_kind == "surface" and object_id is not None
+        )
+        self.fix_tiling_button.setEnabled(
+            self._active_source_kind == "surface" and source is not None
+        )
+        self.fix_tiling_2_button.setEnabled(
+            self._active_source_kind == "surface" and source is not None
         )
 
     def _refresh_atlas_storage_sizes(self) -> None:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 
 from housemaker.camera_models import CameraPose
 from housemaker.generation_state import MASK_MODE_PAINT, MaskPoint, MaskStroke
@@ -17,6 +18,9 @@ from housemaker.surface_texture_state import (
     SURFACE_PBR_ALIGNMENT_VERSION,
     SURFACE_TEXTURE_RESOLUTIONS,
     SURFACE_TEXTURE_SCHEMA_VERSION,
+    SURFACE_TILING_MODE_EDGE_VARIANTS,
+    SURFACE_TILING_MODE_NONE,
+    SURFACE_TILING_MODE_WHOLE_REPEATS,
     SURFACE_TYPE_CEILING,
     SURFACE_TYPE_FLOOR,
     SURFACE_TYPE_WALL,
@@ -267,6 +271,52 @@ class SurfaceTextureSelectionTests(unittest.TestCase):
 
 # ### Assignment validation tests ###
 class SurfaceTextureAssignmentTests(unittest.TestCase):
+    def test_tiling_mode_and_seed_round_trip(self) -> None:
+        for mode in (
+            SURFACE_TILING_MODE_NONE,
+            SURFACE_TILING_MODE_WHOLE_REPEATS,
+            SURFACE_TILING_MODE_EDGE_VARIANTS,
+        ):
+            with self.subTest(mode=mode):
+                assignment = replace(_assignment(), tiling_mode=mode, tiling_seed=42)
+
+                payload = assignment.to_dict()
+                restored = SurfaceTextureAssignment.from_dict(payload)
+
+                self.assertEqual(payload["tiling_mode"], mode)
+                self.assertEqual(payload["tiling_seed"], 42)
+                self.assertEqual(restored, assignment)
+
+    def test_legacy_assignment_defaults_to_no_tiling(self) -> None:
+        payload = _assignment().to_dict()
+        payload.pop("tiling_mode")
+        payload.pop("tiling_seed")
+
+        restored = SurfaceTextureAssignment.from_dict(payload)
+
+        self.assertEqual(restored.tiling_mode, SURFACE_TILING_MODE_NONE)
+        self.assertEqual(restored.tiling_seed, 0)
+
+    def test_assignment_rejects_invalid_tiling_configuration(self) -> None:
+        for mode, seed in (
+            ("random", 0),
+            ("Whole_Repeats", 0),
+            (None, 0),
+            ([], 0),
+            (SURFACE_TILING_MODE_WHOLE_REPEATS, -1),
+            (SURFACE_TILING_MODE_EDGE_VARIANTS, True),
+            (SURFACE_TILING_MODE_NONE, 1.5),
+            (SURFACE_TILING_MODE_NONE, "3"),
+        ):
+            with self.subTest(mode=mode, seed=seed):
+                with self.assertRaises(ValueError):
+                    replace(_assignment(), tiling_mode=mode, tiling_seed=seed)
+                with self.assertRaises(ValueError):
+                    SurfaceTextureAssignment.from_dict(
+                        _assignment().to_dict()
+                        | {"tiling_mode": mode, "tiling_seed": seed}
+                    )
+
     def test_exact_resolution_variants_round_trip_and_infer_active_selection(
         self,
     ) -> None:

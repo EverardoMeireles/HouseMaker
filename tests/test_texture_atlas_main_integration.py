@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -18,7 +19,7 @@ import trimesh
 from PIL import Image
 from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtGui import QWheelEvent
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
@@ -29,7 +30,7 @@ from housemaker.generation_state import (
     GenerationData,
 )
 from housemaker.glb import GeneratedModel
-from housemaker.main import BlueprintWorkspace
+from housemaker.main import BlueprintWorkspace, _build_surface_ao_pre_atlas_scene
 from housemaker.models import (
     GROUND_LEVEL_INDEX,
     LevelData,
@@ -45,13 +46,21 @@ from housemaker.pbr_maps import (
 )
 from housemaker.project_io import ProjectData
 from housemaker.surface_geometry import build_fixed_surfaces
+from housemaker.surface_materials import SurfaceMaterialSourceSpec
 from housemaker.surface_texture_state import (
     SURFACE_TEXTURE_RESOLUTIONS,
+    SURFACE_TILING_MODE_EDGE_VARIANTS,
+    SURFACE_TILING_MODE_WHOLE_REPEATS,
     SURFACE_TYPE_FLOOR,
     SURFACE_TYPE_WALL,
     SurfaceTextureAssignment,
     SurfaceTextureData,
     SurfaceTextureVariant,
+)
+from housemaker.surface_texture_workspace import (
+    PreparedSurfaceTextureTilingRepair,
+    PreparedSurfaceTextureTilingVariant,
+    _build_surface_asset_revision,
 )
 from housemaker.texture_atlas_state import (
     ATLAS_PACKING_MODE_SYMMETRIC_HALF,
@@ -193,6 +202,82 @@ def _wall_texture_assignment_with_pbr_variants(
             PBR_MAP_ROUGHNESS,
             PBR_MAP_METALLIC,
         ),
+    )
+
+
+def _png_bytes(
+    size: tuple[int, int],
+    color: tuple[int, int, int, int],
+) -> bytes:
+    output = BytesIO()
+    Image.new("RGBA", size, color).save(output, format="PNG")
+    return output.getvalue()
+
+
+def _prepared_surface_tiling_repair(
+    surface_workspace,
+    assignment: SurfaceTextureAssignment,
+    *,
+    map_colors: dict[str, tuple[int, int, int, int]],
+) -> PreparedSurfaceTextureTilingRepair:
+    """Build one deterministic accepted repair without running image quilting."""
+
+    variants: list[PreparedSurfaceTextureTilingVariant] = []
+    if assignment.texture_variants:
+        for variant in assignment.texture_variants:
+            variants.append(
+                PreparedSurfaceTextureTilingVariant(
+                    resolution=variant.resolution,
+                    map_pngs=tuple(
+                        (
+                            map_type,
+                            _png_bytes(
+                                (variant.resolution, variant.resolution),
+                                map_colors[map_type],
+                            ),
+                        )
+                        for map_type in variant.map_asset_paths
+                    ),
+                )
+            )
+    else:
+        variants.append(
+            PreparedSurfaceTextureTilingVariant(
+                resolution=None,
+                map_pngs=(
+                    (
+                        ATLAS_MAP_BASE_COLOR,
+                        _png_bytes(
+                            (
+                                assignment.texture_width or 12,
+                                assignment.texture_height or 8,
+                            ),
+                            map_colors[ATLAS_MAP_BASE_COLOR],
+                        ),
+                    ),
+                ),
+            )
+        )
+    asset_directory = surface_workspace._asset_directory
+    source_revisions = tuple(
+        (
+            raw_path,
+            _build_surface_asset_revision(asset_directory, raw_path),
+        )
+        for raw_path in surface_workspace._assignment_asset_relative_paths(
+            assignment
+        )
+    )
+    preview = _png_bytes((12, 12), map_colors[ATLAS_MAP_BASE_COLOR])
+    return PreparedSurfaceTextureTilingRepair(
+        assignment=assignment,
+        variants=tuple(variants),
+        source_revisions=source_revisions,
+        before_preview_png=preview,
+        after_preview_png=preview,
+        seam_score_before=1.0,
+        seam_score_after=0.0,
+        has_changes=True,
     )
 
 
@@ -4023,6 +4108,453 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
                 base_atlas.convert("RGBA").getpixel((256, 256)),
                 (40, 60, 80, 255),
             )
+
+    def test_surface_tiling_preview_allows_changed_rotation_with_equal_seam_score(
+        self,
+    ) -> None:
+        asset_directory = self.settings.path.parent / "surface_textures"
+        assignment = _wall_texture_assignment(
+            asset_directory,
+            assignment_id="rotated-preview",
+        )
+        surface_workspace = self.workspace.surface_texture_generation
+        surface_workspace.set_data(SurfaceTextureData(assignments=[assignment]))
+        candidate = replace(
+            _prepared_surface_tiling_repair(
+                surface_workspace,
+                assignment,
+                map_colors={ATLAS_MAP_BASE_COLOR: (25, 170, 210, 255)},
+            ),
+            seam_score_before=0.5,
+            seam_score_after=0.5,
+        )
+        source_id = build_atlas_wall_texture_source_id(assignment.assignment_id)
+        thread = Mock(result=candidate, error_message=None, was_cancelled=False)
+        self.workspace._surface_texture_tiling_threads[source_id] = thread
+
+        with (
+            patch("housemaker.main.SurfaceTextureTilingPreviewDialog") as dialog,
+            patch.object(
+                self.workspace,
+                "_commit_surface_texture_tiling_repair",
+            ) as commit,
+        ):
+            dialog.return_value.exec.return_value = QDialog.DialogCode.Accepted
+            self.workspace._handle_surface_texture_tiling_prepared(
+                source_id,
+                thread,
+            )
+
+        dialog.assert_called_once()
+        commit.assert_called_once_with(source_id, candidate)
+        thread.deleteLater.assert_called_once_with()
+
+    def test_surface_tiling_buttons_dispatch_distinct_methods(self) -> None:
+        source_id = build_atlas_wall_texture_source_id("dispatch-wall")
+        with patch.object(
+            self.workspace, "_start_surface_texture_tiling_repair"
+        ) as start:
+            atlas_workspace = self.workspace.texture_atlas_workspace
+            atlas_workspace.surface_texture_fix_tiling_requested.emit(source_id)
+            atlas_workspace.surface_texture_fix_tiling_2_requested.emit(source_id)
+
+        self.assertEqual(
+            start.call_args_list,
+            [
+                call(source_id, SURFACE_TILING_MODE_WHOLE_REPEATS),
+                call(source_id, SURFACE_TILING_MODE_EDGE_VARIANTS),
+            ],
+        )
+
+    def test_whole_repeat_tiling_keeps_atlas_pixels_on_commit_and_undo(self) -> None:
+        assignment = _wall_texture_assignment(
+            self.settings.path.parent / "surface_textures",
+            assignment_id="whole-repeat-wall",
+        )
+        surface_workspace = self.workspace.surface_texture_generation
+        surface_workspace.set_data(SurfaceTextureData(assignments=[assignment]))
+        candidate = surface_workspace.prepare_assignment_tiling_repair(
+            assignment.assignment_id,
+            method=SURFACE_TILING_MODE_WHOLE_REPEATS,
+        )
+        source_id = build_atlas_wall_texture_source_id(assignment.assignment_id)
+        atlas_workspace = self.workspace.texture_atlas_workspace
+
+        with patch.object(atlas_workspace, "transition_object_packing") as transition:
+            self.workspace._commit_surface_texture_tiling_repair(
+                source_id, candidate
+            )
+            self.assertEqual(
+                surface_workspace.get_assignment(assignment.assignment_id).tiling_mode,
+                SURFACE_TILING_MODE_WHOLE_REPEATS,
+            )
+            self.workspace._handle_canvas_undo_requested()
+
+        transition.assert_not_called()
+        self.assertEqual(
+            surface_workspace.get_assignment(assignment.assignment_id), assignment
+        )
+
+    def test_surface_ao_snapshot_preserves_tiling_material_spec(self) -> None:
+        assignment = replace(
+            _wall_texture_assignment(
+                self.settings.path.parent / "surface_textures",
+                assignment_id="ao-rotated-wall",
+            ),
+            tiling_mode=SURFACE_TILING_MODE_WHOLE_REPEATS,
+            tiling_seed=73,
+        )
+        self.workspace.surface_texture_generation.set_data(
+            SurfaceTextureData(assignments=[assignment])
+        )
+        snapshot = self.workspace._capture_surface_ao_scene_snapshot(
+            ((), (), ())
+        )
+        source = dict(snapshot.surface_materials)[assignment.surface_ids[0]]
+        self.assertIsInstance(source, SurfaceMaterialSourceSpec)
+        self.assertEqual(source.tiling_mode, SURFACE_TILING_MODE_WHOLE_REPEATS)
+        self.assertEqual(source.tiling_seed, 73)
+
+        mesh = trimesh.creation.box()
+        base_model = GeneratedModel(
+            mesh=mesh,
+            scene=trimesh.Scene(mesh.copy()),
+            glb_bytes=b"",
+        )
+        with patch(
+            "housemaker.main.convert_to_export_scene_model",
+            return_value=base_model,
+        ) as convert:
+            scene = _build_surface_ao_pre_atlas_scene(
+                snapshot, lambda: False
+            )
+
+        self.assertIs(scene.model, base_model)
+        rebuilt = convert.call_args.kwargs["surface_materials"][
+            assignment.surface_ids[0]
+        ]
+        self.assertIsInstance(rebuilt, SurfaceMaterialSourceSpec)
+        self.assertEqual(rebuilt.tiling_mode, SURFACE_TILING_MODE_WHOLE_REPEATS)
+        self.assertEqual(rebuilt.tiling_seed, 73)
+
+    def test_surface_tiling_revision_updates_atlas_in_place_and_undoes(
+        self,
+    ) -> None:
+        surface_asset_directory = self.settings.path.parent / "surface_textures"
+        assignment = _wall_texture_assignment_with_pbr_variants(
+            surface_asset_directory,
+            assignment_id="tiling-wall",
+        )
+        surface_workspace = self.workspace.surface_texture_generation
+        surface_workspace.set_data(
+            SurfaceTextureData(assignments=[assignment])
+        )
+        object_record = _generated_object_record_with_variants(
+            self.settings.path.parent / "generated",
+            object_id="tiling-neighbour",
+            object_name="Tiling neighbour",
+            resolutions=(512,),
+            selected_resolution=512,
+        )
+        self.workspace.generation.set_data(
+            GenerationData(generated_objects=[object_record])
+        )
+        self.workspace._atlas_generation_signature = None
+        self.workspace._sync_atlas_object_texture_sources(
+            automatically_assign_scene_textures=False
+        )
+
+        source_id = build_atlas_wall_texture_source_id(
+            assignment.assignment_id
+        )
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        surface_source = atlas_workspace._sources_by_object_id[source_id]
+        object_source = atlas_workspace._sources_by_object_id[
+            object_record.object_id
+        ]
+        atlas_data = TextureAtlasData()
+        atlas = atlas_data.create_atlas(
+            "Tiling transaction",
+            2048,
+            atlas_id="tiling-transaction",
+        )
+        atlas_data.assign_object(
+            atlas.atlas_id,
+            surface_source.object_id,
+            surface_source.texture_path,
+            surface_source.texture_resolution,
+        )
+        atlas_data.assign_object(
+            atlas.atlas_id,
+            object_source.object_id,
+            object_source.texture_path,
+            object_source.texture_resolution,
+        )
+        atlas_workspace.set_data(atlas_data)
+        self.assertEqual(atlas_workspace.materialize_missing_atlases(), 1)
+
+        original_atlas = atlas_workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert original_atlas is not None
+        original_surface_placement = original_atlas.placement_for_object(source_id)
+        original_object_placement = original_atlas.placement_for_object(
+            object_record.object_id
+        )
+        assert original_surface_placement is not None
+        assert original_object_placement is not None
+        original_surface_files = {
+            raw_path: (surface_asset_directory / raw_path).read_bytes()
+            for variant in assignment.texture_variants
+            for raw_path in variant.map_asset_paths.values()
+        }
+        object_texture_path = object_source.physical_texture_path
+        original_object_texture = object_texture_path.read_bytes()
+        atlas_map_paths = {
+            map_type: (
+                self.settings.path.parent
+                / "texture_atlases"
+                / build_texture_atlas_map_image_relative_path(
+                    atlas.atlas_id,
+                    map_type,
+                )
+            )
+            for map_type in (
+                ATLAS_MAP_BASE_COLOR,
+                PBR_MAP_NORMAL,
+                PBR_MAP_ROUGHNESS,
+                PBR_MAP_METALLIC,
+            )
+        }
+        original_atlas_payloads = {
+            map_type: path.read_bytes()
+            for map_type, path in atlas_map_paths.items()
+        }
+        repaired_colors = {
+            ATLAS_MAP_BASE_COLOR: (210, 35, 65, 255),
+            PBR_MAP_NORMAL: (90, 175, 240, 255),
+            PBR_MAP_ROUGHNESS: (145, 145, 145, 255),
+            PBR_MAP_METALLIC: (25, 25, 25, 255),
+        }
+        candidate = _prepared_surface_tiling_repair(
+            surface_workspace,
+            assignment,
+            map_colors=repaired_colors,
+        )
+
+        self.workspace._commit_surface_texture_tiling_repair(
+            source_id,
+            candidate,
+        )
+
+        repaired_assignment = surface_workspace.get_assignment(
+            assignment.assignment_id
+        )
+        assert repaired_assignment is not None
+        self.assertEqual(
+            replace(
+                repaired_assignment,
+                asset_path=assignment.asset_path,
+                texture_variants=assignment.texture_variants,
+            ),
+            assignment,
+        )
+        self.assertEqual(
+            tuple(
+                (variant.resolution, tuple(variant.map_asset_paths))
+                for variant in repaired_assignment.texture_variants
+            ),
+            tuple(
+                (variant.resolution, tuple(variant.map_asset_paths))
+                for variant in assignment.texture_variants
+            ),
+        )
+        self.assertNotEqual(
+            repaired_assignment.asset_path,
+            assignment.asset_path,
+        )
+        for raw_path, payload in original_surface_files.items():
+            self.assertEqual(
+                (surface_asset_directory / raw_path).read_bytes(),
+                payload,
+            )
+        for variant in repaired_assignment.texture_variants:
+            for map_type, raw_path in variant.map_asset_paths.items():
+                self.assertNotIn(raw_path, original_surface_files)
+                with Image.open(surface_asset_directory / raw_path) as image:
+                    self.assertEqual(
+                        image.convert("RGBA").getpixel((0, 0)),
+                        repaired_colors[map_type],
+                    )
+
+        repaired_atlas = atlas_workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert repaired_atlas is not None
+        repaired_surface_placement = repaired_atlas.placement_for_object(source_id)
+        repaired_object_placement = repaired_atlas.placement_for_object(
+            object_record.object_id
+        )
+        assert repaired_surface_placement is not None
+        assert repaired_object_placement is not None
+        self.assertEqual(
+            (
+                repaired_surface_placement.x,
+                repaired_surface_placement.y,
+                repaired_surface_placement.size,
+                repaired_surface_placement.packing_mode,
+                repaired_surface_placement.slot_half,
+                repaired_surface_placement.slot_quadrant,
+            ),
+            (
+                original_surface_placement.x,
+                original_surface_placement.y,
+                original_surface_placement.size,
+                original_surface_placement.packing_mode,
+                original_surface_placement.slot_half,
+                original_surface_placement.slot_quadrant,
+            ),
+        )
+        self.assertNotEqual(
+            repaired_surface_placement.texture_path,
+            original_surface_placement.texture_path,
+        )
+        self.assertEqual(
+            repaired_object_placement.to_dict(),
+            original_object_placement.to_dict(),
+        )
+        self.assertEqual(object_texture_path.read_bytes(), original_object_texture)
+        for map_type, path in atlas_map_paths.items():
+            self.assertNotEqual(
+                path.read_bytes(),
+                original_atlas_payloads[map_type],
+            )
+            with Image.open(path) as atlas_image:
+                self.assertEqual(
+                    atlas_image.convert("RGBA").getpixel(
+                        (
+                            repaired_surface_placement.x + 256,
+                            repaired_surface_placement.y + 256,
+                        )
+                    ),
+                    repaired_colors[map_type],
+                )
+        self.assertEqual(len(self.workspace._canvas_undo_stack), 1)
+        repaired_paths = tuple(
+            surface_asset_directory / raw_path
+            for variant in repaired_assignment.texture_variants
+            for raw_path in variant.map_asset_paths.values()
+        )
+
+        self.workspace._handle_canvas_undo_requested()
+
+        self.assertEqual(
+            surface_workspace.get_assignment(assignment.assignment_id),
+            assignment,
+        )
+        restored_atlas = atlas_workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert restored_atlas is not None
+        restored_surface_placement = restored_atlas.placement_for_object(source_id)
+        restored_object_placement = restored_atlas.placement_for_object(
+            object_record.object_id
+        )
+        assert restored_surface_placement is not None
+        assert restored_object_placement is not None
+        self.assertEqual(
+            restored_surface_placement.to_dict(),
+            original_surface_placement.to_dict(),
+        )
+        self.assertEqual(
+            restored_object_placement.to_dict(),
+            original_object_placement.to_dict(),
+        )
+        for map_type, path in atlas_map_paths.items():
+            self.assertEqual(
+                path.read_bytes(),
+                original_atlas_payloads[map_type],
+            )
+        self.assertTrue(all(not path.exists() for path in repaired_paths))
+        self.assertEqual(object_texture_path.read_bytes(), original_object_texture)
+        self.assertEqual(self.workspace._canvas_undo_stack, [])
+
+    def test_surface_tiling_atlas_failure_rolls_back_derived_revision(
+        self,
+    ) -> None:
+        surface_asset_directory = self.settings.path.parent / "surface_textures"
+        assignment = _wall_texture_assignment(
+            surface_asset_directory,
+            assignment_id="tiling-rollback",
+        )
+        surface_workspace = self.workspace.surface_texture_generation
+        surface_workspace.set_data(
+            SurfaceTextureData(assignments=[assignment])
+        )
+        self.workspace._atlas_generation_signature = None
+        self.workspace._sync_atlas_object_texture_sources(
+            automatically_assign_scene_textures=False
+        )
+        source_id = build_atlas_wall_texture_source_id(
+            assignment.assignment_id
+        )
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        source = atlas_workspace._sources_by_object_id[source_id]
+        atlas_data = TextureAtlasData()
+        atlas = atlas_data.create_atlas(
+            "Tiling rollback",
+            2048,
+            atlas_id="tiling-rollback",
+        )
+        atlas_data.assign_object(
+            atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+        )
+        atlas_workspace.set_data(atlas_data)
+        self.assertEqual(atlas_workspace.materialize_missing_atlases(), 1)
+        before_data = atlas_workspace.get_data().to_dict()
+        before_files = {
+            path.name: path.read_bytes()
+            for path in surface_asset_directory.iterdir()
+            if path.is_file()
+        }
+        atlas_path = (
+            self.settings.path.parent
+            / "texture_atlases"
+            / f"{atlas.atlas_id}.png"
+        )
+        before_atlas_payload = atlas_path.read_bytes()
+        candidate = _prepared_surface_tiling_repair(
+            surface_workspace,
+            assignment,
+            map_colors={ATLAS_MAP_BASE_COLOR: (25, 170, 210, 255)},
+        )
+
+        with patch.object(
+            atlas_workspace,
+            "_materialize_atlas",
+            side_effect=ValueError("forced Atlas failure"),
+        ):
+            self.workspace._commit_surface_texture_tiling_repair(
+                source_id,
+                candidate,
+            )
+
+        self.assertEqual(
+            surface_workspace.get_assignment(assignment.assignment_id),
+            assignment,
+        )
+        self.assertEqual(atlas_workspace.get_data().to_dict(), before_data)
+        self.assertEqual(atlas_path.read_bytes(), before_atlas_payload)
+        self.assertEqual(
+            {
+                path.name: path.read_bytes()
+                for path in surface_asset_directory.iterdir()
+                if path.is_file()
+            },
+            before_files,
+        )
+        self.assertEqual(self.workspace._canvas_undo_stack, [])
+        self.assertIn(
+            "original texture and Atlas were kept",
+            atlas_workspace.status_label.text(),
+        )
 
     def test_direct_object_change_refreshes_pbr_path_and_revision_changes(
         self,

@@ -56,6 +56,8 @@ from housemaker.surface_texture_providers import SurfaceTextureResult
 from housemaker.surface_texture_state import (
     SURFACE_PBR_ALIGNMENT_VERSION,
     SURFACE_TEXTURE_RESOLUTIONS,
+    SURFACE_TILING_MODE_EDGE_VARIANTS,
+    SURFACE_TILING_MODE_WHOLE_REPEATS,
     SurfaceTextureAssignment,
     SurfaceTextureData,
     SurfaceTextureVariant,
@@ -70,6 +72,7 @@ from housemaker.surface_texture_workspace import (
     _build_surface_asset_revision,
     _decode_png_rgba,
     _encode_provider_reference_png,
+    prepare_surface_texture_tiling_repair,
 )
 
 # ### Module state ###
@@ -1606,6 +1609,375 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         finally:
             self.workspace._generation_surface_targets.pop("busy-job")
         self.assertEqual(self.workspace.get_data().to_dict(), before)
+
+    def test_tiling_stage_rejects_reservation_created_after_prepare(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(parents=True, exist_ok=True)
+        surface_id = "level:2/room:5/wall:1:2"
+        asset_path = asset_directory / "race-wall.png"
+        original_payload = _colored_texture_png((175, 80, 35, 255))
+        asset_path.write_bytes(original_payload)
+        assignment = _surface_assignment(
+            "race-wall",
+            (surface_id,),
+            asset_path.name,
+        )
+        self.workspace.set_data(
+            SurfaceTextureData(assignments=[assignment])
+        )
+        prepared = self.workspace.prepare_assignment_tiling_repair(
+            assignment.assignment_id
+        )
+        before_files = {
+            path.name: path.read_bytes()
+            for path in asset_directory.iterdir()
+            if path.is_file()
+        }
+
+        self.workspace._generation_surface_targets["new-generation"] = frozenset(
+            (surface_id,)
+        )
+        try:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "became busy while its tiling preview was open",
+            ):
+                self.workspace.stage_assignment_tiling_repair(prepared)
+        finally:
+            self.workspace._generation_surface_targets.pop("new-generation")
+
+        self.assertEqual(
+            self.workspace.get_assignment(assignment.assignment_id),
+            assignment,
+        )
+        self.assertEqual(asset_path.read_bytes(), original_payload)
+        self.assertEqual(
+            {
+                path.name: path.read_bytes()
+                for path in asset_directory.iterdir()
+                if path.is_file()
+            },
+            before_files,
+        )
+        self.assertFalse(
+            any(
+                path.name.startswith("surface-tiling-")
+                for path in asset_directory.iterdir()
+            )
+        )
+
+    def test_whole_repeat_rotation_changes_only_metadata_and_can_be_undone(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(parents=True, exist_ok=True)
+        asset_path = asset_directory / "whole-repeat.png"
+        original_png = _texture_png()
+        asset_path.write_bytes(original_png)
+        assignment = _surface_assignment(
+            "whole-repeat", ("level:2/room:5/wall:1:2",), asset_path.name
+        )
+        self.workspace.set_data(SurfaceTextureData(assignments=[assignment]))
+
+        snapshot = self.workspace.snapshot_assignment_tiling_repair(
+            assignment.assignment_id,
+            method=SURFACE_TILING_MODE_WHOLE_REPEATS,
+            rotation_seed=41,
+        )
+        prepared = prepare_surface_texture_tiling_repair(snapshot)
+        self.assertEqual(prepared.method, SURFACE_TILING_MODE_WHOLE_REPEATS)
+        self.assertEqual(prepared.variants, ())
+        revision = self.workspace.stage_assignment_tiling_repair(prepared)
+        self.assertEqual(revision.created_asset_paths, ())
+        self.assertTrue(
+            self.workspace.activate_assignment_tiling_revision(
+                revision, repaired=True
+            )
+        )
+        active = self.workspace.get_assignment(assignment.assignment_id)
+        assert active is not None
+        self.assertEqual(active.tiling_mode, SURFACE_TILING_MODE_WHOLE_REPEATS)
+        self.assertEqual(active.tiling_seed, 41)
+        self.assertEqual(active.asset_path, assignment.asset_path)
+        self.assertEqual(asset_path.read_bytes(), original_png)
+        self.assertEqual(
+            len(tuple(asset_directory.glob("surface-tiling-*"))), 0
+        )
+        material_source = self.workspace.get_surface_material_sources()[
+            assignment.surface_ids[0]
+        ]
+        self.assertEqual(material_source.tiling_mode, active.tiling_mode)
+        self.assertEqual(material_source.tiling_seed, 41)
+
+        self.assertTrue(
+            self.workspace.activate_assignment_tiling_revision(
+                revision, repaired=False
+            )
+        )
+        self.assertEqual(
+            self.workspace.get_assignment(assignment.assignment_id), assignment
+        )
+        self.assertEqual(self.workspace.discard_assignment_tiling_revision(revision), 0)
+
+    def test_edge_variant_revision_preserves_slot_size_and_can_be_undone(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(parents=True, exist_ok=True)
+        asset_path = asset_directory / "edge-variants.png"
+        asset_path.write_bytes(_texture_png())
+        assignment = _surface_assignment(
+            "edge-variants", ("level:2/room:5/wall:1:2",), asset_path.name
+        )
+        self.workspace.set_data(SurfaceTextureData(assignments=[assignment]))
+
+        snapshot = self.workspace.snapshot_assignment_tiling_repair(
+            assignment.assignment_id,
+            method=SURFACE_TILING_MODE_EDGE_VARIANTS,
+            rotation_seed=41,
+        )
+        prepared = prepare_surface_texture_tiling_repair(snapshot)
+        self.assertEqual(prepared.method, SURFACE_TILING_MODE_EDGE_VARIANTS)
+        self.assertEqual(len(prepared.variants), 1)
+        revised_png = dict(prepared.variants[0].map_pngs)[ATLAS_MAP_BASE_COLOR]
+        with Image.open(io.BytesIO(revised_png)) as image:
+            self.assertEqual(image.size, (12, 8))
+
+        revision = self.workspace.stage_assignment_tiling_repair(prepared)
+        self.assertEqual(len(revision.created_asset_paths), 1)
+        self.assertTrue(
+            self.workspace.activate_assignment_tiling_revision(
+                revision, repaired=True
+            )
+        )
+        active = self.workspace.get_assignment(assignment.assignment_id)
+        assert active is not None
+        self.assertEqual(active.tiling_mode, SURFACE_TILING_MODE_EDGE_VARIANTS)
+        self.assertEqual(active.tiling_seed, 41)
+        self.assertNotEqual(active.asset_path, assignment.asset_path)
+        self.assertEqual(
+            self.workspace.get_surface_material_sources()[
+                assignment.surface_ids[0]
+            ].tiling_mode,
+            SURFACE_TILING_MODE_EDGE_VARIANTS,
+        )
+
+        self.assertTrue(
+            self.workspace.activate_assignment_tiling_revision(
+                revision, repaired=False
+            )
+        )
+        self.assertEqual(
+            self.workspace.get_assignment(assignment.assignment_id), assignment
+        )
+        self.assertEqual(self.workspace.discard_assignment_tiling_revision(revision), 0)
+        self.assertFalse(
+            (asset_directory / revision.created_asset_paths[0]).exists()
+        )
+        self.assertEqual(asset_path.read_bytes(), _texture_png())
+
+    def test_edge_variant_final_resolutions_keep_toroidal_seams_small(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(parents=True, exist_ok=True)
+        variants: list[SurfaceTextureVariant] = []
+        for resolution in SURFACE_TEXTURE_RESOLUTIONS:
+            asset_name = f"quadrant-edge-{resolution}.png"
+            if resolution == 2048:
+                axis = np.linspace(0.0, 1.0, resolution, dtype=np.float32)
+                coarse_grain = np.random.default_rng(41).integers(
+                    -10, 11, (resolution // 4, resolution // 4), dtype=np.int16
+                )
+                grain = np.repeat(np.repeat(coarse_grain, 4, axis=0), 4, axis=1)
+                gray = np.clip(
+                    np.rint(
+                        118.0
+                        + 32.0 * axis[None, :]
+                        + 14.0 * axis[:, None]
+                        + grain
+                    ),
+                    0,
+                    255,
+                ).astype(np.uint8)
+                pixels = np.repeat(gray[:, :, None], 3, axis=2)
+                Image.fromarray(pixels, mode="RGB").save(
+                    asset_directory / asset_name, format="PNG"
+                )
+            else:
+                Image.new("RGB", (resolution, resolution), (40, 80, 120)).save(
+                    asset_directory / asset_name, format="PNG"
+                )
+            variants.append(SurfaceTextureVariant(resolution, asset_name))
+        assignment = SurfaceTextureAssignment(
+            assignment_id="quadrant-edge",
+            surface_type="wall",
+            surface_ids=("level:2/room:5/wall:1:2",),
+            provider="meshy",
+            asset_path=variants[2].asset_path,
+            texture_width=2048,
+            texture_height=2048,
+            texture_variants=tuple(variants),
+            selected_texture_resolution=2048,
+        )
+        self.workspace.set_data(SurfaceTextureData(assignments=[assignment]))
+        snapshot = self.workspace.snapshot_assignment_tiling_repair(
+            assignment.assignment_id,
+            method=SURFACE_TILING_MODE_EDGE_VARIANTS,
+            rotation_seed=41,
+        )
+        prepared = prepare_surface_texture_tiling_repair(snapshot)
+
+        for variant in prepared.variants:
+            if variant.resolution not in (512, 1024):
+                continue
+            image = _decode_png_rgba(
+                dict(variant.map_pngs)[ATLAS_MAP_BASE_COLOR], "Edge variant"
+            )
+            self.assertEqual(image.shape[:2], (variant.resolution,) * 2)
+            for mip_size in (variant.resolution, variant.resolution // 8):
+                sampled = (
+                    image
+                    if mip_size == variant.resolution
+                    else cv2.resize(
+                        image,
+                        (mip_size, mip_size),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                )
+                pixels = sampled[:, :, :3].astype(np.float32)
+                half = mip_size // 2
+                vertical = (
+                    np.abs(pixels[:, 0] - pixels[:, -1]).mean(),
+                    np.abs(pixels[:, half] - pixels[:, half - 1]).mean(),
+                )
+                horizontal = (
+                    np.abs(pixels[0] - pixels[-1]).mean(),
+                    np.abs(pixels[half] - pixels[half - 1]).mean(),
+                )
+                typical_vertical = np.abs(
+                    pixels[:, half // 2] - pixels[:, half // 2 - 1]
+                ).mean()
+                typical_horizontal = np.abs(
+                    pixels[half // 2] - pixels[half // 2 - 1]
+                ).mean()
+                for jump in vertical:
+                    self.assertLessEqual(jump, typical_vertical * 2.0 + 2.0)
+                for jump in horizontal:
+                    self.assertLessEqual(jump, typical_horizontal * 2.0 + 2.0)
+
+    def test_edge_variant_final_png_does_not_create_contrast_spikes(self) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(parents=True, exist_ok=True)
+        asset_path = asset_directory / "bounded-noise.png"
+        gray = np.random.default_rng(42).integers(
+            100, 156, (256, 256), dtype=np.uint8
+        )
+        source = np.repeat(gray[:, :, None], 3, axis=2)
+        Image.fromarray(source, mode="RGB").save(asset_path, format="PNG")
+        assignment = _surface_assignment(
+            "bounded-noise",
+            ("level:2/room:5/wall:1:2",),
+            asset_path.name,
+        )
+        self.workspace.set_data(SurfaceTextureData(assignments=[assignment]))
+
+        prepared = self.workspace.prepare_assignment_tiling_repair(
+            assignment.assignment_id,
+            method=SURFACE_TILING_MODE_EDGE_VARIANTS,
+        )
+        repaired = _decode_png_rgba(
+            dict(prepared.variants[0].map_pngs)[ATLAS_MAP_BASE_COLOR],
+            "Bounded edge variant",
+        )[:, :, :3]
+
+        self.assertGreaterEqual(int(repaired.min()), 72)
+        self.assertLessEqual(int(repaired.max()), 183)
+        first_variant = repaired[16:112, :128, 0].astype(np.float32)
+        edge_detail = np.abs(
+            first_variant[:, 1:5] - first_variant[:, :4]
+        ).mean()
+        interior_detail = np.abs(
+            first_variant[:, 36:100] - first_variant[:, 35:99]
+        ).mean()
+        self.assertGreater(edge_detail, interior_detail * 0.5)
+
+    def test_tiling_preparation_snapshot_is_independent_of_workspace_state(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(parents=True, exist_ok=True)
+        asset_path = asset_directory / "snapshot-wall.png"
+        asset_path.write_bytes(_texture_png())
+        assignment = _surface_assignment(
+            "snapshot-wall",
+            ("level:2/room:5/wall:1:2",),
+            asset_path.name,
+        )
+        self.workspace.set_data(SurfaceTextureData(assignments=[assignment]))
+
+        snapshot = self.workspace.snapshot_assignment_tiling_repair(
+            assignment.assignment_id,
+            method=SURFACE_TILING_MODE_EDGE_VARIANTS,
+            rotation_seed=17,
+        )
+        self.workspace.set_data(SurfaceTextureData())
+        prepared = prepare_surface_texture_tiling_repair(snapshot)
+
+        self.assertEqual(prepared.assignment, assignment)
+        self.assertEqual(snapshot.rotation_seed, 17)
+        self.assertIsNot(prepared.assignment, assignment)
+        self.assertEqual(len(prepared.variants), 1)
+        self.assertEqual(prepared.variants[0].resolution, None)
+        self.assertEqual(
+            prepared.variants[0].map_pngs[0][0],
+            ATLAS_MAP_BASE_COLOR,
+        )
+
+    def test_tiling_preparation_cancels_without_writing_files(self) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(parents=True, exist_ok=True)
+        asset_path = asset_directory / "cancelled-wall.png"
+        asset_path.write_bytes(_texture_png())
+        assignment = _surface_assignment(
+            "cancelled-wall",
+            ("level:2/room:5/wall:1:2",),
+            asset_path.name,
+        )
+        self.workspace.set_data(SurfaceTextureData(assignments=[assignment]))
+        snapshot = self.workspace.snapshot_assignment_tiling_repair(
+            assignment.assignment_id,
+            method=SURFACE_TILING_MODE_EDGE_VARIANTS,
+        )
+        before_files = {
+            path.name: path.read_bytes()
+            for path in asset_directory.iterdir()
+            if path.is_file()
+        }
+        cancellation_checks = 0
+
+        def cancellation_check() -> bool:
+            nonlocal cancellation_checks
+            cancellation_checks += 1
+            return cancellation_checks >= 8
+
+        with self.assertRaisesRegex(InterruptedError, "cancelled"):
+            prepare_surface_texture_tiling_repair(
+                snapshot,
+                cancellation_check=cancellation_check,
+            )
+
+        self.assertGreaterEqual(cancellation_checks, 8)
+        self.assertEqual(
+            {
+                path.name: path.read_bytes()
+                for path in asset_directory.iterdir()
+                if path.is_file()
+            },
+            before_files,
+        )
 
     def test_delete_current_texture_family_clears_state_assets_and_viewer(
         self,

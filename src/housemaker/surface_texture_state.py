@@ -27,6 +27,16 @@ SURFACE_PBR_ALIGNMENT_VERSION = 1
 SURFACE_TYPE_WALL = "wall"
 SURFACE_TYPE_FLOOR = "floor"
 SURFACE_TYPE_CEILING = "ceiling"
+SURFACE_TILING_MODE_NONE = "none"
+SURFACE_TILING_MODE_WHOLE_REPEATS = "whole_repeats"
+SURFACE_TILING_MODE_EDGE_VARIANTS = "edge_variants"
+SURFACE_TILING_MODES = frozenset(
+    {
+        SURFACE_TILING_MODE_NONE,
+        SURFACE_TILING_MODE_WHOLE_REPEATS,
+        SURFACE_TILING_MODE_EDGE_VARIANTS,
+    }
+)
 SURFACE_TYPES = frozenset(
     {
         SURFACE_TYPE_WALL,
@@ -164,6 +174,8 @@ class SurfaceTextureAssignment:
     enabled_pbr_maps: tuple[str, ...] = ()
     available_pbr_maps: tuple[str, ...] = ()
     pbr_alignment_version: int = 0
+    tiling_mode: str = SURFACE_TILING_MODE_NONE
+    tiling_seed: int = 0
 
     def __post_init__(self) -> None:
         assignment_id = _normalize_required_text(
@@ -231,6 +243,19 @@ class SurfaceTextureAssignment:
             <= SURFACE_PBR_ALIGNMENT_VERSION
         ):
             raise ValueError("Surface PBR alignment version is invalid.")
+        if (
+            not isinstance(self.tiling_mode, str)
+            or self.tiling_mode not in SURFACE_TILING_MODES
+        ):
+            raise ValueError("Surface texture tiling mode is invalid.")
+        if (
+            isinstance(self.tiling_seed, bool)
+            or not isinstance(self.tiling_seed, int)
+            or self.tiling_seed < 0
+        ):
+            raise ValueError(
+                "Surface texture tiling seed must be a nonnegative integer."
+            )
         selected_texture_resolution = _normalize_selected_texture_resolution(
             self.selected_texture_resolution,
             texture_variants,
@@ -337,6 +362,8 @@ class SurfaceTextureAssignment:
             "enabled_pbr_maps": list(self.enabled_pbr_maps),
             "available_pbr_maps": list(self.available_pbr_maps),
             "pbr_alignment_version": self.pbr_alignment_version,
+            "tiling_mode": self.tiling_mode,
+            "tiling_seed": self.tiling_seed,
         }
 
     @classmethod
@@ -417,6 +444,8 @@ class SurfaceTextureAssignment:
             enabled_pbr_maps=tuple(raw_enabled_pbr_maps),
             available_pbr_maps=tuple(raw_available_pbr_maps),
             pbr_alignment_version=payload.get("pbr_alignment_version", 0),
+            tiling_mode=payload.get("tiling_mode", SURFACE_TILING_MODE_NONE),
+            tiling_seed=payload.get("tiling_seed", 0),
         )
 
 

@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -223,17 +224,29 @@ from housemaker.surface_geometry import (
     add_wall_window,
     build_fixed_surfaces,
 )
-from housemaker.surface_materials import LEGACY_SURFACE_ROUGHNESS_FACTOR
+from housemaker.surface_materials import (
+    LEGACY_SURFACE_ROUGHNESS_FACTOR,
+    SurfaceMaterialSourceSpec,
+)
 from housemaker.surface_orientation_edits import (
     flip_surface_orientation,
     remap_flipped_surface_ids_with_lineage,
 )
 from housemaker.surface_texture_state import (
+    SURFACE_TILING_MODE_EDGE_VARIANTS,
+    SURFACE_TILING_MODE_WHOLE_REPEATS,
     SurfaceTextureAssignment,
     SurfaceTextureData,
 )
+from housemaker.surface_texture_tiling_dialog import (
+    SurfaceTextureTilingPreviewDialog,
+)
 from housemaker.surface_texture_workspace import (
+    PreparedSurfaceTextureTilingRepair,
     SurfaceTextureGenerationWorkspace,
+    SurfaceTextureTilingPreparationSnapshot,
+    SurfaceTextureTilingRevision,
+    prepare_surface_texture_tiling_repair,
 )
 from housemaker.texture_atlas_state import (
     ATLAS_PACKING_MODE_FULL,
@@ -480,6 +493,39 @@ class _SurfaceAmbientOcclusionPreviewThread(QThread):
         self.result = result
 
 
+# ### Surface texture tiling preparation ###
+class _SurfaceTextureTilingPreparationThread(QThread):
+    """Prepare a texture-tiling comparison without blocking the Qt event loop."""
+
+    def __init__(
+        self,
+        snapshot: SurfaceTextureTilingPreparationSnapshot,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._snapshot = snapshot
+        self.result: PreparedSurfaceTextureTilingRepair | None = None
+        self.error_message: str | None = None
+        self.was_cancelled = False
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            result = prepare_surface_texture_tiling_repair(
+                self._snapshot,
+                cancellation_check=self.isInterruptionRequested,
+            )
+        except Exception as error:  # noqa: BLE001 - worker failures cross Qt safely.
+            if self.isInterruptionRequested():
+                self.was_cancelled = True
+            else:
+                self.error_message = str(error) or type(error).__name__
+            return
+        if self.isInterruptionRequested():
+            self.was_cancelled = True
+            return
+        self.result = result
+
+
 # ### Atlas draw-call estimation ###
 class _AtlasDrawCallEstimateThread(QThread):
     """Estimate exact exported primitives from an immutable scene snapshot."""
@@ -533,7 +579,9 @@ def _build_surface_ao_pre_atlas_scene(
         raise RuntimeError("Ambient-occlusion bake cancelled.")
     surface_materials: dict[str, object] = {}
     for surface_id, source in snapshot.surface_materials:
-        if isinstance(source, tuple):
+        if isinstance(source, SurfaceMaterialSourceSpec):
+            surface_materials[surface_id] = source
+        elif isinstance(source, tuple):
             surface_materials[surface_id] = dict(source)
         else:
             surface_materials[surface_id] = source
@@ -818,6 +866,13 @@ class _CanvasStairsUndoState:
     editing_stair_id: str | None = None
 
 
+@dataclass(frozen=True)
+class _SurfaceTextureTilingUndoState:
+    """One accepted Surface tiling revision and its prior assets."""
+
+    revision: SurfaceTextureTilingRevision
+
+
 _CanvasUndoState = (
     _CanvasBlueprintUndoState
     | _CanvasTopologyUndoState
@@ -829,6 +884,7 @@ _CanvasUndoState = (
     | _CanvasPlacedObjectUndoState
     | _CanvasPlacedObjectGroupUndoState
     | _CanvasStairsUndoState
+    | _SurfaceTextureTilingUndoState
 )
 
 
@@ -1126,6 +1182,10 @@ class BlueprintWorkspace(QWidget):
             str,
             _SurfaceAmbientOcclusionBakeRuntime,
         ] = {}
+        self._surface_texture_tiling_threads: dict[
+            str,
+            _SurfaceTextureTilingPreparationThread,
+        ] = {}
         self._surface_ao_preview_runtimes: dict[
             int,
             _SurfaceAmbientOcclusionPreviewRuntime,
@@ -1199,6 +1259,7 @@ class BlueprintWorkspace(QWidget):
         self._cancel_and_join_atlas_draw_call_estimates()
         self._cancel_and_join_surface_ambient_occlusion_previews()
         self._cancel_and_join_surface_ambient_occlusion_bakes()
+        self._cancel_and_join_surface_texture_tiling_preparations()
         try:
             self.settings_widget.settings_changed.disconnect(
                 self._handle_generation_settings_changed
@@ -1408,6 +1469,16 @@ class BlueprintWorkspace(QWidget):
         self.texture_atlas_workspace = TextureAtlasWorkspace(
             asset_directory=(self._application_settings.path.parent / "texture_atlases")
         )
+        self.texture_atlas_undo_shortcut = QShortcut(
+            QKeySequence.StandardKey.Undo,
+            self.texture_atlas_workspace,
+        )
+        self.texture_atlas_undo_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self.texture_atlas_undo_shortcut.activated.connect(
+            self._handle_canvas_undo_requested
+        )
         self._external_atlas_host = ExternalFullscreenViewerHost(
             self,
             window_title="HouseMaker Atlas",
@@ -1462,6 +1533,12 @@ class BlueprintWorkspace(QWidget):
         )
         self.texture_atlas_workspace.surface_texture_delete_requested.connect(
             self._handle_atlas_surface_texture_delete_requested
+        )
+        self.texture_atlas_workspace.surface_texture_fix_tiling_requested.connect(
+            self._handle_atlas_surface_texture_fix_tiling_requested
+        )
+        self.texture_atlas_workspace.surface_texture_fix_tiling_2_requested.connect(
+            self._handle_atlas_surface_texture_fix_tiling_2_requested
         )
         self.texture_atlas_workspace.ambient_occlusion_bake_requested.connect(
             self._handle_ambient_occlusion_bake_requested
@@ -4099,6 +4176,8 @@ class BlueprintWorkspace(QWidget):
                 skipped_texture_bindings = (
                     self._restore_canvas_stairs_undo_state(state)
                 )
+            elif isinstance(state, _SurfaceTextureTilingUndoState):
+                self._restore_surface_texture_tiling_undo_state(state)
             else:
                 skipped_texture_bindings = self._restore_blueprint_undo_state(state)
         except (RuntimeError, TypeError, ValueError) as error:
@@ -4115,6 +4194,83 @@ class BlueprintWorkspace(QWidget):
             )
         else:
             self.viewer.set_surface_tools_status("Canvas action undone.")
+
+    def _restore_surface_texture_tiling_undo_state(
+        self,
+        state: _SurfaceTextureTilingUndoState,
+    ) -> None:
+        """Restore one Surface tiling revision and any changed Atlas paths."""
+
+        revision = state.revision
+        source_id = build_atlas_wall_texture_source_id(
+            revision.previous_assignment.assignment_id
+        )
+        previous_was_activated = False
+        try:
+            previous_was_activated = (
+                self.surface_texture_generation
+                .activate_assignment_tiling_revision(
+                    revision,
+                    repaired=False,
+                    emit_signals=False,
+                )
+            )
+            previous_assignment = self.surface_texture_generation.get_assignment(
+                revision.previous_assignment.assignment_id
+            )
+            if previous_assignment != revision.previous_assignment:
+                raise RuntimeError(
+                    "The original Surface texture revision is unavailable."
+                )
+            if revision.created_asset_paths:
+                previous_sources = (
+                    self._build_atlas_wall_texture_sources_for_assignment(
+                        previous_assignment,
+                        source_id,
+                    )
+                )
+                if not self.texture_atlas_workspace.transition_object_packing(
+                    source_id,
+                    previous_sources,
+                    commit_callback=lambda: (
+                        self.surface_texture_generation.get_assignment(
+                            previous_assignment.assignment_id
+                        )
+                        == previous_assignment
+                    ),
+                ):
+                    raise RuntimeError(
+                        self.texture_atlas_workspace.status_label.text().strip()
+                        or "The Atlas could not restore the original texture."
+                    )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            if previous_was_activated:
+                try:
+                    self.surface_texture_generation.activate_assignment_tiling_revision(
+                        revision,
+                        repaired=True,
+                        emit_signals=False,
+                    )
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    pass
+            raise RuntimeError(
+                str(error) or "The original Surface texture could not be restored."
+            ) from error
+
+        self._atlas_generation_signature = None
+        self.surface_texture_generation.publish_assignment_tiling_change(
+            "Original Surface texture tiling restored."
+        )
+        cleanup_failure_count = (
+            self.surface_texture_generation.discard_assignment_tiling_revision(
+                revision
+            )
+        )
+        if cleanup_failure_count:
+            self.texture_atlas_workspace.status_label.setText(
+                "Original texture restored, but some unused repaired files "
+                "could not be removed."
+            )
 
     def _restore_canvas_surface_edit_undo_state(
         self,
@@ -6114,16 +6270,24 @@ class BlueprintWorkspace(QWidget):
         for surface_id, source in sorted(
             self.surface_texture_generation.get_surface_material_sources().items()
         ):
-            frozen_source: object = (
-                tuple(
+            if isinstance(source, SurfaceMaterialSourceSpec):
+                frozen_source: object = SurfaceMaterialSourceSpec(
+                    map_sources={
+                        str(map_type): Path(map_path)
+                        for map_type, map_path in source.map_sources.items()
+                    },
+                    tiling_mode=source.tiling_mode,
+                    tiling_seed=source.tiling_seed,
+                )
+            elif isinstance(source, Mapping):
+                frozen_source = tuple(
                     sorted(
                         (str(map_type), Path(map_path))
                         for map_type, map_path in source.items()
                     )
                 )
-                if isinstance(source, Mapping)
-                else Path(source)
-            )
+            else:
+                frozen_source = Path(source)
             material_items.append((str(surface_id), frozen_source))
         return _SurfaceAmbientOcclusionSceneSnapshot(
             levels=levels,
@@ -7100,6 +7264,17 @@ class BlueprintWorkspace(QWidget):
             while runtime.thread.isRunning():
                 runtime.thread.wait(SURFACE_AO_SHUTDOWN_WAIT_MILLISECONDS)
         self._surface_ao_bake_runtimes.clear()
+
+    def _cancel_and_join_surface_texture_tiling_preparations(self) -> None:
+        """Join local tiling workers before their Surface state is replaced."""
+
+        threads = tuple(self._surface_texture_tiling_threads.values())
+        for thread in threads:
+            thread.requestInterruption()
+        for thread in threads:
+            while thread.isRunning():
+                thread.wait(SURFACE_AO_SHUTDOWN_WAIT_MILLISECONDS)
+        self._surface_texture_tiling_threads.clear()
 
     # ### GLB export ###
     def _handle_glb_export_clicked(self) -> None:
@@ -8504,6 +8679,283 @@ class BlueprintWorkspace(QWidget):
         self.texture_atlas_workspace.status_label.setText(
             "The selected Surface texture is busy or could not be deleted."
         )
+
+    def _handle_atlas_surface_texture_fix_tiling_requested(
+        self,
+        source_id: str,
+    ) -> None:
+        """Preview rotating whole repetitions without changing texture pixels."""
+
+        self._start_surface_texture_tiling_repair(
+            source_id,
+            SURFACE_TILING_MODE_WHOLE_REPEATS,
+        )
+
+    def _handle_atlas_surface_texture_fix_tiling_2_requested(
+        self,
+        source_id: str,
+    ) -> None:
+        """Preview edge-compatible rotated variants of the selected texture."""
+
+        self._start_surface_texture_tiling_repair(
+            source_id,
+            SURFACE_TILING_MODE_EDGE_VARIANTS,
+        )
+
+    def _start_surface_texture_tiling_repair(
+        self,
+        source_id: str,
+        method: str,
+    ) -> None:
+        """Prepare the selected tiling method outside the GUI thread."""
+
+        normalized_source_id = str(source_id).strip()
+        assignment_id = get_atlas_wall_texture_assignment_id(
+            normalized_source_id
+        )
+        if assignment_id is None:
+            self.texture_atlas_workspace.status_label.setText(
+                "Select a loaded Surface texture to fix its tiling."
+            )
+            return
+        if normalized_source_id in self._surface_texture_tiling_threads:
+            self.texture_atlas_workspace.status_label.setText(
+                "This Surface texture tiling preview is already being prepared."
+            )
+            return
+        try:
+            preparation_snapshot = (
+                self.surface_texture_generation
+                .snapshot_assignment_tiling_repair(assignment_id, method=method)
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            self.texture_atlas_workspace.status_label.setText(
+                "Texture tiling repair could not start: "
+                + (str(error) or type(error).__name__)
+            )
+            return
+
+        thread = _SurfaceTextureTilingPreparationThread(
+            preparation_snapshot,
+            self,
+        )
+        self._surface_texture_tiling_threads[normalized_source_id] = thread
+        thread.finished.connect(
+            partial(
+                self._handle_surface_texture_tiling_prepared,
+                normalized_source_id,
+                thread,
+            )
+        )
+        status_text = (
+            "Preparing a 3 x 3 whole-repeat rotation comparison..."
+            if method == SURFACE_TILING_MODE_WHOLE_REPEATS
+            else "Preparing a 3 x 3 edge-compatible variant comparison..."
+        )
+        self.texture_atlas_workspace.status_label.setText(status_text)
+        thread.start()
+
+    def _handle_surface_texture_tiling_prepared(
+        self,
+        source_id: str,
+        thread: _SurfaceTextureTilingPreparationThread,
+    ) -> None:
+        """Show the completed comparison and commit it only after acceptance."""
+
+        current_thread = self._surface_texture_tiling_threads.get(source_id)
+        if current_thread is not thread:
+            thread.deleteLater()
+            return
+        self._surface_texture_tiling_threads.pop(source_id, None)
+        candidate = thread.result
+        error_message = thread.error_message
+        was_cancelled = thread.was_cancelled
+        thread.deleteLater()
+        if self._is_shutdown:
+            return
+        if candidate is None:
+            if was_cancelled:
+                self.texture_atlas_workspace.status_label.setText(
+                    "Texture tiling repair cancelled; the original was kept."
+                )
+            else:
+                self.texture_atlas_workspace.status_label.setText(
+                    "Texture tiling repair failed: "
+                    + (error_message or "the preview could not be prepared.")
+                )
+            return
+        if (
+            self.surface_texture_generation.get_assignment(
+                candidate.assignment.assignment_id
+            )
+            != candidate.assignment
+        ):
+            self.texture_atlas_workspace.status_label.setText(
+                "Texture tiling preview discarded because the Surface "
+                "texture changed while it was being prepared."
+            )
+            return
+        if not candidate.has_changes:
+            self.texture_atlas_workspace.status_label.setText(
+                "No different tiling preview could be created. The original was kept."
+            )
+            return
+
+        dialog_parent = (
+            self._external_atlas_host.window
+            if self._external_atlas_host.is_active
+            else self.texture_atlas_workspace
+        )
+        try:
+            dialog = SurfaceTextureTilingPreviewDialog(
+                candidate.before_preview_png,
+                candidate.after_preview_png,
+                method=candidate.method,
+                before_seam_score=None,
+                after_seam_score=None,
+                parent=dialog_parent,
+            )
+        except (RuntimeError, TypeError, ValueError) as error:
+            self.texture_atlas_workspace.status_label.setText(
+                f"Texture tiling preview failed: {error}"
+            )
+            return
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self.texture_atlas_workspace.status_label.setText(
+                "Texture tiling repair cancelled; the original was kept."
+            )
+            return
+        self._commit_surface_texture_tiling_repair(source_id, candidate)
+
+    def _commit_surface_texture_tiling_repair(
+        self,
+        source_id: str,
+        candidate: PreparedSurfaceTextureTilingRepair,
+    ) -> None:
+        """Commit a tiling revision and update Atlas pixels only if they changed."""
+
+        revision: SurfaceTextureTilingRevision | None = None
+        repaired_was_activated = False
+        try:
+            revision = (
+                self.surface_texture_generation.stage_assignment_tiling_repair(
+                    candidate
+                )
+            )
+            repaired_was_activated = (
+                self.surface_texture_generation
+                .activate_assignment_tiling_revision(
+                    revision,
+                    repaired=True,
+                    emit_signals=False,
+                )
+            )
+            repaired_assignment = (
+                self.surface_texture_generation.get_assignment(
+                    revision.repaired_assignment.assignment_id
+                )
+            )
+            if repaired_assignment != revision.repaired_assignment:
+                raise RuntimeError(
+                    "The repaired Surface texture could not be activated."
+                )
+            if revision.created_asset_paths:
+                candidate_sources = (
+                    self._build_atlas_wall_texture_sources_for_assignment(
+                        repaired_assignment,
+                        source_id,
+                    )
+                )
+                atlas_updated = self.texture_atlas_workspace.transition_object_packing(
+                    source_id,
+                    candidate_sources,
+                    commit_callback=lambda: (
+                        self.surface_texture_generation.get_assignment(
+                            repaired_assignment.assignment_id
+                        )
+                        == repaired_assignment
+                    ),
+                )
+                if not atlas_updated:
+                    atlas_status = (
+                        self.texture_atlas_workspace.status_label.text().strip()
+                    )
+                    raise RuntimeError(
+                        atlas_status
+                        or "The Atlas could not accept the repaired texture."
+                    )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            if revision is not None and repaired_was_activated:
+                try:
+                    self.surface_texture_generation.activate_assignment_tiling_revision(
+                        revision,
+                        repaired=False,
+                        emit_signals=False,
+                    )
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    pass
+            if revision is not None:
+                self.surface_texture_generation.discard_assignment_tiling_revision(
+                    revision
+                )
+            self.texture_atlas_workspace.status_label.setText(
+                "Texture tiling repair failed; the original texture and Atlas "
+                f"were kept: {error}"
+            )
+            return
+
+        assert revision is not None
+        self._record_canvas_undo_state(
+            _SurfaceTextureTilingUndoState(revision=revision)
+        )
+        self._atlas_generation_signature = None
+        self.surface_texture_generation.publish_assignment_tiling_change(
+            "Surface texture tiling repaired."
+        )
+        self.texture_atlas_workspace.status_label.setText(
+            "Fixed the selected Surface texture tiling. Press Ctrl+Z to "
+            "restore the original revision."
+        )
+
+    def _build_atlas_wall_texture_sources_for_assignment(
+        self,
+        assignment: SurfaceTextureAssignment,
+        source_id: str,
+    ) -> tuple[AtlasObjectTextureSource, ...]:
+        """Resolve every exact source needed to transition existing placements."""
+
+        if assignment.texture_variants:
+            requested_resolutions: tuple[int | None, ...] = tuple(
+                variant.resolution for variant in assignment.texture_variants
+            )
+        else:
+            packed_resolutions = tuple(
+                dict.fromkeys(
+                    placement.texture_resolution
+                    for atlas in self.texture_atlas_workspace.get_data().atlases
+                    for placement in atlas.placements
+                    if placement.object_id == source_id
+                )
+            )
+            requested_resolutions = packed_resolutions or (None,)
+        sources: list[AtlasObjectTextureSource] = []
+        for resolution in requested_resolutions:
+            source = self._build_atlas_wall_texture_source(
+                assignment,
+                resolution,
+            )
+            if source is None:
+                resolution_label = (
+                    "active"
+                    if resolution is None
+                    else f"{resolution} x {resolution}"
+                )
+                raise ValueError(
+                    "The repaired Surface texture is missing its "
+                    f"{resolution_label} Atlas source."
+                )
+            sources.append(source)
+        return tuple(sources)
 
     def _handle_atlas_surface_assign_requested(self, source_id: str) -> None:
         """Apply and pack one surface texture as a single user transaction."""
@@ -13053,6 +13505,7 @@ class BlueprintWorkspace(QWidget):
         self._cancel_and_join_atlas_draw_call_estimates()
         self._cancel_and_join_surface_ambient_occlusion_previews()
         self._cancel_and_join_surface_ambient_occlusion_bakes()
+        self._cancel_and_join_surface_texture_tiling_preparations()
         self._pending_generation_placement_anchor = None
         self._cancel_direct_object_placement()
 

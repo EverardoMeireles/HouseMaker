@@ -6,6 +6,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+from types import MappingProxyType
 
 import numpy as np
 import trimesh
@@ -13,7 +14,6 @@ from PIL import Image
 from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
-from housemaker.surface_geometry import SURFACE_TYPES
 from housemaker.pbr_maps import (
     ATLAS_MAP_BASE_COLOR,
     ATLAS_MAP_TYPES,
@@ -21,7 +21,12 @@ from housemaker.pbr_maps import (
     PBR_MAP_NORMAL,
     PBR_MAP_ROUGHNESS,
 )
-
+from housemaker.surface_geometry import SURFACE_TYPES
+from housemaker.surface_tiling_uv import (
+    normalize_surface_tiling_mode,
+    normalize_surface_tiling_seed,
+    transform_repeating_surface_uv_mesh,
+)
 
 # ### Constants ###
 DEFAULT_SURFACE_TEXTURE_WORLD_SIZE_METERS = 2.0
@@ -33,7 +38,35 @@ LEGACY_SURFACE_ROUGHNESS_FACTOR = 0.72
 
 # ### Public source types ###
 SurfaceTextureSource = bytes | bytearray | memoryview | str | Path
-SurfaceMaterialSource = SurfaceTextureSource | Mapping[str, SurfaceTextureSource]
+
+
+@dataclass(frozen=True)
+class SurfaceMaterialSourceSpec:
+    """One PBR source family plus its repeat-level UV tiling choice."""
+
+    map_sources: Mapping[str, SurfaceTextureSource]
+    tiling_mode: str | None = None
+    tiling_seed: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.map_sources, Mapping):
+            raise TypeError("Surface material map sources must be a mapping.")
+        object.__setattr__(
+            self, "map_sources", MappingProxyType(dict(self.map_sources))
+        )
+        object.__setattr__(
+            self, "tiling_mode", normalize_surface_tiling_mode(self.tiling_mode)
+        )
+        object.__setattr__(
+            self, "tiling_seed", normalize_surface_tiling_seed(self.tiling_seed)
+        )
+
+
+SurfaceMaterialSource = (
+    SurfaceTextureSource
+    | Mapping[str, SurfaceTextureSource]
+    | SurfaceMaterialSourceSpec
+)
 
 
 # ### Material models ###
@@ -46,10 +79,18 @@ class ResolvedSurfaceMaterial:
     normal_texture_rgba: np.ndarray | None = None
     roughness_texture_rgba: np.ndarray | None = None
     metallic_texture_rgba: np.ndarray | None = None
+    tiling_mode: str | None = None
+    tiling_seed: int = 0
 
     def __post_init__(self) -> None:
         if not self.png_bytes:
             raise ValueError("A surface material PNG cannot be empty.")
+        object.__setattr__(
+            self, "tiling_mode", normalize_surface_tiling_mode(self.tiling_mode)
+        )
+        object.__setattr__(
+            self, "tiling_seed", normalize_surface_tiling_seed(self.tiling_seed)
+        )
         rgba = np.asarray(self.texture_rgba, dtype=np.uint8)
         if rgba.ndim != 3 or rgba.shape[2] != 4:
             raise ValueError("A surface material must contain RGBA pixels.")
@@ -136,6 +177,17 @@ def resolve_surface_material(
 ) -> ResolvedSurfaceMaterial:
     """Load one base PNG or aligned PBR family into owned RGBA arrays."""
 
+    if isinstance(source, SurfaceMaterialSourceSpec):
+        resolved = resolve_surface_material(source.map_sources)
+        return ResolvedSurfaceMaterial(
+            png_bytes=resolved.png_bytes,
+            texture_rgba=resolved.texture_rgba,
+            normal_texture_rgba=resolved.normal_texture_rgba,
+            roughness_texture_rgba=resolved.roughness_texture_rgba,
+            metallic_texture_rgba=resolved.metallic_texture_rgba,
+            tiling_mode=source.tiling_mode,
+            tiling_seed=source.tiling_seed,
+        )
     if isinstance(source, Mapping):
         unknown_map_types = {
             str(map_type).strip().lower() for map_type in source
@@ -274,24 +326,40 @@ def build_world_planar_textured_mesh(
         if material.roughness_texture_rgba is not None
         else LEGACY_SURFACE_ROUGHNESS_FACTOR
     )
-    return trimesh.Trimesh(
+    textured_mesh = trimesh.Trimesh(
         vertices=np.ascontiguousarray(expanded_vertices),
         faces=np.ascontiguousarray(expanded_faces),
+        vertex_normals=np.ascontiguousarray(np.repeat(face_normals, 3, axis=0)),
         visual=TextureVisuals(
             uv=np.ascontiguousarray(uv_coordinates.reshape(-1, 2)),
-            material=PBRMaterial(
-                name=material_name,
-                baseColorFactor=[255, 255, 255, 255],
-                baseColorTexture=texture_image,
-                normalTexture=normal_texture,
-                metallicRoughnessTexture=metallic_roughness_texture,
-                metallicFactor=metallic_factor,
-                roughnessFactor=roughness_factor,
-                doubleSided=bool(double_sided),
-            ),
+            material=None,
         ),
+        metadata=mesh.metadata.copy(),
         process=False,
     )
+    if material.tiling_mode is not None:
+        textured_mesh = transform_repeating_surface_uv_mesh(
+            textured_mesh,
+            mode=material.tiling_mode,
+            seed=material.tiling_seed,
+            allow_quarter_turns=(
+                material.texture_rgba.shape[0] == material.texture_rgba.shape[1]
+            ),
+        )
+    textured_mesh.visual = TextureVisuals(
+        uv=np.ascontiguousarray(textured_mesh.visual.uv),
+        material=PBRMaterial(
+            name=material_name,
+            baseColorFactor=[255, 255, 255, 255],
+            baseColorTexture=texture_image,
+            normalTexture=normal_texture,
+            metallicRoughnessTexture=metallic_roughness_texture,
+            metallicFactor=metallic_factor,
+            roughnessFactor=roughness_factor,
+            doubleSided=bool(double_sided),
+        ),
+    )
+    return textured_mesh
 
 
 def _build_metallic_roughness_texture(
@@ -361,7 +429,7 @@ def build_world_planar_face_uvs(
 
 def normalize_texture_world_size(value: object) -> float:
     if isinstance(value, bool):
-        raise ValueError("Surface texture world size must be a number.")
+        raise ValueError("Surface texture world size must be a number.")  # noqa: TRY004
     try:
         size = float(value)
     except (TypeError, ValueError, OverflowError) as error:
