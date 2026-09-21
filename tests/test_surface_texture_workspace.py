@@ -24,6 +24,7 @@ from PIL import Image
 from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import QApplication, QPushButton
 
+import housemaker.surface_texture_workspace as surface_texture_workspace_module
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.camera_models import CameraPose
 from housemaker.first_person_navigation import (
@@ -1617,7 +1618,7 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         asset_directory.mkdir(parents=True, exist_ok=True)
         surface_id = "level:2/room:5/wall:1:2"
         asset_path = asset_directory / "race-wall.png"
-        original_payload = _colored_texture_png((175, 80, 35, 255))
+        original_payload = _texture_png()
         asset_path.write_bytes(original_payload)
         assignment = _surface_assignment(
             "race-wall",
@@ -1630,6 +1631,7 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         prepared = self.workspace.prepare_assignment_tiling_repair(
             assignment.assignment_id
         )
+        self.assertEqual(prepared.method, SURFACE_TILING_MODE_EDGE_VARIANTS)
         before_files = {
             path.name: path.read_bytes()
             for path in asset_directory.iterdir()
@@ -1668,58 +1670,27 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
             )
         )
 
-    def test_whole_repeat_rotation_changes_only_metadata_and_can_be_undone(
+    def test_legacy_whole_repeat_tiling_cannot_be_created_again(
         self,
     ) -> None:
         asset_directory = self._temporary_path / "surface_assets"
         asset_directory.mkdir(parents=True, exist_ok=True)
         asset_path = asset_directory / "whole-repeat.png"
-        original_png = _texture_png()
-        asset_path.write_bytes(original_png)
+        asset_path.write_bytes(_texture_png())
         assignment = _surface_assignment(
             "whole-repeat", ("level:2/room:5/wall:1:2",), asset_path.name
         )
         self.workspace.set_data(SurfaceTextureData(assignments=[assignment]))
 
-        snapshot = self.workspace.snapshot_assignment_tiling_repair(
-            assignment.assignment_id,
-            method=SURFACE_TILING_MODE_WHOLE_REPEATS,
-            rotation_seed=41,
-        )
-        prepared = prepare_surface_texture_tiling_repair(snapshot)
-        self.assertEqual(prepared.method, SURFACE_TILING_MODE_WHOLE_REPEATS)
-        self.assertEqual(prepared.variants, ())
-        revision = self.workspace.stage_assignment_tiling_repair(prepared)
-        self.assertEqual(revision.created_asset_paths, ())
-        self.assertTrue(
-            self.workspace.activate_assignment_tiling_revision(
-                revision, repaired=True
+        with self.assertRaisesRegex(ValueError, "tiling method"):
+            self.workspace.snapshot_assignment_tiling_repair(
+                assignment.assignment_id,
+                method=SURFACE_TILING_MODE_WHOLE_REPEATS,
             )
-        )
-        active = self.workspace.get_assignment(assignment.assignment_id)
-        assert active is not None
-        self.assertEqual(active.tiling_mode, SURFACE_TILING_MODE_WHOLE_REPEATS)
-        self.assertEqual(active.tiling_seed, 41)
-        self.assertEqual(active.asset_path, assignment.asset_path)
-        self.assertEqual(asset_path.read_bytes(), original_png)
-        self.assertEqual(
-            len(tuple(asset_directory.glob("surface-tiling-*"))), 0
-        )
-        material_source = self.workspace.get_surface_material_sources()[
-            assignment.surface_ids[0]
-        ]
-        self.assertEqual(material_source.tiling_mode, active.tiling_mode)
-        self.assertEqual(material_source.tiling_seed, 41)
-
-        self.assertTrue(
-            self.workspace.activate_assignment_tiling_revision(
-                revision, repaired=False
-            )
-        )
         self.assertEqual(
             self.workspace.get_assignment(assignment.assignment_id), assignment
         )
-        self.assertEqual(self.workspace.discard_assignment_tiling_revision(revision), 0)
+        self.assertFalse(tuple(asset_directory.glob("surface-tiling-*")))
 
     def test_edge_variant_revision_preserves_slot_size_and_can_be_undone(
         self,
@@ -1828,7 +1799,27 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
             method=SURFACE_TILING_MODE_EDGE_VARIANTS,
             rotation_seed=41,
         )
-        prepared = prepare_surface_texture_tiling_repair(snapshot)
+        create_variants = (
+            surface_texture_workspace_module.create_edge_compatible_variants
+        )
+        requested_turns: list[tuple[int, int, int, int] | None] = []
+        chosen_turns: list[tuple[int, int, int, int]] = []
+
+        def record_variant_layout(*args: object, **kwargs: object) -> object:
+            requested_turns.append(kwargs["quarter_turns"])
+            result = create_variants(*args, **kwargs)
+            chosen_turns.append(result.quarter_turns)
+            return result
+
+        with patch.object(
+            surface_texture_workspace_module,
+            "create_edge_compatible_variants",
+            side_effect=record_variant_layout,
+        ):
+            prepared = prepare_surface_texture_tiling_repair(snapshot)
+        self.assertEqual(len(chosen_turns), len(SURFACE_TEXTURE_RESOLUTIONS))
+        self.assertEqual(requested_turns, [None, chosen_turns[0], chosen_turns[0]])
+        self.assertEqual(chosen_turns, [chosen_turns[0]] * len(chosen_turns))
 
         for variant in prepared.variants:
             if variant.resolution not in (512, 1024):

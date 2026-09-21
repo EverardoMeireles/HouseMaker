@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import unittest
+from itertools import permutations
 
 import numpy as np
 
@@ -20,6 +21,7 @@ from housemaker.texture_tiling import (
     repair_texture_tiling,
     texture_tiling_seam_score,
 )
+from housemaker.texture_tiling_scoring import score_variant_sheet
 
 
 # ### Fixture helpers ###
@@ -414,15 +416,41 @@ class TextureTilingRepairTests(unittest.TestCase):
 
 # ### Edge-compatible variant tests ###
 class EdgeCompatibleVariantTests(unittest.TestCase):
+    def test_auto_layout_scores_as_well_as_all_fixed_square_layouts(self) -> None:
+        # Keep the source below the candidate-search proxy size so this checks
+        # the same finished-sheet score used when choosing an arrangement.
+        size = 48
+        source = _seamed_color_texture(size, size)
+        maps = {ATLAS_MAP_BASE_COLOR: source}
+        selected = create_edge_compatible_variants(maps, seed=37)
+        selected_score = score_variant_sheet(
+            selected.maps[ATLAS_MAP_BASE_COLOR], size, size
+        )
+
+        candidate_scores = []
+        for layout in permutations((0, 1, 2, 3)):
+            candidate = create_edge_compatible_variants(
+                maps, seed=37, quarter_turns=layout
+            )
+            self.assertEqual(candidate.quarter_turns, layout)
+            candidate_scores.append(
+                score_variant_sheet(candidate.maps[ATLAS_MAP_BASE_COLOR], size, size)
+            )
+
+        self.assertLessEqual(selected_score, min(candidate_scores) + 1e-5)
+        self.assertLessEqual(selected_score, float(np.median(candidate_scores)))
+
     def test_full_tile_rotations_remove_the_common_unrotated_border(self) -> None:
         size = 64
         source = np.full((size, size, 4), 96, dtype=np.uint8)
         source[:, :, 3] = 255
-        source[3, 11, :3] = 255
+        source[size // 4, size // 3, :3] = 255
+        original = source.copy()
         result = create_edge_compatible_variants(
             {ATLAS_MAP_BASE_COLOR: source}, seed=11
         )
 
+        np.testing.assert_array_equal(source, original)
         self.assertEqual(set(result.quarter_turns), {0, 1, 2, 3})
         for index, turns in enumerate(result.quarter_turns):
             row, column = divmod(index, 2)
@@ -434,7 +462,7 @@ class EdgeCompatibleVariantTests(unittest.TestCase):
             spot_row, spot_column = np.argwhere(expected[:, :, 0] == 255)[0]
             self.assertGreaterEqual(int(actual[spot_row, spot_column, 0]), 200)
             if turns:
-                self.assertLess(int(actual[3, 11, 0]), 160)
+                self.assertLess(int(actual[size // 4, size // 3, 0]), 160)
 
     def test_full_tile_joins_reduce_native_and_mip_seams(self) -> None:
         size = 128
@@ -537,6 +565,13 @@ class EdgeCompatibleVariantTests(unittest.TestCase):
         self.assertEqual(set(result.quarter_turns), {0, 2})
         self.assertEqual(result.maps[ATLAS_MAP_BASE_COLOR].shape, (128, 192, 4))
 
+        forced = (2, 0, 2, 0)
+        fixed = create_edge_compatible_variants(
+            {ATLAS_MAP_BASE_COLOR: source}, seed=9, quarter_turns=forced
+        )
+        self.assertEqual(fixed.quarter_turns, forced)
+        self.assertEqual(fixed.maps[ATLAS_MAP_BASE_COLOR].shape, (128, 192, 4))
+
     def test_rotated_interior_normals_follow_each_quarter_turn(self) -> None:
         height = width = 72
         color = _seamed_color_texture(height, width)
@@ -584,20 +619,13 @@ class EdgeCompatibleVariantTests(unittest.TestCase):
 
         first = create_edge_compatible_variants(maps, seed=17)
         again = create_edge_compatible_variants(maps, seed=17)
-        different = create_edge_compatible_variants(maps, seed=19)
 
         self.assertEqual(first.quarter_turns, again.quarter_turns)
-        self.assertNotEqual(first.quarter_turns, different.quarter_turns)
+        self.assertEqual(set(first.quarter_turns), {0, 1, 2, 3})
         for map_type in maps:
             np.testing.assert_array_equal(first.maps[map_type], again.maps[map_type])
         np.testing.assert_array_equal(
             first.maps[PBR_MAP_ROUGHNESS], first.maps["height"]
-        )
-        self.assertFalse(
-            np.array_equal(
-                first.maps[ATLAS_MAP_BASE_COLOR],
-                different.maps[ATLAS_MAP_BASE_COLOR],
-            )
         )
 
 

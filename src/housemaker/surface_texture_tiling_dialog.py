@@ -13,11 +13,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from housemaker.surface_texture_state import (
-    SURFACE_TILING_MODE_EDGE_VARIANTS,
-    SURFACE_TILING_MODE_WHOLE_REPEATS,
-)
-
 # ### Constants ###
 PREVIEW_EDGE_PIXELS = 360
 
@@ -69,34 +64,22 @@ class SurfaceTextureTilingPreviewDialog(QDialog):
         before_preview_png: bytes,
         after_preview_png: bytes,
         *,
-        before_seam_score: float | None = None,
-        after_seam_score: float | None = None,
-        method: str = SURFACE_TILING_MODE_WHOLE_REPEATS,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("surface_texture_tiling_preview_dialog")
-        self.setWindowTitle(
-            "Fix tiling 2"
-            if method == SURFACE_TILING_MODE_EDGE_VARIANTS
-            else "Fix tiling"
-        )
+        self.setWindowTitle("Fix tiling")
         self.setModal(True)
 
         root_layout = QVBoxLayout(self)
-        if method == SURFACE_TILING_MODE_EDGE_VARIANTS:
-            explanation_text = (
-                "The previews repeat the texture 3 x 3. Four edge-compatible "
-                "rotated variants share the existing Atlas slot and are chosen "
-                "across the surface. Each variant has half the original linear "
-                "pixel resolution. The preview shows how their joins look."
-            )
-        else:
-            explanation_text = (
-                "The previews repeat the texture 3 x 3. Whole repetitions are "
-                "rotated to break up repetition without changing texture pixels "
-                "or Atlas size. Existing seams may still remain."
-            )
+        explanation_text = (
+            "The previews repeat the texture 3 x 3. Fix tiling scores "
+            "the available rotated layouts and uses gently curved joins "
+            "where neighboring details match best. The four variants "
+            "share the existing Atlas slot; each has half the original "
+            "linear pixel resolution. Check the preview for any remaining "
+            "pattern mismatch before applying."
+        )
         explanation = QLabel(explanation_text)
         explanation.setWordWrap(True)
         root_layout.addWidget(explanation)
@@ -111,15 +94,6 @@ class SurfaceTextureTilingPreviewDialog(QDialog):
             1,
         )
         root_layout.addLayout(preview_layout, 1)
-
-        if before_seam_score is not None and after_seam_score is not None:
-            score_label = QLabel(
-                "Edge mismatch: "
-                f"{float(before_seam_score):.4f} -> "
-                f"{float(after_seam_score):.4f} (lower is better)"
-            )
-            score_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            root_layout.addWidget(score_label)
 
         button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Apply

@@ -275,9 +275,8 @@ def _prepared_surface_tiling_repair(
         source_revisions=source_revisions,
         before_preview_png=preview,
         after_preview_png=preview,
-        seam_score_before=1.0,
-        seam_score_after=0.0,
         has_changes=True,
+        method=SURFACE_TILING_MODE_EDGE_VARIANTS,
     )
 
 
@@ -4119,14 +4118,10 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         )
         surface_workspace = self.workspace.surface_texture_generation
         surface_workspace.set_data(SurfaceTextureData(assignments=[assignment]))
-        candidate = replace(
-            _prepared_surface_tiling_repair(
-                surface_workspace,
-                assignment,
-                map_colors={ATLAS_MAP_BASE_COLOR: (25, 170, 210, 255)},
-            ),
-            seam_score_before=0.5,
-            seam_score_after=0.5,
+        candidate = _prepared_surface_tiling_repair(
+            surface_workspace,
+            assignment,
+            map_colors={ATLAS_MAP_BASE_COLOR: (25, 170, 210, 255)},
         )
         source_id = build_atlas_wall_texture_source_id(assignment.assignment_id)
         thread = Mock(result=candidate, error_message=None, was_cancelled=False)
@@ -4149,51 +4144,25 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         commit.assert_called_once_with(source_id, candidate)
         thread.deleteLater.assert_called_once_with()
 
-    def test_surface_tiling_buttons_dispatch_distinct_methods(self) -> None:
+    def test_surface_tiling_button_prepares_edge_variants(self) -> None:
         source_id = build_atlas_wall_texture_source_id("dispatch-wall")
-        with patch.object(
-            self.workspace, "_start_surface_texture_tiling_repair"
-        ) as start:
+        surface_workspace = self.workspace.surface_texture_generation
+        with (
+            patch.object(
+                surface_workspace, "snapshot_assignment_tiling_repair"
+            ) as snapshot,
+            patch(
+                "housemaker.main._SurfaceTextureTilingPreparationThread"
+            ) as thread_type,
+        ):
+            thread_type.return_value.isRunning.return_value = False
             atlas_workspace = self.workspace.texture_atlas_workspace
             atlas_workspace.surface_texture_fix_tiling_requested.emit(source_id)
-            atlas_workspace.surface_texture_fix_tiling_2_requested.emit(source_id)
 
-        self.assertEqual(
-            start.call_args_list,
-            [
-                call(source_id, SURFACE_TILING_MODE_WHOLE_REPEATS),
-                call(source_id, SURFACE_TILING_MODE_EDGE_VARIANTS),
-            ],
+        snapshot.assert_called_once_with(
+            "dispatch-wall", method=SURFACE_TILING_MODE_EDGE_VARIANTS
         )
-
-    def test_whole_repeat_tiling_keeps_atlas_pixels_on_commit_and_undo(self) -> None:
-        assignment = _wall_texture_assignment(
-            self.settings.path.parent / "surface_textures",
-            assignment_id="whole-repeat-wall",
-        )
-        surface_workspace = self.workspace.surface_texture_generation
-        surface_workspace.set_data(SurfaceTextureData(assignments=[assignment]))
-        candidate = surface_workspace.prepare_assignment_tiling_repair(
-            assignment.assignment_id,
-            method=SURFACE_TILING_MODE_WHOLE_REPEATS,
-        )
-        source_id = build_atlas_wall_texture_source_id(assignment.assignment_id)
-        atlas_workspace = self.workspace.texture_atlas_workspace
-
-        with patch.object(atlas_workspace, "transition_object_packing") as transition:
-            self.workspace._commit_surface_texture_tiling_repair(
-                source_id, candidate
-            )
-            self.assertEqual(
-                surface_workspace.get_assignment(assignment.assignment_id).tiling_mode,
-                SURFACE_TILING_MODE_WHOLE_REPEATS,
-            )
-            self.workspace._handle_canvas_undo_requested()
-
-        transition.assert_not_called()
-        self.assertEqual(
-            surface_workspace.get_assignment(assignment.assignment_id), assignment
-        )
+        thread_type.return_value.start.assert_called_once_with()
 
     def test_surface_ao_snapshot_preserves_tiling_material_spec(self) -> None:
         assignment = replace(
@@ -4354,8 +4323,14 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
                 repaired_assignment,
                 asset_path=assignment.asset_path,
                 texture_variants=assignment.texture_variants,
+                tiling_mode=assignment.tiling_mode,
+                tiling_seed=assignment.tiling_seed,
             ),
             assignment,
+        )
+        self.assertEqual(
+            repaired_assignment.tiling_mode,
+            SURFACE_TILING_MODE_EDGE_VARIANTS,
         )
         self.assertEqual(
             tuple(
@@ -4370,6 +4345,7 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         self.assertNotEqual(
             repaired_assignment.asset_path,
             assignment.asset_path,
+            atlas_workspace.status_label.text(),
         )
         for raw_path, payload in original_surface_files.items():
             self.assertEqual(

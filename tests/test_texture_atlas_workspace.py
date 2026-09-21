@@ -1103,7 +1103,7 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
 
         deletion_requests.assert_called_once_with(surface_source.object_id)
 
-    def test_tiling_buttons_only_request_a_loaded_surface_texture(
+    def test_tiling_button_only_requests_a_loaded_surface_texture(
         self,
     ) -> None:
         object_source = _source(
@@ -1118,12 +1118,8 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             (object_source, surface_source)
         )
         repair_requests = Mock()
-        variant_requests = Mock()
         self.workspace.surface_texture_fix_tiling_requested.connect(
             repair_requests
-        )
-        self.workspace.surface_texture_fix_tiling_2_requested.connect(
-            variant_requests
         )
 
         self.assertEqual(self.workspace.fix_tiling_button.text(), "Fix tiling")
@@ -1131,28 +1127,20 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             self.workspace.fix_tiling_button.objectName(),
             "texture_atlas_fix_tiling_button",
         )
-        self.assertEqual(self.workspace.fix_tiling_2_button.text(), "Fix tiling 2")
-        self.assertEqual(
-            self.workspace.fix_tiling_2_button.objectName(),
-            "texture_atlas_fix_tiling_2_button",
-        )
-        self.assertIn("whole repeats", self.workspace.fix_tiling_button.toolTip())
         self.assertIn(
             "edge-compatible rotated variants",
-            self.workspace.fix_tiling_2_button.toolTip(),
+            self.workspace.fix_tiling_button.toolTip(),
+        )
+        self.assertFalse(hasattr(self.workspace, "fix_tiling_2_button"))
+        self.assertFalse(
+            hasattr(self.workspace, "surface_texture_fix_tiling_2_requested")
         )
         self.assertFalse(self.workspace.fix_tiling_button.isEnabled())
-        self.assertFalse(self.workspace.fix_tiling_2_button.isEnabled())
 
         self.workspace.surface_list.setCurrentRow(0)
 
         self.assertTrue(self.workspace.fix_tiling_button.isEnabled())
-        self.assertTrue(self.workspace.fix_tiling_2_button.isEnabled())
         self.workspace.fix_tiling_button.click()
-        repair_requests.assert_called_once_with(surface_source.object_id)
-        variant_requests.assert_not_called()
-        self.workspace.fix_tiling_2_button.click()
-        variant_requests.assert_called_once_with(surface_source.object_id)
         repair_requests.assert_called_once_with(surface_source.object_id)
 
         missing_source_id = build_atlas_wall_texture_source_id(
@@ -1172,11 +1160,8 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.workspace.surface_list.setCurrentRow(0)
 
         self.assertFalse(self.workspace.fix_tiling_button.isEnabled())
-        self.assertFalse(self.workspace.fix_tiling_2_button.isEnabled())
         self.workspace.fix_tiling_button.click()
-        self.workspace.fix_tiling_2_button.click()
         repair_requests.assert_called_once_with(surface_source.object_id)
-        variant_requests.assert_called_once_with(surface_source.object_id)
 
     def test_scene_bound_sources_are_green_only_in_lists(
         self,

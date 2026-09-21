@@ -3,7 +3,9 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from itertools import permutations
 
+import cv2
 import numpy as np
 
 from housemaker.pbr_maps import (
@@ -12,6 +14,8 @@ from housemaker.pbr_maps import (
     PBR_MAP_NORMAL,
     PBR_MAP_ROUGHNESS,
 )
+from housemaker.texture_tiling_curved import build_curved_variant_sheet
+from housemaker.texture_tiling_scoring import score_variant_sheet
 
 # ### Constants ###
 _MIN_ROTATION_SIZE = 16
@@ -28,6 +32,15 @@ _MAX_EDGE_CORRECTION_RANGE_FRACTION = 0.5
 _MAX_OUTPUT_RANGE_EXTENSION_FRACTION = 0.1
 _EDGE_NEIGHBORHOOD_FRACTION = 0.03
 _MAX_EDGE_NEIGHBORHOOD_WIDTH = 64
+_CURVED_SEAM_OVERLAP_FRACTION = 0.04
+_CURVED_SEAM_MAX_OVERLAP = 64
+_CANDIDATE_TILE_EDGE = 128
+_CANDIDATE_SCORE_WEIGHTS = {
+    ATLAS_MAP_BASE_COLOR: 1.0,
+    PBR_MAP_NORMAL: 0.5,
+    PBR_MAP_ROUGHNESS: 0.25,
+    PBR_MAP_METALLIC: 0.15,
+}
 _SCALAR_MAP_TYPES = frozenset(
     {
         PBR_MAP_ROUGHNESS,
@@ -194,16 +207,16 @@ def create_edge_compatible_variants(
     *,
     reference_map_type: str = ATLAS_MAP_BASE_COLOR,
     seed: int = 0,
+    quarter_turns: tuple[int, int, int, int] | None = None,
+    tile_height: int | None = None,
+    tile_width: int | None = None,
     cancellation_check: Callable[[], bool] | None = None,
 ) -> EdgeCompatibleVariantResult:
-    """Rotate whole tiles and reconcile their seams without an inset patch.
+    """Choose the best rotated layout and join its cells with curved seams.
 
-    Each cell contains a complete source-image rotation. Color and scalar-map
-    corrections at internal and wrapped joins are distributed across each
-    whole cell; normal and metallic corrections stay local to their joins.
-    There is no shared unrotated border or square rotation boundary. The seam
-    lies between texels, and its gradient follows neighboring texels. A
-    consumer must select one sheet cell per whole texture repeat.
+    The source may be larger than an output cell. This lets all generated
+    resolutions be sampled directly from one canonical texture family while
+    keeping the selected layout identical across its variants.
     """
 
     _raise_if_tiling_repair_cancelled(cancellation_check)
@@ -214,38 +227,242 @@ def create_edge_compatible_variants(
             f"The tiling repair reference map {normalized_reference!r} is missing."
         )
     _validate_seed(seed)
-    tile_height, tile_width = next(iter(normalized_maps.values())).shape[:2]
-    generator = np.random.default_rng(seed)
-    possible_turns = (0, 1, 2, 3) if tile_height == tile_width else (0, 2, 0, 2)
-    quarter_turns = tuple(int(value) for value in generator.permutation(possible_turns))
+    source_height, source_width = next(iter(normalized_maps.values())).shape[:2]
+    output_height = _validate_variant_dimension(tile_height, source_height)
+    output_width = _validate_variant_dimension(tile_width, source_width)
+    if min(output_height, output_width) < 8:
+        available = (
+            (0, 1, 2, 3)
+            if output_height == output_width
+            else (0, 0, 2, 2)
+        )
+        small_turns = (
+            _validate_variant_turns(quarter_turns, output_height, output_width)
+            if quarter_turns is not None
+            else tuple(
+                int(turn)
+                for turn in np.random.default_rng(seed).permutation(available)
+            )
+        )
+        return EdgeCompatibleVariantResult(
+            maps=_build_small_variant_sheets(
+                normalized_maps, small_turns, output_height, output_width
+            ),
+            tile_height=output_height,
+            tile_width=output_width,
+            quarter_turns=small_turns,
+            seed=seed,
+        )
+    if quarter_turns is None:
+        selected_turns = _select_edge_variant_turns(
+            normalized_maps,
+            output_height,
+            output_width,
+            seed=seed,
+            cancellation_check=cancellation_check,
+        )
+    else:
+        selected_turns = _validate_variant_turns(
+            quarter_turns, output_height, output_width
+        )
+
+    overlap = _curved_variant_overlap(output_height, output_width)
+    prepared_maps = _prepare_curved_variant_maps(
+        normalized_maps, output_height, output_width, overlap
+    )
+    sheets = build_curved_variant_sheet(
+        prepared_maps,
+        selected_turns,
+        tile_height=output_height,
+        tile_width=output_width,
+        overlap=overlap,
+        cancellation_check=cancellation_check,
+    )
+    _raise_if_tiling_repair_cancelled(cancellation_check)
+
+    return EdgeCompatibleVariantResult(
+        maps=sheets,
+        tile_height=output_height,
+        tile_width=output_width,
+        quarter_turns=selected_turns,
+        seed=seed,
+    )
+
+
+# ### Edge-compatible layout selection ###
+def _build_small_variant_sheets(
+    texture_maps: Mapping[str, np.ndarray],
+    turns: tuple[int, int, int, int],
+    tile_height: int,
+    tile_width: int,
+) -> dict[str, np.ndarray]:
+    """Keep legacy tiny textures usable where an overlap cannot fit."""
 
     sheets: dict[str, np.ndarray] = {}
-    for map_type, source in normalized_maps.items():
-        _raise_if_tiling_repair_cancelled(cancellation_check)
-        sheet = np.empty(
-            (tile_height * 2, tile_width * 2, source.shape[2]), dtype=np.uint8
+    for map_type, source in texture_maps.items():
+        tile = _resize_curved_variant_map(
+            source, map_type, (tile_width, tile_height)
         )
-        for index, turns in enumerate(quarter_turns):
-            variant = np.rot90(source, turns).copy()
-            if map_type == PBR_MAP_NORMAL and turns:
-                variant = _rotate_tangent_normals(variant, turns)
+        sheet = np.empty((tile_height * 2, tile_width * 2, tile.shape[2]), np.uint8)
+        for index, turn in enumerate(turns):
             row, column = divmod(index, 2)
+            variant = np.rot90(tile, turn).copy()
+            if map_type == PBR_MAP_NORMAL and turn:
+                variant = _rotate_tangent_normals(variant, turn)
             sheet[
                 row * tile_height : (row + 1) * tile_height,
                 column * tile_width : (column + 1) * tile_width,
             ] = variant
         sheets[map_type] = _stitch_whole_tile_sheet(
-            sheet, map_type, tile_height, tile_width, cancellation_check
+            sheet, map_type, tile_height, tile_width, None
         )
-        _raise_if_tiling_repair_cancelled(cancellation_check)
+    return sheets
 
-    return EdgeCompatibleVariantResult(
-        maps=sheets,
-        tile_height=tile_height,
-        tile_width=tile_width,
-        quarter_turns=quarter_turns,
-        seed=seed,
+
+def _validate_variant_dimension(value: int | None, fallback: int) -> int:
+    if value is None:
+        return fallback
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("An edge-compatible tile dimension must be positive.")
+    return value
+
+
+def _validate_variant_turns(
+    turns: tuple[int, int, int, int], tile_height: int, tile_width: int
+) -> tuple[int, int, int, int]:
+    if not isinstance(turns, tuple) or len(turns) != 4 or any(
+        isinstance(turn, bool) or not isinstance(turn, (int, np.integer))
+        for turn in turns
+    ):
+        raise ValueError("An edge-compatible layout needs four quarter-turns.")
+    normalized = tuple(int(turn) for turn in turns)
+    expected = (0, 1, 2, 3) if tile_height == tile_width else (0, 0, 2, 2)
+    if tuple(sorted(normalized)) != expected:
+        raise ValueError("The selected edge-compatible rotations are invalid.")
+    return normalized
+
+
+def _curved_variant_overlap(tile_height: int, tile_width: int) -> int:
+    shortest = min(tile_height, tile_width)
+    return min(
+        _CURVED_SEAM_MAX_OVERLAP,
+        max(1, round(shortest * _CURVED_SEAM_OVERLAP_FRACTION)),
+        max(1, shortest // 4),
     )
+
+
+def _select_edge_variant_turns(
+    texture_maps: Mapping[str, np.ndarray],
+    tile_height: int,
+    tile_width: int,
+    *,
+    seed: int,
+    cancellation_check: Callable[[], bool] | None,
+) -> tuple[int, int, int, int]:
+    """Rank every valid layout after stitching a small proxy of each map."""
+
+    scale = min(1.0, _CANDIDATE_TILE_EDGE / max(tile_height, tile_width))
+    proxy_height = max(1, round(tile_height * scale))
+    proxy_width = max(1, round(tile_width * scale))
+    overlap = _curved_variant_overlap(proxy_height, proxy_width)
+    source_height, source_width = next(iter(texture_maps.values())).shape[:2]
+    proxy_input = texture_maps
+    if (source_height, source_width) == (tile_height, tile_width) and scale < 1.0:
+        # Direct callers use reflected overscan at full size. Search with the
+        # same boundary construction, rather than a cropped proxy.
+        proxy_input = {
+            map_type: _resize_curved_variant_map(
+                source, map_type, (proxy_width, proxy_height)
+            )
+            for map_type, source in texture_maps.items()
+        }
+    proxy_maps = _prepare_curved_variant_maps(
+        proxy_input, proxy_height, proxy_width, overlap
+    )
+    available = (0, 1, 2, 3) if tile_height == tile_width else (0, 0, 2, 2)
+    candidates = list(dict.fromkeys(permutations(available)))
+    np.random.default_rng(seed).shuffle(candidates)
+    best_turns = candidates[0]
+    best_score = float("inf")
+    for turns in candidates:
+        _raise_if_tiling_repair_cancelled(cancellation_check)
+        sheets = build_curved_variant_sheet(
+            proxy_maps,
+            turns,
+            tile_height=proxy_height,
+            tile_width=proxy_width,
+            overlap=overlap,
+            cancellation_check=cancellation_check,
+        )
+        score = sum(
+            _CANDIDATE_SCORE_WEIGHTS.get(map_type, 0.15)
+            * score_variant_sheet(
+                sheet, proxy_height, proxy_width, map_type=map_type
+            )
+            for map_type, sheet in sheets.items()
+        )
+        if score < best_score - 1e-9:
+            best_turns = turns
+            best_score = score
+    return _validate_variant_turns(best_turns, tile_height, tile_width)
+
+
+def _prepare_curved_variant_maps(
+    texture_maps: Mapping[str, np.ndarray],
+    tile_height: int,
+    tile_width: int,
+    overlap: int,
+) -> dict[str, np.ndarray]:
+    target_size = (tile_width + 2 * overlap, tile_height + 2 * overlap)
+    prepared: dict[str, np.ndarray] = {}
+    for map_type, source in texture_maps.items():
+        if source.shape[:2] == (tile_height, tile_width):
+            border_mode = "reflect" if min(tile_height, tile_width) > 1 else "edge"
+            prepared[map_type] = np.pad(
+                source,
+                ((overlap, overlap), (overlap, overlap), (0, 0)),
+                mode=border_mode,
+            )
+        else:
+            prepared[map_type] = _resize_curved_variant_map(
+                source, map_type, target_size
+            )
+    return prepared
+
+
+def _resize_curved_variant_map(
+    source: np.ndarray, map_type: str, target_size: tuple[int, int]
+) -> np.ndarray:
+    if source.shape[:2] == (target_size[1], target_size[0]):
+        return source.copy()
+    interpolation = (
+        cv2.INTER_AREA
+        if target_size[0] < source.shape[1] or target_size[1] < source.shape[0]
+        else cv2.INTER_LINEAR
+    )
+    if map_type == PBR_MAP_METALLIC:
+        interpolation = cv2.INTER_NEAREST
+    if map_type == PBR_MAP_NORMAL:
+        vectors = source[:, :, :3].astype(np.float32) / 127.5 - 1.0
+        vectors = cv2.resize(vectors, target_size, interpolation=interpolation)
+        lengths = np.linalg.norm(vectors, axis=2, keepdims=True)
+        vectors /= np.maximum(lengths, _MIN_NORMAL_LENGTH)
+        vectors[lengths[:, :, 0] <= _MIN_NORMAL_LENGTH] = (0.0, 0.0, 1.0)
+        encoded = np.clip(np.rint((vectors * 0.5 + 0.5) * 255.0), 0, 255).astype(
+            np.uint8
+        )
+        if source.shape[2] == 3:
+            return np.ascontiguousarray(encoded)
+        extra = cv2.resize(
+            source[:, :, 3:], target_size, interpolation=interpolation
+        )
+        if extra.ndim == 2:
+            extra = extra[:, :, None]
+        return np.ascontiguousarray(np.concatenate((encoded, extra), axis=2))
+    resized = cv2.resize(source, target_size, interpolation=interpolation)
+    if resized.ndim == 2:
+        resized = resized[:, :, None]
+    return np.ascontiguousarray(resized, dtype=np.uint8)
 
 
 def build_tiling_repair_plan(

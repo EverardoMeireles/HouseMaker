@@ -234,7 +234,6 @@ from housemaker.surface_orientation_edits import (
 )
 from housemaker.surface_texture_state import (
     SURFACE_TILING_MODE_EDGE_VARIANTS,
-    SURFACE_TILING_MODE_WHOLE_REPEATS,
     SurfaceTextureAssignment,
     SurfaceTextureData,
 )
@@ -1536,9 +1535,6 @@ class BlueprintWorkspace(QWidget):
         )
         self.texture_atlas_workspace.surface_texture_fix_tiling_requested.connect(
             self._handle_atlas_surface_texture_fix_tiling_requested
-        )
-        self.texture_atlas_workspace.surface_texture_fix_tiling_2_requested.connect(
-            self._handle_atlas_surface_texture_fix_tiling_2_requested
         )
         self.texture_atlas_workspace.ambient_occlusion_bake_requested.connect(
             self._handle_ambient_occlusion_bake_requested
@@ -8684,30 +8680,15 @@ class BlueprintWorkspace(QWidget):
         self,
         source_id: str,
     ) -> None:
-        """Preview rotating whole repetitions without changing texture pixels."""
-
-        self._start_surface_texture_tiling_repair(
-            source_id,
-            SURFACE_TILING_MODE_WHOLE_REPEATS,
-        )
-
-    def _handle_atlas_surface_texture_fix_tiling_2_requested(
-        self,
-        source_id: str,
-    ) -> None:
         """Preview edge-compatible rotated variants of the selected texture."""
 
-        self._start_surface_texture_tiling_repair(
-            source_id,
-            SURFACE_TILING_MODE_EDGE_VARIANTS,
-        )
+        self._start_surface_texture_tiling_repair(source_id)
 
     def _start_surface_texture_tiling_repair(
         self,
         source_id: str,
-        method: str,
     ) -> None:
-        """Prepare the selected tiling method outside the GUI thread."""
+        """Prepare edge-compatible tiling outside the GUI thread."""
 
         normalized_source_id = str(source_id).strip()
         assignment_id = get_atlas_wall_texture_assignment_id(
@@ -8726,7 +8707,10 @@ class BlueprintWorkspace(QWidget):
         try:
             preparation_snapshot = (
                 self.surface_texture_generation
-                .snapshot_assignment_tiling_repair(assignment_id, method=method)
+                .snapshot_assignment_tiling_repair(
+                    assignment_id,
+                    method=SURFACE_TILING_MODE_EDGE_VARIANTS,
+                )
             )
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             self.texture_atlas_workspace.status_label.setText(
@@ -8747,12 +8731,9 @@ class BlueprintWorkspace(QWidget):
                 thread,
             )
         )
-        status_text = (
-            "Preparing a 3 x 3 whole-repeat rotation comparison..."
-            if method == SURFACE_TILING_MODE_WHOLE_REPEATS
-            else "Preparing a 3 x 3 edge-compatible variant comparison..."
+        self.texture_atlas_workspace.status_label.setText(
+            "Preparing a 3 x 3 edge-compatible variant comparison..."
         )
-        self.texture_atlas_workspace.status_label.setText(status_text)
         thread.start()
 
     def _handle_surface_texture_tiling_prepared(
@@ -8810,9 +8791,6 @@ class BlueprintWorkspace(QWidget):
             dialog = SurfaceTextureTilingPreviewDialog(
                 candidate.before_preview_png,
                 candidate.after_preview_png,
-                method=candidate.method,
-                before_seam_score=None,
-                after_seam_score=None,
                 parent=dialog_parent,
             )
         except (RuntimeError, TypeError, ValueError) as error:

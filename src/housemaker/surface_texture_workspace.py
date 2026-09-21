@@ -47,8 +47,6 @@ from housemaker.pbr_maps import (
     ATLAS_MAP_BASE_COLOR,
     ATLAS_MAP_LABELS,
     ATLAS_MAP_TYPES,
-    PBR_MAP_METALLIC,
-    PBR_MAP_NORMAL,
     PBR_MAP_TYPES,
     normalize_pbr_map_types,
 )
@@ -71,7 +69,6 @@ from housemaker.surface_texture_state import (
     SURFACE_PBR_ALIGNMENT_VERSION,
     SURFACE_TILING_MODE_EDGE_VARIANTS,
     SURFACE_TILING_MODE_NONE,
-    SURFACE_TILING_MODE_WHOLE_REPEATS,
     SURFACE_TYPE_WALL,
     SurfaceTextureAssignment,
     SurfaceTextureData,
@@ -86,7 +83,6 @@ from housemaker.surface_texture_variants import (
     build_surface_texture_variants,
 )
 from housemaker.surface_texture_viewer import SurfaceTextureViewer
-from housemaker.surface_tiling_uv import quarter_turns_for_tile
 from housemaker.texture_tiling import create_edge_compatible_variants
 from housemaker.video_source import VIDEO_FILE_FILTER, VideoFrameSource, probe_video
 
@@ -399,8 +395,6 @@ class PreparedSurfaceTextureTilingRepair:
     source_revisions: tuple[tuple[str, tuple[object, ...]], ...]
     before_preview_png: bytes
     after_preview_png: bytes
-    seam_score_before: float
-    seam_score_after: float
     has_changes: bool
     method: str = SURFACE_TILING_MODE_NONE
     rotation_seed: int = 0
@@ -417,7 +411,7 @@ class SurfaceTextureTilingPreparationSnapshot:
     active_resolution: int | None
     active_base_path: Path
     rotation_seed: int
-    method: str = SURFACE_TILING_MODE_WHOLE_REPEATS
+    method: str = SURFACE_TILING_MODE_EDGE_VARIANTS
 
 
 @dataclass(frozen=True)
@@ -1089,7 +1083,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self,
         assignment_id: str,
         *,
-        method: str = SURFACE_TILING_MODE_WHOLE_REPEATS,
+        method: str = SURFACE_TILING_MODE_EDGE_VARIANTS,
     ) -> PreparedSurfaceTextureTilingRepair:
         """Build one tiling candidate without changing files or state."""
 
@@ -1104,7 +1098,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         assignment_id: str,
         *,
         rotation_seed: int | None = None,
-        method: str = SURFACE_TILING_MODE_WHOLE_REPEATS,
+        method: str = SURFACE_TILING_MODE_EDGE_VARIANTS,
     ) -> SurfaceTextureTilingPreparationSnapshot:
         """Capture one repair's immutable inputs on the workspace's GUI thread."""
 
@@ -1115,13 +1109,10 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             raise ValueError("The selected Surface texture is currently busy.")
         if assignment.tiling_mode == SURFACE_TILING_MODE_EDGE_VARIANTS:
             raise ValueError(
-                "This texture already uses Fix tiling 2. Press Ctrl+Z to "
-                "restore the original before trying another tiling method."
+                "This texture already uses Fix tiling. Press Ctrl+Z to "
+                "restore the original before applying it again."
             )
-        if method not in {
-            SURFACE_TILING_MODE_WHOLE_REPEATS,
-            SURFACE_TILING_MODE_EDGE_VARIANTS,
-        }:
+        if method != SURFACE_TILING_MODE_EDGE_VARIANTS:
             raise ValueError("The selected Surface tiling method is invalid.")
         if rotation_seed is None:
             rotation_seed = secrets.randbits(64)
@@ -1229,20 +1220,8 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 "A Surface texture file changed while its tiling preview was open."
             )
 
-        if prepared.method == SURFACE_TILING_MODE_WHOLE_REPEATS:
-            if prepared.variants:
-                raise ValueError(
-                    "Whole-repeat rotation cannot replace source texture pixels."
-                )
-            return SurfaceTextureTilingRevision(
-                previous_assignment=assignment,
-                repaired_assignment=replace(
-                    assignment,
-                    tiling_mode=SURFACE_TILING_MODE_WHOLE_REPEATS,
-                    tiling_seed=prepared.rotation_seed,
-                ),
-                created_asset_paths=(),
-            )
+        if prepared.method != SURFACE_TILING_MODE_EDGE_VARIANTS:
+            raise ValueError("The selected Surface tiling method is invalid.")
 
         revision_token = uuid.uuid4().hex
         created_asset_paths: list[str] = []
@@ -4075,29 +4054,6 @@ def prepare_surface_texture_tiling_repair(
     _raise_if_surface_texture_tiling_cancelled(cancellation_check)
     assignment = snapshot.assignment
     before_preview_png = _build_repeating_texture_preview_png(active_base_map)
-    if snapshot.method == SURFACE_TILING_MODE_WHOLE_REPEATS:
-        after_preview_png = _build_whole_repeat_rotation_preview_png(
-            active_base_map,
-            snapshot.rotation_seed,
-        )
-        has_changes = (
-            before_preview_png != after_preview_png
-            or assignment.tiling_mode != SURFACE_TILING_MODE_WHOLE_REPEATS
-            or assignment.tiling_seed != snapshot.rotation_seed
-        )
-        return PreparedSurfaceTextureTilingRepair(
-            assignment=assignment,
-            variants=(),
-            source_revisions=snapshot.source_revisions,
-            before_preview_png=before_preview_png,
-            after_preview_png=after_preview_png,
-            seam_score_before=0.0,
-            seam_score_after=0.0,
-            has_changes=has_changes,
-            method=snapshot.method,
-            rotation_seed=snapshot.rotation_seed,
-        )
-
     if snapshot.method != SURFACE_TILING_MODE_EDGE_VARIANTS:
         raise ValueError("The selected Surface tiling method is invalid.")
     if canonical_shape is None or any(size % 2 for size in canonical_shape):
@@ -4106,6 +4062,7 @@ def prepare_surface_texture_tiling_repair(
         )
     prepared_variants: list[PreparedSurfaceTextureTilingVariant] = []
     repaired_active_map: np.ndarray | None = None
+    selected_turns: tuple[int, int, int, int] | None = None
     target_variants: tuple[tuple[int | None, int | tuple[int, int]], ...] = (
         tuple(
             (variant.resolution, variant.resolution)
@@ -4125,22 +4082,16 @@ def prepare_surface_texture_tiling_repair(
             raise ValueError(
                 "Edge-compatible variants require even texture dimensions."
             )
-        source_maps: dict[str, np.ndarray] = {}
-        for map_type in ATLAS_MAP_TYPES:
-            source_map = canonical_maps.get(map_type)
-            if source_map is None:
-                continue
-            _raise_if_surface_texture_tiling_cancelled(cancellation_check)
-            source_maps[map_type] = _resize_repaired_texture_map(
-                source_map,
-                map_type,
-                (target_width // 2, target_height // 2),
-            )
-        prepared_maps = create_edge_compatible_variants(
-            source_maps,
+        prepared_result = create_edge_compatible_variants(
+            canonical_maps,
             seed=snapshot.rotation_seed,
+            quarter_turns=selected_turns,
+            tile_height=target_height // 2,
+            tile_width=target_width // 2,
             cancellation_check=cancellation_check,
-        ).maps
+        )
+        selected_turns = prepared_result.quarter_turns
+        prepared_maps = prepared_result.maps
         if resolution == snapshot.active_resolution:
             repaired_active_map = prepared_maps[ATLAS_MAP_BASE_COLOR]
         encoded_maps: list[tuple[str, bytes]] = []
@@ -4166,8 +4117,6 @@ def prepare_surface_texture_tiling_repair(
         source_revisions=snapshot.source_revisions,
         before_preview_png=before_preview_png,
         after_preview_png=after_preview_png,
-        seam_score_before=0.0,
-        seam_score_after=0.0,
         has_changes=(
             before_preview_png != after_preview_png
             or assignment.tiling_mode != SURFACE_TILING_MODE_EDGE_VARIANTS
@@ -4226,73 +4175,6 @@ def _encode_texture_map_png(texture_map: np.ndarray) -> bytes:
     return bytes(encoded)
 
 
-def _resize_repaired_texture_map(
-    texture_map: np.ndarray,
-    map_type: str,
-    resolution: int | tuple[int, int],
-) -> np.ndarray:
-    """Downsample one source map while preserving PBR map semantics."""
-
-    source = np.asarray(texture_map, dtype=np.uint8)
-    target_size = (
-        (int(resolution), int(resolution))
-        if isinstance(resolution, int)
-        else (int(resolution[0]), int(resolution[1]))
-    )
-    if source.shape[:2] == (target_size[1], target_size[0]):
-        return np.ascontiguousarray(source.copy(), dtype=np.uint8)
-    if map_type == PBR_MAP_METALLIC:
-        resized = cv2.resize(
-            source,
-            target_size,
-            interpolation=cv2.INTER_NEAREST,
-        )
-        if resized.ndim == 2:
-            resized = resized[:, :, None]
-        return np.ascontiguousarray(resized, dtype=np.uint8)
-    if map_type == PBR_MAP_NORMAL and source.shape[2] >= 3:
-        vectors = source[:, :, :3].astype(np.float32) / 127.5 - 1.0
-        vectors = cv2.resize(
-            vectors,
-            target_size,
-            interpolation=cv2.INTER_AREA,
-        )
-        lengths = np.linalg.norm(vectors, axis=2, keepdims=True)
-        fallback = np.zeros_like(vectors)
-        fallback[:, :, 2] = 1.0
-        vectors = np.where(
-            lengths > 1e-6,
-            vectors / np.maximum(lengths, 1e-6),
-            fallback,
-        )
-        encoded_vectors = np.clip(
-            np.rint((vectors + 1.0) * 127.5),
-            0,
-            255,
-        ).astype(np.uint8)
-        if source.shape[2] == 3:
-            return np.ascontiguousarray(encoded_vectors)
-        extra_channels = cv2.resize(
-            source[:, :, 3:],
-            target_size,
-            interpolation=cv2.INTER_AREA,
-        )
-        if extra_channels.ndim == 2:
-            extra_channels = extra_channels[:, :, None]
-        return np.ascontiguousarray(
-            np.concatenate((encoded_vectors, extra_channels), axis=2),
-            dtype=np.uint8,
-        )
-    resized = cv2.resize(
-        source,
-        target_size,
-        interpolation=cv2.INTER_AREA,
-    )
-    if resized.ndim == 2:
-        resized = resized[:, :, None]
-    return np.ascontiguousarray(resized, dtype=np.uint8)
-
-
 def _build_repeating_texture_preview_png(texture_map: np.ndarray) -> bytes:
     """Encode a bounded 3-by-3 repetition that makes edge seams obvious."""
 
@@ -4335,32 +4217,6 @@ def _build_tiling_preview_tile(texture_map: np.ndarray) -> np.ndarray:
     if tile.ndim == 2:
         tile = tile[:, :, None]
     return np.ascontiguousarray(tile)
-
-
-def _build_whole_repeat_rotation_preview_png(
-    texture_map: np.ndarray,
-    seed: int,
-) -> bytes:
-    """Preview the same signed-tile rotations used by Canvas and GLB export."""
-
-    tile = _build_tiling_preview_tile(texture_map)
-    allow_odd_turns = tile.shape[0] == tile.shape[1]
-    rows: list[np.ndarray] = []
-    for row_index in range(3):
-        tiles = [
-            np.rot90(
-                tile,
-                quarter_turns_for_tile(
-                    column,
-                    2 - row_index,
-                    seed,
-                    allow_odd_turns=allow_odd_turns,
-                ),
-            )
-            for column in range(3)
-        ]
-        rows.append(np.concatenate(tiles, axis=1))
-    return _encode_texture_map_png(np.concatenate(rows, axis=0))
 
 
 def _build_edge_variant_preview_png(texture_sheet: np.ndarray) -> bytes:
