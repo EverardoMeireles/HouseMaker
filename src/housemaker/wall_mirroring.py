@@ -1,11 +1,13 @@
 # ### Imports ###
 from __future__ import annotations
 
+import copy
 import math
 from collections import deque
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
+from housemaker.doorway_geometry import doorway_indices_on_removed_wall_edges
 from housemaker.level_coordinates import level_image_to_world_xy
 from housemaker.models import (
     MAX_LEVEL_INDEX,
@@ -700,6 +702,10 @@ def _remove_wall_mirror_link_closure(
         level.index: level.vertex_data.clone()
         for level in levels
     }
+    doorway_snapshots = {
+        level.index: copy.deepcopy(level.doorways)
+        for level in levels
+    }
     changed_levels: set[int] = set()
     try:
         for link in sorted(
@@ -711,12 +717,31 @@ def _remove_wall_mirror_link_closure(
             if target_level is None:
                 changed_levels.add(link.source_level_index)
                 continue
+            removed_doorway_indices = doorway_indices_on_removed_wall_edges(
+                target_level.vertex_data,
+                target_level.doorways,
+                (
+                    edge
+                    for edge in target_level.vertex_data.edges
+                    if link.target_vertex_id in (
+                        edge.start_vertex_id,
+                        edge.end_vertex_id,
+                    )
+                ),
+            )
             if target_level.vertex_data.delete_vertex(link.target_vertex_id):
                 changed_levels.add(link.target_level_index)
+                if removed_doorway_indices:
+                    target_level.doorways[:] = [
+                        doorway
+                        for index, doorway in enumerate(target_level.doorways)
+                        if index not in removed_doorway_indices
+                    ]
             changed_levels.add(link.source_level_index)
     except Exception:
         for level in levels:
             level.vertex_data.copy_from(level_snapshots[level.index])
+            level.doorways[:] = doorway_snapshots[level.index]
         raise
 
     remaining_links = normalize_wall_mirror_links(

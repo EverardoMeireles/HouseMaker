@@ -15,8 +15,8 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from housemaker.blueprint_canvas import (
-    BlueprintCanvas,
     STAIR_FLOATING_WITH_RISER_COLOR,
+    BlueprintCanvas,
     StairPlacement,
     StairSectionPlacement,
     _get_stair_style_color,
@@ -29,7 +29,6 @@ from housemaker.models import (
     STAIR_STYLE_SUPPORTED,
     LevelData,
 )
-
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -469,8 +468,10 @@ class StairCanvasTests(unittest.TestCase):
         self.assertEqual(
             errors,
             [
-                "Place the second point of the current stair section before "
-                "confirming."
+                (
+                    "Place the second point of the current stair section before "
+                    "confirming."
+                )
             ],
         )
 
@@ -565,8 +566,10 @@ class StairCanvasTests(unittest.TestCase):
         self.assertEqual(
             errors,
             [
-                "Return to level 2 and place the second point of this stair "
-                "segment."
+                (
+                    "Return to level 2 and place the second point of this stair "
+                    "segment."
+                )
             ],
         )
 
@@ -625,7 +628,7 @@ class StairCanvasTests(unittest.TestCase):
         self.assertIsNone(canvas.selected_stair_index)
         self.assertEqual(canvas.stairs, stairs)
 
-    def test_plain_click_on_a_bound_stair_point_selects_its_canvas_vertex(
+    def test_plain_click_on_a_bound_stair_point_selects_the_stair(
         self,
     ) -> None:
         level = _build_level(2)
@@ -641,8 +644,101 @@ class StairCanvasTests(unittest.TestCase):
             pos=_image_position(canvas, vertex.x, vertex.y),
         )
 
+        self.assertIsNone(canvas.selected_vertex_id)
+        self.assertEqual(canvas.selected_stair_index, 0)
+        self.assertEqual(canvas.selected_stair_endpoint_name, "start_a")
+
+        QTest.mouseClick(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.ShiftModifier,
+            pos=_image_position(canvas, vertex.x, vertex.y),
+        )
+
         self.assertEqual(canvas.selected_vertex_id, vertex.id)
         self.assertIsNone(canvas.selected_stair_index)
+
+    def test_dragging_stair_point_previews_then_emits_edit_on_release(self) -> None:
+        level = _build_level(2)
+        canvas = self._build_canvas(level)
+        stair = _four_point_stair_dict()
+        canvas.set_stair_context([stair], level)
+        finished: list[tuple[int, str, float, float, bool]] = []
+        canvas.stair_point_drag_finished.connect(
+            lambda *args: finished.append(args)
+        )
+        start = _image_position(canvas, 20.0, 30.0)
+        target = _image_position(canvas, 35.0, 42.0)
+
+        QTest.mousePress(canvas, Qt.MouseButton.LeftButton, pos=start)
+        QTest.mouseMove(canvas, target)
+
+        self.assertEqual(canvas.selected_stair_index, 0)
+        self.assertEqual(canvas.selected_stair_endpoint_name, "start_a")
+        preview = canvas._stair_drag_preview_point
+        self.assertIsNotNone(preview)
+        self.assertAlmostEqual(preview[0], 35.0, delta=0.1)
+        self.assertAlmostEqual(preview[1], 42.0, delta=0.1)
+        self.assertEqual(stair["start_a_x"], 20.0)
+        self.assertEqual(finished, [])
+        with (
+            patch.object(canvas, "_paint_stair_segment") as paint_segment,
+            patch.object(canvas, "_paint_stair_route_continuity"),
+        ):
+            canvas._paint_stairs(object())  # type: ignore[arg-type]
+        painted_point = paint_segment.call_args.kwargs["point_a"]
+        self.assertLess(
+            (painted_point - QPointF(target)).manhattanLength(),
+            2.0,
+        )
+
+        QTest.mouseRelease(canvas, Qt.MouseButton.LeftButton, pos=target)
+
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0][:2], (0, "start_a"))
+        self.assertAlmostEqual(finished[0][2], 35.0, delta=0.1)
+        self.assertAlmostEqual(finished[0][3], 42.0, delta=0.1)
+        self.assertTrue(finished[0][4])
+        self.assertIsNone(canvas._stair_drag_preview_point)
+
+    def test_clicking_stair_point_does_not_emit_drag_edit(self) -> None:
+        level = _build_level(2)
+        canvas = self._build_canvas(level)
+        canvas.set_stair_context([_four_point_stair_dict()], level)
+        finished: list[tuple[object, ...]] = []
+        canvas.stair_point_drag_finished.connect(
+            lambda *args: finished.append(args)
+        )
+
+        QTest.mouseClick(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            pos=_image_position(canvas, 20.0, 30.0),
+        )
+
+        self.assertEqual(canvas.selected_stair_index, 0)
+        self.assertEqual(finished, [])
+
+    def test_delete_after_plain_stair_point_selection_requests_stair_removal(
+        self,
+    ) -> None:
+        level = _build_level(2)
+        canvas = self._build_canvas(level)
+        canvas.set_stair_context([_four_point_stair_dict()], level)
+        deleted: list[int] = []
+        canvas.stair_delete_requested.connect(deleted.append)
+
+        QTest.mouseClick(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            pos=_image_position(canvas, 50.0, 30.0),
+        )
+        self.assertEqual(canvas.selected_stair_endpoint_name, "start_b")
+        QTest.keyClick(canvas, Qt.Key.Key_Delete)
+
+        self.assertEqual(deleted, [0])
+        self.assertIsNone(canvas.selected_stair_index)
+        self.assertIsNone(canvas.selected_stair_endpoint_name)
 
     def test_intermediate_section_is_painted_and_can_select_its_stair(
         self,

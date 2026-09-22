@@ -5463,6 +5463,102 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         )
         self.assertIn("Deleted generated object", atlas_workspace.status_label.text())
 
+    def test_atlas_permanent_object_delete_removes_every_selected_object(
+        self,
+    ) -> None:
+        generation = self.workspace.generation
+        asset_directory = generation._asset_directory
+        records = tuple(
+            _generated_object_record_with_variants(
+                asset_directory,
+                object_id=object_id,
+                object_name=object_id.title(),
+                resolutions=(512,),
+                selected_resolution=512,
+                placement=GeneratedObjectPlacement(
+                    level_index=self.workspace.current_level.index,
+                    image_x=20.0 + index * 10.0,
+                    image_y=30.0,
+                ),
+            )
+            for index, object_id in enumerate(
+                ("delete-chair", "keep-lamp", "delete-table")
+            )
+        )
+        generation.set_data(GenerationData(generated_objects=list(records)))
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        atlas_data = TextureAtlasData()
+        atlas = atlas_data.create_atlas("Objects", 2048, atlas_id="objects")
+        atlas_workspace.set_data(atlas_data)
+        self.workspace._atlas_generation_signature = None
+        self.workspace._sync_atlas_object_texture_sources(
+            automatically_assign_scene_textures=False
+        )
+        for record in records:
+            self.assertTrue(
+                atlas_workspace.assign_source_to_selected_atlas(record.object_id)
+            )
+        self.workspace.workspace_tabs.setCurrentWidget(atlas_workspace)
+        _qt_application.processEvents()
+        object_list = atlas_workspace.object_list
+        rows_by_id = {
+            object_list.item(row).data(Qt.ItemDataRole.UserRole): row
+            for row in range(object_list.count())
+        }
+        for object_id, modifier in (
+            ("delete-chair", Qt.KeyboardModifier.NoModifier),
+            ("delete-table", Qt.KeyboardModifier.ControlModifier),
+        ):
+            item = object_list.item(rows_by_id[object_id])
+            QTest.mouseClick(
+                object_list.viewport(),
+                Qt.MouseButton.LeftButton,
+                modifier,
+                object_list.visualItemRect(item).center(),
+            )
+        self.assertEqual(
+            atlas_workspace.selected_object_texture_ids,
+            ("delete-chair", "delete-table"),
+        )
+
+        with patch(
+            "housemaker.main.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Cancel,
+        ) as question:
+            atlas_workspace.delete_object_button.click()
+
+        question.assert_called_once()
+        self.assertEqual(
+            generation.get_generated_object_ids(),
+            ("delete-chair", "keep-lamp", "delete-table"),
+        )
+
+        with patch(
+            "housemaker.main.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ) as question:
+            atlas_workspace.delete_object_button.click()
+            _qt_application.processEvents()
+
+        question.assert_called_once()
+        self.assertIn("2 generated objects", question.call_args.args[2])
+        self.assertEqual(generation.get_generated_object_ids(), ("keep-lamp",))
+        updated_atlas = atlas_workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert updated_atlas is not None
+        for object_id in ("delete-chair", "delete-table"):
+            self.assertIsNone(updated_atlas.placement_for_object(object_id))
+            self.assertFalse(
+                (asset_directory / f"{object_id}.texture-512.glb").exists()
+            )
+        self.assertIsNotNone(updated_atlas.placement_for_object("keep-lamp"))
+        self.assertTrue(
+            (asset_directory / "keep-lamp.texture-512.glb").is_file()
+        )
+        self.assertIn(
+            "Deleted 2 of 2 selected generated objects",
+            atlas_workspace.status_label.text(),
+        )
+
     def test_changed_object_is_routed_to_atlas_path_refresh_once(self) -> None:
         changed_record = SimpleNamespace(object_id="chair")
 

@@ -2797,6 +2797,7 @@ class GlbViewerWidget(QWidget):
     object_placement_cancelled = Signal(str)
     canvas_surface_selection_changed = Signal(object)
     canvas_stair_part_selection_changed = Signal(object)
+    canvas_stair_deletion_requested = Signal(object)
     canvas_stair_preview_cancelled = Signal()
     canvas_surface_orientation_flip_requested = Signal(str)
     face_selection_changed = Signal(object)
@@ -4963,6 +4964,19 @@ class GlbViewerWidget(QWidget):
         """Route Delete to Canvas placement removal or the generic consumer."""
 
         self._invalidate_external_canvas_rectangle_selection()
+        selected_stair_ids = tuple(
+            dict.fromkeys(
+                part.stair_id
+                for semantic_id in self._selected_canvas_stair_part_ids
+                if (
+                    part := self._canvas_stair_part_targets.get(semantic_id)
+                ) is not None
+            )
+        )
+        if self._window_editing_enabled and selected_stair_ids:
+            self.set_selected_canvas_stair_part_ids(())
+            self.canvas_stair_deletion_requested.emit(selected_stair_ids)
+            return
         if self._get_selected_canvas_opening_target() is not None:
             # Openings are structural edits. Delete must never fall through to
             # an unrelated face/object consumer merely because one is selected.

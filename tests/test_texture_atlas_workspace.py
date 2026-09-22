@@ -1257,6 +1257,71 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         assert retained is not None
         self.assertIsNotNone(retained.placement_for_object(source.object_id))
 
+    def test_delete_object_button_requests_all_ctrl_and_shift_selected_objects(
+        self,
+    ) -> None:
+        sources = tuple(
+            _source(object_id, directory=self._temporary_directory.name)
+            for object_id in ("chair", "table", "lamp")
+        )
+        self.workspace.set_object_texture_sources(
+            sources,
+            deletable_object_ids=tuple(source.object_id for source in sources),
+        )
+        deletion_requests = Mock()
+        self.workspace.object_delete_requested.connect(deletion_requests)
+        object_list = self.workspace.object_list
+        for row, modifier in (
+            (0, Qt.KeyboardModifier.NoModifier),
+            (2, Qt.KeyboardModifier.ControlModifier),
+            (1, Qt.KeyboardModifier.ShiftModifier),
+        ):
+            QTest.mouseClick(
+                object_list.viewport(),
+                Qt.MouseButton.LeftButton,
+                modifier,
+                object_list.visualItemRect(object_list.item(row)).center(),
+            )
+
+        self.assertEqual(
+            self.workspace.selected_object_texture_ids,
+            ("chair", "table", "lamp"),
+        )
+        self.workspace.delete_object_button.click()
+
+        deletion_requests.assert_called_once_with(("chair", "table", "lamp"))
+
+    def test_delete_object_button_includes_selected_object_when_active_is_unavailable(
+        self,
+    ) -> None:
+        sources = tuple(
+            _source(object_id, directory=self._temporary_directory.name)
+            for object_id in ("completed-chair", "draft-table")
+        )
+        self.workspace.set_object_texture_sources(
+            sources,
+            deletable_object_ids=("completed-chair",),
+        )
+        deletion_requests = Mock()
+        self.workspace.object_delete_requested.connect(deletion_requests)
+        object_list = self.workspace.object_list
+        QTest.mouseClick(
+            object_list.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.ControlModifier,
+            object_list.visualItemRect(object_list.item(1)).center(),
+        )
+
+        self.assertEqual(
+            self.workspace.selected_object_texture_ids,
+            ("completed-chair", "draft-table"),
+        )
+        self.assertEqual(self.workspace.selected_object_texture_id, "draft-table")
+        self.assertTrue(self.workspace.delete_object_button.isEnabled())
+        self.workspace.delete_object_button.click()
+
+        deletion_requests.assert_called_once_with("completed-chair")
+
     def test_delete_texture_button_only_requests_permanent_surface_deletion(
         self,
     ) -> None:

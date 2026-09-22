@@ -2,19 +2,94 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable, Sequence
 
 from housemaker.models import (
     DEFAULT_DOORWAY_ARCH_AMOUNT,
     DOORWAY_SHAPE_ARCH,
     DOORWAY_SHAPE_RECTANGULAR,
+    PIXEL_TO_METER,
+    DoorwayData,
+    Edge,
+    VertexData,
     normalize_doorway_arch_amount,
     normalize_doorway_shape,
 )
 
-
 # ### Constants ###
 DOORWAY_ARCH_SEGMENT_COUNT = 64
 DOORWAY_PROFILE_EPSILON = 1e-9
+DOORWAY_WALL_ALIGNMENT_MINIMUM = 0.95
+
+
+# ### Wall ownership helpers ###
+def doorway_indices_on_removed_wall_edges(
+    vertex_data: VertexData,
+    doorways: Sequence[DoorwayData],
+    removed_edges: Iterable[Edge],
+) -> set[int]:
+    """Find openings supported by removed wall edges in image coordinates.
+
+    Doorways predate stable wall IDs, so ownership is determined by overlap
+    with their oriented width/depth footprint. Perpendicular crossing walls
+    and parallel walls outside that footprint are not owners.
+    """
+
+    edge_points: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    for edge in removed_edges:
+        start = vertex_data.get_vertex(edge.start_vertex_id)
+        end = vertex_data.get_vertex(edge.end_vertex_id)
+        if start is not None and end is not None:
+            edge_points.append(((start.x, start.y), (end.x, end.y)))
+
+    return {
+        index
+        for index, doorway in enumerate(doorways)
+        if any(
+            _wall_edge_overlaps_doorway(doorway, start, end)
+            for start, end in edge_points
+        )
+    }
+
+
+def _wall_edge_overlaps_doorway(
+    doorway: DoorwayData,
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> bool:
+    angle = math.radians(doorway.rotation_degrees)
+    depth_axis = (math.cos(angle), math.sin(angle))
+    width_axis = (-depth_axis[1], depth_axis[0])
+    delta = (end[0] - start[0], end[1] - start[1])
+    edge_length = math.hypot(*delta)
+    if edge_length <= DOORWAY_PROFILE_EPSILON:
+        return False
+    alignment = abs(
+        (delta[0] * width_axis[0] + delta[1] * width_axis[1])
+        / edge_length
+    )
+    if alignment < DOORWAY_WALL_ALIGNMENT_MINIMUM:
+        return False
+
+    local_points = tuple(
+        (
+            offset_x * width_axis[0] + offset_y * width_axis[1],
+            offset_x * depth_axis[0] + offset_y * depth_axis[1],
+        )
+        for offset_x, offset_y in (
+            (start[0] - doorway.center_x, start[1] - doorway.center_y),
+            (end[0] - doorway.center_x, end[1] - doorway.center_y),
+        )
+    )
+    half_width = doorway.width_meters / PIXEL_TO_METER / 2.0
+    half_depth = doorway.depth_meters / PIXEL_TO_METER / 2.0
+    width_overlap = min(max(point[0] for point in local_points), half_width) - max(
+        min(point[0] for point in local_points), -half_width
+    )
+    depth_overlap = min(max(point[1] for point in local_points), half_depth) - max(
+        min(point[1] for point in local_points), -half_depth
+    )
+    return width_overlap > DOORWAY_PROFILE_EPSILON and depth_overlap >= -1e-6
 
 
 # ### Public profile helpers ###

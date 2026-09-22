@@ -63,6 +63,7 @@ from housemaker.models import (
     WindowData,
     create_default_doorway_presets,
     create_default_levels,
+    create_fallback_doorway_preset,
     normalize_doorway_arch_amount,
     normalize_doorway_shape,
 )
@@ -98,6 +99,10 @@ class ProjectData:
     stairs: list[StairData] = field(default_factory=list)
     texture_atlases: TextureAtlasData = field(default_factory=TextureAtlasData)
     wall_mirror_links: tuple[WallMirrorVertexLink, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.doorway_presets:
+            self.doorway_presets = [create_fallback_doorway_preset()]
 
 
 # ### Public helpers ###
@@ -549,6 +554,7 @@ def _add_legacy_stair_id(raw_stair: object, stair_position: int) -> object:
 def _serialize_doorway_presets(
     doorway_presets: list[DoorwayPreset],
 ) -> list[dict[str, float | str]]:
+    presets_to_serialize = doorway_presets or [create_fallback_doorway_preset()]
     return [
         {
             "width_meters": float(preset.width_meters),
@@ -556,7 +562,7 @@ def _serialize_doorway_presets(
             "shape": preset.shape,
             "arch_amount": float(preset.arch_amount),
         }
-        for preset in doorway_presets
+        for preset in presets_to_serialize
     ]
 
 
@@ -595,7 +601,7 @@ def _deserialize_doorway_presets(raw_presets: object) -> list[DoorwayPreset]:
             )
         )
 
-    return doorway_presets
+    return doorway_presets or [create_fallback_doorway_preset()]
 
 
 def _serialize_doorway(doorway: DoorwayData) -> dict[str, float | str]:

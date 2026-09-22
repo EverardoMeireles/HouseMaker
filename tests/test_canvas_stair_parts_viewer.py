@@ -544,6 +544,27 @@ class CanvasStairPartViewerTests(unittest.TestCase):
         self.assertEqual(resolved.part_kind, STAIR_PART_TREADS)
         self.assertEqual(len(self.viewer._canvas_stair_part_selection_items), 2)
 
+    def test_delete_selected_stair_part_requests_its_whole_stair(self) -> None:
+        treads = _build_stair_part(
+            STAIR_PART_TREADS,
+            center=(0.0, 0.0, 0.5),
+        )
+        risers = _build_stair_part(
+            STAIR_PART_RISERS,
+            center=(2.0, 0.0, 0.5),
+        )
+        self._install(treads, risers)
+        requested: list[object] = []
+        self.viewer.canvas_stair_deletion_requested.connect(requested.append)
+        self.viewer.set_selected_canvas_stair_part_ids(
+            (treads.semantic_id, risers.semantic_id)
+        )
+
+        self.viewer._handle_view_delete_requested()
+
+        self.assertEqual(requested, [(treads.stair_id,)])
+        self.assertEqual(self.viewer.get_selected_canvas_stair_part_ids(), ())
+
     def test_clicking_any_component_selects_one_part_not_one_step(self) -> None:
         treads = _build_stair_part(
             STAIR_PART_TREADS,

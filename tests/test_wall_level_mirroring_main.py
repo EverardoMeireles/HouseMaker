@@ -21,7 +21,7 @@ from housemaker.level_coordinates import (
     level_world_to_image_xy,
 )
 from housemaker.main import BlueprintWorkspace
-from housemaker.models import LevelData, RoomData, VertexData
+from housemaker.models import DoorwayData, LevelData, RoomData, VertexData
 from housemaker.wall_mirroring import WallMirrorVertexLink
 
 # ### Module state ###
@@ -356,6 +356,68 @@ class WallLevelMirroringMainTests(unittest.TestCase):
             links_before_delete,
         )
         self.assertEqual(self.workspace.canvas.selected_vertex_ids, (1, 2))
+
+    def test_removing_mirrored_wall_removes_and_undo_restores_its_doorway(
+        self,
+    ) -> None:
+        self._select_source_wall_vertices(1, 2)
+        self.workspace.wall_mirror_up_button.click()
+        target_ids = self._target_ids((1, 2), self.upper_level.index)
+        first = self.upper_level.vertex_data.get_vertex(target_ids[1])
+        second = self.upper_level.vertex_data.get_vertex(target_ids[2])
+        assert first is not None and second is not None
+        doorway = DoorwayData(
+            center_x=(first.x + second.x) / 2.0,
+            center_y=(first.y + second.y) / 2.0,
+            width_meters=0.9,
+            height_meters=2.1,
+            rotation_degrees=90.0,
+        )
+        self.upper_level.doorways.append(doorway)
+        self.workspace._reset_viewer_doorway_snapshots()
+
+        self.workspace.wall_mirror_undo_button.click()
+        self.assertEqual(self.upper_level.doorways, [])
+        self.workspace._commit_pending_wall_vertex_update()
+        self.assertEqual(
+            self.workspace._viewer_doorways_by_level_index[self.upper_level.index],
+            (),
+        )
+
+        _send_ctrl_z(self.workspace)
+        self.assertEqual(self.upper_level.doorways, [doorway])
+        self.assertEqual(
+            self.workspace._viewer_doorways_by_level_index[self.upper_level.index],
+            (doorway,),
+        )
+
+    def test_deleting_source_wall_restores_mirrored_doorway_on_undo(self) -> None:
+        self._select_source_wall_vertices(1, 2)
+        self.workspace.wall_mirror_up_button.click()
+        target_ids = self._target_ids((1, 2), self.upper_level.index)
+        first = self.upper_level.vertex_data.get_vertex(target_ids[1])
+        second = self.upper_level.vertex_data.get_vertex(target_ids[2])
+        assert first is not None and second is not None
+        doorway = DoorwayData(
+            center_x=(first.x + second.x) / 2.0,
+            center_y=(first.y + second.y) / 2.0,
+            width_meters=0.9,
+            height_meters=2.1,
+            rotation_degrees=90.0,
+        )
+        self.upper_level.doorways.append(doorway)
+        self.workspace._reset_viewer_doorway_snapshots()
+
+        self.workspace.canvas._delete_selected_vertices()
+        self.workspace._commit_pending_wall_vertex_update()
+        self.assertEqual(self.upper_level.doorways, [])
+
+        _send_ctrl_z(self.workspace)
+        self.assertEqual(self.upper_level.doorways, [doorway])
+        self.assertEqual(
+            self.workspace._viewer_doorways_by_level_index[self.upper_level.index],
+            (doorway,),
+        )
 
     def test_dedicated_undo_clears_selected_outgoing_mirrors_atomically(
         self,

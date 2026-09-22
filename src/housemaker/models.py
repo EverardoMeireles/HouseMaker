@@ -27,6 +27,7 @@ MIN_FLOOR_THICKNESS_METERS = 0.01
 MAX_FLOOR_THICKNESS_METERS = 10.0
 DEFAULT_DOORWAY_WIDTH_METERS = 0.90
 DEFAULT_DOORWAY_HEIGHT_METERS = 2.10
+FALLBACK_DOORWAY_PRESET_SIZE_METERS = 1.0
 DEFAULT_DOORWAY_DEPTH_METERS = 0.20
 DEFAULT_DOORWAY_BOTTOM_HEIGHT_METERS = 0.0
 DOORWAY_SHAPE_RECTANGULAR = "rectangular"
@@ -1824,6 +1825,16 @@ def _migrate_legacy_stair_centerline(
         normalized_end_y + lateral_y,
         normalized_end_x - lateral_x,
         normalized_end_y - lateral_y,
+    )
+
+
+# ### Doorway preset helpers ###
+def create_fallback_doorway_preset() -> DoorwayPreset:
+    """Return the neutral preset used whenever a preset list becomes empty."""
+
+    return DoorwayPreset(
+        width_meters=FALLBACK_DOORWAY_PRESET_SIZE_METERS,
+        height_meters=FALLBACK_DOORWAY_PRESET_SIZE_METERS,
     )
 
 

@@ -24,6 +24,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QWidget
 
 from housemaker.camera_models import CameraPose
+from housemaker.doorway_geometry import doorway_indices_on_removed_wall_edges
 from housemaker.level_coordinates import level_world_to_image_xy
 from housemaker.models import (
     DEFAULT_CANVAS_LEVEL_SCALE,
@@ -33,8 +34,10 @@ from housemaker.models import (
     DOORWAY_SHAPE_ARCH,
     MAX_CANVAS_LEVEL_SCALE,
     MAX_CANVAS_OFFSET_PIXELS,
+    MAX_DOORWAY_WIDTH_METERS,
     MIN_CANVAS_LEVEL_SCALE,
     MIN_CANVAS_OFFSET_PIXELS,
+    MIN_DOORWAY_WIDTH_METERS,
     PIXEL_TO_METER,
     STAIR_STYLE_FLOATING,
     STAIR_STYLE_FLOATING_WITH_RISER,
@@ -101,6 +104,8 @@ CENTER_SNAP_TOLERANCE_SCREEN = 10.0
 CENTER_SNAP_EQUAL_ANGLE_TOLERANCE_DEGREES = 1.0
 DRAG_THRESHOLD_SCREEN = 4.0
 WINDOW_STRIP_HALF_WIDTH_SCREEN = 5.0
+DOORWAY_WIDTH_HANDLE_RADIUS_SCREEN = 7.0
+DOORWAY_WIDTH_HANDLE_HIT_RADIUS_SCREEN = 11.0
 MIN_ZOOM_SCALE = 1.0
 MAX_ZOOM_SCALE = 16.0
 ZOOM_STEP_FACTOR = 1.15
@@ -204,6 +209,7 @@ class EdgeHit:
 @dataclass(frozen=True)
 class DoorwayHit:
     doorway_index: int
+    width_side_sign: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -341,6 +347,8 @@ class BlueprintCanvas(QWidget):
     doorway_dimension_preview_changed = Signal()
     doorway_move_drag_started = Signal()
     doorway_move_drag_finished = Signal(bool)
+    doorway_resize_drag_started = Signal()
+    doorway_resize_drag_finished = Signal(bool)
     selected_doorway_changed = Signal(int)
     stair_start_placed = Signal(object)
     stair_placement_ready = Signal(object)
@@ -348,6 +356,7 @@ class BlueprintCanvas(QWidget):
     stair_placement_cancelled = Signal()
     stair_placement_invalid_endpoint = Signal(str)
     stair_delete_requested = Signal(int)
+    stair_point_drag_finished = Signal(int, str, float, float, bool)
     selected_vertex_changed = Signal(object)
     selected_vertices_changed = Signal(object)
     undo_snapshot_created = Signal(object)
@@ -400,9 +409,16 @@ class BlueprintCanvas(QWidget):
         self.doorway_drag_press_image_point: tuple[float, float] | None = None
         self.doorway_drag_initial_doorway: DoorwayData | None = None
         self.doorway_drag_wall_edge: Edge | None = None
+        self.doorway_drag_width_side_sign = 0.0
         self.doorway_drag_changed = False
         self.stairs: list[object] = []
         self.selected_stair_index: int | None = None
+        self.selected_stair_endpoint_name: str | None = None
+        self._pressed_stair_hit: StairHit | None = None
+        self._stair_drag_press_position: QPointF | None = None
+        self._stair_drag_initial_point: tuple[float, float] | None = None
+        self._stair_drag_preview_point: tuple[float, float] | None = None
+        self._stair_drag_active = False
         self.pending_stair_style: str | None = None
         self.pending_stair_placement: PendingStairPlacement | None = None
         self.pending_stair_draft: StairPlacement | None = None
@@ -854,6 +870,8 @@ class BlueprintCanvas(QWidget):
         self.selected_vertex_id = None
         self._set_selected_doorway_index(None)
         self.selected_stair_index = None
+        self.selected_stair_endpoint_name = None
+        self._reset_stair_drag()
         self.selected_open_space_id = None
         self.preview_point = None
         self.preview_guides = []
@@ -912,6 +930,8 @@ class BlueprintCanvas(QWidget):
             and self.selected_stair_index >= len(self.stairs)
         ):
             self.selected_stair_index = None
+            self.selected_stair_endpoint_name = None
+            self._reset_stair_drag()
         if self._is_stair_placement_active():
             self.setCursor(Qt.CursorShape.CrossCursor)
         self.update()
@@ -938,6 +958,8 @@ class BlueprintCanvas(QWidget):
         self.selected_vertex_id = None
         self.selected_open_space_id = None
         self.selected_stair_index = None
+        self.selected_stair_endpoint_name = None
+        self._reset_stair_drag()
         self.preview_point = None
         self.preview_guides = []
         self._reset_pointer_state()
@@ -1124,6 +1146,8 @@ class BlueprintCanvas(QWidget):
         self.level_context = None
         self._set_selected_doorway_index(None)
         self.selected_stair_index = None
+        self.selected_stair_endpoint_name = None
+        self._reset_stair_drag()
         self._reset_pointer_state()
         self._reset_doorway_pointer_state()
         self._reset_view()
@@ -1342,17 +1366,27 @@ class BlueprintCanvas(QWidget):
         open_space = self._find_open_space_at(event.position())
         self.selected_open_space_id = None
 
-        if event.modifiers() & Qt.KeyboardModifier.AltModifier:
+        if not (
+            event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+            and not event.modifiers() & Qt.KeyboardModifier.AltModifier
+        ):
             stair_hit = self._find_stair_hit(event.position())
             if stair_hit is not None:
+                self._clear_active_vertex_chain_for_selection()
                 self.selected_stair_index = stair_hit.stair_index
+                self.selected_stair_endpoint_name = stair_hit.endpoint_name
                 self._set_selected_doorway_index(None)
                 self.selected_vertex_id = None
+                self._pressed_stair_hit = stair_hit
+                self._stair_drag_press_position = QPointF(event.position())
+                self._stair_drag_initial_point = self._get_stair_hit_point(stair_hit)
+                self.setCursor(Qt.CursorShape.OpenHandCursor)
                 self.update()
                 event.accept()
                 return
 
         self.selected_stair_index = None
+        self.selected_stair_endpoint_name = None
         if self._find_window_at(event.position()) is not None:
             self._set_selected_doorway_index(None)
             self.selected_vertex_id = None
@@ -1381,7 +1415,11 @@ class BlueprintCanvas(QWidget):
             self.doorway_drag_wall_edge = (
                 None if nearest_wall is None else nearest_wall.edge
             )
-            self.doorway_move_drag_started.emit()
+            self.doorway_drag_width_side_sign = doorway_hit.width_side_sign
+            if self.doorway_drag_width_side_sign:
+                self.doorway_resize_drag_started.emit()
+            else:
+                self.doorway_move_drag_started.emit()
             self.update()
             event.accept()
             return
@@ -1409,6 +1447,7 @@ class BlueprintCanvas(QWidget):
         if open_space is not None:
             self.selected_open_space_id = open_space.open_space_id
             self.selected_stair_index = None
+            self.selected_stair_endpoint_name = None
             self._set_selected_doorway_index(None)
             self.selected_vertex_id = None
             self.update()
@@ -1489,6 +1528,14 @@ class BlueprintCanvas(QWidget):
             return
 
         if (
+            self._pressed_stair_hit is not None
+            and event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            self._move_dragged_stair_point(event.position())
+            event.accept()
+            return
+
+        if (
             self.pressed_doorway_index is not None
             and event.buttons() & Qt.MouseButton.LeftButton
         ):
@@ -1497,7 +1544,10 @@ class BlueprintCanvas(QWidget):
 
             if self.drag_doorway_index is not None:
                 image_point = self._widget_to_image_clamped(event.position())
-                self._move_dragged_doorway(image_point)
+                if self.doorway_drag_width_side_sign:
+                    self._resize_dragged_doorway_width(image_point)
+                else:
+                    self._move_dragged_doorway(image_point)
                 self.update()
                 event.accept()
                 return
@@ -1572,6 +1622,16 @@ class BlueprintCanvas(QWidget):
                 self._reset_doorway_pointer_state()
                 self._update_edit_hover_cursor(event.position())
                 self.update()
+                event.accept()
+                return
+
+            if (
+                event.button() == Qt.MouseButton.LeftButton
+                and self._pressed_stair_hit is not None
+            ):
+                self._move_dragged_stair_point(event.position())
+                self._finish_stair_drag()
+                self._update_edit_hover_cursor(event.position())
                 event.accept()
                 return
 
@@ -2222,6 +2282,9 @@ class BlueprintCanvas(QWidget):
             placement = _coerce_stair_placement(self.stairs[stair_index])
             if placement is None:
                 continue
+            placement = self._stair_placement_with_drag_preview(
+                stair_index, placement
+            )
 
             for section_name, section in _get_stair_sections(placement):
                 if section.level_index != level.index:
@@ -2249,6 +2312,121 @@ class BlueprintCanvas(QWidget):
 
         return None
 
+    def _get_stair_hit_point(
+        self,
+        stair_hit: StairHit,
+    ) -> tuple[float, float] | None:
+        """Resolve the displayed position of one existing stair endpoint."""
+
+        if not 0 <= stair_hit.stair_index < len(self.stairs):
+            return None
+        placement = _coerce_stair_placement(self.stairs[stair_hit.stair_index])
+        if placement is None:
+            return None
+        for section_name, section in _get_stair_sections(placement):
+            for point_name in ("a", "b"):
+                if stair_hit.endpoint_name != f"{section_name}_{point_name}":
+                    continue
+                return self._resolve_stair_canvas_point(
+                    getattr(section, f"{point_name}_x"),
+                    getattr(section, f"{point_name}_y"),
+                    getattr(section, f"{point_name}_vertex_id"),
+                )
+        return None
+
+    def _stair_placement_with_drag_preview(
+        self,
+        stair_index: int,
+        placement: StairPlacement,
+    ) -> StairPlacement:
+        """Move only the painted stair point until the drag is committed."""
+
+        hit = self._pressed_stair_hit
+        preview = self._stair_drag_preview_point
+        if hit is None or preview is None or hit.stair_index != stair_index:
+            return placement
+        section_name, point_name = hit.endpoint_name.rsplit("_", 1)
+        if point_name not in ("a", "b"):
+            return placement
+        if section_name in ("start", "end"):
+            return replace(
+                placement,
+                **{
+                    f"{section_name}_{point_name}_x": preview[0],
+                    f"{section_name}_{point_name}_y": preview[1],
+                    f"{section_name}_{point_name}_vertex_id": None,
+                },
+            )
+        if not section_name.startswith("intermediate_"):
+            return placement
+        try:
+            section_index = int(section_name.removeprefix("intermediate_"))
+        except ValueError:
+            return placement
+        if not 0 <= section_index < len(placement.intermediate_sections):
+            return placement
+        sections = list(placement.intermediate_sections)
+        sections[section_index] = replace(
+            sections[section_index],
+            **{
+                f"{point_name}_x": preview[0],
+                f"{point_name}_y": preview[1],
+                f"{point_name}_vertex_id": None,
+            },
+        )
+        return replace(placement, intermediate_sections=tuple(sections))
+
+    def _move_dragged_stair_point(self, widget_point: QPointF) -> None:
+        """Preview one endpoint without touching project stair geometry."""
+
+        press_point = self._stair_drag_press_position
+        initial_point = self._stair_drag_initial_point
+        if press_point is None or initial_point is None:
+            return
+        if not self._stair_drag_active:
+            self._stair_drag_active = (
+                _qpoint_distance(widget_point, press_point)
+                >= DRAG_THRESHOLD_SCREEN
+            )
+        if not self._stair_drag_active:
+            return
+        image_point = self._widget_to_image_clamped(widget_point)
+        preview = (image_point.x(), image_point.y())
+        self._stair_drag_preview_point = (
+            None
+            if math.hypot(
+                preview[0] - initial_point[0],
+                preview[1] - initial_point[1],
+            ) <= 1e-6
+            else preview
+        )
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        self.update()
+
+    def _finish_stair_drag(self) -> None:
+        """Emit one geometry edit after release, never during pointer motion."""
+
+        hit = self._pressed_stair_hit
+        preview = self._stair_drag_preview_point
+        changed = self._stair_drag_active and hit is not None and preview is not None
+        self._reset_stair_drag()
+        self.update()
+        if changed:
+            self.stair_point_drag_finished.emit(
+                hit.stair_index,
+                hit.endpoint_name,
+                preview[0],
+                preview[1],
+                True,
+            )
+
+    def _reset_stair_drag(self) -> None:
+        self._pressed_stair_hit = None
+        self._stair_drag_press_position = None
+        self._stair_drag_initial_point = None
+        self._stair_drag_preview_point = None
+        self._stair_drag_active = False
+
     def _resolve_stair_canvas_point(
         self,
         saved_x: float,
@@ -2269,6 +2447,8 @@ class BlueprintCanvas(QWidget):
             return False
 
         self.selected_stair_index = None
+        self.selected_stair_endpoint_name = None
+        self._reset_stair_drag()
         self.stair_delete_requested.emit(stair_index)
         self.update()
         return True
@@ -2304,8 +2484,11 @@ class BlueprintCanvas(QWidget):
         return None
 
     def _update_edit_hover_cursor(self, widget_point: QPointF) -> None:
-        """Show doorway movement feedback without making windows editable."""
+        """Show movement feedback for editable points and doorways."""
 
+        if self._find_stair_hit(widget_point) is not None:
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            return
         if self._find_window_at(widget_point) is not None:
             self.unsetCursor()
             return
@@ -2504,6 +2687,7 @@ class BlueprintCanvas(QWidget):
 
     def _reset_doorway_pointer_state(self) -> None:
         drag_was_active = self.pressed_doorway_index is not None
+        resize_was_active = bool(self.doorway_drag_width_side_sign)
         drag_changed = self.doorway_drag_changed
         if (
             drag_changed
@@ -2524,9 +2708,13 @@ class BlueprintCanvas(QWidget):
         self.doorway_drag_press_image_point = None
         self.doorway_drag_initial_doorway = None
         self.doorway_drag_wall_edge = None
+        self.doorway_drag_width_side_sign = 0.0
         self.doorway_drag_changed = False
         if drag_was_active:
-            self.doorway_move_drag_finished.emit(drag_changed)
+            if resize_was_active:
+                self.doorway_resize_drag_finished.emit(drag_changed)
+            else:
+                self.doorway_move_drag_finished.emit(drag_changed)
 
     def _find_doorway_at(self, widget_point: QPointF) -> int | None:
         doorway_hit = self._find_doorway_hit(widget_point)
@@ -2545,10 +2733,17 @@ class BlueprintCanvas(QWidget):
                 point,
                 doorway,
                 hit_tolerance_pixels=image_hit_tolerance,
+                width_handle_tolerance_pixels=self._screen_distance_to_image(
+                    DOORWAY_WIDTH_HANDLE_HIT_RADIUS_SCREEN
+                ),
+                include_width_handles=(
+                    doorway_index == self.selected_doorway_index
+                ),
             )
             if doorway_hit is not None:
                 return DoorwayHit(
                     doorway_index=doorway_index,
+                    width_side_sign=doorway_hit.width_side_sign,
                 )
 
         return None
@@ -2558,7 +2753,33 @@ class BlueprintCanvas(QWidget):
         if doorway_hit is None:
             self.unsetCursor()
             return
+        if doorway_hit.width_side_sign:
+            doorway = self.doorways[doorway_hit.doorway_index]
+            self._set_directional_resize_cursor(
+                *self._get_doorway_width_direction(doorway)
+            )
+            return
         self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def _set_directional_resize_cursor(
+        self,
+        direction_x: float,
+        direction_y: float,
+    ) -> None:
+        """Use the screen cursor which best matches a doorway-local axis."""
+
+        horizontal_axis_threshold = math.tan(math.radians(22.5))
+        if abs(direction_y) <= abs(direction_x) * horizontal_axis_threshold:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+            return
+        if abs(direction_x) <= abs(direction_y) * horizontal_axis_threshold:
+            self.setCursor(Qt.CursorShape.SizeVerCursor)
+            return
+        self.setCursor(
+            Qt.CursorShape.SizeFDiagCursor
+            if direction_x * direction_y >= 0.0
+            else Qt.CursorShape.SizeBDiagCursor
+        )
 
     def _should_start_doorway_drag(self, widget_point: QPointF) -> bool:
         if (
@@ -2581,7 +2802,104 @@ class BlueprintCanvas(QWidget):
             return
 
         self.drag_doorway_index = doorway_index
-        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        if self.doorway_drag_width_side_sign:
+            doorway = self.doorways[doorway_index]
+            self._set_directional_resize_cursor(
+                *self._get_doorway_width_direction(doorway)
+            )
+        else:
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def _resize_dragged_doorway_width(self, image_point: QPointF) -> None:
+        """Move one doorway end while keeping its opposite end anchored."""
+
+        doorway_index = self.drag_doorway_index
+        initial_doorway = self.doorway_drag_initial_doorway
+        wall_edge = self.doorway_drag_wall_edge
+        side_sign = self.doorway_drag_width_side_sign
+        if (
+            doorway_index is None
+            or not (0 <= doorway_index < len(self.doorways))
+            or initial_doorway is None
+            or wall_edge is None
+            or not side_sign
+        ):
+            return
+
+        start_vertex = self.vertex_data.get_vertex(wall_edge.start_vertex_id)
+        end_vertex = self.vertex_data.get_vertex(wall_edge.end_vertex_id)
+        if start_vertex is None or end_vertex is None:
+            return
+        wall_delta_x = end_vertex.x - start_vertex.x
+        wall_delta_y = end_vertex.y - start_vertex.y
+        wall_length_pixels = math.hypot(wall_delta_x, wall_delta_y)
+        if wall_length_pixels <= 1e-6:
+            return
+
+        tangent_x = wall_delta_x / wall_length_pixels
+        tangent_y = wall_delta_y / wall_length_pixels
+        width_direction = self._get_doorway_width_direction(initial_doorway)
+        width_alignment = (
+            width_direction[0] * tangent_x + width_direction[1] * tangent_y
+        )
+        if abs(width_alignment) <= 1e-6:
+            return
+
+        initial_center_position = (
+            (initial_doorway.center_x - start_vertex.x) * tangent_x
+            + (initial_doorway.center_y - start_vertex.y) * tangent_y
+        )
+        initial_half_width_pixels = (
+            initial_doorway.width_meters / PIXEL_TO_METER * 0.5
+        )
+        anchored_position = (
+            initial_center_position
+            - side_sign * width_alignment * initial_half_width_pixels
+        )
+        if not -1e-6 <= anchored_position <= wall_length_pixels + 1e-6:
+            return
+        anchored_position = min(max(anchored_position, 0.0), wall_length_pixels)
+
+        side_direction = 1.0 if side_sign * width_alignment > 0.0 else -1.0
+        available_length_pixels = (
+            wall_length_pixels - anchored_position
+            if side_direction > 0.0
+            else anchored_position
+        )
+        minimum_width_pixels = MIN_DOORWAY_WIDTH_METERS / PIXEL_TO_METER
+        maximum_width_pixels = min(
+            MAX_DOORWAY_WIDTH_METERS / PIXEL_TO_METER,
+            available_length_pixels,
+        )
+        if maximum_width_pixels < minimum_width_pixels:
+            return
+
+        cursor_position = (
+            (image_point.x() - start_vertex.x) * tangent_x
+            + (image_point.y() - start_vertex.y) * tangent_y
+        )
+        desired_width_pixels = side_direction * (
+            cursor_position - anchored_position
+        )
+        width_pixels = min(
+            max(desired_width_pixels, minimum_width_pixels),
+            maximum_width_pixels,
+        )
+        moving_position = anchored_position + side_direction * width_pixels
+        center_position = (anchored_position + moving_position) * 0.5
+        resized_doorway = self._copy_doorway_with(
+            initial_doorway,
+            center_x=start_vertex.x + tangent_x * center_position,
+            center_y=start_vertex.y + tangent_y * center_position,
+            width_meters=width_pixels * PIXEL_TO_METER,
+        )
+        if resized_doorway == self.doorways[doorway_index]:
+            return
+        if not self.doorway_drag_changed:
+            self._push_undo_state()
+        self.doorways[doorway_index] = resized_doorway
+        self.doorway_drag_changed = True
+        self.doorway_dimension_preview_changed.emit()
 
     def _move_dragged_doorway(self, image_point: QPointF) -> None:
         """Move one doorway along its original wall while preserving depth."""
@@ -2839,6 +3157,8 @@ class BlueprintCanvas(QWidget):
         point: tuple[float, float],
         doorway: DoorwayData,
         hit_tolerance_pixels: float,
+        width_handle_tolerance_pixels: float = 0.0,
+        include_width_handles: bool = False,
     ) -> DoorwayHit | None:
         depth_direction_x, depth_direction_y = self._get_doorway_depth_direction(
             doorway
@@ -2855,6 +3175,26 @@ class BlueprintCanvas(QWidget):
         )
         half_depth_pixels = doorway.depth_meters / PIXEL_TO_METER / 2.0
         half_width_pixels = doorway.width_meters / PIXEL_TO_METER / 2.0
+        if include_width_handles:
+            nearest_handle: tuple[float, float] | None = None
+            for side_sign in (-1.0, 1.0):
+                handle_center = (
+                    doorway.center_x
+                    + side_sign * width_direction_x * half_width_pixels,
+                    doorway.center_y
+                    + side_sign * width_direction_y * half_width_pixels,
+                )
+                handle_distance = self._point_distance(point, handle_center)
+                if nearest_handle is None or handle_distance < nearest_handle[0]:
+                    nearest_handle = (handle_distance, side_sign)
+            if (
+                nearest_handle is not None
+                and nearest_handle[0] <= width_handle_tolerance_pixels
+            ):
+                return DoorwayHit(
+                    doorway_index=-1,
+                    width_side_sign=nearest_handle[1],
+                )
         if (
             abs(depth_position) > half_depth_pixels + hit_tolerance_pixels
             or abs(width_position) > half_width_pixels + hit_tolerance_pixels
@@ -2969,8 +3309,27 @@ class BlueprintCanvas(QWidget):
 
         self._push_undo_state(CANVAS_SNAPSHOT_ACTION_VERTEX_DELETION)
         deleted_vertex_id_set = set(deleted_vertex_ids)
+        removed_doorway_indices = doorway_indices_on_removed_wall_edges(
+            self.vertex_data,
+            self.doorways,
+            (
+                edge
+                for edge in self.vertex_data.edges
+                if edge.start_vertex_id in deleted_vertex_id_set
+                or edge.end_vertex_id in deleted_vertex_id_set
+            ),
+        )
         self.vertex_data.delete_vertices(deleted_vertex_id_set)
         self._remove_vertices_from_rooms(deleted_vertex_id_set)
+        if removed_doorway_indices:
+            self.doorways[:] = [
+                doorway
+                for index, doorway in enumerate(self.doorways)
+                if index not in removed_doorway_indices
+            ]
+            self._set_selected_doorway_index(None)
+            self._reset_doorway_pointer_state()
+            self.doorways_changed.emit()
 
         if (
             self.active_vertex_id is not None
@@ -4043,6 +4402,8 @@ class BlueprintCanvas(QWidget):
             painter.setPen(doorway_pen)
             painter.setBrush(DOORWAY_FILL_COLOR)
             painter.drawPolygon(self._get_doorway_widget_polygon(doorway))
+            if is_selected:
+                self._paint_doorway_width_handles(painter, doorway)
 
             doorway_center = self._image_to_widget(doorway.center_x, doorway.center_y)
             painter.setPen(QPen(TEXT_COLOR))
@@ -4059,6 +4420,36 @@ class BlueprintCanvas(QWidget):
                 self._get_doorway_label_text(doorway),
             )
 
+    def _paint_doorway_width_handles(
+        self,
+        painter: QPainter,
+        doorway: DoorwayData,
+    ) -> None:
+        """Draw fixed-size handles at the two wall-longitudinal doorway ends."""
+
+        width_direction_x, width_direction_y = (
+            self._get_doorway_width_direction(doorway)
+        )
+        half_width_pixels = doorway.width_meters / PIXEL_TO_METER * 0.5
+        painter.save()
+        handle_pen = QPen(VERTEX_OUTLINE_COLOR, 2.0)
+        handle_pen.setCosmetic(True)
+        painter.setPen(handle_pen)
+        painter.setBrush(SELECTED_DOORWAY_EDGE_COLOR)
+        for side_sign in (-1.0, 1.0):
+            handle_center = self._image_to_widget(
+                doorway.center_x
+                + side_sign * width_direction_x * half_width_pixels,
+                doorway.center_y
+                + side_sign * width_direction_y * half_width_pixels,
+            )
+            painter.drawEllipse(
+                handle_center,
+                DOORWAY_WIDTH_HANDLE_RADIUS_SCREEN,
+                DOORWAY_WIDTH_HANDLE_RADIUS_SCREEN,
+            )
+        painter.restore()
+
     # ### Stair painting ###
     def _paint_stairs(self, painter: QPainter) -> None:
         level = self.level_context
@@ -4069,6 +4460,9 @@ class BlueprintCanvas(QWidget):
             placement = _coerce_stair_placement(raw_stair)
             if placement is None:
                 continue
+            placement = self._stair_placement_with_drag_preview(
+                stair_index, placement
+            )
 
             self._paint_stair_route_continuity(
                 painter=painter,
@@ -4108,6 +4502,17 @@ class BlueprintCanvas(QWidget):
                         f"({_format_stair_style_label(placement.style)})"
                     )
                     destination_level_index = None
+                selected_endpoint_name = self.selected_stair_endpoint_name
+                if (
+                    stair_index != self.selected_stair_index
+                    or selected_endpoint_name is None
+                    or not selected_endpoint_name.startswith(f"{section_name}_")
+                ):
+                    selected_endpoint_name = None
+                else:
+                    selected_endpoint_name = selected_endpoint_name.removeprefix(
+                        f"{section_name}_"
+                    )
                 self._paint_stair_segment(
                     painter=painter,
                     point_a=self._image_to_widget(point_a_x, point_a_y),
@@ -4115,6 +4520,7 @@ class BlueprintCanvas(QWidget):
                     style=placement.style,
                     label=label,
                     selected=stair_index == self.selected_stair_index,
+                    selected_endpoint_name=selected_endpoint_name,
                     destination_level_index=destination_level_index,
                 )
 
@@ -4413,6 +4819,7 @@ class BlueprintCanvas(QWidget):
         style: str,
         label: str,
         selected: bool,
+        selected_endpoint_name: str | None = None,
         destination_level_index: int | None = None,
         pending: bool = False,
     ) -> None:
@@ -4441,7 +4848,7 @@ class BlueprintCanvas(QWidget):
             other_point=None,
             style=style,
             label="A",
-            selected=selected,
+            selected=selected and selected_endpoint_name == "a",
             pending=pending,
         )
         self._paint_stair_endpoint(
@@ -4450,7 +4857,7 @@ class BlueprintCanvas(QWidget):
             other_point=None,
             style=style,
             label="B",
-            selected=selected,
+            selected=selected and selected_endpoint_name == "b",
             pending=pending,
         )
 

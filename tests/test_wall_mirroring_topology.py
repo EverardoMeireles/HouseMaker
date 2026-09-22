@@ -5,7 +5,7 @@ import math
 import unittest
 
 from housemaker.level_coordinates import level_image_to_world_xy
-from housemaker.models import LevelData, VertexData, create_default_levels
+from housemaker.models import DoorwayData, LevelData, VertexData, create_default_levels
 from housemaker.wall_mirroring import (
     WallMirrorVertexLink,
     find_next_wall_mirror_target_level_index,
@@ -315,6 +315,44 @@ class WallMirrorProjectionTests(unittest.TestCase):
 
 # ### Removal and reconciliation tests ###
 class WallMirrorRemovalTests(unittest.TestCase):
+    def test_removing_mirrored_wall_also_removes_its_doorway(self) -> None:
+        levels, source_index, (first_id, second_id, _third_id) = (
+            _build_three_vertex_source()
+        )
+        mirrored = mirror_wall_vertex_group(
+            levels,
+            (),
+            source_index,
+            (first_id, second_id),
+            source_index + 1,
+        )
+        target = levels[source_index + 1]
+        target_edge = target.vertex_data.edges[0]
+        start = target.vertex_data.get_vertex(target_edge.start_vertex_id)
+        end = target.vertex_data.get_vertex(target_edge.end_vertex_id)
+        assert start is not None and end is not None
+        doorway = DoorwayData(
+            center_x=(start.x + end.x) / 2.0,
+            center_y=(start.y + end.y) / 2.0,
+            width_meters=0.9,
+            height_meters=2.1,
+            depth_meters=0.2,
+            rotation_degrees=90.0,
+        )
+        target.doorways.append(doorway)
+
+        removed = remove_wall_vertex_mirrors(
+            levels,
+            mirrored.links,
+            source_index,
+            (first_id, second_id),
+            remove_incoming=False,
+        )
+
+        self.assertIn(target.index, removed.changed_level_indices)
+        self.assertEqual(target.vertex_data.edges, [])
+        self.assertEqual(target.doorways, [])
+
     def test_removal_deletes_owned_targets_edges_and_descendants(self) -> None:
         levels, source_index, (first_id, second_id, _third_id) = (
             _build_three_vertex_source()

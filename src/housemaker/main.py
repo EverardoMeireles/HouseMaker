@@ -204,6 +204,7 @@ from housemaker.models import (
     calculate_stair_step_layout,
     create_default_doorway_presets,
     create_default_levels,
+    create_fallback_doorway_preset,
 )
 from housemaker.pbr_maps import (
     ATLAS_MAP_BASE_COLOR,
@@ -723,6 +724,7 @@ class _CanvasBlueprintUndoState:
     atlas_placements: tuple[tuple[str, TextureAtlasPlacement], ...] = ()
     wall_mirror_links: tuple[WallMirrorVertexLink, ...] = ()
     other_level_vertex_data: tuple[tuple[int, VertexData], ...] = ()
+    other_level_doorways: tuple[tuple[int, tuple[DoorwayData, ...]], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -771,6 +773,7 @@ class _CanvasWallMirrorUndoState:
     """Cross-level wall topology before one mirror side-panel action."""
 
     vertex_data_by_level: tuple[tuple[int, VertexData], ...]
+    doorways_by_level: tuple[tuple[int, tuple[DoorwayData, ...]], ...]
     wall_mirror_links: tuple[WallMirrorVertexLink, ...]
     selected_level_index: int
     selected_vertex_ids: tuple[int, ...]
@@ -1037,6 +1040,11 @@ class BlueprintWorkspace(QWidget):
         self._stair_preview_update_timer.timeout.connect(
             self._rebuild_staged_stair_preview
         )
+        self._pending_stair_point_mesh_update = False
+        self._pending_stair_point_undo_state: _CanvasStairsUndoState | None = None
+        self._pending_stair_point_id: str | None = None
+        self._stair_point_mesh_update_timer = QTimer(self)
+        self._stair_point_mesh_update_timer.setSingleShot(True)
         self._desired_canvas_stair_part_ids: tuple[str, ...] = ()
         self._canvas_stair_part_targets_by_id: dict[str, PreviewStairPart] = {}
         self._canvas_stair_semantic_surfaces_by_id: dict[str, FixedSurface] = {}
@@ -1074,8 +1082,10 @@ class BlueprintWorkspace(QWidget):
             DEFAULT_WALL_VERTEX_UPDATE_DELAY_SECONDS
         )
         self._pending_wall_vertex_mesh_update = False
+        self._pending_wall_vertex_doorway_level_indices: set[int] = set()
         self._is_canvas_wall_vertex_interaction_active = False
         self._is_doorway_move_drag_active = False
+        self._is_doorway_resize_drag_active = False
         self._is_canvas_opening_drag_active = False
         self._active_canvas_opening_reference: CanvasOpeningReference | None = None
         self._active_canvas_opening_start_edit: CanvasOpeningEdit | None = None
@@ -1126,6 +1136,12 @@ class BlueprintWorkspace(QWidget):
         )
         self._canvas_surface_mesh_update_timer.timeout.connect(
             self._commit_pending_canvas_surface_mesh_update
+        )
+        self._stair_point_mesh_update_timer.setInterval(
+            round(self._mesh_edit_update_delay_seconds * 1000.0)
+        )
+        self._stair_point_mesh_update_timer.timeout.connect(
+            self._commit_pending_stair_point_mesh_update
         )
         self._level_transform_mesh_update_timer = QTimer(self)
         self._level_transform_mesh_update_timer.setSingleShot(True)
@@ -1739,6 +1755,9 @@ class BlueprintWorkspace(QWidget):
         )
         self.viewer.canvas_stair_part_selection_changed.connect(
             self._handle_canvas_stair_part_selection_changed
+        )
+        self.viewer.canvas_stair_deletion_requested.connect(
+            self._handle_canvas_stair_deletion_requested
         )
         self.viewer.canvas_stair_preview_cancelled.connect(
             self._handle_canvas_stair_preview_cancelled
@@ -2998,6 +3017,12 @@ class BlueprintWorkspace(QWidget):
         self.canvas.doorway_move_drag_finished.connect(
             self._handle_doorway_move_drag_finished
         )
+        self.canvas.doorway_resize_drag_started.connect(
+            self._handle_doorway_resize_drag_started
+        )
+        self.canvas.doorway_resize_drag_finished.connect(
+            self._handle_doorway_resize_drag_finished
+        )
         self.canvas.selected_doorway_changed.connect(
             self._handle_canvas_doorway_selection_changed
         )
@@ -3013,6 +3038,9 @@ class BlueprintWorkspace(QWidget):
             self._handle_stair_placement_invalid_endpoint
         )
         self.canvas.stair_delete_requested.connect(self._handle_stair_delete_requested)
+        self.canvas.stair_point_drag_finished.connect(
+            self._handle_stair_point_drag_finished
+        )
         self._update_wall_mirror_button_state()
         self._refresh_levels_list()
         self._update_stair_button_state()
@@ -3830,6 +3858,10 @@ class BlueprintWorkspace(QWidget):
     def _clear_canvas_undo_history(self) -> None:
         """Start a new history branch after replacing Canvas coordinates."""
 
+        self._stair_point_mesh_update_timer.stop()
+        self._pending_stair_point_mesh_update = False
+        self._pending_stair_point_undo_state = None
+        self._pending_stair_point_id = None
         self._canvas_undo_stack.clear()
         self.canvas.undo_stack.clear()
 
@@ -3872,6 +3904,11 @@ class BlueprintWorkspace(QWidget):
                 wall_mirror_links=self.wall_mirror_links,
                 other_level_vertex_data=tuple(
                     (level.index, level.vertex_data.clone())
+                    for level in self.levels
+                    if level.index != self.current_level.index
+                ),
+                other_level_doorways=tuple(
+                    (level.index, self._copy_doorways(level.doorways))
                     for level in self.levels
                     if level.index != self.current_level.index
                 ),
@@ -4100,8 +4137,10 @@ class BlueprintWorkspace(QWidget):
                 if placement.object_id in affected_source_ids
             ),
         )
-        if self._canvas_undo_stack and self._canvas_undo_stack[-1] is state:
-            self._canvas_undo_stack[-1] = finalized_state
+        for index, undo_entry in enumerate(self._canvas_undo_stack):
+            if undo_entry is state:
+                self._canvas_undo_stack[index] = finalized_state
+                break
 
     def _handle_canvas_undo_requested(self) -> None:
         """Undo the latest committed Canvas action from either Canvas view."""
@@ -4143,6 +4182,11 @@ class BlueprintWorkspace(QWidget):
         if self._undo_pending_canvas_surface_mesh_update():
             self.viewer.set_surface_tools_status("Canvas surface edit undone.")
             return
+        if self._pending_stair_point_mesh_update:
+            self._stair_point_mesh_update_timer.stop()
+            self._pending_stair_point_mesh_update = False
+            self._pending_stair_point_undo_state = None
+            self._pending_stair_point_id = None
         if not self._canvas_undo_stack:
             self.viewer.set_surface_tools_status("No Canvas action to undo.")
             return
@@ -4153,6 +4197,10 @@ class BlueprintWorkspace(QWidget):
             self._cancel_pending_canvas_surface_mesh_update()
             self._cancel_pending_wall_vertex_update()
             self._cancel_pending_doorway_mesh_update(clear_outline=True)
+            self._stair_point_mesh_update_timer.stop()
+            self._pending_stair_point_mesh_update = False
+            self._pending_stair_point_undo_state = None
+            self._pending_stair_point_id = None
             if isinstance(state, _CanvasTopologyUndoState):
                 skipped_texture_bindings = self._restore_canvas_topology_undo_state(
                     state
@@ -4337,6 +4385,16 @@ class BlueprintWorkspace(QWidget):
                 )
             level.vertex_data.copy_from(vertex_data)
             restored_level_indices.add(level_index)
+        for level_index, doorways in state.doorways_by_level:
+            level = self._get_level_by_index(level_index)
+            if level is None:
+                raise ValueError(
+                    "A wall-mirror doorway level in this undo step no longer exists."
+                )
+            level.doorways[:] = copy.deepcopy(doorways)
+            self._viewer_doorways_by_level_index[level_index] = (
+                self._copy_doorways(level.doorways)
+            )
 
         self.wall_mirror_links = state.wall_mirror_links
         if self.current_level.index == state.selected_level_index:
@@ -4593,8 +4651,23 @@ class BlueprintWorkspace(QWidget):
                     "A wall-mirror level in this undo step no longer exists."
                 )
             other_level.vertex_data.copy_from(vertex_data)
+        other_doorways_changed = False
+        for other_level_index, doorways in state.other_level_doorways:
+            other_level = self._get_level_by_index(other_level_index)
+            if other_level is None:
+                raise ValueError(
+                    "A wall-mirror doorway level in this undo step no longer exists."
+                )
+            if self._copy_doorways(other_level.doorways) != doorways:
+                other_level.doorways[:] = copy.deepcopy(doorways)
+                self._viewer_doorways_by_level_index[other_level_index] = (
+                    self._copy_doorways(other_level.doorways)
+                )
+                other_doorways_changed = True
         self.wall_mirror_links = state.wall_mirror_links
         self._sync_canvas_wall_mirror_state()
+        if other_doorways_changed:
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
         return self._restore_blueprint_surface_bindings(state)
 
     def _restore_blueprint_surface_bindings(
@@ -6396,6 +6469,7 @@ class BlueprintWorkspace(QWidget):
             or self._is_canvas_wall_vertex_interaction_active
             or self._is_canvas_opening_drag_active
             or self._is_doorway_move_drag_active
+            or self._is_doorway_resize_drag_active
             or self._pending_doorway_mesh_level_index is not None
             or self._pending_window_mesh_level_index is not None
             or self._level_transform_drag_active
@@ -8641,21 +8715,31 @@ class BlueprintWorkspace(QWidget):
             "The selected object is not currently available for placement."
         )
 
-    def _handle_atlas_object_delete_requested(self, object_id: str) -> None:
-        """Confirm and permanently delete one exact generated object."""
+    def _handle_atlas_object_delete_requested(
+        self, object_ids: str | tuple[str, ...]
+    ) -> None:
+        """Confirm once, then delete the snapshotted generated objects."""
 
-        normalized_object_id = str(object_id).strip()
-        record = next(
-            (
-                candidate
-                for candidate in self.generation.get_data().generated_objects
-                if candidate.object_id == normalized_object_id
-            ),
-            None,
+        requested_ids = (object_ids,) if isinstance(object_ids, str) else object_ids
+        requested_ids = tuple(
+            dict.fromkeys(
+                object_id.strip()
+                for object_id in requested_ids
+                if isinstance(object_id, str) and object_id.strip()
+            )
         )
-        if record is None:
+        records_by_id = {
+            record.object_id: record
+            for record in self.generation.get_data().generated_objects
+        }
+        records = tuple(
+            records_by_id[object_id]
+            for object_id in requested_ids
+            if object_id in records_by_id
+        )
+        if not records:
             self.texture_atlas_workspace.status_label.setText(
-                "The selected generated object is no longer available."
+                "The selected generated objects are no longer available."
             )
             return
         dialog_parent = (
@@ -8663,13 +8747,21 @@ class BlueprintWorkspace(QWidget):
             if self._external_atlas_host.is_active
             else self.texture_atlas_workspace
         )
+        if len(records) == 1:
+            confirmation_text = (
+                f'Permanently delete "{records[0].object_name}", its embedded '
+                "textures, and its unreferenced local GLB revisions?"
+            )
+        else:
+            confirmation_text = (
+                f"Permanently delete these {len(records)} generated objects, "
+                "their embedded textures, and their unreferenced local GLB "
+                "revisions?"
+            )
         answer = QMessageBox.question(
             dialog_parent,
-            "Delete generated object",
-            (
-                f'Permanently delete "{record.object_name}", its embedded '
-                "textures, and its unreferenced local GLB revisions?"
-            ),
+            "Delete generated objects" if len(records) > 1 else "Delete generated object",
+            confirmation_text,
             (
                 QMessageBox.StandardButton.Yes
                 | QMessageBox.StandardButton.Cancel
@@ -8678,20 +8770,32 @@ class BlueprintWorkspace(QWidget):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        if not self.generation.delete_generated_object(normalized_object_id):
-            generation_status = self.generation.status_label.text().strip()
-            detail = (
-                f" {generation_status}"
-                if generation_status
-                else " The object may be busy or unavailable."
+        deleted_names: list[str] = []
+        failed_names: list[str] = []
+        for record in records:
+            if self.generation.delete_generated_object(record.object_id):
+                deleted_names.append(record.object_name)
+            else:
+                failed_names.append(record.object_name)
+        if len(records) == 1:
+            if deleted_names:
+                status = f"Deleted generated object: {deleted_names[0]}."
+            else:
+                generation_status = self.generation.status_label.text().strip()
+                detail = (
+                    f" {generation_status}"
+                    if generation_status
+                    else " The object may be busy or unavailable."
+                )
+                status = "The selected generated object could not be deleted." + detail
+        else:
+            status = (
+                f"Deleted {len(deleted_names)} of {len(records)} selected "
+                "generated objects."
             )
-            self.texture_atlas_workspace.status_label.setText(
-                "The selected generated object could not be deleted." + detail
-            )
-            return
-        self.texture_atlas_workspace.status_label.setText(
-            f"Deleted generated object: {record.object_name}."
-        )
+            if failed_names:
+                status += f" Could not delete: {', '.join(failed_names)}."
+        self.texture_atlas_workspace.status_label.setText(status)
 
     def _handle_atlas_source_remove_requested(
         self,
@@ -11045,6 +11149,7 @@ class BlueprintWorkspace(QWidget):
             self._doorway_mesh_update_timer,
             self._canvas_surface_mesh_update_timer,
             self._level_transform_mesh_update_timer,
+            self._stair_point_mesh_update_timer,
         )
         active_timers = tuple(timer.isActive() for timer in timers)
         self._mesh_edit_update_delay_seconds = normalized_delay
@@ -11338,6 +11443,7 @@ class BlueprintWorkspace(QWidget):
             self._active_canvas_surface_edit_target is not None
             or self._pending_canvas_surface_mesh_update
             or self._pending_wall_vertex_mesh_update
+            or self._pending_stair_point_mesh_update
         ):
             return
         revision = self._viewer_preview_revision
@@ -11429,6 +11535,7 @@ class BlueprintWorkspace(QWidget):
             self._active_canvas_surface_edit_target is not None
             or self._pending_canvas_surface_mesh_update
             or self._pending_wall_vertex_mesh_update
+            or self._pending_stair_point_mesh_update
         ):
             return
         if self._is_viewer_refresh_scheduled:
@@ -11473,6 +11580,7 @@ class BlueprintWorkspace(QWidget):
             self._active_canvas_surface_edit_target is not None
             or self._pending_canvas_surface_mesh_update
             or self._pending_wall_vertex_mesh_update
+            or self._pending_stair_point_mesh_update
         ):
             return
 
@@ -11499,6 +11607,7 @@ class BlueprintWorkspace(QWidget):
         self._commit_pending_level_transform_update()
         self._commit_pending_canvas_surface_mesh_update()
         self._commit_pending_wall_vertex_update()
+        self._commit_pending_stair_point_mesh_update()
 
         try:
             save_project(
@@ -11649,6 +11758,9 @@ class BlueprintWorkspace(QWidget):
         self,
         selected_index: int | None = None,
     ) -> None:
+        if not self.doorway_presets:
+            self.doorway_presets.append(create_fallback_doorway_preset())
+            selected_index = 0
         if selected_index is None:
             selected_index = self.doorway_preset_list.currentRow()
 
@@ -12134,9 +12246,7 @@ class BlueprintWorkspace(QWidget):
 
     def _update_doorway_preset_button_state(self) -> None:
         has_selected_preset = self._get_selected_doorway_preset() is not None
-        self.remove_doorway_preset_button.setEnabled(
-            has_selected_preset and len(self.doorway_presets) > 1
-        )
+        self.remove_doorway_preset_button.setEnabled(has_selected_preset)
         self.place_doorway_button.setEnabled(has_selected_preset)
         self.save_doorway_template_button.setEnabled(
             self._get_selected_placed_doorway() is not None
@@ -12861,13 +12971,14 @@ class BlueprintWorkspace(QWidget):
     def _handle_remove_doorway_preset_clicked(self) -> None:
         selected_index = self.doorway_preset_list.currentRow()
         if (
-            len(self.doorway_presets) <= 1
-            or selected_index < 0
+            selected_index < 0
             or selected_index >= len(self.doorway_presets)
         ):
             return
 
         del self.doorway_presets[selected_index]
+        if not self.doorway_presets:
+            self.doorway_presets.append(create_fallback_doorway_preset())
         next_selected_index = min(selected_index, len(self.doorway_presets) - 1)
         self._refresh_doorway_preset_list(selected_index=next_selected_index)
 
@@ -12970,6 +13081,10 @@ class BlueprintWorkspace(QWidget):
             vertex_data_by_level=tuple(
                 (level.index, level.vertex_data.clone()) for level in self.levels
             ),
+            doorways_by_level=tuple(
+                (level.index, self._copy_doorways(level.doorways))
+                for level in self.levels
+            ),
             wall_mirror_links=self.wall_mirror_links,
             selected_level_index=self.current_level.index,
             selected_vertex_ids=self.canvas.selected_vertex_ids,
@@ -12984,6 +13099,9 @@ class BlueprintWorkspace(QWidget):
         self._sync_canvas_wall_mirror_state()
         self._update_wall_mirror_button_state()
         if result.changed_level_indices:
+            self._pending_wall_vertex_doorway_level_indices.update(
+                result.changed_level_indices
+            )
             self._pending_wall_vertex_mesh_update = True
             self._restart_pending_wall_vertex_update_if_idle()
 
@@ -13091,6 +13209,9 @@ class BlueprintWorkspace(QWidget):
             self.levels,
             self.wall_mirror_links,
         )
+        self._pending_wall_vertex_doorway_level_indices.update(
+            result.changed_level_indices
+        )
         self.wall_mirror_links = result.links
         self.canvas.set_wall_mirror_vertex_ids(
             get_wall_mirror_vertex_ids(
@@ -13162,6 +13283,7 @@ class BlueprintWorkspace(QWidget):
         """Commit structural doorway changes without a debounce delay."""
 
         self._is_doorway_move_drag_active = False
+        self._is_doorway_resize_drag_active = False
         self.current_level.doorways = self.canvas.doorways
         next_snapshot = self._copy_doorways(self.current_level.doorways)
         snapshot_changed = bool(
@@ -13189,6 +13311,21 @@ class BlueprintWorkspace(QWidget):
                 self._handle_doorway_dimension_preview_changed()
             self._commit_pending_doorway_mesh_update()
             return
+        if self._pending_doorway_mesh_level_index is not None:
+            self._doorway_mesh_update_timer.start()
+
+    def _handle_doorway_resize_drag_started(self) -> None:
+        """Pause doorway mesh rebuilding while a 2D side handle is held."""
+
+        self._is_doorway_resize_drag_active = True
+        self._doorway_mesh_update_timer.stop()
+
+    def _handle_doorway_resize_drag_finished(self, changed: bool) -> None:
+        """Start the shared mesh-edit delay after a 2D resize is released."""
+
+        self._is_doorway_resize_drag_active = False
+        if changed and self._pending_doorway_mesh_level_index is None:
+            self._handle_doorway_dimension_preview_changed()
         if self._pending_doorway_mesh_level_index is not None:
             self._doorway_mesh_update_timer.start()
 
@@ -13243,7 +13380,10 @@ class BlueprintWorkspace(QWidget):
 
         self._pending_doorway_mesh_level_index = level.index
         self._pending_canvas_opening_key = f"doorway:{level.index}:{selected_index}"
-        if self._is_doorway_move_drag_active:
+        if (
+            self._is_doorway_move_drag_active
+            or self._is_doorway_resize_drag_active
+        ):
             self._doorway_mesh_update_timer.stop()
         else:
             self._doorway_mesh_update_timer.start()
@@ -13457,13 +13597,124 @@ class BlueprintWorkspace(QWidget):
             f"{self.current_level.display_name}."
         )
 
+    # ### Canvas stair point edits ###
+    def _handle_stair_point_drag_finished(
+        self,
+        stair_index: int,
+        endpoint_name: str,
+        image_x: float,
+        image_y: float,
+        changed: bool,
+    ) -> None:
+        """Save a released 2D point edit and debounce its 3D mesh rebuild."""
+
+        if not changed or not 0 <= stair_index < len(self.stairs):
+            return
+        if not math.isfinite(image_x) or not math.isfinite(image_y):
+            return
+        stair = self.stairs[stair_index]
+        section_name, separator, side = endpoint_name.rpartition("_")
+        if not separator or side not in ("a", "b"):
+            return
+        coordinates = {
+            f"{side}_x": image_x,
+            f"{side}_y": image_y,
+            f"{side}_vertex_id": None,
+        }
+        try:
+            if section_name in ("start", "end"):
+                candidate = replace(
+                    stair,
+                    **{
+                        f"{section_name}_{key}": value
+                        for key, value in coordinates.items()
+                    },
+                )
+            elif section_name.startswith("intermediate_"):
+                section_index = int(section_name.removeprefix("intermediate_"))
+                sections = list(stair.intermediate_sections)
+                if not 0 <= section_index < len(sections):
+                    return
+                sections[section_index] = replace(
+                    sections[section_index], **coordinates
+                )
+                candidate = replace(stair, intermediate_sections=tuple(sections))
+            else:
+                return
+            if candidate == stair:
+                return
+            build_stair_meshes(self.levels, (candidate,))
+        except (TypeError, ValueError) as error:
+            self.stair_status_label.setText(f"Stair point not moved: {error}")
+            return
+
+        undo_state = self._capture_canvas_stairs_undo_state()
+        self._record_canvas_undo_state(undo_state)
+        self.stairs[stair_index] = candidate
+        self.canvas.set_stair_context(self.stairs, self.current_level)
+        if self._editing_stair_index == stair_index:
+            self._sync_stair_calculated_values(candidate)
+        self._pending_stair_point_mesh_update = True
+        self._pending_stair_point_undo_state = undo_state
+        self._pending_stair_point_id = candidate.stair_id
+        self._stair_point_mesh_update_timer.start()
+        self.stair_status_label.setText("Stair point moved; waiting to update mesh.")
+
+    def _commit_pending_stair_point_mesh_update(self) -> None:
+        """Rebuild a moved stair only after the shared mesh-edit delay."""
+
+        self._stair_point_mesh_update_timer.stop()
+        if not self._pending_stair_point_mesh_update:
+            return
+        self._pending_stair_point_mesh_update = False
+        undo_state = self._pending_stair_point_undo_state
+        stair_id = self._pending_stair_point_id
+        self._pending_stair_point_undo_state = None
+        self._pending_stair_point_id = None
+        assignments_changed = self._reconcile_surface_assignments_with_scene()
+        if stair_id is not None:
+            self._retarget_canvas_stair_selection_after_edit(stair_id)
+        if undo_state is not None:
+            self._finalize_canvas_stairs_undo_state(undo_state)
+        if not assignments_changed:
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+        self.stair_status_label.setText("Stair mesh updated.")
+
     def _handle_stair_delete_requested(self, stair_index: int) -> None:
         self._delete_stair_at_index(stair_index)
+
+    def _handle_canvas_stair_deletion_requested(
+        self,
+        raw_stair_ids: object,
+    ) -> None:
+        """Delete the owner of each selected 3D stair part once."""
+
+        try:
+            stair_ids = {
+                str(value).strip()
+                for value in raw_stair_ids  # type: ignore[arg-type]
+            }
+        except TypeError:
+            return
+        stair_indices = sorted(
+            (
+                index
+                for index, stair in enumerate(self.stairs)
+                if stair.stair_id in stair_ids
+            ),
+            reverse=True,
+        )
+        for stair_index in stair_indices:
+            self._delete_stair_at_index(stair_index)
 
     def _delete_stair_at_index(self, stair_index: int) -> None:
         if not 0 <= stair_index < len(self.stairs):
             return
 
+        self._stair_point_mesh_update_timer.stop()
+        self._pending_stair_point_mesh_update = False
+        self._pending_stair_point_undo_state = None
+        self._pending_stair_point_id = None
         undo_state = self._capture_canvas_stairs_undo_state()
         self._record_canvas_undo_state(undo_state)
         editing_index = self._editing_stair_index
@@ -13566,6 +13817,14 @@ class BlueprintWorkspace(QWidget):
         if not self._pending_wall_vertex_mesh_update:
             return
         self._pending_wall_vertex_mesh_update = False
+        doorway_level_indices = self._pending_wall_vertex_doorway_level_indices
+        self._pending_wall_vertex_doorway_level_indices = set()
+        for level_index in doorway_level_indices:
+            level = self._get_level_by_index(level_index)
+            if level is not None:
+                self._viewer_doorways_by_level_index[level_index] = (
+                    self._copy_doorways(level.doorways)
+                )
         self._reconcile_canvas_surface_edit_and_refresh()
 
     def _cancel_pending_wall_vertex_update(self) -> None:
@@ -13573,6 +13832,7 @@ class BlueprintWorkspace(QWidget):
 
         self._wall_vertex_update_timer.stop()
         self._pending_wall_vertex_mesh_update = False
+        self._pending_wall_vertex_doorway_level_indices.clear()
         self._is_canvas_wall_vertex_interaction_active = False
 
     def _handle_include_toggled(self, checked: bool) -> None:
@@ -13636,6 +13896,7 @@ class BlueprintWorkspace(QWidget):
         self._cancel_direct_object_placement()
 
         self._is_doorway_move_drag_active = False
+        self._is_doorway_resize_drag_active = False
         self._level_transform_drag_active = False
         self._cancel_pending_level_transform(
             sync_controls=False,
@@ -13648,6 +13909,10 @@ class BlueprintWorkspace(QWidget):
         self._cancel_pending_canvas_surface_mesh_update()
         self._cancel_pending_wall_vertex_update()
         self._cancel_pending_doorway_mesh_update(clear_outline=True)
+        self._stair_point_mesh_update_timer.stop()
+        self._pending_stair_point_mesh_update = False
+        self._pending_stair_point_undo_state = None
+        self._pending_stair_point_id = None
         self._stair_preview_update_timer.stop()
         self._pending_stair_parameters = None
         self.canvas.cancel_open_space_placement()
@@ -13685,9 +13950,9 @@ class BlueprintWorkspace(QWidget):
             image_library_paths or []
         )
         if doorway_presets is not None:
-            self.doorway_presets = (
-                list(doorway_presets) or create_default_doorway_presets()
-            )
+            self.doorway_presets = list(doorway_presets)
+            if not self.doorway_presets:
+                self.doorway_presets.append(create_fallback_doorway_preset())
         self.current_level_index = min(
             max(current_level_index, 0),
             len(self.levels) - 1,

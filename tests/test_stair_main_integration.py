@@ -1133,6 +1133,48 @@ class StairMainIntegrationTests(unittest.TestCase):
             "Stair deleted.",
         )
 
+    def test_delete_selected_3d_stair_part_removes_stair(self) -> None:
+        stair = _make_editable_stair()
+        self.workspace.stairs = [stair]
+        self.workspace.canvas.set_stair_context(
+            self.workspace.stairs,
+            self.workspace.current_level,
+        )
+        self.workspace._set_canvas_viewer_targets(())
+        semantic_id = next(iter(self.workspace._canvas_stair_part_targets_by_id))
+        self.workspace.viewer.select_canvas_stair_part_target(semantic_id)
+
+        self.workspace.viewer._handle_view_delete_requested()
+
+        self.assertEqual(self.workspace.stairs, [])
+        self.assertEqual(self.workspace.viewer.get_selected_canvas_stair_part_ids(), ())
+        self.assertEqual(self.workspace.stair_status_label.text(), "Stair deleted.")
+
+    def test_dragged_canvas_stair_point_waits_for_mesh_edit_delay(self) -> None:
+        stair = _make_editable_stair()
+        self.workspace.stairs = [stair]
+        _make_current_canvas_clickable(self.workspace)
+        self.workspace._set_mesh_edit_update_delay_seconds(0.05)
+        revision_before = self.workspace._viewer_preview_revision
+
+        self.workspace.canvas.stair_point_drag_finished.emit(
+            0, "start_a", 25.0, 32.0, True
+        )
+
+        self.assertEqual(self.workspace.stairs[0].start_a_x, 25.0)
+        self.assertEqual(self.workspace.stairs[0].start_a_y, 32.0)
+        self.assertTrue(self.workspace._stair_point_mesh_update_timer.isActive())
+        self.assertEqual(self.workspace._viewer_preview_revision, revision_before)
+        self.assertEqual(self.workspace.canvas.stairs[0], self.workspace.stairs[0])
+
+        QTest.qWait(75)
+        _qt_application.processEvents()
+
+        self.assertFalse(self.workspace._stair_point_mesh_update_timer.isActive())
+        self.assertGreater(self.workspace._viewer_preview_revision, revision_before)
+        self.workspace._handle_canvas_undo_requested()
+        self.assertEqual(self.workspace.stairs[0], stair)
+
     def test_curve_guides_remain_draft_until_confirmed(self) -> None:
         _make_current_canvas_clickable(self.workspace)
         with patch("housemaker.main.QMessageBox.information"):

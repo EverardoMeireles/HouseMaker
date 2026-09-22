@@ -1934,7 +1934,7 @@ class TextureAtlasWorkspace(QWidget):
     surface_textures_selected = Signal(object)
     surface_texture_repeat_size_changed = Signal(str, float)
     object_place_requested = Signal(str)
-    object_delete_requested = Signal(str)
+    object_delete_requested = Signal(object)
     surface_assign_requested = Signal(str)
     source_remove_requested = Signal(str, str)
     surface_texture_delete_requested = Signal(str)
@@ -4114,7 +4114,7 @@ class TextureAtlasWorkspace(QWidget):
             "texture_atlas_delete_object_button"
         )
         self.delete_object_button.setToolTip(
-            "Permanently delete the selected generated object and its "
+            "Permanently delete the selected generated objects and their "
             "unreferenced local assets."
         )
         self.delete_object_button.clicked.connect(
@@ -5205,19 +5205,26 @@ class TextureAtlasWorkspace(QWidget):
         self.source_remove_requested.emit(source_kind, source_id)
 
     def _request_selected_object_deletion(self) -> None:
-        """Request permanent deletion of the exact selected generated object."""
+        """Request deletion of every selected, available generated object."""
 
-        object_id = self.selected_object_texture_id
-        if object_id is None:
+        selected_ids = self.selected_object_texture_ids
+        if not selected_ids:
             self.status_label.setText("Select an Object texture to delete its object.")
             return
-        if object_id not in self._deletable_object_ids:
+        object_ids = tuple(
+            object_id
+            for object_id in selected_ids
+            if object_id in self._deletable_object_ids
+        )
+        if not object_ids:
             self.status_label.setText(
-                "The selected Object texture has no available generated object "
+                "The selected Object textures have no available generated objects "
                 "to delete."
             )
             return
-        self.object_delete_requested.emit(object_id)
+        self.object_delete_requested.emit(
+            object_ids[0] if len(object_ids) == 1 else object_ids
+        )
 
     def _request_selected_surface_texture_deletion(self) -> None:
         """Request permanent deletion for one selected Surface family."""
@@ -5865,8 +5872,10 @@ class TextureAtlasWorkspace(QWidget):
         self.place_assign_button.setEnabled(can_place_object or can_assign_surface)
         self.delete_object_button.setEnabled(
             self._active_source_kind == "object"
-            and object_id is not None
-            and object_id in self._deletable_object_ids
+            and any(
+                selected_id in self._deletable_object_ids
+                for selected_id in self.selected_object_texture_ids
+            )
         )
         self.remove_source_button.setEnabled(
             object_id is not None and self._active_source_kind in {"object", "surface"}
