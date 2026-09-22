@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -41,18 +42,17 @@ from housemaker.surface_texture_state import (
     SurfaceTextureVariant,
 )
 from housemaker.surface_texture_workspace import (
-    SurfaceTextureWorker,
     SurfaceTextureGenerationWorkspace,
     SurfaceTextureRequest,
-    _SavedSurfaceTextureOutput,
+    SurfaceTextureWorker,
     _prepare_surface_texture_outputs,
+    _SavedSurfaceTextureOutput,
 )
 from tests.test_surface_texture_workspace import (
     _colored_texture_png,
     _test_level,
     _texture_png,
 )
-
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -93,6 +93,34 @@ class _ControlledSurfaceProvider:
             provider="meshy",
             texture_png=_colored_texture_png(color),
             task_id=f"task-{surface_id.rsplit(':', maxsplit=1)[-1]}",
+        )
+
+    def release_all(self) -> None:
+        for event in self.release.values():
+            event.set()
+
+
+class _SameTargetSurfaceProvider:
+    """Hold two requests for one surface independently by job name."""
+
+    def __init__(self) -> None:
+        self.started = {
+            name: threading.Event() for name in ("Older", "Newer")
+        }
+        self.release = {
+            name: threading.Event() for name in ("Older", "Newer")
+        }
+
+    def generate(self, request: SurfaceTextureRequest) -> SurfaceTextureResult:
+        name = request.display_name
+        self.started[name].set()
+        if not self.release[name].wait(timeout=10.0):
+            raise RuntimeError("Controlled Surface provider timed out")
+        color = (190, 40, 30, 255) if name == "Older" else (20, 150, 210, 255)
+        return SurfaceTextureResult(
+            provider="meshy",
+            texture_png=_colored_texture_png(color),
+            task_id=f"task-{name.lower()}",
         )
 
     def release_all(self) -> None:
@@ -343,21 +371,123 @@ class SurfaceTextureMultiJobTests(unittest.TestCase):
             set(persisted_paths),
         )
 
-    def test_same_target_is_rejected_without_starting_a_second_job(self) -> None:
-        self.assertTrue(self.workspace._start_generation(_request(_FIRST_WALL)))
-        self.assertTrue(self.provider.started[_FIRST_WALL].wait(timeout=2.0))
-
-        self.assertFalse(
-            self.workspace._start_generation(
-                _request(_FIRST_WALL, "Duplicate request")
+    def test_newer_same_target_job_wins_even_when_older_finishes_last(
+        self,
+    ) -> None:
+        provider = _SameTargetSurfaceProvider()
+        self.workspace.set_provider(provider)
+        try:
+            self.assertTrue(
+                self.workspace._start_generation(_request(_FIRST_WALL, "Older"))
             )
+            self.assertTrue(provider.started["Older"].wait(timeout=2.0))
+            self.assertTrue(
+                self.workspace._start_generation(_request(_FIRST_WALL, "Newer"))
+            )
+            self.assertTrue(provider.started["Newer"].wait(timeout=2.0))
+            self.assertEqual(len(self.workspace._generation_threads), 2)
+
+            provider.release["Newer"].set()
+            _wait_until(
+                lambda: any(
+                    assignment.display_name == "Newer"
+                    for assignment in self.workspace.get_data().assignments
+                )
+            )
+            provider.release["Older"].set()
+            _wait_until(lambda: not self.workspace.is_generating)
+        finally:
+            provider.release_all()
+
+        assignments = self.workspace.get_data().assignments
+        self.assertEqual(len(assignments), 2)
+        by_name = {assignment.display_name: assignment for assignment in assignments}
+        self.assertEqual(by_name["Newer"].surface_ids, (_FIRST_WALL,))
+        self.assertEqual(by_name["Older"].surface_ids, ())
+        self.assertEqual(
+            {job.status for job in self.manager.jobs()},
+            {JOB_STATUS_COMPLETED},
         )
 
-        self.assertEqual(len(self.workspace._generation_threads), 1)
-        self.assertEqual(len(self.manager.jobs()), 1)
-        self.assertIn("already using", self.workspace.status_label.text())
+    def test_generate_button_stays_enabled_for_busy_selected_surface(self) -> None:
+        self.workspace.surface_view.set_selected_surface_ids((_FIRST_WALL,))
+        self.workspace._data.frame_strokes = {0: []}
+        self.workspace.set_runtime_settings(
+            replace(self.workspace.get_runtime_settings(), meshy_api_key="test-key")
+        )
+        with patch.object(self.workspace, "_video_source", object()):
+            self.workspace._sync_controls()
+            self.assertTrue(self.workspace.generate_button.isEnabled())
+            self.assertTrue(self.workspace._start_generation(_request(_FIRST_WALL)))
+            self.assertTrue(self.provider.started[_FIRST_WALL].wait(timeout=2.0))
+            self.assertTrue(self.workspace.generate_button.isEnabled())
         self.provider.release[_FIRST_WALL].set()
         _wait_until(lambda: not self.workspace.is_generating)
+
+    def test_cancelling_newer_same_target_job_keeps_older_result(self) -> None:
+        provider = _SameTargetSurfaceProvider()
+        self.workspace.set_provider(provider)
+        try:
+            self.assertTrue(
+                self.workspace._start_generation(_request(_FIRST_WALL, "Older"))
+            )
+            self.assertTrue(
+                self.workspace._start_generation(_request(_FIRST_WALL, "Newer"))
+            )
+            self.assertTrue(provider.started["Older"].wait(timeout=2.0))
+            self.assertTrue(provider.started["Newer"].wait(timeout=2.0))
+            newer_job_id = next(
+                job_id
+                for job_id, request in self.workspace._generation_requests.items()
+                if request.display_name == "Newer"
+            )
+            self.assertTrue(self.manager.cancel_job(newer_job_id))
+            provider.release_all()
+            _wait_until(lambda: not self.workspace.is_generating)
+        finally:
+            provider.release_all()
+
+        assignments = self.workspace.get_data().assignments
+        self.assertEqual(len(assignments), 1)
+        self.assertEqual(assignments[0].display_name, "Older")
+        self.assertEqual(assignments[0].surface_ids, (_FIRST_WALL,))
+        self.assertEqual(
+            self.manager.get_job(newer_job_id).status,
+            JOB_STATUS_CANCELLED,
+        )
+
+    def test_older_overlapping_job_keeps_surfaces_newer_job_did_not_target(
+        self,
+    ) -> None:
+        provider = _SameTargetSurfaceProvider()
+        self.workspace.set_provider(provider)
+        older_request = replace(
+            _request(_FIRST_WALL, "Older"),
+            surface_ids=(_FIRST_WALL, _SECOND_WALL),
+        )
+        try:
+            self.assertTrue(self.workspace._start_generation(older_request))
+            self.assertTrue(
+                self.workspace._start_generation(_request(_FIRST_WALL, "Newer"))
+            )
+            self.assertTrue(provider.started["Older"].wait(timeout=2.0))
+            self.assertTrue(provider.started["Newer"].wait(timeout=2.0))
+            provider.release["Newer"].set()
+            _wait_until(
+                lambda: any(
+                    assignment.display_name == "Newer"
+                    for assignment in self.workspace.get_data().assignments
+                )
+            )
+            provider.release["Older"].set()
+            _wait_until(lambda: not self.workspace.is_generating)
+        finally:
+            provider.release_all()
+
+        assignments = self.workspace.get_data().assignments
+        by_name = {assignment.display_name: assignment for assignment in assignments}
+        self.assertEqual(by_name["Newer"].surface_ids, (_FIRST_WALL,))
+        self.assertEqual(by_name["Older"].surface_ids, (_SECOND_WALL,))
 
     def test_cancel_one_job_discards_its_late_result_only(self) -> None:
         self.assertTrue(self.workspace._start_generation(_request(_FIRST_WALL)))

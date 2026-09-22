@@ -372,6 +372,26 @@ class GenerationMainIntegrationTests(unittest.TestCase):
             "orbit",
         )
 
+    def test_clear_mask_hotkey_follows_settings_dropdown(self) -> None:
+        shortcut = self.workspace.merged_generation_workspace.clear_mask_shortcut
+        combo = self.workspace.settings_widget.clear_mask_hotkey_combo
+        self.assertEqual(
+            shortcut.key().toString(QKeySequence.SequenceFormat.PortableText),
+            "Ctrl+Shift+M",
+        )
+
+        combo.setCurrentIndex(combo.findData("Alt+C"))
+        _qt_application.processEvents()
+        self.assertEqual(
+            shortcut.key().toString(QKeySequence.SequenceFormat.PortableText),
+            "Alt+C",
+        )
+        self.assertTrue(shortcut.isEnabled())
+
+        combo.setCurrentIndex(combo.findData(""))
+        _qt_application.processEvents()
+        self.assertFalse(shortcut.isEnabled())
+
     def test_canvas_navigation_hotkey_follows_settings_and_canvas_scope(
         self,
     ) -> None:

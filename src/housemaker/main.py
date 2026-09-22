@@ -1512,11 +1512,11 @@ class BlueprintWorkspace(QWidget):
         self.texture_atlas_workspace.object_texture_resolution_changed.connect(
             self._handle_atlas_object_texture_resolution_changed
         )
-        self.texture_atlas_workspace.object_texture_selected.connect(
-            self._handle_atlas_object_texture_selected
+        self.texture_atlas_workspace.object_textures_selected.connect(
+            self._handle_atlas_object_textures_selected
         )
-        self.texture_atlas_workspace.surface_texture_selected.connect(
-            self._handle_atlas_surface_texture_selected
+        self.texture_atlas_workspace.surface_textures_selected.connect(
+            self._handle_atlas_surface_textures_selected
         )
         self.texture_atlas_workspace.surface_texture_repeat_size_changed.connect(
             self._handle_atlas_surface_texture_repeat_size_changed
@@ -1613,6 +1613,9 @@ class BlueprintWorkspace(QWidget):
         )
         self.generation.set_runtime_settings(generation_settings)
         self.surface_texture_generation.set_runtime_settings(generation_settings)
+        self.merged_generation_workspace.set_clear_mask_hotkey(
+            generation_settings.clear_mask_hotkey
+        )
         self.surface_texture_generation.generation_completed.connect(
             self._handle_surface_texture_generation_completed
         )
@@ -3514,9 +3517,11 @@ class BlueprintWorkspace(QWidget):
             self._desired_canvas_stair_part_ids
             or self._desired_canvas_surface_ids
         )
-        selected_surface_source_id = self._selected_atlas_surface_source_id
-        if selected_surface_source_id is not None:
-            self._handle_atlas_surface_texture_selected(selected_surface_source_id)
+        selected_surface_source_ids = (
+            self.texture_atlas_workspace.selected_surface_texture_ids
+        )
+        if selected_surface_source_ids:
+            self._handle_atlas_surface_textures_selected(selected_surface_source_ids)
         else:
             self._set_atlas_canvas_surface_highlights(())
             self._sync_atlas_green_outline_to_canvas_highlight(None)
@@ -8365,8 +8370,12 @@ class BlueprintWorkspace(QWidget):
             removed_source_ids.add(source_id)
             removable_assignment_ids.append(assignment_id)
         selected_source_was_removed = (
-            self.texture_atlas_workspace.selected_surface_texture_id
-            in removed_source_ids
+            any(
+                source_id in removed_source_ids
+                for source_id in (
+                    self.texture_atlas_workspace.selected_surface_texture_ids
+                )
+            )
         )
         if removable_assignment_ids:
             self.texture_atlas_workspace.remove_deleted_wall_texture_assignments(
@@ -8388,13 +8397,13 @@ class BlueprintWorkspace(QWidget):
     def _sync_canvas_selection_to_current_atlas_source(self) -> None:
         """Reconcile Canvas selection after an Atlas source disappears."""
 
-        surface_source_id = self.texture_atlas_workspace.selected_surface_texture_id
-        if surface_source_id is not None:
-            self._handle_atlas_surface_texture_selected(surface_source_id)
+        surface_source_ids = self.texture_atlas_workspace.selected_surface_texture_ids
+        if surface_source_ids:
+            self._handle_atlas_surface_textures_selected(surface_source_ids)
             return
-        object_id = self.texture_atlas_workspace.selected_object_texture_id
-        if object_id is not None:
-            self._handle_atlas_object_texture_selected(object_id)
+        object_ids = self.texture_atlas_workspace.selected_object_texture_ids
+        if object_ids:
+            self._handle_atlas_object_textures_selected(object_ids)
             return
         self._selected_atlas_surface_source_id = None
         self._desired_canvas_object_id = None
@@ -8433,6 +8442,56 @@ class BlueprintWorkspace(QWidget):
         finally:
             self._is_syncing_canvas_scene_selection = False
 
+    def _handle_atlas_object_textures_selected(self, object_ids: object) -> None:
+        """Mirror Atlas multi-selection onto placed Canvas objects."""
+
+        normalized_ids = tuple(
+            dict.fromkeys(
+                normalized
+                for value in object_ids
+                if (normalized := str(value).strip())
+            )
+        )
+        if not normalized_ids:
+            if self.texture_atlas_workspace.selected_surface_texture_ids:
+                return
+            self._desired_canvas_object_id = None
+            self._desired_canvas_object_ids = ()
+            self._is_syncing_canvas_scene_selection = True
+            try:
+                self.viewer.select_placed_object(None)
+            finally:
+                self._is_syncing_canvas_scene_selection = False
+            return
+        active_id = self.texture_atlas_workspace.selected_object_texture_id
+        if active_id not in normalized_ids:
+            active_id = normalized_ids[-1]
+        assert active_id is not None
+        if len(normalized_ids) == 1:
+            self._handle_atlas_object_texture_selected(active_id)
+            return
+        self._selected_atlas_surface_source_id = None
+        self._atlas_surface_assignment_target_ids = ()
+        self._desired_canvas_object_id = active_id
+        self._desired_canvas_object_ids = normalized_ids
+        self._desired_canvas_surface_ids = ()
+        self._discard_staged_stair_edit(clear_selection=True)
+        self._sync_surface_generation_selection(())
+        self.generation.select_generated_object(active_id)
+        self._set_atlas_canvas_surface_highlights(())
+        self._sync_atlas_green_outline_to_canvas_highlight(None)
+        self._is_syncing_canvas_scene_selection = True
+        try:
+            self.viewer.select_canvas_opening(None)
+            self.viewer.select_wall_target(None)
+            self.viewer.set_selected_canvas_stair_part_ids(())
+            self.viewer.set_selected_placed_object_ids(
+                normalized_ids,
+                active_object_id=active_id,
+            )
+        finally:
+            self._is_syncing_canvas_scene_selection = False
+
     def _handle_atlas_surface_texture_selected(self, source_id: str) -> None:
         """Highlight every Canvas surface using the selected texture family."""
 
@@ -8451,6 +8510,58 @@ class BlueprintWorkspace(QWidget):
         self._selected_atlas_surface_source_id = source_id
         self._set_atlas_canvas_surface_highlights(assignment.surface_ids)
         self._sync_atlas_green_outline_to_canvas_highlight(source_id)
+
+    def _handle_atlas_surface_textures_selected(self, source_ids: object) -> None:
+        """Highlight the union of surfaces using selected Atlas textures."""
+
+        normalized_ids = tuple(
+            dict.fromkeys(
+                normalized
+                for value in source_ids
+                if (normalized := str(value).strip())
+            )
+        )
+        if len(normalized_ids) == 1:
+            self._handle_atlas_surface_texture_selected(normalized_ids[0])
+            return
+        if not normalized_ids:
+            if self.texture_atlas_workspace.selected_object_texture_ids:
+                return
+            self._selected_atlas_surface_source_id = None
+            self._set_atlas_canvas_surface_highlights(())
+            self.texture_atlas_workspace.set_green_outline_source_ids(())
+            return
+        assignments = {
+            source_id: self.surface_texture_generation.get_assignment(assignment_id)
+            for source_id in normalized_ids
+            if (assignment_id := get_atlas_wall_texture_assignment_id(source_id))
+            is not None
+        }
+        surface_ids = tuple(
+            dict.fromkeys(
+                surface_id
+                for assignment in assignments.values()
+                if assignment is not None
+                for surface_id in assignment.surface_ids
+            )
+        )
+        self._selected_atlas_surface_source_id = (
+            self.texture_atlas_workspace.selected_surface_texture_id
+        )
+        self._set_atlas_canvas_surface_highlights(surface_ids)
+        highlighted_ids = set(self.viewer.get_highlighted_canvas_surface_ids())
+        highlighted_ids.update(self.viewer.get_highlighted_canvas_stair_part_ids())
+        self.texture_atlas_workspace.set_green_outline_source_ids(
+            tuple(
+                source_id
+                for source_id, assignment in assignments.items()
+                if assignment is not None
+                and any(
+                    surface_id in highlighted_ids
+                    for surface_id in assignment.surface_ids
+                )
+            )
+        )
 
     def _handle_atlas_surface_texture_repeat_size_changed(
         self,
@@ -10099,14 +10210,15 @@ class BlueprintWorkspace(QWidget):
         # The backing field and source-ID prefix retain their legacy "wall"
         # names so existing project files and integrations remain compatible.
         self._atlas_wall_texture_source_ids = set(surface_sources)
-        selected_surface_source_id = (
-            self.texture_atlas_workspace.selected_surface_texture_id
+        selected_surface_source_ids = (
+            self.texture_atlas_workspace.selected_surface_texture_ids
         )
         if (
-            selected_surface_source_id is not None
-            and selected_surface_source_id == self._selected_atlas_surface_source_id
+            selected_surface_source_ids
+            and self._selected_atlas_surface_source_id
+            in selected_surface_source_ids
         ):
-            self._handle_atlas_surface_texture_selected(selected_surface_source_id)
+            self._handle_atlas_surface_textures_selected(selected_surface_source_ids)
         zero_usage_cleanup_failed = False
         for assignment in surface_assignments:
             if assignment.surface_ids:
@@ -13395,6 +13507,9 @@ class BlueprintWorkspace(QWidget):
         )
         self.generation.set_runtime_settings(settings)
         self.surface_texture_generation.set_runtime_settings(settings)
+        self.merged_generation_workspace.set_clear_mask_hotkey(
+            settings.clear_mask_hotkey
+        )
         self._apply_scene_3d_display_screen(settings.scene_3d_display_screen_id)
         self._apply_generation_display_screen(
             settings.generation_display_screen_id

@@ -34,10 +34,13 @@ from housemaker.settings_widget import (
     AUTOMATIC_ATLAS_TEXTURE_RESOLUTIONS,
     AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR_SETTING_KEY,
     CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY_SETTING_KEY,
+    CLEAR_MASK_HOTKEY_OPTIONS,
+    CLEAR_MASK_HOTKEY_SETTING_KEY,
     DEFAULT_AUTOMATIC_ATLAS_CREATION,
     DEFAULT_AUTOMATIC_ATLAS_TEXTURE_RESOLUTION,
     DEFAULT_AUTOMATIC_ATLAS_TEXTURE_SORT_BY_PBR,
     DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY,
+    DEFAULT_CLEAR_MASK_HOTKEY,
     DEFAULT_HIDE_STAIR_MESH_WHEN_PREVIEWING,
     DEFAULT_IGNORE_TOP_DOWN_CEILING,
     DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS,
@@ -82,6 +85,7 @@ from housemaker.settings_widget import (
     read_automatic_atlas_texture_resolution,
     read_automatic_atlas_texture_sort_by_pbr,
     read_canvas_3d_navigation_toggle_hotkey,
+    read_clear_mask_hotkey,
     read_first_person_navigation_mode,
     read_generation_display_screen_id,
     read_hide_stair_mesh_when_previewing,
@@ -153,6 +157,11 @@ class SettingsWidgetTests(unittest.TestCase):
                         widget.mesh_edit_update_delay_spinbox,
                         widget.wall_vertex_update_delay_spinbox,
                     ),
+                ),
+                (
+                    widget.generation_shortcuts_group,
+                    "Generation shortcuts",
+                    (widget.clear_mask_hotkey_combo,),
                 ),
                 (
                     widget.object_generation_settings_group,
@@ -1650,6 +1659,64 @@ class SettingsWidgetTests(unittest.TestCase):
                 .toString(QKeySequence.SequenceFormat.PortableText),
                 DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY,
             )
+
+    def test_clear_mask_keymapping_dropdown_persists_and_can_be_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            widget = SettingsWidget(
+                application_settings=application_settings,
+                environment={},
+            )
+            changes: list[bool] = []
+            widget.settings_changed.connect(lambda: changes.append(True))
+
+            self.assertEqual(
+                widget.get_settings().clear_mask_hotkey,
+                DEFAULT_CLEAR_MASK_HOTKEY,
+            )
+            self.assertEqual(
+                widget.clear_mask_hotkey_combo.count(),
+                len(CLEAR_MASK_HOTKEY_OPTIONS),
+            )
+            widget.clear_mask_hotkey_combo.setCurrentIndex(
+                widget.clear_mask_hotkey_combo.findData("Alt+C")
+            )
+            self.assertEqual(
+                application_settings.get(CLEAR_MASK_HOTKEY_SETTING_KEY),
+                "Alt+C",
+            )
+            self.assertEqual(widget.get_settings().clear_mask_hotkey, "Alt+C")
+            self.assertEqual(len(changes), 1)
+
+            restored = SettingsWidget(
+                application_settings=_build_test_settings(temporary_directory),
+                environment={},
+            )
+            self.assertEqual(restored.get_settings().clear_mask_hotkey, "Alt+C")
+            restored.clear_mask_hotkey_combo.setCurrentIndex(
+                restored.clear_mask_hotkey_combo.findData("")
+            )
+            self.assertEqual(restored.get_settings().clear_mask_hotkey, "")
+            self.assertEqual(
+                read_clear_mask_hotkey(application_settings),
+                "",
+            )
+
+    def test_clear_mask_keymapping_rejects_invalid_saved_value(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            application_settings = _build_test_settings(temporary_directory)
+            for invalid_value in ("Ctrl+Z", "Q", None, ["Alt+C"]):
+                with self.subTest(invalid_value=invalid_value):
+                    application_settings.set(
+                        CLEAR_MASK_HOTKEY_SETTING_KEY,
+                        invalid_value,
+                    )
+                    self.assertEqual(
+                        read_clear_mask_hotkey(application_settings),
+                        DEFAULT_CLEAR_MASK_HOTKEY,
+                    )
+            with self.assertRaisesRegex(ValueError, "Clear mask hotkey"):
+                GenerationServiceSettings(clear_mask_hotkey="Ctrl+Z")
 
     def test_canvas_3d_navigation_hotkey_persists_and_emits_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

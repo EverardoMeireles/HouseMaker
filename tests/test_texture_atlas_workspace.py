@@ -1027,6 +1027,117 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.workspace.place_assign_button.click()
         assign_requests.assert_called_once_with(surface_source.object_id)
 
+    def test_ctrl_and_shift_select_multiple_sources_and_publish_groups(self) -> None:
+        object_sources = tuple(
+            _source(object_id, directory=self._temporary_directory.name)
+            for object_id in ("chair", "table", "lamp")
+        )
+        surface_sources = tuple(
+            _wall_source(object_id, directory=self._temporary_directory.name)
+            for object_id in ("plaster", "brick", "stone")
+        )
+        self.workspace.set_object_texture_sources((*object_sources, *surface_sources))
+        object_groups = Mock()
+        surface_groups = Mock()
+        self.workspace.object_textures_selected.connect(object_groups)
+        self.workspace.surface_textures_selected.connect(surface_groups)
+
+        object_list = self.workspace.object_list
+        for row, modifiers in (
+            (0, Qt.KeyboardModifier.NoModifier),
+            (2, Qt.KeyboardModifier.ControlModifier),
+        ):
+            QTest.mouseClick(
+                object_list.viewport(),
+                Qt.MouseButton.LeftButton,
+                modifiers,
+                object_list.visualItemRect(object_list.item(row)).center(),
+            )
+
+        self.assertEqual(
+            self.workspace.selected_object_texture_ids,
+            (object_sources[0].object_id, object_sources[2].object_id),
+        )
+        self.assertEqual(self.workspace.selected_object_texture_id, "lamp")
+        object_groups.assert_called_with(("chair", "lamp"))
+
+        QTest.mouseClick(
+            object_list.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.ShiftModifier,
+            object_list.visualItemRect(object_list.item(1)).center(),
+        )
+        self.assertEqual(
+            self.workspace.selected_object_texture_ids,
+            ("chair", "table", "lamp"),
+        )
+        object_groups.assert_called_with(("chair", "table", "lamp"))
+
+        surface_list = self.workspace.surface_list
+        QTest.mouseClick(
+            surface_list.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            surface_list.visualItemRect(surface_list.item(0)).center(),
+        )
+        QTest.mouseClick(
+            surface_list.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.ControlModifier,
+            surface_list.visualItemRect(surface_list.item(2)).center(),
+        )
+        self.assertEqual(self.workspace.selected_object_texture_ids, ())
+        self.assertEqual(
+            self.workspace.selected_surface_texture_ids,
+            (surface_sources[0].object_id, surface_sources[2].object_id),
+        )
+        self.assertEqual(
+            self.workspace.selected_surface_texture_id,
+            surface_sources[2].object_id,
+        )
+        surface_groups.assert_called_with(
+            (surface_sources[0].object_id, surface_sources[2].object_id)
+        )
+
+    def test_multi_selection_survives_source_refresh_and_actions_use_active_row(
+        self,
+    ) -> None:
+        sources = tuple(
+            _source(object_id, directory=self._temporary_directory.name)
+            for object_id in ("chair", "table", "lamp")
+        )
+        self.workspace.set_object_texture_sources(sources)
+        source_list = self.workspace.object_list
+        QTest.mouseClick(
+            source_list.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            source_list.visualItemRect(source_list.item(0)).center(),
+        )
+        QTest.mouseClick(
+            source_list.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.ControlModifier,
+            source_list.visualItemRect(source_list.item(2)).center(),
+        )
+        place_requests = Mock()
+        remove_requests = Mock()
+        self.workspace.object_place_requested.connect(place_requests)
+        self.workspace.source_remove_requested.connect(remove_requests)
+
+        self.workspace.set_object_texture_sources(sources)
+
+        self.assertEqual(self.workspace.selected_object_texture_ids, ("chair", "lamp"))
+        self.assertEqual(self.workspace.selected_object_texture_id, "lamp")
+        self.workspace.place_assign_button.click()
+        self.workspace.remove_source_button.click()
+        place_requests.assert_called_once_with("lamp")
+        remove_requests.assert_called_once_with("object", "lamp")
+
+        self.workspace.set_object_texture_sources(sources[:2])
+        self.assertEqual(self.workspace.selected_object_texture_ids, ("chair",))
+        self.assertEqual(self.workspace.selected_object_texture_id, "chair")
+
     def test_remove_button_requests_typed_semantic_source_removal(self) -> None:
         object_source = _source(
             "chair",

@@ -19,6 +19,7 @@ import trimesh
 from PIL import Image
 from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtGui import QWheelEvent
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
@@ -723,6 +724,98 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             [call(None), call(record.object_id)],
         )
         request_placement.assert_called_once_with(record.object_id)
+
+    def test_atlas_multi_object_selection_syncs_group_to_canvas(self) -> None:
+        records = tuple(
+            _generated_object_record_with_variants(
+                self.settings.path.parent / "generated",
+                object_id=object_id,
+                object_name=object_id.title(),
+                resolutions=(512,),
+                selected_resolution=512,
+            )
+            for object_id in ("chair", "table")
+        )
+        data = GenerationData(generated_objects=list(records))
+        self.workspace.generation.set_data(data)
+        self.workspace.generation.data_changed.emit(data)
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        source_list = atlas_workspace.object_list
+
+        with patch.object(
+            self.workspace.viewer,
+            "set_selected_placed_object_ids",
+        ) as select_objects:
+            for row, modifiers in (
+                (0, Qt.KeyboardModifier.NoModifier),
+                (1, Qt.KeyboardModifier.ControlModifier),
+            ):
+                QTest.mouseClick(
+                    source_list.viewport(),
+                    Qt.MouseButton.LeftButton,
+                    modifiers,
+                    source_list.visualItemRect(source_list.item(row)).center(),
+                )
+
+        self.assertEqual(
+            atlas_workspace.selected_object_texture_ids,
+            ("chair", "table"),
+        )
+        self.assertEqual(self.workspace._desired_canvas_object_ids, ("chair", "table"))
+        select_objects.assert_called_with(
+            ("chair", "table"),
+            active_object_id="table",
+        )
+
+    def test_atlas_multi_surface_selection_highlights_surface_union(self) -> None:
+        _add_square_room_to_level(self.workspace.current_level)
+        surfaces = tuple(build_fixed_surfaces(self.workspace.levels))
+        wall_ids = tuple(
+            surface.surface_id
+            for surface in surfaces
+            if surface.surface_type == SURFACE_TYPE_WALL
+        )[:2]
+        self.assertEqual(len(wall_ids), 2)
+        self.workspace.surface_texture_generation.set_levels(self.workspace.levels)
+        self.workspace._set_canvas_viewer_targets(surfaces)
+        assignments = tuple(
+            _wall_texture_assignment(
+                self.settings.path.parent / "surface_textures",
+                assignment_id=f"wall-{index}",
+                surface_ids=(wall_id,),
+            )
+            for index, wall_id in enumerate(wall_ids)
+        )
+        data = SurfaceTextureData(assignments=list(assignments))
+        self.workspace.surface_texture_generation.set_data(data)
+        self.workspace.surface_texture_generation.data_changed.emit(data)
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        source_list = atlas_workspace.surface_list
+
+        for row, modifiers in (
+            (0, Qt.KeyboardModifier.NoModifier),
+            (1, Qt.KeyboardModifier.ControlModifier),
+        ):
+            QTest.mouseClick(
+                source_list.viewport(),
+                Qt.MouseButton.LeftButton,
+                modifiers,
+                source_list.visualItemRect(source_list.item(row)).center(),
+            )
+
+        source_ids = tuple(
+            build_atlas_wall_texture_source_id(assignment.assignment_id)
+            for assignment in assignments
+        )
+        self.assertEqual(atlas_workspace.selected_surface_texture_ids, source_ids)
+        self.assertEqual(
+            set(self.workspace.viewer.get_highlighted_canvas_surface_ids()),
+            set(wall_ids),
+        )
+        self.assertEqual(
+            atlas_workspace._green_outline_source_ids,
+            frozenset(source_ids),
+        )
 
     def test_geometry_only_object_can_be_previewed_and_placed_from_atlas(
         self,

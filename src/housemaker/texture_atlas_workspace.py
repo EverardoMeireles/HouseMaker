@@ -846,6 +846,8 @@ class TextureAtlasObjectList(QListWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setItemDelegate(_NewSourceAttentionDelegate(self))
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._last_click_modifiers = Qt.KeyboardModifier.NoModifier
 
     def startDrag(self, supported_actions: Qt.DropAction) -> None:  # type: ignore[override]
         del supported_actions
@@ -866,6 +868,7 @@ class TextureAtlasObjectList(QListWidget):
     def mousePressEvent(self, event: QMouseEvent) -> None:  # type: ignore[override]
         item = self.itemAt(event.position().toPoint())
         button = event.button()
+        self._last_click_modifiers = event.modifiers()
         is_supported_click = button in {
             Qt.MouseButton.LeftButton,
             Qt.MouseButton.RightButton,
@@ -884,6 +887,12 @@ class TextureAtlasObjectList(QListWidget):
     @property
     def mouse_button_in_progress(self) -> object | None:
         return getattr(self, "_mouse_button_in_progress", None)
+
+    @property
+    def last_click_modifiers(self) -> Qt.KeyboardModifier:
+        """Return modifiers from the last mouse press before emitting its click."""
+
+        return self._last_click_modifiers
 
 
 # ### Atlas preview ###
@@ -1921,6 +1930,8 @@ class TextureAtlasWorkspace(QWidget):
     object_texture_resolution_changed = Signal(str, int)
     object_texture_selected = Signal(str)
     surface_texture_selected = Signal(str)
+    object_textures_selected = Signal(object)
+    surface_textures_selected = Signal(object)
     surface_texture_repeat_size_changed = Signal(str, float)
     object_place_requested = Signal(str)
     object_delete_requested = Signal(str)
@@ -1992,6 +2003,9 @@ class TextureAtlasWorkspace(QWidget):
             _AtlasStorageSizeCacheEntry,
         ] = {}
         self._active_source_kind: str | None = None
+        self._last_published_source_selection: (
+            tuple[str | None, tuple[str, ...], str | None] | None
+        ) = None
         self._object_preview_widget: QWidget | None = None
         self._build_ui()
         self._refresh_all()
@@ -3386,12 +3400,24 @@ class TextureAtlasWorkspace(QWidget):
         return self._selected_object_id()
 
     @property
+    def selected_object_texture_ids(self) -> tuple[str, ...]:
+        """Return all selected Object texture sources in displayed row order."""
+
+        return self._selected_source_ids("object")
+
+    @property
     def selected_surface_texture_id(self) -> str | None:
         """Return the selected architectural-surface source, if active."""
 
         if self._active_source_kind != "surface":
             return None
         return self._selected_object_id()
+
+    @property
+    def selected_surface_texture_ids(self) -> tuple[str, ...]:
+        """Return all selected Surface texture sources in displayed row order."""
+
+        return self._selected_source_ids("surface")
 
     @property
     def object_preview_widget(self) -> QWidget | None:
@@ -4078,6 +4104,9 @@ class TextureAtlasWorkspace(QWidget):
         self.object_list.currentItemChanged.connect(
             self._handle_object_list_selection_changed
         )
+        self.object_list.itemSelectionChanged.connect(
+            lambda: self._handle_source_items_selection_changed("object")
+        )
         self.object_list.object_clicked.connect(self._handle_object_mouse_click)
         texture_column_layout.addWidget(self.object_list, 1)
         self.delete_object_button = QPushButton("Delete object")
@@ -4111,6 +4140,9 @@ class TextureAtlasWorkspace(QWidget):
         self.surface_list.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
         self.surface_list.currentItemChanged.connect(
             self._handle_surface_list_selection_changed
+        )
+        self.surface_list.itemSelectionChanged.connect(
+            lambda: self._handle_source_items_selection_changed("surface")
         )
         self.surface_list.object_clicked.connect(self._handle_object_mouse_click)
         texture_column_layout.addWidget(self.surface_list, 1)
@@ -5002,6 +5034,36 @@ class TextureAtlasWorkspace(QWidget):
     ) -> None:
         self._handle_source_selection_changed("surface", current)
 
+    def _handle_source_items_selection_changed(self, source_kind: str) -> None:
+        """Publish Ctrl/Shift and keyboard selection changes after Qt applies them."""
+
+        source_list = self.object_list if source_kind == "object" else self.surface_list
+        if self._is_syncing or source_list.mouse_button_in_progress is not None:
+            return
+        selected_ids = self._selected_source_ids(source_kind)
+        if selected_ids:
+            other_list = (
+                self.surface_list if source_kind == "object" else self.object_list
+            )
+            self._is_syncing = True
+            try:
+                other_list.setCurrentRow(-1)
+                other_list.clearSelection()
+            finally:
+                self._is_syncing = False
+            self._active_source_kind = source_kind
+        elif self._active_source_kind == source_kind:
+            self._active_source_kind = None
+        else:
+            return
+        selected_id = self._selected_object_id()
+        for preview in self.map_previews.values():
+            preview.set_selected_object_id(selected_id)
+        self._sync_controls()
+        if selected_id is None and not self.is_ambient_occlusion_preview_active:
+            self.object_preview_clear_requested.emit()
+        self._emit_selected_source_set_signal()
+
     def _handle_source_selection_changed(
         self,
         source_kind: str,
@@ -5019,6 +5081,7 @@ class TextureAtlasWorkspace(QWidget):
                 if not self.is_ambient_occlusion_preview_active:
                     self.object_preview_clear_requested.emit()
             self._sync_controls()
+            self._emit_selected_source_set_signal()
             return
         other_list = self.surface_list if source_kind == "object" else self.object_list
         self._is_syncing = True
@@ -5054,7 +5117,20 @@ class TextureAtlasWorkspace(QWidget):
         self._dismiss_new_source_attention(object_id)
         self._is_handling_object_click = True
         try:
-            self._select_object_row(object_id)
+            source_list = (
+                self.surface_list
+                if self._is_surface_texture_source_id(object_id)
+                else self.object_list
+            )
+            additive_click = bool(
+                source_list.last_click_modifiers
+                & (
+                    Qt.KeyboardModifier.ControlModifier
+                    | Qt.KeyboardModifier.ShiftModifier
+                )
+            )
+            if not additive_click or button != Qt.MouseButton.LeftButton:
+                self._select_object_row(object_id)
             if (
                 object_id in self._placeable_objects_by_id
                 and object_id not in self._sources_by_object_id
@@ -5078,11 +5154,30 @@ class TextureAtlasWorkspace(QWidget):
 
         source_id = self._selected_object_id()
         if source_id is None:
+            self._emit_selected_source_set_signal()
             return
         if self._active_source_kind == "surface":
             self.surface_texture_selected.emit(source_id)
         elif self._active_source_kind == "object":
             self.object_texture_selected.emit(source_id)
+        self._emit_selected_source_set_signal()
+
+    def _emit_selected_source_set_signal(self) -> None:
+        """Publish the whole selected group, retaining one active row for actions."""
+
+        source_kind = self._active_source_kind
+        selected_ids = self._selected_source_ids(source_kind)
+        signature = (source_kind, selected_ids, self._selected_object_id())
+        if signature == self._last_published_source_selection:
+            return
+        self._last_published_source_selection = signature
+        if source_kind == "surface":
+            self.surface_textures_selected.emit(selected_ids)
+        elif source_kind == "object":
+            self.object_textures_selected.emit(selected_ids)
+        else:
+            self.object_textures_selected.emit(())
+            self.surface_textures_selected.emit(())
 
     def _request_selected_source_action(self) -> None:
         """Request placement or assignment according to the selected list."""
@@ -5385,6 +5480,11 @@ class TextureAtlasWorkspace(QWidget):
     def _refresh_object_list(self, selected_object_id: str | None) -> None:
         was_syncing = self._is_syncing
         atlas = self.selected_atlas
+        previously_selected_ids = {
+            source_kind: set(self._selected_source_ids(source_kind))
+            for source_kind in ("object", "surface")
+        }
+        previous_source_kind = self._active_source_kind
         self._is_syncing = True
         try:
             self.object_list.clear()
@@ -5523,9 +5623,27 @@ class TextureAtlasWorkspace(QWidget):
                     "surface" if selected_list is self.surface_list else "object"
                 )
             elif selected_object_id is not None:
+                retained_list = (
+                    self.object_list
+                    if previous_source_kind == "object"
+                    else self.surface_list
+                )
+                retained_row = next(
+                    (
+                        row
+                        for row in range(retained_list.count() - 1, -1, -1)
+                        if str(retained_list.item(row).data(OBJECT_ID_ROLE))
+                        in previously_selected_ids.get(previous_source_kind, set())
+                    ),
+                    -1,
+                )
                 self.object_list.setCurrentRow(-1)
                 self.surface_list.setCurrentRow(-1)
-                self._active_source_kind = None
+                if retained_row >= 0:
+                    retained_list.setCurrentRow(retained_row)
+                    self._active_source_kind = previous_source_kind
+                else:
+                    self._active_source_kind = None
             elif self.object_list.count() > 0:
                 self.object_list.setCurrentRow(0)
                 self._active_source_kind = "object"
@@ -5534,6 +5652,17 @@ class TextureAtlasWorkspace(QWidget):
                 self._active_source_kind = "surface"
             else:
                 self._active_source_kind = None
+            for source_kind, source_list in (
+                ("object", self.object_list),
+                ("surface", self.surface_list),
+            ):
+                if source_kind != self._active_source_kind:
+                    continue
+                selected_ids = previously_selected_ids[source_kind]
+                for row in range(source_list.count()):
+                    item = source_list.item(row)
+                    if str(item.data(OBJECT_ID_ROLE)) in selected_ids:
+                        item.setSelected(True)
         finally:
             self._is_syncing = was_syncing
         selected_id = self._selected_object_id()
@@ -5935,7 +6064,24 @@ class TextureAtlasWorkspace(QWidget):
             item = self.object_list.currentItem()
             if item is None:
                 item = self.surface_list.currentItem()
-        return None if item is None else str(item.data(OBJECT_ID_ROLE))
+        if item is not None and item.isSelected():
+            return str(item.data(OBJECT_ID_ROLE))
+        selected_ids = self._selected_source_ids(self._active_source_kind)
+        if selected_ids:
+            return selected_ids[-1]
+        return None
+
+    def _selected_source_ids(self, source_kind: str | None) -> tuple[str, ...]:
+        """Return selected source IDs in list order for one active category."""
+
+        if source_kind not in {"object", "surface"}:
+            return ()
+        source_list = self.object_list if source_kind == "object" else self.surface_list
+        return tuple(
+            str(source_list.item(row).data(OBJECT_ID_ROLE))
+            for row in range(source_list.count())
+            if source_list.item(row).isSelected()
+        )
 
     def _selected_object_source(self) -> AtlasObjectTextureSource | None:
         object_id = self._selected_object_id()
@@ -5959,7 +6105,9 @@ class TextureAtlasWorkspace(QWidget):
                 try:
                     other_list.setCurrentRow(-1)
                     other_list.clearSelection()
+                    target_list.clearSelection()
                     target_list.setCurrentRow(row)
+                    item.setSelected(True)
                 finally:
                     self._is_syncing = was_syncing
                 self._active_source_kind = (

@@ -56,6 +56,7 @@ AUTOMATIC_ATLAS_TEXTURE_RESOLUTION_SETTING_KEY = (
 CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY_SETTING_KEY = (
     "navigation/canvas_3d_navigation_toggle_hotkey"
 )
+CLEAR_MASK_HOTKEY_SETTING_KEY = "generation/clear_mask_hotkey"
 FIRST_PERSON_NAVIGATION_MODE_SETTING_KEY = (
     "navigation/first_person_navigation_mode"
 )
@@ -81,6 +82,19 @@ SNAP_MIDDLE_EQUAL_ANGLE_ONLY_SETTING_KEY = (
     "canvas/snap_middle_equal_angle_only"
 )
 DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY = "N"
+DEFAULT_CLEAR_MASK_HOTKEY = "Ctrl+Shift+M"
+CLEAR_MASK_HOTKEY_OPTIONS = (
+    ("Off", ""),
+    ("Ctrl+Shift+M", "Ctrl+Shift+M"),
+    ("Ctrl+Shift+C", "Ctrl+Shift+C"),
+    ("Ctrl+Alt+M", "Ctrl+Alt+M"),
+    ("Ctrl+Alt+C", "Ctrl+Alt+C"),
+    ("Alt+M", "Alt+M"),
+    ("Alt+C", "Alt+C"),
+)
+CLEAR_MASK_HOTKEY_VALUES = frozenset(
+    hotkey for _label, hotkey in CLEAR_MASK_HOTKEY_OPTIONS
+)
 DEFAULT_UNUSED_FACE_REMOVAL = False
 DEFAULT_USE_UV_RAYCAST_FOR_OBJECT_GENERATION = False
 DEFAULT_MINIMUM_FACE_VISIBILITY_PERCENTAGE = 5
@@ -199,6 +213,7 @@ class GenerationServiceSettings:
     hide_stair_mesh_when_previewing: bool = (
         DEFAULT_HIDE_STAIR_MESH_WHEN_PREVIEWING
     )
+    clear_mask_hotkey: str = DEFAULT_CLEAR_MASK_HOTKEY
 
     def __post_init__(self) -> None:
         try:
@@ -355,6 +370,11 @@ class GenerationServiceSettings:
             "canvas_3d_navigation_toggle_hotkey",
             normalized_hotkey,
         )
+        if (
+            not isinstance(self.clear_mask_hotkey, str)
+            or self.clear_mask_hotkey not in CLEAR_MASK_HOTKEY_VALUES
+        ):
+            raise ValueError("Clear mask hotkey must be a listed keymapping.")
         normalized_mesh_edit_delay = (
             _normalize_mesh_edit_update_delay_seconds(
                 self.mesh_edit_update_delay_seconds
@@ -479,6 +499,7 @@ class SettingsWidget(QWidget):
             canvas_3d_navigation_toggle_hotkey=(
                 self._selected_canvas_3d_navigation_toggle_hotkey()
             ),
+            clear_mask_hotkey=str(self.clear_mask_hotkey_combo.currentData()),
             unused_face_removal=self.unused_face_removal_checkbox.isChecked(),
             use_uv_raycast_for_object_generation=(
                 self.use_uv_raycast_for_object_generation_checkbox.isChecked()
@@ -590,6 +611,12 @@ class SettingsWidget(QWidget):
             "Canvas",
             "canvas_settings_group",
         )
+        self.generation_shortcuts_group, generation_shortcuts_form = (
+            self._build_form_group(
+                "Generation shortcuts",
+                "generation_shortcuts_group",
+            )
+        )
         (
             self.object_generation_settings_group,
             object_generation_form,
@@ -607,6 +634,7 @@ class SettingsWidget(QWidget):
         sections_layout.addWidget(self.api_credentials_group)
         sections_layout.addWidget(self.display_settings_group)
         sections_layout.addWidget(self.canvas_settings_group)
+        sections_layout.addWidget(self.generation_shortcuts_group)
         sections_layout.addWidget(self.object_generation_settings_group)
         sections_layout.addWidget(self.atlas_automation_settings_group)
         sections_layout.addStretch(1)
@@ -796,6 +824,22 @@ class SettingsWidget(QWidget):
         canvas_form.addRow(
             "Canvas 3D navigation hotkey",
             self.canvas_3d_navigation_toggle_hotkey_edit,
+        )
+
+        self.clear_mask_hotkey_combo = QComboBox()
+        self.clear_mask_hotkey_combo.setObjectName("clear_mask_hotkey_combo")
+        self.clear_mask_hotkey_combo.setToolTip(
+            "Choose a shortcut for clearing the shared Generation mask. "
+            "The shortcut works only while Generation is active."
+        )
+        for label, hotkey in CLEAR_MASK_HOTKEY_OPTIONS:
+            self.clear_mask_hotkey_combo.addItem(label, hotkey)
+        self.clear_mask_hotkey_combo.currentIndexChanged.connect(
+            self._handle_clear_mask_hotkey_changed
+        )
+        generation_shortcuts_form.addRow(
+            "Clear mask",
+            self.clear_mask_hotkey_combo,
         )
 
         self.first_person_navigation_combo = QComboBox()
@@ -1079,6 +1123,14 @@ class SettingsWidget(QWidget):
                     self._application_settings
                 ),
                 QKeySequence.SequenceFormat.PortableText,
+            )
+        )
+        self.clear_mask_hotkey_combo.setCurrentIndex(
+            max(
+                0,
+                self.clear_mask_hotkey_combo.findData(
+                    read_clear_mask_hotkey(self._application_settings)
+                ),
             )
         )
         first_person_navigation_mode = read_first_person_navigation_mode(
@@ -1372,6 +1424,15 @@ class SettingsWidget(QWidget):
             self.canvas_3d_navigation_toggle_hotkey_edit.keySequence()
         )
         return hotkey or DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY
+
+    def _handle_clear_mask_hotkey_changed(self, _index: int) -> None:
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            CLEAR_MASK_HOTKEY_SETTING_KEY,
+            str(self.clear_mask_hotkey_combo.currentData()),
+        )
+        self.settings_changed.emit()
 
     def _handle_canvas_3d_navigation_toggle_hotkey_changed(
         self,
@@ -1874,6 +1935,22 @@ def read_canvas_3d_navigation_toggle_hotkey(
         application_settings.get(CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY_SETTING_KEY)
     )
     return hotkey or DEFAULT_CANVAS_3D_NAVIGATION_TOGGLE_HOTKEY
+
+
+def read_clear_mask_hotkey(
+    application_settings: ApplicationSettingsStore,
+) -> str:
+    """Read a listed Generation mask shortcut, falling back safely."""
+
+    hotkey = application_settings.get(
+        CLEAR_MASK_HOTKEY_SETTING_KEY,
+        DEFAULT_CLEAR_MASK_HOTKEY,
+    )
+    return (
+        hotkey
+        if isinstance(hotkey, str) and hotkey in CLEAR_MASK_HOTKEY_VALUES
+        else DEFAULT_CLEAR_MASK_HOTKEY
+    )
 
 
 def _get_gui_application() -> QGuiApplication | None:

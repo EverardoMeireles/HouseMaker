@@ -13,6 +13,8 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import QApplication, QWidget
 
 from housemaker.app_settings import ApplicationSettingsStore
@@ -412,6 +414,35 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         self.assertEqual(self.objects.get_data().frame_strokes[1], [second_stroke])
         self.assertEqual(self.surfaces.get_data().frame_strokes[1], [second_stroke])
         self.assertEqual(self.workspace.video_view.get_strokes(), [first_stroke])
+
+    def test_clear_mask_keymapping_uses_shared_button_and_can_be_disabled(self) -> None:
+        video_path = Path(self.temporary_directory.name) / "source.avi"
+        _write_test_video(video_path)
+        self.objects.load_video(str(video_path))
+        self.surfaces.load_video(str(video_path))
+        self.workspace.video_view.set_strokes([_stroke(0.5)])
+        self.workspace.sync_shared_controls()
+
+        self.assertTrue(self.workspace.clear_mask_button.isEnabled())
+        self.assertEqual(
+            self.workspace.clear_mask_shortcut.context(),
+            Qt.ShortcutContext.WidgetWithChildrenShortcut,
+        )
+        self.workspace.set_clear_mask_hotkey("Alt+C")
+        self.assertEqual(
+            self.workspace.clear_mask_shortcut.key().toString(
+                QKeySequence.SequenceFormat.PortableText
+            ),
+            "Alt+C",
+        )
+        self.workspace.clear_mask_shortcut.activated.emit()
+        self.assertFalse(self.workspace.video_view.has_selection())
+
+        self.workspace.video_view.set_strokes([_stroke(0.5)])
+        self.workspace.sync_shared_controls()
+        self.workspace.set_clear_mask_hotkey("")
+        self.assertFalse(self.workspace.clear_mask_shortcut.isEnabled())
+        self.assertTrue(self.workspace.video_view.has_selection())
 
     def test_cancel_targets_newest_relevant_job_only(self) -> None:
         cancelled: list[str] = []

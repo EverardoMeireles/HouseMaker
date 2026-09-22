@@ -7,7 +7,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from PySide6.QtCore import QRect, Qt, Slot
-from PySide6.QtGui import QColor, QPainter, QPaintEvent, QPen
+from PySide6.QtGui import QColor, QKeySequence, QPainter, QPaintEvent, QPen, QShortcut
 from PySide6.QtWidgets import (
     QFileDialog,
     QGridLayout,
@@ -38,6 +38,7 @@ from housemaker.generation_workspace import (
     GENERATION_JOB_KIND_TEXTURE,
     GenerationWorkspace,
 )
+from housemaker.settings_widget import DEFAULT_CLEAR_MASK_HOTKEY
 from housemaker.surface_texture_state import SurfaceTextureData
 from housemaker.surface_texture_workspace import (
     SURFACE_TEXTURE_JOB_KIND,
@@ -142,7 +143,28 @@ class MergedGenerationWorkspace(QWidget):
         self._adopt_shared_controls()
         self._build_ui()
         self._connect_shared_controls()
+        self.clear_mask_shortcut = QShortcut(self)
+        self.clear_mask_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self.clear_mask_shortcut.activated.connect(self._clear_mask_from_shortcut)
+        self.set_clear_mask_hotkey(DEFAULT_CLEAR_MASK_HOTKEY)
         self.sync_shared_controls()
+
+    def set_clear_mask_hotkey(self, hotkey: str) -> None:
+        """Apply the selected Generation-only Clear mask keymapping."""
+
+        self.clear_mask_shortcut.setKey(
+            QKeySequence(hotkey, QKeySequence.SequenceFormat.PortableText)
+        )
+        self.clear_mask_shortcut.setEnabled(bool(hotkey))
+
+    @Slot()
+    def _clear_mask_from_shortcut(self) -> None:
+        """Use the same enabled-state guard as the shared Clear mask button."""
+
+        if self.clear_mask_button.isEnabled():
+            self.clear_mask_button.click()
 
     def refresh_file_backed_previews(self) -> None:
         """Refresh the generated-object preview at the tab cache boundary."""

@@ -711,6 +711,9 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._generation_workers: dict[str, SurfaceTextureWorker] = {}
         self._generation_requests: dict[str, SurfaceTextureRequest] = {}
         self._generation_surface_targets: dict[str, frozenset[str]] = {}
+        self._generation_submission_count = 0
+        self._generation_submission_order: dict[str, int] = {}
+        self._latest_applied_generation_order: dict[str, int] = {}
         self._cancelled_generation_job_ids: set[str] = set()
         self._is_shutting_down = False
         self._restored_assignment_texture_signature: (
@@ -2117,6 +2120,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._close_video_source()
         self._displayed_frame_index = None
         self._data = SurfaceTextureData() if data is None else data.clone()
+        self._latest_applied_generation_order.clear()
         migration_failure_count = self._migrate_legacy_meshy_pbr_alignment()
         metadata = self._data.video_metadata
         if metadata is not None and Path(metadata.path).exists():
@@ -2450,6 +2454,8 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._generation_workers.clear()
         self._generation_requests.clear()
         self._generation_surface_targets.clear()
+        self._generation_submission_order.clear()
+        self._latest_applied_generation_order.clear()
         self._close_video_source()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
@@ -2633,15 +2639,9 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         *,
         reference_input: _SurfaceTextureReferenceInput | None = None,
     ) -> bool:
-        """Start one independently tracked job unless its surfaces are busy."""
+        """Start an independently tracked job for the current request snapshot."""
 
         if self._is_shutting_down:
-            return False
-        if self._surface_targets_are_reserved(request.surface_ids):
-            self.status_label.setText(
-                "A surface texture job is already using part of this selection."
-            )
-            self._sync_controls()
             return False
         job = self._job_manager.create_job(
             kind=SURFACE_TEXTURE_JOB_KIND,
@@ -2663,6 +2663,10 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._generation_requests[job_id] = request
         self._generation_surface_targets[job_id] = frozenset(
             request.surface_ids
+        )
+        self._generation_submission_count += 1
+        self._generation_submission_order[job_id] = (
+            self._generation_submission_count
         )
         self._job_manager.set_cancel_callback(
             job_id,
@@ -2853,6 +2857,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         result: SurfaceTextureResult,
         prepared_outputs: Sequence[_PreparedSurfaceTextureOutput] | None = None,
         saved_outputs: Sequence[_SavedSurfaceTextureOutput] | None = None,
+        applied_surface_ids: frozenset[str] | None = None,
     ) -> bool:
         surface_by_id = self._all_existing_surfaces_by_id()
         if any(
@@ -2911,6 +2916,14 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         assignments: list[SurfaceTextureAssignment] = []
         try:
             for saved_output in saved_output_items:
+                target_ids = tuple(
+                    surface_id
+                    for surface_id in saved_output.surface_ids
+                    if (
+                        applied_surface_ids is None
+                        or surface_id in applied_surface_ids
+                    )
+                )
                 selected_resolution = DEFAULT_SURFACE_TEXTURE_RESOLUTION
                 active_variant = next(
                     variant
@@ -2920,21 +2933,21 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 area_m2 = float(
                     sum(
                         surface_areas.get(surface_id, 0.0)
-                        for surface_id in saved_output.surface_ids
+                        for surface_id in target_ids
                     )
                 )
                 assignments.append(
                     SurfaceTextureAssignment(
                         assignment_id=saved_output.assignment_id,
                         surface_type=request.surface_type,
-                        surface_ids=saved_output.surface_ids,
+                        surface_ids=target_ids,
                         provider=result.provider,
                         provider_task_id=result.task_id,
                         provider_pbr_task_id=result.pbr_task_id,
                         asset_path=active_variant.asset_path,
                         combined_area_m2=area_m2,
                         area_description=(
-                            f"{len(saved_output.surface_ids)} "
+                            f"{len(target_ids)} "
                             f"{request.surface_type} "
                             f"surface(s), {area_m2:.2f} m²"
                         ),
@@ -2970,17 +2983,18 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 assignments,
                 strict=True,
             ):
-                self._set_surface_view_texture(
-                    saved_output.surface_ids,
-                    saved_output.png_for_resolution(
-                        assignment.selected_texture_resolution
-                        or DEFAULT_SURFACE_TEXTURE_RESOLUTION
-                    ),
-                    saved_output.map_pngs_for_resolution(
-                        assignment.selected_texture_resolution
-                        or DEFAULT_SURFACE_TEXTURE_RESOLUTION
-                    ),
-                )
+                if assignment.surface_ids:
+                    self._set_surface_view_texture(
+                        assignment.surface_ids,
+                        saved_output.png_for_resolution(
+                            assignment.selected_texture_resolution
+                            or DEFAULT_SURFACE_TEXTURE_RESOLUTION
+                        ),
+                        saved_output.map_pngs_for_resolution(
+                            assignment.selected_texture_resolution
+                            or DEFAULT_SURFACE_TEXTURE_RESOLUTION
+                        ),
+                    )
         except (OSError, TypeError, ValueError) as error:
             self._restore_assignment_textures()
             self._discard_saved_outputs(saved_output_items)
@@ -2994,15 +3008,28 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         # file-backed cache unvalidated so activation confirms the exact bytes
         # that were persisted, including a concurrent same-path replacement.
         self._restored_assignment_texture_signature = None
-        status = (
-            f"Applied {request.display_name!r} to {len(request.surface_ids)} "
-            f"{request.surface_type} surface(s)."
-            if request.display_name
-            else (
-                f"Applied generated texture to {len(request.surface_ids)} "
-                f"{request.surface_type} surface(s)."
-            )
+        applied_count = len(
+            {
+                surface_id
+                for assignment in assignments
+                for surface_id in assignment.surface_ids
+            }
         )
+        if not applied_count:
+            status = (
+                "Generated texture saved as an unassigned source because a "
+                "newer job already textured its surfaces."
+            )
+        else:
+            status = (
+                f"Applied {request.display_name!r} to {applied_count} "
+                f"{request.surface_type} surface(s)."
+                if request.display_name
+                else (
+                    f"Applied generated texture to {applied_count} "
+                    f"{request.surface_type} surface(s)."
+                )
+            )
         self.status_label.setText(status)
         self._emit_data_changed()
         for assignment in assignments:
@@ -3221,13 +3248,25 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             stage="Applying texture (99%)",
             progress=99,
         )
+        submission_order = self._generation_submission_order[job_id]
+        applicable_surface_ids = frozenset(
+            surface_id
+            for surface_id in raw_request.surface_ids
+            if self._latest_applied_generation_order.get(surface_id, 0)
+            <= submission_order
+        )
         worker.claim_saved_outputs()
         committed = self._handle_generation_succeeded(
             raw_request,
             raw_result,
             saved_outputs=tuple(raw_prepared_outputs),
+            applied_surface_ids=applicable_surface_ids,
         )
         if committed:
+            for surface_id in applicable_surface_ids:
+                self._latest_applied_generation_order[surface_id] = (
+                    submission_order
+                )
             self._job_manager.complete_job(job_id)
         else:
             self._job_manager.fail_job(job_id, self.status_label.text())
@@ -3300,6 +3339,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._generation_workers.pop(job_id, None)
         self._generation_requests.pop(job_id, None)
         self._generation_surface_targets.pop(job_id, None)
+        self._generation_submission_order.pop(job_id, None)
         self._cancelled_generation_job_ids.discard(job_id)
         self._sync_controls()
 
@@ -3651,11 +3691,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         has_video = self._video_source is not None
         has_mask = bool(self._data.frame_strokes) or self.video_view.has_selection()
         selection = self._get_surface_selection_snapshot()
-        selected_surface_ids = selection.surface_ids
         has_surface = selection.is_valid
-        selection_is_reserved = self._surface_targets_are_reserved(
-            selected_surface_ids
-        )
         has_key = bool(self._settings.surface_texture_api_key)
         if self._shared_controls is None:
             self.load_video_button.setEnabled(True)
@@ -3677,7 +3713,6 @@ class SurfaceTextureGenerationWorkspace(QWidget):
             and has_mask
             and has_surface
             and has_key
-            and not selection_is_reserved
         )
 
     def _emit_data_changed(self) -> None:
