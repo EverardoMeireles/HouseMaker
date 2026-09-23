@@ -4288,11 +4288,11 @@ class BlueprintCanvas(QWidget):
     def _paint_empty_state(self, painter: QPainter) -> None:
         painter.setPen(QPen(TEXT_COLOR))
         painter.setFont(QFont("Segoe UI", 15))
-        empty_message = "Use Load image to select a blueprint for this level."
+        empty_message = "Use Load plan image to select a blueprint for this level."
         if self.blueprint_path is not None:
             empty_message = (
                 f"Image not found:\n{self.blueprint_path}\n\n"
-                "Use Load image to select a replacement for this level."
+                "Use Load plan image to select a replacement for this level."
             )
         painter.drawText(
             self.rect(),

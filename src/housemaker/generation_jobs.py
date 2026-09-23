@@ -19,7 +19,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-
 # ### Constants ###
 JOB_STATUS_RUNNING = "running"
 JOB_STATUS_CANCELLING = "cancelling"
@@ -294,7 +293,7 @@ class JobsWindow(QWidget):
         root_layout.setSpacing(10)
 
         header_layout = QHBoxLayout()
-        title = QLabel("Generation jobs")
+        title = QLabel("Jobs")
         title.setStyleSheet("font-size: 18px; font-weight: 600;")
         header_layout.addWidget(title)
         header_layout.addStretch(1)

@@ -161,6 +161,9 @@ def save_project(
                 "offset_y_meters": float(level.offset_y_meters),
                 "floor_thickness_meters": level.floor_thickness_meters,
                 "image_path": _normalize_optional_path(level.image_path),
+                "original_image_path": _normalize_optional_path(
+                    level.original_image_path
+                ),
                 "image_size_pixels": _serialize_image_size(level.image_size_pixels),
                 "include_in_export": bool(level.include_in_export),
                 "vertex_data": level.vertex_data.to_dict(),
@@ -250,6 +253,9 @@ def load_project(path: str | Path) -> ProjectData:
         )
         level.image_path = _normalize_optional_path(
             raw_level.get("image_path", legacy_blueprint_path)
+        )
+        level.original_image_path = _normalize_optional_path(
+            raw_level.get("original_image_path")
         )
         level.image_size_pixels = _deserialize_image_size(
             raw_level.get("image_size_pixels")

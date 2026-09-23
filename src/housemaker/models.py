@@ -1366,6 +1366,7 @@ class LevelData:
     open_spaces: list[OpenSpaceData] = field(default_factory=list)
     editable_surfaces: list[EditableSurfaceMeshData] = field(default_factory=list)
     flipped_surface_ids: set[str] = field(default_factory=set)
+    original_image_path: str | None = None
 
     @property
     def display_name(self) -> str:

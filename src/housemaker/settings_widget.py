@@ -6,8 +6,13 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from PySide6.QtCore import QSignalBlocker, Qt, Signal
-from PySide6.QtGui import QGuiApplication, QKeySequence, QScreen
+from PySide6.QtCore import QSignalBlocker, Qt, QUrl, Signal
+from PySide6.QtGui import QGuiApplication, QKeySequence, QScreen, QShowEvent
+from PySide6.QtNetwork import (
+    QNetworkAccessManager,
+    QNetworkReply,
+    QNetworkRequest,
+)
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -29,12 +34,28 @@ from housemaker.first_person_navigation import (
     FIRST_PERSON_NAVIGATION_MODE_OPTIONS,
     normalize_first_person_navigation_mode,
 )
+from housemaker.openai_model_pricing import (
+    OPENAI_PRICING_MARKDOWN_URL,
+    OPENAI_PRICING_RESPONSE_LIMIT_BYTES,
+    OPENAI_PRICING_TIMEOUT_MILLISECONDS,
+    ModelTokenPricing,
+    format_plan_correction_model_label,
+    parse_openai_pricing_markdown,
+)
+from housemaker.plan_correction_models import (
+    DEFAULT_PLAN_CORRECTION_MODEL,
+    PLAN_CORRECTION_MODEL_OPTIONS,
+    PLAN_CORRECTION_MODELS,
+    plan_correction_model_label,
+)
 
 # ### Constants ###
 MESHY_API_KEY_ENVIRONMENT_VARIABLE = "MESHY_API_KEY"
 MESHY_API_KEY_SETTING_KEY = "generation/meshy_api_key"
 OPENAI_API_KEY_ENVIRONMENT_VARIABLE = "OPENAI_API_KEY"
 OPENAI_API_KEY_SETTING_KEY = "generation/openai_api_key"
+PLAN_CORRECTION_MODEL_SETTING_KEY = "canvas/plan_correction_model"
+MAKE_WALLS_CONTINUOUS_SETTING_KEY = "canvas/make_walls_continuous"
 SURFACE_TEXTURE_PROVIDER_SETTING_KEY = "generation/surface_texture_provider"
 FULLSCREEN_3D_VIEWER_SCREEN_SETTING_KEY = (
     "display/fullscreen_3d_viewer_screen_id"
@@ -110,6 +131,7 @@ DEFAULT_WALL_VERTEX_UPDATE_DELAY_SECONDS = 15.0
 DEFAULT_SNAP_MIDDLE_EQUAL_ANGLE_ONLY = True
 DEFAULT_IGNORE_TOP_DOWN_CEILING = True
 DEFAULT_HIDE_STAIR_MESH_WHEN_PREVIEWING = True
+DEFAULT_MAKE_WALLS_CONTINUOUS = False
 MIN_MESH_EDIT_UPDATE_DELAY_SECONDS = 0.1
 MAX_MESH_EDIT_UPDATE_DELAY_SECONDS = 10.0
 MESH_EDIT_UPDATE_DELAY_STEP_SECONDS = 0.1
@@ -214,6 +236,8 @@ class GenerationServiceSettings:
         DEFAULT_HIDE_STAIR_MESH_WHEN_PREVIEWING
     )
     clear_mask_hotkey: str = DEFAULT_CLEAR_MASK_HOTKEY
+    plan_correction_model: str = DEFAULT_PLAN_CORRECTION_MODEL
+    make_walls_continuous: bool = DEFAULT_MAKE_WALLS_CONTINUOUS
 
     def __post_init__(self) -> None:
         try:
@@ -304,6 +328,18 @@ class GenerationServiceSettings:
             raise ValueError(
                 "Unknown surface texture provider: "
                 f"{self.surface_texture_provider!r}."
+            )
+        if (
+            not isinstance(self.plan_correction_model, str)
+            or self.plan_correction_model not in PLAN_CORRECTION_MODELS
+        ):
+            raise ValueError(
+                "Unknown plan correction model: "
+                f"{self.plan_correction_model!r}."
+            )
+        if not isinstance(self.make_walls_continuous, bool):
+            raise ValueError(
+                "Make walls continuous must be enabled or disabled."
             )
         if (
             self.scene_3d_display_screen_id is not None
@@ -434,6 +470,8 @@ class SettingsWidget(QWidget):
         application_settings: ApplicationSettingsStore | None = None,
         environment: Mapping[str, str] | None = None,
         parent: QWidget | None = None,
+        *,
+        plan_pricing_network_manager: QNetworkAccessManager | None = None,
     ) -> None:
         super().__init__(parent)
         self._application_settings = (
@@ -445,6 +483,11 @@ class SettingsWidget(QWidget):
         self._is_disposed = False
         self._screen_signals_connected = False
         self._screen_application = _get_gui_application()
+        self._plan_pricing_network_manager = plan_pricing_network_manager
+        self._plan_pricing_reply: QNetworkReply | None = None
+        self._plan_pricing_response = bytearray()
+        self._plan_pricing_request_failed = False
+        self._plan_pricing_lookup_started = False
         environment_values = os.environ if environment is None else environment
         self._environment_meshy_api_key = str(
             environment_values.get(
@@ -525,6 +568,12 @@ class SettingsWidget(QWidget):
             hide_stair_mesh_when_previewing=(
                 self.hide_stair_mesh_when_previewing_checkbox.isChecked()
             ),
+            plan_correction_model=str(
+                self.plan_correction_model_combo.currentData()
+            ),
+            make_walls_continuous=(
+                self.make_walls_continuous_checkbox.isChecked()
+            ),
         )
 
     def get_scene_3d_display_screen_id(self) -> str | None:
@@ -553,12 +602,20 @@ class SettingsWidget(QWidget):
         self.meshy_api_key_edit.clear()
         self.openai_api_key_edit.clear()
 
+    # ### QWidget lifecycle ###
+    def showEvent(self, event: QShowEvent) -> None:
+        """Load current model prices when Settings first becomes visible."""
+
+        super().showEvent(event)
+        self._start_plan_correction_pricing_lookup()
+
     def dispose(self) -> None:
         """Disconnect application-wide display signals exactly once."""
 
         if self._is_disposed:
             return
         self._is_disposed = True
+        self._cancel_plan_correction_pricing_lookup()
         if (
             self._screen_application is None
             or not self._screen_signals_connected
@@ -672,6 +729,53 @@ class SettingsWidget(QWidget):
         self.openai_key_status_label = QLabel()
         self.openai_key_status_label.setObjectName("openai_key_status_label")
         api_credentials_form.addRow("", self.openai_key_status_label)
+
+        self.plan_correction_model_combo = QComboBox()
+        self.plan_correction_model_combo.setObjectName(
+            "plan_correction_model_combo"
+        )
+        self.plan_correction_model_combo.setToolTip(
+            "Choose the image model used to straighten and clean imported "
+            "architectural plan photographs. GPT Image 2, GPT-5.6 Luna, and "
+            "GPT-5.6 Terra use the configured OpenAI API key. The GPT-5.6 "
+            "token prices shown here exclude the additional GPT Image 2 tool "
+            "charges incurred when producing the corrected image. Displayed "
+            "prices are Standard API rates per 1M tokens; Luna and Terra use "
+            "their short-context rates. Cached, long-context, Batch, Flex, and "
+            "other processing-tier rates are not shown. Qwen runs locally, "
+            "but its Research License limits use to non-commercial research "
+            "or evaluation unless you obtain a separate commercial license."
+        )
+        for label, model_id in PLAN_CORRECTION_MODEL_OPTIONS:
+            display_label = format_plan_correction_model_label(
+                label,
+                model_id,
+                None,
+            )
+            self.plan_correction_model_combo.addItem(display_label, model_id)
+        self.plan_correction_model_combo.currentIndexChanged.connect(
+            self._handle_plan_correction_model_changed
+        )
+        canvas_form.addRow(
+            "Plan correction model",
+            self.plan_correction_model_combo,
+        )
+
+        self.make_walls_continuous_checkbox = QCheckBox()
+        self.make_walls_continuous_checkbox.setObjectName(
+            "make_walls_continuous_checkbox"
+        )
+        self.make_walls_continuous_checkbox.setToolTip(
+            "After AI correction, use local image processing to bridge paired "
+            "wall boundaries interrupted by doorway openings."
+        )
+        self.make_walls_continuous_checkbox.toggled.connect(
+            self._handle_make_walls_continuous_changed
+        )
+        canvas_form.addRow(
+            "Make walls continuous",
+            self.make_walls_continuous_checkbox,
+        )
 
         self.scene_3d_display_screen_combo = QComboBox()
         self.scene_3d_display_screen_combo.setObjectName(
@@ -1091,6 +1195,20 @@ class SettingsWidget(QWidget):
                 or ""
             )
         )
+        plan_correction_model = read_plan_correction_model(
+            self._application_settings
+        )
+        self.plan_correction_model_combo.setCurrentIndex(
+            max(
+                0,
+                self.plan_correction_model_combo.findData(
+                    plan_correction_model
+                ),
+            )
+        )
+        self.make_walls_continuous_checkbox.setChecked(
+            read_make_walls_continuous(self._application_settings)
+        )
         self._refresh_scene_3d_display_screen_options()
         self._refresh_generation_display_screen_options()
         self._refresh_jobs_window_screen_options()
@@ -1191,6 +1309,215 @@ class SettingsWidget(QWidget):
         )
         self._sync_key_status_labels()
         self.settings_changed.emit()
+
+    def _handle_plan_correction_model_changed(self, _index: int) -> None:
+        """Persist the model used for architectural-plan correction."""
+
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            PLAN_CORRECTION_MODEL_SETTING_KEY,
+            str(self.plan_correction_model_combo.currentData()),
+        )
+        self.settings_changed.emit()
+
+    def _handle_make_walls_continuous_changed(
+        self,
+        enabled: bool,
+    ) -> None:
+        """Persist optional doorway-gap wall continuation."""
+
+        if self._is_loading_settings:
+            return
+        self._application_settings.set(
+            MAKE_WALLS_CONTINUOUS_SETTING_KEY,
+            bool(enabled),
+        )
+        self.settings_changed.emit()
+
+    # ### Plan correction pricing ###
+    def _start_plan_correction_pricing_lookup(self) -> None:
+        """Fetch current official token rates without blocking the Settings UI."""
+
+        if self._is_disposed or self._plan_pricing_lookup_started:
+            return
+        self._plan_pricing_lookup_started = True
+        request = QNetworkRequest(QUrl(OPENAI_PRICING_MARKDOWN_URL))
+        request.setTransferTimeout(OPENAI_PRICING_TIMEOUT_MILLISECONDS)
+        request.setAttribute(
+            QNetworkRequest.Attribute.RedirectPolicyAttribute,
+            QNetworkRequest.RedirectPolicy.NoLessSafeRedirectPolicy,
+        )
+        request.setRawHeader(b"User-Agent", b"HouseMaker/1.0")
+        network_manager = self._plan_pricing_network_manager
+        if network_manager is None:
+            try:
+                network_manager = QNetworkAccessManager(self)
+            except RuntimeError:
+                self._apply_plan_correction_model_pricing({})
+                return
+            self._plan_pricing_network_manager = network_manager
+        try:
+            reply = network_manager.get(request)
+        except (RuntimeError, TypeError, ValueError):
+            self._apply_plan_correction_model_pricing({})
+            return
+
+        self._plan_pricing_reply = reply
+        self._plan_pricing_response.clear()
+        self._plan_pricing_request_failed = False
+        reply.readyRead.connect(self._read_plan_correction_pricing_response)
+        reply.downloadProgress.connect(
+            self._handle_plan_correction_pricing_download_progress
+        )
+        reply.finished.connect(self._finish_plan_correction_pricing_lookup)
+
+    def _read_plan_correction_pricing_response(self) -> None:
+        """Buffer one bounded response chunk from the official pricing page."""
+
+        reply = self._plan_pricing_reply
+        if reply is None or self._is_disposed:
+            return
+        try:
+            chunk = bytes(reply.readAll())
+        except RuntimeError:
+            self._plan_pricing_request_failed = True
+            return
+        if (
+            len(self._plan_pricing_response) + len(chunk)
+            > OPENAI_PRICING_RESPONSE_LIMIT_BYTES
+        ):
+            self._plan_pricing_request_failed = True
+            self._plan_pricing_response.clear()
+            try:
+                reply.abort()
+            except RuntimeError:
+                pass
+            return
+        self._plan_pricing_response.extend(chunk)
+
+    def _handle_plan_correction_pricing_download_progress(
+        self,
+        bytes_received: int,
+        bytes_total: int,
+    ) -> None:
+        """Abort an oversized pricing document before it can grow unbounded."""
+
+        if self._is_disposed or self._plan_pricing_reply is None:
+            return
+        if bytes_received <= OPENAI_PRICING_RESPONSE_LIMIT_BYTES and (
+            bytes_total < 0
+            or bytes_total <= OPENAI_PRICING_RESPONSE_LIMIT_BYTES
+        ):
+            return
+        self._plan_pricing_request_failed = True
+        self._plan_pricing_response.clear()
+        try:
+            self._plan_pricing_reply.abort()
+        except RuntimeError:
+            pass
+
+    def _finish_plan_correction_pricing_lookup(self) -> None:
+        """Parse a successful official response and refresh only combo labels."""
+
+        reply = self._plan_pricing_reply
+        if reply is None:
+            return
+        self._read_plan_correction_pricing_response()
+        self._plan_pricing_reply = None
+        pricing: dict[str, ModelTokenPricing] = {}
+        if not self._is_disposed and self._pricing_reply_is_usable(reply):
+            try:
+                markdown = bytes(self._plan_pricing_response).decode("utf-8")
+            except UnicodeDecodeError:
+                markdown = ""
+            pricing = parse_openai_pricing_markdown(markdown)
+        self._plan_pricing_response.clear()
+        try:
+            reply.deleteLater()
+        except RuntimeError:
+            pass
+        if not self._is_disposed:
+            self._apply_plan_correction_model_pricing(pricing)
+
+    def _pricing_reply_is_usable(self, reply: QNetworkReply) -> bool:
+        """Return whether a reply is an intact 200 Markdown response."""
+
+        if self._plan_pricing_request_failed:
+            return False
+        try:
+            if reply.error() != QNetworkReply.NetworkError.NoError:
+                return False
+            status = reply.attribute(
+                QNetworkRequest.Attribute.HttpStatusCodeAttribute
+            )
+            if int(status) != 200:
+                return False
+            response_url = reply.url()
+            if (
+                response_url.scheme().lower() != "https"
+                or response_url.host().lower() != "developers.openai.com"
+                or response_url.path() != "/api/docs/pricing.md"
+                or response_url.hasQuery()
+                or bool(response_url.userInfo())
+                or response_url.port(-1) != -1
+            ):
+                return False
+            content_type = str(
+                reply.header(QNetworkRequest.KnownHeaders.ContentTypeHeader)
+                or ""
+            ).lower()
+        except (RuntimeError, TypeError, ValueError):
+            return False
+        return content_type.split(";", 1)[0].strip() == "text/markdown"
+
+    def _apply_plan_correction_model_pricing(
+        self,
+        pricing: Mapping[str, ModelTokenPricing],
+    ) -> None:
+        """Relabel models without changing their IDs, selection, or settings."""
+
+        if self._is_disposed:
+            return
+        blocker = QSignalBlocker(self.plan_correction_model_combo)
+        for index in range(self.plan_correction_model_combo.count()):
+            model_id = str(self.plan_correction_model_combo.itemData(index))
+            self.plan_correction_model_combo.setItemText(
+                index,
+                format_plan_correction_model_label(
+                    plan_correction_model_label(model_id),
+                    model_id,
+                    pricing.get(model_id),
+                ),
+            )
+        del blocker
+
+    def _cancel_plan_correction_pricing_lookup(self) -> None:
+        """Abort and detach the pending lookup during Settings disposal."""
+
+        reply = self._plan_pricing_reply
+        self._plan_pricing_reply = None
+        self._plan_pricing_response.clear()
+        self._plan_pricing_request_failed = True
+        if reply is None:
+            return
+        for signal, callback in (
+            (reply.readyRead, self._read_plan_correction_pricing_response),
+            (
+                reply.downloadProgress,
+                self._handle_plan_correction_pricing_download_progress,
+            ),
+            (reply.finished, self._finish_plan_correction_pricing_lookup),
+        ):
+            try:
+                signal.disconnect(callback)
+            except (RuntimeError, TypeError):
+                pass
+        try:
+            reply.abort()
+            reply.deleteLater()
+        except RuntimeError:
+            pass
 
     def _connect_screen_change_signals(self) -> None:
         if (
@@ -1953,6 +2280,36 @@ def read_clear_mask_hotkey(
     )
 
 
+# ### Plan correction setting helpers ###
+def read_plan_correction_model(
+    application_settings: ApplicationSettingsStore,
+) -> str:
+    """Read the architectural-plan correction model with a safe default."""
+
+    model = application_settings.get(
+        PLAN_CORRECTION_MODEL_SETTING_KEY,
+        DEFAULT_PLAN_CORRECTION_MODEL,
+    )
+    if not isinstance(model, str) or model not in PLAN_CORRECTION_MODELS:
+        return DEFAULT_PLAN_CORRECTION_MODEL
+    return model
+
+
+def read_make_walls_continuous(
+    application_settings: ApplicationSettingsStore,
+) -> bool:
+    """Read optional doorway-gap wall continuation with a safe default."""
+
+    enabled = application_settings.get(
+        MAKE_WALLS_CONTINUOUS_SETTING_KEY,
+        DEFAULT_MAKE_WALLS_CONTINUOUS,
+    )
+    if isinstance(enabled, bool):
+        return enabled
+    return DEFAULT_MAKE_WALLS_CONTINUOUS
+
+
+# ### Qt application helpers ###
 def _get_gui_application() -> QGuiApplication | None:
     application = QGuiApplication.instance()
     if isinstance(application, QGuiApplication):

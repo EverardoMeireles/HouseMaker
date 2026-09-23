@@ -211,7 +211,24 @@ from housemaker.pbr_maps import (
     ATLAS_MAP_TYPES,
     PBR_MAP_ROUGHNESS,
 )
+from housemaker.plan_correction_models import (
+    OPENAI_PLAN_CORRECTION_MODELS,
+    PLAN_CORRECTION_MODEL_GPT_IMAGE_2,
+    PLAN_CORRECTION_MODEL_QWEN_IMAGE_2_1,
+    plan_correction_model_label,
+)
+from housemaker.plan_image_correction import (
+    CORRECTION_METHOD_OPENAI,
+    CORRECTION_METHOD_QWEN,
+    PlanCorrectionProgress,
+    PlanImageCorrectionResult,
+    correct_plan_image,
+)
 from housemaker.project_io import ProjectData, load_project, save_project
+from housemaker.qwen_plan_image_correction import (
+    QwenPlanCorrectionError,
+    create_default_qwen_plan_image_editor,
+)
 from housemaker.settings_widget import (
     DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS,
     DEFAULT_WALL_VERTEX_UPDATE_DELAY_SECONDS,
@@ -317,6 +334,74 @@ SURFACE_AO_SHUTDOWN_WAIT_MILLISECONDS = 100
 SURFACE_AO_PREVIEW_REFRESH_DELAY_MILLISECONDS = 150
 ATLAS_DRAW_CALL_ESTIMATE_REFRESH_DELAY_MILLISECONDS = 200
 STAIR_PREVIEW_UPDATE_DELAY_MILLISECONDS = 35
+PLAN_IMAGE_CORRECTION_SHUTDOWN_WAIT_MILLISECONDS = 100
+
+
+# ### Plan-image correction jobs ###
+class _PlanImageCorrectionThread(QThread):
+    """Correct one immutable plan photograph outside the GUI thread."""
+
+    progress = Signal(object)
+
+    def __init__(
+        self,
+        input_path: Path,
+        output_path: Path,
+        api_key: str,
+        model: str = PLAN_CORRECTION_MODEL_GPT_IMAGE_2,
+        parent: QObject | None = None,
+        *,
+        make_walls_continuous: bool = False,
+    ) -> None:
+        super().__init__(parent)
+        self._input_path = input_path
+        self._output_path = output_path
+        self._api_key = api_key
+        self._model = model
+        self._make_walls_continuous = bool(make_walls_continuous)
+        self.result: PlanImageCorrectionResult | None = None
+        self.error_message: str | None = None
+        self.was_cancelled = False
+
+    @property
+    def model(self) -> str:
+        """Return the immutable model selected for this job."""
+
+        return self._model
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            result = correct_plan_image(
+                self._input_path,
+                self._output_path,
+                api_key=self._api_key,
+                model=self._model,
+                make_walls_continuous=self._make_walls_continuous,
+                progress_callback=self.progress.emit,
+                cancellation_check=self.isInterruptionRequested,
+            )
+        except Exception as error:  # noqa: BLE001 - worker failures cross Qt safely.
+            if self.isInterruptionRequested():
+                self.was_cancelled = True
+            else:
+                self.error_message = str(error) or type(error).__name__
+            return
+        if self.isInterruptionRequested():
+            self.was_cancelled = True
+            return
+        self.result = result
+
+
+@dataclass
+class _PlanImageCorrectionRuntime:
+    """GUI-owned lifecycle and stale-input guard for one correction job."""
+
+    source_path: Path
+    source_revision: tuple[object, ...]
+    output_path: Path
+    job_id: str
+    thread: _PlanImageCorrectionThread
+    cancel_requested: bool = False
 
 
 # ### Atlas ambient-occlusion jobs ###
@@ -1193,6 +1278,10 @@ class BlueprintWorkspace(QWidget):
         self._pending_generation_placement_anchor: (
             SceneObjectPlacementCandidate | None
         ) = None
+        self._plan_image_correction_runtimes: dict[
+            int,
+            _PlanImageCorrectionRuntime,
+        ] = {}
         self._surface_ao_bake_runtimes: dict[
             str,
             _SurfaceAmbientOcclusionBakeRuntime,
@@ -1271,6 +1360,7 @@ class BlueprintWorkspace(QWidget):
         self._cancel_pending_canvas_surface_mesh_update()
         self._cancel_pending_wall_vertex_update()
         self._cancel_pending_doorway_mesh_update(clear_outline=True)
+        self._cancel_and_join_plan_image_corrections()
         self._cancel_and_join_atlas_draw_call_estimates()
         self._cancel_and_join_surface_ambient_occlusion_previews()
         self._cancel_and_join_surface_ambient_occlusion_bakes()
@@ -2905,10 +2995,29 @@ class BlueprintWorkspace(QWidget):
         self.levels_group = QGroupBox("Levels")
         levels_layout = QVBoxLayout(self.levels_group)
 
-        self.load_image_button = QPushButton("Load image")
+        plan_image_buttons_layout = QHBoxLayout()
+        plan_image_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        plan_image_buttons_layout.setSpacing(10)
+
+        self.load_image_button = QPushButton("Load plan image")
         self.load_image_button.setMinimumHeight(44)
         self.load_image_button.clicked.connect(self._handle_load_image_clicked)
-        levels_layout.addWidget(self.load_image_button)
+        plan_image_buttons_layout.addWidget(self.load_image_button)
+
+        self.image_correction_button = QPushButton("Image correction")
+        self.image_correction_button.setMinimumHeight(44)
+        self.image_correction_button.setToolTip(
+            "Use the plan correction model selected in Settings to flatten and "
+            "clean the loaded photograph into a black-and-white plan. The original "
+            "photo is retained. OpenAI models may incur usage and cost; the "
+            "local Qwen model is limited to non-commercial research or evaluation "
+            "unless separately licensed under the Qwen Research License."
+        )
+        self.image_correction_button.clicked.connect(
+            self._handle_image_correction_clicked
+        )
+        plan_image_buttons_layout.addWidget(self.image_correction_button)
+        levels_layout.addLayout(plan_image_buttons_layout)
 
         self.blueprint_name_label = QLabel("Image: none for this level")
         self.blueprint_name_label.setWordWrap(True)
@@ -2962,6 +3071,7 @@ class BlueprintWorkspace(QWidget):
         side_layout.addLayout(buttons_layout)
 
         self._refresh_doorway_preset_list(selected_index=0)
+        self._update_image_correction_button_state()
 
         self._generals_value_input_wheel_filter = RightPanelValueInputWheelFilter(
             generals_tab
@@ -11699,6 +11809,7 @@ class BlueprintWorkspace(QWidget):
                 normalized_path,
             )
 
+    # ### Plan image loading and correction ###
     def _handle_load_image_clicked(self) -> None:
         file_path = self._get_image_file_path()
         if not file_path:
@@ -11709,10 +11820,301 @@ class BlueprintWorkspace(QWidget):
         except ValueError as error:
             QMessageBox.critical(self, "Image load failed", str(error))
 
+    def _handle_image_correction_clicked(self) -> None:
+        """Start one non-blocking correction for the current level's source photo."""
+
+        if self._is_shutdown:
+            return
+        level = self.current_level
+        if level.index in self._plan_image_correction_runtimes:
+            return
+        source_path = self._get_plan_correction_source_path(level)
+        source_revision = _build_local_file_revision(source_path)
+        if source_path is None or not _local_file_revision_has_file(source_revision):
+            QMessageBox.warning(
+                self,
+                "Image correction unavailable",
+                "Load a valid plan image before correcting it.",
+            )
+            return
+        if self._level_has_plan_dependent_geometry(level):
+            QMessageBox.warning(
+                self,
+                "Image correction unavailable",
+                "Correct the plan image before adding walls, openings, stairs, "
+                "open spaces, or editable surfaces to this level.",
+            )
+            return
+
+        service_settings = self.settings_widget.get_settings()
+        correction_model = service_settings.plan_correction_model
+        api_key = service_settings.openai_api_key.strip()
+        if correction_model in OPENAI_PLAN_CORRECTION_MODELS and not api_key:
+            QMessageBox.warning(
+                self,
+                "OpenAI API key required",
+                "Add an OpenAI API key in Settings before using Image correction.",
+            )
+            return
+        if correction_model == PLAN_CORRECTION_MODEL_QWEN_IMAGE_2_1:
+            try:
+                create_default_qwen_plan_image_editor()
+            except QwenPlanCorrectionError as error:
+                QMessageBox.warning(
+                    self,
+                    "Local Qwen model unavailable",
+                    str(error),
+                )
+                return
+
+        source_path = Path(str(source_revision[0]))
+        correction_directory = (
+            self._application_settings.path.parent / "corrected_plans"
+        )
+        output_path = (
+            correction_directory
+            / f"corrected-plan-L{level.index}-{uuid.uuid4().hex}.png"
+        )
+        thread = _PlanImageCorrectionThread(
+            source_path,
+            output_path,
+            api_key,
+            correction_model,
+            parent=self,
+            make_walls_continuous=service_settings.make_walls_continuous,
+        )
+        job = self.job_manager.create_job(
+            kind="Image correction",
+            requested_name="",
+            default_name=f"Correct {level.display_name} plan",
+            stage="Preparing plan image (0%)",
+        )
+        runtime = _PlanImageCorrectionRuntime(
+            source_path=source_path,
+            source_revision=source_revision,
+            output_path=output_path,
+            job_id=job.job_id,
+            thread=thread,
+        )
+        self._plan_image_correction_runtimes[level.index] = runtime
+        self.job_manager.set_cancel_callback(
+            job.job_id,
+            partial(self._cancel_plan_image_correction_for_level, level.index),
+        )
+        thread.progress.connect(
+            partial(
+                self._handle_plan_image_correction_progress,
+                level.index,
+                job.job_id,
+            )
+        )
+        thread.finished.connect(
+            partial(
+                self._handle_plan_image_correction_finished,
+                level.index,
+                job.job_id,
+                thread,
+            )
+        )
+        self._update_image_correction_button_state()
+        thread.start()
+
+    @staticmethod
+    def _get_plan_correction_source_path(level: LevelData) -> Path | None:
+        raw_path = level.original_image_path or level.image_path
+        if raw_path is None or not str(raw_path).strip():
+            return None
+        try:
+            return Path(raw_path).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            return None
+
+    def _level_has_plan_dependent_geometry(self, level: LevelData) -> bool:
+        """Return whether changing this level's image coordinates is unsafe."""
+
+        return bool(
+            level.vertex_data.vertices
+            or level.vertex_data.edges
+            or level.rooms
+            or level.doorways
+            or level.windows
+            or level.open_spaces
+            or level.editable_surfaces
+            or any(
+                stair.start_level_index == level.index
+                or stair.end_level_index == level.index
+                for stair in self.stairs
+            )
+        )
+
+    def _handle_plan_image_correction_progress(
+        self,
+        level_index: int,
+        job_id: str,
+        raw_progress: object,
+    ) -> None:
+        runtime = self._plan_image_correction_runtimes.get(level_index)
+        if (
+            runtime is None
+            or runtime.job_id != job_id
+            or not isinstance(raw_progress, PlanCorrectionProgress)
+        ):
+            return
+        message = raw_progress.message.strip() or raw_progress.stage.strip()
+        stage = f"{message} ({raw_progress.percent}%)"
+        self.job_manager.update_job(
+            job_id,
+            stage=stage,
+            progress=raw_progress.percent,
+        )
+
+    def _handle_plan_image_correction_finished(
+        self,
+        level_index: int,
+        job_id: str,
+        thread: _PlanImageCorrectionThread,
+    ) -> None:
+        """Commit a correction only when its source and level are unchanged."""
+
+        runtime = self._plan_image_correction_runtimes.get(level_index)
+        try:
+            if (
+                runtime is None
+                or runtime.job_id != job_id
+                or runtime.thread is not thread
+            ):
+                return
+            self._plan_image_correction_runtimes.pop(level_index, None)
+            self.job_manager.set_cancel_callback(job_id, None)
+            if (
+                self._is_shutdown
+                or runtime.cancel_requested
+                or thread.was_cancelled
+            ):
+                self.job_manager.mark_cancelled(job_id)
+                self._discard_plan_correction_output(runtime.output_path)
+                return
+            if thread.error_message is not None or thread.result is None:
+                message = thread.error_message or (
+                    "Image correction finished without returning an image."
+                )
+                self.job_manager.fail_job(job_id, f"Failed: {message}")
+                self._discard_plan_correction_output(runtime.output_path)
+                QMessageBox.critical(self, "Image correction failed", message)
+                return
+
+            level = self._get_level_by_index(level_index)
+            if not self._plan_image_correction_context_is_current(level, runtime):
+                message = (
+                    "The plan or level changed while it was being corrected. "
+                    "The generated image was not applied."
+                )
+                self.job_manager.fail_job(job_id, f"Failed: {message}")
+                self._discard_plan_correction_output(runtime.output_path)
+                QMessageBox.warning(self, "Image correction not applied", message)
+                return
+
+            assert level is not None
+            self._apply_plan_image_correction_result(level, runtime, thread.result)
+            if thread.result.method in {
+                CORRECTION_METHOD_OPENAI,
+                CORRECTION_METHOD_QWEN,
+            }:
+                model_label = plan_correction_model_label(thread.model)
+                completion_stage = f"{model_label} plan correction completed"
+            else:
+                completion_stage = "Plan correction completed"
+            self.job_manager.complete_job(job_id, completion_stage)
+        finally:
+            self._update_image_correction_button_state()
+            thread.deleteLater()
+
+    def _plan_image_correction_context_is_current(
+        self,
+        level: LevelData | None,
+        runtime: _PlanImageCorrectionRuntime,
+    ) -> bool:
+        if level is None or self._level_has_plan_dependent_geometry(level):
+            return False
+        source_path = self._get_plan_correction_source_path(level)
+        if source_path != runtime.source_path:
+            return False
+        return _build_local_file_revision(source_path) == runtime.source_revision
+
+    def _apply_plan_image_correction_result(
+        self,
+        level: LevelData,
+        runtime: _PlanImageCorrectionRuntime,
+        result: PlanImageCorrectionResult,
+    ) -> None:
+        corrected_path = str(Path(result.output_path).resolve())
+        source_path = str(runtime.source_path)
+        if level is self.current_level:
+            self._set_current_level_image(
+                corrected_path,
+                original_image_path=source_path,
+            )
+            return
+        level.image_path = corrected_path
+        level.original_image_path = source_path
+        level.image_size_pixels = tuple(float(value) for value in result.output_size)
+
+    def _cancel_plan_image_correction_for_level(self, level_index: int) -> bool:
+        runtime = self._plan_image_correction_runtimes.get(int(level_index))
+        if runtime is None or not runtime.thread.isRunning():
+            return False
+        runtime.cancel_requested = True
+        runtime.thread.requestInterruption()
+        self._update_image_correction_button_state()
+        return True
+
+    def _cancel_and_join_plan_image_corrections(self) -> None:
+        runtimes = tuple(self._plan_image_correction_runtimes.values())
+        for runtime in runtimes:
+            runtime.cancel_requested = True
+            runtime.thread.requestInterruption()
+            self.job_manager.mark_cancelled(runtime.job_id)
+        for runtime in runtimes:
+            while runtime.thread.isRunning():
+                runtime.thread.wait(PLAN_IMAGE_CORRECTION_SHUTDOWN_WAIT_MILLISECONDS)
+            self._discard_plan_correction_output(runtime.output_path)
+            runtime.thread.deleteLater()
+        self._plan_image_correction_runtimes.clear()
+        if hasattr(self, "image_correction_button"):
+            self._update_image_correction_button_state()
+
+    @staticmethod
+    def _discard_plan_correction_output(output_path: Path) -> None:
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _update_image_correction_button_state(self) -> None:
+        if not hasattr(self, "image_correction_button"):
+            return
+        try:
+            level = self.current_level
+        except IndexError:
+            self.image_correction_button.setEnabled(False)
+            self.image_correction_button.setText("Image correction")
+            return
+        runtime = self._plan_image_correction_runtimes.get(level.index)
+        source_path = self._get_plan_correction_source_path(level)
+        has_source = source_path is not None and _local_file_revision_has_file(
+            _build_local_file_revision(source_path)
+        )
+        self.image_correction_button.setEnabled(
+            not self._is_shutdown and has_source and runtime is None
+        )
+        self.image_correction_button.setText(
+            "Correcting..." if runtime is not None else "Image correction"
+        )
+
     def _get_image_file_path(self) -> str:
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "load image",
+            "Load plan image",
             str(Path.home()),
             "Image Files (*.png *.jpg *.jpeg *.bmp *.webp)",
         )
@@ -12323,6 +12725,7 @@ class BlueprintWorkspace(QWidget):
         if self.levels_list.currentRow() != current_level_row:
             self.levels_list.setCurrentRow(current_level_row)
         self._update_blueprint_name_label()
+        self._update_image_correction_button_state()
         self._is_syncing_level_controls = False
 
     def _handle_level_list_row_changed(self, level_row: int) -> None:
@@ -13888,6 +14291,7 @@ class BlueprintWorkspace(QWidget):
         # boundary. Finish retiring workers while the old scene and Atlas data
         # are still intact, so a queued completion cannot commit into the
         # incoming project.
+        self._cancel_and_join_plan_image_corrections()
         self._cancel_and_join_atlas_draw_call_estimates()
         self._cancel_and_join_surface_ambient_occlusion_previews()
         self._cancel_and_join_surface_ambient_occlusion_bakes()
@@ -14034,7 +14438,17 @@ class BlueprintWorkspace(QWidget):
         if self.texture_atlas_workspace.is_ambient_occlusion_preview_active:
             self._refresh_surface_ambient_occlusion_preview()
 
-    def _set_current_level_image(self, file_path: str) -> None:
+    def _set_current_level_image(
+        self,
+        file_path: str,
+        *,
+        original_image_path: str | None = None,
+    ) -> None:
+        active_correction = self._plan_image_correction_runtimes.get(
+            self.current_level.index
+        )
+        if active_correction is not None:
+            self.job_manager.cancel_job(active_correction.job_id)
         self._finish_level_transform_drag()
         self._commit_pending_level_transform_update()
         self._cancel_active_canvas_surface_edit()
@@ -14055,6 +14469,9 @@ class BlueprintWorkspace(QWidget):
         )
         self._clear_canvas_undo_history()
         self.current_level.image_path = normalized_path
+        self.current_level.original_image_path = str(
+            Path(original_image_path or normalized_path).resolve()
+        )
         self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
         self.canvas.set_stair_context(self.stairs, self.current_level)
         self._sync_canvas_wall_mirror_state()
@@ -14102,8 +14519,12 @@ class BlueprintWorkspace(QWidget):
             label_text = f"Image missing: {image_path}"
         else:
             label_text = f"Image: {Path(image_path).name}"
+            original_path = self.current_level.original_image_path
+            if original_path and Path(original_path) != Path(image_path):
+                label_text += f" (corrected from {Path(original_path).name})"
 
         self.blueprint_name_label.setText(label_text)
+        self._update_image_correction_button_state()
 
 
 class MainWindow(QMainWindow):
