@@ -862,6 +862,32 @@ class GlbViewerRenderingTests(unittest.TestCase):
         self.assertEqual(viewer.get_navigation_mode(), NAVIGATION_MODE_ORBIT)
         self.assertTrue(viewer.first_person_crosshair_label.isHidden())
 
+    def test_first_person_frame_overlay_can_be_set_and_cleared(self) -> None:
+        viewer = self._build_viewer()
+        frame_bgr = np.zeros((3, 5, 3), dtype=np.uint8)
+        frame_bgr[:, :] = (17, 83, 211)
+        viewer.enter_first_person_mode()
+
+        viewer.set_first_person_frame_overlay(frame_bgr)
+
+        self.assertTrue(viewer.is_first_person_frame_overlay_visible)
+
+        viewer.clear_first_person_frame_overlay()
+
+        self.assertFalse(viewer.is_first_person_frame_overlay_visible)
+
+    def test_leaving_first_person_clears_the_frame_overlay(self) -> None:
+        viewer = self._build_viewer()
+        viewer.enter_first_person_mode()
+        viewer.set_first_person_frame_overlay(
+            np.full((3, 5, 3), 127, dtype=np.uint8)
+        )
+        self.assertTrue(viewer.is_first_person_frame_overlay_visible)
+
+        viewer.exit_first_person_mode()
+
+        self.assertFalse(viewer.is_first_person_frame_overlay_visible)
+
     def test_first_person_pose_survives_a_model_scene_refresh(self) -> None:
         viewer = self._build_viewer()
         pose = CameraPose(x=1.0, y=2.0, z=1.7, yaw_degrees=45.0)

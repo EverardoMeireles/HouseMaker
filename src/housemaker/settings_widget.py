@@ -167,8 +167,9 @@ _MODIFIER_ONLY_SHORTCUT_KEYS = frozenset(
         Qt.Key.Key_Super_R,
     }
 )
-_FIRST_PERSON_MOVEMENT_SHORTCUT_KEYS = frozenset(
+_FIRST_PERSON_RESERVED_SHORTCUT_KEYS = frozenset(
     {
+        Qt.Key.Key_A,
         Qt.Key.Key_D,
         Qt.Key.Key_F,
         Qt.Key.Key_Q,
@@ -918,9 +919,10 @@ class SettingsWidget(QWidget):
         self.canvas_3d_navigation_toggle_hotkey_edit.setClearButtonEnabled(True)
         self.canvas_3d_navigation_toggle_hotkey_edit.setToolTip(
             "Press one key combination to switch the Canvas 3D view between "
-            "top-down orbit and first-person navigation. Bare Z, Q, S, D, R, "
-            "and F are reserved for first-person movement; Ctrl+Z is reserved "
-            "for Canvas undo."
+            "top-down orbit and first-person navigation. Bare A is reserved "
+            "for the Generation-frame overlay; Z, Q, S, D, R, and F are "
+            "reserved for first-person movement; Ctrl+Z is reserved for "
+            "Canvas undo."
         )
         self.canvas_3d_navigation_toggle_hotkey_edit.keySequenceChanged.connect(
             self._handle_canvas_3d_navigation_toggle_hotkey_changed
@@ -2407,7 +2409,7 @@ def _hotkey_from_key_sequence(key_sequence: QKeySequence) -> str | None:
     if key_combination.key() in _MODIFIER_ONLY_SHORTCUT_KEYS:
         return None
     if (
-        key_combination.key() in _FIRST_PERSON_MOVEMENT_SHORTCUT_KEYS
+        key_combination.key() in _FIRST_PERSON_RESERVED_SHORTCUT_KEYS
         and key_combination.keyboardModifiers()
         == Qt.KeyboardModifier.NoModifier
     ):

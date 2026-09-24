@@ -1764,6 +1764,7 @@ class SettingsWidgetTests(unittest.TestCase):
             "",
             "garbage",
             "Ctrl+Shift",
+            "A",
             "Z",
             "Q",
             "S",

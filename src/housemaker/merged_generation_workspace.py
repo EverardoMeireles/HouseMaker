@@ -6,7 +6,8 @@ from collections import Counter
 from collections.abc import Iterable
 from pathlib import Path
 
-from PySide6.QtCore import QRect, Qt, Slot
+import numpy as np
+from PySide6.QtCore import QRect, Qt, Signal, Slot
 from PySide6.QtGui import QColor, QKeySequence, QPainter, QPaintEvent, QPen, QShortcut
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -122,6 +123,8 @@ class _WorkflowControlsRow(QWidget):
 class MergedGenerationWorkspace(QWidget):
     """Present Surface and Object generation around one reference editor."""
 
+    current_video_frame_changed = Signal()
+
     def __init__(
         self,
         surface_workspace: SurfaceTextureGenerationWorkspace,
@@ -175,6 +178,11 @@ class MergedGenerationWorkspace(QWidget):
         """Forward navigation focus to the embedded generated-object view."""
 
         self.object_workspace.object_3d_panel.focus_navigation()
+
+    def get_current_video_frame_bgr(self) -> np.ndarray | None:
+        """Return a defensive copy of the frame displayed by Generation."""
+
+        return self.video_view.get_frame_bgr()
 
     @staticmethod
     def merge_project_video_state(
@@ -496,6 +504,9 @@ class MergedGenerationWorkspace(QWidget):
 
         self.video_view.strokes_changed.connect(surface._handle_video_strokes_changed)
         self.video_view.strokes_changed.connect(self.sync_shared_controls)
+        self.video_view.frame_changed.connect(
+            self.current_video_frame_changed.emit
+        )
         try:
             self.seekbar.valueChanged.disconnect()
         except (RuntimeError, TypeError):

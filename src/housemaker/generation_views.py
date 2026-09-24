@@ -35,6 +35,7 @@ class VideoInpaintView(QWidget):
     """Aspect-fit video view with brush and enclosed-region mask editing."""
 
     strokes_changed = Signal(object)
+    frame_changed = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -69,6 +70,7 @@ class VideoInpaintView(QWidget):
             self._mask_overlay_image = QImage()
             self._strokes = []
             self.update()
+            self.frame_changed.emit()
             return
 
         normalized_frame = normalize_video_frame(np.asarray(frame_bgr))
@@ -77,6 +79,7 @@ class VideoInpaintView(QWidget):
         self._strokes = list(strokes or [])
         self._rebuild_mask()
         self.update()
+        self.frame_changed.emit()
 
     def clear_frame(self, empty_text: str | None = None) -> None:
         if empty_text is not None:

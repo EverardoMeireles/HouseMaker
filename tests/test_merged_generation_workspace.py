@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeySequence
+from PySide6.QtTest import QSignalSpy
 from PySide6.QtWidgets import QApplication, QWidget
 
 from housemaker.app_settings import ApplicationSettingsStore
@@ -157,6 +158,29 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         self.assertIsNotNone(primary_actions)
         assert primary_actions is not None
         self.assertEqual(primary_actions.layout().spacing(), 0)
+
+    def test_current_video_frame_api_tracks_shared_video_view(self) -> None:
+        changed = QSignalSpy(self.workspace.current_video_frame_changed)
+        frame_bgr = np.zeros((4, 6, 3), dtype=np.uint8)
+        frame_bgr[:, :] = (23, 91, 207)
+
+        self.workspace.video_view.set_frame(frame_bgr)
+
+        self.assertEqual(changed.count(), 1)
+        returned_frame = self.workspace.get_current_video_frame_bgr()
+        self.assertIsNotNone(returned_frame)
+        assert returned_frame is not None
+        np.testing.assert_array_equal(returned_frame, frame_bgr)
+        returned_frame[:] = 0
+        np.testing.assert_array_equal(
+            self.workspace.get_current_video_frame_bgr(),
+            frame_bgr,
+        )
+
+        self.workspace.video_view.clear_frame()
+
+        self.assertEqual(changed.count(), 2)
+        self.assertIsNone(self.workspace.get_current_video_frame_bgr())
 
     def test_default_window_splits_views_evenly_and_uses_one_shared_column(
         self,

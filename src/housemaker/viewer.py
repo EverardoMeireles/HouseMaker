@@ -19,13 +19,16 @@ from PIL import Image
 from pyqtgraph import Transform3D
 from pyqtgraph.opengl import shaders as gl_shaders
 from pyqtgraph.opengl.GLGraphicsItem import GLGraphicsItem
-from PySide6.QtCore import QEvent, QPointF, QRect, Qt, QTimer, Signal, Slot
+from PySide6.QtCore import QEvent, QPointF, QRect, QRectF, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import (
     QCursor,
+    QImage,
     QKeyEvent,
     QKeySequence,
     QMouseEvent,
     QOpenGLContext,
+    QPainter,
+    QPaintEvent,
     QShortcut,
     QVector3D,
 )
@@ -100,6 +103,7 @@ from housemaker.surface_geometry import (
     get_wall_window_world_corners,
 )
 from housemaker.unused_face_removal import ALL_CAMERA_IDS
+from housemaker.video_source import normalize_video_frame
 
 # ### Constants ###
 EDGE_COLOR = (0.12, 0.12, 0.16, 1.0)
@@ -139,6 +143,7 @@ DEFAULT_MOUSE_LOOK_SENSITIVITY_DEGREES = 0.16
 FIRST_PERSON_UPDATE_INTERVAL_MILLISECONDS = 16
 FIRST_PERSON_LOOK_DISTANCE_METERS = 1.0
 MAX_FIRST_PERSON_PITCH_DEGREES = 89.0
+FIRST_PERSON_FRAME_OVERLAY_OPACITY = 0.5
 WINDOW_EDITOR_PANEL_WIDTH = 190
 WINDOW_PREVIEW_OFFSET_METERS = 0.006
 CANVAS_SURFACE_SELECTION_COLOR = (1.0, 0.72, 0.18, 1.0)
@@ -612,6 +617,61 @@ class _CanvasSurfaceEdgeSnapCandidate:
 
 
 # ### Widgets ###
+class _FirstPersonFrameOverlay(QWidget):
+    """Paint one mouse-transparent Generation frame above the 3D viewport."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._frame_image = QImage()
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+    @property
+    def has_frame(self) -> bool:
+        """Whether the overlay currently owns a drawable video frame."""
+
+        return not self._frame_image.isNull()
+
+    def set_frame_bgr(self, frame_bgr: object) -> None:
+        """Copy one BGR video frame into Qt-owned image memory."""
+
+        frame = normalize_video_frame(np.asarray(frame_bgr))
+        if frame.dtype != np.uint8:
+            raise ValueError("First-person frame overlays require uint8 pixels.")
+        image = QImage(
+            frame.data,
+            frame.shape[1],
+            frame.shape[0],
+            int(frame.strides[0]),
+            QImage.Format.Format_BGR888,
+        )
+        self._frame_image = image.copy()
+        self.update()
+
+    def clear_frame(self) -> None:
+        """Release the copied frame and repaint transparently."""
+
+        self._frame_image = QImage()
+        self.update()
+
+    def paintEvent(self, event: QPaintEvent) -> None:  # type: ignore[override]
+        if self._frame_image.isNull() or self.width() <= 0 or self.height() <= 0:
+            return
+        image_size = self._frame_image.size()
+        image_size.scale(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
+        target = QRectF(
+            (self.width() - image_size.width()) / 2.0,
+            (self.height() - image_size.height()) / 2.0,
+            float(image_size.width()),
+            float(image_size.height()),
+        )
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.setOpacity(FIRST_PERSON_FRAME_OVERLAY_OPACITY)
+        painter.drawImage(target, self._frame_image)
+
+
 class SelectableGLViewWidget(gl.GLViewWidget):
     """3D viewport with selectable items and two explicit navigation modes."""
 
@@ -1841,14 +1901,15 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             if self._first_person_ctrl_interaction_enabled:
                 self.setToolTip(
                     "First-person controls: Z/Q/S/D to move, R/F to move "
-                    "down/up, move the mouse to look, hold Ctrl temporarily "
-                    "or right-click to keep the Canvas cursor free."
+                    "down/up, A to overlay the Generation frame, move the "
+                    "mouse to look, hold Ctrl temporarily or right-click to "
+                    "keep the Canvas cursor free."
                 )
                 return
             self.setToolTip(
                 "First-person controls: Z/Q/S/D to move, R/F to move down/up, "
-                "move the mouse to look, right-click to release the pointer "
-                "for selection."
+                "A to overlay the Generation frame, move the mouse to look, "
+                "right-click to release the pointer for selection."
             )
             return
         if self.is_first_person_ctrl_interaction_active:
@@ -1872,7 +1933,8 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             if not self._first_person_ctrl_interaction_enabled:
                 self.setToolTip(
                     "First-person view: click to select, Z/Q/S/D to move, and "
-                    "use the navigation hotkey to return to orbit controls."
+                    "A to overlay the Generation frame. Use the navigation "
+                    "hotkey to return to orbit controls."
                 )
                 return
             self.setToolTip(
@@ -3205,6 +3267,13 @@ class GlbViewerWidget(QWidget):
         )
         layout.addWidget(self.view)
 
+        self.first_person_frame_overlay = _FirstPersonFrameOverlay()
+        self.first_person_frame_overlay.setObjectName(
+            "generated_model_first_person_frame_overlay"
+        )
+        self.first_person_frame_overlay.hide()
+        layout.addWidget(self.first_person_frame_overlay)
+
         self.first_person_crosshair_label = QLabel("+")
         self.first_person_crosshair_label.setObjectName(
             "generated_model_first_person_crosshair_label"
@@ -3645,6 +3714,8 @@ class GlbViewerWidget(QWidget):
     def _handle_view_navigation_mode_changed(self, mode: str) -> None:
         """Reevaluate orbit-only ceiling filtering before forwarding the mode."""
 
+        if mode != NAVIGATION_MODE_FIRST_PERSON:
+            self.clear_first_person_frame_overlay()
         if self._window_editing_enabled and self._ignore_top_down_ceiling:
             self._apply_canvas_scene_visibility_change()
         self.navigation_mode_changed.emit(mode)
@@ -7254,6 +7325,7 @@ class GlbViewerWidget(QWidget):
         if self.surface_tools_status_label is not None:
             self.surface_tools_status_label.setText(str(message))
 
+    # ### Viewer navigation and frame overlay API ###
     def focus_navigation(self) -> None:
         """Give the OpenGL viewport input focus after external reparenting."""
 
@@ -7281,6 +7353,35 @@ class GlbViewerWidget(QWidget):
         """Release mouse-look while preserving the first-person camera view."""
 
         self.view.release_first_person_pointer_capture()
+
+    @property
+    def is_first_person_frame_overlay_visible(self) -> bool:
+        """Whether the Generation frame is currently drawn above the scene."""
+
+        return bool(
+            not self.first_person_frame_overlay.isHidden()
+            and self.first_person_frame_overlay.has_frame
+        )
+
+    def set_first_person_frame_overlay(self, frame_bgr: object | None) -> bool:
+        """Show one Generation frame over the active first-person viewport."""
+
+        if frame_bgr is None or not self.is_first_person_active:
+            self.clear_first_person_frame_overlay()
+            return False
+        self.first_person_frame_overlay.set_frame_bgr(frame_bgr)
+        self.first_person_frame_overlay.show()
+        self.first_person_frame_overlay.raise_()
+        self.first_person_crosshair_label.raise_()
+        return True
+
+    def clear_first_person_frame_overlay(self) -> bool:
+        """Hide and release the copied Generation frame, if one exists."""
+
+        was_visible = self.is_first_person_frame_overlay_visible
+        self.first_person_frame_overlay.hide()
+        self.first_person_frame_overlay.clear_frame()
+        return was_visible
 
     def get_navigation_mode(self) -> str:
         """Return the active ``orbit`` or ``first_person`` navigation mode."""

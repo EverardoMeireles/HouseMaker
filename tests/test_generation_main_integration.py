@@ -372,6 +372,75 @@ class GenerationMainIntegrationTests(unittest.TestCase):
             "orbit",
         )
 
+    def test_a_shortcut_toggles_generation_frame_only_in_first_person(
+        self,
+    ) -> None:
+        shortcut = self.workspace.first_person_generation_frame_shortcut
+        viewer = self.workspace.viewer
+        frame_bgr = np.zeros((5, 7, 3), dtype=np.uint8)
+        frame_bgr[:, :] = (31, 97, 223)
+        self.workspace.merged_generation_workspace.video_view.set_frame(
+            frame_bgr
+        )
+
+        self.assertEqual(
+            shortcut.key().toString(QKeySequence.SequenceFormat.PortableText),
+            "A",
+        )
+        self.workspace.workspace_tabs.setCurrentWidget(
+            self.workspace.scene_3d_workspace
+        )
+        viewer.view.setFocus()
+        QTest.keyClick(viewer.view, Qt.Key.Key_A)
+        self.assertFalse(viewer.is_first_person_frame_overlay_visible)
+
+        viewer.enter_first_person_mode()
+        QTest.keyClick(viewer.view, Qt.Key.Key_A)
+
+        self.assertTrue(viewer.is_first_person_frame_overlay_visible)
+
+        QTest.keyClick(viewer.view, Qt.Key.Key_A)
+
+        self.assertFalse(viewer.is_first_person_frame_overlay_visible)
+
+    def test_visible_generation_frame_overlay_live_syncs_and_clears(
+        self,
+    ) -> None:
+        shortcut = self.workspace.first_person_generation_frame_shortcut
+        viewer = self.workspace.viewer
+        first_frame = np.full((4, 6, 3), 45, dtype=np.uint8)
+        second_frame = np.full((4, 6, 3), 185, dtype=np.uint8)
+        self.workspace.merged_generation_workspace.video_view.set_frame(
+            first_frame
+        )
+        viewer.enter_first_person_mode()
+
+        with patch.object(
+            viewer,
+            "set_first_person_frame_overlay",
+            wraps=viewer.set_first_person_frame_overlay,
+        ) as set_overlay:
+            shortcut.activated.emit()
+            self.assertTrue(viewer.is_first_person_frame_overlay_visible)
+            np.testing.assert_array_equal(
+                set_overlay.call_args.args[0],
+                first_frame,
+            )
+
+            self.workspace.merged_generation_workspace.video_view.set_frame(
+                second_frame
+            )
+
+            self.assertEqual(set_overlay.call_count, 2)
+            np.testing.assert_array_equal(
+                set_overlay.call_args.args[0],
+                second_frame,
+            )
+
+            self.workspace.merged_generation_workspace.video_view.clear_frame()
+
+        self.assertFalse(viewer.is_first_person_frame_overlay_visible)
+
     def test_clear_mask_hotkey_follows_settings_dropdown(self) -> None:
         shortcut = self.workspace.merged_generation_workspace.clear_mask_shortcut
         combo = self.workspace.settings_widget.clear_mask_hotkey_combo

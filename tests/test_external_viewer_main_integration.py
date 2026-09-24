@@ -219,6 +219,33 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
             -1,
         )
 
+    def test_generation_frame_overlay_shortcut_survives_detached_windows(
+        self,
+    ) -> None:
+        frame_bgr = np.full((4, 6, 3), (21, 87, 203), dtype=np.uint8)
+        self.workspace.merged_generation_workspace.video_view.set_frame(frame_bgr)
+
+        with patch(
+            "housemaker.main.resolve_fullscreen_3d_viewer_screen",
+            return_value=_primary_screen(),
+        ):
+            self.workspace._apply_scene_3d_display_screen("screen:scene")
+            self.workspace._apply_generation_display_screen("screen:generation")
+        _qt_application.processEvents()
+
+        viewer = self.workspace.viewer
+        self.workspace._external_scene_3d_host.window.activateWindow()
+        self.workspace._external_scene_3d_host.window.raise_()
+        viewer.enter_first_person_mode()
+        viewer.view.setFocus()
+        _qt_application.processEvents()
+        QTest.keyClick(viewer.view, Qt.Key.Key_A)
+        _qt_application.processEvents()
+
+        self.assertTrue(self.workspace._external_scene_3d_host.is_active)
+        self.assertTrue(self.workspace._external_generation_host.is_active)
+        self.assertTrue(viewer.is_first_person_frame_overlay_visible)
+
     def test_atlas_click_loads_exact_variant_in_embedded_viewer(self) -> None:
         asset_path = Path(self._temporary_directory.name) / "chair-2048.glb"
         asset_path.write_bytes(b"test glb")

@@ -1804,6 +1804,23 @@ class BlueprintWorkspace(QWidget):
             self.generation,
             self.job_manager,
         )
+        self.first_person_generation_frame_shortcut = QShortcut(
+            QKeySequence("A", QKeySequence.SequenceFormat.PortableText),
+            self.viewer,
+        )
+        self.first_person_generation_frame_shortcut.setObjectName(
+            "first_person_generation_frame_shortcut"
+        )
+        self.first_person_generation_frame_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self.first_person_generation_frame_shortcut.setAutoRepeat(False)
+        self.first_person_generation_frame_shortcut.activated.connect(
+            self._toggle_first_person_generation_frame_overlay
+        )
+        self.merged_generation_workspace.current_video_frame_changed.connect(
+            self._sync_first_person_generation_frame_overlay
+        )
         for checkbox in self.merged_generation_workspace.pbr_map_checkboxes.values():
             checkbox.toggled.connect(
                 self._handle_generation_scene_pbr_maps_changed
@@ -3583,6 +3600,27 @@ class BlueprintWorkspace(QWidget):
             return
 
         self.viewer.toggle_navigation_mode()
+
+    def _toggle_first_person_generation_frame_overlay(self) -> None:
+        """Toggle the current Generation frame above the first-person scene."""
+
+        if not self.viewer.is_first_person_active:
+            return
+        if self.viewer.is_first_person_frame_overlay_visible:
+            self.viewer.clear_first_person_frame_overlay()
+            return
+        self.viewer.set_first_person_frame_overlay(
+            self.merged_generation_workspace.get_current_video_frame_bgr()
+        )
+
+    def _sync_first_person_generation_frame_overlay(self) -> None:
+        """Keep an active scene overlay synchronized with Generation seeking."""
+
+        if not self.viewer.is_first_person_frame_overlay_visible:
+            return
+        self.viewer.set_first_person_frame_overlay(
+            self.merged_generation_workspace.get_current_video_frame_bgr()
+        )
 
     def _handle_canvas_3d_navigation_mode_changed(self, mode: str) -> None:
         """Keep the 2D camera indicator synchronized with scene navigation."""
