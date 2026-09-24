@@ -11,6 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # ### Imports ###
 import numpy as np
 import trimesh
+from OpenGL import GL
 from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtTest import QTest
@@ -21,7 +22,9 @@ from housemaker.glass_material import build_housemaker_glass_material
 from housemaker.glb import GeneratedModel, PreviewPlacedObject
 from housemaker.surface_geometry import SURFACE_TYPE_WALL, FixedSurface
 from housemaker.viewer import (
+    CANVAS_OPENING_OVERLAY_DEPTH_VALUE,
     NAVIGATION_MODE_FIRST_PERSON,
+    TRANSFORM_GIZMO_TRANSLATE,
     GlbViewerWidget,
     _build_axis_drag_plane_normal,
     _get_nearest_preview_placed_object_ray_hit,
@@ -342,6 +345,46 @@ class CanvasObjectGizmoTests(unittest.TestCase):
         self.assertEqual(viewer.get_selected_placed_object_id(), "chair")
         viewer.set_model(_build_preview_model(), preserve_camera=True)
         self.assertIsNone(viewer.get_selected_placed_object_id())
+
+    def test_selected_object_gizmos_remain_visible_through_its_mesh(self) -> None:
+        viewer = self._build_viewer(_build_placed_object("chair"))
+
+        with patch.object(viewer.view, "pixelSize", return_value=0.01):
+            self.assertTrue(viewer.select_placed_object("chair"))
+
+        items = tuple(viewer._transform_gizmo_items)
+        self.assertEqual(len(items), 9)
+        for item in items:
+            self.assertEqual(
+                item.depthValue(),
+                CANVAS_OPENING_OVERLAY_DEPTH_VALUE,
+            )
+            gl_options = item._GLGraphicsItem__glOpts
+            self.assertFalse(gl_options[GL.GL_DEPTH_TEST])
+            self.assertTrue(gl_options[GL.GL_BLEND])
+
+    def test_transform_handle_inside_generated_object_is_clickable(self) -> None:
+        viewer = self._build_viewer(_build_placed_object("chair"))
+        with patch.object(viewer.view, "pixelSize", return_value=0.01):
+            self.assertTrue(viewer.select_placed_object("chair"))
+
+        buried_z_axis_ray = _forward_ray(z=0.25)
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=buried_z_axis_ray,
+        ):
+            viewer._handle_placed_object_pointer_pressed(QPointF())
+
+        drag = viewer._placed_object_transform_drag
+        self.assertIsNotNone(drag)
+        assert drag is not None
+        self.assertEqual(
+            drag.handle,
+            _TransformGizmoHandle(TRANSFORM_GIZMO_TRANSLATE, 2),
+        )
+        self.assertTrue(viewer.view.is_primary_pointer_drag_reserved)
+        viewer._cancel_placed_object_gizmo_drag()
 
     def test_wall_and_window_tools_clear_object_selection(self) -> None:
         wall = _build_wall()

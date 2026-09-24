@@ -103,6 +103,11 @@ class VideoInpaintView(QWidget):
             return None
         return self._frame_bgr.copy()
 
+    def has_frame(self) -> bool:
+        """Report frame availability without copying the image buffer."""
+
+        return self._frame_bgr is not None
+
     def has_selection(self) -> bool:
         return bool(self._mask.size and np.any(self._mask > 0))
 

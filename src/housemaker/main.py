@@ -1467,6 +1467,7 @@ class BlueprintWorkspace(QWidget):
         except (RuntimeError, TypeError):
             pass
         self.settings_widget.dispose()
+        self.merged_generation_workspace.shutdown()
         self._cancel_direct_object_placement()
         self._external_atlas_host.dispose()
         self._external_generation_host.dispose()

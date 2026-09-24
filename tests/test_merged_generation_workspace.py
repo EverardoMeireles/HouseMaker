@@ -8,6 +8,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # ### Imports ###
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -19,6 +21,11 @@ from PySide6.QtTest import QSignalSpy
 from PySide6.QtWidgets import QApplication, QWidget
 
 from housemaker.app_settings import ApplicationSettingsStore
+from housemaker.ceiling_height_estimation import (
+    CEILING_HEIGHT_JOB_KIND,
+    CeilingHeightEstimate,
+    CeilingHeightEstimationCancelled,
+)
 from housemaker.generation_jobs import JOB_STATUS_CANCELLING, GenerationJobManager
 from housemaker.generation_state import (
     MASK_MODE_PAINT,
@@ -31,9 +38,11 @@ from housemaker.generation_workspace import (
     GenerationWorkspace,
 )
 from housemaker.merged_generation_workspace import (
+    CEILING_HEIGHT_NOT_ESTIMATED_TEXT,
     OBJECT_WORKFLOW_OUTLINE_PADDING,
     MergedGenerationWorkspace,
 )
+from housemaker.settings_widget import GenerationServiceSettings
 from housemaker.surface_texture_state import SurfaceTextureData
 from housemaker.surface_texture_workspace import (
     SURFACE_TEXTURE_JOB_KIND,
@@ -77,6 +86,17 @@ def _write_test_video(path: Path, frame_count: int = 3) -> None:
         writer.release()
 
 
+def _wait_until(predicate, timeout_seconds: float = 3.0) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        _qt_application.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.005)
+    _qt_application.processEvents()
+    return bool(predicate())
+
+
 # ### Merged workspace tests ###
 class MergedGenerationWorkspaceTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -100,6 +120,7 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
+        self.workspace.shutdown()
         self.surfaces.shutdown()
         self.objects.shutdown()
         self.workspace.close()
@@ -182,6 +203,110 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         self.assertEqual(changed.count(), 2)
         self.assertIsNone(self.workspace.get_current_video_frame_bgr())
 
+    def test_ceiling_height_control_analyzes_and_displays_current_frame(
+        self,
+    ) -> None:
+        captured_frames: list[np.ndarray] = []
+        captured_keys: list[str] = []
+
+        def estimator(
+            frame_bgr: np.ndarray,
+            *,
+            api_key: str,
+            cancellation_check=None,
+        ) -> CeilingHeightEstimate:
+            captured_frames.append(frame_bgr.copy())
+            captured_keys.append(api_key)
+            frame_bgr[:] = 0
+            return CeilingHeightEstimate(
+                status="estimated",
+                estimate_m=2.6,
+                minimum_m=2.4,
+                maximum_m=2.8,
+                confidence="medium",
+                basis="Door proportions and visible room boundaries agree.",
+            )
+
+        self.workspace._ceiling_height_estimator = estimator
+        self.objects.set_runtime_settings(
+            GenerationServiceSettings(openai_api_key="sk-test")
+        )
+        frame_bgr = np.full((8, 12, 3), 137, dtype=np.uint8)
+
+        self.assertFalse(self.workspace.infer_ceiling_height_button.isEnabled())
+        self.workspace.video_view.set_frame(frame_bgr)
+        self.assertTrue(self.workspace.infer_ceiling_height_button.isEnabled())
+
+        completed = QSignalSpy(
+            self.workspace.ceiling_height_estimate_changed
+        )
+        self.workspace.infer_ceiling_height_button.click()
+
+        self.assertFalse(self.workspace.infer_ceiling_height_button.isEnabled())
+        self.assertEqual(
+            self.workspace.infer_ceiling_height_button.text(),
+            "Inferring...",
+        )
+        self.assertTrue(_wait_until(lambda: completed.count() == 1))
+        self.assertEqual(captured_keys, ["sk-test"])
+        np.testing.assert_array_equal(captured_frames[0], frame_bgr)
+        np.testing.assert_array_equal(
+            self.workspace.get_current_video_frame_bgr(),
+            frame_bgr,
+        )
+        self.assertIn(
+            "Estimated ceiling height: 2.6 m",
+            self.workspace.ceiling_height_result_label.text(),
+        )
+        self.assertTrue(self.workspace.infer_ceiling_height_button.isEnabled())
+        job = self.job_manager.jobs()[-1]
+        self.assertEqual(job.kind, CEILING_HEIGHT_JOB_KIND)
+        self.assertEqual(job.status, "completed")
+
+    def test_frame_change_cancels_and_clears_a_pending_height_estimate(
+        self,
+    ) -> None:
+        started = threading.Event()
+
+        def blocking_estimator(
+            _frame_bgr: np.ndarray,
+            *,
+            api_key: str,
+            cancellation_check=None,
+        ) -> CeilingHeightEstimate:
+            self.assertEqual(api_key, "sk-test")
+            started.set()
+            while cancellation_check is None or not cancellation_check():
+                time.sleep(0.005)
+            raise CeilingHeightEstimationCancelled("Cancelled")
+
+        self.workspace._ceiling_height_estimator = blocking_estimator
+        self.objects.set_runtime_settings(
+            GenerationServiceSettings(openai_api_key="sk-test")
+        )
+        self.workspace.video_view.set_frame(
+            np.full((8, 12, 3), 40, dtype=np.uint8)
+        )
+        self.workspace.infer_ceiling_height_button.click()
+        self.assertTrue(started.wait(1.0))
+        self.assertTrue(self.workspace.cancel_button.isEnabled())
+
+        self.workspace.video_view.set_frame(
+            np.full((8, 12, 3), 210, dtype=np.uint8)
+        )
+
+        self.assertTrue(
+            _wait_until(
+                lambda: self.workspace._ceiling_height_runtime is None
+            )
+        )
+        self.assertEqual(
+            self.workspace.ceiling_height_result_label.text(),
+            CEILING_HEIGHT_NOT_ESTIMATED_TEXT,
+        )
+        self.assertEqual(self.job_manager.jobs()[-1].status, "cancelled")
+        self.assertTrue(self.workspace.infer_ceiling_height_button.isEnabled())
+
     def test_default_window_splits_views_evenly_and_uses_one_shared_column(
         self,
     ) -> None:
@@ -219,6 +344,10 @@ class MergedGenerationWorkspaceTests(unittest.TestCase):
         )
         self.assertFalse(
             self.objects.status_label.isVisibleTo(self.workspace)
+        )
+        self.assertEqual(
+            self.workspace.ceiling_height_result_label.textFormat(),
+            Qt.TextFormat.PlainText,
         )
         self.assertGreaterEqual(
             self.workspace.controls_scroll.viewport().height(),

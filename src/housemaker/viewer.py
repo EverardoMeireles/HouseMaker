@@ -10438,9 +10438,7 @@ class GlbViewerWidget(QWidget):
                 antialias=True,
                 mode="lines",
             )
-            axis_item.setGLOptions("translucent")
-            self.view.addItem(axis_item)
-            self._transform_gizmo_items.append(axis_item)
+            self._add_transform_gizmo_overlay_item(axis_item)
 
             endpoint_item = gl.GLScatterPlotItem(
                 pos=np.asarray((endpoint,), dtype=float),
@@ -10448,9 +10446,7 @@ class GlbViewerWidget(QWidget):
                 size=10.0,
                 pxMode=True,
             )
-            endpoint_item.setGLOptions("translucent")
-            self.view.addItem(endpoint_item)
-            self._transform_gizmo_items.append(endpoint_item)
+            self._add_transform_gizmo_overlay_item(endpoint_item)
 
             ring_positions = _build_rotation_ring_positions(
                 pivot,
@@ -10465,9 +10461,18 @@ class GlbViewerWidget(QWidget):
                 antialias=True,
                 mode="line_strip",
             )
-            ring_item.setGLOptions("translucent")
-            self.view.addItem(ring_item)
-            self._transform_gizmo_items.append(ring_item)
+            self._add_transform_gizmo_overlay_item(ring_item)
+
+    def _add_transform_gizmo_overlay_item(
+        self,
+        item: GLGraphicsItem,
+    ) -> None:
+        """Draw a transform handle above meshes that intersect the gizmo."""
+
+        item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+        item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE)
+        self.view.addItem(item)
+        self._transform_gizmo_items.append(item)
 
     def _remove_transform_gizmo_items(self) -> None:
         if not hasattr(self, "view"):

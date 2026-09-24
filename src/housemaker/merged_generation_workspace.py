@@ -4,10 +4,12 @@ from __future__ import annotations
 import copy
 from collections import Counter
 from collections.abc import Iterable
+from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QRect, Qt, Signal, Slot
+from PySide6.QtCore import QThread, QRect, Qt, Signal, Slot
 from PySide6.QtGui import QColor, QKeySequence, QPainter, QPaintEvent, QPen, QShortcut
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -16,6 +18,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMessageBox,
+    QPushButton,
     QScrollArea,
     QSizePolicy,
     QSplitter,
@@ -23,6 +26,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from housemaker.ceiling_height_estimation import (
+    CEILING_HEIGHT_JOB_KIND,
+    CeilingHeightEstimate,
+    CeilingHeightEstimationCancelled,
+    CeilingHeightEstimationError,
+    CeilingHeightEstimator,
+    format_ceiling_height_estimate,
+    infer_ceiling_height,
+)
 from housemaker.generation_jobs import (
     JOB_STATUS_RUNNING,
     GenerationJob,
@@ -54,14 +66,78 @@ WORKFLOW_OUTLINE_WIDTH = 2
 WORKFLOW_OUTLINE_INSET = 3
 OBJECT_WORKFLOW_OUTLINE_PADDING = 5
 WORKFLOW_SECTION_SPACING = 10
+CEILING_HEIGHT_SHUTDOWN_WAIT_MILLISECONDS = 100
+CEILING_HEIGHT_NOT_ESTIMATED_TEXT = "Ceiling height: Not estimated"
 CANCELLABLE_GENERATION_JOB_KINDS = frozenset(
     {
         GENERATION_JOB_KIND_MODEL,
         GENERATION_JOB_KIND_TEXTURE,
         GENERATION_JOB_KIND_FACE_EDIT,
         SURFACE_TEXTURE_JOB_KIND,
+        CEILING_HEIGHT_JOB_KIND,
     }
 )
+
+
+# ### Ceiling-height inference jobs ###
+class _CeilingHeightInferenceThread(QThread):
+    """Analyze one immutable Generation frame outside the GUI thread."""
+
+    def __init__(
+        self,
+        frame_bgr: np.ndarray,
+        api_key: str,
+        estimator: CeilingHeightEstimator,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._frame_bgr = np.ascontiguousarray(frame_bgr).copy()
+        self._api_key = str(api_key)
+        self._estimator = estimator
+        self.result: CeilingHeightEstimate | None = None
+        self.error_message: str | None = None
+        self.was_cancelled = False
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            try:
+                result = self._estimator(
+                    self._frame_bgr,
+                    api_key=self._api_key,
+                    cancellation_check=self.isInterruptionRequested,
+                )
+            except CeilingHeightEstimationCancelled:
+                self.was_cancelled = True
+                return
+            except CeilingHeightEstimationError as error:
+                if self.isInterruptionRequested():
+                    self.was_cancelled = True
+                else:
+                    self.error_message = str(error)
+                return
+            except Exception:  # noqa: BLE001 - redact unexpected worker failures.
+                if self.isInterruptionRequested():
+                    self.was_cancelled = True
+                else:
+                    self.error_message = "Ceiling height inference failed."
+                return
+            if self.isInterruptionRequested():
+                self.was_cancelled = True
+                return
+            self.result = result
+        finally:
+            self._api_key = ""
+            self._frame_bgr = np.empty((0, 0, 3), dtype=np.uint8)
+
+
+@dataclass
+class _CeilingHeightInferenceRuntime:
+    """GUI-owned lifecycle and stale-frame guard for one inference."""
+
+    frame_revision: int
+    job_id: str
+    thread: _CeilingHeightInferenceThread
+    cancel_requested: bool = False
 
 
 # ### Overlapping workflow outlines ###
@@ -124,6 +200,7 @@ class MergedGenerationWorkspace(QWidget):
     """Present Surface and Object generation around one reference editor."""
 
     current_video_frame_changed = Signal()
+    ceiling_height_estimate_changed = Signal(object)
 
     def __init__(
         self,
@@ -131,12 +208,22 @@ class MergedGenerationWorkspace(QWidget):
         object_workspace: GenerationWorkspace,
         job_manager: GenerationJobManager,
         parent: QWidget | None = None,
+        *,
+        ceiling_height_estimator: CeilingHeightEstimator | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("merged_generation_workspace")
         self.surface_workspace = surface_workspace
         self.object_workspace = object_workspace
         self.job_manager = job_manager
+        self._ceiling_height_estimator = (
+            infer_ceiling_height
+            if ceiling_height_estimator is None
+            else ceiling_height_estimator
+        )
+        self._ceiling_height_frame_revision = 0
+        self._ceiling_height_runtime: _CeilingHeightInferenceRuntime | None = None
+        self._is_shutdown = False
 
         self.surface_workspace.setParent(self)
         self.object_workspace.setParent(self)
@@ -153,6 +240,27 @@ class MergedGenerationWorkspace(QWidget):
         self.clear_mask_shortcut.activated.connect(self._clear_mask_from_shortcut)
         self.set_clear_mask_hotkey(DEFAULT_CLEAR_MASK_HOTKEY)
         self.sync_shared_controls()
+
+    def shutdown(self) -> None:
+        """Cancel and join the frame-analysis worker exactly once."""
+
+        if self._is_shutdown:
+            return
+        self._is_shutdown = True
+        runtime = self._ceiling_height_runtime
+        if runtime is None:
+            return
+        runtime.cancel_requested = True
+        runtime.thread.requestInterruption()
+        self.job_manager.set_cancel_callback(runtime.job_id, None)
+        self.job_manager.mark_cancelled(
+            runtime.job_id,
+            stage="Cancelled during shutdown",
+        )
+        while runtime.thread.isRunning():
+            runtime.thread.wait(CEILING_HEIGHT_SHUTDOWN_WAIT_MILLISECONDS)
+        runtime.thread.deleteLater()
+        self._ceiling_height_runtime = None
 
     def set_clear_mask_hotkey(self, hotkey: str) -> None:
         """Apply the selected Generation-only Clear mask keymapping."""
@@ -357,6 +465,40 @@ class MergedGenerationWorkspace(QWidget):
             "merged_generation_shared_primary_column"
         )
         shared_layout.addWidget(self.load_video_button)
+
+        self.ceiling_height_section, ceiling_height_layout = (
+            _build_boxed_section(
+                "Room analysis",
+                "merged_generation_ceiling_height_section",
+            )
+        )
+        self.infer_ceiling_height_button = QPushButton(
+            "Infer ceiling height"
+        )
+        self.infer_ceiling_height_button.setObjectName(
+            "infer_ceiling_height_button"
+        )
+        self.infer_ceiling_height_button.setToolTip(
+            "Estimate floor-to-ceiling height from the current video frame "
+            "using visible perspective and scale cues."
+        )
+        ceiling_height_layout.addWidget(self.infer_ceiling_height_button)
+        self.ceiling_height_result_label = QLabel(
+            CEILING_HEIGHT_NOT_ESTIMATED_TEXT
+        )
+        self.ceiling_height_result_label.setObjectName(
+            "ceiling_height_result_label"
+        )
+        self.ceiling_height_result_label.setWordWrap(True)
+        self.ceiling_height_result_label.setTextFormat(
+            Qt.TextFormat.PlainText
+        )
+        self.ceiling_height_result_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        ceiling_height_layout.addWidget(self.ceiling_height_result_label)
+        shared_layout.addWidget(self.ceiling_height_section)
+
         self.clear_mask_button.setText("Clear mask")
         shared_layout.addWidget(self.mask_mode_control)
 
@@ -382,7 +524,7 @@ class MergedGenerationWorkspace(QWidget):
         self.cancel_button.setObjectName("cancel_generation_job_button")
         self.cancel_button.setText("Cancel")
         self.cancel_button.setToolTip(
-            "Cancel the newest active Surface or Object generation job."
+            "Cancel the newest active generation or frame-analysis job."
         )
         material_layout.addWidget(self.cancel_button)
         shared_layout.addWidget(self.shared_material_section)
@@ -501,12 +643,13 @@ class MergedGenerationWorkspace(QWidget):
         except (RuntimeError, TypeError):
             pass
         self.load_video_button.clicked.connect(self._handle_load_video_clicked)
+        self.infer_ceiling_height_button.clicked.connect(
+            self._start_ceiling_height_inference
+        )
 
         self.video_view.strokes_changed.connect(surface._handle_video_strokes_changed)
         self.video_view.strokes_changed.connect(self.sync_shared_controls)
-        self.video_view.frame_changed.connect(
-            self.current_video_frame_changed.emit
-        )
+        self.video_view.frame_changed.connect(self._handle_video_frame_changed)
         try:
             self.seekbar.valueChanged.disconnect()
         except (RuntimeError, TypeError):
@@ -526,6 +669,154 @@ class MergedGenerationWorkspace(QWidget):
 
         objects._sync_controls()
         surface._sync_controls()
+
+    @Slot()
+    def _handle_video_frame_changed(self) -> None:
+        """Invalidate estimates and preserve external current-frame updates."""
+
+        self._ceiling_height_frame_revision += 1
+        runtime = self._ceiling_height_runtime
+        if runtime is not None:
+            runtime.cancel_requested = True
+            if not self.job_manager.cancel_job(runtime.job_id):
+                runtime.thread.requestInterruption()
+        self.ceiling_height_result_label.setText(
+            CEILING_HEIGHT_NOT_ESTIMATED_TEXT
+        )
+        self.current_video_frame_changed.emit()
+        self.sync_shared_controls()
+
+    @Slot()
+    def _start_ceiling_height_inference(self) -> None:
+        """Snapshot and analyze the exact frame currently shown to the user."""
+
+        if self._is_shutdown or self._ceiling_height_runtime is not None:
+            return
+        frame_bgr = self.get_current_video_frame_bgr()
+        if frame_bgr is None:
+            self.ceiling_height_result_label.setText(
+                "Ceiling height: Load a video frame first."
+            )
+            self.sync_shared_controls()
+            return
+        api_key = (
+            self.object_workspace.get_runtime_settings().openai_api_key.strip()
+        )
+        if not api_key:
+            self.ceiling_height_result_label.setText(
+                "Ceiling height: Add an OpenAI API key in Settings first."
+            )
+            return
+
+        frame_revision = self._ceiling_height_frame_revision
+        thread = _CeilingHeightInferenceThread(
+            frame_bgr,
+            api_key,
+            self._ceiling_height_estimator,
+            parent=self,
+        )
+        job = self.job_manager.create_job(
+            kind=CEILING_HEIGHT_JOB_KIND,
+            requested_name="",
+            default_name="Ceiling height",
+            stage="Analyzing current video frame",
+        )
+        runtime = _CeilingHeightInferenceRuntime(
+            frame_revision=frame_revision,
+            job_id=job.job_id,
+            thread=thread,
+        )
+        self._ceiling_height_runtime = runtime
+        self.job_manager.set_cancel_callback(
+            job.job_id,
+            partial(self._cancel_ceiling_height_inference, job.job_id),
+        )
+        thread.finished.connect(
+            partial(
+                self._handle_ceiling_height_inference_finished,
+                job.job_id,
+                thread,
+            )
+        )
+        self.ceiling_height_result_label.setText(
+            "Ceiling height: Estimating..."
+        )
+        self.sync_shared_controls()
+        thread.start()
+
+    def _cancel_ceiling_height_inference(self, job_id: str) -> bool:
+        runtime = self._ceiling_height_runtime
+        if runtime is None or runtime.job_id != str(job_id):
+            return False
+        runtime.cancel_requested = True
+        runtime.thread.requestInterruption()
+        self.sync_shared_controls()
+        return True
+
+    def _handle_ceiling_height_inference_finished(
+        self,
+        job_id: str,
+        thread: _CeilingHeightInferenceThread,
+    ) -> None:
+        """Publish a result only if the displayed frame is still identical."""
+
+        runtime = self._ceiling_height_runtime
+        try:
+            if (
+                runtime is None
+                or runtime.job_id != job_id
+                or runtime.thread is not thread
+            ):
+                return
+            self.job_manager.set_cancel_callback(job_id, None)
+            is_stale = (
+                runtime.frame_revision != self._ceiling_height_frame_revision
+            )
+            if (
+                self._is_shutdown
+                or runtime.cancel_requested
+                or thread.was_cancelled
+                or is_stale
+            ):
+                stage = (
+                    "Ignored after the video frame changed"
+                    if is_stale
+                    else "Cancelled"
+                )
+                self.job_manager.mark_cancelled(job_id, stage=stage)
+                if not self._is_shutdown and not is_stale:
+                    self.ceiling_height_result_label.setText(
+                        "Ceiling height: Inference cancelled."
+                    )
+                return
+            if thread.error_message is not None or thread.result is None:
+                message = thread.error_message or (
+                    "Ceiling height inference returned no result."
+                )
+                self.job_manager.fail_job(job_id, stage=f"Failed: {message}")
+                self.ceiling_height_result_label.setText(
+                    f"Ceiling height inference failed: {message}"
+                )
+                return
+
+            estimate = thread.result
+            self.ceiling_height_result_label.setText(
+                format_ceiling_height_estimate(estimate)
+            )
+            if estimate.has_estimate:
+                assert estimate.estimate_m is not None
+                completion_stage = (
+                    f"Estimated ceiling height: {estimate.estimate_m:.2f} m"
+                )
+            else:
+                completion_stage = "Insufficient visual evidence"
+            self.job_manager.complete_job(job_id, stage=completion_stage)
+            self.ceiling_height_estimate_changed.emit(estimate)
+        finally:
+            if runtime is not None and runtime.thread is thread:
+                self._ceiling_height_runtime = None
+            self.sync_shared_controls()
+            thread.deleteLater()
 
     @Slot()
     def _handle_load_video_clicked(self) -> None:
@@ -614,6 +905,17 @@ class MergedGenerationWorkspace(QWidget):
         self.pbr_map_control.setEnabled(not has_untracked_object_job)
         self.ai_prompt_edit.setEnabled(not has_untracked_object_job)
         self.video_view.set_interaction_enabled(editor_is_available)
+        ceiling_inference_is_running = self._ceiling_height_runtime is not None
+        self.infer_ceiling_height_button.setEnabled(
+            not self._is_shutdown
+            and self.video_view.has_frame()
+            and not ceiling_inference_is_running
+        )
+        self.infer_ceiling_height_button.setText(
+            "Inferring..."
+            if ceiling_inference_is_running
+            else "Infer ceiling height"
+        )
         self._sync_cancel_button()
 
     @Slot()
@@ -622,7 +924,7 @@ class MergedGenerationWorkspace(QWidget):
         self.cancel_button.setEnabled(job is not None)
         if job is None:
             self.cancel_button.setToolTip(
-                "There is no active Surface or Object generation job."
+                "There is no active generation or frame-analysis job."
             )
             return
         self.cancel_button.setToolTip(f'Cancel the newest active job: "{job.name}".')

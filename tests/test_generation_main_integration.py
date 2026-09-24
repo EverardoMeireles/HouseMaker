@@ -272,6 +272,8 @@ class GenerationMainIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(shared_column)
         for shared_control in (
             merged.load_video_button,
+            merged.infer_ceiling_height_button,
+            merged.ceiling_height_result_label,
             merged.pbr_map_control,
             merged.mask_mode_control,
             merged.clear_mask_button,
