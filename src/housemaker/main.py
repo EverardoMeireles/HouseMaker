@@ -73,11 +73,20 @@ from housemaker.atlas_export import (
     estimate_texture_atlas_draw_calls,
     prepare_surface_ambient_occlusion_preview_for_atlas,
 )
+from housemaker.automatic_wall_detection import (
+    PlanWallAnalysis,
+    PlanWallDetectionOptions,
+    PlanWallDetectionResult,
+    analyze_plan_wall_image,
+    reconstruct_plan_walls,
+)
 from housemaker.blueprint_canvas import (
+    CANVAS_SNAPSHOT_ACTION_GENERATED_WALLS,
     CANVAS_SNAPSHOT_ACTION_OPEN_SPACE,
     CANVAS_SNAPSHOT_ACTION_VERTEX_DELETION,
     BlueprintCanvas,
     CanvasSnapshot,
+    PlanImageEraseCommit,
 )
 from housemaker.canvas_openings import (
     CANVAS_OPENING_DOORWAY,
@@ -335,6 +344,8 @@ SURFACE_AO_PREVIEW_REFRESH_DELAY_MILLISECONDS = 150
 ATLAS_DRAW_CALL_ESTIMATE_REFRESH_DELAY_MILLISECONDS = 200
 STAIR_PREVIEW_UPDATE_DELAY_MILLISECONDS = 35
 PLAN_IMAGE_CORRECTION_SHUTDOWN_WAIT_MILLISECONDS = 100
+PLAN_WALL_DETECTION_SHUTDOWN_WAIT_MILLISECONDS = 100
+PLAN_WALL_PREVIEW_REFRESH_DELAY_MILLISECONDS = 75
 
 
 # ### Plan-image correction jobs ###
@@ -402,6 +413,64 @@ class _PlanImageCorrectionRuntime:
     job_id: str
     thread: _PlanImageCorrectionThread
     cancel_requested: bool = False
+
+
+# ### Automatic wall-generation jobs ###
+class _PlanWallDetectionThread(QThread):
+    """Analyze one immutable plan image outside the GUI thread."""
+
+    def __init__(
+        self,
+        image_path: Path,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._image_path = Path(image_path)
+        self.analysis: PlanWallAnalysis | None = None
+        self.error_message: str | None = None
+        self.was_cancelled = False
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            analysis = analyze_plan_wall_image(
+                self._image_path,
+                cancellation_check=self.isInterruptionRequested,
+            )
+        except Exception as error:  # noqa: BLE001 - worker failures cross Qt safely.
+            if self.isInterruptionRequested():
+                self.was_cancelled = True
+            else:
+                self.error_message = str(error) or type(error).__name__
+            return
+        if self.isInterruptionRequested():
+            self.was_cancelled = True
+            return
+        self.analysis = analysis
+
+
+@dataclass
+class _PlanWallDetectionRuntime:
+    """GUI-owned lifecycle and stale-input guard for wall analysis."""
+
+    source_path: Path
+    source_revision: tuple[object, ...]
+    topology_signature: tuple[object, ...]
+    baseline_vertex_data: VertexData
+    job_id: str
+    thread: _PlanWallDetectionThread
+    cancel_requested: bool = False
+
+
+@dataclass(frozen=True)
+class _PlanWallPreviewSession:
+    """Reusable wall evidence and immutable inputs for live reconstruction."""
+
+    level_index: int
+    source_revision: tuple[object, ...]
+    topology_signature: tuple[object, ...]
+    baseline_vertex_data: VertexData
+    existing_edge_keys: frozenset[tuple[int, int]]
+    analysis: PlanWallAnalysis
 
 
 # ### Atlas ambient-occlusion jobs ###
@@ -810,6 +879,15 @@ class _CanvasBlueprintUndoState:
     wall_mirror_links: tuple[WallMirrorVertexLink, ...] = ()
     other_level_vertex_data: tuple[tuple[int, VertexData], ...] = ()
     other_level_doorways: tuple[tuple[int, tuple[DoorwayData, ...]], ...] = ()
+    level_offsets_meters: tuple[float, float] | None = None
+
+
+@dataclass(frozen=True)
+class _CanvasPlanImageUndoState:
+    """One immutable plan-image revision created by a marquee erase."""
+
+    level_index: int
+    commit: PlanImageEraseCommit
 
 
 @dataclass(frozen=True)
@@ -962,6 +1040,7 @@ class _SurfaceTextureTilingUndoState:
 
 _CanvasUndoState = (
     _CanvasBlueprintUndoState
+    | _CanvasPlanImageUndoState
     | _CanvasTopologyUndoState
     | _CanvasSurfaceEditUndoState
     | _CanvasLevelPropertiesUndoState
@@ -1282,6 +1361,21 @@ class BlueprintWorkspace(QWidget):
             int,
             _PlanImageCorrectionRuntime,
         ] = {}
+        self._plan_wall_detection_runtimes: dict[
+            int,
+            _PlanWallDetectionRuntime,
+        ] = {}
+        self._plan_wall_preview_session: _PlanWallPreviewSession | None = None
+        self._plan_wall_preview_is_valid = False
+        self._is_syncing_plan_wall_controls = False
+        self._plan_wall_preview_refresh_timer = QTimer(self)
+        self._plan_wall_preview_refresh_timer.setSingleShot(True)
+        self._plan_wall_preview_refresh_timer.setInterval(
+            PLAN_WALL_PREVIEW_REFRESH_DELAY_MILLISECONDS
+        )
+        self._plan_wall_preview_refresh_timer.timeout.connect(
+            self._refresh_plan_wall_preview
+        )
         self._surface_ao_bake_runtimes: dict[
             str,
             _SurfaceAmbientOcclusionBakeRuntime,
@@ -1361,6 +1455,7 @@ class BlueprintWorkspace(QWidget):
         self._cancel_pending_wall_vertex_update()
         self._cancel_pending_doorway_mesh_update(clear_outline=True)
         self._cancel_and_join_plan_image_corrections()
+        self._cancel_and_join_plan_wall_detections()
         self._cancel_and_join_atlas_draw_call_estimates()
         self._cancel_and_join_surface_ambient_occlusion_previews()
         self._cancel_and_join_surface_ambient_occlusion_bakes()
@@ -1425,6 +1520,42 @@ class BlueprintWorkspace(QWidget):
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
         field_layout.addWidget(value_label)
+        return field, slider, value_label
+
+    @staticmethod
+    def _build_plan_wall_slider_field(
+        *,
+        minimum: int,
+        maximum: int,
+        value: int,
+        value_text: str,
+        tooltip: str,
+    ) -> tuple[QWidget, QSlider, QLabel]:
+        """Build one live automatic-wall reconstruction control."""
+
+        field = QWidget()
+        layout = QHBoxLayout(field)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(minimum, maximum)
+        slider.setSingleStep(1)
+        slider.setPageStep(max(1, (maximum - minimum) // 10))
+        slider.setTracking(True)
+        slider.setValue(max(minimum, min(maximum, int(value))))
+        slider.setMinimumHeight(30)
+        slider.setToolTip(tooltip)
+        layout.addWidget(slider, 1)
+
+        value_label = QLabel(value_text)
+        value_label.setMinimumWidth(54)
+        value_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        field.setToolTip(tooltip)
+        value_label.setToolTip(tooltip)
+        layout.addWidget(value_label)
         return field, slider, value_label
 
     @staticmethod
@@ -3004,6 +3135,29 @@ class BlueprintWorkspace(QWidget):
         self.load_image_button.clicked.connect(self._handle_load_image_clicked)
         plan_image_buttons_layout.addWidget(self.load_image_button)
 
+        self.erase_plan_image_button = QPushButton("Erase")
+        self.erase_plan_image_button.setCheckable(True)
+        self.erase_plan_image_button.setMinimumHeight(44)
+        self.erase_plan_image_button.setToolTip(
+            "Drag a rectangle around unwanted plan-image content to erase it. "
+            "Right-click or press Escape to exit."
+        )
+        self.erase_plan_image_button.clicked.connect(
+            self._handle_erase_plan_image_clicked
+        )
+        plan_image_buttons_layout.addWidget(self.erase_plan_image_button)
+
+        self.generate_walls_button = QPushButton("Generate walls")
+        self.generate_walls_button.setMinimumHeight(44)
+        self.generate_walls_button.setToolTip(
+            "Analyze the current plan without changing the level. Generated "
+            "wall faces appear as a live Canvas preview until confirmed."
+        )
+        self.generate_walls_button.clicked.connect(
+            self._handle_generate_walls_clicked
+        )
+        plan_image_buttons_layout.addWidget(self.generate_walls_button)
+
         self.image_correction_button = QPushButton("Image correction")
         self.image_correction_button.setMinimumHeight(44)
         self.image_correction_button.setToolTip(
@@ -3018,6 +3172,220 @@ class BlueprintWorkspace(QWidget):
         )
         plan_image_buttons_layout.addWidget(self.image_correction_button)
         levels_layout.addLayout(plan_image_buttons_layout)
+
+        default_wall_options = PlanWallDetectionOptions()
+        self.plan_wall_controls_group = QGroupBox("Automatic wall placement")
+        plan_wall_controls_layout = QFormLayout(self.plan_wall_controls_group)
+        plan_wall_controls_layout.setContentsMargins(8, 8, 8, 8)
+        plan_wall_controls_layout.setSpacing(6)
+        plan_wall_controls_layout.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+        )
+
+        (
+            minimum_wall_separation_field,
+            self.minimum_wall_separation_slider,
+            self.minimum_wall_separation_value_label,
+        ) = self._build_plan_wall_slider_field(
+            minimum=1,
+            maximum=80,
+            value=round(default_wall_options.minimum_wall_separation_pixels),
+            value_text=(
+                f"{round(default_wall_options.minimum_wall_separation_pixels)} px"
+            ),
+            tooltip=(
+                "Smallest perpendicular distance, in plan-image pixels, allowed "
+                "between two parallel lines that form the faces of one wall. "
+                "Increase it to reject thin annotation-line pairs; values that "
+                "are too high can discard genuinely thin walls."
+            ),
+        )
+        plan_wall_controls_layout.addRow(
+            "Minimum wall thickness",
+            minimum_wall_separation_field,
+        )
+
+        (
+            maximum_wall_separation_field,
+            self.maximum_wall_separation_slider,
+            self.maximum_wall_separation_value_label,
+        ) = self._build_plan_wall_slider_field(
+            minimum=2,
+            maximum=200,
+            value=round(default_wall_options.maximum_wall_separation_pixels),
+            value_text=(
+                f"{round(default_wall_options.maximum_wall_separation_pixels)} px"
+            ),
+            tooltip=(
+                "Largest perpendicular distance, in plan-image pixels, allowed "
+                "between two parallel lines that form the faces of one wall. "
+                "Increase it to detect thicker walls; values that are too high "
+                "can pair unrelated parallel lines."
+            ),
+        )
+        plan_wall_controls_layout.addRow(
+            "Maximum wall thickness",
+            maximum_wall_separation_field,
+        )
+
+        (
+            parallel_angle_field,
+            self.parallel_wall_angle_slider,
+            self.parallel_wall_angle_value_label,
+        ) = self._build_plan_wall_slider_field(
+            minimum=1,
+            maximum=30,
+            value=round(default_wall_options.parallel_angle_tolerance_degrees),
+            value_text=(
+                f"{round(default_wall_options.parallel_angle_tolerance_degrees)}"
+                "\N{DEGREE SIGN}"
+            ),
+            tooltip=(
+                "Largest direction difference allowed when treating two lines "
+                "as parallel wall faces. Increase it for skewed photographs or "
+                "imperfect drawings; values that are too high can pair lines "
+                "from different walls."
+            ),
+        )
+        plan_wall_controls_layout.addRow(
+            "Parallel angle tolerance",
+            parallel_angle_field,
+        )
+
+        (
+            parallel_overlap_field,
+            self.parallel_wall_overlap_slider,
+            self.parallel_wall_overlap_value_label,
+        ) = self._build_plan_wall_slider_field(
+            minimum=5,
+            maximum=100,
+            value=round(default_wall_options.minimum_parallel_overlap_ratio * 100),
+            value_text=(
+                f"{round(default_wall_options.minimum_parallel_overlap_ratio * 100)}%"
+            ),
+            tooltip=(
+                "Minimum shared projected length of two candidate wall faces, "
+                "measured against the longer line. Higher values reject short "
+                "or staggered matches; lower values recover partially obscured "
+                "walls but can accept unrelated lines."
+            ),
+        )
+        plan_wall_controls_layout.addRow(
+            "Minimum parallel overlap",
+            parallel_overlap_field,
+        )
+
+        (
+            gap_bridge_field,
+            self.wall_gap_bridge_slider,
+            self.wall_gap_bridge_value_label,
+        ) = self._build_plan_wall_slider_field(
+            minimum=0,
+            maximum=250,
+            value=round(default_wall_options.maximum_gap_bridge_pixels),
+            value_text=f"{round(default_wall_options.maximum_gap_bridge_pixels)} px",
+            tooltip=(
+                "Largest along-line gap, in plan-image pixels, bridged between "
+                "collinear wall fragments. Increase it to span door openings or "
+                "broken scan ink; values that are too high can join separate "
+                "walls that happen to align."
+            ),
+        )
+        plan_wall_controls_layout.addRow("Gap bridge distance", gap_bridge_field)
+
+        (
+            endpoint_snap_field,
+            self.wall_endpoint_snap_slider,
+            self.wall_endpoint_snap_value_label,
+        ) = self._build_plan_wall_slider_field(
+            minimum=0,
+            maximum=100,
+            value=round(default_wall_options.endpoint_snap_distance_pixels),
+            value_text=(
+                f"{round(default_wall_options.endpoint_snap_distance_pixels)} px"
+            ),
+            tooltip=(
+                "Maximum distance, in plan-image pixels, used to extend nearby "
+                "nonparallel wall lines to their theoretical corner or T-junction. "
+                "It also lets generated walls reuse nearby endpoints of existing "
+                "walls; values that are too high can create false junctions."
+            ),
+        )
+        plan_wall_controls_layout.addRow("Endpoint snap distance", endpoint_snap_field)
+
+        (
+            maximum_vertex_distance_field,
+            self.maximum_vertex_distance_slider,
+            self.maximum_vertex_distance_value_label,
+        ) = self._build_plan_wall_slider_field(
+            minimum=0,
+            maximum=50,
+            value=round(default_wall_options.maximum_vertex_distance_pixels),
+            value_text=(
+                f"{round(default_wall_options.maximum_vertex_distance_pixels)} px"
+            ),
+            tooltip=(
+                "Generated vertex candidates at or closer than this distance are "
+                "consolidated, reusing an existing wall vertex when possible. "
+                "Opposite parallel wall faces are protected. Increase it to "
+                "remove near-duplicate vertices; 0 disables this extra merge. "
+                "Values that are too high can merge distinct nearby corners or "
+                "erase very short wall details."
+            ),
+        )
+        plan_wall_controls_layout.addRow(
+            "Maximum vertex distance",
+            maximum_vertex_distance_field,
+        )
+
+        (
+            minimum_wall_length_field,
+            self.minimum_wall_length_slider,
+            self.minimum_wall_length_value_label,
+        ) = self._build_plan_wall_slider_field(
+            minimum=5,
+            maximum=500,
+            value=round(default_wall_options.minimum_wall_length_pixels),
+            value_text=f"{round(default_wall_options.minimum_wall_length_pixels)} px",
+            tooltip=(
+                "Shortest detected line, in plan-image pixels, that may remain as "
+                "a wall face. Increase it to filter text and dimension marks; "
+                "values that are too high can remove short real walls."
+            ),
+        )
+        plan_wall_controls_layout.addRow(
+            "Minimum wall length",
+            minimum_wall_length_field,
+        )
+
+        (
+            confidence_field,
+            self.wall_detection_confidence_slider,
+            self.wall_detection_confidence_value_label,
+        ) = self._build_plan_wall_slider_field(
+            minimum=0,
+            maximum=100,
+            value=round(default_wall_options.confidence_threshold * 100),
+            value_text=f"{round(default_wall_options.confidence_threshold * 100)}%",
+            tooltip=(
+                "Minimum geometric confidence required for a detected wall pair. "
+                "Confidence combines line strength, length, overlap, angle, "
+                "separation, existing-wall alignment, and supporting outlines. "
+                "Higher values are cleaner but may omit uncertain walls."
+            ),
+        )
+        plan_wall_controls_layout.addRow("Detection confidence", confidence_field)
+
+        self.plan_wall_generation_status_label = QLabel(
+            "Generate walls to analyze the current plan."
+        )
+        self.plan_wall_generation_status_label.setWordWrap(True)
+        plan_wall_controls_layout.addRow(self.plan_wall_generation_status_label)
+        self.plan_wall_controls_group.setEnabled(False)
+        levels_layout.addWidget(self.plan_wall_controls_group)
+
+        for slider in self._get_plan_wall_generation_sliders():
+            slider.valueChanged.connect(self._handle_plan_wall_slider_changed)
 
         self.blueprint_name_label = QLabel("Image: none for this level")
         self.blueprint_name_label.setWordWrap(True)
@@ -3072,6 +3440,8 @@ class BlueprintWorkspace(QWidget):
 
         self._refresh_doorway_preset_list(selected_index=0)
         self._update_image_correction_button_state()
+        self._update_plan_wall_generation_controls_state()
+        self._update_plan_image_erase_button_state()
 
         self._generals_value_input_wheel_filter = RightPanelValueInputWheelFilter(
             generals_tab
@@ -3117,6 +3487,15 @@ class BlueprintWorkspace(QWidget):
         self.canvas.open_spaces_changed.connect(self._handle_open_spaces_changed)
         self.canvas.open_space_placement_changed.connect(
             self._handle_open_space_placement_changed
+        )
+        self.canvas.plan_image_erase_mode_changed.connect(
+            self._handle_plan_image_erase_mode_changed
+        )
+        self.canvas.plan_image_erase_committed.connect(
+            self._handle_plan_image_erase_committed
+        )
+        self.canvas.plan_image_erase_failed.connect(
+            self._handle_plan_image_erase_failed
         )
         self.canvas.doorway_dimension_preview_changed.connect(
             self._handle_doorway_dimension_preview_changed
@@ -4022,6 +4401,15 @@ class BlueprintWorkspace(QWidget):
                     for level in self.levels
                     if level.index != self.current_level.index
                 ),
+                level_offsets_meters=(
+                    (
+                        float(self.current_level.offset_x_meters),
+                        float(self.current_level.offset_y_meters),
+                    )
+                    if raw_snapshot.action_kind
+                    == CANVAS_SNAPSHOT_ACTION_GENERATED_WALLS
+                    else None
+                ),
             )
         )
 
@@ -4311,7 +4699,9 @@ class BlueprintWorkspace(QWidget):
             self._pending_stair_point_mesh_update = False
             self._pending_stair_point_undo_state = None
             self._pending_stair_point_id = None
-            if isinstance(state, _CanvasTopologyUndoState):
+            if isinstance(state, _CanvasPlanImageUndoState):
+                self._restore_canvas_plan_image_undo_state(state)
+            elif isinstance(state, _CanvasTopologyUndoState):
                 skipped_texture_bindings = self._restore_canvas_topology_undo_state(
                     state
                 )
@@ -4731,6 +5121,61 @@ class BlueprintWorkspace(QWidget):
             + skipped_atlas_placements
         )
 
+    def _restore_canvas_plan_image_undo_state(
+        self,
+        state: _CanvasPlanImageUndoState,
+    ) -> None:
+        """Restore the immutable plan image preceding one marquee erase."""
+
+        level = self._get_level_by_index(state.level_index)
+        if level is None:
+            raise ValueError("The plan-image level in this undo step no longer exists.")
+        commit = state.commit
+        current_path = (
+            None
+            if level.image_path is None
+            else str(Path(level.image_path).resolve())
+        )
+        replacement_path = str(Path(commit.replacement_path).resolve())
+        previous_path = str(Path(commit.previous_path).resolve())
+        if current_path != replacement_path:
+            raise RuntimeError(
+                "The plan image changed after this erase; it was not overwritten."
+            )
+        if (
+            _build_local_file_revision(replacement_path)
+            != commit.replacement_revision
+        ):
+            raise RuntimeError(
+                "The erased plan-image file changed outside HouseMaker."
+            )
+        previous_revision = _build_local_file_revision(previous_path)
+        if (
+            not _local_file_revision_has_file(previous_revision)
+            or previous_revision != commit.previous_revision
+        ):
+            raise RuntimeError(
+                "The previous plan-image revision is no longer available."
+            )
+
+        if (
+            level is self.current_level
+            and not self.canvas.load_blueprint_image_preserving_view(previous_path)
+        ):
+            raise RuntimeError("The previous plan image could not be restored.")
+        level.image_path = previous_path
+        level.image_size_pixels = tuple(commit.image_size_pixels)
+        self._level_blueprint_image_revisions[level.index] = previous_revision
+        if level is self.current_level:
+            self._clear_plan_wall_preview(update_controls=False)
+            self._update_blueprint_name_label()
+            self._update_plan_wall_generation_controls_state()
+            self._update_image_correction_button_state()
+            if self.canvas.is_plan_image_erasing():
+                self.canvas.set_plan_image_erase_output_path(
+                    self._new_plan_image_erase_output_path(level)
+                )
+
     def _restore_blueprint_undo_state(
         self,
         state: _CanvasBlueprintUndoState,
@@ -4740,9 +5185,16 @@ class BlueprintWorkspace(QWidget):
         level = self._get_level_by_index(state.level_index)
         if level is None:
             raise ValueError("The Canvas level in this undo step no longer exists.")
+        if state.level_offsets_meters is not None:
+            (
+                level.offset_x_meters,
+                level.offset_y_meters,
+            ) = state.level_offsets_meters
         if level is self.current_level:
             self.canvas.discard_undo_snapshot(state.snapshot)
             self.canvas.restore_snapshot(state.snapshot)
+            if state.level_offsets_meters is not None:
+                self._sync_level_controls()
         else:
             level.vertex_data.copy_from(state.snapshot.vertex_data)
             level.rooms.clear()
@@ -11809,7 +12261,460 @@ class BlueprintWorkspace(QWidget):
                 normalized_path,
             )
 
-    # ### Plan image loading and correction ###
+    # ### Plan images and automatic wall generation ###
+    def _get_plan_wall_generation_sliders(self) -> tuple[QSlider, ...]:
+        """Return every control that reconstructs the cached wall evidence."""
+
+        return (
+            self.minimum_wall_separation_slider,
+            self.maximum_wall_separation_slider,
+            self.parallel_wall_angle_slider,
+            self.parallel_wall_overlap_slider,
+            self.wall_gap_bridge_slider,
+            self.wall_endpoint_snap_slider,
+            self.maximum_vertex_distance_slider,
+            self.minimum_wall_length_slider,
+            self.wall_detection_confidence_slider,
+        )
+
+    def _build_plan_wall_detection_options(self) -> PlanWallDetectionOptions:
+        """Read one validated immutable reconstruction configuration."""
+
+        return PlanWallDetectionOptions(
+            minimum_wall_separation_pixels=float(
+                self.minimum_wall_separation_slider.value()
+            ),
+            maximum_wall_separation_pixels=float(
+                self.maximum_wall_separation_slider.value()
+            ),
+            parallel_angle_tolerance_degrees=float(
+                self.parallel_wall_angle_slider.value()
+            ),
+            minimum_parallel_overlap_ratio=(
+                self.parallel_wall_overlap_slider.value() / 100.0
+            ),
+            maximum_gap_bridge_pixels=float(self.wall_gap_bridge_slider.value()),
+            endpoint_snap_distance_pixels=float(
+                self.wall_endpoint_snap_slider.value()
+            ),
+            maximum_vertex_distance_pixels=float(
+                self.maximum_vertex_distance_slider.value()
+            ),
+            minimum_wall_length_pixels=float(self.minimum_wall_length_slider.value()),
+            confidence_threshold=(
+                self.wall_detection_confidence_slider.value() / 100.0
+            ),
+        )
+
+    def _handle_plan_wall_slider_changed(self, _value: int) -> None:
+        """Refresh value labels and debounce one live Canvas reconstruction."""
+
+        if self._is_syncing_plan_wall_controls:
+            return
+        self._is_syncing_plan_wall_controls = True
+        try:
+            minimum_slider = self.minimum_wall_separation_slider
+            maximum_slider = self.maximum_wall_separation_slider
+            if minimum_slider.value() > maximum_slider.value():
+                if self.sender() is minimum_slider:
+                    maximum_slider.setValue(minimum_slider.value())
+                else:
+                    minimum_slider.setValue(maximum_slider.value())
+            self.minimum_wall_separation_value_label.setText(
+                f"{minimum_slider.value()} px"
+            )
+            self.maximum_wall_separation_value_label.setText(
+                f"{maximum_slider.value()} px"
+            )
+            self.parallel_wall_angle_value_label.setText(
+                f"{self.parallel_wall_angle_slider.value()}\N{DEGREE SIGN}"
+            )
+            self.parallel_wall_overlap_value_label.setText(
+                f"{self.parallel_wall_overlap_slider.value()}%"
+            )
+            self.wall_gap_bridge_value_label.setText(
+                f"{self.wall_gap_bridge_slider.value()} px"
+            )
+            self.wall_endpoint_snap_value_label.setText(
+                f"{self.wall_endpoint_snap_slider.value()} px"
+            )
+            self.maximum_vertex_distance_value_label.setText(
+                f"{self.maximum_vertex_distance_slider.value()} px"
+            )
+            self.minimum_wall_length_value_label.setText(
+                f"{self.minimum_wall_length_slider.value()} px"
+            )
+            self.wall_detection_confidence_value_label.setText(
+                f"{self.wall_detection_confidence_slider.value()}%"
+            )
+        finally:
+            self._is_syncing_plan_wall_controls = False
+
+        session = self._plan_wall_preview_session
+        if session is None or session.level_index != self.current_level.index:
+            return
+        self._plan_wall_preview_is_valid = False
+        self.plan_wall_generation_status_label.setText("Updating wall preview...")
+        self._update_plan_wall_generation_controls_state()
+        if not self._plan_wall_preview_refresh_timer.isActive():
+            self._plan_wall_preview_refresh_timer.start()
+
+    def _handle_generate_walls_clicked(self) -> None:
+        """Start image analysis or confirm the current generated-wall preview."""
+
+        session = self._plan_wall_preview_session
+        if session is not None and session.level_index == self.current_level.index:
+            self._confirm_generated_walls()
+            return
+        self._start_plan_wall_detection()
+
+    def _start_plan_wall_detection(self) -> None:
+        """Start one non-blocking wall analysis for the active level image."""
+
+        if self._is_shutdown:
+            return
+        self.canvas.stop_plan_image_erasing()
+        self._refresh_blueprint_file_dependencies(include_exported_levels=False)
+        level = self.current_level
+        if level.index in self._plan_wall_detection_runtimes:
+            return
+        if level.index in self._plan_image_correction_runtimes:
+            return
+        raw_source_path = str(level.image_path or "").strip()
+        if not raw_source_path:
+            QMessageBox.warning(
+                self,
+                "Wall generation unavailable",
+                "Load or correct a plan image before generating walls.",
+            )
+            return
+        try:
+            source_path = Path(raw_source_path).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            source_path = Path(raw_source_path)
+        source_revision = _build_local_file_revision(source_path)
+        if not _local_file_revision_has_file(source_revision):
+            QMessageBox.warning(
+                self,
+                "Wall generation unavailable",
+                "The current plan image cannot be read.",
+            )
+            return
+        if (
+            self.canvas.blueprint_image is None
+            or self.canvas.get_blueprint_image_revision() != source_revision
+        ):
+            QMessageBox.warning(
+                self,
+                "Wall generation unavailable",
+                "The current plan image could not be refreshed safely.",
+            )
+            return
+
+        self._clear_plan_wall_preview(update_controls=False)
+        baseline_vertex_data = level.vertex_data.clone()
+        topology_signature = _build_vertex_data_signature(baseline_vertex_data)
+        thread = _PlanWallDetectionThread(source_path, parent=self)
+        job = self.job_manager.create_job(
+            kind="Wall generation",
+            requested_name="",
+            default_name=f"Detect {level.display_name} walls",
+            stage="Analyzing plan wall evidence (5%)",
+        )
+        runtime = _PlanWallDetectionRuntime(
+            source_path=source_path,
+            source_revision=source_revision,
+            topology_signature=topology_signature,
+            baseline_vertex_data=baseline_vertex_data,
+            job_id=job.job_id,
+            thread=thread,
+        )
+        self._plan_wall_detection_runtimes[level.index] = runtime
+        self.job_manager.set_cancel_callback(
+            job.job_id,
+            partial(self._cancel_plan_wall_detection_for_level, level.index),
+        )
+        thread.finished.connect(
+            partial(
+                self._handle_plan_wall_detection_finished,
+                level.index,
+                job.job_id,
+                thread,
+            )
+        )
+        self.plan_wall_generation_status_label.setText("Analyzing plan walls...")
+        self._update_plan_wall_generation_controls_state()
+        self._update_image_correction_button_state()
+        thread.start()
+
+    def _handle_plan_wall_detection_finished(
+        self,
+        level_index: int,
+        job_id: str,
+        thread: _PlanWallDetectionThread,
+    ) -> None:
+        """Create a preview only while image and anchored topology still match."""
+
+        runtime = self._plan_wall_detection_runtimes.get(level_index)
+        try:
+            if (
+                runtime is None
+                or runtime.job_id != job_id
+                or runtime.thread is not thread
+            ):
+                return
+            self._plan_wall_detection_runtimes.pop(level_index, None)
+            self.job_manager.set_cancel_callback(job_id, None)
+            if self._is_shutdown or runtime.cancel_requested or thread.was_cancelled:
+                self.job_manager.mark_cancelled(job_id)
+                return
+            if thread.error_message is not None or thread.analysis is None:
+                message = thread.error_message or (
+                    "Wall analysis finished without returning usable evidence."
+                )
+                self.job_manager.fail_job(job_id, f"Failed: {message}")
+                QMessageBox.critical(self, "Wall generation failed", message)
+                return
+
+            level = self._get_level_by_index(level_index)
+            if level is None or not self._plan_wall_detection_context_is_current(
+                level,
+                runtime,
+            ):
+                message = (
+                    "The plan image or its existing walls changed during analysis."
+                )
+                self.job_manager.fail_job(job_id, f"Not applied: {message}")
+                if level is self.current_level:
+                    QMessageBox.warning(self, "Wall generation not applied", message)
+                return
+
+            session = _PlanWallPreviewSession(
+                level_index=level_index,
+                source_revision=runtime.source_revision,
+                topology_signature=runtime.topology_signature,
+                baseline_vertex_data=runtime.baseline_vertex_data,
+                existing_edge_keys=_get_vertex_data_edge_keys(
+                    runtime.baseline_vertex_data
+                ),
+                analysis=thread.analysis,
+            )
+            if level is not self.current_level:
+                self.job_manager.complete_job(job_id, "Analysis completed")
+                return
+            self._plan_wall_preview_session = session
+            if not self._refresh_plan_wall_preview():
+                message = (
+                    "Wall evidence was found, but no valid preview could be built."
+                )
+                self.job_manager.fail_job(job_id, f"Failed: {message}")
+                return
+            self.job_manager.complete_job(job_id, "Wall preview ready")
+        finally:
+            thread.deleteLater()
+            self._update_plan_wall_generation_controls_state()
+            self._update_image_correction_button_state()
+
+    def _plan_wall_detection_context_is_current(
+        self,
+        level: LevelData,
+        runtime: _PlanWallDetectionRuntime,
+    ) -> bool:
+        """Return whether a wall analysis can still target its captured level."""
+
+        if (
+            _build_vertex_data_signature(level.vertex_data)
+            != runtime.topology_signature
+        ):
+            return False
+        return (
+            _build_local_file_revision(level.image_path)
+            == runtime.source_revision
+        )
+
+    def _refresh_plan_wall_preview(self) -> bool:
+        """Reconstruct the cached evidence and publish one lightweight overlay."""
+
+        self._plan_wall_preview_refresh_timer.stop()
+        session = self._plan_wall_preview_session
+        if session is None or session.level_index != self.current_level.index:
+            self._plan_wall_preview_is_valid = False
+            self._update_plan_wall_generation_controls_state()
+            return False
+        if (
+            _build_local_file_revision(self.current_level.image_path)
+            != session.source_revision
+            or _build_vertex_data_signature(self.current_level.vertex_data)
+            != session.topology_signature
+        ):
+            self._clear_plan_wall_preview()
+            return False
+
+        try:
+            result = reconstruct_plan_walls(
+                session.analysis,
+                self._build_plan_wall_detection_options(),
+                existing_vertex_data=session.baseline_vertex_data,
+            )
+            added_count = _validate_plan_wall_detection_result(session, result)
+            self.canvas.set_generated_wall_preview(
+                result.vertex_data,
+                session.existing_edge_keys,
+            )
+        except (RuntimeError, TypeError, ValueError) as error:
+            self._plan_wall_preview_is_valid = False
+            self.canvas.clear_generated_wall_preview()
+            self.plan_wall_generation_status_label.setText(
+                f"Preview unavailable: {error}"
+            )
+            self._update_plan_wall_generation_controls_state()
+            return False
+        self._plan_wall_preview_is_valid = added_count > 0
+        if self._plan_wall_preview_is_valid:
+            self.plan_wall_generation_status_label.setText(
+                f"{added_count} generated wall faces. Adjust the sliders or confirm."
+            )
+        else:
+            self.plan_wall_generation_status_label.setText(
+                "No wall pairs match the current controls. Adjust the sliders."
+            )
+        self._update_plan_wall_generation_controls_state()
+        return True
+
+    def _confirm_generated_walls(self) -> None:
+        """Commit the latest preview and build its 3D walls exactly once."""
+
+        self._finish_level_transform_drag()
+        self._commit_pending_level_transform_update()
+        if (
+            not self._refresh_plan_wall_preview()
+            or not self._plan_wall_preview_is_valid
+        ):
+            return
+        session = self._plan_wall_preview_session
+        if session is None:
+            return
+        level = self.current_level
+        preview = self.canvas.get_generated_wall_preview()
+        offset_compensation = (0.0, 0.0)
+        if preview is not None and session.baseline_vertex_data.vertices:
+            previous_pivot_x, previous_pivot_y = get_level_world_pivot(level)
+            preview_level = copy.copy(level)
+            preview_level.vertex_data = preview.to_vertex_data()
+            next_pivot_x, next_pivot_y = get_level_world_pivot(preview_level)
+            scale = float(level.scale)
+            offset_compensation = (
+                (1.0 - scale) * (previous_pivot_x - next_pivot_x),
+                (1.0 - scale) * (previous_pivot_y - next_pivot_y),
+            )
+        self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_wall_vertex_update()
+        self._commit_pending_doorway_mesh_update()
+        self._plan_wall_preview_session = None
+        self._plan_wall_preview_is_valid = False
+        if not self.canvas.commit_generated_wall_preview():
+            self._update_plan_wall_generation_controls_state()
+            return
+        level.offset_x_meters += offset_compensation[0]
+        level.offset_y_meters += offset_compensation[1]
+        self._sync_level_controls()
+        self.plan_wall_generation_status_label.setText(
+            "Generated walls confirmed."
+        )
+        self.viewer.set_surface_tools_status(
+            "Generated walls confirmed. Press Ctrl+Z to undo."
+        )
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
+        self._update_plan_wall_generation_controls_state()
+        self._update_image_correction_button_state()
+
+    def _clear_plan_wall_preview(self, *, update_controls: bool = True) -> None:
+        """Discard cached wall evidence and its non-destructive Canvas overlay."""
+
+        self._plan_wall_preview_refresh_timer.stop()
+        self._plan_wall_preview_session = None
+        self._plan_wall_preview_is_valid = False
+        if hasattr(self, "canvas"):
+            self.canvas.clear_generated_wall_preview()
+        if hasattr(self, "plan_wall_generation_status_label"):
+            self.plan_wall_generation_status_label.setText(
+                "Generate walls to analyze the current plan."
+            )
+        if update_controls:
+            self._update_plan_wall_generation_controls_state()
+            self._update_image_correction_button_state()
+
+    def _cancel_plan_wall_detection_for_level(self, level_index: int) -> bool:
+        runtime = self._plan_wall_detection_runtimes.get(int(level_index))
+        if runtime is None:
+            return False
+        runtime.cancel_requested = True
+        if runtime.thread.isRunning():
+            runtime.thread.requestInterruption()
+        self._update_plan_wall_generation_controls_state()
+        return True
+
+    def _cancel_and_join_plan_wall_detections(self) -> None:
+        """Retire every wall-analysis worker before its project context changes."""
+
+        self._clear_plan_wall_preview(update_controls=False)
+        runtimes = tuple(self._plan_wall_detection_runtimes.values())
+        for runtime in runtimes:
+            runtime.cancel_requested = True
+            runtime.thread.requestInterruption()
+            self.job_manager.mark_cancelled(runtime.job_id)
+        for runtime in runtimes:
+            while runtime.thread.isRunning():
+                runtime.thread.wait(PLAN_WALL_DETECTION_SHUTDOWN_WAIT_MILLISECONDS)
+            runtime.thread.deleteLater()
+        self._plan_wall_detection_runtimes.clear()
+        if hasattr(self, "generate_walls_button"):
+            self._update_plan_wall_generation_controls_state()
+
+    def _update_plan_wall_generation_controls_state(self) -> None:
+        """Synchronize the Generate/Confirm wall action and live controls."""
+
+        if not hasattr(self, "generate_walls_button"):
+            return
+        try:
+            level = self.current_level
+        except IndexError:
+            self.generate_walls_button.setEnabled(False)
+            self.generate_walls_button.setText("Generate walls")
+            self.plan_wall_controls_group.setEnabled(False)
+            self._update_plan_image_erase_button_state()
+            return
+        runtime = self._plan_wall_detection_runtimes.get(level.index)
+        correction_runtime = self._plan_image_correction_runtimes.get(level.index)
+        session = self._plan_wall_preview_session
+        has_preview = session is not None and session.level_index == level.index
+        source_revision = _build_local_file_revision(level.image_path)
+        has_source = _local_file_revision_has_file(source_revision)
+        if runtime is not None:
+            self.generate_walls_button.setEnabled(False)
+            self.generate_walls_button.setText("Generating walls...")
+            self.plan_wall_controls_group.setEnabled(False)
+            self._update_plan_image_erase_button_state()
+            return
+        if correction_runtime is not None:
+            self.generate_walls_button.setEnabled(False)
+            self.generate_walls_button.setText("Generate walls")
+            self.plan_wall_controls_group.setEnabled(False)
+            self._update_plan_image_erase_button_state()
+            return
+        self.generate_walls_button.setText(
+            "Confirm walls" if has_preview else "Generate walls"
+        )
+        self.generate_walls_button.setEnabled(
+            not self._is_shutdown
+            and has_source
+            and (self._plan_wall_preview_is_valid if has_preview else True)
+        )
+        self.plan_wall_controls_group.setEnabled(
+            not self._is_shutdown and has_preview
+        )
+        self._update_plan_image_erase_button_state()
+
     def _handle_load_image_clicked(self) -> None:
         file_path = self._get_image_file_path()
         if not file_path:
@@ -11820,11 +12725,162 @@ class BlueprintWorkspace(QWidget):
         except ValueError as error:
             QMessageBox.critical(self, "Image load failed", str(error))
 
+    # ### Plan-image erasing ###
+    def _new_plan_image_erase_output_path(self, level: LevelData) -> Path:
+        """Return one application-owned immutable PNG path for a marquee erase."""
+
+        output_directory = self._application_settings.path.parent / "edited_plans"
+        return (
+            output_directory
+            / f"edited-plan-L{level.index}-{uuid.uuid4().hex}.png"
+        )
+
+    def _handle_erase_plan_image_clicked(self, checked: bool) -> None:
+        """Enter or leave the Canvas plan-image Erase mode."""
+
+        if not checked:
+            self.canvas.stop_plan_image_erasing()
+            self._update_plan_image_erase_button_state()
+            return
+
+        level = self.current_level
+        if (
+            self._is_shutdown
+            or self.canvas.blueprint_image is None
+            or level.image_path is None
+            or level.index in self._plan_image_correction_runtimes
+            or level.index in self._plan_wall_detection_runtimes
+        ):
+            was_blocked = self.erase_plan_image_button.blockSignals(True)
+            self.erase_plan_image_button.setChecked(False)
+            self.erase_plan_image_button.blockSignals(was_blocked)
+            self._update_plan_image_erase_button_state()
+            return
+
+        output_path = self._new_plan_image_erase_output_path(level)
+        if not self.canvas.start_plan_image_erasing(output_path):
+            was_blocked = self.erase_plan_image_button.blockSignals(True)
+            self.erase_plan_image_button.setChecked(False)
+            self.erase_plan_image_button.blockSignals(was_blocked)
+            return
+        self._clear_plan_wall_preview()
+        self.viewer.set_surface_tools_status(
+            "Plan-image Erase active. Drag a rectangle on the Canvas; "
+            "right-click or press Escape to exit."
+        )
+
+    def _handle_plan_image_erase_mode_changed(self, active: bool) -> None:
+        """Keep the checkable Erase button synchronized with the Canvas mode."""
+
+        if not hasattr(self, "erase_plan_image_button"):
+            return
+        was_blocked = self.erase_plan_image_button.blockSignals(True)
+        self.erase_plan_image_button.setChecked(bool(active))
+        self.erase_plan_image_button.blockSignals(was_blocked)
+        self._update_plan_image_erase_button_state()
+
+    def _handle_plan_image_erase_committed(self, raw_commit: object) -> None:
+        """Publish one atomically saved marquee erase to the active level."""
+
+        if not isinstance(raw_commit, PlanImageEraseCommit):
+            return
+        level = self.current_level
+        previous_path = str(Path(raw_commit.previous_path).resolve())
+        replacement_path = str(Path(raw_commit.replacement_path).resolve())
+        current_path = (
+            None
+            if level.image_path is None
+            else str(Path(level.image_path).resolve())
+        )
+        if current_path != previous_path:
+            if current_path is not None:
+                self.canvas.load_blueprint_image_preserving_view(current_path)
+            if self.canvas.is_plan_image_erasing():
+                self.canvas.set_plan_image_erase_output_path(
+                    self._new_plan_image_erase_output_path(level)
+                )
+            QMessageBox.critical(
+                self,
+                "Plan erase not applied",
+                "The active level image changed before the erase could be "
+                "committed.",
+            )
+            return
+
+        self._clear_plan_wall_preview(update_controls=False)
+        self._record_canvas_undo_state(
+            _CanvasPlanImageUndoState(
+                level_index=level.index,
+                commit=raw_commit,
+            )
+        )
+        if level.original_image_path is None:
+            level.original_image_path = previous_path
+        level.image_path = replacement_path
+        level.image_size_pixels = tuple(raw_commit.image_size_pixels)
+        self._level_blueprint_image_revisions[level.index] = (
+            raw_commit.replacement_revision
+        )
+        self.canvas.set_plan_image_erase_output_path(
+            self._new_plan_image_erase_output_path(level)
+        )
+        self._update_blueprint_name_label()
+        self._update_plan_wall_generation_controls_state()
+        self._update_plan_image_erase_button_state()
+        self.viewer.set_surface_tools_status(
+            "Plan-image selection erased. Press Ctrl+Z to undo."
+        )
+
+    def _handle_plan_image_erase_failed(self, message: str) -> None:
+        """Report an atomic-save failure after the Canvas restored its pixels."""
+
+        QMessageBox.critical(
+            self,
+            "Plan erase failed",
+            str(message).strip() or "The edited plan image could not be saved.",
+        )
+        if self.canvas.is_plan_image_erasing():
+            self.canvas.set_plan_image_erase_output_path(
+                self._new_plan_image_erase_output_path(self.current_level)
+            )
+        self._update_plan_image_erase_button_state()
+
+    def _update_plan_image_erase_button_state(self) -> None:
+        """Enable Erase only while the active plan can be edited safely."""
+
+        if not hasattr(self, "erase_plan_image_button"):
+            return
+        try:
+            level = self.current_level
+        except IndexError:
+            self.erase_plan_image_button.setEnabled(False)
+            self.erase_plan_image_button.setChecked(False)
+            return
+        has_source = (
+            level.image_path is not None
+            and self.canvas.blueprint_image is not None
+            and _local_file_revision_has_file(
+                _build_local_file_revision(level.image_path)
+            )
+        )
+        self.erase_plan_image_button.setEnabled(
+            not self._is_shutdown
+            and has_source
+            and level.index not in self._plan_image_correction_runtimes
+            and level.index not in self._plan_wall_detection_runtimes
+        )
+        was_blocked = self.erase_plan_image_button.blockSignals(True)
+        self.erase_plan_image_button.setChecked(
+            self.canvas.is_plan_image_erasing()
+        )
+        self.erase_plan_image_button.blockSignals(was_blocked)
+
     def _handle_image_correction_clicked(self) -> None:
         """Start one non-blocking correction for the current level's source photo."""
 
         if self._is_shutdown:
             return
+        self.canvas.stop_plan_image_erasing()
         level = self.current_level
         if level.index in self._plan_image_correction_runtimes:
             return
@@ -11917,6 +12973,7 @@ class BlueprintWorkspace(QWidget):
             )
         )
         self._update_image_correction_button_state()
+        self._update_plan_wall_generation_controls_state()
         thread.start()
 
     @staticmethod
@@ -12027,6 +13084,7 @@ class BlueprintWorkspace(QWidget):
             self.job_manager.complete_job(job_id, completion_stage)
         finally:
             self._update_image_correction_button_state()
+            self._update_plan_wall_generation_controls_state()
             thread.deleteLater()
 
     def _plan_image_correction_context_is_current(
@@ -12098,18 +13156,29 @@ class BlueprintWorkspace(QWidget):
         except IndexError:
             self.image_correction_button.setEnabled(False)
             self.image_correction_button.setText("Image correction")
+            self._update_plan_image_erase_button_state()
             return
         runtime = self._plan_image_correction_runtimes.get(level.index)
+        wall_runtime = self._plan_wall_detection_runtimes.get(level.index)
+        wall_preview = self._plan_wall_preview_session
+        has_wall_preview = (
+            wall_preview is not None and wall_preview.level_index == level.index
+        )
         source_path = self._get_plan_correction_source_path(level)
         has_source = source_path is not None and _local_file_revision_has_file(
             _build_local_file_revision(source_path)
         )
         self.image_correction_button.setEnabled(
-            not self._is_shutdown and has_source and runtime is None
+            not self._is_shutdown
+            and has_source
+            and runtime is None
+            and wall_runtime is None
+            and not has_wall_preview
         )
         self.image_correction_button.setText(
             "Correcting..." if runtime is not None else "Image correction"
         )
+        self._update_plan_image_erase_button_state()
 
     def _get_image_file_path(self) -> str:
         file_path, _ = QFileDialog.getOpenFileName(
@@ -12726,6 +13795,7 @@ class BlueprintWorkspace(QWidget):
             self.levels_list.setCurrentRow(current_level_row)
         self._update_blueprint_name_label()
         self._update_image_correction_button_state()
+        self._update_plan_wall_generation_controls_state()
         self._is_syncing_level_controls = False
 
     def _handle_level_list_row_changed(self, level_row: int) -> None:
@@ -12749,6 +13819,13 @@ class BlueprintWorkspace(QWidget):
             return
 
         if level_index != self.current_level_index:
+            previous_level = self.current_level
+            active_wall_detection = self._plan_wall_detection_runtimes.get(
+                previous_level.index
+            )
+            if active_wall_detection is not None:
+                self.job_manager.cancel_job(active_wall_detection.job_id)
+            self._clear_plan_wall_preview()
             self.canvas.cancel_open_space_placement()
             self._finish_level_transform_drag()
             self._commit_pending_level_transform_update()
@@ -13706,14 +14783,11 @@ class BlueprintWorkspace(QWidget):
         self._doorway_mesh_update_timer.stop()
 
     def _handle_doorway_move_drag_finished(self, changed: bool) -> None:
-        """Commit a moved doorway immediately when the mouse is released."""
+        """Start the shared mesh-edit delay after a 2D move is released."""
 
         self._is_doorway_move_drag_active = False
-        if changed:
-            if self._pending_doorway_mesh_level_index is None:
-                self._handle_doorway_dimension_preview_changed()
-            self._commit_pending_doorway_mesh_update()
-            return
+        if changed and self._pending_doorway_mesh_level_index is None:
+            self._handle_doorway_dimension_preview_changed()
         if self._pending_doorway_mesh_level_index is not None:
             self._doorway_mesh_update_timer.start()
 
@@ -13733,7 +14807,7 @@ class BlueprintWorkspace(QWidget):
             self._doorway_mesh_update_timer.start()
 
     def _handle_doorway_dimension_preview_changed(self) -> None:
-        """Show a live doorway outline and debounce an arch mesh rebuild."""
+        """Show a live doorway outline and debounce the wall mesh rebuild."""
 
         self.current_level.doorways = self.canvas.doorways
         level = self.current_level
@@ -14174,9 +15248,21 @@ class BlueprintWorkspace(QWidget):
 
     # ### Canvas wall drawing updates ###
     def _handle_canvas_surface_geometry_changed(self) -> None:
-        """Reconcile changed surfaces before refreshing Canvas geometry."""
+        """Delay active wall edits and reconcile other Canvas geometry."""
 
+        session = self._plan_wall_preview_session
+        if (
+            session is not None
+            and session.level_index == self.current_level.index
+            and _build_vertex_data_signature(self.current_level.vertex_data)
+            != session.topology_signature
+        ):
+            self._clear_plan_wall_preview()
         self._sync_canvas_wall_mirror_state()
+        if self._is_canvas_wall_vertex_interaction_active:
+            self._pending_wall_vertex_mesh_update = True
+            self._restart_pending_wall_vertex_update_if_idle()
+            return
         if self._pending_wall_vertex_mesh_update:
             self._restart_pending_wall_vertex_update_if_idle()
             return
@@ -14292,6 +15378,7 @@ class BlueprintWorkspace(QWidget):
         # are still intact, so a queued completion cannot commit into the
         # incoming project.
         self._cancel_and_join_plan_image_corrections()
+        self._cancel_and_join_plan_wall_detections()
         self._cancel_and_join_atlas_draw_call_estimates()
         self._cancel_and_join_surface_ambient_occlusion_previews()
         self._cancel_and_join_surface_ambient_occlusion_bakes()
@@ -14449,6 +15536,12 @@ class BlueprintWorkspace(QWidget):
         )
         if active_correction is not None:
             self.job_manager.cancel_job(active_correction.job_id)
+        active_wall_detection = self._plan_wall_detection_runtimes.get(
+            self.current_level.index
+        )
+        if active_wall_detection is not None:
+            self.job_manager.cancel_job(active_wall_detection.job_id)
+        self._clear_plan_wall_preview(update_controls=False)
         self._finish_level_transform_drag()
         self._commit_pending_level_transform_update()
         self._cancel_active_canvas_surface_edit()
@@ -14479,6 +15572,7 @@ class BlueprintWorkspace(QWidget):
         self._update_blueprint_name_label()
         self._update_open_space_controls()
         self._schedule_viewer_preview_refresh()
+        self._update_plan_wall_generation_controls_state()
 
     def _sync_canvas_to_current_level(self) -> None:
         self._viewer_doorways_by_level_index.setdefault(
@@ -14510,6 +15604,7 @@ class BlueprintWorkspace(QWidget):
         )
         self._update_blueprint_name_label()
         self._update_open_space_controls()
+        self._update_plan_wall_generation_controls_state()
 
     def _update_blueprint_name_label(self) -> None:
         image_path = self.current_level.image_path
@@ -14755,6 +15850,81 @@ def _local_file_revision_has_file(revision: tuple[object, ...]) -> bool:
     """Return whether a local-file revision represents an existing file."""
 
     return len(revision) == 4 and all(value is not None for value in revision[1:])
+
+
+def _build_vertex_data_signature(vertex_data: VertexData) -> tuple[object, ...]:
+    """Return stable topology and coordinate evidence for stale-preview guards."""
+
+    vertices = tuple(
+        sorted(
+            (
+                int(vertex.id),
+                float(vertex.x),
+                float(vertex.y),
+            )
+            for vertex in vertex_data.vertices
+        )
+    )
+    edges = tuple(
+        sorted(
+            tuple(
+                sorted(
+                    (
+                        int(edge.start_vertex_id),
+                        int(edge.end_vertex_id),
+                    )
+                )
+            )
+            for edge in vertex_data.edges
+        )
+    )
+    return vertices, edges
+
+
+def _get_vertex_data_edge_keys(
+    vertex_data: VertexData,
+) -> frozenset[tuple[int, int]]:
+    """Return direction-independent keys for every existing wall edge."""
+
+    return frozenset(
+        tuple(sorted((int(edge.start_vertex_id), int(edge.end_vertex_id))))
+        for edge in vertex_data.edges
+    )
+
+
+def _validate_plan_wall_detection_result(
+    session: _PlanWallPreviewSession,
+    result: object,
+) -> int:
+    """Validate that a detector candidate can only extend its baseline graph."""
+
+    if not isinstance(result, PlanWallDetectionResult):
+        raise TypeError("The wall detector returned an invalid result.")
+    candidate = result.vertex_data
+    if not isinstance(candidate, VertexData):
+        raise TypeError("The wall detector returned an invalid wall graph.")
+
+    baseline = session.baseline_vertex_data
+    baseline_vertex_count = len(baseline.vertices)
+    baseline_edge_count = len(baseline.edges)
+    if candidate.vertices[:baseline_vertex_count] != baseline.vertices:
+        raise ValueError("Generated walls cannot replace existing vertices.")
+    if candidate.edges[:baseline_edge_count] != baseline.edges:
+        raise ValueError("Generated walls cannot replace existing wall edges.")
+
+    raw_added_edge_count = result.added_edge_count
+    if isinstance(raw_added_edge_count, bool) or not isinstance(
+        raw_added_edge_count,
+        int,
+    ):
+        raise TypeError("The generated wall count must be an integer.")
+    expected_added_edge_count = len(candidate.edges) - baseline_edge_count
+    if (
+        expected_added_edge_count < 0
+        or raw_added_edge_count != expected_added_edge_count
+    ):
+        raise ValueError("The generated wall count does not match the wall graph.")
+    return expected_added_edge_count
 
 
 # ### Entrypoint helpers ###

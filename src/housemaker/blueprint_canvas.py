@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import copy
 import math
+import os
+import tempfile
 import uuid
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
@@ -10,7 +12,7 @@ from itertools import combinations, pairwise
 from pathlib import Path
 
 import cv2
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal, Slot
+from PySide6.QtCore import QPointF, QRect, QRectF, Qt, Signal, Slot
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -34,9 +36,11 @@ from housemaker.models import (
     DOORWAY_SHAPE_ARCH,
     MAX_CANVAS_LEVEL_SCALE,
     MAX_CANVAS_OFFSET_PIXELS,
+    MAX_DOORWAY_DEPTH_METERS,
     MAX_DOORWAY_WIDTH_METERS,
     MIN_CANVAS_LEVEL_SCALE,
     MIN_CANVAS_OFFSET_PIXELS,
+    MIN_DOORWAY_DEPTH_METERS,
     MIN_DOORWAY_WIDTH_METERS,
     PIXEL_TO_METER,
     STAIR_STYLE_FLOATING,
@@ -66,12 +70,19 @@ EDGE_COLOR = QColor("#63c0ff")
 SELECTED_WALL_EDGE_COLOR = QColor("#f6c85f")
 SELECTED_WALL_EDGE_WIDTH_SCREEN = 5.0
 PREVIEW_EDGE_COLOR = QColor("#f6c85f")
+GENERATED_WALL_PREVIEW_EDGE_COLOR = QColor("#2ee59d")
+GENERATED_WALL_PREVIEW_VERTEX_COLOR = QColor("#b7ffe4")
+GENERATED_WALL_PREVIEW_EDGE_WIDTH_SCREEN = 3.0
+GENERATED_WALL_PREVIEW_VERTEX_RADIUS_SCREEN = 4.5
 GUIDE_COLOR = QColor("#39d98a")
 VERTEX_FILL_COLOR = QColor("#ffffff")
 ACTIVE_VERTEX_FILL_COLOR = QColor("#ff7f50")
 SELECTED_VERTEX_FILL_COLOR = QColor("#90cdf4")
 WALL_MIRROR_VERTEX_FILL_COLOR = QColor("#39d98a")
 VERTEX_OUTLINE_COLOR = QColor("#20242a")
+VERTEX_SELECTION_FILL_COLOR = QColor(144, 205, 244, 48)
+VERTEX_SELECTION_OUTLINE_COLOR = QColor("#90cdf4")
+VERTEX_SELECTION_OUTLINE_SHADOW_COLOR = QColor("#20242a")
 TEXT_COLOR = QColor("#f5f7fa")
 DOORWAY_FILL_COLOR = QColor(97, 196, 255, 115)
 DOORWAY_EDGE_COLOR = QColor("#32b8ff")
@@ -106,6 +117,10 @@ DRAG_THRESHOLD_SCREEN = 4.0
 WINDOW_STRIP_HALF_WIDTH_SCREEN = 5.0
 DOORWAY_WIDTH_HANDLE_RADIUS_SCREEN = 7.0
 DOORWAY_WIDTH_HANDLE_HIT_RADIUS_SCREEN = 11.0
+DOORWAY_WIDTH_HANDLE_MINIMUM_OFFSET_SCREEN = 18.0
+DOORWAY_DEPTH_HANDLE_RADIUS_SCREEN = 7.0
+DOORWAY_DEPTH_HANDLE_HIT_RADIUS_SCREEN = 11.0
+DOORWAY_DEPTH_HANDLE_MINIMUM_OFFSET_SCREEN = 18.0
 MIN_ZOOM_SCALE = 1.0
 MAX_ZOOM_SCALE = 16.0
 ZOOM_STEP_FACTOR = 1.15
@@ -123,8 +138,12 @@ SELECTED_OPEN_SPACE_EDGE_COLOR = QColor("#f6c85f")
 PENDING_OPEN_SPACE_FILL_COLOR = QColor(255, 209, 102, 64)
 PENDING_OPEN_SPACE_EDGE_COLOR = QColor("#ffd166")
 OPEN_SPACE_HIT_TOLERANCE_SCREEN = 8.0
+PLAN_IMAGE_ERASE_SELECTION_FILL_COLOR = QColor(255, 255, 255, 72)
+PLAN_IMAGE_ERASE_SELECTION_OUTLINE_COLOR = QColor("#ffffff")
+PLAN_IMAGE_ERASE_SELECTION_OUTLINE_SHADOW_COLOR = QColor("#20242a")
 CANVAS_SNAPSHOT_ACTION_OPEN_SPACE = "open_space"
 CANVAS_SNAPSHOT_ACTION_VERTEX_DELETION = "vertex_deletion"
+CANVAS_SNAPSHOT_ACTION_GENERATED_WALLS = "generated_walls"
 
 # ### Snapshot models ###
 @dataclass
@@ -142,6 +161,17 @@ class CanvasSnapshot:
 
 
 @dataclass(frozen=True)
+class PlanImageEraseCommit:
+    """One immutable plan-image revision created by a completed erase selection."""
+
+    previous_path: str
+    replacement_path: str
+    previous_revision: tuple[object, ...]
+    replacement_revision: tuple[object, ...]
+    image_size_pixels: tuple[float, float]
+
+
+@dataclass(frozen=True)
 class CanvasLevelComparisonOverlay:
     """One adjacent level rendered temporarily over the editable Canvas."""
 
@@ -156,6 +186,25 @@ class CanvasLevelComparisonOverlay:
     doorways: tuple[DoorwayData, ...]
     windows: tuple[WindowData, ...]
     open_spaces: tuple[OpenSpaceData, ...]
+
+
+@dataclass(frozen=True)
+class GeneratedWallPreview:
+    """An immutable candidate wall graph drawn without editing the level."""
+
+    vertices: tuple[Vertex, ...]
+    edges: tuple[Edge, ...]
+    existing_edge_keys: frozenset[tuple[int, int]]
+    next_vertex_id: int
+
+    def to_vertex_data(self) -> VertexData:
+        """Return an independent mutable graph for an atomic commit."""
+
+        return VertexData(
+            vertices=list(self.vertices),
+            edges=list(self.edges),
+            _next_vertex_id=self.next_vertex_id,
+        )
 
 
 @dataclass(frozen=True)
@@ -210,6 +259,7 @@ class EdgeHit:
 class DoorwayHit:
     doorway_index: int
     width_side_sign: float = 0.0
+    depth_side_sign: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -362,6 +412,9 @@ class BlueprintCanvas(QWidget):
     undo_snapshot_created = Signal(object)
     undo_snapshot_discarded = Signal(object)
     undo_requested = Signal()
+    plan_image_erase_mode_changed = Signal(bool)
+    plan_image_erase_committed = Signal(object)
+    plan_image_erase_failed = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -383,6 +436,7 @@ class BlueprintCanvas(QWidget):
         self._level_comparison_image_cache: (
             _BlueprintImageCacheEntry | None
         ) = None
+        self._generated_wall_preview: GeneratedWallPreview | None = None
         self.active_vertex_id: int | None = None
         self._selected_vertex_ids: tuple[int, ...] = ()
         self._wall_mirror_vertex_ids: frozenset[int] = frozenset()
@@ -394,6 +448,13 @@ class BlueprintCanvas(QWidget):
         self.drag_vertex_id: int | None = None
         self.drag_press_position: QPointF | None = None
         self._is_wall_vertex_interaction_active = False
+        self._vertex_selection_start_image: QPointF | None = None
+        self._vertex_selection_current_image: QPointF | None = None
+        self._vertex_selection_press_widget: QPointF | None = None
+        self._vertex_selection_initial_ids: tuple[int, ...] = ()
+        self._vertex_selection_additive = False
+        self._vertex_selection_drag_active = False
+        self._pending_blank_vertex_point: tuple[float, float] | None = None
         self.zoom_scale = MIN_ZOOM_SCALE
         self.view_offset = QPointF(0.0, 0.0)
         self.is_panning = False
@@ -410,6 +471,7 @@ class BlueprintCanvas(QWidget):
         self.doorway_drag_initial_doorway: DoorwayData | None = None
         self.doorway_drag_wall_edge: Edge | None = None
         self.doorway_drag_width_side_sign = 0.0
+        self.doorway_drag_depth_side_sign = 0.0
         self.doorway_drag_changed = False
         self.stairs: list[object] = []
         self.selected_stair_index: int | None = None
@@ -433,6 +495,14 @@ class BlueprintCanvas(QWidget):
         self._open_space_drag_start_image: QPointF | None = None
         self._open_space_drag_current_image: QPointF | None = None
         self._open_space_drag_press_widget: QPointF | None = None
+        self._plan_image_erase_active = False
+        self._plan_image_erase_output_path: Path | None = None
+        self._plan_image_erase_baseline_image: QImage | None = None
+        self._plan_image_erase_previous_path: str | None = None
+        self._plan_image_erase_previous_revision: tuple[object, ...] | None = None
+        self._plan_image_erase_selection_start: QPointF | None = None
+        self._plan_image_erase_selection_current: QPointF | None = None
+        self._plan_image_erase_press_widget: QPointF | None = None
 
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -747,6 +817,89 @@ class BlueprintCanvas(QWidget):
         self.update()
         return True
 
+    # ### Generated-wall preview ###
+    def set_generated_wall_preview(
+        self,
+        vertex_data: VertexData,
+        existing_edge_keys: Iterable[tuple[int, int]] = (),
+    ) -> bool:
+        """Snapshot and display a non-interactive generated wall candidate."""
+
+        if not isinstance(vertex_data, VertexData):
+            raise TypeError("Generated wall preview must use VertexData.")
+
+        vertices = tuple(vertex_data.vertices)
+        vertex_ids = {vertex.id for vertex in vertices}
+        if len(vertex_ids) != len(vertices):
+            raise ValueError("Generated wall preview contains duplicate vertex IDs.")
+        if any(
+            not math.isfinite(vertex.x) or not math.isfinite(vertex.y)
+            for vertex in vertices
+        ):
+            raise ValueError("Generated wall preview coordinates must be finite.")
+
+        edges = tuple(vertex_data.edges)
+        if any(
+            edge.start_vertex_id not in vertex_ids
+            or edge.end_vertex_id not in vertex_ids
+            for edge in edges
+        ):
+            raise ValueError("Generated wall preview contains an orphaned edge.")
+
+        normalized_existing_keys = frozenset(
+            _normalize_preview_edge_key(start_vertex_id, end_vertex_id)
+            for start_vertex_id, end_vertex_id in existing_edge_keys
+        )
+        minimum_next_vertex_id = max(vertex_ids, default=0) + 1
+        preview = GeneratedWallPreview(
+            vertices=vertices,
+            edges=edges,
+            existing_edge_keys=normalized_existing_keys,
+            next_vertex_id=max(
+                minimum_next_vertex_id,
+                int(vertex_data._next_vertex_id),
+            ),
+        )
+        if preview == self._generated_wall_preview:
+            return False
+        self._generated_wall_preview = preview
+        self.update()
+        return True
+
+    def get_generated_wall_preview(self) -> GeneratedWallPreview | None:
+        """Return the immutable generated-wall candidate, when present."""
+
+        return self._generated_wall_preview
+
+    def clear_generated_wall_preview(self) -> bool:
+        """Remove the candidate overlay without changing level geometry."""
+
+        if self._generated_wall_preview is None:
+            return False
+        self._generated_wall_preview = None
+        self.update()
+        return True
+
+    def commit_generated_wall_preview(self) -> bool:
+        """Replace level walls with the candidate as one undoable edit."""
+
+        preview = self._generated_wall_preview
+        if preview is None:
+            return False
+
+        self._reset_vertex_selection_gesture()
+        self._push_undo_state(CANVAS_SNAPSHOT_ACTION_GENERATED_WALLS)
+        self.vertex_data.copy_from(preview.to_vertex_data())
+        self.active_vertex_id = None
+        self.set_selected_vertex_ids(())
+        self.preview_point = None
+        self.preview_guides = []
+        self._reset_pointer_state()
+        self._generated_wall_preview = None
+        self.geometry_changed.emit()
+        self.update()
+        return True
+
     def _load_level_comparison_image(self, image_path: str) -> QImage:
         """Reuse a decoded adjacent plan until its file revision changes."""
 
@@ -836,6 +989,8 @@ class BlueprintCanvas(QWidget):
         next_revision = _build_blueprint_image_revision(self.blueprint_path)
         if next_revision == self._blueprint_image_revision:
             return False
+        self.stop_plan_image_erasing()
+        self._reset_vertex_selection_gesture()
         if not _blueprint_revision_has_file(next_revision):
             self.blueprint_image = None
             self._blueprint_image_revision = next_revision
@@ -853,12 +1008,350 @@ class BlueprintCanvas(QWidget):
         self.update()
         return True
 
+    def load_blueprint_image_preserving_view(self, file_path: str) -> bool:
+        """Load one exact image revision without resetting Canvas edit state."""
+
+        normalized_path = str(Path(file_path).expanduser().resolve())
+        revision_before = _build_blueprint_image_revision(normalized_path)
+        if not _blueprint_revision_has_file(revision_before):
+            return False
+        try:
+            blueprint_image = _load_qimage_from_path(normalized_path)
+        except (OSError, ValueError):
+            return False
+        revision_after = _build_blueprint_image_revision(normalized_path)
+        if revision_before != revision_after:
+            return False
+
+        self.stop_plan_image_erasing()
+        self._reset_vertex_selection_gesture()
+        self.blueprint_image = blueprint_image
+        self.blueprint_path = normalized_path
+        self._blueprint_image_revision = revision_after
+        self.update()
+        return True
+
+    # ### Plan-image erasing ###
+    def start_plan_image_erasing(self, output_path: str | Path) -> bool:
+        """Enter persistent erase mode with one owner-provided output revision."""
+
+        if self.blueprint_image is None or self.blueprint_path is None:
+            return False
+        current_revision = _build_blueprint_image_revision(self.blueprint_path)
+        if (
+            not _blueprint_revision_has_file(current_revision)
+            or current_revision != self._blueprint_image_revision
+        ):
+            return False
+
+        self.cancel_open_space_placement()
+        self._cancel_stair_placement_for_other_mode()
+        self._reset_doorway_placement()
+        self._reset_doorway_pointer_state()
+        self._clear_active_vertex_chain_for_selection()
+        self._reset_vertex_selection_gesture()
+        self._reset_plan_image_erase_selection()
+        self.set_plan_image_erase_output_path(output_path)
+        if not self._plan_image_erase_active:
+            self._plan_image_erase_active = True
+            self.plan_image_erase_mode_changed.emit(True)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.update()
+        return True
+
+    def stop_plan_image_erasing(self) -> bool:
+        """Exit erase mode and discard any uncommitted rectangle selection."""
+
+        if not self._plan_image_erase_active:
+            self._reset_plan_image_erase_selection()
+            self._plan_image_erase_output_path = None
+            return False
+
+        self._reset_plan_image_erase_selection()
+        self._plan_image_erase_active = False
+        self._plan_image_erase_output_path = None
+        if (
+            self.pending_doorway_preset is None
+            and not self._is_stair_placement_active()
+            and not self._open_space_placement_active
+        ):
+            self.unsetCursor()
+        self.plan_image_erase_mode_changed.emit(False)
+        self.update()
+        return True
+
+    def is_plan_image_erasing(self) -> bool:
+        """Return whether left drags currently select plan-image pixels to erase."""
+
+        return self._plan_image_erase_active
+
+    def set_plan_image_erase_output_path(self, output_path: str | Path) -> None:
+        """Supply the unused PNG path consumed by the next changed selection."""
+
+        normalized_path = _normalize_plan_image_erase_output_path(output_path)
+        if self.blueprint_path is not None and normalized_path == Path(
+            self.blueprint_path
+        ).resolve():
+            raise ValueError("The erased plan must use a new image path.")
+        if normalized_path.exists():
+            raise ValueError("The erased plan output path already exists.")
+        self._plan_image_erase_output_path = normalized_path
+
+    def _begin_plan_image_erase_selection(
+        self,
+        image_point: QPointF,
+        widget_point: QPointF,
+    ) -> bool:
+        """Capture the source revision and begin a non-destructive marquee."""
+
+        output_path = self._plan_image_erase_output_path
+        previous_path = self.blueprint_path
+        previous_revision = self._blueprint_image_revision
+        if output_path is None:
+            self.plan_image_erase_failed.emit(
+                "No output path is available for the next erased plan image."
+            )
+            return False
+        if self.blueprint_image is None or previous_path is None:
+            self.plan_image_erase_failed.emit("No plan image is available to erase.")
+            return False
+        current_revision = _build_blueprint_image_revision(previous_path)
+        if (
+            previous_revision is None
+            or current_revision != previous_revision
+            or not _blueprint_revision_has_file(current_revision)
+        ):
+            self.plan_image_erase_failed.emit(
+                "The plan image changed before the erase selection could begin."
+            )
+            return False
+
+        self._plan_image_erase_baseline_image = self.blueprint_image.copy()
+        self._plan_image_erase_previous_path = previous_path
+        self._plan_image_erase_previous_revision = previous_revision
+        self._plan_image_erase_selection_start = QPointF(image_point)
+        self._plan_image_erase_selection_current = QPointF(image_point)
+        self._plan_image_erase_press_widget = QPointF(widget_point)
+        self.update()
+        return True
+
+    def _continue_plan_image_erase_selection(self, image_point: QPointF) -> None:
+        """Update the clamped image-space corner of the active marquee."""
+
+        if self._plan_image_erase_selection_start is None:
+            return
+        self._plan_image_erase_selection_current = QPointF(image_point)
+        self.update()
+
+    def _finish_plan_image_erase_selection(self, widget_point: QPointF) -> bool:
+        """Erase and atomically persist one meaningfully sized marquee."""
+
+        baseline = self._plan_image_erase_baseline_image
+        start_point = self._plan_image_erase_selection_start
+        end_point = self._plan_image_erase_selection_current
+        press_widget = self._plan_image_erase_press_widget
+        output_path = self._plan_image_erase_output_path
+        previous_path = self._plan_image_erase_previous_path
+        previous_revision = self._plan_image_erase_previous_revision
+        if (
+            baseline is None
+            or start_point is None
+            or end_point is None
+            or press_widget is None
+        ):
+            return False
+
+        if (
+            abs(widget_point.x() - press_widget.x()) < DRAG_THRESHOLD_SCREEN
+            or abs(widget_point.y() - press_widget.y()) < DRAG_THRESHOLD_SCREEN
+        ):
+            self._reset_plan_image_erase_selection()
+            self.update()
+            return False
+
+        image = baseline.copy()
+        erase_rect = _build_plan_image_erase_rect(
+            start_point,
+            end_point,
+            image.width(),
+            image.height(),
+        )
+        if erase_rect.isEmpty():
+            self._reset_plan_image_erase_selection()
+            self.update()
+            return False
+        image_painter = QPainter(image)
+        image_painter.fillRect(erase_rect, Qt.GlobalColor.white)
+        image_painter.end()
+        if image == baseline:
+            self._reset_plan_image_erase_selection()
+            self.update()
+            return False
+
+        self._plan_image_erase_output_path = None
+        output_was_created = False
+        try:
+            if output_path is None:
+                raise ValueError(
+                    "No output path is available for the erased plan image."
+                )
+            if previous_path is None or previous_revision is None:
+                raise ValueError("The previous plan image revision is unavailable.")
+            _save_plan_image_png_atomically(image, output_path)
+            output_was_created = True
+            replacement_revision = _build_blueprint_image_revision(
+                str(output_path)
+            )
+            if not _blueprint_revision_has_file(replacement_revision):
+                raise OSError("The erased plan image could not be verified.")
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            if output_was_created and output_path is not None:
+                try:
+                    output_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            self._reset_plan_image_erase_selection()
+            self.plan_image_erase_failed.emit(str(error))
+            self.update()
+            return False
+
+        self.blueprint_image = image
+        self.blueprint_path = str(output_path)
+        self._blueprint_image_revision = replacement_revision
+        commit = PlanImageEraseCommit(
+            previous_path=previous_path,
+            replacement_path=str(output_path),
+            previous_revision=previous_revision,
+            replacement_revision=replacement_revision,
+            image_size_pixels=(float(image.width()), float(image.height())),
+        )
+        self._reset_plan_image_erase_selection()
+        self.plan_image_erase_committed.emit(commit)
+        self.update()
+        return True
+
+    def _reset_plan_image_erase_selection(self) -> None:
+        """Clear the transient non-destructive erase marquee."""
+
+        self._plan_image_erase_baseline_image = None
+        self._plan_image_erase_previous_path = None
+        self._plan_image_erase_previous_revision = None
+        self._plan_image_erase_selection_start = None
+        self._plan_image_erase_selection_current = None
+        self._plan_image_erase_press_widget = None
+
+    # ### Vertex marquee selection ###
+    def _begin_vertex_selection_gesture(
+        self,
+        image_point: QPointF,
+        widget_point: QPointF,
+        *,
+        additive: bool,
+        pending_blank_vertex_point: tuple[float, float] | None,
+    ) -> None:
+        """Arm a click-or-marquee gesture without changing geometry."""
+
+        self._reset_vertex_selection_gesture()
+        self._vertex_selection_start_image = QPointF(image_point)
+        self._vertex_selection_current_image = QPointF(image_point)
+        self._vertex_selection_press_widget = QPointF(widget_point)
+        self._vertex_selection_initial_ids = self.selected_vertex_ids
+        self._vertex_selection_additive = bool(additive)
+        self._pending_blank_vertex_point = pending_blank_vertex_point
+
+    def _update_vertex_selection_gesture(self, widget_point: QPointF) -> None:
+        """Update a candidate gesture and promote a real drag to a marquee."""
+
+        if (
+            self._vertex_selection_start_image is None
+            or self._vertex_selection_press_widget is None
+        ):
+            return
+        self._vertex_selection_current_image = self._widget_to_image_clamped(
+            widget_point
+        )
+        if self._vertex_selection_drag_active:
+            self.update()
+            return
+
+        distance = math.hypot(
+            widget_point.x() - self._vertex_selection_press_widget.x(),
+            widget_point.y() - self._vertex_selection_press_widget.y(),
+        )
+        if distance < DRAG_THRESHOLD_SCREEN:
+            return
+
+        self._vertex_selection_drag_active = True
+        self._pending_blank_vertex_point = None
+        self._clear_active_vertex_chain_for_selection()
+        self.update()
+
+    def _finish_vertex_selection_gesture(self, widget_point: QPointF) -> bool:
+        """Complete one blank click or select vertices inside a dragged box."""
+
+        start_point = self._vertex_selection_start_image
+        if start_point is None:
+            return False
+        self._update_vertex_selection_gesture(widget_point)
+        current_point = self._vertex_selection_current_image
+        is_marquee = self._vertex_selection_drag_active
+        additive = self._vertex_selection_additive
+        initial_ids = self._vertex_selection_initial_ids
+        pending_blank_vertex_point = self._pending_blank_vertex_point
+        self._reset_vertex_selection_gesture()
+
+        if is_marquee and current_point is not None:
+            selection_rect = QRectF(start_point, current_point).normalized()
+            enclosed_ids = tuple(
+                vertex.id
+                for vertex in self.vertex_data.vertices
+                if selection_rect.contains(QPointF(vertex.x, vertex.y))
+            )
+            if additive:
+                selected_ids = list(initial_ids)
+                selected_ids.extend(
+                    vertex_id
+                    for vertex_id in enclosed_ids
+                    if vertex_id not in initial_ids
+                )
+                self.set_selected_vertex_ids(selected_ids)
+            else:
+                self.set_selected_vertex_ids(enclosed_ids)
+            self.update()
+            return True
+
+        if pending_blank_vertex_point is not None and not additive:
+            self._begin_wall_vertex_interaction()
+            try:
+                self._handle_new_vertex_click(pending_blank_vertex_point)
+            finally:
+                self._finish_wall_vertex_interaction()
+            self.update()
+        return True
+
+    def _reset_vertex_selection_gesture(self) -> bool:
+        """Discard the transient click-or-marquee gesture state."""
+
+        had_gesture = self._vertex_selection_start_image is not None
+        self._vertex_selection_start_image = None
+        self._vertex_selection_current_image = None
+        self._vertex_selection_press_widget = None
+        self._vertex_selection_initial_ids = ()
+        self._vertex_selection_additive = False
+        self._vertex_selection_drag_active = False
+        self._pending_blank_vertex_point = None
+        if had_gesture:
+            self.update()
+        return had_gesture
+
     # ### Open-space placement ###
     def start_open_space_placement(self) -> bool:
         """Start a one-shot rectangle drag for the current level."""
 
         if self.blueprint_image is None:
             return False
+        self.stop_plan_image_erasing()
+        self._reset_vertex_selection_gesture()
         if self._open_space_placement_active:
             self.setCursor(Qt.CursorShape.CrossCursor)
             return True
@@ -942,6 +1435,8 @@ class BlueprintCanvas(QWidget):
     ) -> None:
         """Start endpoint placement followed by optional curve refinement."""
 
+        self.stop_plan_image_erasing()
+        self._reset_vertex_selection_gesture()
         self.cancel_open_space_placement()
         if self._is_stair_placement_active():
             # The Add/Confirm button and level changes can both revisit this
@@ -1049,6 +1544,9 @@ class BlueprintCanvas(QWidget):
         pending_placement = _coerce_pending_stair_placement(placement)
         if placement is not None and pending_placement is None:
             return False
+        if pending_placement is not None:
+            self.stop_plan_image_erasing()
+            self._reset_vertex_selection_gesture()
 
         self.pending_stair_placement = pending_placement
         self.pending_stair_draft = None
@@ -1085,6 +1583,8 @@ class BlueprintCanvas(QWidget):
 
     def start_doorway_placement(self, preset: DoorwayPreset) -> None:
         """Begin placing one doorway using the selected hole dimensions."""
+        self.stop_plan_image_erasing()
+        self._reset_vertex_selection_gesture()
         self.cancel_open_space_placement()
         self._cancel_stair_placement_for_other_mode()
         self.active_vertex_id = None
@@ -1114,6 +1614,8 @@ class BlueprintCanvas(QWidget):
         canvas_offset_y_pixels: float,
         blueprint_revision: tuple[object, ...] | None,
     ) -> None:
+        self.stop_plan_image_erasing()
+        self._reset_vertex_selection_gesture()
         self.blueprint_image = blueprint_image
         self.blueprint_path = blueprint_path
         self._blueprint_image_revision = blueprint_revision
@@ -1132,6 +1634,7 @@ class BlueprintCanvas(QWidget):
             canvas_offset_y_pixels
         )
         self._level_comparison_overlay = None
+        self._generated_wall_preview = None
         self._wall_mirror_vertex_ids = frozenset()
         self.active_vertex_id = None
         self.selected_vertex_id = None
@@ -1158,6 +1661,7 @@ class BlueprintCanvas(QWidget):
         self.update()
 
     def undo_last_step(self) -> None:
+        self._reset_vertex_selection_gesture()
         if self.cancel_open_space_placement():
             return
         if not self.undo_stack:
@@ -1171,6 +1675,7 @@ class BlueprintCanvas(QWidget):
 
         if not isinstance(snapshot, CanvasSnapshot):
             raise TypeError("Canvas undo history contains an invalid snapshot.")
+        self._reset_vertex_selection_gesture()
         previous_vertex_data = self.vertex_data.clone()
         previous_rooms = copy.deepcopy(self.rooms)
         previous_doorways = copy.deepcopy(self.doorways)
@@ -1221,6 +1726,20 @@ class BlueprintCanvas(QWidget):
         return False
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if (
+            event.key() == Qt.Key.Key_Escape
+            and self.stop_plan_image_erasing()
+        ):
+            event.accept()
+            return
+
+        if (
+            event.key() == Qt.Key.Key_Escape
+            and self._reset_vertex_selection_gesture()
+        ):
+            event.accept()
+            return
+
         if (
             event.key() == Qt.Key.Key_Escape
             and self.cancel_open_space_placement()
@@ -1286,6 +1805,13 @@ class BlueprintCanvas(QWidget):
             super().wheelEvent(event)
             return
 
+        if (
+            self._plan_image_erase_selection_start is not None
+            or self._vertex_selection_start_image is not None
+        ):
+            event.accept()
+            return
+
         wheel_delta = event.angleDelta().y()
         if wheel_delta == 0:
             wheel_delta = event.pixelDelta().y()
@@ -1302,6 +1828,21 @@ class BlueprintCanvas(QWidget):
 
         if self.blueprint_image is None:
             super().mousePressEvent(event)
+            return
+
+        if (
+            event.button() == Qt.MouseButton.RightButton
+            and self._plan_image_erase_active
+        ):
+            self.stop_plan_image_erasing()
+            event.accept()
+            return
+
+        if (
+            event.button() == Qt.MouseButton.RightButton
+            and self._reset_vertex_selection_gesture()
+        ):
+            event.accept()
             return
 
         if event.button() == Qt.MouseButton.RightButton:
@@ -1326,12 +1867,28 @@ class BlueprintCanvas(QWidget):
             return
 
         if event.button() == Qt.MouseButton.MiddleButton:
+            if (
+                self._plan_image_erase_selection_start is not None
+                or self._vertex_selection_start_image is not None
+            ):
+                event.accept()
+                return
             self._start_panning(event.position())
             event.accept()
             return
 
         if event.button() != Qt.MouseButton.LeftButton:
             super().mousePressEvent(event)
+            return
+
+        if self._plan_image_erase_active:
+            image_point = self._widget_to_image(event.position())
+            if image_point is not None:
+                self._begin_plan_image_erase_selection(
+                    image_point,
+                    event.position(),
+                )
+            event.accept()
             return
 
         if self._open_space_placement_active:
@@ -1387,6 +1944,24 @@ class BlueprintCanvas(QWidget):
 
         self.selected_stair_index = None
         self.selected_stair_endpoint_name = None
+        hit_vertex = self._find_vertex_at(event.position())
+        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            self._clear_active_vertex_chain_for_selection()
+            if hit_vertex is not None:
+                self.select_vertex(hit_vertex.id, additive=True)
+            else:
+                image_point = self._widget_to_image(event.position())
+                if image_point is not None:
+                    self._begin_vertex_selection_gesture(
+                        image_point,
+                        event.position(),
+                        additive=True,
+                        pending_blank_vertex_point=None,
+                    )
+            self.update()
+            event.accept()
+            return
+
         if self._find_window_at(event.position()) is not None:
             self._set_selected_doorway_index(None)
             self.selected_vertex_id = None
@@ -1416,7 +1991,11 @@ class BlueprintCanvas(QWidget):
                 None if nearest_wall is None else nearest_wall.edge
             )
             self.doorway_drag_width_side_sign = doorway_hit.width_side_sign
-            if self.doorway_drag_width_side_sign:
+            self.doorway_drag_depth_side_sign = doorway_hit.depth_side_sign
+            if (
+                self.doorway_drag_width_side_sign
+                or self.doorway_drag_depth_side_sign
+            ):
                 self.doorway_resize_drag_started.emit()
             else:
                 self.doorway_move_drag_started.emit()
@@ -1425,15 +2004,6 @@ class BlueprintCanvas(QWidget):
             return
 
         self._set_selected_doorway_index(None)
-        hit_vertex = self._find_vertex_at(event.position())
-        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-            self._clear_active_vertex_chain_for_selection()
-            if hit_vertex is not None:
-                self.select_vertex(hit_vertex.id, additive=True)
-            self.update()
-            event.accept()
-            return
-
         if hit_vertex is not None:
             self._begin_wall_vertex_interaction()
             self.selected_vertex_id = hit_vertex.id
@@ -1468,8 +2038,12 @@ class BlueprintCanvas(QWidget):
             return
 
         snap_preview = self._build_connection_preview(image_point, event.modifiers())
-        self._begin_wall_vertex_interaction()
-        self._handle_new_vertex_click(snap_preview.point)
+        self._begin_vertex_selection_gesture(
+            image_point,
+            event.position(),
+            additive=False,
+            pending_blank_vertex_point=snap_preview.point,
+        )
 
         self.update()
         event.accept()
@@ -1481,6 +2055,18 @@ class BlueprintCanvas(QWidget):
 
         if self.is_panning and event.buttons() & Qt.MouseButton.MiddleButton:
             self._update_pan(event.position())
+            event.accept()
+            return
+
+        if self._plan_image_erase_active:
+            if (
+                self._plan_image_erase_selection_start is not None
+                and event.buttons() & Qt.MouseButton.LeftButton
+            ):
+                self._continue_plan_image_erase_selection(
+                    self._widget_to_image_clamped(event.position())
+                )
+            self.update()
             event.accept()
             return
 
@@ -1527,6 +2113,12 @@ class BlueprintCanvas(QWidget):
             event.accept()
             return
 
+        if self._vertex_selection_start_image is not None:
+            if event.buttons() & Qt.MouseButton.LeftButton:
+                self._update_vertex_selection_gesture(event.position())
+            event.accept()
+            return
+
         if (
             self._pressed_stair_hit is not None
             and event.buttons() & Qt.MouseButton.LeftButton
@@ -1546,6 +2138,8 @@ class BlueprintCanvas(QWidget):
                 image_point = self._widget_to_image_clamped(event.position())
                 if self.doorway_drag_width_side_sign:
                     self._resize_dragged_doorway_width(image_point)
+                elif self.doorway_drag_depth_side_sign:
+                    self._resize_dragged_doorway_depth(image_point)
                 else:
                     self._move_dragged_doorway(image_point)
                 self.update()
@@ -1609,9 +2203,28 @@ class BlueprintCanvas(QWidget):
 
             if (
                 event.button() == Qt.MouseButton.LeftButton
+                and self._plan_image_erase_active
+            ):
+                if self._plan_image_erase_selection_start is not None:
+                    self._continue_plan_image_erase_selection(
+                        self._widget_to_image_clamped(event.position())
+                    )
+                    self._finish_plan_image_erase_selection(event.position())
+                event.accept()
+                return
+
+            if (
+                event.button() == Qt.MouseButton.LeftButton
                 and self._open_space_placement_active
             ):
                 self._finish_open_space_drag(event.position())
+                event.accept()
+                return
+
+            if (
+                event.button() == Qt.MouseButton.LeftButton
+                and self._finish_vertex_selection_gesture(event.position())
+            ):
                 event.accept()
                 return
 
@@ -1683,6 +2296,7 @@ class BlueprintCanvas(QWidget):
             self.pending_doorway_preset is None
             and not self._is_stair_placement_active()
             and not self._open_space_placement_active
+            and not self._plan_image_erase_active
         ):
             self.unsetCursor()
         super().leaveEvent(event)
@@ -1702,6 +2316,7 @@ class BlueprintCanvas(QWidget):
 
         self._paint_open_spaces(painter)
         self._paint_edges(painter)
+        self._paint_generated_wall_preview(painter)
         self._paint_selected_wall(painter)
         self._paint_windows(painter)
         self._paint_doorways(painter)
@@ -1714,6 +2329,73 @@ class BlueprintCanvas(QWidget):
         self._paint_pending_open_space(painter)
         self._paint_camera_indicator(painter)
         self._paint_level_comparison_overlay(painter)
+        self._paint_vertex_selection_marquee(painter)
+        self._paint_plan_image_erase_selection(painter)
+
+    def _paint_vertex_selection_marquee(self, painter: QPainter) -> None:
+        """Draw the active vertex-selection rectangle above the Canvas scene."""
+
+        start_point = self._vertex_selection_start_image
+        current_point = self._vertex_selection_current_image
+        if (
+            not self._vertex_selection_drag_active
+            or start_point is None
+            or current_point is None
+        ):
+            return
+        start_widget = self._image_to_widget(start_point.x(), start_point.y())
+        current_widget = self._image_to_widget(
+            current_point.x(),
+            current_point.y(),
+        )
+        selection_rect = QRectF(start_widget, current_widget).normalized()
+        painter.save()
+        painter.setBrush(VERTEX_SELECTION_FILL_COLOR)
+        painter.setPen(
+            QPen(VERTEX_SELECTION_OUTLINE_SHADOW_COLOR, 3.0)
+        )
+        painter.drawRect(selection_rect)
+        outline_pen = QPen(
+            VERTEX_SELECTION_OUTLINE_COLOR,
+            1.0,
+            Qt.PenStyle.DashLine,
+        )
+        outline_pen.setDashPattern([5.0, 3.0])
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(outline_pen)
+        painter.drawRect(selection_rect)
+        painter.restore()
+
+    def _paint_plan_image_erase_selection(self, painter: QPainter) -> None:
+        """Draw the translucent, image-clamped erase marquee."""
+
+        start_point = self._plan_image_erase_selection_start
+        end_point = self._plan_image_erase_selection_current
+        if (
+            not self._plan_image_erase_active
+            or start_point is None
+            or end_point is None
+        ):
+            return
+        start_widget = self._image_to_widget(start_point.x(), start_point.y())
+        end_widget = self._image_to_widget(end_point.x(), end_point.y())
+        selection_rect = QRectF(start_widget, end_widget).normalized()
+        painter.save()
+        painter.setBrush(PLAN_IMAGE_ERASE_SELECTION_FILL_COLOR)
+        painter.setPen(
+            QPen(PLAN_IMAGE_ERASE_SELECTION_OUTLINE_SHADOW_COLOR, 3.0)
+        )
+        painter.drawRect(selection_rect)
+        outline_pen = QPen(
+            PLAN_IMAGE_ERASE_SELECTION_OUTLINE_COLOR,
+            1.0,
+            Qt.PenStyle.DashLine,
+        )
+        outline_pen.setDashPattern([5.0, 3.0])
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(outline_pen)
+        painter.drawRect(selection_rect)
+        painter.restore()
 
     # ### Open-space editing and painting ###
     def _finish_open_space_drag(self, widget_point: QPointF) -> bool:
@@ -2687,7 +3369,10 @@ class BlueprintCanvas(QWidget):
 
     def _reset_doorway_pointer_state(self) -> None:
         drag_was_active = self.pressed_doorway_index is not None
-        resize_was_active = bool(self.doorway_drag_width_side_sign)
+        resize_was_active = bool(
+            self.doorway_drag_width_side_sign
+            or self.doorway_drag_depth_side_sign
+        )
         drag_changed = self.doorway_drag_changed
         if (
             drag_changed
@@ -2709,6 +3394,7 @@ class BlueprintCanvas(QWidget):
         self.doorway_drag_initial_doorway = None
         self.doorway_drag_wall_edge = None
         self.doorway_drag_width_side_sign = 0.0
+        self.doorway_drag_depth_side_sign = 0.0
         self.doorway_drag_changed = False
         if drag_was_active:
             if resize_was_active:
@@ -2736,7 +3422,13 @@ class BlueprintCanvas(QWidget):
                 width_handle_tolerance_pixels=self._screen_distance_to_image(
                     DOORWAY_WIDTH_HANDLE_HIT_RADIUS_SCREEN
                 ),
+                depth_handle_tolerance_pixels=self._screen_distance_to_image(
+                    DOORWAY_DEPTH_HANDLE_HIT_RADIUS_SCREEN
+                ),
                 include_width_handles=(
+                    doorway_index == self.selected_doorway_index
+                ),
+                include_depth_handles=(
                     doorway_index == self.selected_doorway_index
                 ),
             )
@@ -2744,6 +3436,7 @@ class BlueprintCanvas(QWidget):
                 return DoorwayHit(
                     doorway_index=doorway_index,
                     width_side_sign=doorway_hit.width_side_sign,
+                    depth_side_sign=doorway_hit.depth_side_sign,
                 )
 
         return None
@@ -2757,6 +3450,12 @@ class BlueprintCanvas(QWidget):
             doorway = self.doorways[doorway_hit.doorway_index]
             self._set_directional_resize_cursor(
                 *self._get_doorway_width_direction(doorway)
+            )
+            return
+        if doorway_hit.depth_side_sign:
+            doorway = self.doorways[doorway_hit.doorway_index]
+            self._set_directional_resize_cursor(
+                *self._get_doorway_depth_direction(doorway)
             )
             return
         self.setCursor(Qt.CursorShape.OpenHandCursor)
@@ -2798,7 +3497,10 @@ class BlueprintCanvas(QWidget):
         doorway_index = self.pressed_doorway_index
         if doorway_index is None or not (0 <= doorway_index < len(self.doorways)):
             return
-        if self.doorway_drag_wall_edge is None:
+        if (
+            self.doorway_drag_wall_edge is None
+            and not self.doorway_drag_depth_side_sign
+        ):
             return
 
         self.drag_doorway_index = doorway_index
@@ -2806,6 +3508,11 @@ class BlueprintCanvas(QWidget):
             doorway = self.doorways[doorway_index]
             self._set_directional_resize_cursor(
                 *self._get_doorway_width_direction(doorway)
+            )
+        elif self.doorway_drag_depth_side_sign:
+            doorway = self.doorways[doorway_index]
+            self._set_directional_resize_cursor(
+                *self._get_doorway_depth_direction(doorway)
             )
         else:
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
@@ -2878,9 +3585,18 @@ class BlueprintCanvas(QWidget):
             (image_point.x() - start_vertex.x) * tangent_x
             + (image_point.y() - start_vertex.y) * tangent_y
         )
-        desired_width_pixels = side_direction * (
+        visual_distance_pixels = side_direction * (
             cursor_position - anchored_position
         )
+        minimum_visual_half_width = self._screen_distance_to_image(
+            DOORWAY_WIDTH_HANDLE_MINIMUM_OFFSET_SCREEN
+        )
+        if visual_distance_pixels >= minimum_visual_half_width * 2.0:
+            desired_width_pixels = visual_distance_pixels
+        else:
+            desired_width_pixels = 2.0 * (
+                visual_distance_pixels - minimum_visual_half_width
+            )
         width_pixels = min(
             max(desired_width_pixels, minimum_width_pixels),
             maximum_width_pixels,
@@ -2892,6 +3608,79 @@ class BlueprintCanvas(QWidget):
             center_x=start_vertex.x + tangent_x * center_position,
             center_y=start_vertex.y + tangent_y * center_position,
             width_meters=width_pixels * PIXEL_TO_METER,
+        )
+        if resized_doorway == self.doorways[doorway_index]:
+            return
+        if not self.doorway_drag_changed:
+            self._push_undo_state()
+        self.doorways[doorway_index] = resized_doorway
+        self.doorway_drag_changed = True
+        self.doorway_dimension_preview_changed.emit()
+
+    def _resize_dragged_doorway_depth(self, image_point: QPointF) -> None:
+        """Move one depth side while keeping the opposite cut edge anchored."""
+
+        doorway_index = self.drag_doorway_index
+        initial_doorway = self.doorway_drag_initial_doorway
+        side_sign = self.doorway_drag_depth_side_sign
+        if (
+            doorway_index is None
+            or not (0 <= doorway_index < len(self.doorways))
+            or initial_doorway is None
+            or not side_sign
+        ):
+            return
+
+        depth_direction_x, depth_direction_y = (
+            self._get_doorway_depth_direction(initial_doorway)
+        )
+        side_direction_x = side_sign * depth_direction_x
+        side_direction_y = side_sign * depth_direction_y
+        initial_depth_pixels = initial_doorway.depth_meters / PIXEL_TO_METER
+        anchored_x = (
+            initial_doorway.center_x
+            - side_direction_x * initial_depth_pixels * 0.5
+        )
+        anchored_y = (
+            initial_doorway.center_y
+            - side_direction_y * initial_depth_pixels * 0.5
+        )
+
+        visual_distance_pixels = (
+            (image_point.x() - anchored_x) * side_direction_x
+            + (image_point.y() - anchored_y) * side_direction_y
+        )
+        minimum_visual_half_depth = self._screen_distance_to_image(
+            DOORWAY_DEPTH_HANDLE_MINIMUM_OFFSET_SCREEN
+        )
+        if visual_distance_pixels >= minimum_visual_half_depth * 2.0:
+            desired_depth_pixels = visual_distance_pixels
+        else:
+            desired_depth_pixels = 2.0 * (
+                visual_distance_pixels - minimum_visual_half_depth
+            )
+
+        minimum_depth_pixels = MIN_DOORWAY_DEPTH_METERS / PIXEL_TO_METER
+        maximum_depth_pixels = min(
+            MAX_DOORWAY_DEPTH_METERS / PIXEL_TO_METER,
+            self._get_image_ray_boundary_distance(
+                (anchored_x, anchored_y),
+                (side_direction_x, side_direction_y),
+            ),
+        )
+        if maximum_depth_pixels < minimum_depth_pixels:
+            return
+        depth_pixels = min(
+            max(desired_depth_pixels, minimum_depth_pixels),
+            maximum_depth_pixels,
+        )
+        moving_x = anchored_x + side_direction_x * depth_pixels
+        moving_y = anchored_y + side_direction_y * depth_pixels
+        resized_doorway = self._copy_doorway_with(
+            initial_doorway,
+            center_x=(anchored_x + moving_x) * 0.5,
+            center_y=(anchored_y + moving_y) * 0.5,
+            depth_meters=depth_pixels * PIXEL_TO_METER,
         )
         if resized_doorway == self.doorways[doorway_index]:
             return
@@ -3158,7 +3947,9 @@ class BlueprintCanvas(QWidget):
         doorway: DoorwayData,
         hit_tolerance_pixels: float,
         width_handle_tolerance_pixels: float = 0.0,
+        depth_handle_tolerance_pixels: float = 0.0,
         include_width_handles: bool = False,
+        include_depth_handles: bool = False,
     ) -> DoorwayHit | None:
         depth_direction_x, depth_direction_y = self._get_doorway_depth_direction(
             doorway
@@ -3175,32 +3966,90 @@ class BlueprintCanvas(QWidget):
         )
         half_depth_pixels = doorway.depth_meters / PIXEL_TO_METER / 2.0
         half_width_pixels = doorway.width_meters / PIXEL_TO_METER / 2.0
+        handle_hits: list[tuple[float, str, float]] = []
         if include_width_handles:
-            nearest_handle: tuple[float, float] | None = None
             for side_sign in (-1.0, 1.0):
-                handle_center = (
-                    doorway.center_x
-                    + side_sign * width_direction_x * half_width_pixels,
-                    doorway.center_y
-                    + side_sign * width_direction_y * half_width_pixels,
+                handle_center = self._get_doorway_width_handle_image_position(
+                    doorway,
+                    side_sign,
                 )
                 handle_distance = self._point_distance(point, handle_center)
-                if nearest_handle is None or handle_distance < nearest_handle[0]:
-                    nearest_handle = (handle_distance, side_sign)
-            if (
-                nearest_handle is not None
-                and nearest_handle[0] <= width_handle_tolerance_pixels
-            ):
-                return DoorwayHit(
-                    doorway_index=-1,
-                    width_side_sign=nearest_handle[1],
+                if handle_distance <= width_handle_tolerance_pixels:
+                    handle_hits.append(
+                        (handle_distance, "width", side_sign)
+                    )
+        if include_depth_handles:
+            for side_sign in (-1.0, 1.0):
+                handle_center = self._get_doorway_depth_handle_image_position(
+                    doorway,
+                    side_sign,
                 )
+                handle_distance = self._point_distance(point, handle_center)
+                if handle_distance <= depth_handle_tolerance_pixels:
+                    handle_hits.append(
+                        (handle_distance, "depth", side_sign)
+                    )
+        if handle_hits:
+            _, handle_axis, side_sign = min(handle_hits, key=lambda hit: hit[0])
+            return DoorwayHit(
+                doorway_index=-1,
+                width_side_sign=(side_sign if handle_axis == "width" else 0.0),
+                depth_side_sign=(side_sign if handle_axis == "depth" else 0.0),
+            )
         if (
             abs(depth_position) > half_depth_pixels + hit_tolerance_pixels
             or abs(width_position) > half_width_pixels + hit_tolerance_pixels
         ):
             return None
         return DoorwayHit(doorway_index=-1)
+
+    def _get_doorway_width_handle_image_position(
+        self,
+        doorway: DoorwayData,
+        side_sign: float,
+    ) -> tuple[float, float]:
+        """Return a separated width-handle center in plan-image coordinates."""
+
+        width_direction_x, width_direction_y = self._get_doorway_width_direction(
+            doorway
+        )
+        half_width_pixels = doorway.width_meters / PIXEL_TO_METER / 2.0
+        visual_half_width_pixels = max(
+            half_width_pixels,
+            self._screen_distance_to_image(
+                DOORWAY_WIDTH_HANDLE_MINIMUM_OFFSET_SCREEN
+            ),
+        )
+        return (
+            doorway.center_x
+            + side_sign * width_direction_x * visual_half_width_pixels,
+            doorway.center_y
+            + side_sign * width_direction_y * visual_half_width_pixels,
+        )
+
+    def _get_doorway_depth_handle_image_position(
+        self,
+        doorway: DoorwayData,
+        side_sign: float,
+    ) -> tuple[float, float]:
+        """Return a separated depth-handle center in plan-image coordinates."""
+
+        depth_direction_x, depth_direction_y = self._get_doorway_depth_direction(
+            doorway
+        )
+        half_depth_pixels = doorway.depth_meters / PIXEL_TO_METER / 2.0
+        visual_half_depth_pixels = max(
+            half_depth_pixels,
+            self._screen_distance_to_image(
+                DOORWAY_DEPTH_HANDLE_MINIMUM_OFFSET_SCREEN
+            ),
+        )
+        return (
+            doorway.center_x
+            + side_sign * depth_direction_x * visual_half_depth_pixels,
+            doorway.center_y
+            + side_sign * depth_direction_y * visual_half_depth_pixels,
+        )
 
     def _get_doorway_depth_direction(
         self,
@@ -3471,6 +4320,36 @@ class BlueprintCanvas(QWidget):
         clamped_x = min(max(x, 0.0), float(self.blueprint_image.width() - 1))
         clamped_y = min(max(y, 0.0), float(self.blueprint_image.height() - 1))
         return clamped_x, clamped_y
+
+    def _get_image_ray_boundary_distance(
+        self,
+        origin: tuple[float, float],
+        direction: tuple[float, float],
+    ) -> float:
+        """Return how far a unit ray can travel before leaving the plan image."""
+
+        if self.blueprint_image is None:
+            return math.inf
+
+        origin_x, origin_y = origin
+        direction_x, direction_y = direction
+        maximum_x = float(self.blueprint_image.width() - 1)
+        maximum_y = float(self.blueprint_image.height() - 1)
+        boundary_distances: list[float] = []
+        if direction_x > 1e-9:
+            boundary_distances.append((maximum_x - origin_x) / direction_x)
+        elif direction_x < -1e-9:
+            boundary_distances.append((0.0 - origin_x) / direction_x)
+        if direction_y > 1e-9:
+            boundary_distances.append((maximum_y - origin_y) / direction_y)
+        elif direction_y < -1e-9:
+            boundary_distances.append((0.0 - origin_y) / direction_y)
+        nonnegative_distances = [
+            distance
+            for distance in boundary_distances
+            if math.isfinite(distance) and distance >= 0.0
+        ]
+        return min(nonnegative_distances, default=0.0)
 
     def _find_vertex_at(self, widget_point: QPointF) -> Vertex | None:
         closest_vertex: Vertex | None = None
@@ -4327,6 +5206,54 @@ class BlueprintCanvas(QWidget):
                 ),
             )
 
+    # ### Generated-wall preview painting ###
+    def _paint_generated_wall_preview(self, painter: QPainter) -> None:
+        """Overlay generated candidates without exposing them to interaction."""
+
+        preview = self._generated_wall_preview
+        if preview is None:
+            return
+
+        vertex_by_id = {vertex.id: vertex for vertex in preview.vertices}
+        visible_vertex_ids: set[int] = set()
+        edge_pen = QPen(
+            GENERATED_WALL_PREVIEW_EDGE_COLOR,
+            GENERATED_WALL_PREVIEW_EDGE_WIDTH_SCREEN,
+        )
+        edge_pen.setCosmetic(True)
+        edge_pen.setStyle(Qt.PenStyle.DashLine)
+        edge_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+
+        painter.save()
+        painter.setPen(edge_pen)
+        for edge in preview.edges:
+            edge_key = _normalize_preview_edge_key(
+                edge.start_vertex_id,
+                edge.end_vertex_id,
+            )
+            if edge_key in preview.existing_edge_keys:
+                continue
+            start_vertex = vertex_by_id[edge.start_vertex_id]
+            end_vertex = vertex_by_id[edge.end_vertex_id]
+            visible_vertex_ids.update(edge_key)
+            painter.drawLine(
+                self._image_to_widget(start_vertex.x, start_vertex.y),
+                self._image_to_widget(end_vertex.x, end_vertex.y),
+            )
+
+        vertex_pen = QPen(GENERATED_WALL_PREVIEW_EDGE_COLOR, 1.5)
+        vertex_pen.setCosmetic(True)
+        painter.setPen(vertex_pen)
+        painter.setBrush(GENERATED_WALL_PREVIEW_VERTEX_COLOR)
+        for vertex_id in visible_vertex_ids:
+            vertex = vertex_by_id[vertex_id]
+            painter.drawEllipse(
+                self._image_to_widget(vertex.x, vertex.y),
+                GENERATED_WALL_PREVIEW_VERTEX_RADIUS_SCREEN,
+                GENERATED_WALL_PREVIEW_VERTEX_RADIUS_SCREEN,
+            )
+        painter.restore()
+
     # ### Selected wall highlight painting ###
     def _paint_selected_wall(self, painter: QPainter) -> None:
         """Overlay the selected semantic wall using its current endpoints."""
@@ -4403,7 +5330,7 @@ class BlueprintCanvas(QWidget):
             painter.setBrush(DOORWAY_FILL_COLOR)
             painter.drawPolygon(self._get_doorway_widget_polygon(doorway))
             if is_selected:
-                self._paint_doorway_width_handles(painter, doorway)
+                self._paint_doorway_resize_handles(painter, doorway)
 
             doorway_center = self._image_to_widget(doorway.center_x, doorway.center_y)
             painter.setPen(QPen(TEXT_COLOR))
@@ -4420,12 +5347,12 @@ class BlueprintCanvas(QWidget):
                 self._get_doorway_label_text(doorway),
             )
 
-    def _paint_doorway_width_handles(
+    def _paint_doorway_resize_handles(
         self,
         painter: QPainter,
         doorway: DoorwayData,
     ) -> None:
-        """Draw fixed-size handles at the two wall-longitudinal doorway ends."""
+        """Draw distinct width and depth handles around a selected doorway."""
 
         width_direction_x, width_direction_y = (
             self._get_doorway_width_direction(doorway)
@@ -4434,19 +5361,58 @@ class BlueprintCanvas(QWidget):
         painter.save()
         handle_pen = QPen(VERTEX_OUTLINE_COLOR, 2.0)
         handle_pen.setCosmetic(True)
+        connector_pen = QPen(SELECTED_DOORWAY_EDGE_COLOR, 1.5)
+        connector_pen.setCosmetic(True)
+        connector_pen.setStyle(Qt.PenStyle.DotLine)
         painter.setPen(handle_pen)
         painter.setBrush(SELECTED_DOORWAY_EDGE_COLOR)
         for side_sign in (-1.0, 1.0):
-            handle_center = self._image_to_widget(
+            actual_side_center = self._image_to_widget(
                 doorway.center_x
                 + side_sign * width_direction_x * half_width_pixels,
                 doorway.center_y
                 + side_sign * width_direction_y * half_width_pixels,
             )
+            handle_center = self._image_to_widget(
+                *self._get_doorway_width_handle_image_position(
+                    doorway,
+                    side_sign,
+                )
+            )
+            painter.setPen(connector_pen)
+            painter.drawLine(actual_side_center, handle_center)
+            painter.setPen(handle_pen)
             painter.drawEllipse(
                 handle_center,
                 DOORWAY_WIDTH_HANDLE_RADIUS_SCREEN,
                 DOORWAY_WIDTH_HANDLE_RADIUS_SCREEN,
+            )
+
+        depth_direction_x, depth_direction_y = (
+            self._get_doorway_depth_direction(doorway)
+        )
+        half_depth_pixels = doorway.depth_meters / PIXEL_TO_METER * 0.5
+        for side_sign in (-1.0, 1.0):
+            actual_side_center = self._image_to_widget(
+                doorway.center_x
+                + side_sign * depth_direction_x * half_depth_pixels,
+                doorway.center_y
+                + side_sign * depth_direction_y * half_depth_pixels,
+            )
+            handle_image_position = (
+                self._get_doorway_depth_handle_image_position(
+                    doorway,
+                    side_sign,
+                )
+            )
+            handle_center = self._image_to_widget(*handle_image_position)
+            painter.setPen(connector_pen)
+            painter.drawLine(actual_side_center, handle_center)
+            painter.setPen(handle_pen)
+            painter.drawEllipse(
+                handle_center,
+                DOORWAY_DEPTH_HANDLE_RADIUS_SCREEN,
+                DOORWAY_DEPTH_HANDLE_RADIUS_SCREEN,
             )
         painter.restore()
 
@@ -5150,6 +6116,15 @@ class BlueprintCanvas(QWidget):
         painter.drawEllipse(center, VERTEX_RADIUS_SCREEN, VERTEX_RADIUS_SCREEN)
 
 # ### Numeric helpers ###
+def _normalize_preview_edge_key(
+    start_vertex_id: int,
+    end_vertex_id: int,
+) -> tuple[int, int]:
+    """Return one direction-independent generated-wall edge key."""
+
+    return tuple(sorted((int(start_vertex_id), int(end_vertex_id))))
+
+
 def _normalize_stair_style(style: object) -> str:
     normalized_style = str(style).strip().lower()
     if normalized_style in STAIR_STYLES:
@@ -5483,7 +6458,75 @@ def _points_are_coincident(
     ) <= 1e-6
 
 
+def _build_plan_image_erase_rect(
+    start_point: QPointF,
+    end_point: QPointF,
+    image_width: int,
+    image_height: int,
+) -> QRect:
+    """Return the clamped integer pixel rectangle covered by a marquee."""
+
+    minimum_x = min(start_point.x(), end_point.x())
+    maximum_x = max(start_point.x(), end_point.x())
+    minimum_y = min(start_point.y(), end_point.y())
+    maximum_y = max(start_point.y(), end_point.y())
+    left = min(max(0, math.floor(minimum_x)), image_width)
+    top = min(max(0, math.floor(minimum_y)), image_height)
+    right = min(max(0, math.ceil(maximum_x)), image_width)
+    bottom = min(max(0, math.ceil(maximum_y)), image_height)
+    if maximum_x >= float(image_width - 1):
+        right = image_width
+    if maximum_y >= float(image_height - 1):
+        bottom = image_height
+    return QRect(left, top, max(0, right - left), max(0, bottom - top))
+
+
 # ### File helpers ###
+def _normalize_plan_image_erase_output_path(output_path: str | Path) -> Path:
+    """Return one absolute unused PNG path supplied by the owning workspace."""
+
+    if not str(output_path).strip():
+        raise ValueError("The erased plan output path is empty.")
+    normalized_path = Path(output_path).expanduser().resolve()
+    if normalized_path.suffix.lower() != ".png":
+        raise ValueError("The erased plan output path must use the PNG format.")
+    return normalized_path
+
+
+def _save_plan_image_png_atomically(image: QImage, destination: Path) -> None:
+    """Create an immutable PNG revision without exposing a partial file."""
+
+    if image.isNull():
+        raise ValueError("The erased plan image is empty.")
+    if destination.exists():
+        raise ValueError("The erased plan output path already exists.")
+
+    temporary_path: Path | None = None
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, raw_temporary_path = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            dir=str(destination.parent),
+        )
+        os.close(descriptor)
+        temporary_path = Path(raw_temporary_path)
+        if not image.save(str(temporary_path), "PNG"):
+            raise OSError("The erased plan image could not be encoded as PNG.")
+        with temporary_path.open("rb+") as temporary_file:
+            os.fsync(temporary_file.fileno())
+        if destination.exists():
+            raise ValueError("The erased plan output path already exists.")
+        os.replace(temporary_path, destination)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def _build_blueprint_image_revision(
     file_path: str,
 ) -> tuple[object, ...]:

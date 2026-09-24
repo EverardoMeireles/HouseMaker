@@ -93,11 +93,35 @@ class CanvasControlGroupingTests(unittest.TestCase):
         self._assert_group_contains(
             "Levels",
             self.workspace.load_image_button,
+            self.workspace.erase_plan_image_button,
+            self.workspace.generate_walls_button,
+            self.workspace.image_correction_button,
             self.workspace.blueprint_name_label,
             self.workspace.levels_list,
             self.workspace.include_yes_radio,
             self.workspace.include_no_radio,
             labels={"Include"},
+        )
+
+    def test_automatic_wall_controls_share_a_dedicated_group(self) -> None:
+        self._assert_group_contains(
+            "Automatic wall placement",
+            *self.workspace._get_plan_wall_generation_sliders(),
+            self.workspace.plan_wall_generation_status_label,
+        )
+        levels_layout = self.workspace.levels_group.layout()
+        self.assertIsNotNone(levels_layout)
+        assert levels_layout is not None
+        buttons_layout = levels_layout.itemAt(0).layout()
+        self.assertIsNotNone(buttons_layout)
+        assert buttons_layout is not None
+        self.assertEqual(
+            buttons_layout.indexOf(self.workspace.erase_plan_image_button),
+            buttons_layout.indexOf(self.workspace.load_image_button) + 1,
+        )
+        self.assertEqual(
+            buttons_layout.indexOf(self.workspace.generate_walls_button),
+            buttons_layout.indexOf(self.workspace.erase_plan_image_button) + 1,
         )
 
     def test_doorways_group_contains_all_doorway_controls(self) -> None:

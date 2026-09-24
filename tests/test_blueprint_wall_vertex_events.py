@@ -26,6 +26,7 @@ def _send_drag_move(
     canvas: BlueprintCanvas,
     position: QPoint,
     button: Qt.MouseButton = Qt.MouseButton.LeftButton,
+    modifiers: Qt.KeyboardModifier = Qt.KeyboardModifier.NoModifier,
 ) -> None:
     event = QMouseEvent(
         QEvent.Type.MouseMove,
@@ -33,9 +34,32 @@ def _send_drag_move(
         QPointF(canvas.mapToGlobal(position)),
         Qt.MouseButton.NoButton,
         button,
-        Qt.KeyboardModifier.NoModifier,
+        modifiers,
     )
     QApplication.sendEvent(canvas, event)
+
+
+def _drag_canvas(
+    canvas: BlueprintCanvas,
+    start: QPoint,
+    end: QPoint,
+    modifiers: Qt.KeyboardModifier = Qt.KeyboardModifier.NoModifier,
+) -> None:
+    """Send one complete left-button drag with stable keyboard modifiers."""
+
+    QTest.mousePress(
+        canvas,
+        Qt.MouseButton.LeftButton,
+        modifiers,
+        start,
+    )
+    _send_drag_move(canvas, end, modifiers=modifiers)
+    QTest.mouseRelease(
+        canvas,
+        Qt.MouseButton.LeftButton,
+        modifiers,
+        end,
+    )
 
 
 # ### Wall vertex event tests ###
@@ -103,14 +127,8 @@ class BlueprintWallVertexEventTests(unittest.TestCase):
             pos=position,
         )
 
-        self.assertEqual(
-            events,
-            [
-                "interaction:True",
-                "wall_vertex_added",
-                "geometry_changed",
-            ],
-        )
+        self.assertEqual(events, [])
+        self.assertEqual(self.canvas.vertex_data.vertices, [])
 
         QTest.mouseRelease(
             self.canvas,
@@ -118,7 +136,46 @@ class BlueprintWallVertexEventTests(unittest.TestCase):
             pos=position,
         )
 
-        self.assertEqual(events[-1], "interaction:False")
+        self.assertEqual(
+            events,
+            [
+                "interaction:True",
+                "wall_vertex_added",
+                "geometry_changed",
+                "interaction:False",
+            ],
+        )
+        self.assertEqual(len(self.canvas.vertex_data.vertices), 1)
+
+    def test_subthreshold_blank_drag_remains_one_deferred_vertex_click(
+        self,
+    ) -> None:
+        start = self.canvas._image_to_widget(25.0, 40.0).toPoint()
+        end = start + QPoint(2, 1)
+        events = self._record_geometry_events()
+
+        QTest.mousePress(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            pos=start,
+        )
+        _send_drag_move(self.canvas, end)
+
+        self.assertEqual(self.canvas.vertex_data.vertices, [])
+        self.assertEqual(events, [])
+
+        QTest.mouseRelease(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            pos=end,
+        )
+
+        self.assertEqual(len(self.canvas.vertex_data.vertices), 1)
+        self.assertEqual(
+            events,
+            ["wall_vertex_added", "geometry_changed"],
+        )
+        self.assertEqual(len(self.canvas.undo_stack), 1)
 
     def test_new_vertex_on_edge_emits_wall_event_before_geometry_event(
         self,
@@ -336,6 +393,196 @@ class BlueprintWallVertexEventTests(unittest.TestCase):
 
         self.assertEqual(events, [])
         self.assertEqual(interaction_states, [True, False])
+
+    def test_blank_drag_selects_enclosed_vertices_without_editing_geometry(
+        self,
+    ) -> None:
+        vertex_data = VertexData()
+        first = vertex_data.add_vertex(30.0, 30.0)
+        second = vertex_data.add_vertex(45.0, 45.0)
+        outside = vertex_data.add_vertex(75.0, 75.0)
+        self.canvas.vertex_data = vertex_data
+        self.canvas.selected_vertex_id = outside.id
+        self.canvas.active_vertex_id = outside.id
+        original_positions = [
+            (vertex.id, vertex.x, vertex.y)
+            for vertex in vertex_data.vertices
+        ]
+        geometry_events = self._record_geometry_events()
+        interaction_states: list[bool] = []
+        self.canvas.wall_vertex_interaction_changed.connect(
+            interaction_states.append
+        )
+
+        _drag_canvas(
+            self.canvas,
+            self.canvas._image_to_widget(20.0, 20.0).toPoint(),
+            self.canvas._image_to_widget(55.0, 55.0).toPoint(),
+        )
+
+        self.assertEqual(
+            self.canvas.selected_vertex_ids,
+            (first.id, second.id),
+        )
+        self.assertIsNone(self.canvas.active_vertex_id)
+        self.assertEqual(
+            [
+                (vertex.id, vertex.x, vertex.y)
+                for vertex in vertex_data.vertices
+            ],
+            original_positions,
+        )
+        self.assertEqual(vertex_data.edges, [])
+        self.assertEqual(self.canvas.undo_stack, [])
+        self.assertEqual(geometry_events, [])
+        self.assertEqual(interaction_states, [])
+
+    def test_reverse_blank_drag_selects_the_same_vertices(self) -> None:
+        vertex_data = VertexData()
+        first = vertex_data.add_vertex(30.0, 30.0)
+        second = vertex_data.add_vertex(45.0, 45.0)
+        vertex_data.add_vertex(75.0, 75.0)
+        self.canvas.vertex_data = vertex_data
+
+        _drag_canvas(
+            self.canvas,
+            self.canvas._image_to_widget(55.0, 55.0).toPoint(),
+            self.canvas._image_to_widget(20.0, 20.0).toPoint(),
+        )
+
+        self.assertEqual(
+            self.canvas.selected_vertex_ids,
+            (first.id, second.id),
+        )
+
+    def test_shift_blank_drag_adds_enclosed_vertices_in_vertex_order(
+        self,
+    ) -> None:
+        vertex_data = VertexData()
+        first = vertex_data.add_vertex(30.0, 30.0)
+        second = vertex_data.add_vertex(45.0, 45.0)
+        existing = vertex_data.add_vertex(75.0, 75.0)
+        self.canvas.vertex_data = vertex_data
+        self.canvas.selected_vertex_id = existing.id
+
+        _drag_canvas(
+            self.canvas,
+            self.canvas._image_to_widget(20.0, 20.0).toPoint(),
+            self.canvas._image_to_widget(55.0, 55.0).toPoint(),
+            Qt.KeyboardModifier.ShiftModifier,
+        )
+
+        self.assertEqual(
+            self.canvas.selected_vertex_ids,
+            (existing.id, first.id, second.id),
+        )
+        self.assertEqual(self.canvas.selected_vertex_id, second.id)
+        self.assertEqual(vertex_data.edges, [])
+        self.assertEqual(self.canvas.undo_stack, [])
+
+    def test_empty_blank_drag_replaces_or_preserves_selection_by_modifier(
+        self,
+    ) -> None:
+        selected = self.canvas.vertex_data.add_vertex(75.0, 75.0)
+        start = self.canvas._image_to_widget(5.0, 5.0).toPoint()
+        end = self.canvas._image_to_widget(15.0, 15.0).toPoint()
+        self.canvas.selected_vertex_id = selected.id
+
+        _drag_canvas(self.canvas, start, end)
+
+        self.assertEqual(self.canvas.selected_vertex_ids, ())
+        self.canvas.selected_vertex_id = selected.id
+
+        _drag_canvas(
+            self.canvas,
+            start,
+            end,
+            Qt.KeyboardModifier.ShiftModifier,
+        )
+
+        self.assertEqual(self.canvas.selected_vertex_ids, (selected.id,))
+        self.assertEqual(len(self.canvas.vertex_data.vertices), 1)
+
+    def test_blank_drag_selection_respects_canvas_view_transforms(self) -> None:
+        vertex_data = VertexData()
+        first = vertex_data.add_vertex(45.0, 45.0)
+        second = vertex_data.add_vertex(55.0, 55.0)
+        vertex_data.add_vertex(75.0, 75.0)
+        self.canvas.vertex_data = vertex_data
+        self.canvas.canvas_level_scale = 0.75
+        self.canvas.canvas_offset_x_pixels = 30.0
+        self.canvas.canvas_offset_y_pixels = -20.0
+        self.canvas.zoom_scale = 1.35
+        self.canvas.view_offset = QPointF(23.0, -17.0)
+
+        _drag_canvas(
+            self.canvas,
+            self.canvas._image_to_widget(35.0, 35.0).toPoint(),
+            self.canvas._image_to_widget(65.0, 65.0).toPoint(),
+        )
+
+        self.assertEqual(
+            self.canvas.selected_vertex_ids,
+            (first.id, second.id),
+        )
+        self.assertEqual(len(vertex_data.vertices), 3)
+
+    def test_blank_drag_clamps_to_the_plan_bounds(self) -> None:
+        vertex_data = VertexData()
+        before_start = vertex_data.add_vertex(10.0, 10.0)
+        first = vertex_data.add_vertex(35.0, 35.0)
+        second = vertex_data.add_vertex(90.0, 90.0)
+        self.canvas.vertex_data = vertex_data
+        start = self.canvas._image_to_widget(20.0, 20.0).toPoint()
+        outside_plan = (
+            self.canvas._image_display_rect().bottomRight().toPoint()
+            + QPoint(80, 80)
+        )
+
+        _drag_canvas(self.canvas, start, outside_plan)
+
+        self.assertEqual(
+            self.canvas.selected_vertex_ids,
+            (first.id, second.id),
+        )
+        self.assertNotIn(
+            before_start.id,
+            self.canvas.selected_vertex_ids,
+        )
+        self.assertEqual(len(vertex_data.vertices), 3)
+
+    def test_escape_cancels_blank_drag_without_changing_selection_or_geometry(
+        self,
+    ) -> None:
+        vertex_data = VertexData()
+        enclosed = vertex_data.add_vertex(35.0, 35.0)
+        selected = vertex_data.add_vertex(75.0, 75.0)
+        self.canvas.vertex_data = vertex_data
+        self.canvas.selected_vertex_id = selected.id
+        geometry_events = self._record_geometry_events()
+        start = self.canvas._image_to_widget(20.0, 20.0).toPoint()
+        end = self.canvas._image_to_widget(50.0, 50.0).toPoint()
+
+        QTest.mousePress(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            pos=start,
+        )
+        _send_drag_move(self.canvas, end)
+        QTest.keyClick(self.canvas, Qt.Key.Key_Escape)
+        QTest.mouseRelease(
+            self.canvas,
+            Qt.MouseButton.LeftButton,
+            pos=end,
+        )
+
+        self.assertEqual(self.canvas.selected_vertex_ids, (selected.id,))
+        self.assertEqual(
+            [vertex.id for vertex in vertex_data.vertices],
+            [enclosed.id, selected.id],
+        )
+        self.assertEqual(geometry_events, [])
+        self.assertEqual(self.canvas.undo_stack, [])
 
     def test_shift_click_builds_an_ordered_vertex_selection_without_edges(
         self,

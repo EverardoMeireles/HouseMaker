@@ -12,6 +12,8 @@ from shapely.geometry.base import BaseGeometry
 
 from housemaker.floor_geometry import (
     OUTER_ENVELOPE_CLOSING_RADIUS_METERS,
+    _build_linework_footprint,
+    _build_straight_gap_closures,
     build_level_floor_footprint,
     build_level_open_space_geometry,
 )
@@ -24,7 +26,6 @@ from housemaker.models import Edge, LevelData
 # ### Constants ###
 WALL_ORIENTATION_EPSILON = 1e-8
 WALL_SIDE_PROBE_RATIOS = (1e-7, 1e-6, 1e-5, 1e-4, 1e-3)
-WALL_GAP_ALIGNMENT_MINIMUM_DOT = math.cos(math.radians(10.0))
 WALL_PAIR_ALIGNMENT_MINIMUM_DOT = math.cos(math.radians(5.0))
 WALL_PAIR_MAXIMUM_DISTANCE_METERS = 0.6
 WALL_PAIR_MINIMUM_OVERLAP_RATIO = 0.5
@@ -37,7 +38,6 @@ Point2D = tuple[float, float]
 LevelPointTransform = Callable[[float, float], Point2D]
 WorldDirectionToImage = Callable[[Point2D], Point2D | None]
 WallSideCandidate = tuple[np.ndarray, Polygon]
-WallEndpoint = tuple[np.ndarray, np.ndarray, int]
 WallFrame = tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray]
 ParallelWallSpan = tuple[float, Point2D, float, float]
 
@@ -50,6 +50,10 @@ class WallOrientationResolver:
     bounded_cells: tuple[Polygon, ...]
     floor_footprint: BaseGeometry | None
     open_space_geometry: BaseGeometry | None
+    _orientation_footprint: BaseGeometry | None = field(
+        repr=False,
+        compare=False,
+    )
     _cell_tree: STRtree | None = field(repr=False, compare=False)
     _wall_lines: tuple[LineString, ...] = field(repr=False, compare=False)
     _wall_tree: STRtree | None = field(repr=False, compare=False)
@@ -160,7 +164,7 @@ class WallOrientationResolver:
                 midpoint,
                 wall_normal,
                 wall_length,
-                self.floor_footprint,
+                self._orientation_footprint,
             )
 
         paired_wall_normal = self._resolve_paired_wall_normal(
@@ -404,6 +408,14 @@ def build_level_wall_orientation_resolver(
         if floor_footprint is not None
         else _build_level_world_floor_footprint(level, point_to_world)
     )
+    orientation_footprint = resolved_footprint
+    if orientation_footprint is None and lines:
+        # Preserve the legacy broad topology hint only for wall orientation.
+        # Floor and ceiling generation continue to use clustered footprints.
+        orientation_footprint = _build_linework_footprint(
+            shapely.union_all(lines),
+            closing_radius,
+        )
     open_space_geometry = _build_level_world_open_space_geometry(
         level,
         point_to_world,
@@ -413,6 +425,7 @@ def build_level_wall_orientation_resolver(
         bounded_cells=polygons,
         floor_footprint=resolved_footprint,
         open_space_geometry=open_space_geometry,
+        _orientation_footprint=orientation_footprint,
         _cell_tree=STRtree(polygons) if polygons else None,
         _wall_lines=wall_lines,
         _wall_tree=STRtree(wall_lines) if wall_lines else None,
@@ -451,103 +464,6 @@ def _build_orientation_polygons(
             shapely.polygonize(tuple(shapely.get_parts(linework)))
         )
         if isinstance(candidate, Polygon) and candidate.area > WALL_ORIENTATION_EPSILON
-    )
-
-
-def _build_straight_gap_closures(
-    linework: BaseGeometry,
-    maximum_gap: float,
-) -> tuple[LineString, ...]:
-    """Pair nearby dangling endpoints only when their tangents face each other."""
-
-    endpoints = _get_dangling_endpoints(linework)
-    if len(endpoints) < 2:
-        return ()
-    endpoint_points = tuple(Point(*point) for point, _direction, _chain in endpoints)
-    endpoint_tree = STRtree(endpoint_points)
-    candidates: list[tuple[int, float, Point2D, Point2D, int, int]] = []
-    for first_index, (
-        first_point,
-        first_direction,
-        first_chain_index,
-    ) in enumerate(endpoints):
-        nearby_indices = endpoint_tree.query(
-            endpoint_points[first_index],
-            predicate="dwithin",
-            distance=maximum_gap,
-        )
-        for second_index in (
-            int(index) for index in nearby_indices if int(index) > first_index
-        ):
-            second_point, second_direction, second_chain_index = endpoints[second_index]
-            gap_delta = second_point - first_point
-            gap_length = float(np.linalg.norm(gap_delta))
-            if gap_length <= WALL_ORIENTATION_EPSILON or gap_length > maximum_gap:
-                continue
-            gap_direction = gap_delta / gap_length
-            if (
-                float(np.dot(first_direction, gap_direction))
-                < WALL_GAP_ALIGNMENT_MINIMUM_DOT
-                or float(np.dot(second_direction, -gap_direction))
-                < WALL_GAP_ALIGNMENT_MINIMUM_DOT
-            ):
-                continue
-            candidates.append(
-                (
-                    int(first_chain_index != second_chain_index),
-                    gap_length,
-                    _normal_to_tuple(first_point),
-                    _normal_to_tuple(second_point),
-                    first_index,
-                    second_index,
-                )
-            )
-
-    matched_indices: set[int] = set()
-    closures: list[LineString] = []
-    for (
-        _different_chain,
-        _gap_length,
-        first_point,
-        second_point,
-        first_index,
-        second_index,
-    ) in sorted(candidates):
-        if first_index in matched_indices or second_index in matched_indices:
-            continue
-        matched_indices.update((first_index, second_index))
-        closures.append(LineString((first_point, second_point)))
-    return tuple(closures)
-
-
-def _get_dangling_endpoints(
-    linework: BaseGeometry,
-) -> tuple[WallEndpoint, ...]:
-    """Return degree-one endpoints and their outward continuation vectors."""
-
-    occurrences_by_point: dict[Point2D, list[WallEndpoint]] = {}
-    merged_linework = shapely.line_merge(linework)
-    for chain_index, line in enumerate(shapely.get_parts(merged_linework)):
-        if not isinstance(line, LineString):
-            continue
-        coordinates = np.asarray(line.coords, dtype=float)
-        if len(coordinates) < 2:
-            continue
-        for endpoint_index, neighbor_index in ((0, 1), (-1, -2)):
-            point = coordinates[endpoint_index]
-            outward = point - coordinates[neighbor_index]
-            outward_length = float(np.linalg.norm(outward))
-            if outward_length <= WALL_ORIENTATION_EPSILON:
-                continue
-            endpoint = (point, outward / outward_length, chain_index)
-            occurrences_by_point.setdefault(
-                _normal_to_tuple(point),
-                [],
-            ).append(endpoint)
-    return tuple(
-        occurrences[0]
-        for _point, occurrences in sorted(occurrences_by_point.items())
-        if len(occurrences) == 1
     )
 
 

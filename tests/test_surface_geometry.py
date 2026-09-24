@@ -4,7 +4,9 @@ from __future__ import annotations
 import unittest
 
 import numpy as np
+import shapely
 from shapely import Polygon
+from shapely.geometry.base import BaseGeometry
 
 from housemaker.models import (
     DoorwayData,
@@ -18,6 +20,7 @@ from housemaker.surface_geometry import (
     SURFACE_TYPE_CEILING,
     SURFACE_TYPE_FLOOR,
     SURFACE_TYPE_WALL,
+    FixedSurface,
     _build_horizontal_surface,
     build_fixed_surfaces,
     get_combined_surface_area,
@@ -206,11 +209,21 @@ def _build_level_from_segments(
     return LevelData(index=2, name="Ground", vertex_data=vertex_data)
 
 
-def _surface_by_id(level: LevelData) -> dict[str, object]:
+def _surface_by_id(level: LevelData) -> dict[str, FixedSurface]:
     return {
         surface.surface_id: surface
         for surface in build_fixed_surfaces([level])
     }
+
+
+# ### Mesh inspection helpers ###
+def _get_horizontal_surface_plan_geometry(surface: FixedSurface) -> BaseGeometry:
+    """Return one fixed horizontal surface's dissolved plan geometry."""
+
+    mesh = surface.mesh
+    return shapely.union_all(
+        [Polygon(triangle[:, :2]) for triangle in mesh.triangles]
+    )
 
 
 # ### Tests ###
@@ -362,6 +375,74 @@ class FixedSurfaceGeometryTests(unittest.TestCase):
                 "level:2/wall:2:3",
                 "level:2/wall:3:4",
             },
+        )
+
+    def test_floor_and_ceiling_keep_all_closed_components_and_ignore_open_walls(
+        self,
+    ) -> None:
+        level = _build_level_from_segments(
+            (
+                ((0.0, 0.0), (200.0, 0.0)),
+                ((200.0, 0.0), (200.0, 200.0)),
+                ((200.0, 200.0), (0.0, 200.0)),
+                ((0.0, 200.0), (0.0, 0.0)),
+                ((200.0, 200.0), (200.0, 201.0)),
+                ((400.0, 0.0), (450.0, 0.0)),
+                ((450.0, 0.0), (450.0, 50.0)),
+                ((450.0, 50.0), (400.0, 50.0)),
+                ((400.0, 50.0), (400.0, 0.0)),
+                ((600.0, 0.0), (700.0, 0.0)),
+                ((700.0, 0.0), (700.0, 100.0)),
+            )
+        )
+
+        surfaces = _surface_by_id(level)
+
+        floor = surfaces["level:2/floor"]
+        ceiling = surfaces["level:2/ceiling"]
+        floor_geometry = _get_horizontal_surface_plan_geometry(floor)
+        ceiling_geometry = _get_horizontal_surface_plan_geometry(ceiling)
+        for surface, geometry in (
+            (floor, floor_geometry),
+            (ceiling, ceiling_geometry),
+        ):
+            self.assertAlmostEqual(surface.area_square_meters, 17.0)
+            self.assertAlmostEqual(float(geometry.area), 17.0)
+            self.assertEqual(
+                sum(
+                    isinstance(component, Polygon)
+                    for component in shapely.get_parts(geometry)
+                ),
+                2,
+            )
+            self.assertFalse(geometry.covers(shapely.Point(6.0, -0.5)))
+        self.assertAlmostEqual(
+            float(floor_geometry.symmetric_difference(ceiling_geometry).area),
+            0.0,
+        )
+
+    def test_orientation_fallback_does_not_create_horizontal_surfaces(
+        self,
+    ) -> None:
+        level = _build_level_from_segments(
+            (
+                ((10.0, 0.0), (90.0, 0.0)),
+                ((100.0, 10.0), (100.0, 90.0)),
+                ((90.0, 100.0), (10.0, 100.0)),
+                ((0.0, 90.0), (0.0, 10.0)),
+            )
+        )
+
+        surfaces = _surface_by_id(level)
+
+        self.assertNotIn("level:2/floor", surfaces)
+        self.assertNotIn("level:2/ceiling", surfaces)
+        self.assertEqual(
+            sum(
+                surface.surface_type == SURFACE_TYPE_WALL
+                for surface in surfaces.values()
+            ),
+            4,
         )
 
     def test_gapped_outer_walls_share_one_floor_and_ceiling_footprint(

@@ -22,7 +22,6 @@ from housemaker.blueprint_canvas import BlueprintCanvas
 from housemaker.main import BlueprintWorkspace
 from housemaker.models import LevelData, VertexData
 
-
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
 _qt_application.setQuitOnLastWindowClosed(False)
@@ -42,6 +41,13 @@ def _build_level_with_wall(index: int = 2) -> LevelData:
     first = level.vertex_data.add_vertex(10.0, 50.0)
     second = level.vertex_data.add_vertex(90.0, 50.0)
     level.vertex_data.add_edge(first.id, second.id)
+    return level
+
+
+def _build_level_with_disconnected_vertices(index: int = 2) -> LevelData:
+    level = _build_level(index)
+    level.vertex_data.add_vertex(10.0, 50.0)
+    level.vertex_data.add_vertex(90.0, 50.0)
     return level
 
 
@@ -162,8 +168,11 @@ class CanvasWallVertexDelayMainTests(unittest.TestCase):
                 pos=position,
             )
 
-            self.assertEqual(len(canvas.vertex_data.vertices), 1)
-            self._assert_pointer_hold_defers_timer()
+            self.assertEqual(len(canvas.vertex_data.vertices), 0)
+            self.assertFalse(self.workspace._pending_wall_vertex_mesh_update)
+            self.assertFalse(
+                self.workspace._wall_vertex_update_timer.isActive()
+            )
             reconcile_assignments.assert_not_called()
             schedule_refresh.assert_not_called()
 
@@ -173,6 +182,7 @@ class CanvasWallVertexDelayMainTests(unittest.TestCase):
                 pos=position,
             )
 
+        self.assertEqual(len(canvas.vertex_data.vertices), 1)
         self.assertTrue(self.workspace._pending_wall_vertex_mesh_update)
         self.assertTrue(self.workspace._wall_vertex_update_timer.isActive())
         reconcile_assignments.assert_not_called()
@@ -235,6 +245,140 @@ class CanvasWallVertexDelayMainTests(unittest.TestCase):
 
         self.assertTrue(self.workspace._pending_wall_vertex_mesh_update)
         self.assertTrue(timer.isActive())
+
+    def test_moving_existing_vertex_waits_until_release_and_then_debounces(
+        self,
+    ) -> None:
+        level = _build_level_with_wall()
+        self._install_levels([level])
+        canvas = self.workspace.canvas
+        timer = self.workspace._wall_vertex_update_timer
+        start = self._image_position(10.0, 50.0)
+        target = self._image_position(30.0, 30.0)
+
+        with (
+            patch.object(
+                self.workspace.surface_texture_generation,
+                "reconcile_assignments_with_levels",
+                return_value=False,
+            ) as reconcile_assignments,
+            patch.object(
+                self.workspace,
+                "_schedule_viewer_preview_refresh",
+            ) as schedule_refresh,
+        ):
+            QTest.mousePress(
+                canvas,
+                Qt.MouseButton.LeftButton,
+                pos=start,
+            )
+            _send_drag_move(canvas, target)
+
+            moved_vertex = level.vertex_data.vertices[0]
+            self.assertNotEqual((moved_vertex.x, moved_vertex.y), (10.0, 50.0))
+            self.assertFalse(timer.isActive())
+            reconcile_assignments.assert_not_called()
+            schedule_refresh.assert_not_called()
+
+            QTest.mouseRelease(
+                canvas,
+                Qt.MouseButton.LeftButton,
+                pos=target,
+            )
+
+        self.assertTrue(self.workspace._pending_wall_vertex_mesh_update)
+        self.assertTrue(timer.isActive())
+        reconcile_assignments.assert_not_called()
+        schedule_refresh.assert_not_called()
+
+    def test_connecting_existing_vertices_waits_until_release_and_debounces(
+        self,
+    ) -> None:
+        level = _build_level_with_disconnected_vertices()
+        self._install_levels([level])
+        canvas = self.workspace.canvas
+        timer = self.workspace._wall_vertex_update_timer
+        first_position = self._image_position(10.0, 50.0)
+        second_position = self._image_position(90.0, 50.0)
+        first_vertex, second_vertex = level.vertex_data.vertices
+
+        QTest.mouseClick(
+            canvas,
+            Qt.MouseButton.LeftButton,
+            pos=first_position,
+        )
+        self.assertEqual(canvas.active_vertex_id, first_vertex.id)
+        self.assertFalse(self.workspace._pending_wall_vertex_mesh_update)
+        self.assertFalse(timer.isActive())
+
+        with (
+            patch.object(
+                self.workspace.surface_texture_generation,
+                "reconcile_assignments_with_levels",
+                return_value=False,
+            ) as reconcile_assignments,
+            patch.object(
+                self.workspace,
+                "_schedule_viewer_preview_refresh",
+            ) as schedule_refresh,
+        ):
+            QTest.mousePress(
+                canvas,
+                Qt.MouseButton.LeftButton,
+                pos=second_position,
+            )
+
+            self.assertFalse(
+                level.vertex_data.has_edge(first_vertex.id, second_vertex.id)
+            )
+            self.assertFalse(timer.isActive())
+            reconcile_assignments.assert_not_called()
+            schedule_refresh.assert_not_called()
+
+            QTest.mouseRelease(
+                canvas,
+                Qt.MouseButton.LeftButton,
+                pos=second_position,
+            )
+
+        self.assertTrue(
+            level.vertex_data.has_edge(first_vertex.id, second_vertex.id)
+        )
+        self.assertTrue(self.workspace._pending_wall_vertex_mesh_update)
+        self.assertTrue(timer.isActive())
+        reconcile_assignments.assert_not_called()
+        schedule_refresh.assert_not_called()
+
+    def test_existing_vertex_selection_click_does_not_queue_mesh_work(
+        self,
+    ) -> None:
+        level = _build_level_with_wall()
+        self._install_levels([level])
+        canvas = self.workspace.canvas
+        position = self._image_position(10.0, 50.0)
+
+        with (
+            patch.object(
+                self.workspace.surface_texture_generation,
+                "reconcile_assignments_with_levels",
+                return_value=False,
+            ) as reconcile_assignments,
+            patch.object(
+                self.workspace,
+                "_schedule_viewer_preview_refresh",
+            ) as schedule_refresh,
+        ):
+            QTest.mouseClick(
+                canvas,
+                Qt.MouseButton.LeftButton,
+                pos=position,
+            )
+
+        self.assertEqual(canvas.selected_vertex_id, level.vertex_data.vertices[0].id)
+        self.assertFalse(self.workspace._pending_wall_vertex_mesh_update)
+        self.assertFalse(self.workspace._wall_vertex_update_timer.isActive())
+        reconcile_assignments.assert_not_called()
+        schedule_refresh.assert_not_called()
 
     def test_new_vertex_press_without_movement_pauses_until_release(
         self,

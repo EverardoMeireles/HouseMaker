@@ -1,14 +1,20 @@
 # ### Imports ###
 from __future__ import annotations
 
-from io import BytesIO
 import unittest
+from io import BytesIO
 
 import numpy as np
 import shapely
 import trimesh
-from shapely import Polygon
+from shapely import LineString, Polygon
+from shapely.geometry.base import BaseGeometry
 
+from housemaker.floor_geometry import (
+    _build_floor_prism_mesh,
+    _build_straight_gap_closures,
+    _build_wall_linework_clusters,
+)
 from housemaker.glb import convert_to_glb
 from housemaker.models import LevelData, VertexData
 
@@ -87,12 +93,8 @@ def _get_horizontal_cap_metrics(
     mesh: trimesh.Trimesh,
     normal_y_sign: float,
 ) -> tuple[float, float, int]:
+    cap_geometry = _get_horizontal_cap_geometry(mesh, normal_y_sign)
     face_mask = mesh.face_normals[:, 1] * normal_y_sign > 0.9
-    polygons = [
-        Polygon(triangle[:, (0, 2)])
-        for triangle in mesh.triangles[face_mask]
-    ]
-    cap_geometry = shapely.union_all(polygons)
     component_count = sum(
         isinstance(component, Polygon)
         for component in shapely.get_parts(cap_geometry)
@@ -101,6 +103,21 @@ def _get_horizontal_cap_metrics(
         float(np.sum(mesh.area_faces[face_mask])),
         float(cap_geometry.area),
         component_count,
+    )
+
+
+def _get_horizontal_cap_geometry(
+    mesh: trimesh.Trimesh,
+    normal_y_sign: float,
+) -> BaseGeometry:
+    """Return the dissolved plan geometry for one slab cap."""
+
+    face_mask = mesh.face_normals[:, 1] * normal_y_sign > 0.9
+    return shapely.union_all(
+        [
+            Polygon(triangle[:, (0, 2)])
+            for triangle in mesh.triangles[face_mask]
+        ]
     )
 
 
@@ -131,6 +148,67 @@ def _get_interior_vertical_face_centers(
 
 # ### Automatic floor geometry tests ###
 class AutomaticFloorGeometryTests(unittest.TestCase):
+    def test_floor_prism_handles_nearly_coincident_collinear_boundary_points(
+        self,
+    ) -> None:
+        footprint = Polygon(
+            (
+                (0.0, 0.0),
+                (2.0, 0.0),
+                (2.0, 1.0),
+                (2.0, 1.0 + 1e-10),
+                (2.0, 2.0),
+                (0.0, 2.0),
+            )
+        )
+
+        floor_mesh = _build_floor_prism_mesh(footprint, 0.0, 0.3)
+
+        self.assertTrue(footprint.is_valid)
+        self.assertIsNotNone(floor_mesh)
+        assert floor_mesh is not None
+        self.assertTrue(floor_mesh.is_watertight)
+        self.assertTrue(floor_mesh.is_volume)
+        self.assertAlmostEqual(abs(float(floor_mesh.volume)), 1.2)
+
+    def test_aligned_gap_connector_does_not_absorb_crossed_closed_structure(
+        self,
+    ) -> None:
+        structural_lines = (
+            LineString(((-2.0, 0.0), (0.0, 0.0))),
+            LineString(((4.0, 0.0), (6.0, 0.0))),
+            LineString(((1.5, -0.5), (2.5, -0.5))),
+            LineString(((2.5, -0.5), (2.5, 0.5))),
+            LineString(((2.5, 0.5), (1.5, 0.5))),
+            LineString(((1.5, 0.5), (1.5, -0.5))),
+        )
+        linework = shapely.union_all(structural_lines)
+
+        connectors = _build_straight_gap_closures(linework, 4.0)
+        clusters = _build_wall_linework_clusters(
+            structural_lines,
+            maximum_gap=4.0,
+        )
+
+        self.assertEqual(len(connectors), 1)
+        self.assertTrue(
+            connectors[0].crosses(shapely.union_all(structural_lines[2:]))
+        )
+        self.assertEqual(len(clusters), 2)
+        closed_regions = tuple(
+            region
+            for cluster in clusters
+            for region in shapely.get_parts(
+                shapely.polygonize(tuple(shapely.get_parts(cluster)))
+            )
+            if isinstance(region, Polygon)
+        )
+        self.assertEqual(len(closed_regions), 1)
+        self.assertAlmostEqual(float(closed_regions[0].area), 1.0)
+        self.assertFalse(
+            shapely.union_all(clusters).covers(shapely.Point(1.0, 0.0))
+        )
+
     def test_combined_outermost_wall_area_preserves_concave_footprint(
         self,
     ) -> None:
@@ -260,6 +338,319 @@ class AutomaticFloorGeometryTests(unittest.TestCase):
             if geometry_name == "l2_ground_floor":
                 continue
             self.assertGreaterEqual(float(mesh.bounds[0, 1]), 0.65)
+
+    def test_tiny_connected_dangling_spur_does_not_suppress_floor(self) -> None:
+        level = _build_square_level()
+        spur_end = level.vertex_data.add_vertex(100.0, 101.0)
+        level.vertex_data.add_edge(3, spur_end.id)
+
+        model = convert_to_glb([level])
+
+        self.assertIn("l2_ground_floor", model.scene.geometry)
+        floor_mesh = model.scene.geometry["l2_ground_floor"]
+        for normal_y_sign in (-1.0, 1.0):
+            triangle_area, union_area, component_count = (
+                _get_horizontal_cap_metrics(floor_mesh, normal_y_sign)
+            )
+            self.assertAlmostEqual(triangle_area, 4.0)
+            self.assertAlmostEqual(union_area, 4.0)
+            self.assertEqual(component_count, 1)
+
+    def test_parallel_dangling_branches_do_not_extend_exact_floor(self) -> None:
+        for branch_end_x in (300.0, 700.0):
+            with self.subTest(
+                branch_length_meters=(branch_end_x - 200.0) * 0.02,
+            ):
+                level = _build_closed_level(
+                    (
+                        (0.0, 0.0),
+                        (200.0, 0.0),
+                        (200.0, 50.0),
+                        (200.0, 150.0),
+                        (200.0, 200.0),
+                        (0.0, 200.0),
+                    )
+                )
+                lower_branch_end = level.vertex_data.add_vertex(
+                    branch_end_x,
+                    50.0,
+                )
+                upper_branch_end = level.vertex_data.add_vertex(
+                    branch_end_x,
+                    150.0,
+                )
+                level.vertex_data.add_edge(3, lower_branch_end.id)
+                level.vertex_data.add_edge(4, upper_branch_end.id)
+
+                model = convert_to_glb([level])
+
+                self.assertEqual(
+                    sum(
+                        name == "l2_ground_floor"
+                        for name in model.scene.geometry
+                    ),
+                    1,
+                )
+                floor_mesh = model.scene.geometry["l2_ground_floor"]
+                for normal_y_sign in (-1.0, 1.0):
+                    triangle_area, union_area, component_count = (
+                        _get_horizontal_cap_metrics(
+                            floor_mesh,
+                            normal_y_sign,
+                        )
+                    )
+                    self.assertAlmostEqual(triangle_area, 16.0)
+                    self.assertAlmostEqual(union_area, 16.0)
+                    self.assertEqual(component_count, 1)
+                    cap_geometry = _get_horizontal_cap_geometry(
+                        floor_mesh,
+                        normal_y_sign,
+                    )
+                    self.assertFalse(
+                        cap_geometry.covers(shapely.Point(5.0, 2.0))
+                    )
+
+    def test_point_touching_closed_squares_form_two_watertight_floor_islands(
+        self,
+    ) -> None:
+        level = _build_closed_level(
+            (
+                (0.0, 0.0),
+                (50.0, 0.0),
+                (50.0, 50.0),
+                (0.0, 50.0),
+            )
+        )
+        _add_closed_wall_loop(
+            level.vertex_data,
+            (
+                (50.0, 50.0),
+                (100.0, 50.0),
+                (100.0, 100.0),
+                (50.0, 100.0),
+            ),
+        )
+
+        model = convert_to_glb([level])
+
+        self.assertEqual(
+            sum(name == "l2_ground_floor" for name in model.scene.geometry),
+            1,
+        )
+        floor_mesh = model.scene.geometry["l2_ground_floor"]
+        self.assertTrue(floor_mesh.is_watertight)
+        self.assertTrue(floor_mesh.is_volume)
+        self.assertAlmostEqual(abs(float(floor_mesh.volume)), 0.6)
+        for normal_y_sign in (-1.0, 1.0):
+            triangle_area, union_area, component_count = (
+                _get_horizontal_cap_metrics(floor_mesh, normal_y_sign)
+            )
+            self.assertAlmostEqual(triangle_area, 2.0)
+            self.assertAlmostEqual(union_area, 2.0)
+            self.assertEqual(component_count, 2)
+
+    def test_detached_closed_buildings_share_one_disconnected_floor_mesh(
+        self,
+    ) -> None:
+        level = _build_closed_level(
+            (
+                (0.0, 0.0),
+                (200.0, 0.0),
+                (200.0, 200.0),
+                (0.0, 200.0),
+            )
+        )
+        _add_closed_wall_loop(
+            level.vertex_data,
+            (
+                (400.0, 0.0),
+                (450.0, 0.0),
+                (450.0, 50.0),
+                (400.0, 50.0),
+            ),
+        )
+
+        model = convert_to_glb([level])
+
+        self.assertEqual(
+            sum(name == "l2_ground_floor" for name in model.scene.geometry),
+            1,
+        )
+        floor_mesh = model.scene.geometry["l2_ground_floor"]
+        for normal_y_sign in (-1.0, 1.0):
+            triangle_area, union_area, component_count = (
+                _get_horizontal_cap_metrics(floor_mesh, normal_y_sign)
+            )
+            self.assertAlmostEqual(triangle_area, 17.0)
+            self.assertAlmostEqual(union_area, 17.0)
+            self.assertEqual(component_count, 2)
+            cap_geometry = _get_horizontal_cap_geometry(
+                floor_mesh,
+                normal_y_sign,
+            )
+            self.assertFalse(cap_geometry.covers(shapely.Point(6.0, 0.5)))
+
+    def test_spur_recovery_does_not_bridge_a_nearby_detached_shed(
+        self,
+    ) -> None:
+        level = _build_closed_level(
+            (
+                (0.0, 0.0),
+                (200.0, 0.0),
+                (200.0, 200.0),
+                (0.0, 200.0),
+            )
+        )
+        spur_end = level.vertex_data.add_vertex(200.0, 201.0)
+        level.vertex_data.add_edge(3, spur_end.id)
+        _add_closed_wall_loop(
+            level.vertex_data,
+            (
+                (225.0, 0.0),
+                (275.0, 0.0),
+                (275.0, 50.0),
+                (225.0, 50.0),
+            ),
+        )
+
+        model = convert_to_glb([level])
+
+        self.assertEqual(
+            sum(name == "l2_ground_floor" for name in model.scene.geometry),
+            1,
+        )
+        floor_mesh = model.scene.geometry["l2_ground_floor"]
+        for normal_y_sign in (-1.0, 1.0):
+            triangle_area, union_area, component_count = (
+                _get_horizontal_cap_metrics(floor_mesh, normal_y_sign)
+            )
+            self.assertAlmostEqual(triangle_area, 17.0)
+            self.assertAlmostEqual(union_area, 17.0)
+            self.assertEqual(component_count, 2)
+            cap_geometry = _get_horizontal_cap_geometry(
+                floor_mesh,
+                normal_y_sign,
+            )
+            self.assertFalse(cap_geometry.covers(shapely.Point(4.25, 0.5)))
+
+    def test_opposing_spurs_do_not_bridge_separate_closed_buildings(
+        self,
+    ) -> None:
+        level = _build_closed_level(
+            (
+                (0.0, 0.0),
+                (200.0, 0.0),
+                (200.0, 100.0),
+                (200.0, 200.0),
+                (0.0, 200.0),
+            )
+        )
+        main_spur_end = level.vertex_data.add_vertex(225.0, 100.0)
+        level.vertex_data.add_edge(3, main_spur_end.id)
+        shed_vertex_ids = _add_closed_wall_loop(
+            level.vertex_data,
+            (
+                (300.0, 0.0),
+                (400.0, 0.0),
+                (400.0, 200.0),
+                (300.0, 200.0),
+                (300.0, 100.0),
+            ),
+        )
+        shed_spur_end = level.vertex_data.add_vertex(275.0, 100.0)
+        level.vertex_data.add_edge(shed_vertex_ids[-1], shed_spur_end.id)
+
+        model = convert_to_glb([level])
+
+        self.assertEqual(
+            sum(name == "l2_ground_floor" for name in model.scene.geometry),
+            1,
+        )
+        floor_mesh = model.scene.geometry["l2_ground_floor"]
+        for normal_y_sign in (-1.0, 1.0):
+            triangle_area, union_area, component_count = (
+                _get_horizontal_cap_metrics(floor_mesh, normal_y_sign)
+            )
+            self.assertAlmostEqual(triangle_area, 24.0)
+            self.assertAlmostEqual(union_area, 24.0)
+            self.assertEqual(component_count, 2)
+            cap_geometry = _get_horizontal_cap_geometry(
+                floor_mesh,
+                normal_y_sign,
+            )
+            self.assertFalse(cap_geometry.covers(shapely.Point(5.0, 1.0)))
+
+    def test_spur_recovery_preserves_l_shape_and_shed_in_its_concavity(
+        self,
+    ) -> None:
+        level = _build_closed_level(
+            (
+                (0.0, 0.0),
+                (300.0, 0.0),
+                (300.0, 100.0),
+                (100.0, 100.0),
+                (100.0, 300.0),
+                (0.0, 300.0),
+            )
+        )
+        spur_end = level.vertex_data.add_vertex(301.0, 0.0)
+        level.vertex_data.add_edge(2, spur_end.id)
+        _add_closed_wall_loop(
+            level.vertex_data,
+            (
+                (125.0, 125.0),
+                (175.0, 125.0),
+                (175.0, 175.0),
+                (125.0, 175.0),
+            ),
+        )
+
+        model = convert_to_glb([level])
+
+        self.assertEqual(
+            sum(name == "l2_ground_floor" for name in model.scene.geometry),
+            1,
+        )
+        floor_mesh = model.scene.geometry["l2_ground_floor"]
+        for normal_y_sign in (-1.0, 1.0):
+            triangle_area, union_area, component_count = (
+                _get_horizontal_cap_metrics(floor_mesh, normal_y_sign)
+            )
+            self.assertAlmostEqual(triangle_area, 21.0)
+            self.assertAlmostEqual(union_area, 21.0)
+            self.assertEqual(component_count, 2)
+            cap_geometry = _get_horizontal_cap_geometry(
+                floor_mesh,
+                normal_y_sign,
+            )
+            self.assertFalse(cap_geometry.covers(shapely.Point(2.25, 3.0)))
+            self.assertFalse(cap_geometry.covers(shapely.Point(4.0, 4.0)))
+
+    def test_tiny_exact_closed_loop_survives_dangling_spur_recovery(
+        self,
+    ) -> None:
+        level = _build_closed_level(
+            (
+                (0.0, 0.0),
+                (20.0, 0.0),
+                (20.0, 20.0),
+                (0.0, 20.0),
+            )
+        )
+        spur_end = level.vertex_data.add_vertex(20.0, 21.0)
+        level.vertex_data.add_edge(3, spur_end.id)
+
+        model = convert_to_glb([level])
+
+        self.assertIn("l2_ground_floor", model.scene.geometry)
+        floor_mesh = model.scene.geometry["l2_ground_floor"]
+        for normal_y_sign in (-1.0, 1.0):
+            triangle_area, union_area, component_count = (
+                _get_horizontal_cap_metrics(floor_mesh, normal_y_sign)
+            )
+            self.assertAlmostEqual(triangle_area, 0.16)
+            self.assertAlmostEqual(union_area, 0.16)
+            self.assertEqual(component_count, 1)
 
     def test_nested_perimeter_is_filled_without_inner_slab_sides(self) -> None:
         level = _build_closed_level(
@@ -646,7 +1037,7 @@ class AutomaticFloorGeometryTests(unittest.TestCase):
 
         self.assertNotIn("l2_ground_floor", model.scene.geometry)
 
-    def test_unresolved_walls_do_not_extrude_only_small_closed_cells(
+    def test_open_detached_walls_do_not_suppress_closed_floor_component(
         self,
     ) -> None:
         level = _build_level_from_segments(
@@ -661,7 +1052,20 @@ class AutomaticFloorGeometryTests(unittest.TestCase):
 
         model = convert_to_glb([level])
 
-        self.assertNotIn("l2_ground_floor", model.scene.geometry)
+        self.assertIn("l2_ground_floor", model.scene.geometry)
+        floor_mesh = model.scene.geometry["l2_ground_floor"]
+        np.testing.assert_allclose(
+            floor_mesh.bounds[:, (0, 2)],
+            np.asarray(((0.0, 0.0), (2.0, 2.0))),
+            atol=1e-9,
+        )
+        for normal_y_sign in (-1.0, 1.0):
+            triangle_area, union_area, component_count = (
+                _get_horizontal_cap_metrics(floor_mesh, normal_y_sign)
+            )
+            self.assertAlmostEqual(triangle_area, 4.0)
+            self.assertAlmostEqual(union_area, 4.0)
+            self.assertEqual(component_count, 1)
 
     def test_invalid_floor_thickness_is_rejected(self) -> None:
         for invalid_thickness in (0.0, -0.1, float("nan"), True):
