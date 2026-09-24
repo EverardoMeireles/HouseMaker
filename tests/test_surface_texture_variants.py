@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import unittest
 from io import BytesIO
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -132,6 +133,27 @@ def _four_pixel_period_normal_rgba(
         0,
         255,
     ).astype(np.uint8)
+    rgba[:, :, 3] = 255
+    return rgba
+
+
+def _periodic_base_color_rgba(size: int = 512) -> np.ndarray:
+    axis = np.arange(size, dtype=np.float32) * (2.0 * np.pi / size)
+    values = 125.0 + 18.0 * np.sin(axis[:, None]) + 15.0 * np.cos(axis[None, :])
+    channel = np.clip(np.rint(values), 0, 255).astype(np.uint8)
+    rgba = np.empty((size, size, 4), dtype=np.uint8)
+    rgba[:, :, :3] = channel[:, :, None]
+    rgba[:, :, 3] = 255
+    return rgba
+
+
+def _gradient_base_color_rgba(size: int = 512) -> np.ndarray:
+    channel = np.broadcast_to(
+        np.linspace(0, 255, size, dtype=np.uint8),
+        (size, size),
+    )
+    rgba = np.empty((size, size, 4), dtype=np.uint8)
+    rgba[:, :, :3] = channel[:, :, None]
     rgba[:, :, 3] = 255
     return rgba
 
@@ -343,6 +365,38 @@ class SurfaceTextureVariantAlgorithmTests(unittest.TestCase):
         self.assertEqual(DEFAULT_SURFACE_TEXTURE_RESOLUTION, 1024)
         with self.assertRaises(ValueError):
             SurfaceTextureVariants({512: b"png"})
+
+    def test_tiling_fix_diagnostic_propagates_from_512_base_color(self) -> None:
+        periodic = build_surface_texture_variants(
+            _encode_png(_periodic_base_color_rgba())
+        )
+        gradient = build_surface_texture_variants(
+            _encode_png(_gradient_base_color_rgba())
+        )
+
+        self.assertFalse(periodic.tiling_fix_needed)
+        self.assertTrue(gradient.tiling_fix_needed)
+
+    def test_tiling_fix_diagnostic_defaults_false_and_requires_a_bool(self) -> None:
+        payloads = {resolution: b"png" for resolution in SURFACE_TEXTURE_RESOLUTIONS}
+
+        self.assertFalse(SurfaceTextureVariants(payloads).tiling_fix_needed)
+        with self.assertRaises(TypeError):
+            SurfaceTextureVariants(
+                payloads,
+                tiling_fix_needed=1,  # type: ignore[arg-type]
+            )
+
+    def test_tiling_fix_diagnostic_failure_does_not_fail_generation(self) -> None:
+        source = np.full((8, 8, 4), (40, 60, 80, 255), dtype=np.uint8)
+
+        with patch(
+            "housemaker.surface_texture_variants.texture_needs_tiling_fix",
+            side_effect=ValueError("diagnostic failed"),
+        ):
+            variants = build_surface_texture_variants(_encode_png(source))
+
+        self.assertFalse(variants.tiling_fix_needed)
 
 
 # ### Test entry point ###

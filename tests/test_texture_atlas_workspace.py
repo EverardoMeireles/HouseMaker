@@ -25,6 +25,7 @@ from PySide6.QtGui import (
     QImage,
     QMouseEvent,
     QPainter,
+    QPalette,
     QWheelEvent,
 )
 from PySide6.QtTest import QTest
@@ -647,6 +648,29 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         )
         self.assertIn("3 surfaces", self.workspace.surface_list.item(0).text())
 
+    def test_surface_tiling_fix_entry_flag_requires_an_exact_boolean(self) -> None:
+        source_id = build_atlas_wall_texture_source_id("plaster")
+
+        self.assertIs(
+            AtlasSurfaceTextureEntry(
+                source_id=source_id,
+                display_name="Plaster",
+                surface_usage_count=1,
+            ).tiling_fix_needed,
+            False,
+        )
+        for value in (0, 1, None, "true", [], {}):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(TypeError, "tiling fix needed"),
+            ):
+                AtlasSurfaceTextureEntry(
+                    source_id=source_id,
+                    display_name="Plaster",
+                    surface_usage_count=1,
+                    tiling_fix_needed=value,
+                )
+
     def test_new_object_and_surface_sources_breathe_until_each_is_clicked(
         self,
     ) -> None:
@@ -729,6 +753,251 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
             surface_item.background().style(),
             Qt.BrushStyle.NoBrush,
         )
+
+    def test_surface_tiling_warning_keeps_blinking_after_its_row_is_clicked(
+        self,
+    ) -> None:
+        surface_source = _wall_source(
+            "plaster",
+            directory=self._temporary_directory.name,
+        )
+        self.workspace.set_object_texture_sources(
+            (surface_source,),
+            surface_texture_entries=(
+                AtlasSurfaceTextureEntry(
+                    source_id=surface_source.object_id,
+                    display_name="Plaster",
+                    surface_usage_count=1,
+                    tiling_fix_needed=True,
+                ),
+            ),
+        )
+        self.workspace.mark_sources_new((surface_source.object_id,))
+        self.workspace._apply_new_source_attention_strength(1.0)
+        surface_item = self.workspace.surface_list.item(0)
+
+        QTest.mouseClick(
+            self.workspace.surface_list.viewport(),
+            Qt.MouseButton.LeftButton,
+            pos=self.workspace.surface_list.visualItemRect(surface_item).center(),
+        )
+        self.workspace._apply_new_source_attention_strength(1.0)
+
+        self.assertNotIn(
+            surface_source.object_id,
+            self.workspace._new_source_attention_ids,
+        )
+        self.assertIn(
+            surface_source.object_id,
+            self.workspace._surface_tiling_fix_attention_ids,
+        )
+        self.assertEqual(
+            surface_item.background().color(),
+            NEW_SOURCE_ATTENTION_COLOR,
+        )
+        self.assertEqual(
+            self.workspace._new_source_attention_animation.state(),
+            QAbstractAnimation.State.Running,
+        )
+
+    def test_selected_surface_tiling_warning_blinks_and_resets_fix_button(
+        self,
+    ) -> None:
+        object_source = _source(
+            "chair",
+            directory=self._temporary_directory.name,
+        )
+        warned_surface = _wall_source(
+            "plaster",
+            directory=self._temporary_directory.name,
+        )
+        clean_surface = _wall_source(
+            "brick",
+            directory=self._temporary_directory.name,
+        )
+        self.workspace.set_object_texture_sources(
+            (object_source, warned_surface, clean_surface),
+            surface_texture_entries=(
+                AtlasSurfaceTextureEntry(
+                    source_id=warned_surface.object_id,
+                    display_name="Plaster",
+                    surface_usage_count=1,
+                    tiling_fix_needed=True,
+                ),
+                AtlasSurfaceTextureEntry(
+                    source_id=clean_surface.object_id,
+                    display_name="Brick",
+                    surface_usage_count=1,
+                ),
+            ),
+        )
+        base_color = self.workspace._fix_tiling_button_base_color
+
+        self.workspace.surface_list.setCurrentRow(0)
+        self.workspace._apply_new_source_attention_strength(1.0)
+
+        self.assertTrue(self.workspace.fix_tiling_button.isEnabled())
+        self.assertEqual(
+            self.workspace.fix_tiling_button.palette().color(
+                QPalette.ColorRole.Button
+            ),
+            NEW_SOURCE_ATTENTION_COLOR,
+        )
+
+        self.workspace.surface_list.setCurrentRow(1)
+
+        self.assertTrue(self.workspace.fix_tiling_button.isEnabled())
+        self.assertEqual(
+            self.workspace.fix_tiling_button.palette().color(
+                QPalette.ColorRole.Button
+            ),
+            base_color,
+        )
+
+        self.workspace.surface_list.setCurrentRow(0)
+        self.workspace._apply_new_source_attention_strength(1.0)
+        self.workspace.object_list.setCurrentRow(0)
+
+        self.assertFalse(self.workspace.fix_tiling_button.isEnabled())
+        self.assertEqual(
+            self.workspace.fix_tiling_button.palette().color(
+                QPalette.ColorRole.Button
+            ),
+            base_color,
+        )
+
+        self.workspace.surface_list.setCurrentRow(0)
+        self.workspace._apply_new_source_attention_strength(1.0)
+        self.workspace.select_source_ids(())
+
+        self.assertFalse(self.workspace.fix_tiling_button.isEnabled())
+        self.assertEqual(
+            self.workspace.fix_tiling_button.palette().color(
+                QPalette.ColorRole.Button
+            ),
+            base_color,
+        )
+
+    def test_surface_tiling_warning_survives_refresh_and_prunes_on_removal(
+        self,
+    ) -> None:
+        surface_source = _wall_source(
+            "plaster",
+            directory=self._temporary_directory.name,
+        )
+        entry = AtlasSurfaceTextureEntry(
+            source_id=surface_source.object_id,
+            display_name="Plaster",
+            surface_usage_count=1,
+            tiling_fix_needed=True,
+        )
+        self.workspace.set_object_texture_sources(
+            (surface_source,),
+            surface_texture_entries=(entry,),
+        )
+        self.workspace._apply_new_source_attention_strength(1.0)
+
+        self.workspace.set_scene_bound_source_ids((surface_source.object_id,))
+        self.workspace._apply_new_source_attention_strength(1.0)
+
+        self.assertIn(
+            surface_source.object_id,
+            self.workspace._surface_tiling_fix_attention_ids,
+        )
+        self.assertEqual(
+            self.workspace.surface_list.item(0).background().color(),
+            NEW_SOURCE_ATTENTION_COLOR,
+        )
+        self.assertEqual(
+            self.workspace._new_source_attention_animation.state(),
+            QAbstractAnimation.State.Running,
+        )
+
+        self.workspace.set_object_texture_sources(())
+
+        self.assertEqual(self.workspace._surface_tiling_fix_attention_ids, set())
+        self.assertEqual(self.workspace.surface_list.count(), 0)
+        self.assertEqual(
+            self.workspace._new_source_attention_animation.state(),
+            QAbstractAnimation.State.Stopped,
+        )
+        self.assertEqual(
+            self.workspace.fix_tiling_button.palette().color(
+                QPalette.ColorRole.Button
+            ),
+            self.workspace._fix_tiling_button_base_color,
+        )
+
+    def test_scene_source_selection_is_silent_and_preserves_new_attention(
+        self,
+    ) -> None:
+        object_sources = tuple(
+            _source(object_id, directory=self._temporary_directory.name)
+            for object_id in ("chair", "table")
+        )
+        surface_source = _wall_source(
+            "plaster",
+            directory=self._temporary_directory.name,
+        )
+        source_ids = tuple(
+            source.object_id for source in (*object_sources, surface_source)
+        )
+        self.workspace.set_object_texture_sources(
+            (*object_sources, surface_source)
+        )
+        self.workspace.mark_sources_new(source_ids)
+        self.workspace._apply_new_source_attention_strength(1.0)
+        object_selections = Mock()
+        surface_selections = Mock()
+        object_groups = Mock()
+        surface_groups = Mock()
+        self.workspace.object_texture_selected.connect(object_selections)
+        self.workspace.surface_texture_selected.connect(surface_selections)
+        self.workspace.object_textures_selected.connect(object_groups)
+        self.workspace.surface_textures_selected.connect(surface_groups)
+
+        selected_ids = self.workspace.select_source_ids(
+            tuple(source.object_id for source in object_sources),
+            active_source_id=object_sources[-1].object_id,
+        )
+
+        self.assertEqual(selected_ids, ("chair", "table"))
+        self.assertEqual(
+            self.workspace.selected_object_texture_ids,
+            ("chair", "table"),
+        )
+        self.assertEqual(self.workspace.selected_object_texture_id, "table")
+        self.assertEqual(self.workspace.selected_surface_texture_ids, ())
+        self.assertEqual(self.workspace._new_source_attention_ids, set(source_ids))
+        for row in range(self.workspace.object_list.count()):
+            self.assertEqual(
+                self.workspace.object_list.item(row).background().color(),
+                NEW_SOURCE_ATTENTION_COLOR,
+            )
+
+        selected_ids = self.workspace.select_source_ids(
+            (surface_source.object_id,),
+            active_source_id=surface_source.object_id,
+        )
+
+        self.assertEqual(selected_ids, (surface_source.object_id,))
+        self.assertEqual(self.workspace.selected_object_texture_ids, ())
+        self.assertEqual(
+            self.workspace.selected_surface_texture_ids,
+            (surface_source.object_id,),
+        )
+        self.assertEqual(
+            self.workspace.surface_list.item(0).background().color(),
+            NEW_SOURCE_ATTENTION_COLOR,
+        )
+        self.assertEqual(
+            self.workspace._new_source_attention_animation.state(),
+            QAbstractAnimation.State.Running,
+        )
+        object_selections.assert_not_called()
+        surface_selections.assert_not_called()
+        object_groups.assert_not_called()
+        surface_groups.assert_not_called()
 
     def test_new_source_attention_survives_refresh_and_pending_source_arrival(
         self,

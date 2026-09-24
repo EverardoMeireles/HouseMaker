@@ -462,6 +462,7 @@ class _SavedSurfaceTextureOutput:
     assignment_id: str
     variants: tuple[SurfaceTextureVariant, ...]
     texture_png_by_resolution: tuple[tuple[int, bytes], ...]
+    tiling_fix_needed: bool = False
     map_png_by_resolution: dict[str, dict[int, bytes]] = field(
         default_factory=dict
     )
@@ -1298,6 +1299,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                     assignment,
                     asset_path=selected_variant.asset_path,
                     texture_variants=tuple(repaired_variants),
+                    tiling_fix_needed=False,
                     tiling_mode=(
                         SURFACE_TILING_MODE_EDGE_VARIANTS
                         if prepared.method == SURFACE_TILING_MODE_EDGE_VARIANTS
@@ -1315,6 +1317,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                 repaired_assignment = replace(
                     assignment,
                     asset_path=legacy_asset_path,
+                    tiling_fix_needed=False,
                     tiling_mode=(
                         SURFACE_TILING_MODE_EDGE_VARIANTS
                         if prepared.method == SURFACE_TILING_MODE_EDGE_VARIANTS
@@ -2964,6 +2967,7 @@ class SurfaceTextureGenerationWorkspace(QWidget):
                             if map_type in active_variant.map_asset_paths
                         ),
                         pbr_alignment_version=SURFACE_PBR_ALIGNMENT_VERSION,
+                        tiling_fix_needed=saved_output.tiling_fix_needed,
                     )
                 )
         except (OSError, ValueError) as error:
@@ -3897,6 +3901,7 @@ def _persist_surface_texture_variants(
         assignment_id=assignment_id,
         variants=tuple(persisted),
         texture_png_by_resolution=png_items,
+        tiling_fix_needed=texture_variants.tiling_fix_needed,
         map_png_by_resolution=map_png_by_resolution,
     )
 

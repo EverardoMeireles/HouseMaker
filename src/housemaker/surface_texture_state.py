@@ -22,7 +22,7 @@ from housemaker.pbr_maps import (
 from housemaker.video_source import VideoMetadata
 
 # ### Constants ###
-SURFACE_TEXTURE_SCHEMA_VERSION = 10
+SURFACE_TEXTURE_SCHEMA_VERSION = 11
 SURFACE_PBR_ALIGNMENT_VERSION = 1
 SURFACE_TYPE_WALL = "wall"
 SURFACE_TYPE_FLOOR = "floor"
@@ -178,6 +178,7 @@ class SurfaceTextureAssignment:
     tiling_mode: str = SURFACE_TILING_MODE_NONE
     tiling_seed: int = 0
     texture_repeat_size_m: float = DEFAULT_TEXTURE_REPEAT_SIZE_M
+    tiling_fix_needed: bool = False
 
     def __post_init__(self) -> None:
         assignment_id = _normalize_required_text(
@@ -261,6 +262,10 @@ class SurfaceTextureAssignment:
         texture_repeat_size_m = _normalize_texture_repeat_size_m(
             self.texture_repeat_size_m
         )
+        if not isinstance(self.tiling_fix_needed, bool):
+            raise TypeError(
+                "Surface texture tiling fix needed flag must be a boolean."
+            )
         selected_texture_resolution = _normalize_selected_texture_resolution(
             self.selected_texture_resolution,
             texture_variants,
@@ -371,6 +376,7 @@ class SurfaceTextureAssignment:
             "tiling_mode": self.tiling_mode,
             "tiling_seed": self.tiling_seed,
             "texture_repeat_size_m": self.texture_repeat_size_m,
+            "tiling_fix_needed": self.tiling_fix_needed,
         }
 
     @classmethod
@@ -457,6 +463,7 @@ class SurfaceTextureAssignment:
                 "texture_repeat_size_m",
                 DEFAULT_TEXTURE_REPEAT_SIZE_M,
             ),
+            tiling_fix_needed=payload.get("tiling_fix_needed", False),
         )
 
 

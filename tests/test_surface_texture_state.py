@@ -272,6 +272,31 @@ class SurfaceTextureSelectionTests(unittest.TestCase):
 
 # ### Assignment validation tests ###
 class SurfaceTextureAssignmentTests(unittest.TestCase):
+    def test_tiling_fix_needed_round_trips_and_defaults_for_legacy_data(
+        self,
+    ) -> None:
+        assignment = replace(_assignment(), tiling_fix_needed=True)
+
+        payload = assignment.to_dict()
+        self.assertIs(payload["tiling_fix_needed"], True)
+        restored = SurfaceTextureAssignment.from_dict(payload)
+        payload.pop("tiling_fix_needed")
+        legacy = SurfaceTextureAssignment.from_dict(payload)
+
+        self.assertIs(restored.tiling_fix_needed, True)
+        self.assertEqual(restored, assignment)
+        self.assertIs(legacy.tiling_fix_needed, False)
+
+    def test_tiling_fix_needed_requires_an_exact_boolean(self) -> None:
+        for value in (0, 1, None, "true", [], {}):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(TypeError, "tiling fix needed"):
+                    replace(_assignment(), tiling_fix_needed=value)
+                with self.assertRaisesRegex(TypeError, "tiling fix needed"):
+                    SurfaceTextureAssignment.from_dict(
+                        _assignment().to_dict() | {"tiling_fix_needed": value}
+                    )
+
     def test_texture_repeat_size_round_trips_and_defaults_for_legacy_data(self) -> None:
         assignment = replace(_assignment(), texture_repeat_size_m=0.75)
 
@@ -371,7 +396,7 @@ class SurfaceTextureAssignmentTests(unittest.TestCase):
 
         restored = SurfaceTextureAssignment.from_dict(assignment.to_dict())
 
-        self.assertEqual(SURFACE_TEXTURE_SCHEMA_VERSION, 10)
+        self.assertEqual(SURFACE_TEXTURE_SCHEMA_VERSION, 11)
         self.assertEqual(
             restored.selected_texture_resolution,
             DEFAULT_SURFACE_TEXTURE_RESOLUTION,

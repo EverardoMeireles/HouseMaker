@@ -166,6 +166,14 @@ def _colored_texture_png(color: tuple[int, int, int, int]) -> bytes:
     return output.getvalue()
 
 
+def _horizontal_gradient_texture_png(size: int = 128) -> bytes:
+    axis = np.linspace(20, 235, size, dtype=np.uint8)
+    pixels = np.repeat(np.tile(axis, (size, 1))[:, :, None], 3, axis=2)
+    output = io.BytesIO()
+    Image.fromarray(pixels, mode="RGB").save(output, format="PNG")
+    return output.getvalue()
+
+
 def _set_current_mask(
     workspace: SurfaceTextureGenerationWorkspace,
     stroke: MaskStroke,
@@ -178,6 +186,8 @@ def _surface_assignment(
     assignment_id: str,
     surface_ids: tuple[str, ...],
     asset_path: str,
+    *,
+    tiling_fix_needed: bool = False,
 ) -> SurfaceTextureAssignment:
     return SurfaceTextureAssignment(
         assignment_id=assignment_id,
@@ -185,6 +195,7 @@ def _surface_assignment(
         surface_ids=surface_ids,
         provider="meshy",
         asset_path=asset_path,
+        tiling_fix_needed=tiling_fix_needed,
     )
 
 
@@ -1755,7 +1766,10 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         asset_path = asset_directory / "edge-variants.png"
         asset_path.write_bytes(_texture_png())
         assignment = _surface_assignment(
-            "edge-variants", ("level:2/room:5/wall:1:2",), asset_path.name
+            "edge-variants",
+            ("level:2/room:5/wall:1:2",),
+            asset_path.name,
+            tiling_fix_needed=True,
         )
         self.workspace.set_data(SurfaceTextureData(assignments=[assignment]))
 
@@ -1782,6 +1796,7 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         assert active is not None
         self.assertEqual(active.tiling_mode, SURFACE_TILING_MODE_EDGE_VARIANTS)
         self.assertEqual(active.tiling_seed, 41)
+        self.assertFalse(active.tiling_fix_needed)
         self.assertNotEqual(active.asset_path, assignment.asset_path)
         self.assertEqual(
             self.workspace.get_surface_material_sources()[
@@ -1795,9 +1810,10 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
                 revision, repaired=False
             )
         )
-        self.assertEqual(
-            self.workspace.get_assignment(assignment.assignment_id), assignment
-        )
+        restored_assignment = self.workspace.get_assignment(assignment.assignment_id)
+        self.assertEqual(restored_assignment, assignment)
+        assert restored_assignment is not None
+        self.assertTrue(restored_assignment.tiling_fix_needed)
         self.assertEqual(self.workspace.discard_assignment_tiling_revision(revision), 0)
         self.assertFalse(
             (asset_directory / revision.created_asset_paths[0]).exists()
@@ -2701,6 +2717,37 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         finally:
             restored.shutdown()
             restored.close()
+
+    def test_generated_repeat_seam_warning_reaches_persisted_assignment(
+        self,
+    ) -> None:
+        surface_id = "level:2/room:5/floor"
+        request = SurfaceTextureRequest(
+            provider="meshy",
+            api_key="test-key",
+            reference_pngs=(_texture_png(),),
+            reference_frame_indices=(0,),
+            surface_type="floor",
+            surface_ids=(surface_id,),
+            combined_area_m2=4.0,
+            prompt="Visible horizontal gradient",
+        )
+
+        succeeded = self.workspace._handle_generation_succeeded(
+            request,
+            SurfaceTextureResult(
+                provider="meshy",
+                texture_png=_horizontal_gradient_texture_png(),
+                task_id="seamed-texture-task",
+            ),
+        )
+
+        self.assertTrue(succeeded)
+        assignments = self.workspace.get_data().assignments
+        self.assertEqual(len(assignments), 1)
+        self.assertTrue(assignments[0].tiling_fix_needed)
+        restored = SurfaceTextureAssignment.from_dict(assignments[0].to_dict())
+        self.assertTrue(restored.tiling_fix_needed)
 
     def test_generation_keeps_fully_replaced_texture_as_unused_library_item(
         self,

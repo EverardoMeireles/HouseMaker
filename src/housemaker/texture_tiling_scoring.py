@@ -9,6 +9,7 @@ _MIN_VARIATION = 0.025
 _JOIN_ALLOWANCE = 1.10
 _RIDGE_ALLOWANCE = 0.80
 _CORNER_RADIUS_FRACTION = 0.06
+TILING_FIX_SCORE_THRESHOLD = 1.0
 _SCALAR_MAP_TYPES = frozenset(
     {
         "ambient_occlusion",
@@ -71,7 +72,51 @@ def score_variant_sheet(
     return float(0.4 * np.mean(scale_scores) + 0.6 * max(scale_scores))
 
 
+def score_repeated_texture_tile(
+    tile: np.ndarray,
+    *,
+    map_type: str = "base_color",
+) -> float:
+    """Score the visible seams produced by repeating one texture tile."""
+
+    _validate_tile(tile)
+    tile_height, tile_width = tile.shape[:2]
+    repeated_sheet = np.tile(tile, (2, 2, 1))
+    return score_variant_sheet(
+        repeated_sheet,
+        tile_height,
+        tile_width,
+        map_type=map_type,
+    )
+
+
+def texture_needs_tiling_fix(
+    tile: np.ndarray,
+    *,
+    map_type: str = "base_color",
+) -> bool:
+    """Return whether one repeated texture tile has a visible seam."""
+
+    return (
+        score_repeated_texture_tile(tile, map_type=map_type)
+        >= TILING_FIX_SCORE_THRESHOLD
+    )
+
+
 # ### Input validation ###
+def _validate_tile(tile: np.ndarray) -> None:
+    if not isinstance(tile, np.ndarray):
+        raise TypeError("The repeated texture tile must be a NumPy array.")
+    if tile.dtype != np.uint8 or tile.ndim != 3 or tile.shape[2] not in (1, 2, 3, 4):
+        raise ValueError(
+            "The repeated texture tile must contain uint8 pixels with 1–4 channels."
+        )
+    if min(tile.shape[:2]) < 4:
+        raise ValueError(
+            "Repeated texture tiles must be at least four pixels wide and high."
+        )
+
+
 def _validate_sheet(sheet: np.ndarray, tile_height: int, tile_width: int) -> None:
     if not isinstance(sheet, np.ndarray):
         raise TypeError("The variant sheet must be a NumPy array.")
@@ -195,4 +240,9 @@ def _corner_scores(
 
 
 # ### Public exports ###
-__all__ = ["score_variant_sheet"]
+__all__ = [
+    "TILING_FIX_SCORE_THRESHOLD",
+    "score_repeated_texture_tile",
+    "score_variant_sheet",
+    "texture_needs_tiling_fix",
+]

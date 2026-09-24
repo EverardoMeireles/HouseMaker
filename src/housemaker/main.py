@@ -4039,6 +4039,10 @@ class BlueprintWorkspace(QWidget):
         )
         if selected_surface_source_ids:
             self._handle_atlas_surface_textures_selected(selected_surface_source_ids)
+        elif self._selected_atlas_surface_source_id is not None:
+            self._handle_atlas_surface_texture_selected(
+                self._selected_atlas_surface_source_id
+            )
         else:
             self._set_atlas_canvas_surface_highlights(())
             self._sync_atlas_green_outline_to_canvas_highlight(None)
@@ -4147,6 +4151,7 @@ class BlueprintWorkspace(QWidget):
         self._sync_surface_generation_selection(
             self._desired_canvas_stair_part_ids
         )
+        self._sync_atlas_texture_selection_from_canvas_scene()
 
     def _handle_canvas_stair_part_selection_changed(
         self,
@@ -4181,12 +4186,14 @@ class BlueprintWorkspace(QWidget):
             self._discard_staged_stair_edit(clear_selection=True)
             self._atlas_surface_assignment_target_ids = ()
             self._sync_surface_generation_selection(())
+            self._sync_atlas_texture_selection_from_canvas_scene()
             return
         self._desired_canvas_object_id = None
         self._desired_canvas_object_ids = ()
         self._desired_canvas_surface_ids = ()
         self._atlas_surface_assignment_target_ids = semantic_ids
         self._sync_surface_generation_selection(semantic_ids)
+        self._sync_atlas_texture_selection_from_canvas_scene()
         if self._editing_stair_index == stair_index:
             return
 
@@ -4250,6 +4257,7 @@ class BlueprintWorkspace(QWidget):
             self._desired_canvas_object_id = None
             self._desired_canvas_object_ids = ()
         self._sync_surface_generation_selection(surface_ids)
+        self._sync_atlas_texture_selection_from_canvas_scene()
         active_surface_id = surface_ids[-1] if surface_ids else None
         self._sync_selected_canvas_wall_highlight(active_surface_id)
         self._commit_pending_wall_vertex_update()
@@ -6367,6 +6375,59 @@ class BlueprintWorkspace(QWidget):
             self._sync_surface_generation_selection(())
         if normalized_active_id is not None:
             self.generation.select_generated_object(normalized_active_id)
+        self._sync_atlas_texture_selection_from_canvas_scene()
+
+    def _sync_atlas_texture_selection_from_canvas_scene(self) -> None:
+        """Select textures assigned to the current semantic 3D selection."""
+
+        object_ids = self._desired_canvas_object_ids
+        if object_ids:
+            textured_object_ids = tuple(
+                object_id
+                for object_id in object_ids
+                if self.generation.get_active_texture_variant(object_id) is not None
+            )
+            active_object_id = (
+                self._desired_canvas_object_id
+                if self._desired_canvas_object_id in textured_object_ids
+                else None
+            )
+            self.texture_atlas_workspace.select_source_ids(
+                textured_object_ids,
+                active_source_id=active_object_id,
+            )
+            self._selected_atlas_surface_source_id = None
+            self._set_atlas_canvas_surface_highlights(())
+            self._sync_atlas_green_outline_to_canvas_highlight(None)
+            return
+
+        surface_ids = tuple(
+            dict.fromkeys(
+                (
+                    *self._desired_canvas_surface_ids,
+                    *self._desired_canvas_stair_part_ids,
+                )
+            )
+        )
+        source_id_by_surface_id = self._build_atlas_surface_source_ids()
+        source_ids = tuple(
+            dict.fromkeys(
+                source_id_by_surface_id[surface_id]
+                for surface_id in surface_ids
+                if surface_id in source_id_by_surface_id
+            )
+        )
+        active_surface_id = surface_ids[-1] if surface_ids else None
+        active_source_id = (
+            None
+            if active_surface_id is None
+            else source_id_by_surface_id.get(active_surface_id)
+        )
+        selected_source_ids = self.texture_atlas_workspace.select_source_ids(
+            source_ids,
+            active_source_id=active_source_id,
+        )
+        self._handle_atlas_surface_textures_selected(selected_source_ids)
 
     def _discard_desired_canvas_object(self, object_id: str) -> None:
         """Forget one vanished object without dropping other selected objects."""
@@ -10682,6 +10743,7 @@ class BlueprintWorkspace(QWidget):
                     assignment.texture_height,
                     assignment.surface_ids,
                     assignment.texture_repeat_size_m,
+                    assignment.tiling_fix_needed,
                     tuple(variant_signature),
                 )
             )
@@ -10699,6 +10761,7 @@ class BlueprintWorkspace(QWidget):
                         surface_usage_count=len(assignment.surface_ids),
                         surface_type=assignment.surface_type,
                         texture_repeat_size_m=assignment.texture_repeat_size_m,
+                        tiling_fix_needed=assignment.tiling_fix_needed,
                     )
                 )
                 if assignment.surface_ids:

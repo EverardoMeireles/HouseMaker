@@ -19,7 +19,7 @@ from housemaker.surface_texture_state import (
     DEFAULT_SURFACE_TEXTURE_RESOLUTION,
     SURFACE_TEXTURE_RESOLUTIONS,
 )
-
+from housemaker.texture_tiling_scoring import texture_needs_tiling_fix
 
 # ### Constants ###
 CANONICAL_SURFACE_TEXTURE_RESOLUTION = 2048
@@ -46,8 +46,11 @@ class SurfaceTextureVariants:
 
     texture_png_by_resolution: dict[int, bytes]
     map_png_by_resolution: dict[str, dict[int, bytes]] | None = None
+    tiling_fix_needed: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.tiling_fix_needed, bool):
+            raise TypeError("Surface texture tiling-fix state must be a boolean.")
         raw_variants = self.texture_png_by_resolution
         if not isinstance(raw_variants, dict):
             raise TypeError("Surface texture variants must contain a mapping.")
@@ -154,7 +157,20 @@ def build_surface_texture_variants(
     return SurfaceTextureVariants(
         texture_png_by_resolution=encoded_maps[ATLAS_MAP_BASE_COLOR],
         map_png_by_resolution=encoded_maps,
+        tiling_fix_needed=_detect_tiling_fix_needed(
+            maps_by_resolution[512][ATLAS_MAP_BASE_COLOR],
+        ),
     )
+
+
+# ### Tiling diagnostics ###
+def _detect_tiling_fix_needed(base_color_rgba: np.ndarray) -> bool:
+    """Run seam analysis without failing otherwise valid texture generation."""
+
+    try:
+        return texture_needs_tiling_fix(base_color_rgba)
+    except (TypeError, ValueError):
+        return False
 
 
 # ### PNG helpers ###

@@ -187,6 +187,7 @@ class AtlasSurfaceTextureEntry:
     surface_usage_count: int
     surface_type: str = "surface"
     texture_repeat_size_m: float = DEFAULT_SURFACE_TEXTURE_REPEAT_SIZE_M
+    tiling_fix_needed: bool = False
 
     def __post_init__(self) -> None:
         source_id = str(self.source_id).strip()
@@ -213,6 +214,10 @@ class AtlasSurfaceTextureEntry:
             or repeat_size <= 0.0
         ):
             raise ValueError("Atlas surface texture repeat size must be positive.")
+        if not isinstance(self.tiling_fix_needed, bool):
+            raise TypeError(
+                "Atlas surface texture tiling fix needed flag must be a boolean."
+            )
         object.__setattr__(self, "source_id", source_id)
         object.__setattr__(self, "display_name", display_name)
         object.__setattr__(self, "surface_type", surface_type)
@@ -1970,6 +1975,7 @@ class TextureAtlasWorkspace(QWidget):
         self._green_outline_source_ids: frozenset[str] = frozenset()
         self._new_source_attention_ids: set[str] = set()
         self._seen_new_source_attention_ids: set[str] = set()
+        self._surface_tiling_fix_attention_ids: set[str] = set()
         self._new_source_attention_strength = 0.0
         self._new_source_attention_animation = QVariantAnimation(self)
         self._new_source_attention_animation.setDuration(
@@ -2292,6 +2298,11 @@ class TextureAtlasWorkspace(QWidget):
         self._deletable_object_ids = normalized_deletable_object_ids
         self._surface_texture_entries_by_id = {
             entry.source_id: entry for entry in normalized_surface_entries
+        }
+        self._surface_tiling_fix_attention_ids = {
+            entry.source_id
+            for entry in normalized_surface_entries
+            if entry.tiling_fix_needed
         }
         self._texture_variant_resolver = variant_resolver
         self._texture_variant_selectability_resolver = selectability_resolver
@@ -3419,6 +3430,93 @@ class TextureAtlasWorkspace(QWidget):
 
         return self._selected_source_ids("surface")
 
+    def select_source_ids(
+        self,
+        source_ids: Sequence[str],
+        *,
+        active_source_id: str | None = None,
+    ) -> tuple[str, ...]:
+        """Select scene-owned texture rows without emitting selection signals."""
+
+        raw_source_ids = (source_ids,) if isinstance(source_ids, str) else source_ids
+        normalized_ids = tuple(
+            dict.fromkeys(
+                source_id
+                for source_id in (str(value).strip() for value in raw_source_ids)
+                if source_id
+            )
+        )
+        normalized_active_id = (
+            None if active_source_id is None else str(active_source_id).strip() or None
+        )
+        locations: dict[
+            str,
+            tuple[str, TextureAtlasObjectList, int, QListWidgetItem],
+        ] = {}
+        for source_kind, source_list in (
+            ("object", self.object_list),
+            ("surface", self.surface_list),
+        ):
+            for row in range(source_list.count()):
+                item = source_list.item(row)
+                locations[str(item.data(OBJECT_ID_ROLE))] = (
+                    source_kind,
+                    source_list,
+                    row,
+                    item,
+                )
+
+        matched_ids = tuple(
+            source_id for source_id in normalized_ids if source_id in locations
+        )
+        active_match = (
+            normalized_active_id
+            if normalized_active_id in matched_ids
+            else (matched_ids[-1] if matched_ids else None)
+        )
+        source_kind = None if active_match is None else locations[active_match][0]
+        selected_ids = tuple(
+            source_id
+            for source_id in matched_ids
+            if locations[source_id][0] == source_kind
+        )
+        if active_match not in selected_ids:
+            active_match = selected_ids[-1] if selected_ids else None
+
+        was_syncing = self._is_syncing
+        self._is_syncing = True
+        try:
+            self.object_list.setCurrentRow(-1)
+            self.object_list.clearSelection()
+            self.surface_list.setCurrentRow(-1)
+            self.surface_list.clearSelection()
+            if active_match is not None:
+                _kind, target_list, active_row, _item = locations[active_match]
+                target_list.setCurrentRow(active_row)
+                for source_id in selected_ids:
+                    locations[source_id][3].setSelected(True)
+        finally:
+            self._is_syncing = was_syncing
+
+        self._active_source_kind = source_kind
+        active_item = None if active_match is None else locations[active_match][3]
+        if active_item is not None:
+            locations[active_match][1].scrollToItem(
+                active_item,
+                QAbstractItemView.ScrollHint.EnsureVisible,
+            )
+        for preview in self.map_previews.values():
+            preview.set_selected_object_id(active_match)
+        self._sync_controls()
+        self.request_selected_object_preview()
+        actual_selected_ids = self._selected_source_ids(source_kind)
+        self._last_published_source_selection = (
+            source_kind,
+            actual_selected_ids,
+            active_match,
+        )
+        return actual_selected_ids
+
     @property
     def object_preview_widget(self) -> QWidget | None:
         """Return the 3D viewer currently embedded beside the source lists."""
@@ -4191,10 +4289,14 @@ class TextureAtlasWorkspace(QWidget):
             "Create edge-compatible rotated variants of the selected Surface "
             "texture and aligned PBR maps in the same Atlas slot. The best "
             "layout uses gently curved joins; each variant has half the "
-            "original linear resolution."
+            "original linear resolution. A yellow pulse means repetition-seam "
+            "analysis recommends this repair."
         )
         self.fix_tiling_button.clicked.connect(
             self._request_selected_surface_texture_tiling_fix
+        )
+        self._fix_tiling_button_base_color = QColor(
+            self.fix_tiling_button.palette().color(QPalette.ColorRole.Button)
         )
         texture_column_layout.addWidget(self.fix_tiling_button)
 
@@ -5704,7 +5806,7 @@ class TextureAtlasWorkspace(QWidget):
             item.setForeground(SCENE_BOUND_SOURCE_COLOR)
 
     def _apply_new_source_attention_strength(self, value: object) -> None:
-        """Apply one animation frame to every pending generated source row."""
+        """Apply one animation frame to every source needing attention."""
 
         try:
             strength = float(value)
@@ -5712,11 +5814,16 @@ class TextureAtlasWorkspace(QWidget):
             strength = 0.0
         self._new_source_attention_strength = max(0.0, min(1.0, strength))
         self._apply_new_source_attention_backgrounds()
+        self._apply_fix_tiling_button_attention()
 
     def _apply_new_source_attention_backgrounds(self) -> None:
-        """Blend visible pending rows from their list color toward yellow."""
+        """Blend visible pending and tiling-warning rows toward yellow."""
 
         strength = self._new_source_attention_strength
+        attention_ids = (
+            self._new_source_attention_ids
+            | self._surface_tiling_fix_attention_ids
+        )
         for source_list in (self.object_list, self.surface_list):
             normal_color = source_list.palette().color(QPalette.ColorRole.Base)
             attention_color = _interpolate_color(
@@ -5727,12 +5834,33 @@ class TextureAtlasWorkspace(QWidget):
             for row in range(source_list.count()):
                 item = source_list.item(row)
                 source_id = str(item.data(OBJECT_ID_ROLE))
-                if source_id in self._new_source_attention_ids:
+                if source_id in attention_ids:
                     item.setBackground(attention_color)
                     item.setData(NEW_SOURCE_ATTENTION_ROLE, strength)
                 else:
                     item.setBackground(QBrush())
                     item.setData(NEW_SOURCE_ATTENTION_ROLE, None)
+
+    def _apply_fix_tiling_button_attention(self) -> None:
+        """Blink the enabled repair action for one warned Surface texture."""
+
+        source_id = self.selected_surface_texture_id
+        needs_attention = (
+            self.fix_tiling_button.isEnabled()
+            and source_id in self._surface_tiling_fix_attention_ids
+        )
+        button_color = self._fix_tiling_button_base_color
+        if needs_attention:
+            button_color = _interpolate_color(
+                button_color,
+                NEW_SOURCE_ATTENTION_COLOR,
+                self._new_source_attention_strength,
+            )
+        palette = self.fix_tiling_button.palette()
+        if palette.color(QPalette.ColorRole.Button) == button_color:
+            return
+        palette.setColor(QPalette.ColorRole.Button, button_color)
+        self.fix_tiling_button.setPalette(palette)
 
     def _dismiss_new_source_attention(self, source_id: str) -> None:
         """Clear one notification only after its row receives a mouse click."""
@@ -5750,20 +5878,25 @@ class TextureAtlasWorkspace(QWidget):
 
         self._new_source_attention_ids.clear()
         self._seen_new_source_attention_ids.clear()
-        self._new_source_attention_animation.stop()
-        self._new_source_attention_strength = 0.0
         self._apply_new_source_attention_backgrounds()
+        self._sync_new_source_attention_animation()
 
     def _sync_new_source_attention_animation(self) -> None:
-        """Run the breathing animation only while a pending row is visible."""
+        """Run the breathing animation while any attention row is visible."""
 
         visible_source_ids = {
             str(source_list.item(row).data(OBJECT_ID_ROLE))
             for source_list in (self.object_list, self.surface_list)
             for row in range(source_list.count())
         }
-        visible_attention_ids = self._new_source_attention_ids.intersection(
+        visible_new_attention_ids = self._new_source_attention_ids.intersection(
             visible_source_ids
+        )
+        visible_tiling_attention_ids = (
+            self._surface_tiling_fix_attention_ids.intersection(visible_source_ids)
+        )
+        visible_attention_ids = (
+            visible_new_attention_ids | visible_tiling_attention_ids
         )
         stale_attention_ids = self._seen_new_source_attention_ids.difference(
             visible_source_ids
@@ -5771,7 +5904,7 @@ class TextureAtlasWorkspace(QWidget):
         if stale_attention_ids:
             self._new_source_attention_ids.difference_update(stale_attention_ids)
             self._seen_new_source_attention_ids.difference_update(stale_attention_ids)
-        self._seen_new_source_attention_ids.update(visible_attention_ids)
+        self._seen_new_source_attention_ids.update(visible_new_attention_ids)
         if visible_attention_ids:
             if (
                 self._new_source_attention_animation.state()
@@ -5781,6 +5914,8 @@ class TextureAtlasWorkspace(QWidget):
             return
         self._new_source_attention_animation.stop()
         self._new_source_attention_strength = 0.0
+        self._apply_new_source_attention_backgrounds()
+        self._apply_fix_tiling_button_attention()
 
     def _refresh_preview(self) -> None:
         self._refresh_atlas_storage_sizes()
@@ -5886,6 +6021,7 @@ class TextureAtlasWorkspace(QWidget):
         self.fix_tiling_button.setEnabled(
             self._active_source_kind == "surface" and source is not None
         )
+        self._apply_fix_tiling_button_attention()
         self._sync_surface_repeat_size_editor()
 
     def _sync_surface_repeat_size_editor(self) -> None:

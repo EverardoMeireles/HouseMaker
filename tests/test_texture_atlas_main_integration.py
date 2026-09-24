@@ -817,6 +817,266 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             frozenset(source_ids),
         )
 
+    def test_canvas_object_selection_selects_its_object_texture_without_feedback(
+        self,
+    ) -> None:
+        records = tuple(
+            _generated_object_record_with_variants(
+                self.settings.path.parent / "generated",
+                object_id=object_id,
+                object_name=object_id.title(),
+                resolutions=(512,),
+                selected_resolution=512,
+            )
+            for object_id in ("chair", "table")
+        )
+        data = GenerationData(generated_objects=list(records))
+        self.workspace.generation.set_data(data)
+        self.workspace.generation.data_changed.emit(data)
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        self.assertTrue(atlas_workspace._select_object_row("table"))
+        object_selection_signals: list[object] = []
+        surface_selection_signals: list[object] = []
+        atlas_workspace.object_textures_selected.connect(
+            object_selection_signals.append
+        )
+        atlas_workspace.surface_textures_selected.connect(
+            surface_selection_signals.append
+        )
+
+        with patch.object(
+            self.workspace.viewer,
+            "get_selected_placed_object_ids",
+            return_value=("chair",),
+        ):
+            self.workspace._handle_canvas_placed_object_selection_changed("chair")
+
+        self.assertEqual(atlas_workspace.selected_object_texture_ids, ("chair",))
+        self.assertEqual(atlas_workspace.selected_object_texture_id, "chair")
+        self.assertEqual(atlas_workspace.selected_surface_texture_ids, ())
+        self.assertEqual(object_selection_signals, [])
+        self.assertEqual(surface_selection_signals, [])
+
+    def test_canvas_multi_object_selection_selects_all_textured_objects_in_atlas(
+        self,
+    ) -> None:
+        records = tuple(
+            _generated_object_record_with_variants(
+                self.settings.path.parent / "generated",
+                object_id=object_id,
+                object_name=object_id.title(),
+                resolutions=(512,),
+                selected_resolution=512,
+            )
+            for object_id in ("chair", "lamp", "table")
+        )
+        data = GenerationData(generated_objects=list(records))
+        self.workspace.generation.set_data(data)
+        self.workspace.generation.data_changed.emit(data)
+        atlas_workspace = self.workspace.texture_atlas_workspace
+
+        with patch.object(
+            self.workspace.viewer,
+            "get_selected_placed_object_id",
+            return_value="table",
+        ):
+            self.workspace._handle_canvas_placed_object_selection_set_changed(
+                ("chair", "table")
+            )
+
+        self.assertEqual(
+            atlas_workspace.selected_object_texture_ids,
+            ("chair", "table"),
+        )
+        self.assertEqual(atlas_workspace.selected_object_texture_id, "table")
+        self.assertEqual(atlas_workspace.selected_surface_texture_ids, ())
+
+    def test_canvas_untextured_object_selection_clears_stale_atlas_selection(
+        self,
+    ) -> None:
+        textured_record = _generated_object_record_with_variants(
+            self.settings.path.parent / "generated",
+            object_id="textured-chair",
+            object_name="Textured chair",
+            resolutions=(512,),
+            selected_resolution=512,
+        )
+        geometry_only_record = replace(
+            _generated_object_record_with_variants(
+                self.settings.path.parent / "generated",
+                object_id="geometry-only-table",
+                object_name="Geometry only table",
+                resolutions=(512,),
+                selected_resolution=512,
+            ),
+            pipeline={},
+        )
+        data = GenerationData(
+            generated_objects=[textured_record, geometry_only_record]
+        )
+        self.workspace.generation.set_data(data)
+        self.workspace.generation.data_changed.emit(data)
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        self.assertTrue(atlas_workspace._select_object_row("textured-chair"))
+
+        with patch.object(
+            self.workspace.viewer,
+            "get_selected_placed_object_ids",
+            return_value=("geometry-only-table",),
+        ):
+            self.workspace._handle_canvas_placed_object_selection_changed(
+                "geometry-only-table"
+            )
+
+        self.assertEqual(atlas_workspace.selected_object_texture_ids, ())
+        self.assertIsNone(atlas_workspace.selected_object_texture_id)
+        self.assertEqual(atlas_workspace.selected_surface_texture_ids, ())
+
+    def test_canvas_surface_selection_selects_distinct_assigned_surface_textures(
+        self,
+    ) -> None:
+        _add_square_room_to_level(self.workspace.current_level)
+        surfaces = tuple(build_fixed_surfaces(self.workspace.levels))
+        wall_ids = tuple(
+            surface.surface_id
+            for surface in surfaces
+            if surface.surface_type == SURFACE_TYPE_WALL
+        )[:3]
+        self.assertEqual(len(wall_ids), 3)
+        self.workspace.surface_texture_generation.set_levels(self.workspace.levels)
+        self.workspace._set_canvas_viewer_targets(surfaces)
+        assignments = (
+            _wall_texture_assignment(
+                self.settings.path.parent / "surface_textures",
+                assignment_id="brick",
+                surface_ids=(wall_ids[0],),
+            ),
+            _wall_texture_assignment(
+                self.settings.path.parent / "surface_textures",
+                assignment_id="plaster",
+                surface_ids=(wall_ids[1],),
+            ),
+        )
+        data = SurfaceTextureData(assignments=list(assignments))
+        self.workspace.surface_texture_generation.set_data(data)
+        self.workspace.surface_texture_generation.data_changed.emit(data)
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        plaster_source_id = build_atlas_wall_texture_source_id("plaster")
+        self.assertTrue(atlas_workspace._select_object_row(plaster_source_id))
+        object_selection_signals: list[object] = []
+        surface_selection_signals: list[object] = []
+        atlas_workspace.object_textures_selected.connect(
+            object_selection_signals.append
+        )
+        atlas_workspace.surface_textures_selected.connect(
+            surface_selection_signals.append
+        )
+
+        self.workspace._handle_canvas_surface_selection_changed(
+            (wall_ids[0], wall_ids[1], wall_ids[2])
+        )
+
+        source_ids = tuple(
+            build_atlas_wall_texture_source_id(assignment.assignment_id)
+            for assignment in assignments
+        )
+        self.assertEqual(atlas_workspace.selected_surface_texture_ids, source_ids)
+        self.assertEqual(atlas_workspace.selected_surface_texture_id, source_ids[-1])
+        self.assertEqual(atlas_workspace.selected_object_texture_ids, ())
+        self.assertEqual(object_selection_signals, [])
+        self.assertEqual(surface_selection_signals, [])
+
+        self.workspace._handle_canvas_surface_selection_changed((wall_ids[2],))
+
+        self.assertEqual(atlas_workspace.selected_surface_texture_ids, ())
+        self.assertIsNone(atlas_workspace.selected_surface_texture_id)
+        self.assertEqual(atlas_workspace.selected_object_texture_ids, ())
+
+    def test_canvas_stair_surface_selection_selects_its_surface_texture(
+        self,
+    ) -> None:
+        semantic_id = f"stair:{'a' * 32}/part:treads:floor"
+        assignment = _wall_texture_assignment(
+            self.settings.path.parent / "surface_textures",
+            assignment_id="stair-treads",
+            surface_ids=(semantic_id,),
+            surface_type=SURFACE_TYPE_FLOOR,
+        )
+        data = SurfaceTextureData(assignments=[assignment])
+        self.workspace.surface_texture_generation.set_data(data)
+        self.workspace.surface_texture_generation.data_changed.emit(data)
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        source_id = build_atlas_wall_texture_source_id(assignment.assignment_id)
+        self.workspace.stairs = [Mock()]
+        self.workspace._canvas_stair_part_targets_by_id = {
+            semantic_id: SimpleNamespace(stair_index=0)
+        }
+
+        with (
+            patch.object(
+                self.workspace,
+                "_sync_surface_generation_selection",
+            ),
+            patch.object(
+                self.workspace,
+                "_read_stair_editor_parameters",
+                return_value=Mock(),
+            ),
+            patch.object(self.workspace, "_discard_staged_stair_edit"),
+            patch.object(self.workspace, "_load_stair_editor_from_stair"),
+            patch.object(self.workspace, "_update_stair_button_state"),
+        ):
+            self.workspace._handle_canvas_stair_part_selection_changed(
+                (semantic_id,)
+            )
+
+        self.assertEqual(
+            atlas_workspace.selected_surface_texture_ids,
+            (source_id,),
+        )
+        self.assertEqual(atlas_workspace.selected_surface_texture_id, source_id)
+        self.assertEqual(atlas_workspace.selected_object_texture_ids, ())
+
+    def test_surface_tiling_warning_refreshes_when_diagnostic_changes(self) -> None:
+        assignment = replace(
+            _wall_texture_assignment(
+                self.settings.path.parent / "surface_textures",
+                assignment_id="seamed-plaster",
+            ),
+            tiling_fix_needed=True,
+        )
+        source_id = build_atlas_wall_texture_source_id(assignment.assignment_id)
+        data = SurfaceTextureData(assignments=[assignment])
+
+        self.workspace.surface_texture_generation.set_data(data)
+        self.workspace.surface_texture_generation.data_changed.emit(data)
+
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        self.assertTrue(
+            atlas_workspace._surface_texture_entries_by_id[
+                source_id
+            ].tiling_fix_needed
+        )
+        self.assertIn(
+            source_id,
+            atlas_workspace._surface_tiling_fix_attention_ids,
+        )
+
+        repaired = replace(assignment, tiling_fix_needed=False)
+        repaired_data = SurfaceTextureData(assignments=[repaired])
+        self.workspace.surface_texture_generation.set_data(repaired_data)
+        self.workspace.surface_texture_generation.data_changed.emit(repaired_data)
+
+        self.assertFalse(
+            atlas_workspace._surface_texture_entries_by_id[
+                source_id
+            ].tiling_fix_needed
+        )
+        self.assertNotIn(
+            source_id,
+            atlas_workspace._surface_tiling_fix_attention_ids,
+        )
+
     def test_geometry_only_object_can_be_previewed_and_placed_from_atlas(
         self,
     ) -> None:
@@ -4355,9 +4615,12 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         self,
     ) -> None:
         surface_asset_directory = self.settings.path.parent / "surface_textures"
-        assignment = _wall_texture_assignment_with_pbr_variants(
-            surface_asset_directory,
-            assignment_id="tiling-wall",
+        assignment = replace(
+            _wall_texture_assignment_with_pbr_variants(
+                surface_asset_directory,
+                assignment_id="tiling-wall",
+            ),
+            tiling_fix_needed=True,
         )
         surface_workspace = self.workspace.surface_texture_generation
         surface_workspace.set_data(
@@ -4382,6 +4645,10 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             assignment.assignment_id
         )
         atlas_workspace = self.workspace.texture_atlas_workspace
+        self.assertIn(
+            source_id,
+            atlas_workspace._surface_tiling_fix_attention_ids,
+        )
         surface_source = atlas_workspace._sources_by_object_id[source_id]
         object_source = atlas_workspace._sources_by_object_id[
             object_record.object_id
@@ -4470,12 +4737,18 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
                 texture_variants=assignment.texture_variants,
                 tiling_mode=assignment.tiling_mode,
                 tiling_seed=assignment.tiling_seed,
+                tiling_fix_needed=assignment.tiling_fix_needed,
             ),
             assignment,
         )
         self.assertEqual(
             repaired_assignment.tiling_mode,
             SURFACE_TILING_MODE_EDGE_VARIANTS,
+        )
+        self.assertFalse(repaired_assignment.tiling_fix_needed)
+        self.assertNotIn(
+            source_id,
+            atlas_workspace._surface_tiling_fix_attention_ids,
         )
         self.assertEqual(
             tuple(
@@ -4568,6 +4841,10 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
         self.assertEqual(
             surface_workspace.get_assignment(assignment.assignment_id),
             assignment,
+        )
+        self.assertIn(
+            source_id,
+            atlas_workspace._surface_tiling_fix_attention_ids,
         )
         restored_atlas = atlas_workspace.get_data().atlas_by_id(atlas.atlas_id)
         assert restored_atlas is not None
