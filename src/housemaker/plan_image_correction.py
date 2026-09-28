@@ -531,6 +531,7 @@ def openai_responses_image_edit(
     prompt: str,
     output_size: tuple[int, int],
     cancellation_check: CancellationCheck | None,
+    background: str | None = None,
 ) -> bytes:
     """Use a GPT-5.6 model to direct an image-generation edit."""
 
@@ -547,8 +548,22 @@ def openai_responses_image_edit(
             "OpenAI image correction is not configured."
         )
     _validate_output_size(output_size)
+    if background not in {None, "auto", "opaque", "transparent"}:
+        raise PlanImageCorrectionInferenceError(
+            "The requested OpenAI image background is unsupported."
+        )
     _raise_if_cancelled(cancellation_check)
     encoded_input = base64.b64encode(bytes(image_bytes)).decode("ascii")
+    image_tool = {
+        "type": "image_generation",
+        "model": OPENAI_IMAGE_MODEL,
+        "action": "edit",
+        "quality": OPENAI_IMAGE_QUALITY,
+        "size": f"{output_size[0]}x{output_size[1]}",
+        "output_format": "png",
+    }
+    if background is not None:
+        image_tool["background"] = background
     request_body = json.dumps(
         {
             "model": model,
@@ -565,16 +580,7 @@ def openai_responses_image_edit(
                     ],
                 }
             ],
-            "tools": [
-                {
-                    "type": "image_generation",
-                    "model": OPENAI_IMAGE_MODEL,
-                    "action": "edit",
-                    "quality": OPENAI_IMAGE_QUALITY,
-                    "size": f"{output_size[0]}x{output_size[1]}",
-                    "output_format": "png",
-                }
-            ],
+            "tools": [image_tool],
             "tool_choice": {"type": "image_generation"},
             "store": False,
         },

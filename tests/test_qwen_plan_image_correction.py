@@ -17,6 +17,7 @@ from housemaker.qwen_plan_image_correction import (
     QwenPlanCorrectionError,
     QwenSdCppModelBundle,
     QwenSdCppPlanImageEditor,
+    create_default_qwen_object_reference_editor,
     default_qwen_model_bundle,
 )
 
@@ -133,10 +134,66 @@ class QwenSdCppPlanImageEditorTests(unittest.TestCase):
         self.assertIn("--offload-to-cpu", command)
         self.assertIn("--diffusion-fa", command)
         self.assertIn("--vae-tiling", command)
+        self.assertNotIn("--ref-image-args", command)
         self.assertEqual(command[command.index("-p") + 1], "Correct this architectural plan.")
         self.assertFalse(kwargs["shell"])
         self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
         self.assertEqual(kwargs["stderr"], subprocess.STDOUT)
+
+    def test_default_object_reference_factory_only_preserves_output_alpha(
+        self,
+    ) -> None:
+        with patch(
+            "housemaker.qwen_plan_image_correction.default_qwen_model_bundle",
+            return_value=self.bundle,
+        ):
+            editor = create_default_qwen_object_reference_editor()
+
+        self.assertFalse(editor._preserve_input_alpha)
+        self.assertTrue(editor._preserve_output_alpha)
+
+    def test_preserves_qwen_alpha_output(self) -> None:
+        staged_mode = ""
+
+        def start_process(
+            command: list[str],
+            **_kwargs: object,
+        ) -> CompletedProcess:
+            nonlocal staged_mode
+            input_path = Path(command[command.index("-r") + 1])
+            with Image.open(input_path) as staged:
+                staged_mode = staged.mode
+            output_path = Path(command[command.index("-o") + 1])
+            Image.new("RGBA", (1024, 1024), (20, 40, 60, 73)).save(
+                output_path,
+                "PNG",
+            )
+            return CompletedProcess()
+
+        editor = QwenSdCppPlanImageEditor(
+            self.bundle,
+            preserve_output_alpha=True,
+        )
+        source = BytesIO()
+        Image.new("RGBA", (1024, 1024), (100, 120, 140, 51)).save(
+            source,
+            format="PNG",
+        )
+        with patch(
+            "housemaker.qwen_plan_image_correction.subprocess.Popen",
+            side_effect=start_process,
+        ):
+            result = editor(
+                source.getvalue(),
+                prompt="Generate an isolated object.",
+                output_size=(1024, 1024),
+                cancellation_check=None,
+            )
+
+        self.assertEqual(staged_mode, "RGB")
+        with Image.open(BytesIO(result)) as image:
+            self.assertEqual(image.mode, "RGBA")
+            self.assertEqual(image.getpixel((0, 0)), (20, 40, 60, 73))
 
     def test_cancellation_terminates_running_process(self) -> None:
         state = {"cancelled": False}

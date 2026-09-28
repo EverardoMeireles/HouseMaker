@@ -3,20 +3,22 @@ from __future__ import annotations
 
 import copy
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QThread, QRect, Qt, Signal, Slot
+from PySide6.QtCore import QRect, Qt, QThread, Signal, Slot
 from PySide6.QtGui import QColor, QKeySequence, QPainter, QPaintEvent, QPen, QShortcut
 from PySide6.QtWidgets import (
+    QComboBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -51,6 +53,16 @@ from housemaker.generation_workspace import (
     GENERATION_JOB_KIND_TEXTURE,
     GenerationWorkspace,
 )
+from housemaker.object_reference_editing import (
+    DEFAULT_OBJECT_REFERENCE_EDIT_MODEL,
+    OBJECT_REFERENCE_EDIT_MODEL_OPTIONS,
+    OBJECT_REFERENCE_EDIT_OUTPUT_SHAPE,
+    SUPPORTED_OBJECT_REFERENCE_EDIT_MODELS,
+    ObjectReferenceEditingCancelled,
+    ObjectReferenceEditingError,
+    edit_object_reference,
+    object_reference_edit_model_requires_api_key,
+)
 from housemaker.settings_widget import DEFAULT_CLEAR_MASK_HOTKEY
 from housemaker.surface_texture_state import SurfaceTextureData
 from housemaker.surface_texture_workspace import (
@@ -68,6 +80,17 @@ OBJECT_WORKFLOW_OUTLINE_PADDING = 5
 WORKFLOW_SECTION_SPACING = 10
 CEILING_HEIGHT_SHUTDOWN_WAIT_MILLISECONDS = 100
 CEILING_HEIGHT_NOT_ESTIMATED_TEXT = "Ceiling height: Not estimated"
+OBJECT_REFERENCE_EDIT_JOB_KIND = "object_reference_edit"
+OBJECT_REFERENCE_EDIT_STATUS_EMPTY = (
+    "Select one object, describe the change, then click Edit reference."
+)
+OBJECT_REFERENCE_EDIT_PROMPT_PRESETS = (
+    "show me a front of it",
+    "slightly rotated to the left",
+    "slightly rotated to the right",
+    "slightly isometric",
+    "top-down view",
+)
 CANCELLABLE_GENERATION_JOB_KINDS = frozenset(
     {
         GENERATION_JOB_KIND_MODEL,
@@ -75,6 +98,7 @@ CANCELLABLE_GENERATION_JOB_KINDS = frozenset(
         GENERATION_JOB_KIND_FACE_EDIT,
         SURFACE_TEXTURE_JOB_KIND,
         CEILING_HEIGHT_JOB_KIND,
+        OBJECT_REFERENCE_EDIT_JOB_KIND,
     }
 )
 
@@ -137,6 +161,92 @@ class _CeilingHeightInferenceRuntime:
     frame_revision: int
     job_id: str
     thread: _CeilingHeightInferenceThread
+    cancel_requested: bool = False
+
+
+# ### Object-reference editing jobs ###
+ObjectReferenceEditor = Callable[..., np.ndarray]
+
+
+class _ObjectReferenceEditThread(QThread):
+    """Generate one immutable square reference away from the GUI thread."""
+
+    def __init__(
+        self,
+        source_bgra: np.ndarray,
+        prompt: str,
+        model: str,
+        api_key: str,
+        editor: ObjectReferenceEditor,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._source_bgra = np.ascontiguousarray(source_bgra).copy()
+        self._prompt = str(prompt)
+        self._model = str(model)
+        self._api_key = str(api_key)
+        self._editor = editor
+        self.result: np.ndarray | None = None
+        self.error_message: str | None = None
+        self.was_cancelled = False
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            try:
+                result = self._editor(
+                    self._source_bgra,
+                    self._prompt,
+                    api_key=self._api_key,
+                    model=self._model,
+                    cancellation_check=self.isInterruptionRequested,
+                )
+            except ObjectReferenceEditingCancelled:
+                self.was_cancelled = True
+                return
+            except ObjectReferenceEditingError as error:
+                if self.isInterruptionRequested():
+                    self.was_cancelled = True
+                else:
+                    self.error_message = str(error)
+                return
+            except Exception:  # noqa: BLE001 - redact worker/provider internals.
+                if self.isInterruptionRequested():
+                    self.was_cancelled = True
+                else:
+                    self.error_message = "Object reference editing failed."
+                return
+            if self.isInterruptionRequested():
+                self.was_cancelled = True
+                return
+            prepared_result = np.asarray(result)
+            if (
+                prepared_result.dtype != np.uint8
+                or prepared_result.shape != OBJECT_REFERENCE_EDIT_OUTPUT_SHAPE
+                or prepared_result.ndim != 3
+                or prepared_result.shape[2] != 4
+                or not np.any(prepared_result[:, :, 3] > 0)
+            ):
+                self.error_message = (
+                    "Object reference editing returned an invalid image."
+                )
+                return
+            self.result = np.ascontiguousarray(prepared_result).copy()
+        finally:
+            self._api_key = ""
+            self._model = ""
+            self._prompt = ""
+            self._source_bgra = np.empty((0, 0, 4), dtype=np.uint8)
+
+
+@dataclass
+class _ObjectReferenceEditRuntime:
+    """GUI-owned lifecycle and stale-input guard for one reference edit."""
+
+    signature: tuple[object, ...]
+    model: str
+    prompt: str
+    job_id: str
+    thread: _ObjectReferenceEditThread
     cancel_requested: bool = False
 
 
@@ -210,6 +320,7 @@ class MergedGenerationWorkspace(QWidget):
         parent: QWidget | None = None,
         *,
         ceiling_height_estimator: CeilingHeightEstimator | None = None,
+        object_reference_editor: ObjectReferenceEditor | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("merged_generation_workspace")
@@ -223,6 +334,14 @@ class MergedGenerationWorkspace(QWidget):
         )
         self._ceiling_height_frame_revision = 0
         self._ceiling_height_runtime: _CeilingHeightInferenceRuntime | None = None
+        self._object_reference_editor = (
+            edit_object_reference
+            if object_reference_editor is None
+            else object_reference_editor
+        )
+        self._object_reference_edit_runtime: (
+            _ObjectReferenceEditRuntime | None
+        ) = None
         self._is_shutdown = False
 
         self.surface_workspace.setParent(self)
@@ -242,25 +361,33 @@ class MergedGenerationWorkspace(QWidget):
         self.sync_shared_controls()
 
     def shutdown(self) -> None:
-        """Cancel and join the frame-analysis worker exactly once."""
+        """Cancel and join Generation-tab analysis workers exactly once."""
 
         if self._is_shutdown:
             return
         self._is_shutdown = True
-        runtime = self._ceiling_height_runtime
-        if runtime is None:
-            return
-        runtime.cancel_requested = True
-        runtime.thread.requestInterruption()
-        self.job_manager.set_cancel_callback(runtime.job_id, None)
-        self.job_manager.mark_cancelled(
-            runtime.job_id,
-            stage="Cancelled during shutdown",
+        runtimes = tuple(
+            runtime
+            for runtime in (
+                self._ceiling_height_runtime,
+                self._object_reference_edit_runtime,
+            )
+            if runtime is not None
         )
-        while runtime.thread.isRunning():
-            runtime.thread.wait(CEILING_HEIGHT_SHUTDOWN_WAIT_MILLISECONDS)
-        runtime.thread.deleteLater()
+        for runtime in runtimes:
+            runtime.cancel_requested = True
+            runtime.thread.requestInterruption()
+            self.job_manager.set_cancel_callback(runtime.job_id, None)
+            self.job_manager.mark_cancelled(
+                runtime.job_id,
+                stage="Cancelled during shutdown",
+            )
+        for runtime in runtimes:
+            while runtime.thread.isRunning():
+                runtime.thread.wait(CEILING_HEIGHT_SHUTDOWN_WAIT_MILLISECONDS)
+            runtime.thread.deleteLater()
         self._ceiling_height_runtime = None
+        self._object_reference_edit_runtime = None
 
     def set_clear_mask_hotkey(self, hotkey: str) -> None:
         """Apply the selected Generation-only Clear mask keymapping."""
@@ -581,6 +708,88 @@ class MergedGenerationWorkspace(QWidget):
         editing_layout.addWidget(face_actions)
         primary_layout.addWidget(self.object_editing_section)
 
+        self.reference_editing_section, reference_edit_layout = (
+            _build_boxed_section(
+                "Reference editing",
+                "merged_generation_object_reference_editing_section",
+            )
+        )
+        self.reference_edit_model_combo = QComboBox()
+        self.reference_edit_model_combo.setObjectName(
+            "object_reference_edit_model"
+        )
+        for label, model_id in OBJECT_REFERENCE_EDIT_MODEL_OPTIONS:
+            self.reference_edit_model_combo.addItem(label, model_id)
+        default_model_index = self.reference_edit_model_combo.findData(
+            DEFAULT_OBJECT_REFERENCE_EDIT_MODEL
+        )
+        self.reference_edit_model_combo.setCurrentIndex(default_model_index)
+        self.reference_edit_model_combo.setToolTip(
+            "Choose the AI model used to edit the selected object. Qwen runs "
+            "locally; the other choices use the configured OpenAI API key."
+        )
+        reference_edit_layout.addWidget(
+            _build_labeled_inline_control(
+                "Model",
+                self.reference_edit_model_combo,
+            )
+        )
+        self.reference_edit_prompt_preset_combo = QComboBox()
+        self.reference_edit_prompt_preset_combo.setObjectName(
+            "object_reference_edit_prompt_preset"
+        )
+        self.reference_edit_prompt_preset_combo.addItem(
+            "Append view instruction...",
+            None,
+        )
+        for preset in OBJECT_REFERENCE_EDIT_PROMPT_PRESETS:
+            self.reference_edit_prompt_preset_combo.addItem(preset, preset)
+        self.reference_edit_prompt_preset_combo.setCurrentIndex(0)
+        self.reference_edit_prompt_preset_combo.setToolTip(
+            "Append a reusable camera-view instruction to the edit prompt."
+        )
+        reference_edit_layout.addWidget(
+            _build_labeled_inline_control(
+                "View preset",
+                self.reference_edit_prompt_preset_combo,
+            )
+        )
+        self.reference_edit_prompt = QLineEdit()
+        self.reference_edit_prompt.setObjectName(
+            "object_reference_edit_prompt"
+        )
+        self.reference_edit_prompt.setPlaceholderText(
+            "Example: Remove the cover and reconstruct a bare wooden tabletop"
+        )
+        self.reference_edit_prompt.setMaxLength(2_000)
+        self.reference_edit_prompt.setClearButtonEnabled(True)
+        reference_edit_layout.addWidget(
+            _build_labeled_inline_control(
+                "Edit instruction",
+                self.reference_edit_prompt,
+            )
+        )
+
+        self.edit_reference_button = QPushButton("Edit reference")
+        self.edit_reference_button.setObjectName(
+            "edit_object_reference_button"
+        )
+        self.edit_reference_button.setToolTip(
+            "Use the current object mask and edit instruction to generate a "
+            "new 1024x1024 AI object reference and use it automatically. "
+            "Click again to retry, or move the frame slider to undo."
+        )
+        reference_edit_layout.addWidget(self.edit_reference_button)
+        self.reference_edit_status_label = QLabel(
+            OBJECT_REFERENCE_EDIT_STATUS_EMPTY
+        )
+        self.reference_edit_status_label.setObjectName(
+            "object_reference_edit_status_label"
+        )
+        self.reference_edit_status_label.setWordWrap(True)
+        reference_edit_layout.addWidget(self.reference_edit_status_label)
+        primary_layout.addWidget(self.reference_editing_section)
+
         self.object_creation_section, creation_layout = _build_boxed_section(
             "Generation",
             "merged_generation_object_creation_section",
@@ -646,10 +855,26 @@ class MergedGenerationWorkspace(QWidget):
         self.infer_ceiling_height_button.clicked.connect(
             self._start_ceiling_height_inference
         )
+        self.edit_reference_button.clicked.connect(
+            self._start_object_reference_edit
+        )
+        self.reference_edit_prompt_preset_combo.activated.connect(
+            self._append_reference_edit_prompt_preset
+        )
+        self.reference_edit_prompt.textChanged.connect(
+            self._handle_reference_edit_inputs_changed
+        )
+        self.reference_edit_model_combo.currentTextChanged.connect(
+            self._handle_reference_edit_inputs_changed
+        )
 
         self.video_view.strokes_changed.connect(surface._handle_video_strokes_changed)
         self.video_view.strokes_changed.connect(self.sync_shared_controls)
+        self.video_view.strokes_changed.connect(
+            self._handle_reference_edit_inputs_changed
+        )
         self.video_view.frame_changed.connect(self._handle_video_frame_changed)
+        objects.reference_edit_state_changed.connect(self.sync_shared_controls)
         try:
             self.seekbar.valueChanged.disconnect()
         except (RuntimeError, TypeError):
@@ -675,6 +900,11 @@ class MergedGenerationWorkspace(QWidget):
         """Invalidate estimates and preserve external current-frame updates."""
 
         self._ceiling_height_frame_revision += 1
+        reference_runtime = self._object_reference_edit_runtime
+        if reference_runtime is not None:
+            reference_runtime.cancel_requested = True
+            if not self.job_manager.cancel_job(reference_runtime.job_id):
+                reference_runtime.thread.requestInterruption()
         runtime = self._ceiling_height_runtime
         if runtime is not None:
             runtime.cancel_requested = True
@@ -682,6 +912,11 @@ class MergedGenerationWorkspace(QWidget):
                 runtime.thread.requestInterruption()
         self.ceiling_height_result_label.setText(
             CEILING_HEIGHT_NOT_ESTIMATED_TEXT
+        )
+        self.reference_edit_status_label.setText(
+            "Accepted edit active for this frame."
+            if self.object_workspace.has_current_accepted_object_reference()
+            else OBJECT_REFERENCE_EDIT_STATUS_EMPTY
         )
         self.current_video_frame_changed.emit()
         self.sync_shared_controls()
@@ -818,6 +1053,208 @@ class MergedGenerationWorkspace(QWidget):
             self.sync_shared_controls()
             thread.deleteLater()
 
+    # ### Object-reference editing ###
+    @Slot(int)
+    def _append_reference_edit_prompt_preset(self, index: int) -> None:
+        """Append one reusable view phrase without turning it into state."""
+
+        preset = self.reference_edit_prompt_preset_combo.itemData(int(index))
+        self.reference_edit_prompt_preset_combo.setCurrentIndex(0)
+        if not isinstance(preset, str) or not preset.strip():
+            return
+        current_prompt = self.reference_edit_prompt.text().strip()
+        separator = " " if current_prompt.endswith(",") else ", "
+        next_prompt = (
+            preset.strip()
+            if not current_prompt
+            else f"{current_prompt}{separator}{preset.strip()}"
+        )
+        if len(next_prompt) > self.reference_edit_prompt.maxLength():
+            self.reference_edit_status_label.setText(
+                "The view preset would exceed the edit instruction limit."
+            )
+            return
+        self.reference_edit_prompt.setText(next_prompt)
+
+    @Slot(object)
+    def _handle_reference_edit_inputs_changed(self, _value: object) -> None:
+        """Cancel stale work without discarding an accepted frame edit."""
+
+        self.reference_edit_status_label.setText(
+            "Edited reference remains active. Click Edit reference to replace "
+            "it, or move the frame slider to undo."
+            if self.object_workspace.has_current_accepted_object_reference()
+            else OBJECT_REFERENCE_EDIT_STATUS_EMPTY
+        )
+        runtime = self._object_reference_edit_runtime
+        if runtime is not None:
+            runtime.cancel_requested = True
+            if not self.job_manager.cancel_job(runtime.job_id):
+                runtime.thread.requestInterruption()
+        self.sync_shared_controls()
+
+    @Slot()
+    def _start_object_reference_edit(self) -> None:
+        """Generate one square reference from the selected masked object."""
+
+        if self._is_shutdown or self._object_reference_edit_runtime is not None:
+            return
+        prompt = self.reference_edit_prompt.text().strip()
+        if not prompt:
+            self.reference_edit_status_label.setText(
+                "Enter how the selected object should be changed."
+            )
+            return
+        model = str(self.reference_edit_model_combo.currentData() or "")
+        if model not in SUPPORTED_OBJECT_REFERENCE_EDIT_MODELS:
+            self.reference_edit_status_label.setText(
+                "Choose a supported object reference editing model."
+            )
+            return
+        api_key = (
+            self.object_workspace.get_runtime_settings().openai_api_key.strip()
+        )
+        if object_reference_edit_model_requires_api_key(model) and not api_key:
+            self.reference_edit_status_label.setText(
+                "Add an OpenAI API key in Settings before editing a reference."
+            )
+            return
+        try:
+            source_bgra, signature = (
+                self.object_workspace.build_object_reference_edit_inputs()
+            )
+        except ValueError as error:
+            self.reference_edit_status_label.setText(str(error))
+            return
+
+        thread = _ObjectReferenceEditThread(
+            source_bgra,
+            prompt,
+            model,
+            api_key,
+            self._object_reference_editor,
+            parent=self,
+        )
+        job = self.job_manager.create_job(
+            kind=OBJECT_REFERENCE_EDIT_JOB_KIND,
+            requested_name="",
+            default_name="Object reference edit",
+            stage="Preparing square object reference (10%)",
+        )
+        runtime = _ObjectReferenceEditRuntime(
+            signature=signature,
+            model=model,
+            prompt=prompt,
+            job_id=job.job_id,
+            thread=thread,
+        )
+        self._object_reference_edit_runtime = runtime
+        self.job_manager.set_cancel_callback(
+            job.job_id,
+            partial(self._cancel_object_reference_edit, job.job_id),
+        )
+        thread.finished.connect(
+            partial(
+                self._handle_object_reference_edit_finished,
+                job.job_id,
+                thread,
+            )
+        )
+        self.reference_edit_status_label.setText(
+            "Generating a 1024x1024 object reference..."
+        )
+        self.job_manager.update_job(
+            job.job_id,
+            stage="Generating edited object reference (20%)",
+        )
+        self.sync_shared_controls()
+        thread.start()
+
+    def _cancel_object_reference_edit(self, job_id: str) -> bool:
+        runtime = self._object_reference_edit_runtime
+        if runtime is None or runtime.job_id != str(job_id):
+            return False
+        runtime.cancel_requested = True
+        runtime.thread.requestInterruption()
+        self.sync_shared_controls()
+        return True
+
+    def _handle_object_reference_edit_finished(
+        self,
+        job_id: str,
+        thread: _ObjectReferenceEditThread,
+    ) -> None:
+        """Atomically accept a successful result from still-current inputs."""
+
+        runtime = self._object_reference_edit_runtime
+        try:
+            if (
+                runtime is None
+                or runtime.job_id != job_id
+                or runtime.thread is not thread
+            ):
+                return
+            self.job_manager.set_cancel_callback(job_id, None)
+            current_signature = (
+                self.object_workspace.get_current_object_reference_edit_signature()
+            )
+            is_stale = (
+                current_signature != runtime.signature
+                or self.reference_edit_model_combo.currentData() != runtime.model
+                or self.reference_edit_prompt.text().strip() != runtime.prompt
+            )
+            if (
+                self._is_shutdown
+                or runtime.cancel_requested
+                or thread.was_cancelled
+                or is_stale
+            ):
+                stage = (
+                    "Ignored after the reference inputs changed"
+                    if is_stale
+                    else "Cancelled"
+                )
+                self.job_manager.mark_cancelled(job_id, stage=stage)
+                if not self._is_shutdown:
+                    self.reference_edit_status_label.setText(stage + ".")
+                return
+            if thread.error_message is not None or thread.result is None:
+                message = thread.error_message or (
+                    "Object reference editing returned no image."
+                )
+                self.job_manager.fail_job(job_id, stage=f"Failed: {message}")
+                self.reference_edit_status_label.setText(
+                    f"Reference edit failed: {message}"
+                )
+                return
+
+            if not self.object_workspace.accept_object_reference_edit(
+                runtime.signature,
+                thread.result,
+            ):
+                message = (
+                    "The selected object changed before the edited reference "
+                    "could be applied."
+                )
+                self.job_manager.fail_job(job_id, stage=f"Failed: {message}")
+                self.reference_edit_status_label.setText(message)
+                return
+            self.video_view.set_reference_preview_bgra(thread.result)
+            self.reference_edit_status_label.setText(
+                "Edited reference active for the next Meshy request. Click "
+                "Edit reference again to retry, or move the frame slider to "
+                "undo."
+            )
+            self.job_manager.complete_job(
+                job_id,
+                stage="Reference edit accepted",
+            )
+        finally:
+            if runtime is not None and runtime.thread is thread:
+                self._object_reference_edit_runtime = None
+            self.sync_shared_controls()
+            thread.deleteLater()
+
     @Slot()
     def _handle_load_video_clicked(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
@@ -868,6 +1305,7 @@ class MergedGenerationWorkspace(QWidget):
         target_strokes = objects._data.strokes_for_frame(safe_index)
         if not target_strokes:
             target_strokes = surface._data.strokes_for_frame(safe_index)
+        objects.discard_object_reference_before_frame_change(safe_index)
         for workspace in (objects, surface):
             workspace._data.current_frame_index = safe_index
             workspace._displayed_frame_index = safe_index
@@ -893,18 +1331,59 @@ class MergedGenerationWorkspace(QWidget):
         has_untracked_object_job = bool(
             objects._generation_thread is not None and not objects._object_job_runtimes
         )
-        editor_is_available = has_video and not has_untracked_object_job
-        self.load_video_button.setEnabled(not has_untracked_object_job)
+        reference_edit_is_running = self._object_reference_edit_runtime is not None
+        editor_is_available = (
+            has_video
+            and not has_untracked_object_job
+            and not reference_edit_is_running
+        )
+        accepted_edit_is_available = (
+            objects.has_current_accepted_object_reference()
+        )
+        inpainting_is_available = (
+            editor_is_available and not accepted_edit_is_available
+        )
+        self.load_video_button.setEnabled(
+            not has_untracked_object_job and not reference_edit_is_running
+        )
         self.seekbar.setEnabled(editor_is_available)
-        self.paint_mask_button.setEnabled(editor_is_available)
-        self.erase_mask_button.setEnabled(editor_is_available)
-        self.brush_size_spinbox.setEnabled(editor_is_available)
+        self.paint_mask_button.setEnabled(inpainting_is_available)
+        self.erase_mask_button.setEnabled(inpainting_is_available)
+        self.brush_size_spinbox.setEnabled(inpainting_is_available)
         self.clear_mask_button.setEnabled(
-            editor_is_available and self.video_view.has_selection()
+            inpainting_is_available and self.video_view.has_selection()
         )
         self.pbr_map_control.setEnabled(not has_untracked_object_job)
         self.ai_prompt_edit.setEnabled(not has_untracked_object_job)
-        self.video_view.set_interaction_enabled(editor_is_available)
+        self.video_view.set_interaction_enabled(inpainting_is_available)
+        has_object_mask = self.video_view.has_selection()
+        has_edit_prompt = bool(self.reference_edit_prompt.text().strip())
+        has_openai_key = bool(
+            objects.get_runtime_settings().openai_api_key.strip()
+        )
+        selected_reference_model = str(
+            self.reference_edit_model_combo.currentData() or ""
+        )
+        has_reference_edit_credentials = (
+            selected_reference_model in SUPPORTED_OBJECT_REFERENCE_EDIT_MODELS
+            and (
+                not object_reference_edit_model_requires_api_key(
+                    selected_reference_model
+                )
+                or has_openai_key
+            )
+        )
+        self.edit_reference_button.setEnabled(
+            editor_is_available
+            and has_object_mask
+            and has_edit_prompt
+            and has_reference_edit_credentials
+        )
+        self.reference_edit_prompt.setEnabled(editor_is_available)
+        self.reference_edit_prompt_preset_combo.setEnabled(
+            editor_is_available
+        )
+        self.reference_edit_model_combo.setEnabled(editor_is_available)
         ceiling_inference_is_running = self._ceiling_height_runtime is not None
         self.infer_ceiling_height_button.setEnabled(
             not self._is_shutdown

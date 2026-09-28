@@ -28,6 +28,9 @@ BRUSH_CURSOR_PAINT_COLOR = QColor(95, 215, 255, 235)
 BRUSH_CURSOR_ERASE_COLOR = QColor(255, 174, 92, 235)
 DEFAULT_BRUSH_RADIUS_PIXELS = 24
 MIN_NORMALIZED_BRUSH_RADIUS = 1e-6
+PREVIEW_CHECKER_LIGHT_COLOR = QColor("#66707c")
+PREVIEW_CHECKER_DARK_COLOR = QColor("#404852")
+PREVIEW_CHECKER_SIZE_PIXELS = 12
 
 
 # ### Video mask widget ###
@@ -44,6 +47,9 @@ class VideoInpaintView(QWidget):
         self._mask = np.empty((0, 0), dtype=np.uint8)
         self._mask_overlay_image = QImage()
         self._strokes: list[MaskStroke] = []
+        self._reference_edit_input_revision = 0
+        self._reference_preview_bgra: np.ndarray | None = None
+        self._reference_preview_image = QImage()
         self._active_points: list[MaskPoint] = []
         self._brush_mode = MASK_MODE_PAINT
         self._brush_radius_pixels = DEFAULT_BRUSH_RADIUS_PIXELS
@@ -63,12 +69,14 @@ class VideoInpaintView(QWidget):
         strokes: list[MaskStroke] | None = None,
     ) -> None:
         self._cancel_active_stroke()
+        self.clear_reference_preview()
         if frame_bgr is None:
             self._frame_bgr = None
             self._frame_image = QImage()
             self._mask = np.empty((0, 0), dtype=np.uint8)
             self._mask_overlay_image = QImage()
             self._strokes = []
+            self._mark_reference_edit_inputs_changed()
             self.update()
             self.frame_changed.emit()
             return
@@ -78,6 +86,7 @@ class VideoInpaintView(QWidget):
         self._frame_image = _bgr_array_to_qimage(self._frame_bgr)
         self._strokes = list(strokes or [])
         self._rebuild_mask()
+        self._mark_reference_edit_inputs_changed()
         self.update()
         self.frame_changed.emit()
 
@@ -90,6 +99,7 @@ class VideoInpaintView(QWidget):
         self._cancel_active_stroke()
         self._strokes = list(strokes)
         self._rebuild_mask()
+        self._mark_reference_edit_inputs_changed()
         self.update()
 
     def get_strokes(self) -> list[MaskStroke]:
@@ -97,6 +107,11 @@ class VideoInpaintView(QWidget):
 
     def get_mask(self) -> np.ndarray:
         return self._mask.copy()
+
+    def get_reference_edit_input_revision(self) -> int:
+        """Return a cheap identity for the frame and object selection."""
+
+        return int(self._reference_edit_input_revision)
 
     def get_frame_bgr(self) -> np.ndarray | None:
         if self._frame_bgr is None:
@@ -133,12 +148,52 @@ class VideoInpaintView(QWidget):
             self._cancel_active_stroke()
         self.update()
 
+    def set_reference_preview_bgra(self, preview_bgra: np.ndarray) -> None:
+        """Show an isolated edited-object preview without mutating source data."""
+
+        preview = np.asarray(preview_bgra)
+        if (
+            preview.ndim != 3
+            or preview.shape[0] <= 0
+            or preview.shape[1] <= 0
+            or preview.shape[2] != 4
+        ):
+            raise ValueError(
+                "Reference preview must be a non-empty BGRA image."
+            )
+        self._cancel_active_stroke()
+        if preview.dtype != np.uint8:
+            preview = np.clip(preview, 0, 255).astype(np.uint8)
+        self._reference_preview_bgra = np.ascontiguousarray(preview).copy()
+        self._reference_preview_image = _bgra_array_to_qimage(
+            self._reference_preview_bgra
+        )
+        self.update()
+
+    def clear_reference_preview(self) -> None:
+        """Restore source-frame display while retaining the object selection."""
+
+        if self._reference_preview_bgra is None:
+            return
+        self._reference_preview_bgra = None
+        self._reference_preview_image = QImage()
+        self.update()
+
+    def has_reference_preview(self) -> bool:
+        return self._reference_preview_bgra is not None
+
+    def get_reference_preview_bgra(self) -> np.ndarray | None:
+        if self._reference_preview_bgra is None:
+            return None
+        return self._reference_preview_bgra.copy()
+
     def clear_mask(self) -> None:
         self._cancel_active_stroke()
         if not self._strokes and not self.has_selection():
             return
         self._strokes = []
         self._rebuild_mask()
+        self._mark_reference_edit_inputs_changed()
         self.strokes_changed.emit([])
         self.update()
 
@@ -198,6 +253,7 @@ class VideoInpaintView(QWidget):
             return 0
         self._strokes.extend(fills)
         self._rebuild_mask()
+        self._mark_reference_edit_inputs_changed()
         self.strokes_changed.emit(self.get_strokes())
         self.update()
         return len(fills)
@@ -251,6 +307,38 @@ class VideoInpaintView(QWidget):
                 crops.append(crop)
         return tuple(crops)
 
+    def build_reference_edit_source(
+        self,
+        padding_ratio: float = 0.08,
+    ) -> np.ndarray:
+        """Return one selected-object BGRA crop for whole-object editing.
+
+        Semantic reference editing is intentionally limited to one connected
+        object. This avoids applying one generated reconstruction across the
+        unrelated crops used by multi-object generation.
+        """
+
+        if self._frame_bgr is None or not self.has_selection():
+            raise ValueError(
+                "Reference editing requires one selected object."
+            )
+        selected_mask = np.where(self._mask > 0, 255, 0).astype(np.uint8)
+        component_count, _labels = cv2.connectedComponents(
+            selected_mask,
+            connectivity=8,
+        )
+        object_count = component_count - 1
+        if object_count != 1:
+            raise ValueError(
+                "Reference editing requires exactly one connected object "
+                f"blob; found {object_count}."
+            )
+        return _build_masked_frame_crop(
+            self._frame_bgr,
+            selected_mask,
+            padding_ratio,
+        )
+
     def build_context_overlay(self) -> np.ndarray:
         """Return the full frame with a translucent colored selection overlay."""
 
@@ -282,7 +370,8 @@ class VideoInpaintView(QWidget):
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         painter.fillRect(self.rect(), VIEW_BACKGROUND_COLOR)
 
-        if self._frame_image.isNull():
+        display_image = self._get_display_image()
+        if display_image.isNull():
             painter.setPen(VIEW_EMPTY_TEXT_COLOR)
             painter.drawText(
                 self.rect(),
@@ -292,7 +381,12 @@ class VideoInpaintView(QWidget):
             return
 
         target_rect = self._get_image_target_rect()
-        painter.drawImage(target_rect, self._frame_image)
+        if self.has_reference_preview():
+            self._paint_preview_checkerboard(painter, target_rect)
+            painter.drawImage(target_rect, display_image)
+            return
+
+        painter.drawImage(target_rect, display_image)
         if not self._mask_overlay_image.isNull():
             painter.drawImage(target_rect, self._mask_overlay_image)
         self._paint_mask_outline(painter, target_rect)
@@ -304,6 +398,7 @@ class VideoInpaintView(QWidget):
             if point is not None:
                 self._cancel_active_stroke()
                 if self._append_enclosed_fill(point):
+                    self._mark_reference_edit_inputs_changed()
                     self.strokes_changed.emit(self.get_strokes())
                 self.update()
                 event.accept()
@@ -343,6 +438,7 @@ class VideoInpaintView(QWidget):
         self._strokes.append(self._build_active_stroke())
         self._active_points = []
         self._rebuild_mask()
+        self._mark_reference_edit_inputs_changed()
         self.strokes_changed.emit(self.get_strokes())
         self.update()
         event.accept()
@@ -353,14 +449,19 @@ class VideoInpaintView(QWidget):
         super().leaveEvent(event)
 
     def _can_edit_mask(self) -> bool:
-        return self._interaction_enabled and self._frame_bgr is not None
+        return (
+            self._interaction_enabled
+            and self._frame_bgr is not None
+            and not self.has_reference_preview()
+        )
 
     def _get_image_target_rect(self) -> QRectF:
-        if self._frame_image.isNull():
+        display_image = self._get_display_image()
+        if display_image.isNull():
             return QRectF()
         return _get_aspect_fit_rect(
-            self._frame_image.width(),
-            self._frame_image.height(),
+            display_image.width(),
+            display_image.height(),
             QRectF(self.rect()),
         )
 
@@ -431,7 +532,11 @@ class VideoInpaintView(QWidget):
         self._mask = mask
         self._mask_overlay_image = _build_mask_overlay_qimage(mask)
 
-    def _paint_mask_outline(self, painter: QPainter, target_rect: QRectF) -> None:
+    def _paint_mask_outline(
+        self,
+        painter: QPainter,
+        target_rect: QRectF,
+    ) -> None:
         if not self.has_selection():
             return
         contours, _ = cv2.findContours(
@@ -478,6 +583,38 @@ class VideoInpaintView(QWidget):
         self._active_points = []
         self._rebuild_mask()
 
+    def _mark_reference_edit_inputs_changed(self) -> None:
+        self._reference_edit_input_revision += 1
+
+    def _get_display_image(self) -> QImage:
+        if not self._reference_preview_image.isNull():
+            return self._reference_preview_image
+        return self._frame_image
+
+    @staticmethod
+    def _paint_preview_checkerboard(
+        painter: QPainter,
+        target_rect: QRectF,
+    ) -> None:
+        painter.save()
+        painter.setClipRect(target_rect)
+        cell_size = PREVIEW_CHECKER_SIZE_PIXELS
+        left = math.floor(target_rect.left())
+        top = math.floor(target_rect.top())
+        right = math.ceil(target_rect.right())
+        bottom = math.ceil(target_rect.bottom())
+        for row, y in enumerate(range(top, bottom + cell_size, cell_size)):
+            for column, x in enumerate(
+                range(left, right + cell_size, cell_size)
+            ):
+                color = (
+                    PREVIEW_CHECKER_LIGHT_COLOR
+                    if (row + column) % 2 == 0
+                    else PREVIEW_CHECKER_DARK_COLOR
+                )
+                painter.fillRect(x, y, cell_size, cell_size, color)
+        painter.restore()
+
 
 # ### Mask crop helpers ###
 def _build_masked_frame_crop(
@@ -487,9 +624,27 @@ def _build_masked_frame_crop(
 ) -> np.ndarray:
     """Crop one frame around the nonzero mask while preserving transparency."""
 
+    bounds = _get_mask_crop_bounds(mask, padding_ratio)
+    if bounds is None:
+        return np.empty((0, 0, 4), dtype=np.uint8)
+    left, top, right, bottom = bounds
+    crop_bgr = frame_bgr[top:bottom, left:right]
+    crop_alpha = mask[top:bottom, left:right]
+    crop_bgra = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2BGRA)
+    crop_bgra[crop_alpha == 0, :3] = 0
+    crop_bgra[:, :, 3] = crop_alpha
+    return np.ascontiguousarray(crop_bgra)
+
+
+def _get_mask_crop_bounds(
+    mask: np.ndarray,
+    padding_ratio: float,
+) -> tuple[int, int, int, int] | None:
+    """Return left/top/right/bottom bounds shared by aligned mask crops."""
+
     mask_rows, mask_columns = np.nonzero(mask > 0)
     if mask_rows.size == 0:
-        return np.empty((0, 0, 4), dtype=np.uint8)
+        return None
     frame_height, frame_width = mask.shape
     selection_width = int(mask_columns.max() - mask_columns.min() + 1)
     selection_height = int(mask_rows.max() - mask_rows.min() + 1)
@@ -500,13 +655,7 @@ def _build_masked_frame_crop(
     right = min(frame_width, int(mask_columns.max()) + padding + 1)
     top = max(0, int(mask_rows.min()) - padding)
     bottom = min(frame_height, int(mask_rows.max()) + padding + 1)
-
-    crop_bgr = frame_bgr[top:bottom, left:right]
-    crop_alpha = mask[top:bottom, left:right]
-    crop_bgra = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2BGRA)
-    crop_bgra[crop_alpha == 0, :3] = 0
-    crop_bgra[:, :, 3] = crop_alpha
-    return np.ascontiguousarray(crop_bgra)
+    return left, top, right, bottom
 
 
 # ### Mask rasterization helpers ###
@@ -616,6 +765,19 @@ def _bgr_array_to_qimage(frame_bgr: np.ndarray) -> QImage:
     return image.copy()
 
 
+def _bgra_array_to_qimage(frame_bgra: np.ndarray) -> QImage:
+    frame_rgba = cv2.cvtColor(frame_bgra, cv2.COLOR_BGRA2RGBA)
+    frame_rgba = np.ascontiguousarray(frame_rgba)
+    image = QImage(
+        frame_rgba.data,
+        frame_rgba.shape[1],
+        frame_rgba.shape[0],
+        int(frame_rgba.strides[0]),
+        QImage.Format.Format_RGBA8888,
+    )
+    return image.copy()
+
+
 def _build_mask_overlay_qimage(mask: np.ndarray) -> QImage:
     if mask.size == 0 or not np.any(mask > 0):
         return QImage()
@@ -623,7 +785,9 @@ def _build_mask_overlay_qimage(mask: np.ndarray) -> QImage:
     overlay[:, :, 0] = MASK_OVERLAY_RGB[0]
     overlay[:, :, 1] = MASK_OVERLAY_RGB[1]
     overlay[:, :, 2] = MASK_OVERLAY_RGB[2]
-    overlay[:, :, 3] = np.where(mask > 0, MASK_OVERLAY_ALPHA, 0).astype(np.uint8)
+    overlay[:, :, 3] = np.where(mask > 0, MASK_OVERLAY_ALPHA, 0).astype(
+        np.uint8
+    )
     overlay = np.ascontiguousarray(overlay)
     image = QImage(
         overlay.data,

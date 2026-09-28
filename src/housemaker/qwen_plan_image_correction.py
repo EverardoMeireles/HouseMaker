@@ -87,6 +87,20 @@ def create_default_qwen_plan_image_editor() -> QwenSdCppPlanImageEditor:
     return QwenSdCppPlanImageEditor(default_qwen_model_bundle())
 
 
+def create_default_qwen_object_reference_editor() -> QwenSdCppPlanImageEditor:
+    """Create the Qwen object-reference editor.
+
+    The selected reference is staged on an opaque canvas so its alpha mask does
+    not become a requested output silhouette. Generated alpha is kept because
+    Qwen controls output transparency through the prompt.
+    """
+
+    return QwenSdCppPlanImageEditor(
+        default_qwen_model_bundle(),
+        preserve_output_alpha=True,
+    )
+
+
 # ### Public exceptions ###
 class QwenPlanCorrectionError(RuntimeError):
     """A local-backend error whose text is safe to show in the UI."""
@@ -105,11 +119,19 @@ class QwenSdCppPlanImageEditor:
         bundle: QwenSdCppModelBundle,
         *,
         num_inference_steps: int = QWEN_DEFAULT_STEPS,
+        preserve_input_alpha: bool = False,
+        preserve_output_alpha: bool = False,
     ) -> None:
         self._bundle = _validate_bundle(bundle)
         if type(num_inference_steps) is not int or not 1 <= num_inference_steps <= 200:
             raise ValueError("Qwen inference steps must be an integer from 1 to 200.")
         self._num_inference_steps = num_inference_steps
+        if type(preserve_input_alpha) is not bool:
+            raise TypeError("Qwen input-alpha preservation must be a boolean.")
+        if type(preserve_output_alpha) is not bool:
+            raise TypeError("Qwen output-alpha preservation must be a boolean.")
+        self._preserve_input_alpha = preserve_input_alpha
+        self._preserve_output_alpha = preserve_output_alpha
         # One process at a time avoids loading several large model bundles into
         # system and GPU memory. Waiting callers remain cooperatively cancellable.
         self._inference_lock = QWEN_INFERENCE_LOCK
@@ -128,7 +150,11 @@ class QwenSdCppPlanImageEditor:
         del api_key
         normalized_prompt = _validate_prompt(prompt)
         width, height = _validate_output_size(output_size)
-        prepared_image = _decode_prepared_png(image_bytes, (width, height))
+        prepared_image = _decode_prepared_png(
+            image_bytes,
+            (width, height),
+            preserve_alpha=self._preserve_input_alpha,
+        )
         _raise_if_cancelled(cancellation_check)
         _acquire_cancellable(self._inference_lock, cancellation_check)
         try:
@@ -186,7 +212,11 @@ class QwenSdCppPlanImageEditor:
                     "The local Qwen correction process failed."
                 )
             _raise_if_cancelled(cancellation_check)
-            return _read_exact_output_png(output_path, output_size)
+            return _read_exact_output_png(
+                output_path,
+                output_size,
+                preserve_alpha=self._preserve_output_alpha,
+            )
 
     def _build_command(
         self,
@@ -314,6 +344,8 @@ def _validate_output_size(output_size: tuple[int, int]) -> tuple[int, int]:
 def _decode_prepared_png(
     image_bytes: bytes,
     output_size: tuple[int, int],
+    *,
+    preserve_alpha: bool,
 ) -> Image.Image:
     if not isinstance(image_bytes, bytes) or not image_bytes:
         raise QwenPlanCorrectionError("The prepared Qwen input is not a PNG image.")
@@ -334,6 +366,8 @@ def _decode_prepared_png(
                     "The prepared Qwen input must match the requested output size."
                 )
             rgba = opened.convert("RGBA")
+            if preserve_alpha:
+                return rgba
             white = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
             return Image.alpha_composite(white, rgba).convert("RGB")
     except QwenPlanCorrectionError:
@@ -392,7 +426,12 @@ def _save_input_png(path: Path, image: Image.Image) -> None:
         ) from None
 
 
-def _read_exact_output_png(path: Path, output_size: tuple[int, int]) -> bytes:
+def _read_exact_output_png(
+    path: Path,
+    output_size: tuple[int, int],
+    *,
+    preserve_alpha: bool,
+) -> bytes:
     try:
         with Image.open(path) as opened:
             if opened.format != "PNG" or opened.size != output_size:
@@ -400,7 +439,11 @@ def _read_exact_output_png(path: Path, output_size: tuple[int, int]) -> bytes:
                     "Local Qwen correction returned an unexpected image size."
                 )
             opened.load()
-            image = opened.convert("RGB")
+            image = (
+                opened.convert("RGBA")
+                if preserve_alpha
+                else opened.convert("RGB")
+            )
     except QwenPlanCorrectionError:
         raise
     except (OSError, UnidentifiedImageError, Image.DecompressionBombError):

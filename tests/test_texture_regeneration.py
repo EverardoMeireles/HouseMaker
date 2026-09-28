@@ -2102,6 +2102,45 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
             expected,
         )
 
+    def test_accepted_reference_edit_is_the_retexture_image(self) -> None:
+        self._seed_object(0, name="Edited table", task_id="geometry-task")
+        original_crop = self._load_reference()
+        _source, signature = self.workspace.build_object_reference_edit_inputs()
+        edited_reference = np.empty((1024, 1024, 4), dtype=np.uint8)
+        edited_reference[:] = (17, 83, 229, 255)
+        self.assertTrue(
+            self.workspace.accept_object_reference_edit(
+                signature,
+                edited_reference,
+            )
+        )
+
+        self.workspace.video_view.clear_mask()
+        _qt_application.processEvents()
+
+        self.assertTrue(self.workspace.regenerate_texture_button.isEnabled())
+        preflight = self.workspace._build_texture_regeneration_request()
+        self.assertIsNotNone(preflight)
+        assert preflight is not None
+        self.assertEqual(preflight.reference_image_bgra.shape, (1024, 1024, 4))
+        np.testing.assert_array_equal(
+            preflight.reference_image_bgra,
+            edited_reference,
+        )
+        self.assertNotEqual(
+            preflight.reference_image_bgra.shape,
+            original_crop.shape,
+        )
+
+        materialized = _materialize_texture_regeneration_preflight(
+            preflight,
+            self.asset_directory,
+        ).request
+        np.testing.assert_array_equal(
+            materialized.reference_image_bgra,
+            edited_reference,
+        )
+
     def test_existing_glass_retexture_defers_to_authored_sidedness(self) -> None:
         record, _variants = self._seed_object(
             0,

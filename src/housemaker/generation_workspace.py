@@ -76,6 +76,9 @@ from housemaker.object_face_edit import (
     load_object_face_geometry,
     load_object_face_geometry_from_scene,
 )
+from housemaker.object_reference_editing import (
+    OBJECT_REFERENCE_EDIT_OUTPUT_SHAPE,
+)
 from housemaker.object_symmetry import (
     AUTOMATIC_SYMMETRIC_DIVISION_METADATA_VERSION,
     LEGACY_SYMMETRIC_PAIR_METADATA_VERSION,
@@ -2953,6 +2956,7 @@ class GenerationWorkspace(QWidget):
     new_object_placement_requested = Signal()
     operation_finished = Signal(str)
     generation_batch_started = Signal(object)
+    reference_edit_state_changed = Signal()
 
     def __init__(
         self,
@@ -2997,6 +3001,9 @@ class GenerationWorkspace(QWidget):
         self._latest_generation_batch_mask_signature: (
             tuple[int, tuple[int, ...], str] | None
         ) = None
+        self._accepted_reference_edits: dict[int, np.ndarray] = {}
+        self._reference_edit_signature_cache_key: tuple[int, int] | None = None
+        self._reference_edit_signature_cache_value: tuple[object, ...] | None = None
         self._generation_thread: QThread | None = None
         self._generation_worker: (
             GenerationWorker
@@ -3034,6 +3041,155 @@ class GenerationWorkspace(QWidget):
     def get_data(self) -> GenerationData:
         self._store_current_frame_strokes()
         return self._data.clone()
+
+    def build_object_reference_edit_inputs(
+        self,
+    ) -> tuple[np.ndarray, tuple[object, ...]]:
+        """Snapshot one selected object and its stable input identity."""
+
+        source_bgra = self.video_view.build_reference_edit_source()
+        signature = self._build_object_reference_edit_signature(
+            source_bgra,
+        )
+        self._reference_edit_signature_cache_key = (
+            self._current_reference_edit_cache_key()
+        )
+        self._reference_edit_signature_cache_value = signature
+        return source_bgra, signature
+
+    def accept_object_reference_edit(
+        self,
+        signature: tuple[object, ...],
+        edited_bgra: np.ndarray,
+    ) -> bool:
+        """Use an immutable square reference until its video frame is left."""
+
+        normalized_signature = tuple(signature)
+        try:
+            current_source = self.video_view.build_reference_edit_source()
+        except ValueError:
+            return False
+        current_signature = self._build_object_reference_edit_signature(
+            current_source,
+        )
+        edited = np.asarray(edited_bgra)
+        if (
+            current_signature != normalized_signature
+            or edited.ndim != 3
+            or edited.shape[2] != 4
+            or edited.shape != OBJECT_REFERENCE_EDIT_OUTPUT_SHAPE
+            or edited.dtype != np.uint8
+            or edited.size == 0
+            or not np.any(edited[:, :, 3] > 0)
+        ):
+            return False
+        frame_index = int(normalized_signature[0])
+        self._accepted_reference_edits[frame_index] = (
+            np.ascontiguousarray(edited).copy()
+        )
+        self.reference_edit_state_changed.emit()
+        return True
+
+    def get_current_object_reference_edit_signature(
+        self,
+    ) -> tuple[object, ...] | None:
+        """Return a stable identity for the current frame and object mask."""
+
+        cache_key = self._current_reference_edit_cache_key()
+        if self._reference_edit_signature_cache_key == cache_key:
+            return self._reference_edit_signature_cache_value
+        try:
+            source_bgra = self.video_view.build_reference_edit_source()
+        except ValueError:
+            self._reference_edit_signature_cache_key = cache_key
+            self._reference_edit_signature_cache_value = None
+            return None
+        signature = self._build_object_reference_edit_signature(
+            source_bgra,
+        )
+        self._reference_edit_signature_cache_key = cache_key
+        self._reference_edit_signature_cache_value = signature
+        return signature
+
+    def get_current_accepted_object_reference(self) -> np.ndarray | None:
+        """Return the accepted square while its video frame remains active."""
+
+        edited = self._accepted_reference_edits.get(
+            int(self._data.current_frame_index)
+        )
+        return None if edited is None else edited.copy()
+
+    def has_current_accepted_object_reference(self) -> bool:
+        """Report whether generation currently has a matching accepted edit."""
+
+        return self._has_cached_reference_edit_for_current_frame()
+
+    def _has_current_object_generation_reference(self) -> bool:
+        """Report whether the frame has an accepted edit or painted source."""
+
+        return bool(
+            self.has_current_accepted_object_reference()
+            or self.video_view.has_selection()
+        )
+
+    def _build_current_object_generation_reference(self) -> np.ndarray:
+        """Resolve the frame-scoped edit before falling back to its live mask."""
+
+        accepted_reference = self.get_current_accepted_object_reference()
+        if accepted_reference is not None:
+            return accepted_reference
+        return self.video_view.build_selected_object_crop()
+
+    def discard_object_reference_before_frame_change(
+        self,
+        next_frame_index: int,
+    ) -> bool:
+        """Permanently expire the accepted square when leaving its frame."""
+
+        current_frame_index = self._displayed_frame_index
+        if (
+            current_frame_index is None
+            or int(current_frame_index) == int(next_frame_index)
+        ):
+            return False
+        self._reference_edit_signature_cache_key = None
+        self._reference_edit_signature_cache_value = None
+        did_discard = self._discard_reference_edits_for_frame(
+            current_frame_index
+        )
+        if did_discard:
+            self.reference_edit_state_changed.emit()
+        return did_discard
+
+    def _has_cached_reference_edit_for_current_frame(self) -> bool:
+        frame_index = int(self._data.current_frame_index)
+        return frame_index in self._accepted_reference_edits
+
+    def _discard_reference_edits_for_frame(self, frame_index: int) -> bool:
+        normalized_frame_index = int(frame_index)
+        if normalized_frame_index not in self._accepted_reference_edits:
+            return False
+        self._accepted_reference_edits.pop(normalized_frame_index, None)
+        return True
+
+    def _current_reference_edit_cache_key(self) -> tuple[int, int]:
+        return (
+            int(self._data.current_frame_index),
+            self.video_view.get_reference_edit_input_revision(),
+        )
+
+    def _build_object_reference_edit_signature(
+        self,
+        source_bgra: np.ndarray,
+    ) -> tuple[object, ...]:
+        """Fingerprint exact pixel inputs so stale AI edits cannot be reused."""
+
+        source = np.ascontiguousarray(source_bgra)
+        return (
+            int(self._data.current_frame_index),
+            tuple(int(value) for value in source.shape),
+            hashlib.sha256(source.tobytes()).hexdigest(),
+        )
 
     def get_shared_controls(self) -> GenerationSharedControls:
         """Expose the canonical controls shared by both generation pipelines."""
@@ -3293,6 +3449,9 @@ class GenerationWorkspace(QWidget):
         self._latest_generation_batch_id = None
         self._latest_generation_batch_member_ids.clear()
         self._latest_generation_batch_mask_signature = None
+        self._accepted_reference_edits.clear()
+        self._reference_edit_signature_cache_key = None
+        self._reference_edit_signature_cache_value = None
         self._close_video_source()
         self._displayed_frame_index = None
         self._data = GenerationData() if data is None else data.clone()
@@ -4373,6 +4532,9 @@ class GenerationWorkspace(QWidget):
         self._data.video_metadata = next_source.metadata
         self._data.current_frame_index = 0
         self._data.frame_strokes = {}
+        self._accepted_reference_edits.clear()
+        self._reference_edit_signature_cache_key = None
+        self._reference_edit_signature_cache_value = None
         self._sync_video_controls()
         self.show_frame(0)
         self.status_label.setText(
@@ -4393,6 +4555,7 @@ class GenerationWorkspace(QWidget):
             self.status_label.setText(str(error))
             return
 
+        self.discard_object_reference_before_frame_change(safe_index)
         self._data.current_frame_index = safe_index
         self._displayed_frame_index = safe_index
         self.video_view.set_frame(
@@ -5266,6 +5429,7 @@ class GenerationWorkspace(QWidget):
             self.video_view.get_strokes(),
         )
         self._emit_data_changed()
+        self.reference_edit_state_changed.emit()
         self._sync_controls()
 
     # ### Active operation helpers ###
@@ -6520,10 +6684,10 @@ class GenerationWorkspace(QWidget):
         if self.video_view.get_frame_bgr() is None:
             self.status_label.setText("Load a video before generating.")
             return None
-        if not self.video_view.has_selection():
+        if not self._has_current_object_generation_reference():
             self.status_label.setText("Paint over the object to generate first.")
             return None
-        selected_crop = self.video_view.build_selected_object_crop()
+        selected_crop = self._build_current_object_generation_reference()
         if selected_crop.size == 0:
             self.status_label.setText("The selected object mask is empty.")
             return None
@@ -6577,10 +6741,13 @@ class GenerationWorkspace(QWidget):
         template = self._build_generation_request(geometry_only=geometry_only)
         if template is None:
             return ()
-        selected_crops = self.video_view.build_selected_object_crops()
-        if not selected_crops:
-            self.status_label.setText("The selected object mask is empty.")
-            return ()
+        if self.has_current_accepted_object_reference():
+            selected_crops = (template.selected_object_bgra,)
+        else:
+            selected_crops = self.video_view.build_selected_object_crops()
+            if not selected_crops:
+                self.status_label.setText("The selected object mask is empty.")
+                return ()
         return tuple(
             GenerationRequest(
                 frame_index=template.frame_index,
@@ -6611,8 +6778,8 @@ class GenerationWorkspace(QWidget):
         record = self._find_generated_object_record(self._selected_object_id)
         if not self._can_regenerate_object_texture(record):
             self.status_label.setText(
-                "Select a generated object and paint a current video reference "
-                "before generating its texture."
+                "Select a generated object and paint or accept a current video "
+                "reference before generating its texture."
             )
             return None
         assert record is not None
@@ -6622,7 +6789,7 @@ class GenerationWorkspace(QWidget):
         if any(index < 0 for index in normalized_glass_faces):
             self.status_label.setText("Selected glass faces are invalid.")
             return None
-        selected_crop = self.video_view.build_selected_object_crop()
+        selected_crop = self._build_current_object_generation_reference()
         if selected_crop.size == 0:
             self.status_label.setText("The selected texture reference is empty.")
             return None
@@ -6717,7 +6884,6 @@ class GenerationWorkspace(QWidget):
             frame_index,
             self.video_view.get_strokes(),
         )
-
     def _sync_video_controls(self) -> None:
         metadata = self._data.video_metadata
         frame_count = 0 if metadata is None else metadata.frame_count
@@ -6735,6 +6901,9 @@ class GenerationWorkspace(QWidget):
             and not self._object_job_runtimes
         )
         has_mask = self.video_view.has_selection()
+        has_generation_reference = (
+            self._has_current_object_generation_reference()
+        )
         selected_record = self._find_generated_object_record(
             self._selected_object_id
         )
@@ -6787,7 +6956,7 @@ class GenerationWorkspace(QWidget):
             and required_key_is_available
             and self._video_source is not None
             and self.video_view.get_frame_bgr() is not None
-            and self.video_view.has_selection()
+            and has_generation_reference
             and projection_camera_percentages_are_valid
         )
         self.result_view.set_face_editing_enabled(
@@ -6811,14 +6980,14 @@ class GenerationWorkspace(QWidget):
             self.ai_prompt_edit.setEnabled(not has_untracked_legacy_job)
         self.generate_button.setEnabled(
             has_video
-            and has_mask
+            and has_generation_reference
             and required_key_is_available
             and projection_camera_percentages_are_valid
             and not has_untracked_legacy_job
         )
         self.generate_geometry_button.setEnabled(
             has_video
-            and has_mask
+            and has_generation_reference
             and required_key_is_available
             and not self.symmetric_division_checkbox.isChecked()
             and not has_untracked_legacy_job
@@ -6871,7 +7040,7 @@ class GenerationWorkspace(QWidget):
             or not self._settings.meshy_api_key
             or self._video_source is None
             or self.video_view.get_frame_bgr() is None
-            or not self.video_view.has_selection()
+            or not self._has_current_object_generation_reference()
             or record.provider != GENERATION_BACKEND_MESHY
         ):
             return False
@@ -7001,7 +7170,7 @@ class GenerationWorkspace(QWidget):
             None if symmetry is None else symmetry.orientation,
             None if symmetry is None else symmetry.plane_coordinate,
         )
-        self._sync_model_statistics(generated_model)
+        self._sync_model_statistics(generated_model, record)
         self._displayed_object_snapshot = next_snapshot
         self._sync_face_selection_outputs()
 
@@ -7295,8 +7464,15 @@ class GenerationWorkspace(QWidget):
         self._generated_model_cache[record.object_id] = model
         self._generated_model_cache_revisions[record.object_id] = asset_revision
 
-    def _sync_model_statistics(self, model: GeneratedModel | None) -> None:
-        self.model_statistics_label.setText(_format_model_statistics(model))
+    def _sync_model_statistics(
+        self,
+        model: GeneratedModel | None,
+        record: GeneratedObjectRecord | None = None,
+    ) -> None:
+        pipeline = None if record is None else record.pipeline
+        self.model_statistics_label.setText(
+            _format_model_statistics(model, pipeline=pipeline)
+        )
 
     def _persist_meshy_asset(self, object_id: str, glb_bytes: bytes) -> str:
         return self._persist_meshy_named_asset(
@@ -9292,7 +9468,11 @@ def _get_texture_variant_metadata(
 
 
 # ### Model-statistics helpers ###
-def _format_model_statistics(model: GeneratedModel | None) -> str:
+def _format_model_statistics(
+    model: GeneratedModel | None,
+    *,
+    pipeline: Mapping[str, object] | None = None,
+) -> str:
     """Describe the preview mesh without relying on provider-specific metadata."""
 
     if model is None:
@@ -9320,12 +9500,57 @@ def _format_model_statistics(model: GeneratedModel | None) -> str:
         if has_vertex_colors
         else "material color"
     )
-    return (
+    statistics = (
         f"{vertex_count:,} vertices · {triangle_count:,} triangles (polycount) · "
         f"{dimensions_text} · {material_count} material"
         f"{'s' if material_count != 1 else ''} · {texture_count} texture"
         f"{'s' if texture_count != 1 else ''} · {appearance}"
     )
+    removal_status = _format_unused_face_removal_statistics(pipeline)
+    if removal_status:
+        statistics += f"\n{removal_status}"
+    return statistics
+
+
+def _format_unused_face_removal_statistics(
+    pipeline: Mapping[str, object] | None,
+) -> str:
+    """Describe generation-time unused-face cleanup without merging passes."""
+
+    if (
+        pipeline is None
+        or pipeline.get("unused_face_removal_applied") is not True
+    ):
+        return ""
+    geometry_count = _read_nonnegative_face_count(
+        pipeline,
+        "removed_face_count",
+    )
+    final_count = _read_nonnegative_face_count(
+        pipeline,
+        "final_removed_face_count",
+    )
+    if pipeline.get("final_face_removal_applied") is True:
+        total_count = geometry_count + final_count
+        return (
+            f"Unused-face removal: {total_count:,} "
+            + ("face removal " if total_count == 1 else "face removals ")
+            + f"({geometry_count:,} geometry, {final_count:,} final texture)"
+        )
+    return (
+        f"Unused-face removal: {geometry_count:,} "
+        + ("face removed" if geometry_count == 1 else "faces removed")
+    )
+
+
+def _read_nonnegative_face_count(
+    pipeline: Mapping[str, object],
+    key: str,
+) -> int:
+    value = pipeline.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
 
 
 def _get_model_material_statistics(model: GeneratedModel) -> tuple[int, int]:

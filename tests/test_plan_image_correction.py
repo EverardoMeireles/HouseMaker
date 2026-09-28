@@ -650,6 +650,39 @@ class OpenAIImageEditTests(unittest.TestCase):
                 cancellation_check=None,
             )
 
+    def test_responses_edit_can_request_a_transparent_background(self) -> None:
+        returned = _png_bytes(_plan_array((320, 240)))
+        response = json.dumps(
+            {
+                "output": [
+                    {
+                        "type": "image_generation_call",
+                        "result": base64.b64encode(returned).decode(),
+                    }
+                ]
+            }
+        ).encode()
+        captured = []
+
+        def fake_open(request, **kwargs):
+            captured.append((request, kwargs))
+            return FakeResponse(response)
+
+        with patch.object(correction, "urlopen", side_effect=fake_open):
+            result = openai_responses_image_edit(
+                b"input-png",
+                model=PLAN_CORRECTION_MODEL_GPT_5_6_LUNA,
+                api_key="sk-test",
+                prompt=PLAN_CORRECTION_PROMPT,
+                output_size=(1024, 768),
+                cancellation_check=None,
+                background="transparent",
+            )
+
+        self.assertEqual(result, returned)
+        body = json.loads(captured[0][0].data.decode())
+        self.assertEqual(body["tools"][0]["background"], "transparent")
+
 
 # ### Local processing tests ###
 class PlanCleanupTests(unittest.TestCase):

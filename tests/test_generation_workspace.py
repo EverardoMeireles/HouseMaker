@@ -2125,6 +2125,10 @@ class GenerationWorkspaceTests(unittest.TestCase):
             restored_data = GenerationData.from_dict(saved_data.to_dict())
             self.assertEqual(restored_data.generated_objects[0], record)
             self.assertIn("Removed 40 of 120 faces", self.workspace.status_label.text())
+            self.assertIn(
+                "Unused-face removal: 40 faces removed",
+                self.workspace.model_statistics_label.text(),
+            )
             self.workspace.shutdown()
 
     def test_meshy_success_displays_saves_persists_and_rebuilds_glb(self) -> None:
@@ -2596,6 +2600,40 @@ class GenerationWorkspaceTests(unittest.TestCase):
         self.assertEqual(
             self.workspace.model_statistics_label.text(),
             "No generated object",
+        )
+
+    def test_model_statistics_report_each_unused_face_removal_pass(self) -> None:
+        model = _test_model()
+        two_pass_statistics = _format_model_statistics(
+            model,
+            pipeline={
+                "unused_face_removal_applied": True,
+                "removed_face_count": 40,
+                "final_face_removal_applied": True,
+                "final_removed_face_count": 3,
+            },
+        )
+        self.assertIn(
+            "Unused-face removal: 43 face removals "
+            "(40 geometry, 3 final texture)",
+            two_pass_statistics,
+        )
+
+        zero_statistics = _format_model_statistics(
+            model,
+            pipeline={
+                "unused_face_removal_applied": True,
+                "removed_face_count": 0,
+                "final_face_removal_applied": False,
+            },
+        )
+        self.assertIn(
+            "Unused-face removal: 0 faces removed",
+            zero_statistics,
+        )
+        self.assertNotIn(
+            "Unused-face removal",
+            _format_model_statistics(model),
         )
 
     def test_scan_projected_success_persists_uv_authority_metadata(self) -> None:
