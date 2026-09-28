@@ -301,6 +301,7 @@ class PlacedGeneratedModel:
     rotation_degrees: tuple[float, float, float] = (0.0, 0.0, 0.0)
     object_name: str | None = None
     scale: float = 1.0
+    axis_scales: tuple[float, float, float] = (1.0, 1.0, 1.0)
 
     def __post_init__(self) -> None:
         if not isinstance(self.object_id, str):
@@ -328,6 +329,11 @@ class PlacedGeneratedModel:
         object.__setattr__(self, "world_position", normalized_position)
         object.__setattr__(self, "rotation_degrees", normalized_rotation)
         object.__setattr__(self, "scale", _normalize_placed_scale(self.scale))
+        object.__setattr__(
+            self,
+            "axis_scales",
+            _normalize_placed_axis_scales(self.axis_scales),
+        )
         object.__setattr__(self, "symmetric_preview_orientation", orientation)
         object.__setattr__(
             self,
@@ -348,6 +354,7 @@ class PreviewPlacedObject:
     symmetric_preview_orientation: str | None = None
     symmetric_preview_plane_coordinate: float | None = None
     scale: float = 1.0
+    axis_scales: tuple[float, float, float] = (1.0, 1.0, 1.0)
 
     def __post_init__(self) -> None:
         if not isinstance(self.object_id, str) or not self.object_id.strip():
@@ -375,6 +382,11 @@ class PreviewPlacedObject:
             _normalize_placed_rotation(self.rotation_degrees),
         )
         object.__setattr__(self, "scale", _normalize_placed_scale(self.scale))
+        object.__setattr__(
+            self,
+            "axis_scales",
+            _normalize_placed_axis_scales(self.axis_scales),
+        )
         object.__setattr__(self, "symmetric_preview_orientation", orientation)
         object.__setattr__(
             self,
@@ -1115,6 +1127,7 @@ def _compose_placed_generated_models(
                 world_position=placement.world_position,
                 rotation_degrees=placement.rotation_degrees,
                 scale=placement.scale,
+                axis_scales=placement.axis_scales,
                 symmetric_preview_orientation=(placement.symmetric_preview_orientation),
                 symmetric_preview_plane_coordinate=(
                     placement.symmetric_preview_plane_coordinate
@@ -1229,6 +1242,41 @@ def _normalize_placed_scale(raw_scale: object) -> float:
     return scale
 
 
+def _normalize_placed_axis_scales(
+    raw_axis_scales: object,
+) -> tuple[float, float, float]:
+    """Return finite positive local XYZ scale multipliers."""
+
+    if isinstance(raw_axis_scales, (str, bytes, bytearray)) or not isinstance(
+        raw_axis_scales,
+        Sequence,
+    ):
+        raise TypeError(
+            "Placed generated-object axis scales must be XYZ sequences."
+        )
+    if len(raw_axis_scales) != 3:
+        raise ValueError(
+            "Placed generated-object axis scales must contain three values."
+        )
+    scales: list[float] = []
+    for raw_scale in raw_axis_scales:
+        if isinstance(raw_scale, bool) or not isinstance(
+            raw_scale,
+            (int, float, np.integer, np.floating),
+        ):
+            raise TypeError(
+                "Placed generated-object axis scales must be numbers."
+            )
+        scale = float(raw_scale)
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError(
+                "Placed generated-object axis scales must be finite and greater "
+                "than zero."
+            )
+        scales.append(scale)
+    return scales[0], scales[1], scales[2]
+
+
 def _normalize_symmetric_preview(
     raw_orientation: object,
     raw_plane_coordinate: object,
@@ -1317,14 +1365,16 @@ def _build_placed_model_transform(
     )
     move_pivot_to_origin = np.eye(4, dtype=float)
     move_pivot_to_origin[:3, 3] = -bottom_center
-    uniform_scale = np.eye(4, dtype=float)
-    uniform_scale[:3, :3] *= placement.scale
+    object_scale = np.eye(4, dtype=float)
+    object_scale[:3, :3] = np.diag(
+        placement.scale * np.asarray(placement.axis_scales, dtype=float)
+    )
     move_to_world = np.eye(4, dtype=float)
     move_to_world[:3, 3] = np.asarray(
         placement.world_position,
         dtype=float,
     )
-    return move_to_world @ rotation @ uniform_scale @ move_pivot_to_origin
+    return move_to_world @ rotation @ object_scale @ move_pivot_to_origin
 
 
 def _build_half_mesh_node_metadata(

@@ -112,6 +112,7 @@ class GeneratedObjectPlacement:
     height_offset_meters: float = 0.0
     rotation_degrees: tuple[float, float, float] = (0.0, 0.0, 0.0)
     scale: float = 1.0
+    axis_scales: tuple[float, float, float] = (1.0, 1.0, 1.0)
 
     def __post_init__(self) -> None:
         if (
@@ -153,6 +154,11 @@ class GeneratedObjectPlacement:
                 "than zero."
             )
         object.__setattr__(self, "scale", float(self.scale))
+        object.__setattr__(
+            self,
+            "axis_scales",
+            _normalize_placement_axis_scales(self.axis_scales),
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -162,6 +168,7 @@ class GeneratedObjectPlacement:
             "height_offset_meters": self.height_offset_meters,
             "rotation_degrees": list(self.rotation_degrees),
             "scale": self.scale,
+            "axis_scales": list(self.axis_scales),
         }
 
     @classmethod
@@ -180,6 +187,7 @@ class GeneratedObjectPlacement:
                 (0.0, 0.0, 0.0),
             ),
             scale=payload.get("scale", 1.0),
+            axis_scales=payload.get("axis_scales", (1.0, 1.0, 1.0)),
         )
 
 
@@ -399,6 +407,29 @@ def _normalize_placement_rotation(
             "Generated-object placement rotation must contain three finite angles."
         )
     return tuple(float(value) for value in raw_rotation)
+
+
+def _normalize_placement_axis_scales(
+    raw_axis_scales: object,
+) -> tuple[float, float, float]:
+    """Return finite positive XYZ scale multipliers without coercing text."""
+
+    if isinstance(raw_axis_scales, (str, bytes, bytearray)) or not isinstance(
+        raw_axis_scales,
+        Sequence,
+    ):
+        raise ValueError(
+            "Generated-object placement axis scales must contain three values."
+        )
+    if len(raw_axis_scales) != 3 or not all(
+        _is_strict_finite_number(value) and float(value) > 0.0
+        for value in raw_axis_scales
+    ):
+        raise ValueError(
+            "Generated-object placement axis scales must contain three finite "
+            "values greater than zero."
+        )
+    return tuple(float(value) for value in raw_axis_scales)
 
 
 def _load_meshy_generated_objects(

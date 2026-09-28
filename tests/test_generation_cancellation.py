@@ -825,6 +825,60 @@ class GenerationCancellationTests(unittest.TestCase):
             )
         )
 
+    def test_repositioning_preserves_uniform_and_axis_scales(self) -> None:
+        original, _variants = self._seed_textured_object()
+        existing_placement = GeneratedObjectPlacement(
+            2,
+            10.0,
+            20.0,
+            height_offset_meters=1.25,
+            rotation_degrees=(5.0, 10.0, 15.0),
+            scale=1.75,
+            axis_scales=(2.0, 0.5, 1.25),
+        )
+        self.workspace.set_data(
+            GenerationData(
+                generated_objects=[
+                    replace(original, placement=existing_placement)
+                ]
+            )
+        )
+        requested = QSignalSpy(self.workspace.placement_requested)
+        self.assertTrue(
+            self.workspace.request_generated_object_placement(
+                original.object_id
+            )
+        )
+        request_id = str(requested.at(0)[0])
+
+        self.assertTrue(
+            self.workspace.set_active_object_placement(
+                request_id,
+                GeneratedObjectPlacement(7, 88.5, 42.25),
+            )
+        )
+
+        replacement = self.workspace.get_generated_object_placement(
+            original.object_id
+        )
+        self.assertIsNotNone(replacement)
+        assert replacement is not None
+        self.assertEqual(replacement.level_index, 7)
+        self.assertEqual((replacement.image_x, replacement.image_y), (88.5, 42.25))
+        self.assertEqual(
+            replacement.height_offset_meters,
+            existing_placement.height_offset_meters,
+        )
+        self.assertEqual(
+            replacement.rotation_degrees,
+            existing_placement.rotation_degrees,
+        )
+        self.assertEqual(replacement.scale, existing_placement.scale)
+        self.assertEqual(
+            replacement.axis_scales,
+            existing_placement.axis_scales,
+        )
+
     def test_direct_placement_update_replaces_only_the_requested_object(
         self,
     ) -> None:

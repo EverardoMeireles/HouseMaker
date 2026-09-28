@@ -86,6 +86,7 @@ class GenerationStatePersistenceTests(unittest.TestCase):
                         image_x=120.0,
                         image_y=240.0,
                         scale=1.75,
+                        axis_scales=(1.25, 0.75, 2.0),
                     ),
                 ),
             ],
@@ -110,7 +111,7 @@ class GenerationStatePersistenceTests(unittest.TestCase):
         self.assertEqual(raw_payload["generation"], generation.to_dict())
         self.assertEqual(loaded_generation, generation)
 
-    def test_legacy_placement_without_scale_defaults_to_one(self) -> None:
+    def test_legacy_placement_without_scales_defaults_to_one(self) -> None:
         placement = GeneratedObjectPlacement.from_dict(
             {
                 "level_index": 2,
@@ -120,6 +121,29 @@ class GenerationStatePersistenceTests(unittest.TestCase):
         )
 
         self.assertEqual(placement.scale, 1.0)
+        self.assertEqual(placement.axis_scales, (1.0, 1.0, 1.0))
+
+    def test_placement_rejects_invalid_axis_scales(self) -> None:
+        for invalid_axis_scales in (
+            "1,1,1",
+            (1.0, 1.0),
+            (1.0, True, 1.0),
+            (1.0, "1.0", 1.0),
+            (0.0, 1.0, 1.0),
+            (-1.0, 1.0, 1.0),
+            (float("nan"), 1.0, 1.0),
+            (float("inf"), 1.0, 1.0),
+        ):
+            with (
+                self.subTest(axis_scales=invalid_axis_scales),
+                self.assertRaises(ValueError),
+            ):
+                GeneratedObjectPlacement(
+                    level_index=2,
+                    image_x=20.0,
+                    image_y=30.0,
+                    axis_scales=invalid_axis_scales,
+                )
 
     def test_legacy_procedural_records_are_dropped_without_rejecting_project(
         self,

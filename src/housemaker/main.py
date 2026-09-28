@@ -505,6 +505,7 @@ class _PlacedGeneratedModelFileSnapshot:
     world_position: tuple[float, float, float]
     rotation_degrees: tuple[float, float, float]
     scale: float
+    axis_scales: tuple[float, float, float]
     symmetric_preview_orientation: str | None = None
     symmetric_preview_plane_coordinate: float | None = None
 
@@ -782,6 +783,7 @@ def _build_surface_ao_pre_atlas_scene(
                 ),
                 rotation_degrees=placed.rotation_degrees,
                 scale=placed.scale,
+                axis_scales=placed.axis_scales,
             )
         )
     if cancellation_check():
@@ -1982,6 +1984,9 @@ class BlueprintWorkspace(QWidget):
         )
         self.viewer.placed_object_scales_changed.connect(
             self._handle_placed_object_scales_changed
+        )
+        self.viewer.placed_object_axis_scales_changed.connect(
+            self._handle_placed_object_axis_scales_changed
         )
         self.viewer.placed_object_selection_changed.connect(
             self._handle_canvas_placed_object_selection_changed
@@ -6994,6 +6999,7 @@ class BlueprintWorkspace(QWidget):
                     ),
                     rotation_degrees=placement.rotation_degrees,
                     scale=placement.scale,
+                    axis_scales=placement.axis_scales,
                     symmetric_preview_orientation=(
                         None if raw_orientation is None else str(raw_orientation)
                     ),
@@ -8433,6 +8439,7 @@ class BlueprintWorkspace(QWidget):
                     placement,
                     rotation_degrees=previous_placement.rotation_degrees,
                     scale=previous_placement.scale,
+                    axis_scales=previous_placement.axis_scales,
                 )
             previous_states.append(
                 (
@@ -8839,6 +8846,7 @@ class BlueprintWorkspace(QWidget):
                 height_offset_meters=float(world_z) - float(base_z),
                 rotation_degrees=rotation_degrees,
                 scale=existing_placement.scale,
+                axis_scales=existing_placement.axis_scales,
             )
         except (TypeError, ValueError, OverflowError):
             self._schedule_viewer_preview_refresh(preserve_camera=True)
@@ -9015,6 +9023,111 @@ class BlueprintWorkspace(QWidget):
                 dependency_signature_before,
                 dependency_signature_after,
                 expected_placements,
+            )
+        ):
+            self._canvas_viewer_preview_revision = revision
+            self._viewer_preview_dependency_signature = dependency_signature_after
+            self._viewer_preview_dependency_signature_revision = revision
+            return
+        self._queue_viewer_preview_refresh()
+
+    def _handle_placed_object_axis_scales_changed(
+        self,
+        object_id: str,
+        raw_axis_scales: object,
+    ) -> None:
+        """Persist one completed XYZ scale-gizmo gesture with undo support."""
+
+        normalized_object_id = str(object_id).strip()
+        try:
+            if (
+                isinstance(raw_axis_scales, (str, bytes, bytearray))
+                or not isinstance(raw_axis_scales, Sequence)
+            ):
+                raise TypeError("Placed-object axis scales must be an XYZ sequence.")
+            if any(isinstance(value, bool) for value in raw_axis_scales):
+                raise TypeError("Placed-object axis scales must be numeric.")
+            axis_scales = tuple(float(value) for value in raw_axis_scales)
+            if (
+                not normalized_object_id
+                or len(axis_scales) != 3
+                or any(
+                    not math.isfinite(value) or value <= 0.0
+                    for value in axis_scales
+                )
+            ):
+                raise ValueError(
+                    "Placed-object axis scales must be positive XYZ values."
+                )
+        except (TypeError, ValueError, OverflowError):
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+            return
+
+        existing = self.generation.get_generated_object_placement(
+            normalized_object_id
+        )
+        if existing is None:
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+            return
+        try:
+            replacement = replace(existing, axis_scales=axis_scales)
+        except (TypeError, ValueError, OverflowError):
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+            return
+        if replacement == existing:
+            return
+
+        canvas_was_current = (
+            self._canvas_viewer_preview_revision == self._viewer_preview_revision
+        )
+        dependency_signature_before: tuple[object, ...] | None = None
+        if canvas_was_current:
+            current_dependency_signature = (
+                self._build_viewer_preview_dependency_signature()
+            )
+            canvas_was_current = bool(
+                self._viewer_preview_dependency_signature_revision
+                == self._viewer_preview_revision
+                and current_dependency_signature
+                == self._viewer_preview_dependency_signature
+            )
+            if canvas_was_current:
+                dependency_signature_before = current_dependency_signature
+
+        if not self.generation.update_generated_object_placement(
+            normalized_object_id,
+            replacement,
+            emit_change_signals=False,
+        ):
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+            return
+        if not self._is_restoring_canvas_undo:
+            self._record_canvas_undo_state(
+                _CanvasPlacedObjectUndoState(
+                    object_id=normalized_object_id,
+                    placement=existing,
+                    selected_object_ids=self._desired_canvas_object_ids,
+                    active_object_id=self._desired_canvas_object_id,
+                )
+            )
+
+        revision = self._mark_viewer_preview_dirty(
+            preserve_camera=True,
+            affects_draw_call_estimate=False,
+        )
+        dependency_signature_after = (
+            self._build_viewer_preview_dependency_signature()
+            if canvas_was_current
+            else None
+        )
+        if (
+            dependency_signature_before is not None
+            and dependency_signature_after is not None
+            and self._dependency_change_is_only_target_placement(
+                dependency_signature_before,
+                dependency_signature_after,
+                normalized_object_id,
+                replacement,
             )
         ):
             self._canvas_viewer_preview_revision = revision
@@ -12070,6 +12183,7 @@ class BlueprintWorkspace(QWidget):
                     ),
                     rotation_degrees=placement.rotation_degrees,
                     scale=placement.scale,
+                    axis_scales=placement.axis_scales,
                 )
             )
         return tuple(placed_models)

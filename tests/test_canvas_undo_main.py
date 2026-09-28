@@ -621,6 +621,45 @@ class CanvasUndoMainTests(unittest.TestCase):
         )
         self.assertEqual(self.workspace._canvas_undo_stack, [])
 
+    def test_ctrl_z_restores_one_axis_scale_gizmo_gesture(self) -> None:
+        placement = GeneratedObjectPlacement(
+            level_index=self.level.index,
+            image_x=20.0,
+            image_y=30.0,
+            scale=1.5,
+        )
+        self.workspace.generation.set_data(
+            GenerationData(
+                generated_objects=[
+                    _generated_object_record("chair", placement)
+                ]
+            )
+        )
+        self.workspace._desired_canvas_object_ids = ("chair",)
+        self.workspace._desired_canvas_object_id = "chair"
+
+        self.workspace._handle_placed_object_axis_scales_changed(
+            "chair",
+            (2.0, 0.75, 1.25),
+        )
+
+        updated = self.workspace.generation.get_generated_object_placement(
+            "chair"
+        )
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        self.assertEqual(updated.axis_scales, (2.0, 0.75, 1.25))
+        self.assertAlmostEqual(updated.scale, 1.5)
+        self.assertEqual(len(self.workspace._canvas_undo_stack), 1)
+
+        _send_undo_to_viewer(self.workspace)
+
+        self.assertEqual(
+            self.workspace.generation.get_generated_object_placement("chair"),
+            placement,
+        )
+        self.assertEqual(self.workspace._canvas_undo_stack, [])
+
     def test_ctrl_z_removes_a_newly_added_window(self) -> None:
         wall = next(
             surface

@@ -10,6 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # ### Imports ###
 import numpy as np
+import pyqtgraph.opengl as gl
 import trimesh
 from OpenGL import GL
 from PySide6.QtCore import QPoint, QPointF, Qt
@@ -24,6 +25,9 @@ from housemaker.surface_geometry import SURFACE_TYPE_WALL, FixedSurface
 from housemaker.viewer import (
     CANVAS_OPENING_OVERLAY_DEPTH_VALUE,
     NAVIGATION_MODE_FIRST_PERSON,
+    PLACED_OBJECT_GIZMO_SCALE,
+    PLACED_OBJECT_GIZMO_TRANSFORM,
+    TRANSFORM_GIZMO_SCALE,
     TRANSFORM_GIZMO_TRANSLATE,
     GlbViewerWidget,
     _build_axis_drag_plane_normal,
@@ -102,6 +106,7 @@ def _build_placed_object(
     world_position: tuple[float, float, float] = (0.0, 0.0, 0.0),
     rotation_degrees: tuple[float, float, float] = (0.0, 0.0, 0.0),
     scale: float = 1.0,
+    axis_scales: tuple[float, float, float] = (1.0, 1.0, 1.0),
     symmetric: bool = False,
 ) -> PreviewPlacedObject:
     local_mesh = (
@@ -110,7 +115,13 @@ def _build_placed_object(
         else _build_local_box()
     )
     placement_transform = _translation_transform(*world_position)
-    placement_transform[:3, :3] *= scale
+    placement_transform[:3, :3] = (
+        trimesh.transformations.euler_matrix(
+            *np.radians(np.asarray(rotation_degrees, dtype=float)),
+            axes="sxyz",
+        )[:3, :3]
+        @ np.diag(scale * np.asarray(axis_scales, dtype=float))
+    )
     return PreviewPlacedObject(
         object_id=object_id,
         meshes=(local_mesh,),
@@ -118,6 +129,7 @@ def _build_placed_object(
         world_position=world_position,
         rotation_degrees=rotation_degrees,
         scale=scale,
+        axis_scales=axis_scales,
         symmetric_preview_orientation="vertical" if symmetric else None,
         symmetric_preview_plane_coordinate=0.0 if symmetric else None,
     )
@@ -362,6 +374,82 @@ class CanvasObjectGizmoTests(unittest.TestCase):
             gl_options = item._GLGraphicsItem__glOpts
             self.assertFalse(gl_options[GL.GL_DEPTH_TEST])
             self.assertTrue(gl_options[GL.GL_BLEND])
+
+    def test_selecting_an_already_selected_object_switches_gizmo_sets(
+        self,
+    ) -> None:
+        viewer = self._build_viewer(
+            _build_placed_object("chair"),
+            _build_placed_object("table", world_position=(2.0, 0.0, 0.0)),
+        )
+
+        with (
+            patch.object(viewer.view, "build_camera_ray", return_value=_forward_ray()),
+            patch.object(viewer.view, "pixelSize", return_value=0.01),
+        ):
+            viewer.view.viewport_clicked.emit(QPointF(20.0, 20.0))
+            self.assertEqual(
+                viewer.get_placed_object_gizmo_mode(),
+                PLACED_OBJECT_GIZMO_TRANSFORM,
+            )
+            self.assertEqual(len(viewer._transform_gizmo_items), 9)
+
+            viewer.view.viewport_clicked.emit(QPointF(20.0, 20.0))
+            self.assertEqual(
+                viewer.get_placed_object_gizmo_mode(),
+                PLACED_OBJECT_GIZMO_SCALE,
+            )
+            self.assertEqual(len(viewer._transform_gizmo_items), 6)
+            self.assertEqual(
+                sum(
+                    isinstance(item, gl.GLMeshItem)
+                    for item in viewer._transform_gizmo_items
+                ),
+                3,
+            )
+            for item in viewer._transform_gizmo_items:
+                self.assertEqual(
+                    item.depthValue(),
+                    CANVAS_OPENING_OVERLAY_DEPTH_VALUE,
+                )
+                self.assertFalse(
+                    item._GLGraphicsItem__glOpts[GL.GL_DEPTH_TEST]
+                )
+
+            viewer.view.viewport_clicked.emit(QPointF(20.0, 20.0))
+            self.assertEqual(
+                viewer.get_placed_object_gizmo_mode(),
+                PLACED_OBJECT_GIZMO_TRANSFORM,
+            )
+
+        self.assertTrue(viewer.select_placed_object("table"))
+        self.assertEqual(
+            viewer.get_placed_object_gizmo_mode(),
+            PLACED_OBJECT_GIZMO_TRANSFORM,
+        )
+
+    def test_scale_cube_handle_inside_generated_object_is_clickable(self) -> None:
+        viewer = self._build_viewer(_build_placed_object("chair"))
+        with patch.object(viewer.view, "pixelSize", return_value=0.01):
+            viewer.select_placed_object("chair")
+            viewer._toggle_placed_object_gizmo_mode()
+            x_endpoint = viewer._transform_gizmo_size
+
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_forward_ray(x=x_endpoint, z=0.0),
+        ):
+            viewer._handle_placed_object_pointer_pressed(QPointF())
+
+        drag = viewer._placed_object_transform_drag
+        self.assertIsNotNone(drag)
+        assert drag is not None
+        self.assertEqual(
+            drag.handle,
+            _TransformGizmoHandle(TRANSFORM_GIZMO_SCALE, 0),
+        )
+        viewer._cancel_placed_object_gizmo_drag()
 
     def test_transform_handle_inside_generated_object_is_clickable(self) -> None:
         viewer = self._build_viewer(_build_placed_object("chair"))
@@ -634,6 +722,104 @@ class CanvasObjectGizmoTests(unittest.TestCase):
             atol=1e-7,
         )
         self.assertEqual(group.preview.scale, 2.0)
+
+    def test_axis_scale_drag_uses_local_axis_and_keeps_wheel_scale_independent(
+        self,
+    ) -> None:
+        preview = _build_placed_object(
+            "chair",
+            world_position=(2.0, 3.0, 0.0),
+            rotation_degrees=(0.0, 0.0, 90.0),
+        )
+        viewer = self._build_viewer(preview)
+        emitted: list[tuple[str, object]] = []
+        viewer.placed_object_axis_scales_changed.connect(
+            lambda object_id, axis_scales: emitted.append(
+                (object_id, axis_scales)
+            )
+        )
+
+        with patch.object(viewer.view, "pixelSize", return_value=0.01):
+            viewer.select_placed_object("chair")
+            viewer._toggle_placed_object_gizmo_mode()
+            gizmo_size = viewer._transform_gizmo_size
+            handle = _TransformGizmoHandle(
+                kind=TRANSFORM_GIZMO_SCALE,
+                axis_index=0,
+            )
+            with patch.object(
+                viewer.view,
+                "build_camera_ray",
+                return_value=_downward_ray(2.0, 3.0),
+            ):
+                self.assertTrue(
+                    viewer._begin_placed_object_gizmo_drag(handle, QPointF())
+                )
+            with patch.object(
+                viewer.view,
+                "build_camera_ray",
+                return_value=_downward_ray(2.0, 3.0 + gizmo_size),
+            ):
+                self.assertTrue(
+                    viewer._finish_placed_object_gizmo_drag(QPointF(20.0, 0.0))
+                )
+
+        self.assertEqual(len(emitted), 1)
+        self.assertEqual(emitted[0][0], "chair")
+        np.testing.assert_allclose(emitted[0][1], (2.0, 1.0, 1.0))
+        group = viewer._placed_object_render_groups["chair"]
+        np.testing.assert_allclose(group.preview.axis_scales, (2.0, 1.0, 1.0))
+        np.testing.assert_allclose(
+            _transform_point(group.current_transform, (0.0, 0.0, 0.0)),
+            preview.world_position,
+            atol=1e-7,
+        )
+
+        viewer._handle_placed_object_scale_wheel_steps_requested(1)
+
+        self.assertAlmostEqual(group.preview.scale, 1.1)
+        np.testing.assert_allclose(group.preview.axis_scales, (2.0, 1.0, 1.0))
+        np.testing.assert_allclose(
+            np.linalg.norm(group.current_transform[:3, :3], axis=0),
+            (2.2, 1.1, 1.1),
+            atol=1e-7,
+        )
+
+    def test_rotation_drag_preserves_existing_axis_scales(self) -> None:
+        viewer = self._build_viewer(
+            _build_placed_object(
+                "chair",
+                scale=1.5,
+                axis_scales=(2.0, 0.5, 3.0),
+            )
+        )
+        viewer.select_placed_object("chair")
+        handle = _TransformGizmoHandle(kind="rotate", axis_index=2)
+
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_downward_ray(1.0, 0.0),
+        ):
+            self.assertTrue(
+                viewer._begin_placed_object_gizmo_drag(handle, QPointF())
+            )
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_downward_ray(0.0, 1.0),
+        ):
+            self.assertTrue(
+                viewer._finish_placed_object_gizmo_drag(QPointF(20.0, 20.0))
+            )
+
+        group = viewer._placed_object_render_groups["chair"]
+        np.testing.assert_allclose(
+            np.linalg.norm(group.current_transform[:3, :3], axis=0),
+            (3.0, 0.75, 4.5),
+            atol=1e-7,
+        )
+        np.testing.assert_allclose(group.preview.axis_scales, (2.0, 0.5, 3.0))
 
     def test_cancelled_drag_restores_preview_and_emits_nothing(self) -> None:
         viewer = self._build_viewer(_build_placed_object("chair"))

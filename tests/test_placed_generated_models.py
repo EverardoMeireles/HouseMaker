@@ -551,6 +551,39 @@ class PlacedGeneratedModelCompositionTests(unittest.TestCase):
         self.assertEqual(preview.scale, 2.0)
         np.testing.assert_allclose(preview.world_position, (10.0, 20.0, 30.0))
 
+    def test_axis_scales_are_combined_with_uniform_scale_before_rotation(
+        self,
+    ) -> None:
+        base_model = _base_box_model()
+        object_mesh = trimesh.creation.box(extents=(2.0, 4.0, 2.0))
+        object_mesh.apply_translation((4.0, -2.0, 1.0))
+        object_model = _single_mesh_model(object_mesh)
+
+        composed = compose_placed_generated_models(
+            base_model,
+            [
+                PlacedGeneratedModel(
+                    object_id="axis-scaled-chair",
+                    model=object_model,
+                    world_position=(10.0, 20.0, 30.0),
+                    rotation_degrees=(0.0, 0.0, 90.0),
+                    scale=2.0,
+                    axis_scales=(2.0, 0.5, 3.0),
+                )
+            ],
+        )
+
+        placed_mesh = _placed_world_mesh(composed.scene)
+        np.testing.assert_allclose(
+            placed_mesh.bounds,
+            ((8.0, 16.0, 30.0), (12.0, 24.0, 42.0)),
+            atol=1e-7,
+        )
+        preview = composed.preview_placed_objects[0]
+        self.assertEqual(preview.scale, 2.0)
+        self.assertEqual(preview.axis_scales, (2.0, 0.5, 3.0))
+        np.testing.assert_allclose(preview.world_position, (10.0, 20.0, 30.0))
+
     def test_symmetric_placement_adds_only_a_world_space_preview_mirror(
         self,
     ) -> None:
@@ -1169,6 +1202,27 @@ class PlacedGeneratedModelCompositionTests(unittest.TestCase):
                     object_model,
                     (0.0, 0.0, 0.0),
                     scale=invalid_scale,
+                )
+
+        for invalid_axis_scales in (
+            "1,1,1",
+            (1.0, 1.0),
+            (1.0, True, 1.0),
+            (1.0, "1.0", 1.0),
+            (0.0, 1.0, 1.0),
+            (-1.0, 1.0, 1.0),
+            (math.nan, 1.0, 1.0),
+            (math.inf, 1.0, 1.0),
+        ):
+            with (
+                self.subTest(axis_scales=invalid_axis_scales),
+                self.assertRaises((TypeError, ValueError)),
+            ):
+                PlacedGeneratedModel(
+                    "id",
+                    object_model,
+                    (0.0, 0.0, 0.0),
+                    axis_scales=invalid_axis_scales,
                 )
 
         with self.assertRaises(ValueError):

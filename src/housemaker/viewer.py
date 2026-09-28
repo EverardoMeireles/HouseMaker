@@ -190,9 +190,14 @@ OBJECT_PLACEMENT_PREVIEW_EDGE_COLOR = (0.12, 1.0, 0.55, 0.95)
 TRANSFORM_GIZMO_AXIS_HIT_RATIO = 0.09
 TRANSFORM_GIZMO_RING_RADIUS_RATIO = 0.72
 TRANSFORM_GIZMO_RING_HIT_RATIO = 0.085
+TRANSFORM_GIZMO_SCALE_CUBE_SIZE_RATIO = 0.16
+TRANSFORM_GIZMO_SCALE_CUBE_HIT_RATIO = 0.14
 TRANSFORM_GIZMO_SELECTION_COLOR = (1.0, 0.72, 0.18, 0.95)
 TRANSFORM_GIZMO_TRANSLATE = "translate"
 TRANSFORM_GIZMO_ROTATE = "rotate"
+TRANSFORM_GIZMO_SCALE = "scale"
+PLACED_OBJECT_GIZMO_TRANSFORM = "transform"
+PLACED_OBJECT_GIZMO_SCALE = "scale"
 PLACED_OBJECT_SCALE_FACTOR_PER_WHEEL_STEP = 1.1
 PLACED_OBJECT_MIN_SCALE = 0.05
 PLACED_OBJECT_MAX_SCALE = 20.0
@@ -473,7 +478,7 @@ class _CanvasSceneLevelMesh:
 
 @dataclass(frozen=True)
 class _TransformGizmoHandle:
-    """One global-axis translation arrow or rotation ring."""
+    """One translation, rotation, or local-axis scale handle."""
 
     kind: str
     axis_index: int
@@ -482,6 +487,7 @@ class _TransformGizmoHandle:
         if self.kind not in {
             TRANSFORM_GIZMO_TRANSLATE,
             TRANSFORM_GIZMO_ROTATE,
+            TRANSFORM_GIZMO_SCALE,
         }:
             raise ValueError("Unknown placed-object gizmo handle kind.")
         if self.axis_index not in {0, 1, 2}:
@@ -2710,6 +2716,7 @@ class _PlacedObjectTransformDrag:
     handle: _TransformGizmoHandle
     start_world_position: np.ndarray
     start_rotation_degrees: tuple[float, float, float]
+    start_axis_scales: tuple[float, float, float]
     start_transform: np.ndarray
     local_pivot: np.ndarray
     axis: np.ndarray
@@ -2719,6 +2726,7 @@ class _PlacedObjectTransformDrag:
     accumulated_rotation_degrees: float = 0.0
     preview_world_position: tuple[float, float, float] | None = None
     preview_rotation_degrees: tuple[float, float, float] | None = None
+    preview_axis_scales: tuple[float, float, float] | None = None
 
 
 # ### Face-selection background models ###
@@ -2853,6 +2861,7 @@ class GlbViewerWidget(QWidget):
     placed_object_removal_requested = Signal(str)
     placed_object_transform_changed = Signal(str, object, object)
     placed_object_scales_changed = Signal(object)
+    placed_object_axis_scales_changed = Signal(str, object)
     placed_object_selection_changed = Signal(object)
     placed_object_selection_set_changed = Signal(object)
     object_placement_selected = Signal(str, object)
@@ -2947,6 +2956,7 @@ class GlbViewerWidget(QWidget):
         self._placed_object_transform_drag: (
             _PlacedObjectTransformDrag | None
         ) = None
+        self._placed_object_gizmo_mode = PLACED_OBJECT_GIZMO_TRANSFORM
         self._transform_gizmo_items: list[GLGraphicsItem] = []
         self._transform_gizmo_size = TRANSFORM_GIZMO_MIN_SIZE_METERS
         self._object_placement_request_id: str | None = None
@@ -5031,6 +5041,26 @@ class GlbViewerWidget(QWidget):
 
         return self._selected_placed_object_ids
 
+    def get_placed_object_gizmo_mode(self) -> str:
+        """Return whether the active object shows transform or scale handles."""
+
+        return self._placed_object_gizmo_mode
+
+    def _toggle_placed_object_gizmo_mode(self) -> bool:
+        """Switch the selected object's handle set after a repeated click."""
+
+        if self._selected_placed_object_id is None:
+            return False
+        if self._placed_object_transform_drag is not None:
+            self._cancel_placed_object_gizmo_drag()
+        self._placed_object_gizmo_mode = (
+            PLACED_OBJECT_GIZMO_SCALE
+            if self._placed_object_gizmo_mode == PLACED_OBJECT_GIZMO_TRANSFORM
+            else PLACED_OBJECT_GIZMO_TRANSFORM
+        )
+        self._sync_placed_object_selection_rendering()
+        return True
+
     def _handle_view_delete_requested(self) -> None:
         """Route Delete to Canvas placement removal or the generic consumer."""
 
@@ -5149,6 +5179,8 @@ class GlbViewerWidget(QWidget):
         self.view.set_object_scale_wheel_steps_enabled(False)
         self._selected_placed_object_ids = normalized_ids
         self._selected_placed_object_id = normalized_active_id
+        if active_changed:
+            self._placed_object_gizmo_mode = PLACED_OBJECT_GIZMO_TRANSFORM
         self._sync_placed_object_selection_rendering()
         if selection_changed:
             self.placed_object_selection_set_changed.emit(normalized_ids)
@@ -5621,6 +5653,11 @@ class GlbViewerWidget(QWidget):
                     (*self._selected_placed_object_ids, object_id),
                     active_object_id=object_id,
                 )
+            elif (
+                self._selected_placed_object_ids == (object_id,)
+                and self._selected_placed_object_id == object_id
+            ):
+                self._toggle_placed_object_gizmo_mode()
             else:
                 self.set_selected_placed_object_ids(
                     (object_id,),
@@ -10289,6 +10326,8 @@ class GlbViewerWidget(QWidget):
             selected_id = selected_ids[-1] if selected_ids else None
         active_changed = selected_id != self._selected_placed_object_id
         self._selected_placed_object_id = selected_id
+        if active_changed:
+            self._placed_object_gizmo_mode = PLACED_OBJECT_GIZMO_TRANSFORM
         if selection_changed:
             self.placed_object_selection_set_changed.emit(selected_ids)
         if active_changed:
@@ -10317,14 +10356,22 @@ class GlbViewerWidget(QWidget):
             if hasattr(self, "view"):
                 self.view.update()
             return
-        self._build_transform_gizmo_items(
+        self._build_placed_object_gizmo_items(
             self._placed_object_render_groups[selected_id]
         )
         if self.object_transform_status_label is not None:
-            self.object_transform_status_label.setText(
-                "Drag an RGB arrow to move, an RGB ring to rotate, or use "
-                "the wheel to scale."
-            )
+            if self._placed_object_gizmo_mode == PLACED_OBJECT_GIZMO_SCALE:
+                self.object_transform_status_label.setText(
+                    "Drag an RGB cube to scale one local axis. Use the wheel "
+                    "to scale uniformly; select the object again to switch "
+                    "gizmos."
+                )
+            else:
+                self.object_transform_status_label.setText(
+                    "Drag an RGB arrow to move or an RGB ring to rotate. Use "
+                    "the wheel to scale uniformly; select the object again "
+                    "to switch gizmos."
+                )
         self.view.update()
 
     def _sync_placed_object_scale_input_state(self) -> None:
@@ -10398,10 +10445,23 @@ class GlbViewerWidget(QWidget):
         self._sync_placed_object_selection_rendering()
         self.placed_object_scales_changed.emit(tuple(updated_scales))
 
-    def _build_transform_gizmo_items(
+    def _build_placed_object_gizmo_items(
         self,
         group: _PlacedObjectRenderGroup,
     ) -> None:
+        """Build the active transform or per-axis scale handle set."""
+
+        if self._placed_object_gizmo_mode == PLACED_OBJECT_GIZMO_SCALE:
+            self._build_scale_gizmo_items(group)
+            return
+        self._build_transform_gizmo_items(group)
+
+    def _calculate_transform_gizmo_size(
+        self,
+        group: _PlacedObjectRenderGroup,
+    ) -> tuple[np.ndarray, float]:
+        """Return a screen-stable gizmo pivot and world-space size."""
+
         pivot = _get_render_group_world_pivot(group)
         local_bounds = _get_combined_mesh_bounds(group.pick_meshes)
         fallback_size = TRANSFORM_GIZMO_MIN_SIZE_METERS
@@ -10427,10 +10487,17 @@ class GlbViewerWidget(QWidget):
             TRANSFORM_GIZMO_MIN_SIZE_METERS,
             gizmo_size,
         )
+        return pivot, self._transform_gizmo_size
+
+    def _build_transform_gizmo_items(
+        self,
+        group: _PlacedObjectRenderGroup,
+    ) -> None:
+        pivot, gizmo_size = self._calculate_transform_gizmo_size(group)
         axes = np.eye(3, dtype=float)
         for axis_index, axis in enumerate(axes):
             color = TRANSFORM_GIZMO_AXIS_COLORS[axis_index]
-            endpoint = pivot + axis * self._transform_gizmo_size
+            endpoint = pivot + axis * gizmo_size
             axis_item = gl.GLLinePlotItem(
                 pos=np.asarray((pivot, endpoint), dtype=float),
                 color=color,
@@ -10451,8 +10518,7 @@ class GlbViewerWidget(QWidget):
             ring_positions = _build_rotation_ring_positions(
                 pivot,
                 axis_index,
-                self._transform_gizmo_size
-                * TRANSFORM_GIZMO_RING_RADIUS_RATIO,
+                gizmo_size * TRANSFORM_GIZMO_RING_RADIUS_RATIO,
             )
             ring_item = gl.GLLinePlotItem(
                 pos=ring_positions,
@@ -10462,6 +10528,41 @@ class GlbViewerWidget(QWidget):
                 mode="line_strip",
             )
             self._add_transform_gizmo_overlay_item(ring_item)
+
+    def _build_scale_gizmo_items(
+        self,
+        group: _PlacedObjectRenderGroup,
+    ) -> None:
+        """Build local XYZ scale shafts with cube-shaped tips."""
+
+        pivot, gizmo_size = self._calculate_transform_gizmo_size(group)
+        cube_size = gizmo_size * TRANSFORM_GIZMO_SCALE_CUBE_SIZE_RATIO
+        for axis_index in range(3):
+            axis = _get_placed_object_scale_world_axis(group, axis_index)
+            color = TRANSFORM_GIZMO_AXIS_COLORS[axis_index]
+            endpoint = pivot + axis * gizmo_size
+            axis_item = gl.GLLinePlotItem(
+                pos=np.asarray((pivot, endpoint), dtype=float),
+                color=color,
+                width=3.0,
+                antialias=True,
+                mode="lines",
+            )
+            self._add_transform_gizmo_overlay_item(axis_item)
+
+            cube = trimesh.creation.box(extents=(cube_size,) * 3)
+            cube.apply_translation(endpoint)
+            cube_item = gl.GLMeshItem(
+                vertexes=np.asarray(cube.vertices, dtype=np.float32),
+                faces=np.asarray(cube.faces, dtype=np.int32),
+                color=color,
+                smooth=False,
+                drawFaces=True,
+                drawEdges=True,
+                edgeColor=color,
+                shader="shaded",
+            )
+            self._add_transform_gizmo_overlay_item(cube_item)
 
     def _add_transform_gizmo_overlay_item(
         self,
@@ -10497,7 +10598,16 @@ class GlbViewerWidget(QWidget):
             return None
         pivot = _get_render_group_world_pivot(group)
         candidates: list[tuple[float, _TransformGizmoHandle]] = []
-        for axis_index, axis in enumerate(np.eye(3, dtype=float)):
+        scale_mode = self._placed_object_gizmo_mode == PLACED_OBJECT_GIZMO_SCALE
+        axes = (
+            tuple(
+                _get_placed_object_scale_world_axis(group, axis_index)
+                for axis_index in range(3)
+            )
+            if scale_mode
+            else tuple(np.eye(3, dtype=float))
+        )
+        for axis_index, axis in enumerate(axes):
             segment_end = pivot + axis * self._transform_gizmo_size
             segment_distance = _get_ray_segment_distance(
                 origin,
@@ -10514,11 +10624,37 @@ class GlbViewerWidget(QWidget):
                     (
                         segment_distance / max(axis_tolerance, 1e-12),
                         _TransformGizmoHandle(
-                            TRANSFORM_GIZMO_TRANSLATE,
+                            (
+                                TRANSFORM_GIZMO_SCALE
+                                if scale_mode
+                                else TRANSFORM_GIZMO_TRANSLATE
+                            ),
                             axis_index,
                         ),
                     )
                 )
+
+            if scale_mode:
+                point_hit = _get_ray_point_distance(
+                    origin,
+                    direction,
+                    segment_end,
+                )
+                cube_tolerance = (
+                    self._transform_gizmo_size
+                    * TRANSFORM_GIZMO_SCALE_CUBE_HIT_RATIO
+                )
+                if point_hit is not None and point_hit[0] <= cube_tolerance:
+                    candidates.append(
+                        (
+                            point_hit[0] / max(cube_tolerance, 1e-12),
+                            _TransformGizmoHandle(
+                                TRANSFORM_GIZMO_SCALE,
+                                axis_index,
+                            ),
+                        )
+                    )
+                continue
 
             ring_hit = _intersect_ray_with_plane(
                 origin,
@@ -10570,7 +10706,11 @@ class GlbViewerWidget(QWidget):
         if group is None or camera_ray is None:
             return False
         origin, direction = camera_ray
-        axis = np.eye(3, dtype=float)[handle.axis_index]
+        axis = (
+            _get_placed_object_scale_world_axis(group, handle.axis_index)
+            if handle.kind == TRANSFORM_GIZMO_SCALE
+            else np.eye(3, dtype=float)[handle.axis_index]
+        )
         pivot = _get_render_group_world_pivot(group)
         start_transform = np.asarray(group.current_transform, dtype=float).copy()
         try:
@@ -10580,7 +10720,10 @@ class GlbViewerWidget(QWidget):
             )
         except np.linalg.LinAlgError:
             return False
-        if handle.kind == TRANSFORM_GIZMO_TRANSLATE:
+        if handle.kind in {
+            TRANSFORM_GIZMO_TRANSLATE,
+            TRANSFORM_GIZMO_SCALE,
+        }:
             drag_plane_normal = _build_axis_drag_plane_normal(axis, direction)
             hit = _intersect_ray_with_plane(
                 origin,
@@ -10614,6 +10757,7 @@ class GlbViewerWidget(QWidget):
                 dtype=float,
             ),
             start_rotation_degrees=group.preview.rotation_degrees,
+            start_axis_scales=group.preview.axis_scales,
             start_transform=start_transform,
             local_pivot=local_pivot,
             axis=axis,
@@ -10622,15 +10766,16 @@ class GlbViewerWidget(QWidget):
             previous_rotation_vector=previous_rotation_vector,
             preview_world_position=group.preview.world_position,
             preview_rotation_degrees=group.preview.rotation_degrees,
+            preview_axis_scales=group.preview.axis_scales,
         )
         self._sync_placed_object_scale_input_state()
         self.view.reserve_primary_pointer_drag()
         if self.object_transform_status_label is not None:
-            action = (
-                "Moving"
-                if handle.kind == TRANSFORM_GIZMO_TRANSLATE
-                else "Rotating"
-            )
+            action = {
+                TRANSFORM_GIZMO_TRANSLATE: "Moving",
+                TRANSFORM_GIZMO_ROTATE: "Rotating",
+                TRANSFORM_GIZMO_SCALE: "Scaling",
+            }[handle.kind]
             self.object_transform_status_label.setText(
                 f"{action} on {'XYZ'[handle.axis_index]}. "
                 "Release to save; Escape cancels."
@@ -10665,6 +10810,39 @@ class GlbViewerWidget(QWidget):
             transform = np.eye(4, dtype=float)
             transform[:3, 3] = delta
             transform = transform @ drag.start_transform
+            axis_scales = drag.start_axis_scales
+        elif drag.handle.kind == TRANSFORM_GIZMO_SCALE:
+            assert drag.start_axis_parameter is not None
+            parameter = float(np.dot(hit - pivot, drag.axis))
+            scale_factor = 1.0 + (
+                parameter - drag.start_axis_parameter
+            ) / max(self._transform_gizmo_size, 1e-12)
+            uniform_scale = float(group.preview.scale)
+            start_axis_scale = drag.start_axis_scales[
+                drag.handle.axis_index
+            ]
+            next_axis_scale = min(
+                PLACED_OBJECT_MAX_SCALE,
+                max(
+                    PLACED_OBJECT_MIN_SCALE,
+                    start_axis_scale * scale_factor,
+                ),
+            )
+            mutable_axis_scales = list(drag.start_axis_scales)
+            mutable_axis_scales[drag.handle.axis_index] = next_axis_scale
+            axis_scales = tuple(float(value) for value in mutable_axis_scales)
+            world_position = drag.start_world_position
+            rotation_degrees = drag.start_rotation_degrees
+            scaled_rotation = _build_placed_object_scaled_rotation(
+                rotation_degrees,
+                uniform_scale,
+                axis_scales,
+            )
+            transform = _build_pivoted_world_transform(
+                world_position,
+                scaled_rotation,
+                drag.local_pivot,
+            )
         else:
             current_vector = _normalize_vector(hit - pivot)
             previous_vector = drag.previous_rotation_vector
@@ -10680,15 +10858,19 @@ class GlbViewerWidget(QWidget):
                 math.radians(drag.accumulated_rotation_degrees),
                 drag.axis,
             )[:3, :3]
-            scale = float(group.preview.scale)
-            world_orientation = (
-                delta_rotation @ drag.start_transform[:3, :3] / scale
+            world_orientation = delta_rotation @ _build_rotation_matrix(
+                drag.start_rotation_degrees
             )
             rotation_degrees = _rotation_matrix_to_degrees(world_orientation)
             world_position = drag.start_world_position
+            axis_scales = drag.start_axis_scales
             transform = _build_pivoted_world_transform(
                 world_position,
-                world_orientation * scale,
+                world_orientation
+                @ np.diag(
+                    float(group.preview.scale)
+                    * np.asarray(axis_scales, dtype=float)
+                ),
                 drag.local_pivot,
             )
 
@@ -10700,8 +10882,11 @@ class GlbViewerWidget(QWidget):
         drag.preview_rotation_degrees = tuple(
             float(value) for value in rotation_degrees
         )
+        drag.preview_axis_scales = tuple(
+            float(value) for value in axis_scales
+        )
         self._remove_transform_gizmo_items()
-        self._build_transform_gizmo_items(group)
+        self._build_placed_object_gizmo_items(group)
         self.view.update()
         return True
 
@@ -10712,7 +10897,8 @@ class GlbViewerWidget(QWidget):
         self._update_placed_object_gizmo_drag(position)
         world_position = drag.preview_world_position
         rotation_degrees = drag.preview_rotation_degrees
-        changed = bool(
+        axis_scales = drag.preview_axis_scales
+        transform_changed = bool(
             world_position is not None
             and rotation_degrees is not None
             and (
@@ -10730,34 +10916,56 @@ class GlbViewerWidget(QWidget):
                 )
             )
         )
+        axis_scale_changed = bool(
+            axis_scales is not None
+            and not np.allclose(
+                axis_scales,
+                drag.start_axis_scales,
+                atol=1e-9,
+                rtol=0.0,
+            )
+        )
+        changed = transform_changed or axis_scale_changed
+        committed = False
         self._placed_object_transform_drag = None
         self.view.release_primary_pointer_drag()
         if changed:
-            assert world_position is not None and rotation_degrees is not None
+            assert (
+                world_position is not None
+                and rotation_degrees is not None
+                and axis_scales is not None
+            )
             group = self._placed_object_render_groups.get(drag.object_id)
-            if group is None:
-                changed = False
-            else:
+            if group is not None:
                 self._remember_placed_object_preview_transform(
                     group,
                     world_position,
                     rotation_degrees,
+                    axis_scales,
                 )
-        if changed:
+                committed = True
+        if transform_changed and committed:
             assert world_position is not None and rotation_degrees is not None
             self.placed_object_transform_changed.emit(
                 drag.object_id,
                 world_position,
                 rotation_degrees,
             )
+        if axis_scale_changed and committed:
+            assert axis_scales is not None
+            self.placed_object_axis_scales_changed.emit(
+                drag.object_id,
+                axis_scales,
+            )
         self._sync_placed_object_selection_rendering()
-        return changed
+        return committed
 
     def _remember_placed_object_preview_transform(
         self,
         group: _PlacedObjectRenderGroup,
         world_position: tuple[float, float, float],
         rotation_degrees: tuple[float, float, float],
+        axis_scales: tuple[float, float, float],
     ) -> None:
         """Make a committed live transform the baseline for the next drag."""
 
@@ -10766,6 +10974,7 @@ class GlbViewerWidget(QWidget):
             placement_transform=group.current_transform,
             world_position=world_position,
             rotation_degrees=rotation_degrees,
+            axis_scales=axis_scales,
         )
         group.preview = preview
         group.current_transform = np.asarray(
@@ -14175,6 +14384,57 @@ def _transform_point(transform: object, point: object) -> np.ndarray:
     if abs(float(transformed[3])) <= 1e-12:
         raise ValueError("A transformed point cannot have a zero homogeneous W.")
     return np.asarray(transformed[:3] / transformed[3], dtype=float)
+
+
+def _build_rotation_matrix(rotation_degrees: object) -> np.ndarray:
+    """Build one pure XYZ Euler rotation matrix from stored degrees."""
+
+    rotation = np.asarray(rotation_degrees, dtype=float)
+    if rotation.shape != (3,) or not np.all(np.isfinite(rotation)):
+        raise ValueError("Placed-object rotations must contain finite XYZ angles.")
+    return trimesh.transformations.euler_matrix(
+        *np.radians(rotation),
+        axes="sxyz",
+    )[:3, :3]
+
+
+def _build_placed_object_scaled_rotation(
+    rotation_degrees: object,
+    uniform_scale: float,
+    axis_scales: object,
+) -> np.ndarray:
+    """Combine pure rotation with independent local XYZ scale multipliers."""
+
+    scale = float(uniform_scale)
+    local_scales = np.asarray(axis_scales, dtype=float)
+    if (
+        local_scales.shape != (3,)
+        or not np.all(np.isfinite(local_scales))
+        or np.any(local_scales <= 0.0)
+        or not math.isfinite(scale)
+        or scale <= 0.0
+    ):
+        raise ValueError("Placed-object scale values must be finite and positive.")
+    return _build_rotation_matrix(rotation_degrees) @ np.diag(
+        scale * local_scales
+    )
+
+
+def _get_placed_object_scale_world_axis(
+    group: _PlacedObjectRenderGroup,
+    axis_index: int,
+) -> np.ndarray:
+    """Return the world direction of one object's local scale axis."""
+
+    if axis_index not in {0, 1, 2}:
+        raise ValueError("Placed-object scale axes must be X, Y, or Z.")
+    axis = _build_rotation_matrix(group.preview.rotation_degrees)[
+        :, axis_index
+    ]
+    normalized_axis = _normalize_vector(axis)
+    if normalized_axis is None:
+        raise ValueError("Placed-object scale axes must have a direction.")
+    return normalized_axis
 
 
 def _build_uniform_scale_about_point(
