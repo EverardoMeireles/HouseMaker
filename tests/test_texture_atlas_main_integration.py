@@ -459,6 +459,107 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             hasattr(self.workspace.generation, "delete_generated_object_button")
         )
 
+    def test_atlas_external_glb_import_cancel_does_not_start_processing(
+        self,
+    ) -> None:
+        with (
+            patch(
+                "housemaker.main.QFileDialog.getOpenFileName",
+                return_value=("", "GLB Files (*.glb)"),
+            ) as file_dialog,
+            patch.object(
+                self.workspace.generation,
+                "start_external_glb_import",
+            ) as start_external_glb_import,
+        ):
+            self.workspace._handle_atlas_external_glb_import_requested()
+
+        file_dialog.assert_called_once()
+        start_external_glb_import.assert_not_called()
+
+    def test_atlas_external_glb_import_selects_and_highlights_new_object(
+        self,
+    ) -> None:
+        record = SimpleNamespace(object_id="external-chair")
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        self.workspace.generation.status_label.setText(
+            "Imported GLB: External chair. Removed 8 hidden faces."
+        )
+
+        with (
+            patch(
+                "housemaker.main.QFileDialog.getOpenFileName",
+                return_value=("C:/models/external-chair.glb", "GLB Files (*.glb)"),
+            ),
+            patch.object(
+                self.workspace.generation,
+                "start_external_glb_import",
+                return_value=True,
+            ) as start_external_glb_import,
+            patch.object(
+                self.workspace,
+                "_sync_atlas_object_texture_sources",
+            ) as sync_sources,
+            patch.object(atlas_workspace, "select_source_ids") as select_sources,
+            patch.object(atlas_workspace, "mark_sources_new") as mark_sources_new,
+            patch.object(
+                self.workspace,
+                "_request_hosted_atlas_object_preview",
+            ) as request_preview,
+        ):
+            self.workspace._handle_atlas_external_glb_import_requested()
+            self.workspace.generation.external_glb_import_completed.emit(
+                record,
+                _generated_box_model(),
+            )
+
+        start_external_glb_import.assert_called_once_with(
+            "C:/models/external-chair.glb"
+        )
+        sync_sources.assert_called_once_with()
+        select_sources.assert_called_once_with(
+            ("external-chair",),
+            active_source_id="external-chair",
+        )
+        mark_sources_new.assert_called_once_with(("external-chair",))
+        request_preview.assert_called_once_with()
+        self.assertEqual(
+            atlas_workspace.status_label.text(),
+            "Imported GLB: External chair. Removed 8 hidden faces.",
+        )
+
+    def test_atlas_external_glb_import_reports_processing_failure(self) -> None:
+        atlas_workspace = self.workspace.texture_atlas_workspace
+
+        with (
+            patch(
+                "housemaker.main.QFileDialog.getOpenFileName",
+                return_value=("C:/models/broken.glb", "GLB Files (*.glb)"),
+            ),
+            patch.object(
+                self.workspace.generation,
+                "start_external_glb_import",
+                side_effect=ValueError("The GLB contains no triangle mesh."),
+            ),
+            patch("housemaker.main.QMessageBox.critical") as critical,
+            patch.object(
+                self.workspace,
+                "_sync_atlas_object_texture_sources",
+            ) as sync_sources,
+        ):
+            self.workspace._handle_atlas_external_glb_import_requested()
+
+        critical.assert_called_once()
+        self.assertEqual(
+            critical.call_args.args[1:],
+            ("GLB import failed", "The GLB contains no triangle mesh."),
+        )
+        self.assertEqual(
+            atlas_workspace.status_label.text(),
+            "GLB import failed: The GLB contains no triangle mesh.",
+        )
+        sync_sources.assert_not_called()
+
     def test_save_passes_detached_atlas_state_to_project_io(self) -> None:
         atlas_data = TextureAtlasData()
         atlas_data.create_atlas("Saved Atlas", 2048, atlas_id="atlas-a")

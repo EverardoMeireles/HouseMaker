@@ -17,7 +17,10 @@ MAX_MASK_STROKES_PER_FRAME = 10_000
 MAX_MASK_POINTS_PER_STROKE = 100_000
 GENERATION_PIPELINE_SCHEMA_VERSION = 1
 MESHY_GENERATION_PROVIDER = "meshy"
-GENERATION_PROVIDERS = frozenset({MESHY_GENERATION_PROVIDER})
+EXTERNAL_GLB_GENERATION_PROVIDER = "external_glb"
+GENERATION_PROVIDERS = frozenset(
+    {MESHY_GENERATION_PROVIDER, EXTERNAL_GLB_GENERATION_PROVIDER}
+)
 
 
 # ### Mask models ###
@@ -195,8 +198,8 @@ class GeneratedObjectPlacement:
 class GeneratedObjectRecord:
     """Serializable provenance for a generated object.
 
-    Meshy meshes use a validated local GLB asset path instead of embedding bytes
-    in project JSON. ``pipeline`` is retained as an empty compatibility field.
+    Generated and imported meshes use a validated local GLB asset path instead
+    of embedding bytes in project JSON. ``pipeline`` stores local provenance.
     """
 
     object_id: str
@@ -224,6 +227,13 @@ class GeneratedObjectRecord:
                 raise ValueError("Meshy generated objects require a task ID.")
             if not str(self.asset_path or "").strip():
                 raise ValueError("Meshy generated objects require an asset path.")
+        elif self.provider == EXTERNAL_GLB_GENERATION_PROVIDER:
+            if self.provider_task_id is not None:
+                raise ValueError(
+                    "Imported GLB objects cannot have a provider task ID."
+                )
+            if not str(self.asset_path or "").strip():
+                raise ValueError("Imported GLB objects require an asset path.")
         if self.placement is not None and not isinstance(
             self.placement,
             GeneratedObjectPlacement,
@@ -383,7 +393,7 @@ class GenerationData:
                 for frame_index, raw_strokes in raw_frame_strokes.items()
                 if isinstance(raw_strokes, list)
             },
-            generated_objects=_load_meshy_generated_objects(raw_generated_objects),
+            generated_objects=_load_generated_objects(raw_generated_objects),
         )
 
 
@@ -432,10 +442,10 @@ def _normalize_placement_axis_scales(
     return tuple(float(value) for value in raw_axis_scales)
 
 
-def _load_meshy_generated_objects(
+def _load_generated_objects(
     raw_generated_objects: list[object],
 ) -> list[GeneratedObjectRecord]:
-    """Load Meshy records and silently retire legacy procedural records."""
+    """Load supported records and silently retire legacy procedural ones."""
 
     records: list[GeneratedObjectRecord] = []
     for raw_record in raw_generated_objects:

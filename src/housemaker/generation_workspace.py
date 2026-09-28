@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import math
 import os
 import re
@@ -46,6 +47,7 @@ from shiboken6 import isValid as is_valid_qt_object
 from housemaker.generation_jobs import GenerationJobManager
 from housemaker.generation_shared_controls import GenerationSharedControls
 from housemaker.generation_state import (
+    EXTERNAL_GLB_GENERATION_PROVIDER,
     MASK_MODE_ERASE,
     MASK_MODE_PAINT,
     GeneratedObjectPlacement,
@@ -61,7 +63,16 @@ from housemaker.glass_material import (
     get_housemaker_glass_runtime_key,
     is_housemaker_glass_material,
 )
-from housemaker.glb import GeneratedModel, import_generated_glb
+from housemaker.glb import (
+    GLB_CHUNK_HEADER_BYTE_COUNT,
+    GLB_HEADER_BYTE_COUNT,
+    GLB_JSON_CHUNK_TYPE,
+    GLB_MAGIC,
+    GLB_VERSION,
+    MAX_IMPORTED_GENERATED_MODEL_FACES,
+    GeneratedModel,
+    import_generated_glb,
+)
 from housemaker.meshy_generation import (
     MAX_IMAGE_TO_3D_TEXTURE_PROMPT_CHARACTERS,
     MeshyGenerationResult,
@@ -115,6 +126,7 @@ from housemaker.object_texture_variants import (
     TEXTURE_RESOLUTION_2048,
     TEXTURE_RESOLUTIONS,
     ObjectTextureVariants,
+    build_external_object_texture_variants,
     build_object_texture_variants,
     replace_object_base_color_texture_from_glb,
     replace_object_variant_base_color_texture,
@@ -179,6 +191,7 @@ CONTROL_STRETCH = 0
 INTERRUPT_POLL_SECONDS = 0.01
 SHUTDOWN_WAIT_MILLISECONDS = 250
 GENERATION_BACKEND_MESHY = "meshy"
+GENERATION_BACKEND_EXTERNAL_GLB = EXTERNAL_GLB_GENERATION_PROVIDER
 OBJECT_FACE_GEOMETRY_CACHE_MAX_ENTRIES = 16
 GEOMETRY_FINGERPRINT_DECIMALS = 6
 MESHY_REVISION_GEOMETRY = "geometry"
@@ -200,6 +213,7 @@ PBR_MAPS_ENABLED_PIPELINE_KEY = "pbr_maps_enabled"
 GLASS_CONVERSION_PIPELINE_KEY = "glass_conversion"
 GLASS_MATERIAL_SOURCE_PREFAB = "housemaker_prefab"
 SAFE_DUPLICATE_REMOVAL_PIPELINE_KEY = "safe_duplicate_face_removal"
+EXTERNAL_GLB_IMPORT_PIPELINE_KEY = "external_glb_import"
 # Legacy-only key retained so later geometry operations can discard obsolete
 # masks from projects saved before Object Generation inpainting was removed.
 TEXTURE_INPAINT_STROKES_PIPELINE_KEY = "texture_inpaint_strokes"
@@ -442,6 +456,25 @@ class _ObjectJobSignalRelay(QObject):
     @Slot()
     def forward_thread_finished(self) -> None:
         self.thread_finished.emit(self._operation_id)
+
+
+class _ExternalGlbImportSignalRelay(QObject):
+    """Tag import-thread events before dispatching them on the GUI thread."""
+
+    progress = Signal(str, str)
+    thread_finished = Signal(str)
+
+    def __init__(self, import_id: str, parent: QObject) -> None:
+        super().__init__(parent)
+        self._import_id = str(import_id)
+
+    @Slot(str)
+    def forward_progress(self, message: str) -> None:
+        self.progress.emit(self._import_id, str(message))
+
+    @Slot()
+    def forward_thread_finished(self) -> None:
+        self.thread_finished.emit(self._import_id)
 
 
 @dataclass
@@ -1066,6 +1099,29 @@ class _SavedObjectTextureRegeneration:
     preview_model: GeneratedModel
     preview_asset_revision: tuple[object, ...]
     persisted_asset_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _PreparedExternalGlbImport:
+    """Cleaned project-owned assets awaiting a short GUI-thread commit."""
+
+    record: GeneratedObjectRecord
+    preview_model: GeneratedModel
+    persisted_asset_paths: tuple[str, ...]
+    texture_variant_error: str | None
+    removed_face_count: int
+
+
+@dataclass
+class _ExternalGlbImportRuntime:
+    """GUI-owned lifecycle for one independently cancellable GLB import."""
+
+    import_id: str
+    object_name: str
+    thread: ExternalGlbImportThread
+    relay: _ExternalGlbImportSignalRelay
+    managed_job_id: str | None
+    cancel_requested: bool = False
 
 
 @dataclass(frozen=True)
@@ -3175,6 +3231,61 @@ class ObjectFaceCreationWorker(QObject):
             self.finished.emit()
 
 
+# ### External GLB import worker ###
+class ExternalGlbImportThread(QThread):
+    """Clean and persist one external model without blocking the Atlas UI."""
+
+    progress = Signal(str)
+
+    def __init__(
+        self,
+        source_path: Path,
+        asset_directory: Path,
+        settings: GenerationServiceSettings,
+        object_id: str,
+        object_name: str,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._source_path = Path(source_path)
+        self._asset_directory = Path(asset_directory)
+        self._settings = settings
+        self._object_id = str(object_id)
+        self._object_name = str(object_name)
+        self.result: _PreparedExternalGlbImport | None = None
+        self.error_message: str | None = None
+        self.was_cancelled = False
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            prepared = _prepare_external_glb_import(
+                source_path=self._source_path,
+                asset_directory=self._asset_directory,
+                settings=self._settings,
+                object_id=self._object_id,
+                object_name=self._object_name,
+                cancel_requested=self.isInterruptionRequested,
+                progress_callback=self.progress.emit,
+            )
+        except _GenerationCancelled:
+            self.was_cancelled = True
+            return
+        except Exception as error:  # noqa: BLE001 - worker errors cross Qt safely.
+            if self.isInterruptionRequested():
+                self.was_cancelled = True
+            else:
+                self.error_message = str(error).strip() or type(error).__name__
+            return
+        if self.isInterruptionRequested():
+            _discard_generated_asset_paths(
+                self._asset_directory,
+                prepared.persisted_asset_paths,
+            )
+            self.was_cancelled = True
+            return
+        self.result = prepared
+
+
 # ### Generation workspace ###
 class GenerationWorkspace(QWidget):
     """Manual video selection and Meshy Image-to-3D workspace."""
@@ -3193,6 +3304,8 @@ class GenerationWorkspace(QWidget):
     operation_finished = Signal(str)
     generation_batch_started = Signal(object)
     reference_edit_state_changed = Signal()
+    external_glb_import_completed = Signal(object, object)
+    external_glb_import_failed = Signal(str)
 
     def __init__(
         self,
@@ -3232,6 +3345,10 @@ class GenerationWorkspace(QWidget):
         self._is_syncing_seekbar = False
         self._job_manager = job_manager
         self._object_job_runtimes: dict[str, _ObjectJobRuntime] = {}
+        self._external_glb_import_runtimes: dict[
+            str,
+            _ExternalGlbImportRuntime,
+        ] = {}
         self._latest_generation_batch_id: str | None = None
         self._latest_generation_batch_member_ids: dict[int, str] = {}
         self._latest_generation_batch_mask_signature: (
@@ -3451,6 +3568,196 @@ class GenerationWorkspace(QWidget):
         """Return lightweight immutable IDs without cloning Generation data."""
 
         return tuple(record.object_id for record in self._data.generated_objects)
+
+    def import_external_glb(
+        self,
+        source_path: str | Path,
+    ) -> GeneratedObjectRecord:
+        """Clean, copy, and publish one external static GLB transactionally."""
+
+        path = Path(source_path).expanduser()
+        object_id = uuid.uuid4().hex
+        object_name = self._build_unique_generated_object_name(path.stem)
+        prepared = _prepare_external_glb_import(
+            source_path=path,
+            asset_directory=self._asset_directory,
+            settings=self._settings,
+            object_id=object_id,
+            object_name=object_name,
+        )
+        return self._commit_external_glb_import(prepared)
+
+    def start_external_glb_import(self, source_path: str | Path) -> bool:
+        """Start one independently cancellable Atlas GLB import job."""
+
+        path = Path(source_path).expanduser()
+        _validate_external_glb_source_path(path)
+        object_id = uuid.uuid4().hex
+        object_name = self._build_unique_generated_object_name(path.stem)
+        import_id = uuid.uuid4().hex
+        thread = ExternalGlbImportThread(
+            path,
+            self._asset_directory,
+            self._settings,
+            object_id,
+            object_name,
+            self,
+        )
+        relay = _ExternalGlbImportSignalRelay(import_id, self)
+        managed_job_id: str | None = None
+        if self._job_manager is not None:
+            job = self._job_manager.create_job(
+                kind="GLB import",
+                requested_name=object_name,
+                default_name=object_name,
+                stage="Validating external GLB (2%)",
+            )
+            managed_job_id = job.job_id
+        runtime = _ExternalGlbImportRuntime(
+            import_id=import_id,
+            object_name=object_name,
+            thread=thread,
+            relay=relay,
+            managed_job_id=managed_job_id,
+        )
+        self._external_glb_import_runtimes[import_id] = runtime
+        if self._job_manager is not None and managed_job_id is not None:
+            self._job_manager.set_cancel_callback(
+                managed_job_id,
+                lambda import_id=import_id: self.cancel_external_glb_import(
+                    import_id
+                ),
+            )
+        thread.progress.connect(relay.forward_progress)
+        relay.progress.connect(self._handle_external_glb_import_progress)
+        thread.finished.connect(relay.forward_thread_finished)
+        relay.thread_finished.connect(
+            self._handle_external_glb_import_finished
+        )
+        thread.finished.connect(thread.deleteLater)
+        self.status_label.setText(
+            f"Importing {object_name} and removing hidden or unused faces..."
+        )
+        thread.start()
+        return True
+
+    def cancel_external_glb_import(self, import_id: str) -> bool:
+        """Request cancellation of one exact external-model import."""
+
+        runtime = self._external_glb_import_runtimes.get(str(import_id))
+        if runtime is None:
+            return False
+        if runtime.cancel_requested:
+            return True
+        runtime.cancel_requested = True
+        runtime.thread.requestInterruption()
+        return True
+
+    def _commit_external_glb_import(
+        self,
+        prepared: _PreparedExternalGlbImport,
+    ) -> GeneratedObjectRecord:
+        """Publish one fully prepared import without further file processing."""
+
+        if not isinstance(prepared, _PreparedExternalGlbImport):
+            raise TypeError("The prepared external GLB import is invalid.")
+        record = prepared.record
+        if self._find_generated_object_record(record.object_id) is not None:
+            raise ValueError("The imported GLB object ID is already in use.")
+        try:
+            asset_path = self._resolve_meshy_asset_path(record.asset_path)
+            asset_revision = _build_generation_asset_revision(
+                self._asset_directory,
+                record.asset_path,
+            )
+            if (
+                not asset_path.is_file()
+                or asset_revision[1] != len(prepared.preview_model.glb_bytes)
+            ):
+                raise ValueError(
+                    "The imported GLB asset changed before it could be applied."
+                )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            self._remove_newly_persisted_assets(
+                prepared.persisted_asset_paths
+            )
+            raise
+
+        self._data.generated_objects.append(record)
+        self._cache_generated_model(
+            record,
+            prepared.preview_model,
+            asset_revision=asset_revision,
+        )
+        self._selected_object_id = record.object_id
+        self._generated_model = prepared.preview_model
+        self._select_generated_object(record.object_id)
+        status = _format_external_glb_import_status(prepared)
+        self.status_label.setText(status)
+        self._emit_data_changed()
+        self.generation_completed.emit(record, prepared.preview_model)
+        self.external_glb_import_completed.emit(record, prepared.preview_model)
+        return record
+
+    @Slot(str, str)
+    def _handle_external_glb_import_progress(
+        self,
+        import_id: str,
+        message: str,
+    ) -> None:
+        runtime = self._external_glb_import_runtimes.get(str(import_id))
+        if runtime is None or runtime.cancel_requested:
+            return
+        self.status_label.setText(str(message))
+        if self._job_manager is not None and runtime.managed_job_id is not None:
+            self._job_manager.update_job(
+                runtime.managed_job_id,
+                stage=str(message),
+            )
+
+    @Slot(str)
+    def _handle_external_glb_import_finished(self, import_id: str) -> None:
+        runtime = self._external_glb_import_runtimes.pop(str(import_id), None)
+        if runtime is None:
+            return
+        runtime.relay.deleteLater()
+        thread = runtime.thread
+        job_id = runtime.managed_job_id
+        if self._job_manager is not None and job_id is not None:
+            self._job_manager.set_cancel_callback(job_id, None)
+        if runtime.cancel_requested or thread.was_cancelled:
+            if thread.result is not None:
+                _discard_generated_asset_paths(
+                    self._asset_directory,
+                    thread.result.persisted_asset_paths,
+                )
+            self.status_label.setText(
+                f"Cancelled GLB import: {runtime.object_name}."
+            )
+            if self._job_manager is not None and job_id is not None:
+                self._job_manager.mark_cancelled(job_id)
+            return
+        if thread.error_message is not None or thread.result is None:
+            message = thread.error_message or "The GLB import returned no result."
+            self.status_label.setText(f"GLB import failed: {message}")
+            if self._job_manager is not None and job_id is not None:
+                self._job_manager.fail_job(job_id, f"Failed: {message}")
+            self.external_glb_import_failed.emit(message)
+            return
+        try:
+            record = self._commit_external_glb_import(thread.result)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            message = str(error).strip() or type(error).__name__
+            self.status_label.setText(f"GLB import failed: {message}")
+            if self._job_manager is not None and job_id is not None:
+                self._job_manager.fail_job(job_id, f"Failed: {message}")
+            self.external_glb_import_failed.emit(message)
+            return
+        if self._job_manager is not None and job_id is not None:
+            self._job_manager.complete_job(
+                job_id,
+                f"Imported: {record.object_name}",
+            )
 
     def select_generated_object(self, object_id: str | None) -> bool:
         """Select one generated object for preview and editing without a list."""
@@ -3680,7 +3987,7 @@ class GenerationWorkspace(QWidget):
         )
 
     def set_data(self, data: GenerationData | None) -> None:
-        if self.is_generating:
+        if self.is_generating or self._external_glb_import_runtimes:
             raise RuntimeError("Cannot replace Generation data while generating.")
         self._finish_existing_object_placement_request()
         self._latest_generation_batch_id = None
@@ -5071,6 +5378,10 @@ class GenerationWorkspace(QWidget):
             self._active_placeable_object_name(runtime)
             for runtime in self._object_job_runtimes.values()
         )
+        existing_names.update(
+            runtime.object_name
+            for runtime in self._external_glb_import_runtimes.values()
+        )
         manager = self._job_manager
         if manager is not None:
             existing_names.update(job.name.strip() for job in manager.jobs())
@@ -5521,6 +5832,28 @@ class GenerationWorkspace(QWidget):
 
     def shutdown(self) -> None:
         self._existing_object_placement_request = None
+        import_runtimes = tuple(self._external_glb_import_runtimes.values())
+        for import_runtime in import_runtimes:
+            import_runtime.cancel_requested = True
+            import_runtime.thread.requestInterruption()
+        for import_runtime in import_runtimes:
+            thread = import_runtime.thread
+            while is_valid_qt_object(thread) and thread.isRunning():
+                thread.wait(SHUTDOWN_WAIT_MILLISECONDS)
+            if thread.result is not None:
+                _discard_generated_asset_paths(
+                    self._asset_directory,
+                    thread.result.persisted_asset_paths,
+                )
+            if (
+                self._job_manager is not None
+                and import_runtime.managed_job_id is not None
+            ):
+                self._job_manager.mark_cancelled(
+                    import_runtime.managed_job_id,
+                    "Cancelled during shutdown",
+                )
+        self._external_glb_import_runtimes.clear()
         runtimes = tuple(self._object_job_runtimes.values())
         for runtime in runtimes:
             runtime.operation.cancel_requested = True
@@ -9023,7 +9356,13 @@ def _get_object_operation_undo_stack(
             continue
         if not isinstance(asset_path, str) or not asset_path.strip():
             continue
-        if not isinstance(provider_task_id, str) or not provider_task_id.strip():
+        if record.provider == GENERATION_BACKEND_MESHY:
+            if (
+                not isinstance(provider_task_id, str)
+                or not provider_task_id.strip()
+            ):
+                continue
+        elif provider_task_id is not None:
             continue
         if not isinstance(pipeline, dict):
             continue
@@ -9084,7 +9423,10 @@ def _restore_object_operation_snapshot(
     raw_pipeline = snapshot.get("pipeline")
     if not isinstance(asset_path, str) or not asset_path.strip():
         raise ValueError("The saved undo model path is invalid.")
-    if not isinstance(provider_task_id, str) or not provider_task_id.strip():
+    if record.provider == GENERATION_BACKEND_MESHY:
+        if not isinstance(provider_task_id, str) or not provider_task_id.strip():
+            raise ValueError("The saved undo provider task is invalid.")
+    elif provider_task_id is not None:
         raise ValueError("The saved undo provider task is invalid.")
     if not isinstance(raw_pipeline, dict):
         raise ValueError("The saved undo provenance is invalid.")
@@ -9490,6 +9832,310 @@ def _resolve_deletable_asset(
         return None
     identity = os.path.normcase(str(resolved_candidate))
     return candidate, identity
+
+
+# ### External GLB import preparation ###
+def _validate_external_glb_source_path(source_path: Path) -> None:
+    """Reject unsupported or unavailable external-model paths early."""
+
+    path = Path(source_path)
+    if path.suffix.lower() != ".glb":
+        raise ValueError("Select a binary glTF (.glb) model.")
+    if not path.is_file():
+        raise ValueError("The selected GLB file is unavailable.")
+
+
+def _raise_if_external_glb_import_cancelled(
+    cancel_requested: Callable[[], bool] | None,
+) -> None:
+    if cancel_requested is not None and cancel_requested():
+        raise _GenerationCancelled
+
+
+def _validate_external_glb_static_features(payload: bytes) -> None:
+    """Reject GLB features the static project-owned pipeline cannot retain."""
+
+    document = _parse_external_glb_document(payload)
+    _validate_external_glb_resource_uris(document)
+    if document.get("animations") or document.get("skins"):
+        raise ValueError(
+            "Animated or skinned GLBs are not supported by static Atlas "
+            "object placement. Export a static mesh before importing it."
+        )
+    if _external_glb_has_morph_targets(document):
+        raise ValueError(
+            "Morph-target GLBs are not supported by static Atlas object "
+            "placement. Export a static mesh before importing it."
+        )
+
+
+def _parse_external_glb_document(payload: bytes) -> dict[str, object]:
+    """Return one validated binary glTF JSON document."""
+
+    try:
+        if (
+            len(payload) < GLB_HEADER_BYTE_COUNT + GLB_CHUNK_HEADER_BYTE_COUNT
+            or payload[:4] != GLB_MAGIC
+            or int.from_bytes(payload[4:8], "little") != GLB_VERSION
+            or int.from_bytes(payload[8:12], "little") != len(payload)
+        ):
+            raise ValueError("The GLB header is invalid.")
+        json_byte_count = int.from_bytes(payload[12:16], "little")
+        if payload[16:20] != GLB_JSON_CHUNK_TYPE:
+            raise ValueError("The GLB JSON chunk is missing.")
+        json_end = (
+            GLB_HEADER_BYTE_COUNT
+            + GLB_CHUNK_HEADER_BYTE_COUNT
+            + json_byte_count
+        )
+        if json_byte_count <= 0 or json_end > len(payload):
+            raise ValueError("The GLB JSON chunk is invalid.")
+        document = json.loads(
+            payload[20:json_end].rstrip(b" \t\r\n\0").decode("utf-8")
+        )
+        if not isinstance(document, dict):
+            raise ValueError("The GLB JSON root is invalid.")
+    except (TypeError, UnicodeError, ValueError) as error:
+        raise ValueError(
+            "The selected file is not a valid binary glTF model."
+        ) from error
+    return document
+
+
+def _validate_external_glb_resource_uris(
+    document: Mapping[str, object],
+) -> None:
+    """Require resources that remain valid after the GLB is project-owned."""
+
+    for collection_name in ("buffers", "images"):
+        raw_resources = document.get(collection_name, [])
+        if not isinstance(raw_resources, list):
+            continue
+        for raw_resource in raw_resources:
+            if not isinstance(raw_resource, Mapping) or "uri" not in raw_resource:
+                continue
+            raw_uri = raw_resource.get("uri")
+            if isinstance(raw_uri, str) and raw_uri.strip().casefold().startswith(
+                "data:"
+            ):
+                continue
+            raise ValueError(
+                "The selected GLB references external image or buffer files. "
+                "Export a self-contained GLB with every resource embedded "
+                "before importing it."
+            )
+
+
+def _external_glb_has_morph_targets(document: Mapping[str, object]) -> bool:
+    """Return whether any imported mesh primitive uses morph targets."""
+
+    raw_meshes = document.get("meshes", [])
+    if not isinstance(raw_meshes, list):
+        return False
+    for raw_mesh in raw_meshes:
+        if not isinstance(raw_mesh, dict):
+            continue
+        raw_primitives = raw_mesh.get("primitives", [])
+        if not isinstance(raw_primitives, list):
+            continue
+        for raw_primitive in raw_primitives:
+            if isinstance(raw_primitive, dict) and raw_primitive.get("targets"):
+                return True
+    return False
+
+
+def _format_external_glb_cleanup_progress(
+    update: UnusedFaceRemovalProgress,
+) -> str:
+    """Map visibility-cleanup stages into one monotonic import progress range."""
+
+    if update.stage == "capturing":
+        camera_index = (
+            -1
+            if update.camera_id not in ALL_CAMERA_IDS
+            else ALL_CAMERA_IDS.index(update.camera_id)
+        )
+        progress = 8 if camera_index < 0 else 8 + round(
+            50 * (camera_index + 1) / len(ALL_CAMERA_IDS)
+        )
+        camera_suffix = "" if update.camera_id is None else f" ({update.camera_id})"
+        return f"Scanning external GLB faces{camera_suffix} ({progress}%)"
+    if update.stage == "checking":
+        return "Classifying hidden and stacked faces (64%)"
+    if update.stage == "exporting":
+        return "Rebuilding visible external GLB geometry (72%)"
+    return "Hidden-face cleanup complete (76%)"
+
+
+def _prepare_external_glb_import(
+    *,
+    source_path: Path,
+    asset_directory: Path,
+    settings: GenerationServiceSettings,
+    object_id: str,
+    object_name: str,
+    cancel_requested: Callable[[], bool] | None = None,
+    progress_callback: Callable[[str], None] | None = None,
+) -> _PreparedExternalGlbImport:
+    """Prepare all imported assets atomically without mutating Qt widgets."""
+
+    path = Path(source_path)
+    _validate_external_glb_source_path(path)
+
+    def report(message: str) -> None:
+        if progress_callback is not None:
+            progress_callback(str(message))
+
+    report("Validating external GLB (2%)")
+    _raise_if_external_glb_import_cancelled(cancel_requested)
+    try:
+        source_glb = path.read_bytes()
+    except OSError as error:
+        raise ValueError("The selected GLB file could not be read.") from error
+    if not source_glb:
+        raise ValueError("The selected GLB file is empty.")
+    _validate_external_glb_static_features(source_glb)
+    import_generated_glb(source_glb)
+    _raise_if_external_glb_import_cancelled(cancel_requested)
+
+    cleanup = remove_unused_faces_from_glb(
+        source_glb,
+        options=replace(
+            _build_unused_face_removal_options(settings),
+            max_face_count=MAX_IMPORTED_GENERATED_MODEL_FACES,
+            preserve_zero_projected_sample_faces=True,
+        ),
+        cancel_requested=cancel_requested,
+        progress_callback=lambda update: report(
+            _format_external_glb_cleanup_progress(update)
+        ),
+    )
+    cleaned_glb = bytes(cleanup.glb_bytes)
+    cleaned_model = import_generated_glb(cleaned_glb)
+    _raise_if_external_glb_import_cancelled(cancel_requested)
+
+    report("Preparing external texture variants (80%)")
+    texture_variant_error: str | None = None
+    try:
+        texture_variants = build_external_object_texture_variants(cleaned_glb)
+    except ValueError as error:
+        # A multi-atlas material cannot use one existing Atlas slot without a
+        # UV rewrite. Retain the original embedded materials and keep the
+        # imported model placeable rather than rejecting valid geometry.
+        texture_variants = None
+        texture_variant_error = str(error).strip() or type(error).__name__
+    _raise_if_external_glb_import_cancelled(cancel_requested)
+
+    persisted_asset_paths: list[str] = []
+    try:
+        report("Saving project-owned GLB assets (90%)")
+        source_asset_path = _persist_generated_named_asset(
+            asset_directory,
+            f"{object_id}.imported.glb",
+            cleaned_glb,
+        )
+        persisted_asset_paths.append(source_asset_path)
+        pipeline: dict[str, object] = {
+            "mode": "external_glb_import",
+            "source_asset_path": source_asset_path,
+            "postprocessed_asset_path": source_asset_path,
+            "geometry_only": texture_variants is None,
+            EXTERNAL_GLB_IMPORT_PIPELINE_KEY: {
+                "source_file_name": path.name,
+                "original_face_count": cleanup.original_face_count,
+                "retained_face_count": cleanup.retained_face_count,
+                "removed_face_count": cleanup.removed_face_count,
+                "visibility_removed_face_count": (
+                    cleanup.visibility_removed_face_count
+                ),
+                "stacked_face_removed_count": (
+                    cleanup.stacked_face_removed_count
+                ),
+                "minimum_face_visibility_percentage": (
+                    settings.minimum_face_visibility_percentage
+                ),
+            },
+        }
+        active_asset_path = source_asset_path
+        active_model = cleaned_model
+        if texture_variants is not None:
+            variant_metadata = _persist_object_texture_variants_to_directory(
+                asset_directory,
+                object_id,
+                texture_variants,
+                asset_stem=f"{object_id}.imported",
+            )
+            persisted_asset_paths.extend(
+                _iter_variant_metadata_asset_paths(variant_metadata)
+            )
+            active_variant = variant_metadata[str(DEFAULT_TEXTURE_RESOLUTION)]
+            active_asset_path = str(
+                active_variant[TEXTURE_VARIANT_GLB_PATH_KEY]
+            )
+            active_model = import_generated_glb(
+                texture_variants.glb_by_resolution[DEFAULT_TEXTURE_RESOLUTION]
+            )
+            pipeline.update(
+                {
+                    TEXTURE_VARIANTS_PIPELINE_KEY: variant_metadata,
+                    SELECTED_TEXTURE_RESOLUTION_PIPELINE_KEY: (
+                        DEFAULT_TEXTURE_RESOLUTION
+                    ),
+                    "postprocessed_asset_path": active_asset_path,
+                    "geometry_only": False,
+                    **_build_pbr_pipeline_metadata(
+                        _available_variant_pbr_maps(texture_variants),
+                        texture_variants,
+                    ),
+                }
+            )
+        elif texture_variant_error:
+            import_metadata = pipeline[EXTERNAL_GLB_IMPORT_PIPELINE_KEY]
+            assert isinstance(import_metadata, dict)
+            import_metadata["atlas_texture_error"] = texture_variant_error
+        _raise_if_external_glb_import_cancelled(cancel_requested)
+        record = GeneratedObjectRecord(
+            object_id=object_id,
+            frame_index=0,
+            object_name=object_name,
+            pipeline=pipeline,
+            provider=GENERATION_BACKEND_EXTERNAL_GLB,
+            provider_task_id=None,
+            asset_path=active_asset_path,
+        )
+    except Exception:
+        _discard_generated_asset_paths(
+            asset_directory,
+            persisted_asset_paths,
+        )
+        raise
+
+    report("Waiting to add imported GLB (98%)")
+    return _PreparedExternalGlbImport(
+        record=record,
+        preview_model=active_model,
+        persisted_asset_paths=tuple(persisted_asset_paths),
+        texture_variant_error=texture_variant_error,
+        removed_face_count=cleanup.removed_face_count,
+    )
+
+
+def _format_external_glb_import_status(
+    prepared: _PreparedExternalGlbImport,
+) -> str:
+    """Describe cleanup and any Atlas texture limitation after one import."""
+
+    removed_count = prepared.removed_face_count
+    status = (
+        f"Imported: {prepared.record.object_name}. Removed {removed_count:,} "
+        f"hidden or unused {'face' if removed_count == 1 else 'faces'}."
+    )
+    if prepared.texture_variant_error:
+        status += (
+            " Embedded materials were retained, but its textures could not be "
+            f"added to an Atlas: {prepared.texture_variant_error}"
+        )
+    return status
 
 
 # ### Background asset preparation ###

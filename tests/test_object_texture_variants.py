@@ -30,6 +30,7 @@ from housemaker.object_texture_variants import (
     PBR_MAP_NORMAL,
     PBR_MAP_ROUGHNESS,
     TEXTURE_RESOLUTIONS,
+    build_external_object_texture_variants,
     build_object_texture_variants,
     build_object_texture_variants_from_texture,
     prepare_uv_rewrite_material_textures,
@@ -170,6 +171,71 @@ def _rewrite_uv_layout(
 
 # ### Variant algorithm tests ###
 class ObjectTextureVariantAlgorithmTests(unittest.TestCase):
+    def test_external_shared_texture_is_normalized_for_atlas_variants(self) -> None:
+        variants = build_external_object_texture_variants(
+            _textured_glb(texture_size=(320, 180))
+        )
+
+        self.assertIsNotNone(variants)
+        assert variants is not None
+        for resolution in TEXTURE_RESOLUTIONS:
+            with self.subTest(resolution=resolution):
+                with Image.open(
+                    BytesIO(variants.texture_png_by_resolution[resolution])
+                ) as image:
+                    self.assertEqual(image.size, (resolution, resolution))
+                    self.assertEqual(image.getpixel((0, 0)), (24, 80, 160, 96))
+                imported = import_generated_glb(
+                    variants.glb_by_resolution[resolution]
+                )
+                self.assertGreater(len(imported.mesh.faces), 0)
+
+    def test_external_mixed_texture_coverage_is_not_atlas_compatible(self) -> None:
+        textured = trimesh.creation.box()
+        textured.visual = TextureVisuals(
+            uv=np.zeros((len(textured.vertices), 2), dtype=float),
+            material=PBRMaterial(
+                baseColorTexture=Image.new("RGBA", (64, 64), "red")
+            ),
+        )
+        untextured = trimesh.creation.box()
+        scene = trimesh.Scene()
+        scene.add_geometry(textured, geom_name="textured")
+        scene.add_geometry(untextured, geom_name="untextured")
+
+        with self.assertRaisesRegex(ValueError, "mixes textured and untextured"):
+            build_external_object_texture_variants(
+                bytes(scene.export(file_type="glb"))
+            )
+
+    def test_external_atlas_uvs_must_be_finite_and_inside_unit_region(
+        self,
+    ) -> None:
+        vertex_count = len(trimesh.creation.box().vertices)
+        invalid_uvs = {
+            "missing": None,
+            "non-finite": np.full((vertex_count, 2), np.nan, dtype=float),
+            "out-of-range": np.full((vertex_count, 2), 1.25, dtype=float),
+        }
+        for label, uv in invalid_uvs.items():
+            with self.subTest(label=label):
+                mesh = trimesh.creation.box()
+                mesh.visual = TextureVisuals(
+                    uv=uv,
+                    material=PBRMaterial(
+                        baseColorTexture=Image.new("RGBA", (64, 64), "red")
+                    ),
+                )
+                scene = trimesh.Scene(mesh)
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "finite per-vertex UV coordinates",
+                ):
+                    object_texture_variants._validate_external_atlas_compatibility(
+                        scene
+                    )
+
     def test_uv_rewrite_preparation_strips_legacy_specular_glossiness(self) -> None:
         scene = trimesh.Scene(trimesh.creation.box())
         material = PBRMaterial(emissiveFactor=(0.1, 0.2, 0.3))

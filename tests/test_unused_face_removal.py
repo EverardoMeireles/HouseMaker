@@ -11,7 +11,10 @@ from PIL import Image
 from trimesh.visual.material import PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
-from housemaker.glb import import_generated_glb
+from housemaker.glb import (
+    _serialize_scene_glb_with_half_mesh_extras,
+    import_generated_glb,
+)
 from housemaker.unused_face_removal import (
     ALL_CAMERA_IDS,
     CAMERA_ID_BOTTOM,
@@ -145,6 +148,7 @@ class UnusedFaceCameraTests(unittest.TestCase):
             options.minimum_projected_samples,
             DEFAULT_MINIMUM_PROJECTED_SAMPLES,
         )
+        self.assertFalse(options.preserve_zero_projected_sample_faces)
         for invalid_fraction in (-0.01, 1.01, float("nan"), True, "0.05"):
             with self.subTest(invalid_fraction=invalid_fraction):
                 with self.assertRaisesRegex(ValueError, "visible fraction"):
@@ -156,6 +160,14 @@ class UnusedFaceCameraTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "projected samples"):
                     UnusedFaceRemovalOptions(
                         minimum_projected_samples=invalid_samples,  # type: ignore[arg-type]
+                    )
+        for invalid_preservation in (0, 1, None, "true"):
+            with self.subTest(invalid_preservation=invalid_preservation):
+                with self.assertRaisesRegex(ValueError, "must be a boolean"):
+                    UnusedFaceRemovalOptions(
+                        preserve_zero_projected_sample_faces=(
+                            invalid_preservation  # type: ignore[arg-type]
+                        )
                     )
 
 
@@ -294,6 +306,52 @@ class UnusedFaceVisibilityRegressionTests(unittest.TestCase):
         self.assertEqual(result.retained_face_count, 12)
         self.assertEqual(result.visibility_removed_face_count, 12)
 
+    def test_conservative_mode_preserves_faces_with_zero_projected_samples(
+        self,
+    ) -> None:
+        tiny_visible_face = _triangle_mesh(
+            np.asarray(
+                (
+                    (1.1, 0.122, 0.156),
+                    (1.1, 0.124, 0.156),
+                    (1.1, 0.123, 0.158),
+                ),
+                dtype=float,
+            )
+        )
+        source_glb = _scene_glb(
+            ("outer", trimesh.creation.box(extents=(2.0, 2.0, 2.0)), None),
+            ("tiny", tiny_visible_face, None),
+        )
+
+        default_result = remove_unused_faces_from_glb(
+            source_glb,
+            options=UnusedFaceRemovalOptions(image_size=32),
+        )
+        conservative_result = remove_unused_faces_from_glb(
+            source_glb,
+            options=UnusedFaceRemovalOptions(
+                image_size=32,
+                preserve_zero_projected_sample_faces=True,
+            ),
+        )
+
+        self.assertEqual(default_result.retained_face_count, 12)
+        self.assertEqual(conservative_result.retained_face_count, 13)
+        self.assertIn("tiny", conservative_result.model.scene.geometry)
+
+    def test_conservative_mode_still_removes_a_sampled_hidden_shell(self) -> None:
+        result = remove_unused_faces_from_glb(
+            _nested_box_glb(),
+            options=UnusedFaceRemovalOptions(
+                preserve_zero_projected_sample_faces=True,
+            ),
+        )
+
+        self.assertEqual(result.original_face_count, 24)
+        self.assertEqual(result.retained_face_count, 12)
+        self.assertEqual(result.visibility_removed_face_count, 12)
+
     def test_visible_fraction_controls_a_real_small_protrusion(self) -> None:
         source_glb = _scene_glb(
             ("rear", _wafer_triangle(0.0), None),
@@ -348,6 +406,42 @@ class UnusedFaceVisibilityRegressionTests(unittest.TestCase):
 
 # ### Asset preservation tests ###
 class UnusedFaceAssetPreservationTests(unittest.TestCase):
+    def test_filtered_glb_preserves_half_mesh_node_extras(self) -> None:
+        outer = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+        inner = trimesh.creation.box(extents=(1.0, 1.0, 1.0))
+        mesh = trimesh.util.concatenate((outer, inner))
+        half_mesh = {
+            "mirrorPlane": {
+                "point": [0.0, 0.0, 0.0],
+                "normal": [1.0, 0.0, 0.0],
+            },
+            "uvMode": "reuse",
+        }
+        scene = trimesh.Scene()
+        scene.geometry["half-geometry"] = mesh
+        scene.graph.update(
+            frame_to="[HALF] cabinet",
+            frame_from=scene.graph.base_frame,
+            matrix=np.eye(4, dtype=float),
+            geometry="half-geometry",
+            metadata={"halfMesh": half_mesh},
+        )
+        source_glb = _serialize_scene_glb_with_half_mesh_extras(
+            scene,
+            failure_message="Fixture export failed.",
+        )
+
+        result = remove_unused_faces_from_glb(source_glb)
+
+        self.assertEqual(result.removed_face_count, 12)
+        parent_name = result.model.scene.graph.transforms.parents[
+            "[HALF] cabinet"
+        ]
+        edge_data = result.model.scene.graph.transforms.edge_data[
+            (parent_name, "[HALF] cabinet")
+        ]
+        self.assertEqual(edge_data["metadata"]["halfMesh"], half_mesh)
+
     def test_partial_face_filter_preserves_one_mesh_texture_and_uvs(self) -> None:
         outer = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
         inner = trimesh.creation.box(extents=(1.0, 1.0, 1.0))

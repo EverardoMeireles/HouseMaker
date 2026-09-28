@@ -1779,6 +1779,9 @@ class BlueprintWorkspace(QWidget):
         self.texture_atlas_workspace.object_delete_requested.connect(
             self._handle_atlas_object_delete_requested
         )
+        self.texture_atlas_workspace.external_glb_import_requested.connect(
+            self._handle_atlas_external_glb_import_requested
+        )
         self.texture_atlas_workspace.surface_assign_requested.connect(
             self._handle_atlas_surface_assign_requested
         )
@@ -1926,6 +1929,12 @@ class BlueprintWorkspace(QWidget):
         )
         self.generation.generation_completed.connect(
             self._handle_generated_object_completed_for_canvas
+        )
+        self.generation.external_glb_import_completed.connect(
+            self._handle_atlas_external_glb_import_completed
+        )
+        self.generation.external_glb_import_failed.connect(
+            self._handle_atlas_external_glb_import_failed
         )
         self.generation.generated_object_changed.connect(
             self._handle_generated_object_changed_for_canvas
@@ -9800,6 +9809,76 @@ class BlueprintWorkspace(QWidget):
             return
         self.texture_atlas_workspace.status_label.setText(
             "The selected object is not currently available for placement."
+        )
+
+    def _handle_atlas_external_glb_import_requested(self) -> None:
+        """Import one static GLB through the shared hidden-face cleanup path."""
+
+        dialog_parent = (
+            self._external_atlas_host.window
+            if self._external_atlas_host.is_active
+            else self.texture_atlas_workspace
+        )
+        file_path, _selected_filter = QFileDialog.getOpenFileName(
+            dialog_parent,
+            "Import GLB model",
+            "",
+            "GLB Files (*.glb)",
+        )
+        if not file_path:
+            return
+        self.texture_atlas_workspace.status_label.setText(
+            "Importing GLB and removing hidden or unused faces..."
+        )
+        try:
+            started = self.generation.start_external_glb_import(file_path)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            message = str(error).strip() or type(error).__name__
+            self._handle_atlas_external_glb_import_failed(message)
+            return
+        if not started:
+            self._handle_atlas_external_glb_import_failed(
+                "The external GLB import could not be started."
+            )
+
+    def _handle_atlas_external_glb_import_completed(
+        self,
+        raw_record: object,
+        _generated_model: object,
+    ) -> None:
+        """Select a newly imported object after its worker publishes it."""
+
+        object_id = getattr(raw_record, "object_id", None)
+        if not isinstance(object_id, str) or not object_id.strip():
+            return
+        self._atlas_generation_signature = None
+        self._sync_atlas_object_texture_sources()
+        self.texture_atlas_workspace.select_source_ids(
+            (object_id,),
+            active_source_id=object_id,
+        )
+        self.texture_atlas_workspace.mark_sources_new((object_id,))
+        self._request_hosted_atlas_object_preview()
+        self.texture_atlas_workspace.status_label.setText(
+            self.generation.status_label.text()
+        )
+
+    def _handle_atlas_external_glb_import_failed(self, message: str) -> None:
+        """Report one asynchronous import error against the active Atlas host."""
+
+        normalized_message = str(message).strip() or "Unknown GLB import error."
+        self.texture_atlas_workspace.status_label.setText(
+            f"GLB import failed: {normalized_message}"
+        )
+        dialog_parent = (
+            self._external_atlas_host.window
+            if self._external_atlas_host.is_active
+            else self.texture_atlas_workspace
+        )
+        QMessageBox.critical(
+            dialog_parent,
+            "GLB import failed",
+            normalized_message,
         )
 
     def _handle_atlas_object_delete_requested(

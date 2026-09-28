@@ -2024,6 +2024,7 @@ class TextureAtlasWorkspace(QWidget):
     surface_texture_repeat_size_changed = Signal(str, float)
     object_place_requested = Signal(str)
     object_delete_requested = Signal(object)
+    external_glb_import_requested = Signal()
     surface_assign_requested = Signal(str)
     source_remove_requested = Signal(str, str)
     surface_texture_delete_requested = Signal(str)
@@ -4340,6 +4341,18 @@ class TextureAtlasWorkspace(QWidget):
             self._request_selected_object_deletion
         )
         texture_column_layout.addWidget(self.delete_object_button)
+        self.import_glb_button = QPushButton("Import GLB")
+        self.import_glb_button.setObjectName(
+            "texture_atlas_import_glb_button"
+        )
+        self.import_glb_button.setToolTip(
+            "Import an external static GLB model after removing hidden and "
+            "unused faces."
+        )
+        self.import_glb_button.clicked.connect(
+            self.external_glb_import_requested.emit
+        )
+        texture_column_layout.addWidget(self.import_glb_button)
         self.delete_object_list_shortcut = QShortcut(
             QKeySequence.StandardKey.Delete,
             self.object_list,

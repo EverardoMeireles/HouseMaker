@@ -89,6 +89,19 @@ class GenerationStatePersistenceTests(unittest.TestCase):
                         axis_scales=(1.25, 0.75, 2.0),
                     ),
                 ),
+                GeneratedObjectRecord(
+                    object_id="external-table",
+                    frame_index=0,
+                    object_name="Imported table",
+                    provider="external_glb",
+                    pipeline={
+                        "external_glb_import": {
+                            "source_file_name": "table.glb",
+                            "removed_face_count": 4,
+                        }
+                    },
+                    asset_path="external-table.imported.glb",
+                ),
             ],
         )
 

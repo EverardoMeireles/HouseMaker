@@ -60,6 +60,7 @@ _MATERIAL_ATTRIBUTE_BY_TEXTURE_TYPE = {
 _OPAQUE_BLACK = np.asarray((0, 0, 0, 255), dtype=np.uint8)
 _NEUTRAL_NORMAL = np.asarray((128, 128, 255, 255), dtype=np.uint8)
 _NEUTRAL_METALLIC_ROUGHNESS = np.asarray((0, 255, 0, 255), dtype=np.uint8)
+_ATLAS_UV_TOLERANCE = 1e-6
 
 
 # ### Data models ###
@@ -159,6 +160,50 @@ def build_object_texture_variants(
         scene,
         texture_maps_2048,
     )
+
+
+def build_external_object_texture_variants(
+    glb_bytes: bytes,
+) -> ObjectTextureVariants | None:
+    """Build Atlas-ready variants from one shared external texture set.
+
+    External GLBs are not guaranteed to use Meshy's exact 2048-square source
+    atlas.  Normalized UV coordinates remain valid when a shared image is
+    resampled, so compatible base-color and PBR maps are first normalized to
+    the canonical 2048-square working image.  Models with no embedded base
+    color remain valid geometry-only imports.  Models with multiple distinct
+    atlases are rejected here because merging them would require a UV rewrite.
+    """
+
+    payload = bytes(glb_bytes)
+    if not payload:
+        raise ValueError("The imported GLB is empty.")
+    scene = _load_glb_scene(payload)
+    source_maps = _collect_material_texture_maps(scene)
+    source_textures = source_maps.get(MATERIAL_TEXTURE_BASE_COLOR, [])
+    if not source_textures:
+        return None
+    _validate_external_atlas_compatibility(scene)
+
+    canonical_maps: dict[str, np.ndarray] = {}
+    for map_type in MATERIAL_TEXTURE_TYPES:
+        textures = source_maps.get(map_type, [])
+        if not textures:
+            continue
+        texture = _validate_shared_texture(textures)
+        height, width = texture.shape[:2]
+        interpolation = (
+            cv2.INTER_AREA
+            if width >= TEXTURE_RESOLUTION_2048
+            and height >= TEXTURE_RESOLUTION_2048
+            else cv2.INTER_LANCZOS4
+        )
+        canonical_maps[map_type] = _resize_rgba(
+            texture,
+            TEXTURE_RESOLUTION_2048,
+            interpolation,
+        )
+    return _build_variants_from_scene(scene, canonical_maps)
 
 
 def build_object_texture_variants_from_texture(
@@ -427,6 +472,51 @@ def _validate_shared_texture(
 
 
 # ### GLB material helpers ###
+def _validate_external_atlas_compatibility(scene: trimesh.Scene) -> None:
+    """Reject external layouts that one shared Atlas material cannot preserve."""
+
+    for geometry in scene.geometry.values():
+        if not isinstance(geometry, trimesh.Trimesh) or not len(geometry.faces):
+            continue
+        visual = getattr(geometry, "visual", None)
+        material = getattr(visual, "material", None)
+        material_leaves = _iter_material_leaves(material)
+        non_glass_materials = tuple(
+            leaf
+            for leaf in material_leaves
+            if not is_housemaker_glass_material(leaf)
+        )
+        if not material_leaves:
+            raise ValueError(
+                "The imported object mixes textured and untextured geometry. "
+                "Atlas packing requires every non-glass face to use the shared "
+                "base-color texture."
+            )
+        if not non_glass_materials:
+            continue
+        if any(
+            _get_material_texture(leaf, MATERIAL_TEXTURE_BASE_COLOR) is None
+            for leaf in non_glass_materials
+        ):
+            raise ValueError(
+                "The imported object mixes textured and untextured geometry. "
+                "Atlas packing requires every non-glass face to use the shared "
+                "base-color texture."
+            )
+
+        uv = np.asarray(getattr(visual, "uv", ()), dtype=float)
+        if (
+            uv.shape != (len(geometry.vertices), 2)
+            or not np.all(np.isfinite(uv))
+            or np.any(uv < -_ATLAS_UV_TOLERANCE)
+            or np.any(uv > 1.0 + _ATLAS_UV_TOLERANCE)
+        ):
+            raise ValueError(
+                "The imported object's textured geometry requires finite "
+                "per-vertex UV coordinates inside the 0-to-1 Atlas region."
+            )
+
+
 def _load_glb_scene(payload: bytes) -> trimesh.Scene:
     try:
         loaded = trimesh.load(

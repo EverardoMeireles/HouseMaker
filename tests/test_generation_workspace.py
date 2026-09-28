@@ -22,7 +22,13 @@ from PIL import Image
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import QApplication
+from trimesh.visual.material import PBRMaterial
+from trimesh.visual.texture import TextureVisuals
 
+from housemaker.generation_jobs import (
+    JOB_STATUS_COMPLETED,
+    GenerationJobManager,
+)
 from housemaker.generation_state import (
     MASK_MODE_ERASE,
     MASK_MODE_PAINT,
@@ -33,37 +39,53 @@ from housemaker.generation_state import (
     MaskStroke,
 )
 from housemaker.generation_views import VideoInpaintView, rasterize_mask_strokes
-from housemaker.glass_material import HOUSEMAKER_GLASS_MATERIAL_NAME
 from housemaker.generation_workspace import (
     GENERATION_BACKEND_MESHY,
+    LOCALLY_AUTHORED_UVS_PIPELINE_KEY,
+    SAFE_DUPLICATE_REMOVAL_PIPELINE_KEY,
+    SCAN_PROJECTION_PIPELINE_KEY,
+    TEXTURE_VARIANT_GLB_PATH_KEY,
+    TEXTURE_VARIANTS_PIPELINE_KEY,
+    VISIBILITY_UV_UNWRAP_PIPELINE_KEY,
+    ExternalGlbImportThread,
     GenerationRequest,
     GenerationWorker,
     GenerationWorkspace,
     MeshyImagePlanner,
     MeshyModelExecutor,
-    LOCALLY_AUTHORED_UVS_PIPELINE_KEY,
-    SAFE_DUPLICATE_REMOVAL_PIPELINE_KEY,
-    SCAN_PROJECTION_PIPELINE_KEY,
     ScanProjectedMeshyGenerationResult,
     StagedMeshyGenerationResult,
-    TEXTURE_VARIANTS_PIPELINE_KEY,
-    TEXTURE_VARIANT_GLB_PATH_KEY,
-    VISIBILITY_UV_UNWRAP_PIPELINE_KEY,
-    _ObjectGenerationProgressMapper,
-    _GenerationCancelled,
     _build_geometry_fingerprint,
     _build_safe_duplicate_removal_pipeline_metadata,
     _build_staged_generation_pipeline_metadata,
     _collect_scene_glass_face_indices,
+    _ExternalGlbImportRuntime,
+    _ExternalGlbImportSignalRelay,
     _format_model_statistics,
+    _GenerationCancelled,
+    _ObjectGenerationProgressMapper,
+    _PreparedExternalGlbImport,
     _remap_faces_by_world_geometry,
     _resolve_staged_postprocessed_asset_path,
     _staged_generation_mode,
+    _validate_external_glb_resource_uris,
     update_projection_camera_percentage,
 )
-from housemaker.glb import GeneratedModel, import_generated_glb
+from housemaker.glass_material import HOUSEMAKER_GLASS_MATERIAL_NAME
+from housemaker.glb import (
+    GeneratedModel,
+    PlacedGeneratedModel,
+    compose_placed_generated_models,
+    import_generated_glb,
+)
 from housemaker.meshy_generation import MeshyGenerationResult
 from housemaker.object_face_edit import load_object_face_geometry
+from housemaker.object_texture_variants import (
+    PBR_MAP_METALLIC,
+    PBR_MAP_NORMAL,
+    PBR_MAP_ROUGHNESS,
+    PBR_MAP_TYPES,
+)
 from housemaker.object_uv_raycast import (
     UV_TARGET_DOMAIN_FULL,
     VISIBILITY_UV_UNWRAP_VERSION,
@@ -77,12 +99,6 @@ from housemaker.object_uv_scan_projection import (
     ScanProjectionResult,
     ScanProjectionStats,
 )
-from housemaker.object_texture_variants import (
-    PBR_MAP_METALLIC,
-    PBR_MAP_NORMAL,
-    PBR_MAP_ROUGHNESS,
-    PBR_MAP_TYPES,
-)
 from housemaker.settings_widget import (
     DEFAULT_MESHY_TARGET_POLYCOUNT,
     GenerationServiceSettings,
@@ -93,9 +109,6 @@ from housemaker.unused_face_removal import (
     UnusedFaceRemovalResult,
 )
 from housemaker.video_source import VideoMetadata
-from trimesh.visual.material import PBRMaterial
-from trimesh.visual.texture import TextureVisuals
-
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -127,6 +140,24 @@ def _test_textured_model(color: tuple[int, int, int, int]) -> GeneratedModel:
         scene=scene,
         glb_bytes=scene.export(file_type="glb"),
     )
+
+
+def _test_nested_textured_glb() -> bytes:
+    """Build a textured outer shell around a fully hidden inner shell."""
+
+    outer = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+    inner = trimesh.creation.box(extents=(1.0, 1.0, 1.0))
+    vertices = np.vstack((outer.vertices, inner.vertices))
+    faces = np.vstack((outer.faces, inner.faces + len(outer.vertices)))
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    uv = vertices[:, :2] / 2.0 + 0.5
+    mesh.visual = TextureVisuals(
+        uv=uv,
+        material=PBRMaterial(
+            baseColorTexture=Image.new("RGBA", (16, 8), (40, 120, 200, 255))
+        ),
+    )
+    return bytes(trimesh.Scene(mesh).export(file_type="glb"))
 
 
 def _test_meshy_result(name: str = "Test chair") -> MeshyGenerationResult:
@@ -345,6 +376,24 @@ class GenerationStateTests(unittest.TestCase):
         self.assertEqual(loaded, original)
         self.assertIsNot(loaded.frame_strokes, original.frame_strokes)
         self.assertNotIn("api", str(original.to_dict()).lower())
+
+    def test_generation_data_round_trip_preserves_external_glb_records(
+        self,
+    ) -> None:
+        record = GeneratedObjectRecord(
+            object_id="imported-chair",
+            frame_index=0,
+            object_name="Imported chair",
+            pipeline={"external_glb_import": {"removed_face_count": 4}},
+            provider="external_glb",
+            asset_path="imported-chair.glb",
+        )
+
+        restored = GenerationData.from_dict(
+            GenerationData(generated_objects=[record]).to_dict()
+        )
+
+        self.assertEqual(restored.generated_objects, [record])
 
     def test_legacy_simplification_pipeline_round_trip_is_lossless(self) -> None:
         legacy_pipeline = {
@@ -1650,6 +1699,323 @@ class GenerationWorkspaceTests(unittest.TestCase):
         self.workspace.shutdown()
         self.workspace.close()
         _qt_application.processEvents()
+
+    def test_external_glb_resource_validation_rejects_sidecar_files(self) -> None:
+        for collection_name, uri in (
+            ("buffers", "geometry.bin"),
+            ("images", "textures/base-color.png"),
+            ("images", "https://example.invalid/normal.png"),
+        ):
+            with self.subTest(collection_name=collection_name, uri=uri):
+                with self.assertRaisesRegex(ValueError, "self-contained GLB"):
+                    _validate_external_glb_resource_uris(
+                        {collection_name: [{"uri": uri}]}
+                    )
+
+    def test_external_glb_resource_validation_accepts_embedded_resources(
+        self,
+    ) -> None:
+        _validate_external_glb_resource_uris(
+            {
+                "buffers": [
+                    {},
+                    {
+                        "uri": (
+                            "data:application/octet-stream;base64,AA=="
+                        )
+                    },
+                ],
+                "images": [
+                    {"bufferView": 0, "mimeType": "image/png"},
+                    {"uri": "data:image/png;base64,AA=="},
+                ],
+            }
+        )
+
+    def test_import_external_glb_cleans_and_persists_the_processed_model(
+        self,
+    ) -> None:
+        source_scene = trimesh.Scene()
+        source_scene.add_geometry(trimesh.creation.box(extents=(2.0, 2.0, 2.0)))
+        source_scene.add_geometry(trimesh.creation.box(extents=(1.0, 1.0, 1.0)))
+        source_glb = source_scene.export(file_type="glb")
+        cleaned_model = _test_model((2.0, 2.0, 2.0))
+        cleanup_result = UnusedFaceRemovalResult(
+            model=cleaned_model,
+            enabled_camera_ids=ALL_CAMERA_IDS,
+            original_face_count=24,
+            retained_face_count=12,
+            removed_face_count=12,
+            protected_face_count=12,
+            visibility_removed_face_count=12,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_root = Path(directory)
+            source_path = temporary_root / "Imported cabinet.glb"
+            source_path.write_bytes(source_glb)
+            asset_directory = temporary_root / "assets"
+            workspace = GenerationWorkspace(asset_directory=asset_directory)
+            data_changes: list[GenerationData] = []
+            workspace.data_changed.connect(data_changes.append)
+            try:
+                with patch(
+                    "housemaker.generation_workspace.remove_unused_faces_from_glb",
+                    return_value=cleanup_result,
+                ) as remove_hidden_faces:
+                    record = workspace.import_external_glb(source_path)
+
+                remove_hidden_faces.assert_called_once()
+                self.assertEqual(remove_hidden_faces.call_args.args[0], source_glb)
+                cleanup_options = remove_hidden_faces.call_args.kwargs["options"]
+                self.assertTrue(
+                    cleanup_options.preserve_zero_projected_sample_faces
+                )
+                self.assertEqual(record.provider, "external_glb")
+                self.assertIsNone(record.provider_task_id)
+                self.assertEqual(record.object_name, "Imported cabinet")
+                self.assertIsNotNone(record.asset_path)
+                assert record.asset_path is not None
+                persisted_path = asset_directory / record.asset_path
+                self.assertTrue(persisted_path.is_file())
+                self.assertNotEqual(persisted_path.resolve(), source_path.resolve())
+                self.assertEqual(persisted_path.read_bytes(), cleaned_model.glb_bytes)
+
+                import_metadata = record.pipeline["external_glb_import"]
+                self.assertIsInstance(import_metadata, dict)
+                assert isinstance(import_metadata, dict)
+                self.assertEqual(import_metadata["source_file_name"], source_path.name)
+                self.assertEqual(import_metadata["original_face_count"], 24)
+                self.assertEqual(import_metadata["retained_face_count"], 12)
+                self.assertEqual(import_metadata["removed_face_count"], 12)
+
+                self.assertEqual(
+                    workspace.get_generated_object_ids(), (record.object_id,)
+                )
+                self.assertEqual(
+                    workspace.get_placeable_object_names_by_id(),
+                    {record.object_id: "Imported cabinet"},
+                )
+                self.assertTrue(data_changes)
+                self.assertEqual(data_changes[-1].generated_objects, [record])
+            finally:
+                workspace.shutdown()
+                workspace.close()
+                _qt_application.processEvents()
+
+    def test_external_glb_real_pipeline_cleans_textures_places_and_exports(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_root = Path(directory)
+            source_path = temporary_root / "Textured nested cabinet.glb"
+            source_path.write_bytes(_test_nested_textured_glb())
+            asset_directory = temporary_root / "assets"
+            workspace = GenerationWorkspace(asset_directory=asset_directory)
+            try:
+                record = workspace.import_external_glb(source_path)
+
+                import_metadata = record.pipeline["external_glb_import"]
+                assert isinstance(import_metadata, dict)
+                self.assertEqual(import_metadata["original_face_count"], 24)
+                self.assertEqual(import_metadata["retained_face_count"], 12)
+                self.assertEqual(import_metadata["removed_face_count"], 12)
+                self.assertNotIn("atlas_texture_error", import_metadata)
+                self.assertEqual(
+                    set(record.pipeline[TEXTURE_VARIANTS_PIPELINE_KEY]),
+                    {"512", "1024", "2048"},
+                )
+                for resolution in (512, 1024, 2048):
+                    with self.subTest(resolution=resolution):
+                        self.assertIsNotNone(
+                            workspace.get_texture_variant(
+                                record.object_id,
+                                resolution,
+                            )
+                        )
+
+                imported_model = workspace.get_generated_object_model(
+                    record.object_id
+                )
+                self.assertIsNotNone(imported_model)
+                assert imported_model is not None
+                self.assertEqual(len(imported_model.mesh.faces), 12)
+                placement = GeneratedObjectPlacement(0, 25.0, 40.0)
+                self.assertTrue(
+                    workspace.restore_generated_object_placement(
+                        record.object_id,
+                        placement,
+                    )
+                )
+                exported = compose_placed_generated_models(
+                    _test_model(),
+                    (
+                        PlacedGeneratedModel(
+                            object_id=record.object_id,
+                            object_name=record.object_name,
+                            model=imported_model,
+                            world_position=(1.0, 2.0, 0.0),
+                        ),
+                    ),
+                )
+                exported_model = import_generated_glb(exported.glb_bytes)
+                self.assertEqual(len(exported_model.mesh.faces), 24)
+            finally:
+                workspace.shutdown()
+                workspace.close()
+                _qt_application.processEvents()
+
+    def test_import_external_glb_is_transactional_when_cleanup_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_root = Path(directory)
+            source_path = temporary_root / "damaged.glb"
+            source_path.write_bytes(_test_model().glb_bytes)
+            asset_directory = temporary_root / "assets"
+            workspace = GenerationWorkspace(asset_directory=asset_directory)
+            try:
+                with (
+                    patch(
+                        "housemaker.generation_workspace."
+                        "remove_unused_faces_from_glb",
+                        side_effect=ValueError("cleanup failed"),
+                    ),
+                    self.assertRaisesRegex(ValueError, "cleanup failed"),
+                ):
+                    workspace.import_external_glb(source_path)
+
+                self.assertEqual(workspace.get_generated_object_ids(), ())
+                self.assertFalse(asset_directory.exists())
+            finally:
+                workspace.shutdown()
+                workspace.close()
+                _qt_application.processEvents()
+
+    def test_cancelled_external_glb_import_discards_prepared_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_root = Path(directory)
+            source_path = temporary_root / "cancelled.glb"
+            source_path.write_bytes(_test_model().glb_bytes)
+            asset_directory = temporary_root / "assets"
+            asset_directory.mkdir()
+            asset_path = "cancelled.imported.glb"
+            preview_model = _test_model()
+            (asset_directory / asset_path).write_bytes(preview_model.glb_bytes)
+            record = GeneratedObjectRecord(
+                object_id="cancelled-import",
+                frame_index=0,
+                object_name="Cancelled import",
+                pipeline={"external_glb_import": {}},
+                provider="external_glb",
+                asset_path=asset_path,
+            )
+            prepared = _PreparedExternalGlbImport(
+                record=record,
+                preview_model=preview_model,
+                persisted_asset_paths=(asset_path,),
+                texture_variant_error=None,
+                removed_face_count=0,
+            )
+            workspace = GenerationWorkspace(asset_directory=asset_directory)
+            import_id = "cancelled-import-job"
+            thread = ExternalGlbImportThread(
+                source_path,
+                asset_directory,
+                GenerationServiceSettings(),
+                record.object_id,
+                record.object_name,
+                workspace,
+            )
+            thread.result = prepared
+            relay = _ExternalGlbImportSignalRelay(import_id, workspace)
+            workspace._external_glb_import_runtimes[import_id] = (
+                _ExternalGlbImportRuntime(
+                    import_id=import_id,
+                    object_name=record.object_name,
+                    thread=thread,
+                    relay=relay,
+                    managed_job_id=None,
+                    cancel_requested=True,
+                )
+            )
+            try:
+                workspace._handle_external_glb_import_finished(import_id)
+
+                self.assertFalse((asset_directory / asset_path).exists())
+                self.assertEqual(workspace.get_generated_object_ids(), ())
+            finally:
+                workspace.shutdown()
+                workspace.close()
+                _qt_application.processEvents()
+
+    def test_async_external_glb_import_publishes_data_and_completes_job(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temporary_root = Path(directory)
+            source_path = temporary_root / "Async chair.glb"
+            source_path.write_bytes(b"external-glb-fixture")
+            asset_directory = temporary_root / "assets"
+            asset_directory.mkdir()
+            preview_model = _test_model()
+            asset_path = "async-chair.imported.glb"
+            (asset_directory / asset_path).write_bytes(preview_model.glb_bytes)
+            record = GeneratedObjectRecord(
+                object_id="async-chair",
+                frame_index=0,
+                object_name="Async chair",
+                pipeline={
+                    "external_glb_import": {
+                        "source_file_name": source_path.name,
+                        "removed_face_count": 5,
+                    }
+                },
+                provider="external_glb",
+                asset_path=asset_path,
+            )
+            prepared = _PreparedExternalGlbImport(
+                record=record,
+                preview_model=preview_model,
+                persisted_asset_paths=(asset_path,),
+                texture_variant_error=None,
+                removed_face_count=5,
+            )
+            job_manager = GenerationJobManager()
+            workspace = GenerationWorkspace(
+                asset_directory=asset_directory,
+                job_manager=job_manager,
+            )
+            completed = QSignalSpy(workspace.external_glb_import_completed)
+            try:
+                with patch(
+                    "housemaker.generation_workspace."
+                    "_prepare_external_glb_import",
+                    return_value=prepared,
+                ) as prepare_import:
+                    self.assertTrue(
+                        workspace.start_external_glb_import(source_path)
+                    )
+                    for _poll in range(300):
+                        if completed.count() > 0:
+                            break
+                        QTest.qWait(10)
+
+                prepare_import.assert_called_once()
+                self.assertEqual(completed.count(), 1)
+                self.assertIs(completed.at(0)[0], record)
+                self.assertIs(completed.at(0)[1], preview_model)
+                self.assertEqual(
+                    workspace.get_data().generated_objects,
+                    [record],
+                )
+                jobs = job_manager.jobs()
+                self.assertEqual(len(jobs), 1)
+                self.assertEqual(jobs[0].status, JOB_STATUS_COMPLETED)
+                self.assertEqual(jobs[0].progress, 100)
+                self.assertEqual(jobs[0].stage, "Imported: Async chair")
+            finally:
+                workspace.shutdown()
+                workspace.close()
+                _qt_application.processEvents()
 
     def test_generate_actions_start_one_named_job_per_disconnected_blob(
         self,

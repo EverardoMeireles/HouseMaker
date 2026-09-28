@@ -1,9 +1,10 @@
 # ### Imports ###
 from __future__ import annotations
 
+import copy
 import math
 import operator
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from io import BytesIO
 
@@ -16,7 +17,6 @@ from housemaker.glb import (
     GeneratedModel,
     import_generated_glb,
 )
-
 
 # ### Camera constants ###
 CAMERA_ID_POS_X = "pos_x"
@@ -73,8 +73,13 @@ class UnusedFaceRemovalOptions:
     progress_interval_faces: int = DEFAULT_PROGRESS_INTERVAL_FACES
     minimum_visible_fraction: float = DEFAULT_MINIMUM_VISIBLE_FRACTION
     minimum_projected_samples: int = DEFAULT_MINIMUM_PROJECTED_SAMPLES
+    preserve_zero_projected_sample_faces: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.preserve_zero_projected_sample_faces, bool):
+            raise ValueError(
+                "Zero-sample face preservation must be a boolean."
+            )
         normalized_camera_ids = _normalize_camera_ids(self.enabled_camera_ids)
         object.__setattr__(self, "enabled_camera_ids", normalized_camera_ids)
         minimum_visible_fraction = _normalize_minimum_visible_fraction(
@@ -159,6 +164,7 @@ class _MeshInstance:
     mesh: trimesh.Trimesh
     transform: np.ndarray
     first_face_index: int
+    node_metadata: dict[str, object]
 
     @property
     def face_count(self) -> int:
@@ -379,6 +385,9 @@ def remove_unused_faces_from_glb(
         minimum_projected_samples=(
             normalized_options.minimum_projected_samples
         ),
+        preserve_zero_projected_sample_faces=(
+            normalized_options.preserve_zero_projected_sample_faces
+        ),
     )
     stacked_faces = _find_stacked_faces(
         vertices=vertices,
@@ -501,6 +510,7 @@ def _collect_scene_geometry(
                 mesh=geometry.copy(),
                 transform=node_transform.copy(),
                 first_face_index=face_offset,
+                node_metadata=_get_scene_node_metadata(scene, node_name),
             )
         )
         vertex_offset += len(local_vertices)
@@ -693,12 +703,14 @@ def _build_visibility_keep_mask(
     *,
     minimum_visible_fraction: float,
     minimum_projected_samples: int,
+    preserve_zero_projected_sample_faces: bool,
 ) -> np.ndarray:
-    """Keep measured visible faces and protect genuine subpixel projections."""
+    """Keep visible faces and optionally protect faces the raster never samples."""
 
     if not captures:
         return np.empty(0, dtype=bool)
     face_count = len(captures[0].projected_sample_counts)
+    has_projected_sample = np.zeros(face_count, dtype=bool)
     has_meaningful_projection = np.zeros(face_count, dtype=bool)
     has_visible_sample = np.zeros(face_count, dtype=bool)
     qualifies_as_visible = np.zeros(face_count, dtype=bool)
@@ -706,6 +718,7 @@ def _build_visibility_keep_mask(
         projected = capture.projected_sample_counts
         visible = capture.visible_sample_counts
         meaningful = projected >= minimum_projected_samples
+        has_projected_sample |= projected > 0
         has_meaningful_projection |= meaningful
         has_visible_sample |= visible > 0
         qualifies_as_visible |= (
@@ -717,7 +730,10 @@ def _build_visibility_keep_mask(
             )
         )
     unmeasurable_subpixel = ~has_meaningful_projection & has_visible_sample
-    return qualifies_as_visible | unmeasurable_subpixel
+    keep_faces = qualifies_as_visible | unmeasurable_subpixel
+    if preserve_zero_projected_sample_faces:
+        keep_faces |= ~has_projected_sample
+    return keep_faces
 
 
 # ### Stacked-layer helpers ###
@@ -865,11 +881,13 @@ def _export_filtered_scene(
             used_node_names,
             fallback=f"node_{instance_index}",
         )
-        output_scene.add_geometry(
-            filtered_mesh,
-            geom_name=geometry_name,
-            node_name=node_name,
-            transform=instance.transform,
+        output_scene.geometry[geometry_name] = filtered_mesh
+        output_scene.graph.update(
+            frame_to=node_name,
+            frame_from=output_scene.graph.base_frame,
+            matrix=instance.transform,
+            geometry=geometry_name,
+            metadata=copy.deepcopy(instance.node_metadata),
         )
     if not output_scene.geometry:
         raise ValueError("Unused-face removal produced an empty scene.")
@@ -877,6 +895,25 @@ def _export_filtered_scene(
         return bytes(output_scene.export(file_type="glb"))
     except Exception as error:
         raise ValueError("The post-processed GLB could not be exported.") from error
+
+
+def _get_scene_node_metadata(
+    scene: trimesh.Scene,
+    node_name: object,
+) -> dict[str, object]:
+    """Copy glTF node metadata retained by trimesh for a filtered instance."""
+
+    parent_name = scene.graph.transforms.parents.get(node_name)
+    if parent_name is None:
+        return {}
+    edge_data = scene.graph.transforms.edge_data.get(
+        (parent_name, node_name),
+        {},
+    )
+    raw_metadata = edge_data.get("metadata")
+    if not isinstance(raw_metadata, Mapping):
+        return {}
+    return copy.deepcopy(dict(raw_metadata))
 
 
 def _make_unique_name(

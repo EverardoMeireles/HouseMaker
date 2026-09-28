@@ -1212,6 +1212,32 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.assertEqual(delete_object_index, object_list_index + 1)
         self.assertLess(delete_object_index, surface_list_index)
 
+    def test_import_glb_button_requests_one_external_model_import(self) -> None:
+        requests: list[bool] = []
+        self.workspace.external_glb_import_requested.connect(
+            lambda: requests.append(True)
+        )
+
+        self.workspace.import_glb_button.click()
+
+        self.assertEqual(self.workspace.import_glb_button.text(), "Import GLB")
+        self.assertEqual(requests, [True])
+
+    def test_import_glb_button_is_grouped_with_object_texture_actions(
+        self,
+    ) -> None:
+        texture_menu_layout = self.workspace.object_list.parentWidget().layout()
+        assert texture_menu_layout is not None
+
+        delete_object_index = texture_menu_layout.indexOf(
+            self.workspace.delete_object_button
+        )
+        import_glb_index = texture_menu_layout.indexOf(self.workspace.import_glb_button)
+        surface_list_index = texture_menu_layout.indexOf(self.workspace.surface_list)
+
+        self.assertEqual(import_glb_index, delete_object_index + 1)
+        self.assertLess(import_glb_index, surface_list_index)
+
     def test_missing_surface_texture_keeps_its_name_and_usage_count(self) -> None:
         source_id = build_atlas_wall_texture_source_id("missing-plaster")
 
