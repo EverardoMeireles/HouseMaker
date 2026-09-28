@@ -68,6 +68,10 @@ from housemaker.texture_atlas_workspace import (
     get_atlas_wall_texture_assignment_id,
     load_atlas_object_texture_source,
 )
+from housemaker.texture_color_balance import (
+    TextureColorBalanceSettings,
+    apply_texture_color_balance_rgba,
+)
 
 # ### Test application ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -351,6 +355,142 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         )
         self.assertIsNone(get_atlas_wall_texture_assignment_id("chair"))
         self.assertIsNone(get_atlas_wall_texture_assignment_id("surface-wall-texture:"))
+
+    def test_color_balance_sliders_preview_base_color_without_committing(
+        self,
+    ) -> None:
+        source = _mapped_source(
+            "chair",
+            directory=self._temporary_directory.name,
+            map_colors={
+                ATLAS_MAP_BASE_COLOR: (40, 110, 190, 231),
+                ATLAS_MAP_NORMAL: (120, 130, 240, 255),
+            },
+        )
+        self.workspace.set_object_texture_sources((source,))
+        self.assertTrue(self.workspace._select_object_row(source.object_id))
+        preview_requests: list[
+            tuple[str, str, TextureColorBalanceSettings]
+        ] = []
+        commit_requests: list[
+            tuple[str, str, TextureColorBalanceSettings]
+        ] = []
+        self.workspace.texture_color_balance_preview_requested.connect(
+            lambda kind, source_id, settings: preview_requests.append(
+                (kind, source_id, settings)
+            )
+        )
+        self.workspace.texture_color_balance_requested.connect(
+            lambda kind, source_id, settings: commit_requests.append(
+                (kind, source_id, settings)
+            )
+        )
+        original_preview = source.preview_rgba.copy()
+        original_png = source.physical_texture_path.read_bytes()
+        normal_preview = self.workspace.map_previews[
+            ATLAS_MAP_NORMAL
+        ]._source_preview_images[source.object_id].copy()
+
+        self.workspace.color_balance_preserve_luminosity_checkbox.setChecked(
+            False
+        )
+        self.workspace.color_balance_cyan_red_slider.setValue(40)
+
+        self.assertEqual(len(preview_requests), 1)
+        self.assertEqual(commit_requests, [])
+        settings = preview_requests[-1][2]
+        expected = apply_texture_color_balance_rgba(
+            original_preview,
+            settings,
+        )[0, 0]
+        balanced_image = self.workspace.map_previews[
+            ATLAS_MAP_BASE_COLOR
+        ]._source_preview_images[source.object_id]
+        actual_color = balanced_image.pixelColor(0, 0)
+        self.assertEqual(
+            (
+                actual_color.red(),
+                actual_color.green(),
+                actual_color.blue(),
+                actual_color.alpha(),
+            ),
+            tuple(int(value) for value in expected),
+        )
+        self.assertTrue(np.array_equal(source.preview_rgba, original_preview))
+        self.assertEqual(source.physical_texture_path.read_bytes(), original_png)
+        self.assertEqual(
+            self.workspace.map_previews[
+                ATLAS_MAP_NORMAL
+            ]._source_preview_images[source.object_id],
+            normal_preview,
+        )
+
+    def test_color_balance_reset_and_successful_completion_clear_preview(
+        self,
+    ) -> None:
+        source = _source("lamp", directory=self._temporary_directory.name)
+        self.workspace.set_object_texture_sources((source,))
+        self.assertTrue(self.workspace._select_object_row(source.object_id))
+        cleared = Mock()
+        self.workspace.texture_color_balance_preview_clear_requested.connect(
+            cleared
+        )
+        original_image = source.get_preview_image()
+
+        self.workspace.color_balance_cyan_red_slider.setValue(25)
+        self.workspace.color_balance_reset_button.click()
+
+        restored = self.workspace.map_previews[
+            ATLAS_MAP_BASE_COLOR
+        ]._source_preview_images[source.object_id]
+        self.assertEqual(restored, original_image)
+        self.assertEqual(self.workspace.color_balance_cyan_red_slider.value(), 0)
+        self.assertGreaterEqual(cleared.call_count, 1)
+
+        self.workspace.color_balance_cyan_red_slider.setValue(35)
+        self.workspace.complete_texture_color_balance_edit(
+            "object",
+            source.object_id,
+        )
+
+        self.assertTrue(self.workspace._pending_color_balance_settings.is_neutral)
+        self.assertEqual(self.workspace.color_balance_cyan_red_slider.value(), 0)
+        self.assertEqual(
+            self.workspace.map_previews[
+                ATLAS_MAP_BASE_COLOR
+            ]._source_preview_images[source.object_id],
+            original_image,
+        )
+
+    def test_color_balance_preview_clears_when_texture_selection_changes(
+        self,
+    ) -> None:
+        first = _source("first", directory=self._temporary_directory.name)
+        second = _source(
+            "second",
+            directory=self._temporary_directory.name,
+            color=(190, 80, 30, 255),
+        )
+        self.workspace.set_object_texture_sources((first, second))
+        self.assertTrue(self.workspace._select_object_row(first.object_id))
+        original_first = first.get_preview_image()
+        clears = Mock()
+        self.workspace.texture_color_balance_preview_clear_requested.connect(
+            clears
+        )
+        self.workspace.color_balance_cyan_red_slider.setValue(30)
+
+        self.assertTrue(self.workspace._select_object_row(second.object_id))
+
+        self.assertTrue(self.workspace._pending_color_balance_settings.is_neutral)
+        self.assertEqual(self.workspace.color_balance_cyan_red_slider.value(), 0)
+        self.assertEqual(
+            self.workspace.map_previews[
+                ATLAS_MAP_BASE_COLOR
+            ]._source_preview_images[first.object_id],
+            original_first,
+        )
+        self.assertGreaterEqual(clears.call_count, 1)
 
     def test_draw_call_estimate_shows_exported_and_mirrored_counts(self) -> None:
         self.assertIsNone(self.workspace.draw_call_estimate)

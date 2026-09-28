@@ -34,6 +34,7 @@ from housemaker.object_texture_variants import (
     build_object_texture_variants_from_texture,
     prepare_uv_rewrite_material_textures,
     replace_object_base_color_texture_from_glb,
+    replace_object_variant_base_color_texture,
 )
 
 
@@ -493,6 +494,104 @@ class ObjectTextureVariantAlgorithmTests(unittest.TestCase):
                 source_glb,
                 b"not a png",
             )
+
+    def test_exact_variant_base_color_replacement_preserves_mesh_and_pbr(
+        self,
+    ) -> None:
+        texture_size = (32, 16)
+        source_scene = trimesh.load(
+            BytesIO(_textured_glb(texture_size=texture_size)),
+            file_type="glb",
+            force="scene",
+            process=False,
+        )
+        normal_pixels = np.full(
+            (texture_size[1], texture_size[0], 4),
+            (91, 139, 247, 255),
+            dtype=np.uint8,
+        )
+        metallic_roughness_pixels = np.full(
+            (texture_size[1], texture_size[0], 4),
+            (0, 73, 181, 255),
+            dtype=np.uint8,
+        )
+        for geometry in source_scene.geometry.values():
+            material = geometry.visual.material
+            material.normalTexture = Image.fromarray(normal_pixels, mode="RGBA")
+            material.metallicRoughnessTexture = Image.fromarray(
+                metallic_roughness_pixels,
+                mode="RGBA",
+            )
+        source_glb = bytes(source_scene.export(file_type="glb"))
+        replacement_pixels = np.empty(
+            (texture_size[1], texture_size[0], 4),
+            dtype=np.uint8,
+        )
+        replacement_pixels[..., 0] = np.arange(texture_size[0], dtype=np.uint8)
+        replacement_pixels[..., 1] = 211
+        replacement_pixels[..., 2] = 37
+        replacement_pixels[..., 3] = np.arange(
+            texture_size[1],
+            dtype=np.uint8,
+        )[:, None]
+        replacement_output = BytesIO()
+        Image.fromarray(replacement_pixels, mode="RGBA").save(
+            replacement_output,
+            format="PNG",
+        )
+
+        replaced_glb = replace_object_variant_base_color_texture(
+            source_glb,
+            replacement_output.getvalue(),
+        )
+
+        replaced_scene = trimesh.load(
+            BytesIO(replaced_glb),
+            file_type="glb",
+            force="scene",
+            process=False,
+        )
+        self.assertEqual(set(replaced_scene.geometry), set(source_scene.geometry))
+        for geometry_name, source_geometry in source_scene.geometry.items():
+            replaced_geometry = replaced_scene.geometry[geometry_name]
+            np.testing.assert_allclose(
+                replaced_geometry.vertices,
+                source_geometry.vertices,
+            )
+            np.testing.assert_array_equal(
+                replaced_geometry.faces,
+                source_geometry.faces,
+            )
+            np.testing.assert_allclose(
+                replaced_geometry.visual.uv,
+                source_geometry.visual.uv,
+            )
+            material = replaced_geometry.visual.material
+            np.testing.assert_array_equal(
+                np.asarray(
+                    material.baseColorTexture.convert("RGBA"),
+                    dtype=np.uint8,
+                ),
+                replacement_pixels,
+            )
+            np.testing.assert_array_equal(
+                np.asarray(
+                    material.normalTexture.convert("RGBA"),
+                    dtype=np.uint8,
+                ),
+                normal_pixels,
+            )
+            np.testing.assert_array_equal(
+                np.asarray(
+                    material.metallicRoughnessTexture.convert("RGBA"),
+                    dtype=np.uint8,
+                ),
+                metallic_roughness_pixels,
+            )
+        np.testing.assert_allclose(
+            replaced_scene.graph.get("sphere-node")[0],
+            source_scene.graph.get("sphere-node")[0],
+        )
 
     def test_provider_texture_replaces_only_the_authoritative_model_atlas(
         self,

@@ -228,6 +228,43 @@ def replace_object_base_color_texture_from_glb(
             "object geometry."
         ) from error
 
+
+def replace_object_variant_base_color_texture(
+    glb_bytes: bytes,
+    texture_png: bytes,
+) -> bytes:
+    """Replace one exact-resolution GLB's shared base-color texture only.
+
+    This path is intentionally resolution-agnostic so Atlas-side appearance
+    edits can retain the object's existing geometry, UVs, optional PBR maps,
+    glass materials, and compact symmetric packing without rebuilding them.
+    """
+
+    payload = bytes(glb_bytes)
+    if not payload:
+        raise ValueError("The generated GLB is empty.")
+    scene = _load_glb_scene(payload)
+    shared_maps = _validate_shared_texture_maps(
+        _collect_material_texture_maps(scene)
+    )
+    replacement_texture = _decode_png_rgba_any_size(texture_png)
+    expected_shape = shared_maps[MATERIAL_TEXTURE_BASE_COLOR].shape
+    if replacement_texture.shape != expected_shape:
+        height, width = expected_shape[:2]
+        raise ValueError(
+            "The replacement texture must match the embedded base-color "
+            f"texture ({width} x {height})."
+        )
+    shared_maps[MATERIAL_TEXTURE_BASE_COLOR] = replacement_texture
+    _replace_material_texture_maps_with_shared(scene, shared_maps)
+    try:
+        return bytes(scene.export(file_type="glb"))
+    except Exception as error:
+        raise ValueError(
+            "The adjusted base-color texture could not be embedded in the "
+            "generated object."
+        ) from error
+
 def _build_variants_from_scene(
     scene: trimesh.Scene,
     texture_maps_2048: Mapping[str, np.ndarray],
@@ -859,6 +896,18 @@ def _decode_texture_rgba(texture: object) -> np.ndarray:
 
 
 def _decode_png_rgba(payload: bytes) -> np.ndarray:
+    rgba = _decode_png_rgba_any_size(payload)
+    if rgba.shape[:2] != (
+        TEXTURE_RESOLUTION_2048,
+        TEXTURE_RESOLUTION_2048,
+    ):
+        raise ValueError("The replacement texture must be 2048 x 2048.")
+    return rgba
+
+
+def _decode_png_rgba_any_size(payload: bytes) -> np.ndarray:
+    """Decode one static PNG without imposing a texture resolution."""
+
     normalized = bytes(payload)
     if not normalized.startswith(b"\x89PNG\r\n\x1a\n"):
         raise ValueError("The replacement texture must be a PNG image.")
@@ -868,11 +917,6 @@ def _decode_png_rgba(payload: bytes) -> np.ndarray:
                 raise ValueError("The replacement texture must be a PNG image.")
             if int(getattr(image, "n_frames", 1)) != 1:
                 raise ValueError("The replacement texture must be a static PNG.")
-            if image.size != (
-                TEXTURE_RESOLUTION_2048,
-                TEXTURE_RESOLUTION_2048,
-            ):
-                raise ValueError("The replacement texture must be 2048 x 2048.")
             image.load()
             rgba = np.asarray(image.convert("RGBA"), dtype=np.uint8)
     except ValueError:

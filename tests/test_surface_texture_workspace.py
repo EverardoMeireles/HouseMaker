@@ -67,6 +67,7 @@ from housemaker.surface_texture_state import (
 from housemaker.surface_texture_workspace import (
     MAX_PROVIDER_REFERENCE_EDGE_PIXELS,
     SURFACE_TEXTURE_JOB_KIND,
+    SurfaceTextureColorBalanceRevision,
     SurfaceTextureGenerationWorkspace,
     SurfaceTextureRequest,
     _build_contact_sheet,
@@ -75,6 +76,10 @@ from housemaker.surface_texture_workspace import (
     _decode_png_rgba,
     _encode_provider_reference_png,
     prepare_surface_texture_tiling_repair,
+)
+from housemaker.texture_color_balance import (
+    ColorBalanceAdjustment,
+    TextureColorBalanceSettings,
 )
 
 # ### Module state ###
@@ -233,6 +238,95 @@ def _surface_assignment_with_variants(
         texture_variants=tuple(variants),
         selected_texture_resolution=selected_resolution,
     )
+
+
+def _small_surface_assignment_with_pbr_variants(
+    asset_directory: Path,
+    assignment_id: str,
+    surface_ids: tuple[str, ...],
+) -> tuple[
+    SurfaceTextureAssignment,
+    dict[int, np.ndarray],
+    dict[str, bytes],
+]:
+    """Persist a compact all-resolution family with distinct PBR assets."""
+
+    asset_directory.mkdir(parents=True, exist_ok=True)
+    variants: list[SurfaceTextureVariant] = []
+    source_rgba_by_resolution: dict[int, np.ndarray] = {}
+    pbr_payload_by_path: dict[str, bytes] = {}
+    for variant_index, resolution in enumerate(SURFACE_TEXTURE_RESOLUTIONS):
+        source_rgba = np.empty((4, 5, 4), dtype=np.uint8)
+        source_rgba[:, :, :3] = (
+            70 + variant_index * 20,
+            110 + variant_index * 15,
+            145 - variant_index * 10,
+        )
+        source_rgba[:, :, 3] = np.asarray(
+            (
+                (0, 32, 64, 128, 255),
+                (255, 192, 128, 64, 0),
+                (17, 51, 102, 153, 204),
+                (204, 153, 102, 51, 17),
+            ),
+            dtype=np.uint8,
+        )
+        base_path = f"{assignment_id}.texture-{resolution}.png"
+        Image.fromarray(source_rgba, mode="RGBA").save(
+            asset_directory / base_path,
+            format="PNG",
+        )
+        source_rgba_by_resolution[resolution] = source_rgba.copy()
+        map_asset_paths = {ATLAS_MAP_BASE_COLOR: base_path}
+        for map_index, map_type in enumerate(PBR_MAP_TYPES):
+            map_path = (
+                f"{assignment_id}.texture-{resolution}.{map_type}.png"
+            )
+            map_payload = _colored_texture_png(
+                (
+                    30 + variant_index * 20,
+                    60 + map_index * 30,
+                    90 + variant_index * 10,
+                    255,
+                )
+            )
+            (asset_directory / map_path).write_bytes(map_payload)
+            map_asset_paths[map_type] = map_path
+            pbr_payload_by_path[map_path] = map_payload
+        variants.append(
+            SurfaceTextureVariant(
+                resolution=resolution,
+                asset_path=base_path,
+                map_asset_paths=map_asset_paths,
+            )
+        )
+    selected_resolution = 1024
+    active_path = next(
+        variant.asset_path
+        for variant in variants
+        if variant.resolution == selected_resolution
+    )
+    assignment = SurfaceTextureAssignment(
+        assignment_id=assignment_id,
+        surface_type="wall",
+        surface_ids=surface_ids,
+        provider="meshy",
+        asset_path=active_path,
+        provider_task_id="surface-color-task",
+        combined_area_m2=4.25,
+        area_description="2 wall surfaces, 4.25 m² total",
+        texture_width=selected_resolution,
+        texture_height=selected_resolution,
+        texture_variants=tuple(variants),
+        selected_texture_resolution=selected_resolution,
+        display_name="Balanced plaster",
+        enabled_pbr_maps=PBR_MAP_TYPES,
+        available_pbr_maps=PBR_MAP_TYPES,
+        pbr_alignment_version=SURFACE_PBR_ALIGNMENT_VERSION,
+        texture_repeat_size_m=1.75,
+        tiling_fix_needed=True,
+    )
+    return assignment, source_rgba_by_resolution, pbr_payload_by_path
 
 
 def _edited_face_surface(
@@ -1676,6 +1770,324 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         finally:
             self.workspace._generation_surface_targets.pop("busy-job")
         self.assertEqual(self.workspace.get_data().to_dict(), before)
+
+    def test_surface_color_balance_stages_every_resolution_and_reuses_pbr(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        surface_ids = (
+            "level:2/room:5/wall:1:2",
+            "level:2/room:5/wall:2:3",
+        )
+        assignment, source_rgba_by_resolution, pbr_payload_by_path = (
+            _small_surface_assignment_with_pbr_variants(
+                asset_directory,
+                "balanced-wall",
+                surface_ids,
+            )
+        )
+        self.workspace.set_data(SurfaceTextureData(assignments=[assignment]))
+        settings = TextureColorBalanceSettings(
+            midtones=ColorBalanceAdjustment(
+                cyan_red=55,
+                magenta_green=-25,
+                yellow_blue=20,
+            ),
+            preserve_luminosity=False,
+        )
+
+        revision = self.workspace.stage_assignment_color_balance(
+            assignment.assignment_id,
+            settings,
+        )
+
+        self.assertIsInstance(revision, SurfaceTextureColorBalanceRevision)
+        assert revision is not None
+        self.assertEqual(revision.previous_assignment, assignment)
+        self.assertEqual(revision.settings, settings)
+        self.assertEqual(len(revision.created_asset_paths), 3)
+        self.assertEqual(
+            self.workspace.get_assignment(assignment.assignment_id),
+            assignment,
+        )
+        balanced = revision.balanced_assignment
+        self.assertEqual(balanced.selected_texture_resolution, 1024)
+        self.assertEqual(balanced.texture_repeat_size_m, 1.75)
+        self.assertEqual(balanced.display_name, assignment.display_name)
+        self.assertEqual(balanced.surface_ids, assignment.surface_ids)
+        self.assertEqual(balanced.enabled_pbr_maps, assignment.enabled_pbr_maps)
+        self.assertEqual(
+            balanced.available_pbr_maps,
+            assignment.available_pbr_maps,
+        )
+        self.assertEqual(balanced.tiling_fix_needed, assignment.tiling_fix_needed)
+
+        for original_variant, balanced_variant in zip(
+            assignment.texture_variants,
+            balanced.texture_variants,
+            strict=True,
+        ):
+            resolution = original_variant.resolution
+            self.assertEqual(balanced_variant.resolution, resolution)
+            self.assertNotEqual(
+                balanced_variant.asset_path,
+                original_variant.asset_path,
+            )
+            self.assertEqual(
+                balanced_variant.map_asset_paths[ATLAS_MAP_BASE_COLOR],
+                balanced_variant.asset_path,
+            )
+            for map_type in PBR_MAP_TYPES:
+                self.assertEqual(
+                    balanced_variant.map_asset_paths[map_type],
+                    original_variant.map_asset_paths[map_type],
+                )
+            with Image.open(
+                asset_directory / balanced_variant.asset_path
+            ) as image:
+                balanced_rgba = np.asarray(
+                    image.convert("RGBA"),
+                    dtype=np.uint8,
+                )
+            source_rgba = source_rgba_by_resolution[resolution]
+            self.assertEqual(balanced_rgba.shape, source_rgba.shape)
+            np.testing.assert_array_equal(
+                balanced_rgba[:, :, 3],
+                source_rgba[:, :, 3],
+            )
+            self.assertFalse(
+                np.array_equal(
+                    balanced_rgba[:, :, :3],
+                    source_rgba[:, :, :3],
+                )
+            )
+        for pbr_path, original_payload in pbr_payload_by_path.items():
+            self.assertEqual(
+                (asset_directory / pbr_path).read_bytes(),
+                original_payload,
+            )
+
+        data_changed = QSignalSpy(self.workspace.data_changed)
+        content_changed = QSignalSpy(self.workspace.surface_content_changed)
+        self.assertTrue(
+            self.workspace.activate_assignment_color_balance_revision(
+                revision,
+                balanced=True,
+                emit_signals=False,
+            )
+        )
+        self.assertEqual(data_changed.count(), 0)
+        self.assertEqual(content_changed.count(), 0)
+        self.workspace.publish_assignment_color_balance_change(
+            "Surface color updated."
+        )
+        self.assertEqual(data_changed.count(), 1)
+        self.assertEqual(content_changed.count(), 1)
+        self.assertEqual(
+            self.workspace.get_assignment(assignment.assignment_id),
+            balanced,
+        )
+
+        self.assertTrue(
+            self.workspace.activate_assignment_color_balance_revision(
+                revision,
+                balanced=False,
+                emit_signals=False,
+            )
+        )
+        self.assertEqual(
+            self.workspace.get_assignment(assignment.assignment_id),
+            assignment,
+        )
+        self.assertEqual(
+            self.workspace.discard_assignment_color_balance_revision(revision),
+            0,
+        )
+        self.assertTrue(
+            all(
+                not (asset_directory / raw_path).exists()
+                for raw_path in revision.created_asset_paths
+            )
+        )
+        for pbr_path, original_payload in pbr_payload_by_path.items():
+            self.assertEqual(
+                (asset_directory / pbr_path).read_bytes(),
+                original_payload,
+            )
+
+    def test_surface_color_balance_neutral_is_an_exact_no_op(self) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "neutral-wall",
+            ("level:2/room:5/wall:1:2",),
+        )
+        self.workspace.set_data(SurfaceTextureData(assignments=[assignment]))
+        before_files = {
+            path.name: path.read_bytes()
+            for path in asset_directory.iterdir()
+            if path.is_file()
+        }
+
+        revision = self.workspace.apply_assignment_color_balance(
+            assignment.assignment_id,
+            TextureColorBalanceSettings(preserve_luminosity=False),
+        )
+
+        self.assertIsNone(revision)
+        self.assertEqual(
+            self.workspace.get_assignment(assignment.assignment_id),
+            assignment,
+        )
+        self.assertEqual(
+            {
+                path.name: path.read_bytes()
+                for path in asset_directory.iterdir()
+                if path.is_file()
+            },
+            before_files,
+        )
+        with self.assertRaisesRegex(ValueError, "no longer exists"):
+            self.workspace.stage_assignment_color_balance(
+                "missing-texture",
+                TextureColorBalanceSettings(),
+            )
+
+    def test_surface_color_balance_apply_rolls_back_files_and_assignment(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "rollback-wall",
+            ("level:2/room:5/wall:1:2",),
+        )
+        self.workspace.set_data(SurfaceTextureData(assignments=[assignment]))
+        settings = TextureColorBalanceSettings(
+            highlights=ColorBalanceAdjustment(yellow_blue=60),
+        )
+
+        with (
+            patch.object(
+                self.workspace,
+                "_restore_assignment_textures",
+                side_effect=(ValueError("preview update failed"), None),
+            ),
+            self.assertRaisesRegex(ValueError, "preview update failed"),
+        ):
+            self.workspace.apply_assignment_color_balance(
+                assignment.assignment_id,
+                settings,
+            )
+
+        self.assertEqual(
+            self.workspace.get_assignment(assignment.assignment_id),
+            assignment,
+        )
+        self.assertFalse(
+            tuple(asset_directory.glob("surface-color-balance-*.png"))
+        )
+
+    def test_surface_color_balance_rejects_missing_invalid_and_busy_sources(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        asset_directory.mkdir(parents=True, exist_ok=True)
+        surface_id = "level:2/room:5/wall:1:2"
+        assignment = _surface_assignment(
+            "invalid-color-source",
+            (surface_id,),
+            "invalid-color-source.png",
+        )
+        self.workspace.set_data(SurfaceTextureData(assignments=[assignment]))
+        settings = TextureColorBalanceSettings(
+            shadows=ColorBalanceAdjustment(cyan_red=20),
+        )
+
+        with self.assertRaisesRegex(ValueError, "file is missing"):
+            self.workspace.stage_assignment_color_balance(
+                assignment.assignment_id,
+                settings,
+            )
+        (asset_directory / assignment.asset_path).write_bytes(b"not a png")
+        with self.assertRaisesRegex(ValueError, "not a valid PNG"):
+            self.workspace.stage_assignment_color_balance(
+                assignment.assignment_id,
+                settings,
+            )
+
+        (asset_directory / assignment.asset_path).write_bytes(_texture_png())
+        self.workspace._generation_surface_targets["busy-color"] = frozenset(
+            (surface_id,)
+        )
+        try:
+            with self.assertRaisesRegex(ValueError, "currently busy"):
+                self.workspace.stage_assignment_color_balance(
+                    assignment.assignment_id,
+                    settings,
+                )
+        finally:
+            self.workspace._generation_surface_targets.pop("busy-color")
+        self.assertFalse(
+            tuple(asset_directory.glob("surface-color-balance-*.png"))
+        )
+
+    def test_surface_color_balance_stage_removes_partial_revision_files(
+        self,
+    ) -> None:
+        asset_directory = self._temporary_path / "surface_assets"
+        assignment = _surface_assignment_with_variants(
+            asset_directory,
+            "partial-color-wall",
+            ("level:2/room:5/wall:1:2",),
+        )
+        self.workspace.set_data(SurfaceTextureData(assignments=[assignment]))
+        original_files = {
+            path.name: path.read_bytes()
+            for path in asset_directory.iterdir()
+            if path.is_file()
+        }
+        real_persist = surface_texture_workspace_module._persist_surface_texture_file
+        persist_call_count = 0
+
+        def fail_second_revision_file(
+            target_directory: Path,
+            file_name: str,
+            texture_png: bytes,
+        ) -> str:
+            nonlocal persist_call_count
+            persist_call_count += 1
+            if persist_call_count == 2:
+                raise OSError("simulated color revision write failure")
+            return real_persist(target_directory, file_name, texture_png)
+
+        with (
+            patch.object(
+                surface_texture_workspace_module,
+                "_persist_surface_texture_file",
+                side_effect=fail_second_revision_file,
+            ),
+            self.assertRaisesRegex(OSError, "simulated color revision"),
+        ):
+            self.workspace.stage_assignment_color_balance(
+                assignment.assignment_id,
+                TextureColorBalanceSettings(
+                    midtones=ColorBalanceAdjustment(magenta_green=30),
+                ),
+            )
+
+        self.assertEqual(
+            {
+                path.name: path.read_bytes()
+                for path in asset_directory.iterdir()
+                if path.is_file()
+            },
+            original_files,
+        )
+        self.assertEqual(
+            self.workspace.get_assignment(assignment.assignment_id),
+            assignment,
+        )
 
     def test_tiling_stage_rejects_reservation_created_after_prepare(
         self,

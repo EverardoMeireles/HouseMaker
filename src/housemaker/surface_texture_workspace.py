@@ -84,6 +84,10 @@ from housemaker.surface_texture_variants import (
     build_surface_texture_variants,
 )
 from housemaker.surface_texture_viewer import SurfaceTextureViewer
+from housemaker.texture_color_balance import (
+    TextureColorBalanceSettings,
+    apply_texture_color_balance_rgba,
+)
 from housemaker.texture_tiling import create_edge_compatible_variants
 from housemaker.video_source import VIDEO_FILE_FILTER, VideoFrameSource, probe_video
 
@@ -422,6 +426,16 @@ class SurfaceTextureTilingRevision:
     previous_assignment: SurfaceTextureAssignment
     repaired_assignment: SurfaceTextureAssignment
     created_asset_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SurfaceTextureColorBalanceRevision:
+    """Two immutable Surface base-color revisions used by commit and undo."""
+
+    previous_assignment: SurfaceTextureAssignment
+    balanced_assignment: SurfaceTextureAssignment
+    created_asset_paths: tuple[str, ...]
+    settings: TextureColorBalanceSettings
 
 
 @dataclass(frozen=True)
@@ -1094,6 +1108,270 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         """Return one immutable assignment without cloning all Surface data."""
 
         return self._assignment_by_id(assignment_id)
+
+    # ### Surface texture color balance ###
+    def stage_assignment_color_balance(
+        self,
+        assignment_id: str,
+        settings: TextureColorBalanceSettings,
+    ) -> SurfaceTextureColorBalanceRevision | None:
+        """Persist balanced base-color variants without activating them.
+
+        Every selectable resolution is adjusted from its own authoritative
+        PNG. Optional material maps keep their existing paths and bytes.
+        """
+
+        if not isinstance(settings, TextureColorBalanceSettings):
+            raise TypeError("Texture color balance settings are required.")
+        assignment = self._assignment_by_id(assignment_id)
+        if assignment is None:
+            raise ValueError("The selected Surface texture no longer exists.")
+        if self._assignment_is_reserved(assignment):
+            raise ValueError("The selected Surface texture is currently busy.")
+        if settings.is_neutral:
+            return None
+
+        source_variants: tuple[tuple[int | None, str], ...] = (
+            tuple(
+                (variant.resolution, variant.asset_path)
+                for variant in assignment.texture_variants
+            )
+            if assignment.texture_variants
+            else ((None, assignment.asset_path),)
+        )
+        balanced_pngs: list[tuple[int | None, bytes]] = []
+        for resolution, raw_asset_path in source_variants:
+            resolution_label = (
+                "legacy"
+                if resolution is None
+                else f"{resolution} x {resolution}"
+            )
+            try:
+                source_path = self._resolve_asset_path(raw_asset_path)
+            except ValueError as error:
+                raise ValueError(
+                    f"The {resolution_label} Surface base-color path is invalid."
+                ) from error
+            try:
+                source_png = source_path.read_bytes()
+            except OSError as error:
+                raise ValueError(
+                    f"The {resolution_label} Surface base-color file is missing."
+                ) from error
+            source_rgba = _decode_surface_base_color_rgba(
+                source_png,
+                f"{resolution_label} Surface base color",
+            )
+            balanced_rgba = apply_texture_color_balance_rgba(
+                source_rgba,
+                settings,
+            )
+            if balanced_rgba.shape != source_rgba.shape:
+                raise ValueError(
+                    "Color balancing changed the Surface texture dimensions."
+                )
+            if not np.array_equal(
+                balanced_rgba[:, :, 3],
+                source_rgba[:, :, 3],
+            ):
+                raise ValueError(
+                    "Color balancing changed the Surface texture alpha channel."
+                )
+            balanced_pngs.append(
+                (resolution, _encode_texture_map_png(balanced_rgba))
+            )
+
+        revision_token = uuid.uuid4().hex
+        created_asset_paths: list[str] = []
+        balanced_path_by_resolution: dict[int | None, str] = {}
+        try:
+            for resolution, balanced_png in balanced_pngs:
+                resolution_suffix = (
+                    "legacy" if resolution is None else str(resolution)
+                )
+                balanced_path = _persist_surface_texture_file(
+                    self._asset_directory,
+                    (
+                        f"surface-color-balance-{revision_token}.texture-"
+                        f"{resolution_suffix}.png"
+                    ),
+                    balanced_png,
+                )
+                created_asset_paths.append(balanced_path)
+                balanced_path_by_resolution[resolution] = balanced_path
+
+            if assignment.texture_variants:
+                balanced_variants = tuple(
+                    SurfaceTextureVariant(
+                        resolution=variant.resolution,
+                        asset_path=balanced_path_by_resolution[
+                            variant.resolution
+                        ],
+                        map_asset_paths={
+                            **variant.map_asset_paths,
+                            ATLAS_MAP_BASE_COLOR: balanced_path_by_resolution[
+                                variant.resolution
+                            ],
+                        },
+                    )
+                    for variant in assignment.texture_variants
+                )
+                selected_resolution = assignment.selected_texture_resolution
+                if selected_resolution is None:
+                    raise ValueError(
+                        "The selected Surface texture has no active resolution."
+                    )
+                selected_variant = next(
+                    (
+                        variant
+                        for variant in balanced_variants
+                        if variant.resolution == selected_resolution
+                    ),
+                    None,
+                )
+                if selected_variant is None:
+                    raise ValueError(
+                        "The balanced Surface family has no active resolution."
+                    )
+                balanced_assignment = replace(
+                    assignment,
+                    asset_path=selected_variant.asset_path,
+                    texture_variants=balanced_variants,
+                )
+            else:
+                balanced_assignment = replace(
+                    assignment,
+                    asset_path=balanced_path_by_resolution[None],
+                )
+        except Exception:
+            _discard_surface_texture_asset_paths(
+                self._asset_directory,
+                created_asset_paths,
+            )
+            raise
+
+        return SurfaceTextureColorBalanceRevision(
+            previous_assignment=assignment,
+            balanced_assignment=balanced_assignment,
+            created_asset_paths=tuple(created_asset_paths),
+            settings=settings,
+        )
+
+    def apply_assignment_color_balance(
+        self,
+        assignment_id: str,
+        settings: TextureColorBalanceSettings,
+        *,
+        emit_signals: bool = True,
+    ) -> SurfaceTextureColorBalanceRevision | None:
+        """Stage and atomically activate one Surface color revision."""
+
+        revision = self.stage_assignment_color_balance(
+            assignment_id,
+            settings,
+        )
+        if revision is None:
+            return None
+        try:
+            self.activate_assignment_color_balance_revision(
+                revision,
+                balanced=True,
+                emit_signals=False,
+            )
+            if emit_signals:
+                self.publish_assignment_color_balance_change(
+                    "Surface texture color balance updated."
+                )
+        except Exception:
+            if (
+                self._assignment_by_id(assignment_id)
+                == revision.balanced_assignment
+            ):
+                self.activate_assignment_color_balance_revision(
+                    revision,
+                    balanced=False,
+                    emit_signals=False,
+                )
+            self.discard_assignment_color_balance_revision(revision)
+            raise
+        return revision
+
+    def activate_assignment_color_balance_revision(
+        self,
+        revision: SurfaceTextureColorBalanceRevision,
+        *,
+        balanced: bool,
+        emit_signals: bool = True,
+    ) -> bool:
+        """Switch between one Surface texture's original and balanced files."""
+
+        if not isinstance(revision, SurfaceTextureColorBalanceRevision):
+            raise TypeError("A Surface texture color-balance revision is required.")
+        current_assignment = self._assignment_by_id(
+            revision.previous_assignment.assignment_id
+        )
+        target_assignment = (
+            revision.balanced_assignment
+            if balanced
+            else revision.previous_assignment
+        )
+        expected_assignment = (
+            revision.previous_assignment
+            if balanced
+            else revision.balanced_assignment
+        )
+        if current_assignment == target_assignment:
+            return False
+        if current_assignment != expected_assignment:
+            raise RuntimeError(
+                "A newer Surface texture revision prevents this color-balance "
+                "change."
+            )
+
+        previous_assignments = list(self._data.assignments)
+        self._data.assignments = [
+            (
+                target_assignment
+                if assignment.assignment_id == target_assignment.assignment_id
+                else assignment
+            )
+            for assignment in previous_assignments
+        ]
+        self._invalidate_assignment_caches()
+        try:
+            self._restore_assignment_textures()
+        except (OSError, RuntimeError, TypeError, ValueError):
+            self._data.assignments = previous_assignments
+            self._invalidate_assignment_caches()
+            self._restore_assignment_textures()
+            raise
+        self._sync_selection_status()
+        self._sync_controls()
+        if emit_signals:
+            self.publish_assignment_color_balance_change(
+                "Surface texture color balance updated."
+            )
+        return True
+
+    def discard_assignment_color_balance_revision(
+        self,
+        revision: SurfaceTextureColorBalanceRevision,
+    ) -> int:
+        """Delete a balanced revision once no assignment references it."""
+
+        if not isinstance(revision, SurfaceTextureColorBalanceRevision):
+            raise TypeError("A Surface texture color-balance revision is required.")
+        return self._delete_orphaned_assignment_assets(
+            (revision.balanced_assignment,)
+        )
+
+    def publish_assignment_color_balance_change(self, message: str) -> None:
+        """Publish an already committed Surface color-balance transaction."""
+
+        self.status_label.setText(str(message).strip())
+        self._emit_data_changed()
+        self.surface_content_changed.emit()
+        self._sync_controls()
 
     def prepare_assignment_tiling_repair(
         self,
@@ -4074,6 +4352,27 @@ def _invoke_provider(
     if callable(provider):
         return provider(request)
     raise TypeError("The surface texture provider is not callable.")
+
+
+# ### Surface color-balance helpers ###
+def _decode_surface_base_color_rgba(
+    png_bytes: bytes,
+    label: str,
+) -> np.ndarray:
+    """Decode a Surface base color into the RGBA contract used by balancing."""
+
+    decoded = _decode_texture_map_png(png_bytes, label)
+    channel_count = int(decoded.shape[2])
+    if channel_count == 4:
+        return decoded
+    if channel_count == 1:
+        rgb = np.repeat(decoded, 3, axis=2)
+    elif channel_count == 3:
+        rgb = decoded
+    else:
+        raise ValueError(f"{label} has unsupported color channels.")
+    alpha = np.full((*rgb.shape[:2], 1), 255, dtype=np.uint8)
+    return np.ascontiguousarray(np.concatenate((rgb, alpha), axis=2))
 
 
 # ### Tiling repair helpers ###

@@ -14,7 +14,7 @@ import unittest
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import cv2
 import numpy as np
@@ -100,10 +100,18 @@ from housemaker.object_uv_scan_projection import (
     ScanProjectionStats,
 )
 from housemaker.object_texture_variants import (
+    ATLAS_MAP_BASE_COLOR,
+    PBR_MAP_METALLIC,
+    PBR_MAP_NORMAL,
+    PBR_MAP_ROUGHNESS,
     TEXTURE_RESOLUTIONS,
     ObjectTextureVariants,
 )
 from housemaker.settings_widget import GenerationServiceSettings
+from housemaker.texture_color_balance import (
+    ColorBalanceAdjustment,
+    TextureColorBalanceSettings,
+)
 from housemaker.safe_duplicate_face_removal import (
     remove_safe_duplicate_faces_from_glb,
 )
@@ -221,6 +229,103 @@ def _png_bytes(color: tuple[int, int, int, int]) -> bytes:
     if not encoded:
         raise RuntimeError("Test PNG encoding failed.")
     return bytes(payload)
+
+
+def _rgba_png_bytes(pixels: np.ndarray) -> bytes:
+    """Encode exact RGBA fixture pixels without OpenCV channel swapping."""
+
+    output = BytesIO()
+    Image.fromarray(np.asarray(pixels, dtype=np.uint8), mode="RGBA").save(
+        output,
+        format="PNG",
+    )
+    return output.getvalue()
+
+
+def _read_rgba_png(path: Path) -> np.ndarray:
+    """Read one persisted fixture texture as exact RGBA bytes."""
+
+    with Image.open(path) as image:
+        return np.asarray(image.convert("RGBA"), dtype=np.uint8)
+
+
+def _color_balance_texture_variants() -> ObjectTextureVariants:
+    """Build compact exact-resolution variants with base color and PBR."""
+
+    glb_by_resolution: dict[int, bytes] = {}
+    base_pngs: dict[int, bytes] = {}
+    base_previews: dict[int, np.ndarray] = {}
+    normal_pngs: dict[int, bytes] = {}
+    normal_previews: dict[int, np.ndarray] = {}
+    roughness_pngs: dict[int, bytes] = {}
+    roughness_previews: dict[int, np.ndarray] = {}
+    metallic_pngs: dict[int, bytes] = {}
+    metallic_previews: dict[int, np.ndarray] = {}
+    for variant_index, resolution in enumerate(TEXTURE_RESOLUTIONS):
+        base = np.empty((8, 8, 4), dtype=np.uint8)
+        base[..., 0] = 38 + variant_index * 11
+        base[..., 1] = np.arange(8, dtype=np.uint8)[None, :] * 8 + 72
+        base[..., 2] = np.arange(8, dtype=np.uint8)[:, None] * 7 + 103
+        base[..., 3] = (
+            np.arange(64, dtype=np.uint8).reshape((8, 8)) * 3 + 17
+        )
+        normal = np.full((8, 8, 4), (91, 139, 247, 255), dtype=np.uint8)
+        roughness = np.full(
+            (8, 8, 4),
+            (71 + variant_index,) * 3 + (255,),
+            dtype=np.uint8,
+        )
+        metallic = np.full(
+            (8, 8, 4),
+            (181 - variant_index,) * 3 + (255,),
+            dtype=np.uint8,
+        )
+        metallic_roughness = np.empty((8, 8, 4), dtype=np.uint8)
+        metallic_roughness[..., 0] = 0
+        metallic_roughness[..., 1] = roughness[..., 0]
+        metallic_roughness[..., 2] = metallic[..., 0]
+        metallic_roughness[..., 3] = 255
+
+        mesh = trimesh.creation.box(extents=(1.0, 2.0, 3.0))
+        material = PBRMaterial(baseColorTexture=Image.fromarray(base, mode="RGBA"))
+        material.normalTexture = Image.fromarray(normal, mode="RGBA")
+        material.metallicRoughnessTexture = Image.fromarray(
+            metallic_roughness,
+            mode="RGBA",
+        )
+        mesh.visual = TextureVisuals(
+            uv=np.linspace(0.05, 0.95, len(mesh.vertices) * 2).reshape((-1, 2)),
+            material=material,
+        )
+        glb_by_resolution[resolution] = bytes(
+            trimesh.Scene(mesh).export(file_type="glb")
+        )
+        base_pngs[resolution] = _rgba_png_bytes(base)
+        base_previews[resolution] = base
+        normal_pngs[resolution] = _rgba_png_bytes(normal)
+        normal_previews[resolution] = normal
+        roughness_pngs[resolution] = _rgba_png_bytes(roughness)
+        roughness_previews[resolution] = roughness
+        metallic_pngs[resolution] = _rgba_png_bytes(metallic)
+        metallic_previews[resolution] = metallic
+
+    return ObjectTextureVariants(
+        glb_by_resolution=glb_by_resolution,
+        texture_png_by_resolution=base_pngs,
+        preview_rgba_by_resolution=base_previews,
+        map_png_by_resolution={
+            ATLAS_MAP_BASE_COLOR: base_pngs,
+            PBR_MAP_NORMAL: normal_pngs,
+            PBR_MAP_ROUGHNESS: roughness_pngs,
+            PBR_MAP_METALLIC: metallic_pngs,
+        },
+        map_preview_rgba_by_resolution={
+            ATLAS_MAP_BASE_COLOR: base_previews,
+            PBR_MAP_NORMAL: normal_previews,
+            PBR_MAP_ROUGHNESS: roughness_previews,
+            PBR_MAP_METALLIC: metallic_previews,
+        },
+    )
 
 
 def _texture_variants(
@@ -2023,6 +2128,23 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
         self.workspace._handle_generation_succeeded(result, model)
         return self.workspace.get_data().generated_objects[-1], variants
 
+    def _seed_color_balance_object(
+        self,
+    ) -> tuple[GeneratedObjectRecord, ObjectTextureVariants]:
+        """Persist one textured object with independently stored PBR maps."""
+
+        variants = _color_balance_texture_variants()
+        model = _model_with_variants(variants)
+        self.workspace._handle_generation_succeeded(
+            MeshyGenerationResult(
+                "color-balance-source-task",
+                variants.glb_by_resolution[1024],
+                "Color balance source",
+            ),
+            model,
+        )
+        return self.workspace.get_data().generated_objects[-1], variants
+
     def _replace_record(
         self,
         record: GeneratedObjectRecord,
@@ -2259,6 +2381,266 @@ class TextureRegenerationPipelineTests(unittest.TestCase):
             )
         )
         self.assertEqual(data_changed.count(), 1)
+
+    def test_object_color_balance_updates_every_base_variant_only(self) -> None:
+        original, _variants = self._seed_color_balance_object()
+        original_metadata = original.pipeline["texture_variants"]
+        original_base_pixels: dict[int, np.ndarray] = {}
+        original_scenes: dict[int, trimesh.Scene] = {}
+        original_pbr_paths: dict[int, dict[str, str]] = {}
+        original_pbr_bytes: dict[str, bytes] = {}
+        for resolution in TEXTURE_RESOLUTIONS:
+            metadata = original_metadata[str(resolution)]
+            original_base_pixels[resolution] = _read_rgba_png(
+                self.asset_directory / metadata["texture_asset_path"]
+            )
+            original_scenes[resolution] = trimesh.load(
+                self.asset_directory / metadata["glb_asset_path"],
+                file_type="glb",
+                force="scene",
+                process=False,
+            )
+            map_paths = metadata["map_texture_asset_paths"]
+            original_pbr_paths[resolution] = {
+                map_type: map_paths[map_type]
+                for map_type in (
+                    PBR_MAP_NORMAL,
+                    PBR_MAP_ROUGHNESS,
+                    PBR_MAP_METALLIC,
+                )
+            }
+            for path in original_pbr_paths[resolution].values():
+                original_pbr_bytes[path] = (
+                    self.asset_directory / path
+                ).read_bytes()
+        changed = QSignalSpy(self.workspace.generated_object_changed)
+        settings = TextureColorBalanceSettings(
+            shadows=ColorBalanceAdjustment(cyan_red=35),
+            midtones=ColorBalanceAdjustment(cyan_red=35),
+            highlights=ColorBalanceAdjustment(cyan_red=35),
+            preserve_luminosity=False,
+        )
+
+        self.assertTrue(
+            self.workspace.apply_object_texture_color_balance(
+                original.object_id,
+                settings,
+            )
+        )
+
+        adjusted = self.workspace.get_data().generated_objects[0]
+        adjusted_metadata = adjusted.pipeline["texture_variants"]
+        self.assertEqual(adjusted.pipeline["color_balance_revision_count"], 1)
+        self.assertEqual(changed.count(), 1)
+        for resolution in TEXTURE_RESOLUTIONS:
+            with self.subTest(resolution=resolution):
+                old_metadata = original_metadata[str(resolution)]
+                new_metadata = adjusted_metadata[str(resolution)]
+                self.assertNotEqual(
+                    new_metadata["texture_asset_path"],
+                    old_metadata["texture_asset_path"],
+                )
+                self.assertNotEqual(
+                    new_metadata["glb_asset_path"],
+                    old_metadata["glb_asset_path"],
+                )
+                self.assertEqual(
+                    new_metadata["map_texture_asset_paths"][
+                        ATLAS_MAP_BASE_COLOR
+                    ],
+                    new_metadata["texture_asset_path"],
+                )
+                self.assertEqual(
+                    {
+                        map_type: new_metadata["map_texture_asset_paths"][
+                            map_type
+                        ]
+                        for map_type in (
+                            PBR_MAP_NORMAL,
+                            PBR_MAP_ROUGHNESS,
+                            PBR_MAP_METALLIC,
+                        )
+                    },
+                    original_pbr_paths[resolution],
+                )
+                adjusted_pixels = _read_rgba_png(
+                    self.asset_directory / new_metadata["texture_asset_path"]
+                )
+                source_pixels = original_base_pixels[resolution]
+                self.assertGreater(
+                    np.count_nonzero(
+                        adjusted_pixels[..., :3] != source_pixels[..., :3]
+                    ),
+                    0,
+                )
+                np.testing.assert_array_equal(
+                    adjusted_pixels[..., 3],
+                    source_pixels[..., 3],
+                )
+
+                old_scene = original_scenes[resolution]
+                new_scene = trimesh.load(
+                    self.asset_directory / new_metadata["glb_asset_path"],
+                    file_type="glb",
+                    force="scene",
+                    process=False,
+                )
+                self.assertEqual(set(new_scene.geometry), set(old_scene.geometry))
+                for geometry_name, old_geometry in old_scene.geometry.items():
+                    new_geometry = new_scene.geometry[geometry_name]
+                    np.testing.assert_allclose(
+                        new_geometry.vertices,
+                        old_geometry.vertices,
+                    )
+                    np.testing.assert_array_equal(
+                        new_geometry.faces,
+                        old_geometry.faces,
+                    )
+                    np.testing.assert_allclose(
+                        new_geometry.visual.uv,
+                        old_geometry.visual.uv,
+                    )
+                    np.testing.assert_array_equal(
+                        np.asarray(
+                            new_geometry.visual.material.baseColorTexture.convert(
+                                "RGBA"
+                            ),
+                            dtype=np.uint8,
+                        ),
+                        adjusted_pixels,
+                    )
+                    for texture_attribute in (
+                        "normalTexture",
+                        "metallicRoughnessTexture",
+                    ):
+                        np.testing.assert_array_equal(
+                            np.asarray(
+                                getattr(
+                                    new_geometry.visual.material,
+                                    texture_attribute,
+                                ).convert("RGBA"),
+                                dtype=np.uint8,
+                            ),
+                            np.asarray(
+                                getattr(
+                                    old_geometry.visual.material,
+                                    texture_attribute,
+                                ).convert("RGBA"),
+                                dtype=np.uint8,
+                            ),
+                        )
+        for path, expected_bytes in original_pbr_bytes.items():
+            self.assertEqual(
+                (self.asset_directory / path).read_bytes(),
+                expected_bytes,
+            )
+
+    def test_object_color_balance_neutral_is_an_exact_no_op(self) -> None:
+        original, _variants = self._seed_color_balance_object()
+        original_paths = {
+            path.name: path.read_bytes()
+            for path in self.asset_directory.iterdir()
+        }
+        transition = Mock(return_value=True)
+        self.workspace.set_object_packing_change_handler(transition)
+
+        self.assertFalse(
+            self.workspace.apply_object_texture_color_balance(
+                original.object_id,
+                TextureColorBalanceSettings(),
+            )
+        )
+
+        self.assertEqual(self.workspace.get_data().generated_objects[0], original)
+        self.assertEqual(
+            {
+                path.name: path.read_bytes()
+                for path in self.asset_directory.iterdir()
+            },
+            original_paths,
+        )
+        transition.assert_not_called()
+
+    def test_object_color_balance_has_targeted_undo(self) -> None:
+        original, _variants = self._seed_color_balance_object()
+        settings = TextureColorBalanceSettings(
+            midtones=ColorBalanceAdjustment(
+                cyan_red=45,
+                magenta_green=-20,
+            ),
+            preserve_luminosity=False,
+        )
+
+        self.assertTrue(
+            self.workspace.apply_object_texture_color_balance(
+                original.object_id,
+                settings,
+            )
+        )
+        balanced = self.workspace.get_data().generated_objects[0]
+        balanced_paths = _record_variant_paths(balanced)
+        original_paths = _record_variant_paths(original)
+        created_paths = balanced_paths - original_paths
+        self.assertTrue(created_paths)
+
+        self.assertTrue(
+            self.workspace.undo_object_texture_color_balance(
+                original.object_id
+            )
+        )
+
+        restored = self.workspace.get_data().generated_objects[0]
+        self.assertEqual(restored, original)
+        self.assertTrue(
+            all(
+                self.asset_directory.joinpath(path).is_file()
+                for path in original_paths
+            )
+        )
+        self.assertTrue(
+            all(
+                not self.asset_directory.joinpath(path).exists()
+                for path in created_paths
+            )
+        )
+        self.assertFalse(
+            self.workspace.undo_object_texture_color_balance(
+                original.object_id
+            )
+        )
+        self.assertIn("no applied", self.workspace.status_label.text().lower())
+
+    def test_object_color_balance_rejection_rolls_back_files_and_state(
+        self,
+    ) -> None:
+        original, _variants = self._seed_color_balance_object()
+        original_files = {
+            path.name: path.read_bytes()
+            for path in self.asset_directory.iterdir()
+        }
+        original_model = self.workspace.result_view.model
+        transition = Mock(return_value=False)
+        self.workspace.set_object_packing_change_handler(transition)
+        settings = TextureColorBalanceSettings(
+            midtones=ColorBalanceAdjustment(magenta_green=42),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "Atlas could not commit"):
+            self.workspace.apply_object_texture_color_balance(
+                original.object_id,
+                settings,
+            )
+
+        self.assertEqual(self.workspace.get_data().generated_objects[0], original)
+        self.assertIs(self.workspace.result_view.model, original_model)
+        self.assertEqual(
+            {
+                path.name: path.read_bytes()
+                for path in self.asset_directory.iterdir()
+            },
+            original_files,
+        )
+        self.assertEqual(transition.call_count, 1)
 
     def test_legacy_camera_uv_metadata_is_preserved_but_not_activated(
         self,

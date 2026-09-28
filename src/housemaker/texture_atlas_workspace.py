@@ -5,11 +5,10 @@ import copy
 import math
 import os
 import tempfile
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Callable
 
 import numpy as np
 from PIL import Image
@@ -46,9 +45,11 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -107,6 +108,12 @@ from housemaker.texture_atlas_state import (
     TextureAtlasPlacement,
     TextureAtlasRecord,
     write_texture_atlas_png,
+)
+from housemaker.texture_color_balance import (
+    ColorBalanceAdjustment,
+    ColorBalanceTone,
+    TextureColorBalanceSettings,
+    apply_texture_color_balance_rgba,
 )
 
 # ### Constants ###
@@ -919,6 +926,10 @@ class TextureAtlasPreview(QWidget):
         self._atlas: TextureAtlasRecord | None = None
         self._sources: dict[str, AtlasObjectTextureSource] = {}
         self._source_preview_images: dict[str, QImage] = {}
+        self._color_balance_preview_source_id: str | None = None
+        self._color_balance_preview_settings: (
+            TextureColorBalanceSettings | None
+        ) = None
         self._surface_ao_image: QImage | None = None
         self._surface_ao_message = "No ambient occlusion bake yet"
         self._content_signature: tuple[object, ...] | None = None
@@ -1088,9 +1099,82 @@ class TextureAtlasPreview(QWidget):
         self._atlas = atlas
         self._sources = dict(sources)
         self._source_preview_images = source_preview_images
+        self._apply_color_balance_preview_override()
         self._content_signature = content_signature
         self._drag_slot_preview = None
         self.update()
+
+    def set_color_balance_preview(
+        self,
+        source_id: str,
+        settings: TextureColorBalanceSettings,
+    ) -> None:
+        """Display one transient base-color edit without changing its source."""
+
+        if self._map_type != ATLAS_MAP_BASE_COLOR:
+            return
+        normalized_source_id = str(source_id).strip()
+        if not normalized_source_id:
+            raise ValueError("A color-balance preview source ID cannot be empty.")
+        if not isinstance(settings, TextureColorBalanceSettings):
+            raise TypeError("Color-balance preview settings are required.")
+        if settings.is_neutral:
+            self.clear_color_balance_preview()
+            return
+        self._restore_color_balance_preview_source()
+        self._color_balance_preview_source_id = normalized_source_id
+        self._color_balance_preview_settings = settings
+        self._apply_color_balance_preview_override()
+        self.update()
+
+    def clear_color_balance_preview(self) -> None:
+        """Restore the immutable source thumbnail after a transient edit."""
+
+        if self._map_type != ATLAS_MAP_BASE_COLOR:
+            return
+        if self._color_balance_preview_source_id is None:
+            return
+        self._restore_color_balance_preview_source()
+        self._color_balance_preview_source_id = None
+        self._color_balance_preview_settings = None
+        self.update()
+
+    def _restore_color_balance_preview_source(self) -> None:
+        """Restore the currently overridden image from its source object."""
+
+        source_id = self._color_balance_preview_source_id
+        source = None if source_id is None else self._sources.get(source_id)
+        if source_id is not None and source is not None:
+            self._source_preview_images[source_id] = source.get_preview_image(
+                ATLAS_MAP_BASE_COLOR
+            )
+
+    def _apply_color_balance_preview_override(self) -> None:
+        """Rebuild the override from original pixels, never prior preview pixels."""
+
+        source_id = self._color_balance_preview_source_id
+        settings = self._color_balance_preview_settings
+        if (
+            self._map_type != ATLAS_MAP_BASE_COLOR
+            or source_id is None
+            or settings is None
+        ):
+            return
+        source = self._sources.get(source_id)
+        if source is None:
+            return
+        balanced_rgba = apply_texture_color_balance_rgba(
+            source.preview_rgba,
+            settings,
+        )
+        image = QImage(
+            balanced_rgba.data,
+            balanced_rgba.shape[1],
+            balanced_rgba.shape[0],
+            balanced_rgba.strides[0],
+            QImage.Format.Format_RGBA8888,
+        )
+        self._source_preview_images[source_id] = image.copy()
 
     def _set_surface_ambient_occlusion_content(
         self,
@@ -1944,6 +2028,17 @@ class TextureAtlasWorkspace(QWidget):
     source_remove_requested = Signal(str, str)
     surface_texture_delete_requested = Signal(str)
     surface_texture_fix_tiling_requested = Signal(str)
+    texture_color_balance_requested = Signal(
+        str,
+        str,
+        TextureColorBalanceSettings,
+    )
+    texture_color_balance_preview_requested = Signal(
+        str,
+        str,
+        TextureColorBalanceSettings,
+    )
+    texture_color_balance_preview_clear_requested = Signal()
     selected_atlas_changed = Signal(object)
     ambient_occlusion_bake_requested = Signal(str, float)
     ambient_occlusion_bake_all_requested = Signal()
@@ -2009,6 +2104,9 @@ class TextureAtlasWorkspace(QWidget):
             _AtlasStorageSizeCacheEntry,
         ] = {}
         self._active_source_kind: str | None = None
+        self._color_balance_editor_source_key: tuple[str, str] | None = None
+        self._pending_color_balance_settings = TextureColorBalanceSettings()
+        self._is_syncing_color_balance_controls = False
         self._last_published_source_selection: (
             tuple[str | None, tuple[str, ...], str | None] | None
         ) = None
@@ -4019,6 +4117,29 @@ class TextureAtlasWorkspace(QWidget):
         self.object_preview_requested.emit(object_id, resolution)
         return True
 
+    @staticmethod
+    def _build_color_balance_slider_row(
+        object_name: str,
+    ) -> tuple[QWidget, QSlider, QLabel]:
+        """Build one compact signed color-balance editor row."""
+
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setObjectName(object_name)
+        slider.setRange(-100, 100)
+        slider.setValue(0)
+        layout.addWidget(slider, 1)
+        value_label = QLabel("0")
+        value_label.setMinimumWidth(30)
+        value_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        layout.addWidget(value_label)
+        return row, slider, value_label
+
     def _build_ui(self) -> None:
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(12, 12, 12, 12)
@@ -4323,6 +4444,117 @@ class TextureAtlasWorkspace(QWidget):
         source_action_buttons.addWidget(self.delete_surface_texture_button)
         texture_column_layout.addLayout(source_action_buttons)
 
+        self.color_balance_group = QGroupBox("Color balance")
+        self.color_balance_group.setObjectName(
+            "texture_atlas_color_balance_group"
+        )
+        color_balance_layout = QFormLayout(self.color_balance_group)
+        color_balance_layout.setContentsMargins(8, 8, 8, 8)
+        color_balance_layout.setHorizontalSpacing(8)
+        color_balance_layout.setVerticalSpacing(4)
+
+        self.color_balance_tone_combo = QComboBox()
+        self.color_balance_tone_combo.setObjectName(
+            "texture_atlas_color_balance_tone_combo"
+        )
+        for tone, label in (
+            (ColorBalanceTone.SHADOWS, "Shadows"),
+            (ColorBalanceTone.MIDTONES, "Midtones"),
+            (ColorBalanceTone.HIGHLIGHTS, "Highlights"),
+        ):
+            self.color_balance_tone_combo.addItem(label, tone)
+        self.color_balance_tone_combo.setCurrentIndex(
+            self.color_balance_tone_combo.findData(ColorBalanceTone.MIDTONES)
+        )
+        self.color_balance_tone_combo.currentIndexChanged.connect(
+            self._sync_color_balance_tone_controls
+        )
+        color_balance_layout.addRow("Tone", self.color_balance_tone_combo)
+
+        (
+            cyan_red_row,
+            self.color_balance_cyan_red_slider,
+            self.color_balance_cyan_red_value_label,
+        ) = self._build_color_balance_slider_row(
+            "texture_atlas_color_balance_cyan_red_slider"
+        )
+        self.color_balance_cyan_red_slider.valueChanged.connect(
+            lambda value: self._handle_color_balance_channel_changed(
+                "cyan_red",
+                value,
+            )
+        )
+        color_balance_layout.addRow("Cyan / Red", cyan_red_row)
+
+        (
+            magenta_green_row,
+            self.color_balance_magenta_green_slider,
+            self.color_balance_magenta_green_value_label,
+        ) = self._build_color_balance_slider_row(
+            "texture_atlas_color_balance_magenta_green_slider"
+        )
+        self.color_balance_magenta_green_slider.valueChanged.connect(
+            lambda value: self._handle_color_balance_channel_changed(
+                "magenta_green",
+                value,
+            )
+        )
+        color_balance_layout.addRow("Magenta / Green", magenta_green_row)
+
+        (
+            yellow_blue_row,
+            self.color_balance_yellow_blue_slider,
+            self.color_balance_yellow_blue_value_label,
+        ) = self._build_color_balance_slider_row(
+            "texture_atlas_color_balance_yellow_blue_slider"
+        )
+        self.color_balance_yellow_blue_slider.valueChanged.connect(
+            lambda value: self._handle_color_balance_channel_changed(
+                "yellow_blue",
+                value,
+            )
+        )
+        color_balance_layout.addRow("Yellow / Blue", yellow_blue_row)
+
+        self.color_balance_preserve_luminosity_checkbox = QCheckBox(
+            "Preserve luminosity"
+        )
+        self.color_balance_preserve_luminosity_checkbox.setObjectName(
+            "texture_atlas_color_balance_preserve_luminosity_checkbox"
+        )
+        self.color_balance_preserve_luminosity_checkbox.setChecked(True)
+        self.color_balance_preserve_luminosity_checkbox.toggled.connect(
+            self._handle_color_balance_preserve_luminosity_changed
+        )
+        color_balance_layout.addRow(
+            "",
+            self.color_balance_preserve_luminosity_checkbox,
+        )
+
+        color_balance_action_row = QHBoxLayout()
+        self.color_balance_reset_button = QPushButton("Reset")
+        self.color_balance_reset_button.setObjectName(
+            "texture_atlas_color_balance_reset_button"
+        )
+        self.color_balance_reset_button.clicked.connect(
+            self._reset_pending_color_balance_settings
+        )
+        color_balance_action_row.addWidget(self.color_balance_reset_button)
+        self.color_balance_apply_button = QPushButton("Apply")
+        self.color_balance_apply_button.setObjectName(
+            "texture_atlas_color_balance_apply_button"
+        )
+        self.color_balance_apply_button.setToolTip(
+            "Apply the pending color balance to the selected texture's base "
+            "color while retaining its alpha and PBR maps."
+        )
+        self.color_balance_apply_button.clicked.connect(
+            self._request_selected_texture_color_balance
+        )
+        color_balance_action_row.addWidget(self.color_balance_apply_button)
+        color_balance_layout.addRow("", color_balance_action_row)
+        texture_column_layout.addWidget(self.color_balance_group)
+
         texture_column_layout.addWidget(QLabel("3D preview"))
         self.object_preview_container = QWidget()
         self.object_preview_container.setObjectName("texture_atlas_embedded_3d_preview")
@@ -4433,6 +4665,230 @@ class TextureAtlasWorkspace(QWidget):
         self.status_label.setObjectName("texture_atlas_status_label")
         self.status_label.setWordWrap(True)
         root_layout.addWidget(self.status_label)
+
+    # ### Color-balance controls ###
+    def _active_color_balance_tone(self) -> ColorBalanceTone:
+        """Return the tone range currently shown by the compact editor."""
+
+        tone = self.color_balance_tone_combo.currentData()
+        if isinstance(tone, ColorBalanceTone):
+            return tone
+        try:
+            return ColorBalanceTone(str(tone))
+        except ValueError:
+            return ColorBalanceTone.MIDTONES
+
+    def _sync_color_balance_editor(self) -> None:
+        """Enable and reset the editor when its active texture changes."""
+
+        source_id = self._selected_object_id()
+        source_kind = self._active_source_kind
+        source = self._selected_object_source()
+        source_key = (
+            (source_kind, source_id)
+            if source_kind in {"object", "surface"}
+            and source_id is not None
+            and source is not None
+            else None
+        )
+        if source_key != self._color_balance_editor_source_key:
+            if self._color_balance_editor_source_key is not None:
+                self._clear_color_balance_preview()
+            self._color_balance_editor_source_key = source_key
+            self._pending_color_balance_settings = TextureColorBalanceSettings()
+            was_syncing = self._is_syncing_color_balance_controls
+            self._is_syncing_color_balance_controls = True
+            try:
+                self.color_balance_tone_combo.setCurrentIndex(
+                    self.color_balance_tone_combo.findData(
+                        ColorBalanceTone.MIDTONES
+                    )
+                )
+            finally:
+                self._is_syncing_color_balance_controls = was_syncing
+            self._sync_color_balance_editor_controls()
+        self.color_balance_group.setEnabled(source_key is not None)
+
+    def _sync_color_balance_editor_controls(self) -> None:
+        """Reflect all pending values without treating them as user edits."""
+
+        was_syncing = self._is_syncing_color_balance_controls
+        self._is_syncing_color_balance_controls = True
+        try:
+            self.color_balance_preserve_luminosity_checkbox.setChecked(
+                self._pending_color_balance_settings.preserve_luminosity
+            )
+            self._sync_color_balance_tone_controls()
+        finally:
+            self._is_syncing_color_balance_controls = was_syncing
+
+    def _sync_color_balance_tone_controls(self, _index: int = -1) -> None:
+        """Display the three retained values for the selected tone range."""
+
+        adjustment = getattr(
+            self._pending_color_balance_settings,
+            self._active_color_balance_tone().value,
+        )
+        was_syncing = self._is_syncing_color_balance_controls
+        self._is_syncing_color_balance_controls = True
+        try:
+            for slider, label, value in (
+                (
+                    self.color_balance_cyan_red_slider,
+                    self.color_balance_cyan_red_value_label,
+                    adjustment.cyan_red,
+                ),
+                (
+                    self.color_balance_magenta_green_slider,
+                    self.color_balance_magenta_green_value_label,
+                    adjustment.magenta_green,
+                ),
+                (
+                    self.color_balance_yellow_blue_slider,
+                    self.color_balance_yellow_blue_value_label,
+                    adjustment.yellow_blue,
+                ),
+            ):
+                slider.setValue(value)
+                label.setText("0" if value == 0 else f"{value:+d}")
+        finally:
+            self._is_syncing_color_balance_controls = was_syncing
+
+    def _handle_color_balance_channel_changed(
+        self,
+        channel_name: str,
+        value: int,
+    ) -> None:
+        """Retain one signed channel value in the active tone range."""
+
+        normalized_value = max(-100, min(100, int(value)))
+        labels = {
+            "cyan_red": self.color_balance_cyan_red_value_label,
+            "magenta_green": self.color_balance_magenta_green_value_label,
+            "yellow_blue": self.color_balance_yellow_blue_value_label,
+        }
+        label = labels.get(channel_name)
+        if label is None:
+            raise ValueError("Unknown color-balance channel.")
+        label.setText(
+            "0" if normalized_value == 0 else f"{normalized_value:+d}"
+        )
+        if self._is_syncing_color_balance_controls:
+            return
+        tone = self._active_color_balance_tone()
+        current_adjustment = getattr(
+            self._pending_color_balance_settings,
+            tone.value,
+        )
+        next_adjustment = ColorBalanceAdjustment(
+            cyan_red=(
+                normalized_value
+                if channel_name == "cyan_red"
+                else current_adjustment.cyan_red
+            ),
+            magenta_green=(
+                normalized_value
+                if channel_name == "magenta_green"
+                else current_adjustment.magenta_green
+            ),
+            yellow_blue=(
+                normalized_value
+                if channel_name == "yellow_blue"
+                else current_adjustment.yellow_blue
+            ),
+        )
+        self._pending_color_balance_settings = replace(
+            self._pending_color_balance_settings,
+            **{tone.value: next_adjustment},
+        )
+        self._publish_color_balance_preview()
+
+    def _handle_color_balance_preserve_luminosity_changed(
+        self,
+        checked: bool,
+    ) -> None:
+        """Retain the pending luminosity policy without touching source pixels."""
+
+        if self._is_syncing_color_balance_controls:
+            return
+        self._pending_color_balance_settings = replace(
+            self._pending_color_balance_settings,
+            preserve_luminosity=bool(checked),
+        )
+        self._publish_color_balance_preview()
+
+    def _reset_pending_color_balance_settings(self) -> None:
+        """Restore every tone range to its neutral pending values."""
+
+        self._pending_color_balance_settings = TextureColorBalanceSettings()
+        self._sync_color_balance_editor_controls()
+        self._clear_color_balance_preview()
+
+    def _publish_color_balance_preview(self) -> None:
+        """Publish and paint the current non-destructive base-color preview."""
+
+        source_key = self._color_balance_editor_source_key
+        settings = self._pending_color_balance_settings
+        if source_key is None or settings.is_neutral:
+            self._clear_color_balance_preview()
+            return
+        source_kind, source_id = source_key
+        if self._selected_object_source() is None:
+            self._clear_color_balance_preview()
+            return
+        for preview in self.map_previews.values():
+            preview.set_color_balance_preview(source_id, settings)
+        self.texture_color_balance_preview_requested.emit(
+            source_kind,
+            source_id,
+            settings,
+        )
+
+    def _clear_color_balance_preview(self) -> None:
+        """Clear every transient image/model preview without changing files."""
+
+        for preview in self.map_previews.values():
+            preview.clear_color_balance_preview()
+        self.texture_color_balance_preview_clear_requested.emit()
+
+    def complete_texture_color_balance_edit(
+        self,
+        source_kind: str,
+        source_id: str,
+    ) -> None:
+        """Finish a successful commit without applying its preview twice."""
+
+        source_key = (
+            str(source_kind).strip().lower(),
+            str(source_id).strip(),
+        )
+        if source_key != self._color_balance_editor_source_key:
+            return
+        self._pending_color_balance_settings = TextureColorBalanceSettings()
+        self._sync_color_balance_editor_controls()
+        self._clear_color_balance_preview()
+
+    def refresh_texture_color_balance_preview(self) -> None:
+        """Re-publish a retained preview after the 3D view was rebuilt."""
+
+        self._publish_color_balance_preview()
+
+    def _request_selected_texture_color_balance(self) -> None:
+        """Publish one immutable edit request for the active texture source."""
+
+        source_id = self._selected_object_id()
+        source_kind = self._active_source_kind
+        if (
+            source_kind not in {"object", "surface"}
+            or source_id is None
+            or self._selected_object_source() is None
+        ):
+            return
+        self.texture_color_balance_requested.emit(
+            source_kind,
+            source_id,
+            self._pending_color_balance_settings,
+        )
 
     def _handle_active_preview_map_changed(self, _index: int) -> None:
         """Publish the active material-map tab for external 3D previews."""
@@ -6023,6 +6479,7 @@ class TextureAtlasWorkspace(QWidget):
         )
         self._apply_fix_tiling_button_attention()
         self._sync_surface_repeat_size_editor()
+        self._sync_color_balance_editor()
 
     def _sync_surface_repeat_size_editor(self) -> None:
         """Reflect the selected assignment without publishing programmatic edits."""

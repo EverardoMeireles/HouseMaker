@@ -6,29 +6,30 @@ import unittest
 from unittest.mock import Mock, call, patch
 
 import numpy as np
-from OpenGL import GL
 import pyqtgraph.opengl as gl
 import trimesh
+from OpenGL import GL
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 # ### Imports ###
+from PIL import Image
 from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
 from PySide6.QtGui import QFocusEvent, QKeyEvent, QVector3D
 from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import QApplication, QPushButton
-from PIL import Image
 from trimesh.visual.material import MultiMaterial, PBRMaterial
 from trimesh.visual.texture import TextureVisuals
 
-from housemaker.camera_models import CameraPose
 from housemaker.camera_indicators import INDICATOR_SELECTED_COLOR
+from housemaker.camera_models import CameraPose
 from housemaker.first_person_navigation import (
     DEFAULT_FIRST_PERSON_NAVIGATION_MODE,
     FIRST_PERSON_NAVIGATION_MODE_GRAVITY,
     FIRST_PERSON_NAVIGATION_MODE_NOCLIP,
 )
+from housemaker.glass_material import build_housemaker_glass_material
 from housemaker.glb import (
     GeneratedModel,
     PreviewPlacedObject,
@@ -36,11 +37,14 @@ from housemaker.glb import (
     PreviewTexturedWall,
     import_generated_glb,
 )
-from housemaker.glass_material import build_housemaker_glass_material
 from housemaker.object_texture_variants import (
     PBR_MAP_METALLIC,
     PBR_MAP_NORMAL,
     PBR_MAP_ROUGHNESS,
+)
+from housemaker.texture_color_balance import (
+    ColorBalanceAdjustment,
+    TextureColorBalanceSettings,
 )
 from housemaker.unused_face_removal import ALL_CAMERA_IDS
 from housemaker.viewer import (
@@ -369,6 +373,243 @@ class GlbViewerRenderingTests(unittest.TestCase):
         ]
         self.assertEqual(len(glass_items), 1)
         self.assertFalse(glass_items[0]._double_sided)
+
+    def test_color_balance_preview_reaches_future_model_and_mirror_items(
+        self,
+    ) -> None:
+        viewer = self._build_viewer()
+        settings = TextureColorBalanceSettings(
+            shadows=ColorBalanceAdjustment(cyan_red=-20),
+            midtones=ColorBalanceAdjustment(
+                magenta_green=35,
+                yellow_blue=-15,
+            ),
+            highlights=ColorBalanceAdjustment(cyan_red=10),
+            preserve_luminosity=False,
+        )
+
+        viewer.set_texture_color_balance_preview(settings)
+        viewer.set_model(
+            _build_mixed_prefab_glass_model(double_sided=False)
+        )
+        viewer.set_symmetric_division_preview("vertical", 0.0)
+
+        textured_items = viewer._iter_textured_mesh_items()
+        self.assertGreaterEqual(len(textured_items), 4)
+        opaque_items = [
+            item for item in textured_items if not item._is_prefab_glass
+        ]
+        glass_items = [
+            item for item in textured_items if item._is_prefab_glass
+        ]
+        self.assertTrue(opaque_items)
+        self.assertTrue(glass_items)
+        self.assertTrue(
+            all(
+                item._color_balance_preview_settings == settings
+                for item in opaque_items
+            )
+        )
+        self.assertTrue(
+            all(
+                item._color_balance_preview_settings.is_neutral
+                for item in glass_items
+            )
+        )
+
+        viewer.set_texture_color_balance_preview(None)
+
+        self.assertTrue(
+            all(
+                item._color_balance_preview_settings.is_neutral
+                for item in opaque_items
+            )
+        )
+
+    def test_color_balance_preview_does_not_mutate_texture_or_pbr_pixels(
+        self,
+    ) -> None:
+        model = _build_generated_model(textured=True)
+        normal_pixels = np.full(
+            (2, 2, 4),
+            (128, 128, 255, 255),
+            dtype=np.uint8,
+        )
+        model.mesh.visual.material.normalTexture = Image.fromarray(
+            normal_pixels,
+            mode="RGBA",
+        )
+        viewer = self._build_viewer()
+        viewer.set_model(model)
+        assert viewer.textured_mesh_item is not None
+        textured_item = viewer.textured_mesh_item
+        original_base = textured_item._texture_rgba.copy()
+        original_normal = textured_item._normal_texture_rgba.copy()
+
+        viewer.set_texture_color_balance_preview(
+            TextureColorBalanceSettings(
+                midtones=ColorBalanceAdjustment(
+                    cyan_red=80,
+                    magenta_green=-40,
+                    yellow_blue=25,
+                )
+            )
+        )
+
+        np.testing.assert_array_equal(textured_item._texture_rgba, original_base)
+        np.testing.assert_array_equal(
+            textured_item._normal_texture_rgba,
+            original_normal,
+        )
+
+    def test_selected_placed_object_color_balance_preview_is_scoped_and_cleared(
+        self,
+    ) -> None:
+        model = _build_generated_model(textured=True)
+        model.preview_base_mesh = model.mesh
+        model.preview_textured_surfaces = [
+            PreviewTexturedSurface(
+                surface_id="floor-one",
+                surface_type="floor",
+                mesh=model.mesh.copy(),
+            )
+        ]
+        model.preview_placed_objects = [
+            PreviewPlacedObject(
+                object_id="selected-object",
+                meshes=(model.mesh.copy(),),
+                placement_transform=np.eye(4, dtype=float),
+                world_position=(0.0, 0.0, 0.0),
+                rotation_degrees=(0.0, 0.0, 0.0),
+                symmetric_preview_orientation="vertical",
+                symmetric_preview_plane_coordinate=0.5,
+            ),
+            PreviewPlacedObject(
+                object_id="other-object",
+                meshes=(model.mesh.copy(),),
+                placement_transform=np.eye(4, dtype=float),
+                world_position=(2.0, 0.0, 0.0),
+                rotation_degrees=(0.0, 0.0, 0.0),
+            ),
+        ]
+        viewer = self._build_viewer(window_editing_enabled=True)
+        viewer.set_model(model)
+        self.assertTrue(
+            viewer.set_selected_placed_object_ids(("selected-object",))
+        )
+        settings = TextureColorBalanceSettings(
+            shadows=ColorBalanceAdjustment(cyan_red=-35),
+            highlights=ColorBalanceAdjustment(yellow_blue=45),
+        )
+
+        self.assertTrue(
+            viewer.set_placed_object_texture_color_balance_preview(
+                "selected-object",
+                settings,
+            )
+        )
+
+        selected_group = viewer._placed_object_render_groups["selected-object"]
+        selected_items = [
+            part.textured_item for part in selected_group.retained_parts
+        ] + [
+            group.textured_item for group in selected_group.symmetric_groups
+        ]
+        self.assertTrue(selected_group.symmetric_groups)
+        self.assertTrue(
+            all(
+                item is not None
+                and item._color_balance_preview_settings == settings
+                for item in selected_items
+            )
+        )
+        other_items = viewer._iter_placed_object_textured_mesh_items(
+            "other-object"
+        )
+        self.assertTrue(other_items)
+        self.assertTrue(
+            all(
+                item._color_balance_preview_settings.is_neutral
+                for item in other_items
+            )
+        )
+        self.assertTrue(viewer.textured_surface_items)
+        self.assertTrue(
+            all(
+                item._color_balance_preview_settings.is_neutral
+                for item in viewer.textured_surface_items
+            )
+        )
+
+        self.assertTrue(viewer.set_selected_placed_object_ids(()))
+
+        self.assertTrue(
+            all(
+                item is not None
+                and item._color_balance_preview_settings.is_neutral
+                for item in selected_items
+            )
+        )
+        self.assertIsNone(
+            viewer._placed_object_color_balance_preview_object_id
+        )
+
+    def test_missing_placed_object_drops_color_balance_preview_across_rebuilds(
+        self,
+    ) -> None:
+        placed_model = _build_generated_model(textured=True)
+        placed_model.preview_base_mesh = placed_model.mesh
+        placed_model.preview_placed_objects = [
+            PreviewPlacedObject(
+                object_id="temporary-object",
+                meshes=(placed_model.mesh.copy(),),
+                placement_transform=np.eye(4, dtype=float),
+                world_position=(0.0, 0.0, 0.0),
+                rotation_degrees=(0.0, 0.0, 0.0),
+            )
+        ]
+        empty_model = _build_generated_model(textured=True)
+        empty_model.preview_base_mesh = empty_model.mesh
+        viewer = self._build_viewer(window_editing_enabled=True)
+        viewer.set_model(placed_model)
+        self.assertTrue(
+            viewer.set_selected_placed_object_ids(("temporary-object",))
+        )
+        settings = TextureColorBalanceSettings(
+            midtones=ColorBalanceAdjustment(cyan_red=55),
+        )
+        self.assertTrue(
+            viewer.set_placed_object_texture_color_balance_preview(
+                "temporary-object",
+                settings,
+            )
+        )
+
+        viewer.set_model(empty_model)
+
+        self.assertEqual(viewer.get_selected_placed_object_ids(), ())
+        self.assertIsNone(
+            viewer._placed_object_color_balance_preview_object_id
+        )
+        self.assertTrue(
+            viewer._placed_object_color_balance_preview_settings.is_neutral
+        )
+
+        viewer.set_model(placed_model)
+        self.assertTrue(
+            viewer.set_selected_placed_object_ids(("temporary-object",))
+        )
+
+        reintroduced_items = viewer._iter_placed_object_textured_mesh_items(
+            "temporary-object"
+        )
+        self.assertTrue(reintroduced_items)
+        self.assertTrue(
+            all(
+                item._color_balance_preview_settings.is_neutral
+                for item in reintroduced_items
+            )
+        )
 
     def test_pbr_map_state_updates_all_textured_preview_kinds(self) -> None:
         model = _build_generated_model(textured=True)

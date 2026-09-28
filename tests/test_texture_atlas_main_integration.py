@@ -75,6 +75,10 @@ from housemaker.texture_atlas_workspace import (
     build_atlas_wall_texture_source_id,
     build_texture_atlas_map_image_relative_path,
 )
+from housemaker.texture_color_balance import (
+    ColorBalanceAdjustment,
+    TextureColorBalanceSettings,
+)
 
 # ### Test application ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -4565,6 +4569,396 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             "dispatch-wall", method=SURFACE_TILING_MODE_EDGE_VARIANTS
         )
         thread_type.return_value.start.assert_called_once_with()
+
+    def test_atlas_object_color_balance_signal_uses_generation_and_refreshes(
+        self,
+    ) -> None:
+        settings = TextureColorBalanceSettings(
+            midtones=ColorBalanceAdjustment(cyan_red=30),
+        )
+        self.workspace._atlas_generation_signature = ("stale",)
+
+        with (
+            patch.object(
+                self.workspace.generation,
+                "apply_object_texture_color_balance",
+                return_value=True,
+            ) as apply_balance,
+            patch.object(
+                self.workspace,
+                "_sync_atlas_object_texture_sources",
+            ) as sync_sources,
+            patch.object(
+                self.workspace,
+                "_schedule_viewer_preview_refresh",
+            ) as refresh_scene,
+            patch.object(
+                self.workspace,
+                "_request_hosted_atlas_object_preview",
+            ) as refresh_preview,
+        ):
+            self.workspace.texture_atlas_workspace \
+                .texture_color_balance_requested.emit(
+                    "object",
+                    "balanced-object",
+                    settings,
+                )
+
+        apply_balance.assert_called_once_with("balanced-object", settings)
+        sync_sources.assert_called_once_with(
+            automatically_assign_scene_textures=False
+        )
+        refresh_scene.assert_called_once_with(preserve_camera=True)
+        refresh_preview.assert_called_once_with()
+        self.assertIsNone(self.workspace._atlas_generation_signature)
+        self.assertIn(
+            "Applied color balance",
+            self.workspace.texture_atlas_workspace.status_label.text(),
+        )
+
+    def test_atlas_color_balance_preview_updates_only_matching_3d_model(
+        self,
+    ) -> None:
+        settings = TextureColorBalanceSettings(
+            shadows=ColorBalanceAdjustment(cyan_red=-25),
+            midtones=ColorBalanceAdjustment(magenta_green=35),
+        )
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        self.workspace._atlas_preview_variant_key = (
+            "preview-object",
+            512,
+            "file-revision",
+        )
+
+        with (
+            patch.object(
+                self.workspace.atlas_object_preview_viewer,
+                "set_texture_color_balance_preview",
+            ) as set_preview,
+            patch.object(
+                self.workspace.viewer,
+                "get_selected_placed_object_ids",
+                return_value=("preview-object",),
+            ),
+            patch.object(
+                self.workspace.viewer,
+                "set_placed_object_texture_color_balance_preview",
+            ) as set_scene_preview,
+        ):
+            atlas_workspace.texture_color_balance_preview_requested.emit(
+                "object",
+                "preview-object",
+                settings,
+            )
+            atlas_workspace.texture_color_balance_preview_requested.emit(
+                "object",
+                "different-object",
+                settings,
+            )
+            atlas_workspace.texture_color_balance_preview_clear_requested.emit()
+
+        self.assertEqual(
+            set_preview.call_args_list,
+            [call(settings), call(None)],
+        )
+        self.assertEqual(
+            set_scene_preview.call_args_list,
+            [
+                call("preview-object", settings),
+                call(None, None),
+                call(None, None),
+            ],
+        )
+
+    def test_atlas_color_balance_does_not_preview_an_unselected_scene_object(
+        self,
+    ) -> None:
+        settings = TextureColorBalanceSettings(
+            midtones=ColorBalanceAdjustment(magenta_green=20),
+        )
+        self.workspace._atlas_preview_variant_key = (
+            "preview-object",
+            512,
+            "file-revision",
+        )
+
+        with (
+            patch.object(
+                self.workspace.viewer,
+                "get_selected_placed_object_ids",
+                return_value=("other-object",),
+            ),
+            patch.object(
+                self.workspace.viewer,
+                "set_placed_object_texture_color_balance_preview",
+            ) as set_scene_preview,
+        ):
+            self.workspace.texture_atlas_workspace \
+                .texture_color_balance_preview_requested.emit(
+                    "object",
+                    "preview-object",
+                    settings,
+                )
+
+        set_scene_preview.assert_called_once_with(None, None)
+
+    def test_scene_color_balance_preview_does_not_require_embedded_preview(
+        self,
+    ) -> None:
+        settings = TextureColorBalanceSettings(
+            highlights=ColorBalanceAdjustment(yellow_blue=-30),
+        )
+        atlas_workspace = self.workspace.texture_atlas_workspace
+
+        for preview_key in (
+            None,
+            ("different-object", 512, "file-revision"),
+        ):
+            with self.subTest(preview_key=preview_key):
+                self.workspace._atlas_preview_variant_key = preview_key
+                with (
+                    patch.object(
+                        self.workspace.viewer,
+                        "get_selected_placed_object_ids",
+                        return_value=("selected-object",),
+                    ),
+                    patch.object(
+                        self.workspace.viewer,
+                        "set_placed_object_texture_color_balance_preview",
+                    ) as set_scene_preview,
+                    patch.object(
+                        self.workspace.atlas_object_preview_viewer,
+                        "set_texture_color_balance_preview",
+                    ) as set_embedded_preview,
+                ):
+                    atlas_workspace.texture_color_balance_preview_requested.emit(
+                        "object",
+                        "selected-object",
+                        settings,
+                    )
+
+                set_scene_preview.assert_called_once_with(
+                    "selected-object",
+                    settings,
+                )
+                set_embedded_preview.assert_not_called()
+
+    def test_atlas_ctrl_z_routes_object_color_balance_to_targeted_undo(
+        self,
+    ) -> None:
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        atlas_workspace._active_source_kind = "object"
+        self.workspace.generation.status_label.setText(
+            "Undid texture color balance: Chair."
+        )
+
+        with (
+            patch.object(
+                atlas_workspace,
+                "_selected_object_id",
+                return_value="balanced-object",
+            ),
+            patch.object(
+                self.workspace.generation,
+                "undo_object_texture_color_balance",
+                return_value=True,
+            ) as undo_balance,
+            patch.object(
+                atlas_workspace,
+                "complete_texture_color_balance_edit",
+            ) as complete_edit,
+            patch.object(
+                self.workspace,
+                "_request_hosted_atlas_object_preview",
+            ) as refresh_preview,
+            patch.object(
+                self.workspace,
+                "_handle_canvas_undo_requested",
+            ) as canvas_undo,
+        ):
+            self.workspace._handle_atlas_undo_requested()
+
+        undo_balance.assert_called_once_with("balanced-object")
+        complete_edit.assert_called_once_with("object", "balanced-object")
+        refresh_preview.assert_called_once_with()
+        canvas_undo.assert_not_called()
+        self.assertIn(
+            "Undid texture color balance",
+            atlas_workspace.status_label.text(),
+        )
+
+    def test_atlas_surface_color_balance_updates_atlas_and_undoes(self) -> None:
+        surface_asset_directory = self.settings.path.parent / "surface_textures"
+        assignment = _wall_texture_assignment(
+            surface_asset_directory,
+            assignment_id="color-balanced-wall",
+        )
+        surface_workspace = self.workspace.surface_texture_generation
+        surface_workspace.set_data(SurfaceTextureData(assignments=[assignment]))
+        self.workspace._atlas_generation_signature = None
+        self.workspace._sync_atlas_object_texture_sources(
+            automatically_assign_scene_textures=False
+        )
+
+        source_id = build_atlas_wall_texture_source_id(
+            assignment.assignment_id
+        )
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        source = atlas_workspace._sources_by_object_id[source_id]
+        atlas_data = TextureAtlasData()
+        atlas = atlas_data.create_atlas(
+            "Color balance transaction",
+            2048,
+            atlas_id="color-balance-transaction",
+        )
+        atlas_data.assign_object(
+            atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+        )
+        atlas_workspace.set_data(atlas_data)
+        self.assertEqual(atlas_workspace.materialize_missing_atlases(), 1)
+
+        original_atlas = atlas_workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert original_atlas is not None
+        original_placement = original_atlas.placement_for_object(source_id)
+        assert original_placement is not None
+        original_texture_path = surface_asset_directory / assignment.asset_path
+        original_texture_payload = original_texture_path.read_bytes()
+        settings = TextureColorBalanceSettings(
+            midtones=ColorBalanceAdjustment(cyan_red=45),
+            preserve_luminosity=False,
+        )
+
+        atlas_workspace.texture_color_balance_requested.emit(
+            "surface",
+            source_id,
+            settings,
+        )
+
+        balanced_assignment = surface_workspace.get_assignment(
+            assignment.assignment_id
+        )
+        assert balanced_assignment is not None
+        self.assertNotEqual(balanced_assignment.asset_path, assignment.asset_path)
+        balanced_texture_path = (
+            surface_asset_directory / balanced_assignment.asset_path
+        )
+        self.assertTrue(balanced_texture_path.is_file())
+        self.assertNotEqual(
+            balanced_texture_path.read_bytes(),
+            original_texture_payload,
+        )
+        self.assertEqual(original_texture_path.read_bytes(), original_texture_payload)
+        balanced_atlas = atlas_workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert balanced_atlas is not None
+        balanced_placement = balanced_atlas.placement_for_object(source_id)
+        assert balanced_placement is not None
+        self.assertNotEqual(
+            balanced_placement.texture_path,
+            original_placement.texture_path,
+        )
+        self.assertEqual(len(self.workspace._canvas_undo_stack), 1)
+        self.assertIn("Press Ctrl+Z", atlas_workspace.status_label.text())
+
+        self.workspace._handle_canvas_undo_requested()
+
+        self.assertEqual(
+            surface_workspace.get_assignment(assignment.assignment_id),
+            assignment,
+        )
+        restored_atlas = atlas_workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert restored_atlas is not None
+        restored_placement = restored_atlas.placement_for_object(source_id)
+        assert restored_placement is not None
+        self.assertEqual(
+            restored_placement.to_dict(),
+            original_placement.to_dict(),
+        )
+        self.assertFalse(balanced_texture_path.exists())
+        self.assertEqual(original_texture_path.read_bytes(), original_texture_payload)
+        self.assertEqual(self.workspace._canvas_undo_stack, [])
+
+    def test_atlas_surface_color_balance_failure_rolls_back_revision(self) -> None:
+        surface_asset_directory = self.settings.path.parent / "surface_textures"
+        assignment = _wall_texture_assignment(
+            surface_asset_directory,
+            assignment_id="color-balance-rollback",
+        )
+        surface_workspace = self.workspace.surface_texture_generation
+        surface_workspace.set_data(SurfaceTextureData(assignments=[assignment]))
+        self.workspace._atlas_generation_signature = None
+        self.workspace._sync_atlas_object_texture_sources(
+            automatically_assign_scene_textures=False
+        )
+
+        source_id = build_atlas_wall_texture_source_id(
+            assignment.assignment_id
+        )
+        atlas_workspace = self.workspace.texture_atlas_workspace
+        source = atlas_workspace._sources_by_object_id[source_id]
+        atlas_data = TextureAtlasData()
+        atlas = atlas_data.create_atlas(
+            "Color balance rollback",
+            2048,
+            atlas_id="color-balance-rollback",
+        )
+        atlas_data.assign_object(
+            atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+        )
+        atlas_workspace.set_data(atlas_data)
+        self.assertEqual(atlas_workspace.materialize_missing_atlases(), 1)
+        before_data = atlas_workspace.get_data().to_dict()
+        before_files = {
+            path.name: path.read_bytes()
+            for path in surface_asset_directory.iterdir()
+            if path.is_file()
+        }
+        atlas_path = (
+            self.settings.path.parent
+            / "texture_atlases"
+            / f"{atlas.atlas_id}.png"
+        )
+        before_atlas_payload = atlas_path.read_bytes()
+        settings = TextureColorBalanceSettings(
+            highlights=ColorBalanceAdjustment(yellow_blue=40),
+            preserve_luminosity=False,
+        )
+
+        with patch.object(
+            atlas_workspace,
+            "_materialize_atlas",
+            side_effect=ValueError("forced Atlas failure"),
+        ):
+            atlas_workspace.texture_color_balance_requested.emit(
+                "surface",
+                source_id,
+                settings,
+            )
+
+        self.assertEqual(
+            surface_workspace.get_assignment(assignment.assignment_id),
+            assignment,
+        )
+        self.assertEqual(atlas_workspace.get_data().to_dict(), before_data)
+        self.assertEqual(atlas_path.read_bytes(), before_atlas_payload)
+        self.assertEqual(
+            {
+                path.name: path.read_bytes()
+                for path in surface_asset_directory.iterdir()
+                if path.is_file()
+            },
+            before_files,
+        )
+        self.assertEqual(self.workspace._canvas_undo_stack, [])
+        self.assertIn(
+            "existing texture was kept",
+            atlas_workspace.status_label.text(),
+        )
 
     def test_surface_ao_snapshot_preserves_tiling_material_spec(self) -> None:
         assignment = replace(

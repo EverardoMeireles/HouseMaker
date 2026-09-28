@@ -271,6 +271,7 @@ from housemaker.surface_texture_tiling_dialog import (
 )
 from housemaker.surface_texture_workspace import (
     PreparedSurfaceTextureTilingRepair,
+    SurfaceTextureColorBalanceRevision,
     SurfaceTextureGenerationWorkspace,
     SurfaceTextureTilingPreparationSnapshot,
     SurfaceTextureTilingRevision,
@@ -298,6 +299,7 @@ from housemaker.texture_atlas_workspace import (
     is_atlas_wall_texture_source_id,
     load_atlas_object_texture_source,
 )
+from housemaker.texture_color_balance import TextureColorBalanceSettings
 from housemaker.viewer import (
     GlbViewerWidget,
     SceneObjectPlacementCandidate,
@@ -1042,6 +1044,13 @@ class _SurfaceTextureTilingUndoState:
     revision: SurfaceTextureTilingRevision
 
 
+@dataclass(frozen=True)
+class _SurfaceTextureColorBalanceUndoState:
+    """One accepted Surface base-color revision and its prior assets."""
+
+    revision: SurfaceTextureColorBalanceRevision
+
+
 _CanvasUndoState = (
     _CanvasBlueprintUndoState
     | _CanvasPlanImageUndoState
@@ -1055,6 +1064,7 @@ _CanvasUndoState = (
     | _CanvasPlacedObjectGroupUndoState
     | _CanvasStairsUndoState
     | _SurfaceTextureTilingUndoState
+    | _SurfaceTextureColorBalanceUndoState
 )
 
 
@@ -1718,7 +1728,7 @@ class BlueprintWorkspace(QWidget):
             Qt.ShortcutContext.WidgetWithChildrenShortcut
         )
         self.texture_atlas_undo_shortcut.activated.connect(
-            self._handle_canvas_undo_requested
+            self._handle_atlas_undo_requested
         )
         self._external_atlas_host = ExternalFullscreenViewerHost(
             self,
@@ -1780,6 +1790,15 @@ class BlueprintWorkspace(QWidget):
         )
         self.texture_atlas_workspace.surface_texture_fix_tiling_requested.connect(
             self._handle_atlas_surface_texture_fix_tiling_requested
+        )
+        self.texture_atlas_workspace.texture_color_balance_requested.connect(
+            self._handle_atlas_texture_color_balance_requested
+        )
+        self.texture_atlas_workspace.texture_color_balance_preview_requested.connect(
+            self._handle_atlas_texture_color_balance_preview_requested
+        )
+        self.texture_atlas_workspace.texture_color_balance_preview_clear_requested.connect(
+            self._clear_atlas_texture_color_balance_preview
         )
         self.texture_atlas_workspace.ambient_occlusion_bake_requested.connect(
             self._handle_ambient_occlusion_bake_requested
@@ -4793,6 +4812,8 @@ class BlueprintWorkspace(QWidget):
                 )
             elif isinstance(state, _SurfaceTextureTilingUndoState):
                 self._restore_surface_texture_tiling_undo_state(state)
+            elif isinstance(state, _SurfaceTextureColorBalanceUndoState):
+                self._restore_surface_texture_color_balance_undo_state(state)
             else:
                 skipped_texture_bindings = self._restore_blueprint_undo_state(state)
         except (RuntimeError, TypeError, ValueError) as error:
@@ -4809,6 +4830,31 @@ class BlueprintWorkspace(QWidget):
             )
         else:
             self.viewer.set_surface_tools_status("Canvas action undone.")
+
+    def _handle_atlas_undo_requested(self) -> None:
+        """Undo an Object color edit or fall back to shared Canvas history."""
+
+        object_id = self.texture_atlas_workspace.selected_object_texture_id
+        if object_id is not None:
+            undone = self.generation.undo_object_texture_color_balance(
+                object_id
+            )
+            if undone:
+                self.texture_atlas_workspace.complete_texture_color_balance_edit(
+                    "object",
+                    object_id,
+                )
+                self._request_hosted_atlas_object_preview()
+            self.texture_atlas_workspace.status_label.setText(
+                self.generation.status_label.text().strip()
+                or (
+                    "Object texture color balance undone."
+                    if undone
+                    else "There is no applied Object color balance to undo."
+                )
+            )
+            return
+        self._handle_canvas_undo_requested()
 
     def _restore_surface_texture_tiling_undo_state(
         self,
@@ -4885,6 +4931,88 @@ class BlueprintWorkspace(QWidget):
             self.texture_atlas_workspace.status_label.setText(
                 "Original texture restored, but some unused repaired files "
                 "could not be removed."
+            )
+
+    def _restore_surface_texture_color_balance_undo_state(
+        self,
+        state: _SurfaceTextureColorBalanceUndoState,
+    ) -> None:
+        """Restore one Surface base-color revision and every Atlas path."""
+
+        revision = state.revision
+        assignment_id = revision.previous_assignment.assignment_id
+        source_id = build_atlas_wall_texture_source_id(assignment_id)
+        previous_was_activated = False
+        try:
+            previous_was_activated = (
+                self.surface_texture_generation
+                .activate_assignment_color_balance_revision(
+                    revision,
+                    balanced=False,
+                    emit_signals=False,
+                )
+            )
+            previous_assignment = self.surface_texture_generation.get_assignment(
+                assignment_id
+            )
+            if previous_assignment != revision.previous_assignment:
+                raise RuntimeError(
+                    "The original Surface texture revision is unavailable."
+                )
+            candidate_sources = (
+                self._build_atlas_wall_texture_sources_for_assignment(
+                    previous_assignment,
+                    source_id,
+                )
+            )
+            if not self.texture_atlas_workspace.transition_object_packing(
+                source_id,
+                candidate_sources,
+                commit_callback=lambda: (
+                    self.surface_texture_generation.get_assignment(
+                        assignment_id
+                    )
+                    == previous_assignment
+                ),
+            ):
+                raise RuntimeError(
+                    self.texture_atlas_workspace.status_label.text().strip()
+                    or "The Atlas could not restore the original texture."
+                )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            if previous_was_activated:
+                try:
+                    self.surface_texture_generation.activate_assignment_color_balance_revision(
+                        revision,
+                        balanced=True,
+                        emit_signals=False,
+                    )
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    pass
+            raise RuntimeError(
+                str(error) or "The original Surface texture could not be restored."
+            ) from error
+
+        self._atlas_generation_signature = None
+        self.surface_texture_generation.publish_assignment_color_balance_change(
+            "Original Surface texture color restored."
+        )
+        self.texture_atlas_workspace.complete_texture_color_balance_edit(
+            "surface",
+            source_id,
+        )
+        cleanup_failure_count = (
+            self.surface_texture_generation
+            .discard_assignment_color_balance_revision(revision)
+        )
+        if cleanup_failure_count:
+            self.texture_atlas_workspace.status_label.setText(
+                "Original color restored, but some unused adjusted files "
+                "could not be removed."
+            )
+        else:
+            self.texture_atlas_workspace.status_label.setText(
+                "Surface texture color balance undone."
             )
 
     def _restore_canvas_surface_edit_undo_state(
@@ -7139,6 +7267,7 @@ class BlueprintWorkspace(QWidget):
         if self._is_shutdown:
             return
         if is_ambient_occlusion:
+            self._clear_atlas_texture_color_balance_preview()
             self._surface_ao_preview_refresh_timer.stop()
             if self._atlas_preview_display_state is None:
                 self._atlas_preview_display_state = (
@@ -7198,6 +7327,7 @@ class BlueprintWorkspace(QWidget):
             self.viewer.set_ambient_light_intensity(ambient_light_intensity)
         self._clear_atlas_object_preview()
         self.texture_atlas_workspace.request_selected_object_preview()
+        self.texture_atlas_workspace.refresh_texture_color_balance_preview()
         self._restore_canvas_preview_after_ambient_occlusion()
 
     def _set_canvas_ambient_occlusion_preview_pending(self) -> None:
@@ -9886,6 +10016,210 @@ class BlueprintWorkspace(QWidget):
         """Preview edge-compatible rotated variants of the selected texture."""
 
         self._start_surface_texture_tiling_repair(source_id)
+
+    def _handle_atlas_texture_color_balance_preview_requested(
+        self,
+        source_kind: str,
+        source_id: str,
+        settings: object,
+    ) -> None:
+        """Apply pending base-color controls to the current 3D draw items."""
+
+        normalized_kind = str(source_kind).strip().lower()
+        if (
+            self._is_shutdown
+            or self.texture_atlas_workspace.is_ambient_occlusion_preview_active
+            or normalized_kind not in {"object", "surface"}
+            or not isinstance(settings, TextureColorBalanceSettings)
+        ):
+            return
+        normalized_source_id = str(source_id).strip()
+        if not normalized_source_id:
+            return
+        selected_scene_object_ids = (
+            self.viewer.get_selected_placed_object_ids()
+        )
+        if (
+            normalized_kind == "object"
+            and normalized_source_id in selected_scene_object_ids
+        ):
+            self.viewer.set_placed_object_texture_color_balance_preview(
+                normalized_source_id,
+                settings,
+            )
+        else:
+            self.viewer.set_placed_object_texture_color_balance_preview(
+                None,
+                None,
+            )
+        if (
+            self._atlas_preview_variant_key is None
+            or self._atlas_preview_variant_key[0] != normalized_source_id
+        ):
+            return
+        self.atlas_object_preview_viewer.set_texture_color_balance_preview(
+            settings
+        )
+
+    def _clear_atlas_texture_color_balance_preview(self) -> None:
+        """Restore the selected Atlas model's unadjusted material preview."""
+
+        self.atlas_object_preview_viewer.set_texture_color_balance_preview(None)
+        self.viewer.set_placed_object_texture_color_balance_preview(None, None)
+
+    def _handle_atlas_texture_color_balance_requested(
+        self,
+        source_kind: str,
+        source_id: str,
+        settings: object,
+    ) -> None:
+        """Commit one selected texture's base-color adjustment transaction."""
+
+        if not isinstance(settings, TextureColorBalanceSettings):
+            self.texture_atlas_workspace.status_label.setText(
+                "Color balance failed: the requested settings are invalid."
+            )
+            return
+        if settings.is_neutral:
+            self.texture_atlas_workspace.status_label.setText(
+                "Color balance is neutral; the texture was not changed."
+            )
+            return
+        normalized_kind = str(source_kind).strip().lower()
+        normalized_source_id = str(source_id).strip()
+        try:
+            if normalized_kind == "object":
+                changed = self.generation.apply_object_texture_color_balance(
+                    normalized_source_id,
+                    settings,
+                )
+                if not changed:
+                    return
+                self._atlas_generation_signature = None
+                self._sync_atlas_object_texture_sources(
+                    automatically_assign_scene_textures=False
+                )
+                self.texture_atlas_workspace.complete_texture_color_balance_edit(
+                    normalized_kind,
+                    normalized_source_id,
+                )
+                self._schedule_viewer_preview_refresh(preserve_camera=True)
+                self._request_hosted_atlas_object_preview()
+                self.texture_atlas_workspace.status_label.setText(
+                    "Applied color balance to the selected Object texture. "
+                    "Normal, roughness, metallic, and AO maps were retained. "
+                    "Press Ctrl+Z to restore the original revision."
+                )
+                return
+            if normalized_kind == "surface":
+                self._commit_surface_texture_color_balance(
+                    normalized_source_id,
+                    settings,
+                )
+                return
+            raise ValueError("Select one Object or Surface texture.")
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            self.texture_atlas_workspace.status_label.setText(
+                "Color balance failed; the existing texture was kept: "
+                + (str(error) or type(error).__name__)
+            )
+
+    def _commit_surface_texture_color_balance(
+        self,
+        source_id: str,
+        settings: TextureColorBalanceSettings,
+    ) -> None:
+        """Commit a Surface base-color revision with Atlas rollback."""
+
+        assignment_id = get_atlas_wall_texture_assignment_id(source_id)
+        if assignment_id is None:
+            raise ValueError("Select one loaded Surface texture.")
+        revision: SurfaceTextureColorBalanceRevision | None = None
+        balanced_was_activated = False
+        try:
+            revision = (
+                self.surface_texture_generation.stage_assignment_color_balance(
+                    assignment_id,
+                    settings,
+                )
+            )
+            if revision is None:
+                self.texture_atlas_workspace.status_label.setText(
+                    "Color balance is neutral; the texture was not changed."
+                )
+                return
+            balanced_was_activated = (
+                self.surface_texture_generation
+                .activate_assignment_color_balance_revision(
+                    revision,
+                    balanced=True,
+                    emit_signals=False,
+                )
+            )
+            balanced_assignment = self.surface_texture_generation.get_assignment(
+                assignment_id
+            )
+            if balanced_assignment != revision.balanced_assignment:
+                raise RuntimeError(
+                    "The adjusted Surface texture could not be activated."
+                )
+            candidate_sources = (
+                self._build_atlas_wall_texture_sources_for_assignment(
+                    balanced_assignment,
+                    source_id,
+                )
+            )
+            if not self.texture_atlas_workspace.transition_object_packing(
+                source_id,
+                candidate_sources,
+                commit_callback=lambda: (
+                    self.surface_texture_generation.get_assignment(
+                        assignment_id
+                    )
+                    == balanced_assignment
+                ),
+            ):
+                raise RuntimeError(
+                    self.texture_atlas_workspace.status_label.text().strip()
+                    or "The Atlas could not accept the adjusted texture."
+                )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            if revision is not None and balanced_was_activated:
+                try:
+                    self.surface_texture_generation.activate_assignment_color_balance_revision(
+                        revision,
+                        balanced=False,
+                        emit_signals=False,
+                    )
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    pass
+            if revision is not None:
+                self.surface_texture_generation.discard_assignment_color_balance_revision(
+                    revision
+                )
+            raise
+
+        assert revision is not None
+        self._record_canvas_undo_state(
+            _SurfaceTextureColorBalanceUndoState(revision=revision)
+        )
+        self._atlas_generation_signature = None
+        self.surface_texture_generation.publish_assignment_color_balance_change(
+            "Surface texture color balance applied."
+        )
+        self._sync_atlas_object_texture_sources(
+            automatically_assign_scene_textures=False
+        )
+        self.texture_atlas_workspace.complete_texture_color_balance_edit(
+            "surface",
+            source_id,
+        )
+        self._request_hosted_atlas_object_preview()
+        self.texture_atlas_workspace.status_label.setText(
+            "Applied color balance to the selected Surface texture. Normal, "
+            "roughness, metallic, and AO maps were retained. Press Ctrl+Z to "
+            "restore the original revision."
+        )
 
     def _start_surface_texture_tiling_repair(
         self,

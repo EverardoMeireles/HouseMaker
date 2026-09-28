@@ -115,6 +115,7 @@ from housemaker.object_texture_variants import (
     ObjectTextureVariants,
     build_object_texture_variants,
     replace_object_base_color_texture_from_glb,
+    replace_object_variant_base_color_texture,
 )
 from housemaker.object_uv_raycast import (
     VISIBILITY_UV_UNWRAP_VERSION,
@@ -141,6 +142,10 @@ from housemaker.settings_widget import (
     MESHY_SMART_TOPOLOGY_MAX_TARGET_POLYCOUNT,
     MESHY_SMART_TOPOLOGY_MIN_TARGET_POLYCOUNT,
     GenerationServiceSettings,
+)
+from housemaker.texture_color_balance import (
+    TextureColorBalanceSettings,
+    apply_texture_color_balance_rgba,
 )
 from housemaker.unused_face_removal import (
     ALL_CAMERA_IDS,
@@ -201,6 +206,7 @@ MAX_OBJECT_OPERATION_UNDO_COUNT = 10
 OBJECT_OPERATION_GENERATE_MODEL = "generate_model"
 OBJECT_OPERATION_GENERATE_TEXTURE = "generate_texture"
 OBJECT_OPERATION_DELETE_FACES = "delete_faces"
+OBJECT_OPERATION_COLOR_BALANCE = "color_balance"
 FACE_EDIT_REVISION_PIPELINE_KEY = "face_edit_revision"
 FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY = "face_edit_texture_stale"
 FACE_EDIT_ATLAS_PLACEHOLDERS_PIPELINE_KEY = "face_edit_atlas_placeholders"
@@ -3734,6 +3740,134 @@ class GenerationWorkspace(QWidget):
             variant[TEXTURE_VARIANT_MAP_PNG_PATHS_KEY],
         )
 
+    def apply_object_texture_color_balance(
+        self,
+        object_id: str,
+        settings: TextureColorBalanceSettings,
+    ) -> bool:
+        """Create and commit a base-color-only revision for one object."""
+
+        if not isinstance(settings, TextureColorBalanceSettings):
+            raise TypeError("Object color balance settings are invalid.")
+        if settings.is_neutral:
+            return False
+        normalized_object_id = str(object_id).strip()
+        if self._object_has_active_mutation_job(normalized_object_id):
+            raise ValueError(
+                "Wait for the object's active generation job to finish."
+            )
+        record = self._find_generated_object_record(normalized_object_id)
+        if record is None:
+            raise ValueError("The selected generated object no longer exists.")
+        if record.pipeline.get(FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY) is True:
+            raise ValueError(
+                "Generate a texture for the edited object before balancing it."
+            )
+
+        raw_variants = record.pipeline.get(TEXTURE_VARIANTS_PIPELINE_KEY)
+        if not isinstance(raw_variants, dict):
+            raise ValueError("The selected object has no texture variants.")
+        next_variants = copy.deepcopy(raw_variants)
+        created_paths: list[str] = []
+        asset_stem = f"color-balanced-{uuid.uuid4().hex}"
+        try:
+            for resolution in _selectable_texture_resolutions(record):
+                variant = _get_texture_variant_metadata(record, resolution)
+                if variant is None:
+                    raise ValueError(
+                        f"The {resolution} x {resolution} object texture is "
+                        "unavailable."
+                    )
+                source_png_path = self._resolve_generated_asset_path(
+                    variant[TEXTURE_VARIANT_PNG_PATH_KEY],
+                    allowed_suffixes=frozenset({".png"}),
+                )
+                source_glb_path = self._resolve_meshy_asset_path(
+                    variant[TEXTURE_VARIANT_GLB_PATH_KEY]
+                )
+                source_png = source_png_path.read_bytes()
+                adjusted_rgba = apply_texture_color_balance_rgba(
+                    _decode_color_balance_png_rgba(source_png),
+                    settings,
+                )
+                adjusted_png = _encode_color_balance_png_rgba(adjusted_rgba)
+                adjusted_glb = replace_object_variant_base_color_texture(
+                    source_glb_path.read_bytes(),
+                    adjusted_png,
+                )
+                glb_path = self._persist_meshy_named_asset(
+                    f"{asset_stem}.texture-{resolution}.glb",
+                    adjusted_glb,
+                )
+                created_paths.append(glb_path)
+                png_path = self._persist_meshy_named_asset(
+                    f"{asset_stem}.texture-{resolution}.png",
+                    adjusted_png,
+                )
+                created_paths.append(png_path)
+                map_paths = dict(
+                    variant[TEXTURE_VARIANT_MAP_PNG_PATHS_KEY]
+                )
+                map_paths[ATLAS_MAP_BASE_COLOR] = png_path
+                next_variants[str(resolution)] = {
+                    TEXTURE_VARIANT_GLB_PATH_KEY: glb_path,
+                    TEXTURE_VARIANT_PNG_PATH_KEY: png_path,
+                    TEXTURE_VARIANT_MAP_PNG_PATHS_KEY: map_paths,
+                }
+
+            selected_resolution = _get_selected_texture_resolution(record)
+            selected_variant = next_variants.get(str(selected_resolution))
+            if not isinstance(selected_variant, dict):
+                raise ValueError(
+                    "The selected object texture resolution is unavailable."
+                )
+            selected_glb_path = selected_variant.get(
+                TEXTURE_VARIANT_GLB_PATH_KEY
+            )
+            if not isinstance(selected_glb_path, str):
+                raise ValueError("The adjusted object texture is invalid.")
+            next_pipeline = dict(record.pipeline)
+            next_pipeline[TEXTURE_VARIANTS_PIPELINE_KEY] = next_variants
+            next_pipeline["color_balance_revision_count"] = (
+                _next_nonnegative_revision_count(
+                    record.pipeline.get("color_balance_revision_count")
+                )
+            )
+            replacement = replace(
+                record,
+                pipeline=_push_object_operation_undo_snapshot(
+                    record,
+                    next_pipeline,
+                    operation=OBJECT_OPERATION_COLOR_BALANCE,
+                ),
+                asset_path=selected_glb_path,
+            )
+            preview_model = import_generated_glb(
+                self._resolve_meshy_asset_path(selected_glb_path).read_bytes()
+            )
+        except Exception:
+            self._remove_newly_persisted_assets(created_paths)
+            raise
+
+        if not self._request_object_packing_change(
+            record,
+            replacement,
+            preview_model,
+            require_host_transition=True,
+        ):
+            self._remove_newly_persisted_assets(created_paths)
+            raise RuntimeError(
+                "The Atlas could not commit the adjusted object texture."
+            )
+
+        self._delete_unreferenced_object_assets(record)
+        self.status_label.setText(
+            f"Balanced base color: {record.object_name}."
+        )
+        self._emit_data_changed()
+        self.generated_object_changed.emit(replacement, preview_model)
+        return True
+
     def get_atlas_texture_image_variant(
         self,
         object_id: str,
@@ -4359,6 +4493,36 @@ class GenerationWorkspace(QWidget):
             return False
         return self._undo_object_change(self._selected_object_id)
 
+    def undo_object_texture_color_balance(self, object_id: str) -> bool:
+        """Undo one object's latest operation only when it is color balance."""
+
+        normalized_object_id = str(object_id).strip()
+        if not normalized_object_id:
+            return False
+        if self._object_has_active_mutation_job(normalized_object_id):
+            self.status_label.setText(
+                "Wait for the object's active generation job to finish."
+            )
+            return False
+        record = self._find_generated_object_record(normalized_object_id)
+        undo_stack = (
+            () if record is None else _get_object_operation_undo_stack(record)
+        )
+        if not undo_stack:
+            self.status_label.setText(
+                "There is no applied Object color balance to undo."
+            )
+            return False
+        if undo_stack[-1].get("operation") != OBJECT_OPERATION_COLOR_BALANCE:
+            self.status_label.setText(
+                "Undo the object's newer edit before its texture color balance."
+            )
+            return False
+        return self._undo_object_change(
+            normalized_object_id,
+            expected_operation=OBJECT_OPERATION_COLOR_BALANCE,
+        )
+
     def _undo_object_change(
         self,
         object_id: str,
@@ -4404,6 +4568,9 @@ class GenerationWorkspace(QWidget):
             record,
             replacement,
             preview_model,
+            require_host_transition=(
+                snapshot.get("operation") == OBJECT_OPERATION_COLOR_BALANCE
+            ),
         ):
             self.status_label.setText(
                 "Undo could not restore the object because the Atlas packing "
@@ -4416,6 +4583,7 @@ class GenerationWorkspace(QWidget):
         operation_label = {
             OBJECT_OPERATION_GENERATE_TEXTURE: "texture generation",
             OBJECT_OPERATION_DELETE_FACES: "face deletion",
+            OBJECT_OPERATION_COLOR_BALANCE: "texture color balance",
         }.get(operation, "object change")
         status_suffix = (
             " Some superseded files could not be removed."
@@ -7251,6 +7419,7 @@ class GenerationWorkspace(QWidget):
         preview_model: GeneratedModel,
         *,
         preview_asset_revision: tuple[object, ...] | None = None,
+        require_host_transition: bool = False,
     ) -> bool:
         """Commit one prepared packing transition with host rollback."""
 
@@ -7323,7 +7492,8 @@ class GenerationWorkspace(QWidget):
 
         handler = self._object_packing_change_handler
         packing_change_requires_host = (
-            _get_object_symmetric_division_metadata(record) is not None
+            bool(require_host_transition)
+            or _get_object_symmetric_division_metadata(record) is not None
             or _get_object_symmetric_division_metadata(replacement) is not None
             or record.pipeline.get(FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY) is True
             or replacement.pipeline.get(FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY)
@@ -8255,6 +8425,17 @@ def _build_automatic_symmetric_generation_pipeline(
 
 
 # ### Object-operation undo helpers ###
+def _next_nonnegative_revision_count(raw_value: object) -> int:
+    """Increment one persisted non-negative revision counter safely."""
+
+    if isinstance(raw_value, bool):
+        return 1
+    try:
+        return max(int(raw_value), 0) + 1
+    except (TypeError, ValueError, OverflowError):
+        return 1
+
+
 def _get_object_operation_undo_stack(
     record: GeneratedObjectRecord | None,
 ) -> tuple[dict[str, object], ...]:
@@ -8276,6 +8457,7 @@ def _get_object_operation_undo_stack(
         if operation not in {
             OBJECT_OPERATION_GENERATE_TEXTURE,
             OBJECT_OPERATION_DELETE_FACES,
+            OBJECT_OPERATION_COLOR_BALANCE,
         }:
             continue
         if not isinstance(asset_path, str) or not asset_path.strip():
@@ -8308,6 +8490,7 @@ def _push_object_operation_undo_snapshot(
     if operation not in {
         OBJECT_OPERATION_GENERATE_TEXTURE,
         OBJECT_OPERATION_DELETE_FACES,
+        OBJECT_OPERATION_COLOR_BALANCE,
     }:
         raise ValueError("Unknown undoable object operation.")
     snapshot_pipeline = copy.deepcopy(record.pipeline)
@@ -8355,6 +8538,42 @@ def _restore_object_operation_snapshot(
         provider_task_id=provider_task_id,
         asset_path=asset_path,
     )
+
+
+# ### Texture color-balance image helpers ###
+def _decode_color_balance_png_rgba(payload: bytes) -> np.ndarray:
+    """Decode one persisted PNG into contiguous RGBA byte pixels."""
+
+    encoded = np.frombuffer(bytes(payload), dtype=np.uint8)
+    decoded = cv2.imdecode(encoded, cv2.IMREAD_UNCHANGED)
+    if decoded is None or decoded.ndim not in {2, 3}:
+        raise ValueError("The object base-color texture is not a valid PNG.")
+    if decoded.ndim == 2:
+        rgb = cv2.cvtColor(decoded, cv2.COLOR_GRAY2RGB)
+        alpha = np.full(decoded.shape, 255, dtype=np.uint8)
+        return np.ascontiguousarray(np.dstack((rgb, alpha)))
+    if decoded.shape[2] == 3:
+        rgb = cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB)
+        alpha = np.full(decoded.shape[:2], 255, dtype=np.uint8)
+        return np.ascontiguousarray(np.dstack((rgb, alpha)))
+    if decoded.shape[2] == 4:
+        return np.ascontiguousarray(
+            cv2.cvtColor(decoded, cv2.COLOR_BGRA2RGBA)
+        )
+    raise ValueError("The object base-color texture has unsupported channels.")
+
+
+def _encode_color_balance_png_rgba(rgba: np.ndarray) -> bytes:
+    """Encode contiguous RGBA pixels as one lossless PNG."""
+
+    bgra = cv2.cvtColor(
+        np.ascontiguousarray(rgba, dtype=np.uint8),
+        cv2.COLOR_RGBA2BGRA,
+    )
+    did_encode, encoded = cv2.imencode(".png", bgra)
+    if not did_encode:
+        raise ValueError("The adjusted object texture could not be encoded.")
+    return bytes(encoded)
 
 
 # ### Texture-regeneration helpers ###

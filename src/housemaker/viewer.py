@@ -102,6 +102,12 @@ from housemaker.surface_geometry import (
     build_wall_window_placement,
     get_wall_window_world_corners,
 )
+from housemaker.texture_color_balance import (
+    MAX_COLOR_BALANCE_VALUE,
+    MAXIMUM_COLOR_BALANCE_CHANNEL_SHIFT,
+    ColorBalanceAdjustment,
+    TextureColorBalanceSettings,
+)
 from housemaker.unused_face_removal import ALL_CAMERA_IDS
 from housemaker.video_source import normalize_video_frame
 
@@ -361,10 +367,57 @@ TEXTURED_AMBIENT_FRAGMENT_SHADER = """
     uniform float u_alpha_pass;
     uniform float u_ambient_light;
     uniform float u_opacity;
+    uniform float u_color_balance_enabled;
+    uniform vec3 u_color_balance_shadows;
+    uniform vec3 u_color_balance_midtones;
+    uniform vec3 u_color_balance_highlights;
+    uniform float u_color_balance_preserve_luminosity;
     varying vec3 v_normal;
     varying vec3 v_tangent;
     varying vec3 v_bitangent;
     varying vec2 v_texcoord;
+
+    float color_balance_gamut_limit(float source, float delta) {
+        if (delta > 0.0000001) {
+            return (1.0 - source) / delta;
+        }
+        if (delta < -0.0000001) {
+            return -source / delta;
+        }
+        return 1.0;
+    }
+
+    vec3 apply_color_balance(vec3 source) {
+        if (
+            u_color_balance_enabled < 0.5
+            || max(max(source.r, source.g), source.b) <= 0.0
+        ) {
+            return source;
+        }
+        vec3 luminance_weights = vec3(0.2126, 0.7152, 0.0722);
+        float luminance = dot(source, luminance_weights);
+        float shadow_weight = 1.0 - smoothstep(0.0, 0.5, luminance);
+        float highlight_weight = smoothstep(0.5, 1.0, luminance);
+        float midtone_weight = 1.0 - shadow_weight - highlight_weight;
+        vec3 delta = (
+            u_color_balance_shadows * shadow_weight
+            + u_color_balance_midtones * midtone_weight
+            + u_color_balance_highlights * highlight_weight
+        );
+        if (u_color_balance_preserve_luminosity > 0.5) {
+            delta -= vec3(dot(delta, luminance_weights));
+            float gamut_scale = min(
+                color_balance_gamut_limit(source.r, delta.r),
+                min(
+                    color_balance_gamut_limit(source.g, delta.g),
+                    color_balance_gamut_limit(source.b, delta.b)
+                )
+            );
+            delta *= clamp(gamut_scale, 0.0, 1.0);
+        }
+        return clamp(source + delta, 0.0, 1.0);
+    }
+
     void main() {
         vec4 base_color = texture2D(u_texture, v_texcoord);
         float output_alpha = base_color.a * u_opacity;
@@ -381,6 +434,7 @@ TEXTURED_AMBIENT_FRAGMENT_SHADER = """
         ) {
             discard;
         }
+        base_color.rgb = apply_color_balance(base_color.rgb);
         float edit_amount = texture2D(u_edit_mask, v_texcoord).r
             * u_edit_mask_enabled * 0.58;
         base_color.rgb = mix(
@@ -2039,6 +2093,7 @@ class TexturedMeshItem(GLGraphicsItem):
             NEUTRAL_METALLIC_TEXTURE_RGBA,
         )
         self._pbr_maps_enabled = _normalize_pbr_maps_enabled(pbr_maps_enabled)
+        self._color_balance_preview_settings = TextureColorBalanceSettings()
         self._tangents: np.ndarray | None = None
         self._bitangents: np.ndarray | None = None
         if self._pbr_maps_enabled[PBR_MAP_NORMAL]:
@@ -2143,6 +2198,26 @@ class TexturedMeshItem(GLGraphicsItem):
         """Return an isolated copy of the active material-map toggles."""
 
         return dict(self._pbr_maps_enabled)
+
+    def set_texture_color_balance_preview(
+        self,
+        settings: TextureColorBalanceSettings | None,
+    ) -> None:
+        """Preview base-color balance in the shader without mutating textures."""
+
+        normalized = (
+            TextureColorBalanceSettings()
+            if settings is None
+            else settings
+        )
+        if not isinstance(normalized, TextureColorBalanceSettings):
+            raise TypeError(
+                "Texture color-balance previews require valid settings."
+            )
+        if normalized == self._color_balance_preview_settings:
+            return
+        self._color_balance_preview_settings = normalized
+        self.update()
 
     def set_edit_mask(self, mask: np.ndarray | None) -> None:
         """Overlay the editable texels in orange without changing the model."""
@@ -2344,6 +2419,39 @@ class TexturedMeshItem(GLGraphicsItem):
             self._shader_program,
             "u_opacity",
             self._opacity,
+        )
+        _set_float_uniform(
+            self._shader_program,
+            "u_color_balance_enabled",
+            float(not self._color_balance_preview_settings.is_neutral),
+        )
+        _set_vector3_uniform(
+            self._shader_program,
+            "u_color_balance_shadows",
+            _color_balance_adjustment_uniform(
+                self._color_balance_preview_settings.shadows
+            ),
+        )
+        _set_vector3_uniform(
+            self._shader_program,
+            "u_color_balance_midtones",
+            _color_balance_adjustment_uniform(
+                self._color_balance_preview_settings.midtones
+            ),
+        )
+        _set_vector3_uniform(
+            self._shader_program,
+            "u_color_balance_highlights",
+            _color_balance_adjustment_uniform(
+                self._color_balance_preview_settings.highlights
+            ),
+        )
+        _set_float_uniform(
+            self._shader_program,
+            "u_color_balance_preserve_luminosity",
+            float(
+                self._color_balance_preview_settings.preserve_luminosity
+            ),
         )
         _set_integer_uniform(self._shader_program, "u_texture", 0)
         _set_integer_uniform(self._shader_program, "u_edit_mask", 1)
@@ -2931,6 +3039,13 @@ class GlbViewerWidget(QWidget):
         self._wireframe_enabled = bool(wireframe_enabled)
         self._wireframe_only = bool(wireframe_only)
         self._pbr_maps_enabled = _normalize_pbr_maps_enabled(pbr_maps_enabled)
+        self._texture_color_balance_preview_settings = (
+            TextureColorBalanceSettings()
+        )
+        self._placed_object_color_balance_preview_object_id: str | None = None
+        self._placed_object_color_balance_preview_settings = (
+            TextureColorBalanceSettings()
+        )
         self._window_editing_enabled = bool(window_editing_enabled)
         self._projection_camera_indicators_visible = False
         self._face_editing_enabled = bool(face_editing_enabled)
@@ -5232,6 +5347,9 @@ class GlbViewerWidget(QWidget):
         self.view.set_object_scale_wheel_steps_enabled(False)
         self._selected_placed_object_ids = normalized_ids
         self._selected_placed_object_id = normalized_active_id
+        self._clear_placed_object_color_balance_preview_if_unselected(
+            normalized_ids
+        )
         if active_changed:
             self._placed_object_gizmo_mode = PLACED_OBJECT_GIZMO_TRANSFORM
         self._sync_placed_object_selection_rendering()
@@ -8170,6 +8288,10 @@ class GlbViewerWidget(QWidget):
                 translucent=True,
                 pbr_maps_enabled=self._pbr_maps_enabled,
             )
+            if not mirrored_texture_data.is_prefab_glass:
+                textured_item.set_texture_color_balance_preview(
+                    self._texture_color_balance_preview_settings
+                )
             self._attach_preview_item(textured_item, parent_item)
         face_colors = (
             np.tile(FACE_COLOR, (faces.shape[0], 1))
@@ -8229,6 +8351,10 @@ class GlbViewerWidget(QWidget):
                 translucent=True,
                 pbr_maps_enabled=self._pbr_maps_enabled,
             )
+            if not texture_mesh_data.is_prefab_glass:
+                textured_item.set_texture_color_balance_preview(
+                    self._texture_color_balance_preview_settings
+                )
             self._attach_preview_item(textured_item, parent_item)
         face_colors = (
             np.tile(FACE_COLOR, (faces.shape[0], 1))
@@ -8470,6 +8596,165 @@ class GlbViewerWidget(QWidget):
         """Return an isolated copy of the current auxiliary-map state."""
 
         return dict(self._pbr_maps_enabled)
+
+    def set_texture_color_balance_preview(
+        self,
+        settings: TextureColorBalanceSettings | None,
+    ) -> None:
+        """Preview base-color balance without changing the source textures.
+
+        ``None`` clears the transient adjustment. Prefabricated glass stays
+        atlas-independent, matching the committed texture-revision path.
+        """
+
+        normalized = (
+            TextureColorBalanceSettings()
+            if settings is None
+            else settings
+        )
+        if not isinstance(normalized, TextureColorBalanceSettings):
+            raise TypeError(
+                "Texture color-balance previews require valid settings."
+            )
+        self._texture_color_balance_preview_settings = normalized
+        self._apply_texture_color_balance_preview_to_items()
+
+    def _apply_texture_color_balance_preview_to_items(self) -> None:
+        """Propagate the retained preview to every non-glass draw item."""
+
+        for textured_item in self._iter_textured_mesh_items():
+            if textured_item._is_prefab_glass:
+                continue
+            textured_item.set_texture_color_balance_preview(
+                self._texture_color_balance_preview_settings
+            )
+        self._apply_placed_object_texture_color_balance_preview()
+        if hasattr(self, "view"):
+            self.view.update()
+
+    def set_placed_object_texture_color_balance_preview(
+        self,
+        object_id: str | None,
+        settings: TextureColorBalanceSettings | None,
+    ) -> bool:
+        """Preview color balance on one selected placed object only.
+
+        Clearing or changing the target first restores its draw items to the
+        viewer-wide preview. A target that is no longer selected is rejected,
+        which keeps a stale Atlas edit from tinting an unrelated scene object.
+        """
+
+        normalized_object_id = (
+            None if object_id is None else str(object_id).strip() or None
+        )
+        normalized_settings = settings
+        if normalized_object_id is None or normalized_settings is None:
+            normalized_object_id = None
+            normalized_settings = TextureColorBalanceSettings()
+        if not isinstance(normalized_settings, TextureColorBalanceSettings):
+            raise TypeError(
+                "Placed-object color-balance previews require valid settings."
+            )
+        if (
+            normalized_object_id is not None
+            and normalized_object_id not in self._selected_placed_object_ids
+        ):
+            normalized_object_id = None
+            normalized_settings = TextureColorBalanceSettings()
+
+        previous_object_id = (
+            self._placed_object_color_balance_preview_object_id
+        )
+        previous_settings = (
+            self._placed_object_color_balance_preview_settings
+        )
+        if (
+            previous_object_id == normalized_object_id
+            and previous_settings == normalized_settings
+        ):
+            return False
+
+        if previous_object_id is not None:
+            self._set_placed_object_texture_color_balance_preview_on_items(
+                previous_object_id,
+                self._texture_color_balance_preview_settings,
+            )
+        self._placed_object_color_balance_preview_object_id = (
+            normalized_object_id
+        )
+        self._placed_object_color_balance_preview_settings = (
+            normalized_settings
+        )
+        self._apply_placed_object_texture_color_balance_preview()
+        if hasattr(self, "view"):
+            self.view.update()
+        return True
+
+    def _clear_placed_object_color_balance_preview_if_unselected(
+        self,
+        selected_object_ids: Sequence[str],
+    ) -> None:
+        """Restore a targeted preview once its scene object is unselected."""
+
+        preview_object_id = (
+            self._placed_object_color_balance_preview_object_id
+        )
+        if (
+            preview_object_id is not None
+            and preview_object_id not in selected_object_ids
+        ):
+            self.set_placed_object_texture_color_balance_preview(None, None)
+
+    def _apply_placed_object_texture_color_balance_preview(self) -> None:
+        """Apply the retained object-specific preview after global settings."""
+
+        object_id = self._placed_object_color_balance_preview_object_id
+        if object_id is None or object_id not in self._selected_placed_object_ids:
+            return
+        self._set_placed_object_texture_color_balance_preview_on_items(
+            object_id,
+            self._placed_object_color_balance_preview_settings,
+        )
+
+    def _set_placed_object_texture_color_balance_preview_on_items(
+        self,
+        object_id: str,
+        settings: TextureColorBalanceSettings,
+    ) -> None:
+        """Set one placed hierarchy's non-glass shader preview uniformly."""
+
+        for textured_item in self._iter_placed_object_textured_mesh_items(
+            object_id
+        ):
+            if textured_item._is_prefab_glass:
+                continue
+            textured_item.set_texture_color_balance_preview(settings)
+
+    def _iter_placed_object_textured_mesh_items(
+        self,
+        object_id: str,
+    ) -> tuple[TexturedMeshItem, ...]:
+        """Return retained and mirrored textured items for one scene object."""
+
+        group = self._placed_object_render_groups.get(str(object_id).strip())
+        if group is None:
+            return ()
+        candidates = [
+            retained_part.textured_item
+            for retained_part in group.retained_parts
+        ]
+        candidates.extend(
+            symmetric_group.textured_item
+            for symmetric_group in group.symmetric_groups
+        )
+        unique_items: list[TexturedMeshItem] = []
+        seen_ids: set[int] = set()
+        for item in candidates:
+            if item is None or id(item) in seen_ids:
+                continue
+            seen_ids.add(id(item))
+            unique_items.append(item)
+        return tuple(unique_items)
 
     def _iter_textured_mesh_items(self) -> tuple[TexturedMeshItem, ...]:
         """Return each current textured draw item exactly once."""
@@ -8869,6 +9154,7 @@ class GlbViewerWidget(QWidget):
             self._add_placed_object_items()
         else:
             self._build_embedded_symmetric_preview_items()
+        self._apply_texture_color_balance_preview_to_items()
         self._apply_render_display_options()
         self._ensure_projection_camera_indicators()
 
@@ -10374,6 +10660,9 @@ class GlbViewerWidget(QWidget):
         )
         selection_changed = selected_ids != self._selected_placed_object_ids
         self._selected_placed_object_ids = selected_ids
+        self._clear_placed_object_color_balance_preview_if_unselected(
+            selected_ids
+        )
         selected_id = self._selected_placed_object_id
         if selected_id not in selected_ids:
             selected_id = selected_ids[-1] if selected_ids else None
@@ -15830,7 +16119,35 @@ def _set_float_uniform(shader_program: int, name: str, value: float) -> None:
         GL.glUniform1f(location, float(value))
 
 
+def _set_vector3_uniform(
+    shader_program: int,
+    name: str,
+    values: tuple[float, float, float],
+) -> None:
+    """Set one RGB-style shader vector when the program exposes it."""
+
+    location = int(GL.glGetUniformLocation(shader_program, name))
+    if location >= 0:
+        GL.glUniform3f(location, *map(float, values))
+
+
 def _set_integer_uniform(shader_program: int, name: str, value: int) -> None:
     location = int(GL.glGetUniformLocation(shader_program, name))
     if location >= 0:
         GL.glUniform1i(location, int(value))
+
+
+def _color_balance_adjustment_uniform(
+    adjustment: ColorBalanceAdjustment,
+) -> tuple[float, float, float]:
+    """Convert one signed editor triplet to the CPU algorithm's RGB shift."""
+
+    scale = (
+        MAXIMUM_COLOR_BALANCE_CHANNEL_SHIFT
+        / float(MAX_COLOR_BALANCE_VALUE)
+    )
+    return (
+        adjustment.cyan_red * scale,
+        adjustment.magenta_green * scale,
+        adjustment.yellow_blue * scale,
+    )
