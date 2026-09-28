@@ -287,6 +287,9 @@ CANVAS_FACE_COPLANAR_DISTANCE_TOLERANCE_METERS = 1e-6
 CANVAS_FACE_SHARED_EDGE_TOLERANCE_METERS = 1e-6
 FACE_SELECTION_COLOR = (1.0, 0.36, 0.08, 0.72)
 FACE_SELECTION_EDGE_COLOR = (1.0, 0.78, 0.18, 1.0)
+VERTEX_SELECTION_COLOR = (1.0, 0.72, 0.18, 1.0)
+VERTEX_SELECTION_SIZE_PIXELS = 16.0
+VERTEX_SELECTION_PICK_RADIUS_PIXELS = 12.0
 FACE_SELECTION_MAX_RASTER_DIMENSION = 768
 SELECTION_CLIP_PLANE_EPSILON = 1e-7
 SELECTION_HOMOGENEOUS_CLIP_PLANES = (
@@ -753,6 +756,11 @@ class SelectableGLViewWidget(gl.GLViewWidget):
     face_selection_pointer_moved = Signal(object)
     face_selection_pointer_released = Signal(object)
     face_selection_pointer_cancel_requested = Signal()
+    vertex_selection_pointer_pressed = Signal(object)
+    vertex_selection_pointer_moved = Signal(object)
+    vertex_selection_pointer_released = Signal(object)
+    vertex_selection_pointer_cancel_requested = Signal()
+    face_fill_requested = Signal()
     overlay_selection_requested = Signal(object)
     overlay_wheel_steps_requested = Signal(int)
     object_scale_wheel_steps_requested = Signal(int)
@@ -781,6 +789,8 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self._face_selection_gestures_enabled = False
         self._face_selection_gesture_active = False
         self._face_selection_release_suppressed = False
+        self._vertex_selection_gesture_active = False
+        self._vertex_selection_release_suppressed = False
         self._navigation_mode = NAVIGATION_MODE_ORBIT
         self._first_person_pointer_captured = False
         self._first_person_ctrl_interaction_enabled = False
@@ -1010,6 +1020,12 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         return self._face_selection_gesture_active
 
     @property
+    def is_vertex_selection_gesture_active(self) -> bool:
+        """Whether Ctrl+left vertex selection currently owns the pointer."""
+
+        return self._vertex_selection_gesture_active
+
+    @property
     def is_middle_navigation_active(self) -> bool:
         """Whether an orbit/pan gesture currently owns the middle button."""
 
@@ -1020,10 +1036,16 @@ class SelectableGLViewWidget(gl.GLViewWidget):
 
         self._cancel_face_selection_gesture()
 
+    def cancel_vertex_selection_gesture(self) -> None:
+        """Release a pending Ctrl+left gesture after a context change."""
+
+        self._cancel_vertex_selection_gesture()
+
     def cancel_transient_pointer_interactions(self) -> None:
         """Release selection/navigation ownership that cannot cross contexts."""
 
         self._cancel_face_selection_gesture()
+        self._cancel_vertex_selection_gesture()
         if self._primary_pointer_drag_reserved:
             self._primary_pointer_release_suppressed = True
             self.primary_pointer_cancel_requested.emit()
@@ -1039,6 +1061,8 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self._face_selection_gestures_enabled = bool(enabled)
         if not self._face_selection_gestures_enabled:
             self._cancel_face_selection_gesture()
+            self._cancel_vertex_selection_gesture()
+        self._update_navigation_tooltip()
 
     @property
     def navigation_mode(self) -> str:
@@ -1353,6 +1377,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.MouseButton.LeftButton:
             self._face_selection_release_suppressed = False
+            self._vertex_selection_release_suppressed = False
             self._primary_pointer_release_suppressed = False
         if self._rectangle_drawing_enabled:
             if event.button() == Qt.MouseButton.LeftButton:
@@ -1368,6 +1393,19 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             and event.button() == Qt.MouseButton.RightButton
         ):
             self.primary_pointer_cancel_requested.emit()
+            event.accept()
+            return
+
+        if (
+            self._face_selection_gestures_enabled
+            and event.button() == Qt.MouseButton.LeftButton
+            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+            and not self.is_first_person_pointer_captured
+        ):
+            self.click_press_position = event.position()
+            self._vertex_selection_gesture_active = True
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+            self.vertex_selection_pointer_pressed.emit(event.position())
             event.accept()
             return
 
@@ -1407,9 +1445,13 @@ class SelectableGLViewWidget(gl.GLViewWidget):
 
         if (
             event.button() == Qt.MouseButton.RightButton
-            and self._face_selection_gesture_active
+            and (
+                self._face_selection_gesture_active
+                or self._vertex_selection_gesture_active
+            )
         ):
             self._cancel_face_selection_gesture()
+            self._cancel_vertex_selection_gesture()
             event.accept()
             return
 
@@ -1480,6 +1522,14 @@ class SelectableGLViewWidget(gl.GLViewWidget):
 
         if (
             event.button() == Qt.MouseButton.LeftButton
+            and self._vertex_selection_release_suppressed
+        ):
+            self._vertex_selection_release_suppressed = False
+            event.accept()
+            return
+
+        if (
+            event.button() == Qt.MouseButton.LeftButton
             and self._primary_pointer_release_suppressed
         ):
             self._primary_pointer_release_suppressed = False
@@ -1492,6 +1542,15 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         ):
             self._face_selection_gesture_active = False
             self.face_selection_pointer_released.emit(event.position())
+            event.accept()
+            return
+
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._vertex_selection_gesture_active
+        ):
+            self._vertex_selection_gesture_active = False
+            self.vertex_selection_pointer_released.emit(event.position())
             event.accept()
             return
 
@@ -1585,6 +1644,12 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         if self._face_selection_gesture_active:
             if event.buttons() & Qt.MouseButton.LeftButton:
                 self.face_selection_pointer_moved.emit(event.position())
+            event.accept()
+            return
+
+        if self._vertex_selection_gesture_active:
+            if event.buttons() & Qt.MouseButton.LeftButton:
+                self.vertex_selection_pointer_moved.emit(event.position())
             event.accept()
             return
 
@@ -1706,10 +1771,14 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             event.accept()
             return
         if (
-            self._face_selection_gesture_active
+            (
+                self._face_selection_gesture_active
+                or self._vertex_selection_gesture_active
+            )
             and event.key() == Qt.Key.Key_Escape
         ):
             self._cancel_face_selection_gesture()
+            self._cancel_vertex_selection_gesture()
             event.accept()
             return
         if (
@@ -1740,6 +1809,20 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             and event.key() in _first_person_movement_keys()
         ):
             self._pressed_movement_keys.add(event.key())
+            event.accept()
+            return
+        if (
+            not self.is_first_person_active
+            and self._face_selection_gestures_enabled
+            and event.key() == Qt.Key.Key_F
+            and event.modifiers()
+            in {
+                Qt.KeyboardModifier.NoModifier,
+                Qt.KeyboardModifier.ControlModifier,
+            }
+        ):
+            if not event.isAutoRepeat():
+                self.face_fill_requested.emit()
             event.accept()
             return
         super().keyPressEvent(event)
@@ -1812,6 +1895,15 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self._face_selection_gesture_active = False
         self._face_selection_release_suppressed = True
         self.face_selection_pointer_cancel_requested.emit()
+
+    def _cancel_vertex_selection_gesture(self) -> None:
+        """Cancel one active Ctrl vertex-selection gesture, if present."""
+
+        if not self._vertex_selection_gesture_active:
+            return
+        self._vertex_selection_gesture_active = False
+        self._vertex_selection_release_suppressed = True
+        self.vertex_selection_pointer_cancel_requested.emit()
 
     def _enter_first_person_mode(self) -> None:
         self._orbit_camera_state = self._capture_camera_state()
@@ -2003,10 +2095,16 @@ class SelectableGLViewWidget(gl.GLViewWidget):
                 "navigation hotkey to return to orbit controls."
             )
             return
-        self.setToolTip(
-            "Blender controls: middle-drag to orbit, "
-            "Shift+middle-drag to pan, mouse wheel to zoom."
+        tooltip = (
+            "Blender controls: middle-drag to orbit, Shift+middle-drag to "
+            "pan, mouse wheel to zoom."
         )
+        if self._face_selection_gestures_enabled:
+            tooltip += (
+                " Shift+click/drag selects faces; Ctrl+click/drag selects "
+                "vertices; F fills the selected vertex boundary."
+            )
+        self.setToolTip(tooltip)
 
     def _capture_camera_state(self) -> dict[str, object]:
         camera_state: dict[str, object] = {}
@@ -2874,6 +2972,27 @@ class _FaceRectangleSelectionResult:
     face_indices: frozenset[int]
 
 
+@dataclass(frozen=True)
+class _VertexRectangleSelectionTask:
+    """Immutable projected input for one visible-vertex raster pass."""
+
+    request_revision: int
+    geometry_revision: int
+    projected_geometry: tuple[tuple[np.ndarray, np.ndarray], ...]
+    rectangle: tuple[int, int, int, int]
+    source_faces: np.ndarray
+    source_vertex_count: int
+
+
+@dataclass(frozen=True)
+class _VertexRectangleSelectionResult:
+    """Canonical retained vertex IDs visible inside one selection box."""
+
+    request_revision: int
+    geometry_revision: int
+    vertex_indices: tuple[int, ...]
+
+
 # ### Canvas rectangle-selection background models ###
 @dataclass(frozen=True)
 class _CanvasRectangleSelectionTask:
@@ -2980,9 +3099,12 @@ class GlbViewerWidget(QWidget):
     canvas_stair_preview_cancelled = Signal()
     canvas_surface_orientation_flip_requested = Signal(str)
     face_selection_changed = Signal(object)
+    vertex_selection_changed = Signal(object)
+    object_face_creation_requested = Signal(object)
     projection_camera_selection_changed = Signal(object)
     projection_camera_percentage_step_requested = Signal(str, int)
     _face_rectangle_selection_completed = Signal(object)
+    _vertex_rectangle_selection_completed = Signal(object)
     _canvas_rectangle_selection_completed = Signal(object)
     delete_requested = Signal()
     undo_requested = Signal()
@@ -3051,11 +3173,16 @@ class GlbViewerWidget(QWidget):
         self._face_editing_enabled = bool(face_editing_enabled)
         self._face_edit_vertices: np.ndarray | None = None
         self._face_edit_faces: np.ndarray | None = None
+        self._face_edit_vertex_representatives: np.ndarray | None = None
         self._selected_face_indices: set[int] = set()
+        self._selected_vertex_indices: list[int] = []
         self._face_selection_press_position: QPointF | None = None
+        self._vertex_selection_press_position: QPointF | None = None
         self._face_selection_rubber_band: QRubberBand | None = None
         self._face_selection_item: gl.GLMeshItem | None = None
         self._mirrored_face_selection_item: gl.GLMeshItem | None = None
+        self._vertex_selection_item: gl.GLScatterPlotItem | None = None
+        self._mirrored_vertex_selection_item: gl.GLScatterPlotItem | None = None
         self._face_selection_geometry_revision = 0
         self._face_rectangle_selection_request_revision = 0
         self._face_rectangle_selection_cancel_event: (
@@ -7705,7 +7832,7 @@ class GlbViewerWidget(QWidget):
 
     # ### Face editor API ###
     def set_face_editing_enabled(self, enabled: bool) -> None:
-        """Enable or disable Shift-based face-selection input."""
+        """Enable or disable Shift-face and Ctrl-vertex editing input."""
 
         normalized_enabled = bool(enabled)
         if normalized_enabled == self._face_editing_enabled:
@@ -7716,6 +7843,7 @@ class GlbViewerWidget(QWidget):
         )
         if not self._face_editing_enabled:
             self._cancel_face_selection_gesture()
+            self._cancel_vertex_selection_gesture()
 
     def set_face_edit_geometry(
         self,
@@ -7745,8 +7873,14 @@ class GlbViewerWidget(QWidget):
             normalized_vertices
         ).copy()
         self._face_edit_faces = np.ascontiguousarray(normalized_faces).copy()
+        self._face_edit_vertex_representatives = (
+            _build_coincident_vertex_representatives(
+                self._face_edit_vertices
+            )
+        )
         self._face_selection_geometry_revision += 1
         self.clear_face_selection()
+        self.clear_vertex_selection()
 
     def clear_face_edit_geometry(self) -> None:
         """Forget editable geometry and clear every transient selection."""
@@ -7754,20 +7888,25 @@ class GlbViewerWidget(QWidget):
         self.cancel_face_selection_interaction()
         self._face_edit_vertices = None
         self._face_edit_faces = None
+        self._face_edit_vertex_representatives = None
         self._face_selection_geometry_revision += 1
         self.clear_face_selection()
+        self.clear_vertex_selection()
 
     def cancel_face_selection_interaction(self) -> None:
         """Cancel both viewport and controller layers of one selection drag."""
 
         self.view.cancel_face_selection_gesture()
+        self.view.cancel_vertex_selection_gesture()
         self._cancel_face_selection_gesture()
+        self._cancel_vertex_selection_gesture()
 
     def cancel_transient_pointer_interactions(self) -> None:
         """Release orbit, pan, and face-selection pointer ownership."""
 
         self.view.cancel_transient_pointer_interactions()
         self._cancel_face_selection_gesture()
+        self._cancel_vertex_selection_gesture()
         self._cancel_canvas_rectangle_selection()
 
     def get_selected_face_indices(self) -> tuple[int, ...]:
@@ -7803,6 +7942,8 @@ class GlbViewerWidget(QWidget):
         normalized_mode = str(mode)
         if normalized_mode not in FACE_SELECTION_UPDATE_MODES:
             raise ValueError("Unknown face-selection update mode.")
+        if normalized and self._selected_vertex_indices:
+            self.clear_vertex_selection()
         self._invalidate_face_rectangle_selection_requests()
         if normalized_mode == FACE_SELECTION_REPLACE:
             self._selected_face_indices = normalized
@@ -7824,6 +7965,92 @@ class GlbViewerWidget(QWidget):
         self._remove_face_selection_items()
         if had_selection:
             self.face_selection_changed.emit(())
+
+    def get_selected_vertex_indices(self) -> tuple[int, ...]:
+        """Return canonical object vertices in stable selection order."""
+
+        return tuple(self._selected_vertex_indices)
+
+    def set_selected_vertex_indices(self, vertex_indices: object) -> None:
+        """Replace the Ctrl-vertex selection after validating global IDs."""
+
+        self.update_vertex_selection(
+            vertex_indices,
+            mode=FACE_SELECTION_REPLACE,
+        )
+
+    def update_vertex_selection(
+        self,
+        vertex_indices: object,
+        *,
+        mode: str,
+    ) -> None:
+        """Apply click, box, and programmatic vertex selection uniformly."""
+
+        vertex_count = (
+            0 if self._face_edit_vertices is None else len(self._face_edit_vertices)
+        )
+        try:
+            requested = tuple(vertex_indices)  # type: ignore[arg-type]
+        except TypeError as error:
+            raise ValueError("Selected vertex indices must be integers.") from error
+        normalized: list[int] = []
+        for raw_index in requested:
+            try:
+                index = int(raw_index)
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError(
+                    "Selected vertex indices must be integers."
+                ) from error
+            if index < 0 or index >= vertex_count:
+                raise ValueError("A selected vertex index is outside the object.")
+            representative = self._get_editable_vertex_representative(index)
+            if representative not in normalized:
+                normalized.append(representative)
+        normalized_mode = str(mode)
+        if normalized_mode not in FACE_SELECTION_UPDATE_MODES:
+            raise ValueError("Unknown vertex-selection update mode.")
+        if normalized and self._selected_face_indices:
+            self.clear_face_selection()
+        self._invalidate_face_rectangle_selection_requests()
+        if normalized_mode == FACE_SELECTION_REPLACE:
+            self._selected_vertex_indices = normalized
+        elif normalized_mode == FACE_SELECTION_TOGGLE:
+            for index in normalized:
+                if index in self._selected_vertex_indices:
+                    self._selected_vertex_indices.remove(index)
+                else:
+                    self._selected_vertex_indices.append(index)
+        else:
+            self._selected_vertex_indices.extend(
+                index
+                for index in normalized
+                if index not in self._selected_vertex_indices
+            )
+        self._refresh_vertex_selection_items()
+        self.vertex_selection_changed.emit(
+            self.get_selected_vertex_indices()
+        )
+
+    def _get_editable_vertex_representative(self, vertex_index: int) -> int:
+        """Map one UV-seam duplicate to its stable geometric position ID."""
+
+        representatives = self._face_edit_vertex_representatives
+        if representatives is None:
+            return int(vertex_index)
+        return int(representatives[int(vertex_index)])
+
+    def clear_vertex_selection(self) -> None:
+        """Clear selected object vertices and their retained/mirrored markers."""
+
+        self._invalidate_face_rectangle_selection_requests()
+        had_selection = bool(self._selected_vertex_indices)
+        self._selected_vertex_indices.clear()
+        self._vertex_selection_press_position = None
+        self._hide_face_selection_rubber_band()
+        self._remove_vertex_selection_items()
+        if had_selection:
+            self.vertex_selection_changed.emit(())
 
     @property
     def face_edit_face_count(self) -> int:
@@ -7847,8 +8074,27 @@ class GlbViewerWidget(QWidget):
         self.view.face_selection_pointer_cancel_requested.connect(
             self._cancel_face_selection_gesture
         )
+        self.view.vertex_selection_pointer_pressed.connect(
+            self._handle_vertex_selection_pointer_pressed
+        )
+        self.view.vertex_selection_pointer_moved.connect(
+            self._handle_vertex_selection_pointer_moved
+        )
+        self.view.vertex_selection_pointer_released.connect(
+            self._handle_vertex_selection_pointer_released
+        )
+        self.view.vertex_selection_pointer_cancel_requested.connect(
+            self._cancel_vertex_selection_gesture
+        )
+        self.view.face_fill_requested.connect(
+            self._handle_object_face_fill_requested
+        )
         self._face_rectangle_selection_completed.connect(
             self._apply_face_rectangle_selection_result,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self._vertex_rectangle_selection_completed.connect(
+            self._apply_vertex_rectangle_selection_result,
             Qt.ConnectionType.QueuedConnection,
         )
 
@@ -7899,6 +8145,62 @@ class GlbViewerWidget(QWidget):
         self._face_selection_press_position = None
         self._hide_face_selection_rubber_band()
 
+    @Slot(object)
+    def _handle_vertex_selection_pointer_pressed(self, position: object) -> None:
+        self._invalidate_face_rectangle_selection_requests()
+        if not self._can_select_vertices():
+            return
+        self._vertex_selection_press_position = QPointF(position)
+
+    @Slot(object)
+    def _handle_vertex_selection_pointer_moved(self, position: object) -> None:
+        start = self._vertex_selection_press_position
+        if start is None or not self._can_select_vertices():
+            return
+        current = QPointF(position)
+        if _get_point_distance(start, current) <= CLICK_SELECTION_TOLERANCE:
+            return
+        rubber_band = self._ensure_face_selection_rubber_band()
+        rubber_band.setGeometry(
+            QRect(start.toPoint(), current.toPoint()).normalized()
+        )
+        rubber_band.show()
+
+    @Slot(object)
+    def _handle_vertex_selection_pointer_released(self, position: object) -> None:
+        start = self._vertex_selection_press_position
+        self._vertex_selection_press_position = None
+        self._hide_face_selection_rubber_band()
+        if start is None or not self._can_select_vertices():
+            return
+        end = QPointF(position)
+        if _get_point_distance(start, end) <= CLICK_SELECTION_TOLERANCE:
+            vertex_index = self._pick_editable_vertex(end)
+            if vertex_index is None:
+                return
+            self.update_vertex_selection(
+                (vertex_index,),
+                mode=FACE_SELECTION_TOGGLE,
+            )
+            return
+        self._start_editable_vertex_rectangle_selection(start, end)
+
+    @Slot()
+    def _cancel_vertex_selection_gesture(self) -> None:
+        self._invalidate_face_rectangle_selection_requests()
+        self._vertex_selection_press_position = None
+        self._hide_face_selection_rubber_band()
+
+    @Slot()
+    def _handle_object_face_fill_requested(self) -> None:
+        """Request one retained face only from a complete vertex selection."""
+
+        if not self._face_editing_enabled or len(self._selected_vertex_indices) < 3:
+            return
+        self.object_face_creation_requested.emit(
+            self.get_selected_vertex_indices()
+        )
+
     def _can_select_faces(self) -> bool:
         return bool(
             self._face_editing_enabled
@@ -7906,6 +8208,13 @@ class GlbViewerWidget(QWidget):
             and self._face_edit_vertices is not None
             and self._face_edit_faces is not None
             and len(self._face_edit_faces)
+        )
+
+    def _can_select_vertices(self) -> bool:
+        return bool(
+            self._can_select_faces()
+            and self._face_edit_vertices is not None
+            and len(self._face_edit_vertices)
         )
 
     def _pick_editable_face(self, position: QPointF) -> int | None:
@@ -7946,6 +8255,83 @@ class GlbViewerWidget(QWidget):
         if not hits:
             return None
         return min(hits, key=lambda item: item[1])[0]
+
+    def _pick_editable_vertex(self, position: QPointF) -> int | None:
+        """Return the nearest visible canonical vertex under a Ctrl click."""
+
+        if self._face_edit_vertices is None or self._face_edit_faces is None:
+            return None
+        geometry = self._get_editable_selection_geometry()
+        radius = math.ceil(VERTEX_SELECTION_PICK_RADIUS_PIXELS)
+        selection_rectangle = QRect(
+            math.floor(position.x()) - radius,
+            math.floor(position.y()) - radius,
+            radius * 2 + 1,
+            radius * 2 + 1,
+        )
+        captured = _capture_face_selection_raster_input(
+            self.view,
+            geometry,
+            selection_rectangle,
+        )
+        if captured is None:
+            return None
+        projected_geometry, rectangle = captured
+        visible_vertices = _rasterize_visible_vertex_selection(
+            projected_geometry,
+            QRect(*rectangle),
+            self._face_edit_faces,
+            len(self._face_edit_vertices),
+        )
+        if not visible_vertices:
+            return None
+        point = np.asarray((position.x(), position.y()), dtype=float)
+        candidates: list[tuple[float, float, int]] = []
+        for projected_vertices, _faces in projected_geometry:
+            canonical_projected = projected_vertices[
+                : len(self._face_edit_vertices)
+            ]
+            for vertex_index in visible_vertices:
+                projected = canonical_projected[vertex_index]
+                if not _is_usable_projected_point(projected):
+                    continue
+                distance = float(np.linalg.norm(projected[:2] - point))
+                if distance <= VERTEX_SELECTION_PICK_RADIUS_PIXELS:
+                    representative = (
+                        self._get_editable_vertex_representative(
+                            vertex_index
+                        )
+                    )
+                    candidates.append(
+                        (distance, float(projected[2]), representative)
+                    )
+        if not candidates:
+            return None
+        return min(candidates)[2]
+
+    def _get_editable_selection_geometry(
+        self,
+    ) -> tuple[tuple[np.ndarray, np.ndarray], ...]:
+        """Return retained and optional mirrored geometry with canonical IDs."""
+
+        if self._face_edit_vertices is None or self._face_edit_faces is None:
+            return ()
+        geometry = [(self._face_edit_vertices, self._face_edit_faces)]
+        if (
+            self._symmetric_preview_orientation is not None
+            and self._symmetric_preview_plane_coordinate is not None
+        ):
+            geometry.append(
+                (
+                    _mirror_preview_vertices(
+                        self._face_edit_vertices,
+                        self._symmetric_preview_orientation,
+                        self._symmetric_preview_plane_coordinate,
+                    ),
+                    self._face_edit_faces[:, (0, 2, 1)],
+                )
+            )
+        return tuple(geometry)
 
     def _start_editable_face_rectangle_selection(
         self,
@@ -8003,6 +8389,48 @@ class GlbViewerWidget(QWidget):
         worker.start()
         return True
 
+    def _start_editable_vertex_rectangle_selection(
+        self,
+        start: QPointF,
+        end: QPointF,
+    ) -> bool:
+        """Capture current-camera geometry for one Ctrl box selection."""
+
+        if self._face_edit_vertices is None or self._face_edit_faces is None:
+            return False
+        captured = _capture_face_selection_raster_input(
+            self.view,
+            self._get_editable_selection_geometry(),
+            QRect(start.toPoint(), end.toPoint()).normalized(),
+        )
+        if captured is None:
+            return False
+        projected_geometry, rectangle = captured
+        source_faces = np.ascontiguousarray(
+            self._face_edit_faces,
+            dtype=np.int64,
+        ).copy()
+        source_faces.setflags(write=False)
+        self._invalidate_face_rectangle_selection_requests()
+        cancel_event = threading.Event()
+        self._face_rectangle_selection_cancel_event = cancel_event
+        task = _VertexRectangleSelectionTask(
+            request_revision=self._face_rectangle_selection_request_revision,
+            geometry_revision=self._face_selection_geometry_revision,
+            projected_geometry=projected_geometry,
+            rectangle=rectangle,
+            source_faces=source_faces,
+            source_vertex_count=len(self._face_edit_vertices),
+        )
+        worker = threading.Thread(
+            target=_run_vertex_rectangle_selection_task,
+            args=(task, cancel_event, weakref.ref(self)),
+            name=f"housemaker-vertex-selection-{task.request_revision}",
+            daemon=True,
+        )
+        worker.start()
+        return True
+
     def _invalidate_face_rectangle_selection_requests(self) -> None:
         """Cancel delivery from the active raster task and advance its ID."""
 
@@ -8035,6 +8463,34 @@ class GlbViewerWidget(QWidget):
         self._face_rectangle_selection_cancel_event = None
         self.update_face_selection(
             raw_result.face_indices,
+            mode=FACE_SELECTION_ADD,
+        )
+
+    @Slot(object)
+    def _apply_vertex_rectangle_selection_result(self, raw_result: object) -> None:
+        """Apply one current visible-vertex result on the Qt GUI thread."""
+
+        if not isinstance(raw_result, _VertexRectangleSelectionResult):
+            return
+        if (
+            raw_result.request_revision
+            != self._face_rectangle_selection_request_revision
+            or raw_result.geometry_revision
+            != self._face_selection_geometry_revision
+            or not self._can_select_vertices()
+        ):
+            return
+        vertex_count = (
+            0 if self._face_edit_vertices is None else len(self._face_edit_vertices)
+        )
+        if any(
+            vertex_index < 0 or vertex_index >= vertex_count
+            for vertex_index in raw_result.vertex_indices
+        ):
+            return
+        self._face_rectangle_selection_cancel_event = None
+        self.update_vertex_selection(
+            raw_result.vertex_indices,
             mode=FACE_SELECTION_ADD,
         )
 
@@ -8108,6 +8564,55 @@ class GlbViewerWidget(QWidget):
         self._face_selection_item = None
         self._mirrored_face_selection_item = None
 
+    def _refresh_vertex_selection_items(self) -> None:
+        """Render retained and mirrored Ctrl-selected object vertices."""
+
+        self._remove_vertex_selection_items()
+        if (
+            not self._selected_vertex_indices
+            or self._face_edit_vertices is None
+            or not hasattr(self, "view")
+        ):
+            return
+        selected = np.asarray(self._selected_vertex_indices, dtype=np.int64)
+        selected_vertices = np.ascontiguousarray(
+            self._face_edit_vertices[selected],
+            dtype=np.float32,
+        )
+        self._vertex_selection_item = _build_vertex_selection_item(
+            selected_vertices
+        )
+        self.view.addItem(self._vertex_selection_item)
+        if (
+            self._symmetric_preview_orientation is not None
+            and self._symmetric_preview_plane_coordinate is not None
+        ):
+            mirrored_vertices = _mirror_preview_vertices(
+                selected_vertices,
+                self._symmetric_preview_orientation,
+                self._symmetric_preview_plane_coordinate,
+            )
+            self._mirrored_vertex_selection_item = (
+                _build_vertex_selection_item(mirrored_vertices)
+            )
+            self.view.addItem(self._mirrored_vertex_selection_item)
+        self.view.update()
+
+    def _remove_vertex_selection_items(self) -> None:
+        """Remove both selected-vertex marker passes from the viewport."""
+
+        for item in (
+            self._vertex_selection_item,
+            self._mirrored_vertex_selection_item,
+        ):
+            if item is not None and hasattr(self, "view"):
+                try:
+                    self.view.removeItem(item)
+                except ValueError:
+                    pass
+        self._vertex_selection_item = None
+        self._mirrored_vertex_selection_item = None
+
     # ### Symmetric divided-object preview API ###
     def set_symmetric_division_preview(
         self,
@@ -8145,6 +8650,7 @@ class GlbViewerWidget(QWidget):
         self._symmetric_preview_plane_coordinate = normalized_plane
         self._build_symmetric_preview_items()
         self._refresh_face_selection_items()
+        self._refresh_vertex_selection_items()
         self._rebuild_projection_camera_indicators()
         self.view.update()
 
@@ -8503,6 +9009,7 @@ class GlbViewerWidget(QWidget):
         self._symmetric_preview_plane_coordinate = None
         if hasattr(self, "view"):
             self._refresh_face_selection_items()
+            self._refresh_vertex_selection_items()
             self._rebuild_projection_camera_indicators()
             self.view.update()
 
@@ -9064,6 +9571,8 @@ class GlbViewerWidget(QWidget):
         self._add_grid()
         if self.model is None:
             self._set_default_camera()
+            self._refresh_face_selection_items()
+            self._refresh_vertex_selection_items()
             self._refresh_canvas_surface_selection_outlines()
             self._refresh_canvas_stair_part_selection_outlines()
             self._refresh_canvas_face_orientation_item()
@@ -9175,6 +9684,8 @@ class GlbViewerWidget(QWidget):
         self.view.remember_orbit_camera_state()
         self._set_default_first_person_camera_pose_from_bounding_box(bounding_box)
         self.view.apply_navigation_camera()
+        self._refresh_face_selection_items()
+        self._refresh_vertex_selection_items()
         self._refresh_canvas_surface_selection_outlines()
         self._refresh_canvas_stair_part_selection_outlines()
         self._refresh_canvas_face_orientation_item()
@@ -11492,6 +12003,8 @@ class GlbViewerWidget(QWidget):
         self._model_material_preview_meshes = ()
         self._face_selection_item = None
         self._mirrored_face_selection_item = None
+        self._vertex_selection_item = None
+        self._mirrored_vertex_selection_item = None
         self._reset_symmetric_preview_item_state()
         self._embedded_symmetric_preview_groups = []
         self._placed_object_render_groups = {}
@@ -11581,6 +12094,31 @@ class GlbViewerWidget(QWidget):
 
 
 # ### Selection geometry and raster helpers ###
+def _build_coincident_vertex_representatives(
+    vertices: np.ndarray,
+) -> np.ndarray:
+    """Map exact UV-seam duplicates to the first canonical vertex ID."""
+
+    normalized = np.asarray(vertices, dtype=np.float32)
+    if normalized.ndim != 2 or normalized.shape[1:] != (3,):
+        raise ValueError("Coincident-vertex grouping requires XYZ positions.")
+    if not len(normalized):
+        representatives = np.empty(0, dtype=np.int64)
+    else:
+        _positions, first_indices, inverse = np.unique(
+            normalized,
+            axis=0,
+            return_index=True,
+            return_inverse=True,
+        )
+        representatives = np.ascontiguousarray(
+            first_indices[inverse],
+            dtype=np.int64,
+        )
+    representatives.setflags(write=False)
+    return representatives
+
+
 def _build_face_selection_item(
     vertices: np.ndarray,
     faces: np.ndarray,
@@ -11600,6 +12138,21 @@ def _build_face_selection_item(
         drawEdges=True,
         edgeColor=FACE_SELECTION_EDGE_COLOR,
         shader="shaded",
+    )
+    item.setGLOptions("translucent")
+    return item
+
+
+def _build_vertex_selection_item(
+    vertices: np.ndarray,
+) -> _DepthTestedOverlayScatterItem:
+    """Build prominent markers that remain hidden by nearer geometry."""
+
+    item = _DepthTestedOverlayScatterItem(
+        pos=np.asarray(vertices, dtype=np.float32),
+        color=VERTEX_SELECTION_COLOR,
+        size=VERTEX_SELECTION_SIZE_PIXELS,
+        pxMode=True,
     )
     item.setGLOptions("translucent")
     return item
@@ -12244,6 +12797,228 @@ def _rasterize_face_selection(
     }
 
 
+def _rasterize_visible_vertex_selection(
+    projected_geometry: Sequence[tuple[np.ndarray, np.ndarray]],
+    rectangle: QRect,
+    source_faces: np.ndarray,
+    source_vertex_count: int,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> tuple[int, ...]:
+    """Return canonical vertices whose projected surface point is visible."""
+
+    normalized_faces = np.asarray(source_faces, dtype=np.int64)
+    normalized_vertex_count = int(source_vertex_count)
+    if (
+        normalized_vertex_count < 0
+        or normalized_faces.ndim != 2
+        or normalized_faces.shape[1:] != (3,)
+        or np.any(normalized_faces < 0)
+        or (
+            normalized_faces.size
+            and np.any(normalized_faces >= normalized_vertex_count)
+        )
+    ):
+        raise ValueError(
+            "Visible-vertex selection requires valid source triangle IDs."
+        )
+    if normalized_vertex_count == 0 or not len(normalized_faces):
+        return ()
+
+    logical_indices_by_geometry = getattr(
+        projected_geometry,
+        "logical_face_indices_by_geometry",
+        None,
+    )
+    if (
+        logical_indices_by_geometry is not None
+        and len(logical_indices_by_geometry) != len(projected_geometry)
+    ):
+        raise ValueError(
+            "Logical face-index arrays must match projected geometry."
+        )
+
+    left = float(rectangle.left())
+    top = float(rectangle.top())
+    right = left + max(int(rectangle.width()), 1)
+    bottom = top + max(int(rectangle.height()), 1)
+    projected_occurrences: dict[int, list[np.ndarray]] = {}
+    visibility_triangles: list[np.ndarray] = []
+    visibility_face_indices: list[np.ndarray] = []
+    for geometry_index, (projected_vertices, faces) in enumerate(
+        projected_geometry
+    ):
+        if cancel_event is not None and cancel_event.is_set():
+            return ()
+        normalized_projected = np.asarray(projected_vertices, dtype=float)
+        geometry_faces = np.asarray(faces, dtype=np.int64)
+        if (
+            normalized_projected.ndim != 2
+            or normalized_projected.shape[1:] != (4,)
+            or geometry_faces.ndim != 2
+            or geometry_faces.shape[1:] != (3,)
+            or np.any(geometry_faces < 0)
+            or (
+                geometry_faces.size
+                and np.any(geometry_faces >= len(normalized_projected))
+            )
+        ):
+            raise ValueError(
+                "Visible-vertex selection requires projected triangles."
+            )
+        canonical_projected = normalized_projected[
+            : min(normalized_vertex_count, len(normalized_projected))
+        ]
+        usable = np.asarray(
+            [_is_usable_projected_point(point) for point in canonical_projected],
+            dtype=bool,
+        )
+        if len(canonical_projected):
+            usable &= (
+                (canonical_projected[:, 0] >= left)
+                & (canonical_projected[:, 0] <= right)
+                & (canonical_projected[:, 1] >= top)
+                & (canonical_projected[:, 1] <= bottom)
+            )
+        for vertex_index in np.flatnonzero(usable):
+            projected_occurrences.setdefault(int(vertex_index), []).append(
+                canonical_projected[int(vertex_index)]
+            )
+        if not len(geometry_faces):
+            continue
+        if logical_indices_by_geometry is None:
+            logical_indices = np.arange(len(geometry_faces), dtype=np.int64)
+        else:
+            logical_indices = np.asarray(
+                logical_indices_by_geometry[geometry_index],
+                dtype=np.int64,
+            )
+            if logical_indices.shape != (len(geometry_faces),):
+                raise ValueError(
+                    "Each logical face-index array must match its face count."
+                )
+        visibility_triangles.append(normalized_projected[geometry_faces])
+        visibility_face_indices.append(logical_indices)
+
+    if not projected_occurrences or not visibility_triangles:
+        return ()
+    triangles = np.concatenate(visibility_triangles, axis=0)
+    logical_face_indices = np.concatenate(
+        visibility_face_indices,
+        axis=0,
+    )
+    finite_triangles = np.all(np.isfinite(triangles), axis=(1, 2))
+    triangles = triangles[finite_triangles]
+    logical_face_indices = logical_face_indices[finite_triangles]
+    if not len(triangles):
+        return ()
+
+    incident_faces: list[set[int]] = [
+        set() for _index in range(normalized_vertex_count)
+    ]
+    for face_index, face in enumerate(normalized_faces):
+        for vertex_index in face:
+            incident_faces[int(vertex_index)].add(face_index)
+
+    selected: list[int] = []
+    for vertex_index in sorted(projected_occurrences):
+        if cancel_event is not None and cancel_event.is_set():
+            return ()
+        if not incident_faces[vertex_index]:
+            continue
+        for projected_point in projected_occurrences[vertex_index]:
+            visible_depth, visible_faces = (
+                _get_visible_projected_faces_at_point(
+                    triangles,
+                    logical_face_indices,
+                    projected_point[:2],
+                )
+            )
+            if (
+                visible_depth is not None
+                and float(projected_point[2]) <= visible_depth + 1e-5
+                and incident_faces[vertex_index].intersection(visible_faces)
+            ):
+                selected.append(vertex_index)
+                break
+    return tuple(selected)
+
+
+def _get_visible_projected_faces_at_point(
+    triangles: np.ndarray,
+    logical_face_indices: np.ndarray,
+    point: np.ndarray,
+) -> tuple[float | None, set[int]]:
+    """Return the nearest projected depth and tied logical faces at a point."""
+
+    normalized_point = np.asarray(point, dtype=float)
+    if normalized_point.shape != (2,) or not np.all(np.isfinite(normalized_point)):
+        return None, set()
+    screen_triangles = triangles[:, :, :2]
+    candidate_mask = (
+        (np.min(screen_triangles[:, :, 0], axis=1) <= normalized_point[0] + 1e-7)
+        & (
+            np.max(screen_triangles[:, :, 0], axis=1)
+            >= normalized_point[0] - 1e-7
+        )
+        & (np.min(screen_triangles[:, :, 1], axis=1) <= normalized_point[1] + 1e-7)
+        & (
+            np.max(screen_triangles[:, :, 1], axis=1)
+            >= normalized_point[1] - 1e-7
+        )
+    )
+    if not np.any(candidate_mask):
+        return None, set()
+    candidates = triangles[candidate_mask]
+    candidate_face_indices = logical_face_indices[candidate_mask]
+    first = candidates[:, 0, :2]
+    second = candidates[:, 1, :2]
+    third = candidates[:, 2, :2]
+    denominator = (
+        (first[:, 0] - third[:, 0])
+        * (second[:, 1] - third[:, 1])
+        - (second[:, 0] - third[:, 0])
+        * (first[:, 1] - third[:, 1])
+    )
+    usable = np.abs(denominator) > 1e-12
+    safe_denominator = np.where(usable, denominator, 1.0)
+    first_weight = (
+        (second[:, 1] - third[:, 1])
+        * (normalized_point[0] - third[:, 0])
+        + (third[:, 0] - second[:, 0])
+        * (normalized_point[1] - third[:, 1])
+    ) / safe_denominator
+    second_weight = (
+        (third[:, 1] - first[:, 1])
+        * (normalized_point[0] - third[:, 0])
+        + (first[:, 0] - third[:, 0])
+        * (normalized_point[1] - third[:, 1])
+    ) / safe_denominator
+    third_weight = 1.0 - first_weight - second_weight
+    usable &= (
+        (first_weight >= -1e-7)
+        & (second_weight >= -1e-7)
+        & (third_weight >= -1e-7)
+    )
+    depths = (
+        first_weight * candidates[:, 0, 2]
+        + second_weight * candidates[:, 1, 2]
+        + third_weight * candidates[:, 2, 2]
+    )
+    usable &= (
+        np.isfinite(depths)
+        & (depths >= -1.0 - 1e-6)
+        & (depths <= 1.0 + 1e-6)
+    )
+    if not np.any(usable):
+        return None, set()
+    nearest_depth = float(np.min(depths[usable]))
+    tied = usable & (depths <= nearest_depth + 1e-5)
+    return nearest_depth, {
+        int(face_index) for face_index in candidate_face_indices[tied]
+    }
+
+
 def _rasterize_canvas_target_selection(
     projected_targets: Sequence[
         tuple[str, str, np.ndarray, np.ndarray]
@@ -12357,6 +13132,48 @@ def _run_face_rectangle_selection_task(
     )
     try:
         viewer._face_rectangle_selection_completed.emit(result)
+    except RuntimeError:
+        # The Qt wrapper may disappear between weak-reference lookup and emit.
+        return
+
+
+def _run_vertex_rectangle_selection_task(
+    task: _VertexRectangleSelectionTask,
+    cancel_event: threading.Event,
+    viewer_reference: weakref.ReferenceType[GlbViewerWidget],
+) -> None:
+    """Depth-test immutable projected vertices and queue current IDs."""
+
+    if cancel_event.is_set():
+        return
+    try:
+        selected = _rasterize_visible_vertex_selection(
+            task.projected_geometry,
+            QRect(*task.rectangle),
+            task.source_faces,
+            task.source_vertex_count,
+            cancel_event=cancel_event,
+        )
+    except (
+        TypeError,
+        ValueError,
+        IndexError,
+        OverflowError,
+        FloatingPointError,
+    ):
+        return
+    if cancel_event.is_set():
+        return
+    viewer = viewer_reference()
+    if viewer is None:
+        return
+    result = _VertexRectangleSelectionResult(
+        request_revision=task.request_revision,
+        geometry_revision=task.geometry_revision,
+        vertex_indices=selected,
+    )
+    try:
+        viewer._vertex_rectangle_selection_completed.emit(result)
     except RuntimeError:
         # The Qt wrapper may disappear between weak-reference lookup and emit.
         return

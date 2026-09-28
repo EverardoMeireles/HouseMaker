@@ -70,8 +70,10 @@ from housemaker.meshy_generation import (
     request_retextured_model,
 )
 from housemaker.object_face_edit import (
+    ObjectFaceAdditionResult,
     ObjectFaceDeletionResult,
     ObjectFaceGeometry,
+    _add_object_face_preserving_uvs_with_geometry,
     _delete_object_faces_preserving_uvs_with_geometry,
     load_object_face_geometry,
     load_object_face_geometry_from_scene,
@@ -205,6 +207,7 @@ OBJECT_OPERATION_UNDO_STACK_PIPELINE_KEY = "object_operation_undo_stack"
 MAX_OBJECT_OPERATION_UNDO_COUNT = 10
 OBJECT_OPERATION_GENERATE_MODEL = "generate_model"
 OBJECT_OPERATION_GENERATE_TEXTURE = "generate_texture"
+OBJECT_OPERATION_CREATE_FACE = "create_face"
 OBJECT_OPERATION_DELETE_FACES = "delete_faces"
 OBJECT_OPERATION_COLOR_BALANCE = "color_balance"
 FACE_EDIT_REVISION_PIPELINE_KEY = "face_edit_revision"
@@ -447,7 +450,12 @@ class _ObjectJobRuntime:
 
     operation: _ActiveObjectOperation
     thread: QThread
-    worker: GenerationWorker | TextureRegenerationWorker | ObjectFaceDeletionWorker
+    worker: (
+        GenerationWorker
+        | TextureRegenerationWorker
+        | ObjectFaceDeletionWorker
+        | ObjectFaceCreationWorker
+    )
     relay: _ObjectJobSignalRelay
     generation_request: GenerationRequest | None = None
     requested_name: str = ""
@@ -937,11 +945,72 @@ class ObjectFaceDeletionRequest:
 
 
 @dataclass(frozen=True)
+class ObjectFaceCreationRequest:
+    """Saved GLB revisions and ordered vertices for one local fill job."""
+
+    object_id: str
+    reference_asset_path: str
+    source_asset_paths: tuple[str, ...]
+    selected_vertex_indices: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        normalized_object_id = str(self.object_id).strip()
+        reference_asset_path = _normalize_face_edit_asset_path(
+            self.reference_asset_path
+        )
+        source_asset_paths = tuple(
+            dict.fromkeys(
+                _normalize_face_edit_asset_path(path)
+                for path in self.source_asset_paths
+            )
+        )
+        requested_vertices = tuple(self.selected_vertex_indices)
+        if any(
+            isinstance(index, bool)
+            or not isinstance(index, int | np.integer)
+            for index in requested_vertices
+        ):
+            raise TypeError("Face creation requires integer vertex indices.")
+        selected = tuple(int(index) for index in requested_vertices)
+        if not normalized_object_id:
+            raise ValueError("Face creation requires an object ID.")
+        if (
+            not source_asset_paths
+            or reference_asset_path not in source_asset_paths
+        ):
+            raise ValueError("Face creation requires its displayed GLB revision.")
+        if len(selected) < 3 or len(set(selected)) != len(selected):
+            raise ValueError(
+                "Face creation requires at least three distinct vertices."
+            )
+        if any(index < 0 for index in selected):
+            raise ValueError("Face creation requires valid vertex indices.")
+        object.__setattr__(self, "object_id", normalized_object_id)
+        object.__setattr__(
+            self,
+            "reference_asset_path",
+            reference_asset_path,
+        )
+        object.__setattr__(self, "source_asset_paths", source_asset_paths)
+        object.__setattr__(self, "selected_vertex_indices", selected)
+
+
+@dataclass(frozen=True)
 class PreparedObjectFaceDeletion:
     """Every edited GLB revision plus reference face-count metadata."""
 
     request: ObjectFaceDeletionRequest
     reference_result: ObjectFaceDeletionResult
+    edited_glbs: tuple[tuple[str, bytes], ...]
+    preview_model: GeneratedModel
+
+
+@dataclass(frozen=True)
+class PreparedObjectFaceCreation:
+    """Every filled GLB revision plus reference face-count metadata."""
+
+    request: ObjectFaceCreationRequest
+    reference_result: ObjectFaceAdditionResult
     edited_glbs: tuple[tuple[str, bytes], ...]
     preview_model: GeneratedModel
 
@@ -2811,6 +2880,80 @@ def _prepare_object_face_deletion(
     )
 
 
+def _prepare_object_face_creation(
+    asset_directory: Path,
+    request: ObjectFaceCreationRequest,
+) -> PreparedObjectFaceCreation:
+    """Fill the same world-space boundary in every saved GLB revision."""
+
+    source_glbs = {
+        raw_path: _resolve_face_edit_source_path(
+            asset_directory,
+            raw_path,
+        ).read_bytes()
+        for raw_path in request.source_asset_paths
+    }
+    reference_glb = source_glbs[request.reference_asset_path]
+    reference_result, reference_geometry = (
+        _add_object_face_preserving_uvs_with_geometry(
+            reference_glb,
+            request.selected_vertex_indices,
+            validate_export=False,
+        )
+    )
+    edited_glbs: list[tuple[str, bytes]] = [
+        (request.reference_asset_path, reference_result.glb_bytes)
+    ]
+    for raw_path in request.source_asset_paths:
+        if raw_path == request.reference_asset_path:
+            continue
+        source_glb = source_glbs[raw_path]
+        candidate_geometry = load_object_face_geometry(source_glb)
+        if not _face_edit_geometry_matches(
+            reference_geometry,
+            candidate_geometry,
+        ):
+            raise ValueError(
+                "Saved texture revisions do not share the displayed face "
+                "layout. The existing object was kept."
+            )
+        mapped_vertex_indices = _map_face_edit_vertex_indices(
+            reference_geometry,
+            candidate_geometry,
+            request.selected_vertex_indices,
+        )
+        candidate_result, _candidate_source_geometry = (
+            _add_object_face_preserving_uvs_with_geometry(
+                source_glb,
+                mapped_vertex_indices,
+                validate_export=False,
+            )
+        )
+        if (
+            candidate_result.result_face_count
+            != reference_result.result_face_count
+            or candidate_result.added_triangle_count
+            != reference_result.added_triangle_count
+        ):
+            raise ValueError(
+                "Face creation changed inconsistent saved revisions."
+            )
+        edited_glbs.append((raw_path, candidate_result.glb_bytes))
+
+    edited_by_path = dict(edited_glbs)
+    preview_model = import_generated_glb(
+        edited_by_path[request.reference_asset_path]
+    )
+    if len(preview_model.mesh.faces) != reference_result.result_face_count:
+        raise ValueError("Face creation exported an unexpected face count.")
+    return PreparedObjectFaceCreation(
+        request=request,
+        reference_result=reference_result,
+        edited_glbs=tuple(edited_glbs),
+        preview_model=preview_model,
+    )
+
+
 def _face_edit_geometry_matches(
     reference: ObjectFaceGeometry,
     candidate: ObjectFaceGeometry,
@@ -2842,6 +2985,45 @@ def _face_edit_geometry_matches(
             atol=tolerance,
         )
     )
+
+
+def _map_face_edit_vertex_indices(
+    reference: ObjectFaceGeometry,
+    candidate: ObjectFaceGeometry,
+    reference_vertex_indices: Sequence[int],
+) -> tuple[int, ...]:
+    """Map selected vertices through stable ordered triangle corners."""
+
+    mapped: list[int] = []
+    reference_faces = np.asarray(reference.faces, dtype=np.int64)
+    candidate_faces = np.asarray(candidate.faces, dtype=np.int64)
+    if reference_faces.shape != candidate_faces.shape:
+        raise ValueError("Saved texture revisions have incompatible topology.")
+    for raw_vertex_index in reference_vertex_indices:
+        vertex_index = int(raw_vertex_index)
+        if vertex_index < 0 or vertex_index >= len(reference.vertices):
+            raise ValueError("A selected vertex is outside the displayed object.")
+        face_corners = np.argwhere(reference_faces == vertex_index)
+        if len(face_corners) == 0:
+            raise ValueError(
+                "A selected vertex is not part of the displayed mesh."
+            )
+        candidate_indices = {
+            int(candidate_faces[int(face_index), int(corner_index)])
+            for face_index, corner_index in face_corners
+        }
+        if len(candidate_indices) != 1:
+            raise ValueError(
+                "Saved texture revisions split a selected vertex differently. "
+                "The existing object was kept."
+            )
+        mapped.append(candidate_indices.pop())
+    if len(set(mapped)) != len(mapped):
+        raise ValueError(
+            "Saved texture revisions merge selected vertices differently. "
+            "The existing object was kept."
+        )
+    return tuple(mapped)
 
 
 def _rewrite_face_edit_glb_paths(
@@ -2945,6 +3127,54 @@ class ObjectFaceDeletionWorker(QObject):
             self.finished.emit()
 
 
+class ObjectFaceCreationWorker(QObject):
+    """Create one polygon face in every saved GLB without blocking Qt."""
+
+    succeeded = Signal(object, object)
+    failed = Signal(str)
+    finished = Signal()
+    progress = Signal(str)
+
+    def __init__(
+        self,
+        request: ObjectFaceCreationRequest,
+        asset_directory: Path,
+    ) -> None:
+        super().__init__()
+        self._request = request
+        self._asset_directory = Path(asset_directory)
+        self._cancel_event = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            _raise_if_generation_cancelled(self._cancel_event)
+            self.progress.emit("Creating face (10%)")
+            request = self._request
+            result = _run_interruptible_stage(
+                lambda: _prepare_object_face_creation(
+                    self._asset_directory,
+                    request,
+                ),
+                self._cancel_event,
+            )
+            _raise_if_generation_cancelled(self._cancel_event)
+            self.progress.emit("Existing UVs and textures retained (90%)")
+        except _GenerationCancelled:
+            return
+        except Exception as error:
+            if not self._cancel_event.is_set():
+                self.failed.emit(str(error).strip() or error.__class__.__name__)
+            return
+        else:
+            self.succeeded.emit(result, None)
+        finally:
+            self.finished.emit()
+
+
 # ### Generation workspace ###
 class GenerationWorkspace(QWidget):
     """Manual video selection and Meshy Image-to-3D workspace."""
@@ -3015,6 +3245,7 @@ class GenerationWorkspace(QWidget):
             GenerationWorker
             | TextureRegenerationWorker
             | ObjectFaceDeletionWorker
+            | ObjectFaceCreationWorker
             | None
         ) = None
         self._generated_model: GeneratedModel | None = None
@@ -4405,6 +4636,43 @@ class GenerationWorkspace(QWidget):
             return False
         return self.delete_generated_object(self._selected_object_id)
 
+    def create_selected_object_face(self) -> bool:
+        """Start a local F-key face fill for the selected object."""
+
+        self.result_view.cancel_transient_pointer_interactions()
+        record = self._find_generated_object_record(self._selected_object_id)
+        selected_vertices = self.result_view.get_selected_vertex_indices()
+        if record is None:
+            return False
+        if len(selected_vertices) < 3:
+            self.status_label.setText(
+                "Select at least three object vertices with Ctrl before "
+                "pressing F."
+            )
+            return False
+        if self._object_has_active_mutation_job(record.object_id):
+            self.status_label.setText(
+                "Wait for this object's active job to finish before editing it."
+            )
+            return False
+        generated_model = self._generated_model
+        if (
+            generated_model is None
+            or self.result_view.model is not generated_model
+        ):
+            return False
+        try:
+            request = ObjectFaceCreationRequest(
+                object_id=record.object_id,
+                reference_asset_path=record.asset_path,
+                source_asset_paths=_get_face_edit_glb_asset_paths(record),
+                selected_vertex_indices=selected_vertices,
+            )
+        except (TypeError, ValueError) as error:
+            self.status_label.setText(f"Face creation failed: {error}")
+            return False
+        return self._start_object_face_creation(request, record)
+
     def delete_selected_object_faces(self) -> bool:
         """Start a local face deletion for the current viewer selection."""
 
@@ -4582,6 +4850,7 @@ class GenerationWorkspace(QWidget):
         operation = str(snapshot.get("operation", "object change"))
         operation_label = {
             OBJECT_OPERATION_GENERATE_TEXTURE: "texture generation",
+            OBJECT_OPERATION_CREATE_FACE: "face creation",
             OBJECT_OPERATION_DELETE_FACES: "face deletion",
             OBJECT_OPERATION_COLOR_BALANCE: "texture color balance",
         }.get(operation, "object change")
@@ -5025,6 +5294,71 @@ class GenerationWorkspace(QWidget):
         self._sync_controls()
         return True
 
+    def _start_object_face_creation(
+        self,
+        request: ObjectFaceCreationRequest,
+        record: GeneratedObjectRecord,
+    ) -> bool:
+        """Run one exact F-key face fill on an independent worker."""
+
+        if (
+            request.object_id != record.object_id
+            or self._object_has_active_mutation_job(record.object_id)
+        ):
+            return False
+        self.result_view.cancel_transient_pointer_interactions()
+        operation = _ActiveObjectOperation(
+            kind=OBJECT_OPERATION_CREATE_FACE,
+            target_object_id=record.object_id,
+        )
+        thread = QThread(self)
+        worker = ObjectFaceCreationWorker(request, self._asset_directory)
+        relay = _ObjectJobSignalRelay(operation.operation_id, self)
+        managed_job_id = self._create_managed_job(
+            operation,
+            kind=GENERATION_JOB_KIND_FACE_EDIT,
+            requested_name=None,
+            default_name=f"Create face: {record.object_name}",
+            stage="Preparing face creation...",
+        )
+        runtime = _ObjectJobRuntime(
+            operation=operation,
+            thread=thread,
+            worker=worker,
+            relay=relay,
+            managed_job_id=managed_job_id,
+            record_snapshot=replace(
+                record,
+                pipeline=copy.deepcopy(record.pipeline),
+            ),
+            source_asset_revision=_build_face_edit_source_revisions(
+                self._asset_directory,
+                request.source_asset_paths,
+            ),
+        )
+        self._register_object_job_runtime(runtime)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(relay.forward_pair_succeeded)
+        worker.failed.connect(relay.forward_failed)
+        worker.progress.connect(relay.forward_progress)
+        relay.pair_succeeded.connect(
+            self._handle_job_face_creation_succeeded
+        )
+        relay.failed.connect(self._handle_job_face_creation_failed)
+        relay.progress.connect(self._handle_job_generation_progress)
+        relay.thread_finished.connect(
+            self._handle_object_job_thread_finished
+        )
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(relay.forward_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        self.status_label.setText("Preparing face creation...")
+        thread.start()
+        self._sync_controls()
+        return True
+
     # ### Multi-job runtime helpers ###
     def _create_managed_job(
         self,
@@ -5254,6 +5588,12 @@ class GenerationWorkspace(QWidget):
         )
         self.result_view.face_selection_changed.connect(
             self._handle_face_selection_changed
+        )
+        self.result_view.vertex_selection_changed.connect(
+            self._handle_vertex_selection_changed
+        )
+        self.result_view.object_face_creation_requested.connect(
+            self._handle_object_face_creation_requested
         )
         self.result_view.undo_requested.connect(
             self.undo_selected_object_change
@@ -5541,6 +5881,21 @@ class GenerationWorkspace(QWidget):
         """Push the authoritative viewer selection to every output."""
 
         self._sync_face_selection_outputs()
+
+    @Slot(object)
+    def _handle_vertex_selection_changed(self, _raw_indices: object) -> None:
+        """Keep face-dependent controls current when component mode changes."""
+
+        self._sync_face_selection_outputs()
+
+    @Slot(object)
+    def _handle_object_face_creation_requested(
+        self,
+        _raw_vertex_indices: object,
+    ) -> None:
+        """Create a persistent face from the viewer's current vertices."""
+
+        self.create_selected_object_face()
 
     def _sync_face_selection_outputs(self) -> None:
         """Synchronize face-dependent control state from the 3D view."""
@@ -5851,6 +6206,10 @@ class GenerationWorkspace(QWidget):
                 None,
             )
             next_pipeline.pop("face_edit_uv_utilization", None)
+            next_pipeline.pop("face_edit_result_face_count", None)
+            next_pipeline.pop("face_edit_added_face_count", None)
+            next_pipeline.pop("face_edit_added_triangle_count", None)
+            next_pipeline.pop("face_edit_created_polygon_count", None)
             for pipeline_key in FACE_EDIT_INVALIDATED_UV_PROVENANCE_PIPELINE_KEYS:
                 next_pipeline.pop(pipeline_key, None)
             next_pipeline.update(
@@ -5943,6 +6302,195 @@ class GenerationWorkspace(QWidget):
             return
         self._set_legacy_active_job_runtime(runtime)
         message = f"Face deletion failed: {str(error_message)}"
+        self.status_label.setText(message)
+        self._fail_managed_job(runtime, message)
+
+    @Slot(str, object, object)
+    def _handle_job_face_creation_succeeded(
+        self,
+        operation_id: str,
+        raw_result: object,
+        _unused_preview: object,
+    ) -> None:
+        """Commit one completed face fill if its source is still current."""
+
+        if self._should_ignore_operation_result(
+            OBJECT_OPERATION_CREATE_FACE,
+            operation_id,
+        ):
+            return
+        runtime = self._object_job_runtimes.get(str(operation_id))
+        if runtime is None:
+            return
+        self._set_legacy_active_job_runtime(runtime)
+        prepared = raw_result
+        snapshot = runtime.record_snapshot
+        if (
+            not isinstance(prepared, PreparedObjectFaceCreation)
+            or snapshot is None
+        ):
+            self._handle_job_face_creation_failed(
+                operation_id,
+                "The local face-creation result is invalid.",
+            )
+            return
+        record = self._find_generated_object_record(snapshot.object_id)
+        if (
+            record is None
+            or record != snapshot
+            or _build_face_edit_source_revisions(
+                self._asset_directory,
+                prepared.request.source_asset_paths,
+            )
+            != runtime.source_asset_revision
+        ):
+            self._handle_job_face_creation_failed(
+                operation_id,
+                "The object changed before its new face could be applied.",
+            )
+            return
+
+        persisted_paths: list[str] = []
+        try:
+            if prepared.request.object_id != record.object_id:
+                raise ValueError(
+                    "The face-creation result targets a different object."
+                )
+            result = prepared.reference_result
+            face_edit_id = uuid.uuid4().hex
+            replacement_paths: dict[str, str] = {}
+            for source_index, (source_path, edited_glb) in enumerate(
+                prepared.edited_glbs,
+                start=1,
+            ):
+                persisted_path = self._persist_meshy_named_asset(
+                    f"{record.object_id}.face-edit-{face_edit_id}."
+                    f"revision-{source_index}.glb",
+                    edited_glb,
+                )
+                persisted_paths.append(persisted_path)
+                replacement_paths[source_path] = persisted_path
+
+            next_pipeline = copy.deepcopy(record.pipeline)
+            next_asset_path = _rewrite_face_edit_glb_paths(
+                record,
+                next_pipeline,
+                replacement_paths,
+            )
+            preview_model = prepared.preview_model
+            preview_revision = _build_generation_asset_revision(
+                self._asset_directory,
+                next_asset_path,
+            )
+            if preview_revision[1] is None:
+                raise OSError("The saved face-edit revision is unavailable.")
+            face_edit_revision = _next_nonnegative_revision_count(
+                record.pipeline.get(FACE_EDIT_REVISION_PIPELINE_KEY, 0)
+            )
+            next_pipeline.pop(FACE_EDIT_TEXTURE_STALE_PIPELINE_KEY, None)
+            next_pipeline.pop(
+                FACE_EDIT_ATLAS_PLACEHOLDERS_PIPELINE_KEY,
+                None,
+            )
+            next_pipeline.pop("face_edit_uv_utilization", None)
+            next_pipeline.pop("face_edit_retained_face_count", None)
+            next_pipeline.pop("face_edit_deleted_face_count", None)
+            next_pipeline.pop("face_edit_added_face_count", None)
+            for pipeline_key in FACE_EDIT_INVALIDATED_UV_PROVENANCE_PIPELINE_KEYS:
+                next_pipeline.pop(pipeline_key, None)
+            next_pipeline.update(
+                {
+                    FACE_EDIT_REVISION_PIPELINE_KEY: face_edit_revision,
+                    LOCALLY_AUTHORED_UVS_PIPELINE_KEY: True,
+                    "face_edit_texture_preserved": (
+                        result.preserved_textured_uvs
+                    ),
+                    "face_edit_original_face_count": (
+                        result.original_face_count
+                    ),
+                    "face_edit_result_face_count": result.result_face_count,
+                    "face_edit_added_triangle_count": (
+                        result.added_triangle_count
+                    ),
+                    "face_edit_created_polygon_count": 1,
+                }
+            )
+            replacement = replace(
+                record,
+                asset_path=next_asset_path,
+                pipeline=_push_object_operation_undo_snapshot(
+                    record,
+                    next_pipeline,
+                    operation=OBJECT_OPERATION_CREATE_FACE,
+                ),
+            )
+        except Exception as error:
+            self._remove_newly_persisted_assets(persisted_paths)
+            self._handle_job_face_creation_failed(
+                operation_id,
+                f"The edited object could not be saved: {error}",
+            )
+            return
+
+        if not self._request_object_packing_change(
+            record,
+            replacement,
+            preview_model,
+            preview_asset_revision=preview_revision,
+        ):
+            self._remove_newly_persisted_assets(persisted_paths)
+            self._handle_job_face_creation_failed(
+                operation_id,
+                "The Atlas packing change could not be committed.",
+            )
+            return
+
+        self._record_operation_commit(
+            OBJECT_OPERATION_CREATE_FACE,
+            record.object_id,
+            operation_id,
+        )
+        cleanup_failed = self._delete_unreferenced_object_assets(record)
+        triangle_count = result.added_triangle_count
+        status = (
+            f"Created a face on {record.object_name} using "
+            f"{triangle_count:,} triangle"
+            + ("" if triangle_count == 1 else "s")
+            + ". "
+            + (
+                "Its existing UVs and texture were retained."
+                if result.preserved_textured_uvs
+                else "Its existing material data was retained."
+            )
+            + (
+                " Some superseded files could not be removed."
+                if cleanup_failed
+                else ""
+            )
+        )
+        self.status_label.setText(status)
+        self._emit_data_changed()
+        self.generated_object_changed.emit(replacement, preview_model)
+        self._complete_managed_job(runtime, status)
+
+    @Slot(str, str)
+    def _handle_job_face_creation_failed(
+        self,
+        operation_id: str,
+        error_message: str,
+    ) -> None:
+        """Keep the old object and selected vertices after a failed fill."""
+
+        if self._should_ignore_operation_result(
+            OBJECT_OPERATION_CREATE_FACE,
+            operation_id,
+        ):
+            return
+        runtime = self._object_job_runtimes.get(str(operation_id))
+        if runtime is None:
+            return
+        self._set_legacy_active_job_runtime(runtime)
+        message = f"Face creation failed: {error_message!s}"
         self.status_label.setText(message)
         self._fail_managed_job(runtime, message)
 
@@ -6739,6 +7287,7 @@ class GenerationWorkspace(QWidget):
             )
         if operation.kind not in {
             OBJECT_OPERATION_GENERATE_TEXTURE,
+            OBJECT_OPERATION_CREATE_FACE,
             OBJECT_OPERATION_DELETE_FACES,
         }:
             return False
@@ -6786,6 +7335,14 @@ class GenerationWorkspace(QWidget):
                 else "The existing geometry was kept."
             )
             self.status_label.setText("Face deletion cancelled. " + outcome)
+            return
+        if operation.kind == OBJECT_OPERATION_CREATE_FACE:
+            outcome = (
+                "The previous geometry was restored."
+                if had_commit
+                else "The existing geometry was kept."
+            )
+            self.status_label.setText("Face creation cancelled. " + outcome)
             return
         self.status_label.setText("Operation cancelled.")
 
@@ -6839,7 +7396,10 @@ class GenerationWorkspace(QWidget):
         self._set_legacy_active_job_runtime(
             self._legacy_active_job_runtime()
         )
-        if operation.kind == OBJECT_OPERATION_DELETE_FACES:
+        if operation.kind in {
+            OBJECT_OPERATION_CREATE_FACE,
+            OBJECT_OPERATION_DELETE_FACES,
+        }:
             self.result_view.cancel_transient_pointer_interactions()
             self._sync_face_selection_outputs()
         else:
@@ -8456,6 +9016,7 @@ def _get_object_operation_undo_stack(
         pipeline = raw_snapshot.get("pipeline")
         if operation not in {
             OBJECT_OPERATION_GENERATE_TEXTURE,
+            OBJECT_OPERATION_CREATE_FACE,
             OBJECT_OPERATION_DELETE_FACES,
             OBJECT_OPERATION_COLOR_BALANCE,
         }:
@@ -8489,6 +9050,7 @@ def _push_object_operation_undo_snapshot(
 
     if operation not in {
         OBJECT_OPERATION_GENERATE_TEXTURE,
+        OBJECT_OPERATION_CREATE_FACE,
         OBJECT_OPERATION_DELETE_FACES,
         OBJECT_OPERATION_COLOR_BALANCE,
     }:

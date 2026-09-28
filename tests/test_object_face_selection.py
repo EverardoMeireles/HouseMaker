@@ -1,11 +1,11 @@
 # ### Environment setup ###
 from __future__ import annotations
 
-from collections.abc import Callable
 import os
 import threading
 import time
 import unittest
+from collections.abc import Callable
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -23,14 +23,16 @@ from housemaker.glb import GeneratedModel
 from housemaker.viewer import (
     GlbViewerWidget,
     SelectableGLViewWidget,
-    _FaceRectangleSelectionResult,
-    _WireframeOverlayMeshItem,
     _capture_face_selection_raster_input,
+    _DepthTestedOverlayScatterItem,
+    _FaceRectangleSelectionResult,
     _get_nearest_triangle_ray_face_index,
     _project_vertices_to_view,
     _rasterize_face_selection,
+    _rasterize_visible_vertex_selection,
+    _VertexRectangleSelectionResult,
+    _WireframeOverlayMeshItem,
 )
-
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -517,6 +519,56 @@ class ObjectFaceSelectionGeometryTests(unittest.TestCase):
 
         self.assertEqual(visible, {0})
 
+    def test_vertex_selection_excludes_vertices_hidden_by_a_front_face(
+        self,
+    ) -> None:
+        projected_vertices = np.asarray(
+            (
+                (0.0, 10.0, 0.5, 1.0),
+                (10.0, 10.0, 0.5, 1.0),
+                (5.0, 0.0, 0.5, 1.0),
+                (0.0, 10.0, -0.5, 1.0),
+                (10.0, 10.0, -0.5, 1.0),
+                (5.0, 0.0, -0.5, 1.0),
+            ),
+            dtype=float,
+        )
+        faces = np.asarray(((0, 1, 2), (3, 4, 5)), dtype=np.int64)
+
+        selected = _rasterize_visible_vertex_selection(
+            ((projected_vertices, faces),),
+            QRect(0, 0, 11, 11),
+            faces,
+            6,
+        )
+
+        self.assertEqual(selected, (3, 4, 5))
+
+    def test_mirrored_projected_vertices_keep_canonical_source_ids(self) -> None:
+        retained = np.asarray(
+            (
+                (30.0, 40.0, 0.0, 1.0),
+                (40.0, 40.0, 0.0, 1.0),
+                (35.0, 30.0, 0.0, 1.0),
+            ),
+            dtype=float,
+        )
+        mirrored = retained.copy()
+        mirrored[:, 0] -= 30.0
+        faces = np.asarray(((0, 1, 2),), dtype=np.int64)
+
+        selected = _rasterize_visible_vertex_selection(
+            (
+                (retained, faces),
+                (mirrored, faces[:, (0, 2, 1)]),
+            ),
+            QRect(0, 20, 11, 21),
+            faces,
+            3,
+        )
+
+        self.assertEqual(selected, (0, 1, 2))
+
 
 # ### Widget interaction tests ###
 class ObjectFaceSelectionWidgetTests(unittest.TestCase):
@@ -548,13 +600,15 @@ class ObjectFaceSelectionWidgetTests(unittest.TestCase):
         viewer.set_face_edit_geometry(vertices, faces)
         return viewer
 
-    def test_shift_click_is_opt_in_and_ctrl_click_is_untouched(self) -> None:
+    def test_shift_and_ctrl_clicks_route_to_separate_editing_modes(self) -> None:
         view = SelectableGLViewWidget()
         self.widgets.append(view)
         view.resize(200, 160)
         view.show()
-        pressed = QSignalSpy(view.face_selection_pointer_pressed)
-        released = QSignalSpy(view.face_selection_pointer_released)
+        face_pressed = QSignalSpy(view.face_selection_pointer_pressed)
+        face_released = QSignalSpy(view.face_selection_pointer_released)
+        vertex_pressed = QSignalSpy(view.vertex_selection_pointer_pressed)
+        vertex_released = QSignalSpy(view.vertex_selection_pointer_released)
 
         QTest.mouseClick(
             view,
@@ -562,8 +616,10 @@ class ObjectFaceSelectionWidgetTests(unittest.TestCase):
             Qt.KeyboardModifier.ShiftModifier,
             QPoint(80, 60),
         )
-        self.assertEqual(pressed.count(), 0)
-        self.assertEqual(released.count(), 0)
+        self.assertEqual(face_pressed.count(), 0)
+        self.assertEqual(face_released.count(), 0)
+        self.assertEqual(vertex_pressed.count(), 0)
+        self.assertEqual(vertex_released.count(), 0)
 
         view.set_face_selection_gestures_enabled(True)
         QTest.mouseClick(
@@ -572,16 +628,155 @@ class ObjectFaceSelectionWidgetTests(unittest.TestCase):
             Qt.KeyboardModifier.ControlModifier,
             QPoint(80, 60),
         )
-        self.assertEqual(pressed.count(), 0)
-        self.assertEqual(released.count(), 0)
+        self.assertEqual(face_pressed.count(), 0)
+        self.assertEqual(face_released.count(), 0)
+        self.assertEqual(vertex_pressed.count(), 1)
+        self.assertEqual(vertex_released.count(), 1)
+        QTest.mouseClick(
+            view,
+            Qt.MouseButton.LeftButton,
+            (
+                Qt.KeyboardModifier.ControlModifier
+                | Qt.KeyboardModifier.ShiftModifier
+            ),
+            QPoint(80, 60),
+        )
+        self.assertEqual(face_pressed.count(), 0)
+        self.assertEqual(face_released.count(), 0)
+        self.assertEqual(vertex_pressed.count(), 2)
+        self.assertEqual(vertex_released.count(), 2)
         QTest.mouseClick(
             view,
             Qt.MouseButton.LeftButton,
             Qt.KeyboardModifier.ShiftModifier,
             QPoint(80, 60),
         )
-        self.assertEqual(pressed.count(), 1)
-        self.assertEqual(released.count(), 1)
+        self.assertEqual(face_pressed.count(), 1)
+        self.assertEqual(face_released.count(), 1)
+        self.assertEqual(vertex_pressed.count(), 2)
+        self.assertEqual(vertex_released.count(), 2)
+
+    def test_ctrl_click_toggles_ordered_vertices_and_excludes_faces(self) -> None:
+        viewer = self._build_face_edit_viewer()
+        vertex_changes = QSignalSpy(viewer.vertex_selection_changed)
+        face_changes = QSignalSpy(viewer.face_selection_changed)
+        viewer.set_selected_face_indices((1,))
+
+        with patch.object(
+            viewer,
+            "_pick_editable_vertex",
+            side_effect=(2, 0, 2),
+        ):
+            for _index in range(3):
+                viewer._handle_vertex_selection_pointer_pressed(
+                    QPointF(50.0, 50.0)
+                )
+                viewer._handle_vertex_selection_pointer_released(
+                    QPointF(50.0, 50.0)
+                )
+
+        self.assertEqual(viewer.get_selected_vertex_indices(), (0,))
+        self.assertEqual(viewer.get_selected_face_indices(), ())
+        self.assertGreaterEqual(vertex_changes.count(), 3)
+        self.assertGreaterEqual(face_changes.count(), 2)
+
+        viewer.update_face_selection((0,), mode="add")
+
+        self.assertEqual(viewer.get_selected_vertex_indices(), ())
+        self.assertEqual(viewer.get_selected_face_indices(), (0,))
+
+    def test_uv_seam_duplicates_share_one_vertex_selection(self) -> None:
+        viewer = self._build_face_edit_viewer()
+        requests = QSignalSpy(viewer.object_face_creation_requested)
+
+        # IDs 1 and 3 are separate UV corners at the same XYZ position.
+        viewer.set_selected_vertex_indices((3,))
+        self.assertEqual(viewer.get_selected_vertex_indices(), (1,))
+
+        viewer.update_vertex_selection((1,), mode="toggle")
+        self.assertEqual(viewer.get_selected_vertex_indices(), ())
+        viewer.update_vertex_selection((3,), mode="toggle")
+        self.assertEqual(viewer.get_selected_vertex_indices(), (1,))
+
+        viewer.set_selected_vertex_indices((4, 1, 3))
+        self.assertEqual(viewer.get_selected_vertex_indices(), (4, 1))
+        QTest.keyClick(viewer.view, Qt.Key.Key_F)
+        self.assertEqual(requests.count(), 0)
+
+    def test_picker_returns_the_uv_seam_position_representative(self) -> None:
+        viewer = self._build_face_edit_viewer()
+        projected = np.zeros((6, 4), dtype=float)
+        projected[:, 3] = 1.0
+        projected[1] = (50.0, 50.0, 0.0, 1.0)
+        projected[3] = (50.0, 50.0, 0.0, 1.0)
+        assert viewer._face_edit_faces is not None
+
+        with (
+            patch(
+                "housemaker.viewer._capture_face_selection_raster_input",
+                return_value=(
+                    ((projected, viewer._face_edit_faces),),
+                    (38, 38, 25, 25),
+                ),
+            ),
+            patch(
+                "housemaker.viewer._rasterize_visible_vertex_selection",
+                return_value=(3,),
+            ),
+        ):
+            selected = viewer._pick_editable_vertex(QPointF(50.0, 50.0))
+
+        self.assertEqual(selected, 1)
+
+    def test_mirrored_preview_draws_one_marker_per_uv_seam_position(
+        self,
+    ) -> None:
+        viewer = self._build_face_edit_viewer()
+        viewer.set_symmetric_division_preview("vertical", 0.0)
+
+        viewer.set_selected_vertex_indices((3, 1))
+
+        self.assertEqual(viewer.get_selected_vertex_indices(), (1,))
+        assert viewer._vertex_selection_item is not None
+        assert viewer._mirrored_vertex_selection_item is not None
+        self.assertEqual(len(viewer._vertex_selection_item.pos), 1)
+        self.assertEqual(len(viewer._mirrored_vertex_selection_item.pos), 1)
+
+    def test_orbit_f_requests_a_face_in_vertex_selection_order(self) -> None:
+        viewer = self._build_face_edit_viewer()
+        viewer.resize(320, 240)
+        viewer.show()
+        requests = QSignalSpy(viewer.object_face_creation_requested)
+
+        viewer.set_selected_vertex_indices((4, 1))
+        QTest.keyClick(viewer.view, Qt.Key.Key_F)
+        self.assertEqual(requests.count(), 0)
+
+        viewer.set_selected_vertex_indices((4, 1, 2))
+        QTest.keyClick(
+            viewer.view,
+            Qt.Key.Key_F,
+            Qt.KeyboardModifier.ControlModifier,
+        )
+
+        self.assertEqual(requests.count(), 1)
+        self.assertEqual(tuple(requests.at(0)[0]), (4, 1, 2))
+
+    def test_first_person_f_remains_camera_movement(self) -> None:
+        viewer = self._build_face_edit_viewer()
+        viewer.resize(320, 240)
+        viewer.show()
+        viewer.set_selected_vertex_indices((0, 1, 2))
+        requests = QSignalSpy(viewer.object_face_creation_requested)
+        viewer.view.enter_first_person_mode()
+
+        QTest.keyPress(viewer.view, Qt.Key.Key_F)
+
+        self.assertEqual(requests.count(), 0)
+        self.assertIn(Qt.Key.Key_F, viewer.view._pressed_movement_keys)
+
+        QTest.keyRelease(viewer.view, Qt.Key.Key_F)
+        self.assertNotIn(Qt.Key.Key_F, viewer.view._pressed_movement_keys)
 
     def test_plain_click_is_inert_in_face_editor_and_keeps_navigation_live(
         self,
@@ -843,6 +1038,70 @@ class ObjectFaceSelectionWidgetTests(unittest.TestCase):
         self.assertEqual(delivery_threads, [main_thread_id])
         self.assertEqual(viewer.get_selected_face_indices(), (1,))
 
+    def test_vertex_rectangle_selection_runs_on_a_daemon_thread(self) -> None:
+        viewer = self._build_face_edit_viewer()
+        viewer.resize(320, 240)
+        viewer.show()
+        _qt_application.processEvents()
+        main_thread_id = threading.get_ident()
+        started = threading.Event()
+        release = threading.Event()
+        observations: dict[str, object] = {}
+        delivery_threads: list[int] = []
+        viewer.vertex_selection_changed.connect(
+            lambda _indices: delivery_threads.append(threading.get_ident())
+        )
+        changed = QSignalSpy(viewer.vertex_selection_changed)
+
+        def blocking_raster(
+            projected_geometry: object,
+            _rectangle: object,
+            source_faces: np.ndarray,
+            source_vertex_count: int,
+            *,
+            cancel_event: threading.Event | None = None,
+        ) -> tuple[int, ...]:
+            arrays = tuple(
+                array
+                for pair in projected_geometry  # type: ignore[union-attr]
+                for array in pair
+            ) + (source_faces,)
+            observations["thread_id"] = threading.get_ident()
+            observations["daemon"] = threading.current_thread().daemon
+            observations["read_only"] = all(
+                not array.flags.writeable for array in arrays
+            )
+            observations["vertex_count"] = source_vertex_count
+            observations["cancel_event"] = cancel_event is not None
+            started.set()
+            release.wait(5.0)
+            return (2, 0)
+
+        try:
+            with patch(
+                "housemaker.viewer._rasterize_visible_vertex_selection",
+                side_effect=blocking_raster,
+            ):
+                self.assertTrue(
+                    viewer._start_editable_vertex_rectangle_selection(
+                        QPointF(10.0, 10.0),
+                        QPointF(180.0, 160.0),
+                    )
+                )
+                self.assertTrue(started.wait(2.0))
+                release.set()
+                self.assertTrue(_wait_until(lambda: changed.count() == 1))
+        finally:
+            release.set()
+
+        self.assertNotEqual(observations["thread_id"], main_thread_id)
+        self.assertTrue(observations["daemon"])
+        self.assertTrue(observations["read_only"])
+        self.assertEqual(observations["vertex_count"], 6)
+        self.assertTrue(observations["cancel_event"])
+        self.assertEqual(delivery_threads, [main_thread_id])
+        self.assertEqual(viewer.get_selected_vertex_indices(), (2, 0))
+
     def test_stale_rectangle_results_are_rejected_by_both_revisions(
         self,
     ) -> None:
@@ -886,6 +1145,47 @@ class ObjectFaceSelectionWidgetTests(unittest.TestCase):
 
         self.assertEqual(changed.count(), 0)
         self.assertEqual(viewer.get_selected_face_indices(), ())
+
+    def test_stale_vertex_rectangle_results_are_rejected(self) -> None:
+        viewer = self._build_face_edit_viewer()
+        changed = QSignalSpy(viewer.vertex_selection_changed)
+        old_request_revision = (
+            viewer._face_rectangle_selection_request_revision
+        )
+
+        viewer._invalidate_face_rectangle_selection_requests()
+        viewer._vertex_rectangle_selection_completed.emit(
+            _VertexRectangleSelectionResult(
+                request_revision=old_request_revision,
+                geometry_revision=viewer._face_selection_geometry_revision,
+                vertex_indices=(0, 1, 2),
+            )
+        )
+        QTest.qWait(20)
+
+        self.assertEqual(changed.count(), 0)
+        self.assertEqual(viewer.get_selected_vertex_indices(), ())
+
+        old_geometry_revision = viewer._face_selection_geometry_revision
+        assert viewer._face_edit_vertices is not None
+        assert viewer._face_edit_faces is not None
+        viewer.set_face_edit_geometry(
+            viewer._face_edit_vertices,
+            viewer._face_edit_faces,
+        )
+        viewer._vertex_rectangle_selection_completed.emit(
+            _VertexRectangleSelectionResult(
+                request_revision=(
+                    viewer._face_rectangle_selection_request_revision
+                ),
+                geometry_revision=old_geometry_revision,
+                vertex_indices=(3, 4, 5),
+            )
+        )
+        QTest.qWait(20)
+
+        self.assertEqual(changed.count(), 0)
+        self.assertEqual(viewer.get_selected_vertex_indices(), ())
 
     def test_close_cancels_pending_rectangle_result_delivery(self) -> None:
         viewer = self._build_face_edit_viewer()
@@ -963,6 +1263,28 @@ class ObjectFaceSelectionWidgetTests(unittest.TestCase):
         self.assertIsInstance(
             viewer._mirrored_face_selection_item,
             _WireframeOverlayMeshItem,
+        )
+
+        viewer.set_selected_vertex_indices((0, 2))
+
+        self.assertIsInstance(
+            viewer._vertex_selection_item,
+            _DepthTestedOverlayScatterItem,
+        )
+        self.assertIsInstance(
+            viewer._mirrored_vertex_selection_item,
+            _DepthTestedOverlayScatterItem,
+        )
+        assert viewer._mirrored_vertex_selection_item is not None
+        np.testing.assert_allclose(
+            viewer._mirrored_vertex_selection_item.pos,
+            np.asarray(
+                (
+                    (-1.0, -1.0, -1.0),
+                    (-1.0, 0.0, 1.0),
+                ),
+                dtype=np.float32,
+            ),
         )
 
 
