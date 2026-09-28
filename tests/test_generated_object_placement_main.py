@@ -21,7 +21,11 @@ from housemaker.generation_state import (
     GeneratedObjectRecord,
     GenerationData,
 )
-from housemaker.glb import GeneratedModel, PlacedGeneratedModel
+from housemaker.glb import (
+    GeneratedModel,
+    PlacedGeneratedModel,
+    build_placed_generated_model_top_down_footprint,
+)
 from housemaker.level_coordinates import (
     build_level_base_z_lookup,
     level_image_to_world_xy,
@@ -146,6 +150,191 @@ class GeneratedObjectPlacementMainTests(unittest.TestCase):
         self.workspace.generation.operation_finished.emit("operation-two")
         self.assertIsNone(self.workspace._direct_object_placement_session)
         self.assertFalse(self.workspace.viewer.is_object_placement_active)
+
+    def test_top_down_footprint_includes_scale_rotation_and_mirrored_half(
+        self,
+    ) -> None:
+        retained_mesh = trimesh.creation.box(extents=(1.0, 2.0, 1.0))
+        retained_mesh.apply_translation((0.5, 0.0, 0.0))
+        scene = trimesh.Scene(retained_mesh.copy())
+        generated_model = GeneratedModel(
+            mesh=retained_mesh,
+            scene=scene,
+            glb_bytes=scene.export(file_type="glb"),
+        )
+        placement = PlacedGeneratedModel(
+            object_id="half-cabinet",
+            model=generated_model,
+            world_position=(5.0, 6.0, 0.0),
+            symmetric_preview_orientation="vertical",
+            symmetric_preview_plane_coordinate=0.0,
+            rotation_degrees=(0.0, 0.0, 90.0),
+            scale=2.0,
+            axis_scales=(0.5, 1.0, 1.0),
+        )
+
+        corners = build_placed_generated_model_top_down_footprint(placement)
+
+        self.assertEqual(len(corners), 4)
+        self.assertAlmostEqual(min(x for x, _y in corners), 3.0)
+        self.assertAlmostEqual(max(x for x, _y in corners), 7.0)
+        self.assertAlmostEqual(min(y for _x, y in corners), 4.5)
+        self.assertAlmostEqual(max(y for _x, y in corners), 6.5)
+
+    def test_2d_profile_transform_preserves_non_planar_placement_fields(
+        self,
+    ) -> None:
+        level = _level(2)
+        self.workspace.levels = [level]
+        self.workspace.current_level_index = 0
+        original = GeneratedObjectPlacement(
+            level_index=2,
+            image_x=40.0,
+            image_y=50.0,
+            height_offset_meters=1.25,
+            rotation_degrees=(12.0, 18.0, 25.0),
+            scale=1.75,
+            axis_scales=(0.8, 1.2, 1.5),
+        )
+        self.workspace.generation.set_data(
+            GenerationData(generated_objects=[_record("chair", original)])
+        )
+        undo_count = len(self.workspace._canvas_undo_stack)
+
+        with (
+            patch.object(
+                self.workspace,
+                "_sync_canvas_placed_object_profiles",
+            ) as sync_profiles,
+            patch.object(
+                self.workspace,
+                "_schedule_viewer_preview_refresh",
+            ) as schedule_refresh,
+            patch.object(
+                self.workspace.viewer,
+                "apply_placed_object_transform_preview",
+                return_value=False,
+            ),
+        ):
+            self.workspace._handle_blueprint_placed_object_transform_committed(
+                "chair",
+                65.0,
+                72.0,
+                -35.0,
+            )
+
+        placement = self.workspace.generation.get_generated_object_placement("chair")
+        self.assertIsNotNone(placement)
+        assert placement is not None
+        self.assertEqual((placement.image_x, placement.image_y), (65.0, 72.0))
+        self.assertEqual(placement.height_offset_meters, 1.25)
+        self.assertEqual(placement.rotation_degrees, (12.0, 18.0, -35.0))
+        self.assertEqual(placement.scale, 1.75)
+        self.assertEqual(placement.axis_scales, (0.8, 1.2, 1.5))
+        self.assertEqual(len(self.workspace._canvas_undo_stack), undo_count + 1)
+        sync_profiles.assert_called_once_with()
+        schedule_refresh.assert_called_once_with(preserve_camera=True)
+
+    def test_2d_transform_uses_retained_preview_and_is_undoable(self) -> None:
+        level = _level(2, scale=1.5, offset_x_meters=2.0, offset_y_meters=-1.0)
+        self.workspace.levels = [level]
+        self.workspace.current_level_index = 0
+        original = GeneratedObjectPlacement(
+            level_index=2,
+            image_x=30.0,
+            image_y=45.0,
+            height_offset_meters=0.75,
+            rotation_degrees=(5.0, 10.0, 15.0),
+            scale=1.25,
+            axis_scales=(0.9, 1.1, 1.0),
+        )
+        self.workspace.generation.set_data(
+            GenerationData(generated_objects=[_record("chair", original)])
+        )
+        undo_count = len(self.workspace._canvas_undo_stack)
+        expected_x, expected_y = level_image_to_world_xy(level, 80.0, 65.0)
+        expected_z = (
+            build_level_base_z_lookup(self.workspace.levels)[2]
+            + original.height_offset_meters
+        )
+
+        with (
+            patch.object(
+                self.workspace.viewer,
+                "apply_placed_object_transform_preview",
+                return_value=True,
+            ) as apply_preview,
+            patch.object(
+                self.workspace,
+                "_sync_canvas_placed_object_profiles",
+            ),
+            patch.object(self.workspace, "_queue_viewer_preview_refresh"),
+        ):
+            self.workspace._handle_blueprint_placed_object_transform_committed(
+                "chair",
+                80.0,
+                65.0,
+                -40.0,
+            )
+
+        apply_preview.assert_called_once_with(
+            "chair",
+            (expected_x, expected_y, expected_z),
+            (5.0, 10.0, -40.0),
+        )
+        changed = self.workspace.generation.get_generated_object_placement("chair")
+        self.assertIsNotNone(changed)
+        assert changed is not None
+        self.assertEqual((changed.image_x, changed.image_y), (80.0, 65.0))
+        self.assertEqual(changed.rotation_degrees, (5.0, 10.0, -40.0))
+        self.assertEqual(len(self.workspace._canvas_undo_stack), undo_count + 1)
+
+        with (
+            patch.object(self.workspace, "_sync_atlas_object_texture_sources"),
+            patch.object(self.workspace, "_sync_canvas_placed_object_profiles"),
+            patch.object(self.workspace, "_schedule_viewer_preview_refresh"),
+        ):
+            self.workspace._handle_canvas_undo_requested()
+
+        self.assertEqual(
+            self.workspace.generation.get_generated_object_placement("chair"),
+            original,
+        )
+        self.assertEqual(len(self.workspace._canvas_undo_stack), undo_count)
+
+    def test_2d_profiles_include_only_objects_on_the_current_level(self) -> None:
+        current_level = _level(2, include_in_export=False)
+        other_level = _level(3)
+        self.workspace.levels = [current_level, other_level]
+        self.workspace.current_level_index = 0
+        self.workspace.canvas.set_stair_context((), current_level)
+        self.workspace.generation.set_data(
+            GenerationData(
+                generated_objects=[
+                    _record(
+                        "chair",
+                        GeneratedObjectPlacement(2, 40.0, 50.0),
+                    ),
+                    _record(
+                        "table",
+                        GeneratedObjectPlacement(3, 70.0, 60.0),
+                    ),
+                ]
+            )
+        )
+        model = _generated_model((2.0, 1.0, 1.0))
+
+        with patch.object(
+            self.workspace.generation,
+            "get_generated_object_model",
+            return_value=model,
+        ):
+            self.workspace._sync_canvas_placed_object_profiles()
+
+        profiles = self.workspace.canvas.get_placed_object_profiles()
+        self.assertEqual(tuple(profile.object_id for profile in profiles), ("chair",))
+        self.assertEqual(profiles[0].level_index, 2)
+        self.assertEqual((profiles[0].anchor_x, profiles[0].anchor_y), (40.0, 50.0))
 
     def test_completed_atlas_request_uses_actual_model_preview(self) -> None:
         model = _generated_model()

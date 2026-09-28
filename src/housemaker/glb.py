@@ -1050,6 +1050,83 @@ def compose_placed_generated_models_preview(
     )
 
 
+def build_placed_generated_model_top_down_footprint(
+    placement: PlacedGeneratedModel,
+) -> tuple[tuple[float, float], ...]:
+    """Return a yaw-aligned world-XY rectangle around one visible object.
+
+    The bounds include pitch, roll, non-uniform scaling, and the viewer-only
+    mirrored half of symmetric objects.  Keeping the rectangle aligned to the
+    object's Z rotation makes its Canvas rotation handle predictable while the
+    bounds still contain the complete top-down projection.
+    """
+
+    if not isinstance(placement, PlacedGeneratedModel):
+        raise TypeError("Placed-object footprints require a placed model.")
+    source_vertices = np.asarray(placement.model.mesh.vertices, dtype=float)
+    if source_vertices.ndim != 2 or source_vertices.shape[1:] != (3,):
+        raise ValueError("Placed-object footprints require XYZ mesh vertices.")
+    if not len(source_vertices) or not np.all(np.isfinite(source_vertices)):
+        raise ValueError("Placed-object footprint vertices must be finite.")
+
+    footprint_vertices = [source_vertices]
+    orientation = placement.symmetric_preview_orientation
+    if orientation is not None:
+        plane_coordinate = placement.symmetric_preview_plane_coordinate
+        assert plane_coordinate is not None
+        mirrored_vertices = source_vertices.copy()
+        mirror_axis = SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION[orientation]
+        mirrored_vertices[:, mirror_axis] = (
+            float(plane_coordinate) * 2.0
+            - mirrored_vertices[:, mirror_axis]
+        )
+        footprint_vertices.append(mirrored_vertices)
+
+    local_vertices = np.concatenate(footprint_vertices, axis=0)
+    world_vertices = trimesh.transform_points(
+        local_vertices,
+        _build_placed_model_transform(placement),
+    )
+    world_xy = np.asarray(world_vertices[:, :2], dtype=float)
+    if not np.all(np.isfinite(world_xy)):
+        raise ValueError("Placed-object world footprint vertices must be finite.")
+
+    anchor_xy = np.asarray(placement.world_position[:2], dtype=float)
+    yaw_radians = math.radians(float(placement.rotation_degrees[2]))
+    yaw_x_axis = np.array(
+        [math.cos(yaw_radians), math.sin(yaw_radians)],
+        dtype=float,
+    )
+    yaw_y_axis = np.array(
+        [-math.sin(yaw_radians), math.cos(yaw_radians)],
+        dtype=float,
+    )
+    relative_xy = world_xy - anchor_xy
+    yaw_local_xy = np.column_stack(
+        (
+            relative_xy @ yaw_x_axis,
+            relative_xy @ yaw_y_axis,
+        )
+    )
+    minimum = np.min(yaw_local_xy, axis=0)
+    maximum = np.max(yaw_local_xy, axis=0)
+
+    corners: list[tuple[float, float]] = []
+    for local_x, local_y in (
+        (minimum[0], minimum[1]),
+        (maximum[0], minimum[1]),
+        (maximum[0], maximum[1]),
+        (minimum[0], maximum[1]),
+    ):
+        world_corner = (
+            anchor_xy
+            + yaw_x_axis * float(local_x)
+            + yaw_y_axis * float(local_y)
+        )
+        corners.append((float(world_corner[0]), float(world_corner[1])))
+    return tuple(corners)
+
+
 def _compose_placed_generated_models(
     base_model: GeneratedModel,
     placements: Sequence[PlacedGeneratedModel],

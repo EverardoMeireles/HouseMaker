@@ -5041,6 +5041,59 @@ class GlbViewerWidget(QWidget):
 
         return self._selected_placed_object_ids
 
+    def apply_placed_object_transform_preview(
+        self,
+        object_id: str,
+        world_position: object,
+        rotation_degrees: object,
+    ) -> bool:
+        """Move one retained object immediately without emitting a gizmo commit."""
+
+        normalized_object_id = str(object_id).strip()
+        group = self._placed_object_render_groups.get(normalized_object_id)
+        if group is None or self._placed_object_transform_drag is not None:
+            return False
+        try:
+            normalized_position = tuple(float(value) for value in world_position)
+            normalized_rotation = tuple(float(value) for value in rotation_degrees)
+            if (
+                len(normalized_position) != 3
+                or len(normalized_rotation) != 3
+                or not all(
+                    math.isfinite(value)
+                    for value in (*normalized_position, *normalized_rotation)
+                )
+            ):
+                return False
+            local_pivot = _transform_point(
+                np.linalg.inv(group.preview.placement_transform),
+                group.preview.world_position,
+            )
+            scaled_rotation = _build_placed_object_scaled_rotation(
+                normalized_rotation,
+                group.preview.scale,
+                group.preview.axis_scales,
+            )
+            transform = _build_pivoted_world_transform(
+                normalized_position,
+                scaled_rotation,
+                local_pivot,
+            )
+        except (TypeError, ValueError, OverflowError, np.linalg.LinAlgError):
+            return False
+
+        group.current_transform = np.asarray(transform, dtype=float)
+        group.root_item.setTransform(_numpy_transform_to_qt(transform))
+        self._remember_placed_object_preview_transform(
+            group,
+            normalized_position,
+            normalized_rotation,
+            group.preview.axis_scales,
+        )
+        self._sync_placed_object_selection_rendering()
+        self.view.update()
+        return True
+
     def get_placed_object_gizmo_mode(self) -> str:
         """Return whether the active object shows transform or scale handles."""
 

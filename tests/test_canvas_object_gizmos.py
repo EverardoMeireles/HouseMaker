@@ -358,6 +358,47 @@ class CanvasObjectGizmoTests(unittest.TestCase):
         viewer.set_model(_build_preview_model(), preserve_camera=True)
         self.assertIsNone(viewer.get_selected_placed_object_id())
 
+    def test_external_profile_transform_updates_the_retained_object_root(self) -> None:
+        original = _build_placed_object(
+            "chair",
+            world_position=(1.0, 2.0, 0.0),
+            scale=1.5,
+            axis_scales=(0.8, 1.2, 1.4),
+        )
+        viewer = self._build_viewer(original)
+        group = viewer._placed_object_render_groups["chair"]
+        local_pivot = _transform_point(
+            np.linalg.inv(group.preview.placement_transform),
+            group.preview.world_position,
+        )
+        emitted: list[object] = []
+        viewer.placed_object_transform_changed.connect(emitted.append)
+
+        self.assertTrue(
+            viewer.apply_placed_object_transform_preview(
+                "chair",
+                (4.0, 5.0, 1.25),
+                (10.0, 20.0, 35.0),
+            )
+        )
+
+        np.testing.assert_allclose(
+            _transform_point(group.current_transform, local_pivot),
+            (4.0, 5.0, 1.25),
+        )
+        self.assertEqual(group.preview.world_position, (4.0, 5.0, 1.25))
+        self.assertEqual(group.preview.rotation_degrees, (10.0, 20.0, 35.0))
+        self.assertEqual(group.preview.scale, 1.5)
+        self.assertEqual(group.preview.axis_scales, (0.8, 1.2, 1.4))
+        self.assertEqual(emitted, [])
+        self.assertFalse(
+            viewer.apply_placed_object_transform_preview(
+                "missing",
+                (0.0, 0.0, 0.0),
+                (0.0, 0.0, 0.0),
+            )
+        )
+
     def test_selected_object_gizmos_remain_visible_through_its_mesh(self) -> None:
         viewer = self._build_viewer(_build_placed_object("chair"))
 

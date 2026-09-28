@@ -16,6 +16,11 @@ import trimesh
 from PySide6.QtWidgets import QApplication
 
 from housemaker.app_settings import ApplicationSettingsStore
+from housemaker.generation_state import (
+    GeneratedObjectPlacement,
+    GeneratedObjectRecord,
+    GenerationData,
+)
 from housemaker.glb import GeneratedModel, PreviewPlacedObject
 from housemaker.main import BlueprintWorkspace
 from housemaker.models import LevelData, VertexData
@@ -98,6 +103,19 @@ def _empty_level() -> LevelData:
     )
 
 
+def _generated_object_record(object_id: str) -> GeneratedObjectRecord:
+    return GeneratedObjectRecord(
+        object_id=object_id,
+        frame_index=0,
+        object_name=object_id.title(),
+        pipeline={},
+        provider="meshy",
+        provider_task_id=f"task-{object_id}",
+        asset_path=f"{object_id}.glb",
+        placement=GeneratedObjectPlacement(0, 50.0, 50.0),
+    )
+
+
 # ### Main-workspace multi-object selection tests ###
 class CanvasMultiObjectSelectionMainTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -133,6 +151,14 @@ class CanvasMultiObjectSelectionMainTests(unittest.TestCase):
         )
         self.assertEqual(
             self.workspace._desired_canvas_object_id,
+            active_object_id,
+        )
+        self.assertEqual(
+            self.workspace.canvas.get_selected_placed_object_ids(),
+            ("chair", "table"),
+        )
+        self.assertEqual(
+            self.workspace.canvas.get_active_placed_object_id(),
             active_object_id,
         )
 
@@ -184,6 +210,37 @@ class CanvasMultiObjectSelectionMainTests(unittest.TestCase):
             self.workspace._desired_canvas_surface_ids,
             (wall.surface_id,),
         )
+
+    def test_2d_profile_selection_updates_the_shared_scene_selection(self) -> None:
+        level = _empty_level()
+        self.workspace.levels = [level]
+        self.workspace.current_level_index = 0
+        self.workspace.generation.set_data(
+            GenerationData(
+                generated_objects=[_generated_object_record("chair")]
+            )
+        )
+        self.workspace.viewer.set_model(_preview_model("chair"))
+        wall = _wall()
+        self.workspace._set_canvas_viewer_targets((wall,))
+        self.workspace.canvas.set_selected_wall_surface_id(wall.surface_id)
+
+        self.workspace._handle_blueprint_placed_object_selection_requested(
+            ("chair",),
+            "chair",
+        )
+
+        self.assertEqual(self.workspace._desired_canvas_object_ids, ("chair",))
+        self.assertEqual(self.workspace._desired_canvas_object_id, "chair")
+        self.assertEqual(
+            self.workspace.viewer.get_selected_placed_object_ids(),
+            ("chair",),
+        )
+        self.assertEqual(
+            self.workspace.canvas.get_selected_placed_object_ids(),
+            ("chair",),
+        )
+        self.assertIsNone(self.workspace.canvas.get_selected_wall_surface_id())
 
     def test_discarding_one_selected_object_retains_the_other_selection(
         self,

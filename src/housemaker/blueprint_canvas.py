@@ -138,6 +138,15 @@ SELECTED_OPEN_SPACE_EDGE_COLOR = QColor("#f6c85f")
 PENDING_OPEN_SPACE_FILL_COLOR = QColor(255, 209, 102, 64)
 PENDING_OPEN_SPACE_EDGE_COLOR = QColor("#ffd166")
 OPEN_SPACE_HIT_TOLERANCE_SCREEN = 8.0
+PLACED_OBJECT_FILL_COLOR = QColor(46, 229, 157, 72)
+PLACED_OBJECT_EDGE_COLOR = QColor("#2ee59d")
+PLACED_OBJECT_SELECTED_EDGE_COLOR = QColor("#f6c85f")
+PLACED_OBJECT_EDGE_WIDTH_SCREEN = 2.0
+PLACED_OBJECT_SELECTED_EDGE_WIDTH_SCREEN = 3.0
+PLACED_OBJECT_PROFILE_HIT_TOLERANCE_SCREEN = 8.0
+PLACED_OBJECT_ROTATION_HANDLE_RADIUS_SCREEN = 7.0
+PLACED_OBJECT_ROTATION_HANDLE_HIT_RADIUS_SCREEN = 12.0
+PLACED_OBJECT_ROTATION_HANDLE_OFFSET_SCREEN = 28.0
 PLAN_IMAGE_ERASE_SELECTION_FILL_COLOR = QColor(255, 255, 255, 72)
 PLAN_IMAGE_ERASE_SELECTION_OUTLINE_COLOR = QColor("#ffffff")
 PLAN_IMAGE_ERASE_SELECTION_OUTLINE_SHADOW_COLOR = QColor("#20242a")
@@ -385,6 +394,71 @@ class StairHit:
     endpoint_name: str
 
 
+@dataclass(frozen=True)
+class CanvasPlacedObjectProfile:
+    """One placed object's complete top-down footprint in image coordinates."""
+
+    object_id: str
+    level_index: int
+    anchor_x: float
+    anchor_y: float
+    corners: tuple[tuple[float, float], ...]
+    rotation_degrees: tuple[float, float, float]
+
+    def __post_init__(self) -> None:
+        normalized_id = str(self.object_id).strip()
+        if not normalized_id:
+            raise ValueError("Canvas placed-object profile IDs cannot be empty.")
+        if isinstance(self.level_index, bool):
+            raise TypeError("Canvas placed-object profile levels must be integers.")
+        normalized_level_index = int(self.level_index)
+        normalized_anchor = (float(self.anchor_x), float(self.anchor_y))
+        normalized_corners = tuple(
+            (float(corner[0]), float(corner[1]))
+            for corner in self.corners
+        )
+        normalized_rotation = tuple(float(value) for value in self.rotation_degrees)
+        if len(normalized_corners) != 4:
+            raise ValueError("Canvas placed-object profiles require four corners.")
+        if len(normalized_rotation) != 3:
+            raise ValueError("Canvas placed-object rotations require XYZ angles.")
+        if not all(
+            math.isfinite(value)
+            for value in (
+                *normalized_anchor,
+                *(coordinate for corner in normalized_corners for coordinate in corner),
+                *normalized_rotation,
+            )
+        ):
+            raise ValueError("Canvas placed-object profile values must be finite.")
+        object.__setattr__(self, "object_id", normalized_id)
+        object.__setattr__(self, "level_index", normalized_level_index)
+        object.__setattr__(self, "anchor_x", normalized_anchor[0])
+        object.__setattr__(self, "anchor_y", normalized_anchor[1])
+        object.__setattr__(self, "corners", normalized_corners)
+        object.__setattr__(self, "rotation_degrees", normalized_rotation)
+
+
+@dataclass(frozen=True)
+class _PlacedObjectWidgetGeometry:
+    polygon: QPolygonF
+    anchor: QPointF
+    rotation_connector_start: QPointF
+    rotation_handle: QPointF
+
+
+@dataclass
+class _PlacedObjectEditDrag:
+    object_id: str
+    operation: str
+    press_widget_point: QPointF
+    press_image_point: QPointF
+    initial_profile: CanvasPlacedObjectProfile
+    latest_external_profile: CanvasPlacedObjectProfile
+    initial_pointer_angle_radians: float | None = None
+    active: bool = False
+
+
 # ### Widgets ###
 class BlueprintCanvas(QWidget):
     geometry_changed = Signal()
@@ -415,6 +489,8 @@ class BlueprintCanvas(QWidget):
     plan_image_erase_mode_changed = Signal(bool)
     plan_image_erase_committed = Signal(object)
     plan_image_erase_failed = Signal(str)
+    placed_object_selection_requested = Signal(object, object)
+    placed_object_transform_committed = Signal(str, float, float, float)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -490,6 +566,10 @@ class BlueprintCanvas(QWidget):
         self.level_context: LevelData | None = None
         self._camera_indicator_pose: CameraPose | None = None
         self._selected_wall_surface_id: str | None = None
+        self._placed_object_profiles: tuple[CanvasPlacedObjectProfile, ...] = ()
+        self._selected_placed_object_ids: tuple[str, ...] = ()
+        self._active_placed_object_id: str | None = None
+        self._placed_object_edit_drag: _PlacedObjectEditDrag | None = None
         self.selected_open_space_id: str | None = None
         self._open_space_placement_active = False
         self._open_space_drag_start_image: QPointF | None = None
@@ -960,6 +1040,103 @@ class BlueprintCanvas(QWidget):
         """Return the world-space pose currently represented on the Canvas."""
 
         return self._camera_indicator_pose
+
+    # ### Placed-object profiles ###
+    def set_placed_object_profiles(
+        self,
+        profiles: Iterable[CanvasPlacedObjectProfile],
+    ) -> bool:
+        """Replace the immutable profiles displayed for the current project."""
+
+        normalized_profiles = tuple(profiles)
+        if not all(
+            isinstance(profile, CanvasPlacedObjectProfile)
+            for profile in normalized_profiles
+        ):
+            raise TypeError(
+                "Canvas placed-object profiles must contain profile values."
+            )
+        profile_ids = tuple(profile.object_id for profile in normalized_profiles)
+        if len(profile_ids) != len(set(profile_ids)):
+            raise ValueError("Canvas placed-object profile IDs must be unique.")
+        drag = self._placed_object_edit_drag
+        if drag is not None:
+            incoming_drag_profile = next(
+                (
+                    profile
+                    for profile in normalized_profiles
+                    if profile.object_id == drag.object_id
+                ),
+                None,
+            )
+            current_drag_profile = self._get_placed_object_profile(drag.object_id)
+            if incoming_drag_profile is None or current_drag_profile is None:
+                self._cancel_placed_object_edit_drag(restore_initial=False)
+            else:
+                drag.latest_external_profile = incoming_drag_profile
+                normalized_profiles = tuple(
+                    current_drag_profile
+                    if profile.object_id == drag.object_id
+                    else profile
+                    for profile in normalized_profiles
+                )
+        if normalized_profiles == self._placed_object_profiles:
+            return False
+        self._placed_object_profiles = normalized_profiles
+        self.update()
+        return True
+
+    def get_placed_object_profiles(self) -> tuple[CanvasPlacedObjectProfile, ...]:
+        """Return the immutable profiles currently known to the Canvas."""
+
+        return self._placed_object_profiles
+
+    def set_selected_placed_object_ids(
+        self,
+        object_ids: Iterable[object],
+        *,
+        active_object_id: object | None = None,
+    ) -> bool:
+        """Mirror semantic object selection without emitting a user request."""
+
+        normalized_ids = tuple(
+            dict.fromkeys(
+                object_id
+                for object_id in (str(value).strip() for value in object_ids)
+                if object_id
+            )
+        )
+        normalized_active_id = (
+            None
+            if active_object_id is None
+            else str(active_object_id).strip() or None
+        )
+        if normalized_active_id not in normalized_ids:
+            normalized_active_id = normalized_ids[-1] if normalized_ids else None
+        if (
+            normalized_ids == self._selected_placed_object_ids
+            and normalized_active_id == self._active_placed_object_id
+        ):
+            return False
+        if (
+            self._placed_object_edit_drag is not None
+            and self._placed_object_edit_drag.object_id != normalized_active_id
+        ):
+            self._cancel_placed_object_edit_drag(restore_initial=True)
+        self._selected_placed_object_ids = normalized_ids
+        self._active_placed_object_id = normalized_active_id
+        self.update()
+        return True
+
+    def get_selected_placed_object_ids(self) -> tuple[str, ...]:
+        """Return selected placed-object IDs in selection order."""
+
+        return self._selected_placed_object_ids
+
+    def get_active_placed_object_id(self) -> str | None:
+        """Return the placed object whose rotation handle is active."""
+
+        return self._active_placed_object_id
 
     # ### Selected wall highlight ###
     def set_selected_wall_surface_id(self, surface_id: str | None) -> bool:
@@ -1614,6 +1791,7 @@ class BlueprintCanvas(QWidget):
         canvas_offset_y_pixels: float,
         blueprint_revision: tuple[object, ...] | None,
     ) -> None:
+        self._cancel_placed_object_edit_drag(restore_initial=True)
         self.stop_plan_image_erasing()
         self._reset_vertex_selection_gesture()
         self.blueprint_image = blueprint_image
@@ -1726,6 +1904,13 @@ class BlueprintCanvas(QWidget):
         return False
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if (
+            event.key() == Qt.Key.Key_Escape
+            and self._cancel_placed_object_edit_drag(restore_initial=True)
+        ):
+            event.accept()
+            return
+
         if (
             event.key() == Qt.Key.Key_Escape
             and self.stop_plan_image_erasing()
@@ -1845,6 +2030,13 @@ class BlueprintCanvas(QWidget):
             event.accept()
             return
 
+        if (
+            event.button() == Qt.MouseButton.RightButton
+            and self._cancel_placed_object_edit_drag(restore_initial=True)
+        ):
+            event.accept()
+            return
+
         if event.button() == Qt.MouseButton.RightButton:
             if self.cancel_open_space_placement():
                 event.accept()
@@ -1919,6 +2111,15 @@ class BlueprintCanvas(QWidget):
                 self._commit_pending_doorway()
             event.accept()
             return
+
+        if self._begin_placed_object_pointer_interaction(
+            event.position(),
+            event.modifiers(),
+        ):
+            event.accept()
+            return
+
+        self._clear_placed_object_selection_for_structural_interaction()
 
         open_space = self._find_open_space_at(event.position())
         self.selected_open_space_id = None
@@ -2113,6 +2314,14 @@ class BlueprintCanvas(QWidget):
             event.accept()
             return
 
+        if (
+            self._placed_object_edit_drag is not None
+            and event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            self._update_placed_object_edit_drag(event.position())
+            event.accept()
+            return
+
         if self._vertex_selection_start_image is not None:
             if event.buttons() & Qt.MouseButton.LeftButton:
                 self._update_vertex_selection_gesture(event.position())
@@ -2223,6 +2432,15 @@ class BlueprintCanvas(QWidget):
 
             if (
                 event.button() == Qt.MouseButton.LeftButton
+                and self._placed_object_edit_drag is not None
+            ):
+                self._finish_placed_object_edit_drag(event.position())
+                self._update_edit_hover_cursor(event.position())
+                event.accept()
+                return
+
+            if (
+                event.button() == Qt.MouseButton.LeftButton
                 and self._finish_vertex_selection_gesture(event.position())
             ):
                 event.accept()
@@ -2297,6 +2515,7 @@ class BlueprintCanvas(QWidget):
             and not self._is_stair_placement_active()
             and not self._open_space_placement_active
             and not self._plan_image_erase_active
+            and self._placed_object_edit_drag is None
         ):
             self.unsetCursor()
         super().leaveEvent(event)
@@ -2329,6 +2548,7 @@ class BlueprintCanvas(QWidget):
         self._paint_pending_open_space(painter)
         self._paint_camera_indicator(painter)
         self._paint_level_comparison_overlay(painter)
+        self._paint_placed_object_profiles(painter)
         self._paint_vertex_selection_marquee(painter)
         self._paint_plan_image_erase_selection(painter)
 
@@ -3135,6 +3355,382 @@ class BlueprintCanvas(QWidget):
         self.update()
         return True
 
+    # ### Placed-object profile editing ###
+    def _visible_placed_object_profiles(
+        self,
+    ) -> tuple[CanvasPlacedObjectProfile, ...]:
+        """Return profiles owned by the level currently shown on the Canvas."""
+
+        level = self.level_context
+        if level is None:
+            return ()
+        return tuple(
+            profile
+            for profile in self._placed_object_profiles
+            if profile.level_index == level.index
+        )
+
+    def _get_placed_object_profile(
+        self,
+        object_id: str,
+    ) -> CanvasPlacedObjectProfile | None:
+        return next(
+            (
+                profile
+                for profile in self._placed_object_profiles
+                if profile.object_id == object_id
+            ),
+            None,
+        )
+
+    def _get_placed_object_widget_geometry(
+        self,
+        profile: CanvasPlacedObjectProfile,
+    ) -> _PlacedObjectWidgetGeometry:
+        polygon = QPolygonF(
+            [self._image_to_widget(x, y) for x, y in profile.corners]
+        )
+        anchor = self._image_to_widget(profile.anchor_x, profile.anchor_y)
+        connector_start = QPointF(
+            (polygon.at(0).x() + polygon.at(1).x()) * 0.5,
+            (polygon.at(0).y() + polygon.at(1).y()) * 0.5,
+        )
+        outward = connector_start - anchor
+        outward_length = math.hypot(outward.x(), outward.y())
+        if outward_length <= 1e-6:
+            outward = QPointF(0.0, -1.0)
+        else:
+            outward /= outward_length
+        rotation_handle = (
+            connector_start
+            + outward * PLACED_OBJECT_ROTATION_HANDLE_OFFSET_SCREEN
+        )
+        return _PlacedObjectWidgetGeometry(
+            polygon=polygon,
+            anchor=anchor,
+            rotation_connector_start=connector_start,
+            rotation_handle=rotation_handle,
+        )
+
+    def _paint_placed_object_profiles(self, painter: QPainter) -> None:
+        """Paint translucent green footprints above the architectural plan."""
+
+        profiles = self._visible_placed_object_profiles()
+        if not profiles:
+            return
+        painter.save()
+        for profile in profiles:
+            selected = profile.object_id in self._selected_placed_object_ids
+            pen = QPen(
+                (
+                    PLACED_OBJECT_SELECTED_EDGE_COLOR
+                    if selected
+                    else PLACED_OBJECT_EDGE_COLOR
+                ),
+                (
+                    PLACED_OBJECT_SELECTED_EDGE_WIDTH_SCREEN
+                    if selected
+                    else PLACED_OBJECT_EDGE_WIDTH_SCREEN
+                ),
+                Qt.PenStyle.DotLine,
+            )
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.setBrush(PLACED_OBJECT_FILL_COLOR)
+            geometry = self._get_placed_object_widget_geometry(profile)
+            painter.drawPolygon(geometry.polygon)
+
+            if profile.object_id != self._active_placed_object_id:
+                continue
+            handle_pen = QPen(PLACED_OBJECT_SELECTED_EDGE_COLOR, 2.0)
+            handle_pen.setCosmetic(True)
+            painter.setPen(handle_pen)
+            painter.setBrush(PLACED_OBJECT_FILL_COLOR)
+            painter.drawLine(
+                geometry.rotation_connector_start,
+                geometry.rotation_handle,
+            )
+            painter.drawEllipse(
+                geometry.rotation_handle,
+                PLACED_OBJECT_ROTATION_HANDLE_RADIUS_SCREEN,
+                PLACED_OBJECT_ROTATION_HANDLE_RADIUS_SCREEN,
+            )
+        painter.restore()
+
+    def _find_placed_object_rotation_handle(
+        self,
+        widget_point: QPointF,
+    ) -> CanvasPlacedObjectProfile | None:
+        active_id = self._active_placed_object_id
+        if active_id is None:
+            return None
+        profile = next(
+            (
+                candidate
+                for candidate in self._visible_placed_object_profiles()
+                if candidate.object_id == active_id
+            ),
+            None,
+        )
+        if profile is None:
+            return None
+        geometry = self._get_placed_object_widget_geometry(profile)
+        if (
+            _qpoint_distance(widget_point, geometry.rotation_handle)
+            <= PLACED_OBJECT_ROTATION_HANDLE_HIT_RADIUS_SCREEN
+        ):
+            return profile
+        return None
+
+    def _find_placed_object_profile_at(
+        self,
+        widget_point: QPointF,
+    ) -> CanvasPlacedObjectProfile | None:
+        profiles = list(self._visible_placed_object_profiles())
+        active_id = self._active_placed_object_id
+        if active_id is not None:
+            profiles.sort(key=lambda profile: profile.object_id == active_id)
+        for profile in reversed(profiles):
+            geometry = self._get_placed_object_widget_geometry(profile)
+            if geometry.polygon.containsPoint(
+                widget_point,
+                Qt.FillRule.OddEvenFill,
+            ):
+                return profile
+            for edge_index in range(geometry.polygon.size()):
+                edge_start = geometry.polygon.at(edge_index)
+                edge_end = geometry.polygon.at(
+                    (edge_index + 1) % geometry.polygon.size()
+                )
+                projection = _project_point_onto_widget_segment(
+                    widget_point,
+                    edge_start,
+                    edge_end,
+                )
+                if projection is None:
+                    continue
+                projected_point, _segment_ratio = projection
+                if (
+                    _qpoint_distance(widget_point, projected_point)
+                    <= PLACED_OBJECT_PROFILE_HIT_TOLERANCE_SCREEN
+                ):
+                    return profile
+        return None
+
+    def _begin_placed_object_pointer_interaction(
+        self,
+        widget_point: QPointF,
+        modifiers: Qt.KeyboardModifier,
+    ) -> bool:
+        """Select a profile and stage either movement or rotation."""
+
+        rotation_profile = self._find_placed_object_rotation_handle(widget_point)
+        if rotation_profile is not None:
+            geometry = self._get_placed_object_widget_geometry(rotation_profile)
+            self._placed_object_edit_drag = _PlacedObjectEditDrag(
+                object_id=rotation_profile.object_id,
+                operation="rotate",
+                press_widget_point=QPointF(widget_point),
+                press_image_point=self._widget_to_image_clamped(widget_point),
+                initial_profile=rotation_profile,
+                latest_external_profile=rotation_profile,
+                initial_pointer_angle_radians=math.atan2(
+                    widget_point.y() - geometry.anchor.y(),
+                    widget_point.x() - geometry.anchor.x(),
+                ),
+            )
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            return True
+
+        profile = self._find_placed_object_profile_at(widget_point)
+        if profile is None:
+            return False
+
+        additive = bool(
+            modifiers
+            & (
+                Qt.KeyboardModifier.ShiftModifier
+                | Qt.KeyboardModifier.ControlModifier
+            )
+        )
+        selected_ids = list(self._selected_placed_object_ids)
+        if additive and profile.object_id in selected_ids:
+            selected_ids.remove(profile.object_id)
+            active_id = selected_ids[-1] if selected_ids else None
+            self._request_placed_object_selection(selected_ids, active_id)
+            return True
+        if additive:
+            selected_ids.append(profile.object_id)
+        else:
+            selected_ids = [profile.object_id]
+        self._request_placed_object_selection(selected_ids, profile.object_id)
+        self._clear_structural_selection_for_placed_object()
+        self._placed_object_edit_drag = _PlacedObjectEditDrag(
+            object_id=profile.object_id,
+            operation="move",
+            press_widget_point=QPointF(widget_point),
+            press_image_point=self._widget_to_image_clamped(widget_point),
+            initial_profile=profile,
+            latest_external_profile=profile,
+        )
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        return True
+
+    def _request_placed_object_selection(
+        self,
+        object_ids: Iterable[object],
+        active_object_id: object | None,
+    ) -> None:
+        changed = self.set_selected_placed_object_ids(
+            object_ids,
+            active_object_id=active_object_id,
+        )
+        if changed:
+            self.placed_object_selection_requested.emit(
+                self._selected_placed_object_ids,
+                self._active_placed_object_id,
+            )
+
+    def _clear_structural_selection_for_placed_object(self) -> None:
+        self._clear_active_vertex_chain_for_selection()
+        self.set_selected_vertex_ids(())
+        self.selected_open_space_id = None
+        self.selected_stair_index = None
+        self.selected_stair_endpoint_name = None
+        self._set_selected_doorway_index(None)
+        self.set_selected_wall_surface_id(None)
+
+    def _clear_placed_object_selection_for_structural_interaction(self) -> None:
+        if not self._selected_placed_object_ids:
+            return
+        self._cancel_placed_object_edit_drag(restore_initial=True)
+        self._request_placed_object_selection((), None)
+
+    def _update_placed_object_edit_drag(self, widget_point: QPointF) -> bool:
+        drag = self._placed_object_edit_drag
+        if drag is None:
+            return False
+        if not drag.active:
+            drag.active = bool(
+                _qpoint_distance(widget_point, drag.press_widget_point)
+                >= DRAG_THRESHOLD_SCREEN
+            )
+        if not drag.active:
+            return False
+
+        if drag.operation == "move":
+            current_image = self._widget_to_image_clamped(widget_point)
+            delta_x = current_image.x() - drag.press_image_point.x()
+            delta_y = current_image.y() - drag.press_image_point.y()
+            next_profile = replace(
+                drag.initial_profile,
+                anchor_x=drag.initial_profile.anchor_x + delta_x,
+                anchor_y=drag.initial_profile.anchor_y + delta_y,
+                corners=tuple(
+                    (corner_x + delta_x, corner_y + delta_y)
+                    for corner_x, corner_y in drag.initial_profile.corners
+                ),
+            )
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        elif drag.operation == "rotate":
+            geometry = self._get_placed_object_widget_geometry(
+                drag.initial_profile
+            )
+            pointer_delta = widget_point - geometry.anchor
+            if math.hypot(pointer_delta.x(), pointer_delta.y()) <= 1e-6:
+                return False
+            assert drag.initial_pointer_angle_radians is not None
+            current_angle = math.atan2(pointer_delta.y(), pointer_delta.x())
+            angle_delta = current_angle - drag.initial_pointer_angle_radians
+            angle_delta = math.atan2(math.sin(angle_delta), math.cos(angle_delta))
+            cosine = math.cos(angle_delta)
+            sine = math.sin(angle_delta)
+            anchor_x = drag.initial_profile.anchor_x
+            anchor_y = drag.initial_profile.anchor_y
+            rotated_corners: list[tuple[float, float]] = []
+            for corner_x, corner_y in drag.initial_profile.corners:
+                relative_x = corner_x - anchor_x
+                relative_y = corner_y - anchor_y
+                rotated_corners.append(
+                    (
+                        anchor_x + relative_x * cosine - relative_y * sine,
+                        anchor_y + relative_x * sine + relative_y * cosine,
+                    )
+                )
+            initial_rotation = drag.initial_profile.rotation_degrees
+            next_profile = replace(
+                drag.initial_profile,
+                corners=tuple(rotated_corners),
+                rotation_degrees=(
+                    initial_rotation[0],
+                    initial_rotation[1],
+                    initial_rotation[2] - math.degrees(angle_delta),
+                ),
+            )
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            raise ValueError("Unknown Canvas placed-object edit operation.")
+
+        self._replace_placed_object_profile(next_profile)
+        self.update()
+        return True
+
+    def _finish_placed_object_edit_drag(self, widget_point: QPointF) -> bool:
+        drag = self._placed_object_edit_drag
+        if drag is None:
+            return False
+        self._update_placed_object_edit_drag(widget_point)
+        final_profile = self._get_placed_object_profile(drag.object_id)
+        changed = bool(
+            drag.active
+            and final_profile is not None
+            and final_profile != drag.initial_profile
+        )
+        self._placed_object_edit_drag = None
+        if not changed:
+            self._replace_placed_object_profile(drag.latest_external_profile)
+        self.unsetCursor()
+        self.update()
+        if changed and final_profile is not None:
+            self.placed_object_transform_committed.emit(
+                final_profile.object_id,
+                final_profile.anchor_x,
+                final_profile.anchor_y,
+                final_profile.rotation_degrees[2],
+            )
+        return changed
+
+    def _cancel_placed_object_edit_drag(
+        self,
+        *,
+        restore_initial: bool,
+    ) -> bool:
+        drag = self._placed_object_edit_drag
+        if drag is None:
+            return False
+        self._placed_object_edit_drag = None
+        if restore_initial:
+            self._replace_placed_object_profile(drag.latest_external_profile)
+        self.unsetCursor()
+        self.update()
+        return True
+
+    def _replace_placed_object_profile(
+        self,
+        replacement: CanvasPlacedObjectProfile,
+    ) -> bool:
+        replaced = False
+        next_profiles: list[CanvasPlacedObjectProfile] = []
+        for profile in self._placed_object_profiles:
+            if profile.object_id == replacement.object_id:
+                next_profiles.append(replacement)
+                replaced = True
+            else:
+                next_profiles.append(profile)
+        if replaced:
+            self._placed_object_profiles = tuple(next_profiles)
+        return replaced
+
     # ### Window helpers ###
     def _find_window_at(self, widget_point: QPointF) -> int | None:
         """Return the topmost visible window strip under the pointer."""
@@ -3168,6 +3764,12 @@ class BlueprintCanvas(QWidget):
     def _update_edit_hover_cursor(self, widget_point: QPointF) -> None:
         """Show movement feedback for editable points and doorways."""
 
+        if self._find_placed_object_rotation_handle(widget_point) is not None:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            return
+        if self._find_placed_object_profile_at(widget_point) is not None:
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            return
         if self._find_stair_hit(widget_point) is not None:
             self.setCursor(Qt.CursorShape.OpenHandCursor)
             return

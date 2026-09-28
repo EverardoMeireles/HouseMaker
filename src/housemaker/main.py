@@ -85,6 +85,7 @@ from housemaker.blueprint_canvas import (
     CANVAS_SNAPSHOT_ACTION_OPEN_SPACE,
     CANVAS_SNAPSHOT_ACTION_VERTEX_DELETION,
     BlueprintCanvas,
+    CanvasPlacedObjectProfile,
     CanvasSnapshot,
     PlanImageEraseCommit,
 )
@@ -133,6 +134,7 @@ from housemaker.glb import (
     PlacedGeneratedModel,
     PreviewStairPart,
     build_canvas_stair_part_targets,
+    build_placed_generated_model_top_down_footprint,
     build_stair_meshes,
     build_texture_preview_plane_model,
     compose_placed_generated_models,
@@ -1994,6 +1996,12 @@ class BlueprintWorkspace(QWidget):
         self.viewer.placed_object_selection_set_changed.connect(
             self._handle_canvas_placed_object_selection_set_changed
         )
+        self.canvas.placed_object_selection_requested.connect(
+            self._handle_blueprint_placed_object_selection_requested
+        )
+        self.canvas.placed_object_transform_committed.connect(
+            self._handle_blueprint_placed_object_transform_committed
+        )
         self.viewer.canvas_surface_selection_changed.connect(
             self._handle_canvas_surface_selection_changed
         )
@@ -3800,6 +3808,7 @@ class BlueprintWorkspace(QWidget):
             self._discard_staged_stair_edit(clear_selection=True)
             self._desired_canvas_object_id = None
             self._desired_canvas_object_ids = ()
+            self._sync_blueprint_placed_object_selection()
             self._desired_canvas_surface_ids = ()
             self._atlas_surface_assignment_target_ids = ()
         doorway_index: int | None = None
@@ -4234,6 +4243,7 @@ class BlueprintWorkspace(QWidget):
             return
         self._desired_canvas_object_id = None
         self._desired_canvas_object_ids = ()
+        self._sync_blueprint_placed_object_selection()
         self._desired_canvas_surface_ids = ()
         self._atlas_surface_assignment_target_ids = semantic_ids
         self._sync_surface_generation_selection(semantic_ids)
@@ -4300,6 +4310,7 @@ class BlueprintWorkspace(QWidget):
             self._discard_staged_stair_edit(clear_selection=True)
             self._desired_canvas_object_id = None
             self._desired_canvas_object_ids = ()
+            self._sync_blueprint_placed_object_selection()
         self._sync_surface_generation_selection(surface_ids)
         self._sync_atlas_texture_selection_from_canvas_scene()
         active_surface_id = surface_ids[-1] if surface_ids else None
@@ -4917,6 +4928,7 @@ class BlueprintWorkspace(QWidget):
                 level.canvas_offset_y_pixels,
             )
             self.canvas.update()
+            self._sync_canvas_placed_object_profiles()
         self._sync_canvas_wall_mirror_state()
         self._reconcile_surface_assignments_with_scene()
         self._refresh_scene_atlas_texture_requirements()
@@ -5055,6 +5067,7 @@ class BlueprintWorkspace(QWidget):
         self._desired_canvas_object_ids = selected_object_ids
         self._desired_canvas_object_id = active_object_id
         self._desired_canvas_surface_ids = ()
+        self._sync_canvas_placed_object_profiles()
         self._schedule_viewer_preview_refresh(preserve_camera=True)
         return skipped_atlas_placements
 
@@ -5412,6 +5425,7 @@ class BlueprintWorkspace(QWidget):
                 else ()
             )
         )
+        self._sync_blueprint_placed_object_selection()
         self._active_canvas_surface_drawing_vertex_id = state.active_vertex_id
         expected_by_id = {
             assignment.assignment_id: assignment
@@ -5710,6 +5724,7 @@ class BlueprintWorkspace(QWidget):
             self._atlas_surface_assignment_target_ids = previous_assignment_target_ids
             self._desired_canvas_object_id = previous_object_id
             self._desired_canvas_object_ids = previous_object_ids
+            BlueprintWorkspace._sync_blueprint_placed_object_selection(self)
             self._active_canvas_surface_drawing_vertex_id = previous_active_vertex_id
             self._sync_canvas_surface_drawing_overlay()
             self.viewer.set_surface_tools_status(f"Surface edit stopped: {error}")
@@ -5719,6 +5734,7 @@ class BlueprintWorkspace(QWidget):
 
         if result.requires_mesh_refresh:
             BlueprintWorkspace._reconcile_surface_assignments_with_scene(self)
+        BlueprintWorkspace._sync_blueprint_placed_object_selection(self)
         if result.state_changed:
             self._record_canvas_undo_state(
                 BlueprintWorkspace._finalize_canvas_topology_undo_state(
@@ -6339,6 +6355,63 @@ class BlueprintWorkspace(QWidget):
         self._canvas_surface_mesh_update_timer.start()
 
     # ### Canvas scene selection synchronization ###
+    def _handle_blueprint_placed_object_selection_requested(
+        self,
+        raw_object_ids: object,
+        raw_active_object_id: object,
+    ) -> None:
+        """Apply one user selection from the 2D Canvas to every scene view."""
+
+        if self._is_syncing_canvas_scene_selection:
+            return
+        try:
+            requested_ids = (
+                (raw_object_ids,)
+                if isinstance(raw_object_ids, str)
+                else tuple(raw_object_ids)  # type: ignore[arg-type]
+            )
+        except TypeError:
+            return
+        current_level_index = self.current_level.index
+        normalized_ids = tuple(
+            dict.fromkeys(
+                object_id
+                for value in requested_ids
+                if (object_id := str(value).strip())
+                and (
+                    (placement := self.generation.get_generated_object_placement(
+                        object_id
+                    ))
+                    is not None
+                    and placement.level_index == current_level_index
+                )
+            )
+        )
+        active_object_id = (
+            None
+            if raw_active_object_id is None
+            else str(raw_active_object_id).strip() or None
+        )
+        if active_object_id not in normalized_ids:
+            active_object_id = normalized_ids[-1] if normalized_ids else None
+
+        self._is_syncing_canvas_scene_selection = True
+        try:
+            self.viewer.select_canvas_opening(None)
+            self.viewer.set_selected_canvas_surface_ids(())
+            self.viewer.set_selected_canvas_stair_part_ids(())
+            self.viewer.set_selected_placed_object_ids(
+                normalized_ids,
+                active_object_id=active_object_id,
+            )
+        finally:
+            self._is_syncing_canvas_scene_selection = False
+        self._remember_desired_canvas_object_selection(
+            normalized_ids,
+            active_object_id=active_object_id,
+        )
+        self._sync_selected_canvas_wall_highlight(None)
+
     def _handle_canvas_placed_object_selection_changed(
         self,
         raw_object_id: object,
@@ -6412,6 +6485,7 @@ class BlueprintWorkspace(QWidget):
             )
         self._desired_canvas_object_ids = normalized_object_ids
         self._desired_canvas_object_id = normalized_active_id
+        self._sync_blueprint_placed_object_selection()
         if normalized_object_ids:
             self._discard_staged_stair_edit(clear_selection=True)
             self._desired_canvas_surface_ids = ()
@@ -6420,6 +6494,16 @@ class BlueprintWorkspace(QWidget):
         if normalized_active_id is not None:
             self.generation.select_generated_object(normalized_active_id)
         self._sync_atlas_texture_selection_from_canvas_scene()
+
+    def _sync_blueprint_placed_object_selection(self) -> None:
+        """Mirror semantic scene selection onto the 2D profile overlay."""
+
+        if not hasattr(self, "canvas"):
+            return
+        self.canvas.set_selected_placed_object_ids(
+            self._desired_canvas_object_ids,
+            active_object_id=self._desired_canvas_object_id,
+        )
 
     def _sync_atlas_texture_selection_from_canvas_scene(self) -> None:
         """Select textures assigned to the current semantic 3D selection."""
@@ -8652,6 +8736,7 @@ class BlueprintWorkspace(QWidget):
                     restore_atlas_bindings=True,
                 )
             )
+        self._sync_canvas_placed_object_profiles()
         self._schedule_viewer_preview_refresh(preserve_camera=False)
 
     def _handle_generated_object_changed_for_canvas(
@@ -8665,6 +8750,7 @@ class BlueprintWorkspace(QWidget):
             isinstance(raw_record, GeneratedObjectRecord)
             and raw_record.placement is not None
         ):
+            self._sync_canvas_placed_object_profiles()
             self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     def _handle_generated_object_placement_changed_for_canvas(
@@ -8674,6 +8760,7 @@ class BlueprintWorkspace(QWidget):
         """Move or remove a completed object in the Canvas preview."""
 
         if isinstance(raw_record, GeneratedObjectRecord):
+            self._sync_canvas_placed_object_profiles()
             self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     def _capture_canvas_atlas_placements(
@@ -8800,6 +8887,7 @@ class BlueprintWorkspace(QWidget):
             self.texture_atlas_workspace.remove_scene_texture_from_atlases(
                 normalized_object_id
             )
+            self._sync_canvas_placed_object_profiles()
             return
         self._schedule_viewer_preview_refresh(preserve_camera=True)
 
@@ -8887,6 +8975,7 @@ class BlueprintWorkspace(QWidget):
                     active_object_id=self._desired_canvas_object_id,
                 )
             )
+        self._sync_canvas_placed_object_profiles()
 
         revision = self._mark_viewer_preview_dirty(
             preserve_camera=True,
@@ -8912,6 +9001,92 @@ class BlueprintWorkspace(QWidget):
             self._viewer_preview_dependency_signature_revision = revision
             return
         self._queue_viewer_preview_refresh()
+
+    def _handle_blueprint_placed_object_transform_committed(
+        self,
+        object_id: str,
+        image_x: float,
+        image_y: float,
+        rotation_z_degrees: float,
+    ) -> None:
+        """Persist one release-only move or rotation from the 2D Canvas."""
+
+        normalized_object_id = str(object_id).strip()
+        existing = self.generation.get_generated_object_placement(
+            normalized_object_id
+        )
+        if existing is None or existing.level_index != self.current_level.index:
+            self._sync_canvas_placed_object_profiles()
+            return
+        try:
+            next_image_x = float(image_x)
+            next_image_y = float(image_y)
+            next_rotation_z = float(rotation_z_degrees)
+            if not all(
+                math.isfinite(value)
+                for value in (next_image_x, next_image_y, next_rotation_z)
+            ):
+                raise ValueError("Canvas object transforms must be finite.")
+            replacement = replace(
+                existing,
+                image_x=next_image_x,
+                image_y=next_image_y,
+                rotation_degrees=(
+                    existing.rotation_degrees[0],
+                    existing.rotation_degrees[1],
+                    next_rotation_z,
+                ),
+            )
+        except (TypeError, ValueError, OverflowError):
+            self._sync_canvas_placed_object_profiles()
+            return
+        if replacement == existing:
+            self._sync_canvas_placed_object_profiles()
+            return
+        base_z = build_level_base_z_lookup(self.levels).get(existing.level_index)
+        level = self._get_level_by_index(existing.level_index)
+        if level is not None and base_z is not None:
+            world_x, world_y = level_image_to_world_xy(
+                level,
+                replacement.image_x,
+                replacement.image_y,
+            )
+            world_position = (
+                world_x,
+                world_y,
+                float(base_z) + replacement.height_offset_meters,
+            )
+            if self.viewer.apply_placed_object_transform_preview(
+                normalized_object_id,
+                world_position,
+                replacement.rotation_degrees,
+            ):
+                self._handle_placed_object_transform_changed(
+                    normalized_object_id,
+                    world_position,
+                    replacement.rotation_degrees,
+                )
+                return
+        if not self.generation.update_generated_object_placement(
+            normalized_object_id,
+            replacement,
+            emit_change_signals=False,
+        ):
+            self._sync_canvas_placed_object_profiles()
+            return
+        if not self._is_restoring_canvas_undo:
+            self._record_canvas_undo_state(
+                _CanvasPlacedObjectUndoState(
+                    object_id=normalized_object_id,
+                    placement=existing,
+                    selected_object_ids=self._desired_canvas_object_ids,
+                    active_object_id=self._desired_canvas_object_id,
+                )
+            )
+        self._sync_canvas_placed_object_profiles()
+        # Unlike the 3D gizmo path, the retained Viewer root has not already
+        # moved. Always invalidate it so the 3D scene cannot keep stale pixels.
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     def _handle_placed_object_scales_changed(self, raw_updates: object) -> None:
         """Persist one wheel gesture for every selected placed object."""
@@ -9002,6 +9177,7 @@ class BlueprintWorkspace(QWidget):
                 if len(undo_members) == 1
                 else _CanvasPlacedObjectGroupUndoState(undo_members)
             )
+        self._sync_canvas_placed_object_profiles()
 
         revision = self._mark_viewer_preview_dirty(
             preserve_camera=True,
@@ -9110,6 +9286,7 @@ class BlueprintWorkspace(QWidget):
                     active_object_id=self._desired_canvas_object_id,
                 )
             )
+        self._sync_canvas_placed_object_profiles()
 
         revision = self._mark_viewer_preview_dirty(
             preserve_camera=True,
@@ -9145,6 +9322,7 @@ class BlueprintWorkspace(QWidget):
         normalized_object_id = str(object_id).strip()
         self._discard_canvas_placement_undo_object_id(normalized_object_id)
         self._discard_desired_canvas_object(normalized_object_id)
+        self._sync_canvas_placed_object_profiles()
         self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     def _refresh_placed_object_texture_if_needed(
@@ -9257,6 +9435,7 @@ class BlueprintWorkspace(QWidget):
         self._selected_atlas_surface_source_id = None
         self._desired_canvas_object_id = None
         self._desired_canvas_object_ids = ()
+        self._sync_blueprint_placed_object_selection()
         self._set_atlas_canvas_surface_highlights(())
         self._sync_atlas_green_outline_to_canvas_highlight(None)
         self._is_syncing_canvas_scene_selection = True
@@ -9275,6 +9454,7 @@ class BlueprintWorkspace(QWidget):
         self._atlas_surface_assignment_target_ids = ()
         self._desired_canvas_object_id = normalized_id
         self._desired_canvas_object_ids = (normalized_id,)
+        self._sync_blueprint_placed_object_selection()
         self._desired_canvas_surface_ids = ()
         self._discard_staged_stair_edit(clear_selection=True)
         self._sync_surface_generation_selection(())
@@ -9306,6 +9486,7 @@ class BlueprintWorkspace(QWidget):
                 return
             self._desired_canvas_object_id = None
             self._desired_canvas_object_ids = ()
+            self._sync_blueprint_placed_object_selection()
             self._is_syncing_canvas_scene_selection = True
             try:
                 self.viewer.select_placed_object(None)
@@ -9323,6 +9504,7 @@ class BlueprintWorkspace(QWidget):
         self._atlas_surface_assignment_target_ids = ()
         self._desired_canvas_object_id = active_id
         self._desired_canvas_object_ids = normalized_ids
+        self._sync_blueprint_placed_object_selection()
         self._desired_canvas_surface_ids = ()
         self._discard_staged_stair_edit(clear_selection=True)
         self._sync_surface_generation_selection(())
@@ -12188,6 +12370,83 @@ class BlueprintWorkspace(QWidget):
             )
         return tuple(placed_models)
 
+    def _sync_canvas_placed_object_profiles(self) -> None:
+        """Publish current-level object footprints without loading in paint code."""
+
+        if (
+            not hasattr(self, "canvas")
+            or not self.levels
+            or not 0 <= self.current_level_index < len(self.levels)
+        ):
+            return
+        level = self.current_level
+        base_z = build_level_base_z_lookup(self.levels).get(level.index)
+        if base_z is None:
+            self.canvas.set_placed_object_profiles(())
+            self._sync_blueprint_placed_object_selection()
+            return
+
+        profiles: list[CanvasPlacedObjectProfile] = []
+        for record in self.generation.get_data().generated_objects:
+            placement = record.placement
+            if placement is None or placement.level_index != level.index:
+                continue
+            generated_model = self.generation.get_generated_object_model(
+                record.object_id
+            )
+            if generated_model is None:
+                continue
+            try:
+                symmetry = self.generation.resolve_symmetric_division_for_record(
+                    record
+                )
+                world_x, world_y = level_image_to_world_xy(
+                    level,
+                    placement.image_x,
+                    placement.image_y,
+                )
+                placed_model = PlacedGeneratedModel(
+                    object_id=record.object_id,
+                    object_name=record.object_name,
+                    model=generated_model,
+                    world_position=(
+                        world_x,
+                        world_y,
+                        float(base_z) + placement.height_offset_meters,
+                    ),
+                    symmetric_preview_orientation=(
+                        None if symmetry is None else symmetry.orientation
+                    ),
+                    symmetric_preview_plane_coordinate=(
+                        None if symmetry is None else symmetry.plane_coordinate
+                    ),
+                    rotation_degrees=placement.rotation_degrees,
+                    scale=placement.scale,
+                    axis_scales=placement.axis_scales,
+                )
+                world_corners = build_placed_generated_model_top_down_footprint(
+                    placed_model
+                )
+                image_corners = tuple(
+                    level_world_to_image_xy(level, corner_x, corner_y)
+                    for corner_x, corner_y in world_corners
+                )
+                profiles.append(
+                    CanvasPlacedObjectProfile(
+                        object_id=record.object_id,
+                        level_index=placement.level_index,
+                        anchor_x=placement.image_x,
+                        anchor_y=placement.image_y,
+                        corners=image_corners,
+                        rotation_degrees=placement.rotation_degrees,
+                    )
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+
+        self.canvas.set_placed_object_profiles(profiles)
+        self._sync_blueprint_placed_object_selection()
+
     def _handle_surface_texture_generation_completed(
         self,
         assignment: object,
@@ -14435,6 +14694,7 @@ class BlueprintWorkspace(QWidget):
         )
         if level is self.current_level:
             self.canvas.update()
+            self._sync_canvas_placed_object_profiles()
         self._sync_canvas_wall_mirror_state()
         self._schedule_viewer_preview_refresh(preserve_camera=True)
         self._level_transform_outline_commit_revision = self._viewer_preview_revision
@@ -15783,6 +16043,7 @@ class BlueprintWorkspace(QWidget):
         )
         self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
         self.canvas.set_stair_context(self.stairs, self.current_level)
+        self._sync_canvas_placed_object_profiles()
         self._sync_canvas_wall_mirror_state()
         self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
         self._update_blueprint_name_label()
@@ -15813,6 +16074,7 @@ class BlueprintWorkspace(QWidget):
         if self.canvas.blueprint_image is not None:
             self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
         self.canvas.set_stair_context(self.stairs, self.current_level)
+        self._sync_canvas_placed_object_profiles()
         self._sync_canvas_wall_mirror_state()
         self._update_wall_mirror_button_state()
         self._sync_selected_canvas_wall_highlight(
