@@ -69,6 +69,7 @@ from housemaker.canvas_surface_edits import (
     CanvasSurfaceEdit,
     CanvasSurfaceEditHandleTarget,
 )
+from housemaker.doorway_geometry import build_doorway_cross_section_outline
 from housemaker.first_person_navigation import (
     DEFAULT_FIRST_PERSON_NAVIGATION_MODE,
     build_first_person_forward_vector,
@@ -87,6 +88,7 @@ from housemaker.glb import (
     PreviewTexturedWall,
     remove_covered_surface_faces,
 )
+from housemaker.models import DOORWAY_SHAPE_ARCH
 from housemaker.object_texture_variants import (
     PBR_MAP_METALLIC,
     PBR_MAP_NORMAL,
@@ -209,6 +211,7 @@ PLACED_OBJECT_MIN_SCALE = 0.05
 PLACED_OBJECT_MAX_SCALE = 20.0
 CANVAS_OPENING_GIZMO_SIDE = "side"
 CANVAS_OPENING_GIZMO_ANCHOR = "anchor"
+CANVAS_OPENING_GIZMO_ARCH = "arch"
 CANVAS_OPENING_SIDE_LEFT = "left"
 CANVAS_OPENING_SIDE_RIGHT = "right"
 CANVAS_OPENING_SIDE_BOTTOM = "bottom"
@@ -221,12 +224,19 @@ CANVAS_OPENING_RESIZE_SIDES = frozenset(
         CANVAS_OPENING_SIDE_TOP,
     )
 )
+CANVAS_OPENING_ARCH_SIDES = frozenset(
+    (CANVAS_OPENING_SIDE_LEFT, CANVAS_OPENING_SIDE_RIGHT)
+)
 CANVAS_OPENING_PREVIEW_COLOR = (1.0, 0.72, 0.18, 0.98)
 CANVAS_OPENING_SIDE_COLOR = (1.0, 0.46, 0.12, 1.0)
 CANVAS_OPENING_ANCHOR_COLOR = (0.20, 0.86, 0.38, 1.0)
+CANVAS_OPENING_ARCH_COLOR = (0.25, 0.72, 1.0, 1.0)
+CANVAS_OPENING_ARCH_GUIDE_COLOR = (0.25, 0.72, 1.0, 0.72)
 CANVAS_OPENING_OUTLINE_WIDTH = 4.0
 CANVAS_OPENING_SIDE_SIZE_PIXELS = 22.0
 CANVAS_OPENING_ANCHOR_SIZE_PIXELS = 20.0
+CANVAS_OPENING_ARCH_SIZE_PIXELS = 24.0
+CANVAS_OPENING_ARCH_GUIDE_WIDTH = 3.0
 CANVAS_OPENING_HANDLE_HIT_RADIUS_PIXELS = 20.0
 CANVAS_OPENING_HANDLE_MIN_HIT_RADIUS_METERS = 0.04
 CANVAS_OPENING_OVERLAY_DEPTH_VALUE = 10_000.0
@@ -553,7 +563,7 @@ class _TransformGizmoHandle:
 
 @dataclass(frozen=True)
 class _CanvasOpeningGizmoHandle:
-    """One side resizer or center movement anchor for an opening."""
+    """One side, center, or arch-shoulder control for an opening."""
 
     kind: str
     side: str | None = None
@@ -562,11 +572,16 @@ class _CanvasOpeningGizmoHandle:
         if self.kind not in {
             CANVAS_OPENING_GIZMO_SIDE,
             CANVAS_OPENING_GIZMO_ANCHOR,
+            CANVAS_OPENING_GIZMO_ARCH,
         }:
             raise ValueError("Unknown Canvas opening gizmo handle kind.")
         if self.kind == CANVAS_OPENING_GIZMO_SIDE:
             if self.side not in CANVAS_OPENING_RESIZE_SIDES:
                 raise ValueError("Canvas opening side handles must name one side.")
+            return
+        if self.kind == CANVAS_OPENING_GIZMO_ARCH:
+            if self.side not in CANVAS_OPENING_ARCH_SIDES:
+                raise ValueError("Canvas opening arch handles must name one side.")
             return
         if self.side is not None:
             raise ValueError("A Canvas opening anchor has no resize side.")
@@ -574,13 +589,14 @@ class _CanvasOpeningGizmoHandle:
 
 @dataclass
 class _CanvasOpeningEditDrag:
-    """Stable wall frame and live bounds for one opening gizmo drag."""
+    """Stable wall frame and live shape for one opening gizmo drag."""
 
     start_target: CanvasOpeningTarget
     preview_target: CanvasOpeningTarget
     handle: _CanvasOpeningGizmoHandle
     pointer_offset_local: tuple[float, float]
     last_emitted_bounds: CanvasOpeningBounds
+    last_emitted_arch_amount: float | None
 
 
 @dataclass
@@ -5199,6 +5215,22 @@ class GlbViewerWidget(QWidget):
             return
         self._refresh_canvas_opening_gizmo_items()
 
+    def update_canvas_opening_target(self, target: CanvasOpeningTarget) -> None:
+        """Refresh one opening's live shape without disturbing its selection."""
+
+        if not self._window_editing_enabled:
+            return
+        if not isinstance(target, CanvasOpeningTarget):
+            raise TypeError("A Canvas opening target is required.")
+        if target.key not in self._canvas_opening_targets:
+            raise ValueError("The Canvas opening target is no longer available.")
+        if self._canvas_opening_edit_drag is not None:
+            raise RuntimeError("A Canvas opening target cannot change during a drag.")
+        self._canvas_opening_targets[target.key] = target
+        if target.key == self._selected_canvas_opening_key:
+            self._set_canvas_opening_edit_instruction(target)
+        self._refresh_canvas_opening_gizmo_items()
+
     def get_selected_canvas_opening_reference(
         self,
     ) -> CanvasOpeningReference | None:
@@ -5262,15 +5294,28 @@ class GlbViewerWidget(QWidget):
             self.set_selected_canvas_surface_ids(())
         self._sync_window_tools_controls()
         if normalized_key is not None:
-            self._set_window_tools_status(
-                "Drag a side handle to resize or the center anchor to move."
-            )
+            target = self._canvas_opening_targets[normalized_key]
+            self._set_canvas_opening_edit_instruction(target)
         self._refresh_canvas_opening_gizmo_items()
         target = self._get_selected_canvas_opening_target()
         self.canvas_opening_selection_changed.emit(
             None if target is None else target.reference
         )
         return True
+
+    def _set_canvas_opening_edit_instruction(
+        self,
+        target: CanvasOpeningTarget,
+    ) -> None:
+        """Describe every control currently visible for one opening."""
+
+        instruction = "Drag a side handle to resize or the center anchor to move."
+        if target.arch_amount is not None:
+            instruction = (
+                "Drag a side handle to resize, the center anchor to move, "
+                "or a blue arch shoulder to reshape the arch."
+            )
+        self._set_window_tools_status(instruction)
 
     # ### Placed-object transform API ###
     def get_selected_placed_object_id(self) -> str | None:
@@ -10009,7 +10054,7 @@ class GlbViewerWidget(QWidget):
 
     # ### Canvas opening selection and gizmo rendering ###
     def _refresh_canvas_opening_gizmo_items(self) -> None:
-        """Draw one selected outline, four side handles, and its anchor."""
+        """Draw the selected opening outline and its available controls."""
 
         self._remove_canvas_opening_gizmo_items()
         if self._level_transform_preview_level_index is not None:
@@ -10028,9 +10073,17 @@ class GlbViewerWidget(QWidget):
                 self.view.update()
             return
 
-        corners = np.asarray(target.get_world_corners(), dtype=float)
-        display_corners = _offset_points_toward_camera(
-            corners,
+        outline_positions = np.asarray(
+            tuple(
+                target.local_to_world(*local_position)
+                for local_position in _get_canvas_opening_outline_local_positions(
+                    target
+                )
+            ),
+            dtype=float,
+        )
+        display_outline_positions = _offset_points_toward_camera(
+            outline_positions,
             target.wall_normal_world,
             self.view.cameraPosition(),
             WINDOW_PREVIEW_OFFSET_METERS * 2.0,
@@ -10041,7 +10094,7 @@ class GlbViewerWidget(QWidget):
             else CANVAS_SURFACE_SELECTION_COLOR
         )
         outline_item = gl.GLLinePlotItem(
-            pos=np.vstack((display_corners, display_corners[:1])),
+            pos=display_outline_positions,
             color=outline_color,
             width=CANVAS_OPENING_OUTLINE_WIDTH,
             antialias=True,
@@ -10086,6 +10139,37 @@ class GlbViewerWidget(QWidget):
             pxMode=True,
         )
         self._add_canvas_opening_overlay_item(anchor_item)
+
+        arch_local_positions = _get_canvas_opening_arch_local_positions(target)
+        if arch_local_positions:
+            arch_positions = np.asarray(
+                tuple(
+                    target.local_to_world(*local_position)
+                    for _side, local_position in arch_local_positions
+                ),
+                dtype=float,
+            )
+            display_arch_positions = _offset_points_toward_camera(
+                arch_positions,
+                target.wall_normal_world,
+                self.view.cameraPosition(),
+                WINDOW_PREVIEW_OFFSET_METERS * 2.0,
+            )
+            arch_guide_item = gl.GLLinePlotItem(
+                pos=display_arch_positions,
+                color=CANVAS_OPENING_ARCH_GUIDE_COLOR,
+                width=CANVAS_OPENING_ARCH_GUIDE_WIDTH,
+                antialias=True,
+                mode="lines",
+            )
+            self._add_canvas_opening_overlay_item(arch_guide_item)
+            arch_handle_item = gl.GLScatterPlotItem(
+                pos=display_arch_positions,
+                color=CANVAS_OPENING_ARCH_COLOR,
+                size=CANVAS_OPENING_ARCH_SIZE_PIXELS,
+                pxMode=True,
+            )
+            self._add_canvas_opening_overlay_item(arch_handle_item)
         self.view.update()
 
     def _add_canvas_opening_overlay_item(
@@ -10121,8 +10205,34 @@ class GlbViewerWidget(QWidget):
             return None
 
         candidates: list[
-            tuple[float, float, int, _CanvasOpeningGizmoHandle]
+            tuple[float, int, float, _CanvasOpeningGizmoHandle]
         ] = []
+        for side, local_position in _get_canvas_opening_arch_local_positions(target):
+            arch_position = np.asarray(
+                target.local_to_world(*local_position),
+                dtype=float,
+            )
+            hit = _get_ray_point_distance(origin, direction, arch_position)
+            if hit is None:
+                continue
+            distance, ray_parameter = hit
+            tolerance = self._get_canvas_opening_handle_hit_radius(
+                target,
+                arch_position,
+            )
+            if distance <= tolerance:
+                candidates.append(
+                    (
+                        distance / max(tolerance, 1e-12),
+                        0,
+                        ray_parameter,
+                        _CanvasOpeningGizmoHandle(
+                            CANVAS_OPENING_GIZMO_ARCH,
+                            side,
+                        ),
+                    )
+                )
+
         for side, local_position in _get_canvas_opening_side_local_positions(target):
             side_position = np.asarray(
                 target.local_to_world(*local_position),
@@ -10140,8 +10250,8 @@ class GlbViewerWidget(QWidget):
                 candidates.append(
                     (
                         distance / max(tolerance, 1e-12),
+                        1,
                         ray_parameter,
-                        0,
                         _CanvasOpeningGizmoHandle(
                             CANVAS_OPENING_GIZMO_SIDE,
                             side,
@@ -10158,8 +10268,8 @@ class GlbViewerWidget(QWidget):
                 candidates.append(
                     (
                         distance / max(tolerance, 1e-12),
+                        2,
                         ray_parameter,
-                        1,
                         _CanvasOpeningGizmoHandle(
                             CANVAS_OPENING_GIZMO_ANCHOR,
                         ),
@@ -10224,6 +10334,7 @@ class GlbViewerWidget(QWidget):
             handle=handle,
             pointer_offset_local=pointer_offset,
             last_emitted_bounds=target.bounds,
+            last_emitted_arch_amount=target.arch_amount,
         )
         self.view.reserve_primary_pointer_drag()
         self._refresh_canvas_opening_gizmo_items()
@@ -10252,16 +10363,20 @@ class GlbViewerWidget(QWidget):
             pointer_local[0] + drag.pointer_offset_local[0],
             pointer_local[1] + drag.pointer_offset_local[1],
         )
-        bounds = _build_dragged_canvas_opening_bounds(
+        preview_target = _build_dragged_canvas_opening_target(
             target,
             drag.handle,
             requested_local,
         )
-        drag.preview_target = target.with_bounds(bounds)
+        drag.preview_target = preview_target
         self._refresh_canvas_opening_gizmo_items()
-        if bounds == drag.last_emitted_bounds:
+        if (
+            preview_target.bounds == drag.last_emitted_bounds
+            and preview_target.arch_amount == drag.last_emitted_arch_amount
+        ):
             return False
-        drag.last_emitted_bounds = bounds
+        drag.last_emitted_bounds = preview_target.bounds
+        drag.last_emitted_arch_amount = preview_target.arch_amount
         self.canvas_opening_edit_preview_changed.emit(
             _build_canvas_opening_edit(drag.preview_target)
         )
@@ -10275,7 +10390,10 @@ class GlbViewerWidget(QWidget):
             return False
         self._update_canvas_opening_gizmo_drag(position)
         final_target = drag.preview_target
-        changed = final_target.bounds != drag.start_target.bounds
+        changed = (
+            final_target.bounds != drag.start_target.bounds
+            or final_target.arch_amount != drag.start_target.arch_amount
+        )
         if changed:
             self._canvas_opening_targets[final_target.key] = final_target
         else:
@@ -13367,6 +13485,7 @@ def _build_canvas_opening_edit(target: CanvasOpeningTarget) -> CanvasOpeningEdit
         reference=target.reference,
         wall_surface_id=target.wall_surface_id,
         bounds=target.bounds,
+        arch_amount=target.arch_amount,
     )
 
 
@@ -14884,7 +15003,42 @@ def _get_canvas_opening_handle_local_position(
             (bounds.bottom_ratio + bounds.top_ratio) * 0.5,
         )
     assert handle.side is not None
+    if handle.kind == CANVAS_OPENING_GIZMO_ARCH:
+        return dict(_get_canvas_opening_arch_local_positions(target))[handle.side]
     return dict(_get_canvas_opening_side_local_positions(target))[handle.side]
+
+
+def _get_canvas_opening_outline_local_positions(
+    target: CanvasOpeningTarget,
+) -> tuple[tuple[float, float], ...]:
+    """Return a closed rectangle or smooth arch in wall-local ratios."""
+
+    bounds = target.bounds
+    if target.arch_amount is None:
+        return (
+            (bounds.start_ratio, bounds.bottom_ratio),
+            (bounds.end_ratio, bounds.bottom_ratio),
+            (bounds.end_ratio, bounds.top_ratio),
+            (bounds.start_ratio, bounds.top_ratio),
+            (bounds.start_ratio, bounds.bottom_ratio),
+        )
+
+    opening_width = bounds.horizontal_span * target.wall_width_meters
+    opening_height = bounds.vertical_span * target.wall_height_meters
+    center_horizontal = (bounds.start_ratio + bounds.end_ratio) * 0.5
+    profile = build_doorway_cross_section_outline(
+        opening_width,
+        opening_height,
+        DOORWAY_SHAPE_ARCH,
+        target.arch_amount,
+    )
+    return tuple(
+        (
+            center_horizontal + horizontal_meters / target.wall_width_meters,
+            bounds.bottom_ratio + vertical_meters / target.wall_height_meters,
+        )
+        for horizontal_meters, vertical_meters in profile
+    )
 
 
 def _get_canvas_opening_side_local_positions(
@@ -14912,6 +15066,67 @@ def _get_canvas_opening_side_local_positions(
             CANVAS_OPENING_SIDE_TOP,
             (center_horizontal, bounds.top_ratio),
         ),
+    )
+
+
+def _get_canvas_opening_arch_local_positions(
+    target: CanvasOpeningTarget,
+) -> tuple[tuple[str, tuple[float, float]], ...]:
+    """Return the two spring-line handles for an active doorway arch."""
+
+    if target.arch_amount is None:
+        return ()
+    spring_ratio = (
+        target.bounds.top_ratio
+        - _get_canvas_opening_maximum_arch_rise_ratio(target)
+        * target.arch_amount
+    )
+    return (
+        (
+            CANVAS_OPENING_SIDE_LEFT,
+            (target.bounds.start_ratio, spring_ratio),
+        ),
+        (
+            CANVAS_OPENING_SIDE_RIGHT,
+            (target.bounds.end_ratio, spring_ratio),
+        ),
+    )
+
+
+def _get_canvas_opening_maximum_arch_rise_ratio(
+    target: CanvasOpeningTarget,
+) -> float:
+    """Return the maximum smooth arch rise in wall-height ratios."""
+
+    opening_width = target.bounds.horizontal_span * target.wall_width_meters
+    opening_height = target.bounds.vertical_span * target.wall_height_meters
+    maximum_rise_meters = min(opening_width * 0.5, opening_height)
+    return maximum_rise_meters / target.wall_height_meters
+
+
+def _build_dragged_canvas_opening_target(
+    target: CanvasOpeningTarget,
+    handle: _CanvasOpeningGizmoHandle,
+    requested_local: tuple[float, float],
+) -> CanvasOpeningTarget:
+    """Build one live bounds or arch edit from an absolute pointer point."""
+
+    if handle.kind == CANVAS_OPENING_GIZMO_ARCH:
+        maximum_rise_ratio = _get_canvas_opening_maximum_arch_rise_ratio(target)
+        if maximum_rise_ratio <= 1e-12:
+            return target
+        requested_arch_amount = (
+            target.bounds.top_ratio - float(requested_local[1])
+        ) / maximum_rise_ratio
+        return target.with_arch_amount(
+            float(np.clip(requested_arch_amount, 0.0, 1.0))
+        )
+    return target.with_bounds(
+        _build_dragged_canvas_opening_bounds(
+            target,
+            handle,
+            requested_local,
+        )
     )
 
 

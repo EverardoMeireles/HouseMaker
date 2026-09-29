@@ -10,11 +10,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # ### Imports ###
 import numpy as np
+import trimesh
 from OpenGL import GL
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QApplication
-import trimesh
 
 from housemaker.canvas_openings import (
     CANVAS_OPENING_DOORWAY,
@@ -24,9 +24,11 @@ from housemaker.canvas_openings import (
     CanvasOpeningTarget,
 )
 from housemaker.glb import GeneratedModel
-from housemaker.surface_geometry import FixedSurface, SURFACE_TYPE_WALL
+from housemaker.surface_geometry import SURFACE_TYPE_WALL, FixedSurface
 from housemaker.viewer import (
+    CANVAS_OPENING_ARCH_SIZE_PIXELS,
     CANVAS_OPENING_GIZMO_ANCHOR,
+    CANVAS_OPENING_GIZMO_ARCH,
     CANVAS_OPENING_GIZMO_SIDE,
     CANVAS_OPENING_HANDLE_HIT_RADIUS_PIXELS,
     CANVAS_OPENING_OVERLAY_DEPTH_VALUE,
@@ -40,7 +42,6 @@ from housemaker.viewer import (
     _CanvasOpeningGizmoHandle,
 )
 
-
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
 _qt_application.setQuitOnLastWindowClosed(False)
@@ -53,6 +54,7 @@ def _build_target(
     item_index: int = 0,
     stable_id: str = "window-a",
     bounds: CanvasOpeningBounds | None = None,
+    arch_amount: float | None = None,
 ) -> CanvasOpeningTarget:
     return CanvasOpeningTarget(
         reference=CanvasOpeningReference(
@@ -76,6 +78,7 @@ def _build_target(
             bottom_ratio=0.2,
             top_ratio=0.8,
         ),
+        arch_amount=arch_amount,
     )
 
 
@@ -288,6 +291,91 @@ class CanvasOpeningGizmoTests(unittest.TestCase):
         self.assertEqual(
             anchor_handle,
             _CanvasOpeningGizmoHandle(CANVAS_OPENING_GIZMO_ANCHOR),
+        )
+
+    def test_arch_doorway_renders_and_picks_two_linked_shoulder_handles(
+        self,
+    ) -> None:
+        target = _build_target(
+            CANVAS_OPENING_DOORWAY,
+            arch_amount=0.6,
+        )
+        viewer = self._build_viewer(target)
+        viewer.select_canvas_opening(target.reference)
+        items = tuple(viewer._canvas_opening_gizmo_items)
+
+        self.assertEqual(len(items), 5)
+        self.assertGreater(len(np.asarray(items[0].pos)), 20)
+        guide_positions = np.asarray(items[3].pos, dtype=float)
+        handle_positions = np.asarray(items[4].pos, dtype=float)
+        np.testing.assert_allclose(
+            guide_positions[:, (0, 2)],
+            ((1.0, 1.8), (3.0, 1.8)),
+            atol=1e-9,
+        )
+        np.testing.assert_allclose(handle_positions, guide_positions, atol=1e-9)
+        self.assertGreaterEqual(CANVAS_OPENING_ARCH_SIZE_PIXELS, 20.0)
+
+        with patch.object(viewer.view, "pixelSize", return_value=0.01):
+            left_handle = viewer._pick_canvas_opening_gizmo_handle(
+                *_ray_at(1.0, 1.8)
+            )
+            right_handle = viewer._pick_canvas_opening_gizmo_handle(
+                *_ray_at(3.0, 1.8)
+            )
+
+        self.assertEqual(
+            left_handle,
+            _CanvasOpeningGizmoHandle(
+                CANVAS_OPENING_GIZMO_ARCH,
+                CANVAS_OPENING_SIDE_LEFT,
+            ),
+        )
+        self.assertEqual(
+            right_handle,
+            _CanvasOpeningGizmoHandle(
+                CANVAS_OPENING_GIZMO_ARCH,
+                CANVAS_OPENING_SIDE_RIGHT,
+            ),
+        )
+
+    def test_arch_shoulder_drag_changes_only_arch_amount(self) -> None:
+        target = _build_target(
+            CANVAS_OPENING_DOORWAY,
+            arch_amount=0.6,
+        )
+        viewer = self._build_viewer(target)
+        viewer.select_canvas_opening(target.reference)
+        finished: list[tuple[object, bool]] = []
+        viewer.canvas_opening_edit_finished.connect(
+            lambda edit, changed: finished.append((edit, changed))
+        )
+        handle = _CanvasOpeningGizmoHandle(
+            CANVAS_OPENING_GIZMO_ARCH,
+            CANVAS_OPENING_SIDE_LEFT,
+        )
+
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_ray_at(1.0, 1.8),
+        ):
+            self.assertTrue(viewer._begin_canvas_opening_gizmo_drag(handle, QPointF()))
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_ray_at(1.0, 2.2),
+        ):
+            self.assertTrue(viewer._finish_canvas_opening_gizmo_drag(QPointF()))
+
+        self.assertEqual(len(finished), 1)
+        final_edit, changed = finished[0]
+        self.assertTrue(changed)
+        self.assertEqual(final_edit.bounds, target.bounds)
+        self.assertAlmostEqual(final_edit.arch_amount, 0.2)
+        self.assertAlmostEqual(
+            viewer._canvas_opening_targets[target.key].arch_amount,
+            0.2,
         )
 
     def test_each_side_drag_changes_only_its_own_boundary(self) -> None:

@@ -13,8 +13,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
-from PySide6.QtWidgets import QApplication
 import trimesh
+from PySide6.QtWidgets import QApplication
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.canvas_openings import (
@@ -24,9 +24,13 @@ from housemaker.canvas_openings import (
     build_canvas_opening_targets,
 )
 from housemaker.main import BlueprintWorkspace
-from housemaker.models import DoorwayData, LevelData, WindowData
-from housemaker.surface_geometry import FixedSurface, SURFACE_TYPE_WALL
-
+from housemaker.models import (
+    DOORWAY_SHAPE_ARCH,
+    DoorwayData,
+    LevelData,
+    WindowData,
+)
+from housemaker.surface_geometry import SURFACE_TYPE_WALL, FixedSurface
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -162,6 +166,145 @@ class CanvasOpeningMainTests(unittest.TestCase):
             tuple(self.level.doorways),
         )
         schedule_refresh.assert_called_once_with(preserve_camera=True)
+
+    def test_arch_checkbox_immediately_exposes_3d_shoulders(self) -> None:
+        target = self._get_target(CANVAS_OPENING_DOORWAY)
+
+        self.assertTrue(self.workspace.viewer.select_canvas_opening(target.reference))
+        self.assertTrue(
+            self.workspace.selected_doorway_arch_checkbox.isEnabled()
+        )
+        self.workspace.selected_doorway_arch_checkbox.click()
+
+        self.assertEqual(self.level.doorways[0].shape, DOORWAY_SHAPE_ARCH)
+        updated_target = self.workspace._canvas_opening_targets_by_key[target.key]
+        self.assertEqual(updated_target.arch_amount, 1.0)
+        self.assertEqual(
+            self.workspace.viewer._canvas_opening_targets[target.key].arch_amount,
+            1.0,
+        )
+        self.assertEqual(
+            len(self.workspace.viewer._canvas_opening_gizmo_items),
+            5,
+        )
+        status_label = self.workspace.viewer.window_tools_status_label
+        assert status_label is not None
+        self.assertIn("blue arch shoulder", status_label.text())
+
+        self.workspace.selected_doorway_arch_checkbox.click()
+
+        self.assertIsNone(
+            self.workspace.viewer._canvas_opening_targets[target.key].arch_amount
+        )
+        self.assertEqual(
+            len(self.workspace.viewer._canvas_opening_gizmo_items),
+            3,
+        )
+        self.assertNotIn("blue arch shoulder", status_label.text())
+
+    def test_arch_gizmo_uses_delayed_mesh_commit_and_updates_amount_field(
+        self,
+    ) -> None:
+        target = self._get_target(CANVAS_OPENING_DOORWAY).with_arch_amount(0.5)
+        self.level.doorways[0].shape = DOORWAY_SHAPE_ARCH
+        self.level.doorways[0].arch_amount = 0.5
+        self.workspace._canvas_opening_targets_by_key[target.key] = target
+        start_edit = CanvasOpeningEdit(
+            target.reference,
+            target.wall_surface_id,
+            target.bounds,
+            arch_amount=0.5,
+        )
+        changed_edit = CanvasOpeningEdit(
+            target.reference,
+            target.wall_surface_id,
+            target.bounds,
+            arch_amount=0.25,
+        )
+
+        self.workspace._handle_canvas_opening_edit_started(start_edit)
+        self.workspace._handle_canvas_opening_edit_preview_changed(changed_edit)
+
+        self.assertEqual(self.level.doorways[0].arch_amount, 0.25)
+        self.assertEqual(
+            self.workspace.selected_doorway_arch_amount_spinbox.value(),
+            25.0,
+        )
+        self.assertFalse(self.workspace._doorway_mesh_update_timer.isActive())
+
+        self.workspace._handle_canvas_opening_edit_finished(changed_edit, True)
+
+        self.assertTrue(self.workspace._doorway_mesh_update_timer.isActive())
+
+    def test_cancelled_arch_gizmo_restores_without_a_residual_outline(
+        self,
+    ) -> None:
+        self.level.doorways[0].shape = DOORWAY_SHAPE_ARCH
+        self.level.doorways[0].arch_amount = 0.5
+        self.workspace._reset_viewer_doorway_snapshots()
+        self.workspace._set_canvas_viewer_targets((self.wall,))
+        target = self._get_target(CANVAS_OPENING_DOORWAY)
+        start_edit = CanvasOpeningEdit(
+            target.reference,
+            target.wall_surface_id,
+            target.bounds,
+            arch_amount=0.5,
+        )
+        changed_edit = CanvasOpeningEdit(
+            target.reference,
+            target.wall_surface_id,
+            target.bounds,
+            arch_amount=0.2,
+        )
+        self.workspace.viewer.set_doorway_preview_outline(
+            np.asarray(((0.0, 0.0, 0.0), (1.0, 0.0, 1.0)))
+        )
+
+        self.workspace._handle_canvas_opening_edit_started(start_edit)
+        self.workspace._handle_canvas_opening_edit_preview_changed(changed_edit)
+        self.workspace._handle_canvas_opening_edit_cancelled(start_edit)
+
+        self.assertEqual(self.level.doorways[0].arch_amount, 0.5)
+        self.assertIsNone(
+            self.workspace.viewer._doorway_preview_outline_positions
+        )
+        self.assertFalse(self.workspace._doorway_mesh_update_timer.isActive())
+        self.assertIsNone(self.workspace._pending_doorway_mesh_level_index)
+
+    def test_ctrl_z_immediately_restores_the_arch_gizmo_baseline(self) -> None:
+        self.level.doorways[0].shape = DOORWAY_SHAPE_ARCH
+        self.level.doorways[0].arch_amount = 0.5
+        self.workspace._reset_viewer_doorway_snapshots()
+        self.workspace._set_canvas_viewer_targets((self.wall,))
+        target = self._get_target(CANVAS_OPENING_DOORWAY)
+        self.workspace.viewer.select_canvas_opening(target.reference)
+        start_edit = CanvasOpeningEdit(
+            target.reference,
+            target.wall_surface_id,
+            target.bounds,
+            arch_amount=0.5,
+        )
+        changed_edit = CanvasOpeningEdit(
+            target.reference,
+            target.wall_surface_id,
+            target.bounds,
+            arch_amount=0.2,
+        )
+
+        self.workspace._handle_canvas_opening_edit_started(start_edit)
+        self.workspace.viewer.update_canvas_opening_target(
+            target.with_arch_amount(0.2)
+        )
+        self.workspace._handle_canvas_opening_edit_preview_changed(changed_edit)
+        self.workspace._handle_canvas_opening_edit_finished(changed_edit, True)
+        self.workspace._handle_canvas_undo_requested()
+
+        self.assertEqual(self.level.doorways[0].arch_amount, 0.5)
+        self.assertEqual(
+            self.workspace.viewer._canvas_opening_targets[target.key].arch_amount,
+            0.5,
+        )
+        self.assertEqual(self.workspace._canvas_undo_stack, [])
 
     def test_cancelled_window_drag_restores_data_without_a_mesh_update(self) -> None:
         target = next(

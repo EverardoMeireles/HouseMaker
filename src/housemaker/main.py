@@ -3866,12 +3866,14 @@ class BlueprintWorkspace(QWidget):
         self._active_canvas_opening_reference = raw_edit.reference
         self._active_canvas_opening_start_edit = raw_edit
         self._doorway_mesh_update_timer.stop()
+        if raw_edit.reference.kind == CANVAS_OPENING_DOORWAY:
+            self.viewer.set_doorway_preview_outline(None)
 
     def _handle_canvas_opening_edit_preview_changed(
         self,
         raw_edit: object,
     ) -> None:
-        """Apply a lightweight opening rectangle while retaining the old mesh."""
+        """Apply a lightweight opening shape while retaining the old mesh."""
 
         if not isinstance(raw_edit, CanvasOpeningEdit):
             return
@@ -3891,13 +3893,11 @@ class BlueprintWorkspace(QWidget):
             )
         except (TypeError, ValueError) as error:
             self.viewer.set_window_tools_status(
-                f"Opening could not be resized: {error}"
+                f"Opening could not be edited: {error}"
             )
             return
 
-        self._canvas_opening_targets_by_key[target.key] = target.with_bounds(
-            raw_edit.bounds
-        )
+        self._canvas_opening_targets_by_key[target.key] = target.with_edit(raw_edit)
         self._sync_live_canvas_opening(applied.reference, applied.level)
         self._refresh_pending_canvas_opening_state(applied.reference)
         if self._is_canvas_opening_drag_active:
@@ -3918,7 +3918,7 @@ class BlueprintWorkspace(QWidget):
         ):
             return
         start_edit = self._active_canvas_opening_start_edit
-        if changed and start_edit is not None and raw_edit.bounds != start_edit.bounds:
+        if changed and start_edit is not None and raw_edit != start_edit:
             self._record_canvas_undo_state(
                 _CanvasOpeningEditUndoState(start_edit=start_edit),
                 commit_pending_surface_edit=False,
@@ -3929,7 +3929,7 @@ class BlueprintWorkspace(QWidget):
         self,
         raw_start_edit: object,
     ) -> None:
-        """Restore the exact drag-start rectangle after viewer cancellation."""
+        """Restore the exact drag-start shape after viewer cancellation."""
 
         start_edit = (
             raw_start_edit
@@ -3965,6 +3965,7 @@ class BlueprintWorkspace(QWidget):
         if reference.kind == CANVAS_OPENING_DOORWAY:
             self.canvas.doorways = level.doorways
             self.canvas._set_selected_doorway_index(reference.item_index)
+            self._handle_canvas_doorway_selection_changed(reference.item_index)
         else:
             self.canvas.windows = level.windows
         self.canvas.update()
@@ -4075,7 +4076,7 @@ class BlueprintWorkspace(QWidget):
         if drag_start is not None:
             opening_targets = tuple(
                 (
-                    target.with_bounds(drag_start.bounds)
+                    target.with_edit(drag_start)
                     if target.key == drag_start.reference.key
                     else target
                 )
@@ -5119,8 +5120,9 @@ class BlueprintWorkspace(QWidget):
             target,
             state.start_edit,
         )
-        restored_target = target.with_bounds(state.start_edit.bounds)
+        restored_target = target.with_edit(state.start_edit)
         self._canvas_opening_targets_by_key[target.key] = restored_target
+        self.viewer.update_canvas_opening_target(restored_target)
         self._sync_live_canvas_opening(applied.reference, applied.level)
         self._refresh_pending_canvas_opening_state(applied.reference)
         if (
@@ -15623,11 +15625,36 @@ class BlueprintWorkspace(QWidget):
         del amount_blocker
         del blocker
 
+    def _sync_selected_doorway_arch_gizmo(self) -> None:
+        """Expose or refresh arch shoulders from the live doorway data."""
+
+        doorway_index = self.canvas.selected_doorway_index
+        if doorway_index is None or not 0 <= doorway_index < len(
+            self.canvas.doorways
+        ):
+            return
+        target_key = f"doorway:{self.current_level.index}:{doorway_index}"
+        target = self._canvas_opening_targets_by_key.get(target_key)
+        if target is None:
+            return
+        doorway = self.canvas.doorways[doorway_index]
+        arch_amount = (
+            doorway.arch_amount
+            if doorway.shape == DOORWAY_SHAPE_ARCH
+            else None
+        )
+        updated_target = target.with_arch_amount(arch_amount)
+        if updated_target == target:
+            return
+        self._canvas_opening_targets_by_key[target_key] = updated_target
+        self.viewer.update_canvas_opening_target(updated_target)
+
     def _handle_selected_doorway_arch_toggled(self, enabled: bool) -> None:
         """Turn the selected doorway arch profile on or off."""
 
         shape = DOORWAY_SHAPE_ARCH if enabled else DOORWAY_SHAPE_RECTANGULAR
         self.canvas.set_selected_doorway_shape(shape)
+        self._sync_selected_doorway_arch_gizmo()
         self._handle_canvas_doorway_selection_changed(
             -1
             if self.canvas.selected_doorway_index is None
@@ -15641,6 +15668,7 @@ class BlueprintWorkspace(QWidget):
         """Preview a normalized arch amount for the selected doorway."""
 
         if self.canvas.set_selected_doorway_arch_amount(arch_amount_percent / 100.0):
+            self._sync_selected_doorway_arch_gizmo()
             return
         self._handle_canvas_doorway_selection_changed(
             -1

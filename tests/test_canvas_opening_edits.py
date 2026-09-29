@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 
 import numpy as np
 import trimesh
@@ -14,8 +15,13 @@ from housemaker.canvas_openings import (
     apply_canvas_opening_edit,
     build_canvas_opening_targets,
 )
-from housemaker.models import DoorwayData, LevelData, WindowData
-from housemaker.surface_geometry import FixedSurface, SURFACE_TYPE_WALL
+from housemaker.models import (
+    DOORWAY_SHAPE_ARCH,
+    DoorwayData,
+    LevelData,
+    WindowData,
+)
+from housemaker.surface_geometry import SURFACE_TYPE_WALL, FixedSurface
 
 
 # ### Fixture helpers ###
@@ -141,6 +147,36 @@ class CanvasOpeningEditTests(unittest.TestCase):
         self.assertAlmostEqual(doorway.bottom_height_meters, 0.6)
         self.assertAlmostEqual(doorway.height_meters, 1.95)
         self.assertAlmostEqual(doorway.rotation_degrees, 90.0)
+
+    def test_arch_target_and_edit_preserve_the_shape_and_update_its_amount(
+        self,
+    ) -> None:
+        level, wall = _build_level()
+        level.doorways[0] = replace(
+            level.doorways[0],
+            shape=DOORWAY_SHAPE_ARCH,
+            arch_amount=0.35,
+        )
+        target = next(
+            target
+            for target in build_canvas_opening_targets((level,), (wall,))
+            if target.reference.kind == CANVAS_OPENING_DOORWAY
+        )
+
+        result = apply_canvas_opening_edit(
+            (level,),
+            target,
+            CanvasOpeningEdit(
+                target.reference,
+                target.wall_surface_id,
+                target.bounds,
+                arch_amount=0.8,
+            ),
+        )
+
+        self.assertEqual(target.arch_amount, 0.35)
+        self.assertEqual(result.current.shape, DOORWAY_SHAPE_ARCH)
+        self.assertEqual(result.current.arch_amount, 0.8)
 
     def test_window_edit_resolves_the_stable_id_after_list_reordering(self) -> None:
         level, wall = _build_level()

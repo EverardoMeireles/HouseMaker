@@ -12,18 +12,19 @@ from housemaker.level_coordinates import (
     level_world_to_image_xy,
 )
 from housemaker.models import (
+    DOORWAY_SHAPE_ARCH,
     MIN_DOORWAY_HEIGHT_METERS,
     MIN_DOORWAY_WIDTH_METERS,
     DoorwayData,
     LevelData,
     WindowData,
+    normalize_doorway_arch_amount,
 )
 from housemaker.surface_geometry import (
     MIN_WINDOW_SIZE_METERS,
     SURFACE_TYPE_WALL,
     FixedSurface,
 )
-
 
 # ### Constants ###
 CANVAS_OPENING_DOORWAY = "doorway"
@@ -122,6 +123,7 @@ class CanvasOpeningTarget:
     minimum_width_meters: float
     minimum_height_meters: float
     bounds: CanvasOpeningBounds
+    arch_amount: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.reference, CanvasOpeningReference):
@@ -161,6 +163,10 @@ class CanvasOpeningTarget:
         )
         if not isinstance(self.bounds, CanvasOpeningBounds):
             raise TypeError("Canvas opening targets require wall-local bounds.")
+        arch_amount = _normalize_optional_doorway_arch_amount(
+            self.reference,
+            self.arch_amount,
+        )
         object.__setattr__(self, "wall_surface_id", normalized_surface_id)
         object.__setattr__(self, "plane_start_world", plane_start)
         object.__setattr__(self, "wall_tangent_world", tangent)
@@ -169,6 +175,7 @@ class CanvasOpeningTarget:
         object.__setattr__(self, "wall_height_meters", wall_height)
         object.__setattr__(self, "minimum_width_meters", minimum_width)
         object.__setattr__(self, "minimum_height_meters", minimum_height)
+        object.__setattr__(self, "arch_amount", arch_amount)
 
     @property
     def key(self) -> str:
@@ -230,17 +237,41 @@ class CanvasOpeningTarget:
         vertical_ratio = float(offset[2] / self.wall_height_meters)
         return horizontal_ratio, vertical_ratio
 
-    def with_bounds(self, bounds: CanvasOpeningBounds) -> "CanvasOpeningTarget":
+    def with_bounds(self, bounds: CanvasOpeningBounds) -> CanvasOpeningTarget:
         return replace(self, bounds=bounds)
+
+    def with_arch_amount(
+        self,
+        arch_amount: float | None,
+    ) -> CanvasOpeningTarget:
+        """Return this stable wall target with a new optional arch control."""
+
+        return replace(self, arch_amount=arch_amount)
+
+    def with_edit(self, edit: CanvasOpeningEdit) -> CanvasOpeningTarget:
+        """Return the live target state represented by one matching edit."""
+
+        if edit.reference != self.reference:
+            raise ValueError("The Canvas opening edit targets another opening.")
+        if edit.wall_surface_id != self.wall_surface_id:
+            raise ValueError("The Canvas opening edit targets another wall.")
+        if (edit.arch_amount is None) != (self.arch_amount is None):
+            raise ValueError("The Canvas doorway arch mode changed during the edit.")
+        return replace(
+            self,
+            bounds=edit.bounds,
+            arch_amount=edit.arch_amount,
+        )
 
 
 @dataclass(frozen=True)
 class CanvasOpeningEdit:
-    """One live wall-local rectangle emitted by the detached Canvas viewer."""
+    """One live wall-local opening shape emitted by the 3D scene viewer."""
 
     reference: CanvasOpeningReference
     wall_surface_id: str
     bounds: CanvasOpeningBounds
+    arch_amount: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.reference, CanvasOpeningReference):
@@ -250,7 +281,12 @@ class CanvasOpeningEdit:
             raise ValueError("Canvas opening edits require a wall surface ID.")
         if not isinstance(self.bounds, CanvasOpeningBounds):
             raise TypeError("Canvas opening edits require bounds.")
+        arch_amount = _normalize_optional_doorway_arch_amount(
+            self.reference,
+            self.arch_amount,
+        )
         object.__setattr__(self, "wall_surface_id", normalized_surface_id)
+        object.__setattr__(self, "arch_amount", arch_amount)
 
 
 @dataclass(frozen=True)
@@ -382,6 +418,11 @@ def _build_doorway_target(
             top_ratio=(bottom_height + float(doorway.height_meters))
             / wall_height,
         ),
+        arch_amount=(
+            doorway.arch_amount
+            if doorway.shape == DOORWAY_SHAPE_ARCH
+            else None
+        ),
     )
 
 
@@ -497,7 +538,7 @@ def apply_canvas_opening_edit(
     target: CanvasOpeningTarget,
     edit: CanvasOpeningEdit,
 ) -> AppliedCanvasOpeningEdit:
-    """Apply validated wall-local bounds while retaining opening semantics."""
+    """Apply validated wall-local bounds and arch state to one opening."""
 
     if not isinstance(target, CanvasOpeningTarget):
         raise TypeError("Canvas opening edits require their current target frame.")
@@ -507,6 +548,8 @@ def apply_canvas_opening_edit(
         raise ValueError("The Canvas opening edit target changed during the drag.")
     if edit.wall_surface_id != target.wall_surface_id:
         raise ValueError("The Canvas opening edit moved to a different wall.")
+    if (edit.arch_amount is None) != (target.arch_amount is None):
+        raise ValueError("The Canvas doorway arch mode changed during the drag.")
     _validate_committed_bounds(target, edit.bounds)
     level = next(
         (
@@ -590,6 +633,11 @@ def _apply_doorway_edit(
         height_meters=(
             edit.bounds.vertical_span * target.wall_height_meters
         ),
+        arch_amount=(
+            previous.arch_amount
+            if edit.arch_amount is None
+            else edit.arch_amount
+        ),
     )
     level.doorways[doorway_index] = current
     return AppliedCanvasOpeningEdit(
@@ -619,6 +667,19 @@ def _validate_committed_bounds(
 
 
 # ### Validation helpers ###
+def _normalize_optional_doorway_arch_amount(
+    reference: CanvasOpeningReference,
+    value: object | None,
+) -> float | None:
+    """Normalize an active doorway arch, leaving other openings unarched."""
+
+    if value is None:
+        return None
+    if reference.kind != CANVAS_OPENING_DOORWAY:
+        raise ValueError("Only Canvas doorways can expose an arch control.")
+    return normalize_doorway_arch_amount(value)
+
+
 def _normalize_finite_number(value: object, field_name: str) -> float:
     if isinstance(value, bool):
         raise ValueError(f"{field_name.capitalize()} must be a finite number.")
