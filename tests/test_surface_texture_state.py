@@ -234,6 +234,34 @@ class SurfaceTextureSelectionTests(unittest.TestCase):
                         selected_surface_ids=(surface_id,),
                     )
 
+    def test_selection_accepts_architectural_trim_part_ids(self) -> None:
+        trim_id = "fedcba9876543210" * 2
+
+        for part_kind in ("front", "top", "bottom", "sides"):
+            surface_id = f"trim:{trim_id}/part:{part_kind}:wall"
+            with self.subTest(part_kind=part_kind):
+                state = SurfaceTextureData(
+                    selected_surface_type=SURFACE_TYPE_WALL,
+                    selected_surface_ids=(surface_id,),
+                )
+                self.assertEqual(state.selected_surface_ids, (surface_id,))
+
+    def test_selection_rejects_malformed_architectural_trim_part_ids(self) -> None:
+        trim_id = "a" * 32
+
+        for surface_id in (
+            f"trim:{'a' * 31}/part:front:wall",
+            f"trim:{'A' * 32}/part:front:wall",
+            f"trim:{trim_id}/part:unknown:wall",
+            f"trim:{trim_id}/part:front:floor",
+        ):
+            with self.subTest(surface_id=surface_id):
+                with self.assertRaises(ValueError):
+                    SurfaceTextureData(
+                        selected_surface_type=SURFACE_TYPE_WALL,
+                        selected_surface_ids=(surface_id,),
+                    )
+
     def test_selection_rejects_malformed_edited_face_ids(self) -> None:
         invalid_surface_ids = (
             f"level:2/edit-face:{'a' * 31}:wall",

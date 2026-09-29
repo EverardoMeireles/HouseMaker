@@ -147,6 +147,7 @@ GLTF_CLAMP_TO_EDGE_WRAP = 33071
 NAMED_MESH_ROLE_SURFACE = "surface"
 NAMED_MESH_ROLE_OPENING_REVEAL = "opening_reveal"
 NAMED_MESH_ROLE_STAIR = "stair"
+NAMED_MESH_ROLE_ARCHITECTURAL_TRIM = "architectural_trim"
 STAIR_PART_TREADS = "treads"
 STAIR_PART_SUPPORT = "support"
 STAIR_PART_RISERS = "risers"
@@ -287,6 +288,7 @@ class GeneratedModel:
     )
     preview_placed_objects: list["PreviewPlacedObject"] = field(default_factory=list)
     preview_stair_parts: list[PreviewStairPart] = field(default_factory=list)
+    preview_architectural_trim_parts: list[object] = field(default_factory=list)
     preview_base_mesh: trimesh.Trimesh | None = None
 
 
@@ -772,6 +774,7 @@ def _build_blueprint_model(
 ) -> GeneratedModel:
     fixed_surfaces: Sequence[object] | None = None
     preview_stair_parts: list[PreviewStairPart] = []
+    preview_architectural_trim_parts: list[object] = []
     if isinstance(level_source, VertexData):
         if stairs:
             raise ValueError("Stairs require level data with endpoint levels.")
@@ -784,6 +787,10 @@ def _build_blueprint_model(
         )
         named_meshes = _build_named_meshes_for_single_level(wall_meshes)
     else:
+        from housemaker.architectural_trim import (
+            build_architectural_trim_geometry,
+            is_architectural_trim_surface_id,
+        )
         from housemaker.surface_geometry import (
             build_base_fixed_surfaces,
             build_fixed_surfaces,
@@ -801,7 +808,25 @@ def _build_blueprint_model(
             exportable_stairs,
         )
         base_fixed_surfaces = build_base_fixed_surfaces(level_source)
+        trim_geometry = build_architectural_trim_geometry(
+            level_source,
+            base_fixed_surfaces,
+        )
+        preview_architectural_trim_parts = list(trim_geometry.parts)
+        named_meshes.extend(
+            NamedMesh(
+                name=f"architectural_trim_{run.run_id}",
+                mesh=run.mesh.copy(),
+                export_role=NAMED_MESH_ROLE_ARCHITECTURAL_TRIM,
+            )
+            for run in trim_geometry.runs
+        )
         fixed_surfaces = build_fixed_surfaces(level_source)
+        structural_fixed_surfaces = tuple(
+            surface
+            for surface in fixed_surfaces
+            if not is_architectural_trim_surface_id(surface.surface_id)
+        )
         named_meshes.extend(
             _build_untextured_ceiling_named_meshes(
                 level_source,
@@ -812,13 +837,13 @@ def _build_blueprint_model(
             named_meshes,
             level_source,
             base_fixed_surfaces,
-            fixed_surfaces,
+            structural_fixed_surfaces,
         )
         named_meshes = _apply_manual_floor_orientation_geometry(
             named_meshes,
             level_source,
             base_fixed_surfaces,
-            fixed_surfaces,
+            structural_fixed_surfaces,
         )
         preview_textured_walls = _build_preview_textured_walls(
             level_source,
@@ -841,6 +866,7 @@ def _build_blueprint_model(
         glb_bytes=glb_bytes,
         preview_textured_walls=preview_textured_walls,
         preview_stair_parts=preview_stair_parts,
+        preview_architectural_trim_parts=preview_architectural_trim_parts,
     )
     if not surface_materials and export_untextured_surfaces:
         return model
@@ -1278,6 +1304,9 @@ def _compose_placed_generated_models(
         preview_placed_objects=preview_placed_objects,
         preview_base_mesh=preview_base_mesh,
         preview_stair_parts=list(base_model.preview_stair_parts),
+        preview_architectural_trim_parts=list(
+            base_model.preview_architectural_trim_parts
+        ),
     )
 
 
@@ -4620,20 +4649,45 @@ def _apply_surface_materials(
         *textured_named_meshes,
     ]
     if not export_untextured_surfaces:
+        architectural_trim_surfaces = [
+            surface
+            for surface in base_surfaces
+            if str(getattr(surface, "surface_id", "")).startswith("trim:")
+        ]
+        structural_surfaces = [
+            surface
+            for surface in base_surfaces
+            if not str(getattr(surface, "surface_id", "")).startswith("trim:")
+        ]
+        textured_trim_named_meshes = [
+            named_mesh
+            for named_mesh in textured_named_meshes
+            if named_mesh.export_role == NAMED_MESH_ROLE_ARCHITECTURAL_TRIM
+        ]
         export_named_meshes = _build_assigned_surface_export_named_meshes(
             named_meshes,
-            base_surfaces,
+            structural_surfaces,
             [
                 named_mesh
                 for named_mesh in textured_named_meshes
-                if named_mesh.export_role != NAMED_MESH_ROLE_STAIR
+                if named_mesh.export_role
+                not in {
+                    NAMED_MESH_ROLE_STAIR,
+                    NAMED_MESH_ROLE_ARCHITECTURAL_TRIM,
+                }
             ],
+        )
+        export_named_meshes = _replace_assigned_architectural_trim_part_meshes(
+            export_named_meshes,
+            architectural_trim_surfaces,
+            set(resolved_materials),
         )
         export_named_meshes = _replace_assigned_stair_part_meshes(
             export_named_meshes,
             stair_parts,
             set(resolved_materials),
         )
+        export_named_meshes.extend(textured_trim_named_meshes)
         export_named_meshes.extend(textured_stair_named_meshes)
     scene = _build_export_scene(export_named_meshes)
     return GeneratedModel(
@@ -4644,6 +4698,9 @@ def _apply_surface_materials(
         preview_textured_surfaces=preview_textured_surfaces,
         preview_untextured_mesh=preview_base_mesh,
         preview_stair_parts=model.preview_stair_parts,
+        preview_architectural_trim_parts=(
+            model.preview_architectural_trim_parts
+        ),
     )
 
 
@@ -4693,6 +4750,11 @@ def _build_surface_named_meshes(
             NamedMesh(
                 name=object_name,
                 mesh=mesh,
+                export_role=(
+                    NAMED_MESH_ROLE_ARCHITECTURAL_TRIM
+                    if surface_id.startswith("trim:")
+                    else NAMED_MESH_ROLE_SURFACE
+                ),
             )
         )
     return named_meshes, preview_surfaces
@@ -4776,6 +4838,40 @@ def _replace_assigned_stair_part_meshes(
         if part.stair_id in assigned_stair_ids
         and part.semantic_id not in assigned_surface_ids
     )
+    return retained
+
+
+def _replace_assigned_architectural_trim_part_meshes(
+    named_meshes: Sequence[NamedMesh],
+    trim_surfaces: Sequence[object],
+    assigned_surface_ids: set[str],
+) -> list[NamedMesh]:
+    """Remove assigned trim skins while retaining each run's remaining body."""
+
+    replacement_surfaces = tuple(
+        surface
+        for surface in trim_surfaces
+        if str(getattr(surface, "surface_id", "")) in assigned_surface_ids
+    )
+    if not replacement_surfaces:
+        return list(named_meshes)
+    replacement_face_keys = _build_oriented_surface_face_keys(
+        replacement_surfaces
+    )
+    replacement_plane_coverage = _build_surface_plane_coverage(
+        replacement_surfaces
+    )
+    retained: list[NamedMesh] = []
+    for named_mesh in named_meshes:
+        if named_mesh.export_role != NAMED_MESH_ROLE_ARCHITECTURAL_TRIM:
+            retained.append(named_mesh)
+            continue
+        filtered = _remove_named_mesh_surface_faces(
+            (named_mesh,),
+            replacement_face_keys,
+            replacement_plane_coverage,
+        )
+        retained.extend(filtered)
     return retained
 
 

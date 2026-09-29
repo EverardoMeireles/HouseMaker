@@ -126,6 +126,7 @@ def build_fixed_surfaces(levels: Sequence[LevelData]) -> list[FixedSurface]:
     """Build walls, floors, and ceilings with stable semantic identities."""
 
     from housemaker.architectural_surface_edits import apply_editable_surfaces
+    from housemaker.architectural_trim import build_architectural_trim_geometry
 
     base_surfaces = build_base_fixed_surfaces(
         levels,
@@ -136,12 +137,27 @@ def build_fixed_surfaces(levels: Sequence[LevelData]) -> list[FixedSurface]:
         levels,
         edited_surfaces,
     )
+    resolved_surfaces = _apply_manual_surface_orientation_overrides(
+        levels,
+        clipped_surfaces,
+        edited_surfaces_only=True,
+    )
+    trim_geometry = build_architectural_trim_geometry(levels, base_surfaces)
+    trim_surfaces = tuple(
+        FixedSurface(
+            surface_id=part.semantic_id,
+            surface_type=part.surface_type,
+            level_index=part.level_index,
+            room_index=None,
+            mesh=part.mesh,
+            area_square_meters=float(part.mesh.area),
+            source_surface_id=part.source_wall_surface_id,
+        )
+        for part in trim_geometry.parts
+        if float(part.mesh.area) > SURFACE_GEOMETRY_EPSILON
+    )
     return sorted(
-        _apply_manual_surface_orientation_overrides(
-            levels,
-            clipped_surfaces,
-            edited_surfaces_only=True,
-        ),
+        (*resolved_surfaces, *trim_surfaces),
         key=_get_surface_sort_key,
     )
 

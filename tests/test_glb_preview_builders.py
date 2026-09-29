@@ -29,7 +29,13 @@ from housemaker.glb import (
     convert_to_preview_model,
     import_generated_glb,
 )
-from housemaker.models import LevelData, RoomData, VertexData
+from housemaker.models import (
+    TRIM_KIND_SKIRTING_BOARD,
+    ArchitecturalTrimData,
+    LevelData,
+    RoomData,
+    VertexData,
+)
 from housemaker.surface_geometry import build_fixed_surfaces
 
 
@@ -129,6 +135,55 @@ def _assert_models_have_matching_geometry(
 
 # ### Preview conversion tests ###
 class GlbPreviewConversionTests(unittest.TestCase):
+    def test_architectural_trim_parts_survive_preview_and_texture_replacement(
+        self,
+    ) -> None:
+        level = _build_room_level()
+        wall = next(
+            surface
+            for surface in build_fixed_surfaces([level])
+            if surface.surface_type == "wall"
+        )
+        trim_id = "b" * 32
+        level.architectural_trims.append(
+            ArchitecturalTrimData(
+                trim_id=trim_id,
+                kind=TRIM_KIND_SKIRTING_BOARD,
+                wall_surface_ids=(wall.surface_id,),
+            )
+        )
+        untextured = convert_to_preview_model([level])
+        front_id = f"trim:{trim_id}/part:front:wall"
+
+        self.assertTrue(untextured.preview_architectural_trim_parts)
+        self.assertIn(front_id, {
+            part.semantic_id
+            for part in untextured.preview_architectural_trim_parts
+        })
+        self.assertTrue(
+            any(
+                name.startswith("architectural_trim_")
+                for name in untextured.scene.geometry
+            )
+        )
+
+        textured = convert_to_glb(
+            [level],
+            surface_materials={
+                front_id: _png_bytes((180, 120, 60, 255)),
+            },
+        )
+
+        self.assertTrue(textured.glb_bytes)
+        self.assertIn(
+            front_id,
+            {
+                surface.surface_id
+                for surface in textured.preview_textured_surfaces
+            },
+        )
+        self.assertTrue(textured.preview_architectural_trim_parts)
+
     def test_surface_material_preview_matches_export_without_serializing(
         self,
     ) -> None:
@@ -177,6 +232,40 @@ class GlbPreviewConversionTests(unittest.TestCase):
 
 # ### Preview composition tests ###
 class GlbPreviewCompositionTests(unittest.TestCase):
+    def test_placed_preview_preserves_architectural_trim_part_targets(self) -> None:
+        level = _build_room_level()
+        wall = next(
+            surface
+            for surface in build_fixed_surfaces([level])
+            if surface.surface_type == "wall"
+        )
+        level.architectural_trims.append(
+            ArchitecturalTrimData(
+                trim_id="c" * 32,
+                kind=TRIM_KIND_SKIRTING_BOARD,
+                wall_surface_ids=(wall.surface_id,),
+            )
+        )
+        base = convert_to_preview_model([level])
+        placement = PlacedGeneratedModel(
+            object_id="chair-with-trim-scene",
+            model=_build_textured_object_model(),
+            world_position=(1.0, 2.0, 0.0),
+        )
+
+        preview = compose_placed_generated_models_preview(base, [placement])
+
+        self.assertEqual(
+            tuple(
+                part.semantic_id
+                for part in preview.preview_architectural_trim_parts
+            ),
+            tuple(
+                part.semantic_id
+                for part in base.preview_architectural_trim_parts
+            ),
+        )
+
     def test_placed_preview_preserves_base_stair_part_targets(self) -> None:
         base = convert_to_preview_model([_build_room_level()])
         stair_part = PreviewStairPart(

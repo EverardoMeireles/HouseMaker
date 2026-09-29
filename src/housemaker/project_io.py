@@ -48,6 +48,7 @@ from housemaker.models import (
     MIN_LEVEL_INDEX,
     MIN_LEVEL_OFFSET_METERS,
     MIN_LEVEL_SCALE,
+    ArchitecturalTrimData,
     DoorwayData,
     DoorwayPreset,
     EditableSurfaceEdgeData,
@@ -178,6 +179,9 @@ def save_project(
                     for editable_surface in level.editable_surfaces
                 ],
                 "flipped_surface_ids": sorted(level.flipped_surface_ids),
+                "architectural_trims": [
+                    trim.to_dict() for trim in level.architectural_trims
+                ],
             }
             for level in levels
         ],
@@ -289,6 +293,13 @@ def load_project(path: str | Path) -> ProjectData:
         level.flipped_surface_ids = _deserialize_flipped_surface_ids(
             raw_level.get("flipped_surface_ids", []),
             level_index=level.index,
+        )
+        level.architectural_trims = _deserialize_architectural_trims(
+            raw_level.get("architectural_trims", []),
+            level_index=level.index,
+            valid_vertex_ids={
+                vertex.id for vertex in level.vertex_data.vertices
+            },
         )
 
     image_library_paths = _deserialize_image_library_paths(
@@ -812,6 +823,43 @@ def _deserialize_windows(
         window_ids.add(window.window_id)
         windows.append(window)
     return windows
+
+
+# ### Architectural trim serialization helpers ###
+def _deserialize_architectural_trims(
+    raw_trims: object,
+    *,
+    level_index: int,
+    valid_vertex_ids: set[int],
+) -> list[ArchitecturalTrimData]:
+    """Load valid level-local trim records while isolating malformed entries."""
+
+    if not isinstance(raw_trims, list | tuple):
+        return []
+
+    trims: list[ArchitecturalTrimData] = []
+    trim_ids: set[str] = set()
+    level_prefix = f"level:{int(level_index)}/"
+    for raw_trim in raw_trims:
+        try:
+            trim = ArchitecturalTrimData.from_dict(raw_trim)
+        except (TypeError, ValueError):
+            continue
+        if trim.trim_id in trim_ids:
+            continue
+        if any(
+            not surface_id.startswith(level_prefix)
+            for surface_id in trim.wall_surface_ids
+        ):
+            continue
+        if (
+            trim.corner_vertex_id is not None
+            and trim.corner_vertex_id not in valid_vertex_ids
+        ):
+            continue
+        trim_ids.add(trim.trim_id)
+        trims.append(trim)
+    return trims
 
 
 # ### Open-space serialization helpers ###

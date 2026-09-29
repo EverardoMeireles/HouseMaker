@@ -55,6 +55,23 @@ MAX_WINDOW_SURFACE_ID_LENGTH = 512
 MIN_WINDOW_RATIO_SPAN = 1e-6
 MAX_OPEN_SPACE_ID_LENGTH = 128
 MIN_OPEN_SPACE_SPAN_PIXELS = 1e-6
+TRIM_KIND_SKIRTING_BOARD = "skirting_board"
+TRIM_KIND_CORNICE = "cornice"
+TRIM_KIND_EDGING_STRIP = "edging_strip"
+ARCHITECTURAL_TRIM_KINDS = frozenset(
+    {
+        TRIM_KIND_SKIRTING_BOARD,
+        TRIM_KIND_CORNICE,
+        TRIM_KIND_EDGING_STRIP,
+    }
+)
+DEFAULT_ARCHITECTURAL_TRIM_WIDTH_METERS = 0.08
+DEFAULT_ARCHITECTURAL_TRIM_HEIGHT_METERS = 0.10
+DEFAULT_ARCHITECTURAL_TRIM_DEPTH_METERS = 0.02
+DEFAULT_ARCHITECTURAL_TRIM_CORNER_RADIUS_METERS = 0.0
+MIN_ARCHITECTURAL_TRIM_DIMENSION_METERS = 0.001
+MAX_ARCHITECTURAL_TRIM_DIMENSION_METERS = 20.0
+MAX_ARCHITECTURAL_TRIM_WALL_COUNT = 10_000
 DEFAULT_ROOM_HEIGHT_METERS = 3.0
 DEFAULT_INCLUDE_IN_EXPORT = True
 DEFAULT_UV_MAP_WIDTH = 1024
@@ -144,6 +161,7 @@ _WINDOW_WALL_SURFACE_ID_PATTERN = re.compile(
     r"(?:room:(?:0|[1-9]\d*)/)?"
     r"wall:[1-9]\d*:[1-9]\d*$"
 )
+_ARCHITECTURAL_TRIM_UUID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 EDITABLE_SURFACE_FRAME_WALL_RATIO = "wall_ratio"
 EDITABLE_SURFACE_FRAME_LEVEL_IMAGE = "level_image"
 EDITABLE_SURFACE_FRAME_KINDS = frozenset(
@@ -307,6 +325,137 @@ class WindowData:
             end_ratio=payload.get("end_ratio"),
             bottom_ratio=payload.get("bottom_ratio"),
             top_ratio=payload.get("top_ratio"),
+        )
+
+
+@dataclass(frozen=True)
+class ArchitecturalTrimData:
+    """One persistent wall-bound skirting, cornice, or edging component."""
+
+    trim_id: str
+    kind: str
+    wall_surface_ids: tuple[str, ...]
+    corner_vertex_id: int | None = None
+    width_meters: float = DEFAULT_ARCHITECTURAL_TRIM_WIDTH_METERS
+    height_meters: float = DEFAULT_ARCHITECTURAL_TRIM_HEIGHT_METERS
+    depth_meters: float = DEFAULT_ARCHITECTURAL_TRIM_DEPTH_METERS
+    corner_radius_meters: float = DEFAULT_ARCHITECTURAL_TRIM_CORNER_RADIUS_METERS
+
+    def __post_init__(self) -> None:
+        trim_id = str(self.trim_id).strip().lower()
+        if _ARCHITECTURAL_TRIM_UUID_PATTERN.fullmatch(trim_id) is None:
+            raise ValueError("Architectural trim IDs must be 32-character UUID hex.")
+        kind = str(self.kind).strip().lower()
+        if kind not in ARCHITECTURAL_TRIM_KINDS:
+            raise ValueError(f"Unknown architectural trim kind: {self.kind!r}.")
+        try:
+            wall_surface_ids = tuple(
+                str(surface_id).strip() for surface_id in self.wall_surface_ids
+            )
+        except TypeError as error:
+            raise ValueError(
+                "Architectural trim wall surface IDs must contain a sequence."
+            ) from error
+        if not wall_surface_ids:
+            raise ValueError("Architectural trim requires at least one wall surface.")
+        if len(wall_surface_ids) > MAX_ARCHITECTURAL_TRIM_WALL_COUNT:
+            raise ValueError("Architectural trim references too many wall surfaces.")
+        if len(set(wall_surface_ids)) != len(wall_surface_ids):
+            raise ValueError("Architectural trim wall surface IDs must be unique.")
+        if any(
+            _WINDOW_WALL_SURFACE_ID_PATTERN.fullmatch(surface_id) is None
+            for surface_id in wall_surface_ids
+        ):
+            raise ValueError(
+                "Architectural trim must reference stable wall surface IDs."
+            )
+        corner_vertex_id = self.corner_vertex_id
+        if corner_vertex_id is not None:
+            if (
+                isinstance(corner_vertex_id, bool)
+                or not isinstance(corner_vertex_id, int)
+                or corner_vertex_id <= 0
+            ):
+                raise ValueError(
+                    "Architectural trim corner vertex IDs must be positive integers."
+                )
+        if kind == TRIM_KIND_EDGING_STRIP:
+            if len(wall_surface_ids) != 2 or corner_vertex_id is None:
+                raise ValueError(
+                    "Edging strips require two walls and their shared corner vertex."
+                )
+        elif corner_vertex_id is not None:
+            raise ValueError(
+                "Only edging strips can reference a wall corner vertex."
+            )
+
+        width = _normalize_architectural_trim_dimension(
+            self.width_meters,
+            "width",
+        )
+        height = _normalize_architectural_trim_dimension(
+            self.height_meters,
+            "height",
+        )
+        depth = _normalize_architectural_trim_dimension(
+            self.depth_meters,
+            "depth",
+        )
+        radius = _normalize_architectural_trim_radius(
+            self.corner_radius_meters,
+            depth,
+            height,
+        )
+        object.__setattr__(self, "trim_id", trim_id)
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "wall_surface_ids", wall_surface_ids)
+        object.__setattr__(self, "width_meters", width)
+        object.__setattr__(self, "height_meters", height)
+        object.__setattr__(self, "depth_meters", depth)
+        object.__setattr__(self, "corner_radius_meters", radius)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "trim_id": self.trim_id,
+            "kind": self.kind,
+            "wall_surface_ids": list(self.wall_surface_ids),
+            "corner_vertex_id": self.corner_vertex_id,
+            "width_meters": self.width_meters,
+            "height_meters": self.height_meters,
+            "depth_meters": self.depth_meters,
+            "corner_radius_meters": self.corner_radius_meters,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "ArchitecturalTrimData":
+        if not isinstance(payload, dict):
+            raise ValueError("Architectural trim JSON must contain an object.")
+        raw_surface_ids = payload.get("wall_surface_ids", ())
+        if not isinstance(raw_surface_ids, list | tuple):
+            raise ValueError(
+                "Architectural trim wall surface IDs must contain a list."
+            )
+        return cls(
+            trim_id=payload.get("trim_id", ""),
+            kind=payload.get("kind", ""),
+            wall_surface_ids=tuple(raw_surface_ids),
+            corner_vertex_id=payload.get("corner_vertex_id"),
+            width_meters=payload.get(
+                "width_meters",
+                DEFAULT_ARCHITECTURAL_TRIM_WIDTH_METERS,
+            ),
+            height_meters=payload.get(
+                "height_meters",
+                DEFAULT_ARCHITECTURAL_TRIM_HEIGHT_METERS,
+            ),
+            depth_meters=payload.get(
+                "depth_meters",
+                DEFAULT_ARCHITECTURAL_TRIM_DEPTH_METERS,
+            ),
+            corner_radius_meters=payload.get(
+                "corner_radius_meters",
+                DEFAULT_ARCHITECTURAL_TRIM_CORNER_RADIUS_METERS,
+            ),
         )
 
 
@@ -1367,6 +1516,7 @@ class LevelData:
     editable_surfaces: list[EditableSurfaceMeshData] = field(default_factory=list)
     flipped_surface_ids: set[str] = field(default_factory=set)
     original_image_path: str | None = None
+    architectural_trims: list[ArchitecturalTrimData] = field(default_factory=list)
 
     @property
     def display_name(self) -> str:
@@ -1448,6 +1598,55 @@ def _normalize_finite_float(value: object, field_name: str) -> float:
     if not math.isfinite(normalized):
         raise ValueError(f"Editable surface {field_name} must be finite.")
     return normalized
+
+
+# ### Architectural trim validation helpers ###
+def _normalize_architectural_trim_dimension(
+    value: object,
+    field_name: str,
+) -> float:
+    if isinstance(value, bool):
+        raise ValueError(
+            f"Architectural trim {field_name} must be a finite positive number."
+        )
+    try:
+        dimension = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            f"Architectural trim {field_name} must be a finite positive number."
+        ) from error
+    if (
+        not math.isfinite(dimension)
+        or not MIN_ARCHITECTURAL_TRIM_DIMENSION_METERS
+        <= dimension
+        <= MAX_ARCHITECTURAL_TRIM_DIMENSION_METERS
+    ):
+        raise ValueError(
+            f"Architectural trim {field_name} must be between "
+            f"{MIN_ARCHITECTURAL_TRIM_DIMENSION_METERS:g} and "
+            f"{MAX_ARCHITECTURAL_TRIM_DIMENSION_METERS:g} meters."
+        )
+    return dimension
+
+
+def _normalize_architectural_trim_radius(
+    value: object,
+    depth_meters: float,
+    height_meters: float,
+) -> float:
+    if isinstance(value, bool):
+        raise ValueError("Architectural trim corner radius must be finite.")
+    try:
+        radius = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Architectural trim corner radius must be finite.") from error
+    maximum_radius = min(depth_meters, height_meters) * 0.5
+    if not math.isfinite(radius) or not 0.0 <= radius <= maximum_radius:
+        raise ValueError(
+            "Architectural trim corner radius must be between zero and half "
+            "of its smallest profile dimension."
+        )
+    return radius
 
 
 # ### Window validation helpers ###

@@ -80,6 +80,9 @@ _SURFACE_ID_PATTERN = re.compile(
     r"stair:(?P<stair_id>[0-9a-f]{32})/"
     r"part:(?P<stair_part>treads|support|risers|stringers):"
     r"(?P<stair_surface_type>wall|floor)"
+    r"|trim:(?P<trim_id>[0-9a-f]{32})/"
+    r"part:(?P<trim_part>front|top|bottom|sides):"
+    r"(?P<trim_surface_type>wall)"
     r")$"
 )
 _LEGACY_SURFACE_OVERLAY_ID_PATTERN = re.compile(r"/overlay:[1-9]\d*$")
@@ -907,6 +910,9 @@ def _surface_type_for_id(surface_id: str) -> str:
     stair_surface_type = match.group("stair_surface_type")
     if stair_surface_type is not None:
         return str(stair_surface_type)
+    trim_surface_type = match.group("trim_surface_type")
+    if trim_surface_type is not None:
+        return str(trim_surface_type)
     return SURFACE_TYPE_WALL if match.group("wall") else str(match.group("plane"))
 
 

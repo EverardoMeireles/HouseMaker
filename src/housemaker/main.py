@@ -64,6 +64,20 @@ from housemaker.architectural_surface_edits import (
     extrude_surface_faces,
     place_surface_vertex,
 )
+from housemaker.architectural_trim import (
+    TRIM_HANDLE_CORNER_RADIUS,
+    TRIM_HANDLE_DEPTH,
+    TRIM_HANDLE_HEIGHT,
+    TRIM_HANDLE_WIDTH,
+    ArchitecturalTrimEditTarget,
+    ArchitecturalTrimPart,
+    ArchitecturalTrimPlacementRequest,
+    add_architectural_trim,
+    build_architectural_trim_edit_targets,
+    build_architectural_trim_geometry,
+    is_architectural_trim_surface_id,
+    remove_architectural_trim,
+)
 from housemaker.atlas_export import (
     AtlasDrawCallEstimate,
     SurfaceAmbientOcclusionAtlasContext,
@@ -205,6 +219,7 @@ from housemaker.models import (
     STAIR_TREAD_EDGE_STRAIGHT,
     STAIR_TYPE_FLOATING,
     STAIR_TYPE_SUPPORTED,
+    ArchitecturalTrimData,
     DoorwayData,
     DoorwayPreset,
     EditableSurfaceMeshData,
@@ -252,6 +267,7 @@ from housemaker.surface_geometry import (
     FixedSurface,
     WallWindowPlacement,
     add_wall_window,
+    build_base_fixed_surfaces,
     build_fixed_surfaces,
 )
 from housemaker.surface_materials import (
@@ -302,6 +318,7 @@ from housemaker.texture_atlas_workspace import (
 )
 from housemaker.texture_color_balance import TextureColorBalanceSettings
 from housemaker.viewer import (
+    ArchitecturalTrimDimensionEdit,
     GlbViewerWidget,
     SceneObjectPlacementCandidate,
     build_scene_object_placement_group_candidate,
@@ -887,6 +904,10 @@ class _CanvasBlueprintUndoState:
     other_level_vertex_data: tuple[tuple[int, VertexData], ...] = ()
     other_level_doorways: tuple[tuple[int, tuple[DoorwayData, ...]], ...] = ()
     level_offsets_meters: tuple[float, float] | None = None
+    architectural_trims_by_level: tuple[
+        tuple[int, tuple[ArchitecturalTrimData, ...]],
+        ...,
+    ] = ()
 
 
 @dataclass(frozen=True)
@@ -906,10 +927,15 @@ class _CanvasTopologyUndoState:
         ...,
     ]
     flipped_surface_ids_by_level: tuple[tuple[int, tuple[str, ...]], ...]
+    architectural_trims_by_level: tuple[
+        tuple[int, tuple[ArchitecturalTrimData, ...]],
+        ...,
+    ]
     assignments: tuple[SurfaceTextureAssignment, ...]
     assignment_targets_after: tuple[SurfaceTextureAssignment, ...]
     atlas_placements: tuple[tuple[str, TextureAtlasPlacement], ...]
     selected_surface_ids: tuple[str, ...]
+    selected_architectural_trim_part_ids: tuple[str, ...]
     assignment_target_ids: tuple[str, ...]
     selected_object_id: str | None
     active_vertex_id: str | None
@@ -1227,6 +1253,26 @@ class BlueprintWorkspace(QWidget):
         self._desired_canvas_stair_part_ids: tuple[str, ...] = ()
         self._canvas_stair_part_targets_by_id: dict[str, PreviewStairPart] = {}
         self._canvas_stair_semantic_surfaces_by_id: dict[str, FixedSurface] = {}
+        self._desired_canvas_architectural_trim_part_ids: tuple[str, ...] = ()
+        self._canvas_architectural_trim_parts_by_id: dict[
+            str,
+            ArchitecturalTrimPart,
+        ] = {}
+        self._canvas_architectural_trim_semantic_surfaces_by_id: dict[
+            str,
+            FixedSurface,
+        ] = {}
+        self._canvas_architectural_trim_edit_targets_by_id: dict[
+            str,
+            ArchitecturalTrimEditTarget,
+        ] = {}
+        self._active_architectural_trim_undo_state: _CanvasTopologyUndoState | None = (
+            None
+        )
+        self._pending_architectural_trim_undo_state: _CanvasTopologyUndoState | None = (
+            None
+        )
+        self._pending_architectural_trim_run_id: str | None = None
         self.current_level_index = GROUND_LEVEL_INDEX
         self._is_syncing_level_controls = False
         self._level_transform_drag_active = False
@@ -1318,6 +1364,14 @@ class BlueprintWorkspace(QWidget):
         self._canvas_surface_mesh_update_timer.timeout.connect(
             self._commit_pending_canvas_surface_mesh_update
         )
+        self._architectural_trim_mesh_update_timer = QTimer(self)
+        self._architectural_trim_mesh_update_timer.setSingleShot(True)
+        self._architectural_trim_mesh_update_timer.setInterval(
+            round(self._mesh_edit_update_delay_seconds * 1000.0)
+        )
+        self._architectural_trim_mesh_update_timer.timeout.connect(
+            self._commit_pending_architectural_trim_mesh_update
+        )
         self._stair_point_mesh_update_timer.setInterval(
             round(self._mesh_edit_update_delay_seconds * 1000.0)
         )
@@ -1368,9 +1422,9 @@ class BlueprintWorkspace(QWidget):
         self._canvas_window_undo_ids: list[str] = []
         self._canvas_undo_stack: list[_CanvasUndoState] = []
         self._is_restoring_canvas_undo = False
-        self._direct_object_placement_session: (
-            _DirectObjectPlacementSession | None
-        ) = None
+        self._direct_object_placement_session: _DirectObjectPlacementSession | None = (
+            None
+        )
         self._pending_generation_placement_anchor: (
             SceneObjectPlacementCandidate | None
         ) = None
@@ -1469,6 +1523,7 @@ class BlueprintWorkspace(QWidget):
         )
         self._cancel_active_canvas_surface_edit()
         self._cancel_pending_canvas_surface_mesh_update()
+        self._clear_pending_architectural_trim_mesh_update()
         self._cancel_pending_wall_vertex_update()
         self._cancel_pending_doorway_mesh_update(clear_outline=True)
         self._cancel_and_join_plan_image_corrections()
@@ -1852,9 +1907,7 @@ class BlueprintWorkspace(QWidget):
             self._sync_first_person_generation_frame_overlay
         )
         for checkbox in self.merged_generation_workspace.pbr_map_checkboxes.values():
-            checkbox.toggled.connect(
-                self._handle_generation_scene_pbr_maps_changed
-            )
+            checkbox.toggled.connect(self._handle_generation_scene_pbr_maps_changed)
         self._external_generation_host = ExternalFullscreenViewerHost(
             self,
             window_title="HouseMaker Generation",
@@ -2038,6 +2091,27 @@ class BlueprintWorkspace(QWidget):
         )
         self.viewer.canvas_stair_part_selection_changed.connect(
             self._handle_canvas_stair_part_selection_changed
+        )
+        self.viewer.architectural_trim_placement_requested.connect(
+            self._handle_architectural_trim_placement_requested
+        )
+        self.viewer.architectural_trim_part_selection_changed.connect(
+            self._handle_architectural_trim_part_selection_changed
+        )
+        self.viewer.architectural_trim_deletion_requested.connect(
+            self._handle_architectural_trim_deletion_requested
+        )
+        self.viewer.architectural_trim_edit_started.connect(
+            self._handle_architectural_trim_edit_started
+        )
+        self.viewer.architectural_trim_edit_preview_changed.connect(
+            self._handle_architectural_trim_edit_preview_changed
+        )
+        self.viewer.architectural_trim_edit_finished.connect(
+            self._handle_architectural_trim_edit_finished
+        )
+        self.viewer.architectural_trim_edit_cancelled.connect(
+            self._handle_architectural_trim_edit_cancelled
         )
         self.viewer.canvas_stair_deletion_requested.connect(
             self._handle_canvas_stair_deletion_requested
@@ -2445,9 +2519,7 @@ class BlueprintWorkspace(QWidget):
 
         stair_parameters_layout = QFormLayout()
         stair_parameters_layout.setContentsMargins(0, 0, 0, 0)
-        stair_parameters_layout.setRowWrapPolicy(
-            QFormLayout.RowWrapPolicy.DontWrapRows
-        )
+        stair_parameters_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
         stair_parameters_layout.setFieldGrowthPolicy(
             QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
         )
@@ -2540,17 +2612,11 @@ class BlueprintWorkspace(QWidget):
         )
         nosing_row_layout.addWidget(self.stair_nosing_overhang_spinbox, 0, 1)
         self.stair_nosing_left_checkbox = QCheckBox("Left")
-        self.stair_nosing_left_checkbox.setObjectName(
-            "stair_nosing_left_checkbox"
-        )
+        self.stair_nosing_left_checkbox.setObjectName("stair_nosing_left_checkbox")
         self.stair_nosing_right_checkbox = QCheckBox("Right")
-        self.stair_nosing_right_checkbox.setObjectName(
-            "stair_nosing_right_checkbox"
-        )
+        self.stair_nosing_right_checkbox.setObjectName("stair_nosing_right_checkbox")
         self.stair_nosing_front_checkbox = QCheckBox("Front")
-        self.stair_nosing_front_checkbox.setObjectName(
-            "stair_nosing_front_checkbox"
-        )
+        self.stair_nosing_front_checkbox.setObjectName("stair_nosing_front_checkbox")
         self.stair_nosing_front_checkbox.setChecked(True)
         nosing_placement_widget = QWidget()
         nosing_placement_layout = QHBoxLayout(nosing_placement_widget)
@@ -2618,9 +2684,7 @@ class BlueprintWorkspace(QWidget):
             "The effective radius is clamped when the tread does not have "
             "enough depth."
         )
-        self.stair_tread_edge_radius_spinbox.setToolTip(
-            stair_tread_edge_radius_tooltip
-        )
+        self.stair_tread_edge_radius_spinbox.setToolTip(stair_tread_edge_radius_tooltip)
         self.stair_tread_edge_radius_spinbox.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Fixed,
@@ -2641,9 +2705,7 @@ class BlueprintWorkspace(QWidget):
         self.stair_tread_edge_label.setWordWrap(False)
         self.stair_tread_edge_radius_label = QLabel("Edge radius")
         self.stair_tread_edge_radius_label.setWordWrap(False)
-        self.stair_tread_edge_radius_label.setToolTip(
-            stair_tread_edge_radius_tooltip
-        )
+        self.stair_tread_edge_radius_label.setToolTip(stair_tread_edge_radius_tooltip)
         self.stair_tread_edge_field_widget = QWidget()
         self.stair_tread_edge_radius_field_widget = QWidget()
         tread_edge_fields = (
@@ -2677,9 +2739,7 @@ class BlueprintWorkspace(QWidget):
         self._sync_stair_tread_edge_radius_enabled()
 
         self.stair_starting_step_combo = QComboBox()
-        self.stair_starting_step_combo.setObjectName(
-            "stair_starting_step_combo"
-        )
+        self.stair_starting_step_combo.setObjectName("stair_starting_step_combo")
         self.stair_starting_step_combo.addItem(
             "None",
             STAIR_STARTING_STEP_NONE,
@@ -2765,9 +2825,7 @@ class BlueprintWorkspace(QWidget):
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Preferred,
         )
-        starting_step_row_layout = QVBoxLayout(
-            self.stair_starting_step_row_widget
-        )
+        starting_step_row_layout = QVBoxLayout(self.stair_starting_step_row_widget)
         starting_step_row_layout.setContentsMargins(0, 0, 0, 0)
         starting_step_row_layout.setSpacing(6)
         self.stair_starting_step_label = QLabel("Starting step")
@@ -2788,9 +2846,7 @@ class BlueprintWorkspace(QWidget):
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Fixed,
         )
-        starting_step_field_layout = QHBoxLayout(
-            self.stair_starting_step_field_widget
-        )
+        starting_step_field_layout = QHBoxLayout(self.stair_starting_step_field_widget)
         starting_step_field_layout.setContentsMargins(0, 0, 0, 0)
         starting_step_field_layout.setSpacing(6)
         starting_step_field_layout.addWidget(self.stair_starting_step_label)
@@ -2798,9 +2854,7 @@ class BlueprintWorkspace(QWidget):
         starting_step_row_layout.addWidget(self.stair_starting_step_field_widget)
 
         self.stair_starting_step_detail_row_widget = QWidget()
-        detail_row_layout = QHBoxLayout(
-            self.stair_starting_step_detail_row_widget
-        )
+        detail_row_layout = QHBoxLayout(self.stair_starting_step_detail_row_widget)
         detail_row_layout.setContentsMargins(0, 0, 0, 0)
         detail_row_layout.setSpacing(6)
         starting_step_detail_fields = (
@@ -2834,9 +2888,7 @@ class BlueprintWorkspace(QWidget):
             field_layout.addWidget(field_label)
             field_layout.addWidget(field_control)
             detail_row_layout.addWidget(field_widget, 1)
-        starting_step_row_layout.addWidget(
-            self.stair_starting_step_detail_row_widget
-        )
+        starting_step_row_layout.addWidget(self.stair_starting_step_detail_row_widget)
         stair_parameters_layout.addRow(self.stair_starting_step_row_widget)
         self._sync_stair_starting_step_edge_radius_enabled()
 
@@ -2972,8 +3024,7 @@ class BlueprintWorkspace(QWidget):
                 for control in single_field_controls
             )
             widest_control = max(
-                control.minimumSizeHint().width()
-                for control in single_field_controls
+                control.minimumSizeHint().width() for control in single_field_controls
             )
             row_wrap_policy = (
                 QFormLayout.RowWrapPolicy.DontWrapRows
@@ -3016,8 +3067,7 @@ class BlueprintWorkspace(QWidget):
                 self.stair_tread_edge_radius_spinbox.minimumSizeHint().width(),
             )
             + tread_edge_row_layout.spacing(),
-            3 * placement_checkbox_width
-            + 2 * nosing_placement_layout.spacing(),
+            3 * placement_checkbox_width + 2 * nosing_placement_layout.spacing(),
         )
         self.stairs_group.setMinimumWidth(minimum_stair_form_width + 16)
         self.stairs_scroll_area = QScrollArea()
@@ -3215,9 +3265,7 @@ class BlueprintWorkspace(QWidget):
             "Analyze the current plan without changing the level. Generated "
             "wall faces appear as a live Canvas preview until confirmed."
         )
-        self.generate_walls_button.clicked.connect(
-            self._handle_generate_walls_clicked
-        )
+        self.generate_walls_button.clicked.connect(self._handle_generate_walls_clicked)
         plan_image_buttons_layout.addWidget(self.generate_walls_button)
 
         self.image_correction_button = QPushButton("Image correction")
@@ -3646,9 +3694,7 @@ class BlueprintWorkspace(QWidget):
     def _toggle_canvas_3d_navigation_mode(self) -> None:
         """Toggle the active Canvas viewer between orbit and first person."""
 
-        scene_is_local = (
-            self.workspace_tabs.currentWidget() is self.scene_3d_workspace
-        )
+        scene_is_local = self.workspace_tabs.currentWidget() is self.scene_3d_workspace
         if not scene_is_local and not self._external_scene_3d_host.is_active:
             return
 
@@ -3695,6 +3741,7 @@ class BlueprintWorkspace(QWidget):
             )
             return
 
+        self._commit_pending_architectural_trim_mesh_update()
         try:
             window = add_wall_window(self.levels, raw_placement)
         except (TypeError, ValueError) as error:
@@ -3761,6 +3808,7 @@ class BlueprintWorkspace(QWidget):
             self.viewer.set_window_tools_status("No added window to undo.")
             return
 
+        self._commit_pending_architectural_trim_mesh_update()
         window_id = self._canvas_window_undo_ids[-1]
         removed = self._remove_canvas_window(window_id)
         if removed is None:
@@ -3869,6 +3917,7 @@ class BlueprintWorkspace(QWidget):
         if not isinstance(raw_edit, CanvasOpeningEdit):
             return
         self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_architectural_trim_mesh_update()
         pending_key = self._pending_canvas_opening_key
         if pending_key is not None and pending_key != raw_edit.reference.key:
             self._stage_pending_canvas_opening_snapshots()
@@ -3903,9 +3952,7 @@ class BlueprintWorkspace(QWidget):
                 raw_edit,
             )
         except (TypeError, ValueError) as error:
-            self.viewer.set_window_tools_status(
-                f"Opening could not be edited: {error}"
-            )
+            self.viewer.set_window_tools_status(f"Opening could not be edited: {error}")
             return
 
         self._canvas_opening_targets_by_key[target.key] = target.with_edit(raw_edit)
@@ -4043,7 +4090,10 @@ class BlueprintWorkspace(QWidget):
         """Install semantic surfaces and their selectable opening overlays."""
 
         surface_targets = tuple(
-            surface for surface in surfaces if isinstance(surface, FixedSurface)
+            surface
+            for surface in surfaces
+            if isinstance(surface, FixedSurface)
+            and not is_architectural_trim_surface_id(surface.surface_id)
         )
         installed_surface_ids = {surface.surface_id for surface in surface_targets}
         self._canvas_surface_targets_by_id = {
@@ -4100,9 +4150,13 @@ class BlueprintWorkspace(QWidget):
         stair_part_targets = self._sync_canvas_stair_semantic_targets(
             self._build_viewer_preview_levels()
         )
+        trim_part_targets = self._sync_canvas_architectural_trim_semantic_targets(
+            self._build_viewer_preview_levels()
+        )
         assignable_surface_ids = (
             installed_surface_ids
             | self._canvas_stair_semantic_surfaces_by_id.keys()
+            | self._canvas_architectural_trim_semantic_surfaces_by_id.keys()
         )
         self._atlas_surface_assignment_target_ids = tuple(
             surface_id
@@ -4114,17 +4168,28 @@ class BlueprintWorkspace(QWidget):
             for semantic_id in self._desired_canvas_stair_part_ids
             if semantic_id in self._canvas_stair_part_targets_by_id
         )
+        self._desired_canvas_architectural_trim_part_ids = tuple(
+            semantic_id
+            for semantic_id in self._desired_canvas_architectural_trim_part_ids
+            if semantic_id in self._canvas_architectural_trim_parts_by_id
+        )
         self._is_syncing_canvas_scene_selection = True
         try:
             self.viewer.set_canvas_stair_part_targets(stair_part_targets)
+            self.viewer.set_architectural_trim_parts(trim_part_targets)
             if self._desired_canvas_stair_part_ids:
                 self.viewer.set_selected_canvas_stair_part_ids(
                     self._desired_canvas_stair_part_ids
                 )
+            elif self._desired_canvas_architectural_trim_part_ids:
+                self.viewer.set_selected_architectural_trim_part_ids(
+                    self._desired_canvas_architectural_trim_part_ids
+                )
         finally:
             self._is_syncing_canvas_scene_selection = False
         self._sync_surface_generation_selection(
-            self._desired_canvas_stair_part_ids
+            self._desired_canvas_architectural_trim_part_ids
+            or self._desired_canvas_stair_part_ids
             or self._desired_canvas_surface_ids
         )
         selected_surface_source_ids = (
@@ -4186,6 +4251,53 @@ class BlueprintWorkspace(QWidget):
         )
         return stair_part_targets
 
+    def _sync_canvas_architectural_trim_semantic_targets(
+        self,
+        levels: Sequence[LevelData],
+    ) -> tuple[ArchitecturalTrimPart, ...]:
+        """Publish trim parts, independent texture targets, and edit handles."""
+
+        try:
+            structural_surfaces = build_base_fixed_surfaces(levels)
+            geometry = build_architectural_trim_geometry(
+                levels,
+                structural_surfaces,
+            )
+            edit_targets = build_architectural_trim_edit_targets(
+                levels,
+                structural_surfaces,
+            )
+        except (TypeError, ValueError):
+            geometry_parts: tuple[ArchitecturalTrimPart, ...] = ()
+            edit_targets = ()
+        else:
+            geometry_parts = geometry.parts
+
+        self._canvas_architectural_trim_parts_by_id = {
+            part.semantic_id: part for part in geometry_parts
+        }
+        semantic_surfaces = tuple(
+            FixedSurface(
+                surface_id=part.semantic_id,
+                surface_type=part.surface_type,
+                level_index=part.level_index,
+                room_index=None,
+                mesh=part.mesh,
+                area_square_meters=float(part.mesh.area),
+                source_surface_id=part.source_wall_surface_id,
+            )
+            for part in geometry_parts
+            if float(part.mesh.area) > 0.0
+        )
+        self._canvas_architectural_trim_semantic_surfaces_by_id = {
+            surface.surface_id: surface for surface in semantic_surfaces
+        }
+        self._canvas_architectural_trim_edit_targets_by_id = {
+            target.trim_id: target for target in edit_targets
+        }
+        self.viewer.set_architectural_trim_edit_targets(edit_targets)
+        return geometry_parts
+
     def _reconcile_surface_assignments_with_scene(
         self,
         *,
@@ -4195,6 +4307,14 @@ class BlueprintWorkspace(QWidget):
 
         if hasattr(self, "stairs"):
             BlueprintWorkspace._sync_canvas_stair_semantic_targets(
+                self,
+                self.levels,
+            )
+        if hasattr(self, "_canvas_architectural_trim_parts_by_id") and hasattr(
+            self,
+            "viewer",
+        ):
+            BlueprintWorkspace._sync_canvas_architectural_trim_semantic_targets(
                 self,
                 self.levels,
             )
@@ -4238,12 +4358,8 @@ class BlueprintWorkspace(QWidget):
             if fallback is not None:
                 retained_ids.append(fallback)
         self._desired_canvas_stair_part_ids = tuple(dict.fromkeys(retained_ids))
-        self._atlas_surface_assignment_target_ids = (
-            self._desired_canvas_stair_part_ids
-        )
-        self._sync_surface_generation_selection(
-            self._desired_canvas_stair_part_ids
-        )
+        self._atlas_surface_assignment_target_ids = self._desired_canvas_stair_part_ids
+        self._sync_surface_generation_selection(self._desired_canvas_stair_part_ids)
         self._sync_atlas_texture_selection_from_canvas_scene()
 
     def _handle_canvas_stair_part_selection_changed(
@@ -4283,6 +4399,7 @@ class BlueprintWorkspace(QWidget):
             return
         self._desired_canvas_object_id = None
         self._desired_canvas_object_ids = ()
+        self._desired_canvas_architectural_trim_part_ids = ()
         self._sync_blueprint_placed_object_selection()
         self._desired_canvas_surface_ids = ()
         self._atlas_surface_assignment_target_ids = semantic_ids
@@ -4297,6 +4414,622 @@ class BlueprintWorkspace(QWidget):
         self._editing_stair_index = stair_index
         self._load_stair_editor_from_stair(self.stairs[stair_index])
         self._update_stair_button_state()
+
+    # ### Canvas architectural-trim editor ###
+    def _handle_architectural_trim_placement_requested(
+        self,
+        raw_request: object,
+    ) -> None:
+        """Persist one snapped trim request as an undoable scene component."""
+
+        if not isinstance(raw_request, ArchitecturalTrimPlacementRequest):
+            return
+        self._commit_pending_architectural_trim_mesh_update()
+        owner_surface = self._canvas_surface_targets_by_id.get(
+            raw_request.wall_surface_ids[0]
+        )
+        level = (
+            None
+            if owner_surface is None
+            else self._get_level_by_index(owner_surface.level_index)
+        )
+        if level is None:
+            self.viewer.set_architectural_trim_status(
+                "Architectural trim was not added: its wall no longer exists."
+            )
+            return
+
+        undo_state = self._capture_canvas_topology_undo_state()
+        try:
+            structural_surfaces = build_base_fixed_surfaces(self.levels)
+            trim = add_architectural_trim(
+                level,
+                raw_request,
+                structural_surfaces,
+            )
+        except (TypeError, ValueError) as error:
+            self.viewer.set_architectural_trim_status(
+                f"Architectural trim was not added: {error}"
+            )
+            return
+
+        parts = self._refresh_canvas_architectural_trim_targets()
+        selected_part_id = next(
+            (
+                part.semantic_id
+                for part in parts
+                if part.trim_id == trim.trim_id and part.part_kind == "front"
+            ),
+            next(
+                (part.semantic_id for part in parts if part.trim_id == trim.trim_id),
+                None,
+            ),
+        )
+        self._desired_canvas_architectural_trim_part_ids = (
+            () if selected_part_id is None else (selected_part_id,)
+        )
+        self._desired_canvas_surface_ids = ()
+        self._desired_canvas_stair_part_ids = ()
+        self._desired_canvas_object_id = None
+        self._desired_canvas_object_ids = ()
+        self._atlas_surface_assignment_target_ids = (
+            self._desired_canvas_architectural_trim_part_ids
+        )
+        self._is_syncing_canvas_scene_selection = True
+        try:
+            self.viewer.set_selected_architectural_trim_part_ids(
+                self._desired_canvas_architectural_trim_part_ids
+            )
+        finally:
+            self._is_syncing_canvas_scene_selection = False
+        self._sync_surface_generation_selection(
+            self._desired_canvas_architectural_trim_part_ids
+        )
+        self._sync_atlas_texture_selection_from_canvas_scene()
+        self._reconcile_surface_assignments_with_scene()
+        self._record_canvas_undo_state(
+            self._finalize_canvas_topology_undo_state(undo_state),
+            commit_pending_surface_edit=False,
+        )
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
+        self.viewer.set_architectural_trim_status(
+            "Architectural trim added. Select one of its parts to texture or edit it."
+        )
+
+    def _handle_architectural_trim_part_selection_changed(
+        self,
+        raw_semantic_ids: object,
+    ) -> None:
+        """Synchronize selected trim parts with generation and Atlas state."""
+
+        if self._is_syncing_canvas_scene_selection:
+            return
+        try:
+            semantic_ids = tuple(
+                dict.fromkeys(
+                    str(value).strip()
+                    for value in raw_semantic_ids  # type: ignore[arg-type]
+                    if str(value).strip()
+                )
+            )
+        except TypeError:
+            return
+        semantic_ids = tuple(
+            semantic_id
+            for semantic_id in semantic_ids
+            if semantic_id in self._canvas_architectural_trim_parts_by_id
+        )
+        self._desired_canvas_architectural_trim_part_ids = semantic_ids
+        self._atlas_surface_assignment_target_ids = semantic_ids
+        if semantic_ids:
+            self._desired_canvas_surface_ids = ()
+            self._desired_canvas_stair_part_ids = ()
+            self._desired_canvas_object_id = None
+            self._desired_canvas_object_ids = ()
+            self._discard_staged_stair_edit(clear_selection=True)
+            self._sync_blueprint_placed_object_selection()
+        self._sync_surface_generation_selection(semantic_ids)
+        self._sync_atlas_texture_selection_from_canvas_scene()
+        self._sync_selected_canvas_wall_highlight(None)
+
+    def _handle_architectural_trim_deletion_requested(
+        self,
+        raw_trim_ids: object,
+    ) -> None:
+        """Delete every selected trim owner as one undoable transaction."""
+
+        try:
+            trim_ids = tuple(
+                dict.fromkeys(
+                    str(value).strip()
+                    for value in raw_trim_ids  # type: ignore[arg-type]
+                    if str(value).strip()
+                )
+            )
+        except TypeError:
+            return
+        if not trim_ids:
+            return
+        self._commit_pending_architectural_trim_mesh_update()
+        undo_state = self._capture_canvas_topology_undo_state()
+        removed_count = 0
+        for trim_id in trim_ids:
+            for level in self.levels:
+                if remove_architectural_trim(level, trim_id) is not None:
+                    removed_count += 1
+                    break
+        if not removed_count:
+            return
+
+        self._desired_canvas_architectural_trim_part_ids = ()
+        self._atlas_surface_assignment_target_ids = ()
+        self._sync_surface_generation_selection(())
+        self._reconcile_surface_assignments_with_scene()
+        self._record_canvas_undo_state(
+            self._finalize_canvas_topology_undo_state(undo_state),
+            commit_pending_surface_edit=False,
+        )
+        self._refresh_canvas_architectural_trim_targets()
+        self._sync_atlas_texture_selection_from_canvas_scene()
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
+        self.viewer.set_architectural_trim_status(
+            f"Deleted {removed_count} architectural trim component(s)."
+        )
+
+    def _handle_architectural_trim_edit_started(
+        self,
+        raw_edit: object,
+    ) -> None:
+        """Pause the debounce and capture this drag's immediate baseline."""
+
+        if not isinstance(raw_edit, ArchitecturalTrimDimensionEdit):
+            return
+        run_id = self._get_architectural_trim_run_id(raw_edit.trim_id)
+        if (
+            self._pending_architectural_trim_undo_state is not None
+            and self._pending_architectural_trim_run_id != run_id
+        ):
+            self._commit_pending_architectural_trim_mesh_update()
+        self._architectural_trim_mesh_update_timer.stop()
+        if self._active_architectural_trim_undo_state is None:
+            self._active_architectural_trim_undo_state = (
+                self._capture_canvas_topology_undo_state()
+            )
+
+    def _handle_architectural_trim_edit_preview_changed(
+        self,
+        raw_edit: object,
+    ) -> None:
+        """Apply a gizmo value to the connected run and refresh its preview."""
+
+        if not isinstance(raw_edit, ArchitecturalTrimDimensionEdit):
+            return
+        if self._active_architectural_trim_undo_state is None:
+            self._active_architectural_trim_undo_state = (
+                self._capture_canvas_topology_undo_state()
+            )
+        try:
+            changed = self._apply_architectural_trim_dimension_edit(raw_edit)
+            preview_parts = (
+                self._build_architectural_trim_run_preview(raw_edit.trim_id)[1]
+                if changed
+                else ()
+            )
+        except (TypeError, ValueError) as error:
+            self.viewer.set_architectural_trim_status(
+                f"Architectural trim preview stopped: {error}"
+            )
+            return
+        if changed:
+            self.viewer.set_architectural_trim_edit_preview_parts(preview_parts)
+
+    def _handle_architectural_trim_edit_finished(
+        self,
+        raw_edit: object,
+        changed: bool,
+    ) -> None:
+        """Retain the preview and start its quiet-period mesh debounce."""
+
+        drag_undo_state = self._active_architectural_trim_undo_state
+        self._active_architectural_trim_undo_state = None
+        if drag_undo_state is None or not isinstance(
+            raw_edit,
+            ArchitecturalTrimDimensionEdit,
+        ):
+            return
+        if changed:
+            try:
+                self._apply_architectural_trim_dimension_edit(raw_edit)
+            except (TypeError, ValueError) as error:
+                self._restore_architectural_trims_from_topology_state(drag_undo_state)
+                self._restore_pending_architectural_trim_preview()
+                if self._pending_architectural_trim_undo_state is not None:
+                    self._architectural_trim_mesh_update_timer.start()
+                self.viewer.set_architectural_trim_status(
+                    f"Architectural trim change was not applied: {error}"
+                )
+                return
+
+        burst_undo_state = (
+            self._pending_architectural_trim_undo_state or drag_undo_state
+        )
+        if self._architectural_trims_match_topology_state(burst_undo_state):
+            self._clear_pending_architectural_trim_mesh_update()
+            self._refresh_canvas_architectural_trim_targets()
+            self._queue_viewer_preview_refresh()
+            return
+
+        self._pending_architectural_trim_undo_state = burst_undo_state
+        self._pending_architectural_trim_run_id = self._get_architectural_trim_run_id(
+            raw_edit.trim_id
+        )
+        self._restore_pending_architectural_trim_preview()
+        self._architectural_trim_mesh_update_timer.start()
+        self.viewer.set_architectural_trim_status(
+            "Architectural trim preview ready. The mesh will update after "
+            f"{self._mesh_edit_update_delay_seconds:g} seconds without changes."
+        )
+
+    def _handle_architectural_trim_edit_cancelled(
+        self,
+        _raw_edit: object,
+    ) -> None:
+        """Restore this drag while preserving an earlier pending preview."""
+
+        undo_state = self._active_architectural_trim_undo_state
+        self._active_architectural_trim_undo_state = None
+        if undo_state is None:
+            return
+        self._restore_architectural_trims_from_topology_state(undo_state)
+        self._restore_pending_architectural_trim_preview()
+        if self._pending_architectural_trim_undo_state is not None:
+            self._architectural_trim_mesh_update_timer.start()
+
+    def _get_architectural_trim_run_id(self, trim_id: str) -> str | None:
+        """Return the current seamless-run identity for one trim owner."""
+
+        return next(
+            (
+                part.run_id
+                for part in self._canvas_architectural_trim_parts_by_id.values()
+                if part.trim_id == trim_id
+            ),
+            None,
+        )
+
+    def _restore_pending_architectural_trim_preview(self) -> None:
+        """Rebuild only the staged run and retain it as the delayed overlay."""
+
+        run_id = self._pending_architectural_trim_run_id
+        if run_id is None:
+            self.viewer.clear_architectural_trim_edit_preview()
+            return
+        trim_id = next(
+            (
+                part.trim_id
+                for part in self._canvas_architectural_trim_parts_by_id.values()
+                if part.run_id == run_id
+            ),
+            None,
+        )
+        if trim_id is None:
+            self.viewer.clear_architectural_trim_edit_preview()
+            return
+        affected_ids, parts, edit_targets = self._build_architectural_trim_run_preview(
+            trim_id,
+            include_edit_targets=True,
+        )
+        self._install_architectural_trim_run_preview(
+            affected_ids,
+            parts,
+            edit_targets,
+        )
+        self.viewer.set_architectural_trim_edit_preview_parts(parts)
+
+    def _commit_pending_architectural_trim_mesh_update(self) -> bool:
+        """Apply one stable trim preview after the shared mesh-edit delay."""
+
+        self._architectural_trim_mesh_update_timer.stop()
+        undo_state = self._pending_architectural_trim_undo_state
+        if undo_state is None:
+            return False
+        self._pending_architectural_trim_undo_state = None
+        self._pending_architectural_trim_run_id = None
+        if self._architectural_trims_match_topology_state(undo_state):
+            self.viewer.clear_architectural_trim_edit_preview()
+            self._refresh_canvas_architectural_trim_targets()
+            self._queue_viewer_preview_refresh()
+            return False
+
+        self._reconcile_surface_assignments_with_scene()
+        self._record_canvas_undo_state(
+            self._finalize_canvas_topology_undo_state(undo_state),
+            commit_pending_surface_edit=False,
+            commit_pending_architectural_trim_edit=False,
+        )
+        self.viewer.clear_architectural_trim_edit_preview()
+        self._refresh_canvas_architectural_trim_targets()
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
+        self.viewer.set_architectural_trim_status(
+            "Architectural trim dimensions updated."
+        )
+        return True
+
+    def _clear_pending_architectural_trim_mesh_update(self) -> bool:
+        """Discard delayed trim bookkeeping and its transient overlay."""
+
+        had_pending = self._pending_architectural_trim_undo_state is not None
+        self._architectural_trim_mesh_update_timer.stop()
+        self._pending_architectural_trim_undo_state = None
+        self._pending_architectural_trim_run_id = None
+        self.viewer.clear_architectural_trim_edit_preview()
+        return had_pending
+
+    def _undo_pending_architectural_trim_mesh_update(self) -> bool:
+        """Roll back an uncommitted trim preview without consuming history."""
+
+        undo_state = self._pending_architectural_trim_undo_state
+        if undo_state is None:
+            return False
+        self._clear_pending_architectural_trim_mesh_update()
+        self._restore_architectural_trims_from_topology_state(undo_state)
+        self._refresh_canvas_architectural_trim_targets()
+        self._queue_viewer_preview_refresh()
+        return True
+
+    def _apply_architectural_trim_dimension_edit(
+        self,
+        edit: ArchitecturalTrimDimensionEdit,
+    ) -> bool:
+        """Apply one scalar profile edit to every member of its joined run."""
+
+        owner_level = next(
+            (
+                level
+                for level in self.levels
+                if any(
+                    trim.trim_id == edit.trim_id for trim in level.architectural_trims
+                )
+            ),
+            None,
+        )
+        if owner_level is None:
+            raise ValueError("The selected trim no longer exists.")
+        affected_ids = set(self._get_architectural_trim_run_trim_ids(edit.trim_id))
+        field_by_handle = {
+            TRIM_HANDLE_WIDTH: "width_meters",
+            TRIM_HANDLE_HEIGHT: "height_meters",
+            TRIM_HANDLE_DEPTH: "depth_meters",
+            TRIM_HANDLE_CORNER_RADIUS: "corner_radius_meters",
+        }
+        field_name = field_by_handle.get(edit.handle_kind)
+        if field_name is None:
+            raise ValueError("The selected trim gizmo is not supported.")
+        previous_trims = tuple(owner_level.architectural_trims)
+        try:
+            next_trims = tuple(
+                replace(trim, **{field_name: float(edit.value_meters)})
+                if trim.trim_id in affected_ids
+                else trim
+                for trim in previous_trims
+            )
+        except (TypeError, ValueError):
+            raise
+        if next_trims == previous_trims:
+            return False
+        owner_level.architectural_trims = list(next_trims)
+        return True
+
+    def _get_architectural_trim_run_trim_ids(
+        self,
+        trim_id: str,
+    ) -> tuple[str, ...]:
+        """Return cached owners for the selected connected trim run."""
+
+        run_id = self._get_architectural_trim_run_id(trim_id)
+        if run_id is None:
+            return (trim_id,)
+        trim_ids = tuple(
+            dict.fromkeys(
+                part.trim_id
+                for part in self._canvas_architectural_trim_parts_by_id.values()
+                if part.run_id == run_id
+            )
+        )
+        return trim_ids or (trim_id,)
+
+    def _build_architectural_trim_run_preview(
+        self,
+        trim_id: str,
+        *,
+        include_edit_targets: bool = False,
+    ) -> tuple[
+        tuple[str, ...],
+        tuple[ArchitecturalTrimPart, ...],
+        tuple[ArchitecturalTrimEditTarget, ...],
+    ]:
+        """Build only one connected run for responsive profile previews."""
+
+        owner_level = next(
+            (
+                level
+                for level in self.levels
+                if any(trim.trim_id == trim_id for trim in level.architectural_trims)
+            ),
+            None,
+        )
+        if owner_level is None:
+            raise ValueError("The selected trim no longer exists.")
+        affected_ids = self._get_architectural_trim_run_trim_ids(trim_id)
+        affected_id_set = set(affected_ids)
+        run_trims = tuple(
+            trim
+            for trim in owner_level.architectural_trims
+            if trim.trim_id in affected_id_set
+        )
+        if len(run_trims) != len(affected_ids):
+            raise ValueError("The connected architectural trim run is incomplete.")
+
+        host_surface_ids = tuple(
+            dict.fromkeys(
+                surface_id for trim in run_trims for surface_id in trim.wall_surface_ids
+            )
+        )
+        wall_surfaces_by_id = {
+            surface_id: surface
+            for surface_id in host_surface_ids
+            if (surface := self._canvas_surface_targets_by_id.get(surface_id))
+            is not None
+        }
+        if len(wall_surfaces_by_id) != len(host_surface_ids):
+            fallback_surfaces = {
+                surface.surface_id: surface
+                for surface in build_base_fixed_surfaces((owner_level,))
+            }
+            for surface_id in host_surface_ids:
+                if surface_id in fallback_surfaces:
+                    wall_surfaces_by_id[surface_id] = fallback_surfaces[surface_id]
+        if len(wall_surfaces_by_id) != len(host_surface_ids):
+            raise ValueError("A host wall for the selected trim is unavailable.")
+
+        preview_level = copy.copy(owner_level)
+        preview_level.architectural_trims = list(run_trims)
+        wall_surfaces = tuple(
+            wall_surfaces_by_id[surface_id] for surface_id in host_surface_ids
+        )
+        geometry = build_architectural_trim_geometry(
+            (preview_level,),
+            wall_surfaces,
+        )
+        parts = geometry.parts
+        if not parts:
+            raise ValueError("The selected trim preview could not be built.")
+        edit_targets = (
+            build_architectural_trim_edit_targets(
+                (preview_level,),
+                wall_surfaces,
+            )
+            if include_edit_targets
+            else ()
+        )
+        return affected_ids, parts, edit_targets
+
+    def _install_architectural_trim_run_preview(
+        self,
+        affected_ids: Sequence[str],
+        parts: Sequence[ArchitecturalTrimPart],
+        edit_targets: Sequence[ArchitecturalTrimEditTarget],
+    ) -> None:
+        """Replace cached targets for one staged run without rebuilding others."""
+
+        affected_id_set = set(affected_ids)
+        retained_parts = {
+            semantic_id: part
+            for semantic_id, part in self._canvas_architectural_trim_parts_by_id.items()
+            if part.trim_id not in affected_id_set
+        }
+        retained_parts.update({part.semantic_id: part for part in parts})
+        self._canvas_architectural_trim_parts_by_id = retained_parts
+
+        retained_targets = {
+            trim_id: target
+            for trim_id, target in (
+                self._canvas_architectural_trim_edit_targets_by_id.items()
+            )
+            if trim_id not in affected_id_set
+        }
+        retained_targets.update({target.trim_id: target for target in edit_targets})
+        self._canvas_architectural_trim_edit_targets_by_id = retained_targets
+
+        affected_semantic_ids = {
+            surface_id
+            for surface_id in self._canvas_architectural_trim_semantic_surfaces_by_id
+            if any(
+                surface_id.startswith(f"trim:{affected_id}/")
+                for affected_id in affected_id_set
+            )
+        }
+        for surface_id in affected_semantic_ids:
+            self._canvas_architectural_trim_semantic_surfaces_by_id.pop(
+                surface_id,
+                None,
+            )
+        self._canvas_architectural_trim_semantic_surfaces_by_id.update(
+            {
+                part.semantic_id: FixedSurface(
+                    surface_id=part.semantic_id,
+                    surface_type=part.surface_type,
+                    level_index=part.level_index,
+                    room_index=None,
+                    mesh=part.mesh,
+                    area_square_meters=float(part.mesh.area),
+                    source_surface_id=part.source_wall_surface_id,
+                )
+                for part in parts
+                if float(part.mesh.area) > 0.0
+            }
+        )
+
+        self._desired_canvas_architectural_trim_part_ids = tuple(
+            semantic_id
+            for semantic_id in self._desired_canvas_architectural_trim_part_ids
+            if semantic_id in retained_parts
+        )
+        self._is_syncing_canvas_scene_selection = True
+        try:
+            self.viewer.set_architectural_trim_parts(tuple(retained_parts.values()))
+            self.viewer.set_architectural_trim_edit_targets(
+                tuple(retained_targets.values())
+            )
+            self.viewer.set_selected_architectural_trim_part_ids(
+                self._desired_canvas_architectural_trim_part_ids
+            )
+        finally:
+            self._is_syncing_canvas_scene_selection = False
+        self._sync_surface_generation_selection(
+            self._desired_canvas_architectural_trim_part_ids
+        )
+
+    def _refresh_canvas_architectural_trim_targets(
+        self,
+    ) -> tuple[ArchitecturalTrimPart, ...]:
+        """Rebuild trim selection geometry without waiting for a full scene build."""
+
+        parts = self._sync_canvas_architectural_trim_semantic_targets(
+            self._build_viewer_preview_levels()
+        )
+        self._desired_canvas_architectural_trim_part_ids = tuple(
+            semantic_id
+            for semantic_id in self._desired_canvas_architectural_trim_part_ids
+            if semantic_id in self._canvas_architectural_trim_parts_by_id
+        )
+        self._is_syncing_canvas_scene_selection = True
+        try:
+            self.viewer.set_architectural_trim_parts(parts)
+            self.viewer.set_selected_architectural_trim_part_ids(
+                self._desired_canvas_architectural_trim_part_ids
+            )
+        finally:
+            self._is_syncing_canvas_scene_selection = False
+        return parts
+
+    def _architectural_trims_match_topology_state(
+        self,
+        state: _CanvasTopologyUndoState,
+    ) -> bool:
+        expected = dict(state.architectural_trims_by_level)
+        return all(
+            tuple(level.architectural_trims) == expected.get(level.index, ())
+            for level in self.levels
+        )
+
+    def _restore_architectural_trims_from_topology_state(
+        self,
+        state: _CanvasTopologyUndoState,
+    ) -> None:
+        trims_by_level = dict(state.architectural_trims_by_level)
+        for level in self.levels:
+            level.architectural_trims = list(trims_by_level.get(level.index, ()))
 
     def _handle_canvas_stair_preview_cancelled(self) -> None:
         """Restore persisted settings after Escape or transient undo."""
@@ -4347,6 +5080,7 @@ class BlueprintWorkspace(QWidget):
         self._desired_canvas_surface_ids = surface_ids
         self._atlas_surface_assignment_target_ids = surface_ids
         if surface_ids:
+            self._desired_canvas_architectural_trim_part_ids = ()
             self._discard_staged_stair_edit(clear_selection=True)
             self._desired_canvas_object_id = None
             self._desired_canvas_object_ids = ()
@@ -4386,13 +5120,14 @@ class BlueprintWorkspace(QWidget):
                 surface := (
                     self._canvas_surface_targets_by_id.get(surface_id)
                     or self._canvas_stair_semantic_surfaces_by_id.get(surface_id)
+                    or self._canvas_architectural_trim_semantic_surfaces_by_id.get(
+                        surface_id
+                    )
                 )
             )
             is not None
         )
-        self.surface_texture_generation.set_scene_surface_selection(
-            selected_surfaces
-        )
+        self.surface_texture_generation.set_scene_surface_selection(selected_surfaces)
 
     def _handle_canvas_surface_orientation_flip_requested(
         self,
@@ -4437,6 +5172,7 @@ class BlueprintWorkspace(QWidget):
         state: _CanvasUndoState,
         *,
         commit_pending_surface_edit: bool = True,
+        commit_pending_architectural_trim_edit: bool = True,
     ) -> None:
         """Append one action after committing every chronologically older edit."""
 
@@ -4445,6 +5181,8 @@ class BlueprintWorkspace(QWidget):
         self._commit_pending_level_transform_update()
         if commit_pending_surface_edit:
             self._commit_pending_canvas_surface_mesh_update()
+        if commit_pending_architectural_trim_edit:
+            self._commit_pending_architectural_trim_mesh_update()
         self._canvas_undo_stack.append(state)
 
     def _clear_canvas_undo_history(self) -> None:
@@ -4512,6 +5250,10 @@ class BlueprintWorkspace(QWidget):
                     if raw_snapshot.action_kind
                     == CANVAS_SNAPSHOT_ACTION_GENERATED_WALLS
                     else None
+                ),
+                architectural_trims_by_level=tuple(
+                    (level.index, tuple(level.architectural_trims))
+                    for level in self.levels
                 ),
             )
         )
@@ -4618,10 +5360,18 @@ class BlueprintWorkspace(QWidget):
                 (level.index, tuple(sorted(level.flipped_surface_ids)))
                 for level in self.levels
             ),
+            architectural_trims_by_level=tuple(
+                (level.index, tuple(level.architectural_trims)) for level in self.levels
+            ),
             assignments=assignments,
             assignment_targets_after=(),
             atlas_placements=atlas_placements,
             selected_surface_ids=self._desired_canvas_surface_ids,
+            selected_architectural_trim_part_ids=getattr(
+                self,
+                "_desired_canvas_architectural_trim_part_ids",
+                (),
+            ),
             assignment_target_ids=self._atlas_surface_assignment_target_ids,
             selected_object_id=self._desired_canvas_object_id,
             active_vertex_id=self._active_canvas_surface_drawing_vertex_id,
@@ -4746,14 +5496,9 @@ class BlueprintWorkspace(QWidget):
     def _handle_canvas_undo_requested(self) -> None:
         """Undo the latest committed Canvas action from either Canvas view."""
 
-        if (
-            self._pending_stair_parameters is not None
-            or self._staged_stair is not None
-        ):
+        if self._pending_stair_parameters is not None or self._staged_stair is not None:
             self._discard_staged_stair_edit(clear_selection=False)
-            self.viewer.set_surface_tools_status(
-                "Current stair changes discarded."
-            )
+            self.viewer.set_surface_tools_status("Current stair changes discarded.")
             return
         if self.canvas.cancel_open_space_placement():
             self.viewer.set_surface_tools_status(
@@ -4783,6 +5528,11 @@ class BlueprintWorkspace(QWidget):
         if self._undo_pending_canvas_surface_mesh_update():
             self.viewer.set_surface_tools_status("Canvas surface edit undone.")
             return
+        if self._undo_pending_architectural_trim_mesh_update():
+            self.viewer.set_architectural_trim_status(
+                "Architectural trim preview undone."
+            )
+            return
         if self._pending_stair_point_mesh_update:
             self._stair_point_mesh_update_timer.stop()
             self._pending_stair_point_mesh_update = False
@@ -4796,6 +5546,7 @@ class BlueprintWorkspace(QWidget):
         self._is_restoring_canvas_undo = True
         try:
             self._cancel_pending_canvas_surface_mesh_update()
+            self._clear_pending_architectural_trim_mesh_update()
             self._cancel_pending_wall_vertex_update()
             self._cancel_pending_doorway_mesh_update(clear_outline=True)
             self._stair_point_mesh_update_timer.stop()
@@ -4828,9 +5579,7 @@ class BlueprintWorkspace(QWidget):
                     for member in reversed(state.members)
                 )
             elif isinstance(state, _CanvasStairsUndoState):
-                skipped_texture_bindings = (
-                    self._restore_canvas_stairs_undo_state(state)
-                )
+                skipped_texture_bindings = self._restore_canvas_stairs_undo_state(state)
             elif isinstance(state, _SurfaceTextureTilingUndoState):
                 self._restore_surface_texture_tiling_undo_state(state)
             elif isinstance(state, _SurfaceTextureColorBalanceUndoState):
@@ -4857,9 +5606,7 @@ class BlueprintWorkspace(QWidget):
 
         object_id = self.texture_atlas_workspace.selected_object_texture_id
         if object_id is not None:
-            undone = self.generation.undo_object_texture_color_balance(
-                object_id
-            )
+            undone = self.generation.undo_object_texture_color_balance(object_id)
             if undone:
                 self.texture_atlas_workspace.complete_texture_color_balance_edit(
                     "object",
@@ -4890,8 +5637,7 @@ class BlueprintWorkspace(QWidget):
         previous_was_activated = False
         try:
             previous_was_activated = (
-                self.surface_texture_generation
-                .activate_assignment_tiling_revision(
+                self.surface_texture_generation.activate_assignment_tiling_revision(
                     revision,
                     repaired=False,
                     emit_signals=False,
@@ -4944,9 +5690,7 @@ class BlueprintWorkspace(QWidget):
             "Original Surface texture tiling restored."
         )
         cleanup_failure_count = (
-            self.surface_texture_generation.discard_assignment_tiling_revision(
-                revision
-            )
+            self.surface_texture_generation.discard_assignment_tiling_revision(revision)
         )
         if cleanup_failure_count:
             self.texture_atlas_workspace.status_label.setText(
@@ -4965,13 +5709,10 @@ class BlueprintWorkspace(QWidget):
         source_id = build_atlas_wall_texture_source_id(assignment_id)
         previous_was_activated = False
         try:
-            previous_was_activated = (
-                self.surface_texture_generation
-                .activate_assignment_color_balance_revision(
-                    revision,
-                    balanced=False,
-                    emit_signals=False,
-                )
+            previous_was_activated = self.surface_texture_generation.activate_assignment_color_balance_revision(
+                revision,
+                balanced=False,
+                emit_signals=False,
             )
             previous_assignment = self.surface_texture_generation.get_assignment(
                 assignment_id
@@ -4980,19 +5721,15 @@ class BlueprintWorkspace(QWidget):
                 raise RuntimeError(
                     "The original Surface texture revision is unavailable."
                 )
-            candidate_sources = (
-                self._build_atlas_wall_texture_sources_for_assignment(
-                    previous_assignment,
-                    source_id,
-                )
+            candidate_sources = self._build_atlas_wall_texture_sources_for_assignment(
+                previous_assignment,
+                source_id,
             )
             if not self.texture_atlas_workspace.transition_object_packing(
                 source_id,
                 candidate_sources,
                 commit_callback=lambda: (
-                    self.surface_texture_generation.get_assignment(
-                        assignment_id
-                    )
+                    self.surface_texture_generation.get_assignment(assignment_id)
                     == previous_assignment
                 ),
             ):
@@ -5023,8 +5760,9 @@ class BlueprintWorkspace(QWidget):
             source_id,
         )
         cleanup_failure_count = (
-            self.surface_texture_generation
-            .discard_assignment_color_balance_revision(revision)
+            self.surface_texture_generation.discard_assignment_color_balance_revision(
+                revision
+            )
         )
         if cleanup_failure_count:
             self.texture_atlas_workspace.status_label.setText(
@@ -5105,8 +5843,8 @@ class BlueprintWorkspace(QWidget):
                     "A wall-mirror doorway level in this undo step no longer exists."
                 )
             level.doorways[:] = copy.deepcopy(doorways)
-            self._viewer_doorways_by_level_index[level_index] = (
-                self._copy_doorways(level.doorways)
+            self._viewer_doorways_by_level_index[level_index] = self._copy_doorways(
+                level.doorways
             )
 
         self.wall_mirror_links = state.wall_mirror_links
@@ -5210,9 +5948,7 @@ class BlueprintWorkspace(QWidget):
             active_object_id = (
                 state.active_object_id
                 if state.active_object_id in selected_object_ids
-                else (
-                    selected_object_ids[-1] if selected_object_ids else None
-                )
+                else (selected_object_ids[-1] if selected_object_ids else None)
             )
         self._desired_canvas_object_ids = selected_object_ids
         self._desired_canvas_object_id = active_object_id
@@ -5299,6 +6035,7 @@ class BlueprintWorkspace(QWidget):
         assignable_surface_ids = (
             self._canvas_surface_targets_by_id.keys()
             | self._canvas_stair_semantic_surfaces_by_id.keys()
+            | self._canvas_architectural_trim_semantic_surfaces_by_id.keys()
         )
         self._atlas_surface_assignment_target_ids = tuple(
             surface_id
@@ -5317,17 +6054,13 @@ class BlueprintWorkspace(QWidget):
             self._editing_stair_index is not None
             and 0 <= self._editing_stair_index < len(self.stairs)
         ):
-            self._load_stair_editor_from_stair(
-                self.stairs[self._editing_stair_index]
-            )
+            self._load_stair_editor_from_stair(self.stairs[self._editing_stair_index])
         else:
             self._editing_stair_index = None
             self._desired_canvas_stair_part_ids = ()
             self._set_stair_editor_parameters(self._new_stair_parameters)
             self._sync_stair_calculated_values(None)
-        self._sync_surface_generation_selection(
-            self._desired_canvas_stair_part_ids
-        )
+        self._sync_surface_generation_selection(self._desired_canvas_stair_part_ids)
         self._update_stair_button_state()
         self._schedule_viewer_preview_refresh(preserve_camera=True)
         return (
@@ -5347,9 +6080,7 @@ class BlueprintWorkspace(QWidget):
             raise ValueError("The plan-image level in this undo step no longer exists.")
         commit = state.commit
         current_path = (
-            None
-            if level.image_path is None
-            else str(Path(level.image_path).resolve())
+            None if level.image_path is None else str(Path(level.image_path).resolve())
         )
         replacement_path = str(Path(commit.replacement_path).resolve())
         previous_path = str(Path(commit.previous_path).resolve())
@@ -5357,13 +6088,8 @@ class BlueprintWorkspace(QWidget):
             raise RuntimeError(
                 "The plan image changed after this erase; it was not overwritten."
             )
-        if (
-            _build_local_file_revision(replacement_path)
-            != commit.replacement_revision
-        ):
-            raise RuntimeError(
-                "The erased plan-image file changed outside HouseMaker."
-            )
+        if _build_local_file_revision(replacement_path) != commit.replacement_revision:
+            raise RuntimeError("The erased plan-image file changed outside HouseMaker.")
         previous_revision = _build_local_file_revision(previous_path)
         if (
             not _local_file_revision_has_file(previous_revision)
@@ -5441,9 +6167,17 @@ class BlueprintWorkspace(QWidget):
                     self._copy_doorways(other_level.doorways)
                 )
                 other_doorways_changed = True
+        for level_index, architectural_trims in state.architectural_trims_by_level:
+            trim_level = self._get_level_by_index(level_index)
+            if trim_level is None:
+                raise ValueError(
+                    "An architectural-trim level in this undo step no longer exists."
+                )
+            trim_level.architectural_trims = list(architectural_trims)
         self.wall_mirror_links = state.wall_mirror_links
         self._sync_canvas_wall_mirror_state()
-        if other_doorways_changed:
+        if other_doorways_changed or state.architectural_trims_by_level:
+            self._reconcile_surface_assignments_with_scene()
             self._schedule_viewer_preview_refresh(preserve_camera=True)
         return self._restore_blueprint_surface_bindings(state)
 
@@ -5551,29 +6285,28 @@ class BlueprintWorkspace(QWidget):
         for level_index, editable_surfaces in state.editable_surfaces_by_level:
             level = levels_by_index.get(level_index)
             if level is None:
-                raise ValueError(
-                    "The Canvas level in this undo step no longer exists."
-                )
+                raise ValueError("The Canvas level in this undo step no longer exists.")
             restoration_targets.append((level, editable_surfaces))
         for level, editable_surfaces in restoration_targets:
             level.editable_surfaces = list(editable_surfaces)
         for level_index, flipped_surface_ids in state.flipped_surface_ids_by_level:
             level = levels_by_index.get(level_index)
             if level is None:
-                raise ValueError(
-                    "The Canvas level in this undo step no longer exists."
-                )
+                raise ValueError("The Canvas level in this undo step no longer exists.")
             level.flipped_surface_ids = set(flipped_surface_ids)
+        for level_index, architectural_trims in state.architectural_trims_by_level:
+            level = levels_by_index.get(level_index)
+            if level is None:
+                raise ValueError("The Canvas level in this undo step no longer exists.")
+            level.architectural_trims = list(architectural_trims)
         self._desired_canvas_surface_ids = state.selected_surface_ids
+        self._desired_canvas_architectural_trim_part_ids = (
+            state.selected_architectural_trim_part_ids
+        )
         self._atlas_surface_assignment_target_ids = state.assignment_target_ids
         self._desired_canvas_object_id = state.selected_object_id
-        self._desired_canvas_object_ids = (
-            state.selected_object_ids
-            or (
-                (state.selected_object_id,)
-                if state.selected_object_id is not None
-                else ()
-            )
+        self._desired_canvas_object_ids = state.selected_object_ids or (
+            (state.selected_object_id,) if state.selected_object_id is not None else ()
         )
         self._sync_blueprint_placed_object_selection()
         self._active_canvas_surface_drawing_vertex_id = state.active_vertex_id
@@ -5827,6 +6560,7 @@ class BlueprintWorkspace(QWidget):
         """Apply geometry and texture-lineage changes as one UI transaction."""
 
         self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_architectural_trim_mesh_update()
         self._commit_pending_wall_vertex_update()
         self._commit_pending_doorway_mesh_update()
         undo_state = BlueprintWorkspace._capture_canvas_topology_undo_state(self)
@@ -6159,9 +6893,7 @@ class BlueprintWorkspace(QWidget):
     def _reconcile_canvas_surface_edit_and_refresh(self) -> None:
         """Reconcile semantic assignments before one structural mesh rebuild."""
 
-        assignments_changed = (
-            self._reconcile_surface_assignments_with_scene()
-        )
+        assignments_changed = self._reconcile_surface_assignments_with_scene()
         self._finalize_blueprint_surface_binding_undo_state()
         if not assignments_changed:
             self._schedule_viewer_preview_refresh(preserve_camera=True)
@@ -6449,6 +7181,7 @@ class BlueprintWorkspace(QWidget):
             self._pending_floor_thickness_level_index != level.index
         ):
             self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_architectural_trim_mesh_update()
         self._commit_pending_wall_vertex_update()
 
         previous_thickness = float(level.floor_thickness_meters)
@@ -6529,9 +7262,11 @@ class BlueprintWorkspace(QWidget):
                 for value in requested_ids
                 if (object_id := str(value).strip())
                 and (
-                    (placement := self.generation.get_generated_object_placement(
-                        object_id
-                    ))
+                    (
+                        placement := self.generation.get_generated_object_placement(
+                            object_id
+                        )
+                    )
                     is not None
                     and placement.level_index == current_level_index
                 )
@@ -6625,9 +7360,7 @@ class BlueprintWorkspace(QWidget):
             )
         )
         normalized_active_id = (
-            None
-            if active_object_id is None
-            else str(active_object_id).strip() or None
+            None if active_object_id is None else str(active_object_id).strip() or None
         )
         if normalized_active_id not in normalized_object_ids:
             normalized_active_id = (
@@ -6639,6 +7372,7 @@ class BlueprintWorkspace(QWidget):
         if normalized_object_ids:
             self._discard_staged_stair_edit(clear_selection=True)
             self._desired_canvas_surface_ids = ()
+            self._desired_canvas_architectural_trim_part_ids = ()
             self._atlas_surface_assignment_target_ids = ()
             self._sync_surface_generation_selection(())
         if normalized_active_id is not None:
@@ -6684,6 +7418,7 @@ class BlueprintWorkspace(QWidget):
                 (
                     *self._desired_canvas_surface_ids,
                     *self._desired_canvas_stair_part_ids,
+                    *self._desired_canvas_architectural_trim_part_ids,
                 )
             )
         )
@@ -6738,6 +7473,21 @@ class BlueprintWorkspace(QWidget):
     def _restore_desired_canvas_scene_selection(self) -> None:
         """Reapply the last semantic Canvas selection after a model refresh."""
 
+        if self._desired_canvas_architectural_trim_part_ids:
+            was_syncing_selection = self._is_syncing_canvas_scene_selection
+            self._is_syncing_canvas_scene_selection = True
+            try:
+                self.viewer.set_selected_placed_object_ids(())
+                self.viewer.select_canvas_opening(None)
+                self.viewer.set_selected_canvas_surface_ids(())
+                self.viewer.set_selected_canvas_stair_part_ids(())
+                self.viewer.set_selected_architectural_trim_part_ids(
+                    self._desired_canvas_architectural_trim_part_ids
+                )
+            finally:
+                self._is_syncing_canvas_scene_selection = was_syncing_selection
+            self._sync_selected_canvas_wall_highlight(None)
+            return
         if self._desired_canvas_stair_part_ids:
             was_syncing_selection = self._is_syncing_canvas_scene_selection
             self._is_syncing_canvas_scene_selection = True
@@ -7148,8 +7898,7 @@ class BlueprintWorkspace(QWidget):
                 placement.object_id for placement in atlas.placements
             }
             if any(
-                source_id in required_source_ids
-                and source_id not in claimed_source_ids
+                source_id in required_source_ids and source_id not in claimed_source_ids
                 for source_id in placement_source_ids
             ):
                 targets.append((atlas.atlas_id, atlas.surface_ao_intensity))
@@ -7370,6 +8119,8 @@ class BlueprintWorkspace(QWidget):
             self._active_canvas_surface_edit_target is not None
             or self._pending_canvas_surface_mesh_update
             or self._pending_wall_vertex_mesh_update
+            or self._active_architectural_trim_undo_state is not None
+            or self._pending_architectural_trim_undo_state is not None
             or self._is_canvas_wall_vertex_interaction_active
             or self._is_canvas_opening_drag_active
             or self._is_doorway_move_drag_active
@@ -7822,6 +8573,7 @@ class BlueprintWorkspace(QWidget):
 
         self._cancel_active_canvas_surface_edit()
         self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_architectural_trim_mesh_update()
         self._commit_pending_wall_vertex_update()
         self._finish_level_transform_drag()
         self._commit_pending_level_transform_update()
@@ -7838,15 +8590,15 @@ class BlueprintWorkspace(QWidget):
             dependency_signature_before
         )
         required_source_ids = scene_snapshot.required_source_ids
-        atlas_context_signature_before = (
-            self._build_surface_ao_atlas_context_signature(required_source_ids)
+        atlas_context_signature_before = self._build_surface_ao_atlas_context_signature(
+            required_source_ids
         )
         atlas_context = self.texture_atlas_workspace.prepare_surface_ao_atlas_context(
             required_source_ids
         )
         dependency_signature_after = self._build_viewer_preview_dependency_signature()
-        atlas_context_signature_after = (
-            self._build_surface_ao_atlas_context_signature(required_source_ids)
+        atlas_context_signature_after = self._build_surface_ao_atlas_context_signature(
+            required_source_ids
         )
         if (
             viewer_revision != self._viewer_preview_revision
@@ -7924,9 +8676,7 @@ class BlueprintWorkspace(QWidget):
             ):
                 raise ValueError("AO intensity must be between 0 and 1.")
             if atlas_record is None:
-                raise ValueError(
-                    "The ambient-occlusion target Atlas no longer exists."
-                )
+                raise ValueError("The ambient-occlusion target Atlas no longer exists.")
             if preparation is None:
                 preparation = self._capture_ambient_occlusion_bake_preparation()
             scene_snapshot = preparation.scene_snapshot
@@ -8263,6 +9013,7 @@ class BlueprintWorkspace(QWidget):
     def _handle_glb_export_clicked(self) -> None:
         self._cancel_active_canvas_surface_edit()
         self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_architectural_trim_mesh_update()
         self._commit_pending_wall_vertex_update()
         self._sync_atlas_object_texture_sources(
             automatically_assign_scene_textures=False
@@ -8360,12 +9111,8 @@ class BlueprintWorkspace(QWidget):
             }
             for level in self.levels:
                 if (
-                    (
-                        current_level is not None
-                        and level.index == current_level.index
-                    )
-                    or level.image_path is None
-                ):
+                    current_level is not None and level.index == current_level.index
+                ) or level.image_path is None:
                     continue
                 revision_before = _build_local_file_revision(level.image_path)
                 if (
@@ -8393,6 +9140,7 @@ class BlueprintWorkspace(QWidget):
                     geometry_dimensions_changed = True
 
         if geometry_dimensions_changed:
+            self._commit_pending_architectural_trim_mesh_update()
             self._cancel_pending_canvas_surface_mesh_update()
             self._cancel_pending_wall_vertex_update()
             self._cancel_pending_doorway_mesh_update(clear_outline=True)
@@ -8528,11 +9276,7 @@ class BlueprintWorkspace(QWidget):
             if scene_index >= 0:
                 self.workspace_tabs.setCurrentIndex(scene_index)
         self._ensure_viewer_preview_current(preserve_camera=True)
-        preview_meshes = (
-            None
-            if preview_model is None
-            else (preview_model.mesh,)
-        )
+        preview_meshes = None if preview_model is None else (preview_model.mesh,)
         if self.viewer.begin_object_placement(
             session.request_id,
             preview_meshes=preview_meshes,
@@ -8563,11 +9307,9 @@ class BlueprintWorkspace(QWidget):
         self._direct_object_placement_session = None
         if session.accepts_next_generation_batch and not session.placeable_ids:
             anchor = raw_candidate.world_positions[0]
-            self._pending_generation_placement_anchor = (
-                SceneObjectPlacementCandidate(
-                    level_index=raw_candidate.level_index,
-                    world_positions=(anchor,),
-                )
+            self._pending_generation_placement_anchor = SceneObjectPlacementCandidate(
+                level_index=raw_candidate.level_index,
+                world_positions=(anchor,),
             )
             self.generation.status_label.setText(
                 "Placement selected. The next generated object batch will appear there."
@@ -8666,9 +9408,7 @@ class BlueprintWorkspace(QWidget):
             previous_state = self.generation.get_placeable_object_placement_state(
                 placeable_id
             )
-            previous_placement = (
-                None if previous_state is None else previous_state[1]
-            )
+            previous_placement = None if previous_state is None else previous_state[1]
             placement = raw_placement
             if previous_placement is not None:
                 placement = replace(
@@ -9164,9 +9904,7 @@ class BlueprintWorkspace(QWidget):
         """Persist one release-only move or rotation from the 2D Canvas."""
 
         normalized_object_id = str(object_id).strip()
-        existing = self.generation.get_generated_object_placement(
-            normalized_object_id
-        )
+        existing = self.generation.get_generated_object_placement(normalized_object_id)
         if existing is None or existing.level_index != self.current_level.index:
             self._sync_canvas_placed_object_profiles()
             return
@@ -9256,10 +9994,7 @@ class BlueprintWorkspace(QWidget):
             for raw_update in updates:
                 object_id, raw_scale = tuple(raw_update)
                 normalized_object_id = str(object_id).strip()
-                if (
-                    not normalized_object_id
-                    or normalized_object_id in seen_object_ids
-                ):
+                if not normalized_object_id or normalized_object_id in seen_object_ids:
                     raise ValueError("Placed-object scale IDs must be unique.")
                 existing = self.generation.get_generated_object_placement(
                     normalized_object_id
@@ -9368,9 +10103,8 @@ class BlueprintWorkspace(QWidget):
 
         normalized_object_id = str(object_id).strip()
         try:
-            if (
-                isinstance(raw_axis_scales, (str, bytes, bytearray))
-                or not isinstance(raw_axis_scales, Sequence)
+            if isinstance(raw_axis_scales, (str, bytes, bytearray)) or not isinstance(
+                raw_axis_scales, Sequence
             ):
                 raise TypeError("Placed-object axis scales must be an XYZ sequence.")
             if any(isinstance(value, bool) for value in raw_axis_scales):
@@ -9380,8 +10114,7 @@ class BlueprintWorkspace(QWidget):
                 not normalized_object_id
                 or len(axis_scales) != 3
                 or any(
-                    not math.isfinite(value) or value <= 0.0
-                    for value in axis_scales
+                    not math.isfinite(value) or value <= 0.0 for value in axis_scales
                 )
             ):
                 raise ValueError(
@@ -9391,9 +10124,7 @@ class BlueprintWorkspace(QWidget):
             self._schedule_viewer_preview_refresh(preserve_camera=True)
             return
 
-        existing = self.generation.get_generated_object_placement(
-            normalized_object_id
-        )
+        existing = self.generation.get_generated_object_placement(normalized_object_id)
         if existing is None:
             self._schedule_viewer_preview_refresh(preserve_camera=True)
             return
@@ -9548,13 +10279,9 @@ class BlueprintWorkspace(QWidget):
                 continue
             removed_source_ids.add(source_id)
             removable_assignment_ids.append(assignment_id)
-        selected_source_was_removed = (
-            any(
-                source_id in removed_source_ids
-                for source_id in (
-                    self.texture_atlas_workspace.selected_surface_texture_ids
-                )
-            )
+        selected_source_was_removed = any(
+            source_id in removed_source_ids
+            for source_id in (self.texture_atlas_workspace.selected_surface_texture_ids)
         )
         if removable_assignment_ids:
             self.texture_atlas_workspace.remove_deleted_wall_texture_assignments(
@@ -9608,6 +10335,7 @@ class BlueprintWorkspace(QWidget):
         self._desired_canvas_object_ids = (normalized_id,)
         self._sync_blueprint_placed_object_selection()
         self._desired_canvas_surface_ids = ()
+        self._desired_canvas_architectural_trim_part_ids = ()
         self._discard_staged_stair_edit(clear_selection=True)
         self._sync_surface_generation_selection(())
         self.generation.select_generated_object(normalized_id)
@@ -9619,6 +10347,7 @@ class BlueprintWorkspace(QWidget):
             self.viewer.select_canvas_opening(None)
             self.viewer.select_wall_target(None)
             self.viewer.set_selected_canvas_stair_part_ids(())
+            self.viewer.set_selected_architectural_trim_part_ids(())
             self.viewer.select_placed_object(normalized_id)
         finally:
             self._is_syncing_canvas_scene_selection = False
@@ -9628,9 +10357,7 @@ class BlueprintWorkspace(QWidget):
 
         normalized_ids = tuple(
             dict.fromkeys(
-                normalized
-                for value in object_ids
-                if (normalized := str(value).strip())
+                normalized for value in object_ids if (normalized := str(value).strip())
             )
         )
         if not normalized_ids:
@@ -9658,6 +10385,7 @@ class BlueprintWorkspace(QWidget):
         self._desired_canvas_object_ids = normalized_ids
         self._sync_blueprint_placed_object_selection()
         self._desired_canvas_surface_ids = ()
+        self._desired_canvas_architectural_trim_part_ids = ()
         self._discard_staged_stair_edit(clear_selection=True)
         self._sync_surface_generation_selection(())
         self.generation.select_generated_object(active_id)
@@ -9668,6 +10396,7 @@ class BlueprintWorkspace(QWidget):
             self.viewer.select_canvas_opening(None)
             self.viewer.select_wall_target(None)
             self.viewer.set_selected_canvas_stair_part_ids(())
+            self.viewer.set_selected_architectural_trim_part_ids(())
             self.viewer.set_selected_placed_object_ids(
                 normalized_ids,
                 active_object_id=active_id,
@@ -9699,9 +10428,7 @@ class BlueprintWorkspace(QWidget):
 
         normalized_ids = tuple(
             dict.fromkeys(
-                normalized
-                for value in source_ids
-                if (normalized := str(value).strip())
+                normalized for value in source_ids if (normalized := str(value).strip())
             )
         )
         if len(normalized_ids) == 1:
@@ -9734,6 +10461,9 @@ class BlueprintWorkspace(QWidget):
         self._set_atlas_canvas_surface_highlights(surface_ids)
         highlighted_ids = set(self.viewer.get_highlighted_canvas_surface_ids())
         highlighted_ids.update(self.viewer.get_highlighted_canvas_stair_part_ids())
+        highlighted_ids.update(
+            self.viewer.get_highlighted_architectural_trim_part_ids()
+        )
         self.texture_atlas_workspace.set_green_outline_source_ids(
             tuple(
                 source_id
@@ -9777,7 +10507,7 @@ class BlueprintWorkspace(QWidget):
         self,
         surface_ids: Sequence[str],
     ) -> None:
-        """Split Atlas highlighting between architecture and stair parts."""
+        """Split Atlas highlighting between architecture and semantic parts."""
 
         normalized_ids = tuple(dict.fromkeys(str(value) for value in surface_ids))
         self.viewer.set_highlighted_canvas_surface_ids(
@@ -9792,6 +10522,13 @@ class BlueprintWorkspace(QWidget):
                 surface_id
                 for surface_id in normalized_ids
                 if surface_id in self._canvas_stair_part_targets_by_id
+            )
+        )
+        self.viewer.set_highlighted_architectural_trim_part_ids(
+            tuple(
+                surface_id
+                for surface_id in normalized_ids
+                if surface_id in self._canvas_architectural_trim_parts_by_id
             )
         )
 
@@ -9810,6 +10547,7 @@ class BlueprintWorkspace(QWidget):
             and (
                 self.viewer.get_highlighted_canvas_surface_ids()
                 or self.viewer.get_highlighted_canvas_stair_part_ids()
+                or self.viewer.get_highlighted_architectural_trim_part_ids()
             )
             else ()
         )
@@ -9939,12 +10677,11 @@ class BlueprintWorkspace(QWidget):
             )
         answer = QMessageBox.question(
             dialog_parent,
-            "Delete generated objects" if len(records) > 1 else "Delete generated object",
+            "Delete generated objects"
+            if len(records) > 1
+            else "Delete generated object",
             confirmation_text,
-            (
-                QMessageBox.StandardButton.Yes
-                | QMessageBox.StandardButton.Cancel
-            ),
+            (QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel),
             QMessageBox.StandardButton.Cancel,
         )
         if answer != QMessageBox.StandardButton.Yes:
@@ -10082,10 +10819,7 @@ class BlueprintWorkspace(QWidget):
                 "Every generated resolution in this texture family will be "
                 "deleted."
             ),
-            (
-                QMessageBox.StandardButton.Yes
-                | QMessageBox.StandardButton.Cancel
-            ),
+            (QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel),
             QMessageBox.StandardButton.Cancel,
         )
         if answer != QMessageBox.StandardButton.Yes:
@@ -10128,9 +10862,7 @@ class BlueprintWorkspace(QWidget):
         normalized_source_id = str(source_id).strip()
         if not normalized_source_id:
             return
-        selected_scene_object_ids = (
-            self.viewer.get_selected_placed_object_ids()
-        )
+        selected_scene_object_ids = self.viewer.get_selected_placed_object_ids()
         if (
             normalized_kind == "object"
             and normalized_source_id in selected_scene_object_ids
@@ -10149,9 +10881,7 @@ class BlueprintWorkspace(QWidget):
             or self._atlas_preview_variant_key[0] != normalized_source_id
         ):
             return
-        self.atlas_object_preview_viewer.set_texture_color_balance_preview(
-            settings
-        )
+        self.atlas_object_preview_viewer.set_texture_color_balance_preview(settings)
 
     def _clear_atlas_texture_color_balance_preview(self) -> None:
         """Restore the selected Atlas model's unadjusted material preview."""
@@ -10229,24 +10959,19 @@ class BlueprintWorkspace(QWidget):
         revision: SurfaceTextureColorBalanceRevision | None = None
         balanced_was_activated = False
         try:
-            revision = (
-                self.surface_texture_generation.stage_assignment_color_balance(
-                    assignment_id,
-                    settings,
-                )
+            revision = self.surface_texture_generation.stage_assignment_color_balance(
+                assignment_id,
+                settings,
             )
             if revision is None:
                 self.texture_atlas_workspace.status_label.setText(
                     "Color balance is neutral; the texture was not changed."
                 )
                 return
-            balanced_was_activated = (
-                self.surface_texture_generation
-                .activate_assignment_color_balance_revision(
-                    revision,
-                    balanced=True,
-                    emit_signals=False,
-                )
+            balanced_was_activated = self.surface_texture_generation.activate_assignment_color_balance_revision(
+                revision,
+                balanced=True,
+                emit_signals=False,
             )
             balanced_assignment = self.surface_texture_generation.get_assignment(
                 assignment_id
@@ -10255,19 +10980,15 @@ class BlueprintWorkspace(QWidget):
                 raise RuntimeError(
                     "The adjusted Surface texture could not be activated."
                 )
-            candidate_sources = (
-                self._build_atlas_wall_texture_sources_for_assignment(
-                    balanced_assignment,
-                    source_id,
-                )
+            candidate_sources = self._build_atlas_wall_texture_sources_for_assignment(
+                balanced_assignment,
+                source_id,
             )
             if not self.texture_atlas_workspace.transition_object_packing(
                 source_id,
                 candidate_sources,
                 commit_callback=lambda: (
-                    self.surface_texture_generation.get_assignment(
-                        assignment_id
-                    )
+                    self.surface_texture_generation.get_assignment(assignment_id)
                     == balanced_assignment
                 ),
             ):
@@ -10320,9 +11041,7 @@ class BlueprintWorkspace(QWidget):
         """Prepare edge-compatible tiling outside the GUI thread."""
 
         normalized_source_id = str(source_id).strip()
-        assignment_id = get_atlas_wall_texture_assignment_id(
-            normalized_source_id
-        )
+        assignment_id = get_atlas_wall_texture_assignment_id(normalized_source_id)
         if assignment_id is None:
             self.texture_atlas_workspace.status_label.setText(
                 "Select a loaded Surface texture to fix its tiling."
@@ -10335,8 +11054,7 @@ class BlueprintWorkspace(QWidget):
             return
         try:
             preparation_snapshot = (
-                self.surface_texture_generation
-                .snapshot_assignment_tiling_repair(
+                self.surface_texture_generation.snapshot_assignment_tiling_repair(
                     assignment_id,
                     method=SURFACE_TILING_MODE_EDGE_VARIANTS,
                 )
@@ -10444,23 +11162,18 @@ class BlueprintWorkspace(QWidget):
         revision: SurfaceTextureTilingRevision | None = None
         repaired_was_activated = False
         try:
-            revision = (
-                self.surface_texture_generation.stage_assignment_tiling_repair(
-                    candidate
-                )
+            revision = self.surface_texture_generation.stage_assignment_tiling_repair(
+                candidate
             )
             repaired_was_activated = (
-                self.surface_texture_generation
-                .activate_assignment_tiling_revision(
+                self.surface_texture_generation.activate_assignment_tiling_revision(
                     revision,
                     repaired=True,
                     emit_signals=False,
                 )
             )
-            repaired_assignment = (
-                self.surface_texture_generation.get_assignment(
-                    revision.repaired_assignment.assignment_id
-                )
+            repaired_assignment = self.surface_texture_generation.get_assignment(
+                revision.repaired_assignment.assignment_id
             )
             if repaired_assignment != revision.repaired_assignment:
                 raise RuntimeError(
@@ -10553,9 +11266,7 @@ class BlueprintWorkspace(QWidget):
             )
             if source is None:
                 resolution_label = (
-                    "active"
-                    if resolution is None
-                    else f"{resolution} x {resolution}"
+                    "active" if resolution is None else f"{resolution} x {resolution}"
                 )
                 raise ValueError(
                     "The repaired Surface texture is missing its "
@@ -10681,7 +11392,10 @@ class BlueprintWorkspace(QWidget):
         selected_surface_ids = self.viewer.get_selected_canvas_surface_ids()
         if selected_surface_ids:
             return selected_surface_ids
-        return self.viewer.get_selected_canvas_stair_part_ids()
+        selected_stair_ids = self.viewer.get_selected_canvas_stair_part_ids()
+        if selected_stair_ids:
+            return selected_stair_ids
+        return self.viewer.get_selected_architectural_trim_part_ids()
 
     def _atlas_surface_targets_match_assignment(
         self,
@@ -11330,9 +12044,7 @@ class BlueprintWorkspace(QWidget):
                 tuple(placeable_object_names_by_id.items()),
             )
         )
-        signature_items.append(
-            ("deletable_objects", tuple(generated_object_ids))
-        )
+        signature_items.append(("deletable_objects", tuple(generated_object_ids)))
         for object_id in generated_object_ids:
             variant = self.generation.get_active_texture_variant(object_id)
             symmetry = self.generation.get_object_symmetric_division(object_id)
@@ -11664,12 +12376,9 @@ class BlueprintWorkspace(QWidget):
         ) -> bool:
             surface_assignment = surface_assignments_by_source_id.get(object_id)
             if surface_assignment is not None:
-                return (
-                    self.surface_texture_generation
-                    .can_select_assignment_texture_resolution(
-                        surface_assignment.assignment_id,
-                        resolution,
-                    )
+                return self.surface_texture_generation.can_select_assignment_texture_resolution(
+                    surface_assignment.assignment_id,
+                    resolution,
                 )
             if self.generation.has_active_object_job(object_id):
                 return False
@@ -11704,8 +12413,7 @@ class BlueprintWorkspace(QWidget):
         )
         if (
             selected_surface_source_ids
-            and self._selected_atlas_surface_source_id
-            in selected_surface_source_ids
+            and self._selected_atlas_surface_source_id in selected_surface_source_ids
         ):
             self._handle_atlas_surface_textures_selected(selected_surface_source_ids)
         zero_usage_cleanup_failed = False
@@ -12000,9 +12708,7 @@ class BlueprintWorkspace(QWidget):
             self._external_scene_3d_host.restore()
             self._restore_workspace_tab(self.scene_3d_workspace)
             return
-        tab_index = self._prepare_workspace_for_detachment(
-            self.scene_3d_workspace
-        )
+        tab_index = self._prepare_workspace_for_detachment(self.scene_3d_workspace)
         self._external_scene_3d_host.show_on_screen(
             self.scene_3d_workspace,
             screen,
@@ -12078,10 +12784,7 @@ class BlueprintWorkspace(QWidget):
         """Return one tab slot and move local focus away before detaching it."""
 
         tab_index = self.workspace_tabs.indexOf(workspace)
-        if (
-            tab_index >= 0
-            and self.workspace_tabs.currentWidget() is workspace
-        ):
+        if tab_index >= 0 and self.workspace_tabs.currentWidget() is workspace:
             self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
         return tab_index
 
@@ -12109,8 +12812,7 @@ class BlueprintWorkspace(QWidget):
         existing_index = self.workspace_tabs.indexOf(workspace)
         if (
             0 <= existing_index < self.workspace_tabs.count()
-            and self.workspace_tabs.widget(existing_index)
-            is workspace
+            and self.workspace_tabs.widget(existing_index) is workspace
         ):
             self._refresh_workspace_tab_indices()
             return
@@ -12200,8 +12902,7 @@ class BlueprintWorkspace(QWidget):
             self.workspace_tabs.currentWidget() is self.scene_3d_workspace
             or (
                 self._external_scene_3d_host.is_active
-                and self._external_scene_3d_host.viewer
-                is self.scene_3d_workspace
+                and self._external_scene_3d_host.viewer is self.scene_3d_workspace
             )
         )
 
@@ -12533,6 +13234,7 @@ class BlueprintWorkspace(QWidget):
         timers = (
             self._doorway_mesh_update_timer,
             self._canvas_surface_mesh_update_timer,
+            self._architectural_trim_mesh_update_timer,
             self._level_transform_mesh_update_timer,
             self._stair_point_mesh_update_timer,
         )
@@ -12830,9 +13532,7 @@ class BlueprintWorkspace(QWidget):
             if generated_model is None:
                 continue
             try:
-                symmetry = self.generation.resolve_symmetric_division_for_record(
-                    record
-                )
+                symmetry = self.generation.resolve_symmetric_division_for_record(record)
                 world_x, world_y = level_image_to_world_xy(
                     level,
                     placement.image_x,
@@ -12914,6 +13614,8 @@ class BlueprintWorkspace(QWidget):
             or self._pending_canvas_surface_mesh_update
             or self._pending_wall_vertex_mesh_update
             or self._pending_stair_point_mesh_update
+            or self._active_architectural_trim_undo_state is not None
+            or self._pending_architectural_trim_undo_state is not None
         ):
             return
         revision = self._viewer_preview_revision
@@ -13006,6 +13708,8 @@ class BlueprintWorkspace(QWidget):
             or self._pending_canvas_surface_mesh_update
             or self._pending_wall_vertex_mesh_update
             or self._pending_stair_point_mesh_update
+            or self._active_architectural_trim_undo_state is not None
+            or self._pending_architectural_trim_undo_state is not None
         ):
             return
         if self._is_viewer_refresh_scheduled:
@@ -13051,6 +13755,8 @@ class BlueprintWorkspace(QWidget):
             or self._pending_canvas_surface_mesh_update
             or self._pending_wall_vertex_mesh_update
             or self._pending_stair_point_mesh_update
+            or self._active_architectural_trim_undo_state is not None
+            or self._pending_architectural_trim_undo_state is not None
         ):
             return
 
@@ -13076,6 +13782,7 @@ class BlueprintWorkspace(QWidget):
         self._finish_level_transform_drag()
         self._commit_pending_level_transform_update()
         self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_architectural_trim_mesh_update()
         self._commit_pending_wall_vertex_update()
         self._commit_pending_stair_point_mesh_update()
 
@@ -13126,6 +13833,7 @@ class BlueprintWorkspace(QWidget):
             return
 
         self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_architectural_trim_mesh_update()
         self._commit_pending_wall_vertex_update()
 
         try:
@@ -13202,9 +13910,7 @@ class BlueprintWorkspace(QWidget):
                 self.parallel_wall_overlap_slider.value() / 100.0
             ),
             maximum_gap_bridge_pixels=float(self.wall_gap_bridge_slider.value()),
-            endpoint_snap_distance_pixels=float(
-                self.wall_endpoint_snap_slider.value()
-            ),
+            endpoint_snap_distance_pixels=float(self.wall_endpoint_snap_slider.value()),
             maximum_vertex_distance_pixels=float(
                 self.maximum_vertex_distance_slider.value()
             ),
@@ -13435,10 +14141,7 @@ class BlueprintWorkspace(QWidget):
             != runtime.topology_signature
         ):
             return False
-        return (
-            _build_local_file_revision(level.image_path)
-            == runtime.source_revision
-        )
+        return _build_local_file_revision(level.image_path) == runtime.source_revision
 
     def _refresh_plan_wall_preview(self) -> bool:
         """Reconstruct the cached evidence and publish one lightweight overlay."""
@@ -13516,6 +14219,7 @@ class BlueprintWorkspace(QWidget):
                 (1.0 - scale) * (previous_pivot_y - next_pivot_y),
             )
         self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_architectural_trim_mesh_update()
         self._commit_pending_wall_vertex_update()
         self._commit_pending_doorway_mesh_update()
         self._plan_wall_preview_session = None
@@ -13526,9 +14230,7 @@ class BlueprintWorkspace(QWidget):
         level.offset_x_meters += offset_compensation[0]
         level.offset_y_meters += offset_compensation[1]
         self._sync_level_controls()
-        self.plan_wall_generation_status_label.setText(
-            "Generated walls confirmed."
-        )
+        self.plan_wall_generation_status_label.setText("Generated walls confirmed.")
         self.viewer.set_surface_tools_status(
             "Generated walls confirmed. Press Ctrl+Z to undo."
         )
@@ -13618,9 +14320,7 @@ class BlueprintWorkspace(QWidget):
             and has_source
             and (self._plan_wall_preview_is_valid if has_preview else True)
         )
-        self.plan_wall_controls_group.setEnabled(
-            not self._is_shutdown and has_preview
-        )
+        self.plan_wall_controls_group.setEnabled(not self._is_shutdown and has_preview)
         self._update_plan_image_erase_button_state()
 
     def _handle_load_image_clicked(self) -> None:
@@ -13638,10 +14338,7 @@ class BlueprintWorkspace(QWidget):
         """Return one application-owned immutable PNG path for a marquee erase."""
 
         output_directory = self._application_settings.path.parent / "edited_plans"
-        return (
-            output_directory
-            / f"edited-plan-L{level.index}-{uuid.uuid4().hex}.png"
-        )
+        return output_directory / f"edited-plan-L{level.index}-{uuid.uuid4().hex}.png"
 
     def _handle_erase_plan_image_clicked(self, checked: bool) -> None:
         """Enter or leave the Canvas plan-image Erase mode."""
@@ -13696,9 +14393,7 @@ class BlueprintWorkspace(QWidget):
         previous_path = str(Path(raw_commit.previous_path).resolve())
         replacement_path = str(Path(raw_commit.replacement_path).resolve())
         current_path = (
-            None
-            if level.image_path is None
-            else str(Path(level.image_path).resolve())
+            None if level.image_path is None else str(Path(level.image_path).resolve())
         )
         if current_path != previous_path:
             if current_path is not None:
@@ -13710,8 +14405,7 @@ class BlueprintWorkspace(QWidget):
             QMessageBox.critical(
                 self,
                 "Plan erase not applied",
-                "The active level image changed before the erase could be "
-                "committed.",
+                "The active level image changed before the erase could be committed.",
             )
             return
 
@@ -13778,9 +14472,7 @@ class BlueprintWorkspace(QWidget):
             and level.index not in self._plan_wall_detection_runtimes
         )
         was_blocked = self.erase_plan_image_button.blockSignals(True)
-        self.erase_plan_image_button.setChecked(
-            self.canvas.is_plan_image_erasing()
-        )
+        self.erase_plan_image_button.setChecked(self.canvas.is_plan_image_erasing())
         self.erase_plan_image_button.blockSignals(was_blocked)
 
     def _handle_image_correction_clicked(self) -> None:
@@ -13951,11 +14643,7 @@ class BlueprintWorkspace(QWidget):
                 return
             self._plan_image_correction_runtimes.pop(level_index, None)
             self.job_manager.set_cancel_callback(job_id, None)
-            if (
-                self._is_shutdown
-                or runtime.cancel_requested
-                or thread.was_cancelled
-            ):
+            if self._is_shutdown or runtime.cancel_requested or thread.was_cancelled:
                 self.job_manager.mark_cancelled(job_id)
                 self._discard_plan_correction_output(runtime.output_path)
                 return
@@ -14161,8 +14849,7 @@ class BlueprintWorkspace(QWidget):
         """Enable edge-radius editing only for a rounded modern tread."""
 
         has_rounded_edge = (
-            self.stair_tread_edge_combo.currentData()
-            == STAIR_TREAD_EDGE_ROUNDED
+            self.stair_tread_edge_combo.currentData() == STAIR_TREAD_EDGE_ROUNDED
         )
         placement_active = self.canvas.is_stair_placement_active()
         self.stair_tread_edge_radius_label.setEnabled(has_rounded_edge)
@@ -14177,8 +14864,7 @@ class BlueprintWorkspace(QWidget):
         """Enable starting-curve editing only when a profile is selected."""
 
         has_starting_step = (
-            self.stair_starting_step_combo.currentData()
-            != STAIR_STARTING_STEP_NONE
+            self.stair_starting_step_combo.currentData() != STAIR_STARTING_STEP_NONE
         )
         placement_active = self.canvas.is_stair_placement_active()
         self.stair_starting_step_edge_radius_label.setEnabled(has_starting_step)
@@ -14213,18 +14899,13 @@ class BlueprintWorkspace(QWidget):
         """Capture one normalized parameter set from the Canvas controls."""
 
         return _StairEditorParameters(
-            stair_type=str(
-                self.stair_type_combo.currentData() or DEFAULT_STAIR_TYPE
-            ),
-            target_rise_meters=float(
-                self.stair_step_rise_target_spinbox.value()
-            ) / 100.0,
-            tread_thickness_meters=float(
-                self.stair_tread_thickness_spinbox.value()
-            ) / 100.0,
-            tread_overhang_meters=float(
-                self.stair_nosing_overhang_spinbox.value()
-            ) / 100.0,
+            stair_type=str(self.stair_type_combo.currentData() or DEFAULT_STAIR_TYPE),
+            target_rise_meters=float(self.stair_step_rise_target_spinbox.value())
+            / 100.0,
+            tread_thickness_meters=float(self.stair_tread_thickness_spinbox.value())
+            / 100.0,
+            tread_overhang_meters=float(self.stair_nosing_overhang_spinbox.value())
+            / 100.0,
             nosing_placements=tuple(
                 placement
                 for placement, checkbox in (
@@ -14238,9 +14919,7 @@ class BlueprintWorkspace(QWidget):
                 self.stair_tread_edge_combo.currentData()
                 or DEFAULT_STAIR_TREAD_EDGE_PROFILE
             ),
-            tread_edge_radius_meters=float(
-                self.stair_tread_edge_radius_spinbox.value()
-            )
+            tread_edge_radius_meters=float(self.stair_tread_edge_radius_spinbox.value())
             / 100.0,
             starting_step=str(
                 self.stair_starting_step_combo.currentData()
@@ -14269,7 +14948,8 @@ class BlueprintWorkspace(QWidget):
         if stair_type not in {STAIR_TYPE_SUPPORTED, STAIR_TYPE_FLOATING}:
             stair_type = (
                 STAIR_TYPE_FLOATING
-                if stair.style in {
+                if stair.style
+                in {
                     STAIR_STYLE_FLOATING,
                     STAIR_STYLE_FLOATING_WITH_RISER,
                 }
@@ -14432,9 +15112,7 @@ class BlueprintWorkspace(QWidget):
     ) -> StairData:
         """Return a stair with only its editable geometry settings changed."""
 
-        if parameters == BlueprintWorkspace._stair_editor_parameters_for_stair(
-            stair
-        ):
+        if parameters == BlueprintWorkspace._stair_editor_parameters_for_stair(stair):
             return stair
         return replace(
             stair,
@@ -14586,8 +15264,7 @@ class BlueprintWorkspace(QWidget):
             and 0 <= self._editing_stair_index < len(self.stairs)
         )
         has_staged_changes = (
-            self._staged_stair is not None
-            or self._pending_stair_parameters is not None
+            self._staged_stair is not None or self._pending_stair_parameters is not None
         )
         if editing_stair:
             button_text = "Apply changes to stair"
@@ -14743,6 +15420,7 @@ class BlueprintWorkspace(QWidget):
             self._finish_canvas_transform_drag()
             self._cancel_active_canvas_surface_edit()
             self._commit_pending_canvas_surface_mesh_update()
+            self._commit_pending_architectural_trim_mesh_update()
             self._commit_pending_wall_vertex_update()
             self._commit_pending_doorway_mesh_update()
         self.current_level_index = level_index
@@ -14795,6 +15473,7 @@ class BlueprintWorkspace(QWidget):
         self._finish_canvas_transform_drag()
         self._cancel_active_canvas_surface_edit()
         self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_architectural_trim_mesh_update()
         self._commit_pending_wall_vertex_update()
         self._commit_pending_doorway_mesh_update()
         self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
@@ -14903,6 +15582,7 @@ class BlueprintWorkspace(QWidget):
         if self._is_syncing_level_controls or self._level_transform_drag_active:
             return
         self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_architectural_trim_mesh_update()
         self._level_transform_mesh_update_timer.stop()
         self._level_transform_drag_active = True
 
@@ -14977,6 +15657,7 @@ class BlueprintWorkspace(QWidget):
         if pending is None:
             self._finish_canvas_transform_drag()
             self._commit_pending_canvas_surface_mesh_update()
+            self._commit_pending_architectural_trim_mesh_update()
             self._commit_pending_wall_vertex_update()
             self._commit_pending_doorway_mesh_update()
             pending = _PendingLevelTransform(
@@ -15165,6 +15846,7 @@ class BlueprintWorkspace(QWidget):
         self._finish_level_transform_drag()
         self._commit_pending_level_transform_update()
         self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_architectural_trim_mesh_update()
         self._canvas_transform_drag_active = True
         self._canvas_transform_drag_undo_state = (
             self._capture_canvas_level_properties_undo_state(self.current_level)
@@ -15401,10 +16083,7 @@ class BlueprintWorkspace(QWidget):
 
     def _handle_remove_doorway_preset_clicked(self) -> None:
         selected_index = self.doorway_preset_list.currentRow()
-        if (
-            selected_index < 0
-            or selected_index >= len(self.doorway_presets)
-        ):
+        if selected_index < 0 or selected_index >= len(self.doorway_presets):
             return
 
         del self.doorway_presets[selected_index]
@@ -15501,6 +16180,7 @@ class BlueprintWorkspace(QWidget):
         self._finish_level_transform_drag()
         self._commit_pending_level_transform_update()
         self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_architectural_trim_mesh_update()
         self._commit_pending_wall_vertex_update()
 
     def _capture_canvas_wall_mirror_undo_state(
@@ -15689,9 +16369,7 @@ class BlueprintWorkspace(QWidget):
         """Expose or refresh arch shoulders from the live doorway data."""
 
         doorway_index = self.canvas.selected_doorway_index
-        if doorway_index is None or not 0 <= doorway_index < len(
-            self.canvas.doorways
-        ):
+        if doorway_index is None or not 0 <= doorway_index < len(self.canvas.doorways):
             return
         target_key = f"doorway:{self.current_level.index}:{doorway_index}"
         target = self._canvas_opening_targets_by_key.get(target_key)
@@ -15699,9 +16377,7 @@ class BlueprintWorkspace(QWidget):
             return
         doorway = self.canvas.doorways[doorway_index]
         arch_amount = (
-            doorway.arch_amount
-            if doorway.shape == DOORWAY_SHAPE_ARCH
-            else None
+            doorway.arch_amount if doorway.shape == DOORWAY_SHAPE_ARCH else None
         )
         updated_target = target.with_arch_amount(arch_amount)
         if updated_target == target:
@@ -15834,19 +16510,13 @@ class BlueprintWorkspace(QWidget):
 
         self._pending_doorway_mesh_level_index = level.index
         self._pending_canvas_opening_key = f"doorway:{level.index}:{selected_index}"
-        if (
-            self._is_doorway_move_drag_active
-            or self._is_doorway_resize_drag_active
-        ):
+        if self._is_doorway_move_drag_active or self._is_doorway_resize_drag_active:
             self._doorway_mesh_update_timer.stop()
         else:
             self._doorway_mesh_update_timer.start()
 
     def _handle_add_stairs_clicked(self) -> None:
-        if (
-            self._staged_stair is not None
-            or self._pending_stair_parameters is not None
-        ):
+        if self._staged_stair is not None or self._pending_stair_parameters is not None:
             self._apply_staged_stair_edit()
             return
         draft = self.canvas.get_stair_placement_draft()
@@ -15880,9 +16550,7 @@ class BlueprintWorkspace(QWidget):
         parameters = self._read_stair_editor_parameters()
         self._new_stair_parameters = parameters
         self.workspace_tabs.setCurrentWidget(self.canvas_viewer_workspace)
-        self.canvas.start_stair_placement(
-            parameters.stair_type
-        )
+        self.canvas.start_stair_placement(parameters.stair_type)
         self._update_stair_button_state()
         self.stair_status_label.setText(
             "Click two points to define the stair opening on this level."
@@ -16201,9 +16869,7 @@ class BlueprintWorkspace(QWidget):
         self.viewer.set_first_person_movement_mode(
             settings.first_person_navigation_mode
         )
-        self.viewer.set_ignore_top_down_ceiling(
-            settings.ignore_top_down_ceiling
-        )
+        self.viewer.set_ignore_top_down_ceiling(settings.ignore_top_down_ceiling)
         self.viewer.set_hide_stair_mesh_when_previewing(
             settings.hide_stair_mesh_when_previewing
         )
@@ -16216,9 +16882,7 @@ class BlueprintWorkspace(QWidget):
             settings.clear_mask_hotkey
         )
         self._apply_scene_3d_display_screen(settings.scene_3d_display_screen_id)
-        self._apply_generation_display_screen(
-            settings.generation_display_screen_id
-        )
+        self._apply_generation_display_screen(settings.generation_display_screen_id)
         self._apply_jobs_window_screen(settings.jobs_window_screen_id)
         self._apply_atlas_display_screen(settings.atlas_display_screen_id)
         self._refresh_scene_atlas_texture_requirements()
@@ -16243,9 +16907,7 @@ class BlueprintWorkspace(QWidget):
         if self._pending_wall_vertex_mesh_update:
             self._restart_pending_wall_vertex_update_if_idle()
             return
-        assignments_changed = (
-            self._reconcile_surface_assignments_with_scene()
-        )
+        assignments_changed = self._reconcile_surface_assignments_with_scene()
         self._finalize_blueprint_surface_binding_undo_state()
         if not assignments_changed:
             self._schedule_viewer_preview_refresh()
@@ -16264,9 +16926,50 @@ class BlueprintWorkspace(QWidget):
 
         self._pending_wall_vertex_mesh_update = True
         self._sync_canvas_wall_mirror_state()
+        self._remove_architectural_trims_without_host_walls()
         self._reconcile_surface_assignments_with_scene()
         self._finalize_blueprint_surface_binding_undo_state()
         self._restart_pending_wall_vertex_update_if_idle()
+
+    def _remove_architectural_trims_without_host_walls(self) -> tuple[str, ...]:
+        """Remove trim records whose stable host walls no longer exist."""
+
+        live_wall_ids = {
+            surface.surface_id
+            for surface in build_base_fixed_surfaces(self.levels)
+            if surface.surface_type == SURFACE_TYPE_WALL
+        }
+        removed_trim_ids: set[str] = set()
+        for level in self.levels:
+            retained_trims = []
+            for trim in level.architectural_trims:
+                if all(
+                    surface_id in live_wall_ids for surface_id in trim.wall_surface_ids
+                ):
+                    retained_trims.append(trim)
+                else:
+                    removed_trim_ids.add(trim.trim_id)
+            level.architectural_trims = retained_trims
+        if not removed_trim_ids:
+            return ()
+
+        def is_retained_part(surface_id: str) -> bool:
+            return not any(
+                surface_id.startswith(f"trim:{trim_id}/")
+                for trim_id in removed_trim_ids
+            )
+
+        self._desired_canvas_architectural_trim_part_ids = tuple(
+            surface_id
+            for surface_id in self._desired_canvas_architectural_trim_part_ids
+            if is_retained_part(surface_id)
+        )
+        self._atlas_surface_assignment_target_ids = tuple(
+            surface_id
+            for surface_id in self._atlas_surface_assignment_target_ids
+            if is_retained_part(surface_id)
+        )
+        return tuple(sorted(removed_trim_ids))
 
     def _handle_canvas_wall_vertex_interaction_changed(
         self,
@@ -16300,8 +17003,8 @@ class BlueprintWorkspace(QWidget):
         for level_index in doorway_level_indices:
             level = self._get_level_by_index(level_index)
             if level is not None:
-                self._viewer_doorways_by_level_index[level_index] = (
-                    self._copy_doorways(level.doorways)
+                self._viewer_doorways_by_level_index[level_index] = self._copy_doorways(
+                    level.doorways
                 )
         self._reconcile_canvas_surface_edit_and_refresh()
 
@@ -16403,6 +17106,9 @@ class BlueprintWorkspace(QWidget):
         self._desired_canvas_object_id = None
         self._desired_canvas_object_ids = ()
         self._desired_canvas_surface_ids = ()
+        self._desired_canvas_architectural_trim_part_ids = ()
+        self._active_architectural_trim_undo_state = None
+        self._clear_pending_architectural_trim_mesh_update()
         self._active_canvas_surface_drawing_vertex_id = None
         self._atlas_surface_assignment_target_ids = ()
         self._selected_atlas_surface_source_id = None
@@ -16425,6 +17131,9 @@ class BlueprintWorkspace(QWidget):
         self._desired_canvas_stair_part_ids = ()
         self._canvas_stair_part_targets_by_id = {}
         self._canvas_stair_semantic_surfaces_by_id = {}
+        self._canvas_architectural_trim_parts_by_id = {}
+        self._canvas_architectural_trim_semantic_surfaces_by_id = {}
+        self._canvas_architectural_trim_edit_targets_by_id = {}
         self.surface_texture_generation.set_external_semantic_surfaces(())
         self.viewer.clear_canvas_stair_preview()
         self._set_stair_editor_parameters(self._new_stair_parameters)
@@ -16469,19 +17178,24 @@ class BlueprintWorkspace(QWidget):
         self.texture_atlas_workspace.set_data(texture_atlases)
         self.surface_texture_generation.set_levels(self.levels)
         self._sync_canvas_stair_semantic_targets(self.levels)
+        self._sync_canvas_architectural_trim_semantic_targets(self.levels)
         self.surface_texture_generation.set_data(surface_texture_generation)
-        restored_surface_ids = tuple(
-            surface_texture_generation.selected_surface_ids
-        )
+        restored_surface_ids = tuple(surface_texture_generation.selected_surface_ids)
         self._desired_canvas_stair_part_ids = tuple(
             surface_id
             for surface_id in restored_surface_ids
             if surface_id in self._canvas_stair_part_targets_by_id
         )
+        self._desired_canvas_architectural_trim_part_ids = tuple(
+            surface_id
+            for surface_id in restored_surface_ids
+            if surface_id in self._canvas_architectural_trim_parts_by_id
+        )
         self._desired_canvas_surface_ids = tuple(
             surface_id
             for surface_id in restored_surface_ids
             if surface_id not in self._canvas_stair_part_targets_by_id
+            and surface_id not in self._canvas_architectural_trim_parts_by_id
         )
         self._atlas_surface_assignment_target_ids = restored_surface_ids
         selected_stair_target = (
@@ -16496,9 +17210,7 @@ class BlueprintWorkspace(QWidget):
             and 0 <= selected_stair_target.stair_index < len(self.stairs)
         ):
             self._editing_stair_index = selected_stair_target.stair_index
-            self._load_stair_editor_from_stair(
-                self.stairs[self._editing_stair_index]
-            )
+            self._load_stair_editor_from_stair(self.stairs[self._editing_stair_index])
         self._update_stair_button_state()
         self.merged_generation_workspace.sync_shared_controls()
         self._reconcile_surface_assignments_with_scene(
@@ -16538,6 +17250,7 @@ class BlueprintWorkspace(QWidget):
         self._commit_pending_level_transform_update()
         self._cancel_active_canvas_surface_edit()
         self._commit_pending_canvas_surface_mesh_update()
+        self._commit_pending_architectural_trim_mesh_update()
         self._commit_pending_wall_vertex_update()
         self._commit_pending_doorway_mesh_update()
         normalized_path = str(Path(file_path).resolve())
