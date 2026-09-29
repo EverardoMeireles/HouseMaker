@@ -463,6 +463,7 @@ class _PlacedObjectEditDrag:
 class BlueprintCanvas(QWidget):
     geometry_changed = Signal()
     wall_vertex_added = Signal()
+    wall_vertices_deleted = Signal(object)
     wall_vertex_interaction_changed = Signal(bool)
     rooms_changed = Signal()
     doorways_changed = Signal()
@@ -489,6 +490,7 @@ class BlueprintCanvas(QWidget):
     plan_image_erase_mode_changed = Signal(bool)
     plan_image_erase_committed = Signal(object)
     plan_image_erase_failed = Signal(str)
+    level_comparison_direction_changed = Signal(object)
     placed_object_selection_requested = Signal(object, object)
     placed_object_transform_committed = Signal(str, float, float, float)
 
@@ -512,6 +514,7 @@ class BlueprintCanvas(QWidget):
         self._level_comparison_image_cache: (
             _BlueprintImageCacheEntry | None
         ) = None
+        self._held_level_comparison_keys: list[int] = []
         self._generated_wall_preview: GeneratedWallPreview | None = None
         self.active_vertex_id: int | None = None
         self._selected_vertex_ids: tuple[int, ...] = ()
@@ -780,6 +783,7 @@ class BlueprintCanvas(QWidget):
         canvas_level_scale: float = DEFAULT_CANVAS_LEVEL_SCALE,
         canvas_offset_x_pixels: float = DEFAULT_CANVAS_OFFSET_PIXELS,
         canvas_offset_y_pixels: float = DEFAULT_CANVAS_OFFSET_PIXELS,
+        preserve_view: bool = False,
     ) -> None:
         blueprint_image: QImage | None = None
         blueprint_revision = (
@@ -814,6 +818,7 @@ class BlueprintCanvas(QWidget):
             canvas_offset_x_pixels=canvas_offset_x_pixels,
             canvas_offset_y_pixels=canvas_offset_y_pixels,
             blueprint_revision=blueprint_revision,
+            preserve_view=preserve_view,
         )
 
     def get_image_size_pixels(self) -> tuple[float, float] | None:
@@ -1016,6 +1021,15 @@ class BlueprintCanvas(QWidget):
             return False
         self._level_comparison_overlay = None
         self.update()
+        return True
+
+    def clear_level_comparison_keys(self) -> bool:
+        """Release every keyboard-held adjacent-level comparison."""
+
+        if not self._held_level_comparison_keys:
+            return False
+        self._held_level_comparison_keys.clear()
+        self.level_comparison_direction_changed.emit(None)
         return True
 
     def get_level_comparison_overlay(
@@ -1790,6 +1804,7 @@ class BlueprintCanvas(QWidget):
         canvas_offset_x_pixels: float,
         canvas_offset_y_pixels: float,
         blueprint_revision: tuple[object, ...] | None,
+        preserve_view: bool = False,
     ) -> None:
         self._cancel_placed_object_edit_drag(restore_initial=True)
         self.stop_plan_image_erasing()
@@ -1831,7 +1846,8 @@ class BlueprintCanvas(QWidget):
         self._reset_stair_drag()
         self._reset_pointer_state()
         self._reset_doorway_pointer_state()
-        self._reset_view()
+        if not preserve_view:
+            self._reset_view()
         if self._is_stair_placement_active():
             self.setCursor(Qt.CursorShape.CrossCursor)
         else:
@@ -1904,6 +1920,24 @@ class BlueprintCanvas(QWidget):
         return False
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        comparison_direction = _level_comparison_key_direction(event.key())
+        if (
+            comparison_direction is not None
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+        ):
+            if not event.isAutoRepeat():
+                self._held_level_comparison_keys = [
+                    key
+                    for key in self._held_level_comparison_keys
+                    if key != event.key()
+                ]
+                self._held_level_comparison_keys.append(event.key())
+                self.level_comparison_direction_changed.emit(
+                    comparison_direction
+                )
+            event.accept()
+            return
+
         if (
             event.key() == Qt.Key.Key_Escape
             and self._cancel_placed_object_edit_drag(restore_initial=True)
@@ -1984,6 +2018,30 @@ class BlueprintCanvas(QWidget):
             return
 
         super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if (
+            not event.isAutoRepeat()
+            and event.key() in self._held_level_comparison_keys
+        ):
+            self._held_level_comparison_keys.remove(event.key())
+            next_direction = (
+                _level_comparison_key_direction(
+                    self._held_level_comparison_keys[-1]
+                )
+                if self._held_level_comparison_keys
+                else None
+            )
+            self.level_comparison_direction_changed.emit(next_direction)
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
+
+    def focusOutEvent(self, event) -> None:  # type: ignore[override]
+        """Prevent a held comparison from sticking after focus changes."""
+
+        self.clear_level_comparison_keys()
+        super().focusOutEvent(event)
 
     def wheelEvent(self, event) -> None:  # type: ignore[override]
         if self.blueprint_image is None:
@@ -4793,6 +4851,7 @@ class BlueprintCanvas(QWidget):
         self.preview_guides = []
         self._reset_pointer_state()
         self.update()
+        self.wall_vertices_deleted.emit(deleted_vertex_ids)
         self.geometry_changed.emit()
 
     def _remove_vertices_from_rooms(
@@ -6716,6 +6775,18 @@ class BlueprintCanvas(QWidget):
         painter.setPen(QPen(VERTEX_OUTLINE_COLOR, 1.5))
         painter.setBrush(fill_color)
         painter.drawEllipse(center, VERTEX_RADIUS_SCREEN, VERTEX_RADIUS_SCREEN)
+
+
+# ### Keyboard helpers ###
+def _level_comparison_key_direction(key: int) -> int | None:
+    """Map Canvas comparison keys to adjacent level-index offsets."""
+
+    if key == Qt.Key.Key_R:
+        return 1
+    if key == Qt.Key.Key_F:
+        return -1
+    return None
+
 
 # ### Numeric helpers ###
 def _normalize_preview_edge_key(

@@ -86,6 +86,9 @@ class BlueprintWallVertexEventTests(unittest.TestCase):
         self.canvas.wall_vertex_added.connect(
             lambda: events.append("wall_vertex_added")
         )
+        self.canvas.wall_vertices_deleted.connect(
+            lambda _vertex_ids: events.append("wall_vertices_deleted")
+        )
         self.canvas.geometry_changed.connect(
             lambda: events.append("geometry_changed")
         )
@@ -240,14 +243,17 @@ class BlueprintWallVertexEventTests(unittest.TestCase):
         self.assertEqual(self.canvas.active_vertex_id, second.id)
         self.assertEqual(self.canvas.selected_vertex_id, second.id)
 
-    def test_deleting_existing_vertex_is_only_a_general_change(self) -> None:
+    def test_deleting_existing_vertex_emits_wall_event_before_geometry(self) -> None:
         vertex = self.canvas.vertex_data.add_vertex(10.0, 20.0)
         self.canvas.selected_vertex_id = vertex.id
         events = self._record_geometry_events()
 
         self.canvas._delete_selected_vertices()
 
-        self.assertEqual(events, ["geometry_changed"])
+        self.assertEqual(
+            events,
+            ["wall_vertices_deleted", "geometry_changed"],
+        )
         self.assertIsNone(self.canvas.vertex_data.get_vertex(vertex.id))
 
     def test_delete_removes_the_full_vertex_selection_in_one_action(self) -> None:
@@ -282,7 +288,14 @@ class BlueprintWallVertexEventTests(unittest.TestCase):
 
         QTest.keyClick(self.canvas, Qt.Key.Key_Delete)
 
-        self.assertEqual(events, ["rooms_changed", "geometry_changed"])
+        self.assertEqual(
+            events,
+            [
+                "rooms_changed",
+                "wall_vertices_deleted",
+                "geometry_changed",
+            ],
+        )
         self.assertEqual(
             [vertex.id for vertex in vertex_data.vertices],
             [

@@ -13,6 +13,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # ### Imports ###
 from PIL import Image
+from PySide6.QtCore import QEvent, QPointF, Qt
+from PySide6.QtGui import QFocusEvent, QKeyEvent
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 import housemaker.blueprint_canvas as blueprint_canvas_module
@@ -138,12 +141,14 @@ class CanvasLevelScaleWorkspaceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         temporary_path = Path(self.temporary_directory.name)
-        self.image_paths = [temporary_path / f"level-{index}.png" for index in range(3)]
+        self.image_paths = [
+            temporary_path / f"level-{index}.png" for index in range(4)
+        ]
         for index, image_path in enumerate(self.image_paths):
             _write_blueprint(image_path, (30 + index * 20, 40, 50))
         self.levels = [
             _build_level(index, self.image_paths[index])
-            for index in range(3)
+            for index in range(4)
         ]
         self.levels[1].canvas_level_scale = 0.75
         self.workspace = BlueprintWorkspace(
@@ -211,6 +216,175 @@ class CanvasLevelScaleWorkspaceTests(unittest.TestCase):
         self.assertEqual(overlay.level_index, 2)
 
         self.workspace._handle_canvas_transform_drag_finished()
+
+    def test_selecting_another_level_preserves_zoom_and_view_position(
+        self,
+    ) -> None:
+        self.workspace.canvas.zoom_scale = 2.35
+        self.workspace.canvas.view_offset = QPointF(47.0, -31.0)
+
+        self.workspace._handle_level_selection_changed(1)
+
+        self.assertAlmostEqual(self.workspace.canvas.zoom_scale, 2.35)
+        self.assertEqual(
+            self.workspace.canvas.view_offset,
+            QPointF(47.0, -31.0),
+        )
+
+        self.workspace._handle_level_selection_changed(3)
+
+        self.assertAlmostEqual(self.workspace.canvas.zoom_scale, 2.35)
+        self.assertEqual(
+            self.workspace.canvas.view_offset,
+            QPointF(47.0, -31.0),
+        )
+
+    def test_r_and_f_hold_exact_upper_and_lower_level_previews(self) -> None:
+        QTest.keyPress(self.workspace.canvas, Qt.Key.Key_R)
+        upper_overlay = self.workspace.canvas.get_level_comparison_overlay()
+        self.assertIsNotNone(upper_overlay)
+        assert upper_overlay is not None
+        self.assertEqual(upper_overlay.level_index, 3)
+
+        QTest.keyRelease(self.workspace.canvas, Qt.Key.Key_R)
+        self.assertIsNone(
+            self.workspace.canvas.get_level_comparison_overlay()
+        )
+
+        QTest.keyPress(self.workspace.canvas, Qt.Key.Key_F)
+        lower_overlay = self.workspace.canvas.get_level_comparison_overlay()
+        self.assertIsNotNone(lower_overlay)
+        assert lower_overlay is not None
+        self.assertEqual(lower_overlay.level_index, 1)
+
+        QTest.keyRelease(self.workspace.canvas, Qt.Key.Key_F)
+        self.assertIsNone(
+            self.workspace.canvas.get_level_comparison_overlay()
+        )
+
+    def test_keyboard_preview_ignores_modifiers_and_auto_repeat(self) -> None:
+        QTest.keyPress(
+            self.workspace.canvas,
+            Qt.Key.Key_R,
+            Qt.KeyboardModifier.ControlModifier,
+        )
+        self.assertIsNone(
+            self.workspace.canvas.get_level_comparison_overlay()
+        )
+        QTest.keyRelease(
+            self.workspace.canvas,
+            Qt.Key.Key_R,
+            Qt.KeyboardModifier.ControlModifier,
+        )
+
+        repeat_event = QKeyEvent(
+            QEvent.Type.KeyPress,
+            Qt.Key.Key_R,
+            Qt.KeyboardModifier.NoModifier,
+            "r",
+            True,
+            2,
+        )
+        QApplication.sendEvent(self.workspace.canvas, repeat_event)
+        self.assertIsNone(
+            self.workspace.canvas.get_level_comparison_overlay()
+        )
+
+    def test_transform_preview_wins_and_restores_held_keyboard_preview(
+        self,
+    ) -> None:
+        QTest.keyPress(self.workspace.canvas, Qt.Key.Key_R)
+        self.workspace._handle_canvas_transform_drag_started()
+        transform_overlay = self.workspace.canvas.get_level_comparison_overlay()
+        self.assertIsNotNone(transform_overlay)
+        assert transform_overlay is not None
+        self.assertEqual(transform_overlay.level_index, 1)
+
+        self.workspace._handle_canvas_transform_drag_finished()
+        restored_overlay = self.workspace.canvas.get_level_comparison_overlay()
+        self.assertIsNotNone(restored_overlay)
+        assert restored_overlay is not None
+        self.assertEqual(restored_overlay.level_index, 3)
+
+        QTest.keyRelease(self.workspace.canvas, Qt.Key.Key_R)
+        self.assertIsNone(
+            self.workspace.canvas.get_level_comparison_overlay()
+        )
+
+    def test_keyboard_release_cannot_clear_active_transform_preview(self) -> None:
+        QTest.keyPress(self.workspace.canvas, Qt.Key.Key_R)
+        self.workspace._handle_canvas_transform_drag_started()
+
+        QTest.keyRelease(self.workspace.canvas, Qt.Key.Key_R)
+        overlay = self.workspace.canvas.get_level_comparison_overlay()
+        self.assertIsNotNone(overlay)
+        assert overlay is not None
+        self.assertEqual(overlay.level_index, 1)
+
+        self.workspace._handle_canvas_transform_drag_finished()
+        self.assertIsNone(
+            self.workspace.canvas.get_level_comparison_overlay()
+        )
+
+    def test_level_transform_button_restores_held_keyboard_preview(self) -> None:
+        QTest.keyPress(self.workspace.canvas, Qt.Key.Key_R)
+        self.workspace._handle_level_transform_button_pressed(
+            self.workspace.level_scale_slider,
+            1,
+        )
+        transform_overlay = self.workspace.canvas.get_level_comparison_overlay()
+        self.assertIsNotNone(transform_overlay)
+        assert transform_overlay is not None
+        self.assertEqual(transform_overlay.level_index, 1)
+
+        self.workspace._handle_level_transform_button_released()
+        restored_overlay = self.workspace.canvas.get_level_comparison_overlay()
+        self.assertIsNotNone(restored_overlay)
+        assert restored_overlay is not None
+        self.assertEqual(restored_overlay.level_index, 3)
+
+        QTest.keyRelease(self.workspace.canvas, Qt.Key.Key_R)
+
+    def test_focus_loss_and_level_switch_clear_keyboard_preview(self) -> None:
+        QTest.keyPress(self.workspace.canvas, Qt.Key.Key_R)
+        QApplication.sendEvent(
+            self.workspace.canvas,
+            QFocusEvent(QEvent.Type.FocusOut),
+        )
+        self.assertIsNone(
+            self.workspace.canvas.get_level_comparison_overlay()
+        )
+
+        QTest.keyPress(self.workspace.canvas, Qt.Key.Key_F)
+        self.workspace._handle_level_selection_changed(1)
+        self.assertIsNone(
+            self.workspace.canvas.get_level_comparison_overlay()
+        )
+
+    def test_keyboard_preview_handles_level_bounds_and_missing_images(
+        self,
+    ) -> None:
+        self.workspace._handle_level_selection_changed(3)
+        QTest.keyPress(self.workspace.canvas, Qt.Key.Key_R)
+        self.assertIsNone(
+            self.workspace.canvas.get_level_comparison_overlay()
+        )
+        QTest.keyRelease(self.workspace.canvas, Qt.Key.Key_R)
+
+        self.workspace._handle_level_selection_changed(0)
+        QTest.keyPress(self.workspace.canvas, Qt.Key.Key_F)
+        self.assertIsNone(
+            self.workspace.canvas.get_level_comparison_overlay()
+        )
+        QTest.keyRelease(self.workspace.canvas, Qt.Key.Key_F)
+
+        self.workspace._handle_level_selection_changed(2)
+        self.workspace.levels[3].image_path = None
+        QTest.keyPress(self.workspace.canvas, Qt.Key.Key_R)
+        self.assertIsNone(
+            self.workspace.canvas.get_level_comparison_overlay()
+        )
+        QTest.keyRelease(self.workspace.canvas, Qt.Key.Key_R)
 
 
 # ### Project compatibility tests ###

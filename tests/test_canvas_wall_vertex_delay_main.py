@@ -51,6 +51,17 @@ def _build_level_with_disconnected_vertices(index: int = 2) -> LevelData:
     return level
 
 
+def _build_level_with_two_walls(index: int = 2) -> LevelData:
+    level = _build_level(index)
+    first = level.vertex_data.add_vertex(10.0, 25.0)
+    second = level.vertex_data.add_vertex(90.0, 25.0)
+    third = level.vertex_data.add_vertex(10.0, 75.0)
+    fourth = level.vertex_data.add_vertex(90.0, 75.0)
+    level.vertex_data.add_edge(first.id, second.id)
+    level.vertex_data.add_edge(third.id, fourth.id)
+    return level
+
+
 def _send_drag_move(canvas: BlueprintCanvas, position: QPoint) -> None:
     event = QMouseEvent(
         QEvent.Type.MouseMove,
@@ -472,6 +483,110 @@ class CanvasWallVertexDelayMainTests(unittest.TestCase):
         self.assertGreater(timer.remainingTime(), remaining_before_general_change)
         reconcile_assignments.assert_not_called()
         schedule_refresh.assert_not_called()
+
+    def test_multi_vertex_delete_rebuilds_the_3d_geometry_after_delay(
+        self,
+    ) -> None:
+        level = _build_level_with_two_walls()
+        self._install_levels([level])
+        self.workspace.workspace_tabs.setCurrentWidget(
+            self.workspace.scene_3d_workspace
+        )
+        _qt_application.processEvents()
+        installed_model = self.workspace.viewer.model
+        assert installed_model is not None
+        installed_face_count = len(installed_model.mesh.faces)
+        original_model = self.workspace._build_viewer_preview_model(None)
+        assert original_model is not None
+        original_face_count = len(original_model.mesh.faces)
+        self.assertEqual(installed_face_count, original_face_count)
+        original_revision = self.workspace._viewer_preview_revision
+        deleted_vertex_ids = tuple(
+            vertex.id for vertex in level.vertex_data.vertices[:2]
+        )
+        self.workspace.canvas.set_selected_vertex_ids(deleted_vertex_ids)
+
+        self.workspace.canvas._delete_selected_vertices()
+
+        self.assertTrue(self.workspace._pending_wall_vertex_mesh_update)
+        self.assertTrue(self.workspace._wall_vertex_update_timer.isActive())
+        self.assertEqual(
+            self.workspace._viewer_preview_revision,
+            original_revision,
+        )
+        self.assertTrue(
+            all(
+                level.vertex_data.get_vertex(vertex_id) is None
+                for vertex_id in deleted_vertex_ids
+            )
+        )
+
+        self.workspace._commit_pending_wall_vertex_update()
+
+        self.assertFalse(self.workspace._pending_wall_vertex_mesh_update)
+        self.assertGreater(
+            self.workspace._viewer_preview_revision,
+            original_revision,
+        )
+        rebuilt_model = self.workspace._build_viewer_preview_model(None)
+        assert rebuilt_model is not None
+        self.assertLess(len(rebuilt_model.mesh.faces), original_face_count)
+        _qt_application.processEvents()
+        refreshed_model = self.workspace.viewer.model
+        assert refreshed_model is not None
+        self.assertLess(len(refreshed_model.mesh.faces), installed_face_count)
+
+    def test_deleting_the_last_wall_clears_the_live_3d_geometry_after_delay(
+        self,
+    ) -> None:
+        level = _build_level_with_wall()
+        self._install_levels([level])
+        self.workspace.workspace_tabs.setCurrentWidget(
+            self.workspace.scene_3d_workspace
+        )
+        _qt_application.processEvents()
+        self.assertIsNotNone(self.workspace.viewer.model)
+        deleted_vertex_id = level.vertex_data.vertices[0].id
+        self.workspace.canvas.set_selected_vertex_ids((deleted_vertex_id,))
+
+        self.workspace.canvas._delete_selected_vertices()
+        self.workspace._commit_pending_wall_vertex_update()
+        _qt_application.processEvents()
+
+        self.assertIsNone(level.vertex_data.get_vertex(deleted_vertex_id))
+        self.assertEqual(len(level.vertex_data.vertices), 1)
+        self.assertEqual(level.vertex_data.edges, [])
+        self.assertIsNone(self.workspace.viewer.model)
+
+    def test_deleting_the_last_wall_clears_a_detached_3d_window(
+        self,
+    ) -> None:
+        level = _build_level_with_wall()
+        self._install_levels([level])
+        screen = QApplication.primaryScreen()
+        assert screen is not None
+        with patch(
+            "housemaker.main.resolve_fullscreen_3d_viewer_screen",
+            return_value=screen,
+        ):
+            self.workspace._apply_scene_3d_display_screen(
+                "screen:vertex-delete-test"
+            )
+        _qt_application.processEvents()
+        self.assertTrue(self.workspace._external_scene_3d_host.is_active)
+        self.assertIsNotNone(self.workspace.viewer.model)
+        deleted_vertex_id = level.vertex_data.vertices[0].id
+        self.workspace.canvas.set_selected_vertex_ids((deleted_vertex_id,))
+
+        self.workspace.canvas._delete_selected_vertices()
+        self.workspace._commit_pending_wall_vertex_update()
+        _qt_application.processEvents()
+
+        self.assertIsNone(self.workspace.viewer.model)
+        self.assertEqual(
+            self.workspace._canvas_viewer_preview_revision,
+            self.workspace._viewer_preview_revision,
+        )
 
     def test_ordinary_general_change_remains_immediate(self) -> None:
         timer = self.workspace._wall_vertex_update_timer

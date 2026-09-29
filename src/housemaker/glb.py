@@ -162,6 +162,11 @@ STAIR_PART_SURFACE_TYPE = {
 _fallback_qt_application: QGuiApplication | None = None
 
 
+# ### Exceptions ###
+class NoUsableBlueprintGeometryError(ValueError):
+    """Raised when a valid blueprint currently has nothing to mesh."""
+
+
 # ### Data models ###
 @dataclass(frozen=True)
 class PackedOrmMaterialSpec:
@@ -821,7 +826,9 @@ def _build_blueprint_model(
         )
 
     if not named_meshes:
-        raise ValueError("The current blueprint data does not contain usable edges.")
+        raise NoUsableBlueprintGeometryError(
+            "The current blueprint data does not contain usable edges."
+        )
 
     combined_mesh = _combine_preview_mesh_geometry(
         [_build_transformed_named_mesh_copy(named_mesh) for named_mesh in named_meshes]

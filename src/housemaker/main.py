@@ -131,6 +131,7 @@ from housemaker.glb import (
     DEFAULT_WALL_HEIGHT_METERS,
     STAIR_PART_TREADS,
     GeneratedModel,
+    NoUsableBlueprintGeometryError,
     PlacedGeneratedModel,
     PreviewStairPart,
     build_canvas_stair_part_targets,
@@ -1229,9 +1230,11 @@ class BlueprintWorkspace(QWidget):
         self.current_level_index = GROUND_LEVEL_INDEX
         self._is_syncing_level_controls = False
         self._level_transform_drag_active = False
+        self._level_transform_button_comparison_active = False
         self._pending_level_transform: _PendingLevelTransform | None = None
         self._level_transform_outline_commit_revision: int | None = None
         self._canvas_transform_drag_active = False
+        self._canvas_keyboard_comparison_direction: int | None = None
         self._canvas_transform_drag_undo_state: (
             _CanvasLevelPropertiesUndoState | None
         ) = None
@@ -3386,10 +3389,12 @@ class BlueprintWorkspace(QWidget):
             tooltip=(
                 "Generated vertex candidates at or closer than this distance are "
                 "consolidated, reusing an existing wall vertex when possible. "
-                "Opposite parallel wall faces are protected. Increase it to "
-                "remove near-duplicate vertices; 0 disables this extra merge. "
-                "Values that are too high can merge distinct nearby corners or "
-                "erase very short wall details."
+                "Existing and mirrored wall lines within this distance also anchor "
+                "nearby detections so they are not generated twice. Opposite "
+                "parallel wall faces are protected. Increase it to remove "
+                "near-duplicate geometry; 0 disables this extra alignment and "
+                "merge. Values that are too high can merge distinct nearby corners "
+                "or erase very short wall details."
             ),
         )
         plan_wall_controls_layout.addRow(
@@ -3536,6 +3541,9 @@ class BlueprintWorkspace(QWidget):
             self._handle_canvas_surface_geometry_changed
         )
         self.canvas.wall_vertex_added.connect(self._handle_canvas_wall_vertex_added)
+        self.canvas.wall_vertices_deleted.connect(
+            self._handle_canvas_wall_vertices_deleted
+        )
         self.canvas.wall_vertex_interaction_changed.connect(
             self._handle_canvas_wall_vertex_interaction_changed
         )
@@ -3555,6 +3563,9 @@ class BlueprintWorkspace(QWidget):
         )
         self.canvas.plan_image_erase_failed.connect(
             self._handle_plan_image_erase_failed
+        )
+        self.canvas.level_comparison_direction_changed.connect(
+            self._handle_canvas_level_comparison_direction_changed
         )
         self.canvas.doorway_dimension_preview_changed.connect(
             self._handle_doorway_dimension_preview_changed
@@ -12695,13 +12706,20 @@ class BlueprintWorkspace(QWidget):
         """Build render data without paying the GLB serialization cost."""
 
         try:
-            base_model = convert_to_preview_model(
-                self._build_viewer_preview_levels(),
-                stairs=self.stairs,
-                surface_materials=(
-                    self.surface_texture_generation.get_surface_material_sources()
-                ),
-            )
+            try:
+                base_model = convert_to_preview_model(
+                    self._build_viewer_preview_levels(),
+                    stairs=self.stairs,
+                    surface_materials=(
+                        self.surface_texture_generation.get_surface_material_sources()
+                    ),
+                )
+            except NoUsableBlueprintGeometryError:
+                base_model = GeneratedModel(
+                    mesh=trimesh.Trimesh(process=False),
+                    scene=trimesh.Scene(),
+                    glb_bytes=b"",
+                )
             placed_models = self._build_placed_generated_models(
                 include_excluded_levels=True
             )
@@ -12931,7 +12949,7 @@ class BlueprintWorkspace(QWidget):
         generated_model = self._viewer_preview_model
 
         if canvas_is_stale:
-            if generated_model is None:
+            if generated_model is None or not len(generated_model.mesh.faces):
                 self._set_canvas_viewer_targets(())
                 self._is_syncing_canvas_scene_selection = True
                 try:
@@ -14709,6 +14727,9 @@ class BlueprintWorkspace(QWidget):
             return
 
         if level_index != self.current_level_index:
+            self.canvas.clear_level_comparison_keys()
+            self._canvas_keyboard_comparison_direction = None
+            self._level_transform_button_comparison_active = False
             previous_level = self.current_level
             active_wall_detection = self._plan_wall_detection_runtimes.get(
                 previous_level.index
@@ -14726,7 +14747,7 @@ class BlueprintWorkspace(QWidget):
             self._commit_pending_doorway_mesh_update()
         self.current_level_index = level_index
         self._sync_level_controls()
-        self._sync_canvas_to_current_level()
+        self._sync_canvas_to_current_level(preserve_view=True)
         self._update_pending_stair_level_status()
         self._ensure_viewer_preview_current()
 
@@ -14894,18 +14915,16 @@ class BlueprintWorkspace(QWidget):
 
         if self._is_syncing_level_controls:
             return
-        needs_comparison = not self._level_transform_drag_active
         self._handle_level_transform_drag_started()
+        self._level_transform_button_comparison_active = True
         slider.setValue(slider.value() + direction * slider.singleStep())
-        if needs_comparison or self.canvas.get_level_comparison_overlay() is None:
-            self.canvas.set_level_comparison_overlay(
-                self._get_canvas_transform_comparison_level()
-            )
+        self._refresh_canvas_level_comparison_overlay()
 
     def _handle_level_transform_button_released(self) -> None:
         """End a 3D transform-button gesture and begin its delayed update."""
 
-        self.canvas.clear_level_comparison_overlay()
+        self._level_transform_button_comparison_active = False
+        self._refresh_canvas_level_comparison_overlay()
         self._handle_level_transform_drag_finished()
 
     def _handle_level_transform_drag_finished(self) -> None:
@@ -15150,9 +15169,7 @@ class BlueprintWorkspace(QWidget):
         self._canvas_transform_drag_undo_state = (
             self._capture_canvas_level_properties_undo_state(self.current_level)
         )
-        self.canvas.set_level_comparison_overlay(
-            self._get_canvas_transform_comparison_level()
-        )
+        self._refresh_canvas_level_comparison_overlay()
 
     def _handle_canvas_transform_button_pressed(
         self,
@@ -15253,12 +15270,12 @@ class BlueprintWorkspace(QWidget):
         """Finalize any active Canvas scale or translation gesture."""
 
         if not self._canvas_transform_drag_active:
-            self.canvas.clear_level_comparison_overlay()
+            self._refresh_canvas_level_comparison_overlay()
             return
         state = self._canvas_transform_drag_undo_state
         self._canvas_transform_drag_active = False
         self._canvas_transform_drag_undo_state = None
-        self.canvas.clear_level_comparison_overlay()
+        self._refresh_canvas_level_comparison_overlay()
         if state is None:
             return
         changed = (
@@ -15294,6 +15311,49 @@ class BlueprintWorkspace(QWidget):
             (level for level in self.levels if level.index == comparison_index),
             None,
         )
+
+    def _handle_canvas_level_comparison_direction_changed(
+        self,
+        direction: object,
+    ) -> None:
+        """Show the exact adjacent level requested from the 2D Canvas."""
+
+        normalized_direction = (
+            direction
+            if isinstance(direction, int)
+            and not isinstance(direction, bool)
+            and direction in (-1, 1)
+            else None
+        )
+        self._canvas_keyboard_comparison_direction = normalized_direction
+        self._refresh_canvas_level_comparison_overlay()
+
+    def _refresh_canvas_level_comparison_overlay(self) -> None:
+        """Render the highest-priority temporary level comparison."""
+
+        if (
+            self._canvas_transform_drag_active
+            or self._level_transform_button_comparison_active
+        ):
+            comparison_level = self._get_canvas_transform_comparison_level()
+        elif self._canvas_keyboard_comparison_direction is not None:
+            comparison_level = self._get_canvas_adjacent_level(
+                self._canvas_keyboard_comparison_direction
+            )
+        else:
+            comparison_level = None
+
+        if comparison_level is None:
+            self.canvas.clear_level_comparison_overlay()
+        else:
+            self.canvas.set_level_comparison_overlay(comparison_level)
+
+    def _get_canvas_adjacent_level(self, direction: int) -> LevelData | None:
+        """Return the exact upper or lower neighbor of the current level."""
+
+        if direction not in (-1, 1):
+            raise ValueError("An adjacent Canvas level direction must be -1 or 1.")
+        return self._get_level_by_index(self.current_level.index + direction)
 
     def _update_canvas_level_scale_value_label(self, value: float) -> None:
         """Keep the numeric readout adjacent to the scale bar."""
@@ -16196,6 +16256,18 @@ class BlueprintWorkspace(QWidget):
         self._pending_wall_vertex_mesh_update = True
         self._restart_pending_wall_vertex_update_if_idle()
 
+    def _handle_canvas_wall_vertices_deleted(
+        self,
+        _vertex_ids: object,
+    ) -> None:
+        """Retire deleted surfaces now and debounce their 3D mesh rebuild."""
+
+        self._pending_wall_vertex_mesh_update = True
+        self._sync_canvas_wall_mirror_state()
+        self._reconcile_surface_assignments_with_scene()
+        self._finalize_blueprint_surface_binding_undo_state()
+        self._restart_pending_wall_vertex_update_if_idle()
+
     def _handle_canvas_wall_vertex_interaction_changed(
         self,
         active: bool,
@@ -16306,12 +16378,15 @@ class BlueprintWorkspace(QWidget):
         self._is_doorway_move_drag_active = False
         self._is_doorway_resize_drag_active = False
         self._level_transform_drag_active = False
+        self._level_transform_button_comparison_active = False
         self._cancel_pending_level_transform(
             sync_controls=False,
             restore_canvas_tools=False,
         )
         self._canvas_transform_drag_active = False
+        self._canvas_keyboard_comparison_direction = None
         self._canvas_transform_drag_undo_state = None
+        self.canvas.clear_level_comparison_keys()
         self.canvas.clear_level_comparison_overlay()
         self._cancel_active_canvas_surface_edit()
         self._cancel_pending_canvas_surface_mesh_update()
@@ -16492,7 +16567,13 @@ class BlueprintWorkspace(QWidget):
         self._schedule_viewer_preview_refresh()
         self._update_plan_wall_generation_controls_state()
 
-    def _sync_canvas_to_current_level(self) -> None:
+    def _sync_canvas_to_current_level(
+        self,
+        *,
+        preserve_view: bool = False,
+    ) -> None:
+        """Display the current level, optionally retaining the shared 2D view."""
+
         self._viewer_doorways_by_level_index.setdefault(
             self.current_level.index,
             self._copy_doorways(self.current_level.doorways),
@@ -16511,6 +16592,7 @@ class BlueprintWorkspace(QWidget):
             canvas_level_scale=self.current_level.canvas_level_scale,
             canvas_offset_x_pixels=(self.current_level.canvas_offset_x_pixels),
             canvas_offset_y_pixels=(self.current_level.canvas_offset_y_pixels),
+            preserve_view=preserve_view,
         )
         if self.canvas.blueprint_image is not None:
             self.current_level.image_size_pixels = self.canvas.get_image_size_pixels()
