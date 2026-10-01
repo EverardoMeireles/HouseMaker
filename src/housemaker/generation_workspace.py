@@ -50,6 +50,8 @@ from housemaker.generation_state import (
     EXTERNAL_GLB_GENERATION_PROVIDER,
     MASK_MODE_ERASE,
     MASK_MODE_PAINT,
+    MAX_GENERATED_OBJECT_NAME_LENGTH,
+    GeneratedObjectInstance,
     GeneratedObjectPlacement,
     GeneratedObjectRecord,
     GenerationData,
@@ -192,6 +194,8 @@ INTERRUPT_POLL_SECONDS = 0.01
 SHUTDOWN_WAIT_MILLISECONDS = 250
 GENERATION_BACKEND_MESHY = "meshy"
 GENERATION_BACKEND_EXTERNAL_GLB = EXTERNAL_GLB_GENERATION_PROVIDER
+GENERATED_OBJECT_NAME_PREFIX = "object_"
+GENERATED_OBJECT_NAME_PATTERN = re.compile(r"object_(\d+)\Z", re.IGNORECASE)
 OBJECT_FACE_GEOMETRY_CACHE_MAX_ENTRIES = 16
 GEOMETRY_FINGERPRINT_DECIMALS = 6
 MESHY_REVISION_GEOMETRY = "geometry"
@@ -3296,6 +3300,7 @@ class GenerationWorkspace(QWidget):
     texture_regeneration_completed = Signal(object, object)
     generated_object_changed = Signal(object, object)
     generated_object_placement_changed = Signal(object)
+    generated_object_instances_changed = Signal(object)
     placeable_objects_changed = Signal(object)
     operation_cancelled = Signal(str, object)
     placement_requested = Signal(str)
@@ -3775,6 +3780,73 @@ class GenerationWorkspace(QWidget):
             for record in self._data.generated_objects
         }
 
+    def rename_generated_object(
+        self,
+        object_id: str,
+        object_name: str,
+    ) -> GeneratedObjectRecord | None:
+        """Rename one completed or still-placeable generated object."""
+
+        normalized_id = str(object_id).strip()
+        normalized_name = str(object_name).strip()
+        if not normalized_name:
+            raise ValueError("Generated object name cannot be empty.")
+        if len(normalized_name) > MAX_GENERATED_OBJECT_NAME_LENGTH:
+            raise ValueError("Generated object name is too long.")
+        record = self._find_generated_object_record(normalized_id)
+        matching_runtimes = tuple(
+            runtime
+            for runtime in self._object_job_runtimes.values()
+            if runtime.operation_id == normalized_id
+            or runtime.operation.committed_object_id == normalized_id
+        )
+        if record is None and not matching_runtimes:
+            raise ValueError(f"Unknown generated object ID: {normalized_id!r}.")
+
+        target_operation_ids = {
+            runtime.operation_id for runtime in matching_runtimes
+        }
+        conflicting_names = {
+            candidate.object_name.casefold()
+            for candidate in self._data.generated_objects
+            if record is None or candidate.object_id != record.object_id
+        }
+        conflicting_names.update(
+            self._active_placeable_object_name(runtime).casefold()
+            for runtime in self._object_job_runtimes.values()
+            if runtime.operation_id not in target_operation_ids
+        )
+        conflicting_names.update(
+            runtime.object_name.strip().casefold()
+            for runtime in self._external_glb_import_runtimes.values()
+            if runtime.object_name.strip()
+        )
+        if normalized_name.casefold() in conflicting_names:
+            raise ValueError(
+                f"Generated object name already exists: {normalized_name!r}."
+            )
+
+        renamed_record = record
+        record_changed = record is not None and record.object_name != normalized_name
+        if record is not None:
+            renamed_record = self._data.rename_generated_object(
+                record.object_id,
+                normalized_name,
+            )
+        runtime_changed = False
+        for runtime in matching_runtimes:
+            if runtime.requested_name != normalized_name:
+                runtime.requested_name = normalized_name
+                runtime_changed = True
+            manager = self._job_manager
+            if manager is not None and runtime.managed_job_id is not None:
+                manager.rename_job(runtime.managed_job_id, normalized_name)
+        if record_changed:
+            self._emit_data_changed()
+        if record_changed or runtime_changed:
+            self._emit_placeable_objects_changed()
+        return renamed_record
+
     def has_generated_object_texture_variants(self, object_id: str) -> bool:
         """Report whether a completed object declares generated textures."""
 
@@ -3894,7 +3966,7 @@ class GenerationWorkspace(QWidget):
         )
 
     def get_scene_bound_placeable_object_ids(self) -> tuple[str, ...]:
-        """Return completed and in-flight objects with a Canvas placement."""
+        """Return sources represented by an authored placement or an instance."""
 
         bound_ids = [
             record.object_id
@@ -3907,7 +3979,10 @@ class GenerationWorkspace(QWidget):
             if self._can_place_active_operation(runtime.operation)
             and runtime.operation.pending_placement is not None
         )
-        return tuple(bound_ids)
+        bound_ids.extend(
+            instance.source_object_id for instance in self._data.object_instances
+        )
+        return tuple(dict.fromkeys(bound_ids))
 
     def refresh_file_backed_previews(self) -> None:
         """Reload the selected Object preview only after an asset revision."""
@@ -3937,6 +4012,198 @@ class GenerationWorkspace(QWidget):
 
         record = self._find_generated_object_record(str(object_id).strip())
         return None if record is None else record.placement
+
+    def get_generated_object_instance(
+        self,
+        instance_id: str,
+    ) -> GeneratedObjectInstance | None:
+        """Return one lightweight instance by its stable scene ID."""
+
+        normalized_id = str(instance_id).strip()
+        return next(
+            (
+                instance
+                for instance in self._data.object_instances
+                if instance.instance_id == normalized_id
+            ),
+            None,
+        )
+
+    def get_generated_object_instances(
+        self,
+        source_object_id: str | None = None,
+    ) -> tuple[GeneratedObjectInstance, ...]:
+        """Return immutable instance records, optionally for one source object."""
+
+        normalized_source_id = (
+            None if source_object_id is None else str(source_object_id).strip()
+        )
+        return tuple(
+            instance
+            for instance in self._data.object_instances
+            if (
+                normalized_source_id is None
+                or instance.source_object_id == normalized_source_id
+            )
+        )
+
+    def get_scene_object_placement(
+        self,
+        scene_object_id: str,
+    ) -> GeneratedObjectPlacement | None:
+        """Resolve an authored placement or one lightweight instance placement."""
+
+        normalized_id = str(scene_object_id).strip()
+        instance = self.get_generated_object_instance(normalized_id)
+        if instance is not None:
+            return instance.placement
+        return self.get_generated_object_placement(normalized_id)
+
+    def get_scene_object_source_id(self, scene_object_id: str) -> str | None:
+        """Return the generated source object used by one scene object ID."""
+
+        normalized_id = str(scene_object_id).strip()
+        instance = self.get_generated_object_instance(normalized_id)
+        if instance is not None:
+            return instance.source_object_id
+        return (
+            normalized_id
+            if self._find_generated_object_record(normalized_id) is not None
+            else None
+        )
+
+    def add_generated_object_instance(
+        self,
+        source_object_id: str,
+        placement: GeneratedObjectPlacement,
+    ) -> GeneratedObjectInstance | None:
+        """Create one persistent instance linked to an available source object."""
+
+        normalized_source_id = str(source_object_id).strip()
+        source_record = self._find_generated_object_record(normalized_source_id)
+        if (
+            source_record is None
+            or not isinstance(placement, GeneratedObjectPlacement)
+        ):
+            return None
+        occupied_ids = {
+            record.object_id for record in self._data.generated_objects
+        } | {instance.instance_id for instance in self._data.object_instances}
+        while True:
+            instance_id = f"instance-{uuid.uuid4().hex}"
+            if instance_id not in occupied_ids:
+                break
+        instance = GeneratedObjectInstance(
+            instance_id=instance_id,
+            source_object_id=normalized_source_id,
+            placement=placement,
+        )
+        self._data.object_instances.append(instance)
+        self._emit_data_changed()
+        self.generated_object_instances_changed.emit(
+            self.get_generated_object_instances()
+        )
+        return instance
+
+    def update_generated_object_instance(
+        self,
+        instance_id: str,
+        placement: GeneratedObjectPlacement,
+        *,
+        emit_change_signals: bool = True,
+    ) -> bool:
+        """Replace one instance transform without touching its source object."""
+
+        if not isinstance(placement, GeneratedObjectPlacement):
+            return False
+        normalized_id = str(instance_id).strip()
+        instance_index = next(
+            (
+                index
+                for index, instance in enumerate(self._data.object_instances)
+                if instance.instance_id == normalized_id
+            ),
+            None,
+        )
+        if instance_index is None:
+            return False
+        existing = self._data.object_instances[instance_index]
+        if existing.placement == placement:
+            return True
+        self._data.object_instances[instance_index] = replace(
+            existing,
+            placement=placement,
+        )
+        if emit_change_signals:
+            self._emit_data_changed()
+            self.generated_object_instances_changed.emit(
+                self.get_generated_object_instances()
+            )
+        return True
+
+    def restore_generated_object_instance(
+        self,
+        instance: GeneratedObjectInstance,
+        *,
+        emit_change_signals: bool = True,
+    ) -> bool:
+        """Restore one exact instance record for Canvas undo or project repair."""
+
+        if not isinstance(instance, GeneratedObjectInstance):
+            return False
+        source = self._find_generated_object_record(instance.source_object_id)
+        if source is None:
+            return False
+        if any(
+            record.object_id == instance.instance_id
+            for record in self._data.generated_objects
+        ) or any(
+            candidate.instance_id == instance.instance_id
+            for candidate in self._data.object_instances
+        ):
+            return False
+        self._data.object_instances.append(instance)
+        if emit_change_signals:
+            self._emit_data_changed()
+            self.generated_object_instances_changed.emit(
+                self.get_generated_object_instances()
+            )
+        return True
+
+    def publish_generated_object_instance_changes(self) -> None:
+        """Publish an atomic group of instance mutations prepared by a caller."""
+
+        self._emit_data_changed()
+        self.generated_object_instances_changed.emit(
+            self.get_generated_object_instances()
+        )
+
+    def remove_generated_object_instance(
+        self,
+        instance_id: str,
+        *,
+        emit_change_signals: bool = True,
+    ) -> bool:
+        """Remove one lightweight instance while retaining its source object."""
+
+        normalized_id = str(instance_id).strip()
+        instance_index = next(
+            (
+                index
+                for index, instance in enumerate(self._data.object_instances)
+                if instance.instance_id == normalized_id
+            ),
+            None,
+        )
+        if instance_index is None:
+            return False
+        self._data.object_instances.pop(instance_index)
+        if emit_change_signals:
+            self._emit_data_changed()
+            self.generated_object_instances_changed.emit(
+                self.get_generated_object_instances()
+            )
+        return True
 
     def get_existing_object_placement_request_state(
         self,
@@ -4065,6 +4332,27 @@ class GenerationWorkspace(QWidget):
                     ),
                     _get_selected_texture_resolution(record),
                     _get_object_symmetric_division_metadata(record),
+                )
+            )
+        records_by_id = {
+            record.object_id: record for record in self._data.generated_objects
+        }
+        for instance in self._data.object_instances:
+            source_record = records_by_id.get(instance.source_object_id)
+            if source_record is None:
+                continue
+            signature.append(
+                (
+                    instance.instance_id,
+                    instance.placement,
+                    _build_generation_asset_revision(
+                        self._asset_directory,
+                        source_record.asset_path,
+                    ),
+                    _get_selected_texture_resolution(source_record),
+                    _get_object_symmetric_division_metadata(source_record),
+                    True,
+                    instance.source_object_id,
                 )
             )
         return tuple(signature)
@@ -5216,6 +5504,7 @@ class GenerationWorkspace(QWidget):
         ):
             self._finish_existing_object_placement_request()
         deleted_record = self._data.generated_objects.pop(record_index)
+        removed_instances = self._remove_instances_for_source(object_id)
         self._generated_model_cache.pop(object_id, None)
         self._generated_model_cache_revisions.pop(object_id, None)
         self._discard_object_face_geometry_cache(object_id)
@@ -5242,9 +5531,33 @@ class GenerationWorkspace(QWidget):
             self.status_label.setText(f"Deleted: {deleted_record.object_name}")
         self.generated_object_deleted.emit(deleted_record.object_id)
         self._emit_data_changed()
+        if removed_instances:
+            self.generated_object_instances_changed.emit(
+                self.get_generated_object_instances()
+            )
         self._emit_placeable_objects_changed()
         self._sync_controls()
         return True
+
+    def _remove_instances_for_source(
+        self,
+        source_object_id: str,
+    ) -> tuple[GeneratedObjectInstance, ...]:
+        """Cascade instance cleanup when its exported parent disappears."""
+
+        normalized_source_id = str(source_object_id).strip()
+        removed = tuple(
+            instance
+            for instance in self._data.object_instances
+            if instance.source_object_id == normalized_source_id
+        )
+        if removed:
+            self._data.object_instances = [
+                instance
+                for instance in self._data.object_instances
+                if instance.source_object_id != normalized_source_id
+            ]
+        return removed
 
     def set_meshy_planner(
         self,
@@ -5339,13 +5652,12 @@ class GenerationWorkspace(QWidget):
         request_count = len(requests)
         batch_id = uuid.uuid4().hex
         operation_ids: list[str] = []
+        reserved_names: list[str] = []
         for request_index, request in enumerate(requests, start=1):
-            requested_name = None
-            if request_count > 1:
-                requested_name = self._build_unique_generated_object_name(
-                    "Object from frame "
-                    f"{request.frame_index + 1} - Blob {request_index}"
-                )
+            requested_name = self._build_next_generated_object_name(
+                reserved_names
+            )
+            reserved_names.append(requested_name)
             operation_ids.append(
                 self._start_generation(
                     request,
@@ -5365,10 +5677,9 @@ class GenerationWorkspace(QWidget):
         )
         self.generation_batch_started.emit(tuple(operation_ids))
 
-    def _build_unique_generated_object_name(self, base_name: str) -> str:
-        """Keep automatically named jobs and objects distinguishable."""
+    def _reserved_generated_object_names(self) -> set[str]:
+        """Return committed and in-flight names that new objects must avoid."""
 
-        normalized_base_name = str(base_name).strip() or "Generated object"
         existing_names = {
             record.object_name.strip()
             for record in self._data.generated_objects
@@ -5385,6 +5696,33 @@ class GenerationWorkspace(QWidget):
         manager = self._job_manager
         if manager is not None:
             existing_names.update(job.name.strip() for job in manager.jobs())
+        return existing_names
+
+    def _build_next_generated_object_name(
+        self,
+        additional_reserved_names: Sequence[str] = (),
+    ) -> str:
+        """Allocate the next ``object_n`` name across active and saved objects."""
+
+        reserved_names = self._reserved_generated_object_names()
+        reserved_names.update(
+            str(name).strip() for name in additional_reserved_names
+        )
+        highest_number = max(
+            (
+                int(match.group(1))
+                for name in reserved_names
+                if (match := GENERATED_OBJECT_NAME_PATTERN.fullmatch(name))
+            ),
+            default=0,
+        )
+        return f"{GENERATED_OBJECT_NAME_PREFIX}{highest_number + 1}"
+
+    def _build_unique_generated_object_name(self, base_name: str) -> str:
+        """Keep automatically named jobs and objects distinguishable."""
+
+        normalized_base_name = str(base_name).strip() or "Generated object"
+        existing_names = self._reserved_generated_object_names()
         if normalized_base_name not in existing_names:
             return normalized_base_name
         suffix = 2
@@ -5403,6 +5741,9 @@ class GenerationWorkspace(QWidget):
     ) -> str:
         """Start one independently owned model-generation request."""
 
+        resolved_name = str(requested_name or "").strip()
+        if not resolved_name:
+            resolved_name = self._build_next_generated_object_name()
         object_id = uuid.uuid4().hex
         operation = _ActiveObjectOperation(
             kind=OBJECT_OPERATION_GENERATE_MODEL,
@@ -5422,8 +5763,8 @@ class GenerationWorkspace(QWidget):
         managed_job_id = self._create_managed_job(
             operation,
             kind=GENERATION_JOB_KIND_MODEL,
-            requested_name=requested_name,
-            default_name=f"Object from frame {request.frame_index + 1}",
+            requested_name=resolved_name,
+            default_name=resolved_name,
             stage=f"Submitting frame {request.frame_index + 1} to Meshy...",
         )
         runtime = _ObjectJobRuntime(
@@ -5432,7 +5773,7 @@ class GenerationWorkspace(QWidget):
             worker=worker,
             relay=relay,
             generation_request=request,
-            requested_name=str(requested_name or "").strip(),
+            requested_name=resolved_name,
             managed_job_id=managed_job_id,
         )
         self._register_object_job_runtime(runtime)
@@ -6870,7 +7211,7 @@ class GenerationWorkspace(QWidget):
         object_name = (
             runtime.requested_name
             if runtime is not None and runtime.requested_name
-            else result.name
+            else self._build_next_generated_object_name()
         )
         pipeline: dict[str, object] = (
             _build_safe_duplicate_removal_pipeline_metadata(result)
@@ -7123,7 +7464,7 @@ class GenerationWorkspace(QWidget):
         object_name = (
             runtime.requested_name
             if runtime is not None and runtime.requested_name
-            else result.name
+            else self._build_next_generated_object_name()
         )
         active_operation = (
             self._active_object_operation
@@ -7208,13 +7549,6 @@ class GenerationWorkspace(QWidget):
         self._emit_data_changed()
         self.generation_completed.emit(record, saved.preview_model)
         if runtime is not None and not runtime.operation.cancel_requested:
-            manager = self._job_manager
-            if (
-                not runtime.requested_name
-                and manager is not None
-                and runtime.managed_job_id is not None
-            ):
-                manager.rename_job(runtime.managed_job_id, result.name)
             self._complete_managed_job(
                 runtime,
                 f"Generated: {object_name}",

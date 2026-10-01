@@ -17,6 +17,7 @@ from PySide6.QtWidgets import QApplication
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.generation_state import (
+    GeneratedObjectInstance,
     GeneratedObjectPlacement,
     GeneratedObjectRecord,
     GenerationData,
@@ -33,7 +34,10 @@ from housemaker.level_coordinates import (
 )
 from housemaker.main import BlueprintWorkspace
 from housemaker.models import LevelData, VertexData
-from housemaker.viewer import SceneObjectPlacementCandidate
+from housemaker.viewer import (
+    PlacedObjectInstanceRequest,
+    SceneObjectPlacementCandidate,
+)
 
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
@@ -150,6 +154,348 @@ class GeneratedObjectPlacementMainTests(unittest.TestCase):
         self.workspace.generation.operation_finished.emit("operation-two")
         self.assertIsNone(self.workspace._direct_object_placement_session)
         self.assertFalse(self.workspace.viewer.is_object_placement_active)
+
+    def test_atlas_place_instance_uses_the_scene_picker_and_links_source(self) -> None:
+        level = _level(2)
+        self.workspace.levels = [level]
+        source_placement = GeneratedObjectPlacement(
+            level_index=2,
+            image_x=25.0,
+            image_y=30.0,
+            rotation_degrees=(0.0, 0.0, 35.0),
+            scale=1.5,
+            axis_scales=(1.0, 2.0, 0.75),
+        )
+        self.workspace.generation.set_data(
+            GenerationData(
+                generated_objects=[_record("chair", source_placement)]
+            )
+        )
+        source_model = _generated_model()
+        with (
+            patch.object(
+                self.workspace.generation,
+                "get_generated_object_model",
+                return_value=source_model,
+            ),
+            patch.object(self.workspace, "_ensure_viewer_preview_current"),
+        ):
+            self.workspace._handle_atlas_object_instance_place_requested("chair")
+            session = self.workspace._direct_object_placement_session
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(session.instance_source_object_id, "chair")
+            self.workspace._handle_direct_object_placement_selected(
+                session.request_id,
+                SceneObjectPlacementCandidate(
+                    level_index=2,
+                    world_positions=((1.0, 2.0, 0.5),),
+                ),
+            )
+
+        instances = self.workspace.generation.get_generated_object_instances()
+        self.assertEqual(len(instances), 1)
+        instance = instances[0]
+        self.assertEqual(instance.source_object_id, "chair")
+        self.assertEqual(
+            instance.placement.rotation_degrees,
+            source_placement.rotation_degrees,
+        )
+        self.assertEqual(instance.placement.scale, source_placement.scale)
+        self.assertEqual(instance.placement.axis_scales, source_placement.axis_scales)
+
+    def test_atlas_places_and_previews_instance_of_unplaced_source(self) -> None:
+        level = _level(2)
+        self.workspace.levels = [level]
+        self.workspace.current_level_index = 0
+        self.workspace.canvas.set_stair_context((), level)
+        self.workspace.generation.set_data(
+            GenerationData(generated_objects=[_record("chair", None)])
+        )
+        source_model = _generated_model((1.0, 2.0, 1.0))
+
+        with (
+            patch.object(
+                self.workspace.generation,
+                "get_generated_object_model",
+                return_value=source_model,
+            ),
+            patch.object(self.workspace, "_ensure_viewer_preview_current"),
+        ):
+            self.workspace._handle_atlas_object_instance_place_requested("chair")
+            session = self.workspace._direct_object_placement_session
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.workspace._handle_direct_object_placement_selected(
+                session.request_id,
+                SceneObjectPlacementCandidate(
+                    level_index=2,
+                    world_positions=((1.0, 2.0, 0.5),),
+                ),
+            )
+
+            instances = self.workspace.generation.get_generated_object_instances()
+            self.assertEqual(len(instances), 1)
+            self.assertEqual(instances[0].source_object_id, "chair")
+            self.assertEqual(
+                instances[0].placement.rotation_degrees,
+                (0.0, 0.0, 0.0),
+            )
+            self.assertEqual(instances[0].placement.scale, 1.0)
+            self.assertEqual(instances[0].placement.axis_scales, (1.0, 1.0, 1.0))
+
+            preview_models = self.workspace._build_placed_generated_models(
+                include_excluded_levels=True,
+                include_instances=True,
+            )
+            self.workspace._sync_canvas_placed_object_profiles()
+
+        self.assertEqual(len(preview_models), 1)
+        self.assertEqual(preview_models[0].object_id, instances[0].instance_id)
+        self.assertEqual(preview_models[0].source_object_id, "chair")
+        profiles = self.workspace.canvas.get_placed_object_profiles()
+        self.assertEqual(len(profiles), 1)
+        self.assertEqual(profiles[0].object_id, instances[0].instance_id)
+
+        undo_state = self.workspace._canvas_undo_stack[-1]
+        self.assertTrue(undo_state.restore_atlas_bindings)
+        with (
+            patch.object(
+                self.workspace.texture_atlas_workspace,
+                "remove_scene_texture_from_atlases",
+            ) as remove_atlas_source,
+            patch.object(
+                self.workspace,
+                "_sync_atlas_object_texture_sources",
+            ),
+        ):
+            self.workspace._restore_canvas_placed_object_undo_state(undo_state)
+
+        self.assertEqual(
+            self.workspace.generation.get_generated_object_instances("chair"),
+            (),
+        )
+        remove_atlas_source.assert_called_once_with("chair")
+
+    def test_instance_group_adds_one_canonical_source_when_source_is_placed(
+        self,
+    ) -> None:
+        level = _level(2)
+        self.workspace.levels = [level]
+        source_placement = GeneratedObjectPlacement(2, 50.0, 50.0)
+        source_record = _record("table", source_placement)
+        self.workspace.generation.set_data(
+            GenerationData(generated_objects=[source_record])
+        )
+        request = PlacedObjectInstanceRequest(
+            source_scene_object_id="table",
+            world_position=(1.5, -2.0, 0.75),
+            rotation_degrees=(0.0, 0.0, 90.0),
+            scale=1.25,
+            axis_scales=(0.5, 1.0, 2.0),
+            world_transform=trimesh.transformations.translation_matrix(
+                (1.5, -2.0, 0.75)
+            ),
+        )
+
+        self.workspace._handle_placed_object_instance_requested(request)
+
+        instances = self.workspace.generation.get_generated_object_instances()
+        self.assertEqual(len(instances), 1)
+        self.assertEqual(instances[0].source_object_id, "table")
+        self.assertEqual(instances[0].placement.scale, 1.25)
+        source_model = _generated_model()
+        base_model = _generated_model((2.0, 2.0, 1.0))
+        with (
+            patch("housemaker.main.convert_to_glb", return_value=base_model),
+            patch.object(
+                self.workspace.generation,
+                "get_generated_object_model",
+                return_value=source_model,
+            ),
+            patch(
+                "housemaker.main.compose_placed_generated_models",
+                return_value=base_model,
+            ) as compose,
+        ):
+            scene = self.workspace._build_pre_atlas_export_scene()
+
+        compose.assert_not_called()
+        self.assertIsNot(scene.model, base_model)
+        self.assertEqual(scene.placed_models, ())
+        self.assertEqual(
+            [placement.object_id for placement in scene.instance_source_models],
+            ["table"],
+        )
+        self.assertEqual(len(scene.model.scene.geometry), 2)
+        self.assertIn("Object table", scene.model.scene.graph.nodes)
+
+    def test_export_uses_instance_when_source_level_is_excluded(self) -> None:
+        self.workspace.levels = [
+            _level(1, include_in_export=False),
+            _level(2, include_in_export=True),
+        ]
+        source = _record(
+            "table",
+            GeneratedObjectPlacement(1, 25.0, 30.0),
+        )
+        self.workspace.generation.set_data(
+            GenerationData(
+                generated_objects=[source],
+                object_instances=[
+                    GeneratedObjectInstance(
+                        instance_id="table-instance",
+                        source_object_id="table",
+                        placement=GeneratedObjectPlacement(2, 50.0, 50.0),
+                    )
+                ],
+            )
+        )
+
+        with patch.object(
+            self.workspace.generation,
+            "get_generated_object_model",
+            return_value=_generated_model(),
+        ):
+            placed_models, instance_models = (
+                self.workspace._build_export_placed_models()
+            )
+
+        self.assertEqual(placed_models, ())
+        self.assertEqual(
+            [placement.object_id for placement in instance_models],
+            ["table-instance"],
+        )
+        self.assertEqual(instance_models[0].source_object_id, "table")
+
+    def test_unplaced_source_instances_add_one_canonical_library_source(
+        self,
+    ) -> None:
+        self.workspace.levels = [_level(2, include_in_export=True)]
+        source = _record("table", None)
+        instance = GeneratedObjectInstance(
+            instance_id="table-instance",
+            source_object_id="table",
+            placement=GeneratedObjectPlacement(2, 50.0, 50.0),
+        )
+        self.workspace.generation.set_data(
+            GenerationData(
+                generated_objects=[source],
+                object_instances=[instance],
+            )
+        )
+        source_model = _generated_model()
+        base_model = GeneratedModel(
+            mesh=trimesh.Trimesh(process=False),
+            scene=trimesh.Scene(),
+            glb_bytes=b"empty-house-glb",
+        )
+        with (
+            patch("housemaker.main.convert_to_glb", return_value=base_model),
+            patch.object(
+                self.workspace.generation,
+                "get_generated_object_model",
+                return_value=source_model,
+            ),
+            patch(
+                "housemaker.main.compose_placed_generated_models",
+                return_value=base_model,
+            ) as compose,
+        ):
+            scene = self.workspace._build_pre_atlas_export_scene()
+
+        self.assertEqual(scene.placed_models, ())
+        self.assertIsNot(scene.model, base_model)
+        compose.assert_not_called()
+        self.assertEqual(
+            [
+                str(placement.source_object_id)
+                for placement in scene.instance_source_models
+            ],
+            ["table"],
+        )
+        self.assertEqual(len(scene.model.scene.geometry), 1)
+        self.assertIn("Object table", scene.model.scene.graph.nodes)
+
+    def test_ao_snapshot_uses_one_representative_json_instance(
+        self,
+    ) -> None:
+        self.workspace.levels = [_level(2, include_in_export=True)]
+        self.workspace.generation.set_data(
+            GenerationData(generated_objects=[_record("chair", None)])
+        )
+        carrier_placement = GeneratedObjectPlacement(2, 20.0, 30.0)
+        other_placement = GeneratedObjectPlacement(2, 80.0, 70.0)
+        asset_revision = ("chair.glb", 10, 20, 30)
+        dependency_signature = (
+            (),
+            (
+                (
+                    "instance-z",
+                    other_placement,
+                    asset_revision,
+                    1024,
+                    None,
+                    True,
+                    "chair",
+                ),
+                (
+                    "instance-a",
+                    carrier_placement,
+                    asset_revision,
+                    1024,
+                    None,
+                    True,
+                    "chair",
+                ),
+            ),
+            (),
+        )
+
+        snapshot = self.workspace._capture_surface_ao_scene_snapshot(
+            dependency_signature
+        )
+
+        self.assertEqual(len(snapshot.placed_models), 1)
+        carrier = snapshot.placed_models[0]
+        self.assertEqual(carrier.object_id, "chair")
+        self.assertEqual(carrier.object_name, "Object chair")
+        expected_x, expected_y = level_image_to_world_xy(
+            self.workspace.levels[0],
+            carrier_placement.image_x,
+            carrier_placement.image_y,
+        )
+        expected_z = build_level_base_z_lookup(self.workspace.levels)[2]
+        self.assertEqual(
+            carrier.world_position,
+            (expected_x, expected_y, expected_z),
+        )
+        self.assertIn("chair", snapshot.required_source_ids)
+
+    def test_draw_call_snapshot_tracks_json_instance_sources(self) -> None:
+        self.workspace.levels = [_level(2)]
+        source = _record(
+            "chair",
+            GeneratedObjectPlacement(2, 25.0, 30.0),
+        )
+        self.workspace.generation.set_data(
+            GenerationData(
+                generated_objects=[source],
+                object_instances=[
+                    GeneratedObjectInstance(
+                        instance_id="chair-instance",
+                        source_object_id="chair",
+                        placement=GeneratedObjectPlacement(2, 50.0, 50.0),
+                    )
+                ],
+            )
+        )
+
+        _scene_snapshot, _atlases, snapshot = (
+            self.workspace._capture_atlas_draw_call_estimate_request()
+        )
+
+        self.assertEqual(snapshot.instance_source_ids, ("chair",))
 
     def test_top_down_footprint_includes_scale_rotation_and_mirrored_half(
         self,
@@ -1042,6 +1388,26 @@ class GeneratedObjectPlacementMainTests(unittest.TestCase):
                 model,
             )
             refresh.assert_not_called()
+
+            self.workspace.generation.set_data(
+                GenerationData(
+                    generated_objects=[unplaced_record],
+                    object_instances=[
+                        GeneratedObjectInstance(
+                            instance_id="unplaced-instance",
+                            source_object_id="unplaced",
+                            placement=GeneratedObjectPlacement(2, 30.0, 40.0),
+                        )
+                    ],
+                )
+            )
+            refresh.reset_mock()
+            self.workspace._handle_generated_object_changed_for_canvas(
+                unplaced_record,
+                model,
+            )
+            refresh.assert_called_once_with(preserve_camera=True)
+            refresh.reset_mock()
 
             self.workspace._handle_generated_object_completed_for_canvas(
                 placed_record,

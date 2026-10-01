@@ -126,6 +126,27 @@ class AtlasDrawCallEstimatorTests(unittest.TestCase):
         self.assertEqual(estimate.atlas_batch_count, 1)
         self.assertEqual(estimate.exported_count, 1)
 
+    def test_instance_source_stays_separate_from_shared_atlas_batch(self) -> None:
+        scene = trimesh.Scene()
+        scene.add_geometry(_mesh(object_id="chair"), node_name="chair")
+        scene.add_geometry(_mesh(object_id="table"), node_name="table")
+        atlas = TextureAtlasRecord(
+            atlas_id="furniture",
+            name="Furniture",
+            resolution=2048,
+            placements=[_placement("chair"), _placement("table", x=512)],
+        )
+
+        estimate = estimate_texture_atlas_draw_calls(
+            _model(scene),
+            (atlas,),
+            instance_source_ids=("chair",),
+        )
+
+        self.assertEqual(estimate.atlas_batch_count, 1)
+        self.assertEqual(estimate.passthrough_primitive_count, 1)
+        self.assertEqual(estimate.exported_count, 2)
+
     def test_half_glass_and_passthrough_groups_remain_independent(self) -> None:
         scene = trimesh.Scene()
         scene.add_geometry(_mesh(object_id="ordinary"), node_name="ordinary")

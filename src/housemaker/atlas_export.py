@@ -28,6 +28,8 @@ from housemaker.glb import (
     GLTF_Y_UP_TO_Z_UP_TRANSFORM,
     HALF_MESH_EXTRAS_KEY,
     HALF_NODE_NAME_PREFIX,
+    INSTANCE_SOURCE_ID_METADATA_KEY,
+    INSTANCE_SOURCE_NAME_METADATA_KEY,
     PACKED_ORM_AO_UV_ATTRIBUTE,
     GeneratedModel,
     PackedOrmMaterialSpec,
@@ -367,18 +369,40 @@ class _PendingAtlasPart:
     ) = None
 
 
+@dataclass(frozen=True)
+class _InstanceSourcePart:
+    """One canonical runtime-source fragment retained outside Atlas batches."""
+
+    fragment: trimesh.Trimesh
+    world_transform: np.ndarray
+    source_id: str
+    root_name: str
+    node_metadata: dict[str, object]
+    atlas_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _PendingInstanceSourcePart:
+    """One Atlas-bound runtime-source fragment awaiting UV remapping."""
+
+    pending: _PendingAtlasPart
+    root_name: str
+
+
 # ### Public export helpers ###
 def estimate_texture_atlas_draw_calls(
     model: GeneratedModel,
     atlases: Sequence[TextureAtlasRecord],
     *,
     surface_source_ids: Mapping[str, str] | None = None,
+    instance_source_ids: Sequence[str] = (),
 ) -> AtlasDrawCallEstimate:
     """Estimate the exporter output without remapping UVs or loading images.
 
     Ordinary opaque geometry is flattened to one primitive per used Atlas.
-    Half meshes, glass, and non-Atlas passthrough groups remain independent,
-    matching :func:`apply_texture_atlases_to_export` routing.
+    Half meshes, glass, JSON-instance sources, and non-Atlas passthrough groups
+    remain independent. Instance-source accounting is estimator-only; their
+    source roots are detached from the GLB's default render scene.
     """
 
     if not isinstance(model, GeneratedModel):
@@ -394,6 +418,18 @@ def estimate_texture_atlas_draw_calls(
         str(surface_id): str(source_id)
         for surface_id, source_id in (surface_source_ids or {}).items()
     }
+    if isinstance(instance_source_ids, (str, bytes, bytearray)):
+        raise TypeError("Instance source IDs must be provided as a collection.")
+    try:
+        normalized_instance_source_ids = frozenset(
+            source_id
+            for value in instance_source_ids
+            if (source_id := str(value).strip())
+        )
+    except TypeError as error:
+        raise TypeError(
+            "Instance source IDs must be provided as a collection."
+        ) from error
     atlas_id_by_source_id: dict[str, str] = {}
     for atlas in normalized_atlases:
         for placement in atlas.placements:
@@ -420,6 +456,8 @@ def estimate_texture_atlas_draw_calls(
                 half_primitive_count += 1
             elif is_housemaker_glass_material(material):
                 glass_primitive_count += 1
+            elif source_id in normalized_instance_source_ids:
+                passthrough_primitive_count += 1
             elif atlas_id is not None:
                 used_atlas_ids.add(atlas_id)
             else:
@@ -681,6 +719,9 @@ def _apply_texture_atlases_to_export(
     pending_atlas_parts: dict[str, list[_PendingAtlasPart]] = {
         item.atlas.atlas_id: [] for item in normalized_atlases
     }
+    pending_instance_source_parts: list[_PendingInstanceSourcePart] = []
+    instance_source_parts: dict[str, list[_InstanceSourcePart]] = {}
+    instance_source_names: dict[str, str] = {}
     opaque_occluders: list[trimesh.Trimesh] = []
     object_ao_source_ids = {
         placement.object_id
@@ -725,6 +766,21 @@ def _apply_texture_atlases_to_export(
             geometry,
             normalized_surface_sources,
         )
+        instance_source_context = _resolve_instance_source_context(geometry)
+        if instance_source_context is not None:
+            instance_source_id, instance_source_name = instance_source_context
+            previous_name = instance_source_names.setdefault(
+                instance_source_id,
+                instance_source_name,
+            )
+            if previous_name != instance_source_name:
+                raise ValueError(
+                    "One instance source cannot use multiple exported root names."
+                )
+            instance_source_parts.setdefault(instance_source_id, [])
+        else:
+            instance_source_id = None
+            instance_source_name = None
         binding = bindings.get(source_id) if source_id is not None else None
         half_context = half_context_by_node.get(node_name)
         node_metadata = _get_scene_node_metadata(model.scene, node_name)
@@ -735,7 +791,11 @@ def _apply_texture_atlases_to_export(
             fragment = _build_face_fragment(geometry, face_indices, material)
             is_glass = is_housemaker_glass_material(material)
             mirror_plane = None
-            if has_any_ao_receiver and not is_glass:
+            if (
+                has_any_ao_receiver
+                and not is_glass
+                and instance_source_id is None
+            ):
                 world_occluder = _build_world_occluder(
                     fragment,
                     world_transform,
@@ -752,22 +812,30 @@ def _apply_texture_atlases_to_export(
                 atlas_item, placement = binding
                 atlas_id = atlas_item.atlas.atlas_id
                 assert source_id is not None
-                pending_atlas_parts[atlas_id].append(
-                    _PendingAtlasPart(
-                        receiver_key=(
-                            f"{atlas_id}:{node_name!s}:{material_group_index}:"
-                            f"{len(pending_atlas_parts[atlas_id])}"
-                        ),
-                        fragment=fragment,
-                        world_transform=world_transform,
-                        source_id=source_id,
-                        is_surface=is_surface,
-                        placement=placement,
-                        half_context=half_context,
-                        node_metadata=node_metadata,
-                        mirror_plane=mirror_plane,
-                    )
+                pending = _PendingAtlasPart(
+                    receiver_key=(
+                        f"{atlas_id}:{node_name!s}:{material_group_index}:"
+                        f"{len(pending_atlas_parts[atlas_id])}"
+                    ),
+                    fragment=fragment,
+                    world_transform=world_transform,
+                    source_id=source_id,
+                    is_surface=is_surface,
+                    placement=placement,
+                    half_context=half_context,
+                    node_metadata=node_metadata,
+                    mirror_plane=mirror_plane,
                 )
+                if instance_source_id is None:
+                    pending_atlas_parts[atlas_id].append(pending)
+                else:
+                    assert instance_source_name is not None
+                    pending_instance_source_parts.append(
+                        _PendingInstanceSourcePart(
+                            pending=pending,
+                            root_name=instance_source_name,
+                        )
+                    )
                 continue
 
             if is_glass:
@@ -776,6 +844,18 @@ def _apply_texture_atlases_to_export(
                     material,
                     shared_glass_materials,
                 )
+            if instance_source_id is not None:
+                assert instance_source_name is not None
+                instance_source_parts[instance_source_id].append(
+                    _InstanceSourcePart(
+                        fragment=fragment,
+                        world_transform=world_transform,
+                        source_id=instance_source_id,
+                        root_name=instance_source_name,
+                        node_metadata=node_metadata,
+                    )
+                )
+                continue
             if half_context is not None:
                 half_parts_by_marker[half_context.source_marker_name].append(
                     _HalfModelPart(
@@ -859,6 +939,36 @@ def _apply_texture_atlases_to_export(
                 object_ao_targets=object_ao_targets,
             )
 
+    for pending_source in pending_instance_source_parts:
+        pending = pending_source.pending
+        binding = bindings.get(pending.source_id)
+        if binding is None:
+            raise ValueError("An instance-source Atlas binding disappeared.")
+        atlas_item, _placement = binding
+        atlas_id = atlas_item.atlas.atlas_id
+        try:
+            remapped = _remap_fragment_to_atlas(
+                pending.fragment,
+                pending.placement,
+                atlas_item.atlas.resolution,
+                repeat_source_uvs=False,
+            )
+        except ValueError as error:
+            raise ValueError(
+                f"Atlas source {pending.source_id!r} cannot share its "
+                f"material: {error}"
+            ) from error
+        instance_source_parts[pending.source_id].append(
+            _InstanceSourcePart(
+                fragment=remapped,
+                world_transform=pending.world_transform,
+                source_id=pending.source_id,
+                root_name=pending_source.root_name,
+                node_metadata=pending.node_metadata,
+                atlas_id=atlas_id,
+            )
+        )
+
     active_object_ao_targets = {
         atlas_id: tuple(targets)
         for atlas_id, targets in object_ao_targets.items()
@@ -894,6 +1004,16 @@ def _apply_texture_atlases_to_export(
         )
         half_model_count += 1
 
+    instance_source_count = _append_instance_source_models_to_scene(
+        output_scene,
+        instance_source_parts,
+        instance_source_names,
+        occupied_names,
+        materialized_by_id,
+        atlas_materials,
+        ambient_occlusion_by_atlas,
+    )
+
     batched_count = 0
     for atlas_id, parts in atlas_parts.items():
         if not parts:
@@ -920,7 +1040,11 @@ def _apply_texture_atlases_to_export(
         )
         batched_count += 1
 
-    if batched_count == 0 and half_model_count == 0:
+    if (
+        batched_count == 0
+        and half_model_count == 0
+        and instance_source_count == 0
+    ):
         return model, surface_ao_bakes
     packed_orm_material_names: dict[str, str | PackedOrmMaterialSpec] = {}
     atlas_texture_material_names: dict[str, str] = {}
@@ -1054,6 +1178,101 @@ def _get_scene_node_metadata(
     if not isinstance(raw_metadata, Mapping):
         return {}
     return copy.deepcopy(dict(raw_metadata))
+
+
+def _resolve_instance_source_context(
+    geometry: trimesh.Trimesh,
+) -> tuple[str, str] | None:
+    """Read the canonical runtime-source marker copied onto one geometry."""
+
+    metadata = getattr(geometry, "metadata", {})
+    if not isinstance(metadata, Mapping):
+        return None
+    raw_source_id = metadata.get(INSTANCE_SOURCE_ID_METADATA_KEY)
+    raw_root_name = metadata.get(INSTANCE_SOURCE_NAME_METADATA_KEY)
+    if raw_source_id is None and raw_root_name is None:
+        return None
+    source_id = str(raw_source_id).strip()
+    root_name = str(raw_root_name).strip()
+    if not source_id or not root_name:
+        raise ValueError("An instance-source geometry marker is incomplete.")
+    object_id = str(metadata.get(OBJECT_ID_METADATA_KEY, "")).strip()
+    if object_id != source_id:
+        raise ValueError("An instance-source geometry has a mismatched source ID.")
+    return source_id, root_name
+
+
+def _append_instance_source_models_to_scene(
+    output_scene: trimesh.Scene,
+    parts_by_source_id: Mapping[str, Sequence[_InstanceSourcePart]],
+    source_names: Mapping[str, str],
+    occupied_names: set[str],
+    materialized_by_id: Mapping[str, MaterializedTextureAtlas],
+    material_cache: dict[str, PBRMaterial],
+    ambient_occlusion_by_atlas: Mapping[str, np.ndarray],
+) -> int:
+    """Emit marked source roots while sharing the scene's Atlas materials."""
+
+    emitted_count = 0
+    for source_id in sorted(parts_by_source_id):
+        parts = tuple(parts_by_source_id[source_id])
+        if not parts:
+            continue
+        root_name = source_names.get(source_id)
+        if root_name is None or any(part.root_name != root_name for part in parts):
+            raise ValueError("An instance source has inconsistent root metadata.")
+        if root_name in occupied_names:
+            raise ValueError(
+                f"The instance source node name {root_name!r} is already used in "
+                "the exported scene. Rename the object before exporting."
+            )
+        occupied_names.add(root_name)
+        output_scene.graph.update(
+            frame_to=root_name,
+            frame_from=output_scene.graph.base_frame,
+            matrix=np.eye(4, dtype=float),
+            metadata={
+                INSTANCE_SOURCE_ID_METADATA_KEY: source_id,
+                INSTANCE_SOURCE_NAME_METADATA_KEY: root_name,
+            },
+        )
+
+        for part_index, part in enumerate(parts, start=1):
+            fragment = part.fragment
+            if part.atlas_id is not None:
+                atlas_item = materialized_by_id[part.atlas_id]
+                material = _get_atlas_material(
+                    atlas_item,
+                    material_cache,
+                    ambient_occlusion_by_atlas,
+                )
+                fragment.visual = TextureVisuals(
+                    uv=_optional_valid_uv(fragment),
+                    material=material,
+                )
+            child_metadata = copy.deepcopy(part.node_metadata)
+            child_metadata.pop(INSTANCE_SOURCE_ID_METADATA_KEY, None)
+            child_metadata.pop(INSTANCE_SOURCE_NAME_METADATA_KEY, None)
+            is_half = isinstance(
+                child_metadata.get(HALF_MESH_EXTRAS_KEY),
+                Mapping,
+            )
+            preferred_name = (
+                f"{HALF_NODE_NAME_PREFIX}{root_name}_part_{part_index}"
+                if is_half
+                else f"instance_source_{source_id}_part_{part_index}"
+            )
+            child_name = _reserve_name(preferred_name, occupied_names)
+            output_scene.geometry[child_name] = fragment
+            output_scene.graph.update(
+                frame_to=child_name,
+                frame_from=root_name,
+                matrix=_normalize_transform(part.world_transform),
+                geometry=child_name,
+                metadata=child_metadata or None,
+            )
+        emitted_count += 1
+    return emitted_count
 
 
 def _resolve_half_mirror_plane(

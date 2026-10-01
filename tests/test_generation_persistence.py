@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from housemaker.generation_state import (
+    GeneratedObjectInstance,
     GeneratedObjectPlacement,
     GeneratedObjectRecord,
     GenerationData,
@@ -36,6 +37,47 @@ def _write_payload(project_path: Path, payload: dict[str, object]) -> None:
 
 # ### Generation-state persistence tests ###
 class GenerationStatePersistenceTests(unittest.TestCase):
+    def test_generated_object_rename_preserves_ids_instances_and_persistence(
+        self,
+    ) -> None:
+        first = GeneratedObjectRecord(
+            object_id="chair-source",
+            frame_index=0,
+            object_name="Chair",
+            provider="external_glb",
+            pipeline={},
+            asset_path="chair.glb",
+        )
+        second = GeneratedObjectRecord(
+            object_id="table-source",
+            frame_index=0,
+            object_name="Table",
+            provider="external_glb",
+            pipeline={},
+            asset_path="table.glb",
+        )
+        instance = GeneratedObjectInstance(
+            instance_id="chair-instance",
+            source_object_id=first.object_id,
+            placement=GeneratedObjectPlacement(2, 10.0, 20.0),
+        )
+        data = GenerationData(
+            generated_objects=[first, second],
+            object_instances=[instance],
+        )
+
+        renamed = data.rename_generated_object(first.object_id, " Lounge chair ")
+
+        self.assertEqual(renamed.object_name, "Lounge chair")
+        self.assertEqual(renamed.object_id, first.object_id)
+        self.assertEqual(data.object_instances, [instance])
+        restored = GenerationData.from_dict(data.to_dict())
+        self.assertEqual(restored.generated_objects[0].object_name, "Lounge chair")
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            data.rename_generated_object(first.object_id, "table")
+        with self.assertRaisesRegex(ValueError, "Unknown generated object"):
+            data.rename_generated_object("missing", "Other")
+
     def test_generation_data_round_trips_masks_and_meshy_generated_objects(
         self,
     ) -> None:
@@ -101,6 +143,28 @@ class GenerationStatePersistenceTests(unittest.TestCase):
                         }
                     },
                     asset_path="external-table.imported.glb",
+                ),
+            ],
+            object_instances=[
+                GeneratedObjectInstance(
+                    instance_id="instance-armchair-2",
+                    source_object_id="armchair-frame-91",
+                    placement=GeneratedObjectPlacement(
+                        level_index=2,
+                        image_x=360.0,
+                        image_y=240.0,
+                        rotation_degrees=(0.0, 0.0, 45.0),
+                        scale=1.25,
+                    ),
+                ),
+                GeneratedObjectInstance(
+                    instance_id="instance-external-table-1",
+                    source_object_id="external-table",
+                    placement=GeneratedObjectPlacement(
+                        level_index=2,
+                        image_x=80.0,
+                        image_y=140.0,
+                    ),
                 ),
             ],
         )

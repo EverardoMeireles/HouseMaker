@@ -72,6 +72,24 @@ def _assignment() -> SurfaceTextureAssignment:
 
 # ### State round-trip tests ###
 class SurfaceTextureStateRoundTripTests(unittest.TestCase):
+    def test_surface_texture_rename_preserves_assignment_identity_and_pixels(
+        self,
+    ) -> None:
+        assignment = _assignment()
+        data = SurfaceTextureData(assignments=[assignment])
+
+        renamed = data.rename_assignment(assignment.assignment_id, " White plaster ")
+
+        self.assertEqual(renamed.display_name, "White plaster")
+        self.assertEqual(renamed.assignment_id, assignment.assignment_id)
+        self.assertEqual(renamed.asset_path, assignment.asset_path)
+        restored = SurfaceTextureData.from_dict(data.to_dict())
+        self.assertEqual(restored.assignments[0].display_name, "White plaster")
+        with self.assertRaisesRegex(ValueError, "cannot be empty"):
+            data.rename_assignment(assignment.assignment_id, "   ")
+        with self.assertRaisesRegex(ValueError, "Unknown surface texture"):
+            data.rename_assignment("missing", "Brick")
+
     def test_video_enclosed_fill_action_round_trips(self) -> None:
         fill = MaskStroke(
             mode=MASK_MODE_PAINT,

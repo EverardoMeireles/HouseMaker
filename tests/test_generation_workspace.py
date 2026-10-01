@@ -32,6 +32,7 @@ from housemaker.generation_jobs import (
 from housemaker.generation_state import (
     MASK_MODE_ERASE,
     MASK_MODE_PAINT,
+    GeneratedObjectInstance,
     GeneratedObjectPlacement,
     GeneratedObjectRecord,
     GenerationData,
@@ -2060,8 +2061,8 @@ class GenerationWorkspaceTests(unittest.TestCase):
             self.assertEqual(
                 tuple(call.kwargs["requested_name"] for call in calls),
                 (
-                    "Object from frame 1 - Blob 1",
-                    "Object from frame 1 - Blob 2",
+                    "object_1",
+                    "object_2",
                 ),
             )
             self.assertEqual(
@@ -2084,6 +2085,91 @@ class GenerationWorkspaceTests(unittest.TestCase):
                     for request in requests
                 )
             )
+
+    def test_generated_objects_ignore_provider_names_and_increment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            self.workspace._asset_directory = Path(temporary_directory)
+
+            self.workspace._handle_generation_succeeded(
+                _test_meshy_result("Provider chair"),
+                _test_model(),
+            )
+            self.workspace._handle_generation_succeeded(
+                _test_meshy_result("Provider table"),
+                _test_model(),
+            )
+
+        self.assertEqual(
+            tuple(
+                record.object_name
+                for record in self.workspace.get_data().generated_objects
+            ),
+            ("object_1", "object_2"),
+        )
+
+    def test_next_generated_object_name_uses_saved_and_active_numbers(
+        self,
+    ) -> None:
+        self.workspace._data.generated_objects.append(
+            GeneratedObjectRecord(
+                object_id="saved-object",
+                frame_index=0,
+                object_name="object_4",
+                pipeline={},
+                provider=GENERATION_BACKEND_MESHY,
+                provider_task_id="saved-task",
+                asset_path="saved.glb",
+            )
+        )
+        active_runtime = Mock(requested_name="object_9")
+        self.workspace._object_job_runtimes["active-operation"] = active_runtime
+
+        self.assertEqual(
+            self.workspace._build_next_generated_object_name(),
+            "object_10",
+        )
+
+        self.workspace._object_job_runtimes.clear()
+
+    def test_next_generated_object_name_matches_names_case_insensitively(
+        self,
+    ) -> None:
+        self.workspace._data.generated_objects.append(
+            GeneratedObjectRecord(
+                object_id="manually-renamed-object",
+                frame_index=0,
+                object_name="Object_4",
+                pipeline={},
+                provider=GENERATION_BACKEND_MESHY,
+                provider_task_id="renamed-task",
+                asset_path="renamed.glb",
+            )
+        )
+
+        self.assertEqual(
+            self.workspace._build_next_generated_object_name(),
+            "object_5",
+        )
+
+    def test_active_generated_object_can_be_renamed_before_commit(self) -> None:
+        runtime = Mock(
+            operation_id="active-operation",
+            operation=Mock(committed_object_id=None),
+            requested_name="object_1",
+            managed_job_id=None,
+        )
+        self.workspace._object_job_runtimes[runtime.operation_id] = runtime
+        catalog_changed = QSignalSpy(self.workspace.placeable_objects_changed)
+
+        renamed = self.workspace.rename_generated_object(
+            runtime.operation_id,
+            "Dining chair",
+        )
+
+        self.assertIsNone(renamed)
+        self.assertEqual(runtime.requested_name, "Dining chair")
+        self.assertEqual(catalog_changed.count(), 1)
+        self.workspace._object_job_runtimes.clear()
 
     def test_started_generation_batch_emits_ordered_placeable_ids(self) -> None:
         first_request = GenerationRequest(
@@ -3459,6 +3545,51 @@ class GeneratedObjectDeletionTests(unittest.TestCase):
         _qt_application.processEvents()
         return records
 
+    def test_rename_generated_object_refreshes_catalog_and_persists(self) -> None:
+        self._set_generated_objects(
+            [
+                ("chair", "Chair", (180, 30, 20, 255)),
+                ("table", "Table", (30, 180, 20, 255)),
+            ]
+        )
+        data_changed = QSignalSpy(self.workspace.data_changed)
+        catalog_changed = QSignalSpy(self.workspace.placeable_objects_changed)
+
+        renamed = self.workspace.rename_generated_object(
+            "chair",
+            " Lounge chair ",
+        )
+
+        assert renamed is not None
+        self.assertEqual(renamed.object_name, "Lounge chair")
+        self.assertEqual(
+            self.workspace.get_generated_object_names_by_id()["chair"],
+            "Lounge chair",
+        )
+        self.assertEqual(data_changed.count(), 1)
+        self.assertEqual(catalog_changed.count(), 1)
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            self.workspace.rename_generated_object("chair", "TABLE")
+        self.assertEqual(data_changed.count(), 1)
+        self.assertEqual(catalog_changed.count(), 1)
+
+    def test_rename_generated_object_reserves_active_import_names(self) -> None:
+        self._set_generated_objects(
+            [("chair", "Chair", (180, 30, 20, 255))]
+        )
+        self.workspace._external_glb_import_runtimes["active-import"] = Mock(
+            object_name="Incoming cabinet"
+        )
+
+        try:
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                self.workspace.rename_generated_object(
+                    "chair",
+                    "incoming CABINET",
+                )
+        finally:
+            self.workspace._external_glb_import_runtimes.clear()
+
     def test_remove_placement_retains_generated_record_and_assets(self) -> None:
         records = self._set_generated_objects(
             [("chair", "Chair", (180, 30, 20, 255))]
@@ -3494,6 +3625,45 @@ class GeneratedObjectDeletionTests(unittest.TestCase):
         self.assertFalse(
             self.workspace.remove_generated_object_placement("chair")
         )
+
+    def test_remove_source_placement_retains_its_linked_instances(self) -> None:
+        records = self._set_generated_objects(
+            [("chair", "Chair", (180, 30, 20, 255))]
+        )
+        source_placement = GeneratedObjectPlacement(2, 25.0, 40.0)
+        instance = GeneratedObjectInstance(
+            instance_id="chair-instance",
+            source_object_id="chair",
+            placement=GeneratedObjectPlacement(2, 75.0, 40.0),
+        )
+        self.workspace.set_data(
+            GenerationData(
+                generated_objects=[
+                    replace(records[0], placement=source_placement)
+                ],
+                object_instances=[instance],
+            )
+        )
+        instances_changed = QSignalSpy(
+            self.workspace.generated_object_instances_changed
+        )
+
+        self.assertTrue(
+            self.workspace.remove_generated_object_placement("chair")
+        )
+
+        self.assertIsNone(
+            self.workspace.get_generated_object_placement("chair")
+        )
+        self.assertEqual(
+            self.workspace.get_generated_object_instances("chair"),
+            (instance,),
+        )
+        self.assertEqual(
+            self.workspace.get_scene_bound_placeable_object_ids(),
+            ("chair",),
+        )
+        self.assertEqual(instances_changed.count(), 0)
 
     def test_delete_selects_successor_then_previous_for_the_last_row(
         self,

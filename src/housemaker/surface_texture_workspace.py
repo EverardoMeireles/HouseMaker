@@ -801,6 +801,18 @@ class SurfaceTextureGenerationWorkspace(QWidget):
         self._store_viewer_state()
         return self._data.clone()
 
+    def rename_assignment(
+        self,
+        assignment_id: str,
+        display_name: str,
+    ) -> SurfaceTextureAssignment:
+        """Rename one persisted surface texture and refresh shared consumers."""
+
+        renamed = self._data.rename_assignment(assignment_id, display_name)
+        self._emit_data_changed()
+        self.surface_content_changed.emit()
+        return renamed
+
     # ### Shared scene selection API ###
     def set_scene_surface_selection(
         self,

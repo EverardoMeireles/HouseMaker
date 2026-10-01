@@ -26,6 +26,7 @@ from trimesh.visual.texture import TextureVisuals
 
 from housemaker.app_settings import ApplicationSettingsStore
 from housemaker.generation_state import (
+    GeneratedObjectInstance,
     GeneratedObjectPlacement,
     GeneratedObjectRecord,
     GenerationData,
@@ -459,6 +460,65 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             hasattr(self.workspace.generation, "delete_generated_object_button")
         )
 
+    def test_atlas_object_inline_rename_updates_generation_state(self) -> None:
+        record = GeneratedObjectRecord(
+            object_id="rename-object",
+            frame_index=0,
+            object_name="object_1",
+            pipeline={},
+            provider_task_id="rename-object-task",
+            asset_path="rename-object.glb",
+        )
+        self.workspace.generation._data.generated_objects = [record]
+        self.workspace._atlas_generation_signature = None
+        self.workspace._sync_atlas_object_texture_sources()
+
+        self.workspace.texture_atlas_workspace.object_rename_requested.emit(
+            record.object_id,
+            "Dining table",
+        )
+
+        renamed = self.workspace.generation.get_data().generated_objects[0]
+        self.assertEqual(renamed.object_name, "Dining table")
+        self.assertEqual(
+            self.workspace.texture_atlas_workspace._placeable_objects_by_id[
+                record.object_id
+            ],
+            "Dining table",
+        )
+
+    def test_atlas_surface_inline_rename_updates_surface_state(self) -> None:
+        assignment = replace(
+            _wall_texture_assignment(
+                self.settings.path.parent / "surface_textures",
+                assignment_id="rename-surface",
+            ),
+            display_name="Original wall",
+        )
+        self.workspace.surface_texture_generation.set_data(
+            SurfaceTextureData(assignments=[assignment])
+        )
+        self.workspace._atlas_generation_signature = None
+        self.workspace._sync_atlas_object_texture_sources()
+        source_id = build_atlas_wall_texture_source_id(assignment.assignment_id)
+
+        self.workspace.texture_atlas_workspace.surface_texture_rename_requested.emit(
+            source_id,
+            "Limestone wall",
+        )
+
+        renamed = self.workspace.surface_texture_generation.get_assignment(
+            assignment.assignment_id
+        )
+        assert renamed is not None
+        self.assertEqual(renamed.display_name, "Limestone wall")
+        self.assertEqual(
+            self.workspace.texture_atlas_workspace
+            ._surface_texture_entries_by_id[source_id]
+            .display_name,
+            "Limestone wall",
+        )
+
     def test_atlas_external_glb_import_cancel_does_not_start_processing(
         self,
     ) -> None:
@@ -829,6 +889,116 @@ class TextureAtlasMainIntegrationTests(unittest.TestCase):
             [call(None), call(record.object_id)],
         )
         request_placement.assert_called_once_with(record.object_id)
+
+    def test_atlas_object_selection_selects_source_and_all_linked_instances(
+        self,
+    ) -> None:
+        source_id = "instanced-chair"
+        record = _generated_object_record_with_variants(
+            self.settings.path.parent / "generated",
+            object_id=source_id,
+            object_name="Instanced chair",
+            resolutions=(512,),
+            selected_resolution=512,
+            placement=GeneratedObjectPlacement(
+                level_index=self.workspace.current_level.index,
+                image_x=12.0,
+                image_y=18.0,
+            ),
+        )
+        instances = tuple(
+            GeneratedObjectInstance(
+                instance_id=instance_id,
+                source_object_id=source_id,
+                placement=GeneratedObjectPlacement(
+                    level_index=self.workspace.current_level.index,
+                    image_x=image_x,
+                    image_y=24.0,
+                ),
+            )
+            for instance_id, image_x in (
+                ("chair-instance-a", 30.0),
+                ("chair-instance-b", 48.0),
+            )
+        )
+        data = GenerationData(
+            generated_objects=[record],
+            object_instances=list(instances),
+        )
+        self.workspace.generation.set_data(data)
+        self.workspace.generation.data_changed.emit(data)
+        atlas_workspace = self.workspace.texture_atlas_workspace
+
+        with patch.object(
+            self.workspace.viewer,
+            "set_selected_placed_object_ids",
+        ) as select_objects:
+            atlas_workspace.object_list.object_clicked.emit(
+                source_id,
+                Qt.MouseButton.LeftButton,
+            )
+
+        expected_ids = (source_id, *(instance.instance_id for instance in instances))
+        self.assertEqual(self.workspace._desired_canvas_object_ids, expected_ids)
+        self.assertEqual(self.workspace._desired_canvas_object_id, source_id)
+        select_objects.assert_called_once_with(
+            expected_ids,
+            active_object_id=source_id,
+        )
+
+    def test_atlas_unplaced_object_selection_selects_all_linked_instances(
+        self,
+    ) -> None:
+        source_id = "unplaced-table"
+        record = _generated_object_record_with_variants(
+            self.settings.path.parent / "generated",
+            object_id=source_id,
+            object_name="Unplaced table",
+            resolutions=(512,),
+            selected_resolution=512,
+        )
+        instances = tuple(
+            GeneratedObjectInstance(
+                instance_id=instance_id,
+                source_object_id=source_id,
+                placement=GeneratedObjectPlacement(
+                    level_index=self.workspace.current_level.index,
+                    image_x=image_x,
+                    image_y=42.0,
+                ),
+            )
+            for instance_id, image_x in (
+                ("table-instance-a", 15.0),
+                ("table-instance-b", 35.0),
+            )
+        )
+        data = GenerationData(
+            generated_objects=[record],
+            object_instances=list(instances),
+        )
+        self.workspace.generation.set_data(data)
+        self.workspace.generation.data_changed.emit(data)
+        atlas_workspace = self.workspace.texture_atlas_workspace
+
+        with patch.object(
+            self.workspace.viewer,
+            "set_selected_placed_object_ids",
+        ) as select_objects:
+            atlas_workspace.object_list.object_clicked.emit(
+                source_id,
+                Qt.MouseButton.LeftButton,
+            )
+
+        expected_ids = tuple(instance.instance_id for instance in instances)
+        self.assertEqual(self.workspace._desired_canvas_object_ids, expected_ids)
+        self.assertEqual(
+            self.workspace._desired_canvas_object_id,
+            instances[0].instance_id,
+        )
+        select_objects.assert_called_once_with(
+            expected_ids,
+            active_object_id=instances[0].instance_id,
+        )
 
     def test_atlas_multi_object_selection_syncs_group_to_canvas(self) -> None:
         records = tuple(

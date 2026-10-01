@@ -4,7 +4,7 @@ from __future__ import annotations
 import copy
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from housemaker.video_source import VideoMetadata
@@ -15,6 +15,7 @@ MASK_MODE_ERASE = "erase"
 MASK_MODES = frozenset({MASK_MODE_PAINT, MASK_MODE_ERASE})
 MAX_MASK_STROKES_PER_FRAME = 10_000
 MAX_MASK_POINTS_PER_STROKE = 100_000
+MAX_GENERATED_OBJECT_NAME_LENGTH = 256
 GENERATION_PIPELINE_SCHEMA_VERSION = 1
 MESHY_GENERATION_PROVIDER = "meshy"
 EXTERNAL_GLB_GENERATION_PROVIDER = "external_glb"
@@ -195,6 +196,47 @@ class GeneratedObjectPlacement:
 
 
 @dataclass(frozen=True)
+class GeneratedObjectInstance:
+    """One lightweight scene instance linked to a generated source object."""
+
+    instance_id: str
+    source_object_id: str
+    placement: GeneratedObjectPlacement
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.instance_id, str) or not self.instance_id.strip():
+            raise ValueError("Generated-object instance IDs cannot be empty.")
+        if (
+            not isinstance(self.source_object_id, str)
+            or not self.source_object_id.strip()
+        ):
+            raise ValueError("Generated-object instance source IDs cannot be empty.")
+        if not isinstance(self.placement, GeneratedObjectPlacement):
+            raise ValueError(
+                "Generated-object instances require a GeneratedObjectPlacement."
+            )
+        object.__setattr__(self, "instance_id", self.instance_id.strip())
+        object.__setattr__(self, "source_object_id", self.source_object_id.strip())
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "instance_id": self.instance_id,
+            "source_object_id": self.source_object_id,
+            "placement": self.placement.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "GeneratedObjectInstance":
+        if not isinstance(payload, dict):
+            raise ValueError("Generated-object instance data must contain an object.")
+        return cls(
+            instance_id=str(payload["instance_id"]),
+            source_object_id=str(payload["source_object_id"]),
+            placement=GeneratedObjectPlacement.from_dict(payload["placement"]),
+        )
+
+
+@dataclass(frozen=True)
 class GeneratedObjectRecord:
     """Serializable provenance for a generated object.
 
@@ -216,8 +258,12 @@ class GeneratedObjectRecord:
             raise ValueError("Generated object ID cannot be empty.")
         if int(self.frame_index) < 0:
             raise ValueError("Generated object frame index cannot be negative.")
-        if not str(self.object_name).strip():
+        normalized_object_name = str(self.object_name).strip()
+        if not normalized_object_name:
             raise ValueError("Generated object name cannot be empty.")
+        if len(normalized_object_name) > MAX_GENERATED_OBJECT_NAME_LENGTH:
+            raise ValueError("Generated object name is too long.")
+        object.__setattr__(self, "object_name", normalized_object_name)
         if not isinstance(self.pipeline, dict):
             raise ValueError("Generated object pipeline must contain an object.")
         if self.provider not in GENERATION_PROVIDERS:
@@ -299,6 +345,7 @@ class GenerationData:
     current_frame_index: int = 0
     frame_strokes: dict[int, list[MaskStroke]] = field(default_factory=dict)
     generated_objects: list[GeneratedObjectRecord] = field(default_factory=list)
+    object_instances: list[GeneratedObjectInstance] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if int(self.current_frame_index) < 0:
@@ -323,6 +370,33 @@ class GenerationData:
             raise ValueError(
                 "Generated objects must be GeneratedObjectRecord values."
             )
+        if not all(
+            isinstance(instance, GeneratedObjectInstance)
+            for instance in self.object_instances
+        ):
+            raise ValueError(
+                "Generated object instances must be GeneratedObjectInstance values."
+            )
+        sources_by_id = {
+            record.object_id: record for record in self.generated_objects
+        }
+        source_ids = set(sources_by_id)
+        instance_ids: set[str] = set()
+        for instance in self.object_instances:
+            if (
+                instance.instance_id in source_ids
+                or instance.instance_id in instance_ids
+            ):
+                raise ValueError(
+                    "Generated-object instance IDs must be unique and distinct from "
+                    "source object IDs."
+                )
+            if instance.source_object_id not in source_ids:
+                raise ValueError(
+                    "Generated-object instances must reference an existing source "
+                    "object."
+                )
+            instance_ids.add(instance.instance_id)
 
     def clone(self) -> "GenerationData":
         return copy.deepcopy(self)
@@ -350,6 +424,44 @@ class GenerationData:
         else:
             self.frame_strokes.pop(normalized_index, None)
 
+    def rename_generated_object(
+        self,
+        object_id: str,
+        object_name: str,
+    ) -> GeneratedObjectRecord:
+        """Rename one source object without changing its stable relationships."""
+
+        normalized_id = str(object_id)
+        normalized_name = str(object_name).strip()
+        if not normalized_name:
+            raise ValueError("Generated object name cannot be empty.")
+        if len(normalized_name) > MAX_GENERATED_OBJECT_NAME_LENGTH:
+            raise ValueError("Generated object name is too long.")
+        record_index = next(
+            (
+                index
+                for index, record in enumerate(self.generated_objects)
+                if record.object_id == normalized_id
+            ),
+            None,
+        )
+        if record_index is None:
+            raise ValueError(f"Unknown generated object ID: {normalized_id!r}.")
+        if any(
+            candidate.object_id != normalized_id
+            and candidate.object_name.casefold() == normalized_name.casefold()
+            for candidate in self.generated_objects
+        ):
+            raise ValueError(
+                f"Generated object name already exists: {normalized_name!r}."
+            )
+        current = self.generated_objects[record_index]
+        if current.object_name == normalized_name:
+            return current
+        renamed = replace(current, object_name=normalized_name)
+        self.generated_objects[record_index] = renamed
+        return renamed
+
     def to_dict(self) -> dict[str, object]:
         return {
             "video_metadata": (
@@ -365,6 +477,9 @@ class GenerationData:
             "generated_objects": [
                 record.to_dict() for record in self.generated_objects
             ],
+            "object_instances": [
+                instance.to_dict() for instance in self.object_instances
+            ],
         }
 
     @classmethod
@@ -378,6 +493,10 @@ class GenerationData:
         raw_generated_objects = payload.get("generated_objects", [])
         if not isinstance(raw_generated_objects, list):
             raise ValueError("Generated objects must contain a list.")
+        raw_object_instances = payload.get("object_instances", [])
+        if not isinstance(raw_object_instances, list):
+            raise ValueError("Generated object instances must contain a list.")
+        generated_objects = _load_generated_objects(raw_generated_objects)
         return cls(
             video_metadata=(
                 None
@@ -393,7 +512,11 @@ class GenerationData:
                 for frame_index, raw_strokes in raw_frame_strokes.items()
                 if isinstance(raw_strokes, list)
             },
-            generated_objects=_load_generated_objects(raw_generated_objects),
+            generated_objects=generated_objects,
+            object_instances=_load_generated_object_instances(
+                raw_object_instances,
+                generated_objects,
+            ),
         )
 
 
@@ -456,6 +579,21 @@ def _load_generated_objects(
             continue
         records.append(GeneratedObjectRecord.from_dict(raw_record))
     return records
+
+
+def _load_generated_object_instances(
+    raw_instances: list[object],
+    generated_objects: Sequence[GeneratedObjectRecord],
+) -> list[GeneratedObjectInstance]:
+    """Load valid instances while retiring references to legacy objects."""
+
+    source_ids = {record.object_id for record in generated_objects}
+    instances: list[GeneratedObjectInstance] = []
+    for raw_instance in raw_instances:
+        instance = GeneratedObjectInstance.from_dict(raw_instance)
+        if instance.source_object_id in source_ids:
+            instances.append(instance)
+    return instances
 
 
 def _is_finite_number(value: object) -> bool:

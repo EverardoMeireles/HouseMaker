@@ -28,6 +28,8 @@ from housemaker.glass_material import (
 from housemaker.glb import (
     GLTF_Y_UP_TO_Z_UP_TRANSFORM,
     GeneratedModel,
+    PlacedGeneratedModel,
+    compose_generated_model_instance_sources,
     convert_to_glb,
 )
 from housemaker.models import LevelData, RoomData, VertexData
@@ -634,6 +636,189 @@ class TextureAtlasExportTests(unittest.TestCase):
                 for primitive in mesh["primitives"]
             ),
             1,
+        )
+
+    def test_instance_source_keeps_a_named_root_and_shares_atlas_material(
+        self,
+    ) -> None:
+        resolution = 2048
+        atlas = TextureAtlasRecord(
+            atlas_id="shared-runtime",
+            name="Shared runtime Atlas",
+            resolution=resolution,
+            placements=[
+                TextureAtlasPlacement(
+                    object_id="ordinary",
+                    texture_path="ordinary.png",
+                    texture_resolution=512,
+                    x=0,
+                    y=0,
+                    size=512,
+                ),
+                TextureAtlasPlacement(
+                    object_id="chair",
+                    texture_path="chair.png",
+                    texture_resolution=512,
+                    x=512,
+                    y=0,
+                    size=512,
+                ),
+            ],
+        )
+        ordinary = _textured_triangle(
+            name="Ordinary",
+            metadata={"housemaker_object_id": "ordinary"},
+        )
+        base = GeneratedModel(
+            mesh=ordinary,
+            scene=trimesh.Scene(ordinary),
+            glb_bytes=b"",
+        )
+        source_mesh = _textured_triangle(name="Chair", metadata={})
+        source_model = GeneratedModel(
+            mesh=source_mesh,
+            scene=trimesh.Scene(source_mesh),
+            glb_bytes=b"",
+        )
+        carrier = PlacedGeneratedModel(
+            object_id="chair-copy",
+            source_object_id="chair",
+            object_name="chair_prototype",
+            model=source_model,
+            world_position=(15.0, 20.0, 5.0),
+        )
+        pre_atlas = compose_generated_model_instance_sources(base, (carrier,))
+
+        with tempfile.TemporaryDirectory() as temporary_directory, patch(
+            "housemaker.atlas_export.bake_placed_object_ambient_occlusion",
+            return_value={},
+        ) as bake_ao:
+            result = apply_texture_atlases_to_export(
+                pre_atlas,
+                (
+                    MaterializedTextureAtlas(
+                        atlas,
+                        _write_atlas_maps(
+                            Path(temporary_directory),
+                            resolution,
+                        ),
+                        active_map_types=frozenset({ATLAS_MAP_BASE_COLOR}),
+                    ),
+                ),
+            )
+
+        bake_ao.assert_called_once()
+        ao_targets = bake_ao.call_args.args[0][atlas.atlas_id]
+        self.assertEqual(len(ao_targets), 1)
+        document = _read_glb_json(result.glb_bytes)
+        materials = document["materials"]
+        self.assertEqual([material["name"] for material in materials], [atlas.name])
+        atlas_material_index = 0
+        root_index = next(
+            index
+            for index, node in enumerate(document["nodes"])
+            if node.get("name") == "chair_prototype"
+        )
+        root = document["nodes"][root_index]
+        self.assertEqual(
+            root["extras"]["housemaker_instance_source_id"],
+            "chair",
+        )
+        self.assertEqual(
+            root["extras"]["housemaker_instance_source_name"],
+            "chair_prototype",
+        )
+        source_material_indices = {
+            primitive["material"]
+            for child_index in root["children"]
+            for primitive in document["meshes"][
+                document["nodes"][child_index]["mesh"]
+            ]["primitives"]
+        }
+        self.assertEqual(source_material_indices, {atlas_material_index})
+        self.assertGreaterEqual(
+            sum(
+                primitive.get("material") == atlas_material_index
+                for mesh in document["meshes"]
+                for primitive in mesh["primitives"]
+            ),
+            2,
+        )
+
+    def test_half_instance_source_preserves_mirror_extras_and_glass(self) -> None:
+        resolution = 2048
+        atlas = TextureAtlasRecord(
+            atlas_id="half-runtime",
+            name="Half runtime Atlas",
+            resolution=resolution,
+            placements=[
+                TextureAtlasPlacement(
+                    object_id="window",
+                    texture_path="window.png",
+                    texture_resolution=512,
+                    x=0,
+                    y=0,
+                    size=512,
+                )
+            ],
+        )
+        opaque = _textured_triangle(name="Frame", metadata={})
+        glass = _textured_triangle(
+            name="Glass",
+            metadata={},
+            glass=True,
+            x_offset=2.0,
+        )
+        source_scene = trimesh.Scene()
+        source_scene.add_geometry(opaque, node_name="frame")
+        source_scene.add_geometry(glass, node_name="glass")
+        source_model = GeneratedModel(
+            mesh=trimesh.util.concatenate((opaque, glass)),
+            scene=source_scene,
+            glb_bytes=b"",
+        )
+        carrier = PlacedGeneratedModel(
+            object_id="window-copy",
+            source_object_id="window",
+            object_name="window_prototype",
+            model=source_model,
+            world_position=(0.0, 0.0, 0.0),
+            symmetric_preview_orientation="vertical",
+            symmetric_preview_plane_coordinate=0.0,
+        )
+        empty = GeneratedModel(
+            mesh=trimesh.Trimesh(process=False),
+            scene=trimesh.Scene(),
+            glb_bytes=b"",
+        )
+        pre_atlas = compose_generated_model_instance_sources(empty, (carrier,))
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            result = apply_texture_atlases_to_export(
+                pre_atlas,
+                (
+                    MaterializedTextureAtlas(
+                        atlas,
+                        _write_atlas_maps(Path(temporary_directory), resolution),
+                        active_map_types=frozenset({ATLAS_MAP_BASE_COLOR}),
+                    ),
+                ),
+            )
+
+        document = _read_glb_json(result.glb_bytes)
+        root = next(
+            node
+            for node in document["nodes"]
+            if node.get("name") == "window_prototype"
+        )
+        child_nodes = [document["nodes"][index] for index in root["children"]]
+        self.assertEqual(len(child_nodes), 2)
+        self.assertTrue(
+            all("halfMesh" in node.get("extras", {}) for node in child_nodes)
+        )
+        self.assertEqual(
+            {material["name"] for material in document["materials"]},
+            {atlas.name, HOUSEMAKER_GLASS_MATERIAL_NAME},
         )
 
     def test_wall_floor_and_ceiling_share_one_atlas_primitive(self) -> None:

@@ -5,7 +5,7 @@ import copy
 import math
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath, PureWindowsPath
 
 from housemaker.camera_models import CameraPose
@@ -588,6 +588,38 @@ class SurfaceTextureData:
             for assignment in self.assignments
             if normalized_id in assignment.surface_ids
         ]
+
+    def rename_assignment(
+        self,
+        assignment_id: str,
+        display_name: str,
+    ) -> SurfaceTextureAssignment:
+        """Rename one generated surface texture while preserving its identity."""
+
+        normalized_id = str(assignment_id)
+        normalized_name = _normalize_required_text(
+            display_name,
+            "Surface texture display name",
+            MAX_ASSIGNMENT_DISPLAY_NAME_LENGTH,
+        )
+        assignment_index = next(
+            (
+                index
+                for index, assignment in enumerate(self.assignments)
+                if assignment.assignment_id == normalized_id
+            ),
+            None,
+        )
+        if assignment_index is None:
+            raise ValueError(
+                f"Unknown surface texture assignment ID: {normalized_id!r}."
+            )
+        current = self.assignments[assignment_index]
+        if current.display_name == normalized_name:
+            return current
+        renamed = replace(current, display_name=normalized_name)
+        self.assignments[assignment_index] = renamed
+        return renamed
 
     def to_dict(self) -> dict[str, object]:
         return {

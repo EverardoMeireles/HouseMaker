@@ -455,6 +455,25 @@ class TextureAtlasData:
             self.selected_atlas_id = atlas.atlas_id
         return atlas
 
+    def rename_atlas(
+        self,
+        atlas_id: str,
+        name: str,
+    ) -> TextureAtlasRecord:
+        """Rename one atlas without invalidating its pixels or AO bake."""
+
+        atlas = self._require_atlas(atlas_id)
+        normalized_name = str(name).strip()
+        _validate_atlas_name(normalized_name)
+        if any(
+            candidate.atlas_id != atlas.atlas_id
+            and candidate.name.casefold() == normalized_name.casefold()
+            for candidate in self.atlases
+        ):
+            raise ValueError(f"Texture atlas name already exists: {normalized_name!r}.")
+        atlas.name = normalized_name
+        return atlas
+
     def remove_atlas(self, atlas_id: str) -> bool:
         atlas = self.atlas_by_id(atlas_id)
         if atlas is None:

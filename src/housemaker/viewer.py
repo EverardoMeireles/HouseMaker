@@ -216,6 +216,11 @@ TRANSFORM_GIZMO_RING_HIT_RATIO = 0.085
 TRANSFORM_GIZMO_SCALE_CUBE_SIZE_RATIO = 0.16
 TRANSFORM_GIZMO_SCALE_CUBE_HIT_RATIO = 0.14
 TRANSFORM_GIZMO_SELECTION_COLOR = (1.0, 0.72, 0.18, 0.95)
+PLACED_OBJECT_INSTANCE_GIZMO_COLOR = (0.82, 0.34, 1.0, 1.0)
+PLACED_OBJECT_INSTANCE_GIZMO_OFFSET_RATIO = 1.12
+PLACED_OBJECT_INSTANCE_GIZMO_HIT_RATIO = 0.18
+PLACED_OBJECT_INSTANCE_GIZMO_POINT_SIZE_PIXELS = 18.0
+PLACED_OBJECT_INSTANCE_PREVIEW_COLOR = (0.52, 1.0, 0.72, 0.82)
 TRANSFORM_GIZMO_TRANSLATE = "translate"
 TRANSFORM_GIZMO_ROTATE = "rotate"
 TRANSFORM_GIZMO_SCALE = "scale"
@@ -595,6 +600,51 @@ class _TransformGizmoHandle:
             raise ValueError("Unknown placed-object gizmo handle kind.")
         if self.axis_index not in {0, 1, 2}:
             raise ValueError("Placed-object gizmo axes must be X, Y, or Z.")
+
+
+@dataclass(frozen=True)
+class PlacedObjectInstanceRequest:
+    """One viewer-authored request for a sibling of a selected scene object."""
+
+    source_scene_object_id: str
+    world_position: tuple[float, float, float]
+    rotation_degrees: tuple[float, float, float]
+    scale: float
+    axis_scales: tuple[float, float, float]
+    world_transform: np.ndarray
+
+    def __post_init__(self) -> None:
+        source_scene_object_id = str(self.source_scene_object_id).strip()
+        world_position = tuple(float(value) for value in self.world_position)
+        rotation_degrees = tuple(float(value) for value in self.rotation_degrees)
+        axis_scales = tuple(float(value) for value in self.axis_scales)
+        scale = float(self.scale)
+        world_transform = np.asarray(self.world_transform, dtype=float).copy()
+        if not source_scene_object_id:
+            raise ValueError("Instance requests require a source scene object ID.")
+        if (
+            len(world_position) != 3
+            or len(rotation_degrees) != 3
+            or len(axis_scales) != 3
+            or not all(
+                math.isfinite(value)
+                for value in (*world_position, *rotation_degrees, *axis_scales, scale)
+            )
+            or scale <= 0.0
+            or any(value <= 0.0 for value in axis_scales)
+        ):
+            raise ValueError("Instance requests require finite positive transforms.")
+        if world_transform.shape != (4, 4) or not np.all(np.isfinite(world_transform)):
+            raise ValueError(
+                "Instance request transforms must be finite 4 by 4 matrices."
+            )
+        world_transform.setflags(write=False)
+        object.__setattr__(self, "source_scene_object_id", source_scene_object_id)
+        object.__setattr__(self, "world_position", world_position)
+        object.__setattr__(self, "rotation_degrees", rotation_degrees)
+        object.__setattr__(self, "scale", scale)
+        object.__setattr__(self, "axis_scales", axis_scales)
+        object.__setattr__(self, "world_transform", world_transform)
 
 
 @dataclass(frozen=True)
@@ -2952,6 +3002,22 @@ class _PlacedObjectTransformDrag:
     preview_axis_scales: tuple[float, float, float] | None = None
 
 
+@dataclass
+class _PlacedObjectInstanceDrag:
+    """Horizontal clone-handle drag with a lightweight retained preview."""
+
+    source_scene_object_id: str
+    start_world_position: np.ndarray
+    rotation_degrees: tuple[float, float, float]
+    scale: float
+    axis_scales: tuple[float, float, float]
+    start_transform: np.ndarray
+    start_plane_hit: np.ndarray
+    preview_root: GLGraphicsItem
+    preview_world_position: tuple[float, float, float]
+    preview_transform: np.ndarray
+
+
 # ### Face-selection background models ###
 class _ProjectedSelectionGeometry(tuple):
     """Tuple-compatible projected meshes carrying original logical face IDs."""
@@ -3100,6 +3166,7 @@ class GlbViewerWidget(QWidget):
     canvas_surface_face_extrusion_requested = Signal(object)
     canvas_surface_face_deletion_requested = Signal(object)
     placed_object_removal_requested = Signal(str)
+    placed_object_instance_requested = Signal(object)
     placed_object_transform_changed = Signal(str, object, object)
     placed_object_scales_changed = Signal(object)
     placed_object_axis_scales_changed = Signal(str, object)
@@ -3211,8 +3278,11 @@ class GlbViewerWidget(QWidget):
         self._selected_placed_object_ids: tuple[str, ...] = ()
         self._selected_placed_object_id: str | None = None
         self._placed_object_transform_drag: _PlacedObjectTransformDrag | None = None
+        self._placed_object_instance_drag: _PlacedObjectInstanceDrag | None = None
         self._placed_object_gizmo_mode = PLACED_OBJECT_GIZMO_TRANSFORM
         self._transform_gizmo_items: list[GLGraphicsItem] = []
+        self._placed_object_instance_gizmo_items: list[GLGraphicsItem] = []
+        self._placed_object_instance_gizmo_center: np.ndarray | None = None
         self._transform_gizmo_size = TRANSFORM_GIZMO_MIN_SIZE_METERS
         self._object_placement_request_id: str | None = None
         self._object_placement_preview_meshes: tuple[trimesh.Trimesh, ...] = ()
@@ -5649,7 +5719,11 @@ class GlbViewerWidget(QWidget):
 
         normalized_object_id = str(object_id).strip()
         group = self._placed_object_render_groups.get(normalized_object_id)
-        if group is None or self._placed_object_transform_drag is not None:
+        if (
+            group is None
+            or self._placed_object_transform_drag is not None
+            or self._placed_object_instance_drag is not None
+        ):
             return False
         try:
             normalized_position = tuple(float(value) for value in world_position)
@@ -5702,6 +5776,8 @@ class GlbViewerWidget(QWidget):
 
         if self._selected_placed_object_id is None:
             return False
+        if self._placed_object_instance_drag is not None:
+            self._cancel_placed_object_instance_drag()
         if self._placed_object_transform_drag is not None:
             self._cancel_placed_object_gizmo_drag()
         self._placed_object_gizmo_mode = (
@@ -5834,6 +5910,7 @@ class GlbViewerWidget(QWidget):
         active_changed = normalized_active_id != self._selected_placed_object_id
         if not selection_changed and not active_changed:
             return False
+        self._cancel_placed_object_instance_drag()
         self._cancel_placed_object_gizmo_drag()
         self.view.set_object_scale_wheel_steps_enabled(False)
         self._selected_placed_object_ids = normalized_ids
@@ -6955,6 +7032,11 @@ class GlbViewerWidget(QWidget):
         if surface_edit_target is not None:
             self._begin_canvas_surface_edit_drag(surface_edit_target, position)
             return
+        if (
+            self._pick_placed_object_instance_gizmo_handle(*camera_ray)
+            and self._begin_placed_object_instance_drag(position)
+        ):
+            return
         handle = self._pick_transform_gizmo_handle(*camera_ray)
         if handle is not None:
             self._begin_placed_object_gizmo_drag(handle, position)
@@ -6987,6 +7069,9 @@ class GlbViewerWidget(QWidget):
             return
         if self._canvas_rectangle_selection_press_position is not None:
             self._update_canvas_rectangle_selection(position)
+            return
+        if self._placed_object_instance_drag is not None:
+            self._update_placed_object_instance_drag(position)
             return
         self._update_placed_object_gizmo_drag(position)
 
@@ -7022,6 +7107,9 @@ class GlbViewerWidget(QWidget):
         if self._canvas_rectangle_selection_press_position is not None:
             self._finish_canvas_rectangle_selection(position)
             return
+        if self._placed_object_instance_drag is not None:
+            self._finish_placed_object_instance_drag(position)
+            return
         self._finish_placed_object_gizmo_drag(position)
 
     def _cancel_canvas_gizmo_drag(self, *_args: object) -> None:
@@ -7053,6 +7141,9 @@ class GlbViewerWidget(QWidget):
             or self._canvas_rectangle_selection_cancel_event is not None
         ):
             self._cancel_canvas_rectangle_selection()
+            return
+        if self._placed_object_instance_drag is not None:
+            self._cancel_placed_object_instance_drag()
             return
         self._cancel_placed_object_gizmo_drag()
 
@@ -12547,6 +12638,7 @@ class GlbViewerWidget(QWidget):
         for object_id, group in self._placed_object_render_groups.items():
             group.selection_item.setVisible(object_id in selected_id_set)
         self._remove_transform_gizmo_items()
+        self._remove_placed_object_instance_gizmo_items()
         self._sync_placed_object_scale_input_state()
         if (
             selected_id is not None
@@ -12574,14 +12666,15 @@ class GlbViewerWidget(QWidget):
             if self._placed_object_gizmo_mode == PLACED_OBJECT_GIZMO_SCALE:
                 self.object_transform_status_label.setText(
                     "Drag an RGB cube to scale one local axis. Use the wheel "
-                    "to scale uniformly; select the object again to switch "
-                    "gizmos."
+                    "to scale uniformly, or drag the purple handle to create "
+                    "an instance; select the object again to switch gizmos."
                 )
             else:
                 self.object_transform_status_label.setText(
                     "Drag an RGB arrow to move or an RGB ring to rotate. Use "
-                    "the wheel to scale uniformly; select the object again "
-                    "to switch gizmos."
+                    "the wheel to scale uniformly, or drag the purple handle "
+                    "to create an instance; select the object again to switch "
+                    "gizmos."
                 )
         self.view.update()
 
@@ -12594,6 +12687,7 @@ class GlbViewerWidget(QWidget):
                 and self._selected_placed_object_ids
                 and self._level_transform_preview_level_index is None
                 and self._placed_object_transform_drag is None
+                and self._placed_object_instance_drag is None
                 and not self.is_object_placement_active
             )
         )
@@ -12606,7 +12700,11 @@ class GlbViewerWidget(QWidget):
         """Uniformly scale every selected placed object around its floor anchor."""
 
         normalized_steps = int(steps)
-        if normalized_steps == 0 or self._placed_object_transform_drag is not None:
+        if (
+            normalized_steps == 0
+            or self._placed_object_transform_drag is not None
+            or self._placed_object_instance_drag is not None
+        ):
             return
         requested_factor = PLACED_OBJECT_SCALE_FACTOR_PER_WHEEL_STEP ** (
             normalized_steps
@@ -12662,10 +12760,12 @@ class GlbViewerWidget(QWidget):
     ) -> None:
         """Build the active transform or per-axis scale handle set."""
 
+        self._remove_placed_object_instance_gizmo_items()
         if self._placed_object_gizmo_mode == PLACED_OBJECT_GIZMO_SCALE:
             self._build_scale_gizmo_items(group)
-            return
-        self._build_transform_gizmo_items(group)
+        else:
+            self._build_transform_gizmo_items(group)
+        self._build_placed_object_instance_gizmo_items(group)
 
     def _calculate_transform_gizmo_size(
         self,
@@ -12793,6 +12893,83 @@ class GlbViewerWidget(QWidget):
                 self.view.removeItem(item)
         self._transform_gizmo_items = []
 
+    def _build_placed_object_instance_gizmo_items(
+        self,
+        group: _PlacedObjectRenderGroup,
+    ) -> None:
+        """Draw a distinct diagonal handle that can create a sibling instance."""
+
+        pivot = _get_render_group_world_pivot(group)
+        diagonal = np.asarray((1.0, 1.0, 0.0), dtype=float)
+        diagonal /= float(np.linalg.norm(diagonal))
+        center = pivot + (
+            diagonal
+            * self._transform_gizmo_size
+            * PLACED_OBJECT_INSTANCE_GIZMO_OFFSET_RATIO
+        )
+        self._placed_object_instance_gizmo_center = center
+        guide_item = gl.GLLinePlotItem(
+            pos=np.asarray((pivot, center), dtype=float),
+            color=PLACED_OBJECT_INSTANCE_GIZMO_COLOR,
+            width=3.0,
+            antialias=True,
+            mode="lines",
+        )
+        self._add_placed_object_instance_gizmo_overlay_item(guide_item)
+        handle_item = gl.GLScatterPlotItem(
+            pos=np.asarray((center,), dtype=float),
+            color=PLACED_OBJECT_INSTANCE_GIZMO_COLOR,
+            size=PLACED_OBJECT_INSTANCE_GIZMO_POINT_SIZE_PIXELS,
+            pxMode=True,
+        )
+        self._add_placed_object_instance_gizmo_overlay_item(handle_item)
+
+    def _add_placed_object_instance_gizmo_overlay_item(
+        self,
+        item: GLGraphicsItem,
+    ) -> None:
+        """Keep the clone handle clickable even when geometry overlaps it."""
+
+        item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+        item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE)
+        self.view.addItem(item)
+        self._placed_object_instance_gizmo_items.append(item)
+
+    def _remove_placed_object_instance_gizmo_items(self) -> None:
+        """Remove only clone-handle overlays, preserving ordinary gizmo counts."""
+
+        self._placed_object_instance_gizmo_center = None
+        if not hasattr(self, "view"):
+            self._placed_object_instance_gizmo_items = []
+            return
+        for item in self._placed_object_instance_gizmo_items:
+            if item in self.view.items:
+                self.view.removeItem(item)
+        self._placed_object_instance_gizmo_items = []
+
+    def _pick_placed_object_instance_gizmo_handle(
+        self,
+        ray_origin: object,
+        ray_direction: object,
+    ) -> bool:
+        """Return whether a ray reaches the active clone-handle endpoint."""
+
+        if (
+            self._selected_placed_object_id is None
+            or self._placed_object_instance_gizmo_center is None
+        ):
+            return False
+        point_hit = _get_ray_point_distance(
+            ray_origin,
+            ray_direction,
+            self._placed_object_instance_gizmo_center,
+        )
+        return bool(
+            point_hit is not None
+            and point_hit[0]
+            <= self._transform_gizmo_size * PLACED_OBJECT_INSTANCE_GIZMO_HIT_RATIO
+        )
+
     def _pick_transform_gizmo_handle(
         self,
         ray_origin: object,
@@ -12892,6 +13069,138 @@ class GlbViewerWidget(QWidget):
                 candidate[1].axis_index,
             ),
         )[1]
+
+    # ### Placed-object instance dragging ###
+    def _begin_placed_object_instance_drag(self, position: QPointF) -> bool:
+        """Start a horizontal drag without modifying the selected source."""
+
+        selected_id = self._selected_placed_object_id
+        group = self._placed_object_render_groups.get(selected_id or "")
+        camera_ray = self.view.build_camera_ray(position)
+        if group is None or camera_ray is None:
+            return False
+        ray_origin, ray_direction = camera_ray
+        start_world_position = np.asarray(group.preview.world_position, dtype=float)
+        plane_hit = _intersect_ray_with_plane(
+            ray_origin,
+            ray_direction,
+            start_world_position,
+            np.asarray((0.0, 0.0, 1.0), dtype=float),
+        )
+        bounds = _get_combined_mesh_bounds(group.pick_meshes)
+        if plane_hit is None or bounds is None:
+            return False
+
+        preview_root = GLGraphicsItem()
+        preview_root.setTransform(_numpy_transform_to_qt(group.current_transform))
+        self.view.addItem(preview_root)
+        preview_bounds = gl.GLLinePlotItem(
+            pos=_build_bounds_line_positions(bounds),
+            color=PLACED_OBJECT_INSTANCE_PREVIEW_COLOR,
+            width=3.0,
+            antialias=True,
+            mode="lines",
+        )
+        preview_bounds.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+        preview_bounds.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE)
+        preview_bounds.setParentItem(preview_root)
+        start_transform = np.asarray(group.current_transform, dtype=float).copy()
+        self._placed_object_instance_drag = _PlacedObjectInstanceDrag(
+            source_scene_object_id=group.preview.object_id,
+            start_world_position=start_world_position,
+            rotation_degrees=group.preview.rotation_degrees,
+            scale=float(group.preview.scale),
+            axis_scales=group.preview.axis_scales,
+            start_transform=start_transform,
+            start_plane_hit=np.asarray(plane_hit, dtype=float),
+            preview_root=preview_root,
+            preview_world_position=group.preview.world_position,
+            preview_transform=start_transform.copy(),
+        )
+        self._sync_placed_object_scale_input_state()
+        self.view.reserve_primary_pointer_drag()
+        if self.object_transform_status_label is not None:
+            self.object_transform_status_label.setText(
+                "Drag the purple handle across the floor plane and release to "
+                "create an instance; Escape cancels."
+            )
+        return True
+
+    def _update_placed_object_instance_drag(self, position: QPointF) -> bool:
+        """Move the lightweight clone outline on a horizontal world plane."""
+
+        drag = self._placed_object_instance_drag
+        camera_ray = self.view.build_camera_ray(position)
+        if drag is None or camera_ray is None:
+            return False
+        ray_origin, ray_direction = camera_ray
+        plane_hit = _intersect_ray_with_plane(
+            ray_origin,
+            ray_direction,
+            drag.start_world_position,
+            np.asarray((0.0, 0.0, 1.0), dtype=float),
+        )
+        if plane_hit is None:
+            return False
+        delta = np.asarray(plane_hit, dtype=float) - drag.start_plane_hit
+        delta[2] = 0.0
+        transform = np.eye(4, dtype=float)
+        transform[:3, 3] = delta
+        transform = transform @ drag.start_transform
+        world_position = drag.start_world_position + delta
+        drag.preview_world_position = tuple(float(value) for value in world_position)
+        drag.preview_transform = transform
+        drag.preview_root.setTransform(_numpy_transform_to_qt(transform))
+        self.view.update()
+        return True
+
+    def _finish_placed_object_instance_drag(self, position: QPointF) -> bool:
+        """Emit one immutable request only after a meaningful clone drag."""
+
+        drag = self._placed_object_instance_drag
+        if drag is None:
+            return False
+        self._update_placed_object_instance_drag(position)
+        moved = not np.allclose(
+            drag.preview_world_position,
+            drag.start_world_position,
+            atol=1e-9,
+            rtol=0.0,
+        )
+        request = (
+            PlacedObjectInstanceRequest(
+                source_scene_object_id=drag.source_scene_object_id,
+                world_position=drag.preview_world_position,
+                rotation_degrees=drag.rotation_degrees,
+                scale=drag.scale,
+                axis_scales=drag.axis_scales,
+                world_transform=drag.preview_transform,
+            )
+            if moved
+            else None
+        )
+        self._placed_object_instance_drag = None
+        self.view.release_primary_pointer_drag()
+        if drag.preview_root in self.view.items:
+            self.view.removeItem(drag.preview_root)
+        self._sync_placed_object_selection_rendering()
+        if request is not None:
+            self.placed_object_instance_requested.emit(request)
+            return True
+        return False
+
+    def _cancel_placed_object_instance_drag(self, *_args: object) -> bool:
+        """Discard the ghost instance without mutating or emitting a request."""
+
+        drag = self._placed_object_instance_drag
+        if drag is None:
+            return False
+        self._placed_object_instance_drag = None
+        self.view.cancel_primary_pointer_drag()
+        if drag.preview_root in self.view.items:
+            self.view.removeItem(drag.preview_root)
+        self._sync_placed_object_selection_rendering()
+        return True
 
     # ### Placed-object gizmo dragging ###
     def _begin_placed_object_gizmo_drag(
@@ -13078,6 +13387,7 @@ class GlbViewerWidget(QWidget):
         )
         drag.preview_axis_scales = tuple(float(value) for value in axis_scales)
         self._remove_transform_gizmo_items()
+        self._remove_placed_object_instance_gizmo_items()
         self._build_placed_object_gizmo_items(group)
         self.view.update()
         return True
@@ -13325,6 +13635,7 @@ class GlbViewerWidget(QWidget):
         if not hasattr(self, "view"):
             return
 
+        self._cancel_placed_object_instance_drag()
         self._symmetric_preview_timer.stop()
         self._canvas_stair_preview_timer.stop()
         self._release_textured_mesh_gl_resources()
@@ -13342,6 +13653,7 @@ class GlbViewerWidget(QWidget):
         self._embedded_symmetric_preview_groups = []
         self._placed_object_render_groups = {}
         self._remove_transform_gizmo_items()
+        self._remove_placed_object_instance_gizmo_items()
         self._canvas_opening_gizmo_items = []
         self._canvas_surface_edit_gizmo_items = []
         self._canvas_surface_edit_gizmo_sizes = {}

@@ -133,6 +133,7 @@ from housemaker.canvas_surface_edits import (
 from housemaker.external_viewer_host import ExternalFullscreenViewerHost
 from housemaker.generation_jobs import GenerationJobManager, JobsWindow
 from housemaker.generation_state import (
+    GeneratedObjectInstance,
     GeneratedObjectPlacement,
     GeneratedObjectRecord,
     GenerationData,
@@ -152,6 +153,7 @@ from housemaker.glb import (
     build_placed_generated_model_top_down_footprint,
     build_stair_meshes,
     build_texture_preview_plane_model,
+    compose_generated_model_instance_sources,
     compose_placed_generated_models,
     compose_placed_generated_models_preview,
     convert_to_export_scene_model,
@@ -256,6 +258,7 @@ from housemaker.qwen_plan_image_correction import (
     QwenPlanCorrectionError,
     create_default_qwen_plan_image_editor,
 )
+from housemaker.scene_export import write_runtime_scene_manifest
 from housemaker.settings_widget import (
     DEFAULT_MESH_EDIT_UPDATE_DELAY_SECONDS,
     DEFAULT_WALL_VERTEX_UPDATE_DELAY_SECONDS,
@@ -320,6 +323,7 @@ from housemaker.texture_color_balance import TextureColorBalanceSettings
 from housemaker.viewer import (
     ArchitecturalTrimDimensionEdit,
     GlbViewerWidget,
+    PlacedObjectInstanceRequest,
     SceneObjectPlacementCandidate,
     build_scene_object_placement_group_candidate,
 )
@@ -501,7 +505,11 @@ class _PreAtlasExportScene:
     """The shared scene and source bindings before Atlas UV remapping."""
 
     model: GeneratedModel
+    # Only ordinary authored placements belong in the default GLB scene. A
+    # source with runtime instances is exported once as a detached library
+    # root; its world transforms live exclusively in the companion JSON.
     placed_models: tuple[PlacedGeneratedModel, ...]
+    instance_source_models: tuple[PlacedGeneratedModel, ...]
     surface_source_ids: dict[str, str]
 
     @property
@@ -510,6 +518,10 @@ class _PreAtlasExportScene:
             dict.fromkeys(
                 (
                     *(placement.object_id for placement in self.placed_models),
+                    *(
+                        str(placement.source_object_id)
+                        for placement in self.instance_source_models
+                    ),
                     *self.surface_source_ids.values(),
                 )
             )
@@ -711,11 +723,19 @@ class _AtlasDrawCallEstimateThread(QThread):
         self,
         scene_snapshot: _SurfaceAmbientOcclusionSceneSnapshot,
         atlases: Sequence[TextureAtlasRecord],
+        instance_source_ids: Sequence[str],
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self._scene_snapshot = scene_snapshot
         self._atlases = tuple(copy.deepcopy(tuple(atlases)))
+        self._instance_source_ids = tuple(
+            dict.fromkeys(
+                source_id
+                for value in instance_source_ids
+                if (source_id := str(value).strip())
+            )
+        )
         self.result: AtlasDrawCallEstimate | None = None
         self.error_message: str | None = None
         self.was_cancelled = False
@@ -731,6 +751,7 @@ class _AtlasDrawCallEstimateThread(QThread):
                 pre_atlas_scene.model,
                 self._atlases,
                 surface_source_ids=pre_atlas_scene.surface_source_ids,
+                instance_source_ids=self._instance_source_ids,
             )
         except Exception as error:  # noqa: BLE001 - worker failures cross Qt safely.
             if self.isInterruptionRequested():
@@ -818,6 +839,7 @@ def _build_surface_ao_pre_atlas_scene(
     return _PreAtlasExportScene(
         model=generated_model,
         placed_models=tuple(placements),
+        instance_source_models=(),
         surface_source_ids=dict(snapshot.surface_source_ids),
     )
 
@@ -878,6 +900,7 @@ class _AtlasDrawCallEstimateSnapshot:
     atlas_layout_signature: tuple[tuple[object, ...], ...]
     required_source_ids: tuple[str, ...]
     surface_source_signature: tuple[tuple[str, str], ...]
+    instance_source_ids: tuple[str, ...]
 
 
 @dataclass
@@ -1013,6 +1036,8 @@ class _CanvasPlacedObjectUndoState:
     restore_atlas_bindings: bool = False
     selected_object_ids: tuple[str, ...] | None = None
     active_object_id: str | None = None
+    source_object_id: str | None = None
+    child_instances: tuple[GeneratedObjectInstance, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1030,6 +1055,7 @@ class _DirectObjectPlacementSession:
     placeable_ids: tuple[str, ...] = ()
     generation_request_token: str | None = None
     accepts_next_generation_batch: bool = False
+    instance_source_object_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1828,11 +1854,20 @@ class BlueprintWorkspace(QWidget):
         self.texture_atlas_workspace.surface_textures_selected.connect(
             self._handle_atlas_surface_textures_selected
         )
+        self.texture_atlas_workspace.object_rename_requested.connect(
+            self._handle_atlas_object_rename_requested
+        )
+        self.texture_atlas_workspace.surface_texture_rename_requested.connect(
+            self._handle_atlas_surface_texture_rename_requested
+        )
         self.texture_atlas_workspace.surface_texture_repeat_size_changed.connect(
             self._handle_atlas_surface_texture_repeat_size_changed
         )
         self.texture_atlas_workspace.object_place_requested.connect(
             self._handle_atlas_object_place_requested
+        )
+        self.texture_atlas_workspace.object_instance_place_requested.connect(
+            self._handle_atlas_object_instance_place_requested
         )
         self.texture_atlas_workspace.object_delete_requested.connect(
             self._handle_atlas_object_delete_requested
@@ -1998,6 +2033,9 @@ class BlueprintWorkspace(QWidget):
         self.generation.generated_object_placement_changed.connect(
             self._handle_generated_object_placement_changed_for_canvas
         )
+        self.generation.generated_object_instances_changed.connect(
+            self._handle_generated_object_instances_changed_for_canvas
+        )
         self.generation.generated_object_deleted.connect(
             self._handle_generated_object_deleted_for_canvas
         )
@@ -2073,6 +2111,9 @@ class BlueprintWorkspace(QWidget):
         )
         self.viewer.placed_object_axis_scales_changed.connect(
             self._handle_placed_object_axis_scales_changed
+        )
+        self.viewer.placed_object_instance_requested.connect(
+            self._handle_placed_object_instance_requested
         )
         self.viewer.placed_object_selection_changed.connect(
             self._handle_canvas_placed_object_selection_changed
@@ -3542,7 +3583,7 @@ class BlueprintWorkspace(QWidget):
         self.load_button.clicked.connect(self._handle_load_clicked)
         buttons_layout.addWidget(self.load_button)
 
-        self.export_button = QPushButton("GLB")
+        self.export_button = QPushButton("Export")
         self.export_button.setMinimumHeight(56)
         self.export_button.setStyleSheet("font-size: 18px; font-weight: 600;")
         self.export_button.clicked.connect(self._handle_glb_export_clicked)
@@ -5902,16 +5943,57 @@ class BlueprintWorkspace(QWidget):
     ) -> int:
         """Restore one object's prior placement and eligible Atlas bindings."""
 
-        restored = self.generation.restore_placeable_object_placement(
-            state.object_id,
-            state.placement,
-            emit_change_signals=False,
-        )
+        instance_state_changed = False
+        if state.source_object_id is not None:
+            current_instance = self.generation.get_generated_object_instance(
+                state.object_id
+            )
+            if state.placement is None:
+                restored = bool(
+                    current_instance is not None
+                    and self.generation.remove_generated_object_instance(
+                        state.object_id,
+                        emit_change_signals=False,
+                    )
+                )
+            elif current_instance is None:
+                restored = self.generation.restore_generated_object_instance(
+                    GeneratedObjectInstance(
+                        instance_id=state.object_id,
+                        source_object_id=state.source_object_id,
+                        placement=state.placement,
+                    ),
+                    emit_change_signals=False,
+                )
+            else:
+                restored = self.generation.update_generated_object_instance(
+                    state.object_id,
+                    state.placement,
+                    emit_change_signals=False,
+                )
+            instance_state_changed = restored
+        else:
+            restored = self.generation.restore_placeable_object_placement(
+                state.object_id,
+                state.placement,
+                emit_change_signals=False,
+            )
         if not restored:
             raise ValueError("The placed object in this undo step no longer exists.")
+        for instance in state.child_instances:
+            if not self.generation.restore_generated_object_instance(
+                instance,
+                emit_change_signals=False,
+            ):
+                raise ValueError(
+                    "A linked instance in this undo step could not be restored."
+                )
+            instance_state_changed = True
+        if instance_state_changed:
+            self.generation.publish_generated_object_instance_changes()
         if state.restore_atlas_bindings and state.placement is None:
             self.texture_atlas_workspace.remove_scene_texture_from_atlases(
-                state.object_id
+                state.source_object_id or state.object_id
             )
         skipped_atlas_placements = (
             self._restore_canvas_atlas_placements(state.atlas_placements)
@@ -5941,8 +6023,7 @@ class BlueprintWorkspace(QWidget):
                 dict.fromkeys(
                     object_id
                     for object_id in state.selected_object_ids
-                    if self.generation.get_generated_object_placement(object_id)
-                    is not None
+                    if self.generation.get_scene_object_placement(object_id) is not None
                 )
             )
             active_object_id = (
@@ -7263,7 +7344,7 @@ class BlueprintWorkspace(QWidget):
                 if (object_id := str(value).strip())
                 and (
                     (
-                        placement := self.generation.get_generated_object_placement(
+                        placement := self.generation.get_scene_object_placement(
                             object_id
                         )
                     )
@@ -7376,7 +7457,11 @@ class BlueprintWorkspace(QWidget):
             self._atlas_surface_assignment_target_ids = ()
             self._sync_surface_generation_selection(())
         if normalized_active_id is not None:
-            self.generation.select_generated_object(normalized_active_id)
+            source_object_id = self.generation.get_scene_object_source_id(
+                normalized_active_id
+            )
+            if source_object_id is not None:
+                self.generation.select_generated_object(source_object_id)
         self._sync_atlas_texture_selection_from_canvas_scene()
 
     def _sync_blueprint_placed_object_selection(self) -> None:
@@ -7395,13 +7480,25 @@ class BlueprintWorkspace(QWidget):
         object_ids = self._desired_canvas_object_ids
         if object_ids:
             textured_object_ids = tuple(
-                object_id
-                for object_id in object_ids
-                if self.generation.get_active_texture_variant(object_id) is not None
+                dict.fromkeys(
+                    source_object_id
+                    for object_id in object_ids
+                    if (
+                        source_object_id := (
+                            self.generation.get_scene_object_source_id(object_id)
+                        )
+                    )
+                    is not None
+                    and self.generation.get_active_texture_variant(source_object_id)
+                    is not None
+                )
+            )
+            desired_active_source_id = self.generation.get_scene_object_source_id(
+                self._desired_canvas_object_id or ""
             )
             active_object_id = (
-                self._desired_canvas_object_id
-                if self._desired_canvas_object_id in textured_object_ids
+                desired_active_source_id
+                if desired_active_source_id in textured_object_ids
                 else None
             )
             self.texture_atlas_workspace.select_source_ids(
@@ -7672,6 +7769,7 @@ class BlueprintWorkspace(QWidget):
                 signature.append(tuple(item) if isinstance(item, tuple) else (item,))
                 continue
             placement = item[1]
+            is_instance = len(item) >= 7 and item[5] is True
             signature.append(
                 (
                     item[0],
@@ -7682,9 +7780,31 @@ class BlueprintWorkspace(QWidget):
                     ),
                     item[2],
                     item[4],
+                    str(item[6]) if is_instance else None,
                 )
             )
         return tuple(signature)
+
+    def _build_atlas_draw_call_instance_source_ids(self) -> tuple[str, ...]:
+        """Return JSON-instance sources counted as independent draw calls."""
+
+        included_level_indices = {
+            level.index for level in self.levels if level.include_in_export
+        }
+        source_ids: list[str] = []
+        for item in self.generation.get_placed_preview_dependency_signature():
+            if (
+                not isinstance(item, tuple)
+                or len(item) < 7
+                or item[5] is not True
+                or not isinstance(item[1], GeneratedObjectPlacement)
+                or item[1].level_index not in included_level_indices
+            ):
+                continue
+            source_id = str(item[6]).strip()
+            if source_id:
+                source_ids.append(source_id)
+        return tuple(dict.fromkeys(source_ids))
 
     def _capture_atlas_draw_call_estimate_request(
         self,
@@ -7698,6 +7818,9 @@ class BlueprintWorkspace(QWidget):
         scene_revision = self._atlas_draw_call_scene_revision
         dependency_signature_before = self._build_viewer_preview_dependency_signature()
         draw_call_dependency_before = self._build_atlas_draw_call_dependency_signature()
+        instance_source_ids_before = (
+            self._build_atlas_draw_call_instance_source_ids()
+        )
         scene_snapshot = self._capture_surface_ao_scene_snapshot(
             dependency_signature_before
         )
@@ -7708,10 +7831,14 @@ class BlueprintWorkspace(QWidget):
         )
         dependency_signature_after = self._build_viewer_preview_dependency_signature()
         draw_call_dependency_after = self._build_atlas_draw_call_dependency_signature()
+        instance_source_ids_after = (
+            self._build_atlas_draw_call_instance_source_ids()
+        )
         if (
             scene_revision != self._atlas_draw_call_scene_revision
             or dependency_signature_before != dependency_signature_after
             or draw_call_dependency_before != draw_call_dependency_after
+            or instance_source_ids_before != instance_source_ids_after
             or atlas_layout_signature
             != self._build_atlas_draw_call_layout_signature(
                 self.texture_atlas_workspace.get_data().atlases,
@@ -7729,6 +7856,7 @@ class BlueprintWorkspace(QWidget):
             atlas_layout_signature=atlas_layout_signature,
             required_source_ids=scene_snapshot.required_source_ids,
             surface_source_signature=scene_snapshot.surface_source_ids,
+            instance_source_ids=instance_source_ids_after,
         )
         return scene_snapshot, atlases, snapshot
 
@@ -7748,6 +7876,11 @@ class BlueprintWorkspace(QWidget):
         if (
             tuple(sorted(self._build_atlas_surface_source_ids().items()))
             != snapshot.surface_source_signature
+        ):
+            return False
+        if (
+            self._build_atlas_draw_call_instance_source_ids()
+            != snapshot.instance_source_ids
         ):
             return False
         return (
@@ -7797,7 +7930,12 @@ class BlueprintWorkspace(QWidget):
             return
 
         request_id = self._cancel_atlas_draw_call_estimate_preparations()
-        thread = _AtlasDrawCallEstimateThread(scene_snapshot, atlases, parent=self)
+        thread = _AtlasDrawCallEstimateThread(
+            scene_snapshot,
+            atlases,
+            snapshot.instance_source_ids,
+            parent=self,
+        )
         runtime = _AtlasDrawCallEstimateRuntime(
             request_id=request_id,
             thread=thread,
@@ -7933,11 +8071,51 @@ class BlueprintWorkspace(QWidget):
         }
         base_z_by_level_index = build_level_base_z_lookup(levels)
         object_names = self.generation.get_generated_object_names_by_id()
+
+        # A shared Atlas texture can contain only one AO bake per source. Use
+        # one representative placement for estimator and bake calculations;
+        # this geometry is never copied into the exported GLB.
+        authored_source_ids: set[str] = set()
+        instance_carrier_ids: dict[str, str] = {}
+        for raw_item in dependency_signature[1]:
+            if not isinstance(raw_item, tuple) or len(raw_item) < 5:
+                raise RuntimeError("A placed-object AO dependency is invalid.")
+            placement = raw_item[1]
+            if (
+                not isinstance(placement, GeneratedObjectPlacement)
+                or placement.level_index not in visible_level_by_index
+            ):
+                continue
+            is_instance = len(raw_item) >= 6 and raw_item[5] is True
+            if not is_instance:
+                authored_source_ids.add(str(raw_item[0]))
+                continue
+            if len(raw_item) < 7:
+                raise RuntimeError("A placed-object instance source is invalid.")
+            source_id = str(raw_item[6]).strip()
+            instance_id = str(raw_item[0]).strip()
+            if not source_id or not instance_id:
+                raise RuntimeError("A placed-object instance source is invalid.")
+            current_carrier_id = instance_carrier_ids.get(source_id)
+            if current_carrier_id is None or instance_id < current_carrier_id:
+                instance_carrier_ids[source_id] = instance_id
+
         placed_models: list[_PlacedGeneratedModelFileSnapshot] = []
         for raw_item in dependency_signature[1]:
             if not isinstance(raw_item, tuple) or len(raw_item) < 5:
                 raise RuntimeError("A placed-object AO dependency is invalid.")
-            object_id = str(raw_item[0])
+            is_instance = len(raw_item) >= 6 and raw_item[5] is True
+            object_id = str(raw_item[0]).strip()
+            if is_instance:
+                if len(raw_item) < 7:
+                    raise RuntimeError("A placed-object instance source is invalid.")
+                source_id = str(raw_item[6]).strip()
+                if (
+                    source_id in authored_source_ids
+                    or instance_carrier_ids.get(source_id) != object_id
+                ):
+                    continue
+                object_id = source_id
             placement = raw_item[1]
             asset_revision = raw_item[2]
             symmetry = raw_item[4]
@@ -9024,7 +9202,7 @@ class BlueprintWorkspace(QWidget):
         default_path = Path.cwd() / "housemaker_export.glb"
         file_path, _ = QFileDialog.getSaveFileName(
             self,
-            "Export GLB",
+            "Export",
             str(default_path),
             "GLB Files (*.glb)",
         )
@@ -9053,7 +9231,19 @@ class BlueprintWorkspace(QWidget):
         generated_model, _dependency_signature = validated_build
 
         try:
+            source_placements, instance_placements = (
+                self._build_export_placed_models()
+            )
+            source_placements_by_id = {
+                placement.object_id: placement
+                for placement in source_placements
+            }
             exported_path = export_glb_file(generated_model, export_path)
+            manifest_path = write_runtime_scene_manifest(
+                exported_path,
+                source_placements=source_placements_by_id,
+                instance_placements=instance_placements,
+            )
         except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Export failed", str(error))
             return
@@ -9066,8 +9256,8 @@ class BlueprintWorkspace(QWidget):
             self._ensure_viewer_preview_current(preserve_camera=True)
         QMessageBox.information(
             self,
-            "GLB exported",
-            f"Saved GLB to:\n{exported_path}",
+            "Export complete",
+            f"Saved GLB to:\n{exported_path}\n\nSaved scene data to:\n{manifest_path}",
         )
 
     def _refresh_blueprint_file_dependencies(
@@ -9305,6 +9495,12 @@ class BlueprintWorkspace(QWidget):
         ):
             return
         self._direct_object_placement_session = None
+        if session.instance_source_object_id is not None:
+            self._commit_generated_object_instance_placement(
+                session.instance_source_object_id,
+                raw_candidate,
+            )
+            return
         if session.accepts_next_generation_batch and not session.placeable_ids:
             anchor = raw_candidate.world_positions[0]
             self._pending_generation_placement_anchor = SceneObjectPlacementCandidate(
@@ -9332,6 +9528,62 @@ class BlueprintWorkspace(QWidget):
             session.placeable_ids,
             raw_candidate,
         )
+
+    def _commit_generated_object_instance_placement(
+        self,
+        source_object_id: str,
+        candidate: SceneObjectPlacementCandidate,
+    ) -> bool:
+        """Create one linked runtime instance from a 3D floor-picker result."""
+
+        source_placement = self.generation.get_generated_object_placement(
+            source_object_id
+        )
+        placement = self._build_generated_object_placement_from_world(
+            candidate.level_index,
+            candidate.world_positions[0],
+        )
+        if placement is None:
+            self.texture_atlas_workspace.status_label.setText(
+                "The object instance could not be mapped to the selected level."
+            )
+            return False
+        if source_placement is not None:
+            placement = replace(
+                placement,
+                rotation_degrees=source_placement.rotation_degrees,
+                scale=source_placement.scale,
+                axis_scales=source_placement.axis_scales,
+            )
+        previous_atlas_placements = self._capture_canvas_atlas_placements(
+            source_object_id
+        )
+        instance = self.generation.add_generated_object_instance(
+            source_object_id,
+            placement,
+        )
+        if instance is None:
+            self.texture_atlas_workspace.status_label.setText(
+                "The object instance could not be placed."
+            )
+            return False
+        self._record_canvas_undo_state(
+            _CanvasPlacedObjectUndoState(
+                object_id=instance.instance_id,
+                source_object_id=source_object_id,
+                placement=None,
+                atlas_placements=previous_atlas_placements,
+                restore_atlas_bindings=True,
+                selected_object_ids=self._desired_canvas_object_ids,
+                active_object_id=self._desired_canvas_object_id,
+            )
+        )
+        self._remember_desired_canvas_object_selection(
+            (instance.instance_id,),
+            active_object_id=instance.instance_id,
+        )
+        self.texture_atlas_workspace.status_label.setText("Object instance placed.")
+        return True
 
     def _commit_generation_owned_placement_request(
         self,
@@ -9636,11 +9888,16 @@ class BlueprintWorkspace(QWidget):
         raw_record: object,
         _generated_model: object,
     ) -> None:
-        """Refresh the Canvas model after one placed object revision changes."""
+        """Refresh revisions represented by a source placement or instances."""
 
         if (
             isinstance(raw_record, GeneratedObjectRecord)
-            and raw_record.placement is not None
+            and (
+                raw_record.placement is not None
+                or self.generation.get_generated_object_instances(
+                    raw_record.object_id
+                )
+            )
         ):
             self._sync_canvas_placed_object_profiles()
             self._schedule_viewer_preview_refresh(preserve_camera=True)
@@ -9654,6 +9911,26 @@ class BlueprintWorkspace(QWidget):
         if isinstance(raw_record, GeneratedObjectRecord):
             self._sync_canvas_placed_object_profiles()
             self._schedule_viewer_preview_refresh(preserve_camera=True)
+
+    def _handle_generated_object_instances_changed_for_canvas(
+        self,
+        _instances: object,
+    ) -> None:
+        """Refresh both scene overlays after an instance is added or removed."""
+
+        retained_selection = tuple(
+            object_id
+            for object_id in self._desired_canvas_object_ids
+            if self.generation.get_scene_object_placement(object_id) is not None
+        )
+        if retained_selection != self._desired_canvas_object_ids:
+            self._remember_desired_canvas_object_selection(
+                retained_selection,
+                active_object_id=self._desired_canvas_object_id,
+            )
+        self._sync_canvas_placed_object_profiles()
+        self._sync_viewer_scene_levels()
+        self._schedule_viewer_preview_refresh(preserve_camera=True)
 
     def _capture_canvas_atlas_placements(
         self,
@@ -9679,7 +9956,10 @@ class BlueprintWorkspace(QWidget):
         retained_states: list[_CanvasUndoState] = []
         for state in self._canvas_undo_stack:
             if isinstance(state, _CanvasPlacedObjectUndoState):
-                if state.object_id != normalized_object_id:
+                if (
+                    state.object_id != normalized_object_id
+                    and state.source_object_id != normalized_object_id
+                ):
                     retained_states.append(state)
                 continue
             if isinstance(state, _CanvasPlacedObjectGroupUndoState):
@@ -9687,6 +9967,7 @@ class BlueprintWorkspace(QWidget):
                     member
                     for member in state.members
                     if member.object_id != normalized_object_id
+                    and member.source_object_id != normalized_object_id
                 )
                 if members:
                     retained_states.append(
@@ -9761,27 +10042,160 @@ class BlueprintWorkspace(QWidget):
         """Remove a Canvas placement and unassign its texture from Atlases."""
 
         normalized_object_id = str(object_id).strip()
-        existing_placement = self.generation.get_generated_object_placement(
+        instance = self.generation.get_generated_object_instance(
+            normalized_object_id
+        )
+        if instance is not None:
+            selected_object_ids = self._desired_canvas_object_ids
+            active_object_id = self._desired_canvas_object_id
+            source_instances = self.generation.get_generated_object_instances(
+                instance.source_object_id
+            )
+            removes_last_scene_occurrence = (
+                self.generation.get_generated_object_placement(
+                    instance.source_object_id
+                )
+                is None
+                and len(source_instances) == 1
+            )
+            atlas_placements = (
+                self._capture_canvas_atlas_placements(instance.source_object_id)
+                if removes_last_scene_occurrence
+                else ()
+            )
+            if self.generation.remove_generated_object_instance(
+                normalized_object_id
+            ):
+                self._record_canvas_undo_state(
+                    _CanvasPlacedObjectUndoState(
+                        object_id=normalized_object_id,
+                        source_object_id=instance.source_object_id,
+                        placement=instance.placement,
+                        atlas_placements=atlas_placements,
+                        restore_atlas_bindings=removes_last_scene_occurrence,
+                        selected_object_ids=selected_object_ids,
+                        active_object_id=active_object_id,
+                    )
+                )
+                self._discard_desired_canvas_object(normalized_object_id)
+                if removes_last_scene_occurrence:
+                    self.texture_atlas_workspace.remove_scene_texture_from_atlases(
+                        instance.source_object_id
+                    )
+                self._sync_canvas_placed_object_profiles()
+            return
+        existing_placement = self.generation.get_scene_object_placement(
             normalized_object_id
         )
         atlas_placements = self._capture_canvas_atlas_placements(normalized_object_id)
         if self.generation.remove_generated_object_placement(normalized_object_id):
+            source_remains_in_scene = bool(
+                self.generation.get_generated_object_instances(normalized_object_id)
+            )
             if existing_placement is not None:
                 self._record_canvas_undo_state(
                     _CanvasPlacedObjectUndoState(
                         object_id=normalized_object_id,
                         placement=existing_placement,
-                        atlas_placements=atlas_placements,
-                        restore_atlas_bindings=True,
+                        atlas_placements=(
+                            () if source_remains_in_scene else atlas_placements
+                        ),
+                        restore_atlas_bindings=not source_remains_in_scene,
                     )
                 )
             self._discard_desired_canvas_object(normalized_object_id)
-            self.texture_atlas_workspace.remove_scene_texture_from_atlases(
-                normalized_object_id
-            )
+            if not source_remains_in_scene:
+                self.texture_atlas_workspace.remove_scene_texture_from_atlases(
+                    normalized_object_id
+                )
             self._sync_canvas_placed_object_profiles()
             return
         self._schedule_viewer_preview_refresh(preserve_camera=True)
+
+    def _update_scene_object_placement(
+        self,
+        scene_object_id: str,
+        placement: GeneratedObjectPlacement,
+        *,
+        emit_change_signals: bool,
+    ) -> bool:
+        """Update either an authored object or one linked runtime instance."""
+
+        if self.generation.get_generated_object_instance(scene_object_id) is not None:
+            return self.generation.update_generated_object_instance(
+                scene_object_id,
+                placement,
+                emit_change_signals=emit_change_signals,
+            )
+        return self.generation.update_generated_object_placement(
+            scene_object_id,
+            placement,
+            emit_change_signals=emit_change_signals,
+        )
+
+    def _get_instance_source_for_undo(self, scene_object_id: str) -> str | None:
+        """Return a source ID only when the scene object is a linked instance."""
+
+        instance = self.generation.get_generated_object_instance(scene_object_id)
+        return None if instance is None else instance.source_object_id
+
+    def _handle_placed_object_instance_requested(self, raw_request: object) -> None:
+        """Persist one clone created with the viewer's dedicated instance handle."""
+
+        if not isinstance(raw_request, PlacedObjectInstanceRequest):
+            return
+        source_scene_object_id = raw_request.source_scene_object_id
+        source_placement = self.generation.get_scene_object_placement(
+            source_scene_object_id
+        )
+        source_object_id = self.generation.get_scene_object_source_id(
+            source_scene_object_id
+        )
+        if source_placement is None or source_object_id is None:
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+            return
+        placement = self._build_generated_object_placement_from_world(
+            source_placement.level_index,
+            raw_request.world_position,
+        )
+        if placement is None:
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+            return
+        try:
+            placement = replace(
+                placement,
+                rotation_degrees=raw_request.rotation_degrees,
+                scale=raw_request.scale,
+                axis_scales=raw_request.axis_scales,
+            )
+        except (TypeError, ValueError, OverflowError):
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+            return
+        previous_atlas_placements = self._capture_canvas_atlas_placements(
+            source_object_id
+        )
+        instance = self.generation.add_generated_object_instance(
+            source_object_id,
+            placement,
+        )
+        if instance is None:
+            self._schedule_viewer_preview_refresh(preserve_camera=True)
+            return
+        self._record_canvas_undo_state(
+            _CanvasPlacedObjectUndoState(
+                object_id=instance.instance_id,
+                source_object_id=source_object_id,
+                placement=None,
+                atlas_placements=previous_atlas_placements,
+                restore_atlas_bindings=True,
+                selected_object_ids=self._desired_canvas_object_ids,
+                active_object_id=self._desired_canvas_object_id,
+            )
+        )
+        self._remember_desired_canvas_object_selection(
+            (instance.instance_id,),
+            active_object_id=instance.instance_id,
+        )
 
     def _handle_placed_object_transform_changed(
         self,
@@ -9792,7 +10206,7 @@ class BlueprintWorkspace(QWidget):
         """Convert one world-space gizmo commit back to level-relative state."""
 
         normalized_object_id = str(object_id).strip()
-        existing_placement = self.generation.get_generated_object_placement(
+        existing_placement = self.generation.get_scene_object_placement(
             normalized_object_id
         )
         if existing_placement is None:
@@ -9850,7 +10264,7 @@ class BlueprintWorkspace(QWidget):
             )
             if canvas_was_current:
                 dependency_signature_before = current_dependency_signature
-        was_updated = self.generation.update_generated_object_placement(
+        was_updated = self._update_scene_object_placement(
             normalized_object_id,
             placement,
             emit_change_signals=False,
@@ -9862,6 +10276,9 @@ class BlueprintWorkspace(QWidget):
             self._record_canvas_undo_state(
                 _CanvasPlacedObjectUndoState(
                     object_id=normalized_object_id,
+                    source_object_id=self._get_instance_source_for_undo(
+                        normalized_object_id
+                    ),
                     placement=existing_placement,
                     selected_object_ids=self._desired_canvas_object_ids,
                     active_object_id=self._desired_canvas_object_id,
@@ -9904,7 +10321,7 @@ class BlueprintWorkspace(QWidget):
         """Persist one release-only move or rotation from the 2D Canvas."""
 
         normalized_object_id = str(object_id).strip()
-        existing = self.generation.get_generated_object_placement(normalized_object_id)
+        existing = self.generation.get_scene_object_placement(normalized_object_id)
         if existing is None or existing.level_index != self.current_level.index:
             self._sync_canvas_placed_object_profiles()
             return
@@ -9957,7 +10374,7 @@ class BlueprintWorkspace(QWidget):
                     replacement.rotation_degrees,
                 )
                 return
-        if not self.generation.update_generated_object_placement(
+        if not self._update_scene_object_placement(
             normalized_object_id,
             replacement,
             emit_change_signals=False,
@@ -9968,6 +10385,9 @@ class BlueprintWorkspace(QWidget):
             self._record_canvas_undo_state(
                 _CanvasPlacedObjectUndoState(
                     object_id=normalized_object_id,
+                    source_object_id=self._get_instance_source_for_undo(
+                        normalized_object_id
+                    ),
                     placement=existing,
                     selected_object_ids=self._desired_canvas_object_ids,
                     active_object_id=self._desired_canvas_object_id,
@@ -9996,7 +10416,7 @@ class BlueprintWorkspace(QWidget):
                 normalized_object_id = str(object_id).strip()
                 if not normalized_object_id or normalized_object_id in seen_object_ids:
                     raise ValueError("Placed-object scale IDs must be unique.")
-                existing = self.generation.get_generated_object_placement(
+                existing = self.generation.get_scene_object_placement(
                     normalized_object_id
                 )
                 if existing is None:
@@ -10034,13 +10454,13 @@ class BlueprintWorkspace(QWidget):
             tuple[str, GeneratedObjectPlacement, GeneratedObjectPlacement]
         ] = []
         for object_id, existing, replacement in normalized_updates:
-            if not self.generation.update_generated_object_placement(
+            if not self._update_scene_object_placement(
                 object_id,
                 replacement,
                 emit_change_signals=False,
             ):
                 for committed_id, previous, _next in reversed(committed_updates):
-                    self.generation.update_generated_object_placement(
+                    self._update_scene_object_placement(
                         committed_id,
                         previous,
                         emit_change_signals=False,
@@ -10053,6 +10473,7 @@ class BlueprintWorkspace(QWidget):
             undo_members = tuple(
                 _CanvasPlacedObjectUndoState(
                     object_id=object_id,
+                    source_object_id=self._get_instance_source_for_undo(object_id),
                     placement=existing,
                     selected_object_ids=self._desired_canvas_object_ids,
                     active_object_id=self._desired_canvas_object_id,
@@ -10124,7 +10545,7 @@ class BlueprintWorkspace(QWidget):
             self._schedule_viewer_preview_refresh(preserve_camera=True)
             return
 
-        existing = self.generation.get_generated_object_placement(normalized_object_id)
+        existing = self.generation.get_scene_object_placement(normalized_object_id)
         if existing is None:
             self._schedule_viewer_preview_refresh(preserve_camera=True)
             return
@@ -10153,7 +10574,7 @@ class BlueprintWorkspace(QWidget):
             if canvas_was_current:
                 dependency_signature_before = current_dependency_signature
 
-        if not self.generation.update_generated_object_placement(
+        if not self._update_scene_object_placement(
             normalized_object_id,
             replacement,
             emit_change_signals=False,
@@ -10164,6 +10585,9 @@ class BlueprintWorkspace(QWidget):
             self._record_canvas_undo_state(
                 _CanvasPlacedObjectUndoState(
                     object_id=normalized_object_id,
+                    source_object_id=self._get_instance_source_for_undo(
+                        normalized_object_id
+                    ),
                     placement=existing,
                     selected_object_ids=self._desired_canvas_object_ids,
                     active_object_id=self._desired_canvas_object_id,
@@ -10329,10 +10753,17 @@ class BlueprintWorkspace(QWidget):
         normalized_id = str(object_id).strip()
         if not normalized_id:
             return
+        scene_object_ids = self._scene_object_ids_for_atlas_sources(
+            (normalized_id,)
+        )
+        active_scene_object_id = self._active_scene_object_id_for_atlas_source(
+            normalized_id,
+            scene_object_ids,
+        )
         self._selected_atlas_surface_source_id = None
         self._atlas_surface_assignment_target_ids = ()
-        self._desired_canvas_object_id = normalized_id
-        self._desired_canvas_object_ids = (normalized_id,)
+        self._desired_canvas_object_id = active_scene_object_id
+        self._desired_canvas_object_ids = scene_object_ids
         self._sync_blueprint_placed_object_selection()
         self._desired_canvas_surface_ids = ()
         self._desired_canvas_architectural_trim_part_ids = ()
@@ -10343,12 +10774,19 @@ class BlueprintWorkspace(QWidget):
         self._sync_atlas_green_outline_to_canvas_highlight(None)
         self._is_syncing_canvas_scene_selection = True
         try:
-            self.viewer.select_placed_object(None)
+            if scene_object_ids == (normalized_id,):
+                self.viewer.select_placed_object(None)
             self.viewer.select_canvas_opening(None)
             self.viewer.select_wall_target(None)
             self.viewer.set_selected_canvas_stair_part_ids(())
             self.viewer.set_selected_architectural_trim_part_ids(())
-            self.viewer.select_placed_object(normalized_id)
+            if scene_object_ids == (normalized_id,):
+                self.viewer.select_placed_object(normalized_id)
+            else:
+                self.viewer.set_selected_placed_object_ids(
+                    scene_object_ids,
+                    active_object_id=active_scene_object_id,
+                )
         finally:
             self._is_syncing_canvas_scene_selection = False
 
@@ -10379,10 +10817,15 @@ class BlueprintWorkspace(QWidget):
         if len(normalized_ids) == 1:
             self._handle_atlas_object_texture_selected(active_id)
             return
+        scene_object_ids = self._scene_object_ids_for_atlas_sources(normalized_ids)
+        active_scene_object_id = self._active_scene_object_id_for_atlas_source(
+            active_id,
+            scene_object_ids,
+        )
         self._selected_atlas_surface_source_id = None
         self._atlas_surface_assignment_target_ids = ()
-        self._desired_canvas_object_id = active_id
-        self._desired_canvas_object_ids = normalized_ids
+        self._desired_canvas_object_id = active_scene_object_id
+        self._desired_canvas_object_ids = scene_object_ids
         self._sync_blueprint_placed_object_selection()
         self._desired_canvas_surface_ids = ()
         self._desired_canvas_architectural_trim_part_ids = ()
@@ -10398,11 +10841,62 @@ class BlueprintWorkspace(QWidget):
             self.viewer.set_selected_canvas_stair_part_ids(())
             self.viewer.set_selected_architectural_trim_part_ids(())
             self.viewer.set_selected_placed_object_ids(
-                normalized_ids,
-                active_object_id=active_id,
+                scene_object_ids,
+                active_object_id=active_scene_object_id,
             )
         finally:
             self._is_syncing_canvas_scene_selection = False
+
+    def _scene_object_ids_for_atlas_sources(
+        self,
+        source_object_ids: Sequence[str],
+    ) -> tuple[str, ...]:
+        """Expand Atlas source IDs into every linked scene occurrence."""
+
+        scene_object_ids: list[str] = []
+        for source_object_id in source_object_ids:
+            source_occurrence_ids: list[str] = []
+            if (
+                self.generation.get_generated_object_placement(source_object_id)
+                is not None
+            ):
+                source_occurrence_ids.append(source_object_id)
+            source_occurrence_ids.extend(
+                instance.instance_id
+                for instance in self.generation.get_generated_object_instances(
+                    source_object_id
+                )
+            )
+            # Retain the established semantic selection for an unplaced source.
+            # The viewer safely ignores it until the source gains a placement.
+            if not source_occurrence_ids:
+                source_occurrence_ids.append(source_object_id)
+            scene_object_ids.extend(source_occurrence_ids)
+        return tuple(dict.fromkeys(scene_object_ids))
+
+    def _active_scene_object_id_for_atlas_source(
+        self,
+        source_object_id: str,
+        scene_object_ids: Sequence[str],
+    ) -> str:
+        """Choose the authored placement, then the first linked instance."""
+
+        if source_object_id in scene_object_ids:
+            return source_object_id
+        instance_ids = {
+            instance.instance_id
+            for instance in self.generation.get_generated_object_instances(
+                source_object_id
+            )
+        }
+        return next(
+            (
+                scene_object_id
+                for scene_object_id in scene_object_ids
+                if scene_object_id in instance_ids
+            ),
+            scene_object_ids[-1],
+        )
 
     def _handle_atlas_surface_texture_selected(self, source_id: str) -> None:
         """Highlight every Canvas surface using the selected texture family."""
@@ -10503,6 +10997,70 @@ class BlueprintWorkspace(QWidget):
                 f"Texture repeat size: {repeat_size_m:g} m."
             )
 
+    def _handle_atlas_object_rename_requested(
+        self,
+        object_id: str,
+        object_name: str,
+    ) -> None:
+        """Persist one Atlas object-list rename in Generation state."""
+
+        normalized_id = str(object_id).strip()
+        try:
+            self.generation.rename_generated_object(normalized_id, object_name)
+        except (TypeError, ValueError) as error:
+            self._atlas_generation_signature = None
+            self._sync_atlas_object_texture_sources(
+                automatically_assign_scene_textures=False
+            )
+            self.texture_atlas_workspace.status_label.setText(
+                "Object rename was not applied; its existing name was kept: "
+                f"{error}"
+            )
+            return
+        renamed_name = self.generation.get_placeable_object_names_by_id().get(
+            normalized_id,
+            str(object_name).strip(),
+        )
+        self.texture_atlas_workspace.status_label.setText(
+            f"Renamed object to {renamed_name}."
+        )
+
+    def _handle_atlas_surface_texture_rename_requested(
+        self,
+        source_id: str,
+        display_name: str,
+    ) -> None:
+        """Persist one Atlas surface-list rename in Surface generation state."""
+
+        assignment_id = get_atlas_wall_texture_assignment_id(source_id)
+        if assignment_id is None:
+            self._atlas_generation_signature = None
+            self._sync_atlas_object_texture_sources(
+                automatically_assign_scene_textures=False
+            )
+            self.texture_atlas_workspace.status_label.setText(
+                "The selected Surface texture cannot be renamed."
+            )
+            return
+        try:
+            renamed = self.surface_texture_generation.rename_assignment(
+                assignment_id,
+                display_name,
+            )
+        except (TypeError, ValueError) as error:
+            self._atlas_generation_signature = None
+            self._sync_atlas_object_texture_sources(
+                automatically_assign_scene_textures=False
+            )
+            self.texture_atlas_workspace.status_label.setText(
+                "Surface texture rename was not applied; its existing name was "
+                f"kept: {error}"
+            )
+            return
+        self.texture_atlas_workspace.status_label.setText(
+            f"Renamed Surface texture to {renamed.display_name}."
+        )
+
     def _set_atlas_canvas_surface_highlights(
         self,
         surface_ids: Sequence[str],
@@ -10560,6 +11118,24 @@ class BlueprintWorkspace(QWidget):
             return
         self.texture_atlas_workspace.status_label.setText(
             "The selected object is not currently available for placement."
+        )
+
+    def _handle_atlas_object_instance_place_requested(self, object_id: str) -> None:
+        """Arm the shared scene picker for an instance of an available object."""
+
+        source_object_id = str(object_id).strip()
+        preview_model = self.generation.get_generated_object_model(source_object_id)
+        if preview_model is None:
+            self.texture_atlas_workspace.status_label.setText(
+                "The selected object is not currently available for instancing."
+            )
+            return
+        self._begin_direct_object_placement(
+            _DirectObjectPlacementSession(
+                request_id=f"instance-placement-{uuid.uuid4().hex}",
+                instance_source_object_id=source_object_id,
+            ),
+            preview_model=preview_model,
         )
 
     def _handle_atlas_external_glb_import_requested(self) -> None:
@@ -10727,31 +11303,50 @@ class BlueprintWorkspace(QWidget):
             previous_state = self.generation.get_placeable_object_placement_state(
                 normalized_source_id
             )
+            child_instances = self.generation.get_generated_object_instances(
+                normalized_source_id
+            )
             previous_atlas_placements = self._capture_canvas_atlas_placements(
                 normalized_source_id
             )
             removed_from_canvas = self.generation.remove_placeable_object_placement(
                 normalized_source_id
             )
+            removed_instances = False
+            for instance in child_instances:
+                removed_instances = (
+                    self.generation.remove_generated_object_instance(
+                        instance.instance_id,
+                        emit_change_signals=False,
+                    )
+                    or removed_instances
+                )
+            if removed_instances:
+                self.generation.publish_generated_object_instance_changes()
             removed_from_atlases = (
                 self.texture_atlas_workspace.remove_scene_texture_from_atlases(
                     normalized_source_id
                 )
             )
-            if removed_from_canvas and previous_state is not None:
-                stable_id, previous_placement = previous_state
+            if removed_from_canvas or removed_instances:
+                stable_id, previous_placement = (
+                    previous_state
+                    if previous_state is not None
+                    else (normalized_source_id, None)
+                )
                 self._record_canvas_undo_state(
                     _CanvasPlacedObjectUndoState(
                         object_id=stable_id,
                         placement=previous_placement,
                         atlas_placements=previous_atlas_placements,
                         restore_atlas_bindings=True,
+                        child_instances=child_instances,
                     )
                 )
             self._discard_desired_canvas_object(normalized_source_id)
             self._atlas_generation_signature = None
             self._sync_atlas_object_texture_sources()
-            if removed_from_canvas or removed_from_atlases:
+            if removed_from_canvas or removed_instances or removed_from_atlases:
                 self.texture_atlas_workspace.status_label.setText(
                     "Removed the selected object from Canvas and its texture "
                     "from the Atlas."
@@ -11777,6 +12372,16 @@ class BlueprintWorkspace(QWidget):
                 )
             ):
                 required_ids.append(object_id)
+        for instance in self.generation.get_generated_object_instances():
+            source_id = instance.source_object_id
+            if (
+                instance.placement.level_index in included_level_indices
+                and (
+                    source_id in self._atlas_available_source_ids
+                    or self.generation.has_generated_object_texture_variants(source_id)
+                )
+            ):
+                required_ids.append(source_id)
         exported_surface_ids = {
             surface.surface_id for surface in build_fixed_surfaces(self.levels)
         }
@@ -13212,6 +13817,12 @@ class BlueprintWorkspace(QWidget):
             for record in self.generation.get_data().generated_objects
             if record.placement is not None
         }
+        placed_object_levels.update(
+            {
+                instance.instance_id: instance.placement.level_index
+                for instance in self.generation.get_generated_object_instances()
+            }
+        )
         self.viewer.set_canvas_scene_levels(
             level_items,
             placed_object_levels=placed_object_levels,
@@ -13373,7 +13984,38 @@ class BlueprintWorkspace(QWidget):
             ),
             export_untextured_surfaces=False,
         )
-        placed_models = self._build_placed_generated_models()
+        authored_models, instance_models = self._build_export_placed_models()
+        runtime_source_ids = {
+            str(placement.source_object_id)
+            for placement in instance_models
+            if placement.source_object_id is not None
+        }
+        placed_models = tuple(
+            placement
+            for placement in authored_models
+            if placement.object_id not in runtime_source_ids
+        )
+        authored_by_source_id = {
+            placement.object_id: placement for placement in authored_models
+        }
+        instances_by_source_id: dict[str, list[PlacedGeneratedModel]] = {}
+        for placement in instance_models:
+            source_id = str(placement.source_object_id)
+            instances_by_source_id.setdefault(source_id, []).append(placement)
+        instance_source_models = tuple(
+            authored_by_source_id.get(source_id)
+            or min(
+                instances_by_source_id[source_id],
+                key=lambda placement: placement.object_id,
+            )
+            for source_id in sorted(runtime_source_ids)
+        )
+        pre_atlas_scene = _PreAtlasExportScene(
+            model=base_model,
+            placed_models=placed_models,
+            instance_source_models=instance_source_models,
+            surface_source_ids=self._build_atlas_surface_source_ids(),
+        )
         generated_model = (
             base_model
             if not placed_models
@@ -13382,11 +14024,12 @@ class BlueprintWorkspace(QWidget):
                 placed_models,
             )
         )
-        return _PreAtlasExportScene(
-            model=generated_model,
-            placed_models=placed_models,
-            surface_source_ids=self._build_atlas_surface_source_ids(),
-        )
+        if instance_source_models:
+            generated_model = compose_generated_model_instance_sources(
+                generated_model,
+                instance_source_models,
+            )
+        return replace(pre_atlas_scene, model=generated_model)
 
     def _build_atlas_surface_source_ids(self) -> dict[str, str]:
         """Map each assigned architectural surface to its Atlas source ID."""
@@ -13400,6 +14043,32 @@ class BlueprintWorkspace(QWidget):
             for surface_id in assignment.surface_ids:
                 source_ids[surface_id] = source_id
         return source_ids
+
+    def _build_export_placed_models(
+        self,
+    ) -> tuple[
+        tuple[PlacedGeneratedModel, ...],
+        tuple[PlacedGeneratedModel, ...],
+    ]:
+        """Choose included authored placements and JSON-only linked instances."""
+
+        all_placed_models = self._build_placed_generated_models(
+            include_instances=True
+        )
+        placed_models = tuple(
+            placement
+            for placement in all_placed_models
+            if placement.object_id == placement.source_object_id
+        )
+        instance_models = [
+            placement
+            for placement in all_placed_models
+            if placement.object_id != placement.source_object_id
+        ]
+        return (
+            placed_models,
+            tuple(instance_models),
+        )
 
     def _build_viewer_preview_model(
         self,
@@ -13423,7 +14092,8 @@ class BlueprintWorkspace(QWidget):
                     glb_bytes=b"",
                 )
             placed_models = self._build_placed_generated_models(
-                include_excluded_levels=True
+                include_excluded_levels=True,
+                include_instances=True,
             )
             if not placed_models:
                 return base_model
@@ -13440,8 +14110,9 @@ class BlueprintWorkspace(QWidget):
         self,
         *,
         include_excluded_levels: bool = False,
+        include_instances: bool = False,
     ) -> tuple[PlacedGeneratedModel, ...]:
-        """Resolve persisted Canvas clicks into current world positions."""
+        """Resolve authored placements and optional linked preview instances."""
 
         visible_level_by_index = {
             level.index: level
@@ -13451,59 +14122,91 @@ class BlueprintWorkspace(QWidget):
         if not visible_level_by_index:
             return ()
         base_z_by_level_index = build_level_base_z_lookup(self.levels)
+        generation_data = self.generation.get_data()
+        records_by_id = {
+            record.object_id: record for record in generation_data.generated_objects
+        }
         placed_models: list[PlacedGeneratedModel] = []
-        for record in self.generation.get_data().generated_objects:
+        for record in generation_data.generated_objects:
             placement = record.placement
             if placement is None:
                 continue
-            level = visible_level_by_index.get(placement.level_index)
-            base_z = base_z_by_level_index.get(placement.level_index)
-            if level is None or base_z is None:
-                continue
-            generated_model = self.generation.get_generated_object_model(
-                record.object_id
+            placed_model = self._resolve_placed_generated_model(
+                record,
+                scene_object_id=record.object_id,
+                source_object_id=record.object_id,
+                placement=placement,
+                visible_level_by_index=visible_level_by_index,
+                base_z_by_level_index=base_z_by_level_index,
             )
-            if generated_model is None:
-                if not self.generation.is_generated_object_asset_available(
-                    record.object_id
-                ):
+            if placed_model is not None:
+                placed_models.append(placed_model)
+        if include_instances:
+            for instance in generation_data.object_instances:
+                source_record = records_by_id.get(instance.source_object_id)
+                if source_record is None:
                     continue
-                object_name = getattr(
-                    record,
-                    "object_name",
-                    record.object_id,
+                placed_model = self._resolve_placed_generated_model(
+                    source_record,
+                    scene_object_id=instance.instance_id,
+                    source_object_id=instance.source_object_id,
+                    placement=instance.placement,
+                    visible_level_by_index=visible_level_by_index,
+                    base_z_by_level_index=base_z_by_level_index,
                 )
-                raise ValueError(
-                    f"Placed object '{object_name}' is temporarily unavailable."
-                )
-            symmetry = self.generation.resolve_symmetric_division_for_record(record)
-            world_x, world_y = level_image_to_world_xy(
-                level,
-                placement.image_x,
-                placement.image_y,
-            )
-            placed_models.append(
-                PlacedGeneratedModel(
-                    object_id=record.object_id,
-                    object_name=record.object_name,
-                    model=generated_model,
-                    world_position=(
-                        world_x,
-                        world_y,
-                        base_z + placement.height_offset_meters,
-                    ),
-                    symmetric_preview_orientation=(
-                        None if symmetry is None else symmetry.orientation
-                    ),
-                    symmetric_preview_plane_coordinate=(
-                        None if symmetry is None else symmetry.plane_coordinate
-                    ),
-                    rotation_degrees=placement.rotation_degrees,
-                    scale=placement.scale,
-                    axis_scales=placement.axis_scales,
-                )
-            )
+                if placed_model is not None:
+                    placed_models.append(placed_model)
         return tuple(placed_models)
+
+    def _resolve_placed_generated_model(
+        self,
+        record: GeneratedObjectRecord,
+        *,
+        scene_object_id: str,
+        source_object_id: str,
+        placement: GeneratedObjectPlacement,
+        visible_level_by_index: Mapping[int, LevelData],
+        base_z_by_level_index: Mapping[int, float],
+    ) -> PlacedGeneratedModel | None:
+        """Resolve one source-backed scene object without duplicating its asset."""
+
+        level = visible_level_by_index.get(placement.level_index)
+        base_z = base_z_by_level_index.get(placement.level_index)
+        if level is None or base_z is None:
+            return None
+        generated_model = self.generation.get_generated_object_model(record.object_id)
+        if generated_model is None:
+            if not self.generation.is_generated_object_asset_available(record.object_id):
+                return None
+            raise ValueError(
+                f"Placed object '{record.object_name}' is temporarily unavailable."
+            )
+        symmetry = self.generation.resolve_symmetric_division_for_record(record)
+        world_x, world_y = level_image_to_world_xy(
+            level,
+            placement.image_x,
+            placement.image_y,
+        )
+        return PlacedGeneratedModel(
+            object_id=scene_object_id,
+            source_object_id=source_object_id,
+            object_name=record.object_name,
+            model=generated_model,
+            world_position=(
+                world_x,
+                world_y,
+                base_z + placement.height_offset_meters,
+            ),
+            symmetric_preview_orientation=(
+                None if symmetry is None else symmetry.orientation
+            ),
+            symmetric_preview_plane_coordinate=(
+                None if symmetry is None else symmetry.plane_coordinate
+            ),
+            rotation_degrees=placement.rotation_degrees,
+            scale=placement.scale,
+            axis_scales=placement.axis_scales,
+        )
 
     def _sync_canvas_placed_object_profiles(self) -> None:
         """Publish current-level object footprints without loading in paint code."""
@@ -13522,41 +14225,20 @@ class BlueprintWorkspace(QWidget):
             return
 
         profiles: list[CanvasPlacedObjectProfile] = []
-        for record in self.generation.get_data().generated_objects:
-            placement = record.placement
+        try:
+            placed_models = self._build_placed_generated_models(
+                include_excluded_levels=True,
+                include_instances=True,
+            )
+        except (TypeError, ValueError, OverflowError):
+            placed_models = ()
+        for placed_model in placed_models:
+            placement = self.generation.get_scene_object_placement(
+                placed_model.object_id
+            )
             if placement is None or placement.level_index != level.index:
                 continue
-            generated_model = self.generation.get_generated_object_model(
-                record.object_id
-            )
-            if generated_model is None:
-                continue
             try:
-                symmetry = self.generation.resolve_symmetric_division_for_record(record)
-                world_x, world_y = level_image_to_world_xy(
-                    level,
-                    placement.image_x,
-                    placement.image_y,
-                )
-                placed_model = PlacedGeneratedModel(
-                    object_id=record.object_id,
-                    object_name=record.object_name,
-                    model=generated_model,
-                    world_position=(
-                        world_x,
-                        world_y,
-                        float(base_z) + placement.height_offset_meters,
-                    ),
-                    symmetric_preview_orientation=(
-                        None if symmetry is None else symmetry.orientation
-                    ),
-                    symmetric_preview_plane_coordinate=(
-                        None if symmetry is None else symmetry.plane_coordinate
-                    ),
-                    rotation_degrees=placement.rotation_degrees,
-                    scale=placement.scale,
-                    axis_scales=placement.axis_scales,
-                )
                 world_corners = build_placed_generated_model_top_down_footprint(
                     placed_model
                 )
@@ -13564,18 +14246,18 @@ class BlueprintWorkspace(QWidget):
                     level_world_to_image_xy(level, corner_x, corner_y)
                     for corner_x, corner_y in world_corners
                 )
-                profiles.append(
-                    CanvasPlacedObjectProfile(
-                        object_id=record.object_id,
-                        level_index=placement.level_index,
-                        anchor_x=placement.image_x,
-                        anchor_y=placement.image_y,
-                        corners=image_corners,
-                        rotation_degrees=placement.rotation_degrees,
-                    )
-                )
             except (TypeError, ValueError, OverflowError):
                 continue
+            profiles.append(
+                CanvasPlacedObjectProfile(
+                    object_id=placed_model.object_id,
+                    level_index=placement.level_index,
+                    anchor_x=placement.image_x,
+                    anchor_y=placement.image_y,
+                    corners=image_corners,
+                    rotation_degrees=placement.rotation_degrees,
+                )
+            )
 
         self.canvas.set_placed_object_profiles(profiles)
         self._sync_blueprint_placed_object_selection()

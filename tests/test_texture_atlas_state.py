@@ -36,6 +36,27 @@ from housemaker.texture_atlas_state import (
 
 # ### Texture atlas state tests ###
 class TextureAtlasStateTests(unittest.TestCase):
+    def test_atlas_rename_is_unique_and_preserves_baked_assets(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("First", 2048, atlas_id="first")
+        data.create_atlas("Second", 2048, atlas_id="second")
+        atlas.image_path = "atlases/first.png"
+        atlas.set_surface_ambient_occlusion(
+            "atlases/first-ao.png",
+            "geometry-signature",
+        )
+
+        renamed = data.rename_atlas(atlas.atlas_id, " Furniture ")
+
+        self.assertIs(renamed, atlas)
+        self.assertEqual(atlas.name, "Furniture")
+        self.assertEqual(atlas.image_path, "atlases/first.png")
+        self.assertEqual(atlas.surface_ao_image_path, "atlases/first-ao.png")
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            data.rename_atlas(atlas.atlas_id, "second")
+        with self.assertRaisesRegex(ValueError, "Unknown texture atlas"):
+            data.rename_atlas("missing", "Other")
+
     def test_schema_v1_placements_migrate_to_full_slots(self) -> None:
         payload = {
             "schema_version": 1,

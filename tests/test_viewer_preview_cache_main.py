@@ -23,7 +23,6 @@ from housemaker.generation_state import GeneratedObjectPlacement
 from housemaker.glb import GeneratedModel
 from housemaker.main import BlueprintWorkspace
 
-
 # ### Module state ###
 _qt_application = QApplication.instance() or QApplication([])
 _qt_application.setQuitOnLastWindowClosed(False)
@@ -658,6 +657,10 @@ class ViewerPreviewCacheMainTests(unittest.TestCase):
                 return_value=(export_model, (("stable",),)),
             ),
             patch("housemaker.main.export_glb_file", return_value=export_path),
+            patch(
+                "housemaker.main.write_runtime_scene_manifest",
+                return_value=export_path.with_suffix(".json"),
+            ),
             patch.object(
                 self.workspace,
                 "_ensure_viewer_preview_current",

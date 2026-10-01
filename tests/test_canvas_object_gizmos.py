@@ -416,6 +416,118 @@ class CanvasObjectGizmoTests(unittest.TestCase):
             self.assertFalse(gl_options[GL.GL_DEPTH_TEST])
             self.assertTrue(gl_options[GL.GL_BLEND])
 
+        self.assertEqual(len(viewer._placed_object_instance_gizmo_items), 2)
+        for item in viewer._placed_object_instance_gizmo_items:
+            self.assertEqual(
+                item.depthValue(),
+                CANVAS_OPENING_OVERLAY_DEPTH_VALUE,
+            )
+            gl_options = item._GLGraphicsItem__glOpts
+            self.assertFalse(gl_options[GL.GL_DEPTH_TEST])
+            self.assertTrue(gl_options[GL.GL_BLEND])
+
+    def test_instance_handle_drag_emits_one_request_without_moving_source(
+        self,
+    ) -> None:
+        source = _build_placed_object(
+            "chair",
+            world_position=(1.0, 2.0, 0.0),
+            rotation_degrees=(0.0, 0.0, 25.0),
+            scale=1.25,
+            axis_scales=(1.0, 1.5, 0.75),
+        )
+        viewer = self._build_viewer(source)
+        with patch.object(viewer.view, "pixelSize", return_value=0.01):
+            self.assertTrue(viewer.select_placed_object("chair"))
+        center = np.asarray(
+            viewer._placed_object_instance_gizmo_center,
+            dtype=float,
+        )
+        source_transform = viewer._placed_object_render_groups[
+            "chair"
+        ].current_transform.copy()
+        emitted: list[object] = []
+        viewer.placed_object_instance_requested.connect(emitted.append)
+
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_downward_ray(float(center[0]), float(center[1])),
+        ):
+            viewer._handle_placed_object_pointer_pressed(QPointF())
+
+        drag = viewer._placed_object_instance_drag
+        self.assertIsNotNone(drag)
+        assert drag is not None
+        ghost_root = drag.preview_root
+        self.assertIn(ghost_root, viewer.view.items)
+        self.assertTrue(viewer.view.is_primary_pointer_drag_reserved)
+
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_downward_ray(
+                float(center[0] + 2.0),
+                float(center[1] + 3.0),
+            ),
+        ):
+            viewer._handle_canvas_gizmo_pointer_moved(QPointF(20.0, 30.0))
+            viewer._handle_canvas_gizmo_pointer_released(QPointF(20.0, 30.0))
+
+        self.assertEqual(len(emitted), 1)
+        request = emitted[0]
+        self.assertEqual(request.source_scene_object_id, "chair")
+        np.testing.assert_allclose(request.world_position, (3.0, 5.0, 0.0))
+        np.testing.assert_allclose(
+            request.world_transform,
+            _translation_transform(2.0, 3.0, 0.0) @ source_transform,
+        )
+        self.assertEqual(request.rotation_degrees, (0.0, 0.0, 25.0))
+        self.assertEqual(request.scale, 1.25)
+        self.assertEqual(request.axis_scales, (1.0, 1.5, 0.75))
+        np.testing.assert_allclose(
+            viewer._placed_object_render_groups["chair"].current_transform,
+            source_transform,
+        )
+        self.assertNotIn(ghost_root, viewer.view.items)
+        self.assertIsNone(viewer._placed_object_instance_drag)
+        self.assertFalse(viewer.view.is_primary_pointer_drag_reserved)
+
+    def test_escape_cancels_instance_drag_and_removes_ghost(self) -> None:
+        viewer = self._build_viewer(_build_placed_object("chair"))
+        with patch.object(viewer.view, "pixelSize", return_value=0.01):
+            viewer.select_placed_object("chair")
+        center = np.asarray(
+            viewer._placed_object_instance_gizmo_center,
+            dtype=float,
+        )
+        emitted: list[object] = []
+        viewer.placed_object_instance_requested.connect(emitted.append)
+        with patch.object(
+            viewer.view,
+            "build_camera_ray",
+            return_value=_downward_ray(float(center[0]), float(center[1])),
+        ):
+            viewer._handle_placed_object_pointer_pressed(QPointF())
+        drag = viewer._placed_object_instance_drag
+        self.assertIsNotNone(drag)
+        assert drag is not None
+        ghost_root = drag.preview_root
+
+        viewer.view.keyPressEvent(
+            QKeyEvent(
+                QKeyEvent.Type.KeyPress,
+                Qt.Key.Key_Escape,
+                Qt.KeyboardModifier.NoModifier,
+            )
+        )
+
+        self.assertEqual(emitted, [])
+        self.assertIsNone(viewer._placed_object_instance_drag)
+        self.assertNotIn(ghost_root, viewer.view.items)
+        self.assertFalse(viewer.view.is_primary_pointer_drag_reserved)
+        self.assertEqual(viewer.get_selected_placed_object_id(), "chair")
+
     def test_selecting_an_already_selected_object_switches_gizmo_sets(
         self,
     ) -> None:

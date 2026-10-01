@@ -121,6 +121,7 @@ ATLAS_ID_ROLE = Qt.ItemDataRole.UserRole
 OBJECT_ID_ROLE = Qt.ItemDataRole.UserRole
 OBJECT_MISSING_ROLE = Qt.ItemDataRole.UserRole + 1
 NEW_SOURCE_ATTENTION_ROLE = Qt.ItemDataRole.UserRole + 2
+INLINE_RENAME_TEXT_ROLE = Qt.ItemDataRole.UserRole + 3
 PREVIEW_MARGIN_PIXELS = 16.0
 PREVIEW_BACKGROUND_COLOR = QColor(31, 34, 39)
 PREVIEW_EMPTY_COLOR = QColor(50, 54, 61)
@@ -805,7 +806,28 @@ def get_atlas_wall_texture_assignment_id(source_id: object) -> str | None:
 
 # ### Interactive object list ###
 class _NewSourceAttentionDelegate(QStyledItemDelegate):
-    """Keep the breathing background visible on selected source rows."""
+    """Paint source attention and edit only the undecorated item name."""
+
+    name_committed = Signal(str, str)
+
+    def setEditorData(self, editor, index) -> None:  # type: ignore[override]
+        """Populate inline editors with names instead of decorated row text."""
+
+        if isinstance(editor, QLineEdit):
+            editor.setText(str(index.data(INLINE_RENAME_TEXT_ROLE) or ""))
+            editor.selectAll()
+            return
+        super().setEditorData(editor, index)
+
+    def setModelData(self, editor, model, index) -> None:  # type: ignore[override]
+        """Publish a rename without replacing the row's decorated label."""
+
+        if isinstance(editor, QLineEdit):
+            item_id = str(index.data(Qt.ItemDataRole.UserRole) or "").strip()
+            if item_id:
+                self.name_committed.emit(item_id, editor.text())
+            return
+        super().setModelData(editor, model, index)
 
     def paint(self, painter, option, index) -> None:  # type: ignore[override]
         raw_strength = index.data(NEW_SOURCE_ATTENTION_ROLE)
@@ -850,14 +872,29 @@ class _NewSourceAttentionDelegate(QStyledItemDelegate):
         )
 
 
-class TextureAtlasObjectList(QListWidget):
-    """Selectable and draggable texture sources."""
+class _TextureAtlasRenameList(QListWidget):
+    """List whose selected rows use Windows-style delayed-click renaming."""
+
+    item_rename_committed = Signal(str, str)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        delegate = _NewSourceAttentionDelegate(self)
+        delegate.name_committed.connect(self.item_rename_committed.emit)
+        self.setItemDelegate(delegate)
+        self.setEditTriggers(
+            QAbstractItemView.EditTrigger.SelectedClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+        )
+
+
+class TextureAtlasObjectList(_TextureAtlasRenameList):
+    """Selectable, draggable, and inline-renamable texture sources."""
 
     object_clicked = Signal(str, object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setItemDelegate(_NewSourceAttentionDelegate(self))
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._last_click_modifiers = Qt.KeyboardModifier.NoModifier
 
@@ -2021,8 +2058,11 @@ class TextureAtlasWorkspace(QWidget):
     surface_texture_selected = Signal(str)
     object_textures_selected = Signal(object)
     surface_textures_selected = Signal(object)
+    object_rename_requested = Signal(str, str)
+    surface_texture_rename_requested = Signal(str, str)
     surface_texture_repeat_size_changed = Signal(str, float)
     object_place_requested = Signal(str)
+    object_instance_place_requested = Signal(str)
     object_delete_requested = Signal(object)
     external_glb_import_requested = Signal()
     surface_assign_requested = Signal(str)
@@ -4207,9 +4247,12 @@ class TextureAtlasWorkspace(QWidget):
         atlas_column_layout.setContentsMargins(0, 0, 0, 0)
 
         atlas_column_layout.addWidget(QLabel("Atlases"))
-        self.atlas_list = QListWidget()
+        self.atlas_list = _TextureAtlasRenameList()
         self.atlas_list.setObjectName("texture_atlas_list")
         self.atlas_list.currentItemChanged.connect(self._handle_atlas_selection_changed)
+        self.atlas_list.item_rename_committed.connect(
+            self._rename_atlas_from_list
+        )
         atlas_column_layout.addWidget(self.atlas_list, 1)
 
         selected_atlas_editor = QWidget()
@@ -4328,6 +4371,13 @@ class TextureAtlasWorkspace(QWidget):
             lambda: self._handle_source_items_selection_changed("object")
         )
         self.object_list.object_clicked.connect(self._handle_object_mouse_click)
+        self.object_list.item_rename_committed.connect(
+            lambda source_id, name: self._request_source_rename(
+                "object",
+                source_id,
+                name,
+            )
+        )
         texture_column_layout.addWidget(self.object_list, 1)
         self.delete_object_button = QPushButton("Delete object")
         self.delete_object_button.setObjectName(
@@ -4377,6 +4427,13 @@ class TextureAtlasWorkspace(QWidget):
             lambda: self._handle_source_items_selection_changed("surface")
         )
         self.surface_list.object_clicked.connect(self._handle_object_mouse_click)
+        self.surface_list.item_rename_committed.connect(
+            lambda source_id, name: self._request_source_rename(
+                "surface",
+                source_id,
+                name,
+            )
+        )
         texture_column_layout.addWidget(self.surface_list, 1)
         self.delete_surface_list_shortcut = QShortcut(
             QKeySequence.StandardKey.Delete,
@@ -4434,15 +4491,11 @@ class TextureAtlasWorkspace(QWidget):
         )
         texture_column_layout.addWidget(self.fix_tiling_button)
 
-        source_action_buttons = QHBoxLayout()
-        self.place_assign_button = QPushButton("Place")
-        self.place_assign_button.setObjectName("texture_atlas_place_assign_button")
-        self.place_assign_button.clicked.connect(self._request_selected_source_action)
-        source_action_buttons.addWidget(self.place_assign_button)
+        source_removal_buttons = QHBoxLayout()
         self.remove_source_button = QPushButton("Remove")
         self.remove_source_button.setObjectName("texture_atlas_remove_source_button")
         self.remove_source_button.clicked.connect(self._request_selected_source_removal)
-        source_action_buttons.addWidget(self.remove_source_button)
+        source_removal_buttons.addWidget(self.remove_source_button)
         self.delete_surface_texture_button = QPushButton("Delete texture")
         self.delete_surface_texture_button.setObjectName(
             "texture_atlas_delete_surface_texture_button"
@@ -4454,8 +4507,27 @@ class TextureAtlasWorkspace(QWidget):
         self.delete_surface_texture_button.clicked.connect(
             self._request_selected_surface_texture_deletion
         )
-        source_action_buttons.addWidget(self.delete_surface_texture_button)
-        texture_column_layout.addLayout(source_action_buttons)
+        source_removal_buttons.addWidget(self.delete_surface_texture_button)
+        texture_column_layout.addLayout(source_removal_buttons)
+
+        source_placement_buttons = QHBoxLayout()
+        self.place_assign_button = QPushButton("Place")
+        self.place_assign_button.setObjectName("texture_atlas_place_assign_button")
+        self.place_assign_button.clicked.connect(self._request_selected_source_action)
+        source_placement_buttons.addWidget(self.place_assign_button)
+        self.place_instance_button = QPushButton("Place instance")
+        self.place_instance_button.setObjectName(
+            "texture_atlas_place_instance_button"
+        )
+        self.place_instance_button.setToolTip(
+            "Place a linked scene instance of the selected object. The source "
+            "object does not need to be placed first."
+        )
+        self.place_instance_button.clicked.connect(
+            self._request_selected_object_instance_placement
+        )
+        source_placement_buttons.addWidget(self.place_instance_button)
+        texture_column_layout.addLayout(source_placement_buttons)
 
         self.color_balance_group = QGroupBox("Color balance")
         self.color_balance_group.setObjectName(
@@ -5074,6 +5146,37 @@ class TextureAtlasWorkspace(QWidget):
             )
         return True
 
+    def _rename_atlas_from_list(self, atlas_id: str, name: str) -> None:
+        """Commit one list rename without rebuilding unchanged Atlas pixels."""
+
+        normalized_atlas_id = str(atlas_id).strip()
+        atlas = self._data.atlas_by_id(normalized_atlas_id)
+        if atlas is None:
+            self._refresh_atlas_list(self._data.selected_atlas_id)
+            self.status_label.setText("The texture atlas no longer exists.")
+            return
+        old_name = atlas.name
+        try:
+            renamed = self._data.rename_atlas(normalized_atlas_id, name)
+        except (TypeError, ValueError) as error:
+            self._refresh_atlas_list(self._data.selected_atlas_id)
+            self.status_label.setText(
+                "Atlas rename was not applied; its existing name was kept: "
+                f"{error}"
+            )
+            return
+        if renamed.name == old_name:
+            self._refresh_atlas_list(self._data.selected_atlas_id)
+            return
+        self._refresh_atlas_list(self._data.selected_atlas_id)
+        self._sync_selected_atlas_editor()
+        self._refresh_preview()
+        self._emit_data_changed()
+        self.selected_atlas_changed.emit(copy.deepcopy(self.selected_atlas))
+        self.status_label.setText(
+            f"Renamed texture atlas from {old_name} to {renamed.name}."
+        )
+
     def _build_atlas_edit_candidate(
         self,
         atlas_id: str,
@@ -5538,6 +5641,12 @@ class TextureAtlasWorkspace(QWidget):
     def remove_selected_texture_from_atlas(self) -> None:
         """Delete one selected source using its object or surface semantics."""
 
+        focus_widget = QApplication.focusWidget()
+        if isinstance(focus_widget, QLineEdit) and (
+            self.object_list.isAncestorOf(focus_widget)
+            or self.surface_list.isAncestorOf(focus_widget)
+        ):
+            return
         atlas = self.selected_atlas
         object_id = self._selected_object_id()
         if atlas is None or object_id is None:
@@ -5604,6 +5713,49 @@ class TextureAtlasWorkspace(QWidget):
         _previous: QListWidgetItem | None,
     ) -> None:
         self._handle_source_selection_changed("surface", current)
+
+    def _request_source_rename(
+        self,
+        source_kind: str,
+        source_id: str,
+        name: str,
+    ) -> None:
+        """Publish one object or surface rename while retaining decorated rows."""
+
+        normalized_id = str(source_id).strip()
+        normalized_name = str(name).strip()
+        if not normalized_name:
+            self._refresh_object_list(normalized_id)
+            self.status_label.setText("Texture and object names cannot be empty.")
+            return
+        current_name = self._object_display_name(normalized_id)
+        if normalized_name == current_name:
+            self._refresh_object_list(normalized_id)
+            return
+        if source_kind == "object":
+            if (
+                normalized_id not in self._placeable_objects_by_id
+                and normalized_id not in self._sources_by_object_id
+            ):
+                self._refresh_object_list(normalized_id)
+                self.status_label.setText("The generated object no longer exists.")
+                return
+            self.object_rename_requested.emit(normalized_id, normalized_name)
+        elif source_kind == "surface":
+            if not self._is_surface_texture_source_id(normalized_id):
+                self._refresh_object_list(normalized_id)
+                self.status_label.setText("The surface texture no longer exists.")
+                return
+            self.surface_texture_rename_requested.emit(
+                normalized_id,
+                normalized_name,
+            )
+        else:
+            raise ValueError(f"Unknown Atlas source kind: {source_kind!r}.")
+        # Rename owners refresh these immutable descriptors synchronously. A
+        # second refresh also restores the original label when no owner accepts
+        # the request, rather than leaving decorated metadata replaced by text.
+        self._refresh_object_list(normalized_id)
 
     def _handle_source_items_selection_changed(self, source_kind: str) -> None:
         """Publish Ctrl/Shift and keyboard selection changes after Qt applies them."""
@@ -5765,6 +5917,21 @@ class TextureAtlasWorkspace(QWidget):
                 or source_id in self._placeable_objects_by_id
             ):
                 self.object_place_requested.emit(source_id)
+
+    def _request_selected_object_instance_placement(self) -> None:
+        """Request an instance of the active available object source."""
+
+        source_id = self._selected_object_id()
+        if (
+            self._active_source_kind != "object"
+            or source_id is None
+            or (
+                source_id not in self._sources_by_object_id
+                and source_id not in self._placeable_objects_by_id
+            )
+        ):
+            return
+        self.object_instance_place_requested.emit(source_id)
 
     def _request_selected_source_removal(self) -> None:
         """Request semantic scene removal for the active typed source."""
@@ -6048,6 +6215,8 @@ class TextureAtlasWorkspace(QWidget):
                 f"{'s' if len(atlas.placements) != 1 else ''}"
             )
             item.setData(ATLAS_ID_ROLE, atlas.atlas_id)
+            item.setData(INLINE_RENAME_TEXT_ROLE, atlas.name)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
             self.atlas_list.addItem(item)
             if atlas.atlas_id == selected_atlas_id:
                 selected_row = row
@@ -6100,6 +6269,8 @@ class TextureAtlasWorkspace(QWidget):
                 )
                 item.setData(OBJECT_ID_ROLE, source.object_id)
                 item.setData(OBJECT_MISSING_ROLE, False)
+                item.setData(INLINE_RENAME_TEXT_ROLE, source.object_name)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
                 self._apply_scene_bound_item_highlight(item, source.object_id)
                 if is_surface:
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsDragEnabled)
@@ -6126,6 +6297,8 @@ class TextureAtlasWorkspace(QWidget):
                 item = QListWidgetItem(f"[No texture] {display_name}")
                 item.setData(OBJECT_ID_ROLE, object_id)
                 item.setData(OBJECT_MISSING_ROLE, True)
+                item.setData(INLINE_RENAME_TEXT_ROLE, display_name)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
                 self._apply_scene_bound_item_highlight(item, object_id)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsDragEnabled)
                 item.setToolTip(
@@ -6150,6 +6323,8 @@ class TextureAtlasWorkspace(QWidget):
                 )
                 item.setData(OBJECT_ID_ROLE, entry.source_id)
                 item.setData(OBJECT_MISSING_ROLE, True)
+                item.setData(INLINE_RENAME_TEXT_ROLE, entry.display_name)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
                 self._apply_scene_bound_item_highlight(item, entry.source_id)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsDragEnabled)
                 item.setToolTip(
@@ -6474,6 +6649,9 @@ class TextureAtlasWorkspace(QWidget):
             self._active_source_kind == "surface" and source is not None
         )
         self.place_assign_button.setEnabled(can_place_object or can_assign_surface)
+        self.place_instance_button.setEnabled(
+            can_place_object
+        )
         self.delete_object_button.setEnabled(
             self._active_source_kind == "object"
             and any(

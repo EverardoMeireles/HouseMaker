@@ -414,6 +414,29 @@ class SurfaceTextureGenerationWorkspaceTests(unittest.TestCase):
         _qt_application.processEvents()
         shutil.rmtree(self._temporary_path, ignore_errors=True)
 
+    def test_rename_assignment_refreshes_consumers_and_persists(self) -> None:
+        assignment = _surface_assignment_with_variants(
+            self._temporary_path / "surface_assets",
+            "wall-finish",
+            ("level:2/room:0/wall:1:2",),
+        )
+        self.workspace.set_data(SurfaceTextureData(assignments=[assignment]))
+        data_changed = QSignalSpy(self.workspace.data_changed)
+        content_changed = QSignalSpy(self.workspace.surface_content_changed)
+
+        renamed = self.workspace.rename_assignment(
+            assignment.assignment_id,
+            " Lime plaster ",
+        )
+
+        self.assertEqual(renamed.display_name, "Lime plaster")
+        self.assertEqual(
+            self.workspace.get_data().assignments[0].display_name,
+            "Lime plaster",
+        )
+        self.assertEqual(data_changed.count(), 1)
+        self.assertEqual(content_changed.count(), 1)
+
     def test_retired_surface_controls_are_absent(self) -> None:
         for attribute_name in (
             "add_plane_button",

@@ -29,7 +29,7 @@ from PySide6.QtGui import (
     QWheelEvent,
 )
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import QAbstractItemView, QApplication, QLineEdit, QWidget
 
 import housemaker.texture_atlas_workspace as texture_atlas_workspace_module
 from housemaker.atlas_export import AtlasDrawCallEstimate
@@ -327,6 +327,25 @@ def _paint_drag_feedback(preview) -> QImage:
     preview._paint_drag_slot_preview(painter, atlas_rect)
     painter.end()
     return image
+
+
+def _commit_inline_list_rename(
+    source_list,
+    item,
+    name: str,
+) -> None:
+    """Exercise the same item editor opened by a delayed selected-row click."""
+
+    source_list.setCurrentItem(item)
+    source_list.editItem(item)
+    _qt_application.processEvents()
+    editors = source_list.findChildren(QLineEdit)
+    if len(editors) != 1:
+        raise AssertionError("Expected exactly one inline list-name editor.")
+    editor = editors[0]
+    editor.setText(name)
+    QTest.keyClick(editor, Qt.Key.Key_Return)
+    _qt_application.processEvents()
 
 
 # ### Workspace tests ###
@@ -1462,6 +1481,49 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.workspace.place_assign_button.click()
         assign_requests.assert_called_once_with(surface_source.object_id)
 
+    def test_place_instance_requires_one_available_object_selection(self) -> None:
+        object_source = _source(
+            "chair",
+            directory=self._temporary_directory.name,
+        )
+        surface_source = _wall_source(
+            "plaster",
+            directory=self._temporary_directory.name,
+        )
+        self.workspace.set_object_texture_sources(
+            (object_source, surface_source),
+            placeable_objects={"geometry-only": "Geometry only"},
+        )
+        instance_requests = Mock()
+        self.workspace.object_instance_place_requested.connect(instance_requests)
+
+        self.assertEqual(self.workspace.place_instance_button.text(), "Place instance")
+        self.assertTrue(self.workspace.place_instance_button.isEnabled())
+        self.workspace.place_instance_button.click()
+        instance_requests.assert_called_once_with(object_source.object_id)
+
+        self.workspace.set_scene_bound_source_ids((object_source.object_id,))
+
+        self.assertTrue(self.workspace.place_instance_button.isEnabled())
+        self.workspace.place_instance_button.click()
+        instance_requests.assert_called_with(object_source.object_id)
+
+        self.workspace.surface_list.setCurrentRow(0)
+
+        self.assertFalse(self.workspace.place_instance_button.isEnabled())
+        self.workspace.set_scene_bound_source_ids((surface_source.object_id,))
+        self.assertFalse(self.workspace.place_instance_button.isEnabled())
+
+        self.workspace.object_list.setCurrentRow(1)
+
+        self.assertTrue(self.workspace.place_instance_button.isEnabled())
+        self.workspace.place_instance_button.click()
+        instance_requests.assert_called_with("geometry-only")
+        self.workspace.set_scene_bound_source_ids(("geometry-only",))
+        self.assertTrue(self.workspace.place_instance_button.isEnabled())
+        self.workspace.place_instance_button.click()
+        instance_requests.assert_called_with("geometry-only")
+
     def test_ctrl_and_shift_select_multiple_sources_and_publish_groups(self) -> None:
         object_sources = tuple(
             _source(object_id, directory=self._temporary_directory.name)
@@ -1591,8 +1653,20 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.workspace.source_remove_requested.connect(removal_requests)
         self.workspace.object_delete_requested.connect(object_deletion_requests)
 
+        self.assertEqual(
+            self.workspace.delete_surface_texture_button.y(),
+            self.workspace.remove_source_button.y(),
+        )
         self.assertGreater(
-            self.workspace.remove_source_button.x(),
+            self.workspace.place_assign_button.y(),
+            self.workspace.remove_source_button.y(),
+        )
+        self.assertEqual(
+            self.workspace.place_instance_button.y(),
+            self.workspace.place_assign_button.y(),
+        )
+        self.assertGreater(
+            self.workspace.place_instance_button.x(),
             self.workspace.place_assign_button.x(),
         )
         self.workspace.remove_source_button.click()
@@ -3353,6 +3427,66 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         self.assertEqual(len(changes), 1)
         self.assertIn("Renamed texture atlas", self.workspace.status_label.text())
 
+    def test_selected_atlas_row_can_be_renamed_in_place(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Before", 2048, atlas_id="atlas-a")
+        self.workspace.set_data(data)
+        changes: list[TextureAtlasData] = []
+        self.workspace.data_changed.connect(changes.append)
+
+        self.assertTrue(
+            self.workspace.atlas_list.editTriggers()
+            & QAbstractItemView.EditTrigger.SelectedClicked
+        )
+        item = self.workspace.atlas_list.item(0)
+        self.assertTrue(item.flags() & Qt.ItemFlag.ItemIsEditable)
+        _commit_inline_list_rename(self.workspace.atlas_list, item, "After")
+
+        updated = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert updated is not None
+        self.assertEqual(updated.name, "After")
+        self.assertIn("After", self.workspace.atlas_list.item(0).text())
+        self.assertIn("2048 x 2048", self.workspace.atlas_list.item(0).text())
+        self.assertEqual(len(changes), 1)
+
+    def test_object_row_inline_rename_publishes_stable_object_id(self) -> None:
+        source = _source("chair-id", directory=self._temporary_directory.name)
+        self.workspace.set_object_texture_sources(
+            (source,),
+            placeable_objects={source.object_id: source.object_name},
+        )
+        requests: list[tuple[str, str]] = []
+        self.workspace.object_rename_requested.connect(
+            lambda object_id, name: requests.append((object_id, name))
+        )
+
+        item = self.workspace.object_list.item(0)
+        self.assertTrue(item.flags() & Qt.ItemFlag.ItemIsEditable)
+        _commit_inline_list_rename(self.workspace.object_list, item, "Dining chair")
+
+        self.assertEqual(requests, [(source.object_id, "Dining chair")])
+        self.assertIn(source.object_name, self.workspace.object_list.item(0).text())
+        self.assertIn("512 x 512", self.workspace.object_list.item(0).text())
+
+    def test_surface_row_inline_rename_publishes_stable_source_id(self) -> None:
+        source = _wall_source(
+            "plaster-id",
+            directory=self._temporary_directory.name,
+        )
+        self.workspace.set_object_texture_sources((source,))
+        requests: list[tuple[str, str]] = []
+        self.workspace.surface_texture_rename_requested.connect(
+            lambda source_id, name: requests.append((source_id, name))
+        )
+
+        item = self.workspace.surface_list.item(0)
+        self.assertTrue(item.flags() & Qt.ItemFlag.ItemIsEditable)
+        _commit_inline_list_rename(self.workspace.surface_list, item, "Warm plaster")
+
+        self.assertEqual(requests, [(source.object_id, "Warm plaster")])
+        self.assertIn("[SURFACE]", self.workspace.surface_list.item(0).text())
+        self.assertIn("Wall texture", self.workspace.surface_list.item(0).text())
+
     def test_atlas_downsize_preserves_placements_already_inside_bounds(
         self,
     ) -> None:
@@ -3886,6 +4020,44 @@ class TextureAtlasWorkspaceTests(unittest.TestCase):
         assert updated is not None
         self.assertIsNotNone(updated.placement_for_object(source.object_id))
         self.assertEqual(self.workspace.atlas_name_edit.text(), "raft atlas")
+
+    def test_delete_key_edits_inline_name_before_removing_list_texture(self) -> None:
+        data = TextureAtlasData()
+        atlas = data.create_atlas("Editable", 2048, atlas_id="atlas-a")
+        source = _source("chair", directory=self._temporary_directory.name)
+        data.assign_object(
+            atlas.atlas_id,
+            source.object_id,
+            source.texture_path,
+            source.texture_resolution,
+        )
+        self.workspace.set_data(data)
+        self.workspace.set_object_texture_sources([source])
+        item = self.workspace.object_list.item(0)
+        self.workspace.object_list.setCurrentItem(item)
+        self.workspace.object_list.editItem(item)
+        _qt_application.processEvents()
+        editors = self.workspace.object_list.findChildren(QLineEdit)
+        self.assertEqual(len(editors), 1)
+        editor = editors[0]
+        editor.selectAll()
+
+        QTest.keyClick(editor, Qt.Key.Key_Delete)
+        _qt_application.processEvents()
+
+        edited_atlas = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert edited_atlas is not None
+        self.assertEqual(editor.text(), "")
+        self.assertIsNotNone(edited_atlas.placement_for_object(source.object_id))
+
+        QTest.keyClick(editor, Qt.Key.Key_Escape)
+        self.workspace.object_list.setFocus()
+        QTest.keyClick(self.workspace.object_list, Qt.Key.Key_Delete)
+        _qt_application.processEvents()
+
+        removed_atlas = self.workspace.get_data().atlas_by_id(atlas.atlas_id)
+        assert removed_atlas is not None
+        self.assertIsNone(removed_atlas.placement_for_object(source.object_id))
 
     def test_resizable_wall_texture_wheel_emits_global_assignment(self) -> None:
         data = TextureAtlasData()

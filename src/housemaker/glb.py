@@ -135,6 +135,9 @@ SYMMETRIC_PREVIEW_AXIS_BY_ORIENTATION = {
 HALF_NODE_NAME_PREFIX = "[HALF] "
 HALF_MESH_EXTRAS_KEY = "halfMesh"
 HALF_MESH_UV_MODE = "reuse"
+OBJECT_ID_METADATA_KEY = "housemaker_object_id"
+INSTANCE_SOURCE_ID_METADATA_KEY = "housemaker_instance_source_id"
+INSTANCE_SOURCE_NAME_METADATA_KEY = "housemaker_instance_source_name"
 PACKED_ORM_AO_UV_ATTRIBUTE = "_HOUSEMAKER_AO_UV"
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
@@ -309,6 +312,7 @@ class PlacedGeneratedModel:
     object_name: str | None = None
     scale: float = 1.0
     axis_scales: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    source_object_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.object_id, str):
@@ -331,8 +335,16 @@ class PlacedGeneratedModel:
         )
         if not normalized_object_name:
             raise ValueError("Placed generated-object names cannot be empty.")
+        normalized_source_object_id = (
+            normalized_object_id
+            if self.source_object_id is None
+            else str(self.source_object_id).strip()
+        )
+        if not normalized_source_object_id:
+            raise ValueError("Placed source-object IDs cannot be empty.")
         object.__setattr__(self, "object_id", normalized_object_id)
         object.__setattr__(self, "object_name", normalized_object_name)
+        object.__setattr__(self, "source_object_id", normalized_source_object_id)
         object.__setattr__(self, "world_position", normalized_position)
         object.__setattr__(self, "rotation_degrees", normalized_rotation)
         object.__setattr__(self, "scale", _normalize_placed_scale(self.scale))
@@ -362,6 +374,7 @@ class PreviewPlacedObject:
     symmetric_preview_plane_coordinate: float | None = None
     scale: float = 1.0
     axis_scales: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    source_object_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.object_id, str) or not self.object_id.strip():
@@ -377,6 +390,14 @@ class PreviewPlacedObject:
             self.symmetric_preview_plane_coordinate,
         )
         object.__setattr__(self, "object_id", self.object_id.strip())
+        normalized_source_object_id = (
+            self.object_id
+            if self.source_object_id is None
+            else str(self.source_object_id).strip()
+        )
+        if not normalized_source_object_id:
+            raise ValueError("Placed preview source-object IDs cannot be empty.")
+        object.__setattr__(self, "source_object_id", normalized_source_object_id)
         object.__setattr__(self, "placement_transform", transform)
         object.__setattr__(
             self,
@@ -1083,6 +1104,69 @@ def compose_placed_generated_models_preview(
     )
 
 
+def compose_generated_model_instance_sources(
+    base_model: GeneratedModel,
+    source_placements: Sequence[PlacedGeneratedModel],
+) -> GeneratedModel:
+    """Add canonical, non-preview instance sources to an export scene.
+
+    Each source keeps its authored local geometry.  Its synthetic root is
+    marked so the companion-scene exporter can move it out of the default
+    glTF scene after Atlas UV and material processing has completed.
+    """
+
+    if not isinstance(base_model, GeneratedModel):
+        raise TypeError("Instance sources require a GeneratedModel house base.")
+    if isinstance(source_placements, (str, bytes, bytearray)) or not isinstance(
+        source_placements,
+        Sequence,
+    ):
+        raise TypeError("Instance sources must contain placed generated models.")
+    normalized_sources = tuple(source_placements)
+    if not all(
+        isinstance(placement, PlacedGeneratedModel)
+        for placement in normalized_sources
+    ):
+        raise TypeError("Instance sources must contain placed generated models.")
+    if not normalized_sources:
+        return base_model
+    if not isinstance(base_model.scene, trimesh.Scene):
+        raise TypeError("The house base must contain a trimesh scene.")
+
+    canonical_sources = tuple(
+        _build_canonical_instance_source_placement(placement)
+        for placement in normalized_sources
+    )
+    source_ids = tuple(placement.object_id for placement in canonical_sources)
+    source_names = tuple(str(placement.object_name) for placement in canonical_sources)
+    if len(source_ids) != len(set(source_ids)):
+        raise ValueError("Instance source IDs must be unique.")
+    if len(source_names) != len(set(source_names)):
+        raise ValueError("Instanced objects must have unique names before export.")
+
+    output_scene = copy.deepcopy(base_model.scene)
+    occupied_geometry_names = set(output_scene.geometry)
+    occupied_node_names = set(output_scene.graph.nodes)
+    for source_index, placement in enumerate(canonical_sources, start=1):
+        _append_instance_source_model_scene(
+            output_scene=output_scene,
+            placement=placement,
+            source_index=source_index,
+            occupied_geometry_names=occupied_geometry_names,
+            occupied_node_names=occupied_node_names,
+        )
+
+    glb_bytes = _serialize_scene_glb_with_half_mesh_extras(
+        output_scene,
+        failure_message="The instance-source scene could not be exported.",
+    )
+    return replace(
+        base_model,
+        scene=output_scene,
+        glb_bytes=glb_bytes,
+    )
+
+
 def build_placed_generated_model_top_down_footprint(
     placement: PlacedGeneratedModel,
 ) -> tuple[tuple[float, float], ...]:
@@ -1160,6 +1244,18 @@ def build_placed_generated_model_top_down_footprint(
     return tuple(corners)
 
 
+def build_placed_generated_model_gltf_transform(
+    placement: PlacedGeneratedModel,
+) -> np.ndarray:
+    """Return one placed object's glTF Y-up transform as a safe copy."""
+
+    if not isinstance(placement, PlacedGeneratedModel):
+        raise TypeError("Placed-object transforms require a placed model.")
+    return _source_to_gltf_y_up_transform(
+        _build_placed_model_transform(placement)
+    ).copy()
+
+
 def _compose_placed_generated_models(
     base_model: GeneratedModel,
     placements: Sequence[PlacedGeneratedModel],
@@ -1232,6 +1328,7 @@ def _compose_placed_generated_models(
         preview_placed_objects.append(
             PreviewPlacedObject(
                 object_id=placement.object_id,
+                source_object_id=placement.source_object_id,
                 meshes=local_meshes,
                 placement_transform=placement_transform,
                 world_position=placement.world_position,
@@ -1572,6 +1669,152 @@ def _get_scene_node_metadata(
     return copy.deepcopy(dict(raw_metadata))
 
 
+def _build_canonical_instance_source_placement(
+    placement: PlacedGeneratedModel,
+) -> PlacedGeneratedModel:
+    """Return a source whose normal placement transform is exactly identity."""
+
+    source_id = str(placement.source_object_id)
+    mesh = placement.model.mesh
+    if not isinstance(mesh, trimesh.Trimesh):
+        raise TypeError("Instance sources must contain a triangle mesh.")
+    vertices = np.asarray(mesh.vertices, dtype=float)
+    if (
+        vertices.ndim != 2
+        or vertices.shape[1:] != (3,)
+        or not len(vertices)
+        or not np.all(np.isfinite(vertices))
+    ):
+        raise ValueError("Instance sources must contain finite XYZ vertices.")
+    minimum = np.min(vertices, axis=0)
+    maximum = np.max(vertices, axis=0)
+    bottom_center = (
+        float((minimum[0] + maximum[0]) / 2.0),
+        float((minimum[1] + maximum[1]) / 2.0),
+        float(minimum[2]),
+    )
+    return replace(
+        placement,
+        object_id=source_id,
+        source_object_id=source_id,
+        world_position=bottom_center,
+        rotation_degrees=(0.0, 0.0, 0.0),
+        scale=1.0,
+        axis_scales=(1.0, 1.0, 1.0),
+    )
+
+
+def _append_instance_source_model_scene(
+    *,
+    output_scene: trimesh.Scene,
+    placement: PlacedGeneratedModel,
+    source_index: int,
+    occupied_geometry_names: set[object],
+    occupied_node_names: set[object],
+) -> None:
+    """Copy one authored hierarchy below an exact, marked source root."""
+
+    source_scene = placement.model.scene
+    if not isinstance(source_scene, trimesh.Scene):
+        raise TypeError("Instance sources must contain trimesh scenes.")
+    if not source_scene.geometry or not source_scene.graph.nodes_geometry:
+        raise ValueError("Instance sources must contain scene geometry.")
+
+    source_id = placement.object_id
+    root_name = str(placement.object_name)
+    if root_name in occupied_node_names:
+        raise ValueError(
+            f"The instance source node name {root_name!r} is already used in "
+            "the exported scene. Rename the object before exporting."
+        )
+    occupied_node_names.add(root_name)
+
+    prefix = f"instance_source_{source_index}_{_slugify_name(source_id)}"
+    geometry_names: dict[object, str] = {}
+    for source_name, geometry in source_scene.geometry.items():
+        geometry_name = _reserve_unique_scene_name(
+            f"{prefix}_geometry_{_slugify_scene_name(source_name)}",
+            occupied_geometry_names,
+        )
+        copied_geometry = copy.deepcopy(geometry)
+        copied_geometry.metadata = copy.deepcopy(
+            dict(getattr(copied_geometry, "metadata", {}) or {})
+        )
+        copied_geometry.metadata[OBJECT_ID_METADATA_KEY] = source_id
+        copied_geometry.metadata[INSTANCE_SOURCE_ID_METADATA_KEY] = source_id
+        copied_geometry.metadata[INSTANCE_SOURCE_NAME_METADATA_KEY] = root_name
+        output_scene.geometry[geometry_name] = copied_geometry
+        geometry_names[source_name] = geometry_name
+
+    source_base_frame = source_scene.graph.base_frame
+    node_names: dict[object, object] = {source_base_frame: root_name}
+    for source_node_name in source_scene.graph.nodes:
+        if source_node_name == source_base_frame:
+            continue
+        node_names[source_node_name] = _reserve_unique_scene_name(
+            f"{prefix}_node_{_slugify_scene_name(source_node_name)}",
+            occupied_node_names,
+        )
+
+    source_base_data = source_scene.graph.transforms.node_data.get(
+        source_base_frame,
+        {},
+    )
+    root_metadata = copy.deepcopy(source_base_data.get("metadata") or {})
+    root_metadata.pop(OBJECT_ID_METADATA_KEY, None)
+    root_metadata[OBJECT_ID_METADATA_KEY] = source_id
+    root_metadata[INSTANCE_SOURCE_ID_METADATA_KEY] = source_id
+    root_metadata[INSTANCE_SOURCE_NAME_METADATA_KEY] = root_name
+    half_metadata = _build_half_mesh_node_metadata(
+        placement,
+        np.eye(4, dtype=float),
+    )
+    root_kwargs: dict[str, object] = {
+        "matrix": np.eye(4, dtype=float),
+        "metadata": root_metadata,
+    }
+    source_base_geometry = source_base_data.get("geometry")
+    if source_base_geometry in geometry_names:
+        root_kwargs["geometry"] = geometry_names[source_base_geometry]
+        if half_metadata is not None:
+            root_metadata.update(copy.deepcopy(half_metadata))
+    output_scene.graph.update(
+        frame_to=root_name,
+        frame_from=output_scene.graph.base_frame,
+        **root_kwargs,
+    )
+
+    for source_from, source_to, raw_attributes in source_scene.graph.to_edgelist():
+        attributes = dict(raw_attributes)
+        edge_kwargs: dict[str, object] = {
+            "matrix": _get_valid_source_transform(attributes.get("matrix")),
+        }
+        source_geometry_name = attributes.get("geometry")
+        if source_geometry_name is not None:
+            if source_geometry_name not in geometry_names:
+                raise ValueError(
+                    "An instance-source node references missing geometry."
+                )
+            edge_kwargs["geometry"] = geometry_names[source_geometry_name]
+        child_metadata = copy.deepcopy(attributes.get("metadata") or {})
+        if not isinstance(child_metadata, Mapping):
+            child_metadata = {}
+        else:
+            child_metadata = dict(child_metadata)
+        child_metadata.pop(OBJECT_ID_METADATA_KEY, None)
+        child_metadata[OBJECT_ID_METADATA_KEY] = source_id
+        child_metadata[INSTANCE_SOURCE_ID_METADATA_KEY] = source_id
+        child_metadata[INSTANCE_SOURCE_NAME_METADATA_KEY] = root_name
+        if source_geometry_name is not None and half_metadata is not None:
+            child_metadata.update(copy.deepcopy(half_metadata))
+        edge_kwargs["metadata"] = child_metadata
+        output_scene.graph.update(
+            frame_to=node_names[source_to],
+            frame_from=node_names[source_from],
+            **edge_kwargs,
+        )
+
+
 def _append_placed_half_model_meshes(
     *,
     output_scene: trimesh.Scene,
@@ -1636,7 +1879,8 @@ def _append_placed_half_model_meshes(
         )
         node_metadata = copy.deepcopy(source_base_metadata)
         node_metadata.update(_get_scene_node_metadata(source_scene, source_node_name))
-        node_metadata["housemaker_object_id"] = placement.object_id
+        node_metadata.pop(OBJECT_ID_METADATA_KEY, None)
+        node_metadata[OBJECT_ID_METADATA_KEY] = placement.object_id
         node_metadata.update(half_metadata)
         output_scene.graph.update(
             frame_to=node_name,
@@ -1709,7 +1953,8 @@ def _append_placed_model_scene(
         {},
     )
     root_metadata = copy.deepcopy(source_base_data.get("metadata") or {})
-    root_metadata["housemaker_object_id"] = placement.object_id
+    root_metadata.pop(OBJECT_ID_METADATA_KEY, None)
+    root_metadata[OBJECT_ID_METADATA_KEY] = placement.object_id
     root_kwargs: dict[str, object] = {
         "matrix": _source_to_gltf_y_up_transform(placement_transform),
         "metadata": root_metadata,
@@ -1736,7 +1981,11 @@ def _append_placed_model_scene(
                 )
             edge_kwargs["geometry"] = geometry_names[source_geometry_name]
         if attributes.get("metadata") is not None:
-            edge_kwargs["metadata"] = copy.deepcopy(attributes["metadata"])
+            child_metadata = copy.deepcopy(attributes["metadata"])
+            if isinstance(child_metadata, Mapping):
+                child_metadata = dict(child_metadata)
+                child_metadata.pop(OBJECT_ID_METADATA_KEY, None)
+            edge_kwargs["metadata"] = child_metadata
         output_scene.graph.update(
             frame_to=node_names[source_to],
             frame_from=node_names[source_from],

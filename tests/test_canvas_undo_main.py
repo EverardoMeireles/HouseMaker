@@ -30,6 +30,7 @@ from housemaker.canvas_surface_edits import (
     CanvasSurfaceEdit,
 )
 from housemaker.generation_state import (
+    GeneratedObjectInstance,
     GeneratedObjectPlacement,
     GeneratedObjectRecord,
     GenerationData,
@@ -527,6 +528,116 @@ class CanvasUndoMainTests(unittest.TestCase):
         )
         self.assertEqual(self.workspace._canvas_undo_stack, [])
 
+    def test_canvas_unplacing_source_retains_instances_and_atlas_binding(self) -> None:
+        source_placement = GeneratedObjectPlacement(
+            level_index=self.level.index,
+            image_x=20.0,
+            image_y=30.0,
+        )
+        instance = GeneratedObjectInstance(
+            instance_id="chair-instance",
+            source_object_id="chair",
+            placement=replace(source_placement, image_x=70.0),
+        )
+        self.workspace.generation.set_data(
+            GenerationData(
+                generated_objects=[
+                    _generated_object_record("chair", source_placement)
+                ],
+                object_instances=[instance],
+            )
+        )
+        atlas_data = TextureAtlasData()
+        atlas_data.create_atlas("Objects", 2048, atlas_id="objects")
+        atlas_data.assign_object("objects", "chair", "chair.png", 512)
+        self.workspace.texture_atlas_workspace.set_data(atlas_data)
+
+        with patch.object(
+            self.workspace,
+            "_sync_atlas_object_texture_sources",
+        ):
+            self.workspace._handle_placed_object_removal_requested("chair")
+
+            self.assertIsNone(
+                self.workspace.generation.get_generated_object_placement("chair")
+            )
+            self.assertEqual(
+                self.workspace.generation.get_generated_object_instances("chair"),
+                (instance,),
+            )
+            atlas = self.workspace.texture_atlas_workspace.get_data().atlas_by_id(
+                "objects"
+            )
+            self.assertIsNotNone(atlas)
+            assert atlas is not None
+            self.assertIsNotNone(atlas.placement_for_object("chair"))
+
+            _send_undo_to_viewer(self.workspace)
+
+        self.assertEqual(
+            self.workspace.generation.get_generated_object_placement("chair"),
+            source_placement,
+        )
+        self.assertEqual(
+            self.workspace.generation.get_generated_object_instances("chair"),
+            (instance,),
+        )
+
+    def test_canvas_removing_last_instance_removes_and_restores_atlas_binding(
+        self,
+    ) -> None:
+        instance = GeneratedObjectInstance(
+            instance_id="chair-instance",
+            source_object_id="chair",
+            placement=GeneratedObjectPlacement(
+                level_index=self.level.index,
+                image_x=70.0,
+                image_y=30.0,
+            ),
+        )
+        self.workspace.generation.set_data(
+            GenerationData(
+                generated_objects=[_generated_object_record("chair", None)],
+                object_instances=[instance],
+            )
+        )
+        atlas_data = TextureAtlasData()
+        atlas_data.create_atlas("Objects", 2048, atlas_id="objects")
+        atlas_data.assign_object("objects", "chair", "chair.png", 512)
+        self.workspace.texture_atlas_workspace.set_data(atlas_data)
+
+        with patch.object(
+            self.workspace,
+            "_sync_atlas_object_texture_sources",
+        ):
+            self.workspace._handle_placed_object_removal_requested(
+                instance.instance_id
+            )
+
+            self.assertEqual(
+                self.workspace.generation.get_generated_object_instances("chair"),
+                (),
+            )
+            atlas = self.workspace.texture_atlas_workspace.get_data().atlas_by_id(
+                "objects"
+            )
+            self.assertIsNotNone(atlas)
+            assert atlas is not None
+            self.assertIsNone(atlas.placement_for_object("chair"))
+
+            _send_undo_to_viewer(self.workspace)
+
+        self.assertEqual(
+            self.workspace.generation.get_generated_object_instances("chair"),
+            (instance,),
+        )
+        restored_atlas = (
+            self.workspace.texture_atlas_workspace.get_data().atlas_by_id("objects")
+        )
+        self.assertIsNotNone(restored_atlas)
+        assert restored_atlas is not None
+        self.assertIsNotNone(restored_atlas.placement_for_object("chair"))
+
     def test_transform_undo_restores_the_multi_object_selection(self) -> None:
         chair_placement = GeneratedObjectPlacement(
             level_index=self.level.index,
@@ -1022,11 +1133,17 @@ class CanvasUndoMainTests(unittest.TestCase):
             image_x=40.0,
             image_y=60.0,
         )
+        instance = GeneratedObjectInstance(
+            instance_id="chair-instance",
+            source_object_id="chair",
+            placement=replace(placement, image_x=75.0),
+        )
         self.workspace.generation.set_data(
             GenerationData(
                 generated_objects=[
                     _generated_object_record("chair", placement)
-                ]
+                ],
+                object_instances=[instance],
             )
         )
         atlas_data = TextureAtlasData()
@@ -1058,6 +1175,10 @@ class CanvasUndoMainTests(unittest.TestCase):
                     "chair"
                 )
             )
+            self.assertEqual(
+                self.workspace.generation.get_generated_object_instances("chair"),
+                (),
+            )
             _send_undo_to_viewer(self.workspace)
             refresh_texture_source_content.assert_any_call(("chair",))
 
@@ -1065,10 +1186,64 @@ class CanvasUndoMainTests(unittest.TestCase):
             self.workspace.generation.get_generated_object_placement("chair"),
             placement,
         )
+        self.assertEqual(
+            self.workspace.generation.get_generated_object_instances("chair"),
+            (instance,),
+        )
         restored_atlas = (
             self.workspace.texture_atlas_workspace.get_data().atlas_by_id(
                 "objects"
             )
+        )
+        self.assertIsNotNone(restored_atlas)
+        assert restored_atlas is not None
+        self.assertIsNotNone(restored_atlas.placement_for_object("chair"))
+
+    def test_atlas_remove_restores_instances_of_an_unplaced_source(self) -> None:
+        instance = GeneratedObjectInstance(
+            instance_id="chair-instance",
+            source_object_id="chair",
+            placement=GeneratedObjectPlacement(
+                level_index=self.level.index,
+                image_x=75.0,
+                image_y=60.0,
+            ),
+        )
+        self.workspace.generation.set_data(
+            GenerationData(
+                generated_objects=[_generated_object_record("chair", None)],
+                object_instances=[instance],
+            )
+        )
+        atlas_data = TextureAtlasData()
+        atlas_data.create_atlas("Objects", 2048, atlas_id="objects")
+        atlas_data.assign_object("objects", "chair", "chair.png", 512)
+        self.workspace.texture_atlas_workspace.set_data(atlas_data)
+
+        with patch.object(
+            self.workspace,
+            "_sync_atlas_object_texture_sources",
+        ):
+            self.workspace._handle_atlas_source_remove_requested(
+                "object",
+                "chair",
+            )
+            self.assertEqual(
+                self.workspace.generation.get_generated_object_instances("chair"),
+                (),
+            )
+
+            _send_undo_to_viewer(self.workspace)
+
+        self.assertIsNone(
+            self.workspace.generation.get_generated_object_placement("chair")
+        )
+        self.assertEqual(
+            self.workspace.generation.get_generated_object_instances("chair"),
+            (instance,),
+        )
+        restored_atlas = (
+            self.workspace.texture_atlas_workspace.get_data().atlas_by_id("objects")
         )
         self.assertIsNotNone(restored_atlas)
         assert restored_atlas is not None
