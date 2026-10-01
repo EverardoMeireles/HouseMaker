@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from housemaker.glb import (
+    HALF_MESH_EXTRAS_KEY,
     INSTANCE_SOURCE_ID_METADATA_KEY,
     INSTANCE_SOURCE_NAME_METADATA_KEY,
     PlacedGeneratedModel,
@@ -107,14 +108,15 @@ def build_runtime_scene_manifest(
                 key=lambda value: value.object_id,
             )
         ]
-        groups.append(
-            {
-                "sourceNodeName": _get_instance_source_node_name(
-                    source_model_placement
-                ),
-                "instances": group_instances,
-            }
-        )
+        group: dict[str, object] = {
+            "sourceNodeName": _get_instance_source_node_name(
+                source_model_placement
+            ),
+            "instances": group_instances,
+        }
+        if _get_instance_source_symmetry(source_model_placement) is not None:
+            group[HALF_MESH_EXTRAS_KEY] = True
+        groups.append(group)
 
     return {
         "format": RUNTIME_SCENE_FORMAT,
@@ -222,6 +224,15 @@ def _build_instance_source_groups(
             raise ValueError(
                 f"Runtime instances for {source_id!r} do not share one object name."
             )
+        expected_symmetry = _get_instance_source_symmetry(source_model_placement)
+        if any(
+            _get_instance_source_symmetry(placement) != expected_symmetry
+            for placement in runtime_instances
+        ):
+            raise ValueError(
+                f"Runtime instances for {source_id!r} do not share one "
+                "half-mesh mirror plane."
+            )
         if expected_name in occupied_node_names:
             raise ValueError(
                 "Instanced objects must have unique names before export."
@@ -247,6 +258,19 @@ def _get_instance_source_node_name(
 
     assert placement.object_name is not None
     return placement.object_name
+
+
+def _get_instance_source_symmetry(
+    placement: PlacedGeneratedModel,
+) -> tuple[str, float] | None:
+    """Return the authored source-space mirror definition, when present."""
+
+    orientation = placement.symmetric_preview_orientation
+    if orientation is None:
+        return None
+    plane_coordinate = placement.symmetric_preview_plane_coordinate
+    assert plane_coordinate is not None
+    return orientation, float(plane_coordinate)
 
 
 # ### Detached glTF prototype helpers ###

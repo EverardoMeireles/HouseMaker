@@ -183,6 +183,89 @@ class RuntimeSceneManifestTests(unittest.TestCase):
                 atol=1e-9,
             )
 
+    def test_manifest_marks_a_placed_half_mesh_instance_group(self) -> None:
+        source_model = _source_model()
+        source = PlacedGeneratedModel(
+            object_id="half-chair",
+            object_name="half-chair",
+            model=source_model,
+            world_position=(1.0, 2.0, 0.5),
+            symmetric_preview_orientation="vertical",
+            symmetric_preview_plane_coordinate=0.25,
+        )
+        instance = PlacedGeneratedModel(
+            object_id="half-chair-copy",
+            source_object_id="half-chair",
+            object_name="half-chair",
+            model=source_model,
+            world_position=(4.0, -2.0, 1.0),
+            symmetric_preview_orientation="vertical",
+            symmetric_preview_plane_coordinate=0.25,
+        )
+
+        payload = build_runtime_scene_manifest(
+            glb_name="house.glb",
+            glb_bytes=b"glb",
+            source_placements={"half-chair": source},
+            instance_placements=(instance,),
+        )
+
+        group = payload["instanceGroups"][0]
+        self.assertEqual(
+            set(group),
+            {"sourceNodeName", "halfMesh", "instances"},
+        )
+        self.assertIs(group["halfMesh"], True)
+
+    def test_manifest_marks_an_unplaced_half_mesh_instance_group(self) -> None:
+        source_model = _source_model()
+        instance = PlacedGeneratedModel(
+            object_id="half-table-copy",
+            source_object_id="half-table",
+            object_name="half-table",
+            model=source_model,
+            world_position=(4.0, -2.0, 1.0),
+            symmetric_preview_orientation="vertical",
+            symmetric_preview_plane_coordinate=0.0,
+        )
+
+        payload = build_runtime_scene_manifest(
+            glb_name="house.glb",
+            glb_bytes=b"glb",
+            source_placements={},
+            instance_placements=(instance,),
+        )
+
+        group = payload["instanceGroups"][0]
+        self.assertIs(group["halfMesh"], True)
+        self.assertEqual(group["sourceNodeName"], "half-table")
+
+    def test_manifest_rejects_mixed_half_mesh_instance_metadata(self) -> None:
+        source_model = _source_model()
+        source = PlacedGeneratedModel(
+            object_id="half-chair",
+            object_name="half-chair",
+            model=source_model,
+            world_position=(1.0, 2.0, 0.5),
+            symmetric_preview_orientation="vertical",
+            symmetric_preview_plane_coordinate=0.0,
+        )
+        mismatched_instance = PlacedGeneratedModel(
+            object_id="half-chair-copy",
+            source_object_id="half-chair",
+            object_name="half-chair",
+            model=source_model,
+            world_position=(4.0, -2.0, 1.0),
+        )
+
+        with self.assertRaisesRegex(ValueError, "half-mesh mirror plane"):
+            build_runtime_scene_manifest(
+                glb_name="house.glb",
+                glb_bytes=b"glb",
+                source_placements={"half-chair": source},
+                instance_placements=(mismatched_instance,),
+            )
+
     def test_manifest_orders_groups_and_instances_deterministically(self) -> None:
         source_model = _source_model()
         chair = PlacedGeneratedModel(
@@ -407,6 +490,79 @@ class RuntimeSceneManifestTests(unittest.TestCase):
         self.assertEqual(
             manifest["instanceGroups"][0]["sourceNodeName"],
             "chair_prototype",
+        )
+
+    def test_writer_marks_half_group_and_preserves_source_mirror_extras(
+        self,
+    ) -> None:
+        source_model = _source_model_with_node_name("0")
+        source = PlacedGeneratedModel(
+            object_id="half-chair-source",
+            object_name="half-chair",
+            model=source_model,
+            world_position=(0.0, 0.0, 0.0),
+            symmetric_preview_orientation="vertical",
+            symmetric_preview_plane_coordinate=0.25,
+        )
+        instance = PlacedGeneratedModel(
+            object_id="half-chair-copy",
+            source_object_id="half-chair-source",
+            object_name="half-chair",
+            model=source_model,
+            world_position=(2.0, 0.0, 0.0),
+            symmetric_preview_orientation="vertical",
+            symmetric_preview_plane_coordinate=0.25,
+        )
+        integrated = compose_generated_model_instance_sources(
+            _source_model(),
+            (source,),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            glb_path = export_glb_file(
+                integrated,
+                Path(temporary_directory) / "scene.glb",
+            )
+            manifest_path = write_runtime_scene_manifest(
+                glb_path,
+                source_placements={source.object_id: source},
+                instance_placements=(instance,),
+            )
+            document = _read_glb_document(glb_path.read_bytes())
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        group = manifest["instanceGroups"][0]
+        self.assertIs(group["halfMesh"], True)
+        self.assertEqual(group["sourceNodeName"], "half-chair")
+
+        nodes = document["nodes"]
+        source_root_index = next(
+            index
+            for index, node in enumerate(nodes)
+            if node.get("name") == "half-chair"
+        )
+        pending = list(nodes[source_root_index].get("children", []))
+        descendant_half_meshes: list[object] = []
+        while pending:
+            node = nodes[pending.pop()]
+            pending.extend(node.get("children", []))
+            extras = node.get("extras", {})
+            if "halfMesh" in extras:
+                descendant_half_meshes.append(extras["halfMesh"])
+
+        self.assertTrue(descendant_half_meshes)
+        self.assertTrue(
+            all(
+                half_mesh
+                == {
+                    "mirrorPlane": {
+                        "point": [0.25, 0.0, 0.0],
+                        "normal": [1.0, 0.0, 0.0],
+                    },
+                    "uvMode": "reuse",
+                }
+                for half_mesh in descendant_half_meshes
+            )
         )
 
     def test_manifest_rejects_an_instance_id_used_by_another_source(self) -> None:
