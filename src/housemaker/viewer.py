@@ -8,14 +8,18 @@ import weakref
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from io import BytesIO
+from itertools import pairwise
 
+import cv2
 import numpy as np
 import pyqtgraph.opengl as gl
+import shapely
 import trimesh
 from OpenGL import GL
 from OpenGL.GL import shaders as opengl_shaders
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from pyqtgraph import Transform3D
 from pyqtgraph.opengl import shaders as gl_shaders
 from pyqtgraph.opengl.GLGraphicsItem import GLGraphicsItem
@@ -129,6 +133,12 @@ from housemaker.texture_color_balance import (
     ColorBalanceAdjustment,
     TextureColorBalanceSettings,
 )
+from housemaker.tour_state import (
+    DEFAULT_TOUR_TRIGGER_AREA_SIZE_METERS,
+    TourCurveData,
+    evaluate_catmull_rom_point,
+)
+from housemaker.tour_tooltip_overlay import TourTooltipOverlay
 from housemaker.unused_face_removal import ALL_CAMERA_IDS
 from housemaker.video_source import normalize_video_frame
 
@@ -229,6 +239,69 @@ PLACED_OBJECT_GIZMO_SCALE = "scale"
 PLACED_OBJECT_SCALE_FACTOR_PER_WHEEL_STEP = 1.1
 PLACED_OBJECT_MIN_SCALE = 0.05
 PLACED_OBJECT_MAX_SCALE = 20.0
+TOUR_POINT_KIND_TRIGGER = "trigger"
+TOUR_POINT_KIND_CURVE = "curve"
+TOUR_POINT_KINDS = frozenset(
+    (
+        TOUR_POINT_KIND_TRIGGER,
+        TOUR_POINT_KIND_CURVE,
+    )
+)
+TOUR_TRIGGER_COLOR = (1.0, 0.58, 0.12, 1.0)
+TOUR_CURVE_COLOR = (0.22, 0.82, 1.0, 1.0)
+TOUR_CURVE_POINT_COLOR = (0.20, 0.95, 0.72, 1.0)
+TOUR_STEP_COLOR = (1.0, 1.0, 0.0, 1.0)
+TOUR_CAMERA_TARGET_COLOR = (1.0, 0.68, 0.80, 1.0)
+TOUR_NEXT_CAMERA_TARGET_COLOR = (1.0, 0.24, 0.68, 1.0)
+TOUR_TIMELINE_PROGRESS_COLOR = (1.0, 0.12, 0.12, 1.0)
+TOUR_TEXT_COLOR = (0.94, 0.96, 1.0, 1.0)
+TOUR_TOOLTIP_HOTSPOT_COLOR = (0.30, 0.88, 1.0, 1.0)
+TOUR_TOOLTIP_HOTSPOT_SELECTED_COLOR = (1.0, 0.78, 0.18, 1.0)
+TOUR_TOOLTIP_HOTSPOT_SIZE_PIXELS = 20.0
+TOUR_TOOLTIP_HOVER_TOLERANCE_PIXELS = 16.0
+TOUR_PLACEMENT_HOVER_COLOR = (0.34, 1.0, 0.46, 1.0)
+TOUR_UNSELECTED_OPACITY = 0.25
+TOUR_TRIGGER_AREA_FACE_OPACITY = 0.24
+TOUR_TRIGGER_AREA_EDGE_OPACITY = 0.95
+TOUR_TRIGGER_AREA_EDGE_WIDTH_PIXELS = 3.0
+TOUR_TRIGGER_AREA_PICK_THICKNESS_METERS = 0.08
+TOUR_TRIGGER_AREA_MINIMUM_SIZE_METERS = 0.10
+TOUR_CURVE_POINT_SIZE_PIXELS = 12.0
+TOUR_STEP_SIZE_PIXELS = 14.0
+TOUR_CAMERA_TARGET_SIZE_PIXELS = 15.0
+TOUR_TIMELINE_PROGRESS_SIZE_PIXELS = 15.0
+TOUR_TIMELINE_DIRECTION_ARROW_MIN_LENGTH_METERS = 0.40
+TOUR_TIMELINE_DIRECTION_ARROW_MAX_LENGTH_METERS = 1.20
+TOUR_TIMELINE_DIRECTION_ARROW_TARGET_DISTANCE_RATIO = 0.20
+TOUR_TIMELINE_DIRECTION_ARROW_HEAD_LENGTH_RATIO = 0.34
+TOUR_TIMELINE_DIRECTION_ARROW_HEAD_WIDTH_RATIO = 0.18
+TOUR_TIMELINE_DIRECTION_ARROW_WIDTH_PIXELS = 4.0
+TOUR_PLACEMENT_HOVER_SIZE_PIXELS = 20.0
+TOUR_CURVE_WIDTH_PIXELS = 4.0
+TOUR_CURVE_PREVIEW_SAMPLE_COUNT = 160
+TOUR_DEFAULT_TENSION = 0.5
+TOUR_DEFAULT_TEXT_POINT_SIZE = 12.0
+TOUR_TEXT_RASTER_FONT_SIZE_PIXELS = 128
+TOUR_TEXT_HEIGHT_METERS_PER_POINT = 0.025
+TOUR_TEXT_EXTRUSION_DEPTH_RATIO = 0.06
+TOUR_TEXT_MINIMUM_EXTRUSION_METERS = 0.006
+TOUR_DEFAULT_DURATION_SECONDS = 10.0
+TOUR_OVERLAY_SELECTION_TOLERANCE_PIXELS = 10.0
+TOUR_TEXT_SELECTION_TOLERANCE_PIXELS = 18.0
+TOUR_GIZMO_SCREEN_SIZE_PIXELS = 92.0
+TOUR_GIZMO_MIN_SIZE_METERS = 0.35
+TOUR_GIZMO_AXIS_HIT_RATIO = 0.09
+TOUR_GIZMO_RING_RADIUS_RATIO = 0.72
+TOUR_GIZMO_RING_HIT_RATIO = 0.085
+TOUR_TEXT_HIT_BOX_MINIMUM_SIZE_METERS = 0.35
+TOUR_TEXT_HIT_BOX_PADDING_RATIO = 0.18
+TOUR_EDIT_TARGET_TRIGGER = "trigger"
+TOUR_EDIT_TARGET_CURVE_POINT = "curve_point"
+TOUR_EDIT_TARGET_CAMERA_TARGET = "camera_target"
+TOUR_EDIT_TARGET_ACTION = "action"
+TOUR_EDIT_TARGET_ACTION_ROTATION = "action_rotation"
+TOUR_DRAFT_OVERLAY_ID = "__draft__"
+TOUR_LEGACY_OVERLAY_ID = "__legacy__"
 CANVAS_OPENING_GIZMO_SIDE = "side"
 CANVAS_OPENING_GIZMO_ANCHOR = "anchor"
 CANVAS_OPENING_GIZMO_ARCH = "arch"
@@ -853,6 +926,7 @@ class SelectableGLViewWidget(gl.GLViewWidget):
     primary_pointer_moved = Signal(object)
     primary_pointer_released = Signal(object)
     primary_pointer_cancel_requested = Signal()
+    primary_pointer_finish_requested = Signal()
     control_modifier_changed = Signal(bool)
     face_selection_pointer_pressed = Signal(object)
     face_selection_pointer_moved = Signal(object)
@@ -879,6 +953,8 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         self._is_middle_navigation_active = False
         self._rectangle_drawing_enabled = False
         self._primary_pointer_tool_active = False
+        self._primary_pointer_interaction_enabled = False
+        self._primary_pointer_finish_enabled = False
         self._primary_pointer_drag_reserved = False
         self._primary_pointer_release_suppressed = False
         self._item_click_selection_enabled = True
@@ -947,10 +1023,24 @@ class SelectableGLViewWidget(gl.GLViewWidget):
         if normalized_active:
             self.release_first_person_pointer_capture()
         self._primary_pointer_tool_active = normalized_active
+        if not normalized_active:
+            self._primary_pointer_finish_enabled = False
         if normalized_active:
             self.focus_navigation()
             return
         self._resume_first_person_pointer_capture_if_ready()
+
+    def set_primary_pointer_finish_enabled(self, enabled: bool) -> None:
+        """Allow Enter or double-click to finish one open-ended pointer tool."""
+
+        self._primary_pointer_finish_enabled = bool(
+            enabled and self._primary_pointer_tool_active
+        )
+
+    def set_primary_pointer_interaction_enabled(self, enabled: bool) -> None:
+        """Allow retained overlays to receive primary-pointer press events."""
+
+        self._primary_pointer_interaction_enabled = bool(enabled)
 
     @property
     def is_primary_pointer_drag_reserved(self) -> bool:
@@ -1506,12 +1596,15 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             return
 
         if (
-            self._face_selection_gestures_enabled
-            or (
-                not self._item_click_selection_enabled
-                and not self._viewport_click_selection_enabled
+            (
+                self._face_selection_gestures_enabled
+                or (
+                    not self._item_click_selection_enabled
+                    and not self._viewport_click_selection_enabled
+                )
+                or self._overlay_selection_enabled
             )
-            or self._overlay_selection_enabled
+            and not self._primary_pointer_interaction_enabled
         ) and event.button() == Qt.MouseButton.LeftButton:
             # Plain clicks have no meaning in non-item-picking viewers such
             # as the object face editor.  Do not run GLViewWidget's legacy
@@ -1579,6 +1672,18 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             return
         super().mousePressEvent(event)
 
+    def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
+        """Let open-ended viewport tools use a double-click as completion."""
+
+        if (
+            self._primary_pointer_finish_enabled
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            self.primary_pointer_finish_requested.emit()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
         if self._rectangle_drawing_enabled:
             if event.button() == Qt.MouseButton.LeftButton:
@@ -1637,7 +1742,10 @@ class SelectableGLViewWidget(gl.GLViewWidget):
                 and not self._viewport_click_selection_enabled
             )
             or self._overlay_selection_enabled
-        ) and event.button() == Qt.MouseButton.LeftButton:
+        ) and (
+            event.button() == Qt.MouseButton.LeftButton
+            and not self._primary_pointer_drag_reserved
+        ):
             # Match the inert press above without invoking itemsAt().  In the
             # face editor, 3D selection is deliberately Shift+click/drag only.
             if (
@@ -1836,6 +1944,13 @@ class SelectableGLViewWidget(gl.GLViewWidget):
             return
         if event.key() == Qt.Key.Key_Delete:
             self.delete_requested.emit()
+            event.accept()
+            return
+        if (
+            self._primary_pointer_finish_enabled
+            and event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter}
+        ):
+            self.primary_pointer_finish_requested.emit()
             event.accept()
             return
         if (
@@ -3100,6 +3215,237 @@ class _CanvasRectangleSelectionResult:
     additive: bool
 
 
+# ### Tour overlay models ###
+@dataclass(frozen=True)
+class _TourOverlayData:
+    """Normalized viewer-only representation of one persisted or draft tour."""
+
+    tour_id: str
+    trigger_point: tuple[float, float, float] | None
+    trigger_area_size: tuple[float, float]
+    curve_points: tuple[tuple[float, float, float], ...]
+    tension: float
+    steps: tuple[object, ...]
+    duration_seconds: float
+    is_draft: bool = False
+
+
+@dataclass(frozen=True)
+class _TourEditTarget:
+    """One selected tour position that owns the translation gizmo."""
+
+    tour_id: str
+    kind: str
+    reference: object | None
+    step_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _TourOverlayPick:
+    """Stable result of one screen-space tour-overlay pick."""
+
+    tour_id: str
+    kind: str
+    reference: object | None = None
+    step_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _TourDragCameraSnapshot:
+    """Frozen inverse camera transform used throughout one Tour drag."""
+
+    inverse_view_projection: np.ndarray
+    viewport_width: float
+    viewport_height: float
+
+
+@dataclass
+class _TourEditDrag:
+    """Stable world-axis constraint and live position for one tour drag."""
+
+    target: _TourEditTarget
+    axis_index: int
+    axis: np.ndarray
+    drag_plane_normal: np.ndarray
+    start_axis_parameter: float
+    start_position: np.ndarray
+    preview_position: tuple[float, float, float]
+    start_pointer_position: tuple[float, float]
+    camera_snapshot: _TourDragCameraSnapshot | None
+
+
+@dataclass
+class _TourRotationDrag:
+    """One world-axis text rotation drag and its accumulated preview."""
+
+    target: _TourEditTarget
+    axis_index: int
+    axis: np.ndarray
+    pivot: np.ndarray
+    start_rotation_degrees: tuple[float, float, float]
+    previous_rotation_vector: np.ndarray
+    accumulated_rotation_degrees: float = 0.0
+    preview_rotation_degrees: tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+
+@dataclass(frozen=True)
+class _TourGizmoHandle:
+    """One translation-axis or rotation-ring hit."""
+
+    kind: str
+    axis_index: int
+
+
+# ### Tour drag camera helpers ###
+def _capture_tour_drag_camera_snapshot(
+    view: SelectableGLViewWidget,
+) -> _TourDragCameraSnapshot | None:
+    """Capture one immutable screen-to-world camera transform."""
+
+    width = max(float(view.width()), 1.0)
+    height = max(float(view.height()), 1.0)
+    viewport = (0, 0, int(width), int(height))
+    try:
+        view_projection = view.projectionMatrix(viewport, viewport) * view.viewMatrix()
+        inverse = np.linalg.inv(_get_view_projection_matrix(view_projection))
+    except (AttributeError, RuntimeError, TypeError, ValueError, np.linalg.LinAlgError):
+        return None
+    if inverse.shape != (4, 4) or not np.all(np.isfinite(inverse)):
+        return None
+    inverse = np.ascontiguousarray(inverse, dtype=float)
+    inverse.setflags(write=False)
+    return _TourDragCameraSnapshot(inverse, width, height)
+
+
+def _build_tour_drag_camera_ray(
+    snapshot: _TourDragCameraSnapshot,
+    position: QPointF,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Build a ray with the camera transform frozen when dragging began."""
+
+    normalized_x = 2.0 * float(position.x()) / snapshot.viewport_width - 1.0
+    normalized_y = 1.0 - 2.0 * float(position.y()) / snapshot.viewport_height
+    near_homogeneous = snapshot.inverse_view_projection @ np.asarray(
+        (normalized_x, normalized_y, -1.0, 1.0),
+        dtype=float,
+    )
+    far_homogeneous = snapshot.inverse_view_projection @ np.asarray(
+        (normalized_x, normalized_y, 1.0, 1.0),
+        dtype=float,
+    )
+    if (
+        abs(float(near_homogeneous[3])) <= 1e-12
+        or abs(float(far_homogeneous[3])) <= 1e-12
+    ):
+        return None
+    origin = near_homogeneous[:3] / near_homogeneous[3]
+    far = far_homogeneous[:3] / far_homogeneous[3]
+    direction = _normalize_vector(far - origin)
+    if not np.all(np.isfinite(origin)) or direction is None:
+        return None
+    return np.asarray(origin, dtype=float), direction
+
+
+# ### Tour curve helpers ###
+def evaluate_open_catmull_rom_curve(
+    control_points: Sequence[Sequence[float]],
+    progress: float,
+    *,
+    tension: float = TOUR_DEFAULT_TENSION,
+) -> tuple[float, float, float]:
+    """Evaluate plain points through the canonical project Catmull-Rom helper."""
+
+    points = _normalize_tour_points(control_points)
+    if not points:
+        raise ValueError("A tour curve requires at least one control point.")
+    if len(points) == 1:
+        return tuple(float(value) for value in points[0])
+    normalized_progress = min(max(float(progress), 0.0), 1.0)
+    curve = TourCurveData(
+        points=tuple(tuple(float(value) for value in point) for point in points),
+        tension=float(tension),
+        closed=False,
+    )
+    return evaluate_catmull_rom_point(curve, normalized_progress)
+
+
+def sample_open_catmull_rom_curve(
+    control_points: Sequence[Sequence[float]],
+    *,
+    sample_count: int = TOUR_CURVE_PREVIEW_SAMPLE_COUNT,
+    tension: float = TOUR_DEFAULT_TENSION,
+) -> np.ndarray:
+    """Return stable preview samples, including both open-curve endpoints."""
+
+    points = _normalize_tour_points(control_points)
+    if not points:
+        return np.empty((0, 3), dtype=np.float32)
+    normalized_count = max(int(sample_count), 2)
+    if len(points) == 1:
+        return np.asarray(points, dtype=np.float32)
+    curve = TourCurveData(
+        points=tuple(tuple(float(value) for value in point) for point in points),
+        tension=float(tension),
+        closed=False,
+    )
+    return np.asarray(
+        tuple(
+            evaluate_catmull_rom_point(
+                curve,
+                sample_index / float(normalized_count - 1),
+            )
+            for sample_index in range(normalized_count)
+        ),
+        dtype=np.float32,
+    )
+
+
+# ### Tour direction-arrow helpers ###
+def _build_tour_direction_arrow_positions(
+    camera_position: object,
+    camera_target: object,
+) -> np.ndarray | None:
+    """Build a shaft and four-sided arrowhead pointing at the camera target."""
+
+    origin = _normalize_tour_point(camera_position)
+    target = _normalize_tour_point(camera_target)
+    target_delta = target - origin
+    direction = _normalize_vector(target_delta)
+    if direction is None:
+        return None
+    target_distance = float(np.linalg.norm(target_delta))
+    arrow_length = float(
+        np.clip(
+            target_distance * TOUR_TIMELINE_DIRECTION_ARROW_TARGET_DISTANCE_RATIO,
+            TOUR_TIMELINE_DIRECTION_ARROW_MIN_LENGTH_METERS,
+            TOUR_TIMELINE_DIRECTION_ARROW_MAX_LENGTH_METERS,
+        )
+    )
+    tip = origin + direction * arrow_length
+    head_length = arrow_length * TOUR_TIMELINE_DIRECTION_ARROW_HEAD_LENGTH_RATIO
+    head_width = arrow_length * TOUR_TIMELINE_DIRECTION_ARROW_HEAD_WIDTH_RATIO
+    head_center = tip - direction * head_length
+    reference = np.asarray((0.0, 0.0, 1.0), dtype=float)
+    if abs(float(np.dot(direction, reference))) > 0.92:
+        reference = np.asarray((0.0, 1.0, 0.0), dtype=float)
+    side = _normalize_vector(np.cross(direction, reference))
+    if side is None:
+        return None
+    up = _normalize_vector(np.cross(direction, side))
+    if up is None:
+        return None
+    head_points = (
+        head_center + side * head_width,
+        head_center - side * head_width,
+        head_center + up * head_width,
+        head_center - up * head_width,
+    )
+    positions: list[np.ndarray] = [origin, tip]
+    for head_point in head_points:
+        positions.extend((tip, head_point))
+    return np.ascontiguousarray(positions, dtype=np.float32)
+
+
 # ### Direct object-placement models ###
 @dataclass(frozen=True)
 class SceneObjectPlacementCandidate:
@@ -3174,6 +3520,13 @@ class GlbViewerWidget(QWidget):
     placed_object_selection_set_changed = Signal(object)
     object_placement_selected = Signal(str, object)
     object_placement_cancelled = Signal(str)
+    tour_point_placed = Signal(str, object)
+    tour_point_placement_cancelled = Signal(str)
+    tour_curve_finished = Signal(object)
+    tour_selection_changed = Signal(object)
+    tour_edit_target_selected = Signal(str, str, object)
+    tour_edit_preview_changed = Signal(str, str, object, object)
+    tour_edit_finished = Signal(str, str, object, object, bool)
     canvas_surface_selection_changed = Signal(object)
     canvas_stair_part_selection_changed = Signal(object)
     canvas_stair_deletion_requested = Signal(object)
@@ -3209,6 +3562,8 @@ class GlbViewerWidget(QWidget):
         wireframe_only: bool = DEFAULT_WIREFRAME_ONLY,
         window_editing_enabled: bool = False,
         face_editing_enabled: bool = False,
+        tour_direction_arrow_enabled: bool = True,
+        tour_html_tooltips_enabled: bool = False,
         pbr_maps_enabled: Mapping[str, bool] | Sequence[str] | None = None,
     ) -> None:
         super().__init__(parent)
@@ -3255,6 +3610,8 @@ class GlbViewerWidget(QWidget):
         self._window_editing_enabled = bool(window_editing_enabled)
         self._projection_camera_indicators_visible = False
         self._face_editing_enabled = bool(face_editing_enabled)
+        self._tour_direction_arrow_enabled = bool(tour_direction_arrow_enabled)
+        self._tour_html_tooltips_enabled = bool(tour_html_tooltips_enabled)
         self._face_edit_vertices: np.ndarray | None = None
         self._face_edit_faces: np.ndarray | None = None
         self._face_edit_vertex_representatives: np.ndarray | None = None
@@ -3291,6 +3648,64 @@ class GlbViewerWidget(QWidget):
         self._object_placement_pointer_pressed = False
         self._object_placement_preview_root: GLGraphicsItem | None = None
         self._object_placement_preview_items: list[gl.GLMeshItem] = []
+        self._tour_point_placement_kind: str | None = None
+        self._tour_point_placement_repeat = False
+        self._tour_point_vertical_offset_meters = 0.0
+        self._tour_point_fallback_plane_z: float | None = None
+        self._tour_point_hover_position: tuple[float, float, float] | None = None
+        self._tour_point_pointer_pressed = False
+        self._tour_trigger_drag_start: tuple[float, float, float] | None = None
+        self._tour_placed_curve_points: list[tuple[float, float, float]] = []
+        self._tour_overlays: dict[str, _TourOverlayData] = {}
+        self._tour_selected_tour_id: str | None = None
+        self._tour_selected_step_id: object | None = None
+        self._tour_selected_action_id: str | None = None
+        self._tour_edit_target: _TourEditTarget | None = None
+        self._tour_edit_drag: _TourEditDrag | _TourRotationDrag | None = None
+        self._tour_position_overrides: dict[
+            tuple[str, str, object | None],
+            tuple[float, float, float],
+        ] = {}
+        self._tour_rotation_overrides: dict[
+            tuple[str, str],
+            tuple[float, float, float],
+        ] = {}
+        self._tour_overlay_pointer_pressed = False
+        self._tour_trigger_point: tuple[float, float, float] | None = None
+        self._tour_curve_points: tuple[tuple[float, float, float], ...] = ()
+        self._tour_curve_tension = TOUR_DEFAULT_TENSION
+        self._tour_steps: tuple[object, ...] = ()
+        self._tour_selected_step: object | None = None
+        self._tour_preview_progress: float | None = None
+        self._tour_preview_position: tuple[float, float, float] | None = None
+        self._tour_preview_target: tuple[float, float, float] | None = None
+        self._tour_camera_state_before_preview: dict[str, object] | None = None
+        self._tour_static_overlay_items: list[GLGraphicsItem] = []
+        self._tour_text_overlay_items: list[GLGraphicsItem] = []
+        self._tour_preview_overlay_items: list[GLGraphicsItem] = []
+        self._tour_rendered_text_step_index: int | None = None
+        self._tour_point_hover_items: list[GLGraphicsItem] = []
+        self._tour_curve_overlay_items: dict[str, gl.GLLinePlotItem] = {}
+        self._tour_trigger_overlay_items: dict[str, gl.GLMeshItem] = {}
+        self._tour_step_overlay_items: dict[str, gl.GLScatterPlotItem] = {}
+        self._tour_camera_target_overlay_items: dict[
+            tuple[str, str],
+            gl.GLScatterPlotItem,
+        ] = {}
+        self._tour_control_point_overlay_item: gl.GLScatterPlotItem | None = None
+        self._tour_text_item_targets: dict[GLGraphicsItem, _TourEditTarget] = {}
+        self._tour_text_hit_boxes: dict[
+            _TourEditTarget,
+            tuple[np.ndarray, np.ndarray],
+        ] = {}
+        self._tour_tooltip_hotspot_items: dict[
+            _TourEditTarget,
+            gl.GLScatterPlotItem,
+        ] = {}
+        self._tour_hovered_tooltip_action_id: str | None = None
+        self.tour_tooltip_overlay: TourTooltipOverlay | None = None
+        self._tour_gizmo_items: list[GLGraphicsItem] = []
+        self._tour_gizmo_size = TOUR_GIZMO_MIN_SIZE_METERS
         self._canvas_opening_targets: dict[str, CanvasOpeningTarget] = {}
         self._selected_canvas_opening_key: str | None = None
         self._canvas_opening_edit_drag: _CanvasOpeningEditDrag | None = None
@@ -3451,6 +3866,7 @@ class GlbViewerWidget(QWidget):
         self._ambient_shader = _build_ambient_shader(self._ambient_light_intensity)
 
         self._build_ui()
+        self._connect_tour_input()
         self.undo_shortcut: QShortcut | None = None
         if self._window_editing_enabled:
             self.undo_shortcut = QShortcut(
@@ -3468,6 +3884,606 @@ class GlbViewerWidget(QWidget):
             Qt.ConnectionType.QueuedConnection,
         )
         self._populate_scene()
+
+    # ### Tour placement and preview API ###
+    @property
+    def is_tour_point_placement_active(self) -> bool:
+        """Whether clicks currently create a trigger or curve point."""
+
+        return self._tour_point_placement_kind is not None
+
+    def begin_tour_point_placement(
+        self,
+        kind: str,
+        *,
+        repeat: bool | None = None,
+        vertical_offset_meters: float = 0.0,
+        fallback_plane_z: float | None = None,
+    ) -> bool:
+        """Arm scene-hit point placement without coupling the viewer to tour state."""
+
+        normalized_kind = str(kind).strip().lower()
+        if normalized_kind not in TOUR_POINT_KINDS:
+            return False
+        normalized_offset = float(vertical_offset_meters)
+        if not math.isfinite(normalized_offset):
+            raise ValueError("A tour point vertical offset must be finite.")
+        normalized_fallback = (
+            None if fallback_plane_z is None else float(fallback_plane_z)
+        )
+        if normalized_fallback is not None and not math.isfinite(normalized_fallback):
+            raise ValueError("A tour fallback plane height must be finite.")
+        if self.model is None and normalized_fallback is None:
+            return False
+
+        self.cancel_tour_point_placement(notify=False)
+        self.cancel_object_placement(notify=True)
+        self.cancel_architectural_trim_placement()
+        if self.is_window_placement_active():
+            self.cancel_window_placement(status_message=None)
+        if self.is_surface_vertex_placement_active():
+            self.cancel_surface_vertex_placement()
+        self._cancel_canvas_gizmo_drag()
+        self._tour_point_placement_kind = normalized_kind
+        self._tour_point_placement_repeat = bool(
+            normalized_kind == TOUR_POINT_KIND_CURVE if repeat is None else repeat
+        )
+        self._tour_point_vertical_offset_meters = normalized_offset
+        self._tour_point_fallback_plane_z = normalized_fallback
+        self._tour_point_hover_position = None
+        self._tour_point_pointer_pressed = False
+        self._tour_trigger_drag_start = None
+        if normalized_kind == TOUR_POINT_KIND_CURVE:
+            self._tour_placed_curve_points = list(self._tour_curve_points)
+        self.view.set_primary_pointer_tool_active(True)
+        self.view.set_primary_pointer_finish_enabled(
+            normalized_kind == TOUR_POINT_KIND_CURVE
+        )
+        self._sync_tour_pointer_input_state()
+        self.view.setCursor(Qt.CursorShape.CrossCursor)
+        self.view.setToolTip(_get_tour_placement_instruction(normalized_kind))
+        self._refresh_tour_point_hover_item()
+        return True
+
+    def cancel_tour_point_placement(self, *, notify: bool = True) -> bool:
+        """Disarm the active tour point tool and clear its hover marker."""
+
+        kind = self._tour_point_placement_kind
+        if kind is None:
+            return False
+        self._tour_point_placement_kind = None
+        self._tour_point_placement_repeat = False
+        self._tour_point_vertical_offset_meters = 0.0
+        self._tour_point_fallback_plane_z = None
+        self._tour_point_hover_position = None
+        self._tour_point_pointer_pressed = False
+        self._tour_trigger_drag_start = None
+        if self.view.is_primary_pointer_drag_reserved:
+            self.view.cancel_primary_pointer_drag()
+        self.view.set_primary_pointer_tool_active(False)
+        self._sync_tour_pointer_input_state()
+        self.view.unsetCursor()
+        self.view.setToolTip("")
+        self._remove_tour_point_hover_item()
+        if notify:
+            self.tour_point_placement_cancelled.emit(kind)
+        return True
+
+    def finish_tour_curve_placement(self) -> bool:
+        """Finish repeated curve-point input once an open curve can be formed."""
+
+        points = (
+            self._tour_curve_points
+            if len(self._tour_curve_points) >= 2
+            else tuple(self._tour_placed_curve_points)
+        )
+        has_distinct_segment = any(
+            not np.allclose(first, second, rtol=0.0, atol=1e-9)
+            for first, second in pairwise(points)
+        )
+        if (
+            self._tour_point_placement_kind != TOUR_POINT_KIND_CURVE
+            or len(points) < 2
+            or not has_distinct_segment
+        ):
+            return False
+        self.cancel_tour_point_placement(notify=False)
+        self.tour_curve_finished.emit(tuple(points))
+        return True
+
+    def set_tour_overlays(
+        self,
+        tours: object,
+        *,
+        selected_tour_id: object | None = None,
+        selected_step_id: object | None = None,
+        selected_action_id: object | None = None,
+        timeline_progress: float | None = None,
+        draft: object | None = None,
+    ) -> None:
+        """Show every tour and synchronize the active authoring/playback state.
+
+        ``draft`` accepts the same TourData-like shape as ``tours``.  A draft
+        without an ID is exposed as :data:`TOUR_DRAFT_OVERLAY_ID`, allowing a
+        controller to select it before a persisted TourData value exists.
+        """
+
+        normalized_overlays = {
+            overlay.tour_id: overlay
+            for overlay in _normalize_tour_overlay_collection(tours)
+        }
+        if draft is not None:
+            draft_overlay = _normalize_tour_overlay_data(
+                draft,
+                fallback_tour_id=TOUR_DRAFT_OVERLAY_ID,
+                is_draft=True,
+            )
+            if draft_overlay.tour_id in normalized_overlays:
+                raise ValueError("A draft tour ID must not duplicate a saved tour ID.")
+            normalized_overlays[draft_overlay.tour_id] = draft_overlay
+
+        normalized_selected_id = (
+            None if selected_tour_id is None else str(selected_tour_id).strip()
+        )
+        if normalized_selected_id not in normalized_overlays:
+            normalized_selected_id = None
+        normalized_progress = _normalize_optional_tour_progress(timeline_progress)
+        normalized_action_id = (
+            None if selected_action_id is None else str(selected_action_id).strip()
+        )
+        if not normalized_action_id:
+            normalized_action_id = None
+
+        previous_target = self._tour_edit_target
+        self._tour_position_overrides = {}
+        self._tour_rotation_overrides = {}
+        self._tour_overlays = normalized_overlays
+        self._tour_selected_tour_id = normalized_selected_id
+        self._tour_selected_step_id = selected_step_id
+        self._tour_selected_action_id = normalized_action_id
+        self._tour_preview_progress = normalized_progress
+        self._tour_preview_position = None
+        self._tour_preview_target = None
+
+        selected_overlay = self._get_selected_tour_overlay()
+        if selected_overlay is None:
+            self._tour_trigger_point = None
+            self._tour_curve_points = ()
+            self._tour_curve_tension = TOUR_DEFAULT_TENSION
+            self._tour_steps = ()
+            self._tour_selected_step = None
+            self._tour_edit_target = None
+        else:
+            self._tour_trigger_point = selected_overlay.trigger_point
+            self._tour_curve_points = selected_overlay.curve_points
+            self._tour_curve_tension = selected_overlay.tension
+            self._tour_steps = selected_overlay.steps
+            self._tour_selected_step = selected_step_id
+            if normalized_action_id is not None:
+                self._tour_edit_target = self._find_tour_action_edit_target(
+                    selected_overlay,
+                    normalized_action_id,
+                )
+            elif (
+                previous_target is not None
+                and previous_target.tour_id == selected_overlay.tour_id
+                and previous_target.kind != TOUR_EDIT_TARGET_ACTION
+                and (
+                    previous_target.kind != TOUR_EDIT_TARGET_CAMERA_TARGET
+                    or str(previous_target.reference) == str(selected_step_id)
+                )
+                and self._get_tour_edit_target_position(previous_target) is not None
+            ):
+                self._tour_edit_target = previous_target
+            else:
+                self._tour_edit_target = None
+        if self._tour_point_placement_kind == TOUR_POINT_KIND_CURVE:
+            self._tour_placed_curve_points = list(self._tour_curve_points)
+
+        self._refresh_tour_static_overlay_items()
+        self._refresh_tour_text_overlay_items()
+        self._refresh_tour_preview_overlay_items()
+        self._refresh_tour_edit_gizmo_items()
+        self._sync_tour_pointer_input_state()
+
+    def select_tour_edit_target(
+        self,
+        tour_id: object,
+        kind: object,
+        reference: object | None = None,
+        step_id: object | None = None,
+        *,
+        emit: bool = False,
+    ) -> bool:
+        """Select one retained Tour gizmo target without moving the camera."""
+
+        normalized_tour_id = str(tour_id).strip()
+        normalized_kind = str(kind).strip().lower()
+        overlay = self._tour_overlays.get(normalized_tour_id)
+        if overlay is None or normalized_tour_id != self._tour_selected_tour_id:
+            return False
+        normalized_step_id = None if step_id is None else str(step_id)
+        if normalized_kind == TOUR_EDIT_TARGET_CAMERA_TARGET:
+            normalized_step_id = str(
+                reference if normalized_step_id is None else normalized_step_id
+            )
+            reference = normalized_step_id
+        target = _TourEditTarget(
+            normalized_tour_id,
+            normalized_kind,
+            reference,
+            normalized_step_id,
+        )
+        if self._get_tour_edit_target_position(target) is None:
+            return False
+        self._tour_edit_target = target
+        if normalized_step_id is not None:
+            self._tour_selected_step_id = normalized_step_id
+            self._tour_selected_step = normalized_step_id
+        self._tour_selected_action_id = (
+            str(reference)
+            if normalized_kind == TOUR_EDIT_TARGET_ACTION
+            else None
+        )
+        self._refresh_tour_static_overlay_items()
+        self._refresh_tour_text_overlay_items()
+        self._refresh_tour_edit_gizmo_items()
+        if emit:
+            self.tour_edit_target_selected.emit(
+                normalized_tour_id,
+                normalized_kind,
+                reference,
+            )
+        return True
+
+    def set_tour_edit_preview_position(
+        self,
+        tour_id: object,
+        kind: object,
+        reference: object | None,
+        position: object,
+    ) -> bool:
+        """Apply one temporary edit position without emitting edit signals.
+
+        Controllers use this to mirror a gizmo drag into another 3D view. The
+        retained Tour data remains unchanged until the originating viewer
+        emits :attr:`tour_edit_finished` and the controller commits the edit.
+        """
+
+        normalized_tour_id = str(tour_id).strip()
+        normalized_kind = str(kind).strip().lower()
+        if normalized_tour_id not in self._tour_overlays:
+            return False
+        if normalized_kind == TOUR_EDIT_TARGET_CURVE_POINT:
+            if not isinstance(reference, int) or isinstance(reference, bool):
+                return False
+            normalized_reference: object | None = reference
+        elif normalized_kind in {
+            TOUR_EDIT_TARGET_CAMERA_TARGET,
+            TOUR_EDIT_TARGET_ACTION,
+        }:
+            normalized_reference = str(reference).strip()
+            if not normalized_reference:
+                return False
+        elif normalized_kind == TOUR_EDIT_TARGET_TRIGGER:
+            normalized_reference = None
+        else:
+            return False
+        target = _TourEditTarget(
+            normalized_tour_id,
+            normalized_kind,
+            normalized_reference,
+        )
+        if self._get_tour_edit_target_position(target) is None:
+            return False
+        try:
+            normalized_position = tuple(
+                float(value) for value in _normalize_tour_point(position)
+            )
+        except (TypeError, ValueError):
+            return False
+        self._tour_position_overrides[
+            (normalized_tour_id, normalized_kind, normalized_reference)
+        ] = normalized_position
+        self._refresh_tour_static_overlay_items()
+        self._refresh_tour_text_overlay_items()
+        self._refresh_tour_preview_overlay_items()
+        self._refresh_tour_edit_gizmo_items()
+        return True
+
+    def set_tour_edit_preview_rotation(
+        self,
+        tour_id: object,
+        action_id: object,
+        rotation_degrees: object,
+    ) -> bool:
+        """Apply a temporary 3D-text rotation without emitting edit signals."""
+
+        normalized_tour_id = str(tour_id).strip()
+        normalized_action_id = str(action_id).strip()
+        overlay = self._tour_overlays.get(normalized_tour_id)
+        if overlay is None or not normalized_action_id:
+            return False
+        target = self._find_tour_action_edit_target(
+            overlay,
+            normalized_action_id,
+        )
+        if target is None or self._get_tour_edit_target_rotation(target) is None:
+            return False
+        try:
+            normalized_rotation = _normalize_tour_rotation_degrees(
+                rotation_degrees
+            )
+        except (TypeError, ValueError):
+            return False
+        self._tour_rotation_overrides[
+            (normalized_tour_id, normalized_action_id)
+        ] = normalized_rotation
+        self._refresh_tour_text_overlay_items()
+        self._refresh_tour_edit_gizmo_items()
+        return True
+
+    def set_tour_overlay(
+        self,
+        trigger_point: object | None,
+        curve_points: object,
+        steps: object = (),
+        selected_step: object | None = None,
+        *,
+        tension: float = TOUR_DEFAULT_TENSION,
+    ) -> None:
+        """Compatibility wrapper for the former single-tour overlay API."""
+
+        normalized_steps = _normalize_tour_steps(steps)
+        selected_step_id = (
+            selected_step
+            if isinstance(selected_step, (str, int))
+            else _read_tour_field(selected_step, "step_id", "id")
+        )
+        self.set_tour_overlays(
+            (
+                {
+                    "tour_id": TOUR_LEGACY_OVERLAY_ID,
+                    "trigger_point": trigger_point,
+                    "curve_points": curve_points,
+                    "tension": tension,
+                    "steps": normalized_steps,
+                },
+            ),
+            selected_tour_id=TOUR_LEGACY_OVERLAY_ID,
+            selected_step_id=selected_step_id,
+            timeline_progress=self._tour_preview_progress,
+        )
+
+    def clear_tour_overlay(self) -> None:
+        """Remove retained tour authoring geometry without changing the scene."""
+
+        self._cancel_tour_edit_drag(notify=False)
+        self._tour_overlays = {}
+        self._tour_selected_tour_id = None
+        self._tour_selected_step_id = None
+        self._tour_selected_action_id = None
+        self._tour_edit_target = None
+        self._tour_position_overrides = {}
+        self._tour_rotation_overrides = {}
+        self._tour_overlay_pointer_pressed = False
+        self._tour_trigger_point = None
+        self._tour_curve_points = ()
+        self._tour_steps = ()
+        self._tour_selected_step = None
+        self._tour_preview_progress = None
+        self._tour_preview_position = None
+        self._tour_preview_target = None
+        self._tour_camera_state_before_preview = None
+        self._tour_rendered_text_step_index = None
+        self._tour_hovered_tooltip_action_id = None
+        self._remove_tour_static_overlay_items()
+        self._remove_tour_text_overlay_items()
+        self._remove_tour_preview_overlay_items()
+        self._remove_tour_edit_gizmo_items()
+        self._refresh_tour_tooltip_overlay()
+        self._sync_tour_pointer_input_state()
+
+    def set_tour_preview(
+        self,
+        progress: float,
+        camera_target: object | None,
+        *,
+        camera_position: object | None = None,
+    ) -> bool:
+        """Move the Tour camera to its curve or one explicit preview position."""
+
+        selected_overlay = self._get_selected_tour_overlay()
+        if selected_overlay is None or not selected_overlay.curve_points:
+            return False
+        normalized_progress = _normalize_optional_tour_progress(progress)
+        assert normalized_progress is not None
+        if camera_position is None:
+            resolved_camera_position = np.asarray(
+                evaluate_open_catmull_rom_curve(
+                    selected_overlay.curve_points,
+                    normalized_progress,
+                    tension=selected_overlay.tension,
+                ),
+                dtype=float,
+            )
+        else:
+            resolved_camera_position = _normalize_tour_point(camera_position)
+        if camera_target is None:
+            target = _derive_tour_camera_target(
+                selected_overlay.curve_points,
+                normalized_progress,
+                selected_overlay.tension,
+            )
+        else:
+            target = _normalize_tour_point(camera_target)
+        camera_delta = resolved_camera_position - target
+        distance = float(np.linalg.norm(camera_delta))
+        if not math.isfinite(distance) or distance <= 1e-9:
+            target = _derive_tour_camera_target(
+                selected_overlay.curve_points,
+                normalized_progress,
+                selected_overlay.tension,
+            )
+            camera_delta = resolved_camera_position - target
+            distance = float(np.linalg.norm(camera_delta))
+        if not math.isfinite(distance) or distance <= 1e-9:
+            target = resolved_camera_position + np.asarray((0.0, 1.0, 0.0))
+            camera_delta = resolved_camera_position - target
+            distance = 1.0
+        if self._tour_camera_state_before_preview is None:
+            self._tour_camera_state_before_preview = self._capture_camera_state()
+        if self.get_navigation_mode() != NAVIGATION_MODE_ORBIT:
+            self.set_navigation_mode(NAVIGATION_MODE_ORBIT)
+        elevation = math.degrees(math.asin(float(camera_delta[2]) / distance))
+        azimuth = math.degrees(
+            math.atan2(float(camera_delta[1]), float(camera_delta[0]))
+        )
+        self.view.opts["center"] = QVector3D(*[float(value) for value in target])
+        self.view.setCameraPosition(
+            distance=max(distance, 0.01),
+            elevation=elevation,
+            azimuth=azimuth,
+        )
+        self.view.remember_orbit_camera_state()
+        self._tour_preview_progress = normalized_progress
+        self._tour_preview_position = None
+        self._tour_preview_target = tuple(float(value) for value in target)
+        self._refresh_tour_preview_overlay_items()
+        self._refresh_tour_text_overlay_items()
+        self._refresh_tour_edit_gizmo_items()
+        self.view.update()
+        return True
+
+    def set_tour_timeline_progress(
+        self,
+        progress: float,
+        *,
+        camera_position: object | None = None,
+        camera_target: object | None = None,
+    ) -> bool:
+        """Move the playhead and optionally aim its direction indicator."""
+
+        if self._get_selected_tour_overlay() is None:
+            return False
+        normalized_progress = _normalize_optional_tour_progress(progress)
+        assert normalized_progress is not None
+        self._tour_preview_progress = normalized_progress
+        self._tour_preview_position = (
+            None
+            if camera_position is None
+            else tuple(
+                float(value) for value in _normalize_tour_point(camera_position)
+            )
+        )
+        self._tour_preview_target = (
+            None
+            if camera_target is None
+            else tuple(float(value) for value in _normalize_tour_point(camera_target))
+        )
+        self._refresh_tour_preview_overlay_items()
+        self._refresh_tour_text_overlay_items()
+        self._refresh_tour_edit_gizmo_items()
+        return True
+
+    def clear_tour_preview(self, *, restore_camera: bool = False) -> bool:
+        """Stop timeline preview and optionally restore the prior orbit camera."""
+
+        had_preview = self._tour_preview_progress is not None
+        self._tour_preview_progress = None
+        self._tour_preview_position = None
+        self._tour_preview_target = None
+        prior_camera = self._tour_camera_state_before_preview
+        self._tour_camera_state_before_preview = None
+        if restore_camera and prior_camera is not None:
+            self._restore_camera_state(prior_camera)
+        self._remove_tour_preview_overlay_items()
+        self._refresh_tour_text_overlay_items()
+        self._refresh_tour_edit_gizmo_items()
+        return had_preview
+
+    def get_tour_camera_look_direction(self) -> tuple[float, float, float]:
+        """Return the current preview camera's normalized world-space direction."""
+
+        camera_position = self.view.cameraPosition()
+        center = self.view.opts.get("center")
+        if isinstance(center, QVector3D):
+            direction = np.asarray(
+                (
+                    center.x() - camera_position.x(),
+                    center.y() - camera_position.y(),
+                    center.z() - camera_position.z(),
+                ),
+                dtype=float,
+            )
+            normalized = _normalize_vector(direction)
+            if normalized is not None:
+                return tuple(float(value) for value in normalized)
+        camera_ray = self.view.build_camera_ray(
+            QPointF(self.view.width() * 0.5, self.view.height() * 0.5)
+        )
+        if camera_ray is None:
+            return (0.0, 1.0, 0.0)
+        return tuple(float(value) for value in camera_ray[1])
+
+    def get_camera_forward_world_point(
+        self,
+        distance_meters: float = 1.0,
+    ) -> tuple[float, float, float]:
+        """Return a point at an exact distance along the live camera direction."""
+
+        distance = float(distance_meters)
+        if not math.isfinite(distance) or distance <= 0.0:
+            raise ValueError("Camera forward distance must be finite and positive.")
+        camera_position = self.view.cameraPosition()
+        origin = np.asarray(
+            (camera_position.x(), camera_position.y(), camera_position.z()),
+            dtype=float,
+        )
+        forward = np.asarray(self.get_tour_camera_look_direction(), dtype=float)
+        normalized_forward = _normalize_vector(forward)
+        if normalized_forward is None:
+            raise RuntimeError("The camera forward direction is invalid.")
+        return tuple(float(value) for value in origin + normalized_forward * distance)
+
+    def get_tour_screen_center_world_point(
+        self,
+        *,
+        fallback_distance_meters: float = 5.0,
+    ) -> tuple[float, float, float]:
+        """Return the nearest scene hit at screen center or a forward fallback."""
+
+        fallback_distance = float(fallback_distance_meters)
+        if not math.isfinite(fallback_distance) or fallback_distance <= 0.0:
+            raise ValueError("Tour center-point fallback distance must be positive.")
+        camera_ray = self.view.build_camera_ray(
+            QPointF(self.view.width() * 0.5, self.view.height() * 0.5)
+        )
+        if camera_ray is None:
+            camera_position = self.view.cameraPosition()
+            origin = np.asarray(
+                (camera_position.x(), camera_position.y(), camera_position.z()),
+                dtype=float,
+            )
+            direction = np.asarray(self.get_tour_camera_look_direction(), dtype=float)
+        else:
+            origin, direction = _normalize_ray(*camera_ray)
+            if origin is None or direction is None:
+                raise RuntimeError("The tour preview camera ray is invalid.")
+        hit = self._pick_nearest_tour_scene_hit(origin, direction)
+        point = (
+            origin + direction * fallback_distance
+            if hit is None
+            else np.asarray(hit[0], dtype=float)
+        )
+        return tuple(float(value) for value in point)
+
+    def clear_tour(self, *, restore_camera: bool = False) -> None:
+        """Clear placement, overlay geometry, and timeline-camera preview."""
+
+        self.cancel_tour_point_placement(notify=False)
+        self.clear_tour_preview(restore_camera=restore_camera)
+        self.clear_tour_overlay()
 
     # ### Doorway preview outline API ###
     def set_doorway_preview_outline(self, positions: object | None) -> None:
@@ -3606,6 +4622,9 @@ class GlbViewerWidget(QWidget):
         if self._window_editing_enabled:
             self._build_architectural_trim_hover_action_widget()
         layout.addWidget(self.view)
+
+        if self._tour_html_tooltips_enabled:
+            self.tour_tooltip_overlay = TourTooltipOverlay(self.view)
 
         self.first_person_frame_overlay = _FirstPersonFrameOverlay()
         self.first_person_frame_overlay.setObjectName(
@@ -5323,6 +6342,7 @@ class GlbViewerWidget(QWidget):
             self._set_add_surface_vertex_button_checked(False)
             return False
         self._clear_architectural_trim_passive_hover()
+        self.cancel_tour_point_placement()
         if self.is_window_placement_active():
             self.cancel_window_placement(status_message=None)
         self._cancel_canvas_gizmo_drag()
@@ -5961,6 +6981,7 @@ class GlbViewerWidget(QWidget):
             return False
 
         self._clear_architectural_trim_passive_hover()
+        self.cancel_tour_point_placement()
         self.cancel_object_placement(notify=False)
         self.cancel_architectural_trim_placement()
         if self.is_window_placement_active():
@@ -6176,6 +7197,7 @@ class GlbViewerWidget(QWidget):
             return False
 
         self._clear_architectural_trim_passive_hover()
+        self.cancel_tour_point_placement()
         self.cancel_architectural_trim_placement()
         self.cancel_object_placement(notify=True)
         if self.is_window_placement_active():
@@ -6640,6 +7662,7 @@ class GlbViewerWidget(QWidget):
             return False
 
         self._clear_architectural_trim_passive_hover()
+        self.cancel_tour_point_placement()
         if self.is_surface_vertex_placement_active():
             self.cancel_surface_vertex_placement()
         self.cancel_architectural_trim_placement()
@@ -6675,6 +7698,2033 @@ class GlbViewerWidget(QWidget):
         self._sync_window_undo_button()
         if status_message is not None:
             self._set_window_tools_status(status_message)
+
+    # ### Tour pointer input ###
+    def _connect_tour_input(self) -> None:
+        """Connect generic point authoring in every shared or dedicated viewer."""
+
+        self.view.primary_pointer_pressed.connect(self._handle_tour_pointer_pressed)
+        self.view.primary_pointer_hovered.connect(self._handle_tour_pointer_hovered)
+        self.view.primary_pointer_left.connect(self._handle_tour_pointer_left)
+        self.view.primary_pointer_moved.connect(self._handle_tour_pointer_moved)
+        self.view.primary_pointer_released.connect(self._handle_tour_pointer_released)
+        self.view.primary_pointer_cancel_requested.connect(
+            self._handle_tour_placement_cancel_requested
+        )
+        self.view.primary_pointer_finish_requested.connect(
+            self.finish_tour_curve_placement
+        )
+
+    def _handle_tour_pointer_hovered(self, position: QPointF) -> None:
+        if self.is_tour_point_placement_active:
+            self._update_tour_point_hover(position)
+            return
+        self._update_tour_tooltip_hover(position)
+
+    def _handle_tour_pointer_left(self) -> None:
+        if not self.is_tour_point_placement_active:
+            self._tour_hovered_tooltip_action_id = None
+            self._refresh_tour_tooltip_overlay()
+            return
+        if self._tour_point_pointer_pressed:
+            return
+        self._tour_point_hover_position = None
+        self._refresh_tour_point_hover_item()
+
+    def _handle_tour_pointer_pressed(self, position: QPointF) -> None:
+        if self.is_tour_point_placement_active:
+            self._update_tour_point_hover(position)
+            if self._tour_point_hover_position is None:
+                return
+            self._tour_point_pointer_pressed = True
+            if self._tour_point_placement_kind == TOUR_POINT_KIND_TRIGGER:
+                self._tour_trigger_drag_start = self._tour_point_hover_position
+            self.view.reserve_primary_pointer_drag()
+            self._refresh_tour_point_hover_item()
+            return
+        if not self._tour_overlays or self.view.is_first_person_pointer_captured:
+            return
+
+        camera_ray = self.view.build_camera_ray(position)
+        if camera_ray is not None:
+            handle = self._pick_tour_gizmo_handle(*camera_ray)
+            if handle is not None:
+                began_drag = (
+                    self._begin_tour_rotation_drag(handle.axis_index, position)
+                    if handle.kind == TRANSFORM_GIZMO_ROTATE
+                    else self._begin_tour_edit_drag(handle.axis_index, position)
+                )
+                if began_drag:
+                    return
+        picked = self._pick_tour_overlay(position)
+        if picked is None:
+            return
+        self._tour_overlay_pointer_pressed = True
+        self.view.reserve_primary_pointer_drag()
+        self._apply_tour_overlay_pick(picked)
+
+    def _handle_tour_pointer_moved(self, position: QPointF) -> None:
+        if self._tour_point_pointer_pressed:
+            self._update_tour_point_hover(position)
+            return
+        if self._tour_edit_drag is not None:
+            self._update_tour_edit_drag(position)
+
+    def _handle_tour_pointer_released(self, position: QPointF) -> None:
+        if self._tour_edit_drag is not None:
+            self._finish_tour_edit_drag(position)
+            return
+        if self._tour_overlay_pointer_pressed:
+            self._tour_overlay_pointer_pressed = False
+            self.view.release_primary_pointer_drag()
+            return
+        if not self._tour_point_pointer_pressed:
+            return
+        self._tour_point_pointer_pressed = False
+        self._update_tour_point_hover(position)
+        self.view.release_primary_pointer_drag()
+        self._commit_tour_point_placement()
+
+    def _handle_tour_placement_cancel_requested(self) -> None:
+        if self._tour_edit_drag is not None:
+            self._cancel_tour_edit_drag()
+            return
+        if self._tour_overlay_pointer_pressed:
+            self._tour_overlay_pointer_pressed = False
+            self.view.cancel_primary_pointer_drag()
+            return
+        if self.is_tour_point_placement_active:
+            self.cancel_tour_point_placement()
+
+    def _update_tour_point_hover(self, position: QPointF) -> None:
+        camera_ray = self.view.build_camera_ray(position)
+        point = None
+        if camera_ray is not None:
+            trigger_plane_z = (
+                self._tour_trigger_drag_start[2]
+                if self._tour_trigger_drag_start is not None
+                else self._tour_point_fallback_plane_z
+            )
+            if (
+                self._tour_point_placement_kind == TOUR_POINT_KIND_TRIGGER
+                and trigger_plane_z is not None
+            ):
+                point = _intersect_ray_with_plane(
+                    np.asarray(camera_ray[0], dtype=float),
+                    np.asarray(camera_ray[1], dtype=float),
+                    np.asarray((0.0, 0.0, trigger_plane_z), dtype=float),
+                    np.asarray((0.0, 0.0, 1.0), dtype=float),
+                )
+            else:
+                point = self._pick_tour_world_point(*camera_ray)
+        self._tour_point_hover_position = (
+            None
+            if point is None
+            else tuple(float(value) for value in point)
+        )
+        self._refresh_tour_point_hover_item()
+
+    def _pick_tour_world_point(
+        self,
+        ray_origin: object,
+        ray_direction: object,
+    ) -> np.ndarray | None:
+        """Resolve the nearest visible scene hit, with an optional ground fallback."""
+
+        origin = np.asarray(ray_origin, dtype=float)
+        direction = np.asarray(ray_direction, dtype=float)
+        nearest_hit = self._pick_nearest_tour_scene_hit(origin, direction)
+        if nearest_hit is not None:
+            point = np.asarray(nearest_hit[0], dtype=float).copy()
+        elif self._tour_point_fallback_plane_z is not None:
+            point = _intersect_ray_with_plane(
+                origin,
+                direction,
+                np.asarray((0.0, 0.0, self._tour_point_fallback_plane_z)),
+                np.asarray((0.0, 0.0, 1.0)),
+            )
+            if point is None:
+                return None
+            point = np.asarray(point, dtype=float)
+        else:
+            return None
+        point[2] += self._tour_point_vertical_offset_meters
+        return point
+
+    def _pick_nearest_tour_scene_hit(
+        self,
+        ray_origin: object,
+        ray_direction: object,
+    ) -> tuple[np.ndarray, float] | None:
+        """Return the nearest model, surface, object, stair, or trim ray hit."""
+
+        origin, direction = _normalize_ray(ray_origin, ray_direction)
+        if origin is None or direction is None:
+            return None
+        candidates: list[tuple[np.ndarray, float]] = []
+        surface_hit = _get_nearest_fixed_surface_ray_hit(
+            tuple(
+                surface
+                for surface in self._canvas_surface_targets.values()
+                if self._canvas_surface_is_visible(surface)
+            ),
+            origin,
+            direction,
+        )
+        if surface_hit is not None:
+            candidates.append((np.asarray(surface_hit[1], dtype=float), surface_hit[2]))
+        object_hit = _get_nearest_preview_placed_object_ray_hit(
+            tuple(
+                replace(group.preview, placement_transform=group.current_transform)
+                for group in self._placed_object_render_groups.values()
+                if self._canvas_objects_are_visible()
+            ),
+            origin,
+            direction,
+        )
+        if object_hit is not None:
+            candidates.append((np.asarray(object_hit[1], dtype=float), object_hit[2]))
+        stair_hit = _get_nearest_preview_stair_part_ray_hit(
+            tuple(
+                part
+                for part in self._canvas_stair_part_targets.values()
+                if self._canvas_stair_part_is_visible(part)
+                and not self._canvas_stair_part_is_preview_hidden(part)
+            ),
+            origin,
+            direction,
+        )
+        if stair_hit is not None:
+            candidates.append((np.asarray(stair_hit[1], dtype=float), stair_hit[2]))
+        trim_hit = _get_nearest_architectural_trim_part_ray_hit(
+            tuple(
+                part
+                for part in self._architectural_trim_parts.values()
+                if self._architectural_trim_part_is_visible(part)
+            ),
+            origin,
+            direction,
+        )
+        if trim_hit is not None:
+            candidates.append((np.asarray(trim_hit[1], dtype=float), trim_hit[2]))
+        display_mesh = self._get_display_mesh()
+        if display_mesh is not None:
+            mesh_hit = _get_nearest_triangle_ray_hit(display_mesh, origin, direction)
+            if mesh_hit is not None:
+                candidates.append((np.asarray(mesh_hit[0], dtype=float), mesh_hit[1]))
+
+        return (
+            None
+            if not candidates
+            else min(candidates, key=lambda candidate: candidate[1])
+        )
+
+    def _commit_tour_point_placement(self) -> bool:
+        kind = self._tour_point_placement_kind
+        point = self._tour_point_hover_position
+        if kind is None or point is None:
+            return False
+        placed_value: object = point
+        if kind == TOUR_POINT_KIND_TRIGGER:
+            placed_value = _build_tour_trigger_area_payload(
+                self._tour_trigger_drag_start or point,
+                point,
+            )
+        if kind == TOUR_POINT_KIND_CURVE:
+            self._tour_placed_curve_points.append(point)
+        should_repeat = self._tour_point_placement_repeat
+        if not should_repeat:
+            self.cancel_tour_point_placement(notify=False)
+        self.tour_point_placed.emit(kind, placed_value)
+        return True
+
+    # ### Tour overlay rendering ###
+    def _refresh_tour_point_hover_item(self) -> None:
+        self._remove_tour_point_hover_item()
+        point = self._tour_point_hover_position
+        if point is None or not hasattr(self, "view"):
+            return
+        if self._tour_point_placement_kind == TOUR_POINT_KIND_TRIGGER:
+            payload = _build_tour_trigger_area_payload(
+                self._tour_trigger_drag_start or point,
+                point,
+            )
+            self._add_tour_trigger_area_item(
+                payload["center"],
+                payload["size"],
+                TOUR_PLACEMENT_HOVER_COLOR,
+                self._tour_point_hover_items,
+            )
+            return
+        item = gl.GLScatterPlotItem(
+            pos=np.asarray((point,), dtype=np.float32),
+            color=TOUR_PLACEMENT_HOVER_COLOR,
+            size=TOUR_PLACEMENT_HOVER_SIZE_PIXELS,
+            pxMode=True,
+            glOptions="translucent",
+        )
+        item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE + 10.0)
+        self.view.addItem(item)
+        self._tour_point_hover_items.append(item)
+
+    def _remove_tour_point_hover_item(self) -> None:
+        self._remove_tour_item_group(self._tour_point_hover_items)
+        self._tour_point_hover_items = []
+
+    def _refresh_tour_static_overlay_items(self) -> None:
+        """Rebuild every trigger/path and only the selected path's controls."""
+
+        self._remove_tour_static_overlay_items()
+        if not hasattr(self, "view"):
+            return
+        for tour_id, overlay in self._tour_overlays.items():
+            selected = tour_id == self._tour_selected_tour_id
+            opacity = 1.0 if selected else TOUR_UNSELECTED_OPACITY
+            trigger = self._get_tour_trigger_display_position(overlay)
+            if trigger is not None:
+                trigger_item = self._add_tour_trigger_area_item(
+                    trigger,
+                    overlay.trigger_area_size,
+                    _tour_color_with_opacity(TOUR_TRIGGER_COLOR, opacity),
+                    self._tour_static_overlay_items,
+                )
+                if trigger_item is not None:
+                    trigger_item._housemaker_tour_id = tour_id
+                    trigger_item._housemaker_tour_role = TOUR_EDIT_TARGET_TRIGGER
+                    self._tour_trigger_overlay_items[tour_id] = trigger_item
+
+            display_points = self._get_tour_curve_display_points(overlay)
+            if len(display_points) >= 2 and overlay.steps:
+                step_positions = tuple(
+                    evaluate_open_catmull_rom_curve(
+                        display_points,
+                        _read_tour_progress(step, default=0.0),
+                        tension=overlay.tension,
+                    )
+                    for step in overlay.steps
+                )
+                step_item = self._add_tour_scatter_item(
+                    step_positions,
+                    _tour_color_with_opacity(TOUR_STEP_COLOR, opacity),
+                    TOUR_STEP_SIZE_PIXELS,
+                    self._tour_static_overlay_items,
+                )
+                if step_item is not None:
+                    step_item._housemaker_tour_id = tour_id
+                    step_item._housemaker_tour_role = "step_markers"
+                    step_item._housemaker_step_ids = tuple(
+                        _get_tour_step_id(step, step_index)
+                        for step_index, step in enumerate(overlay.steps)
+                    )
+                    self._tour_step_overlay_items[tour_id] = step_item
+            if selected and display_points:
+                control_item = self._add_tour_scatter_item(
+                    display_points,
+                    TOUR_CURVE_POINT_COLOR,
+                    TOUR_CURVE_POINT_SIZE_PIXELS,
+                    self._tour_static_overlay_items,
+                )
+                if control_item is not None:
+                    control_item._housemaker_tour_id = tour_id
+                    control_item._housemaker_tour_role = TOUR_EDIT_TARGET_CURVE_POINT
+                    self._tour_control_point_overlay_item = control_item
+            selected_step_index = (
+                _resolve_selected_tour_step_index(
+                    overlay.steps,
+                    self._tour_selected_step_id,
+                )
+                if selected
+                else None
+            )
+            if selected_step_index is not None:
+                target_contexts: list[tuple[int, tuple[float, ...], str]] = []
+                next_step_index = _resolve_next_tour_step_index(
+                    overlay.steps,
+                    selected_step_index,
+                )
+                if next_step_index is not None:
+                    target_contexts.append(
+                        (
+                            next_step_index,
+                            TOUR_NEXT_CAMERA_TARGET_COLOR,
+                            "next",
+                        )
+                    )
+                target_contexts.append(
+                    (selected_step_index, TOUR_CAMERA_TARGET_COLOR, "current")
+                )
+                for step_index, target_color, target_timing in target_contexts:
+                    step = overlay.steps[step_index]
+                    step_id = _get_tour_step_id(step, step_index)
+                    camera_target = (
+                        self._get_tour_step_camera_target_display_position(
+                            overlay,
+                            step,
+                            step_index,
+                        )
+                    )
+                    if camera_target is None:
+                        continue
+                    target_item = self._add_tour_scatter_item(
+                        (camera_target,),
+                        target_color,
+                        TOUR_CAMERA_TARGET_SIZE_PIXELS,
+                        self._tour_static_overlay_items,
+                    )
+                    if target_item is not None:
+                        target_item._housemaker_tour_id = tour_id
+                        target_item._housemaker_tour_role = (
+                            TOUR_EDIT_TARGET_CAMERA_TARGET
+                        )
+                        target_item._housemaker_step_id = step_id
+                        target_item._housemaker_tour_target_timing = target_timing
+                        self._tour_camera_target_overlay_items[
+                            (tour_id, step_id)
+                        ] = target_item
+            if len(display_points) < 2:
+                continue
+            samples = sample_open_catmull_rom_curve(
+                display_points,
+                tension=overlay.tension,
+            )
+            curve_item = gl.GLLinePlotItem(
+                pos=samples,
+                color=_tour_color_with_opacity(TOUR_CURVE_COLOR, opacity),
+                width=TOUR_CURVE_WIDTH_PIXELS,
+                antialias=True,
+                mode="line_strip",
+                glOptions="translucent",
+            )
+            curve_item._housemaker_tour_id = tour_id
+            curve_item._housemaker_tour_role = "curve"
+            curve_item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE + 4.0)
+            self.view.addItem(curve_item)
+            self._tour_static_overlay_items.append(curve_item)
+            self._tour_curve_overlay_items[tour_id] = curve_item
+        self.view.update()
+
+    def _refresh_tour_text_overlay_items(self) -> None:
+        """Render actions only for the selected tour's current timeline step."""
+
+        self._remove_tour_text_overlay_items()
+        if not hasattr(self, "view"):
+            return
+        overlay = self._get_selected_tour_overlay()
+        if overlay is None:
+            self._tour_rendered_text_step_index = None
+            self._tour_hovered_tooltip_action_id = None
+            self._refresh_tour_tooltip_overlay()
+            self.view.update()
+            return
+        step_index = self._get_active_tour_text_step_index()
+        self._tour_rendered_text_step_index = step_index
+        if step_index is None:
+            self._tour_hovered_tooltip_action_id = None
+            self._refresh_tour_tooltip_overlay()
+            self.view.update()
+            return
+
+        for (
+            visible_step_index,
+            action_index,
+            action,
+            alpha,
+        ) in self._iter_visible_tour_text_actions(overlay, step_index):
+            position = _read_optional_tour_point(action, "position")
+            text = str(_read_tour_field(action, "text") or "").strip()
+            if position is None or not text:
+                continue
+            action_id = _get_tour_action_id(
+                action,
+                f"{visible_step_index}-{action_index}",
+            )
+            if action_id == self._tour_selected_action_id:
+                alpha = 1.0
+            if alpha <= 0.0:
+                continue
+            step_id = _get_tour_step_id(
+                overlay.steps[visible_step_index],
+                visible_step_index,
+            )
+            target = _TourEditTarget(
+                tour_id=overlay.tour_id,
+                kind=TOUR_EDIT_TARGET_ACTION,
+                reference=action_id,
+                step_id=step_id,
+            )
+            override = self._tour_position_overrides.get(
+                (overlay.tour_id, TOUR_EDIT_TARGET_ACTION, action_id)
+            )
+            if override is not None:
+                position = np.asarray(override, dtype=float)
+            size_points = _read_positive_tour_number(
+                action,
+                "size_points",
+                default=TOUR_DEFAULT_TEXT_POINT_SIZE,
+            )
+            color = _read_tour_color(action, default=TOUR_TEXT_COLOR)
+            color = (*color[:3], color[3] * alpha)
+            local_vertices, text_faces = _build_tour_text_local_mesh(
+                text,
+                size_points,
+            )
+            if not len(local_vertices) or not len(text_faces):
+                continue
+            look_direction = self._get_tour_step_camera_look_direction(
+                overlay,
+                overlay.steps[visible_step_index],
+                visible_step_index,
+            )
+            rotation_degrees = self._get_tour_action_rotation_degrees(
+                overlay,
+                action,
+                action_id,
+            )
+            world_vertices = _orient_tour_text_mesh(
+                local_vertices,
+                position,
+                look_direction,
+                rotation_degrees,
+            )
+            text_item = gl.GLMeshItem(
+                vertexes=world_vertices,
+                faces=text_faces,
+                color=color,
+                smooth=False,
+                drawFaces=True,
+                drawEdges=False,
+                shader="shaded",
+            )
+            text_item.setGLOptions("translucent")
+            text_item.text = text
+            text_item._housemaker_is_extruded_text = True
+            text_item._housemaker_tour_id = overlay.tour_id
+            text_item._housemaker_tour_role = TOUR_EDIT_TARGET_ACTION
+            text_item._housemaker_action_id = action_id
+            text_item._housemaker_step_id = step_id
+            text_item._housemaker_alpha = alpha
+            text_item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE + 8.0)
+            self.view.addItem(text_item)
+            self._tour_text_overlay_items.append(text_item)
+            self._tour_text_item_targets[text_item] = target
+            self._tour_text_hit_boxes[target] = _build_tour_text_hit_box(
+                world_vertices
+            )
+        step = overlay.steps[step_index]
+        step_id = _get_tour_step_id(step, step_index)
+        for action_index, action in enumerate(_read_tour_actions(step)):
+            if _get_tour_component_type(action) != "floatingtooltip":
+                continue
+            anchor_point = _read_optional_tour_point(
+                action,
+                "anchor_point",
+                "anchorPoint",
+            )
+            if anchor_point is None:
+                continue
+            action_id = _get_tour_action_id(action, f"{step_index}-{action_index}")
+            override = self._tour_position_overrides.get(
+                (overlay.tour_id, TOUR_EDIT_TARGET_ACTION, action_id)
+            )
+            if override is not None:
+                anchor_point = np.asarray(override, dtype=float)
+            target = _TourEditTarget(
+                tour_id=overlay.tour_id,
+                kind=TOUR_EDIT_TARGET_ACTION,
+                reference=action_id,
+                step_id=step_id,
+            )
+            color = (
+                TOUR_TOOLTIP_HOTSPOT_SELECTED_COLOR
+                if action_id == self._tour_selected_action_id
+                else TOUR_TOOLTIP_HOTSPOT_COLOR
+            )
+            hotspot_item = self._add_tour_scatter_item(
+                (anchor_point,),
+                color,
+                TOUR_TOOLTIP_HOTSPOT_SIZE_PIXELS,
+                self._tour_text_overlay_items,
+            )
+            if hotspot_item is None:
+                continue
+            hotspot_item._housemaker_tour_id = overlay.tour_id
+            hotspot_item._housemaker_tour_role = "floating_tooltip_hotspot"
+            hotspot_item._housemaker_action_id = action_id
+            hotspot_item._housemaker_step_id = step_id
+            self._tour_tooltip_hotspot_items[target] = hotspot_item
+        if self._tour_hovered_tooltip_action_id not in {
+            str(target.reference) for target in self._tour_tooltip_hotspot_items
+        }:
+            self._tour_hovered_tooltip_action_id = None
+        self._refresh_tour_tooltip_overlay()
+        self.view.update()
+
+    def _get_tour_step_camera_look_direction(
+        self,
+        overlay: _TourOverlayData,
+        step: object,
+        step_index: int,
+    ) -> tuple[float, float, float]:
+        """Orient authored text once in world space toward its step camera."""
+
+        display_points = self._get_tour_curve_display_points(overlay)
+        camera_target = self._get_tour_step_camera_target_display_position(
+            overlay,
+            step,
+            step_index,
+        )
+        if display_points and camera_target is not None:
+            camera_position = np.asarray(
+                evaluate_open_catmull_rom_curve(
+                    display_points,
+                    _read_tour_progress(step, default=0.0),
+                    tension=overlay.tension,
+                ),
+                dtype=float,
+            )
+            direction = _normalize_vector(
+                np.asarray(camera_target, dtype=float) - camera_position
+            )
+            if direction is not None:
+                return tuple(float(value) for value in direction)
+        return (0.0, 1.0, 0.0)
+
+    def _get_active_tour_text_step_index(self) -> int | None:
+        overlay = self._get_selected_tour_overlay()
+        if overlay is None or self._tour_selected_step_id is None:
+            return None
+        if self._tour_preview_progress is not None:
+            selected_index = _resolve_selected_tour_step_index(
+                overlay.steps,
+                self._tour_selected_step_id,
+            )
+            if selected_index is not None and math.isclose(
+                _read_tour_progress(
+                    overlay.steps[selected_index],
+                    default=-1.0,
+                ),
+                self._tour_preview_progress,
+                abs_tol=1e-12,
+            ):
+                return selected_index
+            return _resolve_active_tour_step_index(
+                overlay.steps,
+                self._tour_preview_progress,
+            )
+        return _resolve_selected_tour_step_index(
+            overlay.steps,
+            self._tour_selected_step_id,
+        )
+
+    # ### Tour floating-tooltip preview ###
+    def _update_tour_tooltip_hover(self, position: QPointF) -> None:
+        """Show the nearest current-step tooltip when its hotspot is hovered."""
+
+        if not self._tour_html_tooltips_enabled:
+            return
+        pointer = np.asarray((position.x(), position.y()), dtype=float)
+        candidates: list[tuple[float, float, str]] = []
+        for target in self._tour_tooltip_hotspot_items:
+            anchor_point = self._get_tour_edit_target_position(target)
+            if anchor_point is None:
+                continue
+            projected = self._project_tour_world_point(anchor_point)
+            if projected is None:
+                continue
+            screen_position, depth = projected
+            distance = float(
+                np.linalg.norm(
+                    pointer
+                    - np.asarray(
+                        (screen_position.x(), screen_position.y()),
+                        dtype=float,
+                    )
+                )
+            )
+            if distance <= TOUR_TOOLTIP_HOVER_TOLERANCE_PIXELS:
+                candidates.append((distance, depth, str(target.reference)))
+        hovered_action_id = None if not candidates else min(candidates)[2]
+        if hovered_action_id == self._tour_hovered_tooltip_action_id:
+            self._refresh_tour_tooltip_overlay()
+            return
+        self._tour_hovered_tooltip_action_id = hovered_action_id
+        self._refresh_tour_tooltip_overlay()
+
+    def _refresh_tour_tooltip_overlay(self) -> None:
+        """Synchronize the rich-HTML overlay with the hovered 3D hotspot."""
+
+        tooltip_overlay = self.tour_tooltip_overlay
+        action_id = self._tour_hovered_tooltip_action_id
+        if tooltip_overlay is None or action_id is None:
+            if tooltip_overlay is not None:
+                tooltip_overlay.hide_tooltip()
+            return
+        context = self._find_active_tour_tooltip_action(action_id)
+        if context is None:
+            self._tour_hovered_tooltip_action_id = None
+            tooltip_overlay.hide_tooltip()
+            return
+        action, target = context
+        anchor_point = self._get_tour_edit_target_position(target)
+        projected = (
+            None
+            if anchor_point is None
+            else self._project_tour_world_point(anchor_point)
+        )
+        if projected is None:
+            tooltip_overlay.hide_tooltip()
+            return
+        html_body = str(
+            _read_tour_field(action, "html_body", "htmlBody") or ""
+        ).strip()
+        if not html_body:
+            tooltip_overlay.hide_tooltip()
+            return
+        tooltip_overlay.show_tooltip(
+            anchor_screen_position=projected[0],
+            tooltip_position=str(
+                _read_tour_field(
+                    action,
+                    "tooltip_position",
+                    "tooltipPosition",
+                )
+                or "opposite"
+            ),
+            html_body=html_body,
+            style=str(_read_tour_field(action, "style") or ""),
+        )
+
+    def _find_active_tour_tooltip_action(
+        self,
+        action_id: str,
+    ) -> tuple[object, _TourEditTarget] | None:
+        """Return one visible current-step tooltip and its editable anchor."""
+
+        overlay = self._get_selected_tour_overlay()
+        step_index = self._get_active_tour_text_step_index()
+        if overlay is None or step_index is None:
+            return None
+        step = overlay.steps[step_index]
+        step_id = _get_tour_step_id(step, step_index)
+        for action_index, action in enumerate(_read_tour_actions(step)):
+            if _get_tour_component_type(action) != "floatingtooltip":
+                continue
+            candidate_id = _get_tour_action_id(
+                action,
+                f"{step_index}-{action_index}",
+            )
+            if candidate_id == action_id:
+                return action, _TourEditTarget(
+                    tour_id=overlay.tour_id,
+                    kind=TOUR_EDIT_TARGET_ACTION,
+                    reference=candidate_id,
+                    step_id=step_id,
+                )
+        return None
+
+    def _project_tour_world_point(
+        self,
+        point: object,
+    ) -> tuple[QPointF, float] | None:
+        """Project one Tour world point into this viewport's pixel space."""
+
+        width = max(int(self.view.width()), 1)
+        height = max(int(self.view.height()), 1)
+        viewport = (0, 0, width, height)
+        try:
+            view_projection = (
+                self.view.projectionMatrix(viewport, viewport)
+                * self.view.viewMatrix()
+            )
+            projected = _project_vertices_to_view(
+                np.asarray((_normalize_tour_point(point),), dtype=float),
+                view_projection,
+                width,
+                height,
+            )[0]
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return None
+        if not _is_usable_projected_point(projected):
+            return None
+        return QPointF(float(projected[0]), float(projected[1])), float(
+            projected[2]
+        )
+
+    def _refresh_tour_preview_overlay_items(self) -> None:
+        """Rebuild the red playhead and its camera-look direction arrow."""
+
+        self._remove_tour_preview_overlay_items()
+        overlay = self._get_selected_tour_overlay()
+        if (
+            not hasattr(self, "view")
+            or self._tour_preview_progress is None
+            or overlay is None
+            or not overlay.curve_points
+        ):
+            return
+        display_points = self._get_tour_curve_display_points(overlay)
+        camera_position = (
+            np.asarray(self._tour_preview_position, dtype=np.float32)
+            if self._tour_preview_position is not None
+            else np.asarray(
+                evaluate_open_catmull_rom_curve(
+                    display_points,
+                    self._tour_preview_progress,
+                    tension=overlay.tension,
+                ),
+                dtype=np.float32,
+            )
+        )
+        progress_item = self._add_tour_scatter_item(
+            (camera_position,),
+            TOUR_TIMELINE_PROGRESS_COLOR,
+            TOUR_TIMELINE_PROGRESS_SIZE_PIXELS,
+            self._tour_preview_overlay_items,
+        )
+        if progress_item is not None:
+            progress_item._housemaker_tour_id = overlay.tour_id
+            progress_item._housemaker_tour_role = "timeline_progress"
+            progress_item._housemaker_tour_progress = self._tour_preview_progress
+        if not self._tour_direction_arrow_enabled:
+            self.view.update()
+            return
+        camera_target = self._get_tour_preview_camera_target(
+            overlay,
+            camera_position,
+        )
+        if _normalize_vector(camera_target - camera_position) is None:
+            camera_target = _derive_tour_camera_target(
+                display_points,
+                self._tour_preview_progress,
+                overlay.tension,
+            )
+        arrow_positions = _build_tour_direction_arrow_positions(
+            camera_position,
+            camera_target,
+        )
+        if arrow_positions is not None:
+            arrow_item = gl.GLLinePlotItem(
+                pos=arrow_positions,
+                color=TOUR_TIMELINE_PROGRESS_COLOR,
+                width=TOUR_TIMELINE_DIRECTION_ARROW_WIDTH_PIXELS,
+                antialias=True,
+                mode="lines",
+            )
+            arrow_item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+            arrow_item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE + 7.0)
+            arrow_item._housemaker_tour_id = overlay.tour_id
+            arrow_item._housemaker_tour_role = "timeline_direction"
+            arrow_item._housemaker_tour_progress = self._tour_preview_progress
+            direction = _normalize_vector(camera_target - camera_position)
+            arrow_item._housemaker_tour_direction = (
+                None
+                if direction is None
+                else tuple(float(value) for value in direction)
+            )
+            self.view.addItem(arrow_item)
+            self._tour_preview_overlay_items.append(arrow_item)
+        self.view.update()
+
+    def _get_tour_preview_camera_target(
+        self,
+        overlay: _TourOverlayData,
+        camera_position: np.ndarray,
+    ) -> np.ndarray:
+        """Return the live or interpolated target used by the red arrow."""
+
+        if self._tour_preview_target is not None:
+            return np.asarray(self._tour_preview_target, dtype=float)
+        assert self._tour_preview_progress is not None
+        targets: list[tuple[float, str, np.ndarray]] = []
+        for step_index, step in enumerate(overlay.steps):
+            target = self._get_tour_step_camera_target_display_position(
+                overlay,
+                step,
+                step_index,
+            )
+            if target is None:
+                continue
+            targets.append(
+                (
+                    _read_tour_progress(step, default=0.0),
+                    _get_tour_step_id(step, step_index),
+                    np.asarray(target, dtype=float),
+                )
+            )
+        if not targets:
+            return _derive_tour_camera_target(
+                self._get_tour_curve_display_points(overlay),
+                self._tour_preview_progress,
+                overlay.tension,
+            )
+        targets.sort(key=lambda item: (item[0], item[1]))
+        if self._tour_preview_progress <= targets[0][0]:
+            return targets[0][2]
+        if self._tour_preview_progress >= targets[-1][0]:
+            return targets[-1][2]
+        for first, second in pairwise(targets):
+            if self._tour_preview_progress > second[0]:
+                continue
+            span = second[0] - first[0]
+            if math.isclose(span, 0.0, abs_tol=1e-12):
+                return second[2]
+            amount = (self._tour_preview_progress - first[0]) / span
+            return first[2] + (second[2] - first[2]) * amount
+        return np.asarray(camera_position, dtype=float) + np.asarray(
+            (0.0, 1.0, 0.0),
+            dtype=float,
+        )
+
+    def _add_tour_trigger_area_item(
+        self,
+        center: object,
+        size: object,
+        color: object,
+        item_group: list[GLGraphicsItem],
+    ) -> gl.GLMeshItem:
+        """Draw one translucent horizontal trigger area and its perimeter."""
+
+        vertices, faces, outline, bounds = _build_tour_trigger_area_geometry(
+            center,
+            size,
+        )
+        normalized_color = tuple(float(value) for value in color)
+        face_color = (
+            *normalized_color[:3],
+            normalized_color[3] * TOUR_TRIGGER_AREA_FACE_OPACITY,
+        )
+        edge_color = (
+            *normalized_color[:3],
+            normalized_color[3] * TOUR_TRIGGER_AREA_EDGE_OPACITY,
+        )
+        area_item = gl.GLMeshItem(
+            vertexes=vertices,
+            faces=faces,
+            color=face_color,
+            smooth=False,
+            drawFaces=True,
+            drawEdges=False,
+        )
+        area_item.setGLOptions("translucent")
+        area_item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE + 5.0)
+        area_item._housemaker_tour_trigger_center = tuple(
+            float(value) for value in _normalize_tour_point(center)
+        )
+        area_item._housemaker_tour_trigger_size = _normalize_tour_trigger_area_size(
+            size
+        )
+        area_item._housemaker_tour_trigger_bounds = bounds
+        edge_item = gl.GLLinePlotItem(
+            pos=outline,
+            color=edge_color,
+            width=TOUR_TRIGGER_AREA_EDGE_WIDTH_PIXELS,
+            antialias=True,
+            mode="line_strip",
+        )
+        edge_item.setGLOptions("translucent")
+        edge_item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE + 6.0)
+        self.view.addItem(area_item)
+        self.view.addItem(edge_item)
+        item_group.extend((area_item, edge_item))
+        return area_item
+
+    def _add_tour_scatter_item(
+        self,
+        positions: object,
+        color: object,
+        size_pixels: float,
+        item_group: list[GLGraphicsItem],
+    ) -> gl.GLScatterPlotItem | None:
+        points = _normalize_tour_points(positions)
+        if not points:
+            return None
+        item = gl.GLScatterPlotItem(
+            pos=np.asarray(points, dtype=np.float32),
+            color=color,
+            size=float(size_pixels),
+            pxMode=True,
+            glOptions="translucent",
+        )
+        item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE + 6.0)
+        self.view.addItem(item)
+        item_group.append(item)
+        return item
+
+    # ### Tour overlay selection and editing ###
+    def _get_selected_tour_overlay(self) -> _TourOverlayData | None:
+        selected_id = self._tour_selected_tour_id
+        return self._tour_overlays.get(selected_id or "")
+
+    def _sync_tour_pointer_input_state(self) -> None:
+        if not hasattr(self, "view"):
+            return
+        self.view.set_primary_pointer_interaction_enabled(
+            bool(self._tour_overlays or self.is_tour_point_placement_active)
+        )
+
+    def _get_tour_trigger_display_position(
+        self,
+        overlay: _TourOverlayData,
+    ) -> tuple[float, float, float] | None:
+        override = self._tour_position_overrides.get(
+            (overlay.tour_id, TOUR_EDIT_TARGET_TRIGGER, None)
+        )
+        return override if override is not None else overlay.trigger_point
+
+    def _get_tour_curve_display_points(
+        self,
+        overlay: _TourOverlayData,
+    ) -> tuple[tuple[float, float, float], ...]:
+        return tuple(
+            self._tour_position_overrides.get(
+                (overlay.tour_id, TOUR_EDIT_TARGET_CURVE_POINT, point_index),
+                point,
+            )
+            for point_index, point in enumerate(overlay.curve_points)
+        )
+
+    def _get_tour_step_camera_target_display_position(
+        self,
+        overlay: _TourOverlayData,
+        step: object,
+        step_index: int,
+    ) -> tuple[float, float, float] | None:
+        """Return one step target, including local gizmo drag overrides."""
+
+        step_id = _get_tour_step_id(step, step_index)
+        override = self._tour_position_overrides.get(
+            (overlay.tour_id, TOUR_EDIT_TARGET_CAMERA_TARGET, step_id)
+        )
+        if override is not None:
+            return override
+        declared_target = _read_optional_tour_point(
+            step,
+            "camera_target",
+            "cameraTarget",
+        )
+        if declared_target is not None:
+            return tuple(float(value) for value in declared_target)
+        legacy_direction = _read_tour_field(
+            step,
+            "camera_look_direction",
+            "cameraLookDirection",
+        )
+        display_points = self._get_tour_curve_display_points(overlay)
+        if legacy_direction is None or not display_points:
+            return None
+        try:
+            direction = _normalize_tour_direction(legacy_direction)
+        except (TypeError, ValueError):
+            return None
+        progress = _read_tour_progress(step, default=0.0)
+        camera_position = np.asarray(
+            evaluate_open_catmull_rom_curve(
+                display_points,
+                progress,
+                tension=overlay.tension,
+            ),
+            dtype=float,
+        )
+        return tuple(float(value) for value in camera_position + direction)
+
+    def _find_tour_action_edit_target(
+        self,
+        overlay: _TourOverlayData,
+        action_id: str,
+    ) -> _TourEditTarget | None:
+        for step_index, step in enumerate(overlay.steps):
+            step_id = _get_tour_step_id(step, step_index)
+            for action_index, action in enumerate(_read_tour_actions(step)):
+                candidate_id = _get_tour_action_id(
+                    action,
+                    f"{step_index}-{action_index}",
+                )
+                if candidate_id != action_id:
+                    continue
+                if _get_tour_component_type(action) not in {
+                    "text3d",
+                    "floatingtooltip",
+                }:
+                    return None
+                return _TourEditTarget(
+                    tour_id=overlay.tour_id,
+                    kind=TOUR_EDIT_TARGET_ACTION,
+                    reference=candidate_id,
+                    step_id=step_id,
+                )
+        return None
+
+    def _get_tour_action_rotation_degrees(
+        self,
+        overlay: _TourOverlayData,
+        action: object,
+        action_id: str,
+    ) -> tuple[float, float, float]:
+        """Return retained or temporary world-space XYZ text rotation."""
+
+        override = self._tour_rotation_overrides.get(
+            (overlay.tour_id, action_id)
+        )
+        if override is not None:
+            return override
+        declared = _read_tour_field(
+            action,
+            "rotation_degrees",
+            "rotationDegrees",
+        )
+        if declared is None:
+            return (0.0, 0.0, 0.0)
+        try:
+            return _normalize_tour_rotation_degrees(declared)
+        except (TypeError, ValueError):
+            return (0.0, 0.0, 0.0)
+
+    def _get_tour_edit_target_rotation(
+        self,
+        target: _TourEditTarget,
+    ) -> tuple[float, float, float] | None:
+        """Return an action target's current preview-aware XYZ rotation."""
+
+        if target.kind != TOUR_EDIT_TARGET_ACTION:
+            return None
+        overlay = self._tour_overlays.get(target.tour_id)
+        if overlay is None:
+            return None
+        action_id = str(target.reference)
+        for step_index, step in enumerate(overlay.steps):
+            for action_index, action in enumerate(_read_tour_actions(step)):
+                candidate_id = _get_tour_action_id(
+                    action,
+                    f"{step_index}-{action_index}",
+                )
+                if candidate_id == action_id:
+                    if _get_tour_component_type(action) != "text3d":
+                        return None
+                    return self._get_tour_action_rotation_degrees(
+                        overlay,
+                        action,
+                        action_id,
+                    )
+        return None
+
+    def _get_tour_edit_target_position(
+        self,
+        target: _TourEditTarget,
+    ) -> tuple[float, float, float] | None:
+        override = self._tour_position_overrides.get(
+            (target.tour_id, target.kind, target.reference)
+        )
+        if override is not None:
+            return override
+        overlay = self._tour_overlays.get(target.tour_id)
+        if overlay is None:
+            return None
+        if target.kind == TOUR_EDIT_TARGET_TRIGGER:
+            return overlay.trigger_point
+        if target.kind == TOUR_EDIT_TARGET_CURVE_POINT:
+            if not isinstance(target.reference, int) or isinstance(
+                target.reference,
+                bool,
+            ):
+                return None
+            if not 0 <= target.reference < len(overlay.curve_points):
+                return None
+            return overlay.curve_points[target.reference]
+        if target.kind == TOUR_EDIT_TARGET_CAMERA_TARGET:
+            step_id = str(target.reference)
+            for step_index, step in enumerate(overlay.steps):
+                if _get_tour_step_id(step, step_index) != step_id:
+                    continue
+                return self._get_tour_step_camera_target_display_position(
+                    overlay,
+                    step,
+                    step_index,
+                )
+            return None
+        if target.kind != TOUR_EDIT_TARGET_ACTION:
+            return None
+        action_id = str(target.reference)
+        for step_index, step in enumerate(overlay.steps):
+            for action_index, action in enumerate(_read_tour_actions(step)):
+                if (
+                    _get_tour_action_id(
+                        action,
+                        f"{step_index}-{action_index}",
+                    )
+                    != action_id
+                ):
+                    continue
+                position = _read_optional_tour_point(
+                    action,
+                    "position",
+                    "anchor_point",
+                    "anchorPoint",
+                )
+                if position is not None:
+                    return tuple(float(value) for value in position)
+        return None
+
+    def _iter_visible_tour_text_actions(
+        self,
+        overlay: _TourOverlayData,
+        active_step_index: int,
+    ) -> tuple[tuple[int, int, object, float], ...]:
+        """Return active fade-ins plus any immediately previous fade-outs."""
+
+        selected_step_index = _resolve_selected_tour_step_index(
+            overlay.steps,
+            self._tour_selected_step_id,
+        )
+        is_authoring_selected_step = (
+            selected_step_index == active_step_index
+            and (
+                self._tour_preview_progress is None
+                or math.isclose(
+                    _read_tour_progress(
+                        overlay.steps[active_step_index],
+                        default=-1.0,
+                    ),
+                    self._tour_preview_progress,
+                    abs_tol=1e-12,
+                )
+            )
+        )
+        if is_authoring_selected_step:
+            return tuple(
+                (active_step_index, action_index, action, 1.0)
+                for action_index, action in enumerate(
+                    _read_tour_actions(overlay.steps[active_step_index])
+                )
+                if _get_tour_component_type(action) == "text3d"
+            )
+
+        duration_ms = overlay.duration_seconds * 1000.0
+        timeline_ms = self._tour_preview_progress * duration_ms
+        active_step = overlay.steps[active_step_index]
+        active_start_ms = (
+            _read_tour_progress(active_step, default=0.0) * duration_ms
+        )
+        elapsed_ms = max(timeline_ms - active_start_ms, 0.0)
+        visible: list[tuple[int, int, object, float]] = []
+
+        previous_candidates = tuple(
+            (
+                _read_tour_progress(step, default=0.0),
+                step_index,
+            )
+            for step_index, step in enumerate(overlay.steps)
+            if _read_tour_progress(step, default=0.0)
+            < _read_tour_progress(active_step, default=0.0) - 1e-12
+        )
+        if previous_candidates:
+            previous_index = max(previous_candidates)[1]
+            for action_index, action in enumerate(
+                _read_tour_actions(overlay.steps[previous_index])
+            ):
+                if _get_tour_component_type(action) != "text3d":
+                    continue
+                fade_duration = _read_nonnegative_tour_number(
+                    action,
+                    "fade_duration_ms",
+                    default=2000.0,
+                )
+                alpha = (
+                    0.0
+                    if fade_duration <= 0.0
+                    else max(0.0, 1.0 - elapsed_ms / fade_duration)
+                )
+                if alpha > 0.0:
+                    visible.append((previous_index, action_index, action, alpha))
+
+        for action_index, action in enumerate(_read_tour_actions(active_step)):
+            if _get_tour_component_type(action) != "text3d":
+                continue
+            fade_delay = _read_nonnegative_tour_number(
+                action,
+                "fade_delay_ms",
+                default=0.0,
+            )
+            fade_duration = _read_nonnegative_tour_number(
+                action,
+                "fade_duration_ms",
+                default=2000.0,
+            )
+            after_delay = elapsed_ms - fade_delay
+            if after_delay < 0.0:
+                alpha = 0.0
+            elif fade_duration <= 0.0:
+                alpha = 1.0
+            else:
+                alpha = min(max(after_delay / fade_duration, 0.0), 1.0)
+            visible.append((active_step_index, action_index, action, alpha))
+        return tuple(visible)
+
+    def _refresh_tour_edit_gizmo_items(self) -> None:
+        self._remove_tour_edit_gizmo_items()
+        target = self._tour_edit_target
+        if target is None or target.tour_id != self._tour_selected_tour_id:
+            return
+        position = self._get_tour_edit_target_position(target)
+        if position is None or not hasattr(self, "view"):
+            return
+        pivot = np.asarray(position, dtype=float)
+        try:
+            pixel_size = float(
+                self.view.pixelSize(QVector3D(*[float(value) for value in pivot]))
+            )
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            pixel_size = 0.0
+        self._tour_gizmo_size = max(
+            TOUR_GIZMO_MIN_SIZE_METERS,
+            (
+                pixel_size * TOUR_GIZMO_SCREEN_SIZE_PIXELS
+                if math.isfinite(pixel_size) and pixel_size > 0.0
+                else TOUR_GIZMO_MIN_SIZE_METERS
+            ),
+        )
+        can_rotate = self._get_tour_edit_target_rotation(target) is not None
+        for axis_index, axis in enumerate(np.eye(3, dtype=float)):
+            color = TRANSFORM_GIZMO_AXIS_COLORS[axis_index]
+            endpoint = pivot + axis * self._tour_gizmo_size
+            axis_item = gl.GLLinePlotItem(
+                pos=np.asarray((pivot, endpoint), dtype=float),
+                color=color,
+                width=3.0,
+                antialias=True,
+                mode="lines",
+            )
+            endpoint_item = gl.GLScatterPlotItem(
+                pos=np.asarray((endpoint,), dtype=float),
+                color=color,
+                size=10.0,
+                pxMode=True,
+            )
+            for item in (axis_item, endpoint_item):
+                item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+                item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE + 12.0)
+                self.view.addItem(item)
+                self._tour_gizmo_items.append(item)
+            if not can_rotate:
+                continue
+            ring_item = gl.GLLinePlotItem(
+                pos=_build_rotation_ring_positions(
+                    pivot,
+                    axis_index,
+                    self._tour_gizmo_size * TOUR_GIZMO_RING_RADIUS_RATIO,
+                ),
+                color=color,
+                width=2.0,
+                antialias=True,
+                mode="line_strip",
+            )
+            ring_item.setGLOptions(CANVAS_OPENING_OVERLAY_GL_OPTIONS)
+            ring_item.setDepthValue(CANVAS_OPENING_OVERLAY_DEPTH_VALUE + 12.0)
+            self.view.addItem(ring_item)
+            self._tour_gizmo_items.append(ring_item)
+        self.view.update()
+
+    def _pick_tour_gizmo_handle(
+        self,
+        ray_origin: object,
+        ray_direction: object,
+    ) -> _TourGizmoHandle | None:
+        """Pick a translation shaft or a selected text's rotation ring."""
+
+        target = self._tour_edit_target
+        position = (
+            None if target is None else self._get_tour_edit_target_position(target)
+        )
+        origin, direction = _normalize_ray(ray_origin, ray_direction)
+        if position is None or origin is None or direction is None:
+            return None
+        pivot = np.asarray(position, dtype=float)
+        candidates: list[tuple[float, _TourGizmoHandle]] = []
+        axis_tolerance = self._tour_gizmo_size * TOUR_GIZMO_AXIS_HIT_RATIO
+        can_rotate = (
+            target is not None
+            and self._get_tour_edit_target_rotation(target) is not None
+        )
+        for axis_index, axis in enumerate(np.eye(3, dtype=float)):
+            endpoint = pivot + axis * self._tour_gizmo_size
+            distance = _get_ray_segment_distance(
+                origin,
+                direction,
+                pivot,
+                endpoint,
+            )
+            if distance is not None and distance <= axis_tolerance:
+                candidates.append(
+                    (
+                        distance / max(axis_tolerance, 1e-12),
+                        _TourGizmoHandle(TRANSFORM_GIZMO_TRANSLATE, axis_index),
+                    )
+                )
+            if not can_rotate:
+                continue
+            ring_hit = _intersect_ray_with_plane(
+                origin,
+                direction,
+                pivot,
+                axis,
+            )
+            if ring_hit is None:
+                continue
+            radius = self._tour_gizmo_size * TOUR_GIZMO_RING_RADIUS_RATIO
+            ring_error = abs(float(np.linalg.norm(ring_hit - pivot)) - radius)
+            ring_tolerance = self._tour_gizmo_size * TOUR_GIZMO_RING_HIT_RATIO
+            if ring_error <= ring_tolerance:
+                candidates.append(
+                    (
+                        ring_error / max(ring_tolerance, 1e-12),
+                        _TourGizmoHandle(TRANSFORM_GIZMO_ROTATE, axis_index),
+                    )
+                )
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda candidate: (
+                candidate[0],
+                candidate[1].kind != TRANSFORM_GIZMO_TRANSLATE,
+                candidate[1].axis_index,
+            ),
+        )[1]
+
+    def _pick_tour_gizmo_axis(
+        self,
+        ray_origin: object,
+        ray_direction: object,
+    ) -> int | None:
+        handle = self._pick_tour_gizmo_handle(ray_origin, ray_direction)
+        if handle is None or handle.kind != TRANSFORM_GIZMO_TRANSLATE:
+            return None
+        return handle.axis_index
+
+    def _begin_tour_edit_drag(self, axis_index: int, position: QPointF) -> bool:
+        target = self._tour_edit_target
+        target_position = (
+            None if target is None else self._get_tour_edit_target_position(target)
+        )
+        camera_ray = self.view.build_camera_ray(position)
+        if target is None or target_position is None or camera_ray is None:
+            return False
+        origin, direction = camera_ray
+        axis = np.eye(3, dtype=float)[axis_index]
+        start_position = np.asarray(target_position, dtype=float)
+        drag_plane_normal = _build_axis_drag_plane_normal(axis, direction)
+        hit = _intersect_ray_with_plane(
+            origin,
+            direction,
+            start_position,
+            drag_plane_normal,
+        )
+        if hit is None:
+            return False
+        self._tour_edit_drag = _TourEditDrag(
+            target=target,
+            axis_index=axis_index,
+            axis=axis,
+            drag_plane_normal=drag_plane_normal,
+            start_axis_parameter=float(np.dot(hit - start_position, axis)),
+            start_position=start_position,
+            preview_position=tuple(float(value) for value in start_position),
+            start_pointer_position=(float(position.x()), float(position.y())),
+            camera_snapshot=_capture_tour_drag_camera_snapshot(self.view),
+        )
+        self.view.reserve_primary_pointer_drag()
+        return True
+
+    def _begin_tour_rotation_drag(
+        self,
+        axis_index: int,
+        position: QPointF,
+    ) -> bool:
+        """Start rotating a selected 3D-text action around one world axis."""
+
+        target = self._tour_edit_target
+        target_position = (
+            None if target is None else self._get_tour_edit_target_position(target)
+        )
+        rotation = (
+            None if target is None else self._get_tour_edit_target_rotation(target)
+        )
+        camera_ray = self.view.build_camera_ray(position)
+        if (
+            target is None
+            or target.kind != TOUR_EDIT_TARGET_ACTION
+            or target_position is None
+            or rotation is None
+            or camera_ray is None
+            or axis_index not in {0, 1, 2}
+        ):
+            return False
+        pivot = np.asarray(target_position, dtype=float)
+        axis = np.eye(3, dtype=float)[axis_index]
+        hit = _intersect_ray_with_plane(*camera_ray, pivot, axis)
+        if hit is None:
+            return False
+        initial_vector = _normalize_vector(hit - pivot)
+        if initial_vector is None:
+            return False
+        self._tour_edit_drag = _TourRotationDrag(
+            target=target,
+            axis_index=axis_index,
+            axis=axis,
+            pivot=pivot,
+            start_rotation_degrees=rotation,
+            previous_rotation_vector=initial_vector,
+            preview_rotation_degrees=rotation,
+        )
+        self.view.reserve_primary_pointer_drag()
+        return True
+
+    def _update_tour_edit_drag(self, position: QPointF) -> bool:
+        drag = self._tour_edit_drag
+        if isinstance(drag, _TourRotationDrag):
+            return self._update_tour_rotation_drag(drag, position)
+        pointer_position = (float(position.x()), float(position.y()))
+        pointer_moved = not np.allclose(
+            pointer_position,
+            drag.start_pointer_position if drag is not None else pointer_position,
+            atol=1e-9,
+            rtol=0.0,
+        )
+        camera_ray = (
+            _build_tour_drag_camera_ray(drag.camera_snapshot, position)
+            if (
+                drag is not None
+                and pointer_moved
+                and drag.camera_snapshot is not None
+            )
+            else self.view.build_camera_ray(position)
+        )
+        if drag is None or camera_ray is None:
+            return False
+        hit = _intersect_ray_with_plane(
+            *camera_ray,
+            drag.start_position,
+            drag.drag_plane_normal,
+        )
+        if hit is None:
+            return False
+        axis_parameter = float(np.dot(hit - drag.start_position, drag.axis))
+        next_position_array = drag.start_position + drag.axis * (
+            axis_parameter - drag.start_axis_parameter
+        )
+        next_position = tuple(float(value) for value in next_position_array)
+        if np.allclose(next_position, drag.preview_position, atol=1e-9, rtol=0.0):
+            return False
+        drag.preview_position = next_position
+        if not self.set_tour_edit_preview_position(
+            drag.target.tour_id,
+            drag.target.kind,
+            drag.target.reference,
+            next_position,
+        ):
+            return False
+        self.tour_edit_preview_changed.emit(
+            drag.target.tour_id,
+            drag.target.kind,
+            drag.target.reference,
+            next_position,
+        )
+        return True
+
+    def _update_tour_rotation_drag(
+        self,
+        drag: _TourRotationDrag,
+        position: QPointF,
+    ) -> bool:
+        """Update one text rotation and publish its live XYZ preview."""
+
+        camera_ray = self.view.build_camera_ray(position)
+        if camera_ray is None:
+            return False
+        hit = _intersect_ray_with_plane(
+            *camera_ray,
+            drag.pivot,
+            drag.axis,
+        )
+        if hit is None:
+            return False
+        current_vector = _normalize_vector(hit - drag.pivot)
+        if current_vector is None:
+            return False
+        drag.accumulated_rotation_degrees += _get_signed_rotation_degrees(
+            drag.axis,
+            drag.previous_rotation_vector,
+            current_vector,
+        )
+        drag.previous_rotation_vector = current_vector
+        next_rotation = list(drag.start_rotation_degrees)
+        next_rotation[drag.axis_index] += drag.accumulated_rotation_degrees
+        normalized_rotation = tuple(float(value) for value in next_rotation)
+        if np.allclose(
+            normalized_rotation,
+            drag.preview_rotation_degrees,
+            atol=1e-9,
+            rtol=0.0,
+        ):
+            return False
+        drag.preview_rotation_degrees = normalized_rotation
+        if not self.set_tour_edit_preview_rotation(
+            drag.target.tour_id,
+            drag.target.reference,
+            normalized_rotation,
+        ):
+            return False
+        self.tour_edit_preview_changed.emit(
+            drag.target.tour_id,
+            TOUR_EDIT_TARGET_ACTION_ROTATION,
+            drag.target.reference,
+            normalized_rotation,
+        )
+        return True
+
+    def _finish_tour_edit_drag(self, position: QPointF) -> bool:
+        drag = self._tour_edit_drag
+        if drag is None:
+            return False
+        if isinstance(drag, _TourRotationDrag):
+            return self._finish_tour_rotation_drag(drag, position)
+        self._update_tour_edit_drag(position)
+        changed = not np.allclose(
+            drag.preview_position,
+            drag.start_position,
+            atol=1e-9,
+            rtol=0.0,
+        )
+        self._tour_edit_drag = None
+        self.view.release_primary_pointer_drag()
+        self._refresh_tour_edit_gizmo_items()
+        self.tour_edit_finished.emit(
+            drag.target.tour_id,
+            drag.target.kind,
+            drag.target.reference,
+            drag.preview_position,
+            changed,
+        )
+        return changed
+
+    def _finish_tour_rotation_drag(
+        self,
+        drag: _TourRotationDrag,
+        position: QPointF,
+    ) -> bool:
+        """Commit one live text rotation when its ring is released."""
+
+        self._update_tour_rotation_drag(drag, position)
+        changed = not np.allclose(
+            drag.preview_rotation_degrees,
+            drag.start_rotation_degrees,
+            atol=1e-9,
+            rtol=0.0,
+        )
+        self._tour_edit_drag = None
+        self.view.release_primary_pointer_drag()
+        self._refresh_tour_edit_gizmo_items()
+        self.tour_edit_finished.emit(
+            drag.target.tour_id,
+            TOUR_EDIT_TARGET_ACTION_ROTATION,
+            drag.target.reference,
+            drag.preview_rotation_degrees,
+            changed,
+        )
+        return changed
+
+    def _cancel_tour_edit_drag(
+        self,
+        *_args: object,
+        notify: bool = True,
+    ) -> bool:
+        drag = self._tour_edit_drag
+        if drag is None:
+            return False
+        self._tour_edit_drag = None
+        if isinstance(drag, _TourRotationDrag):
+            self._tour_rotation_overrides.pop(
+                (drag.target.tour_id, str(drag.target.reference)),
+                None,
+            )
+        else:
+            self._tour_position_overrides.pop(
+                (drag.target.tour_id, drag.target.kind, drag.target.reference),
+                None,
+            )
+        if hasattr(self, "view"):
+            self.view.cancel_primary_pointer_drag()
+        self._refresh_tour_static_overlay_items()
+        self._refresh_tour_text_overlay_items()
+        self._refresh_tour_preview_overlay_items()
+        self._refresh_tour_edit_gizmo_items()
+        if notify:
+            if isinstance(drag, _TourRotationDrag):
+                self.tour_edit_finished.emit(
+                    drag.target.tour_id,
+                    TOUR_EDIT_TARGET_ACTION_ROTATION,
+                    drag.target.reference,
+                    drag.start_rotation_degrees,
+                    False,
+                )
+            else:
+                self.tour_edit_finished.emit(
+                    drag.target.tour_id,
+                    drag.target.kind,
+                    drag.target.reference,
+                    tuple(float(value) for value in drag.start_position),
+                    False,
+                )
+        return True
+
+    def _pick_tour_overlay(self, position: QPointF) -> _TourOverlayPick | None:
+        """Pick text, controls, triggers, then curves in screen space."""
+
+        if not self._tour_overlays:
+            return None
+        width = max(int(self.view.width()), 1)
+        height = max(int(self.view.height()), 1)
+        viewport = (0, 0, width, height)
+        try:
+            view_projection = (
+                self.view.projectionMatrix(viewport, viewport)
+                * self.view.viewMatrix()
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return None
+        pointer = np.asarray((position.x(), position.y()), dtype=float)
+        candidates: list[tuple[int, float, float, int, _TourOverlayPick]] = []
+        order = 0
+        camera_ray = self.view.build_camera_ray(position)
+
+        for text_target in self._tour_text_item_targets.values():
+            bounds = self._tour_text_hit_boxes.get(text_target)
+            hit_distance = (
+                None
+                if camera_ray is None or bounds is None
+                else _get_ray_axis_aligned_bounds_hit_distance(
+                    *camera_ray,
+                    bounds[0],
+                    bounds[1],
+                )
+            )
+            text_position = self._get_tour_edit_target_position(text_target)
+            if text_position is None:
+                continue
+            projected = _project_vertices_to_view(
+                np.asarray((text_position,), dtype=float),
+                view_projection,
+                width,
+                height,
+            )[0]
+            if not _is_usable_projected_point(projected):
+                continue
+            distance = float(np.linalg.norm(pointer - projected[:2]))
+            if (
+                hit_distance is not None
+                or distance <= TOUR_TEXT_SELECTION_TOLERANCE_PIXELS
+            ):
+                candidates.append(
+                    (
+                        1,
+                        0.0 if hit_distance is not None else distance,
+                        (
+                            float(hit_distance)
+                            if hit_distance is not None
+                            else float(projected[2])
+                        ),
+                        order,
+                        _TourOverlayPick(
+                            text_target.tour_id,
+                            TOUR_EDIT_TARGET_ACTION,
+                            text_target.reference,
+                            text_target.step_id,
+                        ),
+                    )
+                )
+                order += 1
+
+        for tooltip_target in self._tour_tooltip_hotspot_items:
+            anchor_point = self._get_tour_edit_target_position(tooltip_target)
+            if anchor_point is None:
+                continue
+            projected = _project_vertices_to_view(
+                np.asarray((anchor_point,), dtype=float),
+                view_projection,
+                width,
+                height,
+            )[0]
+            if not _is_usable_projected_point(projected):
+                continue
+            distance = float(np.linalg.norm(pointer - projected[:2]))
+            if distance > TOUR_TOOLTIP_HOVER_TOLERANCE_PIXELS:
+                continue
+            candidates.append(
+                (
+                    1,
+                    distance,
+                    float(projected[2]),
+                    order,
+                    _TourOverlayPick(
+                        tooltip_target.tour_id,
+                        TOUR_EDIT_TARGET_ACTION,
+                        tooltip_target.reference,
+                        tooltip_target.step_id,
+                    ),
+                )
+            )
+            order += 1
+
+        selected_overlay = self._get_selected_tour_overlay()
+        if selected_overlay is not None:
+            selected_step_index = _resolve_selected_tour_step_index(
+                selected_overlay.steps,
+                self._tour_selected_step_id,
+            )
+            if selected_step_index is not None:
+                visible_target_indexes = [selected_step_index]
+                next_step_index = _resolve_next_tour_step_index(
+                    selected_overlay.steps,
+                    selected_step_index,
+                )
+                if next_step_index is not None:
+                    visible_target_indexes.append(next_step_index)
+                for step_index in visible_target_indexes:
+                    step = selected_overlay.steps[step_index]
+                    step_id = _get_tour_step_id(step, step_index)
+                    camera_target = (
+                        self._get_tour_step_camera_target_display_position(
+                            selected_overlay,
+                            step,
+                            step_index,
+                        )
+                    )
+                    if camera_target is None:
+                        continue
+                    projected = _project_vertices_to_view(
+                        np.asarray((camera_target,), dtype=float),
+                        view_projection,
+                        width,
+                        height,
+                    )[0]
+                    if not _is_usable_projected_point(projected):
+                        continue
+                    distance = float(np.linalg.norm(pointer - projected[:2]))
+                    if distance <= TOUR_OVERLAY_SELECTION_TOLERANCE_PIXELS:
+                        candidates.append(
+                            (
+                                0,
+                                distance,
+                                float(projected[2]),
+                                order,
+                                _TourOverlayPick(
+                                    selected_overlay.tour_id,
+                                    TOUR_EDIT_TARGET_CAMERA_TARGET,
+                                    step_id,
+                                    step_id,
+                                )
+                            )
+                        )
+                        order += 1
+            for point_index, point in enumerate(
+                self._get_tour_curve_display_points(selected_overlay)
+            ):
+                projected = _project_vertices_to_view(
+                    np.asarray((point,), dtype=float),
+                    view_projection,
+                    width,
+                    height,
+                )[0]
+                if not _is_usable_projected_point(projected):
+                    continue
+                distance = float(np.linalg.norm(pointer - projected[:2]))
+                if distance <= TOUR_OVERLAY_SELECTION_TOLERANCE_PIXELS:
+                    candidates.append(
+                        (
+                            0,
+                            distance,
+                            float(projected[2]),
+                            order,
+                            _TourOverlayPick(
+                                selected_overlay.tour_id,
+                                TOUR_EDIT_TARGET_CURVE_POINT,
+                                point_index,
+                            ),
+                        )
+                    )
+                    order += 1
+
+        for overlay in self._tour_overlays.values():
+            trigger = self._get_tour_trigger_display_position(overlay)
+            if trigger is not None:
+                trigger_bounds = _build_tour_trigger_area_geometry(
+                    trigger,
+                    overlay.trigger_area_size,
+                )[3]
+                hit_distance = (
+                    None
+                    if camera_ray is None
+                    else _get_ray_axis_aligned_bounds_hit_distance(
+                        *camera_ray,
+                        trigger_bounds[0],
+                        trigger_bounds[1],
+                    )
+                )
+                projected = _project_vertices_to_view(
+                    np.asarray((trigger,), dtype=float),
+                    view_projection,
+                    width,
+                    height,
+                )[0]
+                projected_is_usable = _is_usable_projected_point(projected)
+                distance = (
+                    float(np.linalg.norm(pointer - projected[:2]))
+                    if projected_is_usable
+                    else math.inf
+                )
+                if (
+                    hit_distance is not None
+                    or distance <= TOUR_OVERLAY_SELECTION_TOLERANCE_PIXELS
+                ):
+                    candidates.append(
+                        (
+                            0,
+                            0.0 if hit_distance is not None else distance,
+                            (
+                                float(hit_distance)
+                                if hit_distance is not None
+                                else float(projected[2])
+                            ),
+                            order,
+                            _TourOverlayPick(
+                                overlay.tour_id,
+                                TOUR_EDIT_TARGET_TRIGGER,
+                            ),
+                        )
+                    )
+                    order += 1
+
+            display_points = self._get_tour_curve_display_points(overlay)
+            if len(display_points) < 2:
+                continue
+            samples = sample_open_catmull_rom_curve(
+                display_points,
+                tension=overlay.tension,
+            )
+            line_positions = np.stack(
+                (samples[:-1], samples[1:]),
+                axis=1,
+            ).reshape((-1, 3))
+            projected_lines = _project_vertices_to_view(
+                line_positions,
+                view_projection,
+                width,
+                height,
+            )
+            hit = _get_nearest_projected_line_hit(pointer, projected_lines)
+            if hit is None or hit[0] > TOUR_OVERLAY_SELECTION_TOLERANCE_PIXELS:
+                continue
+            candidates.append(
+                (
+                    2,
+                    hit[0],
+                    hit[1],
+                    order,
+                    _TourOverlayPick(overlay.tour_id, "curve"),
+                )
+            )
+            order += 1
+        return None if not candidates else min(candidates)[4]
+
+    def _apply_tour_overlay_pick(self, picked: _TourOverlayPick) -> None:
+        if (
+            picked.kind == "curve"
+            and picked.tour_id == self._tour_selected_tour_id
+        ):
+            self._tour_selected_tour_id = None
+            self._tour_selected_step_id = None
+            self._tour_selected_action_id = None
+            self._tour_edit_target = None
+            self._tour_trigger_point = None
+            self._tour_curve_points = ()
+            self._tour_curve_tension = TOUR_DEFAULT_TENSION
+            self._tour_steps = ()
+            self._tour_selected_step = None
+            self._refresh_tour_static_overlay_items()
+            self._refresh_tour_text_overlay_items()
+            self._refresh_tour_preview_overlay_items()
+            self._refresh_tour_edit_gizmo_items()
+            self.tour_selection_changed.emit(None)
+            return
+        selection_changed = picked.tour_id != self._tour_selected_tour_id
+        target_selected = picked.kind != "curve"
+        self._tour_selected_tour_id = picked.tour_id
+        overlay = self._tour_overlays[picked.tour_id]
+        self._tour_trigger_point = overlay.trigger_point
+        self._tour_curve_points = overlay.curve_points
+        self._tour_curve_tension = overlay.tension
+        self._tour_steps = overlay.steps
+        if picked.kind == "curve":
+            self._tour_edit_target = None
+            self._tour_selected_action_id = None
+        else:
+            self._tour_edit_target = _TourEditTarget(
+                picked.tour_id,
+                picked.kind,
+                picked.reference,
+                picked.step_id,
+            )
+            if picked.kind == TOUR_EDIT_TARGET_ACTION:
+                self._tour_selected_step_id = picked.step_id
+                self._tour_selected_step = picked.step_id
+                self._tour_selected_action_id = str(picked.reference)
+            elif picked.kind == TOUR_EDIT_TARGET_CAMERA_TARGET:
+                self._tour_selected_step_id = picked.step_id or picked.reference
+                self._tour_selected_step = self._tour_selected_step_id
+                self._tour_selected_action_id = None
+            else:
+                self._tour_selected_action_id = None
+        self._refresh_tour_static_overlay_items()
+        self._refresh_tour_text_overlay_items()
+        self._refresh_tour_preview_overlay_items()
+        self._refresh_tour_edit_gizmo_items()
+        if selection_changed:
+            self.tour_selection_changed.emit(picked.tour_id)
+        if target_selected:
+            self.tour_edit_target_selected.emit(
+                picked.tour_id,
+                picked.kind,
+                picked.reference,
+            )
+
+    def _remove_tour_static_overlay_items(self) -> None:
+        self._remove_tour_item_group(self._tour_static_overlay_items)
+        self._tour_static_overlay_items = []
+        self._tour_curve_overlay_items = {}
+        self._tour_trigger_overlay_items = {}
+        self._tour_step_overlay_items = {}
+        self._tour_camera_target_overlay_items = {}
+        self._tour_control_point_overlay_item = None
+
+    def _remove_tour_text_overlay_items(self) -> None:
+        self._remove_tour_item_group(self._tour_text_overlay_items)
+        self._tour_text_overlay_items = []
+        self._tour_text_item_targets = {}
+        self._tour_text_hit_boxes = {}
+        self._tour_tooltip_hotspot_items = {}
+
+    def _remove_tour_preview_overlay_items(self) -> None:
+        self._remove_tour_item_group(self._tour_preview_overlay_items)
+        self._tour_preview_overlay_items = []
+
+    def _remove_tour_edit_gizmo_items(self) -> None:
+        self._remove_tour_item_group(self._tour_gizmo_items)
+        self._tour_gizmo_items = []
+
+    def _remove_tour_item_group(self, items: Sequence[GLGraphicsItem]) -> None:
+        if hasattr(self, "view"):
+            for item in items:
+                if item in self.view.items:
+                    self.view.removeItem(item)
 
     # ### Canvas window editor input ###
     def _connect_window_editor_input(self) -> None:
@@ -6983,6 +10033,12 @@ class GlbViewerWidget(QWidget):
 
     # ### Placed-object gizmo input ###
     def _handle_placed_object_pointer_pressed(self, position: QPointF) -> None:
+        if (
+            self.is_tour_point_placement_active
+            or self._tour_edit_drag is not None
+            or self._tour_overlay_pointer_pressed
+        ):
+            return
         if self.is_object_placement_active:
             self._update_object_placement_hover(position)
             self._object_placement_pointer_pressed = True
@@ -7046,6 +10102,8 @@ class GlbViewerWidget(QWidget):
     def _handle_canvas_gizmo_pointer_moved(self, position: QPointF) -> None:
         """Update the one Canvas gizmo that currently owns the pointer."""
 
+        if self.is_tour_point_placement_active:
+            return
         if self._object_placement_pointer_pressed:
             self._update_object_placement_hover(position)
             return
@@ -7078,6 +10136,8 @@ class GlbViewerWidget(QWidget):
     def _handle_canvas_gizmo_pointer_released(self, position: QPointF) -> None:
         """Finish the one Canvas gizmo that currently owns the pointer."""
 
+        if self.is_tour_point_placement_active:
+            return
         if self._object_placement_pointer_pressed:
             self._object_placement_pointer_pressed = False
             self._update_object_placement_hover(position)
@@ -9264,6 +12324,7 @@ class GlbViewerWidget(QWidget):
             self._architectural_trim_placement_kind if preserve_camera else None
         )
         self.view.cancel_transient_pointer_interactions()
+        self.cancel_tour_point_placement(notify=False)
         self._cancel_canvas_rectangle_selection()
         self._cancel_canvas_opening_edit_drag()
         self._cancel_canvas_surface_edit_drag()
@@ -9308,6 +12369,7 @@ class GlbViewerWidget(QWidget):
 
     def clear_model(self) -> None:
         self.view.cancel_transient_pointer_interactions()
+        self.cancel_tour_point_placement(notify=False)
         self._cancel_canvas_rectangle_selection()
         self._cancel_canvas_opening_edit_drag()
         self._cancel_canvas_surface_edit_drag()
@@ -11021,6 +14083,11 @@ class GlbViewerWidget(QWidget):
             self._refresh_architectural_trim_hover_preview_items()
             self._refresh_architectural_trim_edit_preview_items()
             self._refresh_canvas_stair_preview_items()
+            self._refresh_tour_static_overlay_items()
+            self._refresh_tour_text_overlay_items()
+            self._refresh_tour_preview_overlay_items()
+            self._refresh_tour_edit_gizmo_items()
+            self._refresh_tour_point_hover_item()
             return
 
         display_mesh = self._get_display_mesh()
@@ -11133,6 +14200,11 @@ class GlbViewerWidget(QWidget):
         self._refresh_architectural_trim_hover_preview_items()
         self._refresh_architectural_trim_edit_preview_items()
         self._refresh_canvas_stair_preview_items()
+        self._refresh_tour_static_overlay_items()
+        self._refresh_tour_text_overlay_items()
+        self._refresh_tour_preview_overlay_items()
+        self._refresh_tour_edit_gizmo_items()
+        self._refresh_tour_point_hover_item()
         self.view.update()
 
     def _get_display_mesh(self):
@@ -13686,6 +16758,16 @@ class GlbViewerWidget(QWidget):
         self._doorway_preview_outline_item = None
         self._object_placement_preview_root = None
         self._object_placement_preview_items = []
+        self._tour_static_overlay_items = []
+        self._tour_text_overlay_items = []
+        self._tour_preview_overlay_items = []
+        self._tour_point_hover_items = []
+        self._tour_curve_overlay_items = {}
+        self._tour_trigger_overlay_items = {}
+        self._tour_step_overlay_items = {}
+        self._tour_control_point_overlay_item = None
+        self._tour_text_item_targets = {}
+        self._tour_gizmo_items = []
 
     def _release_textured_mesh_gl_resources(self) -> None:
         """Delete all textured-item GL names before detaching scene parents."""
@@ -13742,6 +16824,774 @@ class GlbViewerWidget(QWidget):
         self.view.remember_orbit_camera_state()
         self.view.apply_navigation_camera()
         self.view.update()
+
+
+# ### Tour trigger-area helpers ###
+def _normalize_tour_trigger_area_size(value: object) -> tuple[float, float]:
+    try:
+        dimensions = np.asarray(value, dtype=float)
+    except (TypeError, ValueError) as error:
+        raise TypeError("A tour trigger area size must contain two numbers.") from error
+    if (
+        dimensions.shape != (2,)
+        or not np.all(np.isfinite(dimensions))
+        or np.any(dimensions <= 0.0)
+    ):
+        raise ValueError("A tour trigger area size must be two positive dimensions.")
+    return (float(dimensions[0]), float(dimensions[1]))
+
+
+def _build_tour_trigger_area_payload(
+    first_corner: object,
+    second_corner: object,
+) -> dict[str, tuple[float, ...]]:
+    """Build a stable center/size payload from opposite horizontal corners."""
+
+    first = _normalize_tour_point(first_corner)
+    second = _normalize_tour_point(second_corner)
+    raw_size = np.abs(second[:2] - first[:2])
+    if np.all(raw_size < TOUR_TRIGGER_AREA_MINIMUM_SIZE_METERS):
+        size = np.asarray(DEFAULT_TOUR_TRIGGER_AREA_SIZE_METERS, dtype=float)
+    else:
+        size = np.maximum(raw_size, TOUR_TRIGGER_AREA_MINIMUM_SIZE_METERS)
+    center = np.asarray(
+        (
+            (first[0] + second[0]) * 0.5,
+            (first[1] + second[1]) * 0.5,
+            first[2],
+        ),
+        dtype=float,
+    )
+    return {
+        "center": tuple(float(value) for value in center),
+        "size": tuple(float(value) for value in size),
+    }
+
+
+def _build_tour_trigger_area_geometry(
+    center: object,
+    size: object,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[np.ndarray, np.ndarray]]:
+    """Build a flat quad, perimeter, and pick bounds for one trigger area."""
+
+    normalized_center = _normalize_tour_point(center)
+    width, depth = _normalize_tour_trigger_area_size(size)
+    half_width = width * 0.5
+    half_depth = depth * 0.5
+    z_position = normalized_center[2] + TOUR_TRIGGER_AREA_PICK_THICKNESS_METERS * 0.5
+    vertices = np.asarray(
+        (
+            (normalized_center[0] - half_width, normalized_center[1] - half_depth, z_position),
+            (normalized_center[0] + half_width, normalized_center[1] - half_depth, z_position),
+            (normalized_center[0] + half_width, normalized_center[1] + half_depth, z_position),
+            (normalized_center[0] - half_width, normalized_center[1] + half_depth, z_position),
+        ),
+        dtype=np.float32,
+    )
+    faces = np.asarray(((0, 1, 2), (0, 2, 3)), dtype=np.int32)
+    outline = np.asarray((*vertices, vertices[0]), dtype=np.float32)
+    bounds = (
+        np.asarray(
+            (
+                normalized_center[0] - half_width,
+                normalized_center[1] - half_depth,
+                normalized_center[2],
+            ),
+            dtype=float,
+        ),
+        np.asarray(
+            (
+                normalized_center[0] + half_width,
+                normalized_center[1] + half_depth,
+                normalized_center[2] + TOUR_TRIGGER_AREA_PICK_THICKNESS_METERS,
+            ),
+            dtype=float,
+        ),
+    )
+    return vertices, faces, outline, bounds
+
+
+# ### Tour normalization helpers ###
+def _normalize_tour_point(point: object) -> np.ndarray:
+    try:
+        normalized = np.asarray(point, dtype=float)
+    except (TypeError, ValueError) as error:
+        raise TypeError("A tour point must contain three numeric values.") from error
+    if normalized.shape != (3,) or not np.all(np.isfinite(normalized)):
+        raise ValueError("A tour point must be one finite XYZ coordinate.")
+    return np.ascontiguousarray(normalized, dtype=float)
+
+
+def _normalize_tour_points(points: object) -> tuple[np.ndarray, ...]:
+    if points is None:
+        return ()
+    if isinstance(points, np.ndarray) and points.shape == (3,):
+        return (_normalize_tour_point(points),)
+    if not isinstance(points, Sequence) or isinstance(
+        points,
+        (str, bytes, bytearray),
+    ):
+        try:
+            points = tuple(points)  # type: ignore[arg-type]
+        except TypeError as error:
+            raise TypeError("Tour points must be one sequence of XYZ coordinates.") from error
+    return tuple(_normalize_tour_point(point) for point in points)
+
+
+def _read_tour_field(source: object, *names: str) -> object | None:
+    for name in names:
+        if isinstance(source, Mapping) and name in source:
+            return source[name]
+        if hasattr(source, name):
+            return getattr(source, name)
+    return None
+
+
+def _normalize_tour_overlay_collection(
+    tours: object,
+) -> tuple[_TourOverlayData, ...]:
+    """Normalize a TourData sequence or ID-to-tour mapping for rendering."""
+
+    if tours is None:
+        return ()
+    sources: tuple[tuple[object, str | None], ...]
+    if isinstance(tours, Mapping):
+        if any(
+            field in tours
+            for field in ("tour_id", "id", "curve", "curve_points")
+        ):
+            sources = ((tours, None),)
+        else:
+            sources = tuple((value, str(key)) for key, value in tours.items())
+    elif isinstance(tours, Sequence) and not isinstance(
+        tours,
+        (str, bytes, bytearray),
+    ):
+        sources = tuple((value, None) for value in tours)
+    else:
+        try:
+            sources = tuple((value, None) for value in tours)  # type: ignore[union-attr]
+        except TypeError as error:
+            raise TypeError("Tour overlays must be supplied as a sequence or mapping.") from error
+
+    overlays = tuple(
+        _normalize_tour_overlay_data(source, fallback_tour_id=fallback_id)
+        for source, fallback_id in sources
+    )
+    identifiers = tuple(overlay.tour_id for overlay in overlays)
+    if len(set(identifiers)) != len(identifiers):
+        raise ValueError("Tour overlay IDs must be unique.")
+    return overlays
+
+
+def _normalize_tour_overlay_data(
+    source: object,
+    *,
+    fallback_tour_id: str | None = None,
+    is_draft: bool = False,
+) -> _TourOverlayData:
+    """Normalize one persisted TourData or lightweight in-progress draft."""
+
+    raw_id = _read_tour_field(source, "tour_id", "id")
+    tour_id = str(raw_id if raw_id is not None else fallback_tour_id or "").strip()
+    if not tour_id:
+        raise ValueError("A tour overlay requires a non-empty tour ID.")
+    trigger = _read_optional_tour_point(source, "trigger_point", "trigger")
+    trigger_point = (
+        None if trigger is None else tuple(float(value) for value in trigger)
+    )
+    raw_trigger_area_size = _read_tour_field(
+        source,
+        "trigger_area_size",
+        "triggerAreaSize",
+    )
+    trigger_area_size = _normalize_tour_trigger_area_size(
+        DEFAULT_TOUR_TRIGGER_AREA_SIZE_METERS
+        if raw_trigger_area_size is None
+        else raw_trigger_area_size
+    )
+
+    curve_source = _read_tour_field(source, "curve")
+    raw_points = (
+        _read_tour_field(curve_source, "points", "curve_points")
+        if curve_source is not None
+        else None
+    )
+    if raw_points is None:
+        raw_points = _read_tour_field(source, "curve_points", "points")
+    curve_points = tuple(
+        tuple(float(value) for value in point)
+        for point in _normalize_tour_points(raw_points)
+    )
+    raw_tension = (
+        _read_tour_field(curve_source, "tension")
+        if curve_source is not None
+        else None
+    )
+    if raw_tension is None:
+        raw_tension = _read_tour_field(source, "tension")
+    tension = TOUR_DEFAULT_TENSION if raw_tension is None else float(raw_tension)
+    if not math.isfinite(tension) or not 0.0 <= tension <= 1.0:
+        raise ValueError("A tour curve tension must be in [0, 1].")
+    steps = _normalize_tour_steps(_read_tour_field(source, "steps"))
+    raw_duration = _read_tour_field(source, "duration_seconds", "duration")
+    duration_seconds = (
+        TOUR_DEFAULT_DURATION_SECONDS
+        if raw_duration is None
+        else float(raw_duration)
+    )
+    if not math.isfinite(duration_seconds) or duration_seconds <= 0.0:
+        raise ValueError("A tour duration must be finite and positive.")
+    return _TourOverlayData(
+        tour_id=tour_id,
+        trigger_point=trigger_point,
+        trigger_area_size=trigger_area_size,
+        curve_points=curve_points,
+        tension=tension,
+        steps=steps,
+        duration_seconds=duration_seconds,
+        is_draft=bool(is_draft),
+    )
+
+
+def _normalize_tour_steps(steps: object) -> tuple[object, ...]:
+    if steps is None:
+        return ()
+    if isinstance(steps, Mapping):
+        return tuple(steps.values())
+    if isinstance(steps, Sequence) and not isinstance(
+        steps,
+        (str, bytes, bytearray),
+    ):
+        return tuple(steps)
+    raise TypeError("Tour steps must be one sequence or mapping.")
+
+
+def _normalize_optional_tour_progress(progress: object | None) -> float | None:
+    if progress is None:
+        return None
+    try:
+        normalized = float(progress)
+    except (TypeError, ValueError) as error:
+        raise TypeError("Tour timeline progress must be numeric.") from error
+    if not math.isfinite(normalized):
+        raise ValueError("Tour timeline progress must be finite.")
+    return min(max(normalized, 0.0), 1.0)
+
+
+def _normalize_tour_direction(direction: object) -> np.ndarray:
+    normalized = _normalize_vector(direction)
+    if normalized is None:
+        raise ValueError("A tour camera look direction must be finite and non-zero.")
+    return normalized
+
+
+def _normalize_tour_rotation_degrees(
+    rotation_degrees: object,
+) -> tuple[float, float, float]:
+    """Normalize one finite world-space XYZ Euler rotation."""
+
+    try:
+        rotation = np.asarray(rotation_degrees, dtype=float)
+    except (TypeError, ValueError) as error:
+        raise TypeError("Tour text rotation must contain XYZ degrees.") from error
+    if rotation.shape != (3,) or not np.all(np.isfinite(rotation)):
+        raise ValueError("Tour text rotation must contain finite XYZ degrees.")
+    return tuple(float(value) for value in rotation)
+
+
+def _tour_color_with_opacity(
+    color: Sequence[float],
+    opacity: float,
+) -> tuple[float, float, float, float]:
+    return (
+        float(color[0]),
+        float(color[1]),
+        float(color[2]),
+        float(color[3]) * float(opacity),
+    )
+
+
+def _read_optional_tour_point(source: object, *names: str) -> np.ndarray | None:
+    value = _read_tour_field(source, *names)
+    return None if value is None else _normalize_tour_point(value)
+
+
+def _read_tour_actions(step: object) -> tuple[object, ...]:
+    """Read the current actions collection with a legacy components fallback."""
+
+    actions = _read_tour_field(step, "actions", "components")
+    if actions is None:
+        return ()
+    if isinstance(actions, Mapping):
+        return tuple(actions.values())
+    if isinstance(actions, Sequence) and not isinstance(
+        actions,
+        (str, bytes, bytearray),
+    ):
+        return tuple(actions)
+    raise TypeError("Tour step actions must be one sequence or mapping.")
+
+
+def _get_tour_step_id(step: object, fallback_index: int) -> str:
+    raw_id = _read_tour_field(step, "step_id", "id")
+    return str(raw_id if raw_id is not None else f"step-{fallback_index}")
+
+
+def _get_tour_action_id(action: object, fallback_suffix: object) -> str:
+    raw_id = _read_tour_field(action, "action_id", "component_id", "id")
+    return str(raw_id if raw_id is not None else f"action-{fallback_suffix}")
+
+
+def _read_tour_progress(source: object, *, default: float) -> float:
+    value = _read_tour_field(source, "progress")
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(normalized):
+        return float(default)
+    return min(max(normalized, 0.0), 1.0)
+
+
+def _get_tour_component_type(component: object) -> str:
+    declared = _read_tour_field(component, "type", "component_type")
+    if declared is not None:
+        return str(declared).strip().lower().replace("_", "")
+    if (
+        _read_tour_field(component, "text") is not None
+        and _read_tour_field(component, "position") is not None
+    ):
+        return "text3d"
+    if (
+        _read_tour_field(component, "html_body", "htmlBody") is not None
+        and _read_tour_field(component, "anchor_point", "anchorPoint") is not None
+    ):
+        return "floatingtooltip"
+    return ""
+
+
+def _read_positive_tour_number(
+    source: object,
+    name: str,
+    *,
+    default: float,
+) -> float:
+    value = _read_tour_field(source, name)
+    if value is None:
+        return float(default)
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return normalized if math.isfinite(normalized) and normalized > 0.0 else float(default)
+
+
+def _read_nonnegative_tour_number(
+    source: object,
+    name: str,
+    *,
+    default: float,
+) -> float:
+    value = _read_tour_field(source, name)
+    if value is None:
+        return float(default)
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return (
+        normalized
+        if math.isfinite(normalized) and normalized >= 0.0
+        else float(default)
+    )
+
+
+def _read_tour_color(
+    source: object,
+    *,
+    default: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    value = _read_tour_field(source, "color")
+    if isinstance(value, str):
+        normalized = value.strip().lstrip("#")
+        if len(normalized) in {6, 8}:
+            try:
+                channels = tuple(
+                    int(normalized[index : index + 2], 16) / 255.0
+                    for index in range(0, len(normalized), 2)
+                )
+            except ValueError:
+                channels = ()
+            if len(channels) == 3:
+                return channels[0], channels[1], channels[2], 1.0
+            if len(channels) == 4:
+                return channels  # type: ignore[return-value]
+    try:
+        channels = tuple(float(channel) for channel in value)  # type: ignore[union-attr]
+    except (TypeError, ValueError):
+        return default
+    if len(channels) == 3:
+        channels = (*channels, 1.0)
+    if len(channels) != 4 or not all(
+        math.isfinite(channel) and 0.0 <= channel <= 1.0 for channel in channels
+    ):
+        return default
+    return channels  # type: ignore[return-value]
+
+
+def _resolve_selected_tour_step_index(
+    steps: Sequence[object],
+    selected_step: object | None,
+) -> int | None:
+    if selected_step is None:
+        return None
+    if isinstance(selected_step, int) and not isinstance(selected_step, bool):
+        return selected_step if 0 <= selected_step < len(steps) else None
+    selected_id = (
+        str(selected_step)
+        if isinstance(selected_step, str)
+        else _read_tour_field(selected_step, "step_id", "id")
+    )
+    for index, step in enumerate(steps):
+        if step is selected_step or step == selected_step:
+            return index
+        step_id = _read_tour_field(step, "step_id", "id")
+        if selected_id is not None and step_id is not None and str(step_id) == str(selected_id):
+            return index
+    return None
+
+
+def _resolve_next_tour_step_index(
+    steps: Sequence[object],
+    selected_step_index: int,
+) -> int | None:
+    """Return the next marker in stable chronological authoring order."""
+
+    if not 0 <= selected_step_index < len(steps):
+        return None
+    ordered_indexes = sorted(
+        range(len(steps)),
+        key=lambda index: (
+            _read_tour_progress(steps[index], default=0.0),
+            index,
+        ),
+    )
+    selected_order_index = ordered_indexes.index(selected_step_index)
+    next_order_index = selected_order_index + 1
+    return (
+        ordered_indexes[next_order_index]
+        if next_order_index < len(ordered_indexes)
+        else None
+    )
+
+
+def _resolve_active_tour_step_index(
+    steps: Sequence[object],
+    progress: float,
+) -> int | None:
+    """Return the latest timeline step at or before the normalized playhead."""
+
+    active: tuple[float, int] | None = None
+    for index, step in enumerate(steps):
+        raw_progress = _read_tour_field(step, "progress")
+        try:
+            step_progress = float(raw_progress)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(step_progress) or step_progress > progress + 1e-12:
+            continue
+        candidate = step_progress, index
+        if active is None or candidate > active:
+            active = candidate
+    return None if active is None else active[1]
+
+
+def _tour_overlay_values_equal(first: object, second: object) -> bool:
+    """Compare retained immutable tour data without assuming scalar equality."""
+
+    if first is second:
+        return True
+    try:
+        result = first == second
+    except (TypeError, ValueError):
+        return False
+    if isinstance(result, np.ndarray):
+        return bool(np.all(result))
+    try:
+        return bool(result)
+    except (TypeError, ValueError):
+        return False
+
+
+# ### Tour 3D text mesh helpers ###
+@lru_cache(maxsize=128)
+def _build_tour_text_local_mesh(
+    text: str,
+    size_points: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build centered, extruded text geometry in a stable local frame."""
+
+    normalized_text = str(text).replace("\t", "    ").strip()
+    normalized_size = float(size_points)
+    if not normalized_text or not math.isfinite(normalized_size) or normalized_size <= 0.0:
+        return (
+            np.empty((0, 3), dtype=np.float32),
+            np.empty((0, 3), dtype=np.int32),
+        )
+    try:
+        font = ImageFont.truetype(
+            "DejaVuSans.ttf",
+            TOUR_TEXT_RASTER_FONT_SIZE_PIXELS,
+        )
+    except OSError:
+        font = ImageFont.load_default(size=TOUR_TEXT_RASTER_FONT_SIZE_PIXELS)
+    scratch = Image.new("L", (1, 1), 0)
+    scratch_draw = ImageDraw.Draw(scratch)
+    line_spacing = max(1, TOUR_TEXT_RASTER_FONT_SIZE_PIXELS // 5)
+    bounds = scratch_draw.multiline_textbbox(
+        (0, 0),
+        normalized_text,
+        font=font,
+        spacing=line_spacing,
+    )
+    width = max(int(math.ceil(bounds[2] - bounds[0])), 1)
+    height = max(int(math.ceil(bounds[3] - bounds[1])), 1)
+    padding = 4
+    image = Image.new(
+        "L",
+        (width + padding * 2, height + padding * 2),
+        0,
+    )
+    ImageDraw.Draw(image).multiline_text(
+        (padding - bounds[0], padding - bounds[1]),
+        normalized_text,
+        font=font,
+        fill=255,
+        spacing=line_spacing,
+    )
+    mask = np.asarray(image, dtype=np.uint8)
+    contours, hierarchy = cv2.findContours(
+        np.where(mask >= 128, 255, 0).astype(np.uint8),
+        cv2.RETR_CCOMP,
+        cv2.CHAIN_APPROX_TC89_KCOS,
+    )
+    if hierarchy is None or not contours:
+        return (
+            np.empty((0, 3), dtype=np.float32),
+            np.empty((0, 3), dtype=np.int32),
+        )
+
+    meters_per_pixel = (
+        normalized_size
+        * TOUR_TEXT_HEIGHT_METERS_PER_POINT
+        / float(TOUR_TEXT_RASTER_FONT_SIZE_PIXELS)
+    )
+    contour_hierarchy = hierarchy[0]
+    polygons: list[object] = []
+    for contour_index, contour in enumerate(contours):
+        if int(contour_hierarchy[contour_index][3]) != -1:
+            continue
+        shell = _tour_text_contour_ring(contour, meters_per_pixel)
+        if len(shell) < 3:
+            continue
+        holes: list[tuple[tuple[float, float], ...]] = []
+        child_index = int(contour_hierarchy[contour_index][2])
+        while child_index >= 0:
+            hole = _tour_text_contour_ring(
+                contours[child_index],
+                meters_per_pixel,
+            )
+            if len(hole) >= 3:
+                holes.append(hole)
+            child_index = int(contour_hierarchy[child_index][0])
+        polygon = shapely.Polygon(shell, holes)
+        if not polygon.is_valid:
+            polygon = shapely.make_valid(polygon)
+        if not polygon.is_empty:
+            polygons.append(polygon)
+    if not polygons:
+        return (
+            np.empty((0, 3), dtype=np.float32),
+            np.empty((0, 3), dtype=np.int32),
+        )
+
+    geometry = shapely.union_all(polygons)
+    triangulation_vertices: list[tuple[float, float]] = []
+    triangulation_faces: list[tuple[int, int, int]] = []
+    vertex_indices: dict[tuple[float, float], int] = {}
+    for polygon in _iter_tour_text_polygons(geometry):
+        triangles = shapely.constrained_delaunay_triangles(polygon)
+        for triangle in shapely.get_parts(triangles):
+            if triangle.geom_type != "Polygon" or triangle.is_empty:
+                continue
+            coordinates = tuple(
+                (float(x), float(y))
+                for x, y in tuple(triangle.exterior.coords)[:-1]
+            )
+            if len(coordinates) != 3:
+                continue
+            face: list[int] = []
+            for coordinate in coordinates:
+                vertex_index = vertex_indices.get(coordinate)
+                if vertex_index is None:
+                    vertex_index = len(triangulation_vertices)
+                    vertex_indices[coordinate] = vertex_index
+                    triangulation_vertices.append(coordinate)
+                face.append(vertex_index)
+            triangulation_faces.append((face[0], face[1], face[2]))
+    if not triangulation_faces:
+        return (
+            np.empty((0, 3), dtype=np.float32),
+            np.empty((0, 3), dtype=np.int32),
+        )
+
+    text_height_meters = normalized_size * TOUR_TEXT_HEIGHT_METERS_PER_POINT
+    extrusion_depth = max(
+        text_height_meters * TOUR_TEXT_EXTRUSION_DEPTH_RATIO,
+        TOUR_TEXT_MINIMUM_EXTRUSION_METERS,
+    )
+    mesh = trimesh.creation.extrude_triangulation(
+        np.asarray(triangulation_vertices, dtype=float),
+        np.asarray(triangulation_faces, dtype=np.int64),
+        extrusion_depth,
+        process=False,
+    )
+    center = np.asarray(mesh.bounds, dtype=float).mean(axis=0)
+    mesh.apply_translation(-center)
+    vertices = np.ascontiguousarray(mesh.vertices, dtype=np.float32)
+    faces = np.ascontiguousarray(mesh.faces, dtype=np.int32)
+    vertices.setflags(write=False)
+    faces.setflags(write=False)
+    return vertices, faces
+
+
+def _tour_text_contour_ring(
+    contour: np.ndarray,
+    meters_per_pixel: float,
+) -> tuple[tuple[float, float], ...]:
+    """Convert one OpenCV glyph contour to an upward-facing metric ring."""
+
+    points = np.asarray(contour, dtype=float).reshape((-1, 2))
+    return tuple(
+        (
+            float(point[0]) * meters_per_pixel,
+            -float(point[1]) * meters_per_pixel,
+        )
+        for point in points
+    )
+
+
+def _iter_tour_text_polygons(geometry: object) -> tuple[object, ...]:
+    """Return every usable polygon from a repaired glyph geometry."""
+
+    return tuple(
+        part
+        for part in shapely.get_parts(geometry)
+        if part.geom_type == "Polygon" and not part.is_empty and part.area > 1e-12
+    )
+
+
+def _orient_tour_text_mesh(
+    local_vertices: np.ndarray,
+    position: object,
+    camera_look_direction: object,
+    rotation_degrees: object = (0.0, 0.0, 0.0),
+) -> np.ndarray:
+    """Place extruded text, then apply its authored world XYZ rotation."""
+
+    anchor = _normalize_tour_point(position)
+    forward = _normalize_tour_direction(camera_look_direction)
+    world_up = np.asarray((0.0, 0.0, 1.0), dtype=float)
+    right = _normalize_vector(np.cross(forward, world_up))
+    if right is None:
+        right = _normalize_vector(
+            np.cross(forward, np.asarray((0.0, 1.0, 0.0), dtype=float))
+        )
+    assert right is not None
+    up = _normalize_tour_direction(np.cross(right, forward))
+    camera_facing_normal = -forward
+    local = np.asarray(local_vertices, dtype=float)
+    oriented_offsets = (
+        local[:, 0, None] * right[None, :]
+        + local[:, 1, None] * up[None, :]
+        + local[:, 2, None] * camera_facing_normal[None, :]
+    )
+    rotation = _build_rotation_matrix(
+        _normalize_tour_rotation_degrees(rotation_degrees)
+    )
+    world = anchor[None, :] + (rotation @ oriented_offsets.T).T
+    return np.ascontiguousarray(world, dtype=np.float32)
+
+
+def _build_tour_text_hit_box(
+    world_vertices: object,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build a generous invisible cube around one rendered 3D text mesh."""
+
+    vertices = np.asarray(world_vertices, dtype=float)
+    if vertices.ndim != 2 or vertices.shape[1:] != (3,) or not len(vertices):
+        raise ValueError("A Tour text hit box requires world-space vertices.")
+    minimum = np.min(vertices, axis=0)
+    maximum = np.max(vertices, axis=0)
+    center = (minimum + maximum) * 0.5
+    largest_extent = max(float(np.max(maximum - minimum)), 0.0)
+    size = max(
+        TOUR_TEXT_HIT_BOX_MINIMUM_SIZE_METERS,
+        largest_extent * (1.0 + TOUR_TEXT_HIT_BOX_PADDING_RATIO * 2.0),
+    )
+    half_extent = np.full(3, size * 0.5, dtype=float)
+    return center - half_extent, center + half_extent
+
+
+def _derive_tour_camera_target(
+    curve_points: Sequence[Sequence[float]],
+    progress: float,
+    tension: float,
+) -> np.ndarray:
+    current = np.asarray(
+        evaluate_open_catmull_rom_curve(
+            curve_points,
+            progress,
+            tension=tension,
+        ),
+        dtype=float,
+    )
+    preview_delta = 1.0 / max((len(curve_points) - 1) * 32.0, 32.0)
+    if progress < 1.0:
+        adjacent = np.asarray(
+            evaluate_open_catmull_rom_curve(
+                curve_points,
+                min(progress + preview_delta, 1.0),
+                tension=tension,
+            ),
+            dtype=float,
+        )
+        direction = adjacent - current
+    else:
+        adjacent = np.asarray(
+            evaluate_open_catmull_rom_curve(
+                curve_points,
+                max(progress - preview_delta, 0.0),
+                tension=tension,
+            ),
+            dtype=float,
+        )
+        direction = current - adjacent
+    length = float(np.linalg.norm(direction))
+    if not math.isfinite(length) or length <= 1e-9:
+        direction = np.asarray((0.0, 1.0, 0.0), dtype=float)
+    else:
+        direction /= length
+    return current + direction
+
+
+def _get_tour_placement_instruction(kind: str) -> str:
+    if kind == TOUR_POINT_KIND_CURVE:
+        return "Click curve points. Press Enter or double-click to finish; Escape cancels."
+    if kind == TOUR_POINT_KIND_TRIGGER:
+        return "Click and drag to define the rectangular tour trigger area."
+    return "Click a visible surface to place the tour point."
 
 
 # ### Selection geometry and raster helpers ###
@@ -17896,6 +21746,52 @@ def _get_ray_point_distance(
         return None
     nearest_point = origin + direction * ray_parameter
     return float(np.linalg.norm(raw_point - nearest_point)), ray_parameter
+
+
+def _get_ray_axis_aligned_bounds_hit_distance(
+    ray_origin: object,
+    ray_direction: object,
+    minimum: object,
+    maximum: object,
+) -> float | None:
+    """Return the forward distance to an invisible axis-aligned hit box."""
+
+    origin, direction = _normalize_ray(ray_origin, ray_direction)
+    bounds_minimum = np.asarray(minimum, dtype=float)
+    bounds_maximum = np.asarray(maximum, dtype=float)
+    if (
+        origin is None
+        or direction is None
+        or bounds_minimum.shape != (3,)
+        or bounds_maximum.shape != (3,)
+        or not np.all(np.isfinite(bounds_minimum))
+        or not np.all(np.isfinite(bounds_maximum))
+        or np.any(bounds_minimum > bounds_maximum)
+    ):
+        return None
+    near = 0.0
+    far = math.inf
+    for axis_index in range(3):
+        if abs(float(direction[axis_index])) <= 1e-12:
+            if not (
+                bounds_minimum[axis_index]
+                <= origin[axis_index]
+                <= bounds_maximum[axis_index]
+            ):
+                return None
+            continue
+        first = (
+            bounds_minimum[axis_index] - origin[axis_index]
+        ) / direction[axis_index]
+        second = (
+            bounds_maximum[axis_index] - origin[axis_index]
+        ) / direction[axis_index]
+        axis_near, axis_far = sorted((float(first), float(second)))
+        near = max(near, axis_near)
+        far = min(far, axis_far)
+        if near > far:
+            return None
+    return near if far >= 0.0 else None
 
 
 def _intersect_ray_with_plane(

@@ -59,6 +59,8 @@ class StartupRestorationTests(unittest.TestCase):
             else:
                 widget.generation.shutdown()
                 widget.close()
+            widget.deleteLater()
+        self._widgets.clear()
         _qt_application.processEvents()
         self._temporary_directory.cleanup()
 

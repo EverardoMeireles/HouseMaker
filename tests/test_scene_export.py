@@ -100,7 +100,7 @@ class RuntimeSceneManifestTests(unittest.TestCase):
 
         self.assertEqual(payload["format"], RUNTIME_SCENE_FORMAT)
         self.assertEqual(payload["version"], RUNTIME_SCENE_VERSION)
-        self.assertEqual(payload["version"], 3)
+        self.assertEqual(payload["version"], 7)
         self.assertEqual(payload["coordinateSystem"], "gltf-y-up")
         self.assertEqual(payload["matrixLayout"], "column-major")
         self.assertEqual(payload["asset"]["glb"], "house.glb")
@@ -408,7 +408,7 @@ class RuntimeSceneManifestTests(unittest.TestCase):
             ],
             ["chair_prototype", "table_prototype"],
         )
-        self.assertEqual(manifest["version"], 3)
+        self.assertEqual(manifest["version"], 7)
         self.assertEqual(
             manifest["asset"]["sha256"],
             hashlib.sha256(final_glb).hexdigest(),

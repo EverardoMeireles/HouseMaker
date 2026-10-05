@@ -769,28 +769,39 @@ class ExternalViewerMainIntegrationTests(unittest.TestCase):
             )
             self.workspace._apply_atlas_display_screen("screen:atlas")
 
-        self.assertEqual(self._top_level_tab_labels(), ["Canvas", "Settings"])
+        self.assertEqual(
+            self._top_level_tab_labels(),
+            ["Canvas", "Tour", "Settings"],
+        )
 
         self.workspace._apply_generation_display_screen(None)
         self.assertEqual(
             self._top_level_tab_labels(),
-            ["Canvas", "Generation", "Settings"],
+            ["Canvas", "Generation", "Tour", "Settings"],
         )
         self.workspace._apply_atlas_display_screen(None)
         self.assertEqual(
             self._top_level_tab_labels(),
-            ["Canvas", "Atlas", "Generation", "Settings"],
+            ["Canvas", "Atlas", "Generation", "Tour", "Settings"],
         )
         self.workspace._apply_scene_3d_display_screen(None)
         self.assertEqual(
             self._top_level_tab_labels(),
-            ["Canvas", "3D scene", "Atlas", "Generation", "Settings"],
+            [
+                "Canvas",
+                "3D scene",
+                "Atlas",
+                "Generation",
+                "Tour",
+                "Settings",
+            ],
         )
         self.assertEqual(self.workspace.canvas_workspace_tab_index, 0)
         self.assertEqual(self.workspace.scene_3d_workspace_tab_index, 1)
         self.assertEqual(self.workspace.atlas_workspace_tab_index, 2)
         self.assertEqual(self.workspace.generation_workspace_tab_index, 3)
-        self.assertEqual(self.workspace.settings_workspace_tab_index, 4)
+        self.assertEqual(self.workspace.tour_workspace_tab_index, 4)
+        self.assertEqual(self.workspace.settings_workspace_tab_index, 5)
 
     # ### Test helpers ###
     def _seed_packed_wall_texture(

@@ -18,10 +18,11 @@ from housemaker.glb import (
     PlacedGeneratedModel,
     build_placed_generated_model_gltf_transform,
 )
+from housemaker.tour_state import TourData, tours_to_runtime_dicts
 
 # ### Constants ###
 RUNTIME_SCENE_FORMAT = "housemaker-r3f-scene"
-RUNTIME_SCENE_VERSION = 3
+RUNTIME_SCENE_VERSION = 7
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
 GLB_JSON_CHUNK_TYPE = b"JSON"
@@ -39,6 +40,7 @@ def write_runtime_scene_manifest(
     *,
     source_placements: Mapping[str, PlacedGeneratedModel],
     instance_placements: Sequence[PlacedGeneratedModel],
+    tours: Sequence[TourData] = (),
 ) -> Path:
     """Write the R3F runtime companion JSON next to an exported GLB."""
 
@@ -69,6 +71,7 @@ def write_runtime_scene_manifest(
         glb_bytes=glb_bytes,
         source_placements=normalized_sources,
         instance_placements=normalized_instances,
+        tours=tours,
     )
     manifest_path = normalized_glb_path.with_suffix(".json")
     _write_json_atomically(manifest_path, manifest)
@@ -81,8 +84,9 @@ def build_runtime_scene_manifest(
     glb_bytes: bytes,
     source_placements: Mapping[str, PlacedGeneratedModel],
     instance_placements: Sequence[PlacedGeneratedModel],
+    tours: Sequence[TourData] = (),
 ) -> dict[str, object]:
-    """Build a versioned runtime manifest for non-GLB instance transforms."""
+    """Build a versioned runtime manifest for instances and camera tours."""
 
     if not isinstance(glb_bytes, bytes) or not glb_bytes:
         raise ValueError("A runtime scene manifest requires exported GLB bytes.")
@@ -128,6 +132,7 @@ def build_runtime_scene_manifest(
             "sha256": hashlib.sha256(glb_bytes).hexdigest(),
         },
         "instanceGroups": groups,
+        "tours": tours_to_runtime_dicts(tours),
     }
 
 

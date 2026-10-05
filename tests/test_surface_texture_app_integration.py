@@ -221,6 +221,7 @@ class SurfaceTextureMainIntegrationTests(unittest.TestCase):
                 "3D scene",
                 "Atlas",
                 "Generation",
+                "Tour",
                 "Settings",
             ],
         )

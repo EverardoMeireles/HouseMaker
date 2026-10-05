@@ -320,7 +320,26 @@ from housemaker.texture_atlas_workspace import (
     load_atlas_object_texture_source,
 )
 from housemaker.texture_color_balance import TextureColorBalanceSettings
+from housemaker.tour_state import (
+    TourActionData,
+    TourData,
+    TourFloatingTooltipData,
+    TourText3DData,
+    evaluate_tour_camera_target,
+)
+from housemaker.tour_workspace import (
+    TOUR_POINT_ACTION_CURVE,
+    TOUR_POINT_ACTION_TRIGGER,
+    TourWorkspace,
+)
 from housemaker.viewer import (
+    TOUR_EDIT_TARGET_ACTION,
+    TOUR_EDIT_TARGET_ACTION_ROTATION,
+    TOUR_EDIT_TARGET_CAMERA_TARGET,
+    TOUR_EDIT_TARGET_CURVE_POINT,
+    TOUR_EDIT_TARGET_TRIGGER,
+    TOUR_POINT_KIND_CURVE,
+    TOUR_POINT_KIND_TRIGGER,
     ArchitecturalTrimDimensionEdit,
     GlbViewerWidget,
     PlacedObjectInstanceRequest,
@@ -372,6 +391,11 @@ STAIR_PREVIEW_UPDATE_DELAY_MILLISECONDS = 35
 PLAN_IMAGE_CORRECTION_SHUTDOWN_WAIT_MILLISECONDS = 100
 PLAN_WALL_DETECTION_SHUTDOWN_WAIT_MILLISECONDS = 100
 PLAN_WALL_PREVIEW_REFRESH_DELAY_MILLISECONDS = 75
+TOUR_CURVE_EYE_HEIGHT_METERS = 1.6
+TOUR_VIEWER_POINT_KIND_BY_ACTION = {
+    TOUR_POINT_ACTION_TRIGGER: TOUR_POINT_KIND_TRIGGER,
+    TOUR_POINT_ACTION_CURVE: TOUR_POINT_KIND_CURVE,
+}
 
 
 # ### Plan-image correction jobs ###
@@ -1451,6 +1475,10 @@ class BlueprintWorkspace(QWidget):
         self._direct_object_placement_session: _DirectObjectPlacementSession | None = (
             None
         )
+        self._tour_viewer_preview_revision = -1
+        self._tour_point_request_revision = 0
+        self._tour_draft_overlay: dict[str, object] | None = None
+        self._suppress_tour_preview_camera_updates = False
         self._pending_generation_placement_anchor: (
             SceneObjectPlacementCandidate | None
         ) = None
@@ -1567,6 +1595,12 @@ class BlueprintWorkspace(QWidget):
         self.settings_widget.dispose()
         self.merged_generation_workspace.shutdown()
         self._cancel_direct_object_placement()
+        self._tour_point_request_revision += 1
+        self.tour_workspace.shutdown()
+        self.viewer.clear_tour(restore_camera=False)
+        if self.tour_preview_viewer is not None:
+            self.tour_preview_viewer.clear_tour(restore_camera=False)
+            self.tour_preview_viewer.clear_model()
         self._external_atlas_host.dispose()
         self._external_generation_host.dispose()
         self._external_scene_3d_host.dispose()
@@ -1954,6 +1988,52 @@ class BlueprintWorkspace(QWidget):
         self._external_generation_host.viewer_restored.connect(
             self._handle_external_generation_workspace_restored
         )
+        self.tour_workspace = TourWorkspace(self)
+        self.tour_preview_viewer: GlbViewerWidget | None = None
+        self.tour_workspace.point_placement_requested.connect(
+            self._handle_tour_point_placement_requested
+        )
+        self.tour_workspace.point_placement_cancel_requested.connect(
+            self._handle_tour_point_placement_cancel_requested
+        )
+        self.tour_workspace.draft_changed.connect(
+            self._handle_tour_draft_changed
+        )
+        self.tour_workspace.data_changed.connect(
+            self._handle_tour_data_changed
+        )
+        self.tour_workspace.tour_selection_changed.connect(
+            self._handle_tour_selection_changed
+        )
+        self.tour_workspace.step_selection_changed.connect(
+            self._handle_tour_step_selection_changed
+        )
+        self.tour_workspace.action_selection_changed.connect(
+            self._handle_tour_action_selection_changed
+        )
+        self.tour_workspace.camera_target_requested.connect(
+            self._handle_tour_camera_target_requested
+        )
+        self.tour_workspace.text_action_position_requested.connect(
+            self._handle_tour_text_action_position_requested
+        )
+        self.tour_workspace.floating_tooltip_position_requested.connect(
+            self._handle_tour_floating_tooltip_position_requested
+        )
+        self.tour_workspace.preview_requested.connect(
+            self._handle_tour_preview_requested
+        )
+        self.tour_workspace.preview_pose_requested.connect(
+            self._handle_tour_preview_pose_requested
+        )
+        self.viewer.tour_point_placed.connect(self._handle_tour_point_placed)
+        self.viewer.tour_point_placement_cancelled.connect(
+            self._handle_tour_point_placement_cancelled
+        )
+        self.viewer.tour_curve_finished.connect(
+            self._handle_tour_curve_finished
+        )
+        self._connect_tour_editor_viewer(self.viewer)
         self.settings_widget = SettingsWidget(
             application_settings=self._application_settings
         )
@@ -2076,6 +2156,10 @@ class BlueprintWorkspace(QWidget):
         self.generation_workspace_tab_index = self.workspace_tabs.addTab(
             self.merged_generation_workspace,
             "Generation",
+        )
+        self.tour_workspace_tab_index = self.workspace_tabs.addTab(
+            self.tour_workspace,
+            "Tour",
         )
         self.settings_workspace_tab_index = self.workspace_tabs.addTab(
             self.settings_widget,
@@ -9187,6 +9271,621 @@ class BlueprintWorkspace(QWidget):
                 thread.wait(SURFACE_AO_SHUTDOWN_WAIT_MILLISECONDS)
         self._surface_texture_tiling_threads.clear()
 
+    # ### Tour authoring ###
+    def _ensure_tour_preview_viewer(self) -> GlbViewerWidget:
+        """Create the Tour GL viewer only when its tab is first opened."""
+
+        existing = self.tour_preview_viewer
+        if existing is not None:
+            return existing
+        viewer = GlbViewerWidget(
+            self.tour_workspace,
+            tour_direction_arrow_enabled=False,
+            tour_html_tooltips_enabled=True,
+        )
+        viewer.setObjectName("tour_preview_viewer")
+        viewer.set_ambient_light_intensity(0.5)
+        enabled_maps = tuple(
+            map_type
+            for map_type, checkbox in (
+                self.merged_generation_workspace.pbr_map_checkboxes.items()
+            )
+            if checkbox.isChecked()
+        )
+        viewer.set_pbr_maps_enabled(enabled_maps)
+        self.tour_preview_viewer = viewer
+        self.tour_workspace.set_preview_widget(viewer)
+        self._connect_tour_editor_viewer(viewer)
+        return viewer
+
+    def _connect_tour_editor_viewer(self, viewer: GlbViewerWidget) -> None:
+        """Connect selection and transform editing from one Tour-capable viewer."""
+
+        viewer.tour_selection_changed.connect(
+            self._handle_tour_viewer_selection_changed
+        )
+        viewer.tour_edit_target_selected.connect(
+            self._handle_tour_viewer_edit_target_selected
+        )
+        viewer.tour_edit_preview_changed.connect(
+            partial(self._handle_tour_viewer_edit_preview_changed, viewer)
+        )
+        viewer.tour_edit_finished.connect(self._handle_tour_viewer_edit_finished)
+
+    def _handle_tour_point_placement_requested(
+        self,
+        action: str,
+        _context: object,
+    ) -> None:
+        """Open the shared scene and arm the point tool requested by Tour."""
+
+        normalized_action = str(action).strip().lower()
+        if normalized_action not in TOUR_VIEWER_POINT_KIND_BY_ACTION:
+            self.tour_workspace.set_status_message(
+                "The requested tour point action is not supported."
+            )
+            return
+        self._tour_point_request_revision += 1
+        request_revision = self._tour_point_request_revision
+        if self._external_scene_3d_host.is_active:
+            scene_window = self._external_scene_3d_host.window
+            scene_window.show()
+            scene_window.raise_()
+            scene_window.activateWindow()
+        else:
+            scene_index = self.workspace_tabs.indexOf(self.scene_3d_workspace)
+            if scene_index >= 0:
+                self.workspace_tabs.setCurrentIndex(scene_index)
+        self._ensure_viewer_preview_current(preserve_camera=True)
+        QTimer.singleShot(
+            0,
+            partial(
+                self._arm_tour_point_placement,
+                normalized_action,
+                request_revision,
+            ),
+        )
+
+    def _arm_tour_point_placement(
+        self,
+        action: str,
+        request_revision: int,
+    ) -> None:
+        """Arm one still-current Tour point request after the scene is visible."""
+
+        if (
+            self._is_shutdown
+            or request_revision != self._tour_point_request_revision
+            or self.tour_workspace.pending_point_action() != action
+        ):
+            return
+        self._refresh_viewer_preview(preserve_camera=True)
+        level_base_z = build_level_base_z_lookup(self.levels).get(
+            self.current_level.index,
+            0.0,
+        )
+        viewer_kind = TOUR_VIEWER_POINT_KIND_BY_ACTION[action]
+        was_armed = self.viewer.begin_tour_point_placement(
+            viewer_kind,
+            repeat=action == TOUR_POINT_ACTION_CURVE,
+            vertical_offset_meters=(
+                TOUR_CURVE_EYE_HEIGHT_METERS
+                if action == TOUR_POINT_ACTION_CURVE
+                else 0.0
+            ),
+            fallback_plane_z=float(level_base_z),
+        )
+        if was_armed:
+            self.viewer.focus_navigation()
+            return
+        self.tour_workspace.set_status_message(
+            "Tour point placement could not be started in the 3D scene."
+        )
+
+    def _handle_tour_point_placement_cancel_requested(self) -> None:
+        """Disarm scene picking after Tour completes or cancels an action."""
+
+        self._tour_point_request_revision += 1
+        self.viewer.cancel_tour_point_placement(notify=False)
+
+    def _handle_tour_point_placed(self, kind: str, point: object) -> None:
+        """Forward one shared-scene hit to the pending Tour authoring action."""
+
+        action = self.tour_workspace.pending_point_action()
+        if action is None:
+            return
+        expected_kind = TOUR_VIEWER_POINT_KIND_BY_ACTION.get(action)
+        if str(kind) != expected_kind:
+            return
+        accepted = self.tour_workspace.accept_world_point(point)
+        if not accepted:
+            return
+
+    def _handle_tour_point_placement_cancelled(self, _kind: str) -> None:
+        """Return to Tour when the user cancels the active scene point tool."""
+
+        action = self.tour_workspace.pending_point_action()
+        if action is None:
+            return
+        self._tour_point_request_revision += 1
+        self.tour_workspace.cancel_point_placement(
+            remove_draft=action
+            in (TOUR_POINT_ACTION_TRIGGER, TOUR_POINT_ACTION_CURVE)
+        )
+        tour_index = self.workspace_tabs.indexOf(self.tour_workspace)
+        if tour_index >= 0:
+            self.workspace_tabs.setCurrentIndex(tour_index)
+
+    def _handle_tour_curve_finished(self, _points: object) -> None:
+        """Finalize the active open curve from Enter or a viewport double-click."""
+
+        if not self.tour_workspace.finish_curve():
+            self.tour_workspace.set_status_message(
+                "Place at least two distinct curve points before finishing."
+            )
+            return
+        tour_index = self.workspace_tabs.indexOf(self.tour_workspace)
+        if tour_index >= 0:
+            self.workspace_tabs.setCurrentIndex(tour_index)
+
+    def _handle_tour_draft_changed(self, payload: object) -> None:
+        """Preview an incomplete trigger and curve in both scene consumers."""
+
+        self._tour_draft_overlay = dict(payload) if isinstance(payload, Mapping) else None
+        self._sync_tour_overlays()
+
+    def _handle_tour_data_changed(self, _tours: object) -> None:
+        """Keep retained overlay geometry synchronized with Tour edits."""
+
+        self._sync_tour_overlays()
+
+    def _handle_tour_selection_changed(self, _tour: object) -> None:
+        """Select one curve while keeping every finalized curve visible."""
+
+        self._sync_tour_overlays()
+
+    def _handle_tour_step_selection_changed(self, _step: object) -> None:
+        """Show only the selected step's actions and editing handles."""
+
+        self._sync_tour_overlays()
+
+    def _handle_tour_action_selection_changed(self, _action: object) -> None:
+        """Synchronize the action gizmo in both Tour-capable viewers."""
+
+        self._sync_tour_overlays()
+
+    def _handle_tour_camera_target_requested(
+        self,
+        tour_id: str,
+        step_id: str,
+    ) -> None:
+        """Place a target one meter forward without moving the preview camera."""
+
+        viewer = self._ensure_tour_preview_viewer()
+        try:
+            target = viewer.get_camera_forward_world_point(1.0)
+        except (RuntimeError, TypeError, ValueError, OverflowError):
+            self.tour_workspace.set_status_message(
+                "The 3D tour preview camera direction is unavailable."
+            )
+            return
+        was_suppressed = self._suppress_tour_preview_camera_updates
+        self._suppress_tour_preview_camera_updates = True
+        try:
+            updated = self.tour_workspace.set_tour_camera_target(
+                str(tour_id),
+                str(step_id),
+                target,
+            )
+        finally:
+            self._suppress_tour_preview_camera_updates = was_suppressed
+        if not updated:
+            self.tour_workspace.set_status_message(
+                "Select a finalized tour step before setting its camera target."
+            )
+
+    def _handle_tour_text_action_position_requested(
+        self,
+        _context: object,
+    ) -> None:
+        """Create text at the nearest scene point under the preview center."""
+
+        viewer = self._ensure_tour_preview_viewer()
+        try:
+            position = viewer.get_tour_screen_center_world_point()
+        except (RuntimeError, TypeError, ValueError):
+            self.tour_workspace.set_status_message(
+                "The 3D tour preview could not determine a text position."
+            )
+            return
+        if not self.tour_workspace.add_text_action_at_position(position):
+            self.tour_workspace.set_status_message(
+                "Select a finalized tour step before adding 3D text."
+            )
+
+    def _handle_tour_floating_tooltip_position_requested(
+        self,
+        tour_id: str,
+        step_id: str,
+        action_id: str,
+    ) -> None:
+        """Anchor a new tooltip at the Tour preview's screen-center hit."""
+
+        viewer = self._ensure_tour_preview_viewer()
+        try:
+            anchor_point = viewer.get_tour_screen_center_world_point()
+        except (RuntimeError, TypeError, ValueError):
+            self.tour_workspace.set_status_message(
+                "The 3D tour preview could not determine a tooltip position."
+            )
+            return
+        if not self.tour_workspace.set_floating_tooltip_action_anchor_point(
+            str(tour_id),
+            str(step_id),
+            str(action_id),
+            anchor_point,
+        ):
+            self.tour_workspace.set_status_message(
+                "Select a finalized tour step before adding a floating tooltip."
+            )
+
+    def _handle_tour_viewer_selection_changed(self, tour_id: object) -> None:
+        """Apply curve selection without moving the authoring preview camera."""
+
+        selected_id = None if tour_id is None else str(tour_id).strip() or None
+        was_suppressed = self._suppress_tour_preview_camera_updates
+        self._suppress_tour_preview_camera_updates = True
+        try:
+            self.tour_workspace.select_tour(selected_id, select_action=False)
+        finally:
+            self._suppress_tour_preview_camera_updates = was_suppressed
+
+    def _handle_tour_viewer_edit_target_selected(
+        self,
+        tour_id: str,
+        kind: str,
+        reference: object,
+    ) -> None:
+        """Synchronize one clicked Tour handle without moving the camera."""
+
+        normalized_tour_id = str(tour_id)
+        normalized_kind = str(kind)
+        was_suppressed = self._suppress_tour_preview_camera_updates
+        self._suppress_tour_preview_camera_updates = True
+        try:
+            selected_step_id: str | None = None
+            if normalized_kind == TOUR_EDIT_TARGET_CAMERA_TARGET:
+                selected_step_id = str(reference)
+                was_selected = self.tour_workspace.select_step(
+                    normalized_tour_id,
+                    selected_step_id,
+                )
+            elif normalized_kind not in (
+                TOUR_EDIT_TARGET_ACTION,
+                TOUR_EDIT_TARGET_ACTION_ROTATION,
+            ):
+                was_selected = self.tour_workspace.select_tour(
+                    normalized_tour_id,
+                    select_action=False,
+                )
+                if was_selected:
+                    self.tour_workspace.clear_action_selection()
+            else:
+                action_context = self._find_tour_action_context(
+                    normalized_tour_id,
+                    str(reference),
+                )
+                if action_context is None:
+                    return
+                selected_step_id, action_id = action_context
+                was_selected = self.tour_workspace.select_action(
+                    normalized_tour_id,
+                    selected_step_id,
+                    action_id,
+                )
+            if not was_selected:
+                return
+            viewers = [self.viewer]
+            if self.tour_preview_viewer is not None:
+                viewers.append(self.tour_preview_viewer)
+            for viewer in viewers:
+                viewer.select_tour_edit_target(
+                    normalized_tour_id,
+                    normalized_kind,
+                    reference,
+                    selected_step_id,
+                    emit=False,
+                )
+        finally:
+            self._suppress_tour_preview_camera_updates = was_suppressed
+
+    def _handle_tour_viewer_edit_preview_changed(
+        self,
+        source_viewer: GlbViewerWidget,
+        tour_id: str,
+        kind: str,
+        reference: object,
+        point: object,
+    ) -> None:
+        """Mirror one temporary Tour gizmo position into the peer 3D view."""
+
+        try:
+            preview_point = tuple(float(value) for value in point)  # type: ignore[arg-type]
+        except (TypeError, ValueError, OverflowError):
+            return
+        if len(preview_point) != 3 or not all(
+            math.isfinite(value) for value in preview_point
+        ):
+            return
+
+        normalized_tour_id = str(tour_id)
+        normalized_kind = str(kind)
+        viewers = [self.viewer]
+        if self.tour_preview_viewer is not None:
+            viewers.append(self.tour_preview_viewer)
+        for viewer in viewers:
+            if viewer is source_viewer:
+                continue
+            if normalized_kind == TOUR_EDIT_TARGET_ACTION_ROTATION:
+                viewer.set_tour_edit_preview_rotation(
+                    normalized_tour_id,
+                    str(reference),
+                    preview_point,
+                )
+            else:
+                viewer.set_tour_edit_preview_position(
+                    normalized_tour_id,
+                    normalized_kind,
+                    reference,
+                    preview_point,
+                )
+
+        if normalized_kind != TOUR_EDIT_TARGET_CAMERA_TARGET:
+            return
+        tour = self.tour_workspace.current_tour()
+        step = self.tour_workspace.selected_step()
+        preview_viewer = self.tour_preview_viewer
+        if (
+            tour is None
+            or step is None
+            or preview_viewer is None
+            or tour.tour_id != normalized_tour_id
+            or step.step_id != str(reference)
+            or self._suppress_tour_preview_camera_updates
+        ):
+            return
+        preview_viewer.set_tour_preview(
+            self.tour_workspace.preview_progress(),
+            preview_point,
+        )
+
+    def _handle_tour_viewer_edit_finished(
+        self,
+        tour_id: str,
+        kind: str,
+        reference: object,
+        point: object,
+        changed: bool,
+    ) -> None:
+        """Commit one completed Tour gizmo drag to persistent authoring state."""
+
+        try:
+            if not changed:
+                return
+            normalized_tour_id = str(tour_id)
+            normalized_kind = str(kind)
+            if normalized_kind == TOUR_EDIT_TARGET_CAMERA_TARGET:
+                self.tour_workspace.set_tour_camera_target(
+                    normalized_tour_id,
+                    str(reference),
+                    point,
+                )
+                return
+            if normalized_kind == TOUR_EDIT_TARGET_TRIGGER:
+                self.tour_workspace.set_tour_trigger_point(
+                    normalized_tour_id,
+                    point,
+                )
+                return
+            if normalized_kind == TOUR_EDIT_TARGET_CURVE_POINT:
+                if isinstance(reference, bool):
+                    return
+                try:
+                    point_index = int(reference)
+                except (TypeError, ValueError, OverflowError):
+                    return
+                self.tour_workspace.set_tour_curve_point(
+                    normalized_tour_id,
+                    point_index,
+                    point,
+                )
+                return
+            if normalized_kind == TOUR_EDIT_TARGET_ACTION_ROTATION:
+                action_context = self._find_tour_action(
+                    normalized_tour_id,
+                    str(reference),
+                )
+                if action_context is None:
+                    return
+                step_id, action = action_context
+                if not isinstance(action, TourText3DData):
+                    return
+                self.tour_workspace.set_text_action_rotation(
+                    normalized_tour_id,
+                    step_id,
+                    action.component_id,
+                    point,
+                )
+                return
+            if normalized_kind != TOUR_EDIT_TARGET_ACTION:
+                return
+            action_context = self._find_tour_action(
+                normalized_tour_id,
+                str(reference),
+            )
+            if action_context is None:
+                return
+            step_id, action = action_context
+            if isinstance(action, TourText3DData):
+                self.tour_workspace.set_text_action_position(
+                    normalized_tour_id,
+                    step_id,
+                    action.component_id,
+                    point,
+                )
+            elif isinstance(action, TourFloatingTooltipData):
+                self.tour_workspace.set_floating_tooltip_action_anchor_point(
+                    normalized_tour_id,
+                    step_id,
+                    action.component_id,
+                    point,
+                )
+        finally:
+            self._sync_tour_overlays()
+
+    def _find_tour_action_context(
+        self,
+        tour_id: str,
+        action_id: str,
+    ) -> tuple[str, str] | None:
+        """Return the step/action IDs for one globally unique Tour action."""
+
+        context = self._find_tour_action(tour_id, action_id)
+        if context is None:
+            return None
+        step_id, action = context
+        return step_id, action.component_id
+
+    def _find_tour_action(
+        self,
+        tour_id: str,
+        action_id: str,
+    ) -> tuple[str, TourActionData] | None:
+        """Return the owning step ID and action for one globally unique ID."""
+
+        tour = next(
+            (
+                candidate
+                for candidate in self.tour_workspace.tours()
+                if candidate.tour_id == tour_id
+            ),
+            None,
+        )
+        if tour is None:
+            return None
+        for step in tour.steps:
+            for action in step.actions:
+                if action.component_id == action_id:
+                    return step.step_id, action
+        return None
+
+    def _sync_tour_overlays(self) -> None:
+        """Render all curves and the selected Tour's current authoring context."""
+
+        tour = self.tour_workspace.current_tour()
+        selected_step = self.tour_workspace.selected_step()
+        selected_action = self.tour_workspace.selected_action()
+        selected_tour_id = tour.tour_id if tour is not None else None
+        if selected_tour_id is None and self._tour_draft_overlay is not None:
+            draft_id = self._tour_draft_overlay.get("tour_id")
+            if draft_id is not None:
+                selected_tour_id = str(draft_id)
+        selected_step_id = selected_step.step_id if selected_step is not None else None
+        selected_action_id = (
+            selected_action.component_id if selected_action is not None else None
+        )
+        progress = self.tour_workspace.preview_progress() if tour is not None else None
+        viewers = [self.viewer]
+        if self.tour_preview_viewer is not None:
+            viewers.append(self.tour_preview_viewer)
+        for viewer in viewers:
+            if viewer is self.tour_preview_viewer and tour is None:
+                viewer.clear_tour_preview(
+                    restore_camera=not self._suppress_tour_preview_camera_updates
+                )
+            viewer.set_tour_overlays(
+                self.tour_workspace.tours(),
+                selected_tour_id=selected_tour_id,
+                selected_step_id=selected_step_id,
+                selected_action_id=selected_action_id,
+                timeline_progress=progress,
+                draft=self._tour_draft_overlay,
+            )
+        if (
+            tour is not None
+            and self.tour_preview_viewer is not None
+            and not self._suppress_tour_preview_camera_updates
+        ):
+            self.tour_preview_viewer.set_tour_preview(
+                progress,
+                evaluate_tour_camera_target(tour, progress),
+            )
+
+    def _handle_tour_preview_requested(
+        self,
+        tour: object,
+        progress: float,
+    ) -> None:
+        """Scrub the preview camera and red progress marker along one tour."""
+
+        if not isinstance(tour, TourData):
+            return
+        if self._tour_viewer_preview_is_active():
+            self._refresh_viewer_preview(preserve_camera=True)
+        selected = self.tour_workspace.current_tour()
+        if selected is None or selected.tour_id != tour.tour_id:
+            return
+        normalized_progress = max(0.0, min(1.0, float(progress)))
+        self.viewer.set_tour_timeline_progress(normalized_progress)
+        if (
+            self.tour_preview_viewer is not None
+            and not self._suppress_tour_preview_camera_updates
+        ):
+            self.tour_preview_viewer.set_tour_preview(
+                normalized_progress,
+                evaluate_tour_camera_target(
+                    tour,
+                    normalized_progress,
+                ),
+            )
+
+    def _handle_tour_preview_pose_requested(
+        self,
+        tour: object,
+        progress: float,
+        camera_position: object,
+        camera_target: object,
+    ) -> None:
+        """Apply an action-authored pose only to the embedded Tour preview."""
+
+        if not isinstance(tour, TourData):
+            return
+        selected = self.tour_workspace.current_tour()
+        if selected is None or selected.tour_id != tour.tour_id:
+            return
+        try:
+            normalized_progress = max(0.0, min(1.0, float(progress)))
+        except (TypeError, ValueError, OverflowError):
+            return
+        self.viewer.set_tour_timeline_progress(
+            normalized_progress,
+            camera_position=camera_position,
+            camera_target=camera_target,
+        )
+        if (
+            self.tour_preview_viewer is None
+            or self._suppress_tour_preview_camera_updates
+        ):
+            return
+        try:
+            self.tour_preview_viewer.set_tour_preview(
+                normalized_progress,
+                camera_target,
+                camera_position=camera_position,
+            )
+        except (TypeError, ValueError, OverflowError):
+            return
+
     # ### GLB export ###
     def _handle_glb_export_clicked(self) -> None:
         self._cancel_active_canvas_surface_edit()
@@ -9243,6 +9942,7 @@ class BlueprintWorkspace(QWidget):
                 exported_path,
                 source_placements=source_placements_by_id,
                 instance_placements=instance_placements,
+                tours=self.tour_workspace.tours(),
             )
         except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Export failed", str(error))
@@ -9341,11 +10041,13 @@ class BlueprintWorkspace(QWidget):
     def _handle_workspace_tab_changed(self, tab_index: int) -> None:
         selected_widget = self.workspace_tabs.widget(tab_index)
         is_atlas_workspace = selected_widget is self.texture_atlas_workspace
+        is_tour_workspace = selected_widget is self.tour_workspace
         is_full_width_workspace = bool(
             is_atlas_workspace
             or selected_widget
             in (
                 self.merged_generation_workspace,
+                self.tour_workspace,
                 self.settings_widget,
             )
         )
@@ -9357,6 +10059,13 @@ class BlueprintWorkspace(QWidget):
         elif is_atlas_workspace:
             self._sync_atlas_object_texture_sources()
             self._schedule_atlas_draw_call_estimate()
+        elif is_tour_workspace:
+            self._ensure_tour_preview_viewer()
+            self._sync_tour_overlays()
+            if not self._viewer_preview_is_active():
+                return
+            self._refresh_blueprint_file_dependencies(include_exported_levels=False)
+            self._ensure_viewer_preview_current(preserve_camera=True)
         if is_full_width_workspace:
             return
 
@@ -13466,6 +14175,7 @@ class BlueprintWorkspace(QWidget):
             (self.scene_3d_workspace, "3D scene"),
             (self.texture_atlas_workspace, "Atlas"),
             (self.merged_generation_workspace, "Generation"),
+            (self.tour_workspace, "Tour"),
             (self.settings_widget, "Settings"),
         )
 
@@ -13480,6 +14190,8 @@ class BlueprintWorkspace(QWidget):
             self.atlas_workspace_tab_index = index
         elif workspace is self.merged_generation_workspace:
             self.generation_workspace_tab_index = index
+        elif workspace is self.tour_workspace:
+            self.tour_workspace_tab_index = index
         elif workspace is self.settings_widget:
             self.settings_workspace_tab_index = index
 
@@ -13511,8 +14223,19 @@ class BlueprintWorkspace(QWidget):
             )
         )
 
+    def _tour_viewer_preview_is_active(self) -> bool:
+        """Return whether the embedded Tour scene preview is visible."""
+
+        return bool(
+            self.tour_preview_viewer is not None
+            and self.workspace_tabs.currentWidget() is self.tour_workspace
+        )
+
     def _viewer_preview_is_active(self) -> bool:
-        return self._canvas_viewer_preview_is_active()
+        return bool(
+            self._canvas_viewer_preview_is_active()
+            or self._tour_viewer_preview_is_active()
+        )
 
     def _active_viewer_preview_needs_refresh(self) -> bool:
         revision = self._viewer_preview_revision
@@ -13520,9 +14243,15 @@ class BlueprintWorkspace(QWidget):
             self.texture_atlas_workspace.is_ambient_occlusion_preview_active
         )
         return bool(
-            self._canvas_viewer_preview_is_active()
-            and not ambient_occlusion_override_active
-            and self._canvas_viewer_preview_revision != revision
+            (
+                self._canvas_viewer_preview_is_active()
+                and not ambient_occlusion_override_active
+                and self._canvas_viewer_preview_revision != revision
+            )
+            or (
+                self._tour_viewer_preview_is_active()
+                and self._tour_viewer_preview_revision != revision
+            )
         )
 
     def _remember_current_canvas_preview_model(
@@ -14289,6 +15018,8 @@ class BlueprintWorkspace(QWidget):
             if checkbox.isChecked()
         )
         self.viewer.set_pbr_maps_enabled(enabled_maps)
+        if self.tour_preview_viewer is not None:
+            self.tour_preview_viewer.set_pbr_maps_enabled(enabled_maps)
 
     def _refresh_viewer_preview(self, preserve_camera: bool = False) -> None:
         if (
@@ -14309,7 +15040,11 @@ class BlueprintWorkspace(QWidget):
             and not ambient_occlusion_override_active
             and self._canvas_viewer_preview_revision != revision
         )
-        if not canvas_is_stale:
+        tour_is_stale = bool(
+            self._tour_viewer_preview_is_active()
+            and self._tour_viewer_preview_revision != revision
+        )
+        if not canvas_is_stale and not tour_is_stale:
             return
 
         preview_levels = self._build_viewer_preview_levels()
@@ -14360,6 +15095,20 @@ class BlueprintWorkspace(QWidget):
                 self._refresh_pending_level_transform_outline()
             self._clear_committed_doorway_outline_if_displayed()
             self._clear_committed_level_transform_outline_if_displayed()
+
+        if tour_is_stale:
+            tour_preview_viewer = self.tour_preview_viewer
+            if tour_preview_viewer is None:
+                return
+            if generated_model is None or not len(generated_model.mesh.faces):
+                tour_preview_viewer.clear_model()
+            else:
+                tour_preview_viewer.set_model(
+                    generated_model,
+                    preserve_camera=preserve_camera,
+                )
+            self._tour_viewer_preview_revision = revision
+            self._sync_tour_overlays()
 
     def _mark_viewer_preview_dirty(
         self,
@@ -14480,6 +15229,7 @@ class BlueprintWorkspace(QWidget):
                 texture_atlases=self.texture_atlas_workspace.get_data(),
                 stairs=self.stairs,
                 wall_mirror_links=self.wall_mirror_links,
+                tours=self.tour_workspace.tours(),
             )
         except ValueError as error:
             QMessageBox.critical(self, "Save failed", str(error))
@@ -17724,6 +18474,7 @@ class BlueprintWorkspace(QWidget):
             texture_atlases=project_data.texture_atlases,
             stairs=project_data.stairs,
             wall_mirror_links=project_data.wall_mirror_links,
+            tours=project_data.tours,
         )
 
     def _apply_project_state(
@@ -17737,6 +18488,7 @@ class BlueprintWorkspace(QWidget):
         texture_atlases: TextureAtlasData | None = None,
         stairs: list[StairData] | None = None,
         wall_mirror_links: Sequence[WallMirrorVertexLink] | None = None,
+        tours: Sequence[TourData] | None = None,
     ) -> None:
         if (
             self.generation.is_generating
@@ -17759,6 +18511,10 @@ class BlueprintWorkspace(QWidget):
         self._cancel_and_join_surface_texture_tiling_preparations()
         self._pending_generation_placement_anchor = None
         self._cancel_direct_object_placement()
+        self._tour_point_request_revision += 1
+        self.viewer.clear_tour(restore_camera=True)
+        if self.tour_preview_viewer is not None:
+            self.tour_preview_viewer.clear_tour(restore_camera=True)
 
         self._is_doorway_move_drag_active = False
         self._is_doorway_resize_drag_active = False
@@ -17805,6 +18561,8 @@ class BlueprintWorkspace(QWidget):
             wall_mirror_links or (),
         )
         self.wall_mirror_links = wall_mirror_result.links
+        self.tour_workspace.set_tours(tuple(tours or ()))
+        self._sync_tour_overlays()
         self._reset_viewer_doorway_snapshots()
         self._level_blueprint_image_revisions.clear()
         self.stairs = list(stairs or [])

@@ -70,6 +70,7 @@ from housemaker.models import (
 )
 from housemaker.surface_texture_state import SurfaceTextureData
 from housemaker.texture_atlas_state import TextureAtlasData
+from housemaker.tour_state import TourData, tours_from_payload, tours_to_dicts
 from housemaker.wall_mirroring import (
     WallMirrorVertexLink,
     materialize_legacy_wall_mirrors,
@@ -100,10 +101,13 @@ class ProjectData:
     stairs: list[StairData] = field(default_factory=list)
     texture_atlases: TextureAtlasData = field(default_factory=TextureAtlasData)
     wall_mirror_links: tuple[WallMirrorVertexLink, ...] = ()
+    tours: tuple[TourData, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.doorway_presets:
             self.doorway_presets = [create_fallback_doorway_preset()]
+        self.tours = tuple(self.tours)
+        tours_to_dicts(self.tours)
 
 
 # ### Public helpers ###
@@ -118,6 +122,7 @@ def save_project(
     stairs: list[StairData] | None = None,
     texture_atlases: TextureAtlasData | None = None,
     wall_mirror_links: Iterable[WallMirrorVertexLink] | None = None,
+    tours: Iterable[TourData] | None = None,
 ) -> Path:
     export_path = Path(path)
     payload = {
@@ -149,6 +154,7 @@ def save_project(
         ),
         "stairs": _serialize_stairs(stairs or []),
         "wall_mirror_links": wall_mirror_links_to_dicts(wall_mirror_links or ()),
+        "tours": tours_to_dicts(tours or ()),
         "levels": [
             {
                 "index": level.index,
@@ -318,6 +324,7 @@ def load_project(path: str | Path) -> ProjectData:
         payload.get("stairs"),
         valid_level_indices=set(level_lookup),
     )
+    tours = tours_from_payload(payload.get("tours"))
     loaded_wall_mirror_links = wall_mirror_links_from_payload(
         payload.get("wall_mirror_links"),
         levels=levels,
@@ -348,6 +355,7 @@ def load_project(path: str | Path) -> ProjectData:
         texture_atlases=texture_atlases,
         stairs=stairs,
         wall_mirror_links=materialized_wall_mirrors.links,
+        tours=tours,
     )
 
 
