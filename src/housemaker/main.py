@@ -18634,6 +18634,7 @@ class BlueprintWorkspace(QWidget):
             )
         )
         self.generation.set_data(generation)
+        self._sync_canvas_placed_object_profiles()
         self._sync_viewer_scene_levels(reset_visibility=True)
         self.texture_atlas_workspace.set_data(texture_atlases)
         self.surface_texture_generation.set_levels(self.levels)

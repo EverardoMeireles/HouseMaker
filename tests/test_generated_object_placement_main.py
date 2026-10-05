@@ -682,6 +682,34 @@ class GeneratedObjectPlacementMainTests(unittest.TestCase):
         self.assertEqual(profiles[0].level_index, 2)
         self.assertEqual((profiles[0].anchor_x, profiles[0].anchor_y), (40.0, 50.0))
 
+    def test_loading_project_publishes_placed_object_profiles_immediately(
+        self,
+    ) -> None:
+        level = _level(2)
+        generation = GenerationData(
+            generated_objects=[
+                _record(
+                    "chair",
+                    GeneratedObjectPlacement(2, 40.0, 50.0),
+                )
+            ]
+        )
+
+        with patch.object(
+            self.workspace.generation,
+            "get_generated_object_model",
+            return_value=_generated_model((2.0, 1.0, 1.0)),
+        ):
+            self.workspace._apply_project_state(
+                [level],
+                0,
+                generation=generation,
+            )
+
+        profiles = self.workspace.canvas.get_placed_object_profiles()
+        self.assertEqual(tuple(profile.object_id for profile in profiles), ("chair",))
+        self.assertEqual((profiles[0].anchor_x, profiles[0].anchor_y), (40.0, 50.0))
+
     def test_completed_atlas_request_uses_actual_model_preview(self) -> None:
         model = _generated_model()
         self.workspace.generation.set_data(
